@@ -1,6 +1,6 @@
 # smolvm
 
-OCI-native microVM runtime. Run containers in lightweight VMs using [libkrun](https://github.com/containers/libkrun).
+Tool for MicroVM manager. Run containers in lightweight VMs using [libkrun](https://github.com/containers/libkrun).
 
 > **Alpha** - APIs may change.
 
@@ -46,24 +46,9 @@ smolvm microvm stop myvm
 smolvm microvm delete myvm
 ```
 
-### Key Difference
-
-| Command | Runs In | MicroVM |
-|---------|---------|---------|
-| `run` | Container (OCI image) | Stops after |
-| `exec` | VM directly (Alpine) | Keeps running |
-
 ### Common Options
 
 `-e KEY=VAL` env, `-v host:guest` mount, `-w /path` workdir, `--net` network, `-p 8080:80` ports, `--timeout 30s`, `-it` interactive
-
-## Troubleshooting
-
-```bash
-RUST_LOG=debug smolvm microvm run alpine:latest  # Debug logging
-cat ~/Library/Caches/smolvm/agent-console.log    # Agent logs
-pkill -9 -f krun                                  # Kill stuck VM
-```
 
 ## Limitations
 
