@@ -71,7 +71,6 @@ pub mod error;
 pub mod mount;
 pub mod network;
 pub mod process;
-pub mod protocol;
 pub mod rootfs;
 pub mod storage;
 pub mod util;

@@ -5,7 +5,7 @@
 //! DYLD_LIBRARY_PATH is still available for dlopen.
 
 use crate::error::{Error, Result};
-use crate::protocol::ports;
+use smolvm_protocol::ports;
 use crate::storage::StorageDisk;
 use crate::vm::config::HostMount;
 use std::ffi::CString;

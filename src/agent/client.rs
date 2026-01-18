@@ -4,7 +4,7 @@
 //! and receiving responses.
 
 use crate::error::{Error, Result};
-use crate::protocol::{
+use smolvm_protocol::{
     encode_message, AgentRequest, AgentResponse, ContainerInfo, ImageInfo, OverlayInfo,
     StorageStatus,
 };
