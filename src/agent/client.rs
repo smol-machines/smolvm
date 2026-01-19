@@ -29,8 +29,12 @@ impl AgentClient {
             .map_err(|e| Error::AgentError(format!("failed to connect to agent: {}", e)))?;
 
         // Set timeouts
-        stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
-        stream.set_write_timeout(Some(Duration::from_secs(10))).ok();
+        if let Err(e) = stream.set_read_timeout(Some(Duration::from_secs(30))) {
+            tracing::warn!(error = %e, "failed to set socket read timeout");
+        }
+        if let Err(e) = stream.set_write_timeout(Some(Duration::from_secs(10))) {
+            tracing::warn!(error = %e, "failed to set socket write timeout");
+        }
 
         Ok(Self { stream })
     }
@@ -262,7 +266,9 @@ impl AgentClient {
             Some(t) => t + Duration::from_secs(5),
             None => Duration::from_secs(3600),
         };
-        self.stream.set_read_timeout(Some(socket_timeout)).ok();
+        if let Err(e) = self.stream.set_read_timeout(Some(socket_timeout)) {
+            tracing::warn!(error = %e, "failed to set socket read timeout");
+        }
 
         let timeout_ms = timeout.map(|t| t.as_millis() as u64);
 
@@ -276,9 +282,9 @@ impl AgentClient {
         })?;
 
         // Reset timeout
-        self.stream
-            .set_read_timeout(Some(Duration::from_secs(30)))
-            .ok();
+        if let Err(e) = self.stream.set_read_timeout(Some(Duration::from_secs(30))) {
+            tracing::warn!(error = %e, "failed to reset socket read timeout");
+        }
 
         match resp {
             AgentResponse::Completed {
@@ -318,9 +324,9 @@ impl AgentClient {
         use std::io::{stderr, stdout, Write};
 
         // Set long socket timeout for interactive sessions
-        self.stream
-            .set_read_timeout(Some(Duration::from_secs(3600)))
-            .ok();
+        if let Err(e) = self.stream.set_read_timeout(Some(Duration::from_secs(3600))) {
+            tracing::warn!(error = %e, "failed to set socket read timeout for interactive session");
+        }
 
         let timeout_ms = timeout.map(|t| t.as_millis() as u64);
 
@@ -446,7 +452,9 @@ impl AgentClient {
             Some(t) => t + Duration::from_secs(5), // Add buffer for response
             None => Duration::from_secs(3600),     // Default 1 hour
         };
-        self.stream.set_read_timeout(Some(socket_timeout)).ok();
+        if let Err(e) = self.stream.set_read_timeout(Some(socket_timeout)) {
+            tracing::warn!(error = %e, "failed to set socket read timeout");
+        }
 
         // Convert timeout to milliseconds for protocol
         let timeout_ms = timeout.map(|t| t.as_millis() as u64);
@@ -463,9 +471,9 @@ impl AgentClient {
         })?;
 
         // Reset timeout
-        self.stream
-            .set_read_timeout(Some(Duration::from_secs(30)))
-            .ok();
+        if let Err(e) = self.stream.set_read_timeout(Some(Duration::from_secs(30))) {
+            tracing::warn!(error = %e, "failed to reset socket read timeout");
+        }
 
         match resp {
             AgentResponse::Completed {
@@ -509,9 +517,9 @@ impl AgentClient {
         use std::io::{stderr, stdout, Write};
 
         // Set long socket timeout for interactive sessions
-        self.stream
-            .set_read_timeout(Some(Duration::from_secs(3600)))
-            .ok();
+        if let Err(e) = self.stream.set_read_timeout(Some(Duration::from_secs(3600))) {
+            tracing::warn!(error = %e, "failed to set socket read timeout for interactive session");
+        }
 
         // Convert timeout to milliseconds for protocol
         let timeout_ms = timeout.map(|t| t.as_millis() as u64);
@@ -715,7 +723,9 @@ impl AgentClient {
             Some(t) => t + Duration::from_secs(5),
             None => Duration::from_secs(3600),
         };
-        self.stream.set_read_timeout(Some(socket_timeout)).ok();
+        if let Err(e) = self.stream.set_read_timeout(Some(socket_timeout)) {
+            tracing::warn!(error = %e, "failed to set socket read timeout");
+        }
 
         let timeout_ms = timeout.map(|t| t.as_millis() as u64);
 
@@ -728,9 +738,9 @@ impl AgentClient {
         })?;
 
         // Reset timeout
-        self.stream
-            .set_read_timeout(Some(Duration::from_secs(30)))
-            .ok();
+        if let Err(e) = self.stream.set_read_timeout(Some(Duration::from_secs(30))) {
+            tracing::warn!(error = %e, "failed to reset socket read timeout");
+        }
 
         match resp {
             AgentResponse::Completed {

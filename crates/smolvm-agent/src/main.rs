@@ -8,12 +8,9 @@
 //!
 //! Communication is via vsock on port 6000.
 
-use smolvm_protocol::{
-    ports, AgentRequest, AgentResponse, ContainerInfo, ImageInfo, OverlayInfo, StorageStatus,
-    PROTOCOL_VERSION,
-};
+use smolvm_protocol::{ports, AgentRequest, AgentResponse, ContainerInfo, PROTOCOL_VERSION};
 use std::io::{Read, Write};
-use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::unix::io::AsRawFd;
 use std::process::{Child, Command, Stdio};
 use tracing::{debug, error, info, warn};
 
@@ -649,7 +646,7 @@ fn run_interactive_loop(
 
 /// Try to read a request with a very short timeout.
 fn try_read_request(
-    stream: &mut impl ReadWrite,
+    _stream: &mut impl ReadWrite,
 ) -> Result<Option<AgentRequest>, Box<dyn std::error::Error>> {
     // For now, use a simple non-blocking approach
     // In a production implementation, we'd use poll/select

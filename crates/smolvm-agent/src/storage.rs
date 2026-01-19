@@ -882,6 +882,7 @@ fn unsanitize_image_name(name: &str) -> String {
 }
 
 /// Get disk usage for a path.
+#[allow(unused_variables)] // path is used only on Linux
 fn get_disk_usage(path: &Path) -> Result<(u64, u64)> {
     // Use statvfs on Linux
     #[cfg(target_os = "linux")]

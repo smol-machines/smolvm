@@ -70,6 +70,7 @@ pub mod config;
 pub mod error;
 pub mod mount;
 pub mod network;
+pub mod platform;
 pub mod process;
 pub mod rootfs;
 pub mod storage;

@@ -54,6 +54,7 @@ pub struct ContainerInfo {
     /// Image the container was created from.
     pub image: String,
     /// Path to the OCI bundle directory.
+    #[allow(dead_code)] // Stored for debugging and potential future use
     pub bundle_path: PathBuf,
     /// Current container state.
     pub state: ContainerState,
@@ -94,6 +95,7 @@ impl ContainerRegistry {
     }
 
     /// Get a container by ID.
+    #[allow(dead_code)] // Used in tests
     pub fn get(&self, id: &str) -> Option<ContainerInfo> {
         let containers = self.containers.read().unwrap_or_else(|e| e.into_inner());
         containers.get(id).cloned()

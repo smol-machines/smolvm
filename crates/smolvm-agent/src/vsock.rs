@@ -3,15 +3,17 @@
 //! This module provides vsock server functionality for Linux guests.
 
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 
 /// vsock listener.
 pub struct VsockListener {
+    #[allow(dead_code)] // Accessed via AsRawFd trait
     fd: OwnedFd,
 }
 
 /// vsock stream (connection).
 pub struct VsockStream {
+    #[allow(dead_code)] // Accessed via AsRawFd trait
     fd: OwnedFd,
 }
 

@@ -4,12 +4,11 @@
 //! which uses Hypervisor.framework on macOS and KVM on Linux.
 
 use std::ffi::CString;
-use std::fs::{self, File};
-use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
+use crate::platform::{self, VmExecutor};
 use crate::vm::config::{NetworkPolicy, RootfsSource, VmConfig};
 use crate::vm::state::{ExitReason, VmState};
 use crate::vm::{VmBackend, VmHandle, VmId};
@@ -254,13 +253,12 @@ impl LibkrunVm {
                 })
                 .collect();
 
-            // Build exec command (with mount wrapper on macOS if needed)
-            #[cfg(target_os = "macos")]
+            // Build exec command using platform-specific executor
+            // On macOS, this wraps the command with a mount script for virtiofs
+            // On Linux, the kernel handles virtiofs mounting automatically
+            let executor = platform::vm_executor();
             let (exec_path, argv, _argv_cstrings) =
-                build_exec_with_mounts(&config.command, &mount_specs, rootfs_path)?;
-
-            #[cfg(not(target_os = "macos"))]
-            let (exec_path, argv, _argv_cstrings) = build_exec_args(&config.command)?;
+                executor.build_exec_command(&config.command, &mount_specs, rootfs_path)?;
 
             tracing::debug!("[libkrun] exec_path: {:?}", exec_path);
             tracing::debug!("[libkrun] command: {:?}", config.command);
@@ -524,12 +522,15 @@ fn path_to_cstring(path: &Path) -> Result<CString> {
         .map_err(|_| Error::vm_creation("path contains null byte"))
 }
 
-/// Build exec arguments for libkrun.
+/// Build exec arguments for libkrun (test helper).
 ///
 /// libkrun passes exec_path as KRUN_INIT env var, and argv is appended to the
 /// kernel cmdline after " -- ". init.krun replaces argv[0] with KRUN_INIT.
 /// Therefore, argv should NOT include the command name (argv[0]) - only the
 /// arguments starting from argv[1].
+///
+/// Note: Production code uses `platform::vm_executor().build_exec_command()` instead.
+#[cfg(test)]
 fn build_exec_args(
     command: &Option<Vec<String>>,
 ) -> Result<(CString, Vec<*const libc::c_char>, Vec<CString>)> {
@@ -590,95 +591,6 @@ fn build_env_args(
     envp.push(std::ptr::null());
 
     Ok((envp, cstrings))
-}
-
-/// Write a mount helper script to the rootfs (macOS virtiofs workaround).
-///
-/// On macOS, virtiofs devices need to be explicitly mounted by the guest.
-/// This function writes a shell script that mounts all virtiofs volumes
-/// before executing the user's command.
-///
-/// The script is written to /tmp inside the rootfs to avoid mutating the
-/// container image. /tmp is typically a tmpfs and cleaned up automatically.
-#[cfg(target_os = "macos")]
-fn write_mount_script(
-    rootfs: &Path,
-    mounts: &[(String, String)], // (tag, guest_path)
-) -> Result<String> {
-    // Write to /tmp to avoid mutating the container image
-    let tmp_dir = rootfs.join("tmp");
-    if !tmp_dir.exists() {
-        fs::create_dir_all(&tmp_dir)
-            .map_err(|e| Error::vm_creation(format!("failed to create /tmp in rootfs: {}", e)))?;
-    }
-
-    let host_path = tmp_dir.join("smolvm-mount.sh");
-    let guest_path = "/tmp/smolvm-mount.sh";
-
-    let mut file = File::create(&host_path)
-        .map_err(|e| Error::vm_creation(format!("failed to create mount script: {}", e)))?;
-
-    writeln!(file, "#!/bin/sh").unwrap();
-    writeln!(file, "set -e").unwrap();
-
-    // Mount each virtiofs volume
-    for (tag, guest_mount) in mounts {
-        // Create mount point if it doesn't exist
-        writeln!(file, "mkdir -p \"{}\"", guest_mount).unwrap();
-        writeln!(file, "mount -t virtiofs {} \"{}\"", tag, guest_mount).unwrap();
-    }
-
-    // Clean up the mount script after execution
-    writeln!(file, "rm -f \"$0\"").unwrap();
-
-    // Execute the user's command
-    writeln!(file, "exec \"$@\"").unwrap();
-
-    // Make executable
-    let perms = fs::Permissions::from_mode(0o755);
-    fs::set_permissions(&host_path, perms).map_err(|e| {
-        Error::vm_creation(format!("failed to set mount script permissions: {}", e))
-    })?;
-
-    tracing::debug!("wrote mount script to {:?}", host_path);
-    Ok(guest_path.to_string())
-}
-
-/// Build exec arguments with mount wrapper if needed.
-/// Note: libkrun expects argv to contain only the arguments, NOT the command itself.
-#[cfg(target_os = "macos")]
-fn build_exec_with_mounts(
-    command: &Option<Vec<String>>,
-    mounts: &[(String, String)],
-    rootfs: &Path,
-) -> Result<(CString, Vec<*const libc::c_char>, Vec<CString>)> {
-    if mounts.is_empty() {
-        // No mounts, use command directly
-        return build_exec_args(command);
-    }
-
-    // Write mount script and use it as the command
-    let script_path = write_mount_script(rootfs, mounts)?;
-
-    let default_cmd = vec!["/bin/sh".to_string()];
-    let user_cmd = command.as_ref().unwrap_or(&default_cmd);
-
-    // exec_path is the mount script
-    let exec_path = CString::new(script_path.as_str())
-        .map_err(|_| Error::vm_creation("invalid script path"))?;
-
-    // argv is the user's command and arguments (passed to the script via $@)
-    let cstrings: Vec<CString> = user_cmd
-        .iter()
-        .map(|s| CString::new(s.as_str()))
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|_| Error::vm_creation("invalid command argument"))?;
-
-    let mut argv: Vec<*const libc::c_char> = cstrings.iter().map(|s| s.as_ptr()).collect();
-    argv.push(std::ptr::null());
-
-    tracing::debug!("using mount wrapper with {} virtiofs mounts", mounts.len());
-    Ok((exec_path, argv, cstrings))
 }
 
 #[cfg(test)]
