@@ -17,7 +17,11 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Manage microvms (run, exec, create, start, stop, delete, status, ls)
+    /// Run a container in an ephemeral sandbox (quick start)
+    #[command(subcommand)]
+    Sandbox(cli::sandbox::SandboxCmd),
+
+    /// Manage microvms (exec, create, start, stop, delete, status, ls)
     #[command(subcommand)]
     Microvm(cli::microvm::MicrovmCmd),
 
@@ -36,6 +40,7 @@ fn main() {
 
     // Execute command
     let result = match cli.command {
+        Commands::Sandbox(cmd) => cmd.run(),
         Commands::Microvm(cmd) => cmd.run(),
         Commands::Container(cmd) => cmd.run(),
     };

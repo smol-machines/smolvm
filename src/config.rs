@@ -118,13 +118,13 @@ impl SmolvmConfig {
 }
 
 /// Record of a VM in the registry.
+///
+/// This stores microvm configuration only. Container configuration
+/// is managed separately via the container commands.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VmRecord {
     /// VM name/ID.
     pub name: String,
-
-    /// OCI image reference.
-    pub image: String,
 
     /// Creation timestamp.
     pub created_at: String,
@@ -145,21 +145,13 @@ pub struct VmRecord {
     #[serde(default = "default_mem")]
     pub mem: u32,
 
-    /// Command to execute.
-    #[serde(default)]
-    pub command: Option<Vec<String>>,
-
-    /// Working directory.
-    #[serde(default)]
-    pub workdir: Option<String>,
-
-    /// Environment variables.
-    #[serde(default)]
-    pub env: Vec<(String, String)>,
-
     /// Volume mounts (host_path, guest_path, read_only).
     #[serde(default)]
     pub mounts: Vec<(String, String, bool)>,
+
+    /// Port mappings (host_port, guest_port).
+    #[serde(default)]
+    pub ports: Vec<(u16, u16)>,
 }
 
 fn default_cpus() -> u8 {
@@ -167,33 +159,27 @@ fn default_cpus() -> u8 {
 }
 
 fn default_mem() -> u32 {
-    256
+    512
 }
 
 impl VmRecord {
     /// Create a new VM record.
     pub fn new(
         name: String,
-        image: String,
         cpus: u8,
         mem: u32,
-        command: Option<Vec<String>>,
-        workdir: Option<String>,
-        env: Vec<(String, String)>,
         mounts: Vec<(String, String, bool)>,
+        ports: Vec<(u16, u16)>,
     ) -> Self {
         Self {
             name,
-            image,
             created_at: crate::util::current_timestamp(),
             state: RecordState::Created,
             pid: None,
             cpus,
             mem,
-            command,
-            workdir,
-            env,
             mounts,
+            ports,
         }
     }
 

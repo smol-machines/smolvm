@@ -1,7 +1,6 @@
 //! MicroVM management commands.
 //!
 //! All VM-related commands are under the `microvm` subcommand:
-//! - run: Ephemeral execution (stops microvm after)
 //! - exec: Persistent execution (microvm keeps running)
 //! - create: Create named VM configuration
 //! - start: Start a microvm (named or default)
@@ -49,9 +48,6 @@ fn parse_env_spec(spec: &str) -> Option<(String, String)> {
 /// Manage microvms
 #[derive(Subcommand, Debug)]
 pub enum MicrovmCmd {
-    /// Run a command in a container (ephemeral - stops microvm after)
-    Run(RunCmd),
-
     /// Execute a command in a microvm (persistent - microvm keeps running)
     Exec(ExecCmd),
 
@@ -82,7 +78,6 @@ pub enum MicrovmCmd {
 impl MicrovmCmd {
     pub fn run(self) -> smolvm::Result<()> {
         match self {
-            MicrovmCmd::Run(cmd) => cmd.run(),
             MicrovmCmd::Exec(cmd) => cmd.run(),
             MicrovmCmd::Create(cmd) => cmd.run(),
             MicrovmCmd::Start(cmd) => cmd.run(),
@@ -92,168 +87,6 @@ impl MicrovmCmd {
             MicrovmCmd::Ls(cmd) => cmd.run(),
             MicrovmCmd::NetworkTest(cmd) => cmd.run(),
         }
-    }
-}
-
-// ============================================================================
-// Run Command (Ephemeral)
-// ============================================================================
-
-/// Run a command in a container (ephemeral - stops microvm after).
-#[derive(Args, Debug)]
-pub struct RunCmd {
-    /// OCI image reference
-    pub image: String,
-
-    /// Command to execute inside the container
-    #[arg(trailing_var_arg = true)]
-    pub command: Vec<String>,
-
-    /// Number of vCPUs
-    #[arg(long, default_value = "1")]
-    pub cpus: u8,
-
-    /// Memory in MiB
-    #[arg(long, default_value = "512")]
-    pub mem: u32,
-
-    /// Working directory inside the container
-    #[arg(short = 'w', long)]
-    pub workdir: Option<String>,
-
-    /// Environment variable (KEY=VALUE)
-    #[arg(short = 'e', long = "env")]
-    pub env: Vec<String>,
-
-    /// Volume mount (host:container[:ro])
-    #[arg(short = 'v', long = "volume")]
-    pub volume: Vec<String>,
-
-    /// Enable network egress (auto-enabled when -p is used)
-    #[arg(long)]
-    pub net: bool,
-
-    /// Port mapping from host to guest (HOST:GUEST or PORT)
-    #[arg(short = 'p', long = "port", value_parser = parse_port)]
-    pub port: Vec<PortMapping>,
-
-    /// Timeout for command execution (e.g., "30s", "5m")
-    #[arg(long, value_parser = parse_duration)]
-    pub timeout: Option<Duration>,
-
-    /// Keep stdin open (interactive mode)
-    #[arg(short = 'i', long)]
-    pub interactive: bool,
-
-    /// Allocate a pseudo-TTY
-    #[arg(short = 't', long)]
-    pub tty: bool,
-}
-
-impl RunCmd {
-    pub fn run(self) -> smolvm::Result<()> {
-        use smolvm::Error;
-        use std::io::Write;
-
-        // Parse volume mounts
-        let mounts = parse_mounts(&self.volume)?;
-        let ports = self.port.clone();
-
-        let resources = VmResources {
-            cpus: self.cpus,
-            mem: self.mem,
-        };
-
-        // Start agent VM
-        let manager = AgentManager::default()
-            .map_err(|e| Error::AgentError(format!("failed to create agent manager: {}", e)))?;
-
-        // Show startup message
-        let mount_info = if !mounts.is_empty() {
-            format!(" with {} mount(s)", mounts.len())
-        } else {
-            String::new()
-        };
-        let port_info = if !ports.is_empty() {
-            format!(" and {} port mapping(s)", ports.len())
-        } else {
-            String::new()
-        };
-        println!("Starting microvm{}{}...", mount_info, port_info);
-
-        manager
-            .ensure_running_with_full_config(mounts.clone(), ports, resources)
-            .map_err(|e| Error::AgentError(format!("failed to start microvm: {}", e)))?;
-
-        // Connect to agent
-        let mut client = AgentClient::connect(manager.vsock_socket())?;
-
-        // Pull image
-        println!("Pulling image {}...", self.image);
-        client.pull(&self.image, None)?;
-
-        // Build command
-        let command = if self.command.is_empty() {
-            vec!["/bin/sh".to_string()]
-        } else {
-            self.command.clone()
-        };
-
-        // Parse environment variables
-        let env: Vec<(String, String)> =
-            self.env.iter().filter_map(|e| parse_env_spec(e)).collect();
-
-        // Convert mounts to agent format
-        let mount_bindings: Vec<(String, String, bool)> = mounts
-            .iter()
-            .enumerate()
-            .map(|(i, m)| {
-                (
-                    format!("smolvm{}", i),
-                    m.target.to_string_lossy().to_string(),
-                    m.read_only,
-                )
-            })
-            .collect();
-
-        // Run command
-        let exit_code = if self.interactive || self.tty {
-            client.run_interactive(
-                &self.image,
-                command,
-                env,
-                self.workdir.clone(),
-                mount_bindings,
-                self.timeout,
-                self.tty,
-            )?
-        } else {
-            let (exit_code, stdout, stderr) = client.run_with_mounts_and_timeout(
-                &self.image,
-                command,
-                env,
-                self.workdir.clone(),
-                mount_bindings,
-                self.timeout,
-            )?;
-
-            if !stdout.is_empty() {
-                print!("{}", stdout);
-            }
-            if !stderr.is_empty() {
-                eprint!("{}", stderr);
-            }
-            let _ = std::io::stdout().flush();
-            let _ = std::io::stderr().flush();
-            exit_code
-        };
-
-        // Stop the microvm (ephemeral mode)
-        if let Err(e) = manager.stop() {
-            tracing::warn!(error = %e, "failed to stop microvm");
-        }
-
-        std::process::exit(exit_code);
     }
 }
 
@@ -357,17 +190,12 @@ impl ExecCmd {
 // ============================================================================
 
 /// Create a named VM configuration without starting it.
+///
+/// This creates a microvm configuration with specified resources.
+/// Use `smolvm container` commands to run containers inside the VM.
 #[derive(Args, Debug)]
 pub struct CreateCmd {
-    /// OCI image reference
-    pub image: String,
-
-    /// Command to execute when the VM starts
-    #[arg(trailing_var_arg = true)]
-    pub command: Vec<String>,
-
-    /// VM name (required)
-    #[arg(long)]
+    /// VM name
     pub name: String,
 
     /// Number of vCPUs
@@ -375,20 +203,16 @@ pub struct CreateCmd {
     pub cpus: u8,
 
     /// Memory in MiB
-    #[arg(long, default_value = "256")]
+    #[arg(long, default_value = "512")]
     pub mem: u32,
-
-    /// Working directory inside the container
-    #[arg(short = 'w', long)]
-    pub workdir: Option<String>,
-
-    /// Environment variable (KEY=VALUE)
-    #[arg(short = 'e', long = "env")]
-    pub env: Vec<String>,
 
     /// Volume mount (host:guest[:ro])
     #[arg(short = 'v', long = "volume")]
     pub volume: Vec<String>,
+
+    /// Port mapping from host to guest (HOST:GUEST or PORT)
+    #[arg(short = 'p', long = "port", value_parser = parse_port)]
+    pub port: Vec<PortMapping>,
 }
 
 impl CreateCmd {
@@ -403,43 +227,35 @@ impl CreateCmd {
             )));
         }
 
-        // Parse environment variables
-        let env: Vec<(String, String)> =
-            self.env.iter().filter_map(|e| parse_env_spec(e)).collect();
-
         // Parse and validate volume mounts
         let mounts = parse_mounts_as_tuples(&self.volume)?;
 
-        // Build command
-        let command = if self.command.is_empty() {
-            None
-        } else {
-            Some(self.command.clone())
-        };
+        // Convert port mappings to tuple format for storage
+        let ports: Vec<(u16, u16)> = self.port.iter().map(|p| (p.host, p.guest)).collect();
 
         // Create record
         let record = VmRecord::new(
             self.name.clone(),
-            self.image.clone(),
             self.cpus,
             self.mem,
-            command,
-            self.workdir.clone(),
-            env,
             mounts,
+            ports,
         );
 
         // Store in config
         config.vms.insert(self.name.clone(), record);
         config.save()?;
 
-        println!("Created VM: {}", self.name);
-        println!("  Image: {}", self.image);
+        println!("Created microvm: {}", self.name);
         println!("  CPUs: {}, Memory: {} MiB", self.cpus, self.mem);
         if !self.volume.is_empty() {
             println!("  Mounts: {}", self.volume.len());
         }
-        println!("\nUse 'smolvm microvm start {}' to start the VM", self.name);
+        if !self.port.is_empty() {
+            println!("  Ports: {}", self.port.len());
+        }
+        println!("\nUse 'smolvm microvm start {}' to start the microvm", self.name);
+        println!("Then use 'smolvm container create {}' to run containers", self.name);
 
         Ok(())
     }
@@ -459,7 +275,6 @@ pub struct StartCmd {
 impl StartCmd {
     pub fn run(self) -> smolvm::Result<()> {
         use smolvm::Error;
-        use std::io::Write;
 
         // If no name provided, start default anonymous microvm
         if self.name.is_none() {
@@ -478,10 +293,12 @@ impl StartCmd {
         // Check state
         let actual_state = record.actual_state();
         if actual_state == RecordState::Running {
-            return Err(Error::InvalidState {
-                expected: "created or stopped".to_string(),
-                actual: "running".to_string(),
-            });
+            let pid = record
+                .pid
+                .map(|p| format!(" (PID: {})", p))
+                .unwrap_or_default();
+            println!("MicroVM '{}' already running{}", name, pid);
+            return Ok(());
         }
 
         // Convert stored mounts to HostMount
@@ -495,6 +312,13 @@ impl StartCmd {
             })
             .collect();
 
+        // Convert stored ports to PortMapping
+        let ports: Vec<PortMapping> = record
+            .ports
+            .iter()
+            .map(|(host, guest)| PortMapping::new(*host, *guest))
+            .collect();
+
         let resources = VmResources {
             cpus: record.cpus,
             mem: record.mem,
@@ -504,14 +328,21 @@ impl StartCmd {
         let manager = AgentManager::for_vm(name)
             .map_err(|e| Error::AgentError(format!("failed to create agent manager: {}", e)))?;
 
-        if !mounts.is_empty() {
-            println!("Starting VM '{}' with {} mount(s)...", name, mounts.len());
+        // Show startup message
+        let mount_info = if !mounts.is_empty() {
+            format!(" with {} mount(s)", mounts.len())
         } else {
-            println!("Starting VM '{}'...", name);
-        }
+            String::new()
+        };
+        let port_info = if !ports.is_empty() {
+            format!(" and {} port mapping(s)", ports.len())
+        } else {
+            String::new()
+        };
+        println!("Starting microvm '{}'{}{}...", name, mount_info, port_info);
 
         manager
-            .ensure_running_with_config(mounts.clone(), resources)
+            .ensure_running_with_full_config(mounts, ports, resources)
             .map_err(|e| Error::AgentError(format!("failed to start microvm: {}", e)))?;
 
         // Update state
@@ -522,63 +353,12 @@ impl StartCmd {
         });
         config.save()?;
 
-        // Connect to agent
-        let mut client = AgentClient::connect(manager.vsock_socket())?;
+        println!("MicroVM '{}' running (PID: {})", name, pid.unwrap_or(0));
+        println!("\nUse 'smolvm container create {} <image>' to run containers", name);
 
-        // Pull image
-        println!("Pulling image {}...", record.image);
-        client.pull(&record.image, None)?;
-
-        // Build command
-        let command = record
-            .command
-            .clone()
-            .unwrap_or_else(|| vec!["/bin/sh".to_string()]);
-
-        // Convert mounts to agent format
-        let mount_bindings: Vec<(String, String, bool)> = mounts
-            .iter()
-            .enumerate()
-            .map(|(i, m)| {
-                (
-                    format!("smolvm{}", i),
-                    m.target.to_string_lossy().to_string(),
-                    m.read_only,
-                )
-            })
-            .collect();
-
-        // Run command
-        let (exit_code, stdout, stderr) = client.run_with_mounts(
-            &record.image,
-            command,
-            record.env.clone(),
-            record.workdir.clone(),
-            mount_bindings,
-        )?;
-
-        if !stdout.is_empty() {
-            print!("{}", stdout);
-        }
-        if !stderr.is_empty() {
-            eprint!("{}", stderr);
-        }
-        let _ = std::io::stdout().flush();
-        let _ = std::io::stderr().flush();
-
-        // Update state to stopped
-        config.update_vm(name, |r| {
-            r.state = RecordState::Stopped;
-            r.pid = None;
-        });
-        config.save()?;
-
-        // Stop the agent
-        if let Err(e) = manager.stop() {
-            tracing::warn!(error = %e, "failed to stop microvm");
-        }
-
-        std::process::exit(exit_code);
+        // Keep microvm running
+        std::mem::forget(manager);
+        Ok(())
     }
 
     fn start_anonymous(&self) -> smolvm::Result<()> {
@@ -811,14 +591,11 @@ impl LsCmd {
                     serde_json::json!({
                         "name": name,
                         "state": actual_state.to_string(),
-                        "image": record.image,
                         "cpus": record.cpus,
                         "memory_mib": record.mem,
                         "pid": record.pid,
-                        "command": record.command,
-                        "workdir": record.workdir,
-                        "env": record.env,
                         "mounts": record.mounts.len(),
+                        "ports": record.ports.len(),
                         "created_at": record.created_at,
                     })
                 })
@@ -826,36 +603,33 @@ impl LsCmd {
             println!("{}", serde_json::to_string_pretty(&json_vms).unwrap());
         } else {
             println!(
-                "{:<20} {:<10} {:<5} {:<8} {:<25} {:<6}",
-                "NAME", "STATE", "CPUS", "MEMORY", "IMAGE", "MOUNTS"
+                "{:<20} {:<10} {:<5} {:<8} {:<6} {:<6}",
+                "NAME", "STATE", "CPUS", "MEMORY", "MOUNTS", "PORTS"
             );
-            println!("{}", "-".repeat(78));
+            println!("{}", "-".repeat(60));
 
             for (name, record) in vms {
                 let actual_state = record.actual_state();
                 println!(
-                    "{:<20} {:<10} {:<5} {:<8} {:<25} {:<6}",
+                    "{:<20} {:<10} {:<5} {:<8} {:<6} {:<6}",
                     truncate(name, 18),
                     actual_state,
                     record.cpus,
                     format!("{} MiB", record.mem),
-                    truncate(&record.image, 23),
                     record.mounts.len(),
+                    record.ports.len(),
                 );
 
                 if self.verbose {
-                    if let Some(cmd) = &record.command {
-                        println!("  Command: {:?}", cmd);
-                    }
-                    if let Some(wd) = &record.workdir {
-                        println!("  Workdir: {}", wd);
-                    }
-                    if !record.env.is_empty() {
-                        println!("  Env: {} variable(s)", record.env.len());
+                    if record.pid.is_some() {
+                        println!("  PID: {}", record.pid.unwrap());
                     }
                     for (host, guest, ro) in &record.mounts {
                         let ro_str = if *ro { " (ro)" } else { "" };
                         println!("  Mount: {} -> {}{}", host, guest, ro_str);
+                    }
+                    for (host, guest) in &record.ports {
+                        println!("  Port: {} -> {}", host, guest);
                     }
                     println!("  Created: {}", record.created_at);
                     println!();
@@ -934,56 +708,6 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         format!("{}...", &s[..max - 3])
     }
-}
-
-/// Parse volume mount specifications into HostMount structs.
-fn parse_mounts(specs: &[String]) -> smolvm::Result<Vec<HostMount>> {
-    use smolvm::Error;
-
-    let mut mounts = Vec::new();
-
-    for spec in specs {
-        let parts: Vec<&str> = spec.split(':').collect();
-        if parts.len() < 2 {
-            return Err(Error::Mount(format!(
-                "invalid volume specification '{}': expected host:container[:ro]",
-                spec
-            )));
-        }
-
-        let host_path = PathBuf::from(parts[0]);
-        let guest_path = PathBuf::from(parts[1]);
-        let read_only = parts.get(2).map(|&s| s == "ro").unwrap_or(false);
-
-        // Validate host path exists
-        if !host_path.exists() {
-            return Err(Error::Mount(format!(
-                "host path does not exist: {}",
-                host_path.display()
-            )));
-        }
-
-        // Must be a directory (virtiofs limitation)
-        if !host_path.is_dir() {
-            return Err(Error::Mount(format!(
-                "host path must be a directory (virtiofs limitation): {}",
-                host_path.display()
-            )));
-        }
-
-        // Canonicalize host path
-        let host_path = host_path.canonicalize().map_err(|e| {
-            Error::Mount(format!("failed to resolve host path '{}': {}", parts[0], e))
-        })?;
-
-        mounts.push(HostMount {
-            source: host_path,
-            target: guest_path,
-            read_only,
-        });
-    }
-
-    Ok(mounts)
 }
 
 /// Parse volume mount specifications into tuple format for VmRecord storage.
