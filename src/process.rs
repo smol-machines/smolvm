@@ -3,15 +3,68 @@
 //! This module provides utilities for managing child processes,
 //! including signal handling and graceful shutdown.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
+
+/// Flag indicating whether SIGCHLD handler has been installed.
+static SIGCHLD_HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
 
 /// Default timeout for graceful shutdown before SIGKILL.
 pub const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default timeout for SIGKILL to take effect.
 pub const SIGKILL_WAIT: Duration = Duration::from_millis(500);
+
+/// Install a SIGCHLD handler to automatically reap zombie child processes.
+///
+/// This function installs a signal handler that calls waitpid(-1, WNOHANG) to
+/// reap any terminated child processes, preventing zombie accumulation.
+///
+/// The handler is only installed once; subsequent calls are no-ops.
+///
+/// # Safety
+///
+/// This function installs a signal handler which must be async-signal-safe.
+/// The handler only calls waitpid() which is safe.
+pub fn install_sigchld_handler() {
+    // Only install once
+    if SIGCHLD_HANDLER_INSTALLED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = sigchld_handler as usize;
+        sa.sa_flags = libc::SA_RESTART | libc::SA_NOCLDSTOP;
+        libc::sigemptyset(&mut sa.sa_mask);
+
+        if libc::sigaction(libc::SIGCHLD, &sa, std::ptr::null_mut()) != 0 {
+            // Failed to install handler, reset flag
+            SIGCHLD_HANDLER_INSTALLED.store(false, Ordering::SeqCst);
+            tracing::warn!("failed to install SIGCHLD handler");
+        } else {
+            tracing::debug!("installed SIGCHLD handler for zombie reaping");
+        }
+    }
+}
+
+/// SIGCHLD signal handler that reaps zombie children.
+///
+/// This handler is async-signal-safe as it only calls waitpid().
+extern "C" fn sigchld_handler(_sig: libc::c_int) {
+    // Reap all terminated children (non-blocking)
+    // Loop until no more children to reap
+    loop {
+        let result = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
+        if result <= 0 {
+            // No more children to reap (0) or error (-1)
+            break;
+        }
+        // Successfully reaped a child, continue to check for more
+    }
+}
 
 /// Check if a process is alive.
 ///
