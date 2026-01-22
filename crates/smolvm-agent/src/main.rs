@@ -15,7 +15,10 @@ use std::process::{Child, Command, Stdio};
 use tracing::{debug, error, info, warn};
 
 mod container;
+mod crun;
 mod oci;
+mod paths;
+mod process;
 mod storage;
 mod vsock;
 
@@ -34,6 +37,14 @@ fn main() {
     if let Err(e) = storage::init() {
         error!(error = %e, "failed to initialize storage");
         std::process::exit(1);
+    }
+
+    // Load and reconcile container registry
+    if let Err(e) = container::REGISTRY.load() {
+        warn!(error = %e, "failed to load container registry, starting fresh");
+    }
+    if let Err(e) = container::REGISTRY.reconcile() {
+        warn!(error = %e, "failed to reconcile container registry");
     }
 
     // Start vsock server
@@ -128,6 +139,17 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
             continue;
         }
 
+        // Check if this is an interactive container exec request
+        if let AgentRequest::Exec {
+            interactive: true, ..
+        }
+        | AgentRequest::Exec { tty: true, .. } = &request
+        {
+            // Handle interactive container exec session
+            handle_interactive_container_exec(stream, request)?;
+            continue;
+        }
+
         // Handle regular request
         let response = handle_request(request);
         send_response(stream, &response)?;
@@ -172,8 +194,11 @@ fn handle_request(request: AgentRequest) -> AgentResponse {
         AgentRequest::NetworkTest { url } => {
             info!(url = %url, "testing network connectivity directly from agent");
 
+            // Extract host:port for TCP test from URL
+            let tcp_target = extract_host_port(&url).unwrap_or_else(|| "1.1.1.1:80".to_string());
+
             // Test 1: Pure syscall TCP connect test (bypass C library)
-            let syscall_result = test_tcp_syscall();
+            let syscall_result = test_tcp_syscall(&tcp_target);
 
             // Test 2: Try wget (busybox/musl)
             let wget_result = match std::process::Command::new("wget")
@@ -312,6 +337,8 @@ fn handle_request(request: AgentRequest) -> AgentResponse {
             env,
             workdir,
             timeout_ms,
+            interactive: false,
+            tty: false,
         } => handle_exec(
             &container_id,
             &command,
@@ -319,6 +346,14 @@ fn handle_request(request: AgentRequest) -> AgentResponse {
             workdir.as_deref(),
             timeout_ms,
         ),
+
+        AgentRequest::Exec { .. } => {
+            // Interactive mode should be handled by handle_interactive_container_exec
+            AgentResponse::Error {
+                message: "interactive container exec not handled here".into(),
+                code: Some("INTERNAL_ERROR".into()),
+            }
+        }
     }
 }
 
@@ -413,9 +448,6 @@ fn handle_interactive_run(
     Ok(())
 }
 
-/// Path to crun binary.
-const CRUN_PATH: &str = "/usr/bin/crun";
-
 /// Directory where virtiofs mounts are staged.
 const VIRTIOFS_MOUNT_ROOT: &str = "/mnt/virtiofs";
 
@@ -468,20 +500,6 @@ fn spawn_interactive_command(
     // Generate unique container ID
     let container_id = oci::generate_container_id();
 
-    // Build crun run command
-    let mut cmd = Command::new(CRUN_PATH);
-    cmd.args([
-        "run",
-        "--bundle",
-        &bundle_path.to_string_lossy(),
-        &container_id,
-    ]);
-
-    // Setup stdio for interactive mode
-    cmd.stdin(Stdio::piped());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-
     // TODO: For TTY mode, use --console-socket to receive PTY master FD
 
     info!(
@@ -491,12 +509,17 @@ fn spawn_interactive_command(
         mounts = mounts.len(),
         "spawning interactive container with crun"
     );
-    let child = cmd.spawn()?;
+
+    // Build and spawn crun run command with stdio piped for interactive mode
+    let child = crun::CrunCommand::run(&bundle_path, &container_id)
+        .stdin_piped()
+        .capture_output()
+        .spawn()?;
 
     Ok(child)
 }
 
-/// Run the interactive I/O loop.
+/// Run the interactive I/O loop using poll() for efficient I/O multiplexing.
 fn run_interactive_loop(
     stream: &mut impl ReadWrite,
     child: &mut Child,
@@ -529,40 +552,7 @@ fn run_interactive_loop(
         match child.try_wait()? {
             Some(status) => {
                 // Drain any remaining output
-                if let Some(ref mut stdout) = child_stdout {
-                    loop {
-                        match stdout.read(&mut stdout_buf) {
-                            Ok(0) => break,
-                            Ok(n) => {
-                                send_response(
-                                    stream,
-                                    &AgentResponse::Stdout {
-                                        data: stdout_buf[..n].to_vec(),
-                                    },
-                                )?;
-                            }
-                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                            Err(_) => break,
-                        }
-                    }
-                }
-                if let Some(ref mut stderr) = child_stderr {
-                    loop {
-                        match stderr.read(&mut stderr_buf) {
-                            Ok(0) => break,
-                            Ok(n) => {
-                                send_response(
-                                    stream,
-                                    &AgentResponse::Stderr {
-                                        data: stderr_buf[..n].to_vec(),
-                                    },
-                                )?;
-                            }
-                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                            Err(_) => break,
-                        }
-                    }
-                }
+                drain_remaining_output(stream, &mut child_stdout, &mut child_stderr, &mut stdout_buf, &mut stderr_buf)?;
                 return Ok(status.code().unwrap_or(-1));
             }
             None => {}
@@ -578,48 +568,106 @@ fn run_interactive_loop(
             }
         }
 
-        // Read available stdout
-        if let Some(ref mut stdout) = child_stdout {
-            match stdout.read(&mut stdout_buf) {
-                Ok(0) => {} // EOF
-                Ok(n) => {
-                    send_response(
-                        stream,
-                        &AgentResponse::Stdout {
-                            data: stdout_buf[..n].to_vec(),
-                        },
-                    )?;
+        // Calculate poll timeout: either remaining time until deadline, or 100ms default
+        let poll_timeout_ms = match deadline {
+            Some(dl) => {
+                let remaining = dl.saturating_duration_since(Instant::now());
+                // Cap at 100ms to periodically check child exit status
+                remaining.as_millis().min(100) as i32
+            }
+            None => 100, // Default 100ms poll timeout
+        };
+
+        // Build poll fds array for stdout and stderr
+        let stdout_fd = child_stdout.as_ref().map(|s| s.as_raw_fd()).unwrap_or(-1);
+        let stderr_fd = child_stderr.as_ref().map(|s| s.as_raw_fd()).unwrap_or(-1);
+
+        let mut poll_fds = [
+            libc::pollfd {
+                fd: stdout_fd,
+                events: if stdout_fd >= 0 { libc::POLLIN } else { 0 },
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: stderr_fd,
+                events: if stderr_fd >= 0 { libc::POLLIN } else { 0 },
+                revents: 0,
+            },
+        ];
+
+        // Wait for I/O or timeout using poll()
+        let nfds = if stdout_fd >= 0 && stderr_fd >= 0 {
+            2
+        } else if stdout_fd >= 0 || stderr_fd >= 0 {
+            // Only one fd is valid, adjust nfds
+            if stdout_fd >= 0 { 1 } else { 2 }
+        } else {
+            0
+        };
+
+        if nfds > 0 {
+            let poll_result = unsafe {
+                libc::poll(poll_fds.as_mut_ptr(), nfds as libc::nfds_t, poll_timeout_ms)
+            };
+
+            if poll_result < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() != std::io::ErrorKind::Interrupted {
+                    debug!(error = %err, "poll error");
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(e) => {
-                    debug!(error = %e, "stdout read error");
+                // On EINTR, just continue the loop
+                continue;
+            }
+        } else {
+            // No fds to poll, just sleep briefly to avoid busy-loop
+            std::thread::sleep(Duration::from_millis(poll_timeout_ms as u64));
+        }
+
+        // Read available stdout if poll indicated data ready (or always try in non-blocking mode)
+        if let Some(ref mut stdout) = child_stdout {
+            loop {
+                match stdout.read(&mut stdout_buf) {
+                    Ok(0) => break, // EOF
+                    Ok(n) => {
+                        send_response(
+                            stream,
+                            &AgentResponse::Stdout {
+                                data: stdout_buf[..n].to_vec(),
+                            },
+                        )?;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) => {
+                        debug!(error = %e, "stdout read error");
+                        break;
+                    }
                 }
             }
         }
 
         // Read available stderr
         if let Some(ref mut stderr) = child_stderr {
-            match stderr.read(&mut stderr_buf) {
-                Ok(0) => {} // EOF
-                Ok(n) => {
-                    send_response(
-                        stream,
-                        &AgentResponse::Stderr {
-                            data: stderr_buf[..n].to_vec(),
-                        },
-                    )?;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(e) => {
-                    debug!(error = %e, "stderr read error");
+            loop {
+                match stderr.read(&mut stderr_buf) {
+                    Ok(0) => break, // EOF
+                    Ok(n) => {
+                        send_response(
+                            stream,
+                            &AgentResponse::Stderr {
+                                data: stderr_buf[..n].to_vec(),
+                            },
+                        )?;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) => {
+                        debug!(error = %e, "stderr read error");
+                        break;
+                    }
                 }
             }
         }
 
         // Check for incoming stdin data (non-blocking read from vsock)
-        // This requires the stream to support non-blocking or using poll/select
-        // For now, we use a simple polling approach with short timeout
-
         // Try to read a request (with timeout)
         if let Some(request) = try_read_request(stream)? {
             match request {
@@ -638,10 +686,54 @@ fn run_interactive_loop(
                 }
             }
         }
-
-        // Small sleep to prevent busy-waiting
-        std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// Drain any remaining output from stdout/stderr after child exits.
+fn drain_remaining_output(
+    stream: &mut impl Write,
+    child_stdout: &mut Option<std::process::ChildStdout>,
+    child_stderr: &mut Option<std::process::ChildStderr>,
+    stdout_buf: &mut [u8],
+    stderr_buf: &mut [u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Read as _;
+
+    if let Some(ref mut stdout) = child_stdout {
+        loop {
+            match stdout.read(stdout_buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    send_response(
+                        stream,
+                        &AgentResponse::Stdout {
+                            data: stdout_buf[..n].to_vec(),
+                        },
+                    )?;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+    }
+    if let Some(ref mut stderr) = child_stderr {
+        loop {
+            match stderr.read(stderr_buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    send_response(
+                        stream,
+                        &AgentResponse::Stderr {
+                            data: stderr_buf[..n].to_vec(),
+                        },
+                    )?;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Try to read a request with a very short timeout.
@@ -667,17 +759,68 @@ fn set_nonblocking(fd: i32) {
     }
 }
 
+/// Extract host:port from a URL for TCP connection testing.
+///
+/// Supports URLs like:
+/// - `http://example.com` -> `example.com:80`
+/// - `https://example.com` -> `example.com:443`
+/// - `http://example.com:8080` -> `example.com:8080`
+/// - `example.com:80` -> `example.com:80`
+fn extract_host_port(url: &str) -> Option<String> {
+    // Remove protocol prefix if present
+    let without_proto = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .unwrap_or(url);
+
+    // Extract host (remove path)
+    let host_port = without_proto.split('/').next()?;
+
+    // If no port, add default based on protocol
+    if host_port.contains(':') {
+        Some(host_port.to_string())
+    } else if url.starts_with("https://") {
+        Some(format!("{}:443", host_port))
+    } else {
+        Some(format!("{}:80", host_port))
+    }
+}
+
 /// Test TCP connection using pure syscalls (bypass C library).
-/// Connects to 1.1.1.1:80 and sends HTTP GET request.
-fn test_tcp_syscall() -> serde_json::Value {
+/// Connects to the specified target and sends HTTP GET request.
+///
+/// # Arguments
+/// * `target` - Host:port to connect to (e.g., "1.1.1.1:80", "example.com:443")
+fn test_tcp_syscall(target: &str) -> serde_json::Value {
     use std::io::{Read as _, Write as _};
-    use std::net::{SocketAddr, TcpStream};
+    use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
     use std::time::Duration;
 
-    info!("testing TCP with pure Rust std::net");
+    info!(target = %target, "testing TCP with pure Rust std::net");
 
-    // Test 1: Try to create a TCP connection to 1.1.1.1:80
-    let addr: SocketAddr = "1.1.1.1:80".parse().unwrap();
+    // Resolve the target to socket address
+    let addr: SocketAddr = match target.to_socket_addrs() {
+        Ok(mut addrs) => match addrs.next() {
+            Some(addr) => addr,
+            None => {
+                return serde_json::json!({
+                    "success": false,
+                    "error": "could not resolve target address",
+                    "target": target,
+                });
+            }
+        },
+        Err(e) => {
+            return serde_json::json!({
+                "success": false,
+                "error": format!("failed to resolve {}: {}", target, e),
+                "target": target,
+            });
+        }
+    };
+
+    // Extract host for HTTP Host header
+    let host = target.split(':').next().unwrap_or(target);
 
     let connect_result = match TcpStream::connect_timeout(&addr, Duration::from_secs(10)) {
         Ok(mut stream) => {
@@ -686,7 +829,7 @@ fn test_tcp_syscall() -> serde_json::Value {
             let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
 
             // Send a simple HTTP request
-            let request = "GET / HTTP/1.0\r\nHost: 1.1.1.1\r\n\r\n";
+            let request = format!("GET / HTTP/1.0\r\nHost: {}\r\n\r\n", host);
             match stream.write_all(request.as_bytes()) {
                 Ok(_) => {
                     // Try to read the response
@@ -887,8 +1030,12 @@ fn handle_pull(image: &str, platform: Option<&str>) -> AgentResponse {
     info!(image = %image, ?platform, "pulling image");
 
     match storage::pull_image(image, platform) {
-        Ok(info) => AgentResponse::Ok {
-            data: Some(serde_json::to_value(info).unwrap()),
+        Ok(info) => match serde_json::to_value(info) {
+            Ok(data) => AgentResponse::Ok { data: Some(data) },
+            Err(e) => AgentResponse::Error {
+                message: format!("failed to serialize image info: {}", e),
+                code: Some("SERIALIZATION_ERROR".to_string()),
+            },
         },
         Err(e) => AgentResponse::Error {
             message: e.to_string(),
@@ -900,8 +1047,12 @@ fn handle_pull(image: &str, platform: Option<&str>) -> AgentResponse {
 /// Handle image query request.
 fn handle_query(image: &str) -> AgentResponse {
     match storage::query_image(image) {
-        Ok(Some(info)) => AgentResponse::Ok {
-            data: Some(serde_json::to_value(info).unwrap()),
+        Ok(Some(info)) => match serde_json::to_value(info) {
+            Ok(data) => AgentResponse::Ok { data: Some(data) },
+            Err(e) => AgentResponse::Error {
+                message: format!("failed to serialize image info: {}", e),
+                code: Some("SERIALIZATION_ERROR".to_string()),
+            },
         },
         Ok(None) => AgentResponse::Error {
             message: format!("image not found: {}", image),
@@ -917,8 +1068,12 @@ fn handle_query(image: &str) -> AgentResponse {
 /// Handle list images request.
 fn handle_list_images() -> AgentResponse {
     match storage::list_images() {
-        Ok(images) => AgentResponse::Ok {
-            data: Some(serde_json::to_value(images).unwrap()),
+        Ok(images) => match serde_json::to_value(images) {
+            Ok(data) => AgentResponse::Ok { data: Some(data) },
+            Err(e) => AgentResponse::Error {
+                message: format!("failed to serialize image list: {}", e),
+                code: Some("SERIALIZATION_ERROR".to_string()),
+            },
         },
         Err(e) => AgentResponse::Error {
             message: e.to_string(),
@@ -948,8 +1103,12 @@ fn handle_prepare_overlay(image: &str, workload_id: &str) -> AgentResponse {
     info!(image = %image, workload_id = %workload_id, "preparing overlay");
 
     match storage::prepare_overlay(image, workload_id) {
-        Ok(info) => AgentResponse::Ok {
-            data: Some(serde_json::to_value(info).unwrap()),
+        Ok(info) => match serde_json::to_value(info) {
+            Ok(data) => AgentResponse::Ok { data: Some(data) },
+            Err(e) => AgentResponse::Error {
+                message: format!("failed to serialize overlay info: {}", e),
+                code: Some("SERIALIZATION_ERROR".to_string()),
+            },
         },
         Err(e) => AgentResponse::Error {
             message: e.to_string(),
@@ -987,8 +1146,12 @@ fn handle_format_storage() -> AgentResponse {
 /// Handle storage status request.
 fn handle_storage_status() -> AgentResponse {
     match storage::status() {
-        Ok(status) => AgentResponse::Ok {
-            data: Some(serde_json::to_value(status).unwrap()),
+        Ok(status) => match serde_json::to_value(status) {
+            Ok(data) => AgentResponse::Ok { data: Some(data) },
+            Err(e) => AgentResponse::Error {
+                message: format!("failed to serialize storage status: {}", e),
+                code: Some("SERIALIZATION_ERROR".to_string()),
+            },
         },
         Err(e) => AgentResponse::Error {
             message: e.to_string(),
@@ -1222,17 +1385,20 @@ fn handle_create_container(
                 };
             }
 
-            AgentResponse::Ok {
-                data: Some(
-                    serde_json::to_value(ContainerInfo {
-                        id: info.id,
-                        image: info.image,
-                        state: "running".to_string(),
-                        created_at: info.created_at,
-                        command: info.command,
-                    })
-                    .unwrap(),
-                ),
+            let container_info = ContainerInfo {
+                id: info.id,
+                image: info.image,
+                state: "running".to_string(),
+                created_at: info.created_at,
+                command: info.command,
+            };
+
+            match serde_json::to_value(container_info) {
+                Ok(data) => AgentResponse::Ok { data: Some(data) },
+                Err(e) => AgentResponse::Error {
+                    message: format!("failed to serialize container info: {}", e),
+                    code: Some("SERIALIZATION_ERROR".to_string()),
+                },
             }
         }
         Err(e) => AgentResponse::Error {
@@ -1291,8 +1457,12 @@ fn handle_list_containers() -> AgentResponse {
         })
         .collect();
 
-    AgentResponse::Ok {
-        data: Some(serde_json::to_value(infos).unwrap()),
+    match serde_json::to_value(infos) {
+        Ok(data) => AgentResponse::Ok { data: Some(data) },
+        Err(e) => AgentResponse::Error {
+            message: format!("failed to serialize container list: {}", e),
+            code: Some("SERIALIZATION_ERROR".to_string()),
+        },
     }
 }
 
@@ -1316,6 +1486,68 @@ fn handle_exec(
             code: Some("EXEC_FAILED".to_string()),
         },
     }
+}
+
+/// Handle interactive container exec with streaming I/O.
+fn handle_interactive_container_exec(
+    stream: &mut impl ReadWrite,
+    request: AgentRequest,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (container_id, command, env, workdir, timeout_ms, tty) = match request {
+        AgentRequest::Exec {
+            container_id,
+            command,
+            env,
+            workdir,
+            timeout_ms,
+            tty,
+            ..
+        } => (container_id, command, env, workdir, timeout_ms, tty),
+        _ => {
+            send_response(
+                stream,
+                &AgentResponse::Error {
+                    message: "expected Exec request".into(),
+                    code: Some("INVALID_REQUEST".into()),
+                },
+            )?;
+            return Ok(());
+        }
+    };
+
+    info!(container_id = %container_id, command = ?command, tty = tty, "starting interactive container exec");
+
+    // Spawn the interactive exec process
+    let mut child = match container::spawn_interactive_exec(
+        &container_id,
+        &command,
+        &env,
+        workdir.as_deref(),
+        tty,
+    ) {
+        Ok(child) => child,
+        Err(e) => {
+            send_response(
+                stream,
+                &AgentResponse::Error {
+                    message: e.to_string(),
+                    code: Some("EXEC_FAILED".into()),
+                },
+            )?;
+            return Ok(());
+        }
+    };
+
+    // Send Started response
+    send_response(stream, &AgentResponse::Started)?;
+
+    // Run the interactive I/O loop
+    let exit_code = run_interactive_loop(stream, &mut child, timeout_ms)?;
+
+    // Send Exited response
+    send_response(stream, &AgentResponse::Exited { exit_code })?;
+
+    Ok(())
 }
 
 /// Send a response to the client.
