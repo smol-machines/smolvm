@@ -136,12 +136,12 @@ impl ExecCmd {
         let manager = get_manager(&self.name)?;
         let label = microvm_label(&self.name);
 
-        // Check if microvm is running, start if needed
-        let was_running = manager.try_connect_existing().is_some();
-
-        if !was_running {
-            println!("Starting microvm '{}'...", label);
-            manager.ensure_running()?;
+        // Check if microvm is running - exec requires a running VM
+        if manager.try_connect_existing().is_none() {
+            return Err(smolvm::Error::AgentError(format!(
+                "microvm '{}' is not running. Use 'smolvm microvm start' first.",
+                label
+            )));
         }
 
         // Connect to agent
