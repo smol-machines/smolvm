@@ -423,6 +423,18 @@ impl AgentManager {
             }
             0 => {
                 // Child process - launch the VM
+                //
+                // Call setsid() to become a session leader. This detaches the VM process
+                // from the server's session, so the VM survives if the server is killed.
+                // Each VM becomes leader of its own independent session.
+                unsafe {
+                    libc::setsid();
+                }
+
+                // NOTE: Database file descriptors are handled by the caller closing
+                // the database before fork and reopening after. This avoids the
+                // fragile approach of closing fds in a range.
+
                 // All libkrun setup happens here in the child, same as the regular run path.
                 // This ensures DYLD_LIBRARY_PATH is still available (inherited from parent).
 

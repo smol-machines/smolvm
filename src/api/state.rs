@@ -264,6 +264,22 @@ impl ApiState {
     pub fn db(&self) -> &SmolvmDb {
         &self.db
     }
+
+    /// Temporarily close the database to release file locks before forking.
+    ///
+    /// This prevents child processes (VMs) from inheriting the database
+    /// file descriptor and holding the lock after the parent reopens it.
+    /// Call `reopen_db()` after the fork completes.
+    pub fn close_db_temporarily(&self) {
+        self.db.close_temporarily();
+    }
+
+    /// Reopen the database after a fork operation.
+    ///
+    /// Call this after forking to restore database access.
+    pub fn reopen_db(&self) -> crate::Result<()> {
+        self.db.reopen()
+    }
 }
 
 impl Default for ApiState {

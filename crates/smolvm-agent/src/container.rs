@@ -778,18 +778,47 @@ pub fn start_container(container_id: &str) -> Result<(), StorageError> {
             return Ok(());
         }
         ContainerState::Created => {
-            // Container is in created state, call crun start directly
-            let output = CrunCommand::start(&info.id)
+            // Container is in created state, call crun start with timeout handling
+            let mut child = CrunCommand::start(&info.id)
                 .stdin_null()
                 .stderr_piped()
-                .output()
-                .map_err(|e| StorageError::new(format!("failed to run crun start: {}", e)))?;
+                .spawn()
+                .map_err(|e| StorageError::new(format!("failed to spawn crun start: {}", e)))?;
 
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                warn!(container_id = %info.id, error = %stderr, "crun start failed, cleaning up");
-                let _ = CrunCommand::delete(&info.id, true).output();
-                return Err(StorageError::new(format!("crun start failed: {}", stderr)));
+            let result = wait_with_timeout(&mut child, Some(10_000), None)
+                .map_err(|e| StorageError::new(format!("failed to wait for crun start: {}", e)))?;
+
+            match result {
+                WaitResult::Completed { exit_code, output } => {
+                    if exit_code != 0 {
+                        warn!(
+                            container_id = %info.id,
+                            exit_code = exit_code,
+                            error = %output.stderr,
+                            "crun start failed, cleaning up"
+                        );
+                        let _ = CrunCommand::delete(&info.id, true).output();
+                        return Err(StorageError::new(format!(
+                            "crun start failed (exit {}): {}",
+                            exit_code,
+                            output.stderr
+                        )));
+                    }
+                }
+                WaitResult::TimedOut { output, timeout_ms } => {
+                    warn!(
+                        container_id = %info.id,
+                        timeout_ms = timeout_ms,
+                        error = %output.stderr,
+                        "crun start timed out, cleaning up"
+                    );
+                    let _ = CrunCommand::delete(&info.id, true).output();
+                    return Err(StorageError::new(format!(
+                        "crun start timed out after {}ms: {}",
+                        timeout_ms,
+                        output.stderr
+                    )));
+                }
             }
 
             REGISTRY.update_state(&info.id, ContainerState::Running);

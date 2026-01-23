@@ -155,16 +155,24 @@ pub async fn start_sandbox(
         )
     };
 
-    // Start the sandbox in a blocking task
+    // Close database before forking to prevent child from inheriting the fd lock
+    state.close_db_temporarily();
+
+    // Start the sandbox in a blocking task (this forks)
     let entry_clone = entry.clone();
-    tokio::task::spawn_blocking(move || {
+    let start_result = tokio::task::spawn_blocking(move || {
         let entry = entry_clone.lock();
         entry
             .manager
             .ensure_running_with_full_config(mounts, ports, resources)
     })
-    .await?
-    .map_err(|e| ApiError::Internal(e.to_string()))?;
+    .await?;
+
+    // Reopen database after fork completes
+    state.reopen_db().map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    // Now check the start result
+    start_result.map_err(|e| ApiError::Internal(e.to_string()))?;
 
     // Get updated state and persist
     let (agent_state, pid) = {
