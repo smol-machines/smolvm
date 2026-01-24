@@ -6,9 +6,176 @@
 //! Phase 0: Basic types and validation.
 //! Phase 1: Full virtiofs integration with the guest agent.
 
+use crate::api::types::{MountInfo, MountSpec};
 use crate::error::{Error, Result};
 use crate::vm::config::HostMount;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Canonical mount binding representation.
+///
+/// This is the internal representation used throughout the codebase.
+/// Use the conversion methods to transform to/from API and storage formats.
+///
+/// # Examples
+///
+/// ```ignore
+/// use smolvm::mount::MountBinding;
+///
+/// // Create from API spec (validates paths exist)
+/// let binding = MountBinding::new("/host/path", "/guest/path", true)?;
+///
+/// // Convert to database tuple
+/// let (source, target, ro) = binding.to_tuple();
+///
+/// // Convert to agent binding with virtiofs tag
+/// let (tag, target, ro) = binding.to_agent_binding(0);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountBinding {
+    /// Canonicalized host path.
+    pub source: PathBuf,
+    /// Target path in guest.
+    pub target: PathBuf,
+    /// Read-only mount.
+    pub read_only: bool,
+}
+
+impl MountBinding {
+    /// Create a new mount binding with full validation.
+    ///
+    /// Validates:
+    /// - Source path is absolute
+    /// - Target path is absolute
+    /// - Source exists and is a directory
+    /// - Source is canonicalized
+    pub fn new(
+        source: impl Into<PathBuf>,
+        target: impl Into<PathBuf>,
+        read_only: bool,
+    ) -> Result<Self> {
+        let source = source.into();
+        let target = target.into();
+
+        // Validate source is absolute
+        if !source.is_absolute() {
+            return Err(Error::Mount(format!(
+                "source must be absolute: {}",
+                source.display()
+            )));
+        }
+
+        // Validate target is absolute
+        if !target.is_absolute() {
+            return Err(Error::Mount(format!(
+                "target must be absolute: {}",
+                target.display()
+            )));
+        }
+
+        // Validate source exists
+        if !source.exists() {
+            return Err(Error::Mount(format!(
+                "source does not exist: {}",
+                source.display()
+            )));
+        }
+
+        // Validate source is a directory
+        if !source.is_dir() {
+            return Err(Error::Mount(format!(
+                "source must be a directory (virtiofs limitation): {}",
+                source.display()
+            )));
+        }
+
+        // Canonicalize source path
+        let source = source.canonicalize().map_err(|e| {
+            Error::Mount(format!(
+                "failed to canonicalize source '{}': {}",
+                source.display(),
+                e
+            ))
+        })?;
+
+        Ok(Self {
+            source,
+            target,
+            read_only,
+        })
+    }
+
+    /// Create without validation (for loading from database).
+    ///
+    /// Use this only when loading persisted mounts that were previously validated.
+    pub fn from_stored(source: String, target: String, read_only: bool) -> Self {
+        Self {
+            source: PathBuf::from(source),
+            target: PathBuf::from(target),
+            read_only,
+        }
+    }
+
+    /// Convert to database storage tuple format.
+    pub fn to_tuple(&self) -> (String, String, bool) {
+        (
+            self.source.to_string_lossy().to_string(),
+            self.target.to_string_lossy().to_string(),
+            self.read_only,
+        )
+    }
+
+    /// Convert to agent binding with virtiofs tag.
+    ///
+    /// Returns (virtiofs_tag, target_path, read_only).
+    pub fn to_agent_binding(&self, index: usize) -> (String, String, bool) {
+        (
+            format!("smolvm{}", index),
+            self.target.to_string_lossy().to_string(),
+            self.read_only,
+        )
+    }
+
+    /// Convert to MountInfo for API responses.
+    pub fn to_mount_info(&self, index: usize) -> MountInfo {
+        MountInfo {
+            tag: format!("smolvm{}", index),
+            source: self.source.to_string_lossy().to_string(),
+            target: self.target.to_string_lossy().to_string(),
+            readonly: self.read_only,
+        }
+    }
+}
+
+// Conversion from API MountSpec
+impl TryFrom<&MountSpec> for MountBinding {
+    type Error = Error;
+
+    fn try_from(spec: &MountSpec) -> Result<Self> {
+        MountBinding::new(&spec.source, &spec.target, spec.readonly)
+    }
+}
+
+// Conversion to API MountSpec
+impl From<&MountBinding> for MountSpec {
+    fn from(m: &MountBinding) -> Self {
+        MountSpec {
+            source: m.source.to_string_lossy().to_string(),
+            target: m.target.to_string_lossy().to_string(),
+            readonly: m.read_only,
+        }
+    }
+}
+
+// Conversion to HostMount (for AgentManager)
+impl From<&MountBinding> for HostMount {
+    fn from(m: &MountBinding) -> Self {
+        if m.read_only {
+            HostMount::new(&m.source, &m.target)
+        } else {
+            HostMount::new_writable(&m.source, &m.target)
+        }
+    }
+}
 
 /// Validate a host mount configuration.
 ///
