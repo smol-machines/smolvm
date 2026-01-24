@@ -5,7 +5,7 @@ use crate::api::error::ApiError;
 use crate::api::types::{MountInfo, MountSpec, PortSpec, ResourceSpec, RestartSpec, SandboxInfo};
 use crate::config::{RecordState, RestartConfig, RestartPolicy, VmRecord};
 use crate::db::SmolvmDb;
-use crate::mount::validate_mount;
+use crate::mount::MountBinding;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -33,6 +33,78 @@ pub struct SandboxEntry {
     pub resources: ResourceSpec,
     /// Restart configuration for this sandbox.
     pub restart: RestartConfig,
+}
+
+/// RAII guard for sandbox name reservation.
+///
+/// Automatically releases reservation on drop unless consumed by `complete()`.
+/// This ensures reservations are always cleaned up, even on panic.
+///
+/// # Example
+///
+/// ```ignore
+/// let guard = ReservationGuard::new(&state, "my-sandbox".to_string())?;
+///
+/// // Create the sandbox manager...
+/// let manager = AgentManager::for_vm(guard.name())?;
+///
+/// // Complete registration, consuming the guard
+/// guard.complete(manager, mounts, ports, resources, restart)?;
+/// ```
+pub struct ReservationGuard<'a> {
+    state: &'a ApiState,
+    name: String,
+    completed: bool,
+}
+
+impl<'a> ReservationGuard<'a> {
+    /// Reserve a sandbox name. Returns a guard that auto-releases on drop.
+    pub fn new(state: &'a ApiState, name: String) -> Result<Self, ApiError> {
+        state.reserve_sandbox_name(&name)?;
+        Ok(Self {
+            state,
+            name,
+            completed: false,
+        })
+    }
+
+    /// Get the reserved name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Complete registration, consuming the guard without releasing.
+    ///
+    /// This transfers ownership of the name to the sandbox registry.
+    pub fn complete(
+        mut self,
+        manager: AgentManager,
+        mounts: Vec<MountSpec>,
+        ports: Vec<PortSpec>,
+        resources: ResourceSpec,
+        restart: RestartConfig,
+    ) -> Result<(), ApiError> {
+        // Mark as completed before calling complete_sandbox_registration
+        // (which will remove from reservations internally)
+        self.completed = true;
+        self.state.complete_sandbox_registration(
+            self.name.clone(),
+            manager,
+            mounts,
+            ports,
+            resources,
+            restart,
+        )
+    }
+}
+
+impl Drop for ReservationGuard<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.state.release_sandbox_reservation(&self.name);
+            tracing::debug!(sandbox = %self.name, "reservation guard released on drop");
+        }
+    }
 }
 
 impl ApiState {
@@ -511,14 +583,22 @@ impl Default for ApiState {
 // ============================================================================
 
 /// Convert MountSpec to HostMount.
+///
+/// Validates and canonicalizes the mount paths.
 pub fn mount_spec_to_host_mount(spec: &MountSpec) -> crate::Result<HostMount> {
-    let mount = if spec.readonly {
-        HostMount::new(&spec.source, &spec.target)
-    } else {
-        HostMount::new_writable(&spec.source, &spec.target)
-    };
-    validate_mount(&mount)?;
-    Ok(mount)
+    // Use MountBinding for validation and canonicalization
+    let binding = MountBinding::try_from(spec)?;
+    Ok(HostMount::from(&binding))
+}
+
+/// Convert multiple MountSpecs to MountBindings.
+///
+/// Returns an error if any mount fails validation.
+pub fn mounts_to_bindings(specs: &[MountSpec]) -> Result<Vec<MountBinding>, ApiError> {
+    specs
+        .iter()
+        .map(|s| MountBinding::try_from(s).map_err(|e| ApiError::BadRequest(e.to_string())))
+        .collect()
 }
 
 /// Convert PortSpec to PortMapping.
@@ -544,11 +624,13 @@ pub fn vm_resources_to_spec(res: VmResources) -> ResourceSpec {
 
 /// Convert HostMount to MountSpec.
 pub fn host_mount_to_spec(mount: &HostMount) -> MountSpec {
-    MountSpec {
-        source: mount.source.to_string_lossy().to_string(),
-        target: mount.target.to_string_lossy().to_string(),
-        readonly: mount.read_only,
-    }
+    // Create a MountBinding without validation (already validated)
+    let binding = MountBinding::from_stored(
+        mount.source.to_string_lossy().to_string(),
+        mount.target.to_string_lossy().to_string(),
+        mount.read_only,
+    );
+    MountSpec::from(&binding)
 }
 
 /// Convert PortMapping to PortSpec.

@@ -10,7 +10,7 @@ use crate::agent::AgentManager;
 use crate::api::error::ApiError;
 use crate::api::state::{
     mount_spec_to_host_mount, port_spec_to_mapping, resource_spec_to_vm_resources,
-    restart_spec_to_config, ApiState,
+    restart_spec_to_config, ApiState, ReservationGuard,
 };
 use crate::api::types::{
     CreateSandboxRequest, ListSandboxesResponse, MountInfo, MountSpec, ResourceSpec, SandboxInfo,
@@ -130,37 +130,26 @@ pub async fn create_sandbox(
     // Parse restart configuration
     let restart_config = restart_spec_to_config(req.restart.as_ref());
 
-    // ATOMIC CREATE: Reserve the name first to prevent race conditions.
-    // This ensures no concurrent request can create a sandbox with the same name
-    // between our check and actual registration.
-    state.reserve_sandbox_name(&req.name)?;
+    // Reserve name with RAII guard - automatically released on any error or panic
+    let guard = ReservationGuard::new(&state, req.name.clone())?;
 
     // Create AgentManager in blocking task
-    let name = req.name.clone();
+    let name = guard.name().to_string();
     let manager_result = tokio::task::spawn_blocking(move || AgentManager::for_vm(&name)).await;
 
-    // Handle manager creation result
+    // Handle manager creation result - guard auto-releases on error return
     let manager = match manager_result {
         Ok(Ok(m)) => m,
-        Ok(Err(e)) => {
-            // Release reservation on failure
-            state.release_sandbox_reservation(&req.name);
-            return Err(ApiError::Internal(e.to_string()));
-        }
-        Err(e) => {
-            // Release reservation on task panic
-            state.release_sandbox_reservation(&req.name);
-            return Err(ApiError::Internal(e.to_string()));
-        }
+        Ok(Err(e)) => return Err(ApiError::Internal(e.to_string())),
+        Err(e) => return Err(ApiError::Internal(e.to_string())),
     };
 
-    // Get state for response
+    // Get state for response before completing registration
     let agent_state = format!("{:?}", manager.state()).to_lowercase();
     let pid = manager.child_pid();
 
-    // Complete registration (converts reservation to full entry)
-    state.complete_sandbox_registration(
-        req.name.clone(),
+    // Complete registration - consumes the guard
+    guard.complete(
         manager,
         req.mounts.clone(),
         req.ports.clone(),
