@@ -32,9 +32,6 @@ pub mod ports {
     pub const WORKLOAD_LOGS: u32 = 5001;
     /// Agent control port (for OCI operations and management).
     pub const AGENT_CONTROL: u32 = 6000;
-    /// Legacy alias for AGENT_CONTROL (deprecated, use AGENT_CONTROL).
-    #[deprecated(note = "use AGENT_CONTROL instead")]
-    pub const HELPER_CONTROL: u32 = AGENT_CONTROL;
 }
 
 /// vsock CID constants.
@@ -328,15 +325,6 @@ pub enum AgentResponse {
         exit_code: i32,
     },
 }
-
-// Legacy type aliases for backward compatibility
-/// Legacy alias for AgentRequest.
-#[deprecated(note = "use AgentRequest instead")]
-pub type HelperRequest = AgentRequest;
-
-/// Legacy alias for AgentResponse.
-#[deprecated(note = "use AgentResponse instead")]
-pub type HelperResponse = AgentResponse;
 
 /// Image information returned by Query/ListImages.
 #[derive(Debug, Clone, Serialize, Deserialize)]

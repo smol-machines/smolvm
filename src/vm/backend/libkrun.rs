@@ -16,8 +16,6 @@ use crate::vm::{VmBackend, VmHandle, VmId};
 
 // FFI bindings to libkrun
 // Linking is handled by build.rs
-// Note: Some functions are declared but not yet used - allow dead_code for FFI completeness
-#[allow(dead_code)]
 extern "C" {
     // Logging
     fn krun_set_log_level(level: u32) -> i32;
@@ -59,16 +57,7 @@ extern "C" {
         read_only: bool,
     ) -> i32;
 
-    // Disk-based root filesystem (boots from virtiofs then switches to block device)
-    fn krun_set_root_disk_remount(
-        ctx: u32,
-        device: *const libc::c_char,
-        fstype: *const libc::c_char,
-        options: *const libc::c_char,
-    ) -> i32;
-
     // vsock ports for host-guest communication
-    fn krun_add_vsock_port(ctx: u32, port: u32, filepath: *const libc::c_char) -> i32;
     fn krun_add_vsock_port2(
         ctx: u32,
         port: u32,
@@ -80,22 +69,13 @@ extern "C" {
     fn krun_set_console_output(ctx: u32, filepath: *const libc::c_char) -> i32;
 
     // Console setup - adds virtio console connected to given file descriptors
+    #[allow(dead_code)] // Reserved for future TTY support
     fn krun_add_virtio_console_default(
         ctx: u32,
         input_fd: libc::c_int,
         output_fd: libc::c_int,
         error_fd: libc::c_int,
     ) -> i32;
-
-    // Serial console - legacy serial device
-    fn krun_add_serial_console_default(
-        ctx: u32,
-        input_fd: libc::c_int,
-        output_fd: libc::c_int,
-    ) -> i32;
-
-    // Set kernel console parameter (e.g., "hvc0" for virtio console)
-    fn krun_set_kernel_console(ctx: u32, console: *const libc::c_char) -> i32;
 
     // Start VM (blocks until exit)
     fn krun_start_enter(ctx: u32) -> i32;
