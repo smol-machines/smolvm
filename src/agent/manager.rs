@@ -6,9 +6,10 @@
 use crate::error::{Error, Result};
 use crate::process::{self, ChildProcess};
 use crate::storage::StorageDisk;
+use parking_lot::Mutex;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::launcher::launch_agent_vm;
@@ -114,7 +115,7 @@ impl AgentManager {
     ) -> Result<Self> {
         // Create runtime directory for sockets
         let runtime_dir = dirs::runtime_dir()
-            .or_else(|| dirs::cache_dir())
+            .or_else(dirs::cache_dir)
             .unwrap_or_else(|| PathBuf::from("/tmp"));
 
         // Named VMs get their own subdirectory
@@ -148,7 +149,7 @@ impl AgentManager {
     /// Get the default (anonymous) agent manager.
     ///
     /// Uses default paths for rootfs and storage.
-    pub fn default() -> Result<Self> {
+    pub fn new_default() -> Result<Self> {
         let rootfs_path = Self::default_rootfs_path()?;
         let storage_disk = StorageDisk::open_or_create()?;
 
@@ -164,7 +165,7 @@ impl AgentManager {
 
         // Named VMs get their own storage disk
         let storage_dir = dirs::cache_dir()
-            .or_else(|| dirs::data_local_dir())
+            .or_else(dirs::data_local_dir)
             .unwrap_or_else(|| PathBuf::from("/tmp"))
             .join("smolvm")
             .join("vms")
@@ -194,7 +195,7 @@ impl AgentManager {
 
     /// Get the current state of the agent.
     pub fn state(&self) -> AgentState {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).state
+        self.inner.lock().state
     }
 
     /// Check if the agent is running.
@@ -233,7 +234,7 @@ impl AgentManager {
         if let Ok(mut client) = super::AgentClient::connect(&self.vsock_socket) {
             if client.ping().is_ok() {
                 // Update internal state to reflect running
-                let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                let mut inner = self.inner.lock();
                 inner.state = AgentState::Running;
                 // Set the child process if PID is known and process is alive
                 if let Some(p) = pid {
@@ -250,7 +251,7 @@ impl AgentManager {
 
     /// Get the child PID if known.
     pub fn child_pid(&self) -> Option<i32> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).child.as_ref().map(|c| c.pid())
+        self.inner.lock().child.as_ref().map(|c| c.pid())
     }
 
     /// Connect to the running agent and return a client.
@@ -260,24 +261,24 @@ impl AgentManager {
 
     /// Get the currently configured mounts.
     pub fn mounts(&self) -> Vec<HostMount> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).mounts.clone()
+        self.inner.lock().mounts.clone()
     }
 
     /// Check if the given mounts match the currently running agent's mounts.
     pub fn mounts_match(&self, mounts: &[HostMount]) -> bool {
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let inner = self.inner.lock();
         inner.mounts == mounts
     }
 
     /// Check if the given resources match the currently running agent's resources.
     pub fn resources_match(&self, resources: VmResources) -> bool {
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let inner = self.inner.lock();
         inner.resources == resources
     }
 
     /// Check if the given port mappings match the currently running agent's ports.
     pub fn ports_match(&self, ports: &[PortMapping]) -> bool {
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let inner = self.inner.lock();
         inner.ports == ports
     }
 
@@ -319,7 +320,7 @@ impl AgentManager {
 
         // If running with different config, we need to restart
         let needs_restart = {
-            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let inner = self.inner.lock();
             inner.state == AgentState::Running
                 && (inner.mounts != mounts || inner.ports != ports || inner.resources != resources)
         };
@@ -381,7 +382,7 @@ impl AgentManager {
     ) -> Result<()> {
         // Check and update state
         {
-            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let mut inner = self.inner.lock();
             if inner.state != AgentState::Stopped {
                 return Err(Error::AgentError(
                     "agent already starting or running".into(),
@@ -403,7 +404,7 @@ impl AgentManager {
 
         // Validate rootfs exists
         if !self.rootfs_path.exists() {
-            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let mut inner = self.inner.lock();
             inner.state = AgentState::Stopped;
             return Err(Error::AgentError(format!(
                 "agent rootfs not found: {}",
@@ -475,7 +476,7 @@ impl AgentManager {
         }) {
             Ok(pid) => pid,
             Err(e) => {
-                let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                let mut inner = self.inner.lock();
                 inner.state = AgentState::Stopped;
                 return Err(Error::AgentError(format!("fork failed: {}", e)));
             }
@@ -486,14 +487,14 @@ impl AgentManager {
 
         // Store child process
         {
-            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let mut inner = self.inner.lock();
             inner.child = Some(ChildProcess::new(child_pid));
         }
 
         // Wait for the agent to be ready
         match self.wait_for_ready() {
             Ok(_) => {
-                let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                let mut inner = self.inner.lock();
                 inner.state = AgentState::Running;
                 tracing::info!(pid = child_pid, "agent VM is ready");
                 Ok(())
@@ -501,7 +502,7 @@ impl AgentManager {
             Err(e) => {
                 // Kill child if startup failed
                 process::terminate(child_pid);
-                let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                let mut inner = self.inner.lock();
                 inner.state = AgentState::Stopped;
                 inner.child = None;
                 Err(e)
@@ -512,7 +513,7 @@ impl AgentManager {
     /// Stop the agent VM.
     pub fn stop(&self) -> Result<()> {
         let state = {
-            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let inner = self.inner.lock();
             inner.state
         };
 
@@ -521,7 +522,7 @@ impl AgentManager {
         }
 
         {
-            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let mut inner = self.inner.lock();
             inner.state = AgentState::Stopping;
         }
 
@@ -536,7 +537,7 @@ impl AgentManager {
 
         // Stop the child process using shared utilities
         let child_pid = {
-            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let inner = self.inner.lock();
             inner.child.as_ref().map(|c| c.pid())
         };
 
@@ -547,7 +548,7 @@ impl AgentManager {
 
         // Clean up
         {
-            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let mut inner = self.inner.lock();
             inner.state = AgentState::Stopped;
             inner.child = None;
         }
@@ -569,7 +570,7 @@ impl AgentManager {
         while start.elapsed() < timeout {
             // Check if child process is still alive
             {
-                let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                let mut inner = self.inner.lock();
                 if let Some(ref mut child) = inner.child {
                     if !child.is_running() {
                         // Child exited
@@ -633,7 +634,7 @@ impl AgentManager {
 
     /// Check if agent process is still running.
     pub fn check_alive(&self) -> bool {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = self.inner.lock();
 
         if let Some(ref mut child) = inner.child {
             child.is_running()
@@ -652,14 +653,14 @@ impl AgentManager {
     /// - Other resources (non-child-process) are still properly cleaned up
     /// - The manager can still be used after detaching
     pub fn detach(&self) {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = self.inner.lock();
         inner.detached = true;
         tracing::debug!("agent manager detached, VM will continue running");
     }
 
     /// Check if the agent manager has been detached.
     pub fn is_detached(&self) -> bool {
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let inner = self.inner.lock();
         inner.detached
     }
 }
@@ -667,12 +668,7 @@ impl AgentManager {
 impl Drop for AgentManager {
     fn drop(&mut self) {
         // Check if detached before attempting cleanup
-        let detached = {
-            self.inner
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .detached
-        };
+        let detached = self.inner.lock().detached;
 
         if !detached {
             // Best-effort cleanup

@@ -19,8 +19,9 @@ use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::RwLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
@@ -221,14 +222,14 @@ impl ContainerRegistry {
 
     /// Register a new container.
     pub fn register(&self, info: ContainerInfo) {
-        let mut containers = self.containers.write().unwrap_or_else(|e| e.into_inner());
+        let mut containers = self.containers.write();
         info!(container_id = %info.id, image = %info.image, "registered container");
         containers.insert(info.id.clone(), info);
     }
 
     /// Unregister a container.
     pub fn unregister(&self, id: &str) -> Option<ContainerInfo> {
-        let mut containers = self.containers.write().unwrap_or_else(|e| e.into_inner());
+        let mut containers = self.containers.write();
         let removed = containers.remove(id);
         if removed.is_some() {
             info!(container_id = %id, "unregistered container");
@@ -239,13 +240,13 @@ impl ContainerRegistry {
     /// Get a container by ID.
     #[allow(dead_code)] // Used in tests
     pub fn get(&self, id: &str) -> Option<ContainerInfo> {
-        let containers = self.containers.read().unwrap_or_else(|e| e.into_inner());
+        let containers = self.containers.read();
         containers.get(id).cloned()
     }
 
     /// Update container state.
     pub fn update_state(&self, id: &str, state: ContainerState) {
-        let mut containers = self.containers.write().unwrap_or_else(|e| e.into_inner());
+        let mut containers = self.containers.write();
         if let Some(info) = containers.get_mut(id) {
             info.state = state;
             debug!(container_id = %id, state = %state, "updated container state");
@@ -254,13 +255,13 @@ impl ContainerRegistry {
 
     /// List all containers.
     pub fn list(&self) -> Vec<ContainerInfo> {
-        let containers = self.containers.read().unwrap_or_else(|e| e.into_inner());
+        let containers = self.containers.read();
         containers.values().cloned().collect()
     }
 
     /// Find container by ID prefix (for short IDs).
     pub fn find_by_prefix(&self, prefix: &str) -> Option<ContainerInfo> {
-        let containers = self.containers.read().unwrap_or_else(|e| e.into_inner());
+        let containers = self.containers.read();
 
         // First try exact match
         if let Some(info) = containers.get(prefix) {
@@ -291,7 +292,7 @@ impl ContainerRegistry {
         // Acquire exclusive lock
         let _lock = RegistryLock::acquire()?;
 
-        let containers = self.containers.read().unwrap_or_else(|e| e.into_inner());
+        let containers = self.containers.read();
 
         // Ensure parent directory exists
         if let Some(parent) = Path::new(paths::REGISTRY_PATH).parent() {
@@ -360,7 +361,7 @@ impl ContainerRegistry {
 
         // Try to parse as new versioned format first
         if let Ok(state) = serde_json::from_str::<RegistryState>(&json) {
-            let mut containers = self.containers.write().unwrap_or_else(|e| e.into_inner());
+            let mut containers = self.containers.write();
             *containers = state.containers;
 
             // Check for stale state (different instance)
@@ -389,7 +390,7 @@ impl ContainerRegistry {
         // Fall back to old format (just HashMap) for migration
         match serde_json::from_str::<HashMap<String, ContainerInfo>>(&json) {
             Ok(loaded) => {
-                let mut containers = self.containers.write().unwrap_or_else(|e| e.into_inner());
+                let mut containers = self.containers.write();
                 *containers = loaded;
                 info!(
                     path = paths::REGISTRY_PATH,
@@ -441,7 +442,7 @@ impl ContainerRegistry {
     /// updating or removing entries that don't match reality.
     pub fn reconcile(&self) -> Result<(), StorageError> {
         let container_ids: Vec<String> = {
-            let containers = self.containers.read().unwrap_or_else(|e| e.into_inner());
+            let containers = self.containers.read();
             containers.keys().cloned().collect()
         };
 
@@ -484,7 +485,7 @@ impl ContainerRegistry {
 
         // Apply updates
         {
-            let mut containers = self.containers.write().unwrap_or_else(|e| e.into_inner());
+            let mut containers = self.containers.write();
             for (id, state) in to_update {
                 if let Some(info) = containers.get_mut(&id) {
                     info.state = state;
@@ -678,7 +679,7 @@ pub fn create_container(
     // when child processes inherit fds
     info!("about to call crun create");
     let mut child = Command::new(paths::CRUN_PATH)
-        .args(&crun_args)
+        .args(crun_args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())  // Don't capture - can cause blocking
         .stderr(Stdio::null())  // Don't capture - can cause blocking
