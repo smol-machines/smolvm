@@ -38,8 +38,38 @@ const IO_BUFFER_SIZE: usize = 4096;
 /// Default poll timeout in milliseconds for interactive I/O loop.
 const INTERACTIVE_POLL_TIMEOUT_MS: i32 = 100;
 
+/// Get system uptime in milliseconds (for timing relative to boot).
+fn uptime_ms() -> u64 {
+    if let Ok(contents) = std::fs::read_to_string("/proc/uptime") {
+        if let Some(uptime_str) = contents.split_whitespace().next() {
+            if let Ok(uptime_secs) = uptime_str.parse::<f64>() {
+                return (uptime_secs * 1000.0) as u64;
+            }
+        }
+    }
+    0
+}
+
 fn main() {
-    // Initialize logging
+    // CRITICAL: Mount essential filesystems FIRST, before anything else.
+    // When running as init (PID 1), we need these for the system to function.
+    // This must happen before logging (which needs /dev for output).
+    mount_essential_filesystems();
+
+    // CRITICAL: Create vsock listener IMMEDIATELY after mounts.
+    // This must happen before logging setup to minimize time to listener ready.
+    // The kernel boots in ~30ms and host connects immediately after.
+    let listener = match vsock::listen(ports::AGENT_CONTROL) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("failed to create vsock listener: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let start_uptime = uptime_ms();
+
+    // Initialize logging (after vsock listener is ready)
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -47,37 +77,193 @@ fn main() {
         )
         .init();
 
-    info!(version = env!("CARGO_PKG_VERSION"), "starting smolvm-agent");
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        uptime_ms = start_uptime,
+        "smolvm-agent started, vsock listener already ready"
+    );
 
-    // Initialize storage
+    // Mount storage disk (moved from init script for faster vsock availability)
+    let t0 = uptime_ms();
+    mount_storage_disk();
+    info!(duration_ms = uptime_ms() - t0, "storage disk mounted");
+
+    // Now do initialization - the vsock listener is already accepting at kernel level
+    let t0 = uptime_ms();
     if let Err(e) = storage::init() {
         error!(error = %e, "failed to initialize storage");
         std::process::exit(1);
     }
+    info!(duration_ms = uptime_ms() - t0, "storage initialized");
 
     // Load and reconcile container registry
+    let t0 = uptime_ms();
     if let Err(e) = container::REGISTRY.load() {
         warn!(error = %e, "failed to load container registry, starting fresh");
     }
     if let Err(e) = container::REGISTRY.reconcile() {
         warn!(error = %e, "failed to reconcile container registry");
     }
+    info!(duration_ms = uptime_ms() - t0, "registry reconciled");
 
-    // Start vsock server
-    if let Err(e) = run_server() {
+    info!(
+        total_startup_ms = uptime_ms() - start_uptime,
+        uptime_ms = uptime_ms(),
+        "agent startup complete, entering accept loop"
+    );
+
+    // Start accepting connections (listener already bound)
+    if let Err(e) = run_server_with_listener(listener) {
         error!(error = %e, "server error");
         std::process::exit(1);
     }
 }
 
-/// Run the vsock server.
-fn run_server() -> Result<(), Box<dyn std::error::Error>> {
-    let listener = vsock::listen(ports::AGENT_CONTROL)?;
-    info!(port = ports::AGENT_CONTROL, "listening on vsock");
+/// Mount essential filesystems (proc, sysfs, devtmpfs).
+/// This must be done first when running as init (PID 1).
+/// Uses direct syscalls to avoid any overhead.
+fn mount_essential_filesystems() {
+    use std::ffi::CString;
+
+    // Mount proc
+    let _ = std::fs::create_dir_all("/proc");
+    unsafe {
+        let source = CString::new("proc").unwrap();
+        let target = CString::new("/proc").unwrap();
+        let fstype = CString::new("proc").unwrap();
+        libc::mount(
+            source.as_ptr(),
+            target.as_ptr(),
+            fstype.as_ptr(),
+            0,
+            std::ptr::null(),
+        );
+    }
+
+    // Mount sysfs
+    let _ = std::fs::create_dir_all("/sys");
+    unsafe {
+        let source = CString::new("sysfs").unwrap();
+        let target = CString::new("/sys").unwrap();
+        let fstype = CString::new("sysfs").unwrap();
+        libc::mount(
+            source.as_ptr(),
+            target.as_ptr(),
+            fstype.as_ptr(),
+            0,
+            std::ptr::null(),
+        );
+    }
+
+    // Mount devtmpfs
+    let _ = std::fs::create_dir_all("/dev");
+    unsafe {
+        let source = CString::new("devtmpfs").unwrap();
+        let target = CString::new("/dev").unwrap();
+        let fstype = CString::new("devtmpfs").unwrap();
+        libc::mount(
+            source.as_ptr(),
+            target.as_ptr(),
+            fstype.as_ptr(),
+            0,
+            std::ptr::null(),
+        );
+    }
+
+    // Set up loopback interface (non-blocking, best effort)
+    unsafe {
+        let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+        if fd >= 0 {
+            // This would require more complex ioctl calls, skip for now
+            // The networking will be set up by TSI anyway
+            libc::close(fd);
+        }
+    }
+}
+
+/// Mount the storage disk at /storage.
+/// This is done by the agent (instead of init script) to allow vsock listener
+/// to be created first, reducing cold start latency.
+fn mount_storage_disk() {
+    use std::process::Command;
+
+    const STORAGE_DEVICE: &str = "/dev/vda";
+    const STORAGE_MOUNT: &str = "/storage";
+
+    // Create mount point if needed
+    let _ = std::fs::create_dir_all(STORAGE_MOUNT);
+
+    // Check if device exists
+    if !std::path::Path::new(STORAGE_DEVICE).exists() {
+        // Try to create device node
+        let _ = Command::new("mknod")
+            .args([STORAGE_DEVICE, "b", "253", "0"])
+            .status();
+    }
+
+    // Check if already mounted
+    if std::path::Path::new(STORAGE_MOUNT).join("layers").exists() {
+        debug!("storage already mounted");
+        return;
+    }
+
+    // Try to mount (disk should be pre-formatted by host)
+    let mount_result = Command::new("mount")
+        .args([STORAGE_DEVICE, STORAGE_MOUNT])
+        .status();
+
+    match mount_result {
+        Ok(status) if status.success() => {
+            debug!("storage disk mounted successfully");
+            // Create directory structure
+            let dirs = ["layers", "configs", "manifests", "overlays",
+                       "containers/run", "containers/logs", "containers/exit"];
+            for dir in dirs {
+                let _ = std::fs::create_dir_all(std::path::Path::new(STORAGE_MOUNT).join(dir));
+            }
+        }
+        _ => {
+            // Mount failed - try formatting first (first boot)
+            warn!("mount failed, attempting to format storage disk");
+            let _ = Command::new("mkfs.ext4")
+                .args(["-F", "-q", STORAGE_DEVICE])
+                .status();
+            let _ = Command::new("mount")
+                .args([STORAGE_DEVICE, STORAGE_MOUNT])
+                .status();
+            // Create directory structure
+            let dirs = ["layers", "configs", "manifests", "overlays",
+                       "containers/run", "containers/logs", "containers/exit"];
+            for dir in dirs {
+                let _ = std::fs::create_dir_all(std::path::Path::new(STORAGE_MOUNT).join(dir));
+            }
+        }
+    }
+}
+
+/// Run the vsock server with a pre-created listener.
+/// The listener is created early (before initialization) to ensure the kernel
+/// has a listener ready when the host connects.
+fn run_server_with_listener(listener: vsock::VsockListener) -> Result<(), Box<dyn std::error::Error>> {
+    let mut first_connection = true;
+    let listen_start = uptime_ms();
+
+    info!(
+        uptime_ms = uptime_ms(),
+        "entering vsock accept loop"
+    );
 
     loop {
         match listener.accept() {
             Ok(mut stream) => {
+                if first_connection {
+                    info!(
+                        wait_for_first_connection_ms = uptime_ms() - listen_start,
+                        uptime_ms = uptime_ms(),
+                        "first connection accepted"
+                    );
+                    first_connection = false;
+                }
                 info!("accepted connection");
 
                 if let Err(e) = handle_connection(&mut stream) {

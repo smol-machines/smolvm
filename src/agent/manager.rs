@@ -23,7 +23,12 @@ use super::{HostMount, PortMapping, VmResources};
 const AGENT_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Poll interval when waiting for agent readiness.
-const AGENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// Use aggressive polling initially to reduce cold start latency.
+const AGENT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Number of aggressive poll attempts before backing off.
+/// At 10ms intervals, this covers ~100ms of aggressive polling.
+const AGGRESSIVE_POLL_COUNT: u32 = 10;
 
 /// Timeout for agent to stop gracefully before force kill.
 const AGENT_STOP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -563,11 +568,22 @@ impl AgentManager {
     fn wait_for_ready(&self) -> Result<()> {
         let timeout = AGENT_READY_TIMEOUT;
         let start = Instant::now();
-        let poll_interval = AGENT_POLL_INTERVAL;
 
         tracing::debug!("waiting for agent to be ready");
 
+        // Track timing for each phase
+        let mut socket_appeared_at: Option<Duration> = None;
+        let mut first_connect_at: Option<Duration> = None;
+        let mut poll_count: u32 = 0;
+
         while start.elapsed() < timeout {
+            // Use aggressive polling at first, then back off
+            let poll_interval = if poll_count < AGGRESSIVE_POLL_COUNT {
+                AGENT_POLL_INTERVAL // 10ms
+            } else {
+                Duration::from_millis(100) // Back off to 100ms
+            };
+            poll_count += 1;
             // Check if child process is still alive
             {
                 let mut inner = self.inner.lock();
@@ -583,15 +599,39 @@ impl AgentManager {
 
             // Try to connect to vsock socket
             if self.vsock_socket.exists() {
+                // Log when socket first appears
+                if socket_appeared_at.is_none() {
+                    socket_appeared_at = Some(start.elapsed());
+                    tracing::debug!(
+                        elapsed_ms = socket_appeared_at.unwrap().as_millis(),
+                        "vsock socket appeared"
+                    );
+                }
+
                 match UnixStream::connect(&self.vsock_socket) {
                     Ok(stream) => {
                         drop(stream);
+
+                        // Log when first connect succeeds
+                        if first_connect_at.is_none() {
+                            first_connect_at = Some(start.elapsed());
+                            tracing::debug!(
+                                elapsed_ms = first_connect_at.unwrap().as_millis(),
+                                "vsock first connect succeeded"
+                            );
+                        }
 
                         // Try to ping
                         match super::AgentClient::connect(&self.vsock_socket) {
                             Ok(mut client) => {
                                 if client.ping().is_ok() {
-                                    tracing::debug!("agent ping successful");
+                                    let total = start.elapsed();
+                                    tracing::info!(
+                                        total_ms = total.as_millis(),
+                                        socket_wait_ms = socket_appeared_at.map(|d| d.as_millis()).unwrap_or(0),
+                                        connect_wait_ms = first_connect_at.map(|d| d.as_millis()).unwrap_or(0),
+                                        "agent ready - timing breakdown"
+                                    );
                                     return Ok(());
                                 }
                             }

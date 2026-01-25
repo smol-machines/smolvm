@@ -15,13 +15,13 @@ Cargo.lock
 # Build artifacts
 *.so
 *.a
-*.dylib
 
 # Distribution build output
 /dist/smolvm-*/
 /dist/*.tar.gz
 
-# Bundled libraries (large binaries - install via Homebrew)
+# Bundled libraries (large binaries - download or build locally)
+# These are bundled into release tarballs by build-dist.sh
 /lib/
 
 # Helper rootfs (downloaded/generated content)

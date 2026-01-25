@@ -66,8 +66,13 @@ pub fn launch_agent_vm(
     raise_fd_limits();
 
     unsafe {
-        // Set log level (0 = off, increase for debugging)
-        krun_set_log_level(0);
+        // Set log level (0 = off, 1 = error, 2 = warn, 3 = info, 4 = debug)
+        // Enable debug logging to trace vsock timing issues
+        let log_level = std::env::var("SMOLVM_KRUN_LOG_LEVEL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        krun_set_log_level(log_level);
 
         // Create VM context
         let ctx = krun_create_ctx();
