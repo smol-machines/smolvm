@@ -1,0 +1,2 @@
+lib/libkrun.dylib filter=lfs diff=lfs merge=lfs -text
+lib/libkrunfw.5.dylib filter=lfs diff=lfs merge=lfs -text
