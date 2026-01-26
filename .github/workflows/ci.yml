@@ -1,0 +1,239 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ==========================================================================
+  # Quick checks (no platform-specific deps needed)
+  # ==========================================================================
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  # ==========================================================================
+  # macOS Build & Test (Apple Silicon)
+  # ==========================================================================
+  macos:
+    name: macOS (arm64)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: macos-arm64-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: macos-arm64-cargo-
+
+      - name: Install libkrun via Homebrew
+        run: |
+          brew install libkrun libkrunfw
+
+      - name: Build
+        run: cargo build --release
+        env:
+          LIBRARY_PATH: /opt/homebrew/opt/libkrun/lib:/opt/homebrew/opt/libkrunfw/lib
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+        env:
+          LIBRARY_PATH: /opt/homebrew/opt/libkrun/lib:/opt/homebrew/opt/libkrunfw/lib
+
+      - name: Run unit tests
+        run: cargo test --lib
+        env:
+          LIBRARY_PATH: /opt/homebrew/opt/libkrun/lib:/opt/homebrew/opt/libkrunfw/lib
+          DYLD_LIBRARY_PATH: /opt/homebrew/opt/libkrun/lib:/opt/homebrew/opt/libkrunfw/lib
+
+      - name: Sign binary for integration tests
+        run: |
+          cat > /tmp/entitlements.plist << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>com.apple.security.hypervisor</key>
+              <true/>
+          </dict>
+          </plist>
+          EOF
+          codesign --sign - --entitlements /tmp/entitlements.plist --force target/release/smolvm
+
+      # Optional: Integration tests (requires VM to actually run)
+      # GitHub macOS runners support Hypervisor.framework
+      - name: Integration test - version
+        run: |
+          DYLD_LIBRARY_PATH=/opt/homebrew/opt/libkrun/lib:/opt/homebrew/opt/libkrunfw/lib \
+          ./target/release/smolvm --version
+
+  # ==========================================================================
+  # Linux Build & Test
+  # ==========================================================================
+  linux:
+    name: Linux (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: linux-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: linux-${{ matrix.arch }}-cargo-
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            libssl-dev \
+            pkg-config
+
+      # libkrun is not easily available on Ubuntu, so we create a stub library
+      # for linking. This allows us to compile and run unit tests.
+      # Full integration tests require macOS or a Linux machine with KVM.
+      - name: Create libkrun stub for linking
+        run: |
+          # Create minimal stub that satisfies the linker
+          cat > /tmp/libkrun_stub.c << 'EOF'
+          // Stub implementations - these won't be called in unit tests
+          int krun_create_ctx() { return -1; }
+          int krun_free_ctx(int ctx) { return 0; }
+          int krun_set_vm_config(int ctx, int cpus, int mem) { return -1; }
+          int krun_set_root(int ctx, const char* path) { return -1; }
+          int krun_set_exec(int ctx, const char* path, char** argv, char** env) { return -1; }
+          int krun_start_enter(int ctx) { return -1; }
+          int krun_set_log_level(int level) { return 0; }
+          int krun_add_disk2(int ctx, const char* id, const char* path, int flags, int ro) { return -1; }
+          int krun_set_port_map(int ctx, char** map) { return -1; }
+          int krun_add_vsock_port(int ctx, int port, const char* path) { return -1; }
+          int krun_set_passt_fd(int ctx, int fd) { return -1; }
+          int krun_add_virtiofs2(int ctx, const char* tag, const char* path, int flags) { return -1; }
+          int krun_set_console_output(int ctx, const char* path) { return -1; }
+          EOF
+          gcc -shared -fPIC -o /tmp/libkrun.so /tmp/libkrun_stub.c
+          sudo cp /tmp/libkrun.so /usr/local/lib/
+          sudo ln -sf /usr/local/lib/libkrun.so /usr/local/lib/libkrun.1.dylib
+          sudo ldconfig
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+        env:
+          LIBRARY_PATH: /usr/local/lib
+
+      - name: Clippy
+        run: cargo clippy --all-targets --target ${{ matrix.target }} -- -D warnings
+        env:
+          LIBRARY_PATH: /usr/local/lib
+
+      - name: Run unit tests
+        run: cargo test --lib --target ${{ matrix.target }}
+        env:
+          LIBRARY_PATH: /usr/local/lib
+          LD_LIBRARY_PATH: /usr/local/lib
+
+      # Note: Full VM tests require KVM + real libkrun.
+      # Use macOS job or self-hosted Linux runner for integration tests.
+
+  # ==========================================================================
+  # Build agent (Linux musl for static binary)
+  # ==========================================================================
+  agent:
+    name: Agent (Linux musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl, x86_64-unknown-linux-musl
+
+      - name: Install musl tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Install cross-compilation tools
+        run: |
+          # For aarch64 cross-compilation
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build agent (x86_64)
+        run: cargo build --release --target x86_64-unknown-linux-musl -p smolvm-agent
+        working-directory: .
+
+      - name: Build agent (aarch64)
+        run: |
+          export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
+          cargo build --release --target aarch64-unknown-linux-musl -p smolvm-agent
+        working-directory: .
+
+      - name: Verify static binaries
+        run: |
+          echo "x86_64 agent:"
+          file target/x86_64-unknown-linux-musl/release/smolvm-agent
+
+          echo "aarch64 agent:"
+          file target/aarch64-unknown-linux-musl/release/smolvm-agent
+
+  # ==========================================================================
+  # Summary job for branch protection
+  # ==========================================================================
+  ci-success:
+    name: CI Success
+    needs: [fmt, macos, linux, agent]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Check all jobs passed
+        run: |
+          if [[ "${{ needs.fmt.result }}" != "success" ]] || \
+             [[ "${{ needs.macos.result }}" != "success" ]] || \
+             [[ "${{ needs.linux.result }}" != "success" ]] || \
+             [[ "${{ needs.agent.result }}" != "success" ]]; then
+            echo "One or more jobs failed"
+            exit 1
+          fi
+          echo "All CI jobs passed!"
