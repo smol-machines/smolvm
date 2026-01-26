@@ -48,25 +48,31 @@ jobs:
           key: macos-arm64-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: macos-arm64-cargo-
 
-      - name: Install libkrun via Homebrew
+      - name: Setup Git LFS
         run: |
-          brew install libkrun libkrunfw
+          git lfs install
+          git lfs pull
+
+      - name: Verify LFS dylibs
+        run: |
+          ls -la lib/
+          file lib/*.dylib
 
       - name: Build
         run: cargo build --release
         env:
-          LIBRARY_PATH: /opt/homebrew/opt/libkrun/lib:/opt/homebrew/opt/libkrunfw/lib
+          LIBRARY_PATH: ${{ github.workspace }}/lib
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
         env:
-          LIBRARY_PATH: /opt/homebrew/opt/libkrun/lib:/opt/homebrew/opt/libkrunfw/lib
+          LIBRARY_PATH: ${{ github.workspace }}/lib
 
       - name: Run unit tests
         run: cargo test --lib
         env:
-          LIBRARY_PATH: /opt/homebrew/opt/libkrun/lib:/opt/homebrew/opt/libkrunfw/lib
-          DYLD_LIBRARY_PATH: /opt/homebrew/opt/libkrun/lib:/opt/homebrew/opt/libkrunfw/lib
+          LIBRARY_PATH: ${{ github.workspace }}/lib
+          DYLD_LIBRARY_PATH: ${{ github.workspace }}/lib
 
       - name: Sign binary for integration tests
         run: |
@@ -82,12 +88,10 @@ jobs:
           EOF
           codesign --sign - --entitlements /tmp/entitlements.plist --force target/release/smolvm
 
-      # Optional: Integration tests (requires VM to actually run)
-      # GitHub macOS runners support Hypervisor.framework
       - name: Integration test - version
-        run: |
-          DYLD_LIBRARY_PATH=/opt/homebrew/opt/libkrun/lib:/opt/homebrew/opt/libkrunfw/lib \
-          ./target/release/smolvm --version
+        run: ./target/release/smolvm --version
+        env:
+          DYLD_LIBRARY_PATH: ${{ github.workspace }}/lib
 
   # ==========================================================================
   # Linux Build & Test
