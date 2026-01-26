@@ -41,7 +41,7 @@ pub fn install_sigchld_handler() {
 
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = sigchld_handler as usize;
+        sa.sa_sigaction = sigchld_handler as *const () as usize;
         sa.sa_flags = libc::SA_RESTART | libc::SA_NOCLDSTOP;
         libc::sigemptyset(&mut sa.sa_mask);
 

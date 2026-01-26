@@ -36,7 +36,7 @@
 //! LIBKRUN_STATIC=/path/to/libkrun.a cargo build
 //! ```
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
@@ -86,7 +86,7 @@ fn link_libkrun() {
             println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path/../lib");
 
             // Change the library's install_name to use @rpath and re-sign
-            let lib_path = Path::new(&bundle_path).join("libkrun.dylib");
+            let lib_path = std::path::Path::new(&bundle_path).join("libkrun.dylib");
             if lib_path.exists() {
                 let _ = Command::new("install_name_tool")
                     .args(["-id", "@rpath/libkrun.dylib", lib_path.to_str().unwrap()])
