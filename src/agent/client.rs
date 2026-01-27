@@ -917,6 +917,16 @@ impl AgentClient {
         }
     }
 
+    /// Low-level send without waiting for response (public).
+    pub fn send_raw(&mut self, request: &AgentRequest) -> Result<()> {
+        self.send(request)
+    }
+
+    /// Low-level receive a single response (public).
+    pub fn recv_raw(&mut self) -> Result<AgentResponse> {
+        self.receive()
+    }
+
     /// Low-level send without waiting for response.
     fn send(&mut self, request: &AgentRequest) -> Result<()> {
         let json = serde_json::to_vec(request)

@@ -73,7 +73,7 @@ fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("smolvm_agent=debug".parse().unwrap()),
+                .add_directive("smolvm_agent=debug".parse().expect("valid directive")),
         )
         .init();
 
@@ -95,6 +95,16 @@ fn main() {
         std::process::exit(1);
     }
     info!(duration_ms = uptime_ms() - t0, "storage initialized");
+
+    // Initialize packed layers support (if SMOLVM_PACKED_LAYERS env var is set)
+    let t0 = uptime_ms();
+    if let Some(packed_dir) = storage::get_packed_layers_dir() {
+        info!(
+            duration_ms = uptime_ms() - t0,
+            packed_dir = %packed_dir.display(),
+            "packed layers initialized"
+        );
+    }
 
     // Load and reconcile container registry
     let t0 = uptime_ms();
@@ -122,19 +132,23 @@ fn main() {
 /// Mount essential filesystems (proc, sysfs, devtmpfs).
 /// This must be done first when running as init (PID 1).
 /// Uses direct syscalls to avoid any overhead.
+#[cfg(target_os = "linux")]
 fn mount_essential_filesystems() {
     use std::ffi::CString;
 
+    // Helper to create CString from static str (safe: no null bytes in literals)
+    fn cstr(s: &str) -> CString {
+        CString::new(s).expect("static string without null bytes")
+    }
+
     // Mount proc
     let _ = std::fs::create_dir_all("/proc");
+    // SAFETY: libc::mount with valid CString pointers for proc filesystem
     unsafe {
-        let source = CString::new("proc").unwrap();
-        let target = CString::new("/proc").unwrap();
-        let fstype = CString::new("proc").unwrap();
         libc::mount(
-            source.as_ptr(),
-            target.as_ptr(),
-            fstype.as_ptr(),
+            cstr("proc").as_ptr(),
+            cstr("/proc").as_ptr(),
+            cstr("proc").as_ptr(),
             0,
             std::ptr::null(),
         );
@@ -142,14 +156,12 @@ fn mount_essential_filesystems() {
 
     // Mount sysfs
     let _ = std::fs::create_dir_all("/sys");
+    // SAFETY: libc::mount with valid CString pointers for sysfs
     unsafe {
-        let source = CString::new("sysfs").unwrap();
-        let target = CString::new("/sys").unwrap();
-        let fstype = CString::new("sysfs").unwrap();
         libc::mount(
-            source.as_ptr(),
-            target.as_ptr(),
-            fstype.as_ptr(),
+            cstr("sysfs").as_ptr(),
+            cstr("/sys").as_ptr(),
+            cstr("sysfs").as_ptr(),
             0,
             std::ptr::null(),
         );
@@ -157,14 +169,12 @@ fn mount_essential_filesystems() {
 
     // Mount devtmpfs
     let _ = std::fs::create_dir_all("/dev");
+    // SAFETY: libc::mount with valid CString pointers for devtmpfs
     unsafe {
-        let source = CString::new("devtmpfs").unwrap();
-        let target = CString::new("/dev").unwrap();
-        let fstype = CString::new("devtmpfs").unwrap();
         libc::mount(
-            source.as_ptr(),
-            target.as_ptr(),
-            fstype.as_ptr(),
+            cstr("devtmpfs").as_ptr(),
+            cstr("/dev").as_ptr(),
+            cstr("devtmpfs").as_ptr(),
             0,
             std::ptr::null(),
         );
@@ -179,6 +189,12 @@ fn mount_essential_filesystems() {
             libc::close(fd);
         }
     }
+}
+
+/// Stub for non-Linux platforms (agent only runs on Linux inside VM).
+#[cfg(not(target_os = "linux"))]
+fn mount_essential_filesystems() {
+    // No-op on non-Linux platforms
 }
 
 /// Mount the storage disk at /storage.
@@ -587,6 +603,11 @@ fn handle_request(request: AgentRequest) -> AgentResponse {
                 code: Some("INTERNAL_ERROR".into()),
             }
         }
+
+        AgentRequest::ExportLayer {
+            image_digest,
+            layer_index,
+        } => handle_export_layer(&image_digest, layer_index),
     }
 }
 
@@ -1401,6 +1422,54 @@ fn handle_format_storage() -> AgentResponse {
             message: e.to_string(),
             code: Some("FORMAT_FAILED".to_string()),
         },
+    }
+}
+
+/// Handle export layer request.
+/// Returns the layer data as base64 encoded tar.
+fn handle_export_layer(image_digest: &str, layer_index: usize) -> AgentResponse {
+    info!(image_digest = %image_digest, layer_index = layer_index, "exporting layer");
+
+    // Export layer to tar file
+    let tar_path = match storage::export_layer(image_digest, layer_index) {
+        Ok(path) => path,
+        Err(e) => {
+            return AgentResponse::Error {
+                message: e.to_string(),
+                code: Some("EXPORT_FAILED".to_string()),
+            };
+        }
+    };
+
+    // Get layer digest for metadata (verifies the layer exists)
+    let _layer_digest = match storage::get_layer_digest(image_digest, layer_index) {
+        Ok(d) => d,
+        Err(e) => {
+            return AgentResponse::Error {
+                message: e.to_string(),
+                code: Some("EXPORT_FAILED".to_string()),
+            };
+        }
+    };
+
+    // Read the tar file
+    let tar_data = match std::fs::read(&tar_path) {
+        Ok(data) => data,
+        Err(e) => {
+            return AgentResponse::Error {
+                message: format!("failed to read tar file: {}", e),
+                code: Some("EXPORT_FAILED".to_string()),
+            };
+        }
+    };
+
+    // Clean up temp file
+    let _ = std::fs::remove_file(&tar_path);
+
+    // Return layer data
+    AgentResponse::LayerData {
+        data: tar_data,
+        done: true,
     }
 }
 

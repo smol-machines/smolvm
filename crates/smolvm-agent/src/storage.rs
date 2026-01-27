@@ -6,6 +6,7 @@
 //! - Layer extraction and deduplication
 //! - Overlay filesystem management
 //! - Container execution via crun OCI runtime
+//! - Support for pre-packed OCI layers (smolvm pack)
 
 use crate::crun::CrunCommand;
 use crate::oci::{generate_container_id, OciSpec};
@@ -14,6 +15,7 @@ use crate::process::{wait_with_timeout_and_cleanup, WaitResult, TIMEOUT_EXIT_COD
 use smolvm_protocol::{ImageInfo, OverlayInfo, StorageStatus};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use tracing::{debug, info, warn};
 
 /// Storage root path (where the ext4 disk is mounted).
@@ -24,6 +26,130 @@ const LAYERS_DIR: &str = "layers";
 const CONFIGS_DIR: &str = "configs";
 const MANIFESTS_DIR: &str = "manifests";
 const OVERLAYS_DIR: &str = "overlays";
+
+/// Global state for packed layers support.
+/// Set at startup if SMOLVM_PACKED_LAYERS env var is present.
+static PACKED_LAYERS_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+/// Initialize packed layers support by checking SMOLVM_PACKED_LAYERS env var.
+/// Format: "virtiofs_tag:mount_point" (e.g., "smolvm_layers:/packed_layers")
+/// Returns the mount point path if successfully mounted.
+pub fn init_packed_layers() -> Option<PathBuf> {
+    let env_val = match std::env::var("SMOLVM_PACKED_LAYERS") {
+        Ok(v) => v,
+        Err(_) => return None,
+    };
+
+    // Parse "tag:mount_point"
+    let parts: Vec<&str> = env_val.split(':').collect();
+    if parts.len() != 2 {
+        warn!(env_val = %env_val, "invalid SMOLVM_PACKED_LAYERS format, expected 'tag:mount_point'");
+        return None;
+    }
+
+    let tag = parts[0];
+    let mount_point = PathBuf::from(parts[1]);
+
+    info!(tag = %tag, mount_point = %mount_point.display(), "setting up packed layers from virtiofs");
+
+    // Create mount point
+    if let Err(e) = std::fs::create_dir_all(&mount_point) {
+        warn!(error = %e, mount_point = %mount_point.display(), "failed to create packed layers mount point");
+        return None;
+    }
+
+    // Mount virtiofs
+    let status = Command::new("mount")
+        .args(["-t", "virtiofs", tag])
+        .arg(&mount_point)
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {
+            info!(mount_point = %mount_point.display(), "packed layers mounted successfully");
+
+            // List contents for debugging
+            if let Ok(entries) = std::fs::read_dir(&mount_point) {
+                let layer_dirs: Vec<_> = entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.path().is_dir())
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .collect();
+                info!(layer_count = layer_dirs.len(), layers = ?layer_dirs, "packed layers available");
+            }
+
+            Some(mount_point)
+        }
+        Ok(s) => {
+            warn!(exit_code = ?s.code(), tag = %tag, "failed to mount packed layers virtiofs");
+            None
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to run mount command for packed layers");
+            None
+        }
+    }
+}
+
+/// Get the packed layers directory if available.
+pub fn get_packed_layers_dir() -> Option<&'static PathBuf> {
+    PACKED_LAYERS_DIR.get_or_init(|| init_packed_layers()).as_ref()
+}
+
+/// Create a synthetic ImageInfo from packed layers.
+/// This is used when running from a packed binary where layers are pre-extracted.
+fn create_packed_image_info(image: &str, packed_dir: &Path) -> Result<ImageInfo> {
+    // Find all layer directories in packed_dir
+    let mut layer_dirs: Vec<String> = Vec::new();
+
+    let entries = std::fs::read_dir(packed_dir)
+        .map_err(|e| StorageError(format!("failed to read packed layers directory: {}", e)))?;
+
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            // Skip .tar files, only use directories
+            if !name.ends_with(".tar") {
+                // Store as sha256:{short_digest} for consistency
+                layer_dirs.push(format!("sha256:{}", name));
+            }
+        }
+    }
+
+    // Sort for consistent ordering
+    layer_dirs.sort();
+
+    // Calculate approximate size
+    let mut total_size = 0u64;
+    for layer_digest in &layer_dirs {
+        let short_id = layer_digest.strip_prefix("sha256:").unwrap_or(layer_digest);
+        let layer_path = packed_dir.join(short_id);
+        if let Ok(size) = dir_size(&layer_path) {
+            total_size += size;
+        }
+    }
+
+    // Determine architecture from environment or default
+    #[cfg(target_arch = "aarch64")]
+    let architecture = "arm64".to_string();
+    #[cfg(target_arch = "x86_64")]
+    let architecture = "amd64".to_string();
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    let architecture = "unknown".to_string();
+
+    Ok(ImageInfo {
+        reference: image.to_string(),
+        digest: "packed".to_string(),  // No real digest available for packed images
+        size: total_size,
+        created: None,
+        architecture,
+        os: "linux".to_string(),
+        layer_count: layer_dirs.len(),
+        layers: layer_dirs,
+    })
+}
 
 /// Error type for storage operations.
 #[derive(Debug)]
@@ -224,6 +350,13 @@ pub fn status() -> Result<StorageStatus> {
 pub fn pull_image(image: &str, platform: Option<&str>) -> Result<ImageInfo> {
     // Validate image reference before any operations
     crate::oci::validate_image_reference(image).map_err(StorageError)?;
+
+    // If packed layers are available, return synthetic image info
+    // The layers are already present from the packed binary
+    if let Some(packed_dir) = get_packed_layers_dir() {
+        info!(image = %image, "using packed layers, skipping network pull");
+        return create_packed_image_info(image, packed_dir);
+    }
 
     // Check if already cached - skip network call entirely
     if let Ok(Some(info)) = query_image(image) {
@@ -466,6 +599,130 @@ pub fn list_images() -> Result<Vec<ImageInfo>> {
     Ok(images)
 }
 
+/// Export a layer as a tar archive to a file.
+///
+/// Used by `smolvm pack` to extract layers for packaging.
+/// Returns the path to the created tar file.
+pub fn export_layer(image_digest: &str, layer_index: usize) -> Result<PathBuf> {
+    let root = Path::new(STORAGE_ROOT);
+
+    // Find image by digest - need to scan manifests
+    let manifests_dir = root.join(MANIFESTS_DIR);
+    if !manifests_dir.exists() {
+        return Err(StorageError("no images found".into()));
+    }
+
+    // Find manifest with matching digest
+    let mut layers: Option<Vec<String>> = None;
+
+    for entry in std::fs::read_dir(&manifests_dir)? {
+        let entry = entry?;
+        let content = std::fs::read_to_string(entry.path())?;
+        if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(config) = manifest.get("config") {
+                if let Some(digest) = config.get("digest").and_then(|d| d.as_str()) {
+                    if digest == image_digest {
+                        layers = manifest["layers"]
+                            .as_array()
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|l| l["digest"].as_str().map(String::from))
+                                    .collect()
+                            });
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let layers = layers.ok_or_else(|| {
+        StorageError(format!("image with digest {} not found", image_digest))
+    })?;
+
+    if layer_index >= layers.len() {
+        return Err(StorageError(format!(
+            "layer index {} out of bounds (image has {} layers)",
+            layer_index,
+            layers.len()
+        )));
+    }
+
+    let layer_digest = &layers[layer_index];
+    let layer_id = layer_digest.strip_prefix("sha256:").unwrap_or(layer_digest);
+    let layer_dir = root.join(LAYERS_DIR).join(layer_id);
+
+    if !layer_dir.exists() {
+        return Err(StorageError(format!(
+            "layer directory not found: {}",
+            layer_dir.display()
+        )));
+    }
+
+    // Create tar archive in /tmp
+    let tar_path = PathBuf::from(format!("/tmp/layer-{}.tar", &layer_id[..12]));
+
+    info!(
+        layer_id = %layer_id,
+        layer_index = layer_index,
+        output = %tar_path.display(),
+        "exporting layer as tar"
+    );
+
+    // Use tar command to create archive
+    let status = Command::new("tar")
+        .args(["-cf"])
+        .arg(&tar_path)
+        .arg("-C")
+        .arg(&layer_dir)
+        .arg(".")
+        .status()?;
+
+    if !status.success() {
+        return Err(StorageError(format!(
+            "failed to create tar archive for layer {}",
+            layer_id
+        )));
+    }
+
+    Ok(tar_path)
+}
+
+/// Get the layer digest for an image at a specific index.
+pub fn get_layer_digest(image_digest: &str, layer_index: usize) -> Result<String> {
+    let root = Path::new(STORAGE_ROOT);
+    let manifests_dir = root.join(MANIFESTS_DIR);
+
+    if !manifests_dir.exists() {
+        return Err(StorageError("no images found".into()));
+    }
+
+    for entry in std::fs::read_dir(&manifests_dir)? {
+        let entry = entry?;
+        let content = std::fs::read_to_string(entry.path())?;
+        if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(config) = manifest.get("config") {
+                if let Some(digest) = config.get("digest").and_then(|d| d.as_str()) {
+                    if digest == image_digest {
+                        if let Some(layers) = manifest["layers"].as_array() {
+                            if layer_index < layers.len() {
+                                if let Some(layer_digest) = layers[layer_index]["digest"].as_str() {
+                                    return Ok(layer_digest.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Err(StorageError(format!(
+        "layer {} not found for image {}",
+        layer_index, image_digest
+    )))
+}
+
 /// Run garbage collection.
 pub fn garbage_collect(dry_run: bool) -> Result<u64> {
     let root = Path::new(STORAGE_ROOT);
@@ -518,6 +775,12 @@ pub fn garbage_collect(dry_run: bool) -> Result<u64> {
 
 /// Prepare an overlay filesystem for a workload.
 pub fn prepare_overlay(image: &str, workload_id: &str) -> Result<OverlayInfo> {
+    // Check if we have packed layers available
+    if let Some(packed_dir) = get_packed_layers_dir() {
+        info!(image = %image, packed_dir = %packed_dir.display(), "using packed layers");
+        return prepare_overlay_from_packed(image, workload_id, packed_dir);
+    }
+
     let root = Path::new(STORAGE_ROOT);
 
     // Ensure image exists
@@ -621,6 +884,171 @@ pub fn prepare_overlay(image: &str, workload_id: &str) -> Result<OverlayInfo> {
 
     // Create OCI bundle directory structure
     // crun will use this bundle to run containers
+    let bundle_path = overlay_root.join("bundle");
+    std::fs::create_dir_all(&bundle_path)?;
+
+    // Create symlink: bundle/rootfs -> ../merged
+    let rootfs_link = bundle_path.join("rootfs");
+    if !rootfs_link.exists() {
+        std::os::unix::fs::symlink("../merged", &rootfs_link)
+            .map_err(|e| StorageError(format!("failed to create rootfs symlink: {}", e)))?;
+    }
+
+    debug!(bundle = %bundle_path.display(), "OCI bundle directory created");
+
+    Ok(OverlayInfo {
+        rootfs_path: merged_path.display().to_string(),
+        upper_path: upper_path.display().to_string(),
+        work_path: work_path.display().to_string(),
+    })
+}
+
+/// Prepare an overlay filesystem using pre-packed layers.
+///
+/// Packed layers are stored as directories named by short digest (first 12 chars)
+/// in the packed_dir. This function builds the overlay using these layers.
+fn prepare_overlay_from_packed(
+    image: &str,
+    workload_id: &str,
+    packed_dir: &Path,
+) -> Result<OverlayInfo> {
+    let root = Path::new(STORAGE_ROOT);
+
+    // Create overlay directories
+    let overlay_root = root.join(OVERLAYS_DIR).join(workload_id);
+    let upper_path = overlay_root.join("upper");
+    let work_path = overlay_root.join("work");
+    let merged_path = overlay_root.join("merged");
+
+    std::fs::create_dir_all(&upper_path)?;
+    std::fs::create_dir_all(&work_path)?;
+    std::fs::create_dir_all(&merged_path)?;
+
+    // Set up DNS resolution BEFORE mounting (TSI intercepts writes to mounted overlays)
+    let upper_etc = upper_path.join("etc");
+    std::fs::create_dir_all(&upper_etc)?;
+    let resolv_path = upper_etc.join("resolv.conf");
+    if let Err(e) = std::fs::write(&resolv_path, "nameserver 8.8.8.8\nnameserver 1.1.1.1\n") {
+        warn!(error = %e, "failed to write resolv.conf to upper layer");
+    }
+
+    // Create /dev directory in upper layer
+    let upper_dev = upper_path.join("dev");
+    std::fs::create_dir_all(&upper_dev)?;
+
+    // Find layer directories in packed_dir
+    // Packed layers are named by short digest (first 12 chars of sha256)
+    // We need to find all layer directories and build the overlay
+    let mut layer_dirs: Vec<PathBuf> = Vec::new();
+
+    // Read all directories in packed_dir
+    let entries = std::fs::read_dir(packed_dir)
+        .map_err(|e| StorageError(format!("failed to read packed layers directory: {}", e)))?;
+
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            // Skip .tar files, only use directories
+            if !name.ends_with(".tar") {
+                layer_dirs.push(path);
+            }
+        }
+    }
+
+    if layer_dirs.is_empty() {
+        return Err(StorageError(format!(
+            "no layer directories found in {}",
+            packed_dir.display()
+        )));
+    }
+
+    info!(
+        image = %image,
+        layer_count = layer_dirs.len(),
+        layers = ?layer_dirs.iter().map(|p| p.file_name().unwrap_or_default().to_string_lossy().to_string()).collect::<Vec<_>>(),
+        "found packed layers"
+    );
+
+    // Sort layer directories by name for consistent ordering
+    // The stub creates layers in order, so alphabetical sort should work
+    layer_dirs.sort();
+
+    // Build lowerdir from layers (reversed for overlay order - top layer first)
+    let lowerdirs: Vec<String> = layer_dirs
+        .iter()
+        .rev()
+        .map(|path| path.display().to_string())
+        .collect();
+
+    let lowerdir = lowerdirs.join(":");
+
+    // Verify layer paths exist and have contents
+    for layer_path in &lowerdirs {
+        let path = Path::new(layer_path);
+        if !path.exists() {
+            return Err(StorageError(format!(
+                "packed layer path does not exist: {}",
+                layer_path
+            )));
+        }
+        // Check if layer has contents
+        let entry_count = std::fs::read_dir(path)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        if entry_count == 0 {
+            warn!(layer = %layer_path, "packed layer directory is empty");
+        } else {
+            debug!(layer = %layer_path, entry_count = entry_count, "packed layer verified");
+        }
+    }
+
+    // Mount overlay
+    let mount_opts = format!(
+        "lowerdir={},upperdir={},workdir={}",
+        lowerdir,
+        upper_path.display(),
+        work_path.display()
+    );
+
+    debug!(mount_opts = %mount_opts, merged_path = %merged_path.display(), "mounting overlay from packed layers");
+
+    let output = Command::new("mount")
+        .args(["-t", "overlay", "overlay", "-o", &mount_opts])
+        .arg(&merged_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(StorageError(format!(
+            "failed to mount overlay from packed layers: {}",
+            stderr
+        )));
+    }
+
+    // Verify mount succeeded
+    let merged_entry_count = std::fs::read_dir(&merged_path)
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+
+    if merged_entry_count == 0 {
+        warn!(
+            workload_id = %workload_id,
+            merged_path = %merged_path.display(),
+            "overlay mount returned success but merged directory is empty"
+        );
+    }
+
+    info!(
+        workload_id = %workload_id,
+        entry_count = merged_entry_count,
+        "overlay mounted from packed layers"
+    );
+
+    // Create OCI bundle directory structure
     let bundle_path = overlay_root.join("bundle");
     std::fs::create_dir_all(&bundle_path)?;
 

@@ -21,8 +21,8 @@ use serde::{Deserialize, Serialize};
 /// Protocol version.
 pub const PROTOCOL_VERSION: u32 = 1;
 
-/// Maximum frame size (16 MB).
-pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
+/// Maximum frame size (256 MB - increased to support large OCI layers for pack).
+pub const MAX_FRAME_SIZE: u32 = 256 * 1024 * 1024;
 
 /// Well-known vsock ports.
 pub mod ports {
@@ -107,6 +107,17 @@ pub enum AgentRequest {
 
     /// Shutdown the agent.
     Shutdown,
+
+    /// Export a layer as a tar archive.
+    ///
+    /// Used by `smolvm pack` to extract OCI layers for packaging.
+    /// The agent streams the layer tar data back via LayerData responses.
+    ExportLayer {
+        /// Image digest (sha256:...).
+        image_digest: String,
+        /// Layer index (0-based).
+        layer_index: usize,
+    },
 
     /// Execute a command directly in the VM (not in a container).
     ///
@@ -323,6 +334,14 @@ pub enum AgentResponse {
     Exited {
         /// Exit code from the command.
         exit_code: i32,
+    },
+
+    /// Layer data chunk (for ExportLayer).
+    LayerData {
+        /// Binary data chunk.
+        data: Vec<u8>,
+        /// Whether this is the last chunk.
+        done: bool,
     },
 }
 

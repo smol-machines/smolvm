@@ -35,7 +35,7 @@ pub trait VmExecutor: Send + Sync {
     /// Tuple of (exec_path, argv_pointers, cstrings_to_keep_alive).
     /// The cstrings must be kept alive for the duration of the argv usage.
     ///
-    /// Note: libkrun expects argv to contain only arguments (not argv[0]),
+    /// Note: libkrun expects argv to contain only arguments (not `argv[0]`),
     /// as it passes exec_path via KRUN_INIT environment variable.
     fn build_exec_command(
         &self,

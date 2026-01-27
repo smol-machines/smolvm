@@ -1,0 +1,15 @@
+[package]
+name = "smolvm-pack"
+version = "0.1.0"
+edition = "2021"
+description = "Single-binary packaging for smolvm"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tar = "0.4"
+zstd = "0.13"
+crc32fast = "1.4"
+tempfile = "3"

@@ -41,6 +41,9 @@ enum Commands {
 
     /// Start the HTTP API server for programmatic control
     Serve(cli::serve::ServeCmd),
+
+    /// Package an OCI image into a self-contained executable
+    Pack(cli::pack::PackCmd),
 }
 
 fn main() {
@@ -57,6 +60,7 @@ fn main() {
         Commands::Microvm(cmd) => cmd.run(),
         Commands::Container(cmd) => cmd.run(),
         Commands::Serve(cmd) => cmd.run(),
+        Commands::Pack(cmd) => cmd.run(),
     };
 
     // Handle errors

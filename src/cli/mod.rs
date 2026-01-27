@@ -2,6 +2,7 @@
 
 pub mod container;
 pub mod microvm;
+pub mod pack;
 pub mod parsers;
 pub mod sandbox;
 pub mod serve;

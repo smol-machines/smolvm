@@ -9,6 +9,8 @@
 #   ./tests/run_all.sh microvm      # Run only microvm tests
 #   ./tests/run_all.sh container    # Run only container tests
 #   ./tests/run_all.sh api          # Run only HTTP API tests
+#   ./tests/run_all.sh pack         # Run only pack tests
+#   ./tests/run_all.sh pack-quick   # Run pack tests (quick mode, skips large images)
 #
 # Environment:
 #   SMOLVM=/path/to/smolvm   # Use specific binary
@@ -75,16 +77,23 @@ case "$TESTS_TO_RUN" in
     api)
         run_suite "HTTP API Tests" "$SCRIPT_DIR/test_api.sh"
         ;;
+    pack)
+        run_suite "Pack Tests" "$SCRIPT_DIR/test_pack.sh"
+        ;;
+    pack-quick)
+        run_suite "Pack Tests (Quick)" "$SCRIPT_DIR/test_pack.sh --quick"
+        ;;
     all)
         run_suite "CLI Tests" "$SCRIPT_DIR/test_cli.sh"
         run_suite "Sandbox Tests" "$SCRIPT_DIR/test_sandbox.sh"
         run_suite "MicroVM Tests" "$SCRIPT_DIR/test_microvm.sh"
         run_suite "Container Tests" "$SCRIPT_DIR/test_container.sh"
         run_suite "HTTP API Tests" "$SCRIPT_DIR/test_api.sh"
+        run_suite "Pack Tests" "$SCRIPT_DIR/test_pack.sh"
         ;;
     *)
         echo "Unknown test suite: $TESTS_TO_RUN"
-        echo "Available: cli, sandbox, microvm, container, api, all"
+        echo "Available: cli, sandbox, microvm, container, api, pack, pack-quick, all"
         exit 1
         ;;
 esac
