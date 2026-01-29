@@ -564,9 +564,14 @@ impl PruneCmd {
             let total_size: u64 = images.iter().map(|i| i.size).sum();
 
             if self.dry_run {
-                println!("Would remove {} images ({})", images.len(), format_bytes(total_size));
+                println!(
+                    "Would remove {} images ({})",
+                    images.len(),
+                    format_bytes(total_size)
+                );
                 for image in &images {
-                    println!("  - {} ({}, {} layers)",
+                    println!(
+                        "  - {} ({}, {} layers)",
                         image.reference,
                         format_bytes(image.size),
                         image.layer_count
@@ -582,7 +587,9 @@ impl PruneCmd {
 
                 println!("Freed {} of unreferenced layers", format_bytes(freed));
                 println!();
-                println!("Note: To remove all images, stop the sandbox and delete the storage disk:");
+                println!(
+                    "Note: To remove all images, stop the sandbox and delete the storage disk:"
+                );
                 println!("  smolvm sandbox stop");
                 println!("  rm ~/.smolvm/vms/default/storage.raw");
             }
@@ -593,7 +600,10 @@ impl PruneCmd {
                 let would_free = client.garbage_collect(true)?;
 
                 if would_free > 0 {
-                    println!("Would free {} of unreferenced layers", format_bytes(would_free));
+                    println!(
+                        "Would free {} of unreferenced layers",
+                        format_bytes(would_free)
+                    );
                 } else {
                     println!("No unreferenced layers to remove.");
                 }

@@ -853,12 +853,8 @@ pub fn prepare_overlay(image: &str, workload_id: &str) -> Result<OverlayInfo> {
 
     // Try multi-lowerdir mount first (efficient)
     // If it fails, fall back to sequential overlay construction (more compatible)
-    let mount_result = try_mount_overlay_multi_lower(
-        &lowerdirs,
-        &upper_path,
-        &work_path,
-        &merged_path,
-    );
+    let mount_result =
+        try_mount_overlay_multi_lower(&lowerdirs, &upper_path, &work_path, &merged_path);
 
     if let Err(multi_err) = mount_result {
         if lowerdirs.len() > 1 {
@@ -1034,12 +1030,8 @@ fn prepare_overlay_from_packed(
 
     // Try multi-lowerdir mount first (efficient)
     // If it fails, fall back to sequential overlay construction (more compatible)
-    let mount_result = try_mount_overlay_multi_lower(
-        &lowerdirs,
-        &upper_path,
-        &work_path,
-        &merged_path,
-    );
+    let mount_result =
+        try_mount_overlay_multi_lower(&lowerdirs, &upper_path, &work_path, &merged_path);
 
     if let Err(multi_err) = mount_result {
         if lowerdirs.len() > 1 {
@@ -1454,10 +1446,7 @@ fn mount_overlay_sequential(
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(StorageError(format!(
-                "overlay mount failed: {}",
-                stderr
-            )));
+            return Err(StorageError(format!("overlay mount failed: {}", stderr)));
         }
         return Ok(());
     }
@@ -1489,8 +1478,10 @@ fn mount_overlay_sequential(
             .arg("-c")
             .arg(format!(
                 "cp -a '{}'/. '{}/' 2>/dev/null || cp -a '{}/'* '{}/' 2>/dev/null || true",
-                layer_path, merged_layers_dir.display(),
-                layer_path, merged_layers_dir.display()
+                layer_path,
+                merged_layers_dir.display(),
+                layer_path,
+                merged_layers_dir.display()
             ))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
