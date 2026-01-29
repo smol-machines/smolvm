@@ -15,7 +15,13 @@ static SIGCHLD_HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
 pub const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default timeout for SIGKILL to take effect.
-pub const SIGKILL_WAIT: Duration = Duration::from_millis(500);
+pub const SIGKILL_WAIT: Duration = Duration::from_millis(50);
+
+/// Aggressive poll interval for fast process shutdown.
+const FAST_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Number of aggressive polls before backing off.
+const FAST_POLL_COUNT: u32 = 10;
 
 /// Exit code returned when the actual exit status cannot be determined.
 /// This happens when a process is confirmed dead but waitpid() fails to
@@ -189,6 +195,69 @@ pub fn stop_process(pid: libc::pid_t, timeout: Duration, force: bool) -> Result<
 
         // Reap the process
         Ok(wait(pid))
+    } else {
+        Err(Error::vm_creation(format!(
+            "timeout waiting for process {} to stop",
+            pid
+        )))
+    }
+}
+
+/// Optimized process stop with aggressive polling for fast response.
+///
+/// This version uses a two-phase polling strategy:
+/// 1. Aggressive polling (10ms intervals) for the first 100ms
+/// 2. Backs off to 100ms intervals for the remainder
+///
+/// This minimizes latency for processes that exit quickly while
+/// still being efficient for slower shutdowns.
+pub fn stop_process_fast(pid: libc::pid_t, timeout: Duration, force: bool) -> Result<i32> {
+    // Check if already dead
+    if !is_alive(pid) {
+        if let Some(code) = try_wait(pid) {
+            return Ok(code);
+        }
+        return Ok(0);
+    }
+
+    // Send SIGTERM
+    if !terminate(pid) {
+        return Ok(try_wait(pid).unwrap_or(UNKNOWN_EXIT_CODE));
+    }
+
+    // Two-phase polling: aggressive first, then back off
+    let start = Instant::now();
+    let mut poll_count: u32 = 0;
+
+    while start.elapsed() < timeout {
+        // Check immediately, then poll
+        if let Some(code) = try_wait(pid) {
+            return Ok(code);
+        }
+
+        if !is_alive(pid) {
+            return Ok(try_wait(pid).unwrap_or(UNKNOWN_EXIT_CODE));
+        }
+
+        // Aggressive polling for first ~100ms, then back off
+        let poll_interval = if poll_count < FAST_POLL_COUNT {
+            FAST_POLL_INTERVAL // 10ms
+        } else {
+            Duration::from_millis(100)
+        };
+        poll_count += 1;
+
+        std::thread::sleep(poll_interval);
+    }
+
+    // Timeout reached
+    if force {
+        tracing::debug!(pid = pid, "SIGTERM timeout, sending SIGKILL");
+        kill(pid);
+
+        // Brief wait then poll for exit
+        std::thread::sleep(SIGKILL_WAIT);
+        Ok(try_wait(pid).unwrap_or_else(|| wait(pid)))
     } else {
         Err(Error::vm_creation(format!(
             "timeout waiting for process {} to stop",

@@ -31,10 +31,8 @@ const AGENT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const AGGRESSIVE_POLL_COUNT: u32 = 10;
 
 /// Timeout for agent to stop gracefully before force kill.
-const AGENT_STOP_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Grace period after sending shutdown command before checking process.
-const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_millis(500);
+/// Reduced from 5s - VMs typically exit within 100ms after shutdown signal.
+const AGENT_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Timeout when waiting for agent to stop.
 const WAIT_FOR_STOP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -543,22 +541,20 @@ impl AgentManager {
 
         tracing::info!("stopping agent VM");
 
-        // Try graceful shutdown via vsock first
-        if let Ok(mut client) = super::AgentClient::connect(&self.vsock_socket) {
-            let _ = client.shutdown();
-            // Give it a moment to shut down
-            std::thread::sleep(SHUTDOWN_GRACE_PERIOD);
-        }
-
-        // Stop the child process using shared utilities
+        // Get the child PID first so we can check if it exits quickly
         let child_pid = {
             let inner = self.inner.lock();
             inner.child.as_ref().map(|c| c.pid())
         };
 
+        // Try graceful shutdown via vsock (fire-and-forget, don't wait for response)
+        if let Ok(mut client) = super::AgentClient::connect(&self.vsock_socket) {
+            let _ = client.shutdown();
+        }
+
         if let Some(pid) = child_pid {
-            // Use shared process utilities for stop with timeout + force kill
-            let _ = process::stop_process(pid, AGENT_STOP_TIMEOUT, true);
+            // Use optimized stop with aggressive polling for fast response
+            let _ = process::stop_process_fast(pid, AGENT_STOP_TIMEOUT, true);
         }
 
         // Clean up

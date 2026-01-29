@@ -336,14 +336,16 @@ impl AgentClient {
     }
 
     /// Request agent shutdown.
+    ///
+    /// This is a fire-and-forget operation - we send the shutdown command
+    /// but don't wait for a response since the agent may exit immediately.
     pub fn shutdown(&mut self) -> Result<()> {
-        let resp = self.request(&AgentRequest::Shutdown)?;
-
-        match resp {
-            AgentResponse::Ok { .. } => Ok(()),
-            AgentResponse::Error { message, .. } => Err(Error::AgentError(message)),
-            _ => Err(Error::AgentError("unexpected response".into())),
-        }
+        // Just send the shutdown request, don't wait for response
+        // The agent may exit immediately, causing the socket to close
+        let data = encode_message(&AgentRequest::Shutdown)
+            .map_err(|e| Error::AgentError(e.to_string()))?;
+        let _ = self.stream.write_all(&data);
+        Ok(())
     }
 
     // ========================================================================
