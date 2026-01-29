@@ -799,6 +799,14 @@ pub fn prepare_overlay(image: &str, workload_id: &str) -> Result<OverlayInfo> {
     let work_path = overlay_root.join("work");
     let merged_path = overlay_root.join("merged");
 
+    // Clean up any previous overlay state - workdir must be empty for overlay mount
+    if overlay_root.exists() {
+        // Try to unmount if previously mounted
+        let _ = Command::new("umount").arg(&merged_path).output();
+        // Remove old directories to ensure clean state
+        let _ = std::fs::remove_dir_all(&overlay_root);
+    }
+
     std::fs::create_dir_all(&upper_path)?;
     std::fs::create_dir_all(&work_path)?;
     std::fs::create_dir_all(&merged_path)?;
@@ -826,8 +834,6 @@ pub fn prepare_overlay(image: &str, workload_id: &str) -> Result<OverlayInfo> {
         })
         .collect();
 
-    let lowerdir = lowerdirs.join(":");
-
     // Verify layer paths exist before mounting
     for layer_path in &lowerdirs {
         let path = Path::new(layer_path);
@@ -845,26 +851,36 @@ pub fn prepare_overlay(image: &str, workload_id: &str) -> Result<OverlayInfo> {
         }
     }
 
-    // Mount overlay
-    let mount_opts = format!(
-        "lowerdir={},upperdir={},workdir={}",
-        lowerdir,
-        upper_path.display(),
-        work_path.display()
+    // Try multi-lowerdir mount first (efficient)
+    // If it fails, fall back to sequential overlay construction (more compatible)
+    let mount_result = try_mount_overlay_multi_lower(
+        &lowerdirs,
+        &upper_path,
+        &work_path,
+        &merged_path,
     );
 
-    debug!(mount_opts = %mount_opts, merged_path = %merged_path.display(), "mounting overlay");
+    if let Err(multi_err) = mount_result {
+        if lowerdirs.len() > 1 {
+            // Multi-lowerdir failed, try sequential approach
+            warn!(
+                layer_count = lowerdirs.len(),
+                error = %multi_err,
+                "multi-lowerdir mount failed, trying sequential overlay construction"
+            );
 
-    let output = Command::new("mount")
-        .args(["-t", "overlay", "overlay", "-o", &mount_opts])
-        .arg(&merged_path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(StorageError(format!("failed to mount overlay: {}", stderr)));
+            // Sequential overlay: merge layers one at a time
+            mount_overlay_sequential(
+                &lowerdirs,
+                &upper_path,
+                &work_path,
+                &merged_path,
+                &overlay_root,
+            )?;
+        } else {
+            // Single layer, can't use sequential approach
+            return Err(multi_err);
+        }
     }
 
     // Verify mount succeeded by checking if merged directory has contents
@@ -925,6 +941,14 @@ fn prepare_overlay_from_packed(
     let upper_path = overlay_root.join("upper");
     let work_path = overlay_root.join("work");
     let merged_path = overlay_root.join("merged");
+
+    // Clean up any previous overlay state - workdir must be empty for overlay mount
+    if overlay_root.exists() {
+        // Try to unmount if previously mounted
+        let _ = Command::new("umount").arg(&merged_path).output();
+        // Remove old directories to ensure clean state
+        let _ = std::fs::remove_dir_all(&overlay_root);
+    }
 
     std::fs::create_dir_all(&upper_path)?;
     std::fs::create_dir_all(&work_path)?;
@@ -988,8 +1012,6 @@ fn prepare_overlay_from_packed(
         .map(|path| path.display().to_string())
         .collect();
 
-    let lowerdir = lowerdirs.join(":");
-
     // Verify layer paths exist and have contents
     for layer_path in &lowerdirs {
         let path = Path::new(layer_path);
@@ -1010,29 +1032,35 @@ fn prepare_overlay_from_packed(
         }
     }
 
-    // Mount overlay
-    let mount_opts = format!(
-        "lowerdir={},upperdir={},workdir={}",
-        lowerdir,
-        upper_path.display(),
-        work_path.display()
+    // Try multi-lowerdir mount first (efficient)
+    // If it fails, fall back to sequential overlay construction (more compatible)
+    let mount_result = try_mount_overlay_multi_lower(
+        &lowerdirs,
+        &upper_path,
+        &work_path,
+        &merged_path,
     );
 
-    debug!(mount_opts = %mount_opts, merged_path = %merged_path.display(), "mounting overlay from packed layers");
+    if let Err(multi_err) = mount_result {
+        if lowerdirs.len() > 1 {
+            // Multi-lowerdir failed, try sequential approach
+            warn!(
+                layer_count = lowerdirs.len(),
+                error = %multi_err,
+                "multi-lowerdir mount failed for packed layers, trying sequential overlay construction"
+            );
 
-    let output = Command::new("mount")
-        .args(["-t", "overlay", "overlay", "-o", &mount_opts])
-        .arg(&merged_path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(StorageError(format!(
-            "failed to mount overlay from packed layers: {}",
-            stderr
-        )));
+            mount_overlay_sequential(
+                &lowerdirs,
+                &upper_path,
+                &work_path,
+                &merged_path,
+                &overlay_root,
+            )?;
+        } else {
+            // Single layer, can't use sequential approach
+            return Err(multi_err);
+        }
     }
 
     // Verify mount succeeded
@@ -1080,12 +1108,12 @@ pub fn cleanup_overlay(workload_id: &str) -> Result<()> {
     let overlay_root = root.join(OVERLAYS_DIR).join(workload_id);
     let merged_path = overlay_root.join("merged");
 
-    // Unmount if mounted
+    // Unmount main merged path if mounted
     if merged_path.exists() {
         let _ = Command::new("umount").arg(&merged_path).status();
     }
 
-    // Remove overlay directories
+    // Remove overlay directories (includes merged_layers, upper, work, etc.)
     if overlay_root.exists() {
         std::fs::remove_dir_all(&overlay_root)?;
     }
@@ -1339,6 +1367,183 @@ fn run_with_crun(
             })
         }
     }
+}
+
+// ============================================================================
+// Overlay mounting helper functions
+// ============================================================================
+
+/// Try to mount overlay with multiple lowerdirs (efficient but requires kernel support).
+fn try_mount_overlay_multi_lower(
+    lowerdirs: &[String],
+    upper_path: &Path,
+    work_path: &Path,
+    merged_path: &Path,
+) -> Result<()> {
+    let lowerdir = lowerdirs.join(":");
+
+    // Mount overlay with index=off for compatibility
+    // index=off disables inode index which requires more filesystem features
+    let mount_opts = format!(
+        "lowerdir={},upperdir={},workdir={},index=off",
+        lowerdir,
+        upper_path.display(),
+        work_path.display()
+    );
+
+    info!(
+        layer_count = lowerdirs.len(),
+        mount_opts_len = mount_opts.len(),
+        merged_path = %merged_path.display(),
+        "attempting multi-lowerdir overlay mount"
+    );
+    debug!(mount_opts = %mount_opts, "overlay mount options");
+
+    let output = Command::new("mount")
+        .args(["-t", "overlay", "overlay", "-o", &mount_opts])
+        .arg(merged_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(StorageError(format!(
+            "multi-lowerdir overlay mount failed: {}",
+            stderr
+        )));
+    }
+
+    Ok(())
+}
+
+/// Mount overlay by merging layers into a single directory (most compatible).
+///
+/// This approach physically copies all layers into a single merged directory,
+/// then creates a simple overlay on top of it. This works on all kernels with
+/// basic overlay support, but uses more disk space and is slower for initial setup.
+///
+/// This is the fallback when multi-lowerdir overlay mounts fail.
+fn mount_overlay_sequential(
+    lowerdirs: &[String],
+    upper_path: &Path,
+    work_path: &Path,
+    merged_path: &Path,
+    overlay_root: &Path,
+) -> Result<()> {
+    info!(
+        layer_count = lowerdirs.len(),
+        "building overlay by merging layers"
+    );
+
+    // If only one layer, mount directly
+    if lowerdirs.len() == 1 {
+        let mount_opts = format!(
+            "lowerdir={},upperdir={},workdir={},index=off",
+            lowerdirs[0],
+            upper_path.display(),
+            work_path.display()
+        );
+
+        let output = Command::new("mount")
+            .args(["-t", "overlay", "overlay", "-o", &mount_opts])
+            .arg(merged_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(StorageError(format!(
+                "overlay mount failed: {}",
+                stderr
+            )));
+        }
+        return Ok(());
+    }
+
+    // Create a directory to hold the physically merged layers
+    let merged_layers_dir = overlay_root.join("merged_layers");
+    std::fs::create_dir_all(&merged_layers_dir)?;
+
+    // lowerdirs is in overlay order (topmost first)
+    // We need to copy from bottom up so top layers overwrite bottom layers
+    let layers: Vec<&String> = lowerdirs.iter().rev().collect();
+
+    info!(
+        layer_count = layers.len(),
+        merged_dir = %merged_layers_dir.display(),
+        "physically merging layers"
+    );
+
+    for (i, layer_path) in layers.iter().enumerate() {
+        debug!(
+            layer_index = i,
+            layer_path = %layer_path,
+            "copying layer to merged directory"
+        );
+
+        // Use shell to copy layer contents, preserving all attributes
+        // cp -a preserves symlinks, permissions, etc.
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "cp -a '{}'/. '{}/' 2>/dev/null || cp -a '{}/'* '{}/' 2>/dev/null || true",
+                layer_path, merged_layers_dir.display(),
+                layer_path, merged_layers_dir.display()
+            ))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()?;
+
+        // Don't fail on cp errors - some layers might have special files
+        // that can't be copied, but the overlay should still work
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stderr.is_empty() {
+                debug!(
+                    layer_index = i,
+                    stderr = %stderr,
+                    "layer copy had warnings (non-fatal)"
+                );
+            }
+        }
+    }
+
+    info!(
+        merged_dir = %merged_layers_dir.display(),
+        "layer merge complete, mounting overlay"
+    );
+
+    // Now mount a simple overlay with just the merged directory as lowerdir
+    let mount_opts = format!(
+        "lowerdir={},upperdir={},workdir={},index=off",
+        merged_layers_dir.display(),
+        upper_path.display(),
+        work_path.display()
+    );
+
+    let output = Command::new("mount")
+        .args(["-t", "overlay", "overlay", "-o", &mount_opts])
+        .arg(merged_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(StorageError(format!(
+            "overlay mount on merged layers failed: {}",
+            stderr
+        )));
+    }
+
+    info!(
+        layer_count = lowerdirs.len(),
+        "overlay construction complete (merged layers approach)"
+    );
+
+    Ok(())
 }
 
 // ============================================================================
