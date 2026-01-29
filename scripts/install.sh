@@ -419,6 +419,36 @@ uninstall_smolvm() {
         success "Removed symlink $BIN_DIR/smolvm"
     fi
 
+    # Remove data directory (agent-rootfs, storage)
+    local data_dir
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        data_dir="$HOME/Library/Application Support/smolvm"
+    else
+        data_dir="${XDG_DATA_HOME:-$HOME/.local/share}/smolvm"
+    fi
+    if [[ -d "$data_dir" ]]; then
+        rm -rf "$data_dir"
+        success "Removed data directory $data_dir"
+    fi
+
+    # Remove cache directories
+    local cache_dir cache_pack_dir
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        cache_dir="$HOME/Library/Caches/smolvm"
+        cache_pack_dir="$HOME/Library/Caches/smolvm-pack"
+    else
+        cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/smolvm"
+        cache_pack_dir="${XDG_CACHE_HOME:-$HOME/.cache}/smolvm-pack"
+    fi
+    if [[ -d "$cache_dir" ]]; then
+        rm -rf "$cache_dir"
+        success "Removed cache directory $cache_dir"
+    fi
+    if [[ -d "$cache_pack_dir" ]]; then
+        rm -rf "$cache_pack_dir"
+        success "Removed pack cache directory $cache_pack_dir"
+    fi
+
     # Note about PATH
     warn "You may want to remove the PATH entry from your shell profile."
 

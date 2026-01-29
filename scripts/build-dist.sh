@@ -145,6 +145,10 @@ TROUBLESHOOTING
 For more information: https://github.com/smolvm/smolvm
 EOF
 
+# Generate checksums
+echo "Generating checksums..."
+(cd "$DIST_DIR" && shasum -a 256 smolvm smolvm-bin lib/* > checksums.txt)
+
 # Create tarball
 echo "Creating tarball..."
 cd dist
