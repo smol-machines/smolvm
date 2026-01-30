@@ -9,8 +9,6 @@ use std::net::{IpAddr, Ipv4Addr};
 pub const DEFAULT_DNS: &str = "1.1.1.1";
 /// Default DNS server as IpAddr (compile-time constant).
 pub const DEFAULT_DNS_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
-/// Google's public DNS server.
-pub const GOOGLE_DNS: &str = "8.8.8.8";
 
 /// Get the DNS server for a network policy.
 pub fn get_dns_server(policy: &NetworkPolicy) -> Option<IpAddr> {
@@ -20,47 +18,22 @@ pub fn get_dns_server(policy: &NetworkPolicy) -> Option<IpAddr> {
     }
 }
 
-/// Check if a network policy allows egress.
-pub fn allows_egress(policy: &NetworkPolicy) -> bool {
-    matches!(policy, NetworkPolicy::Egress { .. })
-}
-
-/// Create an egress policy with the default DNS.
-pub fn egress_default() -> NetworkPolicy {
-    NetworkPolicy::Egress { dns: None }
-}
-
-/// Create an egress policy with a custom DNS server.
-pub fn egress_with_dns(dns: IpAddr) -> NetworkPolicy {
-    NetworkPolicy::Egress { dns: Some(dns) }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_get_dns_server_none() {
+    fn test_get_dns_server() {
+        // None policy returns no DNS
         assert!(get_dns_server(&NetworkPolicy::None).is_none());
-    }
 
-    #[test]
-    fn test_get_dns_server_egress_default() {
-        let dns = get_dns_server(&egress_default()).unwrap();
+        // Egress with default DNS
+        let dns = get_dns_server(&NetworkPolicy::Egress { dns: None }).unwrap();
         assert_eq!(dns.to_string(), DEFAULT_DNS);
-    }
 
-    #[test]
-    fn test_get_dns_server_egress_custom() {
-        let custom: IpAddr = GOOGLE_DNS.parse().unwrap();
-        let policy = egress_with_dns(custom);
-        let dns = get_dns_server(&policy).unwrap();
-        assert_eq!(dns.to_string(), GOOGLE_DNS);
-    }
-
-    #[test]
-    fn test_allows_egress() {
-        assert!(!allows_egress(&NetworkPolicy::None));
-        assert!(allows_egress(&egress_default()));
+        // Egress with custom DNS
+        let custom: IpAddr = "8.8.8.8".parse().unwrap();
+        let dns = get_dns_server(&NetworkPolicy::Egress { dns: Some(custom) }).unwrap();
+        assert_eq!(dns.to_string(), "8.8.8.8");
     }
 }
