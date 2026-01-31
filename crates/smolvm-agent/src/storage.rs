@@ -12,7 +12,7 @@ use crate::crun::CrunCommand;
 use crate::oci::{generate_container_id, OciSpec};
 use crate::paths;
 use crate::process::{wait_with_timeout_and_cleanup, WaitResult, TIMEOUT_EXIT_CODE};
-use smolvm_protocol::{ImageInfo, OverlayInfo, StorageStatus};
+use smolvm_protocol::{ImageInfo, OverlayInfo, RegistryAuth, StorageStatus};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
@@ -350,6 +350,15 @@ pub fn status() -> Result<StorageStatus> {
 
 /// Pull an OCI image using crane.
 pub fn pull_image(image: &str, platform: Option<&str>) -> Result<ImageInfo> {
+    pull_image_with_auth(image, platform, None)
+}
+
+/// Pull an OCI image using crane with optional authentication.
+pub fn pull_image_with_auth(
+    image: &str,
+    platform: Option<&str>,
+    auth: Option<&RegistryAuth>,
+) -> Result<ImageInfo> {
     // Validate image reference before any operations
     crate::oci::validate_image_reference(image).map_err(StorageError)?;
 
@@ -360,15 +369,8 @@ pub fn pull_image(image: &str, platform: Option<&str>) -> Result<ImageInfo> {
         return create_packed_image_info(image, packed_dir);
     }
 
-    // Check if already cached - skip network call entirely
-    if let Ok(Some(info)) = query_image(image) {
-        debug!(image = %image, "image already cached, skipping pull");
-        return Ok(info);
-    }
-
-    let root = Path::new(STORAGE_ROOT);
-
     // Determine platform - default to current architecture
+    // This must happen BEFORE the cache check so we can verify architecture
     let platform = platform.or({
         #[cfg(target_arch = "aarch64")]
         {
@@ -384,9 +386,43 @@ pub fn pull_image(image: &str, platform: Option<&str>) -> Result<ImageInfo> {
         }
     });
 
+    // Check if already cached with correct architecture
+    if let Ok(Some(info)) = query_image(image) {
+        // Verify cached image architecture matches requested platform
+        let cached_arch = &info.architecture;
+        let requested_arch = platform
+            .map(|p| platform_to_arch(p))
+            .unwrap_or_else(|| cached_arch.clone());
+
+        if cached_arch == &requested_arch {
+            debug!(
+                image = %image,
+                architecture = %cached_arch,
+                "image already cached with correct architecture, skipping pull"
+            );
+            return Ok(info);
+        } else {
+            // Architecture mismatch - need to re-pull
+            info!(
+                image = %image,
+                cached_arch = %cached_arch,
+                requested_arch = %requested_arch,
+                "cached image has wrong architecture, will re-pull"
+            );
+            // Clean up the mismatched cached manifest
+            let root = Path::new(STORAGE_ROOT);
+            let manifest_path = root
+                .join(MANIFESTS_DIR)
+                .join(sanitize_image_name(image) + ".json");
+            let _ = std::fs::remove_file(&manifest_path);
+        }
+    }
+
+    let root = Path::new(STORAGE_ROOT);
+
     // Get manifest with platform specified
     info!(image = %image, platform = ?platform, "fetching manifest");
-    let manifest = crane_manifest(image, platform)?;
+    let manifest = crane_manifest(image, platform, auth)?;
 
     // Parse manifest to get config and layers
     let manifest_json: serde_json::Value =
@@ -425,7 +461,7 @@ pub fn pull_image(image: &str, platform: Option<&str>) -> Result<ImageInfo> {
     std::fs::write(&manifest_path, &manifest)?;
 
     // Fetch and save config
-    let config = crane_config(image, platform)?;
+    let config = crane_config(image, platform, auth)?;
     let config_id = config_digest
         .strip_prefix("sha256:")
         .unwrap_or(config_digest);
@@ -456,18 +492,25 @@ pub fn pull_image(image: &str, platform: Option<&str>) -> Result<ImageInfo> {
         std::fs::create_dir_all(&layer_dir)?;
 
         // Stream layer directly to tar extraction
-        let status = Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "crane blob '{}@{}' {} | tar -xzf - -C '{}'",
-                image,
-                layer_digest,
-                platform
-                    .map(|p| format!("--platform={}", p))
-                    .unwrap_or_default(),
-                layer_dir.display()
-            ))
-            .status()?;
+        // Include auth credentials if provided
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(format!(
+            "crane blob '{}@{}' {} | tar -xzf - -C '{}'",
+            image,
+            layer_digest,
+            platform
+                .map(|p| format!("--platform={}", p))
+                .unwrap_or_default(),
+            layer_dir.display()
+        ));
+
+        // Pass credentials via environment variables
+        if let Some(a) = auth {
+            cmd.env("CRANE_USERNAME", &a.username);
+            cmd.env("CRANE_PASSWORD", &a.password);
+        }
+
+        let status = cmd.status()?;
 
         if !status.success() {
             // Clean up failed layer
@@ -510,6 +553,21 @@ pub fn pull_image(image: &str, platform: Option<&str>) -> Result<ImageInfo> {
 pub fn pull_image_with_progress<F>(
     image: &str,
     platform: Option<&str>,
+    progress: F,
+) -> Result<ImageInfo>
+where
+    F: FnMut(usize, usize, &str),
+{
+    pull_image_with_progress_and_auth(image, platform, None, progress)
+}
+
+/// Pull an OCI image with progress callback and optional authentication.
+///
+/// The callback is called for each layer being pulled with (current, total, layer_id).
+pub fn pull_image_with_progress_and_auth<F>(
+    image: &str,
+    platform: Option<&str>,
+    auth: Option<&RegistryAuth>,
     mut progress: F,
 ) -> Result<ImageInfo>
 where
@@ -524,15 +582,8 @@ where
         return create_packed_image_info(image, packed_dir);
     }
 
-    // Check if already cached - skip network call entirely
-    if let Ok(Some(info)) = query_image(image) {
-        debug!(image = %image, "image already cached, skipping pull");
-        return Ok(info);
-    }
-
-    let root = Path::new(STORAGE_ROOT);
-
     // Determine platform - default to current architecture
+    // This must happen BEFORE the cache check so we can verify architecture
     let platform = platform.or({
         #[cfg(target_arch = "aarch64")]
         {
@@ -548,10 +599,44 @@ where
         }
     });
 
+    // Check if already cached with correct architecture
+    if let Ok(Some(info)) = query_image(image) {
+        // Verify cached image architecture matches requested platform
+        let cached_arch = &info.architecture;
+        let requested_arch = platform
+            .map(|p| platform_to_arch(p))
+            .unwrap_or_else(|| cached_arch.clone());
+
+        if cached_arch == &requested_arch {
+            debug!(
+                image = %image,
+                architecture = %cached_arch,
+                "image already cached with correct architecture, skipping pull"
+            );
+            return Ok(info);
+        } else {
+            // Architecture mismatch - need to re-pull
+            info!(
+                image = %image,
+                cached_arch = %cached_arch,
+                requested_arch = %requested_arch,
+                "cached image has wrong architecture, will re-pull"
+            );
+            // Clean up the mismatched cached manifest
+            let root = Path::new(STORAGE_ROOT);
+            let manifest_path = root
+                .join(MANIFESTS_DIR)
+                .join(sanitize_image_name(image) + ".json");
+            let _ = std::fs::remove_file(&manifest_path);
+        }
+    }
+
+    let root = Path::new(STORAGE_ROOT);
+
     // Get manifest with platform specified
     progress(0, 0, "fetching manifest");
     info!(image = %image, platform = ?platform, "fetching manifest");
-    let manifest = crane_manifest(image, platform)?;
+    let manifest = crane_manifest(image, platform, auth)?;
 
     // Parse manifest to get config and layers
     let manifest_json: serde_json::Value =
@@ -591,7 +676,7 @@ where
     std::fs::write(&manifest_path, &manifest)?;
 
     // Fetch and save config
-    let config = crane_config(image, platform)?;
+    let config = crane_config(image, platform, auth)?;
     let config_id = config_digest
         .strip_prefix("sha256:")
         .unwrap_or(config_digest);
@@ -625,18 +710,25 @@ where
         std::fs::create_dir_all(&layer_dir)?;
 
         // Stream layer directly to tar extraction
-        let status = Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "crane blob '{}@{}' {} | tar -xzf - -C '{}'",
-                image,
-                layer_digest,
-                platform
-                    .map(|p| format!("--platform={}", p))
-                    .unwrap_or_default(),
-                layer_dir.display()
-            ))
-            .status()?;
+        // Include auth credentials if provided
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(format!(
+            "crane blob '{}@{}' {} | tar -xzf - -C '{}'",
+            image,
+            layer_digest,
+            platform
+                .map(|p| format!("--platform={}", p))
+                .unwrap_or_default(),
+            layer_dir.display()
+        ));
+
+        // Pass credentials via environment variables
+        if let Some(a) = auth {
+            cmd.env("CRANE_USERNAME", &a.username);
+            cmd.env("CRANE_PASSWORD", &a.password);
+        }
+
+        let status = cmd.status()?;
 
         if !status.success() {
             let _ = std::fs::remove_dir_all(&layer_dir);
@@ -946,6 +1038,189 @@ pub fn garbage_collect(dry_run: bool) -> Result<u64> {
     Ok(freed)
 }
 
+// ============================================================================
+// Overlay Setup Helper
+// ============================================================================
+
+/// Helper for setting up overlay filesystems.
+///
+/// Encapsulates the common logic for preparing overlay directories,
+/// mounting layers, and creating OCI bundles.
+struct OverlaySetup {
+    overlay_root: PathBuf,
+    upper_path: PathBuf,
+    work_path: PathBuf,
+    merged_path: PathBuf,
+    workload_id: String,
+}
+
+impl OverlaySetup {
+    /// Create a new overlay setup for the given workload.
+    fn new(workload_id: &str) -> Self {
+        let root = Path::new(STORAGE_ROOT);
+        let overlay_root = root.join(OVERLAYS_DIR).join(workload_id);
+        Self {
+            upper_path: overlay_root.join("upper"),
+            work_path: overlay_root.join("work"),
+            merged_path: overlay_root.join("merged"),
+            overlay_root,
+            workload_id: workload_id.to_string(),
+        }
+    }
+
+    /// Prepare overlay directories, cleaning up any previous state.
+    fn prepare_directories(&self) -> Result<()> {
+        // Clean up any previous overlay state - workdir must be empty for overlay mount
+        if self.overlay_root.exists() {
+            // Try to unmount if previously mounted
+            let _ = Command::new("umount").arg(&self.merged_path).output();
+            // Remove old directories to ensure clean state
+            let _ = std::fs::remove_dir_all(&self.overlay_root);
+        }
+
+        std::fs::create_dir_all(&self.upper_path)?;
+        std::fs::create_dir_all(&self.work_path)?;
+        std::fs::create_dir_all(&self.merged_path)?;
+
+        Ok(())
+    }
+
+    /// Set up the upper layer with DNS resolution and /dev directory.
+    fn setup_upper_layer(&self) -> Result<()> {
+        // Set up DNS resolution BEFORE mounting (TSI intercepts writes to mounted overlays)
+        let upper_etc = self.upper_path.join("etc");
+        std::fs::create_dir_all(&upper_etc)?;
+        let resolv_path = upper_etc.join("resolv.conf");
+        if let Err(e) = std::fs::write(&resolv_path, "nameserver 8.8.8.8\nnameserver 1.1.1.1\n") {
+            warn!(error = %e, "failed to write resolv.conf to upper layer");
+        }
+
+        // Create /dev directory in upper layer - we'll bind mount the real /dev later
+        let upper_dev = self.upper_path.join("dev");
+        std::fs::create_dir_all(&upper_dev)?;
+
+        Ok(())
+    }
+
+    /// Verify that all layer paths exist and log warnings for empty layers.
+    fn verify_layers(&self, lowerdirs: &[String]) -> Result<()> {
+        for layer_path in lowerdirs {
+            let path = Path::new(layer_path);
+            if !path.exists() {
+                return Err(StorageError(format!(
+                    "layer path does not exist: {}",
+                    layer_path
+                )));
+            }
+            // Check if layer has contents
+            let entry_count = std::fs::read_dir(path)
+                .map(|entries| entries.count())
+                .unwrap_or(0);
+            if entry_count == 0 {
+                warn!(layer = %layer_path, "layer directory is empty");
+            }
+        }
+        Ok(())
+    }
+
+    /// Mount the overlay filesystem with fallback from multi-lowerdir to sequential.
+    fn mount(&self, lowerdirs: &[String]) -> Result<()> {
+        // Try multi-lowerdir mount first (efficient)
+        let mount_result = try_mount_overlay_multi_lower(
+            lowerdirs,
+            &self.upper_path,
+            &self.work_path,
+            &self.merged_path,
+        );
+
+        if let Err(multi_err) = mount_result {
+            if lowerdirs.len() > 1 {
+                // Multi-lowerdir failed, try sequential approach
+                warn!(
+                    layer_count = lowerdirs.len(),
+                    error = %multi_err,
+                    "multi-lowerdir mount failed, trying sequential overlay construction"
+                );
+
+                mount_overlay_sequential(
+                    lowerdirs,
+                    &self.upper_path,
+                    &self.work_path,
+                    &self.merged_path,
+                    &self.overlay_root,
+                )?;
+            } else {
+                // Single layer, can't use sequential approach
+                return Err(multi_err);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Verify that the mount succeeded by checking merged directory contents.
+    fn verify_mount(&self) -> usize {
+        let entry_count = std::fs::read_dir(&self.merged_path)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+
+        if entry_count == 0 {
+            warn!(
+                workload_id = %self.workload_id,
+                merged_path = %self.merged_path.display(),
+                "overlay mount returned success but merged directory is empty"
+            );
+            // Try to get more info about the mount state
+            if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
+                let merged_str = self.merged_path.to_string_lossy();
+                let is_mounted = mounts.lines().any(|line| line.contains(&*merged_str));
+                warn!(is_mounted = is_mounted, "mount point status");
+            }
+        }
+
+        entry_count
+    }
+
+    /// Create OCI bundle directory structure.
+    fn create_bundle(&self) -> Result<()> {
+        let bundle_path = self.overlay_root.join("bundle");
+        std::fs::create_dir_all(&bundle_path)?;
+
+        // Create symlink: bundle/rootfs -> ../merged
+        let rootfs_link = bundle_path.join("rootfs");
+        if !rootfs_link.exists() {
+            std::os::unix::fs::symlink("../merged", &rootfs_link)
+                .map_err(|e| StorageError(format!("failed to create rootfs symlink: {}", e)))?;
+        }
+
+        debug!(bundle = %bundle_path.display(), "OCI bundle directory created");
+        Ok(())
+    }
+
+    /// Convert to OverlayInfo result.
+    fn into_overlay_info(self) -> OverlayInfo {
+        OverlayInfo {
+            rootfs_path: self.merged_path.display().to_string(),
+            upper_path: self.upper_path.display().to_string(),
+            work_path: self.work_path.display().to_string(),
+        }
+    }
+
+    /// Execute the full overlay setup pipeline with the given lower directories.
+    fn execute(self, lowerdirs: Vec<String>) -> Result<OverlayInfo> {
+        self.prepare_directories()?;
+        self.setup_upper_layer()?;
+        self.verify_layers(&lowerdirs)?;
+        self.mount(&lowerdirs)?;
+
+        let entry_count = self.verify_mount();
+        info!(workload_id = %self.workload_id, entry_count = entry_count, "overlay mounted");
+
+        self.create_bundle()?;
+        Ok(self.into_overlay_info())
+    }
+}
+
 /// Prepare an overlay filesystem for a workload.
 pub fn prepare_overlay(image: &str, workload_id: &str) -> Result<OverlayInfo> {
     // Check if we have packed layers available
@@ -954,138 +1229,24 @@ pub fn prepare_overlay(image: &str, workload_id: &str) -> Result<OverlayInfo> {
         return prepare_overlay_from_packed(image, workload_id, packed_dir);
     }
 
-    let root = Path::new(STORAGE_ROOT);
-
     // Ensure image exists
     let info =
         query_image(image)?.ok_or_else(|| StorageError(format!("image not found: {}", image)))?;
 
-    // Create overlay directories
-    let overlay_root = root.join(OVERLAYS_DIR).join(workload_id);
-    let upper_path = overlay_root.join("upper");
-    let work_path = overlay_root.join("work");
-    let merged_path = overlay_root.join("merged");
-
-    // Clean up any previous overlay state - workdir must be empty for overlay mount
-    if overlay_root.exists() {
-        // Try to unmount if previously mounted
-        let _ = Command::new("umount").arg(&merged_path).output();
-        // Remove old directories to ensure clean state
-        let _ = std::fs::remove_dir_all(&overlay_root);
-    }
-
-    std::fs::create_dir_all(&upper_path)?;
-    std::fs::create_dir_all(&work_path)?;
-    std::fs::create_dir_all(&merged_path)?;
-
-    // Set up DNS resolution BEFORE mounting (TSI intercepts writes to mounted overlays)
-    let upper_etc = upper_path.join("etc");
-    std::fs::create_dir_all(&upper_etc)?;
-    let resolv_path = upper_etc.join("resolv.conf");
-    if let Err(e) = std::fs::write(&resolv_path, "nameserver 8.8.8.8\nnameserver 1.1.1.1\n") {
-        warn!(error = %e, "failed to write resolv.conf to upper layer");
-    }
-
-    // Create /dev directory in upper layer - we'll bind mount the real /dev later
-    let upper_dev = upper_path.join("dev");
-    std::fs::create_dir_all(&upper_dev)?;
-
-    // Build lowerdir from layers (in order)
+    // Build lowerdir from layers (reversed for overlay order - top layer first)
+    let root = Path::new(STORAGE_ROOT);
     let lowerdirs: Vec<String> = info
         .layers
         .iter()
-        .rev() // Reverse for overlay order (top layer first)
+        .rev()
         .map(|digest| {
             let id = digest.strip_prefix("sha256:").unwrap_or(digest);
             root.join(LAYERS_DIR).join(id).display().to_string()
         })
         .collect();
 
-    // Verify layer paths exist before mounting
-    for layer_path in &lowerdirs {
-        let path = Path::new(layer_path);
-        if !path.exists() {
-            return Err(StorageError(format!(
-                "layer path does not exist: {}",
-                layer_path
-            )));
-        }
-        // Check if layer has contents
-        if let Ok(mut entries) = std::fs::read_dir(path) {
-            if entries.next().is_none() {
-                warn!(layer = %layer_path, "layer directory is empty");
-            }
-        }
-    }
-
-    // Try multi-lowerdir mount first (efficient)
-    // If it fails, fall back to sequential overlay construction (more compatible)
-    let mount_result =
-        try_mount_overlay_multi_lower(&lowerdirs, &upper_path, &work_path, &merged_path);
-
-    if let Err(multi_err) = mount_result {
-        if lowerdirs.len() > 1 {
-            // Multi-lowerdir failed, try sequential approach
-            warn!(
-                layer_count = lowerdirs.len(),
-                error = %multi_err,
-                "multi-lowerdir mount failed, trying sequential overlay construction"
-            );
-
-            // Sequential overlay: merge layers one at a time
-            mount_overlay_sequential(
-                &lowerdirs,
-                &upper_path,
-                &work_path,
-                &merged_path,
-                &overlay_root,
-            )?;
-        } else {
-            // Single layer, can't use sequential approach
-            return Err(multi_err);
-        }
-    }
-
-    // Verify mount succeeded by checking if merged directory has contents
-    let merged_entry_count = std::fs::read_dir(&merged_path)
-        .map(|entries| entries.count())
-        .unwrap_or(0);
-
-    if merged_entry_count == 0 {
-        warn!(
-            workload_id = %workload_id,
-            merged_path = %merged_path.display(),
-            "overlay mount returned success but merged directory is empty"
-        );
-        // Try to get more info about the mount state
-        if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
-            let merged_str = merged_path.to_string_lossy();
-            let is_mounted = mounts.lines().any(|line| line.contains(&*merged_str));
-            warn!(is_mounted = is_mounted, "mount point status");
-        }
-    }
-
-    info!(workload_id = %workload_id, entry_count = merged_entry_count, "overlay mounted");
-
-    // Create OCI bundle directory structure
-    // crun will use this bundle to run containers
-    let bundle_path = overlay_root.join("bundle");
-    std::fs::create_dir_all(&bundle_path)?;
-
-    // Create symlink: bundle/rootfs -> ../merged
-    let rootfs_link = bundle_path.join("rootfs");
-    if !rootfs_link.exists() {
-        std::os::unix::fs::symlink("../merged", &rootfs_link)
-            .map_err(|e| StorageError(format!("failed to create rootfs symlink: {}", e)))?;
-    }
-
-    debug!(bundle = %bundle_path.display(), "OCI bundle directory created");
-
-    Ok(OverlayInfo {
-        rootfs_path: merged_path.display().to_string(),
-        upper_path: upper_path.display().to_string(),
-        work_path: work_path.display().to_string(),
-    })
+    // Use shared overlay setup logic
+    OverlaySetup::new(workload_id).execute(lowerdirs)
 }
 
 /// Prepare an overlay filesystem using pre-packed layers.
@@ -1097,44 +1258,10 @@ fn prepare_overlay_from_packed(
     workload_id: &str,
     packed_dir: &Path,
 ) -> Result<OverlayInfo> {
-    let root = Path::new(STORAGE_ROOT);
-
-    // Create overlay directories
-    let overlay_root = root.join(OVERLAYS_DIR).join(workload_id);
-    let upper_path = overlay_root.join("upper");
-    let work_path = overlay_root.join("work");
-    let merged_path = overlay_root.join("merged");
-
-    // Clean up any previous overlay state - workdir must be empty for overlay mount
-    if overlay_root.exists() {
-        // Try to unmount if previously mounted
-        let _ = Command::new("umount").arg(&merged_path).output();
-        // Remove old directories to ensure clean state
-        let _ = std::fs::remove_dir_all(&overlay_root);
-    }
-
-    std::fs::create_dir_all(&upper_path)?;
-    std::fs::create_dir_all(&work_path)?;
-    std::fs::create_dir_all(&merged_path)?;
-
-    // Set up DNS resolution BEFORE mounting (TSI intercepts writes to mounted overlays)
-    let upper_etc = upper_path.join("etc");
-    std::fs::create_dir_all(&upper_etc)?;
-    let resolv_path = upper_etc.join("resolv.conf");
-    if let Err(e) = std::fs::write(&resolv_path, "nameserver 8.8.8.8\nnameserver 1.1.1.1\n") {
-        warn!(error = %e, "failed to write resolv.conf to upper layer");
-    }
-
-    // Create /dev directory in upper layer
-    let upper_dev = upper_path.join("dev");
-    std::fs::create_dir_all(&upper_dev)?;
-
     // Find layer directories in packed_dir
     // Packed layers are named by short digest (first 12 chars of sha256)
-    // We need to find all layer directories and build the overlay
     let mut layer_dirs: Vec<PathBuf> = Vec::new();
 
-    // Read all directories in packed_dir
     let entries = std::fs::read_dir(packed_dir)
         .map_err(|e| StorageError(format!("failed to read packed layers directory: {}", e)))?;
 
@@ -1175,90 +1302,8 @@ fn prepare_overlay_from_packed(
         .map(|path| path.display().to_string())
         .collect();
 
-    // Verify layer paths exist and have contents
-    for layer_path in &lowerdirs {
-        let path = Path::new(layer_path);
-        if !path.exists() {
-            return Err(StorageError(format!(
-                "packed layer path does not exist: {}",
-                layer_path
-            )));
-        }
-        // Check if layer has contents
-        let entry_count = std::fs::read_dir(path)
-            .map(|entries| entries.count())
-            .unwrap_or(0);
-        if entry_count == 0 {
-            warn!(layer = %layer_path, "packed layer directory is empty");
-        } else {
-            debug!(layer = %layer_path, entry_count = entry_count, "packed layer verified");
-        }
-    }
-
-    // Try multi-lowerdir mount first (efficient)
-    // If it fails, fall back to sequential overlay construction (more compatible)
-    let mount_result =
-        try_mount_overlay_multi_lower(&lowerdirs, &upper_path, &work_path, &merged_path);
-
-    if let Err(multi_err) = mount_result {
-        if lowerdirs.len() > 1 {
-            // Multi-lowerdir failed, try sequential approach
-            warn!(
-                layer_count = lowerdirs.len(),
-                error = %multi_err,
-                "multi-lowerdir mount failed for packed layers, trying sequential overlay construction"
-            );
-
-            mount_overlay_sequential(
-                &lowerdirs,
-                &upper_path,
-                &work_path,
-                &merged_path,
-                &overlay_root,
-            )?;
-        } else {
-            // Single layer, can't use sequential approach
-            return Err(multi_err);
-        }
-    }
-
-    // Verify mount succeeded
-    let merged_entry_count = std::fs::read_dir(&merged_path)
-        .map(|entries| entries.count())
-        .unwrap_or(0);
-
-    if merged_entry_count == 0 {
-        warn!(
-            workload_id = %workload_id,
-            merged_path = %merged_path.display(),
-            "overlay mount returned success but merged directory is empty"
-        );
-    }
-
-    info!(
-        workload_id = %workload_id,
-        entry_count = merged_entry_count,
-        "overlay mounted from packed layers"
-    );
-
-    // Create OCI bundle directory structure
-    let bundle_path = overlay_root.join("bundle");
-    std::fs::create_dir_all(&bundle_path)?;
-
-    // Create symlink: bundle/rootfs -> ../merged
-    let rootfs_link = bundle_path.join("rootfs");
-    if !rootfs_link.exists() {
-        std::os::unix::fs::symlink("../merged", &rootfs_link)
-            .map_err(|e| StorageError(format!("failed to create rootfs symlink: {}", e)))?;
-    }
-
-    debug!(bundle = %bundle_path.display(), "OCI bundle directory created");
-
-    Ok(OverlayInfo {
-        rootfs_path: merged_path.display().to_string(),
-        upper_path: upper_path.display().to_string(),
-        work_path: work_path.display().to_string(),
-    })
+    // Use shared overlay setup logic
+    OverlaySetup::new(workload_id).execute(lowerdirs)
 }
 
 /// Clean up an overlay filesystem.
@@ -1710,12 +1755,33 @@ fn mount_overlay_sequential(
 // ============================================================================
 
 /// Run a crane command with the given operation.
-fn run_crane(operation: &str, image: &str, platform: Option<&str>) -> Result<String> {
+///
+/// If auth is provided, sets CRANE_USERNAME and CRANE_PASSWORD environment variables
+/// which crane will use for registry authentication.
+fn run_crane(
+    operation: &str,
+    image: &str,
+    platform: Option<&str>,
+    auth: Option<&RegistryAuth>,
+) -> Result<String> {
     let mut cmd = Command::new("crane");
     cmd.arg(operation).arg(image);
 
     if let Some(p) = platform {
         cmd.arg("--platform").arg(p);
+    }
+
+    // Set credentials via environment if provided
+    // crane supports these environment variables for authentication
+    if let Some(a) = auth {
+        cmd.env("CRANE_USERNAME", &a.username);
+        cmd.env("CRANE_PASSWORD", &a.password);
+        debug!(
+            operation = %operation,
+            image = %image,
+            username = %a.username,
+            "using registry credentials"
+        );
     }
 
     let output = cmd.output()?;
@@ -1732,13 +1798,21 @@ fn run_crane(operation: &str, image: &str, platform: Option<&str>) -> Result<Str
 }
 
 /// Run crane manifest command.
-fn crane_manifest(image: &str, platform: Option<&str>) -> Result<String> {
-    run_crane("manifest", image, platform)
+fn crane_manifest(
+    image: &str,
+    platform: Option<&str>,
+    auth: Option<&RegistryAuth>,
+) -> Result<String> {
+    run_crane("manifest", image, platform, auth)
 }
 
 /// Run crane config command.
-fn crane_config(image: &str, platform: Option<&str>) -> Result<String> {
-    run_crane("config", image, platform)
+fn crane_config(
+    image: &str,
+    platform: Option<&str>,
+    auth: Option<&RegistryAuth>,
+) -> Result<String> {
+    run_crane("config", image, platform, auth)
 }
 
 /// Sanitize image name for use as filename.
@@ -1794,6 +1868,24 @@ fn count_entries(path: &Path) -> Result<usize> {
     Ok(std::fs::read_dir(path)?.count())
 }
 
+/// Convert a platform string to its architecture component.
+///
+/// # Examples
+/// - "linux/arm64" -> "arm64"
+/// - "linux/amd64" -> "amd64"
+/// - "linux/arm64/v8" -> "arm64"
+fn platform_to_arch(platform: &str) -> String {
+    // Platform format is "os/arch" or "os/arch/variant"
+    // We want just the arch part
+    let parts: Vec<&str> = platform.split('/').collect();
+    if parts.len() >= 2 {
+        parts[1].to_string()
+    } else {
+        // Fallback: return as-is if not in expected format
+        platform.to_string()
+    }
+}
+
 /// Calculate directory size recursively.
 fn dir_size(path: &Path) -> Result<u64> {
     let mut size = 0;
@@ -1814,4 +1906,45 @@ fn dir_size(path: &Path) -> Result<u64> {
     }
 
     Ok(size)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_platform_to_arch_linux_arm64() {
+        assert_eq!(platform_to_arch("linux/arm64"), "arm64");
+    }
+
+    #[test]
+    fn test_platform_to_arch_linux_amd64() {
+        assert_eq!(platform_to_arch("linux/amd64"), "amd64");
+    }
+
+    #[test]
+    fn test_platform_to_arch_with_variant() {
+        assert_eq!(platform_to_arch("linux/arm64/v8"), "arm64");
+        assert_eq!(platform_to_arch("linux/arm/v7"), "arm");
+    }
+
+    #[test]
+    fn test_platform_to_arch_fallback() {
+        // If not in expected format, return as-is
+        assert_eq!(platform_to_arch("arm64"), "arm64");
+        assert_eq!(platform_to_arch("unknown"), "unknown");
+    }
+
+    #[test]
+    fn test_sanitize_image_name() {
+        assert_eq!(sanitize_image_name("alpine:latest"), "alpine_latest");
+        assert_eq!(
+            sanitize_image_name("docker.io/library/alpine:3.18"),
+            "docker.io_library_alpine_3.18"
+        );
+        assert_eq!(
+            sanitize_image_name("ghcr.io/owner/repo@sha256:abc123"),
+            "ghcr.io_owner_repo_sha256_abc123"
+        );
+    }
 }

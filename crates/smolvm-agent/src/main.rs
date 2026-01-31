@@ -8,7 +8,9 @@
 //!
 //! Communication is via vsock on port 6000.
 
-use smolvm_protocol::{ports, AgentRequest, AgentResponse, ContainerInfo, PROTOCOL_VERSION};
+use smolvm_protocol::{
+    ports, AgentRequest, AgentResponse, ContainerInfo, RegistryAuth, PROTOCOL_VERSION,
+};
 use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::process::{Child, Command, Stdio};
@@ -403,9 +405,10 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
         if let AgentRequest::Pull {
             ref image,
             ref platform,
+            ref auth,
         } = request
         {
-            handle_streaming_pull(stream, image, platform.as_deref())?;
+            handle_streaming_pull(stream, image, platform.as_deref(), auth.as_ref())?;
             continue;
         }
 
@@ -432,7 +435,11 @@ fn handle_request(request: AgentRequest) -> AgentResponse {
             version: PROTOCOL_VERSION,
         },
 
-        AgentRequest::Pull { image, platform } => handle_pull(&image, platform.as_deref()),
+        AgentRequest::Pull {
+            image,
+            platform,
+            auth,
+        } => handle_pull(&image, platform.as_deref(), auth.as_ref()),
 
         AgentRequest::Query { image } => handle_query(&image),
 
@@ -1323,8 +1330,14 @@ fn handle_streaming_pull<S: Read + Write>(
     stream: &mut S,
     image: &str,
     platform: Option<&str>,
+    auth: Option<&RegistryAuth>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    info!(image = %image, ?platform, "pulling image with progress");
+    info!(
+        image = %image,
+        ?platform,
+        has_auth = auth.is_some(),
+        "pulling image with progress"
+    );
 
     // Create a progress callback that sends updates over the stream
     let progress_callback = |current: usize, total: usize, layer: &str| {
@@ -1342,7 +1355,12 @@ fn handle_streaming_pull<S: Read + Write>(
         let _ = send_response(stream, &response);
     };
 
-    let response = match storage::pull_image_with_progress(image, platform, progress_callback) {
+    let response = match storage::pull_image_with_progress_and_auth(
+        image,
+        platform,
+        auth,
+        progress_callback,
+    ) {
         Ok(info) => match serde_json::to_value(info) {
             Ok(data) => AgentResponse::Ok { data: Some(data) },
             Err(e) => AgentResponse::Error {
@@ -1361,10 +1379,15 @@ fn handle_streaming_pull<S: Read + Write>(
 
 /// Handle image pull request (legacy, no progress).
 #[allow(dead_code)]
-fn handle_pull(image: &str, platform: Option<&str>) -> AgentResponse {
-    info!(image = %image, ?platform, "pulling image");
+fn handle_pull(image: &str, platform: Option<&str>, auth: Option<&RegistryAuth>) -> AgentResponse {
+    info!(
+        image = %image,
+        ?platform,
+        has_auth = auth.is_some(),
+        "pulling image"
+    );
 
-    match storage::pull_image(image, platform) {
+    match storage::pull_image_with_auth(image, platform, auth) {
         Ok(info) => match serde_json::to_value(info) {
             Ok(data) => AgentResponse::Ok { data: Some(data) },
             Err(e) => AgentResponse::Error {

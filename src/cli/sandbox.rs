@@ -12,7 +12,9 @@ use crate::cli::parsers::{
 };
 use crate::cli::{flush_output, format_pid_suffix, truncate_id};
 use clap::{Args, Subcommand};
-use smolvm::agent::{AgentClient, AgentManager, PortMapping, RunConfig, VmResources};
+use smolvm::agent::{
+    docker_config_mount, AgentClient, AgentManager, PortMapping, RunConfig, VmResources,
+};
 use std::time::Duration;
 
 /// Quick sandbox commands for running containers
@@ -262,6 +264,13 @@ pub struct RunCmd {
     )]
     pub env: Vec<String>,
 
+    /// Target platform for multi-arch images (e.g., linux/arm64, linux/amd64)
+    ///
+    /// By default, uses the host architecture. Use this to override, for example
+    /// to run x86_64 images via Rosetta on Apple Silicon.
+    #[arg(long, value_name = "OS/ARCH", help_heading = "Container")]
+    pub platform: Option<String>,
+
     /// Mount host directory into container (can be used multiple times)
     #[arg(
         short = 'v',
@@ -296,6 +305,14 @@ pub struct RunCmd {
         help_heading = "Resources"
     )]
     pub mem: u32,
+
+    /// Mount ~/.docker/ config into VM for registry authentication
+    ///
+    /// When enabled, the Docker config directory (typically ~/.docker/) is
+    /// mounted into the VM at /root/.docker/, allowing crane to use Docker
+    /// credentials for private registry access and authenticated pulls.
+    #[arg(long, help_heading = "Registry")]
+    pub docker_config: bool,
 }
 
 impl RunCmd {
@@ -303,8 +320,19 @@ impl RunCmd {
         use smolvm::Error;
 
         // Parse volume mounts
-        let mounts = parse_mounts(&self.volume)?;
+        let mut mounts = parse_mounts(&self.volume)?;
         let ports = self.port.clone();
+
+        // Add docker config mount if requested
+        if self.docker_config {
+            if let Some(docker_mount) = docker_config_mount() {
+                mounts.push(docker_mount);
+            } else {
+                tracing::warn!(
+                    "Docker config directory not found, --docker-config will have no effect"
+                );
+            }
+        }
 
         let resources = VmResources {
             cpus: self.cpus,
@@ -341,30 +369,35 @@ impl RunCmd {
         let mut client = AgentClient::connect(manager.vsock_socket())?;
 
         // Pull image with progress display
+        // Use registry config for automatic credential lookup
         print!("Pulling image {}...", self.image);
         let _ = std::io::Write::flush(&mut std::io::stdout());
 
         let mut last_percent = 0u8;
-        client.pull_with_progress(&self.image, None, |percent, _total, _layer| {
-            let percent = percent as u8;
-            if percent != last_percent && percent <= 100 {
-                // Clear line and show progress bar
-                print!("\rPulling image {}... [", self.image);
-                let filled = (percent as usize) / 5; // 20 chars wide
-                for i in 0..20 {
-                    if i < filled {
-                        print!("=");
-                    } else if i == filled {
-                        print!(">");
-                    } else {
-                        print!(" ");
+        client.pull_with_registry_config_and_progress(
+            &self.image,
+            self.platform.as_deref(),
+            |percent, _total, _layer| {
+                let percent = percent as u8;
+                if percent != last_percent && percent <= 100 {
+                    // Clear line and show progress bar
+                    print!("\rPulling image {}... [", self.image);
+                    let filled = (percent as usize) / 5; // 20 chars wide
+                    for i in 0..20 {
+                        if i < filled {
+                            print!("=");
+                        } else if i == filled {
+                            print!(">");
+                        } else {
+                            print!(" ");
+                        }
                     }
+                    print!("] {}%", percent);
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                    last_percent = percent;
                 }
-                print!("] {}%", percent);
-                let _ = std::io::Write::flush(&mut std::io::stdout());
-                last_percent = percent;
-            }
-        })?;
+            },
+        )?;
         println!(
             "\rPulling image {}... done.                              ",
             self.image

@@ -8,8 +8,8 @@ mod launcher;
 mod manager;
 
 pub use crate::vm::config::HostMount;
-pub use client::{AgentClient, RunConfig};
-pub use manager::{AgentManager, AgentState};
+pub use client::{AgentClient, PullOptions, RunConfig};
+pub use manager::{docker_config_dir, docker_config_mount, AgentManager, AgentState};
 
 /// Default agent VM memory in MiB.
 pub const DEFAULT_MEMORY_MIB: u32 = 256;

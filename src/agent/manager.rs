@@ -50,6 +50,54 @@ pub enum AgentState {
     Stopping,
 }
 
+/// Get the Docker config directory path.
+///
+/// Checks DOCKER_CONFIG environment variable first, then falls back to ~/.docker/
+pub fn docker_config_dir() -> Option<PathBuf> {
+    // Check DOCKER_CONFIG env var first
+    if let Ok(docker_config) = std::env::var("DOCKER_CONFIG") {
+        let path = PathBuf::from(docker_config);
+        if path.exists() {
+            return Some(path);
+        }
+        tracing::debug!(
+            path = %path.display(),
+            "DOCKER_CONFIG path does not exist"
+        );
+    }
+
+    // Fall back to ~/.docker/
+    if let Some(home) = dirs::home_dir() {
+        let docker_dir = home.join(".docker");
+        if docker_dir.exists() {
+            return Some(docker_dir);
+        }
+    }
+
+    None
+}
+
+/// Create a HostMount for Docker config directory.
+///
+/// Returns Some(mount) if the Docker config directory exists,
+/// None otherwise.
+pub fn docker_config_mount() -> Option<HostMount> {
+    let docker_dir = docker_config_dir()?;
+
+    tracing::info!(
+        path = %docker_dir.display(),
+        "mounting Docker config directory"
+    );
+
+    // Mount to /root/.docker which is where crane looks by default
+    // Use read-only mount to prevent modification
+    Some(HostMount {
+        source: docker_dir,
+        target: PathBuf::from("/root/.docker"),
+        read_only: true,
+    })
+}
+
 /// Internal state shared between threads.
 struct AgentInner {
     state: AgentState,

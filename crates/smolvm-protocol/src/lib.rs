@@ -61,6 +61,9 @@ pub enum AgentRequest {
         image: String,
         /// Platform to pull (e.g., "linux/arm64", "linux/amd64").
         platform: Option<String>,
+        /// Optional registry authentication credentials.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth: Option<RegistryAuth>,
     },
 
     /// Query if an image exists locally.
@@ -407,6 +410,15 @@ pub struct ContainerInfo {
     pub command: Vec<String>,
 }
 
+/// Registry authentication credentials for pulling images.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegistryAuth {
+    /// Username for authentication.
+    pub username: String,
+    /// Password or token for authentication.
+    pub password: String,
+}
+
 // ============================================================================
 // Workload VM Protocol (Command Execution)
 // ============================================================================
@@ -602,16 +614,52 @@ mod tests {
         let req = AgentRequest::Pull {
             image: "alpine:latest".to_string(),
             platform: Some("linux/arm64".to_string()),
+            auth: None,
         };
 
         let encoded = encode_message(&req).unwrap();
         let decoded: AgentRequest = decode_message(&encoded).unwrap();
 
-        let AgentRequest::Pull { image, platform } = decoded else {
+        let AgentRequest::Pull {
+            image,
+            platform,
+            auth,
+        } = decoded
+        else {
             panic!("expected Pull variant, got {:?}", decoded);
         };
         assert_eq!(image, "alpine:latest");
         assert_eq!(platform, Some("linux/arm64".to_string()));
+        assert!(auth.is_none());
+    }
+
+    #[test]
+    fn test_encode_decode_with_auth() {
+        let req = AgentRequest::Pull {
+            image: "ghcr.io/owner/repo:latest".to_string(),
+            platform: None,
+            auth: Some(RegistryAuth {
+                username: "testuser".to_string(),
+                password: "testpass".to_string(),
+            }),
+        };
+
+        let encoded = encode_message(&req).unwrap();
+        let decoded: AgentRequest = decode_message(&encoded).unwrap();
+
+        let AgentRequest::Pull {
+            image,
+            platform,
+            auth,
+        } = decoded
+        else {
+            panic!("expected Pull variant, got {:?}", decoded);
+        };
+        assert_eq!(image, "ghcr.io/owner/repo:latest");
+        assert!(platform.is_none());
+        let auth = auth.expect("auth should be Some");
+        assert_eq!(auth.username, "testuser");
+        assert_eq!(auth.password, "testpass");
     }
 
     #[test]
