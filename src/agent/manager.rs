@@ -661,10 +661,7 @@ impl AgentManager {
                 if socket_appeared_at.is_none() {
                     let elapsed = start.elapsed();
                     socket_appeared_at = Some(elapsed);
-                    tracing::debug!(
-                        elapsed_ms = elapsed.as_millis(),
-                        "vsock socket appeared"
-                    );
+                    tracing::debug!(elapsed_ms = elapsed.as_millis(), "vsock socket appeared");
                 }
 
                 match UnixStream::connect(&self.vsock_socket) {
