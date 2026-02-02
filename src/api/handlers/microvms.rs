@@ -424,7 +424,9 @@ pub async fn exec_microvm(
         }
 
         // Execute command
-        let mut client = manager.connect().map_err(|e| format!("connect error: {}", e))?;
+        let mut client = manager
+            .connect()
+            .map_err(|e| format!("connect error: {}", e))?;
         let (exit_code, stdout, stderr) = client
             .vm_exec(command, env, workdir, timeout)
             .map_err(|e| format!("exec error: {}", e))?;

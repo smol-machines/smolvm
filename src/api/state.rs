@@ -163,6 +163,17 @@ impl ApiState {
         })
     }
 
+    /// Create a new API state with a specific database.
+    ///
+    /// Useful for testing with temporary databases.
+    pub fn with_db(db: SmolvmDb) -> Self {
+        Self {
+            sandboxes: RwLock::new(HashMap::new()),
+            reserved_names: RwLock::new(HashSet::new()),
+            db,
+        }
+    }
+
     /// Load existing sandboxes from persistent database.
     /// Call this on server startup to reconnect to running VMs.
     pub fn load_persisted_sandboxes(&self) -> Vec<String> {
@@ -747,6 +758,15 @@ pub fn restart_spec_to_config(spec: Option<&RestartSpec>) -> RestartConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    /// Create an ApiState with a temporary database for testing.
+    fn temp_api_state() -> (TempDir, ApiState) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.redb");
+        let db = SmolvmDb::open_at(&path).unwrap();
+        (dir, ApiState::with_db(db))
+    }
 
     #[test]
     fn test_type_conversions() {
@@ -777,7 +797,7 @@ mod tests {
 
     #[test]
     fn test_sandbox_not_found() {
-        let state = ApiState::new().expect("failed to create API state for test");
+        let (_dir, state) = temp_api_state();
         assert!(matches!(
             state.get_sandbox("nope"),
             Err(ApiError::NotFound(_))
