@@ -9,7 +9,7 @@
 //! Communication is via vsock on port 6000.
 
 use smolvm_protocol::{
-    ports, AgentRequest, AgentResponse, ContainerInfo, RegistryAuth, PROTOCOL_VERSION,
+    error_codes, ports, AgentRequest, AgentResponse, ContainerInfo, RegistryAuth, PROTOCOL_VERSION,
 };
 use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
@@ -21,6 +21,7 @@ mod crun;
 mod oci;
 mod paths;
 mod process;
+mod retry;
 mod storage;
 mod vsock;
 
@@ -39,6 +40,13 @@ const IO_BUFFER_SIZE: usize = 4096;
 
 /// Default poll timeout in milliseconds for interactive I/O loop.
 const INTERACTIVE_POLL_TIMEOUT_MS: i32 = 100;
+
+/// Timeout for network connectivity test operations.
+/// Used in diagnostics/troubleshooting functions.
+const NETWORK_TEST_TIMEOUT_SECS: u64 = 10;
+
+/// Poll interval for checking process completion in VM exec.
+const PROCESS_POLL_INTERVAL_MS: u64 = 10;
 
 /// Get system uptime in milliseconds (for timing relative to boot).
 fn uptime_ms() -> u64 {
@@ -416,10 +424,10 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
             );
             send_response(
                 stream,
-                &AgentResponse::Error {
-                    message: format!("message size {} exceeds maximum {}", len, MAX_MESSAGE_SIZE),
-                    code: Some("MESSAGE_TOO_LARGE".to_string()),
-                },
+                &AgentResponse::error(
+                    format!("message size {} exceeds maximum {}", len, MAX_MESSAGE_SIZE),
+                    error_codes::MESSAGE_TOO_LARGE,
+                ),
             )?;
             continue;
         }
@@ -438,10 +446,10 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
                 warn!(error = %e, "invalid request");
                 send_response(
                     stream,
-                    &AgentResponse::Error {
-                        message: format!("invalid request: {}", e),
-                        code: Some("INVALID_REQUEST".to_string()),
-                    },
+                    &AgentResponse::error(
+                        format!("invalid request: {}", e),
+                        error_codes::INVALID_REQUEST,
+                    ),
                 )?;
                 continue;
             }
@@ -620,10 +628,10 @@ fn handle_request(request: AgentRequest) -> AgentResponse {
 
         AgentRequest::VmExec { .. } => {
             // Interactive mode should be handled by handle_interactive_vm_exec
-            AgentResponse::Error {
-                message: "interactive VM exec not handled here".into(),
-                code: Some("INTERNAL_ERROR".into()),
-            }
+            AgentResponse::error(
+                "interactive VM exec not handled here",
+                error_codes::INTERNAL_ERROR,
+            )
         }
 
         AgentRequest::Run {
@@ -646,16 +654,16 @@ fn handle_request(request: AgentRequest) -> AgentResponse {
 
         AgentRequest::Run { .. } => {
             // Interactive mode should be handled by handle_interactive_run
-            AgentResponse::Error {
-                message: "interactive mode not handled here".into(),
-                code: Some("INTERNAL_ERROR".into()),
-            }
+            AgentResponse::error(
+                "interactive mode not handled here",
+                error_codes::INTERNAL_ERROR,
+            )
         }
 
-        AgentRequest::Stdin { .. } | AgentRequest::Resize { .. } => AgentResponse::Error {
-            message: "stdin/resize only valid during interactive session".into(),
-            code: Some("INVALID_REQUEST".into()),
-        },
+        AgentRequest::Stdin { .. } | AgentRequest::Resize { .. } => AgentResponse::error(
+            "stdin/resize only valid during interactive session",
+            error_codes::INVALID_REQUEST,
+        ),
 
         // Container lifecycle
         AgentRequest::CreateContainer {
@@ -698,10 +706,10 @@ fn handle_request(request: AgentRequest) -> AgentResponse {
 
         AgentRequest::Exec { .. } => {
             // Interactive mode should be handled by handle_interactive_container_exec
-            AgentResponse::Error {
-                message: "interactive container exec not handled here".into(),
-                code: Some("INTERNAL_ERROR".into()),
-            }
+            AgentResponse::error(
+                "interactive container exec not handled here",
+                error_codes::INTERNAL_ERROR,
+            )
         }
 
         AgentRequest::ExportLayer {
@@ -730,10 +738,7 @@ fn handle_interactive_run(
         _ => {
             send_response(
                 stream,
-                &AgentResponse::Error {
-                    message: "expected Run request".into(),
-                    code: Some("INVALID_REQUEST".into()),
-                },
+                &AgentResponse::error("expected Run request", error_codes::INVALID_REQUEST),
             )?;
             return Ok(());
         }
@@ -745,13 +750,7 @@ fn handle_interactive_run(
     let rootfs = match storage::prepare_for_run(&image) {
         Ok(path) => path,
         Err(e) => {
-            send_response(
-                stream,
-                &AgentResponse::Error {
-                    message: e.to_string(),
-                    code: Some("RUN_FAILED".into()),
-                },
-            )?;
+            send_response(stream, &AgentResponse::from_err(e, error_codes::RUN_FAILED))?;
             return Ok(());
         }
     };
@@ -760,10 +759,7 @@ fn handle_interactive_run(
     if let Err(e) = storage::setup_mounts(&rootfs, &mounts) {
         send_response(
             stream,
-            &AgentResponse::Error {
-                message: e.to_string(),
-                code: Some("MOUNT_FAILED".into()),
-            },
+            &AgentResponse::from_err(e, error_codes::MOUNT_FAILED),
         )?;
         return Ok(());
     }
@@ -781,10 +777,7 @@ fn handle_interactive_run(
         Err(e) => {
             send_response(
                 stream,
-                &AgentResponse::Error {
-                    message: e.to_string(),
-                    code: Some("SPAWN_FAILED".into()),
-                },
+                &AgentResponse::from_err(e, error_codes::SPAWN_FAILED),
             )?;
             return Ok(());
         }
@@ -1201,62 +1194,65 @@ fn test_tcp_syscall(target: &str) -> serde_json::Value {
     // Extract host for HTTP Host header
     let host = target.split(':').next().unwrap_or(target);
 
-    let connect_result = match TcpStream::connect_timeout(&addr, Duration::from_secs(10)) {
-        Ok(mut stream) => {
-            // Try to set timeouts
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-            let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+    let connect_result =
+        match TcpStream::connect_timeout(&addr, Duration::from_secs(NETWORK_TEST_TIMEOUT_SECS)) {
+            Ok(mut stream) => {
+                // Try to set timeouts
+                let _ =
+                    stream.set_read_timeout(Some(Duration::from_secs(NETWORK_TEST_TIMEOUT_SECS)));
+                let _ =
+                    stream.set_write_timeout(Some(Duration::from_secs(NETWORK_TEST_TIMEOUT_SECS)));
 
-            // Send a simple HTTP request
-            let request = format!("GET / HTTP/1.0\r\nHost: {}\r\n\r\n", host);
-            match stream.write_all(request.as_bytes()) {
-                Ok(_) => {
-                    // Try to read the response
-                    let mut response = vec![0u8; 1024];
-                    match stream.read(&mut response) {
-                        Ok(n) => {
-                            let response_str =
-                                String::from_utf8_lossy(&response[..n.min(200)]).to_string();
-                            serde_json::json!({
-                                "success": true,
-                                "connected": true,
-                                "sent_request": true,
-                                "received_bytes": n,
-                                "response_preview": response_str,
-                            })
-                        }
-                        Err(e) => {
-                            serde_json::json!({
-                                "success": false,
-                                "connected": true,
-                                "sent_request": true,
-                                "read_error": format!("{}", e),
-                                "read_error_kind": format!("{:?}", e.kind()),
-                            })
+                // Send a simple HTTP request
+                let request = format!("GET / HTTP/1.0\r\nHost: {}\r\n\r\n", host);
+                match stream.write_all(request.as_bytes()) {
+                    Ok(_) => {
+                        // Try to read the response
+                        let mut response = vec![0u8; 1024];
+                        match stream.read(&mut response) {
+                            Ok(n) => {
+                                let response_str =
+                                    String::from_utf8_lossy(&response[..n.min(200)]).to_string();
+                                serde_json::json!({
+                                    "success": true,
+                                    "connected": true,
+                                    "sent_request": true,
+                                    "received_bytes": n,
+                                    "response_preview": response_str,
+                                })
+                            }
+                            Err(e) => {
+                                serde_json::json!({
+                                    "success": false,
+                                    "connected": true,
+                                    "sent_request": true,
+                                    "read_error": format!("{}", e),
+                                    "read_error_kind": format!("{:?}", e.kind()),
+                                })
+                            }
                         }
                     }
-                }
-                Err(e) => {
-                    serde_json::json!({
-                        "success": false,
-                        "connected": true,
-                        "write_error": format!("{}", e),
-                    })
+                    Err(e) => {
+                        serde_json::json!({
+                            "success": false,
+                            "connected": true,
+                            "write_error": format!("{}", e),
+                        })
+                    }
                 }
             }
-        }
-        Err(e) => {
-            // Get more details about the error
-            let raw_os_error = e.raw_os_error();
-            serde_json::json!({
-                "success": false,
-                "connected": false,
-                "error": format!("{}", e),
-                "error_kind": format!("{:?}", e.kind()),
-                "raw_os_error": raw_os_error,
-            })
-        }
-    };
+            Err(e) => {
+                // Get more details about the error
+                let raw_os_error = e.raw_os_error();
+                serde_json::json!({
+                    "success": false,
+                    "connected": false,
+                    "error": format!("{}", e),
+                    "error_kind": format!("{:?}", e.kind()),
+                    "raw_os_error": raw_os_error,
+                })
+            }
+        };
 
     // Also test socket syscall and lseek behavior using safe nix APIs
     #[cfg(target_os = "linux")]
@@ -1401,10 +1397,7 @@ fn handle_run(
             stdout: result.stdout,
             stderr: result.stderr,
         },
-        Err(e) => AgentResponse::Error {
-            message: e.to_string(),
-            code: Some("RUN_FAILED".to_string()),
-        },
+        Err(e) => AgentResponse::from_err(e, error_codes::RUN_FAILED),
     }
 }
 
@@ -1438,24 +1431,10 @@ fn handle_streaming_pull<S: Read + Write>(
         let _ = send_response(stream, &response);
     };
 
-    let response = match storage::pull_image_with_progress_and_auth(
-        image,
-        platform,
-        auth,
-        progress_callback,
-    ) {
-        Ok(info) => match serde_json::to_value(info) {
-            Ok(data) => AgentResponse::Ok { data: Some(data) },
-            Err(e) => AgentResponse::Error {
-                message: format!("failed to serialize image info: {}", e),
-                code: Some("SERIALIZATION_ERROR".to_string()),
-            },
-        },
-        Err(e) => AgentResponse::Error {
-            message: e.to_string(),
-            code: Some("PULL_FAILED".to_string()),
-        },
-    };
+    let response = AgentResponse::from_result(
+        storage::pull_image_with_progress_and_auth(image, platform, auth, progress_callback),
+        error_codes::PULL_FAILED,
+    );
 
     send_response(stream, &response)
 }
@@ -1470,117 +1449,64 @@ fn handle_pull(image: &str, platform: Option<&str>, auth: Option<&RegistryAuth>)
         "pulling image"
     );
 
-    match storage::pull_image_with_auth(image, platform, auth) {
-        Ok(info) => match serde_json::to_value(info) {
-            Ok(data) => AgentResponse::Ok { data: Some(data) },
-            Err(e) => AgentResponse::Error {
-                message: format!("failed to serialize image info: {}", e),
-                code: Some("SERIALIZATION_ERROR".to_string()),
-            },
-        },
-        Err(e) => AgentResponse::Error {
-            message: e.to_string(),
-            code: Some("PULL_FAILED".to_string()),
-        },
-    }
+    AgentResponse::from_result(
+        storage::pull_image_with_auth(image, platform, auth),
+        error_codes::PULL_FAILED,
+    )
 }
 
 /// Handle image query request.
 fn handle_query(image: &str) -> AgentResponse {
     match storage::query_image(image) {
-        Ok(Some(info)) => match serde_json::to_value(info) {
-            Ok(data) => AgentResponse::Ok { data: Some(data) },
-            Err(e) => AgentResponse::Error {
-                message: format!("failed to serialize image info: {}", e),
-                code: Some("SERIALIZATION_ERROR".to_string()),
-            },
-        },
-        Ok(None) => AgentResponse::Error {
-            message: format!("image not found: {}", image),
-            code: Some("NOT_FOUND".to_string()),
-        },
-        Err(e) => AgentResponse::Error {
-            message: e.to_string(),
-            code: Some("QUERY_FAILED".to_string()),
-        },
+        Ok(Some(info)) => AgentResponse::ok_with_data(info),
+        Ok(None) => AgentResponse::error(
+            format!("image not found: {}", image),
+            error_codes::NOT_FOUND,
+        ),
+        Err(e) => AgentResponse::from_err(e, error_codes::QUERY_FAILED),
     }
 }
 
 /// Handle list images request.
 fn handle_list_images() -> AgentResponse {
-    match storage::list_images() {
-        Ok(images) => match serde_json::to_value(images) {
-            Ok(data) => AgentResponse::Ok { data: Some(data) },
-            Err(e) => AgentResponse::Error {
-                message: format!("failed to serialize image list: {}", e),
-                code: Some("SERIALIZATION_ERROR".to_string()),
-            },
-        },
-        Err(e) => AgentResponse::Error {
-            message: e.to_string(),
-            code: Some("LIST_FAILED".to_string()),
-        },
-    }
+    AgentResponse::from_result(storage::list_images(), error_codes::LIST_FAILED)
 }
 
 /// Handle garbage collection request.
 fn handle_gc(dry_run: bool) -> AgentResponse {
     match storage::garbage_collect(dry_run) {
-        Ok(freed) => AgentResponse::Ok {
-            data: Some(serde_json::json!({
-                "freed_bytes": freed,
-                "dry_run": dry_run,
-            })),
-        },
-        Err(e) => AgentResponse::Error {
-            message: e.to_string(),
-            code: Some("GC_FAILED".to_string()),
-        },
+        Ok(freed) => AgentResponse::ok_with_data(serde_json::json!({
+            "freed_bytes": freed,
+            "dry_run": dry_run,
+        })),
+        Err(e) => AgentResponse::from_err(e, error_codes::GC_FAILED),
     }
 }
 
 /// Handle overlay preparation request.
 fn handle_prepare_overlay(image: &str, workload_id: &str) -> AgentResponse {
     info!(image = %image, workload_id = %workload_id, "preparing overlay");
-
-    match storage::prepare_overlay(image, workload_id) {
-        Ok(info) => match serde_json::to_value(info) {
-            Ok(data) => AgentResponse::Ok { data: Some(data) },
-            Err(e) => AgentResponse::Error {
-                message: format!("failed to serialize overlay info: {}", e),
-                code: Some("SERIALIZATION_ERROR".to_string()),
-            },
-        },
-        Err(e) => AgentResponse::Error {
-            message: e.to_string(),
-            code: Some("OVERLAY_FAILED".to_string()),
-        },
-    }
+    AgentResponse::from_result(
+        storage::prepare_overlay(image, workload_id),
+        error_codes::OVERLAY_FAILED,
+    )
 }
 
 /// Handle overlay cleanup request.
 fn handle_cleanup_overlay(workload_id: &str) -> AgentResponse {
     info!(workload_id = %workload_id, "cleaning up overlay");
-
     match storage::cleanup_overlay(workload_id) {
-        Ok(_) => AgentResponse::Ok { data: None },
-        Err(e) => AgentResponse::Error {
-            message: e.to_string(),
-            code: Some("CLEANUP_FAILED".to_string()),
-        },
+        Ok(_) => AgentResponse::ok(None),
+        Err(e) => AgentResponse::from_err(e, error_codes::CLEANUP_FAILED),
     }
 }
 
 /// Handle storage format request.
 fn handle_format_storage() -> AgentResponse {
     info!("formatting storage");
-
     match storage::format() {
-        Ok(_) => AgentResponse::Ok { data: None },
-        Err(e) => AgentResponse::Error {
-            message: e.to_string(),
-            code: Some("FORMAT_FAILED".to_string()),
-        },
+        Ok(_) => AgentResponse::ok(None),
+        Err(e) => AgentResponse::from_err(e, error_codes::FORMAT_FAILED),
     }
 }
 
@@ -1593,32 +1519,24 @@ fn handle_export_layer(image_digest: &str, layer_index: usize) -> AgentResponse 
     let tar_path = match storage::export_layer(image_digest, layer_index) {
         Ok(path) => path,
         Err(e) => {
-            return AgentResponse::Error {
-                message: e.to_string(),
-                code: Some("EXPORT_FAILED".to_string()),
-            };
+            return AgentResponse::from_err(e, error_codes::EXPORT_FAILED);
         }
     };
 
     // Get layer digest for metadata (verifies the layer exists)
     let _layer_digest = match storage::get_layer_digest(image_digest, layer_index) {
         Ok(d) => d,
-        Err(e) => {
-            return AgentResponse::Error {
-                message: e.to_string(),
-                code: Some("EXPORT_FAILED".to_string()),
-            };
-        }
+        Err(e) => return AgentResponse::from_err(e, error_codes::EXPORT_FAILED),
     };
 
     // Read the tar file
     let tar_data = match std::fs::read(&tar_path) {
         Ok(data) => data,
         Err(e) => {
-            return AgentResponse::Error {
-                message: format!("failed to read tar file: {}", e),
-                code: Some("EXPORT_FAILED".to_string()),
-            };
+            return AgentResponse::error(
+                format!("failed to read tar file: {}", e),
+                error_codes::EXPORT_FAILED,
+            );
         }
     };
 
@@ -1634,19 +1552,7 @@ fn handle_export_layer(image_digest: &str, layer_index: usize) -> AgentResponse 
 
 /// Handle storage status request.
 fn handle_storage_status() -> AgentResponse {
-    match storage::status() {
-        Ok(status) => match serde_json::to_value(status) {
-            Ok(data) => AgentResponse::Ok { data: Some(data) },
-            Err(e) => AgentResponse::Error {
-                message: format!("failed to serialize storage status: {}", e),
-                code: Some("SERIALIZATION_ERROR".to_string()),
-            },
-        },
-        Err(e) => AgentResponse::Error {
-            message: e.to_string(),
-            code: Some("STATUS_FAILED".to_string()),
-        },
-    }
+    AgentResponse::from_result(storage::status(), error_codes::STATUS_FAILED)
 }
 
 // ============================================================================
@@ -1664,10 +1570,7 @@ fn handle_vm_exec(
     info!(command = ?command, "executing directly in VM");
 
     if command.is_empty() {
-        return AgentResponse::Error {
-            message: "command cannot be empty".into(),
-            code: Some("INVALID_REQUEST".into()),
-        };
+        return AgentResponse::error("command cannot be empty", error_codes::INVALID_REQUEST);
     }
 
     let mut cmd = Command::new(&command[0]);
@@ -1690,10 +1593,10 @@ fn handle_vm_exec(
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
-            return AgentResponse::Error {
-                message: format!("failed to spawn command: {}", e),
-                code: Some("SPAWN_FAILED".into()),
-            };
+            return AgentResponse::error(
+                format!("failed to spawn command: {}", e),
+                error_codes::SPAWN_FAILED,
+            );
         }
     };
 
@@ -1742,13 +1645,13 @@ fn handle_vm_exec(
                         };
                     }
                 }
-                std::thread::sleep(std::time::Duration::from_millis(10));
+                std::thread::sleep(std::time::Duration::from_millis(PROCESS_POLL_INTERVAL_MS));
             }
             Err(e) => {
-                return AgentResponse::Error {
-                    message: format!("failed to check process status: {}", e),
-                    code: Some("WAIT_FAILED".into()),
-                };
+                return AgentResponse::error(
+                    format!("failed to check process status: {}", e),
+                    error_codes::WAIT_FAILED,
+                );
             }
         }
     }
@@ -1771,10 +1674,7 @@ fn handle_interactive_vm_exec(
         _ => {
             send_response(
                 stream,
-                &AgentResponse::Error {
-                    message: "expected VmExec request".into(),
-                    code: Some("INVALID_REQUEST".into()),
-                },
+                &AgentResponse::error("expected VmExec request", error_codes::INVALID_REQUEST),
             )?;
             return Ok(());
         }
@@ -1785,10 +1685,7 @@ fn handle_interactive_vm_exec(
     if command.is_empty() {
         send_response(
             stream,
-            &AgentResponse::Error {
-                message: "command cannot be empty".into(),
-                code: Some("INVALID_REQUEST".into()),
-            },
+            &AgentResponse::error("command cannot be empty", error_codes::INVALID_REQUEST),
         )?;
         return Ok(());
     }
@@ -1800,10 +1697,7 @@ fn handle_interactive_vm_exec(
         Err(e) => {
             send_response(
                 stream,
-                &AgentResponse::Error {
-                    message: e.to_string(),
-                    code: Some("SPAWN_FAILED".into()),
-                },
+                &AgentResponse::from_err(e, error_codes::SPAWN_FAILED),
             )?;
             return Ok(());
         }
@@ -1874,10 +1768,10 @@ fn handle_create_container(
             // Also start the container immediately
             if let Err(e) = container::start_container(&info.id) {
                 warn!(error = %e, "failed to start container after create");
-                return AgentResponse::Error {
-                    message: format!("container created but failed to start: {}", e),
-                    code: Some("START_FAILED".to_string()),
-                };
+                return AgentResponse::error(
+                    format!("container created but failed to start: {}", e),
+                    error_codes::START_FAILED,
+                );
             }
 
             let container_info = ContainerInfo {
@@ -1888,54 +1782,33 @@ fn handle_create_container(
                 command: info.command,
             };
 
-            match serde_json::to_value(container_info) {
-                Ok(data) => AgentResponse::Ok { data: Some(data) },
-                Err(e) => AgentResponse::Error {
-                    message: format!("failed to serialize container info: {}", e),
-                    code: Some("SERIALIZATION_ERROR".to_string()),
-                },
-            }
+            AgentResponse::ok_with_data(container_info)
         }
-        Err(e) => AgentResponse::Error {
-            message: e.to_string(),
-            code: Some("CREATE_FAILED".to_string()),
-        },
+        Err(e) => AgentResponse::from_err(e, error_codes::CREATE_FAILED),
     }
 }
 
 fn handle_start_container(container_id: &str) -> AgentResponse {
     info!(container_id = %container_id, "starting container");
-
     match container::start_container(container_id) {
-        Ok(()) => AgentResponse::Ok { data: None },
-        Err(e) => AgentResponse::Error {
-            message: e.to_string(),
-            code: Some("START_FAILED".to_string()),
-        },
+        Ok(()) => AgentResponse::ok(None),
+        Err(e) => AgentResponse::from_err(e, error_codes::START_FAILED),
     }
 }
 
 fn handle_stop_container(container_id: &str, timeout_secs: u64) -> AgentResponse {
     info!(container_id = %container_id, timeout_secs = timeout_secs, "stopping container");
-
     match container::stop_container(container_id, timeout_secs) {
-        Ok(()) => AgentResponse::Ok { data: None },
-        Err(e) => AgentResponse::Error {
-            message: e.to_string(),
-            code: Some("STOP_FAILED".to_string()),
-        },
+        Ok(()) => AgentResponse::ok(None),
+        Err(e) => AgentResponse::from_err(e, error_codes::STOP_FAILED),
     }
 }
 
 fn handle_delete_container(container_id: &str, force: bool) -> AgentResponse {
     info!(container_id = %container_id, force = force, "deleting container");
-
     match container::delete_container(container_id, force) {
-        Ok(()) => AgentResponse::Ok { data: None },
-        Err(e) => AgentResponse::Error {
-            message: e.to_string(),
-            code: Some("DELETE_FAILED".to_string()),
-        },
+        Ok(()) => AgentResponse::ok(None),
+        Err(e) => AgentResponse::from_err(e, error_codes::DELETE_FAILED),
     }
 }
 
@@ -1952,13 +1825,7 @@ fn handle_list_containers() -> AgentResponse {
         })
         .collect();
 
-    match serde_json::to_value(infos) {
-        Ok(data) => AgentResponse::Ok { data: Some(data) },
-        Err(e) => AgentResponse::Error {
-            message: format!("failed to serialize container list: {}", e),
-            code: Some("SERIALIZATION_ERROR".to_string()),
-        },
-    }
+    AgentResponse::ok_with_data(infos)
 }
 
 fn handle_exec(
@@ -1976,10 +1843,7 @@ fn handle_exec(
             stdout: result.stdout,
             stderr: result.stderr,
         },
-        Err(e) => AgentResponse::Error {
-            message: e.to_string(),
-            code: Some("EXEC_FAILED".to_string()),
-        },
+        Err(e) => AgentResponse::from_err(e, error_codes::EXEC_FAILED),
     }
 }
 
@@ -2001,10 +1865,7 @@ fn handle_interactive_container_exec(
         _ => {
             send_response(
                 stream,
-                &AgentResponse::Error {
-                    message: "expected Exec request".into(),
-                    code: Some("INVALID_REQUEST".into()),
-                },
+                &AgentResponse::error("expected Exec request", error_codes::INVALID_REQUEST),
             )?;
             return Ok(());
         }
@@ -2024,10 +1885,7 @@ fn handle_interactive_container_exec(
         Err(e) => {
             send_response(
                 stream,
-                &AgentResponse::Error {
-                    message: e.to_string(),
-                    code: Some("EXEC_FAILED".into()),
-                },
+                &AgentResponse::from_err(e, error_codes::EXEC_FAILED),
             )?;
             return Ok(());
         }

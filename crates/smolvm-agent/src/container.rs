@@ -34,6 +34,23 @@ use crate::storage;
 /// Error type for container operations (reuses storage error).
 pub use crate::storage::StorageError;
 
+// ============================================================================
+// Timeout Configuration Constants
+// ============================================================================
+
+/// Timeout for crun create/start operations in milliseconds.
+/// 10 seconds is generous for container creation which should be quick.
+const CRUN_OPERATION_TIMEOUT_MS: u64 = 10_000;
+
+/// Poll interval for checking crun operation completion.
+const CRUN_POLL_INTERVAL_MS: u64 = 100;
+
+/// Retry interval when waiting for registry lock acquisition.
+const LOCK_RETRY_INTERVAL_MS: u64 = 10;
+
+/// Poll interval when checking if a container has stopped.
+const CONTAINER_STOP_POLL_INTERVAL_MS: u64 = 100;
+
 /// Current schema version for the registry file format.
 ///
 /// Increment this when making breaking changes to the registry format.
@@ -143,7 +160,7 @@ impl RegistryLock {
             }
 
             // Wait a bit and retry
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(LOCK_RETRY_INTERVAL_MS));
         }
     }
 }
@@ -690,10 +707,10 @@ pub fn create_container(
         .spawn()
         .map_err(|e| StorageError::new(format!("failed to spawn crun create: {}", e)))?;
 
-    // Wait with timeout (10 seconds should be plenty for crun create)
-    let timeout = std::time::Duration::from_secs(10);
-    let start = std::time::Instant::now();
-    let poll_interval = std::time::Duration::from_millis(100);
+    // Wait with timeout for crun create
+    let timeout = Duration::from_millis(CRUN_OPERATION_TIMEOUT_MS);
+    let start = Instant::now();
+    let poll_interval = Duration::from_millis(CRUN_POLL_INTERVAL_MS);
 
     let status = loop {
         match child.try_wait() {
@@ -803,7 +820,7 @@ pub fn start_container(container_id: &str) -> Result<(), StorageError> {
                 .spawn()
                 .map_err(|e| StorageError::new(format!("failed to spawn crun start: {}", e)))?;
 
-            let result = wait_with_timeout(&mut child, Some(10_000), None)
+            let result = wait_with_timeout(&mut child, Some(CRUN_OPERATION_TIMEOUT_MS), None)
                 .map_err(|e| StorageError::new(format!("failed to wait for crun start: {}", e)))?;
 
             match result {
@@ -906,10 +923,10 @@ pub fn start_container(container_id: &str) -> Result<(), StorageError> {
                 .spawn()
                 .map_err(|e| StorageError::new(format!("failed to spawn crun create: {}", e)))?;
 
-            // Wait with timeout (10 seconds should be plenty for crun create)
-            let timeout = Duration::from_secs(10);
+            // Wait with timeout for crun create
+            let timeout = Duration::from_millis(CRUN_OPERATION_TIMEOUT_MS);
             let start = Instant::now();
-            let poll_interval = Duration::from_millis(100);
+            let poll_interval = Duration::from_millis(CRUN_POLL_INTERVAL_MS);
 
             let status = loop {
                 match child.try_wait() {
@@ -1195,7 +1212,7 @@ pub fn stop_container(container_id: &str, timeout_secs: u64) -> Result<(), Stora
                 return Ok(());
             }
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(CONTAINER_STOP_POLL_INTERVAL_MS));
     }
 
     // Force kill if still running

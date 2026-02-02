@@ -53,6 +53,8 @@ pub fn capture_child_output(child: &mut Child) -> ChildOutput {
 ///
 /// The poll_interval_ms parameter controls how often we check for completion
 /// (default: 10ms).
+///
+/// Handles EINTR (interrupted system call) by retrying the wait.
 pub fn wait_with_timeout(
     child: &mut Child,
     timeout_ms: Option<u64>,
@@ -62,14 +64,14 @@ pub fn wait_with_timeout(
     let deadline = timeout_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
 
     loop {
-        match child.try_wait()? {
-            Some(status) => {
+        match try_wait_with_eintr(child) {
+            Ok(Some(status)) => {
                 // Process completed
                 let output = capture_child_output(child);
                 let exit_code = status.code().unwrap_or(-1);
                 return Ok(WaitResult::Completed { exit_code, output });
             }
-            None => {
+            Ok(None) => {
                 // Still running - check timeout
                 if let Some(deadline) = deadline {
                     if Instant::now() >= deadline {
@@ -90,6 +92,24 @@ pub fn wait_with_timeout(
                 // Sleep before checking again
                 std::thread::sleep(poll_interval);
             }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Try to wait for a child process, handling EINTR by retrying.
+///
+/// EINTR can occur when a signal is delivered during the wait syscall.
+/// This is not a real error - we should just retry the wait.
+fn try_wait_with_eintr(child: &mut Child) -> std::io::Result<Option<std::process::ExitStatus>> {
+    loop {
+        match child.try_wait() {
+            Ok(status) => return Ok(status),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                // EINTR - signal interrupted the syscall, retry
+                continue;
+            }
+            Err(e) => return Err(e),
         }
     }
 }
@@ -98,6 +118,8 @@ pub fn wait_with_timeout(
 ///
 /// The on_timeout callback is called when the process times out, before
 /// killing it. This allows for custom cleanup (e.g., killing containers).
+///
+/// Handles EINTR (interrupted system call) by retrying the wait.
 pub fn wait_with_timeout_and_cleanup<F>(
     child: &mut Child,
     timeout_ms: Option<u64>,
@@ -110,13 +132,13 @@ where
     let deadline = timeout_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
 
     loop {
-        match child.try_wait()? {
-            Some(status) => {
+        match try_wait_with_eintr(child) {
+            Ok(Some(status)) => {
                 let output = capture_child_output(child);
                 let exit_code = status.code().unwrap_or(-1);
                 return Ok(WaitResult::Completed { exit_code, output });
             }
-            None => {
+            Ok(None) => {
                 if let Some(deadline) = deadline {
                     if Instant::now() >= deadline {
                         // Call custom cleanup before killing
@@ -137,6 +159,7 @@ where
 
                 std::thread::sleep(poll_interval);
             }
+            Err(e) => return Err(e),
         }
     }
 }

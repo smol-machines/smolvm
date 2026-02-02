@@ -488,7 +488,7 @@ pub fn pull_image_with_auth(
     let config_json: serde_json::Value =
         serde_json::from_str(&config).map_err(|e| StorageError(e.to_string()))?;
 
-    // Extract layers
+    // Extract layers with retry logic for transient failures
     let mut total_size = 0u64;
     for (i, layer_digest) in layers.iter().enumerate() {
         let layer_id = layer_digest.strip_prefix("sha256:").unwrap_or(layer_digest);
@@ -496,13 +496,11 @@ pub fn pull_image_with_auth(
 
         if is_layer_cached(&layer_dir) {
             info!(layer = %layer_id, "layer already cached");
+            // Still count cached layer size
+            if let Ok(size) = dir_size(&layer_dir) {
+                total_size += size;
+            }
             continue;
-        }
-
-        // Clean up empty/incomplete layer directory if it exists
-        if layer_dir.exists() {
-            warn!(layer = %layer_id, "removing empty/incomplete layer directory");
-            let _ = std::fs::remove_dir_all(&layer_dir);
         }
 
         info!(
@@ -511,47 +509,8 @@ pub fn pull_image_with_auth(
             "extracting layer"
         );
 
-        std::fs::create_dir_all(&layer_dir)?;
-
-        // Stream layer directly to tar extraction
-        // Include auth credentials via Docker config if provided
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg(format!(
-            "crane blob '{}@{}' {} | tar -xzf - -C '{}'",
-            image,
-            layer_digest,
-            platform
-                .map(|p| format!("--platform={}", p))
-                .unwrap_or_default(),
-            layer_dir.display()
-        ));
-
-        // Set up auth via Docker config file if credentials provided
-        if let Some(a) = auth {
-            let registry = extract_registry_from_image(image);
-            let docker_config_dir = std::path::Path::new("/tmp/crane-auth");
-            let _ = std::fs::create_dir_all(docker_config_dir);
-            let auth_b64 = base64_encode(&format!("{}:{}", a.username, a.password));
-            let config_json = format!(
-                r#"{{"auths":{{"{}":{{"auth":"{}"}}}}}}"#,
-                registry, auth_b64
-            );
-            let config_path = docker_config_dir.join("config.json");
-            if std::fs::write(&config_path, &config_json).is_ok() {
-                cmd.env("DOCKER_CONFIG", docker_config_dir);
-            }
-        }
-
-        let status = cmd.status()?;
-
-        if !status.success() {
-            // Clean up failed layer
-            let _ = std::fs::remove_dir_all(&layer_dir);
-            return Err(StorageError(format!(
-                "failed to extract layer {}",
-                layer_digest
-            )));
-        }
+        // Extract with retry logic for transient network failures
+        extract_layer_with_retry(image, layer_digest, &layer_dir, platform, auth)?;
 
         // Get layer size
         if let Ok(size) = dir_size(&layer_dir) {
@@ -748,7 +707,9 @@ where
         // Clean up empty/incomplete layer directory if it exists
         if layer_dir.exists() {
             warn!(layer = %layer_id, "removing empty/incomplete layer directory");
-            let _ = std::fs::remove_dir_all(&layer_dir);
+            if let Err(e) = std::fs::remove_dir_all(&layer_dir) {
+                warn!(layer = %layer_id, error = %e, "failed to remove incomplete layer directory");
+            }
         }
 
         info!(
@@ -791,7 +752,9 @@ where
         let status = cmd.status()?;
 
         if !status.success() {
-            let _ = std::fs::remove_dir_all(&layer_dir);
+            if let Err(e) = std::fs::remove_dir_all(&layer_dir) {
+                warn!(layer = %layer_id, error = %e, "failed to clean up layer directory after extraction failure");
+            }
             return Err(StorageError(format!(
                 "failed to extract layer {}",
                 layer_digest
@@ -1145,9 +1108,13 @@ impl OverlaySetup {
         // Clean up any previous overlay state - workdir must be empty for overlay mount
         if self.overlay_root.exists() {
             // Try to unmount if previously mounted
-            let _ = Command::new("umount").arg(&self.merged_path).output();
+            if let Err(e) = Command::new("umount").arg(&self.merged_path).output() {
+                debug!(path = %self.merged_path.display(), error = %e, "failed to unmount previous overlay (may not have been mounted)");
+            }
             // Remove old directories to ensure clean state
-            let _ = std::fs::remove_dir_all(&self.overlay_root);
+            if let Err(e) = std::fs::remove_dir_all(&self.overlay_root) {
+                warn!(path = %self.overlay_root.display(), error = %e, "failed to remove old overlay directory");
+            }
         }
 
         std::fs::create_dir_all(&self.upper_path)?;
@@ -1386,7 +1353,14 @@ pub fn cleanup_overlay(workload_id: &str) -> Result<()> {
 
     // Unmount main merged path if mounted
     if merged_path.exists() {
-        let _ = Command::new("umount").arg(&merged_path).status();
+        if let Err(e) = Command::new("umount").arg(&merged_path).status() {
+            debug!(
+                workload_id = %workload_id,
+                path = %merged_path.display(),
+                error = %e,
+                "failed to unmount overlay (may not have been mounted)"
+            );
+        }
     }
 
     // Remove overlay directories (includes merged_layers, upper, work, etc.)
@@ -1874,7 +1848,37 @@ fn base64_encode(input: &str) -> String {
 /// Run a crane command with the given operation.
 ///
 /// If auth is provided, creates a temporary Docker config for crane to use.
+/// Includes retry logic for transient network failures.
 fn run_crane(
+    operation: &str,
+    image: &str,
+    platform: Option<&str>,
+    auth: Option<&RegistryAuth>,
+) -> Result<String> {
+    use crate::retry::{
+        is_permanent_error, is_transient_network_error, retry_with_backoff, RetryConfig,
+    };
+
+    let op_name = format!("crane {}", operation);
+
+    retry_with_backoff(
+        RetryConfig::for_network(),
+        &op_name,
+        || run_crane_once(operation, image, platform, auth),
+        |e| {
+            let error_msg = e.to_string();
+            // Don't retry permanent errors
+            if is_permanent_error(&error_msg) {
+                return false;
+            }
+            // Retry transient network errors
+            is_transient_network_error(&error_msg)
+        },
+    )
+}
+
+/// Execute a single crane command attempt.
+fn run_crane_once(
     operation: &str,
     image: &str,
     platform: Option<&str>,
@@ -2043,6 +2047,96 @@ fn dir_size(path: &Path) -> Result<u64> {
     }
 
     Ok(size)
+}
+
+/// Extract a single layer with retry logic for transient network failures.
+///
+/// Cleans up failed extractions and retries on transient errors.
+fn extract_layer_with_retry(
+    image: &str,
+    layer_digest: &str,
+    layer_dir: &Path,
+    platform: Option<&str>,
+    auth: Option<&RegistryAuth>,
+) -> Result<()> {
+    use crate::retry::{
+        is_permanent_error, is_transient_network_error, retry_with_backoff, RetryConfig,
+    };
+
+    let layer_id = layer_digest.strip_prefix("sha256:").unwrap_or(layer_digest);
+    let op_name = format!("extract layer {}", &layer_id[..12.min(layer_id.len())]);
+
+    retry_with_backoff(
+        RetryConfig::for_network(),
+        &op_name,
+        || {
+            // Clean up any previous failed attempt
+            if layer_dir.exists() {
+                let _ = std::fs::remove_dir_all(layer_dir);
+            }
+            std::fs::create_dir_all(layer_dir)?;
+
+            // Stream layer directly to tar extraction
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c").arg(format!(
+                "crane blob '{}@{}' {} | tar -xzf - -C '{}'",
+                image,
+                layer_digest,
+                platform
+                    .map(|p| format!("--platform={}", p))
+                    .unwrap_or_default(),
+                layer_dir.display()
+            ));
+
+            // Set up auth via Docker config file if credentials provided
+            if let Some(a) = auth {
+                let registry = extract_registry_from_image(image);
+                let docker_config_dir = std::path::Path::new("/tmp/crane-auth");
+                let _ = std::fs::create_dir_all(docker_config_dir);
+                let auth_b64 = base64_encode(&format!("{}:{}", a.username, a.password));
+                let config_json = format!(
+                    r#"{{"auths":{{"{}":{{"auth":"{}"}}}}}}"#,
+                    registry, auth_b64
+                );
+                let config_path = docker_config_dir.join("config.json");
+                if std::fs::write(&config_path, &config_json).is_ok() {
+                    cmd.env("DOCKER_CONFIG", docker_config_dir);
+                }
+            }
+
+            let output = cmd.output()?;
+
+            if !output.status.success() {
+                // Clean up failed layer
+                let _ = std::fs::remove_dir_all(layer_dir);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(StorageError(format!(
+                    "failed to extract layer {}: {}",
+                    layer_digest, stderr
+                )));
+            }
+
+            // Verify extraction succeeded (directory is not empty)
+            if !is_layer_cached(layer_dir) {
+                let _ = std::fs::remove_dir_all(layer_dir);
+                return Err(StorageError(format!(
+                    "layer extraction produced empty directory: {}",
+                    layer_digest
+                )));
+            }
+
+            Ok(())
+        },
+        |e| {
+            let error_msg = e.to_string();
+            // Don't retry permanent errors
+            if is_permanent_error(&error_msg) {
+                return false;
+            }
+            // Retry transient network errors
+            is_transient_network_error(&error_msg)
+        },
+    )
 }
 
 #[cfg(test)]

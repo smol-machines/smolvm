@@ -18,6 +18,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod retry;
+
 /// Protocol version.
 pub const PROTOCOL_VERSION: u32 = 1;
 
@@ -346,6 +348,138 @@ pub enum AgentResponse {
         /// Whether this is the last chunk.
         done: bool,
     },
+}
+
+// ============================================================================
+// Error Code Constants
+// ============================================================================
+//
+// Standard error codes for AgentResponse::Error. Using constants ensures
+// consistency across the codebase and makes error handling more reliable.
+
+/// Error codes for agent responses.
+pub mod error_codes {
+    /// Request payload was invalid or malformed.
+    pub const INVALID_REQUEST: &str = "INVALID_REQUEST";
+    /// Requested resource was not found.
+    pub const NOT_FOUND: &str = "NOT_FOUND";
+    /// Internal error during operation.
+    pub const INTERNAL_ERROR: &str = "INTERNAL_ERROR";
+    /// Image pull operation failed.
+    pub const PULL_FAILED: &str = "PULL_FAILED";
+    /// Image query operation failed.
+    pub const QUERY_FAILED: &str = "QUERY_FAILED";
+    /// Command execution failed.
+    pub const RUN_FAILED: &str = "RUN_FAILED";
+    /// Command execution failed in container.
+    pub const EXEC_FAILED: &str = "EXEC_FAILED";
+    /// Process spawn failed.
+    pub const SPAWN_FAILED: &str = "SPAWN_FAILED";
+    /// Mount operation failed.
+    pub const MOUNT_FAILED: &str = "MOUNT_FAILED";
+    /// Overlay filesystem operation failed.
+    pub const OVERLAY_FAILED: &str = "OVERLAY_FAILED";
+    /// Cleanup operation failed.
+    pub const CLEANUP_FAILED: &str = "CLEANUP_FAILED";
+    /// Storage format operation failed.
+    pub const FORMAT_FAILED: &str = "FORMAT_FAILED";
+    /// Storage status query failed.
+    pub const STATUS_FAILED: &str = "STATUS_FAILED";
+    /// List operation failed.
+    pub const LIST_FAILED: &str = "LIST_FAILED";
+    /// Garbage collection failed.
+    pub const GC_FAILED: &str = "GC_FAILED";
+    /// Container creation failed.
+    pub const CREATE_FAILED: &str = "CREATE_FAILED";
+    /// Container start failed.
+    pub const START_FAILED: &str = "START_FAILED";
+    /// Container stop failed.
+    pub const STOP_FAILED: &str = "STOP_FAILED";
+    /// Container delete failed.
+    pub const DELETE_FAILED: &str = "DELETE_FAILED";
+    /// Export operation failed.
+    pub const EXPORT_FAILED: &str = "EXPORT_FAILED";
+    /// Serialization error.
+    pub const SERIALIZATION_ERROR: &str = "SERIALIZATION_ERROR";
+    /// Message size exceeds maximum.
+    pub const MESSAGE_TOO_LARGE: &str = "MESSAGE_TOO_LARGE";
+    /// Process wait operation failed.
+    pub const WAIT_FAILED: &str = "WAIT_FAILED";
+}
+
+impl AgentResponse {
+    /// Create an error response with the given message and code.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use smolvm_protocol::{AgentResponse, error_codes};
+    ///
+    /// let response = AgentResponse::error("image not found", error_codes::NOT_FOUND);
+    /// ```
+    pub fn error(message: impl Into<String>, code: &str) -> Self {
+        AgentResponse::Error {
+            message: message.into(),
+            code: Some(code.to_string()),
+        }
+    }
+
+    /// Create an error response from a Result's error, with the given code.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let response = some_operation()
+    ///     .map(|data| AgentResponse::ok_with_data(data))
+    ///     .unwrap_or_else(|e| AgentResponse::from_err(e, error_codes::PULL_FAILED));
+    /// ```
+    pub fn from_err<E: std::fmt::Display>(err: E, code: &str) -> Self {
+        AgentResponse::Error {
+            message: err.to_string(),
+            code: Some(code.to_string()),
+        }
+    }
+
+    /// Create an Ok response with optional JSON data.
+    pub fn ok(data: Option<serde_json::Value>) -> Self {
+        AgentResponse::Ok { data }
+    }
+
+    /// Create an Ok response with JSON-serializable data.
+    ///
+    /// Returns an error response if serialization fails.
+    pub fn ok_with_data<T: serde::Serialize>(data: T) -> Self {
+        match serde_json::to_value(data) {
+            Ok(value) => AgentResponse::Ok { data: Some(value) },
+            Err(e) => AgentResponse::error(
+                format!("failed to serialize response: {}", e),
+                error_codes::SERIALIZATION_ERROR,
+            ),
+        }
+    }
+
+    /// Convert a Result into an AgentResponse.
+    ///
+    /// On success, serializes the value to JSON. On error, creates an error response.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let response = AgentResponse::from_result(
+    ///     storage::pull_image(image),
+    ///     error_codes::PULL_FAILED,
+    /// );
+    /// ```
+    pub fn from_result<T, E>(result: Result<T, E>, error_code: &str) -> Self
+    where
+        T: serde::Serialize,
+        E: std::fmt::Display,
+    {
+        match result {
+            Ok(data) => Self::ok_with_data(data),
+            Err(e) => Self::from_err(e, error_code),
+        }
+    }
 }
 
 /// Image information returned by Query/ListImages.

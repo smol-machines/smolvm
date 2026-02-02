@@ -8,6 +8,34 @@
 //! - Daemon: Keep VM running for fast repeated exec (~50ms)
 
 use smolvm_pack::format::PackManifest;
+
+// ============================================================================
+// Timeout Configuration Constants
+// ============================================================================
+//
+// These values control various timeout behaviors for VM and agent operations.
+
+/// Timeout for waiting for the agent to become available after VM boot.
+/// 30 seconds allows for initial boot, filesystem setup, and agent initialization.
+const AGENT_READY_TIMEOUT_SECS: u64 = 30;
+
+/// Initial delay before first agent connection attempt.
+/// Gives the VM kernel and agent time to initialize before we start polling.
+const AGENT_INITIAL_DELAY_MS: u64 = 300;
+
+/// Interval between agent connection polling attempts.
+const AGENT_POLL_INTERVAL_MS: u64 = 100;
+
+/// Read timeout for socket operations during command execution.
+/// 5 minutes allows for long-running commands while preventing indefinite hangs.
+const SOCKET_READ_TIMEOUT_SECS: u64 = 300;
+
+/// Write timeout for socket operations.
+/// 30 seconds is sufficient for sending requests to the agent.
+const SOCKET_WRITE_TIMEOUT_SECS: u64 = 30;
+
+/// Delay before force-killing a daemon that didn't stop gracefully.
+const DAEMON_STOP_GRACE_PERIOD_MS: u64 = 500;
 use smolvm_protocol::ports;
 use std::ffi::{CStr, CString};
 use std::fs::{self, File};
@@ -280,7 +308,8 @@ pub fn launch_vm(config: LaunchConfig) -> Result<i32, String> {
             }
 
             // Wait for agent to be ready
-            let socket = wait_for_agent(&vsock_path, Duration::from_secs(30))?;
+            let socket =
+                wait_for_agent(&vsock_path, Duration::from_secs(AGENT_READY_TIMEOUT_SECS))?;
 
             // Build the command to run
             let run_command =
@@ -391,7 +420,7 @@ pub fn start_daemon(config: DaemonConfig) -> Result<(), String> {
             }
 
             // Wait for agent to be ready
-            match wait_for_agent(&vsock_path, Duration::from_secs(30)) {
+            match wait_for_agent(&vsock_path, Duration::from_secs(AGENT_READY_TIMEOUT_SECS)) {
                 Ok(_socket) => {
                     // Agent is ready, save state
                     let state = DaemonState {
@@ -444,8 +473,12 @@ pub fn exec_in_daemon(config: ExecConfig) -> Result<i32, String> {
     let socket = UnixStream::connect(&socket_path)
         .map_err(|e| format!("failed to connect to daemon: {}", e))?;
 
-    socket.set_read_timeout(Some(Duration::from_secs(300))).ok();
-    socket.set_write_timeout(Some(Duration::from_secs(30))).ok();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(SOCKET_READ_TIMEOUT_SECS)))
+        .ok();
+    socket
+        .set_write_timeout(Some(Duration::from_secs(SOCKET_WRITE_TIMEOUT_SECS)))
+        .ok();
 
     // Build command
     let run_command = build_run_command_from_config(&config.manifest, config.command.as_deref());
@@ -488,7 +521,7 @@ pub fn stop_daemon(cache_dir: &Path, debug: bool) -> Result<(), String> {
     }
 
     // Wait briefly for process to exit
-    std::thread::sleep(Duration::from_millis(500));
+    std::thread::sleep(Duration::from_millis(DAEMON_STOP_GRACE_PERIOD_MS));
 
     // If still running, force kill
     if is_process_alive(state.pid) {
@@ -614,8 +647,8 @@ fn create_or_copy_storage_disk(
 /// Wait for the agent to become available.
 fn wait_for_agent(socket_path: &Path, timeout: Duration) -> Result<UnixStream, String> {
     let start = std::time::Instant::now();
-    let initial_delay = Duration::from_millis(300); // Give agent time to start
-    let poll_interval = Duration::from_millis(100);
+    let initial_delay = Duration::from_millis(AGENT_INITIAL_DELAY_MS);
+    let poll_interval = Duration::from_millis(AGENT_POLL_INTERVAL_MS);
 
     // Initial delay to let VM and agent initialize before first connection attempt
     std::thread::sleep(initial_delay);
@@ -624,8 +657,12 @@ fn wait_for_agent(socket_path: &Path, timeout: Duration) -> Result<UnixStream, S
         match UnixStream::connect(socket_path) {
             Ok(stream) => {
                 // Set timeouts
-                stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
-                stream.set_write_timeout(Some(Duration::from_secs(30))).ok();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(SOCKET_WRITE_TIMEOUT_SECS)))
+                    .ok();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(SOCKET_WRITE_TIMEOUT_SECS)))
+                    .ok();
                 return Ok(stream);
             }
             Err(_) => {
