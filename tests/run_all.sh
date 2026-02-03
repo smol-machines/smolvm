@@ -65,6 +65,20 @@ echo "=========================================="
 echo "  smolvm Integration Test Suite"
 echo "=========================================="
 
+# Source common utilities for cleanup functions
+source "$SCRIPT_DIR/common.sh"
+
+# Ensure no orphan processes are holding the database lock
+echo ""
+echo -e "${BLUE}[INFO]${NC} Cleaning up any orphan smolvm processes..."
+kill_orphan_smolvm_processes
+if ! check_smolvm_processes; then
+    echo -e "${YELLOW}[WARN]${NC} Some smolvm processes still running - tests may fail with database lock errors"
+    ps aux | grep -E "(smolvm serve|smolvm-bin microvm|smolvm microvm)" | grep -v grep || true
+else
+    echo -e "${GREEN}[OK]${NC} No orphan processes detected"
+fi
+
 case "$TESTS_TO_RUN" in
     cli)
         run_suite "CLI Tests" "$SCRIPT_DIR/test_cli.sh"

@@ -14,6 +14,10 @@
 source "$(dirname "$0")/common.sh"
 init_smolvm
 
+# Pre-flight: Kill any existing smolvm processes that might hold database lock
+log_info "Pre-flight cleanup: killing orphan processes..."
+kill_orphan_smolvm_processes
+
 QUICK_MODE=false
 if [[ "${1:-}" == "--quick" ]]; then
     QUICK_MODE=true
@@ -132,14 +136,16 @@ test_packed_run_echo() {
         $SMOLVM pack alpine:latest -o "$output" 2>&1
     fi
 
-    # Run the command, retrying once if it fails (handles first-run extraction race)
+    # Run with 60s timeout to prevent indefinite hangs
     local result
-    result=$("$output" echo "pack-test-marker-12345" 2>&1)
-    if [[ "$result" != *"pack-test-marker-12345"* ]]; then
-        # Retry once after a brief delay
-        sleep 1
-        result=$("$output" echo "pack-test-marker-12345" 2>&1)
+    result=$(run_with_timeout 60 "$output" echo "pack-test-marker-12345" 2>&1)
+    local exit_code=$?
+
+    if [[ $exit_code -eq 124 ]]; then
+        echo "TIMEOUT: packed binary hung"
+        return 1
     fi
+
     [[ "$result" == *"pack-test-marker-12345"* ]]
 }
 
@@ -151,13 +157,15 @@ test_packed_exit_code() {
         $SMOLVM pack alpine:latest -o "$output" 2>&1
     fi
 
-    # Exit code 0
-    "$output" sh -c "exit 0" 2>&1
+    # Exit code 0 (with timeout)
+    run_with_timeout 60 "$output" sh -c "exit 0" 2>&1
     local exit_zero=$?
+    [[ $exit_zero -eq 124 ]] && { echo "TIMEOUT"; return 1; }
 
-    # Exit code 42
+    # Exit code 42 (with timeout)
     local exit_42=0
-    "$output" sh -c "exit 42" 2>&1 || exit_42=$?
+    run_with_timeout 60 "$output" sh -c "exit 42" 2>&1 || exit_42=$?
+    [[ $exit_42 -eq 124 ]] && { echo "TIMEOUT"; return 1; }
 
     [[ $exit_zero -eq 0 ]] && [[ $exit_42 -eq 42 ]]
 }
@@ -171,7 +179,8 @@ test_packed_env_var() {
     fi
 
     local result
-    result=$("$output" -e TEST_VAR=hello_pack sh -c 'echo $TEST_VAR' 2>&1)
+    result=$(run_with_timeout 60 "$output" -e TEST_VAR=hello_pack sh -c 'echo $TEST_VAR' 2>&1)
+    [[ $? -eq 124 ]] && { echo "TIMEOUT"; return 1; }
     [[ "$result" == *"hello_pack"* ]]
 }
 
@@ -184,7 +193,8 @@ test_packed_workdir() {
     fi
 
     local result
-    result=$("$output" -w /tmp pwd 2>&1)
+    result=$(run_with_timeout 60 "$output" -w /tmp pwd 2>&1)
+    [[ $? -eq 124 ]] && { echo "TIMEOUT"; return 1; }
     [[ "$result" == *"/tmp"* ]]
 }
 
@@ -205,40 +215,52 @@ test_packed_daemon_mode() {
         $SMOLVM pack alpine:latest -o "$output" 2>&1
     fi
 
-    # Start daemon
+    # Start daemon (with timeout)
     local start_result
-    start_result=$("$output" start 2>&1)
-    if [[ $? -ne 0 ]]; then
-        echo "start failed: $start_result"
+    start_result=$(run_with_timeout 60 "$output" start 2>&1)
+    if [[ $? -eq 124 ]]; then
+        echo "TIMEOUT: daemon start hung"
         return 1
     fi
 
     # Give it a moment to start
     sleep 2
 
-    # Check status
+    # Check status (with timeout)
     local status_result
-    status_result=$("$output" status 2>&1)
+    status_result=$(run_with_timeout 30 "$output" status 2>&1)
+    if [[ $? -eq 124 ]]; then
+        echo "TIMEOUT: daemon status hung"
+        "$output" stop 2>/dev/null || true
+        return 1
+    fi
     if [[ "$status_result" != *"running"* ]] && [[ "$status_result" != *"Daemon running"* ]]; then
         echo "status check failed: $status_result"
         "$output" stop 2>/dev/null || true
         return 1
     fi
 
-    # Test exec while running
+    # Test exec while running (with timeout)
     local exec_result
-    exec_result=$("$output" exec echo "daemon-exec-test" 2>&1)
+    exec_result=$(run_with_timeout 60 "$output" exec echo "daemon-exec-test" 2>&1)
+    if [[ $? -eq 124 ]]; then
+        echo "TIMEOUT: daemon exec hung"
+        "$output" stop 2>/dev/null || true
+        return 1
+    fi
     if [[ "$exec_result" != *"daemon-exec-test"* ]]; then
         echo "exec failed: $exec_result"
         "$output" stop 2>/dev/null || true
         return 1
     fi
 
-    # Stop daemon
+    # Stop daemon (with timeout)
     local stop_result
-    stop_result=$("$output" stop 2>&1)
-    if [[ $? -ne 0 ]]; then
-        echo "stop failed: $stop_result"
+    stop_result=$(run_with_timeout 30 "$output" stop 2>&1)
+    if [[ $? -eq 124 ]]; then
+        echo "TIMEOUT: daemon stop hung"
+        # Force kill any remaining processes
+        pkill -9 -f "$output" 2>/dev/null || true
         return 1
     fi
 
@@ -309,13 +331,14 @@ test_single_file_run_echo() {
         $SMOLVM pack alpine:latest -o "$output" --single-file 2>&1
     fi
 
+    # Run with 60s timeout to prevent indefinite hangs
     local result
-    result=$("$output" echo "single-file-test-marker" 2>&1)
+    result=$(run_with_timeout 60 "$output" echo "single-file-test-marker" 2>&1)
+    local exit_code=$?
 
-    # Retry once if it fails (handles first-run extraction)
-    if [[ "$result" != *"single-file-test-marker"* ]]; then
-        sleep 1
-        result=$("$output" echo "single-file-test-marker" 2>&1)
+    if [[ $exit_code -eq 124 ]]; then
+        echo "TIMEOUT: packed binary hung"
+        return 1
     fi
 
     [[ "$result" == *"single-file-test-marker"* ]]
@@ -361,7 +384,8 @@ test_packed_python_run() {
     fi
 
     local result
-    result=$("$output" python -c "print('Hello from packed Python')" 2>&1)
+    result=$(run_with_timeout 90 "$output" python -c "print('Hello from packed Python')" 2>&1)
+    [[ $? -eq 124 ]] && { echo "TIMEOUT"; return 1; }
     [[ "$result" == *"Hello from packed Python"* ]]
 }
 

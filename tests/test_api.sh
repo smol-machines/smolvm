@@ -16,6 +16,10 @@ echo "  smolvm HTTP API Tests (End-to-End)"
 echo "=========================================="
 echo ""
 
+# Pre-flight: Kill any existing smolvm processes that might hold database lock
+log_info "Pre-flight cleanup: killing orphan processes..."
+kill_orphan_smolvm_processes
+
 # API server configuration
 API_PORT=18080
 API_URL="http://127.0.0.1:$API_PORT"

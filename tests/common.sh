@@ -163,3 +163,101 @@ cleanup_container() {
     local container_id="$1"
     $SMOLVM container rm default "$container_id" -f 2>/dev/null || true
 }
+
+# Run a command with a timeout (default 60 seconds).
+# Usage: run_with_timeout [timeout_seconds] command [args...]
+# Returns the command's exit code, or 124 if timed out.
+# Output is written to stdout.
+run_with_timeout() {
+    local timeout_secs="${1:-60}"
+    shift
+
+    # Create temp file for output
+    local tmpfile
+    tmpfile=$(mktemp)
+
+    # Run command in background, redirecting output to temp file
+    "$@" > "$tmpfile" 2>&1 &
+    local pid=$!
+
+    # Wait with timeout
+    local count=0
+    while kill -0 "$pid" 2>/dev/null; do
+        sleep 1
+        ((count++))
+        if [[ $count -ge $timeout_secs ]]; then
+            echo "[TIMEOUT] Command timed out after ${timeout_secs}s: $*" >&2
+            # Kill the process and all its children
+            kill -9 "$pid" 2>/dev/null
+            pkill -9 -P "$pid" 2>/dev/null
+            wait "$pid" 2>/dev/null
+            cat "$tmpfile"
+            rm -f "$tmpfile"
+            return 124
+        fi
+    done
+
+    # Get exit code and output
+    wait "$pid"
+    local exit_code=$?
+    cat "$tmpfile"
+    rm -f "$tmpfile"
+    return $exit_code
+}
+
+# Kill any orphaned smolvm processes that might be holding the database lock.
+# This includes:
+#   - smolvm serve (API server)
+#   - smolvm-bin microvm start (VM processes from previous test runs)
+#   - Packed binaries running as daemons
+#
+# Call this before running tests to ensure clean state.
+kill_orphan_smolvm_processes() {
+    local killed=0
+
+    # Kill any smolvm serve processes
+    if pkill -f "smolvm serve" 2>/dev/null; then
+        ((killed++)) || true
+    fi
+    if pkill -f "smolvm-bin serve" 2>/dev/null; then
+        ((killed++)) || true
+    fi
+
+    # Kill any orphaned microvm processes (from smolvm-bin in dist/)
+    if pkill -f "smolvm-bin microvm start" 2>/dev/null; then
+        ((killed++)) || true
+    fi
+
+    # Kill any orphaned microvm processes (from target/release)
+    if pkill -f "smolvm microvm start" 2>/dev/null; then
+        ((killed++)) || true
+    fi
+
+    # Wait briefly for processes to die
+    if [[ $killed -gt 0 ]]; then
+        sleep 1
+    fi
+}
+
+# Check if any smolvm processes are running that might interfere with tests
+check_smolvm_processes() {
+    local procs
+    procs=$(pgrep -f "(smolvm serve|smolvm-bin microvm start|smolvm microvm start)" 2>/dev/null || true)
+    if [[ -n "$procs" ]]; then
+        return 1  # Processes found
+    fi
+    return 0  # No interfering processes
+}
+
+# Ensure clean test environment - call at start of test suite
+ensure_clean_test_environment() {
+    # First, try to kill any orphan processes
+    kill_orphan_smolvm_processes
+
+    # Verify they're gone
+    if ! check_smolvm_processes; then
+        log_info "Warning: Some smolvm processes are still running after cleanup"
+        log_info "Processes:"
+        ps aux | grep -E "(smolvm serve|smolvm-bin microvm|smolvm microvm)" | grep -v grep || true
+    fi
+}

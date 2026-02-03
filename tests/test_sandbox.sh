@@ -11,6 +11,10 @@
 source "$(dirname "$0")/common.sh"
 init_smolvm
 
+# Pre-flight: Kill any existing smolvm processes that might hold database lock
+log_info "Pre-flight cleanup: killing orphan processes..."
+kill_orphan_smolvm_processes
+
 echo ""
 echo "=========================================="
 echo "  smolvm Sandbox Tests"
