@@ -33,11 +33,12 @@ impl OpenapiCmd {
         let spec = ApiDoc::openapi();
 
         let output = match self.format {
-            OutputFormat::Json => spec
-                .to_pretty_json()
-                .map_err(|e| smolvm::Error::Config(format!("failed to serialize OpenAPI: {}", e)))?,
-            OutputFormat::Yaml => serde_yaml::to_string(&spec)
-                .map_err(|e| smolvm::Error::Config(format!("failed to serialize OpenAPI: {}", e)))?,
+            OutputFormat::Json => spec.to_pretty_json().map_err(|e| {
+                smolvm::Error::Config(format!("failed to serialize OpenAPI: {}", e))
+            })?,
+            OutputFormat::Yaml => serde_yaml::to_string(&spec).map_err(|e| {
+                smolvm::Error::Config(format!("failed to serialize OpenAPI: {}", e))
+            })?,
         };
 
         match &self.output {

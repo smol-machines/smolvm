@@ -10,7 +10,7 @@ use crate::agent::AgentManager;
 use crate::api::error::ApiError;
 use crate::api::state::{
     mount_spec_to_host_mount, port_spec_to_mapping, resource_spec_to_vm_resources,
-    restart_spec_to_config, ApiState, DbCloseGuard, ReservationGuard,
+    restart_spec_to_config, ApiState, DbCloseGuard, ReservationGuard, SandboxRegistration,
 };
 use crate::api::types::{
     ApiErrorResponse, CreateSandboxRequest, DeleteQuery, DeleteResponse, ListSandboxesResponse,
@@ -161,14 +161,14 @@ pub async fn create_sandbox(
     let pid = manager.child_pid();
 
     // Complete registration - consumes the guard
-    guard.complete(
+    guard.complete(SandboxRegistration {
         manager,
-        req.mounts.clone(),
-        req.ports.clone(),
-        resources.clone(),
-        restart_config,
+        mounts: req.mounts.clone(),
+        ports: req.ports.clone(),
+        resources: resources.clone(),
+        restart: restart_config,
         network,
-    )?;
+    })?;
 
     Ok(Json(SandboxInfo {
         name: req.name.clone(),

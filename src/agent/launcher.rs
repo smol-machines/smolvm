@@ -111,9 +111,7 @@ pub fn launch_agent_vm(
             // Disable implicit vsock to take explicit control
             if krun_disable_implicit_vsock(ctx) < 0 {
                 krun_free_ctx(ctx);
-                return Err(Error::AgentError(
-                    "failed to disable implicit vsock".into(),
-                ));
+                return Err(Error::AgentError("failed to disable implicit vsock".into()));
             }
 
             // Add vsock with TSI HIJACK_INET flag to enable network access

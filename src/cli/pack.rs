@@ -96,7 +96,14 @@ impl PackCmd {
         // Start agent to pull image and export layers
         println!("Starting agent VM...");
         let manager = AgentManager::new_default()?;
-        manager.start_with_config(Vec::new(), VmResources { cpus: 2, mem: 512, network: true })?;
+        manager.start_with_config(
+            Vec::new(),
+            VmResources {
+                cpus: 2,
+                mem: 512,
+                network: true,
+            },
+        )?;
         let mut client = manager.connect()?;
 
         // Pull image

@@ -219,7 +219,14 @@ impl CreateCmd {
         let ports: Vec<(u16, u16)> = self.port.iter().map(|p| (p.host, p.guest)).collect();
 
         // Create record
-        let record = VmRecord::new(self.name.clone(), self.cpus, self.mem, mounts, ports, self.net);
+        let record = VmRecord::new(
+            self.name.clone(),
+            self.cpus,
+            self.mem,
+            mounts,
+            ports,
+            self.net,
+        );
 
         // Store in config (persisted immediately to database)
         config.insert_vm(self.name.clone(), record)?;

@@ -141,7 +141,8 @@ impl Supervisor {
                 .collect();
             let mounts = mounts_result?;
             let ports: Vec<_> = entry_guard.ports.iter().map(port_spec_to_mapping).collect();
-            let resources = resource_spec_to_vm_resources(&entry_guard.resources, entry_guard.network);
+            let resources =
+                resource_spec_to_vm_resources(&entry_guard.resources, entry_guard.network);
             (mounts, ports, resources)
         };
 

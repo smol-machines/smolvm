@@ -37,6 +37,22 @@ pub struct SandboxEntry {
     pub network: bool,
 }
 
+/// Parameters for registering a new sandbox.
+pub struct SandboxRegistration {
+    /// The agent manager for this sandbox.
+    pub manager: AgentManager,
+    /// Host mounts to configure.
+    pub mounts: Vec<MountSpec>,
+    /// Port mappings to configure.
+    pub ports: Vec<PortSpec>,
+    /// VM resources to configure.
+    pub resources: ResourceSpec,
+    /// Restart configuration.
+    pub restart: RestartConfig,
+    /// Whether outbound network access is enabled.
+    pub network: bool,
+}
+
 /// RAII guard for sandbox name reservation.
 ///
 /// Automatically releases reservation on drop unless consumed by `complete()`.
@@ -51,7 +67,7 @@ pub struct SandboxEntry {
 /// let manager = AgentManager::for_vm(guard.name())?;
 ///
 /// // Complete registration, consuming the guard
-/// guard.complete(manager, mounts, ports, resources, restart)?;
+/// guard.complete(SandboxRegistration { manager, mounts, ports, resources, restart, network })?;
 /// ```
 pub struct ReservationGuard<'a> {
     state: &'a ApiState,
@@ -78,27 +94,12 @@ impl<'a> ReservationGuard<'a> {
     /// Complete registration, consuming the guard without releasing.
     ///
     /// This transfers ownership of the name to the sandbox registry.
-    pub fn complete(
-        mut self,
-        manager: AgentManager,
-        mounts: Vec<MountSpec>,
-        ports: Vec<PortSpec>,
-        resources: ResourceSpec,
-        restart: RestartConfig,
-        network: bool,
-    ) -> Result<(), ApiError> {
+    pub fn complete(mut self, registration: SandboxRegistration) -> Result<(), ApiError> {
         // Mark as completed before calling complete_sandbox_registration
         // (which will remove from reservations internally)
         self.completed = true;
-        self.state.complete_sandbox_registration(
-            self.name.clone(),
-            manager,
-            mounts,
-            ports,
-            resources,
-            restart,
-            network,
-        )
+        self.state
+            .complete_sandbox_registration(self.name.clone(), registration)
     }
 }
 
@@ -257,16 +258,7 @@ impl ApiState {
     }
 
     /// Register a new sandbox (also persists to database).
-    pub fn register_sandbox(
-        &self,
-        name: String,
-        manager: AgentManager,
-        mounts: Vec<MountSpec>,
-        ports: Vec<PortSpec>,
-        resources: ResourceSpec,
-        restart: RestartConfig,
-        network: bool,
-    ) -> Result<(), ApiError> {
+    pub fn register_sandbox(&self, name: String, reg: SandboxRegistration) -> Result<(), ApiError> {
         // Check for conflicts
         {
             let sandboxes = self.sandboxes.read();
@@ -281,17 +273,17 @@ impl ApiState {
         // Persist to database
         let record = VmRecord::new_with_restart(
             name.clone(),
-            resources.cpus.unwrap_or(crate::agent::DEFAULT_CPUS),
-            resources
+            reg.resources.cpus.unwrap_or(crate::agent::DEFAULT_CPUS),
+            reg.resources
                 .memory_mb
                 .unwrap_or(crate::agent::DEFAULT_MEMORY_MIB),
-            mounts
+            reg.mounts
                 .iter()
                 .map(|m| (m.source.clone(), m.target.clone(), m.readonly))
                 .collect(),
-            ports.iter().map(|p| (p.host, p.guest)).collect(),
-            network,
-            restart.clone(),
+            reg.ports.iter().map(|p| (p.host, p.guest)).collect(),
+            reg.network,
+            reg.restart.clone(),
         );
 
         if let Err(e) = self.db.insert_vm(&name, &record) {
@@ -303,12 +295,12 @@ impl ApiState {
         sandboxes.insert(
             name,
             Arc::new(parking_lot::Mutex::new(SandboxEntry {
-                manager,
-                mounts,
-                ports,
-                resources,
-                restart,
-                network,
+                manager: reg.manager,
+                mounts: reg.mounts,
+                ports: reg.ports,
+                resources: reg.resources,
+                restart: reg.restart,
+                network: reg.network,
             })),
         );
         Ok(())
@@ -479,12 +471,7 @@ impl ApiState {
     pub fn complete_sandbox_registration(
         &self,
         name: String,
-        manager: AgentManager,
-        mounts: Vec<MountSpec>,
-        ports: Vec<PortSpec>,
-        resources: ResourceSpec,
-        restart: RestartConfig,
-        network: bool,
+        reg: SandboxRegistration,
     ) -> Result<(), ApiError> {
         // Remove from reservations
         {
@@ -498,17 +485,17 @@ impl ApiState {
         // Persist to database (with conflict detection)
         let record = VmRecord::new_with_restart(
             name.clone(),
-            resources.cpus.unwrap_or(crate::agent::DEFAULT_CPUS),
-            resources
+            reg.resources.cpus.unwrap_or(crate::agent::DEFAULT_CPUS),
+            reg.resources
                 .memory_mb
                 .unwrap_or(crate::agent::DEFAULT_MEMORY_MIB),
-            mounts
+            reg.mounts
                 .iter()
                 .map(|m| (m.source.clone(), m.target.clone(), m.readonly))
                 .collect(),
-            ports.iter().map(|p| (p.host, p.guest)).collect(),
-            network,
-            restart.clone(),
+            reg.ports.iter().map(|p| (p.host, p.guest)).collect(),
+            reg.network,
+            reg.restart.clone(),
         );
 
         // Use insert_vm_if_not_exists for atomic database insert
@@ -519,12 +506,12 @@ impl ApiState {
                 sandboxes.insert(
                     name,
                     Arc::new(parking_lot::Mutex::new(SandboxEntry {
-                        manager,
-                        mounts,
-                        ports,
-                        resources,
-                        restart,
-                        network,
+                        manager: reg.manager,
+                        mounts: reg.mounts,
+                        ports: reg.ports,
+                        resources: reg.resources,
+                        restart: reg.restart,
+                        network: reg.network,
                     })),
                 );
                 Ok(())
