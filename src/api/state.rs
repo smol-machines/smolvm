@@ -283,6 +283,7 @@ impl ApiState {
                 .map(|m| (m.source.clone(), m.target.clone(), m.readonly))
                 .collect(),
             ports.iter().map(|p| (p.host, p.guest)).collect(),
+            true, // Enable network for sandboxes
             restart.clone(),
         );
 
@@ -496,6 +497,7 @@ impl ApiState {
                 .map(|m| (m.source.clone(), m.target.clone(), m.readonly))
                 .collect(),
             ports.iter().map(|p| (p.host, p.guest)).collect(),
+            true, // Enable network for sandboxes
             restart.clone(),
         );
 
@@ -705,6 +707,7 @@ pub fn resource_spec_to_vm_resources(spec: &ResourceSpec) -> VmResources {
     VmResources {
         cpus: spec.cpus.unwrap_or(crate::agent::DEFAULT_CPUS),
         mem: spec.memory_mb.unwrap_or(crate::agent::DEFAULT_MEMORY_MIB),
+        network: false, // TODO: Add network to ResourceSpec if needed
     }
 }
 

@@ -44,7 +44,12 @@ extern "C" {
     fn krun_set_port_map(ctx: u32, port_map: *const *const libc::c_char) -> i32;
     fn krun_add_virtiofs(ctx: u32, tag: *const libc::c_char, path: *const libc::c_char) -> i32;
     fn krun_start_enter(ctx: u32) -> i32;
+    fn krun_disable_implicit_vsock(ctx: u32) -> i32;
+    fn krun_add_vsock(ctx: u32, tsi_features: u32) -> i32;
 }
+
+// TSI (Transparent Socket Impersonation) feature flags
+const KRUN_TSI_HIJACK_INET: u32 = 1 << 0;
 
 /// Launch the agent VM (call in the forked child process).
 ///
@@ -94,14 +99,33 @@ pub fn launch_agent_vm(
             return Err(Error::AgentError("failed to set root filesystem".into()));
         }
 
-        // Set port map for TCP port forwarding (only if there are mappings)
-        // Note: Only call krun_set_port_map if we have actual mappings.
-        // An empty port map might interfere with TSI networking.
-        if !port_mappings.is_empty() {
+        // Enable TSI (Transparent Socket Impersonation) networking when requested.
+        // TSI allows the guest to access the network via the host's network stack
+        // by intercepting socket system calls and proxying them through vsock.
+        //
+        // Note: TSI supports TCP/UDP but not raw sockets (e.g., ICMP/ping).
+        //
+        // The default implicit vsock uses heuristics that may not enable TSI,
+        // so we explicitly configure it when network access is needed.
+        if resources.network || !port_mappings.is_empty() {
+            // Disable implicit vsock to take explicit control
+            if krun_disable_implicit_vsock(ctx) < 0 {
+                krun_free_ctx(ctx);
+                return Err(Error::AgentError(
+                    "failed to disable implicit vsock".into(),
+                ));
+            }
+
+            // Add vsock with TSI HIJACK_INET flag to enable network access
+            if krun_add_vsock(ctx, KRUN_TSI_HIJACK_INET) < 0 {
+                krun_free_ctx(ctx);
+                return Err(Error::AgentError("failed to add vsock with TSI".into()));
+            }
+
+            // Set port mappings for TCP port forwarding
             let port_cstrings: Vec<CString> = port_mappings
                 .iter()
                 .map(|p| {
-                    // Port numbers are always valid ASCII, so this cannot fail
                     CString::new(format!("{}:{}", p.host, p.guest))
                         .expect("port mapping format cannot contain null bytes")
                 })
@@ -116,8 +140,9 @@ pub fn launch_agent_vm(
             }
 
             tracing::debug!(
+                network = resources.network,
                 port_count = port_mappings.len(),
-                "configured port forwarding"
+                "configured TSI networking with HIJACK_INET"
             );
         }
 

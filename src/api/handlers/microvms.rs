@@ -147,8 +147,8 @@ pub async fn create_microvm(
     // Convert ports to storage format
     let ports: Vec<(u16, u16)> = req.ports.iter().map(|p| (p.host, p.guest)).collect();
 
-    // Create record
-    let record = VmRecord::new(name.clone(), cpus, mem, mounts, ports);
+    // Create record (enable network by default for API-created microvms)
+    let record = VmRecord::new(name.clone(), cpus, mem, mounts, ports, true);
 
     // Use atomic insert to detect conflicts
     let db = state.db();
@@ -233,6 +233,7 @@ pub async fn start_microvm(
     let resources = VmResources {
         cpus: record.cpus,
         mem: record.mem,
+        network: record.network,
     };
 
     // Start agent VM in blocking task
@@ -513,6 +514,7 @@ mod tests {
                 ("/host/ro".to_string(), "/guest/ro".to_string(), true),
             ],
             vec![(8080, 80), (3000, 3000)],
+            false,
         );
 
         let info = record_to_info("test-vm", &record);
@@ -528,7 +530,7 @@ mod tests {
 
     #[test]
     fn test_record_to_info_with_running_state() {
-        let mut record = VmRecord::new("running-vm".to_string(), 1, 512, vec![], vec![]);
+        let mut record = VmRecord::new("running-vm".to_string(), 1, 512, vec![], vec![], false);
         record.state = RecordState::Running;
         record.pid = Some(12345);
 
@@ -545,7 +547,7 @@ mod tests {
 
     #[test]
     fn test_record_to_info_default_values() {
-        let record = VmRecord::new("minimal-vm".to_string(), 1, 512, vec![], vec![]);
+        let record = VmRecord::new("minimal-vm".to_string(), 1, 512, vec![], vec![], false);
 
         let info = record_to_info("minimal-vm", &record);
 

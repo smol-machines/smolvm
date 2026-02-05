@@ -337,6 +337,7 @@ impl RunCmd {
         let resources = VmResources {
             cpus: self.cpus,
             mem: self.mem,
+            network: self.net,
         };
 
         // Start agent VM

@@ -418,6 +418,7 @@ mod tests {
             1024,
             vec![("/host".to_string(), "/guest".to_string(), false)],
             vec![(8080, 80)],
+            false,
         );
 
         // Insert
@@ -463,7 +464,7 @@ mod tests {
                 let db = db.clone();
                 std::thread::spawn(move || {
                     let name = format!("vm-{}", i);
-                    let record = VmRecord::new(name.clone(), 1, 512, vec![], vec![]);
+                    let record = VmRecord::new(name.clone(), 1, 512, vec![], vec![], false);
                     db.insert_vm(&name, &record).unwrap();
                 })
             })
@@ -516,7 +517,7 @@ mod tests {
         let (_dir, db) = temp_db();
 
         // Insert a VM before closing
-        let record = VmRecord::new("test-vm".to_string(), 1, 512, vec![], vec![]);
+        let record = VmRecord::new("test-vm".to_string(), 1, 512, vec![], vec![], false);
         db.insert_vm("test-vm", &record).unwrap();
 
         // Verify database is open
@@ -539,7 +540,7 @@ mod tests {
         assert_eq!(retrieved.name, "test-vm");
 
         // New operations should work
-        let record2 = VmRecord::new("test-vm2".to_string(), 2, 1024, vec![], vec![]);
+        let record2 = VmRecord::new("test-vm2".to_string(), 2, 1024, vec![], vec![], false);
         db.insert_vm("test-vm2", &record2).unwrap();
 
         let vms = db.list_vms().unwrap();
@@ -550,7 +551,7 @@ mod tests {
     fn test_insert_vm_if_not_exists() {
         let (_dir, db) = temp_db();
 
-        let record = VmRecord::new("test-vm".to_string(), 1, 512, vec![], vec![]);
+        let record = VmRecord::new("test-vm".to_string(), 1, 512, vec![], vec![], false);
 
         // First insert should succeed
         let inserted = db.insert_vm_if_not_exists("test-vm", &record).unwrap();
@@ -565,7 +566,7 @@ mod tests {
         assert_eq!(vms.len(), 1);
 
         // Different name should succeed
-        let record2 = VmRecord::new("test-vm2".to_string(), 2, 1024, vec![], vec![]);
+        let record2 = VmRecord::new("test-vm2".to_string(), 2, 1024, vec![], vec![], false);
         let inserted = db.insert_vm_if_not_exists("test-vm2", &record2).unwrap();
         assert!(inserted, "different name should succeed");
 
@@ -583,7 +584,7 @@ mod tests {
                 let db = db.clone();
                 std::thread::spawn(move || {
                     let record =
-                        VmRecord::new("contested-name".to_string(), 1, 512, vec![], vec![]);
+                        VmRecord::new("contested-name".to_string(), 1, 512, vec![], vec![], false);
                     db.insert_vm_if_not_exists("contested-name", &record)
                         .unwrap()
                 })

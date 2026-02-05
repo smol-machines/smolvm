@@ -51,6 +51,8 @@ pub struct VmResources {
     pub cpus: u8,
     /// Memory in MiB.
     pub mem: u32,
+    /// Enable outbound network access (TSI).
+    pub network: bool,
 }
 
 impl Default for VmResources {
@@ -58,6 +60,7 @@ impl Default for VmResources {
         Self {
             cpus: DEFAULT_CPUS,
             mem: DEFAULT_MEMORY_MIB,
+            network: false,
         }
     }
 }

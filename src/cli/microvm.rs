@@ -194,6 +194,10 @@ pub struct CreateCmd {
     /// Expose port from VM to host (can be used multiple times)
     #[arg(short = 'p', long = "port", value_parser = parse_port, value_name = "HOST:GUEST")]
     pub port: Vec<PortMapping>,
+
+    /// Enable outbound network access
+    #[arg(long)]
+    pub net: bool,
 }
 
 impl CreateCmd {
@@ -215,7 +219,7 @@ impl CreateCmd {
         let ports: Vec<(u16, u16)> = self.port.iter().map(|p| (p.host, p.guest)).collect();
 
         // Create record
-        let record = VmRecord::new(self.name.clone(), self.cpus, self.mem, mounts, ports);
+        let record = VmRecord::new(self.name.clone(), self.cpus, self.mem, mounts, ports, self.net);
 
         // Store in config (persisted immediately to database)
         config.insert_vm(self.name.clone(), record)?;
@@ -300,6 +304,7 @@ impl StartCmd {
         let resources = VmResources {
             cpus: record.cpus,
             mem: record.mem,
+            network: record.network,
         };
 
         // Start agent VM for this named VM

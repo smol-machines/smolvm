@@ -295,6 +295,10 @@ pub struct VmRecord {
     #[serde(default)]
     pub ports: Vec<(u16, u16)>,
 
+    /// Enable outbound network access (TSI).
+    #[serde(default)]
+    pub network: bool,
+
     /// Restart configuration.
     #[serde(default)]
     pub restart: RestartConfig,
@@ -320,6 +324,7 @@ impl VmRecord {
         mem: u32,
         mounts: Vec<(String, String, bool)>,
         ports: Vec<(u16, u16)>,
+        network: bool,
     ) -> Self {
         Self {
             name,
@@ -330,6 +335,7 @@ impl VmRecord {
             mem,
             mounts,
             ports,
+            network,
             restart: RestartConfig::default(),
             last_exit_code: None,
         }
@@ -342,6 +348,7 @@ impl VmRecord {
         mem: u32,
         mounts: Vec<(String, String, bool)>,
         ports: Vec<(u16, u16)>,
+        network: bool,
         restart: RestartConfig,
     ) -> Self {
         Self {
@@ -353,6 +360,7 @@ impl VmRecord {
             mem,
             mounts,
             ports,
+            network,
             restart,
             last_exit_code: None,
         }
@@ -393,6 +401,7 @@ mod tests {
             512,
             vec![("/host".to_string(), "/guest".to_string(), false)],
             vec![(8080, 80)],
+            false,
         );
 
         let json = serde_json::to_string(&record).unwrap();
@@ -410,7 +419,7 @@ mod tests {
             user_stopped: false,
         };
         let record =
-            VmRecord::new_with_restart("test".to_string(), 2, 512, vec![], vec![], restart);
+            VmRecord::new_with_restart("test".to_string(), 2, 512, vec![], vec![], false, restart);
 
         let json = serde_json::to_string(&record).unwrap();
         let deserialized: VmRecord = serde_json::from_str(&json).unwrap();
