@@ -16,6 +16,7 @@ use crate::api::types::{
     ApiErrorResponse, CreateSandboxRequest, DeleteQuery, DeleteResponse, ListSandboxesResponse,
     MountInfo, MountSpec, ResourceSpec, SandboxInfo,
 };
+use crate::api::validation::validate_resource_name;
 use crate::config::RecordState;
 
 /// Maximum sandbox name length.
@@ -45,65 +46,7 @@ fn mounts_to_info(mounts: &[MountSpec]) -> Vec<MountInfo> {
 /// - No consecutive hyphens
 /// - No path separators (/, \)
 fn validate_sandbox_name(name: &str) -> Result<(), ApiError> {
-    // Check length and get first/last chars safely
-    let first_char = name
-        .chars()
-        .next()
-        .ok_or_else(|| ApiError::BadRequest("sandbox name cannot be empty".into()))?;
-
-    if name.len() > MAX_NAME_LENGTH {
-        return Err(ApiError::BadRequest(format!(
-            "sandbox name too long: {} characters (max {})",
-            name.len(),
-            MAX_NAME_LENGTH
-        )));
-    }
-
-    // Check first character (must be alphanumeric)
-    if !first_char.is_ascii_alphanumeric() {
-        return Err(ApiError::BadRequest(
-            "sandbox name must start with a letter or digit".into(),
-        ));
-    }
-
-    // Check last character (cannot be hyphen)
-    // Safe to unwrap: we know string is non-empty from first_char check
-    let last_char = name.chars().last().expect("non-empty string has last char");
-    if last_char == '-' {
-        return Err(ApiError::BadRequest(
-            "sandbox name cannot end with a hyphen".into(),
-        ));
-    }
-
-    // Check all characters and patterns
-    let mut prev_was_hyphen = false;
-    for c in name.chars() {
-        if c == '-' {
-            if prev_was_hyphen {
-                return Err(ApiError::BadRequest(
-                    "sandbox name cannot contain consecutive hyphens".into(),
-                ));
-            }
-            prev_was_hyphen = true;
-        } else {
-            prev_was_hyphen = false;
-        }
-
-        // Check character whitelist
-        if !c.is_ascii_alphanumeric() && c != '-' && c != '_' {
-            if c == '/' || c == '\\' {
-                return Err(ApiError::BadRequest(
-                    "sandbox name cannot contain path separators".into(),
-                ));
-            }
-            return Err(ApiError::BadRequest(format!(
-                "sandbox name contains invalid character: '{}'",
-                c
-            )));
-        }
-    }
-
-    Ok(())
+    validate_resource_name(name, "sandbox", MAX_NAME_LENGTH)
 }
 
 /// Create a new sandbox.
@@ -391,7 +334,7 @@ pub async fn delete_sandbox(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
     Query(query): Query<DeleteQuery>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<Json<DeleteResponse>, ApiError> {
     // First, get the entry and stop the sandbox (before removing from registry).
     let entry = state.get_sandbox(&id)?;
 
@@ -433,9 +376,7 @@ pub async fn delete_sandbox(
     // Now remove from registry and database
     state.remove_sandbox(&id)?;
 
-    Ok(Json(serde_json::json!({
-        "deleted": id
-    })))
+    Ok(Json(DeleteResponse { deleted: id }))
 }
 
 #[cfg(test)]

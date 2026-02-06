@@ -20,6 +20,7 @@ pub mod handlers;
 pub mod state;
 pub mod supervisor;
 pub mod types;
+pub mod validation;
 
 use axum::{
     routing::{delete, get, post},
@@ -117,6 +118,8 @@ use state::ApiState;
         types::PullImageResponse,
         types::MicrovmInfo,
         types::ListMicrovmsResponse,
+        types::StartResponse,
+        types::StopResponse,
         types::DeleteResponse,
         types::ApiErrorResponse,
     ))

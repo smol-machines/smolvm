@@ -34,6 +34,7 @@ use crate::api::types::{
     ApiErrorResponse, CreateMicrovmRequest, DeleteResponse, ExecResponse, ListMicrovmsResponse,
     MicrovmExecRequest, MicrovmInfo,
 };
+use crate::api::validation::validate_resource_name;
 use crate::config::{RecordState, VmRecord};
 use crate::mount::MountBinding;
 
@@ -55,59 +56,7 @@ const MAX_NAME_LENGTH: usize = 40;
 /// - No consecutive hyphens
 /// - No path separators (/, \)
 fn validate_microvm_name(name: &str) -> Result<(), ApiError> {
-    let first_char = name
-        .chars()
-        .next()
-        .ok_or_else(|| ApiError::BadRequest("microvm name cannot be empty".into()))?;
-
-    if name.len() > MAX_NAME_LENGTH {
-        return Err(ApiError::BadRequest(format!(
-            "microvm name too long: {} characters (max {})",
-            name.len(),
-            MAX_NAME_LENGTH
-        )));
-    }
-
-    if !first_char.is_ascii_alphanumeric() {
-        return Err(ApiError::BadRequest(
-            "microvm name must start with a letter or digit".into(),
-        ));
-    }
-
-    let last_char = name.chars().last().expect("non-empty string has last char");
-    if last_char == '-' {
-        return Err(ApiError::BadRequest(
-            "microvm name cannot end with a hyphen".into(),
-        ));
-    }
-
-    let mut prev_was_hyphen = false;
-    for c in name.chars() {
-        if c == '-' {
-            if prev_was_hyphen {
-                return Err(ApiError::BadRequest(
-                    "microvm name cannot contain consecutive hyphens".into(),
-                ));
-            }
-            prev_was_hyphen = true;
-        } else {
-            prev_was_hyphen = false;
-        }
-
-        if !c.is_ascii_alphanumeric() && c != '-' && c != '_' {
-            if c == '/' || c == '\\' {
-                return Err(ApiError::BadRequest(
-                    "microvm name cannot contain path separators".into(),
-                ));
-            }
-            return Err(ApiError::BadRequest(format!(
-                "microvm name contains invalid character: '{}'",
-                c
-            )));
-        }
-    }
-
-    Ok(())
+    validate_resource_name(name, "microvm", MAX_NAME_LENGTH)
 }
 
 /// Convert VmRecord to MicrovmInfo.
@@ -419,7 +368,7 @@ pub async fn stop_microvm(
 pub async fn delete_microvm(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<Json<DeleteResponse>, ApiError> {
     let db = state.db();
 
     // Check if VM exists and get its state
@@ -458,9 +407,7 @@ pub async fn delete_microvm(
     // Remove from database
     db.remove_vm(&name).map_err(ApiError::database)?;
 
-    Ok(Json(serde_json::json!({
-        "deleted": name
-    })))
+    Ok(Json(DeleteResponse { deleted: name }))
 }
 
 /// Execute a command in a microvm.

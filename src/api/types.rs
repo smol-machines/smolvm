@@ -512,3 +512,19 @@ pub struct DeleteResponse {
     #[schema(example = "my-sandbox")]
     pub deleted: String,
 }
+
+/// Generic start response.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct StartResponse {
+    /// Identifier of started resource.
+    #[schema(example = "abc123")]
+    pub started: String,
+}
+
+/// Generic stop response.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct StopResponse {
+    /// Identifier of stopped resource.
+    #[schema(example = "abc123")]
+    pub stopped: String,
+}

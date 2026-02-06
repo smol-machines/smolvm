@@ -11,7 +11,8 @@ use crate::api::error::ApiError;
 use crate::api::state::{ensure_sandbox_running, ApiState};
 use crate::api::types::{
     ApiErrorResponse, ContainerExecRequest, ContainerInfo, CreateContainerRequest,
-    DeleteContainerRequest, ExecResponse, ListContainersResponse, StopContainerRequest,
+    DeleteContainerRequest, DeleteResponse, ExecResponse, ListContainersResponse, StartResponse,
+    StopContainerRequest, StopResponse,
 };
 
 /// Create a container in a sandbox.
@@ -142,7 +143,7 @@ pub async fn list_containers(
         ("cid" = String, Path, description = "Container ID")
     ),
     responses(
-        (status = 200, description = "Container started"),
+        (status = 200, description = "Container started", body = StartResponse),
         (status = 404, description = "Sandbox or container not found", body = ApiErrorResponse),
         (status = 500, description = "Failed to start container", body = ApiErrorResponse)
     )
@@ -150,7 +151,7 @@ pub async fn list_containers(
 pub async fn start_container(
     State(state): State<Arc<ApiState>>,
     Path((sandbox_id, container_id)): Path<(String, String)>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<Json<StartResponse>, ApiError> {
     let entry = state.get_sandbox(&sandbox_id)?;
 
     // Clone container_id for the response
@@ -166,9 +167,9 @@ pub async fn start_container(
     .await?
     .map_err(ApiError::internal)?;
 
-    Ok(Json(serde_json::json!({
-        "started": container_id_response
-    })))
+    Ok(Json(StartResponse {
+        started: container_id_response,
+    }))
 }
 
 /// Stop a container.
@@ -182,7 +183,7 @@ pub async fn start_container(
     ),
     request_body = StopContainerRequest,
     responses(
-        (status = 200, description = "Container stopped"),
+        (status = 200, description = "Container stopped", body = StopResponse),
         (status = 404, description = "Sandbox or container not found", body = ApiErrorResponse),
         (status = 500, description = "Failed to stop container", body = ApiErrorResponse)
     )
@@ -191,7 +192,7 @@ pub async fn stop_container(
     State(state): State<Arc<ApiState>>,
     Path((sandbox_id, container_id)): Path<(String, String)>,
     Json(req): Json<StopContainerRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<Json<StopResponse>, ApiError> {
     let entry = state.get_sandbox(&sandbox_id)?;
 
     let timeout_secs = req.timeout_secs;
@@ -209,9 +210,9 @@ pub async fn stop_container(
     .await?
     .map_err(ApiError::internal)?;
 
-    Ok(Json(serde_json::json!({
-        "stopped": container_id_response
-    })))
+    Ok(Json(StopResponse {
+        stopped: container_id_response,
+    }))
 }
 
 /// Delete a container.
@@ -225,7 +226,7 @@ pub async fn stop_container(
     ),
     request_body = DeleteContainerRequest,
     responses(
-        (status = 200, description = "Container deleted"),
+        (status = 200, description = "Container deleted", body = DeleteResponse),
         (status = 404, description = "Sandbox or container not found", body = ApiErrorResponse),
         (status = 500, description = "Failed to delete container", body = ApiErrorResponse)
     )
@@ -234,7 +235,7 @@ pub async fn delete_container(
     State(state): State<Arc<ApiState>>,
     Path((sandbox_id, container_id)): Path<(String, String)>,
     Json(req): Json<DeleteContainerRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<Json<DeleteResponse>, ApiError> {
     let entry = state.get_sandbox(&sandbox_id)?;
 
     let force = req.force;
@@ -252,9 +253,9 @@ pub async fn delete_container(
     .await?
     .map_err(ApiError::internal)?;
 
-    Ok(Json(serde_json::json!({
-        "deleted": container_id_response
-    })))
+    Ok(Json(DeleteResponse {
+        deleted: container_id_response,
+    }))
 }
 
 /// Execute a command in a container.
