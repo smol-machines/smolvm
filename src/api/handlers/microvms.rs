@@ -75,6 +75,25 @@ fn record_to_info(name: &str, record: &VmRecord) -> MicrovmInfo {
     }
 }
 
+/// Attempt graceful shutdown, then force-terminate if still running.
+fn shutdown_microvm_process(name: &str, pid: Option<i32>) {
+    // Try graceful shutdown via vsock first.
+    if let Ok(manager) = AgentManager::for_vm(name) {
+        if let Ok(mut client) = crate::agent::AgentClient::connect(manager.vsock_socket()) {
+            let _ = client.shutdown();
+        }
+    }
+
+    // Fall back to PID-based signal handling.
+    if let Some(pid) = pid {
+        crate::process::terminate(pid);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if crate::process::is_alive(pid) {
+            crate::process::kill(pid);
+        }
+    }
+}
+
 /// Create a new microvm.
 #[utoipa::path(
     post,
@@ -311,25 +330,7 @@ pub async fn stop_microvm(
     let name_clone = name.clone();
     let db_clone = db.clone();
     tokio::task::spawn_blocking(move || {
-        // First try graceful shutdown via vsock
-        if let Ok(manager) = AgentManager::for_vm(&name_clone) {
-            // manager.stop() won't work because it creates a new manager without the child
-            // But we can use it to get the vsock socket path and try graceful shutdown
-            if let Ok(mut client) = crate::agent::AgentClient::connect(manager.vsock_socket()) {
-                let _ = client.shutdown();
-            }
-        }
-
-        // Terminate the process using PID from database
-        if let Some(pid) = pid {
-            crate::process::terminate(pid);
-            // Give it a moment to exit gracefully
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            // Force kill if still running
-            if crate::process::is_alive(pid) {
-                crate::process::kill(pid);
-            }
-        }
+        shutdown_microvm_process(&name_clone, pid);
 
         // Update state in database
         if let Err(e) = db_clone.update_vm(&name_clone, |r| {
@@ -383,23 +384,7 @@ pub async fn delete_microvm(
     // Stop if running (in blocking task)
     let name_clone = name.clone();
     tokio::task::spawn_blocking(move || {
-        // First try graceful shutdown via vsock
-        if let Ok(manager) = AgentManager::for_vm(&name_clone) {
-            if let Ok(mut client) = crate::agent::AgentClient::connect(manager.vsock_socket()) {
-                let _ = client.shutdown();
-            }
-        }
-
-        // Terminate the process using PID from database
-        if let Some(pid) = pid {
-            crate::process::terminate(pid);
-            // Give it a moment to exit gracefully
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            // Force kill if still running
-            if crate::process::is_alive(pid) {
-                crate::process::kill(pid);
-            }
-        }
+        shutdown_microvm_process(&name_clone, pid);
     })
     .await
     .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
