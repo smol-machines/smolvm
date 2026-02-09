@@ -23,7 +23,6 @@ const CONFIG_TABLE: TableDefinition<&str, &str> = TableDefinition::new("config")
 #[derive(Clone)]
 pub struct SmolvmDb {
     db: Arc<RwLock<Option<Database>>>,
-    path: PathBuf,
 }
 
 impl std::fmt::Debug for SmolvmDb {
@@ -58,44 +57,12 @@ impl SmolvmDb {
 
         let instance = Self {
             db: Arc::new(RwLock::new(Some(db))),
-            path: path.to_path_buf(),
         };
 
         // Initialize tables
         instance.init_tables()?;
 
         Ok(instance)
-    }
-
-    /// Temporarily close the database to release file locks.
-    ///
-    /// This is used before forking child processes to prevent them from
-    /// inheriting the database file descriptor and holding the lock.
-    ///
-    /// Call `reopen()` after the fork to restore database access.
-    pub fn close_temporarily(&self) {
-        let mut db = self.db.write();
-        *db = None;
-        tracing::debug!("database closed temporarily");
-    }
-
-    /// Reopen the database after a temporary close.
-    ///
-    /// Call this after forking to restore database access.
-    pub fn reopen(&self) -> Result<()> {
-        let mut db = self.db.write();
-        if db.is_none() {
-            let new_db = Database::create(&self.path)
-                .map_err(|e| Error::database("reopen", e.to_string()))?;
-            *db = Some(new_db);
-            tracing::debug!("database reopened");
-        }
-        Ok(())
-    }
-
-    /// Check if the database is currently open.
-    pub fn is_open(&self) -> bool {
-        self.db.read().is_some()
     }
 
     /// Get the default database path.
@@ -568,41 +535,6 @@ mod tests {
         // Remove should return None for non-existent VM
         let result = db.remove_vm("nonexistent").unwrap();
         assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_close_and_reopen() {
-        let (_dir, db) = temp_db();
-
-        // Insert a VM before closing
-        let record = VmRecord::new("test-vm".to_string(), 1, 512, vec![], vec![], false);
-        db.insert_vm("test-vm", &record).unwrap();
-
-        // Verify database is open
-        assert!(db.is_open());
-
-        // Close temporarily
-        db.close_temporarily();
-        assert!(!db.is_open());
-
-        // Operations should fail while closed
-        assert!(db.get_vm("test-vm").is_err());
-        assert!(db.list_vms().is_err());
-
-        // Reopen
-        db.reopen().unwrap();
-        assert!(db.is_open());
-
-        // Data should still be there after reopen
-        let retrieved = db.get_vm("test-vm").unwrap().unwrap();
-        assert_eq!(retrieved.name, "test-vm");
-
-        // New operations should work
-        let record2 = VmRecord::new("test-vm2".to_string(), 2, 1024, vec![], vec![], false);
-        db.insert_vm("test-vm2", &record2).unwrap();
-
-        let vms = db.list_vms().unwrap();
-        assert_eq!(vms.len(), 2);
     }
 
     #[test]

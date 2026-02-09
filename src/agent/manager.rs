@@ -22,13 +22,8 @@ use super::{HostMount, PortMapping, VmResources};
 /// Timeout for the agent to become ready after starting.
 const AGENT_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Poll interval when waiting for agent readiness.
-/// Use aggressive polling initially to reduce cold start latency.
-const AGENT_POLL_INTERVAL: Duration = Duration::from_millis(10);
-
-/// Number of aggressive poll attempts before backing off.
-/// At 10ms intervals, this covers ~100ms of aggressive polling.
-const AGGRESSIVE_POLL_COUNT: u32 = 10;
+// Re-use shared polling constants from process module.
+use crate::process::{FAST_POLL_COUNT, FAST_POLL_INTERVAL};
 
 /// Timeout for agent to stop gracefully before force kill.
 /// Reduced from 5s - VMs typically exit within 100ms after shutdown signal.
@@ -48,6 +43,17 @@ pub enum AgentState {
     Running,
     /// Agent is shutting down.
     Stopping,
+}
+
+impl std::fmt::Display for AgentState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AgentState::Stopped => write!(f, "stopped"),
+            AgentState::Starting => write!(f, "starting"),
+            AgentState::Running => write!(f, "running"),
+            AgentState::Stopping => write!(f, "stopping"),
+        }
+    }
 }
 
 /// Get the Docker config directory path.
@@ -258,6 +264,51 @@ impl AgentManager {
         self.state() == AgentState::Running
     }
 
+    /// If cached state is Running but the process is not actually alive,
+    /// reset to Stopped so that start paths can proceed. This handles the
+    /// case where a VM crashed without going through `stop()`.
+    fn reset_stale_running_state(&self) {
+        let mut inner = self.inner.lock();
+        if inner.state == AgentState::Running && !self.is_process_alive_inner(&inner) {
+            tracing::info!("resetting stale Running state to Stopped (VM process is dead)");
+            inner.state = AgentState::Stopped;
+            inner.child = None;
+        }
+    }
+
+    /// Return the effective agent state, correcting for stale cached state.
+    ///
+    /// If cached state is `Running` but the process is dead, returns `Stopped`.
+    /// Use this for API-facing status rather than `state()`.
+    pub fn effective_state(&self) -> AgentState {
+        let inner = self.inner.lock();
+        if inner.state == AgentState::Running && !self.is_process_alive_inner(&inner) {
+            AgentState::Stopped
+        } else {
+            inner.state
+        }
+    }
+
+    /// Return consistent (state, pid) for API status responses.
+    ///
+    /// Uses `effective_state` for the state and clears the PID when the
+    /// effective state is `Stopped`, so clients never see a stale PID
+    /// paired with a stopped state.
+    pub fn effective_status(&self) -> (AgentState, Option<i32>) {
+        let inner = self.inner.lock();
+        let state = if inner.state == AgentState::Running && !self.is_process_alive_inner(&inner) {
+            AgentState::Stopped
+        } else {
+            inner.state
+        };
+        let pid = if state == AgentState::Stopped {
+            None
+        } else {
+            inner.child.as_ref().map(|c| c.pid())
+        };
+        (state, pid)
+    }
+
     /// Get the vsock socket path.
     pub fn vsock_socket(&self) -> &Path {
         &self.vsock_socket
@@ -282,12 +333,40 @@ impl AgentManager {
     /// Falls back to reading the PID file if no PID is provided.
     /// Returns Some(()) if agent is running and reachable, None otherwise.
     pub fn try_connect_existing_with_pid(&self, pid: Option<i32>) -> Option<()> {
+        self.try_connect_existing_with_pid_and_start_time(pid, None)
+    }
+
+    /// Try to reconnect to an existing agent with a known PID and expected start time.
+    ///
+    /// The `expected_start_time` is the start time stored when the VM was originally
+    /// launched. If provided, it is used to verify the PID hasn't been recycled by the OS.
+    pub fn try_connect_existing_with_pid_and_start_time(
+        &self,
+        pid: Option<i32>,
+        expected_start_time: Option<u64>,
+    ) -> Option<()> {
         if !self.vsock_socket.exists() {
             return None;
         }
 
-        // Resolve PID: use provided PID, or fall back to PID file
-        let effective_pid = pid.or_else(|| self.read_pid_file());
+        // Resolve PID and start time.
+        // If caller provides expected_start_time, use it (DB source of truth).
+        // Otherwise fall back to PID file which stores both PID and start time.
+        let (effective_pid, pid_start_time) = if let Some(p) = pid {
+            (
+                Some(p),
+                expected_start_time.or_else(|| {
+                    // Caller didn't provide start time — try PID file as fallback
+                    self.read_pid_file_with_start_time()
+                        .and_then(|(file_pid, st)| if file_pid == p { st } else { None })
+                }),
+            )
+        } else {
+            match self.read_pid_file_with_start_time() {
+                Some((p, st)) => (Some(p), st),
+                None => (None, None),
+            }
+        };
 
         // Try to ping the agent
         if let Ok(mut client) = super::AgentClient::connect(&self.vsock_socket) {
@@ -295,10 +374,16 @@ impl AgentManager {
                 // Update internal state to reflect running
                 let mut inner = self.inner.lock();
                 inner.state = AgentState::Running;
-                // Set the child process if PID is known and process is alive
+                // Only store child PID if identity is verified via start time.
+                // Without verification, stop() could signal the wrong process.
                 if let Some(p) = effective_pid {
-                    if process::is_alive(p) {
+                    if process::is_our_process_strict(p, pid_start_time) {
                         inner.child = Some(ChildProcess::new(p));
+                    } else {
+                        tracing::debug!(
+                            pid = p,
+                            "skipping child PID storage: identity not verified"
+                        );
                     }
                 }
                 return Some(());
@@ -308,16 +393,46 @@ impl AgentManager {
         None
     }
 
-    /// Read the PID from the PID file, if it exists and contains a valid PID.
-    fn read_pid_file(&self) -> Option<i32> {
-        std::fs::read_to_string(&self.pid_file)
-            .ok()
-            .and_then(|s| s.trim().parse::<i32>().ok())
+    /// Read PID and start time from the PID file.
+    fn read_pid_file_with_start_time(&self) -> Option<(i32, Option<u64>)> {
+        let content = std::fs::read_to_string(&self.pid_file).ok()?;
+        let mut lines = content.lines();
+        let pid = lines.next()?.trim().parse::<i32>().ok()?;
+        let start_time = lines.next().and_then(|s| s.trim().parse::<u64>().ok());
+        Some((pid, start_time))
     }
 
     /// Get the child PID if known.
     pub fn child_pid(&self) -> Option<i32> {
         self.inner.lock().child.as_ref().map(|c| c.pid())
+    }
+
+    /// Check if the VM process is actually alive using start-time-aware
+    /// verification.
+    ///
+    /// Checks in-memory child handle first, then falls back to PID file.
+    /// Returns `false` when neither source provides a PID (fail-closed).
+    /// Uses `is_our_process` (lenient) so that a live process without
+    /// start-time data is assumed to be ours rather than silently ignored.
+    pub fn is_process_alive(&self) -> bool {
+        let inner = self.inner.lock();
+        self.is_process_alive_inner(&inner)
+    }
+
+    /// Inner liveness check that accepts a lock guard to avoid double-locking.
+    fn is_process_alive_inner(&self, inner: &AgentInner) -> bool {
+        // Try in-memory child handle first (has stored start time)
+        if let Some(child) = inner.child.as_ref() {
+            return crate::process::is_our_process(child.pid(), child.start_time());
+        }
+
+        // Fall back to PID file (covers orphan/reconnect paths)
+        if let Some((pid, start_time)) = self.read_pid_file_with_start_time() {
+            return crate::process::is_our_process(pid, start_time);
+        }
+
+        // No PID source — fail closed
+        false
     }
 
     /// Connect to the running agent and return a client.
@@ -396,6 +511,10 @@ impl AgentManager {
         if needs_restart {
             tracing::info!("restarting agent VM due to configuration change");
             self.stop()?;
+        } else {
+            // try_connect_existing failed but state may still be Running (crashed VM).
+            // Reset to Stopped so start_with_full_config can proceed.
+            self.reset_stale_running_state();
         }
 
         // Start with new config
@@ -412,11 +531,15 @@ impl AgentManager {
             return Ok(());
         }
 
-        // Otherwise, check internal state
+        // try_connect_existing failed — if state is stale Running (crashed VM),
+        // reset to Stopped so we can start fresh.
+        self.reset_stale_running_state();
+
+        // Check internal state
         let state = self.state();
 
         match state {
-            AgentState::Running => Ok(()),
+            AgentState::Running => Ok(()), // shouldn't reach here after reset, but safe
             AgentState::Starting => self.wait_for_ready(),
             AgentState::Stopped => self.start(),
             AgentState::Stopping => {
@@ -508,7 +631,11 @@ impl AgentManager {
         crate::process::install_sigchld_handler();
 
         // Clean up old socket
-        let _ = std::fs::remove_file(&self.vsock_socket);
+        if let Err(e) = std::fs::remove_file(&self.vsock_socket) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::debug!(error = %e, path = %self.vsock_socket.display(), "failed to remove old socket");
+            }
+        }
 
         // Clone paths for the child process (owned copies)
         let rootfs_path = self.rootfs_path.clone();
@@ -520,9 +647,8 @@ impl AgentManager {
         // The child becomes a session leader (detached from parent's session)
         // so the VM survives if the parent process is killed.
         let child_pid = match process::fork_session_leader(move || {
-            // NOTE: Database file descriptors are handled by the caller closing
-            // the database before fork and reopening after. This avoids the
-            // fragile approach of closing fds in a range.
+            // Inherited file descriptors (including database locks) are closed
+            // by fork_session_leader before this closure runs.
 
             // All libkrun setup happens here in the child, same as the regular run path.
             // This ensures DYLD_LIBRARY_PATH is still available (inherited from parent).
@@ -574,8 +700,13 @@ impl AgentManager {
             inner.child = Some(ChildProcess::new(child_pid));
         }
 
-        // Write PID file so future CLI invocations can find this process
-        if let Err(e) = std::fs::write(&self.pid_file, child_pid.to_string()) {
+        // Write PID file so future CLI invocations can find this process.
+        // Include start time on second line for PID reuse detection.
+        let pid_content = match process::process_start_time(child_pid) {
+            Some(t) => format!("{}\n{}", child_pid, t),
+            None => child_pid.to_string(),
+        };
+        if let Err(e) = std::fs::write(&self.pid_file, pid_content) {
             tracing::warn!(error = %e, "failed to write PID file");
         }
 
@@ -608,13 +739,35 @@ impl AgentManager {
         if state == AgentState::Stopped {
             // Even if internal state is Stopped, check PID file for orphan processes
             // from previous CLI invocations that weren't properly cleaned up.
-            if let Some(pid) = self.read_pid_file() {
-                if process::is_alive(pid) {
+            if let Some((pid, start_time)) = self.read_pid_file_with_start_time() {
+                if process::is_our_process_strict(pid, start_time) {
                     tracing::info!(pid, "found orphan VM process via PID file, killing");
                     let _ = process::stop_process_fast(pid, AGENT_STOP_TIMEOUT, true);
                 }
-                let _ = std::fs::remove_file(&self.pid_file);
-                let _ = std::fs::remove_file(&self.vsock_socket);
+                // Only clean up markers if the process is confirmed dead.
+                // If verification failed and we couldn't signal, preserve markers
+                // so recovery remains possible.
+                if !process::is_alive(pid) {
+                    if let Err(e) = std::fs::remove_file(&self.pid_file) {
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            tracing::debug!(error = %e, "failed to remove orphan pid file");
+                        }
+                    }
+                    if let Err(e) = std::fs::remove_file(&self.vsock_socket) {
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            tracing::debug!(error = %e, "failed to remove orphan socket");
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        pid,
+                        "orphan process still alive, preserving PID/socket files"
+                    );
+                    return Err(Error::agent(
+                        "stop agent",
+                        format!("orphan process {} still alive after stop attempts", pid),
+                    ));
+                }
             }
             return Ok(());
         }
@@ -626,14 +779,23 @@ impl AgentManager {
 
         tracing::info!("stopping agent VM");
 
-        // Get the child PID — try in-memory first, then fall back to PID file.
+        // Get the child PID and start time — try in-memory first, then PID file.
         // The PID file fallback is critical for anonymous VMs where a fresh
         // AgentManager doesn't know the PID from a previous CLI invocation.
-        let child_pid = {
+        let (child_pid, pid_start_time) = {
             let inner = self.inner.lock();
-            inner.child.as_ref().map(|c| c.pid())
-        }
-        .or_else(|| self.read_pid_file());
+            if let Some(child) = inner.child.as_ref() {
+                // Use the start time captured when the child handle was created,
+                // not recomputed from the PID (which would be self-fulfilling
+                // if the PID was recycled by the OS).
+                (Some(child.pid()), child.start_time())
+            } else {
+                match self.read_pid_file_with_start_time() {
+                    Some((pid, start_time)) => (Some(pid), start_time),
+                    None => (None, None),
+                }
+            }
+        };
 
         // Graceful shutdown via vsock - waits for agent to acknowledge
         // The agent calls sync() before responding, ensuring ext4 journal is flushed
@@ -642,8 +804,25 @@ impl AgentManager {
         }
 
         if let Some(pid) = child_pid {
-            // Now safe to terminate - agent has synced filesystem
-            let _ = process::stop_process_fast(pid, AGENT_STOP_TIMEOUT, true);
+            // Verify PID identity before signaling to prevent killing wrong process
+            if process::is_our_process_strict(pid, pid_start_time) {
+                let _ = process::stop_process_fast(pid, AGENT_STOP_TIMEOUT, true);
+            } else {
+                tracing::warn!(pid, "skipping stop_process_fast: PID identity not verified");
+            }
+
+            // Post-check: is the process actually dead?
+            if process::is_alive(pid) {
+                // Revert to Running — don't lie about state or delete markers
+                {
+                    let mut inner = self.inner.lock();
+                    inner.state = AgentState::Running;
+                }
+                return Err(Error::agent(
+                    "stop agent",
+                    format!("process {} still alive after stop attempts", pid),
+                ));
+            }
         }
 
         // Defense in depth: sync host's view of the storage file
@@ -655,7 +834,7 @@ impl AgentManager {
             }
         }
 
-        // Clean up
+        // Clean up — safe now that process is confirmed dead
         {
             let mut inner = self.inner.lock();
             inner.state = AgentState::Stopped;
@@ -663,8 +842,16 @@ impl AgentManager {
         }
 
         // Remove socket and PID file
-        let _ = std::fs::remove_file(&self.vsock_socket);
-        let _ = std::fs::remove_file(&self.pid_file);
+        if let Err(e) = std::fs::remove_file(&self.vsock_socket) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::debug!(error = %e, "failed to remove socket during stop");
+            }
+        }
+        if let Err(e) = std::fs::remove_file(&self.pid_file) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::debug!(error = %e, "failed to remove pid file during stop");
+            }
+        }
 
         Ok(())
     }
@@ -683,8 +870,8 @@ impl AgentManager {
 
         while start.elapsed() < timeout {
             // Use aggressive polling at first, then back off
-            let poll_interval = if poll_count < AGGRESSIVE_POLL_COUNT {
-                AGENT_POLL_INTERVAL // 10ms
+            let poll_interval = if poll_count < FAST_POLL_COUNT {
+                FAST_POLL_INTERVAL // 10ms
             } else {
                 Duration::from_millis(100) // Back off to 100ms
             };
@@ -774,7 +961,7 @@ impl AgentManager {
             if self.state() == AgentState::Stopped {
                 return Ok(());
             }
-            std::thread::sleep(AGENT_POLL_INTERVAL);
+            std::thread::sleep(FAST_POLL_INTERVAL);
         }
 
         Err(Error::agent(

@@ -40,6 +40,19 @@
 use std::path::PathBuf;
 use thiserror::Error;
 
+/// Classification for agent errors, used to map to HTTP status codes
+/// without fragile string matching on error messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AgentErrorKind {
+    /// Resource not found (maps to 404).
+    NotFound,
+    /// Conflict / resource already exists (maps to 409).
+    Conflict,
+    /// General error (maps to 500).
+    #[default]
+    Other,
+}
+
 /// Result type alias using smolvm's Error type.
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -188,6 +201,8 @@ pub enum Error {
         operation: String,
         /// The reason for the failure.
         reason: String,
+        /// Classification for HTTP status mapping.
+        kind: AgentErrorKind,
     },
 
     // ========================================================================
@@ -314,6 +329,25 @@ impl Error {
         Self::Agent {
             operation: operation.into(),
             reason: reason.into(),
+            kind: AgentErrorKind::Other,
+        }
+    }
+
+    /// Create an agent "not found" error (maps to 404).
+    pub fn agent_not_found(operation: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::Agent {
+            operation: operation.into(),
+            reason: reason.into(),
+            kind: AgentErrorKind::NotFound,
+        }
+    }
+
+    /// Create an agent "conflict" error (maps to 409).
+    pub fn agent_conflict(operation: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::Agent {
+            operation: operation.into(),
+            reason: reason.into(),
+            kind: AgentErrorKind::Conflict,
         }
     }
 

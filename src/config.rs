@@ -279,6 +279,11 @@ pub struct VmRecord {
     #[serde(default)]
     pub pid: Option<i32>,
 
+    /// Process start time (seconds since epoch) for PID verification.
+    /// Used alongside PID to detect PID reuse by the OS.
+    #[serde(default)]
+    pub pid_start_time: Option<u64>,
+
     /// Number of vCPUs.
     #[serde(default = "default_cpus")]
     pub cpus: u8,
@@ -331,6 +336,7 @@ impl VmRecord {
             created_at: crate::util::current_timestamp(),
             state: RecordState::Created,
             pid: None,
+            pid_start_time: None,
             cpus,
             mem,
             mounts,
@@ -356,6 +362,7 @@ impl VmRecord {
             created_at: crate::util::current_timestamp(),
             state: RecordState::Created,
             pid: None,
+            pid_start_time: None,
             cpus,
             mem,
             mounts,
@@ -367,9 +374,12 @@ impl VmRecord {
     }
 
     /// Check if the VM process is still alive.
+    ///
+    /// Uses start time verification to detect PID reuse by the OS.
+    /// Falls back to PID-only check for legacy records without start time.
     pub fn is_process_alive(&self) -> bool {
         if let Some(pid) = self.pid {
-            crate::process::is_alive(pid)
+            crate::process::is_our_process(pid, self.pid_start_time)
         } else {
             false
         }
@@ -385,6 +395,35 @@ impl VmRecord {
             }
         } else {
             self.state.clone()
+        }
+    }
+
+    /// Convert stored mounts to HostMount format.
+    pub fn host_mounts(&self) -> Vec<crate::vm::config::HostMount> {
+        self.mounts
+            .iter()
+            .map(|(host, guest, ro)| crate::vm::config::HostMount {
+                source: std::path::PathBuf::from(host),
+                target: std::path::PathBuf::from(guest),
+                read_only: *ro,
+            })
+            .collect()
+    }
+
+    /// Convert stored ports to PortMapping format.
+    pub fn port_mappings(&self) -> Vec<crate::agent::PortMapping> {
+        self.ports
+            .iter()
+            .map(|(host, guest)| crate::agent::PortMapping::new(*host, *guest))
+            .collect()
+    }
+
+    /// Convert record fields to VmResources.
+    pub fn vm_resources(&self) -> crate::agent::VmResources {
+        crate::agent::VmResources {
+            cpus: self.cpus,
+            mem: self.mem,
+            network: self.network,
         }
     }
 }
