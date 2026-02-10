@@ -55,6 +55,11 @@ find_smolvm() {
 init_smolvm() {
     SMOLVM=$(find_smolvm)
 
+    # Resolve to absolute path (tests cd into temp dirs)
+    if [[ -n "$SMOLVM" ]] && [[ "$SMOLVM" != /* ]]; then
+        SMOLVM="$(cd "$(dirname "$SMOLVM")" && pwd)/$(basename "$SMOLVM")"
+    fi
+
     if [[ -z "$SMOLVM" ]]; then
         echo -e "${RED}Error: Could not find smolvm binary${NC}"
         echo "Either:"

@@ -39,6 +39,15 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+/// Link libkrun — weak on macOS so the binary can start without it
+/// (packed binary mode uses dlopen instead of link-time symbols).
+fn link_krun() {
+    #[cfg(target_os = "macos")]
+    println!("cargo:rustc-link-arg=-Wl,-weak-lkrun");
+    #[cfg(not(target_os = "macos"))]
+    link_krun();
+}
+
 fn main() {
     // On macOS, create a placeholder __SMOLVM,__smolvm Mach-O section.
     // This section is replaced with real data by `smolvm pack --single-file`.
@@ -73,7 +82,7 @@ fn link_libkrun() {
     if std::env::var("LIBKRUN_BUILD").is_ok() {
         if let Some(lib_path) = build_libkrun_from_submodule() {
             println!("cargo:rustc-link-search=native={}", lib_path.display());
-            println!("cargo:rustc-link-lib=krun");
+            link_krun();
 
             // Set rpath to find libraries relative to executable
             #[cfg(target_os = "macos")]
@@ -95,7 +104,7 @@ fn link_libkrun() {
     // Option 1: Bundle libraries with the binary
     if let Ok(bundle_path) = std::env::var("LIBKRUN_BUNDLE") {
         println!("cargo:rustc-link-search=native={}", bundle_path);
-        println!("cargo:rustc-link-lib=krun");
+        link_krun();
 
         // Set rpath to find libraries relative to executable
         #[cfg(target_os = "macos")]
@@ -151,7 +160,7 @@ fn link_libkrun() {
     // Option 3: Custom directory
     if let Ok(dir) = std::env::var("LIBKRUN_DIR") {
         println!("cargo:rustc-link-search=native={}", dir);
-        println!("cargo:rustc-link-lib=krun");
+        link_krun();
         return;
     }
 
@@ -169,7 +178,7 @@ fn link_libkrun() {
                 lib_dir
             );
             println!("cargo:rustc-link-search=native={}", lib_dir);
-            println!("cargo:rustc-link-lib=krun");
+            link_krun();
 
             // Set rpath to find libraries relative to executable
             println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/lib");
@@ -202,7 +211,7 @@ fn link_libkrun() {
         for path in paths {
             if std::path::Path::new(path).join("libkrun.dylib").exists() {
                 println!("cargo:rustc-link-search=native={}", path);
-                println!("cargo:rustc-link-lib=krun");
+                link_krun();
                 // Set rpath so runtime linker can find dependencies
                 println!("cargo:rustc-link-arg=-Wl,-rpath,{}", path);
                 return;
@@ -224,14 +233,14 @@ fn link_libkrun() {
         for path in paths {
             if std::path::Path::new(path).join("libkrun.so").exists() {
                 println!("cargo:rustc-link-search=native={}", path);
-                println!("cargo:rustc-link-lib=krun");
+                link_krun();
                 return;
             }
         }
     }
 
     // Fallback
-    println!("cargo:rustc-link-lib=krun");
+    link_krun();
 }
 
 /// Build libkrun from the vendored submodule.

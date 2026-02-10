@@ -14,13 +14,19 @@ use std::process::Command;
 use crate::PackError;
 use crate::Result;
 
-/// Default entitlements for hypervisor access on macOS.
+/// Default entitlements for packed binaries on macOS.
+///
+/// - `hypervisor`: access to Hypervisor.framework for the microVM
+/// - `cs.disable-library-validation`: allow dlopen of libkrun from
+///   the extracted cache directory (ad-hoc signed libraries)
 #[cfg(target_os = "macos")]
 const HYPERVISOR_ENTITLEMENTS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>com.apple.security.hypervisor</key>
+    <true/>
+    <key>com.apple.security.cs.disable-library-validation</key>
     <true/>
 </dict>
 </plist>
@@ -172,6 +178,7 @@ mod tests {
     fn test_entitlements_format() {
         // Verify the entitlements XML is valid
         assert!(HYPERVISOR_ENTITLEMENTS.contains("com.apple.security.hypervisor"));
+        assert!(HYPERVISOR_ENTITLEMENTS.contains("cs.disable-library-validation"));
         assert!(HYPERVISOR_ENTITLEMENTS.contains("<true/>"));
     }
 }
