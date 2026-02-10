@@ -109,8 +109,9 @@ pub fn try_wait(pid: libc::pid_t) -> Option<i32> {
                 // EINTR - interrupted by signal, retry
                 continue;
             }
-            // Other error (process doesn't exist or not our child)
-            return Some(-1);
+            // ECHILD: not our child (e.g., session-leader reparented to init).
+            // Return None so callers fall back to is_alive() (kill -0) polling.
+            return None;
         } else {
             // Still running
             return None;

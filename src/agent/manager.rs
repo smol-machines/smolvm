@@ -715,6 +715,64 @@ impl AgentManager {
         }
     }
 
+    /// Verify identity of a VM process and kill it.
+    ///
+    /// Uses two methods to confirm the PID belongs to our VM:
+    /// 1. **Vsock shutdown** — if the guest agent acknowledges, it's our VM
+    /// 2. **PID start-time** — strict comparison guards against PID reuse
+    ///
+    /// If either method confirms identity, sends SIGTERM (then SIGKILL on timeout).
+    /// Returns `Ok(())` if the process is confirmed dead, `Err` if still alive
+    /// or identity could not be verified.
+    fn stop_vm_process(&self, pid: libc::pid_t, start_time: Option<u64>) -> Result<()> {
+        let shutdown_acked = if let Ok(mut client) = super::AgentClient::connect(&self.vsock_socket)
+        {
+            client.shutdown().is_ok()
+        } else {
+            false
+        };
+
+        let identity_verified = process::is_our_process_strict(pid, start_time);
+
+        if identity_verified || shutdown_acked {
+            if !identity_verified {
+                tracing::debug!(
+                    pid,
+                    "PID identity not verified (session-leader child), \
+                     but shutdown was acknowledged over vsock"
+                );
+            }
+            let _ = process::stop_process_fast(pid, AGENT_STOP_TIMEOUT, true);
+        } else {
+            tracing::warn!(
+                pid,
+                "skipping kill: PID identity not verified and vsock shutdown failed"
+            );
+        }
+
+        if process::is_alive(pid) {
+            Err(Error::agent(
+                "stop agent",
+                format!("process {} still alive after stop attempts", pid),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Remove PID file and vsock socket marker files.
+    ///
+    /// Only call after the VM process is confirmed dead.
+    fn cleanup_marker_files(&self) {
+        for path in [&self.pid_file, &self.vsock_socket] {
+            if let Err(e) = std::fs::remove_file(path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::debug!(error = %e, path = %path.display(), "failed to remove marker file");
+                }
+            }
+        }
+    }
+
     /// Stop the agent VM.
     pub fn stop(&self) -> Result<()> {
         let state = {
@@ -726,34 +784,14 @@ impl AgentManager {
             // Even if internal state is Stopped, check PID file for orphan processes
             // from previous CLI invocations that weren't properly cleaned up.
             if let Some((pid, start_time)) = self.read_pid_file_with_start_time() {
-                if process::is_our_process_strict(pid, start_time) {
-                    tracing::info!(pid, "found orphan VM process via PID file, killing");
-                    let _ = process::stop_process_fast(pid, AGENT_STOP_TIMEOUT, true);
-                }
-                // Only clean up markers if the process is confirmed dead.
-                // If verification failed and we couldn't signal, preserve markers
-                // so recovery remains possible.
-                if !process::is_alive(pid) {
-                    if let Err(e) = std::fs::remove_file(&self.pid_file) {
-                        if e.kind() != std::io::ErrorKind::NotFound {
-                            tracing::debug!(error = %e, "failed to remove orphan pid file");
-                        }
-                    }
-                    if let Err(e) = std::fs::remove_file(&self.vsock_socket) {
-                        if e.kind() != std::io::ErrorKind::NotFound {
-                            tracing::debug!(error = %e, "failed to remove orphan socket");
-                        }
-                    }
-                } else {
+                if let Err(e) = self.stop_vm_process(pid, start_time) {
                     tracing::warn!(
                         pid,
                         "orphan process still alive, preserving PID/socket files"
                     );
-                    return Err(Error::agent(
-                        "stop agent",
-                        format!("orphan process {} still alive after stop attempts", pid),
-                    ));
+                    return Err(e);
                 }
+                self.cleanup_marker_files();
             }
             return Ok(());
         }
@@ -783,46 +821,14 @@ impl AgentManager {
             }
         };
 
-        // Graceful shutdown via vsock - waits for agent to acknowledge
-        // The agent calls sync() before responding, ensuring ext4 journal is flushed
-        let shutdown_acked = if let Ok(mut client) = super::AgentClient::connect(&self.vsock_socket)
-        {
-            client.shutdown().is_ok()
-        } else {
-            false
-        };
-
         if let Some(pid) = child_pid {
-            // Verify PID identity before signaling to prevent killing wrong process.
-            // Session-leader children (VM processes) may return None from
-            // process_start_time() because proc_pidinfo can't read their BSD info
-            // from a different session. In that case, if the agent acknowledged
-            // shutdown over vsock, we know it's our process — proceed with kill.
-            let identity_verified = process::is_our_process_strict(pid, pid_start_time);
-            if identity_verified || shutdown_acked {
-                if !identity_verified {
-                    tracing::debug!(
-                        pid,
-                        "PID identity not verified (session-leader child), \
-                         but shutdown was acknowledged over vsock"
-                    );
-                }
-                let _ = process::stop_process_fast(pid, AGENT_STOP_TIMEOUT, true);
-            } else {
-                tracing::warn!(pid, "skipping stop_process_fast: PID identity not verified");
-            }
-
-            // Post-check: is the process actually dead?
-            if process::is_alive(pid) {
+            if let Err(e) = self.stop_vm_process(pid, pid_start_time) {
                 // Revert to Running — don't lie about state or delete markers
                 {
                     let mut inner = self.inner.lock();
                     inner.state = AgentState::Running;
                 }
-                return Err(Error::agent(
-                    "stop agent",
-                    format!("process {} still alive after stop attempts", pid),
-                ));
+                return Err(e);
             }
         }
 
@@ -842,17 +848,7 @@ impl AgentManager {
             inner.child = None;
         }
 
-        // Remove socket and PID file
-        if let Err(e) = std::fs::remove_file(&self.vsock_socket) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::debug!(error = %e, "failed to remove socket during stop");
-            }
-        }
-        if let Err(e) = std::fs::remove_file(&self.pid_file) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::debug!(error = %e, "failed to remove pid file during stop");
-            }
-        }
+        self.cleanup_marker_files();
 
         Ok(())
     }
