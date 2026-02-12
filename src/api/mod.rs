@@ -215,13 +215,24 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .nest("/microvms", microvm_routes);
 
     // CORS: Use configured origins, or default to localhost for security.
-    let origins: Vec<axum::http::HeaderValue> = if cors_origins.is_empty() {
+    let default_origins = || {
         vec![
-            "http://localhost:8080".parse().unwrap(),
-            "http://127.0.0.1:8080".parse().unwrap(),
-            "http://localhost:3000".parse().unwrap(),
-            "http://127.0.0.1:3000".parse().unwrap(),
+            "http://localhost:8080"
+                .parse()
+                .expect("hardcoded CORS origin"),
+            "http://127.0.0.1:8080"
+                .parse()
+                .expect("hardcoded CORS origin"),
+            "http://localhost:3000"
+                .parse()
+                .expect("hardcoded CORS origin"),
+            "http://127.0.0.1:3000"
+                .parse()
+                .expect("hardcoded CORS origin"),
         ]
+    };
+    let origins: Vec<axum::http::HeaderValue> = if cors_origins.is_empty() {
+        default_origins()
     } else {
         let mut valid = Vec::new();
         for origin in &cors_origins {
@@ -234,12 +245,7 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         }
         if valid.is_empty() {
             tracing::warn!("no valid CORS origins provided, falling back to defaults");
-            vec![
-                "http://localhost:8080".parse().unwrap(),
-                "http://127.0.0.1:8080".parse().unwrap(),
-                "http://localhost:3000".parse().unwrap(),
-                "http://127.0.0.1:3000".parse().unwrap(),
-            ]
+            default_origins()
         } else {
             valid
         }
