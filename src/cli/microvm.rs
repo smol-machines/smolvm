@@ -10,7 +10,7 @@
 //! - ls: List all named VMs
 
 use crate::cli::flush_output;
-use crate::cli::parsers::{parse_duration, parse_env_spec, parse_port};
+use crate::cli::parsers::{parse_duration, parse_env_list, parse_port};
 use crate::cli::vm_common::{self, CreateVmParams, DeleteVmOptions, VmKind};
 use clap::{Args, Subcommand};
 use smolvm::agent::{AgentClient, PortMapping};
@@ -128,8 +128,7 @@ impl ExecCmd {
         let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
 
         // Parse environment variables
-        let env: Vec<(String, String)> =
-            self.env.iter().filter_map(|e| parse_env_spec(e)).collect();
+        let env = parse_env_list(&self.env);
 
         // Run command directly in VM
         let exit_code = if self.interactive || self.tty {

@@ -68,10 +68,6 @@ pub enum Error {
     #[error("vm creation failed: {0}")]
     VmCreation(String),
 
-    /// Failed to boot a VM.
-    #[error("vm boot failed: {0}")]
-    BootFailed(String),
-
     /// VM not found by name.
     #[error("vm not found: {name}")]
     VmNotFound {

@@ -11,7 +11,7 @@
 //! `sandbox create`, managed with `sandbox start/stop/ls/delete`.
 
 use crate::cli::parsers::{
-    mounts_to_virtiofs_bindings, parse_duration, parse_env_spec, parse_mounts, parse_port,
+    mounts_to_virtiofs_bindings, parse_duration, parse_env_list, parse_mounts, parse_port,
 };
 use crate::cli::vm_common::{self, CreateVmParams, DeleteVmOptions, VmKind};
 use crate::cli::{flush_output, format_bytes, truncate_id};
@@ -418,8 +418,7 @@ impl RunCmd {
         };
 
         // Parse environment variables
-        let env: Vec<(String, String)> =
-            self.env.iter().filter_map(|e| parse_env_spec(e)).collect();
+        let env = parse_env_list(&self.env);
 
         // Convert mounts to agent format
         let mount_bindings = mounts_to_virtiofs_bindings(&mounts);
