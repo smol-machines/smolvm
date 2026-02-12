@@ -36,7 +36,9 @@
 //! LIBKRUN_STATIC=/path/to/libkrun.a cargo build
 //! ```
 
-use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
 
 /// Check if a file is a Git LFS pointer (not the actual binary).
@@ -44,6 +46,7 @@ use std::process::Command;
 /// LFS pointer files start with "version https://git-lfs.github.com/spec/v1"
 /// and are small text files. This prevents the build from trying to link
 /// against LFS pointers when the actual files haven't been fetched.
+#[cfg(target_os = "linux")]
 fn is_lfs_pointer(path: &Path) -> bool {
     // LFS pointers are small text files (typically < 200 bytes)
     if let Ok(metadata) = std::fs::metadata(path) {
