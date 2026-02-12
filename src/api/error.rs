@@ -86,6 +86,21 @@ impl From<crate::error::Error> for ApiError {
     }
 }
 
+/// Classify errors from `ensure_sandbox_running` into proper HTTP status codes.
+///
+/// Mount validation errors are 400 (Bad Request), everything else uses the
+/// standard `Error -> ApiError` mapping (500 for startup failures, etc.).
+pub fn classify_ensure_running_error(err: crate::Error) -> ApiError {
+    match &err {
+        crate::Error::Mount { .. }
+        | crate::Error::InvalidMountPath { .. }
+        | crate::Error::MountSourceNotFound { .. } => {
+            ApiError::BadRequest(format!("mount validation failed: {}", err))
+        }
+        _ => ApiError::from(err),
+    }
+}
+
 impl From<tokio::task::JoinError> for ApiError {
     fn from(err: tokio::task::JoinError) -> Self {
         ApiError::Internal(format!("task failed: {}", err))

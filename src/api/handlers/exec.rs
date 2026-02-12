@@ -11,28 +11,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::api::error::ApiError;
+use crate::api::error::{classify_ensure_running_error, ApiError};
 use crate::api::state::{ensure_sandbox_running, with_sandbox_client, ApiState};
 use crate::api::types::{
     ApiErrorResponse, EnvVar, ExecRequest, ExecResponse, LogsQuery, RunRequest,
 };
 use crate::api::validation::validate_command;
 use tokio::sync::Semaphore;
-
-/// Classify errors from `ensure_sandbox_running` into proper HTTP status codes.
-///
-/// Mount validation errors are 400 (Bad Request), everything else uses the
-/// standard `Error -> ApiError` mapping (500 for startup failures, etc.).
-fn classify_ensure_running_error(err: crate::Error) -> ApiError {
-    match &err {
-        crate::Error::Mount { .. }
-        | crate::Error::InvalidMountPath { .. }
-        | crate::Error::MountSourceNotFound { .. } => {
-            ApiError::BadRequest(format!("mount validation failed: {}", err))
-        }
-        _ => ApiError::from(err),
-    }
-}
 
 /// Execute a command in a sandbox.
 ///

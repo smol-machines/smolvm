@@ -7,7 +7,7 @@ use axum::{
 use std::sync::Arc;
 
 use crate::agent::PullOptions;
-use crate::api::error::ApiError;
+use crate::api::error::{classify_ensure_running_error, ApiError};
 use crate::api::state::{ensure_sandbox_running, with_sandbox_client, ApiState};
 use crate::api::types::{
     ApiErrorResponse, ImageInfo, ListImagesResponse, PullImageRequest, PullImageResponse,
@@ -89,7 +89,7 @@ pub async fn pull_image(
     // Ensure sandbox is running
     ensure_sandbox_running(&entry)
         .await
-        .map_err(ApiError::internal)?;
+        .map_err(classify_ensure_running_error)?;
 
     let image = req.image.clone();
     let platform = req.platform.clone();

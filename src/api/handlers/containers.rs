@@ -7,7 +7,7 @@ use axum::{
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::api::error::ApiError;
+use crate::api::error::{classify_ensure_running_error, ApiError};
 use crate::api::state::{ensure_sandbox_running, with_sandbox_client, ApiState};
 use crate::api::types::{
     ApiErrorResponse, ContainerExecRequest, ContainerInfo, CreateContainerRequest,
@@ -41,7 +41,7 @@ pub async fn create_container(
     // Ensure sandbox is running
     ensure_sandbox_running(&entry)
         .await
-        .map_err(ApiError::internal)?;
+        .map_err(classify_ensure_running_error)?;
 
     // Prepare parameters
     let image = req.image.clone();
