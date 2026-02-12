@@ -277,18 +277,6 @@ impl AgentClient {
         })
     }
 
-    /// Reset socket read timeout to the default value.
-    ///
-    /// Logs a warning if resetting fails, as we're already past the critical operation.
-    fn reset_read_timeout(&self) {
-        if let Err(e) = self
-            .stream
-            .set_read_timeout(Some(Duration::from_secs(DEFAULT_READ_TIMEOUT_SECS)))
-        {
-            tracing::warn!(error = %e, "failed to reset socket read timeout to default");
-        }
-    }
-
     /// Connect to the agent via Unix socket.
     ///
     /// # Arguments
@@ -710,12 +698,14 @@ impl AgentClient {
         workdir: Option<String>,
         timeout: Option<Duration>,
     ) -> Result<(i32, String, String)> {
-        // Set socket read timeout based on command timeout (with buffer for response)
+        // Set socket read timeout based on command timeout (with buffer for response).
+        // The guard resets the timeout on drop (including error paths).
         let socket_timeout = match timeout {
             Some(t) => t + Duration::from_secs(TIMEOUT_BUFFER_SECS),
             None => Duration::from_secs(INTERACTIVE_TIMEOUT_SECS),
         };
         self.set_read_timeout(socket_timeout)?;
+        let _timeout_guard = ReadTimeoutGuard::new(&self.stream);
 
         let timeout_ms = timeout.map(|t| t.as_millis() as u64);
 
@@ -727,9 +717,6 @@ impl AgentClient {
             interactive: false,
             tty: false,
         })?;
-
-        // Reset timeout (warning-only since operation completed)
-        self.reset_read_timeout();
 
         expect_completed(resp, "vm exec")
     }
@@ -965,12 +952,14 @@ impl AgentClient {
         mounts: Vec<(String, String, bool)>,
         timeout: Option<Duration>,
     ) -> Result<(i32, String, String)> {
-        // Set socket read timeout based on command timeout (with buffer for response)
+        // Set socket read timeout based on command timeout (with buffer for response).
+        // The guard resets the timeout on drop (including error paths).
         let socket_timeout = match timeout {
             Some(t) => t + Duration::from_secs(TIMEOUT_BUFFER_SECS),
             None => Duration::from_secs(INTERACTIVE_TIMEOUT_SECS),
         };
         self.set_read_timeout(socket_timeout)?;
+        let _timeout_guard = ReadTimeoutGuard::new(&self.stream);
 
         // Convert timeout to milliseconds for protocol
         let timeout_ms = timeout.map(|t| t.as_millis() as u64);
@@ -985,9 +974,6 @@ impl AgentClient {
             interactive: false,
             tty: false,
         })?;
-
-        // Reset timeout (warning-only since operation completed)
-        self.reset_read_timeout();
 
         expect_completed(resp, "run command")
     }
@@ -1145,12 +1131,14 @@ impl AgentClient {
         workdir: Option<String>,
         timeout: Option<Duration>,
     ) -> Result<(i32, String, String)> {
-        // Set socket read timeout based on command timeout (with buffer for response)
+        // Set socket read timeout based on command timeout (with buffer for response).
+        // The guard resets the timeout on drop (including error paths).
         let socket_timeout = match timeout {
             Some(t) => t + Duration::from_secs(TIMEOUT_BUFFER_SECS),
             None => Duration::from_secs(INTERACTIVE_TIMEOUT_SECS),
         };
         self.set_read_timeout(socket_timeout)?;
+        let _timeout_guard = ReadTimeoutGuard::new(&self.stream);
 
         let timeout_ms = timeout.map(|t| t.as_millis() as u64);
 
@@ -1163,9 +1151,6 @@ impl AgentClient {
             interactive: false,
             tty: false,
         })?;
-
-        // Reset timeout (warning-only since operation completed)
-        self.reset_read_timeout();
 
         expect_completed(resp, "exec command")
     }
