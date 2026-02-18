@@ -144,9 +144,10 @@ cp -a "$ROOTFS_SRC"/* "$DIST_DIR/agent-rootfs/"
 rm -f "$DIST_DIR/agent-rootfs/usr/local/bin/smolvm-agent"
 rm -f "$DIST_DIR/agent-rootfs/sbin/init"
 cp ./target/release-small/smolvm-agent "$DIST_DIR/agent-rootfs/usr/local/bin/smolvm-agent"
-cp ./target/release-small/smolvm-agent "$DIST_DIR/agent-rootfs/sbin/init"
 chmod +x "$DIST_DIR/agent-rootfs/usr/local/bin/smolvm-agent"
-chmod +x "$DIST_DIR/agent-rootfs/sbin/init"
+# Symlink /sbin/init → agent (saves ~1.8MB in initramfs vs a copy).
+# The agent handles overlayfs setup + pivot_root internally.
+ln -sf /usr/local/bin/smolvm-agent "$DIST_DIR/agent-rootfs/sbin/init"
 
 echo "Agent rootfs size: $(du -sh "$DIST_DIR/agent-rootfs" | cut -f1)"
 
