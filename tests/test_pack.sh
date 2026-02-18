@@ -263,15 +263,15 @@ test_single_file_run_echo() {
 }
 
 # =============================================================================
-# run-packed Subcommand - Basic Tests
+# runpack Subcommand - Basic Tests
 # =============================================================================
 
-test_run_packed_help() {
-    # Verify run-packed subcommand exists and shows help
-    $SMOLVM run-packed --help 2>&1 | grep -q "Run a VM from a packed"
+test_runpack_help() {
+    # Verify runpack subcommand exists and shows help
+    $SMOLVM runpack --help 2>&1 | grep -q "Run a VM from a packed"
 }
 
-test_run_packed_info() {
+test_runpack_info() {
     local output="$TEST_DIR/test-alpine"
 
     # Ensure we have a packed binary with sidecar
@@ -279,22 +279,22 @@ test_run_packed_info() {
         $SMOLVM pack alpine:latest -o "$output" 2>&1
     fi
 
-    # Test --info via run-packed
+    # Test --info via runpack
     local info_output
-    info_output=$($SMOLVM run-packed --sidecar "$output.smolmachine" --info 2>&1)
+    info_output=$($SMOLVM runpack --sidecar "$output.smolmachine" --info 2>&1)
     [[ "$info_output" == *"Image:"* ]] && \
     [[ "$info_output" == *"Platform:"* ]] && \
     [[ "$info_output" == *"Checksum:"* ]] || return 1
 }
 
-test_run_packed_info_no_sidecar() {
+test_runpack_info_no_sidecar() {
     # Should error clearly when sidecar doesn't exist
     local exit_code=0
-    $SMOLVM run-packed --sidecar /tmp/nonexistent-file.smolmachine --info 2>&1 || exit_code=$?
+    $SMOLVM runpack --sidecar /tmp/nonexistent-file.smolmachine --info 2>&1 || exit_code=$?
     [[ $exit_code -ne 0 ]]
 }
 
-test_run_packed_auto_detect() {
+test_runpack_auto_detect() {
     # Test auto-detection of .smolmachine file in current directory
     local output="$TEST_DIR/test-alpine"
 
@@ -307,13 +307,13 @@ test_run_packed_auto_detect() {
     mkdir -p "$detect_dir"
     cp "$output.smolmachine" "$detect_dir/myapp.smolmachine"
 
-    # run-packed --info from that directory should auto-detect
+    # runpack --info from that directory should auto-detect
     local info_output
-    info_output=$(cd "$detect_dir" && $SMOLVM run-packed --info 2>&1)
+    info_output=$(cd "$detect_dir" && $SMOLVM runpack --info 2>&1)
     [[ "$info_output" == *"Image:"* ]]
 }
 
-test_run_packed_auto_detect_ambiguous() {
+test_runpack_auto_detect_ambiguous() {
     # Should error when multiple .smolmachine files exist and no --sidecar given
     local detect_dir="$TEST_DIR/multi-detect"
     mkdir -p "$detect_dir"
@@ -323,15 +323,15 @@ test_run_packed_auto_detect_ambiguous() {
     touch "$detect_dir/app2.smolmachine"
 
     local exit_code=0
-    (cd "$detect_dir" && $SMOLVM run-packed --info 2>&1) || exit_code=$?
+    (cd "$detect_dir" && $SMOLVM runpack --info 2>&1) || exit_code=$?
     [[ $exit_code -ne 0 ]]
 }
 
 # =============================================================================
-# run-packed Subcommand - Execution Tests (Requires VM)
+# runpack Subcommand - Execution Tests (Requires VM)
 # =============================================================================
 
-test_run_packed_resource_override() {
+test_runpack_resource_override() {
     local output="$TEST_DIR/test-alpine"
 
     if [[ ! -f "$output.smolmachine" ]]; then
@@ -341,7 +341,7 @@ test_run_packed_resource_override() {
     # Verify resource override flags are accepted (boot with custom resources)
     # We use --debug to see the config, and run a quick command
     local result
-    result=$(run_with_timeout 60 $SMOLVM run-packed --sidecar "$output.smolmachine" --cpus 2 --mem 512 --debug -- echo "resource-test" 2>&1)
+    result=$(run_with_timeout 60 $SMOLVM runpack --sidecar "$output.smolmachine" --cpus 2 --mem 512 --debug -- echo "resource-test" 2>&1)
     local exit_code=$?
 
     [[ $exit_code -eq 124 ]] && { echo "TIMEOUT"; return 1; }
@@ -351,7 +351,7 @@ test_run_packed_resource_override() {
     [[ "$result" == *"resource-test"* ]]
 }
 
-test_run_packed_force_extract() {
+test_runpack_force_extract() {
     local output="$TEST_DIR/test-alpine"
 
     if [[ ! -f "$output.smolmachine" ]]; then
@@ -360,7 +360,7 @@ test_run_packed_force_extract() {
 
     # Run with --force-extract and --debug to verify re-extraction
     local result
-    result=$(run_with_timeout 60 $SMOLVM run-packed --sidecar "$output.smolmachine" --force-extract --debug -- echo "re-extracted" 2>&1)
+    result=$(run_with_timeout 60 $SMOLVM runpack --sidecar "$output.smolmachine" --force-extract --debug -- echo "re-extracted" 2>&1)
     local exit_code=$?
 
     [[ $exit_code -eq 124 ]] && { echo "TIMEOUT"; return 1; }
@@ -369,7 +369,7 @@ test_run_packed_force_extract() {
     [[ "$result" == *"extract"* ]] && [[ "$result" == *"re-extracted"* ]]
 }
 
-test_run_packed_cached_fast() {
+test_runpack_cached_fast() {
     # Second run should use cached assets (no extraction)
     local output="$TEST_DIR/test-alpine"
 
@@ -378,18 +378,18 @@ test_run_packed_cached_fast() {
     fi
 
     # First run ensures cache exists
-    run_with_timeout 60 $SMOLVM run-packed --sidecar "$output.smolmachine" -- true 2>&1 || true
+    run_with_timeout 60 $SMOLVM runpack --sidecar "$output.smolmachine" -- true 2>&1 || true
 
     # Second run with --debug should show "using cached assets"
     local result
-    result=$(run_with_timeout 60 $SMOLVM run-packed --sidecar "$output.smolmachine" --debug -- echo "cached-run" 2>&1)
+    result=$(run_with_timeout 60 $SMOLVM runpack --sidecar "$output.smolmachine" --debug -- echo "cached-run" 2>&1)
     local exit_code=$?
 
     [[ $exit_code -eq 124 ]] && { echo "TIMEOUT"; return 1; }
     [[ "$result" == *"cached"* ]] && [[ "$result" == *"cached-run"* ]]
 }
 
-test_run_packed_python() {
+test_runpack_python() {
     if [[ "$QUICK_MODE" == "true" ]]; then
         echo "SKIP: --quick mode"
         return 0
@@ -402,9 +402,9 @@ test_run_packed_python() {
     fi
 
     local result
-    result=$(run_with_timeout 90 $SMOLVM run-packed --sidecar "$output.smolmachine" -- python -c "print('Hello from run-packed Python')" 2>&1)
+    result=$(run_with_timeout 90 $SMOLVM runpack --sidecar "$output.smolmachine" -- python -c "print('Hello from runpack Python')" 2>&1)
     [[ $? -eq 124 ]] && { echo "TIMEOUT"; return 1; }
-    [[ "$result" == *"Hello from run-packed Python"* ]]
+    [[ "$result" == *"Hello from runpack Python"* ]]
 }
 
 # =============================================================================
@@ -494,22 +494,22 @@ run_test "Packed env variable" test_packed_env_var || true
 run_test "Packed workdir" test_packed_workdir || true
 
 echo ""
-echo "Running run-packed Subcommand Tests..."
+echo "Running runpack Subcommand Tests..."
 echo ""
 
-run_test "run-packed help" test_run_packed_help || true
-run_test "run-packed --info" test_run_packed_info || true
-run_test "run-packed --info with missing sidecar" test_run_packed_info_no_sidecar || true
-run_test "run-packed auto-detect sidecar" test_run_packed_auto_detect || true
-run_test "run-packed auto-detect ambiguous" test_run_packed_auto_detect_ambiguous || true
+run_test "runpack help" test_runpack_help || true
+run_test "runpack --info" test_runpack_info || true
+run_test "runpack --info with missing sidecar" test_runpack_info_no_sidecar || true
+run_test "runpack auto-detect sidecar" test_runpack_auto_detect || true
+run_test "runpack auto-detect ambiguous" test_runpack_auto_detect_ambiguous || true
 
 echo ""
-echo "Running run-packed Execution Tests (requires VM)..."
+echo "Running runpack Execution Tests (requires VM)..."
 echo ""
 
-run_test "run-packed resource override" test_run_packed_resource_override || true
-run_test "run-packed --force-extract" test_run_packed_force_extract || true
-run_test "run-packed cached fast" test_run_packed_cached_fast || true
+run_test "runpack resource override" test_runpack_resource_override || true
+run_test "runpack --force-extract" test_runpack_force_extract || true
+run_test "runpack cached fast" test_runpack_cached_fast || true
 
 echo ""
 echo "Running Error Handling Tests..."
@@ -524,7 +524,7 @@ if [[ "$QUICK_MODE" != "true" ]]; then
 
     run_test "Pack Python image" test_pack_python || true
     run_test "Packed Python run" test_packed_python_run || true
-    run_test "run-packed Python" test_run_packed_python || true
+    run_test "runpack Python" test_runpack_python || true
 fi
 
 print_summary "Pack Tests"

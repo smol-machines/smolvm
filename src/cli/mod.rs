@@ -6,7 +6,7 @@ pub mod microvm;
 pub mod openapi;
 pub mod pack;
 pub mod parsers;
-pub mod run_packed;
+pub mod runpack;
 pub mod sandbox;
 pub mod serve;
 pub mod smolfile;

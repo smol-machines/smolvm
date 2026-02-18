@@ -53,7 +53,7 @@ enum Commands {
     Openapi(cli::openapi::OpenapiCmd),
 
     /// Run a VM from a packed .smolmachine sidecar file
-    RunPacked(cli::run_packed::RunPackedCmd),
+    Runpack(cli::runpack::RunpackCmd),
 }
 
 fn main() {
@@ -61,7 +61,7 @@ fn main() {
     // If this executable has a `.smolmachine` sidecar, appended assets,
     // or a Mach-O section with packed data, run as a packed binary instead.
     if let Some(mode) = smolvm_pack::detect_packed_mode() {
-        cli::run_packed::run_as_packed_binary(mode);
+        cli::runpack::run_as_packed_binary(mode);
     }
 
     let cli = Cli::parse();
@@ -80,7 +80,7 @@ fn main() {
         Commands::Pack(cmd) => cmd.run(),
         Commands::Config(cmd) => cmd.run(),
         Commands::Openapi(cmd) => cmd.run(),
-        Commands::RunPacked(cmd) => cmd.run(),
+        Commands::Runpack(cmd) => cmd.run(),
     };
 
     // Handle errors

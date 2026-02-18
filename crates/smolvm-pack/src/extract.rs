@@ -1,7 +1,7 @@
 //! Asset extraction for packed binaries.
 //!
 //! Provides shared extraction logic used by both the main `smolvm` binary
-//! (sidecar mode via `run-packed`) and the standalone stub executable.
+//! (sidecar mode via `runpack`) and the standalone stub executable.
 
 use crate::format::{PackFooter, SIDECAR_EXTENSION};
 use std::fs::{self, File};
@@ -45,7 +45,7 @@ pub fn sidecar_path_for(exe_path: &Path) -> PathBuf {
 
 /// Extract assets from a sidecar `.smolmachine` file to the cache directory.
 ///
-/// This is the primary extraction function for `smolvm run-packed`.
+/// This is the primary extraction function for `smolvm runpack`.
 /// The sidecar file format is: compressed_assets + manifest + footer.
 ///
 /// Uses file-based locking (`flock`) to prevent races when multiple processes
