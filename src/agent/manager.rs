@@ -295,7 +295,15 @@ impl AgentManager {
     }
 
     /// Get the default path for the agent rootfs.
+    ///
+    /// Checks `SMOLVM_AGENT_ROOTFS` env var first, then falls back to the
+    /// platform data directory (`~/.local/share/smolvm/agent-rootfs` on Linux,
+    /// `~/Library/Application Support/smolvm/agent-rootfs` on macOS).
     pub fn default_rootfs_path() -> Result<PathBuf> {
+        if let Ok(path) = std::env::var("SMOLVM_AGENT_ROOTFS") {
+            return Ok(PathBuf::from(path));
+        }
+
         let data_dir = dirs::data_local_dir()
             .or_else(dirs::data_dir)
             .ok_or_else(|| Error::storage("resolve path", "could not determine data directory"))?;

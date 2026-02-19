@@ -162,7 +162,7 @@ fn cstr(s: &str) -> std::ffi::CString {
     std::ffi::CString::new(s).expect("static string without null bytes")
 }
 
-/// Mount essential filesystems (proc, sysfs, devtmpfs).
+/// Mount essential filesystems (proc, sysfs, devtmpfs, devpts).
 /// This must be done first when running as init (PID 1).
 /// Uses direct syscalls to avoid any overhead.
 #[cfg(target_os = "linux")]
@@ -205,6 +205,23 @@ fn mount_essential_filesystems() {
             std::ptr::null(),
         );
     }
+
+    // Mount devpts for PTY support (needed by openpty() for interactive exec)
+    let _ = std::fs::create_dir_all("/dev/pts");
+    // SAFETY: libc::mount with valid CString pointers for devpts filesystem
+    unsafe {
+        libc::mount(
+            cstr("devpts").as_ptr(),
+            cstr("/dev/pts").as_ptr(),
+            cstr("devpts").as_ptr(),
+            0,
+            cstr("mode=0620,ptmxmode=0666").as_ptr() as *const _,
+        );
+    }
+
+    // Create /dev/ptmx symlink pointing to pts/ptmx
+    // This ensures openpty() can find the PTY multiplexer
+    let _ = std::os::unix::fs::symlink("pts/ptmx", "/dev/ptmx");
 
     // Set up loopback interface (non-blocking, best effort)
     unsafe {
