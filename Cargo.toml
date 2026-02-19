@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "smolvm"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2021"
 description = "OCI-native microVM runtime"
 license = "Apache-2.0"

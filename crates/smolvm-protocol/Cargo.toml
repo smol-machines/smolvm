@@ -1,6 +1,6 @@
 [package]
 name = "smolvm-protocol"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2021"
 description = "Protocol types for smolvm host-guest communication"
 license = "Apache-2.0"

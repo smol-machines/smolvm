@@ -1,6 +1,6 @@
 [package]
 name = "smolvm-pack"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2021"
 description = "Single-binary packaging for smolvm"
 license = "Apache-2.0"
