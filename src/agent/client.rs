@@ -1220,11 +1220,16 @@ impl AgentClient {
         Ok(())
     }
 
-    /// Read exactly `buf.len()` bytes, retrying on EAGAIN/WouldBlock.
+    /// Read exactly `buf.len()` bytes, retrying on EAGAIN/WouldBlock only
+    /// when partial data has already been read (to avoid losing bytes).
     ///
     /// Unlike `read_exact`, this never loses partially-read data on EAGAIN.
     /// On macOS, vsock sockets can spuriously return WouldBlock even in
     /// blocking mode, so we must handle it without corrupting the stream.
+    ///
+    /// If WouldBlock occurs before any bytes are read (pos == 0), the error
+    /// is propagated — this preserves read timeout behavior for callers that
+    /// set one (non-interactive exec paths).
     fn read_exact_retry(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
         let mut pos = 0;
         while pos < buf.len() {
@@ -1237,6 +1242,11 @@ impl AgentClient {
                 }
                 Ok(n) => pos += n,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if pos == 0 {
+                        // No partial data consumed — safe to propagate (e.g. timeout)
+                        return Err(e);
+                    }
+                    // Mid-frame EAGAIN — must retry to avoid losing partial data
                     std::thread::sleep(std::time::Duration::from_millis(1));
                     continue;
                 }
