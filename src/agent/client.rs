@@ -1220,10 +1220,37 @@ impl AgentClient {
         Ok(())
     }
 
+    /// Read exactly `buf.len()` bytes, retrying on EAGAIN/WouldBlock.
+    ///
+    /// Unlike `read_exact`, this never loses partially-read data on EAGAIN.
+    /// On macOS, vsock sockets can spuriously return WouldBlock even in
+    /// blocking mode, so we must handle it without corrupting the stream.
+    fn read_exact_retry(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+        let mut pos = 0;
+        while pos < buf.len() {
+            match self.stream.read(&mut buf[pos..]) {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "connection closed",
+                    ));
+                }
+                Ok(n) => pos += n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    continue;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
     /// Low-level receive a single response.
     fn receive(&mut self) -> Result<AgentResponse> {
         let mut header = [0u8; 4];
-        self.stream.read_exact(&mut header)?;
+        self.read_exact_retry(&mut header)?;
         let len = u32::from_be_bytes(header) as usize;
 
         // Validate frame size to prevent OOM from malicious/buggy responses
@@ -1238,7 +1265,7 @@ impl AgentClient {
         }
 
         let mut buf = vec![0u8; len];
-        self.stream.read_exact(&mut buf)?;
+        self.read_exact_retry(&mut buf)?;
 
         let resp: AgentResponse = serde_json::from_slice(&buf)
             .map_err(|e| Error::agent("deserialize response", e.to_string()))?;

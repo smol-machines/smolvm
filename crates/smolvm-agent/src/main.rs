@@ -262,10 +262,10 @@ fn setup_persistent_rootfs() {
     // On devtmpfs, the kernel creates /dev/vdb automatically when libkrun
     // attaches a second virtio-blk disk. No mknod needed.
     if !Path::new(OVERLAY_DEVICE).exists() {
-        eprintln!("smolvm-agent: no overlay device, skipping");
+        tracing::debug!("no overlay device, skipping");
         return;
     }
-    eprintln!("smolvm-agent: overlay device found, setting up overlayfs");
+    tracing::debug!("overlay device found, setting up overlayfs");
 
     let _ = std::fs::create_dir_all(OVERLAY_MOUNT);
 
@@ -285,7 +285,7 @@ fn setup_persistent_rootfs() {
     };
 
     if !mounted {
-        eprintln!("smolvm-agent: formatting overlay disk on first boot");
+        tracing::debug!("formatting overlay disk on first boot");
         // First boot — format the disk
         let _ = std::process::Command::new("mkfs.ext4")
             .args(["-F", "-q", "-L", "smolvm-overlay", OVERLAY_DEVICE])
@@ -338,7 +338,7 @@ fn setup_persistent_rootfs() {
         eprintln!("smolvm-agent: failed to mount overlayfs: {}", err);
         return;
     }
-    eprintln!("smolvm-agent: overlayfs mounted, doing pivot_root");
+    tracing::debug!("overlayfs mounted, doing pivot_root");
 
     // Create mount point directories in new root and move special mounts
     for dir in &["proc", "sys", "dev"] {
@@ -376,7 +376,7 @@ fn setup_persistent_rootfs() {
         eprintln!("smolvm-agent: pivot_root failed: {}", err);
         return;
     }
-    eprintln!("smolvm-agent: pivot_root done");
+    tracing::debug!("pivot_root done");
 
     // Set working directory to new root
     let _ = std::env::set_current_dir("/");
