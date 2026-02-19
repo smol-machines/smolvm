@@ -323,6 +323,14 @@ pub struct VmRecord {
     /// Working directory for init commands.
     #[serde(default)]
     pub workdir: Option<String>,
+
+    /// Storage disk size in GiB (None = default 20 GiB).
+    #[serde(default)]
+    pub storage_gb: Option<u64>,
+
+    /// Overlay disk size in GiB (None = default 2 GiB).
+    #[serde(default)]
+    pub overlay_gb: Option<u64>,
 }
 
 fn default_cpus() -> u8 {
@@ -359,6 +367,8 @@ impl VmRecord {
             init: Vec::new(),
             env: Vec::new(),
             workdir: None,
+            storage_gb: None,
+            overlay_gb: None,
         }
     }
 
@@ -388,6 +398,8 @@ impl VmRecord {
             init: Vec::new(),
             env: Vec::new(),
             workdir: None,
+            storage_gb: None,
+            overlay_gb: None,
         }
     }
 
@@ -442,6 +454,8 @@ impl VmRecord {
             cpus: self.cpus,
             mem: self.mem,
             network: self.network,
+            storage_gb: self.storage_gb,
+            overlay_gb: self.overlay_gb,
         }
     }
 }

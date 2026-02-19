@@ -156,7 +156,9 @@ pub async fn create_microvm(
     let ports: Vec<(u16, u16)> = req.ports.iter().map(|p| (p.host, p.guest)).collect();
 
     // Create record with requested network setting
-    let record = VmRecord::new(name.clone(), cpus, mem, mounts, ports, req.network);
+    let mut record = VmRecord::new(name.clone(), cpus, mem, mounts, ports, req.network);
+    record.storage_gb = req.storage_gb;
+    record.overlay_gb = req.overlay_gb;
 
     // Use atomic insert to detect conflicts
     let db = state.db();
@@ -259,8 +261,10 @@ pub async fn start_microvm(
     // Start agent VM in blocking task.
     // Child process closes inherited fds, so DB stays open for concurrent requests.
     let name_clone = name.clone();
+    let storage_gb = record.storage_gb;
+    let overlay_gb = record.overlay_gb;
     let pid = tokio::task::spawn_blocking(move || {
-        let manager = AgentManager::for_vm(&name_clone)
+        let manager = AgentManager::for_vm_with_sizes(&name_clone, storage_gb, overlay_gb)
             .map_err(|e| format!("failed to create agent manager: {}", e))?;
 
         manager

@@ -336,20 +336,38 @@ pub fn create_storage_disk(path: &Path, size: u64) -> std::io::Result<()> {
 ///
 /// If a pre-formatted template exists in the cache, copy it.
 /// Otherwise, create an empty sparse file (will be formatted by agent on first boot).
+///
+/// `size_gb_override` lets callers specify a custom disk size (in GiB).
+/// When `None`, falls back to 512 MiB.
 pub fn create_or_copy_storage_disk(
     cache_dir: &Path,
     template_path: Option<&str>,
     storage_path: &Path,
+    size_gb_override: Option<u64>,
 ) -> std::io::Result<()> {
     if let Some(template) = template_path {
         let template_path = cache_dir.join(template);
         if template_path.exists() {
             fs::copy(&template_path, storage_path)?;
+            // If a custom size was requested and it's larger than the template,
+            // extend the sparse file (resize2fs in the agent will expand the FS).
+            if let Some(gb) = size_gb_override {
+                let desired = gb * 1024 * 1024 * 1024;
+                let current = fs::metadata(storage_path)?.len();
+                if desired > current {
+                    let file = fs::OpenOptions::new().write(true).open(storage_path)?;
+                    file.set_len(desired)?;
+                }
+            }
             return Ok(());
         }
     }
     // Fallback: create empty sparse file (agent will format on first boot)
-    create_storage_disk(storage_path, 512 * 1024 * 1024)
+    let size = match size_gb_override {
+        Some(gb) => gb * 1024 * 1024 * 1024,
+        None => 512 * 1024 * 1024,
+    };
+    create_storage_disk(storage_path, size)
 }
 
 #[cfg(test)]

@@ -184,10 +184,12 @@ impl ApiState {
                 cpus: Some(record.cpus),
                 memory_mb: Some(record.mem),
                 network: Some(record.network),
+                storage_gb: record.storage_gb,
+                overlay_gb: record.overlay_gb,
             };
 
             // Create AgentManager and try to reconnect
-            match AgentManager::for_vm(&name) {
+            match AgentManager::for_vm_with_sizes(&name, record.storage_gb, record.overlay_gb) {
                 Ok(manager) => {
                     // Try to reconnect to existing running VM
                     let reconnected = manager
@@ -414,7 +416,7 @@ impl ApiState {
         }
 
         // Persist to database (with conflict detection)
-        let record = VmRecord::new_with_restart(
+        let mut record = VmRecord::new_with_restart(
             name.clone(),
             reg.resources.cpus.unwrap_or(crate::agent::DEFAULT_CPUS),
             reg.resources
@@ -428,6 +430,8 @@ impl ApiState {
             reg.network,
             reg.restart.clone(),
         );
+        record.storage_gb = reg.resources.storage_gb;
+        record.overlay_gb = reg.resources.overlay_gb;
 
         // Use insert_vm_if_not_exists for atomic database insert
         match self.db.insert_vm_if_not_exists(&name, &record) {
@@ -668,6 +672,8 @@ pub fn resource_spec_to_vm_resources(spec: &ResourceSpec, network: bool) -> VmRe
         cpus: spec.cpus.unwrap_or(crate::agent::DEFAULT_CPUS),
         mem: spec.memory_mb.unwrap_or(crate::agent::DEFAULT_MEMORY_MIB),
         network,
+        storage_gb: spec.storage_gb,
+        overlay_gb: spec.overlay_gb,
     }
 }
 
@@ -677,6 +683,8 @@ pub fn vm_resources_to_spec(res: VmResources) -> ResourceSpec {
         cpus: Some(res.cpus),
         memory_mb: Some(res.mem),
         network: Some(res.network),
+        storage_gb: res.storage_gb,
+        overlay_gb: res.overlay_gb,
     }
 }
 
@@ -735,6 +743,8 @@ mod tests {
             cpus: None,
             memory_mb: None,
             network: None,
+            storage_gb: None,
+            overlay_gb: None,
         };
         let res = resource_spec_to_vm_resources(&spec, false);
         assert_eq!(res.cpus, crate::agent::DEFAULT_CPUS);

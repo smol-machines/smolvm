@@ -71,6 +71,8 @@ pub fn build_create_params(
     cli_env: Vec<String>,
     cli_workdir: Option<String>,
     smolfile_path: Option<PathBuf>,
+    cli_storage_gb: Option<u64>,
+    cli_overlay_gb: Option<u64>,
 ) -> smolvm::Result<CreateVmParams> {
     let sf = match smolfile_path {
         Some(path) => load(&path)?,
@@ -85,6 +87,8 @@ pub fn build_create_params(
                 init: cli_init,
                 env: cli_env,
                 workdir: cli_workdir,
+                storage_gb: cli_storage_gb,
+                overlay_gb: cli_overlay_gb,
             });
         }
     };
@@ -145,5 +149,7 @@ pub fn build_create_params(
         init,
         env,
         workdir,
+        storage_gb: cli_storage_gb,
+        overlay_gb: cli_overlay_gb,
     })
 }

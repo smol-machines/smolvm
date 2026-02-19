@@ -492,9 +492,18 @@ fn mount_storage_disk() {
         }
     };
 
+    // Expand the ext4 filesystem to fill the block device. The host creates
+    // storage from a 512MB template then extends the sparse file to 20GB, but
+    // the ext4 superblock still thinks the FS is 512MB. resize2fs fixes this.
+    // Safe to call even when the FS already spans the device (instant no-op).
+    let resize_fs = || {
+        let _ = Command::new("resize2fs").arg(STORAGE_DEVICE).output(); // output() to suppress stdout/stderr
+    };
+
     match mount_result {
         Ok(status) if status.success() => {
             debug!("storage disk mounted successfully");
+            resize_fs();
             create_dirs();
         }
         _ => {
@@ -515,6 +524,7 @@ fn mount_storage_disk() {
                     if let Ok(status) = mount_after_fsck {
                         if status.success() {
                             info!("storage disk mounted after fsck repair");
+                            resize_fs();
                             create_dirs();
                             return;
                         }
@@ -528,7 +538,8 @@ fn mount_storage_disk() {
                 }
             }
 
-            // Format as last resort
+            // Format as last resort (mkfs creates the FS at full device size,
+            // no resize needed)
             let _ = Command::new("mkfs.ext4")
                 .args(["-F", "-q", STORAGE_DEVICE])
                 .status();

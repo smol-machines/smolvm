@@ -86,6 +86,8 @@ pub struct CreateVmParams {
     pub init: Vec<String>,
     pub env: Vec<String>,
     pub workdir: Option<String>,
+    pub storage_gb: Option<u64>,
+    pub overlay_gb: Option<u64>,
 }
 
 /// Create a named VM/sandbox configuration (does not start it).
@@ -132,6 +134,8 @@ pub fn create_vm(kind: VmKind, params: CreateVmParams) -> smolvm::Result<()> {
     record.init = params.init.clone();
     record.env = env;
     record.workdir = params.workdir.clone();
+    record.storage_gb = params.storage_gb;
+    record.overlay_gb = params.overlay_gb;
 
     // Store in config (persisted immediately to database)
     config.insert_vm(params.name.clone(), record)?;
@@ -195,7 +199,7 @@ pub fn start_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
     let resources = record.vm_resources();
 
     // Start agent VM
-    let manager = AgentManager::for_vm(name)
+    let manager = AgentManager::for_vm_with_sizes(name, record.storage_gb, record.overlay_gb)
         .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
 
     let mount_info = if !mounts.is_empty() {

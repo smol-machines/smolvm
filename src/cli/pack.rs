@@ -108,6 +108,8 @@ impl PackCmd {
                 cpus: 2,
                 mem: 512,
                 network: true,
+                storage_gb: None,
+                overlay_gb: None,
             },
         )?;
         let mut client = manager.connect()?;
@@ -310,7 +312,11 @@ impl PackCmd {
         ];
 
         for candidate in candidates.into_iter().flatten() {
-            if candidate.join("sbin/init").exists() {
+            // Use symlink_metadata instead of exists() because sbin/init
+            // is a symlink to a guest-only path (/usr/local/bin/smolvm-agent)
+            // that doesn't exist on the host. exists() follows symlinks and
+            // returns false for broken symlinks.
+            if std::fs::symlink_metadata(candidate.join("sbin/init")).is_ok() {
                 debug!(rootfs_dir = %candidate.display(), "found agent rootfs");
                 return Ok(candidate);
             }

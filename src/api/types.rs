@@ -94,6 +94,14 @@ pub struct ResourceSpec {
     /// Note: Only TCP/UDP supported, not ICMP (ping).
     #[serde(default)]
     pub network: Option<bool>,
+    /// Storage disk size in GiB (default: 20).
+    #[serde(default)]
+    #[schema(example = 20)]
+    pub storage_gb: Option<u64>,
+    /// Overlay disk size in GiB (default: 2).
+    #[serde(default)]
+    #[schema(example = 2)]
+    pub overlay_gb: Option<u64>,
 }
 
 /// Sandbox status information.
@@ -458,6 +466,12 @@ pub struct CreateMicrovmRequest {
     /// Note: Only TCP/UDP supported, not ICMP (ping).
     #[serde(default)]
     pub network: bool,
+    /// Storage disk size in GiB (default: 20).
+    #[serde(default)]
+    pub storage_gb: Option<u64>,
+    /// Overlay disk size in GiB (default: 2).
+    #[serde(default)]
+    pub overlay_gb: Option<u64>,
 }
 
 /// Request to execute a command in a microvm.

@@ -86,6 +86,8 @@ pub async fn create_sandbox(
         cpus: None,
         memory_mb: None,
         network: None,
+        storage_gb: None,
+        overlay_gb: None,
     });
 
     // Get network setting from resources (default to false)
@@ -99,7 +101,12 @@ pub async fn create_sandbox(
 
     // Create AgentManager in blocking task
     let name = guard.name().to_string();
-    let manager_result = tokio::task::spawn_blocking(move || AgentManager::for_vm(&name)).await;
+    let storage_gb = resources.storage_gb;
+    let overlay_gb = resources.overlay_gb;
+    let manager_result = tokio::task::spawn_blocking(move || {
+        AgentManager::for_vm_with_sizes(&name, storage_gb, overlay_gb)
+    })
+    .await;
 
     // Handle manager creation result - guard auto-releases on error return
     let manager = match manager_result {

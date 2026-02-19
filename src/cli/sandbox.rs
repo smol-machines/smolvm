@@ -341,6 +341,14 @@ pub struct RunCmd {
     )]
     pub mem: u32,
 
+    /// Storage disk size in GiB (for OCI layers and container data)
+    #[arg(long, value_name = "GiB", help_heading = "Resources")]
+    pub storage: Option<u64>,
+
+    /// Overlay disk size in GiB (for persistent rootfs changes)
+    #[arg(long, value_name = "GiB", help_heading = "Resources")]
+    pub overlay: Option<u64>,
+
     /// Mount ~/.docker/ config into VM for registry authentication
     ///
     /// When enabled, the Docker config directory (typically ~/.docker/) is
@@ -373,10 +381,12 @@ impl RunCmd {
             cpus: self.cpus,
             mem: self.mem,
             network: self.net,
+            storage_gb: self.storage,
+            overlay_gb: self.overlay,
         };
 
         // Start agent VM
-        let manager = AgentManager::new_default()
+        let manager = AgentManager::new_default_with_sizes(self.storage, self.overlay)
             .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
 
         // Show startup message
@@ -517,6 +527,14 @@ pub struct CreateCmd {
     #[arg(long, default_value_t = smolvm::agent::DEFAULT_MEMORY_MIB, value_name = "MiB")]
     pub mem: u32,
 
+    /// Storage disk size in GiB (for OCI layers and container data)
+    #[arg(long, value_name = "GiB")]
+    pub storage: Option<u64>,
+
+    /// Overlay disk size in GiB (for persistent rootfs changes)
+    #[arg(long, value_name = "GiB")]
+    pub overlay: Option<u64>,
+
     /// Mount host directory (can be used multiple times)
     #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro]")]
     pub volume: Vec<String>,
@@ -559,6 +577,8 @@ impl CreateCmd {
             self.env,
             self.workdir,
             self.smolfile,
+            self.storage,
+            self.overlay,
         )?;
         vm_common::create_vm(KIND, params)
     }

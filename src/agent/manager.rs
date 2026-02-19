@@ -225,9 +225,16 @@ impl AgentManager {
     /// Get the default (anonymous) agent manager.
     ///
     /// Uses default paths for rootfs and storage.
-    pub fn new_default() -> Result<Self> {
+    /// `storage_gb` and `overlay_gb` override the default disk sizes (20 GiB / 2 GiB).
+    pub fn new_default_with_sizes(
+        storage_gb: Option<u64>,
+        overlay_gb: Option<u64>,
+    ) -> Result<Self> {
         let rootfs_path = Self::default_rootfs_path()?;
-        let storage_disk = StorageDisk::open_or_create()?;
+        let sg = storage_gb.unwrap_or(crate::storage::DEFAULT_STORAGE_SIZE_GB);
+        let og = overlay_gb.unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GB);
+
+        let storage_disk = StorageDisk::open_or_create_with_size(sg)?;
 
         // Overlay disk lives next to the storage disk
         let overlay_path = storage_disk
@@ -235,18 +242,29 @@ impl AgentManager {
             .parent()
             .unwrap_or_else(|| Path::new("/tmp"))
             .join(crate::storage::OVERLAY_DISK_FILENAME);
-        let overlay_disk =
-            OverlayDisk::open_or_create_at(&overlay_path, crate::storage::DEFAULT_OVERLAY_SIZE_GB)?;
+        let overlay_disk = OverlayDisk::open_or_create_at(&overlay_path, og)?;
 
         Self::new(rootfs_path, storage_disk, overlay_disk)
+    }
+
+    /// Get the default (anonymous) agent manager with default sizes.
+    pub fn new_default() -> Result<Self> {
+        Self::new_default_with_sizes(None, None)
     }
 
     /// Get an agent manager for a named VM.
     ///
     /// Each named VM gets its own isolated storage and socket.
-    pub fn for_vm(name: impl Into<String>) -> Result<Self> {
+    /// `storage_gb` and `overlay_gb` override the default disk sizes (20 GiB / 2 GiB).
+    pub fn for_vm_with_sizes(
+        name: impl Into<String>,
+        storage_gb: Option<u64>,
+        overlay_gb: Option<u64>,
+    ) -> Result<Self> {
         let name = name.into();
         let rootfs_path = Self::default_rootfs_path()?;
+        let sg = storage_gb.unwrap_or(crate::storage::DEFAULT_STORAGE_SIZE_GB);
+        let og = overlay_gb.unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GB);
 
         // Named VMs get their own storage disk
         let storage_dir = dirs::cache_dir()
@@ -258,14 +276,17 @@ impl AgentManager {
         std::fs::create_dir_all(&storage_dir)?;
 
         let storage_path = storage_dir.join(crate::storage::STORAGE_DISK_FILENAME);
-        let storage_disk =
-            StorageDisk::open_or_create_at(&storage_path, crate::storage::DEFAULT_STORAGE_SIZE_GB)?;
+        let storage_disk = StorageDisk::open_or_create_at(&storage_path, sg)?;
 
         let overlay_path = storage_dir.join(crate::storage::OVERLAY_DISK_FILENAME);
-        let overlay_disk =
-            OverlayDisk::open_or_create_at(&overlay_path, crate::storage::DEFAULT_OVERLAY_SIZE_GB)?;
+        let overlay_disk = OverlayDisk::open_or_create_at(&overlay_path, og)?;
 
         Self::new_named(name, rootfs_path, storage_disk, overlay_disk)
+    }
+
+    /// Get an agent manager for a named VM with default sizes.
+    pub fn for_vm(name: impl Into<String>) -> Result<Self> {
+        Self::for_vm_with_sizes(name, None, None)
     }
 
     /// Get the VM name if this is a named agent.
@@ -665,6 +686,12 @@ impl AgentManager {
         let overlay_disk_path = self.overlay_disk.path().to_path_buf();
         let vsock_socket = self.vsock_socket.clone();
         let console_log = self.console_log.clone();
+        let storage_size_gb = resources
+            .storage_gb
+            .unwrap_or(crate::storage::DEFAULT_STORAGE_SIZE_GB);
+        let overlay_size_gb = resources
+            .overlay_gb
+            .unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GB);
 
         // Fork child process using the safe abstraction.
         // The child becomes a session leader (detached from parent's session)
@@ -679,7 +706,7 @@ impl AgentManager {
             // Re-create StorageDisk in child (we only have the path)
             let storage_disk = match crate::storage::StorageDisk::open_or_create_at(
                 &storage_disk_path,
-                crate::storage::DEFAULT_STORAGE_SIZE_GB,
+                storage_size_gb,
             ) {
                 Ok(d) => d,
                 Err(e) => {
@@ -691,7 +718,7 @@ impl AgentManager {
             // Re-create OverlayDisk in child
             let overlay_disk = match crate::storage::OverlayDisk::open_or_create_at(
                 &overlay_disk_path,
-                crate::storage::DEFAULT_OVERLAY_SIZE_GB,
+                overlay_size_gb,
             ) {
                 Ok(d) => d,
                 Err(e) => {

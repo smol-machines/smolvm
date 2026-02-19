@@ -146,6 +146,12 @@ impl StorageDisk {
         Self::open_or_create_at(&path, DEFAULT_STORAGE_SIZE_GB)
     }
 
+    /// Open or create the storage disk at the default location with a custom size.
+    pub fn open_or_create_with_size(size_gb: u64) -> Result<Self> {
+        let path = Self::default_path()?;
+        Self::open_or_create_at(&path, size_gb)
+    }
+
     /// Open or create the storage disk at a custom path.
     pub fn open_or_create_at(path: &Path, size_gb: u64) -> Result<Self> {
         // Validate size

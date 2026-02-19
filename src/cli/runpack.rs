@@ -110,6 +110,14 @@ pub struct RunpackCmd {
     #[arg(long, value_name = "MiB", help_heading = "Resources")]
     pub mem: Option<u32>,
 
+    /// Storage disk size in GiB (for OCI layers and container data)
+    #[arg(long, value_name = "GiB", help_heading = "Resources")]
+    pub storage: Option<u64>,
+
+    /// Overlay disk size in GiB (for persistent rootfs changes)
+    #[arg(long, value_name = "GiB", help_heading = "Resources")]
+    pub overlay: Option<u64>,
+
     /// Re-extract assets even if already cached
     #[arg(long)]
     pub force_extract: bool,
@@ -226,7 +234,7 @@ impl RunpackCmd {
             .storage_template
             .as_ref()
             .map(|t| t.path.as_str());
-        extract::create_or_copy_storage_disk(&cache_dir, template, &storage_path)
+        extract::create_or_copy_storage_disk(&cache_dir, template, &storage_path, self.storage)
             .map_err(|e| Error::agent("create storage disk", e.to_string()))?;
 
         // 7. Parse CLI args
@@ -237,6 +245,8 @@ impl RunpackCmd {
             cpus: self.cpus.unwrap_or(manifest.cpus),
             mem: self.mem.unwrap_or(manifest.mem),
             network: self.net || !self.port.is_empty(),
+            storage_gb: self.storage,
+            overlay_gb: self.overlay,
         };
 
         // Build packed mounts for the launcher
@@ -627,6 +637,14 @@ struct PackedCli {
     #[arg(long, value_name = "MiB", global = true)]
     mem: Option<u32>,
 
+    /// Storage disk size in GiB
+    #[arg(long, value_name = "GiB", global = true)]
+    storage: Option<u64>,
+
+    /// Overlay disk size in GiB
+    #[arg(long, value_name = "GiB", global = true)]
+    overlay: Option<u64>,
+
     /// Expose port from container to host
     #[arg(short = 'p', long = "port", value_parser = parse_port, value_name = "HOST:GUEST")]
     port: Vec<PortMapping>,
@@ -715,6 +733,8 @@ fn runpack_inner(mode: PackedMode, cli: PackedCli) -> smolvm::Result<()> {
                 net: cli.net,
                 cpus: cli.cpus,
                 mem: cli.mem,
+                storage: cli.storage,
+                overlay: cli.overlay,
                 force_extract: cli.force_extract,
                 info: cli.info,
                 debug: cli.debug,
@@ -814,7 +834,7 @@ fn run_from_cache(
         .storage_template
         .as_ref()
         .map(|t| t.path.as_str());
-    extract::create_or_copy_storage_disk(cache_dir, template, &storage_path)
+    extract::create_or_copy_storage_disk(cache_dir, template, &storage_path, cli.storage)
         .map_err(|e| Error::agent("create storage disk", e.to_string()))?;
 
     let mounts = parse_mounts(&cli.volume)?;
@@ -824,6 +844,8 @@ fn run_from_cache(
         cpus: cli.cpus.unwrap_or(manifest.cpus),
         mem: cli.mem.unwrap_or(manifest.mem),
         network: cli.net || !cli.port.is_empty(),
+        storage_gb: cli.storage,
+        overlay_gb: cli.overlay,
     };
 
     let packed_mounts: Vec<PackedMount> = mounts
@@ -912,6 +934,8 @@ fn run_from_cache(
         net: cli.net,
         cpus: cli.cpus,
         mem: cli.mem,
+        storage: cli.storage,
+        overlay: cli.overlay,
         force_extract: false,
         info: false,
         debug,

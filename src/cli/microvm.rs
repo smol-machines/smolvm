@@ -191,6 +191,14 @@ pub struct CreateCmd {
     #[arg(long, default_value_t = smolvm::agent::DEFAULT_MEMORY_MIB, value_name = "MiB")]
     pub mem: u32,
 
+    /// Storage disk size in GiB (for OCI layers and container data)
+    #[arg(long, value_name = "GiB")]
+    pub storage: Option<u64>,
+
+    /// Overlay disk size in GiB (for persistent rootfs changes)
+    #[arg(long, value_name = "GiB")]
+    pub overlay: Option<u64>,
+
     /// Mount host directory (can be used multiple times)
     #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro]")]
     pub volume: Vec<String>,
@@ -233,6 +241,8 @@ impl CreateCmd {
             self.env,
             self.workdir,
             self.smolfile,
+            self.storage,
+            self.overlay,
         )?;
         vm_common::create_vm(KIND, params)
     }
