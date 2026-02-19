@@ -646,11 +646,11 @@ struct PackedCli {
     overlay: Option<u64>,
 
     /// Expose port from container to host
-    #[arg(short = 'p', long = "port", value_parser = parse_port, value_name = "HOST:GUEST")]
+    #[arg(short = 'p', long = "port", value_parser = parse_port, value_name = "HOST:GUEST", global = true)]
     port: Vec<PortMapping>,
 
     /// Enable outbound network access
-    #[arg(long)]
+    #[arg(long, global = true)]
     net: bool,
 
     /// Show manifest info and exit
@@ -675,6 +675,18 @@ enum PackedDaemonCmd {
         /// Command to run
         #[arg(trailing_var_arg = true)]
         command: Vec<String>,
+
+        /// Keep stdin open for interactive input
+        #[arg(short = 'i', long)]
+        interactive: bool,
+
+        /// Allocate a pseudo-TTY (use with -i for interactive shells)
+        #[arg(short = 't', long)]
+        tty: bool,
+
+        /// Kill command after duration (e.g., "30s", "5m")
+        #[arg(long, value_parser = crate::cli::parsers::parse_duration, value_name = "DURATION")]
+        timeout: Option<Duration>,
     },
     /// Stop the running daemon VM
     Stop,
@@ -701,17 +713,31 @@ pub fn run_as_packed_binary(mode: PackedMode) -> ! {
 }
 
 fn runpack_inner(mode: PackedMode, cli: PackedCli) -> smolvm::Result<()> {
-    // Handle daemon subcommands (not yet implemented)
-    if let Some(daemon_cmd) = cli.daemon_command {
-        return Err(Error::agent(
-            "daemon mode",
-            match daemon_cmd {
-                PackedDaemonCmd::Start => "daemon mode not yet implemented. Run commands directly.",
-                PackedDaemonCmd::Exec { .. } => "daemon mode not yet implemented.",
-                PackedDaemonCmd::Stop => "daemon mode not yet implemented.",
-                PackedDaemonCmd::Status => "daemon mode not yet implemented.",
-            },
-        ));
+    // Handle daemon subcommands
+    if let Some(ref daemon_cmd) = cli.daemon_command {
+        let checksum = mode_checksum(&mode);
+        return match daemon_cmd {
+            PackedDaemonCmd::Start => daemon_start(&mode, &cli),
+            PackedDaemonCmd::Exec {
+                ref command,
+                interactive,
+                tty,
+                ref timeout,
+            } => {
+                let manifest = read_manifest_for_mode(&mode)?;
+                daemon_exec(
+                    checksum,
+                    command.clone(),
+                    *interactive,
+                    *tty,
+                    *timeout,
+                    &cli,
+                    &manifest,
+                )
+            }
+            PackedDaemonCmd::Stop => daemon_stop(checksum, cli.debug),
+            PackedDaemonCmd::Status => daemon_status(checksum),
+        };
     }
 
     match mode {
@@ -969,4 +995,434 @@ fn print_manifest_info(manifest: &smolvm_pack::PackManifest, checksum: u32) {
         }
     }
     println!("Checksum:   {:08x}", checksum);
+}
+
+// ===========================================================================
+// Daemon mode helpers and implementation
+// ===========================================================================
+
+/// Extract the checksum from any PackedMode variant.
+fn mode_checksum(mode: &PackedMode) -> u32 {
+    match mode {
+        #[cfg(target_os = "macos")]
+        PackedMode::Section { checksum, .. } => *checksum,
+        PackedMode::Embedded { footer, .. } => footer.checksum,
+        PackedMode::Sidecar { footer, .. } => footer.checksum,
+    }
+}
+
+/// Get the daemon state directory for a given checksum.
+///
+/// Returns `~/.cache/smolvm-pack/{checksum:08x}/daemon/`.
+fn daemon_dir(checksum: u32) -> smolvm::Result<PathBuf> {
+    let cache_dir = extract::get_cache_dir(checksum)
+        .map_err(|e| Error::agent("get cache dir", e.to_string()))?;
+    Ok(cache_dir.join("daemon"))
+}
+
+/// Read PID and start time from the daemon PID file.
+///
+/// The PID file format is: `{pid}\n{start_time}`.
+/// Returns `None` if the file doesn't exist or is malformed.
+fn read_daemon_pid(checksum: u32) -> Option<(libc::pid_t, Option<u64>)> {
+    let dir = daemon_dir(checksum).ok()?;
+    let pid_path = dir.join("agent.pid");
+    let contents = std::fs::read_to_string(&pid_path).ok()?;
+    let mut lines = contents.lines();
+    let pid: libc::pid_t = lines.next()?.parse().ok()?;
+    let start_time: Option<u64> = lines.next().and_then(|s| s.parse().ok());
+    Some((pid, start_time))
+}
+
+/// Write PID and start time to the daemon PID file.
+fn write_daemon_pid(
+    checksum: u32,
+    pid: libc::pid_t,
+    start_time: Option<u64>,
+) -> smolvm::Result<()> {
+    let dir = daemon_dir(checksum)?;
+    let pid_path = dir.join("agent.pid");
+    let contents = match start_time {
+        Some(st) => format!("{}\n{}", pid, st),
+        None => format!("{}", pid),
+    };
+    std::fs::write(&pid_path, contents).map_err(|e| Error::agent("write PID file", e.to_string()))
+}
+
+/// Read the manifest for any PackedMode variant.
+fn read_manifest_for_mode(mode: &PackedMode) -> smolvm::Result<smolvm_pack::PackManifest> {
+    match mode {
+        #[cfg(target_os = "macos")]
+        PackedMode::Section { manifest, .. } => Ok((**manifest).clone()),
+        PackedMode::Embedded { exe_path, .. } => smolvm_pack::read_manifest(exe_path)
+            .map_err(|e| Error::agent("read manifest", e.to_string())),
+        PackedMode::Sidecar { sidecar_path, .. } => {
+            smolvm_pack::read_manifest_from_sidecar(sidecar_path)
+                .map_err(|e| Error::agent("read manifest", e.to_string()))
+        }
+    }
+}
+
+/// Ensure assets are extracted to the cache directory for the given mode.
+fn ensure_extracted(mode: &PackedMode, force: bool, debug: bool) -> smolvm::Result<PathBuf> {
+    let checksum = mode_checksum(mode);
+    let cache_dir = extract::get_cache_dir(checksum)
+        .map_err(|e| Error::agent("get cache dir", e.to_string()))?;
+
+    let needs_extract = force || !extract::is_extracted(&cache_dir);
+    if needs_extract {
+        match mode {
+            #[cfg(target_os = "macos")]
+            PackedMode::Section {
+                assets_ptr,
+                assets_size,
+                ..
+            } => unsafe {
+                extract::extract_from_section(&cache_dir, *assets_ptr, *assets_size, debug)
+                    .map_err(|e| Error::agent("extract section assets", e.to_string()))?;
+            },
+            PackedMode::Embedded {
+                exe_path, footer, ..
+            } => {
+                extract::extract_from_binary(exe_path, &cache_dir, footer, debug)
+                    .map_err(|e| Error::agent("extract embedded assets", e.to_string()))?;
+            }
+            PackedMode::Sidecar {
+                sidecar_path,
+                footer,
+                ..
+            } => {
+                extract::extract_sidecar(sidecar_path, &cache_dir, footer, force, debug)
+                    .map_err(|e| Error::agent("extract sidecar assets", e.to_string()))?;
+            }
+        }
+    }
+
+    Ok(cache_dir)
+}
+
+/// Check if the daemon is currently running and connectable.
+fn is_daemon_running(checksum: u32) -> bool {
+    let Some((pid, start_time)) = read_daemon_pid(checksum) else {
+        return false;
+    };
+
+    // Check PID identity (guards against PID reuse)
+    if !smolvm::process::is_our_process_strict(pid, start_time) {
+        return false;
+    }
+
+    // Try to actually connect and ping
+    let dir = match daemon_dir(checksum) {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+    let sock_path = dir.join("agent.sock");
+    if !sock_path.exists() {
+        return false;
+    }
+
+    AgentClient::connect(&sock_path)
+        .and_then(|mut c| c.ping())
+        .is_ok()
+}
+
+/// Start the daemon VM.
+///
+/// Extracts assets if needed, creates the daemon directory, forks a child
+/// process that runs the VM, writes a PID file, and waits for the agent
+/// to become ready.
+fn daemon_start(mode: &PackedMode, cli: &PackedCli) -> smolvm::Result<()> {
+    let checksum = mode_checksum(mode);
+    let manifest = read_manifest_for_mode(mode)?;
+
+    // Extract assets to cache
+    let cache_dir = ensure_extracted(mode, cli.force_extract, cli.debug)?;
+
+    // Create daemon directory
+    let daemon = cache_dir.join("daemon");
+    std::fs::create_dir_all(&daemon)
+        .map_err(|e| Error::agent("create daemon dir", e.to_string()))?;
+
+    // Check if already running
+    if is_daemon_running(checksum) {
+        let (pid, _) = read_daemon_pid(checksum).unwrap();
+        println!("Daemon already running (PID: {})", pid);
+        return Ok(());
+    }
+
+    // Clean up stale PID/socket files from previous runs
+    let _ = std::fs::remove_file(daemon.join("agent.pid"));
+    let _ = std::fs::remove_file(daemon.join("agent.sock"));
+
+    // Create storage disk if not exists (preserves existing disk on restart)
+    let storage_path = daemon.join("storage.ext4");
+    if !storage_path.exists() {
+        let template = manifest
+            .assets
+            .storage_template
+            .as_ref()
+            .map(|t| t.path.as_str());
+        extract::create_or_copy_storage_disk(&cache_dir, template, &storage_path, cli.storage)
+            .map_err(|e| Error::agent("create storage disk", e.to_string()))?;
+    }
+
+    let vsock_path = daemon.join("agent.sock");
+
+    // Parse CLI args
+    let mounts = parse_mounts(&cli.volume)?;
+    let port_mappings: Vec<(u16, u16)> = cli.port.iter().map(|p| (p.host, p.guest)).collect();
+
+    let resources = VmResources {
+        cpus: cli.cpus.unwrap_or(manifest.cpus),
+        mem: cli.mem.unwrap_or(manifest.mem),
+        network: cli.net || !cli.port.is_empty(),
+        storage_gb: cli.storage,
+        overlay_gb: cli.overlay,
+    };
+
+    let packed_mounts: Vec<PackedMount> = mounts
+        .iter()
+        .enumerate()
+        .map(|(i, m)| PackedMount {
+            tag: mount_tag(i),
+            host_path: m.source.to_string_lossy().to_string(),
+            guest_path: m.target.to_string_lossy().to_string(),
+            read_only: m.read_only,
+        })
+        .collect();
+
+    let rootfs_path = cache_dir.join("agent-rootfs");
+    let lib_dir = cache_dir.join("lib");
+    let layers_dir = cache_dir.join("layers");
+    let debug = cli.debug;
+
+    if debug {
+        eprintln!("debug: daemon dir={}", daemon.display());
+        eprintln!("debug: rootfs={}", rootfs_path.display());
+        eprintln!("debug: lib_dir={}", lib_dir.display());
+        eprintln!("debug: storage={}", storage_path.display());
+        eprintln!("debug: vsock={}", vsock_path.display());
+        eprintln!(
+            "debug: resources cpus={} mem={} net={}",
+            resources.cpus, resources.mem, resources.network
+        );
+    }
+
+    // Fork child → launch VM
+    smolvm::process::install_sigchld_handler();
+
+    let vsock_path_clone = vsock_path.clone();
+    let child_pid = smolvm::process::fork_session_leader(move || {
+        let krun = match unsafe { KrunFunctions::load(&lib_dir) } {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("failed to load libkrun: {}", e);
+                smolvm::process::exit_child(1);
+            }
+        };
+
+        let config = PackedLaunchConfig {
+            rootfs_path: &rootfs_path,
+            storage_path: &storage_path,
+            vsock_socket: &vsock_path_clone,
+            layers_dir: &layers_dir,
+            mounts: &packed_mounts,
+            port_mappings: &port_mappings,
+            resources,
+            debug,
+        };
+
+        if let Err(e) = launch_agent_vm_dynamic(&krun, &config) {
+            eprintln!("VM launch failed: {}", e);
+        }
+
+        smolvm::process::exit_child(1);
+    })
+    .map_err(|e| Error::agent("fork VM process", e.to_string()))?;
+
+    // Capture child start time for PID identity verification
+    let child_start_time = {
+        let mut st = smolvm::process::process_start_time(child_pid);
+        if st.is_none() && smolvm::process::is_alive(child_pid) {
+            for _ in 0..5 {
+                std::thread::sleep(Duration::from_millis(1));
+                st = smolvm::process::process_start_time(child_pid);
+                if st.is_some() {
+                    break;
+                }
+            }
+        }
+        if st.is_none() && smolvm::process::is_alive(child_pid) {
+            let _ = smolvm::process::stop_process_fast(child_pid, Duration::from_secs(5), true);
+            return Err(Error::agent(
+                "verify child process",
+                "unable to capture child start time for safe lifecycle management",
+            ));
+        }
+        st
+    };
+
+    // Write PID file
+    write_daemon_pid(checksum, child_pid, child_start_time)?;
+
+    if debug {
+        eprintln!("debug: forked VM process with PID {}", child_pid);
+    }
+
+    // Wait for agent to become ready
+    println!("Starting daemon...");
+    let _client = wait_for_agent(&vsock_path, debug)?;
+
+    println!("Daemon started (PID: {})", child_pid);
+    Ok(())
+}
+
+/// Execute a command in the running daemon VM.
+fn daemon_exec(
+    checksum: u32,
+    command: Vec<String>,
+    interactive: bool,
+    tty: bool,
+    timeout: Option<Duration>,
+    cli: &PackedCli,
+    manifest: &smolvm_pack::PackManifest,
+) -> smolvm::Result<()> {
+    let dir = daemon_dir(checksum)?;
+    let sock_path = dir.join("agent.sock");
+
+    // Check daemon is running
+    if !is_daemon_running(checksum) {
+        return Err(Error::agent(
+            "daemon exec",
+            "daemon is not running. Start it with: <binary> start",
+        ));
+    }
+
+    // Connect to agent
+    let mut client = AgentClient::connect(&sock_path)?;
+
+    // Build command from args or manifest defaults
+    let command = build_command(manifest, &command);
+    let env = build_env(manifest, &cli.env);
+
+    // Parse mounts
+    let mounts = parse_mounts(&cli.volume)?;
+    let mount_bindings: Vec<(String, String, bool)> = mounts
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            (
+                mount_tag(i),
+                m.target.to_string_lossy().to_string(),
+                m.read_only,
+            )
+        })
+        .collect();
+
+    let workdir = cli.workdir.clone().or_else(|| manifest.workdir.clone());
+
+    let exit_code = if interactive || tty {
+        let config = RunConfig::new(&manifest.image, command)
+            .with_env(env)
+            .with_workdir(workdir)
+            .with_mounts(mount_bindings)
+            .with_timeout(timeout)
+            .with_tty(tty);
+        client.run_interactive(config)?
+    } else {
+        let (exit_code, stdout, stderr) = client.run_with_mounts_and_timeout(
+            &manifest.image,
+            command,
+            env,
+            workdir,
+            mount_bindings,
+            timeout,
+        )?;
+
+        if !stdout.is_empty() {
+            print!("{}", stdout);
+        }
+        if !stderr.is_empty() {
+            eprint!("{}", stderr);
+        }
+        crate::cli::flush_output();
+        exit_code
+    };
+
+    std::process::exit(exit_code);
+}
+
+/// Stop the daemon VM.
+fn daemon_stop(checksum: u32, debug: bool) -> smolvm::Result<()> {
+    let Some((pid, start_time)) = read_daemon_pid(checksum) else {
+        println!("Daemon not running");
+        return Ok(());
+    };
+
+    let dir = daemon_dir(checksum)?;
+    let sock_path = dir.join("agent.sock");
+
+    // Try graceful shutdown via agent protocol
+    if sock_path.exists() {
+        if let Ok(mut client) = AgentClient::connect(&sock_path) {
+            if debug {
+                eprintln!("debug: sending shutdown to agent");
+            }
+            let _ = client.shutdown();
+        }
+    }
+
+    // Verify PID identity and force-kill if still alive
+    if smolvm::process::is_our_process_strict(pid, start_time) {
+        if debug {
+            eprintln!(
+                "debug: stopping process {} (start_time: {:?})",
+                pid, start_time
+            );
+        }
+        let _ = smolvm::process::stop_process_fast(pid, Duration::from_secs(5), true);
+    }
+
+    // Clean up PID and socket files (keep storage.ext4 for persistence)
+    let _ = std::fs::remove_file(dir.join("agent.pid"));
+    let _ = std::fs::remove_file(dir.join("agent.sock"));
+
+    println!("Daemon stopped");
+    Ok(())
+}
+
+/// Check daemon status.
+fn daemon_status(checksum: u32) -> smolvm::Result<()> {
+    let Some((pid, start_time)) = read_daemon_pid(checksum) else {
+        println!("Status: not running");
+        return Ok(());
+    };
+
+    // Check if PID is still our process
+    if !smolvm::process::is_our_process_strict(pid, start_time) {
+        println!("Status: not running (stale PID file)");
+        // Clean up stale files
+        if let Ok(dir) = daemon_dir(checksum) {
+            let _ = std::fs::remove_file(dir.join("agent.pid"));
+            let _ = std::fs::remove_file(dir.join("agent.sock"));
+        }
+        return Ok(());
+    }
+
+    // Try to connect and ping
+    let dir = daemon_dir(checksum)?;
+    let sock_path = dir.join("agent.sock");
+
+    if sock_path.exists() {
+        if let Ok(mut client) = AgentClient::connect(&sock_path) {
+            if client.ping().is_ok() {
+                println!("Status: running (PID: {})", pid);
+                return Ok(());
+            }
+        }
+    }
+
+    println!("Status: running (PID: {}, agent not responding)", pid);
+    Ok(())
 }
