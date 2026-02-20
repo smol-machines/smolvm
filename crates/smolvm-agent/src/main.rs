@@ -220,10 +220,34 @@ impl MountEntry {
 #[cfg(target_os = "linux")]
 fn mount_essential_filesystems() {
     let mounts = [
-        MountEntry { source: "proc",     target: "/proc",    fstype: "proc",     flags: 0, data: None },
-        MountEntry { source: "sysfs",    target: "/sys",     fstype: "sysfs",    flags: 0, data: None },
-        MountEntry { source: "devtmpfs", target: "/dev",     fstype: "devtmpfs", flags: 0, data: None },
-        MountEntry { source: "devpts",   target: "/dev/pts", fstype: "devpts",   flags: 0, data: Some("mode=0620,ptmxmode=0666") },
+        MountEntry {
+            source: "proc",
+            target: "/proc",
+            fstype: "proc",
+            flags: 0,
+            data: None,
+        },
+        MountEntry {
+            source: "sysfs",
+            target: "/sys",
+            fstype: "sysfs",
+            flags: 0,
+            data: None,
+        },
+        MountEntry {
+            source: "devtmpfs",
+            target: "/dev",
+            fstype: "devtmpfs",
+            flags: 0,
+            data: None,
+        },
+        MountEntry {
+            source: "devpts",
+            target: "/dev/pts",
+            fstype: "devpts",
+            flags: 0,
+            data: Some("mode=0620,ptmxmode=0666"),
+        },
     ];
 
     for entry in &mounts {
