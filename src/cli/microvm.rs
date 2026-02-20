@@ -10,7 +10,7 @@
 //! - ls: List all named VMs
 
 use crate::cli::flush_output;
-use crate::cli::parsers::{parse_duration, parse_env_list, parse_port};
+use crate::cli::parsers::{parse_cidr, parse_duration, parse_env_list, parse_port};
 use crate::cli::vm_common::{self, DeleteVmOptions, VmKind};
 use clap::{Args, Subcommand};
 use smolvm::agent::{AgentClient, PortMapping};
@@ -211,6 +211,14 @@ pub struct CreateCmd {
     #[arg(long)]
     pub net: bool,
 
+    /// Restrict outbound to specific IPs/CIDRs (implies --net, can be repeated)
+    #[arg(long = "allow-ip", value_parser = parse_cidr, value_name = "CIDR")]
+    pub allow_ip: Vec<String>,
+
+    /// Restrict outbound to localhost only (implies --net)
+    #[arg(long)]
+    pub outbound_localhost_only: bool,
+
     /// Run command on every VM start (can be used multiple times)
     #[arg(long = "init", value_name = "COMMAND")]
     pub init: Vec<String>,
@@ -230,19 +238,26 @@ pub struct CreateCmd {
 
 impl CreateCmd {
     pub fn run(self) -> smolvm::Result<()> {
+        let mut allow_cidrs = self.allow_ip.clone();
+        if self.outbound_localhost_only {
+            allow_cidrs.push("127.0.0.0/8".to_string());
+            allow_cidrs.push("::1/128".to_string());
+        }
+
         let params = crate::cli::smolfile::build_create_params(
             self.name,
             self.cpus,
             self.mem,
             self.volume,
             self.port,
-            self.net,
+            self.net || !allow_cidrs.is_empty(),
             self.init,
             self.env,
             self.workdir,
             self.smolfile,
             self.storage,
             self.overlay,
+            allow_cidrs,
         )?;
         vm_common::create_vm(KIND, params)
     }

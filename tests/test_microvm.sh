@@ -408,6 +408,83 @@ test_microvm_rootfs_persists_across_reboot() {
 }
 
 # =============================================================================
+# Egress Policy (--allow-ip / --outbound-localhost-only)
+# Tests verify IP/CIDR-based egress restrictions enforced at the TSI layer
+# for persistent microVMs created with `microvm create`.
+# =============================================================================
+
+test_microvm_egress_allow_ip_permitted() {
+    local vm_name="egress-allow-test-$$"
+
+    $SMOLVM microvm stop "$vm_name" 2>/dev/null || true
+    $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+
+    # Create VM allowing only Cloudflare DNS
+    $SMOLVM microvm create "$vm_name" --allow-ip 1.1.1.1/32 2>&1 || return 1
+    $SMOLVM microvm start "$vm_name" 2>&1 || { $SMOLVM microvm delete "$vm_name" -f 2>/dev/null; return 1; }
+
+    # DNS lookup to allowed IP should succeed
+    local output exit_code=0
+    output=$($SMOLVM microvm exec --name "$vm_name" -- nslookup cloudflare.com 1.1.1.1 2>&1) || exit_code=$?
+
+    $SMOLVM microvm stop "$vm_name" 2>/dev/null || true
+    $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+
+    [[ $exit_code -eq 0 ]] && [[ "$output" == *"Address"* ]]
+}
+
+test_microvm_egress_allow_ip_blocked() {
+    local vm_name="egress-block-test-$$"
+
+    $SMOLVM microvm stop "$vm_name" 2>/dev/null || true
+    $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+
+    # Create VM allowing only private range — external IPs should be blocked
+    $SMOLVM microvm create "$vm_name" --allow-ip 10.0.0.0/8 2>&1 || return 1
+    $SMOLVM microvm start "$vm_name" 2>&1 || { $SMOLVM microvm delete "$vm_name" -f 2>/dev/null; return 1; }
+
+    local exit_code=0
+    $SMOLVM microvm exec --name "$vm_name" -- nslookup cloudflare.com 1.1.1.1 2>&1 || exit_code=$?
+
+    $SMOLVM microvm stop "$vm_name" 2>/dev/null || true
+    $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+
+    # Should fail: 1.1.1.1 is NOT in the allowlist
+    [[ $exit_code -ne 0 ]]
+}
+
+test_microvm_egress_outbound_localhost_only() {
+    local vm_name="egress-localhost-test-$$"
+
+    $SMOLVM microvm stop "$vm_name" 2>/dev/null || true
+    $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+
+    # Create VM with --outbound-localhost-only
+    $SMOLVM microvm create "$vm_name" --outbound-localhost-only 2>&1 || return 1
+    $SMOLVM microvm start "$vm_name" 2>&1 || { $SMOLVM microvm delete "$vm_name" -f 2>/dev/null; return 1; }
+
+    local exit_code=0
+    $SMOLVM microvm exec --name "$vm_name" -- nslookup cloudflare.com 1.1.1.1 2>&1 || exit_code=$?
+
+    $SMOLVM microvm stop "$vm_name" 2>/dev/null || true
+    $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+
+    # Should fail: only localhost is allowed
+    [[ $exit_code -ne 0 ]]
+}
+
+test_microvm_egress_invalid_cidr_rejected() {
+    # Invalid CIDR should be rejected at create time
+    local vm_name="egress-invalid-test-$$"
+    local output exit_code=0
+    output=$($SMOLVM microvm create "$vm_name" --allow-ip "not-a-cidr" 2>&1) || exit_code=$?
+
+    $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+
+    [[ $exit_code -ne 0 ]] && [[ "$output" == *"invalid"* ]]
+}
+
+# =============================================================================
 # Run Tests
 # =============================================================================
 
@@ -429,5 +506,9 @@ run_test "Network: DNS resolution" test_microvm_network_dns_resolution || true
 run_test "Network: multiple DNS lookups" test_microvm_network_multiple_dns_lookups || true
 run_test "Overlay: root is overlayfs" test_microvm_overlay_root_active || true
 run_test "Overlay: rootfs persists across reboot" test_microvm_rootfs_persists_across_reboot || true
+run_test "Egress: allow-ip permits matching traffic" test_microvm_egress_allow_ip_permitted || true
+run_test "Egress: allow-ip blocks non-matching traffic" test_microvm_egress_allow_ip_blocked || true
+run_test "Egress: --outbound-localhost-only blocks external" test_microvm_egress_outbound_localhost_only || true
+run_test "Egress: invalid CIDR rejected at create" test_microvm_egress_invalid_cidr_rejected || true
 
 print_summary "MicroVM Tests"

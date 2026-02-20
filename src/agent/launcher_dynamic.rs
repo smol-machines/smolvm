@@ -44,6 +44,7 @@ pub struct KrunFunctions {
     pub disable_implicit_vsock: unsafe extern "C" fn(u32) -> i32,
     pub add_vsock: unsafe extern "C" fn(u32, u32) -> i32,
     pub set_console_output: unsafe extern "C" fn(u32, *const libc::c_char) -> i32,
+    pub set_egress_policy: Option<unsafe extern "C" fn(u32, *const *const libc::c_char) -> i32>,
 }
 
 impl KrunFunctions {
@@ -132,6 +133,16 @@ impl KrunFunctions {
             disable_implicit_vsock: load_sym!(krun_disable_implicit_vsock),
             add_vsock: load_sym!(krun_add_vsock),
             set_console_output: load_sym!(krun_set_console_output),
+            set_egress_policy: {
+                let sym_name = CString::new("krun_set_egress_policy").expect("symbol name is static");
+                let sym = libc::dlsym(handle, sym_name.as_ptr());
+                if sym.is_null() {
+                    None
+                } else {
+                    #[allow(clippy::missing_transmute_annotations)]
+                    Some(std::mem::transmute(sym))
+                }
+            },
         })
     }
 }
@@ -241,7 +252,8 @@ pub fn launch_agent_vm_dynamic(
             return Err("krun_disable_implicit_vsock failed".to_string());
         }
 
-        if config.resources.network || !config.port_mappings.is_empty() {
+        let has_egress_policy = !config.resources.allow_cidrs.is_empty();
+        if config.resources.network || !config.port_mappings.is_empty() || has_egress_policy {
             if (krun.add_vsock)(ctx, KRUN_TSI_HIJACK_INET) < 0 {
                 (krun.free_ctx)(ctx);
                 return Err("krun_add_vsock with TSI failed".to_string());
@@ -263,6 +275,30 @@ pub fn launch_agent_vm_dynamic(
             if (krun.set_port_map)(ctx, port_ptrs.as_ptr()) < 0 {
                 (krun.free_ctx)(ctx);
                 return Err("krun_set_port_map failed".to_string());
+            }
+
+            // Set egress policy if CIDRs are specified
+            if has_egress_policy {
+                let set_egress = krun.set_egress_policy.ok_or(
+                    "libkrun does not support egress policy (krun_set_egress_policy not found). \
+                     Update libkrun or remove --allow-ip flags."
+                        .to_string(),
+                )?;
+
+                let cidr_cstrings: Vec<CString> = config
+                    .resources
+                    .allow_cidrs
+                    .iter()
+                    .map(|c| CString::new(c.as_str()).expect("CIDR cannot contain null bytes"))
+                    .collect();
+                let mut cidr_ptrs: Vec<*const libc::c_char> =
+                    cidr_cstrings.iter().map(|s| s.as_ptr()).collect();
+                cidr_ptrs.push(std::ptr::null());
+
+                if (set_egress)(ctx, cidr_ptrs.as_ptr()) < 0 {
+                    (krun.free_ctx)(ctx);
+                    return Err("krun_set_egress_policy failed".to_string());
+                }
             }
         } else {
             // Control-only vsock, no network

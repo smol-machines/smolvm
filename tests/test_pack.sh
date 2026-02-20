@@ -512,6 +512,60 @@ run_test "runpack --force-extract" test_runpack_force_extract || true
 run_test "runpack cached fast" test_runpack_cached_fast || true
 
 echo ""
+echo "Running Egress Policy Tests (requires VM)..."
+echo ""
+
+test_runpack_egress_allow_ip_permitted() {
+    local output="$TEST_DIR/test-alpine"
+
+    if [[ ! -f "$output.smolmachine" ]]; then
+        $SMOLVM pack alpine:latest -o "$output" 2>&1
+    fi
+
+    # Allow Cloudflare DNS — lookup should succeed
+    local result
+    result=$(run_with_timeout 60 $SMOLVM runpack --sidecar "$output.smolmachine" --allow-ip 1.1.1.1/32 -- nslookup cloudflare.com 1.1.1.1 2>&1)
+    local exit_code=$?
+
+    [[ $exit_code -eq 124 ]] && { echo "TIMEOUT"; return 1; }
+    [[ $exit_code -eq 0 ]] && [[ "$result" == *"Address"* ]]
+}
+
+test_runpack_egress_allow_ip_blocked() {
+    local output="$TEST_DIR/test-alpine"
+
+    if [[ ! -f "$output.smolmachine" ]]; then
+        $SMOLVM pack alpine:latest -o "$output" 2>&1
+    fi
+
+    # Allow only private range — external connections should fail
+    local result exit_code=0
+    result=$(run_with_timeout 60 $SMOLVM runpack --sidecar "$output.smolmachine" --allow-ip 10.0.0.0/8 -- nslookup cloudflare.com 1.1.1.1 2>&1) || exit_code=$?
+
+    [[ $exit_code -eq 124 ]] && { echo "TIMEOUT"; return 1; }
+    [[ $exit_code -ne 0 ]]
+}
+
+test_runpack_egress_outbound_localhost_only() {
+    local output="$TEST_DIR/test-alpine"
+
+    if [[ ! -f "$output.smolmachine" ]]; then
+        $SMOLVM pack alpine:latest -o "$output" 2>&1
+    fi
+
+    # --outbound-localhost-only should block all external
+    local result exit_code=0
+    result=$(run_with_timeout 60 $SMOLVM runpack --sidecar "$output.smolmachine" --outbound-localhost-only -- nslookup cloudflare.com 1.1.1.1 2>&1) || exit_code=$?
+
+    [[ $exit_code -eq 124 ]] && { echo "TIMEOUT"; return 1; }
+    [[ $exit_code -ne 0 ]]
+}
+
+run_test "runpack egress: allow-ip permits matching" test_runpack_egress_allow_ip_permitted || true
+run_test "runpack egress: allow-ip blocks non-matching" test_runpack_egress_allow_ip_blocked || true
+run_test "runpack egress: --outbound-localhost-only blocks external" test_runpack_egress_outbound_localhost_only || true
+
+echo ""
 echo "Running Error Handling Tests..."
 echo ""
 

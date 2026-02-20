@@ -55,7 +55,7 @@ impl PortMapping {
 }
 
 /// VM configuration for the agent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmResources {
     /// Number of vCPUs.
     pub cpus: u8,
@@ -67,6 +67,8 @@ pub struct VmResources {
     pub storage_gb: Option<u64>,
     /// Overlay disk size in GiB (None = default 2 GiB).
     pub overlay_gb: Option<u64>,
+    /// Allowed egress CIDRs. Empty = no policy (allow all when network=true).
+    pub allow_cidrs: Vec<String>,
 }
 
 impl Default for VmResources {
@@ -77,6 +79,7 @@ impl Default for VmResources {
             network: false,
             storage_gb: None,
             overlay_gb: None,
+            allow_cidrs: Vec::new(),
         }
     }
 }

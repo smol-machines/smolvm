@@ -30,6 +30,47 @@ pub fn parse_port(s: &str) -> Result<PortMapping, String> {
     }
 }
 
+/// Parse and validate a CIDR specification (e.g., "10.0.0.0/8", "1.1.1.1").
+///
+/// Accepts `IP/prefix` or bare `IP` (auto-appends /32 for IPv4, /128 for IPv6).
+/// Returns the normalized CIDR string.
+pub fn parse_cidr(s: &str) -> Result<String, String> {
+    use std::net::IpAddr;
+
+    let (ip_str, prefix_len) = if let Some((ip_part, prefix_part)) = s.split_once('/') {
+        let prefix: u8 = prefix_part
+            .parse()
+            .map_err(|_| format!("invalid prefix length in '{}': expected a number", s))?;
+        (ip_part, prefix)
+    } else {
+        // Bare IP — detect v4 vs v6
+        let default_prefix = if s.contains(':') { 128u8 } else { 32u8 };
+        (s, default_prefix)
+    };
+
+    let ip: IpAddr = ip_str
+        .parse()
+        .map_err(|_| format!("invalid CIDR '{}': expected format like 10.0.0.0/8 or 1.1.1.1", s))?;
+
+    match ip {
+        IpAddr::V4(_) if prefix_len > 32 => {
+            return Err(format!(
+                "invalid CIDR '{}': IPv4 prefix must be 0-32",
+                s
+            ));
+        }
+        IpAddr::V6(_) if prefix_len > 128 => {
+            return Err(format!(
+                "invalid CIDR '{}': IPv6 prefix must be 0-128",
+                s
+            ));
+        }
+        _ => {}
+    }
+
+    Ok(format!("{}/{}", ip, prefix_len))
+}
+
 /// Parse an environment variable specification (KEY=VALUE).
 pub fn parse_env_spec(spec: &str) -> Option<(String, String)> {
     let (key, value) = spec.split_once('=')?;

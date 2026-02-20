@@ -21,7 +21,7 @@
 //! ]
 //! ```
 
-use crate::cli::parsers::parse_port;
+use crate::cli::parsers::{parse_cidr, parse_port};
 use crate::cli::vm_common::CreateVmParams;
 use serde::Deserialize;
 use smolvm::agent::PortMapping;
@@ -43,6 +43,8 @@ pub struct Smolfile {
     #[serde(default)]
     pub init: Vec<String>,
     pub workdir: Option<String>,
+    #[serde(default)]
+    pub allow_ip: Vec<String>,
 }
 
 /// Load and parse a Smolfile from the given path.
@@ -73,6 +75,7 @@ pub fn build_create_params(
     smolfile_path: Option<PathBuf>,
     cli_storage_gb: Option<u64>,
     cli_overlay_gb: Option<u64>,
+    cli_allow_cidrs: Vec<String>,
 ) -> smolvm::Result<CreateVmParams> {
     let sf = match smolfile_path {
         Some(path) => load(&path)?,
@@ -89,6 +92,7 @@ pub fn build_create_params(
                 workdir: cli_workdir,
                 storage_gb: cli_storage_gb,
                 overlay_gb: cli_overlay_gb,
+                allow_cidrs: cli_allow_cidrs,
             });
         }
     };
@@ -139,17 +143,27 @@ pub fn build_create_params(
 
     let workdir = cli_workdir.or(sf.workdir);
 
+    // Merge allow_ip: Smolfile first (validated), CLI extends (already validated by clap)
+    let mut allow_cidrs: Vec<String> = sf
+        .allow_ip
+        .iter()
+        .map(|s| parse_cidr(s))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| smolvm::Error::config("smolfile allow_ip", e))?;
+    allow_cidrs.extend(cli_allow_cidrs);
+
     Ok(CreateVmParams {
         name,
         cpus,
         mem,
         volume: volumes,
         port: ports,
-        net,
+        net: net || !allow_cidrs.is_empty(),
         init,
         env,
         workdir,
         storage_gb: cli_storage_gb,
         overlay_gb: cli_overlay_gb,
+        allow_cidrs,
     })
 }

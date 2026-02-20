@@ -489,9 +489,9 @@ impl AgentManager {
     }
 
     /// Check if the given resources match the currently running agent's resources.
-    pub fn resources_match(&self, resources: VmResources) -> bool {
+    pub fn resources_match(&self, resources: &VmResources) -> bool {
         let inner = self.inner.lock();
-        inner.resources == resources
+        inner.resources == *resources
     }
 
     /// Check if the given port mappings match the currently running agent's ports.
@@ -531,7 +531,7 @@ impl AgentManager {
         if self.try_connect_existing().is_some()
             && self.mounts_match(&mounts)
             && self.ports_match(&ports)
-            && self.resources_match(resources)
+            && self.resources_match(&resources)
         {
             return Ok(());
         }
@@ -618,7 +618,7 @@ impl AgentManager {
             inner.state = AgentState::Starting;
             inner.mounts = mounts.clone();
             inner.ports = ports.clone();
-            inner.resources = resources;
+            inner.resources = resources.clone();
         }
 
         tracing::info!(
