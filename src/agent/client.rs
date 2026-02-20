@@ -727,10 +727,10 @@ impl AgentClient {
     /// streaming stdout/stderr and forwarding stdin until `Exited`.
     fn interactive_session(&mut self, request: AgentRequest, tty: bool, op: &str) -> Result<i32> {
         use crate::agent::terminal::{
-            check_sigwinch, get_terminal_size, install_sigwinch_handler, poll_io, stdin_is_tty,
-            NonBlockingStdin, RawModeGuard,
+            check_sigwinch, flush_retry, get_terminal_size, install_sigwinch_handler, poll_io,
+            stdin_is_tty, write_all_retry, NonBlockingStdin, RawModeGuard,
         };
-        use std::io::{stderr, stdin, stdout, Read, Write};
+        use std::io::{stderr, stdin, stdout, Read};
         use std::os::unix::io::AsRawFd;
 
         // Disable socket read timeout for interactive sessions — the poll loop
@@ -799,12 +799,12 @@ impl AgentClient {
             if poll_result.socket_ready {
                 match self.receive() {
                     Ok(AgentResponse::Stdout { data }) => {
-                        stdout().write_all(&data)?;
-                        stdout().flush()?;
+                        write_all_retry(&mut stdout(), &data)?;
+                        flush_retry(&mut stdout())?;
                     }
                     Ok(AgentResponse::Stderr { data }) => {
-                        stderr().write_all(&data)?;
-                        stderr().flush()?;
+                        write_all_retry(&mut stderr(), &data)?;
+                        flush_retry(&mut stderr())?;
                     }
                     Ok(AgentResponse::Exited { exit_code }) => {
                         break exit_code;

@@ -160,6 +160,43 @@ pub fn stdin_is_tty() -> bool {
     unsafe { libc::isatty(io::stdin().as_raw_fd()) == 1 }
 }
 
+/// Write all bytes to a writer, retrying on WouldBlock.
+///
+/// When stdin is set to non-blocking via `O_NONBLOCK`, the flag propagates
+/// to stdout/stderr on terminals (they share the same kernel file description).
+/// This helper retries writes that fail with WouldBlock.
+pub fn write_all_retry(writer: &mut impl io::Write, data: &[u8]) -> io::Result<()> {
+    let mut pos = 0;
+    while pos < data.len() {
+        match writer.write(&data[pos..]) {
+            Ok(0) => {
+                return Err(io::Error::new(io::ErrorKind::WriteZero, "failed to write"));
+            }
+            Ok(n) => pos += n,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Flush a writer, retrying on WouldBlock.
+pub fn flush_retry(writer: &mut impl io::Write) -> io::Result<()> {
+    loop {
+        match writer.flush() {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// RAII guard for non-blocking stdin mode.
 ///
 /// Sets stdin to non-blocking on creation, restores on drop.
