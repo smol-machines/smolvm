@@ -162,61 +162,75 @@ fn cstr(s: &str) -> std::ffi::CString {
     std::ffi::CString::new(s).expect("static string without null bytes")
 }
 
+/// A single mount entry for `mount_essential_filesystems`.
+#[cfg(target_os = "linux")]
+struct MountEntry {
+    source: &'static str,
+    target: &'static str,
+    fstype: &'static str,
+    flags: libc::c_ulong,
+    data: Option<&'static str>,
+}
+
+#[cfg(target_os = "linux")]
+impl MountEntry {
+    fn mount(&self) -> Result<(), String> {
+        if let Err(e) = std::fs::create_dir_all(self.target) {
+            // Clean up any partial directories left by create_dir_all
+            let _ = std::fs::remove_dir(self.target);
+            return Err(format!("failed to create {}: {}", self.target, e));
+        }
+
+        // Bind the optional data CString so it lives through the libc::mount call.
+        let data_cstr = self.data.map(cstr);
+        let data_ptr = match &data_cstr {
+            Some(d) => d.as_ptr() as *const libc::c_void,
+            None => std::ptr::null(),
+        };
+
+        // SAFETY: libc::mount with valid CString pointers for filesystem mounting.
+        // All CString values (from cstr() calls and data_cstr) are alive for the
+        // duration of this call.
+        let ret = unsafe {
+            libc::mount(
+                cstr(self.source).as_ptr(),
+                cstr(self.target).as_ptr(),
+                cstr(self.fstype).as_ptr(),
+                self.flags,
+                data_ptr,
+            )
+        };
+
+        if ret != 0 {
+            return Err(format!(
+                "failed to mount {} at {}: {}",
+                self.fstype,
+                self.target,
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        Ok(())
+    }
+}
+
 /// Mount essential filesystems (proc, sysfs, devtmpfs, devpts).
 /// This must be done first when running as init (PID 1).
 /// Uses direct syscalls to avoid any overhead.
 #[cfg(target_os = "linux")]
 fn mount_essential_filesystems() {
-    // Mount proc
-    let _ = std::fs::create_dir_all("/proc");
-    // SAFETY: libc::mount with valid CString pointers for proc filesystem
-    unsafe {
-        libc::mount(
-            cstr("proc").as_ptr(),
-            cstr("/proc").as_ptr(),
-            cstr("proc").as_ptr(),
-            0,
-            std::ptr::null(),
-        );
-    }
+    let mounts = [
+        MountEntry { source: "proc",     target: "/proc",    fstype: "proc",     flags: 0, data: None },
+        MountEntry { source: "sysfs",    target: "/sys",     fstype: "sysfs",    flags: 0, data: None },
+        MountEntry { source: "devtmpfs", target: "/dev",     fstype: "devtmpfs", flags: 0, data: None },
+        MountEntry { source: "devpts",   target: "/dev/pts", fstype: "devpts",   flags: 0, data: Some("mode=0620,ptmxmode=0666") },
+    ];
 
-    // Mount sysfs
-    let _ = std::fs::create_dir_all("/sys");
-    // SAFETY: libc::mount with valid CString pointers for sysfs
-    unsafe {
-        libc::mount(
-            cstr("sysfs").as_ptr(),
-            cstr("/sys").as_ptr(),
-            cstr("sysfs").as_ptr(),
-            0,
-            std::ptr::null(),
-        );
-    }
-
-    // Mount devtmpfs
-    let _ = std::fs::create_dir_all("/dev");
-    // SAFETY: libc::mount with valid CString pointers for devtmpfs
-    unsafe {
-        libc::mount(
-            cstr("devtmpfs").as_ptr(),
-            cstr("/dev").as_ptr(),
-            cstr("devtmpfs").as_ptr(),
-            0,
-            std::ptr::null(),
-        );
-    }
-
-    // Mount devpts for PTY support (needed by openpty() for interactive exec)
-    let _ = std::fs::create_dir_all("/dev/pts");
-    // SAFETY: libc::mount with valid CString pointers for devpts filesystem
-    unsafe {
-        libc::mount(
-            cstr("devpts").as_ptr(),
-            cstr("/dev/pts").as_ptr(),
-            cstr("devpts").as_ptr(),
-            0,
-            cstr("mode=0620,ptmxmode=0666").as_ptr() as *const _,
-        );
+    for entry in &mounts {
+        if let Err(e) = entry.mount() {
+            error!("smolvm-agent: {}", e);
+            return;
+        }
     }
 
     // Create /dev/ptmx symlink pointing to pts/ptmx
