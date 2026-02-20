@@ -11,7 +11,8 @@
 //! `sandbox create`, managed with `sandbox start/stop/ls/delete`.
 
 use crate::cli::parsers::{
-    mounts_to_virtiofs_bindings, parse_duration, parse_env_list, parse_mounts, parse_port,
+    mounts_to_virtiofs_bindings, parse_cidr, parse_duration, parse_env_list, parse_mounts,
+    parse_port,
 };
 use crate::cli::vm_common::{self, DeleteVmOptions, VmKind};
 use crate::cli::{flush_output, format_bytes, truncate_id};
@@ -323,6 +324,14 @@ pub struct RunCmd {
     #[arg(long, help_heading = "Network")]
     pub net: bool,
 
+    /// Restrict outbound to specific IPs/CIDRs (implies --net, can be repeated)
+    #[arg(long = "allow-ip", value_parser = parse_cidr, value_name = "CIDR", help_heading = "Network")]
+    pub allow_ip: Vec<String>,
+
+    /// Restrict outbound to localhost only (implies --net)
+    #[arg(long, help_heading = "Network")]
+    pub outbound_localhost_only: bool,
+
     /// Number of virtual CPUs
     #[arg(
         long,
@@ -377,12 +386,21 @@ impl RunCmd {
             }
         }
 
+        // Build allow_cidrs from --allow-ip and --outbound-localhost-only
+        let mut allow_cidrs = self.allow_ip.clone();
+        if self.outbound_localhost_only {
+            allow_cidrs.push("127.0.0.0/8".to_string());
+            allow_cidrs.push("::1/128".to_string());
+        }
+        let has_egress_policy = !allow_cidrs.is_empty();
+
         let resources = VmResources {
             cpus: self.cpus,
             mem: self.mem,
-            network: self.net,
+            network: self.net || has_egress_policy,
             storage_gb: self.storage,
             overlay_gb: self.overlay,
+            allow_cidrs,
         };
 
         // Start agent VM
@@ -547,6 +565,14 @@ pub struct CreateCmd {
     #[arg(long)]
     pub net: bool,
 
+    /// Restrict outbound to specific IPs/CIDRs (implies --net, can be repeated)
+    #[arg(long = "allow-ip", value_parser = parse_cidr, value_name = "CIDR")]
+    pub allow_ip: Vec<String>,
+
+    /// Restrict outbound to localhost only (implies --net)
+    #[arg(long)]
+    pub outbound_localhost_only: bool,
+
     /// Run command on every VM start (can be used multiple times)
     #[arg(long = "init", value_name = "COMMAND")]
     pub init: Vec<String>,
@@ -566,19 +592,26 @@ pub struct CreateCmd {
 
 impl CreateCmd {
     pub fn run(self) -> smolvm::Result<()> {
+        let mut allow_cidrs = self.allow_ip.clone();
+        if self.outbound_localhost_only {
+            allow_cidrs.push("127.0.0.0/8".to_string());
+            allow_cidrs.push("::1/128".to_string());
+        }
+
         let params = crate::cli::smolfile::build_create_params(
             self.name,
             self.cpus,
             self.mem,
             self.volume,
             self.port,
-            self.net,
+            self.net || !allow_cidrs.is_empty(),
             self.init,
             self.env,
             self.workdir,
             self.smolfile,
             self.storage,
             self.overlay,
+            allow_cidrs,
         )?;
         vm_common::create_vm(KIND, params)
     }

@@ -110,6 +110,7 @@ impl PackCmd {
                 network: true,
                 storage_gb: None,
                 overlay_gb: None,
+                allow_cidrs: Vec::new(),
             },
         )?;
         let mut client = manager.connect()?;

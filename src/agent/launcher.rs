@@ -50,6 +50,7 @@ extern "C" {
     ) -> i32;
     fn krun_set_console_output(ctx: u32, filepath: *const libc::c_char) -> i32;
     fn krun_set_port_map(ctx: u32, port_map: *const *const libc::c_char) -> i32;
+    fn krun_set_egress_policy(ctx: u32, cidrs: *const *const libc::c_char) -> i32;
     fn krun_add_virtiofs(ctx: u32, tag: *const libc::c_char, path: *const libc::c_char) -> i32;
     fn krun_start_enter(ctx: u32) -> i32;
     fn krun_disable_implicit_vsock(ctx: u32) -> i32;
@@ -127,7 +128,8 @@ pub fn launch_agent_vm(
             ));
         }
 
-        if resources.network || !port_mappings.is_empty() {
+        let has_egress_policy = !resources.allow_cidrs.is_empty();
+        if resources.network || !port_mappings.is_empty() || has_egress_policy {
             // Add vsock with TSI HIJACK_INET flag to enable network access
             if krun_add_vsock(ctx, KRUN_TSI_HIJACK_INET) < 0 {
                 krun_free_ctx(ctx);
@@ -152,6 +154,31 @@ pub fn launch_agent_vm(
             if krun_set_port_map(ctx, port_ptrs.as_ptr()) < 0 {
                 krun_free_ctx(ctx);
                 return Err(Error::agent("set port mapping", "krun_set_port_map failed"));
+            }
+
+            // Set egress policy if CIDRs are specified
+            if has_egress_policy {
+                let cidr_cstrings: Vec<CString> = resources
+                    .allow_cidrs
+                    .iter()
+                    .map(|c| CString::new(c.as_str()).expect("CIDR cannot contain null bytes"))
+                    .collect();
+                let mut cidr_ptrs: Vec<*const libc::c_char> =
+                    cidr_cstrings.iter().map(|s| s.as_ptr()).collect();
+                cidr_ptrs.push(std::ptr::null());
+
+                if krun_set_egress_policy(ctx, cidr_ptrs.as_ptr()) < 0 {
+                    krun_free_ctx(ctx);
+                    return Err(Error::agent(
+                        "set egress policy",
+                        "krun_set_egress_policy failed",
+                    ));
+                }
+
+                tracing::debug!(
+                    cidr_count = resources.allow_cidrs.len(),
+                    "configured egress policy"
+                );
             }
 
             tracing::debug!(

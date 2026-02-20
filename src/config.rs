@@ -340,6 +340,10 @@ pub struct VmRecord {
     /// Overlay disk size in GiB (None = default 2 GiB).
     #[serde(default)]
     pub overlay_gb: Option<u64>,
+
+    /// Allowed egress CIDRs for network policy.
+    #[serde(default)]
+    pub allow_cidrs: Vec<String>,
 }
 
 fn default_cpus() -> u8 {
@@ -378,6 +382,7 @@ impl VmRecord {
             workdir: None,
             storage_gb: None,
             overlay_gb: None,
+            allow_cidrs: Vec::new(),
         }
     }
 
@@ -409,6 +414,7 @@ impl VmRecord {
             workdir: None,
             storage_gb: None,
             overlay_gb: None,
+            allow_cidrs: Vec::new(),
         }
     }
 
@@ -465,6 +471,7 @@ impl VmRecord {
             network: self.network,
             storage_gb: self.storage_gb,
             overlay_gb: self.overlay_gb,
+            allow_cidrs: self.allow_cidrs.clone(),
         }
     }
 }

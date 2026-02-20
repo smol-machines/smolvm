@@ -333,6 +333,84 @@ test_network_multiple_dns_lookups() {
 }
 
 # =============================================================================
+# Egress Policy (--allow-ip / --outbound-localhost-only)
+# Tests verify IP/CIDR-based egress restrictions enforced at the TSI layer.
+# =============================================================================
+
+test_egress_allow_ip_permitted() {
+    # Allow access to Cloudflare DNS (1.1.1.1) - DNS lookup should succeed
+    local output exit_code=0
+    output=$($SMOLVM sandbox run --allow-ip 1.1.1.1/32 alpine:latest -- nslookup cloudflare.com 1.1.1.1 2>&1) || exit_code=$?
+
+    # Should succeed: 1.1.1.1 is in the allowlist
+    [[ $exit_code -eq 0 ]] && [[ "$output" == *"Address"* ]]
+}
+
+test_egress_allow_ip_blocked() {
+    # Allow only 10.0.0.0/8 (private range) - external connections should fail
+    # Use nslookup with explicit server to test TCP/UDP to an external IP
+    local exit_code=0
+    $SMOLVM sandbox run --allow-ip 10.0.0.0/8 alpine:latest -- nslookup cloudflare.com 1.1.1.1 2>&1 || exit_code=$?
+
+    # Should fail: 1.1.1.1 is NOT in the allowlist (only 10.0.0.0/8 is)
+    [[ $exit_code -ne 0 ]]
+}
+
+test_egress_dns_blocked_no_resolver() {
+    # Allow an external IP range but NOT the DNS resolver
+    # DNS resolution should fail because resolver traffic is blocked
+    local exit_code=0
+    $SMOLVM sandbox run --allow-ip 93.184.216.0/24 alpine:latest -- nslookup example.com 2>&1 || exit_code=$?
+
+    # Should fail: default DNS resolver (1.1.1.1 or similar) is not in allowlist
+    [[ $exit_code -ne 0 ]]
+}
+
+test_egress_outbound_localhost_only() {
+    # --outbound-localhost-only should block all external connections
+    local exit_code=0
+    $SMOLVM sandbox run --outbound-localhost-only alpine:latest -- nslookup cloudflare.com 1.1.1.1 2>&1 || exit_code=$?
+
+    # Should fail: only localhost CIDRs (127.0.0.0/8, ::1/128) are allowed
+    [[ $exit_code -ne 0 ]]
+}
+
+test_egress_invalid_cidr_rejected() {
+    # Invalid CIDR should be rejected at CLI parse time (not at VM launch)
+    local output exit_code=0
+    output=$($SMOLVM sandbox run --allow-ip "not-a-cidr" alpine:latest -- echo hi 2>&1) || exit_code=$?
+
+    # Should fail with a parse error before VM even starts
+    [[ $exit_code -ne 0 ]] && [[ "$output" == *"invalid"* ]]
+}
+
+test_egress_invalid_prefix_rejected() {
+    # IPv4 with prefix > 32 should be rejected
+    local output exit_code=0
+    output=$($SMOLVM sandbox run --allow-ip "10.0.0.0/33" alpine:latest -- echo hi 2>&1) || exit_code=$?
+
+    [[ $exit_code -ne 0 ]] && [[ "$output" == *"invalid"* ]]
+}
+
+test_egress_allow_all_cidr_zero() {
+    # 0.0.0.0/0 should match all IPv4 addresses (allow-all for that family)
+    local output exit_code=0
+    output=$($SMOLVM sandbox run --allow-ip 0.0.0.0/0 alpine:latest -- nslookup cloudflare.com 1.1.1.1 2>&1) || exit_code=$?
+
+    # Should succeed: /0 matches everything
+    [[ $exit_code -eq 0 ]] && [[ "$output" == *"Address"* ]]
+}
+
+test_egress_net_unrestricted_regression() {
+    # --net without --allow-ip should allow unrestricted access (regression test)
+    local output exit_code=0
+    output=$($SMOLVM sandbox run --net alpine:latest -- nslookup cloudflare.com 2>&1) || exit_code=$?
+
+    # Should succeed: no egress policy = allow all
+    [[ $exit_code -eq 0 ]] && [[ "$output" == *"Address"* ]]
+}
+
+# =============================================================================
 # Run Tests
 # =============================================================================
 
@@ -357,5 +435,13 @@ run_test "TSI: coding agent workflow" test_tsi_coding_agent_workflow || true
 run_test "Network: disabled by default" test_network_disabled_by_default || true
 run_test "Network: DNS resolution" test_network_dns_resolution || true
 run_test "Network: multiple DNS lookups" test_network_multiple_dns_lookups || true
+run_test "Egress: allow-ip permits matching traffic" test_egress_allow_ip_permitted || true
+run_test "Egress: allow-ip blocks non-matching traffic" test_egress_allow_ip_blocked || true
+run_test "Egress: DNS blocked when resolver not in allowlist" test_egress_dns_blocked_no_resolver || true
+run_test "Egress: --outbound-localhost-only blocks external" test_egress_outbound_localhost_only || true
+run_test "Egress: invalid CIDR rejected at CLI" test_egress_invalid_cidr_rejected || true
+run_test "Egress: invalid prefix length rejected" test_egress_invalid_prefix_rejected || true
+run_test "Egress: 0.0.0.0/0 allows all traffic" test_egress_allow_all_cidr_zero || true
+run_test "Egress: --net unrestricted (regression)" test_egress_net_unrestricted_regression || true
 
 print_summary "Sandbox Tests"

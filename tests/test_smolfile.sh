@@ -360,6 +360,42 @@ test_ls_verbose_shows_init() {
 }
 
 # =============================================================================
+# Smolfile allow_ip validation
+# =============================================================================
+
+test_smolfile_allow_ip_invalid_rejected() {
+    local vm_name="smolfile-badip-$$"
+    cleanup_vm "$vm_name"
+
+    cat > "$SMOLFILE_TMPDIR/Smolfile.badip" <<'EOF'
+net = true
+allow_ip = ["not-a-cidr"]
+EOF
+
+    local output exit_code=0
+    output=$($SMOLVM microvm create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.badip" 2>&1) || exit_code=$?
+
+    cleanup_vm "$vm_name"
+    [[ $exit_code -ne 0 ]] && [[ "$output" == *"invalid"* ]]
+}
+
+test_smolfile_allow_ip_valid_accepted() {
+    local vm_name="smolfile-goodip-$$"
+    cleanup_vm "$vm_name"
+
+    cat > "$SMOLFILE_TMPDIR/Smolfile.goodip" <<'EOF'
+allow_ip = ["10.0.0.0/8", "1.1.1.1"]
+EOF
+
+    $SMOLVM microvm create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.goodip" 2>&1 || {
+        cleanup_vm "$vm_name"
+        return 1
+    }
+
+    cleanup_vm "$vm_name"
+}
+
+# =============================================================================
 # Run Tests
 # =============================================================================
 
@@ -377,5 +413,7 @@ run_test "Smolfile invalid TOML errors" test_smolfile_invalid_toml_errors || tru
 run_test "Smolfile unknown field errors" test_smolfile_unknown_field_errors || true
 run_test "No auto-detection of Smolfile" test_no_auto_detection || true
 run_test "ls --verbose shows init/env/workdir" test_ls_verbose_shows_init || true
+run_test "Smolfile invalid allow_ip rejected" test_smolfile_allow_ip_invalid_rejected || true
+run_test "Smolfile valid allow_ip accepted" test_smolfile_allow_ip_valid_accepted || true
 
 print_summary "Smolfile Tests"

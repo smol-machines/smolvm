@@ -88,6 +88,7 @@ pub struct CreateVmParams {
     pub workdir: Option<String>,
     pub storage_gb: Option<u64>,
     pub overlay_gb: Option<u64>,
+    pub allow_cidrs: Vec<String>,
 }
 
 /// Create a named VM/sandbox configuration (does not start it).
@@ -136,6 +137,7 @@ pub fn create_vm(kind: VmKind, params: CreateVmParams) -> smolvm::Result<()> {
     record.workdir = params.workdir.clone();
     record.storage_gb = params.storage_gb;
     record.overlay_gb = params.overlay_gb;
+    record.allow_cidrs = params.allow_cidrs.clone();
 
     // Store in config (persisted immediately to database)
     config.insert_vm(params.name.clone(), record)?;

@@ -674,6 +674,7 @@ pub fn resource_spec_to_vm_resources(spec: &ResourceSpec, network: bool) -> VmRe
         network,
         storage_gb: spec.storage_gb,
         overlay_gb: spec.overlay_gb,
+        allow_cidrs: Vec::new(),
     }
 }
 
