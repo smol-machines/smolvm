@@ -30,7 +30,14 @@ find_smolvm() {
         return
     fi
 
-    # Try to find in dist directory
+    # Prefer cargo build output (latest build) over dist
+    local target_release="$PROJECT_ROOT/target/release/smolvm"
+    if [[ -x "$target_release" ]]; then
+        echo "$target_release"
+        return
+    fi
+
+    # Fall back to dist directory
     local dist_dir="$PROJECT_ROOT/dist"
     if [[ -d "$dist_dir" ]]; then
         # Find the extracted distribution directory
@@ -39,13 +46,6 @@ find_smolvm() {
             echo "$smolvm_dir/smolvm"
             return
         fi
-    fi
-
-    # Try cargo build output
-    local target_release="$PROJECT_ROOT/target/release/smolvm"
-    if [[ -x "$target_release" ]]; then
-        echo "$target_release"
-        return
     fi
 
     echo ""
@@ -68,10 +68,15 @@ init_smolvm() {
         exit 1
     fi
 
-    # Set library path for Linux to ensure we use bundled libkrun/libkrunfw
-    # This is needed when running from target/release since the system may have
-    # an older libkrunfw installed that doesn't have all required kernel features
-    if [[ "$(uname -s)" == "Linux" ]]; then
+    # Set library path to ensure we use bundled libkrun/libkrunfw.
+    # This is needed when running from target/release since the system
+    # may not have libkrun on its default library search path.
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        local lib_dir="$PROJECT_ROOT/lib"
+        if [[ -d "$lib_dir" ]]; then
+            export DYLD_LIBRARY_PATH="${lib_dir}${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+        fi
+    else
         local lib_dir="$PROJECT_ROOT/lib/linux-$(uname -m)"
         if [[ -d "$lib_dir" ]]; then
             export LD_LIBRARY_PATH="${lib_dir}:${LD_LIBRARY_PATH:-}"

@@ -18,6 +18,7 @@ smolvm sandbox run --net python:3.12-alpine -- python -V
 
 # microvm - persistent linux VMs
 smolvm microvm start
+smolvm microvm exec -- apk add git  # changes persist across reboots
 smolvm microvm exec -- echo "hello"
 smolvm microvm stop
 
@@ -65,10 +66,10 @@ smolVM makes microVMs easy: <250ms boot, works on macOS and Linux, single binary
 <summary>References</summary>
 
 1. [Container isolation](https://www.docker.com/blog/understanding-docker-container-escapes/)
-2. [containerd benchmark](https://github.com/containerd/containerd/issues/4482)
-3. [QEMU boot time](https://wiki.qemu.org/Features/TCG)
+2. [containerd benchmark](https://medium.com/norma-dev/benchmarking-containerd-vs-dockerd-performance-efficiency-and-scalability-64c9043924b1)
+3. [QEMU boot time](github.com/stefano-garzarella/qemu-boot-time)
 4. [Firecracker website](https://firecracker-microvm.github.io/)
-5. [Kata boot time](https://github.com/kata-containers/kata-containers/issues/4292)
+5. [Kata boot time](https://dev.to/rimelek/comparing-3-docker-container-runtimes-runc-gvisor-and-kata-containers-16j)
 6. [Firecracker requires KVM](https://github.com/firecracker-microvm/firecracker/blob/main/docs/getting-started.md)
 7. [Kata macOS support](https://github.com/kata-containers/kata-containers/issues/243)
 8. [Firecracker rootfs setup](https://github.com/firecracker-microvm/firecracker/blob/main/docs/rootfs-and-kernel-setup.md)
@@ -92,19 +93,10 @@ smolVM makes microVMs easy: <250ms boot, works on macOS and Linux, single binary
 
 ## known limitations
 
-- **Container rootfs writes**: Writes to container filesystem (`/tmp`, `/home`, etc.) fail due to a libkrun TSI bug with overlayfs. **Writes to mounted volumes work**.
+- **Sandbox rootfs writes**: Writes to the sandbox container filesystem (`/tmp`, `/home`, etc.) fail due to a libkrun TSI bug with overlayfs. **Writes to mounted volumes work**. MicroVM rootfs writes work and persist across reboots.
 - **Network is opt-in**: Use `--net` to enable outbound network access (required for image pulls from registries). TCP/UDP only — ICMP (`ping`) and raw sockets do not work.
 - **Volume mounts**: Directories only (no single files)
 - **macOS**: Binary must be signed with Hypervisor.framework entitlements
-
-**File writes for coding agents:**
-```bash
-# Works: top-level mount path
-smolvm sandbox run --net -v /tmp:/workspace alpine:latest -- sh -c "echo 'hello' > /workspace/out.txt"
-
-# Fails: nested mount path or container rootfs
-smolvm sandbox run --net -v /tmp:/mnt/data alpine:latest -- sh -c "echo 'hello' > /mnt/data/out.txt"
-```
 
 ## development
 

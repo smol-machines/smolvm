@@ -105,5 +105,5 @@ The `common.sh` file provides shared test utilities:
 | MicroVM | 13 |
 | Container | 10 |
 | API | 13 |
-| Pack | 16 |
-| **Total** | **82** |
+| Pack | 25 |
+| **Total** | **91** |
