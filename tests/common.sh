@@ -162,9 +162,12 @@ print_summary() {
     fi
 }
 
-# Cleanup helper - stop microvm
+# Cleanup helper - stop microvm and remove named "default" from DB
+# so tests start from a clean slate (no leftover DB records from
+# manual testing or previous test runs).
 cleanup_microvm() {
     $SMOLVM microvm stop 2>/dev/null || true
+    $SMOLVM microvm delete default -f 2>/dev/null || true
 }
 
 # Ensure microvm is running

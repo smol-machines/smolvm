@@ -57,12 +57,39 @@ impl VmKind {
 // Shared helpers
 // ============================================================================
 
+/// Resolve an optional VM name: if no name is given and a VM named "default"
+/// exists in the config database, return `Some("default")` so callers route
+/// through the named-VM code path (which loads config, init commands, network
+/// settings, etc.).  Otherwise returns the input unchanged.
+pub fn resolve_vm_name(name: Option<String>) -> smolvm::Result<Option<String>> {
+    if name.is_some() {
+        return Ok(name);
+    }
+    let config = SmolvmConfig::load()?;
+    if config.get_vm("default").is_some() {
+        Ok(Some("default".to_string()))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Get the agent manager for an optional name (default if `None`).
+///
+/// When no name is given but a named VM "default" exists in the config
+/// database, uses the named path so socket/PID locations are consistent
+/// with `start_vm_named`.
 pub fn get_vm_manager(name: &Option<String>) -> smolvm::Result<AgentManager> {
     if let Some(name) = name {
         AgentManager::for_vm(name)
     } else {
-        AgentManager::new_default()
+        // Check if a named "default" VM exists in config — if so, use its
+        // named paths so exec/status find the same socket that start created.
+        let config = SmolvmConfig::load()?;
+        if config.get_vm("default").is_some() {
+            AgentManager::for_vm("default")
+        } else {
+            AgentManager::new_default()
+        }
     }
 }
 
