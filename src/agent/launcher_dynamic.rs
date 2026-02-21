@@ -210,160 +210,212 @@ pub fn launch_agent_vm_dynamic(
         unsafe { std::env::set_var("LD_LIBRARY_PATH", lib_path.as_ref()) };
     }
 
-    unsafe {
-        // Set log level
-        let log_level = if config.debug { 3 } else { 0 };
-        (krun.set_log_level)(log_level);
+    // SAFETY: Each FFI call below is individually wrapped in unsafe.
+    // All CString/pointer construction is safe Rust outside the unsafe blocks.
 
-        // Create VM context
-        let ctx = (krun.create_ctx)();
-        if ctx < 0 {
-            return Err("krun_create_ctx failed".to_string());
-        }
-        let ctx = ctx as u32;
+    // Set log level
+    let log_level = if config.debug { 3 } else { 0 };
+    // SAFETY: set_log_level is a valid function pointer loaded from libkrun
+    unsafe { (krun.set_log_level)(log_level) };
 
-        // Set VM config
-        if (krun.set_vm_config)(ctx, config.resources.cpus, config.resources.mem) < 0 {
-            (krun.free_ctx)(ctx);
-            return Err("krun_set_vm_config failed".to_string());
-        }
-
-        // Set root filesystem
-        let root = path_to_cstring(config.rootfs_path)?;
-        if (krun.set_root)(ctx, root.as_ptr()) < 0 {
-            (krun.free_ctx)(ctx);
-            return Err("krun_set_root failed".to_string());
-        }
-
-        // Configure TSI networking
-        if (krun.disable_implicit_vsock)(ctx) < 0 {
-            (krun.free_ctx)(ctx);
-            return Err("krun_disable_implicit_vsock failed".to_string());
-        }
-
-        if config.resources.network || !config.port_mappings.is_empty() {
-            if (krun.add_vsock)(ctx, KRUN_TSI_HIJACK_INET) < 0 {
-                (krun.free_ctx)(ctx);
-                return Err("krun_add_vsock with TSI failed".to_string());
-            }
-
-            // Set port mappings
-            let port_cstrings: Vec<CString> = config
-                .port_mappings
-                .iter()
-                .map(|(host, guest)| {
-                    CString::new(format!("{}:{}", host, guest))
-                        .expect("port mapping cannot contain null bytes")
-                })
-                .collect();
-            let mut port_ptrs: Vec<*const libc::c_char> =
-                port_cstrings.iter().map(|s| s.as_ptr()).collect();
-            port_ptrs.push(std::ptr::null());
-
-            if (krun.set_port_map)(ctx, port_ptrs.as_ptr()) < 0 {
-                (krun.free_ctx)(ctx);
-                return Err("krun_set_port_map failed".to_string());
-            }
-        } else {
-            // Control-only vsock, no network
-            if (krun.add_vsock)(ctx, 0) < 0 {
-                (krun.free_ctx)(ctx);
-                return Err("krun_add_vsock failed".to_string());
-            }
-        }
-
-        // Add storage disk
-        let block_id = CString::new("storage").expect("static string");
-        let disk_path = path_to_cstring(config.storage_path)?;
-        if (krun.add_disk2)(ctx, block_id.as_ptr(), disk_path.as_ptr(), 0, false) < 0 {
-            (krun.free_ctx)(ctx);
-            return Err("krun_add_disk2 failed".to_string());
-        }
-
-        // Add vsock port for control channel
-        let socket_path = path_to_cstring(config.vsock_socket)?;
-        if (krun.add_vsock_port2)(ctx, ports::AGENT_CONTROL, socket_path.as_ptr(), true) < 0 {
-            (krun.free_ctx)(ctx);
-            return Err("krun_add_vsock_port2 failed".to_string());
-        }
-
-        // Set working directory
-        let workdir = CString::new("/").expect("static string");
-        (krun.set_workdir)(ctx, workdir.as_ptr());
-
-        // Build environment
-        let mut env_strings = vec![
-            CString::new("HOME=/root").expect("static string"),
-            CString::new("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
-                .expect("static string"),
-            CString::new("TERM=xterm-256color").expect("static string"),
-        ];
-
-        // Tell agent about packed layers mount
-        if config.layers_dir.exists() {
-            if let Ok(cstr) = CString::new("SMOLVM_PACKED_LAYERS=smolvm_layers:/packed_layers") {
-                env_strings.push(cstr);
-            }
-        }
-
-        // Pass mount info to the agent via environment
-        for (i, mount) in config.mounts.iter().enumerate() {
-            let ro_flag = if mount.read_only { "ro" } else { "rw" };
-            let env_val = format!(
-                "SMOLVM_MOUNT_{}={}:{}:{}",
-                i, mount.tag, mount.guest_path, ro_flag
-            );
-            if let Ok(cstr) = CString::new(env_val) {
-                env_strings.push(cstr);
-            }
-        }
-
-        if !config.mounts.is_empty() {
-            if let Ok(cstr) = CString::new(format!("SMOLVM_MOUNT_COUNT={}", config.mounts.len())) {
-                env_strings.push(cstr);
-            }
-        }
-
-        let mut envp: Vec<*const libc::c_char> = env_strings.iter().map(|s| s.as_ptr()).collect();
-        envp.push(std::ptr::null());
-
-        // Set exec command (MUST be before add_virtiofs)
-        let exec_path = CString::new("/sbin/init").expect("static string");
-        let argv_strings = [CString::new("/sbin/init").expect("static string")];
-        let mut argv: Vec<*const libc::c_char> = argv_strings.iter().map(|s| s.as_ptr()).collect();
-        argv.push(std::ptr::null());
-
-        if (krun.set_exec)(ctx, exec_path.as_ptr(), argv.as_ptr(), envp.as_ptr()) < 0 {
-            (krun.free_ctx)(ctx);
-            return Err("krun_set_exec failed".to_string());
-        }
-
-        // Add virtiofs mount for packed layers (AFTER set_exec)
-        if config.layers_dir.exists() {
-            let layers_tag = CString::new("smolvm_layers").expect("static string");
-            let layers_path = path_to_cstring(config.layers_dir)?;
-            if (krun.add_virtiofs)(ctx, layers_tag.as_ptr(), layers_path.as_ptr()) < 0
-                && config.debug
-            {
-                eprintln!("debug: failed to add layers virtiofs mount");
-            }
-        }
-
-        // Add user-specified virtiofs mounts
-        for mount in config.mounts.iter() {
-            let tag = CString::new(mount.tag.as_str()).map_err(|_| "invalid mount tag")?;
-            let host_path =
-                CString::new(mount.host_path.as_str()).map_err(|_| "invalid mount path")?;
-
-            if (krun.add_virtiofs)(ctx, tag.as_ptr(), host_path.as_ptr()) < 0 && config.debug {
-                eprintln!("debug: failed to add virtiofs mount for tag {}", mount.tag);
-            }
-        }
-
-        // Start VM (never returns on success)
-        let ret = (krun.start_enter)(ctx);
-        Err(format!("krun_start_enter returned: {}", ret))
+    // Create VM context
+    // SAFETY: create_ctx is a valid function pointer loaded from libkrun
+    let ctx = unsafe { (krun.create_ctx)() };
+    if ctx < 0 {
+        return Err("krun_create_ctx failed".to_string());
     }
+    let ctx = ctx as u32;
+
+    // Helper: clean up context on error (string message)
+    macro_rules! free_ctx_on_err {
+        ($msg:expr) => {{
+            // SAFETY: ctx is a valid context from krun_create_ctx
+            unsafe { (krun.free_ctx)(ctx) };
+            return Err($msg.to_string());
+        }};
+    }
+
+    // Helper: evaluate a fallible expression, freeing ctx if it fails.
+    // Replaces bare `?` which would leak the libkrun context.
+    macro_rules! try_or_free_ctx {
+        ($expr:expr, $msg:expr) => {
+            match $expr {
+                Ok(val) => val,
+                Err(_) => free_ctx_on_err!($msg),
+            }
+        };
+    }
+
+    // Set VM config
+    // SAFETY: ctx is valid, cpus and mem are primitive values
+    if unsafe { (krun.set_vm_config)(ctx, config.resources.cpus, config.resources.mem) } < 0 {
+        free_ctx_on_err!("krun_set_vm_config failed");
+    }
+
+    // Set root filesystem
+    let root = try_or_free_ctx!(
+        path_to_cstring(config.rootfs_path),
+        "rootfs path contains null byte"
+    );
+    // SAFETY: ctx is valid, root.as_ptr() is a valid null-terminated C string
+    if unsafe { (krun.set_root)(ctx, root.as_ptr()) } < 0 {
+        free_ctx_on_err!("krun_set_root failed");
+    }
+
+    // Configure TSI networking
+    // SAFETY: ctx is valid
+    if unsafe { (krun.disable_implicit_vsock)(ctx) } < 0 {
+        free_ctx_on_err!("krun_disable_implicit_vsock failed");
+    }
+
+    if config.resources.network || !config.port_mappings.is_empty() {
+        // SAFETY: ctx is valid, KRUN_TSI_HIJACK_INET is a valid flag
+        if unsafe { (krun.add_vsock)(ctx, KRUN_TSI_HIJACK_INET) } < 0 {
+            free_ctx_on_err!("krun_add_vsock with TSI failed");
+        }
+
+        // Set port mappings
+        let port_cstrings: Vec<CString> = config
+            .port_mappings
+            .iter()
+            .map(|(host, guest)| {
+                CString::new(format!("{}:{}", host, guest))
+                    .expect("port mapping cannot contain null bytes")
+            })
+            .collect();
+        let mut port_ptrs: Vec<*const libc::c_char> =
+            port_cstrings.iter().map(|s| s.as_ptr()).collect();
+        port_ptrs.push(std::ptr::null());
+
+        // SAFETY: ctx is valid, port_ptrs is a null-terminated array of valid C strings
+        if unsafe { (krun.set_port_map)(ctx, port_ptrs.as_ptr()) } < 0 {
+            free_ctx_on_err!("krun_set_port_map failed");
+        }
+    } else {
+        // Control-only vsock, no network
+        // SAFETY: ctx is valid
+        if unsafe { (krun.add_vsock)(ctx, 0) } < 0 {
+            free_ctx_on_err!("krun_add_vsock failed");
+        }
+    }
+
+    // Add storage disk
+    let block_id = cstr("storage");
+    let disk_path = try_or_free_ctx!(
+        path_to_cstring(config.storage_path),
+        "storage path contains null byte"
+    );
+    // SAFETY: ctx is valid, block_id and disk_path are valid C strings
+    if unsafe { (krun.add_disk2)(ctx, block_id.as_ptr(), disk_path.as_ptr(), 0, false) } < 0 {
+        free_ctx_on_err!("krun_add_disk2 failed");
+    }
+
+    // Add vsock port for control channel
+    let socket_path = try_or_free_ctx!(
+        path_to_cstring(config.vsock_socket),
+        "vsock socket path contains null byte"
+    );
+    // SAFETY: ctx is valid, socket_path is a valid C string
+    if unsafe { (krun.add_vsock_port2)(ctx, ports::AGENT_CONTROL, socket_path.as_ptr(), true) } < 0
+    {
+        free_ctx_on_err!("krun_add_vsock_port2 failed");
+    }
+
+    // Set working directory
+    let workdir = cstr("/");
+    // SAFETY: ctx is valid, workdir is a valid C string
+    unsafe { (krun.set_workdir)(ctx, workdir.as_ptr()) };
+
+    // Build environment (all safe Rust)
+    let mut env_strings = vec![
+        cstr("HOME=/root"),
+        cstr("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
+        cstr("TERM=xterm-256color"),
+    ];
+
+    // Tell agent about packed layers mount
+    if config.layers_dir.exists() {
+        env_strings.push(cstr("SMOLVM_PACKED_LAYERS=smolvm_layers:/packed_layers"));
+    }
+
+    // Pass mount info to the agent via environment
+    for (i, mount) in config.mounts.iter().enumerate() {
+        let ro_flag = if mount.read_only { "ro" } else { "rw" };
+        let env_val = format!(
+            "SMOLVM_MOUNT_{}={}:{}:{}",
+            i, mount.tag, mount.guest_path, ro_flag
+        );
+        if let Ok(cstr) = CString::new(env_val) {
+            env_strings.push(cstr);
+        }
+    }
+
+    if !config.mounts.is_empty() {
+        if let Ok(cstr) = CString::new(format!("SMOLVM_MOUNT_COUNT={}", config.mounts.len())) {
+            env_strings.push(cstr);
+        }
+    }
+
+    let mut envp: Vec<*const libc::c_char> = env_strings.iter().map(|s| s.as_ptr()).collect();
+    envp.push(std::ptr::null());
+
+    // Set exec command (MUST be before add_virtiofs)
+    let exec_path = cstr("/sbin/init");
+    let argv_strings = [cstr("/sbin/init")];
+    let mut argv: Vec<*const libc::c_char> = argv_strings.iter().map(|s| s.as_ptr()).collect();
+    argv.push(std::ptr::null());
+
+    // SAFETY: ctx is valid, all pointers are valid null-terminated C strings/arrays
+    if unsafe { (krun.set_exec)(ctx, exec_path.as_ptr(), argv.as_ptr(), envp.as_ptr()) } < 0 {
+        free_ctx_on_err!("krun_set_exec failed");
+    }
+
+    // Add virtiofs mount for packed layers (AFTER set_exec)
+    if config.layers_dir.exists() {
+        let layers_tag = cstr("smolvm_layers");
+        let layers_path = try_or_free_ctx!(
+            path_to_cstring(config.layers_dir),
+            "layers dir path contains null byte"
+        );
+        // SAFETY: ctx is valid, tag and path are valid C strings
+        if unsafe { (krun.add_virtiofs)(ctx, layers_tag.as_ptr(), layers_path.as_ptr()) } < 0 {
+            free_ctx_on_err!("krun_add_virtiofs failed for packed layers");
+        }
+    }
+
+    // Add user-specified virtiofs mounts
+    for mount in config.mounts.iter() {
+        let tag = try_or_free_ctx!(
+            CString::new(mount.tag.as_str()),
+            "mount tag contains null byte"
+        );
+        let host_path = try_or_free_ctx!(
+            CString::new(mount.host_path.as_str()),
+            "mount path contains null byte"
+        );
+
+        // SAFETY: ctx is valid, tag and host_path are valid C strings
+        if unsafe { (krun.add_virtiofs)(ctx, tag.as_ptr(), host_path.as_ptr()) } < 0 {
+            free_ctx_on_err!(format!(
+                "krun_add_virtiofs failed for '{}' - requested mount cannot be attached",
+                mount.tag
+            ));
+        }
+    }
+
+    // Start VM (never returns on success)
+    // SAFETY: ctx is valid, all configuration has been set
+    let ret = unsafe { (krun.start_enter)(ctx) };
+
+    // If we get here, something went wrong — free the context before returning
+    // SAFETY: ctx is a valid context from krun_create_ctx
+    unsafe { (krun.free_ctx)(ctx) };
+    Err(format!("krun_start_enter returned: {}", ret))
+}
+
+/// Create a CString from a static string that is known not to contain NUL bytes.
+fn cstr(s: &str) -> CString {
+    CString::new(s).expect("string literal must not contain NUL bytes")
 }
 
 /// Convert a Path to a CString.
