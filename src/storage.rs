@@ -540,13 +540,89 @@ impl OverlayDisk {
     }
 
     /// Pre-format the overlay disk with ext4 on the host.
+    ///
+    /// Tries template copy first (fast, no dependencies), then falls back
+    /// to mkfs.ext4 (requires e2fsprogs).
     pub fn ensure_formatted(&self) -> Result<()> {
         if !self.needs_format() {
             tracing::debug!(path = %self.path.display(), "overlay disk already formatted");
             return Ok(());
         }
 
+        // Try to copy from pre-formatted template first (no dependencies)
+        if let Some(template_path) = Self::find_overlay_template() {
+            return self.copy_from_template(&template_path);
+        }
+
+        // Fall back to formatting with mkfs.ext4
         self.format_with_mkfs()
+    }
+
+    /// Find the pre-formatted overlay template.
+    ///
+    /// Searches in order:
+    /// 1. ~/.smolvm/overlay-template.ext4 (installed location)
+    /// 2. Next to the current executable (development)
+    fn find_overlay_template() -> Option<PathBuf> {
+        const TEMPLATE_FILENAME: &str = "overlay-template.ext4";
+
+        // Check ~/.smolvm/ (installed location)
+        if let Some(home) = dirs::home_dir() {
+            let installed_path = home.join(".smolvm").join(TEMPLATE_FILENAME);
+            if installed_path.exists() {
+                tracing::debug!(path = %installed_path.display(), "found overlay template");
+                return Some(installed_path);
+            }
+        }
+
+        // Check next to the current executable (development/testing)
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(exe_dir) = exe_path.parent() {
+                let dev_path = exe_dir.join(TEMPLATE_FILENAME);
+                if dev_path.exists() {
+                    tracing::debug!(path = %dev_path.display(), "found overlay template (dev)");
+                    return Some(dev_path);
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Copy the overlay disk from a pre-formatted template.
+    fn copy_from_template(&self, template_path: &Path) -> Result<()> {
+        tracing::info!(
+            template = %template_path.display(),
+            target = %self.path.display(),
+            "copying overlay from template"
+        );
+
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| Error::storage("create directory", e.to_string()))?;
+        }
+
+        std::fs::copy(template_path, &self.path)
+            .map_err(|e| Error::storage("copy overlay template", e.to_string()))?;
+
+        // Resize to the desired size (template may be smaller)
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&self.path)
+            .map_err(|e| Error::storage("open overlay for resize", e.to_string()))?;
+
+        file.seek(SeekFrom::Start(self.size_bytes - 1))
+            .map_err(|e| Error::storage("seek overlay for resize", e.to_string()))?;
+        file.write_all(&[0])
+            .map_err(|e| Error::storage("extend overlay", e.to_string()))?;
+        file.sync_all()
+            .map_err(|e| Error::storage("sync overlay", e.to_string()))?;
+
+        self.mark_formatted()?;
+
+        tracing::info!(path = %self.path.display(), "overlay copied from template");
+        Ok(())
     }
 
     /// Format the disk using mkfs.ext4.

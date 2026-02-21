@@ -1843,17 +1843,14 @@ fn mount_overlay_sequential(
             "copying layer to merged directory"
         );
 
-        // Use shell to copy layer contents, preserving all attributes
+        // Copy layer contents preserving all attributes.
         // cp -a preserves symlinks, permissions, etc.
-        let output = Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "cp -a '{}'/. '{}/' 2>/dev/null || cp -a '{}/'* '{}/' 2>/dev/null || true",
-                layer_path,
-                merged_layers_dir.display(),
-                layer_path,
-                merged_layers_dir.display()
-            ))
+        // Uses explicit args instead of shell to avoid injection risks.
+        let layer_src = format!("{}/.", layer_path);
+        let output = Command::new("cp")
+            .arg("-a")
+            .arg(&layer_src)
+            .arg(merged_layers_dir.as_os_str())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()?;

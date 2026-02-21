@@ -365,6 +365,14 @@ fn setup_persistent_rootfs() {
         }
     }
 
+    // Expand the ext4 filesystem to fill the block device. The host may have
+    // copied from a small template then extended the sparse file, but the ext4
+    // superblock still reflects the template size. resize2fs fixes this.
+    // Safe to call even when the FS already spans the device (instant no-op).
+    let _ = std::process::Command::new("resize2fs")
+        .arg(OVERLAY_DEVICE)
+        .output();
+
     // Create overlay directories
     let _ = std::fs::create_dir_all(format!("{}/upper", OVERLAY_MOUNT));
     let _ = std::fs::create_dir_all(format!("{}/work", OVERLAY_MOUNT));
