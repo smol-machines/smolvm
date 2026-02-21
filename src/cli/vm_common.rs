@@ -146,6 +146,27 @@ pub fn print_output_and_exit(
     std::process::exit(exit_code);
 }
 
+/// Get the agent manager for a VM by name, auto-starting it if not running.
+///
+/// Unlike [`ensure_running_and_connect`] which errors if the VM isn't running,
+/// this calls `ensure_running()` to start the VM on demand. Used by container
+/// commands that need the VM to be available.
+pub fn get_or_start_vm(name: &str) -> smolvm::Result<AgentManager> {
+    let name_opt = if name == "default" {
+        None
+    } else {
+        Some(name.to_string())
+    };
+    let manager = get_vm_manager(&name_opt)?;
+
+    if manager.try_connect_existing().is_none() {
+        println!("Starting microvm '{}'...", name);
+        manager.ensure_running()?;
+    }
+
+    Ok(manager)
+}
+
 // ============================================================================
 // Create
 // ============================================================================

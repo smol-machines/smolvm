@@ -49,19 +49,7 @@ impl ContainerCmd {
 
 /// Get the agent manager for a microvm, ensuring it's running.
 fn ensure_microvm(name: &str) -> smolvm::Result<AgentManager> {
-    let name_opt = if name == "default" {
-        None
-    } else {
-        Some(name.to_string())
-    };
-    let manager = vm_common::get_vm_manager(&name_opt)?;
-
-    if manager.try_connect_existing().is_none() {
-        println!("Starting microvm '{}'...", name);
-        manager.ensure_running()?;
-    }
-
-    Ok(manager)
+    vm_common::get_or_start_vm(name)
 }
 
 // ============================================================================
