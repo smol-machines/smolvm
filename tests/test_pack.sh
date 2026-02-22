@@ -408,6 +408,103 @@ test_runpack_python() {
 }
 
 # =============================================================================
+# Pack --from-vm Tests (Requires VM + Network)
+# =============================================================================
+
+# Shared VM name for --from-vm tests (cleaned up in test_from_vm_cleanup)
+FROM_VM_NAME="pack-from-vm-test-$$"
+FROM_VM_OUTPUT="$TEST_DIR/test-from-vm"
+
+test_from_vm_setup() {
+    # Create a named VM with network, install a package, then stop it
+    $SMOLVM microvm stop "$FROM_VM_NAME" 2>/dev/null || true
+    $SMOLVM microvm delete "$FROM_VM_NAME" -f 2>/dev/null || true
+
+    $SMOLVM microvm create "$FROM_VM_NAME" --net 2>&1 || return 1
+    $SMOLVM microvm start "$FROM_VM_NAME" 2>&1 || {
+        $SMOLVM microvm delete "$FROM_VM_NAME" -f 2>/dev/null
+        return 1
+    }
+
+    # Install curl so we can verify it persists into the packed binary
+    $SMOLVM microvm exec --name "$FROM_VM_NAME" -- apk add --no-cache curl 2>&1 || {
+        $SMOLVM microvm stop "$FROM_VM_NAME" 2>/dev/null || true
+        $SMOLVM microvm delete "$FROM_VM_NAME" -f 2>/dev/null || true
+        return 1
+    }
+
+    # Verify curl was installed
+    local which_output
+    which_output=$($SMOLVM microvm exec --name "$FROM_VM_NAME" -- which curl 2>&1) || {
+        $SMOLVM microvm stop "$FROM_VM_NAME" 2>/dev/null || true
+        $SMOLVM microvm delete "$FROM_VM_NAME" -f 2>/dev/null || true
+        return 1
+    }
+    [[ "$which_output" == *"/usr/bin/curl"* ]] || {
+        $SMOLVM microvm stop "$FROM_VM_NAME" 2>/dev/null || true
+        $SMOLVM microvm delete "$FROM_VM_NAME" -f 2>/dev/null || true
+        return 1
+    }
+
+    # Stop the VM (pack requires it to be stopped)
+    $SMOLVM microvm stop "$FROM_VM_NAME" 2>&1
+}
+
+test_from_vm_rejects_running() {
+    # --from-vm should fail if the VM is still running
+    local vm_name="pack-running-test-$$"
+    $SMOLVM microvm stop "$vm_name" 2>/dev/null || true
+    $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+
+    $SMOLVM microvm create "$vm_name" 2>&1 || return 1
+    $SMOLVM microvm start "$vm_name" 2>&1 || {
+        $SMOLVM microvm delete "$vm_name" -f 2>/dev/null
+        return 1
+    }
+
+    local exit_code=0
+    $SMOLVM pack --from-vm "$vm_name" -o "$TEST_DIR/should-fail" 2>&1 || exit_code=$?
+
+    # Clean up
+    $SMOLVM microvm stop "$vm_name" 2>/dev/null || true
+    $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+
+    [[ $exit_code -ne 0 ]]
+}
+
+test_from_vm_pack() {
+    # Pack the stopped VM snapshot
+    $SMOLVM pack --from-vm "$FROM_VM_NAME" -o "$FROM_VM_OUTPUT" 2>&1 || return 1
+
+    # Binary and sidecar should exist
+    [[ -f "$FROM_VM_OUTPUT" ]] || return 1
+    [[ -f "$FROM_VM_OUTPUT.smolmachine" ]] || return 1
+    [[ -x "$FROM_VM_OUTPUT" ]] || return 1
+}
+
+test_from_vm_run_finds_installed_package() {
+    if [[ ! -f "$FROM_VM_OUTPUT" ]]; then
+        echo "SKIP: no packed binary (setup or pack failed)"
+        return 1
+    fi
+
+    # The packed binary should have curl from the VM snapshot
+    local result
+    result=$(run_with_timeout 60 "$FROM_VM_OUTPUT" which curl 2>&1)
+    local exit_code=$?
+
+    [[ $exit_code -eq 124 ]] && { echo "TIMEOUT"; return 1; }
+    [[ "$result" == *"/usr/bin/curl"* ]]
+}
+
+test_from_vm_cleanup() {
+    $SMOLVM microvm stop "$FROM_VM_NAME" 2>/dev/null || true
+    $SMOLVM microvm delete "$FROM_VM_NAME" -f 2>/dev/null || true
+    rm -f "$FROM_VM_OUTPUT" "$FROM_VM_OUTPUT.smolmachine"
+    return 0
+}
+
+# =============================================================================
 # Error Handling Tests
 # =============================================================================
 
@@ -510,6 +607,18 @@ echo ""
 run_test "runpack resource override" test_runpack_resource_override || true
 run_test "runpack --force-extract" test_runpack_force_extract || true
 run_test "runpack cached fast" test_runpack_cached_fast || true
+
+if [[ "$QUICK_MODE" != "true" ]]; then
+    echo ""
+    echo "Running --from-vm Tests (requires VM + network)..."
+    echo ""
+
+    run_test "from-vm: rejects running VM" test_from_vm_rejects_running || true
+    run_test "from-vm: setup VM with curl" test_from_vm_setup || true
+    run_test "from-vm: pack stopped VM" test_from_vm_pack || true
+    run_test "from-vm: finds installed package" test_from_vm_run_finds_installed_package || true
+    run_test "from-vm: cleanup" test_from_vm_cleanup || true
+fi
 
 echo ""
 echo "Running Error Handling Tests..."
