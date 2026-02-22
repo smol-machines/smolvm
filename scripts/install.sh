@@ -576,19 +576,7 @@ main() {
         local current_version
         current_version=$(cat "$INSTALL_PREFIX/.version")
         if [[ "$current_version" == "$VERSION" ]]; then
-            info "smolvm $VERSION is already installed"
-            # Still ensure PATH is configured
-            if [[ "$MODIFY_PATH" == true ]]; then
-                modify_path "$BIN_DIR"
-            fi
-            echo ""
-            echo "Run 'smolvm --help' to get started."
-            if ! echo "$PATH" | grep -q "$BIN_DIR"; then
-                echo ""
-                echo "NOTE: Add this to your PATH:"
-                echo "    export PATH=\"$BIN_DIR:\$PATH\""
-            fi
-            exit 0
+            info "Reinstalling smolvm $VERSION..."
         else
             info "Upgrading from $current_version to $VERSION"
         fi

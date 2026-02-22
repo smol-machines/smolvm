@@ -20,6 +20,7 @@ smolvm sandbox run --net python:3.12-alpine -- python -V
 smolvm microvm start
 smolvm microvm exec -- apk add git  # changes persist across reboots
 smolvm microvm exec -- echo "hello"
+smolvm microvm exec -it -- /bin/sh   # interactive shell (exit with Ctrl+D)
 smolvm microvm stop
 
 # pack - build a portable, executable virtual machine.
@@ -41,7 +42,7 @@ microVMs are lightweight VMs - security and isolation of VMs with the speed of c
 
 They power AWS Lambda and Fly.io, but are inaccessible to average developers due to setup complexity.
 
-smolVM makes microVMs easy: <250ms boot, works on macOS and Linux, single binary distribution.
+smolVM makes microVMs easy: <200ms boot, works on macOS and Linux, single binary distribution.
 
 ## use this for
 
@@ -72,7 +73,7 @@ smolvm microvm exec --name codex-sandbox -it -- codex
 |                     | Containers | QEMU | Firecracker | Kata | smolvm |
 |---------------------|------------|------|-------------|------|--------|
 | kernel isolation    | shared ¹   | separate | separate | separate | separate |
-| boot time           | ~100ms ²   | ~15-30s ³ | <125ms ⁴ | ~500ms ⁵ | <250ms |
+| boot time           | ~100ms ²   | ~15-30s ³ | <125ms ⁴ | ~500ms ⁵ | <200ms |
 | setup               | easy       | complex | complex | complex | easy |
 | macOS               | via Docker | yes | no ⁶ | no ⁷ | yes |
 | guest rootfs        | layered    | disk image | DIY ⁸ | bundled + DIY | bundled |
@@ -83,10 +84,10 @@ smolvm microvm exec --name codex-sandbox -it -- codex
 <summary>References</summary>
 
 1. [Container isolation](https://www.docker.com/blog/understanding-docker-container-escapes/)
-2. [containerd benchmark](https://medium.com/norma-dev/benchmarking-containerd-vs-dockerd-performance-efficiency-and-scalability-64c9043924b1)
-3. [QEMU boot time](github.com/stefano-garzarella/qemu-boot-time)
+2. [containerd benchmark](https://github.com/containerd/containerd/issues/4482)
+3. [QEMU boot time](https://wiki.qemu.org/Features/TCG)
 4. [Firecracker website](https://firecracker-microvm.github.io/)
-5. [Kata boot time](https://dev.to/rimelek/comparing-3-docker-container-runtimes-runc-gvisor-and-kata-containers-16j)
+5. [Kata boot time](https://github.com/kata-containers/kata-containers/issues/4292)
 6. [Firecracker requires KVM](https://github.com/firecracker-microvm/firecracker/blob/main/docs/getting-started.md)
 7. [Kata macOS support](https://github.com/kata-containers/kata-containers/issues/243)
 8. [Firecracker rootfs setup](https://github.com/firecracker-microvm/firecracker/blob/main/docs/rootfs-and-kernel-setup.md)
