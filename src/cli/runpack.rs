@@ -319,8 +319,12 @@ impl RunpackCmd {
                 console_log: console_log_path,
             };
 
+            // Detach from parent's terminal so libkrun doesn't
+            // steal keystrokes or corrupt terminal state.
+            smolvm::process::detach_stdio();
+
             if let Err(e) = launch_agent_vm_dynamic(&krun, &config) {
-                eprintln!("VM launch failed: {}", e);
+                let _ = e;
             }
 
             smolvm::process::exit_child(1);
@@ -987,8 +991,12 @@ fn run_from_cache(
             console_log: console_log_path,
         };
 
+        // Detach from parent's terminal so libkrun doesn't
+        // steal keystrokes or corrupt terminal state.
+        smolvm::process::detach_stdio();
+
         if let Err(e) = launch_agent_vm_dynamic(&krun, &config) {
-            eprintln!("VM launch failed: {}", e);
+            let _ = e;
         }
         smolvm::process::exit_child(1);
     })
@@ -1327,8 +1335,15 @@ fn daemon_start(mode: &PackedMode, cli: &PackedCli) -> smolvm::Result<()> {
             console_log: console_log_path,
         };
 
+        // Detach from parent's terminal before launching the VM.
+        // Without this, libkrun's threads inherit stdin and steal
+        // keystrokes from the user's shell.
+        smolvm::process::detach_stdio();
+
         if let Err(e) = launch_agent_vm_dynamic(&krun, &config) {
-            eprintln!("VM launch failed: {}", e);
+            // stderr is /dev/null here, but the error is also logged
+            // to console.log via set_console_output
+            let _ = e;
         }
 
         smolvm::process::exit_child(1);

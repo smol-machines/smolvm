@@ -549,6 +549,30 @@ where
     }
 }
 
+/// Redirect stdin, stdout, and stderr to `/dev/null`.
+///
+/// Call this in a forked child process before launching a long-running
+/// background task (e.g. a VM via `krun_start_enter`). Without this,
+/// the child inherits the parent's terminal file descriptors and libkrun's
+/// internal threads may read from stdin or set terminal attributes,
+/// stealing keystrokes from the user's shell.
+///
+/// Must be called **after** any `eprintln!()` diagnostics that need the
+/// real stderr, but **before** the point of no return (`krun_start_enter`).
+pub fn detach_stdio() {
+    unsafe {
+        let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
+        if devnull >= 0 {
+            libc::dup2(devnull, 0); // stdin
+            libc::dup2(devnull, 1); // stdout
+            libc::dup2(devnull, 2); // stderr
+            if devnull > 2 {
+                libc::close(devnull);
+            }
+        }
+    }
+}
+
 /// Exit the current process immediately without cleanup.
 ///
 /// This is a safe wrapper around `libc::_exit()` for use in forked child

@@ -743,6 +743,11 @@ impl AgentManager {
                 }
             };
 
+            // Detach from parent's terminal before launching the VM.
+            // Without this, libkrun's threads inherit stdin and steal
+            // keystrokes from the user's shell.
+            process::detach_stdio();
+
             // Launch the agent VM (never returns on success)
             let disks = launcher::VmDisks {
                 storage: &storage_disk,
@@ -758,10 +763,9 @@ impl AgentManager {
                 resources,
             );
 
-            // If we get here, something went wrong
-            if let Err(e) = result {
-                eprintln!("agent VM failed to start: {}", e);
-            }
+            // If we get here, something went wrong (stderr is /dev/null,
+            // but the error is also logged to console.log)
+            let _ = result;
 
             process::exit_child(1);
         }) {
