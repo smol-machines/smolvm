@@ -79,7 +79,7 @@ mkdir -p "$DIST_DIR/lib"
 cp ./target/release/smolvm "$DIST_DIR/smolvm-bin"
 
 # Copy wrapper script
-cp ./dist/smolvm "$DIST_DIR/smolvm"
+cp ./scripts/smolvm-wrapper.sh "$DIST_DIR/smolvm"
 chmod +x "$DIST_DIR/smolvm"
 
 # Copy libraries
