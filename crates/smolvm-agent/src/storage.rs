@@ -523,6 +523,7 @@ pub fn init() -> Result<()> {
         (paths::CONTAINERS_RUN_DIR, "container runtime state"),
         (paths::CONTAINERS_LOGS_DIR, "container logs"),
         (paths::CONTAINERS_EXIT_DIR, "container exit codes"),
+        (paths::CRUN_ROOT_DIR, "crun state root"),
     ];
 
     for (dir, description) in &container_dirs {
@@ -576,6 +577,7 @@ pub fn format() -> Result<()> {
         (PathBuf::from(paths::CONTAINERS_RUN_DIR), "container run"),
         (PathBuf::from(paths::CONTAINERS_LOGS_DIR), "container logs"),
         (PathBuf::from(paths::CONTAINERS_EXIT_DIR), "container exit"),
+        (PathBuf::from(paths::CRUN_ROOT_DIR), "crun state root"),
     ];
 
     for (path, name) in &all_dirs {

@@ -549,6 +549,7 @@ fn mount_storage_disk() {
             "containers/run",
             "containers/logs",
             "containers/exit",
+            "containers/crun",
         ];
         for dir in dirs {
             let _ = std::fs::create_dir_all(std::path::Path::new(STORAGE_MOUNT).join(dir));
