@@ -18,14 +18,13 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use crate::crun::{ensure_path_in_env, CrunCommand};
+use crate::crun::CrunCommand;
 use crate::oci::{generate_container_id, OciSpec};
 use crate::paths;
 use crate::process::{wait_with_timeout, WaitResult, TIMEOUT_EXIT_CODE};
@@ -655,19 +654,9 @@ pub fn create_container(
 
     // Create the container with crun create (does NOT start it)
     // This puts the container in "created" state, ready for `crun start`
-    let crun_args = [
-        "--cgroup-manager",
-        paths::CRUN_CGROUP_MANAGER,
-        "create",
-        "--bundle",
-        &bundle_path.to_string_lossy(),
-        &container_id,
-    ];
     info!(
         container_id = %container_id,
         bundle = %bundle_path.display(),
-        crun_path = paths::CRUN_PATH,
-        crun_args = ?crun_args,
         "creating container with crun"
     );
 
@@ -698,12 +687,7 @@ pub fn create_container(
 
     // Use spawn with timeout - don't capture stdout/stderr as pipes can block
     // when child processes inherit fds
-    info!("about to call crun create");
-    let mut child = Command::new(paths::CRUN_PATH)
-        .args(crun_args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null()) // Don't capture - can cause blocking
-        .stderr(Stdio::null()) // Don't capture - can cause blocking
+    let mut child = CrunCommand::create(&bundle_path, &container_id)
         .spawn()
         .map_err(|e| StorageError::new(format!("failed to spawn crun create: {}", e)))?;
 
@@ -905,21 +889,9 @@ pub fn start_container(container_id: &str) -> Result<(), StorageError> {
             }
 
             // Recreate the container using spawn + timeout pattern (same as create_container)
-            // Using Stdio::null() to avoid pipe blocking
             info!(container_id = %info.id, bundle = %info.bundle_path.display(), "recreating container");
 
-            let mut child = Command::new(paths::CRUN_PATH)
-                .args([
-                    "--cgroup-manager",
-                    paths::CRUN_CGROUP_MANAGER,
-                    "create",
-                    "--bundle",
-                    &info.bundle_path.to_string_lossy(),
-                    &info.id,
-                ])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null()) // Don't capture - can cause blocking
-                .stderr(Stdio::null()) // Don't capture - can cause blocking
+            let mut child = CrunCommand::create(&info.bundle_path, &info.id)
                 .spawn()
                 .map_err(|e| StorageError::new(format!("failed to spawn crun create: {}", e)))?;
 
@@ -960,16 +932,9 @@ pub fn start_container(container_id: &str) -> Result<(), StorageError> {
             debug!(container_id = %info.id, "container recreated, now starting");
 
             // Now start it directly with crun start (also use spawn + timeout)
-            let mut child = Command::new(paths::CRUN_PATH)
-                .args([
-                    "--cgroup-manager",
-                    paths::CRUN_CGROUP_MANAGER,
-                    "start",
-                    &info.id,
-                ])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
+            let mut child = CrunCommand::start(&info.id)
+                .stdin_null()
+                .discard_output()
                 .spawn()
                 .map_err(|e| StorageError::new(format!("failed to spawn crun start: {}", e)))?;
 
@@ -1051,31 +1016,7 @@ pub fn exec_in_container(
         "executing command in container"
     );
 
-    if let Some(wd) = workdir {
-        // exec_with_env doesn't support workdir directly, so we build manually
-        // Ensure PATH is set for command lookup when using --env
-        let env_with_path = ensure_path_in_env(env);
-        let mut cmd = Command::new(paths::CRUN_PATH);
-        cmd.args(["--cgroup-manager", paths::CRUN_CGROUP_MANAGER, "exec"]);
-        for (key, value) in &env_with_path {
-            cmd.args(["--env", &format!("{}={}", key, value)]);
-        }
-        cmd.args(["--cwd", wd]);
-        cmd.arg(&info.id);
-        cmd.args(command);
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| StorageError::new(format!("failed to spawn crun exec: {}", e)))?;
-
-        let result = wait_with_timeout(&mut child, timeout_ms, None)?;
-        return convert_wait_result_to_exec(&info.id, result);
-    }
-
-    // No workdir - use CrunCommand (which handles PATH internally)
-    let mut child = CrunCommand::exec_with_env(&info.id, env, command)
+    let mut child = CrunCommand::exec(&info.id, env, command, workdir, false)
         .capture_output()
         .spawn()
         .map_err(|e| StorageError::new(format!("failed to spawn crun exec: {}", e)))?;
@@ -1148,37 +1089,10 @@ pub fn spawn_interactive_exec(
         "spawning interactive exec in container"
     );
 
-    // Build crun exec command
-    let mut cmd = Command::new(paths::CRUN_PATH);
-    cmd.arg("exec");
-
-    // Add TTY flag if requested
-    if tty {
-        cmd.arg("--tty");
-    }
-
-    // Add environment variables (ensure PATH is set for command lookup)
-    let env_with_path = ensure_path_in_env(env);
-    for (key, value) in &env_with_path {
-        cmd.args(["--env", &format!("{}={}", key, value)]);
-    }
-
-    // Add working directory
-    if let Some(wd) = workdir {
-        cmd.args(["--cwd", wd]);
-    }
-
-    // Add container ID and command
-    cmd.arg(&info.id);
-    cmd.args(command);
-
-    // Setup piped stdio for streaming
-    cmd.stdin(Stdio::piped());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-
-    // Spawn the exec
-    let child = cmd
+    // Spawn crun exec with piped stdio for streaming
+    let child = CrunCommand::exec(&info.id, env, command, workdir, tty)
+        .stdin_piped()
+        .capture_output()
         .spawn()
         .map_err(|e| StorageError::new(format!("failed to spawn crun exec: {}", e)))?;
 
