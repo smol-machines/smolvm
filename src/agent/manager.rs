@@ -7,7 +7,6 @@ use crate::error::{Error, Result};
 use crate::process::{self, ChildProcess};
 use crate::storage::{OverlayDisk, StorageDisk};
 use parking_lot::Mutex;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -22,8 +21,22 @@ use super::{HostMount, PortMapping, VmResources};
 /// Timeout for the agent to become ready after starting.
 const AGENT_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
-// Re-use shared polling constants from process module.
-use crate::process::{FAST_POLL_COUNT, FAST_POLL_INTERVAL};
+/// Short read timeout for ping during startup polling.
+/// Must be short so failed pings don't dominate the poll loop: each failed
+/// attempt costs PING_READ_TIMEOUT + poll_interval. 20ms is long enough for a
+/// real ping round-trip (<5ms over local vsock) but wastes minimal time when
+/// the guest agent isn't ready yet.
+const PING_READ_TIMEOUT: Duration = Duration::from_millis(20);
+
+/// Slow poll interval after the initial fast-poll burst.
+const SLOW_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Number of aggressive startup polls before backing off.
+/// 50 × 10ms = 500ms of aggressive readiness probing.
+const STARTUP_FAST_POLL_COUNT: u32 = 50;
+
+// Re-use shared fast poll interval from process module.
+use crate::process::FAST_POLL_INTERVAL;
 
 /// Timeout for agent to stop gracefully before force kill.
 /// Reduced from 5s - VMs typically exit within 100ms after shutdown signal.
@@ -972,10 +985,10 @@ impl AgentManager {
 
         while start.elapsed() < timeout {
             // Use aggressive polling at first, then back off
-            let poll_interval = if poll_count < FAST_POLL_COUNT {
+            let poll_interval = if poll_count < STARTUP_FAST_POLL_COUNT {
                 FAST_POLL_INTERVAL // 10ms
             } else {
-                Duration::from_millis(100) // Back off to 100ms
+                SLOW_POLL_INTERVAL
             };
             poll_count += 1;
             // Check if child process is still alive
@@ -1001,10 +1014,11 @@ impl AgentManager {
                     tracing::debug!(elapsed_ms = elapsed.as_millis(), "vsock socket appeared");
                 }
 
-                match UnixStream::connect(&self.vsock_socket) {
-                    Ok(stream) => {
-                        drop(stream);
-
+                // Connect and ping in one shot — no connect-drop-reconnect.
+                // Use a short read timeout so stale connections fail fast
+                // instead of blocking for ~5s on Linux.
+                match super::AgentClient::connect(&self.vsock_socket) {
+                    Ok(mut client) => {
                         // Log when first connect succeeds
                         if first_connect_at.is_none() {
                             let elapsed = start.elapsed();
@@ -1015,21 +1029,18 @@ impl AgentManager {
                             );
                         }
 
-                        // Try to ping
-                        match super::AgentClient::connect(&self.vsock_socket) {
-                            Ok(mut client) => {
-                                if client.ping().is_ok() {
-                                    let total = start.elapsed();
-                                    tracing::info!(
-                                        total_ms = total.as_millis(),
-                                        socket_wait_ms =
-                                            socket_appeared_at.map(|d| d.as_millis()).unwrap_or(0),
-                                        connect_wait_ms =
-                                            first_connect_at.map(|d| d.as_millis()).unwrap_or(0),
-                                        "agent ready - timing breakdown"
-                                    );
-                                    return Ok(());
-                                }
+                        match client.ping_with_timeout(PING_READ_TIMEOUT) {
+                            Ok(_) => {
+                                let total = start.elapsed();
+                                tracing::info!(
+                                    total_ms = total.as_millis(),
+                                    socket_wait_ms =
+                                        socket_appeared_at.map(|d| d.as_millis()).unwrap_or(0),
+                                    connect_wait_ms =
+                                        first_connect_at.map(|d| d.as_millis()).unwrap_or(0),
+                                    "agent ready - timing breakdown"
+                                );
+                                return Ok(());
                             }
                             Err(e) => {
                                 tracing::trace!("ping failed: {}", e);
