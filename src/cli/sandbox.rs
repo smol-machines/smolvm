@@ -309,6 +309,15 @@ pub struct RunCmd {
     #[arg(long, value_name = "GiB", help_heading = "Resources")]
     pub overlay: Option<u64>,
 
+    /// Load VM configuration from a Smolfile (TOML)
+    #[arg(
+        long = "smolfile",
+        visible_short_alias = 's',
+        value_name = "PATH",
+        help_heading = "Resources"
+    )]
+    pub smolfile: Option<PathBuf>,
+
     /// Mount ~/.docker/ config into VM for registry authentication
     ///
     /// When enabled, the Docker config directory (typically ~/.docker/) is
@@ -322,9 +331,25 @@ impl RunCmd {
     pub fn run(self) -> smolvm::Result<()> {
         use smolvm::Error;
 
+        // Merge CLI flags with Smolfile (if provided)
+        let params = crate::cli::smolfile::build_create_params(
+            "default".to_string(),
+            self.cpus,
+            self.mem,
+            self.volume,
+            self.port,
+            self.net,
+            vec![],
+            self.env,
+            self.workdir,
+            self.smolfile,
+            self.storage,
+            self.overlay,
+        )?;
+
         // Parse volume mounts
-        let mut mounts = parse_mounts(&self.volume)?;
-        let ports = self.port.clone();
+        let mut mounts = parse_mounts(&params.volume)?;
+        let ports = params.port.clone();
 
         // Add docker config mount if requested
         if self.docker_config {
@@ -338,15 +363,15 @@ impl RunCmd {
         }
 
         let resources = VmResources {
-            cpus: self.cpus,
-            mem: self.mem,
-            network: self.net,
-            storage_gb: self.storage,
-            overlay_gb: self.overlay,
+            cpus: params.cpus,
+            mem: params.mem,
+            network: params.net,
+            storage_gb: params.storage_gb,
+            overlay_gb: params.overlay_gb,
         };
 
         // Start agent VM
-        let manager = AgentManager::new_default_with_sizes(self.storage, self.overlay)
+        let manager = AgentManager::new_default_with_sizes(params.storage_gb, params.overlay_gb)
             .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
 
         // Show startup message
@@ -367,7 +392,7 @@ impl RunCmd {
         };
         println!("Starting {} sandbox{}{}...", mode, mount_info, port_info);
 
-        manager
+        let freshly_started = manager
             .ensure_running_with_full_config(mounts.clone(), ports, resources)
             .map_err(|e| Error::agent("start sandbox", e.to_string()))?;
 
@@ -376,6 +401,19 @@ impl RunCmd {
 
         // Pull image with progress display
         crate::cli::pull_with_progress(&mut client, &self.image, self.platform.as_deref())?;
+
+        // Run init commands from Smolfile only on fresh VM start (not when reusing)
+        if freshly_started && !params.init.is_empty() {
+            for (i, cmd) in params.init.iter().enumerate() {
+                let argv = vec!["sh".into(), "-c".into(), cmd.clone()];
+                let init_env = parse_env_list(&params.env);
+                let (exit_code, _stdout, stderr) =
+                    client.vm_exec(argv, init_env, params.workdir.clone(), None)?;
+                if exit_code != 0 {
+                    eprintln!("init[{}] failed (exit {}): {}", i, exit_code, stderr.trim());
+                }
+            }
+        }
 
         // Build command - for detached mode, default to sleep infinity
         let command = if self.command.is_empty() {
@@ -389,7 +427,7 @@ impl RunCmd {
         };
 
         // Parse environment variables
-        let env = parse_env_list(&self.env);
+        let env = parse_env_list(&params.env);
 
         // Convert mounts to agent format
         let mount_bindings = mounts_to_virtiofs_bindings(&mounts);
@@ -400,7 +438,7 @@ impl RunCmd {
                 &self.image,
                 command,
                 env,
-                self.workdir.clone(),
+                params.workdir.clone(),
                 mount_bindings,
             )?;
 
@@ -419,19 +457,22 @@ impl RunCmd {
                     })
                     .collect();
                 let port_tuples: Vec<(u16, u16)> =
-                    self.port.iter().map(|p| (p.host, p.guest)).collect();
+                    params.port.iter().map(|p| (p.host, p.guest)).collect();
                 if let Ok(mut config) = SmolvmConfig::load() {
                     vm_common::persist_default_running(
                         &mut config,
                         manager.child_pid(),
                         Some(DefaultVmOverrides {
-                            cpus: self.cpus,
-                            mem: self.mem,
+                            cpus: params.cpus,
+                            mem: params.mem,
                             mounts: mount_tuples,
                             ports: port_tuples,
-                            network: self.net,
-                            storage_gb: self.storage,
-                            overlay_gb: self.overlay,
+                            network: params.net,
+                            storage_gb: params.storage_gb,
+                            overlay_gb: params.overlay_gb,
+                            init: params.init.clone(),
+                            env: parse_env_list(&params.env),
+                            workdir: params.workdir.clone(),
                         }),
                     );
                     config.close_db();
@@ -459,7 +500,7 @@ impl RunCmd {
             let exit_code = if self.interactive || self.tty {
                 let config = RunConfig::new(&self.image, command)
                     .with_env(env)
-                    .with_workdir(self.workdir.clone())
+                    .with_workdir(params.workdir.clone())
                     .with_mounts(mount_bindings)
                     .with_timeout(self.timeout)
                     .with_tty(self.tty);
@@ -469,7 +510,7 @@ impl RunCmd {
                     &self.image,
                     command,
                     env,
-                    self.workdir.clone(),
+                    params.workdir.clone(),
                     mount_bindings,
                     self.timeout,
                 )?;

@@ -103,9 +103,6 @@ test_sandbox_workdir() {
 
 # =============================================================================
 # Volume Mounts
-# NOTE: These tests may fail due to a known libkrun TSI bug where virtiofs
-# operations are incorrectly intercepted as network calls, causing
-# "Connection reset by network" errors. See DESIGN.md for details.
 # =============================================================================
 
 test_sandbox_volume_mount_read() {
@@ -117,13 +114,6 @@ test_sandbox_volume_mount_read() {
     output=$($SMOLVM sandbox run --net -v "$tmpdir:/hostmnt" alpine:latest -- cat /hostmnt/testfile.txt 2>&1)
 
     rm -rf "$tmpdir"
-
-    # Check for known libkrun TSI bug
-    if [[ "$output" == *"Connection reset"* ]]; then
-        echo "SKIP: libkrun TSI bug (Connection reset)"
-        return 0
-    fi
-
     [[ "$output" == *"mount-test-content-12345"* ]]
 }
 
@@ -131,9 +121,6 @@ test_sandbox_volume_mount_write() {
     local tmpdir
     tmpdir=$(mktemp -d)
 
-    # Write from inside the container to mounted volume
-    # NOTE: Must use top-level mount path (e.g., /workspace) not nested (e.g., /hostmnt)
-    # Nested paths require creating dirs on overlayfs which triggers TSI bug
     local output
     output=$($SMOLVM sandbox run --net -v "$tmpdir:/workspace" alpine:latest -- sh -c "echo 'written-from-vm' > /workspace/output.txt" 2>&1)
 
@@ -154,13 +141,6 @@ test_sandbox_volume_mount_readonly() {
     local output
     output=$($SMOLVM sandbox run --net -v "$tmpdir:/hostmnt:ro" alpine:latest -- cat /hostmnt/readonly.txt 2>&1)
 
-    # Check for known libkrun TSI bug
-    if [[ "$output" == *"Connection reset"* ]]; then
-        rm -rf "$tmpdir"
-        echo "SKIP: libkrun TSI bug (Connection reset)"
-        return 0
-    fi
-
     # Write should fail
     local write_exit=0
     $SMOLVM sandbox run --net -v "$tmpdir:/hostmnt:ro" alpine:latest -- sh -c "echo 'fail' > /hostmnt/newfile.txt" 2>&1 || write_exit=$?
@@ -179,13 +159,6 @@ test_sandbox_volume_mount_subdirectory() {
     output=$($SMOLVM sandbox run --net -v "$tmpdir:/hostmnt" alpine:latest -- cat /hostmnt/subdir/nested/deep.txt 2>&1)
 
     rm -rf "$tmpdir"
-
-    # Check for known libkrun TSI bug
-    if [[ "$output" == *"Connection reset"* ]]; then
-        echo "SKIP: libkrun TSI bug (Connection reset)"
-        return 0
-    fi
-
     [[ "$output" == *"nested-file-content"* ]]
 }
 
@@ -200,13 +173,6 @@ test_sandbox_volume_mount_multiple() {
     output=$($SMOLVM sandbox run --net -v "$tmpdir1:/data1" -v "$tmpdir2:/data2" alpine:latest -- sh -c "cat /data1/file1.txt && cat /data2/file2.txt" 2>&1)
 
     rm -rf "$tmpdir1" "$tmpdir2"
-
-    # Check for known libkrun TSI bug
-    if [[ "$output" == *"Connection reset"* ]]; then
-        echo "SKIP: libkrun TSI bug (Connection reset)"
-        return 0
-    fi
-
     [[ "$output" == *"content-one"* ]] && [[ "$output" == *"content-two"* ]]
 }
 
@@ -346,12 +312,10 @@ test_sandbox_run_detached_appears_in_list() {
     run_output=$($SMOLVM sandbox run -d --net alpine:latest 2>&1) || exit_code=$?
 
     if [[ $exit_code -ne 0 ]]; then
-        # Container start may fail due to environment issues (crun state dir, etc.)
-        # Clean up and skip — this test is about DB persistence, not crun health
         $SMOLVM microvm stop 2>/dev/null || true
         $SMOLVM microvm delete default -f 2>/dev/null || true
-        echo "SKIP: sandbox run -d failed ($exit_code): $run_output"
-        return 0
+        echo "Setup failed: sandbox run -d returned $exit_code: $run_output"
+        return 1
     fi
 
     # Verify it appears in sandbox ls --json as running
@@ -364,6 +328,169 @@ test_sandbox_run_detached_appears_in_list() {
 
     [[ "$list_output" == *'"name": "default"'* ]] && \
     [[ "$list_output" == *'"state": "running"'* ]]
+}
+
+# =============================================================================
+# Smolfile with sandbox run
+# =============================================================================
+
+SMOLFILE_TMPDIR=$(mktemp -d)
+
+test_sandbox_run_smolfile_workdir_env() {
+    cat > "$SMOLFILE_TMPDIR/Smolfile.wdenv" <<'EOF'
+workdir = "/tmp"
+env = ["SMOL_TEST=from_smolfile"]
+EOF
+
+    local output
+    output=$($SMOLVM sandbox run -s "$SMOLFILE_TMPDIR/Smolfile.wdenv" --net alpine:latest -- sh -c 'pwd && echo $SMOL_TEST' 2>&1)
+    [[ "$output" == *"/tmp"* ]] && [[ "$output" == *"from_smolfile"* ]]
+}
+
+test_sandbox_run_smolfile_cli_overrides() {
+    cat > "$SMOLFILE_TMPDIR/Smolfile.override" <<'EOF'
+workdir = "/tmp"
+EOF
+
+    local output
+    output=$($SMOLVM sandbox run -s "$SMOLFILE_TMPDIR/Smolfile.override" -w /root --net alpine:latest -- pwd 2>&1)
+    [[ "$output" == *"/root"* ]]
+}
+
+test_sandbox_run_smolfile_init() {
+    cat > "$SMOLFILE_TMPDIR/Smolfile.init" <<'EOF'
+init = ["echo marker > /tmp/init-ran.txt"]
+EOF
+
+    local output
+    output=$($SMOLVM sandbox run -s "$SMOLFILE_TMPDIR/Smolfile.init" --net alpine:latest -- cat /tmp/init-ran.txt 2>&1)
+    [[ "$output" == *"marker"* ]]
+}
+
+test_sandbox_run_smolfile_init_not_rerun() {
+    # Start a detached sandbox with init that appends to a counter file
+    $SMOLVM microvm stop 2>/dev/null || true
+    $SMOLVM microvm delete default -f 2>/dev/null || true
+
+    cat > "$SMOLFILE_TMPDIR/Smolfile.norerun" <<'EOF'
+init = ["echo boot >> /tmp/init-count.txt"]
+EOF
+
+    # First run: detached, starts fresh VM, init should run
+    local run_output exit_code=0
+    run_output=$($SMOLVM sandbox run -d -s "$SMOLFILE_TMPDIR/Smolfile.norerun" --net alpine:latest 2>&1) || exit_code=$?
+
+    if [[ $exit_code -ne 0 ]]; then
+        $SMOLVM microvm stop 2>/dev/null || true
+        $SMOLVM microvm delete default -f 2>/dev/null || true
+        echo "Setup failed: sandbox run -d returned $exit_code: $run_output"
+        return 1
+    fi
+
+    # Verify init ran once
+    local count1
+    count1=$($SMOLVM microvm exec -- cat /tmp/init-count.txt 2>&1)
+    local lines1
+    lines1=$(echo "$count1" | grep -c "boot" || true)
+    if [[ "$lines1" -ne 1 ]]; then
+        $SMOLVM microvm stop 2>/dev/null || true
+        $SMOLVM microvm delete default -f 2>/dev/null || true
+        echo "Expected 1 boot line after first run, got $lines1"
+        return 1
+    fi
+
+    # Second run: also detached against already-running VM, init should NOT re-run.
+    # Using -d keeps the VM alive so we can verify afterwards.
+    local run2_output run2_exit=0
+    run2_output=$($SMOLVM sandbox run -d -s "$SMOLFILE_TMPDIR/Smolfile.norerun" --net alpine:latest 2>&1) || run2_exit=$?
+
+    if [[ $run2_exit -ne 0 ]]; then
+        $SMOLVM microvm stop 2>/dev/null || true
+        $SMOLVM microvm delete default -f 2>/dev/null || true
+        echo "Second sandbox run -d failed ($run2_exit): $run2_output"
+        return 1
+    fi
+
+    # Check that init-count.txt still has exactly 1 line (init did not re-run)
+    local count2
+    count2=$($SMOLVM microvm exec -- cat /tmp/init-count.txt 2>&1)
+
+    # Clean up
+    $SMOLVM microvm stop 2>/dev/null || true
+    $SMOLVM microvm delete default -f 2>/dev/null || true
+
+    local lines2
+    lines2=$(echo "$count2" | grep -c "boot" || true)
+    [[ "$lines2" -eq 1 ]]
+}
+
+test_sandbox_run_smolfile_detached_persists() {
+    # Clean up any existing default sandbox
+    $SMOLVM microvm stop 2>/dev/null || true
+    $SMOLVM microvm delete default -f 2>/dev/null || true
+
+    # Init command uses $BUILD_ENV (env) and writes to cwd (workdir=/tmp)
+    cat > "$SMOLFILE_TMPDIR/Smolfile.detach" <<'EOF'
+cpus = 2
+net = true
+init = ["echo setup-$BUILD_ENV > setup-marker.txt"]
+env = ["BUILD_ENV=production"]
+workdir = "/tmp"
+EOF
+
+    local run_output exit_code=0
+    run_output=$($SMOLVM sandbox run -d -s "$SMOLFILE_TMPDIR/Smolfile.detach" --net alpine:latest 2>&1) || exit_code=$?
+
+    if [[ $exit_code -ne 0 ]]; then
+        $SMOLVM microvm stop 2>/dev/null || true
+        $SMOLVM microvm delete default -f 2>/dev/null || true
+        echo "Setup failed: sandbox run -d returned $exit_code: $run_output"
+        return 1
+    fi
+
+    # Verify config was persisted in sandbox ls --json (cpus, init, env, workdir)
+    local list_output
+    list_output=$($SMOLVM sandbox ls --json 2>&1)
+
+    if [[ "$list_output" != *'"cpus": 2'* ]]; then
+        echo "cpus not persisted"
+        $SMOLVM microvm stop 2>/dev/null || true
+        $SMOLVM microvm delete default -f 2>/dev/null || true
+        return 1
+    fi
+
+    # Verify init ran on first boot with env ($BUILD_ENV) and workdir (/tmp)
+    # The init command writes "setup-production" to /tmp/setup-marker.txt
+    local first_check
+    first_check=$($SMOLVM microvm exec -- cat /tmp/setup-marker.txt 2>&1)
+    if [[ "$first_check" != *"setup-production"* ]]; then
+        echo "Init did not run correctly on first boot (env/workdir issue): $first_check"
+        $SMOLVM microvm stop 2>/dev/null || true
+        $SMOLVM microvm delete default -f 2>/dev/null || true
+        return 1
+    fi
+
+    # Delete the marker file so we can prove init re-creates it after restart
+    $SMOLVM microvm exec -- rm -f /tmp/setup-marker.txt 2>&1 || true
+
+    # Stop and restart — init should re-run on restart
+    $SMOLVM sandbox stop 2>&1 || true
+    $SMOLVM sandbox start 2>&1 || {
+        $SMOLVM microvm delete default -f 2>/dev/null || true
+        echo "Setup failed: sandbox start after stop failed"
+        return 1
+    }
+
+    # Verify init re-ran after restart: marker recreated with correct env+workdir
+    local setup_output
+    setup_output=$($SMOLVM microvm exec -- cat /tmp/setup-marker.txt 2>&1)
+
+    # Clean up
+    $SMOLVM microvm stop 2>/dev/null || true
+    $SMOLVM microvm delete default -f 2>/dev/null || true
+
+    # "setup-production" proves: init reran, $BUILD_ENV was set, workdir was /tmp
+    [[ "$setup_output" == *"setup-production"* ]]
 }
 
 # =============================================================================
@@ -392,5 +519,12 @@ run_test "TSI: coding agent workflow" test_tsi_coding_agent_workflow || true
 run_test "Network: disabled by default" test_network_disabled_by_default || true
 run_test "Network: DNS resolution" test_network_dns_resolution || true
 run_test "Network: multiple DNS lookups" test_network_multiple_dns_lookups || true
+run_test "Smolfile: workdir + env" test_sandbox_run_smolfile_workdir_env || true
+run_test "Smolfile: CLI overrides workdir" test_sandbox_run_smolfile_cli_overrides || true
+run_test "Smolfile: init commands run" test_sandbox_run_smolfile_init || true
+run_test "Smolfile: init not rerun on reuse" test_sandbox_run_smolfile_init_not_rerun || true
+run_test "Smolfile: detached persists + restart" test_sandbox_run_smolfile_detached_persists || true
+
+rm -rf "$SMOLFILE_TMPDIR"
 
 print_summary "Sandbox Tests"

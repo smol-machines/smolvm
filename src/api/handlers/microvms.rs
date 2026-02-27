@@ -267,7 +267,7 @@ pub async fn start_microvm(
         let manager = AgentManager::for_vm_with_sizes(&name_clone, storage_gb, overlay_gb)
             .map_err(|e| format!("failed to create agent manager: {}", e))?;
 
-        manager
+        let _ = manager
             .ensure_running_with_full_config(mounts, ports, resources)
             .map_err(|e| format!("failed to start microvm: {}", e))?;
 

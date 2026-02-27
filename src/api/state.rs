@@ -610,7 +610,8 @@ pub async fn ensure_sandbox_running(
 
         entry
             .manager
-            .ensure_running_with_full_config(mounts, ports, resources)
+            .ensure_running_with_full_config(mounts, ports, resources)?;
+        Ok(())
     })
     .await
     .map_err(|e| crate::Error::agent("ensure running", e.to_string()))?

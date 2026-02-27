@@ -510,7 +510,7 @@ impl AgentManager {
     /// Ensure the agent is running with the specified mounts.
     ///
     /// If the agent is running with different mounts, it will be restarted.
-    pub fn ensure_running_with_mounts(&self, mounts: Vec<HostMount>) -> Result<()> {
+    pub fn ensure_running_with_mounts(&self, mounts: Vec<HostMount>) -> Result<bool> {
         self.ensure_running_with_full_config(mounts, Vec::new(), VmResources::default())
     }
 
@@ -521,26 +521,27 @@ impl AgentManager {
         &self,
         mounts: Vec<HostMount>,
         resources: VmResources,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         self.ensure_running_with_full_config(mounts, Vec::new(), resources)
     }
 
     /// Ensure the agent is running with the specified mounts, ports, and resources.
     ///
     /// If the agent is running with different configuration, it will be restarted.
+    /// Returns `true` if the VM was freshly started/restarted, `false` if reused.
     pub fn ensure_running_with_full_config(
         &self,
         mounts: Vec<HostMount>,
         ports: Vec<PortMapping>,
         resources: VmResources,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         // Check if agent is already running with the same configuration
         if self.try_connect_existing().is_some()
             && self.mounts_match(&mounts)
             && self.ports_match(&ports)
             && self.resources_match(resources)
         {
-            return Ok(());
+            return Ok(false);
         }
 
         // If running with different config, we need to restart
@@ -560,17 +561,19 @@ impl AgentManager {
         }
 
         // Start with new config
-        self.start_with_full_config(mounts, ports, resources)
+        self.start_with_full_config(mounts, ports, resources)?;
+        Ok(true)
     }
 
     /// Ensure the agent is running.
     ///
     /// If the agent is not running, this starts it.
     /// If the agent is already running, this is a no-op.
-    pub fn ensure_running(&self) -> Result<()> {
+    /// Returns `true` if the VM was freshly started, `false` if reused.
+    pub fn ensure_running(&self) -> Result<bool> {
         // First, check if an agent is already running (from a previous invocation)
         if self.try_connect_existing().is_some() {
-            return Ok(());
+            return Ok(false);
         }
 
         // try_connect_existing failed — if state is stale Running (crashed VM),
@@ -581,12 +584,19 @@ impl AgentManager {
         let state = self.state();
 
         match state {
-            AgentState::Running => Ok(()), // shouldn't reach here after reset, but safe
-            AgentState::Starting => self.wait_for_ready(),
-            AgentState::Stopped => self.start(),
+            AgentState::Running => Ok(false), // shouldn't reach here after reset, but safe
+            AgentState::Starting => {
+                self.wait_for_ready()?;
+                Ok(true)
+            }
+            AgentState::Stopped => {
+                self.start()?;
+                Ok(true)
+            }
             AgentState::Stopping => {
                 self.wait_for_stop()?;
-                self.start()
+                self.start()?;
+                Ok(true)
             }
         }
     }

@@ -372,7 +372,7 @@ pub fn start_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
         port_info
     );
 
-    manager
+    let _ = manager
         .ensure_running_with_full_config(mounts, ports, resources)
         .map_err(|e| Error::agent(format!("start {}", kind.label()), e.to_string()))?;
 
@@ -458,6 +458,9 @@ pub fn persist_default_running(
                 r.network = o.network;
                 r.storage_gb = o.storage_gb;
                 r.overlay_gb = o.overlay_gb;
+                r.init = o.init.clone();
+                r.env = o.env.clone();
+                r.workdir = o.workdir.clone();
             }
         })
         .is_none()
@@ -475,6 +478,9 @@ pub struct DefaultVmOverrides {
     pub network: bool,
     pub storage_gb: Option<u64>,
     pub overlay_gb: Option<u64>,
+    pub init: Vec<String>,
+    pub env: Vec<(String, String)>,
+    pub workdir: Option<String>,
 }
 
 /// Start the default VM/sandbox.
@@ -497,7 +503,26 @@ pub fn start_vm_default(kind: VmKind) -> smolvm::Result<()> {
 
     let mut config = SmolvmConfig::load()?;
     persist_default_running(&mut config, manager.child_pid(), None);
+
+    // Run init commands if the default record has them (persisted from sandbox run -d -s)
+    let record = config.get_vm("default").cloned();
     config.close_db();
+
+    if let Some(record) = record {
+        if !record.init.is_empty() {
+            println!("Running {} init command(s)...", record.init.len());
+            let mut client =
+                smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
+            for (i, cmd) in record.init.iter().enumerate() {
+                let argv = vec!["sh".into(), "-c".into(), cmd.clone()];
+                let (exit_code, _stdout, stderr) =
+                    client.vm_exec(argv, record.env.clone(), record.workdir.clone(), None)?;
+                if exit_code != 0 {
+                    eprintln!("init[{}] failed (exit {}): {}", i, exit_code, stderr.trim());
+                }
+            }
+        }
+    }
 
     println!(
         "{} 'default' running (PID: {})",
