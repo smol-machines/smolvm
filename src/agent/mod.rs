@@ -31,7 +31,7 @@ pub fn mount_tag(index: usize) -> String {
 }
 
 /// TCP port mapping from host to guest.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PortMapping {
     /// Port on the host.
     pub host: u16,
@@ -55,7 +55,7 @@ impl PortMapping {
 }
 
 /// VM configuration for the agent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct VmResources {
     /// Number of vCPUs.
     pub cpus: u8,

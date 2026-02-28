@@ -486,26 +486,20 @@ pub fn init() -> Result<()> {
         )));
     }
 
-    // Check for marker file to see if formatted
-    let marker = root.join(".smolvm_formatted");
-    if !marker.exists() {
-        info!(path = %root.display(), "storage not formatted, waiting for format request");
-        return Ok(());
-    }
-
-    // Create directory structure with detailed error reporting
-    let required_dirs = [
-        (LAYERS_DIR, "OCI image layers"),
-        (CONFIGS_DIR, "image configurations"),
-        (MANIFESTS_DIR, "image manifests"),
-        (OVERLAYS_DIR, "overlay filesystems"),
+    // Create container runtime directories unconditionally — these are needed
+    // as soon as containers are requested, regardless of storage format state.
+    let container_dirs = [
+        (paths::CONTAINERS_RUN_DIR, "container runtime state"),
+        (paths::CONTAINERS_LOGS_DIR, "container logs"),
+        (paths::CONTAINERS_EXIT_DIR, "container exit codes"),
+        (paths::CRUN_ROOT_DIR, "crun state root"),
     ];
 
     let mut created_count = 0;
-    for (dir, description) in &required_dirs {
-        let path = root.join(dir);
+    for (dir, description) in &container_dirs {
+        let path = Path::new(dir);
         if !path.exists() {
-            std::fs::create_dir_all(&path).map_err(|e| {
+            std::fs::create_dir_all(path).map_err(|e| {
                 StorageError::new(format!(
                     "failed to create {} directory '{}': {}",
                     description,
@@ -518,18 +512,25 @@ pub fn init() -> Result<()> {
         }
     }
 
-    // Create container runtime directories
-    let container_dirs = [
-        (paths::CONTAINERS_RUN_DIR, "container runtime state"),
-        (paths::CONTAINERS_LOGS_DIR, "container logs"),
-        (paths::CONTAINERS_EXIT_DIR, "container exit codes"),
-        (paths::CRUN_ROOT_DIR, "crun state root"),
+    // Check for marker file to see if formatted
+    let marker = root.join(".smolvm_formatted");
+    if !marker.exists() {
+        info!(path = %root.display(), "storage not formatted, waiting for format request");
+        return Ok(());
+    }
+
+    // Create OCI storage directory structure
+    let required_dirs = [
+        (LAYERS_DIR, "OCI image layers"),
+        (CONFIGS_DIR, "image configurations"),
+        (MANIFESTS_DIR, "image manifests"),
+        (OVERLAYS_DIR, "overlay filesystems"),
     ];
 
-    for (dir, description) in &container_dirs {
-        let path = Path::new(dir);
+    for (dir, description) in &required_dirs {
+        let path = root.join(dir);
         if !path.exists() {
-            std::fs::create_dir_all(path).map_err(|e| {
+            std::fs::create_dir_all(&path).map_err(|e| {
                 StorageError::new(format!(
                     "failed to create {} directory '{}': {}",
                     description,

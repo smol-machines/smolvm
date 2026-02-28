@@ -625,7 +625,7 @@ impl CreateCmd {
 
 /// Start a sandbox.
 ///
-/// Starts a named sandbox, or the default anonymous sandbox if no name given.
+/// Starts a named sandbox, or the default sandbox if no name given.
 ///
 /// Examples:
 ///   smolvm sandbox start mysandbox

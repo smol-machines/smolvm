@@ -264,7 +264,7 @@ pub struct ContainerListCmd {
 
 impl ContainerListCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        // "default" refers to the anonymous default microvm
+        // "default" refers to the default microvm
         let manager = if self.microvm == "default" {
             AgentManager::new_default()?
         } else {

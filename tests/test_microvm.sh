@@ -409,7 +409,7 @@ test_microvm_rootfs_persists_across_reboot() {
 
 # =============================================================================
 # Default VM DB Persistence
-# Tests verify that the anonymous/default VM lifecycle is reflected in the DB.
+# Tests verify that the default VM lifecycle is reflected in the DB.
 # =============================================================================
 
 test_db_default_vm_appears_in_list_on_start() {

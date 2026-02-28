@@ -358,22 +358,40 @@ EOF
 }
 
 test_sandbox_run_smolfile_init() {
+    # Init runs on the VM (vm_exec), not inside the container, so we can't
+    # read init's files from the container. Instead verify:
+    # 1. A successful init doesn't block the run command
+    # 2. A failing init is reported but doesn't block the run command
     cat > "$SMOLFILE_TMPDIR/Smolfile.init" <<'EOF'
-init = ["echo marker > /tmp/init-ran.txt"]
+init = ["true"]
 EOF
 
     local output
-    output=$($SMOLVM sandbox run -s "$SMOLFILE_TMPDIR/Smolfile.init" --net alpine:latest -- cat /tmp/init-ran.txt 2>&1)
-    [[ "$output" == *"marker"* ]]
+    output=$($SMOLVM sandbox run -s "$SMOLFILE_TMPDIR/Smolfile.init" --net alpine:latest -- echo "after-init-ok" 2>&1)
+    [[ "$output" == *"after-init-ok"* ]]
+}
+
+test_sandbox_run_smolfile_init_failure_reported() {
+    cat > "$SMOLFILE_TMPDIR/Smolfile.initfail" <<'EOF'
+init = ["exit 1"]
+EOF
+
+    # Init failure should be reported but not block the run command
+    local output
+    output=$($SMOLVM sandbox run -s "$SMOLFILE_TMPDIR/Smolfile.initfail" --net alpine:latest -- echo "still-runs" 2>&1)
+    [[ "$output" == *"init[0] failed"* ]] && [[ "$output" == *"still-runs"* ]]
 }
 
 test_sandbox_run_smolfile_init_not_rerun() {
-    # Start a detached sandbox with init that appends to a counter file
+    # Start a detached sandbox with init that writes a unique marker file.
+    # Use a unique filename per test run to avoid overlay persistence contamination.
     $SMOLVM microvm stop 2>/dev/null || true
     $SMOLVM microvm delete default -f 2>/dev/null || true
 
-    cat > "$SMOLFILE_TMPDIR/Smolfile.norerun" <<'EOF'
-init = ["echo boot >> /tmp/init-count.txt"]
+    local marker="/tmp/init-norerun-$$"
+
+    cat > "$SMOLFILE_TMPDIR/Smolfile.norerun" <<EOF
+init = ["echo boot >> $marker"]
 EOF
 
     # First run: detached, starts fresh VM, init should run
@@ -387,9 +405,9 @@ EOF
         return 1
     fi
 
-    # Verify init ran once
+    # Verify init ran exactly once
     local count1
-    count1=$($SMOLVM microvm exec -- cat /tmp/init-count.txt 2>&1)
+    count1=$($SMOLVM microvm exec -- cat "$marker" 2>&1)
     local lines1
     lines1=$(echo "$count1" | grep -c "boot" || true)
     if [[ "$lines1" -ne 1 ]]; then
@@ -411,9 +429,9 @@ EOF
         return 1
     fi
 
-    # Check that init-count.txt still has exactly 1 line (init did not re-run)
+    # Check that marker still has exactly 1 line (init did not re-run)
     local count2
-    count2=$($SMOLVM microvm exec -- cat /tmp/init-count.txt 2>&1)
+    count2=$($SMOLVM microvm exec -- cat "$marker" 2>&1)
 
     # Clean up
     $SMOLVM microvm stop 2>/dev/null || true
@@ -493,6 +511,218 @@ EOF
     [[ "$setup_output" == *"setup-production"* ]]
 }
 
+test_sandbox_run_smolfile_config_change_restarts() {
+    # Start a detached VM with --net and an init marker.
+    # Then run again without --net — config differs, VM should restart,
+    # and init should re-run (proving the restart happened).
+    $SMOLVM microvm stop 2>/dev/null || true
+    $SMOLVM microvm delete default -f 2>/dev/null || true
+
+    local marker="/tmp/config-change-$$"
+
+    cat > "$SMOLFILE_TMPDIR/Smolfile.cfgchange" <<EOF
+init = ["echo boot >> $marker"]
+net = true
+EOF
+
+    # First run: detached with net=true
+    local run_output exit_code=0
+    run_output=$($SMOLVM sandbox run -d -s "$SMOLFILE_TMPDIR/Smolfile.cfgchange" --net alpine:latest 2>&1) || exit_code=$?
+
+    if [[ $exit_code -ne 0 ]]; then
+        $SMOLVM microvm stop 2>/dev/null || true
+        $SMOLVM microvm delete default -f 2>/dev/null || true
+        echo "Setup failed: first sandbox run -d returned $exit_code: $run_output"
+        return 1
+    fi
+
+    # Verify init ran once
+    local count1
+    count1=$($SMOLVM microvm exec -- cat "$marker" 2>&1)
+    local lines1
+    lines1=$(echo "$count1" | grep -c "boot" || true)
+    if [[ "$lines1" -ne 1 ]]; then
+        $SMOLVM microvm stop 2>/dev/null || true
+        $SMOLVM microvm delete default -f 2>/dev/null || true
+        echo "Expected 1 boot line after first run, got $lines1"
+        return 1
+    fi
+
+    # Second run: detached WITHOUT --net (different config)
+    cat > "$SMOLFILE_TMPDIR/Smolfile.cfgchange2" <<EOF
+init = ["echo boot >> $marker"]
+EOF
+
+    local run2_output run2_exit=0
+    run2_output=$($SMOLVM sandbox run -d -s "$SMOLFILE_TMPDIR/Smolfile.cfgchange2" alpine:latest 2>&1) || run2_exit=$?
+
+    if [[ $run2_exit -ne 0 ]]; then
+        $SMOLVM microvm stop 2>/dev/null || true
+        $SMOLVM microvm delete default -f 2>/dev/null || true
+        echo "Second sandbox run -d (no --net) failed ($run2_exit): $run2_output"
+        return 1
+    fi
+
+    # Init should have run again (2 boots) because VM restarted due to config change
+    local count2
+    count2=$($SMOLVM microvm exec -- cat "$marker" 2>&1)
+
+    # Clean up
+    $SMOLVM microvm stop 2>/dev/null || true
+    $SMOLVM microvm delete default -f 2>/dev/null || true
+
+    local lines2
+    lines2=$(echo "$count2" | grep -c "boot" || true)
+    if [[ "$lines2" -ne 2 ]]; then
+        echo "Expected 2 boot lines (config change should restart VM), got $lines2"
+        return 1
+    fi
+}
+
+test_sandbox_run_missing_config_restarts() {
+    # Start a detached VM with --net and init marker.
+    # Delete agent.config.json. Run again with default config.
+    # Since config is unknown (fail-closed), VM should restart and init re-runs.
+    $SMOLVM microvm stop 2>/dev/null || true
+    $SMOLVM microvm delete default -f 2>/dev/null || true
+
+    local marker="/tmp/missing-cfg-$$"
+
+    cat > "$SMOLFILE_TMPDIR/Smolfile.misscfg" <<EOF
+init = ["echo boot >> $marker"]
+net = true
+EOF
+
+    # First run: detached with net=true
+    local run_output exit_code=0
+    run_output=$($SMOLVM sandbox run -d -s "$SMOLFILE_TMPDIR/Smolfile.misscfg" --net alpine:latest 2>&1) || exit_code=$?
+    if [[ $exit_code -ne 0 ]]; then
+        $SMOLVM microvm stop 2>/dev/null || true
+        $SMOLVM microvm delete default -f 2>/dev/null || true
+        echo "Setup failed: sandbox run -d returned $exit_code: $run_output"
+        return 1
+    fi
+
+    # Verify init ran once
+    local count1
+    count1=$($SMOLVM microvm exec -- cat "$marker" 2>&1)
+    local lines1
+    lines1=$(echo "$count1" | grep -c "boot" || true)
+    if [[ "$lines1" -ne 1 ]]; then
+        $SMOLVM microvm stop 2>/dev/null || true
+        $SMOLVM microvm delete default -f 2>/dev/null || true
+        echo "Expected 1 boot line after first run, got $lines1"
+        return 1
+    fi
+
+    # Delete the config file (simulate missing/old VM without config)
+    local config_dir
+    if [[ "$(uname)" == "Darwin" ]]; then
+        config_dir="$HOME/Library/Caches/smolvm/vms/default"
+    else
+        config_dir="${XDG_RUNTIME_DIR:-/tmp}/smolvm/vms/default"
+    fi
+    rm -f "$config_dir/agent.config.json"
+
+    # Second run: same config. But config file is gone, so manager
+    # cannot verify running config matches — should force restart.
+    local run2_output run2_exit=0
+    run2_output=$($SMOLVM sandbox run -d -s "$SMOLFILE_TMPDIR/Smolfile.misscfg" --net alpine:latest 2>&1) || run2_exit=$?
+    if [[ $run2_exit -ne 0 ]]; then
+        $SMOLVM microvm stop 2>/dev/null || true
+        $SMOLVM microvm delete default -f 2>/dev/null || true
+        echo "Second run failed ($run2_exit): $run2_output"
+        return 1
+    fi
+
+    # Init should have run again (2 boots) because VM restarted (fail-closed)
+    local count2
+    count2=$($SMOLVM microvm exec -- cat "$marker" 2>&1)
+
+    # Clean up
+    $SMOLVM microvm stop 2>/dev/null || true
+    $SMOLVM microvm delete default -f 2>/dev/null || true
+
+    local lines2
+    lines2=$(echo "$count2" | grep -c "boot" || true)
+    if [[ "$lines2" -ne 2 ]]; then
+        echo "Expected 2 boot lines (missing config should force restart), got $lines2"
+        return 1
+    fi
+}
+
+test_sandbox_run_corrupt_config_restarts() {
+    # Start a detached VM with --net and init marker.
+    # Write invalid JSON to agent.config.json. Run again.
+    # Since config is corrupt (fail-closed), VM should restart.
+    $SMOLVM microvm stop 2>/dev/null || true
+    $SMOLVM microvm delete default -f 2>/dev/null || true
+
+    local marker="/tmp/corrupt-cfg-$$"
+
+    cat > "$SMOLFILE_TMPDIR/Smolfile.corruptcfg" <<EOF
+init = ["echo boot >> $marker"]
+net = true
+EOF
+
+    # First run: detached with net=true
+    local run_output exit_code=0
+    run_output=$($SMOLVM sandbox run -d -s "$SMOLFILE_TMPDIR/Smolfile.corruptcfg" --net alpine:latest 2>&1) || exit_code=$?
+    if [[ $exit_code -ne 0 ]]; then
+        $SMOLVM microvm stop 2>/dev/null || true
+        $SMOLVM microvm delete default -f 2>/dev/null || true
+        echo "Setup failed: sandbox run -d returned $exit_code: $run_output"
+        return 1
+    fi
+
+    # Verify init ran once
+    local count1
+    count1=$($SMOLVM microvm exec -- cat "$marker" 2>&1)
+    local lines1
+    lines1=$(echo "$count1" | grep -c "boot" || true)
+    if [[ "$lines1" -ne 1 ]]; then
+        $SMOLVM microvm stop 2>/dev/null || true
+        $SMOLVM microvm delete default -f 2>/dev/null || true
+        echo "Expected 1 boot line after first run, got $lines1"
+        return 1
+    fi
+
+    # Corrupt the config file
+    local config_dir
+    if [[ "$(uname)" == "Darwin" ]]; then
+        config_dir="$HOME/Library/Caches/smolvm/vms/default"
+    else
+        config_dir="${XDG_RUNTIME_DIR:-/tmp}/smolvm/vms/default"
+    fi
+    echo "NOT VALID JSON {{{" > "$config_dir/agent.config.json"
+
+    # Second run: same config. But config file is corrupt, so manager
+    # cannot verify running config matches — should force restart.
+    local run2_output run2_exit=0
+    run2_output=$($SMOLVM sandbox run -d -s "$SMOLFILE_TMPDIR/Smolfile.corruptcfg" --net alpine:latest 2>&1) || run2_exit=$?
+    if [[ $run2_exit -ne 0 ]]; then
+        $SMOLVM microvm stop 2>/dev/null || true
+        $SMOLVM microvm delete default -f 2>/dev/null || true
+        echo "Second run failed ($run2_exit): $run2_output"
+        return 1
+    fi
+
+    # Init should have run again (2 boots) because VM restarted (fail-closed)
+    local count2
+    count2=$($SMOLVM microvm exec -- cat "$marker" 2>&1)
+
+    # Clean up
+    $SMOLVM microvm stop 2>/dev/null || true
+    $SMOLVM microvm delete default -f 2>/dev/null || true
+
+    local lines2
+    lines2=$(echo "$count2" | grep -c "boot" || true)
+    if [[ "$lines2" -ne 2 ]]; then
+        echo "Expected 2 boot lines (corrupt config should force restart), got $lines2"
+        return 1
+    fi
+}
+
 # =============================================================================
 # Run Tests
 # =============================================================================
@@ -522,8 +752,12 @@ run_test "Network: multiple DNS lookups" test_network_multiple_dns_lookups || tr
 run_test "Smolfile: workdir + env" test_sandbox_run_smolfile_workdir_env || true
 run_test "Smolfile: CLI overrides workdir" test_sandbox_run_smolfile_cli_overrides || true
 run_test "Smolfile: init commands run" test_sandbox_run_smolfile_init || true
+run_test "Smolfile: init failure reported" test_sandbox_run_smolfile_init_failure_reported || true
 run_test "Smolfile: init not rerun on reuse" test_sandbox_run_smolfile_init_not_rerun || true
 run_test "Smolfile: detached persists + restart" test_sandbox_run_smolfile_detached_persists || true
+run_test "Smolfile: config change triggers restart" test_sandbox_run_smolfile_config_change_restarts || true
+run_test "Smolfile: missing config forces restart" test_sandbox_run_missing_config_restarts || true
+run_test "Smolfile: corrupt config forces restart" test_sandbox_run_corrupt_config_restarts || true
 
 rm -rf "$SMOLFILE_TMPDIR"
 

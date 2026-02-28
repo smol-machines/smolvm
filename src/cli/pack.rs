@@ -117,9 +117,67 @@ impl PackCmd {
 
         // Start a temporary agent VM with a unique identity so concurrent
         // pack runs and the user's "default" VM don't collide.
-        let pack_vm_name = format!("__pack_{}", std::process::id());
-        // Clean up any leftover data from a prior run with the same PID (reuse).
-        let _ = std::fs::remove_dir_all(smolvm::agent::vm_data_dir(&pack_vm_name));
+        // Use PID + epoch nanos to avoid PID-reuse collisions with orphaned VMs.
+        let pack_vm_name = format!(
+            "__pack_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        // Guard ensures VM is stopped on early error. Only removes temp data
+        // dir after confirmed stop — never deletes while VM may still be running.
+        let vm_data_dir = smolvm::agent::vm_data_dir(&pack_vm_name);
+        struct PackVmGuard {
+            manager: AgentManager,
+            data_dir: std::path::PathBuf,
+            finalized: bool,
+        }
+        impl PackVmGuard {
+            /// Stop VM and clean up temp dir. Propagates stop errors.
+            fn stop_and_cleanup(&mut self) -> smolvm::Result<()> {
+                self.manager.stop()?;
+                self.finalized = true;
+                if let Err(e) = std::fs::remove_dir_all(&self.data_dir) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(
+                            error = %e,
+                            dir = %self.data_dir.display(),
+                            "failed to remove pack temp dir"
+                        );
+                    }
+                }
+                Ok(())
+            }
+        }
+        impl Drop for PackVmGuard {
+            fn drop(&mut self) {
+                if self.finalized {
+                    return;
+                }
+                match self.manager.stop() {
+                    Ok(()) => {
+                        if let Err(e) = std::fs::remove_dir_all(&self.data_dir) {
+                            if e.kind() != std::io::ErrorKind::NotFound {
+                                tracing::warn!(
+                                    error = %e,
+                                    dir = %self.data_dir.display(),
+                                    "failed to remove pack temp dir"
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "failed to stop pack VM; preserving temp data dir"
+                        );
+                    }
+                }
+            }
+        }
+
         println!("Starting agent VM...");
         let manager = AgentManager::for_vm(&pack_vm_name)?;
         manager.start_with_config(
@@ -132,7 +190,12 @@ impl PackCmd {
                 overlay_gb: None,
             },
         )?;
-        let mut client = manager.connect()?;
+        let mut guard = PackVmGuard {
+            manager,
+            data_dir: vm_data_dir,
+            finalized: false,
+        };
+        let mut client = guard.manager.connect()?;
 
         // Pull image
         println!("Pulling {}...", image);
@@ -172,9 +235,9 @@ impl PackCmd {
                 .map_err(|e| Error::agent("collect layers", e.to_string()))?;
         }
 
-        // Stop agent and clean up temp VM data
-        manager.stop()?;
-        let _ = std::fs::remove_dir_all(smolvm::agent::vm_data_dir(&pack_vm_name));
+        // Stop agent and clean up temp VM data. Propagates stop errors
+        // so pack fails visibly if VM cannot be stopped.
+        guard.stop_and_cleanup()?;
 
         // Build manifest
         let platform = format!("{}/{}", image_info.os, image_info.architecture);

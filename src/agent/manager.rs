@@ -32,6 +32,37 @@ const AGENT_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 /// Timeout when waiting for agent to stop.
 const WAIT_FOR_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Running VM configuration persisted to disk so new CLI invocations
+/// can restore the actual config of a detached VM.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct RunningVmConfig {
+    /// Schema version for forward compatibility.
+    #[serde(default = "RunningVmConfig::default_version")]
+    version: u32,
+    mounts: Vec<HostMount>,
+    ports: Vec<PortMapping>,
+    resources: VmResources,
+}
+
+impl RunningVmConfig {
+    const CURRENT_VERSION: u32 = 1;
+
+    fn default_version() -> u32 {
+        1
+    }
+}
+
+/// Whether the in-memory VM config is trustworthy.
+#[derive(Debug, Clone)]
+enum ConfigState {
+    /// Config was never populated (fresh manager, no reconnect yet).
+    Unknown,
+    /// Config was set during VM start or restored from disk on reconnect.
+    Known,
+    /// Config file was missing or corrupt on reconnect — cannot trust defaults.
+    LoadFailed(String),
+}
+
 /// State of the agent VM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentState {
@@ -115,6 +146,8 @@ struct AgentInner {
     ports: Vec<PortMapping>,
     /// Currently configured VM resources.
     resources: VmResources,
+    /// Whether the in-memory config is trustworthy.
+    config_state: ConfigState,
     /// If true, the agent has been detached and should not be stopped on drop.
     detached: bool,
 }
@@ -152,6 +185,8 @@ pub struct AgentManager {
     vsock_socket: PathBuf,
     /// PID file path for tracking the VM process across CLI invocations.
     pid_file: PathBuf,
+    /// Config file path for persisting running VM config across CLI invocations.
+    config_file: PathBuf,
     /// Console log path (optional).
     console_log: Option<PathBuf>,
     /// Internal state.
@@ -213,6 +248,7 @@ impl AgentManager {
 
         let vsock_socket = smolvm_runtime.join("agent.sock");
         let pid_file = smolvm_runtime.join("agent.pid");
+        let config_file = smolvm_runtime.join("agent.config.json");
         let console_log = Some(smolvm_runtime.join("agent-console.log"));
 
         Ok(Self {
@@ -222,6 +258,7 @@ impl AgentManager {
             overlay_disk,
             vsock_socket,
             pid_file,
+            config_file,
             console_log,
             inner: Arc::new(Mutex::new(AgentInner {
                 state: AgentState::Stopped,
@@ -229,12 +266,13 @@ impl AgentManager {
                 mounts: Vec::new(),
                 ports: Vec::new(),
                 resources: VmResources::default(),
+                config_state: ConfigState::Unknown,
                 detached: false,
             })),
         })
     }
 
-    /// Get the default (anonymous) agent manager.
+    /// Get the default agent manager.
     ///
     /// Uses default paths for rootfs and storage.
     /// `storage_gb` and `overlay_gb` override the default disk sizes (20 GiB / 2 GiB).
@@ -428,6 +466,27 @@ impl AgentManager {
                         );
                     }
                 }
+                // Restore the running VM config from disk so that
+                // ensure_running_with_full_config can accurately compare
+                // the requested config against the actual running config.
+                if matches!(inner.config_state, ConfigState::Unknown) {
+                    match self.load_running_config() {
+                        Ok(config) => {
+                            inner.mounts = config.mounts;
+                            inner.ports = config.ports;
+                            inner.resources = config.resources;
+                            inner.config_state = ConfigState::Known;
+                        }
+                        Err(reason) => {
+                            tracing::warn!(
+                                reason = %reason,
+                                "could not restore running VM config; \
+                                 config changes will force restart"
+                            );
+                            inner.config_state = ConfigState::LoadFailed(reason);
+                        }
+                    }
+                }
                 return Some(());
             }
         }
@@ -442,6 +501,50 @@ impl AgentManager {
         let pid = lines.next()?.trim().parse::<i32>().ok()?;
         let start_time = lines.next().and_then(|s| s.trim().parse::<u64>().ok());
         Some((pid, start_time))
+    }
+
+    /// Save the running VM config to disk so future CLI invocations can
+    /// restore the actual config of a detached VM on reconnect.
+    ///
+    /// Uses atomic write (tmp + rename) to avoid partial/corrupt reads.
+    fn save_running_config(
+        &self,
+        mounts: &[HostMount],
+        ports: &[PortMapping],
+        resources: &VmResources,
+    ) {
+        let config = RunningVmConfig {
+            version: RunningVmConfig::CURRENT_VERSION,
+            mounts: mounts.to_vec(),
+            ports: ports.to_vec(),
+            resources: *resources,
+        };
+        match serde_json::to_string(&config) {
+            Ok(json) => {
+                let tmp = self.config_file.with_extension("json.tmp");
+                if let Err(e) = std::fs::write(&tmp, &json) {
+                    tracing::warn!(error = %e, "failed to write VM config tmp file");
+                    return;
+                }
+                if let Err(e) = std::fs::rename(&tmp, &self.config_file) {
+                    tracing::warn!(error = %e, "failed to rename VM config file");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to serialize VM config");
+            }
+        }
+    }
+
+    /// Load the running VM config from disk.
+    ///
+    /// Returns an error string describing why the load failed, so callers
+    /// can log it and treat the config as unknown (fail-closed).
+    fn load_running_config(&self) -> std::result::Result<RunningVmConfig, String> {
+        let content = std::fs::read_to_string(&self.config_file)
+            .map_err(|e| format!("config file {}: {}", self.config_file.display(), e))?;
+        serde_json::from_str(&content)
+            .map_err(|e| format!("invalid JSON in {}: {}", self.config_file.display(), e))
     }
 
     /// Get the child PID if known.
@@ -535,20 +638,41 @@ impl AgentManager {
         ports: Vec<PortMapping>,
         resources: VmResources,
     ) -> Result<bool> {
-        // Check if agent is already running with the same configuration
-        if self.try_connect_existing().is_some()
-            && self.mounts_match(&mounts)
-            && self.ports_match(&ports)
-            && self.resources_match(resources)
-        {
-            return Ok(false);
+        // Check if agent is already running with the same configuration.
+        // try_connect_existing restores config from disk on reconnect,
+        // so the comparison below is accurate even for detached VMs.
+        if self.try_connect_existing().is_some() {
+            let inner = self.inner.lock();
+            match &inner.config_state {
+                ConfigState::Known => {
+                    if inner.mounts == mounts
+                        && inner.ports == ports
+                        && inner.resources == resources
+                    {
+                        return Ok(false);
+                    }
+                    // Config is known but doesn't match — fall through to restart.
+                }
+                ConfigState::LoadFailed(reason) => {
+                    // Fail-closed: cannot verify running config matches requested,
+                    // so force restart to ensure correct isolation/network settings.
+                    tracing::info!(
+                        reason = %reason,
+                        "forcing VM restart: running config unknown"
+                    );
+                }
+                ConfigState::Unknown => {
+                    // This shouldn't happen (try_connect_existing always resolves
+                    // Unknown to Known or LoadFailed), but fail-closed just in case.
+                    tracing::info!("forcing VM restart: config state still unknown");
+                }
+            }
         }
 
-        // If running with different config, we need to restart
+        // If running with different/unknown config, we need to restart
         let needs_restart = {
             let inner = self.inner.lock();
             inner.state == AgentState::Running
-                && (inner.mounts != mounts || inner.ports != ports || inner.resources != resources)
         };
 
         if needs_restart {
@@ -636,7 +760,12 @@ impl AgentManager {
             inner.mounts = mounts.clone();
             inner.ports = ports.clone();
             inner.resources = resources;
+            inner.config_state = ConfigState::Known;
         }
+
+        // Write running config early so it's available if the process
+        // gets detached before wait_for_ready completes.
+        self.save_running_config(&mounts, &ports, &resources);
 
         tracing::info!(
             rootfs = %self.rootfs_path.display(),
@@ -861,11 +990,11 @@ impl AgentManager {
         }
     }
 
-    /// Remove PID file and vsock socket marker files.
+    /// Remove PID file, config file, and vsock socket marker files.
     ///
     /// Only call after the VM process is confirmed dead.
     fn cleanup_marker_files(&self) {
-        for path in [&self.pid_file, &self.vsock_socket] {
+        for path in [&self.pid_file, &self.config_file, &self.vsock_socket] {
             if let Err(e) = std::fs::remove_file(path) {
                 if e.kind() != std::io::ErrorKind::NotFound {
                     tracing::debug!(error = %e, path = %path.display(), "failed to remove marker file");
@@ -905,7 +1034,7 @@ impl AgentManager {
         tracing::info!("stopping agent VM");
 
         // Get the child PID and start time — try in-memory first, then PID file.
-        // The PID file fallback is critical for anonymous VMs where a fresh
+        // The PID file fallback is critical for default VMs where a fresh
         // AgentManager doesn't know the PID from a previous CLI invocation.
         let (child_pid, pid_start_time) = {
             let inner = self.inner.lock();

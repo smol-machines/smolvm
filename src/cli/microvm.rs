@@ -353,7 +353,7 @@ impl LsCmd {
 /// Test network connectivity directly from microvm (debug TSI).
 #[derive(Args, Debug)]
 pub struct NetworkTestCmd {
-    /// Named microvm to test (omit for default anonymous)
+    /// Named microvm to test (omit for default)
     #[arg(long)]
     pub name: Option<String>,
 
