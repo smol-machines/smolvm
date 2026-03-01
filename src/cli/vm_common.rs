@@ -7,7 +7,7 @@
 
 use crate::cli::parsers::parse_mounts_as_tuples;
 use crate::cli::{format_pid_suffix, truncate};
-use smolvm::agent::{AgentManager, PortMapping};
+use smolvm::agent::{vm_data_dir, AgentManager, PortMapping};
 use smolvm::config::{RecordState, SmolvmConfig, VmRecord};
 
 // ============================================================================
@@ -669,6 +669,14 @@ pub fn delete_vm(
     // Remove from config
     config.remove_vm(name);
     config.save()?;
+
+    let data_dir = vm_data_dir(name);
+    if data_dir.exists() {
+        println!("Cleaning up data directory for vm: {}", name);
+        if let Err(e) = std::fs::remove_dir_all(&data_dir) {
+            tracing::warn!(error = %e, "Failed to remove VM data directory: {}", data_dir.display());
+        }
+    }
 
     println!("Deleted {}: {}", kind.label(), name);
     Ok(())
