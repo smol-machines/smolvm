@@ -20,8 +20,9 @@ pub const SIGKILL_WAIT: Duration = Duration::from_millis(50);
 /// Aggressive poll interval for fast process shutdown and agent readiness.
 pub const FAST_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
-/// Number of aggressive polls before backing off to slower intervals.
-pub const FAST_POLL_COUNT: u32 = 10;
+/// Number of aggressive polls before backing off in `stop_process_fast`.
+/// 50 × 10ms = 500ms of aggressive polling before switching to 100ms.
+pub const STOP_FAST_POLL_COUNT: u32 = 50;
 
 /// Exit code returned when the actual exit status cannot be determined.
 /// This happens when a process is confirmed dead but waitpid() fails to
@@ -394,7 +395,7 @@ pub fn stop_process(pid: libc::pid_t, timeout: Duration, force: bool) -> Result<
 /// Optimized process stop with aggressive polling for fast response.
 ///
 /// This version uses a two-phase polling strategy:
-/// 1. Aggressive polling (10ms intervals) for the first 100ms
+/// 1. Aggressive polling (10ms intervals) for the first ~500ms
 /// 2. Backs off to 100ms intervals for the remainder
 ///
 /// This minimizes latency for processes that exit quickly while
@@ -427,8 +428,8 @@ pub fn stop_process_fast(pid: libc::pid_t, timeout: Duration, force: bool) -> Re
             return Ok(try_wait(pid).unwrap_or(UNKNOWN_EXIT_CODE));
         }
 
-        // Aggressive polling for first ~100ms, then back off
-        let poll_interval = if poll_count < FAST_POLL_COUNT {
+        // Aggressive polling for first ~500ms, then back off
+        let poll_interval = if poll_count < STOP_FAST_POLL_COUNT {
             FAST_POLL_INTERVAL // 10ms
         } else {
             Duration::from_millis(100)

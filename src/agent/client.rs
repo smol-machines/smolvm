@@ -45,9 +45,11 @@ const INTERACTIVE_TIMEOUT_SECS: u64 = 3600;
 /// timeout to allow for protocol overhead and response transmission.
 const TIMEOUT_BUFFER_SECS: u64 = 5;
 
-/// Short read timeout for status checks (5 seconds).
-/// Used when checking agent status where we want to fail fast.
-const STATUS_CHECK_TIMEOUT_SECS: u64 = 5;
+/// Short read timeout for shutdown ack.
+/// The shutdown ack is best-effort — the agent calls sync() before responding,
+/// and the SIGTERM signal handler also calls sync() as a safety net.
+/// On Linux the ack rarely arrives (vsock teardown race), so keep this short.
+const STATUS_CHECK_TIMEOUT: Duration = Duration::from_millis(500);
 
 // ============================================================================
 // I/O Constants
@@ -393,6 +395,15 @@ impl AgentClient {
         }
     }
 
+    /// Ping with a temporary read timeout, restoring the default afterwards.
+    ///
+    /// Used by startup polling to fail fast when the guest agent isn't ready.
+    pub(crate) fn ping_with_timeout(&mut self, timeout: Duration) -> Result<u32> {
+        self.set_read_timeout(timeout)?;
+        let _timeout_guard = ReadTimeoutGuard::new(&self.stream);
+        self.ping()
+    }
+
     /// Pull an OCI image with the given options.
     ///
     /// This is the primary pull method. Use `PullOptions` to configure
@@ -656,9 +667,7 @@ impl AgentClient {
     pub fn shutdown(&mut self) -> Result<()> {
         // Set a short timeout for shutdown acknowledgment
         // The agent just needs to call sync() which is fast
-        let _ = self
-            .stream
-            .set_read_timeout(Some(Duration::from_secs(STATUS_CHECK_TIMEOUT_SECS)));
+        let _ = self.stream.set_read_timeout(Some(STATUS_CHECK_TIMEOUT));
 
         let data = encode_message(&AgentRequest::Shutdown)
             .map_err(|e| Error::agent("encode message", e.to_string()))?;
