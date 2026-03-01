@@ -162,12 +162,37 @@ print_summary() {
     fi
 }
 
+# Get the data directory for a named microvm.
+# Mirrors the logic in src/agent/manager.rs vm_data_dir().
+#   macOS:  ~/Library/Caches/smolvm/vms/<name>
+#   Linux:  ${XDG_CACHE_HOME:-~/.cache}/smolvm/vms/<name>
+vm_data_dir() {
+    local name="${1:-default}"
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        echo "$HOME/Library/Caches/smolvm/vms/$name"
+    else
+        echo "${XDG_CACHE_HOME:-$HOME/.cache}/smolvm/vms/$name"
+    fi
+}
+
 # Cleanup helper - stop microvm and remove named "default" from DB
 # so tests start from a clean slate (no leftover DB records from
 # manual testing or previous test runs).
 cleanup_microvm() {
     $SMOLVM microvm stop 2>/dev/null || true
     $SMOLVM microvm delete default -f 2>/dev/null || true
+}
+
+# Verify that a VM's data directory was removed after deletion.
+# Returns non-zero if the directory still exists.
+ensure_data_dir_deleted() {
+    local name="${1:?vm name required}"
+    local data_dir
+    data_dir=$(vm_data_dir "$name")
+    if [[ -d "$data_dir" ]]; then
+        echo -e "${RED}ERROR: data directory still exists after delete: $data_dir${NC}" >&2
+        return 1
+    fi
 }
 
 # Ensure microvm is running

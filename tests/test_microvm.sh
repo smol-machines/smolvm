@@ -136,6 +136,7 @@ test_microvm_named_vm() {
     # Stop and delete
     $SMOLVM microvm stop "$vm_name" 2>&1
     $SMOLVM microvm delete "$vm_name" -f 2>&1
+    ensure_data_dir_deleted "$vm_name"
 }
 
 # =============================================================================
@@ -182,6 +183,7 @@ test_db_persistence_across_restart() {
 
     # Clean up
     $SMOLVM microvm delete "$vm_name" -f 2>&1
+    ensure_data_dir_deleted "$vm_name"
 }
 
 test_db_vm_state_update() {
@@ -225,6 +227,7 @@ test_db_vm_state_update() {
 
     # Clean up
     $SMOLVM microvm delete "$vm_name" -f 2>&1
+    ensure_data_dir_deleted "$vm_name"
 
     [[ "$stopped_state" == *'"state": "stopped"'* ]]
 }
@@ -248,6 +251,7 @@ test_db_delete_removes_from_db() {
 
     # Delete it
     $SMOLVM microvm delete "$vm_name" -f 2>&1
+    ensure_data_dir_deleted "$vm_name"
 
     # Verify it's gone
     local after_delete
@@ -281,6 +285,7 @@ test_microvm_network_disabled_by_default() {
     # Clean up
     $SMOLVM microvm stop "$vm_name" 2>/dev/null || true
     $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+    ensure_data_dir_deleted "$vm_name"
 
     # Should fail (non-zero exit code) because network is disabled
     [[ $exit_code -ne 0 ]]
@@ -304,6 +309,7 @@ test_microvm_network_dns_resolution() {
     # Clean up
     $SMOLVM microvm stop "$vm_name" 2>/dev/null || true
     $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+    ensure_data_dir_deleted "$vm_name"
 
     # Should succeed and contain resolved address info
     [[ $exit_code -eq 0 ]] && [[ "$output" == *"Address"* ]]
@@ -327,6 +333,7 @@ test_microvm_network_multiple_dns_lookups() {
     # Clean up
     $SMOLVM microvm stop "$vm_name" 2>/dev/null || true
     $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+    ensure_data_dir_deleted "$vm_name"
 
     # Should succeed and contain addresses for both
     [[ $exit_code -eq 0 ]] && [[ "$output" == *"Address"* ]]
@@ -355,6 +362,7 @@ test_microvm_overlay_root_active() {
     # Clean up
     $SMOLVM microvm stop "$vm_name" 2>/dev/null || true
     $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+    ensure_data_dir_deleted "$vm_name"
 
     [[ $exit_code -eq 0 ]] && [[ "$output" == *"overlay on / type overlay"* ]]
 }
@@ -403,6 +411,7 @@ test_microvm_rootfs_persists_across_reboot() {
     # Clean up
     $SMOLVM microvm stop "$vm_name" 2>/dev/null || true
     $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+    ensure_data_dir_deleted "$vm_name"
 
     [[ $exit_code -eq 0 ]] && [[ "$output" == *"persistence-test-ok"* ]]
 }
