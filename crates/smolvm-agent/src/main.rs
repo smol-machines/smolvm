@@ -75,11 +75,6 @@ fn main() {
     // This must happen before logging (which needs /dev for output).
     mount_essential_filesystems();
 
-    // Pre-create volume mount target directories on the virtiofs root BEFORE
-    // overlay setup. Overlayfs copy-up fails on virtiofs (EOPNOTSUPP for fileattr),
-    // so directories must exist in the lower layer to avoid mkdir failures later.
-    precreate_volume_mount_dirs();
-
     // Set up persistent rootfs overlay (if /dev/vdb exists).
     // This does overlayfs + pivot_root before anything else touches the filesystem.
     setup_persistent_rootfs();
@@ -206,28 +201,6 @@ fn signal_ready_to_host() {
             if std::fs::write(path, uptime_ms().to_string().as_bytes()).is_ok() {
                 debug!(path = path, "ready marker written");
                 return;
-            }
-        }
-    }
-}
-
-/// Pre-create volume mount target directories on the virtiofs root.
-///
-/// Must be called BEFORE `setup_persistent_rootfs()`. Overlayfs copy-up fails
-/// for virtiofs inodes (EOPNOTSUPP on fileattr), so mount target directories
-/// (e.g. `/mnt/hostdata`) must exist in the lower layer before the overlay is
-/// constructed. Errors are silently ignored since this is best-effort; the
-/// actual mount will report failures later.
-fn precreate_volume_mount_dirs() {
-    let count: usize = match std::env::var("SMOLVM_MOUNT_COUNT") {
-        Ok(v) => v.parse().unwrap_or(0),
-        Err(_) => return,
-    };
-    for i in 0..count {
-        if let Ok(val) = std::env::var(format!("SMOLVM_MOUNT_{}", i)) {
-            let parts: Vec<&str> = val.splitn(3, ':').collect();
-            if parts.len() >= 2 {
-                let _ = std::fs::create_dir_all(parts[1]);
             }
         }
     }
