@@ -1,11 +1,63 @@
 #!/bin/bash
 # Build a distributable smolvm package
 #
-# Usage: ./scripts/build-dist.sh
+# Usage:
+#   ./scripts/build-dist.sh
+#   ./scripts/build-dist.sh --with-local-libkrun
 #
 # Output: dist/smolvm-<version>-<platform>.tar.gz
 
 set -e
+
+# Options
+WITH_LOCAL_LIBKRUN=0
+LOCAL_LIBKRUN_DIR=""
+LIBKRUN_MAKE_FLAGS="${LIBKRUN_MAKE_FLAGS:-BLK=1}"
+
+print_help() {
+    cat <<'EOF'
+Build a distributable smolvm package.
+
+Usage:
+  ./scripts/build-dist.sh [options]
+
+Options:
+  --with-local-libkrun       Build libkrun from local checkout and refresh bundled lib/
+  --local-libkrun-dir PATH   Local libkrun checkout (default: ../libkrun)
+  -h, --help                 Show this help text
+
+Environment:
+  LIBKRUN_MAKE_FLAGS   make flags for local libkrun build (default: BLK=1)
+  LIBCLANG_PATH        path to libclang.dylib (auto-detected from brew llvm on macOS)
+  LIB_DIR              Override bundled library directory used by smolvm build
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --with-local-libkrun)
+            WITH_LOCAL_LIBKRUN=1
+            shift
+            ;;
+        --local-libkrun-dir)
+            if [[ -z "${2:-}" ]]; then
+                echo "Error: --local-libkrun-dir requires a path"
+                exit 1
+            fi
+            LOCAL_LIBKRUN_DIR="$2"
+            shift 2
+            ;;
+        -h|--help)
+            print_help
+            exit 0
+            ;;
+        *)
+            echo "Error: unknown option: $1"
+            print_help
+            exit 1
+            ;;
+    esac
+done
 
 # Configuration
 VERSION="${VERSION:-$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)}"
@@ -14,21 +66,149 @@ DIST_NAME="smolvm-${VERSION}-${PLATFORM}"
 DIST_DIR="dist/${DIST_NAME}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+WORKSPACE_SRC_ROOT="$(cd "$PROJECT_ROOT/.." && pwd)"
+LOCAL_STAGE_DIR="$PROJECT_ROOT/target/local-lib-stage"
+LOCAL_INIT_KRUN=""
+
+if [[ -z "$LOCAL_LIBKRUN_DIR" ]]; then
+    LOCAL_LIBKRUN_DIR="$WORKSPACE_SRC_ROOT/libkrun"
+fi
 
 echo "Building smolvm distribution: ${DIST_NAME}"
 
-# Check for required libraries
-# On Linux, look in lib/linux-{arch}/ first
+# Resolve bundled library directory
 if [[ "$(uname -s)" == "Linux" ]]; then
     ARCH="$(uname -m)"
-    LIB_DIR="${LIB_DIR:-./lib/linux-${ARCH}}"
+    DEFAULT_LIB_DIR="./lib/linux-${ARCH}"
+    STAGED_LIB_DIR="$LOCAL_STAGE_DIR/usr/local/lib64"
 else
-    LIB_DIR="${LIB_DIR:-./lib}"
+    DEFAULT_LIB_DIR="./lib"
+    STAGED_LIB_DIR="$LOCAL_STAGE_DIR/usr/local/lib"
 fi
 
-if [[ ! -f "$LIB_DIR/libkrun.dylib" ]] && [[ ! -f "$LIB_DIR/libkrun.so" ]]; then
-    echo "Error: libkrun not found in $LIB_DIR"
+BASE_LIB_DIR="${LIB_DIR:-$DEFAULT_LIB_DIR}"
+WORK_LIB_DIR="$BASE_LIB_DIR"
+LOCAL_BUNDLE_DIR="$PROJECT_ROOT/target/local-lib-bundle"
+
+run_make() {
+    local repo="$1"
+    local flags="$2"
+    shift 2
+    local -a args=()
+    if [[ -n "$flags" ]]; then
+        read -r -a args <<< "$flags"
+    fi
+    make -C "$repo" "${args[@]}" "$@"
+}
+
+copy_matching_libraries() {
+    local src_dir="$1"
+    local pattern="$2"
+    local dst_dir="$3"
+
+    if compgen -G "$src_dir/$pattern" > /dev/null; then
+        cp -a "$src_dir"/$pattern "$dst_dir"/
+    fi
+}
+
+setup_macos_libkrun_env() {
+    if [[ "$(uname -s)" != "Darwin" ]]; then
+        return
+    fi
+    if [[ ! -f "$LOCAL_LIBKRUN_DIR/Makefile" ]]; then
+        return
+    fi
+
+    # libkrun build scripts use bindgen and require libclang.dylib at runtime.
+    if [[ -z "${LIBCLANG_PATH:-}" ]] && command -v brew &> /dev/null; then
+        local llvm_prefix
+        llvm_prefix="$(brew --prefix llvm 2>/dev/null || true)"
+        if [[ -n "$llvm_prefix" ]] && [[ -f "$llvm_prefix/lib/libclang.dylib" ]]; then
+            export LIBCLANG_PATH="$llvm_prefix/lib"
+            echo "Using libclang from $LIBCLANG_PATH"
+        fi
+    fi
+
+    if [[ -n "${LIBCLANG_PATH:-}" ]]; then
+        export DYLD_FALLBACK_LIBRARY_PATH="$LIBCLANG_PATH:${DYLD_FALLBACK_LIBRARY_PATH:-}"
+    else
+        echo "Warning: LIBCLANG_PATH is not set."
+        echo "         If libkrun build fails with 'Library not loaded: @rpath/libclang.dylib',"
+        echo "         install llvm via brew and set LIBCLANG_PATH to its lib directory."
+    fi
+
+    if [[ "$LIBKRUN_MAKE_FLAGS" == *"BUILD_INIT=0"* ]] && [[ ! -f "$LOCAL_LIBKRUN_DIR/init/init" ]]; then
+        echo "Error: LIBKRUN_MAKE_FLAGS includes BUILD_INIT=0 but init binary is missing:"
+        echo "       $LOCAL_LIBKRUN_DIR/init/init"
+        echo "Build init first (for example: make -C \"$LOCAL_LIBKRUN_DIR\" BLK=1),"
+        echo "or remove BUILD_INIT=0 from LIBKRUN_MAKE_FLAGS."
+        exit 1
+    fi
+}
+
+refresh_bundled_libs_from_local() {
+    local repo="$1"
+    local flags="$2"
+    local prefix="$3"
+
+    if [[ ! -f "$repo/Makefile" ]]; then
+        echo "Error: local repo not found: $repo"
+        exit 1
+    fi
+
+    mkdir -p "$WORK_LIB_DIR"
+    rm -rf "$LOCAL_STAGE_DIR"
+    mkdir -p "$LOCAL_STAGE_DIR"
+
+    run_make "$repo" "$flags"
+    run_make "$repo" "$flags" install "DESTDIR=$LOCAL_STAGE_DIR" "PREFIX=/usr/local"
+
+    if [[ ! -d "$STAGED_LIB_DIR" ]]; then
+        echo "Error: no staged libraries found in $STAGED_LIB_DIR"
+        exit 1
+    fi
+
+    if ! compgen -G "$STAGED_LIB_DIR/${prefix}*" > /dev/null; then
+        echo "Error: no staged ${prefix} artifacts found in $STAGED_LIB_DIR"
+        exit 1
+    fi
+
+    cp -a "$STAGED_LIB_DIR"/${prefix}* "$WORK_LIB_DIR"/
+}
+
+if [[ "$WITH_LOCAL_LIBKRUN" == "1" ]]; then
+    if [[ ! -d "$BASE_LIB_DIR" ]]; then
+        echo "Error: base library directory does not exist: $BASE_LIB_DIR"
+        echo "Set LIB_DIR to a directory containing libkrun/libkrunfw artifacts."
+        exit 1
+    fi
+
+    rm -rf "$LOCAL_BUNDLE_DIR"
+    mkdir -p "$LOCAL_BUNDLE_DIR"
+    copy_matching_libraries "$BASE_LIB_DIR" "libkrun*" "$LOCAL_BUNDLE_DIR"
+    copy_matching_libraries "$BASE_LIB_DIR" "libkrunfw*" "$LOCAL_BUNDLE_DIR"
+    WORK_LIB_DIR="$LOCAL_BUNDLE_DIR"
+    echo "Staging local build bundle in $WORK_LIB_DIR"
+fi
+
+if [[ "$WITH_LOCAL_LIBKRUN" == "1" ]]; then
+    echo "Building local libkrun from $LOCAL_LIBKRUN_DIR..."
+    setup_macos_libkrun_env
+    refresh_bundled_libs_from_local "$LOCAL_LIBKRUN_DIR" "$LIBKRUN_MAKE_FLAGS" "libkrun"
+    if [[ -f "$LOCAL_LIBKRUN_DIR/init/init" ]]; then
+        LOCAL_INIT_KRUN="$LOCAL_LIBKRUN_DIR/init/init"
+    fi
+fi
+
+# Check for required libraries
+if [[ ! -f "$WORK_LIB_DIR/libkrun.dylib" ]] && [[ ! -f "$WORK_LIB_DIR/libkrun.so" ]]; then
+    echo "Error: libkrun not found in $WORK_LIB_DIR"
     echo "Set LIB_DIR to point to your libkrun library directory."
+    exit 1
+fi
+if [[ ! -f "$WORK_LIB_DIR/libkrunfw.5.dylib" ]] && [[ ! -f "$WORK_LIB_DIR/libkrunfw.so" ]]; then
+    echo "Error: libkrunfw not found in $WORK_LIB_DIR"
+    echo "Set LIB_DIR to point to your libkrunfw library directory."
     exit 1
 fi
 
@@ -40,7 +220,7 @@ fi
 
 # Build release binaries
 echo "Building release binaries..."
-LIBKRUN_BUNDLE="$LIB_DIR" cargo build --release --bin smolvm
+LIBKRUN_BUNDLE="$WORK_LIB_DIR" cargo build --release --bin smolvm
 
 # Build smolvm-agent for Linux (size-optimized)
 echo "Building smolvm-agent for Linux (optimized for size)..."
@@ -84,25 +264,25 @@ chmod +x "$DIST_DIR/smolvm"
 
 # Copy libraries
 if [[ "$(uname -s)" == "Darwin" ]]; then
-    cp "$LIB_DIR/libkrun.dylib" "$DIST_DIR/lib/"
-    cp "$LIB_DIR/libkrunfw.5.dylib" "$DIST_DIR/lib/"
+    cp "$WORK_LIB_DIR/libkrun.dylib" "$DIST_DIR/lib/"
+    cp "$WORK_LIB_DIR/libkrunfw.5.dylib" "$DIST_DIR/lib/"
     # Create symlink for compatibility
     ln -sf libkrunfw.5.dylib "$DIST_DIR/lib/libkrunfw.dylib"
 else
     # Copy libraries preserving symlinks with -a, or copy files individually
-    if [[ -L "$LIB_DIR/libkrun.so" ]]; then
-        cp -a "$LIB_DIR"/libkrun.so* "$DIST_DIR/lib/" 2>/dev/null || \
-            cp "$LIB_DIR"/libkrun.so* "$DIST_DIR/lib/"
+    if [[ -L "$WORK_LIB_DIR/libkrun.so" ]]; then
+        cp -a "$WORK_LIB_DIR"/libkrun.so* "$DIST_DIR/lib/" 2>/dev/null || \
+            cp "$WORK_LIB_DIR"/libkrun.so* "$DIST_DIR/lib/"
     else
-        cp "$LIB_DIR/libkrun.so" "$DIST_DIR/lib/"
+        cp "$WORK_LIB_DIR/libkrun.so" "$DIST_DIR/lib/"
         # Create versioned symlink
         ln -sf libkrun.so "$DIST_DIR/lib/libkrun.so.1"
     fi
-    if [[ -L "$LIB_DIR/libkrunfw.so" ]]; then
-        cp -a "$LIB_DIR"/libkrunfw.so* "$DIST_DIR/lib/" 2>/dev/null || \
-            cp "$LIB_DIR"/libkrunfw.so* "$DIST_DIR/lib/"
+    if [[ -L "$WORK_LIB_DIR/libkrunfw.so" ]]; then
+        cp -a "$WORK_LIB_DIR"/libkrunfw.so* "$DIST_DIR/lib/" 2>/dev/null || \
+            cp "$WORK_LIB_DIR"/libkrunfw.so* "$DIST_DIR/lib/"
     else
-        cp "$LIB_DIR/libkrunfw.so"* "$DIST_DIR/lib/"
+        cp "$WORK_LIB_DIR/libkrunfw.so"* "$DIST_DIR/lib/"
     fi
 fi
 
@@ -110,7 +290,9 @@ fi
 if [[ "$(uname -s)" == "Linux" ]]; then
     # Look for init.krun in libkrun submodule or system locations
     INIT_KRUN=""
-    if [[ -f "$PROJECT_ROOT/libkrun/init/init" ]]; then
+    if [[ -n "$LOCAL_INIT_KRUN" ]] && [[ -f "$LOCAL_INIT_KRUN" ]]; then
+        INIT_KRUN="$LOCAL_INIT_KRUN"
+    elif [[ -f "$PROJECT_ROOT/libkrun/init/init" ]]; then
         INIT_KRUN="$PROJECT_ROOT/libkrun/init/init"
     elif [[ -f "/usr/local/share/smolvm/init.krun" ]]; then
         INIT_KRUN="/usr/local/share/smolvm/init.krun"

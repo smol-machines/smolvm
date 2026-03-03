@@ -121,6 +121,16 @@ smolvm microvm exec --name codex-sandbox -it -- codex
 # build
 ./scripts/build-dist.sh
 
+# build using local libkrun changes from ../libkrun
+./scripts/build-dist.sh --with-local-libkrun
+
+# local lib bundle staging path used by --with-local-libkrun
+# (libkrun artifacts are copied here and used for linking/packaging)
+# target/local-lib-bundle/libkrun.dylib
+# target/local-lib-bundle/libkrun.1.dylib
+# target/local-lib-bundle/libkrunfw.5.dylib
+# Note: tracked files under ./lib/ are not modified by this mode.
+
 # run tests
 ./tests/run_all.sh
 ```
