@@ -76,7 +76,6 @@ fn create_sparse_disk(path: &Path, size_bytes: u64, label: &str) -> Result<()> {
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
     file.seek(SeekFrom::Start(size_bytes - 1))?;
     file.write_all(&[0])?;
-    file.sync_all()?;
 
     Ok(())
 }
@@ -109,6 +108,10 @@ fn find_disk_template(template_filename: &str) -> Option<PathBuf> {
 }
 
 /// Copy a disk from a pre-formatted template, resizing to target size.
+///
+/// On macOS, uses `clonefile()` for instant APFS copy-on-write cloning.
+/// On Linux, falls back to `fs::copy` (which uses `copy_file_range` for
+/// sparse-aware copying on supported filesystems).
 fn copy_disk_from_template(
     disk_path: &Path,
     size_bytes: u64,
@@ -126,8 +129,7 @@ fn copy_disk_from_template(
             .map_err(|e| Error::storage("create directory", e.to_string()))?;
     }
 
-    std::fs::copy(template_path, disk_path)
-        .map_err(|e| Error::storage("copy template", e.to_string()))?;
+    clone_or_copy_file(template_path, disk_path)?;
 
     // Resize to the desired size (template may be smaller than target)
     use std::io::{Seek, SeekFrom, Write};
@@ -140,14 +142,50 @@ fn copy_disk_from_template(
         .map_err(|e| Error::storage("seek for resize", e.to_string()))?;
     file.write_all(&[0])
         .map_err(|e| Error::storage("extend disk", e.to_string()))?;
-    file.sync_all()
-        .map_err(|e| Error::storage("sync disk", e.to_string()))?;
 
     // Filesystem resize happens inside the VM (guest runs resize2fs on boot).
 
     mark_disk_formatted(disk_path)?;
 
     tracing::info!(path = %disk_path.display(), "{} copied from template", label);
+    Ok(())
+}
+
+/// Clone a file using platform-optimal method.
+///
+/// - macOS: `clonefile()` for instant APFS copy-on-write (falls back to `fs::copy`)
+/// - Linux: `fs::copy` (uses `copy_file_range` for sparse-aware copy)
+fn clone_or_copy_file(src: &Path, dst: &Path) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::CString;
+
+        // clonefile(2) requires the destination to not exist
+        if dst.exists() {
+            let _ = std::fs::remove_file(dst);
+        }
+
+        let src_c = CString::new(src.to_string_lossy().as_bytes())
+            .map_err(|e| Error::storage("clonefile src path", e.to_string()))?;
+        let dst_c = CString::new(dst.to_string_lossy().as_bytes())
+            .map_err(|e| Error::storage("clonefile dst path", e.to_string()))?;
+
+        // clonefile(2): instant APFS copy-on-write clone
+        let ret = unsafe { libc::clonefile(src_c.as_ptr(), dst_c.as_ptr(), 0) };
+        if ret == 0 {
+            tracing::debug!(src = %src.display(), dst = %dst.display(), "clonefile succeeded");
+            return Ok(());
+        }
+
+        // Fall back to regular copy if clonefile fails (e.g., non-APFS filesystem)
+        tracing::debug!(
+            src = %src.display(),
+            errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+            "clonefile failed, falling back to fs::copy"
+        );
+    }
+
+    std::fs::copy(src, dst).map_err(|e| Error::storage("copy template", e.to_string()))?;
     Ok(())
 }
 

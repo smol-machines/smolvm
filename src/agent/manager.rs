@@ -796,23 +796,32 @@ impl AgentManager {
             ));
         }
 
-        // Pre-format storage disk on host (much faster than in-VM formatting)
-        // This tries: 1) copy from template (no deps), 2) mkfs.ext4 (requires e2fsprogs)
+        // Pre-format storage and overlay disks in parallel.
+        // Each tries: 1) clonefile/copy from template, 2) mkfs.ext4 (requires e2fsprogs).
         // If both fail, VM can still format the disk but it may be slower or timeout.
-        if let Err(e) = self.storage_disk.ensure_formatted() {
-            tracing::warn!(
-                error = %e,
-                "failed to pre-format disk on host, will attempt format in VM. \
-                For faster startup, install storage template or e2fsprogs"
-            );
-        }
+        {
+            let storage_disk = &self.storage_disk;
+            let overlay_disk = &self.overlay_disk;
+            std::thread::scope(|s| {
+                let storage_handle = s.spawn(|| storage_disk.ensure_formatted());
+                let overlay_result = overlay_disk.ensure_formatted();
 
-        // Pre-format overlay disk for persistent rootfs
-        if let Err(e) = self.overlay_disk.ensure_formatted() {
-            tracing::warn!(
-                error = %e,
-                "failed to pre-format overlay disk on host, will format in VM on first boot"
-            );
+                if let Err(e) = storage_handle.join().unwrap_or_else(|_| {
+                    Err(crate::Error::storage("format storage", "thread panicked"))
+                }) {
+                    tracing::warn!(
+                        error = %e,
+                        "failed to pre-format disk on host, will attempt format in VM. \
+                        For faster startup, install storage template or e2fsprogs"
+                    );
+                }
+                if let Err(e) = overlay_result {
+                    tracing::warn!(
+                        error = %e,
+                        "failed to pre-format overlay disk on host, will format in VM on first boot"
+                    );
+                }
+            });
         }
 
         // Install SIGCHLD handler to automatically reap zombie children.
