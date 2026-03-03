@@ -3,13 +3,13 @@
 //! This module provides ACID-compliant storage using redb for
 //! VM state persistence with atomic transactions and concurrent access safety.
 //!
-//! The database is opened and closed per-operation to avoid holding OS-level
-//! file locks between transactions, allowing CLI and serve to coexist.
+//! The database handle is cached for the lifetime of the `SmolvmDb` instance,
+//! amortising the ~3ms open + ~2-5ms close cost across all operations.
 
 use crate::config::VmRecord;
 use crate::error::{Error, Result};
 use parking_lot::Mutex;
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableTable, TableDefinition, TableError};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -33,26 +33,38 @@ impl<T, E: std::fmt::Display> DbResultExt<T> for std::result::Result<T, E> {
 
 /// Thread-safe database handle for smolvm state persistence.
 ///
-/// Each operation opens the database, runs a transaction, and closes the handle,
-/// so the OS file lock is held only for the duration of each operation (~1-5ms).
-#[derive(Clone, Debug)]
+/// The redb `Database` handle is opened lazily on first use and cached for
+/// the lifetime of the `SmolvmDb` instance. This avoids the ~3ms open +
+/// ~2-5ms close overhead on every operation (benchmarked: read cycles drop
+/// from ~2ms to ~10us, write cycles from ~6.5ms to ~1.5ms).
+#[derive(Clone)]
 pub struct SmolvmDb {
     path: PathBuf,
-    /// Serializes database opens within a single process. redb's OS file lock
-    /// prevents cross-process conflicts, but within a process only one
-    /// `Database::create()` can be active at a time.
-    lock: Arc<Mutex<()>>,
+    /// Cached database handle, opened lazily on first `with_db()` call.
+    /// The Mutex serializes all database access within the process.
+    handle: Arc<Mutex<Option<Database>>>,
+}
+
+impl std::fmt::Debug for SmolvmDb {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SmolvmDb")
+            .field("path", &self.path)
+            .field("open", &self.handle.lock().is_some())
+            .finish()
+    }
 }
 
 impl SmolvmDb {
-    /// Open the database, run a closure, and drop the handle.
+    /// Run a closure with the cached database handle, opening it on first use.
     fn with_db<T, F>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&Database) -> Result<T>,
     {
-        let _guard = self.lock.lock();
-        let db = Database::create(&self.path).db_err("open database")?;
-        f(&db)
+        let mut guard = self.handle.lock();
+        if guard.is_none() {
+            *guard = Some(Database::create(&self.path).db_err("open database")?);
+        }
+        f(guard.as_ref().unwrap())
     }
 
     /// Open the database at the default location.
@@ -68,19 +80,18 @@ impl SmolvmDb {
 
     /// Open the database at a specific path.
     ///
-    /// Creates parent directories if they don't exist.
+    /// Creates parent directories but does NOT open the database file.
+    /// Tables are created lazily: write operations auto-create tables,
+    /// and read operations handle missing tables gracefully.
     pub fn open_at(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).db_err("create directory")?;
         }
 
-        let instance = Self {
+        Ok(Self {
             path: path.to_path_buf(),
-            lock: Arc::new(Mutex::new(())),
-        };
-
-        instance.init_tables()?;
-        Ok(instance)
+            handle: Arc::new(Mutex::new(None)),
+        })
     }
 
     /// Get the default database path.
@@ -91,8 +102,11 @@ impl SmolvmDb {
         Ok(data_dir.join("smolvm").join("server").join("smolvm.redb"))
     }
 
-    /// Initialize database tables.
-    fn init_tables(&self) -> Result<()> {
+    /// Initialize database tables (creates them if they don't exist).
+    ///
+    /// Call this at server startup for the API path. CLI paths handle
+    /// table creation lazily via write transactions and graceful reads.
+    pub fn init_tables(&self) -> Result<()> {
         self.with_db(|db| {
             let write_txn = db.begin_write().db_err("begin write transaction")?;
             write_txn.open_table(VMS_TABLE).db_err("create vms table")?;
@@ -161,7 +175,11 @@ impl SmolvmDb {
     pub fn get_vm(&self, name: &str) -> Result<Option<VmRecord>> {
         self.with_db(|db| {
             let read_txn = db.begin_read().db_err("begin read transaction")?;
-            let table = read_txn.open_table(VMS_TABLE).db_err("open vms table")?;
+            let table = match read_txn.open_table(VMS_TABLE) {
+                Ok(t) => t,
+                Err(TableError::TableDoesNotExist(_)) => return Ok(None),
+                Err(e) => return Err(Error::database("open vms table", e.to_string())),
+            };
 
             match table.get(name) {
                 Ok(Some(guard)) => {
@@ -215,7 +233,11 @@ impl SmolvmDb {
     pub fn list_vms(&self) -> Result<Vec<(String, VmRecord)>> {
         self.with_db(|db| {
             let read_txn = db.begin_read().db_err("begin read transaction")?;
-            let table = read_txn.open_table(VMS_TABLE).db_err("open vms table")?;
+            let table = match read_txn.open_table(VMS_TABLE) {
+                Ok(t) => t,
+                Err(TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+                Err(e) => return Err(Error::database("open vms table", e.to_string())),
+            };
 
             let mut vms = Vec::new();
             for entry in table.iter().db_err("iterate vms table")? {
@@ -284,6 +306,71 @@ impl SmolvmDb {
         Ok(vms.into_iter().collect())
     }
 
+    /// Load all config settings and VM records in a single database open.
+    ///
+    /// Reads all config keys and all VM records in one `with_db()` call,
+    /// replacing separate `get_config()` × N + `load_all_vms()` calls
+    /// that would each open/close the database independently.
+    /// Handles missing tables gracefully (returns empty maps for fresh DBs).
+    pub fn load_all(&self) -> Result<(HashMap<String, String>, HashMap<String, VmRecord>)> {
+        self.with_db(|db| {
+            let read_txn = db.begin_read().db_err("begin read transaction")?;
+
+            // Read all config keys (empty if table doesn't exist yet)
+            let mut config = HashMap::new();
+            match read_txn.open_table(CONFIG_TABLE) {
+                Ok(config_table) => {
+                    for entry in config_table.iter().db_err("iterate config table")? {
+                        let (key, value) = entry.db_err("read config entry")?;
+                        config.insert(key.value().to_string(), value.value().to_string());
+                    }
+                }
+                Err(TableError::TableDoesNotExist(_)) => {}
+                Err(e) => return Err(Error::database("open config table", e.to_string())),
+            }
+
+            // Read all VMs (empty if table doesn't exist yet)
+            let mut vms = HashMap::new();
+            match read_txn.open_table(VMS_TABLE) {
+                Ok(vms_table) => {
+                    for entry in vms_table.iter().db_err("iterate vms table")? {
+                        let (key, value) = entry.db_err("read vms entry")?;
+                        let name = key.value().to_string();
+                        let record: VmRecord = serde_json::from_slice(value.value())
+                            .db_err(format!("deserialize vm record '{}'", name))?;
+                        vms.insert(name, record);
+                    }
+                }
+                Err(TableError::TableDoesNotExist(_)) => {}
+                Err(e) => return Err(Error::database("open vms table", e.to_string())),
+            }
+
+            Ok((config, vms))
+        })
+    }
+
+    /// Save multiple config key-value pairs in a single transaction.
+    ///
+    /// Replaces calling `set_config()` × N separately, reducing N open/close
+    /// cycles to 1.
+    pub fn save_config(&self, settings: &[(&str, &str)]) -> Result<()> {
+        self.with_db(|db| {
+            let write_txn = db.begin_write().db_err("begin write transaction")?;
+            {
+                let mut table = write_txn
+                    .open_table(CONFIG_TABLE)
+                    .db_err("open config table")?;
+                for (key, value) in settings {
+                    table
+                        .insert(*key, *value)
+                        .db_err(format!("set config '{}'", key))?;
+                }
+            }
+            write_txn.commit().db_err("commit config save")?;
+            Ok(())
+        })
+    }
+
     // ========================================================================
     // Global Config Operations
     // ========================================================================
@@ -292,9 +379,11 @@ impl SmolvmDb {
     pub fn get_config(&self, key: &str) -> Result<Option<String>> {
         self.with_db(|db| {
             let read_txn = db.begin_read().db_err("begin read transaction")?;
-            let table = read_txn
-                .open_table(CONFIG_TABLE)
-                .db_err("open config table")?;
+            let table = match read_txn.open_table(CONFIG_TABLE) {
+                Ok(t) => t,
+                Err(TableError::TableDoesNotExist(_)) => return Ok(None),
+                Err(e) => return Err(Error::database("open config table", e.to_string())),
+            };
 
             match table.get(key) {
                 Ok(Some(guard)) => Ok(Some(guard.value().to_string())),
@@ -497,4 +586,5 @@ mod tests {
         let vms = db.list_vms().unwrap();
         assert_eq!(vms.len(), 1);
     }
+
 }

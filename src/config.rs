@@ -148,34 +148,36 @@ impl SmolvmConfig {
 impl SmolvmConfig {
     /// Load configuration from the database.
     ///
-    /// Opens the database and loads all VM records into the in-memory cache.
-    /// If this is the first run and an old confy config exists, it will be
-    /// migrated automatically.
+    /// Opens the database and loads all config settings and VM records in a
+    /// single database transaction (1 open/close cycle instead of 6).
     pub fn load() -> Result<Self> {
         let db = SmolvmDb::open()?;
 
-        // Load global config settings with defaults
-        let version = db
-            .get_config("version")?
+        // Load all config + all VMs in one DB round-trip
+        let (config_map, vms) = db.load_all()?;
+
+        let version = config_map
+            .get("version")
             .and_then(|s| s.parse().ok())
             .unwrap_or(1);
-        let default_cpus = db
-            .get_config("default_cpus")?
+        let default_cpus = config_map
+            .get("default_cpus")
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_VM_CPUS);
-        let default_mem = db
-            .get_config("default_mem")?
+        let default_mem = config_map
+            .get("default_mem")
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_VM_MEMORY_MIB);
-        let default_dns = db
-            .get_config("default_dns")?
+        let default_dns = config_map
+            .get("default_dns")
+            .cloned()
             .unwrap_or_else(|| DEFAULT_DNS.to_string());
 
         #[cfg(target_os = "macos")]
-        let storage_volume = db.get_config("storage_volume")?.unwrap_or_default();
-
-        // Load all VMs into cache
-        let vms = db.load_all_vms()?;
+        let storage_volume = config_map
+            .get("storage_volume")
+            .cloned()
+            .unwrap_or_default();
 
         Ok(Self {
             db,
@@ -189,25 +191,39 @@ impl SmolvmConfig {
         })
     }
 
-    /// Save configuration to the database.
+    /// Save global configuration to the database.
     ///
-    /// This is now a no-op for VM records since writes are immediate.
-    /// Global config changes are persisted here.
+    /// Persists all global config settings in a single DB transaction
+    /// (1 open/close cycle instead of 4). VM records are not saved here
+    /// since writes are immediate via `update_vm()` and `insert_vm()`.
     pub fn save(&self) -> Result<()> {
-        // Persist global config settings
-        self.db.set_config("version", &self.version.to_string())?;
-        self.db
-            .set_config("default_cpus", &self.default_cpus.to_string())?;
-        self.db
-            .set_config("default_mem", &self.default_mem.to_string())?;
-        self.db.set_config("default_dns", &self.default_dns)?;
+        let version_str = self.version.to_string();
+        let cpus_str = self.default_cpus.to_string();
+        let mem_str = self.default_mem.to_string();
+
+        #[cfg(not(target_os = "macos"))]
+        let settings: Vec<(&str, &str)> = vec![
+            ("version", &version_str),
+            ("default_cpus", &cpus_str),
+            ("default_mem", &mem_str),
+            ("default_dns", &self.default_dns),
+        ];
 
         #[cfg(target_os = "macos")]
-        if !self.storage_volume.is_empty() {
-            self.db.set_config("storage_volume", &self.storage_volume)?;
-        }
+        let settings: Vec<(&str, &str)> = {
+            let mut s = vec![
+                ("version", &version_str),
+                ("default_cpus", &cpus_str),
+                ("default_mem", &mem_str),
+                ("default_dns", self.default_dns.as_str()),
+            ];
+            if !self.storage_volume.is_empty() {
+                s.push(("storage_volume", self.storage_volume.as_str()));
+            }
+            s
+        };
 
-        Ok(())
+        self.db.save_config(&settings)
     }
 
     /// Insert a VM record (persists immediately to database).
