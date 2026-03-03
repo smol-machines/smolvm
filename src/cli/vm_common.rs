@@ -9,6 +9,7 @@ use crate::cli::parsers::parse_mounts_as_tuples;
 use crate::cli::{format_pid_suffix, truncate};
 use smolvm::agent::{vm_data_dir, AgentManager, PortMapping};
 use smolvm::config::{RecordState, SmolvmConfig, VmRecord};
+use smolvm::db::SmolvmDb;
 
 // ============================================================================
 // VmKind
@@ -65,8 +66,10 @@ pub fn resolve_vm_name(name: Option<String>) -> smolvm::Result<Option<String>> {
     if name.is_some() {
         return Ok(name);
     }
-    let config = SmolvmConfig::load()?;
-    if config.get_vm("default").is_some() {
+    // Use direct DB lookup instead of SmolvmConfig::load() to avoid
+    // loading all config + all VMs just to check if "default" exists.
+    let db = SmolvmDb::open()?;
+    if db.get_vm("default")?.is_some() {
         Ok(Some("default".to_string()))
     } else {
         Ok(None)
@@ -322,16 +325,18 @@ pub fn create_vm(kind: VmKind, params: CreateVmParams) -> smolvm::Result<()> {
 // ============================================================================
 
 /// Start a named VM/sandbox that has a config record.
+///
+/// Uses direct DB operations instead of SmolvmConfig::load() to avoid
+/// loading all config settings and all VM records. Only reads the single
+/// named record (1 DB cycle) and updates it after start (1 DB cycle).
 pub fn start_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
     use smolvm::Error;
 
-    let mut config = SmolvmConfig::load()?;
-
-    // Get record
-    let record = config
-        .get_vm(name)
-        .ok_or_else(|| Error::vm_not_found(name))?
-        .clone();
+    // Direct DB lookup — 1 read cycle instead of loading everything
+    let db = SmolvmDb::open()?;
+    let record = db
+        .get_vm(name)?
+        .ok_or_else(|| Error::vm_not_found(name))?;
 
     // Check state
     let actual_state = record.actual_state();
@@ -376,17 +381,10 @@ pub fn start_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
         .ensure_running_with_full_config(mounts, ports, resources)
         .map_err(|e| Error::agent(format!("start {}", kind.label()), e.to_string()))?;
 
-    // Update state with PID start time for safe process identification
+    // Get PID immediately (cheap) and print output before DB write
     let pid = manager.child_pid();
-    let pid_start_time = pid.and_then(smolvm::process::process_start_time);
-    config.update_vm(name, |r| {
-        r.state = RecordState::Running;
-        r.pid = pid;
-        r.pid_start_time = pid_start_time;
-    });
-    config.save()?;
 
-    // Run init commands if configured
+    // Run init commands if configured (before reporting success)
     if !record.init.is_empty() {
         println!("Running {} init command(s)...", record.init.len());
         let mut client = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
@@ -410,6 +408,16 @@ pub fn start_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
         "\nUse 'smolvm container create {} <image>' to run containers",
         name,
     );
+
+    // Persist running state after output — 1 write cycle (not on critical path)
+    let pid_start_time = pid.and_then(smolvm::process::process_start_time);
+    if let Err(e) = db.update_vm(name, |r| {
+        r.state = RecordState::Running;
+        r.pid = pid;
+        r.pid_start_time = pid_start_time;
+    }) {
+        tracing::warn!(error = %e, vm = %name, "failed to persist running state");
+    }
 
     // Keep VM running (persistent)
     manager.detach();
@@ -660,9 +668,8 @@ pub fn delete_vm(
         }
     }
 
-    // Remove from config
+    // Remove from config (persists immediately to database)
     config.remove_vm(name);
-    config.save()?;
 
     let data_dir = vm_data_dir(name);
     if data_dir.exists() {
