@@ -1,6 +1,6 @@
 //! Smolfile parser for declarative VM configuration.
 //!
-//! A Smolfile is a TOML file that defines VM configuration and init commands.
+//! A Smolfile is a TOML file that defines VM configuration, setup, and entrypoint commands.
 //! It is only loaded when explicitly specified via `--smolfile`/`-s`.
 //!
 //! Example Smolfile:
@@ -14,8 +14,11 @@
 //! env = ["NODE_ENV=production"]
 //! workdir = "/app"
 //!
-//! init = [
-//!     "apk add --no-cache openssh",
+//! setup = [
+//!     "apk add --no-cache openssh nodejs npm",
+//! ]
+//!
+//! entrypoint = [
 //!     "ssh-keygen -A",
 //!     "/usr/sbin/sshd",
 //! ]
@@ -41,7 +44,9 @@ pub struct Smolfile {
     #[serde(default)]
     pub env: Vec<String>,
     #[serde(default)]
-    pub init: Vec<String>,
+    pub setup: Vec<String>,
+    #[serde(default)]
+    pub entrypoint: Vec<String>,
     pub workdir: Option<String>,
     pub storage: Option<u64>,
     pub overlay: Option<u64>,
@@ -69,7 +74,8 @@ pub fn build_create_params(
     cli_volume: Vec<String>,
     cli_port: Vec<PortMapping>,
     cli_net: bool,
-    cli_init: Vec<String>,
+    cli_setup: Vec<String>,
+    cli_entrypoint: Vec<String>,
     cli_env: Vec<String>,
     cli_workdir: Option<String>,
     smolfile_path: Option<PathBuf>,
@@ -86,7 +92,8 @@ pub fn build_create_params(
                 volume: cli_volume,
                 port: cli_port,
                 net: cli_net,
-                init: cli_init,
+                setup: cli_setup,
+                entrypoint: cli_entrypoint,
                 env: cli_env,
                 workdir: cli_workdir,
                 storage_gb: cli_storage_gb,
@@ -102,20 +109,19 @@ pub fn build_create_params(
         .map(|s| parse_port(s))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| smolvm::Error::config("smolfile ports", e))?;
-    // CLI ports override/extend
     ports.extend(cli_port);
 
-    // Merge volumes: Smolfile first, CLI extends
     let mut volumes = sf.volumes;
     volumes.extend(cli_volume);
 
-    // Merge env: Smolfile first, CLI extends
     let mut env = sf.env;
     env.extend(cli_env);
 
-    // Merge init: Smolfile first, CLI extends
-    let mut init = sf.init;
-    init.extend(cli_init);
+    let mut setup = sf.setup;
+    setup.extend(cli_setup);
+
+    let mut entrypoint = sf.entrypoint;
+    entrypoint.extend(cli_entrypoint);
 
     // Scalars: CLI non-default overrides Smolfile
     let default_cpus = smolvm::agent::DEFAULT_CPUS;
@@ -141,7 +147,6 @@ pub fn build_create_params(
 
     let workdir = cli_workdir.or(sf.workdir);
 
-    // Scalars: CLI overrides Smolfile
     let storage_gb = cli_storage_gb.or(sf.storage);
     let overlay_gb = cli_overlay_gb.or(sf.overlay);
 
@@ -152,7 +157,8 @@ pub fn build_create_params(
         volume: volumes,
         port: ports,
         net,
-        init,
+        setup,
+        entrypoint,
         env,
         workdir,
         storage_gb,

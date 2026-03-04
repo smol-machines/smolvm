@@ -60,7 +60,7 @@ impl VmKind {
 
 /// Resolve an optional VM name: if no name is given and a VM named "default"
 /// exists in the config database, return `Some("default")` so callers route
-/// through the named-VM code path (which loads config, init commands, network
+/// through the named-VM code path (which loads config, setup/entrypoint commands, network
 /// settings, etc.). Otherwise returns the input unchanged.
 pub fn resolve_vm_name(name: Option<String>) -> smolvm::Result<Option<String>> {
     if name.is_some() {
@@ -175,7 +175,8 @@ pub struct CreateVmParams {
     pub volume: Vec<String>,
     pub port: Vec<PortMapping>,
     pub net: bool,
-    pub init: Vec<String>,
+    pub setup: Vec<String>,
+    pub entrypoint: Vec<String>,
     pub env: Vec<String>,
     pub workdir: Option<String>,
     pub storage_gb: Option<u64>,
@@ -263,7 +264,7 @@ pub fn create_vm(kind: VmKind, params: CreateVmParams) -> smolvm::Result<()> {
     // Convert port mappings to tuple format for storage
     let ports: Vec<(u16, u16)> = params.port.iter().map(|p| (p.host, p.guest)).collect();
 
-    // Parse environment variables for init
+    // Parse environment variables for setup/entrypoint
     let env: Vec<(String, String)> = params
         .env
         .iter()
@@ -286,7 +287,8 @@ pub fn create_vm(kind: VmKind, params: CreateVmParams) -> smolvm::Result<()> {
         ports,
         params.net,
     );
-    record.init = params.init.clone();
+    record.setup = params.setup.clone();
+    record.entrypoint = params.entrypoint.clone();
     record.env = env;
     record.workdir = params.workdir.clone();
     record.storage_gb = params.storage_gb;
@@ -303,8 +305,11 @@ pub fn create_vm(kind: VmKind, params: CreateVmParams) -> smolvm::Result<()> {
     if !params.port.is_empty() {
         println!("  Ports: {}", params.port.len());
     }
-    if !params.init.is_empty() {
-        println!("  Init commands: {}", params.init.len());
+    if !params.setup.is_empty() {
+        println!("  Setup commands: {}", params.setup.len());
+    }
+    if !params.entrypoint.is_empty() {
+        println!("  Entrypoint commands: {}", params.entrypoint.len());
     }
     println!(
         "\nUse '{} start {}' to start the {}",
@@ -382,16 +387,34 @@ pub fn start_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
     // Get PID immediately (cheap) and print output before DB write
     let pid = manager.child_pid();
 
-    // Run init commands if configured (before reporting success)
-    if !record.init.is_empty() {
-        println!("Running {} init command(s)...", record.init.len());
+    // Run setup commands once (if not already completed)
+    let needs_setup = !record.setup.is_empty() && !record.setup_completed;
+    let has_entrypoint = !record.entrypoint.is_empty();
+
+    if needs_setup || has_entrypoint {
         let mut client = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
-        for (i, cmd) in record.init.iter().enumerate() {
-            let argv = vec!["sh".into(), "-c".into(), cmd.clone()];
-            let (exit_code, _stdout, stderr) =
-                client.vm_exec(argv, record.env.clone(), record.workdir.clone(), None)?;
-            if exit_code != 0 {
-                eprintln!("init[{}] failed (exit {}): {}", i, exit_code, stderr.trim());
+
+        if needs_setup {
+            println!("Running {} setup command(s)...", record.setup.len());
+            for (i, cmd) in record.setup.iter().enumerate() {
+                let argv = vec!["sh".into(), "-c".into(), cmd.clone()];
+                let (exit_code, _stdout, stderr) =
+                    client.vm_exec(argv, record.env.clone(), record.workdir.clone(), None)?;
+                if exit_code != 0 {
+                    eprintln!("setup[{}] failed (exit {}): {}", i, exit_code, stderr.trim());
+                }
+            }
+        }
+
+        if has_entrypoint {
+            println!("Running {} entrypoint command(s)...", record.entrypoint.len());
+            for (i, cmd) in record.entrypoint.iter().enumerate() {
+                let argv = vec!["sh".into(), "-c".into(), cmd.clone()];
+                let (exit_code, _stdout, stderr) =
+                    client.vm_exec(argv, record.env.clone(), record.workdir.clone(), None)?;
+                if exit_code != 0 {
+                    eprintln!("entrypoint[{}] failed (exit {}): {}", i, exit_code, stderr.trim());
+                }
             }
         }
     }
@@ -413,6 +436,9 @@ pub fn start_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
         r.state = RecordState::Running;
         r.pid = pid;
         r.pid_start_time = pid_start_time;
+        if needs_setup {
+            r.setup_completed = true;
+        }
     }) {
         tracing::warn!(error = %e, vm = %name, "failed to persist running state");
     }
@@ -459,7 +485,8 @@ pub fn persist_default_running(
                 r.network = o.network;
                 r.storage_gb = o.storage_gb;
                 r.overlay_gb = o.overlay_gb;
-                r.init = o.init.clone();
+                r.setup = o.setup.clone();
+                r.entrypoint = o.entrypoint.clone();
                 r.env = o.env.clone();
                 r.workdir = o.workdir.clone();
             }
@@ -479,7 +506,8 @@ pub struct DefaultVmOverrides {
     pub network: bool,
     pub storage_gb: Option<u64>,
     pub overlay_gb: Option<u64>,
-    pub init: Vec<String>,
+    pub setup: Vec<String>,
+    pub entrypoint: Vec<String>,
     pub env: Vec<(String, String)>,
     pub workdir: Option<String>,
 }
@@ -505,20 +533,47 @@ pub fn start_vm_default(kind: VmKind) -> smolvm::Result<()> {
     let mut config = SmolvmConfig::load()?;
     persist_default_running(&mut config, manager.child_pid(), None);
 
-    // Run init commands if the default record has them (persisted from sandbox run -d -s)
+    // Run setup/entrypoint commands if the default record has them
     let record = config.get_vm("default").cloned();
 
     if let Some(record) = record {
-        if !record.init.is_empty() {
-            println!("Running {} init command(s)...", record.init.len());
+        let needs_setup = !record.setup.is_empty() && !record.setup_completed;
+        let has_entrypoint = !record.entrypoint.is_empty();
+
+        if needs_setup || has_entrypoint {
             let mut client =
                 smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
-            for (i, cmd) in record.init.iter().enumerate() {
-                let argv = vec!["sh".into(), "-c".into(), cmd.clone()];
-                let (exit_code, _stdout, stderr) =
-                    client.vm_exec(argv, record.env.clone(), record.workdir.clone(), None)?;
-                if exit_code != 0 {
-                    eprintln!("init[{}] failed (exit {}): {}", i, exit_code, stderr.trim());
+
+            if needs_setup {
+                println!("Running {} setup command(s)...", record.setup.len());
+                for (i, cmd) in record.setup.iter().enumerate() {
+                    let argv = vec!["sh".into(), "-c".into(), cmd.clone()];
+                    let (exit_code, _stdout, stderr) =
+                        client.vm_exec(argv, record.env.clone(), record.workdir.clone(), None)?;
+                    if exit_code != 0 {
+                        eprintln!("setup[{}] failed (exit {}): {}", i, exit_code, stderr.trim());
+                    }
+                }
+                config.update_vm("default", |r| {
+                    r.setup_completed = true;
+                });
+            }
+
+            if has_entrypoint {
+                println!(
+                    "Running {} entrypoint command(s)...",
+                    record.entrypoint.len()
+                );
+                for (i, cmd) in record.entrypoint.iter().enumerate() {
+                    let argv = vec!["sh".into(), "-c".into(), cmd.clone()];
+                    let (exit_code, _stdout, stderr) =
+                        client.vm_exec(argv, record.env.clone(), record.workdir.clone(), None)?;
+                    if exit_code != 0 {
+                        eprintln!(
+                            "entrypoint[{}] failed (exit {}): {}",
+                            i, exit_code, stderr.trim()
+                        );
+                    }
                 }
             }
         }
@@ -790,8 +845,11 @@ pub fn list_vms(kind: VmKind, verbose: bool, json: bool) -> smolvm::Result<()> {
                 if kind.include_network_in_json() && record.network {
                     println!("  Network: enabled");
                 }
-                for cmd in &record.init {
-                    println!("  Init: {}", cmd);
+                for cmd in &record.setup {
+                    println!("  Setup: {}", cmd);
+                }
+                for cmd in &record.entrypoint {
+                    println!("  Entrypoint: {}", cmd);
                 }
                 for (k, v) in &record.env {
                     println!("  Env: {}={}", k, v);

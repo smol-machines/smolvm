@@ -344,6 +344,7 @@ impl RunCmd {
             self.port,
             self.net,
             vec![],
+            vec![],
             self.env,
             self.workdir,
             self.smolfile,
@@ -406,15 +407,28 @@ impl RunCmd {
         // Pull image with progress display
         crate::cli::pull_with_progress(&mut client, &self.image, self.oci_platform.as_deref())?;
 
-        // Run init commands from Smolfile only on fresh VM start (not when reusing)
-        if freshly_started && !params.init.is_empty() {
-            for (i, cmd) in params.init.iter().enumerate() {
+        // Run setup commands from Smolfile only on fresh VM start (not when reusing)
+        if freshly_started && !params.setup.is_empty() {
+            for (i, cmd) in params.setup.iter().enumerate() {
                 let argv = vec!["sh".into(), "-c".into(), cmd.clone()];
-                let init_env = parse_env_list(&params.env);
+                let setup_env = parse_env_list(&params.env);
                 let (exit_code, _stdout, stderr) =
-                    client.vm_exec(argv, init_env, params.workdir.clone(), None)?;
+                    client.vm_exec(argv, setup_env, params.workdir.clone(), None)?;
                 if exit_code != 0 {
-                    eprintln!("init[{}] failed (exit {}): {}", i, exit_code, stderr.trim());
+                    eprintln!("setup[{}] failed (exit {}): {}", i, exit_code, stderr.trim());
+                }
+            }
+        }
+
+        // Run entrypoint commands on every start
+        if !params.entrypoint.is_empty() {
+            for (i, cmd) in params.entrypoint.iter().enumerate() {
+                let argv = vec!["sh".into(), "-c".into(), cmd.clone()];
+                let ep_env = parse_env_list(&params.env);
+                let (exit_code, _stdout, stderr) =
+                    client.vm_exec(argv, ep_env, params.workdir.clone(), None)?;
+                if exit_code != 0 {
+                    eprintln!("entrypoint[{}] failed (exit {}): {}", i, exit_code, stderr.trim());
                 }
             }
         }
@@ -474,7 +488,8 @@ impl RunCmd {
                             network: params.net,
                             storage_gb: params.storage_gb,
                             overlay_gb: params.overlay_gb,
-                            init: params.init.clone(),
+                            setup: params.setup.clone(),
+                            entrypoint: params.entrypoint.clone(),
                             env: parse_env_list(&params.env),
                             workdir: params.workdir.clone(),
                         }),
@@ -585,15 +600,19 @@ pub struct CreateCmd {
     #[arg(long)]
     pub net: bool,
 
-    /// Run command on every VM start (can be used multiple times)
-    #[arg(long = "init", value_name = "COMMAND")]
-    pub init: Vec<String>,
+    /// Run command once on first VM start (can be used multiple times)
+    #[arg(long = "setup", value_name = "COMMAND")]
+    pub setup: Vec<String>,
 
-    /// Set environment variable for init commands (can be used multiple times)
+    /// Run command on every VM start (can be used multiple times)
+    #[arg(long = "entrypoint", value_name = "COMMAND")]
+    pub entrypoint: Vec<String>,
+
+    /// Set environment variable for setup/entrypoint commands (can be used multiple times)
     #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
     pub env: Vec<String>,
 
-    /// Set working directory for init commands
+    /// Set working directory for setup/entrypoint commands
     #[arg(short = 'w', long = "workdir", value_name = "DIR")]
     pub workdir: Option<String>,
 
@@ -611,7 +630,8 @@ impl CreateCmd {
             self.volume,
             self.port,
             self.net,
-            self.init,
+            self.setup,
+            self.entrypoint,
             self.env,
             self.workdir,
             self.smolfile,

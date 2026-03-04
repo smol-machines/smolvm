@@ -21,10 +21,14 @@ net = true                 # outbound networking (default: false)
 ports = ["8080:80"]        # HOST:GUEST port mapping
 volumes = ["./src:/app"]   # HOST:GUEST[:ro] volume mounts
 env = ["KEY=VALUE"]        # environment variables
-workdir = "/app"           # working directory for init commands
+workdir = "/app"           # working directory for setup/entrypoint commands
 storage = 40               # storage disk GiB (default: 20)
 overlay = 4                # overlay disk GiB (default: 2)
-init = ["apk add git"]     # commands run on every VM start
+setup = ["apk add git"]    # commands run once on first VM start
+entrypoint = ["sshd"]      # commands run on every VM start
 ```
 
 All fields are optional. CLI flags override scalar values; array values are merged.
+
+`setup` runs once (tracked in the DB — won't re-run on subsequent starts).
+`entrypoint` runs on every VM start.

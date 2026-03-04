@@ -10,6 +10,6 @@ net = true
 
 ports = ["3000:3000"]
 
-init = [
+setup = [
     "apk add --no-cache nodejs npm",
 ]

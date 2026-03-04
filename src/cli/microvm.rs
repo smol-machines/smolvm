@@ -186,15 +186,19 @@ pub struct CreateCmd {
     #[arg(long)]
     pub net: bool,
 
-    /// Run command on every VM start (can be used multiple times)
-    #[arg(long = "init", value_name = "COMMAND")]
-    pub init: Vec<String>,
+    /// Run command once on first VM start (can be used multiple times)
+    #[arg(long = "setup", value_name = "COMMAND")]
+    pub setup: Vec<String>,
 
-    /// Set environment variable for init commands (can be used multiple times)
+    /// Run command on every VM start (can be used multiple times)
+    #[arg(long = "entrypoint", value_name = "COMMAND")]
+    pub entrypoint: Vec<String>,
+
+    /// Set environment variable for setup/entrypoint commands (can be used multiple times)
     #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
     pub env: Vec<String>,
 
-    /// Set working directory for init commands
+    /// Set working directory for setup/entrypoint commands
     #[arg(short = 'w', long = "workdir", value_name = "DIR")]
     pub workdir: Option<String>,
 
@@ -212,7 +216,8 @@ impl CreateCmd {
             self.volume,
             self.port,
             self.net,
-            self.init,
+            self.setup,
+            self.entrypoint,
             self.env,
             self.workdir,
             self.smolfile,

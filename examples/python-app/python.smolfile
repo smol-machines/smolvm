@@ -10,6 +10,6 @@ net = true
 
 ports = ["8080:8080"]
 
-init = [
+setup = [
     "apk add --no-cache python3",
 ]

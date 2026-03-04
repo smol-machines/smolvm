@@ -2,8 +2,8 @@
 #
 # Smolfile tests for smolvm.
 #
-# Tests the `--smolfile` and `--init` functionality for both
-# microvm and sandbox create commands.
+# Tests the `--smolfile`, `--setup`, and `--entrypoint` functionality
+# for both microvm and sandbox create commands.
 #
 # Usage:
 #   ./tests/test_smolfile.sh
@@ -37,63 +37,63 @@ cleanup_vm() {
 }
 
 # =============================================================================
-# --init flag (no Smolfile)
+# --entrypoint flag (no Smolfile)
 # =============================================================================
 
-test_init_flag_creates_file() {
-    local vm_name="smolfile-init-flag-$$"
+test_entrypoint_flag_creates_file() {
+    local vm_name="smolfile-ep-flag-$$"
     cleanup_vm "$vm_name"
 
-    # Create VM with --init that creates a marker file
-    $SMOLVM microvm create "$vm_name" --init "echo 'init-ran' > /tmp/init-marker.txt" 2>&1 || return 1
+    # Create VM with --entrypoint that creates a marker file
+    $SMOLVM microvm create "$vm_name" --entrypoint "echo 'ep-ran' > /tmp/ep-marker.txt" 2>&1 || return 1
 
-    # Start VM (init should run)
+    # Start VM (entrypoint should run)
     $SMOLVM microvm start "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
 
-    # Verify the init command ran
+    # Verify the entrypoint command ran
     local output
-    output=$($SMOLVM microvm exec --name "$vm_name" -- cat /tmp/init-marker.txt 2>&1)
+    output=$($SMOLVM microvm exec --name "$vm_name" -- cat /tmp/ep-marker.txt 2>&1)
 
     cleanup_vm "$vm_name"
-    [[ "$output" == *"init-ran"* ]]
+    [[ "$output" == *"ep-ran"* ]]
 }
 
-test_init_flag_multiple_commands() {
-    local vm_name="smolfile-multi-init-$$"
+test_entrypoint_flag_multiple_commands() {
+    local vm_name="smolfile-multi-ep-$$"
     cleanup_vm "$vm_name"
 
-    # Create VM with multiple --init flags
+    # Create VM with multiple --entrypoint flags
     $SMOLVM microvm create "$vm_name" \
-        --init "echo 'first' > /tmp/init1.txt" \
-        --init "echo 'second' > /tmp/init2.txt" \
+        --entrypoint "echo 'first' > /tmp/ep1.txt" \
+        --entrypoint "echo 'second' > /tmp/ep2.txt" \
         2>&1 || return 1
 
     # Start VM
     $SMOLVM microvm start "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
 
-    # Verify both init commands ran
+    # Verify both entrypoint commands ran
     local out1 out2
-    out1=$($SMOLVM microvm exec --name "$vm_name" -- cat /tmp/init1.txt 2>&1)
-    out2=$($SMOLVM microvm exec --name "$vm_name" -- cat /tmp/init2.txt 2>&1)
+    out1=$($SMOLVM microvm exec --name "$vm_name" -- cat /tmp/ep1.txt 2>&1)
+    out2=$($SMOLVM microvm exec --name "$vm_name" -- cat /tmp/ep2.txt 2>&1)
 
     cleanup_vm "$vm_name"
     [[ "$out1" == *"first"* ]] && [[ "$out2" == *"second"* ]]
 }
 
-test_init_flag_with_env() {
-    local vm_name="smolfile-init-env-$$"
+test_entrypoint_flag_with_env() {
+    local vm_name="smolfile-ep-env-$$"
     cleanup_vm "$vm_name"
 
-    # Create VM with --init and -e
+    # Create VM with --entrypoint and -e
     $SMOLVM microvm create "$vm_name" \
         -e MY_VAR=hello_from_env \
-        --init 'echo "$MY_VAR" > /tmp/env-test.txt' \
+        --entrypoint 'echo "$MY_VAR" > /tmp/env-test.txt' \
         2>&1 || return 1
 
     # Start VM
     $SMOLVM microvm start "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
 
-    # Verify env was passed to init
+    # Verify env was passed to entrypoint
     local output
     output=$($SMOLVM microvm exec --name "$vm_name" -- cat /tmp/env-test.txt 2>&1)
 
@@ -101,14 +101,14 @@ test_init_flag_with_env() {
     [[ "$output" == *"hello_from_env"* ]]
 }
 
-test_init_flag_with_workdir() {
-    local vm_name="smolfile-init-wd-$$"
+test_entrypoint_flag_with_workdir() {
+    local vm_name="smolfile-ep-wd-$$"
     cleanup_vm "$vm_name"
 
-    # Create VM with --init and -w
+    # Create VM with --entrypoint and -w
     $SMOLVM microvm create "$vm_name" \
         -w /tmp \
-        --init "pwd > cwd.txt" \
+        --entrypoint "pwd > cwd.txt" \
         2>&1 || return 1
 
     # Start VM
@@ -122,13 +122,13 @@ test_init_flag_with_workdir() {
     [[ "$output" == *"/tmp"* ]]
 }
 
-test_init_runs_on_every_start() {
+test_entrypoint_runs_on_every_start() {
     local vm_name="smolfile-restart-$$"
     cleanup_vm "$vm_name"
 
-    # Create VM with --init that appends to a file
+    # Create VM with --entrypoint that appends to a file
     $SMOLVM microvm create "$vm_name" \
-        --init 'echo "boot" >> /tmp/boot-count.txt' \
+        --entrypoint 'echo "boot" >> /tmp/boot-count.txt' \
         2>&1 || return 1
 
     # First start
@@ -150,8 +150,61 @@ test_init_runs_on_every_start() {
 
     # First boot should have 1 line, second boot should have 2
     # (boot-count.txt is in tmpfs, so it resets between VM stops —
-    #  but the init command should run each time)
+    #  but the entrypoint command should run each time)
     [[ "$count1" == *"1"* ]]
+}
+
+# =============================================================================
+# --setup flag (runs once)
+# =============================================================================
+
+test_setup_runs_once() {
+    local vm_name="smolfile-setup-once-$$"
+    cleanup_vm "$vm_name"
+
+    # Create VM with --setup that creates a marker
+    $SMOLVM microvm create "$vm_name" \
+        --setup "echo 'setup-done' > /tmp/setup-marker.txt" \
+        2>&1 || return 1
+
+    # First start — setup should run
+    $SMOLVM microvm start "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
+
+    local output
+    output=$($SMOLVM microvm exec --name "$vm_name" -- cat /tmp/setup-marker.txt 2>&1)
+    if [[ "$output" != *"setup-done"* ]]; then
+        cleanup_vm "$vm_name"
+        return 1
+    fi
+
+    # Stop, then start again — setup should NOT run (already completed)
+    $SMOLVM microvm stop "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
+    local start_output
+    start_output=$($SMOLVM microvm start "$vm_name" 2>&1)
+
+    cleanup_vm "$vm_name"
+
+    # Second start output should NOT mention setup
+    [[ "$start_output" != *"setup command"* ]]
+}
+
+test_setup_and_entrypoint_together() {
+    local vm_name="smolfile-both-$$"
+    cleanup_vm "$vm_name"
+
+    $SMOLVM microvm create "$vm_name" \
+        --setup "echo 'installed' > /tmp/setup.txt" \
+        --entrypoint "echo 'booted' > /tmp/ep.txt" \
+        2>&1 || return 1
+
+    $SMOLVM microvm start "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
+
+    local setup_out ep_out
+    setup_out=$($SMOLVM microvm exec --name "$vm_name" -- cat /tmp/setup.txt 2>&1)
+    ep_out=$($SMOLVM microvm exec --name "$vm_name" -- cat /tmp/ep.txt 2>&1)
+
+    cleanup_vm "$vm_name"
+    [[ "$setup_out" == *"installed"* ]] && [[ "$ep_out" == *"booted"* ]]
 }
 
 # =============================================================================
@@ -167,8 +220,8 @@ test_smolfile_basic() {
 cpus = 2
 memory = 1024
 
-init = [
-    "echo 'smolfile-init-ran' > /tmp/smolfile-marker.txt",
+setup = [
+    "echo 'smolfile-setup-ran' > /tmp/smolfile-marker.txt",
 ]
 EOF
 
@@ -184,14 +237,14 @@ EOF
         return 1
     fi
 
-    # Start and verify init ran
+    # Start and verify setup ran
     $SMOLVM microvm start "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
 
     local output
     output=$($SMOLVM microvm exec --name "$vm_name" -- cat /tmp/smolfile-marker.txt 2>&1)
 
     cleanup_vm "$vm_name"
-    [[ "$output" == *"smolfile-init-ran"* ]]
+    [[ "$output" == *"smolfile-setup-ran"* ]]
 }
 
 test_smolfile_with_env() {
@@ -201,7 +254,7 @@ test_smolfile_with_env() {
     cat > "$SMOLFILE_TMPDIR/Smolfile.env" <<'EOF'
 env = ["GREETING=hello_from_smolfile"]
 
-init = [
+entrypoint = [
     'echo "$GREETING" > /tmp/greeting.txt',
 ]
 EOF
@@ -237,20 +290,20 @@ EOF
     [[ "$list_output" == *'"memory_mib": 1024'* ]] && [[ "$list_output" == *'"cpus": 2'* ]]
 }
 
-test_smolfile_cli_extends_init() {
+test_smolfile_cli_extends_entrypoint() {
     local vm_name="smolfile-extend-$$"
     cleanup_vm "$vm_name"
 
     cat > "$SMOLFILE_TMPDIR/Smolfile.extend" <<'EOF'
-init = [
+entrypoint = [
     "echo 'from-smolfile' > /tmp/source.txt",
 ]
 EOF
 
-    # CLI --init should extend, not replace
+    # CLI --entrypoint should extend, not replace
     $SMOLVM microvm create "$vm_name" \
         --smolfile "$SMOLFILE_TMPDIR/Smolfile.extend" \
-        --init "echo 'from-cli' > /tmp/cli-source.txt" \
+        --entrypoint "echo 'from-cli' > /tmp/cli-source.txt" \
         2>&1 || return 1
 
     $SMOLVM microvm start "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
@@ -313,7 +366,7 @@ test_no_auto_detection() {
     cat > "$SMOLFILE_TMPDIR/Smolfile" <<'EOF'
 cpus = 4
 memory = 2048
-init = ["echo 'should-not-run' > /tmp/noauto.txt"]
+setup = ["echo 'should-not-run' > /tmp/noauto.txt"]
 EOF
 
     # Create VM WITHOUT --smolfile, even though Smolfile exists in CWD
@@ -334,13 +387,13 @@ EOF
 # Verbose output
 # =============================================================================
 
-test_ls_verbose_shows_init() {
+test_ls_verbose_shows_setup_entrypoint() {
     local vm_name="smolfile-verbose-$$"
     cleanup_vm "$vm_name"
 
     $SMOLVM microvm create "$vm_name" \
-        --init "echo hello" \
-        --init "echo world" \
+        --setup "apk add git" \
+        --entrypoint "echo hello" \
         -e FOO=bar \
         -w /app \
         2>&1 || return 1
@@ -350,8 +403,10 @@ test_ls_verbose_shows_init() {
 
     cleanup_vm "$vm_name"
 
-    # Should show init commands, env, and workdir in verbose output
-    [[ "$verbose_output" == *"Init:"* ]] && \
+    # Should show setup, entrypoint, env, and workdir in verbose output
+    [[ "$verbose_output" == *"Setup:"* ]] && \
+    [[ "$verbose_output" == *"apk add git"* ]] && \
+    [[ "$verbose_output" == *"Entrypoint:"* ]] && \
     [[ "$verbose_output" == *"echo hello"* ]] && \
     [[ "$verbose_output" == *"Env:"* ]] && \
     [[ "$verbose_output" == *"FOO=bar"* ]] && \
@@ -363,19 +418,21 @@ test_ls_verbose_shows_init() {
 # Run Tests
 # =============================================================================
 
-run_test "Init flag creates marker file" test_init_flag_creates_file || true
-run_test "Init flag multiple commands" test_init_flag_multiple_commands || true
-run_test "Init flag with env" test_init_flag_with_env || true
-run_test "Init flag with workdir" test_init_flag_with_workdir || true
-run_test "Init runs on every start" test_init_runs_on_every_start || true
-run_test "Smolfile basic (cpus + init)" test_smolfile_basic || true
+run_test "Entrypoint flag creates marker file" test_entrypoint_flag_creates_file || true
+run_test "Entrypoint flag multiple commands" test_entrypoint_flag_multiple_commands || true
+run_test "Entrypoint flag with env" test_entrypoint_flag_with_env || true
+run_test "Entrypoint flag with workdir" test_entrypoint_flag_with_workdir || true
+run_test "Entrypoint runs on every start" test_entrypoint_runs_on_every_start || true
+run_test "Setup runs once" test_setup_runs_once || true
+run_test "Setup and entrypoint together" test_setup_and_entrypoint_together || true
+run_test "Smolfile basic (cpus + setup)" test_smolfile_basic || true
 run_test "Smolfile with env" test_smolfile_with_env || true
 run_test "Smolfile CLI overrides scalars" test_smolfile_cli_overrides_scalars || true
-run_test "Smolfile CLI extends init" test_smolfile_cli_extends_init || true
+run_test "Smolfile CLI extends entrypoint" test_smolfile_cli_extends_entrypoint || true
 run_test "Smolfile not found errors" test_smolfile_not_found_errors || true
 run_test "Smolfile invalid TOML errors" test_smolfile_invalid_toml_errors || true
 run_test "Smolfile unknown field errors" test_smolfile_unknown_field_errors || true
 run_test "No auto-detection of Smolfile" test_no_auto_detection || true
-run_test "ls --verbose shows init/env/workdir" test_ls_verbose_shows_init || true
+run_test "ls --verbose shows setup/entrypoint/env/workdir" test_ls_verbose_shows_setup_entrypoint || true
 
 print_summary "Smolfile Tests"

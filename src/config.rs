@@ -328,15 +328,23 @@ pub struct VmRecord {
     #[serde(default)]
     pub last_exit_code: Option<i32>,
 
+    /// Commands to run once on first boot (via `sh -c`).
+    #[serde(default)]
+    pub setup: Vec<String>,
+
+    /// Whether setup commands have already been executed.
+    #[serde(default)]
+    pub setup_completed: bool,
+
     /// Commands to run on every VM start (via `sh -c`).
     #[serde(default)]
-    pub init: Vec<String>,
+    pub entrypoint: Vec<String>,
 
-    /// Environment variables for init commands.
+    /// Environment variables for setup/entrypoint commands.
     #[serde(default)]
     pub env: Vec<(String, String)>,
 
-    /// Working directory for init commands.
+    /// Working directory for setup/entrypoint commands.
     #[serde(default)]
     pub workdir: Option<String>,
 
@@ -380,7 +388,9 @@ impl VmRecord {
             network,
             restart: RestartConfig::default(),
             last_exit_code: None,
-            init: Vec::new(),
+            setup: Vec::new(),
+            setup_completed: false,
+            entrypoint: Vec::new(),
             env: Vec::new(),
             workdir: None,
             storage_gb: None,
@@ -411,7 +421,9 @@ impl VmRecord {
             network,
             restart,
             last_exit_code: None,
-            init: Vec::new(),
+            setup: Vec::new(),
+            setup_completed: false,
+            entrypoint: Vec::new(),
             env: Vec::new(),
             workdir: None,
             storage_gb: None,
