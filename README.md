@@ -1,6 +1,6 @@
 # smolVM
 
-Run microVMs locally to sandbox workloads.
+Build and run portable, lightweight, self-contained virtual machines.
 
 > **Alpha** - APIs can change, there may be bugs. [Report issues](https://github.com/smol-machines/smolvm/issues)
 
@@ -10,11 +10,14 @@ Run microVMs locally to sandbox workloads.
 # install (macOS only, Linux coming soon)
 curl -sSL https://smolmachines.com/install.sh | bash
 
-# sandbox - ephemeral isolated environments
-smolvm sandbox run --net alpine:latest -- echo "hello"
-smolvm sandbox run --net -v /tmp:/workspace alpine:latest -- ls /workspace
+# pack - build a portable, executable virtual machine
+smolvm pack alpine:latest -o ./my-sandbox        # creates ./my-sandbox + ./my-sandbox.smolmachine
+smolvm pack alpine:latest -o ./my-sandbox --single-file  # single executable, no sidecar
 
-smolvm sandbox run --net python:3.12-alpine -- python -V
+./my-sandbox uname -a # runs inside the guest linux vm
+
+smolvm pack python:3.12-alpine -o ./my-pythonvm
+./my-pythonvm python3 -c "import sys; print(sys.version)"
 
 # microvm - persistent linux VMs
 smolvm microvm start
@@ -23,14 +26,11 @@ smolvm microvm exec -- echo "hello"
 smolvm microvm exec -it -- /bin/sh   # interactive shell (exit with Ctrl+D)
 smolvm microvm stop
 
-# pack - build a portable, executable virtual machine.
-smolvm pack create alpine:latest -o ./my-sandbox        # creates ./my-sandbox + ./my-sandbox.smolmachine
-smolvm pack create alpine:latest -o ./my-sandbox --single-file  # single executable, no sidecar
+# sandbox - ephemeral isolated environments
+smolvm sandbox run --net alpine:latest -- echo "hello"
+smolvm sandbox run --net -v /tmp:/workspace alpine:latest -- ls /workspace
 
-./my-sandbox uname -a # this will return results of running sys info within the guest linux vm
-
-smolvm pack create python:3.12-alpine -o ./my-pythonvm
-./my-pythonvm python3 -c "import sys; print(sys.version)"
+smolvm sandbox run --net python:3.12-alpine -- python -V
 
 # uninstall
 curl -sSL https://smolmachines.com/install.sh | bash -s -- --uninstall
@@ -38,18 +38,18 @@ curl -sSL https://smolmachines.com/install.sh | bash -s -- --uninstall
 
 ## about
 
-microVMs are lightweight VMs - security and isolation of VMs with the speed of containers.
+microVMs are lightweight VMs — the security and isolation of VMs with the speed of containers.
 
 They power AWS Lambda and Fly.io, but are inaccessible to average developers due to setup complexity.
 
-smolVM makes microVMs easy: <200ms boot, works on macOS and Linux, single binary distribution.
+smolVM makes microVMs easy: <200ms boot, works on macOS and Linux, single binary distribution. Any OCI container image becomes a self-contained, portable VM you can build once and run anywhere.
 
 ## use this for
 
-- run coding agents locally and safely
-- run microVMs locally on macOS and Linux with minimal setup
-- run containers within microvm for improved isolation
-- distribute self-contained sandboxed applications
+- build portable, self-contained executables from any container image
+- run persistent local Linux VMs on macOS and Linux with minimal setup
+- sandbox coding agents, untrusted code, or CI workloads
+- run containers within microVMs for improved isolation
 
 ## demo: run OpenAI Codex in a sandbox
 
