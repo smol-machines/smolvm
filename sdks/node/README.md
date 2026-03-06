@@ -8,3 +8,19 @@ This workspace contains:
 
 Users should only install `smolvm-embedded`. The platform packages are an
 implementation detail used by npm's optional dependency resolution.
+
+Local maintainer workflow:
+
+```bash
+cd sdks/node
+npm install
+npm run build
+npm test
+npm run smoke
+```
+
+Repo-root build entrypoint:
+
+```bash
+./scripts/build-embedded-node.sh
+```

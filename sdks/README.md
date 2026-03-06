@@ -18,3 +18,9 @@ Bundled native library rule:
   directory, not from Homebrew or other system locations.
 - Shared helpers in `sdks/scripts/` should be used to copy the current host's
   libraries into each SDK package's `lib/` directory.
+
+Current status:
+
+- `sdks/node/` is the first embedded SDK implementation.
+- the previous standalone `smolvm-sdk/smolvm-node-native` branch is now a
+  prototype/reference source, not the primary home for the embedded Node SDK.
