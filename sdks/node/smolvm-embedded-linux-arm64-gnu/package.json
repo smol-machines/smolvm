@@ -1,0 +1,18 @@
+{
+  "name": "smolvm-embedded-linux-arm64-gnu",
+  "version": "0.1.0",
+  "description": "Internal platform package for smolvm-embedded on Linux arm64 GNU",
+  "main": "native/index.js",
+  "types": "native/index.d.ts",
+  "files": [
+    "native",
+    "lib"
+  ],
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "license": "Apache-2.0"
+}
