@@ -58,8 +58,8 @@ cat <<EOF
 Built platform package: $PACKAGE_NAME
 Package directory: $PACKAGE_DIR
 
-TODO(next parts):
-  - build the public smolvm-embedded package
-  - wire runtime package resolution from smolvm-embedded to $PACKAGE_NAME
-  - run the embedded Node test and example suite
+Next useful commands:
+  - cd $WORKSPACE_DIR && npm run build
+  - cd $WORKSPACE_DIR && npm test
+  - cd $WORKSPACE_DIR && npm run smoke
 EOF

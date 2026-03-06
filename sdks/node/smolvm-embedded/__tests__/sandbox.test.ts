@@ -1,13 +1,13 @@
 /**
- * Integration tests for @smolvm/node-native.
+ * Integration tests for smolvm-embedded.
  *
  * Requirements:
  * - macOS with Hypervisor.framework or Linux with KVM
- * - libkrun installed (e.g., `brew install libkrun` on macOS)
+ * - repo-local or packaged libkrun/libkrunfw build outputs available
  * - smolvm agent rootfs at the default path:
  *   - macOS: ~/Library/Application Support/smolvm/agent-rootfs
  *   - Linux: ~/.local/share/smolvm/agent-rootfs
- * - The native .node binary must be built first: `npm run build:native`
+ * - The current platform package must be built first: `cd sdks/node && npm run build`
  */
 
 import { describe, it, expect, afterAll } from "vitest";
