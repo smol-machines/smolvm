@@ -39,39 +39,32 @@ else
 fi
 
 echo "Using embedded lib bundle: $LIBKRUN_BUNDLE"
-echo "Building smolvm-napi (part 1)..."
+echo "Building smolvm-napi..."
 
-# TODO(part-3): Add the sdks/node npm workspace inside this repository.
-# TODO(part-4): Detect the current host platform package name (for example
-#   darwin-arm64 or linux-x64-gnu).
-# TODO(part-4): Build the matching internal platform package.
-# TODO(part-5): Copy the built .node artifact into that internal platform
-#   package.
-# TODO(part-5): Copy libkrun and libkrunfw into that package's local lib/
-#   directory.
-# TODO(part-6): Build the public smolvm-embedded package that depends on the
-#   internal platform packages.
-# TODO(part-7): Run embedded Node tests/examples from the in-repo sdk
-#   workspace.
-# TODO(part-7): Add npm pack smoke tests for the public package and
-#   current-host platform package.
+# TODO(release): add CI/release automation for publishing the public package
+#   and internal platform packages.
+# TODO(multi-language): add the python/go/c embedded SDK workspaces that reuse
+#   the same bundled lib staging model.
 
 (
     cd "$REPO_ROOT"
     LIBKRUN_BUNDLE="$LIBKRUN_BUNDLE" cargo build --release -p smolvm-napi
 )
 
+if [[ -f "$REPO_ROOT/sdks/node/package.json" ]]; then
+    echo "Building embedded Node workspace..."
+    (
+        cd "$REPO_ROOT/sdks/node"
+        npm run build
+    )
+fi
+
 cat <<'EOF'
 
-Part 1 complete: built the smolvm-napi crate against the bundled libkrun/libkrunfw.
+Built smolvm-napi and the current-host smolvm-embedded Node packages.
 
-TODO(next parts):
-  1. Add the sdks/node npm workspace inside this repository.
-  2. Detect the current host platform package name (for example darwin-arm64 or linux-x64-gnu).
-  3. Build the matching internal platform package.
-  4. Copy the built .node artifact into that internal platform package.
-  5. Copy libkrun and libkrunfw into that package's local lib/ directory.
-  6. Build the public smolvm-embedded package that depends on the internal platform packages.
-  7. Run embedded Node tests/examples from the in-repo sdk workspace.
-  8. Add npm pack smoke tests for the public package and current-host platform package.
+Useful follow-ups:
+  - cd sdks/node && npm test
+  - cd sdks/node && npm run smoke
+  - cd sdks/node && npm exec --workspace smolvm-embedded tsx examples/basic.ts
 EOF

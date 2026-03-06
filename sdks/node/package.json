@@ -4,7 +4,9 @@
   "scripts": {
     "build:platform": "./scripts/build-platform-package.sh",
     "build:public": "npm run --workspace smolvm-embedded build:ts",
-    "build": "./scripts/build-current-platform.sh"
+    "build": "./scripts/build-current-platform.sh",
+    "test": "npm run build:platform && npm run --workspace smolvm-embedded test",
+    "smoke": "./scripts/smoke-install.sh"
   },
   "workspaces": [
     "smolvm-embedded",

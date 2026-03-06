@@ -21,9 +21,12 @@
     "dist"
   ],
   "scripts": {
-    "build:ts": "tsup",
+    "build:ts": "../node_modules/.bin/tsup",
     "build": "npm run build:ts",
-    "dev": "tsup src/index.ts --format cjs,esm --dts --watch"
+    "dev": "../node_modules/.bin/tsup src/index.ts --format cjs,esm --dts --watch",
+    "test": "../node_modules/.bin/vitest run",
+    "test:watch": "../node_modules/.bin/vitest",
+    "example:basic": "../node_modules/.bin/tsx examples/basic.ts"
   },
   "optionalDependencies": {
     "smolvm-embedded-darwin-arm64": "0.1.0",
