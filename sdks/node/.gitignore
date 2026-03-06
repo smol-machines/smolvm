@@ -1,0 +1,7 @@
+node_modules/
+package-lock.json
+*/dist/
+*/lib/
+*/native/index.js
+*/native/index.d.ts
+*/native/*.node

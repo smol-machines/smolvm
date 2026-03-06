@@ -1,6 +1,9 @@
 {
   "name": "smolvm-embedded-node-workspace",
   "private": true,
+  "scripts": {
+    "build:platform": "./scripts/build-platform-package.sh"
+  },
   "workspaces": [
     "smolvm-embedded",
     "smolvm-embedded-darwin-arm64",
