@@ -2,7 +2,9 @@
   "name": "smolvm-embedded-node-workspace",
   "private": true,
   "scripts": {
-    "build:platform": "./scripts/build-platform-package.sh"
+    "build:platform": "./scripts/build-platform-package.sh",
+    "build:public": "npm run --workspace smolvm-embedded build:ts",
+    "build": "./scripts/build-current-platform.sh"
   },
   "workspaces": [
     "smolvm-embedded",

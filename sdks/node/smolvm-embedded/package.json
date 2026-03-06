@@ -20,11 +20,27 @@
   "files": [
     "dist"
   ],
+  "scripts": {
+    "build:ts": "tsup",
+    "build": "npm run build:ts",
+    "dev": "tsup src/index.ts --format cjs,esm --dts --watch"
+  },
   "optionalDependencies": {
     "smolvm-embedded-darwin-arm64": "0.1.0",
     "smolvm-embedded-darwin-x64": "0.1.0",
     "smolvm-embedded-linux-arm64-gnu": "0.1.0",
     "smolvm-embedded-linux-x64-gnu": "0.1.0"
   },
+  "engines": {
+    "node": ">= 18.0.0"
+  },
+  "keywords": [
+    "smolvm",
+    "embedded",
+    "microvm",
+    "sandbox",
+    "virtualization",
+    "napi"
+  ],
   "license": "Apache-2.0"
 }
