@@ -56,9 +56,10 @@ pub fn to_napi_error(err: SmolvmError) -> napi::Error {
             format!("Mount source not found: {}", path.display()),
         ),
 
-        SmolvmError::Storage { operation, reason } => {
-            (STORAGE_ERROR, format!("Storage ({}): {}", operation, reason))
-        }
+        SmolvmError::Storage { operation, reason } => (
+            STORAGE_ERROR,
+            format!("Storage ({}): {}", operation, reason),
+        ),
 
         SmolvmError::Mount { operation, reason } => {
             (MOUNT_ERROR, format!("Mount ({}): {}", operation, reason))
@@ -72,17 +73,19 @@ pub fn to_napi_error(err: SmolvmError) -> napi::Error {
             (CONFIG_ERROR, format!("Config ({}): {}", operation, reason))
         }
 
-        SmolvmError::CommandFailed { command, reason } => {
-            (COMMAND_FAILED, format!("Command '{}' failed: {}", command, reason))
-        }
+        SmolvmError::CommandFailed { command, reason } => (
+            COMMAND_FAILED,
+            format!("Command '{}' failed: {}", command, reason),
+        ),
 
         SmolvmError::KvmUnavailable(reason) => {
             (KVM_UNAVAILABLE, format!("KVM unavailable: {}", reason))
         }
 
-        SmolvmError::KvmPermission(reason) => {
-            (KVM_UNAVAILABLE, format!("KVM permission denied: {}", reason))
-        }
+        SmolvmError::KvmPermission(reason) => (
+            KVM_UNAVAILABLE,
+            format!("KVM permission denied: {}", reason),
+        ),
 
         _ => (SMOLVM_ERROR, err.to_string()),
     };

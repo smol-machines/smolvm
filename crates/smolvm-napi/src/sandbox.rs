@@ -55,9 +55,12 @@ impl NapiSandbox {
             .map(|r| r.to_vm_resources())
             .unwrap_or_default();
 
-        let manager =
-            AgentManager::for_vm_with_sizes(&config.name, resources.storage_gb, resources.overlay_gb)
-                .into_napi()?;
+        let manager = AgentManager::for_vm_with_sizes(
+            &config.name,
+            resources.storage_gb,
+            resources.overlay_gb,
+        )
+        .into_napi()?;
 
         Ok(Self {
             name: config.name,
@@ -130,7 +133,9 @@ impl NapiSandbox {
         let resources = self.resources;
 
         tokio::task::spawn_blocking(move || {
-            manager.0.ensure_running_with_full_config(mounts, ports, resources)
+            manager
+                .0
+                .ensure_running_with_full_config(mounts, ports, resources)
         })
         .await
         .map_err(|e| napi::Error::from_reason(format!("Task join error: {}", e)))?
@@ -138,9 +143,10 @@ impl NapiSandbox {
 
         // Ensure we have a client connection
         let needs_connect = {
-            let guard = self.client.lock().map_err(|e| {
-                napi::Error::from_reason(format!("Client lock poisoned: {}", e))
-            })?;
+            let guard = self
+                .client
+                .lock()
+                .map_err(|e| napi::Error::from_reason(format!("Client lock poisoned: {}", e)))?;
             guard.is_none()
         };
 
@@ -151,9 +157,10 @@ impl NapiSandbox {
                 .map_err(|e| napi::Error::from_reason(format!("Task join error: {}", e)))?
                 .into_napi()?;
 
-            let mut guard = self.client.lock().map_err(|e| {
-                napi::Error::from_reason(format!("Client lock poisoned: {}", e))
-            })?;
+            let mut guard = self
+                .client
+                .lock()
+                .map_err(|e| napi::Error::from_reason(format!("Client lock poisoned: {}", e)))?;
             *guard = Some(new_client);
         }
 
@@ -284,9 +291,10 @@ impl NapiSandbox {
     pub async fn stop(&self) -> napi::Result<()> {
         // Drop the client first
         {
-            let mut guard = self.client.lock().map_err(|e| {
-                napi::Error::from_reason(format!("Client lock poisoned: {}", e))
-            })?;
+            let mut guard = self
+                .client
+                .lock()
+                .map_err(|e| napi::Error::from_reason(format!("Client lock poisoned: {}", e)))?;
             *guard = None;
         }
 

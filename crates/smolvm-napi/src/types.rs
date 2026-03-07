@@ -162,18 +162,28 @@ impl From<smolvm_protocol::ImageInfo> for ImageInfo {
 /// Parse ExecOptions into the components needed by AgentClient::vm_exec().
 pub fn parse_exec_options(
     options: &Option<ExecOptions>,
-) -> (Vec<(String, String)>, Option<String>, Option<std::time::Duration>) {
+) -> (
+    Vec<(String, String)>,
+    Option<String>,
+    Option<std::time::Duration>,
+) {
     match options {
         Some(opts) => {
             let env = opts
                 .env
                 .as_ref()
-                .map(|vars| vars.iter().map(|v| (v.key.clone(), v.value.clone())).collect())
+                .map(|vars| {
+                    vars.iter()
+                        .map(|v| (v.key.clone(), v.value.clone()))
+                        .collect()
+                })
                 .unwrap_or_default();
 
             let workdir = opts.workdir.clone();
 
-            let timeout = opts.timeout_secs.map(|s| std::time::Duration::from_secs(s as u64));
+            let timeout = opts
+                .timeout_secs
+                .map(|s| std::time::Duration::from_secs(s as u64));
 
             (env, workdir, timeout)
         }
