@@ -1,7 +1,17 @@
-import { dirname } from "node:path";
+import { existsSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 function currentPlatformKey(): string {
   return `${process.platform}:${process.arch}`;
+}
+
+function currentPackageRoot(): string {
+  if (typeof __dirname === "string") {
+    return resolve(__dirname, "..");
+  }
+
+  return resolve(dirname(fileURLToPath(import.meta.url)), "..");
 }
 
 export function getPlatformPackageName(): string {
@@ -23,13 +33,20 @@ export function getPlatformPackageName(): string {
 
 export function getPlatformPackageRoot(): string {
   const packageName = getPlatformPackageName();
+  const packageRoot = currentPackageRoot();
+  const siblingPackageRoot = resolve(packageRoot, "..", packageName);
+  const siblingPackageJson = resolve(siblingPackageRoot, "package.json");
+
+  if (existsSync(siblingPackageJson)) {
+    return siblingPackageRoot;
+  }
 
   try {
     return dirname(require.resolve(`${packageName}/package.json`));
   } catch {
     throw new Error(
       `Missing internal platform package '${packageName}' for smolvm-embedded. ` +
-        "Install workspace dependencies and build the current platform package."
+        "Build the current platform package from sdks/node first."
     );
   }
 }

@@ -9,11 +9,7 @@
     "smoke": "./scripts/smoke-install.sh"
   },
   "workspaces": [
-    "smolvm-embedded",
-    "smolvm-embedded-darwin-arm64",
-    "smolvm-embedded-darwin-x64",
-    "smolvm-embedded-linux-arm64-gnu",
-    "smolvm-embedded-linux-x64-gnu"
+    "smolvm-embedded"
   ],
   "devDependencies": {
     "@napi-rs/cli": "^2.18.0",
