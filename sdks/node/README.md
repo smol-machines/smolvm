@@ -19,6 +19,11 @@ npm test
 npm run smoke
 ```
 
+During local development, `npm install` may warn about unpublished optional
+platform packages. That is expected. Local builds resolve the sibling
+`smolvm-embedded-*` package directories directly instead of relying on npm to
+install those internal packages.
+
 Repo-root build entrypoint:
 
 ```bash
