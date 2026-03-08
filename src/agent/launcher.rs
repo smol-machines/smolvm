@@ -4,9 +4,12 @@
 //! All setup is done in the child process after fork, where
 //! DYLD_LIBRARY_PATH is still available for dlopen.
 
+use crate::consts::ENV_SMOLVM_LIB_DIR;
 use crate::error::{Error, Result};
 use crate::storage::{OverlayDisk, StorageDisk};
+use crate::util::libkrunfw_filename;
 use crate::vm::config::HostMount;
+
 use smolvm_protocol::ports;
 use std::ffi::{CStr, CString};
 use std::path::{Path, PathBuf};
@@ -59,20 +62,31 @@ extern "C" {
 // TSI (Transparent Socket Impersonation) feature flags
 const KRUN_TSI_HIJACK_INET: u32 = 1 << 0;
 
-/// Find the directory containing libkrunfw by checking paths relative to the current executable.
+/// Find the directory containing libkrunfw by checking explicit overrides and
+/// paths relative to the current executable.
 ///
 /// Checks:
+/// - `$SMOLVM_LIB_DIR` (explicit override for embedded runtimes)
 /// - `<exe_dir>/lib/` (distribution layout)
 /// - `<exe_dir>/../lib/` (alternative layout)
 /// - `<exe_dir>/../../lib/linux-<arch>/` (source tree dev builds)
 fn find_lib_dir() -> Option<PathBuf> {
+    let lib_name = libkrunfw_filename();
+    if let Ok(explicit_dir) = std::env::var(ENV_SMOLVM_LIB_DIR) {
+        let path = PathBuf::from(explicit_dir);
+        if path.join(lib_name).exists() {
+            return path.canonicalize().ok().or(Some(path));
+        }
+
+        tracing::warn!(
+            path = %path.display(),
+            lib = lib_name,
+            "{} does not contain the expected libkrunfw library", ENV_SMOLVM_LIB_DIR
+        );
+    }
+
     let exe = std::env::current_exe().ok()?;
     let exe_dir = exe.parent()?;
-
-    #[cfg(target_os = "macos")]
-    let lib_name = "libkrunfw.5.dylib";
-    #[cfg(target_os = "linux")]
-    let lib_name = "libkrunfw.so.5";
 
     let candidates = [
         exe_dir.join("lib"),
@@ -104,12 +118,7 @@ fn preload_libkrunfw() {
         return;
     };
 
-    #[cfg(target_os = "macos")]
-    let lib_name = "libkrunfw.5.dylib";
-    #[cfg(target_os = "linux")]
-    let lib_name = "libkrunfw.so.5";
-
-    let lib_path = lib_dir.join(lib_name);
+    let lib_path = lib_dir.join(libkrunfw_filename());
     let Ok(lib_path_c) = CString::new(lib_path.to_string_lossy().as_bytes()) else {
         return;
     };

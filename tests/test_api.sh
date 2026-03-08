@@ -83,17 +83,21 @@ test_health() {
 }
 
 test_create_and_start_sandbox() {
-    # Create sandbox
-    local status
-    status=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$API_URL/api/v1/sandboxes" \
+    # Create sandbox with network enabled so image pulls work later in the suite
+    local status response tmpfile
+    tmpfile=$(mktemp)
+    status=$(curl -s -o "$tmpfile" -w "%{http_code}" -X POST "$API_URL/api/v1/sandboxes" \
         -H "Content-Type: application/json" \
-        -d "{\"name\": \"$SANDBOX_NAME\"}")
+        -d "{\"name\": \"$SANDBOX_NAME\", \"resources\": {\"network\": true}}")
+    response=$(cat "$tmpfile")
+    rm -f "$tmpfile"
     [[ "$status" != "200" ]] && return 1
+    [[ "$response" == *'"network":true'* ]] || [[ "$response" == *'"network": true'* ]] || return 1
 
     # Start sandbox (boots VM)
-    local response
-    response=$(curl -s -X POST "$API_URL/api/v1/sandboxes/$SANDBOX_NAME/start")
-    [[ "$response" == *'"state":"running"'* ]]
+    local start_response
+    start_response=$(curl -s -X POST "$API_URL/api/v1/sandboxes/$SANDBOX_NAME/start")
+    [[ "$start_response" == *'"state":"running"'* ]]
 }
 
 test_exec_echo() {
@@ -154,17 +158,35 @@ test_exec_shell_pipeline() {
 }
 
 test_pull_and_run_image() {
+    local pull_status pull_response run_status run_response tmpfile
+
     # Pull image
-    curl -s -X POST "$API_URL/api/v1/sandboxes/$SANDBOX_NAME/images/pull" \
+    tmpfile=$(mktemp)
+    pull_status=$(curl -s -o "$tmpfile" -w "%{http_code}" -X POST \
+        "$API_URL/api/v1/sandboxes/$SANDBOX_NAME/images/pull" \
         -H "Content-Type: application/json" \
-        -d '{"image": "alpine:latest"}' >/dev/null
+        -d '{"image": "alpine:latest"}')
+    pull_response=$(cat "$tmpfile")
+    rm -f "$tmpfile"
+    if [[ "$pull_status" != "200" ]]; then
+        echo "image pull failed (status $pull_status): $pull_response" >&2
+        return 1
+    fi
+    [[ "$pull_response" == *'"reference":"alpine:latest"'* ]] || [[ "$pull_response" == *'"reference": "alpine:latest"'* ]] || return 1
 
     # Run in image
-    local response
-    response=$(curl -s -X POST "$API_URL/api/v1/sandboxes/$SANDBOX_NAME/run" \
+    tmpfile=$(mktemp)
+    run_status=$(curl -s -o "$tmpfile" -w "%{http_code}" -X POST \
+        "$API_URL/api/v1/sandboxes/$SANDBOX_NAME/run" \
         -H "Content-Type: application/json" \
         -d '{"image": "alpine:latest", "command": ["echo", "container-test"]}')
-    [[ "$response" == *"container-test"* ]]
+    run_response=$(cat "$tmpfile")
+    rm -f "$tmpfile"
+    if [[ "$run_status" != "200" ]]; then
+        echo "image run failed (status $run_status): $run_response" >&2
+        return 1
+    fi
+    [[ "$run_response" == *"container-test"* ]]
 }
 
 test_stop_sandbox() {

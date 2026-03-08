@@ -64,6 +64,7 @@
 pub mod agent;
 pub mod api;
 pub mod config;
+pub mod consts;
 pub mod db;
 pub mod error;
 pub mod log_rotation;
