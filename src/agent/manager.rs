@@ -194,6 +194,8 @@ pub struct AgentManager {
     config_file: PathBuf,
     /// Console log path (optional).
     console_log: Option<PathBuf>,
+    /// Startup error log path written by the child if microvm launch fails before readiness
+    startup_error_log: PathBuf,
     /// Internal state.
     inner: Arc<Mutex<AgentInner>>,
 }
@@ -255,6 +257,7 @@ impl AgentManager {
         let pid_file = smolvm_runtime.join("agent.pid");
         let config_file = smolvm_runtime.join("agent.config.json");
         let console_log = Some(smolvm_runtime.join("agent-console.log"));
+        let startup_error_log: PathBuf = smolvm_runtime.join("agent-startup-error.log");
 
         Ok(Self {
             name,
@@ -265,6 +268,7 @@ impl AgentManager {
             pid_file,
             config_file,
             console_log,
+            startup_error_log,
             inner: Arc::new(Mutex::new(AgentInner {
                 state: AgentState::Stopped,
                 child: None,
@@ -839,6 +843,7 @@ impl AgentManager {
         // Clean up stale ready marker from previous boot
         let ready_marker = self.rootfs_path.join(READY_MARKER_FILENAME);
         let _ = std::fs::remove_file(&ready_marker);
+        let _ = std::fs::remove_file(&self.startup_error_log);
 
         // Clone mounts/ports for save_running_config (originals move into fork closure)
         let mounts_for_config = mounts.clone();
@@ -874,6 +879,10 @@ impl AgentManager {
             ) {
                 Ok(d) => d,
                 Err(e) => {
+                    let _ = std::fs::write(
+                        &self.startup_error_log,
+                        format!("failed to open storage disk: {}", e),
+                    );
                     eprintln!("failed to open storage disk: {}", e);
                     process::exit_child(1);
                 }
@@ -886,6 +895,10 @@ impl AgentManager {
             ) {
                 Ok(d) => d,
                 Err(e) => {
+                    let _ = std::fs::write(
+                        &self.startup_error_log,
+                        format!("failed to open overlay disk: {}", e),
+                    );
                     eprintln!("failed to open overlay disk: {}", e);
                     process::exit_child(1);
                 }
@@ -912,8 +925,10 @@ impl AgentManager {
             );
 
             // If we get here, something went wrong (stderr is /dev/null,
-            // but the error is also logged to console.log)
-            let _ = result;
+            // but the error is also logged to agent-startup-error.log)
+            if let Err(ref e) = result {
+                let _ = std::fs::write(&self.startup_error_log, e.to_string());
+            }
 
             process::exit_child(1);
         }) {
@@ -962,6 +977,7 @@ impl AgentManager {
                 let mut inner = self.inner.lock();
                 inner.state = AgentState::Stopped;
                 inner.child = None;
+                let _ = std::fs::remove_file(&self.startup_error_log);
                 Err(e)
             }
         }
@@ -1141,9 +1157,16 @@ impl AgentManager {
                 let mut inner = self.inner.lock();
                 if let Some(ref mut child) = inner.child {
                     if !child.is_running() {
+                        let reason = std::fs::read_to_string(&self.startup_error_log)
+                            .ok()
+                            .map(|content| content.trim().to_string())
+                            .filter(|content| !content.is_empty());
+
                         return Err(Error::agent(
                             "monitor agent",
-                            "agent process exited during startup",
+                            reason.unwrap_or_else(|| {
+                                "agent process exited during startup".to_string()
+                            }),
                         ));
                     }
                 }
