@@ -344,7 +344,7 @@ pub struct VmRecord {
     #[serde(default)]
     pub storage_gb: Option<u64>,
 
-    /// Overlay disk size in GiB (None = default 2 GiB).
+    /// Overlay disk size in GiB (None = default 10 GiB).
     #[serde(default)]
     pub overlay_gb: Option<u64>,
 }
