@@ -313,6 +313,67 @@ fn delete_disk_and_marker(disk_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Expand a sparse disk image file to a new size by seeking to the new end
+/// position and writing a single byte, which creates a sparse file.
+pub fn expand_disk(path: &Path, new_size_gb: u64, label: &str) -> Result<()> {
+    use std::fs::OpenOptions;
+    use std::io::{Seek, SeekFrom, Write};
+
+    let new_size_bytes = new_size_gb * 1024 * 1024 * 1024;
+
+    // Get current size
+    let metadata =
+        std::fs::metadata(path).map_err(|e| Error::storage("get disk metadata", e.to_string()))?;
+    let current_size = metadata.len();
+
+    if new_size_bytes <= current_size {
+        return Err(Error::storage(
+            "expand disk",
+            format!(
+                "new size ({} GiB) must be larger than current size ({} GiB)",
+                new_size_gb,
+                current_size / (1024 * 1024 * 1024)
+            ),
+        ));
+    }
+
+    tracing::info!(
+        path = %path.display(),
+        label,
+        current_gb = current_size / (1024 * 1024 * 1024),
+        new_gb = new_size_gb,
+        "expanding {} disk",
+        label
+    );
+
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|e| Error::storage("open disk for expansion", e.to_string()))?;
+
+    // Seek to new end position (minus 1 byte)
+    file.seek(SeekFrom::Start(new_size_bytes - 1))
+        .map_err(|e| Error::storage("seek to expand", e.to_string()))?;
+
+    // Write single byte to extend (creates sparse file)
+    file.write_all(&[0])
+        .map_err(|e| Error::storage("write to expand", e.to_string()))?;
+
+    // Sync to ensure the file is extended on disk
+    file.sync_all()
+        .map_err(|e| Error::storage("sync after expand", e.to_string()))?;
+
+    tracing::info!(
+        path = %path.display(),
+        label,
+        new_gb = new_size_gb,
+        "{} disk expanded successfully",
+        label
+    );
+
+    Ok(())
+}
+
 /// Disk format version info (stored at `/.smolvm/version.json` in ext4 disk).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiskVersion {
@@ -783,6 +844,85 @@ mod tests {
         // Clean up
         disk.delete().unwrap();
         assert!(!disk_path.exists());
+        let _ = std::fs::remove_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_expand_disk_basic() {
+        let temp_dir = std::env::temp_dir().join("smolvm_test_expand");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let disk_path = temp_dir.join("expand_test.raw");
+
+        // Clean up any existing file
+        let _ = std::fs::remove_file(&disk_path);
+
+        // Create a small initial disk (100 MB)
+        let initial_size = 100 * 1024 * 1024;
+        create_sparse_disk(&disk_path, initial_size, "test").unwrap();
+
+        // Verify initial size
+        let metadata = std::fs::metadata(&disk_path).unwrap();
+        assert_eq!(metadata.len(), initial_size);
+
+        // Expand to 200 MB
+        expand_disk(&disk_path, 200, "test").unwrap();
+
+        // Verify new size
+        let metadata = std::fs::metadata(&disk_path).unwrap();
+        assert_eq!(metadata.len(), 200 * 1024 * 1024 * 1024);
+
+        // Clean up
+        let _ = std::fs::remove_file(&disk_path);
+        let _ = std::fs::remove_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_expand_disk_reject_shrink() {
+        let temp_dir = std::env::temp_dir().join("smolvm_test_shrink");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let disk_path = temp_dir.join("shrink_test.raw");
+
+        // Clean up any existing file
+        let _ = std::fs::remove_file(&disk_path);
+
+        // Create a 10 GB disk
+        let initial_size = 10 * 1024 * 1024 * 1024;
+        create_sparse_disk(&disk_path, initial_size, "test").unwrap();
+
+        // Try to shrink to 5 GB - should fail
+        let result = expand_disk(&disk_path, 5, "test");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("must be larger"));
+
+        // Verify size unchanged
+        let metadata = std::fs::metadata(&disk_path).unwrap();
+        assert_eq!(metadata.len(), initial_size);
+
+        // Clean up
+        let _ = std::fs::remove_file(&disk_path);
+        let _ = std::fs::remove_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_expand_disk_same_size_rejected() {
+        let temp_dir = std::env::temp_dir().join("smolvm_test_same");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let disk_path = temp_dir.join("same_test.raw");
+
+        // Clean up any existing file
+        let _ = std::fs::remove_file(&disk_path);
+
+        // Create a 10 GB disk
+        let initial_size = 10 * 1024 * 1024 * 1024;
+        create_sparse_disk(&disk_path, initial_size, "test").unwrap();
+
+        // Try to expand to same size - should fail (must be strictly larger)
+        let result = expand_disk(&disk_path, 10, "test");
+        assert!(result.is_err());
+
+        // Clean up
+        let _ = std::fs::remove_file(&disk_path);
         let _ = std::fs::remove_dir(&temp_dir);
     }
 }

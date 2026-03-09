@@ -565,4 +565,82 @@ mod tests {
         assert_eq!(config.restart_count, 0);
         assert!(!config.user_stopped);
     }
+
+    // ========================================================================
+    // Resize-related tests
+    // ========================================================================
+
+    #[test]
+    fn test_vm_record_storage_overlay_fields() {
+        // Test that storage_gb and overlay_gb fields work correctly
+        let mut record = VmRecord::new("test-vm".to_string(), 1, 512, vec![], vec![], false);
+
+        // Initially None (uses defaults)
+        assert!(record.storage_gb.is_none());
+        assert!(record.overlay_gb.is_none());
+
+        // Set storage_gb
+        record.storage_gb = Some(50);
+        assert_eq!(record.storage_gb, Some(50));
+
+        // Set overlay_gb
+        record.overlay_gb = Some(20);
+        assert_eq!(record.overlay_gb, Some(20));
+    }
+
+    #[test]
+    fn test_vm_record_partial_update() {
+        // Test that we can update only some fields (partial update pattern)
+        let mut record = VmRecord::new("test-vm".to_string(), 1, 512, vec![], vec![], false);
+        record.storage_gb = Some(20);
+        record.overlay_gb = Some(10);
+
+        // Simulate partial update - only storage changes
+        let new_storage_gb: Option<u64> = Some(50);
+        let new_overlay_gb: Option<u64> = None;
+
+        if let Some(s) = new_storage_gb {
+            record.storage_gb = Some(s);
+        }
+        if let Some(o) = new_overlay_gb {
+            record.overlay_gb = Some(o);
+        }
+
+        assert_eq!(record.storage_gb, Some(50));
+        assert_eq!(record.overlay_gb, Some(10)); // Unchanged
+    }
+
+    #[test]
+    fn test_vm_record_vm_resources_includes_storage() {
+        // Test that vm_resources() includes storage_gb and overlay_gb
+        let mut record = VmRecord::new("test-vm".to_string(), 2, 1024, vec![], vec![], false);
+        record.storage_gb = Some(50);
+        record.overlay_gb = Some(20);
+
+        let resources = record.vm_resources();
+        assert_eq!(resources.cpus, 2);
+        assert_eq!(resources.mem, 1024);
+        assert_eq!(resources.storage_gb, Some(50));
+        assert_eq!(resources.overlay_gb, Some(20));
+    }
+
+    #[test]
+    fn test_vm_record_serialization_with_storage_overlay() {
+        // Test that storage_gb and overlay_gb serialize/deserialize correctly
+        let mut record = VmRecord::new("test-vm".to_string(), 1, 512, vec![], vec![], false);
+        record.storage_gb = Some(50);
+        record.overlay_gb = Some(20);
+
+        let json = serde_json::to_string(&record).unwrap();
+
+        // Verify fields are in JSON
+        assert!(json.contains("storage_gb"));
+        assert!(json.contains("overlay_gb"));
+        assert!(json.contains("50"));
+        assert!(json.contains("20"));
+
+        let deserialized: VmRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.storage_gb, Some(50));
+        assert_eq!(deserialized.overlay_gb, Some(20));
+    }
 }

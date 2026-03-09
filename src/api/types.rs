@@ -565,3 +565,21 @@ pub struct StopResponse {
     #[schema(example = "abc123")]
     pub stopped: String,
 }
+
+// ============================================================================
+// Resize Types
+// ============================================================================
+
+/// Request to resize a microvm's disk resources.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ResizeMicrovmRequest {
+    /// Storage disk size in GiB (expand only, optional).
+    #[serde(default)]
+    #[schema(example = 50)]
+    pub storage_gb: Option<u64>,
+    /// Overlay disk size in GiB (expand only, optional).
+    #[serde(default)]
+    #[schema(example = 20)]
+    pub overlay_gb: Option<u64>,
+}

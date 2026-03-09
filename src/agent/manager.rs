@@ -408,6 +408,16 @@ impl AgentManager {
         self.console_log.as_deref()
     }
 
+    /// Get the storage disk path.
+    pub fn storage_path(&self) -> &Path {
+        self.storage_disk.path()
+    }
+
+    /// Get the overlay disk path.
+    pub fn overlay_path(&self) -> &Path {
+        self.overlay_disk.path()
+    }
+
     /// Check if an agent is already running (socket exists + responds to ping).
     ///
     /// Returns Some(()) if agent is running and reachable, None otherwise.

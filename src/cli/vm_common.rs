@@ -807,3 +807,124 @@ pub fn list_vms(kind: VmKind, verbose: bool, json: bool) -> smolvm::Result<()> {
 
     Ok(())
 }
+
+// ============================================================================
+// Resize
+// ============================================================================
+
+/// Resize a microVM's disk resources.
+///
+/// The VM must be stopped before resizing. Only expansion is supported
+/// (no shrinking to prevent data loss).
+pub fn resize_vm(
+    kind: VmKind,
+    name: &str,
+    new_storage_gb: Option<u64>,
+    new_overlay_gb: Option<u64>,
+) -> smolvm::Result<()> {
+    use smolvm::config::RecordState;
+    use smolvm::db::SmolvmDb;
+    use smolvm::storage::{expand_disk, DEFAULT_OVERLAY_SIZE_GB, DEFAULT_STORAGE_SIZE_GB};
+
+    // Get VM record from database
+    let db = SmolvmDb::open()?;
+    let record = db
+        .get_vm(name)?
+        .ok_or_else(|| smolvm::Error::vm_not_found(name))?
+        .clone();
+
+    // Check state - VM must be stopped (Created state also allowed for never-started VMs)
+    let actual_state = record.actual_state();
+    match actual_state {
+        RecordState::Stopped | RecordState::Created => {} // OK to resize
+        _ => {
+            return Err(smolvm::Error::InvalidState {
+                expected: "stopped".into(),
+                actual: format!("{:?}", actual_state),
+            });
+        }
+    }
+
+    // Get current disk sizes (use defaults if not set)
+    let current_storage_gb = record.storage_gb.unwrap_or(DEFAULT_STORAGE_SIZE_GB);
+    let current_overlay_gb = record.overlay_gb.unwrap_or(DEFAULT_OVERLAY_SIZE_GB);
+
+    // Determine target sizes
+    let target_storage_gb = new_storage_gb.unwrap_or(current_storage_gb);
+    let target_overlay_gb = new_overlay_gb.unwrap_or(current_overlay_gb);
+
+    // Validate no shrinking
+    if target_storage_gb < current_storage_gb {
+        return Err(smolvm::Error::config(
+            "resize",
+            format!(
+                "storage disk cannot be shrunk from {} GiB to {} GiB. Only expanding is supported to prevent data loss.",
+                current_storage_gb, target_storage_gb
+            ),
+        ));
+    }
+    if target_overlay_gb < current_overlay_gb {
+        return Err(smolvm::Error::config(
+            "resize",
+            format!(
+                "overlay disk cannot be shrunk from {} GiB to {} GiB. Only expanding is supported to prevent data loss.",
+                current_overlay_gb, target_overlay_gb
+            ),
+        ));
+    }
+
+    // Get agent manager for disk paths
+    let manager = AgentManager::for_vm(name)
+        .map_err(|e| smolvm::Error::agent("get agent manager", e.to_string()))?;
+
+    // Print resize header
+    println!("Resizing {} '{}'...", kind.label(), name);
+
+    // Expand storage disk if requested and changed
+    if let Some(storage_gb) = new_storage_gb {
+        if storage_gb > current_storage_gb {
+            print!(
+                "  Storage: {} GiB → {} GiB (expanding disk...)",
+                current_storage_gb, storage_gb
+            );
+            std::io::Write::flush(&mut std::io::stdout()).ok();
+
+            let storage_path = manager.storage_path();
+            expand_disk(storage_path, storage_gb, "storage")
+                .map_err(|e| smolvm::Error::storage("expand storage disk", e.to_string()))?;
+            println!(" done");
+        }
+    }
+
+    // Expand overlay disk if requested and changed
+    if let Some(overlay_gb) = new_overlay_gb {
+        if overlay_gb > current_overlay_gb {
+            print!(
+                "  Overlay: {} GiB → {} GiB (expanding disk...)",
+                current_overlay_gb, overlay_gb
+            );
+            std::io::Write::flush(&mut std::io::stdout()).ok();
+
+            let overlay_path = manager.overlay_path();
+            expand_disk(overlay_path, overlay_gb, "overlay")
+                .map_err(|e| smolvm::Error::storage("expand overlay disk", e.to_string()))?;
+            println!(" done");
+        }
+    }
+
+    // Update database record with new sizes
+    db.update_vm(name, |r| {
+        if let Some(s) = new_storage_gb {
+            r.storage_gb = Some(s);
+        }
+        if let Some(o) = new_overlay_gb {
+            r.overlay_gb = Some(o);
+        }
+    })?;
+
+    println!();
+    println!("{} '{}' resized successfully.", kind.display_name(), name);
+    println!("Disk changes are applied immediately; filesystem will expand on next boot.");
+
+    Ok(())
+}

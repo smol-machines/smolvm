@@ -23,6 +23,12 @@ smolvm microvm exec -- echo "hello"
 smolvm microvm exec -it -- /bin/sh   # interactive shell (exit with Ctrl+D)
 smolvm microvm stop
 
+# resize disk resources (VM must be stopped first)
+smolvm microvm resize --storage 50           # expand storage to 50 GiB
+smolvm microvm resize --overlay 20           # expand overlay to 20 GiB
+smolvm microvm resize my-vm --storage 100 --overlay 50
+# Disk changes apply immediately; filesystem expands on next boot
+
 # pack - build a portable, executable virtual machine.
 smolvm pack create alpine:latest -o ./my-sandbox        # creates ./my-sandbox + ./my-sandbox.smolmachine
 smolvm pack create alpine:latest -o ./my-sandbox --single-file  # single executable, no sidecar

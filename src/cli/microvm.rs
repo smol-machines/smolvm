@@ -44,6 +44,9 @@ pub enum MicrovmCmd {
     #[command(visible_alias = "list")]
     Ls(LsCmd),
 
+    /// Resize a microVM's disk resources
+    Resize(ResizeCmd),
+
     /// Test network connectivity from inside the VM
     #[command(hide = true)]
     NetworkTest(NetworkTestCmd),
@@ -59,6 +62,7 @@ impl MicrovmCmd {
             MicrovmCmd::Delete(cmd) => cmd.run(),
             MicrovmCmd::Status(cmd) => cmd.run(),
             MicrovmCmd::Ls(cmd) => cmd.run(),
+            MicrovmCmd::Resize(cmd) => cmd.run(),
             MicrovmCmd::NetworkTest(cmd) => cmd.run(),
         }
     }
@@ -349,6 +353,51 @@ pub struct LsCmd {
 impl LsCmd {
     pub fn run(&self) -> smolvm::Result<()> {
         vm_common::list_vms(KIND, self.verbose, self.json)
+    }
+}
+
+// ============================================================================
+// Resize Command
+// ============================================================================
+
+/// Resize a microVM's disk resources.
+///
+/// Expands the storage and/or overlay disk for a stopped microVM.
+/// The VM must be stopped before resizing. Disk expansion happens
+/// immediately; filesystem resize occurs automatically on next boot.
+///
+/// Examples:
+///   smolvm microvm resize my-vm --storage 50
+///   smolvm microvm resize my-vm --overlay 20
+///   smolvm microvm resize my-vm --storage 50 --overlay 20
+///   smolvm microvm resize --storage 50  # default VM
+#[derive(Args, Debug)]
+#[command(group(
+    clap::ArgGroup::new("resize-target")
+        .required(true)
+        .args(["storage", "overlay"])
+        .multiple(true)
+))]
+pub struct ResizeCmd {
+    /// MicroVM to resize (default: "default")
+    #[arg(value_name = "NAME")]
+    pub name: Option<String>,
+
+    /// Storage disk size in GiB (expand only)
+    #[arg(long, value_name = "GiB")]
+    pub storage: Option<u64>,
+
+    /// Overlay disk size in GiB (expand only)
+    #[arg(long, value_name = "GiB")]
+    pub overlay: Option<u64>,
+}
+
+impl ResizeCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        let name = vm_common::resolve_vm_name(self.name)?;
+        let name_str = name.as_deref().unwrap_or("default");
+
+        vm_common::resize_vm(KIND, name_str, self.storage, self.overlay)
     }
 }
 
