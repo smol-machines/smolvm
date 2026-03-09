@@ -6,6 +6,7 @@
 //!
 //! The static FFI path in `launcher.rs` remains untouched for normal operations.
 
+use crate::util::{libkrun_filename, libkrunfw_filename};
 use smolvm_protocol::ports;
 use std::ffi::{CStr, CString};
 use std::path::{Path, PathBuf};
@@ -56,10 +57,8 @@ impl KrunFunctions {
     /// Caller must ensure `lib_dir` contains valid libkrun and libkrunfw libraries.
     pub unsafe fn load(lib_dir: &Path) -> Result<Self, String> {
         // Platform-specific library names
-        #[cfg(target_os = "macos")]
-        let (fw_lib_name, lib_name) = ("libkrunfw.5.dylib", "libkrun.dylib");
-        #[cfg(target_os = "linux")]
-        let (fw_lib_name, lib_name) = ("libkrunfw.so.5", "libkrun.so");
+        let fw_lib_name = libkrunfw_filename();
+        let lib_name = libkrun_filename();
 
         // Preload libkrunfw with RTLD_GLOBAL so libkrun can find it
         let fw_lib_path = lib_dir.join(fw_lib_name);

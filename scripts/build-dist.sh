@@ -442,6 +442,11 @@ EOF
 echo "Generating checksums..."
 (cd "$DIST_DIR" && shasum -a 256 smolvm smolvm-bin lib/* > checksums.txt)
 
+# Delete existing tarball. This is because when a new release is created, there could be 
+# tarball of the old release left in dist/, and ./install-local.sh may pick up the wrong tarball
+echo "Cleaning up existing tarball..."
+rm -f "smolvm-*.tar.gz"
+
 # Create tarball
 echo "Creating tarball..."
 cd dist
