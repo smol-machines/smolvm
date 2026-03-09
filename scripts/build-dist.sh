@@ -76,6 +76,12 @@ fi
 
 echo "Building smolvm distribution: ${DIST_NAME}"
 
+# Check for git-lfs (required for library binaries)
+if ! command -v git-lfs &> /dev/null && ! git lfs version &> /dev/null 2>&1; then
+    echo "Error: git-lfs is required to build smolvm distributions"
+    exit 1
+fi
+
 # Resolve bundled library directory
 if [[ "$(uname -s)" == "Linux" ]]; then
     ARCH="$(uname -m)"

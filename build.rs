@@ -127,6 +127,17 @@ fn link_libkrun() {
 
     // Option 1: Bundle libraries with the binary
     if let Ok(bundle_path) = std::env::var("LIBKRUN_BUNDLE") {
+        // On Linux, check that the library is not an LFS pointer before linking
+        #[cfg(target_os = "linux")]
+        {
+            let lib_path = std::path::Path::new(&bundle_path).join("libkrun.so");
+            if lib_path.exists() && is_lfs_pointer(&lib_path) {
+                println!("cargo:error=libkrun.so is a Git LFS pointer, not the actual library.");
+                println!("cargo:error=Run 'git lfs pull' to fetch the actual library binary.");
+                panic!("Git LFS pointer detected");
+            }
+        }
+
         println!("cargo:rustc-link-search=native={}", bundle_path);
         link_krun();
 

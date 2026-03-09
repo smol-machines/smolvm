@@ -117,6 +117,13 @@ smolvm microvm exec --name codex-sandbox -it -- codex
 
 ## development
 
+**Prerequisites (for building from source):**
+- Rust toolchain
+- [git-lfs](https://git-lfs.com) (required for library binaries)
+- Docker (for cross-compiling the agent)
+- e2fsprogs (for storage template creation; `mkfs.ext4`)
+- LLVM (macOS only, for building libkrun: `brew install llvm`)
+
 ```bash
 # build
 ./scripts/build-dist.sh
