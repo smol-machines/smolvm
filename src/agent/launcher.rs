@@ -53,7 +53,6 @@ extern "C" {
     ) -> i32;
     fn krun_set_console_output(ctx: u32, filepath: *const libc::c_char) -> i32;
     fn krun_set_port_map(ctx: u32, port_map: *const *const libc::c_char) -> i32;
-    fn krun_set_egress_policy(ctx: u32, cidrs: *const *const libc::c_char) -> i32;
     fn krun_add_virtiofs(ctx: u32, tag: *const libc::c_char, path: *const libc::c_char) -> i32;
     fn krun_start_enter(ctx: u32) -> i32;
     fn krun_disable_implicit_vsock(ctx: u32) -> i32;
@@ -257,7 +256,25 @@ pub fn launch_agent_vm(
             }
 
             // Set egress policy if CIDRs are specified
+            // Resolved via dlsym at runtime because libkrun may not have this symbol yet.
             if has_egress_policy {
+                type SetEgressPolicyFn =
+                    unsafe extern "C" fn(u32, *const *const libc::c_char) -> i32;
+
+                let sym_name =
+                    CString::new("krun_set_egress_policy").expect("symbol name is static");
+                let sym = libc::dlsym(libc::RTLD_DEFAULT, sym_name.as_ptr());
+                if sym.is_null() {
+                    krun_free_ctx(ctx);
+                    return Err(Error::agent(
+                        "set egress policy",
+                        "libkrun does not support egress policy (krun_set_egress_policy not found). \
+                         Update libkrun or remove --allow-ip flags.",
+                    ));
+                }
+                #[allow(clippy::missing_transmute_annotations)]
+                let set_egress: SetEgressPolicyFn = std::mem::transmute(sym);
+
                 let cidr_cstrings: Vec<CString> = resources
                     .allow_cidrs
                     .iter()
@@ -267,7 +284,7 @@ pub fn launch_agent_vm(
                     cidr_cstrings.iter().map(|s| s.as_ptr()).collect();
                 cidr_ptrs.push(std::ptr::null());
 
-                if krun_set_egress_policy(ctx, cidr_ptrs.as_ptr()) < 0 {
+                if set_egress(ctx, cidr_ptrs.as_ptr()) < 0 {
                     krun_free_ctx(ctx);
                     return Err(Error::agent(
                         "set egress policy",
