@@ -1,0 +1,15 @@
+# Node.js dev environment in a hardware-isolated microVM
+#
+#   smolvm microvm create dev -s node.smolfile
+#   smolvm microvm start dev
+#   smolvm microvm exec --name dev -- node -e "console.log('hello from microVM')"
+
+cpus = 2
+memory = 512
+net = true
+
+ports = ["3000:3000"]
+
+init = [
+    "apk add --no-cache nodejs npm",
+]

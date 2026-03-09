@@ -18,14 +18,13 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use crate::crun::{ensure_path_in_env, CrunCommand};
+use crate::crun::CrunCommand;
 use crate::oci::{generate_container_id, OciSpec};
 use crate::paths;
 use crate::process::{wait_with_timeout, WaitResult, TIMEOUT_EXIT_CODE};
@@ -182,6 +181,19 @@ pub enum ContainerState {
     Running,
     /// Container has stopped.
     Stopped,
+}
+
+impl ContainerState {
+    /// Parse a crun status string into a ContainerState.
+    /// Returns `None` for unrecognized status values.
+    fn from_crun_status(status: &str) -> Option<Self> {
+        match status {
+            "running" => Some(ContainerState::Running),
+            "stopped" | "exited" => Some(ContainerState::Stopped),
+            "created" => Some(ContainerState::Created),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for ContainerState {
@@ -469,29 +481,48 @@ impl ContainerRegistry {
             containers.keys().cloned().collect()
         };
 
+        if container_ids.is_empty() {
+            debug!("no containers to reconcile");
+            // Still persist to update instance_id
+            self.persist()?;
+            info!("registry reconciliation complete");
+            return Ok(());
+        }
+
+        // Get all container states in one `crun list` call instead of
+        // N separate `crun state` calls (~6ms each).
+        // Falls back to per-container `crun state` if batch call fails,
+        // to avoid incorrectly treating all containers as gone.
+        let crun_states = get_crun_states_batch();
+        if crun_states.is_none() {
+            warn!("crun list failed, falling back to per-container crun state");
+        }
+
         let mut to_remove = Vec::new();
         let mut to_update = Vec::new();
 
-        for id in container_ids {
-            // Check crun state
-            let crun_state = get_crun_state(&id);
-            let exit_code = read_exit_code(&id);
+        for id in &container_ids {
+            let per_container_state;
+            let crun_status = match &crun_states {
+                Some(states) => states.get(id.as_str()),
+                None => {
+                    // Batch failed — fall back to per-container crun state
+                    per_container_state = get_crun_state(id).ok();
+                    per_container_state.as_ref()
+                }
+            };
+            let exit_code = read_exit_code(id);
 
-            match crun_state {
-                Ok(state) => {
-                    let new_state = match state.as_str() {
-                        "running" => ContainerState::Running,
-                        "stopped" | "exited" => ContainerState::Stopped,
-                        "created" => ContainerState::Created,
-                        _ => {
-                            warn!(container_id = %id, state = %state, "unknown crun state");
-                            ContainerState::Stopped
-                        }
-                    };
+            match crun_status {
+                Some(state) => {
+                    let new_state = ContainerState::from_crun_status(state).unwrap_or_else(|| {
+                        warn!(container_id = %id, state = %state, "unknown crun state");
+                        ContainerState::Stopped
+                    });
                     to_update.push((id.clone(), new_state));
                     debug!(container_id = %id, state = %state, "reconciled container");
                 }
-                Err(_) => {
+                None => {
                     // Container doesn't exist in crun
                     if exit_code.is_some() {
                         // Container exited, mark as stopped
@@ -530,6 +561,26 @@ impl ContainerRegistry {
 impl Default for ContainerRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl ContainerRegistry {
+    /// Lazily load the registry from disk and reconcile with crun state.
+    ///
+    /// Called on first container operation that needs full registry state
+    /// (list, stop, delete, status). Deferred from boot to avoid ~30-50ms
+    /// of wasted work when no container operations are requested.
+    pub fn ensure_loaded(&self) {
+        use std::sync::Once;
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            if let Err(e) = self.load() {
+                warn!(error = %e, "failed to load container registry");
+            }
+            if let Err(e) = self.reconcile() {
+                warn!(error = %e, "failed to reconcile container registry");
+            }
+        });
     }
 }
 
@@ -655,19 +706,9 @@ pub fn create_container(
 
     // Create the container with crun create (does NOT start it)
     // This puts the container in "created" state, ready for `crun start`
-    let crun_args = [
-        "--cgroup-manager",
-        paths::CRUN_CGROUP_MANAGER,
-        "create",
-        "--bundle",
-        &bundle_path.to_string_lossy(),
-        &container_id,
-    ];
     info!(
         container_id = %container_id,
         bundle = %bundle_path.display(),
-        crun_path = paths::CRUN_PATH,
-        crun_args = ?crun_args,
         "creating container with crun"
     );
 
@@ -698,12 +739,7 @@ pub fn create_container(
 
     // Use spawn with timeout - don't capture stdout/stderr as pipes can block
     // when child processes inherit fds
-    info!("about to call crun create");
-    let mut child = Command::new(paths::CRUN_PATH)
-        .args(crun_args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null()) // Don't capture - can cause blocking
-        .stderr(Stdio::null()) // Don't capture - can cause blocking
+    let mut child = CrunCommand::create(&bundle_path, &container_id)
         .spawn()
         .map_err(|e| StorageError::new(format!("failed to spawn crun create: {}", e)))?;
 
@@ -905,21 +941,9 @@ pub fn start_container(container_id: &str) -> Result<(), StorageError> {
             }
 
             // Recreate the container using spawn + timeout pattern (same as create_container)
-            // Using Stdio::null() to avoid pipe blocking
             info!(container_id = %info.id, bundle = %info.bundle_path.display(), "recreating container");
 
-            let mut child = Command::new(paths::CRUN_PATH)
-                .args([
-                    "--cgroup-manager",
-                    paths::CRUN_CGROUP_MANAGER,
-                    "create",
-                    "--bundle",
-                    &info.bundle_path.to_string_lossy(),
-                    &info.id,
-                ])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null()) // Don't capture - can cause blocking
-                .stderr(Stdio::null()) // Don't capture - can cause blocking
+            let mut child = CrunCommand::create(&info.bundle_path, &info.id)
                 .spawn()
                 .map_err(|e| StorageError::new(format!("failed to spawn crun create: {}", e)))?;
 
@@ -960,16 +984,9 @@ pub fn start_container(container_id: &str) -> Result<(), StorageError> {
             debug!(container_id = %info.id, "container recreated, now starting");
 
             // Now start it directly with crun start (also use spawn + timeout)
-            let mut child = Command::new(paths::CRUN_PATH)
-                .args([
-                    "--cgroup-manager",
-                    paths::CRUN_CGROUP_MANAGER,
-                    "start",
-                    &info.id,
-                ])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
+            let mut child = CrunCommand::start(&info.id)
+                .stdin_null()
+                .discard_output()
                 .spawn()
                 .map_err(|e| StorageError::new(format!("failed to spawn crun start: {}", e)))?;
 
@@ -1051,31 +1068,7 @@ pub fn exec_in_container(
         "executing command in container"
     );
 
-    if let Some(wd) = workdir {
-        // exec_with_env doesn't support workdir directly, so we build manually
-        // Ensure PATH is set for command lookup when using --env
-        let env_with_path = ensure_path_in_env(env);
-        let mut cmd = Command::new(paths::CRUN_PATH);
-        cmd.args(["--cgroup-manager", paths::CRUN_CGROUP_MANAGER, "exec"]);
-        for (key, value) in &env_with_path {
-            cmd.args(["--env", &format!("{}={}", key, value)]);
-        }
-        cmd.args(["--cwd", wd]);
-        cmd.arg(&info.id);
-        cmd.args(command);
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| StorageError::new(format!("failed to spawn crun exec: {}", e)))?;
-
-        let result = wait_with_timeout(&mut child, timeout_ms, None)?;
-        return convert_wait_result_to_exec(&info.id, result);
-    }
-
-    // No workdir - use CrunCommand (which handles PATH internally)
-    let mut child = CrunCommand::exec_with_env(&info.id, env, command)
+    let mut child = CrunCommand::exec(&info.id, env, command, workdir, false)
         .capture_output()
         .spawn()
         .map_err(|e| StorageError::new(format!("failed to spawn crun exec: {}", e)))?;
@@ -1148,37 +1141,10 @@ pub fn spawn_interactive_exec(
         "spawning interactive exec in container"
     );
 
-    // Build crun exec command
-    let mut cmd = Command::new(paths::CRUN_PATH);
-    cmd.arg("exec");
-
-    // Add TTY flag if requested
-    if tty {
-        cmd.arg("--tty");
-    }
-
-    // Add environment variables (ensure PATH is set for command lookup)
-    let env_with_path = ensure_path_in_env(env);
-    for (key, value) in &env_with_path {
-        cmd.args(["--env", &format!("{}={}", key, value)]);
-    }
-
-    // Add working directory
-    if let Some(wd) = workdir {
-        cmd.args(["--cwd", wd]);
-    }
-
-    // Add container ID and command
-    cmd.arg(&info.id);
-    cmd.args(command);
-
-    // Setup piped stdio for streaming
-    cmd.stdin(Stdio::piped());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-
-    // Spawn the exec
-    let child = cmd
+    // Spawn crun exec with piped stdio for streaming
+    let child = CrunCommand::exec(&info.id, env, command, workdir, tty)
+        .stdin_piped()
+        .capture_output()
         .spawn()
         .map_err(|e| StorageError::new(format!("failed to spawn crun exec: {}", e)))?;
 
@@ -1189,6 +1155,7 @@ pub fn spawn_interactive_exec(
 
 /// Stop a running container.
 pub fn stop_container(container_id: &str, timeout_secs: u64) -> Result<(), StorageError> {
+    REGISTRY.ensure_loaded();
     let info = REGISTRY
         .find_by_prefix(container_id)
         .ok_or_else(|| StorageError::new(format!("container not found: {}", container_id)))?;
@@ -1231,6 +1198,7 @@ pub fn stop_container(container_id: &str, timeout_secs: u64) -> Result<(), Stora
 
 /// Delete a container (must be stopped).
 pub fn delete_container(container_id: &str, force: bool) -> Result<(), StorageError> {
+    REGISTRY.ensure_loaded();
     let info = REGISTRY
         .find_by_prefix(container_id)
         .ok_or_else(|| StorageError::new(format!("container not found: {}", container_id)))?;
@@ -1284,17 +1252,15 @@ pub fn delete_container(container_id: &str, force: bool) -> Result<(), StorageEr
 
 /// List all containers with their current state.
 pub fn list_containers() -> Vec<ContainerInfo> {
+    REGISTRY.ensure_loaded();
     let mut containers = REGISTRY.list();
 
     // Update states from crun
     for container in &mut containers {
         if let Ok(state) = get_crun_state(&container.id) {
-            container.state = match state.as_str() {
-                "running" => ContainerState::Running,
-                "stopped" | "exited" => ContainerState::Stopped,
-                "created" => ContainerState::Created,
-                _ => container.state,
-            };
+            if let Some(new_state) = ContainerState::from_crun_status(&state) {
+                container.state = new_state;
+            }
         }
     }
 
@@ -1327,6 +1293,49 @@ fn get_crun_state(container_id: &str) -> Result<String, StorageError> {
             context: "crun state".into(),
             field: "status".into(),
         })
+}
+
+/// Get all container states in a single `crun list` call.
+///
+/// Returns `Some(map)` of container_id → status string on success,
+/// or `None` if `crun list` failed (so callers can fall back to per-container state).
+/// Much faster than calling `crun state` per container (~6ms per process spawn).
+fn get_crun_states_batch() -> Option<HashMap<String, String>> {
+    let output = match CrunCommand::list().output() {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => {
+            warn!(
+                exit_code = ?o.status.code(),
+                stderr = %String::from_utf8_lossy(&o.stderr),
+                "crun list failed"
+            );
+            return None;
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to run crun list");
+            return None;
+        }
+    };
+
+    // crun list -f json returns an array of objects with "id" and "status" fields
+    let entries: Vec<serde_json::Value> = match serde_json::from_slice(&output.stdout) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = %e, "failed to parse crun list output");
+            return None;
+        }
+    };
+
+    Some(
+        entries
+            .iter()
+            .filter_map(|entry| {
+                let id = entry["id"].as_str()?;
+                let status = entry["status"].as_str()?;
+                Some((id.to_string(), status.to_string()))
+            })
+            .collect(),
+    )
 }
 
 /// Read exit code from the exit file for a container.

@@ -1,0 +1,15 @@
+# Python dev environment in a hardware-isolated microVM
+#
+#   smolvm microvm create dev -s python.smolfile
+#   smolvm microvm start dev
+#   smolvm microvm exec --name dev -- python3 --version
+
+cpus = 2
+memory = 512
+net = true
+
+ports = ["8080:8080"]
+
+init = [
+    "apk add --no-cache python3",
+]

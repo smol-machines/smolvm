@@ -136,6 +136,7 @@ test_microvm_named_vm() {
     # Stop and delete
     $SMOLVM microvm stop "$vm_name" 2>&1
     $SMOLVM microvm delete "$vm_name" -f 2>&1
+    ensure_data_dir_deleted "$vm_name"
 }
 
 # =============================================================================
@@ -182,6 +183,7 @@ test_db_persistence_across_restart() {
 
     # Clean up
     $SMOLVM microvm delete "$vm_name" -f 2>&1
+    ensure_data_dir_deleted "$vm_name"
 }
 
 test_db_vm_state_update() {
@@ -225,6 +227,7 @@ test_db_vm_state_update() {
 
     # Clean up
     $SMOLVM microvm delete "$vm_name" -f 2>&1
+    ensure_data_dir_deleted "$vm_name"
 
     [[ "$stopped_state" == *'"state": "stopped"'* ]]
 }
@@ -248,6 +251,7 @@ test_db_delete_removes_from_db() {
 
     # Delete it
     $SMOLVM microvm delete "$vm_name" -f 2>&1
+    ensure_data_dir_deleted "$vm_name"
 
     # Verify it's gone
     local after_delete
@@ -281,6 +285,7 @@ test_microvm_network_disabled_by_default() {
     # Clean up
     $SMOLVM microvm stop "$vm_name" 2>/dev/null || true
     $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+    ensure_data_dir_deleted "$vm_name"
 
     # Should fail (non-zero exit code) because network is disabled
     [[ $exit_code -ne 0 ]]
@@ -304,6 +309,7 @@ test_microvm_network_dns_resolution() {
     # Clean up
     $SMOLVM microvm stop "$vm_name" 2>/dev/null || true
     $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+    ensure_data_dir_deleted "$vm_name"
 
     # Should succeed and contain resolved address info
     [[ $exit_code -eq 0 ]] && [[ "$output" == *"Address"* ]]
@@ -327,6 +333,7 @@ test_microvm_network_multiple_dns_lookups() {
     # Clean up
     $SMOLVM microvm stop "$vm_name" 2>/dev/null || true
     $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+    ensure_data_dir_deleted "$vm_name"
 
     # Should succeed and contain addresses for both
     [[ $exit_code -eq 0 ]] && [[ "$output" == *"Address"* ]]
@@ -355,6 +362,7 @@ test_microvm_overlay_root_active() {
     # Clean up
     $SMOLVM microvm stop "$vm_name" 2>/dev/null || true
     $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+    ensure_data_dir_deleted "$vm_name"
 
     [[ $exit_code -eq 0 ]] && [[ "$output" == *"overlay on / type overlay"* ]]
 }
@@ -403,6 +411,7 @@ test_microvm_rootfs_persists_across_reboot() {
     # Clean up
     $SMOLVM microvm stop "$vm_name" 2>/dev/null || true
     $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+    ensure_data_dir_deleted "$vm_name"
 
     [[ $exit_code -eq 0 ]] && [[ "$output" == *"persistence-test-ok"* ]]
 }
@@ -485,6 +494,192 @@ test_microvm_egress_invalid_cidr_rejected() {
 }
 
 # =============================================================================
+# Default VM DB Persistence
+# Tests verify that the default VM lifecycle is reflected in the DB.
+# =============================================================================
+
+test_db_default_vm_appears_in_list_on_start() {
+    cleanup_microvm
+
+    # Start the default VM (no name)
+    $SMOLVM microvm start 2>&1 || return 1
+
+    # Verify "default" appears in microvm ls --json as running
+    local list_output
+    list_output=$($SMOLVM microvm ls --json 2>&1)
+
+    # Clean up
+    $SMOLVM microvm stop 2>/dev/null || true
+
+    [[ "$list_output" == *'"name": "default"'* ]] && \
+    [[ "$list_output" == *'"state": "running"'* ]]
+}
+
+test_db_default_vm_shows_stopped_after_stop() {
+    cleanup_microvm
+
+    # Start then stop the default VM
+    $SMOLVM microvm start 2>&1 || return 1
+    $SMOLVM microvm stop 2>&1 || return 1
+
+    # Verify "default" shows as stopped
+    local list_output
+    list_output=$($SMOLVM microvm ls --json 2>&1)
+
+    [[ "$list_output" == *'"name": "default"'* ]] && \
+    [[ "$list_output" == *'"state": "stopped"'* ]]
+}
+
+test_db_default_vm_state_transitions() {
+    cleanup_microvm
+
+    # Start default VM
+    $SMOLVM microvm start 2>&1 || return 1
+
+    # Check running state
+    local running_state
+    running_state=$($SMOLVM microvm ls --json 2>&1)
+    if [[ "$running_state" != *'"state": "running"'* ]]; then
+        echo "State should be 'running' after start"
+        $SMOLVM microvm stop 2>/dev/null || true
+        return 1
+    fi
+
+    # Stop default VM
+    $SMOLVM microvm stop 2>&1 || return 1
+
+    # Check stopped state
+    local stopped_state
+    stopped_state=$($SMOLVM microvm ls --json 2>&1)
+    if [[ "$stopped_state" != *'"state": "stopped"'* ]]; then
+        echo "State should be 'stopped' after stop"
+        return 1
+    fi
+
+    # Restart and check running again
+    $SMOLVM microvm start 2>&1 || return 1
+    local restarted_state
+    restarted_state=$($SMOLVM microvm ls --json 2>&1)
+
+    # Clean up
+    $SMOLVM microvm stop 2>/dev/null || true
+
+    [[ "$restarted_state" == *'"state": "running"'* ]]
+}
+
+# =============================================================================
+# Volume Mounts
+# =============================================================================
+
+test_microvm_volume_mount_visible_to_exec() {
+    local vm_name="test-vm-volmnt"
+
+    # Clean up any existing
+    $SMOLVM microvm stop "$vm_name" 2>/dev/null || true
+    $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+
+    # Create a host directory with a test file
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    echo "volume-mount-marker-54321" > "$tmpdir/testfile.txt"
+
+    # Create and start VM with volume mount
+    $SMOLVM microvm create "$vm_name" -v "$tmpdir:/mnt/hostdata" 2>&1 || {
+        rm -rf "$tmpdir"
+        return 1
+    }
+    $SMOLVM microvm start "$vm_name" 2>&1 || {
+        $SMOLVM microvm delete "$vm_name" -f 2>/dev/null
+        rm -rf "$tmpdir"
+        return 1
+    }
+
+    # Read the file via microvm exec (VmExec) — this exercises boot-time mount
+    local output
+    output=$($SMOLVM microvm exec --name "$vm_name" -- cat /mnt/hostdata/testfile.txt 2>&1)
+
+    # Cleanup
+    $SMOLVM microvm stop "$vm_name" 2>/dev/null || true
+    $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+    rm -rf "$tmpdir"
+    ensure_data_dir_deleted "$vm_name"
+
+    [[ "$output" == *"volume-mount-marker-54321"* ]]
+}
+
+# =============================================================================
+# Port Mapping
+# =============================================================================
+
+test_microvm_port_mapping_http() {
+    local vm_name="test-vm-portmap"
+
+    $SMOLVM microvm stop "$vm_name" 2>/dev/null || true
+    $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+
+    # Create and start VM with port mapping (host 18199 -> guest 8080)
+    $SMOLVM microvm create "$vm_name" -p 18199:8080 2>&1 || return 1
+    $SMOLVM microvm start "$vm_name" 2>&1 || {
+        $SMOLVM microvm delete "$vm_name" -f 2>/dev/null
+        return 1
+    }
+
+    # Start a simple HTTP responder inside the VM (background exec)
+    $SMOLVM microvm exec --name "$vm_name" -- \
+        sh -c 'echo -e "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok" | nc -l -p 8080 -w 5' &
+    local server_pid=$!
+    sleep 1
+
+    # Curl the mapped port from the host
+    local output
+    output=$(curl -s --connect-timeout 5 http://127.0.0.1:18199/ 2>&1)
+    local curl_rc=$?
+
+    kill "$server_pid" 2>/dev/null || true
+    wait "$server_pid" 2>/dev/null || true
+
+    # Cleanup
+    $SMOLVM microvm stop "$vm_name" 2>/dev/null || true
+    $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+    ensure_data_dir_deleted "$vm_name"
+
+    [[ $curl_rc -eq 0 ]] && [[ "$output" == *"ok"* ]]
+}
+
+# =============================================================================
+# Overlay Size
+# =============================================================================
+
+test_microvm_overlay_size() {
+    local vm_name="test-vm-overlay-size"
+
+    $SMOLVM microvm stop "$vm_name" 2>/dev/null || true
+    $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+
+    # Create VM with custom overlay size (4 GiB)
+    $SMOLVM microvm create "$vm_name" --overlay 4 2>&1 || return 1
+    $SMOLVM microvm start "$vm_name" 2>&1 || {
+        $SMOLVM microvm delete "$vm_name" -f 2>/dev/null
+        return 1
+    }
+
+    # Check the overlay disk size inside the VM via df
+    local df_output
+    df_output=$($SMOLVM microvm exec --name "$vm_name" -- df -m / 2>&1)
+
+    # Cleanup
+    $SMOLVM microvm stop "$vm_name" 2>/dev/null || true
+    $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+    ensure_data_dir_deleted "$vm_name"
+
+    # The 4GB overlay should show ~3800-4096 MB total (ext4 overhead)
+    # Just verify it's > 3000 MB (not the old 2GB default)
+    local total_mb
+    total_mb=$(echo "$df_output" | tail -1 | awk '{print $2}')
+    [[ "$total_mb" -gt 3000 ]]
+}
+
+# =============================================================================
 # Run Tests
 # =============================================================================
 
@@ -501,6 +696,9 @@ run_test "Exec when stopped fails" test_microvm_exec_when_stopped || true
 run_test "DB persistence across restart" test_db_persistence_across_restart || true
 run_test "DB VM state update" test_db_vm_state_update || true
 run_test "DB delete removes from database" test_db_delete_removes_from_db || true
+run_test "DB default VM appears in list on start" test_db_default_vm_appears_in_list_on_start || true
+run_test "DB default VM shows stopped after stop" test_db_default_vm_shows_stopped_after_stop || true
+run_test "DB default VM state transitions" test_db_default_vm_state_transitions || true
 run_test "Network: disabled by default" test_microvm_network_disabled_by_default || true
 run_test "Network: DNS resolution" test_microvm_network_dns_resolution || true
 run_test "Network: multiple DNS lookups" test_microvm_network_multiple_dns_lookups || true
@@ -510,5 +708,8 @@ run_test "Egress: allow-ip permits matching traffic" test_microvm_egress_allow_i
 run_test "Egress: allow-ip blocks non-matching traffic" test_microvm_egress_allow_ip_blocked || true
 run_test "Egress: --outbound-localhost-only blocks external" test_microvm_egress_outbound_localhost_only || true
 run_test "Egress: invalid CIDR rejected at create" test_microvm_egress_invalid_cidr_rejected || true
+run_test "Volume: mount visible to exec" test_microvm_volume_mount_visible_to_exec || true
+run_test "Port: mapping host to guest HTTP" test_microvm_port_mapping_http || true
+run_test "Overlay: custom size via --overlay" test_microvm_overlay_size || true
 
 print_summary "MicroVM Tests"

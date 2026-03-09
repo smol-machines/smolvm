@@ -24,6 +24,9 @@ echo "  smolvm Container Tests"
 echo "=========================================="
 echo ""
 
+# Container tests need networking to pull images inside the guest VM
+ensure_microvm_running true
+
 # =============================================================================
 # Create
 # =============================================================================

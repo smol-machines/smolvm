@@ -60,6 +60,259 @@ fn find_e2fsprogs_tool(name: &str) -> Option<String> {
     None
 }
 
+// ============================================================================
+// Shared ext4 disk operations
+// ============================================================================
+
+/// Create a sparse disk image file.
+fn create_sparse_disk(path: &Path, size_bytes: u64, label: &str) -> Result<()> {
+    use std::fs::OpenOptions;
+    use std::io::{Seek, SeekFrom, Write};
+
+    assert!(size_bytes > 0, "disk size must be greater than 0");
+
+    tracing::info!(path = %path.display(), size_gb = size_bytes / (1024*1024*1024), "creating sparse {} disk", label);
+
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    file.seek(SeekFrom::Start(size_bytes - 1))?;
+    file.write_all(&[0])?;
+
+    Ok(())
+}
+
+/// Find a pre-formatted disk template by filename.
+///
+/// Searches in order:
+/// 1. `~/.smolvm/{filename}` (installed location)
+/// 2. Next to the current executable (development)
+fn find_disk_template(template_filename: &str) -> Option<PathBuf> {
+    if let Some(home) = dirs::home_dir() {
+        let installed_path = home.join(".smolvm").join(template_filename);
+        if installed_path.exists() {
+            tracing::debug!(path = %installed_path.display(), "found disk template");
+            return Some(installed_path);
+        }
+    }
+
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            let dev_path = exe_dir.join(template_filename);
+            if dev_path.exists() {
+                tracing::debug!(path = %dev_path.display(), "found disk template (dev)");
+                return Some(dev_path);
+            }
+        }
+    }
+
+    None
+}
+
+/// Copy a disk from a pre-formatted template, resizing to target size.
+///
+/// On macOS, uses `clonefile()` for instant APFS copy-on-write cloning.
+/// On Linux, falls back to `fs::copy` (which uses `copy_file_range` for
+/// sparse-aware copying on supported filesystems).
+fn copy_disk_from_template(
+    disk_path: &Path,
+    size_bytes: u64,
+    template_path: &Path,
+    label: &str,
+) -> Result<()> {
+    tracing::info!(
+        template = %template_path.display(),
+        target = %disk_path.display(),
+        "copying {} from template", label
+    );
+
+    if let Some(parent) = disk_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| Error::storage("create directory", e.to_string()))?;
+    }
+
+    clone_or_copy_file(template_path, disk_path)?;
+
+    // Resize to the desired size (template may be smaller than target)
+    use std::io::{Seek, SeekFrom, Write};
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(disk_path)
+        .map_err(|e| Error::storage("open for resize", e.to_string()))?;
+
+    file.seek(SeekFrom::Start(size_bytes - 1))
+        .map_err(|e| Error::storage("seek for resize", e.to_string()))?;
+    file.write_all(&[0])
+        .map_err(|e| Error::storage("extend disk", e.to_string()))?;
+
+    // Filesystem resize happens inside the VM (guest runs resize2fs on boot).
+
+    mark_disk_formatted(disk_path)?;
+
+    tracing::info!(path = %disk_path.display(), "{} copied from template", label);
+    Ok(())
+}
+
+/// Clone a file using platform-optimal method.
+///
+/// - macOS: `clonefile()` for instant APFS copy-on-write (falls back to `fs::copy`)
+/// - Linux: `fs::copy` (uses `copy_file_range` for sparse-aware copy)
+fn clone_or_copy_file(src: &Path, dst: &Path) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::CString;
+
+        // clonefile(2) requires the destination to not exist
+        if dst.exists() {
+            let _ = std::fs::remove_file(dst);
+        }
+
+        let src_c = CString::new(src.to_string_lossy().as_bytes())
+            .map_err(|e| Error::storage("clonefile src path", e.to_string()))?;
+        let dst_c = CString::new(dst.to_string_lossy().as_bytes())
+            .map_err(|e| Error::storage("clonefile dst path", e.to_string()))?;
+
+        // clonefile(2): instant APFS copy-on-write clone
+        let ret = unsafe { libc::clonefile(src_c.as_ptr(), dst_c.as_ptr(), 0) };
+        if ret == 0 {
+            tracing::debug!(src = %src.display(), dst = %dst.display(), "clonefile succeeded");
+            return Ok(());
+        }
+
+        // Fall back to regular copy if clonefile fails (e.g., non-APFS filesystem)
+        tracing::debug!(
+            src = %src.display(),
+            errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+            "clonefile failed, falling back to fs::copy"
+        );
+    }
+
+    std::fs::copy(src, dst).map_err(|e| Error::storage("copy template", e.to_string()))?;
+    Ok(())
+}
+
+/// Format a disk with mkfs.ext4 (requires e2fsprogs).
+fn format_disk_with_mkfs(disk_path: &Path, volume_label: &str, label: &str) -> Result<()> {
+    tracing::info!(path = %disk_path.display(), "formatting {} disk with mkfs.ext4", label);
+
+    let mkfs_path = find_e2fsprogs_tool("mkfs.ext4").ok_or_else(|| {
+        let hint = if Os::current().is_macos() {
+            "On macOS, install with: brew install e2fsprogs"
+        } else {
+            "On Linux, install with: apt install e2fsprogs (or equivalent)"
+        };
+        Error::storage(
+            "find mkfs.ext4",
+            format!(
+                "mkfs.ext4 not found - required for {} disk formatting.\n  {}",
+                label, hint
+            ),
+        )
+    })?;
+
+    let path_str = disk_path
+        .to_str()
+        .ok_or_else(|| Error::storage("validate path", "disk path contains invalid characters"))?;
+
+    let output = std::process::Command::new(mkfs_path)
+        .args([
+            "-F",
+            "-q",
+            "-m",
+            "0",
+            "-O",
+            "^has_journal",
+            "-L",
+            volume_label,
+            path_str,
+        ])
+        .output()
+        .map_err(|e| Error::storage("run mkfs.ext4", e.to_string()))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::storage("format with mkfs.ext4", stderr.to_string()));
+    }
+
+    mark_disk_formatted(disk_path)?;
+
+    tracing::info!(path = %disk_path.display(), "{} disk formatted successfully", label);
+    Ok(())
+}
+
+/// Check if a disk file appears to be a valid ext4 filesystem.
+/// Used in tests; removed from hot path to avoid spawning `file` command on every start.
+#[cfg(test)]
+fn disk_appears_valid_ext4(disk_path: &Path) -> bool {
+    let output = std::process::Command::new("file")
+        .arg("-b")
+        .arg(disk_path)
+        .output();
+
+    match output {
+        Ok(output) if output.status.success() => {
+            let desc = String::from_utf8_lossy(&output.stdout);
+            let is_ext4 = desc.contains("ext4") || desc.contains("ext2") || desc.contains("ext3");
+            if !is_ext4 {
+                tracing::debug!(
+                    path = %disk_path.display(),
+                    file_type = %desc.trim(),
+                    "disk is not ext4"
+                );
+            }
+            is_ext4
+        }
+        _ => {
+            tracing::debug!(path = %disk_path.display(), "could not verify disk type, assuming valid");
+            true
+        }
+    }
+}
+
+/// Check if a disk needs to be formatted.
+///
+/// Fast path: if the format marker AND the disk file both exist, the disk
+/// was formatted successfully — skip the expensive `file` command validation.
+/// The marker is only created after successful mkfs.ext4 completion.
+fn disk_needs_format(disk_path: &Path, _label: &str) -> bool {
+    let marker_path = disk_marker_path(disk_path);
+
+    if !marker_path.exists() {
+        return true;
+    }
+
+    if !disk_path.exists() {
+        // Marker exists but disk is gone — stale marker
+        let _ = std::fs::remove_file(&marker_path);
+        return true;
+    }
+
+    // Both marker and disk exist — disk was formatted successfully.
+    // Skip spawning `file` command (~10ms) on every restart.
+    false
+}
+
+/// Get the path to the format marker file for a disk.
+fn disk_marker_path(disk_path: &Path) -> PathBuf {
+    disk_path.with_extension("formatted")
+}
+
+/// Mark a disk as formatted by creating its marker file.
+fn mark_disk_formatted(disk_path: &Path) -> Result<()> {
+    std::fs::write(disk_marker_path(disk_path), "1")?;
+    Ok(())
+}
+
+/// Delete a disk image and its marker file.
+fn delete_disk_and_marker(disk_path: &Path) -> Result<()> {
+    if disk_path.exists() {
+        std::fs::remove_file(disk_path)?;
+    }
+    let marker = disk_marker_path(disk_path);
+    if marker.exists() {
+        std::fs::remove_file(&marker)?;
+    }
+    Ok(())
+}
+
 /// Disk format version info (stored at `/.smolvm/version.json` in ext4 disk).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiskVersion {
@@ -186,28 +439,8 @@ impl StorageDisk {
         }
     }
 
-    /// Create a sparse disk image.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `size_bytes` is 0 (would cause underflow).
     fn create_sparse(path: &Path, size_bytes: u64) -> Result<()> {
-        use std::fs::OpenOptions;
-        use std::io::{Seek, SeekFrom, Write};
-
-        // Guard against zero-size disk (would underflow in seek)
-        assert!(size_bytes > 0, "disk size must be greater than 0");
-
-        tracing::info!(path = %path.display(), size_gb = size_bytes / (1024*1024*1024), "creating sparse storage disk");
-
-        let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-
-        // Seek to end and write a single byte to create sparse file
-        file.seek(SeekFrom::Start(size_bytes - 1))?;
-        file.write_all(&[0])?;
-        file.sync_all()?;
-
-        Ok(())
+        create_sparse_disk(path, size_bytes, "storage")
     }
 
     /// Pre-format the disk with ext4 on the host.
@@ -222,132 +455,10 @@ impl StorageDisk {
             tracing::debug!(path = %self.path.display(), "disk already formatted");
             return Ok(());
         }
-
-        // Try to copy from pre-formatted template first (no dependencies)
-        if let Some(template_path) = Self::find_storage_template() {
-            return self.copy_from_template(&template_path);
+        if let Some(template_path) = find_disk_template("storage-template.ext4") {
+            return copy_disk_from_template(&self.path, self.size_bytes, &template_path, "storage");
         }
-
-        // Fall back to formatting with mkfs.ext4
-        self.format_with_mkfs()
-    }
-
-    /// Find the pre-formatted storage template.
-    ///
-    /// Searches in order:
-    /// 1. ~/.smolvm/storage-template.ext4 (installed location)
-    /// 2. Next to the current executable (development)
-    fn find_storage_template() -> Option<PathBuf> {
-        const TEMPLATE_FILENAME: &str = "storage-template.ext4";
-
-        // Check ~/.smolvm/ (installed location)
-        if let Some(home) = dirs::home_dir() {
-            let installed_path = home.join(".smolvm").join(TEMPLATE_FILENAME);
-            if installed_path.exists() {
-                tracing::debug!(path = %installed_path.display(), "found storage template");
-                return Some(installed_path);
-            }
-        }
-
-        // Check next to the current executable (development/testing)
-        if let Ok(exe_path) = std::env::current_exe() {
-            if let Some(exe_dir) = exe_path.parent() {
-                let dev_path = exe_dir.join(TEMPLATE_FILENAME);
-                if dev_path.exists() {
-                    tracing::debug!(path = %dev_path.display(), "found storage template (dev)");
-                    return Some(dev_path);
-                }
-            }
-        }
-
-        None
-    }
-
-    /// Copy the storage disk from a pre-formatted template.
-    fn copy_from_template(&self, template_path: &Path) -> Result<()> {
-        tracing::info!(
-            template = %template_path.display(),
-            target = %self.path.display(),
-            "copying storage from template"
-        );
-
-        // Ensure parent directory exists
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| Error::storage("create directory", e.to_string()))?;
-        }
-
-        // Copy the template file
-        std::fs::copy(template_path, &self.path)
-            .map_err(|e| Error::storage("copy template", e.to_string()))?;
-
-        // Resize to the desired size (template is 512MB, we want 20GB)
-        // This just extends the sparse file - doesn't use actual disk space
-        use std::io::{Seek, SeekFrom, Write};
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&self.path)
-            .map_err(|e| Error::storage("open for resize", e.to_string()))?;
-
-        file.seek(SeekFrom::Start(self.size_bytes - 1))
-            .map_err(|e| Error::storage("seek for resize", e.to_string()))?;
-        file.write_all(&[0])
-            .map_err(|e| Error::storage("extend storage", e.to_string()))?;
-        file.sync_all()
-            .map_err(|e| Error::storage("sync storage", e.to_string()))?;
-
-        // Filesystem resize happens inside the VM (guest runs resize2fs on boot).
-
-        // Mark as formatted
-        self.mark_formatted()?;
-
-        tracing::info!(path = %self.path.display(), "storage copied from template");
-        Ok(())
-    }
-
-    /// Format the disk using mkfs.ext4 (fallback when no template available).
-    ///
-    /// This is only used if the pre-formatted storage template is missing.
-    /// Requires e2fsprogs to be installed on the host.
-    fn format_with_mkfs(&self) -> Result<()> {
-        tracing::info!(path = %self.path.display(), "formatting disk with mkfs.ext4");
-
-        let mkfs_path = find_e2fsprogs_tool("mkfs.ext4").ok_or_else(|| {
-            let hint = if Os::current().is_macos() {
-                "On macOS, install with: brew install e2fsprogs"
-            } else {
-                "On Linux, install with: apt install e2fsprogs (or equivalent for your distro)"
-            };
-            Error::storage(
-                "find mkfs.ext4",
-                format!(
-                    "mkfs.ext4 not found - required for storage disk formatting.\n  {}\n  \
-                     After installing, run your smolvm command again.",
-                    hint
-                ),
-            )
-        })?;
-
-        let path_str = self.path.to_str().ok_or_else(|| {
-            Error::storage("validate path", "disk path contains invalid characters")
-        })?;
-
-        // Format with ext4 (-F = force, -q = quiet, -m 0 = no reserved blocks)
-        let output = std::process::Command::new(mkfs_path)
-            .args(["-F", "-q", "-m", "0", "-L", "smolvm", path_str])
-            .output()
-            .map_err(|e| Error::storage("run mkfs.ext4", e.to_string()))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(Error::storage("format with mkfs.ext4", stderr.to_string()));
-        }
-
-        // Mark as formatted
-        self.mark_formatted()?;
-
-        tracing::info!(path = %self.path.display(), "disk formatted successfully");
-        Ok(())
+        format_disk_with_mkfs(&self.path, "smolvm", "storage")
     }
 
     /// Get the path to the disk image.
@@ -366,96 +477,18 @@ impl StorageDisk {
     }
 
     /// Check if the disk needs to be formatted.
-    ///
-    /// This checks for a marker file that's created after formatting.
-    /// Also validates that the disk appears to be valid ext4.
     pub fn needs_format(&self) -> bool {
-        let marker_path = self.marker_path();
-
-        // If marker doesn't exist, needs format
-        if !marker_path.exists() {
-            return true;
-        }
-
-        // If disk doesn't exist, needs format (and delete stale marker)
-        if !self.path.exists() {
-            let _ = std::fs::remove_file(&marker_path);
-            return true;
-        }
-
-        // Validate disk appears to be ext4 (detect corruption)
-        if !self.appears_valid_ext4() {
-            tracing::warn!(
-                path = %self.path.display(),
-                "storage disk appears corrupt, will recreate"
-            );
-            // Delete corrupt disk and marker so we start fresh
-            let _ = std::fs::remove_file(&self.path);
-            let _ = std::fs::remove_file(&marker_path);
-            return true;
-        }
-
-        false
-    }
-
-    /// Check if the disk file appears to be a valid ext4 filesystem.
-    ///
-    /// Uses the `file` command to check the magic bytes.
-    /// This helps detect corrupted disks that would cause mount failures.
-    fn appears_valid_ext4(&self) -> bool {
-        // Use `file` command to check filesystem type
-        let output = std::process::Command::new("file")
-            .arg("-b") // Brief output
-            .arg(&self.path)
-            .output();
-
-        match output {
-            Ok(output) if output.status.success() => {
-                let desc = String::from_utf8_lossy(&output.stdout);
-                // Valid ext4 should contain "ext4 filesystem" or similar
-                let is_ext4 =
-                    desc.contains("ext4") || desc.contains("ext2") || desc.contains("ext3");
-                if !is_ext4 {
-                    tracing::debug!(
-                        path = %self.path.display(),
-                        file_type = %desc.trim(),
-                        "storage disk is not ext4"
-                    );
-                }
-                is_ext4
-            }
-            _ => {
-                // If file command fails, assume it's okay (don't block on missing `file` command)
-                tracing::debug!(path = %self.path.display(), "could not verify disk type, assuming valid");
-                true
-            }
-        }
+        disk_needs_format(&self.path, "storage")
     }
 
     /// Mark the disk as formatted.
-    ///
-    /// This creates a marker file next to the disk image.
     pub fn mark_formatted(&self) -> Result<()> {
-        let marker_path = self.marker_path();
-        std::fs::write(&marker_path, "1")?;
-        Ok(())
-    }
-
-    /// Get the path to the format marker file.
-    fn marker_path(&self) -> PathBuf {
-        self.path.with_extension("formatted")
+        mark_disk_formatted(&self.path)
     }
 
     /// Delete the storage disk and its marker.
     pub fn delete(&self) -> Result<()> {
-        if self.path.exists() {
-            std::fs::remove_file(&self.path)?;
-        }
-        let marker = self.marker_path();
-        if marker.exists() {
-            std::fs::remove_file(&marker)?;
-        }
-        Ok(())
+        delete_disk_and_marker(&self.path)
     }
 }
 
@@ -463,8 +496,12 @@ impl StorageDisk {
 // Overlay Disk
 // ============================================================================
 
-/// Default size for the rootfs overlay disk (2 GB sparse).
-pub const DEFAULT_OVERLAY_SIZE_GB: u64 = 2;
+/// Default size for the rootfs overlay disk (10 GB sparse).
+///
+/// This is a sparse file — only actually-written data consumes host disk space.
+/// 10 GB provides headroom for package installation (`apk add`, `pip install`, etc.)
+/// without hitting "No space left on device" during typical development workflows.
+pub const DEFAULT_OVERLAY_SIZE_GB: u64 = 10;
 
 /// Overlay disk filename.
 pub const OVERLAY_DISK_FILENAME: &str = "overlay.raw";
@@ -482,7 +519,6 @@ pub struct OverlayDisk {
     /// Path to the disk image file.
     path: PathBuf,
     /// Size in bytes.
-    #[allow(dead_code)]
     size_bytes: u64,
 }
 
@@ -518,80 +554,23 @@ impl OverlayDisk {
         }
     }
 
-    /// Create a sparse disk image.
     fn create_sparse(path: &Path, size_bytes: u64) -> Result<()> {
-        use std::fs::OpenOptions;
-        use std::io::{Seek, SeekFrom, Write};
-
-        assert!(size_bytes > 0, "disk size must be greater than 0");
-
-        tracing::info!(
-            path = %path.display(),
-            size_gb = size_bytes / (1024 * 1024 * 1024),
-            "creating sparse overlay disk"
-        );
-
-        let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-        file.seek(SeekFrom::Start(size_bytes - 1))?;
-        file.write_all(&[0])?;
-        file.sync_all()?;
-
-        Ok(())
+        create_sparse_disk(path, size_bytes, "overlay")
     }
 
     /// Pre-format the overlay disk with ext4 on the host.
+    ///
+    /// Tries template copy first (fast, no dependencies), then falls back
+    /// to mkfs.ext4 (requires e2fsprogs).
     pub fn ensure_formatted(&self) -> Result<()> {
         if !self.needs_format() {
             tracing::debug!(path = %self.path.display(), "overlay disk already formatted");
             return Ok(());
         }
-
-        self.format_with_mkfs()
-    }
-
-    /// Format the disk using mkfs.ext4.
-    fn format_with_mkfs(&self) -> Result<()> {
-        tracing::info!(path = %self.path.display(), "formatting overlay disk with mkfs.ext4");
-
-        let mkfs_path = find_e2fsprogs_tool("mkfs.ext4").ok_or_else(|| {
-            let hint = if crate::platform::Os::current().is_macos() {
-                "On macOS, install with: brew install e2fsprogs"
-            } else {
-                "On Linux, install with: apt install e2fsprogs (or equivalent)"
-            };
-            Error::storage(
-                "find mkfs.ext4",
-                format!(
-                    "mkfs.ext4 not found - required for overlay disk formatting.\n  {}",
-                    hint
-                ),
-            )
-        })?;
-
-        let path_str = self.path.to_str().ok_or_else(|| {
-            Error::storage(
-                "validate path",
-                "overlay disk path contains invalid characters",
-            )
-        })?;
-
-        let output = std::process::Command::new(mkfs_path)
-            .args(["-F", "-q", "-m", "0", "-L", "smolvm-overlay", path_str])
-            .output()
-            .map_err(|e| Error::storage("run mkfs.ext4", e.to_string()))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(Error::storage(
-                "format overlay with mkfs.ext4",
-                stderr.to_string(),
-            ));
+        if let Some(template_path) = find_disk_template("overlay-template.ext4") {
+            return copy_disk_from_template(&self.path, self.size_bytes, &template_path, "overlay");
         }
-
-        self.mark_formatted()?;
-
-        tracing::info!(path = %self.path.display(), "overlay disk formatted successfully");
-        Ok(())
+        format_disk_with_mkfs(&self.path, "smolvm-overlay", "overlay")
     }
 
     /// Get the path to the disk image.
@@ -601,66 +580,12 @@ impl OverlayDisk {
 
     /// Check if the disk needs to be formatted.
     fn needs_format(&self) -> bool {
-        let marker_path = self.marker_path();
-        if !marker_path.exists() {
-            return true;
-        }
-        if !self.path.exists() {
-            let _ = std::fs::remove_file(&marker_path);
-            return true;
-        }
-
-        // Validate disk appears to be ext4 (detect corruption)
-        if !self.appears_valid_ext4() {
-            tracing::warn!(
-                path = %self.path.display(),
-                "overlay disk appears corrupt, will reformat"
-            );
-            let _ = std::fs::remove_file(&self.path);
-            let _ = std::fs::remove_file(&marker_path);
-            return true;
-        }
-
-        false
-    }
-
-    /// Check if the disk file appears to be a valid ext4 filesystem.
-    fn appears_valid_ext4(&self) -> bool {
-        let output = std::process::Command::new("file")
-            .arg("-b")
-            .arg(&self.path)
-            .output();
-
-        match output {
-            Ok(output) if output.status.success() => {
-                let desc = String::from_utf8_lossy(&output.stdout);
-                desc.contains("ext4") || desc.contains("ext2") || desc.contains("ext3")
-            }
-            _ => true, // If `file` command unavailable, assume valid
-        }
-    }
-
-    /// Mark the disk as formatted.
-    fn mark_formatted(&self) -> Result<()> {
-        std::fs::write(self.marker_path(), "1")?;
-        Ok(())
-    }
-
-    /// Get the path to the format marker file.
-    fn marker_path(&self) -> PathBuf {
-        self.path.with_extension("formatted")
+        disk_needs_format(&self.path, "overlay")
     }
 
     /// Delete the overlay disk and its marker.
     pub fn delete(&self) -> Result<()> {
-        if self.path.exists() {
-            std::fs::remove_file(&self.path)?;
-        }
-        let marker = self.marker_path();
-        if marker.exists() {
-            std::fs::remove_file(&marker)?;
-        }
-        Ok(())
+        delete_disk_and_marker(&self.path)
     }
 }
 
@@ -743,20 +668,23 @@ mod tests {
 
         // Verify it's recognized as valid
         assert!(!disk.needs_format());
-        assert!(disk.appears_valid_ext4());
+        assert!(disk_appears_valid_ext4(&disk_path));
 
         // Now corrupt the disk by zeroing the magic bytes
         corrupt_ext4_magic(&disk_path);
 
-        // Create a new disk handle to check corruption detection
+        // disk_appears_valid_ext4 catches corruption via `file` command
+        assert!(!disk_appears_valid_ext4(&disk_path));
+
+        // But needs_format trusts the marker file for performance (avoids
+        // spawning `file` on every start). Marker + disk present = no reformat.
         let disk2 = StorageDisk::open_or_create_at(&disk_path, 1).unwrap();
+        assert!(!disk2.needs_format());
 
-        // Should detect corruption and need reformatting
-        assert!(!disk2.appears_valid_ext4());
-        assert!(disk2.needs_format()); // This should delete the corrupt disk
-
-        // Verify corrupt disk was deleted
-        assert!(!disk_path.exists());
+        // Stale marker (disk deleted) should be detected
+        let _ = std::fs::remove_file(&disk_path);
+        assert!(disk2.needs_format());
+        // Stale marker should be cleaned up
         assert!(!marker_path.exists());
 
         // Clean up temp dir
@@ -803,11 +731,11 @@ mod tests {
         assert!(disk_path.exists());
         assert!(disk.needs_format());
 
-        // Write ext4 magic so appears_valid_ext4() passes
+        // Write ext4 magic so disk_appears_valid_ext4() passes
         write_ext4_magic(&disk_path);
 
         // Mark as formatted
-        disk.mark_formatted().unwrap();
+        mark_disk_formatted(&disk_path).unwrap();
         assert!(!disk.needs_format());
 
         // Delete disk

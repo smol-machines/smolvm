@@ -524,9 +524,27 @@ where
             // stdout(1), stderr(2) for error output during child setup.
             // The child opens fresh fds for everything it needs.
             unsafe {
-                let max_fd = libc::getdtablesize();
-                for fd in 3..max_fd {
-                    libc::close(fd);
+                #[cfg(target_os = "linux")]
+                {
+                    // Use close_range() (Linux 5.9+) for O(1) fd closure instead
+                    // of iterating through potentially 500K+ fds one at a time.
+                    let ret = libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32);
+                    if ret != 0 {
+                        // Fallback for older kernels
+                        let max_fd = libc::getdtablesize();
+                        for fd in 3..max_fd {
+                            libc::close(fd);
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    // macOS: no close_range syscall, but getdtablesize() is
+                    // typically small (e.g. 1024) so iteration is fast.
+                    let max_fd = libc::getdtablesize();
+                    for fd in 3..max_fd {
+                        libc::close(fd);
+                    }
                 }
             }
 
@@ -545,6 +563,30 @@ where
         child_pid => {
             // Parent process
             Ok(child_pid)
+        }
+    }
+}
+
+/// Redirect stdin, stdout, and stderr to `/dev/null`.
+///
+/// Call this in a forked child process before launching a long-running
+/// background task (e.g. a VM via `krun_start_enter`). Without this,
+/// the child inherits the parent's terminal file descriptors and libkrun's
+/// internal threads may read from stdin or set terminal attributes,
+/// stealing keystrokes from the user's shell.
+///
+/// Must be called **after** any `eprintln!()` diagnostics that need the
+/// real stderr, but **before** the point of no return (`krun_start_enter`).
+pub fn detach_stdio() {
+    unsafe {
+        let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
+        if devnull >= 0 {
+            libc::dup2(devnull, 0); // stdin
+            libc::dup2(devnull, 1); // stdout
+            libc::dup2(devnull, 2); // stderr
+            if devnull > 2 {
+                libc::close(devnull);
+            }
         }
     }
 }

@@ -48,22 +48,19 @@ pub fn parse_cidr(s: &str) -> Result<String, String> {
         (s, default_prefix)
     };
 
-    let ip: IpAddr = ip_str
-        .parse()
-        .map_err(|_| format!("invalid CIDR '{}': expected format like 10.0.0.0/8 or 1.1.1.1", s))?;
+    let ip: IpAddr = ip_str.parse().map_err(|_| {
+        format!(
+            "invalid CIDR '{}': expected format like 10.0.0.0/8 or 1.1.1.1",
+            s
+        )
+    })?;
 
     match ip {
         IpAddr::V4(_) if prefix_len > 32 => {
-            return Err(format!(
-                "invalid CIDR '{}': IPv4 prefix must be 0-32",
-                s
-            ));
+            return Err(format!("invalid CIDR '{}': IPv4 prefix must be 0-32", s));
         }
         IpAddr::V6(_) if prefix_len > 128 => {
-            return Err(format!(
-                "invalid CIDR '{}': IPv6 prefix must be 0-128",
-                s
-            ));
+            return Err(format!("invalid CIDR '{}': IPv6 prefix must be 0-128", s));
         }
         _ => {}
     }

@@ -15,6 +15,29 @@ use crate::{PackError, Result};
 /// Compression level for zstd (19 = high compression).
 pub const ZSTD_LEVEL: i32 = 19;
 
+/// Find a pre-formatted disk template by filename.
+///
+/// Searches in order:
+/// 1. `~/.smolvm/{filename}` (installed location)
+/// 2. Next to the current executable (development)
+fn find_existing_template(filename: &str) -> Option<PathBuf> {
+    if let Some(home) = dirs::home_dir() {
+        let path = home.join(".smolvm").join(filename);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let path = dir.join(filename);
+            if path.exists() {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
 /// Asset collector for gathering runtime components.
 pub struct AssetCollector {
     staging_dir: PathBuf,
@@ -38,6 +61,7 @@ impl AssetCollector {
                 },
                 layers: Vec::new(),
                 storage_template: None,
+                overlay_template: None,
             },
         })
     }
@@ -159,6 +183,10 @@ impl AssetCollector {
     /// for the storage disk at runtime. This eliminates the need for mkfs.ext4
     /// on first boot and improves reliability.
     ///
+    /// Tries in order:
+    /// 1. Copy an existing pre-formatted template from `~/.smolvm/` or next to the exe
+    /// 2. Format a new one with `mkfs.ext4` (requires e2fsprogs)
+    ///
     /// The template is a 512MB sparse file (actual size ~100KB when empty).
     pub fn create_storage_template(&mut self) -> Result<()> {
         use std::io::{Seek, SeekFrom, Write};
@@ -168,6 +196,20 @@ impl AssetCollector {
         const TEMPLATE_NAME: &str = "storage.ext4";
 
         let template_path = self.staging_dir.join(TEMPLATE_NAME);
+
+        // Try to copy from an existing pre-formatted template first.
+        // This avoids requiring e2fsprogs on the build machine.
+        if let Some(existing) = find_existing_template("storage-template.ext4") {
+            fs::copy(&existing, &template_path)?;
+            let metadata = fs::metadata(&template_path)?;
+            self.inventory.storage_template = Some(AssetEntry {
+                path: TEMPLATE_NAME.to_string(),
+                size: metadata.len(),
+            });
+            return Ok(());
+        }
+
+        // No pre-formatted template found — create one with mkfs.ext4.
 
         // Create sparse file
         let mut file = File::create(&template_path)?;
@@ -198,7 +240,9 @@ impl AssetCollector {
             })
             .ok_or_else(|| {
                 PackError::AssetNotFound(
-                    "mkfs.ext4 not found. Install e2fsprogs to create storage template.".into(),
+                    "mkfs.ext4 not found. Install e2fsprogs or place a pre-formatted \
+                     storage-template.ext4 in ~/.smolvm/"
+                        .into(),
                 )
             })?;
 
@@ -237,6 +281,32 @@ impl AssetCollector {
         let metadata = fs::metadata(&template_path)?;
         self.inventory.storage_template = Some(AssetEntry {
             path: TEMPLATE_NAME.to_string(),
+            size: metadata.len(),
+        });
+
+        Ok(())
+    }
+
+    /// Add an overlay disk template from an existing VM.
+    ///
+    /// Copies the VM's overlay disk (overlay.raw) to the staging directory
+    /// as `overlay.raw`. This preserves the VM's persistent rootfs state
+    /// for use in packed VM-mode binaries.
+    pub fn add_overlay_template(&mut self, path: &Path) -> Result<()> {
+        if !path.exists() {
+            return Err(PackError::AssetNotFound(format!(
+                "overlay disk not found: {}",
+                path.display()
+            )));
+        }
+
+        const OVERLAY_NAME: &str = "overlay.raw";
+        let dst = self.staging_dir.join(OVERLAY_NAME);
+        fs::copy(path, &dst)?;
+
+        let metadata = fs::metadata(&dst)?;
+        self.inventory.overlay_template = Some(AssetEntry {
+            path: OVERLAY_NAME.to_string(),
             size: metadata.len(),
         });
 

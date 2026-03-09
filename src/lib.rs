@@ -64,6 +64,7 @@
 pub mod agent;
 pub mod api;
 pub mod config;
+pub mod consts;
 pub mod db;
 pub mod error;
 pub mod log_rotation;
@@ -75,6 +76,16 @@ pub mod registry;
 pub mod storage;
 pub mod util;
 pub mod vm;
+
+// ============================================================================
+// Default Command Constants
+// ============================================================================
+
+/// Default interactive command — spawns a shell.
+pub const DEFAULT_SHELL_CMD: &str = "/bin/sh";
+
+/// Default idle command — keeps a container alive without doing work.
+pub const DEFAULT_IDLE_CMD: &[&str] = &["sleep", "infinity"];
 
 // Re-export main types for convenience
 pub use agent::{AgentClient, AgentManager};

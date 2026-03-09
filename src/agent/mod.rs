@@ -11,7 +11,7 @@ pub mod terminal;
 
 pub use crate::vm::config::HostMount;
 pub use client::{AgentClient, PullOptions, RunConfig};
-pub use manager::{docker_config_dir, docker_config_mount, AgentManager, AgentState};
+pub use manager::{docker_config_dir, docker_config_mount, vm_data_dir, AgentManager, AgentState};
 
 /// Default agent VM memory in MiB.
 pub const DEFAULT_MEMORY_MIB: u32 = 512;
@@ -31,7 +31,7 @@ pub fn mount_tag(index: usize) -> String {
 }
 
 /// TCP port mapping from host to guest.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PortMapping {
     /// Port on the host.
     pub host: u16,
@@ -55,7 +55,7 @@ impl PortMapping {
 }
 
 /// VM configuration for the agent.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct VmResources {
     /// Number of vCPUs.
     pub cpus: u8,
@@ -65,7 +65,7 @@ pub struct VmResources {
     pub network: bool,
     /// Storage disk size in GiB (None = default 20 GiB).
     pub storage_gb: Option<u64>,
-    /// Overlay disk size in GiB (None = default 2 GiB).
+    /// Overlay disk size in GiB (None = default 10 GiB).
     pub overlay_gb: Option<u64>,
     /// Allowed egress CIDRs. Empty = no policy (allow all when network=true).
     pub allow_cidrs: Vec<String>,

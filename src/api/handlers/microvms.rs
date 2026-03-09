@@ -267,7 +267,7 @@ pub async fn start_microvm(
         let manager = AgentManager::for_vm_with_sizes(&name_clone, storage_gb, overlay_gb)
             .map_err(|e| format!("failed to create agent manager: {}", e))?;
 
-        manager
+        let _ = manager
             .ensure_running_with_full_config(mounts, ports, resources)
             .map_err(|e| format!("failed to start microvm: {}", e))?;
 
@@ -282,26 +282,20 @@ pub async fn start_microvm(
     // Capture start time for PID verification
     let pid_start_time = pid.and_then(crate::process::process_start_time);
 
-    // Persist state to database
-    let updated = db
+    // Persist state to database and get updated record
+    let record = db
         .update_vm(&name, |r| {
             r.state = RecordState::Running;
             r.pid = pid;
             r.pid_start_time = pid_start_time;
         })
-        .map_err(ApiError::database)?;
-    if updated.is_none() {
-        return Err(ApiError::NotFound(format!(
-            "microvm '{}' disappeared from database during start",
-            name
-        )));
-    }
-
-    // Return updated record
-    let record = db
-        .get_vm(&name)
         .map_err(ApiError::database)?
-        .ok_or_else(|| ApiError::NotFound(format!("microvm '{}' not found", name)))?;
+        .ok_or_else(|| {
+            ApiError::NotFound(format!(
+                "microvm '{}' disappeared from database during start",
+                name
+            ))
+        })?;
 
     Ok(Json(record_to_info(&name, &record)))
 }
@@ -357,26 +351,20 @@ pub async fn stop_microvm(
         )));
     }
 
-    // Persist state to database — only after confirmed stop
-    let updated = db
+    // Persist state to database and get updated record — only after confirmed stop
+    let record = db
         .update_vm(&name, |r| {
             r.state = RecordState::Stopped;
             r.pid = None;
             r.pid_start_time = None;
         })
-        .map_err(ApiError::database)?;
-    if updated.is_none() {
-        return Err(ApiError::NotFound(format!(
-            "microvm '{}' disappeared from database during stop",
-            name
-        )));
-    }
-
-    // Get updated record
-    let record = db
-        .get_vm(&name)
         .map_err(ApiError::database)?
-        .ok_or_else(|| ApiError::NotFound(format!("microvm '{}' not found", name)))?;
+        .ok_or_else(|| {
+            ApiError::NotFound(format!(
+                "microvm '{}' disappeared from database during stop",
+                name
+            ))
+        })?;
 
     Ok(Json(record_to_info(&name, &record)))
 }

@@ -1,0 +1,20 @@
+[package]
+name = "smolvm-napi"
+version = "0.1.0"
+edition = "2021"
+description = "NAPI-RS bindings for smolvm — embed microVMs directly in Node.js"
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+smolvm = { path = "../.." }
+smolvm-protocol = { path = "../smolvm-protocol" }
+napi = { version = "2", features = ["async", "napi6", "tokio_rt"] }
+napi-derive = "2"
+tokio = { version = "1", features = ["rt", "sync"] }
+
+[build-dependencies]
+napi-build = "2"
+pkg-config = "0.3"

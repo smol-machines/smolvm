@@ -45,6 +45,8 @@ pub struct Smolfile {
     pub workdir: Option<String>,
     #[serde(default)]
     pub allow_ip: Vec<String>,
+    pub storage: Option<u64>,
+    pub overlay: Option<u64>,
 }
 
 /// Load and parse a Smolfile from the given path.
@@ -152,6 +154,10 @@ pub fn build_create_params(
         .map_err(|e| smolvm::Error::config("smolfile allow_ip", e))?;
     allow_cidrs.extend(cli_allow_cidrs);
 
+    // Scalars: CLI overrides Smolfile
+    let storage_gb = cli_storage_gb.or(sf.storage);
+    let overlay_gb = cli_overlay_gb.or(sf.overlay);
+
     Ok(CreateVmParams {
         name,
         cpus,
@@ -162,8 +168,8 @@ pub fn build_create_params(
         init,
         env,
         workdir,
-        storage_gb: cli_storage_gb,
-        overlay_gb: cli_overlay_gb,
+        storage_gb,
+        overlay_gb,
         allow_cidrs,
     })
 }

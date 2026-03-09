@@ -4,12 +4,15 @@
 //! All setup is done in the child process after fork, where
 //! DYLD_LIBRARY_PATH is still available for dlopen.
 
+use crate::consts::ENV_SMOLVM_LIB_DIR;
 use crate::error::{Error, Result};
 use crate::storage::{OverlayDisk, StorageDisk};
+use crate::util::libkrunfw_filename;
 use crate::vm::config::HostMount;
+
 use smolvm_protocol::ports;
-use std::ffi::CString;
-use std::path::Path;
+use std::ffi::{CStr, CString};
+use std::path::{Path, PathBuf};
 
 use super::{PortMapping, VmResources};
 
@@ -60,6 +63,82 @@ extern "C" {
 // TSI (Transparent Socket Impersonation) feature flags
 const KRUN_TSI_HIJACK_INET: u32 = 1 << 0;
 
+/// Find the directory containing libkrunfw by checking explicit overrides and
+/// paths relative to the current executable.
+///
+/// Checks:
+/// - `$SMOLVM_LIB_DIR` (explicit override for embedded runtimes)
+/// - `<exe_dir>/lib/` (distribution layout)
+/// - `<exe_dir>/../lib/` (alternative layout)
+/// - `<exe_dir>/../../lib/linux-<arch>/` (source tree dev builds)
+fn find_lib_dir() -> Option<PathBuf> {
+    let lib_name = libkrunfw_filename();
+    if let Ok(explicit_dir) = std::env::var(ENV_SMOLVM_LIB_DIR) {
+        let path = PathBuf::from(explicit_dir);
+        if path.join(lib_name).exists() {
+            return path.canonicalize().ok().or(Some(path));
+        }
+
+        tracing::warn!(
+            path = %path.display(),
+            lib = lib_name,
+            "{} does not contain the expected libkrunfw library", ENV_SMOLVM_LIB_DIR
+        );
+    }
+
+    let exe = std::env::current_exe().ok()?;
+    let exe_dir = exe.parent()?;
+
+    let candidates = [
+        exe_dir.join("lib"),
+        exe_dir.join("../lib"),
+        exe_dir.join("../../lib"),
+        exe_dir.join(format!("../../lib/linux-{}", std::env::consts::ARCH)),
+    ];
+
+    for dir in &candidates {
+        if dir.join(lib_name).exists() {
+            return dir.canonicalize().ok();
+        }
+    }
+
+    None
+}
+
+/// Preload libkrunfw with `RTLD_GLOBAL` so libkrun's internal `dlopen("libkrunfw.so.5")` finds it.
+///
+/// Setting `LD_LIBRARY_PATH` via `std::env::set_var` is insufficient because glibc caches
+/// library search paths at process startup and `dlopen()` never re-reads the environment.
+/// Instead, we load libkrunfw ourselves with `RTLD_GLOBAL`, which makes it visible to all
+/// subsequent `dlopen()` calls by soname — matching how `launcher_dynamic.rs` handles this.
+///
+/// This is a no-op if libkrunfw is not found in any candidate directory (e.g., it's already
+/// in a system library path).
+fn preload_libkrunfw() {
+    let Some(lib_dir) = find_lib_dir() else {
+        return;
+    };
+
+    let lib_path = lib_dir.join(libkrunfw_filename());
+    let Ok(lib_path_c) = CString::new(lib_path.to_string_lossy().as_bytes()) else {
+        return;
+    };
+
+    unsafe {
+        let handle = libc::dlopen(lib_path_c.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL);
+        if handle.is_null() {
+            let err = libc::dlerror();
+            let err_msg = if err.is_null() {
+                "unknown error".to_string()
+            } else {
+                CStr::from_ptr(err).to_string_lossy().to_string()
+            };
+            tracing::warn!(path = %lib_path.display(), error = %err_msg, "failed to preload libkrunfw");
+        }
+        // Intentionally leak the handle — libkrunfw must stay loaded for libkrun to use it.
+    }
+}
+
 /// Launch the agent VM (call in the forked child process).
 ///
 /// This function sets up and starts the VM in a single call.
@@ -78,6 +157,9 @@ pub fn launch_agent_vm(
 ) -> Result<()> {
     // Raise file descriptor limits
     raise_fd_limits();
+
+    // Preload libkrunfw so libkrun's internal dlopen can find it
+    preload_libkrunfw();
 
     unsafe {
         // Set log level (0 = off, 1 = error, 2 = warn, 3 = info, 4 = debug)
@@ -101,8 +183,26 @@ pub fn launch_agent_vm(
             return Err(Error::agent("configure vm", "krun_set_vm_config failed"));
         }
 
+        // Helper: evaluate a fallible expression, freeing ctx if it fails.
+        // Replaces bare `?` which would leak the libkrun context.
+        macro_rules! try_or_free_ctx {
+            ($expr:expr, $op:expr, $msg:expr) => {
+                match $expr {
+                    Ok(val) => val,
+                    Err(_) => {
+                        krun_free_ctx(ctx);
+                        return Err(Error::agent($op, $msg));
+                    }
+                }
+            };
+        }
+
         // Set root filesystem
-        let root = path_to_cstring(rootfs_path)?;
+        let root = try_or_free_ctx!(
+            path_to_cstring(rootfs_path),
+            "set rootfs",
+            "path contains null byte"
+        );
         if krun_set_root(ctx, root.as_ptr()) < 0 {
             krun_free_ctx(ctx);
             return Err(Error::agent("set rootfs", "krun_set_root failed"));
@@ -200,8 +300,12 @@ pub fn launch_agent_vm(
 
         // Add storage disk (critical - VM needs storage to function)
         // This is the first disk → /dev/vda in guest
-        let block_id = CString::new("storage").expect("static string");
-        let disk_path = path_to_cstring(disks.storage.path())?;
+        let block_id = cstr("storage");
+        let disk_path = try_or_free_ctx!(
+            path_to_cstring(disks.storage.path()),
+            "add storage disk",
+            "path contains null byte"
+        );
         if krun_add_disk2(ctx, block_id.as_ptr(), disk_path.as_ptr(), 0, false) < 0 {
             krun_free_ctx(ctx);
             return Err(Error::agent(
@@ -213,8 +317,12 @@ pub fn launch_agent_vm(
         // Add overlay disk for persistent rootfs changes (optional)
         // This is the second disk → /dev/vdb in guest
         if let Some(overlay) = disks.overlay {
-            let overlay_id = CString::new("overlay").expect("static string");
-            let overlay_path = path_to_cstring(overlay.path())?;
+            let overlay_id = cstr("overlay");
+            let overlay_path = try_or_free_ctx!(
+                path_to_cstring(overlay.path()),
+                "add overlay disk",
+                "path contains null byte"
+            );
             if krun_add_disk2(ctx, overlay_id.as_ptr(), overlay_path.as_ptr(), 0, false) < 0 {
                 krun_free_ctx(ctx);
                 return Err(Error::agent(
@@ -225,7 +333,11 @@ pub fn launch_agent_vm(
         }
 
         // Add vsock port for control channel (critical - host-guest communication)
-        let socket_path = path_to_cstring(vsock_socket)?;
+        let socket_path = try_or_free_ctx!(
+            path_to_cstring(vsock_socket),
+            "add vsock port",
+            "path contains null byte"
+        );
         if krun_add_vsock_port2(ctx, ports::AGENT_CONTROL, socket_path.as_ptr(), true) < 0 {
             krun_free_ctx(ctx);
             return Err(Error::agent(
@@ -236,7 +348,11 @@ pub fn launch_agent_vm(
 
         // Set console output if specified
         if let Some(log_path) = console_log {
-            let console_path = path_to_cstring(log_path)?;
+            let console_path = try_or_free_ctx!(
+                path_to_cstring(log_path),
+                "set console output",
+                "path contains null byte"
+            );
             if krun_set_console_output(ctx, console_path.as_ptr()) < 0 {
                 tracing::warn!("failed to set console output");
             }
@@ -246,9 +362,16 @@ pub fn launch_agent_vm(
         // Each mount gets a tag like "smolvm0", "smolvm1", etc.
         // The guest must mount these manually (or via the agent)
         for (i, mount) in mounts.iter().enumerate() {
-            let tag = CString::new(crate::agent::mount_tag(i))
-                .map_err(|_| Error::agent("configure mount", "invalid mount tag"))?;
-            let host_path = path_to_cstring(&mount.source)?;
+            let tag = try_or_free_ctx!(
+                CString::new(crate::agent::mount_tag(i)),
+                "configure mount",
+                "mount tag contains null byte"
+            );
+            let host_path = try_or_free_ctx!(
+                path_to_cstring(&mount.source),
+                "configure mount",
+                "mount path contains null byte"
+            );
 
             tracing::debug!(
                 tag = %crate::agent::mount_tag(i),
@@ -271,15 +394,14 @@ pub fn launch_agent_vm(
         }
 
         // Set working directory
-        let workdir = CString::new("/").expect("static string");
+        let workdir = cstr("/");
         krun_set_workdir(ctx, workdir.as_ptr());
 
         // Build environment
         let mut env_strings = vec![
-            CString::new("HOME=/root").expect("static string"),
-            CString::new("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
-                .expect("static string"),
-            CString::new("TERM=xterm-256color").expect("static string"),
+            cstr("HOME=/root"),
+            cstr("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
+            cstr("TERM=xterm-256color"),
         ];
 
         // Pass mount info to the agent via environment
@@ -309,8 +431,8 @@ pub fn launch_agent_vm(
         envp.push(std::ptr::null());
 
         // Set exec command (/sbin/init)
-        let exec_path = CString::new("/sbin/init").expect("static string");
-        let argv_strings = [CString::new("/sbin/init").expect("static string")];
+        let exec_path = cstr("/sbin/init");
+        let argv_strings = [cstr("/sbin/init")];
         let mut argv: Vec<*const libc::c_char> = argv_strings.iter().map(|s| s.as_ptr()).collect();
         argv.push(std::ptr::null());
 
@@ -320,15 +442,20 @@ pub fn launch_agent_vm(
         }
 
         // Start VM (this replaces the process on success)
-        tracing::info!("starting agent VM");
         let ret = krun_start_enter(ctx);
 
-        // If we get here, something went wrong
+        // If we get here, something went wrong — free the context before returning
+        krun_free_ctx(ctx);
         Err(Error::agent(
             "start vm",
             format!("krun_start_enter returned: {}", ret),
         ))
     }
+}
+
+/// Create a CString from a static string that is known not to contain NUL bytes.
+fn cstr(s: &str) -> CString {
+    CString::new(s).expect("string literal must not contain NUL bytes")
 }
 
 /// Convert a Path to a CString.

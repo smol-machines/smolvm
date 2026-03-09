@@ -20,6 +20,7 @@ use clap::{Args, Subcommand};
 use smolvm::agent::{
     docker_config_mount, AgentClient, AgentManager, PortMapping, RunConfig, VmResources,
 };
+use smolvm::{DEFAULT_IDLE_CMD, DEFAULT_SHELL_CMD};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -118,50 +119,18 @@ impl ExecCmd {
     pub fn run(self) -> smolvm::Result<()> {
         use smolvm::Error;
 
-        let manager = vm_common::get_vm_manager(&self.name)?;
-        let label = vm_common::vm_label(&self.name);
+        let (manager, mut client) =
+            vm_common::ensure_running_and_connect(&self.name, vm_common::VmKind::Sandbox)?;
 
-        // Check if sandbox is running
-        if manager.try_connect_existing().is_none() {
-            return Err(Error::agent(
-                "connect",
-                format!(
-                    "sandbox '{}' is not running. Start one with: smolvm sandbox start {}",
-                    label,
-                    self.name.as_deref().unwrap_or("<name>")
-                ),
-            ));
-        }
-
-        let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
-
-        // Find the container in the sandbox
+        // Find the running container in the sandbox
         let containers = client.list_containers()?;
-        let container = containers.iter().find(|c| c.state == "running");
-
-        let container_id = match container {
-            Some(c) => c.id.clone(),
-            None => {
-                return Err(Error::agent(
-                    "find container",
-                    "no running container in sandbox",
-                ));
-            }
-        };
-
-        // Parse environment variables
-        let env: Vec<(String, String)> = self
-            .env
+        let container_id = containers
             .iter()
-            .filter_map(|e| {
-                let (k, v) = e.split_once('=')?;
-                if k.is_empty() {
-                    None
-                } else {
-                    Some((k.to_string(), v.to_string()))
-                }
-            })
-            .collect();
+            .find(|c| c.state == "running")
+            .map(|c| c.id.clone())
+            .ok_or_else(|| Error::agent("find container", "no running container in sandbox"))?;
+
+        let env = parse_env_list(&self.env);
 
         // Execute in container
         let (exit_code, stdout, stderr) = client.exec(
@@ -172,17 +141,7 @@ impl ExecCmd {
             self.timeout,
         )?;
 
-        if !stdout.is_empty() {
-            print!("{}", stdout);
-        }
-        if !stderr.is_empty() {
-            eprint!("{}", stderr);
-        }
-        flush_output();
-
-        // Keep sandbox running
-        manager.detach();
-        std::process::exit(exit_code);
+        vm_common::print_output_and_exit(&manager, exit_code, &stdout, &stderr);
     }
 }
 
@@ -206,9 +165,10 @@ pub struct StopCmd {
 
 impl StopCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        match &self.name {
+        let name = vm_common::resolve_vm_name(self.name)?;
+        match &name {
             Some(name) => vm_common::stop_vm_named(KIND, name),
-            None => vm_common::stop_vm_anonymous(KIND),
+            None => vm_common::stop_vm_default(KIND),
         }
     }
 }
@@ -300,12 +260,16 @@ pub struct RunCmd {
     )]
     pub env: Vec<String>,
 
-    /// Target platform for multi-arch images (e.g., linux/arm64, linux/amd64)
+    /// Target OCI platform for multi-arch images (e.g., linux/arm64, linux/amd64)
     ///
     /// By default, uses the host architecture. Use this to override, for example
     /// to run x86_64 images via Rosetta on Apple Silicon.
-    #[arg(long, value_name = "OS/ARCH", help_heading = "Container")]
-    pub platform: Option<String>,
+    #[arg(
+        long = "oci-platform",
+        value_name = "OS/ARCH",
+        help_heading = "Container"
+    )]
+    pub oci_platform: Option<String>,
 
     /// Mount host directory into container (can be used multiple times)
     #[arg(
@@ -358,6 +322,15 @@ pub struct RunCmd {
     #[arg(long, value_name = "GiB", help_heading = "Resources")]
     pub overlay: Option<u64>,
 
+    /// Load VM configuration from a Smolfile (TOML)
+    #[arg(
+        long = "smolfile",
+        visible_short_alias = 's',
+        value_name = "PATH",
+        help_heading = "Resources"
+    )]
+    pub smolfile: Option<PathBuf>,
+
     /// Mount ~/.docker/ config into VM for registry authentication
     ///
     /// When enabled, the Docker config directory (typically ~/.docker/) is
@@ -371,9 +344,33 @@ impl RunCmd {
     pub fn run(self) -> smolvm::Result<()> {
         use smolvm::Error;
 
+        // Build allow_cidrs from --allow-ip and --outbound-localhost-only
+        let mut cli_allow_cidrs = self.allow_ip.clone();
+        if self.outbound_localhost_only {
+            cli_allow_cidrs.push("127.0.0.0/8".to_string());
+            cli_allow_cidrs.push("::1/128".to_string());
+        }
+
+        // Merge CLI flags with Smolfile (if provided)
+        let params = crate::cli::smolfile::build_create_params(
+            "default".to_string(),
+            self.cpus,
+            self.mem,
+            self.volume,
+            self.port,
+            self.net,
+            vec![],
+            self.env,
+            self.workdir,
+            self.smolfile,
+            self.storage,
+            self.overlay,
+            cli_allow_cidrs,
+        )?;
+
         // Parse volume mounts
-        let mut mounts = parse_mounts(&self.volume)?;
-        let ports = self.port.clone();
+        let mut mounts = parse_mounts(&params.volume)?;
+        let ports = params.port.clone();
 
         // Add docker config mount if requested
         if self.docker_config {
@@ -386,25 +383,20 @@ impl RunCmd {
             }
         }
 
-        // Build allow_cidrs from --allow-ip and --outbound-localhost-only
-        let mut allow_cidrs = self.allow_ip.clone();
-        if self.outbound_localhost_only {
-            allow_cidrs.push("127.0.0.0/8".to_string());
-            allow_cidrs.push("::1/128".to_string());
-        }
+        let allow_cidrs = params.allow_cidrs;
         let has_egress_policy = !allow_cidrs.is_empty();
 
         let resources = VmResources {
-            cpus: self.cpus,
-            mem: self.mem,
-            network: self.net || has_egress_policy,
-            storage_gb: self.storage,
-            overlay_gb: self.overlay,
+            cpus: params.cpus,
+            mem: params.mem,
+            network: params.net || has_egress_policy,
+            storage_gb: params.storage_gb,
+            overlay_gb: params.overlay_gb,
             allow_cidrs,
         };
 
         // Start agent VM
-        let manager = AgentManager::new_default_with_sizes(self.storage, self.overlay)
+        let manager = AgentManager::new_default_with_sizes(params.storage_gb, params.overlay_gb)
             .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
 
         // Show startup message
@@ -425,7 +417,7 @@ impl RunCmd {
         };
         println!("Starting {} sandbox{}{}...", mode, mount_info, port_info);
 
-        manager
+        let freshly_started = manager
             .ensure_running_with_full_config(mounts.clone(), ports, resources)
             .map_err(|e| Error::agent("start sandbox", e.to_string()))?;
 
@@ -433,21 +425,34 @@ impl RunCmd {
         let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
 
         // Pull image with progress display
-        crate::cli::pull_with_progress(&mut client, &self.image, self.platform.as_deref())?;
+        crate::cli::pull_with_progress(&mut client, &self.image, self.oci_platform.as_deref())?;
+
+        // Run init commands from Smolfile only on fresh VM start (not when reusing)
+        if freshly_started && !params.init.is_empty() {
+            for (i, cmd) in params.init.iter().enumerate() {
+                let argv = vec!["sh".into(), "-c".into(), cmd.clone()];
+                let init_env = parse_env_list(&params.env);
+                let (exit_code, _stdout, stderr) =
+                    client.vm_exec(argv, init_env, params.workdir.clone(), None)?;
+                if exit_code != 0 {
+                    eprintln!("init[{}] failed (exit {}): {}", i, exit_code, stderr.trim());
+                }
+            }
+        }
 
         // Build command - for detached mode, default to sleep infinity
         let command = if self.command.is_empty() {
             if self.detach {
-                vec!["sleep".to_string(), "infinity".to_string()]
+                DEFAULT_IDLE_CMD.iter().map(|s| s.to_string()).collect()
             } else {
-                vec!["/bin/sh".to_string()]
+                vec![DEFAULT_SHELL_CMD.to_string()]
             }
         } else {
             self.command.clone()
         };
 
         // Parse environment variables
-        let env = parse_env_list(&self.env);
+        let env = parse_env_list(&params.env);
 
         // Convert mounts to agent format
         let mount_bindings = mounts_to_virtiofs_bindings(&mounts);
@@ -458,9 +463,45 @@ impl RunCmd {
                 &self.image,
                 command,
                 env,
-                self.workdir.clone(),
+                params.workdir.clone(),
                 mount_bindings,
             )?;
+
+            // Persist "default" record so `sandbox ls` shows this VM
+            {
+                use smolvm::config::SmolvmConfig;
+                use vm_common::DefaultVmOverrides;
+                let mount_tuples: Vec<(String, String, bool)> = mounts
+                    .iter()
+                    .map(|m| {
+                        (
+                            m.source.to_string_lossy().to_string(),
+                            m.target.to_string_lossy().to_string(),
+                            m.read_only,
+                        )
+                    })
+                    .collect();
+                let port_tuples: Vec<(u16, u16)> =
+                    params.port.iter().map(|p| (p.host, p.guest)).collect();
+                if let Ok(mut config) = SmolvmConfig::load() {
+                    vm_common::persist_default_running(
+                        &mut config,
+                        manager.child_pid(),
+                        Some(DefaultVmOverrides {
+                            cpus: params.cpus,
+                            mem: params.mem,
+                            mounts: mount_tuples,
+                            ports: port_tuples,
+                            network: params.net,
+                            storage_gb: params.storage_gb,
+                            overlay_gb: params.overlay_gb,
+                            init: params.init.clone(),
+                            env: parse_env_list(&params.env),
+                            workdir: params.workdir.clone(),
+                        }),
+                    );
+                }
+            }
 
             println!("Sandbox running (container: {})", &info.id[..12]);
             println!("\nTo interact with the sandbox:");
@@ -483,7 +524,7 @@ impl RunCmd {
             let exit_code = if self.interactive || self.tty {
                 let config = RunConfig::new(&self.image, command)
                     .with_env(env)
-                    .with_workdir(self.workdir.clone())
+                    .with_workdir(params.workdir.clone())
                     .with_mounts(mount_bindings)
                     .with_timeout(self.timeout)
                     .with_tty(self.tty);
@@ -493,7 +534,7 @@ impl RunCmd {
                     &self.image,
                     command,
                     env,
-                    self.workdir.clone(),
+                    params.workdir.clone(),
                     mount_bindings,
                     self.timeout,
                 )?;
@@ -623,7 +664,7 @@ impl CreateCmd {
 
 /// Start a sandbox.
 ///
-/// Starts a named sandbox, or the default anonymous sandbox if no name given.
+/// Starts a named sandbox, or the default sandbox if no name given.
 ///
 /// Examples:
 ///   smolvm sandbox start mysandbox
@@ -637,9 +678,11 @@ pub struct StartCmd {
 
 impl StartCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        match &self.name {
-            Some(name) => vm_common::start_vm_named(KIND, name),
-            None => vm_common::start_vm_anonymous(KIND),
+        let name = self.name.unwrap_or_else(|| "default".to_string());
+        match vm_common::start_vm_named(KIND, &name) {
+            Ok(()) => Ok(()),
+            Err(smolvm::Error::VmNotFound { .. }) => vm_common::start_vm_default(KIND),
+            Err(e) => Err(e),
         }
     }
 }
@@ -756,10 +799,9 @@ impl ImagesCmd {
                 },
                 "images": images,
             });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&output).expect("JSON serialization failed")
-            );
+            let json = serde_json::to_string_pretty(&output)
+                .map_err(|e| smolvm::Error::config("serialize json", e.to_string()))?;
+            println!("{}", json);
         } else {
             // Print storage summary
             println!("Storage Usage:");

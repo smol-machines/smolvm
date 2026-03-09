@@ -31,6 +31,10 @@ const OVERLAYS_DIR: &str = "overlays";
 /// Set at startup if SMOLVM_PACKED_LAYERS env var is present.
 static PACKED_LAYERS_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
 
+/// Global state for boot-time volume mounts.
+/// Set at startup if SMOLVM_MOUNT_COUNT env var is present.
+static BOOT_VOLUME_MOUNTS: OnceLock<Vec<(String, String, bool)>> = OnceLock::new();
+
 /// Initialize packed layers support by checking SMOLVM_PACKED_LAYERS env var.
 /// Format: "virtiofs_tag:mount_point" (e.g., "smolvm_layers:/packed_layers")
 /// Returns the mount point path if successfully mounted.
@@ -58,44 +62,106 @@ pub fn init_packed_layers() -> Option<PathBuf> {
         return None;
     }
 
-    // Mount virtiofs
-    let status = Command::new("mount")
-        .args(["-t", "virtiofs", tag])
-        .arg(&mount_point)
-        .status();
+    // Mount virtiofs using direct syscall (avoids ~3-5ms fork+exec overhead)
+    let src = std::ffi::CString::new(tag).ok()?;
+    let dst = std::ffi::CString::new(mount_point.to_str()?).ok()?;
+    let fstype = std::ffi::CString::new("virtiofs").unwrap();
+    // SAFETY: mount virtiofs with valid CString arguments
+    let rc = unsafe {
+        libc::mount(
+            src.as_ptr(),
+            dst.as_ptr(),
+            fstype.as_ptr(),
+            0,
+            std::ptr::null(),
+        )
+    };
 
-    match status {
-        Ok(s) if s.success() => {
-            info!(mount_point = %mount_point.display(), "packed layers mounted successfully");
-
-            // List contents for debugging
-            if let Ok(entries) = std::fs::read_dir(&mount_point) {
-                let layer_dirs: Vec<_> = entries
-                    .filter_map(|e| e.ok())
-                    .filter(|e| e.path().is_dir())
-                    .map(|e| e.file_name().to_string_lossy().to_string())
-                    .collect();
-                info!(layer_count = layer_dirs.len(), layers = ?layer_dirs, "packed layers available");
-            }
-
-            Some(mount_point)
-        }
-        Ok(s) => {
-            warn!(exit_code = ?s.code(), tag = %tag, "failed to mount packed layers virtiofs");
-            None
-        }
-        Err(e) => {
-            warn!(error = %e, "failed to run mount command for packed layers");
-            None
-        }
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        warn!(error = %err, tag = %tag, "failed to mount packed layers virtiofs");
+        return None;
     }
+
+    info!(mount_point = %mount_point.display(), "packed layers mounted successfully");
+
+    // List contents for debugging (only at debug level to avoid boot overhead)
+    if let Ok(entries) = std::fs::read_dir(&mount_point) {
+        let layer_dirs: Vec<_> = entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_dir())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        debug!(layer_count = layer_dirs.len(), layers = ?layer_dirs, "packed layers available");
+    }
+
+    Some(mount_point)
 }
 
 /// Get the packed layers directory if available.
 pub fn get_packed_layers_dir() -> Option<&'static PathBuf> {
-    PACKED_LAYERS_DIR
-        .get_or_init(|| init_packed_layers())
-        .as_ref()
+    PACKED_LAYERS_DIR.get_or_init(init_packed_layers).as_ref()
+}
+
+/// Initialize volume mounts at boot by reading SMOLVM_MOUNT_* env vars.
+///
+/// The host launcher sets:
+///   SMOLVM_MOUNT_COUNT=N
+///   SMOLVM_MOUNT_0=smolvm0:/data:rw
+///   SMOLVM_MOUNT_1=smolvm1:/config:ro
+///
+/// This mounts each virtiofs device at its staging area and bind-mounts
+/// to the guest target path, making volumes visible to all code paths
+/// including VmExec.
+pub fn init_volume_mounts() -> &'static [(String, String, bool)] {
+    BOOT_VOLUME_MOUNTS.get_or_init(|| {
+        let count: usize = match std::env::var("SMOLVM_MOUNT_COUNT") {
+            Ok(v) => match v.parse() {
+                Ok(n) => n,
+                Err(_) => {
+                    warn!(value = %v, "invalid SMOLVM_MOUNT_COUNT");
+                    return Vec::new();
+                }
+            },
+            Err(_) => return Vec::new(),
+        };
+
+        let mut mounts = Vec::with_capacity(count);
+        for i in 0..count {
+            let env_key = format!("SMOLVM_MOUNT_{}", i);
+            let env_val = match std::env::var(&env_key) {
+                Ok(v) => v,
+                Err(_) => {
+                    warn!(key = %env_key, "missing mount env var");
+                    continue;
+                }
+            };
+
+            // Parse "tag:guest_path:ro|rw"
+            let parts: Vec<&str> = env_val.splitn(3, ':').collect();
+            if parts.len() != 3 {
+                warn!(key = %env_key, value = %env_val, "invalid mount format, expected tag:path:ro|rw");
+                continue;
+            }
+
+            let tag = parts[0].to_string();
+            let guest_path = parts[1].to_string();
+            let read_only = parts[2] == "ro";
+
+            info!(tag = %tag, guest_path = %guest_path, read_only = read_only, "boot volume mount");
+            mounts.push((tag, guest_path, read_only));
+        }
+
+        // Mount using existing logic with empty rootfs prefix so bind mounts
+        // go to absolute guest paths (e.g., "/data"), visible to VmExec.
+        if !mounts.is_empty() {
+            if let Err(e) = setup_volume_mounts("", &mounts) {
+                warn!(error = %e, "failed to setup boot volume mounts");
+            }
+        }
+
+        mounts
+    })
 }
 
 /// Create a synthetic ImageInfo from packed layers.
@@ -150,6 +216,11 @@ fn create_packed_image_info(image: &str, packed_dir: &Path) -> Result<ImageInfo>
         os: "linux".to_string(),
         layer_count: layer_dirs.len(),
         layers: layer_dirs,
+        // Packed mode: config is in the PackManifest, not the image
+        entrypoint: Vec::new(),
+        cmd: Vec::new(),
+        env: Vec::new(),
+        workdir: None,
     })
 }
 
@@ -457,6 +528,10 @@ fn is_layer_cached(layer_dir: &Path) -> bool {
 ///
 /// This function ensures all required storage directories exist and are accessible.
 /// Returns early (successfully) if storage hasn't been formatted yet.
+///
+/// Note: `mount_storage_disk()` already creates all directories, so this is
+/// not called during boot. Kept for manual validation/repair use cases.
+#[allow(dead_code)]
 pub fn init() -> Result<()> {
     let root = Path::new(STORAGE_ROOT);
 
@@ -481,26 +556,20 @@ pub fn init() -> Result<()> {
         )));
     }
 
-    // Check for marker file to see if formatted
-    let marker = root.join(".smolvm_formatted");
-    if !marker.exists() {
-        info!(path = %root.display(), "storage not formatted, waiting for format request");
-        return Ok(());
-    }
-
-    // Create directory structure with detailed error reporting
-    let required_dirs = [
-        (LAYERS_DIR, "OCI image layers"),
-        (CONFIGS_DIR, "image configurations"),
-        (MANIFESTS_DIR, "image manifests"),
-        (OVERLAYS_DIR, "overlay filesystems"),
+    // Create container runtime directories unconditionally — these are needed
+    // as soon as containers are requested, regardless of storage format state.
+    let container_dirs = [
+        (paths::CONTAINERS_RUN_DIR, "container runtime state"),
+        (paths::CONTAINERS_LOGS_DIR, "container logs"),
+        (paths::CONTAINERS_EXIT_DIR, "container exit codes"),
+        (paths::CRUN_ROOT_DIR, "crun state root"),
     ];
 
     let mut created_count = 0;
-    for (dir, description) in &required_dirs {
-        let path = root.join(dir);
+    for (dir, description) in &container_dirs {
+        let path = Path::new(dir);
         if !path.exists() {
-            std::fs::create_dir_all(&path).map_err(|e| {
+            std::fs::create_dir_all(path).map_err(|e| {
                 StorageError::new(format!(
                     "failed to create {} directory '{}': {}",
                     description,
@@ -513,17 +582,25 @@ pub fn init() -> Result<()> {
         }
     }
 
-    // Create container runtime directories
-    let container_dirs = [
-        (paths::CONTAINERS_RUN_DIR, "container runtime state"),
-        (paths::CONTAINERS_LOGS_DIR, "container logs"),
-        (paths::CONTAINERS_EXIT_DIR, "container exit codes"),
+    // Check for marker file to see if formatted
+    let marker = root.join(".smolvm_formatted");
+    if !marker.exists() {
+        info!(path = %root.display(), "storage not formatted, waiting for format request");
+        return Ok(());
+    }
+
+    // Create OCI storage directory structure
+    let required_dirs = [
+        (LAYERS_DIR, "OCI image layers"),
+        (CONFIGS_DIR, "image configurations"),
+        (MANIFESTS_DIR, "image manifests"),
+        (OVERLAYS_DIR, "overlay filesystems"),
     ];
 
-    for (dir, description) in &container_dirs {
-        let path = Path::new(dir);
+    for (dir, description) in &required_dirs {
+        let path = root.join(dir);
         if !path.exists() {
-            std::fs::create_dir_all(path).map_err(|e| {
+            std::fs::create_dir_all(&path).map_err(|e| {
                 StorageError::new(format!(
                     "failed to create {} directory '{}': {}",
                     description,
@@ -571,6 +648,7 @@ pub fn format() -> Result<()> {
         (PathBuf::from(paths::CONTAINERS_RUN_DIR), "container run"),
         (PathBuf::from(paths::CONTAINERS_LOGS_DIR), "container logs"),
         (PathBuf::from(paths::CONTAINERS_EXIT_DIR), "container exit"),
+        (PathBuf::from(paths::CRUN_ROOT_DIR), "crun state root"),
     ];
 
     for (path, name) in &all_dirs {
@@ -621,12 +699,24 @@ pub fn status() -> Result<StorageStatus> {
     })
 }
 
+/// Extract a JSON array of strings from a JSON value.
+fn json_string_array(value: &serde_json::Value, key: &str) -> Vec<String> {
+    value[key]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Pull an OCI image with progress callback and optional authentication.
 ///
 /// The callback is called for each layer being pulled with (current, total, layer_id).
 pub fn pull_image_with_progress_and_auth<F>(
     image: &str,
-    platform: Option<&str>,
+    oci_platform: Option<&str>,
     auth: Option<&RegistryAuth>,
     mut progress: F,
 ) -> Result<ImageInfo>
@@ -647,9 +737,9 @@ where
         return create_packed_image_info(image, packed_dir);
     }
 
-    // Determine platform - default to current architecture
+    // Determine OCI platform - default to current architecture
     // This must happen BEFORE the cache check so we can verify architecture
-    let platform = platform.or({
+    let oci_platform = oci_platform.or({
         #[cfg(target_arch = "aarch64")]
         {
             Some("linux/arm64")
@@ -666,10 +756,10 @@ where
 
     // Check if already cached with correct architecture
     if let Ok(Some(info)) = query_image(image) {
-        // Verify cached image architecture matches requested platform
+        // Verify cached image architecture matches requested OCI platform
         let cached_arch = &info.architecture;
-        let requested_arch = platform
-            .map(|p| platform_to_arch(p))
+        let requested_arch = oci_platform
+            .map(oci_platform_to_arch)
             .unwrap_or_else(|| cached_arch.clone());
 
         if cached_arch == &requested_arch {
@@ -698,10 +788,10 @@ where
 
     let root = Path::new(STORAGE_ROOT);
 
-    // Get manifest with platform specified
+    // Get manifest with OCI platform specified
     progress(0, 0, "fetching manifest");
-    info!(image = %image, platform = ?platform, "fetching manifest");
-    let manifest = crane_manifest(image, platform, auth)?;
+    info!(image = %image, oci_platform = ?oci_platform, "fetching manifest");
+    let manifest = crane_manifest(image, oci_platform, auth)?;
 
     // Parse manifest to get config and layers
     let manifest_json: serde_json::Value =
@@ -749,7 +839,7 @@ where
     std::fs::write(&manifest_path, &manifest)?;
 
     // Fetch and save config
-    let config = crane_config(image, platform, auth)?;
+    let config = crane_config(image, oci_platform, auth)?;
     let config_id = config_digest
         .strip_prefix("sha256:")
         .unwrap_or(config_digest);
@@ -800,7 +890,7 @@ where
         let mut crane_cmd = Command::new("crane");
         crane_cmd.arg("blob");
         crane_cmd.arg(format!("{}@{}", image, layer_digest));
-        if let Some(p) = platform {
+        if let Some(p) = oci_platform {
             crane_cmd.arg("--platform").arg(p);
         }
         crane_cmd.stdout(Stdio::piped());
@@ -885,6 +975,16 @@ where
     let os = config_json["os"].as_str().unwrap_or("linux").to_string();
     let created = config_json["created"].as_str().map(String::from);
 
+    // Extract OCI config fields (Entrypoint, Cmd, Env, WorkingDir)
+    let oci_config = &config_json["config"];
+    let entrypoint = json_string_array(oci_config, "Entrypoint");
+    let cmd = json_string_array(oci_config, "Cmd");
+    let env = json_string_array(oci_config, "Env");
+    let workdir = oci_config["WorkingDir"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+
     Ok(ImageInfo {
         reference: image.to_string(),
         digest: config_digest.to_string(),
@@ -894,6 +994,10 @@ where
         os,
         layer_count: layers.len(),
         layers,
+        entrypoint,
+        cmd,
+        env,
+        workdir,
     })
 }
 
@@ -964,6 +1068,16 @@ pub fn query_image(image: &str) -> Result<Option<ImageInfo>> {
         }
     }
 
+    // Extract OCI config fields
+    let oci_config = &config_json["config"];
+    let entrypoint = json_string_array(oci_config, "Entrypoint");
+    let cmd = json_string_array(oci_config, "Cmd");
+    let env = json_string_array(oci_config, "Env");
+    let workdir = oci_config["WorkingDir"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+
     Ok(Some(ImageInfo {
         reference: image.to_string(),
         digest: config_digest.to_string(),
@@ -973,6 +1087,10 @@ pub fn query_image(image: &str) -> Result<Option<ImageInfo>> {
         os,
         layer_count: layers.len(),
         layers,
+        entrypoint,
+        cmd,
+        env,
+        workdir,
     }))
 }
 
@@ -1066,8 +1184,11 @@ pub fn export_layer(image_digest: &str, layer_index: usize) -> Result<PathBuf> {
         )));
     }
 
-    // Create tar archive in /tmp
-    let tar_path = PathBuf::from(format!("/tmp/layer-{}.tar", &layer_id[..12]));
+    // Create tar archive on the storage disk (/tmp is on virtiofs which is
+    // read-only on Linux — ENOTSUP)
+    let tmp_dir = root.join("tmp");
+    std::fs::create_dir_all(&tmp_dir)?;
+    let tar_path = tmp_dir.join(format!("layer-{}.tar", &layer_id[..12]));
 
     info!(
         layer_id = %layer_id,
@@ -1582,15 +1703,32 @@ fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Resul
         if !is_mountpoint(&virtiofs_mount) {
             info!(tag = %tag, mount_point = %virtiofs_mount.display(), "mounting virtiofs");
 
-            // Mount virtiofs with sync option to ensure writes are persisted immediately
-            // Note: cache=none is not supported by libkrunfw's kernel, use sync instead
-            let status = Command::new("mount")
-                .args(["-t", "virtiofs", "-o", "sync", tag])
-                .arg(&virtiofs_mount)
-                .status()?;
-
-            if !status.success() {
-                warn!(tag = %tag, "failed to mount virtiofs device");
+            // Mount virtiofs using direct syscall (avoids ~3-5ms fork+exec overhead).
+            // Use sync option to ensure writes are persisted immediately.
+            let src = std::ffi::CString::new(tag.as_str()).map_err(|e| StorageError::Internal {
+                message: format!("invalid tag: {}", e),
+            })?;
+            let dst =
+                std::ffi::CString::new(virtiofs_mount.to_string_lossy().as_ref()).map_err(|e| {
+                    StorageError::Internal {
+                        message: format!("invalid mount point: {}", e),
+                    }
+                })?;
+            let fstype = std::ffi::CString::new("virtiofs").unwrap();
+            let opts = std::ffi::CString::new("sync").unwrap();
+            // SAFETY: mount virtiofs with valid CString arguments
+            let rc = unsafe {
+                libc::mount(
+                    src.as_ptr(),
+                    dst.as_ptr(),
+                    fstype.as_ptr(),
+                    0,
+                    opts.as_ptr() as *const libc::c_void,
+                )
+            };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                warn!(error = %err, tag = %tag, "failed to mount virtiofs device");
                 continue;
             }
         }
@@ -1608,20 +1746,44 @@ fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Resul
                 "bind-mounting into container"
             );
 
-            let args = ["--bind", &virtiofs_mount.to_string_lossy(), &target_path];
-
-            let status = Command::new("mount").args(args).status()?;
-
-            if !status.success() {
-                warn!(target = %target_path, "failed to bind-mount");
+            // Bind mount using direct syscall
+            let bind_src = std::ffi::CString::new(virtiofs_mount.to_string_lossy().as_ref())
+                .map_err(|e| StorageError::Internal {
+                    message: format!("invalid source: {}", e),
+                })?;
+            let bind_dst = std::ffi::CString::new(target_path.as_str()).map_err(|e| {
+                StorageError::Internal {
+                    message: format!("invalid target: {}", e),
+                }
+            })?;
+            // SAFETY: bind mount with MS_BIND flag
+            let rc = unsafe {
+                libc::mount(
+                    bind_src.as_ptr(),
+                    bind_dst.as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_BIND,
+                    std::ptr::null(),
+                )
+            };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                warn!(error = %err, target = %target_path, "failed to bind-mount");
                 continue;
             }
 
             // Remount read-only if requested
             if *read_only {
-                let _ = Command::new("mount")
-                    .args(["-o", "remount,ro,bind", &target_path])
-                    .status();
+                // SAFETY: remount with MS_BIND|MS_RDONLY|MS_REMOUNT
+                unsafe {
+                    libc::mount(
+                        std::ptr::null(),
+                        bind_dst.as_ptr(),
+                        std::ptr::null(),
+                        libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
+                        std::ptr::null(),
+                    );
+                }
             }
         }
 
@@ -1843,17 +2005,14 @@ fn mount_overlay_sequential(
             "copying layer to merged directory"
         );
 
-        // Use shell to copy layer contents, preserving all attributes
+        // Copy layer contents preserving all attributes.
         // cp -a preserves symlinks, permissions, etc.
-        let output = Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "cp -a '{}'/. '{}/' 2>/dev/null || cp -a '{}/'* '{}/' 2>/dev/null || true",
-                layer_path,
-                merged_layers_dir.display(),
-                layer_path,
-                merged_layers_dir.display()
-            ))
+        // Uses explicit args instead of shell to avoid injection risks.
+        let layer_src = format!("{}/.", layer_path);
+        let output = Command::new("cp")
+            .arg("-a")
+            .arg(&layer_src)
+            .arg(merged_layers_dir.as_os_str())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()?;
@@ -2003,7 +2162,7 @@ fn setup_docker_auth(
 fn run_crane(
     operation: &str,
     image: &str,
-    platform: Option<&str>,
+    oci_platform: Option<&str>,
     auth: Option<&RegistryAuth>,
 ) -> Result<String> {
     use crate::retry::{
@@ -2015,7 +2174,7 @@ fn run_crane(
     retry_with_backoff(
         RetryConfig::for_network(),
         &op_name,
-        || run_crane_once(operation, image, platform, auth),
+        || run_crane_once(operation, image, oci_platform, auth),
         |e| {
             let error_msg = e.to_string();
             // Don't retry permanent errors
@@ -2032,13 +2191,13 @@ fn run_crane(
 fn run_crane_once(
     operation: &str,
     image: &str,
-    platform: Option<&str>,
+    oci_platform: Option<&str>,
     auth: Option<&RegistryAuth>,
 ) -> Result<String> {
     let mut cmd = Command::new("crane");
     cmd.arg(operation).arg(image);
 
-    if let Some(p) = platform {
+    if let Some(p) = oci_platform {
         cmd.arg("--platform").arg(p);
     }
 
@@ -2064,19 +2223,19 @@ fn run_crane_once(
 /// Run crane manifest command.
 fn crane_manifest(
     image: &str,
-    platform: Option<&str>,
+    oci_platform: Option<&str>,
     auth: Option<&RegistryAuth>,
 ) -> Result<String> {
-    run_crane("manifest", image, platform, auth)
+    run_crane("manifest", image, oci_platform, auth)
 }
 
 /// Run crane config command.
 fn crane_config(
     image: &str,
-    platform: Option<&str>,
+    oci_platform: Option<&str>,
     auth: Option<&RegistryAuth>,
 ) -> Result<String> {
-    run_crane("config", image, platform, auth)
+    run_crane("config", image, oci_platform, auth)
 }
 
 /// Sanitize image name for use as filename.
@@ -2135,21 +2294,21 @@ fn count_entries(path: &Path) -> Result<usize> {
     Ok(std::fs::read_dir(path)?.count())
 }
 
-/// Convert a platform string to its architecture component.
+/// Convert an OCI platform string to its architecture component.
 ///
 /// # Examples
 /// - "linux/arm64" -> "arm64"
 /// - "linux/amd64" -> "amd64"
 /// - "linux/arm64/v8" -> "arm64"
-fn platform_to_arch(platform: &str) -> String {
-    // Platform format is "os/arch" or "os/arch/variant"
+fn oci_platform_to_arch(oci_platform: &str) -> String {
+    // OCI platform format is "os/arch" or "os/arch/variant"
     // We want just the arch part
-    let parts: Vec<&str> = platform.split('/').collect();
+    let parts: Vec<&str> = oci_platform.split('/').collect();
     if parts.len() >= 2 {
         parts[1].to_string()
     } else {
         // Fallback: return as-is if not in expected format
-        platform.to_string()
+        oci_platform.to_string()
     }
 }
 
@@ -2180,26 +2339,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_platform_to_arch_linux_arm64() {
-        assert_eq!(platform_to_arch("linux/arm64"), "arm64");
+    fn test_oci_platform_to_arch_linux_arm64() {
+        assert_eq!(oci_platform_to_arch("linux/arm64"), "arm64");
     }
 
     #[test]
-    fn test_platform_to_arch_linux_amd64() {
-        assert_eq!(platform_to_arch("linux/amd64"), "amd64");
+    fn test_oci_platform_to_arch_linux_amd64() {
+        assert_eq!(oci_platform_to_arch("linux/amd64"), "amd64");
     }
 
     #[test]
-    fn test_platform_to_arch_with_variant() {
-        assert_eq!(platform_to_arch("linux/arm64/v8"), "arm64");
-        assert_eq!(platform_to_arch("linux/arm/v7"), "arm");
+    fn test_oci_platform_to_arch_with_variant() {
+        assert_eq!(oci_platform_to_arch("linux/arm64/v8"), "arm64");
+        assert_eq!(oci_platform_to_arch("linux/arm/v7"), "arm");
     }
 
     #[test]
-    fn test_platform_to_arch_fallback() {
+    fn test_oci_platform_to_arch_fallback() {
         // If not in expected format, return as-is
-        assert_eq!(platform_to_arch("arm64"), "arm64");
-        assert_eq!(platform_to_arch("unknown"), "unknown");
+        assert_eq!(oci_platform_to_arch("arm64"), "arm64");
+        assert_eq!(oci_platform_to_arch("unknown"), "unknown");
     }
 
     #[test]

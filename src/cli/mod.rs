@@ -5,8 +5,8 @@ pub mod container;
 pub mod microvm;
 pub mod openapi;
 pub mod pack;
+pub mod pack_run;
 pub mod parsers;
-pub mod runpack;
 pub mod sandbox;
 pub mod serve;
 pub mod smolfile;
@@ -90,7 +90,7 @@ pub fn format_bytes(bytes: u64) -> String {
 pub fn pull_with_progress(
     client: &mut smolvm::agent::AgentClient,
     image: &str,
-    platform: Option<&str>,
+    oci_platform: Option<&str>,
 ) -> smolvm::Result<smolvm_protocol::ImageInfo> {
     print!("Pulling image {}...", image);
     let _ = std::io::stdout().flush();
@@ -98,7 +98,7 @@ pub fn pull_with_progress(
     let mut last_percent = 0u8;
     let result = client.pull_with_registry_config_and_progress(
         image,
-        platform,
+        oci_platform,
         |percent, _total, _layer| {
             let percent = percent as u8;
             if percent != last_percent && percent <= 100 {

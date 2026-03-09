@@ -8,6 +8,7 @@ use crate::cli::vm_common;
 use crate::cli::{flush_output, truncate, truncate_id, COMMAND_WIDTH, IMAGE_NAME_WIDTH};
 use clap::{Args, Subcommand};
 use smolvm::agent::{AgentClient, AgentManager};
+use smolvm::{DEFAULT_IDLE_CMD, DEFAULT_SHELL_CMD};
 use std::time::Duration;
 
 /// Manage containers inside a microVM
@@ -49,19 +50,7 @@ impl ContainerCmd {
 
 /// Get the agent manager for a microvm, ensuring it's running.
 fn ensure_microvm(name: &str) -> smolvm::Result<AgentManager> {
-    let name_opt = if name == "default" {
-        None
-    } else {
-        Some(name.to_string())
-    };
-    let manager = vm_common::get_vm_manager(&name_opt)?;
-
-    if manager.try_connect_existing().is_none() {
-        println!("Starting microvm '{}'...", name);
-        manager.ensure_running()?;
-    }
-
-    Ok(manager)
+    vm_common::get_or_start_vm(name)
 }
 
 // ============================================================================
@@ -123,7 +112,7 @@ impl ContainerCreateCmd {
 
         // Default command is sleep infinity for long-running containers
         let command = if self.command.is_empty() {
-            vec!["sleep".to_string(), "infinity".to_string()]
+            DEFAULT_IDLE_CMD.iter().map(|s| s.to_string()).collect()
         } else {
             self.command.clone()
         };
@@ -275,7 +264,7 @@ pub struct ContainerListCmd {
 
 impl ContainerListCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        // "default" refers to the anonymous default microvm
+        // "default" refers to the default microvm
         let manager = if self.microvm == "default" {
             AgentManager::new_default()?
         } else {
@@ -381,7 +370,7 @@ impl ContainerExecCmd {
 
         // Default command
         let command = if self.command.is_empty() {
-            vec!["/bin/sh".to_string()]
+            vec![DEFAULT_SHELL_CMD.to_string()]
         } else {
             self.command.clone()
         };

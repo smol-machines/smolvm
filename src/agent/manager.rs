@@ -7,7 +7,6 @@ use crate::error::{Error, Result};
 use crate::process::{self, ChildProcess};
 use crate::storage::{OverlayDisk, StorageDisk};
 use parking_lot::Mutex;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -22,8 +21,14 @@ use super::{HostMount, PortMapping, VmResources};
 /// Timeout for the agent to become ready after starting.
 const AGENT_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Ready marker filename that the agent writes to the virtiofs rootfs
+/// after completing initialization. The host watches for this file instead
+/// of the vsock socket to avoid the race where the socket appears (created
+/// by libkrun's muxer thread) before the agent is ready to handle requests.
+const READY_MARKER_FILENAME: &str = ".smolvm-ready";
+
 // Re-use shared polling constants from process module.
-use crate::process::{FAST_POLL_COUNT, FAST_POLL_INTERVAL};
+use crate::process::FAST_POLL_INTERVAL;
 
 /// Timeout for agent to stop gracefully before force kill.
 /// Reduced from 5s - VMs typically exit within 100ms after shutdown signal.
@@ -31,6 +36,37 @@ const AGENT_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Timeout when waiting for agent to stop.
 const WAIT_FOR_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Running VM configuration persisted to disk so new CLI invocations
+/// can restore the actual config of a detached VM.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct RunningVmConfig {
+    /// Schema version for forward compatibility.
+    #[serde(default = "RunningVmConfig::default_version")]
+    version: u32,
+    mounts: Vec<HostMount>,
+    ports: Vec<PortMapping>,
+    resources: VmResources,
+}
+
+impl RunningVmConfig {
+    const CURRENT_VERSION: u32 = 1;
+
+    fn default_version() -> u32 {
+        1
+    }
+}
+
+/// Whether the in-memory VM config is trustworthy.
+#[derive(Debug, Clone)]
+enum ConfigState {
+    /// Config was never populated (fresh manager, no reconnect yet).
+    Unknown,
+    /// Config was set during VM start or restored from disk on reconnect.
+    Known,
+    /// Config file was missing or corrupt on reconnect — cannot trust defaults.
+    LoadFailed(String),
+}
 
 /// State of the agent VM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,8 +151,23 @@ struct AgentInner {
     ports: Vec<PortMapping>,
     /// Currently configured VM resources.
     resources: VmResources,
+    /// Whether the in-memory config is trustworthy.
+    config_state: ConfigState,
     /// If true, the agent has been detached and should not be stopped on drop.
     detached: bool,
+}
+
+/// Get the data directory for a named VM.
+///
+/// Returns `~/.cache/smolvm/vms/{name}/` (macOS) or equivalent on other platforms.
+/// This is the canonical location for a VM's storage disk, overlay disk, and socket.
+pub fn vm_data_dir(name: &str) -> PathBuf {
+    dirs::cache_dir()
+        .or_else(dirs::data_local_dir)
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("smolvm")
+        .join("vms")
+        .join(name)
 }
 
 /// Agent VM manager.
@@ -124,11 +175,10 @@ struct AgentInner {
 /// Manages the lifecycle of the agent VM which handles OCI image operations
 /// and command execution.
 ///
-/// Each named VM gets its own agent with isolated paths:
-/// - Anonymous: `~/.cache/smolvm/agent.sock`
-/// - Named "foo": `~/.cache/smolvm/vms/foo/agent.sock`
+/// Each VM gets its own agent with isolated paths under
+/// `~/.cache/smolvm/vms/{name}/` (socket, PID file, storage, overlay).
 pub struct AgentManager {
-    /// Optional VM name (None for anonymous/default agent).
+    /// VM name (None only for low-level `new()` callers; CLI always sets a name).
     name: Option<String>,
     /// Path to the agent rootfs.
     rootfs_path: PathBuf,
@@ -140,14 +190,18 @@ pub struct AgentManager {
     vsock_socket: PathBuf,
     /// PID file path for tracking the VM process across CLI invocations.
     pid_file: PathBuf,
+    /// Config file path for persisting running VM config across CLI invocations.
+    config_file: PathBuf,
     /// Console log path (optional).
     console_log: Option<PathBuf>,
+    /// Startup error log path written by the child if microvm launch fails before readiness
+    startup_error_log: PathBuf,
     /// Internal state.
     inner: Arc<Mutex<AgentInner>>,
 }
 
 impl AgentManager {
-    /// Create a new agent manager for an anonymous (default) agent.
+    /// Create a new agent manager with explicit paths (low-level).
     ///
     /// # Arguments
     ///
@@ -201,7 +255,9 @@ impl AgentManager {
 
         let vsock_socket = smolvm_runtime.join("agent.sock");
         let pid_file = smolvm_runtime.join("agent.pid");
+        let config_file = smolvm_runtime.join("agent.config.json");
         let console_log = Some(smolvm_runtime.join("agent-console.log"));
+        let startup_error_log: PathBuf = smolvm_runtime.join("agent-startup-error.log");
 
         Ok(Self {
             name,
@@ -210,52 +266,47 @@ impl AgentManager {
             overlay_disk,
             vsock_socket,
             pid_file,
+            config_file,
             console_log,
+            startup_error_log,
             inner: Arc::new(Mutex::new(AgentInner {
                 state: AgentState::Stopped,
                 child: None,
                 mounts: Vec::new(),
                 ports: Vec::new(),
                 resources: VmResources::default(),
+                config_state: ConfigState::Unknown,
                 detached: false,
             })),
         })
     }
 
-    /// Get the default (anonymous) agent manager.
+    /// Get the default agent manager.
     ///
     /// Uses default paths for rootfs and storage.
-    /// `storage_gb` and `overlay_gb` override the default disk sizes (20 GiB / 2 GiB).
+    /// `storage_gb` and `overlay_gb` override the default disk sizes (20 GiB / 10 GiB).
+    ///
+    /// Canonicalized to `for_vm_with_sizes("default", ...)` so that all
+    /// lifecycle commands (start/stop/exec/status) use consistent paths.
     pub fn new_default_with_sizes(
         storage_gb: Option<u64>,
         overlay_gb: Option<u64>,
     ) -> Result<Self> {
-        let rootfs_path = Self::default_rootfs_path()?;
-        let sg = storage_gb.unwrap_or(crate::storage::DEFAULT_STORAGE_SIZE_GB);
-        let og = overlay_gb.unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GB);
-
-        let storage_disk = StorageDisk::open_or_create_with_size(sg)?;
-
-        // Overlay disk lives next to the storage disk
-        let overlay_path = storage_disk
-            .path()
-            .parent()
-            .unwrap_or_else(|| Path::new("/tmp"))
-            .join(crate::storage::OVERLAY_DISK_FILENAME);
-        let overlay_disk = OverlayDisk::open_or_create_at(&overlay_path, og)?;
-
-        Self::new(rootfs_path, storage_disk, overlay_disk)
+        Self::for_vm_with_sizes("default", storage_gb, overlay_gb)
     }
 
-    /// Get the default (anonymous) agent manager with default sizes.
+    /// Get the default agent manager with default sizes.
+    ///
+    /// Canonicalized to `for_vm("default")` so that all lifecycle commands
+    /// use consistent socket/PID/storage paths.
     pub fn new_default() -> Result<Self> {
-        Self::new_default_with_sizes(None, None)
+        Self::for_vm("default")
     }
 
     /// Get an agent manager for a named VM.
     ///
     /// Each named VM gets its own isolated storage and socket.
-    /// `storage_gb` and `overlay_gb` override the default disk sizes (20 GiB / 2 GiB).
+    /// `storage_gb` and `overlay_gb` override the default disk sizes (20 GiB / 10 GiB).
     pub fn for_vm_with_sizes(
         name: impl Into<String>,
         storage_gb: Option<u64>,
@@ -267,12 +318,7 @@ impl AgentManager {
         let og = overlay_gb.unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GB);
 
         // Named VMs get their own storage disk
-        let storage_dir = dirs::cache_dir()
-            .or_else(dirs::data_local_dir)
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join("smolvm")
-            .join("vms")
-            .join(&name);
+        let storage_dir = vm_data_dir(&name);
         std::fs::create_dir_all(&storage_dir)?;
 
         let storage_path = storage_dir.join(crate::storage::STORAGE_DISK_FILENAME);
@@ -295,7 +341,15 @@ impl AgentManager {
     }
 
     /// Get the default path for the agent rootfs.
+    ///
+    /// Checks `SMOLVM_AGENT_ROOTFS` env var first, then falls back to the
+    /// platform data directory (`~/.local/share/smolvm/agent-rootfs` on Linux,
+    /// `~/Library/Application Support/smolvm/agent-rootfs` on macOS).
     pub fn default_rootfs_path() -> Result<PathBuf> {
+        if let Ok(path) = std::env::var("SMOLVM_AGENT_ROOTFS") {
+            return Ok(PathBuf::from(path));
+        }
+
         let data_dir = dirs::data_local_dir()
             .or_else(dirs::data_dir)
             .ok_or_else(|| Error::storage("resolve path", "could not determine data directory"))?;
@@ -421,6 +475,27 @@ impl AgentManager {
                         );
                     }
                 }
+                // Restore the running VM config from disk so that
+                // ensure_running_with_full_config can accurately compare
+                // the requested config against the actual running config.
+                if matches!(inner.config_state, ConfigState::Unknown) {
+                    match self.load_running_config() {
+                        Ok(config) => {
+                            inner.mounts = config.mounts;
+                            inner.ports = config.ports;
+                            inner.resources = config.resources;
+                            inner.config_state = ConfigState::Known;
+                        }
+                        Err(reason) => {
+                            tracing::warn!(
+                                reason = %reason,
+                                "could not restore running VM config; \
+                                 config changes will force restart"
+                            );
+                            inner.config_state = ConfigState::LoadFailed(reason);
+                        }
+                    }
+                }
                 return Some(());
             }
         }
@@ -435,6 +510,50 @@ impl AgentManager {
         let pid = lines.next()?.trim().parse::<i32>().ok()?;
         let start_time = lines.next().and_then(|s| s.trim().parse::<u64>().ok());
         Some((pid, start_time))
+    }
+
+    /// Save the running VM config to disk so future CLI invocations can
+    /// restore the actual config of a detached VM on reconnect.
+    ///
+    /// Uses atomic write (tmp + rename) to avoid partial/corrupt reads.
+    fn save_running_config(
+        &self,
+        mounts: &[HostMount],
+        ports: &[PortMapping],
+        resources: &VmResources,
+    ) {
+        let config = RunningVmConfig {
+            version: RunningVmConfig::CURRENT_VERSION,
+            mounts: mounts.to_vec(),
+            ports: ports.to_vec(),
+            resources: resources.clone(),
+        };
+        match serde_json::to_string(&config) {
+            Ok(json) => {
+                let tmp = self.config_file.with_extension("json.tmp");
+                if let Err(e) = std::fs::write(&tmp, &json) {
+                    tracing::warn!(error = %e, "failed to write VM config tmp file");
+                    return;
+                }
+                if let Err(e) = std::fs::rename(&tmp, &self.config_file) {
+                    tracing::warn!(error = %e, "failed to rename VM config file");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to serialize VM config");
+            }
+        }
+    }
+
+    /// Load the running VM config from disk.
+    ///
+    /// Returns an error string describing why the load failed, so callers
+    /// can log it and treat the config as unknown (fail-closed).
+    fn load_running_config(&self) -> std::result::Result<RunningVmConfig, String> {
+        let content = std::fs::read_to_string(&self.config_file)
+            .map_err(|e| format!("config file {}: {}", self.config_file.display(), e))?;
+        serde_json::from_str(&content)
+            .map_err(|e| format!("invalid JSON in {}: {}", self.config_file.display(), e))
     }
 
     /// Get the child PID if known.
@@ -503,7 +622,7 @@ impl AgentManager {
     /// Ensure the agent is running with the specified mounts.
     ///
     /// If the agent is running with different mounts, it will be restarted.
-    pub fn ensure_running_with_mounts(&self, mounts: Vec<HostMount>) -> Result<()> {
+    pub fn ensure_running_with_mounts(&self, mounts: Vec<HostMount>) -> Result<bool> {
         self.ensure_running_with_full_config(mounts, Vec::new(), VmResources::default())
     }
 
@@ -514,33 +633,55 @@ impl AgentManager {
         &self,
         mounts: Vec<HostMount>,
         resources: VmResources,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         self.ensure_running_with_full_config(mounts, Vec::new(), resources)
     }
 
     /// Ensure the agent is running with the specified mounts, ports, and resources.
     ///
     /// If the agent is running with different configuration, it will be restarted.
+    /// Returns `true` if the VM was freshly started/restarted, `false` if reused.
     pub fn ensure_running_with_full_config(
         &self,
         mounts: Vec<HostMount>,
         ports: Vec<PortMapping>,
         resources: VmResources,
-    ) -> Result<()> {
-        // Check if agent is already running with the same configuration
-        if self.try_connect_existing().is_some()
-            && self.mounts_match(&mounts)
-            && self.ports_match(&ports)
-            && self.resources_match(&resources)
-        {
-            return Ok(());
+    ) -> Result<bool> {
+        // Check if agent is already running with the same configuration.
+        // try_connect_existing restores config from disk on reconnect,
+        // so the comparison below is accurate even for detached VMs.
+        if self.try_connect_existing().is_some() {
+            let inner = self.inner.lock();
+            match &inner.config_state {
+                ConfigState::Known => {
+                    if inner.mounts == mounts
+                        && inner.ports == ports
+                        && inner.resources == resources
+                    {
+                        return Ok(false);
+                    }
+                    // Config is known but doesn't match — fall through to restart.
+                }
+                ConfigState::LoadFailed(reason) => {
+                    // Fail-closed: cannot verify running config matches requested,
+                    // so force restart to ensure correct isolation/network settings.
+                    tracing::info!(
+                        reason = %reason,
+                        "forcing VM restart: running config unknown"
+                    );
+                }
+                ConfigState::Unknown => {
+                    // This shouldn't happen (try_connect_existing always resolves
+                    // Unknown to Known or LoadFailed), but fail-closed just in case.
+                    tracing::info!("forcing VM restart: config state still unknown");
+                }
+            }
         }
 
-        // If running with different config, we need to restart
+        // If running with different/unknown config, we need to restart
         let needs_restart = {
             let inner = self.inner.lock();
             inner.state == AgentState::Running
-                && (inner.mounts != mounts || inner.ports != ports || inner.resources != resources)
         };
 
         if needs_restart {
@@ -553,17 +694,19 @@ impl AgentManager {
         }
 
         // Start with new config
-        self.start_with_full_config(mounts, ports, resources)
+        self.start_with_full_config(mounts, ports, resources)?;
+        Ok(true)
     }
 
     /// Ensure the agent is running.
     ///
     /// If the agent is not running, this starts it.
     /// If the agent is already running, this is a no-op.
-    pub fn ensure_running(&self) -> Result<()> {
+    /// Returns `true` if the VM was freshly started, `false` if reused.
+    pub fn ensure_running(&self) -> Result<bool> {
         // First, check if an agent is already running (from a previous invocation)
         if self.try_connect_existing().is_some() {
-            return Ok(());
+            return Ok(false);
         }
 
         // try_connect_existing failed — if state is stale Running (crashed VM),
@@ -574,12 +717,19 @@ impl AgentManager {
         let state = self.state();
 
         match state {
-            AgentState::Running => Ok(()), // shouldn't reach here after reset, but safe
-            AgentState::Starting => self.wait_for_ready(),
-            AgentState::Stopped => self.start(),
+            AgentState::Running => Ok(false), // shouldn't reach here after reset, but safe
+            AgentState::Starting => {
+                self.wait_for_ready()?;
+                Ok(true)
+            }
+            AgentState::Stopped => {
+                self.start()?;
+                Ok(true)
+            }
             AgentState::Stopping => {
                 self.wait_for_stop()?;
-                self.start()
+                self.start()?;
+                Ok(true)
             }
         }
     }
@@ -619,6 +769,7 @@ impl AgentManager {
             inner.mounts = mounts.clone();
             inner.ports = ports.clone();
             inner.resources = resources.clone();
+            inner.config_state = ConfigState::Known;
         }
 
         tracing::info!(
@@ -649,23 +800,32 @@ impl AgentManager {
             ));
         }
 
-        // Pre-format storage disk on host (much faster than in-VM formatting)
-        // This tries: 1) copy from template (no deps), 2) mkfs.ext4 (requires e2fsprogs)
+        // Pre-format storage and overlay disks in parallel.
+        // Each tries: 1) clonefile/copy from template, 2) mkfs.ext4 (requires e2fsprogs).
         // If both fail, VM can still format the disk but it may be slower or timeout.
-        if let Err(e) = self.storage_disk.ensure_formatted() {
-            tracing::warn!(
-                error = %e,
-                "failed to pre-format disk on host, will attempt format in VM. \
-                For faster startup, install storage template or e2fsprogs"
-            );
-        }
+        {
+            let storage_disk = &self.storage_disk;
+            let overlay_disk = &self.overlay_disk;
+            std::thread::scope(|s| {
+                let storage_handle = s.spawn(|| storage_disk.ensure_formatted());
+                let overlay_result = overlay_disk.ensure_formatted();
 
-        // Pre-format overlay disk for persistent rootfs
-        if let Err(e) = self.overlay_disk.ensure_formatted() {
-            tracing::warn!(
-                error = %e,
-                "failed to pre-format overlay disk on host, will format in VM on first boot"
-            );
+                if let Err(e) = storage_handle.join().unwrap_or_else(|_| {
+                    Err(crate::Error::storage("format storage", "thread panicked"))
+                }) {
+                    tracing::warn!(
+                        error = %e,
+                        "failed to pre-format disk on host, will attempt format in VM. \
+                        For faster startup, install storage template or e2fsprogs"
+                    );
+                }
+                if let Err(e) = overlay_result {
+                    tracing::warn!(
+                        error = %e,
+                        "failed to pre-format overlay disk on host, will format in VM on first boot"
+                    );
+                }
+            });
         }
 
         // Install SIGCHLD handler to automatically reap zombie children.
@@ -679,6 +839,15 @@ impl AgentManager {
                 tracing::debug!(error = %e, path = %self.vsock_socket.display(), "failed to remove old socket");
             }
         }
+
+        // Clean up stale ready marker from previous boot
+        let ready_marker = self.rootfs_path.join(READY_MARKER_FILENAME);
+        let _ = std::fs::remove_file(&ready_marker);
+        let _ = std::fs::remove_file(&self.startup_error_log);
+
+        // Clone mounts/ports for save_running_config (originals move into fork closure)
+        let mounts_for_config = mounts.clone();
+        let ports_for_config = ports.clone();
 
         // Clone paths for the child process (owned copies)
         let rootfs_path = self.rootfs_path.clone();
@@ -696,6 +865,7 @@ impl AgentManager {
         // Fork child process using the safe abstraction.
         // The child becomes a session leader (detached from parent's session)
         // so the VM survives if the parent process is killed.
+        let resources_for_save = resources.clone();
         let child_pid = match process::fork_session_leader(move || {
             // Inherited file descriptors (including database locks) are closed
             // by fork_session_leader before this closure runs.
@@ -710,6 +880,10 @@ impl AgentManager {
             ) {
                 Ok(d) => d,
                 Err(e) => {
+                    let _ = std::fs::write(
+                        &self.startup_error_log,
+                        format!("failed to open storage disk: {}", e),
+                    );
                     eprintln!("failed to open storage disk: {}", e);
                     process::exit_child(1);
                 }
@@ -722,10 +896,19 @@ impl AgentManager {
             ) {
                 Ok(d) => d,
                 Err(e) => {
+                    let _ = std::fs::write(
+                        &self.startup_error_log,
+                        format!("failed to open overlay disk: {}", e),
+                    );
                     eprintln!("failed to open overlay disk: {}", e);
                     process::exit_child(1);
                 }
             };
+
+            // Detach from parent's terminal before launching the VM.
+            // Without this, libkrun's threads inherit stdin and steal
+            // keystrokes from the user's shell.
+            process::detach_stdio();
 
             // Launch the agent VM (never returns on success)
             let disks = launcher::VmDisks {
@@ -742,9 +925,10 @@ impl AgentManager {
                 resources,
             );
 
-            // If we get here, something went wrong
-            if let Err(e) = result {
-                eprintln!("agent VM failed to start: {}", e);
+            // If we get here, something went wrong (stderr is /dev/null,
+            // but the error is also logged to agent-startup-error.log)
+            if let Err(ref e) = result {
+                let _ = std::fs::write(&self.startup_error_log, e.to_string());
             }
 
             process::exit_child(1);
@@ -757,7 +941,7 @@ impl AgentManager {
             }
         };
 
-        // Parent process continues here
+        // Parent process continues here — child is now booting the VM in parallel.
         tracing::debug!(pid = child_pid, "forked agent VM process");
 
         // Store child process
@@ -765,6 +949,10 @@ impl AgentManager {
             let mut inner = self.inner.lock();
             inner.child = Some(ChildProcess::new(child_pid));
         }
+
+        // Write running config while child boots (overlaps with VM startup).
+        // This is needed for future CLI invocations to detect config changes.
+        self.save_running_config(&mounts_for_config, &ports_for_config, &resources_for_save);
 
         // Write PID file so future CLI invocations can find this process.
         // Include start time on second line for PID reuse detection.
@@ -790,6 +978,7 @@ impl AgentManager {
                 let mut inner = self.inner.lock();
                 inner.state = AgentState::Stopped;
                 inner.child = None;
+                let _ = std::fs::remove_file(&self.startup_error_log);
                 Err(e)
             }
         }
@@ -840,11 +1029,11 @@ impl AgentManager {
         }
     }
 
-    /// Remove PID file and vsock socket marker files.
+    /// Remove PID file, config file, and vsock socket marker files.
     ///
     /// Only call after the VM process is confirmed dead.
     fn cleanup_marker_files(&self) {
-        for path in [&self.pid_file, &self.vsock_socket] {
+        for path in [&self.pid_file, &self.config_file, &self.vsock_socket] {
             if let Err(e) = std::fs::remove_file(path) {
                 if e.kind() != std::io::ErrorKind::NotFound {
                     tracing::debug!(error = %e, path = %path.display(), "failed to remove marker file");
@@ -884,7 +1073,7 @@ impl AgentManager {
         tracing::info!("stopping agent VM");
 
         // Get the child PID and start time — try in-memory first, then PID file.
-        // The PID file fallback is critical for anonymous VMs where a fresh
+        // The PID file fallback is critical for default VMs where a fresh
         // AgentManager doesn't know the PID from a previous CLI invocation.
         let (child_pid, pid_start_time) = {
             let inner = self.inner.lock();
@@ -939,90 +1128,87 @@ impl AgentManager {
     }
 
     /// Wait for the agent to be ready.
+    ///
+    /// Polls for a ready marker file (`.smolvm-ready`) in the virtiofs rootfs.
+    /// The agent writes this after completing all initialization, including
+    /// starting the vsock listener. We trust the marker without a verification
+    /// ping since it's written after the listener is active.
+    ///
+    /// Fallback: if no ready marker appears after a grace period, assumes an
+    /// old agent without marker support and falls back to socket + ping.
+    /// The grace period avoids flooding the agent's single-threaded accept
+    /// loop with probe connections during boot.
     fn wait_for_ready(&self) -> Result<()> {
         let timeout = AGENT_READY_TIMEOUT;
         let start = Instant::now();
 
+        // Grace period: only poll for the ready marker (no socket probing).
+        // Current agents always write the marker within ~200ms of boot.
+        // After this grace period, fall back to socket + ping for old agents.
+        let socket_probe_grace = Duration::from_secs(5);
+
         tracing::debug!("waiting for agent to be ready");
 
-        // Track timing for each phase
-        let mut socket_appeared_at: Option<Duration> = None;
-        let mut first_connect_at: Option<Duration> = None;
-        let mut poll_count: u32 = 0;
+        let ready_marker = self.rootfs_path.join(READY_MARKER_FILENAME);
+        let mut socket_probe_started = false;
 
         while start.elapsed() < timeout {
-            // Use aggressive polling at first, then back off
-            let poll_interval = if poll_count < FAST_POLL_COUNT {
-                FAST_POLL_INTERVAL // 10ms
-            } else {
-                Duration::from_millis(100) // Back off to 100ms
-            };
-            poll_count += 1;
             // Check if child process is still alive
             {
                 let mut inner = self.inner.lock();
                 if let Some(ref mut child) = inner.child {
                     if !child.is_running() {
-                        // Child exited
+                        let reason = std::fs::read_to_string(&self.startup_error_log)
+                            .ok()
+                            .map(|content| content.trim().to_string())
+                            .filter(|content| !content.is_empty());
+
                         return Err(Error::agent(
                             "monitor agent",
-                            "agent process exited during startup",
+                            reason.unwrap_or_else(|| {
+                                "agent process exited during startup".to_string()
+                            }),
                         ));
                     }
                 }
             }
 
-            // Try to connect to vsock socket
-            if self.vsock_socket.exists() {
-                // Log when socket first appears
-                if socket_appeared_at.is_none() {
-                    let elapsed = start.elapsed();
-                    socket_appeared_at = Some(elapsed);
-                    tracing::debug!(elapsed_ms = elapsed.as_millis(), "vsock socket appeared");
-                }
-
-                match UnixStream::connect(&self.vsock_socket) {
-                    Ok(stream) => {
-                        drop(stream);
-
-                        // Log when first connect succeeds
-                        if first_connect_at.is_none() {
-                            let elapsed = start.elapsed();
-                            first_connect_at = Some(elapsed);
-                            tracing::debug!(
-                                elapsed_ms = elapsed.as_millis(),
-                                "vsock first connect succeeded"
-                            );
-                        }
-
-                        // Try to ping
-                        match super::AgentClient::connect(&self.vsock_socket) {
-                            Ok(mut client) => {
-                                if client.ping().is_ok() {
-                                    let total = start.elapsed();
-                                    tracing::info!(
-                                        total_ms = total.as_millis(),
-                                        socket_wait_ms =
-                                            socket_appeared_at.map(|d| d.as_millis()).unwrap_or(0),
-                                        connect_wait_ms =
-                                            first_connect_at.map(|d| d.as_millis()).unwrap_or(0),
-                                        "agent ready - timing breakdown"
-                                    );
-                                    return Ok(());
-                                }
-                            }
-                            Err(e) => {
-                                tracing::trace!("ping failed: {}", e);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::trace!("connect failed: {}", e);
-                    }
-                }
+            // Ready marker = agent fully initialized (preferred path)
+            if ready_marker.exists() {
+                let elapsed = start.elapsed();
+                tracing::info!(elapsed_ms = elapsed.as_millis(), "agent ready (marker)");
+                let _ = std::fs::remove_file(&ready_marker);
+                return Ok(());
             }
 
-            std::thread::sleep(poll_interval);
+            // After the grace period, fall back to socket + ping for old
+            // agents that don't write a ready marker. This avoids flooding
+            // the agent's single-threaded accept loop with abandoned probe
+            // connections during normal boot.
+            if start.elapsed() >= socket_probe_grace && self.vsock_socket.exists() {
+                if !socket_probe_started {
+                    socket_probe_started = true;
+                    tracing::debug!(
+                        elapsed_ms = start.elapsed().as_millis(),
+                        "starting socket probe fallback (no marker after grace period)"
+                    );
+                }
+
+                if let Ok(mut client) =
+                    super::AgentClient::connect_with_boot_probe_timeout(&self.vsock_socket)
+                {
+                    if client.ping().is_ok() {
+                        let elapsed = start.elapsed();
+                        tracing::info!(
+                            elapsed_ms = elapsed.as_millis(),
+                            "agent ready (socket fallback)"
+                        );
+                        return Ok(());
+                    }
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(5));
+            }
         }
 
         Err(Error::agent(
@@ -1091,8 +1277,9 @@ impl Drop for AgentManager {
         let detached = self.inner.lock().detached;
 
         if !detached {
-            // Best-effort cleanup
-            let _ = self.stop();
+            if let Err(e) = self.stop() {
+                tracing::debug!(error = %e, "failed to stop agent in drop");
+            }
         }
     }
 }

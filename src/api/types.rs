@@ -9,6 +9,7 @@ use utoipa::ToSchema;
 
 /// Restart policy specification for sandbox creation.
 #[derive(Debug, Clone, Deserialize, Serialize, Default, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct RestartSpec {
     /// Restart policy: "never", "always", "on-failure", "unless-stopped".
     #[serde(default)]
@@ -81,6 +82,7 @@ pub struct PortSpec {
 
 /// VM resource specification.
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct ResourceSpec {
     /// Number of vCPUs.
     #[serde(default)]
@@ -106,6 +108,7 @@ pub struct ResourceSpec {
 
 /// Sandbox status information.
 #[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct SandboxInfo {
     /// Sandbox name.
     #[schema(example = "my-sandbox")]
@@ -143,6 +146,7 @@ pub struct ListSandboxesResponse {
 
 /// Request to execute a command in a sandbox.
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct ExecRequest {
     /// Command and arguments.
     #[schema(example = json!(["echo", "hello"]))]
@@ -182,6 +186,7 @@ impl EnvVar {
 
 /// Command execution result.
 #[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct ExecResponse {
     /// Exit code.
     #[schema(example = 0)]
@@ -196,6 +201,7 @@ pub struct ExecResponse {
 
 /// Request to run a command in an image.
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct RunRequest {
     /// Image to run in.
     #[schema(example = "python:3.12-alpine")]
@@ -261,6 +267,7 @@ pub struct ContainerMountSpec {
 
 /// Container information.
 #[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct ContainerInfo {
     /// Container ID.
     #[schema(example = "abc123")]
@@ -286,6 +293,7 @@ pub struct ListContainersResponse {
 
 /// Request to exec in a container.
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct ContainerExecRequest {
     /// Command and arguments.
     #[schema(example = json!(["ls", "-la"]))]
@@ -303,6 +311,7 @@ pub struct ContainerExecRequest {
 
 /// Request to stop a container.
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct StopContainerRequest {
     /// Timeout before force kill (seconds).
     #[serde(default)]
@@ -324,6 +333,7 @@ pub struct DeleteContainerRequest {
 
 /// Image information.
 #[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct ImageInfo {
     /// Image reference.
     #[schema(example = "alpine:latest")]
@@ -354,14 +364,15 @@ pub struct ListImagesResponse {
 
 /// Request to pull an image.
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct PullImageRequest {
     /// Image reference.
     #[schema(example = "python:3.12-alpine")]
     pub image: String,
-    /// Platform (e.g., "linux/arm64").
+    /// OCI platform for multi-arch images (e.g., "linux/arm64").
     #[serde(default)]
     #[schema(example = "linux/arm64")]
-    pub platform: Option<String>,
+    pub oci_platform: Option<String>,
 }
 
 /// Pull image response.
@@ -444,6 +455,7 @@ fn default_mem() -> u32 {
 
 /// Request to create a new microvm.
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateMicrovmRequest {
     /// Unique name for the microvm.
     #[schema(example = "my-vm")]
@@ -476,6 +488,7 @@ pub struct CreateMicrovmRequest {
 
 /// Request to execute a command in a microvm.
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct MicrovmExecRequest {
     /// Command and arguments.
     #[schema(example = json!(["echo", "hello"]))]
@@ -493,6 +506,7 @@ pub struct MicrovmExecRequest {
 
 /// MicroVM status information.
 #[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct MicrovmInfo {
     /// MicroVM name.
     #[schema(example = "my-vm")]

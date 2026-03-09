@@ -7,10 +7,14 @@ use std::sync::Arc;
 use smolvm::api::state::ApiState;
 use smolvm::Result;
 
+use super::openapi::OpenapiCmd;
+
 /// Start the HTTP API server for programmatic control.
 #[derive(Parser, Debug)]
 #[command(about = "Start the HTTP API server for programmatic sandbox management")]
-#[command(after_long_help = "\
+pub enum ServeCmd {
+    /// Start the HTTP API server
+    #[command(after_long_help = "\
 Sandboxes persist independently of the server - they continue running even if the server stops.
 
 API ENDPOINTS:
@@ -24,10 +28,26 @@ API ENDPOINTS:
   DELETE /api/v1/sandboxes/:id         Delete sandbox
 
 EXAMPLES:
-  smolvm serve                         Listen on 127.0.0.1:8080 (default)
-  smolvm serve -l 0.0.0.0:9000         Listen on all interfaces, port 9000
-  smolvm serve -v                      Enable verbose logging")]
-pub struct ServeCmd {
+  smolvm serve start                         Listen on 127.0.0.1:8080 (default)
+  smolvm serve start -l 0.0.0.0:9000         Listen on all interfaces, port 9000
+  smolvm serve start -v                      Enable verbose logging")]
+    Start(ServeStartCmd),
+
+    /// Export OpenAPI specification for SDK generation
+    Openapi(OpenapiCmd),
+}
+
+impl ServeCmd {
+    pub fn run(self) -> Result<()> {
+        match self {
+            ServeCmd::Start(cmd) => cmd.run(),
+            ServeCmd::Openapi(cmd) => cmd.run(),
+        }
+    }
+}
+
+#[derive(Parser, Debug)]
+pub struct ServeStartCmd {
     /// Address and port to listen on
     #[arg(
         short,
@@ -46,7 +66,7 @@ pub struct ServeCmd {
     cors_origins: Vec<String>,
 }
 
-impl ServeCmd {
+impl ServeStartCmd {
     /// Run the serve command.
     pub fn run(self) -> Result<()> {
         // Parse listen address

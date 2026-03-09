@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::agent::PullOptions;
 use crate::api::error::{classify_ensure_running_error, ApiError};
-use crate::api::state::{ensure_sandbox_running, with_sandbox_client, ApiState};
+use crate::api::state::{ensure_running_and_persist, with_sandbox_client, ApiState};
 use crate::api::types::{
     ApiErrorResponse, ImageInfo, ListImagesResponse, PullImageRequest, PullImageResponse,
 };
@@ -86,17 +86,17 @@ pub async fn pull_image(
 
     let entry = state.get_sandbox(&sandbox_id)?;
 
-    // Ensure sandbox is running
-    ensure_sandbox_running(&entry)
+    // Ensure sandbox is running and persist state to DB
+    ensure_running_and_persist(&state, &sandbox_id, &entry)
         .await
         .map_err(classify_ensure_running_error)?;
 
     let image = req.image.clone();
-    let platform = req.platform.clone();
+    let oci_platform = req.oci_platform.clone();
     let image_info = with_sandbox_client(&entry, move |c| {
         let mut opts = PullOptions::new().use_registry_config(true);
-        if let Some(p) = platform {
-            opts = opts.platform(p);
+        if let Some(p) = oci_platform {
+            opts = opts.oci_platform(p);
         }
         c.pull(&image, opts)
     })

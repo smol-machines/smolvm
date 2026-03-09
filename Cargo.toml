@@ -1,10 +1,16 @@
 [workspace]
-members = [".", "crates/smolvm-agent", "crates/smolvm-protocol", "crates/smolvm-pack"]
+members = [
+    ".",
+    "crates/smolvm-agent",
+    "crates/smolvm-napi",
+    "crates/smolvm-pack",
+    "crates/smolvm-protocol",
+]
 resolver = "2"
 
 [package]
 name = "smolvm"
-version = "0.1.12"
+version = "0.1.18"
 edition = "2021"
 description = "OCI-native microVM runtime"
 license = "Apache-2.0"

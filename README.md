@@ -20,15 +20,16 @@ smolvm sandbox run --net python:3.12-alpine -- python -V
 smolvm microvm start
 smolvm microvm exec -- apk add git  # changes persist across reboots
 smolvm microvm exec -- echo "hello"
+smolvm microvm exec -it -- /bin/sh   # interactive shell (exit with Ctrl+D)
 smolvm microvm stop
 
 # pack - build a portable, executable virtual machine.
-smolvm pack alpine:latest -o ./my-sandbox        # creates ./my-sandbox + ./my-sandbox.smolmachine
-smolvm pack alpine:latest -o ./my-sandbox --single-file  # single executable, no sidecar
+smolvm pack create alpine:latest -o ./my-sandbox        # creates ./my-sandbox + ./my-sandbox.smolmachine
+smolvm pack create alpine:latest -o ./my-sandbox --single-file  # single executable, no sidecar
 
 ./my-sandbox uname -a # this will return results of running sys info within the guest linux vm
 
-smolvm pack python:3.12-alpine -o ./my-pythonvm
+smolvm pack create python:3.12-alpine -o ./my-pythonvm
 ./my-pythonvm python3 -c "import sys; print(sys.version)"
 
 # uninstall
@@ -41,7 +42,7 @@ microVMs are lightweight VMs - security and isolation of VMs with the speed of c
 
 They power AWS Lambda and Fly.io, but are inaccessible to average developers due to setup complexity.
 
-smolVM makes microVMs easy: <250ms boot, works on macOS and Linux, single binary distribution.
+smolVM makes microVMs easy: <200ms boot, works on macOS and Linux, single binary distribution.
 
 ## use this for
 
@@ -50,12 +51,29 @@ smolVM makes microVMs easy: <250ms boot, works on macOS and Linux, single binary
 - run containers within microvm for improved isolation
 - distribute self-contained sandboxed applications
 
+## demo: run OpenAI Codex in a sandbox
+
+```bash
+# create a persistent microVM with networking
+smolvm microvm create codex-sandbox --net --cpus 2 --mem 1024
+smolvm microvm start codex-sandbox
+
+# install Node.js + Codex CLI
+smolvm microvm exec --name codex-sandbox -- sh -c "apk add nodejs npm && npm i -g @openai/codex"
+
+# login (pipe your API key)
+smolvm microvm exec --name codex-sandbox -- sh -c "echo $OPENAI_API_KEY | codex login --with-api-key"
+
+# run Codex interactively — fully isolated in a microVM
+smolvm microvm exec --name codex-sandbox -it -- codex
+```
+
 ## comparison
 
 |                     | Containers | QEMU | Firecracker | Kata | smolvm |
 |---------------------|------------|------|-------------|------|--------|
 | kernel isolation    | shared ¹   | separate | separate | separate | separate |
-| boot time           | ~100ms ²   | ~15-30s ³ | <125ms ⁴ | ~500ms ⁵ | <250ms |
+| boot time           | ~100ms ²   | ~15-30s ³ | <125ms ⁴ | ~500ms ⁵ | <200ms |
 | setup               | easy       | complex | complex | complex | easy |
 | macOS               | via Docker | yes | no ⁶ | no ⁷ | yes |
 | guest rootfs        | layered    | disk image | DIY ⁸ | bundled + DIY | bundled |
@@ -66,10 +84,10 @@ smolVM makes microVMs easy: <250ms boot, works on macOS and Linux, single binary
 <summary>References</summary>
 
 1. [Container isolation](https://www.docker.com/blog/understanding-docker-container-escapes/)
-2. [containerd benchmark](https://medium.com/norma-dev/benchmarking-containerd-vs-dockerd-performance-efficiency-and-scalability-64c9043924b1)
-3. [QEMU boot time](github.com/stefano-garzarella/qemu-boot-time)
+2. [containerd benchmark](https://github.com/containerd/containerd/issues/4482)
+3. [QEMU boot time](https://wiki.qemu.org/Features/TCG)
 4. [Firecracker website](https://firecracker-microvm.github.io/)
-5. [Kata boot time](https://dev.to/rimelek/comparing-3-docker-container-runtimes-runc-gvisor-and-kata-containers-16j)
+5. [Kata boot time](https://github.com/kata-containers/kata-containers/issues/4292)
 6. [Firecracker requires KVM](https://github.com/firecracker-microvm/firecracker/blob/main/docs/getting-started.md)
 7. [Kata macOS support](https://github.com/kata-containers/kata-containers/issues/243)
 8. [Firecracker rootfs setup](https://github.com/firecracker-microvm/firecracker/blob/main/docs/rootfs-and-kernel-setup.md)
@@ -93,16 +111,32 @@ smolVM makes microVMs easy: <250ms boot, works on macOS and Linux, single binary
 
 ## known limitations
 
-- **Sandbox rootfs writes**: Writes to the sandbox container filesystem (`/tmp`, `/home`, etc.) fail due to a libkrun TSI bug with overlayfs. **Writes to mounted volumes work**. MicroVM rootfs writes work and persist across reboots.
 - **Network is opt-in**: Use `--net` to enable outbound network access (required for image pulls from registries). TCP/UDP only — ICMP (`ping`) and raw sockets do not work.
 - **Volume mounts**: Directories only (no single files)
 - **macOS**: Binary must be signed with Hypervisor.framework entitlements
 
 ## development
 
+**Prerequisites (for building from source):**
+- Rust toolchain
+- [git-lfs](https://git-lfs.com) (required for library binaries)
+- Docker (for cross-compiling the agent)
+- e2fsprogs (for storage template creation; `mkfs.ext4`)
+- LLVM (macOS only, for building libkrun: `brew install llvm`)
+
 ```bash
 # build
 ./scripts/build-dist.sh
+
+# build using local libkrun changes from ../libkrun
+./scripts/build-dist.sh --with-local-libkrun
+
+# local lib bundle staging path used by --with-local-libkrun
+# (libkrun artifacts are copied here and used for linking/packaging)
+# target/local-lib-bundle/libkrun.dylib
+# target/local-lib-bundle/libkrun.1.dylib
+# target/local-lib-bundle/libkrunfw.5.dylib
+# Note: tracked files under ./lib/ are not modified by this mode.
 
 # run tests
 ./tests/run_all.sh

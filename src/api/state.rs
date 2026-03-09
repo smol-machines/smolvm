@@ -119,6 +119,10 @@ impl ApiState {
     pub fn new() -> Result<Self, ApiError> {
         let db = SmolvmDb::open()
             .map_err(|e| ApiError::internal(format!("failed to open database: {}", e)))?;
+        // Ensure tables exist at server startup (CLI paths handle this lazily).
+        db.init_tables().map_err(|e| {
+            ApiError::internal(format!("failed to initialize database tables: {}", e))
+        })?;
         Ok(Self {
             sandboxes: RwLock::new(HashMap::new()),
             reserved_names: RwLock::new(HashSet::new()),
@@ -302,7 +306,7 @@ impl ApiState {
             record.pid_start_time = pid_start_time;
         })?;
         match result {
-            Some(()) => Ok(()),
+            Some(_) => Ok(()),
             None => Err(crate::Error::database(
                 "update sandbox state",
                 format!("sandbox '{}' not found in database", name),
@@ -492,7 +496,7 @@ impl ApiState {
     /// `Ok(None)` (row not found) and `Err` without propagating.
     fn update_vm_best_effort(&self, name: &str, op_label: &str, f: impl FnOnce(&mut VmRecord)) {
         match self.db.update_vm(name, f) {
-            Ok(Some(())) => {}
+            Ok(Some(_)) => {}
             Ok(None) => {
                 tracing::warn!(sandbox = %name, op = op_label, "sandbox not found in database");
             }
@@ -610,10 +614,34 @@ pub async fn ensure_sandbox_running(
 
         entry
             .manager
-            .ensure_running_with_full_config(mounts, ports, resources)
+            .ensure_running_with_full_config(mounts, ports, resources)?;
+        Ok(())
     })
     .await
     .map_err(|e| crate::Error::agent("ensure running", e.to_string()))?
+}
+
+/// Ensure a sandbox is running and persist the Running state to the database.
+///
+/// Used by handlers that implicitly start VMs (containers, exec, images).
+/// State persistence is best-effort — a DB write failure is logged but does
+/// not fail the request, matching the supervisor's error-handling pattern.
+pub async fn ensure_running_and_persist(
+    state: &ApiState,
+    name: &str,
+    entry: &Arc<parking_lot::Mutex<SandboxEntry>>,
+) -> crate::Result<()> {
+    ensure_sandbox_running(entry).await?;
+
+    let pid = {
+        let entry = entry.lock();
+        entry.manager.child_pid()
+    };
+    if let Err(e) = state.update_sandbox_state(name, RecordState::Running, pid) {
+        tracing::warn!(sandbox = %name, error = %e, "failed to persist Running state after implicit start");
+    }
+
+    Ok(())
 }
 
 // ============================================================================

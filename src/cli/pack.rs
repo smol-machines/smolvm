@@ -7,40 +7,69 @@
 //! - OCI image layers
 //! - Configuration manifest
 
-use clap::Args;
+use clap::{Args, Subcommand};
 use smolvm::agent::{AgentClient, AgentManager, PullOptions, VmResources};
 
 /// Default memory for packed VMs (lower than sandbox/microvm because
 /// packed VMs are typically single-purpose, minimal workloads).
 const PACK_DEFAULT_MEMORY_MIB: u32 = 256;
-use smolvm::platform::{Os, VmExecutor};
+use smolvm::config::{RecordState, SmolvmConfig};
+use smolvm::platform::{Arch, Os, VmExecutor};
 use smolvm::Error;
 use smolvm_pack::assets::AssetCollector;
-use smolvm_pack::format::PackManifest;
+use smolvm_pack::format::{PackManifest, PackMode};
 use smolvm_pack::packer::Packer;
 use smolvm_pack::signing::sign_with_hypervisor_entitlements;
 use smolvm_protocol::AgentResponse;
 use std::path::PathBuf;
 use tracing::{debug, info, warn};
 
-/// Package an OCI image into a self-contained executable.
+/// Package and run self-contained VM executables.
+#[derive(Subcommand, Debug)]
+pub enum PackCmd {
+    /// Package an OCI image or VM snapshot into a self-contained executable
+    Create(PackCreateCmd),
+
+    /// Run a VM from a packed .smolmachine sidecar file
+    Run(super::pack_run::PackRunCmd),
+}
+
+impl PackCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        match self {
+            PackCmd::Create(cmd) => cmd.run(),
+            PackCmd::Run(cmd) => cmd.run(),
+        }
+    }
+}
+
+/// Package an OCI image or VM snapshot into a self-contained executable.
 ///
 /// Creates a single binary that can be distributed and run without smolvm installed.
 /// The packed binary includes:
 /// - Runtime libraries (libkrun, libkrunfw)
 /// - Agent rootfs
-/// - OCI image layers
+/// - OCI image layers or VM overlay disk
 /// - Default configuration
 ///
 /// Examples:
-///   smolvm pack alpine:latest -o my-alpine
-///   smolvm pack python:3.11-slim -o my-python --cpus 2 --mem 1024
-///   smolvm pack myapp:latest -o myapp --entrypoint /app/run.sh
+///   smolvm pack create alpine:latest -o my-alpine
+///   smolvm pack create python:3.11-slim -o my-python --cpus 2 --mem 1024
+///   smolvm pack create myapp:latest -o myapp --entrypoint /app/run.sh
+///   smolvm pack create --from-vm myvm -o my-devenv
 #[derive(Args, Debug)]
-pub struct PackCmd {
+pub struct PackCreateCmd {
     /// Container image to pack (e.g., alpine:latest, python:3.11-slim)
-    #[arg(value_name = "IMAGE")]
-    pub image: String,
+    #[arg(
+        value_name = "IMAGE",
+        required_unless_present = "from_vm",
+        conflicts_with = "from_vm"
+    )]
+    pub image: Option<String>,
+
+    /// Pack from a stopped VM snapshot instead of an OCI image
+    #[arg(long = "from-vm", value_name = "VM_NAME")]
+    pub from_vm: Option<String>,
 
     /// Output file path for the packed binary
     #[arg(short = 'o', long, value_name = "PATH")]
@@ -55,12 +84,12 @@ pub struct PackCmd {
     #[arg(long, default_value_t = PACK_DEFAULT_MEMORY_MIB, value_name = "MiB")]
     pub mem: u32,
 
-    /// Target platform for multi-arch images (e.g., linux/arm64, linux/amd64)
+    /// Target OCI platform for multi-arch images (e.g., linux/arm64, linux/amd64)
     ///
     /// By default, uses the host architecture. Use this to override, for example
     /// to pack x86_64 images for Rosetta on Apple Silicon.
-    #[arg(long, value_name = "OS/ARCH")]
-    pub platform: Option<String>,
+    #[arg(long = "oci-platform", value_name = "OS/ARCH")]
+    pub oci_platform: Option<String>,
 
     /// Override the image entrypoint
     #[arg(long, value_name = "CMD")]
@@ -90,18 +119,86 @@ pub struct PackCmd {
     pub rootfs_dir: Option<PathBuf>,
 }
 
-impl PackCmd {
+impl PackCreateCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        info!(image = %self.image, output = %self.output.display(), "packing image");
+        if let Some(vm_name) = self.from_vm.clone() {
+            info!(vm = %vm_name, output = %self.output.display(), "packing from VM");
+            return self.pack_from_vm(vm_name);
+        }
+
+        let image = self.image.clone().unwrap();
+        info!(image = %image, output = %self.output.display(), "packing image");
 
         // Create temporary staging directory
         let temp_dir = tempfile::tempdir()
             .map_err(|e| Error::agent("create temp directory", e.to_string()))?;
         let staging_dir = temp_dir.path().join("staging");
 
-        // Start agent to pull image and export layers
+        // Start a temporary agent VM with a unique identity so concurrent
+        // pack runs and the user's "default" VM don't collide.
+        // Use PID + epoch nanos to avoid PID-reuse collisions with orphaned VMs.
+        let pack_vm_name = format!(
+            "__pack_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        // Guard ensures VM is stopped on early error. Only removes temp data
+        // dir after confirmed stop — never deletes while VM may still be running.
+        let vm_data_dir = smolvm::agent::vm_data_dir(&pack_vm_name);
+        struct PackVmGuard {
+            manager: AgentManager,
+            data_dir: std::path::PathBuf,
+            finalized: bool,
+        }
+        impl PackVmGuard {
+            /// Stop VM and clean up temp dir. Propagates stop errors.
+            fn stop_and_cleanup(&mut self) -> smolvm::Result<()> {
+                self.manager.stop()?;
+                self.finalized = true;
+                if let Err(e) = std::fs::remove_dir_all(&self.data_dir) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(
+                            error = %e,
+                            dir = %self.data_dir.display(),
+                            "failed to remove pack temp dir"
+                        );
+                    }
+                }
+                Ok(())
+            }
+        }
+        impl Drop for PackVmGuard {
+            fn drop(&mut self) {
+                if self.finalized {
+                    return;
+                }
+                match self.manager.stop() {
+                    Ok(()) => {
+                        if let Err(e) = std::fs::remove_dir_all(&self.data_dir) {
+                            if e.kind() != std::io::ErrorKind::NotFound {
+                                tracing::warn!(
+                                    error = %e,
+                                    dir = %self.data_dir.display(),
+                                    "failed to remove pack temp dir"
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "failed to stop pack VM; preserving temp data dir"
+                        );
+                    }
+                }
+            }
+        }
+
         println!("Starting agent VM...");
-        let manager = AgentManager::new_default()?;
+        let manager = AgentManager::for_vm(&pack_vm_name)?;
         manager.start_with_config(
             Vec::new(),
             VmResources {
@@ -113,39 +210,31 @@ impl PackCmd {
                 allow_cidrs: Vec::new(),
             },
         )?;
-        let mut client = manager.connect()?;
+        let mut guard = PackVmGuard {
+            manager,
+            data_dir: vm_data_dir,
+            finalized: false,
+        };
+        let mut client = guard.manager.connect()?;
 
         // Pull image
-        println!("Pulling {}...", self.image);
+        println!("Pulling {}...", image);
         let mut pull_opts = PullOptions::new().use_registry_config(true);
-        if let Some(ref platform) = self.platform {
-            pull_opts = pull_opts.platform(platform);
+        if let Some(ref oci_platform) = self.oci_platform {
+            pull_opts = pull_opts.oci_platform(oci_platform);
         }
-        let image_info = client.pull(&self.image, pull_opts)?;
+        let image_info = client.pull(&image, pull_opts)?;
         debug!(image_info = ?image_info, "image pulled");
 
         println!(
             "Image: {} ({} layers, {} bytes)",
-            self.image, image_info.layer_count, image_info.size
+            image, image_info.layer_count, image_info.size
         );
 
-        // Create asset collector
+        // Create asset collector and collect base assets
         let mut collector = AssetCollector::new(staging_dir.clone())
             .map_err(|e| Error::agent("collect assets", e.to_string()))?;
-
-        // Find and collect libraries
-        println!("Collecting runtime libraries...");
-        let lib_dir = self.find_lib_dir()?;
-        collector
-            .collect_libraries(&lib_dir)
-            .map_err(|e| Error::agent("collect libraries", e.to_string()))?;
-
-        // Find and collect agent rootfs
-        println!("Collecting agent rootfs...");
-        let rootfs_dir = self.find_rootfs_dir()?;
-        collector
-            .collect_agent_rootfs(&rootfs_dir)
-            .map_err(|e| Error::agent("collect rootfs", e.to_string()))?;
+        self.collect_base_assets(&mut collector)?;
 
         // Export and collect layers
         println!("Exporting {} layers...", image_info.layer_count);
@@ -166,40 +255,137 @@ impl PackCmd {
                 .map_err(|e| Error::agent("collect layers", e.to_string()))?;
         }
 
-        // Stop agent (no longer needed for remaining steps)
-        manager.stop()?;
+        // Stop agent and clean up temp VM data. Propagates stop errors
+        // so pack fails visibly if VM cannot be stopped.
+        guard.stop_and_cleanup()?;
 
-        // Create pre-formatted storage template
+        // Build manifest
+        let platform = format!("{}/{}", image_info.os, image_info.architecture);
+        let mut manifest = PackManifest::new(image, image_info.digest.clone(), platform);
+        manifest.cpus = self.cpus;
+        manifest.mem = self.mem;
+
+        // Copy OCI config fields from image (CMD, ENTRYPOINT, ENV, WORKDIR)
+        manifest.entrypoint = image_info.entrypoint.clone();
+        manifest.cmd = image_info.cmd.clone();
+        manifest.env = image_info.env.clone();
+        manifest.workdir = image_info.workdir.clone();
+
+        // Override entrypoint if user provided one
+        if let Some(ref ep) = self.entrypoint {
+            manifest.entrypoint = vec![ep.clone()];
+        }
+
+        self.finalize_pack(manifest, collector, staging_dir)
+    }
+
+    /// Pack from a stopped VM's overlay disk.
+    fn pack_from_vm(self, vm_name: String) -> smolvm::Result<()> {
+        // 1. Load config and verify VM exists and is stopped
+        let config = SmolvmConfig::load()?;
+        let vm = config
+            .vms
+            .get(&vm_name)
+            .ok_or_else(|| Error::agent("pack from VM", format!("VM '{}' not found", vm_name)))?;
+
+        if vm.actual_state() == RecordState::Running {
+            return Err(Error::agent(
+                "pack from VM",
+                format!(
+                    "VM '{}' is running. Stop it first with: smolvm microvm stop {}",
+                    vm_name, vm_name
+                ),
+            ));
+        }
+
+        // 2. Locate overlay disk
+        let overlay_path = smolvm::agent::vm_data_dir(&vm_name).join("overlay.raw");
+        if !overlay_path.exists() {
+            return Err(Error::agent(
+                "pack from VM",
+                format!(
+                    "overlay disk not found at {}. The VM may not have been started yet.",
+                    overlay_path.display()
+                ),
+            ));
+        }
+
+        println!("Packing VM '{}' snapshot...", vm_name);
+
+        // 3. Create temporary staging directory
+        let temp_dir = tempfile::tempdir()
+            .map_err(|e| Error::agent("create temp directory", e.to_string()))?;
+        let staging_dir = temp_dir.path().join("staging");
+
+        // 4. Collect base assets + overlay template
+        let mut collector = AssetCollector::new(staging_dir.clone())
+            .map_err(|e| Error::agent("collect assets", e.to_string()))?;
+        self.collect_base_assets(&mut collector)?;
+
+        // Add overlay template from VM
+        println!("Copying overlay disk ({})...", overlay_path.display());
+        collector
+            .add_overlay_template(&overlay_path)
+            .map_err(|e| Error::agent("collect overlay", e.to_string()))?;
+
+        // 5. Build manifest
+        let platform = format!("linux/{}", Arch::current().oci_arch());
+        let mut manifest =
+            PackManifest::new(format!("vm://{}", vm_name), "none".to_string(), platform);
+        manifest.mode = PackMode::Vm;
+        manifest.cpus = self.cpus;
+        manifest.mem = self.mem;
+        manifest.entrypoint = vec!["/bin/sh".to_string()];
+
+        // Inherit env/workdir from VmRecord
+        manifest.env = vm.env.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+        manifest.workdir = vm.workdir.clone();
+
+        // Override entrypoint if user provided one
+        if let Some(ref ep) = self.entrypoint {
+            manifest.entrypoint = vec![ep.clone()];
+        }
+
+        self.finalize_pack(manifest, collector, staging_dir)
+    }
+
+    /// Collect base assets shared by both image and VM packing modes:
+    /// runtime libraries, agent rootfs, and a pre-formatted storage template.
+    fn collect_base_assets(&self, collector: &mut AssetCollector) -> smolvm::Result<()> {
+        println!("Collecting runtime libraries...");
+        let lib_dir = self.find_lib_dir()?;
+        collector
+            .collect_libraries(&lib_dir)
+            .map_err(|e| Error::agent("collect libraries", e.to_string()))?;
+
+        println!("Collecting agent rootfs...");
+        let rootfs_dir = self.find_rootfs_dir()?;
+        collector
+            .collect_agent_rootfs(&rootfs_dir)
+            .map_err(|e| Error::agent("collect rootfs", e.to_string()))?;
+
         println!("Creating storage template...");
         collector
             .create_storage_template()
             .map_err(|e| Error::agent("create storage template", e.to_string()))?;
 
-        // Build manifest
-        let platform = format!("{}/{}", image_info.os, image_info.architecture);
-        let mut manifest =
-            PackManifest::new(self.image.clone(), image_info.digest.clone(), platform);
-        manifest.cpus = self.cpus;
-        manifest.mem = self.mem;
+        Ok(())
+    }
 
-        // Set entrypoint if provided
-        if let Some(ref ep) = self.entrypoint {
-            manifest.entrypoint = vec![ep.clone()];
-        }
-
-        // Get the smolvm binary to embed as the packed runtime
+    /// Finalize pack: set inventory, assemble binary, print summary, and sign.
+    fn finalize_pack(
+        &self,
+        mut manifest: PackManifest,
+        collector: AssetCollector,
+        staging_dir: PathBuf,
+    ) -> smolvm::Result<()> {
         let stub_path = self.find_smolvm_binary()?;
 
-        // Update manifest with inventory
         manifest.assets = collector.into_inventory();
 
-        // Recreate collector for compression (we consumed it above)
-        // Note: We use with_asset_collector instead of with_assets to avoid
-        // overwriting the manifest.assets we just set (which includes storage_template)
         let collector = AssetCollector::new(staging_dir)
             .map_err(|e| Error::agent("collect assets", e.to_string()))?;
 
-        // Pack the binary
         let packer = Packer::new(manifest)
             .with_stub(&stub_path)
             .with_asset_collector(collector);
@@ -260,6 +446,7 @@ impl PackCmd {
         }
 
         // Check common locations
+        let platform_lib = format!("lib/linux-{}", std::env::consts::ARCH);
         let candidates = [
             // Relative to executable
             std::env::current_exe()
@@ -268,9 +455,16 @@ impl PackCmd {
             std::env::current_exe()
                 .ok()
                 .and_then(|p| p.parent().and_then(|d| d.parent()).map(|d| d.join("lib"))),
-            // Source tree
+            // Source tree dev builds: <exe_dir>/../../lib/linux-<arch>/
+            std::env::current_exe().ok().and_then(|p| {
+                p.parent()
+                    .and_then(|d| d.parent())
+                    .map(|d| d.join(&platform_lib))
+            }),
+            // Source tree (CWD)
             Some(PathBuf::from("lib")),
             Some(PathBuf::from("./lib")),
+            Some(PathBuf::from(&platform_lib)),
             // Homebrew
             Some(PathBuf::from("/opt/homebrew/lib")),
             Some(PathBuf::from("/usr/local/lib")),
@@ -378,16 +572,36 @@ impl PackCmd {
         layer_index: usize,
     ) -> smolvm::Result<Vec<u8>> {
         use smolvm_protocol::AgentRequest;
+        use std::time::{Duration, Instant};
+
+        const LAYER_EXPORT_TIMEOUT: Duration = Duration::from_secs(600); // 10 minutes
 
         let request = AgentRequest::ExportLayer {
             image_digest: image_digest.to_string(),
             layer_index,
         };
 
+        // Extend socket read timeout for the duration of the export.
+        // The default 30s timeout would fire before our wall-clock guard
+        // if the agent stalls between chunks.
+        let _timeout_guard = client.set_extended_read_timeout(LAYER_EXPORT_TIMEOUT)?;
+
         client.send_raw(&request)?;
 
+        let start = Instant::now();
         let mut result = Vec::new();
         loop {
+            if start.elapsed() > LAYER_EXPORT_TIMEOUT {
+                return Err(Error::agent(
+                    "export layer",
+                    format!(
+                        "layer export timed out after {}s (received {} bytes so far)",
+                        LAYER_EXPORT_TIMEOUT.as_secs(),
+                        result.len()
+                    ),
+                ));
+            }
+
             let response = client.recv_raw()?;
             match response {
                 AgentResponse::LayerData { data, done } => {

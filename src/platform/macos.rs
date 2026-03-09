@@ -155,12 +155,22 @@ fn write_mount_script(rootfs: &Path, mounts: &[(String, String)], rosetta: bool)
     write_line(&mut file, "#!/bin/sh")?;
     write_line(&mut file, "set -e")?;
 
-    // Mount each virtiofs volume
+    // Mount each virtiofs volume.
+    // Both tag and guest_mount are single-quoted to prevent shell injection.
+    // Any embedded single quotes are escaped as `'\''` (end quote, literal
+    // quote via backslash, restart quote).
     for (tag, guest_mount) in mounts {
-        write_line(&mut file, &format!("mkdir -p \"{}\"", guest_mount))?;
         write_line(
             &mut file,
-            &format!("mount -t virtiofs {} \"{}\"", tag, guest_mount),
+            &format!("mkdir -p '{}'", shell_escape(guest_mount)),
+        )?;
+        write_line(
+            &mut file,
+            &format!(
+                "mount -t virtiofs '{}' '{}'",
+                shell_escape(tag),
+                shell_escape(guest_mount)
+            ),
         )?;
     }
 
@@ -169,14 +179,17 @@ fn write_mount_script(rootfs: &Path, mounts: &[(String, String)], rosetta: bool)
         write_line(&mut file, "# Mount Rosetta runtime")?;
         write_line(
             &mut file,
-            &format!("mkdir -p \"{}\"", crate::vm::rosetta::ROSETTA_GUEST_PATH),
+            &format!(
+                "mkdir -p '{}'",
+                shell_escape(crate::vm::rosetta::ROSETTA_GUEST_PATH)
+            ),
         )?;
         write_line(
             &mut file,
             &format!(
-                "mount -t virtiofs {} \"{}\"",
-                crate::vm::rosetta::ROSETTA_TAG,
-                crate::vm::rosetta::ROSETTA_GUEST_PATH
+                "mount -t virtiofs '{}' '{}'",
+                shell_escape(crate::vm::rosetta::ROSETTA_TAG),
+                shell_escape(crate::vm::rosetta::ROSETTA_GUEST_PATH)
             ),
         )?;
 
@@ -203,6 +216,16 @@ fn write_mount_script(rootfs: &Path, mounts: &[(String, String)], rosetta: bool)
         rosetta
     );
     Ok(guest_path.to_string())
+}
+
+/// Escape a string for safe inclusion inside single quotes in a shell script.
+///
+/// Single-quoting in POSIX shell prevents all interpretation except for the
+/// single-quote character itself. To include a literal `'`, we end the
+/// current quoted segment, insert an escaped quote (`\'`), and restart
+/// quoting: `'foo'\''bar'` produces the literal string `foo'bar`.
+fn shell_escape(s: &str) -> String {
+    s.replace('\'', "'\\''")
 }
 
 /// Build exec arguments without mount wrapper (for no-mounts case).
@@ -300,11 +323,11 @@ mod tests {
         let content = std::fs::read_to_string(&script_path).unwrap();
         assert!(content.contains("#!/bin/sh"), "script should have shebang");
         assert!(
-            content.contains("mkdir -p \"/data\""),
+            content.contains("mkdir -p '/data'"),
             "script should create mount point"
         );
         assert!(
-            content.contains("mount -t virtiofs smolvm0 \"/data\""),
+            content.contains("mount -t virtiofs 'smolvm0' '/data'"),
             "script should mount virtiofs"
         );
         assert!(
@@ -351,6 +374,52 @@ mod tests {
         assert!(
             content.contains("binfmt_misc"),
             "script should register binfmt_misc"
+        );
+    }
+
+    #[test]
+    fn test_shell_escape_no_special_chars() {
+        assert_eq!(shell_escape("smolvm0"), "smolvm0");
+        assert_eq!(shell_escape("/data/dir"), "/data/dir");
+    }
+
+    #[test]
+    fn test_shell_escape_single_quotes() {
+        assert_eq!(shell_escape("it's"), "it'\\''s");
+    }
+
+    #[test]
+    fn test_mount_script_escapes_malicious_input() {
+        let tmp = TempDir::new().unwrap();
+        let mounts = vec![(
+            "smolvm0".to_string(),
+            "/data'; rm -rf /; echo '".to_string(),
+        )];
+        let cmd = Some(vec!["/bin/sh".to_string()]);
+
+        let executor = MacOsExecutor;
+        let _ = executor
+            .build_exec_command(&cmd, &mounts, tmp.path(), false)
+            .unwrap();
+
+        let content = std::fs::read_to_string(tmp.path().join("tmp/smolvm-mount.sh")).unwrap();
+
+        // The single quotes in the malicious input must be escaped as '\''
+        // so the shell never sees an unquoted semicolon.
+        assert!(content.contains("'\\''"), "single quotes should be escaped");
+        // The mount command must NOT contain unescaped single-quote boundaries
+        // that would let the injected semicolon run as a separate command.
+        // In the escaped form, the sequence is: '/data'\''...' which is safe.
+        // Verify the mkdir and mount both use the escaped path:
+        assert!(
+            content.contains("mkdir -p '/data'\\''"),
+            "mkdir should use escaped path, got: {}",
+            content
+        );
+        assert!(
+            content.contains("mount -t virtiofs 'smolvm0' '/data'\\''"),
+            "mount should use escaped path, got: {}",
+            content
         );
     }
 }

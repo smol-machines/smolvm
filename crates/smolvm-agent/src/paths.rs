@@ -12,6 +12,11 @@ use std::path::PathBuf;
 /// Path to crun OCI runtime binary.
 pub const CRUN_PATH: &str = "/usr/bin/crun";
 
+/// crun state root directory.
+/// Stored on the persistent storage disk instead of `/run/crun` because
+/// `/run` may not be writable under the overlayfs rootfs.
+pub const CRUN_ROOT_DIR: &str = "/storage/containers/crun";
+
 /// crun cgroup manager setting.
 /// Set to "disabled" because libkrun mounts cgroup2 as read-only.
 /// Without this, crun create/start hang trying to create container cgroups.

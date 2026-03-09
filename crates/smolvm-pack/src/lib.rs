@@ -47,7 +47,7 @@ pub mod signing;
 
 pub use detect::{detect_packed_mode, PackedMode};
 pub use format::{
-    PackFooter, PackManifest, SectionHeader, FOOTER_SIZE, MAGIC, SECTION_HEADER_SIZE,
+    PackFooter, PackManifest, PackMode, SectionHeader, FOOTER_SIZE, MAGIC, SECTION_HEADER_SIZE,
     SECTION_MAGIC, SIDECAR_EXTENSION,
 };
 pub use packer::{

@@ -7,8 +7,9 @@
 
 use crate::cli::parsers::parse_mounts_as_tuples;
 use crate::cli::{format_pid_suffix, truncate};
-use smolvm::agent::{AgentManager, PortMapping};
+use smolvm::agent::{vm_data_dir, AgentManager, PortMapping};
 use smolvm::config::{RecordState, SmolvmConfig, VmRecord};
+use smolvm::db::SmolvmDb;
 
 // ============================================================================
 // VmKind
@@ -57,7 +58,29 @@ impl VmKind {
 // Shared helpers
 // ============================================================================
 
+/// Resolve an optional VM name: if no name is given and a VM named "default"
+/// exists in the config database, return `Some("default")` so callers route
+/// through the named-VM code path (which loads config, init commands, network
+/// settings, etc.). Otherwise returns the input unchanged.
+pub fn resolve_vm_name(name: Option<String>) -> smolvm::Result<Option<String>> {
+    if name.is_some() {
+        return Ok(name);
+    }
+    // Use direct DB lookup instead of SmolvmConfig::load() to avoid
+    // loading all config + all VMs just to check if "default" exists.
+    let db = SmolvmDb::open()?;
+    if db.get_vm("default")?.is_some() {
+        Ok(Some("default".to_string()))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Get the agent manager for an optional name (default if `None`).
+///
+/// When no name is given, uses `AgentManager::new_default()` which is
+/// canonicalized to `for_vm("default")` — same socket/PID/storage paths
+/// regardless of whether the caller specifies a name or not.
 pub fn get_vm_manager(name: &Option<String>) -> smolvm::Result<AgentManager> {
     if let Some(name) = name {
         AgentManager::for_vm(name)
@@ -69,6 +92,75 @@ pub fn get_vm_manager(name: &Option<String>) -> smolvm::Result<AgentManager> {
 /// Return the display label for an optional VM name.
 pub fn vm_label(name: &Option<String>) -> String {
     name.as_deref().unwrap_or("default").to_string()
+}
+
+/// Ensure a VM is running and return a connected client.
+///
+/// This is the common pattern used by exec commands in both microvm and sandbox.
+/// It resolves the VM manager, checks connectivity, and establishes a client connection.
+pub fn ensure_running_and_connect(
+    name: &Option<String>,
+    kind: VmKind,
+) -> smolvm::Result<(AgentManager, smolvm::agent::AgentClient)> {
+    let manager = get_vm_manager(name)?;
+    let label = vm_label(name);
+
+    if manager.try_connect_existing().is_none() {
+        return Err(smolvm::Error::agent(
+            "connect",
+            format!(
+                "{} '{}' is not running. Use '{} start' first.",
+                kind.label(),
+                label,
+                kind.cli_prefix(),
+            ),
+        ));
+    }
+
+    let client = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
+    Ok((manager, client))
+}
+
+/// Print command output and exit with the given code.
+///
+/// Prints stdout to stdout, stderr to stderr, detaches the manager
+/// (keeping the VM running), and exits the process.
+pub fn print_output_and_exit(
+    manager: &AgentManager,
+    exit_code: i32,
+    stdout: &str,
+    stderr: &str,
+) -> ! {
+    if !stdout.is_empty() {
+        print!("{}", stdout);
+    }
+    if !stderr.is_empty() {
+        eprint!("{}", stderr);
+    }
+    crate::cli::flush_output();
+    manager.detach();
+    std::process::exit(exit_code);
+}
+
+/// Get the agent manager for a VM by name, auto-starting it if not running.
+///
+/// Unlike [`ensure_running_and_connect`] which errors if the VM isn't running,
+/// this calls `ensure_running()` to start the VM on demand. Used by container
+/// commands that need the VM to be available.
+pub fn get_or_start_vm(name: &str) -> smolvm::Result<AgentManager> {
+    let name_opt = if name == "default" {
+        None
+    } else {
+        Some(name.to_string())
+    };
+    let manager = get_vm_manager(&name_opt)?;
+
+    if manager.try_connect_existing().is_none() {
+        println!("Starting microvm '{}'...", name);
+        manager.ensure_running()?;
+    }
+
+    Ok(manager)
 }
 
 // ============================================================================
@@ -91,8 +183,71 @@ pub struct CreateVmParams {
     pub allow_cidrs: Vec<String>,
 }
 
+/// Maximum length for VM/sandbox names.
+const MAX_NAME_LENGTH: usize = 40;
+
+/// Validate a VM/sandbox name for CLI commands.
+///
+/// Same rules as the API validation but returns `smolvm::Error` instead of `ApiError`.
+fn validate_name(name: &str, kind: VmKind) -> smolvm::Result<()> {
+    if name.is_empty() {
+        return Err(smolvm::Error::config(
+            format!("create {}", kind.label()),
+            format!("{} name cannot be empty", kind.label()),
+        ));
+    }
+    if name.len() > MAX_NAME_LENGTH {
+        return Err(smolvm::Error::config(
+            format!("create {}", kind.label()),
+            format!(
+                "{} name too long: {} characters (max {})",
+                kind.label(),
+                name.len(),
+                MAX_NAME_LENGTH
+            ),
+        ));
+    }
+    let first_char = name.chars().next().unwrap();
+    if !first_char.is_ascii_alphanumeric() {
+        return Err(smolvm::Error::config(
+            format!("create {}", kind.label()),
+            format!("{} name must start with a letter or digit", kind.label()),
+        ));
+    }
+    if name.ends_with('-') {
+        return Err(smolvm::Error::config(
+            format!("create {}", kind.label()),
+            format!("{} name cannot end with a hyphen", kind.label()),
+        ));
+    }
+    let mut prev_was_hyphen = false;
+    for c in name.chars() {
+        if c == '-' {
+            if prev_was_hyphen {
+                return Err(smolvm::Error::config(
+                    format!("create {}", kind.label()),
+                    format!("{} name cannot contain consecutive hyphens", kind.label()),
+                ));
+            }
+            prev_was_hyphen = true;
+        } else {
+            prev_was_hyphen = false;
+        }
+        if !c.is_ascii_alphanumeric() && c != '-' && c != '_' {
+            return Err(smolvm::Error::config(
+                format!("create {}", kind.label()),
+                format!("{} name contains invalid character: '{}'", kind.label(), c),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Create a named VM/sandbox configuration (does not start it).
 pub fn create_vm(kind: VmKind, params: CreateVmParams) -> smolvm::Result<()> {
+    // Validate name before touching the database
+    validate_name(&params.name, kind)?;
+
     let mut config = SmolvmConfig::load()?;
 
     // Check if already exists
@@ -172,16 +327,16 @@ pub fn create_vm(kind: VmKind, params: CreateVmParams) -> smolvm::Result<()> {
 // ============================================================================
 
 /// Start a named VM/sandbox that has a config record.
+///
+/// Uses direct DB operations instead of SmolvmConfig::load() to avoid
+/// loading all config settings and all VM records. Only reads the single
+/// named record (1 DB cycle) and updates it after start (1 DB cycle).
 pub fn start_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
     use smolvm::Error;
 
-    let mut config = SmolvmConfig::load()?;
-
-    // Get record
-    let record = config
-        .get_vm(name)
-        .ok_or_else(|| Error::vm_not_found(name))?
-        .clone();
+    // Direct DB lookup — 1 read cycle instead of loading everything
+    let db = SmolvmDb::open()?;
+    let record = db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))?;
 
     // Check state
     let actual_state = record.actual_state();
@@ -222,25 +377,14 @@ pub fn start_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
         port_info
     );
 
-    manager
+    let _ = manager
         .ensure_running_with_full_config(mounts, ports, resources)
         .map_err(|e| Error::agent(format!("start {}", kind.label()), e.to_string()))?;
 
-    // Update state with PID start time for safe process identification
+    // Get PID immediately (cheap) and print output before DB write
     let pid = manager.child_pid();
-    let pid_start_time = pid.and_then(smolvm::process::process_start_time);
-    config.update_vm(name, |r| {
-        r.state = RecordState::Running;
-        r.pid = pid;
-        r.pid_start_time = pid_start_time;
-    });
-    config.save()?;
 
-    // Release the database lock so other smolvm commands can run concurrently
-    // (e.g. `smolvm microvm exec` while init commands are still running).
-    config.close_db();
-
-    // Run init commands if configured
+    // Run init commands if configured (before reporting success)
     if !record.init.is_empty() {
         println!("Running {} init command(s)...", record.init.len());
         let mut client = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
@@ -265,13 +409,85 @@ pub fn start_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
         name,
     );
 
+    // Persist running state after output — 1 write cycle (not on critical path)
+    let pid_start_time = pid.and_then(smolvm::process::process_start_time);
+    if let Err(e) = db.update_vm(name, |r| {
+        r.state = RecordState::Running;
+        r.pid = pid;
+        r.pid_start_time = pid_start_time;
+    }) {
+        tracing::warn!(error = %e, vm = %name, "failed to persist running state");
+    }
+
     // Keep VM running (persistent)
     manager.detach();
     Ok(())
 }
 
-/// Start the default anonymous VM/sandbox.
-pub fn start_vm_anonymous(kind: VmKind) -> smolvm::Result<()> {
+/// Persist the "default" VM as running in the database.
+///
+/// Creates the record if it doesn't exist, then updates state to Running
+/// with the current PID and optional config overrides (cpus, mem, etc.).
+pub fn persist_default_running(
+    config: &mut SmolvmConfig,
+    pid: Option<i32>,
+    overrides: Option<DefaultVmOverrides>,
+) {
+    if config.get_vm("default").is_none() {
+        let record = VmRecord::new(
+            "default".to_string(),
+            smolvm::config::DEFAULT_VM_CPUS,
+            smolvm::config::DEFAULT_VM_MEMORY_MIB,
+            vec![],
+            vec![],
+            false,
+        );
+        if let Err(e) = config.insert_vm("default".to_string(), record) {
+            tracing::warn!(error = %e, "failed to insert default VM record");
+            return;
+        }
+    }
+    let pid_start_time = pid.and_then(smolvm::process::process_start_time);
+    if config
+        .update_vm("default", |r| {
+            r.state = RecordState::Running;
+            r.pid = pid;
+            r.pid_start_time = pid_start_time;
+            if let Some(ref o) = overrides {
+                r.cpus = o.cpus;
+                r.mem = o.mem;
+                r.mounts = o.mounts.clone();
+                r.ports = o.ports.clone();
+                r.network = o.network;
+                r.storage_gb = o.storage_gb;
+                r.overlay_gb = o.overlay_gb;
+                r.init = o.init.clone();
+                r.env = o.env.clone();
+                r.workdir = o.workdir.clone();
+            }
+        })
+        .is_none()
+    {
+        tracing::warn!("failed to update default VM record (record missing after insert)");
+    }
+}
+
+/// Config overrides for the default VM record.
+pub struct DefaultVmOverrides {
+    pub cpus: u8,
+    pub mem: u32,
+    pub mounts: Vec<(String, String, bool)>,
+    pub ports: Vec<(u16, u16)>,
+    pub network: bool,
+    pub storage_gb: Option<u64>,
+    pub overlay_gb: Option<u64>,
+    pub init: Vec<String>,
+    pub env: Vec<(String, String)>,
+    pub workdir: Option<String>,
+}
+
+/// Start the default VM/sandbox.
+pub fn start_vm_default(kind: VmKind) -> smolvm::Result<()> {
     let manager = AgentManager::new_default()?;
 
     if manager.try_connect_existing().is_some() {
@@ -288,8 +504,33 @@ pub fn start_vm_anonymous(kind: VmKind) -> smolvm::Result<()> {
     println!("Starting {} 'default'...", kind.label());
     manager.ensure_running()?;
 
-    let pid = manager.child_pid().unwrap_or(0);
-    println!("{} 'default' running (PID: {})", kind.display_name(), pid);
+    let mut config = SmolvmConfig::load()?;
+    persist_default_running(&mut config, manager.child_pid(), None);
+
+    // Run init commands if the default record has them (persisted from sandbox run -d -s)
+    let record = config.get_vm("default").cloned();
+
+    if let Some(record) = record {
+        if !record.init.is_empty() {
+            println!("Running {} init command(s)...", record.init.len());
+            let mut client =
+                smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
+            for (i, cmd) in record.init.iter().enumerate() {
+                let argv = vec!["sh".into(), "-c".into(), cmd.clone()];
+                let (exit_code, _stdout, stderr) =
+                    client.vm_exec(argv, record.env.clone(), record.workdir.clone(), None)?;
+                if exit_code != 0 {
+                    eprintln!("init[{}] failed (exit {}): {}", i, exit_code, stderr.trim());
+                }
+            }
+        }
+    }
+
+    println!(
+        "{} 'default' running (PID: {})",
+        kind.display_name(),
+        manager.child_pid().unwrap_or(0)
+    );
 
     manager.detach();
     Ok(())
@@ -338,25 +579,22 @@ pub fn stop_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
 
     println!("Stopping {} '{}'...", kind.label(), name);
 
-    if let Ok(manager) = AgentManager::for_vm(name) {
-        if let Err(e) = manager.stop() {
-            tracing::warn!(error = %e, "failed to stop {}", kind.label());
-        }
-    }
+    let manager = AgentManager::for_vm(name)
+        .map_err(|e| smolvm::Error::agent("create agent manager", e.to_string()))?;
+    manager.stop()?;
 
     config.update_vm(name, |r| {
         r.state = RecordState::Stopped;
         r.pid = None;
         r.pid_start_time = None;
     });
-    config.save()?;
 
     println!("Stopped {}: {}", kind.label(), name);
     Ok(())
 }
 
-/// Stop the default anonymous VM/sandbox.
-pub fn stop_vm_anonymous(kind: VmKind) -> smolvm::Result<()> {
+/// Stop the default VM/sandbox.
+pub fn stop_vm_default(kind: VmKind) -> smolvm::Result<()> {
     let manager = AgentManager::new_default()?;
 
     // try_connect_existing sets internal state if agent is reachable;
@@ -364,6 +602,16 @@ pub fn stop_vm_anonymous(kind: VmKind) -> smolvm::Result<()> {
     manager.try_connect_existing();
     println!("Stopping {} 'default'...", kind.label());
     manager.stop()?;
+
+    // Update database record if it exists
+    if let Ok(mut config) = SmolvmConfig::load() {
+        config.update_vm("default", |r| {
+            r.state = RecordState::Stopped;
+            r.pid = None;
+            r.pid_start_time = None;
+        });
+    }
+
     println!("{} 'default' stopped", kind.display_name());
 
     Ok(())
@@ -420,9 +668,16 @@ pub fn delete_vm(
         }
     }
 
-    // Remove from config
+    // Remove from config (persists immediately to database)
     config.remove_vm(name);
-    config.save()?;
+
+    let data_dir = vm_data_dir(name);
+    if data_dir.exists() {
+        println!("Cleaning up data directory for vm: {}", name);
+        if let Err(e) = std::fs::remove_dir_all(&data_dir) {
+            tracing::warn!(error = %e, "Failed to remove VM data directory: {}", data_dir.display());
+        }
+    }
 
     println!("Deleted {}: {}", kind.label(), name);
     Ok(())
@@ -501,10 +756,9 @@ pub fn list_vms(kind: VmKind, verbose: bool, json: bool) -> smolvm::Result<()> {
                 obj
             })
             .collect();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json_vms).expect("JSON serialization failed")
-        );
+        let json = serde_json::to_string_pretty(&json_vms)
+            .map_err(|e| smolvm::Error::config("serialize json", e.to_string()))?;
+        println!("{}", json);
     } else {
         println!(
             "{:<20} {:<10} {:<5} {:<8} {:<6} {:<6}",

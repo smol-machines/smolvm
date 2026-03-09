@@ -203,9 +203,28 @@ impl PackFooter {
     }
 }
 
+/// Execution mode for packed binaries.
+///
+/// Determines how commands are executed at runtime:
+/// - `Container`: commands run inside a crun container (OCI layers)
+/// - `Vm`: commands run directly in the VM rootfs (overlay disk)
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum PackMode {
+    /// Container mode: OCI image layers + crun container execution.
+    #[default]
+    Container,
+    /// VM mode: overlay disk + direct VM execution.
+    Vm,
+}
+
 /// Manifest describing the packed image and configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PackManifest {
+    /// Execution mode (container or VM).
+    #[serde(default)]
+    pub mode: PackMode,
+
     /// Original image reference (e.g., "alpine:latest").
     pub image: String,
 
@@ -257,6 +276,11 @@ pub struct AssetInventory {
     /// When present, copied to cache on first run instead of formatting at runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_template: Option<AssetEntry>,
+
+    /// Overlay disk template (optional, VM mode only).
+    /// Contains the VM's persistent rootfs state from a `--from-vm` pack.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_template: Option<AssetEntry>,
 }
 
 /// An asset file entry.
@@ -286,6 +310,7 @@ impl PackManifest {
     /// Create a new manifest with default values.
     pub fn new(image: String, digest: String, platform: String) -> Self {
         Self {
+            mode: PackMode::default(),
             image,
             digest,
             platform,
@@ -303,6 +328,7 @@ impl PackManifest {
                 },
                 layers: Vec::new(),
                 storage_template: None,
+                overlay_template: None,
             },
         }
     }
@@ -402,5 +428,57 @@ mod tests {
         let json = String::from_utf8(manifest.to_json().unwrap()).unwrap();
         assert!(json.contains("\"image\": \"ubuntu:22.04\""));
         assert!(json.contains("\"platform\": \"linux/amd64\""));
+    }
+
+    #[test]
+    fn test_pack_mode_default_is_container() {
+        assert_eq!(PackMode::default(), PackMode::Container);
+    }
+
+    #[test]
+    fn test_pack_mode_backward_compat() {
+        // Old manifests without a "mode" field should deserialize as Container
+        let json = r#"{
+            "image": "alpine:latest",
+            "digest": "sha256:abc",
+            "platform": "linux/arm64",
+            "cpus": 1,
+            "mem": 256,
+            "entrypoint": [],
+            "cmd": [],
+            "env": [],
+            "assets": {
+                "libraries": [],
+                "agent_rootfs": { "path": "rootfs.tar", "size": 1024 },
+                "layers": []
+            }
+        }"#;
+
+        let manifest: PackManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(manifest.mode, PackMode::Container);
+        assert!(manifest.assets.overlay_template.is_none());
+    }
+
+    #[test]
+    fn test_pack_mode_vm_roundtrip() {
+        let mut manifest = PackManifest::new(
+            "vm://myvm".to_string(),
+            "none".to_string(),
+            "linux/arm64".to_string(),
+        );
+        manifest.mode = PackMode::Vm;
+        manifest.assets.overlay_template = Some(AssetEntry {
+            path: "overlay.raw".to_string(),
+            size: 2 * 1024 * 1024 * 1024,
+        });
+
+        let json = manifest.to_json().unwrap();
+        let restored = PackManifest::from_json(&json).unwrap();
+        assert_eq!(restored.mode, PackMode::Vm);
+        assert!(restored.assets.overlay_template.is_some());
+        assert_eq!(
+            restored.assets.overlay_template.unwrap().path,
+            "overlay.raw"
+        );
     }
 }

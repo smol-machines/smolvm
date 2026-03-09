@@ -1,0 +1,18 @@
+{
+  "name": "smolvm-embedded-darwin-x64",
+  "version": "0.1.0",
+  "description": "Internal platform package for smolvm-embedded on macOS x64",
+  "main": "native/index.js",
+  "types": "native/index.d.ts",
+  "files": [
+    "native",
+    "lib"
+  ],
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "license": "Apache-2.0"
+}

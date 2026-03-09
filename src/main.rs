@@ -40,20 +40,16 @@ enum Commands {
     Container(cli::container::ContainerCmd),
 
     /// Start the HTTP API server for programmatic control
+    #[command(subcommand)]
     Serve(cli::serve::ServeCmd),
 
-    /// Package an OCI image into a self-contained executable
+    /// Package and run self-contained VM executables
+    #[command(subcommand)]
     Pack(cli::pack::PackCmd),
 
     /// Manage smolvm configuration (registries, defaults)
     #[command(subcommand)]
     Config(cli::config::ConfigCmd),
-
-    /// Export OpenAPI specification for SDK generation
-    Openapi(cli::openapi::OpenapiCmd),
-
-    /// Run a VM from a packed .smolmachine sidecar file
-    Runpack(cli::runpack::RunpackCmd),
 }
 
 fn main() {
@@ -61,7 +57,7 @@ fn main() {
     // If this executable has a `.smolmachine` sidecar, appended assets,
     // or a Mach-O section with packed data, run as a packed binary instead.
     if let Some(mode) = smolvm_pack::detect_packed_mode() {
-        cli::runpack::run_as_packed_binary(mode);
+        cli::pack_run::run_as_packed_binary(mode);
     }
 
     let cli = Cli::parse();
@@ -79,8 +75,6 @@ fn main() {
         Commands::Serve(cmd) => cmd.run(),
         Commands::Pack(cmd) => cmd.run(),
         Commands::Config(cmd) => cmd.run(),
-        Commands::Openapi(cmd) => cmd.run(),
-        Commands::Runpack(cmd) => cmd.run(),
     };
 
     // Handle errors

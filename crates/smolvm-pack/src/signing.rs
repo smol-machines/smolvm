@@ -38,6 +38,14 @@ const HYPERVISOR_ENTITLEMENTS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 /// for local development and distribution.
 #[cfg(target_os = "macos")]
 pub fn sign_with_hypervisor_entitlements(binary_path: &Path) -> Result<()> {
+    // Reset SIGCHLD to default before spawning codesign.
+    // The agent VM startup installs a SIGCHLD handler that reaps all children
+    // via waitpid(-1), which races with Command::output()'s internal waitpid
+    // and causes ECHILD (os error 10).
+    unsafe {
+        libc::signal(libc::SIGCHLD, libc::SIG_DFL);
+    }
+
     // Create temporary entitlements file
     let temp_dir = tempfile::tempdir()?;
     let entitlements_path = temp_dir.path().join("entitlements.plist");

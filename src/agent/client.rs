@@ -7,7 +7,7 @@ use crate::error::{Error, Result};
 use crate::registry::{extract_registry, rewrite_image_registry, RegistryAuth, RegistryConfig};
 use smolvm_protocol::{
     encode_message, AgentRequest, AgentResponse, ContainerInfo, ImageInfo, OverlayInfo,
-    StorageStatus, MAX_FRAME_SIZE,
+    StorageStatus, MAX_FRAME_SIZE, PROTOCOL_VERSION,
 };
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -45,16 +45,29 @@ const INTERACTIVE_TIMEOUT_SECS: u64 = 3600;
 /// timeout to allow for protocol overhead and response transmission.
 const TIMEOUT_BUFFER_SECS: u64 = 5;
 
-/// Short read timeout for status checks (5 seconds).
-/// Used when checking agent status where we want to fail fast.
-const STATUS_CHECK_TIMEOUT_SECS: u64 = 5;
+/// Timeout for shutdown acknowledgment (5 seconds).
+/// sync() + ack transmission is typically <100ms, but heavy writes or
+/// large journals may take longer. If no ack within 5s, the VM has
+/// likely already torn down — safe to proceed with SIGTERM.
+const SHUTDOWN_ACK_TIMEOUT_SECS: u64 = 5;
+
+// ============================================================================
+// I/O Constants
+// ============================================================================
+
+/// Buffer size for reading stdin during interactive sessions.
+const STDIN_BUF_SIZE: usize = 4096;
+
+/// Poll timeout in milliseconds for interactive I/O loops.
+/// Short enough for responsive SIGWINCH handling, long enough to avoid busy-waiting.
+const POLL_TIMEOUT_MS: i32 = 100;
 
 /// RAII guard that resets the socket read timeout on drop.
 ///
 /// Ensures the timeout is always restored, even if the operation
 /// returns early due to an error. Uses a cloned UnixStream handle
 /// (shares the underlying fd) to avoid borrow conflicts.
-struct ReadTimeoutGuard {
+pub struct ReadTimeoutGuard {
     stream: UnixStream,
 }
 
@@ -150,7 +163,7 @@ impl RunConfig {
 ///
 /// ```ignore
 /// let options = PullOptions::new()
-///     .platform("linux/arm64")
+///     .oci_platform("linux/arm64")
 ///     .use_registry_config(true)
 ///     .progress(|cur, total, layer| println!("{}/{}: {}", cur, total, layer));
 ///
@@ -161,8 +174,8 @@ pub struct PullOptions<F = fn(usize, usize, &str)>
 where
     F: FnMut(usize, usize, &str),
 {
-    /// Platform to pull (e.g., "linux/arm64").
-    pub platform: Option<String>,
+    /// OCI platform to pull (e.g., "linux/arm64").
+    pub oci_platform: Option<String>,
     /// Explicit authentication credentials.
     pub auth: Option<RegistryAuth>,
     /// Whether to load credentials from registry config file.
@@ -175,7 +188,7 @@ impl PullOptions<fn(usize, usize, &str)> {
     /// Create new pull options with defaults.
     pub fn new() -> Self {
         Self {
-            platform: None,
+            oci_platform: None,
             auth: None,
             use_registry_config: false,
             progress: None,
@@ -184,9 +197,9 @@ impl PullOptions<fn(usize, usize, &str)> {
 }
 
 impl<F: FnMut(usize, usize, &str)> PullOptions<F> {
-    /// Set the target platform (e.g., "linux/arm64").
-    pub fn platform(mut self, platform: impl Into<String>) -> Self {
-        self.platform = Some(platform.into());
+    /// Set the target OCI platform (e.g., "linux/arm64").
+    pub fn oci_platform(mut self, oci_platform: impl Into<String>) -> Self {
+        self.oci_platform = Some(oci_platform.into());
         self
     }
 
@@ -211,12 +224,25 @@ impl<F: FnMut(usize, usize, &str)> PullOptions<F> {
     /// The callback receives (current_percent, total=100, layer_id) for each layer.
     pub fn progress<G: FnMut(usize, usize, &str)>(self, callback: G) -> PullOptions<G> {
         PullOptions {
-            platform: self.platform,
+            oci_platform: self.oci_platform,
             auth: self.auth,
             use_registry_config: self.use_registry_config,
             progress: Some(callback),
         }
     }
+}
+
+/// Check if a shutdown receive error is a benign race condition.
+///
+/// During shutdown the VM may tear down before the ack response is flushed,
+/// causing EAGAIN, connection reset, or similar errors. These are expected
+/// and don't indicate a problem — sync() has likely already completed.
+fn is_benign_shutdown_error(error_str: &str) -> bool {
+    error_str.contains("os error 35") // EAGAIN on macOS
+        || error_str.contains("os error 11") // EAGAIN on Linux
+        || error_str.contains("temporarily unavailable")
+        || error_str.contains("Connection reset")
+        || error_str.contains("connection reset")
 }
 
 /// Client for communicating with the smolvm-agent.
@@ -319,29 +345,46 @@ impl AgentClient {
         )
     }
 
+    /// Connect with a short timeout, for use during startup ping probes.
+    /// Uses 100ms read timeout instead of 30s to fail fast during boot.
+    /// The agent completes init in ~130ms of guest uptime, so 100ms is enough
+    /// to detect a ready agent without wasting time on a full 1s timeout.
+    pub fn connect_with_short_timeout(socket_path: impl AsRef<Path>) -> Result<Self> {
+        Self::connect_with_timeouts_ms(socket_path.as_ref(), 100, 100)
+    }
+
+    /// Connect with a very short timeout for boot-time probe cycles.
+    /// Uses 5ms timeout to minimize blocking between ready-marker checks.
+    /// Only used in the fallback path (old agents without ready markers).
+    pub fn connect_with_boot_probe_timeout(socket_path: impl AsRef<Path>) -> Result<Self> {
+        Self::connect_with_timeouts_ms(socket_path.as_ref(), 5, 5)
+    }
+
     /// Internal connect implementation (single attempt).
     fn connect_once(socket_path: &Path) -> Result<Self> {
+        Self::connect_with_timeouts(
+            socket_path,
+            DEFAULT_READ_TIMEOUT_SECS,
+            DEFAULT_WRITE_TIMEOUT_SECS,
+        )
+    }
+
+    /// Connect to the agent socket and configure read/write timeouts (in seconds).
+    fn connect_with_timeouts(socket_path: &Path, read_secs: u64, write_secs: u64) -> Result<Self> {
+        Self::connect_with_timeouts_ms(socket_path, read_secs * 1000, write_secs * 1000)
+    }
+
+    /// Connect to the agent socket and configure read/write timeouts (in milliseconds).
+    fn connect_with_timeouts_ms(socket_path: &Path, read_ms: u64, write_ms: u64) -> Result<Self> {
         let stream = UnixStream::connect(socket_path)
             .map_err(|e| Error::agent("connect to agent", e.to_string()))?;
 
-        // Set timeouts - fail early if we can't set them to prevent indefinite hangs
         stream
-            .set_read_timeout(Some(Duration::from_secs(DEFAULT_READ_TIMEOUT_SECS)))
-            .map_err(|e| {
-                Error::agent(
-                    "set read timeout",
-                    format!("{} (prevents indefinite hangs)", e),
-                )
-            })?;
-
+            .set_read_timeout(Some(Duration::from_millis(read_ms)))
+            .map_err(|e| Error::agent("set read timeout", e.to_string()))?;
         stream
-            .set_write_timeout(Some(Duration::from_secs(DEFAULT_WRITE_TIMEOUT_SECS)))
-            .map_err(|e| {
-                Error::agent(
-                    "set write timeout",
-                    format!("{} (prevents indefinite hangs)", e),
-                )
-            })?;
+            .set_write_timeout(Some(Duration::from_millis(write_ms)))
+            .map_err(|e| Error::agent("set write timeout", e.to_string()))?;
 
         Ok(Self { stream })
     }
@@ -359,12 +402,24 @@ impl AgentClient {
         self.receive()
     }
 
-    /// Ping the helper daemon.
+    /// Ping the helper daemon and validate the protocol version.
+    ///
+    /// Returns the agent's protocol version. Logs a warning if the version
+    /// doesn't match the host's expected version.
     pub fn ping(&mut self) -> Result<u32> {
         let resp = self.request(&AgentRequest::Ping)?;
 
         match resp {
-            AgentResponse::Pong { version } => Ok(version),
+            AgentResponse::Pong { version } => {
+                if version != PROTOCOL_VERSION {
+                    tracing::warn!(
+                        host_version = PROTOCOL_VERSION,
+                        agent_version = version,
+                        "protocol version mismatch — agent may be outdated or newer than host"
+                    );
+                }
+                Ok(version)
+            }
             AgentResponse::Error { message, .. } => Err(Error::agent("ping", message)),
             _ => Err(Error::agent("ping", "unexpected response type")),
         }
@@ -435,7 +490,7 @@ impl AgentClient {
 
         self.pull_image_internal(
             &effective_image,
-            options.platform.as_deref(),
+            options.oci_platform.as_deref(),
             effective_auth.as_ref(),
             options.progress,
         )
@@ -445,7 +500,7 @@ impl AgentClient {
     fn pull_image_internal<F: FnMut(usize, usize, &str)>(
         &mut self,
         image: &str,
-        platform: Option<&str>,
+        oci_platform: Option<&str>,
         auth: Option<&RegistryAuth>,
         mut progress: Option<F>,
     ) -> Result<ImageInfo> {
@@ -457,7 +512,7 @@ impl AgentClient {
         // Send the pull request
         let data = encode_message(&AgentRequest::Pull {
             image: image.to_string(),
-            platform: platform.map(String::from),
+            oci_platform: oci_platform.map(String::from),
             auth: auth.cloned(),
         })
         .map_err(|e| Error::agent("encode message", e.to_string()))?;
@@ -519,14 +574,14 @@ impl AgentClient {
     pub fn pull_with_registry_config_and_progress<F: FnMut(usize, usize, &str)>(
         &mut self,
         image: &str,
-        platform: Option<&str>,
+        oci_platform: Option<&str>,
         progress: F,
     ) -> Result<ImageInfo> {
         let mut opts = PullOptions::new()
             .use_registry_config(true)
             .progress(progress);
-        if let Some(p) = platform {
-            opts = opts.platform(p);
+        if let Some(p) = oci_platform {
+            opts = opts.oci_platform(p);
         }
         self.pull(image, opts)
     }
@@ -631,11 +686,13 @@ impl AgentClient {
     /// may be killed before ext4 journal commits are flushed, causing layer
     /// corruption on next boot.
     pub fn shutdown(&mut self) -> Result<()> {
-        // Set a short timeout for shutdown acknowledgment
-        // The agent just needs to call sync() which is fast
+        // Set a timeout for shutdown acknowledgment.
+        // The agent calls sync() then sends the ack — typically <100ms,
+        // but heavy writes or large journals may take longer.
+        // If no ack within 5s, the VM has likely already torn down.
         let _ = self
             .stream
-            .set_read_timeout(Some(Duration::from_secs(STATUS_CHECK_TIMEOUT_SECS)));
+            .set_read_timeout(Some(Duration::from_secs(SHUTDOWN_ACK_TIMEOUT_SECS)));
 
         let data = encode_message(&AgentRequest::Shutdown)
             .map_err(|e| Error::agent("encode message", e.to_string()))?;
@@ -644,32 +701,25 @@ impl AgentClient {
             .map_err(|e| Error::agent("send shutdown", e.to_string()))?;
 
         // Wait for acknowledgment - this confirms sync() completed.
-        // If the agent crashes or times out, we proceed anyway since
-        // the sync() happens before the response is sent.
-        //
-        // Note: EAGAIN (os error 35) is common here because the VM may be
-        // torn down before the response arrives - this is benign since
-        // sync() has already completed by that point.
+        // Returns Ok only when the ack is actually received, so callers
+        // can distinguish "sync confirmed" from "sync unknown".
         match self.receive() {
             Ok(_) => {
                 tracing::debug!("agent acknowledged shutdown (sync complete)");
+                Ok(())
             }
             Err(e) => {
-                // Check if this is EAGAIN/EWOULDBLOCK - a common benign race
                 let error_str = e.to_string();
-                if error_str.contains("os error 35")
-                    || error_str.contains("temporarily unavailable")
-                {
+                if is_benign_shutdown_error(&error_str) {
                     tracing::debug!(
-                        "shutdown ack not received (connection closed) - sync likely completed"
+                        "shutdown ack not received (connection closed) - sync may have completed"
                     );
                 } else {
-                    tracing::warn!(error = %e, "shutdown acknowledgment failed, proceeding anyway");
+                    tracing::warn!(error = %e, "shutdown acknowledgment failed");
                 }
+                Err(Error::agent("shutdown ack", error_str))
             }
         }
-
-        Ok(())
     }
 
     // ========================================================================
@@ -698,15 +748,7 @@ impl AgentClient {
         workdir: Option<String>,
         timeout: Option<Duration>,
     ) -> Result<(i32, String, String)> {
-        // Set socket read timeout based on command timeout (with buffer for response).
-        // The guard resets the timeout on drop (including error paths).
-        let socket_timeout = match timeout {
-            Some(t) => t + Duration::from_secs(TIMEOUT_BUFFER_SECS),
-            None => Duration::from_secs(INTERACTIVE_TIMEOUT_SECS),
-        };
-        self.set_read_timeout(socket_timeout)?;
-        let _timeout_guard = ReadTimeoutGuard::new(&self.stream);
-
+        let _timeout_guard = self.set_exec_timeout(timeout)?;
         let timeout_ms = timeout.map(|t| t.as_millis() as u64);
 
         let resp = self.request(&AgentRequest::VmExec {
@@ -779,12 +821,12 @@ impl AgentClient {
         let mut stdin_handle = stdin();
         let stdin_fd = stdin_handle.as_raw_fd();
         let socket_fd = self.stream.as_raw_fd();
-        let mut stdin_buf = [0u8; 4096];
+        let mut stdin_buf = [0u8; STDIN_BUF_SIZE];
         let mut stdin_eof = false;
 
         let exit_code = loop {
             let effective_stdin_fd = if stdin_eof { -1 } else { stdin_fd };
-            let poll_result = poll_io(effective_stdin_fd, socket_fd, 100)
+            let poll_result = poll_io(effective_stdin_fd, socket_fd, POLL_TIMEOUT_MS)
                 .map_err(|e| Error::agent("poll", e.to_string()))?;
 
             // Check for terminal resize (SIGWINCH)
@@ -952,16 +994,7 @@ impl AgentClient {
         mounts: Vec<(String, String, bool)>,
         timeout: Option<Duration>,
     ) -> Result<(i32, String, String)> {
-        // Set socket read timeout based on command timeout (with buffer for response).
-        // The guard resets the timeout on drop (including error paths).
-        let socket_timeout = match timeout {
-            Some(t) => t + Duration::from_secs(TIMEOUT_BUFFER_SECS),
-            None => Duration::from_secs(INTERACTIVE_TIMEOUT_SECS),
-        };
-        self.set_read_timeout(socket_timeout)?;
-        let _timeout_guard = ReadTimeoutGuard::new(&self.stream);
-
-        // Convert timeout to milliseconds for protocol
+        let _timeout_guard = self.set_exec_timeout(timeout)?;
         let timeout_ms = timeout.map(|t| t.as_millis() as u64);
 
         let resp = self.request(&AgentRequest::Run {
@@ -1131,15 +1164,7 @@ impl AgentClient {
         workdir: Option<String>,
         timeout: Option<Duration>,
     ) -> Result<(i32, String, String)> {
-        // Set socket read timeout based on command timeout (with buffer for response).
-        // The guard resets the timeout on drop (including error paths).
-        let socket_timeout = match timeout {
-            Some(t) => t + Duration::from_secs(TIMEOUT_BUFFER_SECS),
-            None => Duration::from_secs(INTERACTIVE_TIMEOUT_SECS),
-        };
-        self.set_read_timeout(socket_timeout)?;
-        let _timeout_guard = ReadTimeoutGuard::new(&self.stream);
-
+        let _timeout_guard = self.set_exec_timeout(timeout)?;
         let timeout_ms = timeout.map(|t| t.as_millis() as u64);
 
         let resp = self.request(&AgentRequest::Exec {
@@ -1205,6 +1230,28 @@ impl AgentClient {
     /// Low-level receive a single response (public).
     pub fn recv_raw(&mut self) -> Result<AgentResponse> {
         self.receive()
+    }
+
+    /// Set a command-execution timeout and return a guard that resets it on drop.
+    ///
+    /// If `timeout` is Some, the socket deadline is `timeout + TIMEOUT_BUFFER_SECS`.
+    /// If None, it uses `INTERACTIVE_TIMEOUT_SECS` (the long-running default).
+    fn set_exec_timeout(&self, timeout: Option<Duration>) -> Result<Option<ReadTimeoutGuard>> {
+        let socket_timeout = match timeout {
+            Some(t) => t + Duration::from_secs(TIMEOUT_BUFFER_SECS),
+            None => Duration::from_secs(INTERACTIVE_TIMEOUT_SECS),
+        };
+        self.set_read_timeout(socket_timeout)?;
+        Ok(ReadTimeoutGuard::new(&self.stream))
+    }
+
+    /// Set an extended read timeout and return a guard that resets it on drop.
+    ///
+    /// Used for long-running streaming operations (e.g., layer export) where
+    /// individual chunks may take longer than the default 30s timeout.
+    pub fn set_extended_read_timeout(&self, timeout: Duration) -> Result<Option<ReadTimeoutGuard>> {
+        self.set_read_timeout(timeout)?;
+        Ok(ReadTimeoutGuard::new(&self.stream))
     }
 
     /// Low-level send without waiting for response.
@@ -1273,6 +1320,10 @@ impl AgentClient {
 
         // Validate frame size to prevent OOM from malicious/buggy responses
         if len > MAX_FRAME_SIZE as usize {
+            // Header consumed but body not read — stream is desynchronized.
+            // Shut down the read half so all future reads fail immediately
+            // rather than interpreting body bytes as a frame header.
+            let _ = self.stream.shutdown(std::net::Shutdown::Read);
             return Err(Error::agent(
                 "validate frame",
                 format!(
@@ -1285,7 +1336,12 @@ impl AgentClient {
         let mut buf = vec![0u8; len];
         // Always retry body reads — header is already consumed so we can't
         // propagate an error without corrupting the stream.
-        self.read_exact_retry(&mut buf, false)?;
+        if let Err(e) = self.read_exact_retry(&mut buf, false) {
+            // Body read failed — stream is desynchronized. Shut down the
+            // read half so future reads fail cleanly.
+            let _ = self.stream.shutdown(std::net::Shutdown::Read);
+            return Err(e.into());
+        }
 
         let resp: AgentResponse = serde_json::from_slice(&buf)
             .map_err(|e| Error::agent("deserialize response", e.to_string()))?;

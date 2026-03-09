@@ -19,7 +19,7 @@ pub const DEFAULT_CONTAINER_PATH: &str =
 ///
 /// When crun exec is called with `--env`, it doesn't search PATH for executables
 /// unless PATH is explicitly set. This function ensures PATH is always present.
-pub fn ensure_path_in_env(env: &[(String, String)]) -> Vec<(String, String)> {
+fn ensure_path_in_env(env: &[(String, String)]) -> Vec<(String, String)> {
     let has_path = env.iter().any(|(k, _)| k == "PATH");
     if has_path {
         env.to_vec()
@@ -40,10 +40,34 @@ pub struct CrunCommand {
 
 impl CrunCommand {
     /// Create a new crun command with standard configuration.
+    ///
+    /// Uses `--root` to store container state on the persistent storage disk
+    /// instead of the default `/run/crun`, which may not be writable when the
+    /// rootfs is an overlayfs with an initramfs lower layer.
     fn new() -> Self {
         let mut cmd = Command::new(paths::CRUN_PATH);
+        cmd.args(["--root", paths::CRUN_ROOT_DIR]);
         cmd.args(["--cgroup-manager", paths::CRUN_CGROUP_MANAGER]);
         Self { cmd }
+    }
+
+    /// Create a container: `crun create --bundle <path> <id>`
+    ///
+    /// This puts the container in "created" state, ready for `crun start`.
+    /// Stdio is null because capturing pipes can block when child processes
+    /// inherit file descriptors.
+    pub fn create(bundle_dir: &Path, container_id: &str) -> Self {
+        let mut c = Self::new();
+        c.cmd.args([
+            "create",
+            "--bundle",
+            &bundle_dir.to_string_lossy(),
+            container_id,
+        ]);
+        c.cmd.stdin(Stdio::null());
+        c.cmd.stdout(Stdio::null());
+        c.cmd.stderr(Stdio::null());
+        c
     }
 
     /// Run a container: `crun run --bundle <path> <id>`
@@ -67,17 +91,30 @@ impl CrunCommand {
         c
     }
 
-    /// Execute with environment: `crun exec --env KEY=VAL <id> <command...>`
+    /// Execute a command in a running container.
     ///
-    /// This automatically ensures PATH is set if not provided, because crun doesn't
+    /// Supports optional working directory and TTY allocation.
+    /// Automatically ensures PATH is set if not provided, because crun doesn't
     /// search PATH for executables when `--env` is used.
-    pub fn exec_with_env(container_id: &str, env: &[(String, String)], command: &[String]) -> Self {
+    pub fn exec(
+        container_id: &str,
+        env: &[(String, String)],
+        command: &[String],
+        workdir: Option<&str>,
+        tty: bool,
+    ) -> Self {
         let mut c = Self::new();
         c.cmd.arg("exec");
+        if tty {
+            c.cmd.arg("--tty");
+        }
         // Ensure PATH is set for command lookup
         let env_with_path = ensure_path_in_env(env);
         for (key, value) in &env_with_path {
             c.cmd.arg("--env").arg(format!("{}={}", key, value));
+        }
+        if let Some(wd) = workdir {
+            c.cmd.args(["--cwd", wd]);
         }
         c.cmd.arg(container_id).args(command);
         c
@@ -108,6 +145,16 @@ impl CrunCommand {
         c
     }
 
+    /// List all containers: `crun list -f json`
+    ///
+    /// Returns all containers in a single invocation, much faster than
+    /// calling `crun state` per container during reconciliation.
+    pub fn list() -> Self {
+        let mut c = Self::new();
+        c.cmd.args(["list", "-f", "json"]);
+        c
+    }
+
     /// Set stdin to null.
     pub fn stdin_null(mut self) -> Self {
         self.cmd.stdin(Stdio::null());
@@ -135,6 +182,13 @@ impl CrunCommand {
     /// Capture both stdout and stderr.
     pub fn capture_output(self) -> Self {
         self.stdout_piped().stderr_piped()
+    }
+
+    /// Discard both stdout and stderr.
+    pub fn discard_output(mut self) -> Self {
+        self.cmd.stdout(Stdio::null());
+        self.cmd.stderr(Stdio::null());
+        self
     }
 
     /// Spawn the command.
