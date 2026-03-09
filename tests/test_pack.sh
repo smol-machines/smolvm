@@ -683,7 +683,7 @@ echo ""
 echo "Running Egress Policy Tests (requires VM)..."
 echo ""
 
-test_runpack_egress_allow_ip_permitted() {
+test_pack_run_egress_allow_ip_permitted() {
     local output="$TEST_DIR/test-alpine"
 
     if [[ ! -f "$output.smolmachine" ]]; then
@@ -692,14 +692,14 @@ test_runpack_egress_allow_ip_permitted() {
 
     # Allow Cloudflare DNS — lookup should succeed
     local result
-    result=$(run_with_timeout 60 $SMOLVM runpack --sidecar "$output.smolmachine" --allow-ip 1.1.1.1/32 -- nslookup cloudflare.com 1.1.1.1 2>&1)
+    result=$(run_with_timeout 60 $SMOLVM pack run --sidecar "$output.smolmachine" --allow-ip 1.1.1.1/32 -- nslookup cloudflare.com 1.1.1.1 2>&1)
     local exit_code=$?
 
     [[ $exit_code -eq 124 ]] && { echo "TIMEOUT"; return 1; }
     [[ $exit_code -eq 0 ]] && [[ "$result" == *"Address"* ]]
 }
 
-test_runpack_egress_allow_ip_blocked() {
+test_pack_run_egress_allow_ip_blocked() {
     local output="$TEST_DIR/test-alpine"
 
     if [[ ! -f "$output.smolmachine" ]]; then
@@ -708,13 +708,13 @@ test_runpack_egress_allow_ip_blocked() {
 
     # Allow only private range — external connections should fail
     local result exit_code=0
-    result=$(run_with_timeout 60 $SMOLVM runpack --sidecar "$output.smolmachine" --allow-ip 10.0.0.0/8 -- nslookup cloudflare.com 1.1.1.1 2>&1) || exit_code=$?
+    result=$(run_with_timeout 60 $SMOLVM pack run --sidecar "$output.smolmachine" --allow-ip 10.0.0.0/8 -- nslookup cloudflare.com 1.1.1.1 2>&1) || exit_code=$?
 
     [[ $exit_code -eq 124 ]] && { echo "TIMEOUT"; return 1; }
     [[ $exit_code -ne 0 ]]
 }
 
-test_runpack_egress_outbound_localhost_only() {
+test_pack_run_egress_outbound_localhost_only() {
     local output="$TEST_DIR/test-alpine"
 
     if [[ ! -f "$output.smolmachine" ]]; then
@@ -723,15 +723,15 @@ test_runpack_egress_outbound_localhost_only() {
 
     # --outbound-localhost-only should block all external
     local result exit_code=0
-    result=$(run_with_timeout 60 $SMOLVM runpack --sidecar "$output.smolmachine" --outbound-localhost-only -- nslookup cloudflare.com 1.1.1.1 2>&1) || exit_code=$?
+    result=$(run_with_timeout 60 $SMOLVM pack run --sidecar "$output.smolmachine" --outbound-localhost-only -- nslookup cloudflare.com 1.1.1.1 2>&1) || exit_code=$?
 
     [[ $exit_code -eq 124 ]] && { echo "TIMEOUT"; return 1; }
     [[ $exit_code -ne 0 ]]
 }
 
-run_test "runpack egress: allow-ip permits matching" test_runpack_egress_allow_ip_permitted || true
-run_test "runpack egress: allow-ip blocks non-matching" test_runpack_egress_allow_ip_blocked || true
-run_test "runpack egress: --outbound-localhost-only blocks external" test_runpack_egress_outbound_localhost_only || true
+run_test "pack run egress: allow-ip permits matching" test_pack_run_egress_allow_ip_permitted || true
+run_test "pack run egress: allow-ip blocks non-matching" test_pack_run_egress_allow_ip_blocked || true
+run_test "pack run egress: --outbound-localhost-only blocks external" test_pack_run_egress_outbound_localhost_only || true
 
 echo ""
 echo "Running Error Handling Tests..."
