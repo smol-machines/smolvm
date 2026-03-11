@@ -100,9 +100,9 @@ pub struct ResourceSpec {
     #[serde(default)]
     #[schema(example = 20)]
     pub storage_gb: Option<u64>,
-    /// Overlay disk size in GiB (default: 2).
+    /// Overlay disk size in GiB (default: 10).
     #[serde(default)]
-    #[schema(example = 2)]
+    #[schema(example = 10)]
     pub overlay_gb: Option<u64>,
 }
 
@@ -481,7 +481,7 @@ pub struct CreateMicrovmRequest {
     /// Storage disk size in GiB (default: 20).
     #[serde(default)]
     pub storage_gb: Option<u64>,
-    /// Overlay disk size in GiB (default: 2).
+    /// Overlay disk size in GiB (default: 10).
     #[serde(default)]
     pub overlay_gb: Option<u64>,
 }
