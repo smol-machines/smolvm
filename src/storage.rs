@@ -20,11 +20,14 @@ use crate::platform::Os;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// Default size for the shared storage disk (20 GB sparse).
-pub const DEFAULT_STORAGE_SIZE_GB: u64 = 20;
+/// Default size for the shared storage disk (20 GiB sparse).
+pub const DEFAULT_STORAGE_SIZE_GIB: u64 = 20;
 
 /// Storage disk filename.
 pub const STORAGE_DISK_FILENAME: &str = "storage.raw";
+
+/// Bytes per gibibyte (GiB).
+const BYTES_PER_GIB: u64 = 1024 * 1024 * 1024;
 
 /// Common search paths for e2fsprogs tools (mkfs.ext4, e2fsck, resize2fs).
 const E2FSPROGS_PATH_PREFIXES: &[&str] = &[
@@ -319,7 +322,7 @@ pub fn expand_disk(path: &Path, new_size_gb: u64, label: &str) -> Result<()> {
     use std::fs::OpenOptions;
     use std::io::{Seek, SeekFrom, Write};
 
-    let new_size_bytes = new_size_gb * 1024 * 1024 * 1024;
+    let new_size_bytes = new_size_gb * BYTES_PER_GIB;
 
     // Get current size
     let metadata =
@@ -332,7 +335,7 @@ pub fn expand_disk(path: &Path, new_size_gb: u64, label: &str) -> Result<()> {
             format!(
                 "new size ({} GiB) must be larger than current size ({} GiB)",
                 new_size_gb,
-                current_size / (1024 * 1024 * 1024)
+                current_size / BYTES_PER_GIB
             ),
         ));
     }
@@ -340,7 +343,7 @@ pub fn expand_disk(path: &Path, new_size_gb: u64, label: &str) -> Result<()> {
     tracing::info!(
         path = %path.display(),
         label,
-        current_gb = current_size / (1024 * 1024 * 1024),
+        current_gb = current_size / BYTES_PER_GIB,
         new_gb = new_size_gb,
         "expanding {} disk",
         label
@@ -457,7 +460,7 @@ impl StorageDisk {
     /// Open or create the storage disk at the default location.
     pub fn open_or_create() -> Result<Self> {
         let path = Self::default_path()?;
-        Self::open_or_create_at(&path, DEFAULT_STORAGE_SIZE_GB)
+        Self::open_or_create_at(&path, DEFAULT_STORAGE_SIZE_GIB)
     }
 
     /// Open or create the storage disk at the default location with a custom size.
@@ -481,7 +484,7 @@ impl StorageDisk {
             std::fs::create_dir_all(parent)?;
         }
 
-        let size_bytes = size_gb * 1024 * 1024 * 1024;
+        let size_bytes = size_gb * BYTES_PER_GIB;
 
         if path.exists() {
             // Open existing disk
@@ -532,9 +535,9 @@ impl StorageDisk {
         self.size_bytes
     }
 
-    /// Get the disk size in GB.
+    /// Get the disk size in GiB.
     pub fn size_gb(&self) -> u64 {
-        self.size_bytes / (1024 * 1024 * 1024)
+        self.size_bytes / BYTES_PER_GIB
     }
 
     /// Check if the disk needs to be formatted.
@@ -557,12 +560,12 @@ impl StorageDisk {
 // Overlay Disk
 // ============================================================================
 
-/// Default size for the rootfs overlay disk (10 GB sparse).
+/// Default size for the rootfs overlay disk (10 GiB sparse).
 ///
 /// This is a sparse file — only actually-written data consumes host disk space.
-/// 10 GB provides headroom for package installation (`apk add`, `pip install`, etc.)
+/// 10 GiB provides headroom for package installation (`apk add`, `pip install`, etc.)
 /// without hitting "No space left on device" during typical development workflows.
-pub const DEFAULT_OVERLAY_SIZE_GB: u64 = 10;
+pub const DEFAULT_OVERLAY_SIZE_GIB: u64 = 10;
 
 /// Overlay disk filename.
 pub const OVERLAY_DISK_FILENAME: &str = "overlay.raw";
@@ -597,7 +600,7 @@ impl OverlayDisk {
             std::fs::create_dir_all(parent)?;
         }
 
-        let size_bytes = size_gb * 1024 * 1024 * 1024;
+        let size_bytes = size_gb * BYTES_PER_GIB;
 
         if path.exists() {
             let metadata = std::fs::metadata(path)?;

@@ -546,10 +546,10 @@ pub async fn resize_microvm(
     // Get current disk sizes (use defaults if not set)
     let current_storage_gb = record
         .storage_gb
-        .unwrap_or(crate::storage::DEFAULT_STORAGE_SIZE_GB);
+        .unwrap_or(crate::storage::DEFAULT_STORAGE_SIZE_GIB);
     let current_overlay_gb = record
         .overlay_gb
-        .unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GB);
+        .unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GIB);
 
     // Validate resize parameters (no shrinking)
     let new_storage_gb = req.storage_gb.unwrap_or(current_storage_gb);

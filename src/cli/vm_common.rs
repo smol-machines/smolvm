@@ -824,7 +824,7 @@ pub fn resize_vm(
 ) -> smolvm::Result<()> {
     use smolvm::config::RecordState;
     use smolvm::db::SmolvmDb;
-    use smolvm::storage::{expand_disk, DEFAULT_OVERLAY_SIZE_GB, DEFAULT_STORAGE_SIZE_GB};
+    use smolvm::storage::{expand_disk, DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
 
     // Get VM record from database
     let db = SmolvmDb::open()?;
@@ -846,8 +846,8 @@ pub fn resize_vm(
     }
 
     // Get current disk sizes (use defaults if not set)
-    let current_storage_gb = record.storage_gb.unwrap_or(DEFAULT_STORAGE_SIZE_GB);
-    let current_overlay_gb = record.overlay_gb.unwrap_or(DEFAULT_OVERLAY_SIZE_GB);
+    let current_storage_gb = record.storage_gb.unwrap_or(DEFAULT_STORAGE_SIZE_GIB);
+    let current_overlay_gb = record.overlay_gb.unwrap_or(DEFAULT_OVERLAY_SIZE_GIB);
 
     // Determine target sizes
     let target_storage_gb = new_storage_gb.unwrap_or(current_storage_gb);

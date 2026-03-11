@@ -314,8 +314,8 @@ impl AgentManager {
     ) -> Result<Self> {
         let name = name.into();
         let rootfs_path = Self::default_rootfs_path()?;
-        let sg = storage_gb.unwrap_or(crate::storage::DEFAULT_STORAGE_SIZE_GB);
-        let og = overlay_gb.unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GB);
+        let sg = storage_gb.unwrap_or(crate::storage::DEFAULT_STORAGE_SIZE_GIB);
+        let og = overlay_gb.unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GIB);
 
         // Named VMs get their own storage disk
         let storage_dir = vm_data_dir(&name);
@@ -867,10 +867,10 @@ impl AgentManager {
         let console_log = self.console_log.clone();
         let storage_size_gb = resources
             .storage_gb
-            .unwrap_or(crate::storage::DEFAULT_STORAGE_SIZE_GB);
+            .unwrap_or(crate::storage::DEFAULT_STORAGE_SIZE_GIB);
         let overlay_size_gb = resources
             .overlay_gb
-            .unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GB);
+            .unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GIB);
 
         // Fork child process using the safe abstraction.
         // The child becomes a session leader (detached from parent's session)
