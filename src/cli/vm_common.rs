@@ -10,6 +10,7 @@ use crate::cli::{format_pid_suffix, truncate};
 use smolvm::agent::{vm_data_dir, AgentManager, PortMapping};
 use smolvm::config::{RecordState, SmolvmConfig, VmRecord};
 use smolvm::db::SmolvmDb;
+use smolvm::storage::{DEFAULT_OVERLAY_SIZE_GB, DEFAULT_STORAGE_SIZE_GB};
 
 // ============================================================================
 // VmKind
@@ -745,6 +746,8 @@ pub fn list_vms(kind: VmKind, verbose: bool, json: bool) -> smolvm::Result<()> {
                     "mounts": record.mounts.len(),
                     "ports": record.ports.len(),
                     "created_at": record.created_at,
+                    "storage_gb": record.storage_gb,
+                    "overlay_gb": record.overlay_gb,
                 });
                 if kind.include_network_in_json() {
                     obj.as_object_mut()
@@ -759,21 +762,25 @@ pub fn list_vms(kind: VmKind, verbose: bool, json: bool) -> smolvm::Result<()> {
         println!("{}", json);
     } else {
         println!(
-            "{:<20} {:<10} {:<5} {:<8} {:<6} {:<6}",
-            "NAME", "STATE", "CPUS", "MEMORY", "MOUNTS", "PORTS"
+            "{:<20} {:<10} {:>5} {:>10} {:>7} {:>7} {:>8} {:>8}",
+            "NAME", "STATE", "CPUS", "MEMORY", "MOUNTS", "PORTS", "STORAGE", "OVERLAY"
         );
-        println!("{}", "-".repeat(60));
+        println!("{}", "-".repeat(82));
 
         for (name, record) in vms {
             let actual_state = record.actual_state();
+            let storage_gb = record.storage_gb.unwrap_or(DEFAULT_STORAGE_SIZE_GB);
+            let overlay_gb = record.overlay_gb.unwrap_or(DEFAULT_OVERLAY_SIZE_GB);
             println!(
-                "{:<20} {:<10} {:<5} {:<8} {:<6} {:<6}",
+                "{:<20} {:<10} {:>5} {:>10} {:>7} {:>7} {:>8} {:>8}",
                 truncate(name, 18),
                 actual_state,
                 record.cpus,
                 format!("{} MiB", record.mem),
                 record.mounts.len(),
                 record.ports.len(),
+                format!("{} GiB", storage_gb),
+                format!("{} GiB", overlay_gb),
             );
 
             if verbose {

@@ -531,6 +531,14 @@ pub struct MicrovmInfo {
     pub ports: usize,
     /// Whether outbound network access is enabled.
     pub network: bool,
+    /// Storage disk size in GiB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 20)]
+    pub storage_gb: Option<u64>,
+    /// Overlay disk size in GiB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 2)]
+    pub overlay_gb: Option<u64>,
     /// Creation timestamp.
     pub created_at: String,
 }

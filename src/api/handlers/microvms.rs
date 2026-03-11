@@ -64,6 +64,8 @@ fn record_to_info(name: &str, record: &VmRecord) -> MicrovmInfo {
         mounts: record.mounts.len(),
         ports: record.ports.len(),
         network: record.network,
+        storage_gb: record.storage_gb,
+        overlay_gb: record.overlay_gb,
         created_at: record.created_at.clone(),
     }
 }
