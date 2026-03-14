@@ -342,14 +342,37 @@ impl AgentManager {
 
     /// Get the default path for the agent rootfs.
     ///
-    /// Checks `SMOLVM_AGENT_ROOTFS` env var first, then falls back to the
-    /// platform data directory (`~/.local/share/smolvm/agent-rootfs` on Linux,
-    /// `~/Library/Application Support/smolvm/agent-rootfs` on macOS).
+    /// Resolution order:
+    /// 1. `SMOLVM_AGENT_ROOTFS` env var (explicit override)
+    /// 2. `./target/agent-rootfs` relative to current directory (local dev)
+    /// 3. Platform data directory (`~/.local/share/smolvm/agent-rootfs` on Linux,
+    ///    `~/Library/Application Support/smolvm/agent-rootfs` on macOS)
+    ///
+    /// Relative paths are resolved relative to the current working directory.
     pub fn default_rootfs_path() -> Result<PathBuf> {
+        // 1. Explicit environment variable override
         if let Ok(path) = std::env::var("SMOLVM_AGENT_ROOTFS") {
-            return Ok(PathBuf::from(path));
+            let rootfs_path = PathBuf::from(path);
+            // Canonicalize to resolve relative paths and symlinks
+            if rootfs_path.exists() {
+                return rootfs_path
+                    .canonicalize()
+                    .map_err(|e| Error::storage("resolve rootfs path", e.to_string()));
+            }
+            return Ok(rootfs_path);
         }
 
+        // 2. Local development: check for ./target/agent-rootfs
+        if let Ok(cwd) = std::env::current_dir() {
+            let local_rootfs = cwd.join("target/agent-rootfs");
+            if local_rootfs.exists() {
+                return local_rootfs
+                    .canonicalize()
+                    .map_err(|e| Error::storage("resolve local rootfs path", e.to_string()));
+            }
+        }
+
+        // 3. Platform data directory
         let data_dir = dirs::data_local_dir()
             .or_else(dirs::data_dir)
             .ok_or_else(|| Error::storage("resolve path", "could not determine data directory"))?;
