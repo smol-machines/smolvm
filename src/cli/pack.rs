@@ -14,7 +14,7 @@ use smolvm::agent::{AgentClient, AgentManager, PullOptions, VmResources};
 /// packed VMs are typically single-purpose, minimal workloads).
 const PACK_DEFAULT_MEMORY_MIB: u32 = 256;
 use smolvm::config::{RecordState, SmolvmConfig};
-use smolvm::platform::{Arch, Os, VmExecutor};
+use smolvm::platform::{Arch, Os};
 use smolvm::Error;
 use smolvm_pack::assets::AssetCollector;
 use smolvm_pack::format::{PackManifest, PackMode};
@@ -207,6 +207,7 @@ impl PackCreateCmd {
                 network: true,
                 storage_gb: None,
                 overlay_gb: None,
+                allowed_cidrs: None,
             },
         )?;
         let mut guard = PackVmGuard {
@@ -351,12 +352,6 @@ impl PackCreateCmd {
     /// Collect base assets shared by both image and VM packing modes:
     /// runtime libraries, agent rootfs, and a pre-formatted storage template.
     fn collect_base_assets(&self, collector: &mut AssetCollector) -> smolvm::Result<()> {
-        println!("Collecting runtime libraries...");
-        let lib_dir = self.find_lib_dir()?;
-        collector
-            .collect_libraries(&lib_dir)
-            .map_err(|e| Error::agent("collect libraries", e.to_string()))?;
-
         println!("Collecting agent rootfs...");
         let rootfs_dir = self.find_rootfs_dir()?;
         collector
@@ -436,55 +431,6 @@ impl PackCreateCmd {
         println!("Options: --help for usage");
 
         Ok(())
-    }
-
-    /// Find the library directory containing libkrun and libkrunfw.
-    fn find_lib_dir(&self) -> smolvm::Result<PathBuf> {
-        if let Some(ref dir) = self.lib_dir {
-            return Ok(dir.clone());
-        }
-
-        // Check common locations
-        let platform_lib = format!("lib/linux-{}", std::env::consts::ARCH);
-        let candidates = [
-            // Relative to executable
-            std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|d| d.join("lib"))),
-            std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().and_then(|d| d.parent()).map(|d| d.join("lib"))),
-            // Source tree dev builds: <exe_dir>/../../lib/linux-<arch>/
-            std::env::current_exe().ok().and_then(|p| {
-                p.parent()
-                    .and_then(|d| d.parent())
-                    .map(|d| d.join(&platform_lib))
-            }),
-            // Source tree (CWD)
-            Some(PathBuf::from("lib")),
-            Some(PathBuf::from("./lib")),
-            Some(PathBuf::from(&platform_lib)),
-            // Homebrew
-            Some(PathBuf::from("/opt/homebrew/lib")),
-            Some(PathBuf::from("/usr/local/lib")),
-        ];
-
-        let lib_name = format!(
-            "libkrun.{}",
-            smolvm::platform::vm_executor().dylib_extension()
-        );
-
-        for candidate in candidates.into_iter().flatten() {
-            if candidate.join(&lib_name).exists() {
-                debug!(lib_dir = %candidate.display(), "found library directory");
-                return Ok(candidate);
-            }
-        }
-
-        Err(Error::agent(
-            "find libkrun",
-            "could not find libkrun library. Use --lib-dir to specify the location.",
-        ))
     }
 
     /// Find the agent rootfs directory.

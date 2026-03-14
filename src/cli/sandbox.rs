@@ -11,7 +11,8 @@
 //! `sandbox create`, managed with `sandbox start/stop/ls/delete`.
 
 use crate::cli::parsers::{
-    mounts_to_virtiofs_bindings, parse_duration, parse_env_list, parse_mounts, parse_port,
+    mounts_to_virtiofs_bindings, parse_cidr, parse_duration, parse_env_list, parse_mounts,
+    parse_port,
 };
 use crate::cli::vm_common::{self, DeleteVmOptions, VmKind};
 use crate::cli::{flush_output, format_bytes, truncate_id};
@@ -287,6 +288,14 @@ pub struct RunCmd {
     #[arg(long, help_heading = "Network")]
     pub net: bool,
 
+    /// Allow egress to specific CIDR range (can be used multiple times, implies --net)
+    #[arg(long = "allow-cidr", value_parser = parse_cidr, value_name = "CIDR", help_heading = "Network")]
+    pub allow_cidr: Vec<String>,
+
+    /// Restrict outbound to localhost only (implies --net)
+    #[arg(long, help_heading = "Network")]
+    pub outbound_localhost_only: bool,
+
     /// Number of virtual CPUs
     #[arg(
         long,
@@ -335,6 +344,14 @@ impl RunCmd {
     pub fn run(self) -> smolvm::Result<()> {
         use smolvm::Error;
 
+        // Build allow_cidrs from --allow-cidr and --outbound-localhost-only
+        let mut cli_allow_cidrs = self.allow_cidr;
+        if self.outbound_localhost_only {
+            cli_allow_cidrs.push("127.0.0.0/8".to_string());
+            cli_allow_cidrs.push("::1/128".to_string());
+        }
+        let net = self.net || !cli_allow_cidrs.is_empty();
+
         // Merge CLI flags with Smolfile (if provided)
         let params = crate::cli::smolfile::build_create_params(
             "default".to_string(),
@@ -342,13 +359,14 @@ impl RunCmd {
             self.mem,
             self.volume,
             self.port,
-            self.net,
+            net,
             vec![],
             self.env,
             self.workdir,
             self.smolfile,
             self.storage,
             self.overlay,
+            cli_allow_cidrs,
         )?;
 
         // Parse volume mounts
@@ -366,12 +384,15 @@ impl RunCmd {
             }
         }
 
+        let has_egress_policy = params.allowed_cidrs.as_ref().is_some_and(|c| !c.is_empty());
+
         let resources = VmResources {
             cpus: params.cpus,
             mem: params.mem,
-            network: params.net,
+            network: params.net || has_egress_policy,
             storage_gb: params.storage_gb,
             overlay_gb: params.overlay_gb,
+            allowed_cidrs: params.allowed_cidrs.clone(),
         };
 
         // Start agent VM
@@ -477,6 +498,7 @@ impl RunCmd {
                             init: params.init.clone(),
                             env: parse_env_list(&params.env),
                             workdir: params.workdir.clone(),
+                            allowed_cidrs: params.allowed_cidrs.clone(),
                         }),
                     );
                 }
@@ -585,6 +607,14 @@ pub struct CreateCmd {
     #[arg(long)]
     pub net: bool,
 
+    /// Allow egress to specific CIDR range (can be used multiple times, implies --net)
+    #[arg(long = "allow-cidr", value_parser = parse_cidr, value_name = "CIDR")]
+    pub allow_cidr: Vec<String>,
+
+    /// Restrict outbound to localhost only (implies --net)
+    #[arg(long)]
+    pub outbound_localhost_only: bool,
+
     /// Run command on every VM start (can be used multiple times)
     #[arg(long = "init", value_name = "COMMAND")]
     pub init: Vec<String>,
@@ -604,19 +634,27 @@ pub struct CreateCmd {
 
 impl CreateCmd {
     pub fn run(self) -> smolvm::Result<()> {
+        let mut cli_allow_cidrs = self.allow_cidr;
+        if self.outbound_localhost_only {
+            cli_allow_cidrs.push("127.0.0.0/8".to_string());
+            cli_allow_cidrs.push("::1/128".to_string());
+        }
+        let net = self.net || !cli_allow_cidrs.is_empty();
+
         let params = crate::cli::smolfile::build_create_params(
             self.name,
             self.cpus,
             self.mem,
             self.volume,
             self.port,
-            self.net,
+            net,
             self.init,
             self.env,
             self.workdir,
             self.smolfile,
             self.storage,
             self.overlay,
+            cli_allow_cidrs,
         )?;
         vm_common::create_vm(KIND, params)
     }
