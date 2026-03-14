@@ -120,9 +120,9 @@ pub struct PackRunCmd {
     #[arg(long, help_heading = "Network")]
     pub net: bool,
 
-    /// Restrict outbound to specific IPs/CIDRs (implies --net, can be repeated)
-    #[arg(long = "allow-ip", value_parser = parse_cidr, value_name = "CIDR", help_heading = "Network")]
-    pub allow_ip: Vec<String>,
+    /// Allow egress to specific CIDR range (can be used multiple times, implies --net)
+    #[arg(long = "allow-cidr", value_parser = parse_cidr, value_name = "CIDR", help_heading = "Network")]
+    pub allow_cidr: Vec<String>,
 
     /// Restrict outbound to localhost only (implies --net)
     #[arg(long, help_heading = "Network")]
@@ -279,7 +279,7 @@ impl PackRunCmd {
         let mounts = parse_mounts(&self.volume)?;
         let port_mappings: Vec<(u16, u16)> = self.port.iter().map(|p| (p.host, p.guest)).collect();
 
-        let mut allow_cidrs = self.allow_ip.clone();
+        let mut allow_cidrs = self.allow_cidr.clone();
         if self.outbound_localhost_only {
             allow_cidrs.push("127.0.0.0/8".to_string());
             allow_cidrs.push("::1/128".to_string());
@@ -291,7 +291,11 @@ impl PackRunCmd {
             network: self.net || !self.port.is_empty() || !allow_cidrs.is_empty(),
             storage_gb: self.storage,
             overlay_gb: self.overlay,
-            allow_cidrs,
+            allowed_cidrs: if allow_cidrs.is_empty() {
+                None
+            } else {
+                Some(allow_cidrs)
+            },
         };
 
         // Build packed mounts for the launcher
@@ -751,9 +755,9 @@ struct PackedCli {
     #[arg(long, global = true)]
     net: bool,
 
-    /// Restrict outbound to specific IPs/CIDRs (implies --net, can be repeated)
-    #[arg(long = "allow-ip", value_parser = parse_cidr, value_name = "CIDR", global = true)]
-    allow_ip: Vec<String>,
+    /// Allow egress to specific CIDR range (can be used multiple times, implies --net)
+    #[arg(long = "allow-cidr", value_parser = parse_cidr, value_name = "CIDR", global = true)]
+    allow_cidr: Vec<String>,
 
     /// Restrict outbound to localhost only (implies --net)
     #[arg(long, global = true)]
@@ -863,7 +867,7 @@ fn pack_run_inner(mode: PackedMode, cli: PackedCli) -> smolvm::Result<()> {
                 volume: cli.volume,
                 port: cli.port,
                 net: cli.net,
-                allow_ip: cli.allow_ip,
+                allow_cidr: cli.allow_cidr,
                 outbound_localhost_only: cli.outbound_localhost_only,
                 cpus: cli.cpus,
                 mem: cli.mem,
@@ -981,7 +985,7 @@ fn run_from_cache(
     let mounts = parse_mounts(&cli.volume)?;
     let port_mappings: Vec<(u16, u16)> = cli.port.iter().map(|p| (p.host, p.guest)).collect();
 
-    let mut allow_cidrs = cli.allow_ip.clone();
+    let mut allow_cidrs = cli.allow_cidr.clone();
     if cli.outbound_localhost_only {
         allow_cidrs.push("127.0.0.0/8".to_string());
         allow_cidrs.push("::1/128".to_string());
@@ -993,7 +997,11 @@ fn run_from_cache(
         network: cli.net || !cli.port.is_empty() || !allow_cidrs.is_empty(),
         storage_gb: cli.storage,
         overlay_gb: cli.overlay,
-        allow_cidrs,
+        allowed_cidrs: if allow_cidrs.is_empty() {
+            None
+        } else {
+            Some(allow_cidrs)
+        },
     };
 
     let packed_mounts = mounts_to_packed(&mounts);
@@ -1080,6 +1088,8 @@ fn run_from_cache(
         volume: Vec::new(), // already parsed
         port: Vec::new(),   // already parsed
         net: cli.net,
+        allow_cidr: cli.allow_cidr,
+        outbound_localhost_only: cli.outbound_localhost_only,
         cpus: cli.cpus,
         mem: cli.mem,
         storage: cli.storage,
@@ -1087,8 +1097,6 @@ fn run_from_cache(
         force_extract: false,
         info: false,
         debug,
-        allow_ip: Vec::new(),
-        outbound_localhost_only: false,
     };
 
     let exit_code = execute_command(&mut client, manifest, &args, &mounts)?;
@@ -1317,7 +1325,7 @@ fn daemon_start(mode: &PackedMode, cli: &PackedCli) -> smolvm::Result<()> {
     let mounts = parse_mounts(&cli.volume)?;
     let port_mappings: Vec<(u16, u16)> = cli.port.iter().map(|p| (p.host, p.guest)).collect();
 
-    let mut allow_cidrs = cli.allow_ip.clone();
+    let mut allow_cidrs = cli.allow_cidr.clone();
     if cli.outbound_localhost_only {
         allow_cidrs.push("127.0.0.0/8".to_string());
         allow_cidrs.push("::1/128".to_string());
@@ -1329,7 +1337,11 @@ fn daemon_start(mode: &PackedMode, cli: &PackedCli) -> smolvm::Result<()> {
         network: cli.net || !cli.port.is_empty() || !allow_cidrs.is_empty(),
         storage_gb: cli.storage,
         overlay_gb: cli.overlay,
-        allow_cidrs,
+        allowed_cidrs: if allow_cidrs.is_empty() {
+            None
+        } else {
+            Some(allow_cidrs)
+        },
     };
 
     let packed_mounts = mounts_to_packed(&mounts);

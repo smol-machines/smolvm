@@ -180,7 +180,7 @@ pub struct CreateVmParams {
     pub workdir: Option<String>,
     pub storage_gb: Option<u64>,
     pub overlay_gb: Option<u64>,
-    pub allow_cidrs: Vec<String>,
+    pub allowed_cidrs: Option<Vec<String>>,
 }
 
 /// Maximum length for VM/sandbox names.
@@ -292,7 +292,7 @@ pub fn create_vm(kind: VmKind, params: CreateVmParams) -> smolvm::Result<()> {
     record.workdir = params.workdir.clone();
     record.storage_gb = params.storage_gb;
     record.overlay_gb = params.overlay_gb;
-    record.allow_cidrs = params.allow_cidrs.clone();
+    record.allowed_cidrs = params.allowed_cidrs.clone();
 
     // Store in config (persisted immediately to database)
     config.insert_vm(params.name.clone(), record)?;
@@ -464,6 +464,7 @@ pub fn persist_default_running(
                 r.init = o.init.clone();
                 r.env = o.env.clone();
                 r.workdir = o.workdir.clone();
+                r.allowed_cidrs = o.allowed_cidrs.clone();
             }
         })
         .is_none()
@@ -484,6 +485,7 @@ pub struct DefaultVmOverrides {
     pub init: Vec<String>,
     pub env: Vec<(String, String)>,
     pub workdir: Option<String>,
+    pub allowed_cidrs: Option<Vec<String>>,
 }
 
 /// Start the default VM/sandbox.

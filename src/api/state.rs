@@ -190,6 +190,7 @@ impl ApiState {
                 network: Some(record.network),
                 storage_gb: record.storage_gb,
                 overlay_gb: record.overlay_gb,
+                allowed_cidrs: record.allowed_cidrs.clone(),
             };
 
             // Create AgentManager and try to reconnect
@@ -436,6 +437,7 @@ impl ApiState {
         );
         record.storage_gb = reg.resources.storage_gb;
         record.overlay_gb = reg.resources.overlay_gb;
+        record.allowed_cidrs = reg.resources.allowed_cidrs.clone();
 
         // Use insert_vm_if_not_exists for atomic database insert
         match self.db.insert_vm_if_not_exists(&name, &record) {
@@ -702,7 +704,7 @@ pub fn resource_spec_to_vm_resources(spec: &ResourceSpec, network: bool) -> VmRe
         network,
         storage_gb: spec.storage_gb,
         overlay_gb: spec.overlay_gb,
-        allow_cidrs: Vec::new(),
+        allowed_cidrs: spec.allowed_cidrs.clone(),
     }
 }
 
@@ -714,6 +716,7 @@ pub fn vm_resources_to_spec(res: VmResources) -> ResourceSpec {
         network: Some(res.network),
         storage_gb: res.storage_gb,
         overlay_gb: res.overlay_gb,
+        allowed_cidrs: res.allowed_cidrs,
     }
 }
 
@@ -774,6 +777,7 @@ mod tests {
             network: None,
             storage_gb: None,
             overlay_gb: None,
+            allowed_cidrs: None,
         };
         let res = resource_spec_to_vm_resources(&spec, false);
         assert_eq!(res.cpus, crate::agent::DEFAULT_CPUS);

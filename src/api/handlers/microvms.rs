@@ -159,6 +159,7 @@ pub async fn create_microvm(
     let mut record = VmRecord::new(name.clone(), cpus, mem, mounts, ports, req.network);
     record.storage_gb = req.storage_gb;
     record.overlay_gb = req.overlay_gb;
+    record.allowed_cidrs = req.allowed_cidrs.clone();
 
     // Use atomic insert to detect conflicts
     let db = state.db();

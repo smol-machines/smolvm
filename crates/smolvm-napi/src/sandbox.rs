@@ -130,7 +130,7 @@ impl NapiSandbox {
         let manager = self.manager.clone();
         let mounts = self.mounts.clone();
         let ports = self.ports.clone();
-        let resources = self.resources;
+        let resources = self.resources.clone();
 
         tokio::task::spawn_blocking(move || {
             manager

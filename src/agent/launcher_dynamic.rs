@@ -284,7 +284,11 @@ pub fn launch_agent_vm_dynamic(
         free_ctx_on_err!("krun_disable_implicit_vsock failed");
     }
 
-    let has_egress_policy = !config.resources.allow_cidrs.is_empty();
+    let has_egress_policy = config
+        .resources
+        .allowed_cidrs
+        .as_ref()
+        .map_or(false, |c| !c.is_empty());
     if config.resources.network || !config.port_mappings.is_empty() || has_egress_policy {
         // SAFETY: ctx is valid, KRUN_TSI_HIJACK_INET is a valid flag
         if unsafe { (krun.add_vsock)(ctx, KRUN_TSI_HIJACK_INET) } < 0 {
@@ -310,26 +314,35 @@ pub fn launch_agent_vm_dynamic(
         }
 
         // Set egress policy if CIDRs are specified
-        if has_egress_policy {
-            let set_egress = krun.set_egress_policy.ok_or(
-                "libkrun does not support egress policy (krun_set_egress_policy not found). \
-                 Update libkrun or remove --allow-ip flags."
-                    .to_string(),
-            )?;
+        if let Some(ref cidrs) = config.resources.allowed_cidrs {
+            if !cidrs.is_empty() {
+                let set_egress = krun.set_egress_policy.ok_or_else(|| {
+                    "libkrun does not support egress policy (krun_set_egress_policy not found). \
+                     Update libkrun or remove --allow-cidr flags."
+                        .to_string()
+                })?;
 
-            let cidr_cstrings: Vec<CString> = config
-                .resources
-                .allow_cidrs
-                .iter()
-                .map(|c| CString::new(c.as_str()).expect("CIDR cannot contain null bytes"))
-                .collect();
-            let mut cidr_ptrs: Vec<*const libc::c_char> =
-                cidr_cstrings.iter().map(|s| s.as_ptr()).collect();
-            cidr_ptrs.push(std::ptr::null());
+                // Auto-include DNS server so DNS resolution doesn't silently break
+                let dns_ip = "1.1.1.1";
+                let mut all_cidrs = cidrs.clone();
+                if !all_cidrs.iter().any(|c| {
+                    c == dns_ip || c == &format!("{}/32", dns_ip) || c.ends_with("/0")
+                }) {
+                    all_cidrs.push(format!("{}/32", dns_ip));
+                }
 
-            // SAFETY: ctx is valid, cidr_ptrs is a null-terminated array of valid C strings
-            if unsafe { (set_egress)(ctx, cidr_ptrs.as_ptr()) } < 0 {
-                free_ctx_on_err!("krun_set_egress_policy failed");
+                let cidr_cstrings: Vec<CString> = all_cidrs
+                    .iter()
+                    .map(|c| CString::new(c.as_str()).expect("CIDR cannot contain null bytes"))
+                    .collect();
+                let mut cidr_ptrs: Vec<*const libc::c_char> =
+                    cidr_cstrings.iter().map(|s| s.as_ptr()).collect();
+                cidr_ptrs.push(std::ptr::null());
+
+                // SAFETY: ctx is valid, cidr_ptrs is a null-terminated array of valid C strings
+                if unsafe { (set_egress)(ctx, cidr_ptrs.as_ptr()) } < 0 {
+                    free_ctx_on_err!("krun_set_egress_policy failed");
+                }
             }
         }
     } else {

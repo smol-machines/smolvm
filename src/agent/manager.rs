@@ -861,11 +861,11 @@ impl AgentManager {
         let overlay_size_gb = resources
             .overlay_gb
             .unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GB);
+        let resources_for_config = resources.clone();
 
         // Fork child process using the safe abstraction.
         // The child becomes a session leader (detached from parent's session)
         // so the VM survives if the parent process is killed.
-        let resources_for_save = resources.clone();
         let child_pid = match process::fork_session_leader(move || {
             // Inherited file descriptors (including database locks) are closed
             // by fork_session_leader before this closure runs.
@@ -952,7 +952,7 @@ impl AgentManager {
 
         // Write running config while child boots (overlaps with VM startup).
         // This is needed for future CLI invocations to detect config changes.
-        self.save_running_config(&mounts_for_config, &ports_for_config, &resources_for_save);
+        self.save_running_config(&mounts_for_config, &ports_for_config, &resources_for_config);
 
         // Write PID file so future CLI invocations can find this process.
         // Include start time on second line for PID reuse detection.

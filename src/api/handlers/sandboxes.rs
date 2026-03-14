@@ -88,6 +88,7 @@ pub async fn create_sandbox(
         network: None,
         storage_gb: None,
         overlay_gb: None,
+        allowed_cidrs: None,
     });
 
     // Get network setting from resources (default to false)

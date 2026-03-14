@@ -207,7 +207,7 @@ impl PackCreateCmd {
                 network: true,
                 storage_gb: None,
                 overlay_gb: None,
-                allow_cidrs: Vec::new(),
+                allowed_cidrs: None,
             },
         )?;
         let mut guard = PackVmGuard {
@@ -352,12 +352,6 @@ impl PackCreateCmd {
     /// Collect base assets shared by both image and VM packing modes:
     /// runtime libraries, agent rootfs, and a pre-formatted storage template.
     fn collect_base_assets(&self, collector: &mut AssetCollector) -> smolvm::Result<()> {
-        println!("Collecting runtime libraries...");
-        let lib_dir = self.find_lib_dir()?;
-        collector
-            .collect_libraries(&lib_dir)
-            .map_err(|e| Error::agent("collect libraries", e.to_string()))?;
-
         println!("Collecting agent rootfs...");
         let rootfs_dir = self.find_rootfs_dir()?;
         collector

@@ -47,6 +47,8 @@ pub struct Smolfile {
     pub allow_ip: Vec<String>,
     pub storage: Option<u64>,
     pub overlay: Option<u64>,
+    #[serde(default)]
+    pub allowed_cidrs: Vec<String>,
 }
 
 /// Load and parse a Smolfile from the given path.
@@ -77,8 +79,10 @@ pub fn build_create_params(
     smolfile_path: Option<PathBuf>,
     cli_storage_gb: Option<u64>,
     cli_overlay_gb: Option<u64>,
-    cli_allow_cidrs: Vec<String>,
+    cli_allow_cidr: Vec<String>,
 ) -> smolvm::Result<CreateVmParams> {
+    let cidrs_to_option = |v: Vec<String>| if v.is_empty() { None } else { Some(v) };
+
     let sf = match smolfile_path {
         Some(path) => load(&path)?,
         None => {
@@ -94,7 +98,7 @@ pub fn build_create_params(
                 workdir: cli_workdir,
                 storage_gb: cli_storage_gb,
                 overlay_gb: cli_overlay_gb,
-                allow_cidrs: cli_allow_cidrs,
+                allowed_cidrs: cidrs_to_option(cli_allow_cidr),
             });
         }
     };
@@ -152,11 +156,27 @@ pub fn build_create_params(
         .map(|s| parse_cidr(s))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| smolvm::Error::config("smolfile allow_ip", e))?;
-    allow_cidrs.extend(cli_allow_cidrs);
+    allow_cidrs.extend(cli_allow_cidr.clone());
 
     // Scalars: CLI overrides Smolfile
     let storage_gb = cli_storage_gb.or(sf.storage);
     let overlay_gb = cli_overlay_gb.or(sf.overlay);
+
+    // Merge allowed_cidrs: Smolfile first (validated), CLI extends (already validated by clap)
+    let mut allowed_cidrs_vec: Vec<String> = sf
+        .allowed_cidrs
+        .iter()
+        .map(|s| parse_cidr(s))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| smolvm::Error::config("smolfile allowed_cidrs", e))?;
+    allowed_cidrs_vec.extend(cli_allow_cidr);
+    // --allow-cidr implies --net
+    let net = if !allowed_cidrs_vec.is_empty() {
+        true
+    } else {
+        net
+    };
+    let allowed_cidrs = cidrs_to_option(allowed_cidrs_vec);
 
     Ok(CreateVmParams {
         name,
@@ -170,6 +190,106 @@ pub fn build_create_params(
         workdir,
         storage_gb,
         overlay_gb,
-        allow_cidrs,
+        allowed_cidrs,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::parsers::parse_cidr;
+
+    #[test]
+    fn test_parse_cidr_validation() {
+        // Valid CIDRs
+        assert_eq!(parse_cidr("10.0.0.0/8").unwrap(), "10.0.0.0/8");
+        assert_eq!(parse_cidr("1.1.1.1").unwrap(), "1.1.1.1/32"); // auto /32
+        assert_eq!(parse_cidr("::1").unwrap(), "::1/128"); // auto /128
+        assert_eq!(parse_cidr("0.0.0.0/0").unwrap(), "0.0.0.0/0");
+
+        // Invalid CIDRs
+        assert!(parse_cidr("not-an-ip").is_err());
+        assert!(parse_cidr("10.0.0.0/33").is_err()); // prefix too large
+        assert!(parse_cidr("10.0.0.0/abc").is_err());
+    }
+
+    #[test]
+    fn test_smolfile_invalid_cidr_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Smolfile");
+        std::fs::write(&path, r#"allowed_cidrs = ["not-a-cidr"]"#).unwrap();
+
+        let result = build_create_params(
+            "test".to_string(), 1, 512, vec![], vec![], false,
+            vec![], vec![], None, Some(path), None, None, vec![],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_smolfile_allowed_cidrs_implies_net() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Smolfile");
+        std::fs::write(
+            &path,
+            r#"allowed_cidrs = ["10.0.0.0/8"]"#,
+        )
+        .unwrap();
+
+        let params = build_create_params(
+            "test".to_string(),
+            1,
+            512,
+            vec![],
+            vec![],
+            false, // net=false on CLI
+            vec![],
+            vec![],
+            None,
+            Some(path),
+            None,
+            None,
+            vec![],
+        )
+        .unwrap();
+
+        assert!(params.net); // Should be true because allowed_cidrs implies --net
+        assert_eq!(
+            params.allowed_cidrs,
+            Some(vec!["10.0.0.0/8".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_smolfile_cidrs_merge_with_cli() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Smolfile");
+        std::fs::write(
+            &path,
+            r#"allowed_cidrs = ["10.0.0.0/8"]"#,
+        )
+        .unwrap();
+
+        let params = build_create_params(
+            "test".to_string(),
+            1,
+            512,
+            vec![],
+            vec![],
+            false,
+            vec![],
+            vec![],
+            None,
+            Some(path),
+            None,
+            None,
+            vec!["192.168.0.0/16".to_string()], // CLI extends Smolfile
+        )
+        .unwrap();
+
+        let cidrs = params.allowed_cidrs.unwrap();
+        assert_eq!(cidrs.len(), 2);
+        assert!(cidrs.contains(&"10.0.0.0/8".to_string()));
+        assert!(cidrs.contains(&"192.168.0.0/16".to_string()));
+    }
 }

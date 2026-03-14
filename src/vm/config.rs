@@ -173,6 +173,9 @@ pub enum NetworkPolicy {
     Egress {
         /// Custom DNS server (default: inherit from host).
         dns: Option<IpAddr>,
+        /// If set, only these CIDR ranges are reachable. Omit for unrestricted.
+        #[serde(default)]
+        allowed_cidrs: Option<Vec<String>>,
     },
 }
 
@@ -527,7 +530,7 @@ mod tests {
             .id(VmId::new("my-vm"))
             .memory(1024)
             .cpus(2)
-            .network(NetworkPolicy::Egress { dns: None })
+            .network(NetworkPolicy::Egress { dns: None, allowed_cidrs: None })
             .mount(HostMount::new("/host", "/guest"))
             .command(vec!["/bin/sh".to_string()])
             .workdir("/app")
@@ -552,9 +555,23 @@ mod tests {
 
         let egress = NetworkPolicy::Egress {
             dns: Some("8.8.8.8".parse().unwrap()),
+            allowed_cidrs: None,
         };
         let json = serde_json::to_string(&egress).unwrap();
         assert!(json.contains("egress"));
         assert!(json.contains("8.8.8.8"));
+    }
+
+    #[test]
+    fn test_network_policy_backwards_compat_deserialization() {
+        // Old JSON without allowed_cidrs should deserialize fine (defaults to None)
+        let json = r#"{"type":"egress","dns":"1.1.1.1"}"#;
+        let policy: NetworkPolicy = serde_json::from_str(json).unwrap();
+        if let NetworkPolicy::Egress { dns, allowed_cidrs } = &policy {
+            assert_eq!(dns.unwrap().to_string(), "1.1.1.1");
+            assert!(allowed_cidrs.is_none());
+        } else {
+            panic!("expected Egress variant");
+        }
     }
 }

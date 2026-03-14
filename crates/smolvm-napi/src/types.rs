@@ -143,6 +143,7 @@ impl VmResourcesConfig {
             network: self.network.unwrap_or(false),
             storage_gb: self.storage_gb.map(|g| g as u64),
             overlay_gb: self.overlay_gb.map(|g| g as u64),
+            allowed_cidrs: None,
         }
     }
 }

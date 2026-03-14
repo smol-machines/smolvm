@@ -67,8 +67,9 @@ pub struct VmResources {
     pub storage_gb: Option<u64>,
     /// Overlay disk size in GiB (None = default 10 GiB).
     pub overlay_gb: Option<u64>,
-    /// Allowed egress CIDRs. Empty = no policy (allow all when network=true).
-    pub allow_cidrs: Vec<String>,
+    /// Allowed egress CIDR ranges. None = unrestricted, Some([]) = deny all.
+    #[serde(default)]
+    pub allowed_cidrs: Option<Vec<String>>,
 }
 
 impl Default for VmResources {
@@ -79,7 +80,7 @@ impl Default for VmResources {
             network: false,
             storage_gb: None,
             overlay_gb: None,
-            allow_cidrs: Vec::new(),
+            allowed_cidrs: None,
         }
     }
 }
