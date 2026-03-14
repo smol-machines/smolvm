@@ -288,7 +288,7 @@ pub fn launch_agent_vm_dynamic(
         .resources
         .allowed_cidrs
         .as_ref()
-        .map_or(false, |c| !c.is_empty());
+        .is_some_and(|c| !c.is_empty());
     if config.resources.network || !config.port_mappings.is_empty() || has_egress_policy {
         // SAFETY: ctx is valid, KRUN_TSI_HIJACK_INET is a valid flag
         if unsafe { (krun.add_vsock)(ctx, KRUN_TSI_HIJACK_INET) } < 0 {
@@ -325,9 +325,10 @@ pub fn launch_agent_vm_dynamic(
                 // Auto-include DNS server so DNS resolution doesn't silently break
                 let dns_ip = "1.1.1.1";
                 let mut all_cidrs = cidrs.clone();
-                if !all_cidrs.iter().any(|c| {
-                    c == dns_ip || c == &format!("{}/32", dns_ip) || c.ends_with("/0")
-                }) {
+                if !all_cidrs
+                    .iter()
+                    .any(|c| c == dns_ip || c == &format!("{}/32", dns_ip) || c.ends_with("/0"))
+                {
                     all_cidrs.push(format!("{}/32", dns_ip));
                 }
 

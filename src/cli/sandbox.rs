@@ -384,10 +384,7 @@ impl RunCmd {
             }
         }
 
-        let has_egress_policy = params
-            .allowed_cidrs
-            .as_ref()
-            .map_or(false, |c| !c.is_empty());
+        let has_egress_policy = params.allowed_cidrs.as_ref().is_some_and(|c| !c.is_empty());
 
         let resources = VmResources {
             cpus: params.cpus,

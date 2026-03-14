@@ -28,12 +28,20 @@ mod tests {
         assert!(get_dns_server(&NetworkPolicy::None).is_none());
 
         // Egress with default DNS
-        let dns = get_dns_server(&NetworkPolicy::Egress { dns: None, allowed_cidrs: None }).unwrap();
+        let dns = get_dns_server(&NetworkPolicy::Egress {
+            dns: None,
+            allowed_cidrs: None,
+        })
+        .unwrap();
         assert_eq!(dns.to_string(), DEFAULT_DNS);
 
         // Egress with custom DNS
         let custom: IpAddr = "8.8.8.8".parse().unwrap();
-        let dns = get_dns_server(&NetworkPolicy::Egress { dns: Some(custom), allowed_cidrs: None }).unwrap();
+        let dns = get_dns_server(&NetworkPolicy::Egress {
+            dns: Some(custom),
+            allowed_cidrs: None,
+        })
+        .unwrap();
         assert_eq!(dns.to_string(), "8.8.8.8");
     }
 }

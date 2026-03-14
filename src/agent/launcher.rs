@@ -230,7 +230,7 @@ pub fn launch_agent_vm(
         let has_egress_policy = resources
             .allowed_cidrs
             .as_ref()
-            .map_or(false, |c| !c.is_empty());
+            .is_some_and(|c| !c.is_empty());
         if resources.network || !port_mappings.is_empty() || has_egress_policy {
             // Add vsock with TSI HIJACK_INET flag to enable network access
             if krun_add_vsock(ctx, KRUN_TSI_HIJACK_INET) < 0 {
@@ -542,7 +542,10 @@ mod tests {
         assert!(cidrs_contain_ip(&["1.1.1.1/32".into()], "1.1.1.1"));
         assert!(cidrs_contain_ip(&["0.0.0.0/0".into()], "8.8.8.8"));
         assert!(!cidrs_contain_ip(&["10.0.0.0/8".into()], "1.1.1.1"));
-        assert!(cidrs_contain_ip(&["10.0.0.0/8".into(), "1.1.1.1/32".into()], "1.1.1.1"));
+        assert!(cidrs_contain_ip(
+            &["10.0.0.0/8".into(), "1.1.1.1/32".into()],
+            "1.1.1.1"
+        ));
         assert!(!cidrs_contain_ip(&[], "1.1.1.1"));
     }
 
@@ -564,10 +567,7 @@ mod tests {
 
     #[test]
     fn test_cidrs_dns_not_duplicated_when_already_present() {
-        let cidrs = vec![
-            "10.0.0.0/8".to_string(),
-            "1.1.1.1/32".to_string(),
-        ];
+        let cidrs = vec!["10.0.0.0/8".to_string(), "1.1.1.1/32".to_string()];
         let dns_ip = "1.1.1.1";
 
         let mut all_cidrs = cidrs.clone();

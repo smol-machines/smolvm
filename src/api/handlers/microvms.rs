@@ -31,11 +31,12 @@ use crate::api::error::ApiError;
 use crate::api::state::ApiState;
 use crate::api::types::{
     ApiErrorResponse, CreateMicrovmRequest, DeleteResponse, EnvVar, ExecResponse,
-    ListMicrovmsResponse, MicrovmExecRequest, MicrovmInfo,
+    ListMicrovmsResponse, MicrovmExecRequest, MicrovmInfo, ResizeMicrovmRequest,
 };
 use crate::api::validation::{validate_command, validate_resource_name};
 use crate::config::{RecordState, VmRecord};
 use crate::mount::MountBinding;
+use crate::storage::expand_disk;
 
 /// Maximum microvm name length.
 ///
@@ -64,6 +65,8 @@ fn record_to_info(name: &str, record: &VmRecord) -> MicrovmInfo {
         mounts: record.mounts.len(),
         ports: record.ports.len(),
         network: record.network,
+        storage_gb: record.storage_gb,
+        overlay_gb: record.overlay_gb,
         created_at: record.created_at.clone(),
     }
 }
@@ -500,9 +503,129 @@ pub async fn exec_microvm(
     result.map(Json).map_err(ApiError::from)
 }
 
+/// Resize a microvm's disk resources.
+#[utoipa::path(
+    post,
+    path = "/api/v1/microvms/{name}/resize",
+    tag = "MicroVMs",
+    params(
+        ("name" = String, Path, description = "MicroVM name")
+    ),
+    request_body = ResizeMicrovmRequest,
+    responses(
+        (status = 200, description = "MicroVM resized", body = MicrovmInfo),
+        (status = 400, description = "Invalid request", body = ApiErrorResponse),
+        (status = 404, description = "MicroVM not found", body = ApiErrorResponse),
+        (status = 409, description = "MicroVM is running", body = ApiErrorResponse),
+        (status = 500, description = "Resize failed", body = ApiErrorResponse)
+    )
+)]
+pub async fn resize_microvm(
+    State(state): State<Arc<ApiState>>,
+    Path(name): Path<String>,
+    Json(req): Json<ResizeMicrovmRequest>,
+) -> Result<Json<MicrovmInfo>, ApiError> {
+    let db = state.db();
+
+    // Get VM record from database
+    let record = db
+        .get_vm(&name)
+        .map_err(ApiError::database)?
+        .ok_or_else(|| ApiError::NotFound(format!("microvm '{}' not found", name)))?
+        .clone();
+
+    // Check state - VM must be stopped (Created state also allowed for never-started VMs)
+    let actual_state = record.actual_state();
+    match actual_state {
+        RecordState::Stopped | RecordState::Created => {} // OK to resize
+        _ => {
+            return Err(ApiError::Conflict(format!(
+                "microvm '{}' must be stopped before resizing. Current state: {:?}",
+                name, actual_state
+            )));
+        }
+    }
+
+    // Get current disk sizes (use defaults if not set)
+    let current_storage_gb = record
+        .storage_gb
+        .unwrap_or(crate::storage::DEFAULT_STORAGE_SIZE_GIB);
+    let current_overlay_gb = record
+        .overlay_gb
+        .unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GIB);
+
+    // Validate resize parameters (no shrinking)
+    let new_storage_gb = req.storage_gb.unwrap_or(current_storage_gb);
+    let new_overlay_gb = req.overlay_gb.unwrap_or(current_overlay_gb);
+
+    if new_storage_gb < current_storage_gb {
+        return Err(ApiError::BadRequest(format!(
+            "storageGb cannot be smaller than current size ({} GiB)",
+            current_storage_gb
+        )));
+    }
+    if new_overlay_gb < current_overlay_gb {
+        return Err(ApiError::BadRequest(format!(
+            "overlayGb cannot be smaller than current size ({} GiB)",
+            current_overlay_gb
+        )));
+    }
+
+    // Check if any resize is actually requested
+    if req.storage_gb.is_none() && req.overlay_gb.is_none() {
+        return Err(ApiError::BadRequest(
+            "at least one of storageGb or overlayGb must be specified. Example: {\"storageGb\": 50}".into(),
+        ));
+    }
+
+    // Expand disk files if sizes changed
+    let manager = crate::agent::AgentManager::for_vm(&name)
+        .map_err(|e| ApiError::internal(format!("failed to get agent manager: {}", e)))?;
+
+    // Expand storage disk if requested and changed
+    if let Some(storage_gb) = req.storage_gb {
+        if storage_gb > current_storage_gb {
+            let storage_path = manager.storage_path();
+            expand_disk(storage_path, storage_gb, "storage")
+                .map_err(|e| ApiError::internal(format!("failed to expand storage disk: {}", e)))?;
+        }
+    }
+
+    // Expand overlay disk if requested and changed
+    if let Some(overlay_gb) = req.overlay_gb {
+        if overlay_gb > current_overlay_gb {
+            let overlay_path = manager.overlay_path();
+            expand_disk(overlay_path, overlay_gb, "overlay")
+                .map_err(|e| ApiError::internal(format!("failed to expand overlay disk: {}", e)))?;
+        }
+    }
+
+    // Update database record with new sizes
+    let record = db
+        .update_vm(&name, |r| {
+            if let Some(s) = req.storage_gb {
+                r.storage_gb = Some(s);
+            }
+            if let Some(o) = req.overlay_gb {
+                r.overlay_gb = Some(o);
+            }
+        })
+        .map_err(ApiError::database)?
+        .ok_or_else(|| {
+            ApiError::NotFound(format!(
+                "microvm '{}' disappeared from database during resize",
+                name
+            ))
+        })?;
+
+    Ok(Json(record_to_info(&name, &record)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::SmolvmDb;
+    use tempfile::TempDir;
 
     #[test]
     fn test_record_to_info() {
@@ -572,5 +695,140 @@ mod tests {
 
         assert_eq!(info.name, "network-vm");
         assert!(info.network);
+    }
+
+    /// Helper to create a test database and API state.
+    fn setup_test_state() -> (TempDir, Arc<ApiState>) {
+        let dir = TempDir::new().expect("failed to create temp dir");
+        let db_path = dir.path().join("test.redb");
+        let db = SmolvmDb::open_at(&db_path).expect("failed to open test db");
+        let state = Arc::new(ApiState::with_db(db));
+        (dir, state)
+    }
+
+    /// Helper to create a VM record in the database.
+    fn create_test_vm(db: &SmolvmDb, name: &str, storage_gb: Option<u64>, overlay_gb: Option<u64>) {
+        let mut record = VmRecord::new(name.to_string(), 1, 512, vec![], vec![], false);
+        record.storage_gb = storage_gb;
+        record.overlay_gb = overlay_gb;
+        db.insert_vm(name, &record)
+            .expect("failed to insert test vm");
+    }
+
+    #[tokio::test]
+    async fn test_resize_validation_shrink_storage_rejected() {
+        let (_dir, state) = setup_test_state();
+        let db = state.db();
+
+        // Create a VM with 20GB storage
+        create_test_vm(db, "test-vm", Some(20), Some(5));
+
+        // Try to shrink storage to 10GB
+        let req = ResizeMicrovmRequest {
+            storage_gb: Some(10),
+            overlay_gb: None,
+        };
+
+        let result = resize_microvm(State(state), Path("test-vm".to_string()), Json(req)).await;
+
+        assert!(result.is_err(), "Expected error when shrinking storage");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ApiError::BadRequest(_)),
+            "Expected BadRequest, got: {:?}",
+            err
+        );
+        let err_msg = format!("{:?}", err);
+        assert!(
+            err_msg.contains("storageGb cannot be smaller"),
+            "Error message should mention storageGb: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resize_validation_shrink_overlay_rejected() {
+        let (_dir, state) = setup_test_state();
+        let db = state.db();
+
+        // Create a VM with 10GB overlay
+        create_test_vm(db, "test-vm", Some(20), Some(10));
+
+        // Try to shrink overlay to 5GB
+        let req = ResizeMicrovmRequest {
+            storage_gb: None,
+            overlay_gb: Some(5),
+        };
+
+        let result = resize_microvm(State(state), Path("test-vm".to_string()), Json(req)).await;
+
+        assert!(result.is_err(), "Expected error when shrinking overlay");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ApiError::BadRequest(_)),
+            "Expected BadRequest, got: {:?}",
+            err
+        );
+        let err_msg = format!("{:?}", err);
+        assert!(
+            err_msg.contains("overlayGb cannot be smaller"),
+            "Error message should mention overlayGb: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resize_validation_no_params_rejected() {
+        let (_dir, state) = setup_test_state();
+        let db = state.db();
+
+        // Create a VM
+        create_test_vm(db, "test-vm", Some(20), Some(5));
+
+        // Try to resize with no parameters
+        let req = ResizeMicrovmRequest {
+            storage_gb: None,
+            overlay_gb: None,
+        };
+
+        let result = resize_microvm(State(state), Path("test-vm".to_string()), Json(req)).await;
+
+        assert!(
+            result.is_err(),
+            "Expected error when no resize params provided"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ApiError::BadRequest(_)),
+            "Expected BadRequest, got: {:?}",
+            err
+        );
+        let err_msg = format!("{:?}", err);
+        assert!(
+            err_msg.contains("at least one of storageGb or overlayGb must be specified"),
+            "Error message should mention required params: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resize_not_found() {
+        let (_dir, state) = setup_test_state();
+
+        // Try to resize non-existent VM
+        let req = ResizeMicrovmRequest {
+            storage_gb: Some(30),
+            overlay_gb: None,
+        };
+
+        let result = resize_microvm(State(state), Path("nonexistent".to_string()), Json(req)).await;
+
+        assert!(result.is_err(), "Expected error for non-existent VM");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ApiError::NotFound(_)),
+            "Expected NotFound, got: {:?}",
+            err
+        );
     }
 }

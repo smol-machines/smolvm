@@ -314,8 +314,8 @@ impl AgentManager {
     ) -> Result<Self> {
         let name = name.into();
         let rootfs_path = Self::default_rootfs_path()?;
-        let sg = storage_gb.unwrap_or(crate::storage::DEFAULT_STORAGE_SIZE_GB);
-        let og = overlay_gb.unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GB);
+        let sg = storage_gb.unwrap_or(crate::storage::DEFAULT_STORAGE_SIZE_GIB);
+        let og = overlay_gb.unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GIB);
 
         // Named VMs get their own storage disk
         let storage_dir = vm_data_dir(&name);
@@ -406,6 +406,16 @@ impl AgentManager {
     /// Get the console log path.
     pub fn console_log(&self) -> Option<&Path> {
         self.console_log.as_deref()
+    }
+
+    /// Get the storage disk path.
+    pub fn storage_path(&self) -> &Path {
+        self.storage_disk.path()
+    }
+
+    /// Get the overlay disk path.
+    pub fn overlay_path(&self) -> &Path {
+        self.overlay_disk.path()
     }
 
     /// Check if an agent is already running (socket exists + responds to ping).
@@ -857,10 +867,10 @@ impl AgentManager {
         let console_log = self.console_log.clone();
         let storage_size_gb = resources
             .storage_gb
-            .unwrap_or(crate::storage::DEFAULT_STORAGE_SIZE_GB);
+            .unwrap_or(crate::storage::DEFAULT_STORAGE_SIZE_GIB);
         let overlay_size_gb = resources
             .overlay_gb
-            .unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GB);
+            .unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GIB);
         let resources_for_config = resources.clone();
 
         // Fork child process using the safe abstraction.

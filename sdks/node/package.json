@@ -1,12 +1,15 @@
 {
   "name": "smolvm-embedded-node-workspace",
   "private": true,
+  "scripts": {
+    "build:platform": "./scripts/build-platform-package.sh",
+    "build:public": "npm run --workspace smolvm-embedded build:ts",
+    "build": "./scripts/build-current-platform.sh",
+    "test": "npm run build:platform && npm run --workspace smolvm-embedded test",
+    "smoke": "./scripts/smoke-install.sh"
+  },
   "workspaces": [
-    "smolvm-embedded",
-    "smolvm-embedded-darwin-arm64",
-    "smolvm-embedded-darwin-x64",
-    "smolvm-embedded-linux-arm64-gnu",
-    "smolvm-embedded-linux-x64-gnu"
+    "smolvm-embedded"
   ],
   "devDependencies": {
     "@napi-rs/cli": "^2.18.0",

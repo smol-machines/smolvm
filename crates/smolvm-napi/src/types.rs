@@ -58,7 +58,7 @@ pub struct VmResourcesConfig {
     pub network: Option<bool>,
     /// Storage disk size in GiB (default: 20).
     pub storage_gb: Option<f64>,
-    /// Overlay disk size in GiB (default: 2).
+    /// Overlay disk size in GiB (default: 10).
     pub overlay_gb: Option<f64>,
 }
 

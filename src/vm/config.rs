@@ -530,7 +530,10 @@ mod tests {
             .id(VmId::new("my-vm"))
             .memory(1024)
             .cpus(2)
-            .network(NetworkPolicy::Egress { dns: None, allowed_cidrs: None })
+            .network(NetworkPolicy::Egress {
+                dns: None,
+                allowed_cidrs: None,
+            })
             .mount(HostMount::new("/host", "/guest"))
             .command(vec!["/bin/sh".to_string()])
             .workdir("/app")

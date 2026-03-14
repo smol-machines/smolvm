@@ -220,8 +220,19 @@ mod tests {
         std::fs::write(&path, r#"allowed_cidrs = ["not-a-cidr"]"#).unwrap();
 
         let result = build_create_params(
-            "test".to_string(), 1, 512, vec![], vec![], false,
-            vec![], vec![], None, Some(path), None, None, vec![],
+            "test".to_string(),
+            1,
+            512,
+            vec![],
+            vec![],
+            false,
+            vec![],
+            vec![],
+            None,
+            Some(path),
+            None,
+            None,
+            vec![],
         );
         assert!(result.is_err());
     }
@@ -230,11 +241,7 @@ mod tests {
     fn test_smolfile_allowed_cidrs_implies_net() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("Smolfile");
-        std::fs::write(
-            &path,
-            r#"allowed_cidrs = ["10.0.0.0/8"]"#,
-        )
-        .unwrap();
+        std::fs::write(&path, r#"allowed_cidrs = ["10.0.0.0/8"]"#).unwrap();
 
         let params = build_create_params(
             "test".to_string(),
@@ -254,21 +261,14 @@ mod tests {
         .unwrap();
 
         assert!(params.net); // Should be true because allowed_cidrs implies --net
-        assert_eq!(
-            params.allowed_cidrs,
-            Some(vec!["10.0.0.0/8".to_string()])
-        );
+        assert_eq!(params.allowed_cidrs, Some(vec!["10.0.0.0/8".to_string()]));
     }
 
     #[test]
     fn test_smolfile_cidrs_merge_with_cli() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("Smolfile");
-        std::fs::write(
-            &path,
-            r#"allowed_cidrs = ["10.0.0.0/8"]"#,
-        )
-        .unwrap();
+        std::fs::write(&path, r#"allowed_cidrs = ["10.0.0.0/8"]"#).unwrap();
 
         let params = build_create_params(
             "test".to_string(),

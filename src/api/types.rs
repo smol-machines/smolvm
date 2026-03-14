@@ -100,9 +100,9 @@ pub struct ResourceSpec {
     #[serde(default)]
     #[schema(example = 20)]
     pub storage_gb: Option<u64>,
-    /// Overlay disk size in GiB (default: 2).
+    /// Overlay disk size in GiB (default: 10).
     #[serde(default)]
-    #[schema(example = 2)]
+    #[schema(example = 10)]
     pub overlay_gb: Option<u64>,
     /// Allowed egress CIDR ranges. When set, only these IP ranges are reachable.
     /// Omit for unrestricted egress. Empty list denies all egress.
@@ -485,7 +485,7 @@ pub struct CreateMicrovmRequest {
     /// Storage disk size in GiB (default: 20).
     #[serde(default)]
     pub storage_gb: Option<u64>,
-    /// Overlay disk size in GiB (default: 2).
+    /// Overlay disk size in GiB (default: 10).
     #[serde(default)]
     pub overlay_gb: Option<u64>,
     /// Allowed egress CIDR ranges.
@@ -538,6 +538,14 @@ pub struct MicrovmInfo {
     pub ports: usize,
     /// Whether outbound network access is enabled.
     pub network: bool,
+    /// Storage disk size in GiB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 20)]
+    pub storage_gb: Option<u64>,
+    /// Overlay disk size in GiB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 2)]
+    pub overlay_gb: Option<u64>,
     /// Creation timestamp.
     pub created_at: String,
 }
@@ -571,4 +579,22 @@ pub struct StopResponse {
     /// Identifier of stopped resource.
     #[schema(example = "abc123")]
     pub stopped: String,
+}
+
+// ============================================================================
+// Resize Types
+// ============================================================================
+
+/// Request to resize a microvm's disk resources.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ResizeMicrovmRequest {
+    /// Storage disk size in GiB (expand only, optional).
+    #[serde(default)]
+    #[schema(example = 50)]
+    pub storage_gb: Option<u64>,
+    /// Overlay disk size in GiB (expand only, optional).
+    #[serde(default)]
+    #[schema(example = 20)]
+    pub overlay_gb: Option<u64>,
 }
