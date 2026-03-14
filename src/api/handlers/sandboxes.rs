@@ -85,7 +85,7 @@ pub async fn create_sandbox(
     let resources = req.resources.clone().unwrap_or(ResourceSpec {
         cpus: None,
         memory_mb: None,
-        network: None,
+        network: Some(true), // network is enabled for sandbox by default
         storage_gb: None,
         overlay_gb: None,
     });

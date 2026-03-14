@@ -171,7 +171,7 @@ impl LibkrunVm {
             let ctx = ctx as u32;
 
             // Set VM resources
-            if krun_set_vm_config(ctx, config.resources.cpus, config.resources.memory_mib) < 0 {
+            if krun_set_vm_config(ctx, config.cpus, config.memory_mib) < 0 {
                 krun_free_ctx(ctx);
                 return Err(Error::vm_creation("failed to set VM config"));
             }

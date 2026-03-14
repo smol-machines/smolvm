@@ -96,7 +96,7 @@ pub use error::{Error, Result};
 pub use mount::MountBinding;
 pub use process::ChildProcess;
 pub use registry::{RegistryAuth, RegistryConfig};
-pub use vm::config::{HostMount, NetworkPolicy, Resources, RootfsSource, Timeouts, VmConfig, VmId};
+pub use vm::config::{HostMount, NetworkPolicy, RootfsSource, Timeouts, VmConfig, VmId};
 pub use vm::state::{ExitReason, VmState};
 pub use vm::{default_backend, VmBackend, VmHandle};
 

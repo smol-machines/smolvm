@@ -12,8 +12,8 @@ pub mod state;
 
 use crate::error::Result;
 pub use config::{
-    DiskConfig, DiskFormat, HostMount, NetworkPolicy, Resources, RootfsSource, Timeouts, VmConfig,
-    VmId, VsockPort,
+    DiskConfig, DiskFormat, HostMount, NetworkPolicy, RootfsSource, Timeouts, VmConfig, VmId,
+    VsockPort,
 };
 pub use state::{ExitReason, VmState};
 
