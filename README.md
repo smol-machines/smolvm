@@ -129,23 +129,103 @@ smolvm microvm exec --name codex-sandbox -it -- codex
 - Docker (for cross-compiling the agent)
 - e2fsprogs (for storage template creation; `mkfs.ext4`)
 - LLVM (macOS only, for building libkrun: `brew install llvm`)
+- [cargo-make](https://github.com/sagiegurari/cargo-make): `cargo install cargo-make`
+
+### Quick Start (Local Development)
+
+We use [`cargo-make`](https://github.com/sagiegurari/cargo-make) to orchestrate build tasks:
 
 ```bash
-# build
-./scripts/build-dist.sh
+# Install cargo-make (one-time)
+cargo install cargo-make
 
-# build using local libkrun changes from ../libkrun
+# View all available tasks
+cargo make --list-all-steps
+
+# Build and codesign (macOS) - binary ready at ./target/release/smolvm
+cargo make dev
+
+# Run smolvm with environment variables set up automatically
+cargo make smolvm --version
+cargo make smolvm sandbox run --net alpine:latest -- echo hello
+cargo make smolvm microvm ls
+
+# Or run the binary directly with environment variables:
+DYLD_LIBRARY_PATH="./lib" SMOLVM_AGENT_ROOTFS="./target/agent-rootfs" ./target/release/smolvm <command>
+```
+
+**How it works:**
+- `cargo make dev` → builds + codesigns (macOS only), binary ready at `./target/release/smolvm`
+- `cargo make smolvm <args>` → runs smolvm with `DYLD_LIBRARY_PATH` and `SMOLVM_AGENT_ROOTFS` set up
+- On macOS, binary is automatically signed with hypervisor entitlements
+
+### Building Distribution Packages
+
+```bash
+# Build distribution package
+cargo make dist
+
+# Build using local libkrun changes from ../libkrun
 ./scripts/build-dist.sh --with-local-libkrun
+```
 
-# local lib bundle staging path used by --with-local-libkrun
-# (libkrun artifacts are copied here and used for linking/packaging)
-# target/local-lib-bundle/libkrun.dylib
-# target/local-lib-bundle/libkrun.1.dylib
-# target/local-lib-bundle/libkrunfw.5.dylib
-# Note: tracked files under ./lib/ are not modified by this mode.
+### Running Tests
 
-# run tests
-./tests/run_all.sh
+```bash
+# Run all tests
+cargo make test
+
+# Run specific test suites
+cargo make test-cli        # CLI tests only
+cargo make test-sandbox    # Sandbox tests only
+cargo make test-microvm    # MicroVM tests only
+cargo make test-pack       # Pack tests only
+cargo make test-lib        # Unit tests (no VM required)
+```
+
+### Agent Rootfs Development
+
+The agent rootfs resolution order is:
+1. `SMOLVM_AGENT_ROOTFS` env var (explicit override)
+2. `./target/agent-rootfs` (local development)
+3. Platform data directory (`~/.local/share/smolvm/` on Linux, `~/Library/Application Support/smolvm/` on macOS)
+
+```bash
+# Build agent for Linux (size-optimized)
+cargo make build-agent
+
+# Build agent rootfs
+cargo make agent-rootfs
+
+# Rebuild agent and update rootfs
+cargo make agent-rebuild
+```
+
+### Code Quality
+
+```bash
+# Run clippy and fmt checks
+cargo make lint
+
+# Auto-fix linting issues
+cargo make fix-lints
+```
+
+### Other Useful Tasks
+
+```bash
+# Install locally from dist package
+cargo make install
+```
+
+### Distribution Scripts
+
+The `cargo make dist` task wraps `scripts/build-dist.sh`. Other scripts you can run directly:
+
+```bash
+./scripts/build-dist.sh
+./scripts/build-agent-rootfs.sh
+./scripts/install-local.sh
 ```
 
 ### troubleshooting tests

@@ -1,0 +1,241 @@
+# cargo-make configuration for smolvm
+# https://github.com/sagiegurari/cargo-make
+#
+# Usage:
+#   cargo make dev              # Build and codesign (macOS)
+#   cargo make smolvm <args>    # Run with env vars configured for local resources
+#   cargo make dist             # Build distribution package
+#   cargo make test             # Run all tests
+#   cargo make lint             # Clippy + fmt checks
+
+[config]
+min_version = "0.37.0"
+default_to_workspace = false
+skip_core_tasks = true
+
+# =============================================================================
+# Development Tasks
+# =============================================================================
+
+[tasks.dev]
+description = "Build and codesign dev binary (macOS auto-signs)"
+category = "Development"
+script_runner = "bash"
+script = [
+'''
+cargo build --release
+if [ "$(uname -s)" = "Darwin" ]; then
+  codesign --force --sign - --entitlements smolvm.entitlements ./target/release/smolvm
+  echo "✓ Codesigned ./target/release/smolvm"
+else
+  echo "✓ Linux: no codesigning needed"
+fi
+echo ""
+echo "Binary ready! Run it with:"
+echo "  cargo make smolvm --version"
+echo "  cargo make smolvm sandbox run --net alpine:latest -- echo hello"
+'''
+]
+
+[tasks.ensure-binary-signed]
+description = "Ensure binary is built and signed (macOS)"
+category = "Development"
+script_runner = "bash"
+script = [
+'''
+if [ ! -f ./target/release/smolvm ]; then
+  echo "Binary not found, building..."
+  cargo build --release
+fi
+if [ "$(uname -s)" = "Darwin" ]; then
+  codesign --force --sign - --entitlements smolvm.entitlements ./target/release/smolvm 2>/dev/null || true
+fi
+'''
+]
+
+[tasks.smolvm]
+description = "Run smolvm with environment variables set up"
+category = "Development"
+dependencies = ["ensure-binary-signed"]
+env = { DYLD_LIBRARY_PATH = "${CARGO_MAKE_WORKING_DIRECTORY}/lib", SMOLVM_AGENT_ROOTFS = "${CARGO_MAKE_WORKING_DIRECTORY}/target/agent-rootfs", SMOLVM_DEV_MODE = "1" }
+script_runner = "bash"
+script = [
+'''
+IFS=';' read -ra ARGS <<< "${CARGO_MAKE_TASK_ARGS}"
+exec ./target/release/smolvm "${ARGS[@]}"
+'''
+]
+
+# =============================================================================
+# Build Tasks
+# =============================================================================
+
+[tasks.build]
+description = "Build release binary"
+category = "Build"
+command = "cargo"
+args = ["build", "--release"]
+
+[tasks.build-agent]
+description = "Build agent for Linux (size-optimized)"
+category = "Build"
+script_runner = "bash"
+script = [
+'''
+if [ "$(uname -s)" = "Linux" ]; then
+  cargo build --profile release-small -p smolvm-agent --target x86_64-unknown-linux-musl
+else
+  docker run --rm -v "$(pwd):/work" -w /work rust:alpine sh -c 'apk add musl-dev && cargo build --profile release-small -p smolvm-agent'
+fi
+'''
+]
+
+# =============================================================================
+# Distribution Tasks
+# =============================================================================
+
+[tasks.dist]
+description = "Build distribution package"
+category = "Distribution"
+script_runner = "bash"
+script = [
+'''
+./scripts/build-dist.sh "$@"
+'''
+]
+
+# =============================================================================
+# Agent Tasks
+# =============================================================================
+
+[tasks.agent-rootfs]
+description = "Build agent rootfs"
+category = "Agent"
+script_runner = "bash"
+script = [
+'''
+./scripts/build-agent-rootfs.sh
+'''
+]
+
+[tasks.agent-rebuild]
+description = "Rebuild agent and update rootfs"
+category = "Agent"
+dependencies = ["build-agent", "agent-rootfs"]
+script_runner = "bash"
+script = [
+'''
+./scripts/rebuild-agent.sh
+'''
+]
+
+# =============================================================================
+# Test Tasks
+# =============================================================================
+
+[tasks.test]
+description = "Run all tests, including cargo tests"
+category = "Test"
+dependencies = ["test-lib"]
+script_runner = "bash"
+script = [
+'''
+./tests/run_all.sh
+'''
+]
+
+[tasks.test-cli]
+description = "Run CLI tests only"
+category = "Test"
+script_runner = "bash"
+script = [
+'''
+./tests/run_all.sh cli
+'''
+]
+
+[tasks.test-sandbox]
+description = "Run sandbox tests only"
+category = "Test"
+script_runner = "bash"
+script = [
+'''
+./tests/run_all.sh sandbox
+'''
+]
+
+[tasks.test-microvm]
+description = "Run microVM tests only"
+category = "Test"
+script_runner = "bash"
+script = [
+'''
+./tests/run_all.sh microvm
+'''
+]
+
+[tasks.test-pack]
+description = "Run pack tests only"
+category = "Test"
+script_runner = "bash"
+script = [
+'''
+./tests/run_all.sh pack
+'''
+]
+
+[tasks.test-lib]
+description = "Run unit tests (no VM required)"
+category = "Test"
+command = "cargo"
+args = ["test", "--lib"]
+
+# =============================================================================
+# Install Tasks
+# =============================================================================
+
+[tasks.install]
+description = "Install locally from dist package"
+category = "Install"
+script_runner = "bash"
+script = [
+'''
+./scripts/install-local.sh
+'''
+]
+
+[tasks.install-homebrew]
+description = "Update Homebrew formula"
+category = "Install"
+script_runner = "bash"
+script = [
+'''
+./scripts/update-formula.sh
+'''
+]
+
+# =============================================================================
+# Code Quality Tasks
+# =============================================================================
+
+[tasks.lint]
+description = "Run clippy and fmt checks"
+category = "Quality"
+script_runner = "bash"
+script = [
+'''
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+'''
+]
+
+[tasks.fix-lints]
+description = "Auto-fix linting issues"
+category = "Quality"
+script_runner = "bash"
+script = [
+'''
+cargo fmt --all
+cargo clippy --all-targets --fix --allow-dirty
+'''
+]

@@ -1,0 +1,14 @@
+# Cargo configuration for smolvm development
+# https://doc.rust-lang.org/cargo/reference/config.html
+
+[env]
+# Tell build.rs where to find libkrun for linking
+LIBKRUN_BUNDLE = { value = "lib", relative = true }
+
+[target.aarch64-apple-darwin]
+# Add rpath to find libkrun.dylib in project's ./lib directory
+# Binary is at target/release/smolvm, lib is at project_root/lib/
+rustflags = [
+    "-C", "link-arg=-Wl,-rpath,@loader_path/../../lib",
+    "-C", "link-arg=-Wl,-rpath,@executable_path/../../lib",
+]
