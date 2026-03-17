@@ -58,40 +58,6 @@ impl AsRef<str> for VmId {
     }
 }
 
-/// VM resource limits (aligned with DESIGN.md defaults).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Resources {
-    /// Memory in MiB (default: 512).
-    pub memory_mib: u32,
-
-    /// Number of vCPUs (default: 1).
-    pub cpus: u8,
-
-    /// Disk size in MiB for writable overlay (default: 10240 = 10GB).
-    pub disk_size_mib: u64,
-}
-
-impl Default for Resources {
-    fn default() -> Self {
-        Self {
-            memory_mib: 512,
-            cpus: 1,
-            disk_size_mib: 10240,
-        }
-    }
-}
-
-impl Resources {
-    /// Create resources with specified memory and CPUs.
-    pub fn new(memory_mib: u32, cpus: u8) -> Self {
-        Self {
-            memory_mib,
-            cpus,
-            ..Default::default()
-        }
-    }
-}
-
 /// Timeout configuration (aligned with DESIGN.md defaults).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Timeouts {
@@ -322,8 +288,11 @@ pub struct VmConfig {
     /// Root filesystem source.
     pub rootfs: RootfsSource,
 
-    /// Resource limits.
-    pub resources: Resources,
+    /// Memory in MiB (default: 512).
+    pub memory_mib: u32,
+
+    /// Number of vCPUs (default: 1).
+    pub cpus: u8,
 
     /// Timeouts.
     pub timeouts: Timeouts,
@@ -376,7 +345,8 @@ impl VmConfigBuilder {
             config: VmConfig {
                 id: VmId::generate(),
                 rootfs,
-                resources: Resources::default(),
+                memory_mib: 512,
+                cpus: 1,
                 timeouts: Timeouts::default(),
                 network: NetworkPolicy::default(),
                 mounts: Vec::new(),
@@ -399,19 +369,13 @@ impl VmConfigBuilder {
 
     /// Set the memory in MiB.
     pub fn memory(mut self, mib: u32) -> Self {
-        self.config.resources.memory_mib = mib;
+        self.config.memory_mib = mib;
         self
     }
 
     /// Set the number of CPUs.
     pub fn cpus(mut self, cpus: u8) -> Self {
-        self.config.resources.cpus = cpus;
-        self
-    }
-
-    /// Set the disk size in MiB.
-    pub fn disk_size(mut self, mib: u64) -> Self {
-        self.config.resources.disk_size_mib = mib;
+        self.config.cpus = cpus;
         self
     }
 
@@ -535,8 +499,8 @@ mod tests {
             .build();
 
         assert_eq!(config.id.as_str(), "my-vm");
-        assert_eq!(config.resources.memory_mib, 1024);
-        assert_eq!(config.resources.cpus, 2);
+        assert_eq!(config.memory_mib, 1024);
+        assert_eq!(config.cpus, 2);
         assert!(matches!(config.network, NetworkPolicy::Egress { .. }));
         assert_eq!(config.mounts.len(), 1);
         assert_eq!(config.command, Some(vec!["/bin/sh".to_string()]));
