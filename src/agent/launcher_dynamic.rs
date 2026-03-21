@@ -252,7 +252,8 @@ pub fn launch_agent_vm_dynamic(
 
     // Set VM config
     // SAFETY: ctx is valid, cpus and mem are primitive values
-    if unsafe { (krun.set_vm_config)(ctx, config.resources.cpus, config.resources.mem) } < 0 {
+    if unsafe { (krun.set_vm_config)(ctx, config.resources.cpus, config.resources.memory_mib) } < 0
+    {
         free_ctx_on_err!("krun_set_vm_config failed");
     }
 

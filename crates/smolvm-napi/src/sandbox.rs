@@ -8,7 +8,8 @@ use std::sync::{Arc, Mutex};
 
 use napi_derive::napi;
 
-use smolvm::agent::{AgentClient, AgentManager, HostMount, PortMapping, VmResources};
+use smolvm::agent::{AgentClient, AgentManager, HostMount, VmResources};
+use smolvm::data::network::PortMapping;
 
 use crate::error::IntoNapiResult;
 use crate::types::*;
@@ -57,8 +58,8 @@ impl NapiSandbox {
 
         let manager = AgentManager::for_vm_with_sizes(
             &config.name,
-            resources.storage_gb,
-            resources.overlay_gb,
+            resources.storage_gib,
+            resources.overlay_gib,
         )
         .into_napi()?;
 

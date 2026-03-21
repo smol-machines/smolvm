@@ -8,12 +8,14 @@
 //!
 //! Both paths converge on the same VM launch infrastructure.
 
-use crate::cli::parsers::{mounts_to_virtiofs_bindings, parse_env_spec, parse_mounts, parse_port};
+use crate::cli::parsers::{mounts_to_virtiofs_bindings, parse_env_spec};
 use clap::{Args, Parser, Subcommand};
 use smolvm::agent::launcher_dynamic::{
     launch_agent_vm_dynamic, KrunFunctions, PackedLaunchConfig, PackedMount,
 };
-use smolvm::agent::{mount_tag, AgentClient, PortMapping, RunConfig, VmResources};
+use smolvm::agent::{mount_tag, AgentClient, RunConfig, VmResources};
+use smolvm::data::network::PortMapping;
+use smolvm::data::storage::HostMount;
 use smolvm::Error;
 use smolvm::DEFAULT_SHELL_CMD;
 use smolvm_pack::detect::PackedMode;
@@ -29,7 +31,7 @@ use std::time::Duration;
 const AGENT_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Convert parsed mounts to PackedMount format for the VM launcher.
-fn mounts_to_packed(mounts: &[smolvm::vm::config::HostMount]) -> Vec<PackedMount> {
+fn mounts_to_packed(mounts: &[smolvm::data::storage::HostMount]) -> Vec<PackedMount> {
     mounts
         .iter()
         .enumerate()
@@ -108,7 +110,7 @@ pub struct PackRunCmd {
     #[arg(
         short = 'p',
         long = "port",
-        value_parser = parse_port,
+        value_parser = PortMapping::parse,
         value_name = "HOST:GUEST",
         help_heading = "Network"
     )]
@@ -266,15 +268,15 @@ impl PackRunCmd {
         )?;
 
         // 7. Parse CLI args
-        let mounts = parse_mounts(&self.volume)?;
+        let mounts = HostMount::parse_many(&self.volume)?;
         let port_mappings: Vec<(u16, u16)> = self.port.iter().map(|p| (p.host, p.guest)).collect();
 
         let resources = VmResources {
             cpus: self.cpus.unwrap_or(manifest.cpus),
-            mem: self.mem.unwrap_or(manifest.mem),
+            memory_mib: self.mem.unwrap_or(manifest.mem),
             network: self.net || !self.port.is_empty(),
-            storage_gb: self.storage,
-            overlay_gb: self.overlay,
+            storage_gib: self.storage,
+            overlay_gib: self.overlay,
         };
 
         // Build packed mounts for the launcher
@@ -287,7 +289,7 @@ impl PackRunCmd {
             eprintln!("debug: vsock={}", vsock_path.display());
             eprintln!(
                 "debug: resources cpus={} mem={} net={}",
-                resources.cpus, resources.mem, resources.network
+                resources.cpus, resources.memory_mib, resources.network
             );
         }
 
@@ -599,7 +601,7 @@ fn execute_command(
     client: &mut AgentClient,
     manifest: &smolvm_pack::PackManifest,
     args: &PackRunCmd,
-    mounts: &[smolvm::vm::config::HostMount],
+    mounts: &[smolvm::data::storage::HostMount],
 ) -> smolvm::Result<i32> {
     let command = build_command(manifest, &args.command);
     let env = build_env(manifest, &args.env);
@@ -727,7 +729,7 @@ struct PackedCli {
     overlay: Option<u64>,
 
     /// Expose port from container to host
-    #[arg(short = 'p', long = "port", value_parser = parse_port, value_name = "HOST:GUEST", global = true)]
+    #[arg(short = 'p', long = "port", value_parser = PortMapping::parse, value_name = "HOST:GUEST", global = true)]
     port: Vec<PortMapping>,
 
     /// Enable outbound network access
@@ -951,15 +953,15 @@ fn run_from_cache(
         cli.overlay,
     )?;
 
-    let mounts = parse_mounts(&cli.volume)?;
+    let mounts = HostMount::parse_many(&cli.volume)?;
     let port_mappings: Vec<(u16, u16)> = cli.port.iter().map(|p| (p.host, p.guest)).collect();
 
     let resources = VmResources {
         cpus: cli.cpus.unwrap_or(manifest.cpus),
-        mem: cli.mem.unwrap_or(manifest.mem),
+        memory_mib: cli.mem.unwrap_or(manifest.mem),
         network: cli.net || !cli.port.is_empty(),
-        storage_gb: cli.storage,
-        overlay_gb: cli.overlay,
+        storage_gib: cli.storage,
+        overlay_gib: cli.overlay,
     };
 
     let packed_mounts = mounts_to_packed(&mounts);
@@ -1278,15 +1280,15 @@ fn daemon_start(mode: &PackedMode, cli: &PackedCli) -> smolvm::Result<()> {
     let vsock_path = daemon.join("agent.sock");
 
     // Parse CLI args
-    let mounts = parse_mounts(&cli.volume)?;
+    let mounts = HostMount::parse_many(&cli.volume)?;
     let port_mappings: Vec<(u16, u16)> = cli.port.iter().map(|p| (p.host, p.guest)).collect();
 
     let resources = VmResources {
         cpus: cli.cpus.unwrap_or(manifest.cpus),
-        mem: cli.mem.unwrap_or(manifest.mem),
+        memory_mib: cli.mem.unwrap_or(manifest.mem),
         network: cli.net || !cli.port.is_empty(),
-        storage_gb: cli.storage,
-        overlay_gb: cli.overlay,
+        storage_gib: cli.storage,
+        overlay_gib: cli.overlay,
     };
 
     let packed_mounts = mounts_to_packed(&mounts);
@@ -1304,7 +1306,7 @@ fn daemon_start(mode: &PackedMode, cli: &PackedCli) -> smolvm::Result<()> {
         eprintln!("debug: vsock={}", vsock_path.display());
         eprintln!(
             "debug: resources cpus={} mem={} net={}",
-            resources.cpus, resources.mem, resources.network
+            resources.cpus, resources.memory_mib, resources.network
         );
     }
 
@@ -1436,7 +1438,7 @@ fn daemon_exec(
         }
         PackMode::Container => {
             // Parse mounts
-            let mounts = parse_mounts(&cli.volume)?;
+            let mounts = HostMount::parse_many(&cli.volume)?;
             let mount_bindings = mounts_to_virtiofs_bindings(&mounts);
 
             if interactive || tty {

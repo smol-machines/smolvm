@@ -7,8 +7,10 @@
 
 use crate::cli::parsers::parse_mounts_as_tuples;
 use crate::cli::{format_pid_suffix, truncate};
-use smolvm::agent::{vm_data_dir, AgentManager, PortMapping};
+use smolvm::agent::{vm_data_dir, AgentManager};
 use smolvm::config::{RecordState, SmolvmConfig, VmRecord};
+use smolvm::data::network::PortMapping;
+use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
 use smolvm::db::SmolvmDb;
 use smolvm::storage::{DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
 
@@ -435,8 +437,8 @@ pub fn persist_default_running(
     if config.get_vm("default").is_none() {
         let record = VmRecord::new(
             "default".to_string(),
-            smolvm::config::DEFAULT_VM_CPUS,
-            smolvm::config::DEFAULT_VM_MEMORY_MIB,
+            DEFAULT_MICROVM_CPU_COUNT,
+            DEFAULT_MICROVM_MEMORY_MIB,
             vec![],
             vec![],
             false,

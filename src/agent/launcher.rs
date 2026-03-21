@@ -4,11 +4,11 @@
 //! All setup is done in the child process after fork, where
 //! DYLD_LIBRARY_PATH is still available for dlopen.
 
-use crate::consts::ENV_SMOLVM_LIB_DIR;
+use crate::data::consts::{ENV_SMOLVM_KRUN_LOG_LEVEL, ENV_SMOLVM_LIB_DIR};
+use crate::data::storage::HostMount;
 use crate::error::{Error, Result};
 use crate::storage::{OverlayDisk, StorageDisk};
 use crate::util::libkrunfw_filename;
-use crate::vm::config::HostMount;
 
 use smolvm_protocol::ports;
 use std::ffi::{CStr, CString};
@@ -163,7 +163,7 @@ pub fn launch_agent_vm(
     unsafe {
         // Set log level (0 = off, 1 = error, 2 = warn, 3 = info, 4 = debug)
         // Enable debug logging to trace vsock timing issues
-        let log_level = std::env::var("SMOLVM_KRUN_LOG_LEVEL")
+        let log_level = std::env::var(ENV_SMOLVM_KRUN_LOG_LEVEL)
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
@@ -177,7 +177,7 @@ pub fn launch_agent_vm(
         let ctx = ctx as u32;
 
         // Set VM config
-        if krun_set_vm_config(ctx, resources.cpus, resources.mem) < 0 {
+        if krun_set_vm_config(ctx, resources.cpus, resources.memory_mib) < 0 {
             krun_free_ctx(ctx);
             return Err(Error::agent("configure vm", "krun_set_vm_config failed"));
         }

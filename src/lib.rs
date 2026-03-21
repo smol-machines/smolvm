@@ -64,9 +64,9 @@
 pub mod agent;
 pub mod api;
 pub mod config;
-pub mod consts;
+/// Canonical shared data models and constants used across adapters.
+pub mod data;
 pub mod db;
-pub mod error;
 pub mod log_rotation;
 pub mod mount;
 pub mod network;
@@ -76,6 +76,15 @@ pub mod registry;
 pub mod storage;
 pub mod util;
 pub mod vm;
+
+/// Compatibility re-exports for smolvm error types.
+///
+/// The canonical error model lives under [`crate::data::error`]. This module
+/// remains as a stable facade for existing `crate::error` and `smolvm::error`
+/// imports.
+pub mod error {
+    pub use crate::data::error::{AgentErrorKind, Error, Result};
+}
 
 // ============================================================================
 // Default Command Constants
@@ -91,12 +100,14 @@ pub const DEFAULT_IDLE_CMD: &[&str] = &["sleep", "infinity"];
 pub use agent::{AgentClient, AgentManager};
 pub use api::ApiDoc;
 pub use config::{RecordState, RestartConfig, RestartPolicy, SmolvmConfig, VmRecord};
+pub use data::resources::VmResources;
+pub use data::storage::HostMount;
 pub use db::SmolvmDb;
 pub use error::{Error, Result};
 pub use mount::MountBinding;
 pub use process::ChildProcess;
 pub use registry::{RegistryAuth, RegistryConfig};
-pub use vm::config::{HostMount, NetworkPolicy, RootfsSource, Timeouts, VmConfig, VmId};
+pub use vm::config::{NetworkPolicy, RootfsSource, Timeouts, VmConfig, VmId};
 pub use vm::state::{ExitReason, VmState};
 pub use vm::{default_backend, VmBackend, VmHandle};
 

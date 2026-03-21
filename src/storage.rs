@@ -15,19 +15,17 @@
 //! It's mounted inside the agent VM which handles OCI layer extraction
 //! and overlay filesystem management.
 
+use crate::data::consts::BYTES_PER_GIB;
+#[cfg(test)]
+use crate::data::consts::BYTES_PER_MIB;
+pub use crate::data::storage::{
+    DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB, OVERLAY_DISK_FILENAME,
+    STORAGE_DISK_FILENAME,
+};
 use crate::error::{Error, Result};
 use crate::platform::Os;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-
-/// Default size for the shared storage disk (20 GiB sparse).
-pub const DEFAULT_STORAGE_SIZE_GIB: u64 = 20;
-
-/// Storage disk filename.
-pub const STORAGE_DISK_FILENAME: &str = "storage.raw";
-
-/// Bytes per gibibyte (GiB).
-const BYTES_PER_GIB: u64 = 1024 * 1024 * 1024;
 
 /// Common search paths for e2fsprogs tools (mkfs.ext4, e2fsck, resize2fs).
 const E2FSPROGS_PATH_PREFIXES: &[&str] = &[
@@ -74,7 +72,12 @@ fn create_sparse_disk(path: &Path, size_bytes: u64, label: &str) -> Result<()> {
 
     assert!(size_bytes > 0, "disk size must be greater than 0");
 
-    tracing::info!(path = %path.display(), size_gb = size_bytes / (1024*1024*1024), "creating sparse {} disk", label);
+    tracing::info!(
+        path = %path.display(),
+        size_gb = size_bytes / BYTES_PER_GIB,
+        "creating sparse {} disk",
+        label
+    );
 
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
     file.seek(SeekFrom::Start(size_bytes - 1))?;
@@ -560,16 +563,6 @@ impl StorageDisk {
 // Overlay Disk
 // ============================================================================
 
-/// Default size for the rootfs overlay disk (10 GiB sparse).
-///
-/// This is a sparse file — only actually-written data consumes host disk space.
-/// 10 GiB provides headroom for package installation (`apk add`, `pip install`, etc.)
-/// without hitting "No space left on device" during typical development workflows.
-pub const DEFAULT_OVERLAY_SIZE_GIB: u64 = 10;
-
-/// Overlay disk filename.
-pub const OVERLAY_DISK_FILENAME: &str = "overlay.raw";
-
 /// Persistent rootfs overlay disk.
 ///
 /// A sparse ext4 disk image used as the upper layer of an overlayfs
@@ -860,7 +853,7 @@ mod tests {
         let _ = std::fs::remove_file(&disk_path);
 
         // Create a small initial disk (100 MB)
-        let initial_size = 100 * 1024 * 1024;
+        let initial_size = 100 * BYTES_PER_MIB;
         create_sparse_disk(&disk_path, initial_size, "test").unwrap();
 
         // Verify initial size
@@ -872,7 +865,7 @@ mod tests {
 
         // Verify new size
         let metadata = std::fs::metadata(&disk_path).unwrap();
-        assert_eq!(metadata.len(), 200 * 1024 * 1024 * 1024);
+        assert_eq!(metadata.len(), 200 * BYTES_PER_GIB);
 
         // Clean up
         let _ = std::fs::remove_file(&disk_path);
@@ -889,7 +882,7 @@ mod tests {
         let _ = std::fs::remove_file(&disk_path);
 
         // Create a 10 GB disk
-        let initial_size = 10 * 1024 * 1024 * 1024;
+        let initial_size = 10 * BYTES_PER_GIB;
         create_sparse_disk(&disk_path, initial_size, "test").unwrap();
 
         // Try to shrink to 5 GB - should fail
@@ -917,7 +910,7 @@ mod tests {
         let _ = std::fs::remove_file(&disk_path);
 
         // Create a 10 GB disk
-        let initial_size = 10 * 1024 * 1024 * 1024;
+        let initial_size = 10 * BYTES_PER_GIB;
         create_sparse_disk(&disk_path, initial_size, "test").unwrap();
 
         // Try to expand to same size - should fail (must be strictly larger)
