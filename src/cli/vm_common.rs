@@ -173,6 +173,9 @@ pub fn get_or_start_vm(name: &str) -> smolvm::Result<AgentManager> {
 /// Parameters for [`create_vm`].
 pub struct CreateVmParams {
     pub name: String,
+    pub image: Option<String>,
+    pub entrypoint: Vec<String>,
+    pub cmd: Vec<String>,
     pub cpus: u8,
     pub mem: u32,
     pub volume: Vec<String>,
@@ -297,6 +300,9 @@ pub fn create_vm(kind: VmKind, params: CreateVmParams) -> smolvm::Result<()> {
     record.workdir = params.workdir.clone();
     record.storage_gb = params.storage_gb;
     record.overlay_gb = params.overlay_gb;
+    record.image = params.image.clone();
+    record.entrypoint = params.entrypoint.clone();
+    record.cmd = params.cmd.clone();
 
     // Store in config (persisted immediately to database)
     config.insert_vm(params.name.clone(), record)?;
@@ -402,16 +408,74 @@ pub fn start_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
         }
     }
 
-    println!(
-        "{} '{}' running (PID: {})",
-        kind.display_name(),
-        name,
-        pid.unwrap_or(0)
-    );
-    println!(
-        "\nUse 'smolvm container create {} <image>' to run containers",
-        name,
-    );
+    // Auto-create container if image is configured (from Smolfile)
+    if let Some(ref image) = record.image {
+        let mut client = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
+
+        println!("Pulling {}...", image);
+        let image_info = crate::cli::pull_with_progress(&mut client, image, None)?;
+
+        // Build command: record (from Smolfile) > image metadata > idle default
+        let ep = if !record.entrypoint.is_empty() {
+            record.entrypoint.clone()
+        } else {
+            image_info.entrypoint.clone()
+        };
+        let args = if !record.cmd.is_empty() {
+            record.cmd.clone()
+        } else {
+            image_info.cmd.clone()
+        };
+        let mut command = ep;
+        command.extend(args);
+        if command.is_empty() {
+            command = smolvm::DEFAULT_IDLE_CMD
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        }
+
+        let env = record.env.clone();
+        let mount_bindings =
+            crate::cli::parsers::mounts_to_virtiofs_bindings(&record.host_mounts());
+
+        let info =
+            client.create_container(image, command, env, record.workdir.clone(), mount_bindings)?;
+
+        println!(
+            "{} '{}' running (PID: {}, container: {})",
+            kind.display_name(),
+            name,
+            pid.unwrap_or(0),
+            &info.id[..12]
+        );
+    } else {
+        // No image — bare VM mode. Run entrypoint+cmd if configured.
+        let mut bare_cmd = record.entrypoint.clone();
+        bare_cmd.extend(record.cmd.clone());
+        if !bare_cmd.is_empty() {
+            let mut client =
+                smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
+            let env = record.env.clone();
+            let (exit_code, stdout, stderr) =
+                client.vm_exec(bare_cmd, env, record.workdir.clone(), None)?;
+            if !stdout.is_empty() {
+                print!("{}", stdout);
+            }
+            if !stderr.is_empty() {
+                eprint!("{}", stderr);
+            }
+            if exit_code != 0 {
+                eprintln!("workload exited with code {}", exit_code);
+            }
+        }
+        println!(
+            "{} '{}' running (PID: {})",
+            kind.display_name(),
+            name,
+            pid.unwrap_or(0)
+        );
+    }
 
     // Persist running state after output — 1 write cycle (not on critical path)
     let pid_start_time = pid.and_then(smolvm::process::process_start_time);
@@ -468,6 +532,9 @@ pub fn persist_default_running(
                 r.init = o.init.clone();
                 r.env = o.env.clone();
                 r.workdir = o.workdir.clone();
+                r.image = o.image.clone();
+                r.entrypoint = o.entrypoint.clone();
+                r.cmd = o.cmd.clone();
             }
         })
         .is_none()
@@ -488,6 +555,9 @@ pub struct DefaultVmOverrides {
     pub init: Vec<String>,
     pub env: Vec<(String, String)>,
     pub workdir: Option<String>,
+    pub image: Option<String>,
+    pub entrypoint: Vec<String>,
+    pub cmd: Vec<String>,
 }
 
 /// Start the default VM/sandbox.
@@ -753,6 +823,9 @@ pub fn list_vms(kind: VmKind, verbose: bool, json: bool) -> smolvm::Result<()> {
                     "created_at": record.created_at,
                     "storage_gb": record.storage_gb,
                     "overlay_gb": record.overlay_gb,
+                    "image": record.image,
+                    "entrypoint": record.entrypoint,
+                    "cmd": record.cmd,
                 });
                 if kind.include_network_in_json() {
                     obj.as_object_mut()

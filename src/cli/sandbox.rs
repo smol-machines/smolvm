@@ -221,13 +221,17 @@ impl StatusCmd {
 ///   smolvm sandbox run -v ./src:/app node -- npm start
 #[derive(Args, Debug)]
 pub struct RunCmd {
-    /// Container image (e.g., alpine, ubuntu:22.04, ghcr.io/org/image)
-    #[arg(value_name = "IMAGE")]
-    pub image: String,
+    /// Container image (e.g., alpine, ubuntu:22.04). Optional if Smolfile provides image.
+    #[arg(long, short = 'I', value_name = "IMAGE")]
+    pub image: Option<String>,
 
-    /// Command and arguments to run (default: image entrypoint or /bin/sh)
-    #[arg(trailing_var_arg = true, value_name = "COMMAND")]
+    /// Command and arguments to run (after --)
+    #[arg(last = true, value_name = "COMMAND")]
     pub command: Vec<String>,
+
+    /// Override the entrypoint (e.g., --entrypoint /app/server)
+    #[arg(long, value_name = "CMD", help_heading = "Container")]
+    pub entrypoint: Option<String>,
 
     /// Run in background and keep sandbox alive after command exits
     #[arg(short = 'd', long, help_heading = "Execution")]
@@ -330,6 +334,174 @@ pub struct RunCmd {
     pub docker_config: bool,
 }
 
+/// Build the command to execute from entrypoint, cmd, CLI args, and image metadata.
+///
+/// Precedence:
+///   entrypoint: CLI --entrypoint > Smolfile > image metadata
+///   cmd:        CLI trailing args > Smolfile cmd > image metadata cmd
+///   fallback:   DEFAULT_IDLE_CMD (detach) or DEFAULT_SHELL_CMD (interactive)
+fn resolve_command(
+    cli_args: &[String],
+    params_entrypoint: &[String],
+    params_cmd: &[String],
+    image_info: Option<&smolvm_protocol::ImageInfo>,
+    detach: bool,
+) -> Vec<String> {
+    let ep = if !params_entrypoint.is_empty() {
+        params_entrypoint.to_vec()
+    } else if let Some(info) = image_info {
+        info.entrypoint.clone()
+    } else {
+        vec![]
+    };
+
+    let args = if !cli_args.is_empty() {
+        cli_args.to_vec()
+    } else if !params_cmd.is_empty() {
+        params_cmd.to_vec()
+    } else if let Some(info) = image_info {
+        info.cmd.clone()
+    } else {
+        vec![]
+    };
+
+    let mut full = ep;
+    full.extend(args);
+
+    if !full.is_empty() {
+        full
+    } else if detach {
+        DEFAULT_IDLE_CMD.iter().map(|s| s.to_string()).collect()
+    } else {
+        vec![DEFAULT_SHELL_CMD.to_string()]
+    }
+}
+
+/// Persist the "default" sandbox record so `sandbox ls/stop/start` work.
+fn persist_default_sandbox(
+    manager: &AgentManager,
+    params: &crate::cli::vm_common::CreateVmParams,
+    mounts: &[smolvm::vm::config::HostMount],
+) {
+    use smolvm::config::SmolvmConfig;
+    use vm_common::DefaultVmOverrides;
+
+    let mount_tuples: Vec<(String, String, bool)> = mounts
+        .iter()
+        .map(|m| {
+            (
+                m.source.to_string_lossy().to_string(),
+                m.target.to_string_lossy().to_string(),
+                m.read_only,
+            )
+        })
+        .collect();
+    let port_tuples: Vec<(u16, u16)> = params.port.iter().map(|p| (p.host, p.guest)).collect();
+
+    if let Ok(mut config) = SmolvmConfig::load() {
+        vm_common::persist_default_running(
+            &mut config,
+            manager.child_pid(),
+            Some(DefaultVmOverrides {
+                cpus: params.cpus,
+                mem: params.mem,
+                mounts: mount_tuples,
+                ports: port_tuples,
+                network: params.net,
+                storage_gb: params.storage_gb,
+                overlay_gb: params.overlay_gb,
+                init: params.init.clone(),
+                env: parse_env_list(&params.env),
+                workdir: params.workdir.clone(),
+                image: params.image.clone(),
+                entrypoint: params.entrypoint.clone(),
+                cmd: params.cmd.clone(),
+            }),
+        );
+    }
+}
+
+/// Run a command and exit with its exit code, stopping the sandbox on completion.
+/// Parameters for running an ephemeral command in a sandbox.
+struct EphemeralRunParams {
+    image: Option<String>,
+    command: Vec<String>,
+    env: Vec<(String, String)>,
+    workdir: Option<String>,
+    mount_bindings: Vec<(String, String, bool)>,
+    timeout: Option<std::time::Duration>,
+    interactive: bool,
+    tty: bool,
+}
+
+fn run_ephemeral_and_exit(
+    client: &mut AgentClient,
+    manager: AgentManager,
+    params: EphemeralRunParams,
+) -> smolvm::Result<()> {
+    let EphemeralRunParams {
+        image,
+        command,
+        env,
+        workdir,
+        mount_bindings,
+        timeout,
+        interactive,
+        tty,
+    } = params;
+    let exit_code = match image.as_deref() {
+        Some(img) => {
+            if interactive || tty {
+                let config = RunConfig::new(img, command)
+                    .with_env(env)
+                    .with_workdir(workdir)
+                    .with_mounts(mount_bindings)
+                    .with_timeout(timeout)
+                    .with_tty(tty);
+                client.run_interactive(config)?
+            } else {
+                let (exit_code, stdout, stderr) = client.run_with_mounts_and_timeout(
+                    img,
+                    command,
+                    env,
+                    workdir,
+                    mount_bindings,
+                    timeout,
+                )?;
+                if !stdout.is_empty() {
+                    print!("{}", stdout);
+                }
+                if !stderr.is_empty() {
+                    eprint!("{}", stderr);
+                }
+                flush_output();
+                exit_code
+            }
+        }
+        None => {
+            // Bare VM: run directly
+            if interactive || tty {
+                client.vm_exec_interactive(command, env, workdir, timeout, tty)?
+            } else {
+                let (exit_code, stdout, stderr) = client.vm_exec(command, env, workdir, timeout)?;
+                if !stdout.is_empty() {
+                    print!("{}", stdout);
+                }
+                if !stderr.is_empty() {
+                    eprint!("{}", stderr);
+                }
+                flush_output();
+                exit_code
+            }
+        }
+    };
+
+    if let Err(e) = manager.stop() {
+        tracing::warn!(error = %e, "failed to stop sandbox");
+    }
+    std::process::exit(exit_code);
+}
+
 impl RunCmd {
     pub fn run(self) -> smolvm::Result<()> {
         use smolvm::Error;
@@ -337,6 +509,9 @@ impl RunCmd {
         // Merge CLI flags with Smolfile (if provided)
         let params = crate::cli::smolfile::build_create_params(
             "default".to_string(),
+            self.image.clone(),
+            self.entrypoint.clone(),
+            self.command.clone(),
             self.cpus,
             self.mem,
             self.volume,
@@ -349,6 +524,9 @@ impl RunCmd {
             self.storage,
             self.overlay,
         )?;
+
+        // Resolve image: CLI > Smolfile > None (bare Alpine VM)
+        let image = params.image.clone();
 
         // Parse volume mounts
         let mut mounts = HostMount::parse(&params.volume)?;
@@ -402,8 +580,16 @@ impl RunCmd {
         // Connect to agent
         let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
 
-        // Pull image with progress display
-        crate::cli::pull_with_progress(&mut client, &self.image, self.oci_platform.as_deref())?;
+        // If image is specified, pull it and capture image metadata
+        let image_info = if let Some(ref img) = image {
+            Some(crate::cli::pull_with_progress(
+                &mut client,
+                img,
+                self.oci_platform.as_deref(),
+            )?)
+        } else {
+            None
+        };
 
         // Run init commands from Smolfile only on fresh VM start (not when reusing)
         if freshly_started && !params.init.is_empty() {
@@ -418,16 +604,13 @@ impl RunCmd {
             }
         }
 
-        // Build command - for detached mode, default to sleep infinity
-        let command = if self.command.is_empty() {
-            if self.detach {
-                DEFAULT_IDLE_CMD.iter().map(|s| s.to_string()).collect()
-            } else {
-                vec![DEFAULT_SHELL_CMD.to_string()]
-            }
-        } else {
-            self.command.clone()
-        };
+        let command = resolve_command(
+            &self.command,
+            &params.entrypoint,
+            &params.cmd,
+            image_info.as_ref(),
+            self.detach,
+        );
 
         // Parse environment variables
         let env = parse_env_list(&params.env);
@@ -436,103 +619,46 @@ impl RunCmd {
         let mount_bindings = mounts_to_virtiofs_bindings(&mounts);
 
         if self.detach {
-            // Detached/persistent mode: create container and keep running
-            let info = client.create_container(
-                &self.image,
-                command,
-                env,
-                params.workdir.clone(),
-                mount_bindings,
-            )?;
-
-            // Persist "default" record so `sandbox ls` shows this VM
-            {
-                use smolvm::config::SmolvmConfig;
-                use vm_common::DefaultVmOverrides;
-                let mount_tuples: Vec<(String, String, bool)> = mounts
-                    .iter()
-                    .map(|m| {
-                        (
-                            m.source.to_string_lossy().to_string(),
-                            m.target.to_string_lossy().to_string(),
-                            m.read_only,
-                        )
-                    })
-                    .collect();
-                let port_tuples: Vec<(u16, u16)> =
-                    params.port.iter().map(|p| (p.host, p.guest)).collect();
-                if let Ok(mut config) = SmolvmConfig::load() {
-                    vm_common::persist_default_running(
-                        &mut config,
-                        manager.child_pid(),
-                        Some(DefaultVmOverrides {
-                            cpus: params.cpus,
-                            mem: params.mem,
-                            mounts: mount_tuples,
-                            ports: port_tuples,
-                            network: params.net,
-                            storage_gb: params.storage_gb,
-                            overlay_gb: params.overlay_gb,
-                            init: params.init.clone(),
-                            env: parse_env_list(&params.env),
-                            workdir: params.workdir.clone(),
-                        }),
-                    );
-                }
-            }
-
-            println!("Sandbox running (container: {})", &info.id[..12]);
-            println!("\nTo interact with the sandbox:");
-            println!(
-                "  smolvm container exec default {} -- <command>",
-                &info.id[..12]
-            );
-            println!(
-                "  smolvm container exec default {} -it -- /bin/sh",
-                &info.id[..12]
-            );
-            println!("\nTo stop the sandbox:");
-            println!("  smolvm sandbox stop");
-
-            // Keep sandbox running
-            manager.detach();
-            Ok(())
-        } else {
-            // Ephemeral mode: run command and clean up
-            let exit_code = if self.interactive || self.tty {
-                let config = RunConfig::new(&self.image, command)
-                    .with_env(env)
-                    .with_workdir(params.workdir.clone())
-                    .with_mounts(mount_bindings)
-                    .with_timeout(self.timeout)
-                    .with_tty(self.tty);
-                client.run_interactive(config)?
-            } else {
-                let (exit_code, stdout, stderr) = client.run_with_mounts_and_timeout(
-                    &self.image,
+            // Detached mode: start container (if image) and keep running
+            if let Some(ref img) = image {
+                let info = client.create_container(
+                    img,
                     command,
                     env,
                     params.workdir.clone(),
                     mount_bindings,
-                    self.timeout,
                 )?;
-
-                if !stdout.is_empty() {
-                    print!("{}", stdout);
-                }
-                if !stderr.is_empty() {
-                    eprint!("{}", stderr);
-                }
-                flush_output();
-                exit_code
-            };
-
-            // Stop the sandbox (ephemeral mode)
-            if let Err(e) = manager.stop() {
-                tracing::warn!(error = %e, "failed to stop sandbox");
+                println!("Sandbox running (container: {})", &info.id[..12]);
+            } else {
+                println!("Sandbox running (bare Alpine VM)");
             }
 
-            std::process::exit(exit_code);
+            persist_default_sandbox(&manager, &params, &mounts);
+
+            println!("\nTo interact:");
+            println!("  smolvm sandbox exec -- <command>");
+            println!("  smolvm sandbox exec -it -- /bin/sh");
+            println!("\nTo stop:");
+            println!("  smolvm sandbox stop");
+
+            manager.detach();
+            Ok(())
+        } else {
+            // Ephemeral mode: run and clean up
+            run_ephemeral_and_exit(
+                &mut client,
+                manager,
+                EphemeralRunParams {
+                    image,
+                    command,
+                    env,
+                    workdir: params.workdir.clone(),
+                    mount_bindings,
+                    timeout: self.timeout,
+                    interactive: self.interactive,
+                    tty: self.tty,
+                },
+            )
         }
     }
 }
@@ -605,6 +731,9 @@ impl CreateCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let params = crate::cli::smolfile::build_create_params(
             self.name,
+            None,   // image: from Smolfile only
+            None,   // entrypoint: from Smolfile only
+            vec![], // cmd: from Smolfile only
             self.cpus,
             self.mem,
             self.volume,

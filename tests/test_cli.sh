@@ -86,9 +86,9 @@ test_invalid_subcommand() {
     ! $SMOLVM nonexistent-command 2>/dev/null
 }
 
-test_sandbox_run_missing_image() {
-    # Should fail when image is not provided
-    ! $SMOLVM sandbox run 2>/dev/null
+test_sandbox_run_invalid_image() {
+    # Should fail when a nonexistent image is provided
+    ! $SMOLVM sandbox run --image nonexistent-image-99999:v1 -- echo hi 2>/dev/null
 }
 
 # =============================================================================
@@ -139,7 +139,7 @@ run_test "Pack --oci-platform flag" test_pack_platform_flag || true
 run_test "Microvm help" test_microvm_help || true
 run_test "Container help" test_container_help || true
 run_test "Invalid subcommand fails" test_invalid_subcommand || true
-run_test "Sandbox run without image fails" test_sandbox_run_missing_image || true
+run_test "Sandbox run with invalid image fails" test_sandbox_run_invalid_image || true
 run_test "Microvm create --overlay flag" test_microvm_create_overlay_flag || true
 run_test "Microvm create --storage flag" test_microvm_create_storage_flag || true
 run_test "Sandbox create --overlay flag" test_sandbox_create_overlay_flag || true

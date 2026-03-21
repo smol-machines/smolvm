@@ -1,17 +1,24 @@
 # OpenClaw gateway in a hardware-isolated microVM
 #
-# Sandbox (quick, ephemeral):
-#   smolvm sandbox run --net -d -s examples/openclaw-app/openclaw.smolfile alpine/openclaw:main -- openclaw gateway --port 18789 --allow-unconfigured
+# Sandbox:
+#   smolvm sandbox run -d -s examples/openclaw-app/openclaw.smolfile
 #   curl http://localhost:18789/health
 #
-# Microvm + Container (persistent):
+# Microvm:
 #   smolvm microvm create openclaw -s examples/openclaw-app/openclaw.smolfile
 #   smolvm microvm start openclaw
-#   smolvm container create openclaw alpine/openclaw:main -- openclaw gateway --port 18789 --allow-unconfigured
-#   curl http://localhost:18789/health
+
+image = "alpine/openclaw:main"
+entrypoint = ["openclaw"]
+cmd = ["gateway", "--port", "18789", "--allow-unconfigured"]
 
 cpus = 2
 memory = 1024
 net = true
 
+[service]
+listen = 18789
+protocol = "http"
+
+[dev]
 ports = ["18789:18789"]
