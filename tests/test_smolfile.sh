@@ -331,6 +331,328 @@ EOF
 }
 
 # =============================================================================
+# Smolfile v2: image, entrypoint, cmd fields
+# =============================================================================
+
+test_smolfile_image_field() {
+    local vm_name="smolfile-image-$$"
+    cleanup_vm "$vm_name"
+
+    cat > "$SMOLFILE_TMPDIR/Smolfile.image" <<'EOF'
+image = "alpine:latest"
+cpus = 1
+memory = 512
+net = true
+EOF
+
+    # Create + start — image from Smolfile should be picked up
+    $SMOLVM microvm create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.image" 2>&1 || return 1
+
+    # Verify image is persisted in the record
+    local list_output
+    list_output=$($SMOLVM microvm ls --json 2>&1)
+
+    cleanup_vm "$vm_name"
+    [[ "$list_output" == *"alpine:latest"* ]]
+}
+
+test_smolfile_entrypoint_field() {
+    cat > "$SMOLFILE_TMPDIR/Smolfile.ep" <<'EOF'
+entrypoint = ["/bin/echo"]
+cmd = ["hello-from-smolfile"]
+cpus = 1
+memory = 512
+EOF
+
+    # Verify it parses without error
+    local exit_code=0
+    local vm_name="smolfile-ep-$$"
+    cleanup_vm "$vm_name"
+    $SMOLVM microvm create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.ep" 2>&1 || exit_code=$?
+
+    cleanup_vm "$vm_name"
+    [[ $exit_code -eq 0 ]]
+}
+
+test_smolfile_cmd_field() {
+    cat > "$SMOLFILE_TMPDIR/Smolfile.cmd" <<'EOF'
+cmd = ["echo", "hello-from-cmd"]
+cpus = 1
+memory = 512
+EOF
+
+    local exit_code=0
+    local vm_name="smolfile-cmd-$$"
+    cleanup_vm "$vm_name"
+    $SMOLVM microvm create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.cmd" 2>&1 || exit_code=$?
+
+    cleanup_vm "$vm_name"
+    [[ $exit_code -eq 0 ]]
+}
+
+# =============================================================================
+# Smolfile v2: [artifact] and [dev] sections
+# =============================================================================
+
+test_smolfile_artifact_section_parses() {
+    cat > "$SMOLFILE_TMPDIR/Smolfile.artifact" <<'EOF'
+image = "python:3.12-alpine"
+cpus = 2
+memory = 1024
+
+[artifact]
+cpus = 4
+memory = 2048
+entrypoint = ["/app/run.sh"]
+oci_platform = "linux/amd64"
+EOF
+
+    local exit_code=0
+    local vm_name="smolfile-artifact-$$"
+    cleanup_vm "$vm_name"
+    $SMOLVM microvm create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.artifact" 2>&1 || exit_code=$?
+
+    cleanup_vm "$vm_name"
+    [[ $exit_code -eq 0 ]]
+}
+
+test_smolfile_pack_alias_parses() {
+    cat > "$SMOLFILE_TMPDIR/Smolfile.pack" <<'EOF'
+image = "alpine:latest"
+
+[pack]
+cpus = 4
+memory = 2048
+EOF
+
+    local exit_code=0
+    local vm_name="smolfile-pack-$$"
+    cleanup_vm "$vm_name"
+    $SMOLVM microvm create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.pack" 2>&1 || exit_code=$?
+
+    cleanup_vm "$vm_name"
+    [[ $exit_code -eq 0 ]]
+}
+
+test_smolfile_dev_section_parses() {
+    cat > "$SMOLFILE_TMPDIR/Smolfile.dev" <<'EOF'
+image = "node:22-alpine"
+cpus = 2
+memory = 512
+net = true
+
+[dev]
+volumes = ["./src:/app"]
+env = ["NODE_ENV=development"]
+init = ["apk add --no-cache nodejs npm"]
+workdir = "/app"
+ports = ["3000:3000"]
+EOF
+
+    local exit_code=0
+    local vm_name="smolfile-dev-$$"
+    cleanup_vm "$vm_name"
+    $SMOLVM microvm create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.dev" 2>&1 || exit_code=$?
+
+    cleanup_vm "$vm_name"
+    [[ $exit_code -eq 0 ]]
+}
+
+test_smolfile_dev_init_used_for_microvm() {
+    local vm_name="smolfile-devinit-$$"
+    cleanup_vm "$vm_name"
+
+    cat > "$SMOLFILE_TMPDIR/Smolfile.devinit" <<'EOF'
+cpus = 1
+memory = 512
+
+[dev]
+init = [
+    "echo 'dev-init-ran' > /tmp/dev-marker.txt",
+]
+EOF
+
+    $SMOLVM microvm create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.devinit" 2>&1 || return 1
+    $SMOLVM microvm start "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
+
+    local output
+    output=$($SMOLVM microvm exec --name "$vm_name" -- cat /tmp/dev-marker.txt 2>&1)
+
+    cleanup_vm "$vm_name"
+    [[ "$output" == *"dev-init-ran"* ]]
+}
+
+# =============================================================================
+# Smolfile v2: [service], [health], [restart], [deploy] parse without error
+# =============================================================================
+
+test_smolfile_full_spec_parses() {
+    cat > "$SMOLFILE_TMPDIR/Smolfile.full" <<'EOF'
+image = "ghcr.io/acme/api:1.2.3"
+entrypoint = ["/app/api"]
+cmd = ["serve"]
+workdir = "/app"
+env = ["PORT=8080"]
+cpus = 2
+memory = 1024
+net = true
+
+[service]
+listen = 8080
+protocol = "http"
+
+[health]
+exec = ["curl", "-f", "http://127.0.0.1:8080/health"]
+interval = "10s"
+timeout = "2s"
+retries = 3
+startup_grace = "20s"
+
+[restart]
+policy = "always"
+max_retries = 5
+
+[dev]
+volumes = ["./src:/app"]
+env = ["APP_MODE=development"]
+init = ["cargo build"]
+ports = ["8080:8080"]
+
+[artifact]
+cpus = 4
+memory = 2048
+entrypoint = ["/app/api"]
+oci_platform = "linux/amd64"
+
+[deploy]
+replicas = 3
+min_ready_seconds = 5
+strategy = "rolling"
+max_unavailable = 1
+max_surge = 1
+EOF
+
+    local exit_code=0
+    local vm_name="smolfile-full-$$"
+    cleanup_vm "$vm_name"
+    $SMOLVM microvm create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.full" 2>&1 || exit_code=$?
+
+    cleanup_vm "$vm_name"
+    [[ $exit_code -eq 0 ]]
+}
+
+test_smolfile_bare_vm_no_image() {
+    # Bare Alpine VM with [dev].init + entrypoint/cmd — no image needed
+    cat > "$SMOLFILE_TMPDIR/Smolfile.bare" <<'EOF'
+entrypoint = ["cat"]
+cmd = ["/tmp/bare.txt"]
+cpus = 1
+memory = 512
+
+[dev]
+init = [
+    "echo 'bare-vm-works' > /tmp/bare.txt",
+]
+EOF
+
+    local output
+    output=$($SMOLVM sandbox run -s "$SMOLFILE_TMPDIR/Smolfile.bare" 2>&1)
+
+    [[ "$output" == *"bare-vm-works"* ]]
+}
+
+test_smolfile_entrypoint_used_at_runtime() {
+    # Verify entrypoint + cmd from Smolfile are combined and used
+    cat > "$SMOLFILE_TMPDIR/Smolfile.ep_runtime" <<'EOF'
+entrypoint = ["echo"]
+cmd = ["hello-from-entrypoint"]
+cpus = 1
+memory = 512
+EOF
+
+    local output
+    output=$($SMOLVM sandbox run -s "$SMOLFILE_TMPDIR/Smolfile.ep_runtime" 2>&1)
+
+    [[ "$output" == *"hello-from-entrypoint"* ]]
+}
+
+test_smolfile_auto_container_on_start() {
+    local vm_name="smolfile-autoct-$$"
+    cleanup_vm "$vm_name"
+
+    cat > "$SMOLFILE_TMPDIR/Smolfile.autoct" <<'EOF'
+image = "alpine:latest"
+cmd = ["echo", "auto-container-works"]
+cpus = 1
+memory = 512
+net = true
+EOF
+
+    $SMOLVM microvm create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.autoct" 2>&1 || return 1
+
+    # Start should auto-pull image and create container
+    local start_output
+    start_output=$($SMOLVM microvm start "$vm_name" 2>&1)
+
+    cleanup_vm "$vm_name"
+
+    # Should mention container creation
+    [[ "$start_output" == *"container:"* ]] || [[ "$start_output" == *"Pulling"* ]]
+}
+
+test_smolfile_image_cmd_only_overrides_when_set() {
+    # When Smolfile has image but no entrypoint/cmd, the image's own
+    # entrypoint/cmd should be used (empty command vec to agent).
+    # When Smolfile sets cmd, it should override the image default.
+    cat > "$SMOLFILE_TMPDIR/Smolfile.cmdonly" <<'EOF'
+image = "alpine:latest"
+cmd = ["echo", "smolfile-cmd-works"]
+cpus = 1
+memory = 512
+net = true
+EOF
+
+    local output
+    output=$($SMOLVM sandbox run -s "$SMOLFILE_TMPDIR/Smolfile.cmdonly" 2>&1)
+
+    [[ "$output" == *"smolfile-cmd-works"* ]]
+}
+
+test_smolfile_image_no_cmd_uses_image_default() {
+    # When Smolfile has image but no entrypoint/cmd, the image's own
+    # defaults should be used. For alpine, that's /bin/sh which expects
+    # stdin, so we pass a command via CLI to verify the image runs.
+    cat > "$SMOLFILE_TMPDIR/Smolfile.imgdefault" <<'EOF'
+image = "alpine:latest"
+cpus = 1
+memory = 512
+net = true
+EOF
+
+    local output
+    output=$($SMOLVM sandbox run -s "$SMOLFILE_TMPDIR/Smolfile.imgdefault" -- echo "image-default-ok" 2>&1)
+
+    [[ "$output" == *"image-default-ok"* ]]
+}
+
+test_smolfile_unknown_section_errors() {
+    cat > "$SMOLFILE_TMPDIR/Smolfile.badsection" <<'EOF'
+cpus = 2
+
+[nonexistent_section]
+foo = "bar"
+EOF
+
+    local exit_code=0
+    local vm_name="smolfile-badsec-$$"
+    cleanup_vm "$vm_name"
+    $SMOLVM microvm create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.badsection" 2>&1 || exit_code=$?
+
+    cleanup_vm "$vm_name"
+    [[ $exit_code -ne 0 ]]
+}
+
+# =============================================================================
 # Verbose output
 # =============================================================================
 
@@ -377,5 +699,24 @@ run_test "Smolfile invalid TOML errors" test_smolfile_invalid_toml_errors || tru
 run_test "Smolfile unknown field errors" test_smolfile_unknown_field_errors || true
 run_test "No auto-detection of Smolfile" test_no_auto_detection || true
 run_test "ls --verbose shows init/env/workdir" test_ls_verbose_shows_init || true
+
+echo ""
+echo "--- Smolfile v2 Tests ---"
+echo ""
+
+run_test "Smolfile v2: image field" test_smolfile_image_field || true
+run_test "Smolfile v2: entrypoint field" test_smolfile_entrypoint_field || true
+run_test "Smolfile v2: cmd field" test_smolfile_cmd_field || true
+run_test "Smolfile v2: [artifact] section parses" test_smolfile_artifact_section_parses || true
+run_test "Smolfile v2: [pack] alias parses" test_smolfile_pack_alias_parses || true
+run_test "Smolfile v2: [dev] section parses" test_smolfile_dev_section_parses || true
+run_test "Smolfile v2: [dev] init used for microvm" test_smolfile_dev_init_used_for_microvm || true
+run_test "Smolfile v2: full spec parses" test_smolfile_full_spec_parses || true
+run_test "Smolfile v2: bare VM (no image)" test_smolfile_bare_vm_no_image || true
+run_test "Smolfile v2: entrypoint used at runtime" test_smolfile_entrypoint_used_at_runtime || true
+run_test "Smolfile v2: auto-container on start" test_smolfile_auto_container_on_start || true
+run_test "Smolfile v2: image+cmd overrides image default" test_smolfile_image_cmd_only_overrides_when_set || true
+run_test "Smolfile v2: image without cmd uses image default" test_smolfile_image_no_cmd_uses_image_default || true
+run_test "Smolfile v2: unknown section errors" test_smolfile_unknown_section_errors || true
 
 print_summary "Smolfile Tests"

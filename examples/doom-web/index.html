@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DOOM - smolvm</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: #111;
+            color: #ccc;
+            font-family: monospace;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            min-height: 100vh;
+        }
+        header {
+            padding: 1rem;
+            text-align: center;
+        }
+        header h1 {
+            color: #c00;
+            font-size: 1.5rem;
+        }
+        header p {
+            font-size: 0.85rem;
+            color: #888;
+            margin-top: 0.25rem;
+        }
+        #jsdos {
+            width: 640px;
+            height: 400px;
+            max-width: 100vw;
+        }
+        footer {
+            padding: 1rem;
+            font-size: 0.75rem;
+            color: #555;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>DOOM &mdash; running in smolvm</h1>
+        <p>Hardware-isolated microVM &bull; served via port forwarding</p>
+    </header>
+
+    <div id="jsdos"></div>
+
+    <footer>
+        Powered by <a href="https://js-dos.com" style="color:#888">js-dos</a> &bull;
+        DOOM shareware &copy; id Software
+    </footer>
+
+    <script src="https://js-dos.com/v8/latest/js-dos.js"></script>
+    <script>
+        Dos(document.getElementById("jsdos")).run(
+            "https://cdn.dos.zone/original/2X/2/2948cd6405c98f11e336ea84d3524f24a1db7b80.jsdos"
+        );
+    </script>
+</body>
+</html>
