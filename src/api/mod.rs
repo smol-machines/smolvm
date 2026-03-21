@@ -15,6 +15,7 @@
 //!   -d '{"name": "test"}'
 //! ```
 
+#[path = "errors.rs"]
 pub mod error;
 pub mod handlers;
 pub mod state;

@@ -1,5 +1,7 @@
 //! VM configuration types.
 
+pub use crate::data::storage::HostMount;
+
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -140,45 +142,6 @@ pub enum NetworkPolicy {
         /// Custom DNS server (default: inherit from host).
         dns: Option<IpAddr>,
     },
-}
-
-/// Host directory mount.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct HostMount {
-    /// Path on the host.
-    pub source: PathBuf,
-
-    /// Path inside the guest.
-    pub target: PathBuf,
-
-    /// Read-only mount (default: true per DESIGN.md).
-    pub read_only: bool,
-}
-
-impl HostMount {
-    /// Create a new read-only host mount.
-    pub fn new(source: impl Into<PathBuf>, target: impl Into<PathBuf>) -> Self {
-        Self {
-            source: source.into(),
-            target: target.into(),
-            read_only: true, // Safe default per DESIGN.md
-        }
-    }
-
-    /// Make this mount writable.
-    pub fn writable(mut self) -> Self {
-        self.read_only = false;
-        self
-    }
-
-    /// Create a writable mount directly.
-    pub fn new_writable(source: impl Into<PathBuf>, target: impl Into<PathBuf>) -> Self {
-        Self {
-            source: source.into(),
-            target: target.into(),
-            read_only: false,
-        }
-    }
 }
 
 /// Disk image format for block devices.

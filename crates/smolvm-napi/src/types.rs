@@ -4,7 +4,8 @@
 //! conversion impls to/from the corresponding smolvm types.
 
 use napi_derive::napi;
-use smolvm::agent::{HostMount, PortMapping, VmResources};
+use smolvm::agent::{HostMount, VmResources};
+use smolvm::data::network::PortMapping;
 
 // ============================================================================
 // Input types (JS → Rust)
@@ -139,10 +140,10 @@ impl VmResourcesConfig {
     pub fn to_vm_resources(&self) -> VmResources {
         VmResources {
             cpus: self.cpus.unwrap_or(1),
-            mem: self.memory_mb.unwrap_or(512),
+            memory_mib: self.memory_mb.unwrap_or(512),
             network: self.network.unwrap_or(false),
-            storage_gb: self.storage_gb.map(|g| g as u64),
-            overlay_gb: self.overlay_gb.map(|g| g as u64),
+            storage_gib: self.storage_gb.map(|g| g as u64),
+            overlay_gib: self.overlay_gb.map(|g| g as u64),
         }
     }
 }
