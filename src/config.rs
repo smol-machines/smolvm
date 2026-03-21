@@ -347,6 +347,10 @@ pub struct VmRecord {
     /// Overlay disk size in GiB (None = default 10 GiB).
     #[serde(default)]
     pub overlay_gb: Option<u64>,
+
+    /// Allowed egress CIDR ranges. None = unrestricted, Some([]) = deny all.
+    #[serde(default)]
+    pub allowed_cidrs: Option<Vec<String>>,
 }
 
 fn default_cpus() -> u8 {
@@ -385,6 +389,7 @@ impl VmRecord {
             workdir: None,
             storage_gb: None,
             overlay_gb: None,
+            allowed_cidrs: None,
         }
     }
 
@@ -416,6 +421,7 @@ impl VmRecord {
             workdir: None,
             storage_gb: None,
             overlay_gb: None,
+            allowed_cidrs: None,
         }
     }
 
@@ -472,6 +478,7 @@ impl VmRecord {
             network: self.network,
             storage_gb: self.storage_gb,
             overlay_gb: self.overlay_gb,
+            allowed_cidrs: self.allowed_cidrs.clone(),
         }
     }
 }
@@ -622,6 +629,15 @@ mod tests {
         assert_eq!(resources.mem, 1024);
         assert_eq!(resources.storage_gb, Some(50));
         assert_eq!(resources.overlay_gb, Some(20));
+    }
+
+    #[test]
+    fn test_vm_record_allowed_cidrs_backwards_compat() {
+        // Old records without allowed_cidrs should deserialize with None
+        let json = r#"{"name":"old-vm","created_at":"2024-01-01","cpus":1,"mem":512,"mounts":[],"ports":[],"network":true}"#;
+        let record: VmRecord = serde_json::from_str(json).unwrap();
+        assert!(record.allowed_cidrs.is_none());
+        assert!(record.network);
     }
 
     #[test]
