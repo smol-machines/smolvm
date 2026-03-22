@@ -1150,8 +1150,8 @@ fn handle_interactive_run(
     info!(image = %image, command = ?command, tty = tty, "starting interactive run");
 
     // Prepare the overlay and get the rootfs path
-    let rootfs = match storage::prepare_for_run(&image) {
-        Ok(path) => path,
+    let prepared = match storage::prepare_for_run(&image) {
+        Ok(prepared) => prepared,
         Err(e) => {
             send_response(stream, &AgentResponse::from_err(e, error_codes::RUN_FAILED))?;
             return Ok(());
@@ -1159,7 +1159,8 @@ fn handle_interactive_run(
     };
 
     // Setup virtiofs mounts at staging area (crun will bind-mount them via OCI spec)
-    if let Err(e) = storage::setup_mounts(&rootfs, &mounts) {
+    if let Err(e) = storage::setup_mounts(&prepared.rootfs_path, &mounts) {
+        let _ = storage::cleanup_overlay(&prepared.workload_id);
         send_response(
             stream,
             &AgentResponse::from_err(e, error_codes::MOUNT_FAILED),
@@ -1169,7 +1170,7 @@ fn handle_interactive_run(
 
     // Spawn the command with crun
     let mut child = match spawn_interactive_command(
-        &rootfs,
+        &prepared.rootfs_path,
         &command,
         &env,
         workdir.as_deref(),
@@ -1178,6 +1179,7 @@ fn handle_interactive_run(
     ) {
         Ok(child) => child,
         Err(e) => {
+            let _ = storage::cleanup_overlay(&prepared.workload_id);
             send_response(
                 stream,
                 &AgentResponse::from_err(e, error_codes::SPAWN_FAILED),
@@ -1190,10 +1192,17 @@ fn handle_interactive_run(
     send_response(stream, &AgentResponse::Started)?;
 
     // Run the interactive I/O loop
-    let exit_code = run_interactive_loop(stream, &mut child, timeout_ms)?;
+    let exit_code = match run_interactive_loop(stream, &mut child, timeout_ms) {
+        Ok(exit_code) => exit_code,
+        Err(e) => {
+            let _ = storage::cleanup_overlay(&prepared.workload_id);
+            return Err(e);
+        }
+    };
 
     // Send Exited response
     send_response(stream, &AgentResponse::Exited { exit_code })?;
+    let _ = storage::cleanup_overlay(&prepared.workload_id);
 
     Ok(())
 }
