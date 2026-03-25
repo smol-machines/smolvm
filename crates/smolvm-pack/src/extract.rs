@@ -1,7 +1,7 @@
 //! Asset extraction for packed binaries.
 //!
 //! Provides shared extraction logic used by both the main `smolvm` binary
-//! (sidecar mode via `runpack`) and the standalone stub executable.
+//! (sidecar mode via `pack run`) and the standalone stub executable.
 
 use crate::format::{PackFooter, SIDECAR_EXTENSION};
 use std::fs::{self, File};

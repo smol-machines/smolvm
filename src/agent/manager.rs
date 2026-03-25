@@ -536,7 +536,7 @@ impl AgentManager {
             version: RunningVmConfig::CURRENT_VERSION,
             mounts: mounts.to_vec(),
             ports: ports.to_vec(),
-            resources: *resources,
+            resources: resources.clone(),
         };
         match serde_json::to_string(&config) {
             Ok(json) => {
@@ -618,9 +618,9 @@ impl AgentManager {
     }
 
     /// Check if the given resources match the currently running agent's resources.
-    pub fn resources_match(&self, resources: VmResources) -> bool {
+    pub fn resources_match(&self, resources: &VmResources) -> bool {
         let inner = self.inner.lock();
-        inner.resources == resources
+        inner.resources == *resources
     }
 
     /// Check if the given port mappings match the currently running agent's ports.
@@ -778,7 +778,7 @@ impl AgentManager {
             inner.state = AgentState::Starting;
             inner.mounts = mounts.clone();
             inner.ports = ports.clone();
-            inner.resources = resources;
+            inner.resources = resources.clone();
             inner.config_state = ConfigState::Known;
         }
 
@@ -871,6 +871,7 @@ impl AgentManager {
         let overlay_size_gb = resources
             .overlay_gb
             .unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GIB);
+        let resources_for_config = resources.clone();
 
         // Fork child process using the safe abstraction.
         // The child becomes a session leader (detached from parent's session)
@@ -961,7 +962,7 @@ impl AgentManager {
 
         // Write running config while child boots (overlaps with VM startup).
         // This is needed for future CLI invocations to detect config changes.
-        self.save_running_config(&mounts_for_config, &ports_for_config, &resources);
+        self.save_running_config(&mounts_for_config, &ports_for_config, &resources_for_config);
 
         // Write PID file so future CLI invocations can find this process.
         // Include start time on second line for PID reuse detection.
