@@ -95,7 +95,7 @@ impl SmolvmDb {
     }
 
     /// Get the default database path.
-    fn default_path() -> Result<PathBuf> {
+    pub fn default_path() -> Result<PathBuf> {
         let data_dir = dirs::data_local_dir().ok_or_else(|| {
             Error::database_unavailable("could not determine local data directory")
         })?;

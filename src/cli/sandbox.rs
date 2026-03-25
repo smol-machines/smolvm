@@ -10,15 +10,14 @@
 //! Sandboxes can also be created as persistent, named configurations using
 //! `sandbox create`, managed with `sandbox start/stop/ls/delete`.
 
-use crate::cli::parsers::{
-    mounts_to_virtiofs_bindings, parse_duration, parse_env_list, parse_mounts, parse_port,
-};
+use crate::cli::parsers::{mounts_to_virtiofs_bindings, parse_duration, parse_env_list};
 use crate::cli::vm_common::{self, DeleteVmOptions, VmKind};
 use crate::cli::{flush_output, format_bytes, truncate_id};
 use clap::{Args, Subcommand};
-use smolvm::agent::{
-    docker_config_mount, AgentClient, AgentManager, PortMapping, RunConfig, VmResources,
-};
+use smolvm::agent::{docker_config_mount, AgentClient, AgentManager, RunConfig, VmResources};
+use smolvm::data::network::PortMapping;
+use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
+use smolvm::data::storage::HostMount;
 use smolvm::{DEFAULT_IDLE_CMD, DEFAULT_SHELL_CMD};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -280,7 +279,7 @@ pub struct RunCmd {
     pub volume: Vec<String>,
 
     /// Expose port from container to host (can be used multiple times)
-    #[arg(short = 'p', long = "port", value_parser = parse_port, value_name = "HOST:GUEST", help_heading = "Network")]
+    #[arg(short = 'p', long = "port", value_parser = PortMapping::parse, value_name = "HOST:GUEST", help_heading = "Network")]
     pub port: Vec<PortMapping>,
 
     /// Enable outbound network access
@@ -290,7 +289,7 @@ pub struct RunCmd {
     /// Number of virtual CPUs
     #[arg(
         long,
-        default_value_t = smolvm::agent::DEFAULT_CPUS,
+        default_value_t = DEFAULT_MICROVM_CPU_COUNT,
         value_name = "N",
         help_heading = "Resources"
     )]
@@ -299,7 +298,7 @@ pub struct RunCmd {
     /// Memory allocation in MiB
     #[arg(
         long,
-        default_value_t = smolvm::agent::DEFAULT_MEMORY_MIB,
+        default_value_t = DEFAULT_MICROVM_MEMORY_MIB,
         value_name = "MiB",
         help_heading = "Resources"
     )]
@@ -352,7 +351,7 @@ impl RunCmd {
         )?;
 
         // Parse volume mounts
-        let mut mounts = parse_mounts(&params.volume)?;
+        let mut mounts = HostMount::parse(&params.volume)?;
         let ports = params.port.clone();
 
         // Add docker config mount if requested
@@ -368,10 +367,10 @@ impl RunCmd {
 
         let resources = VmResources {
             cpus: params.cpus,
-            mem: params.mem,
+            memory_mib: params.mem,
             network: params.net,
-            storage_gb: params.storage_gb,
-            overlay_gb: params.overlay_gb,
+            storage_gib: params.storage_gb,
+            overlay_gib: params.overlay_gb,
         };
 
         // Start agent VM
@@ -558,11 +557,11 @@ pub struct CreateCmd {
     pub name: String,
 
     /// Number of virtual CPUs
-    #[arg(long, default_value_t = smolvm::agent::DEFAULT_CPUS, value_name = "N")]
+    #[arg(long, default_value_t = DEFAULT_MICROVM_CPU_COUNT, value_name = "N")]
     pub cpus: u8,
 
     /// Memory allocation in MiB
-    #[arg(long, default_value_t = smolvm::agent::DEFAULT_MEMORY_MIB, value_name = "MiB")]
+    #[arg(long, default_value_t = DEFAULT_MICROVM_MEMORY_MIB, value_name = "MiB")]
     pub mem: u32,
 
     /// Storage disk size in GiB (for OCI layers and container data)
@@ -578,7 +577,7 @@ pub struct CreateCmd {
     pub volume: Vec<String>,
 
     /// Expose port from sandbox to host (can be used multiple times)
-    #[arg(short = 'p', long = "port", value_parser = parse_port, value_name = "HOST:GUEST")]
+    #[arg(short = 'p', long = "port", value_parser = PortMapping::parse, value_name = "HOST:GUEST")]
     pub port: Vec<PortMapping>,
 
     /// Enable outbound network access

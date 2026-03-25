@@ -21,10 +21,10 @@
 //! ]
 //! ```
 
-use crate::cli::parsers::parse_port;
 use crate::cli::vm_common::CreateVmParams;
 use serde::Deserialize;
-use smolvm::agent::PortMapping;
+use smolvm::data::network::PortMapping;
+use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
 use std::path::{Path, PathBuf};
 
 /// Parsed Smolfile configuration.
@@ -99,7 +99,7 @@ pub fn build_create_params(
     let mut ports: Vec<PortMapping> = sf
         .ports
         .iter()
-        .map(|s| parse_port(s))
+        .map(|s| PortMapping::parse(s))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| smolvm::Error::config("smolfile ports", e))?;
     // CLI ports override/extend
@@ -118,8 +118,8 @@ pub fn build_create_params(
     init.extend(cli_init);
 
     // Scalars: CLI non-default overrides Smolfile
-    let default_cpus = smolvm::agent::DEFAULT_CPUS;
-    let default_mem = smolvm::agent::DEFAULT_MEMORY_MIB;
+    let default_cpus = DEFAULT_MICROVM_CPU_COUNT;
+    let default_mem = DEFAULT_MICROVM_MEMORY_MIB;
 
     let cpus = if cli_cpus != default_cpus {
         cli_cpus

@@ -3,11 +3,12 @@
 //! These commands manage long-running containers via a microvm.
 //! Containers can be created, started, stopped, and deleted independently.
 
-use crate::cli::parsers::{parse_duration, parse_env_list, parse_mounts};
+use crate::cli::parsers::{parse_duration, parse_env_list};
 use crate::cli::vm_common;
 use crate::cli::{flush_output, truncate, truncate_id, COMMAND_WIDTH, IMAGE_NAME_WIDTH};
 use clap::{Args, Subcommand};
 use smolvm::agent::{mount_tag, AgentClient, AgentManager};
+use smolvm::data::storage::HostMount;
 use smolvm::db::SmolvmDb;
 use smolvm::{DEFAULT_IDLE_CMD, DEFAULT_SHELL_CMD};
 use std::time::Duration;
@@ -115,7 +116,7 @@ impl ContainerCreateCmd {
             .map(|r| r.mounts)
             .unwrap_or_default();
 
-        let explicit_host_mounts = parse_mounts(&self.volume)?;
+        let explicit_host_mounts = HostMount::parse(&self.volume)?;
         let mounts = resolve_container_mounts(&self.microvm, &vm_mounts, &explicit_host_mounts)?;
 
         // Default command is sleep infinity for long-running containers
@@ -413,8 +414,6 @@ impl ContainerExecCmd {
 // Mount resolution
 // ============================================================================
 
-use smolvm::vm::config::HostMount;
-
 /// Resolve container volume mounts against a microvm's virtiofs devices.
 ///
 /// Virtiofs devices are registered at VM launch and cannot be added later.
@@ -482,10 +481,10 @@ mod tests {
     }
 
     fn host_mount(source: &str, target: &str, read_only: bool) -> HostMount {
-        if read_only {
-            HostMount::new(PathBuf::from(source), PathBuf::from(target))
-        } else {
-            HostMount::new_writable(PathBuf::from(source), PathBuf::from(target))
+        HostMount {
+            source: PathBuf::from(source),
+            target: PathBuf::from(target),
+            read_only,
         }
     }
 

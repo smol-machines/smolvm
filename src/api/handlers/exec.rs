@@ -17,6 +17,7 @@ use crate::api::types::{
     ApiErrorResponse, EnvVar, ExecRequest, ExecResponse, LogsQuery, RunRequest,
 };
 use crate::api::validation::validate_command;
+use crate::data::consts::BYTES_PER_MIB;
 use tokio::sync::Semaphore;
 
 /// Execute a command in a sandbox.
@@ -330,7 +331,7 @@ const MAX_READ_CHUNK: u64 = 64 * 1024;
 /// Maximum size of the partial (incomplete) line buffer (1 MiB).
 /// If a log produces data without newlines beyond this limit, the partial
 /// buffer is flushed as-is to prevent unbounded memory growth.
-const MAX_PARTIAL_LINE: usize = 1024 * 1024;
+const MAX_PARTIAL_LINE: usize = BYTES_PER_MIB as usize;
 
 /// Read new content from a file starting at a given position.
 /// Reads at most `MAX_READ_CHUNK` bytes per call.

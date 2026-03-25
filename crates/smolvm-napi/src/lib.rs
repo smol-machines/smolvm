@@ -13,6 +13,7 @@
 //!               └── libkrun (dynamic linking) → Hypervisor.framework / KVM
 //! ```
 
+#[path = "errors.rs"]
 pub mod error;
 pub mod sandbox;
 pub mod types;

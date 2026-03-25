@@ -4,6 +4,7 @@ use crate::agent::{AgentManager, HostMount, PortMapping, VmResources};
 use crate::api::error::ApiError;
 use crate::api::types::{MountSpec, PortSpec, ResourceSpec, RestartSpec, SandboxInfo};
 use crate::config::{RecordState, RestartConfig, RestartPolicy, VmRecord};
+use crate::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
 use crate::db::SmolvmDb;
 use crate::mount::MountBinding;
 use parking_lot::RwLock;
@@ -422,10 +423,10 @@ impl ApiState {
         // Persist to database (with conflict detection)
         let mut record = VmRecord::new_with_restart(
             name.clone(),
-            reg.resources.cpus.unwrap_or(crate::agent::DEFAULT_CPUS),
+            reg.resources.cpus.unwrap_or(DEFAULT_MICROVM_CPU_COUNT),
             reg.resources
                 .memory_mb
-                .unwrap_or(crate::agent::DEFAULT_MEMORY_MIB),
+                .unwrap_or(DEFAULT_MICROVM_MEMORY_MIB),
             reg.mounts
                 .iter()
                 .map(|m| (m.source.clone(), m.target.clone(), m.readonly))
@@ -697,11 +698,11 @@ pub fn mounts_to_bindings(specs: &[MountSpec]) -> Result<Vec<MountBinding>, ApiE
 /// Convert ResourceSpec to VmResources.
 pub fn resource_spec_to_vm_resources(spec: &ResourceSpec, network: bool) -> VmResources {
     VmResources {
-        cpus: spec.cpus.unwrap_or(crate::agent::DEFAULT_CPUS),
-        mem: spec.memory_mb.unwrap_or(crate::agent::DEFAULT_MEMORY_MIB),
+        cpus: spec.cpus.unwrap_or(DEFAULT_MICROVM_CPU_COUNT),
+        memory_mib: spec.memory_mb.unwrap_or(DEFAULT_MICROVM_MEMORY_MIB),
         network,
-        storage_gb: spec.storage_gb,
-        overlay_gb: spec.overlay_gb,
+        storage_gib: spec.storage_gb,
+        overlay_gib: spec.overlay_gb,
     }
 }
 
@@ -709,10 +710,10 @@ pub fn resource_spec_to_vm_resources(spec: &ResourceSpec, network: bool) -> VmRe
 pub fn vm_resources_to_spec(res: VmResources) -> ResourceSpec {
     ResourceSpec {
         cpus: Some(res.cpus),
-        memory_mb: Some(res.mem),
+        memory_mb: Some(res.memory_mib),
         network: Some(res.network),
-        storage_gb: res.storage_gb,
-        overlay_gb: res.overlay_gb,
+        storage_gb: res.storage_gib,
+        overlay_gb: res.overlay_gib,
     }
 }
 
@@ -775,8 +776,8 @@ mod tests {
             overlay_gb: None,
         };
         let res = resource_spec_to_vm_resources(&spec, false);
-        assert_eq!(res.cpus, crate::agent::DEFAULT_CPUS);
-        assert_eq!(res.mem, crate::agent::DEFAULT_MEMORY_MIB);
+        assert_eq!(res.cpus, DEFAULT_MICROVM_CPU_COUNT);
+        assert_eq!(res.memory_mib, DEFAULT_MICROVM_MEMORY_MIB);
         assert!(!res.network);
 
         // Test with network enabled

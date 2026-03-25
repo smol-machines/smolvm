@@ -3,12 +3,13 @@
 //! Provides automatic log rotation when log files exceed a size threshold.
 //! Rotated logs follow the pattern: `filename.1`, `filename.2`, etc.
 
+use crate::data::consts::BYTES_PER_MIB;
 use std::fs;
 use std::io;
 use std::path::Path;
 
 /// Maximum log file size before rotation (10 MB).
-const MAX_LOG_SIZE: u64 = 10 * 1024 * 1024;
+const MAX_LOG_SIZE: u64 = 10 * BYTES_PER_MIB;
 
 /// Maximum number of rotated log files to keep.
 const MAX_LOG_FILES: usize = 3;

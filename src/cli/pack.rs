@@ -9,6 +9,7 @@
 
 use clap::{Args, Subcommand};
 use smolvm::agent::{AgentClient, AgentManager, PullOptions, VmResources};
+use smolvm::data::resources::DEFAULT_MICROVM_CPU_COUNT;
 
 /// Default memory for packed VMs (lower than sandbox/microvm because
 /// packed VMs are typically single-purpose, minimal workloads).
@@ -76,7 +77,7 @@ pub struct PackCreateCmd {
     pub output: PathBuf,
 
     /// Default number of vCPUs for the packed VM
-    #[arg(long, default_value_t = smolvm::agent::DEFAULT_CPUS, value_name = "N")]
+    #[arg(long, default_value_t = DEFAULT_MICROVM_CPU_COUNT, value_name = "N")]
     pub cpus: u8,
 
     /// Default memory in MiB for the packed VM (lower than sandbox/microvm
@@ -203,10 +204,10 @@ impl PackCreateCmd {
             Vec::new(),
             VmResources {
                 cpus: 2,
-                mem: 512,
+                memory_mib: 512,
                 network: true,
-                storage_gb: None,
-                overlay_gb: None,
+                storage_gib: None,
+                overlay_gib: None,
             },
         )?;
         let mut guard = PackVmGuard {

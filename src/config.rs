@@ -7,6 +7,8 @@
 //! For backward compatibility, `SmolvmConfig` maintains an in-memory cache of VMs
 //! and provides the same API as the old confy-based implementation.
 
+use crate::data::network::DEFAULT_DNS;
+use crate::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
 use crate::db::SmolvmDb;
 use crate::error::Result;
 use serde::{Deserialize, Serialize};
@@ -95,13 +97,6 @@ pub struct RestartConfig {
     pub user_stopped: bool,
 }
 
-/// Default vCPU count for new VMs.
-pub const DEFAULT_VM_CPUS: u8 = 1;
-/// Default memory in MiB for new VMs.
-pub const DEFAULT_VM_MEMORY_MIB: u32 = 512;
-/// Default DNS server for VMs with network egress.
-pub const DEFAULT_DNS: &str = "1.1.1.1";
-
 /// Global smolvm configuration with database-backed persistence.
 ///
 /// This struct provides backward-compatible access to VM records while
@@ -135,8 +130,8 @@ impl SmolvmConfig {
         Ok(Self {
             db: SmolvmDb::open()?,
             version: 1,
-            default_cpus: DEFAULT_VM_CPUS,
-            default_mem: DEFAULT_VM_MEMORY_MIB,
+            default_cpus: DEFAULT_MICROVM_CPU_COUNT,
+            default_mem: DEFAULT_MICROVM_MEMORY_MIB,
             default_dns: DEFAULT_DNS.to_string(),
             #[cfg(target_os = "macos")]
             storage_volume: String::new(),
@@ -163,11 +158,11 @@ impl SmolvmConfig {
         let default_cpus = config_map
             .get("default_cpus")
             .and_then(|s| s.parse().ok())
-            .unwrap_or(DEFAULT_VM_CPUS);
+            .unwrap_or(DEFAULT_MICROVM_CPU_COUNT);
         let default_mem = config_map
             .get("default_mem")
             .and_then(|s| s.parse().ok())
-            .unwrap_or(DEFAULT_VM_MEMORY_MIB);
+            .unwrap_or(DEFAULT_MICROVM_MEMORY_MIB);
         let default_dns = config_map
             .get("default_dns")
             .cloned()
@@ -445,10 +440,10 @@ impl VmRecord {
     }
 
     /// Convert stored mounts to HostMount format.
-    pub fn host_mounts(&self) -> Vec<crate::vm::config::HostMount> {
+    pub fn host_mounts(&self) -> Vec<crate::data::storage::HostMount> {
         self.mounts
             .iter()
-            .map(|(host, guest, ro)| crate::vm::config::HostMount {
+            .map(|(host, guest, ro)| crate::data::storage::HostMount {
                 source: std::path::PathBuf::from(host),
                 target: std::path::PathBuf::from(guest),
                 read_only: *ro,
@@ -457,10 +452,10 @@ impl VmRecord {
     }
 
     /// Convert stored ports to PortMapping format.
-    pub fn port_mappings(&self) -> Vec<crate::agent::PortMapping> {
+    pub fn port_mappings(&self) -> Vec<crate::data::network::PortMapping> {
         self.ports
             .iter()
-            .map(|(host, guest)| crate::agent::PortMapping::new(*host, *guest))
+            .map(|(host, guest)| crate::data::network::PortMapping::new(*host, *guest))
             .collect()
     }
 
@@ -468,10 +463,10 @@ impl VmRecord {
     pub fn vm_resources(&self) -> crate::agent::VmResources {
         crate::agent::VmResources {
             cpus: self.cpus,
-            mem: self.mem,
+            memory_mib: self.mem,
             network: self.network,
-            storage_gb: self.storage_gb,
-            overlay_gb: self.overlay_gb,
+            storage_gib: self.storage_gb,
+            overlay_gib: self.overlay_gb,
         }
     }
 }
@@ -619,9 +614,9 @@ mod tests {
 
         let resources = record.vm_resources();
         assert_eq!(resources.cpus, 2);
-        assert_eq!(resources.mem, 1024);
-        assert_eq!(resources.storage_gb, Some(50));
-        assert_eq!(resources.overlay_gb, Some(20));
+        assert_eq!(resources.memory_mib, 1024);
+        assert_eq!(resources.storage_gib, Some(50));
+        assert_eq!(resources.overlay_gib, Some(20));
     }
 
     #[test]

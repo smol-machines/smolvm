@@ -9,10 +9,11 @@
 //! - status: Show microvm status
 //! - ls: List all named VMs
 
-use crate::cli::parsers::{parse_duration, parse_env_list, parse_port};
+use crate::cli::parsers::{parse_duration, parse_env_list};
 use crate::cli::vm_common::{self, DeleteVmOptions, VmKind};
 use clap::{Args, Subcommand};
-use smolvm::agent::PortMapping;
+use smolvm::data::network::PortMapping;
+use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -163,11 +164,11 @@ pub struct CreateCmd {
     pub name: String,
 
     /// Number of virtual CPUs
-    #[arg(long, default_value_t = smolvm::agent::DEFAULT_CPUS, value_name = "N")]
+    #[arg(long, default_value_t = DEFAULT_MICROVM_CPU_COUNT, value_name = "N")]
     pub cpus: u8,
 
     /// Memory allocation in MiB
-    #[arg(long, default_value_t = smolvm::agent::DEFAULT_MEMORY_MIB, value_name = "MiB")]
+    #[arg(long, default_value_t = DEFAULT_MICROVM_MEMORY_MIB, value_name = "MiB")]
     pub mem: u32,
 
     /// Storage disk size in GiB (for OCI layers and container data)
@@ -183,7 +184,7 @@ pub struct CreateCmd {
     pub volume: Vec<String>,
 
     /// Expose port from VM to host (can be used multiple times)
-    #[arg(short = 'p', long = "port", value_parser = parse_port, value_name = "HOST:GUEST")]
+    #[arg(short = 'p', long = "port", value_parser = PortMapping::parse, value_name = "HOST:GUEST")]
     pub port: Vec<PortMapping>,
 
     /// Enable outbound network access
