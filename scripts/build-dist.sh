@@ -397,11 +397,14 @@ INSTALLATION
    tar -xzf smolvm-*.tar.gz
    cd smolvm-*
 
-2. (Optional) Add to PATH:
+2. smolvm is looking for the rootfs in the app home (on macOS this is typically ~/Application Support/smolvm). 
+   Symlinks are currenlty not supported, so copy agent-rootfs to that location
+
+3. (Optional) Add to PATH:
    # Add to ~/.bashrc or ~/.zshrc:
    export PATH="/path/to/smolvm-directory:$PATH"
 
-3. (Optional) Create a symlink:
+4. (Optional) Create a symlink:
    sudo ln -s /path/to/smolvm-directory/smolvm /usr/local/bin/smolvm
 
 PREREQUISITES
