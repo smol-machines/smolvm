@@ -6,9 +6,9 @@ use crate::api::types::{MountSpec, PortSpec, ResourceSpec, RestartSpec, SandboxI
 use crate::config::{RecordState, RestartConfig, RestartPolicy, VmRecord};
 use crate::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
 use crate::db::SmolvmDb;
-use crate::mount::MountBinding;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 
 /// Shared API server state.
@@ -653,20 +653,30 @@ impl TryFrom<&MountSpec> for HostMount {
     type Error = crate::Error;
 
     /// Validate and canonicalize a MountSpec into a HostMount.
+    ///
+    /// API mount specs require absolute source paths even though CLI parsing
+    /// allows relative host paths that are canonicalized against the current
+    /// working directory.
     fn try_from(spec: &MountSpec) -> Result<Self, Self::Error> {
-        let binding = MountBinding::try_from(spec)?;
-        Ok(HostMount::from(&binding))
+        let source = Path::new(&spec.source);
+        if !source.is_absolute() {
+            return Err(crate::Error::mount(
+                "validate source",
+                format!("path must be absolute: {}", source.display()),
+            ));
+        }
+
+        HostMount::new(&spec.source, &spec.target, spec.readonly)
     }
 }
 
 impl From<&HostMount> for MountSpec {
     fn from(mount: &HostMount) -> Self {
-        let binding = MountBinding::from_stored(
-            mount.source.to_string_lossy().to_string(),
-            mount.target.to_string_lossy().to_string(),
-            mount.read_only,
-        );
-        MountSpec::from(&binding)
+        MountSpec {
+            source: mount.source.to_string_lossy().to_string(),
+            target: mount.target.to_string_lossy().to_string(),
+            readonly: mount.read_only,
+        }
     }
 }
 
@@ -685,13 +695,13 @@ impl From<&PortMapping> for PortSpec {
     }
 }
 
-/// Convert multiple MountSpecs to MountBindings.
+/// Convert multiple MountSpecs to HostMount values.
 ///
 /// Returns an error if any mount fails validation.
-pub fn mounts_to_bindings(specs: &[MountSpec]) -> Result<Vec<MountBinding>, ApiError> {
+pub fn mounts_to_host_mounts(specs: &[MountSpec]) -> Result<Vec<HostMount>, ApiError> {
     specs
         .iter()
-        .map(|s| MountBinding::try_from(s).map_err(|e| ApiError::BadRequest(e.to_string())))
+        .map(|s| HostMount::try_from(s).map_err(|e| ApiError::BadRequest(e.to_string())))
         .collect()
 }
 

@@ -7,7 +7,7 @@ use crate::cli::parsers::{parse_duration, parse_env_list};
 use crate::cli::vm_common;
 use crate::cli::{flush_output, truncate, truncate_id, COMMAND_WIDTH, IMAGE_NAME_WIDTH};
 use clap::{Args, Subcommand};
-use smolvm::agent::{mount_tag, AgentClient, AgentManager};
+use smolvm::agent::{AgentClient, AgentManager};
 use smolvm::data::storage::HostMount;
 use smolvm::db::SmolvmDb;
 use smolvm::{DEFAULT_IDLE_CMD, DEFAULT_SHELL_CMD};
@@ -433,7 +433,9 @@ fn resolve_container_mounts(
     let mut mounts: Vec<(String, String, bool)> = vm_mounts
         .iter()
         .enumerate()
-        .map(|(i, (_, guest_path, read_only))| (mount_tag(i), guest_path.clone(), *read_only))
+        .map(|(i, (_, guest_path, read_only))| {
+            (HostMount::mount_tag(i), guest_path.clone(), *read_only)
+        })
         .collect();
 
     // Apply explicit -v overrides by matching host path to VM mount index
@@ -446,7 +448,7 @@ fn resolve_container_mounts(
         match vm_index {
             Some(i) => {
                 mounts[i] = (
-                    mount_tag(i),
+                    HostMount::mount_tag(i),
                     host_mount.target.to_string_lossy().to_string(),
                     host_mount.read_only,
                 );

@@ -26,7 +26,7 @@ use axum::{
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::agent::AgentManager;
+use crate::agent::{AgentManager, HostMount};
 use crate::api::error::ApiError;
 use crate::api::state::ApiState;
 use crate::api::types::{
@@ -35,7 +35,6 @@ use crate::api::types::{
 };
 use crate::api::validation::{validate_command, validate_resource_name};
 use crate::config::{RecordState, VmRecord};
-use crate::mount::MountBinding;
 use crate::storage::expand_disk;
 
 /// Maximum microvm name length.
@@ -149,10 +148,9 @@ pub async fn create_microvm(
     let mut mounts: Vec<(String, String, bool)> = Vec::with_capacity(req.mounts.len());
     for mount_spec in &req.mounts {
         // Validate mount paths (checks: absolute paths, source exists, source is directory)
-        let binding =
-            MountBinding::new(&mount_spec.source, &mount_spec.target, mount_spec.readonly)
-                .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-        mounts.push(binding.to_tuple());
+        let mount =
+            HostMount::try_from(mount_spec).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        mounts.push(mount.to_storage_tuple());
     }
 
     // Convert ports to storage format

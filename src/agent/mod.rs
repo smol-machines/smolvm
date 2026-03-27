@@ -17,11 +17,3 @@ pub use manager::{docker_config_dir, docker_config_mount, vm_data_dir, AgentMana
 
 /// Agent VM name.
 pub const AGENT_VM_NAME: &str = "smolvm-agent";
-
-/// Generate a virtiofs mount tag for a given index.
-///
-/// Mount tags follow the format "smolvm0", "smolvm1", etc. and are used
-/// consistently across the host launcher, API handlers, and guest agent.
-pub fn mount_tag(index: usize) -> String {
-    format!("smolvm{}", index)
-}

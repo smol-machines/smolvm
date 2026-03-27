@@ -13,7 +13,7 @@ use clap::{Args, Parser, Subcommand};
 use smolvm::agent::launcher_dynamic::{
     launch_agent_vm_dynamic, KrunFunctions, PackedLaunchConfig, PackedMount,
 };
-use smolvm::agent::{mount_tag, AgentClient, RunConfig, VmResources};
+use smolvm::agent::{AgentClient, RunConfig, VmResources};
 use smolvm::data::network::PortMapping;
 use smolvm::data::storage::HostMount;
 use smolvm::Error;
@@ -36,7 +36,7 @@ fn mounts_to_packed(mounts: &[smolvm::data::storage::HostMount]) -> Vec<PackedMo
         .iter()
         .enumerate()
         .map(|(i, m)| PackedMount {
-            tag: mount_tag(i),
+            tag: HostMount::mount_tag(i),
             host_path: m.source.to_string_lossy().to_string(),
             guest_path: m.target.to_string_lossy().to_string(),
             read_only: m.read_only,

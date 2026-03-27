@@ -335,8 +335,9 @@ pub fn launch_agent_vm(
         // Each mount gets a tag like "smolvm0", "smolvm1", etc.
         // The guest must mount these manually (or via the agent)
         for (i, mount) in mounts.iter().enumerate() {
+            let mount_tag = HostMount::mount_tag(i);
             let tag = try_or_free_ctx!(
-                CString::new(crate::agent::mount_tag(i)),
+                CString::new(mount_tag.clone()),
                 "configure mount",
                 "mount tag contains null byte"
             );
@@ -347,7 +348,7 @@ pub fn launch_agent_vm(
             );
 
             tracing::debug!(
-                tag = %crate::agent::mount_tag(i),
+                tag = %mount_tag,
                 host = %mount.source.display(),
                 guest = %mount.target.display(),
                 read_only = mount.read_only,
@@ -380,11 +381,12 @@ pub fn launch_agent_vm(
         // Pass mount info to the agent via environment
         // Format: SMOLVM_MOUNT_0=tag:guest_path:ro
         for (i, mount) in mounts.iter().enumerate() {
+            let mount_tag = HostMount::mount_tag(i);
             let ro_flag = if mount.read_only { "ro" } else { "rw" };
             let env_val = format!(
-                "SMOLVM_MOUNT_{}=smolvm{}:{}:{}",
+                "SMOLVM_MOUNT_{}={}:{}:{}",
                 i,
-                i,
+                mount_tag,
                 mount.target.display(),
                 ro_flag
             );

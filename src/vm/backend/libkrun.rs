@@ -7,6 +7,7 @@ use std::ffi::CString;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+use crate::data::storage::HostMount;
 use crate::error::{Error, Result};
 use crate::platform::{self, VmExecutor};
 use crate::vm::config::{NetworkPolicy, RootfsSource, VmConfig};
@@ -216,7 +217,7 @@ impl LibkrunVm {
                 .enumerate()
                 .map(|(i, m)| {
                     (
-                        crate::agent::mount_tag(i),
+                        HostMount::mount_tag(i),
                         m.target.to_string_lossy().to_string(),
                     )
                 })
@@ -259,7 +260,7 @@ impl LibkrunVm {
 
             // Add virtiofs mounts for host directories
             for (i, mount) in config.mounts.iter().enumerate() {
-                let tag = CString::new(crate::agent::mount_tag(i))
+                let tag = CString::new(HostMount::mount_tag(i))
                     .map_err(|_| Error::mount("create mount tag", "tag contains null byte"))?;
                 let path = path_to_cstring(&mount.source)?;
 

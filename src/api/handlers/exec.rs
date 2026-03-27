@@ -18,6 +18,7 @@ use crate::api::types::{
 };
 use crate::api::validation::validate_command;
 use crate::data::consts::BYTES_PER_MIB;
+use crate::data::storage::HostMount;
 use tokio::sync::Semaphore;
 
 /// Execute a command in a sandbox.
@@ -113,7 +114,7 @@ pub async fn run_command(
             .iter()
             .enumerate()
             .map(|(i, m)| {
-                let tag = crate::agent::mount_tag(i);
+                let tag = HostMount::mount_tag(i);
                 (tag, m.target.clone(), m.readonly)
             })
             .collect::<Vec<_>>()

@@ -36,7 +36,7 @@ pub fn mounts_to_virtiofs_bindings(mounts: &[HostMount]) -> Vec<(String, String,
         .enumerate()
         .map(|(i, m)| {
             (
-                smolvm::agent::mount_tag(i),
+                HostMount::mount_tag(i),
                 m.target.to_string_lossy().to_string(),
                 m.read_only,
             )

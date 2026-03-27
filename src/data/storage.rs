@@ -32,6 +32,11 @@ pub struct HostMount {
 }
 
 impl HostMount {
+    /// Protected host paths that must never be mounted into the guest.
+    const ILLEGAL_SOURCE_MOUNT_PATH: &[&str] = &[
+        "/", "/etc", "/var", "/usr", "/bin", "/sbin", "/lib", "/System", "/Library", "/private",
+    ];
+
     /// Create a host mount with an explicit read-only flag.
     pub fn new(
         source: impl Into<PathBuf>,
@@ -87,13 +92,55 @@ impl HostMount {
             return Err(Error::mount(
                 "validate host path",
                 format!(
-                    "path must be a directory (virtiofs limitation): {}",
+                    "source path on host must be a directory (virtiofs limitation): {}",
                     mount.source.display()
                 ),
             ));
         }
 
+        let source = mount.source.to_string_lossy();
+        for illegal_path in Self::ILLEGAL_SOURCE_MOUNT_PATH {
+            if source == *illegal_path || source.starts_with(&format!("{}/", illegal_path)) {
+                return Err(Error::mount(
+                    "validate host path",
+                    format!(
+                        "source path on host is a protected system path and cannot be mounted: {}",
+                        mount.source.display()
+                    ),
+                ));
+            }
+        }
+
+        if !mount.target.is_absolute() {
+            return Err(Error::mount(
+                "validate guest path",
+                format!(
+                    "target path on guest should be an absolute directory: {}",
+                    mount.target.display()
+                ),
+            ));
+        }
+
         Ok(())
+    }
+
+    /// Generate a virtiofs mount tag for a given index.
+    ///
+    /// Mount tags follow the format "smolvm0", "smolvm1", etc. and are used
+    /// consistently across the host launcher, API handlers, and guest agent.
+    pub fn mount_tag(index: usize) -> String {
+        format!("smolvm{}", index)
+    }
+
+    /// Create without validation (for loading from database).
+    ///
+    /// Use this only when loading persisted mounts that were previously validated.
+    pub fn from_storage_tuple(source: String, target: String, read_only: bool) -> Self {
+        Self {
+            source: PathBuf::from(source),
+            target: PathBuf::from(target),
+            read_only,
+        }
     }
 
     /// Convert this mount to tuple format for persistence.
@@ -113,6 +160,27 @@ mod tests {
 
     fn parse_one(spec: &str) -> HostMount {
         HostMount::parse(&[spec.to_string()]).unwrap().remove(0)
+    }
+
+    #[test]
+    fn test_new_mount_rejects_illegal_source_mount_path() {
+        for path in ["/", "/etc", "/var/log"] {
+            let result = HostMount::new(path, "/guest/path", true);
+            assert!(result.is_err(), "{} should be rejected", path);
+            let err_msg = result.unwrap_err().to_string();
+            assert!(
+                err_msg.contains("protected system path"),
+                "Error should explain why {} is blocked, got: {}",
+                path,
+                err_msg
+            );
+            assert!(
+                err_msg.contains("cannot be mounted"),
+                "Error should explain that {} cannot be mounted, got: {}",
+                path,
+                err_msg
+            );
+        }
     }
 
     #[test]
@@ -144,7 +212,10 @@ mod tests {
 
     #[test]
     fn test_parse_mount_spec_paths_with_spaces() {
-        let temp_dir = std::env::temp_dir().join("smolvm mount with spaces");
+        let temp_dir = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("smolvm mount with spaces");
         std::fs::create_dir_all(&temp_dir).unwrap();
 
         let spec = format!("{}:/guest/path", temp_dir.display());
@@ -175,9 +246,14 @@ mod tests {
     }
 
     #[test]
-    fn test_new_mount_allows_relative_target() {
+    fn test_new_mount_disallows_relative_target() {
         let result = HostMount::new("/tmp", "relative/path", true);
-        assert!(result.is_ok());
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("absolute"),
+            "Error should explain that guest target paths must be absolute"
+        );
     }
 
     #[test]

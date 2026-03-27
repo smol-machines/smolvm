@@ -29,7 +29,7 @@ pub(crate) fn mounts_to_info(mounts: &[MountSpec]) -> Vec<MountInfo> {
         .iter()
         .enumerate()
         .map(|(i, m)| MountInfo {
-            tag: crate::agent::mount_tag(i),
+            tag: HostMount::mount_tag(i),
             source: m.source.clone(),
             target: m.target.clone(),
             readonly: m.readonly,
