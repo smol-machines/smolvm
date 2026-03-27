@@ -62,8 +62,10 @@ impl PackCmd {
 pub struct PackCreateCmd {
     /// Container image to pack (e.g., alpine:latest, python:3.11-slim)
     #[arg(
+        long,
+        short = 'I',
         value_name = "IMAGE",
-        required_unless_present = "from_vm",
+        required_unless_present_any = ["from_vm", "smolfile"],
         conflicts_with = "from_vm"
     )]
     pub image: Option<String>,
@@ -118,16 +120,40 @@ pub struct PackCreateCmd {
     /// Path to agent rootfs directory
     #[arg(long, value_name = "DIR", hide = true)]
     pub rootfs_dir: Option<PathBuf>,
+
+    /// Load workload configuration from a Smolfile (TOML)
+    #[arg(long = "smolfile", visible_short_alias = 's', value_name = "PATH")]
+    pub smolfile: Option<PathBuf>,
 }
 
 impl PackCreateCmd {
     pub fn run(self) -> smolvm::Result<()> {
         if let Some(vm_name) = self.from_vm.clone() {
+            if self.oci_platform.is_some() {
+                warn!("--oci-platform is ignored with --from-vm (VM snapshot is arch-fixed)");
+            }
             info!(vm = %vm_name, output = %self.output.display(), "packing from VM");
             return self.pack_from_vm(vm_name);
         }
 
-        let image = self.image.clone().unwrap();
+        // Resolve config from Smolfile + CLI
+        let pack_config = crate::cli::smolfile::resolve_pack_config(
+            self.image.clone(),
+            self.entrypoint.clone(),
+            self.cpus,
+            self.mem,
+            self.oci_platform.clone(),
+            self.smolfile.clone(),
+            smolvm::agent::DEFAULT_CPUS,
+            PACK_DEFAULT_MEMORY_MIB,
+        )?;
+
+        let image = pack_config.image.ok_or_else(|| {
+            Error::config(
+                "pack create",
+                "no image specified. Provide IMAGE argument or set 'image' in Smolfile",
+            )
+        })?;
         info!(image = %image, output = %self.output.display(), "packing image");
 
         // Create temporary staging directory
@@ -220,7 +246,7 @@ impl PackCreateCmd {
         // Pull image
         println!("Pulling {}...", image);
         let mut pull_opts = PullOptions::new().use_registry_config(true);
-        if let Some(ref oci_platform) = self.oci_platform {
+        if let Some(ref oci_platform) = pack_config.oci_platform {
             pull_opts = pull_opts.oci_platform(oci_platform);
         }
         let image_info = client.pull(&image, pull_opts)?;
@@ -262,18 +288,41 @@ impl PackCreateCmd {
         // Build manifest
         let platform = format!("{}/{}", image_info.os, image_info.architecture);
         let mut manifest = PackManifest::new(image, image_info.digest.clone(), platform);
-        manifest.cpus = self.cpus;
-        manifest.mem = self.mem;
+        manifest.cpus = pack_config.cpus;
+        manifest.mem = pack_config.mem;
 
-        // Copy OCI config fields from image (CMD, ENTRYPOINT, ENV, WORKDIR)
+        // Start with OCI image config as baseline
         manifest.entrypoint = image_info.entrypoint.clone();
         manifest.cmd = image_info.cmd.clone();
         manifest.env = image_info.env.clone();
         manifest.workdir = image_info.workdir.clone();
 
-        // Override entrypoint if user provided one
-        if let Some(ref ep) = self.entrypoint {
-            manifest.entrypoint = vec![ep.clone()];
+        // Layer Smolfile top-level env on top of image env
+        if !pack_config.env.is_empty() {
+            for e in &pack_config.env {
+                if let Some((key, _)) = e.split_once('=') {
+                    // Remove any existing image env with the same key
+                    manifest.env.retain(|existing| {
+                        !existing.starts_with(&format!("{}=", key))
+                    });
+                }
+                manifest.env.push(e.clone());
+            }
+        }
+
+        // Smolfile workdir overrides image workdir
+        if pack_config.workdir.is_some() {
+            manifest.workdir = pack_config.workdir;
+        }
+
+        // Override entrypoint from Smolfile or CLI
+        if !pack_config.entrypoint.is_empty() {
+            manifest.entrypoint = pack_config.entrypoint;
+        }
+
+        // Override cmd from Smolfile
+        if !pack_config.cmd.is_empty() {
+            manifest.cmd = pack_config.cmd;
         }
 
         self.finalize_pack(manifest, collector, staging_dir)
@@ -328,22 +377,64 @@ impl PackCreateCmd {
             .add_overlay_template(&overlay_path)
             .map_err(|e| Error::agent("collect overlay", e.to_string()))?;
 
-        // 5. Build manifest
+        // 5. Resolve Smolfile overrides if provided
+        //    Precedence: CLI > [artifact] > Smolfile top-level > VmRecord > default
+        let pack_config = crate::cli::smolfile::resolve_pack_config(
+            None, // no image for --from-vm
+            self.entrypoint.clone(),
+            self.cpus,
+            self.mem,
+            self.oci_platform.clone(),
+            self.smolfile.clone(),
+            smolvm::agent::DEFAULT_CPUS,
+            PACK_DEFAULT_MEMORY_MIB,
+        )?;
+
+        // 6. Build manifest
         let platform = format!("linux/{}", Arch::current().oci_arch());
         let mut manifest =
             PackManifest::new(format!("vm://{}", vm_name), "none".to_string(), platform);
         manifest.mode = PackMode::Vm;
-        manifest.cpus = self.cpus;
-        manifest.mem = self.mem;
-        manifest.entrypoint = vec!["/bin/sh".to_string()];
+        manifest.cpus = pack_config.cpus;
+        manifest.mem = pack_config.mem;
 
-        // Inherit env/workdir from VmRecord
+        // Entrypoint baseline: VmRecord > /bin/sh default
+        manifest.entrypoint = if !vm.entrypoint.is_empty() {
+            vm.entrypoint.clone()
+        } else {
+            vec!["/bin/sh".to_string()]
+        };
+        manifest.cmd = vm.cmd.clone();
+
+        // Start with VmRecord env/workdir as baseline
         manifest.env = vm.env.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
         manifest.workdir = vm.workdir.clone();
 
-        // Override entrypoint if user provided one
-        if let Some(ref ep) = self.entrypoint {
-            manifest.entrypoint = vec![ep.clone()];
+        // Layer Smolfile env on top of VmRecord env
+        if !pack_config.env.is_empty() {
+            for e in &pack_config.env {
+                if let Some((key, _)) = e.split_once('=') {
+                    manifest.env.retain(|existing| {
+                        !existing.starts_with(&format!("{}=", key))
+                    });
+                }
+                manifest.env.push(e.clone());
+            }
+        }
+
+        // Smolfile workdir overrides VmRecord workdir
+        if pack_config.workdir.is_some() {
+            manifest.workdir = pack_config.workdir;
+        }
+
+        // Override entrypoint from Smolfile/[artifact] or CLI
+        if !pack_config.entrypoint.is_empty() {
+            manifest.entrypoint = pack_config.entrypoint;
+        }
+
+        // Override cmd from Smolfile/[artifact]
+        if !pack_config.cmd.is_empty() {
+            manifest.cmd = pack_config.cmd;
         }
 
         self.finalize_pack(manifest, collector, staging_dir)

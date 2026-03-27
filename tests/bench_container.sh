@@ -71,7 +71,7 @@ sleep 1
 measure_exec() {
     local START_TIME=$(python3 -c "import time; print(time.time())")
 
-    $SMOLVM sandbox run "$IMAGE" -- /bin/true > /dev/null 2>&1
+    $SMOLVM sandbox run --image "$IMAGE" -- /bin/true > /dev/null 2>&1
 
     local END_TIME=$(python3 -c "import time; print(time.time())")
     python3 -c "print(int(($END_TIME - $START_TIME) * 1000))"
@@ -124,7 +124,7 @@ declare -a ECHO_TIMES
 for i in $(seq 1 $ITERATIONS); do
     START_TIME=$(python3 -c "import time; print(time.time())")
 
-    $SMOLVM sandbox run "$IMAGE" -- /bin/echo "hello" > /dev/null 2>&1
+    $SMOLVM sandbox run --image "$IMAGE" -- /bin/echo "hello" > /dev/null 2>&1
 
     END_TIME=$(python3 -c "import time; print(time.time())")
     DURATION=$(python3 -c "print(int(($END_TIME - $START_TIME) * 1000))")

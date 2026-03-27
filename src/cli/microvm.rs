@@ -212,6 +212,9 @@ impl CreateCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let params = crate::cli::smolfile::build_create_params(
             self.name,
+            None,       // image: from Smolfile only
+            None,       // entrypoint: from Smolfile only
+            vec![],     // cmd: from Smolfile only
             self.cpus,
             self.mem,
             self.volume,

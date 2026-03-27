@@ -342,6 +342,18 @@ pub struct VmRecord {
     /// Overlay disk size in GiB (None = default 10 GiB).
     #[serde(default)]
     pub overlay_gb: Option<u64>,
+
+    /// OCI image for auto-container creation on start.
+    #[serde(default)]
+    pub image: Option<String>,
+
+    /// Entrypoint for the container.
+    #[serde(default)]
+    pub entrypoint: Vec<String>,
+
+    /// Default command for the container.
+    #[serde(default)]
+    pub cmd: Vec<String>,
 }
 
 fn default_cpus() -> u8 {
@@ -380,6 +392,9 @@ impl VmRecord {
             workdir: None,
             storage_gb: None,
             overlay_gb: None,
+            image: None,
+            entrypoint: Vec::new(),
+            cmd: Vec::new(),
         }
     }
 
@@ -411,6 +426,9 @@ impl VmRecord {
             workdir: None,
             storage_gb: None,
             overlay_gb: None,
+            image: None,
+            entrypoint: Vec::new(),
+            cmd: Vec::new(),
         }
     }
 

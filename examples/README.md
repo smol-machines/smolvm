@@ -1,43 +1,113 @@
 # Smolfile Examples
 
-A `.smolfile` is a recipe for smolvm to build a microVM in a reproducible way across different host environments. Similar to `Dockerfile` -> Docker container.
+A Smolfile is the declarative source of truth for a microVM workload. It describes what runs, what resources it needs, and how it behaves — then smolvm uses the same spec for local execution, artifact creation, and future deployment.
 
 ## Quick Start
 
-Here's a Smolfile. Run the commands below to recreate the same microVM setup on your machine:
+```bash
+# Run the OpenClaw gateway from a Smolfile
+smolvm sandbox run -d -s examples/openclaw-app/openclaw.smolfile
+curl http://localhost:18789/health
+
+# Run a Python dev environment
+smolvm sandbox run -s examples/python-app/python.smolfile
+
+# Run Doom in a browser
+smolvm sandbox run -d -s examples/doom-web/doom.smolfile
+open http://localhost:8080
+```
+
+### Persistent microVMs
 
 ```bash
 smolvm microvm create dev -s examples/python-app/python.smolfile
 smolvm microvm start dev
 smolvm microvm exec --name dev -- python3 --version
+smolvm microvm stop dev
 ```
 
-### Running OCI images
-
-Smolfiles can also configure VM resources for OCI container images via `sandbox run`:
+### Pack a distributable binary
 
 ```bash
-# Run the OpenClaw gateway (long-running, port-forwarded)
-smolvm sandbox run --net -d -s examples/openclaw-app/openclaw.smolfile alpine/openclaw:main -- openclaw gateway --port 18789 --allow-unconfigured
-curl http://localhost:18789/health
-
-# One-off command
-smolvm sandbox run --net -s examples/openclaw-app/openclaw.smolfile alpine/openclaw:main -- openclaw --version
+smolvm pack create -s examples/openclaw-app/openclaw.smolfile -o openclaw-packed
+./openclaw-packed
 ```
 
 ## Smolfile Reference
 
 ```toml
-cpus = 2                   # vCPUs (default: 1)
-memory = 1024              # MiB (default: 512)
-net = true                 # outbound networking (default: false)
-ports = ["8080:80"]        # HOST:GUEST port mapping
-volumes = ["./src:/app"]   # HOST:GUEST[:ro] volume mounts
-env = ["KEY=VALUE"]        # environment variables
-workdir = "/app"           # working directory for init commands
-storage = 40               # storage disk GiB (default: 20)
-overlay = 4                # overlay disk GiB (default: 2)
-init = ["apk add git"]     # commands run on every VM start
+# Top-level workload fields
+image = "ghcr.io/acme/api:1.2.3"    # OCI image (optional — omit for bare Alpine VM)
+entrypoint = ["/app/api"]            # executable and fixed leading arguments
+cmd = ["serve"]                      # default arguments appended to entrypoint
+env = ["PORT=8080"]                  # runtime environment variables
+workdir = "/app"                     # working directory
+
+# Resources
+cpus = 2                             # vCPUs (default: 1)
+memory = 1024                        # MiB (default: 512)
+net = true                           # outbound networking (default: false)
+storage = 40                         # storage disk GiB (default: 20)
+overlay = 4                          # overlay disk GiB (default: 2)
+
+# Service semantics (parsed, not yet wired)
+[service]
+listen = 8080                        # primary guest port
+protocol = "http"                    # service protocol
+
+# Health checks (parsed, not yet wired)
+[health]
+exec = ["curl", "-f", "http://127.0.0.1:8080/health"]
+interval = "10s"
+timeout = "2s"
+retries = 3
+
+# Restart policy (parsed, not yet wired)
+[restart]
+policy = "always"
+
+# Local development profile
+[dev]
+volumes = ["./src:/app"]             # host bind mounts
+env = ["APP_MODE=development"]       # dev-only env (extends top-level)
+init = ["npm install"]               # dev bootstrap commands
+workdir = "/app"                     # dev-only workdir override
+ports = ["8080:8080"]                # host:guest port forwarding
+
+# Artifact profile (for smolvm pack create -s)
+[artifact]
+cpus = 4                             # override resources for distribution
+memory = 2048
+entrypoint = ["/app/api"]            # override entrypoint for packed binary
+oci_platform = "linux/amd64"         # target OCI platform
+
+# Deployment profile (parsed, not yet wired)
+[deploy]
+replicas = 3
+strategy = "rolling"
 ```
 
-All fields are optional. CLI flags override scalar values; array values are merged.
+### Merge precedence
+
+CLI flags override Smolfile values. For `sandbox run`:
+
+```
+image:      --image flag > Smolfile image > None (bare Alpine VM)
+entrypoint: --entrypoint flag > Smolfile entrypoint > image metadata
+cmd:        trailing args (after --) > Smolfile cmd > image metadata
+env:        top-level env + [dev].env + CLI -e
+init:       [dev].init + CLI --init
+volumes:    [dev].volumes + CLI -v
+ports:      [dev].ports + CLI -p
+```
+
+For `pack create`:
+
+```
+image:      --image flag > Smolfile image
+entrypoint: --entrypoint flag > [artifact].entrypoint > Smolfile entrypoint > image metadata
+cmd:        [artifact].cmd > Smolfile cmd > image metadata
+cpus:       --cpus flag > [artifact].cpus > top-level cpus
+env:        image env + Smolfile env (dedup by key)
+workdir:    Smolfile workdir > image workdir
+```

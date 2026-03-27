@@ -45,7 +45,7 @@ test_pack_help() {
 test_pack_requires_output() {
     # Pack should fail without -o flag
     local exit_code=0
-    $SMOLVM pack create alpine:latest 2>&1 || exit_code=$?
+    $SMOLVM pack create --image alpine:latest 2>&1 || exit_code=$?
     [[ $exit_code -ne 0 ]]
 }
 
@@ -53,7 +53,7 @@ test_pack_alpine() {
     # Pack a minimal image
     local output="$TEST_DIR/test-alpine"
     local result
-    result=$($SMOLVM pack create alpine:latest -o "$output" 2>&1)
+    result=$($SMOLVM pack create --image alpine:latest -o "$output" 2>&1)
 
     # Binary should exist
     [[ -f "$output" ]]
@@ -68,7 +68,7 @@ test_pack_alpine() {
 test_pack_with_custom_resources() {
     # Pack with custom CPU/memory defaults
     local output="$TEST_DIR/test-resources"
-    $SMOLVM pack create alpine:latest -o "$output" --cpus 2 --mem 512 2>&1
+    $SMOLVM pack create --image alpine:latest -o "$output" --cpus 2 --mem 512 2>&1
 
     # Verify manifest has custom values
     local info
@@ -88,7 +88,7 @@ test_pack_with_platform() {
         host_arch="linux/amd64"
     fi
 
-    $SMOLVM pack create alpine:latest -o "$output" --oci-platform "$host_arch" 2>&1
+    $SMOLVM pack create --image alpine:latest -o "$output" --oci-platform "$host_arch" 2>&1
 
     # Binary should exist
     [[ -f "$output" ]]
@@ -108,7 +108,7 @@ test_packed_info() {
 
     # Ensure we have a packed binary
     if [[ ! -f "$output" ]]; then
-        $SMOLVM pack create alpine:latest -o "$output" 2>&1
+        $SMOLVM pack create --image alpine:latest -o "$output" 2>&1
     fi
 
     # Test --info
@@ -123,7 +123,7 @@ test_packed_version() {
     local output="$TEST_DIR/test-alpine"
 
     if [[ ! -f "$output" ]]; then
-        $SMOLVM pack create alpine:latest -o "$output" 2>&1
+        $SMOLVM pack create --image alpine:latest -o "$output" 2>&1
     fi
 
     local result
@@ -135,7 +135,7 @@ test_packed_help() {
     local output="$TEST_DIR/test-alpine"
 
     if [[ ! -f "$output" ]]; then
-        $SMOLVM pack create alpine:latest -o "$output" 2>&1
+        $SMOLVM pack create --image alpine:latest -o "$output" 2>&1
     fi
 
     local result
@@ -183,7 +183,7 @@ test_packed_run_echo() {
 
     # Ensure we have a packed binary with sidecar
     if [[ ! -f "$output" ]] || [[ ! -f "$output.smolmachine" ]]; then
-        $SMOLVM pack create alpine:latest -o "$output" 2>&1
+        $SMOLVM pack create --image alpine:latest -o "$output" 2>&1
     fi
 
     # Run with 60s timeout to prevent indefinite hangs
@@ -204,7 +204,7 @@ test_packed_exit_code() {
 
     # Ensure we have a packed binary
     if [[ ! -f "$output" ]]; then
-        $SMOLVM pack create alpine:latest -o "$output" 2>&1
+        $SMOLVM pack create --image alpine:latest -o "$output" 2>&1
     fi
 
     # Exit code 0 (with timeout)
@@ -225,7 +225,7 @@ test_packed_env_var() {
 
     # Ensure we have a packed binary
     if [[ ! -f "$output" ]]; then
-        $SMOLVM pack create alpine:latest -o "$output" 2>&1
+        $SMOLVM pack create --image alpine:latest -o "$output" 2>&1
     fi
 
     local result
@@ -239,7 +239,7 @@ test_packed_workdir() {
 
     # Ensure we have a packed binary
     if [[ ! -f "$output" ]]; then
-        $SMOLVM pack create alpine:latest -o "$output" 2>&1
+        $SMOLVM pack create --image alpine:latest -o "$output" 2>&1
     fi
 
     local result
@@ -256,7 +256,7 @@ test_sidecar_required() {
     local output="$TEST_DIR/test-sidecar"
 
     if [[ ! -f "$output" ]]; then
-        $SMOLVM pack create alpine:latest -o "$output" 2>&1
+        $SMOLVM pack create --image alpine:latest -o "$output" 2>&1
     fi
 
     # Remove sidecar
@@ -267,7 +267,7 @@ test_sidecar_required() {
     "$output" --info 2>&1 || exit_code=$?
 
     # Restore sidecar for other tests
-    $SMOLVM pack create alpine:latest -o "$output" 2>&1 >/dev/null
+    $SMOLVM pack create --image alpine:latest -o "$output" 2>&1 >/dev/null
 
     [[ $exit_code -ne 0 ]]
 }
@@ -279,7 +279,7 @@ test_sidecar_required() {
 test_single_file_pack() {
     # Pack with --single-file flag
     local output="$TEST_DIR/test-single-file"
-    $SMOLVM pack create alpine:latest -o "$output" --single-file 2>&1
+    $SMOLVM pack create --image alpine:latest -o "$output" --single-file 2>&1
 
     # Binary should exist and be executable
     [[ -f "$output" ]] || return 1
@@ -301,7 +301,7 @@ test_single_file_run_echo() {
     local output="$TEST_DIR/test-single-file"
 
     if [[ ! -f "$output" ]]; then
-        $SMOLVM pack create alpine:latest -o "$output" --single-file 2>&1
+        $SMOLVM pack create --image alpine:latest -o "$output" --single-file 2>&1
     fi
 
     # Run with 60s timeout to prevent indefinite hangs
@@ -331,7 +331,7 @@ test_pack_run_info() {
 
     # Ensure we have a packed binary with sidecar
     if [[ ! -f "$output.smolmachine" ]]; then
-        $SMOLVM pack create alpine:latest -o "$output" 2>&1
+        $SMOLVM pack create --image alpine:latest -o "$output" 2>&1
     fi
 
     # Test --info via pack run
@@ -354,7 +354,7 @@ test_pack_run_auto_detect() {
     local output="$TEST_DIR/test-alpine"
 
     if [[ ! -f "$output.smolmachine" ]]; then
-        $SMOLVM pack create alpine:latest -o "$output" 2>&1
+        $SMOLVM pack create --image alpine:latest -o "$output" 2>&1
     fi
 
     # Create a temp dir with a single .smolmachine file
@@ -390,7 +390,7 @@ test_pack_run_resource_override() {
     local output="$TEST_DIR/test-alpine"
 
     if [[ ! -f "$output.smolmachine" ]]; then
-        $SMOLVM pack create alpine:latest -o "$output" 2>&1
+        $SMOLVM pack create --image alpine:latest -o "$output" 2>&1
     fi
 
     # Verify resource override flags are accepted (boot with custom resources)
@@ -410,7 +410,7 @@ test_pack_run_force_extract() {
     local output="$TEST_DIR/test-alpine"
 
     if [[ ! -f "$output.smolmachine" ]]; then
-        $SMOLVM pack create alpine:latest -o "$output" 2>&1
+        $SMOLVM pack create --image alpine:latest -o "$output" 2>&1
     fi
 
     # Run with --force-extract and --debug to verify re-extraction
@@ -429,7 +429,7 @@ test_pack_run_cached_fast() {
     local output="$TEST_DIR/test-alpine"
 
     if [[ ! -f "$output.smolmachine" ]]; then
-        $SMOLVM pack create alpine:latest -o "$output" 2>&1
+        $SMOLVM pack create --image alpine:latest -o "$output" 2>&1
     fi
 
     # First run ensures cache exists
@@ -453,7 +453,7 @@ test_pack_run_python() {
     local output="$TEST_DIR/test-python"
 
     if [[ ! -f "$output.smolmachine" ]]; then
-        $SMOLVM pack create python:3.12-slim -o "$output" 2>&1
+        $SMOLVM pack create --image python:3.12-slim -o "$output" 2>&1
     fi
 
     local result
@@ -566,7 +566,7 @@ test_from_vm_cleanup() {
 test_pack_nonexistent_image() {
     local output="$TEST_DIR/test-nonexistent"
     local exit_code=0
-    $SMOLVM pack create nonexistent-image-that-does-not-exist:v999 -o "$output" 2>&1 || exit_code=$?
+    $SMOLVM pack create --image nonexistent-image-that-does-not-exist:v999 -o "$output" 2>&1 || exit_code=$?
     [[ $exit_code -ne 0 ]]
 }
 
@@ -581,7 +581,7 @@ test_pack_python() {
     fi
 
     local output="$TEST_DIR/test-python"
-    $SMOLVM pack create python:3.12-slim -o "$output" 2>&1
+    $SMOLVM pack create --image python:3.12-slim -o "$output" 2>&1
 
     [[ -f "$output" ]] && [[ -f "$output.smolmachine" ]]
 }
@@ -595,7 +595,7 @@ test_packed_python_run() {
     local output="$TEST_DIR/test-python"
 
     if [[ ! -f "$output" ]]; then
-        $SMOLVM pack create python:3.12-slim -o "$output" 2>&1
+        $SMOLVM pack create --image python:3.12-slim -o "$output" 2>&1
     fi
 
     local result
