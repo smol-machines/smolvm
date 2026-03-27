@@ -1,6 +1,6 @@
 use crate::data::error::{Error, Result};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Default size for the rootfs overlay disk (10 GiB sparse).
 ///
@@ -33,8 +33,37 @@ pub struct HostMount {
 
 impl HostMount {
     /// Protected host paths that must never be mounted into the guest.
-    const ILLEGAL_SOURCE_MOUNT_PATH: &[&str] = &[
-        "/", "/etc", "/var", "/usr", "/bin", "/sbin", "/lib", "/System", "/Library", "/private",
+    #[cfg(target_os = "macos")]
+    const ILLEGAL_SOURCE_MOUNT_PATH: &[(&str, bool)] = &[
+        ("/", false),
+        ("/private/var", false),
+        ("/private/var/run", true),
+        ("/private/var/log", true),
+        ("/private/etc", true),
+        ("/usr", true),
+        ("/bin", true),
+        ("/sbin", true),
+        ("/lib", true),
+        ("/System", true),
+        ("/Library", true),
+    ];
+
+    /// Protected host paths that must never be mounted into the guest.
+    #[cfg(target_os = "linux")]
+    const ILLEGAL_SOURCE_MOUNT_PATH: &[(&str, bool)] = &[
+        ("/", false),
+        ("/var", false),
+        ("/var/run", true),
+        ("/var/log", true),
+        ("/etc", true),
+        ("/usr", true),
+        ("/bin", true),
+        ("/sbin", true),
+        ("/lib", true),
+        ("/proc", true),
+        ("/sys", true),
+        ("/dev", true),
+        ("/run", true),
     ];
 
     /// Create a host mount with an explicit read-only flag.
@@ -48,13 +77,30 @@ impl HostMount {
             target: target.into(),
             read_only,
         };
-        Self::validate(&mount)?;
+
+        if !mount.source.exists() {
+            return Err(Error::MountSourceNotFound {
+                path: mount.source.clone(),
+            });
+        }
+
+        if !mount.source.is_dir() {
+            return Err(Error::mount(
+                "validate host path",
+                format!(
+                    "source path on host must be a directory (virtiofs limitation): {}",
+                    mount.source.display()
+                ),
+            ));
+        }
+
         mount.source = mount.source.canonicalize().map_err(|e| {
             Error::mount(
                 "canonicalize host path",
                 format!("'{}': {}", mount.source.display(), e),
             )
         })?;
+        Self::validate(&mount)?;
         Ok(mount)
     }
 
@@ -82,25 +128,11 @@ impl HostMount {
     }
 
     fn validate(mount: &Self) -> Result<()> {
-        if !mount.source.exists() {
-            return Err(Error::MountSourceNotFound {
-                path: mount.source.clone(),
-            });
-        }
-
-        if !mount.source.is_dir() {
-            return Err(Error::mount(
-                "validate host path",
-                format!(
-                    "source path on host must be a directory (virtiofs limitation): {}",
-                    mount.source.display()
-                ),
-            ));
-        }
-
-        let source = mount.source.to_string_lossy();
-        for illegal_path in Self::ILLEGAL_SOURCE_MOUNT_PATH {
-            if source == *illegal_path || source.starts_with(&format!("{}/", illegal_path)) {
+        for (illegal_path, block_subtree) in Self::ILLEGAL_SOURCE_MOUNT_PATH {
+            let illegal_path = Path::new(illegal_path);
+            if mount.source == illegal_path
+                || (*block_subtree && mount.source.starts_with(illegal_path))
+            {
                 return Err(Error::mount(
                     "validate host path",
                     format!(
@@ -164,7 +196,7 @@ mod tests {
 
     #[test]
     fn test_new_mount_rejects_illegal_source_mount_path() {
-        for path in ["/", "/etc", "/var/log"] {
+        for path in ["/", "/etc", "/var", "/var/run", "/var/log"] {
             let result = HostMount::new(path, "/guest/path", true);
             assert!(result.is_err(), "{} should be rejected", path);
             let err_msg = result.unwrap_err().to_string();
@@ -181,6 +213,21 @@ mod tests {
                 err_msg
             );
         }
+    }
+
+    #[test]
+    fn test_new_mount_allows_safe_source_under_var() {
+        let temp_dir = std::env::temp_dir().join("smolvm-safe-var-path");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let result = HostMount::new(&temp_dir, "/guest/path", true);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        assert!(
+            result.is_ok(),
+            "safe paths under the OS temp directory should remain mountable"
+        );
     }
 
     #[test]
