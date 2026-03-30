@@ -11,6 +11,7 @@ set -e
 
 # Options
 WITH_LOCAL_LIBKRUN=0
+SKIP_AGENT_BUILD=0
 LOCAL_LIBKRUN_DIR=""
 LIBKRUN_MAKE_FLAGS="${LIBKRUN_MAKE_FLAGS:-BLK=1}"
 
@@ -24,12 +25,14 @@ Usage:
 Options:
   --with-local-libkrun       Build libkrun from local checkout and refresh bundled lib/
   --local-libkrun-dir PATH   Local libkrun checkout (default: ../libkrun)
+  --skip-agent-build         Skip agent cross-compilation (use pre-built binary)
   -h, --help                 Show this help text
 
 Environment:
   LIBKRUN_MAKE_FLAGS   make flags for local libkrun build (default: BLK=1)
   LIBCLANG_PATH        path to libclang.dylib (auto-detected from brew llvm on macOS)
   LIB_DIR              Override bundled library directory used by smolvm build
+  CODESIGN_IDENTITY    macOS code signing identity (default: - for ad-hoc)
 EOF
 }
 
@@ -37,6 +40,10 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --with-local-libkrun)
             WITH_LOCAL_LIBKRUN=1
+            shift
+            ;;
+        --skip-agent-build)
+            SKIP_AGENT_BUILD=1
             shift
             ;;
         --local-libkrun-dir)
@@ -218,42 +225,58 @@ if [[ ! -f "$WORK_LIB_DIR/libkrunfw.5.dylib" ]] && [[ ! -f "$WORK_LIB_DIR/libkru
     exit 1
 fi
 
-# Check for Docker (required for cross-compiling agent)
-if ! command -v docker &> /dev/null; then
-    echo "Error: Docker is required to cross-compile the agent for Linux"
-    exit 1
-fi
-
 # Build release binaries
 echo "Building release binaries..."
 LIBKRUN_BUNDLE="$WORK_LIB_DIR" cargo build --release --bin smolvm
 
 # Build smolvm-agent for Linux (size-optimized)
-echo "Building smolvm-agent for Linux (optimized for size)..."
-if [[ "$(uname -s)" == "Linux" ]]; then
-    # On Linux, build natively with musl for static linking
-    if command -v cargo &> /dev/null; then
-        # Check if musl target is available
-        if rustup target list --installed 2>/dev/null | grep -q musl; then
-            cargo build --profile release-small -p smolvm-agent --target x86_64-unknown-linux-musl
-        else
-            # Fall back to Docker build
-            docker run --rm --network=host -v "$PROJECT_ROOT:/work" -w /work rust:alpine sh -c \
-                "apk add musl-dev && cargo build --profile release-small -p smolvm-agent"
-        fi
-    else
-        docker run --rm --network=host -v "$PROJECT_ROOT:/work" -w /work rust:alpine sh -c \
-            "apk add musl-dev && cargo build --profile release-small -p smolvm-agent"
+if [[ "$SKIP_AGENT_BUILD" == "1" ]]; then
+    echo "Skipping agent build (--skip-agent-build)"
+    if [[ ! -f "./target/release-small/smolvm-agent" ]]; then
+        echo "Error: --skip-agent-build requires a pre-built agent at target/release-small/smolvm-agent"
+        exit 1
     fi
 else
-    docker run --rm -v "$PROJECT_ROOT:/work" -w /work rust:alpine sh -c \
-        "apk add musl-dev && cargo build --profile release-small -p smolvm-agent"
+    echo "Building smolvm-agent for Linux (optimized for size)..."
+    if [[ "$(uname -s)" == "Linux" ]]; then
+        # On Linux, build natively with musl for static linking
+        if command -v cargo &> /dev/null; then
+            if rustup target list --installed 2>/dev/null | grep -q musl; then
+                cargo build --profile release-small -p smolvm-agent --target x86_64-unknown-linux-musl
+                # Copy to the non-target-triple path that the rest of the script expects
+                mkdir -p ./target/release-small
+                cp "./target/x86_64-unknown-linux-musl/release-small/smolvm-agent" \
+                   "./target/release-small/smolvm-agent"
+            fi
+        fi
+    fi
+
+    # If native build didn't produce the binary, use smolvm
+    if [[ ! -f "./target/release-small/smolvm-agent" ]]; then
+        if command -v smolvm &> /dev/null; then
+            echo "Building via smolvm (rust:alpine)..."
+            smolvm machine run --net --mem 2048 -v "$PROJECT_ROOT:/work" --image rust:alpine \
+                -- sh -c ". /usr/local/cargo/env && apk add musl-dev && cd /work && cargo build --profile release-small -p smolvm-agent"
+        else
+            echo "Error: Cannot build smolvm-agent."
+            echo "  Install smolvm or the musl target (rustup target add x86_64-unknown-linux-musl)"
+            exit 1
+        fi
+    fi
 fi
 
 # Sign binary (macOS only)
+# Set CODESIGN_IDENTITY to a Developer ID for distribution signing.
+# Defaults to ad-hoc signing (-) for local development.
 if [[ "$(uname -s)" == "Darwin" ]]; then
-    echo "Signing binary..."
-    codesign --force --sign - --entitlements smolvm.entitlements ./target/release/smolvm
+    IDENTITY="${CODESIGN_IDENTITY:--}"
+    CODESIGN_ARGS=(--force --sign "$IDENTITY" --entitlements smolvm.entitlements)
+    if [[ "$IDENTITY" != "-" ]]; then
+        # Developer ID signing requires hardened runtime for notarization
+        CODESIGN_ARGS+=(--options runtime)
+    fi
+    echo "Signing binary (identity: $IDENTITY)..."
+    codesign "${CODESIGN_ARGS[@]}" ./target/release/smolvm
 fi
 
 # Create distribution directory
@@ -423,12 +446,13 @@ USAGE
 
 Run the 'smolvm' script (not smolvm-bin directly):
 
-  ./smolvm sandbox run alpine:latest echo "Hello World"
-  ./smolvm microvm create --name myvm alpine:latest /bin/sh
-  ./smolvm microvm start myvm
-  ./smolvm microvm ls
-  ./smolvm microvm stop myvm
-  ./smolvm microvm delete myvm
+  ./smolvm machine run --net --image alpine -- echo "Hello World"
+  ./smolvm machine create --net myvm
+  ./smolvm machine start --name myvm
+  ./smolvm machine exec --name myvm -- /bin/sh
+  ./smolvm machine ls
+  ./smolvm machine stop --name myvm
+  ./smolvm machine delete myvm
 
 TROUBLESHOOTING
 ===============

@@ -7,7 +7,7 @@
 # - smolvm-agent daemon
 # - Required utilities (jq, e2fsprogs, util-linux)
 #
-# Usage: ./scripts/build-agent-rootfs.sh [output-dir]
+# Usage: ./scripts/build-agent-rootfs.sh [--arch aarch64|x86_64] [--no-build-agent] [--install] [output-dir]
 
 set -euo pipefail
 
@@ -16,11 +16,20 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Parse flags
 INSTALL_ROOTFS=0
+OVERRIDE_ARCH=""
+NO_BUILD_AGENT=0
 POSITIONAL_ARGS=()
-for arg in "$@"; do
-    case "$arg" in
-        --install) INSTALL_ROOTFS=1 ;;
-        *) POSITIONAL_ARGS+=("$arg") ;;
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --install) INSTALL_ROOTFS=1; shift ;;
+        --arch)
+            if [[ -z "${2:-}" ]]; then
+                echo "Error: --arch requires a value (aarch64 or x86_64)"
+                exit 1
+            fi
+            OVERRIDE_ARCH="$2"; shift 2 ;;
+        --no-build-agent) NO_BUILD_AGENT=1; shift ;;
+        *) POSITIONAL_ARGS+=("$1"); shift ;;
     esac
 done
 export INSTALL_ROOTFS
@@ -29,10 +38,10 @@ OUTPUT_DIR="${POSITIONAL_ARGS[0]:-$PROJECT_ROOT/target/agent-rootfs}"
 
 # Alpine version
 ALPINE_VERSION="3.19"
-ALPINE_ARCH="aarch64"  # Change to x86_64 for Intel
 
-# Detect architecture
-case "$(uname -m)" in
+# Detect or override architecture
+DETECTED_ARCH="${OVERRIDE_ARCH:-$(uname -m)}"
+case "$DETECTED_ARCH" in
     arm64|aarch64)
         ALPINE_ARCH="aarch64"
         CRANE_ARCH="arm64"
@@ -44,7 +53,7 @@ case "$(uname -m)" in
         RUST_TARGET="x86_64-unknown-linux-musl"
         ;;
     *)
-        echo "Unsupported architecture: $(uname -m)"
+        echo "Unsupported architecture: $DETECTED_ARCH"
         exit 1
         ;;
 esac
@@ -79,7 +88,7 @@ tar -xzf "$ALPINE_TAR" -C "$OUTPUT_DIR"
 
 # Download crane
 echo "Downloading crane..."
-CRANE_TAR="/tmp/crane-${CRANE_VERSION}.tar.gz"
+CRANE_TAR="/tmp/crane-${CRANE_VERSION}-${CRANE_ARCH}.tar.gz"
 if [ ! -f "$CRANE_TAR" ]; then
     curl -fsSL -o "$CRANE_TAR" "$CRANE_URL"
 fi
@@ -89,22 +98,71 @@ echo "Installing crane..."
 mkdir -p "$OUTPUT_DIR/usr/local/bin"
 tar -xzf "$CRANE_TAR" -C "$OUTPUT_DIR/usr/local/bin" crane
 
-# Install additional packages using Docker
-echo "Installing additional packages via Docker..."
-if command -v docker &> /dev/null; then
-    docker run --rm -v "$OUTPUT_DIR:/rootfs" "alpine:${ALPINE_VERSION}" sh -c '
-        apk add --root /rootfs --initdb --no-cache \
-            jq \
-            e2fsprogs \
-            e2fsprogs-extra \
-            crun \
-            util-linux \
-            libcap
-    '
+# Install additional Alpine packages into the rootfs.
+# Strategies:
+#   1. apk.static (Linux only) — runs natively, supports cross-arch via --arch
+#   2. smolvm (any host) — only for native-arch builds (pulls host-arch image)
+echo "Installing additional packages..."
+APK_PACKAGES="jq e2fsprogs e2fsprogs-extra crun util-linux libcap"
+
+# Determine if this is a cross-arch build
+HOST_ARCH="$(uname -m)"
+case "$HOST_ARCH" in
+    arm64) HOST_ALPINE_ARCH="aarch64" ;;
+    amd64) HOST_ALPINE_ARCH="x86_64" ;;
+    *)     HOST_ALPINE_ARCH="$HOST_ARCH" ;;
+esac
+CROSS_ARCH=0
+if [[ "$ALPINE_ARCH" != "$HOST_ALPINE_ARCH" ]]; then
+    CROSS_ARCH=1
+fi
+
+install_packages_apk_static() {
+    echo "  Using apk.static..."
+    # Download Alpine's static apk binary — runs natively on Linux,
+    # can install packages for any target architecture via --arch.
+    APK_STATIC_MIRROR="${ALPINE_MIRROR}/v${ALPINE_VERSION}/main/${HOST_ARCH}"
+    APK_STATIC_PKG=$(curl -fsSL "$APK_STATIC_MIRROR/" | grep -o 'apk-tools-static-[^"]*\.apk' | head -1)
+    if [[ -z "$APK_STATIC_PKG" ]]; then
+        echo "Error: could not find apk-tools-static package at $APK_STATIC_MIRROR"
+        exit 1
+    fi
+    curl -fsSL -o /tmp/apk-static.apk "${APK_STATIC_MIRROR}/${APK_STATIC_PKG}"
+    mkdir -p /tmp/apk-static
+    tar -xzf /tmp/apk-static.apk -C /tmp/apk-static 2>/dev/null || true
+
+    # Set up apk repositories in the rootfs
+    mkdir -p "$OUTPUT_DIR/etc/apk"
+    echo "${ALPINE_MIRROR}/v${ALPINE_VERSION}/main" > "$OUTPUT_DIR/etc/apk/repositories"
+    echo "${ALPINE_MIRROR}/v${ALPINE_VERSION}/community" >> "$OUTPUT_DIR/etc/apk/repositories"
+
+    /tmp/apk-static/sbin/apk.static \
+        --root "$OUTPUT_DIR" \
+        --initdb \
+        --no-cache \
+        --allow-untrusted \
+        --arch "$ALPINE_ARCH" \
+        add $APK_PACKAGES
+    echo "Packages installed successfully"
+}
+
+if [[ "$(uname -s)" == "Linux" ]]; then
+    # On Linux, apk.static is preferred — it handles cross-arch correctly
+    install_packages_apk_static
+elif [[ "$CROSS_ARCH" == "1" ]]; then
+    echo "Error: cross-arch rootfs builds (--arch $ALPINE_ARCH on $HOST_ALPINE_ARCH host)"
+    echo "       are only supported on Linux (uses apk.static)."
+    echo "       On macOS, omit --arch or use the same architecture as your host."
+    exit 1
+elif command -v smolvm &> /dev/null; then
+    echo "  Using smolvm..."
+    smolvm machine run --net -v "$OUTPUT_DIR:/rootfs" --image "alpine:${ALPINE_VERSION}" \
+        -- sh -c "apk add --root /rootfs --initdb --no-cache $APK_PACKAGES"
     echo "Packages installed successfully"
 else
-    echo "Warning: Docker not found, skipping package installation"
-    echo "You may need to install packages manually: jq e2fsprogs crun util-linux"
+    echo "Error: smolvm is required to build the agent rootfs on macOS"
+    echo "Install smolvm first: https://github.com/smolvm/smolvm"
+    exit 1
 fi
 
 # Create necessary directories
@@ -123,12 +181,10 @@ echo "nameserver 1.1.1.1" > "$OUTPUT_DIR/etc/resolv.conf"
 
 PROFILE="release-small"
 
-# Build smolvm-agent for Linux (statically linked with musl)
-echo "Building smolvm-agent for Linux ($RUST_TARGET, profile: $PROFILE)..."
-
-# Allow using a pre-built agent binary via AGENT_BINARY env var
 if [[ -n "${AGENT_BINARY:-}" ]] && [[ -f "${AGENT_BINARY}" ]]; then
     echo "Using pre-built agent binary: $AGENT_BINARY"
+elif [[ "$NO_BUILD_AGENT" == "1" ]]; then
+    echo "Skipping agent build (--no-build-agent)"
 else
     AGENT_BINARY=""
 
@@ -142,35 +198,37 @@ else
         fi
     fi
 
-    # Strategy 2: Docker with rust:alpine
+    # Strategy 2: smolvm with rust:alpine (dogfooding)
     if [[ -z "$AGENT_BINARY" ]] || [[ ! -f "$AGENT_BINARY" ]]; then
-        if command -v docker &> /dev/null; then
-            echo "Building via Docker (rust:alpine)..."
-            docker run --rm --network=host -v "$PROJECT_ROOT:/work" -w /work rust:alpine sh -c \
-                "apk add musl-dev && cargo build --profile $PROFILE -p smolvm-agent"
+        if command -v smolvm &> /dev/null; then
+            echo "Building via smolvm (rust:alpine)..."
+            smolvm machine run --net --mem 2048 -v "$PROJECT_ROOT:/work" --image rust:alpine \
+                -- sh -c ". /usr/local/cargo/env && apk add musl-dev && cd /work && cargo build --profile $PROFILE -p smolvm-agent"
             AGENT_BINARY="$PROJECT_ROOT/target/$PROFILE/smolvm-agent"
         else
             echo "Error: Cannot build smolvm-agent"
             echo "  Either install the musl target: rustup target add $RUST_TARGET"
-            echo "  Or install Docker for cross-compilation"
+            echo "  Or install smolvm for cross-compilation"
             exit 1
         fi
     fi
 fi
 
-if [[ ! -f "$AGENT_BINARY" ]]; then
-    echo "Error: smolvm-agent binary not found at $AGENT_BINARY"
+# Install the agent binary into the rootfs (if we have one)
+if [[ -n "${AGENT_BINARY:-}" ]] && [[ -f "${AGENT_BINARY}" ]]; then
+    echo "Installing smolvm-agent binary..."
+    cp "$AGENT_BINARY" "$OUTPUT_DIR/usr/local/bin/smolvm-agent"
+    chmod +x "$OUTPUT_DIR/usr/local/bin/smolvm-agent"
+elif [[ "$NO_BUILD_AGENT" != "1" ]]; then
+    echo "Error: smolvm-agent binary not found at ${AGENT_BINARY:-<unset>}"
     exit 1
 fi
 
-# Install the agent binary into the rootfs
-echo "Installing smolvm-agent binary..."
-cp "$AGENT_BINARY" "$OUTPUT_DIR/usr/local/bin/smolvm-agent"
-chmod +x "$OUTPUT_DIR/usr/local/bin/smolvm-agent"
-
 echo ""
 echo "Agent rootfs created at: $OUTPUT_DIR"
-echo "Agent binary: $AGENT_BINARY"
+if [[ -n "${AGENT_BINARY:-}" ]]; then
+    echo "Agent binary: $AGENT_BINARY"
+fi
 echo "Rootfs size: $(du -sh "$OUTPUT_DIR" | cut -f1)"
 
 # Install to runtime data directory if --install flag is passed

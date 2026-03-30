@@ -1,0 +1,277 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ==========================================================================
+  # Run CI checks first
+  # ==========================================================================
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  # ==========================================================================
+  # Build agent binaries (both architectures)
+  # ==========================================================================
+  build-agent:
+    name: Build agent (${{ matrix.arch }})
+    needs: ci
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-musl
+            linker_pkg: ""
+            linker_env: ""
+          - arch: aarch64
+            target: aarch64-unknown-linux-musl
+            linker_pkg: gcc-aarch64-linux-gnu
+            linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: agent-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: agent-${{ matrix.arch }}-cargo-
+
+      - name: Install cross-compilation tools
+        if: matrix.linker_pkg != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools ${{ matrix.linker_pkg }}
+
+      - name: Install musl-tools
+        if: matrix.linker_pkg == ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Build agent
+        run: |
+          ${{ matrix.linker_env }} \
+          cargo build --profile release-small -p smolvm-agent --target ${{ matrix.target }}
+
+      - name: Verify static binary
+        run: file target/${{ matrix.target }}/release-small/smolvm-agent
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-${{ matrix.arch }}
+          path: target/${{ matrix.target }}/release-small/smolvm-agent
+
+  # ==========================================================================
+  # Build agent rootfs (both architectures)
+  # ==========================================================================
+  build-rootfs:
+    name: Build rootfs (${{ matrix.arch }})
+    needs: build-agent
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: aarch64
+          - arch: x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download agent binary
+        uses: actions/download-artifact@v4
+        with:
+          name: agent-${{ matrix.arch }}
+          path: /tmp/agent/
+
+      - name: Build rootfs
+        run: |
+          chmod +x /tmp/agent/smolvm-agent
+          AGENT_BINARY=/tmp/agent/smolvm-agent \
+            ./scripts/build-agent-rootfs.sh --arch ${{ matrix.arch }} --no-build-agent
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rootfs-${{ matrix.arch }}
+          path: target/agent-rootfs/
+
+  # ==========================================================================
+  # Build distribution tarballs (per platform)
+  # ==========================================================================
+  build-dist:
+    name: Build dist (${{ matrix.platform }})
+    needs: [build-agent, build-rootfs]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - platform: darwin-arm64
+            runner: macos-14
+            rootfs_arch: aarch64
+            agent_arch: aarch64
+            lib_dir: lib
+          - platform: linux-x86_64
+            runner: ubuntu-latest
+            rootfs_arch: x86_64
+            agent_arch: x86_64
+            lib_dir: lib/linux-x86_64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+          submodules: ${{ matrix.platform == 'linux-x86_64' && 'recursive' || 'false' }}
+
+      - name: Pull LFS files
+        run: git lfs pull
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: dist-${{ matrix.platform }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: dist-${{ matrix.platform }}-cargo-
+
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libssl-dev pkg-config e2fsprogs
+
+      - name: Install build dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install e2fsprogs
+
+      - name: Verify LFS libraries
+        run: |
+          echo "Library directory: ${{ matrix.lib_dir }}"
+          ls -la ${{ matrix.lib_dir }}/
+          file ${{ matrix.lib_dir }}/*
+
+      - name: Download rootfs
+        uses: actions/download-artifact@v4
+        with:
+          name: rootfs-${{ matrix.rootfs_arch }}
+          path: target/agent-rootfs/
+
+      - name: Download agent binary
+        uses: actions/download-artifact@v4
+        with:
+          name: agent-${{ matrix.agent_arch }}
+          path: /tmp/agent/
+
+      - name: Place agent binary for build-dist.sh
+        run: |
+          mkdir -p target/release-small
+          cp /tmp/agent/smolvm-agent target/release-small/smolvm-agent
+          chmod +x target/release-small/smolvm-agent
+
+      # Import Developer ID certificate if available (macOS only).
+      # Set secrets APPLE_CERTIFICATE_P12 (base64-encoded .p12) and
+      # APPLE_CERTIFICATE_PASSWORD in your GitHub repo settings.
+      - name: Import signing certificate (macOS)
+        if: runner.os == 'macOS' && env.APPLE_CERTIFICATE_P12 != ''
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          echo "$APPLE_CERTIFICATE_P12" | base64 --decode > /tmp/certificate.p12
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 16)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security import /tmp/certificate.p12 -k build.keychain \
+            -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: \
+            -s -k "$KEYCHAIN_PASSWORD" build.keychain
+          rm /tmp/certificate.p12
+
+      - name: Build distribution tarball
+        run: ./scripts/build-dist.sh --skip-agent-build
+        env:
+          LIB_DIR: ${{ matrix.lib_dir }}
+          CODESIGN_IDENTITY: ${{ secrets.APPLE_CERTIFICATE_P12 != '' && secrets.CODESIGN_IDENTITY || '-' }}
+
+      # Notarize the macOS binary if Developer ID signing was used.
+      # Requires secrets: APPLE_ID, APPLE_TEAM_ID, APPLE_APP_PASSWORD.
+      - name: Notarize (macOS)
+        if: runner.os == 'macOS' && env.APPLE_CERTIFICATE_P12 != ''
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          TARBALL=$(ls dist/smolvm-*.tar.gz)
+          xcrun notarytool submit "$TARBALL" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --wait
+
+      - name: List distribution contents
+        run: |
+          VERSION="$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)"
+          ls -la "dist/smolvm-${VERSION}-"*/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.platform }}
+          path: dist/smolvm-*.tar.gz
+
+  # ==========================================================================
+  # Create GitHub Release
+  # ==========================================================================
+  release:
+    name: Create Release
+    needs: build-dist
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist/
+          merge-multiple: true
+
+      - name: List release artifacts
+        run: ls -la dist/
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum *.tar.gz > checksums.sha256
+          cat checksums.sha256
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "smolvm ${{ github.ref_name }}" \
+            --generate-notes \
+            dist/*.tar.gz \
+            dist/checksums.sha256

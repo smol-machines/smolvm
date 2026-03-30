@@ -14,12 +14,6 @@ ROOTFS_DIR="$HOME/Library/Application Support/smolvm/agent-rootfs"
 
 cd "$PROJECT_DIR"
 
-# Check if Docker is available
-if ! command -v docker &> /dev/null; then
-    echo "Error: Docker is required to cross-compile the agent"
-    exit 1
-fi
-
 # Clean build artifacts if requested
 CLEAN_CMD=""
 if [[ "$1" == "--clean" ]]; then
@@ -32,8 +26,14 @@ if [[ "$1" == "--clean" ]]; then
 fi
 
 echo "Building smolvm-agent for Linux..."
-docker run --rm -v "$PROJECT_DIR:/work" -w /work rust:alpine sh -c \
-    "apk add musl-dev && ${CLEAN_CMD}cargo build --release -p smolvm-agent"
+if command -v smolvm &> /dev/null; then
+    smolvm machine run --net --mem 2048 -v "$PROJECT_DIR:/work" --image rust:alpine \
+        -- sh -c ". /usr/local/cargo/env && apk add musl-dev && cd /work && ${CLEAN_CMD}cargo build --release -p smolvm-agent"
+else
+    echo "Error: smolvm is required to cross-compile the agent"
+    echo "Install smolvm first: https://github.com/smolvm/smolvm"
+    exit 1
+fi
 
 # Check if rootfs directory exists
 if [[ ! -d "$ROOTFS_DIR/usr/local/bin" ]]; then

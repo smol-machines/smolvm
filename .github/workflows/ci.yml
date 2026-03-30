@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_call:
 
 env:
   CARGO_TERM_COLOR: always
@@ -75,18 +76,7 @@ jobs:
           DYLD_LIBRARY_PATH: ${{ github.workspace }}/lib
 
       - name: Sign binary
-        run: |
-          cat > /tmp/entitlements.plist << 'EOF'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-              <key>com.apple.security.hypervisor</key>
-              <true/>
-          </dict>
-          </plist>
-          EOF
-          codesign --sign - --entitlements /tmp/entitlements.plist --force target/release/smolvm
+        run: codesign --force --sign - --entitlements smolvm.entitlements target/release/smolvm
 
       - name: Verify binary runs
         run: ./target/release/smolvm --version
