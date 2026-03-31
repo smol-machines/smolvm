@@ -15,5 +15,5 @@
 
 #[path = "errors.rs"]
 pub mod error;
-pub mod sandbox;
+pub mod machine;
 pub mod types;

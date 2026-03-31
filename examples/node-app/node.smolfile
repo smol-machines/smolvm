@@ -1,9 +1,9 @@
 # Node.js dev environment in a hardware-isolated microVM
 #
-#   smolvm sandbox run -s examples/node-app/node.smolfile
-#   smolvm microvm create dev -s node.smolfile
-#   smolvm microvm start dev
-#   smolvm microvm exec --name dev -- node -e "console.log('hello')"
+#   smolvm machine run -s examples/node-app/node.smolfile
+#   smolvm machine create dev -s node.smolfile
+#   smolvm machine start dev
+#   smolvm machine exec --name dev -- node -e "console.log('hello')"
 
 image = "node:22-alpine"
 entrypoint = ["node"]

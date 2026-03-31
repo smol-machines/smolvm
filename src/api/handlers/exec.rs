@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::api::error::{classify_ensure_running_error, ApiError};
-use crate::api::state::{ensure_running_and_persist, with_sandbox_client, ApiState};
+use crate::api::state::{ensure_running_and_persist, with_machine_client, ApiState};
 use crate::api::types::{
     ApiErrorResponse, EnvVar, ExecRequest, ExecResponse, LogsQuery, RunRequest,
 };
@@ -21,21 +21,21 @@ use crate::data::consts::BYTES_PER_MIB;
 use crate::data::storage::HostMount;
 use tokio::sync::Semaphore;
 
-/// Execute a command in a sandbox.
+/// Execute a command in a machine.
 ///
 /// This executes directly in the VM (not in a container).
 #[utoipa::path(
     post,
-    path = "/api/v1/sandboxes/{id}/exec",
+    path = "/api/v1/machines/{id}/exec",
     tag = "Execution",
     params(
-        ("id" = String, Path, description = "Sandbox name")
+        ("id" = String, Path, description = "Machine name")
     ),
     request_body = ExecRequest,
     responses(
         (status = 200, description = "Command executed", body = ExecResponse),
         (status = 400, description = "Invalid request", body = ApiErrorResponse),
-        (status = 404, description = "Sandbox not found", body = ApiErrorResponse),
+        (status = 404, description = "Machine not found", body = ApiErrorResponse),
         (status = 500, description = "Execution failed", body = ApiErrorResponse)
     )
 )]
@@ -46,9 +46,9 @@ pub async fn exec_command(
 ) -> Result<Json<ExecResponse>, ApiError> {
     validate_command(&req.command)?;
 
-    let entry = state.get_sandbox(&id)?;
+    let entry = state.get_machine(&id)?;
 
-    // Ensure sandbox is running and persist state to DB
+    // Ensure machine is running and persist state to DB
     ensure_running_and_persist(&state, &id, &entry)
         .await
         .map_err(classify_ensure_running_error)?;
@@ -59,7 +59,7 @@ pub async fn exec_command(
     let timeout = req.timeout_secs.map(Duration::from_secs);
 
     let (exit_code, stdout, stderr) =
-        with_sandbox_client(&entry, move |c| c.vm_exec(command, env, workdir, timeout)).await?;
+        with_machine_client(&entry, move |c| c.vm_exec(command, env, workdir, timeout)).await?;
 
     Ok(Json(ExecResponse {
         exit_code,
@@ -73,16 +73,16 @@ pub async fn exec_command(
 /// This creates a temporary overlay from the image and runs the command.
 #[utoipa::path(
     post,
-    path = "/api/v1/sandboxes/{id}/run",
+    path = "/api/v1/machines/{id}/run",
     tag = "Execution",
     params(
-        ("id" = String, Path, description = "Sandbox name")
+        ("id" = String, Path, description = "Machine name")
     ),
     request_body = RunRequest,
     responses(
         (status = 200, description = "Command executed", body = ExecResponse),
         (status = 400, description = "Invalid request", body = ApiErrorResponse),
-        (status = 404, description = "Sandbox not found", body = ApiErrorResponse),
+        (status = 404, description = "Machine not found", body = ApiErrorResponse),
         (status = 500, description = "Execution failed", body = ApiErrorResponse)
     )
 )]
@@ -93,9 +93,9 @@ pub async fn run_command(
 ) -> Result<Json<ExecResponse>, ApiError> {
     validate_command(&req.command)?;
 
-    let entry = state.get_sandbox(&id)?;
+    let entry = state.get_machine(&id)?;
 
-    // Ensure sandbox is running and persist state to DB
+    // Ensure machine is running and persist state to DB
     ensure_running_and_persist(&state, &id, &entry)
         .await
         .map_err(classify_ensure_running_error)?;
@@ -106,7 +106,7 @@ pub async fn run_command(
     let workdir = req.workdir.clone();
     let timeout = req.timeout_secs.map(Duration::from_secs);
 
-    // Get mounts from sandbox config (converted to protocol format)
+    // Get mounts from machine config (converted to protocol format)
     let mounts_config = {
         let entry = entry.lock();
         entry
@@ -120,7 +120,7 @@ pub async fn run_command(
             .collect::<Vec<_>>()
     };
 
-    let (exit_code, stdout, stderr) = with_sandbox_client(&entry, move |c| {
+    let (exit_code, stdout, stderr) = with_machine_client(&entry, move |c| {
         c.run_with_mounts_and_timeout(&image, command, env, workdir, mounts_config, timeout)
     })
     .await?;
@@ -138,19 +138,19 @@ pub async fn run_command(
 static LOG_FOLLOW_SEMAPHORE: std::sync::LazyLock<Semaphore> =
     std::sync::LazyLock::new(|| Semaphore::new(16));
 
-/// Stream sandbox console logs via SSE.
+/// Stream machine console logs via SSE.
 #[utoipa::path(
     get,
-    path = "/api/v1/sandboxes/{id}/logs",
+    path = "/api/v1/machines/{id}/logs",
     tag = "Logs",
     params(
-        ("id" = String, Path, description = "Sandbox name"),
+        ("id" = String, Path, description = "Machine name"),
         ("follow" = Option<bool>, Query, description = "Follow the logs (like tail -f)"),
         ("tail" = Option<usize>, Query, description = "Number of lines to show from the end")
     ),
     responses(
         (status = 200, description = "Log stream (SSE)", content_type = "text/event-stream"),
-        (status = 404, description = "Sandbox or log file not found", body = ApiErrorResponse)
+        (status = 404, description = "Machine or log file not found", body = ApiErrorResponse)
     )
 )]
 pub async fn stream_logs(
@@ -158,7 +158,7 @@ pub async fn stream_logs(
     Path(id): Path<String>,
     Query(query): Query<LogsQuery>,
 ) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError> {
-    let entry = state.get_sandbox(&id)?;
+    let entry = state.get_machine(&id)?;
 
     // Get console log path
     let log_path: PathBuf = {

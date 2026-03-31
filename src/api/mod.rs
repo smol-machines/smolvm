@@ -1,6 +1,6 @@
 //! HTTP API server for smolvm.
 //!
-//! This module provides an HTTP API for managing sandboxes, containers, and images
+//! This module provides an HTTP API for managing machines, containers, and images
 //! without CLI overhead.
 //!
 //! # Example
@@ -9,8 +9,8 @@
 //! # Start the server
 //! smolvm serve --listen 127.0.0.1:8080
 //!
-//! # Create a sandbox
-//! curl -X POST http://localhost:8080/api/v1/sandboxes \
+//! # Create a machine
+//! curl -X POST http://localhost:8080/api/v1/machines \
 //!   -H "Content-Type: application/json" \
 //!   -d '{"name": "test"}'
 //! ```
@@ -45,28 +45,20 @@ use state::ApiState;
     info(
         title = "smolvm API",
         version = "0.1.6",
-        description = "OCI-native microVM runtime API for managing sandboxes, containers, images, and microvms.",
+        description = "smolvm API for managing machines, containers, and images.",
         license(name = "Apache-2.0", url = "https://www.apache.org/licenses/LICENSE-2.0")
     ),
     tags(
         (name = "Health", description = "Health check endpoints"),
-        (name = "Sandboxes", description = "Sandbox lifecycle management"),
-        (name = "Execution", description = "Command execution in sandboxes"),
+        (name = "Machines", description = "Machine lifecycle management"),
+        (name = "Execution", description = "Command execution in machines"),
         (name = "Logs", description = "Log streaming"),
-        (name = "Containers", description = "Container management within sandboxes"),
-        (name = "Images", description = "OCI image management"),
-        (name = "MicroVMs", description = "Persistent microVM management")
+        (name = "Containers", description = "Container management within machines"),
+        (name = "Images", description = "OCI image management")
     ),
     paths(
         // Health
         handlers::health::health,
-        // Sandboxes
-        handlers::sandboxes::create_sandbox,
-        handlers::sandboxes::list_sandboxes,
-        handlers::sandboxes::get_sandbox,
-        handlers::sandboxes::start_sandbox,
-        handlers::sandboxes::stop_sandbox,
-        handlers::sandboxes::delete_sandbox,
         // Execution
         handlers::exec::exec_command,
         handlers::exec::run_command,
@@ -81,19 +73,19 @@ use state::ApiState;
         // Images
         handlers::images::list_images,
         handlers::images::pull_image,
-        // MicroVMs
-        handlers::microvms::create_microvm,
-        handlers::microvms::list_microvms,
-        handlers::microvms::get_microvm,
-        handlers::microvms::start_microvm,
-        handlers::microvms::stop_microvm,
-        handlers::microvms::delete_microvm,
-        handlers::microvms::exec_microvm,
-        handlers::microvms::resize_microvm,
+        // Machines
+        handlers::machines::create_machine,
+        handlers::machines::list_machines,
+        handlers::machines::get_machine,
+        handlers::machines::start_machine,
+        handlers::machines::stop_machine,
+        handlers::machines::delete_machine,
+        handlers::machines::exec_machine,
+        handlers::machines::resize_machine,
     ),
     components(schemas(
         // Request types
-        types::CreateSandboxRequest,
+        types::CreateMachineRequest,
         types::RestartSpec,
         types::MountSpec,
         types::PortSpec,
@@ -109,22 +101,19 @@ use state::ApiState;
         types::PullImageRequest,
         types::DeleteQuery,
         types::LogsQuery,
-        types::CreateMicrovmRequest,
-        types::MicrovmExecRequest,
-        types::ResizeMicrovmRequest,
+        types::MachineExecRequest,
+        types::ResizeMachineRequest,
         // Response types
         types::HealthResponse,
-        types::SandboxInfo,
+        types::MachineInfo,
         types::MountInfo,
-        types::ListSandboxesResponse,
+        types::ListMachinesResponse,
         types::ExecResponse,
         types::ContainerInfo,
         types::ListContainersResponse,
         types::ImageInfo,
         types::ListImagesResponse,
         types::PullImageResponse,
-        types::MicrovmInfo,
-        types::ListMicrovmsResponse,
         types::StartResponse,
         types::StopResponse,
         types::DeleteResponse,
@@ -150,14 +139,14 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
     // SSE logs route (no timeout - streams indefinitely)
     let logs_route = Router::new().route("/:id/logs", get(handlers::exec::stream_logs));
 
-    // Sandbox routes with timeout
-    let sandbox_routes_with_timeout = Router::new()
-        .route("/", post(handlers::sandboxes::create_sandbox))
-        .route("/", get(handlers::sandboxes::list_sandboxes))
-        .route("/:id", get(handlers::sandboxes::get_sandbox))
-        .route("/:id/start", post(handlers::sandboxes::start_sandbox))
-        .route("/:id/stop", post(handlers::sandboxes::stop_sandbox))
-        .route("/:id", delete(handlers::sandboxes::delete_sandbox))
+    // Machine routes with timeout
+    let machine_routes_with_timeout = Router::new()
+        .route("/", post(handlers::machines::create_machine))
+        .route("/", get(handlers::machines::list_machines))
+        .route("/:id", get(handlers::machines::get_machine))
+        .route("/:id/start", post(handlers::machines::start_machine))
+        .route("/:id/stop", post(handlers::machines::stop_machine))
+        .route("/:id", delete(handlers::machines::delete_machine))
         // Exec routes
         .route("/:id/exec", post(handlers::exec::exec_command))
         .route("/:id/run", post(handlers::exec::run_command))
@@ -194,29 +183,13 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
             API_REQUEST_TIMEOUT_SECS,
         )));
 
-    // Combine sandbox routes (with and without timeout)
-    let sandbox_routes = Router::new()
+    // Machine routes
+    let machine_routes = Router::new()
         .merge(logs_route)
-        .merge(sandbox_routes_with_timeout);
-
-    // MicroVM routes
-    let microvm_routes = Router::new()
-        .route("/", post(handlers::microvms::create_microvm))
-        .route("/", get(handlers::microvms::list_microvms))
-        .route("/:name", get(handlers::microvms::get_microvm))
-        .route("/:name/start", post(handlers::microvms::start_microvm))
-        .route("/:name/stop", post(handlers::microvms::stop_microvm))
-        .route("/:name", delete(handlers::microvms::delete_microvm))
-        .route("/:name/exec", post(handlers::microvms::exec_microvm))
-        .route("/:name/resize", post(handlers::microvms::resize_microvm))
-        .layer(TimeoutLayer::new(Duration::from_secs(
-            API_REQUEST_TIMEOUT_SECS,
-        )));
+        .merge(machine_routes_with_timeout);
 
     // API v1 routes
-    let api_v1 = Router::new()
-        .nest("/sandboxes", sandbox_routes)
-        .nest("/microvms", microvm_routes);
+    let api_v1 = Router::new().nest("/machines", machine_routes);
 
     // CORS: Use configured origins, or default to localhost for security.
     let default_origins = || {

@@ -4,5 +4,4 @@ pub mod containers;
 pub mod exec;
 pub mod health;
 pub mod images;
-pub mod microvms;
-pub mod sandboxes;
+pub mod machines;

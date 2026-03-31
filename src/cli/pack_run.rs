@@ -1484,9 +1484,12 @@ fn daemon_stop(checksum: u32, debug: bool) -> smolvm::Result<()> {
     let dir = daemon_dir(checksum)?;
     let sock_path = dir.join("agent.sock");
 
-    // Try graceful shutdown via agent protocol
+    // Try graceful shutdown via agent protocol.
+    // If the agent responds, this also confirms the PID belongs to our VM.
+    let mut vsock_confirmed = false;
     if sock_path.exists() {
         if let Ok(mut client) = AgentClient::connect(&sock_path) {
+            vsock_confirmed = true;
             if debug {
                 eprintln!("debug: sending shutdown to agent");
             }
@@ -1494,15 +1497,23 @@ fn daemon_stop(checksum: u32, debug: bool) -> smolvm::Result<()> {
         }
     }
 
-    // Verify PID identity and force-kill if still alive
-    if smolvm::process::is_our_process_strict(pid, start_time) {
+    // Identity check: vsock acknowledgement OR strict PID start-time match.
+    // We intentionally do NOT use the lenient is_our_process() here because
+    // it treats any alive PID as "ours" when start_time is None — which risks
+    // killing an unrelated process if the OS reused the PID.
+    let identity_ok = vsock_confirmed || smolvm::process::is_our_process_strict(pid, start_time);
+    if identity_ok {
         if debug {
             eprintln!(
                 "debug: stopping process {} (start_time: {:?})",
                 pid, start_time
             );
         }
-        let _ = smolvm::process::stop_process_fast(pid, Duration::from_secs(5), true);
+        let _ = smolvm::process::stop_vm_process(
+            pid,
+            Duration::from_secs(5),
+            smolvm::process::VM_SIGKILL_TIMEOUT,
+        );
     }
 
     // Clean up PID and socket files (keep storage.ext4 for persistence)

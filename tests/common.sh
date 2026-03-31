@@ -162,7 +162,7 @@ print_summary() {
     fi
 }
 
-# Get the data directory for a named microvm.
+# Get the data directory for a named machine.
 # Mirrors the logic in src/agent/manager.rs vm_data_dir().
 #   macOS:  ~/Library/Caches/smolvm/vms/<name>
 #   Linux:  ${XDG_CACHE_HOME:-~/.cache}/smolvm/vms/<name>
@@ -175,12 +175,12 @@ vm_data_dir() {
     fi
 }
 
-# Cleanup helper - stop microvm and remove named "default" from DB
+# Cleanup helper - stop machine and remove named "default" from DB
 # so tests start from a clean slate (no leftover DB records from
 # manual testing or previous test runs).
-cleanup_microvm() {
-    $SMOLVM microvm stop 2>/dev/null || true
-    $SMOLVM microvm delete default -f 2>/dev/null || true
+cleanup_machine() {
+    $SMOLVM machine stop 2>/dev/null || true
+    $SMOLVM machine delete default -f 2>/dev/null || true
 }
 
 # Verify that a VM's data directory was removed after deletion.
@@ -195,17 +195,17 @@ ensure_data_dir_deleted() {
     fi
 }
 
-# Ensure microvm is running
+# Ensure machine is running
 # If net=true, recreate with --net (needed for container image pulls)
-ensure_microvm_running() {
+ensure_machine_running() {
     local with_net="${1:-false}"
     if [[ "$with_net" == "true" ]]; then
         # Stop and delete existing default VM, recreate with --net
-        $SMOLVM microvm stop 2>/dev/null || true
-        $SMOLVM microvm delete default -f 2>/dev/null || true
-        $SMOLVM microvm create default --net 2>/dev/null || true
+        $SMOLVM machine stop 2>/dev/null || true
+        $SMOLVM machine delete default -f 2>/dev/null || true
+        $SMOLVM machine create default --net 2>/dev/null || true
     fi
-    $SMOLVM microvm start 2>/dev/null || true
+    $SMOLVM machine start 2>/dev/null || true
 }
 
 # Extract container ID from output
@@ -264,7 +264,7 @@ run_with_timeout() {
 # Kill any orphaned smolvm processes that might be holding the database lock.
 # This includes:
 #   - smolvm serve (API server)
-#   - smolvm-bin microvm start (VM processes from previous test runs)
+#   - smolvm-bin machine start (VM processes from previous test runs)
 #   - Packed binaries running as daemons
 #
 # Call this before running tests to ensure clean state.
@@ -279,13 +279,13 @@ kill_orphan_smolvm_processes() {
         ((killed++)) || true
     fi
 
-    # Kill any orphaned microvm processes (from smolvm-bin in dist/)
-    if pkill -f "smolvm-bin microvm start" 2>/dev/null; then
+    # Kill any orphaned machine processes (from smolvm-bin in dist/)
+    if pkill -f "smolvm-bin machine start" 2>/dev/null; then
         ((killed++)) || true
     fi
 
-    # Kill any orphaned microvm processes (from target/release)
-    if pkill -f "smolvm microvm start" 2>/dev/null; then
+    # Kill any orphaned machine processes (from target/release)
+    if pkill -f "smolvm machine start" 2>/dev/null; then
         ((killed++)) || true
     fi
 
@@ -298,7 +298,7 @@ kill_orphan_smolvm_processes() {
 # Check if any smolvm processes are running that might interfere with tests
 check_smolvm_processes() {
     local procs
-    procs=$(pgrep -f "(smolvm serve|smolvm-bin microvm start|smolvm microvm start)" 2>/dev/null || true)
+    procs=$(pgrep -f "(smolvm serve|smolvm-bin machine start|smolvm machine start)" 2>/dev/null || true)
     if [[ -n "$procs" ]]; then
         return 1  # Processes found
     fi
@@ -314,6 +314,6 @@ ensure_clean_test_environment() {
     if ! check_smolvm_processes; then
         log_info "Warning: Some smolvm processes are still running after cleanup"
         log_info "Processes:"
-        ps aux | grep -E "(smolvm serve|smolvm-bin microvm|smolvm microvm)" | grep -v grep || true
+        ps aux | grep -E "(smolvm serve|smolvm-bin machine|smolvm machine)" | grep -v grep || true
     fi
 }

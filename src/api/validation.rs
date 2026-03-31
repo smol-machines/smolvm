@@ -85,7 +85,7 @@ mod tests {
 
     #[test]
     fn test_validate_resource_name() {
-        for kind in ["sandbox", "microvm"] {
+        for kind in ["machine", "machine"] {
             let max_len = 40;
 
             // Valid names

@@ -1,7 +1,7 @@
 # Doom in a browser, served from a hardware-isolated microVM
 #
 # Sandbox:
-#   smolvm sandbox run -d -s examples/doom-web/doom.smolfile
+#   smolvm machine run -d -s examples/doom-web/doom.smolfile
 #   open http://localhost:8080
 
 image = "python:3.12-alpine"

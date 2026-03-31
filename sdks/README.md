@@ -23,7 +23,7 @@ Bundled native library rule:
 
 Current status:
 
-- **The embedded sdk currently create sandbox without involving the DB storage. This means sandboxes created via embedded sdk is not visible via the smolvm CLI. This is a bug and we are actively working on a fix**
+- **The embedded sdk currently create machine without involving the DB storage. This means machinees created via embedded sdk is not visible via the smolvm CLI. This is a bug and we are actively working on a fix**
 - `sdks/node/` is the first embedded SDK implementation.
 
 
@@ -65,7 +65,7 @@ npm exec --workspace smolvm-embedded tsx examples/basic.ts
   temporary project, and checking that the native binding loads correctly.
 - `npm exec --workspace smolvm-embedded tsx examples/basic.ts` runs the local
   integration example that exercises `quickExec`, container execution, managed
-  sandbox lifecycle, and explicit sandbox cleanup.
+  machine lifecycle, and explicit machine cleanup.
 
 ### Manual Fresh-Install Check
 
@@ -104,16 +104,16 @@ npm install \
 Create `index.ts` in the temporary project:
 
 ```ts
-import { quickExec, withSandbox } from "smolvm-embedded";
+import { quickExec, withMachine } from "smolvm-embedded";
 
 async function main() {
   const hello = await quickExec(["echo", "hello from smolvm-embedded"]);
   console.log("quickExec stdout:", hello.stdout.trim());
   console.log("quickExec exitCode:", hello.exitCode);
 
-  await withSandbox({ name: "demo-sandbox" }, async (sb) => {
+  await withMachine({ name: "demo-machine" }, async (sb) => {
     const result = await sb.exec(["uname", "-a"]);
-    console.log("sandbox uname:", result.stdout.trim());
+    console.log("machine uname:", result.stdout.trim());
   });
 }
 

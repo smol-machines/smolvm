@@ -50,11 +50,11 @@ echo ""
 cleanup() {
     echo ""
     echo "Cleaning up..."
-    $SMOLVM microvm stop 2>/dev/null || true
+    $SMOLVM machine stop 2>/dev/null || true
     # Kill any orphaned smolvm processes
-    pkill -f "smolvm-bin microvm" 2>/dev/null || true
-    pkill -f "smolvm microvm start" 2>/dev/null || true
-    pkill -f "smolvm sandbox" 2>/dev/null || true
+    pkill -f "smolvm-bin machine" 2>/dev/null || true
+    pkill -f "smolvm machine start" 2>/dev/null || true
+    pkill -f "smolvm machine" 2>/dev/null || true
 }
 
 # Ensure cleanup runs on exit (normal or error)
@@ -62,30 +62,30 @@ trap cleanup EXIT
 
 # Kill any existing smolvm processes before benchmarking
 echo "Cleaning up any existing smolvm processes..."
-pkill -f "smolvm-bin microvm" 2>/dev/null || true
-pkill -f "smolvm microvm start" 2>/dev/null || true
-$SMOLVM microvm stop 2>/dev/null || true
+pkill -f "smolvm-bin machine" 2>/dev/null || true
+pkill -f "smolvm machine start" 2>/dev/null || true
+$SMOLVM machine stop 2>/dev/null || true
 sleep 1
 
 # Helper function to measure exec time
 measure_exec() {
     local START_TIME=$(python3 -c "import time; print(time.time())")
 
-    $SMOLVM sandbox run --image "$IMAGE" -- /bin/true > /dev/null 2>&1
+    $SMOLVM machine run --image "$IMAGE" -- /bin/true > /dev/null 2>&1
 
     local END_TIME=$(python3 -c "import time; print(time.time())")
     python3 -c "print(int(($END_TIME - $START_TIME) * 1000))"
 }
 
 # ============================================
-# Test 1: Cold Start (no microvm, no image cache)
+# Test 1: Cold Start (no machine, no image cache)
 # ============================================
 echo -e "${BLUE}Test 1: Cold Start${NC}"
 echo "  (MicroVM not running, image not cached)"
 echo ""
 
-# Stop microvm and clear caches
-$SMOLVM microvm stop 2>/dev/null || true
+# Stop machine and clear caches
+$SMOLVM machine stop 2>/dev/null || true
 sleep 1
 
 # Measure cold start
@@ -95,7 +95,7 @@ echo -e "  Cold start: ${YELLOW}${COLD_START}ms${NC}"
 echo ""
 
 # ============================================
-# Test 2: Warm Start (microvm running, image cached)
+# Test 2: Warm Start (machine running, image cached)
 # ============================================
 echo -e "${BLUE}Test 2: Warm Start${NC}"
 echo "  (MicroVM running, image cached, overlay reused)"
@@ -124,7 +124,7 @@ declare -a ECHO_TIMES
 for i in $(seq 1 $ITERATIONS); do
     START_TIME=$(python3 -c "import time; print(time.time())")
 
-    $SMOLVM sandbox run --image "$IMAGE" -- /bin/echo "hello" > /dev/null 2>&1
+    $SMOLVM machine run --image "$IMAGE" -- /bin/echo "hello" > /dev/null 2>&1
 
     END_TIME=$(python3 -c "import time; print(time.time())")
     DURATION=$(python3 -c "print(int(($END_TIME - $START_TIME) * 1000))")

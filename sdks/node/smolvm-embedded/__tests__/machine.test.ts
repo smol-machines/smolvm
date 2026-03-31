@@ -12,16 +12,16 @@
 
 import { describe, it, expect, afterAll } from "vitest";
 import {
-  Sandbox,
-  withSandbox,
+  Machine,
+  withMachine,
   quickExec,
   quickRun,
   ExecResult,
 } from "../src/index";
 
-describe("Sandbox lifecycle", () => {
-  it("should create, exec, and delete a sandbox", async () => {
-    const sb = await Sandbox.create({ name: "test-lifecycle" });
+describe("Machine lifecycle", () => {
+  it("should create, exec, and delete a machine", async () => {
+    const sb = await Machine.create({ name: "test-lifecycle" });
     try {
       expect(sb.state).toBe("running");
 
@@ -36,7 +36,7 @@ describe("Sandbox lifecycle", () => {
   });
 
   it("should handle non-zero exit codes", async () => {
-    await withSandbox({ name: "test-exit-code" }, async (sb) => {
+    await withMachine({ name: "test-exit-code" }, async (sb) => {
       const result = await sb.exec(["sh", "-c", "exit 42"]);
       expect(result.exitCode).toBe(42);
       expect(result.success).toBe(false);
@@ -44,7 +44,7 @@ describe("Sandbox lifecycle", () => {
   });
 
   it("should capture stderr", async () => {
-    await withSandbox({ name: "test-stderr" }, async (sb) => {
+    await withMachine({ name: "test-stderr" }, async (sb) => {
       const result = await sb.exec([
         "sh",
         "-c",
@@ -56,7 +56,7 @@ describe("Sandbox lifecycle", () => {
   });
 
   it("should pass environment variables", async () => {
-    await withSandbox({ name: "test-env" }, async (sb) => {
+    await withMachine({ name: "test-env" }, async (sb) => {
       const result = await sb.exec(["sh", "-c", "echo $MY_VAR"], {
         env: { MY_VAR: "hello-env" },
       });
@@ -66,7 +66,7 @@ describe("Sandbox lifecycle", () => {
 });
 
 describe("quickExec", () => {
-  it("should execute a command in a temporary sandbox", async () => {
+  it("should execute a command in a temporary machine", async () => {
     const result = await quickExec(["echo", "quick"]);
     expect(result.exitCode).toBe(0);
     expect(result.stdout.trim()).toBe("quick");
@@ -96,7 +96,7 @@ describe("Container image execution", () => {
   });
 
   it("should pull and list images", async () => {
-    await withSandbox({
+    await withMachine({
       name: "test-images",
       resources: { network: true },
     }, async (sb) => {
@@ -114,9 +114,9 @@ describe("Container image execution", () => {
   });
 });
 
-describe("withSandbox", () => {
+describe("withMachine", () => {
   it("should clean up on success", async () => {
-    const result = await withSandbox(
+    const result = await withMachine(
       { name: "test-cleanup-success" },
       async (sb) => {
         return sb.exec(["echo", "ok"]);
@@ -127,7 +127,7 @@ describe("withSandbox", () => {
 
   it("should clean up on error", async () => {
     await expect(
-      withSandbox({ name: "test-cleanup-error" }, async () => {
+      withMachine({ name: "test-cleanup-error" }, async () => {
         throw new Error("test error");
       })
     ).rejects.toThrow("test error");
@@ -146,9 +146,9 @@ describe("ExecResult", () => {
   });
 });
 
-describe("Sandbox with resources", () => {
-  it("should create a sandbox with custom resources", async () => {
-    await withSandbox(
+describe("Machine with resources", () => {
+  it("should create a machine with custom resources", async () => {
+    await withMachine(
       {
         name: "test-resources",
         resources: {

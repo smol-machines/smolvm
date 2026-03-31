@@ -5,8 +5,8 @@
  */
 
 import {
-  Sandbox,
-  withSandbox,
+  Machine,
+  withMachine,
   quickExec,
   quickRun,
 } from "../src/index";
@@ -31,10 +31,10 @@ async function main() {
   console.log(`   stdout (first line): ${alpine.stdout.split("\n")[0]}`);
   console.log(`   exit code: ${alpine.exitCode}\n`);
 
-  // 3. Managed sandbox lifecycle
-  console.log("3. withSandbox — managed lifecycle:");
-  await withSandbox({ name: "example-sandbox" }, async (sb) => {
-    console.log(`   sandbox "${sb.name}" state: ${sb.state}`);
+  // 3. Managed machine lifecycle
+  console.log("3. withMachine — managed lifecycle:");
+  await withMachine({ name: "example-machine" }, async (sb) => {
+    console.log(`   machine "${sb.name}" state: ${sb.state}`);
 
     const date = await sb.exec(["date", "+%Y-%m-%d"]);
     console.log(`   date: ${date.stdout.trim()}`);
@@ -42,11 +42,11 @@ async function main() {
     const uname = await sb.exec(["uname", "-a"]);
     console.log(`   uname: ${uname.stdout.trim()}`);
   });
-  console.log("   sandbox cleaned up.\n");
+  console.log("   machine cleaned up.\n");
 
   // 4. Full control
   console.log("4. Full control — create, use, delete:");
-  const sb = await Sandbox.create({
+  const sb = await Machine.create({
     name: "example-full-control",
     resources: {
       cpus: 2,
@@ -73,7 +73,7 @@ async function main() {
     console.log(`   container output: ${result.stdout.trim()}`);
   } finally {
     await sb.delete();
-    console.log("   sandbox deleted.\n");
+    console.log("   machine deleted.\n");
   }
 
   console.log("=== All examples completed ===");

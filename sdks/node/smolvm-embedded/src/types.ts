@@ -10,10 +10,10 @@
 // ============================================================================
 
 /**
- * Configuration for creating a sandbox.
+ * Configuration for creating a machine.
  */
-export interface SandboxConfig {
-  /** Unique name for the sandbox. Used as the VM identifier. */
+export interface MachineConfig {
+  /** Unique name for the machine. Used as the VM identifier. */
   name: string;
   /** Host directories to mount into the VM. */
   mounts?: MountSpec[];
@@ -21,6 +21,8 @@ export interface SandboxConfig {
   ports?: PortSpec[];
   /** VM resource configuration. */
   resources?: ResourceSpec;
+  /** If true, create() does NOT auto-start — call start() explicitly. Storage persists across stop/start. */
+  persistent?: boolean;
 }
 
 /**
@@ -59,23 +61,6 @@ export interface ResourceSpec {
   storageGb?: number;
   /** Overlay disk size in GiB (default: 10). */
   overlayGb?: number;
-}
-
-/**
- * Configuration for creating a MicroVM.
- *
- * Same shape as SandboxConfig — MicroVMs are persistent named VMs
- * that survive across process invocations and support reconnection.
- */
-export interface MicroVMConfig {
-  /** Unique name for the MicroVM. Used as the VM identifier. */
-  name: string;
-  /** Host directories to mount into the VM. */
-  mounts?: MountSpec[];
-  /** Port mappings from host to guest. */
-  ports?: PortSpec[];
-  /** VM resource configuration. */
-  resources?: ResourceSpec;
 }
 
 // ============================================================================

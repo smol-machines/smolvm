@@ -7,8 +7,8 @@ Integration tests and performance benchmarks for smolvm.
 | File | Description | Requires VM |
 |------|-------------|-------------|
 | `test_cli.sh` | Basic CLI tests (--version, --help, flags) | No |
-| `test_sandbox.sh` | Sandbox run tests (exec, env, volumes, TSI) | Yes |
-| `test_microvm.sh` | MicroVM lifecycle tests (start, stop, exec, DB) | Yes |
+| `test_machine.sh` | Machine lifecycle + run tests | Yes |
+| `test_smolfile.sh` | Smolfile parsing and integration | Yes |
 | `test_container.sh` | Container lifecycle tests (create, exec, stop) | Yes |
 | `test_api.sh` | HTTP API tests (`smolvm serve`) | Yes |
 | `test_pack.sh` | Pack command tests (pack, run, daemon mode) | Yes |
@@ -32,8 +32,7 @@ Integration tests and performance benchmarks for smolvm.
 
 ```bash
 ./tests/run_all.sh cli        # CLI tests only
-./tests/run_all.sh sandbox    # Sandbox tests only
-./tests/run_all.sh microvm    # MicroVM tests only
+./tests/run_all.sh machine    # Machine tests only
 ./tests/run_all.sh container  # Container tests only
 ./tests/run_all.sh api        # HTTP API tests only
 ./tests/run_all.sh pack       # Pack tests only
@@ -52,7 +51,8 @@ Integration tests and performance benchmarks for smolvm.
 
 ```bash
 ./tests/test_cli.sh
-./tests/test_sandbox.sh
+./tests/test_machine.sh
+./tests/test_smolfile.sh
 ```
 
 ### Use Specific Binary
@@ -91,8 +91,8 @@ The `common.sh` file provides shared test utilities:
 - `init_smolvm` - Initialize and validate the binary
 - `run_test` - Run a test function with pass/fail tracking
 - `print_summary` - Print test results summary
-- `ensure_microvm_running` - Start the default microvm
-- `cleanup_microvm` - Stop the default microvm
+- `ensure_machine_running` - Start the default machine
+- `cleanup_machine` - Stop the default machine
 - `extract_container_id` - Parse container ID from command output
 - `cleanup_container` - Force remove a container
 
@@ -100,10 +100,10 @@ The `common.sh` file provides shared test utilities:
 
 | Suite | Tests |
 |-------|-------|
-| CLI | 13 |
-| Sandbox | 17 |
-| MicroVM | 13 |
+| CLI | 10 |
+| Machine | 30 |
+| Smolfile | 28 |
 | Container | 10 |
-| API | 13 |
+| API | 16 |
 | Pack | 25 |
-| **Total** | **91** |
+| **Total** | **119** |

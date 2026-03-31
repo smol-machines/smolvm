@@ -1,6 +1,6 @@
 //! Container lifecycle management commands.
 //!
-//! These commands manage long-running containers via a microvm.
+//! These commands manage long-running containers via a machine.
 //! Containers can be created, started, stopped, and deleted independently.
 
 use crate::cli::parsers::{parse_duration, parse_env_list};
@@ -13,7 +13,7 @@ use smolvm::db::SmolvmDb;
 use smolvm::{DEFAULT_IDLE_CMD, DEFAULT_SHELL_CMD};
 use std::time::Duration;
 
-/// Manage containers inside a microVM
+/// Manage containers inside a machine
 #[derive(Subcommand, Debug)]
 pub enum ContainerCmd {
     /// Create a container from an image (does not start it)
@@ -29,7 +29,7 @@ pub enum ContainerCmd {
     #[command(visible_alias = "rm")]
     Remove(ContainerRemoveCmd),
 
-    /// List containers in a microVM
+    /// List containers in a machine
     #[command(visible_alias = "ls")]
     List(ContainerListCmd),
 
@@ -50,8 +50,8 @@ impl ContainerCmd {
     }
 }
 
-/// Get the agent manager for a microvm, ensuring it's running.
-fn ensure_microvm(name: &str) -> smolvm::Result<AgentManager> {
+/// Get the agent manager for a machine, ensuring it's running.
+fn ensure_machine(name: &str) -> smolvm::Result<AgentManager> {
     vm_common::get_or_start_vm(name)
 }
 
@@ -61,7 +61,7 @@ fn ensure_microvm(name: &str) -> smolvm::Result<AgentManager> {
 
 /// Create a container from an image.
 ///
-/// Creates a container in the specified microVM. The container starts
+/// Creates a container in the specified machine. The container starts
 /// automatically if no command is specified (runs sleep infinity).
 ///
 /// Examples:
@@ -69,9 +69,9 @@ fn ensure_microvm(name: &str) -> smolvm::Result<AgentManager> {
 ///   smolvm container create myvm nginx -- nginx -g "daemon off;"
 #[derive(Args, Debug)]
 pub struct ContainerCreateCmd {
-    /// Target microVM name
-    #[arg(value_name = "MICROVM")]
-    pub microvm: String,
+    /// Target machine name
+    #[arg(value_name = "MACHINE")]
+    pub machine: String,
 
     /// Container image (e.g., alpine, nginx:latest)
     #[arg(value_name = "IMAGE")]
@@ -96,7 +96,7 @@ pub struct ContainerCreateCmd {
 
 impl ContainerCreateCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        let manager = ensure_microvm(&self.microvm)?;
+        let manager = ensure_machine(&self.machine)?;
 
         // Connect to agent
         let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
@@ -109,15 +109,15 @@ impl ContainerCreateCmd {
         // Parse environment variables
         let env = parse_env_list(&self.env);
 
-        // Resolve volume mounts against the microvm's virtiofs devices.
+        // Resolve volume mounts against the machine's virtiofs devices.
         let vm_mounts = SmolvmDb::open()
             .ok()
-            .and_then(|db| db.get_vm(&self.microvm).ok().flatten())
+            .and_then(|db| db.get_vm(&self.machine).ok().flatten())
             .map(|r| r.mounts)
             .unwrap_or_default();
 
         let explicit_host_mounts = HostMount::parse(&self.volume)?;
-        let mounts = resolve_container_mounts(&self.microvm, &vm_mounts, &explicit_host_mounts)?;
+        let mounts = resolve_container_mounts(&self.machine, &vm_mounts, &explicit_host_mounts)?;
 
         // Default command is sleep infinity for long-running containers
         let command = if self.command.is_empty() {
@@ -134,7 +134,7 @@ impl ContainerCreateCmd {
         println!("  Image: {}", info.image);
         println!("  State: {}", info.state);
 
-        // Keep microvm running
+        // Keep machine running
         manager.detach();
 
         Ok(())
@@ -150,9 +150,9 @@ impl ContainerCreateCmd {
 /// Resumes execution of a container that was previously stopped.
 #[derive(Args, Debug)]
 pub struct ContainerStartCmd {
-    /// Target microVM name
-    #[arg(value_name = "MICROVM")]
-    pub microvm: String,
+    /// Target machine name
+    #[arg(value_name = "MACHINE")]
+    pub machine: String,
 
     /// Container ID (full or prefix)
     #[arg(value_name = "CONTAINER")]
@@ -161,13 +161,13 @@ pub struct ContainerStartCmd {
 
 impl ContainerStartCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        let manager = ensure_microvm(&self.microvm)?;
+        let manager = ensure_machine(&self.machine)?;
         let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
 
         client.start_container(&self.container_id)?;
         println!("Started container: {}", self.container_id);
 
-        // Keep microvm running
+        // Keep machine running
         manager.detach();
 
         Ok(())
@@ -183,9 +183,9 @@ impl ContainerStartCmd {
 /// Sends SIGTERM, then SIGKILL after timeout if container doesn't stop.
 #[derive(Args, Debug)]
 pub struct ContainerStopCmd {
-    /// Target microVM name
-    #[arg(value_name = "MICROVM")]
-    pub microvm: String,
+    /// Target machine name
+    #[arg(value_name = "MACHINE")]
+    pub machine: String,
 
     /// Container ID (full or prefix)
     #[arg(value_name = "CONTAINER")]
@@ -198,14 +198,14 @@ pub struct ContainerStopCmd {
 
 impl ContainerStopCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        let manager = ensure_microvm(&self.microvm)?;
+        let manager = ensure_machine(&self.machine)?;
         let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
 
         let timeout_secs = self.timeout.map(|d| d.as_secs());
         client.stop_container(&self.container_id, timeout_secs)?;
         println!("Stopped container: {}", self.container_id);
 
-        // Keep microvm running
+        // Keep machine running
         manager.detach();
 
         Ok(())
@@ -221,9 +221,9 @@ impl ContainerStopCmd {
 /// Deletes a stopped container. Use -f to remove a running container.
 #[derive(Args, Debug)]
 pub struct ContainerRemoveCmd {
-    /// Target microVM name
-    #[arg(value_name = "MICROVM")]
-    pub microvm: String,
+    /// Target machine name
+    #[arg(value_name = "MACHINE")]
+    pub machine: String,
 
     /// Container ID (full or prefix)
     #[arg(value_name = "CONTAINER")]
@@ -236,13 +236,13 @@ pub struct ContainerRemoveCmd {
 
 impl ContainerRemoveCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        let manager = ensure_microvm(&self.microvm)?;
+        let manager = ensure_machine(&self.machine)?;
         let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
 
         client.delete_container(&self.container_id, self.force)?;
         println!("Removed container: {}", self.container_id);
 
-        // Keep microvm running
+        // Keep machine running
         manager.detach();
 
         Ok(())
@@ -253,14 +253,14 @@ impl ContainerRemoveCmd {
 // List
 // ============================================================================
 
-/// List containers in a microVM.
+/// List containers in a machine.
 ///
 /// By default shows only running containers. Use -a to include stopped.
 #[derive(Args, Debug)]
 pub struct ContainerListCmd {
-    /// Target microVM name
-    #[arg(value_name = "MICROVM")]
-    pub microvm: String,
+    /// Target machine name
+    #[arg(value_name = "MACHINE")]
+    pub machine: String,
 
     /// Show all containers including stopped
     #[arg(short = 'a', long)]
@@ -273,19 +273,19 @@ pub struct ContainerListCmd {
 
 impl ContainerListCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        // "default" refers to the default microvm
-        let manager = if self.microvm == "default" {
+        // "default" refers to the default machine
+        let manager = if self.machine == "default" {
             AgentManager::new_default()?
         } else {
-            AgentManager::for_vm(&self.microvm)?
+            AgentManager::for_vm(&self.machine)?
         };
 
-        // Check if microvm is running
+        // Check if machine is running
         if manager.try_connect_existing().is_none() {
             if self.quiet {
                 return Ok(());
             }
-            println!("No containers (microvm '{}' not running)", self.microvm);
+            println!("No containers (machine '{}' not running)", self.machine);
             return Ok(());
         }
 
@@ -324,7 +324,7 @@ impl ContainerListCmd {
             }
         }
 
-        // Keep microvm running
+        // Keep machine running
         manager.detach();
 
         Ok(())
@@ -344,9 +344,9 @@ impl ContainerListCmd {
 ///   smolvm container exec myvm web -- /bin/sh
 #[derive(Args, Debug)]
 pub struct ContainerExecCmd {
-    /// Target microVM name
-    #[arg(value_name = "MICROVM")]
-    pub microvm: String,
+    /// Target machine name
+    #[arg(value_name = "MACHINE")]
+    pub machine: String,
 
     /// Container ID (full or prefix)
     #[arg(value_name = "CONTAINER")]
@@ -371,7 +371,7 @@ pub struct ContainerExecCmd {
 
 impl ContainerExecCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        let manager = ensure_microvm(&self.microvm)?;
+        let manager = ensure_machine(&self.machine)?;
         let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
 
         // Parse environment variables
@@ -403,7 +403,7 @@ impl ContainerExecCmd {
 
         flush_output();
 
-        // Keep microvm running
+        // Keep machine running
         manager.detach();
 
         std::process::exit(exit_code);
@@ -414,7 +414,7 @@ impl ContainerExecCmd {
 // Mount resolution
 // ============================================================================
 
-/// Resolve container volume mounts against a microvm's virtiofs devices.
+/// Resolve container volume mounts against a machine's virtiofs devices.
 ///
 /// Virtiofs devices are registered at VM launch and cannot be added later.
 /// Their tags (`smolvm0`, `smolvm1`, ...) correspond 1:1 to the VM's mount
@@ -425,7 +425,7 @@ impl ContainerExecCmd {
 ///   correct virtiofs tag, allowing guest-path remapping.
 /// - An explicit `-v` referencing a host path not in the VM is an error.
 fn resolve_container_mounts(
-    microvm_name: &str,
+    machine_name: &str,
     vm_mounts: &[(String, String, bool)],
     explicit: &[HostMount],
 ) -> smolvm::Result<Vec<(String, String, bool)>> {
@@ -457,11 +457,11 @@ fn resolve_container_mounts(
                 return Err(smolvm::Error::mount(
                     "resolve volume",
                     format!(
-                        "host path '{}' is not mounted in microvm '{}'. \
-                         Add it when creating the microvm: smolvm microvm create {} -v {}:{}",
+                        "host path '{}' is not mounted in machine '{}'. \
+                         Add it when creating the machine: smolvm machine create {} -v {}:{}",
                         host_path_str,
-                        microvm_name,
-                        microvm_name,
+                        machine_name,
+                        machine_name,
                         host_path_str,
                         host_mount.target.display(),
                     ),

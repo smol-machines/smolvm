@@ -1,5 +1,5 @@
 /**
- * Sandbox — high-level wrapper around NapiSandbox.
+ * Machine — high-level wrapper around NapiMachine.
  *
  * Provides the same ergonomic API as @smolvm/node but runs entirely
  * in-process via native bindings (no daemon required).
@@ -9,7 +9,7 @@ import { ExecResult } from "./execution.js";
 import { parseNativeError } from "./errors.js";
 import { loadNativeBinding } from "./native-binding.js";
 import type {
-  SandboxConfig,
+  MachineConfig,
   ExecOptions,
   ImageInfo,
   MountSpec,
@@ -17,7 +17,7 @@ import type {
   ResourceSpec,
 } from "./types.js";
 
-const { NapiSandbox } = loadNativeBinding();
+const { NapiMachine } = loadNativeBinding();
 
 /**
  * Convert SDK ExecOptions to the NAPI format.
@@ -38,7 +38,7 @@ function toNapiExecOptions(
 /**
  * Convert SDK config to NAPI format.
  */
-function toNapiConfig(config: SandboxConfig) {
+function toNapiConfig(config: MachineConfig) {
   return {
     name: config.name,
     mounts: config.mounts?.map((m: MountSpec) => ({
@@ -74,32 +74,52 @@ async function wrapNative<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 /**
- * A sandbox wrapping a microVM with native bindings.
+ * A machine wrapping a microVM with native bindings.
  *
  * No daemon required — the VM runs directly in the Node.js process
  * via libkrun (Hypervisor.framework on macOS, KVM on Linux).
  */
-export class Sandbox {
+export class Machine {
   readonly name: string;
-  private native: InstanceType<typeof NapiSandbox>;
+  private native: InstanceType<typeof NapiMachine>;
   private started = false;
 
-  protected constructor(config: SandboxConfig) {
+  protected constructor(config: MachineConfig) {
     this.name = config.name;
-    this.native = new NapiSandbox(toNapiConfig(config));
+    this.native = new NapiMachine(toNapiConfig(config));
   }
 
   /**
-   * Create and start a new sandbox.
+   * Create a new machine. Auto-starts unless `persistent: true` is set.
    */
-  static async create(config: SandboxConfig): Promise<Sandbox> {
-    const sandbox = new Sandbox(config);
-    await sandbox.start();
-    return sandbox;
+  static async create(config: MachineConfig): Promise<Machine> {
+    const machine = new Machine(config);
+    if (!config.persistent) {
+      await machine.start();
+    }
+    return machine;
   }
 
   /**
-   * Start the sandbox VM.
+   * Connect to an already-running machine by name.
+   *
+   * Throws NotFoundError if no running VM exists with the given name.
+   */
+  static async connect(name: string): Promise<Machine> {
+    try {
+      const config: MachineConfig = { name };
+      const machine = new Machine(config);
+      // Replace native with a connected instance
+      (machine as any).native = NapiMachine.connect(name);
+      machine.started = true;
+      return machine;
+    } catch (err) {
+      throw parseNativeError(err as Error);
+    }
+  }
+
+  /**
+   * Start the machine VM.
    *
    * Boots a microVM via fork + libkrun, waits for the agent to be ready,
    * then establishes a vsock connection. If the VM is already running
@@ -110,7 +130,7 @@ export class Sandbox {
     this.started = true;
   }
 
-  /** Whether the sandbox has been started. */
+  /** Whether the machine has been started. */
   get isStarted(): boolean {
     return this.started;
   }
@@ -118,6 +138,16 @@ export class Sandbox {
   /** Get the current VM state: "stopped", "starting", "running", or "stopping". */
   get state(): string {
     return this.native.state();
+  }
+
+  /** Whether the VM process is currently running. */
+  get isRunning(): boolean {
+    return this.native.isRunning;
+  }
+
+  /** The child PID of the VM process, or null if not running. */
+  get pid(): number | null {
+    return this.native.pid ?? null;
   }
 
   /**
@@ -152,7 +182,7 @@ export class Sandbox {
   }
 
   /**
-   * Pull an OCI image into the sandbox's storage.
+   * Pull an OCI image into the machine's storage.
    */
   async pullImage(image: string): Promise<ImageInfo> {
     return wrapNative(() => this.native.pullImage(image));
@@ -166,7 +196,7 @@ export class Sandbox {
   }
 
   /**
-   * Stop the sandbox VM gracefully.
+   * Stop the machine VM gracefully.
    */
   async stop(): Promise<void> {
     await wrapNative(() => this.native.stop());
@@ -174,7 +204,7 @@ export class Sandbox {
   }
 
   /**
-   * Stop the sandbox and delete all associated storage.
+   * Stop the machine and delete all associated storage.
    */
   async delete(): Promise<void> {
     await wrapNative(() => this.native.delete());
@@ -187,33 +217,33 @@ export class Sandbox {
 // ============================================================================
 
 /**
- * Create a sandbox, run a function with it, then clean up.
+ * Create a machine, run a function with it, then clean up.
  *
  * @example
  * ```ts
- * const result = await withSandbox({ name: "my-task" }, async (sb) => {
+ * const result = await withMachine({ name: "my-task" }, async (sb) => {
  *   return await sb.exec(["echo", "hello"]);
  * });
  * ```
  */
-export async function withSandbox<T>(
-  config: SandboxConfig,
-  fn: (sandbox: Sandbox) => Promise<T>
+export async function withMachine<T>(
+  config: MachineConfig,
+  fn: (machine: Machine) => Promise<T>
 ): Promise<T> {
-  const sandbox = await Sandbox.create(config);
+  const machine = await Machine.create(config);
   try {
-    return await fn(sandbox);
+    return await fn(machine);
   } finally {
-    await sandbox.delete().catch(() => {
+    await machine.delete().catch(() => {
       // Best-effort cleanup
     });
   }
 }
 
 /**
- * Quick one-shot command execution in a temporary sandbox.
+ * Quick one-shot command execution in a temporary machine.
  *
- * Creates a sandbox, runs the command, cleans up, and returns the result.
+ * Creates a machine, runs the command, cleans up, and returns the result.
  *
  * @example
  * ```ts
@@ -223,10 +253,10 @@ export async function withSandbox<T>(
  */
 export async function quickExec(
   command: string[],
-  options?: SandboxConfig & ExecOptions
+  options?: MachineConfig & ExecOptions
 ): Promise<ExecResult> {
   const name = options?.name ?? `quick-${Date.now().toString(36)}`;
-  return withSandbox({ ...options, name }, (sb) =>
+  return withMachine({ ...options, name }, (sb) =>
     sb.exec(command, options)
   );
 }
@@ -234,7 +264,7 @@ export async function quickExec(
 /**
  * Quick one-shot command execution in a container image.
  *
- * Creates a sandbox, pulls the image, runs the command, cleans up.
+ * Creates a machine, pulls the image, runs the command, cleans up.
  *
  * @example
  * ```ts
@@ -245,10 +275,10 @@ export async function quickExec(
 export async function quickRun(
   image: string,
   command: string[],
-  options?: SandboxConfig & ExecOptions
+  options?: MachineConfig & ExecOptions
 ): Promise<ExecResult> {
   const name = options?.name ?? `quick-${Date.now().toString(36)}`;
-  return withSandbox({ ...options, name }, (sb) =>
+  return withMachine({ ...options, name }, (sb) =>
     sb.run(image, command, options)
   );
 }

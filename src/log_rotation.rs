@@ -1,4 +1,4 @@
-//! Log rotation utilities for sandbox console logs.
+//! Log rotation utilities for machine console logs.
 //!
 //! Provides automatic log rotation when log files exceed a size threshold.
 //! Rotated logs follow the pattern: `filename.1`, `filename.2`, etc.

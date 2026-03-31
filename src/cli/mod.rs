@@ -2,12 +2,12 @@
 
 pub mod config;
 pub mod container;
-pub mod microvm;
+pub mod internal_boot;
+pub mod machine;
 pub mod openapi;
 pub mod pack;
 pub mod pack_run;
 pub mod parsers;
-pub mod sandbox;
 pub mod serve;
 pub mod smolfile;
 pub mod vm_common;

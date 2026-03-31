@@ -454,6 +454,85 @@ pub fn stop_process_fast(pid: libc::pid_t, timeout: Duration, force: bool) -> Re
     }
 }
 
+/// Default SIGTERM timeout for VM processes (3 seconds).
+///
+/// Generous to accommodate guest shutdown + Hypervisor.framework teardown.
+pub const VM_SIGTERM_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Default SIGKILL timeout for VM processes (3 seconds).
+///
+/// On macOS, Hypervisor.framework VMs can be in uninterruptible kernel state
+/// (`hv_vcpu_run`). Even SIGKILL may take 1-3 seconds while the kernel tears
+/// down VM resources. This timeout must be long enough for that cleanup.
+pub const VM_SIGKILL_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Stop a VM process with Hypervisor-aware timeouts.
+///
+/// Two-phase shutdown:
+/// 1. SIGTERM → poll up to `sigterm_timeout` with early exit
+/// 2. If still alive: SIGKILL → poll up to `sigkill_timeout` with early exit
+///
+/// Callers must verify process identity BEFORE calling this function.
+///
+/// Returns `Ok(exit_code)` if the process exited, `Err` if still alive.
+pub fn stop_vm_process(
+    pid: libc::pid_t,
+    sigterm_timeout: Duration,
+    sigkill_timeout: Duration,
+) -> Result<i32> {
+    if !is_alive(pid) {
+        return Ok(try_wait(pid).unwrap_or(UNKNOWN_EXIT_CODE));
+    }
+
+    // Phase 1: SIGTERM + poll
+    if !terminate(pid) {
+        return Ok(try_wait(pid).unwrap_or(UNKNOWN_EXIT_CODE));
+    }
+
+    if let Some(code) = poll_for_exit(pid, sigterm_timeout) {
+        return Ok(code);
+    }
+
+    // Phase 2: SIGKILL + poll
+    tracing::debug!(pid, "SIGTERM timeout, sending SIGKILL");
+    kill(pid);
+
+    if let Some(code) = poll_for_exit(pid, sigkill_timeout) {
+        return Ok(code);
+    }
+
+    Err(Error::agent(
+        "stop vm process",
+        format!("process {} still alive after SIGTERM+SIGKILL", pid),
+    ))
+}
+
+/// Poll for process exit with aggressive-then-backoff strategy.
+///
+/// Returns `Some(exit_code)` if the process exits within the timeout.
+fn poll_for_exit(pid: libc::pid_t, timeout: Duration) -> Option<i32> {
+    let start = Instant::now();
+    let mut poll_count: u32 = 0;
+
+    while start.elapsed() < timeout {
+        if let Some(code) = try_wait(pid) {
+            return Some(code);
+        }
+        if !is_alive(pid) {
+            return Some(try_wait(pid).unwrap_or(UNKNOWN_EXIT_CODE));
+        }
+
+        let interval = if poll_count < FAST_POLL_COUNT {
+            FAST_POLL_INTERVAL
+        } else {
+            Duration::from_millis(100)
+        };
+        poll_count += 1;
+        std::thread::sleep(interval);
+    }
+    None
+}
+
 /// Result of a fork operation.
 #[derive(Debug)]
 pub enum ForkResult {

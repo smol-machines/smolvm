@@ -40,18 +40,18 @@ impl std::fmt::Display for RecordState {
     }
 }
 
-/// Restart policy for a sandbox.
+/// Restart policy for a machine.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum RestartPolicy {
-    /// Never restart the sandbox automatically.
+    /// Never restart the machine automatically.
     #[default]
     Never,
-    /// Always restart the sandbox when it exits.
+    /// Always restart the machine when it exits.
     Always,
-    /// Restart only if the sandbox exited with a non-zero exit code.
+    /// Restart only if the machine exited with a non-zero exit code.
     OnFailure,
-    /// Restart unless the user explicitly stopped the sandbox.
+    /// Restart unless the user explicitly stopped the machine.
     UnlessStopped,
 }
 
@@ -80,7 +80,7 @@ impl std::str::FromStr for RestartPolicy {
     }
 }
 
-/// Restart configuration for a sandbox.
+/// Restart configuration for a machine.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RestartConfig {
     /// The restart policy.
@@ -92,7 +92,7 @@ pub struct RestartConfig {
     /// Current restart count.
     #[serde(default)]
     pub restart_count: u32,
-    /// Whether the user explicitly stopped this sandbox.
+    /// Whether the user explicitly stopped this machine.
     #[serde(default)]
     pub user_stopped: bool,
 }
@@ -272,7 +272,7 @@ impl SmolvmConfig {
 
 /// Record of a VM in the registry.
 ///
-/// This stores microvm configuration only. Container configuration
+/// This stores machine configuration only. Container configuration
 /// is managed separately via the container commands.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VmRecord {

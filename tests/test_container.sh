@@ -16,7 +16,7 @@ log_info "Pre-flight cleanup: killing orphan processes..."
 kill_orphan_smolvm_processes
 
 # Cleanup on exit
-trap cleanup_microvm EXIT
+trap cleanup_machine EXIT
 
 echo ""
 echo "=========================================="
@@ -25,14 +25,14 @@ echo "=========================================="
 echo ""
 
 # Container tests need networking to pull images inside the guest VM
-ensure_microvm_running true
+ensure_machine_running true
 
 # =============================================================================
 # Create
 # =============================================================================
 
 test_container_create() {
-    ensure_microvm_running
+    ensure_machine_running
 
     local output container_id
     output=$($SMOLVM container create default alpine:latest -- sleep 300 2>&1)
@@ -49,7 +49,7 @@ test_container_create() {
 }
 
 test_container_id_format() {
-    ensure_microvm_running
+    ensure_machine_running
 
     local output container_id
     output=$($SMOLVM container create default alpine:latest -- sleep 10 2>&1)
@@ -81,7 +81,7 @@ test_container_id_format() {
 # =============================================================================
 
 test_container_list() {
-    ensure_microvm_running
+    ensure_machine_running
 
     local output container_id list_output
     output=$($SMOLVM container create default alpine:latest -- sleep 300 2>&1)
@@ -101,7 +101,7 @@ test_container_list() {
 }
 
 test_container_list_all() {
-    ensure_microvm_running
+    ensure_machine_running
 
     local output container_id
     output=$($SMOLVM container create default alpine:latest -- sleep 300 2>&1)
@@ -129,7 +129,7 @@ test_container_list_all() {
 # =============================================================================
 
 test_container_exec() {
-    ensure_microvm_running
+    ensure_machine_running
 
     local output container_id
     output=$($SMOLVM container create default alpine:latest -- sleep 300 2>&1)
@@ -149,7 +149,7 @@ test_container_exec() {
 }
 
 test_container_exec_env() {
-    ensure_microvm_running
+    ensure_machine_running
 
     local output container_id
     output=$($SMOLVM container create default alpine:latest -- sleep 300 2>&1)
@@ -173,7 +173,7 @@ test_container_exec_env() {
 # =============================================================================
 
 test_container_stop() {
-    ensure_microvm_running
+    ensure_machine_running
 
     local output container_id
     output=$($SMOLVM container create default alpine:latest -- sleep 300 2>&1)
@@ -197,7 +197,7 @@ test_container_stop() {
 }
 
 test_container_restart() {
-    ensure_microvm_running
+    ensure_machine_running
 
     local output container_id
     output=$($SMOLVM container create default alpine:latest -- sleep 300 2>&1)
@@ -235,7 +235,7 @@ test_container_restart() {
 # =============================================================================
 
 test_container_remove() {
-    ensure_microvm_running
+    ensure_machine_running
 
     local output container_id
     output=$($SMOLVM container create default alpine:latest -- sleep 300 2>&1)
@@ -260,7 +260,7 @@ test_container_remove() {
 # =============================================================================
 
 test_container_prefix_matching() {
-    ensure_microvm_running
+    ensure_machine_running
 
     local output container_id
     output=$($SMOLVM container create default alpine:latest -- sleep 300 2>&1)

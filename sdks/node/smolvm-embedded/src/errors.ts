@@ -39,7 +39,7 @@ export class HypervisorUnavailableError extends SmolvmError {
   }
 }
 
-/** Resource conflict (e.g., sandbox already exists). */
+/** Resource conflict (e.g., machine already exists). */
 export class ConflictError extends SmolvmError {
   constructor(message: string) {
     super(message, "CONFLICT");

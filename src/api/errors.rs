@@ -69,7 +69,7 @@ impl From<crate::error::Error> for ApiError {
     fn from(err: crate::error::Error) -> Self {
         match &err {
             crate::error::Error::VmNotFound { name } => {
-                ApiError::NotFound(format!("sandbox not found: {}", name))
+                ApiError::NotFound(format!("machine not found: {}", name))
             }
             crate::error::Error::InvalidState { expected, actual } => ApiError::Conflict(format!(
                 "invalid state: expected {}, got {}",
@@ -86,7 +86,7 @@ impl From<crate::error::Error> for ApiError {
     }
 }
 
-/// Classify errors from `ensure_sandbox_running` into proper HTTP status codes.
+/// Classify errors from `ensure_machine_running` into proper HTTP status codes.
 ///
 /// Mount validation errors are 400 (Bad Request), everything else uses the
 /// standard `Error -> ApiError` mapping (500 for startup failures, etc.).

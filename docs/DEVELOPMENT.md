@@ -26,7 +26,7 @@ cargo make dev
 # Run smolvm with environment variables set up automatically
 cargo make smolvm --version
 cargo make smolvm sandbox run --net --image alpine:latest -- echo hello
-cargo make smolvm microvm ls
+cargo make smolvm machine ls
 
 # Or run the binary directly with environment variables:
 DYLD_LIBRARY_PATH="./lib" SMOLVM_AGENT_ROOTFS="./target/agent-rootfs" ./target/release/smolvm <command>
@@ -56,7 +56,7 @@ cargo make test
 # Run specific test suites
 cargo make test-cli        # CLI tests only
 cargo make test-sandbox    # Sandbox tests only
-cargo make test-microvm    # MicroVM tests only
+cargo make test-machine    # MicroVM tests only
 cargo make test-pack       # Pack tests only
 cargo make test-lib        # Unit tests (no VM required)
 ```
@@ -109,7 +109,7 @@ The `cargo make dist` task wraps `scripts/build-dist.sh`. Other scripts:
 **Database lock errors** ("Database already open"):
 ```bash
 pkill -f "smolvm serve"
-pkill -f "smolvm-bin microvm start"
+pkill -f "smolvm-bin machine start"
 ```
 
 **Hung tests**: Check for stuck VM processes:

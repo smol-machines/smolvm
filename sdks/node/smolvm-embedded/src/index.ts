@@ -6,19 +6,19 @@
  *
  * @example
  * ```ts
- * import { quickExec, withSandbox, Sandbox } from "smolvm-embedded";
+ * import { quickExec, withMachine, Machine } from "smolvm-embedded";
  *
  * // One-liner
  * const result = await quickExec(["echo", "hello"]);
  *
  * // Managed lifecycle
- * await withSandbox({ name: "my-sandbox" }, async (sb) => {
+ * await withMachine({ name: "my-machine" }, async (sb) => {
  *   const r = await sb.exec(["date"]);
  *   console.log(r.stdout);
  * });
  *
  * // Full control
- * const sb = await Sandbox.create({ name: "my-vm" });
+ * const sb = await Machine.create({ name: "my-vm" });
  * const r = await sb.run("alpine:latest", ["cat", "/etc/os-release"]);
  * console.log(r.stdout);
  * await sb.delete();
@@ -26,13 +26,12 @@
  */
 
 // Core classes
-export { Sandbox, withSandbox, quickExec, quickRun } from "./sandbox.js";
-export { MicroVM, withMicroVM } from "./microvm.js";
+export { Machine, withMachine, quickExec, quickRun } from "./machine.js";
 export { ExecResult, ExecutionError } from "./execution.js";
 
 // Presets
-export { PythonSandbox } from "./presets/python.js";
-export { NodeSandbox } from "./presets/node.js";
+export { PythonMachine } from "./presets/python.js";
+export { NodeMachine } from "./presets/node.js";
 
 // Error classes
 export {
@@ -46,8 +45,7 @@ export {
 
 // Types
 export type {
-  SandboxConfig,
-  MicroVMConfig,
+  MachineConfig,
   MountSpec,
   PortSpec,
   ResourceSpec,

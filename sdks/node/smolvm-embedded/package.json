@@ -1,6 +1,6 @@
 {
   "name": "smolvm-embedded",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Embedded Node.js SDK for smolvm",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
@@ -41,7 +41,7 @@
     "smolvm",
     "embedded",
     "microvm",
-    "sandbox",
+    "machine",
     "virtualization",
     "napi"
   ],

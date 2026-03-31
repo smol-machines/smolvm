@@ -11,11 +11,11 @@ use smolvm::data::network::PortMapping;
 // Input types (JS → Rust)
 // ============================================================================
 
-/// Configuration for creating a sandbox.
+/// Configuration for creating a machine.
 #[napi(object)]
 #[derive(Debug, Clone)]
-pub struct SandboxConfig {
-    /// Unique sandbox name. Used as the VM identifier.
+pub struct MachineConfig {
+    /// Unique machine name. Used as the VM identifier.
     pub name: String,
     /// Host directories to mount into the VM.
     pub mounts: Option<Vec<HostMountConfig>>,

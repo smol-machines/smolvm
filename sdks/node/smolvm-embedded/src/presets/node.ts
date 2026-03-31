@@ -1,41 +1,41 @@
 /**
- * NodeSandbox — pre-configured sandbox for running Node.js code.
+ * NodeMachine — pre-configured machine for running Node.js code.
  */
 
-import { Sandbox } from "../sandbox.js";
+import { Machine } from "../machine.js";
 import { ExecResult } from "../execution.js";
-import type { SandboxConfig, ExecOptions, CodeOptions } from "../types.js";
+import type { MachineConfig, ExecOptions, CodeOptions } from "../types.js";
 
-export class NodeSandbox extends Sandbox {
+export class NodeMachine extends Machine {
   static readonly DEFAULT_IMAGE = "node:22-alpine";
 
-  static async create(config: SandboxConfig): Promise<NodeSandbox> {
-    const sandbox = new NodeSandbox(config);
-    await sandbox.start();
+  static async create(config: MachineConfig): Promise<NodeMachine> {
+    const machine = new NodeMachine(config);
+    await machine.start();
     // Pre-pull the Node image
-    await sandbox.pullImage(NodeSandbox.DEFAULT_IMAGE);
-    return sandbox;
+    await machine.pullImage(NodeMachine.DEFAULT_IMAGE);
+    return machine;
   }
 
-  private constructor(config: SandboxConfig) {
+  private constructor(config: MachineConfig) {
     super(config);
   }
 
   /** Run JavaScript code. */
   async runCode(code: string, options?: CodeOptions): Promise<ExecResult> {
-    const image = options?.image ?? NodeSandbox.DEFAULT_IMAGE;
+    const image = options?.image ?? NodeMachine.DEFAULT_IMAGE;
     return this.run(image, ["node", "-e", code], options);
   }
 
   /** Run a JavaScript file (must be in a mounted directory). */
   async runFile(path: string, options?: CodeOptions): Promise<ExecResult> {
-    const image = options?.image ?? NodeSandbox.DEFAULT_IMAGE;
+    const image = options?.image ?? NodeMachine.DEFAULT_IMAGE;
     return this.run(image, ["node", path], options);
   }
 
   /** Run ESM code. */
   async runESM(code: string, options?: CodeOptions): Promise<ExecResult> {
-    const image = options?.image ?? NodeSandbox.DEFAULT_IMAGE;
+    const image = options?.image ?? NodeMachine.DEFAULT_IMAGE;
     return this.run(
       image,
       ["node", "--input-type=module", "-e", code],
@@ -54,7 +54,7 @@ export class NodeSandbox extends Sandbox {
 
   /** Run npm commands. */
   async npm(args: string[], options?: ExecOptions): Promise<ExecResult> {
-    return this.run(NodeSandbox.DEFAULT_IMAGE, ["npm", ...args], options);
+    return this.run(NodeMachine.DEFAULT_IMAGE, ["npm", ...args], options);
   }
 
   /** Install npm packages. */
@@ -67,12 +67,12 @@ export class NodeSandbox extends Sandbox {
 
   /** Run npx commands. */
   async npx(args: string[], options?: ExecOptions): Promise<ExecResult> {
-    return this.run(NodeSandbox.DEFAULT_IMAGE, ["npx", ...args], options);
+    return this.run(NodeMachine.DEFAULT_IMAGE, ["npx", ...args], options);
   }
 
   /** Get Node.js version. */
   async version(options?: CodeOptions): Promise<string> {
-    const image = options?.image ?? NodeSandbox.DEFAULT_IMAGE;
+    const image = options?.image ?? NodeMachine.DEFAULT_IMAGE;
     const result = await this.run(image, ["node", "--version"], options);
     return result.stdout.trim();
   }

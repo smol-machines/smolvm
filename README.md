@@ -25,19 +25,13 @@ Quick Start
 * Join the community: https://discord.gg/qhQ7FHZ2zd
 
 ```bash
-# Run a container image in an isolated microVM
-smolvm sandbox run --net alpine -- echo "hello from a microVM"
-
-# Mount host directories (explicit — host is protected by default)
-smolvm sandbox run --net -v ./src:/workspace alpine -- ls /workspace
-
-# Persistent microVM with interactive shell
-smolvm microvm create --net myvm
-smolvm microvm start myvm
-smolvm microvm exec --name myvm -- apk add sl
-smolvm microvm exec --name myvm -it -- sl
-smolvm microvm exec --name myvm -it -- /bin/sh   # interactive shell
-smolvm microvm stop myvm
+# Create and run an isolated machine
+smolvm machine create --net myvm
+smolvm machine start myvm
+smolvm machine exec --name myvm -- apk add sl
+smolvm machine exec --name myvm -it -- sl
+smolvm machine exec --name myvm -it -- /bin/sh   # interactive shell
+smolvm machine stop myvm
 
 # Pack into a portable executable
 smolvm pack create python:3.12-alpine -o ./my-pythonvm
@@ -84,7 +78,7 @@ Platform Support
 Known Limitations
 -----------------
 
-* Network is opt-in for sandboxes (`--net`). Default microVM has networking enabled. TCP/UDP only, no ICMP.
+* Network is opt-in (`--net` on `machine create`). The default machine has networking enabled. TCP/UDP only, no ICMP.
 * Volume mounts: directories only (no single files).
 * macOS: binary must be signed with Hypervisor.framework entitlements.
 

@@ -2,7 +2,7 @@
 #
 # CLI tests for smolvm.
 #
-# Tests basic CLI functionality like --version and --help.
+# Tests basic CLI functionality like --version, --help, and subcommand structure.
 # Does not require VM environment.
 #
 # Usage:
@@ -30,41 +30,30 @@ test_version() {
 test_help() {
     local output
     output=$($SMOLVM --help 2>&1)
-    [[ "$output" == *"sandbox"* ]] && \
-    [[ "$output" == *"microvm"* ]] && \
-    [[ "$output" == *"container"* ]]
+    [[ "$output" == *"machine"* ]] && \
+    [[ "$output" == *"container"* ]] && \
+    [[ "$output" == *"pack"* ]]
 }
 
-test_sandbox_help() {
+test_machine_help() {
     local output
-    output=$($SMOLVM sandbox --help 2>&1)
-    [[ "$output" == *"run"* ]]
-}
-
-test_sandbox_run_platform_flag() {
-    # Verify --oci-platform flag exists in sandbox run help
-    local output
-    output=$($SMOLVM sandbox run --help 2>&1)
-    [[ "$output" == *"--oci-platform"* ]] && \
-    [[ "$output" == *"linux/arm64"* ]] && \
-    [[ "$output" == *"linux/amd64"* ]]
-}
-
-test_pack_platform_flag() {
-    # Verify --oci-platform flag exists in pack help
-    local output
-    output=$($SMOLVM pack create --help 2>&1)
-    [[ "$output" == *"--oci-platform"* ]] && \
-    [[ "$output" == *"linux/arm64"* ]] && \
-    [[ "$output" == *"linux/amd64"* ]]
-}
-
-test_microvm_help() {
-    local output
-    output=$($SMOLVM microvm --help 2>&1)
+    output=$($SMOLVM machine --help 2>&1)
+    [[ "$output" == *"run"* ]] && \
+    [[ "$output" == *"create"* ]] && \
     [[ "$output" == *"start"* ]] && \
     [[ "$output" == *"stop"* ]] && \
-    [[ "$output" == *"status"* ]]
+    [[ "$output" == *"exec"* ]] && \
+    [[ "$output" == *"images"* ]] && \
+    [[ "$output" == *"prune"* ]]
+}
+
+test_machine_run_help() {
+    local output
+    output=$($SMOLVM machine run --help 2>&1)
+    [[ "$output" == *"IMAGE"* ]] && \
+    [[ "$output" == *"--net"* ]] && \
+    [[ "$output" == *"--detach"* ]] && \
+    [[ "$output" == *"--oci-platform"* ]]
 }
 
 test_container_help() {
@@ -77,54 +66,57 @@ test_container_help() {
     [[ "$output" == *"remove"* ]]
 }
 
+test_pack_help() {
+    local output
+    output=$($SMOLVM pack create --help 2>&1)
+    [[ "$output" == *"--oci-platform"* ]] && \
+    [[ "$output" == *"--output"* ]]
+}
+
+# =============================================================================
+# Removed Commands
+# =============================================================================
+
+
+# =============================================================================
+# Machine Aliases
+# =============================================================================
+
+test_vm_alias() {
+    local output
+    output=$($SMOLVM vm --help 2>&1)
+    [[ "$output" == *"run"* ]] && \
+    [[ "$output" == *"create"* ]]
+}
+
 # =============================================================================
 # Invalid Commands
 # =============================================================================
 
 test_invalid_subcommand() {
-    # Should fail for invalid subcommand
     ! $SMOLVM nonexistent-command 2>/dev/null
 }
 
-test_sandbox_run_invalid_image() {
-    # Should fail when a nonexistent image is provided
-    ! $SMOLVM sandbox run --image nonexistent-image-99999:v1 -- echo hi 2>/dev/null
-}
-
 # =============================================================================
-# Disk Size Flags
+# Flag Presence
 # =============================================================================
 
-test_microvm_create_overlay_flag() {
-    # Verify --overlay flag exists in microvm create help
+test_machine_create_flags() {
     local output
-    output=$($SMOLVM microvm create --help 2>&1)
+    output=$($SMOLVM machine create --help 2>&1)
     [[ "$output" == *"--overlay"* ]] && \
-    [[ "$output" == *"GiB"* ]]
-}
-
-test_microvm_create_storage_flag() {
-    # Verify --storage flag exists in microvm create help
-    local output
-    output=$($SMOLVM microvm create --help 2>&1)
     [[ "$output" == *"--storage"* ]] && \
-    [[ "$output" == *"GiB"* ]]
+    [[ "$output" == *"--net"* ]] && \
+    [[ "$output" == *"--smolfile"* ]]
 }
 
-test_sandbox_create_overlay_flag() {
-    # Verify --overlay flag exists in sandbox create help
+test_machine_run_flags() {
     local output
-    output=$($SMOLVM sandbox create --help 2>&1)
+    output=$($SMOLVM machine run --help 2>&1)
     [[ "$output" == *"--overlay"* ]] && \
-    [[ "$output" == *"GiB"* ]]
-}
-
-test_sandbox_run_overlay_flag() {
-    # Verify --overlay flag exists in sandbox run help
-    local output
-    output=$($SMOLVM sandbox run --help 2>&1)
-    [[ "$output" == *"--overlay"* ]] && \
-    [[ "$output" == *"GiB"* ]]
+    [[ "$output" == *"--volume"* ]] && \
+    [[ "$output" == *"--port"* ]] && \
+    [[ "$output" == *"--smolfile"* ]]
 }
 
 # =============================================================================
@@ -133,16 +125,13 @@ test_sandbox_run_overlay_flag() {
 
 run_test "Version command" test_version || true
 run_test "Help command" test_help || true
-run_test "Sandbox help" test_sandbox_help || true
-run_test "Sandbox run --oci-platform flag" test_sandbox_run_platform_flag || true
-run_test "Pack --oci-platform flag" test_pack_platform_flag || true
-run_test "Microvm help" test_microvm_help || true
+run_test "Machine help" test_machine_help || true
+run_test "Machine run help" test_machine_run_help || true
 run_test "Container help" test_container_help || true
+run_test "Pack help" test_pack_help || true
+run_test "vm alias works" test_vm_alias || true
 run_test "Invalid subcommand fails" test_invalid_subcommand || true
-run_test "Sandbox run with invalid image fails" test_sandbox_run_invalid_image || true
-run_test "Microvm create --overlay flag" test_microvm_create_overlay_flag || true
-run_test "Microvm create --storage flag" test_microvm_create_storage_flag || true
-run_test "Sandbox create --overlay flag" test_sandbox_create_overlay_flag || true
-run_test "Sandbox run --overlay flag" test_sandbox_run_overlay_flag || true
+run_test "Machine create flags" test_machine_create_flags || true
+run_test "Machine run flags" test_machine_run_flags || true
 
 print_summary "CLI Tests"

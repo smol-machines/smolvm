@@ -194,7 +194,7 @@ pub struct AgentManager {
     config_file: PathBuf,
     /// Console log path (optional).
     console_log: Option<PathBuf>,
-    /// Startup error log path written by the child if microvm launch fails before readiness
+    /// Startup error log path written by the child if machine launch fails before readiness
     startup_error_log: PathBuf,
     /// Internal state.
     inner: Arc<Mutex<AgentInner>>,
@@ -759,11 +759,15 @@ impl AgentManager {
         self.start_with_full_config(mounts, Vec::new(), resources)
     }
 
-    /// Start the agent VM with specified mounts, ports, and resources.
-    pub fn start_with_full_config(
+    /// Common pre-launch setup: validate state, pre-format disks, clean markers.
+    ///
+    /// Called by both `start_with_full_config` (fork) and `start_via_subprocess`.
+    /// Sets internal state to `Starting` and stores config. Returns error if
+    /// the agent is not in the `Stopped` state.
+    fn prepare_for_launch(
         &self,
-        mounts: Vec<HostMount>,
-        ports: Vec<PortMapping>,
+        mounts: &[HostMount],
+        ports: &[PortMapping],
         resources: VmResources,
     ) -> Result<()> {
         // Check and update state
@@ -776,8 +780,8 @@ impl AgentManager {
                 ));
             }
             inner.state = AgentState::Starting;
-            inner.mounts = mounts.clone();
-            inner.ports = ports.clone();
+            inner.mounts = mounts.to_vec();
+            inner.ports = ports.to_vec();
             inner.resources = resources;
             inner.config_state = ConfigState::Known;
         }
@@ -787,10 +791,10 @@ impl AgentManager {
             storage = %self.storage_disk.path().display(),
             socket = %self.vsock_socket.display(),
             mount_count = mounts.len(),
-            "starting agent VM"
+            "preparing agent VM launch"
         );
 
-        // Check KVM availability on Linux before attempting to start VM
+        // Check KVM availability on Linux
         #[cfg(target_os = "linux")]
         {
             if let Err(e) = crate::platform::linux::check_kvm_available() {
@@ -810,56 +814,110 @@ impl AgentManager {
             ));
         }
 
-        // Pre-format storage and overlay disks in parallel.
-        // Each tries: 1) clonefile/copy from template, 2) mkfs.ext4 (requires e2fsprogs).
-        // If both fail, VM can still format the disk but it may be slower or timeout.
+        // Pre-format storage and overlay disks in parallel
         {
             let storage_disk = &self.storage_disk;
             let overlay_disk = &self.overlay_disk;
             std::thread::scope(|s| {
                 let storage_handle = s.spawn(|| storage_disk.ensure_formatted());
                 let overlay_result = overlay_disk.ensure_formatted();
-
                 if let Err(e) = storage_handle.join().unwrap_or_else(|_| {
                     Err(crate::Error::storage("format storage", "thread panicked"))
                 }) {
                     tracing::warn!(
                         error = %e,
-                        "failed to pre-format disk on host, will attempt format in VM. \
-                        For faster startup, install storage template or e2fsprogs"
+                        "failed to pre-format disk on host"
                     );
                 }
                 if let Err(e) = overlay_result {
                     tracing::warn!(
                         error = %e,
-                        "failed to pre-format overlay disk on host, will format in VM on first boot"
+                        "failed to pre-format overlay disk on host"
                     );
                 }
             });
         }
 
-        // Install SIGCHLD handler to automatically reap zombie children.
-        // This must be done AFTER ensure_formatted() because the handler
-        // reaps all children, which interferes with Command::output().
-        crate::process::install_sigchld_handler();
-
-        // Clean up old socket
-        if let Err(e) = std::fs::remove_file(&self.vsock_socket) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::debug!(error = %e, path = %self.vsock_socket.display(), "failed to remove old socket");
-            }
-        }
-
-        // Clean up stale ready marker from previous boot
+        // Clean up old socket and stale markers
+        let _ = std::fs::remove_file(&self.vsock_socket);
         let ready_marker = self.rootfs_path.join(READY_MARKER_FILENAME);
         let _ = std::fs::remove_file(&ready_marker);
         let _ = std::fs::remove_file(&self.startup_error_log);
 
-        // Clone mounts/ports for save_running_config (originals move into fork closure)
-        let mounts_for_config = mounts.clone();
-        let ports_for_config = ports.clone();
+        Ok(())
+    }
 
-        // Clone paths for the child process (owned copies)
+    /// Common post-launch bookkeeping: store child PID, write config/PID files,
+    /// wait for agent ready.
+    ///
+    /// Called by both `start_with_full_config` (fork) and `start_via_subprocess`.
+    fn finalize_launch(
+        &self,
+        child_pid: i32,
+        mounts: &[HostMount],
+        ports: &[PortMapping],
+        resources: &VmResources,
+    ) -> Result<()> {
+        // Store child process handle
+        {
+            let mut inner = self.inner.lock();
+            inner.child = Some(ChildProcess::new(child_pid));
+        }
+
+        // Write running config (for future CLI invocations to detect config changes)
+        self.save_running_config(mounts, ports, resources);
+
+        // Write PID file with start time for PID reuse detection
+        let pid_content = match process::process_start_time(child_pid) {
+            Some(t) => format!("{}\n{}", child_pid, t),
+            None => child_pid.to_string(),
+        };
+        if let Err(e) = std::fs::write(&self.pid_file, pid_content) {
+            tracing::warn!(error = %e, "failed to write PID file");
+        }
+
+        // Wait for the agent to be ready
+        match self.wait_for_ready() {
+            Ok(_) => {
+                let mut inner = self.inner.lock();
+                inner.state = AgentState::Running;
+                tracing::info!(pid = child_pid, "agent VM is ready");
+                Ok(())
+            }
+            Err(e) => {
+                process::terminate(child_pid);
+                let mut inner = self.inner.lock();
+                inner.state = AgentState::Stopped;
+                inner.child = None;
+                let _ = std::fs::remove_file(&self.startup_error_log);
+                Err(e)
+            }
+        }
+    }
+
+    /// Start the agent VM with specified mounts, ports, and resources.
+    ///
+    /// Uses `fork()` to create a child process that runs `krun_start_enter`.
+    /// Safe for single-threaded callers (CLI). For multi-threaded callers
+    /// (API server), use `start_via_subprocess` instead.
+    pub fn start_with_full_config(
+        &self,
+        mounts: Vec<HostMount>,
+        ports: Vec<PortMapping>,
+        resources: VmResources,
+    ) -> Result<()> {
+        self.prepare_for_launch(&mounts, &ports, resources)?;
+
+        // Install SIGCHLD handler to automatically reap zombie children.
+        // Must be done AFTER prepare_for_launch (which calls ensure_formatted
+        // via Command::output that needs child reaping to not interfere).
+        crate::process::install_sigchld_handler();
+
+        // Clone mounts/ports for finalize_launch (originals move into fork closure)
+        let mounts_for_finalize = mounts.clone();
+        let ports_for_finalize = ports.clone();
+
+        // Clone paths for the child process (originals are borrowed from self)
         let rootfs_path = self.rootfs_path.clone();
         let storage_disk_path = self.storage_disk.path().to_path_buf();
         let overlay_disk_path = self.overlay_disk.path().to_path_buf();
@@ -872,9 +930,8 @@ impl AgentManager {
             .overlay_gib
             .unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GIB);
 
-        // Fork child process using the safe abstraction.
-        // The child becomes a session leader (detached from parent's session)
-        // so the VM survives if the parent process is killed.
+        // Fork child process. The child becomes a session leader so the VM
+        // survives if the parent process is killed.
         let child_pid = match process::fork_session_leader(move || {
             // Inherited file descriptors (including database locks) are closed
             // by fork_session_leader before this closure runs.
@@ -950,47 +1007,132 @@ impl AgentManager {
             }
         };
 
-        // Parent process continues here — child is now booting the VM in parallel.
         tracing::debug!(pid = child_pid, "forked agent VM process");
+        self.finalize_launch(
+            child_pid,
+            &mounts_for_finalize,
+            &ports_for_finalize,
+            &resources,
+        )
+    }
 
-        // Store child process
-        {
-            let mut inner = self.inner.lock();
-            inner.child = Some(ChildProcess::new(child_pid));
-        }
+    /// Start the VM by spawning a fresh subprocess instead of fork().
+    ///
+    /// On macOS, fork() in a multi-threaded process (e.g., from within the
+    /// tokio-based API server) creates unstable children: Apple frameworks
+    /// like Hypervisor.framework detect the forked multi-threaded state and
+    /// abort the child ~2 seconds after boot.
+    ///
+    /// This method avoids fork entirely by spawning a fresh `smolvm _boot-vm`
+    /// process via `Command::new()` (which uses `posix_spawn` on macOS).
+    /// The subprocess is single-threaded and runs `krun_start_enter` safely.
+    pub fn start_via_subprocess(
+        &self,
+        mounts: Vec<HostMount>,
+        ports: Vec<PortMapping>,
+        resources: VmResources,
+    ) -> Result<()> {
+        use super::boot_config::BootConfig;
 
-        // Write running config while child boots (overlaps with VM startup).
-        // This is needed for future CLI invocations to detect config changes.
-        self.save_running_config(&mounts_for_config, &ports_for_config, &resources);
+        self.prepare_for_launch(&mounts, &ports, resources)?;
 
-        // Write PID file so future CLI invocations can find this process.
-        // Include start time on second line for PID reuse detection.
-        let pid_content = match process::process_start_time(child_pid) {
-            Some(t) => format!("{}\n{}", child_pid, t),
-            None => child_pid.to_string(),
+        let storage_size_gb = resources
+            .storage_gib
+            .unwrap_or(crate::storage::DEFAULT_STORAGE_SIZE_GIB);
+        let overlay_size_gb = resources
+            .overlay_gib
+            .unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GIB);
+
+        // Write boot config to a file the subprocess will read
+        let config = BootConfig {
+            rootfs_path: self.rootfs_path.clone(),
+            storage_disk_path: self.storage_disk.path().to_path_buf(),
+            overlay_disk_path: self.overlay_disk.path().to_path_buf(),
+            vsock_socket: self.vsock_socket.clone(),
+            console_log: self.console_log.clone(),
+            startup_error_log: self.startup_error_log.clone(),
+            storage_size_gb,
+            overlay_size_gb,
+            mounts: mounts.clone(),
+            ports: ports.clone(),
+            resources,
         };
-        if let Err(e) = std::fs::write(&self.pid_file, pid_content) {
-            tracing::warn!(error = %e, "failed to write PID file");
+        let config_path = self
+            .storage_disk
+            .path()
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("/tmp"))
+            .join("boot-config.json");
+        let config_json = serde_json::to_vec(&config)
+            .map_err(|e| Error::agent("serialize boot config", e.to_string()))?;
+        std::fs::write(&config_path, &config_json)
+            .map_err(|e| Error::agent("write boot config", e.to_string()))?;
+
+        // Spawn fresh subprocess (posix_spawn on macOS — safe for multi-threaded parents)
+        let exe = std::env::current_exe()
+            .map_err(|e| Error::agent("find smolvm binary", e.to_string()))?;
+        let child = std::process::Command::new(&exe)
+            .args(["_boot-vm", &config_path.to_string_lossy()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| Error::agent("spawn boot subprocess", e.to_string()))?;
+
+        let child_pid = child.id() as i32;
+        tracing::debug!(pid = child_pid, "spawned boot subprocess");
+
+        self.finalize_launch(child_pid, &mounts, &ports, &resources)
+    }
+
+    /// Like `ensure_running_with_full_config` but uses subprocess launch.
+    ///
+    /// Use this from multi-threaded contexts (API server) where fork() is
+    /// unsafe on macOS. See `start_via_subprocess` for details.
+    pub fn ensure_running_via_subprocess(
+        &self,
+        mounts: Vec<HostMount>,
+        ports: Vec<PortMapping>,
+        resources: VmResources,
+    ) -> Result<bool> {
+        // Check if agent is already running (same logic as ensure_running_with_full_config)
+        if self.try_connect_existing().is_some() {
+            let inner = self.inner.lock();
+            match &inner.config_state {
+                ConfigState::Known => {
+                    if inner.mounts == mounts
+                        && inner.ports == ports
+                        && inner.resources == resources
+                    {
+                        return Ok(false);
+                    }
+                }
+                ConfigState::LoadFailed(reason) => {
+                    tracing::info!(
+                        reason = %reason,
+                        "forcing VM restart: running config unknown"
+                    );
+                }
+                ConfigState::Unknown => {
+                    tracing::info!("forcing VM restart: config state still unknown");
+                }
+            }
         }
 
-        // Wait for the agent to be ready
-        match self.wait_for_ready() {
-            Ok(_) => {
-                let mut inner = self.inner.lock();
-                inner.state = AgentState::Running;
-                tracing::info!(pid = child_pid, "agent VM is ready");
-                Ok(())
-            }
-            Err(e) => {
-                // Kill child if startup failed
-                process::terminate(child_pid);
-                let mut inner = self.inner.lock();
-                inner.state = AgentState::Stopped;
-                inner.child = None;
-                let _ = std::fs::remove_file(&self.startup_error_log);
-                Err(e)
-            }
+        let needs_restart = {
+            let inner = self.inner.lock();
+            inner.state == AgentState::Running
+        };
+
+        if needs_restart {
+            tracing::info!("restarting agent VM due to configuration change");
+            self.stop()?;
+        } else {
+            self.reset_stale_running_state();
         }
+
+        self.start_via_subprocess(mounts, ports, resources)?;
+        Ok(true)
     }
 
     /// Verify identity of a VM process and kill it.
@@ -1010,17 +1152,20 @@ impl AgentManager {
             false
         };
 
-        let identity_verified = process::is_our_process_strict(pid, start_time);
+        // Identity check: vsock acknowledgement OR strict PID start-time match.
+        // We intentionally do NOT use the lenient is_our_process() here because
+        // it treats any alive PID as "ours" when start_time is None — which risks
+        // killing an unrelated process if the OS reused the PID.
+        let identity_ok = shutdown_acked || process::is_our_process_strict(pid, start_time);
 
-        if identity_verified || shutdown_acked {
-            if !identity_verified {
+        if identity_ok {
+            if !process::is_our_process_strict(pid, start_time) {
                 tracing::debug!(
                     pid,
-                    "PID identity not verified (session-leader child), \
-                     but shutdown was acknowledged over vsock"
+                    "PID start-time not verified, identity confirmed via vsock"
                 );
             }
-            let _ = process::stop_process_fast(pid, AGENT_STOP_TIMEOUT, true);
+            let _ = process::stop_vm_process(pid, AGENT_STOP_TIMEOUT, process::VM_SIGKILL_TIMEOUT);
         } else {
             tracing::warn!(
                 pid,

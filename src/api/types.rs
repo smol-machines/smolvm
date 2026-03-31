@@ -4,10 +4,10 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 // ============================================================================
-// Sandbox Types
+// Machine Types
 // ============================================================================
 
-/// Restart policy specification for sandbox creation.
+/// Restart policy specification for machine creation.
 #[derive(Debug, Clone, Deserialize, Serialize, Default, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RestartSpec {
@@ -19,33 +19,13 @@ pub struct RestartSpec {
     pub max_retries: Option<u32>,
 }
 
-/// Request to create a new sandbox.
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct CreateSandboxRequest {
-    /// Unique name for the sandbox.
-    #[schema(example = "my-sandbox")]
-    pub name: String,
-    /// Host mounts to attach.
-    #[serde(default)]
-    pub mounts: Vec<MountSpec>,
-    /// Port mappings (host:guest).
-    #[serde(default)]
-    pub ports: Vec<PortSpec>,
-    /// VM resource configuration.
-    #[serde(default)]
-    pub resources: Option<ResourceSpec>,
-    /// Restart policy configuration.
-    #[serde(default)]
-    pub restart: Option<RestartSpec>,
-}
-
 /// Mount specification (for requests).
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 pub struct MountSpec {
     /// Host path to mount.
     #[schema(example = "/Users/me/code")]
     pub source: String,
-    /// Path inside the sandbox.
+    /// Path inside the machine.
     #[schema(example = "/workspace")]
     pub target: String,
     /// Read-only mount.
@@ -62,7 +42,7 @@ pub struct MountInfo {
     /// Host path.
     #[schema(example = "/Users/me/code")]
     pub source: String,
-    /// Path inside the sandbox.
+    /// Path inside the machine.
     #[schema(example = "/workspace")]
     pub target: String,
     /// Read-only mount.
@@ -75,7 +55,7 @@ pub struct PortSpec {
     /// Port on the host.
     #[schema(example = 8080)]
     pub host: u16,
-    /// Port inside the sandbox.
+    /// Port inside the machine.
     #[schema(example = 80)]
     pub guest: u16,
 }
@@ -106,45 +86,11 @@ pub struct ResourceSpec {
     pub overlay_gb: Option<u64>,
 }
 
-/// Sandbox status information.
-#[derive(Debug, Serialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct SandboxInfo {
-    /// Sandbox name.
-    #[schema(example = "my-sandbox")]
-    pub name: String,
-    /// Current state.
-    #[schema(example = "running")]
-    pub state: String,
-    /// Process ID (if running).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(example = 12345)]
-    pub pid: Option<i32>,
-    /// Configured mounts (with virtiofs tags for use in container mounts).
-    pub mounts: Vec<MountInfo>,
-    /// Configured ports.
-    pub ports: Vec<PortSpec>,
-    /// VM resources.
-    pub resources: ResourceSpec,
-    /// Whether outbound network access is enabled.
-    pub network: bool,
-    /// Number of times this sandbox has been automatically restarted.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub restart_count: Option<u32>,
-}
-
-/// List sandboxes response.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ListSandboxesResponse {
-    /// List of sandboxes.
-    pub sandboxes: Vec<SandboxInfo>,
-}
-
 // ============================================================================
 // Exec Types
 // ============================================================================
 
-/// Request to execute a command in a sandbox.
+/// Request to execute a command in a machine.
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecRequest {
@@ -248,13 +194,13 @@ pub struct CreateContainerRequest {
 /// Container mount specification.
 ///
 /// Note: The `source` field is the virtiofs tag, which corresponds to
-/// host mounts configured on the sandbox. Tags are assigned in order:
-/// `smolvm0`, `smolvm1`, etc. based on the sandbox's mount configuration.
-/// Use `GET /api/v1/sandboxes/:id` to see the tag-to-path mapping.
+/// host mounts configured on the machine. Tags are assigned in order:
+/// `smolvm0`, `smolvm1`, etc. based on the machine's mount configuration.
+/// Use `GET /api/v1/machines/:id` to see the tag-to-path mapping.
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 pub struct ContainerMountSpec {
     /// Virtiofs tag (e.g., "smolvm0", "smolvm1").
-    /// These correspond to sandbox mounts in order.
+    /// These correspond to machine mounts in order.
     #[schema(example = "smolvm0")]
     pub source: String,
     /// Target path in container.
@@ -402,7 +348,7 @@ pub struct LogsQuery {
 // Delete Types
 // ============================================================================
 
-/// Query parameters for delete sandbox endpoint.
+/// Query parameters for delete machine endpoint.
 #[derive(Debug, Default, Deserialize, ToSchema)]
 pub struct DeleteQuery {
     /// If true, force delete even if stop fails and VM is still running.
@@ -434,7 +380,7 @@ pub struct HealthResponse {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ApiErrorResponse {
     /// Error message.
-    #[schema(example = "sandbox 'test' not found")]
+    #[schema(example = "machine 'test' not found")]
     pub error: String,
     /// Error code.
     #[schema(example = "NOT_FOUND")]
@@ -442,7 +388,7 @@ pub struct ApiErrorResponse {
 }
 
 // ============================================================================
-// MicroVM Types
+// Machine Types
 // ============================================================================
 
 fn default_cpus() -> u8 {
@@ -453,11 +399,11 @@ fn default_mem() -> u32 {
     512
 }
 
-/// Request to create a new microvm.
+/// Request to create a new machine.
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct CreateMicrovmRequest {
-    /// Unique name for the microvm.
+pub struct CreateMachineRequest {
+    /// Unique name for the machine.
     #[schema(example = "my-vm")]
     pub name: String,
     /// Number of vCPUs.
@@ -486,10 +432,10 @@ pub struct CreateMicrovmRequest {
     pub overlay_gb: Option<u64>,
 }
 
-/// Request to execute a command in a microvm.
+/// Request to execute a command in a machine.
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct MicrovmExecRequest {
+pub struct MachineExecRequest {
     /// Command and arguments.
     #[schema(example = json!(["echo", "hello"]))]
     pub command: Vec<String>,
@@ -504,11 +450,11 @@ pub struct MicrovmExecRequest {
     pub timeout_secs: Option<u64>,
 }
 
-/// MicroVM status information.
+/// Machine status information.
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct MicrovmInfo {
-    /// MicroVM name.
+pub struct MachineInfo {
+    /// Machine name.
     #[schema(example = "my-vm")]
     pub name: String,
     /// Current state ("created", "running", "stopped").
@@ -525,10 +471,10 @@ pub struct MicrovmInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = 12345)]
     pub pid: Option<i32>,
-    /// Number of configured mounts.
-    pub mounts: usize,
-    /// Number of configured ports.
-    pub ports: usize,
+    /// Configured mounts (with virtiofs tags for container use).
+    pub mounts: Vec<MountInfo>,
+    /// Configured port mappings.
+    pub ports: Vec<PortSpec>,
     /// Whether outbound network access is enabled.
     pub network: bool,
     /// Storage disk size in GiB.
@@ -543,18 +489,18 @@ pub struct MicrovmInfo {
     pub created_at: String,
 }
 
-/// List microvms response.
+/// List machines response.
 #[derive(Debug, Serialize, ToSchema)]
-pub struct ListMicrovmsResponse {
-    /// List of microvms.
-    pub microvms: Vec<MicrovmInfo>,
+pub struct ListMachinesResponse {
+    /// List of machines.
+    pub machines: Vec<MachineInfo>,
 }
 
 /// Generic delete response.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct DeleteResponse {
     /// Name of deleted resource.
-    #[schema(example = "my-sandbox")]
+    #[schema(example = "my-machine")]
     pub deleted: String,
 }
 
@@ -578,10 +524,10 @@ pub struct StopResponse {
 // Resize Types
 // ============================================================================
 
-/// Request to resize a microvm's disk resources.
+/// Request to resize a machine's disk resources.
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct ResizeMicrovmRequest {
+pub struct ResizeMachineRequest {
     /// Storage disk size in GiB (expand only, optional).
     #[serde(default)]
     #[schema(example = 50)]

@@ -3,7 +3,7 @@
 # Smolfile tests for smolvm.
 #
 # Tests the `--smolfile` and `--init` functionality for both
-# microvm and sandbox create commands.
+# machine create commands.
 #
 # Usage:
 #   ./tests/test_smolfile.sh
@@ -23,7 +23,7 @@ echo ""
 
 # Temp directory for Smolfiles
 SMOLFILE_TMPDIR=$(mktemp -d)
-trap 'rm -rf "$SMOLFILE_TMPDIR"; cleanup_microvm' EXIT
+trap 'rm -rf "$SMOLFILE_TMPDIR"; cleanup_machine' EXIT
 
 # =============================================================================
 # Helpers
@@ -32,8 +32,8 @@ trap 'rm -rf "$SMOLFILE_TMPDIR"; cleanup_microvm' EXIT
 # Clean up a named VM, ignoring errors
 cleanup_vm() {
     local name="$1"
-    $SMOLVM microvm stop "$name" 2>/dev/null || true
-    $SMOLVM microvm delete "$name" -f 2>/dev/null || true
+    $SMOLVM machine stop "$name" 2>/dev/null || true
+    $SMOLVM machine delete "$name" -f 2>/dev/null || true
 }
 
 # =============================================================================
@@ -45,14 +45,14 @@ test_init_flag_creates_file() {
     cleanup_vm "$vm_name"
 
     # Create VM with --init that creates a marker file
-    $SMOLVM microvm create "$vm_name" --init "echo 'init-ran' > /tmp/init-marker.txt" 2>&1 || return 1
+    $SMOLVM machine create "$vm_name" --init "echo 'init-ran' > /tmp/init-marker.txt" 2>&1 || return 1
 
     # Start VM (init should run)
-    $SMOLVM microvm start "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
+    $SMOLVM machine start "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
 
     # Verify the init command ran
     local output
-    output=$($SMOLVM microvm exec --name "$vm_name" -- cat /tmp/init-marker.txt 2>&1)
+    output=$($SMOLVM machine exec --name "$vm_name" -- cat /tmp/init-marker.txt 2>&1)
 
     cleanup_vm "$vm_name"
     [[ "$output" == *"init-ran"* ]]
@@ -63,18 +63,18 @@ test_init_flag_multiple_commands() {
     cleanup_vm "$vm_name"
 
     # Create VM with multiple --init flags
-    $SMOLVM microvm create "$vm_name" \
+    $SMOLVM machine create "$vm_name" \
         --init "echo 'first' > /tmp/init1.txt" \
         --init "echo 'second' > /tmp/init2.txt" \
         2>&1 || return 1
 
     # Start VM
-    $SMOLVM microvm start "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
+    $SMOLVM machine start "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
 
     # Verify both init commands ran
     local out1 out2
-    out1=$($SMOLVM microvm exec --name "$vm_name" -- cat /tmp/init1.txt 2>&1)
-    out2=$($SMOLVM microvm exec --name "$vm_name" -- cat /tmp/init2.txt 2>&1)
+    out1=$($SMOLVM machine exec --name "$vm_name" -- cat /tmp/init1.txt 2>&1)
+    out2=$($SMOLVM machine exec --name "$vm_name" -- cat /tmp/init2.txt 2>&1)
 
     cleanup_vm "$vm_name"
     [[ "$out1" == *"first"* ]] && [[ "$out2" == *"second"* ]]
@@ -85,17 +85,17 @@ test_init_flag_with_env() {
     cleanup_vm "$vm_name"
 
     # Create VM with --init and -e
-    $SMOLVM microvm create "$vm_name" \
+    $SMOLVM machine create "$vm_name" \
         -e MY_VAR=hello_from_env \
         --init 'echo "$MY_VAR" > /tmp/env-test.txt' \
         2>&1 || return 1
 
     # Start VM
-    $SMOLVM microvm start "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
+    $SMOLVM machine start "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
 
     # Verify env was passed to init
     local output
-    output=$($SMOLVM microvm exec --name "$vm_name" -- cat /tmp/env-test.txt 2>&1)
+    output=$($SMOLVM machine exec --name "$vm_name" -- cat /tmp/env-test.txt 2>&1)
 
     cleanup_vm "$vm_name"
     [[ "$output" == *"hello_from_env"* ]]
@@ -106,17 +106,17 @@ test_init_flag_with_workdir() {
     cleanup_vm "$vm_name"
 
     # Create VM with --init and -w
-    $SMOLVM microvm create "$vm_name" \
+    $SMOLVM machine create "$vm_name" \
         -w /tmp \
         --init "pwd > cwd.txt" \
         2>&1 || return 1
 
     # Start VM
-    $SMOLVM microvm start "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
+    $SMOLVM machine start "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
 
     # Verify workdir was applied
     local output
-    output=$($SMOLVM microvm exec --name "$vm_name" -- cat /tmp/cwd.txt 2>&1)
+    output=$($SMOLVM machine exec --name "$vm_name" -- cat /tmp/cwd.txt 2>&1)
 
     cleanup_vm "$vm_name"
     [[ "$output" == *"/tmp"* ]]
@@ -127,24 +127,24 @@ test_init_runs_on_every_start() {
     cleanup_vm "$vm_name"
 
     # Create VM with --init that appends to a file
-    $SMOLVM microvm create "$vm_name" \
+    $SMOLVM machine create "$vm_name" \
         --init 'echo "boot" >> /tmp/boot-count.txt' \
         2>&1 || return 1
 
     # First start
-    $SMOLVM microvm start "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
+    $SMOLVM machine start "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
 
     # Check count after first start
     local count1
-    count1=$($SMOLVM microvm exec --name "$vm_name" -- wc -l /tmp/boot-count.txt 2>&1)
+    count1=$($SMOLVM machine exec --name "$vm_name" -- wc -l /tmp/boot-count.txt 2>&1)
 
     # Stop and start again
-    $SMOLVM microvm stop "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
-    $SMOLVM microvm start "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
+    $SMOLVM machine stop "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
+    $SMOLVM machine start "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
 
     # Check count after second start
     local count2
-    count2=$($SMOLVM microvm exec --name "$vm_name" -- wc -l /tmp/boot-count.txt 2>&1)
+    count2=$($SMOLVM machine exec --name "$vm_name" -- wc -l /tmp/boot-count.txt 2>&1)
 
     cleanup_vm "$vm_name"
 
@@ -173,11 +173,11 @@ init = [
 EOF
 
     # Create VM from Smolfile
-    $SMOLVM microvm create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.basic" 2>&1 || return 1
+    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.basic" 2>&1 || return 1
 
     # Verify config was applied
     local list_output
-    list_output=$($SMOLVM microvm ls --json 2>&1)
+    list_output=$($SMOLVM machine ls --json 2>&1)
     if [[ "$list_output" != *'"cpus": 2'* ]] || [[ "$list_output" != *'"memory_mib": 1024'* ]]; then
         echo "Smolfile cpus/memory not applied"
         cleanup_vm "$vm_name"
@@ -185,10 +185,10 @@ EOF
     fi
 
     # Start and verify init ran
-    $SMOLVM microvm start "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
+    $SMOLVM machine start "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
 
     local output
-    output=$($SMOLVM microvm exec --name "$vm_name" -- cat /tmp/smolfile-marker.txt 2>&1)
+    output=$($SMOLVM machine exec --name "$vm_name" -- cat /tmp/smolfile-marker.txt 2>&1)
 
     cleanup_vm "$vm_name"
     [[ "$output" == *"smolfile-init-ran"* ]]
@@ -206,11 +206,11 @@ init = [
 ]
 EOF
 
-    $SMOLVM microvm create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.env" 2>&1 || return 1
-    $SMOLVM microvm start "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
+    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.env" 2>&1 || return 1
+    $SMOLVM machine start "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
 
     local output
-    output=$($SMOLVM microvm exec --name "$vm_name" -- cat /tmp/greeting.txt 2>&1)
+    output=$($SMOLVM machine exec --name "$vm_name" -- cat /tmp/greeting.txt 2>&1)
 
     cleanup_vm "$vm_name"
     [[ "$output" == *"hello_from_smolfile"* ]]
@@ -226,10 +226,10 @@ memory = 256
 EOF
 
     # CLI --mem should override Smolfile memory
-    $SMOLVM microvm create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.override" --mem 1024 2>&1 || return 1
+    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.override" --mem 1024 2>&1 || return 1
 
     local list_output
-    list_output=$($SMOLVM microvm ls --json 2>&1)
+    list_output=$($SMOLVM machine ls --json 2>&1)
 
     cleanup_vm "$vm_name"
 
@@ -248,16 +248,16 @@ init = [
 EOF
 
     # CLI --init should extend, not replace
-    $SMOLVM microvm create "$vm_name" \
+    $SMOLVM machine create "$vm_name" \
         --smolfile "$SMOLFILE_TMPDIR/Smolfile.extend" \
         --init "echo 'from-cli' > /tmp/cli-source.txt" \
         2>&1 || return 1
 
-    $SMOLVM microvm start "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
+    $SMOLVM machine start "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
 
     local sf_out cli_out
-    sf_out=$($SMOLVM microvm exec --name "$vm_name" -- cat /tmp/source.txt 2>&1)
-    cli_out=$($SMOLVM microvm exec --name "$vm_name" -- cat /tmp/cli-source.txt 2>&1)
+    sf_out=$($SMOLVM machine exec --name "$vm_name" -- cat /tmp/source.txt 2>&1)
+    cli_out=$($SMOLVM machine exec --name "$vm_name" -- cat /tmp/cli-source.txt 2>&1)
 
     cleanup_vm "$vm_name"
     [[ "$sf_out" == *"from-smolfile"* ]] && [[ "$cli_out" == *"from-cli"* ]]
@@ -268,7 +268,7 @@ test_smolfile_not_found_errors() {
     cleanup_vm "$vm_name"
 
     local exit_code=0
-    $SMOLVM microvm create "$vm_name" --smolfile "/nonexistent/Smolfile" 2>&1 || exit_code=$?
+    $SMOLVM machine create "$vm_name" --smolfile "/nonexistent/Smolfile" 2>&1 || exit_code=$?
 
     cleanup_vm "$vm_name"
     [[ $exit_code -ne 0 ]]
@@ -283,7 +283,7 @@ this is not valid toml {{{
 EOF
 
     local exit_code=0
-    $SMOLVM microvm create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.bad" 2>&1 || exit_code=$?
+    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.bad" 2>&1 || exit_code=$?
 
     cleanup_vm "$vm_name"
     [[ $exit_code -ne 0 ]]
@@ -299,7 +299,7 @@ typo_field = "oops"
 EOF
 
     local exit_code=0
-    $SMOLVM microvm create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.unknown" 2>&1 || exit_code=$?
+    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.unknown" 2>&1 || exit_code=$?
 
     cleanup_vm "$vm_name"
     [[ $exit_code -ne 0 ]]
@@ -318,11 +318,11 @@ EOF
 
     # Create VM WITHOUT --smolfile, even though Smolfile exists in CWD
     # The Smolfile should NOT be auto-detected
-    (cd "$SMOLFILE_TMPDIR" && $SMOLVM microvm create "$vm_name" 2>&1) || return 1
+    (cd "$SMOLFILE_TMPDIR" && $SMOLVM machine create "$vm_name" 2>&1) || return 1
 
     # Verify default config was used (not Smolfile config)
     local list_output
-    list_output=$($SMOLVM microvm ls --json 2>&1)
+    list_output=$($SMOLVM machine ls --json 2>&1)
 
     cleanup_vm "$vm_name"
 
@@ -346,11 +346,11 @@ net = true
 EOF
 
     # Create + start — image from Smolfile should be picked up
-    $SMOLVM microvm create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.image" 2>&1 || return 1
+    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.image" 2>&1 || return 1
 
     # Verify image is persisted in the record
     local list_output
-    list_output=$($SMOLVM microvm ls --json 2>&1)
+    list_output=$($SMOLVM machine ls --json 2>&1)
 
     cleanup_vm "$vm_name"
     [[ "$list_output" == *"alpine:latest"* ]]
@@ -368,7 +368,7 @@ EOF
     local exit_code=0
     local vm_name="smolfile-ep-$$"
     cleanup_vm "$vm_name"
-    $SMOLVM microvm create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.ep" 2>&1 || exit_code=$?
+    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.ep" 2>&1 || exit_code=$?
 
     cleanup_vm "$vm_name"
     [[ $exit_code -eq 0 ]]
@@ -384,7 +384,7 @@ EOF
     local exit_code=0
     local vm_name="smolfile-cmd-$$"
     cleanup_vm "$vm_name"
-    $SMOLVM microvm create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.cmd" 2>&1 || exit_code=$?
+    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.cmd" 2>&1 || exit_code=$?
 
     cleanup_vm "$vm_name"
     [[ $exit_code -eq 0 ]]
@@ -410,7 +410,7 @@ EOF
     local exit_code=0
     local vm_name="smolfile-artifact-$$"
     cleanup_vm "$vm_name"
-    $SMOLVM microvm create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.artifact" 2>&1 || exit_code=$?
+    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.artifact" 2>&1 || exit_code=$?
 
     cleanup_vm "$vm_name"
     [[ $exit_code -eq 0 ]]
@@ -428,7 +428,7 @@ EOF
     local exit_code=0
     local vm_name="smolfile-pack-$$"
     cleanup_vm "$vm_name"
-    $SMOLVM microvm create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.pack" 2>&1 || exit_code=$?
+    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.pack" 2>&1 || exit_code=$?
 
     cleanup_vm "$vm_name"
     [[ $exit_code -eq 0 ]]
@@ -452,13 +452,13 @@ EOF
     local exit_code=0
     local vm_name="smolfile-dev-$$"
     cleanup_vm "$vm_name"
-    $SMOLVM microvm create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.dev" 2>&1 || exit_code=$?
+    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.dev" 2>&1 || exit_code=$?
 
     cleanup_vm "$vm_name"
     [[ $exit_code -eq 0 ]]
 }
 
-test_smolfile_dev_init_used_for_microvm() {
+test_smolfile_dev_init_used_for_machine() {
     local vm_name="smolfile-devinit-$$"
     cleanup_vm "$vm_name"
 
@@ -472,11 +472,11 @@ init = [
 ]
 EOF
 
-    $SMOLVM microvm create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.devinit" 2>&1 || return 1
-    $SMOLVM microvm start "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
+    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.devinit" 2>&1 || return 1
+    $SMOLVM machine start "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
 
     local output
-    output=$($SMOLVM microvm exec --name "$vm_name" -- cat /tmp/dev-marker.txt 2>&1)
+    output=$($SMOLVM machine exec --name "$vm_name" -- cat /tmp/dev-marker.txt 2>&1)
 
     cleanup_vm "$vm_name"
     [[ "$output" == *"dev-init-ran"* ]]
@@ -535,7 +535,7 @@ EOF
     local exit_code=0
     local vm_name="smolfile-full-$$"
     cleanup_vm "$vm_name"
-    $SMOLVM microvm create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.full" 2>&1 || exit_code=$?
+    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.full" 2>&1 || exit_code=$?
 
     cleanup_vm "$vm_name"
     [[ $exit_code -eq 0 ]]
@@ -556,7 +556,7 @@ init = [
 EOF
 
     local output
-    output=$($SMOLVM sandbox run -s "$SMOLFILE_TMPDIR/Smolfile.bare" 2>&1)
+    output=$($SMOLVM machine run -s "$SMOLFILE_TMPDIR/Smolfile.bare" 2>&1)
 
     [[ "$output" == *"bare-vm-works"* ]]
 }
@@ -571,7 +571,7 @@ memory = 512
 EOF
 
     local output
-    output=$($SMOLVM sandbox run -s "$SMOLFILE_TMPDIR/Smolfile.ep_runtime" 2>&1)
+    output=$($SMOLVM machine run -s "$SMOLFILE_TMPDIR/Smolfile.ep_runtime" 2>&1)
 
     [[ "$output" == *"hello-from-entrypoint"* ]]
 }
@@ -588,11 +588,11 @@ memory = 512
 net = true
 EOF
 
-    $SMOLVM microvm create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.autoct" 2>&1 || return 1
+    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.autoct" 2>&1 || return 1
 
     # Start should auto-pull image and create container
     local start_output
-    start_output=$($SMOLVM microvm start "$vm_name" 2>&1)
+    start_output=$($SMOLVM machine start "$vm_name" 2>&1)
 
     cleanup_vm "$vm_name"
 
@@ -613,7 +613,7 @@ net = true
 EOF
 
     local output
-    output=$($SMOLVM sandbox run -s "$SMOLFILE_TMPDIR/Smolfile.cmdonly" 2>&1)
+    output=$($SMOLVM machine run -s "$SMOLFILE_TMPDIR/Smolfile.cmdonly" 2>&1)
 
     [[ "$output" == *"smolfile-cmd-works"* ]]
 }
@@ -630,7 +630,7 @@ net = true
 EOF
 
     local output
-    output=$($SMOLVM sandbox run -s "$SMOLFILE_TMPDIR/Smolfile.imgdefault" -- echo "image-default-ok" 2>&1)
+    output=$($SMOLVM machine run -s "$SMOLFILE_TMPDIR/Smolfile.imgdefault" -- echo "image-default-ok" 2>&1)
 
     [[ "$output" == *"image-default-ok"* ]]
 }
@@ -646,7 +646,7 @@ EOF
     local exit_code=0
     local vm_name="smolfile-badsec-$$"
     cleanup_vm "$vm_name"
-    $SMOLVM microvm create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.badsection" 2>&1 || exit_code=$?
+    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.badsection" 2>&1 || exit_code=$?
 
     cleanup_vm "$vm_name"
     [[ $exit_code -ne 0 ]]
@@ -660,7 +660,7 @@ test_ls_verbose_shows_init() {
     local vm_name="smolfile-verbose-$$"
     cleanup_vm "$vm_name"
 
-    $SMOLVM microvm create "$vm_name" \
+    $SMOLVM machine create "$vm_name" \
         --init "echo hello" \
         --init "echo world" \
         -e FOO=bar \
@@ -668,7 +668,7 @@ test_ls_verbose_shows_init() {
         2>&1 || return 1
 
     local verbose_output
-    verbose_output=$($SMOLVM microvm ls --verbose 2>&1)
+    verbose_output=$($SMOLVM machine ls --verbose 2>&1)
 
     cleanup_vm "$vm_name"
 
@@ -710,7 +710,7 @@ run_test "Smolfile v2: cmd field" test_smolfile_cmd_field || true
 run_test "Smolfile v2: [artifact] section parses" test_smolfile_artifact_section_parses || true
 run_test "Smolfile v2: [pack] alias parses" test_smolfile_pack_alias_parses || true
 run_test "Smolfile v2: [dev] section parses" test_smolfile_dev_section_parses || true
-run_test "Smolfile v2: [dev] init used for microvm" test_smolfile_dev_init_used_for_microvm || true
+run_test "Smolfile v2: [dev] init used for machine" test_smolfile_dev_init_used_for_machine || true
 run_test "Smolfile v2: full spec parses" test_smolfile_full_spec_parses || true
 run_test "Smolfile v2: bare VM (no image)" test_smolfile_bare_vm_no_image || true
 run_test "Smolfile v2: entrypoint used at runtime" test_smolfile_entrypoint_used_at_runtime || true

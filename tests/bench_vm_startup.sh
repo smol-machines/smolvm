@@ -49,10 +49,10 @@ echo ""
 cleanup() {
     echo ""
     echo "Cleaning up..."
-    $SMOLVM microvm stop 2>/dev/null || true
+    $SMOLVM machine stop 2>/dev/null || true
     # Kill any orphaned smolvm processes
-    pkill -f "smolvm-bin microvm" 2>/dev/null || true
-    pkill -f "smolvm microvm start" 2>/dev/null || true
+    pkill -f "smolvm-bin machine" 2>/dev/null || true
+    pkill -f "smolvm machine start" 2>/dev/null || true
 }
 
 # Ensure cleanup runs on exit (normal or error)
@@ -60,29 +60,29 @@ trap cleanup EXIT
 
 # Kill any existing smolvm processes before benchmarking
 echo "Cleaning up any existing smolvm processes..."
-pkill -f "smolvm-bin microvm" 2>/dev/null || true
-pkill -f "smolvm microvm start" 2>/dev/null || true
-$SMOLVM microvm stop 2>/dev/null || true
+pkill -f "smolvm-bin machine" 2>/dev/null || true
+pkill -f "smolvm machine start" 2>/dev/null || true
+$SMOLVM machine stop 2>/dev/null || true
 sleep 1
 
 # ============================================
 # Test 1: MicroVM Start (VM boot + agent ready)
 # ============================================
-echo -e "${BLUE}Test 1: VM Cold Start (microvm start)${NC}"
+echo -e "${BLUE}Test 1: VM Cold Start (machine start)${NC}"
 echo "  Measures: fork → kernel boot → init → agent ready"
 echo ""
 
 declare -a START_TIMES
 
 for i in $(seq 1 $ITERATIONS); do
-    # Ensure microvm is stopped
-    $SMOLVM microvm stop 2>/dev/null || true
+    # Ensure machine is stopped
+    $SMOLVM machine stop 2>/dev/null || true
     sleep 0.5
 
-    # Measure VM startup time (microvm start returns when agent is ready)
+    # Measure VM startup time (machine start returns when agent is ready)
     START_TIME=$(python3 -c "import time; print(time.time())")
 
-    $SMOLVM microvm start > /dev/null 2>&1
+    $SMOLVM machine start > /dev/null 2>&1
 
     END_TIME=$(python3 -c "import time; print(time.time())")
 
@@ -103,15 +103,15 @@ echo ""
 declare -a PING_TIMES
 
 for i in $(seq 1 $ITERATIONS); do
-    # Ensure microvm is stopped
-    $SMOLVM microvm stop 2>/dev/null || true
+    # Ensure machine is stopped
+    $SMOLVM machine stop 2>/dev/null || true
     sleep 0.5
 
     # Measure from start to first successful command
     START_TIME=$(python3 -c "import time; print(time.time())")
 
-    $SMOLVM microvm start > /dev/null 2>&1
-    $SMOLVM microvm exec echo hello > /dev/null 2>&1
+    $SMOLVM machine start > /dev/null 2>&1
+    $SMOLVM machine exec echo hello > /dev/null 2>&1
 
     END_TIME=$(python3 -c "import time; print(time.time())")
 
@@ -151,7 +151,7 @@ def stats(times, label):
     return avg
 
 print("")
-start_avg = stats(start_times, "VM Cold Start (microvm start)")
+start_avg = stats(start_times, "VM Cold Start (machine start)")
 print("")
 ping_avg = stats(ping_times, "VM Start + First Command")
 

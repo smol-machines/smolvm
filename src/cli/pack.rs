@@ -11,7 +11,7 @@ use clap::{Args, Subcommand};
 use smolvm::agent::{AgentClient, AgentManager, PullOptions, VmResources};
 use smolvm::data::resources::DEFAULT_MICROVM_CPU_COUNT;
 
-/// Default memory for packed VMs (lower than sandbox/microvm because
+/// Default memory for packed VMs (lower than machine create because
 /// packed VMs are typically single-purpose, minimal workloads).
 pub(crate) const PACK_DEFAULT_MEMORY_MIB: u32 = 256;
 use smolvm::config::{RecordState, SmolvmConfig};
@@ -82,7 +82,7 @@ pub struct PackCreateCmd {
     #[arg(long, default_value_t = DEFAULT_MICROVM_CPU_COUNT, value_name = "N")]
     pub cpus: u8,
 
-    /// Default memory in MiB for the packed VM (lower than sandbox/microvm
+    /// Default memory in MiB for the packed VM (lower than machine create
     /// because packed VMs are typically single-purpose, minimal workloads)
     #[arg(long, default_value_t = PACK_DEFAULT_MEMORY_MIB, value_name = "MiB")]
     pub mem: u32,
@@ -339,7 +339,7 @@ impl PackCreateCmd {
             return Err(Error::agent(
                 "pack from VM",
                 format!(
-                    "VM '{}' is running. Stop it first with: smolvm microvm stop {}",
+                    "VM '{}' is running. Stop it first with: smolvm machine stop {}",
                     vm_name, vm_name
                 ),
             ));

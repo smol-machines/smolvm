@@ -1,4 +1,4 @@
-//! NapiSandbox — the main NAPI class wrapping AgentManager + AgentClient.
+//! NapiMachine — the main NAPI class wrapping AgentManager + AgentClient.
 //!
 //! All blocking operations (start, exec, pull, stop) run on tokio's blocking
 //! thread pool to avoid blocking Node's event loop. The AgentManager and
@@ -24,7 +24,7 @@ unsafe impl Send for ManagerWrapper {}
 unsafe impl Sync for ManagerWrapper {}
 
 #[napi]
-pub struct NapiSandbox {
+pub struct NapiMachine {
     name: String,
     manager: Arc<ManagerWrapper>,
     client: Arc<Mutex<Option<AgentClient>>>,
@@ -34,10 +34,10 @@ pub struct NapiSandbox {
 }
 
 #[napi]
-impl NapiSandbox {
-    /// Create a new sandbox. Does not start the VM yet — call `start()`.
+impl NapiMachine {
+    /// Create a new machine. Does not start the VM yet — call `start()`.
     #[napi(constructor)]
-    pub fn new(config: SandboxConfig) -> napi::Result<Self> {
+    pub fn new(config: MachineConfig) -> napi::Result<Self> {
         let mounts: Vec<HostMount> = config
             .mounts
             .as_ref()
@@ -106,7 +106,7 @@ impl NapiSandbox {
         })
     }
 
-    /// Get the sandbox name.
+    /// Get the machine name.
     #[napi(getter)]
     pub fn name(&self) -> String {
         self.name.clone()
@@ -124,13 +124,13 @@ impl NapiSandbox {
         self.manager.0.is_running()
     }
 
-    /// Get the current sandbox state: "stopped", "starting", "running", or "stopping".
+    /// Get the current machine state: "stopped", "starting", "running", or "stopping".
     #[napi]
     pub fn state(&self) -> String {
         self.manager.0.state().to_string()
     }
 
-    /// Start the sandbox VM. Boots via fork + libkrun, waits for agent ready,
+    /// Start the machine VM. Boots via fork + libkrun, waits for agent ready,
     /// then connects the vsock client.
     #[napi]
     pub async fn start(&self) -> napi::Result<()> {
@@ -189,7 +189,7 @@ impl NapiSandbox {
                 .lock()
                 .map_err(|e| napi::Error::from_reason(format!("Client lock poisoned: {}", e)))?;
             let c = guard.as_mut().ok_or_else(|| {
-                napi::Error::from_reason("Sandbox not started. Call start() first.")
+                napi::Error::from_reason("Machine not started. Call start() first.")
             })?;
             c.vm_exec(command, env, workdir, timeout).into_napi()
         })
@@ -224,7 +224,7 @@ impl NapiSandbox {
                 .lock()
                 .map_err(|e| napi::Error::from_reason(format!("Client lock poisoned: {}", e)))?;
             let c = guard.as_mut().ok_or_else(|| {
-                napi::Error::from_reason("Sandbox not started. Call start() first.")
+                napi::Error::from_reason("Machine not started. Call start() first.")
             })?;
             c.pull_with_registry_config(&image_for_pull).into_napi()
         })
@@ -238,7 +238,7 @@ impl NapiSandbox {
                 .lock()
                 .map_err(|e| napi::Error::from_reason(format!("Client lock poisoned: {}", e)))?;
             let c = guard.as_mut().ok_or_else(|| {
-                napi::Error::from_reason("Sandbox not started. Call start() first.")
+                napi::Error::from_reason("Machine not started. Call start() first.")
             })?;
             c.run_with_mounts_and_timeout(&image, command, env, workdir, Vec::new(), timeout)
                 .into_napi()
@@ -253,7 +253,7 @@ impl NapiSandbox {
         })
     }
 
-    /// Pull an OCI image into the sandbox's storage.
+    /// Pull an OCI image into the machine's storage.
     #[napi]
     pub async fn pull_image(&self, image: String) -> napi::Result<ImageInfo> {
         let client = self.client.clone();
@@ -263,7 +263,7 @@ impl NapiSandbox {
                 .lock()
                 .map_err(|e| napi::Error::from_reason(format!("Client lock poisoned: {}", e)))?;
             let c = guard.as_mut().ok_or_else(|| {
-                napi::Error::from_reason("Sandbox not started. Call start() first.")
+                napi::Error::from_reason("Machine not started. Call start() first.")
             })?;
             c.pull_with_registry_config(&image).into_napi()
         })
@@ -273,7 +273,7 @@ impl NapiSandbox {
         Ok(ImageInfo::from(info))
     }
 
-    /// List all cached OCI images in the sandbox's storage.
+    /// List all cached OCI images in the machine's storage.
     #[napi]
     pub async fn list_images(&self) -> napi::Result<Vec<ImageInfo>> {
         let client = self.client.clone();
@@ -283,7 +283,7 @@ impl NapiSandbox {
                 .lock()
                 .map_err(|e| napi::Error::from_reason(format!("Client lock poisoned: {}", e)))?;
             let c = guard.as_mut().ok_or_else(|| {
-                napi::Error::from_reason("Sandbox not started. Call start() first.")
+                napi::Error::from_reason("Machine not started. Call start() first.")
             })?;
             c.list_images().into_napi()
         })
@@ -293,7 +293,7 @@ impl NapiSandbox {
         Ok(images.into_iter().map(ImageInfo::from).collect())
     }
 
-    /// Stop the sandbox VM gracefully.
+    /// Stop the machine VM gracefully.
     #[napi]
     pub async fn stop(&self) -> napi::Result<()> {
         // Drop the client first
@@ -311,7 +311,7 @@ impl NapiSandbox {
             .map_err(|e| napi::Error::from_reason(format!("Task join error: {}", e)))?
     }
 
-    /// Stop the sandbox and clean up all storage (disks, config).
+    /// Stop the machine and clean up all storage (disks, config).
     #[napi]
     pub async fn delete(&self) -> napi::Result<()> {
         self.stop().await?;

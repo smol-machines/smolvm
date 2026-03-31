@@ -5,17 +5,16 @@ use tracing_subscriber::EnvFilter;
 
 mod cli;
 
-/// smolvm - OCI-native microVM runtime
+/// smolvm - build and run portable, self-contained virtual machines
 #[derive(Parser, Debug)]
 #[command(name = "smolvm")]
-#[command(about = "Run containers in lightweight VMs with VM-level isolation")]
+#[command(about = "Build and run portable, self-contained virtual machines")]
 #[command(
-    long_about = "smolvm is an OCI-native microVM runtime for macOS and Linux.\n\n\
-It runs container images inside lightweight VMs using libkrun, providing \
-VM-level isolation with container-like UX.\n\n\
+    long_about = "smolvm runs Linux microVMs on your machine using libkrun.\n\n\
 Quick start:\n  \
-smolvm sandbox run alpine -- echo hello\n  \
-smolvm sandbox run -d nginx -p 8080:80\n\n\
+smolvm machine create --net myvm\n  \
+smolvm machine start myvm\n  \
+smolvm machine exec --name myvm -it -- /bin/sh\n\n\
 For programmatic access:\n  \
 smolvm serve"
 )]
@@ -27,15 +26,11 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Run containers quickly (ephemeral or detached)
-    #[command(subcommand, visible_alias = "sb")]
-    Sandbox(cli::sandbox::SandboxCmd),
-
-    /// Manage persistent microVMs
+    /// Manage machines (create, start, stop, exec)
     #[command(subcommand, visible_alias = "vm")]
-    Microvm(cli::microvm::MicrovmCmd),
+    Machine(cli::machine::MachineCmd),
 
-    /// Manage containers inside a microVM
+    /// Manage containers inside a machine
     #[command(subcommand, visible_alias = "ct")]
     Container(cli::container::ContainerCmd),
 
@@ -50,6 +45,13 @@ enum Commands {
     /// Manage smolvm configuration (registries, defaults)
     #[command(subcommand)]
     Config(cli::config::ConfigCmd),
+
+    /// Internal: boot a VM subprocess (not for direct use)
+    #[command(name = "_boot-vm", hide = true)]
+    BootVm {
+        /// Path to boot config JSON file
+        config: std::path::PathBuf,
+    },
 }
 
 fn main() {
@@ -69,12 +71,12 @@ fn main() {
 
     // Execute command
     let result = match cli.command {
-        Commands::Sandbox(cmd) => cmd.run(),
-        Commands::Microvm(cmd) => cmd.run(),
+        Commands::Machine(cmd) => cmd.run(),
         Commands::Container(cmd) => cmd.run(),
         Commands::Serve(cmd) => cmd.run(),
         Commands::Pack(cmd) => cmd.run(),
         Commands::Config(cmd) => cmd.run(),
+        Commands::BootVm { config } => cli::internal_boot::run(config),
     };
 
     // Handle errors

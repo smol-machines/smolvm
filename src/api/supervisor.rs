@@ -1,13 +1,13 @@
-//! Sandbox supervisor for health monitoring and restart policies.
+//! Machine supervisor for health monitoring and restart policies.
 //!
-//! The supervisor runs as a background task that periodically checks sandbox health
-//! and automatically restarts sandboxes based on their restart policies.
+//! The supervisor runs as a background task that periodically checks machine health
+//! and automatically restarts machinees based on their restart policies.
 
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 
-use crate::api::state::{ensure_sandbox_running, ApiState};
+use crate::api::state::{ensure_machine_running, ApiState};
 use crate::config::{RecordState, RestartConfig, RestartPolicy};
 
 /// Interval between health checks.
@@ -19,7 +19,7 @@ const MAX_BACKOFF_SECS: u64 = 300;
 /// Minimum delay between restart attempts.
 const MIN_RESTART_DELAY: Duration = Duration::from_secs(1);
 
-/// Sandbox supervisor for health monitoring and automatic restarts.
+/// Machine supervisor for health monitoring and automatic restarts.
 pub struct Supervisor {
     state: Arc<ApiState>,
     shutdown_rx: watch::Receiver<bool>,
@@ -44,7 +44,7 @@ impl Supervisor {
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    self.check_all_sandboxes().await;
+                    self.check_all_machinees().await;
                 }
                 _ = self.shutdown_rx.changed() => {
                     if *self.shutdown_rx.borrow() {
@@ -56,31 +56,31 @@ impl Supervisor {
         }
     }
 
-    /// Check all sandboxes and restart any that need it.
-    async fn check_all_sandboxes(&self) {
-        let sandbox_names = self.state.list_sandbox_names();
+    /// Check all machinees and restart any that need it.
+    async fn check_all_machinees(&self) {
+        let machine_names = self.state.list_machine_names();
 
-        for name in sandbox_names {
-            if let Err(e) = self.check_sandbox(&name).await {
-                tracing::warn!(sandbox = %name, error = %e, "failed to check sandbox");
+        for name in machine_names {
+            if let Err(e) = self.check_machine(&name).await {
+                tracing::warn!(machine = %name, error = %e, "failed to check machine");
             }
         }
 
-        // Also rotate logs for all sandboxes
+        // Also rotate logs for all machinees
         self.rotate_logs_if_needed().await;
     }
 
-    /// Check a single sandbox and restart if needed.
-    async fn check_sandbox(&self, name: &str) -> crate::Result<()> {
-        // Check if sandbox is alive
-        let is_alive = self.state.is_sandbox_alive(name);
+    /// Check a single machine and restart if needed.
+    async fn check_machine(&self, name: &str) -> crate::Result<()> {
+        // Check if machine is alive
+        let is_alive = self.state.is_machine_alive(name);
 
         if is_alive {
-            // Sandbox is running, nothing to do
+            // Machine is running, nothing to do
             return Ok(());
         }
 
-        // Sandbox is dead — try to retrieve its exit code via waitpid
+        // Machine is dead — try to retrieve its exit code via waitpid
         // and persist it so the restart policy can use it.
         if let Ok(Some(record)) = self.state.db().get_vm(name) {
             if let Some(pid) = record.pid {
@@ -91,21 +91,21 @@ impl Supervisor {
 
         let last_exit_code = self.state.get_last_exit_code(name);
 
-        // Sandbox is dead, check restart policy
+        // Machine is dead, check restart policy
         let restart_config = match self.state.get_restart_config(name) {
             Some(config) => config,
-            None => return Ok(()), // Sandbox doesn't exist anymore
+            None => return Ok(()), // Machine doesn't exist anymore
         };
 
         // Determine if we should restart
         if !Self::should_restart(&restart_config, last_exit_code) {
-            tracing::debug!(sandbox = %name, policy = %restart_config.policy, "sandbox dead, not restarting per policy");
+            tracing::debug!(machine = %name, policy = %restart_config.policy, "machine dead, not restarting per policy");
             // Update state to stopped (best-effort in supervisor)
             if let Err(e) = self
                 .state
-                .update_sandbox_state(name, RecordState::Stopped, None)
+                .update_machine_state(name, RecordState::Stopped, None)
             {
-                tracing::warn!(sandbox = %name, error = %e, "failed to persist stopped state");
+                tracing::warn!(machine = %name, error = %e, "failed to persist stopped state");
             }
             return Ok(());
         }
@@ -115,10 +115,10 @@ impl Supervisor {
         let backoff = Duration::from_secs(backoff_secs);
 
         tracing::info!(
-            sandbox = %name,
+            machine = %name,
             restart_count = restart_config.restart_count,
             backoff_secs = backoff_secs,
-            "sandbox dead, scheduling restart"
+            "machine dead, scheduling restart"
         );
 
         // Wait for backoff (but check for shutdown during wait)
@@ -130,20 +130,20 @@ impl Supervisor {
         self.state.increment_restart_count(name);
 
         // Attempt restart
-        self.restart_sandbox(name).await
+        self.restart_machine(name).await
     }
 
-    /// Attempt to restart a sandbox.
-    async fn restart_sandbox(&self, name: &str) -> crate::Result<()> {
-        let entry = match self.state.get_sandbox(name) {
+    /// Attempt to restart a machine.
+    async fn restart_machine(&self, name: &str) -> crate::Result<()> {
+        let entry = match self.state.get_machine(name) {
             Ok(entry) => entry,
             Err(_) => {
-                tracing::warn!(sandbox = %name, "sandbox no longer exists, skipping restart");
+                tracing::warn!(machine = %name, "machine no longer exists, skipping restart");
                 return Ok(());
             }
         };
 
-        let start_result = ensure_sandbox_running(&entry).await;
+        let start_result = ensure_machine_running(&entry).await;
 
         // Handle start result
         match start_result {
@@ -155,27 +155,27 @@ impl Supervisor {
                 };
                 if let Err(e) = self
                     .state
-                    .update_sandbox_state(name, RecordState::Running, pid)
+                    .update_machine_state(name, RecordState::Running, pid)
                 {
-                    tracing::warn!(sandbox = %name, error = %e, "failed to persist running state");
+                    tracing::warn!(machine = %name, error = %e, "failed to persist running state");
                 }
-                tracing::info!(sandbox = %name, pid = ?pid, "sandbox restarted successfully");
+                tracing::info!(machine = %name, pid = ?pid, "machine restarted successfully");
                 Ok(())
             }
             Err(e) => {
                 if let Err(db_err) =
                     self.state
-                        .update_sandbox_state(name, RecordState::Failed, None)
+                        .update_machine_state(name, RecordState::Failed, None)
                 {
-                    tracing::warn!(sandbox = %name, error = %db_err, "failed to persist failed state");
+                    tracing::warn!(machine = %name, error = %db_err, "failed to persist failed state");
                 }
-                tracing::error!(sandbox = %name, error = %e, "failed to restart sandbox");
+                tracing::error!(machine = %name, error = %e, "failed to restart machine");
                 Err(e)
             }
         }
     }
 
-    /// Determine if a sandbox should be restarted based on its restart configuration.
+    /// Determine if a machine should be restarted based on its restart configuration.
     fn should_restart(config: &RestartConfig, last_exit_code: Option<i32>) -> bool {
         // Check max retries limit
         if config.max_retries > 0 && config.restart_count >= config.max_retries {
@@ -201,21 +201,21 @@ impl Supervisor {
         (2u64.pow(exponent)).min(MAX_BACKOFF_SECS)
     }
 
-    /// Rotate logs for all sandboxes if they exceed the size limit.
+    /// Rotate logs for all machinees if they exceed the size limit.
     async fn rotate_logs_if_needed(&self) {
-        let sandbox_names = self.state.list_sandbox_names();
+        let machine_names = self.state.list_machine_names();
 
-        for name in sandbox_names {
-            if let Some(log_path) = self.get_sandbox_log_path(&name) {
+        for name in machine_names {
+            if let Some(log_path) = self.get_machine_log_path(&name) {
                 if let Err(e) = crate::log_rotation::rotate_if_needed(&log_path) {
-                    tracing::debug!(sandbox = %name, error = %e, "failed to rotate logs");
+                    tracing::debug!(machine = %name, error = %e, "failed to rotate logs");
                 }
             }
         }
     }
 
-    /// Get the console log path for a sandbox.
-    fn get_sandbox_log_path(&self, name: &str) -> Option<std::path::PathBuf> {
+    /// Get the console log path for a machine.
+    fn get_machine_log_path(&self, name: &str) -> Option<std::path::PathBuf> {
         let runtime_dir = dirs::runtime_dir()
             .or_else(dirs::cache_dir)
             .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));

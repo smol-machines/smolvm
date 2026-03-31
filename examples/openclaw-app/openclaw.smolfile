@@ -1,12 +1,12 @@
 # OpenClaw gateway in a hardware-isolated microVM
 #
 # Sandbox:
-#   smolvm sandbox run -d -s examples/openclaw-app/openclaw.smolfile
+#   smolvm machine run -d -s examples/openclaw-app/openclaw.smolfile
 #   curl http://localhost:18789/health
 #
 # Microvm:
-#   smolvm microvm create openclaw -s examples/openclaw-app/openclaw.smolfile
-#   smolvm microvm start openclaw
+#   smolvm machine create openclaw -s examples/openclaw-app/openclaw.smolfile
+#   smolvm machine start openclaw
 
 image = "alpine/openclaw:main"
 entrypoint = ["openclaw"]

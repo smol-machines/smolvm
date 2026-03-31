@@ -1,35 +1,35 @@
 /**
- * PythonSandbox — pre-configured sandbox for running Python code.
+ * PythonMachine — pre-configured machine for running Python code.
  */
 
-import { Sandbox } from "../sandbox.js";
+import { Machine } from "../machine.js";
 import { ExecResult } from "../execution.js";
-import type { SandboxConfig, ExecOptions, CodeOptions } from "../types.js";
+import type { MachineConfig, ExecOptions, CodeOptions } from "../types.js";
 
-export class PythonSandbox extends Sandbox {
+export class PythonMachine extends Machine {
   static readonly DEFAULT_IMAGE = "python:3.12-alpine";
 
-  static async create(config: SandboxConfig): Promise<PythonSandbox> {
-    const sandbox = new PythonSandbox(config);
-    await sandbox.start();
+  static async create(config: MachineConfig): Promise<PythonMachine> {
+    const machine = new PythonMachine(config);
+    await machine.start();
     // Pre-pull the Python image
-    await sandbox.pullImage(PythonSandbox.DEFAULT_IMAGE);
-    return sandbox;
+    await machine.pullImage(PythonMachine.DEFAULT_IMAGE);
+    return machine;
   }
 
-  private constructor(config: SandboxConfig) {
+  private constructor(config: MachineConfig) {
     super(config);
   }
 
   /** Run Python code. */
   async runCode(code: string, options?: CodeOptions): Promise<ExecResult> {
-    const image = options?.image ?? PythonSandbox.DEFAULT_IMAGE;
+    const image = options?.image ?? PythonMachine.DEFAULT_IMAGE;
     return this.run(image, ["python3", "-c", code], options);
   }
 
   /** Run a Python file (must be in a mounted directory). */
   async runFile(path: string, options?: CodeOptions): Promise<ExecResult> {
-    const image = options?.image ?? PythonSandbox.DEFAULT_IMAGE;
+    const image = options?.image ?? PythonMachine.DEFAULT_IMAGE;
     return this.run(image, ["python3", path], options);
   }
 
@@ -49,7 +49,7 @@ export class PythonSandbox extends Sandbox {
     options?: ExecOptions
   ): Promise<ExecResult> {
     return this.run(
-      PythonSandbox.DEFAULT_IMAGE,
+      PythonMachine.DEFAULT_IMAGE,
       ["pip", "install", ...packages],
       options
     );
@@ -58,7 +58,7 @@ export class PythonSandbox extends Sandbox {
   /** List installed packages. */
   async listPackages(options?: ExecOptions): Promise<string[]> {
     const result = await this.run(
-      PythonSandbox.DEFAULT_IMAGE,
+      PythonMachine.DEFAULT_IMAGE,
       ["pip", "list", "--format=freeze"],
       options
     );
@@ -67,7 +67,7 @@ export class PythonSandbox extends Sandbox {
 
   /** Get Python version. */
   async version(options?: CodeOptions): Promise<string> {
-    const image = options?.image ?? PythonSandbox.DEFAULT_IMAGE;
+    const image = options?.image ?? PythonMachine.DEFAULT_IMAGE;
     const result = await this.run(image, ["python3", "--version"], options);
     return result.stdout.trim();
   }
