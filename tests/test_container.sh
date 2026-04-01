@@ -35,7 +35,7 @@ test_container_create() {
     ensure_machine_running
 
     local output container_id
-    output=$($SMOLVM container create default alpine:latest -- sleep 300 2>&1)
+    output=$($SMOLVM container create --image alpine:latest -- sleep 300 2>&1)
     container_id=$(extract_container_id "$output")
 
     if [[ -z "$container_id" ]]; then
@@ -52,7 +52,7 @@ test_container_id_format() {
     ensure_machine_running
 
     local output container_id
-    output=$($SMOLVM container create default alpine:latest -- sleep 10 2>&1)
+    output=$($SMOLVM container create --image alpine:latest -- sleep 10 2>&1)
     container_id=$(extract_container_id "$output")
 
     # Cleanup first
@@ -84,14 +84,14 @@ test_container_list() {
     ensure_machine_running
 
     local output container_id list_output
-    output=$($SMOLVM container create default alpine:latest -- sleep 300 2>&1)
+    output=$($SMOLVM container create --image alpine:latest -- sleep 300 2>&1)
     container_id=$(extract_container_id "$output")
 
     if [[ -z "$container_id" ]]; then
         return 1
     fi
 
-    list_output=$($SMOLVM container ls default 2>&1)
+    list_output=$($SMOLVM container ls 2>&1)
 
     # Cleanup
     cleanup_container "$container_id"
@@ -104,7 +104,7 @@ test_container_list_all() {
     ensure_machine_running
 
     local output container_id
-    output=$($SMOLVM container create default alpine:latest -- sleep 300 2>&1)
+    output=$($SMOLVM container create --image alpine:latest -- sleep 300 2>&1)
     container_id=$(extract_container_id "$output")
 
     if [[ -z "$container_id" ]]; then
@@ -112,11 +112,11 @@ test_container_list_all() {
     fi
 
     # Stop it
-    $SMOLVM container stop default "$container_id" 2>&1
+    $SMOLVM container stop --container "$container_id" 2>&1
 
     # List with -a should show stopped containers
     local list_output
-    list_output=$($SMOLVM container ls default -a 2>&1)
+    list_output=$($SMOLVM container ls -a 2>&1)
 
     # Cleanup
     cleanup_container "$container_id"
@@ -132,7 +132,7 @@ test_container_exec() {
     ensure_machine_running
 
     local output container_id
-    output=$($SMOLVM container create default alpine:latest -- sleep 300 2>&1)
+    output=$($SMOLVM container create --image alpine:latest -- sleep 300 2>&1)
     container_id=$(extract_container_id "$output")
 
     if [[ -z "$container_id" ]]; then
@@ -140,7 +140,7 @@ test_container_exec() {
     fi
 
     local exec_output
-    exec_output=$($SMOLVM container exec default "$container_id" -- echo "exec-test-marker" 2>&1)
+    exec_output=$($SMOLVM container exec --container "$container_id" -- echo "exec-test-marker" 2>&1)
 
     # Cleanup
     cleanup_container "$container_id"
@@ -152,7 +152,7 @@ test_container_exec_env() {
     ensure_machine_running
 
     local output container_id
-    output=$($SMOLVM container create default alpine:latest -- sleep 300 2>&1)
+    output=$($SMOLVM container create --image alpine:latest -- sleep 300 2>&1)
     container_id=$(extract_container_id "$output")
 
     if [[ -z "$container_id" ]]; then
@@ -160,7 +160,7 @@ test_container_exec_env() {
     fi
 
     local exec_output
-    exec_output=$($SMOLVM container exec default "$container_id" -e MY_VAR=test_value -- sh -c 'echo $MY_VAR' 2>&1)
+    exec_output=$($SMOLVM container exec --container "$container_id" -e MY_VAR=test_value -- sh -c 'echo $MY_VAR' 2>&1)
 
     # Cleanup
     cleanup_container "$container_id"
@@ -176,7 +176,7 @@ test_container_stop() {
     ensure_machine_running
 
     local output container_id
-    output=$($SMOLVM container create default alpine:latest -- sleep 300 2>&1)
+    output=$($SMOLVM container create --image alpine:latest -- sleep 300 2>&1)
     container_id=$(extract_container_id "$output")
 
     if [[ -z "$container_id" ]]; then
@@ -184,11 +184,11 @@ test_container_stop() {
     fi
 
     # Stop it
-    $SMOLVM container stop default "$container_id" 2>&1
+    $SMOLVM container stop --container "$container_id" 2>&1
 
     # Verify it's stopped
     local list_output
-    list_output=$($SMOLVM container ls default -a 2>&1)
+    list_output=$($SMOLVM container ls -a 2>&1)
 
     # Cleanup
     cleanup_container "$container_id"
@@ -200,7 +200,7 @@ test_container_restart() {
     ensure_machine_running
 
     local output container_id
-    output=$($SMOLVM container create default alpine:latest -- sleep 300 2>&1)
+    output=$($SMOLVM container create --image alpine:latest -- sleep 300 2>&1)
     container_id=$(extract_container_id "$output")
 
     if [[ -z "$container_id" ]]; then
@@ -208,21 +208,21 @@ test_container_restart() {
     fi
 
     # Stop it
-    $SMOLVM container stop default "$container_id" 2>&1
+    $SMOLVM container stop --container "$container_id" 2>&1
 
     # Verify stopped
     local list_output
-    list_output=$($SMOLVM container ls default -a 2>&1)
+    list_output=$($SMOLVM container ls -a 2>&1)
     if [[ "$list_output" != *"stopped"* ]]; then
         cleanup_container "$container_id"
         return 1
     fi
 
     # Start it again (restart)
-    $SMOLVM container start default "$container_id" 2>&1
+    $SMOLVM container start --container "$container_id" 2>&1
 
     # Verify running
-    list_output=$($SMOLVM container ls default 2>&1)
+    list_output=$($SMOLVM container ls 2>&1)
 
     # Cleanup
     cleanup_container "$container_id"
@@ -238,7 +238,7 @@ test_container_remove() {
     ensure_machine_running
 
     local output container_id
-    output=$($SMOLVM container create default alpine:latest -- sleep 300 2>&1)
+    output=$($SMOLVM container create --image alpine:latest -- sleep 300 2>&1)
     container_id=$(extract_container_id "$output")
 
     if [[ -z "$container_id" ]]; then
@@ -246,11 +246,11 @@ test_container_remove() {
     fi
 
     # Remove it (force)
-    $SMOLVM container rm default "$container_id" -f 2>&1
+    $SMOLVM container rm --container "$container_id" -f 2>&1
 
     # Verify it's gone
     local list_output
-    list_output=$($SMOLVM container ls default -a 2>&1)
+    list_output=$($SMOLVM container ls -a 2>&1)
 
     [[ "$list_output" != *"$container_id"* ]]
 }
@@ -263,7 +263,7 @@ test_container_prefix_matching() {
     ensure_machine_running
 
     local output container_id
-    output=$($SMOLVM container create default alpine:latest -- sleep 300 2>&1)
+    output=$($SMOLVM container create --image alpine:latest -- sleep 300 2>&1)
     container_id=$(extract_container_id "$output")
 
     if [[ -z "$container_id" ]]; then
@@ -273,7 +273,7 @@ test_container_prefix_matching() {
     # Use prefix for exec (first 15 chars should be unique enough)
     local prefix="${container_id:0:15}"
     local exec_output
-    exec_output=$($SMOLVM container exec default "$prefix" -- echo "prefix-test" 2>&1)
+    exec_output=$($SMOLVM container exec --container "$prefix" -- echo "prefix-test" 2>&1)
 
     # Cleanup
     cleanup_container "$container_id"

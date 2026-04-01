@@ -65,16 +65,16 @@ fn ensure_machine(name: &str) -> smolvm::Result<AgentManager> {
 /// automatically if no command is specified (runs sleep infinity).
 ///
 /// Examples:
-///   smolvm container create default alpine
-///   smolvm container create myvm nginx -- nginx -g "daemon off;"
+///   smolvm container create --image alpine
+///   smolvm container create -m myvm --image nginx -- nginx -g "daemon off;"
 #[derive(Args, Debug)]
 pub struct ContainerCreateCmd {
-    /// Target machine name
-    #[arg(value_name = "MACHINE")]
+    /// Target machine (default: "default")
+    #[arg(short = 'm', long, default_value = "default", value_name = "MACHINE")]
     pub machine: String,
 
     /// Container image (e.g., alpine, nginx:latest)
-    #[arg(value_name = "IMAGE")]
+    #[arg(short = 'I', long, value_name = "IMAGE")]
     pub image: String,
 
     /// Command to run (default: sleep infinity)
@@ -150,12 +150,12 @@ impl ContainerCreateCmd {
 /// Resumes execution of a container that was previously stopped.
 #[derive(Args, Debug)]
 pub struct ContainerStartCmd {
-    /// Target machine name
-    #[arg(value_name = "MACHINE")]
+    /// Target machine (default: "default")
+    #[arg(short = 'm', long, default_value = "default", value_name = "MACHINE")]
     pub machine: String,
 
     /// Container ID (full or prefix)
-    #[arg(value_name = "CONTAINER")]
+    #[arg(short = 'c', long = "container", value_name = "CONTAINER")]
     pub container_id: String,
 }
 
@@ -183,12 +183,12 @@ impl ContainerStartCmd {
 /// Sends SIGTERM, then SIGKILL after timeout if container doesn't stop.
 #[derive(Args, Debug)]
 pub struct ContainerStopCmd {
-    /// Target machine name
-    #[arg(value_name = "MACHINE")]
+    /// Target machine (default: "default")
+    #[arg(short = 'm', long, default_value = "default", value_name = "MACHINE")]
     pub machine: String,
 
     /// Container ID (full or prefix)
-    #[arg(value_name = "CONTAINER")]
+    #[arg(short = 'c', long = "container", value_name = "CONTAINER")]
     pub container_id: String,
 
     /// Seconds to wait before force kill (default: 10)
@@ -221,12 +221,12 @@ impl ContainerStopCmd {
 /// Deletes a stopped container. Use -f to remove a running container.
 #[derive(Args, Debug)]
 pub struct ContainerRemoveCmd {
-    /// Target machine name
-    #[arg(value_name = "MACHINE")]
+    /// Target machine (default: "default")
+    #[arg(short = 'm', long, default_value = "default", value_name = "MACHINE")]
     pub machine: String,
 
     /// Container ID (full or prefix)
-    #[arg(value_name = "CONTAINER")]
+    #[arg(short = 'c', long = "container", value_name = "CONTAINER")]
     pub container_id: String,
 
     /// Force remove even if running
@@ -258,8 +258,8 @@ impl ContainerRemoveCmd {
 /// By default shows only running containers. Use -a to include stopped.
 #[derive(Args, Debug)]
 pub struct ContainerListCmd {
-    /// Target machine name
-    #[arg(value_name = "MACHINE")]
+    /// Target machine (default: "default")
+    #[arg(short = 'm', long, default_value = "default", value_name = "MACHINE")]
     pub machine: String,
 
     /// Show all containers including stopped
@@ -340,16 +340,16 @@ impl ContainerListCmd {
 /// Runs a command inside an existing container. Returns the exit code.
 ///
 /// Examples:
-///   smolvm container exec default abc123 -- ls -la
-///   smolvm container exec myvm web -- /bin/sh
+///   smolvm container exec --container abc123 -- ls -la
+///   smolvm container exec -m myvm --container web -- /bin/sh
 #[derive(Args, Debug)]
 pub struct ContainerExecCmd {
-    /// Target machine name
-    #[arg(value_name = "MACHINE")]
+    /// Target machine (default: "default")
+    #[arg(short = 'm', long, default_value = "default", value_name = "MACHINE")]
     pub machine: String,
 
     /// Container ID (full or prefix)
-    #[arg(value_name = "CONTAINER")]
+    #[arg(short = 'c', long = "container", value_name = "CONTAINER")]
     pub container_id: String,
 
     /// Command to execute (default: /bin/sh)

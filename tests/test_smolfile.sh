@@ -32,7 +32,7 @@ trap 'rm -rf "$SMOLFILE_TMPDIR"; cleanup_machine' EXIT
 # Clean up a named VM, ignoring errors
 cleanup_vm() {
     local name="$1"
-    $SMOLVM machine stop "$name" 2>/dev/null || true
+    $SMOLVM machine stop --name "$name" 2>/dev/null || true
     $SMOLVM machine delete "$name" -f 2>/dev/null || true
 }
 
@@ -48,7 +48,7 @@ test_init_flag_creates_file() {
     $SMOLVM machine create "$vm_name" --init "echo 'init-ran' > /tmp/init-marker.txt" 2>&1 || return 1
 
     # Start VM (init should run)
-    $SMOLVM machine start "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
 
     # Verify the init command ran
     local output
@@ -69,7 +69,7 @@ test_init_flag_multiple_commands() {
         2>&1 || return 1
 
     # Start VM
-    $SMOLVM machine start "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
 
     # Verify both init commands ran
     local out1 out2
@@ -91,7 +91,7 @@ test_init_flag_with_env() {
         2>&1 || return 1
 
     # Start VM
-    $SMOLVM machine start "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
 
     # Verify env was passed to init
     local output
@@ -112,7 +112,7 @@ test_init_flag_with_workdir() {
         2>&1 || return 1
 
     # Start VM
-    $SMOLVM machine start "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
 
     # Verify workdir was applied
     local output
@@ -132,15 +132,15 @@ test_init_runs_on_every_start() {
         2>&1 || return 1
 
     # First start
-    $SMOLVM machine start "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
 
     # Check count after first start
     local count1
     count1=$($SMOLVM machine exec --name "$vm_name" -- wc -l /tmp/boot-count.txt 2>&1)
 
     # Stop and start again
-    $SMOLVM machine stop "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
-    $SMOLVM machine start "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
+    $SMOLVM machine stop --name "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
 
     # Check count after second start
     local count2
@@ -185,7 +185,7 @@ EOF
     fi
 
     # Start and verify init ran
-    $SMOLVM machine start "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
 
     local output
     output=$($SMOLVM machine exec --name "$vm_name" -- cat /tmp/smolfile-marker.txt 2>&1)
@@ -207,7 +207,7 @@ init = [
 EOF
 
     $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.env" 2>&1 || return 1
-    $SMOLVM machine start "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
 
     local output
     output=$($SMOLVM machine exec --name "$vm_name" -- cat /tmp/greeting.txt 2>&1)
@@ -253,7 +253,7 @@ EOF
         --init "echo 'from-cli' > /tmp/cli-source.txt" \
         2>&1 || return 1
 
-    $SMOLVM machine start "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
 
     local sf_out cli_out
     sf_out=$($SMOLVM machine exec --name "$vm_name" -- cat /tmp/source.txt 2>&1)
@@ -473,7 +473,7 @@ init = [
 EOF
 
     $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.devinit" 2>&1 || return 1
-    $SMOLVM machine start "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
 
     local output
     output=$($SMOLVM machine exec --name "$vm_name" -- cat /tmp/dev-marker.txt 2>&1)
@@ -592,7 +592,7 @@ EOF
 
     # Start should auto-pull image and create container
     local start_output
-    start_output=$($SMOLVM machine start "$vm_name" 2>&1)
+    start_output=$($SMOLVM machine start --name "$vm_name" 2>&1)
 
     cleanup_vm "$vm_name"
 

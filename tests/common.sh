@@ -217,7 +217,7 @@ extract_container_id() {
 # Cleanup container by ID
 cleanup_container() {
     local container_id="$1"
-    $SMOLVM container rm default "$container_id" -f 2>/dev/null || true
+    $SMOLVM container rm --container "$container_id" -f 2>/dev/null || true
 }
 
 # Run a command with a timeout (default 60 seconds).

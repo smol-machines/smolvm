@@ -96,14 +96,14 @@ impl MachineCmd {
 /// Use -d/--detach to keep the machine running for later interaction.
 ///
 /// Examples:
-///   smolvm machine run alpine -- echo "hello"
-///   smolvm machine run -it alpine
-///   smolvm machine run -d --net ubuntu
-///   smolvm machine run --net -v ./src:/app node -- npm start
+///   smolvm machine run --image alpine -- echo "hello"
+///   smolvm machine run -it -I alpine
+///   smolvm machine run -d --net -I ubuntu
+///   smolvm machine run --net -v ./src:/app --image node -- npm start
 #[derive(Args, Debug)]
 pub struct RunCmd {
     /// Container image (e.g., alpine, ubuntu:22.04, ghcr.io/org/image)
-    #[arg(value_name = "IMAGE")]
+    #[arg(short = 'I', long, value_name = "IMAGE")]
     pub image: String,
 
     /// Command and arguments to run (default: image entrypoint or /bin/sh)
@@ -334,7 +334,7 @@ impl RunCmd {
             println!("Machine running (container: {})", &info.id[..12]);
             println!("\nTo interact:");
             println!(
-                "  smolvm container exec default {} -- <command>",
+                "  smolvm container exec --container {} -- <command>",
                 &info.id[..12]
             );
             println!("\nTo stop:");
@@ -460,7 +460,7 @@ impl ExecCmd {
 /// Create a named machine configuration.
 ///
 /// Creates a persistent VM configuration that can be started later.
-/// Use `smolvm machine start <name>` to start, then `smolvm container`
+/// Use `smolvm machine start --name <name>` to start, then `smolvm container`
 /// commands to run containers inside.
 ///
 /// Examples:
@@ -550,7 +550,7 @@ impl CreateCmd {
 #[derive(Args, Debug)]
 pub struct StartCmd {
     /// Machine to start (default: "default")
-    #[arg(value_name = "NAME")]
+    #[arg(short = 'n', long, value_name = "NAME")]
     pub name: Option<String>,
 }
 
@@ -580,7 +580,7 @@ impl StartCmd {
 #[derive(Args, Debug)]
 pub struct StopCmd {
     /// Machine to stop (default: "default")
-    #[arg(value_name = "NAME")]
+    #[arg(short = 'n', long, value_name = "NAME")]
     pub name: Option<String>,
 }
 
@@ -635,7 +635,7 @@ impl DeleteCmd {
 #[derive(Args, Debug)]
 pub struct StatusCmd {
     /// Machine to check (default: "default")
-    #[arg(value_name = "NAME")]
+    #[arg(short = 'n', long, value_name = "NAME")]
     pub name: Option<String>,
 }
 
@@ -680,9 +680,9 @@ impl LsCmd {
 /// immediately; filesystem resize occurs automatically on next boot.
 ///
 /// Examples:
-///   smolvm machine resize my-vm --storage 50
-///   smolvm machine resize my-vm --overlay 20
-///   smolvm machine resize my-vm --storage 50 --overlay 20
+///   smolvm machine resize --name my-vm --storage 50
+///   smolvm machine resize --name my-vm --overlay 20
+///   smolvm machine resize --name my-vm --storage 50 --overlay 20
 ///   smolvm machine resize --storage 50  # default VM
 #[derive(Args, Debug)]
 #[command(group(
@@ -693,7 +693,7 @@ impl LsCmd {
 ))]
 pub struct ResizeCmd {
     /// Machine to resize (default: "default")
-    #[arg(value_name = "NAME")]
+    #[arg(short = 'n', long, value_name = "NAME")]
     pub name: Option<String>,
 
     /// Storage disk size in GiB (expand only)

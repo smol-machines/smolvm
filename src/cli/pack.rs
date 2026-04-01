@@ -339,7 +339,7 @@ impl PackCreateCmd {
             return Err(Error::agent(
                 "pack from VM",
                 format!(
-                    "VM '{}' is running. Stop it first with: smolvm machine stop {}",
+                    "VM '{}' is running. Stop it first with: smolvm machine stop --name {}",
                     vm_name, vm_name
                 ),
             ));

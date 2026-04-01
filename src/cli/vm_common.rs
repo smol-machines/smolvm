@@ -314,8 +314,8 @@ pub fn create_vm(kind: VmKind, params: CreateVmParams) -> smolvm::Result<()> {
         kind.label(),
     );
     println!(
-        "Then use 'smolvm container create {}' to run containers",
-        params.name,
+        "Then use 'smolvm container create -m {} --image <image>' to run containers",
+        params.name
     );
 
     Ok(())

@@ -19,7 +19,7 @@ kill_orphan_smolvm_processes
 for vm_name in test-vm-resize-happy test-vm-resize-running test-vm-resize-shrink \
     nonexistent-vm-resize-test test-vm-resize-noparams test-vm-resize-storage-only \
     test-vm-resize-overlay-only; do
-    $SMOLVM machine stop "$vm_name" 2>/dev/null || true
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
     $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
     rm -rf "$(vm_data_dir "$vm_name")"
 done
@@ -42,18 +42,18 @@ test_machine_resize_happy_path() {
     # Integration test: Happy path resize workflow (4.4)
     local vm_name="test-vm-resize-happy"
 
-    $SMOLVM machine stop "$vm_name" 2>/dev/null || true
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
     $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
     rm -rf "$(vm_data_dir "$vm_name")"
 
     # Create VM with small resources
     $SMOLVM machine create "$vm_name" --storage 5 --overlay 2 2>&1 || return 1
-    $SMOLVM machine start "$vm_name" 2>&1 || {
+    $SMOLVM machine start --name "$vm_name" 2>&1 || {
         $SMOLVM machine delete "$vm_name" -f 2>/dev/null
         rm -rf "$(vm_data_dir "$vm_name")"
         return 1
     }
-    $SMOLVM machine stop "$vm_name" 2>&1 || {
+    $SMOLVM machine stop --name "$vm_name" 2>&1 || {
         $SMOLVM machine delete "$vm_name" -f 2>/dev/null
         rm -rf "$(vm_data_dir "$vm_name")"
         return 1
@@ -61,7 +61,7 @@ test_machine_resize_happy_path() {
 
     # Resize
     local resize_output
-    resize_output=$($SMOLVM machine resize "$vm_name" --storage 10 --overlay 5 2>&1)
+    resize_output=$($SMOLVM machine resize --name "$vm_name" --storage 10 --overlay 5 2>&1)
 
     # Verify resize output contains expected messages
     if [[ "$resize_output" != *"Resizing machine"* ]]; then
@@ -84,12 +84,12 @@ test_machine_resize_running_vm_rejected() {
     # Integration test: Resize rejection - running VM (4.5)
     local vm_name="test-vm-resize-running"
 
-    $SMOLVM machine stop "$vm_name" 2>/dev/null || true
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
     $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
 
     # Create and start VM
     $SMOLVM machine create "$vm_name" --storage 5 --overlay 2 2>&1 || return 1
-    $SMOLVM machine start "$vm_name" 2>&1 || {
+    $SMOLVM machine start --name "$vm_name" 2>&1 || {
         $SMOLVM machine delete "$vm_name" -f 2>/dev/null
         return 1
     }
@@ -97,10 +97,10 @@ test_machine_resize_running_vm_rejected() {
     # Attempt resize on running VM - should fail
     local exit_code=0
     local resize_output
-    resize_output=$($SMOLVM machine resize "$vm_name" --storage 10 2>&1) || exit_code=$?
+    resize_output=$($SMOLVM machine resize --name "$vm_name" --storage 10 2>&1) || exit_code=$?
 
     # Clean up
-    $SMOLVM machine stop "$vm_name" 2>/dev/null || true
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
     $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
     ensure_data_dir_deleted "$vm_name"
 
@@ -112,16 +112,16 @@ test_machine_resize_shrink_rejected() {
     # Integration test: Resize rejection - shrink disk (4.5)
     local vm_name="test-vm-resize-shrink"
 
-    $SMOLVM machine stop "$vm_name" 2>/dev/null || true
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
     $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
 
     # Create VM with 10 GiB storage
     $SMOLVM machine create "$vm_name" --storage 10 --overlay 5 2>&1 || return 1
-    $SMOLVM machine start "$vm_name" 2>&1 || {
+    $SMOLVM machine start --name "$vm_name" 2>&1 || {
         $SMOLVM machine delete "$vm_name" -f 2>/dev/null
         return 1
     }
-    $SMOLVM machine stop "$vm_name" 2>&1 || {
+    $SMOLVM machine stop --name "$vm_name" 2>&1 || {
         $SMOLVM machine delete "$vm_name" -f 2>/dev/null
         return 1
     }
@@ -129,7 +129,7 @@ test_machine_resize_shrink_rejected() {
     # Attempt to shrink to 5 GiB - should fail
     local exit_code=0
     local resize_output
-    resize_output=$($SMOLVM machine resize "$vm_name" --storage 5 2>&1) || exit_code=$?
+    resize_output=$($SMOLVM machine resize --name "$vm_name" --storage 5 2>&1) || exit_code=$?
 
     # Clean up
     $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
@@ -146,7 +146,7 @@ test_machine_resize_nonexistent_vm_rejected() {
     # Attempt resize on non-existent VM
     local exit_code=0
     local resize_output
-    resize_output=$($SMOLVM machine resize "$vm_name" --storage 10 2>&1) || exit_code=$?
+    resize_output=$($SMOLVM machine resize --name "$vm_name" --storage 10 2>&1) || exit_code=$?
 
     # Should fail with non-zero exit code and "not found" message
     [[ $exit_code -ne 0 ]] && [[ "$resize_output" == *"not found"* ]]
@@ -183,16 +183,16 @@ test_machine_resize_no_params_rejected() {
     # Integration test: Resize with no parameters should fail
     local vm_name="test-vm-resize-noparams"
 
-    $SMOLVM machine stop "$vm_name" 2>/dev/null || true
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
     $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
 
     # Create VM
     $SMOLVM machine create "$vm_name" --storage 5 --overlay 2 2>&1 || return 1
-    $SMOLVM machine start "$vm_name" 2>&1 || {
+    $SMOLVM machine start --name "$vm_name" 2>&1 || {
         $SMOLVM machine delete "$vm_name" -f 2>/dev/null
         return 1
     }
-    $SMOLVM machine stop "$vm_name" 2>&1 || {
+    $SMOLVM machine stop --name "$vm_name" 2>&1 || {
         $SMOLVM machine delete "$vm_name" -f 2>/dev/null
         return 1
     }
@@ -200,7 +200,7 @@ test_machine_resize_no_params_rejected() {
     # Attempt resize with no parameters - should fail
     local exit_code=0
     local resize_output
-    resize_output=$($SMOLVM machine resize "$vm_name" 2>&1) || exit_code=$?
+    resize_output=$($SMOLVM machine resize --name "$vm_name" 2>&1) || exit_code=$?
 
     # Clean up
     $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
@@ -214,18 +214,18 @@ test_machine_resize_storage_only() {
     # Integration test: Resize storage only (partial update)
     local vm_name="test-vm-resize-storage-only"
 
-    $SMOLVM machine stop "$vm_name" 2>/dev/null || true
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
     $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
     rm -rf "$(vm_data_dir "$vm_name")"
 
     # Create VM with small resources
     $SMOLVM machine create "$vm_name" --storage 5 --overlay 2 2>&1 || return 1
-    $SMOLVM machine start "$vm_name" 2>&1 || {
+    $SMOLVM machine start --name "$vm_name" 2>&1 || {
         $SMOLVM machine delete "$vm_name" -f 2>/dev/null
         rm -rf "$(vm_data_dir "$vm_name")"
         return 1
     }
-    $SMOLVM machine stop "$vm_name" 2>&1 || {
+    $SMOLVM machine stop --name "$vm_name" 2>&1 || {
         $SMOLVM machine delete "$vm_name" -f 2>/dev/null
         rm -rf "$(vm_data_dir "$vm_name")"
         return 1
@@ -233,7 +233,7 @@ test_machine_resize_storage_only() {
 
     # Resize storage only
     local resize_output
-    resize_output=$($SMOLVM machine resize "$vm_name" --storage 15 2>&1)
+    resize_output=$($SMOLVM machine resize --name "$vm_name" --storage 15 2>&1)
 
     # Clean up
     $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
@@ -249,19 +249,19 @@ test_machine_resize_overlay_only() {
     local vm_name="test-vm-resize-overlay-only"
 
     # Aggressive cleanup - stop, delete, and remove directory
-    $SMOLVM machine stop "$vm_name" 2>/dev/null || true
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
     $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
     rm -rf "$(vm_data_dir "$vm_name")"
     sleep 0.5
 
     # Create VM with small resources
     $SMOLVM machine create "$vm_name" --storage 5 --overlay 2 2>&1 || return 1
-    $SMOLVM machine start "$vm_name" 2>&1 || {
+    $SMOLVM machine start --name "$vm_name" 2>&1 || {
         $SMOLVM machine delete "$vm_name" -f 2>/dev/null
         rm -rf "$(vm_data_dir "$vm_name")"
         return 1
     }
-    $SMOLVM machine stop "$vm_name" 2>&1 || {
+    $SMOLVM machine stop --name "$vm_name" 2>&1 || {
         $SMOLVM machine delete "$vm_name" -f 2>/dev/null
         rm -rf "$(vm_data_dir "$vm_name")"
         return 1
@@ -281,7 +281,7 @@ test_machine_resize_overlay_only() {
 
     # Resize overlay only
     local resize_output
-    resize_output=$($SMOLVM machine resize "$vm_name" --overlay 8 2>&1)
+    resize_output=$($SMOLVM machine resize --name "$vm_name" --overlay 8 2>&1)
     echo "RESIZE OUTPUT: '$resize_output'"
 
     # Clean up
