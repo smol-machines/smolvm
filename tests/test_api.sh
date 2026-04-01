@@ -24,16 +24,8 @@ kill_orphan_smolvm_processes
 API_PORT=18080
 API_URL="http://127.0.0.1:$API_PORT"
 SERVER_PID=""
-<<<<<<< Updated upstream
-SANDBOX_NAME="api-test-machine"
-=======
-<<<<<<< Updated upstream
-SANDBOX_NAME="api-test-sandbox"
-=======
-SANDBOX_NAME="api-test-machine"
+MACHINE_NAME="api-test-machine"
 REGISTRY_TEST_NAME="registry-coherence-test"
->>>>>>> Stashed changes
->>>>>>> Stashed changes
 
 # =============================================================================
 # Setup / Teardown
@@ -68,22 +60,10 @@ stop_server() {
 }
 
 cleanup() {
-<<<<<<< Updated upstream
-    # Delete machine via API (this stops the VM properly)
-    if curl -s "$API_URL/health" >/dev/null 2>&1; then
-        curl -s -X DELETE "$API_URL/api/v1/machines/$SANDBOX_NAME" >/dev/null 2>&1 || true
-=======
-<<<<<<< Updated upstream
-    # Delete sandbox via API (this stops the VM properly)
-    if curl -s "$API_URL/health" >/dev/null 2>&1; then
-        curl -s -X DELETE "$API_URL/api/v1/sandboxes/$SANDBOX_NAME" >/dev/null 2>&1 || true
-=======
     # Delete machines via API (this stops the VMs properly)
     if curl -s "$API_URL/health" >/dev/null 2>&1; then
-        curl -s -X DELETE "$API_URL/api/v1/machines/$SANDBOX_NAME" >/dev/null 2>&1 || true
+        curl -s -X DELETE "$API_URL/api/v1/machines/$MACHINE_NAME" >/dev/null 2>&1 || true
         curl -s -X DELETE "$API_URL/api/v1/machines/$REGISTRY_TEST_NAME" >/dev/null 2>&1 || true
->>>>>>> Stashed changes
->>>>>>> Stashed changes
     fi
     stop_server
 
@@ -109,18 +89,18 @@ test_create_and_start_machine() {
     local status
     status=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$API_URL/api/v1/machines" \
         -H "Content-Type: application/json" \
-        -d "{\"name\": \"$SANDBOX_NAME\", \"network\": true, \"cpus\": 1, \"mem\": 512}")
+        -d "{\"name\": \"$MACHINE_NAME\", \"network\": true, \"cpus\": 1, \"mem\": 512}")
     [[ "$status" != "200" ]] && return 1
 
     # Start machine (boots VM)
     local response
-    response=$(curl -s -X POST "$API_URL/api/v1/machines/$SANDBOX_NAME/start")
+    response=$(curl -s -X POST "$API_URL/api/v1/machines/$MACHINE_NAME/start")
     [[ "$response" == *'"state":"running"'* ]]
 }
 
 test_exec_echo() {
     local response
-    response=$(curl -s -X POST "$API_URL/api/v1/machines/$SANDBOX_NAME/exec" \
+    response=$(curl -s -X POST "$API_URL/api/v1/machines/$MACHINE_NAME/exec" \
         -H "Content-Type: application/json" \
         -d '{"command": ["echo", "api-test-marker"]}')
     [[ "$response" == *"api-test-marker"* ]]
@@ -128,7 +108,7 @@ test_exec_echo() {
 
 test_exec_reads_vm_filesystem() {
     local response
-    response=$(curl -s -X POST "$API_URL/api/v1/machines/$SANDBOX_NAME/exec" \
+    response=$(curl -s -X POST "$API_URL/api/v1/machines/$MACHINE_NAME/exec" \
         -H "Content-Type: application/json" \
         -d '{"command": ["cat", "/etc/os-release"]}')
     [[ "$response" == *"Alpine"* ]] || [[ "$response" == *"alpine"* ]]
@@ -137,14 +117,14 @@ test_exec_reads_vm_filesystem() {
 test_exec_exit_codes() {
     # Test exit code 0
     local response exit_code
-    response=$(curl -s -X POST "$API_URL/api/v1/machines/$SANDBOX_NAME/exec" \
+    response=$(curl -s -X POST "$API_URL/api/v1/machines/$MACHINE_NAME/exec" \
         -H "Content-Type: application/json" \
         -d '{"command": ["sh", "-c", "exit 0"]}')
     exit_code=$(echo "$response" | grep -o '"exitCode":[0-9]*' | cut -d: -f2)
     [[ "$exit_code" != "0" ]] && return 1
 
     # Test exit code 42
-    response=$(curl -s -X POST "$API_URL/api/v1/machines/$SANDBOX_NAME/exec" \
+    response=$(curl -s -X POST "$API_URL/api/v1/machines/$MACHINE_NAME/exec" \
         -H "Content-Type: application/json" \
         -d '{"command": ["sh", "-c", "exit 42"]}')
     exit_code=$(echo "$response" | grep -o '"exitCode":[0-9]*' | cut -d: -f2)
@@ -153,7 +133,7 @@ test_exec_exit_codes() {
 
 test_exec_with_env() {
     local response
-    response=$(curl -s -X POST "$API_URL/api/v1/machines/$SANDBOX_NAME/exec" \
+    response=$(curl -s -X POST "$API_URL/api/v1/machines/$MACHINE_NAME/exec" \
         -H "Content-Type: application/json" \
         -d '{"command": ["sh", "-c", "echo $MY_VAR"], "env": [{"name": "MY_VAR", "value": "hello_from_api"}]}')
     [[ "$response" == *"hello_from_api"* ]]
@@ -161,7 +141,7 @@ test_exec_with_env() {
 
 test_exec_with_workdir() {
     local response
-    response=$(curl -s -X POST "$API_URL/api/v1/machines/$SANDBOX_NAME/exec" \
+    response=$(curl -s -X POST "$API_URL/api/v1/machines/$MACHINE_NAME/exec" \
         -H "Content-Type: application/json" \
         -d '{"command": ["pwd"], "workdir": "/tmp"}')
     [[ "$response" == *"/tmp"* ]]
@@ -169,7 +149,7 @@ test_exec_with_workdir() {
 
 test_exec_shell_pipeline() {
     local response
-    response=$(curl -s -X POST "$API_URL/api/v1/machines/$SANDBOX_NAME/exec" \
+    response=$(curl -s -X POST "$API_URL/api/v1/machines/$MACHINE_NAME/exec" \
         -H "Content-Type: application/json" \
         -d '{"command": ["sh", "-c", "echo hello world | wc -w"]}')
     [[ "$response" == *"2"* ]]
@@ -177,13 +157,13 @@ test_exec_shell_pipeline() {
 
 test_pull_and_run_image() {
     # Pull image
-    curl -s -X POST "$API_URL/api/v1/machines/$SANDBOX_NAME/images/pull" \
+    curl -s -X POST "$API_URL/api/v1/machines/$MACHINE_NAME/images/pull" \
         -H "Content-Type: application/json" \
         -d '{"image": "alpine:latest"}' >/dev/null
 
     # Run in image
     local response
-    response=$(curl -s -X POST "$API_URL/api/v1/machines/$SANDBOX_NAME/run" \
+    response=$(curl -s -X POST "$API_URL/api/v1/machines/$MACHINE_NAME/run" \
         -H "Content-Type: application/json" \
         -d '{"image": "alpine:latest", "command": ["echo", "container-test"]}')
     [[ "$response" == *"container-test"* ]]
@@ -191,13 +171,13 @@ test_pull_and_run_image() {
 
 test_stop_machine() {
     local response
-    response=$(curl -s -X POST "$API_URL/api/v1/machines/$SANDBOX_NAME/stop")
+    response=$(curl -s -X POST "$API_URL/api/v1/machines/$MACHINE_NAME/stop")
     [[ "$response" == *'"state":"stopped"'* ]] || [[ "$response" == *'"name":'* ]]
 }
 
 test_delete_machine() {
     local status
-    status=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE "$API_URL/api/v1/machines/$SANDBOX_NAME")
+    status=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE "$API_URL/api/v1/machines/$MACHINE_NAME")
     [[ "$status" == "200" ]]
 }
 

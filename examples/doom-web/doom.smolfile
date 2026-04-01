@@ -1,6 +1,6 @@
 # Doom in a browser, served from a hardware-isolated microVM
 #
-# Sandbox:
+# Run:
 #   smolvm machine run -d -s examples/doom-web/doom.smolfile
 #   open http://localhost:8080
 

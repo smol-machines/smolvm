@@ -5,7 +5,7 @@
 //! normal CLI.
 //!
 //! Called at the very start of `main()` before clap parsing so that a packed
-//! binary (e.g. `./my-sandbox echo hello`) shows packed-binary help rather
+//! binary (e.g. `./my-app echo hello`) shows packed-binary help rather
 //! than the full smolvm CLI.
 
 use crate::format::{PackFooter, FOOTER_SIZE};
