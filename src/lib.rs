@@ -69,6 +69,9 @@ pub mod data;
 pub mod dns_filter;
 pub mod dns_filter_listener;
 pub(crate) mod internal;
+/// Stateful VM orchestration for SDKs and the API server.
+mod smolvm;
+pub use crate::smolvm::Smolvm;
 
 // ============================================================================
 // Public module facades — re-export internal modules so that downstream crates
