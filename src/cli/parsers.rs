@@ -3,7 +3,7 @@
 //! This module consolidates parser functions used across multiple CLI commands
 //! to eliminate code duplication and ensure consistent validation.
 
-use smolvm::data::storage::HostMount;
+use smolvm::data::mount::HostMount;
 use std::time::Duration;
 
 /// Parse a duration string (e.g., "30s", "5m", "1h").

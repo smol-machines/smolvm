@@ -8,10 +8,10 @@
 use crate::cli::{format_pid_suffix, truncate};
 use smolvm::agent::{vm_data_dir, AgentManager};
 use smolvm::config::{RecordState, SmolvmConfig, VmRecord};
+use smolvm::data::disk::{DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
+use smolvm::data::mount::HostMount;
 use smolvm::data::network::PortMapping;
 use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
-use smolvm::data::storage::HostMount;
-use smolvm::data::storage::{DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
 use smolvm::db::SmolvmDb;
 
 // ============================================================================
@@ -918,9 +918,11 @@ pub fn resize_vm(
     new_overlay_gb: Option<u64>,
 ) -> smolvm::Result<()> {
     use smolvm::config::RecordState;
-    use smolvm::data::storage::{DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
+    use smolvm::data::disk::{
+        Overlay, Storage, DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB,
+    };
     use smolvm::db::SmolvmDb;
-    use smolvm::storage::{expand_disk, Overlay, Storage};
+    use smolvm::storage::expand_disk;
 
     // Get VM record from database
     let db = SmolvmDb::open()?;

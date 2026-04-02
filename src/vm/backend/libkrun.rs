@@ -7,7 +7,7 @@ use std::ffi::CString;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use crate::data::storage::HostMount;
+use crate::data::mount::HostMount;
 use crate::error::{Error, Result};
 use crate::platform::{self, VmExecutor};
 use crate::vm::config::{NetworkPolicy, RootfsSource, VmConfig};

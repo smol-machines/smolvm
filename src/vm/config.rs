@@ -1,7 +1,6 @@
 //! VM configuration types.
 
-pub use crate::data::storage::HostMount;
-
+use crate::data::mount::HostMount;
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::path::PathBuf;

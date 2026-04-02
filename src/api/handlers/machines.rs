@@ -26,7 +26,7 @@ use axum::{
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::agent::{AgentManager, HostMount};
+use crate::agent::AgentManager;
 use crate::api::error::ApiError;
 use crate::api::state::{ApiState, MachineEntry};
 use crate::api::types::{
@@ -36,7 +36,9 @@ use crate::api::types::{
 };
 use crate::api::validation::{validate_command, validate_resource_name};
 use crate::config::{RecordState, RestartConfig, VmRecord};
-use crate::storage::{expand_disk, Overlay, Storage};
+use crate::data::disk::{Overlay, Storage};
+use crate::data::mount::HostMount;
+use crate::storage::expand_disk;
 
 /// Maximum machine name length.
 ///
@@ -92,7 +94,7 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
             .enumerate()
             .map(
                 |(i, (source, target, readonly))| crate::api::types::MountInfo {
-                    tag: crate::data::storage::HostMount::mount_tag(i),
+                    tag: crate::data::mount::HostMount::mount_tag(i),
                     source: source.clone(),
                     target: target.clone(),
                     readonly: *readonly,
@@ -680,10 +682,10 @@ pub async fn resize_machine(
 
     let current_storage_gb = record
         .storage_gb
-        .unwrap_or(crate::data::storage::DEFAULT_STORAGE_SIZE_GIB);
+        .unwrap_or(crate::data::disk::DEFAULT_STORAGE_SIZE_GIB);
     let current_overlay_gb = record
         .overlay_gb
-        .unwrap_or(crate::data::storage::DEFAULT_OVERLAY_SIZE_GIB);
+        .unwrap_or(crate::data::disk::DEFAULT_OVERLAY_SIZE_GIB);
 
     if req.storage_gb.unwrap_or(current_storage_gb) < current_storage_gb {
         return Err(ApiError::BadRequest(format!(

@@ -1,7 +1,7 @@
 use crate::data::consts::BYTES_PER_GIB;
+use crate::data::disk::DiskType;
 use crate::error::{Error, Result};
 use crate::platform::Os;
-use crate::storage::DiskType;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 

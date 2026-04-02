@@ -14,8 +14,8 @@ use smolvm::agent::launcher_dynamic::{
     launch_agent_vm_dynamic, KrunFunctions, PackedLaunchConfig, PackedMount,
 };
 use smolvm::agent::{AgentClient, RunConfig, VmResources};
+use smolvm::data::mount::HostMount;
 use smolvm::data::network::PortMapping;
-use smolvm::data::storage::HostMount;
 use smolvm::Error;
 use smolvm::DEFAULT_SHELL_CMD;
 use smolvm_pack::detect::PackedMode;
@@ -73,7 +73,7 @@ fn resolve_lib_dir(cache_dir: &Path, debug: bool) -> smolvm::Result<PathBuf> {
 }
 
 /// Convert parsed mounts to PackedMount format for the VM launcher.
-fn mounts_to_packed(mounts: &[smolvm::data::storage::HostMount]) -> Vec<PackedMount> {
+fn mounts_to_packed(mounts: &[smolvm::data::mount::HostMount]) -> Vec<PackedMount> {
     mounts
         .iter()
         .enumerate()
@@ -655,7 +655,7 @@ fn execute_command(
     client: &mut AgentClient,
     manifest: &smolvm_pack::PackManifest,
     args: &PackRunCmd,
-    mounts: &[smolvm::data::storage::HostMount],
+    mounts: &[smolvm::data::mount::HostMount],
 ) -> smolvm::Result<i32> {
     let command = build_command(manifest, &args.command);
     let env = build_env(manifest, &args.env);

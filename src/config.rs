@@ -552,10 +552,10 @@ impl VmRecord {
     }
 
     /// Convert stored mounts to HostMount format.
-    pub fn host_mounts(&self) -> Vec<crate::data::storage::HostMount> {
+    pub fn host_mounts(&self) -> Vec<crate::data::mount::HostMount> {
         self.mounts
             .iter()
-            .map(|(host, guest, ro)| crate::data::storage::HostMount {
+            .map(|(host, guest, ro)| crate::data::mount::HostMount {
                 source: std::path::PathBuf::from(host),
                 target: std::path::PathBuf::from(guest),
                 read_only: *ro,

@@ -2,22 +2,6 @@ use crate::data::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// Default size for the rootfs overlay disk (10 GiB sparse).
-///
-/// This is a sparse file — only actually-written data consumes host disk space.
-/// 10 GiB provides headroom for package installation (`apk add`, `pip install`, etc.)
-/// without hitting "No space left on device" during typical development workflows.
-pub const DEFAULT_OVERLAY_SIZE_GIB: u64 = 10;
-
-/// Default size for the shared storage disk (20 GiB sparse).
-pub const DEFAULT_STORAGE_SIZE_GIB: u64 = 20;
-
-/// Overlay disk filename.
-pub const OVERLAY_DISK_FILENAME: &str = "overlay.raw";
-
-/// Storage disk filename.
-pub const STORAGE_DISK_FILENAME: &str = "storage.raw";
-
 /// Host directory mount.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HostMount {

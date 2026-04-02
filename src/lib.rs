@@ -104,7 +104,6 @@ pub use agent::{AgentClient, AgentManager};
 pub use api::ApiDoc;
 pub use config::{RecordState, RestartConfig, RestartPolicy, SmolvmConfig, VmRecord};
 pub use data::resources::VmResources;
-pub use data::storage::HostMount;
 pub use db::SmolvmDb;
 pub use error::{Error, Result};
 pub use process::ChildProcess;

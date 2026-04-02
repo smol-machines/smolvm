@@ -1,8 +1,5 @@
 use crate::data::consts::BYTES_PER_GIB;
-use crate::data::storage::{
-    DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB, OVERLAY_DISK_FILENAME,
-    STORAGE_DISK_FILENAME,
-};
+use crate::data::disk::{DiskType, Overlay, Storage};
 use crate::disk_utils;
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -43,42 +40,6 @@ impl DiskVersion {
     pub fn is_compatible(&self) -> bool {
         self.format_version <= Self::CURRENT_VERSION
     }
-}
-
-/// Marker type for the persistent rootfs overlay disk.
-pub enum Overlay {}
-
-/// Marker type for the shared storage disk.
-pub enum Storage {}
-
-/// Compile-time metadata for a typed VM disk.
-pub trait DiskType {
-    /// Human-readable disk type name used in logs and errors.
-    const NAME: &'static str;
-    /// Default filename for this disk type.
-    const DEFAULT_FILENAME: &'static str;
-    /// Default size for this disk type, in GiB.
-    const DEFAULT_SIZE_GIB: u64;
-    /// Preformatted template filename for this disk type.
-    const TEMPLATE_FILENAME: &'static str;
-    /// ext4 volume label used when formatting this disk type.
-    const VOLUME_LABEL: &'static str;
-}
-
-impl DiskType for Overlay {
-    const NAME: &'static str = "overlay";
-    const DEFAULT_FILENAME: &'static str = OVERLAY_DISK_FILENAME;
-    const DEFAULT_SIZE_GIB: u64 = DEFAULT_OVERLAY_SIZE_GIB;
-    const TEMPLATE_FILENAME: &'static str = "overlay-template.ext4";
-    const VOLUME_LABEL: &'static str = "smolvm-overlay";
-}
-
-impl DiskType for Storage {
-    const NAME: &'static str = "storage";
-    const DEFAULT_FILENAME: &'static str = STORAGE_DISK_FILENAME;
-    const DEFAULT_SIZE_GIB: u64 = DEFAULT_STORAGE_SIZE_GIB;
-    const TEMPLATE_FILENAME: &'static str = "storage-template.ext4";
-    const VOLUME_LABEL: &'static str = "smolvm";
 }
 
 /// Shared disk implementation for storage and overlay disks.
@@ -324,6 +285,7 @@ pub fn expand_disk<D: DiskType>(path: &Path, new_size_gb: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::disk::{OVERLAY_DISK_FILENAME, STORAGE_DISK_FILENAME};
 
     #[test]
     fn test_disk_version_compatibility() {

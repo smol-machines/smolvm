@@ -3,6 +3,8 @@
 //! The AgentManager is responsible for starting and stopping the agent VM,
 //! which runs the smolvm-agent for OCI image management and command execution.
 
+use crate::data::disk;
+use crate::data::mount::HostMount;
 use crate::error::{Error, Result};
 use crate::process::{self, ChildProcess};
 use crate::storage::{OverlayDisk, StorageDisk};
@@ -12,7 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::launcher::{self, launch_agent_vm};
-use super::{HostMount, PortMapping, VmResources};
+use super::{PortMapping, VmResources};
 
 // ============================================================================
 // Configuration Constants
@@ -318,17 +320,17 @@ impl AgentManager {
     ) -> Result<Self> {
         let name = name.into();
         let rootfs_path = Self::default_rootfs_path()?;
-        let sg = storage_gb.unwrap_or(crate::data::storage::DEFAULT_STORAGE_SIZE_GIB);
-        let og = overlay_gb.unwrap_or(crate::data::storage::DEFAULT_OVERLAY_SIZE_GIB);
+        let sg = storage_gb.unwrap_or(disk::DEFAULT_STORAGE_SIZE_GIB);
+        let og = overlay_gb.unwrap_or(disk::DEFAULT_OVERLAY_SIZE_GIB);
 
         // Named VMs get their own storage disk
         let storage_dir = vm_data_dir(&name);
         std::fs::create_dir_all(&storage_dir)?;
 
-        let storage_path = storage_dir.join(crate::data::storage::STORAGE_DISK_FILENAME);
+        let storage_path = storage_dir.join(disk::STORAGE_DISK_FILENAME);
         let storage_disk = StorageDisk::open_or_create_at(&storage_path, sg)?;
 
-        let overlay_path = storage_dir.join(crate::data::storage::OVERLAY_DISK_FILENAME);
+        let overlay_path = storage_dir.join(disk::OVERLAY_DISK_FILENAME);
         let overlay_disk = OverlayDisk::open_or_create_at(&overlay_path, og)?;
 
         Self::new_named(name, rootfs_path, storage_disk, overlay_disk)
@@ -967,10 +969,10 @@ impl AgentManager {
         let console_log = self.console_log.clone();
         let storage_size_gb = resources_for_fork
             .storage_gib
-            .unwrap_or(crate::data::storage::DEFAULT_STORAGE_SIZE_GIB);
+            .unwrap_or(disk::DEFAULT_STORAGE_SIZE_GIB);
         let overlay_size_gb = resources_for_fork
             .overlay_gib
-            .unwrap_or(crate::data::storage::DEFAULT_OVERLAY_SIZE_GIB);
+            .unwrap_or(disk::DEFAULT_OVERLAY_SIZE_GIB);
         let resources_for_finalize = resources_for_fork.clone();
 
         // Fork child process. The child becomes a session leader so the VM
@@ -1085,10 +1087,10 @@ impl AgentManager {
 
         let storage_size_gb = resources_for_config
             .storage_gib
-            .unwrap_or(crate::data::storage::DEFAULT_STORAGE_SIZE_GIB);
+            .unwrap_or(disk::DEFAULT_STORAGE_SIZE_GIB);
         let overlay_size_gb = resources_for_config
             .overlay_gib
-            .unwrap_or(crate::data::storage::DEFAULT_OVERLAY_SIZE_GIB);
+            .unwrap_or(disk::DEFAULT_OVERLAY_SIZE_GIB);
 
         // Write boot config to a file the subprocess will read
         let config = BootConfig {

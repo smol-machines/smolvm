@@ -17,9 +17,9 @@ use crate::cli::parsers::{
 use crate::cli::vm_common::{self, DeleteVmOptions, VmKind};
 use clap::{Args, Subcommand};
 use smolvm::agent::{docker_config_mount, AgentClient, AgentManager, RunConfig, VmResources};
+use smolvm::data::mount::HostMount;
 use smolvm::data::network::PortMapping;
 use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
-use smolvm::data::storage::HostMount;
 use smolvm::{DEFAULT_IDLE_CMD, DEFAULT_SHELL_CMD};
 use std::path::PathBuf;
 use std::time::Duration;

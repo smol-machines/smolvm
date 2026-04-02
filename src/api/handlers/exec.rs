@@ -18,7 +18,7 @@ use crate::api::types::{
 };
 use crate::api::validation::validate_command;
 use crate::data::consts::BYTES_PER_MIB;
-use crate::data::storage::HostMount;
+use crate::data::mount::HostMount;
 use tokio::sync::Semaphore;
 
 /// Execute a command in a machine.

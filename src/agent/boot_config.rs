@@ -8,9 +8,9 @@
 //!
 //! This module defines the serializable config passed to that subprocess.
 
+use crate::data::mount::HostMount;
 use crate::data::network::PortMapping;
 use crate::data::resources::VmResources;
-use crate::data::storage::HostMount;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 

@@ -1,9 +1,10 @@
 //! API server state management.
 
-use crate::agent::{AgentManager, HostMount, PortMapping, VmResources};
+use crate::agent::{AgentManager, PortMapping, VmResources};
 use crate::api::error::ApiError;
 use crate::api::types::{MachineInfo, MountSpec, PortSpec, ResourceSpec, RestartSpec};
 use crate::config::{RecordState, RestartConfig, RestartPolicy, VmRecord};
+use crate::data::mount::HostMount;
 use crate::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
 use crate::db::SmolvmDb;
 use parking_lot::RwLock;
@@ -781,7 +782,7 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
             .iter()
             .enumerate()
             .map(|(i, m)| crate::api::types::MountInfo {
-                tag: crate::data::storage::HostMount::mount_tag(i),
+                tag: crate::data::mount::HostMount::mount_tag(i),
                 source: m.source.clone(),
                 target: m.target.clone(),
                 readonly: m.readonly,
