@@ -6,7 +6,7 @@
 //! [`VmKind`].
 
 use crate::cli::{format_pid_suffix, truncate};
-use smolvm::agent::{vm_data_dir, AgentManager};
+use smolvm::agent::AgentManager;
 use smolvm::config::{RecordState, SmolvmConfig, VmRecord};
 use smolvm::data::disk::{DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
 use smolvm::data::mount::HostMount;
@@ -168,89 +168,15 @@ pub struct CreateVmParams {
     pub dns_filter_hosts: Option<Vec<String>>,
 }
 
-/// Maximum length for machine names.
-const MAX_NAME_LENGTH: usize = 40;
-
-/// Validate a machine name for CLI commands.
-///
-/// Same rules as the API validation but returns `smolvm::Error` instead of `ApiError`.
-fn validate_name(name: &str, kind: VmKind) -> smolvm::Result<()> {
-    if name.is_empty() {
-        return Err(smolvm::Error::config(
-            format!("create {}", kind.label()),
-            format!("{} name cannot be empty", kind.label()),
-        ));
-    }
-    if name.len() > MAX_NAME_LENGTH {
-        return Err(smolvm::Error::config(
-            format!("create {}", kind.label()),
-            format!(
-                "{} name too long: {} characters (max {})",
-                kind.label(),
-                name.len(),
-                MAX_NAME_LENGTH
-            ),
-        ));
-    }
-    let first_char = name.chars().next().unwrap();
-    if !first_char.is_ascii_alphanumeric() {
-        return Err(smolvm::Error::config(
-            format!("create {}", kind.label()),
-            format!("{} name must start with a letter or digit", kind.label()),
-        ));
-    }
-    if name.ends_with('-') {
-        return Err(smolvm::Error::config(
-            format!("create {}", kind.label()),
-            format!("{} name cannot end with a hyphen", kind.label()),
-        ));
-    }
-    let mut prev_was_hyphen = false;
-    for c in name.chars() {
-        if c == '-' {
-            if prev_was_hyphen {
-                return Err(smolvm::Error::config(
-                    format!("create {}", kind.label()),
-                    format!("{} name cannot contain consecutive hyphens", kind.label()),
-                ));
-            }
-            prev_was_hyphen = true;
-        } else {
-            prev_was_hyphen = false;
-        }
-        if !c.is_ascii_alphanumeric() && c != '-' && c != '_' {
-            return Err(smolvm::Error::config(
-                format!("create {}", kind.label()),
-                format!("{} name contains invalid character: '{}'", kind.label(), c),
-            ));
-        }
-    }
-    Ok(())
-}
 
 /// Create a named machine configuration (does not start it).
+///
+/// Delegates core persistence to `smolvm::control::create_vm`.
 pub fn create_vm(kind: VmKind, params: CreateVmParams) -> smolvm::Result<()> {
-    // Validate name before touching the database
-    validate_name(&params.name, kind)?;
-
-    let mut config = SmolvmConfig::load()?;
-
-    // Check if already exists
-    if config.get_vm(&params.name).is_some() {
-        return Err(smolvm::Error::config(
-            format!("create {}", kind.label()),
-            format!("{} '{}' already exists", kind.label(), params.name),
-        ));
-    }
+    use smolvm::data::vm::{MicroVm, VmSpec};
 
     // Parse and validate volume mounts
-    let mounts = HostMount::parse(&params.volume)?
-        .into_iter()
-        .map(|m| m.to_storage_tuple())
-        .collect();
-
-    // Convert port mappings to tuple format for storage
-    let ports: Vec<(u16, u16)> = params.port.iter().map(|p| (p.host, p.guest)).collect();
+    let mounts = HostMount::parse(&params.volume)?;
 
     // Parse environment variables for init
     let env: Vec<(String, String)> = params
@@ -266,44 +192,34 @@ pub fn create_vm(kind: VmKind, params: CreateVmParams) -> smolvm::Result<()> {
         })
         .collect();
 
-    // Create record with restart policy if configured
-    let restart = smolvm::config::RestartConfig {
-        policy: params
-            .restart_policy
-            .unwrap_or(smolvm::config::RestartPolicy::Never),
-        max_retries: params.restart_max_retries.unwrap_or(0),
-        max_backoff_secs: params.restart_max_backoff_secs.unwrap_or(0),
-        ..Default::default()
+    // Build MicroVm and delegate to control layer
+    let vm = MicroVm {
+        name: params.name.clone(),
+        spec: VmSpec {
+            resources: smolvm::data::resources::VmResources {
+                cpus: params.cpus,
+                memory_mib: params.mem,
+                network: params.net,
+                storage_gib: params.storage_gb,
+                overlay_gib: params.overlay_gb,
+                allowed_cidrs: params.allowed_cidrs.clone(),
+            },
+            mounts,
+            ports: params.port.clone(),
+            image: params.image.clone(),
+            entrypoint: params.entrypoint.clone(),
+            cmd: params.cmd.clone(),
+            env,
+            workdir: params.workdir.clone(),
+            init: params.init.clone(),
+        },
+        status: None,
     };
-    let mut record = VmRecord::new_with_restart(
-        params.name.clone(),
-        params.cpus,
-        params.mem,
-        mounts,
-        ports,
-        params.net,
-        restart,
-    );
-    record.init = params.init.clone();
-    record.env = env;
-    record.workdir = params.workdir.clone();
-    record.storage_gb = params.storage_gb;
-    record.overlay_gb = params.overlay_gb;
-    record.allowed_cidrs = params.allowed_cidrs.clone();
-    record.image = params.image.clone();
-    record.entrypoint = params.entrypoint.clone();
-    record.cmd = params.cmd.clone();
-    record.health_cmd = params.health_cmd.clone();
-    record.health_interval_secs = params.health_interval_secs;
-    record.health_timeout_secs = params.health_timeout_secs;
-    record.health_retries = params.health_retries;
-    record.health_startup_grace_secs = params.health_startup_grace_secs;
-    record.ssh_agent = params.ssh_agent;
-    record.dns_filter_hosts = params.dns_filter_hosts.clone();
 
-    // Store in config (persisted immediately to database)
-    config.insert_vm(params.name.clone(), record)?;
+    let db = SmolvmDb::open()?;
+    smolvm::control::create_vm(&db, vm)?;
 
+    // CLI output
     println!("Created {}: {}", kind.label(), params.name);
     println!("  CPUs: {}, Memory: {} MiB", params.cpus, params.mem);
     if !params.volume.is_empty() {
@@ -335,44 +251,37 @@ pub fn create_vm(kind: VmKind, params: CreateVmParams) -> smolvm::Result<()> {
 
 /// Start a named machine that has a config record.
 ///
-/// Uses direct DB operations instead of SmolvmConfig::load() to avoid
-/// loading all config settings and all VM records. Only reads the single
-/// named record (1 DB cycle) and updates it after start (1 DB cycle).
+/// Delegates core lifecycle to `smolvm::control::start_vm`, then handles
+/// CLI-specific post-start behavior (init commands, image pull, container creation).
 pub fn start_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
-    use smolvm::Error;
-
-    // Direct DB lookup — 1 read cycle instead of loading everything
     let db = SmolvmDb::open()?;
-    let record = db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))?;
 
-    // Check state
-    let actual_state = record.actual_state();
-    if actual_state == RecordState::Running {
-        let pid_suffix = format_pid_suffix(record.pid);
-        println!(
-            "{} '{}' already running{}",
-            kind.display_name(),
-            name,
-            pid_suffix
-        );
-        return Ok(());
+    // Pre-start info for CLI output
+    let vm = smolvm::control::get_vm(&db, name)?;
+    let spec = &vm.spec;
+
+    // Check if already running
+    if let Some(ref status) = vm.status {
+        if status.phase == smolvm::data::vm::VmPhase::Running {
+            let pid_suffix = format_pid_suffix(status.pid);
+            println!(
+                "{} '{}' already running{}",
+                kind.display_name(),
+                name,
+                pid_suffix
+            );
+            return Ok(());
+        }
     }
 
-    let mounts = record.host_mounts();
-    let ports = record.port_mappings();
-    let resources = record.vm_resources();
-
-    // Start agent VM
-    let manager = AgentManager::for_vm_with_sizes(name, record.storage_gb, record.overlay_gb)
-        .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
-
-    let mount_info = if !mounts.is_empty() {
-        format!(" with {} mount(s)", mounts.len())
+    // CLI progress output
+    let mount_info = if !spec.mounts.is_empty() {
+        format!(" with {} mount(s)", spec.mounts.len())
     } else {
         String::new()
     };
-    let port_info = if !ports.is_empty() {
-        format!(" and {} port mapping(s)", ports.len())
+    let port_info = if !spec.ports.is_empty() {
+        format!(" and {} port mapping(s)", spec.ports.len())
     } else {
         String::new()
     };
@@ -384,45 +293,23 @@ pub fn start_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
         port_info
     );
 
-    // Resolve SSH agent socket path if enabled
-    let ssh_agent_socket = if record.ssh_agent {
-        match std::env::var("SSH_AUTH_SOCK") {
-            Ok(path) => Some(std::path::PathBuf::from(path)),
-            Err(_) => {
-                return Err(Error::config(
-                    "ssh-agent",
-                    "SSH_AUTH_SOCK is not set. Start an SSH agent with: eval $(ssh-agent) && ssh-add",
-                ));
-            }
-        }
-    } else {
-        None
-    };
+    // Core lifecycle (delegated to control layer — handles AgentManager, ensure_running, DB persist)
+    let handle = smolvm::control::start_vm(&db, name)?;
+    let pid = handle.child_pid();
 
-    let features = smolvm::agent::LaunchFeatures {
-        ssh_agent_socket,
-        dns_filter_hosts: record.dns_filter_hosts.clone(),
-    };
-
-    let _ = manager
-        .ensure_running_with_full_config(mounts, ports, resources, features)
-        .map_err(|e| Error::agent(format!("start {}", kind.label()), e.to_string()))?;
-
-    // Get PID immediately (cheap) and print output before DB write
-    let pid = manager.child_pid();
-
-    // Run init commands if configured (before reporting success)
-    if !record.init.is_empty() {
-        println!("Running {} init command(s)...", record.init.len());
-        let mut client = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
-        for (i, cmd) in record.init.iter().enumerate() {
+    // CLI-specific: run init commands
+    if !spec.init.is_empty() {
+        println!("Running {} init command(s)...", spec.init.len());
+        let mut client = smolvm::agent::AgentClient::connect_with_retry(handle.vsock_socket())?;
+        for (i, cmd) in spec.init.iter().enumerate() {
             let argv = vec!["sh".into(), "-c".into(), cmd.clone()];
-            let (exit_code, _stdout, stderr) =
-                client.vm_exec(argv, record.env.clone(), record.workdir.clone(), None)?;
+            let env: Vec<(String, String)> = spec.env.clone();
+            let workdir = spec.workdir.clone();
+            let (exit_code, _stdout, stderr) = client.vm_exec(argv, env, workdir, None)?;
             if exit_code != 0 {
-                if let Err(e) = manager.stop() {
-                    tracing::warn!(error = %e, "failed to stop machine after init failure");
-                }
+                // Stop on init failure
+                drop(handle); // release the handle
+                let _ = smolvm::control::stop_vm(&db, name);
                 return Err(smolvm::Error::agent(
                     "init",
                     format!("init[{}] failed (exit {}): {}", i, exit_code, stderr.trim()),
@@ -431,9 +318,9 @@ pub fn start_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
         }
     }
 
-    // Auto-create container if image is configured (from Smolfile)
-    if let Some(ref image) = record.image {
-        let mut client = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
+    // CLI-specific: auto-create container if image configured (from Smolfile)
+    if let Some(ref image) = spec.image {
+        let mut client = smolvm::agent::AgentClient::connect_with_retry(handle.vsock_socket())?;
 
         println!("Pulling {}...", image);
         let _image_info = crate::cli::pull_with_progress(&mut client, image, None)?;
@@ -450,14 +337,14 @@ pub fn start_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
         );
     } else {
         // No image — bare VM mode. Run entrypoint+cmd if configured.
-        let mut bare_cmd = record.entrypoint.clone();
-        bare_cmd.extend(record.cmd.clone());
+        let mut bare_cmd = spec.entrypoint.clone();
+        bare_cmd.extend(spec.cmd.clone());
         if !bare_cmd.is_empty() {
             let mut client =
-                smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
-            let env = record.env.clone();
+                smolvm::agent::AgentClient::connect_with_retry(handle.vsock_socket())?;
+            let env: Vec<(String, String)> = spec.env.clone();
             let (exit_code, stdout, stderr) =
-                client.vm_exec(bare_cmd, env, record.workdir.clone(), None)?;
+                client.vm_exec(bare_cmd, env, spec.workdir.clone(), None)?;
             if !stdout.is_empty() {
                 print!("{}", stdout);
             }
@@ -476,18 +363,7 @@ pub fn start_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
         );
     }
 
-    // Persist running state after output — 1 write cycle (not on critical path)
-    let pid_start_time = pid.and_then(smolvm::process::process_start_time);
-    if let Err(e) = db.update_vm(name, |r| {
-        r.state = RecordState::Running;
-        r.pid = pid;
-        r.pid_start_time = pid_start_time;
-    }) {
-        tracing::warn!(error = %e, vm = %name, "failed to persist running state");
-    }
-
-    // Keep VM running (persistent)
-    manager.detach();
+    handle.detach();
     Ok(())
 }
 
@@ -562,7 +438,18 @@ pub struct DefaultVmOverrides {
 }
 
 /// Start the default machine.
+///
+/// If the default VM exists in the DB, delegates to `start_vm_named`.
+/// Otherwise creates a fresh default VM via AgentManager.
 pub fn start_vm_default(kind: VmKind) -> smolvm::Result<()> {
+    let db = SmolvmDb::open()?;
+
+    // If default exists in DB, use the named path (gets full config, init, etc.)
+    if db.get_vm("default")?.is_some() {
+        return start_vm_named(kind, "default");
+    }
+
+    // No record — start a bare default VM
     let manager = AgentManager::new_default()?;
 
     if manager.try_connect_existing().is_some() {
@@ -579,33 +466,9 @@ pub fn start_vm_default(kind: VmKind) -> smolvm::Result<()> {
     println!("Starting {} 'default'...", kind.label());
     manager.ensure_running()?;
 
+    // Persist the default record
     let mut config = SmolvmConfig::load()?;
     persist_default_running(&mut config, manager.child_pid(), None);
-
-    // Run init commands if the default record has them (persisted from machine run -d -s)
-    let record = config.get_vm("default").cloned();
-
-    if let Some(record) = record {
-        if !record.init.is_empty() {
-            println!("Running {} init command(s)...", record.init.len());
-            let mut client =
-                smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
-            for (i, cmd) in record.init.iter().enumerate() {
-                let argv = vec!["sh".into(), "-c".into(), cmd.clone()];
-                let (exit_code, _stdout, stderr) =
-                    client.vm_exec(argv, record.env.clone(), record.workdir.clone(), None)?;
-                if exit_code != 0 {
-                    if let Err(e) = manager.stop() {
-                        tracing::warn!(error = %e, "failed to stop machine after init failure");
-                    }
-                    return Err(smolvm::Error::agent(
-                        "init",
-                        format!("init[{}] failed (exit {}): {}", i, exit_code, stderr.trim()),
-                    ));
-                }
-            }
-        }
-    }
 
     println!(
         "{} 'default' running (PID: {})",
@@ -621,80 +484,46 @@ pub fn start_vm_default(kind: VmKind) -> smolvm::Result<()> {
 // Stop
 // ============================================================================
 
-/// Stop a named machine that has a config record (or fall back to
-/// agent-only stop if the name is not in config).
+/// Stop a named machine.
+///
+/// Delegates core lifecycle to `smolvm::control::stop_vm`.
 pub fn stop_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
-    let mut config = SmolvmConfig::load()?;
+    let db = SmolvmDb::open()?;
 
-    // Check config for the named VM
-    let record = match config.get_vm(name) {
-        Some(r) => r.clone(),
-        None => {
-            // Not in config — try to stop a running VM with this name directly
-            let manager = AgentManager::for_vm(name)?;
-            if manager.try_connect_existing().is_some() {
-                println!("Stopping {} '{}'...", kind.label(), name);
-                manager.stop()?;
-                println!("{} '{}' stopped", kind.display_name(), name);
-            } else {
-                println!(
-                    "{} '{}' not found or not running",
-                    kind.display_name(),
-                    name
-                );
-            }
-            return Ok(());
-        }
+    // Check current state for CLI messaging
+    let vm = match smolvm::control::get_vm(&db, name) {
+        Ok(vm) => Some(vm),
+        Err(_) => None,
     };
 
-    let actual_state = record.actual_state();
-    if actual_state != RecordState::Running {
-        println!(
-            "{} '{}' is not running (state: {})",
-            kind.display_name(),
-            name,
-            actual_state,
-        );
-        return Ok(());
+    if let Some(ref vm) = vm {
+        if let Some(ref status) = vm.status {
+            if status.phase != smolvm::data::vm::VmPhase::Running {
+                println!(
+                    "{} '{}' is not running (state: {})",
+                    kind.display_name(),
+                    name,
+                    status.phase,
+                );
+                return Ok(());
+            }
+        }
     }
 
     println!("Stopping {} '{}'...", kind.label(), name);
-
-    let manager = AgentManager::for_vm(name)
-        .map_err(|e| smolvm::Error::agent("create agent manager", e.to_string()))?;
-    manager.stop()?;
-
-    config.update_vm(name, |r| {
-        r.state = RecordState::Stopped;
-        r.pid = None;
-        r.pid_start_time = None;
-    });
-
+    smolvm::control::stop_vm(&db, name)?;
     println!("Stopped {}: {}", kind.label(), name);
     Ok(())
 }
 
 /// Stop the default machine.
+///
+/// Delegates to `stop_vm_named` with "default".
 pub fn stop_vm_default(kind: VmKind) -> smolvm::Result<()> {
-    let manager = AgentManager::new_default()?;
-
-    // try_connect_existing sets internal state if agent is reachable;
-    // stop() handles both responsive agents and orphans via PID file.
-    manager.try_connect_existing();
+    let db = SmolvmDb::open()?;
     println!("Stopping {} 'default'...", kind.label());
-    manager.stop()?;
-
-    // Update database record if it exists
-    if let Ok(mut config) = SmolvmConfig::load() {
-        config.update_vm("default", |r| {
-            r.state = RecordState::Stopped;
-            r.pid = None;
-            r.pid_start_time = None;
-        });
-    }
-
+    smolvm::control::stop_vm(&db, "default")?;
     println!("{} 'default' stopped", kind.display_name());
-
     Ok(())
 }
 
@@ -709,31 +538,32 @@ pub struct DeleteVmOptions {
 }
 
 /// Delete a named machine configuration.
+///
+/// Handles CLI-specific confirmation prompt, then delegates to
+/// `smolvm::control::delete_vm` for the actual deletion.
 pub fn delete_vm(
     kind: VmKind,
     name: &str,
     force: bool,
     options: DeleteVmOptions,
 ) -> smolvm::Result<()> {
-    let mut config = SmolvmConfig::load()?;
+    let db = SmolvmDb::open()?;
 
-    // Check if exists
-    let record = config
-        .get_vm(name)
-        .ok_or_else(|| smolvm::Error::vm_not_found(name))?
-        .clone();
+    // Check if exists (for CLI messaging)
+    let _ = smolvm::control::get_vm(&db, name)?;
 
-    // Stop if running (machine run does this)
-    if options.stop_if_running && record.actual_state() == RecordState::Running {
-        if let Ok(manager) = AgentManager::for_vm(name) {
-            println!("Stopping {} '{}'...", kind.label(), name);
-            if let Err(e) = manager.stop() {
-                tracing::warn!(error = %e, "failed to stop {}", kind.label());
+    // Stop if running and option set (machine run does this)
+    if options.stop_if_running {
+        let vm = smolvm::control::get_vm(&db, name)?;
+        if let Some(ref status) = vm.status {
+            if status.phase == smolvm::data::vm::VmPhase::Running {
+                println!("Stopping {} '{}'...", kind.label(), name);
+                let _ = smolvm::control::stop_vm(&db, name);
             }
         }
     }
 
-    // Confirm deletion unless --force
+    // CLI-specific: confirm deletion unless --force
     if !force {
         eprint!("Delete {} '{}'? [y/N] ", kind.label(), name);
         let mut input = String::new();
@@ -749,16 +579,8 @@ pub fn delete_vm(
         }
     }
 
-    // Remove from config (persists immediately to database)
-    config.remove_vm(name);
-
-    let data_dir = vm_data_dir(name);
-    if data_dir.exists() {
-        println!("Cleaning up data directory for vm: {}", name);
-        if let Err(e) = std::fs::remove_dir_all(&data_dir) {
-            tracing::warn!(error = %e, "Failed to remove VM data directory: {}", data_dir.display());
-        }
-    }
+    // Delegate to control layer
+    smolvm::control::delete_vm(&db, name, true)?;
 
     println!("Deleted {}: {}", kind.label(), name);
     Ok(())
@@ -796,15 +618,17 @@ where
 // ============================================================================
 
 /// List all machines.
+///
+/// Uses `smolvm::control::list_vms` for data, then formats for CLI output.
 pub fn list_vms(kind: VmKind, verbose: bool, json: bool) -> smolvm::Result<()> {
-    let config = SmolvmConfig::load()?;
-    let vms: Vec<_> = config.list_vms().collect();
+    use smolvm::data::vm::MicroVm;
 
-    let empty_label = "No machines found";
+    let db = SmolvmDb::open()?;
+    let vms: Vec<MicroVm> = smolvm::control::list_vms(&db)?;
 
     if vms.is_empty() {
         if !json {
-            println!("{}", empty_label);
+            println!("No machines found");
         } else {
             println!("[]");
         }
@@ -814,28 +638,37 @@ pub fn list_vms(kind: VmKind, verbose: bool, json: bool) -> smolvm::Result<()> {
     if json {
         let json_vms: Vec<_> = vms
             .iter()
-            .map(|(name, record)| {
-                let actual_state = record.actual_state();
+            .map(|vm| {
+                let phase = vm
+                    .status
+                    .as_ref()
+                    .map(|s| s.phase.to_string())
+                    .unwrap_or_else(|| "unknown".into());
+                let pid = vm.status.as_ref().and_then(|s| s.pid);
+                let created_at = vm
+                    .status
+                    .as_ref()
+                    .map(|s| s.created_at.as_str())
+                    .unwrap_or("");
                 let mut obj = serde_json::json!({
-                    "name": name,
-                    "state": actual_state.to_string(),
-                    "cpus": record.cpus,
-                    "memory_mib": record.mem,
-                    "pid": record.pid,
-                    "mounts": record.mounts.len(),
-                    "ports": record.ports.len(),
-                    "created_at": record.created_at,
-                    "storage_gb": record.storage_gb,
-                    "overlay_gb": record.overlay_gb,
-                    "image": record.image,
-                    "entrypoint": record.entrypoint,
-                    "cmd": record.cmd,
-                    "ephemeral": record.ephemeral,
+                    "name": vm.name,
+                    "state": phase,
+                    "cpus": vm.spec.resources.cpus,
+                    "memory_mib": vm.spec.resources.memory_mib,
+                    "pid": pid,
+                    "mounts": vm.spec.mounts.len(),
+                    "ports": vm.spec.ports.len(),
+                    "created_at": created_at,
+                    "storage_gb": vm.spec.resources.storage_gib,
+                    "overlay_gb": vm.spec.resources.overlay_gib,
+                    "image": vm.spec.image,
+                    "entrypoint": vm.spec.entrypoint,
+                    "cmd": vm.spec.cmd,
                 });
                 if kind.include_network_in_json() {
                     obj.as_object_mut()
                         .unwrap()
-                        .insert("network".into(), serde_json::json!(record.network));
+                        .insert("network".into(), serde_json::json!(vm.spec.resources.network));
                 }
                 obj
             })
@@ -850,51 +683,67 @@ pub fn list_vms(kind: VmKind, verbose: bool, json: bool) -> smolvm::Result<()> {
         );
         println!("{}", "-".repeat(88));
 
-        for (name, record) in vms {
-            let actual_state = record.actual_state();
-            let state_display = if record.ephemeral {
-                format!("{} (eph)", actual_state)
-            } else {
-                actual_state.to_string()
-            };
-            let storage_gb = record.storage_gb.unwrap_or(DEFAULT_STORAGE_SIZE_GIB);
-            let overlay_gb = record.overlay_gb.unwrap_or(DEFAULT_OVERLAY_SIZE_GIB);
+        for vm in &vms {
+            let phase = vm
+                .status
+                .as_ref()
+                .map(|s| s.phase.to_string())
+                .unwrap_or_else(|| "unknown".into());
+            let storage_gb = vm
+                .spec
+                .resources
+                .storage_gib
+                .unwrap_or(DEFAULT_STORAGE_SIZE_GIB);
+            let overlay_gb = vm
+                .spec
+                .resources
+                .overlay_gib
+                .unwrap_or(DEFAULT_OVERLAY_SIZE_GIB);
             println!(
-                "{:<20} {:<12} {:>5} {:>10} {:>7} {:>7} {:>8} {:>8}",
-                truncate(name, 18),
-                state_display,
-                record.cpus,
-                format!("{} MiB", record.mem),
-                record.mounts.len(),
-                record.ports.len(),
+                "{:<20} {:<10} {:>5} {:>10} {:>7} {:>7} {:>8} {:>8}",
+                truncate(&vm.name, 18),
+                phase,
+                vm.spec.resources.cpus,
+                format!("{} MiB", vm.spec.resources.memory_mib),
+                vm.spec.mounts.len(),
+                vm.spec.ports.len(),
                 format!("{} GiB", storage_gb),
                 format!("{} GiB", overlay_gb),
             );
 
             if verbose {
-                if let Some(pid) = record.pid {
-                    println!("  PID: {}", pid);
+                if let Some(ref status) = vm.status {
+                    if let Some(pid) = status.pid {
+                        println!("  PID: {}", pid);
+                    }
                 }
-                for (host, guest, ro) in &record.mounts {
-                    let ro_str = if *ro { " (ro)" } else { "" };
-                    println!("  Mount: {} -> {}{}", host, guest, ro_str);
+                for m in &vm.spec.mounts {
+                    let ro_str = if m.read_only { " (ro)" } else { "" };
+                    println!(
+                        "  Mount: {} -> {}{}",
+                        m.source.display(),
+                        m.target.display(),
+                        ro_str
+                    );
                 }
-                for (host, guest) in &record.ports {
-                    println!("  Port: {} -> {}", host, guest);
+                for p in &vm.spec.ports {
+                    println!("  Port: {} -> {}", p.host, p.guest);
                 }
-                if kind.include_network_in_json() && record.network {
+                if kind.include_network_in_json() && vm.spec.resources.network {
                     println!("  Network: enabled");
                 }
-                for cmd in &record.init {
+                for cmd in &vm.spec.init {
                     println!("  Init: {}", cmd);
                 }
-                for (k, v) in &record.env {
+                for (k, v) in &vm.spec.env {
                     println!("  Env: {}={}", k, v);
                 }
-                if let Some(wd) = &record.workdir {
+                if let Some(ref wd) = vm.spec.workdir {
                     println!("  Workdir: {}", wd);
                 }
-                println!("  Created: {}", record.created_at);
+                if let Some(ref status) = vm.status {
+                    println!("  Created: {}", status.created_at);
+                }
                 println!();
             }
         }
@@ -907,118 +756,20 @@ pub fn list_vms(kind: VmKind, verbose: bool, json: bool) -> smolvm::Result<()> {
 // Resize
 // ============================================================================
 
-/// Resize a microVM's disk resources.
+/// Resize a VM's disk resources.
 ///
-/// The VM must be stopped before resizing. Only expansion is supported
-/// (no shrinking to prevent data loss).
+/// Delegates core resize logic to `smolvm::control::resize_vm`.
+/// CLI adds progress output.
 pub fn resize_vm(
     kind: VmKind,
     name: &str,
     new_storage_gb: Option<u64>,
     new_overlay_gb: Option<u64>,
 ) -> smolvm::Result<()> {
-    use smolvm::config::RecordState;
-    use smolvm::data::disk::{
-        Overlay, Storage, DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB,
-    };
-    use smolvm::db::SmolvmDb;
-    use smolvm::storage::expand_disk;
-
-    // Get VM record from database
-    let db = SmolvmDb::open()?;
-    let record = db
-        .get_vm(name)?
-        .ok_or_else(|| smolvm::Error::vm_not_found(name))?
-        .clone();
-
-    // Check state - VM must be stopped (Created state also allowed for never-started VMs)
-    let actual_state = record.actual_state();
-    match actual_state {
-        RecordState::Stopped | RecordState::Created => {} // OK to resize
-        _ => {
-            return Err(smolvm::Error::InvalidState {
-                expected: "stopped".into(),
-                actual: format!("{:?}", actual_state),
-            });
-        }
-    }
-
-    // Get current disk sizes (use defaults if not set)
-    let current_storage_gb = record.storage_gb.unwrap_or(DEFAULT_STORAGE_SIZE_GIB);
-    let current_overlay_gb = record.overlay_gb.unwrap_or(DEFAULT_OVERLAY_SIZE_GIB);
-
-    // Determine target sizes
-    let target_storage_gb = new_storage_gb.unwrap_or(current_storage_gb);
-    let target_overlay_gb = new_overlay_gb.unwrap_or(current_overlay_gb);
-
-    // Validate no shrinking
-    if target_storage_gb < current_storage_gb {
-        return Err(smolvm::Error::config(
-            "resize",
-            format!(
-                "storage disk cannot be shrunk from {} GiB to {} GiB. Only expanding is supported to prevent data loss.",
-                current_storage_gb, target_storage_gb
-            ),
-        ));
-    }
-    if target_overlay_gb < current_overlay_gb {
-        return Err(smolvm::Error::config(
-            "resize",
-            format!(
-                "overlay disk cannot be shrunk from {} GiB to {} GiB. Only expanding is supported to prevent data loss.",
-                current_overlay_gb, target_overlay_gb
-            ),
-        ));
-    }
-
-    // Get agent manager for disk paths
-    let manager = AgentManager::for_vm(name)
-        .map_err(|e| smolvm::Error::agent("get agent manager", e.to_string()))?;
-
-    // Print resize header
     println!("Resizing {} '{}'...", kind.label(), name);
 
-    // Expand storage disk if requested and changed
-    if let Some(storage_gb) = new_storage_gb {
-        if storage_gb > current_storage_gb {
-            print!(
-                "  Storage: {} GiB → {} GiB (expanding disk...)",
-                current_storage_gb, storage_gb
-            );
-            std::io::Write::flush(&mut std::io::stdout()).ok();
-
-            let storage_path = manager.storage_path();
-            expand_disk::<Storage>(storage_path, storage_gb)
-                .map_err(|e| smolvm::Error::storage("expand storage disk", e.to_string()))?;
-            println!(" done");
-        }
-    }
-
-    // Expand overlay disk if requested and changed
-    if let Some(overlay_gb) = new_overlay_gb {
-        if overlay_gb > current_overlay_gb {
-            print!(
-                "  Overlay: {} GiB → {} GiB (expanding disk...)",
-                current_overlay_gb, overlay_gb
-            );
-            std::io::Write::flush(&mut std::io::stdout()).ok();
-
-            let overlay_path = manager.overlay_path();
-            expand_disk::<Overlay>(overlay_path, overlay_gb)
-                .map_err(|e| smolvm::Error::storage("expand overlay disk", e.to_string()))?;
-            println!(" done");
-        }
-    }
-
-    // Update database record with new sizes
-    db.update_vm(name, |r| {
-        if let Some(s) = new_storage_gb {
-            r.storage_gb = Some(s);
-        }
-        if let Some(o) = new_overlay_gb {
-            r.overlay_gb = Some(o);
-        }
-    })?;
+    let db = SmolvmDb::open()?;
+    smolvm::control::resize_vm(&db, name, new_storage_gb, new_overlay_gb)?;
 
     println!();
     println!("{} '{}' resized successfully.", kind.display_name(), name);
