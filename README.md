@@ -40,6 +40,7 @@ smolvm machine create --net myvm
 smolvm machine start --name myvm
 smolvm machine exec --name myvm -- apk add sl
 smolvm machine exec --name myvm -it -- /bin/sh
+# try: sl, ls, uname -a — type 'exit' to leave
 smolvm machine stop --name myvm
 
 # Pack into a portable executable
@@ -73,6 +74,8 @@ Comparison
 | macOS native        | Yes | Via Docker VM | Yes (krunkit) | Yes | No | No |
 | Embeddable SDK      | Yes | No | No | No | No | No |
 | Portable artifacts  | `.smolmachine` | Images (need daemon) | No | No | No | No |
+
+Sources: [container isolation](https://www.docker.com/blog/understanding-docker-container-escapes/) · [containerd benchmark](https://github.com/containerd/containerd/issues/4482) · [QEMU boot time](https://wiki.qemu.org/Features/TCG) · [Firecracker](https://firecracker-microvm.github.io/) · [Kata Containers](https://katacontainers.io/) · [Kata boot time](https://github.com/kata-containers/kata-containers/issues/4292) · [Firecracker requires KVM](https://github.com/firecracker-microvm/firecracker/blob/main/docs/getting-started.md) · [Kata macOS support](https://github.com/kata-containers/kata-containers/issues/243)
 
 Platform Support
 ----------------

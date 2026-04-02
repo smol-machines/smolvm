@@ -8,15 +8,12 @@ mod cli;
 /// smolvm - build and run portable, self-contained virtual machines
 #[derive(Parser, Debug)]
 #[command(name = "smolvm")]
-#[command(about = "Build and run portable, self-contained virtual machines")]
 #[command(
-    long_about = "smolvm runs Linux microVMs on your machine using libkrun.\n\n\
-Quick start:\n  \
-smolvm machine create --net myvm\n  \
-smolvm machine start myvm\n  \
-smolvm machine exec --name myvm -it -- /bin/sh\n\n\
-For programmatic access:\n  \
-smolvm serve"
+    about = "Build and run portable, self-contained virtual machines",
+    after_help = "Agents: run `smolvm --help` for full documentation including CLI reference and Smolfile schema"
+)]
+#[command(
+    long_about = include_str!("../AGENTS.md")
 )]
 #[command(version)]
 struct Cli {
