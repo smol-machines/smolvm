@@ -20,6 +20,17 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
+# Millisecond timestamp using bash builtin (no subprocess overhead)
+now_ms() {
+    # EPOCHREALTIME gives seconds.microseconds — convert to milliseconds
+    local t="${EPOCHREALTIME}"
+    local secs="${t%%.*}"
+    local frac="${t#*.}"
+    # Pad/truncate fractional part to 3 digits (milliseconds)
+    frac="${frac:0:3}"
+    echo $(( secs * 1000 + 10#$frac ))
+}
+
 echo "========================================"
 echo "  smolvm microVM Startup Benchmark"
 echo "========================================"
@@ -28,18 +39,17 @@ echo "Iterations: $ITERATIONS"
 echo ""
 
 # Check if smolvm is available
-if ! command -v smolvm &> /dev/null; then
-    # Try local build
-    if [ -f "$PROJECT_ROOT/target/release/smolvm" ]; then
-        SMOLVM="$PROJECT_ROOT/target/release/smolvm"
-    elif [ -f "$PROJECT_ROOT/target/debug/smolvm" ]; then
-        SMOLVM="$PROJECT_ROOT/target/debug/smolvm"
-    else
-        echo -e "${RED}Error: smolvm not found. Build with 'cargo build --release'${NC}"
-        exit 1
-    fi
-else
+if [[ -n "${SMOLVM:-}" ]] && [[ -x "$SMOLVM" ]]; then
+    : # use provided SMOLVM
+elif command -v smolvm &> /dev/null; then
     SMOLVM="smolvm"
+elif [ -f "$PROJECT_ROOT/target/release/smolvm" ]; then
+    SMOLVM="$PROJECT_ROOT/target/release/smolvm"
+elif [ -f "$PROJECT_ROOT/target/debug/smolvm" ]; then
+    SMOLVM="$PROJECT_ROOT/target/debug/smolvm"
+else
+    echo -e "${RED}Error: smolvm not found. Build with 'cargo build --release'${NC}"
+    exit 1
 fi
 
 echo "Using: $SMOLVM"
@@ -50,12 +60,10 @@ cleanup() {
     echo ""
     echo "Cleaning up..."
     $SMOLVM machine stop 2>/dev/null || true
-    # Kill any orphaned smolvm processes
     pkill -f "smolvm-bin machine" 2>/dev/null || true
     pkill -f "smolvm machine start" 2>/dev/null || true
 }
 
-# Ensure cleanup runs on exit (normal or error)
 trap cleanup EXIT
 
 # Kill any existing smolvm processes before benchmarking
@@ -75,20 +83,15 @@ echo ""
 declare -a START_TIMES
 
 for i in $(seq 1 $ITERATIONS); do
-    # Ensure machine is stopped
     $SMOLVM machine stop 2>/dev/null || true
     sleep 0.5
 
-    # Measure VM startup time (machine start returns when agent is ready)
-    START_TIME=$(python3 -c "import time; print(time.time())")
-
+    START_TIME=$(now_ms)
     $SMOLVM machine start > /dev/null 2>&1
+    END_TIME=$(now_ms)
 
-    END_TIME=$(python3 -c "import time; print(time.time())")
-
-    DURATION=$(python3 -c "print(int(($END_TIME - $START_TIME) * 1000))")
+    DURATION=$(( END_TIME - START_TIME ))
     START_TIMES+=($DURATION)
-
     echo "  Run $i: ${DURATION}ms"
 done
 
@@ -103,68 +106,81 @@ echo ""
 declare -a PING_TIMES
 
 for i in $(seq 1 $ITERATIONS); do
-    # Ensure machine is stopped
     $SMOLVM machine stop 2>/dev/null || true
     sleep 0.5
 
-    # Measure from start to first successful command
-    START_TIME=$(python3 -c "import time; print(time.time())")
-
+    START_TIME=$(now_ms)
     $SMOLVM machine start > /dev/null 2>&1
-    $SMOLVM machine exec echo hello > /dev/null 2>&1
+    $SMOLVM machine exec -- echo hello > /dev/null 2>&1
+    END_TIME=$(now_ms)
 
-    END_TIME=$(python3 -c "import time; print(time.time())")
-
-    DURATION=$(python3 -c "print(int(($END_TIME - $START_TIME) * 1000))")
+    DURATION=$(( END_TIME - START_TIME ))
     PING_TIMES+=($DURATION)
-
     echo "  Run $i: ${DURATION}ms"
 done
 
 # ============================================
-# Results Summary
+# Results Summary (pure bash — no Python)
 # ============================================
+stats() {
+    local label="$1"
+    shift
+    local times=("$@")
+    local n=${#times[@]}
+    local sum=0 min=${times[0]} max=${times[0]}
+
+    for t in "${times[@]}"; do
+        (( sum += t ))
+        (( t < min )) && min=$t
+        (( t > max )) && max=$t
+    done
+
+    local avg=$(( sum / n ))
+    # Standard deviation (integer approximation)
+    local var_sum=0
+    for t in "${times[@]}"; do
+        local diff=$(( t - avg ))
+        (( var_sum += diff * diff ))
+    done
+    local variance=$(( var_sum / n ))
+    # Integer square root approximation
+    local std_dev=0
+    if (( variance > 0 )); then
+        std_dev=1
+        while (( std_dev * std_dev < variance )); do
+            (( std_dev++ ))
+        done
+    fi
+
+    echo "  $label:"
+    echo "    Min:     ${min}ms"
+    echo "    Max:     ${max}ms"
+    echo "    Average: ${avg}ms"
+    echo "    Std Dev: ~${std_dev}ms"
+    # Return average via global
+    _STAT_AVG=$avg
+}
+
 echo ""
 echo "========================================"
 echo "  Results Summary"
 echo "========================================"
+echo ""
 
-START_TIMES_STR=$(IFS=,; echo "${START_TIMES[*]}")
-PING_TIMES_STR=$(IFS=,; echo "${PING_TIMES[*]}")
+stats "VM Cold Start (machine start)" "${START_TIMES[@]}"
+START_AVG=$_STAT_AVG
 
-python3 << EOF
-start_times = [$START_TIMES_STR]
+echo ""
+stats "VM Start + First Command" "${PING_TIMES[@]}"
+PING_AVG=$_STAT_AVG
 
-ping_times = [$PING_TIMES_STR]
-
-def stats(times, label):
-    avg = sum(times) / len(times)
-    min_t = min(times)
-    max_t = max(times)
-    variance = sum((t - avg) ** 2 for t in times) / len(times)
-    std_dev = variance ** 0.5
-    print(f"  {label}:")
-    print(f"    Min:     {min_t}ms")
-    print(f"    Max:     {max_t}ms")
-    print(f"    Average: {avg:.1f}ms")
-    print(f"    Std Dev: {std_dev:.1f}ms")
-    return avg
-
-print("")
-start_avg = stats(start_times, "VM Cold Start (machine start)")
-print("")
-ping_avg = stats(ping_times, "VM Start + First Command")
-
-print("")
-print("----------------------------------------")
-print("Breakdown:")
-print("----------------------------------------")
-print(f"  VM boot to agent ready:  {start_avg:.0f}ms")
-print(f"  First command overhead:  {ping_avg - start_avg:.0f}ms")
-EOF
+echo ""
+echo "----------------------------------------"
+echo "Breakdown:"
+echo "----------------------------------------"
+echo "  VM boot to agent ready:  ${START_AVG}ms"
+echo "  First command overhead:  $(( PING_AVG - START_AVG ))ms"
 
 echo ""
 echo -e "${GREEN}Benchmark complete.${NC}"
 echo ""
-
-# Cleanup handled by trap
