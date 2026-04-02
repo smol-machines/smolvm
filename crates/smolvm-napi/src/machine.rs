@@ -3,6 +3,9 @@
 //! All blocking operations (start, exec, pull, stop) run on tokio's blocking
 //! thread pool to avoid blocking Node's event loop. The AgentManager and
 //! AgentClient are wrapped in Arc<Mutex<>> for safe cross-thread access.
+//!
+//! Lifecycle operations (new, stop, delete) now persist to SmolvmDb via the
+//! control layer, fixing the bug where SDK-created VMs were invisible to CLI/API.
 
 use std::sync::{Arc, Mutex};
 
@@ -10,6 +13,8 @@ use napi_derive::napi;
 
 use smolvm::agent::{AgentClient, AgentManager, HostMount, VmResources};
 use smolvm::data::network::PortMapping;
+use smolvm::data::vm::{MicroVm, VmSpec};
+use smolvm::db::SmolvmDb;
 
 use crate::error::IntoNapiResult;
 use crate::types::*;
@@ -36,6 +41,9 @@ pub struct NapiMachine {
 #[napi]
 impl NapiMachine {
     /// Create a new machine. Does not start the VM yet — call `start()`.
+    ///
+    /// Persists the VM to SmolvmDb so it's visible to CLI (`smolvm machine ls`)
+    /// and the HTTP API.
     #[napi(constructor)]
     pub fn new(config: MachineConfig) -> napi::Result<Self> {
         let mounts: Vec<HostMount> = config
@@ -62,6 +70,27 @@ impl NapiMachine {
             .map(|r| r.to_vm_resources())
             .unwrap_or_default();
 
+        // Persist to DB via control layer (fixes SDK visibility bug)
+        let vm = MicroVm {
+            name: config.name.clone(),
+            spec: VmSpec {
+                resources,
+                mounts: mounts.clone(),
+                ports: ports.clone(),
+                image: None,
+                entrypoint: Vec::new(),
+                cmd: Vec::new(),
+                env: Vec::new(),
+                workdir: None,
+                init: Vec::new(),
+            },
+            status: None,
+        };
+
+        let db = SmolvmDb::open().into_napi()?;
+        smolvm::control::create_vm(&db, vm).into_napi()?;
+
+        // Create AgentManager for runtime operations
         let manager = AgentManager::for_vm_with_sizes(
             &config.name,
             resources.storage_gib,
@@ -84,6 +113,10 @@ impl NapiMachine {
     /// Returns an error if no running VM is found with the given name.
     #[napi(factory)]
     pub fn connect(name: String) -> napi::Result<Self> {
+        // Verify VM exists in DB
+        let db = SmolvmDb::open().into_napi()?;
+        let vm = smolvm::control::get_vm(&db, &name).into_napi()?;
+
         let manager = AgentManager::for_vm(&name).into_napi()?;
 
         let connected = manager.try_connect_existing().is_some();
@@ -100,9 +133,9 @@ impl NapiMachine {
             name,
             manager: Arc::new(ManagerWrapper(manager)),
             client: Arc::new(Mutex::new(Some(client))),
-            mounts: Vec::new(),
-            ports: Vec::new(),
-            resources: VmResources::default(),
+            mounts: vm.spec.mounts,
+            ports: vm.spec.ports,
+            resources: vm.spec.resources,
         })
     }
 
@@ -132,6 +165,8 @@ impl NapiMachine {
 
     /// Start the machine VM. Boots via fork + libkrun, waits for agent ready,
     /// then connects the vsock client.
+    ///
+    /// Persists Running state to SmolvmDb.
     #[napi]
     pub async fn start(&self) -> napi::Result<()> {
         let manager = self.manager.clone();
@@ -147,6 +182,22 @@ impl NapiMachine {
         .await
         .map_err(|e| napi::Error::from_reason(format!("Task join error: {}", e)))?
         .into_napi()?;
+
+        // Persist running state to DB
+        let name = self.name.clone();
+        let pid = self.manager.0.child_pid();
+        tokio::task::spawn_blocking(move || {
+            if let Ok(db) = SmolvmDb::open() {
+                let pid_start_time = pid.and_then(smolvm::process::process_start_time);
+                let _ = db.update_vm(&name, |r| {
+                    r.state = smolvm::config::RecordState::Running;
+                    r.pid = pid;
+                    r.pid_start_time = pid_start_time;
+                });
+            }
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("Task join error: {}", e)))?;
 
         // Ensure we have a client connection
         let needs_connect = {
@@ -294,6 +345,8 @@ impl NapiMachine {
     }
 
     /// Stop the machine VM gracefully.
+    ///
+    /// Persists Stopped state to SmolvmDb.
     #[napi]
     pub async fn stop(&self) -> napi::Result<()> {
         // Drop the client first
@@ -308,24 +361,39 @@ impl NapiMachine {
         let manager = self.manager.clone();
         tokio::task::spawn_blocking(move || manager.0.stop().into_napi())
             .await
-            .map_err(|e| napi::Error::from_reason(format!("Task join error: {}", e)))?
+            .map_err(|e| napi::Error::from_reason(format!("Task join error: {}", e)))??;
+
+        // Persist stopped state to DB
+        let name = self.name.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Ok(db) = SmolvmDb::open() {
+                let _ = db.update_vm(&name, |r| {
+                    r.state = smolvm::config::RecordState::Stopped;
+                    r.pid = None;
+                    r.pid_start_time = None;
+                });
+            }
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("Task join error: {}", e)))?;
+
+        Ok(())
     }
 
-    /// Stop the machine and clean up all storage (disks, config).
+    /// Stop the machine and clean up all storage (disks, config, DB record).
     #[napi]
     pub async fn delete(&self) -> napi::Result<()> {
         self.stop().await?;
 
-        let data_dir = smolvm::agent::vm_data_dir(&self.name);
-        if data_dir.exists() {
-            std::fs::remove_dir_all(&data_dir).map_err(|e| {
-                napi::Error::from_reason(format!(
-                    "Failed to delete VM data at {}: {}",
-                    data_dir.display(),
-                    e
-                ))
-            })?;
-        }
+        // Delete via control layer (removes DB record + data directory)
+        let name = self.name.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Ok(db) = SmolvmDb::open() {
+                let _ = smolvm::control::delete_vm(&db, &name, true);
+            }
+        })
+        .await
+        .map_err(|e| napi::Error::from_reason(format!("Task join error: {}", e)))?;
 
         Ok(())
     }
