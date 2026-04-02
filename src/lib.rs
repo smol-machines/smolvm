@@ -62,6 +62,8 @@
 #![warn(clippy::all)]
 
 pub mod api;
+/// Public-facing VM lifecycle operations.
+pub mod control;
 /// Canonical shared data models and constants used across adapters.
 pub mod data;
 pub mod dns_filter;
