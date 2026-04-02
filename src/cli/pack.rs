@@ -232,6 +232,7 @@ impl PackCreateCmd {
                 network: true,
                 storage_gib: None,
                 overlay_gib: None,
+                allowed_cidrs: None,
             },
         )?;
         let mut guard = PackVmGuard {

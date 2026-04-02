@@ -84,6 +84,10 @@ pub struct ResourceSpec {
     #[serde(default)]
     #[schema(example = 10)]
     pub overlay_gb: Option<u64>,
+    /// Allowed egress CIDR ranges. When set, only these IP ranges are reachable.
+    /// Omit for unrestricted egress. Empty list denies all egress.
+    #[serde(default)]
+    pub allowed_cidrs: Option<Vec<String>>,
 }
 
 // ============================================================================
@@ -430,6 +434,9 @@ pub struct CreateMachineRequest {
     /// Overlay disk size in GiB (default: 10).
     #[serde(default)]
     pub overlay_gb: Option<u64>,
+    /// Allowed egress CIDR ranges.
+    #[serde(default)]
+    pub allowed_cidrs: Option<Vec<String>>,
 }
 
 /// Request to execute a command in a machine.

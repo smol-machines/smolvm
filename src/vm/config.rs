@@ -141,6 +141,9 @@ pub enum NetworkPolicy {
     Egress {
         /// Custom DNS server (default: inherit from host).
         dns: Option<IpAddr>,
+        /// If set, only these CIDR ranges are reachable. Omit for unrestricted.
+        #[serde(default)]
+        allowed_cidrs: Option<Vec<String>>,
     },
 }
 
@@ -454,7 +457,10 @@ mod tests {
             .id(VmId::new("my-vm"))
             .memory(1024)
             .cpus(2)
-            .network(NetworkPolicy::Egress { dns: None })
+            .network(NetworkPolicy::Egress {
+                dns: None,
+                allowed_cidrs: None,
+            })
             .mount(HostMount {
                 source: "/host".into(),
                 target: "/guest".into(),
@@ -483,9 +489,28 @@ mod tests {
 
         let egress = NetworkPolicy::Egress {
             dns: Some("8.8.8.8".parse().unwrap()),
+            allowed_cidrs: None,
         };
         let json = serde_json::to_string(&egress).unwrap();
         assert!(json.contains("egress"));
         assert!(json.contains("8.8.8.8"));
+    }
+
+    #[test]
+    fn test_network_policy_allowed_cidrs_roundtrip() {
+        let policy = NetworkPolicy::Egress {
+            dns: None,
+            allowed_cidrs: Some(vec!["10.0.0.0/8".to_string(), "1.1.1.1/32".to_string()]),
+        };
+        let json = serde_json::to_string(&policy).unwrap();
+        let roundtripped: NetworkPolicy = serde_json::from_str(&json).unwrap();
+        match roundtripped {
+            NetworkPolicy::Egress { dns, allowed_cidrs } => {
+                assert!(dns.is_none());
+                let cidrs = allowed_cidrs.expect("allowed_cidrs should be Some");
+                assert_eq!(cidrs, vec!["10.0.0.0/8", "1.1.1.1/32"]);
+            }
+            _ => panic!("expected Egress variant"),
+        }
     }
 }

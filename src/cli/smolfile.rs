@@ -29,6 +29,7 @@
 //! memory = 2048
 //! ```
 
+use crate::cli::parsers::parse_cidr;
 use crate::cli::vm_common::CreateVmParams;
 use serde::Deserialize;
 use smolvm::data::network::PortMapping;
@@ -67,6 +68,9 @@ pub struct Smolfile {
     pub net: Option<bool>,
     pub storage: Option<u64>,
     pub overlay: Option<u64>,
+    /// Allowed egress CIDR ranges (e.g., ["10.0.0.0/8", "1.1.1.1"]).
+    #[serde(default)]
+    pub allowed_cidrs: Vec<String>,
 
     // Legacy top-level fields (will move to [dev] in Step 4)
     #[serde(default)]
@@ -204,10 +208,14 @@ pub fn build_create_params(
     smolfile_path: Option<PathBuf>,
     cli_storage_gb: Option<u64>,
     cli_overlay_gb: Option<u64>,
+    cli_allow_cidr: Vec<String>,
 ) -> smolvm::Result<CreateVmParams> {
+    let cidrs_to_option = |v: Vec<String>| if v.is_empty() { None } else { Some(v) };
+
     let sf = match smolfile_path {
         Some(path) => load(&path)?,
         None => {
+            let net = cli_net || !cli_allow_cidr.is_empty();
             return Ok(CreateVmParams {
                 name,
                 image: cli_image,
@@ -217,12 +225,13 @@ pub fn build_create_params(
                 mem: cli_mem,
                 volume: cli_volume,
                 port: cli_port,
-                net: cli_net,
+                net,
                 init: cli_init,
                 env: cli_env,
                 workdir: cli_workdir,
                 storage_gb: cli_storage_gb,
                 overlay_gb: cli_overlay_gb,
+                allowed_cidrs: cidrs_to_option(cli_allow_cidr),
             });
         }
     };
@@ -310,6 +319,22 @@ pub fn build_create_params(
     let storage_gb = cli_storage_gb.or(sf.storage);
     let overlay_gb = cli_overlay_gb.or(sf.overlay);
 
+    // Merge allowed_cidrs: Smolfile first (validated), CLI extends
+    let mut allowed_cidrs_vec: Vec<String> = sf
+        .allowed_cidrs
+        .iter()
+        .map(|s| parse_cidr(s))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| smolvm::Error::config("smolfile allowed_cidrs", e))?;
+    allowed_cidrs_vec.extend(cli_allow_cidr);
+    // --allow-cidr implies --net
+    let net = if !allowed_cidrs_vec.is_empty() {
+        true
+    } else {
+        net
+    };
+    let allowed_cidrs = cidrs_to_option(allowed_cidrs_vec);
+
     Ok(CreateVmParams {
         name,
         image,
@@ -325,6 +350,7 @@ pub fn build_create_params(
         workdir,
         storage_gb,
         overlay_gb,
+        allowed_cidrs,
     })
 }
 

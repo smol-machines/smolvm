@@ -123,7 +123,7 @@ impl LibkrunVm {
         inject_init_krun(&rootfs_path)?;
 
         // Setup DNS if network egress is enabled
-        if let NetworkPolicy::Egress { dns } = &config.network {
+        if let NetworkPolicy::Egress { dns, .. } = &config.network {
             setup_dns(&rootfs_path, dns.map(|ip| ip.to_string()).as_deref())?;
         }
 

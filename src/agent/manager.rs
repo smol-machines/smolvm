@@ -536,7 +536,7 @@ impl AgentManager {
             version: RunningVmConfig::CURRENT_VERSION,
             mounts: mounts.to_vec(),
             ports: ports.to_vec(),
-            resources: *resources,
+            resources: resources.clone(),
         };
         match serde_json::to_string(&config) {
             Ok(json) => {
@@ -906,6 +906,7 @@ impl AgentManager {
         ports: Vec<PortMapping>,
         resources: VmResources,
     ) -> Result<()> {
+        let resources_for_fork = resources.clone();
         self.prepare_for_launch(&mounts, &ports, resources)?;
 
         // Install SIGCHLD handler to automatically reap zombie children.
@@ -923,12 +924,13 @@ impl AgentManager {
         let overlay_disk_path = self.overlay_disk.path().to_path_buf();
         let vsock_socket = self.vsock_socket.clone();
         let console_log = self.console_log.clone();
-        let storage_size_gb = resources
+        let storage_size_gb = resources_for_fork
             .storage_gib
             .unwrap_or(crate::storage::DEFAULT_STORAGE_SIZE_GIB);
-        let overlay_size_gb = resources
+        let overlay_size_gb = resources_for_fork
             .overlay_gib
             .unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GIB);
+        let resources_for_finalize = resources_for_fork.clone();
 
         // Fork child process. The child becomes a session leader so the VM
         // survives if the parent process is killed.
@@ -988,7 +990,7 @@ impl AgentManager {
                 console_log.as_deref(),
                 &mounts,
                 &ports,
-                resources,
+                resources_for_fork,
             );
 
             // If we get here, something went wrong (stderr is /dev/null,
@@ -1012,7 +1014,7 @@ impl AgentManager {
             child_pid,
             &mounts_for_finalize,
             &ports_for_finalize,
-            &resources,
+            &resources_for_finalize,
         )
     }
 
@@ -1034,12 +1036,13 @@ impl AgentManager {
     ) -> Result<()> {
         use super::boot_config::BootConfig;
 
+        let resources_for_config = resources.clone();
         self.prepare_for_launch(&mounts, &ports, resources)?;
 
-        let storage_size_gb = resources
+        let storage_size_gb = resources_for_config
             .storage_gib
             .unwrap_or(crate::storage::DEFAULT_STORAGE_SIZE_GIB);
-        let overlay_size_gb = resources
+        let overlay_size_gb = resources_for_config
             .overlay_gib
             .unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GIB);
 
@@ -1055,7 +1058,7 @@ impl AgentManager {
             overlay_size_gb,
             mounts: mounts.clone(),
             ports: ports.clone(),
-            resources,
+            resources: resources_for_config.clone(),
         };
         let config_path = self
             .storage_disk
@@ -1082,7 +1085,7 @@ impl AgentManager {
         let child_pid = child.id() as i32;
         tracing::debug!(pid = child_pid, "spawned boot subprocess");
 
-        self.finalize_launch(child_pid, &mounts, &ports, &resources)
+        self.finalize_launch(child_pid, &mounts, &ports, &resources_for_config)
     }
 
     /// Like `ensure_running_with_full_config` but uses subprocess launch.

@@ -4,7 +4,7 @@ pub const DEFAULT_MICROVM_CPU_COUNT: u8 = 1;
 pub const DEFAULT_MICROVM_MEMORY_MIB: u32 = 512;
 
 /// Resources available to a micro vm.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct VmResources {
     /// Number of vCPUs.
     pub cpus: u8,
@@ -16,6 +16,9 @@ pub struct VmResources {
     pub storage_gib: Option<u64>,
     /// Overlay disk size in GiB (None = default 10 GiB).
     pub overlay_gib: Option<u64>,
+    /// Allowed egress CIDR ranges. None = unrestricted, Some([]) = deny all.
+    #[serde(default)]
+    pub allowed_cidrs: Option<Vec<String>>,
 }
 
 impl Default for VmResources {
@@ -26,6 +29,7 @@ impl Default for VmResources {
             network: false,
             storage_gib: None,
             overlay_gib: None,
+            allowed_cidrs: None,
         }
     }
 }

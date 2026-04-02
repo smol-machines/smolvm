@@ -175,6 +175,7 @@ pub struct CreateVmParams {
     pub workdir: Option<String>,
     pub storage_gb: Option<u64>,
     pub overlay_gb: Option<u64>,
+    pub allowed_cidrs: Option<Vec<String>>,
 }
 
 /// Maximum length for machine names.
@@ -289,6 +290,7 @@ pub fn create_vm(kind: VmKind, params: CreateVmParams) -> smolvm::Result<()> {
     record.workdir = params.workdir.clone();
     record.storage_gb = params.storage_gb;
     record.overlay_gb = params.overlay_gb;
+    record.allowed_cidrs = params.allowed_cidrs.clone();
     record.image = params.image.clone();
     record.entrypoint = params.entrypoint.clone();
     record.cmd = params.cmd.clone();

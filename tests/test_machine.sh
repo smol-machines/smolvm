@@ -340,6 +340,82 @@ test_machine_network_multiple_dns_lookups() {
 }
 
 # =============================================================================
+# Egress Policy (--allow-cidr / --outbound-localhost-only)
+# Tests verify CIDR-based egress restrictions enforced at the TSI layer.
+# =============================================================================
+
+test_machine_egress_allow_cidr_permitted() {
+    local vm_name="egress-allow-test-$$"
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+
+    # Create VM allowing only Cloudflare DNS
+    $SMOLVM machine create "$vm_name" --allow-cidr 1.1.1.1/32 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+
+    # DNS lookup to allowed IP should succeed
+    local output exit_code=0
+    output=$($SMOLVM machine exec --name "$vm_name" -- nslookup cloudflare.com 1.1.1.1 2>&1) || exit_code=$?
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    ensure_data_dir_deleted "$vm_name"
+
+    [[ $exit_code -eq 0 ]] && [[ "$output" == *"Address"* ]]
+}
+
+test_machine_egress_allow_cidr_blocked() {
+    local vm_name="egress-block-test-$$"
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+
+    # Create VM allowing only private range + auto-included DNS (1.1.1.1).
+    # Test with 8.8.8.8 which is NOT in the allowlist.
+    $SMOLVM machine create "$vm_name" --allow-cidr 10.0.0.0/8 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+
+    local exit_code=0
+    $SMOLVM machine exec --name "$vm_name" -- nslookup cloudflare.com 8.8.8.8 2>&1 || exit_code=$?
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    ensure_data_dir_deleted "$vm_name"
+
+    [[ $exit_code -ne 0 ]]
+}
+
+test_machine_egress_outbound_localhost_only() {
+    local vm_name="egress-localhost-test-$$"
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+
+    $SMOLVM machine create "$vm_name" --outbound-localhost-only 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+
+    local exit_code=0
+    $SMOLVM machine exec --name "$vm_name" -- nslookup cloudflare.com 8.8.8.8 2>&1 || exit_code=$?
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    ensure_data_dir_deleted "$vm_name"
+
+    [[ $exit_code -ne 0 ]]
+}
+
+test_machine_egress_invalid_cidr_rejected() {
+    local vm_name="egress-invalid-test-$$"
+    local output exit_code=0
+    output=$($SMOLVM machine create "$vm_name" --allow-cidr "not-a-cidr" 2>&1) || exit_code=$?
+
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+
+    [[ $exit_code -ne 0 ]] && [[ "$output" == *"invalid"* ]]
+}
+
+# =============================================================================
 # Persistent Rootfs (Overlay)
 # Tests verify that the overlayfs root is active and persists across reboots.
 # =============================================================================
@@ -774,6 +850,10 @@ run_test "DB default VM appears in list on start" test_db_default_vm_appears_in_
 run_test "DB default VM state transitions" test_db_default_vm_state_transitions || true
 run_test "Network: disabled by default" test_machine_network_disabled_by_default || true
 run_test "Network: DNS resolution" test_machine_network_dns_resolution || true
+run_test "Egress: allow-cidr permits matching traffic" test_machine_egress_allow_cidr_permitted || true
+run_test "Egress: allow-cidr blocks non-matching traffic" test_machine_egress_allow_cidr_blocked || true
+run_test "Egress: --outbound-localhost-only blocks external" test_machine_egress_outbound_localhost_only || true
+run_test "Egress: invalid CIDR rejected at create" test_machine_egress_invalid_cidr_rejected || true
 run_test "Overlay: root is overlayfs" test_machine_overlay_root_active || true
 run_test "Overlay: rootfs persists across reboot" test_machine_rootfs_persists_across_reboot || true
 run_test "Volume: mount visible to exec" test_machine_volume_mount_visible_to_exec || true

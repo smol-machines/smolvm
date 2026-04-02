@@ -227,7 +227,11 @@ pub fn launch_agent_vm(
             ));
         }
 
-        if resources.network || !port_mappings.is_empty() {
+        let has_egress_policy = resources
+            .allowed_cidrs
+            .as_ref()
+            .is_some_and(|c| !c.is_empty());
+        if resources.network || !port_mappings.is_empty() || has_egress_policy {
             // Add vsock with TSI HIJACK_INET flag to enable network access
             if krun_add_vsock(ctx, KRUN_TSI_HIJACK_INET) < 0 {
                 krun_free_ctx(ctx);
@@ -252,6 +256,55 @@ pub fn launch_agent_vm(
             if krun_set_port_map(ctx, port_ptrs.as_ptr()) < 0 {
                 krun_free_ctx(ctx);
                 return Err(Error::agent("set port mapping", "krun_set_port_map failed"));
+            }
+
+            // Set egress policy (CIDR-based filtering) if specified.
+            // Resolved via dlsym at runtime for backwards compatibility.
+            if let Some(ref cidrs) = resources.allowed_cidrs {
+                type SetEgressPolicyFn =
+                    unsafe extern "C" fn(u32, *const *const libc::c_char) -> i32;
+
+                let sym_name =
+                    CString::new("krun_set_egress_policy").expect("symbol name is static");
+                let sym = libc::dlsym(libc::RTLD_DEFAULT, sym_name.as_ptr());
+                if sym.is_null() {
+                    krun_free_ctx(ctx);
+                    return Err(Error::agent(
+                        "set egress policy",
+                        "libkrun does not support egress policy (krun_set_egress_policy not found). \
+                         Update libkrun or remove --allow-cidr flags.",
+                    ));
+                }
+                #[allow(clippy::missing_transmute_annotations)]
+                let set_egress: SetEgressPolicyFn = std::mem::transmute(sym);
+
+                // Auto-include DNS server so DNS resolution doesn't silently break.
+                let dns_ip = crate::data::network::DEFAULT_DNS;
+                let mut all_cidrs = cidrs.clone();
+                if !cidrs_contain_ip(&all_cidrs, dns_ip) {
+                    all_cidrs.push(format!("{}/32", dns_ip));
+                }
+
+                let cidr_cstrings: Vec<CString> = all_cidrs
+                    .iter()
+                    .map(|c| CString::new(c.as_str()).expect("CIDR cannot contain null bytes"))
+                    .collect();
+                let mut cidr_ptrs: Vec<*const libc::c_char> =
+                    cidr_cstrings.iter().map(|s| s.as_ptr()).collect();
+                cidr_ptrs.push(std::ptr::null());
+
+                if set_egress(ctx, cidr_ptrs.as_ptr()) < 0 {
+                    krun_free_ctx(ctx);
+                    return Err(Error::agent(
+                        "set egress policy",
+                        "krun_set_egress_policy failed",
+                    ));
+                }
+
+                tracing::debug!(
+                    cidr_count = all_cidrs.len(),
+                    "configured egress policy with CIDR filtering"
+                );
             }
 
             tracing::debug!(
@@ -439,6 +492,27 @@ fn path_to_cstring(path: &Path) -> Result<CString> {
         .map_err(|_| Error::agent("convert path", "path contains null byte"))
 }
 
+/// Check if any CIDR in the list already covers the given IP address.
+///
+/// Simple check for exact IP, /32, or /0 wildcard — sufficient for
+/// the DNS auto-include use case.
+fn cidrs_contain_ip(cidrs: &[String], ip: &str) -> bool {
+    for cidr in cidrs {
+        if cidr == ip || cidr == &format!("{}/32", ip) {
+            return true;
+        }
+        if cidr.ends_with("/0") {
+            return true;
+        }
+        if let Some(prefix) = cidr.split('/').next() {
+            if prefix == ip {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Raise file descriptor limits (required by libkrun).
 fn raise_fd_limits() {
     unsafe {
@@ -451,5 +525,50 @@ fn raise_fd_limits() {
             limit.rlim_cur = limit.rlim_max;
             libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cidrs_contain_ip() {
+        assert!(cidrs_contain_ip(&["1.1.1.1".into()], "1.1.1.1"));
+        assert!(cidrs_contain_ip(&["1.1.1.1/32".into()], "1.1.1.1"));
+        assert!(cidrs_contain_ip(&["0.0.0.0/0".into()], "8.8.8.8"));
+        assert!(!cidrs_contain_ip(&["10.0.0.0/8".into()], "1.1.1.1"));
+        assert!(cidrs_contain_ip(
+            &["10.0.0.0/8".into(), "1.1.1.1/32".into()],
+            "1.1.1.1"
+        ));
+        assert!(!cidrs_contain_ip(&[], "1.1.1.1"));
+    }
+
+    #[test]
+    fn test_cidrs_dns_auto_include() {
+        let cidrs = vec!["10.0.0.0/8".to_string()];
+        let dns_ip = crate::data::network::DEFAULT_DNS;
+
+        let mut all_cidrs = cidrs.clone();
+        if !cidrs_contain_ip(&all_cidrs, dns_ip) {
+            all_cidrs.push(format!("{}/32", dns_ip));
+        }
+
+        assert_eq!(all_cidrs.len(), 2);
+        assert!(all_cidrs.contains(&"1.1.1.1/32".to_string()));
+    }
+
+    #[test]
+    fn test_cidrs_dns_not_duplicated() {
+        let cidrs = vec!["10.0.0.0/8".to_string(), "1.1.1.1/32".to_string()];
+        let dns_ip = crate::data::network::DEFAULT_DNS;
+
+        let mut all_cidrs = cidrs.clone();
+        if !cidrs_contain_ip(&all_cidrs, dns_ip) {
+            all_cidrs.push(format!("{}/32", dns_ip));
+        }
+
+        assert_eq!(all_cidrs.len(), 2);
     }
 }

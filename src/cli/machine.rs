@@ -11,7 +11,9 @@
 
 use crate::cli::flush_output;
 use crate::cli::format_bytes;
-use crate::cli::parsers::{mounts_to_virtiofs_bindings, parse_duration, parse_env_list};
+use crate::cli::parsers::{
+    mounts_to_virtiofs_bindings, parse_cidr, parse_duration, parse_env_list,
+};
 use crate::cli::vm_common::{self, DeleteVmOptions, VmKind};
 use clap::{Args, Subcommand};
 use smolvm::agent::{docker_config_mount, AgentClient, AgentManager, RunConfig, VmResources};
@@ -164,6 +166,14 @@ pub struct RunCmd {
     #[arg(long, help_heading = "Network")]
     pub net: bool,
 
+    /// Allow egress to specific CIDR range (can be used multiple times, implies --net)
+    #[arg(long = "allow-cidr", value_parser = parse_cidr, value_name = "CIDR", help_heading = "Network")]
+    pub allow_cidr: Vec<String>,
+
+    /// Restrict outbound to localhost only (implies --net)
+    #[arg(long, help_heading = "Network")]
+    pub outbound_localhost_only: bool,
+
     /// Number of virtual CPUs
     #[arg(long, default_value_t = DEFAULT_MICROVM_CPU_COUNT, value_name = "N", help_heading = "Resources")]
     pub cpus: u8,
@@ -198,6 +208,13 @@ impl RunCmd {
     pub fn run(self) -> smolvm::Result<()> {
         use smolvm::Error;
 
+        let mut cli_allow_cidrs = self.allow_cidr;
+        if self.outbound_localhost_only {
+            cli_allow_cidrs.push("127.0.0.0/8".to_string());
+            cli_allow_cidrs.push("::1/128".to_string());
+        }
+        let net = self.net || !cli_allow_cidrs.is_empty();
+
         let params = crate::cli::smolfile::build_create_params(
             "default".to_string(),
             Some(self.image.clone()),
@@ -207,13 +224,14 @@ impl RunCmd {
             self.mem,
             self.volume,
             self.port,
-            self.net,
+            net,
             vec![],
             self.env,
             self.workdir,
             self.smolfile,
             self.storage,
             self.overlay,
+            cli_allow_cidrs,
         )?;
 
         let mut mounts = HostMount::parse(&params.volume)?;
@@ -233,6 +251,7 @@ impl RunCmd {
             network: params.net,
             storage_gib: params.storage_gb,
             overlay_gib: params.overlay_gb,
+            allowed_cidrs: params.allowed_cidrs.clone(),
         };
 
         let manager = AgentManager::new_default_with_sizes(params.storage_gb, params.overlay_gb)
@@ -500,6 +519,14 @@ pub struct CreateCmd {
     #[arg(long)]
     pub net: bool,
 
+    /// Allow egress to specific CIDR range (can be used multiple times, implies --net)
+    #[arg(long = "allow-cidr", value_parser = parse_cidr, value_name = "CIDR")]
+    pub allow_cidr: Vec<String>,
+
+    /// Restrict outbound to localhost only (implies --net)
+    #[arg(long)]
+    pub outbound_localhost_only: bool,
+
     /// Run command on every VM start (can be used multiple times)
     #[arg(long = "init", value_name = "COMMAND")]
     pub init: Vec<String>,
@@ -519,6 +546,13 @@ pub struct CreateCmd {
 
 impl CreateCmd {
     pub fn run(self) -> smolvm::Result<()> {
+        let mut cli_allow_cidrs = self.allow_cidr;
+        if self.outbound_localhost_only {
+            cli_allow_cidrs.push("127.0.0.0/8".to_string());
+            cli_allow_cidrs.push("::1/128".to_string());
+        }
+        let net = self.net || !cli_allow_cidrs.is_empty();
+
         let params = crate::cli::smolfile::build_create_params(
             self.name,
             None,   // image: from Smolfile only
@@ -528,13 +562,14 @@ impl CreateCmd {
             self.mem,
             self.volume,
             self.port,
-            self.net,
+            net,
             self.init,
             self.env,
             self.workdir,
             self.smolfile,
             self.storage,
             self.overlay,
+            cli_allow_cidrs,
         )?;
         vm_common::create_vm(KIND, params)
     }

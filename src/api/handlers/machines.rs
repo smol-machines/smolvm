@@ -252,6 +252,7 @@ pub async fn create_machine(
         network: Some(req.network),
         storage_gb: req.storage_gb,
         overlay_gb: req.overlay_gb,
+        allowed_cidrs: req.allowed_cidrs.clone(),
     };
 
     // Complete registration: persists to DB + registers in ApiState

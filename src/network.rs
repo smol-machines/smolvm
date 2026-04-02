@@ -10,7 +10,7 @@ use std::net::IpAddr;
 pub fn get_dns_server(policy: &NetworkPolicy) -> Option<IpAddr> {
     match policy {
         NetworkPolicy::None => None,
-        NetworkPolicy::Egress { dns } => Some(dns.unwrap_or(DEFAULT_DNS_ADDR)),
+        NetworkPolicy::Egress { dns, .. } => Some(dns.unwrap_or(DEFAULT_DNS_ADDR)),
     }
 }
 
@@ -24,12 +24,20 @@ mod tests {
         assert!(get_dns_server(&NetworkPolicy::None).is_none());
 
         // Egress with default DNS
-        let dns = get_dns_server(&NetworkPolicy::Egress { dns: None }).unwrap();
+        let dns = get_dns_server(&NetworkPolicy::Egress {
+            dns: None,
+            allowed_cidrs: None,
+        })
+        .unwrap();
         assert_eq!(dns.to_string(), crate::data::network::DEFAULT_DNS);
 
         // Egress with custom DNS
         let custom: IpAddr = "8.8.8.8".parse().unwrap();
-        let dns = get_dns_server(&NetworkPolicy::Egress { dns: Some(custom) }).unwrap();
+        let dns = get_dns_server(&NetworkPolicy::Egress {
+            dns: Some(custom),
+            allowed_cidrs: None,
+        })
+        .unwrap();
         assert_eq!(dns.to_string(), "8.8.8.8");
     }
 }

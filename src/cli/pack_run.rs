@@ -319,6 +319,7 @@ impl PackRunCmd {
             network: self.net || !self.port.is_empty(),
             storage_gib: self.storage,
             overlay_gib: self.overlay,
+            allowed_cidrs: None,
         };
 
         // Build packed mounts for the launcher
@@ -1004,6 +1005,7 @@ fn run_from_cache(
         network: cli.net || !cli.port.is_empty(),
         storage_gib: cli.storage,
         overlay_gib: cli.overlay,
+        allowed_cidrs: None,
     };
 
     let packed_mounts = mounts_to_packed(&mounts);
@@ -1331,6 +1333,7 @@ fn daemon_start(mode: &PackedMode, cli: &PackedCli) -> smolvm::Result<()> {
         network: cli.net || !cli.port.is_empty(),
         storage_gib: cli.storage,
         overlay_gib: cli.overlay,
+        allowed_cidrs: None,
     };
 
     let packed_mounts = mounts_to_packed(&mounts);

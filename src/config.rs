@@ -343,6 +343,10 @@ pub struct VmRecord {
     #[serde(default)]
     pub overlay_gb: Option<u64>,
 
+    /// Allowed egress CIDR ranges. None = unrestricted, Some([]) = deny all.
+    #[serde(default)]
+    pub allowed_cidrs: Option<Vec<String>>,
+
     /// OCI image for auto-container creation on start.
     #[serde(default)]
     pub image: Option<String>,
@@ -392,6 +396,7 @@ impl VmRecord {
             workdir: None,
             storage_gb: None,
             overlay_gb: None,
+            allowed_cidrs: None,
             image: None,
             entrypoint: Vec::new(),
             cmd: Vec::new(),
@@ -426,6 +431,7 @@ impl VmRecord {
             workdir: None,
             storage_gb: None,
             overlay_gb: None,
+            allowed_cidrs: None,
             image: None,
             entrypoint: Vec::new(),
             cmd: Vec::new(),
@@ -485,6 +491,7 @@ impl VmRecord {
             network: self.network,
             storage_gib: self.storage_gb,
             overlay_gib: self.overlay_gb,
+            allowed_cidrs: self.allowed_cidrs.clone(),
         }
     }
 }

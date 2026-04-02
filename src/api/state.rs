@@ -191,6 +191,7 @@ impl ApiState {
                 network: Some(record.network),
                 storage_gb: record.storage_gb,
                 overlay_gb: record.overlay_gb,
+                allowed_cidrs: record.allowed_cidrs.clone(),
             };
 
             // Create AgentManager and try to reconnect
@@ -723,6 +724,7 @@ pub fn resource_spec_to_vm_resources(spec: &ResourceSpec, network: bool) -> VmRe
         network,
         storage_gib: spec.storage_gb,
         overlay_gib: spec.overlay_gb,
+        allowed_cidrs: spec.allowed_cidrs.clone(),
     }
 }
 
@@ -734,6 +736,7 @@ pub fn vm_resources_to_spec(res: VmResources) -> ResourceSpec {
         network: Some(res.network),
         storage_gb: res.storage_gib,
         overlay_gb: res.overlay_gib,
+        allowed_cidrs: res.allowed_cidrs,
     }
 }
 
@@ -827,6 +830,7 @@ mod tests {
             network: None,
             storage_gb: None,
             overlay_gb: None,
+            allowed_cidrs: None,
         };
         let res = resource_spec_to_vm_resources(&spec, false);
         assert_eq!(res.cpus, DEFAULT_MICROVM_CPU_COUNT);
