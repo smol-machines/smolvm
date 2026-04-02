@@ -67,6 +67,7 @@ pub mod config;
 /// Canonical shared data models and constants used across adapters.
 pub mod data;
 pub mod db;
+mod disk_utils;
 pub mod dns_filter;
 pub mod dns_filter_listener;
 pub mod log_rotation;
@@ -74,6 +75,7 @@ pub mod network;
 pub mod platform;
 pub mod process;
 pub mod registry;
+/// Persistent VM disk management.
 pub mod storage;
 pub mod util;
 pub mod vm;
