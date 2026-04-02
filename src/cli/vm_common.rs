@@ -11,8 +11,8 @@ use smolvm::config::{RecordState, SmolvmConfig, VmRecord};
 use smolvm::data::network::PortMapping;
 use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
 use smolvm::data::storage::HostMount;
+use smolvm::data::storage::{DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
 use smolvm::db::SmolvmDb;
-use smolvm::storage::{DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
 
 // ============================================================================
 // VmKind
@@ -906,8 +906,9 @@ pub fn resize_vm(
     new_overlay_gb: Option<u64>,
 ) -> smolvm::Result<()> {
     use smolvm::config::RecordState;
+    use smolvm::data::storage::{DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
     use smolvm::db::SmolvmDb;
-    use smolvm::storage::{expand_disk, DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
+    use smolvm::storage::{expand_disk, Overlay, Storage};
 
     // Get VM record from database
     let db = SmolvmDb::open()?;
@@ -973,7 +974,7 @@ pub fn resize_vm(
             std::io::Write::flush(&mut std::io::stdout()).ok();
 
             let storage_path = manager.storage_path();
-            expand_disk(storage_path, storage_gb, "storage")
+            expand_disk::<Storage>(storage_path, storage_gb)
                 .map_err(|e| smolvm::Error::storage("expand storage disk", e.to_string()))?;
             println!(" done");
         }
@@ -989,7 +990,7 @@ pub fn resize_vm(
             std::io::Write::flush(&mut std::io::stdout()).ok();
 
             let overlay_path = manager.overlay_path();
-            expand_disk(overlay_path, overlay_gb, "overlay")
+            expand_disk::<Overlay>(overlay_path, overlay_gb)
                 .map_err(|e| smolvm::Error::storage("expand overlay disk", e.to_string()))?;
             println!(" done");
         }

@@ -34,9 +34,9 @@ use crate::api::types::{
     ListMachinesResponse, MachineExecRequest, MachineInfo, MountSpec, PortSpec,
     ResizeMachineRequest, ResourceSpec,
 };
-use crate::api::validation::validate_command;
-use crate::api::validation::validate_resource_name;
+use crate::api::validation::{validate_command, validate_resource_name};
 use crate::config::{RecordState, RestartConfig, VmRecord};
+use crate::storage::{expand_disk, Overlay, Storage};
 
 /// Maximum machine name length.
 ///
@@ -676,10 +676,10 @@ pub async fn resize_machine(
 
     let current_storage_gb = record
         .storage_gb
-        .unwrap_or(crate::storage::DEFAULT_STORAGE_SIZE_GIB);
+        .unwrap_or(crate::data::storage::DEFAULT_STORAGE_SIZE_GIB);
     let current_overlay_gb = record
         .overlay_gb
-        .unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GIB);
+        .unwrap_or(crate::data::storage::DEFAULT_OVERLAY_SIZE_GIB);
 
     if req.storage_gb.unwrap_or(current_storage_gb) < current_storage_gb {
         return Err(ApiError::BadRequest(format!(
@@ -706,16 +706,16 @@ pub async fn resize_machine(
     if let Some(storage_gb) = req.storage_gb {
         if storage_gb > current_storage_gb {
             let storage_path = manager.storage_path();
-            crate::storage::expand_disk(storage_path, storage_gb, "storage")
-                .map_err(|e| ApiError::internal(format!("failed to expand storage: {}", e)))?;
+            expand_disk::<Storage>(storage_path, storage_gb)
+                .map_err(|e| ApiError::internal(format!("failed to expand storage disk: {}", e)))?;
         }
     }
 
     if let Some(overlay_gb) = req.overlay_gb {
         if overlay_gb > current_overlay_gb {
             let overlay_path = manager.overlay_path();
-            crate::storage::expand_disk(overlay_path, overlay_gb, "overlay")
-                .map_err(|e| ApiError::internal(format!("failed to expand overlay: {}", e)))?;
+            expand_disk::<Overlay>(overlay_path, overlay_gb)
+                .map_err(|e| ApiError::internal(format!("failed to expand overlay disk: {}", e)))?;
         }
     }
 

@@ -314,17 +314,17 @@ impl AgentManager {
     ) -> Result<Self> {
         let name = name.into();
         let rootfs_path = Self::default_rootfs_path()?;
-        let sg = storage_gb.unwrap_or(crate::storage::DEFAULT_STORAGE_SIZE_GIB);
-        let og = overlay_gb.unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GIB);
+        let sg = storage_gb.unwrap_or(crate::data::storage::DEFAULT_STORAGE_SIZE_GIB);
+        let og = overlay_gb.unwrap_or(crate::data::storage::DEFAULT_OVERLAY_SIZE_GIB);
 
         // Named VMs get their own storage disk
         let storage_dir = vm_data_dir(&name);
         std::fs::create_dir_all(&storage_dir)?;
 
-        let storage_path = storage_dir.join(crate::storage::STORAGE_DISK_FILENAME);
+        let storage_path = storage_dir.join(crate::data::storage::STORAGE_DISK_FILENAME);
         let storage_disk = StorageDisk::open_or_create_at(&storage_path, sg)?;
 
-        let overlay_path = storage_dir.join(crate::storage::OVERLAY_DISK_FILENAME);
+        let overlay_path = storage_dir.join(crate::data::storage::OVERLAY_DISK_FILENAME);
         let overlay_disk = OverlayDisk::open_or_create_at(&overlay_path, og)?;
 
         Self::new_named(name, rootfs_path, storage_disk, overlay_disk)
@@ -925,10 +925,10 @@ impl AgentManager {
         let console_log = self.console_log.clone();
         let storage_size_gb = resources
             .storage_gib
-            .unwrap_or(crate::storage::DEFAULT_STORAGE_SIZE_GIB);
+            .unwrap_or(crate::data::storage::DEFAULT_STORAGE_SIZE_GIB);
         let overlay_size_gb = resources
             .overlay_gib
-            .unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GIB);
+            .unwrap_or(crate::data::storage::DEFAULT_OVERLAY_SIZE_GIB);
 
         // Fork child process. The child becomes a session leader so the VM
         // survives if the parent process is killed.
@@ -1038,10 +1038,10 @@ impl AgentManager {
 
         let storage_size_gb = resources
             .storage_gib
-            .unwrap_or(crate::storage::DEFAULT_STORAGE_SIZE_GIB);
+            .unwrap_or(crate::data::storage::DEFAULT_STORAGE_SIZE_GIB);
         let overlay_size_gb = resources
             .overlay_gib
-            .unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GIB);
+            .unwrap_or(crate::data::storage::DEFAULT_OVERLAY_SIZE_GIB);
 
         // Write boot config to a file the subprocess will read
         let config = BootConfig {
