@@ -26,6 +26,20 @@ use std::time::Duration;
 
 const KIND: VmKind = VmKind::Machine;
 
+/// Resolve `--allow-cidr` and `--outbound-localhost-only` into a CIDR list and net flag.
+fn resolve_egress_flags(
+    mut allow_cidr: Vec<String>,
+    outbound_localhost_only: bool,
+    net: bool,
+) -> (Vec<String>, bool) {
+    if outbound_localhost_only {
+        allow_cidr.push("127.0.0.0/8".to_string());
+        allow_cidr.push("::1/128".to_string());
+    }
+    let net = net || !allow_cidr.is_empty();
+    (allow_cidr, net)
+}
+
 /// Manage machines
 #[derive(Subcommand, Debug)]
 pub enum MachineCmd {
@@ -208,12 +222,8 @@ impl RunCmd {
     pub fn run(self) -> smolvm::Result<()> {
         use smolvm::Error;
 
-        let mut cli_allow_cidrs = self.allow_cidr;
-        if self.outbound_localhost_only {
-            cli_allow_cidrs.push("127.0.0.0/8".to_string());
-            cli_allow_cidrs.push("::1/128".to_string());
-        }
-        let net = self.net || !cli_allow_cidrs.is_empty();
+        let (cli_allow_cidrs, net) =
+            resolve_egress_flags(self.allow_cidr, self.outbound_localhost_only, self.net);
 
         let params = crate::cli::smolfile::build_create_params(
             "default".to_string(),
@@ -546,12 +556,8 @@ pub struct CreateCmd {
 
 impl CreateCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        let mut cli_allow_cidrs = self.allow_cidr;
-        if self.outbound_localhost_only {
-            cli_allow_cidrs.push("127.0.0.0/8".to_string());
-            cli_allow_cidrs.push("::1/128".to_string());
-        }
-        let net = self.net || !cli_allow_cidrs.is_empty();
+        let (cli_allow_cidrs, net) =
+            resolve_egress_flags(self.allow_cidr, self.outbound_localhost_only, self.net);
 
         let params = crate::cli::smolfile::build_create_params(
             self.name,

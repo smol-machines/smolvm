@@ -1,3 +1,4 @@
+use ipnet::IpNet;
 use std::net::{IpAddr, Ipv4Addr};
 
 /// Default DNS server (Cloudflare) as string.
@@ -13,6 +14,28 @@ pub struct PortMapping {
     pub host: u16,
     /// Port inside the guest.
     pub guest: u16,
+}
+
+/// Check if any CIDR in the list covers the given IP address.
+pub fn cidrs_contain_ip(cidrs: &[String], ip: &str) -> bool {
+    let ip: IpAddr = match ip.parse() {
+        Ok(ip) => ip,
+        Err(_) => return false,
+    };
+    cidrs.iter().any(|cidr| {
+        cidr.parse::<IpNet>()
+            .or_else(|_| cidr.parse::<IpAddr>().map(IpNet::from))
+            .is_ok_and(|net| net.contains(&ip))
+    })
+}
+
+/// Ensure the default DNS server is reachable in a CIDR allowlist.
+///
+/// If none of the existing CIDRs cover the DNS IP, appends it as /32.
+pub fn ensure_dns_in_cidrs(cidrs: &mut Vec<String>) {
+    if !cidrs_contain_ip(cidrs, DEFAULT_DNS) {
+        cidrs.push(format!("{}/32", DEFAULT_DNS));
+    }
 }
 
 impl PortMapping {
@@ -45,5 +68,52 @@ impl PortMapping {
                 .map_err(|_| format!("invalid port: {}", spec))?;
             Ok(Self::same(port))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cidrs_contain_ip() {
+        assert!(cidrs_contain_ip(&["1.1.1.1".into()], "1.1.1.1"));
+        assert!(cidrs_contain_ip(&["1.1.1.1/32".into()], "1.1.1.1"));
+        assert!(cidrs_contain_ip(&["0.0.0.0/0".into()], "8.8.8.8"));
+        assert!(cidrs_contain_ip(&["10.0.0.0/8".into()], "10.5.3.1"));
+        assert!(!cidrs_contain_ip(&["10.0.0.0/8".into()], "1.1.1.1"));
+        assert!(cidrs_contain_ip(
+            &["192.168.1.0/24".into()],
+            "192.168.1.100"
+        ));
+        assert!(!cidrs_contain_ip(&["192.168.1.0/24".into()], "192.168.2.1"));
+        assert!(cidrs_contain_ip(
+            &["10.0.0.0/8".into(), "1.1.1.1/32".into()],
+            "1.1.1.1"
+        ));
+        assert!(!cidrs_contain_ip(&[], "1.1.1.1"));
+        assert!(!cidrs_contain_ip(&["not-a-cidr".into()], "1.1.1.1"));
+    }
+
+    #[test]
+    fn test_ensure_dns_adds_when_missing() {
+        let mut cidrs = vec!["10.0.0.0/8".to_string()];
+        ensure_dns_in_cidrs(&mut cidrs);
+        assert_eq!(cidrs.len(), 2);
+        assert!(cidrs.contains(&"1.1.1.1/32".to_string()));
+    }
+
+    #[test]
+    fn test_ensure_dns_skips_when_covered_by_subnet() {
+        let mut cidrs = vec!["1.0.0.0/8".to_string()];
+        ensure_dns_in_cidrs(&mut cidrs);
+        assert_eq!(cidrs.len(), 1);
+    }
+
+    #[test]
+    fn test_ensure_dns_skips_when_exact_match() {
+        let mut cidrs = vec!["10.0.0.0/8".to_string(), "1.1.1.1/32".to_string()];
+        ensure_dns_in_cidrs(&mut cidrs);
+        assert_eq!(cidrs.len(), 2);
     }
 }

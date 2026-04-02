@@ -323,15 +323,8 @@ pub fn launch_agent_vm_dynamic(
                         .to_string()
                 })?;
 
-                // Auto-include DNS server so DNS resolution doesn't silently break
-                let dns_ip = crate::data::network::DEFAULT_DNS;
                 let mut all_cidrs = cidrs.clone();
-                if !all_cidrs
-                    .iter()
-                    .any(|c| c == dns_ip || c == &format!("{}/32", dns_ip) || c.ends_with("/0"))
-                {
-                    all_cidrs.push(format!("{}/32", dns_ip));
-                }
+                crate::data::network::ensure_dns_in_cidrs(&mut all_cidrs);
 
                 let cidr_cstrings: Vec<CString> = all_cidrs
                     .iter()
