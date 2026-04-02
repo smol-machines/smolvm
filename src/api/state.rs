@@ -21,6 +21,8 @@ pub struct ApiState {
     reserved_names: RwLock<HashSet<String>>,
     /// Database for persistent state.
     db: SmolvmDb,
+    /// Smolvm orchestration layer (available for handlers migrating to the control layer).
+    smolvm: crate::Smolvm,
 }
 
 /// Internal machine entry with manager and configuration.
@@ -125,10 +127,12 @@ impl ApiState {
         db.init_tables().map_err(|e| {
             ApiError::internal(format!("failed to initialize database tables: {}", e))
         })?;
+        let smolvm = crate::Smolvm::with_db(db.clone());
         Ok(Self {
             machines: RwLock::new(HashMap::new()),
             reserved_names: RwLock::new(HashSet::new()),
             db,
+            smolvm,
         })
     }
 
@@ -136,10 +140,12 @@ impl ApiState {
     ///
     /// Useful for testing with temporary databases.
     pub fn with_db(db: SmolvmDb) -> Self {
+        let smolvm = crate::Smolvm::with_db(db.clone());
         Self {
             machines: RwLock::new(HashMap::new()),
             reserved_names: RwLock::new(HashSet::new()),
             db,
+            smolvm,
         }
     }
 
@@ -475,6 +481,14 @@ impl ApiState {
     /// Get the underlying database handle.
     pub fn db(&self) -> &SmolvmDb {
         &self.db
+    }
+
+    /// Get the Smolvm orchestration layer.
+    ///
+    /// Handlers migrating to the control layer should use this to access
+    /// `control::` functions via `smolvm.get_vm()`, `smolvm.list_vms()`, etc.
+    pub fn smolvm(&self) -> &crate::Smolvm {
+        &self.smolvm
     }
 
     /// Insert a machine entry directly into the in-memory registry.
