@@ -13,6 +13,8 @@ pub mod mount;
 pub mod network;
 /// Canonical resource configuration data models.
 pub mod resources;
+/// Core MicroVm object model (MicroVm, VmSpec, VmStatus, VmPhase).
+pub mod vm;
 
 /// Target VM identifier used by shared operations.
 pub enum VmTarget {
