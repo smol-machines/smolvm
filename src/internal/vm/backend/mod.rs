@@ -6,7 +6,7 @@
 mod libkrun;
 
 use crate::error::{Error, Result};
-use crate::vm::VmBackend;
+use crate::internal::vm::VmBackend;
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub use libkrun::LibkrunBackend;

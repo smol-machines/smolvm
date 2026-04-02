@@ -26,7 +26,7 @@ use axum::{
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::agent::AgentManager;
+use crate::internal::agent::AgentManager;
 use crate::api::error::ApiError;
 use crate::api::state::{ApiState, MachineEntry};
 use crate::api::types::{
@@ -35,10 +35,10 @@ use crate::api::types::{
     ResizeMachineRequest, ResourceSpec,
 };
 use crate::api::validation::{validate_command, validate_resource_name};
-use crate::config::{RecordState, RestartConfig, VmRecord};
+use crate::internal::config::{RecordState, RestartConfig, VmRecord};
 use crate::data::disk::{Overlay, Storage};
 use crate::data::mount::HostMount;
-use crate::storage::expand_disk;
+use crate::internal::storage::expand_disk;
 
 /// Maximum machine name length.
 ///
@@ -60,7 +60,7 @@ fn resolve_machine_state(name: &str, record: &VmRecord) -> RecordState {
     if record.state == RecordState::Running && state == RecordState::Stopped {
         if let Ok(manager) = AgentManager::for_vm(name) {
             if let Ok(mut client) =
-                crate::agent::AgentClient::connect_with_short_timeout(manager.vsock_socket())
+                crate::internal::agent::AgentClient::connect_with_short_timeout(manager.vsock_socket())
             {
                 if client.ping().is_ok() {
                     return RecordState::Running;
@@ -160,7 +160,7 @@ fn shutdown_machine_process(name: &str, pid: Option<i32>, pid_start_time: Option
     let manager = AgentManager::for_vm(name).ok();
     let mut vsock_confirmed = false;
     if let Some(ref manager) = manager {
-        if let Ok(mut client) = crate::agent::AgentClient::connect(manager.vsock_socket()) {
+        if let Ok(mut client) = crate::internal::agent::AgentClient::connect(manager.vsock_socket()) {
             vsock_confirmed = true;
             let _ = client.shutdown();
         }
@@ -173,27 +173,27 @@ fn shutdown_machine_process(name: &str, pid: Option<i32>, pid_start_time: Option
         // it treats any alive PID as "ours" when start_time is None — which risks
         // killing an unrelated process if the OS reused the PID.
         let identity_ok =
-            vsock_confirmed || crate::process::is_our_process_strict(pid, pid_start_time);
+            vsock_confirmed || crate::internal::process::is_our_process_strict(pid, pid_start_time);
 
         if identity_ok {
-            let _ = crate::process::stop_vm_process(
+            let _ = crate::internal::process::stop_vm_process(
                 pid,
-                crate::process::VM_SIGTERM_TIMEOUT,
-                crate::process::VM_SIGKILL_TIMEOUT,
+                crate::internal::process::VM_SIGTERM_TIMEOUT,
+                crate::internal::process::VM_SIGKILL_TIMEOUT,
             );
         } else {
             tracing::debug!(pid, name, "PID already dead");
         }
 
         // Post-check: verify the process is actually gone.
-        if crate::process::is_alive(pid) {
+        if crate::internal::process::is_alive(pid) {
             tracing::warn!(pid, name, "process still alive after shutdown attempts");
             return false;
         }
     } else {
         // No PID available — check if VM is still reachable via vsock.
         if let Some(ref manager) = manager {
-            if let Ok(mut client) = crate::agent::AgentClient::connect(manager.vsock_socket()) {
+            if let Ok(mut client) = crate::internal::agent::AgentClient::connect(manager.vsock_socket()) {
                 if client.ping().is_ok() {
                     tracing::warn!(name, "VM still reachable via vsock but no PID to signal");
                     return false;
@@ -408,7 +408,7 @@ pub async fn start_machine(
     state.insert_machine(&name, machine_entry_from_record(&record, manager));
 
     // Capture start time for PID verification
-    let pid_start_time = pid.and_then(crate::process::process_start_time);
+    let pid_start_time = pid.and_then(crate::internal::process::process_start_time);
 
     // Persist state to database
     let record = db
@@ -706,7 +706,7 @@ pub async fn resize_machine(
         ));
     }
 
-    let manager = crate::agent::AgentManager::for_vm(&name)
+    let manager = crate::internal::agent::AgentManager::for_vm(&name)
         .map_err(|e| ApiError::internal(format!("failed to get agent manager: {}", e)))?;
 
     if let Some(storage_gb) = req.storage_gb {
@@ -745,7 +745,7 @@ pub async fn resize_machine(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::SmolvmDb;
+    use crate::internal::db::SmolvmDb;
     use tempfile::TempDir;
 
     #[test]

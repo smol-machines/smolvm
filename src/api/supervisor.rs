@@ -8,7 +8,7 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 use crate::api::state::{ensure_machine_running, ApiState};
-use crate::config::RecordState;
+use crate::internal::config::RecordState;
 
 /// Interval between health checks.
 const CHECK_INTERVAL: Duration = Duration::from_secs(5);
@@ -81,7 +81,7 @@ impl Supervisor {
         // and persist it so the restart policy can use it.
         if let Ok(Some(record)) = self.state.db().get_vm(name) {
             if let Some(pid) = record.pid {
-                let exit_code = crate::process::try_wait(pid);
+                let exit_code = crate::internal::process::try_wait(pid);
                 self.state.set_last_exit_code(name, exit_code);
             }
         }
@@ -177,7 +177,7 @@ impl Supervisor {
 
         for name in machine_names {
             if let Some(log_path) = self.get_machine_log_path(&name) {
-                if let Err(e) = crate::log_rotation::rotate_if_needed(&log_path) {
+                if let Err(e) = crate::internal::log_rotation::rotate_if_needed(&log_path) {
                     tracing::debug!(machine = %name, error = %e, "failed to rotate logs");
                 }
             }

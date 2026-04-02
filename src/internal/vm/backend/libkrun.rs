@@ -9,11 +9,11 @@ use std::path::{Path, PathBuf};
 
 use crate::data::mount::HostMount;
 use crate::error::{Error, Result};
-use crate::platform::{self, VmExecutor};
-use crate::vm::config::{NetworkPolicy, RootfsSource, VmConfig};
-use crate::vm::rosetta;
-use crate::vm::state::{ExitReason, VmState};
-use crate::vm::{VmBackend, VmHandle, VmId};
+use crate::internal::platform::{self, VmExecutor};
+use crate::internal::vm::config::{NetworkPolicy, RootfsSource, VmConfig};
+use crate::internal::vm::rosetta;
+use crate::internal::vm::state::{ExitReason, VmState};
+use crate::internal::vm::{VmBackend, VmHandle, VmId};
 
 // FFI bindings to libkrun
 // Linking is handled by build.rs
@@ -108,7 +108,7 @@ pub struct LibkrunVm {
     state: VmState,
     exit_reason: Option<ExitReason>,
     /// Child process running the VM.
-    child: Option<crate::process::ChildProcess>,
+    child: Option<crate::internal::process::ChildProcess>,
 }
 
 impl LibkrunVm {
@@ -373,7 +373,7 @@ impl LibkrunVm {
                 libc::_exit(1);
             } else {
                 // Parent process: store child process and wait
-                let mut child = crate::process::ChildProcess::new(pid);
+                let mut child = crate::internal::process::ChildProcess::new(pid);
                 let exit_code = child.wait();
                 self.child = Some(child);
 
@@ -421,7 +421,7 @@ impl VmHandle for LibkrunVm {
         if let Some(ref mut child) = self.child {
             if child.is_running() {
                 tracing::info!(pid = child.pid(), "stopping VM with SIGTERM");
-                child.stop(crate::process::DEFAULT_STOP_TIMEOUT, true)?;
+                child.stop(crate::internal::process::DEFAULT_STOP_TIMEOUT, true)?;
                 self.state = VmState::Stopped;
             }
         }
@@ -430,9 +430,9 @@ impl VmHandle for LibkrunVm {
 
     fn kill(&mut self) -> Result<()> {
         if let Some(ref child) = self.child {
-            if crate::process::is_alive(child.pid()) {
+            if crate::internal::process::is_alive(child.pid()) {
                 tracing::info!(pid = child.pid(), "killing VM with SIGKILL");
-                crate::process::kill(child.pid());
+                crate::internal::process::kill(child.pid());
             }
         }
         self.state = VmState::Stopped;

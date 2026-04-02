@@ -9,7 +9,7 @@
 
 use crate::data::network::DEFAULT_DNS;
 use crate::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
-use crate::db::SmolvmDb;
+use crate::internal::db::SmolvmDb;
 use crate::error::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -452,7 +452,7 @@ impl VmRecord {
     ) -> Self {
         Self {
             name,
-            created_at: crate::util::current_timestamp(),
+            created_at: crate::internal::util::current_timestamp(),
             state: RecordState::Created,
             pid: None,
             pid_start_time: None,
@@ -495,7 +495,7 @@ impl VmRecord {
     ) -> Self {
         Self {
             name,
-            created_at: crate::util::current_timestamp(),
+            created_at: crate::internal::util::current_timestamp(),
             state: RecordState::Created,
             pid: None,
             pid_start_time: None,
@@ -532,7 +532,7 @@ impl VmRecord {
     /// Falls back to PID-only check for legacy records without start time.
     pub fn is_process_alive(&self) -> bool {
         if let Some(pid) = self.pid {
-            crate::process::is_our_process(pid, self.pid_start_time)
+            crate::internal::process::is_our_process(pid, self.pid_start_time)
         } else {
             false
         }
@@ -572,8 +572,8 @@ impl VmRecord {
     }
 
     /// Convert record fields to VmResources.
-    pub fn vm_resources(&self) -> crate::agent::VmResources {
-        crate::agent::VmResources {
+    pub fn vm_resources(&self) -> crate::internal::agent::VmResources {
+        crate::internal::agent::VmResources {
             cpus: self.cpus,
             memory_mib: self.mem,
             network: self.network,

@@ -6,8 +6,8 @@
 use crate::data::disk;
 use crate::data::mount::HostMount;
 use crate::error::{Error, Result};
-use crate::process::{self, ChildProcess};
-use crate::storage::{OverlayDisk, StorageDisk};
+use crate::internal::process::{self, ChildProcess};
+use crate::internal::storage::{OverlayDisk, StorageDisk};
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -30,7 +30,7 @@ const AGENT_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const READY_MARKER_FILENAME: &str = ".smolvm-ready";
 
 // Re-use shared polling constants from process module.
-use crate::process::FAST_POLL_INTERVAL;
+use crate::internal::process::FAST_POLL_INTERVAL;
 
 /// Timeout for agent to stop gracefully before force kill.
 /// Reduced from 5s - VMs typically exit within 100ms after shutdown signal.
@@ -593,12 +593,12 @@ impl AgentManager {
     fn is_process_alive_inner(&self, inner: &AgentInner) -> bool {
         // Try in-memory child handle first (has stored start time)
         if let Some(child) = inner.child.as_ref() {
-            return crate::process::is_our_process(child.pid(), child.start_time());
+            return crate::internal::process::is_our_process(child.pid(), child.start_time());
         }
 
         // Fall back to PID file (covers orphan/reconnect paths)
         if let Some((pid, start_time)) = self.read_pid_file_with_start_time() {
-            return crate::process::is_our_process(pid, start_time);
+            return crate::internal::process::is_our_process(pid, start_time);
         }
 
         // No PID source — fail closed
@@ -819,7 +819,7 @@ impl AgentManager {
         // Check KVM availability on Linux
         #[cfg(target_os = "linux")]
         {
-            if let Err(e) = crate::platform::linux::check_kvm_available() {
+            if let Err(e) = crate::internal::platform::linux::check_kvm_available() {
                 let mut inner = self.inner.lock();
                 inner.state = AgentState::Stopped;
                 return Err(e);
@@ -935,7 +935,7 @@ impl AgentManager {
         // Install SIGCHLD handler to automatically reap zombie children.
         // Must be done AFTER prepare_for_launch (which calls ensure_formatted
         // via Command::output that needs child reaping to not interfere).
-        crate::process::install_sigchld_handler();
+        crate::internal::process::install_sigchld_handler();
 
         // Clone mounts/ports for finalize_launch (originals move into fork closure)
         let mounts_for_finalize = mounts.clone();
@@ -985,7 +985,7 @@ impl AgentManager {
             // This ensures DYLD_LIBRARY_PATH is still available (inherited from parent).
 
             // Re-create StorageDisk in child (we only have the path)
-            let storage_disk = match crate::storage::StorageDisk::open_or_create_at(
+            let storage_disk = match crate::internal::storage::StorageDisk::open_or_create_at(
                 &storage_disk_path,
                 storage_size_gb,
             ) {
@@ -1001,7 +1001,7 @@ impl AgentManager {
             };
 
             // Re-create OverlayDisk in child
-            let overlay_disk = match crate::storage::OverlayDisk::open_or_create_at(
+            let overlay_disk = match crate::internal::storage::OverlayDisk::open_or_create_at(
                 &overlay_disk_path,
                 overlay_size_gb,
             ) {

@@ -1,6 +1,6 @@
 use crate::data::consts::BYTES_PER_GIB;
 use crate::data::disk::{DiskType, Overlay, Storage};
-use crate::disk_utils;
+use crate::internal::disk_utils;
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::marker::PhantomData;
@@ -30,7 +30,7 @@ impl DiskVersion {
     pub fn new(base_digest: impl Into<String>) -> Self {
         Self {
             format_version: Self::CURRENT_VERSION,
-            created_at: crate::util::current_timestamp(),
+            created_at: crate::internal::util::current_timestamp(),
             base_digest: base_digest.into(),
             smolvm_version: env!("CARGO_PKG_VERSION").to_string(),
         }

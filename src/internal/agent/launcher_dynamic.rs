@@ -6,7 +6,7 @@
 //!
 //! The static FFI path in `launcher.rs` remains untouched for normal operations.
 
-use crate::util::{libkrun_filename, libkrunfw_filename};
+use crate::internal::util::{libkrun_filename, libkrunfw_filename};
 use smolvm_protocol::ports;
 use std::ffi::{CStr, CString};
 use std::path::{Path, PathBuf};

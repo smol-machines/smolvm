@@ -61,24 +61,71 @@
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 
-pub mod agent;
 pub mod api;
-pub mod config;
 /// Canonical shared data models and constants used across adapters.
 pub mod data;
-pub mod db;
-mod disk_utils;
 pub mod dns_filter;
 pub mod dns_filter_listener;
-pub mod log_rotation;
-pub mod network;
-pub mod platform;
-pub mod process;
-pub mod registry;
+pub(crate) mod internal;
+
+// ============================================================================
+// Public module facades — re-export internal modules so that downstream crates
+// (CLI binary, smolvm-napi, etc.) can continue using `smolvm::agent::…` paths.
+// ============================================================================
+
+/// Agent subsystem — VM lifecycle, vsock client, terminal helpers.
+pub mod agent {
+    pub use crate::internal::agent::*;
+}
+
+/// Configuration types — SmolvmConfig, VmRecord, restart policies.
+pub mod config {
+    pub use crate::internal::config::*;
+}
+
+/// Database access.
+pub mod db {
+    pub use crate::internal::db::*;
+}
 /// Persistent VM disk management.
-pub mod storage;
-pub mod util;
-pub mod vm;
+pub mod storage {
+    pub use crate::internal::storage::*;
+}
+
+/// Network helpers.
+pub mod network {
+    pub use crate::internal::network::*;
+}
+
+/// OS / platform abstractions.
+pub mod platform {
+    pub use crate::internal::platform::*;
+}
+
+/// Process management helpers.
+pub mod process {
+    pub use crate::internal::process::*;
+}
+
+/// Container registry helpers.
+pub mod registry {
+    pub use crate::internal::registry::*;
+}
+
+/// Log rotation.
+pub mod log_rotation {
+    pub use crate::internal::log_rotation::*;
+}
+
+/// Utility helpers.
+pub mod util {
+    pub use crate::internal::util::*;
+}
+
+/// VM backend and configuration.
+pub mod vm {
+    pub use crate::internal::vm::*;
+}
 
 /// Compatibility re-exports for smolvm error types.
 ///
@@ -100,17 +147,17 @@ pub const DEFAULT_SHELL_CMD: &str = "/bin/sh";
 pub const DEFAULT_IDLE_CMD: &[&str] = &["sleep", "infinity"];
 
 // Re-export main types for convenience
-pub use agent::{AgentClient, AgentManager};
+pub use internal::agent::{AgentClient, AgentManager};
 pub use api::ApiDoc;
-pub use config::{RecordState, RestartConfig, RestartPolicy, SmolvmConfig, VmRecord};
+pub use internal::config::{RecordState, RestartConfig, RestartPolicy, SmolvmConfig, VmRecord};
 pub use data::resources::VmResources;
-pub use db::SmolvmDb;
+pub use internal::db::SmolvmDb;
 pub use error::{Error, Result};
-pub use process::ChildProcess;
-pub use registry::{RegistryAuth, RegistryConfig};
-pub use vm::config::{NetworkPolicy, RootfsSource, Timeouts, VmConfig, VmId};
-pub use vm::state::{ExitReason, VmState};
-pub use vm::{default_backend, VmBackend, VmHandle};
+pub use internal::process::ChildProcess;
+pub use internal::registry::{RegistryAuth, RegistryConfig};
+pub use internal::vm::config::{NetworkPolicy, RootfsSource, Timeouts, VmConfig, VmId};
+pub use internal::vm::state::{ExitReason, VmState};
+pub use internal::vm::{default_backend, VmBackend, VmHandle};
 
 /// Library version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

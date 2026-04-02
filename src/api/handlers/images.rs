@@ -6,7 +6,7 @@ use axum::{
 };
 use std::sync::Arc;
 
-use crate::agent::PullOptions;
+use crate::internal::agent::PullOptions;
 use crate::api::error::{classify_ensure_running_error, ApiError};
 use crate::api::state::{ensure_running_and_persist, with_machine_client, ApiState};
 use crate::api::types::{

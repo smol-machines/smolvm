@@ -1,12 +1,12 @@
 //! API server state management.
 
-use crate::agent::{AgentManager, PortMapping, VmResources};
+use crate::internal::agent::{AgentManager, PortMapping, VmResources};
 use crate::api::error::ApiError;
 use crate::api::types::{MachineInfo, MountSpec, PortSpec, ResourceSpec, RestartSpec};
-use crate::config::{RecordState, RestartConfig, RestartPolicy, VmRecord};
+use crate::internal::config::{RecordState, RestartConfig, RestartPolicy, VmRecord};
 use crate::data::mount::HostMount;
 use crate::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
-use crate::db::SmolvmDb;
+use crate::internal::db::SmolvmDb;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -302,7 +302,7 @@ impl ApiState {
         state: RecordState,
         pid: Option<i32>,
     ) -> std::result::Result<(), crate::Error> {
-        let pid_start_time = pid.and_then(crate::process::process_start_time);
+        let pid_start_time = pid.and_then(crate::internal::process::process_start_time);
         let result = self.db.update_vm(name, |record| {
             record.state = state;
             record.pid = pid;
@@ -589,7 +589,7 @@ pub async fn with_machine_client<T, F>(
 ) -> Result<T, ApiError>
 where
     T: Send + 'static,
-    F: FnOnce(&mut crate::agent::AgentClient) -> crate::Result<T> + Send + 'static,
+    F: FnOnce(&mut crate::internal::agent::AgentClient) -> crate::Result<T> + Send + 'static,
 {
     let entry_clone = entry.clone();
     tokio::task::spawn_blocking(move || {

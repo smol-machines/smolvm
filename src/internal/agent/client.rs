@@ -4,7 +4,7 @@
 //! and receiving responses.
 
 use crate::error::{Error, Result};
-use crate::registry::{extract_registry, rewrite_image_registry, RegistryAuth, RegistryConfig};
+use crate::internal::registry::{extract_registry, rewrite_image_registry, RegistryAuth, RegistryConfig};
 use smolvm_protocol::{
     encode_message, AgentRequest, AgentResponse, ImageInfo, OverlayInfo, StorageStatus,
     MAX_FRAME_SIZE, PROTOCOL_VERSION,
@@ -336,7 +336,7 @@ impl AgentClient {
     /// This is useful when the agent might be temporarily unavailable
     /// (e.g., during high load or brief network issues).
     pub fn connect_with_retry(socket_path: impl AsRef<Path>) -> Result<Self> {
-        use crate::util::{retry_with_backoff, RetryConfig};
+        use crate::internal::util::{retry_with_backoff, RetryConfig};
 
         let path = socket_path.as_ref();
 
@@ -813,7 +813,7 @@ impl AgentClient {
     /// Sends `request`, waits for `Started`, then runs the poll loop
     /// streaming stdout/stderr and forwarding stdin until `Exited`.
     fn interactive_session(&mut self, request: AgentRequest, tty: bool, op: &str) -> Result<i32> {
-        use crate::agent::terminal::{
+        use crate::internal::agent::terminal::{
             check_sigwinch, flush_retry, get_terminal_size, install_sigwinch_handler, poll_io,
             stdin_is_tty, write_all_retry, NonBlockingStdin, RawModeGuard,
         };

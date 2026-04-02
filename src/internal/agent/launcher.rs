@@ -7,8 +7,8 @@
 use crate::data::consts::{ENV_SMOLVM_KRUN_LOG_LEVEL, ENV_SMOLVM_LIB_DIR};
 use crate::data::mount::HostMount;
 use crate::error::{Error, Result};
-use crate::storage::{OverlayDisk, StorageDisk};
-use crate::util::libkrunfw_filename;
+use crate::internal::storage::{OverlayDisk, StorageDisk};
+use crate::internal::util::libkrunfw_filename;
 
 use smolvm_protocol::ports;
 use std::ffi::{CStr, CString};

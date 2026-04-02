@@ -3,7 +3,7 @@
 //! This module provides network policy configuration for VMs.
 
 use crate::data::network::DEFAULT_DNS_ADDR;
-use crate::vm::config::NetworkPolicy;
+use crate::internal::vm::config::NetworkPolicy;
 use std::net::IpAddr;
 
 /// Get the DNS server for a network policy.

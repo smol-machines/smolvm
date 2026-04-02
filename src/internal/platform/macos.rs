@@ -5,7 +5,7 @@
 //! via a wrapper script, as the kernel doesn't auto-mount virtiofs devices.
 
 use crate::error::{Error, Result};
-use crate::platform::traits::{RosettaSupport, VmExecutor};
+use crate::internal::platform::traits::{RosettaSupport, VmExecutor};
 use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::Write;
@@ -181,21 +181,21 @@ fn write_mount_script(rootfs: &Path, mounts: &[(String, String)], rosetta: bool)
             &mut file,
             &format!(
                 "mkdir -p '{}'",
-                shell_escape(crate::vm::rosetta::ROSETTA_GUEST_PATH)
+                shell_escape(crate::internal::vm::rosetta::ROSETTA_GUEST_PATH)
             ),
         )?;
         write_line(
             &mut file,
             &format!(
                 "mount -t virtiofs '{}' '{}'",
-                shell_escape(crate::vm::rosetta::ROSETTA_TAG),
-                shell_escape(crate::vm::rosetta::ROSETTA_GUEST_PATH)
+                shell_escape(crate::internal::vm::rosetta::ROSETTA_TAG),
+                shell_escape(crate::internal::vm::rosetta::ROSETTA_GUEST_PATH)
             ),
         )?;
 
         // Register Rosetta with binfmt_misc for x86_64 ELF binaries
         write_line(&mut file, "# Register Rosetta with binfmt_misc")?;
-        write_line(&mut file, crate::vm::rosetta::BINFMT_REGISTER_CMD)?;
+        write_line(&mut file, crate::internal::vm::rosetta::BINFMT_REGISTER_CMD)?;
     }
 
     // Clean up the mount script after execution

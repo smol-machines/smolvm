@@ -5,7 +5,7 @@
 //! wrapper script is needed.
 
 use crate::error::{Error, Result};
-use crate::platform::traits::{RosettaSupport, VmExecutor};
+use crate::internal::platform::traits::{RosettaSupport, VmExecutor};
 use std::ffi::CString;
 use std::fs;
 use std::path::Path;

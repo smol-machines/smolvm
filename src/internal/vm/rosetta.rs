@@ -15,7 +15,7 @@
 //! - Rosetta 2 installed (`softwareupdate --install-rosetta`)
 //! - macOS 11.0 or later
 
-use crate::platform::{self, RosettaSupport};
+use crate::internal::platform::{self, RosettaSupport};
 
 /// Virtiofs tag for the Rosetta mount.
 pub const ROSETTA_TAG: &str = "rosetta";

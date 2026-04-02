@@ -6,7 +6,7 @@
 //! The database handle is cached for the lifetime of the `SmolvmDb` instance,
 //! amortising the ~3ms open + ~2-5ms close cost across all operations.
 
-use crate::config::VmRecord;
+use crate::internal::config::VmRecord;
 use crate::error::{Error, Result};
 use parking_lot::Mutex;
 use redb::{Database, ReadableTable, TableDefinition, TableError};
@@ -417,7 +417,7 @@ impl SmolvmDb {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::RecordState;
+    use crate::internal::config::RecordState;
     use tempfile::TempDir;
 
     fn temp_db() -> (TempDir, SmolvmDb) {
