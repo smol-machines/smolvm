@@ -491,10 +491,7 @@ pub fn stop_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
     let db = SmolvmDb::open()?;
 
     // Check current state for CLI messaging
-    let vm = match smolvm::control::get_vm(&db, name) {
-        Ok(vm) => Some(vm),
-        Err(_) => None,
-    };
+    let vm = smolvm::control::get_vm(&db, name).ok();
 
     if let Some(ref vm) = vm {
         if let Some(ref status) = vm.status {
