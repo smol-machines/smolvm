@@ -112,20 +112,56 @@ log_info() {
 # Track failed test names for summary
 FAILED_TESTS=()
 
-# Run a test function
+# Fail-fast mode: stop on first failure.
+# Set FAIL_FAST=1 or pass --fail-fast to run_all.sh.
+FAIL_FAST="${FAIL_FAST:-0}"
+
+# Single test filter: only run tests whose name contains this string.
+# Usage: TEST_FILTER="from .smolmachine" bash tests/test_machine.sh
+TEST_FILTER="${TEST_FILTER:-}"
+
+# Run a test function, capturing output and showing it on failure.
 run_test() {
     local test_name="$1"
     local test_func="$2"
 
+    # Skip if filter is set and test name doesn't match
+    if [[ -n "$TEST_FILTER" ]] && [[ "$test_name" != *"$TEST_FILTER"* ]]; then
+        return 0
+    fi
+
+    # Skip remaining tests if fail-fast triggered
+    if [[ "$FAIL_FAST" == "1" ]] && [[ $TESTS_FAILED -gt 0 ]]; then
+        return 0
+    fi
+
     ((TESTS_RUN++))
     log_test "$test_name"
 
-    if $test_func; then
+    local output_file
+    output_file=$(mktemp)
+
+    if $test_func 2>&1 | tee "$output_file"; then
         log_pass "$test_name"
+        rm -f "$output_file"
         return 0
     else
         log_fail "$test_name"
         FAILED_TESTS+=("$test_name")
+
+        # Show last 10 lines on failure (may already be visible, but
+        # repeating under the FAIL marker makes it easy to find)
+        local output
+        output=$(tail -10 "$output_file" 2>/dev/null || true)
+        if [[ -n "$output" ]]; then
+            echo -e "  ${RED}Error output:${NC}"
+            echo "$output" | sed 's/^/    /'
+        fi
+        rm -f "$output_file"
+
+        if [[ "$FAIL_FAST" == "1" ]]; then
+            echo -e "\n${RED}Stopping: --fail-fast is set${NC}"
+        fi
         return 1
     fi
 }

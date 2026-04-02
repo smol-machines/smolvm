@@ -174,6 +174,52 @@ test_binary_is_clean_macho() {
     [[ "$file_result" == *"Mach-O"* ]]
 }
 
+test_sidecar_has_no_libs() {
+    local output="$TEST_DIR/test-alpine"
+
+    if [[ ! -f "$output.smolmachine" ]]; then
+        echo "SKIP: No sidecar"
+        return 0
+    fi
+
+    # Extract sidecar and verify no lib/ directory (V3: libs are in stub)
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    # Sidecar is: [assets.tar.zst][manifest json][64-byte footer]
+    # Read footer to get assets_size, then extract just the tar.zst
+    # Simpler: just list the tar contents and check for lib/
+    local footer_size=64
+    local file_size
+    file_size=$(stat -f%z "$output.smolmachine" 2>/dev/null || stat -c%s "$output.smolmachine" 2>/dev/null)
+
+    # The assets tar.zst starts at offset 0 in the sidecar
+    # Check that decompressed tar has no lib/ entries
+    if command -v zstd >/dev/null 2>&1; then
+        # Use head to get just the compressed portion (before manifest+footer)
+        # This is approximate but sufficient — if lib/ is in the tar, tar -t will find it
+        zstd -d < "$output.smolmachine" 2>/dev/null | tar -t 2>/dev/null | grep -q "^lib/" && return 1
+    else
+        echo "SKIP: zstd not installed"
+    fi
+
+    rm -rf "$tmpdir"
+    return 0
+}
+
+test_stub_has_libs_footer() {
+    local output="$TEST_DIR/test-alpine"
+
+    if [[ ! -f "$output" ]]; then
+        echo "SKIP: No packed binary"
+        return 0
+    fi
+
+    # Check last 32 bytes for SMOLLIBS magic
+    local magic
+    magic=$(tail -c 32 "$output" | head -c 8 2>/dev/null) || true
+    [[ "$magic" == "SMOLLIBS" ]]
+}
+
 # =============================================================================
 # Packed Binary - Ephemeral Execution (Requires VM)
 # =============================================================================
@@ -625,6 +671,8 @@ run_test "Packed --info" test_packed_info || true
 run_test "Packed --version" test_packed_version || true
 run_test "Packed --help" test_packed_help || true
 run_test "Sidecar has SMOLPACK magic" test_sidecar_has_magic || true
+run_test "Sidecar has no libs (V3)" test_sidecar_has_no_libs || true
+run_test "Stub has SMOLLIBS footer" test_stub_has_libs_footer || true
 run_test "Binary is clean Mach-O" test_binary_is_clean_macho || true
 
 echo ""

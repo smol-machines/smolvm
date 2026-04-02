@@ -470,7 +470,7 @@ impl PackCreateCmd {
 
         manifest.assets = collector.into_inventory();
 
-        let collector = AssetCollector::new(staging_dir)
+        let collector = AssetCollector::new(staging_dir.clone())
             .map_err(|e| Error::agent("collect assets", e.to_string()))?;
 
         let packer = Packer::new(manifest)
@@ -515,6 +515,12 @@ impl PackCreateCmd {
             } else {
                 println!("Signed successfully");
             }
+        }
+
+        // Embed libs in stub AFTER signing — SMOLLIBS footer must be at end of file
+        if !self.single_file {
+            smolvm_pack::packer::embed_libs_in_binary(&self.output, &staging_dir)
+                .map_err(|e| Error::agent("embed libraries", e.to_string()))?;
         }
 
         println!("\nRun with: {}", self.output.display());
@@ -576,6 +582,13 @@ impl PackCreateCmd {
     }
 
     /// Find the agent rootfs directory.
+    ///
+    /// Search order:
+    /// 1. Explicit `--rootfs-dir` flag
+    /// 2. `SMOLVM_AGENT_ROOTFS` env var (same as VM boot path)
+    /// 3. Build output (`target/agent-rootfs`)
+    /// 4. Next to the executable (`exe-dir/agent-rootfs`)
+    /// 5. User data dir (`~/Library/Application Support/smolvm/agent-rootfs`)
     fn find_rootfs_dir(&self) -> smolvm::Result<PathBuf> {
         if let Some(ref dir) = self.rootfs_dir {
             return Ok(dir.clone());
@@ -583,8 +596,10 @@ impl PackCreateCmd {
 
         // Check common locations
         let candidates = [
+            // SMOLVM_AGENT_ROOTFS env var (consistent with VM boot path)
+            std::env::var("SMOLVM_AGENT_ROOTFS").ok().map(PathBuf::from),
             // Build output
-            Some(PathBuf::from("target/agent-rootfs/rootfs")),
+            Some(PathBuf::from("target/agent-rootfs")),
             // Distribution
             std::env::current_exe()
                 .ok()

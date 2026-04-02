@@ -30,6 +30,48 @@ use std::time::Duration;
 /// Timeout waiting for the agent to become ready.
 const AGENT_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Resolve the lib directory containing libkrun/libkrunfw.
+///
+/// Two-file mode: libs embedded in stub binary (SMOLLIBS footer).
+/// Single-file mode: libs extracted from Mach-O section to cache_dir/lib/.
+/// `smolvm pack run`: uses the host-installed libs.
+fn resolve_lib_dir(cache_dir: &Path, debug: bool) -> smolvm::Result<PathBuf> {
+    // Two-file mode: libs embedded in stub binary (SMOLLIBS footer)
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Ok(Some(lib_dir)) = extract::extract_libs_from_binary(&exe_path, debug) {
+            if debug {
+                eprintln!("debug: using libs from stub binary: {}", lib_dir.display());
+            }
+            return Ok(lib_dir);
+        }
+    }
+
+    // Single-file mode: libs extracted from Mach-O section alongside other assets
+    let cache_lib = cache_dir.join("lib");
+    if cache_lib.exists() {
+        if debug {
+            eprintln!("debug: using libs from cache: {}", cache_lib.display());
+        }
+        return Ok(cache_lib);
+    }
+
+    // Host-installed libs (for `smolvm pack run .smolmachine`)
+    if let Some(host_lib) = smolvm::agent::find_lib_dir() {
+        if debug {
+            eprintln!(
+                "debug: using libs from host install: {}",
+                host_lib.display()
+            );
+        }
+        return Ok(host_lib);
+    }
+
+    Err(Error::agent(
+        "find libraries",
+        "libkrun/libkrunfw not found. The binary may be corrupted or the libraries are missing.",
+    ))
+}
+
 /// Convert parsed mounts to PackedMount format for the VM launcher.
 fn mounts_to_packed(mounts: &[smolvm::data::storage::HostMount]) -> Vec<PackedMount> {
     mounts
@@ -240,7 +282,7 @@ impl PackRunCmd {
         //    storage.ext4 / agent.sock.  tempdir_in gives us a truly unique
         //    directory that survives PID reuse and abrupt termination.
         let rootfs_path = cache_dir.join("agent-rootfs");
-        let lib_dir = cache_dir.join("lib");
+        let lib_dir = resolve_lib_dir(&cache_dir, self.debug)?;
         let layers_dir = cache_dir.join("layers");
         let runtime_parent = cache_dir.join("runtime");
         std::fs::create_dir_all(&runtime_parent)
@@ -927,7 +969,7 @@ fn run_from_cache(
     cli: PackedCli,
 ) -> smolvm::Result<()> {
     let rootfs_path = cache_dir.join("agent-rootfs");
-    let lib_dir = cache_dir.join("lib");
+    let lib_dir = resolve_lib_dir(cache_dir, cli.debug)?;
     let layers_dir = cache_dir.join("layers");
     let runtime_parent = cache_dir.join("runtime");
     std::fs::create_dir_all(&runtime_parent)
@@ -1294,7 +1336,7 @@ fn daemon_start(mode: &PackedMode, cli: &PackedCli) -> smolvm::Result<()> {
     let packed_mounts = mounts_to_packed(&mounts);
 
     let rootfs_path = cache_dir.join("agent-rootfs");
-    let lib_dir = cache_dir.join("lib");
+    let lib_dir = resolve_lib_dir(&cache_dir, cli.debug)?;
     let layers_dir = cache_dir.join("layers");
     let debug = cli.debug;
 

@@ -397,6 +397,131 @@ fn post_process_extraction(cache_dir: &Path, debug: bool) -> std::io::Result<()>
     Ok(())
 }
 
+/// Marker file indicating libs extraction is complete.
+const LIBS_EXTRACTION_MARKER: &str = ".smolvm-libs-extracted";
+
+/// Extract runtime libraries from a packed stub binary.
+///
+/// Reads the last 32 bytes of the executable looking for a SMOLLIBS footer.
+/// If found, extracts the compressed libs bundle to a cache directory and
+/// returns the path to the `lib/` directory containing libkrun/libkrunfw.
+///
+/// Returns `None` if the binary has no embedded libs (e.g., a V2 stub or
+/// the base smolvm binary).
+pub fn extract_libs_from_binary(exe_path: &Path, debug: bool) -> std::io::Result<Option<PathBuf>> {
+    use crate::format::{LibsFooter, LIBS_FOOTER_SIZE};
+
+    let mut file = File::open(exe_path)?;
+    let file_size = file.metadata()?.len();
+    if file_size < LIBS_FOOTER_SIZE as u64 {
+        return Ok(None);
+    }
+
+    // Read the last 32 bytes
+    file.seek(SeekFrom::End(-(LIBS_FOOTER_SIZE as i64)))?;
+    let mut footer_buf = [0u8; LIBS_FOOTER_SIZE];
+    file.read_exact(&mut footer_buf)?;
+
+    let footer = match LibsFooter::from_bytes(&footer_buf) {
+        Ok(f) => f,
+        Err(_) => return Ok(None), // No SMOLLIBS footer — not a V3 stub
+    };
+
+    if debug {
+        eprintln!(
+            "debug: found SMOLLIBS footer: offset={}, size={}",
+            footer.libs_offset, footer.libs_size
+        );
+    }
+
+    // Cache key based on libs content hash
+    file.seek(SeekFrom::Start(footer.libs_offset))?;
+    let mut hasher = crc32fast::Hasher::new();
+    let mut remaining = footer.libs_size;
+    let mut buf = [0u8; 64 * 1024];
+    while remaining > 0 {
+        let to_read = remaining.min(buf.len() as u64) as usize;
+        let n = file.read(&mut buf[..to_read])?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        remaining -= n as u64;
+    }
+    let libs_checksum = hasher.finalize();
+
+    let cache_base = dirs::cache_dir()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no cache directory"))?;
+    let libs_cache_dir = cache_base
+        .join("smolvm-libs")
+        .join(format!("{:08x}", libs_checksum));
+    let lib_dir = libs_cache_dir.join("lib");
+
+    // Acquire exclusive lock to prevent concurrent extraction races.
+    if let Some(parent) = libs_cache_dir.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let lock_path = libs_cache_dir.with_extension("lock");
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)?;
+
+    #[cfg(unix)]
+    {
+        let ret = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) };
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+
+    // Re-check after acquiring lock (another process may have finished)
+    if libs_cache_dir.join(LIBS_EXTRACTION_MARKER).exists() {
+        if debug {
+            eprintln!("debug: libs already extracted at {}", lib_dir.display());
+        }
+        // Lock released on drop of lock_file
+        let _ = lock_file;
+        return Ok(Some(lib_dir));
+    }
+
+    // Extract
+    fs::create_dir_all(&libs_cache_dir)?;
+    file.seek(SeekFrom::Start(footer.libs_offset))?;
+    let limited_reader = (&mut file).take(footer.libs_size);
+    let decoder = zstd::stream::Decoder::new(limited_reader)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let mut archive = tar::Archive::new(decoder);
+    safe_unpack(&mut archive, &libs_cache_dir)?;
+
+    // Make libs executable
+    if lib_dir.exists() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for entry in fs::read_dir(&lib_dir)? {
+                let entry = entry?;
+                if entry.path().is_file() {
+                    let mut perms = fs::metadata(entry.path())?.permissions();
+                    perms.set_mode(0o755);
+                    fs::set_permissions(entry.path(), perms)?;
+                }
+            }
+        }
+    }
+
+    fs::write(libs_cache_dir.join(LIBS_EXTRACTION_MARKER), "")?;
+    // Lock released on drop of lock_file
+    let _ = lock_file;
+
+    if debug {
+        eprintln!("debug: extracted libs to {}", lib_dir.display());
+    }
+
+    Ok(Some(lib_dir))
+}
+
 /// Clean up old cached extractions (keep only the most recent N).
 #[allow(dead_code)]
 pub fn cleanup_old_caches(keep: usize) -> std::io::Result<()> {

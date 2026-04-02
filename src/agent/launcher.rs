@@ -70,7 +70,7 @@ const KRUN_TSI_HIJACK_INET: u32 = 1 << 0;
 /// - `<exe_dir>/lib/` (distribution layout)
 /// - `<exe_dir>/../lib/` (alternative layout)
 /// - `<exe_dir>/../../lib/linux-<arch>/` (source tree dev builds)
-fn find_lib_dir() -> Option<PathBuf> {
+pub fn find_lib_dir() -> Option<PathBuf> {
     let lib_name = libkrunfw_filename();
     if let Ok(explicit_dir) = std::env::var(ENV_SMOLVM_LIB_DIR) {
         let path = PathBuf::from(explicit_dir);

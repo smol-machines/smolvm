@@ -13,10 +13,14 @@ pub const MAGIC: &[u8; 8] = b"SMOLPACK";
 /// Magic bytes for embedded section header.
 pub const SECTION_MAGIC: &[u8; 8] = b"SMOLSECT";
 
+/// Magic bytes for libs footer appended to the stub binary.
+pub const LIBS_MAGIC: &[u8; 8] = b"SMOLLIBS";
+
 /// Current format version.
 /// Version 1: Assets appended to binary
 /// Version 2: Assets in sidecar file (.smolmachine)
-pub const FORMAT_VERSION: u32 = 2;
+/// Version 3: Libs in stub binary, sidecar is cross-platform
+pub const FORMAT_VERSION: u32 = 3;
 
 /// Extension for sidecar assets file.
 pub const SIDECAR_EXTENSION: &str = ".smolmachine";
@@ -26,6 +30,9 @@ pub const FOOTER_SIZE: usize = 64;
 
 /// Embedded section header size (fixed).
 pub const SECTION_HEADER_SIZE: usize = 32;
+
+/// Libs footer size in bytes (fixed).
+pub const LIBS_FOOTER_SIZE: usize = 32;
 
 /// Header for data embedded in the __SMOLVM,__smolvm Mach-O section.
 ///
@@ -104,6 +111,61 @@ impl SectionHeader {
                 buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
             ]),
             checksum: u32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]]),
+        })
+    }
+}
+
+/// Footer appended to the stub binary to locate embedded runtime libraries.
+///
+/// The stub reads its own last 32 bytes to find the compressed libs bundle,
+/// extracts them to a cache directory, and dlopen's libkrun from there.
+/// This keeps the .smolmachine sidecar cross-platform (no platform-specific libs).
+///
+/// Layout (32 bytes total):
+/// ```text
+/// Offset  Size  Field
+/// 0       8     magic ("SMOLLIBS")
+/// 8       4     version (u32 LE)
+/// 12      8     libs_offset (u64 LE) - offset to compressed libs blob
+/// 20      8     libs_size (u64 LE) - size of compressed libs blob
+/// 28      4     reserved (zeroes)
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct LibsFooter {
+    /// Offset from start of file to the compressed libs blob.
+    pub libs_offset: u64,
+    /// Size of the compressed libs blob.
+    pub libs_size: u64,
+}
+
+impl LibsFooter {
+    /// Serialize footer to bytes.
+    pub fn to_bytes(&self) -> [u8; LIBS_FOOTER_SIZE] {
+        let mut buf = [0u8; LIBS_FOOTER_SIZE];
+        buf[0..8].copy_from_slice(LIBS_MAGIC);
+        buf[8..12].copy_from_slice(&1u32.to_le_bytes()); // version 1
+        buf[12..20].copy_from_slice(&self.libs_offset.to_le_bytes());
+        buf[20..28].copy_from_slice(&self.libs_size.to_le_bytes());
+        // 28..32 reserved (zeroed)
+        buf
+    }
+
+    /// Deserialize footer from bytes.
+    pub fn from_bytes(buf: &[u8; LIBS_FOOTER_SIZE]) -> Result<Self> {
+        if &buf[0..8] != LIBS_MAGIC {
+            return Err(PackError::InvalidMagic);
+        }
+        let version = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        if version != 1 {
+            return Err(PackError::UnsupportedVersion(version));
+        }
+        Ok(Self {
+            libs_offset: u64::from_le_bytes([
+                buf[12], buf[13], buf[14], buf[15], buf[16], buf[17], buf[18], buf[19],
+            ]),
+            libs_size: u64::from_le_bytes([
+                buf[20], buf[21], buf[22], buf[23], buf[24], buf[25], buf[26], buf[27],
+            ]),
         })
     }
 }

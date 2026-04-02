@@ -48,7 +48,6 @@ impl AssetCollector {
     /// Create a new asset collector with a staging directory.
     pub fn new(staging_dir: PathBuf) -> Result<Self> {
         fs::create_dir_all(&staging_dir)?;
-        fs::create_dir_all(staging_dir.join("lib"))?;
         fs::create_dir_all(staging_dir.join("layers"))?;
 
         Ok(Self {
@@ -77,6 +76,8 @@ impl AssetCollector {
     /// - libkrun.dylib (macOS) or libkrun.so (Linux)
     /// - libkrunfw.5.dylib (macOS) or libkrunfw.so.5 (Linux)
     pub fn collect_libraries(&mut self, lib_dir: &Path) -> Result<()> {
+        fs::create_dir_all(self.staging_dir.join("lib"))?;
+
         let lib_names = if cfg!(target_os = "macos") {
             vec!["libkrun.dylib", "libkrunfw.5.dylib"]
         } else {
@@ -323,17 +324,39 @@ impl AssetCollector {
         self.inventory
     }
 
-    /// Compress all staged assets into a single zstd-compressed tarball.
-    pub fn compress(&self, output: &Path) -> Result<u64> {
+    /// Compress staged assets into a single zstd-compressed tarball.
+    ///
+    /// When `exclude_libs` is true, the `lib/` directory is excluded
+    /// (two-file mode: libs are embedded in the stub binary instead).
+    /// When false, everything is included (single-file mode).
+    pub fn compress(&self, output: &Path, exclude_libs: bool) -> Result<u64> {
         let output_file = File::create(output)?;
         let encoder = zstd::stream::Encoder::new(output_file, ZSTD_LEVEL)
             .map_err(|e| PackError::Compression(e.to_string()))?;
         let mut tar_builder = tar::Builder::new(encoder);
 
-        // Add all files from staging directory
-        tar_builder
-            .append_dir_all(".", &self.staging_dir)
-            .map_err(|e| PackError::Tar(e.to_string()))?;
+        // Sort entries for deterministic tar ordering (consistent checksums)
+        let mut entries: Vec<_> = fs::read_dir(&self.staging_dir)?
+            .filter_map(|e| e.ok())
+            .collect();
+        entries.sort_by_key(|e| e.file_name());
+
+        for entry in entries {
+            let name = entry.file_name();
+            if exclude_libs && name == "lib" {
+                continue; // libs go in the stub, not the sidecar
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                tar_builder
+                    .append_dir_all(name.to_string_lossy().as_ref(), &path)
+                    .map_err(|e| PackError::Tar(e.to_string()))?;
+            } else {
+                tar_builder
+                    .append_path_with_name(&path, name.to_string_lossy().as_ref())
+                    .map_err(|e| PackError::Tar(e.to_string()))?;
+            }
+        }
 
         let encoder = tar_builder
             .into_inner()
@@ -449,7 +472,8 @@ mod tests {
 
         let _collector = AssetCollector::new(staging.clone()).unwrap();
 
-        assert!(staging.join("lib").exists());
+        // lib/ is only created when collect_libraries() is called
+        assert!(!staging.join("lib").exists());
         assert!(staging.join("layers").exists());
     }
 
@@ -467,7 +491,7 @@ mod tests {
         // Create collector and compress
         let collector = AssetCollector::new(staging).unwrap();
         let compressed = temp_dir.path().join("assets.tar.zst");
-        collector.compress(&compressed).unwrap();
+        collector.compress(&compressed, false).unwrap();
 
         // Decompress and verify
         decompress_assets_from_file(&compressed, &output).unwrap();

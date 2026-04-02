@@ -556,11 +556,6 @@ pub struct StartCmd {
 
 impl StartCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        // If a name is given, use the named path directly.
-        // If no name, try starting "default" as a named VM (which already exists
-        // if it was previously created). Only fall back to start_vm_default()
-        // if the named record doesn't exist. This avoids a redundant DB read
-        // that resolve_vm_name would do.
         let name = self.name.unwrap_or_else(|| "default".to_string());
         match vm_common::start_vm_named(KIND, &name) {
             Ok(()) => Ok(()),

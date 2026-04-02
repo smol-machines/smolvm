@@ -90,7 +90,7 @@ impl Packer {
             .as_ref()
             .ok_or_else(|| crate::PackError::AssetNotFound("stub executable".to_string()))?;
 
-        // 1. Copy stub executable to output (pure Mach-O, no modifications)
+        // 1. Copy stub executable to output (libs are appended later, after signing)
         let stub_data = fs::read(stub_path)?;
         let stub_size = stub_data.len() as u64;
         fs::write(output, &stub_data)?;
@@ -104,14 +104,14 @@ impl Packer {
             fs::set_permissions(output, perms)?;
         }
 
-        // 2. Build sidecar file with: assets + manifest + footer
+        // 3. Build sidecar file with: assets (no libs) + manifest + footer
         let sidecar_path = sidecar_path_for(output);
         let mut sidecar_file = File::create(&sidecar_path)?;
 
-        // 2a. Write compressed assets
+        // 3a. Write compressed assets (excludes lib/ — those are embedded in the stub)
         let assets_temp = temp_dir.path().join("assets.tar.zst");
         let assets_size = if let Some(collector) = &self.asset_collector {
-            collector.compress(&assets_temp)?
+            collector.compress(&assets_temp, true)?
         } else {
             let empty_file = File::create(&assets_temp)?;
             let encoder = zstd::stream::Encoder::new(empty_file, 1)?;
@@ -124,19 +124,19 @@ impl Packer {
         let mut assets_file = File::open(&assets_temp)?;
         std::io::copy(&mut assets_file, &mut sidecar_file)?;
 
-        // 2b. Write manifest JSON
+        // 3b. Write manifest JSON
         let manifest_offset = assets_size;
         let manifest_json = self.manifest.to_json()?;
         let manifest_size = manifest_json.len() as u64;
         sidecar_file.write_all(&manifest_json)?;
 
-        // 2c. Calculate checksum of assets + manifest
+        // 3c. Calculate checksum of assets + manifest
         sidecar_file.flush()?;
         drop(sidecar_file);
         let checksum_size = assets_size + manifest_size;
         let checksum = crc32_file_range(&sidecar_path, 0, checksum_size)?;
 
-        // 2d. Write footer to sidecar
+        // 3d. Write footer to sidecar
         let footer = PackFooter {
             stub_size: 0,     // Not used in sidecar mode
             assets_offset: 0, // Assets start at beginning of sidecar
@@ -252,7 +252,7 @@ impl Packer {
         // Compress assets
         let assets_temp = temp_dir.path().join("assets.tar.zst");
         let assets_size = if let Some(collector) = &self.asset_collector {
-            collector.compress(&assets_temp)?
+            collector.compress(&assets_temp, false)? // include libs in single-file mode
         } else {
             let empty_file = File::create(&assets_temp)?;
             let encoder = zstd::stream::Encoder::new(empty_file, 1)?;
@@ -343,7 +343,7 @@ impl Packer {
         // 2. Compress and append assets
         let assets_temp = temp_dir.path().join("assets.tar.zst");
         let assets_size = if let Some(collector) = &self.asset_collector {
-            collector.compress(&assets_temp)?
+            collector.compress(&assets_temp, false)? // include libs in append mode
         } else {
             let empty_file = File::create(&assets_temp)?;
             let encoder = zstd::stream::Encoder::new(empty_file, 1)?;
@@ -402,6 +402,61 @@ impl Packer {
             sidecar_path: None, // No sidecar in embedded mode
         })
     }
+}
+
+/// Append compressed runtime libraries to a packed binary.
+///
+/// Call this AFTER code signing — the SMOLLIBS footer must be the last
+/// bytes of the file so `extract_libs_from_binary()` can find it.
+pub fn embed_libs_in_binary(binary_path: &Path, staging_dir: &Path) -> Result<()> {
+    use crate::format::LibsFooter;
+
+    let lib_dir = staging_dir.join("lib");
+    if !lib_dir.exists() {
+        return Ok(()); // No libs to embed
+    }
+
+    // Check if there are actual library files
+    let has_libs = fs::read_dir(&lib_dir)?
+        .filter_map(|e| e.ok())
+        .any(|e| e.path().is_file());
+    if !has_libs {
+        return Ok(());
+    }
+
+    let temp_dir = tempfile::tempdir()?;
+    let libs_temp = temp_dir.path().join("libs.tar.zst");
+
+    // Compress libs
+    let output_file = File::create(&libs_temp)?;
+    let encoder = zstd::stream::Encoder::new(output_file, crate::assets::ZSTD_LEVEL)
+        .map_err(|e| crate::PackError::Compression(e.to_string()))?;
+    let mut tar_builder = tar::Builder::new(encoder);
+    tar_builder
+        .append_dir_all("lib", &lib_dir)
+        .map_err(|e| crate::PackError::Tar(e.to_string()))?;
+    let encoder = tar_builder
+        .into_inner()
+        .map_err(|e| crate::PackError::Tar(e.to_string()))?;
+    encoder
+        .finish()
+        .map_err(|e| crate::PackError::Compression(e.to_string()))?;
+
+    let libs_size = fs::metadata(&libs_temp)?.len();
+    let binary_size = fs::metadata(binary_path)?.len();
+
+    // Append libs blob + footer
+    let mut output_file = fs::OpenOptions::new().append(true).open(binary_path)?;
+    let mut libs_file = File::open(&libs_temp)?;
+    std::io::copy(&mut libs_file, &mut output_file)?;
+
+    let libs_footer = LibsFooter {
+        libs_offset: binary_size,
+        libs_size,
+    };
+    output_file.write_all(&libs_footer.to_bytes())?;
+
+    Ok(())
 }
 
 /// Get the sidecar path for a packed binary.

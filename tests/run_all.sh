@@ -14,8 +14,12 @@
 #   ./tests/run_all.sh bench-vm     # Run VM startup benchmark only
 #   ./tests/run_all.sh bench-container # Run container benchmark only
 #
+# Flags:
+#   --fail-fast          Stop on first test failure (useful for debugging)
+#
 # Environment:
 #   SMOLVM=/path/to/smolvm   # Use specific binary
+#   FAIL_FAST=1              # Same as --fail-fast
 
 set -euo pipefail
 
@@ -52,12 +56,18 @@ run_suite() {
     fi
 }
 
-# Determine which tests to run
-if [[ $# -eq 0 ]]; then
-    TESTS_TO_RUN="all"
-else
-    TESTS_TO_RUN="$1"
-fi
+# Parse arguments
+TESTS_TO_RUN="all"
+for arg in "$@"; do
+    case "$arg" in
+        --fail-fast)
+            export FAIL_FAST=1
+            ;;
+        *)
+            TESTS_TO_RUN="$arg"
+            ;;
+    esac
+done
 
 echo ""
 echo "=========================================="
