@@ -5,6 +5,7 @@
 
 pub(crate) mod agent;
 pub(crate) mod config;
+pub(crate) mod convert;
 pub(crate) mod db;
 pub(crate) mod disk_utils;
 pub(crate) mod log_rotation;
