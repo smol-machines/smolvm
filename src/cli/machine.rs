@@ -927,7 +927,28 @@ pub struct StopCmd {
 impl StopCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let name = self.name.unwrap_or_else(|| "default".to_string());
-        vm_common::stop_vm(KIND, &name)
+
+        let db = smolvm::db::SmolvmDb::open()?;
+
+        // Check current state for CLI messaging
+        if let Ok(vm) = smolvm::control::get_vm(&db, &name) {
+            if let Some(ref status) = vm.status {
+                if status.phase != smolvm::data::vm::VmPhase::Running {
+                    println!(
+                        "{} '{}' is not running (state: {})",
+                        KIND.display_name(),
+                        name,
+                        status.phase,
+                    );
+                    return Ok(());
+                }
+            }
+        }
+
+        println!("Stopping {} '{}'...", KIND.label(), name);
+        smolvm::control::stop_vm(&db, &name)?;
+        println!("Stopped {}: {}", KIND.label(), name);
+        Ok(())
     }
 }
 

@@ -463,38 +463,6 @@ pub fn start_vm_default(kind: VmKind) -> smolvm::Result<()> {
     Ok(())
 }
 
-// ============================================================================
-// Stop
-// ============================================================================
-
-/// Stop a machine by name.
-///
-/// Delegates core lifecycle to `smolvm::control::stop_vm`.
-pub fn stop_vm(kind: VmKind, name: &str) -> smolvm::Result<()> {
-    let db = SmolvmDb::open()?;
-
-    // Check current state for CLI messaging
-    let vm = smolvm::control::get_vm(&db, name).ok();
-
-    if let Some(ref vm) = vm {
-        if let Some(ref status) = vm.status {
-            if status.phase != smolvm::data::vm::VmPhase::Running {
-                println!(
-                    "{} '{}' is not running (state: {})",
-                    kind.display_name(),
-                    name,
-                    status.phase,
-                );
-                return Ok(());
-            }
-        }
-    }
-
-    println!("Stopping {} '{}'...", kind.label(), name);
-    smolvm::control::stop_vm(&db, name)?;
-    println!("Stopped {}: {}", kind.label(), name);
-    Ok(())
-}
 
 // ============================================================================
 // Delete
