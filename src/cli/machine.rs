@@ -14,15 +14,18 @@ use crate::cli::format_bytes;
 use crate::cli::parsers::{
     mounts_to_virtiofs_bindings, parse_cidr, parse_duration, parse_env_list,
 };
+use crate::cli::truncate;
 use crate::cli::vm_common::{self, DeleteVmOptions, VmKind};
-use smolvm::SmolvmDb;
-use smolvm::control;
 use clap::{Args, Subcommand};
 use smolvm::agent::{docker_config_mount, AgentClient, AgentManager, RunConfig, VmResources};
+use smolvm::control;
 use smolvm::data::consts::DEFAULT_MACHINE_NAME;
+use smolvm::data::disk::{DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
 use smolvm::data::mount::HostMount;
 use smolvm::data::network::PortMapping;
 use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
+use smolvm::data::vm::MicroVm;
+use smolvm::SmolvmDb;
 use smolvm::{DEFAULT_IDLE_CMD, DEFAULT_SHELL_CMD};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -1009,7 +1012,134 @@ pub struct LsCmd {
 
 impl LsCmd {
     pub fn run(&self) -> smolvm::Result<()> {
-        vm_common::list_vms(KIND, self.verbose, self.json)
+        let db = SmolvmDb::open()?;
+        let vms: Vec<MicroVm> = control::list_vms(&db)?;
+
+        if vms.is_empty() {
+            if !self.json {
+                println!("No machines found");
+            } else {
+                println!("[]");
+            }
+            return Ok(());
+        }
+
+        if self.json {
+            let json_vms: Vec<_> = vms
+                .iter()
+                .map(|vm| {
+                    let phase = vm
+                        .status
+                        .as_ref()
+                        .map(|s| s.phase.to_string())
+                        .unwrap_or_else(|| "unknown".into());
+                    let pid = vm.status.as_ref().and_then(|s| s.pid);
+                    let created_at = vm
+                        .status
+                        .as_ref()
+                        .map(|s| s.created_at.as_str())
+                        .unwrap_or("");
+                    let mut obj = serde_json::json!({
+                        "name": vm.name,
+                        "state": phase,
+                        "cpus": vm.spec.resources.cpus,
+                        "memory_mib": vm.spec.resources.memory_mib,
+                        "pid": pid,
+                        "mounts": vm.spec.mounts.len(),
+                        "ports": vm.spec.ports.len(),
+                        "created_at": created_at,
+                        "storage_gib": vm.spec.resources.storage_gib,
+                        "overlay_gib": vm.spec.resources.overlay_gib,
+                        "image": vm.spec.image,
+                        "entrypoint": vm.spec.entrypoint,
+                        "cmd": vm.spec.cmd,
+                    });
+                    if KIND.include_network_in_json() {
+                        obj.as_object_mut().unwrap().insert(
+                            "network".into(),
+                            serde_json::json!(vm.spec.resources.network),
+                        );
+                    }
+                    obj
+                })
+                .collect();
+            let json = serde_json::to_string_pretty(&json_vms)
+                .map_err(|e| smolvm::Error::config("serialize json", e.to_string()))?;
+            println!("{}", json);
+        } else {
+            println!(
+                "{:<20} {:<10} {:>5} {:>10} {:>7} {:>7} {:>8} {:>8}",
+                "NAME", "STATE", "CPUS", "MEMORY", "MOUNTS", "PORTS", "STORAGE", "OVERLAY"
+            );
+            println!("{}", "-".repeat(82));
+
+            for vm in &vms {
+                let phase = vm
+                    .status
+                    .as_ref()
+                    .map(|s| s.phase.to_string())
+                    .unwrap_or_else(|| "unknown".into());
+                let storage_gb = vm
+                    .spec
+                    .resources
+                    .storage_gib
+                    .unwrap_or(DEFAULT_STORAGE_SIZE_GIB);
+                let overlay_gb = vm
+                    .spec
+                    .resources
+                    .overlay_gib
+                    .unwrap_or(DEFAULT_OVERLAY_SIZE_GIB);
+                println!(
+                    "{:<20} {:<10} {:>5} {:>10} {:>7} {:>7} {:>8} {:>8}",
+                    truncate(&vm.name, 18),
+                    phase,
+                    vm.spec.resources.cpus,
+                    format!("{} MiB", vm.spec.resources.memory_mib),
+                    vm.spec.mounts.len(),
+                    vm.spec.ports.len(),
+                    format!("{} GiB", storage_gb),
+                    format!("{} GiB", overlay_gb),
+                );
+
+                if self.verbose {
+                    if let Some(ref status) = vm.status {
+                        if let Some(pid) = status.pid {
+                            println!("  PID: {}", pid);
+                        }
+                    }
+                    for m in &vm.spec.mounts {
+                        let ro_str = if m.read_only { " (ro)" } else { "" };
+                        println!(
+                            "  Mount: {} -> {}{}",
+                            m.source.display(),
+                            m.target.display(),
+                            ro_str
+                        );
+                    }
+                    for p in &vm.spec.ports {
+                        println!("  Port: {} -> {}", p.host, p.guest);
+                    }
+                    if KIND.include_network_in_json() && vm.spec.resources.network {
+                        println!("  Network: enabled");
+                    }
+                    for cmd in &vm.spec.init {
+                        println!("  Init: {}", cmd);
+                    }
+                    for (k, v) in &vm.spec.env {
+                        println!("  Env: {}={}", k, v);
+                    }
+                    if let Some(ref wd) = vm.spec.workdir {
+                        println!("  Workdir: {}", wd);
+                    }
+                    if let Some(ref status) = vm.status {
+                        println!("  Created: {}", status.created_at);
+                    }
+                    println!();
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 

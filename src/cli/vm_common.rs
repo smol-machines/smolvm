@@ -5,11 +5,10 @@
 //! This module provides the common implementations, parameterised by
 //! [`VmKind`].
 
-use crate::cli::{format_pid_suffix, truncate};
+use crate::cli::format_pid_suffix;
 use smolvm::agent::AgentManager;
 use smolvm::config::{RecordState, SmolvmConfig, VmRecord};
 use smolvm::control;
-use smolvm::data::disk::{DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
 use smolvm::data::mount::HostMount;
 use smolvm::data::network::PortMapping;
 use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
@@ -545,143 +544,6 @@ where
         manager.detach();
     } else {
         println!("{} '{}': not running", kind.display_name(), label);
-    }
-
-    Ok(())
-}
-
-// ============================================================================
-// List
-// ============================================================================
-
-/// List all machines.
-///
-/// Uses `control::list_vms` for data, then formats for CLI output.
-pub fn list_vms(kind: VmKind, verbose: bool, json: bool) -> smolvm::Result<()> {
-    let db = SmolvmDb::open()?;
-    let vms: Vec<MicroVm> = control::list_vms(&db)?;
-
-    if vms.is_empty() {
-        if !json {
-            println!("No machines found");
-        } else {
-            println!("[]");
-        }
-        return Ok(());
-    }
-
-    if json {
-        let json_vms: Vec<_> = vms
-            .iter()
-            .map(|vm| {
-                let phase = vm
-                    .status
-                    .as_ref()
-                    .map(|s| s.phase.to_string())
-                    .unwrap_or_else(|| "unknown".into());
-                let pid = vm.status.as_ref().and_then(|s| s.pid);
-                let created_at = vm
-                    .status
-                    .as_ref()
-                    .map(|s| s.created_at.as_str())
-                    .unwrap_or("");
-                let mut obj = serde_json::json!({
-                    "name": vm.name,
-                    "state": phase,
-                    "cpus": vm.spec.resources.cpus,
-                    "memory_mib": vm.spec.resources.memory_mib,
-                    "pid": pid,
-                    "mounts": vm.spec.mounts.len(),
-                    "ports": vm.spec.ports.len(),
-                    "created_at": created_at,
-                    "storage_gb": vm.spec.resources.storage_gib,
-                    "overlay_gb": vm.spec.resources.overlay_gib,
-                    "image": vm.spec.image,
-                    "entrypoint": vm.spec.entrypoint,
-                    "cmd": vm.spec.cmd,
-                });
-                if kind.include_network_in_json() {
-                    obj.as_object_mut()
-                        .unwrap()
-                        .insert("network".into(), serde_json::json!(vm.spec.resources.network));
-                }
-                obj
-            })
-            .collect();
-        let json = serde_json::to_string_pretty(&json_vms)
-            .map_err(|e| smolvm::Error::config("serialize json", e.to_string()))?;
-        println!("{}", json);
-    } else {
-        println!(
-            "{:<20} {:<12} {:>5} {:>10} {:>7} {:>7} {:>8} {:>8}",
-            "NAME", "STATE", "CPUS", "MEMORY", "MOUNTS", "PORTS", "STORAGE", "OVERLAY"
-        );
-        println!("{}", "-".repeat(88));
-
-        for vm in &vms {
-            let phase = vm
-                .status
-                .as_ref()
-                .map(|s| s.phase.to_string())
-                .unwrap_or_else(|| "unknown".into());
-            let storage_gb = vm
-                .spec
-                .resources
-                .storage_gib
-                .unwrap_or(DEFAULT_STORAGE_SIZE_GIB);
-            let overlay_gb = vm
-                .spec
-                .resources
-                .overlay_gib
-                .unwrap_or(DEFAULT_OVERLAY_SIZE_GIB);
-            println!(
-                "{:<20} {:<10} {:>5} {:>10} {:>7} {:>7} {:>8} {:>8}",
-                truncate(&vm.name, 18),
-                phase,
-                vm.spec.resources.cpus,
-                format!("{} MiB", vm.spec.resources.memory_mib),
-                vm.spec.mounts.len(),
-                vm.spec.ports.len(),
-                format!("{} GiB", storage_gb),
-                format!("{} GiB", overlay_gb),
-            );
-
-            if verbose {
-                if let Some(ref status) = vm.status {
-                    if let Some(pid) = status.pid {
-                        println!("  PID: {}", pid);
-                    }
-                }
-                for m in &vm.spec.mounts {
-                    let ro_str = if m.read_only { " (ro)" } else { "" };
-                    println!(
-                        "  Mount: {} -> {}{}",
-                        m.source.display(),
-                        m.target.display(),
-                        ro_str
-                    );
-                }
-                for p in &vm.spec.ports {
-                    println!("  Port: {} -> {}", p.host, p.guest);
-                }
-                if kind.include_network_in_json() && vm.spec.resources.network {
-                    println!("  Network: enabled");
-                }
-                for cmd in &vm.spec.init {
-                    println!("  Init: {}", cmd);
-                }
-                for (k, v) in &vm.spec.env {
-                    println!("  Env: {}={}", k, v);
-                }
-                if let Some(ref wd) = vm.spec.workdir {
-                    println!("  Workdir: {}", wd);
-                }
-                if let Some(ref status) = vm.status {
-                    println!("  Created: {}", status.created_at);
-                }
-                println!();
-            }
-        }
     }
 
     Ok(())
