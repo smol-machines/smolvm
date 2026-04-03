@@ -926,7 +926,9 @@ pub struct StopCmd {
 
 impl StopCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        let name = self.name.unwrap_or_else(|| "default".to_string());
+        let name = self
+            .name
+            .unwrap_or_else(|| smolvm::data::consts::DEFAULT_MACHINE_NAME.to_string());
 
         let db = smolvm::db::SmolvmDb::open()?;
 
