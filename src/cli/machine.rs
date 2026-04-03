@@ -15,8 +15,11 @@ use crate::cli::parsers::{
     mounts_to_virtiofs_bindings, parse_cidr, parse_duration, parse_env_list,
 };
 use crate::cli::vm_common::{self, DeleteVmOptions, VmKind};
+use smolvm::SmolvmDb;
+use smolvm::control;
 use clap::{Args, Subcommand};
 use smolvm::agent::{docker_config_mount, AgentClient, AgentManager, RunConfig, VmResources};
+use smolvm::data::consts::DEFAULT_MACHINE_NAME;
 use smolvm::data::mount::HostMount;
 use smolvm::data::network::PortMapping;
 use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
@@ -923,11 +926,8 @@ pub struct StopCmd {
 
 impl StopCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        let name = vm_common::resolve_vm_name(self.name)?;
-        match &name {
-            Some(name) => vm_common::stop_vm_named(KIND, name),
-            None => vm_common::stop_vm_default(KIND),
-        }
+        let name = self.name.unwrap_or_else(|| "default".to_string());
+        vm_common::stop_vm(KIND, &name)
     }
 }
 
@@ -1044,10 +1044,14 @@ pub struct ResizeCmd {
 
 impl ResizeCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        let name = vm_common::resolve_vm_name(self.name)?;
-        let name_str = name.as_deref().unwrap_or("default");
+        let name = self.name.as_deref().unwrap_or(DEFAULT_MACHINE_NAME);
+        let db = SmolvmDb::open()?;
+        control::resize_vm(&db, name, self.storage, self.overlay)?;
 
-        vm_common::resize_vm(KIND, name_str, self.storage, self.overlay)
+        println!();
+        println!("{} '{}' resized successfully.", VmKind::Machine.display_name(), name);
+        println!("Disk changes are applied immediately; filesystem will expand on next boot.");
+        Ok(())
     }
 }
 

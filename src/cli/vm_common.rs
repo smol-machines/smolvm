@@ -50,23 +50,6 @@ impl VmKind {
 // Shared helpers
 // ============================================================================
 
-/// Resolve an optional VM name: if no name is given and a VM named "default"
-/// exists in the config database, return `Some("default")` so callers route
-/// through the named-VM code path (which loads config, init commands, network
-/// settings, etc.). Otherwise returns the input unchanged.
-pub fn resolve_vm_name(name: Option<String>) -> smolvm::Result<Option<String>> {
-    if name.is_some() {
-        return Ok(name);
-    }
-    // Use direct DB lookup instead of SmolvmConfig::load() to avoid
-    // loading all config + all VMs just to check if "default" exists.
-    let db = SmolvmDb::open()?;
-    if db.get_vm("default")?.is_some() {
-        Ok(Some("default".to_string()))
-    } else {
-        Ok(None)
-    }
-}
 
 /// Get the agent manager for an optional name (default if `None`).
 ///
@@ -484,10 +467,10 @@ pub fn start_vm_default(kind: VmKind) -> smolvm::Result<()> {
 // Stop
 // ============================================================================
 
-/// Stop a named machine.
+/// Stop a machine by name.
 ///
 /// Delegates core lifecycle to `smolvm::control::stop_vm`.
-pub fn stop_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
+pub fn stop_vm(kind: VmKind, name: &str) -> smolvm::Result<()> {
     let db = SmolvmDb::open()?;
 
     // Check current state for CLI messaging
@@ -510,17 +493,6 @@ pub fn stop_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
     println!("Stopping {} '{}'...", kind.label(), name);
     smolvm::control::stop_vm(&db, name)?;
     println!("Stopped {}: {}", kind.label(), name);
-    Ok(())
-}
-
-/// Stop the default machine.
-///
-/// Delegates to `stop_vm_named` with "default".
-pub fn stop_vm_default(kind: VmKind) -> smolvm::Result<()> {
-    let db = SmolvmDb::open()?;
-    println!("Stopping {} 'default'...", kind.label());
-    smolvm::control::stop_vm(&db, "default")?;
-    println!("{} 'default' stopped", kind.display_name());
     Ok(())
 }
 
