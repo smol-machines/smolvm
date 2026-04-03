@@ -15,7 +15,7 @@ use crate::cli::parsers::{
     mounts_to_virtiofs_bindings, parse_cidr, parse_duration, parse_env_list,
 };
 use crate::cli::truncate;
-use crate::cli::vm_common::{self, DeleteVmOptions, VmKind};
+use crate::cli::vm_common::{self, VmKind};
 use clap::{Args, Subcommand};
 use smolvm::agent::{docker_config_mount, AgentClient, AgentManager, RunConfig, VmResources};
 use smolvm::control;
@@ -961,14 +961,7 @@ pub struct DeleteCmd {
 
 impl DeleteCmd {
     pub fn run(&self) -> smolvm::Result<()> {
-        vm_common::delete_vm(
-            KIND,
-            &self.name,
-            self.force,
-            DeleteVmOptions {
-                stop_if_running: false,
-            },
-        )
+        vm_common::delete_vm(KIND, &self.name, self.force)
     }
 }
 
@@ -1079,12 +1072,12 @@ impl LsCmd {
                     .as_ref()
                     .map(|s| s.phase.to_string())
                     .unwrap_or_else(|| "unknown".into());
-                let storage_gb = vm
+                let storage_gib = vm
                     .spec
                     .resources
                     .storage_gib
                     .unwrap_or(DEFAULT_STORAGE_SIZE_GIB);
-                let overlay_gb = vm
+                let overlay_gib = vm
                     .spec
                     .resources
                     .overlay_gib
@@ -1097,8 +1090,8 @@ impl LsCmd {
                     format!("{} MiB", vm.spec.resources.memory_mib),
                     vm.spec.mounts.len(),
                     vm.spec.ports.len(),
-                    format!("{} GiB", storage_gb),
-                    format!("{} GiB", overlay_gb),
+                    format!("{} GiB", storage_gib),
+                    format!("{} GiB", overlay_gib),
                 );
 
                 if self.verbose {

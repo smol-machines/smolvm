@@ -467,37 +467,15 @@ pub fn start_vm_default(kind: VmKind) -> smolvm::Result<()> {
 // Delete
 // ============================================================================
 
-/// Options for machine delete behavior.
-pub struct DeleteVmOptions {
-    /// If true, stop the VM before deleting when it is running.
-    pub stop_if_running: bool,
-}
-
 /// Delete a named machine configuration.
 ///
 /// Handles CLI-specific confirmation prompt, then delegates to
 /// `control::delete_vm` for the actual deletion.
-pub fn delete_vm(
-    kind: VmKind,
-    name: &str,
-    force: bool,
-    options: DeleteVmOptions,
-) -> smolvm::Result<()> {
+pub fn delete_vm(kind: VmKind, name: &str, force: bool) -> smolvm::Result<()> {
     let db = SmolvmDb::open()?;
 
     // Check if exists (for CLI messaging)
     let _ = control::get_vm(&db, name)?;
-
-    // Stop if running and option set (machine run does this)
-    if options.stop_if_running {
-        let vm = control::get_vm(&db, name)?;
-        if let Some(ref status) = vm.status {
-            if status.phase == VmPhase::Running {
-                println!("Stopping {} '{}'...", kind.label(), name);
-                let _ = control::stop_vm(&db, name);
-            }
-        }
-    }
 
     // CLI-specific: confirm deletion unless --force
     if !force {
