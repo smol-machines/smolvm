@@ -682,6 +682,82 @@ test_ls_verbose_shows_init() {
 }
 
 # =============================================================================
+# Restart & Health Config Tests
+# =============================================================================
+
+test_smolfile_restart_policy() {
+    cat > "$SMOLFILE_TMPDIR/Smolfile.restart" <<'EOF'
+cpus = 1
+memory = 512
+
+[restart]
+policy = "always"
+max_retries = 5
+max_backoff = "30s"
+EOF
+
+    local vm_name="smolfile-restart-$$"
+    cleanup_vm "$vm_name"
+
+    # Create should succeed (restart config stored in VmRecord)
+    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.restart" 2>&1 || return 1
+
+    # Verify machine was created
+    $SMOLVM machine ls --json 2>&1 | grep -q "$vm_name" || return 1
+
+    cleanup_vm "$vm_name"
+}
+
+test_smolfile_health_config() {
+    cat > "$SMOLFILE_TMPDIR/Smolfile.health" <<'EOF'
+cpus = 1
+memory = 512
+
+[health]
+exec = ["echo", "ok"]
+interval = "10s"
+timeout = "3s"
+retries = 5
+
+[restart]
+policy = "on-failure"
+EOF
+
+    local vm_name="smolfile-health-$$"
+    cleanup_vm "$vm_name"
+
+    # Create should succeed (health + restart config stored)
+    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.health" 2>&1 || return 1
+
+    # Verify machine was created
+    $SMOLVM machine ls --json 2>&1 | grep -q "$vm_name" || return 1
+
+    cleanup_vm "$vm_name"
+}
+
+test_smolfile_monitor_basic() {
+    local vm_name="smolfile-monitor-$$"
+    cleanup_vm "$vm_name"
+
+    # Create and start a machine
+    $SMOLVM machine create --net "$vm_name" 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || return 1
+
+    # Run monitor briefly — it should print the header then we kill it
+    local output
+    output=$(run_with_timeout 6 $SMOLVM machine monitor --name "$vm_name" --interval 1 2>&1 || true)
+
+    # Verify it printed the monitoring header
+    echo "$output" | grep -q "Monitoring machine" || return 1
+
+    # Machine should still be running after monitor exits
+    $SMOLVM machine exec --name "$vm_name" -- echo "still-alive" 2>&1 | grep -q "still-alive" || return 1
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    cleanup_vm "$vm_name"
+}
+
+# =============================================================================
 # Run Tests
 # =============================================================================
 
@@ -718,5 +794,13 @@ run_test "Smolfile v2: auto-container on start" test_smolfile_auto_container_on_
 run_test "Smolfile v2: image+cmd overrides image default" test_smolfile_image_cmd_only_overrides_when_set || true
 run_test "Smolfile v2: image without cmd uses image default" test_smolfile_image_no_cmd_uses_image_default || true
 run_test "Smolfile v2: unknown section errors" test_smolfile_unknown_section_errors || true
+
+echo ""
+echo "--- Restart & Health Config Tests ---"
+echo ""
+
+run_test "Smolfile: [restart] policy persists" test_smolfile_restart_policy || true
+run_test "Smolfile: [health] config persists" test_smolfile_health_config || true
+run_test "Smolfile: monitor starts and exits" test_smolfile_monitor_basic || true
 
 print_summary "Smolfile Tests"

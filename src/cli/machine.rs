@@ -78,6 +78,9 @@ pub enum MachineCmd {
     /// Remove unused images and layers to free disk space
     Prune(PruneCmd),
 
+    /// Monitor a machine with health checks and restart policy
+    Monitor(MonitorCmd),
+
     /// Test network connectivity from inside the VM
     #[command(hide = true)]
     NetworkTest(NetworkTestCmd),
@@ -97,6 +100,7 @@ impl MachineCmd {
             MachineCmd::Resize(cmd) => cmd.run(),
             MachineCmd::Images(cmd) => cmd.run(),
             MachineCmd::Prune(cmd) => cmd.run(),
+            MachineCmd::Monitor(cmd) => cmd.run(),
             MachineCmd::NetworkTest(cmd) => cmd.run(),
         }
     }
@@ -964,6 +968,305 @@ impl PruneCmd {
             }
         }
 
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Monitor Command
+// ============================================================================
+
+/// Monitor a running machine with health checks and restart policy.
+///
+/// Runs in the foreground, watching the machine and restarting on crash
+/// or health check failure. Uses the restart policy from the machine's
+/// config (set via Smolfile [restart] or --restart flag on create).
+///
+/// Ctrl+C stops monitoring; the machine keeps running.
+///
+/// Examples:
+///   smolvm machine monitor --name myvm
+///   smolvm machine monitor --name myvm --health-cmd "curl -f http://localhost:8080/health"
+///   smolvm machine monitor --name myvm --restart always --interval 10
+#[derive(Args, Debug)]
+pub struct MonitorCmd {
+    /// Machine to monitor (default: "default")
+    #[arg(short = 'n', long, value_name = "NAME")]
+    pub name: Option<String>,
+
+    /// Override restart policy (never, always, on-failure, unless-stopped)
+    #[arg(long, value_name = "POLICY")]
+    pub restart: Option<String>,
+
+    /// Health check command (run inside the VM via sh -c)
+    #[arg(long, value_name = "CMD")]
+    pub health_cmd: Option<String>,
+
+    /// Health check timeout in seconds
+    #[arg(long, default_value = "5", value_name = "SECS")]
+    pub health_timeout: u64,
+
+    /// Check interval in seconds
+    #[arg(long, default_value = "5", value_name = "SECS")]
+    pub interval: u64,
+
+    /// Health check failures before triggering restart
+    #[arg(long, default_value = "3", value_name = "N")]
+    pub health_retries: u32,
+}
+
+impl MonitorCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        use smolvm::config::{RecordState, RestartPolicy};
+        use smolvm::db::SmolvmDb;
+        use smolvm::Error;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let name = self.name.unwrap_or_else(|| "default".to_string());
+
+        // Load machine config from DB
+        let db = SmolvmDb::open()?;
+        let record = db
+            .get_vm(&name)?
+            .ok_or_else(|| Error::vm_not_found(&name))?;
+
+        // Build restart config: CLI override > VmRecord config
+        let mut restart = record.restart.clone();
+        if let Some(ref policy_str) = self.restart {
+            restart.policy = policy_str
+                .parse::<RestartPolicy>()
+                .map_err(|e| Error::config("--restart", e))?;
+        }
+
+        // Resolve health check: CLI override > VmRecord config
+        let health_cmd = self
+            .health_cmd
+            .clone()
+            .map(|c| vec!["sh".into(), "-c".into(), c])
+            .or_else(|| record.health_cmd.clone());
+        let health_timeout =
+            Duration::from_secs(record.health_timeout_secs.unwrap_or(self.health_timeout));
+        let health_retries = record.health_retries.unwrap_or(self.health_retries);
+        let interval = Duration::from_secs(record.health_interval_secs.unwrap_or(self.interval));
+        let startup_grace = record
+            .health_startup_grace_secs
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::ZERO);
+
+        drop(db);
+
+        // Ensure machine is running
+        let manager = AgentManager::for_vm(&name)
+            .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
+
+        if !manager.is_process_alive() {
+            println!("Machine '{}' is not running, starting...", name);
+            vm_common::start_vm_named(KIND, &name)?;
+        }
+
+        println!(
+            "Monitoring machine '{}' (policy: {}, interval: {}s)",
+            name,
+            restart.policy,
+            interval.as_secs()
+        );
+        if health_cmd.is_some() {
+            println!(
+                "  Health check: retries={}, timeout={}s",
+                health_retries,
+                health_timeout.as_secs()
+            );
+        }
+
+        // Ctrl+C handler via SIGINT
+        //
+        // SAFETY: `stop` is an Arc<AtomicBool> that lives until the end of this
+        // function. The cloned Arc below keeps a strong reference alive for the
+        // duration of the monitor loop, so the raw pointer stored in STOP_FLAG
+        // remains valid until after we break out of the loop and the function
+        // returns. The handler only does an atomic store, which is async-signal-safe.
+        let stop = Arc::new(AtomicBool::new(false));
+        {
+            let stop = stop.clone();
+            unsafe {
+                let _ = libc::signal(libc::SIGINT, {
+                    static mut STOP_FLAG: *const AtomicBool = std::ptr::null();
+                    STOP_FLAG = Arc::as_ptr(&stop);
+                    extern "C" fn handler(_: libc::c_int) {
+                        unsafe {
+                            if !STOP_FLAG.is_null() {
+                                (*STOP_FLAG).store(true, Ordering::SeqCst);
+                            }
+                        }
+                    }
+                    handler as *const () as libc::sighandler_t
+                });
+            }
+        }
+
+        let mut consecutive_health_failures: u32 = 0;
+        let mut last_check = std::time::Instant::now();
+        let mut last_start = std::time::Instant::now(); // tracks startup grace period
+
+        loop {
+            std::thread::sleep(interval);
+
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
+
+            // Detect sleep/wake: if the elapsed wall time is much longer than
+            // the expected interval, the machine was likely suspended (laptop lid
+            // closed). Reset health failures and skip this cycle to give the VM
+            // time to recover network connections.
+            let elapsed = last_check.elapsed();
+            last_check = std::time::Instant::now();
+            if elapsed > interval * 3 {
+                let sleep_secs = elapsed.as_secs() - interval.as_secs();
+                println!(
+                    "  detected suspend (~{}s) — skipping health check for recovery",
+                    sleep_secs
+                );
+                consecutive_health_failures = 0;
+                continue;
+            }
+
+            // Refresh manager to pick up PID changes after restart
+            let manager = match AgentManager::for_vm(&name) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            if manager.is_process_alive() {
+                // Skip health checks during startup grace period
+                if !startup_grace.is_zero() && last_start.elapsed() < startup_grace {
+                    continue;
+                }
+
+                // Machine is alive — run health check if configured
+                if let Some(ref cmd) = health_cmd {
+                    match AgentClient::connect_with_short_timeout(manager.vsock_socket()) {
+                        Ok(mut client) => {
+                            match client.vm_exec(cmd.clone(), vec![], None, Some(health_timeout)) {
+                                Ok((0, _, _)) => {
+                                    if consecutive_health_failures > 0 {
+                                        println!("  health check passed (recovered)");
+                                    }
+                                    consecutive_health_failures = 0;
+                                }
+                                Ok((code, _, stderr)) => {
+                                    consecutive_health_failures += 1;
+                                    println!(
+                                        "  health check failed (exit {}, {}/{}): {}",
+                                        code,
+                                        consecutive_health_failures,
+                                        health_retries,
+                                        stderr.trim()
+                                    );
+                                }
+                                Err(e) => {
+                                    consecutive_health_failures += 1;
+                                    println!(
+                                        "  health check error ({}/{}): {}",
+                                        consecutive_health_failures, health_retries, e
+                                    );
+                                }
+                            }
+
+                            if consecutive_health_failures >= health_retries {
+                                println!("  unhealthy — stopping machine for restart");
+                                let _ = vm_common::stop_vm_named(KIND, &name);
+                                continue;
+                            }
+                        }
+                        Err(_) => {
+                            consecutive_health_failures += 1;
+                            println!(
+                                "  cannot connect to agent ({}/{})",
+                                consecutive_health_failures, health_retries
+                            );
+                        }
+                    }
+                }
+            } else {
+                // Machine is dead
+                consecutive_health_failures = 0;
+
+                let exit_code = manager.child_pid().and_then(smolvm::process::try_wait);
+
+                println!(
+                    "  machine exited (exit code: {})",
+                    exit_code
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "unknown".into())
+                );
+
+                // Update DB state
+                if let Ok(db) = SmolvmDb::open() {
+                    let _ = db.update_vm(&name, |r| {
+                        r.state = RecordState::Stopped;
+                        r.pid = None;
+                        r.last_exit_code = exit_code;
+                    });
+                }
+
+                if restart.should_restart(exit_code) {
+                    let backoff = restart.backoff_duration();
+                    restart.restart_count += 1;
+
+                    println!(
+                        "  restarting (attempt {}, backoff {}s)...",
+                        restart.restart_count,
+                        backoff.as_secs()
+                    );
+
+                    if let Ok(db) = SmolvmDb::open() {
+                        let _ = db.update_vm(&name, |r| {
+                            r.restart.restart_count = restart.restart_count;
+                        });
+                    }
+
+                    std::thread::sleep(backoff);
+
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+
+                    match vm_common::start_vm_named(KIND, &name) {
+                        Ok(()) => {
+                            println!("  machine restarted");
+                            last_start = std::time::Instant::now();
+                        }
+                        Err(e) => println!("  restart failed: {}", e),
+                    }
+                } else {
+                    println!(
+                        "  not restarting (policy: {}, count: {}/{})",
+                        restart.policy,
+                        restart.restart_count,
+                        if restart.max_retries > 0 {
+                            restart.max_retries.to_string()
+                        } else {
+                            "unlimited".into()
+                        }
+                    );
+                    break;
+                }
+            }
+        }
+
+        // Mark user stopped
+        if let Ok(db) = SmolvmDb::open() {
+            let _ = db.update_vm(&name, |r| {
+                r.restart.user_stopped = true;
+            });
+        }
+
+        println!(
+            "\nStopped monitoring. Machine '{}' may still be running.",
+            name
+        );
         Ok(())
     }
 }

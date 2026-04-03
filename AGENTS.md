@@ -52,6 +52,7 @@ smolvm machine stop [--name NAME]                 # stop
 smolvm machine delete NAME [-f]                   # delete
 smolvm machine status [--name NAME]               # check state
 smolvm machine ls [--json]                        # list all
+smolvm machine monitor [--name NAME]              # foreground health + restart
 
 smolvm container create --image IMAGE [-- CMD]    # --machine defaults to "default"
 smolvm container exec --container ID [-- CMD]
@@ -118,17 +119,13 @@ memory = 2048
 entrypoint = ["/app/run"]             # override entrypoint for packed binary
 oci_platform = "linux/amd64"          # target OCI platform
 
-# Service (parsed, not yet wired)
-[service]
-listen = 8080
-protocol = "http"
-
-# Health check (parsed, not yet wired)
+# Health check (used by `machine monitor`)
 [health]
 exec = ["curl", "-f", "http://127.0.0.1:8080/health"]
 interval = "10s"
 timeout = "2s"
 retries = 3
+startup_grace = "20s"
 ```
 
 ### Merge Precedence

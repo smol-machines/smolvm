@@ -752,8 +752,7 @@ pub fn restart_spec_to_config(spec: Option<&RestartSpec>) -> RestartConfig {
             RestartConfig {
                 policy,
                 max_retries: spec.max_retries.unwrap_or(0),
-                restart_count: 0,
-                user_stopped: false,
+                ..Default::default()
             }
         }
         None => RestartConfig::default(),

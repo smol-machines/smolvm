@@ -33,6 +33,9 @@ pub enum PackCmd {
 
     /// Run a VM from a packed .smolmachine sidecar file
     Run(super::pack_run::PackRunCmd),
+
+    /// Clean up cached pack extractions to free disk space
+    Prune(PackPruneCmd),
 }
 
 impl PackCmd {
@@ -40,6 +43,7 @@ impl PackCmd {
         match self {
             PackCmd::Create(cmd) => cmd.run(),
             PackCmd::Run(cmd) => cmd.run(),
+            PackCmd::Prune(cmd) => cmd.run(),
         }
     }
 }
@@ -722,4 +726,174 @@ impl PackCreateCmd {
             }
         }
     }
+}
+
+// ============================================================================
+// Pack Prune Command
+// ============================================================================
+
+/// Clean up cached pack extractions to free disk space.
+///
+/// Removes old extracted pack caches from ~/.cache/smolvm-pack/ and
+/// ~/.cache/smolvm-libs/. By default keeps the 5 most recently used.
+///
+/// Examples:
+///   smolvm pack prune              # keep 5 most recent
+///   smolvm pack prune --keep 2     # keep 2 most recent
+///   smolvm pack prune --all        # remove everything
+///   smolvm pack prune --dry-run    # show what would be removed
+#[derive(Args, Debug)]
+pub struct PackPruneCmd {
+    /// Number of cached extractions to keep (default: 5)
+    #[arg(long, default_value = "5", value_name = "N")]
+    pub keep: usize,
+
+    /// Remove all cached extractions
+    #[arg(long)]
+    pub all: bool,
+
+    /// Show what would be removed without actually removing
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+impl PackPruneCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        let keep = if self.all { 0 } else { self.keep };
+
+        let mut total_freed: u64 = 0;
+        let mut total_removed: usize = 0;
+
+        // Clean pack sidecar cache
+        if let Some(base) = dirs::cache_dir() {
+            let pack_cache = base.join("smolvm-pack");
+            let (freed, removed) = self.prune_cache_dir(&pack_cache, keep, "pack cache")?;
+            total_freed += freed;
+            total_removed += removed;
+
+            // Clean libs cache
+            let libs_cache = base.join("smolvm-libs");
+            let (freed, removed) = self.prune_cache_dir(&libs_cache, keep, "libs cache")?;
+            total_freed += freed;
+            total_removed += removed;
+        }
+
+        if total_removed > 0 {
+            if self.dry_run {
+                println!(
+                    "Would remove {} cached entries ({})",
+                    total_removed,
+                    crate::cli::format_bytes(total_freed)
+                );
+            } else {
+                println!(
+                    "Removed {} cached entries, freed {}",
+                    total_removed,
+                    crate::cli::format_bytes(total_freed)
+                );
+            }
+        } else {
+            println!("No cached entries to remove.");
+        }
+
+        Ok(())
+    }
+
+    fn prune_cache_dir(
+        &self,
+        base: &std::path::Path,
+        keep: usize,
+        label: &str,
+    ) -> smolvm::Result<(u64, usize)> {
+        if !base.exists() {
+            return Ok((0, 0));
+        }
+
+        // Collect entries with modification time (skip entries we can't stat)
+        let mut entries: Vec<(std::path::PathBuf, std::time::SystemTime, u64)> = vec![];
+        let read_dir = match std::fs::read_dir(base) {
+            Ok(rd) => rd,
+            Err(e) => {
+                tracing::warn!(error = %e, path = %base.display(), "cannot read {}", label);
+                return Ok((0, 0));
+            }
+        };
+        for entry in read_dir {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let metadata = match std::fs::metadata(&path) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!(error = %e, path = %path.display(), "skipping unreadable entry in {}", label);
+                    continue;
+                }
+            };
+            let modified = metadata
+                .modified()
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            let size = dir_size(&path);
+            entries.push((path, modified, size));
+        }
+
+        // Sort by most recently modified (newest first)
+        entries.sort_by(|a, b| b.1.cmp(&a.1));
+
+        // Remove entries beyond keep count
+        let to_remove = if entries.len() > keep {
+            &entries[keep..]
+        } else {
+            return Ok((0, 0));
+        };
+
+        let mut freed: u64 = 0;
+        let mut removed: usize = 0;
+
+        for (path, _, size) in to_remove {
+            if self.dry_run {
+                println!(
+                    "  would remove: {} ({})",
+                    path.display(),
+                    crate::cli::format_bytes(*size)
+                );
+            } else {
+                if let Err(e) = std::fs::remove_dir_all(path) {
+                    tracing::warn!(error = %e, path = %path.display(), "failed to remove {}", label);
+                    continue;
+                }
+                // Also remove lock file if present
+                let lock = path.with_extension("lock");
+                let _ = std::fs::remove_file(&lock);
+            }
+            freed += size;
+            removed += 1;
+        }
+
+        Ok((freed, removed))
+    }
+}
+
+/// Calculate the total size of a directory (recursive).
+fn dir_size(path: &std::path::Path) -> u64 {
+    std::fs::read_dir(path)
+        .ok()
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .map(|e| {
+                    let meta = e.metadata().ok();
+                    if e.path().is_dir() {
+                        dir_size(&e.path())
+                    } else {
+                        meta.map(|m| m.len()).unwrap_or(0)
+                    }
+                })
+                .sum()
+        })
+        .unwrap_or(0)
 }

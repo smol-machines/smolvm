@@ -522,41 +522,6 @@ pub fn extract_libs_from_binary(exe_path: &Path, debug: bool) -> std::io::Result
     Ok(Some(lib_dir))
 }
 
-/// Clean up old cached extractions (keep only the most recent N).
-#[allow(dead_code)]
-pub fn cleanup_old_caches(keep: usize) -> std::io::Result<()> {
-    let base = match dirs::cache_dir() {
-        Some(d) => d.join("smolvm-pack"),
-        None => return Ok(()),
-    };
-
-    if !base.exists() {
-        return Ok(());
-    }
-
-    let mut entries: Vec<(PathBuf, std::time::SystemTime)> = vec![];
-
-    for entry in fs::read_dir(&base)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            if let Ok(metadata) = fs::metadata(&path) {
-                if let Ok(modified) = metadata.modified() {
-                    entries.push((path, modified));
-                }
-            }
-        }
-    }
-
-    entries.sort_by(|a, b| b.1.cmp(&a.1));
-
-    for (path, _) in entries.into_iter().skip(keep) {
-        let _ = fs::remove_dir_all(path);
-    }
-
-    Ok(())
-}
-
 /// Create a storage disk file (empty sparse file).
 pub fn create_storage_disk(path: &Path, size: u64) -> std::io::Result<()> {
     let file = File::create(path)?;

@@ -176,6 +176,14 @@ pub struct CreateVmParams {
     pub storage_gb: Option<u64>,
     pub overlay_gb: Option<u64>,
     pub allowed_cidrs: Option<Vec<String>>,
+    pub restart_policy: Option<smolvm::config::RestartPolicy>,
+    pub restart_max_retries: Option<u32>,
+    pub restart_max_backoff_secs: Option<u64>,
+    pub health_cmd: Option<Vec<String>>,
+    pub health_interval_secs: Option<u64>,
+    pub health_timeout_secs: Option<u64>,
+    pub health_retries: Option<u32>,
+    pub health_startup_grace_secs: Option<u64>,
 }
 
 /// Maximum length for machine names.
@@ -276,14 +284,23 @@ pub fn create_vm(kind: VmKind, params: CreateVmParams) -> smolvm::Result<()> {
         })
         .collect();
 
-    // Create record
-    let mut record = VmRecord::new(
+    // Create record with restart policy if configured
+    let restart = smolvm::config::RestartConfig {
+        policy: params
+            .restart_policy
+            .unwrap_or(smolvm::config::RestartPolicy::Never),
+        max_retries: params.restart_max_retries.unwrap_or(0),
+        max_backoff_secs: params.restart_max_backoff_secs.unwrap_or(0),
+        ..Default::default()
+    };
+    let mut record = VmRecord::new_with_restart(
         params.name.clone(),
         params.cpus,
         params.mem,
         mounts,
         ports,
         params.net,
+        restart,
     );
     record.init = params.init.clone();
     record.env = env;
@@ -294,6 +311,11 @@ pub fn create_vm(kind: VmKind, params: CreateVmParams) -> smolvm::Result<()> {
     record.image = params.image.clone();
     record.entrypoint = params.entrypoint.clone();
     record.cmd = params.cmd.clone();
+    record.health_cmd = params.health_cmd.clone();
+    record.health_interval_secs = params.health_interval_secs;
+    record.health_timeout_secs = params.health_timeout_secs;
+    record.health_retries = params.health_retries;
+    record.health_startup_grace_secs = params.health_startup_grace_secs;
 
     // Store in config (persisted immediately to database)
     config.insert_vm(params.name.clone(), record)?;

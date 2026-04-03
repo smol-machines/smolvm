@@ -85,15 +85,10 @@ pub struct Smolfile {
     pub pack: Option<ArtifactConfig>, // alias for artifact
     pub dev: Option<DevConfig>,
 
-    // Parsed but not wired yet
-    #[allow(dead_code)]
-    pub service: Option<ServiceConfig>,
-    #[allow(dead_code)]
+    // Wired: flows into VmRecord health fields + monitor command
     pub health: Option<HealthConfig>,
-    #[allow(dead_code)]
+    // Wired: flows into VmRecord restart config
     pub restart: Option<RestartSmolfileConfig>,
-    #[allow(dead_code)]
-    pub deploy: Option<DeployConfig>,
 }
 
 /// Distribution-specific overrides for packed artifacts.
@@ -124,21 +119,9 @@ pub struct DevConfig {
     pub ports: Vec<String>,
 }
 
-/// Service semantics (parsed, not yet wired).
+/// Health check configuration for the monitor command.
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
-#[allow(dead_code)]
-pub struct ServiceConfig {
-    pub listen: Option<u16>,
-    pub protocol: Option<String>,
-    #[serde(default)]
-    pub ports: Vec<String>,
-}
-
-/// Health check configuration (parsed, not yet wired).
-#[derive(Debug, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-#[allow(dead_code)]
 pub struct HealthConfig {
     #[serde(default)]
     pub exec: Vec<String>,
@@ -148,26 +131,15 @@ pub struct HealthConfig {
     pub startup_grace: Option<String>,
 }
 
-/// Restart policy (parsed, not yet wired).
+/// Restart policy for the Smolfile [restart] section.
 /// Named to avoid conflict with smolvm::config::RestartConfig.
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
-#[allow(dead_code)]
 pub struct RestartSmolfileConfig {
     pub policy: Option<String>,
     pub max_retries: Option<u32>,
-}
-
-/// Deployment configuration (parsed, not yet wired).
-#[derive(Debug, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-#[allow(dead_code)]
-pub struct DeployConfig {
-    pub replicas: Option<u32>,
-    pub min_ready_seconds: Option<u32>,
-    pub strategy: Option<String>,
-    pub max_unavailable: Option<u32>,
-    pub max_surge: Option<u32>,
+    /// Maximum backoff duration between restarts (e.g., "60s", "5m").
+    pub max_backoff: Option<String>,
 }
 
 /// Load and parse a Smolfile from the given path.
@@ -178,6 +150,20 @@ pub fn load(path: &Path) -> smolvm::Result<Smolfile> {
 
     toml::from_str(&content)
         .map_err(|e| smolvm::Error::config("parse smolfile", format!("{}: {}", path.display(), e)))
+}
+
+/// Parse a duration string like "10s", "5m", "2h" to seconds.
+fn parse_duration_secs(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if let Some(n) = s.strip_suffix('s') {
+        n.parse().ok()
+    } else if let Some(n) = s.strip_suffix('m') {
+        n.parse::<u64>().ok().map(|n| n * 60)
+    } else if let Some(n) = s.strip_suffix('h') {
+        n.parse::<u64>().ok().map(|n| n * 3600)
+    } else {
+        s.parse().ok() // bare number = seconds
+    }
 }
 
 /// Build `CreateVmParams` by merging CLI flags with an optional Smolfile.
@@ -232,6 +218,14 @@ pub fn build_create_params(
                 storage_gb: cli_storage_gb,
                 overlay_gb: cli_overlay_gb,
                 allowed_cidrs: cidrs_to_option(cli_allow_cidr),
+                restart_policy: None,
+                restart_max_retries: None,
+                restart_max_backoff_secs: None,
+                health_cmd: None,
+                health_interval_secs: None,
+                health_timeout_secs: None,
+                health_retries: None,
+                health_startup_grace_secs: None,
             });
         }
     };
@@ -335,6 +329,46 @@ pub fn build_create_params(
     };
     let allowed_cidrs = cidrs_to_option(allowed_cidrs_vec);
 
+    // Restart policy from [restart] section
+    let restart_policy = sf
+        .restart
+        .as_ref()
+        .and_then(|r| r.policy.as_deref())
+        .map(|p| {
+            p.parse::<smolvm::config::RestartPolicy>()
+                .map_err(|e| smolvm::Error::config("smolfile [restart] policy", e))
+        })
+        .transpose()?;
+    let restart_max_retries = sf.restart.as_ref().and_then(|r| r.max_retries);
+    let restart_max_backoff_secs = sf
+        .restart
+        .as_ref()
+        .and_then(|r| r.max_backoff.as_ref())
+        .and_then(|s| parse_duration_secs(s));
+
+    // Health check from [health] section
+    let health_cmd = sf
+        .health
+        .as_ref()
+        .filter(|h| !h.exec.is_empty())
+        .map(|h| h.exec.clone());
+    let health_interval_secs = sf
+        .health
+        .as_ref()
+        .and_then(|h| h.interval.as_ref())
+        .and_then(|s| parse_duration_secs(s));
+    let health_timeout_secs = sf
+        .health
+        .as_ref()
+        .and_then(|h| h.timeout.as_ref())
+        .and_then(|s| parse_duration_secs(s));
+    let health_retries = sf.health.as_ref().and_then(|h| h.retries);
+    let health_startup_grace_secs = sf
+        .health
+        .as_ref()
+        .and_then(|h| h.startup_grace.as_ref())
+        .and_then(|s| parse_duration_secs(s));
+
     Ok(CreateVmParams {
         name,
         image,
@@ -351,6 +385,14 @@ pub fn build_create_params(
         storage_gb,
         overlay_gb,
         allowed_cidrs,
+        restart_policy,
+        restart_max_retries,
+        restart_max_backoff_secs,
+        health_cmd,
+        health_interval_secs,
+        health_timeout_secs,
+        health_retries,
+        health_startup_grace_secs,
     })
 }
 
