@@ -463,42 +463,6 @@ pub fn start_vm_default(kind: VmKind) -> smolvm::Result<()> {
 }
 
 
-// ============================================================================
-// Delete
-// ============================================================================
-
-/// Delete a named machine configuration.
-///
-/// Handles CLI-specific confirmation prompt, then delegates to
-/// `control::delete_vm` for the actual deletion.
-pub fn delete_vm(kind: VmKind, name: &str, force: bool) -> smolvm::Result<()> {
-    let db = SmolvmDb::open()?;
-
-    // Check if exists (for CLI messaging)
-    let _ = control::get_vm(&db, name)?;
-
-    // CLI-specific: confirm deletion unless --force
-    if !force {
-        eprint!("Delete {} '{}'? [y/N] ", kind.label(), name);
-        let mut input = String::new();
-        if std::io::stdin().read_line(&mut input).is_ok() {
-            let input = input.trim().to_lowercase();
-            if input != "y" && input != "yes" {
-                println!("Cancelled");
-                return Ok(());
-            }
-        } else {
-            println!("Cancelled");
-            return Ok(());
-        }
-    }
-
-    // Delegate to control layer
-    control::delete_vm(&db, name, true)?;
-
-    println!("Deleted {}: {}", kind.label(), name);
-    Ok(())
-}
 
 // ============================================================================
 // Status

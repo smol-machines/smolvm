@@ -961,7 +961,30 @@ pub struct DeleteCmd {
 
 impl DeleteCmd {
     pub fn run(&self) -> smolvm::Result<()> {
-        vm_common::delete_vm(KIND, &self.name, self.force)
+        let db = SmolvmDb::open()?;
+
+        // Check if exists
+        let _ = control::get_vm(&db, &self.name)?;
+
+        // Confirm deletion unless --force
+        if !self.force {
+            eprint!("Delete {} '{}'? [y/N] ", KIND.label(), self.name);
+            let mut input = String::new();
+            if std::io::stdin().read_line(&mut input).is_ok() {
+                let input = input.trim().to_lowercase();
+                if input != "y" && input != "yes" {
+                    println!("Cancelled");
+                    return Ok(());
+                }
+            } else {
+                println!("Cancelled");
+                return Ok(());
+            }
+        }
+
+        control::delete_vm(&db, &self.name, true)?;
+        println!("Deleted {}: {}", KIND.label(), self.name);
+        Ok(())
     }
 }
 
