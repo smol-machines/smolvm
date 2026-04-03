@@ -931,22 +931,6 @@ impl StopCmd {
             .unwrap_or_else(|| smolvm::data::consts::DEFAULT_MACHINE_NAME.to_string());
 
         let db = smolvm::db::SmolvmDb::open()?;
-
-        // Check current state for CLI messaging
-        if let Ok(vm) = smolvm::control::get_vm(&db, &name) {
-            if let Some(ref status) = vm.status {
-                if status.phase != smolvm::data::vm::VmPhase::Running {
-                    println!(
-                        "{} '{}' is not running (state: {})",
-                        KIND.display_name(),
-                        name,
-                        status.phase,
-                    );
-                    return Ok(());
-                }
-            }
-        }
-
         println!("Stopping {} '{}'...", KIND.label(), name);
         smolvm::control::stop_vm(&db, &name)?;
         println!("Stopped {}: {}", KIND.label(), name);

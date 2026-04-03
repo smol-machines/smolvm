@@ -8,7 +8,7 @@
 //! them with a registry cache for SDKs and the API server.
 
 use crate::data::mount::HostMount;
-use crate::data::vm::{MicroVm, VmPhase, VmSpec, VmStatus};
+use crate::data::vm::{MicroVm, VmPhase, VmStatus};
 use crate::internal::agent::{vm_data_dir, AgentManager};
 use crate::internal::config::RecordState;
 use crate::internal::convert;
@@ -224,9 +224,21 @@ pub fn start_vm(db: &SmolvmDb, name: &str) -> crate::error::Result<VmHandle> {
 
 /// Stop a VM. Creates an AgentManager on demand, stops the process,
 /// and persists the Stopped state.
+///
+/// Returns an error if the VM is not found or not running.
 pub fn stop_vm(db: &SmolvmDb, name: &str) -> crate::error::Result<MicroVm> {
-    // Try to find in DB first
-    let record = db.get_vm(name)?;
+    let record = db
+        .get_vm(name)?
+        .ok_or_else(|| crate::Error::vm_not_found(name))?;
+
+    // Check if actually running
+    let actual_state = record.actual_state();
+    if actual_state != RecordState::Running {
+        return Err(crate::Error::InvalidState {
+            expected: "running".into(),
+            actual: format!("{}", actual_state),
+        });
+    }
 
     let manager = AgentManager::for_vm(name)
         .map_err(|e| crate::Error::agent("create agent manager", e.to_string()))?;
@@ -235,35 +247,16 @@ pub fn stop_vm(db: &SmolvmDb, name: &str) -> crate::error::Result<MicroVm> {
     manager.try_connect_existing();
     manager.stop()?;
 
-    // Persist stopped state if record exists
-    if record.is_some() {
-        if let Err(e) = db.update_vm(name, |r| {
-            r.state = RecordState::Stopped;
-            r.pid = None;
-            r.pid_start_time = None;
-        }) {
-            tracing::warn!(error = %e, vm = %name, "failed to persist stopped state");
-        }
+    // Persist stopped state
+    if let Err(e) = db.update_vm(name, |r| {
+        r.state = RecordState::Stopped;
+        r.pid = None;
+        r.pid_start_time = None;
+    }) {
+        tracing::warn!(error = %e, vm = %name, "failed to persist stopped state");
     }
 
-    // Return updated VM
-    match db.get_vm(name)? {
-        Some(record) => Ok(convert::record_to_vm(&record)),
-        None => {
-            // VM was not in DB (agent-only stop) — return minimal info
-            Ok(MicroVm {
-                name: name.to_string(),
-                spec: VmSpec::default(),
-                status: Some(VmStatus {
-                    phase: VmPhase::Stopped,
-                    pid: None,
-                    pid_start_time: None,
-                    created_at: String::new(),
-                    last_exit_code: None,
-                }),
-            })
-        }
-    }
+    get_vm(db, name)
 }
 
 /// Delete a VM. Optionally stops it first, removes from DB, and
