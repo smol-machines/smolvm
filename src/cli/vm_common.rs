@@ -8,10 +8,12 @@
 use crate::cli::{format_pid_suffix, truncate};
 use smolvm::agent::AgentManager;
 use smolvm::config::{RecordState, SmolvmConfig, VmRecord};
+use smolvm::control;
 use smolvm::data::disk::{DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
 use smolvm::data::mount::HostMount;
 use smolvm::data::network::PortMapping;
 use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
+use smolvm::data::vm::{MicroVm, VmPhase, VmSpec};
 use smolvm::db::SmolvmDb;
 
 // ============================================================================
@@ -154,10 +156,8 @@ pub struct CreateVmParams {
 
 /// Create a named machine configuration (does not start it).
 ///
-/// Delegates core persistence to `smolvm::control::create_vm`.
+/// Delegates core persistence to `control::create_vm`.
 pub fn create_vm(kind: VmKind, params: CreateVmParams) -> smolvm::Result<()> {
-    use smolvm::data::vm::{MicroVm, VmSpec};
-
     // Parse and validate volume mounts
     let mounts = HostMount::parse(&params.volume)?;
 
@@ -200,7 +200,7 @@ pub fn create_vm(kind: VmKind, params: CreateVmParams) -> smolvm::Result<()> {
     };
 
     let db = SmolvmDb::open()?;
-    smolvm::control::create_vm(&db, vm)?;
+    control::create_vm(&db, vm)?;
 
     // CLI output
     println!("Created {}: {}", kind.label(), params.name);
@@ -234,18 +234,18 @@ pub fn create_vm(kind: VmKind, params: CreateVmParams) -> smolvm::Result<()> {
 
 /// Start a named machine that has a config record.
 ///
-/// Delegates core lifecycle to `smolvm::control::start_vm`, then handles
+/// Delegates core lifecycle to `control::start_vm`, then handles
 /// CLI-specific post-start behavior (init commands, image pull, container creation).
 pub fn start_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
     let db = SmolvmDb::open()?;
 
     // Pre-start info for CLI output
-    let vm = smolvm::control::get_vm(&db, name)?;
+    let vm = control::get_vm(&db, name)?;
     let spec = &vm.spec;
 
     // Check if already running
     if let Some(ref status) = vm.status {
-        if status.phase == smolvm::data::vm::VmPhase::Running {
+        if status.phase == VmPhase::Running {
             let pid_suffix = format_pid_suffix(status.pid);
             println!(
                 "{} '{}' already running{}",
@@ -277,7 +277,7 @@ pub fn start_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
     );
 
     // Core lifecycle (delegated to control layer — handles AgentManager, ensure_running, DB persist)
-    let handle = smolvm::control::start_vm(&db, name)?;
+    let handle = control::start_vm(&db, name)?;
     let pid = handle.child_pid();
 
     // CLI-specific: run init commands
@@ -292,7 +292,7 @@ pub fn start_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
             if exit_code != 0 {
                 // Stop on init failure
                 drop(handle); // release the handle
-                let _ = smolvm::control::stop_vm(&db, name);
+                let _ = control::stop_vm(&db, name);
                 return Err(smolvm::Error::agent(
                     "init",
                     format!("init[{}] failed (exit {}): {}", i, exit_code, stderr.trim()),
@@ -477,7 +477,7 @@ pub struct DeleteVmOptions {
 /// Delete a named machine configuration.
 ///
 /// Handles CLI-specific confirmation prompt, then delegates to
-/// `smolvm::control::delete_vm` for the actual deletion.
+/// `control::delete_vm` for the actual deletion.
 pub fn delete_vm(
     kind: VmKind,
     name: &str,
@@ -487,15 +487,15 @@ pub fn delete_vm(
     let db = SmolvmDb::open()?;
 
     // Check if exists (for CLI messaging)
-    let _ = smolvm::control::get_vm(&db, name)?;
+    let _ = control::get_vm(&db, name)?;
 
     // Stop if running and option set (machine run does this)
     if options.stop_if_running {
-        let vm = smolvm::control::get_vm(&db, name)?;
+        let vm = control::get_vm(&db, name)?;
         if let Some(ref status) = vm.status {
-            if status.phase == smolvm::data::vm::VmPhase::Running {
+            if status.phase == VmPhase::Running {
                 println!("Stopping {} '{}'...", kind.label(), name);
-                let _ = smolvm::control::stop_vm(&db, name);
+                let _ = control::stop_vm(&db, name);
             }
         }
     }
@@ -517,7 +517,7 @@ pub fn delete_vm(
     }
 
     // Delegate to control layer
-    smolvm::control::delete_vm(&db, name, true)?;
+    control::delete_vm(&db, name, true)?;
 
     println!("Deleted {}: {}", kind.label(), name);
     Ok(())
@@ -556,12 +556,10 @@ where
 
 /// List all machines.
 ///
-/// Uses `smolvm::control::list_vms` for data, then formats for CLI output.
+/// Uses `control::list_vms` for data, then formats for CLI output.
 pub fn list_vms(kind: VmKind, verbose: bool, json: bool) -> smolvm::Result<()> {
-    use smolvm::data::vm::MicroVm;
-
     let db = SmolvmDb::open()?;
-    let vms: Vec<MicroVm> = smolvm::control::list_vms(&db)?;
+    let vms: Vec<MicroVm> = control::list_vms(&db)?;
 
     if vms.is_empty() {
         if !json {

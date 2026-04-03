@@ -928,11 +928,11 @@ impl StopCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let name = self
             .name
-            .unwrap_or_else(|| smolvm::data::consts::DEFAULT_MACHINE_NAME.to_string());
+            .unwrap_or_else(|| DEFAULT_MACHINE_NAME.to_string());
 
-        let db = smolvm::db::SmolvmDb::open()?;
+        let db = SmolvmDb::open()?;
         println!("Stopping {} '{}'...", KIND.label(), name);
-        smolvm::control::stop_vm(&db, &name)?;
+        control::stop_vm(&db, &name)?;
         println!("Stopped {}: {}", KIND.label(), name);
         Ok(())
     }
