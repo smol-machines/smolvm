@@ -650,14 +650,50 @@ fn execute_command(
     let env = build_env(manifest, &args.env);
     let workdir = args.workdir.clone().or_else(|| manifest.workdir.clone());
 
+    let params = ExecParams {
+        command,
+        env,
+        workdir,
+        interactive: args.interactive,
+        tty: args.tty,
+        timeout: args.timeout,
+    };
+    execute_packed_command(client, manifest, params, mounts)
+}
+
+/// Resolved execution parameters for a packed command.
+struct ExecParams {
+    command: Vec<String>,
+    env: Vec<(String, String)>,
+    workdir: Option<String>,
+    interactive: bool,
+    tty: bool,
+    timeout: Option<Duration>,
+}
+
+/// Execute a command in the VM — shared by both `PackRunCmd` and packed binary paths.
+#[allow(clippy::too_many_arguments)]
+fn execute_packed_command(
+    client: &mut AgentClient,
+    manifest: &smolvm_pack::PackManifest,
+    params: ExecParams,
+    mounts: &[smolvm::data::storage::HostMount],
+) -> smolvm::Result<i32> {
+    let ExecParams {
+        command,
+        env,
+        workdir,
+        interactive,
+        tty,
+        timeout,
+    } = params;
     match manifest.mode {
         PackMode::Vm => {
             // VM mode: execute directly in the VM rootfs
-            if args.interactive || args.tty {
-                client.vm_exec_interactive(command, env, workdir, args.timeout, args.tty)
+            if interactive || tty {
+                client.vm_exec_interactive(command, env, workdir, timeout, tty)
             } else {
-                let (exit_code, stdout, stderr) =
-                    client.vm_exec(command, env, workdir, args.timeout)?;
+                let (exit_code, stdout, stderr) = client.vm_exec(command, env, workdir, timeout)?;
 
                 if !stdout.is_empty() {
                     print!("{}", stdout);
@@ -673,13 +709,13 @@ fn execute_command(
             // Container mode: run inside crun container
             let mount_bindings = mounts_to_virtiofs_bindings(mounts);
 
-            if args.interactive || args.tty {
+            if interactive || tty {
                 let config = RunConfig::new(&manifest.image, command)
                     .with_env(env)
                     .with_workdir(workdir)
                     .with_mounts(mount_bindings)
-                    .with_timeout(args.timeout)
-                    .with_tty(args.tty);
+                    .with_timeout(timeout)
+                    .with_tty(tty);
                 client.run_interactive(config)
             } else {
                 let (exit_code, stdout, stderr) = client.run_with_mounts_and_timeout(
@@ -688,7 +724,7 @@ fn execute_command(
                     env,
                     workdir,
                     mount_bindings,
-                    args.timeout,
+                    timeout,
                 )?;
 
                 if !stdout.is_empty() {
@@ -708,40 +744,51 @@ fn execute_command(
 // Packed binary auto-detection entry point
 // ===========================================================================
 
-/// CLI parser for when the binary is running as a packed executable.
-///
-/// This is separate from `PackRunCmd` because:
-/// - No `--sidecar` flag (mode is auto-detected)
-/// - Binary name shows as the packed binary name, not "smolvm"
-/// - Supports daemon subcommands (start/exec/stop/status)
+// CLI for packed binary mode. Parsed in `run_as_packed_binary()` before
+// the normal smolvm CLI. Uses subcommands matching the smolvm pattern.
 #[derive(Parser, Debug)]
-#[command(name = "packed-binary")]
-#[command(about = "Run a containerized application in a microVM")]
+#[command(about = "a smol machine")]
+#[command(
+    long_about = "A portable, self-contained virtual machine.\n\nRun with no arguments to execute the packaged entrypoint.\nUse subcommands for more control."
+)]
+#[command(version)]
+#[command(subcommand_required = false)]
 struct PackedCli {
-    /// Daemon subcommand (start/exec/stop/status)
+    /// Subcommand to execute (defaults to `run` if omitted)
     #[command(subcommand)]
-    daemon_command: Option<PackedDaemonCmd>,
+    command: Option<PackedCmd>,
 
+    /// Force re-extraction of assets
+    #[arg(long, global = true)]
+    force_extract: bool,
+
+    /// Print debug information
+    #[arg(long, global = true)]
+    debug: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum PackedCmd {
+    /// Run a command in an ephemeral VM (cleaned up after exit)
+    Run(PackedRunArgs),
+    /// Start a persistent VM
+    Start(PackedStartArgs),
+    /// Execute a command in a running VM
+    Exec(PackedExecArgs),
+    /// Stop the VM
+    Stop,
+    /// Show VM status
+    Status,
+    /// Show packed binary info
+    Info,
+}
+
+/// Arguments for the `run` subcommand (ephemeral execution).
+#[derive(Args, Debug, Default)]
+struct PackedRunArgs {
     /// Command to run (overrides image entrypoint/cmd)
-    #[arg(trailing_var_arg = true, conflicts_with = "daemon_command")]
+    #[arg(trailing_var_arg = true, value_name = "COMMAND")]
     command: Vec<String>,
-
-    /// Mount a volume (HOST:GUEST[:ro])
-    #[arg(
-        short = 'v',
-        long = "volume",
-        value_name = "HOST:GUEST[:ro]",
-        global = true
-    )]
-    volume: Vec<String>,
-
-    /// Set environment variable (KEY=VALUE)
-    #[arg(short = 'e', long = "env", value_name = "KEY=VALUE", global = true)]
-    env: Vec<String>,
-
-    /// Working directory inside the container
-    #[arg(short = 'w', long = "workdir", value_name = "PATH", global = true)]
-    workdir: Option<String>,
 
     /// Keep stdin open for interactive input
     #[arg(short = 'i', long)]
@@ -755,69 +802,103 @@ struct PackedCli {
     #[arg(long, value_parser = crate::cli::parsers::parse_duration, value_name = "DURATION")]
     timeout: Option<Duration>,
 
-    /// Number of vCPUs (overrides default)
-    #[arg(long, value_name = "N", global = true)]
-    cpus: Option<u8>,
+    /// Working directory inside the container
+    #[arg(short = 'w', long = "workdir", value_name = "PATH")]
+    workdir: Option<String>,
 
-    /// Memory in MiB (overrides default)
-    #[arg(long, value_name = "MiB", global = true)]
-    mem: Option<u32>,
+    /// Set environment variable (KEY=VALUE)
+    #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
+    env: Vec<String>,
 
-    /// Storage disk size in GiB
-    #[arg(long, value_name = "GiB", global = true)]
-    storage: Option<u64>,
-
-    /// Overlay disk size in GiB
-    #[arg(long, value_name = "GiB", global = true)]
-    overlay: Option<u64>,
+    /// Mount a volume (HOST:GUEST[:ro])
+    #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro]")]
+    volume: Vec<String>,
 
     /// Expose port from container to host
-    #[arg(short = 'p', long = "port", value_parser = PortMapping::parse, value_name = "HOST:GUEST", global = true)]
+    #[arg(short = 'p', long = "port", value_parser = PortMapping::parse, value_name = "HOST:GUEST")]
     port: Vec<PortMapping>,
 
     /// Enable outbound network access
-    #[arg(long, global = true)]
+    #[arg(long)]
     net: bool,
 
-    /// Show manifest info and exit
-    #[arg(long)]
-    info: bool,
+    /// Number of vCPUs (overrides default)
+    #[arg(long, value_name = "N")]
+    cpus: Option<u8>,
 
-    /// Force re-extraction of assets
-    #[arg(long, global = true)]
-    force_extract: bool,
+    /// Memory in MiB (overrides default)
+    #[arg(long, value_name = "MiB")]
+    mem: Option<u32>,
 
-    /// Print debug information
-    #[arg(long, global = true)]
-    debug: bool,
+    /// Storage disk size in GiB
+    #[arg(long, value_name = "GiB")]
+    storage: Option<u64>,
+
+    /// Overlay disk size in GiB
+    #[arg(long, value_name = "GiB")]
+    overlay: Option<u64>,
 }
 
-#[derive(Subcommand, Debug)]
-enum PackedDaemonCmd {
-    /// Start the VM daemon (keeps running for subsequent exec calls)
-    Start,
-    /// Execute a command in the running daemon VM (~50ms)
-    Exec {
-        /// Command to run
-        #[arg(trailing_var_arg = true)]
-        command: Vec<String>,
+/// Arguments for the `start` subcommand (persistent daemon).
+#[derive(Args, Debug)]
+struct PackedStartArgs {
+    /// Number of vCPUs (overrides default)
+    #[arg(long, value_name = "N")]
+    cpus: Option<u8>,
 
-        /// Keep stdin open for interactive input
-        #[arg(short = 'i', long)]
-        interactive: bool,
+    /// Memory in MiB (overrides default)
+    #[arg(long, value_name = "MiB")]
+    mem: Option<u32>,
 
-        /// Allocate a pseudo-TTY (use with -i for interactive shells)
-        #[arg(short = 't', long)]
-        tty: bool,
+    /// Storage disk size in GiB
+    #[arg(long, value_name = "GiB")]
+    storage: Option<u64>,
 
-        /// Kill command after duration (e.g., "30s", "5m")
-        #[arg(long, value_parser = crate::cli::parsers::parse_duration, value_name = "DURATION")]
-        timeout: Option<Duration>,
-    },
-    /// Stop the running daemon VM
-    Stop,
-    /// Check if the daemon VM is running
-    Status,
+    /// Overlay disk size in GiB
+    #[arg(long, value_name = "GiB")]
+    overlay: Option<u64>,
+
+    /// Mount a volume (HOST:GUEST[:ro])
+    #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro]")]
+    volume: Vec<String>,
+
+    /// Expose port from container to host
+    #[arg(short = 'p', long = "port", value_parser = PortMapping::parse, value_name = "HOST:GUEST")]
+    port: Vec<PortMapping>,
+
+    /// Enable outbound network access
+    #[arg(long)]
+    net: bool,
+}
+
+/// Arguments for the `exec` subcommand (run in existing VM).
+#[derive(Args, Debug)]
+struct PackedExecArgs {
+    /// Command to run
+    #[arg(trailing_var_arg = true, value_name = "COMMAND")]
+    command: Vec<String>,
+
+    /// Keep stdin open for interactive input
+    #[arg(short = 'i', long)]
+    interactive: bool,
+
+    /// Allocate a pseudo-TTY (use with -i for interactive shells)
+    #[arg(short = 't', long)]
+    tty: bool,
+
+    /// Kill command after duration (e.g., "30s", "5m")
+    #[arg(long, value_parser = crate::cli::parsers::parse_duration, value_name = "DURATION")]
+    timeout: Option<Duration>,
+
+    /// Working directory inside the container
+    #[arg(short = 'w', long = "workdir", value_name = "PATH")]
+    workdir: Option<String>,
+
+    /// Set environment variable (KEY=VALUE)
+    #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
+    env: Vec<String>,
+    // Note: -v/--volume is intentionally absent from exec. Virtiofs devices
+    // are fixed at VM boot time, so mounts must be specified on `start`.
 }
 
 /// Entry point when auto-detection determines we are a packed binary.
@@ -826,7 +907,27 @@ enum PackedDaemonCmd {
 /// Parses its own `PackedCli` args and executes accordingly.
 /// Never returns — calls `std::process::exit()`.
 pub fn run_as_packed_binary(mode: PackedMode) -> ! {
-    let cli = PackedCli::parse();
+    // Use argv[0] as the binary name so --help and --version display
+    // "my-app 0.2.0" instead of "smolvm 0.2.0".
+    let bin_name = std::env::args()
+        .next()
+        .and_then(|a| {
+            std::path::Path::new(&a)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "packed-binary".to_string());
+
+    let args: Vec<String> = std::iter::once(bin_name.clone())
+        .chain(std::env::args().skip(1))
+        .collect();
+    // Leak is safe: this function is `-> !` so the process exits after parsing.
+    let name_static: &'static str = Box::leak(bin_name.into_boxed_str());
+    let matches = <PackedCli as clap::CommandFactory>::command()
+        .name(name_static)
+        .get_matches_from(args);
+    let cli = <PackedCli as clap::FromArgMatches>::from_arg_matches(&matches)
+        .unwrap_or_else(|e| e.exit());
 
     let result = pack_run_inner(mode, cli);
     match result {
@@ -839,57 +940,68 @@ pub fn run_as_packed_binary(mode: PackedMode) -> ! {
 }
 
 fn pack_run_inner(mode: PackedMode, cli: PackedCli) -> smolvm::Result<()> {
-    // Handle daemon subcommands
-    if let Some(ref daemon_cmd) = cli.daemon_command {
-        let checksum = mode_checksum(&mode);
-        return match daemon_cmd {
-            PackedDaemonCmd::Start => daemon_start(&mode, &cli),
-            PackedDaemonCmd::Exec {
-                ref command,
-                interactive,
-                tty,
-                ref timeout,
-            } => {
-                let manifest = read_manifest_for_mode(&mode)?;
-                daemon_exec(
-                    checksum,
-                    command.clone(),
-                    *interactive,
-                    *tty,
-                    *timeout,
-                    &cli,
-                    &manifest,
-                )
-            }
-            PackedDaemonCmd::Stop => daemon_stop(checksum, cli.debug),
-            PackedDaemonCmd::Status => daemon_status(checksum),
-        };
-    }
+    let debug = cli.debug;
+    let force_extract = cli.force_extract;
+    let command = cli
+        .command
+        .unwrap_or(PackedCmd::Run(PackedRunArgs::default()));
 
+    match command {
+        PackedCmd::Run(args) => run_ephemeral(mode, args, debug, force_extract),
+        PackedCmd::Start(args) => daemon_start(&mode, args, debug, force_extract),
+        PackedCmd::Exec(args) => {
+            let checksum = mode_checksum(&mode);
+            let manifest = read_manifest_for_mode(&mode)?;
+            daemon_exec(checksum, args, debug, &manifest)
+        }
+        PackedCmd::Stop => {
+            let checksum = mode_checksum(&mode);
+            daemon_stop(checksum, debug)
+        }
+        PackedCmd::Status => {
+            let checksum = mode_checksum(&mode);
+            daemon_status(checksum)
+        }
+        PackedCmd::Info => {
+            let checksum = mode_checksum(&mode);
+            let manifest = read_manifest_for_mode(&mode)?;
+            print_manifest_info(&manifest, checksum);
+            Ok(())
+        }
+    }
+}
+
+/// Run an ephemeral VM from the packed binary (cleaned up after exit).
+fn run_ephemeral(
+    mode: PackedMode,
+    args: PackedRunArgs,
+    debug: bool,
+    force_extract: bool,
+) -> smolvm::Result<()> {
     match mode {
         PackedMode::Sidecar {
             sidecar_path,
             footer: _,
         } => {
-            // Construct PackRunCmd from PackedCli and delegate to existing path
+            // Construct PackRunCmd from PackedRunArgs and delegate to existing path
             let cmd = PackRunCmd {
                 sidecar: Some(sidecar_path),
-                command: cli.command,
-                interactive: cli.interactive,
-                tty: cli.tty,
-                timeout: cli.timeout,
-                workdir: cli.workdir,
-                env: cli.env,
-                volume: cli.volume,
-                port: cli.port,
-                net: cli.net,
-                cpus: cli.cpus,
-                mem: cli.mem,
-                storage: cli.storage,
-                overlay: cli.overlay,
-                force_extract: cli.force_extract,
-                info: cli.info,
-                debug: cli.debug,
+                command: args.command,
+                interactive: args.interactive,
+                tty: args.tty,
+                timeout: args.timeout,
+                workdir: args.workdir,
+                env: args.env,
+                volume: args.volume,
+                port: args.port,
+                net: args.net,
+                cpus: args.cpus,
+                mem: args.mem,
+                storage: args.storage,
+                overlay: args.overlay,
+                force_extract,
+                info: false,
+                debug,
             };
             cmd.run()
         }
@@ -900,9 +1012,19 @@ fn pack_run_inner(mode: PackedMode, cli: PackedCli) -> smolvm::Result<()> {
             checksum,
             assets_ptr,
             assets_size,
-        } => run_section_mode(*manifest, checksum, assets_ptr, assets_size, cli),
+        } => run_section_mode(
+            *manifest,
+            checksum,
+            assets_ptr,
+            assets_size,
+            args,
+            debug,
+            force_extract,
+        ),
 
-        PackedMode::Embedded { exe_path, footer } => run_embedded_mode(exe_path, footer, cli),
+        PackedMode::Embedded { exe_path, footer } => {
+            run_embedded_mode(exe_path, footer, args, debug, force_extract)
+        }
     }
 }
 
@@ -913,52 +1035,46 @@ fn run_section_mode(
     checksum: u32,
     assets_ptr: *const u8,
     assets_size: usize,
-    cli: PackedCli,
+    args: PackedRunArgs,
+    debug: bool,
+    force_extract: bool,
 ) -> smolvm::Result<()> {
-    if cli.info {
-        print_manifest_info(&manifest, checksum);
-        return Ok(());
-    }
-
     let cache_dir = extract::get_cache_dir(checksum)
         .map_err(|e| Error::agent("get cache dir", e.to_string()))?;
 
-    let needs_extract = cli.force_extract || !extract::is_extracted(&cache_dir);
+    let needs_extract = force_extract || !extract::is_extracted(&cache_dir);
     if needs_extract {
         unsafe {
-            extract::extract_from_section(&cache_dir, assets_ptr, assets_size, cli.debug)
+            extract::extract_from_section(&cache_dir, assets_ptr, assets_size, debug)
                 .map_err(|e| Error::agent("extract section assets", e.to_string()))?;
         }
     }
 
-    run_from_cache(&cache_dir, &manifest, cli)
+    run_from_cache(&cache_dir, &manifest, args, debug)
 }
 
 /// Run from binary-appended assets.
 fn run_embedded_mode(
     exe_path: PathBuf,
     footer: smolvm_pack::PackFooter,
-    cli: PackedCli,
+    args: PackedRunArgs,
+    debug: bool,
+    force_extract: bool,
 ) -> smolvm::Result<()> {
     // Read manifest from the binary
     let manifest = smolvm_pack::read_manifest(&exe_path)
         .map_err(|e| Error::agent("read manifest", e.to_string()))?;
 
-    if cli.info {
-        print_manifest_info(&manifest, footer.checksum);
-        return Ok(());
-    }
-
     let cache_dir = extract::get_cache_dir(footer.checksum)
         .map_err(|e| Error::agent("get cache dir", e.to_string()))?;
 
-    let needs_extract = cli.force_extract || !extract::is_extracted(&cache_dir);
+    let needs_extract = force_extract || !extract::is_extracted(&cache_dir);
     if needs_extract {
-        extract::extract_from_binary(&exe_path, &cache_dir, &footer, cli.debug)
+        extract::extract_from_binary(&exe_path, &cache_dir, &footer, debug)
             .map_err(|e| Error::agent("extract embedded assets", e.to_string()))?;
     }
 
-    run_from_cache(&cache_dir, &manifest, cli)
+    run_from_cache(&cache_dir, &manifest, args, debug)
 }
 
 /// Shared launch path for section and embedded modes.
@@ -967,10 +1083,11 @@ fn run_embedded_mode(
 fn run_from_cache(
     cache_dir: &Path,
     manifest: &smolvm_pack::PackManifest,
-    cli: PackedCli,
+    args: PackedRunArgs,
+    debug: bool,
 ) -> smolvm::Result<()> {
     let rootfs_path = cache_dir.join("agent-rootfs");
-    let lib_dir = resolve_lib_dir(cache_dir, cli.debug)?;
+    let lib_dir = resolve_lib_dir(cache_dir, debug)?;
     let layers_dir = cache_dir.join("layers");
     let runtime_parent = cache_dir.join("runtime");
     std::fs::create_dir_all(&runtime_parent)
@@ -986,25 +1103,25 @@ fn run_from_cache(
         .storage_template
         .as_ref()
         .map(|t| t.path.as_str());
-    extract::create_or_copy_storage_disk(cache_dir, template, &storage_path, cli.storage)
+    extract::create_or_copy_storage_disk(cache_dir, template, &storage_path, args.storage)
         .map_err(|e| Error::agent("create storage disk", e.to_string()))?;
 
     let overlay_runtime_path = setup_vm_overlay(
         manifest,
         cache_dir,
         &runtime_dir.path().join("overlay.raw"),
-        cli.overlay,
+        args.overlay,
     )?;
 
-    let mounts = HostMount::parse(&cli.volume)?;
-    let port_mappings: Vec<(u16, u16)> = cli.port.iter().map(|p| (p.host, p.guest)).collect();
+    let mounts = HostMount::parse(&args.volume)?;
+    let port_mappings: Vec<(u16, u16)> = args.port.iter().map(|p| (p.host, p.guest)).collect();
 
     let resources = VmResources {
-        cpus: cli.cpus.unwrap_or(manifest.cpus),
-        memory_mib: cli.mem.unwrap_or(manifest.mem),
-        network: cli.net || !cli.port.is_empty(),
-        storage_gib: cli.storage,
-        overlay_gib: cli.overlay,
+        cpus: args.cpus.unwrap_or(manifest.cpus),
+        memory_mib: args.mem.unwrap_or(manifest.mem),
+        network: args.net || !args.port.is_empty(),
+        storage_gib: args.storage,
+        overlay_gib: args.overlay,
         allowed_cidrs: None,
     };
 
@@ -1013,7 +1130,6 @@ fn run_from_cache(
     smolvm::process::install_sigchld_handler();
 
     let console_log_path = runtime_dir.path().join("console.log");
-    let debug = cli.debug;
     let vsock_path_clone = vsock_path.clone();
     let child_pid = smolvm::process::fork_session_leader(move || {
         let krun = match unsafe { KrunFunctions::load(&lib_dir) } {
@@ -1080,28 +1196,15 @@ fn run_from_cache(
 
     let mut client = wait_for_agent(&vsock_path, debug)?;
 
-    // Build a minimal PackRunCmd-like struct for execute_command
-    let args = PackRunCmd {
-        sidecar: None,
-        command: cli.command,
-        interactive: cli.interactive,
-        tty: cli.tty,
-        timeout: cli.timeout,
-        workdir: cli.workdir,
-        env: cli.env,
-        volume: Vec::new(), // already parsed
-        port: Vec::new(),   // already parsed
-        net: cli.net,
-        cpus: cli.cpus,
-        mem: cli.mem,
-        storage: cli.storage,
-        overlay: cli.overlay,
-        force_extract: false,
-        info: false,
-        debug,
+    let params = ExecParams {
+        command: build_command(manifest, &args.command),
+        env: build_env(manifest, &args.env),
+        workdir: args.workdir.or_else(|| manifest.workdir.clone()),
+        interactive: args.interactive,
+        tty: args.tty,
+        timeout: args.timeout,
     };
-
-    let exit_code = execute_command(&mut client, manifest, &args, &mounts)?;
+    let exit_code = execute_packed_command(&mut client, manifest, params, &mounts)?;
 
     drop(child_guard);
     std::process::exit(exit_code);
@@ -1271,12 +1374,17 @@ fn is_daemon_running(checksum: u32) -> bool {
 /// Extracts assets if needed, creates the daemon directory, forks a child
 /// process that runs the VM, writes a PID file, and waits for the agent
 /// to become ready.
-fn daemon_start(mode: &PackedMode, cli: &PackedCli) -> smolvm::Result<()> {
+fn daemon_start(
+    mode: &PackedMode,
+    args: PackedStartArgs,
+    debug: bool,
+    force_extract: bool,
+) -> smolvm::Result<()> {
     let checksum = mode_checksum(mode);
     let manifest = read_manifest_for_mode(mode)?;
 
     // Extract assets to cache
-    let cache_dir = ensure_extracted(mode, cli.force_extract, cli.debug)?;
+    let cache_dir = ensure_extracted(mode, force_extract, debug)?;
 
     // Create daemon directory
     let daemon = cache_dir.join("daemon");
@@ -1306,7 +1414,7 @@ fn daemon_start(mode: &PackedMode, cli: &PackedCli) -> smolvm::Result<()> {
             .storage_template
             .as_ref()
             .map(|t| t.path.as_str());
-        extract::create_or_copy_storage_disk(&cache_dir, template, &storage_path, cli.storage)
+        extract::create_or_copy_storage_disk(&cache_dir, template, &storage_path, args.storage)
             .map_err(|e| Error::agent("create storage disk", e.to_string()))?;
     }
 
@@ -1314,7 +1422,7 @@ fn daemon_start(mode: &PackedMode, cli: &PackedCli) -> smolvm::Result<()> {
     let overlay_daemon_path = if manifest.mode == PackMode::Vm {
         let overlay_path = daemon.join("overlay.raw");
         if !overlay_path.exists() {
-            setup_vm_overlay(&manifest, &cache_dir, &overlay_path, cli.overlay)?;
+            setup_vm_overlay(&manifest, &cache_dir, &overlay_path, args.overlay)?;
         }
         Some(overlay_path)
     } else {
@@ -1324,24 +1432,23 @@ fn daemon_start(mode: &PackedMode, cli: &PackedCli) -> smolvm::Result<()> {
     let vsock_path = daemon.join("agent.sock");
 
     // Parse CLI args
-    let mounts = HostMount::parse(&cli.volume)?;
-    let port_mappings: Vec<(u16, u16)> = cli.port.iter().map(|p| (p.host, p.guest)).collect();
+    let mounts = HostMount::parse(&args.volume)?;
+    let port_mappings: Vec<(u16, u16)> = args.port.iter().map(|p| (p.host, p.guest)).collect();
 
     let resources = VmResources {
-        cpus: cli.cpus.unwrap_or(manifest.cpus),
-        memory_mib: cli.mem.unwrap_or(manifest.mem),
-        network: cli.net || !cli.port.is_empty(),
-        storage_gib: cli.storage,
-        overlay_gib: cli.overlay,
+        cpus: args.cpus.unwrap_or(manifest.cpus),
+        memory_mib: args.mem.unwrap_or(manifest.mem),
+        network: args.net || !args.port.is_empty(),
+        storage_gib: args.storage,
+        overlay_gib: args.overlay,
         allowed_cidrs: None,
     };
 
     let packed_mounts = mounts_to_packed(&mounts);
 
     let rootfs_path = cache_dir.join("agent-rootfs");
-    let lib_dir = resolve_lib_dir(&cache_dir, cli.debug)?;
+    let lib_dir = resolve_lib_dir(&cache_dir, debug)?;
     let layers_dir = cache_dir.join("layers");
-    let debug = cli.debug;
 
     if debug {
         eprintln!("debug: daemon dir={}", daemon.display());
@@ -1437,11 +1544,8 @@ fn daemon_start(mode: &PackedMode, cli: &PackedCli) -> smolvm::Result<()> {
 /// Execute a command in the running daemon VM.
 fn daemon_exec(
     checksum: u32,
-    command: Vec<String>,
-    interactive: bool,
-    tty: bool,
-    timeout: Option<Duration>,
-    cli: &PackedCli,
+    args: PackedExecArgs,
+    debug: bool,
     manifest: &smolvm_pack::PackManifest,
 ) -> smolvm::Result<()> {
     let dir = daemon_dir(checksum)?;
@@ -1455,66 +1559,26 @@ fn daemon_exec(
         ));
     }
 
+    if debug {
+        eprintln!("debug: connecting to daemon at {}", sock_path.display());
+    }
+
     // Connect to agent
     let mut client = AgentClient::connect(&sock_path)?;
 
     // Build command from args or manifest defaults
-    let command = build_command(manifest, &command);
-    let env = build_env(manifest, &cli.env);
-    let workdir = cli.workdir.clone().or_else(|| manifest.workdir.clone());
-
-    let exit_code = match manifest.mode {
-        PackMode::Vm => {
-            // VM mode: execute directly in the VM rootfs
-            if interactive || tty {
-                client.vm_exec_interactive(command, env, workdir, timeout, tty)?
-            } else {
-                let (exit_code, stdout, stderr) = client.vm_exec(command, env, workdir, timeout)?;
-
-                if !stdout.is_empty() {
-                    print!("{}", stdout);
-                }
-                if !stderr.is_empty() {
-                    eprint!("{}", stderr);
-                }
-                crate::cli::flush_output();
-                exit_code
-            }
-        }
-        PackMode::Container => {
-            // Parse mounts
-            let mounts = HostMount::parse(&cli.volume)?;
-            let mount_bindings = mounts_to_virtiofs_bindings(&mounts);
-
-            if interactive || tty {
-                let config = RunConfig::new(&manifest.image, command)
-                    .with_env(env)
-                    .with_workdir(workdir)
-                    .with_mounts(mount_bindings)
-                    .with_timeout(timeout)
-                    .with_tty(tty);
-                client.run_interactive(config)?
-            } else {
-                let (exit_code, stdout, stderr) = client.run_with_mounts_and_timeout(
-                    &manifest.image,
-                    command,
-                    env,
-                    workdir,
-                    mount_bindings,
-                    timeout,
-                )?;
-
-                if !stdout.is_empty() {
-                    print!("{}", stdout);
-                }
-                if !stderr.is_empty() {
-                    eprint!("{}", stderr);
-                }
-                crate::cli::flush_output();
-                exit_code
-            }
-        }
+    // Virtiofs devices are fixed at boot — exec cannot add new host mounts.
+    let mounts: Vec<smolvm::data::storage::HostMount> = Vec::new();
+    let params = ExecParams {
+        command: build_command(manifest, &args.command),
+        env: build_env(manifest, &args.env),
+        workdir: args.workdir.or_else(|| manifest.workdir.clone()),
+        interactive: args.interactive,
+        tty: args.tty,
+        timeout: args.timeout,
     };
+
+    let exit_code = execute_packed_command(&mut client, manifest, params, &mounts)?;
 
     std::process::exit(exit_code);
 }

@@ -45,7 +45,7 @@ smolvm machine stop --name myvm
 
 # Pack into a portable executable
 smolvm pack create --image python:3.12-alpine -o ./my-pythonvm
-./my-pythonvm python3 -c "print('hello from a packed VM')"
+./my-pythonvm run -- python3 -c "print('hello from a packed VM')"
 ```
 
 How It Works

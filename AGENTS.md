@@ -20,7 +20,7 @@ smolvm machine delete myvm
 
 # Pack into portable executable
 smolvm pack create --image python:3.12-alpine -o ./my-python
-./my-python python3 -c "print('hello')"
+./my-python run -- python3 -c "print('hello')"
 
 # Containers inside a machine
 smolvm container create --image nginx -- nginx -g "daemon off;"
@@ -162,10 +162,10 @@ cpus/mem:   CLI flag > Smolfile > defaults (1 CPU, 512 MiB)
 
 The packed binary runs as a normal executable:
 ```bash
-./my-app python3 -c "print('hello')"    # ephemeral, cleaned up after exit
-./my-app --daemon start                  # persistent daemon mode
-./my-app --daemon exec -- pip install x  # exec into daemon
-./my-app --daemon stop                   # stop daemon
+./my-app run -- python3 -c "print('hello')"  # ephemeral, cleaned up after exit
+./my-app start                               # persistent daemon mode
+./my-app exec -- pip install x               # exec into daemon
+./my-app stop                                # stop daemon
 ```
 
 ## HTTP API
