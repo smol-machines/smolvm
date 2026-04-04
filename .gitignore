@@ -35,3 +35,6 @@ Cargo.lock
 
 # smol machines artifacts
 *.smolmachine
+
+# Registry infrastructure (separate git repo)
+/smolmachines-registry/

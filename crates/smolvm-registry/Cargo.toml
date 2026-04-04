@@ -1,0 +1,26 @@
+[package]
+name = "smolvm-registry"
+version = "0.2.0"
+edition = "2021"
+description = "OCI Distribution client for smolmachines registry"
+license = "Apache-2.0"
+
+[dependencies]
+smolvm-pack = { path = "../smolvm-pack" }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+sha2 = "0.10"
+bytes = "1"
+hex = "0.4"
+tokio = { version = "1", features = ["fs", "io-util"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+dirs = "5"
+filetime = "0.2"
+tokio-util = { version = "0.7", features = ["io"] }
+futures-util = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = "3"
