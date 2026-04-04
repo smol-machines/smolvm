@@ -249,6 +249,7 @@ pub fn build_create_params(
                 health_retries: None,
                 health_startup_grace_secs: None,
                 ssh_agent: false,
+                dns_filter_hosts: None,
             });
         }
     };
@@ -339,9 +340,12 @@ pub fn build_create_params(
     // Merge network policy: [network] section, then CLI extends
     let network = sf.network.unwrap_or_default();
 
-    // Resolve [network].allow_hosts to CIDRs
+    // Preserve original hostnames for DNS filtering
+    let sf_allow_hosts = network.allow_hosts;
+
+    // Resolve hostnames to CIDRs for egress policy
     let mut allowed_cidrs_vec: Vec<String> = Vec::new();
-    for host in &network.allow_hosts {
+    for host in &sf_allow_hosts {
         let cidrs = crate::cli::parsers::resolve_host_to_cidrs(host)
             .map_err(|e| smolvm::Error::config("smolfile [network] allow_hosts", e))?;
         allowed_cidrs_vec.extend(cidrs);
@@ -432,6 +436,11 @@ pub fn build_create_params(
         health_retries,
         health_startup_grace_secs,
         ssh_agent: sf.auth.as_ref().and_then(|a| a.ssh_agent).unwrap_or(false),
+        dns_filter_hosts: if sf_allow_hosts.is_empty() {
+            None
+        } else {
+            Some(sf_allow_hosts)
+        },
     })
 }
 

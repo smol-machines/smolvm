@@ -67,6 +67,8 @@ pub mod config;
 /// Canonical shared data models and constants used across adapters.
 pub mod data;
 pub mod db;
+pub mod dns_filter;
+pub mod dns_filter_listener;
 pub mod log_rotation;
 pub mod network;
 pub mod platform;

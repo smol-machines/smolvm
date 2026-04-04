@@ -478,6 +478,64 @@ test_machine_egress_allow_host_port_rejected() {
     [[ $exit_code -ne 0 ]] && [[ "$output" == *"port suffixes are not supported"* ]]
 }
 
+# DNS filtering end-to-end: when --allow-host is used with a new agent that
+# has the DNS proxy, queries for non-allowed domains should fail.
+test_machine_dns_filter_blocks_resolution() {
+    local vm_name="dns-filter-test-$$"
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+
+    # Create VM allowing only one.one.one.one
+    $SMOLVM machine create "$vm_name" --allow-host one.one.one.one 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+
+    # Resolving an allowed domain should work
+    local exit_code_allowed=0
+    $SMOLVM machine exec --name "$vm_name" -- nslookup one.one.one.one 1.1.1.1 2>&1 || exit_code_allowed=$?
+
+    # Resolving a non-allowed domain should fail (DNS proxy returns NXDOMAIN,
+    # or if agent doesn't have DNS proxy, TSI still blocks the IP)
+    local exit_code_blocked=0
+    $SMOLVM machine exec --name "$vm_name" -- nslookup attacker-test.example 2>&1 || exit_code_blocked=$?
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    ensure_data_dir_deleted "$vm_name"
+
+    [[ $exit_code_allowed -eq 0 ]] && [[ $exit_code_blocked -ne 0 ]]
+}
+
+test_machine_allow_host_persists_across_restart() {
+    local vm_name="dns-persist-test-$$"
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+
+    # Create with --allow-host, start, stop, start again
+    $SMOLVM machine create "$vm_name" --allow-host one.one.one.one 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+
+    # Verify egress works
+    local exit_code=0
+    $SMOLVM machine exec --name "$vm_name" -- nslookup one.one.one.one 1.1.1.1 2>&1 || exit_code=$?
+    [[ $exit_code -ne 0 ]] && { $SMOLVM machine stop --name "$vm_name" 2>/dev/null; $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+
+    # Stop and restart — config should persist from VmRecord
+    $SMOLVM machine stop --name "$vm_name" 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+
+    # Should still be blocked (8.8.8.8 is not in allowlist)
+    local exit_code_after=0
+    $SMOLVM machine exec --name "$vm_name" -- nslookup cloudflare.com 8.8.8.8 2>&1 || exit_code_after=$?
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    ensure_data_dir_deleted "$vm_name"
+
+    [[ $exit_code_after -ne 0 ]]
+}
+
 # =============================================================================
 # Persistent Rootfs (Overlay)
 # Tests verify that the overlayfs root is active and persists across reboots.
@@ -921,6 +979,8 @@ run_test "Egress: allow-host permits matching traffic" test_machine_egress_allow
 run_test "Egress: allow-host blocks non-matching traffic" test_machine_egress_allow_host_blocked || true
 run_test "Egress: invalid hostname rejected at create" test_machine_egress_allow_host_invalid_rejected || true
 run_test "Egress: host:port syntax rejected" test_machine_egress_allow_host_port_rejected || true
+run_test "DNS filter: blocks resolution of non-allowed domains" test_machine_dns_filter_blocks_resolution || true
+run_test "DNS filter: allow-host persists across restart" test_machine_allow_host_persists_across_restart || true
 run_test "Overlay: root is overlayfs" test_machine_overlay_root_active || true
 run_test "Overlay: rootfs persists across reboot" test_machine_rootfs_persists_across_reboot || true
 run_test "Volume: mount visible to exec" test_machine_volume_mount_visible_to_exec || true

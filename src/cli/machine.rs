@@ -26,7 +26,9 @@ use std::time::Duration;
 
 const KIND: VmKind = VmKind::Machine;
 
-/// Resolve `--allow-cidr`, `--allow-host`, and `--outbound-localhost-only` into a CIDR list and net flag.
+/// Resolve `--allow-cidr`, `--allow-host`, and `--outbound-localhost-only` into a CIDR list,
+/// net flag, and the original hostname list (for DNS filtering).
+///
 /// Resolution failure for `--allow-host` is a hard error — a typo or DNS outage
 /// should not silently weaken the security policy.
 fn resolve_egress_flags(
@@ -34,7 +36,7 @@ fn resolve_egress_flags(
     allow_host: Vec<String>,
     outbound_localhost_only: bool,
     net: bool,
-) -> smolvm::Result<(Vec<String>, bool)> {
+) -> smolvm::Result<(Vec<String>, bool, Option<Vec<String>>)> {
     // Resolve hostnames to CIDRs — fail hard on resolution errors
     for host in &allow_host {
         let cidrs = crate::cli::parsers::resolve_host_to_cidrs(host)
@@ -48,7 +50,15 @@ fn resolve_egress_flags(
         allow_cidr.push("::1/128".to_string());
     }
     let net = net || !allow_cidr.is_empty();
-    Ok((allow_cidr, net))
+
+    // Preserve original hostnames for DNS filtering (None if no --allow-host was used)
+    let dns_filter_hosts = if allow_host.is_empty() {
+        None
+    } else {
+        Some(allow_host)
+    };
+
+    Ok((allow_cidr, net, dns_filter_hosts))
 }
 
 /// Manage machines
@@ -246,7 +256,7 @@ impl RunCmd {
     pub fn run(self) -> smolvm::Result<()> {
         use smolvm::Error;
 
-        let (cli_allow_cidrs, net) = resolve_egress_flags(
+        let (cli_allow_cidrs, net, dns_filter_hosts) = resolve_egress_flags(
             self.allow_cidr,
             self.allow_host,
             self.outbound_localhost_only,
@@ -316,8 +326,13 @@ impl RunCmd {
             None
         };
 
+        let features = smolvm::agent::LaunchFeatures {
+            ssh_agent_socket,
+            dns_filter_hosts,
+        };
+
         let freshly_started = manager
-            .ensure_running_with_full_config(mounts.clone(), ports, resources, ssh_agent_socket)
+            .ensure_running_with_full_config(mounts.clone(), ports, resources, features)
             .map_err(|e| Error::agent("start machine", e.to_string()))?;
 
         let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
@@ -730,7 +745,7 @@ pub struct CreateCmd {
 
 impl CreateCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        let (cli_allow_cidrs, net) = resolve_egress_flags(
+        let (cli_allow_cidrs, net, _dns_filter_hosts) = resolve_egress_flags(
             self.allow_cidr,
             self.allow_host,
             self.outbound_localhost_only,

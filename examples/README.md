@@ -44,18 +44,18 @@ env = ["PORT=8080"]                  # runtime environment variables
 workdir = "/app"                     # working directory
 
 # Resources
-cpus = 2                             # vCPUs (default: 1)
-memory = 1024                        # MiB (default: 512)
+cpus = 2                             # vCPUs (default: 4)
+memory = 1024                        # MiB (default: 8192)
 net = true                           # outbound networking (default: false)
 storage = 40                         # storage disk GiB (default: 20)
 overlay = 4                          # overlay disk GiB (default: 2)
 
-# Service semantics (parsed, not yet wired)
-[service]
-listen = 8080                        # primary guest port
-protocol = "http"                    # service protocol
+# Network policy — egress filtering by hostname and/or CIDR
+[network]
+allow_hosts = ["api.stripe.com", "db.example.com"]  # resolved at VM start
+allow_cidrs = ["10.0.0.0/8"]                        # IP/CIDR ranges
 
-# Health checks (parsed, not yet wired)
+# Health checks
 [health]
 exec = ["curl", "-f", "http://127.0.0.1:8080/health"]
 interval = "10s"
@@ -81,10 +81,6 @@ memory = 2048
 entrypoint = ["/app/api"]            # override entrypoint for packed binary
 oci_platform = "linux/amd64"         # target OCI platform
 
-# Deployment profile (parsed, not yet wired)
-[deploy]
-replicas = 3
-strategy = "rolling"
 ```
 
 ### Merge precedence

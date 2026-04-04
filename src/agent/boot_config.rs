@@ -45,4 +45,8 @@ pub struct BootConfig {
     /// When set, a vsock port is registered so the guest can reach the host's SSH agent.
     #[serde(default)]
     pub ssh_agent_socket: Option<PathBuf>,
+    /// Hostnames for DNS filtering. When set, the host starts a DNS filter
+    /// listener and the guest agent proxies DNS queries through it.
+    #[serde(default)]
+    pub dns_filter_hosts: Option<Vec<String>>,
 }

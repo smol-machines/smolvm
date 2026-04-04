@@ -19,6 +19,7 @@ use tracing::{debug, error, info, warn};
 
 mod container;
 mod crun;
+mod dns_proxy;
 mod oci;
 mod paths;
 mod process;
@@ -147,6 +148,12 @@ fn main() {
         ssh_agent::start();
         // Set env so all child processes (git, ssh, etc.) find the agent socket
         std::env::set_var("SSH_AUTH_SOCK", ssh_agent::GUEST_SSH_AUTH_SOCK);
+    }
+
+    // Start DNS filtering proxy if enabled by host (when --allow-host is used)
+    if dns_proxy::is_enabled() {
+        info!("DNS filtering enabled, starting guest proxy");
+        dns_proxy::start();
     }
 
     info!(

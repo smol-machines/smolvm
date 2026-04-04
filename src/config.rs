@@ -421,6 +421,11 @@ pub struct VmRecord {
     /// Enable SSH agent forwarding into the VM.
     #[serde(default)]
     pub ssh_agent: bool,
+
+    /// Hostnames for DNS filtering. When set, the guest DNS proxy filters
+    /// queries against this allowlist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_filter_hosts: Option<Vec<String>>,
 }
 
 fn default_cpus() -> u8 {
@@ -469,6 +474,7 @@ impl VmRecord {
             health_retries: None,
             health_startup_grace_secs: None,
             ssh_agent: false,
+            dns_filter_hosts: None,
         }
     }
 
@@ -510,6 +516,7 @@ impl VmRecord {
             health_retries: None,
             health_startup_grace_secs: None,
             ssh_agent: false,
+            dns_filter_hosts: None,
         }
     }
 

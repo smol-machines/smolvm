@@ -43,6 +43,10 @@ Use This For
 ```bash
 smolvm machine run --image alpine -- sh -c "pip install sketchy-package"
 # runs in its own kernel — can't touch your host filesystem or network
+
+# lock down egress — only allow specific hosts
+smolvm machine run --allow-host registry.npmjs.org --image node:20-alpine -- npm install
+# npm install works, but malicious postinstall scripts can't phone home
 ```
 
 **Pack into portable executables** — turn any workload into a self-contained binary.
@@ -77,6 +81,9 @@ smolvm machine exec --name myvm -- git clone git@github.com:org/private-repo.git
 ```toml
 image = "python:3.12-alpine"
 net = true
+
+[network]
+allow_hosts = ["api.stripe.com", "db.example.com"]
 
 [dev]
 init = ["pip install -r requirements.txt"]

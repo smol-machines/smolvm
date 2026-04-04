@@ -188,6 +188,8 @@ pub struct AgentManager {
     overlay_disk: OverlayDisk,
     /// vsock socket path for control channel.
     vsock_socket: PathBuf,
+    /// Unix socket path for DNS filter proxy.
+    dns_filter_socket: PathBuf,
     /// PID file path for tracking the VM process across CLI invocations.
     pid_file: PathBuf,
     /// Config file path for persisting running VM config across CLI invocations.
@@ -254,6 +256,7 @@ impl AgentManager {
         std::fs::create_dir_all(&smolvm_runtime)?;
 
         let vsock_socket = smolvm_runtime.join("agent.sock");
+        let dns_filter_socket = smolvm_runtime.join("dns-filter.sock");
         let pid_file = smolvm_runtime.join("agent.pid");
         let config_file = smolvm_runtime.join("agent.config.json");
         let console_log = Some(smolvm_runtime.join("agent-console.log"));
@@ -265,6 +268,7 @@ impl AgentManager {
             storage_disk,
             overlay_disk,
             vsock_socket,
+            dns_filter_socket,
             pid_file,
             config_file,
             console_log,
@@ -633,7 +637,12 @@ impl AgentManager {
     ///
     /// If the agent is running with different mounts, it will be restarted.
     pub fn ensure_running_with_mounts(&self, mounts: Vec<HostMount>) -> Result<bool> {
-        self.ensure_running_with_full_config(mounts, Vec::new(), VmResources::default(), None)
+        self.ensure_running_with_full_config(
+            mounts,
+            Vec::new(),
+            VmResources::default(),
+            Default::default(),
+        )
     }
 
     /// Ensure the agent is running with the specified mounts and resources.
@@ -644,7 +653,7 @@ impl AgentManager {
         mounts: Vec<HostMount>,
         resources: VmResources,
     ) -> Result<bool> {
-        self.ensure_running_with_full_config(mounts, Vec::new(), resources, None)
+        self.ensure_running_with_full_config(mounts, Vec::new(), resources, Default::default())
     }
 
     /// Ensure the agent is running with the specified mounts, ports, and resources.
@@ -656,7 +665,7 @@ impl AgentManager {
         mounts: Vec<HostMount>,
         ports: Vec<PortMapping>,
         resources: VmResources,
-        ssh_agent_socket: Option<std::path::PathBuf>,
+        features: launcher::LaunchFeatures,
     ) -> Result<bool> {
         // Check if agent is already running with the same configuration.
         // try_connect_existing restores config from disk on reconnect,
@@ -705,7 +714,7 @@ impl AgentManager {
         }
 
         // Start with new config
-        self.start_with_full_config(mounts, ports, resources, ssh_agent_socket)?;
+        self.start_with_full_config(mounts, ports, resources, features)?;
         Ok(true)
     }
 
@@ -747,17 +756,27 @@ impl AgentManager {
 
     /// Start the agent VM.
     pub fn start(&self) -> Result<()> {
-        self.start_with_full_config(Vec::new(), Vec::new(), VmResources::default(), None)
+        self.start_with_full_config(
+            Vec::new(),
+            Vec::new(),
+            VmResources::default(),
+            Default::default(),
+        )
     }
 
     /// Start the agent VM with specified mounts.
     pub fn start_with_mounts(&self, mounts: Vec<HostMount>) -> Result<()> {
-        self.start_with_full_config(mounts, Vec::new(), VmResources::default(), None)
+        self.start_with_full_config(
+            mounts,
+            Vec::new(),
+            VmResources::default(),
+            Default::default(),
+        )
     }
 
     /// Start the agent VM with specified mounts and resources.
     pub fn start_with_config(&self, mounts: Vec<HostMount>, resources: VmResources) -> Result<()> {
-        self.start_with_full_config(mounts, Vec::new(), resources, None)
+        self.start_with_full_config(mounts, Vec::new(), resources, Default::default())
     }
 
     /// Common pre-launch setup: validate state, pre-format disks, clean markers.
@@ -906,7 +925,7 @@ impl AgentManager {
         mounts: Vec<HostMount>,
         ports: Vec<PortMapping>,
         resources: VmResources,
-        ssh_agent_socket: Option<std::path::PathBuf>,
+        features: launcher::LaunchFeatures,
     ) -> Result<()> {
         let resources_for_fork = resources.clone();
         self.prepare_for_launch(&mounts, &ports, resources)?;
@@ -919,6 +938,26 @@ impl AgentManager {
         // Clone mounts/ports for finalize_launch (originals move into fork closure)
         let mounts_for_finalize = mounts.clone();
         let ports_for_finalize = ports.clone();
+
+        // Start DNS filter listener if hostnames are configured.
+        // This must happen BEFORE the VM boots so the Unix socket is ready
+        // when the guest agent tries to connect.
+        let dns_filter_socket_path: Option<std::path::PathBuf> =
+            if let Some(ref hosts) = features.dns_filter_hosts {
+                if !hosts.is_empty() {
+                    let socket_path = self.dns_filter_socket.clone();
+                    if let Err(e) = crate::dns_filter_listener::start(&socket_path, hosts.clone()) {
+                        tracing::warn!(error = %e, "failed to start DNS filter listener");
+                        None
+                    } else {
+                        Some(socket_path)
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
         // Clone paths for the child process (originals are borrowed from self)
         let rootfs_path = self.rootfs_path.clone();
@@ -993,7 +1032,8 @@ impl AgentManager {
                 mounts: &mounts,
                 port_mappings: &ports,
                 resources: resources_for_fork,
-                ssh_agent_socket: ssh_agent_socket.as_deref(),
+                ssh_agent_socket: features.ssh_agent_socket.as_deref(),
+                dns_filter_socket: dns_filter_socket_path.as_deref(),
             });
 
             // If we get here, something went wrong (stderr is /dev/null,
@@ -1036,7 +1076,7 @@ impl AgentManager {
         mounts: Vec<HostMount>,
         ports: Vec<PortMapping>,
         resources: VmResources,
-        ssh_agent_socket: Option<std::path::PathBuf>,
+        features: launcher::LaunchFeatures,
     ) -> Result<()> {
         use super::boot_config::BootConfig;
 
@@ -1063,7 +1103,8 @@ impl AgentManager {
             mounts: mounts.clone(),
             ports: ports.clone(),
             resources: resources_for_config.clone(),
-            ssh_agent_socket,
+            ssh_agent_socket: features.ssh_agent_socket,
+            dns_filter_hosts: features.dns_filter_hosts,
         };
         let config_path = self
             .storage_disk
@@ -1102,7 +1143,7 @@ impl AgentManager {
         mounts: Vec<HostMount>,
         ports: Vec<PortMapping>,
         resources: VmResources,
-        ssh_agent_socket: Option<std::path::PathBuf>,
+        features: launcher::LaunchFeatures,
     ) -> Result<bool> {
         // Check if agent is already running (same logic as ensure_running_with_full_config)
         if self.try_connect_existing().is_some() {
@@ -1140,7 +1181,7 @@ impl AgentManager {
             self.reset_stale_running_state();
         }
 
-        self.start_via_subprocess(mounts, ports, resources, ssh_agent_socket)?;
+        self.start_via_subprocess(mounts, ports, resources, features)?;
         Ok(true)
     }
 

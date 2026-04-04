@@ -89,6 +89,7 @@ smolvm config registries edit                     # registry auth
 | `--interactive` | `-i` | run, exec | Keep stdin open |
 | `--tty` | `-t` | run, exec | Allocate pseudo-TTY |
 | `--allow-cidr` | | run, create | CIDR egress filter (implies --net) |
+| `--allow-host` | | run, create | Hostname egress filter, resolved at VM start (implies --net) |
 | `--ssh-agent` | | run, create | Forward host SSH agent (git/ssh without exposing keys) |
 
 ## Smolfile Reference
@@ -104,12 +105,16 @@ env = ["PORT=8080", "DEBUG=1"]        # environment variables
 workdir = "/app"                      # working directory
 
 # Resources
-cpus = 2                              # vCPUs (default: 1)
-memory = 1024                         # MiB (default: 512)
+cpus = 2                              # vCPUs (default: 4)
+memory = 1024                         # MiB (default: 8192, elastic via balloon)
 net = true                            # outbound networking (default: false)
 storage = 40                          # storage disk GiB (default: 20)
 overlay = 4                           # overlay disk GiB (default: 2)
-allowed_cidrs = ["10.0.0.0/8"]        # egress CIDR filter (implies net)
+
+# Network policy — egress filtering by hostname and/or CIDR
+[network]
+allow_hosts = ["api.stripe.com"]      # resolved at VM start (implies net)
+allow_cidrs = ["10.0.0.0/8"]         # IP/CIDR ranges (implies net)
 
 # Dev profile (used by `machine run` and `machine create`)
 [dev]
@@ -151,16 +156,19 @@ env:        top-level env + [dev].env + CLI -e (all merged)
 volumes:    [dev].volumes + CLI -v (all merged)
 ports:      [dev].ports + CLI -p (all merged)
 init:       [dev].init + CLI --init (all merged)
-cpus/mem:   CLI flag > Smolfile > defaults (1 CPU, 512 MiB)
+cpus/mem:   CLI flag > Smolfile > defaults (4 CPU, 8192 MiB)
 ```
 
 ## Networking
 
 - **Off by default** — VMs have no outbound access unless `--net` is specified
 - `--net` enables full outbound (TCP/UDP, DNS)
-- `--allow-cidr 10.0.0.0/8` enables egress only to specified ranges (implies `--net`)
+- `--allow-host api.stripe.com` enables egress only to resolved IPs of that hostname (implies `--net`). Also enables DNS filtering — only allowed hostnames can be resolved.
+- `--allow-cidr 10.0.0.0/8` enables egress only to specified IP ranges (implies `--net`)
+- `--allow-host` and `--allow-cidr` can be combined and used multiple times
 - `--outbound-localhost-only` restricts to 127.0.0.0/8 and ::1 (implies `--net`)
 - `-p HOST:GUEST` forwards a host port to the VM (TCP)
+- Smolfile: use `[network] allow_hosts` and `[network] allow_cidrs`
 
 ## SSH Agent Forwarding
 
@@ -243,5 +251,6 @@ OpenAPI spec: `smolvm serve openapi`
 - Machine name defaults to `"default"` when `--name` is omitted
 - Container `--machine` defaults to `"default"`
 - Network is **off** by default (security-first)
-- CPUs: 1, Memory: 512 MiB, Storage: 20 GiB, Overlay: 2 GiB
+- CPUs: 4, Memory: 8192 MiB (elastic via virtio balloon), Storage: 20 GiB, Overlay: 2 GiB
 - Packed binary CPUs: 1, Memory: 256 MiB (lighter defaults for single-purpose workloads)
+- Memory is elastic — the host only commits what the guest actually uses and reclaims the rest via virtio balloon

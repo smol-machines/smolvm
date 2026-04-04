@@ -185,6 +185,8 @@ pub struct CreateVmParams {
     pub health_retries: Option<u32>,
     pub health_startup_grace_secs: Option<u64>,
     pub ssh_agent: bool,
+    /// Hostnames for DNS filtering (from --allow-host / [network].allow_hosts).
+    pub dns_filter_hosts: Option<Vec<String>>,
 }
 
 /// Maximum length for machine names.
@@ -318,6 +320,7 @@ pub fn create_vm(kind: VmKind, params: CreateVmParams) -> smolvm::Result<()> {
     record.health_retries = params.health_retries;
     record.health_startup_grace_secs = params.health_startup_grace_secs;
     record.ssh_agent = params.ssh_agent;
+    record.dns_filter_hosts = params.dns_filter_hosts.clone();
 
     // Store in config (persisted immediately to database)
     config.insert_vm(params.name.clone(), record)?;
@@ -417,8 +420,13 @@ pub fn start_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
         None
     };
 
+    let features = smolvm::agent::LaunchFeatures {
+        ssh_agent_socket,
+        dns_filter_hosts: record.dns_filter_hosts.clone(),
+    };
+
     let _ = manager
-        .ensure_running_with_full_config(mounts, ports, resources, ssh_agent_socket)
+        .ensure_running_with_full_config(mounts, ports, resources, features)
         .map_err(|e| Error::agent(format!("start {}", kind.label()), e.to_string()))?;
 
     // Get PID immediately (cheap) and print output before DB write

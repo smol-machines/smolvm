@@ -624,9 +624,12 @@ pub async fn ensure_machine_running(
         let resources = resource_spec_to_vm_resources(&entry.resources, entry.network);
 
         // Use subprocess launch to avoid macOS fork-in-multithreaded-process issue.
-        entry
-            .manager
-            .ensure_running_via_subprocess(mounts, ports, resources, None)?;
+        entry.manager.ensure_running_via_subprocess(
+            mounts,
+            ports,
+            resources,
+            Default::default(),
+        )?;
         Ok(())
     })
     .await

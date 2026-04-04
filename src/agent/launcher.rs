@@ -144,6 +144,20 @@ fn preload_libkrunfw() {
 /// It should be called in the child process after fork, where
 /// DYLD_LIBRARY_PATH is still available for dlopen to find libkrunfw.
 ///
+/// Optional features for VM launch (SSH agent, DNS filtering, etc.).
+///
+/// Groups optional capabilities that don't affect core VM operation.
+/// New features should be added here rather than as additional parameters
+/// on manager/launcher functions.
+#[derive(Debug, Clone, Default)]
+pub struct LaunchFeatures {
+    /// Host SSH agent socket path for forwarding into the guest.
+    pub ssh_agent_socket: Option<std::path::PathBuf>,
+    /// Hostnames for DNS filtering. When set, the host starts a DNS filter
+    /// listener and the guest agent proxies DNS queries through it.
+    pub dns_filter_hosts: Option<Vec<String>>,
+}
+
 /// Configuration for launching an agent VM.
 pub struct LaunchConfig<'a> {
     /// Path to the agent rootfs directory.
@@ -162,6 +176,9 @@ pub struct LaunchConfig<'a> {
     pub resources: VmResources,
     /// Host SSH agent socket path for forwarding into the guest.
     pub ssh_agent_socket: Option<&'a Path>,
+    /// Host DNS filter socket path. When set, the guest DNS proxy forwards
+    /// queries over vsock to this socket for filtering.
+    pub dns_filter_socket: Option<&'a Path>,
 }
 
 /// Launch the agent VM using libkrun.
@@ -177,6 +194,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         port_mappings,
         resources,
         ssh_agent_socket,
+        dns_filter_socket,
     } = config;
     // Raise file descriptor limits
     raise_fd_limits();
@@ -410,6 +428,21 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             }
         }
 
+        // Add vsock port for DNS filter proxy (optional)
+        if let Some(dns_socket) = dns_filter_socket {
+            let dns_path = try_or_free_ctx!(
+                path_to_cstring(dns_socket),
+                "add dns filter vsock port",
+                "path contains null byte"
+            );
+            // listen=false: guest connects out to this port, host listens via Unix socket
+            if krun_add_vsock_port2(ctx, ports::DNS_FILTER, dns_path.as_ptr(), false) < 0 {
+                tracing::warn!("failed to add DNS filter vsock port — DNS filtering disabled");
+            } else {
+                tracing::info!("DNS filtering enabled on vsock port {}", ports::DNS_FILTER);
+            }
+        }
+
         // Set console output if specified
         if let Some(log_path) = console_log {
             let console_path = try_or_free_ctx!(
@@ -496,6 +529,11 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // Tell the agent to start SSH agent forwarding bridge
         if ssh_agent_socket.is_some() {
             env_strings.push(cstr("SMOLVM_SSH_AGENT=1"));
+        }
+
+        // Tell the agent to start DNS filtering proxy
+        if dns_filter_socket.is_some() {
+            env_strings.push(cstr("SMOLVM_DNS_FILTER=1"));
         }
 
         let mut envp: Vec<*const libc::c_char> = env_strings.iter().map(|s| s.as_ptr()).collect();

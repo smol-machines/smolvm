@@ -78,6 +78,27 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
         overlay: Some(&overlay_disk),
     };
 
+    // Start DNS filter listener if configured
+    let dns_filter_socket_path = if let Some(ref hosts) = config.dns_filter_hosts {
+        if !hosts.is_empty() {
+            let socket_path = config
+                .vsock_socket
+                .parent()
+                .unwrap_or(std::path::Path::new("/tmp"))
+                .join("dns-filter.sock");
+            if let Err(e) = smolvm::dns_filter_listener::start(&socket_path, hosts.clone()) {
+                tracing::warn!(error = %e, "failed to start DNS filter listener");
+                None
+            } else {
+                Some(socket_path)
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let result = launch_agent_vm(&LaunchConfig {
         rootfs_path: &config.rootfs_path,
         disks: &disks,
@@ -87,6 +108,7 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
         port_mappings: &config.ports,
         resources: config.resources,
         ssh_agent_socket: config.ssh_agent_socket.as_deref(),
+        dns_filter_socket: dns_filter_socket_path.as_deref(),
     });
 
     // If we get here, launch_agent_vm returned (should only happen on error)

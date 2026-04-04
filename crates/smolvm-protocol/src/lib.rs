@@ -60,6 +60,8 @@ pub mod ports {
     pub const AGENT_CONTROL: u32 = 6000;
     /// SSH agent forwarding (host SSH_AUTH_SOCK bridged to guest).
     pub const SSH_AGENT: u32 = 6001;
+    /// DNS filtering proxy (guest forwards DNS queries to host for filtering).
+    pub const DNS_FILTER: u32 = 6002;
 }
 
 /// vsock CID constants.

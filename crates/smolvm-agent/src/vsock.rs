@@ -183,3 +183,58 @@ impl Write for VsockStream {
 pub fn listen(port: u32) -> std::io::Result<VsockListener> {
     VsockListener::bind(port)
 }
+
+/// Connect to a vsock port on the host (CID 2).
+#[cfg(target_os = "linux")]
+pub fn connect(port: u32) -> std::io::Result<VsockStream> {
+    use std::mem;
+    use std::os::fd::FromRawFd;
+
+    const AF_VSOCK: libc::c_int = 40;
+    const HOST_CID: u32 = 2;
+
+    #[repr(C)]
+    struct sockaddr_vm {
+        svm_family: libc::sa_family_t,
+        svm_reserved1: u16,
+        svm_port: u32,
+        svm_cid: u32,
+        svm_zero: [u8; 4],
+    }
+
+    unsafe {
+        let fd = libc::socket(AF_VSOCK, libc::SOCK_STREAM, 0);
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let fd = OwnedFd::from_raw_fd(fd);
+
+        let addr = sockaddr_vm {
+            svm_family: AF_VSOCK as u16,
+            svm_reserved1: 0,
+            svm_port: port,
+            svm_cid: HOST_CID,
+            svm_zero: [0; 4],
+        };
+
+        if libc::connect(
+            fd.as_raw_fd(),
+            &addr as *const sockaddr_vm as *const libc::sockaddr,
+            mem::size_of::<sockaddr_vm>() as libc::socklen_t,
+        ) < 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        Ok(VsockStream { fd })
+    }
+}
+
+/// Connect stub for non-Linux platforms.
+#[cfg(not(target_os = "linux"))]
+pub fn connect(_port: u32) -> std::io::Result<VsockStream> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "vsock only supported on Linux",
+    ))
+}
