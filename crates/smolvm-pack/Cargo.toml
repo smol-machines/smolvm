@@ -15,6 +15,7 @@ crc32fast = "1.4"
 tempfile = "3"
 sha2 = "0.10"
 dirs = "5"
+time = { version = "0.3", features = ["formatting"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

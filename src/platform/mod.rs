@@ -168,6 +168,20 @@ impl Platform {
         }
     }
 
+    /// OCI platform string for the **host** (e.g., "darwin/arm64").
+    ///
+    /// Used for registry Image Index resolution — tells the registry which
+    /// host OS+arch this `.smolmachine` runs on. Distinct from `oci_platform()`
+    /// which always returns `linux/*` (the guest).
+    pub const fn host_oci_platform(&self) -> &'static str {
+        match (self.os, self.arch) {
+            (Os::MacOs, Arch::Arm64) => "darwin/arm64",
+            (Os::MacOs, Arch::X86_64) => "darwin/amd64",
+            (Os::Linux, Arch::Arm64) => "linux/arm64",
+            (Os::Linux, Arch::X86_64) => "linux/amd64",
+        }
+    }
+
     /// Check if this platform supports Rosetta 2.
     ///
     /// Rosetta 2 is only available on Apple Silicon Macs.
@@ -298,5 +312,25 @@ mod tests {
             arch: Arch::Arm64,
         };
         assert_eq!(platform.to_string(), "macos/arm64");
+    }
+
+    #[test]
+    fn test_host_oci_platform_all_combos() {
+        let cases = [
+            (Os::MacOs, Arch::Arm64, "darwin/arm64"),
+            (Os::MacOs, Arch::X86_64, "darwin/amd64"),
+            (Os::Linux, Arch::Arm64, "linux/arm64"),
+            (Os::Linux, Arch::X86_64, "linux/amd64"),
+        ];
+        for (os, arch, expected) in cases {
+            let p = Platform { os, arch };
+            assert_eq!(
+                p.host_oci_platform(),
+                expected,
+                "failed for {:?}/{:?}",
+                os,
+                arch
+            );
+        }
     }
 }

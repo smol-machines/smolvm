@@ -15,7 +15,7 @@ use smolvm::data::resources::DEFAULT_MICROVM_CPU_COUNT;
 /// packed VMs are typically single-purpose, minimal workloads).
 pub(crate) const PACK_DEFAULT_MEMORY_MIB: u32 = 256;
 use smolvm::config::{RecordState, SmolvmConfig};
-use smolvm::platform::{Arch, Os, VmExecutor};
+use smolvm::platform::{Arch, Os, Platform, VmExecutor};
 use smolvm::Error;
 use smolvm_pack::assets::AssetCollector;
 use smolvm_pack::format::{PackManifest, PackMode};
@@ -290,7 +290,9 @@ impl PackCreateCmd {
 
         // Build manifest
         let platform = format!("{}/{}", image_info.os, image_info.architecture);
-        let mut manifest = PackManifest::new(image, image_info.digest.clone(), platform);
+        let host_platform = Platform::current().host_oci_platform().to_string();
+        let mut manifest =
+            PackManifest::new(image, image_info.digest.clone(), platform, host_platform);
         manifest.cpus = pack_config.cpus;
         manifest.mem = pack_config.mem;
 
@@ -393,8 +395,13 @@ impl PackCreateCmd {
 
         // 6. Build manifest
         let platform = format!("linux/{}", Arch::current().oci_arch());
-        let mut manifest =
-            PackManifest::new(format!("vm://{}", vm_name), "none".to_string(), platform);
+        let host_platform = Platform::current().host_oci_platform().to_string();
+        let mut manifest = PackManifest::new(
+            format!("vm://{}", vm_name),
+            "none".to_string(),
+            platform,
+            host_platform,
+        );
         manifest.mode = PackMode::Vm;
         manifest.cpus = pack_config.cpus;
         manifest.mem = pack_config.mem;
