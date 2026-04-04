@@ -228,6 +228,213 @@ pub fn rewrite_image_registry(image: &str, new_registry: &str) -> String {
     }
 }
 
+/// Default registry for smolmachines artifacts.
+pub const SMOLMACHINES_REGISTRY: &str = "registry.smolmachines.com";
+
+/// Error parsing an artifact reference.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReferenceError {
+    /// The original input that failed to parse.
+    pub input: String,
+    /// What went wrong.
+    pub reason: String,
+}
+
+impl std::fmt::Display for ReferenceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid reference '{}': {}", self.input, self.reason)
+    }
+}
+
+impl std::error::Error for ReferenceError {}
+
+/// A parsed OCI-style reference for smolmachine artifacts.
+///
+/// Supports both tag and digest references:
+/// ```text
+/// smolmachines.com/python-dev:latest              # tag
+/// smolmachines.com/python-dev@sha256:abc123...    # digest (immutable)
+/// smolmachines.com/binsquare/custom:v1            # user namespace
+/// python-dev:latest                                # shorthand (default registry)
+/// python-dev                                       # bare (default registry + "latest")
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct Reference {
+    /// Registry hostname (e.g., "registry.smolmachines.com").
+    pub registry: String,
+    /// User namespace, if present (e.g., "binsquare"). None for official.
+    pub namespace: Option<String>,
+    /// Machine name (e.g., "python-dev").
+    pub name: String,
+    /// Tag (e.g., "latest", "v1.0"). None if digest is set.
+    pub tag: Option<String>,
+    /// Digest (e.g., "sha256:abc123..."). None if tag is set.
+    pub digest: Option<String>,
+}
+
+impl Reference {
+    /// Parse a reference string.
+    ///
+    /// Returns a [`ReferenceError`] if the reference is empty or malformed.
+    pub fn parse(input: &str) -> std::result::Result<Self, ReferenceError> {
+        let raw_input = input;
+        let input = input.trim();
+
+        let err = |reason: &str| ReferenceError {
+            input: raw_input.to_string(),
+            reason: reason.to_string(),
+        };
+
+        if input.is_empty() {
+            return Err(err("empty reference"));
+        }
+
+        // Split off digest (@sha256:...) or tag (:tag) from the end.
+        // Digest takes precedence: `image@sha256:...` is a digest ref even if
+        // there's a `:` in the name part.
+        let (path, tag, digest) = if let Some(at_pos) = input.find('@') {
+            let path = &input[..at_pos];
+            let digest_str = &input[at_pos + 1..];
+            validate_digest(raw_input, digest_str)?;
+            (path, None, Some(digest_str.to_string()))
+        } else {
+            // No digest — check for tag after the last colon.
+            // But we must not split on `:` inside a registry hostname with port
+            // (e.g., "localhost:5000/image:tag").
+            // Strategy: find the last `/`, then look for `:` after it.
+            let tag_split_from = input.rfind('/').map(|p| p + 1).unwrap_or(0);
+            let after_last_slash = &input[tag_split_from..];
+
+            if let Some(colon_pos) = after_last_slash.find(':') {
+                let abs_colon = tag_split_from + colon_pos;
+                let path = &input[..abs_colon];
+                let tag = &input[abs_colon + 1..];
+                if tag.is_empty() {
+                    return Err(err("empty tag"));
+                }
+                (path, Some(tag.to_string()), None)
+            } else {
+                (input, None, None)
+            }
+        };
+
+        // Now parse the path into registry / namespace / name.
+        let parts: Vec<&str> = path.split('/').collect();
+
+        let (registry, namespace, name) = match parts.len() {
+            1 => {
+                // "python-dev" — bare name, default registry
+                (
+                    SMOLMACHINES_REGISTRY.to_string(),
+                    None,
+                    parts[0].to_string(),
+                )
+            }
+            2 => {
+                let first = parts[0];
+                if first.contains('.') || first.contains(':') {
+                    // "smolmachines.com/python-dev" — registry + name (official)
+                    (first.to_string(), None, parts[1].to_string())
+                } else {
+                    // "binsquare/custom" — namespace + name (default registry)
+                    (
+                        SMOLMACHINES_REGISTRY.to_string(),
+                        Some(first.to_string()),
+                        parts[1].to_string(),
+                    )
+                }
+            }
+            3 => {
+                // "smolmachines.com/binsquare/custom" — registry + namespace + name
+                let first = parts[0];
+                if !first.contains('.') && !first.contains(':') {
+                    return Err(ReferenceError {
+                        input: raw_input.to_string(),
+                        reason: format!(
+                            "first component '{}' doesn't look like a registry hostname",
+                            first
+                        ),
+                    });
+                }
+                (
+                    first.to_string(),
+                    Some(parts[1].to_string()),
+                    parts[2].to_string(),
+                )
+            }
+            _ => {
+                return Err(err("too many path components"));
+            }
+        };
+
+        if name.is_empty() {
+            return Err(err("empty name"));
+        }
+
+        Ok(Reference {
+            registry,
+            namespace,
+            name,
+            tag,
+            digest,
+        })
+    }
+
+    /// The full repository path (namespace/name or just name).
+    pub fn repository(&self) -> String {
+        match &self.namespace {
+            Some(ns) => format!("{}/{}", ns, self.name),
+            None => self.name.clone(),
+        }
+    }
+}
+
+impl std::fmt::Display for Reference {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let repo = self.repository();
+        let suffix = if let Some(ref d) = self.digest {
+            format!("@{}", d)
+        } else if let Some(ref t) = self.tag {
+            format!(":{}", t)
+        } else {
+            ":latest".to_string()
+        };
+        write!(f, "{}/{}{}", self.registry, repo, suffix)
+    }
+}
+
+/// Validate a digest string: must be `sha256:` followed by exactly 64 hex chars.
+fn validate_digest(raw_input: &str, digest: &str) -> std::result::Result<(), ReferenceError> {
+    let hex = match digest.strip_prefix("sha256:") {
+        Some(h) => h,
+        None => {
+            return Err(ReferenceError {
+                input: raw_input.to_string(),
+                reason: format!(
+                    "unsupported digest algorithm in '{}': only sha256 is supported",
+                    digest
+                ),
+            });
+        }
+    };
+
+    if hex.len() != 64 {
+        return Err(ReferenceError {
+            input: raw_input.to_string(),
+            reason: format!("digest has {} hex chars, expected 64", hex.len()),
+        });
+    }
+
+    if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(ReferenceError {
+            input: raw_input.to_string(),
+            reason: "digest contains non-hex characters".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,5 +678,143 @@ mirror = "ghcr-mirror.example.com"
         let mut config = RegistryConfig::default();
         config.defaults.registry = Some("custom.registry.io".to_string());
         assert_eq!(config.default_registry(), "custom.registry.io");
+    }
+
+    // --- Reference parser tests ---
+
+    #[test]
+    fn test_reference_bare_name() {
+        let r = Reference::parse("python-dev").unwrap();
+        assert_eq!(r.registry, SMOLMACHINES_REGISTRY);
+        assert_eq!(r.namespace, None);
+        assert_eq!(r.name, "python-dev");
+        assert_eq!(r.tag, None);
+        assert_eq!(r.digest, None);
+    }
+
+    #[test]
+    fn test_reference_name_with_tag() {
+        let r = Reference::parse("python-dev:latest").unwrap();
+        assert_eq!(r.registry, SMOLMACHINES_REGISTRY);
+        assert_eq!(r.namespace, None);
+        assert_eq!(r.name, "python-dev");
+        assert_eq!(r.tag, Some("latest".to_string()));
+        assert_eq!(r.digest, None);
+    }
+
+    #[test]
+    fn test_reference_registry_and_name() {
+        let r = Reference::parse("smolmachines.com/python-dev:latest").unwrap();
+        assert_eq!(r.registry, "smolmachines.com");
+        assert_eq!(r.namespace, None);
+        assert_eq!(r.name, "python-dev");
+        assert_eq!(r.tag, Some("latest".to_string()));
+    }
+
+    #[test]
+    fn test_reference_registry_namespace_name() {
+        let r = Reference::parse("smolmachines.com/binsquare/custom:v1").unwrap();
+        assert_eq!(r.registry, "smolmachines.com");
+        assert_eq!(r.namespace, Some("binsquare".to_string()));
+        assert_eq!(r.name, "custom");
+        assert_eq!(r.tag, Some("v1".to_string()));
+    }
+
+    #[test]
+    fn test_reference_namespace_without_registry() {
+        let r = Reference::parse("binsquare/custom:v1").unwrap();
+        assert_eq!(r.registry, SMOLMACHINES_REGISTRY);
+        assert_eq!(r.namespace, Some("binsquare".to_string()));
+        assert_eq!(r.name, "custom");
+        assert_eq!(r.tag, Some("v1".to_string()));
+    }
+
+    #[test]
+    fn test_reference_digest() {
+        let digest = "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let input = format!("python-dev@{}", digest);
+        let r = Reference::parse(&input).unwrap();
+        assert_eq!(r.registry, SMOLMACHINES_REGISTRY);
+        assert_eq!(r.name, "python-dev");
+        assert_eq!(r.tag, None);
+        assert_eq!(r.digest, Some(digest.to_string()));
+    }
+
+    #[test]
+    fn test_reference_registry_with_port() {
+        let r = Reference::parse("localhost:5000/myimage:latest").unwrap();
+        assert_eq!(r.registry, "localhost:5000");
+        assert_eq!(r.namespace, None);
+        assert_eq!(r.name, "myimage");
+        assert_eq!(r.tag, Some("latest".to_string()));
+    }
+
+    #[test]
+    fn test_reference_display() {
+        let r = Reference::parse("python-dev:latest").unwrap();
+        assert_eq!(
+            r.to_string(),
+            format!("{}/python-dev:latest", SMOLMACHINES_REGISTRY)
+        );
+
+        let r = Reference::parse("python-dev").unwrap();
+        // Bare name gets :latest in display
+        assert_eq!(
+            r.to_string(),
+            format!("{}/python-dev:latest", SMOLMACHINES_REGISTRY)
+        );
+    }
+
+    #[test]
+    fn test_reference_display_digest() {
+        let digest = "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let input = format!("smolmachines.com/python-dev@{}", digest);
+        let r = Reference::parse(&input).unwrap();
+        assert_eq!(
+            r.to_string(),
+            format!("smolmachines.com/python-dev@{}", digest)
+        );
+    }
+
+    #[test]
+    fn test_reference_error_empty() {
+        let err = Reference::parse("").unwrap_err();
+        assert_eq!(err.reason, "empty reference");
+        assert!(Reference::parse("  ").is_err());
+    }
+
+    #[test]
+    fn test_reference_error_invalid_digest_algorithm() {
+        let err = Reference::parse("python-dev@md5:abc123").unwrap_err();
+        assert!(err.reason.contains("unsupported digest algorithm"));
+    }
+
+    #[test]
+    fn test_reference_error_digest_too_short() {
+        let err = Reference::parse("python-dev@sha256:tooshort").unwrap_err();
+        assert!(err.reason.contains("hex chars, expected 64"));
+    }
+
+    #[test]
+    fn test_reference_error_digest_non_hex() {
+        // 64 chars but contains 'g' which is not hex
+        let bad = format!(
+            "python-dev@sha256:{}",
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567g9"
+        );
+        let err = Reference::parse(&bad).unwrap_err();
+        assert!(err.reason.contains("non-hex"));
+    }
+
+    #[test]
+    fn test_reference_error_empty_tag() {
+        let err = Reference::parse("python-dev:").unwrap_err();
+        assert_eq!(err.reason, "empty tag");
+    }
+
+    #[test]
+    fn test_reference_error_too_many_components() {
+        let err = Reference::parse("a.com/b/c/d:latest").unwrap_err();
+        assert!(err.reason.contains("too many path components"));
     }
 }

@@ -727,6 +727,7 @@ mod tests {
             "alpine:latest".to_string(),
             "sha256:abc123".to_string(),
             "linux/arm64".to_string(),
+            "darwin/arm64".to_string(),
         );
 
         // Pack
@@ -775,6 +776,7 @@ mod tests {
             "test:latest".to_string(),
             "sha256:test".to_string(),
             "linux/arm64".to_string(),
+            "darwin/arm64".to_string(),
         );
 
         // Pack with assets
@@ -811,6 +813,7 @@ mod tests {
             "alpine:latest".to_string(),
             "sha256:abc123".to_string(),
             "linux/arm64".to_string(),
+            "darwin/arm64".to_string(),
         );
 
         // Pack embedded (single file)
@@ -865,6 +868,7 @@ mod tests {
             "test:embedded".to_string(),
             "sha256:test".to_string(),
             "linux/arm64".to_string(),
+            "darwin/arm64".to_string(),
         );
 
         // Pack embedded with assets
@@ -908,6 +912,7 @@ mod tests {
             "alpine:latest".to_string(),
             "sha256:abc123".to_string(),
             "linux/arm64".to_string(),
+            "darwin/arm64".to_string(),
         );
 
         // Pack sidecar mode
@@ -1003,6 +1008,7 @@ mod tests {
             "test:latest".to_string(),
             "sha256:test".to_string(),
             "linux/arm64".to_string(),
+            "darwin/arm64".to_string(),
         );
 
         // Pack sidecar mode

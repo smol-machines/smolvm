@@ -79,6 +79,21 @@ smolvm serve start [--listen ADDR:PORT]           # HTTP API
 smolvm config registries edit                     # registry auth
 ```
 
+## Artifact References
+
+Artifact references follow OCI conventions and support both tags and digests:
+
+```
+python-dev                                        # bare name (default registry + latest)
+python-dev:v1.0                                   # name + tag
+binsquare/custom:v1                               # namespace + name + tag
+smolmachines.com/python-dev:latest                # registry + name + tag
+smolmachines.com/binsquare/custom:v1              # registry + namespace + name + tag
+python-dev@sha256:abcdef0123...                   # digest reference (immutable)
+```
+
+Default registry: `registry.smolmachines.com`. Digest references require `sha256:` followed by exactly 64 hex characters.
+
 ## Key Flags
 
 | Flag | Short | Used on | Description |
@@ -259,6 +274,11 @@ The packed binary runs as a normal executable:
 ./my-app exec -- pip install x               # exec into daemon
 ./my-app stop                                # stop daemon
 ```
+
+The `.smolmachine` manifest includes registry-oriented metadata:
+- `host_platform` — host OS+arch this machine runs on (e.g., `darwin/arm64`), distinct from `platform` which is the guest
+- `created` — RFC 3339 timestamp of when the machine was packed
+- `smolvm_version` — version of smolvm that built it
 
 ## HTTP API
 

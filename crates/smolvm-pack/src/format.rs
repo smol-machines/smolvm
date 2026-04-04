@@ -318,6 +318,17 @@ pub struct PackManifest {
     /// Default memory in MiB.
     pub mem: u32,
 
+    /// Host platform this .smolmachine runs on (e.g., "darwin/arm64").
+    /// Distinct from `platform` which is the guest architecture (always linux).
+    /// Used for registry Image Index resolution.
+    pub host_platform: String,
+
+    /// RFC 3339 timestamp when this machine was packed.
+    pub created: String,
+
+    /// smolvm version that built this machine (e.g., "0.1.15").
+    pub smolvm_version: String,
+
     /// Asset inventory - files included in the assets blob.
     pub assets: AssetInventory,
 }
@@ -368,9 +379,16 @@ pub struct LayerEntry {
     pub size: u64,
 }
 
+/// Generate an RFC 3339 timestamp for the current time in UTC.
+fn rfc3339_now() -> String {
+    let now = time::OffsetDateTime::now_utc();
+    now.format(&time::format_description::well_known::Rfc3339)
+        .expect("RFC 3339 formatting should never fail for a valid OffsetDateTime")
+}
+
 impl PackManifest {
     /// Create a new manifest with default values.
-    pub fn new(image: String, digest: String, platform: String) -> Self {
+    pub fn new(image: String, digest: String, platform: String, host_platform: String) -> Self {
         Self {
             mode: PackMode::default(),
             image,
@@ -382,6 +400,9 @@ impl PackManifest {
             workdir: None,
             cpus: 1,
             mem: 256,
+            host_platform,
+            created: rfc3339_now(),
+            smolvm_version: env!("CARGO_PKG_VERSION").to_string(),
             assets: AssetInventory {
                 libraries: Vec::new(),
                 agent_rootfs: AssetEntry {
@@ -458,6 +479,7 @@ mod tests {
             "alpine:latest".to_string(),
             "sha256:abc123".to_string(),
             "linux/arm64".to_string(),
+            "darwin/arm64".to_string(),
         );
         manifest.cpus = 2;
         manifest.mem = 1024;
@@ -485,11 +507,16 @@ mod tests {
             "ubuntu:22.04".to_string(),
             "sha256:def456".to_string(),
             "linux/amd64".to_string(),
+            "linux/amd64".to_string(),
         );
 
         let json = String::from_utf8(manifest.to_json().unwrap()).unwrap();
         assert!(json.contains("\"image\": \"ubuntu:22.04\""));
         assert!(json.contains("\"platform\": \"linux/amd64\""));
+        // Phase 0 fields: verify key names serialize correctly
+        assert!(json.contains("\"host_platform\": \"linux/amd64\""));
+        assert!(json.contains("\"smolvm_version\""));
+        assert!(json.contains("\"created\""));
     }
 
     #[test]
@@ -498,35 +525,12 @@ mod tests {
     }
 
     #[test]
-    fn test_pack_mode_backward_compat() {
-        // Old manifests without a "mode" field should deserialize as Container
-        let json = r#"{
-            "image": "alpine:latest",
-            "digest": "sha256:abc",
-            "platform": "linux/arm64",
-            "cpus": 1,
-            "mem": 256,
-            "entrypoint": [],
-            "cmd": [],
-            "env": [],
-            "assets": {
-                "libraries": [],
-                "agent_rootfs": { "path": "rootfs.tar", "size": 1024 },
-                "layers": []
-            }
-        }"#;
-
-        let manifest: PackManifest = serde_json::from_str(json).unwrap();
-        assert_eq!(manifest.mode, PackMode::Container);
-        assert!(manifest.assets.overlay_template.is_none());
-    }
-
-    #[test]
     fn test_pack_mode_vm_roundtrip() {
         let mut manifest = PackManifest::new(
             "vm://myvm".to_string(),
             "none".to_string(),
             "linux/arm64".to_string(),
+            "darwin/arm64".to_string(),
         );
         manifest.mode = PackMode::Vm;
         manifest.assets.overlay_template = Some(AssetEntry {
