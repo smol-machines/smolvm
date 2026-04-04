@@ -122,9 +122,10 @@ impl MachineCmd {
 ///   smolvm machine run --net -v ./src:/app --image node -- npm start
 #[derive(Args, Debug)]
 pub struct RunCmd {
-    /// Container image (e.g., alpine, ubuntu:22.04, ghcr.io/org/image)
+    /// Container image (e.g., alpine, ubuntu:22.04, ghcr.io/org/image).
+    /// Optional when a Smolfile provides the image, or for bare VM mode.
     #[arg(short = 'I', long, value_name = "IMAGE")]
-    pub image: String,
+    pub image: Option<String>,
 
     /// Command and arguments to run (default: image entrypoint or /bin/sh)
     #[arg(trailing_var_arg = true, value_name = "COMMAND")]
@@ -217,6 +218,10 @@ pub struct RunCmd {
     )]
     pub smolfile: Option<PathBuf>,
 
+    /// Forward host SSH agent into the VM (enables git/ssh without exposing keys)
+    #[arg(long, help_heading = "Security")]
+    pub ssh_agent: bool,
+
     /// Mount ~/.docker/ config into VM for registry authentication
     #[arg(long, help_heading = "Registry")]
     pub docker_config: bool,
@@ -231,7 +236,7 @@ impl RunCmd {
 
         let params = crate::cli::smolfile::build_create_params(
             "default".to_string(),
-            Some(self.image.clone()),
+            self.image.clone(),
             None,
             self.command.clone(),
             self.cpus,
@@ -278,13 +283,39 @@ impl RunCmd {
         };
         println!("Starting {} machine...", mode);
 
+        let ssh_agent_socket = if self.ssh_agent || params.ssh_agent {
+            match std::env::var("SSH_AUTH_SOCK") {
+                Ok(path) => Some(std::path::PathBuf::from(path)),
+                Err(_) => {
+                    return Err(Error::config(
+                        "--ssh-agent",
+                        "SSH_AUTH_SOCK is not set. Start an SSH agent with: eval $(ssh-agent) && ssh-add",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+
         let freshly_started = manager
-            .ensure_running_with_full_config(mounts.clone(), ports, resources)
+            .ensure_running_with_full_config(mounts.clone(), ports, resources, ssh_agent_socket)
             .map_err(|e| Error::agent("start machine", e.to_string()))?;
 
         let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
 
-        crate::cli::pull_with_progress(&mut client, &self.image, self.oci_platform.as_deref())?;
+        // Resolve image: CLI > Smolfile > None (bare VM)
+        let image = self.image.clone().or(params.image.clone());
+
+        // Pull image if one is specified
+        let image_info = if let Some(ref img) = image {
+            Some(crate::cli::pull_with_progress(
+                &mut client,
+                img,
+                self.oci_platform.as_deref(),
+            )?)
+        } else {
+            None
+        };
 
         if freshly_started && !params.init.is_empty() {
             for (i, cmd) in params.init.iter().enumerate() {
@@ -304,109 +335,221 @@ impl RunCmd {
             }
         }
 
-        let command = if self.command.is_empty() {
-            if self.detach {
-                DEFAULT_IDLE_CMD.iter().map(|s| s.to_string()).collect()
-            } else {
-                vec![DEFAULT_SHELL_CMD.to_string()]
-            }
-        } else {
+        // Resolve command: CLI trailing args > Smolfile entrypoint+cmd > image metadata > defaults
+        let command = if !self.command.is_empty() {
             self.command.clone()
+        } else if !params.entrypoint.is_empty() || !params.cmd.is_empty() {
+            let mut cmd = params.entrypoint.clone();
+            cmd.extend(params.cmd.clone());
+            cmd
+        } else if let Some(ref info) = image_info {
+            let mut cmd = info.entrypoint.clone();
+            cmd.extend(info.cmd.clone());
+            if cmd.is_empty() {
+                if self.detach {
+                    DEFAULT_IDLE_CMD.iter().map(|s| s.to_string()).collect()
+                } else {
+                    vec![DEFAULT_SHELL_CMD.to_string()]
+                }
+            } else {
+                cmd
+            }
+        } else if self.detach {
+            DEFAULT_IDLE_CMD.iter().map(|s| s.to_string()).collect()
+        } else {
+            vec![DEFAULT_SHELL_CMD.to_string()]
         };
 
         let env = parse_env_list(&params.env);
         let mount_bindings = mounts_to_virtiofs_bindings(&mounts);
 
-        if self.detach {
-            let info = client.create_container(
-                &self.image,
-                command,
-                env,
-                params.workdir.clone(),
-                mount_bindings,
-            )?;
-
-            {
-                use smolvm::config::SmolvmConfig;
-                use vm_common::DefaultVmOverrides;
-                let mount_tuples: Vec<(String, String, bool)> = mounts
-                    .iter()
-                    .map(|m| {
-                        (
-                            m.source.to_string_lossy().to_string(),
-                            m.target.to_string_lossy().to_string(),
-                            m.read_only,
-                        )
-                    })
-                    .collect();
-                let port_tuples: Vec<(u16, u16)> =
-                    params.port.iter().map(|p| (p.host, p.guest)).collect();
-                if let Ok(mut config) = SmolvmConfig::load() {
-                    vm_common::persist_default_running(
-                        &mut config,
-                        manager.child_pid(),
-                        Some(DefaultVmOverrides {
-                            cpus: params.cpus,
-                            mem: params.mem,
-                            mounts: mount_tuples,
-                            ports: port_tuples,
-                            network: params.net,
-                            storage_gb: params.storage_gb,
-                            overlay_gb: params.overlay_gb,
-                            init: params.init.clone(),
-                            env: parse_env_list(&params.env),
-                            workdir: params.workdir.clone(),
-                            image: Some(self.image.clone()),
-                            entrypoint: vec![],
-                            cmd: vec![],
-                        }),
-                    );
-                }
-            }
-
-            println!("Machine running (container: {})", &info.id[..12]);
-            println!("\nTo interact:");
-            println!(
-                "  smolvm container exec --container {} -- <command>",
-                &info.id[..12]
-            );
-            println!("\nTo stop:");
-            println!("  smolvm machine stop");
-
-            manager.detach();
-            Ok(())
-        } else {
-            let exit_code = if self.interactive || self.tty {
-                let config = RunConfig::new(&self.image, command)
-                    .with_env(env)
-                    .with_workdir(params.workdir.clone())
-                    .with_mounts(mount_bindings)
-                    .with_timeout(self.timeout)
-                    .with_tty(self.tty);
-                client.run_interactive(config)?
-            } else {
-                let (exit_code, stdout, stderr) = client.run_with_mounts_and_timeout(
-                    &self.image,
+        // Two modes: container (with image) or bare VM (no image)
+        if let Some(ref img) = image {
+            // Container mode
+            if self.detach {
+                let info = client.create_container(
+                    img,
                     command,
                     env,
                     params.workdir.clone(),
                     mount_bindings,
-                    self.timeout,
                 )?;
-                if !stdout.is_empty() {
-                    print!("{}", stdout);
-                }
-                if !stderr.is_empty() {
-                    eprint!("{}", stderr);
-                }
-                flush_output();
-                exit_code
-            };
 
-            if let Err(e) = manager.stop() {
-                tracing::warn!(error = %e, "failed to stop machine");
+                {
+                    use smolvm::config::SmolvmConfig;
+                    use vm_common::DefaultVmOverrides;
+                    let mount_tuples: Vec<(String, String, bool)> = mounts
+                        .iter()
+                        .map(|m| {
+                            (
+                                m.source.to_string_lossy().to_string(),
+                                m.target.to_string_lossy().to_string(),
+                                m.read_only,
+                            )
+                        })
+                        .collect();
+                    let port_tuples: Vec<(u16, u16)> =
+                        params.port.iter().map(|p| (p.host, p.guest)).collect();
+                    if let Ok(mut config) = SmolvmConfig::load() {
+                        vm_common::persist_default_running(
+                            &mut config,
+                            manager.child_pid(),
+                            Some(DefaultVmOverrides {
+                                cpus: params.cpus,
+                                mem: params.mem,
+                                mounts: mount_tuples,
+                                ports: port_tuples,
+                                network: params.net,
+                                storage_gb: params.storage_gb,
+                                overlay_gb: params.overlay_gb,
+                                init: params.init.clone(),
+                                env: parse_env_list(&params.env),
+                                workdir: params.workdir.clone(),
+                                image: Some(img.clone()),
+                                entrypoint: params.entrypoint.clone(),
+                                cmd: params.cmd.clone(),
+                                ssh_agent: self.ssh_agent || params.ssh_agent,
+                            }),
+                        );
+                    }
+                }
+
+                println!("Machine running (container: {})", &info.id[..12]);
+                println!("\nTo interact:");
+                println!(
+                    "  smolvm container exec --container {} -- <command>",
+                    &info.id[..12]
+                );
+                println!("\nTo stop:");
+                println!("  smolvm machine stop");
+
+                manager.detach();
+                Ok(())
+            } else {
+                let exit_code = if self.interactive || self.tty {
+                    let config = RunConfig::new(img, command)
+                        .with_env(env)
+                        .with_workdir(params.workdir.clone())
+                        .with_mounts(mount_bindings)
+                        .with_timeout(self.timeout)
+                        .with_tty(self.tty);
+                    client.run_interactive(config)?
+                } else {
+                    let (exit_code, stdout, stderr) = client.run_with_mounts_and_timeout(
+                        img,
+                        command,
+                        env,
+                        params.workdir.clone(),
+                        mount_bindings,
+                        self.timeout,
+                    )?;
+                    if !stdout.is_empty() {
+                        print!("{}", stdout);
+                    }
+                    if !stderr.is_empty() {
+                        eprint!("{}", stderr);
+                    }
+                    flush_output();
+                    exit_code
+                };
+
+                if let Err(e) = manager.stop() {
+                    tracing::warn!(error = %e, "failed to stop machine");
+                }
+                std::process::exit(exit_code);
             }
-            std::process::exit(exit_code);
+        } else {
+            // Bare VM mode (no image) — run entrypoint+cmd directly via vm_exec
+            if self.detach {
+                // Run entrypoint+cmd in background if present
+                let is_idle = command.is_empty()
+                    || command
+                        == DEFAULT_IDLE_CMD
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect::<Vec<_>>();
+                if !is_idle {
+                    let pid = client.vm_exec_background(command, env, params.workdir.clone())?;
+                    tracing::info!(pid = pid, "background workload started");
+                }
+
+                // Persist the default VM state so it survives stop/start.
+                {
+                    use smolvm::config::SmolvmConfig;
+                    use vm_common::DefaultVmOverrides;
+                    let mount_tuples: Vec<(String, String, bool)> = mounts
+                        .iter()
+                        .map(|m| {
+                            (
+                                m.source.to_string_lossy().to_string(),
+                                m.target.to_string_lossy().to_string(),
+                                m.read_only,
+                            )
+                        })
+                        .collect();
+                    let port_tuples: Vec<(u16, u16)> =
+                        params.port.iter().map(|p| (p.host, p.guest)).collect();
+                    if let Ok(mut config) = SmolvmConfig::load() {
+                        vm_common::persist_default_running(
+                            &mut config,
+                            manager.child_pid(),
+                            Some(DefaultVmOverrides {
+                                cpus: params.cpus,
+                                mem: params.mem,
+                                mounts: mount_tuples,
+                                ports: port_tuples,
+                                network: params.net,
+                                storage_gb: params.storage_gb,
+                                overlay_gb: params.overlay_gb,
+                                init: params.init.clone(),
+                                env: parse_env_list(&params.env),
+                                workdir: params.workdir.clone(),
+                                image: None,
+                                entrypoint: params.entrypoint.clone(),
+                                cmd: params.cmd.clone(),
+                                ssh_agent: self.ssh_agent || params.ssh_agent,
+                            }),
+                        );
+                    }
+                }
+
+                println!(
+                    "Machine running (PID: {})",
+                    manager.child_pid().unwrap_or(0)
+                );
+                println!("\nTo interact:");
+                println!("  smolvm machine exec -- <command>");
+                println!("\nTo stop:");
+                println!("  smolvm machine stop");
+
+                manager.detach();
+                Ok(())
+            } else {
+                let exit_code = if self.interactive || self.tty {
+                    client.vm_exec_interactive(
+                        command,
+                        env,
+                        params.workdir.clone(),
+                        self.timeout,
+                        self.tty,
+                    )?
+                } else {
+                    let (exit_code, stdout, stderr) =
+                        client.vm_exec(command, env, params.workdir.clone(), None)?;
+                    if !stdout.is_empty() {
+                        print!("{}", stdout);
+                    }
+                    if !stderr.is_empty() {
+                        eprint!("{}", stderr);
+                    }
+                    flush_output();
+                    exit_code
+                };
+                if let Err(e) = manager.stop() {
+                    tracing::warn!(error = %e, "failed to stop machine");
+                }
+                std::process::exit(exit_code);
+            }
         }
     }
 }
@@ -553,6 +696,10 @@ pub struct CreateCmd {
     #[arg(short = 'w', long = "workdir", value_name = "DIR")]
     pub workdir: Option<String>,
 
+    /// Forward host SSH agent into the VM (enables git/ssh without exposing keys)
+    #[arg(long)]
+    pub ssh_agent: bool,
+
     /// Load configuration from a Smolfile (TOML)
     #[arg(long = "smolfile", visible_short_alias = 's', value_name = "PATH")]
     pub smolfile: Option<PathBuf>,
@@ -581,6 +728,10 @@ impl CreateCmd {
             self.overlay,
             cli_allow_cidrs,
         )?;
+        let mut params = params;
+        if self.ssh_agent {
+            params.ssh_agent = true;
+        }
         vm_common::create_vm(KIND, params)
     }
 }

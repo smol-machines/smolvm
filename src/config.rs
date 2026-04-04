@@ -417,6 +417,10 @@ pub struct VmRecord {
     /// Grace period in seconds before health checks start after boot.
     #[serde(default)]
     pub health_startup_grace_secs: Option<u64>,
+
+    /// Enable SSH agent forwarding into the VM.
+    #[serde(default)]
+    pub ssh_agent: bool,
 }
 
 fn default_cpus() -> u8 {
@@ -464,6 +468,7 @@ impl VmRecord {
             health_timeout_secs: None,
             health_retries: None,
             health_startup_grace_secs: None,
+            ssh_agent: false,
         }
     }
 
@@ -504,6 +509,7 @@ impl VmRecord {
             health_timeout_secs: None,
             health_retries: None,
             health_startup_grace_secs: None,
+            ssh_agent: false,
         }
     }
 

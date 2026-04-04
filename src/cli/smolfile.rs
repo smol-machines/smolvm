@@ -89,6 +89,17 @@ pub struct Smolfile {
     pub health: Option<HealthConfig>,
     // Wired: flows into VmRecord restart config
     pub restart: Option<RestartSmolfileConfig>,
+
+    // Credential forwarding
+    pub auth: Option<AuthConfig>,
+}
+
+/// Credential forwarding configuration.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct AuthConfig {
+    /// Forward host SSH agent into the VM.
+    pub ssh_agent: Option<bool>,
 }
 
 /// Distribution-specific overrides for packed artifacts.
@@ -226,6 +237,7 @@ pub fn build_create_params(
                 health_timeout_secs: None,
                 health_retries: None,
                 health_startup_grace_secs: None,
+                ssh_agent: false,
             });
         }
     };
@@ -393,6 +405,7 @@ pub fn build_create_params(
         health_timeout_secs,
         health_retries,
         health_startup_grace_secs,
+        ssh_agent: sf.auth.as_ref().and_then(|a| a.ssh_agent).unwrap_or(false),
     })
 }
 

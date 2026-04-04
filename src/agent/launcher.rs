@@ -144,16 +144,40 @@ fn preload_libkrunfw() {
 /// It should be called in the child process after fork, where
 /// DYLD_LIBRARY_PATH is still available for dlopen to find libkrunfw.
 ///
+/// Configuration for launching an agent VM.
+pub struct LaunchConfig<'a> {
+    /// Path to the agent rootfs directory.
+    pub rootfs_path: &'a Path,
+    /// Storage and overlay disk handles.
+    pub disks: &'a VmDisks<'a>,
+    /// Path to the vsock Unix socket for the control channel.
+    pub vsock_socket: &'a Path,
+    /// Optional path to write console output.
+    pub console_log: Option<&'a Path>,
+    /// Host directory mounts to expose to the guest.
+    pub mounts: &'a [HostMount],
+    /// Port mappings (host:guest).
+    pub port_mappings: &'a [PortMapping],
+    /// VM resources (CPU, memory, network, disk sizes).
+    pub resources: VmResources,
+    /// Host SSH agent socket path for forwarding into the guest.
+    pub ssh_agent_socket: Option<&'a Path>,
+}
+
+/// Launch the agent VM using libkrun.
+///
 /// This function never returns on success.
-pub fn launch_agent_vm(
-    rootfs_path: &Path,
-    disks: &VmDisks<'_>,
-    vsock_socket: &Path,
-    console_log: Option<&Path>,
-    mounts: &[HostMount],
-    port_mappings: &[PortMapping],
-    resources: VmResources,
-) -> Result<()> {
+pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
+    let LaunchConfig {
+        rootfs_path,
+        disks,
+        vsock_socket,
+        console_log,
+        mounts,
+        port_mappings,
+        resources,
+        ssh_agent_socket,
+    } = config;
     // Raise file descriptor limits
     raise_fd_limits();
 
@@ -368,6 +392,24 @@ pub fn launch_agent_vm(
             ));
         }
 
+        // Add vsock port for SSH agent forwarding (optional)
+        if let Some(ssh_socket) = ssh_agent_socket {
+            let ssh_path = try_or_free_ctx!(
+                path_to_cstring(ssh_socket),
+                "add ssh agent vsock port",
+                "path contains null byte"
+            );
+            // listen=false: guest connects out to this port, host receives via Unix socket
+            if krun_add_vsock_port2(ctx, ports::SSH_AGENT, ssh_path.as_ptr(), false) < 0 {
+                tracing::warn!("failed to add SSH agent vsock port — SSH forwarding disabled");
+            } else {
+                tracing::info!(
+                    "SSH agent forwarding enabled on vsock port {}",
+                    ports::SSH_AGENT
+                );
+            }
+        }
+
         // Set console output if specified
         if let Some(log_path) = console_log {
             let console_path = try_or_free_ctx!(
@@ -449,6 +491,11 @@ pub fn launch_agent_vm(
             if let Ok(cstr) = CString::new(format!("SMOLVM_MOUNT_COUNT={}", mounts.len())) {
                 env_strings.push(cstr);
             }
+        }
+
+        // Tell the agent to start SSH agent forwarding bridge
+        if ssh_agent_socket.is_some() {
+            env_strings.push(cstr("SMOLVM_SSH_AGENT=1"));
         }
 
         let mut envp: Vec<*const libc::c_char> = env_strings.iter().map(|s| s.as_ptr()).collect();

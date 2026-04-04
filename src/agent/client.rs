@@ -758,9 +758,41 @@ impl AgentClient {
             timeout_ms,
             interactive: false,
             tty: false,
+            background: false,
         })?;
 
         expect_completed(resp, "vm exec")
+    }
+
+    /// Execute a command in the background inside the VM.
+    ///
+    /// Spawns the process and returns immediately with the PID.
+    /// The process runs detached — stdout/stderr go to /dev/null.
+    pub fn vm_exec_background(
+        &mut self,
+        command: Vec<String>,
+        env: Vec<(String, String)>,
+        workdir: Option<String>,
+    ) -> Result<u32> {
+        let resp = self.request(&AgentRequest::VmExec {
+            command,
+            env,
+            workdir,
+            timeout_ms: None,
+            interactive: false,
+            tty: false,
+            background: true,
+        })?;
+
+        let (exit_code, stdout, _stderr) = expect_completed(resp, "vm exec background")?;
+        if exit_code != 0 {
+            return Err(Error::agent("vm exec background", "spawn failed"));
+        }
+        let pid: u32 = stdout
+            .trim()
+            .parse()
+            .map_err(|_| Error::agent("vm exec background", "invalid PID in response"))?;
+        Ok(pid)
     }
 
     /// Run an interactive I/O session.
@@ -919,6 +951,7 @@ impl AgentClient {
                 timeout_ms,
                 interactive: true,
                 tty,
+                background: false,
             },
             tty,
             "vm exec interactive",

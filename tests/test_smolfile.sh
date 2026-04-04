@@ -561,6 +561,88 @@ EOF
     [[ "$output" == *"bare-vm-works"* ]]
 }
 
+test_smolfile_bare_vm_detached() {
+    # Detached bare VM should start, run init, return without hanging,
+    # and be visible in machine ls (persisted as default).
+    cat > "$SMOLFILE_TMPDIR/Smolfile.bare_detach" <<'EOF'
+cpus = 1
+memory = 512
+
+[dev]
+init = [
+    "echo 'detach-init-ran' > /tmp/detach-marker.txt",
+]
+EOF
+
+    # Stop any existing default machine
+    $SMOLVM machine stop 2>/dev/null || true
+
+    local output
+    output=$($SMOLVM machine run -d -s "$SMOLFILE_TMPDIR/Smolfile.bare_detach" 2>&1)
+
+    # Should print PID and return (not hang)
+    [[ "$output" == *"Machine running"* ]] || return 1
+
+    # Verify the init command ran
+    local marker
+    marker=$($SMOLVM machine exec -- cat /tmp/detach-marker.txt 2>&1) || return 1
+    [[ "$marker" == *"detach-init-ran"* ]] || return 1
+
+    # Verify the VM is visible in machine ls (persisted)
+    local ls_output
+    ls_output=$($SMOLVM machine ls 2>&1) || return 1
+    [[ "$ls_output" == *"default"* ]] || return 1
+    [[ "$ls_output" == *"running"* ]] || return 1
+
+    # Clean up
+    $SMOLVM machine stop 2>/dev/null || true
+}
+
+test_smolfile_bare_vm_detached_with_cmd() {
+    # Detached bare VM with entrypoint/cmd should run workload in background
+    cat > "$SMOLFILE_TMPDIR/Smolfile.bare_detach_cmd" <<'EOF'
+entrypoint = ["sh"]
+cmd = ["-c", "echo bg-workload-ran > /tmp/bg-marker.txt"]
+cpus = 1
+memory = 512
+EOF
+
+    $SMOLVM machine stop 2>/dev/null || true
+
+    local output
+    output=$($SMOLVM machine run -d -s "$SMOLFILE_TMPDIR/Smolfile.bare_detach_cmd" 2>&1) || return 1
+
+    # Should return immediately with "Machine running"
+    [[ "$output" == *"Machine running"* ]] || return 1
+
+    # Give background process a moment to complete
+    sleep 1
+
+    # Verify the background workload ran
+    local marker
+    marker=$($SMOLVM machine exec -- cat /tmp/bg-marker.txt 2>&1) || return 1
+    [[ "$marker" == *"bg-workload-ran"* ]] || return 1
+
+    $SMOLVM machine stop 2>/dev/null || true
+}
+
+test_smolfile_bare_vm_detached_with_cli_cmd() {
+    # Detached bare VM with CLI command should run workload in background
+    $SMOLVM machine stop 2>/dev/null || true
+    local output
+    output=$($SMOLVM machine run -d -- sh -c "echo cli-bg-ran > /tmp/cli-bg-marker.txt" 2>&1) || return 1
+
+    [[ "$output" == *"Machine running"* ]] || return 1
+
+    sleep 1
+
+    local marker
+    marker=$($SMOLVM machine exec -- cat /tmp/cli-bg-marker.txt 2>&1) || return 1
+    [[ "$marker" == *"cli-bg-ran"* ]] || return 1
+
+    $SMOLVM machine stop 2>/dev/null || true
+}
+
 test_smolfile_entrypoint_used_at_runtime() {
     # Verify entrypoint + cmd from Smolfile are combined and used
     cat > "$SMOLFILE_TMPDIR/Smolfile.ep_runtime" <<'EOF'
@@ -789,6 +871,9 @@ run_test "Smolfile v2: [dev] section parses" test_smolfile_dev_section_parses ||
 run_test "Smolfile v2: [dev] init used for machine" test_smolfile_dev_init_used_for_machine || true
 run_test "Smolfile v2: full spec parses" test_smolfile_full_spec_parses || true
 run_test "Smolfile v2: bare VM (no image)" test_smolfile_bare_vm_no_image || true
+run_test "Smolfile v2: bare VM detached" test_smolfile_bare_vm_detached || true
+run_test "Smolfile v2: bare VM detached + Smolfile cmd" test_smolfile_bare_vm_detached_with_cmd || true
+run_test "Smolfile v2: bare VM detached + CLI cmd" test_smolfile_bare_vm_detached_with_cli_cmd || true
 run_test "Smolfile v2: entrypoint used at runtime" test_smolfile_entrypoint_used_at_runtime || true
 run_test "Smolfile v2: auto-container on start" test_smolfile_auto_container_on_start || true
 run_test "Smolfile v2: image+cmd overrides image default" test_smolfile_image_cmd_only_overrides_when_set || true
@@ -802,5 +887,131 @@ echo ""
 run_test "Smolfile: [restart] policy persists" test_smolfile_restart_policy || true
 run_test "Smolfile: [health] config persists" test_smolfile_health_config || true
 run_test "Smolfile: monitor starts and exits" test_smolfile_monitor_basic || true
+
+# =============================================================================
+# SSH Agent Forwarding Tests
+# =============================================================================
+
+test_ssh_agent_flag_creates_socket() {
+    local vm_name="ssh-agent-flag-$$"
+    cleanup_vm "$vm_name"
+
+    # Create VM with --ssh-agent
+    $SMOLVM machine create "$vm_name" --ssh-agent --net 2>&1 || return 1
+
+    # Start VM
+    $SMOLVM machine start --name "$vm_name" 2>&1 || return 1
+
+    # Verify SSH agent socket exists in guest
+    local result
+    result=$($SMOLVM machine exec --name "$vm_name" -- ls /tmp/ssh-agent.sock 2>&1) || return 1
+    [[ "$result" == *"ssh-agent.sock"* ]] || return 1
+
+    # Verify SSH_AUTH_SOCK is set in guest environment
+    result=$($SMOLVM machine exec --name "$vm_name" -- sh -c 'echo $SSH_AUTH_SOCK' 2>&1) || return 1
+    [[ "$result" == *"/tmp/ssh-agent.sock"* ]] || return 1
+
+    cleanup_vm "$vm_name"
+}
+
+test_ssh_agent_lists_host_keys() {
+    local vm_name="ssh-agent-keys-$$"
+    cleanup_vm "$vm_name"
+
+    # Skip if no SSH agent on host
+    if ! ssh-add -l >/dev/null 2>&1; then
+        echo "  SKIP (no SSH keys loaded on host)"
+        return 0
+    fi
+
+    $SMOLVM machine create "$vm_name" --ssh-agent --net 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || return 1
+
+    # Install openssh-client
+    $SMOLVM machine exec --name "$vm_name" -- apk add openssh-client 2>&1 >/dev/null || return 1
+
+    # ssh-add -l should list the same keys as host
+    local guest_keys host_keys
+    guest_keys=$($SMOLVM machine exec --name "$vm_name" -- ssh-add -l 2>&1) || return 1
+    host_keys=$(ssh-add -l 2>&1)
+
+    # Both should contain the same key fingerprint
+    local host_fp
+    host_fp=$(echo "$host_keys" | head -1 | awk '{print $2}')
+    [[ "$guest_keys" == *"$host_fp"* ]] || return 1
+
+    cleanup_vm "$vm_name"
+}
+
+test_ssh_agent_not_present_without_flag() {
+    local vm_name="ssh-agent-absent-$$"
+    cleanup_vm "$vm_name"
+
+    # Create VM WITHOUT --ssh-agent
+    $SMOLVM machine create "$vm_name" --net 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || return 1
+
+    # Socket should NOT exist
+    if $SMOLVM machine exec --name "$vm_name" -- ls /tmp/ssh-agent.sock 2>/dev/null; then
+        return 1  # Socket exists but shouldn't
+    fi
+
+    cleanup_vm "$vm_name"
+}
+
+test_ssh_agent_smolfile() {
+    cat > "$SMOLFILE_TMPDIR/Smolfile.ssh" <<'EOF'
+cpus = 1
+memory = 512
+net = true
+
+[auth]
+ssh_agent = true
+EOF
+
+    local vm_name="ssh-agent-smolfile-$$"
+    cleanup_vm "$vm_name"
+
+    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.ssh" 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || return 1
+
+    # Socket should exist (enabled via Smolfile)
+    local result
+    result=$($SMOLVM machine exec --name "$vm_name" -- ls /tmp/ssh-agent.sock 2>&1) || return 1
+    [[ "$result" == *"ssh-agent.sock"* ]] || return 1
+
+    cleanup_vm "$vm_name"
+}
+
+test_ssh_agent_fails_without_host_socket() {
+    local vm_name="ssh-agent-nosock-$$"
+    cleanup_vm "$vm_name"
+
+    # Temporarily unset SSH_AUTH_SOCK
+    local saved_sock="$SSH_AUTH_SOCK"
+    unset SSH_AUTH_SOCK
+
+    # Create should succeed (flag is just stored)
+    $SMOLVM machine create "$vm_name" --ssh-agent 2>&1 || { export SSH_AUTH_SOCK="$saved_sock"; return 1; }
+
+    # Start should fail with clear error
+    local output
+    output=$($SMOLVM machine start --name "$vm_name" 2>&1) || true
+    export SSH_AUTH_SOCK="$saved_sock"
+
+    [[ "$output" == *"SSH_AUTH_SOCK"* ]] || return 1
+
+    cleanup_vm "$vm_name"
+}
+
+echo ""
+echo "--- SSH Agent Forwarding Tests ---"
+echo ""
+
+run_test "SSH agent: --ssh-agent creates socket in guest" test_ssh_agent_flag_creates_socket || true
+run_test "SSH agent: guest can list host keys" test_ssh_agent_lists_host_keys || true
+run_test "SSH agent: socket absent without flag" test_ssh_agent_not_present_without_flag || true
+run_test "SSH agent: Smolfile [auth] ssh_agent" test_ssh_agent_smolfile || true
+run_test "SSH agent: fails when SSH_AUTH_SOCK missing" test_ssh_agent_fails_without_host_socket || true
 
 print_summary "Smolfile Tests"

@@ -626,7 +626,7 @@ pub async fn ensure_machine_running(
         // Use subprocess launch to avoid macOS fork-in-multithreaded-process issue.
         entry
             .manager
-            .ensure_running_via_subprocess(mounts, ports, resources)?;
+            .ensure_running_via_subprocess(mounts, ports, resources, None)?;
         Ok(())
     })
     .await

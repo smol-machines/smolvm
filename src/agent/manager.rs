@@ -633,7 +633,7 @@ impl AgentManager {
     ///
     /// If the agent is running with different mounts, it will be restarted.
     pub fn ensure_running_with_mounts(&self, mounts: Vec<HostMount>) -> Result<bool> {
-        self.ensure_running_with_full_config(mounts, Vec::new(), VmResources::default())
+        self.ensure_running_with_full_config(mounts, Vec::new(), VmResources::default(), None)
     }
 
     /// Ensure the agent is running with the specified mounts and resources.
@@ -644,7 +644,7 @@ impl AgentManager {
         mounts: Vec<HostMount>,
         resources: VmResources,
     ) -> Result<bool> {
-        self.ensure_running_with_full_config(mounts, Vec::new(), resources)
+        self.ensure_running_with_full_config(mounts, Vec::new(), resources, None)
     }
 
     /// Ensure the agent is running with the specified mounts, ports, and resources.
@@ -656,6 +656,7 @@ impl AgentManager {
         mounts: Vec<HostMount>,
         ports: Vec<PortMapping>,
         resources: VmResources,
+        ssh_agent_socket: Option<std::path::PathBuf>,
     ) -> Result<bool> {
         // Check if agent is already running with the same configuration.
         // try_connect_existing restores config from disk on reconnect,
@@ -704,7 +705,7 @@ impl AgentManager {
         }
 
         // Start with new config
-        self.start_with_full_config(mounts, ports, resources)?;
+        self.start_with_full_config(mounts, ports, resources, ssh_agent_socket)?;
         Ok(true)
     }
 
@@ -746,17 +747,17 @@ impl AgentManager {
 
     /// Start the agent VM.
     pub fn start(&self) -> Result<()> {
-        self.start_with_full_config(Vec::new(), Vec::new(), VmResources::default())
+        self.start_with_full_config(Vec::new(), Vec::new(), VmResources::default(), None)
     }
 
     /// Start the agent VM with specified mounts.
     pub fn start_with_mounts(&self, mounts: Vec<HostMount>) -> Result<()> {
-        self.start_with_full_config(mounts, Vec::new(), VmResources::default())
+        self.start_with_full_config(mounts, Vec::new(), VmResources::default(), None)
     }
 
     /// Start the agent VM with specified mounts and resources.
     pub fn start_with_config(&self, mounts: Vec<HostMount>, resources: VmResources) -> Result<()> {
-        self.start_with_full_config(mounts, Vec::new(), resources)
+        self.start_with_full_config(mounts, Vec::new(), resources, None)
     }
 
     /// Common pre-launch setup: validate state, pre-format disks, clean markers.
@@ -905,6 +906,7 @@ impl AgentManager {
         mounts: Vec<HostMount>,
         ports: Vec<PortMapping>,
         resources: VmResources,
+        ssh_agent_socket: Option<std::path::PathBuf>,
     ) -> Result<()> {
         let resources_for_fork = resources.clone();
         self.prepare_for_launch(&mounts, &ports, resources)?;
@@ -983,15 +985,16 @@ impl AgentManager {
                 storage: &storage_disk,
                 overlay: Some(&overlay_disk),
             };
-            let result = launch_agent_vm(
-                &rootfs_path,
-                &disks,
-                &vsock_socket,
-                console_log.as_deref(),
-                &mounts,
-                &ports,
-                resources_for_fork,
-            );
+            let result = launch_agent_vm(&launcher::LaunchConfig {
+                rootfs_path: &rootfs_path,
+                disks: &disks,
+                vsock_socket: &vsock_socket,
+                console_log: console_log.as_deref(),
+                mounts: &mounts,
+                port_mappings: &ports,
+                resources: resources_for_fork,
+                ssh_agent_socket: ssh_agent_socket.as_deref(),
+            });
 
             // If we get here, something went wrong (stderr is /dev/null,
             // but the error is also logged to agent-startup-error.log)
@@ -1033,6 +1036,7 @@ impl AgentManager {
         mounts: Vec<HostMount>,
         ports: Vec<PortMapping>,
         resources: VmResources,
+        ssh_agent_socket: Option<std::path::PathBuf>,
     ) -> Result<()> {
         use super::boot_config::BootConfig;
 
@@ -1059,6 +1063,7 @@ impl AgentManager {
             mounts: mounts.clone(),
             ports: ports.clone(),
             resources: resources_for_config.clone(),
+            ssh_agent_socket,
         };
         let config_path = self
             .storage_disk
@@ -1097,6 +1102,7 @@ impl AgentManager {
         mounts: Vec<HostMount>,
         ports: Vec<PortMapping>,
         resources: VmResources,
+        ssh_agent_socket: Option<std::path::PathBuf>,
     ) -> Result<bool> {
         // Check if agent is already running (same logic as ensure_running_with_full_config)
         if self.try_connect_existing().is_some() {
@@ -1134,7 +1140,7 @@ impl AgentManager {
             self.reset_stale_running_state();
         }
 
-        self.start_via_subprocess(mounts, ports, resources)?;
+        self.start_via_subprocess(mounts, ports, resources, ssh_agent_socket)?;
         Ok(true)
     }
 

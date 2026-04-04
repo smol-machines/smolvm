@@ -184,6 +184,7 @@ pub struct CreateVmParams {
     pub health_timeout_secs: Option<u64>,
     pub health_retries: Option<u32>,
     pub health_startup_grace_secs: Option<u64>,
+    pub ssh_agent: bool,
 }
 
 /// Maximum length for machine names.
@@ -316,6 +317,7 @@ pub fn create_vm(kind: VmKind, params: CreateVmParams) -> smolvm::Result<()> {
     record.health_timeout_secs = params.health_timeout_secs;
     record.health_retries = params.health_retries;
     record.health_startup_grace_secs = params.health_startup_grace_secs;
+    record.ssh_agent = params.ssh_agent;
 
     // Store in config (persisted immediately to database)
     config.insert_vm(params.name.clone(), record)?;
@@ -400,8 +402,23 @@ pub fn start_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
         port_info
     );
 
+    // Resolve SSH agent socket path if enabled
+    let ssh_agent_socket = if record.ssh_agent {
+        match std::env::var("SSH_AUTH_SOCK") {
+            Ok(path) => Some(std::path::PathBuf::from(path)),
+            Err(_) => {
+                return Err(Error::config(
+                    "ssh-agent",
+                    "SSH_AUTH_SOCK is not set. Start an SSH agent with: eval $(ssh-agent) && ssh-add",
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
     let _ = manager
-        .ensure_running_with_full_config(mounts, ports, resources)
+        .ensure_running_with_full_config(mounts, ports, resources, ssh_agent_socket)
         .map_err(|e| Error::agent(format!("start {}", kind.label()), e.to_string()))?;
 
     // Get PID immediately (cheap) and print output before DB write
@@ -554,6 +571,7 @@ pub fn persist_default_running(
                 r.image = o.image.clone();
                 r.entrypoint = o.entrypoint.clone();
                 r.cmd = o.cmd.clone();
+                r.ssh_agent = o.ssh_agent;
             }
         })
         .is_none()
@@ -577,6 +595,7 @@ pub struct DefaultVmOverrides {
     pub image: Option<String>,
     pub entrypoint: Vec<String>,
     pub cmd: Vec<String>,
+    pub ssh_agent: bool,
 }
 
 /// Start the default machine.

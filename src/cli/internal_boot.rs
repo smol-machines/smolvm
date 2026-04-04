@@ -7,7 +7,7 @@
 //! Usage: smolvm _boot-vm <config-path>
 
 use smolvm::agent::boot_config::BootConfig;
-use smolvm::agent::{launch_agent_vm, VmDisks};
+use smolvm::agent::{launch_agent_vm, LaunchConfig, VmDisks};
 use std::path::PathBuf;
 
 /// Run the boot subprocess.
@@ -78,15 +78,16 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
         overlay: Some(&overlay_disk),
     };
 
-    let result = launch_agent_vm(
-        &config.rootfs_path,
-        &disks,
-        &config.vsock_socket,
-        config.console_log.as_deref(),
-        &config.mounts,
-        &config.ports,
-        config.resources,
-    );
+    let result = launch_agent_vm(&LaunchConfig {
+        rootfs_path: &config.rootfs_path,
+        disks: &disks,
+        vsock_socket: &config.vsock_socket,
+        console_log: config.console_log.as_deref(),
+        mounts: &config.mounts,
+        port_mappings: &config.ports,
+        resources: config.resources,
+        ssh_agent_socket: config.ssh_agent_socket.as_deref(),
+    });
 
     // If we get here, launch_agent_vm returned (should only happen on error)
     if let Err(ref e) = result {

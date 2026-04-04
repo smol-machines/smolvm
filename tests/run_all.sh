@@ -122,16 +122,21 @@ case "$TESTS_TO_RUN" in
         bash "$SCRIPT_DIR/bench_container.sh"
         exit 0
         ;;
+    smolfile)
+        bash "$SCRIPT_DIR/test_smolfile.sh"
+        exit 0
+        ;;
     all)
         run_suite "CLI Tests" "$SCRIPT_DIR/test_cli.sh"
         run_suite "Machine Tests" "$SCRIPT_DIR/test_machine.sh"
         run_suite "Container Tests" "$SCRIPT_DIR/test_container.sh"
         run_suite "HTTP API Tests" "$SCRIPT_DIR/test_api.sh"
         run_suite "Pack Tests" "$SCRIPT_DIR/test_pack.sh"
+        run_suite "Smolfile & SSH Agent Tests" "$SCRIPT_DIR/test_smolfile.sh"
         ;;
     *)
         echo "Unknown test suite: $TESTS_TO_RUN"
-        echo "Available: cli, machine, container, api, pack, pack-quick, bench, bench-vm, bench-container, all"
+        echo "Available: cli, machine, container, smolfile, api, pack, pack-quick, bench, bench-vm, bench-container, all"
         exit 1
         ;;
 esac

@@ -389,7 +389,7 @@ pub async fn start_machine(
             .map_err(|e| format!("failed to create agent manager: {}", e))?;
 
         let _ = manager
-            .ensure_running_via_subprocess(mounts, ports, resources)
+            .ensure_running_via_subprocess(mounts, ports, resources, None)
             .map_err(|e| format!("failed to start machine: {}", e))?;
 
         let pid = manager.child_pid();

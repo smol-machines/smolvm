@@ -41,4 +41,8 @@ pub struct BootConfig {
     pub ports: Vec<PortMapping>,
     /// VM resources (CPU, memory, network, disk sizes).
     pub resources: VmResources,
+    /// Path to the host-side Unix socket for SSH agent forwarding.
+    /// When set, a vsock port is registered so the guest can reach the host's SSH agent.
+    #[serde(default)]
+    pub ssh_agent_socket: Option<PathBuf>,
 }
