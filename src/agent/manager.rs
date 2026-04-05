@@ -1195,7 +1195,10 @@ impl AgentManager {
     /// Returns `Ok(())` if the process is confirmed dead, `Err` if still alive
     /// or identity could not be verified.
     fn stop_vm_process(&self, pid: libc::pid_t, start_time: Option<u64>) -> Result<()> {
-        let shutdown_acked = if let Ok(mut client) = super::AgentClient::connect(&self.vsock_socket)
+        // Use short timeout — the agent may already be gone (ephemeral run exited).
+        // A 100ms connect timeout avoids blocking the exit path.
+        let shutdown_acked = if let Ok(mut client) =
+            super::AgentClient::connect_with_short_timeout(&self.vsock_socket)
         {
             client.shutdown().is_ok()
         } else {
@@ -1244,6 +1247,33 @@ impl AgentManager {
                 }
             }
         }
+    }
+
+    /// Kill the VM process immediately with SIGKILL. No graceful shutdown.
+    ///
+    /// Used for ephemeral `machine run` where the command has already finished
+    /// and there's no state to preserve. Much faster than `stop()` which
+    /// attempts a graceful vsock shutdown + SIGTERM + poll.
+    pub fn kill(&self) {
+        let pid = {
+            let inner = self.inner.lock();
+            inner.child.as_ref().map(|c| c.pid())
+        };
+        let pid = pid.or_else(|| self.read_pid_file_with_start_time().map(|(p, _)| p));
+
+        if let Some(pid) = pid {
+            if process::is_alive(pid) {
+                process::kill(pid);
+                // Brief wait for the kernel to reap (SIGKILL is near-instant).
+                for _ in 0..10 {
+                    if !process::is_alive(pid) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        }
+        self.cleanup_marker_files();
     }
 
     /// Stop the agent VM.

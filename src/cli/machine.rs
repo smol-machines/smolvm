@@ -487,9 +487,9 @@ impl RunCmd {
                     exit_code
                 };
 
-                if let Err(e) = manager.stop() {
-                    tracing::warn!(error = %e, "failed to stop machine");
-                }
+                // Ephemeral run — command finished, kill VM immediately.
+                // No graceful shutdown needed since there's no state to preserve.
+                manager.kill();
                 std::process::exit(exit_code);
             }
         } else {
@@ -579,9 +579,8 @@ impl RunCmd {
                     flush_output();
                     exit_code
                 };
-                if let Err(e) = manager.stop() {
-                    tracing::warn!(error = %e, "failed to stop machine");
-                }
+                // Ephemeral run — command finished, kill VM immediately.
+                manager.kill();
                 std::process::exit(exit_code);
             }
         }

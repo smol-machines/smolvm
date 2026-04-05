@@ -6,9 +6,9 @@ A tool to build and run portable, self-contained virtual machines locally. <200m
 
 ```bash
 # Ephemeral (cleaned up after exit)
-smolvm machine run --image alpine -- echo hello
-smolvm machine run -it --image alpine                    # interactive shell
-smolvm machine run --image python:3.12-alpine -- python3 script.py
+smolvm machine run --net --image alpine -- echo hello
+smolvm machine run --net -it --image alpine -- /bin/sh   # interactive shell
+smolvm machine run --net --image python:3.12-alpine -- python3 script.py
 
 # Persistent (survives stop/start)
 smolvm machine create --net myvm
@@ -36,8 +36,8 @@ smolvm container exec --container abc123 -- curl localhost
 
 | Goal | Command |
 |------|---------|
-| Run a one-off command in isolation | `smolvm machine run --image IMAGE -- CMD` |
-| Interactive shell | `smolvm machine run -it --image IMAGE` |
+| Run a one-off command in isolation | `smolvm machine run --net --image IMAGE -- CMD` |
+| Interactive shell | `smolvm machine run --net -it --image IMAGE -- /bin/sh` |
 | Persistent dev environment | `machine create` → `machine start` → `machine exec` |
 | Run containers inside a VM | `machine start` → `container create` |
 | Ship software as a binary | `smolvm pack create --image IMAGE -o OUTPUT` |

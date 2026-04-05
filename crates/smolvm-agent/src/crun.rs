@@ -54,8 +54,8 @@ impl CrunCommand {
     /// Create a container: `crun create --bundle <path> <id>`
     ///
     /// This puts the container in "created" state, ready for `crun start`.
-    /// Stdio is null because capturing pipes can block when child processes
-    /// inherit file descriptors.
+    /// Stdio defaults to null because capturing pipes can block when child
+    /// processes inherit file descriptors.
     pub fn create(bundle_dir: &Path, container_id: &str) -> Self {
         let mut c = Self::new();
         c.cmd.args([
@@ -164,6 +164,39 @@ impl CrunCommand {
     /// Set stdin to piped.
     pub fn stdin_piped(mut self) -> Self {
         self.cmd.stdin(Stdio::piped());
+        self
+    }
+
+    /// Set stdin from a raw fd (e.g., PTY slave).
+    ///
+    /// # Safety
+    /// The fd must be a valid open file descriptor. Ownership is transferred.
+    #[cfg(unix)]
+    pub unsafe fn stdin_from_fd(mut self, fd: std::os::unix::io::RawFd) -> Self {
+        use std::os::unix::io::FromRawFd;
+        self.cmd.stdin(Stdio::from_raw_fd(fd));
+        self
+    }
+
+    /// Set stdout from a raw fd (e.g., PTY slave).
+    ///
+    /// # Safety
+    /// The fd must be a valid open file descriptor. Ownership is transferred.
+    #[cfg(unix)]
+    pub unsafe fn stdout_from_fd(mut self, fd: std::os::unix::io::RawFd) -> Self {
+        use std::os::unix::io::FromRawFd;
+        self.cmd.stdout(Stdio::from_raw_fd(fd));
+        self
+    }
+
+    /// Set stderr from a raw fd (e.g., PTY slave).
+    ///
+    /// # Safety
+    /// The fd must be a valid open file descriptor. Ownership is transferred.
+    #[cfg(unix)]
+    pub unsafe fn stderr_from_fd(mut self, fd: std::os::unix::io::RawFd) -> Self {
+        use std::os::unix::io::FromRawFd;
+        self.cmd.stderr(Stdio::from_raw_fd(fd));
         self
     }
 

@@ -34,7 +34,7 @@ Quick Start
 smolvm machine run --net --image alpine -- echo "hello from a microVM"
 
 # interactive shell
-smolvm machine run --net -it --image alpine
+smolvm machine run --net -it --image alpine -- /bin/sh
 ```
 
 Use This For
@@ -43,7 +43,7 @@ Use This For
 **Sandbox untrusted code** — run untrusted programs in a hardware-isolated VM. Host filesystem, network, and credentials are separated by a hypervisor boundary.
 
 ```bash
-smolvm machine run --image alpine -- sh -c "pip install sketchy-package"
+smolvm machine run --net --image alpine -- sh -c "pip install sketchy-package"
 # runs in its own kernel — can't touch your host filesystem or network
 
 # lock down egress — only allow specific hosts

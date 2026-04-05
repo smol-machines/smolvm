@@ -1202,7 +1202,7 @@ fn handle_interactive_run(
     }
 
     // Spawn the command with crun
-    let mut child = match spawn_interactive_command(
+    let (mut child, pty_master) = match spawn_interactive_command(
         &prepared.rootfs_path,
         &command,
         &env,
@@ -1210,7 +1210,7 @@ fn handle_interactive_run(
         &mounts,
         tty,
     ) {
-        Ok(child) => child,
+        Ok(result) => result,
         Err(e) => {
             let _ = storage::cleanup_overlay(&prepared.workload_id);
             send_response(
@@ -1224,13 +1224,23 @@ fn handle_interactive_run(
     // Send Started response
     send_response(stream, &AgentResponse::Started)?;
 
-    // Run the interactive I/O loop
-    let exit_code = match run_interactive_loop(stream, &mut child, timeout_ms) {
-        Ok(exit_code) => exit_code,
-        Err(e) => {
-            let _ = storage::cleanup_overlay(&prepared.workload_id);
-            return Err(e);
-        }
+    // Run the appropriate interactive I/O loop
+    let exit_code = match pty_master {
+        #[cfg(target_os = "linux")]
+        Some(pty) => match run_interactive_loop_pty(stream, &mut child, pty, timeout_ms) {
+            Ok(exit_code) => exit_code,
+            Err(e) => {
+                let _ = storage::cleanup_overlay(&prepared.workload_id);
+                return Err(e);
+            }
+        },
+        _ => match run_interactive_loop(stream, &mut child, timeout_ms) {
+            Ok(exit_code) => exit_code,
+            Err(e) => {
+                let _ = storage::cleanup_overlay(&prepared.workload_id);
+                return Err(e);
+            }
+        },
     };
 
     // Send Exited response
@@ -1241,23 +1251,27 @@ fn handle_interactive_run(
 }
 
 /// Spawn a command for interactive execution using crun OCI runtime.
+///
+/// When `tty` is true, allocates a PTY pair and attaches the slave to crun's
+/// stdio. The OCI spec sets `terminal: true` so that crun handles the
+/// controlling terminal setup (setsid + TIOCSCTTY) inside the container.
+/// In foreground `crun run` mode, this doesn't require `--console-socket`.
+#[cfg(target_os = "linux")]
 fn spawn_interactive_command(
     rootfs: &str,
     command: &[String],
     env: &[(String, String)],
     workdir: Option<&str>,
     mounts: &[(String, String, bool)],
-    _tty: bool,
-) -> Result<Child, Box<dyn std::error::Error>> {
+    tty: bool,
+) -> Result<(Child, Option<pty::PtyMaster>), Box<dyn std::error::Error>> {
+    use std::os::unix::io::{AsRawFd as _, FromRawFd as _};
     use std::path::Path;
 
     if command.is_empty() {
         return Err("empty command".into());
     }
 
-    // Compute bundle path from rootfs path
-    // rootfs = /storage/overlays/{id}/merged
-    // bundle = /storage/overlays/{id}/bundle
     let rootfs_path = Path::new(rootfs);
     let overlay_root = rootfs_path
         .parent()
@@ -1268,11 +1282,10 @@ fn spawn_interactive_command(
         return Err(format!("bundle directory not found: {}", bundle_path.display()).into());
     }
 
-    // Generate OCI spec for this command
     let workdir_str = workdir.unwrap_or("/");
-    let mut spec = oci::OciSpec::new(command, env, workdir_str, false);
+    // terminal: true tells crun to set up a controlling terminal (setsid + TIOCSCTTY)
+    let mut spec = oci::OciSpec::new(command, env, workdir_str, tty);
 
-    // Add virtiofs bind mounts to OCI spec
     for (tag, container_path, read_only) in mounts {
         let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
         spec.add_bind_mount(
@@ -1282,30 +1295,98 @@ fn spawn_interactive_command(
         );
     }
 
-    // Write config.json to bundle
     spec.write_to(&bundle_path)
         .map_err(|e| format!("failed to write OCI spec: {}", e))?;
 
-    // Generate unique container ID
     let container_id = oci::generate_container_id();
-
-    // TODO: For TTY mode, use --console-socket to receive PTY master FD
 
     info!(
         command = ?command,
         container_id = %container_id,
         bundle = %bundle_path.display(),
         mounts = mounts.len(),
+        tty = tty,
         "spawning interactive container with crun"
     );
 
-    // Build and spawn crun run command with stdio piped for interactive mode
+    if tty {
+        // Allocate a PTY pair — slave goes to crun's stdio, master returned to caller.
+        // With terminal:true in the OCI spec, crun sets up the controlling terminal
+        // for the container process.
+        let (pty_master, slave_fd) = pty::open_pty(80, 24)?;
+        let slave_raw = slave_fd.as_raw_fd();
+
+        // SAFETY: slave_fd is a valid open fd from openpty.
+        let child = unsafe {
+            crun::CrunCommand::run(&bundle_path, &container_id)
+                .stdin_from_fd(libc::dup(slave_raw))
+                .stdout_from_fd(libc::dup(slave_raw))
+                .stderr_from_fd(libc::dup(slave_raw))
+                .spawn()?
+        };
+
+        // Close slave in parent — crun has its own copies.
+        drop(slave_fd);
+
+        Ok((child, Some(pty_master)))
+    } else {
+        let child = crun::CrunCommand::run(&bundle_path, &container_id)
+            .stdin_piped()
+            .capture_output()
+            .spawn()?;
+        Ok((child, None))
+    }
+}
+
+/// Non-Linux stub for spawn_interactive_command.
+#[cfg(not(target_os = "linux"))]
+fn spawn_interactive_command(
+    rootfs: &str,
+    command: &[String],
+    env: &[(String, String)],
+    workdir: Option<&str>,
+    mounts: &[(String, String, bool)],
+    _tty: bool,
+) -> Result<(Child, Option<()>), Box<dyn std::error::Error>> {
+    use std::path::Path;
+
+    if command.is_empty() {
+        return Err("empty command".into());
+    }
+
+    let rootfs_path = Path::new(rootfs);
+    let overlay_root = rootfs_path
+        .parent()
+        .ok_or("invalid rootfs path: no parent")?;
+    let bundle_path = overlay_root.join("bundle");
+
+    if !bundle_path.exists() {
+        return Err(format!("bundle directory not found: {}", bundle_path.display()).into());
+    }
+
+    let workdir_str = workdir.unwrap_or("/");
+    let mut spec = oci::OciSpec::new(command, env, workdir_str, false);
+
+    for (tag, container_path, read_only) in mounts {
+        let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
+        spec.add_bind_mount(
+            &virtiofs_mount.to_string_lossy(),
+            container_path,
+            *read_only,
+        );
+    }
+
+    spec.write_to(&bundle_path)
+        .map_err(|e| format!("failed to write OCI spec: {}", e))?;
+
+    let container_id = oci::generate_container_id();
+
     let child = crun::CrunCommand::run(&bundle_path, &container_id)
         .stdin_piped()
         .capture_output()
         .spawn()?;
 
-    Ok(child)
+    Ok((child, None))
 }
 
 /// Run the interactive I/O loop using poll() for efficient I/O multiplexing.
@@ -1599,6 +1680,7 @@ fn run_interactive_loop_pty(
         }
 
         // Read available data from PTY master.
+        let mut slave_closed = false;
         if poll_fds[0].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
             loop {
                 match pty_master.read(&mut buf) {
@@ -1613,15 +1695,24 @@ fn run_interactive_loop_pty(
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(e) if e.raw_os_error() == Some(libc::EIO) => {
-                        // Slave side closed — child is exiting.
+                        // Slave side closed — child is exiting. Reap immediately
+                        // instead of waiting for the next poll cycle.
+                        slave_closed = true;
                         break;
                     }
                     Err(e) => {
                         debug!(error = %e, "PTY master read error");
+                        slave_closed = true;
                         break;
                     }
                 }
             }
+        }
+
+        // If the slave closed, the process is exiting — reap it now.
+        if slave_closed {
+            let status = child.wait()?;
+            return Ok(status.code().unwrap_or(-1));
         }
 
         // Read incoming request from host — only when poll confirms data
