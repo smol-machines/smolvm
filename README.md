@@ -13,7 +13,14 @@ smolvm
 
 Ship and run software with isolation by default. Sub-second cold start. No dependency management.
 
+<<<<<<< Updated upstream
 VMs that feel like a CLI tool. Boot in under 200ms, configure with a Smolfile, ship as a single executable. No daemon, no YAML, no cloud account.
+=======
+This is cli tool that lets you:
+1. Manage and run custom linux virtual machine locally with: subsecond coldstart, cross-platform (macOS,Linux), elastic memory usage.
+2. Pack a stateful virtual machine into a single file (.smolmachine) to rehydrate on any supported platforms.
+
+>>>>>>> Stashed changes
 
 Install
 -------

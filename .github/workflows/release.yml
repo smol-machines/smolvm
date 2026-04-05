@@ -103,10 +103,16 @@ jobs:
           AGENT_BINARY=/tmp/agent/smolvm-agent \
             ./scripts/build-agent-rootfs.sh --arch ${{ matrix.arch }} --no-build-agent
 
+      - name: Package rootfs as tarball
+        run: |
+          # Tar preserves ownership/permissions without needing read access
+          # to restricted dirs like /var/run/chrony (owned by chrony:chrony 700)
+          sudo tar -cf target/agent-rootfs.tar -C target/agent-rootfs .
+
       - uses: actions/upload-artifact@v4
         with:
           name: rootfs-${{ matrix.arch }}
-          path: target/agent-rootfs/
+          path: target/agent-rootfs.tar
 
   # ==========================================================================
   # Build distribution tarballs (per platform)
@@ -171,7 +177,12 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: rootfs-${{ matrix.rootfs_arch }}
-          path: target/agent-rootfs/
+          path: /tmp/rootfs-dl/
+
+      - name: Extract rootfs tarball
+        run: |
+          mkdir -p target/agent-rootfs
+          sudo tar -xf /tmp/rootfs-dl/agent-rootfs.tar -C target/agent-rootfs
 
       - name: Download agent binary
         uses: actions/download-artifact@v4
