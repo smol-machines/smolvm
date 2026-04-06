@@ -76,7 +76,7 @@ fn main() {
 
     // Handle errors
     if let Err(e) = result {
-        tracing::error!(error = %e, "command failed");
+        tracing::debug!(error = %e, "command failed");
         eprintln!("Error: {}", e);
         std::process::exit(1);
     }
