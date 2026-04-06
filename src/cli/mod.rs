@@ -9,7 +9,6 @@ pub mod pack_run;
 pub mod parsers;
 pub mod serve;
 pub mod smolfile;
-pub mod vm_common;
 
 use std::io::Write;
 
@@ -63,9 +62,50 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
+pub(crate) trait PullClient {
+    fn pull_with_registry_config_and_progress<F: FnMut(usize, usize, &str)>(
+        &mut self,
+        image: &str,
+        oci_platform: Option<&str>,
+        on_progress: F,
+    ) -> smolvm::Result<smolvm_protocol::ImageInfo>;
+}
+
+impl PullClient for smolvm::agent::AgentClient {
+    fn pull_with_registry_config_and_progress<F: FnMut(usize, usize, &str)>(
+        &mut self,
+        image: &str,
+        oci_platform: Option<&str>,
+        on_progress: F,
+    ) -> smolvm::Result<smolvm_protocol::ImageInfo> {
+        smolvm::agent::AgentClient::pull_with_registry_config_and_progress(
+            self,
+            image,
+            oci_platform,
+            on_progress,
+        )
+    }
+}
+
+impl PullClient for smolvm::control::VmHandle {
+    fn pull_with_registry_config_and_progress<F: FnMut(usize, usize, &str)>(
+        &mut self,
+        image: &str,
+        oci_platform: Option<&str>,
+        on_progress: F,
+    ) -> smolvm::Result<smolvm_protocol::ImageInfo> {
+        smolvm::control::VmHandle::pull_with_registry_config_and_progress(
+            self,
+            image,
+            oci_platform,
+            on_progress,
+        )
+    }
+}
+
 /// Pull an image with a CLI progress bar.
-pub fn pull_with_progress(
-    client: &mut smolvm::agent::AgentClient,
+pub(crate) fn pull_with_progress<P: PullClient>(
+    client: &mut P,
     image: &str,
     oci_platform: Option<&str>,
 ) -> smolvm::Result<smolvm_protocol::ImageInfo> {

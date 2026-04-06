@@ -13,7 +13,9 @@ use std::sync::Arc;
 
 use crate::control::{self, VmHandle};
 use crate::data::vm::MicroVm;
+use crate::error::{Error, Result};
 use crate::internal::agent::AgentClient;
+use crate::internal::config::RecordState;
 use crate::internal::db::SmolvmDb;
 
 /// Stateful VM orchestration for concurrent/long-lived hosts.
@@ -60,7 +62,7 @@ impl Drop for ReservationGuard<'_> {
 
 impl Smolvm {
     /// Create a new Smolvm instance, opening the database.
-    pub fn new() -> crate::error::Result<Self> {
+    pub fn new() -> Result<Self> {
         let db = SmolvmDb::open()?;
         Ok(Self {
             db,
@@ -88,18 +90,18 @@ impl Smolvm {
     // ========================================================================
 
     /// Create a new VM. Validates name, persists to DB.
-    pub fn create_vm(&self, vm: MicroVm) -> crate::error::Result<MicroVm> {
+    pub fn create_vm(&self, vm: MicroVm) -> Result<MicroVm> {
         let result = control::create_vm(&self.db, vm)?;
         Ok(result)
     }
 
     /// Get a VM by name.
-    pub fn get_vm(&self, name: &str) -> crate::error::Result<MicroVm> {
+    pub fn get_vm(&self, name: &str) -> Result<MicroVm> {
         control::get_vm(&self.db, name)
     }
 
     /// List all persisted VMs.
-    pub fn list_vms(&self) -> crate::error::Result<Vec<MicroVm>> {
+    pub fn list_vms(&self) -> Result<Vec<MicroVm>> {
         control::list_vms(&self.db)
     }
 
@@ -107,24 +109,23 @@ impl Smolvm {
     ///
     /// Returns MicroVm (the handle is cached internally).
     /// Idempotent — reconnects if already running.
-    pub fn start_vm(&self, name: &str) -> crate::error::Result<MicroVm> {
+    pub fn start_vm(&self, name: &str) -> Result<MicroVm> {
         let handle = control::start_vm(&self.db, name)?;
-        let vm = handle.vm().clone();
         self.registry
             .write()
             .insert(name.to_string(), Arc::new(Mutex::new(handle)));
-        Ok(vm)
+        control::get_vm(&self.db, name)
     }
 
     /// Stop a VM. Removes from registry.
-    pub fn stop_vm(&self, name: &str) -> crate::error::Result<MicroVm> {
+    pub fn stop_vm(&self, name: &str) -> Result<()> {
         // Remove from registry first (the handle's manager will be dropped)
         self.registry.write().remove(name);
         control::stop_vm(&self.db, name)
     }
 
     /// Delete a VM. Removes from registry and DB.
-    pub fn delete_vm(&self, name: &str, force: bool) -> crate::error::Result<()> {
+    pub fn delete_vm(&self, name: &str, force: bool) -> Result<()> {
         self.registry.write().remove(name);
         control::delete_vm(&self.db, name, force)
     }
@@ -135,12 +136,12 @@ impl Smolvm {
         name: &str,
         storage_gib: Option<u64>,
         overlay_gib: Option<u64>,
-    ) -> crate::error::Result<MicroVm> {
+    ) -> Result<()> {
         control::resize_vm(&self.db, name, storage_gib, overlay_gib)
     }
 
     /// Update a VM's spec/status in the DB.
-    pub fn update_vm(&self, vm: &MicroVm) -> crate::error::Result<()> {
+    pub fn update_vm(&self, vm: &MicroVm) -> Result<()> {
         control::update_vm(&self.db, vm)
     }
 
@@ -151,12 +152,12 @@ impl Smolvm {
     /// Get an AgentClient for a running VM (from the cached registry).
     ///
     /// If the VM is not in the registry, attempts to start it first.
-    pub fn connect(&self, name: &str) -> crate::error::Result<AgentClient> {
+    pub fn connect_vm(&self, name: &str) -> Result<AgentClient> {
         {
             let registry = self.registry.read();
             if let Some(handle) = registry.get(name) {
                 let h = handle.lock();
-                return h.connect();
+                return h.manager.connect();
             }
         }
 
@@ -164,10 +165,10 @@ impl Smolvm {
         self.start_vm(name)?;
         let registry = self.registry.read();
         let handle = registry.get(name).ok_or_else(|| {
-            crate::Error::agent("connect", format!("failed to start vm '{}'", name))
+            Error::agent("connect", format!("failed to start vm '{}'", name))
         })?;
         let h = handle.lock();
-        h.connect()
+        h.manager.connect()
     }
 
     /// Check if a VM process is alive (from cached registry).
@@ -175,9 +176,7 @@ impl Smolvm {
         let registry = self.registry.read();
         if let Some(handle) = registry.get(name) {
             let h = handle.lock();
-            if let Some(status) = h.vm().status.as_ref() {
-                return status.phase == crate::data::vm::VmPhase::Running;
-            }
+            return h.manager.is_process_alive();
         }
         false
     }
@@ -189,17 +188,17 @@ impl Smolvm {
     /// Reserve a VM name for creation. Prevents concurrent creation races.
     ///
     /// Returns a `ReservationGuard` that auto-releases on drop.
-    pub fn reserve_name(&self, name: &str) -> crate::error::Result<ReservationGuard<'_>> {
+    pub fn reserve_name(&self, name: &str) -> Result<ReservationGuard<'_>> {
         // Check registry
         if self.registry.read().contains_key(name) {
-            return Err(crate::Error::config(
+            return Err(Error::config(
                 "reserve name",
                 format!("'{}' already exists", name),
             ));
         }
         // Check DB
         if self.db.get_vm(name)?.is_some() {
-            return Err(crate::Error::config(
+            return Err(Error::config(
                 "reserve name",
                 format!("'{}' already exists", name),
             ));
@@ -207,7 +206,7 @@ impl Smolvm {
         // Check reservations
         let mut reserved = self.reserved.write();
         if reserved.contains(name) {
-            return Err(crate::Error::config(
+            return Err(Error::config(
                 "reserve name",
                 format!("'{}' is being created by another request", name),
             ));
@@ -227,7 +226,7 @@ impl Smolvm {
     /// Reconnect to VMs that were persisted as Running in the DB.
     ///
     /// Call on server/SDK startup. Dead processes get cleaned up.
-    pub fn reconnect_persisted(&self) -> crate::error::Result<()> {
+    pub fn reconnect_persisted(&self) -> Result<()> {
         let vms = self.db.list_vms()?;
 
         for (name, record) in vms {
@@ -244,7 +243,7 @@ impl Smolvm {
                         tracing::warn!(vm = %name, error = %e, "failed to reconnect to vm");
                     }
                 }
-            } else if record.state == crate::internal::config::RecordState::Running {
+            } else if record.state == RecordState::Running {
                 // Process died — clean up stale record
                 tracing::info!(vm = %name, "cleaning up dead vm from database");
                 if let Err(e) = self.db.remove_vm(&name) {

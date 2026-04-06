@@ -16,3 +16,6 @@ pub const ENV_SMOLVM_LIB_DIR: &str = "SMOLVM_LIB_DIR";
 /// Accepted values are integer levels understood by libkrun
 /// (`0 = off`, `1 = error`, `2 = warn`, `3 = info`, `4 = debug`).
 pub const ENV_SMOLVM_KRUN_LOG_LEVEL: &str = "SMOLVM_KRUN_LOG_LEVEL";
+
+/// Default name of a microvm.
+pub const DEFAULT_MACHINE_NAME: &str = "default";

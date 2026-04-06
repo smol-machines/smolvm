@@ -29,11 +29,12 @@
 //! memory = 2048
 //! ```
 
-use crate::cli::parsers::parse_cidr;
-use crate::cli::vm_common::CreateVmParams;
+use crate::cli::parsers::{parse_cidr, parse_env_list};
 use serde::Deserialize;
+use smolvm::data::mount::HostMount;
 use smolvm::data::network::PortMapping;
-use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
+use smolvm::data::resources::{VmResources, DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
+use smolvm::data::vm::VmSpec;
 use std::path::{Path, PathBuf};
 
 /// Parsed Smolfile configuration.
@@ -188,7 +189,7 @@ fn parse_duration_secs(s: &str) -> Option<u64> {
     }
 }
 
-/// Build `CreateVmParams` by merging CLI flags with an optional Smolfile.
+/// Build a `VmSpec` by merging CLI flags with an optional Smolfile.
 ///
 /// CLI flags override Smolfile values. For Vec fields, CLI values are appended
 /// to Smolfile values. For scalar fields, non-default CLI values take priority.
@@ -200,8 +201,7 @@ fn parse_duration_secs(s: &str) -> Option<u64> {
 ///   env:        Smolfile + CLI extends
 ///   init:       Smolfile + CLI extends
 #[allow(clippy::too_many_arguments)]
-pub fn build_create_params(
-    name: String,
+pub fn build_vm_spec(
     cli_image: Option<String>,
     cli_entrypoint: Option<String>,
     cli_cmd: Vec<String>,
@@ -217,32 +217,31 @@ pub fn build_create_params(
     cli_storage_gb: Option<u64>,
     cli_overlay_gb: Option<u64>,
     cli_allow_cidr: Vec<String>,
-) -> smolvm::Result<CreateVmParams> {
+) -> smolvm::Result<VmSpec> {
     let cidrs_to_option = |v: Vec<String>| if v.is_empty() { None } else { Some(v) };
 
     let sf = match smolfile_path {
         Some(path) => load(&path)?,
         None => {
             let net = cli_net || !cli_allow_cidr.is_empty();
-            return Ok(CreateVmParams {
-                name,
+            return Ok(VmSpec {
+                resources: VmResources {
+                    cpus: cli_cpus,
+                    memory_mib: cli_mem,
+                    network: net,
+                    storage_gib: cli_storage_gb,
+                    overlay_gib: cli_overlay_gb,
+                    allowed_cidrs: cidrs_to_option(cli_allow_cidr),
+                },
+                mounts: HostMount::parse(&cli_volume)?,
+                ports: cli_port,
                 image: cli_image,
                 entrypoint: cli_entrypoint.map(|e| vec![e]).unwrap_or_default(),
                 cmd: cli_cmd,
-                cpus: cli_cpus,
-                mem: cli_mem,
-                volume: cli_volume,
-                port: cli_port,
-                net,
-                init: cli_init,
-                env: cli_env,
+                env: parse_env_list(&cli_env),
                 workdir: cli_workdir,
-                storage_gb: cli_storage_gb,
-                overlay_gb: cli_overlay_gb,
-                allowed_cidrs: cidrs_to_option(cli_allow_cidr),
-                restart_policy: None,
-                restart_max_retries: None,
-                restart_max_backoff_secs: None,
+                init: cli_init,
+                restart: smolvm::config::RestartConfig::default(),
                 health_cmd: None,
                 health_interval_secs: None,
                 health_timeout_secs: None,
@@ -250,6 +249,7 @@ pub fn build_create_params(
                 health_startup_grace_secs: None,
                 ssh_agent: false,
                 dns_filter_hosts: None,
+                ephemeral: false,
             });
         }
     };
@@ -411,25 +411,29 @@ pub fn build_create_params(
         .and_then(|h| h.startup_grace.as_ref())
         .and_then(|s| parse_duration_secs(s));
 
-    Ok(CreateVmParams {
-        name,
+    Ok(VmSpec {
+        resources: VmResources {
+            cpus,
+            memory_mib: mem,
+            network: net,
+            storage_gib: storage_gb,
+            overlay_gib: overlay_gb,
+            allowed_cidrs,
+        },
+        mounts: HostMount::parse(&volumes)?,
+        ports,
         image,
         entrypoint,
         cmd,
-        cpus,
-        mem,
-        volume: volumes,
-        port: ports,
-        net,
-        init,
-        env,
+        env: parse_env_list(&env),
         workdir,
-        storage_gb,
-        overlay_gb,
-        allowed_cidrs,
-        restart_policy,
-        restart_max_retries,
-        restart_max_backoff_secs,
+        init,
+        restart: smolvm::config::RestartConfig {
+            policy: restart_policy.unwrap_or(smolvm::config::RestartPolicy::Never),
+            max_retries: restart_max_retries.unwrap_or(0),
+            max_backoff_secs: restart_max_backoff_secs.unwrap_or(0),
+            ..Default::default()
+        },
         health_cmd,
         health_interval_secs,
         health_timeout_secs,
@@ -441,6 +445,7 @@ pub fn build_create_params(
         } else {
             Some(sf_allow_hosts)
         },
+        ephemeral: false,
     })
 }
 

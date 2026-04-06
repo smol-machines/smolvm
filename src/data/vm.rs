@@ -4,6 +4,7 @@
 //! boundaries (CLI, API, SDKs). Internal persistence uses `VmRecord`;
 //! conversions live in `internal::convert`.
 
+use crate::config::RestartConfig;
 use crate::data::mount::HostMount;
 use crate::data::network::PortMapping;
 use crate::data::resources::VmResources;
@@ -52,6 +53,24 @@ pub struct VmSpec {
     pub workdir: Option<String>,
     /// Commands to run on every VM start (via `sh -c`).
     pub init: Vec<String>,
+    /// Restart policy and counters.
+    pub restart: RestartConfig,
+    /// Health check command.
+    pub health_cmd: Option<Vec<String>>,
+    /// Health check interval in seconds.
+    pub health_interval_secs: Option<u64>,
+    /// Health check timeout in seconds.
+    pub health_timeout_secs: Option<u64>,
+    /// Health check failure threshold.
+    pub health_retries: Option<u32>,
+    /// Grace period before health checks start.
+    pub health_startup_grace_secs: Option<u64>,
+    /// Forward the host SSH agent into the VM.
+    pub ssh_agent: bool,
+    /// Hostname allowlist for DNS filtering.
+    pub dns_filter_hosts: Option<Vec<String>>,
+    /// True for generated one-shot run VMs.
+    pub ephemeral: bool,
 }
 
 // ============================================================================

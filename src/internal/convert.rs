@@ -36,6 +36,15 @@ pub(crate) fn record_to_vm(record: &VmRecord) -> MicroVm {
             env: record.env.clone(),
             workdir: record.workdir.clone(),
             init: record.init.clone(),
+            restart: record.restart.clone(),
+            health_cmd: record.health_cmd.clone(),
+            health_interval_secs: record.health_interval_secs,
+            health_timeout_secs: record.health_timeout_secs,
+            health_retries: record.health_retries,
+            health_startup_grace_secs: record.health_startup_grace_secs,
+            ssh_agent: record.ssh_agent,
+            dns_filter_hosts: record.dns_filter_hosts.clone(),
+            ephemeral: record.ephemeral,
         },
         status: Some(VmStatus {
             phase: record_state_to_phase(&record.actual_state()),
@@ -95,6 +104,15 @@ pub(crate) fn vm_to_record(vm: &MicroVm) -> VmRecord {
     record.env = vm.spec.env.clone();
     record.workdir = vm.spec.workdir.clone();
     record.init = vm.spec.init.clone();
+    record.restart = vm.spec.restart.clone();
+    record.health_cmd = vm.spec.health_cmd.clone();
+    record.health_interval_secs = vm.spec.health_interval_secs;
+    record.health_timeout_secs = vm.spec.health_timeout_secs;
+    record.health_retries = vm.spec.health_retries;
+    record.health_startup_grace_secs = vm.spec.health_startup_grace_secs;
+    record.ssh_agent = vm.spec.ssh_agent;
+    record.dns_filter_hosts = vm.spec.dns_filter_hosts.clone();
+    record.ephemeral = vm.spec.ephemeral;
 
     record
 }

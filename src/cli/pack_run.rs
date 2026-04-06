@@ -14,6 +14,7 @@ use smolvm::agent::launcher_dynamic::{
     launch_agent_vm_dynamic, KrunFunctions, PackedLaunchConfig, PackedMount,
 };
 use smolvm::agent::{AgentClient, RunConfig, VmResources};
+use smolvm::data::disk::DEFAULT_OVERLAY_SIZE_GIB;
 use smolvm::data::mount::HostMount;
 use smolvm::data::network::PortMapping;
 use smolvm::Error;
@@ -120,7 +121,7 @@ pub struct PackRunCmd {
     /// Kill command after duration (e.g., "30s", "5m")
     #[arg(
         long,
-        value_parser = crate::cli::parsers::parse_duration,
+        value_parser = humantime::parse_duration,
         value_name = "DURATION",
         help_heading = "Execution"
     )]
@@ -554,7 +555,7 @@ fn setup_vm_overlay(
     // OCI image mode: create a fresh overlay disk so the guest has a
     // writable root (needed for crun to mkdir /dev, mount proc, etc.)
     if !dest.exists() {
-        let size_gb = overlay_gb.unwrap_or(smolvm::storage::DEFAULT_OVERLAY_SIZE_GIB);
+        let size_gb = overlay_gb.unwrap_or(DEFAULT_OVERLAY_SIZE_GIB);
         smolvm::storage::OverlayDisk::open_or_create_at(dest, size_gb)
             .map_err(|e| Error::agent("create overlay disk", e.to_string()))?;
     }
@@ -688,7 +689,7 @@ fn execute_packed_command(
     client: &mut AgentClient,
     manifest: &smolvm_pack::PackManifest,
     params: ExecParams,
-    mounts: &[smolvm::data::storage::HostMount],
+    mounts: &[smolvm::data::mount::HostMount],
 ) -> smolvm::Result<i32> {
     let ExecParams {
         command,
@@ -810,7 +811,7 @@ struct PackedRunArgs {
     tty: bool,
 
     /// Kill command after duration (e.g., "30s", "5m")
-    #[arg(long, value_parser = crate::cli::parsers::parse_duration, value_name = "DURATION")]
+    #[arg(long, value_parser = humantime::parse_duration, value_name = "DURATION")]
     timeout: Option<Duration>,
 
     /// Working directory inside the container
@@ -898,7 +899,7 @@ struct PackedExecArgs {
     tty: bool,
 
     /// Kill command after duration (e.g., "30s", "5m")
-    #[arg(long, value_parser = crate::cli::parsers::parse_duration, value_name = "DURATION")]
+    #[arg(long, value_parser = humantime::parse_duration, value_name = "DURATION")]
     timeout: Option<Duration>,
 
     /// Working directory inside the container
@@ -1577,7 +1578,7 @@ fn daemon_exec(
 
     // Build command from args or manifest defaults
     // Virtiofs devices are fixed at boot — exec cannot add new host mounts.
-    let mounts: Vec<smolvm::data::storage::HostMount> = Vec::new();
+    let mounts: Vec<smolvm::data::mount::HostMount> = Vec::new();
     let params = ExecParams {
         command: build_command(manifest, &args.command),
         env: build_env(manifest, &args.env),

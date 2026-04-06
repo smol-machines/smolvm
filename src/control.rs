@@ -7,36 +7,173 @@
 //! CLI calls these directly. The `Smolvm` struct (in `smolvm.rs`) wraps
 //! them with a registry cache for SDKs and the API server.
 
+use crate::data::disk::{Overlay, Storage, DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
 use crate::data::mount::HostMount;
-use crate::data::vm::{MicroVm, VmPhase, VmStatus};
-use crate::internal::agent::{vm_data_dir, AgentManager};
+use crate::data::vm::MicroVm;
+use crate::error::{Error, Result};
+use crate::internal::agent::{vm_data_dir, AgentClient, AgentManager, LaunchFeatures};
 use crate::internal::config::RecordState;
 use crate::internal::convert;
 use crate::internal::db::SmolvmDb;
+use crate::internal::process::process_start_time;
+use crate::internal::storage::expand_disk;
+use smolvm_protocol::{ImageInfo, StorageStatus};
+use std::time::Duration;
 
 /// Opaque handle to a running VM.
 ///
-/// Wraps an `AgentManager` without exposing it. Callers can:
-/// - `vm()` — get the MicroVm info
-/// - `connect()` — get an `AgentClient` for exec/run operations
+/// Wraps an `AgentManager` and lazily connects an `AgentClient`. Callers can:
+/// - use selected CLI-facing AgentClient operations through the handle
 /// - `detach()` — release the handle so the VM process survives
 pub struct VmHandle {
     pub(crate) manager: AgentManager,
-    vm: MicroVm,
+    pub(crate) client: Option<AgentClient>,
     /// Whether this VM was freshly started (vs already running and reconnected).
     freshly_started: bool,
 }
 
+#[allow(missing_docs)]
 impl VmHandle {
-    /// Get the MicroVm info.
-    pub fn vm(&self) -> &MicroVm { &self.vm }
-
     /// Whether the VM was freshly started by this call (vs already running).
     pub fn freshly_started(&self) -> bool { self.freshly_started }
 
-    /// Connect to the running VM and get an AgentClient for exec/run.
-    pub fn connect(&self) -> crate::error::Result<crate::internal::agent::AgentClient> {
-        self.manager.connect()
+    fn client_mut(&mut self) -> Result<&mut AgentClient> {
+        if self.client.is_none() {
+            self.client = Some(AgentClient::connect_with_retry(self.manager.vsock_socket())?);
+        }
+        Ok(self.client.as_mut().expect("client initialized"))
+    }
+
+    pub fn pull_with_registry_config_and_progress<F: FnMut(usize, usize, &str)>(
+        &mut self,
+        image: &str,
+        oci_platform: Option<&str>,
+        on_progress: F,
+    ) -> Result<ImageInfo> {
+        self.client_mut()?
+            .pull_with_registry_config_and_progress(image, oci_platform, on_progress)
+    }
+
+    pub fn vm_exec(
+        &mut self,
+        command: &[String],
+        env: &[(String, String)],
+        workdir: Option<&str>,
+        timeout: Option<Duration>,
+    ) -> Result<(i32, String, String)> {
+        self.client_mut()?.vm_exec(
+            command.to_vec(),
+            env.to_vec(),
+            workdir.map(str::to_string),
+            timeout,
+        )
+    }
+
+    pub fn vm_exec_interactive(
+        &mut self,
+        command: &[String],
+        env: &[(String, String)],
+        workdir: Option<&str>,
+        timeout: Option<Duration>,
+        tty: bool,
+    ) -> Result<i32> {
+        self.client_mut()?.vm_exec_interactive(
+            command.to_vec(),
+            env.to_vec(),
+            workdir.map(str::to_string),
+            timeout,
+            tty,
+        )
+    }
+
+    pub fn vm_exec_background(
+        &mut self,
+        command: &[String],
+        env: &[(String, String)],
+        workdir: Option<&str>,
+    ) -> Result<u32> {
+        self.client_mut()?.vm_exec_background(
+            command.to_vec(),
+            env.to_vec(),
+            workdir.map(str::to_string),
+        )
+    }
+
+    pub fn vm_exec_streaming(
+        &mut self,
+        command: &[String],
+        env: &[(String, String)],
+        workdir: Option<&str>,
+        timeout: Option<Duration>,
+    ) -> Result<Vec<crate::internal::agent::ExecEvent>> {
+        self.client_mut()?.vm_exec_streaming(
+            command.to_vec(),
+            env.to_vec(),
+            workdir.map(str::to_string),
+            timeout,
+        )
+    }
+
+    pub fn run_with_mounts_and_timeout(
+        &mut self,
+        image: &str,
+        command: &[String],
+        env: &[(String, String)],
+        workdir: Option<&str>,
+        mounts: &[(String, String, bool)],
+        timeout: Option<Duration>,
+    ) -> Result<(i32, String, String)> {
+        self.client_mut()?.run_with_mounts_and_timeout(
+            image,
+            command.to_vec(),
+            env.to_vec(),
+            workdir.map(str::to_string),
+            mounts.to_vec(),
+            timeout,
+        )
+    }
+
+    pub fn run_interactive(
+        &mut self,
+        image: &str,
+        command: &[String],
+        env: &[(String, String)],
+        workdir: Option<&str>,
+        mounts: &[(String, String, bool)],
+        timeout: Option<Duration>,
+        tty: bool,
+    ) -> Result<i32> {
+        let config = crate::internal::agent::RunConfig::new(image, command.to_vec())
+            .with_env(env.to_vec())
+            .with_workdir(workdir.map(str::to_string))
+            .with_mounts(mounts.to_vec())
+            .with_timeout(timeout)
+            .with_tty(tty);
+        self.client_mut()?.run_interactive(config)
+    }
+
+    pub fn write_file(&mut self, path: &str, data: &[u8], mode: Option<u32>) -> Result<()> {
+        self.client_mut()?.write_file(path, data, mode)
+    }
+
+    pub fn read_file(&mut self, path: &str) -> Result<Vec<u8>> {
+        self.client_mut()?.read_file(path)
+    }
+
+    pub fn network_test(&mut self, url: &str) -> Result<serde_json::Value> {
+        self.client_mut()?.network_test(url)
+    }
+
+    pub fn storage_status(&mut self) -> Result<StorageStatus> {
+        self.client_mut()?.storage_status()
+    }
+
+    pub fn list_images(&mut self) -> Result<Vec<ImageInfo>> {
+        self.client_mut()?.list_images()
+    }
+
+    pub fn garbage_collect(&mut self, dry_run: bool) -> Result<u64> {
+        self.client_mut()?.garbage_collect(dry_run)
     }
 
     /// Detach the VM process so it survives after this handle is dropped.
@@ -70,6 +207,44 @@ impl VmHandle {
 // Name validation
 // ============================================================================
 
+// ============================================================================
+// Connect to running VM
+// ============================================================================
+
+/// Connect to a VM by name.
+///
+/// This function does not read the database. Callers are responsible for
+/// checking persistence separately before connecting.
+pub fn connect_vm(name: &str, auto_start_vm: bool) -> Result<VmHandle> {
+    let manager = AgentManager::for_vm(name)
+        .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
+
+    let freshly_started = if manager.try_connect_existing().is_none() {
+        if !auto_start_vm {
+            return Err(Error::agent(
+                "connect",
+                format!("machine '{}' is not running", name),
+            ));
+        }
+
+        manager.ensure_running()?;
+        true
+    } else {
+        false
+    };
+
+    let client = AgentClient::connect_with_retry(manager.vsock_socket())?;
+    Ok(VmHandle {
+        manager,
+        client: Some(client),
+        freshly_started,
+    })
+}
+
+// ============================================================================
+// Name validation
+// ============================================================================
+
 /// Maximum length for VM names.
 const MAX_NAME_LENGTH: usize = 40;
 
@@ -77,12 +252,12 @@ const MAX_NAME_LENGTH: usize = 40;
 ///
 /// Rules: alphanumeric + hyphens/underscores, must start with letter or digit,
 /// no trailing hyphen, no consecutive hyphens, max 40 chars.
-pub fn validate_name(name: &str) -> crate::error::Result<()> {
+pub fn validate_name(name: &str) -> Result<()> {
     if name.is_empty() {
-        return Err(crate::Error::config("validate name", "name cannot be empty"));
+        return Err(Error::config("validate name", "name cannot be empty"));
     }
     if name.len() > MAX_NAME_LENGTH {
-        return Err(crate::Error::config(
+        return Err(Error::config(
             "validate name",
             format!(
                 "name too long: {} characters (max {})",
@@ -93,13 +268,13 @@ pub fn validate_name(name: &str) -> crate::error::Result<()> {
     }
     let first_char = name.chars().next().unwrap();
     if !first_char.is_ascii_alphanumeric() {
-        return Err(crate::Error::config(
+        return Err(Error::config(
             "validate name",
             "name must start with a letter or digit",
         ));
     }
     if name.ends_with('-') {
-        return Err(crate::Error::config(
+        return Err(Error::config(
             "validate name",
             "name cannot end with a hyphen",
         ));
@@ -108,7 +283,7 @@ pub fn validate_name(name: &str) -> crate::error::Result<()> {
     for c in name.chars() {
         if c == '-' {
             if prev_was_hyphen {
-                return Err(crate::Error::config(
+                return Err(Error::config(
                     "validate name",
                     "name cannot contain consecutive hyphens",
                 ));
@@ -118,7 +293,7 @@ pub fn validate_name(name: &str) -> crate::error::Result<()> {
             prev_was_hyphen = false;
         }
         if !c.is_ascii_alphanumeric() && c != '-' && c != '_' {
-            return Err(crate::Error::config(
+            return Err(Error::config(
                 "validate name",
                 format!("name contains invalid character: '{}'", c),
             ));
@@ -135,12 +310,12 @@ pub fn validate_name(name: &str) -> crate::error::Result<()> {
 ///
 /// The input `MicroVm.status` is ignored — the returned MicroVm has
 /// `status.phase = Created`.
-pub fn create_vm(db: &SmolvmDb, vm: MicroVm) -> crate::error::Result<MicroVm> {
+pub fn create_vm(db: &SmolvmDb, vm: MicroVm) -> Result<MicroVm> {
     validate_name(&vm.name)?;
 
     // Check for duplicates
     if db.get_vm(&vm.name)?.is_some() {
-        return Err(crate::Error::config(
+        return Err(Error::config(
             "create vm",
             format!("'{}' already exists", vm.name),
         ));
@@ -155,15 +330,15 @@ pub fn create_vm(db: &SmolvmDb, vm: MicroVm) -> crate::error::Result<MicroVm> {
 }
 
 /// Get a VM by name.
-pub fn get_vm(db: &SmolvmDb, name: &str) -> crate::error::Result<MicroVm> {
+pub fn get_vm(db: &SmolvmDb, name: &str) -> Result<MicroVm> {
     let record = db
         .get_vm(name)?
-        .ok_or_else(|| crate::Error::vm_not_found(name))?;
+        .ok_or_else(|| Error::vm_not_found(name))?;
     Ok(convert::record_to_vm(&record))
 }
 
 /// List all persisted VMs.
-pub fn list_vms(db: &SmolvmDb) -> crate::error::Result<Vec<MicroVm>> {
+pub fn list_vms(db: &SmolvmDb) -> Result<Vec<MicroVm>> {
     let records = db.list_vms()?;
     Ok(records.into_iter().map(|(_, r)| convert::record_to_vm(&r)).collect())
 }
@@ -175,25 +350,43 @@ pub fn list_vms(db: &SmolvmDb) -> crate::error::Result<Vec<MicroVm>> {
 /// VM was just booted (true) or was already running and reconnected (false).
 ///
 /// Idempotent — safe to call on an already-running VM.
-pub fn start_vm(db: &SmolvmDb, name: &str) -> crate::error::Result<VmHandle> {
+pub fn start_vm(db: &SmolvmDb, name: &str) -> Result<VmHandle> {
     let record = db
         .get_vm(name)?
-        .ok_or_else(|| crate::Error::vm_not_found(name))?;
+        .ok_or_else(|| Error::vm_not_found(name))?;
 
     let mounts = record.host_mounts();
     let ports = record.port_mappings();
     let resources = record.vm_resources();
 
     let manager = AgentManager::for_vm_with_sizes(name, record.storage_gb, record.overlay_gb)
-        .map_err(|e| crate::Error::agent("create agent manager", e.to_string()))?;
+        .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
+
+    let ssh_agent_socket = if record.ssh_agent {
+        match std::env::var("SSH_AUTH_SOCK") {
+            Ok(path) => Some(std::path::PathBuf::from(path)),
+            Err(_) => {
+                return Err(Error::config(
+                    "--ssh-agent",
+                    "SSH_AUTH_SOCK is not set. Start an SSH agent with: eval $(ssh-agent) && ssh-add",
+                ));
+            }
+        }
+    } else {
+        None
+    };
+    let features = LaunchFeatures {
+        ssh_agent_socket,
+        dns_filter_hosts: record.dns_filter_hosts.clone(),
+    };
 
     let freshly_started = manager
-        .ensure_running_with_full_config(mounts, ports, resources)
-        .map_err(|e| crate::Error::agent("start vm", e.to_string()))?;
+        .ensure_running_with_full_config(mounts, ports, resources, features)
+        .map_err(|e| Error::agent("start vm", e.to_string()))?;
 
     // Persist running state
     let pid = manager.child_pid();
-    let pid_start_time = pid.and_then(crate::internal::process::process_start_time);
+    let pid_start_time = pid.and_then(process_start_time);
     if let Err(e) = db.update_vm(name, |r| {
         r.state = RecordState::Running;
         r.pid = pid;
@@ -202,22 +395,9 @@ pub fn start_vm(db: &SmolvmDb, name: &str) -> crate::error::Result<VmHandle> {
         tracing::warn!(error = %e, vm = %name, "failed to persist running state");
     }
 
-    // Build the MicroVm with current status
-    let vm = MicroVm {
-        name: name.to_string(),
-        spec: convert::record_to_vm(&record).spec,
-        status: Some(VmStatus {
-            phase: VmPhase::Running,
-            pid,
-            pid_start_time,
-            created_at: record.created_at.clone(),
-            last_exit_code: record.last_exit_code,
-        }),
-    };
-
     Ok(VmHandle {
         manager,
-        vm,
+        client: None,
         freshly_started,
     })
 }
@@ -226,22 +406,22 @@ pub fn start_vm(db: &SmolvmDb, name: &str) -> crate::error::Result<VmHandle> {
 /// and persists the Stopped state.
 ///
 /// Returns an error if the VM is not found or not running.
-pub fn stop_vm(db: &SmolvmDb, name: &str) -> crate::error::Result<MicroVm> {
+pub fn stop_vm(db: &SmolvmDb, name: &str) -> Result<()> {
     let record = db
         .get_vm(name)?
-        .ok_or_else(|| crate::Error::vm_not_found(name))?;
+        .ok_or_else(|| Error::vm_not_found(name))?;
 
     // Check if actually running
     let actual_state = record.actual_state();
     if actual_state != RecordState::Running {
-        return Err(crate::Error::InvalidState {
+        return Err(Error::InvalidState {
             expected: "running".into(),
             actual: format!("{}", actual_state),
         });
     }
 
     let manager = AgentManager::for_vm(name)
-        .map_err(|e| crate::Error::agent("create agent manager", e.to_string()))?;
+        .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
 
     // Reconnect if running, then stop
     manager.try_connect_existing();
@@ -256,17 +436,17 @@ pub fn stop_vm(db: &SmolvmDb, name: &str) -> crate::error::Result<MicroVm> {
         tracing::warn!(error = %e, vm = %name, "failed to persist stopped state");
     }
 
-    get_vm(db, name)
+    Ok(())
 }
 
 /// Delete a VM. Optionally stops it first, removes from DB, and
 /// deletes the data directory.
 ///
 /// Does NOT prompt for confirmation — that's a CLI concern.
-pub fn delete_vm(db: &SmolvmDb, name: &str, force: bool) -> crate::error::Result<()> {
+pub fn delete_vm(db: &SmolvmDb, name: &str, force: bool) -> Result<()> {
     let record = db
         .get_vm(name)?
-        .ok_or_else(|| crate::Error::vm_not_found(name))?;
+        .ok_or_else(|| Error::vm_not_found(name))?;
 
     // Stop if running and force is true
     if force && record.actual_state() == RecordState::Running {
@@ -297,22 +477,17 @@ pub fn resize_vm(
     name: &str,
     new_storage_gib: Option<u64>,
     new_overlay_gib: Option<u64>,
-) -> crate::error::Result<MicroVm> {
-    use crate::data::disk::{
-        Overlay, Storage, DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB,
-    };
-    use crate::internal::storage::expand_disk;
-
+) -> Result<()> {
     let record = db
         .get_vm(name)?
-        .ok_or_else(|| crate::Error::vm_not_found(name))?;
+        .ok_or_else(|| Error::vm_not_found(name))?;
 
     // VM must be stopped or never started
     let actual_state = record.actual_state();
     match actual_state {
         RecordState::Stopped | RecordState::Created => {}
         _ => {
-            return Err(crate::Error::InvalidState {
+            return Err(Error::InvalidState {
                 expected: "stopped".into(),
                 actual: format!("{:?}", actual_state),
             });
@@ -326,7 +501,7 @@ pub fn resize_vm(
 
     // No shrinking
     if target_storage < current_storage {
-        return Err(crate::Error::config(
+        return Err(Error::config(
             "resize",
             format!(
                 "storage disk cannot be shrunk from {} GiB to {} GiB",
@@ -335,7 +510,7 @@ pub fn resize_vm(
         ));
     }
     if target_overlay < current_overlay {
-        return Err(crate::Error::config(
+        return Err(Error::config(
             "resize",
             format!(
                 "overlay disk cannot be shrunk from {} GiB to {} GiB",
@@ -345,19 +520,19 @@ pub fn resize_vm(
     }
 
     let manager = AgentManager::for_vm(name)
-        .map_err(|e| crate::Error::agent("get agent manager", e.to_string()))?;
+        .map_err(|e| Error::agent("get agent manager", e.to_string()))?;
 
     // Expand disks
     if let Some(s) = new_storage_gib {
         if s > current_storage {
             expand_disk::<Storage>(manager.storage_path(), s)
-                .map_err(|e| crate::Error::storage("expand storage disk", e.to_string()))?;
+                .map_err(|e| Error::storage("expand storage disk", e.to_string()))?;
         }
     }
     if let Some(o) = new_overlay_gib {
         if o > current_overlay {
             expand_disk::<Overlay>(manager.overlay_path(), o)
-                .map_err(|e| crate::Error::storage("expand overlay disk", e.to_string()))?;
+                .map_err(|e| Error::storage("expand overlay disk", e.to_string()))?;
         }
     }
 
@@ -371,11 +546,11 @@ pub fn resize_vm(
         }
     })?;
 
-    get_vm(db, name)
+    Ok(())
 }
 
 /// Update a MicroVm's spec and/or status in the DB.
-pub fn update_vm(db: &SmolvmDb, vm: &MicroVm) -> crate::error::Result<()> {
+pub fn update_vm(db: &SmolvmDb, vm: &MicroVm) -> Result<()> {
     let record = convert::vm_to_record(vm);
     db.insert_vm(&vm.name, &record)?;
     Ok(())
@@ -388,7 +563,7 @@ pub fn update_vm(db: &SmolvmDb, vm: &MicroVm) -> crate::error::Result<()> {
 pub fn resolve_container_mounts(
     vm_mounts: &[HostMount],
     container_mounts: &[(String, String, bool)],
-) -> crate::error::Result<Vec<(String, String, bool)>> {
+) -> Result<Vec<(String, String, bool)>> {
     // Auto-propagate all VM mounts to the container
     let mut result: Vec<(String, String, bool)> = vm_mounts
         .iter()
@@ -419,7 +594,7 @@ pub fn resolve_container_mounts(
                 }
             }
             None => {
-                return Err(crate::Error::mount(
+                return Err(Error::mount(
                     "resolve container mounts",
                     format!(
                         "host path '{}' is not mounted on the VM. Add it with --volume first.",

@@ -4,12 +4,6 @@
 //! to eliminate code duplication and ensure consistent validation.
 
 use smolvm::data::mount::HostMount;
-use std::time::Duration;
-
-/// Parse a duration string (e.g., "30s", "5m", "1h").
-pub fn parse_duration(s: &str) -> Result<Duration, humantime::DurationError> {
-    humantime::parse_duration(s)
-}
 
 /// Parse an environment variable specification (KEY=VALUE).
 pub fn parse_env_spec(spec: &str) -> Option<(String, String)> {
