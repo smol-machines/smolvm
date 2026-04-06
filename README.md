@@ -13,15 +13,19 @@ smolvm
 
 Ship and run software with isolation by default.
 
-This is a cli tool that lets you:
-1. Run a custom linux virtual machine locally with subsecond coldstart, cross-platform support on macOS and linux, and dynamic memory right-sizing.
-2. Pack a stateful virtual machine into a single .smolmachine artifact to rehydrate and run like an executable binary on any supported platform.
+This is a CLI tool that lets you:
+1. Manage and run custom Linux virtual machines locally with: sub-second cold start, cross-platform (macOS, Linux), elastic memory usage.
+2. Pack a stateful virtual machine into a single file (.smolmachine) to rehydrate on any supported platform.
 
 Install
 -------
 
 ```bash
+# install (macOS + Linux)
 curl -sSL https://smolmachines.com/install.sh | bash
+
+# for coding agents — install + discover all commands
+curl -sSL https://smolmachines.com/install.sh | bash && smolvm --help
 ```
 
 Or download from [GitHub Releases](https://github.com/smol-machines/smolvm/releases).
@@ -31,10 +35,11 @@ Quick Start
 
 ```bash
 # run a command in an ephemeral VM (cleaned up after exit)
-smolvm machine run --net --image alpine -- sh -c "echo 'hello from a microVM' && uname -a"
+smolvm machine run --net --image alpine -- sh -c "echo 'Hello world from a microVM' && uname -a"
 
 # interactive shell
 smolvm machine run --net -it --image alpine -- /bin/sh
+# inside the VM: apk add sl && sl && exit
 ```
 
 Use This For
@@ -77,7 +82,7 @@ smolvm machine stop --name myvm
 **Use git and SSH without exposing keys** — forward your host SSH agent into the VM. Private keys never enter the guest — the hypervisor enforces this. Requires an SSH agent running on your host (`ssh-add -l` to check).
 
 ```bash
-smolvm machine run --ssh-agent --net --image alpine -- ssh-add -l
+smolvm machine run --ssh-agent --net --image alpine -- sh -c "apk add -q openssh-client && ssh-add -l"
 # lists your host keys, but they can't be extracted from inside the VM
 
 smolvm machine exec --name myvm -- git clone git@github.com:org/private-repo.git
@@ -140,7 +145,7 @@ Platform Support
 Known Limitations
 -----------------
 
-* Network is opt-in (`--net` on `machine create`). The default machine has networking enabled. TCP/UDP only, no ICMP.
+* Network is opt-in (`--net` on `machine create`). TCP/UDP only, no ICMP.
 * Volume mounts: directories only (no single files).
 * macOS: binary must be signed with Hypervisor.framework entitlements.
 * `--ssh-agent` requires an SSH agent running on the host (`SSH_AUTH_SOCK` must be set).
