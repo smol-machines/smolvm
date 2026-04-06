@@ -1002,4 +1002,52 @@ run_test "Machine run: timeout" test_machine_run_timeout || true
 run_test "Machine images" test_machine_images || true
 run_test "Machine prune --dry-run" test_machine_prune_dry_run || true
 
+# =============================================================================
+# Auto-Generated Names
+# =============================================================================
+
+test_auto_generated_names() {
+    # Auto-generate: create with no name, verify format + appears in list
+    local result1 result2
+    result1=$($SMOLVM machine create 2>&1) || return 1
+    result2=$($SMOLVM machine create 2>&1) || return 1
+
+    local name1 name2
+    name1=$(echo "$result1" | grep -oE "vm-[a-f0-9]{8}")
+    name2=$(echo "$result2" | grep -oE "vm-[a-f0-9]{8}")
+
+    # Both should produce valid names
+    [[ -n "$name1" ]] && [[ -n "$name2" ]] || { echo "No auto name found"; return 1; }
+
+    # Names should differ
+    [[ "$name1" != "$name2" ]] || { echo "Names should be unique: $name1"; return 1; }
+
+    # Both should appear in list
+    local list_result
+    list_result=$($SMOLVM machine ls 2>&1)
+    [[ "$list_result" == *"$name1"* ]] && [[ "$list_result" == *"$name2"* ]] || {
+        echo "Auto-named machines not in list"
+        $SMOLVM machine delete "$name1" -f 2>/dev/null
+        $SMOLVM machine delete "$name2" -f 2>/dev/null
+        return 1
+    }
+
+    # Explicit name still works
+    local explicit="explicit-test-$$"
+    $SMOLVM machine create "$explicit" 2>&1 || { echo "Explicit name failed"; return 1; }
+    list_result=$($SMOLVM machine ls 2>&1)
+    [[ "$list_result" == *"$explicit"* ]] || { echo "Explicit name not in list"; return 1; }
+
+    # Cleanup
+    $SMOLVM machine delete "$name1" -f 2>/dev/null
+    $SMOLVM machine delete "$name2" -f 2>/dev/null
+    $SMOLVM machine delete "$explicit" -f 2>/dev/null
+}
+
+echo ""
+echo "--- Auto-Generated Names ---"
+echo ""
+
+run_test "Auto-generated names" test_auto_generated_names || true
+
 print_summary "Machine Tests"

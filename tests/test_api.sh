@@ -264,4 +264,36 @@ run_test "Registry: create→start→exec in one session" test_registry_create_s
 run_test "Registry: get machine after create" test_registry_get_machine || true
 run_test "Registry: cleanup test machine" test_registry_cleanup || true
 
+# Auto-generated names via API
+test_api_auto_generated_names() {
+    # Without name → auto-generated vm-* name
+    local response
+    response=$(curl -sf -X POST "$API_URL/api/v1/machines" \
+        -H "Content-Type: application/json" \
+        -d '{"cpus": 1, "memoryMb": 512}' 2>&1) || { echo "Create failed: $response"; return 1; }
+
+    local auto_name
+    auto_name=$(echo "$response" | jq -r '.name // empty')
+    [[ "$auto_name" == vm-* ]] || { echo "Expected vm-* name, got: $auto_name"; return 1; }
+
+    # With explicit name → uses it
+    local explicit="api-name-test-$$"
+    response=$(curl -sf -X POST "$API_URL/api/v1/machines" \
+        -H "Content-Type: application/json" \
+        -d "{\"name\": \"$explicit\", \"cpus\": 1, \"memoryMb\": 512}" 2>&1) || return 1
+    local name
+    name=$(echo "$response" | jq -r '.name')
+    [[ "$name" == "$explicit" ]] || { echo "Expected $explicit, got: $name"; return 1; }
+
+    # Cleanup
+    curl -sf -X DELETE "$API_URL/api/v1/machines/$auto_name" 2>/dev/null
+    curl -sf -X DELETE "$API_URL/api/v1/machines/$explicit" 2>/dev/null
+}
+
+echo ""
+echo "--- Auto-Generated Names (API) ---"
+echo ""
+
+run_test "API: auto-generated names" test_api_auto_generated_names || true
+
 print_summary "HTTP API Tests"

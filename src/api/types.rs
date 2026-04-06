@@ -407,9 +407,10 @@ fn default_mem() -> u32 {
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateMachineRequest {
-    /// Unique name for the machine.
+    /// Machine name. Auto-generated if omitted.
+    #[serde(default)]
     #[schema(example = "my-vm")]
-    pub name: String,
+    pub name: Option<String>,
     /// Number of vCPUs.
     #[serde(default = "default_cpus")]
     #[schema(example = 2)]

@@ -220,15 +220,18 @@ pub async fn create_machine(
     Json(req): Json<CreateMachineRequest>,
 ) -> Result<Json<MachineInfo>, ApiError> {
     use crate::api::state::{MachineRegistration, ReservationGuard};
-    // Validate name format
-    validate_resource_name(&req.name, "machine", MAX_NAME_LENGTH)?;
+
+    // Generate name if not provided, then validate.
+    let name = req
+        .name
+        .clone()
+        .unwrap_or_else(crate::util::generate_machine_name);
+    validate_resource_name(&name, "machine", MAX_NAME_LENGTH)?;
 
     // Validate mount paths
     for mount_spec in &req.mounts {
         HostMount::try_from(mount_spec).map_err(|e| ApiError::BadRequest(e.to_string()))?;
     }
-
-    let name = req.name.clone();
 
     // Reserve the name atomically (prevents concurrent creation)
     let guard = ReservationGuard::new(&state, name.clone())?;

@@ -677,9 +677,9 @@ impl ExecCmd {
 ///   smolvm machine create webserver --cpus 2 --mem 1024 -p 80:80
 #[derive(Args, Debug)]
 pub struct CreateCmd {
-    /// Name for the machine
+    /// Name for the machine (auto-generated if omitted)
     #[arg(value_name = "NAME")]
-    pub name: String,
+    pub name: Option<String>,
 
     /// Number of virtual CPUs
     #[arg(long, default_value_t = DEFAULT_MICROVM_CPU_COUNT, value_name = "N")]
@@ -751,8 +751,12 @@ impl CreateCmd {
             self.net,
         )?;
 
+        let name = self
+            .name
+            .unwrap_or_else(smolvm::util::generate_machine_name);
+
         let params = crate::cli::smolfile::build_create_params(
-            self.name,
+            name,
             None,   // image: from Smolfile only
             None,   // entrypoint: from Smolfile only
             vec![], // cmd: from Smolfile only
