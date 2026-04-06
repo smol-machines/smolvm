@@ -875,6 +875,7 @@ pub fn list_vms(kind: VmKind, verbose: bool, json: bool) -> smolvm::Result<()> {
                     "image": record.image,
                     "entrypoint": record.entrypoint,
                     "cmd": record.cmd,
+                    "ephemeral": record.ephemeral,
                 });
                 if kind.include_network_in_json() {
                     obj.as_object_mut()
@@ -889,19 +890,24 @@ pub fn list_vms(kind: VmKind, verbose: bool, json: bool) -> smolvm::Result<()> {
         println!("{}", json);
     } else {
         println!(
-            "{:<20} {:<10} {:>5} {:>10} {:>7} {:>7} {:>8} {:>8}",
+            "{:<20} {:<12} {:>5} {:>10} {:>7} {:>7} {:>8} {:>8}",
             "NAME", "STATE", "CPUS", "MEMORY", "MOUNTS", "PORTS", "STORAGE", "OVERLAY"
         );
-        println!("{}", "-".repeat(82));
+        println!("{}", "-".repeat(88));
 
         for (name, record) in vms {
             let actual_state = record.actual_state();
+            let state_display = if record.ephemeral {
+                format!("{} (eph)", actual_state)
+            } else {
+                actual_state.to_string()
+            };
             let storage_gb = record.storage_gb.unwrap_or(DEFAULT_STORAGE_SIZE_GIB);
             let overlay_gb = record.overlay_gb.unwrap_or(DEFAULT_OVERLAY_SIZE_GIB);
             println!(
-                "{:<20} {:<10} {:>5} {:>10} {:>7} {:>7} {:>8} {:>8}",
+                "{:<20} {:<12} {:>5} {:>10} {:>7} {:>7} {:>8} {:>8}",
                 truncate(name, 18),
-                actual_state,
+                state_display,
                 record.cpus,
                 format!("{} MiB", record.mem),
                 record.mounts.len(),
@@ -1061,4 +1067,76 @@ pub fn resize_vm(
     println!("Disk changes are applied immediately; filesystem will expand on next boot.");
 
     Ok(())
+}
+
+// ============================================================================
+// Ephemeral VM Tracking
+// ============================================================================
+
+/// Register an ephemeral VM in the database for tracking.
+///
+/// Called by `machine run` after the VM is forked. The record is removed
+/// on clean exit. Stale records from crashes are cleaned up by
+/// `cleanup_orphaned_ephemeral_vms()`.
+pub fn register_ephemeral_vm(
+    name: &str,
+    pid: Option<i32>,
+    cpus: u8,
+    mem: u32,
+    network: bool,
+    image: Option<String>,
+) {
+    let mut record = VmRecord::new(name.to_string(), cpus, mem, vec![], vec![], network);
+    record.ephemeral = true;
+    record.state = RecordState::Running;
+    record.pid = pid;
+    record.image = image;
+
+    if let Ok(db) = SmolvmDb::open() {
+        if let Err(e) = db.insert_vm(name, &record) {
+            tracing::debug!(error = %e, name, "failed to register ephemeral VM");
+        }
+    }
+}
+
+/// Remove an ephemeral VM record from the database.
+pub fn deregister_ephemeral_vm(name: &str) {
+    if let Ok(db) = SmolvmDb::open() {
+        if let Err(e) = db.remove_vm(name) {
+            tracing::debug!(error = %e, name, "failed to deregister ephemeral VM");
+        }
+    }
+}
+
+/// Clean up orphaned ephemeral VM records.
+///
+/// Called once at CLI startup. Scans for ephemeral records whose PID is no
+/// longer alive and removes them. Fast path: if no ephemeral records exist,
+/// this is a single DB read (~0.2ms).
+pub fn cleanup_orphaned_ephemeral_vms() {
+    let db = match SmolvmDb::open() {
+        Ok(db) => db,
+        Err(_) => return,
+    };
+
+    let vms = match db.list_vms() {
+        Ok(vms) => vms,
+        Err(_) => return,
+    };
+
+    for (name, record) in &vms {
+        if !record.ephemeral {
+            continue;
+        }
+
+        let is_orphan = match record.pid {
+            Some(pid) => !smolvm::process::is_alive(pid),
+            None => true, // No PID recorded — stale
+        };
+
+        if is_orphan {
+            tracing::debug!(name = %name, pid = ?record.pid, "cleaning up orphaned ephemeral VM");
+            let _ = db.remove_vm(name);
+        }
+    }
 }

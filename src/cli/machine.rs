@@ -335,6 +335,17 @@ impl RunCmd {
             .ensure_running_with_full_config(mounts.clone(), ports, resources, features)
             .map_err(|e| Error::agent("start machine", e.to_string()))?;
 
+        // Register ephemeral VM for tracking (machine list, orphan cleanup)
+        let ephemeral_name = smolvm::util::generate_machine_name();
+        vm_common::register_ephemeral_vm(
+            &ephemeral_name,
+            manager.child_pid(),
+            params.cpus,
+            params.mem,
+            params.net,
+            self.image.clone().or(params.image.clone()),
+        );
+
         let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
 
         // Resolve image: CLI > Smolfile > None (bare VM)
@@ -488,7 +499,7 @@ impl RunCmd {
                 };
 
                 // Ephemeral run — command finished, kill VM immediately.
-                // No graceful shutdown needed since there's no state to preserve.
+                vm_common::deregister_ephemeral_vm(&ephemeral_name);
                 manager.kill();
                 std::process::exit(exit_code);
             }
@@ -580,6 +591,7 @@ impl RunCmd {
                     exit_code
                 };
                 // Ephemeral run — command finished, kill VM immediately.
+                vm_common::deregister_ephemeral_vm(&ephemeral_name);
                 manager.kill();
                 std::process::exit(exit_code);
             }

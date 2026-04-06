@@ -66,6 +66,9 @@ fn main() {
 
     tracing::debug!(version = smolvm::VERSION, "starting smolvm");
 
+    // Clean up stale ephemeral VM records from previous crashes.
+    cli::vm_common::cleanup_orphaned_ephemeral_vms();
+
     // Execute command
     let result = match cli.command {
         Commands::Machine(cmd) => cmd.run(),

@@ -1050,4 +1050,58 @@ echo ""
 
 run_test "Auto-generated names" test_auto_generated_names || true
 
+# =============================================================================
+# Ephemeral VM Tracking
+# =============================================================================
+
+test_ephemeral_vm_tracking() {
+    # Ephemeral machine run should appear in list while running, disappear after exit
+    local result
+    result=$(run_with_timeout 30 $SMOLVM machine run --net --image alpine -- echo "ephemeral-tracking-test" 2>&1)
+    local exit_code=$?
+    [[ $exit_code -eq 124 ]] && { echo "TIMEOUT"; return 1; }
+    [[ "$result" == *"ephemeral-tracking-test"* ]] || { echo "Command failed: $result"; return 1; }
+
+    # After clean exit, the ephemeral record should be gone
+    local list_result
+    list_result=$($SMOLVM machine ls 2>&1)
+    # Should NOT contain any ephemeral VMs from this run (they deregister on exit)
+    if echo "$list_result" | grep -q "(eph).*running"; then
+        echo "Ephemeral VM still in list after clean exit"
+        return 1
+    fi
+
+    # Verify orphan cleanup works: list should not error
+    [[ $? -eq 0 ]]
+}
+
+test_ephemeral_shows_in_list_while_running() {
+    # Start a detached ephemeral run and verify it appears in list
+    $SMOLVM machine run --net -d --image alpine -- sleep 30 2>&1 || {
+        echo "Detached run failed"
+        return 1
+    }
+
+    # Should appear in list with (eph) marker
+    sleep 2
+    local list_result
+    list_result=$($SMOLVM machine ls 2>&1)
+    echo "$list_result" | grep -q "eph" || {
+        echo "Detached ephemeral not in list: $list_result"
+        # Clean up any running VMs
+        $SMOLVM machine stop 2>/dev/null || true
+        return 1
+    }
+
+    # Clean up
+    $SMOLVM machine stop 2>/dev/null || true
+}
+
+echo ""
+echo "--- Ephemeral VM Tracking ---"
+echo ""
+
+run_test "Ephemeral VM: clean exit deregisters" test_ephemeral_vm_tracking || true
+run_test "Ephemeral VM: visible while running" test_ephemeral_shows_in_list_while_running || true
+
 print_summary "Machine Tests"

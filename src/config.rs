@@ -426,6 +426,10 @@ pub struct VmRecord {
     /// queries against this allowlist.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns_filter_hosts: Option<Vec<String>>,
+
+    /// True for `machine run` VMs. Auto-deleted on exit or cleanup sweep.
+    #[serde(default)]
+    pub ephemeral: bool,
 }
 
 fn default_cpus() -> u8 {
@@ -475,6 +479,7 @@ impl VmRecord {
             health_startup_grace_secs: None,
             ssh_agent: false,
             dns_filter_hosts: None,
+            ephemeral: false,
         }
     }
 
@@ -517,6 +522,7 @@ impl VmRecord {
             health_startup_grace_secs: None,
             ssh_agent: false,
             dns_filter_hosts: None,
+            ephemeral: false,
         }
     }
 
