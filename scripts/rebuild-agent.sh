@@ -26,14 +26,19 @@ if [[ "$1" == "--clean" ]]; then
 fi
 
 echo "Building smolvm-agent for Linux..."
-if command -v smolvm &> /dev/null; then
-    smolvm machine run --net --mem 2048 -v "$PROJECT_DIR:/work" --image rust:alpine \
-        -- sh -c ". /usr/local/cargo/env && apk add musl-dev && cd /work && ${CLEAN_CMD}cargo build --release -p smolvm-agent"
-else
+# Prefer the locally built binary over the installed one — it has the latest
+# fixes (e.g., registry config path) that the installed version may lack.
+SMOLVM_BIN="${PROJECT_DIR}/target/release/smolvm"
+if [ ! -f "$SMOLVM_BIN" ] && command -v smolvm &> /dev/null; then
+    SMOLVM_BIN="smolvm"
+elif [ ! -f "$SMOLVM_BIN" ]; then
     echo "Error: smolvm is required to cross-compile the agent"
-    echo "Install smolvm first: https://github.com/smolvm/smolvm"
+    echo "Build with: cargo build --release"
     exit 1
 fi
+
+"$SMOLVM_BIN" machine run --net --mem 2048 -v "$PROJECT_DIR:/work" --image rust:alpine \
+    -- sh -c ". /usr/local/cargo/env && apk add musl-dev && cd /work && ${CLEAN_CMD}cargo build --release -p smolvm-agent"
 
 # Check if rootfs directory exists
 if [[ ! -d "$ROOTFS_DIR/usr/local/bin" ]]; then
@@ -49,6 +54,13 @@ cp target/release/smolvm-agent "$ROOTFS_DIR/usr/local/bin/"
 # The agent handles overlayfs setup + pivot_root internally before
 # starting the vsock listener.
 ln -sf /usr/local/bin/smolvm-agent "$ROOTFS_DIR/sbin/init"
+
+# Also update target/agent-rootfs if it exists — pack create reads from
+# there first, so it must stay in sync with the installed rootfs.
+if [[ -d "$PROJECT_DIR/target/agent-rootfs/usr/local/bin" ]]; then
+    cp target/release/smolvm-agent "$PROJECT_DIR/target/agent-rootfs/usr/local/bin/"
+    echo "Updated: target/agent-rootfs (keeps pack create in sync)"
+fi
 
 echo "Stopping running agent (if any)..."
 export DYLD_LIBRARY_PATH="$PROJECT_DIR/lib"

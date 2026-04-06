@@ -745,7 +745,7 @@ test_packed_bare_invocation() {
 
     # ./my-app with no subcommand should run the manifest entrypoint.
     # Alpine's default is /bin/sh — without -it it reads stdin, gets EOF,
-    # and exits 0.  That exit-0 proves the VM booted and ran the entrypoint
+    # and exits 0. That exit-0 proves the VM booted and ran the entrypoint
     # instead of printing clap usage (which would exit non-zero).
     local exit_code=0
     run_with_timeout 30 "$output" </dev/null 2>&1 || exit_code=$?

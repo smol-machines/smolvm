@@ -56,14 +56,11 @@ test_machine_run_help() {
     [[ "$output" == *"--oci-platform"* ]]
 }
 
-test_container_help() {
-    local output
-    output=$($SMOLVM container --help 2>&1)
-    [[ "$output" == *"create"* ]] && \
-    [[ "$output" == *"start"* ]] && \
-    [[ "$output" == *"stop"* ]] && \
-    [[ "$output" == *"list"* ]] && \
-    [[ "$output" == *"remove"* ]]
+test_no_container_command() {
+    # Container subcommand was removed — should not exist
+    local exit_code=0
+    $SMOLVM container --help 2>&1 || exit_code=$?
+    [[ $exit_code -ne 0 ]]
 }
 
 test_pack_help() {
@@ -127,7 +124,7 @@ run_test "Version command" test_version || true
 run_test "Help command" test_help || true
 run_test "Machine help" test_machine_help || true
 run_test "Machine run help" test_machine_run_help || true
-run_test "Container help" test_container_help || true
+run_test "No container command" test_no_container_command || true
 run_test "Pack help" test_pack_help || true
 run_test "vm alias works" test_vm_alias || true
 run_test "Invalid subcommand fails" test_invalid_subcommand || true

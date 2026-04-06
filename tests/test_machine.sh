@@ -1013,8 +1013,8 @@ test_auto_generated_names() {
     result2=$($SMOLVM machine create 2>&1) || return 1
 
     local name1 name2
-    name1=$(echo "$result1" | grep -oE "vm-[a-f0-9]{8}")
-    name2=$(echo "$result2" | grep -oE "vm-[a-f0-9]{8}")
+    name1=$(echo "$result1" | grep "Created machine:" | grep -oE "vm-[a-f0-9]{8}" | head -1)
+    name2=$(echo "$result2" | grep "Created machine:" | grep -oE "vm-[a-f0-9]{8}" | head -1)
 
     # Both should produce valid names
     [[ -n "$name1" ]] && [[ -n "$name2" ]] || { echo "No auto name found"; return 1; }
@@ -1022,9 +1022,9 @@ test_auto_generated_names() {
     # Names should differ
     [[ "$name1" != "$name2" ]] || { echo "Names should be unique: $name1"; return 1; }
 
-    # Both should appear in list
+    # Both should appear in list (use --json for full names, avoids truncation)
     local list_result
-    list_result=$($SMOLVM machine ls 2>&1)
+    list_result=$($SMOLVM machine ls --json 2>&1)
     [[ "$list_result" == *"$name1"* ]] && [[ "$list_result" == *"$name2"* ]] || {
         echo "Auto-named machines not in list"
         $SMOLVM machine delete "$name1" -f 2>/dev/null
@@ -1035,7 +1035,7 @@ test_auto_generated_names() {
     # Explicit name still works
     local explicit="explicit-test-$$"
     $SMOLVM machine create "$explicit" 2>&1 || { echo "Explicit name failed"; return 1; }
-    list_result=$($SMOLVM machine ls 2>&1)
+    list_result=$($SMOLVM machine ls --json 2>&1)
     [[ "$list_result" == *"$explicit"* ]] || { echo "Explicit name not in list"; return 1; }
 
     # Cleanup
@@ -1114,8 +1114,8 @@ test_create_with_image() {
     # Create with --image (new feature), start, exec, verify, cleanup
     $SMOLVM machine create "$vm_name" --image alpine:latest --net 2>&1 || return 1
 
-    # Should appear in list
-    $SMOLVM machine ls 2>&1 | grep -q "$vm_name" || {
+    # Should appear in list (use --json for full names)
+    $SMOLVM machine ls --json 2>&1 | grep -q "$vm_name" || {
         echo "Machine not in list"
         $SMOLVM machine delete "$vm_name" -f 2>/dev/null
         return 1

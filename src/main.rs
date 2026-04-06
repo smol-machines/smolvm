@@ -27,10 +27,6 @@ enum Commands {
     #[command(subcommand, visible_alias = "vm")]
     Machine(cli::machine::MachineCmd),
 
-    /// Manage containers inside a machine
-    #[command(subcommand, visible_alias = "ct")]
-    Container(cli::container::ContainerCmd),
-
     /// Start the HTTP API server for programmatic control
     #[command(subcommand)]
     Serve(cli::serve::ServeCmd),
@@ -72,7 +68,6 @@ fn main() {
     // Execute command
     let result = match cli.command {
         Commands::Machine(cmd) => cmd.run(),
-        Commands::Container(cmd) => cmd.run(),
         Commands::Serve(cmd) => cmd.run(),
         Commands::Pack(cmd) => cmd.run(),
         Commands::Config(cmd) => cmd.run(),

@@ -25,11 +25,6 @@ smolvm machine create myvm --ssh-agent --net
 # Pack into portable executable
 smolvm pack create --image python:3.12-alpine -o ./my-python
 ./my-python run -- python3 -c "print('hello')"
-
-# Containers inside a machine
-smolvm container create --image nginx -- nginx -g "daemon off;"
-smolvm container ls
-smolvm container exec --container abc123 -- curl localhost
 ```
 
 ## When to Use What
@@ -39,10 +34,9 @@ smolvm container exec --container abc123 -- curl localhost
 | Run a one-off command in isolation | `smolvm machine run --net --image IMAGE -- CMD` |
 | Interactive shell | `smolvm machine run --net -it --image IMAGE -- /bin/sh` |
 | Persistent dev environment | `machine create` → `machine start` → `machine exec` |
-| Run containers inside a VM | `machine start` → `container create` |
 | Ship software as a binary | `smolvm pack create --image IMAGE -o OUTPUT` |
 | Use git/ssh with private keys safely | Add `--ssh-agent` to run or create |
-| Minimal VM without container overhead | `smolvm machine run -s Smolfile` (bare VM) |
+| Minimal VM without image | `smolvm machine run -s Smolfile` (bare VM) |
 | Declarative VM config | Create a Smolfile, use `--smolfile`/`-s` flag |
 
 ## CLI Structure
@@ -60,12 +54,6 @@ smolvm machine status [--name NAME]               # check state
 smolvm machine ls [--json]                        # list all
 smolvm machine monitor [--name NAME]              # foreground health + restart
 
-smolvm container create --image IMAGE [-- CMD]    # --machine defaults to "default"
-smolvm container exec --container ID [-- CMD]
-smolvm container stop --container ID
-smolvm container rm --container ID [-f]
-smolvm container ls                               # --machine defaults to "default"
-
 smolvm pack create --image IMAGE -o PATH          # package
 smolvm pack create --from-vm NAME -o PATH         # pack from VM snapshot
 smolvm pack run [--sidecar PATH] [-- CMD]         # run .smolmachine
@@ -78,10 +66,8 @@ smolvm config registries edit                     # registry auth
 
 | Flag | Short | Used on | Description |
 |------|-------|---------|-------------|
-| `--image` | `-I` | run, container create, pack create | OCI image |
+| `--image` | `-I` | run, create, pack create | OCI image |
 | `--name` | `-n` | start, stop, status, exec, resize | Machine name (default: "default") |
-| `--machine` | `-m` | container commands | Target machine (default: "default") |
-| `--container` | `-c` | container start/stop/rm/exec | Container ID |
 | `--net` | | run, create | Enable outbound networking (off by default) |
 | `--volume` | `-v` | run, create | Mount host dir: `HOST:GUEST[:ro]` |
 | `--port` | `-p` | run, create | Port mapping: `HOST:GUEST` |
@@ -210,9 +196,7 @@ smolvm machine run -s Smolfile
 smolvm machine run -d -s Smolfile
 ```
 
-Bare VMs run commands directly in the Alpine rootfs via `vm_exec` — no OCI container layer. Use this when you need a minimal Linux environment without image pull overhead.
-
-Note: `machine run -d` with a bare VM workload (entrypoint/cmd) uses background exec. The process runs inside the VM but stdout/stderr are not captured. For long-running services, use `[dev].init` with backgrounding or switch to container mode.
+Bare VMs run commands directly in the Alpine rootfs — no OCI image pull needed. Use this when you need a minimal Linux environment.
 
 ## Packed Binaries (.smolmachine)
 
@@ -249,7 +233,6 @@ OpenAPI spec: `smolvm serve openapi`
 ## Important Defaults
 
 - Machine name defaults to `"default"` when `--name` is omitted
-- Container `--machine` defaults to `"default"`
 - Network is **off** by default (security-first)
 - CPUs: 4, Memory: 8192 MiB (elastic via virtio balloon), Storage: 20 GiB, Overlay: 2 GiB
 - Packed binary CPUs: 1, Memory: 256 MiB (lighter defaults for single-purpose workloads)

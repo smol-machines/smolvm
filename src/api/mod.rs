@@ -45,7 +45,7 @@ use state::ApiState;
     info(
         title = "smolvm API",
         version = "0.2.0",
-        description = "smolvm API for managing machines, containers, and images.",
+        description = "smolvm API for managing machines and images.",
         license(name = "Apache-2.0", url = "https://www.apache.org/licenses/LICENSE-2.0")
     ),
     tags(
@@ -53,7 +53,6 @@ use state::ApiState;
         (name = "Machines", description = "Machine lifecycle management"),
         (name = "Execution", description = "Command execution in machines"),
         (name = "Logs", description = "Log streaming"),
-        (name = "Containers", description = "Container management within machines"),
         (name = "Images", description = "OCI image management")
     ),
     paths(
@@ -63,13 +62,6 @@ use state::ApiState;
         handlers::exec::exec_command,
         handlers::exec::run_command,
         handlers::exec::stream_logs,
-        // Containers
-        handlers::containers::create_container,
-        handlers::containers::list_containers,
-        handlers::containers::start_container,
-        handlers::containers::stop_container,
-        handlers::containers::delete_container,
-        handlers::containers::exec_in_container,
         // Images
         handlers::images::list_images,
         handlers::images::pull_image,
@@ -93,11 +85,6 @@ use state::ApiState;
         types::ExecRequest,
         types::RunRequest,
         types::EnvVar,
-        types::CreateContainerRequest,
-        types::ContainerMountSpec,
-        types::ContainerExecRequest,
-        types::StopContainerRequest,
-        types::DeleteContainerRequest,
         types::PullImageRequest,
         types::DeleteQuery,
         types::LogsQuery,
@@ -109,8 +96,6 @@ use state::ApiState;
         types::MountInfo,
         types::ListMachinesResponse,
         types::ExecResponse,
-        types::ContainerInfo,
-        types::ListContainersResponse,
         types::ImageInfo,
         types::ListImagesResponse,
         types::PullImageResponse,
@@ -150,31 +135,6 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         // Exec routes
         .route("/:id/exec", post(handlers::exec::exec_command))
         .route("/:id/run", post(handlers::exec::run_command))
-        // Container routes
-        .route(
-            "/:id/containers",
-            post(handlers::containers::create_container),
-        )
-        .route(
-            "/:id/containers",
-            get(handlers::containers::list_containers),
-        )
-        .route(
-            "/:id/containers/:cid/start",
-            post(handlers::containers::start_container),
-        )
-        .route(
-            "/:id/containers/:cid/stop",
-            post(handlers::containers::stop_container),
-        )
-        .route(
-            "/:id/containers/:cid",
-            delete(handlers::containers::delete_container),
-        )
-        .route(
-            "/:id/containers/:cid/exec",
-            post(handlers::containers::exec_in_container),
-        )
         // Image routes
         .route("/:id/images", get(handlers::images::list_images))
         .route("/:id/images/pull", post(handlers::images::pull_image))

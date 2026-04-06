@@ -112,10 +112,13 @@ impl RegistryConfig {
     }
 
     /// Get the path to the registry configuration file.
+    ///
+    /// Always uses `~/.config/smolvm/registries.toml` regardless of platform
+    /// for consistent behavior across macOS and Linux.
     pub fn config_path() -> Result<PathBuf> {
-        let config_dir = dirs::config_dir()
-            .ok_or_else(|| Error::config("resolve path", "no config directory found"))?;
-        Ok(config_dir.join("smolvm").join("registries.toml"))
+        let home = dirs::home_dir()
+            .ok_or_else(|| Error::config("resolve path", "no home directory found"))?;
+        Ok(home.join(".config").join("smolvm").join("registries.toml"))
     }
 
     /// Get credentials for a registry, resolving environment variables.

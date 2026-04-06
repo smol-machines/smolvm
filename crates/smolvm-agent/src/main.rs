@@ -9,7 +9,7 @@
 //! Communication is via vsock on port 6000.
 
 use smolvm_protocol::{
-    error_codes, ports, AgentRequest, AgentResponse, ContainerInfo, RegistryAuth, LAYER_CHUNK_SIZE,
+    error_codes, ports, AgentRequest, AgentResponse, RegistryAuth, LAYER_CHUNK_SIZE,
     PROTOCOL_VERSION,
 };
 use std::io::{Read, Write};
@@ -17,7 +17,6 @@ use std::os::unix::io::AsRawFd;
 use std::process::{Child, Command, Stdio};
 use tracing::{debug, error, info, warn};
 
-mod container;
 mod crun;
 mod dns_proxy;
 mod oci;
@@ -898,17 +897,6 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
             continue;
         }
 
-        // Check if this is an interactive container exec request
-        if let AgentRequest::Exec {
-            interactive: true, ..
-        }
-        | AgentRequest::Exec { tty: true, .. } = &request
-        {
-            // Handle interactive container exec session
-            handle_interactive_container_exec(stream, request)?;
-            continue;
-        }
-
         // Handle Pull with progress streaming
         if let AgentRequest::Pull {
             ref image,
@@ -1100,53 +1088,6 @@ fn handle_request(request: AgentRequest) -> AgentResponse {
             "stdin/resize only valid during interactive session",
             error_codes::INVALID_REQUEST,
         ),
-
-        // Container lifecycle
-        AgentRequest::CreateContainer {
-            image,
-            command,
-            env,
-            workdir,
-            mounts,
-        } => handle_create_container(&image, &command, &env, workdir.as_deref(), &mounts),
-
-        AgentRequest::StartContainer { container_id } => handle_start_container(&container_id),
-
-        AgentRequest::StopContainer {
-            container_id,
-            timeout_secs,
-        } => handle_stop_container(&container_id, timeout_secs.unwrap_or(10)),
-
-        AgentRequest::DeleteContainer {
-            container_id,
-            force,
-        } => handle_delete_container(&container_id, force),
-
-        AgentRequest::ListContainers => handle_list_containers(),
-
-        AgentRequest::Exec {
-            container_id,
-            command,
-            env,
-            workdir,
-            timeout_ms,
-            interactive: false,
-            tty: false,
-        } => handle_exec(
-            &container_id,
-            &command,
-            &env,
-            workdir.as_deref(),
-            timeout_ms,
-        ),
-
-        AgentRequest::Exec { .. } => {
-            // Interactive mode should be handled by handle_interactive_container_exec
-            AgentResponse::error(
-                "interactive container exec not handled here",
-                error_codes::INTERNAL_ERROR,
-            )
-        }
 
         AgentRequest::ExportLayer { .. } => {
             // Streaming export is handled by handle_streaming_export_layer
@@ -2623,159 +2564,6 @@ fn spawn_direct_interactive_command(
 
     let child = cmd.spawn()?;
     Ok((child, None))
-}
-
-// ============================================================================
-// Container Lifecycle Handlers
-// ============================================================================
-
-fn handle_create_container(
-    image: &str,
-    command: &[String],
-    env: &[(String, String)],
-    workdir: Option<&str>,
-    mounts: &[(String, String, bool)],
-) -> AgentResponse {
-    info!(image = %image, command = ?command, "creating container");
-
-    match container::create_container(image, command, env, workdir, mounts) {
-        Ok(info) => {
-            // Also start the container immediately
-            if let Err(e) = container::start_container(&info.id) {
-                warn!(error = %e, "failed to start container after create");
-                return AgentResponse::error(
-                    format!("container created but failed to start: {}", e),
-                    error_codes::START_FAILED,
-                );
-            }
-
-            let container_info = ContainerInfo {
-                id: info.id,
-                image: info.image,
-                state: "running".to_string(),
-                created_at: info.created_at,
-                command: info.command,
-            };
-
-            AgentResponse::ok_with_data(container_info)
-        }
-        Err(e) => AgentResponse::from_err(e, error_codes::CREATE_FAILED),
-    }
-}
-
-fn handle_start_container(container_id: &str) -> AgentResponse {
-    info!(container_id = %container_id, "starting container");
-    match container::start_container(container_id) {
-        Ok(()) => AgentResponse::ok(None),
-        Err(e) => AgentResponse::from_err(e, error_codes::START_FAILED),
-    }
-}
-
-fn handle_stop_container(container_id: &str, timeout_secs: u64) -> AgentResponse {
-    info!(container_id = %container_id, timeout_secs = timeout_secs, "stopping container");
-    match container::stop_container(container_id, timeout_secs) {
-        Ok(()) => AgentResponse::ok(None),
-        Err(e) => AgentResponse::from_err(e, error_codes::STOP_FAILED),
-    }
-}
-
-fn handle_delete_container(container_id: &str, force: bool) -> AgentResponse {
-    info!(container_id = %container_id, force = force, "deleting container");
-    match container::delete_container(container_id, force) {
-        Ok(()) => AgentResponse::ok(None),
-        Err(e) => AgentResponse::from_err(e, error_codes::DELETE_FAILED),
-    }
-}
-
-fn handle_list_containers() -> AgentResponse {
-    let containers = container::list_containers();
-    let infos: Vec<ContainerInfo> = containers
-        .into_iter()
-        .map(|c| ContainerInfo {
-            id: c.id,
-            image: c.image,
-            state: c.state.to_string(),
-            created_at: c.created_at,
-            command: c.command,
-        })
-        .collect();
-
-    AgentResponse::ok_with_data(infos)
-}
-
-fn handle_exec(
-    container_id: &str,
-    command: &[String],
-    env: &[(String, String)],
-    workdir: Option<&str>,
-    timeout_ms: Option<u64>,
-) -> AgentResponse {
-    info!(container_id = %container_id, command = ?command, "executing in container");
-
-    match container::exec_in_container(container_id, command, env, workdir, timeout_ms) {
-        Ok(result) => AgentResponse::Completed {
-            exit_code: result.exit_code,
-            stdout: result.stdout,
-            stderr: result.stderr,
-        },
-        Err(e) => AgentResponse::from_err(e, error_codes::EXEC_FAILED),
-    }
-}
-
-/// Handle interactive container exec with streaming I/O.
-fn handle_interactive_container_exec(
-    stream: &mut impl ReadWrite,
-    request: AgentRequest,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let (container_id, command, env, workdir, timeout_ms, tty) = match request {
-        AgentRequest::Exec {
-            container_id,
-            command,
-            env,
-            workdir,
-            timeout_ms,
-            tty,
-            ..
-        } => (container_id, command, env, workdir, timeout_ms, tty),
-        _ => {
-            send_response(
-                stream,
-                &AgentResponse::error("expected Exec request", error_codes::INVALID_REQUEST),
-            )?;
-            return Ok(());
-        }
-    };
-
-    info!(container_id = %container_id, command = ?command, tty = tty, "starting interactive container exec");
-
-    // Spawn the interactive exec process
-    let mut child = match container::spawn_interactive_exec(
-        &container_id,
-        &command,
-        &env,
-        workdir.as_deref(),
-        tty,
-    ) {
-        Ok(child) => child,
-        Err(e) => {
-            send_response(
-                stream,
-                &AgentResponse::from_err(e, error_codes::EXEC_FAILED),
-            )?;
-            return Ok(());
-        }
-    };
-
-    // Send Started response
-    send_response(stream, &AgentResponse::Started)?;
-
-    // Run the interactive I/O loop
-    let exit_code = run_interactive_loop(stream, &mut child, timeout_ms)?;
-
-    // Send Exited response
-    send_response(stream, &AgentResponse::Exited { exit_code })?;
-
-    Ok(())
 }
 
 /// Send a response to the client.

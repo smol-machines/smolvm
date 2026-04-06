@@ -1,7 +1,6 @@
 //! CLI command implementations.
 
 pub mod config;
-pub mod container;
 pub mod internal_boot;
 pub mod machine;
 pub mod openapi;
@@ -13,19 +12,6 @@ pub mod smolfile;
 pub mod vm_common;
 
 use std::io::Write;
-
-// ============================================================================
-// Display Constants
-// ============================================================================
-
-/// Display width for container IDs (first 12 characters).
-pub const CONTAINER_ID_WIDTH: usize = 12;
-
-/// Display width for image names.
-pub const IMAGE_NAME_WIDTH: usize = 18;
-
-/// Display width for command strings.
-pub const COMMAND_WIDTH: usize = 28;
 
 // ============================================================================
 // Display Helpers
@@ -42,15 +28,6 @@ pub fn truncate(s: &str, max: usize) -> String {
         "...".to_string()
     } else {
         format!("{}...", &s[..max - 3])
-    }
-}
-
-/// Truncate a container ID for display (first 12 characters).
-pub fn truncate_id(id: &str) -> &str {
-    if id.len() > CONTAINER_ID_WIDTH {
-        &id[..CONTAINER_ID_WIDTH]
-    } else {
-        id
     }
 }
 

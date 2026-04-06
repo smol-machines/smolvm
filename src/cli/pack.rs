@@ -588,29 +588,28 @@ impl PackCreateCmd {
 
     /// Find the agent rootfs directory.
     ///
-    /// Search order:
+    /// Resolution order:
     /// 1. Explicit `--rootfs-dir` flag
-    /// 2. `SMOLVM_AGENT_ROOTFS` env var (same as VM boot path)
-    /// 3. Build output (`target/agent-rootfs`)
-    /// 4. Next to the executable (`exe-dir/agent-rootfs`)
-    /// 5. User data dir (`~/Library/Application Support/smolvm/agent-rootfs`)
+    /// 2. `SMOLVM_AGENT_ROOTFS` env var
+    /// 3. Installed location (`~/.local/share/smolvm/agent-rootfs` on Linux,
+    ///    `~/Library/Application Support/smolvm/agent-rootfs` on macOS)
+    ///
+    /// `target/agent-rootfs` is NOT checked — it can contain stale builds.
+    /// Use `--rootfs-dir` or `SMOLVM_AGENT_ROOTFS` env var to override.
     fn find_rootfs_dir(&self) -> smolvm::Result<PathBuf> {
         if let Some(ref dir) = self.rootfs_dir {
             return Ok(dir.clone());
         }
 
-        // Check common locations
         let candidates = [
-            // SMOLVM_AGENT_ROOTFS env var (consistent with VM boot path)
+            // SMOLVM_AGENT_ROOTFS env var
             std::env::var("SMOLVM_AGENT_ROOTFS").ok().map(PathBuf::from),
-            // Build output
-            Some(PathBuf::from("target/agent-rootfs")),
-            // Distribution
+            // Installed location (canonical)
+            dirs::data_dir().map(|d| d.join("smolvm/agent-rootfs")),
+            // Next to the executable (for distribution tarballs)
             std::env::current_exe()
                 .ok()
                 .and_then(|p| p.parent().map(|d| d.join("agent-rootfs"))),
-            // User data dir
-            dirs::data_dir().map(|d| d.join("smolvm/agent-rootfs")),
         ];
 
         for candidate in candidates.into_iter().flatten() {

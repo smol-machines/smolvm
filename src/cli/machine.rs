@@ -408,17 +408,14 @@ impl RunCmd {
         let env = parse_env_list(&params.env);
         let mount_bindings = mounts_to_virtiofs_bindings(&mounts);
 
-        // Two modes: container (with image) or bare VM (no image)
+        // Two modes: with image or bare VM (no image)
         if let Some(ref img) = image {
-            // Container mode
             if self.detach {
-                let info = client.create_container(
-                    img,
-                    command,
-                    env,
-                    params.workdir.clone(),
-                    mount_bindings,
-                )?;
+                // Detach mode: persist the record with image info.
+                // The VM is already running. The image will be pulled and
+                // command started on subsequent `machine start` if stopped/restarted.
+                // For now, pull the image so it's cached for exec.
+                crate::cli::pull_with_progress(&mut client, img, self.oci_platform.as_deref())?;
 
                 {
                     use smolvm::config::SmolvmConfig;
@@ -459,12 +456,9 @@ impl RunCmd {
                     }
                 }
 
-                println!("Machine running (container: {})", &info.id[..12]);
+                println!("Machine running in background");
                 println!("\nTo interact:");
-                println!(
-                    "  smolvm container exec --container {} -- <command>",
-                    &info.id[..12]
-                );
+                println!("  smolvm machine exec -- <command>");
                 println!("\nTo stop:");
                 println!("  smolvm machine stop");
 
@@ -650,27 +644,62 @@ impl ExecCmd {
 
         let env = parse_env_list(&self.env);
 
-        // Run command directly in VM
-        if self.interactive || self.tty {
-            let exit_code = client.vm_exec_interactive(
+        // Check if this machine has an image — if so, exec inside the image's
+        // rootfs via client.run() instead of bare vm_exec().
+        let record_image = {
+            let name = self.name.clone().unwrap_or_else(|| "default".to_string());
+            smolvm::db::SmolvmDb::open()
+                .ok()
+                .and_then(|db| db.get_vm(&name).ok().flatten())
+                .and_then(|r| r.image.clone())
+        };
+
+        if let Some(ref image) = record_image {
+            // Image-based machine: exec inside the image's rootfs via crun.
+            let mount_bindings = vec![]; // mounts were set at create time
+            if self.interactive || self.tty {
+                let config = smolvm::agent::RunConfig::new(image, self.command.clone())
+                    .with_env(env)
+                    .with_workdir(self.workdir.clone())
+                    .with_mounts(mount_bindings)
+                    .with_timeout(self.timeout)
+                    .with_tty(self.tty);
+                let exit_code = client.run_interactive(config)?;
+                manager.detach();
+                std::process::exit(exit_code);
+            }
+
+            let (exit_code, stdout, stderr) = client.run_with_mounts_and_timeout(
+                image,
+                self.command.clone(),
+                env,
+                self.workdir.clone(),
+                mount_bindings,
+                self.timeout,
+            )?;
+            vm_common::print_output_and_exit(&manager, exit_code, &stdout, &stderr);
+        } else {
+            // Bare VM: exec directly in the VM rootfs.
+            if self.interactive || self.tty {
+                let exit_code = client.vm_exec_interactive(
+                    self.command.clone(),
+                    env,
+                    self.workdir.clone(),
+                    self.timeout,
+                    self.tty,
+                )?;
+                manager.detach();
+                std::process::exit(exit_code);
+            }
+
+            let (exit_code, stdout, stderr) = client.vm_exec(
                 self.command.clone(),
                 env,
                 self.workdir.clone(),
                 self.timeout,
-                self.tty,
             )?;
-            manager.detach();
-            std::process::exit(exit_code);
+            vm_common::print_output_and_exit(&manager, exit_code, &stdout, &stderr);
         }
-
-        let (exit_code, stdout, stderr) = client.vm_exec(
-            self.command.clone(),
-            env,
-            self.workdir.clone(),
-            self.timeout,
-        )?;
-
-        vm_common::print_output_and_exit(&manager, exit_code, &stdout, &stderr);
     }
 }
 

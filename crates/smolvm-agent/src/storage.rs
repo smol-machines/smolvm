@@ -1879,8 +1879,11 @@ fn run_with_crun(
         "running container with crun"
     );
 
-    // Spawn the container using CrunCommand
+    // Spawn the container using CrunCommand.
+    // stdin_null() is critical: without it, crun inherits the agent's vsock
+    // stdin, and /bin/sh reads protocol bytes instead of user input, hanging.
     let mut child = CrunCommand::run(bundle_dir, container_id)
+        .stdin_null()
         .capture_output()
         .spawn()
         .map_err(|e| {

@@ -134,27 +134,6 @@ pub fn print_output_and_exit(
     std::process::exit(exit_code);
 }
 
-/// Get the agent manager for a VM by name, auto-starting it if not running.
-///
-/// Unlike [`ensure_running_and_connect`] which errors if the VM isn't running,
-/// this calls `ensure_running()` to start the VM on demand. Used by container
-/// commands that need the VM to be available.
-pub fn get_or_start_vm(name: &str) -> smolvm::Result<AgentManager> {
-    let name_opt = if name == "default" {
-        None
-    } else {
-        Some(name.to_string())
-    };
-    let manager = get_vm_manager(&name_opt)?;
-
-    if manager.try_connect_existing().is_none() {
-        println!("Starting machine '{}'...", name);
-        manager.ensure_running()?;
-    }
-
-    Ok(manager)
-}
-
 // ============================================================================
 // Create
 // ============================================================================
@@ -343,7 +322,7 @@ pub fn create_vm(kind: VmKind, params: CreateVmParams) -> smolvm::Result<()> {
         kind.label(),
     );
     println!(
-        "Then use 'smolvm container create -m {} --image <image>' to run containers",
+        "Then use 'smolvm machine exec --name {} -- <command>' to run commands",
         params.name
     );
 
@@ -457,41 +436,17 @@ pub fn start_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
         let mut client = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
 
         println!("Pulling {}...", image);
-        let image_info = crate::cli::pull_with_progress(&mut client, image, None)?;
+        let _image_info = crate::cli::pull_with_progress(&mut client, image, None)?;
 
-        // Build command: record (from Smolfile) > image metadata > idle default
-        let ep = if !record.entrypoint.is_empty() {
-            record.entrypoint.clone()
-        } else {
-            image_info.entrypoint.clone()
-        };
-        let args = if !record.cmd.is_empty() {
-            record.cmd.clone()
-        } else {
-            image_info.cmd.clone()
-        };
-        let mut command = ep;
-        command.extend(args);
-        if command.is_empty() {
-            command = smolvm::DEFAULT_IDLE_CMD
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
-        }
-
-        let env = record.env.clone();
-        let mount_bindings =
-            crate::cli::parsers::mounts_to_virtiofs_bindings(&record.host_mounts());
-
-        let info =
-            client.create_container(image, command, env, record.workdir.clone(), mount_bindings)?;
+        // Image is pulled and cached. The VM is running and ready for
+        // `machine exec` commands. No background process is started — the
+        // VM sits idle until the user execs into it.
 
         println!(
-            "{} '{}' running (PID: {}, container: {})",
+            "{} '{}' running (PID: {})",
             kind.display_name(),
             name,
-            pid.unwrap_or(0),
-            &info.id[..12]
+            pid.unwrap_or(0)
         );
     } else {
         // No image — bare VM mode. Run entrypoint+cmd if configured.
