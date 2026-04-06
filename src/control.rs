@@ -1,11 +1,7 @@
-//! Public-facing VM lifecycle operations.
+//! VM lifecycle operations.
 //!
-//! These standalone functions implement the core business logic for VM
-//! management. They are stateless — each takes a `&SmolvmDb` and returns
-//! results using the public `MicroVm` / `VmHandle` types from `data::vm`.
-//!
-//! CLI calls these directly. The `Smolvm` struct (in `smolvm.rs`) wraps
-//! them with a registry cache for SDKs and the API server.
+//! DB-backed operations take a `&SmolvmDb`. Runtime connection helpers return
+//! `VmHandle`, which owns process management and lazy agent access.
 
 use crate::data::disk::{Overlay, Storage, DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
 use crate::data::mount::HostMount;
@@ -20,21 +16,17 @@ use crate::internal::storage::expand_disk;
 use smolvm_protocol::{ImageInfo, StorageStatus};
 use std::time::Duration;
 
-/// Opaque handle to a running VM.
-///
-/// Wraps an `AgentManager` and lazily connects an `AgentClient`. Callers can:
-/// - use selected CLI-facing AgentClient operations through the handle
-/// - `detach()` — release the handle so the VM process survives
+/// Handle to a running VM process with lazy access to the guest agent.
 pub struct VmHandle {
     pub(crate) manager: AgentManager,
     pub(crate) client: Option<AgentClient>,
-    /// Whether this VM was freshly started (vs already running and reconnected).
+    /// Whether this handle started the VM instead of reconnecting to it.
     freshly_started: bool,
 }
 
 #[allow(missing_docs)]
 impl VmHandle {
-    /// Whether the VM was freshly started by this call (vs already running).
+    /// Whether this handle started the VM instead of reconnecting to it.
     pub fn freshly_started(&self) -> bool { self.freshly_started }
 
     fn client_mut(&mut self) -> Result<&mut AgentClient> {
@@ -177,12 +169,11 @@ impl VmHandle {
     }
 
     /// Detach the VM process so it survives after this handle is dropped.
-    /// Consumes the handle.
     pub fn detach(self) {
         self.manager.detach();
     }
 
-    /// Get the vsock socket path (needed for AgentClient::connect_with_retry).
+    /// Get the guest agent vsock socket path.
     pub fn vsock_socket(&self) -> &std::path::Path {
         self.manager.vsock_socket()
     }
@@ -192,29 +183,26 @@ impl VmHandle {
         self.manager.child_pid()
     }
 
-    /// Get the underlying AgentManager storage path.
+    /// Get the VM storage disk path.
     pub fn storage_path(&self) -> std::path::PathBuf {
         self.manager.storage_path().to_path_buf()
     }
 
-    /// Get the underlying AgentManager overlay path.
+    /// Get the VM overlay disk path.
     pub fn overlay_path(&self) -> std::path::PathBuf {
         self.manager.overlay_path().to_path_buf()
     }
 }
 
 // ============================================================================
-// Name validation
-// ============================================================================
-
-// ============================================================================
-// Connect to running VM
+// VM connection
 // ============================================================================
 
 /// Connect to a VM by name.
 ///
 /// This function does not read the database. Callers are responsible for
-/// checking persistence separately before connecting.
+/// checking persistence separately before connecting. If `auto_start_vm` is
+/// true, the VM is started with the default manager config when needed.
 pub fn connect_vm(name: &str, auto_start_vm: bool) -> Result<VmHandle> {
     let manager = AgentManager::for_vm(name)
         .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
@@ -313,7 +301,6 @@ pub fn validate_name(name: &str) -> Result<()> {
 pub fn create_vm(db: &SmolvmDb, vm: MicroVm) -> Result<MicroVm> {
     validate_name(&vm.name)?;
 
-    // Check for duplicates
     if db.get_vm(&vm.name)?.is_some() {
         return Err(Error::config(
             "create vm",
@@ -321,11 +308,9 @@ pub fn create_vm(db: &SmolvmDb, vm: MicroVm) -> Result<MicroVm> {
         ));
     }
 
-    // Convert to VmRecord and persist
     let record = convert::vm_to_record(&vm);
     db.insert_vm(&vm.name, &record)?;
 
-    // Return with status populated
     Ok(convert::record_to_vm(&record))
 }
 
@@ -343,8 +328,7 @@ pub fn list_vms(db: &SmolvmDb) -> Result<Vec<MicroVm>> {
     Ok(records.into_iter().map(|(_, r)| convert::record_to_vm(&r)).collect())
 }
 
-/// Start a VM. Reads its config from the DB, creates an AgentManager,
-/// ensures the VM process is running, and persists the Running state.
+/// Start a VM from persisted DB config and persist the Running state.
 ///
 /// Returns a `VmHandle` with `freshly_started()` indicating whether the
 /// VM was just booted (true) or was already running and reconnected (false).
@@ -384,7 +368,6 @@ pub fn start_vm(db: &SmolvmDb, name: &str) -> Result<VmHandle> {
         .ensure_running_with_full_config(mounts, ports, resources, features)
         .map_err(|e| Error::agent("start vm", e.to_string()))?;
 
-    // Persist running state
     let pid = manager.child_pid();
     let pid_start_time = pid.and_then(process_start_time);
     if let Err(e) = db.update_vm(name, |r| {
@@ -402,8 +385,7 @@ pub fn start_vm(db: &SmolvmDb, name: &str) -> Result<VmHandle> {
     })
 }
 
-/// Stop a VM. Creates an AgentManager on demand, stops the process,
-/// and persists the Stopped state.
+/// Stop a running VM and persist the Stopped state.
 ///
 /// Returns an error if the VM is not found or not running.
 pub fn stop_vm(db: &SmolvmDb, name: &str) -> Result<()> {
@@ -411,7 +393,6 @@ pub fn stop_vm(db: &SmolvmDb, name: &str) -> Result<()> {
         .get_vm(name)?
         .ok_or_else(|| Error::vm_not_found(name))?;
 
-    // Check if actually running
     let actual_state = record.actual_state();
     if actual_state != RecordState::Running {
         return Err(Error::InvalidState {
@@ -423,11 +404,9 @@ pub fn stop_vm(db: &SmolvmDb, name: &str) -> Result<()> {
     let manager = AgentManager::for_vm(name)
         .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
 
-    // Reconnect if running, then stop
     manager.try_connect_existing();
     manager.stop()?;
 
-    // Persist stopped state
     if let Err(e) = db.update_vm(name, |r| {
         r.state = RecordState::Stopped;
         r.pid = None;
@@ -448,7 +427,6 @@ pub fn delete_vm(db: &SmolvmDb, name: &str, force: bool) -> Result<()> {
         .get_vm(name)?
         .ok_or_else(|| Error::vm_not_found(name))?;
 
-    // Stop if running and force is true
     if force && record.actual_state() == RecordState::Running {
         if let Ok(manager) = AgentManager::for_vm(name) {
             if let Err(e) = manager.stop() {
@@ -457,10 +435,8 @@ pub fn delete_vm(db: &SmolvmDb, name: &str, force: bool) -> Result<()> {
         }
     }
 
-    // Remove from DB
     db.remove_vm(name)?;
 
-    // Clean up data directory
     let data_dir = vm_data_dir(name);
     if data_dir.exists() {
         if let Err(e) = std::fs::remove_dir_all(&data_dir) {
@@ -482,7 +458,6 @@ pub fn resize_vm(
         .get_vm(name)?
         .ok_or_else(|| Error::vm_not_found(name))?;
 
-    // VM must be stopped or never started
     let actual_state = record.actual_state();
     match actual_state {
         RecordState::Stopped | RecordState::Created => {}
@@ -499,7 +474,6 @@ pub fn resize_vm(
     let target_storage = new_storage_gib.unwrap_or(current_storage);
     let target_overlay = new_overlay_gib.unwrap_or(current_overlay);
 
-    // No shrinking
     if target_storage < current_storage {
         return Err(Error::config(
             "resize",
@@ -522,7 +496,6 @@ pub fn resize_vm(
     let manager = AgentManager::for_vm(name)
         .map_err(|e| Error::agent("get agent manager", e.to_string()))?;
 
-    // Expand disks
     if let Some(s) = new_storage_gib {
         if s > current_storage {
             expand_disk::<Storage>(manager.storage_path(), s)
@@ -536,7 +509,6 @@ pub fn resize_vm(
         }
     }
 
-    // Persist new sizes
     db.update_vm(name, |r| {
         if let Some(s) = new_storage_gib {
             r.storage_gb = Some(s);
