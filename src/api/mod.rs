@@ -24,7 +24,7 @@ pub mod types;
 pub mod validation;
 
 use axum::{
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Router,
 };
 use std::sync::Arc;
@@ -53,7 +53,8 @@ use state::ApiState;
         (name = "Machines", description = "Machine lifecycle management"),
         (name = "Execution", description = "Command execution in machines"),
         (name = "Logs", description = "Log streaming"),
-        (name = "Images", description = "OCI image management")
+        (name = "Images", description = "OCI image management"),
+        (name = "Files", description = "File upload and download")
     ),
     paths(
         // Health
@@ -62,6 +63,9 @@ use state::ApiState;
         handlers::exec::exec_command,
         handlers::exec::run_command,
         handlers::exec::stream_logs,
+        // Files
+        handlers::files::upload_file,
+        handlers::files::download_file,
         // Images
         handlers::images::list_images,
         handlers::images::pull_image,
@@ -135,6 +139,9 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         // Exec routes
         .route("/:id/exec", post(handlers::exec::exec_command))
         .route("/:id/run", post(handlers::exec::run_command))
+        // File I/O routes
+        .route("/:id/files/*path", put(handlers::files::upload_file))
+        .route("/:id/files/*path", get(handlers::files::download_file))
         // Image routes
         .route("/:id/images", get(handlers::images::list_images))
         .route("/:id/images/pull", post(handlers::images::pull_image))

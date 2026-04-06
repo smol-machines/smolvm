@@ -99,6 +99,9 @@ pub enum MachineCmd {
     /// Remove unused images and layers to free disk space
     Prune(PruneCmd),
 
+    /// Copy files between host and machine
+    Cp(CpCmd),
+
     /// Monitor a machine with health checks and restart policy
     Monitor(MonitorCmd),
 
@@ -121,6 +124,7 @@ impl MachineCmd {
             MachineCmd::Resize(cmd) => cmd.run(),
             MachineCmd::Images(cmd) => cmd.run(),
             MachineCmd::Prune(cmd) => cmd.run(),
+            MachineCmd::Cp(cmd) => cmd.run(),
             MachineCmd::Monitor(cmd) => cmd.run(),
             MachineCmd::NetworkTest(cmd) => cmd.run(),
         }
@@ -1207,6 +1211,74 @@ impl PruneCmd {
             } else {
                 println!("No unreferenced layers to remove.");
             }
+        }
+
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Cp (File Copy) Command
+// ============================================================================
+
+/// Copy files between host and a running machine.
+///
+/// Uses `machine:path` syntax to specify the remote side.
+///
+/// Examples:
+///   smolvm machine cp ./script.py myvm:/workspace/script.py    # upload
+///   smolvm machine cp myvm:/workspace/output.json ./output.json # download
+#[derive(Args, Debug)]
+pub struct CpCmd {
+    /// Source path (local file or machine:path)
+    #[arg(value_name = "SRC")]
+    pub src: String,
+
+    /// Destination path (local file or machine:path)
+    #[arg(value_name = "DST")]
+    pub dst: String,
+}
+
+impl CpCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        // Parse src/dst to determine direction
+        let (machine_name, guest_path, local_path, is_upload) =
+            if let Some((name, path)) = self.src.split_once(':') {
+                // Download: machine:path -> local
+                (name.to_string(), path.to_string(), self.dst.clone(), false)
+            } else if let Some((name, path)) = self.dst.split_once(':') {
+                // Upload: local -> machine:path
+                (name.to_string(), path.to_string(), self.src.clone(), true)
+            } else {
+                return Err(smolvm::Error::config(
+                    "cp",
+                    "one of SRC or DST must use machine:path syntax (e.g., myvm:/workspace/file)",
+                ));
+            };
+
+        let (manager, mut client) =
+            vm_common::ensure_running_and_connect(&Some(machine_name), vm_common::VmKind::Machine)?;
+        // Detach so the VM keeps running after cp exits.
+        manager.detach();
+
+        if is_upload {
+            let data = std::fs::read(&local_path).map_err(|e| {
+                smolvm::Error::agent("read local file", format!("{}: {}", local_path, e))
+            })?;
+            let size = data.len();
+            client.write_file(&guest_path, &data, None)?;
+            eprintln!("Uploaded {} ({} bytes) -> {}", local_path, size, guest_path);
+        } else {
+            let data = client.read_file(&guest_path)?;
+            std::fs::write(&local_path, &data).map_err(|e| {
+                smolvm::Error::agent("write local file", format!("{}: {}", local_path, e))
+            })?;
+            eprintln!(
+                "Downloaded {} ({} bytes) -> {}",
+                guest_path,
+                data.len(),
+                local_path
+            );
         }
 
         Ok(())

@@ -1104,6 +1104,81 @@ fn handle_request(request: AgentRequest) -> AgentResponse {
             // Streaming export is handled by handle_streaming_export_layer
             AgentResponse::error("export layer not handled here", error_codes::INTERNAL_ERROR)
         }
+
+        AgentRequest::FileWrite { path, data, mode } => handle_file_write(&path, &data, mode),
+
+        AgentRequest::FileRead { path } => handle_file_read(&path),
+    }
+}
+
+// ============================================================================
+// File I/O Handlers
+// ============================================================================
+
+/// Write a file inside the VM filesystem.
+fn handle_file_write(path: &str, data: &[u8], mode: Option<u32>) -> AgentResponse {
+    use std::fs;
+    use std::path::Path;
+
+    // Create parent directories if needed
+    if let Some(parent) = Path::new(path).parent() {
+        if let Err(e) = fs::create_dir_all(parent) {
+            return AgentResponse::error(
+                format!("failed to create directory {}: {}", parent.display(), e),
+                error_codes::FILE_IO_FAILED,
+            );
+        }
+    }
+
+    if let Err(e) = fs::write(path, data) {
+        return AgentResponse::error(
+            format!("failed to write {}: {}", path, e),
+            error_codes::FILE_IO_FAILED,
+        );
+    }
+
+    // Set file mode if specified
+    #[cfg(unix)]
+    if let Some(m) = mode {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(m)) {
+            info!(path = %path, error = %e, "failed to set file mode (non-fatal)");
+        }
+    }
+
+    info!(path = %path, size = data.len(), "file written");
+    AgentResponse::Ok { data: None }
+}
+
+/// Read a file from the VM filesystem.
+fn handle_file_read(path: &str) -> AgentResponse {
+    use std::fs;
+
+    match fs::read(path) {
+        Ok(data) => {
+            let size = data.len() as u64;
+            // Guard against reading files larger than the frame size
+            if data.len() > MAX_MESSAGE_SIZE - 1024 {
+                return AgentResponse::error(
+                    format!(
+                        "file too large: {} bytes (max {} bytes)",
+                        data.len(),
+                        MAX_MESSAGE_SIZE - 1024
+                    ),
+                    error_codes::FILE_IO_FAILED,
+                );
+            }
+            info!(path = %path, size, "file read");
+            AgentResponse::FileData {
+                path: path.to_string(),
+                data,
+                size,
+            }
+        }
+        Err(e) => AgentResponse::error(
+            format!("failed to read {}: {}", path, e),
+            error_codes::FILE_IO_FAILED,
+        ),
     }
 }
 

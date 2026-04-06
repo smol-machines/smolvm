@@ -52,6 +52,7 @@ smolvm machine stop [--name NAME]                 # stop
 smolvm machine delete NAME [-f]                   # delete
 smolvm machine status [--name NAME]               # check state
 smolvm machine ls [--json]                        # list all
+smolvm machine cp SRC DST                         # copy files (host↔VM)
 smolvm machine monitor [--name NAME]              # foreground health + restart
 
 smolvm pack create --image IMAGE -o PATH          # package
@@ -181,6 +182,18 @@ The host SSH agent signs challenges but never sends private keys across the boun
 
 Requires `SSH_AUTH_SOCK` to be set on the host. If missing, smolvm exits with an error and remediation instructions.
 
+## File Copy
+
+Copy files between the host and a running machine using `machine:path` syntax:
+
+```bash
+# Upload a file to the VM
+smolvm machine cp ./script.py myvm:/workspace/script.py
+
+# Download a file from the VM
+smolvm machine cp myvm:/workspace/output.json ./output.json
+```
+
 ## Bare VM Mode
 
 `machine run` works without `--image` when a Smolfile provides the workload config, or for direct Alpine shell access:
@@ -224,6 +237,8 @@ POST   /api/v1/machines/:name/start        Start machine
 POST   /api/v1/machines/:name/stop         Stop machine
 DELETE /api/v1/machines/:name              Delete machine
 POST   /api/v1/machines/:name/exec         Execute command
+PUT    /api/v1/machines/:name/files/*path  Upload file
+GET    /api/v1/machines/:name/files/*path  Download file
 GET    /api/v1/machines/:name/logs         Stream logs (SSE)
 POST   /api/v1/machines/:name/images/pull  Pull OCI image
 ```

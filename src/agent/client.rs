@@ -1087,6 +1087,32 @@ impl AgentClient {
         self.send(&AgentRequest::Resize { cols, rows })
     }
 
+    // ========================================================================
+    // File I/O
+    // ========================================================================
+
+    /// Write a file into the VM.
+    pub fn write_file(&mut self, path: &str, data: &[u8], mode: Option<u32>) -> Result<()> {
+        let resp = self.request(&AgentRequest::FileWrite {
+            path: path.to_string(),
+            data: data.to_vec(),
+            mode,
+        })?;
+        expect_ok(resp, "write file")
+    }
+
+    /// Read a file from the VM.
+    pub fn read_file(&mut self, path: &str) -> Result<Vec<u8>> {
+        let resp = self.request(&AgentRequest::FileRead {
+            path: path.to_string(),
+        })?;
+        match resp {
+            AgentResponse::FileData { data, .. } => Ok(data),
+            AgentResponse::Error { message, .. } => Err(Error::agent("read file", message)),
+            _ => Err(Error::agent("read file", "unexpected response")),
+        }
+    }
+
     /// Low-level send without waiting for response (public).
     pub fn send_raw(&mut self, request: &AgentRequest) -> Result<()> {
         self.send(request)

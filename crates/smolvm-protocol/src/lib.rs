@@ -225,7 +225,27 @@ pub enum AgentRequest {
         /// New height in rows.
         rows: u16,
     },
+
     // ========================================================================
+    // File I/O
+    // ========================================================================
+    /// Write a file inside the VM.
+    FileWrite {
+        /// Absolute path in the VM filesystem.
+        path: String,
+        /// File contents.
+        #[serde(with = "base64_bytes")]
+        data: Vec<u8>,
+        /// File mode (e.g., 0o644). None = default (0644).
+        #[serde(default)]
+        mode: Option<u32>,
+    },
+
+    /// Read a file from the VM.
+    FileRead {
+        /// Absolute path in the VM filesystem.
+        path: String,
+    },
 }
 
 /// Agent response types.
@@ -308,6 +328,17 @@ pub enum AgentResponse {
         /// Whether this is the last chunk.
         done: bool,
     },
+
+    /// File contents (response to FileRead).
+    FileData {
+        /// Path that was read.
+        path: String,
+        /// File contents.
+        #[serde(with = "base64_bytes")]
+        data: Vec<u8>,
+        /// File size in bytes.
+        size: u64,
+    },
 }
 
 // ============================================================================
@@ -337,6 +368,8 @@ pub mod error_codes {
     pub const SPAWN_FAILED: &str = "SPAWN_FAILED";
     /// Mount operation failed.
     pub const MOUNT_FAILED: &str = "MOUNT_FAILED";
+    /// File I/O operation failed.
+    pub const FILE_IO_FAILED: &str = "FILE_IO_FAILED";
     /// Overlay filesystem operation failed.
     pub const OVERLAY_FAILED: &str = "OVERLAY_FAILED";
     /// Cleanup operation failed.

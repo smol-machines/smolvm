@@ -1176,4 +1176,76 @@ echo ""
 run_test "Create with --image" test_create_with_image || true
 run_test "Create with --image + env" test_create_with_image_and_env || true
 
+# =============================================================================
+# File I/O (machine cp)
+# =============================================================================
+
+test_file_upload_download() {
+    local vm_name="cp-test-$$"
+
+    # Create and start a machine
+    $SMOLVM machine create "$vm_name" 2>&1 || return 1
+    run_with_timeout 30 $SMOLVM machine start --name "$vm_name" 2>&1 || {
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+    }
+
+    # Upload a file
+    local upload_content="hello from host $(date +%s)"
+    echo "$upload_content" > /tmp/smolvm-cp-test.txt
+    $SMOLVM machine cp /tmp/smolvm-cp-test.txt "$vm_name":/tmp/uploaded.txt 2>&1 || {
+        echo "Upload failed"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        rm -f /tmp/smolvm-cp-test.txt
+        return 1
+    }
+
+    # Verify upload via exec
+    local exec_result
+    exec_result=$($SMOLVM machine exec --name "$vm_name" -- cat /tmp/uploaded.txt 2>&1) || {
+        echo "Exec after upload failed"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        rm -f /tmp/smolvm-cp-test.txt
+        return 1
+    }
+    [[ "$exec_result" == *"$upload_content"* ]] || {
+        echo "Upload content mismatch: expected '$upload_content', got '$exec_result'"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        rm -f /tmp/smolvm-cp-test.txt
+        return 1
+    }
+
+    # Create file in VM and download
+    $SMOLVM machine exec --name "$vm_name" -- sh -c "echo 'hello from VM' > /tmp/to-download.txt" 2>&1
+    $SMOLVM machine cp "$vm_name":/tmp/to-download.txt /tmp/smolvm-downloaded.txt 2>&1 || {
+        echo "Download failed"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        rm -f /tmp/smolvm-cp-test.txt /tmp/smolvm-downloaded.txt
+        return 1
+    }
+    local downloaded
+    downloaded=$(cat /tmp/smolvm-downloaded.txt)
+    [[ "$downloaded" == *"hello from VM"* ]] || {
+        echo "Download content mismatch: '$downloaded'"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        rm -f /tmp/smolvm-cp-test.txt /tmp/smolvm-downloaded.txt
+        return 1
+    }
+
+    # Cleanup
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+    rm -f /tmp/smolvm-cp-test.txt /tmp/smolvm-downloaded.txt
+}
+
+echo ""
+echo "--- File I/O (machine cp) ---"
+echo ""
+
+run_test "File upload and download" test_file_upload_download || true
+
 print_summary "Machine Tests"
