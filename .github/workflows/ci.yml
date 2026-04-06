@@ -98,6 +98,9 @@ jobs:
           - arch: x86_64
             runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+          - arch: aarch64
+            runner: ubuntu-24.04-arm64
+            target: aarch64-unknown-linux-gnu
 
     steps:
       - uses: actions/checkout@v4

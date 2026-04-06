@@ -68,7 +68,12 @@ done
 
 # Configuration
 VERSION="${VERSION:-$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)}"
-PLATFORM="$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m)"
+# Normalize architecture: aarch64 -> arm64 for consistent naming across platforms
+_ARCH="$(uname -m)"
+if [[ "$_ARCH" == "aarch64" ]]; then
+    _ARCH="arm64"
+fi
+PLATFORM="$(uname -s | tr '[:upper:]' '[:lower:]')-${_ARCH}"
 DIST_NAME="smolvm-${VERSION}-${PLATFORM}"
 DIST_DIR="dist/${DIST_NAME}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -240,12 +245,13 @@ else
     echo "Building smolvm-agent for Linux (optimized for size)..."
     if [[ "$(uname -s)" == "Linux" ]]; then
         # On Linux, build natively with musl for static linking
+        MUSL_TARGET="$(uname -m)-unknown-linux-musl"
         if command -v cargo &> /dev/null; then
-            if rustup target list --installed 2>/dev/null | grep -q musl; then
-                cargo build --profile release-small -p smolvm-agent --target x86_64-unknown-linux-musl
+            if rustup target list --installed 2>/dev/null | grep -q "$MUSL_TARGET"; then
+                cargo build --profile release-small -p smolvm-agent --target "$MUSL_TARGET"
                 # Copy to the non-target-triple path that the rest of the script expects
                 mkdir -p ./target/release-small
-                cp "./target/x86_64-unknown-linux-musl/release-small/smolvm-agent" \
+                cp "./target/${MUSL_TARGET}/release-small/smolvm-agent" \
                    "./target/release-small/smolvm-agent"
             fi
         fi

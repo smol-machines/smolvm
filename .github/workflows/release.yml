@@ -134,11 +134,16 @@ jobs:
             rootfs_arch: x86_64
             agent_arch: x86_64
             lib_dir: lib/linux-x86_64
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm64
+            rootfs_arch: aarch64
+            agent_arch: aarch64
+            lib_dir: lib/linux-aarch64
     steps:
       - uses: actions/checkout@v4
         with:
           lfs: true
-          submodules: ${{ matrix.platform == 'linux-x86_64' && 'recursive' || 'false' }}
+          submodules: ${{ startsWith(matrix.platform, 'linux-') && 'recursive' || 'false' }}
 
       - name: Pull LFS files
         run: git lfs pull
