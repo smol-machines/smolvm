@@ -527,26 +527,37 @@ fn setup_vm_overlay(
     dest: &Path,
     overlay_gb: Option<u64>,
 ) -> smolvm::Result<Option<PathBuf>> {
-    if manifest.mode != PackMode::Vm {
-        return Ok(None);
+    if manifest.mode == PackMode::Vm {
+        // VM mode: use the overlay template from the pack
+        let overlay_template = manifest
+            .assets
+            .overlay_template
+            .as_ref()
+            .map(|t| t.path.as_str());
+
+        extract::copy_overlay_template(cache_dir, overlay_template, dest, overlay_gb).map_err(
+            |e| {
+                Error::agent(
+                    "setup overlay",
+                    format!(
+                        "VM mode overlay template is missing or corrupt: {}. \
+                         Try re-packing with `smolvm pack --from-vm`.",
+                        e
+                    ),
+                )
+            },
+        )?;
+
+        return Ok(Some(dest.to_path_buf()));
     }
 
-    let overlay_template = manifest
-        .assets
-        .overlay_template
-        .as_ref()
-        .map(|t| t.path.as_str());
-
-    extract::copy_overlay_template(cache_dir, overlay_template, dest, overlay_gb).map_err(|e| {
-        Error::agent(
-            "setup overlay",
-            format!(
-                "VM mode overlay template is missing or corrupt: {}. \
-                 Try re-packing with `smolvm pack --from-vm`.",
-                e
-            ),
-        )
-    })?;
+    // OCI image mode: create a fresh overlay disk so the guest has a
+    // writable root (needed for crun to mkdir /dev, mount proc, etc.)
+    if !dest.exists() {
+        let size_gb = overlay_gb.unwrap_or(smolvm::storage::DEFAULT_OVERLAY_SIZE_GIB);
+        smolvm::storage::OverlayDisk::open_or_create_at(dest, size_gb)
+            .map_err(|e| Error::agent("create overlay disk", e.to_string()))?;
+    }
 
     Ok(Some(dest.to_path_buf()))
 }
@@ -1418,15 +1429,13 @@ fn daemon_start(
             .map_err(|e| Error::agent("create storage disk", e.to_string()))?;
     }
 
-    // Copy overlay template for VM mode (preserves existing disk on restart)
-    let overlay_daemon_path = if manifest.mode == PackMode::Vm {
+    // Create overlay disk (preserves existing disk on restart)
+    let overlay_daemon_path = {
         let overlay_path = daemon.join("overlay.raw");
         if !overlay_path.exists() {
             setup_vm_overlay(&manifest, &cache_dir, &overlay_path, args.overlay)?;
         }
         Some(overlay_path)
-    } else {
-        None
     };
 
     let vsock_path = daemon.join("agent.sock");

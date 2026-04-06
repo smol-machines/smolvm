@@ -440,10 +440,17 @@ fn setup_persistent_rootfs() {
     // subsequent boots to avoid process spawn overhead (~3-5ms).
     let resized_marker = format!("{}/.resized", OVERLAY_MOUNT);
     if !std::path::Path::new(&resized_marker).exists() {
-        let _ = std::process::Command::new("resize2fs")
+        match std::process::Command::new("resize2fs")
             .arg(OVERLAY_DEVICE)
-            .output();
-        let _ = std::fs::write(&resized_marker, "1");
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                let _ = std::fs::write(&resized_marker, "1");
+            }
+            _ => {
+                // resize2fs not found or failed — don't write marker so we retry next boot
+            }
+        }
     }
 
     // Start storage disk mount in parallel while we set up overlayfs.
@@ -717,8 +724,12 @@ fn mount_storage_disk() {
     let resize_fs = || {
         let resized_marker = format!("{}/.resized", STORAGE_MOUNT);
         if !std::path::Path::new(&resized_marker).exists() {
-            let _ = Command::new("resize2fs").arg(STORAGE_DEVICE).output();
-            let _ = std::fs::write(&resized_marker, "1");
+            match Command::new("resize2fs").arg(STORAGE_DEVICE).output() {
+                Ok(output) if output.status.success() => {
+                    let _ = std::fs::write(&resized_marker, "1");
+                }
+                _ => {} // resize2fs not found or failed — retry next boot
+            }
         }
     };
 
