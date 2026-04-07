@@ -447,6 +447,35 @@ pub fn delete_vm(db: &SmolvmDb, name: &str, force: bool) -> Result<()> {
     Ok(())
 }
 
+/// Remove generated ephemeral VM records whose process no longer exists.
+pub fn cleanup_orphaned_ephemeral_vms() {
+    let db = match SmolvmDb::open() {
+        Ok(db) => db,
+        Err(_) => return,
+    };
+
+    let records = match db.list_vms() {
+        Ok(records) => records,
+        Err(_) => return,
+    };
+
+    for (name, record) in records {
+        if !record.ephemeral {
+            continue;
+        }
+
+        let is_orphan = match record.pid {
+            Some(pid) => !crate::internal::process::is_alive(pid),
+            None => true,
+        };
+
+        if is_orphan {
+            tracing::debug!(name = %name, pid = ?record.pid, "cleaning up orphaned ephemeral VM");
+            let _ = delete_vm(&db, &name, true);
+        }
+    }
+}
+
 /// Resize a VM's disks. The VM must be stopped. Only expansion is supported.
 pub fn resize_vm(
     db: &SmolvmDb,

@@ -294,6 +294,7 @@ impl RunCmd {
         if self.ssh_agent {
             spec.ssh_agent = true;
         }
+        spec.ephemeral = !self.detach;
         if self.docker_config {
             if let Some(docker_mount) = docker_config_mount() {
                 spec.mounts.push(docker_mount);
