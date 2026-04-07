@@ -26,7 +26,6 @@ use axum::{
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::internal::agent::AgentManager;
 use crate::api::error::ApiError;
 use crate::api::state::{ApiState, MachineEntry};
 use crate::api::types::{
@@ -35,9 +34,10 @@ use crate::api::types::{
     ResizeMachineRequest, ResourceSpec,
 };
 use crate::api::validation::{validate_command, validate_resource_name};
-use crate::internal::config::{RecordState, RestartConfig, VmRecord};
 use crate::data::disk::{Overlay, Storage};
 use crate::data::mount::HostMount;
+use crate::internal::agent::AgentManager;
+use crate::internal::config::{RecordState, RestartConfig, VmRecord};
 use crate::internal::storage::expand_disk;
 
 /// Maximum machine name length.
@@ -59,9 +59,9 @@ fn resolve_machine_state(name: &str, record: &VmRecord) -> RecordState {
 
     if record.state == RecordState::Running && state == RecordState::Stopped {
         if let Ok(manager) = AgentManager::for_vm(name) {
-            if let Ok(mut client) =
-                crate::internal::agent::AgentClient::connect_with_short_timeout(manager.vsock_socket())
-            {
+            if let Ok(mut client) = crate::internal::agent::AgentClient::connect_with_short_timeout(
+                manager.vsock_socket(),
+            ) {
                 if client.ping().is_ok() {
                     return RecordState::Running;
                 }
@@ -160,7 +160,8 @@ fn shutdown_machine_process(name: &str, pid: Option<i32>, pid_start_time: Option
     let manager = AgentManager::for_vm(name).ok();
     let mut vsock_confirmed = false;
     if let Some(ref manager) = manager {
-        if let Ok(mut client) = crate::internal::agent::AgentClient::connect(manager.vsock_socket()) {
+        if let Ok(mut client) = crate::internal::agent::AgentClient::connect(manager.vsock_socket())
+        {
             vsock_confirmed = true;
             let _ = client.shutdown();
         }
@@ -193,7 +194,9 @@ fn shutdown_machine_process(name: &str, pid: Option<i32>, pid_start_time: Option
     } else {
         // No PID available — check if VM is still reachable via vsock.
         if let Some(ref manager) = manager {
-            if let Ok(mut client) = crate::internal::agent::AgentClient::connect(manager.vsock_socket()) {
+            if let Ok(mut client) =
+                crate::internal::agent::AgentClient::connect(manager.vsock_socket())
+            {
                 if client.ping().is_ok() {
                     tracing::warn!(name, "VM still reachable via vsock but no PID to signal");
                     return false;

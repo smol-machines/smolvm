@@ -153,12 +153,12 @@ pub const DEFAULT_SHELL_CMD: &str = "/bin/sh";
 pub const DEFAULT_IDLE_CMD: &[&str] = &["sleep", "infinity"];
 
 // Re-export main types for convenience
-pub use internal::agent::{AgentClient, AgentManager};
 pub use api::ApiDoc;
-pub use internal::config::{RecordState, RestartConfig, RestartPolicy, SmolvmConfig, VmRecord};
 pub use data::resources::VmResources;
-pub use internal::db::SmolvmDb;
 pub use error::{Error, Result};
+pub use internal::agent::{AgentClient, AgentManager};
+pub use internal::config::{RecordState, RestartConfig, RestartPolicy, SmolvmConfig, VmRecord};
+pub use internal::db::SmolvmDb;
 pub use internal::process::ChildProcess;
 pub use internal::registry::{RegistryAuth, RegistryConfig};
 pub use internal::vm::config::{NetworkPolicy, RootfsSource, Timeouts, VmConfig, VmId};

@@ -4,7 +4,9 @@
 //! and receiving responses.
 
 use crate::error::{Error, Result};
-use crate::internal::registry::{extract_registry, rewrite_image_registry, RegistryAuth, RegistryConfig};
+use crate::internal::registry::{
+    extract_registry, rewrite_image_registry, RegistryAuth, RegistryConfig,
+};
 use smolvm_protocol::{
     encode_message, AgentRequest, AgentResponse, ImageInfo, OverlayInfo, StorageStatus,
     MAX_FRAME_SIZE, PROTOCOL_VERSION,

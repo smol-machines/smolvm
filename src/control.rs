@@ -102,16 +102,17 @@ pub fn create_vm(db: &SmolvmDb, vm: MicroVm) -> Result<MicroVm> {
 
 /// Get a VM by name.
 pub fn get_vm(db: &SmolvmDb, name: &str) -> Result<MicroVm> {
-    let record = db
-        .get_vm(name)?
-        .ok_or_else(|| Error::vm_not_found(name))?;
+    let record = db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))?;
     Ok(convert::record_to_vm(&record))
 }
 
 /// List all persisted VMs.
 pub fn list_vms(db: &SmolvmDb) -> Result<Vec<MicroVm>> {
     let records = db.list_vms()?;
-    Ok(records.into_iter().map(|(_, r)| convert::record_to_vm(&r)).collect())
+    Ok(records
+        .into_iter()
+        .map(|(_, r)| convert::record_to_vm(&r))
+        .collect())
 }
 
 /// Update a MicroVm's spec and/or status in the DB.
@@ -225,9 +226,7 @@ pub fn connect_vm(name: &str, auto_start_vm: bool) -> Result<VmHandle> {
 ///
 /// Returns an error if the VM is not found or not running.
 pub fn stop_vm(db: &SmolvmDb, name: &str) -> Result<()> {
-    let record = db
-        .get_vm(name)?
-        .ok_or_else(|| Error::vm_not_found(name))?;
+    let record = db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))?;
 
     let actual_state = record.actual_state();
     if actual_state != RecordState::Running {
@@ -259,9 +258,7 @@ pub fn stop_vm(db: &SmolvmDb, name: &str) -> Result<()> {
 ///
 /// Does NOT prompt for confirmation — that's a CLI concern.
 pub fn delete_vm(db: &SmolvmDb, name: &str, force: bool) -> Result<()> {
-    let record = db
-        .get_vm(name)?
-        .ok_or_else(|| Error::vm_not_found(name))?;
+    let record = db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))?;
 
     if force && record.actual_state() == RecordState::Running {
         if let Ok(manager) = AgentManager::for_vm(name) {
@@ -290,9 +287,7 @@ pub fn resize_vm(
     new_storage_gib: Option<u64>,
     new_overlay_gib: Option<u64>,
 ) -> Result<()> {
-    let record = db
-        .get_vm(name)?
-        .ok_or_else(|| Error::vm_not_found(name))?;
+    let record = db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))?;
 
     let actual_state = record.actual_state();
     match actual_state {
@@ -329,8 +324,8 @@ pub fn resize_vm(
         ));
     }
 
-    let manager = AgentManager::for_vm(name)
-        .map_err(|e| Error::agent("get agent manager", e.to_string()))?;
+    let manager =
+        AgentManager::for_vm(name).map_err(|e| Error::agent("get agent manager", e.to_string()))?;
 
     if let Some(s) = new_storage_gib {
         if s > current_storage {
@@ -418,9 +413,10 @@ pub fn resolve_container_mounts(
     // Apply explicit container mount overrides
     for (host_path, guest_path, read_only) in container_mounts {
         // Find the matching VM mount by host path
-        let found = vm_mounts.iter().enumerate().find(|(_, m)| {
-            m.source.to_string_lossy() == *host_path
-        });
+        let found = vm_mounts
+            .iter()
+            .enumerate()
+            .find(|(_, m)| m.source.to_string_lossy() == *host_path);
 
         match found {
             Some((idx, _)) => {

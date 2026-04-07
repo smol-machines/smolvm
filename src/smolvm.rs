@@ -164,9 +164,9 @@ impl Smolvm {
         // Not in registry — try to start and then connect
         self.start_vm(name)?;
         let registry = self.registry.read();
-        let handle = registry.get(name).ok_or_else(|| {
-            Error::agent("connect", format!("failed to start vm '{}'", name))
-        })?;
+        let handle = registry
+            .get(name)
+            .ok_or_else(|| Error::agent("connect", format!("failed to start vm '{}'", name)))?;
         let h = handle.lock();
         h.manager.connect()
     }

@@ -1,7 +1,7 @@
 use crate::data::consts::BYTES_PER_GIB;
 use crate::data::disk::{DiskType, Overlay, Storage};
-use crate::internal::disk_utils;
 use crate::error::{Error, Result};
+use crate::internal::disk_utils;
 use serde::{Deserialize, Serialize};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};

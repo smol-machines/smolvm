@@ -25,13 +25,12 @@ use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_
 use smolvm::data::vm::{MicroVm, VmPhase, VmStatus};
 use smolvm::process::process_start_time;
 use smolvm::SmolvmDb;
-use smolvm::{DEFAULT_IDLE_CMD, DEFAULT_SHELL_CMD, Error};
+use smolvm::{Error, DEFAULT_IDLE_CMD, DEFAULT_SHELL_CMD};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-
 
 /// Resolve `--allow-cidr`, `--allow-host`, and `--outbound-localhost-only` into a CIDR list,
 /// net flag, and the original hostname list (for DNS filtering).
@@ -305,8 +304,7 @@ impl RunCmd {
     fn register_run_tracking_record(name: &str, vm: &MicroVm, pid: Option<i32>) {
         match SmolvmDb::open() {
             Ok(db) => {
-                let running_vm =
-                    Self::running_vm_record(vm, name.to_string(), true, pid, None);
+                let running_vm = Self::running_vm_record(vm, name.to_string(), true, pid, None);
                 if let Err(e) = control::update_vm(&db, &running_vm) {
                     tracing::debug!(error = %e, name, "failed to register ephemeral VM");
                 }
@@ -687,12 +685,8 @@ impl ExecCmd {
             std::process::exit(exit_code);
         }
 
-        let (exit_code, stdout, stderr) = handle.vm_exec(
-            &self.command,
-            &env,
-            self.workdir.as_deref(),
-            self.timeout,
-        )?;
+        let (exit_code, stdout, stderr) =
+            handle.vm_exec(&self.command, &env, self.workdir.as_deref(), self.timeout)?;
 
         if !stdout.is_empty() {
             print!("{}", stdout);
@@ -862,9 +856,7 @@ impl CreateCmd {
         }
         println!(
             "\nUse '{} start {}' to start the {}",
-            "smolvm machine",
-            name,
-            "machine",
+            "smolvm machine", name, "machine",
         );
         println!(
             "Then use 'smolvm machine exec --name {} -- <command>' to run commands",
@@ -944,11 +936,7 @@ impl StartCmd {
             println!("Pulling {}...", image);
             let _image_info = crate::cli::pull_with_progress(&mut handle, image, None)?;
 
-            println!(
-                "Machine '{}' running (PID: {})",
-                name,
-                pid.unwrap_or(0)
-            );
+            println!("Machine '{}' running (PID: {})", name, pid.unwrap_or(0));
         } else {
             println!("Machine '{}' running (PID: {})", name, pid.unwrap_or(0));
         }

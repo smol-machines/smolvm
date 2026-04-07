@@ -10,9 +10,9 @@ pub mod launcher_dynamic;
 mod manager;
 pub mod terminal;
 
+pub use crate::data::mount::HostMount;
 pub use crate::data::network::PortMapping;
 pub use crate::data::resources::VmResources;
-pub use crate::data::mount::HostMount;
 pub use client::{AgentClient, ExecEvent, PullOptions, ReadTimeoutGuard, RunConfig};
 pub use launcher::{find_lib_dir, launch_agent_vm, LaunchConfig, LaunchFeatures, VmDisks};
 pub use manager::{docker_config_dir, docker_config_mount, vm_data_dir, AgentManager, AgentState};

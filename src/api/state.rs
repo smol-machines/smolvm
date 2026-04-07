@@ -1,11 +1,11 @@
 //! API server state management.
 
-use crate::internal::agent::{AgentManager, PortMapping, VmResources};
 use crate::api::error::ApiError;
 use crate::api::types::{MachineInfo, MountSpec, PortSpec, ResourceSpec, RestartSpec};
-use crate::internal::config::{RecordState, RestartConfig, RestartPolicy, VmRecord};
 use crate::data::mount::HostMount;
 use crate::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
+use crate::internal::agent::{AgentManager, PortMapping, VmResources};
+use crate::internal::config::{RecordState, RestartConfig, RestartPolicy, VmRecord};
 use crate::internal::db::SmolvmDb;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};

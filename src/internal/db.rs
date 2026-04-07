@@ -6,8 +6,8 @@
 //! The database handle is cached for the lifetime of the `SmolvmDb` instance,
 //! amortising the ~3ms open + ~2-5ms close cost across all operations.
 
-use crate::internal::config::VmRecord;
 use crate::error::{Error, Result};
+use crate::internal::config::VmRecord;
 use parking_lot::Mutex;
 use redb::{Database, ReadableTable, TableDefinition, TableError};
 use std::collections::HashMap;

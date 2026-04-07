@@ -49,7 +49,9 @@ impl VmHandle {
     /// Return the cached agent client, connecting to the guest if needed.
     fn client_mut(&mut self) -> Result<&mut AgentClient> {
         if self.client.is_none() {
-            self.client = Some(AgentClient::connect_with_retry(self.manager.vsock_socket())?);
+            self.client = Some(AgentClient::connect_with_retry(
+                self.manager.vsock_socket(),
+            )?);
         }
         Ok(self.client.as_mut().expect("client initialized"))
     }

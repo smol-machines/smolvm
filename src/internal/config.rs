@@ -9,8 +9,8 @@
 
 use crate::data::network::DEFAULT_DNS;
 use crate::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
-use crate::internal::db::SmolvmDb;
 use crate::error::Result;
+use crate::internal::db::SmolvmDb;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
