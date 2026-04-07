@@ -14,7 +14,7 @@ use crate::cli::format_bytes;
 use crate::cli::parsers::{
     mounts_to_virtiofs_bindings, parse_cidr, parse_duration, parse_env_list,
 };
-use crate::cli::vm_common::{self, DeleteVmOptions, VmKind};
+use crate::cli::vm_common::{self, DeleteVmOptions};
 use clap::{Args, Subcommand};
 use smolvm::agent::{docker_config_mount, AgentClient, AgentManager, RunConfig, VmResources};
 use smolvm::data::network::PortMapping;
@@ -23,8 +23,6 @@ use smolvm::data::storage::HostMount;
 use smolvm::{DEFAULT_IDLE_CMD, DEFAULT_SHELL_CMD};
 use std::path::PathBuf;
 use std::time::Duration;
-
-const KIND: VmKind = VmKind::Machine;
 
 /// Resolve `--allow-cidr`, `--allow-host`, and `--outbound-localhost-only` into a CIDR list,
 /// net flag, and the original hostname list (for DNS filtering).
@@ -661,8 +659,7 @@ pub struct ExecCmd {
 
 impl ExecCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        let (manager, mut client) =
-            vm_common::ensure_running_and_connect(&self.name, vm_common::VmKind::Machine)?;
+        let (manager, mut client) = vm_common::ensure_running_and_connect(&self.name)?;
 
         let env = parse_env_list(&self.env);
 
@@ -878,7 +875,7 @@ impl CreateCmd {
         if self.ssh_agent {
             params.ssh_agent = true;
         }
-        vm_common::create_vm(KIND, params)
+        vm_common::create_vm(params)
     }
 }
 
@@ -899,9 +896,9 @@ pub struct StartCmd {
 impl StartCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let name = self.name.unwrap_or_else(|| "default".to_string());
-        match vm_common::start_vm_named(KIND, &name) {
+        match vm_common::start_vm_named(&name) {
             Ok(()) => Ok(()),
-            Err(smolvm::Error::VmNotFound { .. }) => vm_common::start_vm_default(KIND),
+            Err(smolvm::Error::VmNotFound { .. }) => vm_common::start_vm_default(),
             Err(e) => Err(e),
         }
     }
@@ -925,8 +922,8 @@ impl StopCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let name = vm_common::resolve_vm_name(self.name)?;
         match &name {
-            Some(name) => vm_common::stop_vm_named(KIND, name),
-            None => vm_common::stop_vm_default(KIND),
+            Some(name) => vm_common::stop_vm_named(name),
+            None => vm_common::stop_vm_default(),
         }
     }
 }
@@ -952,7 +949,6 @@ pub struct DeleteCmd {
 impl DeleteCmd {
     pub fn run(&self) -> smolvm::Result<()> {
         vm_common::delete_vm(
-            KIND,
             &self.name,
             self.force,
             DeleteVmOptions {
@@ -978,7 +974,7 @@ pub struct StatusCmd {
 
 impl StatusCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        vm_common::status_vm(KIND, &self.name, |_| {})
+        vm_common::status_vm(&self.name, |_| {})
     }
 }
 
@@ -1002,7 +998,7 @@ pub struct LsCmd {
 
 impl LsCmd {
     pub fn run(&self) -> smolvm::Result<()> {
-        vm_common::list_vms(KIND, self.verbose, self.json)
+        vm_common::list_vms(self.verbose, self.json)
     }
 }
 
@@ -1047,7 +1043,7 @@ impl ResizeCmd {
         let name = vm_common::resolve_vm_name(self.name)?;
         let name_str = name.as_deref().unwrap_or("default");
 
-        vm_common::resize_vm(KIND, name_str, self.storage, self.overlay)
+        vm_common::resize_vm(name_str, self.storage, self.overlay)
     }
 }
 
@@ -1308,8 +1304,7 @@ impl CpCmd {
                 ));
             };
 
-        let (manager, mut client) =
-            vm_common::ensure_running_and_connect(&Some(machine_name), vm_common::VmKind::Machine)?;
+        let (manager, mut client) = vm_common::ensure_running_and_connect(&Some(machine_name))?;
         // Detach so the VM keeps running after cp exits.
         manager.detach();
 
@@ -1427,7 +1422,7 @@ impl MonitorCmd {
 
         if !manager.is_process_alive() {
             println!("Machine '{}' is not running, starting...", name);
-            vm_common::start_vm_named(KIND, &name)?;
+            vm_common::start_vm_named(&name)?;
         }
 
         println!(
@@ -1541,7 +1536,7 @@ impl MonitorCmd {
 
                             if consecutive_health_failures >= health_retries {
                                 println!("  unhealthy — stopping machine for restart");
-                                let _ = vm_common::stop_vm_named(KIND, &name);
+                                let _ = vm_common::stop_vm_named(&name);
                                 continue;
                             }
                         }
@@ -1598,7 +1593,7 @@ impl MonitorCmd {
                         break;
                     }
 
-                    match vm_common::start_vm_named(KIND, &name) {
+                    match vm_common::start_vm_named(&name) {
                         Ok(()) => {
                             println!("  machine restarted");
                             last_start = std::time::Instant::now();

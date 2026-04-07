@@ -1,9 +1,8 @@
 //! Shared helpers for machine CLI commands.
 //!
 //! The `machine` subcommand exposes lifecycle commands
-//! (create, start, stop, delete, ls) with only cosmetic differences.
-//! This module provides the common implementations, parameterised by
-//! [`VmKind`].
+//! (create, start, stop, delete, ls). This module provides the common
+//! implementations used by those commands.
 
 use crate::cli::{format_pid_suffix, truncate};
 use smolvm::agent::{vm_data_dir, AgentManager};
@@ -13,38 +12,6 @@ use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_
 use smolvm::data::storage::HostMount;
 use smolvm::db::SmolvmDb;
 use smolvm::storage::{DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
-
-// ============================================================================
-// VmKind
-// ============================================================================
-
-/// VM kind for display strings.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum VmKind {
-    Machine,
-}
-
-impl VmKind {
-    /// Lowercase label used in user-facing messages.
-    pub fn label(self) -> &'static str {
-        "machine"
-    }
-
-    /// Title-case label.
-    pub fn display_name(self) -> &'static str {
-        "Machine"
-    }
-
-    /// CLI prefix for help text.
-    pub fn cli_prefix(self) -> &'static str {
-        "smolvm machine"
-    }
-
-    /// Whether the JSON list output should include the `network` field.
-    pub fn include_network_in_json(self) -> bool {
-        true
-    }
-}
 
 // ============================================================================
 // Shared helpers
@@ -92,7 +59,6 @@ pub fn vm_label(name: &Option<String>) -> String {
 /// It resolves the VM manager, checks connectivity, and establishes a client connection.
 pub fn ensure_running_and_connect(
     name: &Option<String>,
-    kind: VmKind,
 ) -> smolvm::Result<(AgentManager, smolvm::agent::AgentClient)> {
     let manager = get_vm_manager(name)?;
     let label = vm_label(name);
@@ -101,10 +67,8 @@ pub fn ensure_running_and_connect(
         return Err(smolvm::Error::agent(
             "connect",
             format!(
-                "{} '{}' is not running. Use '{} start' first.",
-                kind.label(),
-                label,
-                kind.cli_prefix(),
+                "machine '{}' is not running. Use 'smolvm machine start' first.",
+                label
             ),
         ));
     }
@@ -174,19 +138,18 @@ const MAX_NAME_LENGTH: usize = 40;
 /// Validate a machine name for CLI commands.
 ///
 /// Same rules as the API validation but returns `smolvm::Error` instead of `ApiError`.
-fn validate_name(name: &str, kind: VmKind) -> smolvm::Result<()> {
+fn validate_name(name: &str) -> smolvm::Result<()> {
     if name.is_empty() {
         return Err(smolvm::Error::config(
-            format!("create {}", kind.label()),
-            format!("{} name cannot be empty", kind.label()),
+            "create machine",
+            "machine name cannot be empty",
         ));
     }
     if name.len() > MAX_NAME_LENGTH {
         return Err(smolvm::Error::config(
-            format!("create {}", kind.label()),
+            "create machine",
             format!(
-                "{} name too long: {} characters (max {})",
-                kind.label(),
+                "machine name too long: {} characters (max {})",
                 name.len(),
                 MAX_NAME_LENGTH
             ),
@@ -195,14 +158,14 @@ fn validate_name(name: &str, kind: VmKind) -> smolvm::Result<()> {
     let first_char = name.chars().next().unwrap();
     if !first_char.is_ascii_alphanumeric() {
         return Err(smolvm::Error::config(
-            format!("create {}", kind.label()),
-            format!("{} name must start with a letter or digit", kind.label()),
+            "create machine",
+            "machine name must start with a letter or digit",
         ));
     }
     if name.ends_with('-') {
         return Err(smolvm::Error::config(
-            format!("create {}", kind.label()),
-            format!("{} name cannot end with a hyphen", kind.label()),
+            "create machine",
+            "machine name cannot end with a hyphen",
         ));
     }
     let mut prev_was_hyphen = false;
@@ -210,8 +173,8 @@ fn validate_name(name: &str, kind: VmKind) -> smolvm::Result<()> {
         if c == '-' {
             if prev_was_hyphen {
                 return Err(smolvm::Error::config(
-                    format!("create {}", kind.label()),
-                    format!("{} name cannot contain consecutive hyphens", kind.label()),
+                    "create machine",
+                    "machine name cannot contain consecutive hyphens",
                 ));
             }
             prev_was_hyphen = true;
@@ -220,8 +183,8 @@ fn validate_name(name: &str, kind: VmKind) -> smolvm::Result<()> {
         }
         if !c.is_ascii_alphanumeric() && c != '-' && c != '_' {
             return Err(smolvm::Error::config(
-                format!("create {}", kind.label()),
-                format!("{} name contains invalid character: '{}'", kind.label(), c),
+                "create machine",
+                format!("machine name contains invalid character: '{}'", c),
             ));
         }
     }
@@ -229,17 +192,17 @@ fn validate_name(name: &str, kind: VmKind) -> smolvm::Result<()> {
 }
 
 /// Create a named machine configuration (does not start it).
-pub fn create_vm(kind: VmKind, params: CreateVmParams) -> smolvm::Result<()> {
+pub fn create_vm(params: CreateVmParams) -> smolvm::Result<()> {
     // Validate name before touching the database
-    validate_name(&params.name, kind)?;
+    validate_name(&params.name)?;
 
     let mut config = SmolvmConfig::load()?;
 
     // Check if already exists
     if config.get_vm(&params.name).is_some() {
         return Err(smolvm::Error::config(
-            format!("create {}", kind.label()),
-            format!("{} '{}' already exists", kind.label(), params.name),
+            "create machine",
+            format!("machine '{}' already exists", params.name),
         ));
     }
 
@@ -304,7 +267,7 @@ pub fn create_vm(kind: VmKind, params: CreateVmParams) -> smolvm::Result<()> {
     // Store in config (persisted immediately to database)
     config.insert_vm(params.name.clone(), record)?;
 
-    println!("Created {}: {}", kind.label(), params.name);
+    println!("Created machine: {}", params.name);
     println!("  CPUs: {}, Memory: {} MiB", params.cpus, params.mem);
     if !params.volume.is_empty() {
         println!("  Mounts: {}", params.volume.len());
@@ -316,10 +279,8 @@ pub fn create_vm(kind: VmKind, params: CreateVmParams) -> smolvm::Result<()> {
         println!("  Init commands: {}", params.init.len());
     }
     println!(
-        "\nUse '{} start {}' to start the {}",
-        kind.cli_prefix(),
-        params.name,
-        kind.label(),
+        "\nUse 'smolvm machine start {}' to start the machine",
+        params.name
     );
     println!(
         "Then use 'smolvm machine exec --name {} -- <command>' to run commands",
@@ -338,7 +299,7 @@ pub fn create_vm(kind: VmKind, params: CreateVmParams) -> smolvm::Result<()> {
 /// Uses direct DB operations instead of SmolvmConfig::load() to avoid
 /// loading all config settings and all VM records. Only reads the single
 /// named record (1 DB cycle) and updates it after start (1 DB cycle).
-pub fn start_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
+pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
     use smolvm::Error;
 
     // Direct DB lookup — 1 read cycle instead of loading everything
@@ -349,12 +310,7 @@ pub fn start_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
     let actual_state = record.actual_state();
     if actual_state == RecordState::Running {
         let pid_suffix = format_pid_suffix(record.pid);
-        println!(
-            "{} '{}' already running{}",
-            kind.display_name(),
-            name,
-            pid_suffix
-        );
+        println!("Machine '{}' already running{}", name, pid_suffix);
         return Ok(());
     }
 
@@ -376,13 +332,7 @@ pub fn start_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
     } else {
         String::new()
     };
-    println!(
-        "Starting {} '{}'{}{}...",
-        kind.label(),
-        name,
-        mount_info,
-        port_info
-    );
+    println!("Starting machine '{}'{}{}...", name, mount_info, port_info);
 
     // Resolve SSH agent socket path if enabled
     let ssh_agent_socket = if record.ssh_agent {
@@ -406,7 +356,7 @@ pub fn start_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
 
     let _ = manager
         .ensure_running_with_full_config(mounts, ports, resources, features)
-        .map_err(|e| Error::agent(format!("start {}", kind.label()), e.to_string()))?;
+        .map_err(|e| Error::agent("start machine", e.to_string()))?;
 
     // Get PID immediately (cheap) and print output before DB write
     let pid = manager.child_pid();
@@ -442,12 +392,7 @@ pub fn start_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
         // `machine exec` commands. No background process is started — the
         // VM sits idle until the user execs into it.
 
-        println!(
-            "{} '{}' running (PID: {})",
-            kind.display_name(),
-            name,
-            pid.unwrap_or(0)
-        );
+        println!("Machine '{}' running (PID: {})", name, pid.unwrap_or(0));
     } else {
         // No image — bare VM mode. Run entrypoint+cmd if configured.
         let mut bare_cmd = record.entrypoint.clone();
@@ -468,12 +413,7 @@ pub fn start_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
                 eprintln!("workload exited with code {}", exit_code);
             }
         }
-        println!(
-            "{} '{}' running (PID: {})",
-            kind.display_name(),
-            name,
-            pid.unwrap_or(0)
-        );
+        println!("Machine '{}' running (PID: {})", name, pid.unwrap_or(0));
     }
 
     // Persist running state after output — 1 write cycle (not on critical path)
@@ -562,21 +502,17 @@ pub struct DefaultVmOverrides {
 }
 
 /// Start the default machine.
-pub fn start_vm_default(kind: VmKind) -> smolvm::Result<()> {
+pub fn start_vm_default() -> smolvm::Result<()> {
     let manager = AgentManager::new_default()?;
 
     if manager.try_connect_existing().is_some() {
         let pid_suffix = format_pid_suffix(manager.child_pid());
-        println!(
-            "{} 'default' already running{}",
-            kind.display_name(),
-            pid_suffix
-        );
+        println!("Machine 'default' already running{}", pid_suffix);
         manager.detach();
         return Ok(());
     }
 
-    println!("Starting {} 'default'...", kind.label());
+    println!("Starting machine 'default'...");
     manager.ensure_running()?;
 
     let mut config = SmolvmConfig::load()?;
@@ -608,8 +544,7 @@ pub fn start_vm_default(kind: VmKind) -> smolvm::Result<()> {
     }
 
     println!(
-        "{} 'default' running (PID: {})",
-        kind.display_name(),
+        "Machine 'default' running (PID: {})",
         manager.child_pid().unwrap_or(0)
     );
 
@@ -623,7 +558,7 @@ pub fn start_vm_default(kind: VmKind) -> smolvm::Result<()> {
 
 /// Stop a named machine that has a config record (or fall back to
 /// agent-only stop if the name is not in config).
-pub fn stop_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
+pub fn stop_vm_named(name: &str) -> smolvm::Result<()> {
     let mut config = SmolvmConfig::load()?;
 
     // Check config for the named VM
@@ -633,15 +568,11 @@ pub fn stop_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
             // Not in config — try to stop a running VM with this name directly
             let manager = AgentManager::for_vm(name)?;
             if manager.try_connect_existing().is_some() {
-                println!("Stopping {} '{}'...", kind.label(), name);
+                println!("Stopping machine '{}'...", name);
                 manager.stop()?;
-                println!("{} '{}' stopped", kind.display_name(), name);
+                println!("Machine '{}' stopped", name);
             } else {
-                println!(
-                    "{} '{}' not found or not running",
-                    kind.display_name(),
-                    name
-                );
+                println!("Machine '{}' not found or not running", name);
             }
             return Ok(());
         }
@@ -650,15 +581,13 @@ pub fn stop_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
     let actual_state = record.actual_state();
     if actual_state != RecordState::Running {
         println!(
-            "{} '{}' is not running (state: {})",
-            kind.display_name(),
-            name,
-            actual_state,
+            "Machine '{}' is not running (state: {})",
+            name, actual_state,
         );
         return Ok(());
     }
 
-    println!("Stopping {} '{}'...", kind.label(), name);
+    println!("Stopping machine '{}'...", name);
 
     let manager = AgentManager::for_vm(name)
         .map_err(|e| smolvm::Error::agent("create agent manager", e.to_string()))?;
@@ -670,18 +599,18 @@ pub fn stop_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
         r.pid_start_time = None;
     });
 
-    println!("Stopped {}: {}", kind.label(), name);
+    println!("Stopped machine: {}", name);
     Ok(())
 }
 
 /// Stop the default machine.
-pub fn stop_vm_default(kind: VmKind) -> smolvm::Result<()> {
+pub fn stop_vm_default() -> smolvm::Result<()> {
     let manager = AgentManager::new_default()?;
 
     // try_connect_existing sets internal state if agent is reachable;
     // stop() handles both responsive agents and orphans via PID file.
     manager.try_connect_existing();
-    println!("Stopping {} 'default'...", kind.label());
+    println!("Stopping machine 'default'...");
     manager.stop()?;
 
     // Update database record if it exists
@@ -693,7 +622,7 @@ pub fn stop_vm_default(kind: VmKind) -> smolvm::Result<()> {
         });
     }
 
-    println!("{} 'default' stopped", kind.display_name());
+    println!("Machine 'default' stopped");
 
     Ok(())
 }
@@ -709,12 +638,7 @@ pub struct DeleteVmOptions {
 }
 
 /// Delete a named machine configuration.
-pub fn delete_vm(
-    kind: VmKind,
-    name: &str,
-    force: bool,
-    options: DeleteVmOptions,
-) -> smolvm::Result<()> {
+pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::Result<()> {
     let mut config = SmolvmConfig::load()?;
 
     // Check if exists
@@ -726,16 +650,16 @@ pub fn delete_vm(
     // Stop if running (machine run does this)
     if options.stop_if_running && record.actual_state() == RecordState::Running {
         if let Ok(manager) = AgentManager::for_vm(name) {
-            println!("Stopping {} '{}'...", kind.label(), name);
+            println!("Stopping machine '{}'...", name);
             if let Err(e) = manager.stop() {
-                tracing::warn!(error = %e, "failed to stop {}", kind.label());
+                tracing::warn!(error = %e, "failed to stop machine");
             }
         }
     }
 
     // Confirm deletion unless --force
     if !force {
-        eprint!("Delete {} '{}'? [y/N] ", kind.label(), name);
+        eprint!("Delete machine '{}'? [y/N] ", name);
         let mut input = String::new();
         if std::io::stdin().read_line(&mut input).is_ok() {
             let input = input.trim().to_lowercase();
@@ -760,7 +684,7 @@ pub fn delete_vm(
         }
     }
 
-    println!("Deleted {}: {}", kind.label(), name);
+    println!("Deleted machine: {}", name);
     Ok(())
 }
 
@@ -772,7 +696,7 @@ pub fn delete_vm(
 ///
 /// The `extra` callback is invoked when the VM is running, allowing callers
 /// to display additional information (e.g., machine lists containers).
-pub fn status_vm<F>(kind: VmKind, name: &Option<String>, extra: F) -> smolvm::Result<()>
+pub fn status_vm<F>(name: &Option<String>, extra: F) -> smolvm::Result<()>
 where
     F: FnOnce(&AgentManager),
 {
@@ -781,11 +705,11 @@ where
 
     if manager.try_connect_existing().is_some() {
         let pid_suffix = crate::cli::format_pid_suffix(manager.child_pid());
-        println!("{} '{}': running{}", kind.display_name(), label, pid_suffix);
+        println!("Machine '{}': running{}", label, pid_suffix);
         extra(&manager);
         manager.detach();
     } else {
-        println!("{} '{}': not running", kind.display_name(), label);
+        println!("Machine '{}': not running", label);
     }
 
     Ok(())
@@ -796,7 +720,7 @@ where
 // ============================================================================
 
 /// List all machines.
-pub fn list_vms(kind: VmKind, verbose: bool, json: bool) -> smolvm::Result<()> {
+pub fn list_vms(verbose: bool, json: bool) -> smolvm::Result<()> {
     let config = SmolvmConfig::load()?;
     let vms: Vec<_> = config.list_vms().collect();
 
@@ -832,11 +756,9 @@ pub fn list_vms(kind: VmKind, verbose: bool, json: bool) -> smolvm::Result<()> {
                     "cmd": record.cmd,
                     "ephemeral": record.ephemeral,
                 });
-                if kind.include_network_in_json() {
-                    obj.as_object_mut()
-                        .unwrap()
-                        .insert("network".into(), serde_json::json!(record.network));
-                }
+                obj.as_object_mut()
+                    .unwrap()
+                    .insert("network".into(), serde_json::json!(record.network));
                 obj
             })
             .collect();
@@ -882,7 +804,7 @@ pub fn list_vms(kind: VmKind, verbose: bool, json: bool) -> smolvm::Result<()> {
                 for (host, guest) in &record.ports {
                     println!("  Port: {} -> {}", host, guest);
                 }
-                if kind.include_network_in_json() && record.network {
+                if record.network {
                     println!("  Network: enabled");
                 }
                 for cmd in &record.init {
@@ -912,7 +834,6 @@ pub fn list_vms(kind: VmKind, verbose: bool, json: bool) -> smolvm::Result<()> {
 /// The VM must be stopped before resizing. Only expansion is supported
 /// (no shrinking to prevent data loss).
 pub fn resize_vm(
-    kind: VmKind,
     name: &str,
     new_storage_gb: Option<u64>,
     new_overlay_gb: Option<u64>,
@@ -973,7 +894,7 @@ pub fn resize_vm(
         .map_err(|e| smolvm::Error::agent("get agent manager", e.to_string()))?;
 
     // Print resize header
-    println!("Resizing {} '{}'...", kind.label(), name);
+    println!("Resizing machine '{}'...", name);
 
     // Expand storage disk if requested and changed
     if let Some(storage_gb) = new_storage_gb {
@@ -1018,7 +939,7 @@ pub fn resize_vm(
     })?;
 
     println!();
-    println!("{} '{}' resized successfully.", kind.display_name(), name);
+    println!("Machine '{}' resized successfully.", name);
     println!("Disk changes are applied immediately; filesystem will expand on next boot.");
 
     Ok(())
