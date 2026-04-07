@@ -68,6 +68,7 @@ pub mod control;
 pub mod data;
 pub mod dns_filter;
 pub mod dns_filter_listener;
+mod handle;
 pub(crate) mod internal;
 /// Stateful VM orchestration for SDKs and the API server.
 mod smolvm;

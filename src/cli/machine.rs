@@ -16,16 +16,21 @@ use crate::cli::parsers::{mounts_to_virtiofs_bindings, parse_cidr, parse_env_lis
 use crate::cli::truncate;
 use clap::{Args, Subcommand};
 use smolvm::agent::{docker_config_mount, AgentClient, AgentManager};
+use smolvm::config::{RecordState, RestartPolicy};
 use smolvm::control;
 use smolvm::data::consts::DEFAULT_MACHINE_NAME;
 use smolvm::data::disk::{DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
 use smolvm::data::network::PortMapping;
 use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
-use smolvm::data::vm::MicroVm;
+use smolvm::data::vm::{MicroVm, VmPhase, VmStatus};
+use smolvm::process::process_start_time;
 use smolvm::SmolvmDb;
 use smolvm::{DEFAULT_IDLE_CMD, DEFAULT_SHELL_CMD, Error};
+use std::io::Write;
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 
 /// Resolve `--allow-cidr`, `--allow-host`, and `--outbound-localhost-only` into a CIDR list,
@@ -259,6 +264,72 @@ pub struct RunCmd {
 }
 
 impl RunCmd {
+    fn running_vm_record(
+        vm: &MicroVm,
+        name: String,
+        ephemeral: bool,
+        pid: Option<i32>,
+        created_at: Option<String>,
+    ) -> MicroVm {
+        let mut vm = vm.clone();
+        vm.name = name;
+        vm.spec.ephemeral = ephemeral;
+        vm.status = Some(VmStatus {
+            phase: VmPhase::Running,
+            pid,
+            pid_start_time: pid.and_then(process_start_time),
+            created_at: created_at.unwrap_or_else(smolvm::util::current_timestamp),
+            last_exit_code: None,
+        });
+        vm
+    }
+
+    fn persist_detached_default(vm: &MicroVm, pid: Option<i32>) {
+        match SmolvmDb::open() {
+            Ok(db) => {
+                let created_at = control::get_vm(&db, &vm.name)
+                    .ok()
+                    .and_then(|existing| existing.status.map(|s| s.created_at));
+                let running_vm =
+                    Self::running_vm_record(vm, vm.name.clone(), false, pid, created_at);
+                if let Err(e) = control::update_vm(&db, &running_vm) {
+                    tracing::warn!(error = %e, "failed to persist detached run machine");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to open db for detached run persistence");
+            }
+        }
+    }
+
+    fn register_run_tracking_record(name: &str, vm: &MicroVm, pid: Option<i32>) {
+        match SmolvmDb::open() {
+            Ok(db) => {
+                let running_vm =
+                    Self::running_vm_record(vm, name.to_string(), true, pid, None);
+                if let Err(e) = control::update_vm(&db, &running_vm) {
+                    tracing::debug!(error = %e, name, "failed to register ephemeral VM");
+                }
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, name, "failed to open db for ephemeral VM registration");
+            }
+        }
+    }
+
+    fn remove_run_tracking_record(name: &str) {
+        match SmolvmDb::open() {
+            Ok(db) => {
+                if let Err(e) = db.remove_vm(name) {
+                    tracing::debug!(error = %e, name, "failed to deregister ephemeral VM");
+                }
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, name, "failed to open db for ephemeral VM deregistration");
+            }
+        }
+    }
+
     fn to_microvm(&self, name: String) -> smolvm::Result<MicroVm> {
         let (cli_allow_cidrs, net, dns_filter_hosts) = resolve_egress_flags(
             self.allow_cidr.clone(),
@@ -294,7 +365,6 @@ impl RunCmd {
         if self.ssh_agent {
             spec.ssh_agent = true;
         }
-        spec.ephemeral = !self.detach;
         if self.docker_config {
             if let Some(docker_mount) = docker_config_mount() {
                 spec.mounts.push(docker_mount);
@@ -310,31 +380,6 @@ impl RunCmd {
         })
     }
 
-    fn generated_name(&self, db: &SmolvmDb) -> smolvm::Result<String> {
-        let prefix = if self.detach {
-            "persistent-run"
-        } else {
-            "ephemeral-run"
-        };
-        let pid = std::process::id() & 0x000f_ffff;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|e| Error::config("generate run name", e.to_string()))?
-            .as_nanos() as u64;
-
-        for attempt in 0..100u32 {
-            let name = format!("{}-{:016x}-{:05x}-{:02x}", prefix, now, pid, attempt);
-            if db.get_vm(&name)?.is_none() {
-                return Ok(name);
-            }
-        }
-
-        Err(Error::config(
-            "generate run name",
-            "failed to generate a unique VM name",
-        ))
-    }
-
     pub fn run(self) -> smolvm::Result<()> {
         if !self.interactive && !self.tty && !self.detach && self.command.is_empty() {
             return Err(smolvm::Error::config(
@@ -345,33 +390,27 @@ impl RunCmd {
             ));
         }
 
-        let db = SmolvmDb::open()?;
-        let name = self.generated_name(&db)?;
+        let name = DEFAULT_MACHINE_NAME.to_string();
         let vm = self.to_microvm(name.clone())?;
-
-        control::create_vm(&db, vm.clone())?;
 
         let mode = if self.detach {
             "persistent"
         } else {
             "ephemeral"
         };
-        println!("Starting {} machine '{}'...", mode, name);
+        println!("Starting {} machine...", mode);
 
-        let mut handle = match control::start_vm(&db, &name) {
-            Ok(handle) => handle,
-            Err(e) => {
-                let _ = control::delete_vm(&db, &name, true);
-                return Err(e);
-            }
-        };
+        let mut handle = control::start_vm_from_spec(&vm)?;
+        let freshly_started = handle.freshly_started();
+        let ephemeral_name = smolvm::util::generate_machine_name();
+        Self::register_run_tracking_record(&ephemeral_name, &vm, handle.child_pid());
 
         let image_info = if let Some(ref image) = vm.spec.image {
             match crate::cli::pull_with_progress(&mut handle, image, self.oci_platform.as_deref()) {
                 Ok(info) => Some(info),
                 Err(e) => {
-                    drop(handle);
-                    let _ = control::delete_vm(&db, &name, true);
+                    Self::remove_run_tracking_record(&ephemeral_name);
+                    let _ = handle.stop();
                     return Err(e);
                 }
             }
@@ -379,28 +418,26 @@ impl RunCmd {
             None
         };
 
-        for (i, cmd) in vm.spec.init.iter().enumerate() {
-            let argv = vec!["sh".into(), "-c".into(), cmd.clone()];
-            let (exit_code, _stdout, stderr) = match handle.vm_exec(
-                &argv,
-                &vm.spec.env,
-                vm.spec.workdir.as_deref(),
-                None,
-            ) {
-                Ok(result) => result,
-                Err(e) => {
-                    drop(handle);
-                    let _ = control::delete_vm(&db, &name, true);
-                    return Err(e);
+        if freshly_started {
+            for (i, cmd) in vm.spec.init.iter().enumerate() {
+                let argv = vec!["sh".into(), "-c".into(), cmd.clone()];
+                let (exit_code, _stdout, stderr) =
+                    match handle.vm_exec(&argv, &vm.spec.env, vm.spec.workdir.as_deref(), None) {
+                        Ok(result) => result,
+                        Err(e) => {
+                            Self::remove_run_tracking_record(&ephemeral_name);
+                            let _ = handle.stop();
+                            return Err(e);
+                        }
+                    };
+                if exit_code != 0 {
+                    Self::remove_run_tracking_record(&ephemeral_name);
+                    let _ = handle.stop();
+                    return Err(Error::agent(
+                        "init",
+                        format!("init[{}] failed (exit {}): {}", i, exit_code, stderr.trim()),
+                    ));
                 }
-            };
-            if exit_code != 0 {
-                drop(handle);
-                let _ = control::delete_vm(&db, &name, true);
-                return Err(Error::agent(
-                    "init",
-                    format!("init[{}] failed (exit {}): {}", i, exit_code, stderr.trim()),
-                ));
             }
         }
 
@@ -433,9 +470,13 @@ impl RunCmd {
             if self.detach {
                 let _ = command;
                 let _ = mount_bindings;
-                println!("Machine '{}' running in background", name);
+                Self::persist_detached_default(&vm, handle.child_pid());
+
+                println!("Machine running in background");
+                println!("\nTo interact:");
+                println!("  smolvm machine exec -- <command>");
                 println!("\nTo stop:");
-                println!("  smolvm machine stop --name {}", name);
+                println!("  smolvm machine stop");
 
                 handle.detach();
                 Ok(())
@@ -472,12 +513,9 @@ impl RunCmd {
                         })
                 };
 
-                drop(handle);
-                if let Err(e) = control::stop_vm(&db, &name) {
+                Self::remove_run_tracking_record(&ephemeral_name);
+                if let Err(e) = handle.stop() {
                     tracing::warn!(error = %e, "failed to stop machine");
-                }
-                if let Err(e) = control::delete_vm(&db, &name, true) {
-                    tracing::warn!(error = %e, "failed to delete ephemeral machine");
                 }
                 let exit_code = run_result?;
                 std::process::exit(exit_code);
@@ -493,15 +531,19 @@ impl RunCmd {
                 if let Err(e) =
                     handle.vm_exec_background(&command, &vm.spec.env, vm.spec.workdir.as_deref())
                 {
-                    drop(handle);
-                    let _ = control::delete_vm(&db, &name, true);
+                    Self::remove_run_tracking_record(&ephemeral_name);
+                    let _ = handle.stop();
                     return Err(e);
                 }
             }
 
-            println!("Machine '{}' running in background", name);
+            Self::persist_detached_default(&vm, handle.child_pid());
+
+            println!("Machine running (PID: {})", handle.child_pid().unwrap_or(0));
+            println!("\nTo interact:");
+            println!("  smolvm machine exec -- <command>");
             println!("\nTo stop:");
-            println!("  smolvm machine stop --name {}", name);
+            println!("  smolvm machine stop");
 
             handle.detach();
             Ok(())
@@ -534,12 +576,9 @@ impl RunCmd {
                     })
             };
 
-            drop(handle);
-            if let Err(e) = control::stop_vm(&db, &name) {
+            Self::remove_run_tracking_record(&ephemeral_name);
+            if let Err(e) = handle.stop() {
                 tracing::warn!(error = %e, "failed to stop machine");
-            }
-            if let Err(e) = control::delete_vm(&db, &name, true) {
-                tracing::warn!(error = %e, "failed to delete ephemeral machine");
             }
             let exit_code = run_result?;
             std::process::exit(exit_code);
@@ -615,12 +654,10 @@ impl ExecCmd {
             for event in events {
                 match event {
                     smolvm::agent::ExecEvent::Stdout(data) => {
-                        use std::io::Write;
                         let _ = std::io::stdout().write_all(&data);
                         let _ = std::io::stdout().flush();
                     }
                     smolvm::agent::ExecEvent::Stderr(data) => {
-                        use std::io::Write;
                         let _ = std::io::stderr().write_all(&data);
                         let _ = std::io::stderr().flush();
                     }
@@ -989,7 +1026,7 @@ impl DeleteCmd {
         }
 
         control::delete_vm(&db, &self.name, true)?;
-        println!("Deleted {}: {}", "machine", self.name);
+        println!("Deleted machine: {}", self.name);
         Ok(())
     }
 }
@@ -1544,12 +1581,6 @@ pub struct MonitorCmd {
 
 impl MonitorCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        use smolvm::config::{RecordState, RestartPolicy};
-        use smolvm::db::SmolvmDb;
-        use smolvm::Error;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Arc;
-
         let name = self.name.unwrap_or_else(|| "default".to_string());
 
         // Load machine config from DB

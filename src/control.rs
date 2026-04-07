@@ -7,227 +7,13 @@ use crate::data::disk::{Overlay, Storage, DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STOR
 use crate::data::mount::HostMount;
 use crate::data::vm::MicroVm;
 use crate::error::{Error, Result};
+pub use crate::handle::VmHandle;
 use crate::internal::agent::{vm_data_dir, AgentClient, AgentManager, LaunchFeatures};
 use crate::internal::config::RecordState;
 use crate::internal::convert;
 use crate::internal::db::SmolvmDb;
 use crate::internal::process::process_start_time;
 use crate::internal::storage::expand_disk;
-use smolvm_protocol::{ImageInfo, StorageStatus};
-use std::time::Duration;
-
-/// Handle to a running VM process with lazy access to the guest agent.
-pub struct VmHandle {
-    pub(crate) manager: AgentManager,
-    pub(crate) client: Option<AgentClient>,
-    /// Whether this handle started the VM instead of reconnecting to it.
-    freshly_started: bool,
-}
-
-#[allow(missing_docs)]
-impl VmHandle {
-    /// Whether this handle started the VM instead of reconnecting to it.
-    pub fn freshly_started(&self) -> bool { self.freshly_started }
-
-    fn client_mut(&mut self) -> Result<&mut AgentClient> {
-        if self.client.is_none() {
-            self.client = Some(AgentClient::connect_with_retry(self.manager.vsock_socket())?);
-        }
-        Ok(self.client.as_mut().expect("client initialized"))
-    }
-
-    pub fn pull_with_registry_config_and_progress<F: FnMut(usize, usize, &str)>(
-        &mut self,
-        image: &str,
-        oci_platform: Option<&str>,
-        on_progress: F,
-    ) -> Result<ImageInfo> {
-        self.client_mut()?
-            .pull_with_registry_config_and_progress(image, oci_platform, on_progress)
-    }
-
-    pub fn vm_exec(
-        &mut self,
-        command: &[String],
-        env: &[(String, String)],
-        workdir: Option<&str>,
-        timeout: Option<Duration>,
-    ) -> Result<(i32, String, String)> {
-        self.client_mut()?.vm_exec(
-            command.to_vec(),
-            env.to_vec(),
-            workdir.map(str::to_string),
-            timeout,
-        )
-    }
-
-    pub fn vm_exec_interactive(
-        &mut self,
-        command: &[String],
-        env: &[(String, String)],
-        workdir: Option<&str>,
-        timeout: Option<Duration>,
-        tty: bool,
-    ) -> Result<i32> {
-        self.client_mut()?.vm_exec_interactive(
-            command.to_vec(),
-            env.to_vec(),
-            workdir.map(str::to_string),
-            timeout,
-            tty,
-        )
-    }
-
-    pub fn vm_exec_background(
-        &mut self,
-        command: &[String],
-        env: &[(String, String)],
-        workdir: Option<&str>,
-    ) -> Result<u32> {
-        self.client_mut()?.vm_exec_background(
-            command.to_vec(),
-            env.to_vec(),
-            workdir.map(str::to_string),
-        )
-    }
-
-    pub fn vm_exec_streaming(
-        &mut self,
-        command: &[String],
-        env: &[(String, String)],
-        workdir: Option<&str>,
-        timeout: Option<Duration>,
-    ) -> Result<Vec<crate::internal::agent::ExecEvent>> {
-        self.client_mut()?.vm_exec_streaming(
-            command.to_vec(),
-            env.to_vec(),
-            workdir.map(str::to_string),
-            timeout,
-        )
-    }
-
-    pub fn run_with_mounts_and_timeout(
-        &mut self,
-        image: &str,
-        command: &[String],
-        env: &[(String, String)],
-        workdir: Option<&str>,
-        mounts: &[(String, String, bool)],
-        timeout: Option<Duration>,
-    ) -> Result<(i32, String, String)> {
-        self.client_mut()?.run_with_mounts_and_timeout(
-            image,
-            command.to_vec(),
-            env.to_vec(),
-            workdir.map(str::to_string),
-            mounts.to_vec(),
-            timeout,
-        )
-    }
-
-    pub fn run_interactive(
-        &mut self,
-        image: &str,
-        command: &[String],
-        env: &[(String, String)],
-        workdir: Option<&str>,
-        mounts: &[(String, String, bool)],
-        timeout: Option<Duration>,
-        tty: bool,
-    ) -> Result<i32> {
-        let config = crate::internal::agent::RunConfig::new(image, command.to_vec())
-            .with_env(env.to_vec())
-            .with_workdir(workdir.map(str::to_string))
-            .with_mounts(mounts.to_vec())
-            .with_timeout(timeout)
-            .with_tty(tty);
-        self.client_mut()?.run_interactive(config)
-    }
-
-    pub fn write_file(&mut self, path: &str, data: &[u8], mode: Option<u32>) -> Result<()> {
-        self.client_mut()?.write_file(path, data, mode)
-    }
-
-    pub fn read_file(&mut self, path: &str) -> Result<Vec<u8>> {
-        self.client_mut()?.read_file(path)
-    }
-
-    pub fn network_test(&mut self, url: &str) -> Result<serde_json::Value> {
-        self.client_mut()?.network_test(url)
-    }
-
-    pub fn storage_status(&mut self) -> Result<StorageStatus> {
-        self.client_mut()?.storage_status()
-    }
-
-    pub fn list_images(&mut self) -> Result<Vec<ImageInfo>> {
-        self.client_mut()?.list_images()
-    }
-
-    pub fn garbage_collect(&mut self, dry_run: bool) -> Result<u64> {
-        self.client_mut()?.garbage_collect(dry_run)
-    }
-
-    /// Detach the VM process so it survives after this handle is dropped.
-    pub fn detach(self) {
-        self.manager.detach();
-    }
-
-    /// Get the guest agent vsock socket path.
-    pub fn vsock_socket(&self) -> &std::path::Path {
-        self.manager.vsock_socket()
-    }
-
-    /// Get the child PID if available.
-    pub fn child_pid(&self) -> Option<i32> {
-        self.manager.child_pid()
-    }
-
-    /// Get the VM storage disk path.
-    pub fn storage_path(&self) -> std::path::PathBuf {
-        self.manager.storage_path().to_path_buf()
-    }
-
-    /// Get the VM overlay disk path.
-    pub fn overlay_path(&self) -> std::path::PathBuf {
-        self.manager.overlay_path().to_path_buf()
-    }
-}
-
-// ============================================================================
-// VM connection
-// ============================================================================
-
-/// Connect to a VM by name.
-///
-/// This function does not read the database. Callers are responsible for
-/// checking persistence separately before connecting. If `auto_start_vm` is
-/// true, the VM is started with the default manager config when needed.
-pub fn connect_vm(name: &str, auto_start_vm: bool) -> Result<VmHandle> {
-    let manager = AgentManager::for_vm(name)
-        .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
-
-    let freshly_started = if manager.try_connect_existing().is_none() {
-        if !auto_start_vm {
-            return Err(Error::agent(
-                "connect",
-                format!("machine '{}' is not running", name),
-            ));
-        }
-
-        manager.ensure_running()?;
-        true
-    } else {
-        false
-    };
-
-    let client = AgentClient::connect_with_retry(manager.vsock_socket())?;
-    Ok(VmHandle {
-        manager,
-        client: Some(client),
-        freshly_started,
-    })
-}
 
 // ============================================================================
 // Name validation
@@ -328,25 +114,30 @@ pub fn list_vms(db: &SmolvmDb) -> Result<Vec<MicroVm>> {
     Ok(records.into_iter().map(|(_, r)| convert::record_to_vm(&r)).collect())
 }
 
-/// Start a VM from persisted DB config and persist the Running state.
+/// Update a MicroVm's spec and/or status in the DB.
+pub fn update_vm(db: &SmolvmDb, vm: &MicroVm) -> Result<()> {
+    let record = convert::vm_to_record(vm);
+    db.insert_vm(&vm.name, &record)?;
+    Ok(())
+}
+
+// ============================================================================
+// Start and connect operations
+// ============================================================================
+
+/// Start a VM directly from a `MicroVm` spec without reading or writing the DB.
 ///
-/// Returns a `VmHandle` with `freshly_started()` indicating whether the
-/// VM was just booted (true) or was already running and reconnected (false).
-///
-/// Idempotent — safe to call on an already-running VM.
-pub fn start_vm(db: &SmolvmDb, name: &str) -> Result<VmHandle> {
-    let record = db
-        .get_vm(name)?
-        .ok_or_else(|| Error::vm_not_found(name))?;
+/// This preserves `machine run` semantics: foreground runs use runtime config
+/// without creating a persisted named machine.
+pub fn start_vm_from_spec(vm: &MicroVm) -> Result<VmHandle> {
+    let manager = AgentManager::for_vm_with_sizes(
+        &vm.name,
+        vm.spec.resources.storage_gib,
+        vm.spec.resources.overlay_gib,
+    )
+    .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
 
-    let mounts = record.host_mounts();
-    let ports = record.port_mappings();
-    let resources = record.vm_resources();
-
-    let manager = AgentManager::for_vm_with_sizes(name, record.storage_gb, record.overlay_gb)
-        .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
-
-    let ssh_agent_socket = if record.ssh_agent {
+    let ssh_agent_socket = if vm.spec.ssh_agent {
         match std::env::var("SSH_AUTH_SOCK") {
             Ok(path) => Some(std::path::PathBuf::from(path)),
             Err(_) => {
@@ -361,14 +152,32 @@ pub fn start_vm(db: &SmolvmDb, name: &str) -> Result<VmHandle> {
     };
     let features = LaunchFeatures {
         ssh_agent_socket,
-        dns_filter_hosts: record.dns_filter_hosts.clone(),
+        dns_filter_hosts: vm.spec.dns_filter_hosts.clone(),
     };
 
     let freshly_started = manager
-        .ensure_running_with_full_config(mounts, ports, resources, features)
+        .ensure_running_with_full_config(
+            vm.spec.mounts.clone(),
+            vm.spec.ports.clone(),
+            vm.spec.resources.clone(),
+            features,
+        )
         .map_err(|e| Error::agent("start vm", e.to_string()))?;
 
-    let pid = manager.child_pid();
+    Ok(VmHandle::new(manager, freshly_started, None))
+}
+
+/// Start a VM from persisted DB config and persist the Running state.
+///
+/// Returns a `VmHandle` with `freshly_started()` indicating whether the
+/// VM was just booted (true) or was already running and reconnected (false).
+///
+/// Idempotent — safe to call on an already-running VM.
+pub fn start_vm(db: &SmolvmDb, name: &str) -> Result<VmHandle> {
+    let vm = get_vm(db, name)?;
+    let handle = start_vm_from_spec(&vm)?;
+
+    let pid = handle.child_pid();
     let pid_start_time = pid.and_then(process_start_time);
     if let Err(e) = db.update_vm(name, |r| {
         r.state = RecordState::Running;
@@ -378,12 +187,39 @@ pub fn start_vm(db: &SmolvmDb, name: &str) -> Result<VmHandle> {
         tracing::warn!(error = %e, vm = %name, "failed to persist running state");
     }
 
-    Ok(VmHandle {
-        manager,
-        client: None,
-        freshly_started,
-    })
+    Ok(handle)
 }
+
+/// Connect to a VM by name.
+///
+/// This function does not read the database. Callers are responsible for
+/// checking persistence separately before connecting. If `auto_start_vm` is
+/// true, the VM is started with the default manager config when needed.
+pub fn connect_vm(name: &str, auto_start_vm: bool) -> Result<VmHandle> {
+    let manager = AgentManager::for_vm(name)
+        .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
+
+    let freshly_started = if manager.try_connect_existing().is_none() {
+        if !auto_start_vm {
+            return Err(Error::agent(
+                "connect",
+                format!("machine '{}' is not running", name),
+            ));
+        }
+
+        manager.ensure_running()?;
+        true
+    } else {
+        false
+    };
+
+    let client = AgentClient::connect_with_retry(manager.vsock_socket())?;
+    Ok(VmHandle::new(manager, freshly_started, Some(client)))
+}
+
+// ============================================================================
+// Stop, delete, and resize operations
+// ============================================================================
 
 /// Stop a running VM and persist the Stopped state.
 ///
@@ -445,35 +281,6 @@ pub fn delete_vm(db: &SmolvmDb, name: &str, force: bool) -> Result<()> {
     }
 
     Ok(())
-}
-
-/// Remove generated ephemeral VM records whose process no longer exists.
-pub fn cleanup_orphaned_ephemeral_vms() {
-    let db = match SmolvmDb::open() {
-        Ok(db) => db,
-        Err(_) => return,
-    };
-
-    let records = match db.list_vms() {
-        Ok(records) => records,
-        Err(_) => return,
-    };
-
-    for (name, record) in records {
-        if !record.ephemeral {
-            continue;
-        }
-
-        let is_orphan = match record.pid {
-            Some(pid) => !crate::internal::process::is_alive(pid),
-            None => true,
-        };
-
-        if is_orphan {
-            tracing::debug!(name = %name, pid = ?record.pid, "cleaning up orphaned ephemeral VM");
-            let _ = delete_vm(&db, &name, true);
-        }
-    }
 }
 
 /// Resize a VM's disks. The VM must be stopped. Only expansion is supported.
@@ -550,12 +357,42 @@ pub fn resize_vm(
     Ok(())
 }
 
-/// Update a MicroVm's spec and/or status in the DB.
-pub fn update_vm(db: &SmolvmDb, vm: &MicroVm) -> Result<()> {
-    let record = convert::vm_to_record(vm);
-    db.insert_vm(&vm.name, &record)?;
-    Ok(())
+// ============================================================================
+// Maintenance helpers
+// ============================================================================
+
+/// Remove generated ephemeral VM records whose process no longer exists.
+pub fn cleanup_orphaned_ephemeral_vms() {
+    let db = match SmolvmDb::open() {
+        Ok(db) => db,
+        Err(_) => return,
+    };
+
+    let records = match db.list_vms() {
+        Ok(records) => records,
+        Err(_) => return,
+    };
+
+    for (name, record) in records {
+        if !record.ephemeral {
+            continue;
+        }
+
+        let is_orphan = match record.pid {
+            Some(pid) => !crate::internal::process::is_alive(pid),
+            None => true,
+        };
+
+        if is_orphan {
+            tracing::debug!(name = %name, pid = ?record.pid, "cleaning up orphaned ephemeral VM");
+            let _ = db.remove_vm(&name);
+        }
+    }
 }
+
+// ============================================================================
+// Container helpers
+// ============================================================================
 
 /// Resolve container mounts against a VM's host mounts.
 ///
