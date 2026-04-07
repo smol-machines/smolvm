@@ -167,8 +167,7 @@ struct VsockStream {
 #[cfg(target_os = "linux")]
 impl std::os::unix::io::AsRawFd for VsockStream {
     fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
-        use std::os::fd::AsRawFd;
-        self.fd.as_raw_fd()
+        std::os::fd::AsRawFd::as_raw_fd(&self.fd)
     }
 }
 

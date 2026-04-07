@@ -1292,7 +1292,7 @@ fn spawn_interactive_command(
     mounts: &[(String, String, bool)],
     tty: bool,
 ) -> Result<(Child, Option<pty::PtyMaster>), Box<dyn std::error::Error>> {
-    use std::os::unix::io::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::io::AsRawFd as _;
     use std::path::Path;
 
     if command.is_empty() {

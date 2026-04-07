@@ -55,6 +55,7 @@ pub fn capture_child_output(child: &mut Child) -> ChildOutput {
 /// (default: 10ms).
 ///
 /// Handles EINTR (interrupted system call) by retrying the wait.
+#[cfg(test)]
 pub fn wait_with_timeout(
     child: &mut Child,
     timeout_ms: Option<u64>,
