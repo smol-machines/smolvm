@@ -9,7 +9,19 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
+
+#[cfg(unix)]
+const ROOTFS_EXECUTABLES: &[&str] = &[
+    "agent-rootfs/usr/bin/crun",
+    "agent-rootfs/usr/local/bin/crane",
+    "agent-rootfs/usr/local/bin/smolvm-agent",
+    "agent-rootfs/bin/busybox",
+    "agent-rootfs/bin/mount",
+    "agent-rootfs/bin/umount",
+];
 
 /// Safely unpack a tar archive, rejecting symlinks, hardlinks, and entries
 /// that resolve outside `dest`.
@@ -133,7 +145,24 @@ pub fn get_cache_dir(checksum: u32) -> std::io::Result<PathBuf> {
 
 /// Check if assets have already been extracted.
 pub fn is_extracted(cache_dir: &Path) -> bool {
-    cache_dir.join(EXTRACTION_MARKER).exists()
+    cache_dir.join(EXTRACTION_MARKER).exists() && rootfs_executable_permissions_ok(cache_dir)
+}
+
+#[cfg(unix)]
+fn rootfs_executable_permissions_ok(cache_dir: &Path) -> bool {
+    ROOTFS_EXECUTABLES.iter().all(|rel| {
+        let path = cache_dir.join(rel);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() => metadata.permissions().mode() & 0o111 != 0,
+            Ok(_) => true,
+            Err(_) => true,
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn rootfs_executable_permissions_ok(_cache_dir: &Path) -> bool {
+    true
 }
 
 /// Check if footer indicates sidecar mode.
@@ -199,6 +228,7 @@ pub fn extract_sidecar(
     // Double-check inside the lock: another process may have completed
     // extraction while we were waiting for the lock.
     if !force && is_extracted(cache_dir) {
+        fix_agent_rootfs_permissions(cache_dir, debug)?;
         if debug {
             eprintln!("debug: assets already extracted (possibly by another process)");
         }
@@ -374,14 +404,20 @@ fn post_process_extraction(cache_dir: &Path, debug: bool) -> std::io::Result<()>
     }
 
     // Write marker file
+    fix_agent_rootfs_permissions(cache_dir, debug)?;
+
+    // Write marker file only after post-processing succeeds.
     fs::write(cache_dir.join(EXTRACTION_MARKER), "")?;
 
-    // Make libraries executable (they need to be loadable)
+    Ok(())
+}
+
+fn fix_agent_rootfs_permissions(cache_dir: &Path, debug: bool) -> std::io::Result<()> {
+    // Make libraries executable (they need to be loadable).
     let lib_dir = cache_dir.join("lib");
     if lib_dir.exists() {
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
             for entry in fs::read_dir(&lib_dir)? {
                 let entry = entry?;
                 let path = entry.path();
@@ -390,6 +426,32 @@ fn post_process_extraction(cache_dir: &Path, debug: bool) -> std::io::Result<()>
                     perms.set_mode(0o755);
                     fs::set_permissions(&path, perms)?;
                 }
+            }
+        }
+    }
+
+    // Some rootfs builds produced guest helper binaries as 0600 when apk was
+    // run through a host-mounted output directory. Normalize the small set of
+    // binaries the agent needs to execute before marking extraction complete.
+    #[cfg(unix)]
+    {
+        for rel in ROOTFS_EXECUTABLES {
+            let path = cache_dir.join(rel);
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(_) => continue,
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+            let mode = metadata.permissions().mode();
+            if mode & 0o111 == 0 {
+                if debug {
+                    eprintln!("debug: fixing executable mode for {}", path.display());
+                }
+                let mut perms = metadata.permissions();
+                perms.set_mode(mode | 0o755);
+                fs::set_permissions(&path, perms)?;
             }
         }
     }

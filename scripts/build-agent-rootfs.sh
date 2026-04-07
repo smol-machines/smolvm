@@ -165,6 +165,21 @@ else
     exit 1
 fi
 
+# Some package-install paths, especially macOS builds that install into a
+# virtiofs-mounted host directory, can leave copied guest helper binaries as
+# non-executable on the host. Normalize the known binaries the agent executes.
+for bin in \
+    "$OUTPUT_DIR/usr/bin/crun" \
+    "$OUTPUT_DIR/usr/local/bin/crane" \
+    "$OUTPUT_DIR/bin/busybox" \
+    "$OUTPUT_DIR/bin/mount" \
+    "$OUTPUT_DIR/bin/umount"
+do
+    if [[ -f "$bin" ]]; then
+        chmod 755 "$bin"
+    fi
+done
+
 # Create necessary directories
 mkdir -p "$OUTPUT_DIR/storage"
 mkdir -p "$OUTPUT_DIR/etc/init.d"
