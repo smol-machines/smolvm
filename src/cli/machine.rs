@@ -295,19 +295,24 @@ impl RunCmd {
             }
         }
 
-        // Require an explicit command or -it flag. Without one, /bin/sh hangs
-        // waiting for input — confusing UX. Error early with guidance.
-        let (interactive, tty) =
-            if !self.interactive && !self.tty && !self.detach && self.command.is_empty() {
-                return Err(smolvm::Error::config(
-                    "machine run",
-                    "no command specified.\n\
+        // Require an explicit command, -it flag, or Smolfile entrypoint/cmd.
+        // Without any of these, /bin/sh hangs waiting for input — confusing UX.
+        let has_smolfile_command = !params.entrypoint.is_empty() || !params.cmd.is_empty();
+        let (interactive, tty) = if !self.interactive
+            && !self.tty
+            && !self.detach
+            && self.command.is_empty()
+            && !has_smolfile_command
+        {
+            return Err(smolvm::Error::config(
+                "machine run",
+                "no command specified.\n\
                      Use: smolvm machine run -- <command>\n\
                      Or:  smolvm machine run -it",
-                ));
-            } else {
-                (self.interactive, self.tty)
-            };
+            ));
+        } else {
+            (self.interactive, self.tty)
+        };
 
         let resources = VmResources {
             cpus: params.cpus,
