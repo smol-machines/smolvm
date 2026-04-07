@@ -11,20 +11,8 @@ pub fn parse_duration(s: &str) -> Result<Duration, humantime::DurationError> {
     humantime::parse_duration(s)
 }
 
-/// Parse an environment variable specification (KEY=VALUE).
-pub fn parse_env_spec(spec: &str) -> Option<(String, String)> {
-    let (key, value) = spec.split_once('=')?;
-    if key.is_empty() {
-        None
-    } else {
-        Some((key.to_string(), value.to_string()))
-    }
-}
-
-/// Parse environment variables from CLI args.
-pub fn parse_env_list(env_args: &[String]) -> Vec<(String, String)> {
-    env_args.iter().filter_map(|e| parse_env_spec(e)).collect()
-}
+// Env parsing delegated to the library.
+pub use smolvm::util::{parse_env_list, parse_env_spec};
 
 /// Convert parsed HostMount list to virtiofs binding format for agent.
 ///
@@ -44,66 +32,8 @@ pub fn mounts_to_virtiofs_bindings(mounts: &[HostMount]) -> Vec<(String, String,
         .collect()
 }
 
-/// Resolve a hostname to IP addresses and return as /32 CIDRs.
-///
-/// Resolution happens on the host at VM start time. Rejects hostnames with
-/// `:port` suffixes — port filtering is not supported by the TSI egress policy.
-pub fn resolve_host_to_cidrs(host: &str) -> Result<Vec<String>, String> {
-    use std::net::{IpAddr, ToSocketAddrs};
-
-    // Reject host:port syntax — we don't support port filtering and accepting
-    // it silently would create a false sense of security.
-    if host.contains(':') {
-        return Err(format!(
-            "invalid hostname '{}': port suffixes are not supported. \
-             Use the hostname only (all ports are allowed to resolved IPs).",
-            host
-        ));
-    }
-
-    // Try parsing as bare IP first (skip resolution)
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return Ok(vec![format!("{}/32", ip)]);
-    }
-
-    // Resolve hostname — may return multiple IPs (round-robin, CDN)
-    let addrs: Vec<String> = format!("{}:0", host)
-        .to_socket_addrs()
-        .map_err(|e| format!("failed to resolve '{}': {}", host, e))?
-        .map(|addr| format!("{}/32", addr.ip()))
-        .collect();
-
-    if addrs.is_empty() {
-        return Err(format!("'{}' resolved to no addresses", host));
-    }
-
-    Ok(addrs)
-}
-
-/// Parse and validate a CIDR specification (e.g., "10.0.0.0/8", "1.1.1.1").
-///
-/// Accepts `IP/prefix` or bare `IP` (auto-appends /32 for IPv4, /128 for IPv6).
-/// Returns the normalized CIDR string.
-pub fn parse_cidr(s: &str) -> Result<String, String> {
-    use ipnet::IpNet;
-    use std::net::IpAddr;
-
-    // Try parsing as CIDR first, then as bare IP
-    let net: IpNet = match s.parse::<IpNet>() {
-        Ok(net) => net,
-        Err(_) => match s.parse::<IpAddr>() {
-            Ok(ip) => IpNet::from(ip), // bare IP → /32 or /128
-            Err(_) => {
-                return Err(format!(
-                    "invalid CIDR '{}': expected format like 10.0.0.0/8 or 1.1.1.1",
-                    s
-                ))
-            }
-        },
-    };
-
-    Ok(net.to_string())
-}
+// Network helpers delegated to the library.
+pub use smolvm::smolfile::{parse_cidr, resolve_host_to_cidrs};
 
 #[cfg(test)]
 mod tests {

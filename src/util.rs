@@ -65,6 +65,25 @@ pub fn libkrun_filename() -> &'static str {
     lib_name
 }
 
+/// Parse a single `KEY=VALUE` environment variable specification.
+///
+/// Returns `None` if the string has no `=` or the key is empty.
+pub fn parse_env_spec(spec: &str) -> Option<(String, String)> {
+    let (key, value) = spec.split_once('=')?;
+    if key.is_empty() {
+        None
+    } else {
+        Some((key.to_string(), value.to_string()))
+    }
+}
+
+/// Parse a list of `KEY=VALUE` strings into `(key, value)` tuples.
+///
+/// Silently skips malformed entries (no `=` or empty key).
+pub fn parse_env_list(env_args: &[String]) -> Vec<(String, String)> {
+    env_args.iter().filter_map(|e| parse_env_spec(e)).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -311,7 +311,7 @@ impl PackRunCmd {
 
         // 7. Parse CLI args
         let mounts = HostMount::parse(&self.volume)?;
-        let port_mappings: Vec<(u16, u16)> = self.port.iter().map(|p| (p.host, p.guest)).collect();
+        let port_mappings = PortMapping::to_tuples(&self.port);
 
         let resources = VmResources {
             cpus: self.cpus.unwrap_or(manifest.cpus),
@@ -1125,7 +1125,7 @@ fn run_from_cache(
     )?;
 
     let mounts = HostMount::parse(&args.volume)?;
-    let port_mappings: Vec<(u16, u16)> = args.port.iter().map(|p| (p.host, p.guest)).collect();
+    let port_mappings = PortMapping::to_tuples(&args.port);
 
     let resources = VmResources {
         cpus: args.cpus.unwrap_or(manifest.cpus),
@@ -1442,7 +1442,7 @@ fn daemon_start(
 
     // Parse CLI args
     let mounts = HostMount::parse(&args.volume)?;
-    let port_mappings: Vec<(u16, u16)> = args.port.iter().map(|p| (p.host, p.guest)).collect();
+    let port_mappings = PortMapping::to_tuples(&args.port);
 
     let resources = VmResources {
         cpus: args.cpus.unwrap_or(manifest.cpus),

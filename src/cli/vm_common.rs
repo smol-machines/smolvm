@@ -250,21 +250,10 @@ pub fn create_vm(kind: VmKind, params: CreateVmParams) -> smolvm::Result<()> {
         .collect();
 
     // Convert port mappings to tuple format for storage
-    let ports: Vec<(u16, u16)> = params.port.iter().map(|p| (p.host, p.guest)).collect();
+    let ports = PortMapping::to_tuples(&params.port);
 
     // Parse environment variables for init
-    let env: Vec<(String, String)> = params
-        .env
-        .iter()
-        .filter_map(|e| {
-            let (k, v) = e.split_once('=')?;
-            if k.is_empty() {
-                None
-            } else {
-                Some((k.to_string(), v.to_string()))
-            }
-        })
-        .collect();
+    let env = smolvm::util::parse_env_list(&params.env);
 
     // Create record with restart policy if configured
     let restart = smolvm::config::RestartConfig {

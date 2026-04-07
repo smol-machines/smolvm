@@ -52,6 +52,16 @@ impl PortMapping {
         }
     }
 
+    /// Convert to `(host, guest)` tuple for storage.
+    pub fn to_tuple(&self) -> (u16, u16) {
+        (self.host, self.guest)
+    }
+
+    /// Batch convert port mappings to tuple format.
+    pub fn to_tuples(ports: &[Self]) -> Vec<(u16, u16)> {
+        ports.iter().map(|p| p.to_tuple()).collect()
+    }
+
     /// Parse a port mapping specification (`HOST:GUEST` or `PORT`).
     pub fn parse(spec: &str) -> Result<Self, String> {
         if let Some((host, guest)) = spec.split_once(':') {

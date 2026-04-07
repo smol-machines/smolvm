@@ -1,191 +1,21 @@
-//! Smolfile parser for declarative microVM workload configuration.
+//! Smolfile CLI integration — merges Smolfile config with CLI flags.
 //!
-//! A Smolfile is the declarative source of truth for a microVM workload.
-//! It is only loaded when explicitly specified via `--smolfile`/`-s`.
-//!
-//! Example Smolfile:
-//! ```toml
-//! image = "ghcr.io/acme/api:1.2.3"
-//! entrypoint = ["/app/api"]
-//! cmd = ["serve"]
-//! workdir = "/app"
-//! env = ["PORT=8080"]
-//!
-//! cpus = 2
-//! memory = 1024
-//! net = true
-//!
-//! [service]
-//! listen = 8080
-//! protocol = "http"
-//!
-//! [dev]
-//! volumes = ["./src:/app"]
-//! init = ["cargo build"]
-//! ports = ["8080:8080"]
-//!
-//! [artifact]
-//! cpus = 4
-//! memory = 2048
-//! ```
+//! Types and parsing live in [`smolvm::smolfile`]. This module provides
+//! the merge logic that combines Smolfile values with CLI arguments
+//! to produce [`CreateVmParams`] and [`PackConfig`].
 
 use crate::cli::parsers::parse_cidr;
 use crate::cli::vm_common::CreateVmParams;
-use serde::Deserialize;
 use smolvm::data::network::PortMapping;
 use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-/// Parsed Smolfile configuration.
-///
-/// The workload command model follows Docker/OCI semantics:
-///
-/// - `entrypoint`: the executable and its fixed leading arguments (like Dockerfile ENTRYPOINT)
-/// - `cmd`: default arguments appended to entrypoint (like Dockerfile CMD)
-/// - `init`: dev bootstrap commands run on every VM start (like RUN at boot, NOT like CMD)
-///
-/// When set, `entrypoint` and `cmd` override the base image's OCI config values.
-/// If neither is set, the image's built-in entrypoint and cmd are used.
-#[derive(Debug, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct Smolfile {
-    // Top-level workload fields
-    /// OCI image (optional — omit for bare Alpine VM).
-    pub image: Option<String>,
-    /// Executable and fixed leading arguments (overrides image ENTRYPOINT).
-    #[serde(default)]
-    pub entrypoint: Vec<String>,
-    /// Default arguments appended to entrypoint (overrides image CMD).
-    #[serde(default)]
-    pub cmd: Vec<String>,
-    #[serde(default)]
-    pub env: Vec<String>,
-    pub workdir: Option<String>,
-
-    // Resources
-    pub cpus: Option<u8>,
-    pub memory: Option<u32>,
-    pub net: Option<bool>,
-    pub storage: Option<u64>,
-    pub overlay: Option<u64>,
-    // Legacy top-level fields (will move to [dev] in Step 4)
-    #[serde(default)]
-    pub ports: Vec<String>,
-    #[serde(default)]
-    pub volumes: Vec<String>,
-    #[serde(default)]
-    pub init: Vec<String>,
-
-    // Profiles
-    pub artifact: Option<ArtifactConfig>,
-    pub pack: Option<ArtifactConfig>, // alias for artifact
-    pub dev: Option<DevConfig>,
-
-    // Network policy
-    pub network: Option<NetworkConfig>,
-
-    // Wired: flows into VmRecord health fields + monitor command
-    pub health: Option<HealthConfig>,
-    // Wired: flows into VmRecord restart config
-    pub restart: Option<RestartSmolfileConfig>,
-
-    // Credential forwarding
-    pub auth: Option<AuthConfig>,
-}
-
-/// Network policy — egress filtering by hostname and/or CIDR.
-#[derive(Debug, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct NetworkConfig {
-    /// Allowed egress hostnames (resolved to IPs at VM start).
-    #[serde(default)]
-    pub allow_hosts: Vec<String>,
-    /// Allowed egress CIDR ranges (e.g., ["10.0.0.0/8", "1.1.1.1"]).
-    #[serde(default)]
-    pub allow_cidrs: Vec<String>,
-}
-
-/// Credential forwarding configuration.
-#[derive(Debug, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct AuthConfig {
-    /// Forward host SSH agent into the VM.
-    pub ssh_agent: Option<bool>,
-}
-
-/// Distribution-specific overrides for packed artifacts.
-#[derive(Debug, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct ArtifactConfig {
-    pub cpus: Option<u8>,
-    pub memory: Option<u32>,
-    #[serde(default)]
-    pub entrypoint: Vec<String>,
-    #[serde(default)]
-    pub cmd: Vec<String>,
-    pub oci_platform: Option<String>,
-}
-
-/// Local development profile.
-#[derive(Debug, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct DevConfig {
-    #[serde(default)]
-    pub volumes: Vec<String>,
-    #[serde(default)]
-    pub env: Vec<String>,
-    #[serde(default)]
-    pub init: Vec<String>,
-    pub workdir: Option<String>,
-    #[serde(default)]
-    pub ports: Vec<String>,
-}
-
-/// Health check configuration for the monitor command.
-#[derive(Debug, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct HealthConfig {
-    #[serde(default)]
-    pub exec: Vec<String>,
-    pub interval: Option<String>,
-    pub timeout: Option<String>,
-    pub retries: Option<u32>,
-    pub startup_grace: Option<String>,
-}
-
-/// Restart policy for the Smolfile [restart] section.
-/// Named to avoid conflict with smolvm::config::RestartConfig.
-#[derive(Debug, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct RestartSmolfileConfig {
-    pub policy: Option<String>,
-    pub max_retries: Option<u32>,
-    /// Maximum backoff duration between restarts (e.g., "60s", "5m").
-    pub max_backoff: Option<String>,
-}
+// Re-export from the library
+pub use smolvm::smolfile::{parse_duration_secs, resolve_host_to_cidrs, Smolfile};
 
 /// Load and parse a Smolfile from the given path.
-pub fn load(path: &Path) -> smolvm::Result<Smolfile> {
-    let content = std::fs::read_to_string(path).map_err(|e| {
-        smolvm::Error::config("load smolfile", format!("{}: {}", path.display(), e))
-    })?;
-
-    toml::from_str(&content)
-        .map_err(|e| smolvm::Error::config("parse smolfile", format!("{}: {}", path.display(), e)))
-}
-
-/// Parse a duration string like "10s", "5m", "2h" to seconds.
-fn parse_duration_secs(s: &str) -> Option<u64> {
-    let s = s.trim();
-    if let Some(n) = s.strip_suffix('s') {
-        n.parse().ok()
-    } else if let Some(n) = s.strip_suffix('m') {
-        n.parse::<u64>().ok().map(|n| n * 60)
-    } else if let Some(n) = s.strip_suffix('h') {
-        n.parse::<u64>().ok().map(|n| n * 3600)
-    } else {
-        s.parse().ok() // bare number = seconds
-    }
+pub fn load(path: &std::path::Path) -> smolvm::Result<Smolfile> {
+    smolvm::smolfile::load(path)
 }
 
 /// Build `CreateVmParams` by merging CLI flags with an optional Smolfile.
@@ -346,7 +176,7 @@ pub fn build_create_params(
     // Resolve hostnames to CIDRs for egress policy
     let mut allowed_cidrs_vec: Vec<String> = Vec::new();
     for host in &sf_allow_hosts {
-        let cidrs = crate::cli::parsers::resolve_host_to_cidrs(host)
+        let cidrs = resolve_host_to_cidrs(host)
             .map_err(|e| smolvm::Error::config("smolfile [network] allow_hosts", e))?;
         allowed_cidrs_vec.extend(cidrs);
     }
@@ -446,13 +276,21 @@ pub fn build_create_params(
 
 /// Resolved pack configuration from Smolfile + CLI args.
 pub struct PackConfig {
+    /// Resolved image.
     pub image: Option<String>,
+    /// Resolved entrypoint.
     pub entrypoint: Vec<String>,
+    /// Resolved cmd.
     pub cmd: Vec<String>,
+    /// Resolved vCPU count.
     pub cpus: u8,
+    /// Resolved memory in MiB.
     pub mem: u32,
+    /// Target OCI platform.
     pub oci_platform: Option<String>,
+    /// Resolved environment variables.
     pub env: Vec<String>,
+    /// Resolved working directory.
     pub workdir: Option<String>,
 }
 
@@ -508,7 +346,7 @@ pub fn resolve_pack_config(
         sf.entrypoint
     };
 
-    // Cmd: [artifact] > top-level (CLI doesn't have a cmd flag for pack)
+    // Cmd: [artifact] > top-level
     let cmd = if !artifact.cmd.is_empty() {
         artifact.cmd
     } else {
