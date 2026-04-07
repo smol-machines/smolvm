@@ -7,7 +7,7 @@ use crate::data::disk::{Overlay, Storage, DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STOR
 use crate::data::mount::HostMount;
 use crate::data::vm::MicroVm;
 use crate::error::{Error, Result};
-pub use crate::handle::VmHandle;
+pub use crate::handle::{RunInteractiveOptions, VmHandle};
 use crate::internal::agent::{vm_data_dir, AgentClient, AgentManager, LaunchFeatures};
 use crate::internal::config::RecordState;
 use crate::internal::convert;

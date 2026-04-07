@@ -24,6 +24,15 @@ pub struct VmHandle {
     freshly_started: bool,
 }
 
+/// Extra options for an interactive OCI image run.
+#[derive(Debug, Clone, Copy)]
+pub struct RunInteractiveOptions {
+    /// Timeout for command execution.
+    pub timeout: Option<Duration>,
+    /// Whether to allocate a TTY.
+    pub tty: bool,
+}
+
 impl VmHandle {
     /// Construct a handle from an already-created process manager.
     ///
@@ -163,15 +172,14 @@ impl VmHandle {
         env: &[(String, String)],
         workdir: Option<&str>,
         mounts: &[(String, String, bool)],
-        timeout: Option<Duration>,
-        tty: bool,
+        options: RunInteractiveOptions,
     ) -> Result<i32> {
         let config = RunConfig::new(image, command.to_vec())
             .with_env(env.to_vec())
             .with_workdir(workdir.map(str::to_string))
             .with_mounts(mounts.to_vec())
-            .with_timeout(timeout)
-            .with_tty(tty);
+            .with_timeout(options.timeout)
+            .with_tty(options.tty);
         self.client_mut()?.run_interactive(config)
     }
 

@@ -17,7 +17,7 @@ use crate::cli::truncate;
 use clap::{Args, Subcommand};
 use smolvm::agent::{docker_config_mount, AgentClient, AgentManager};
 use smolvm::config::{RecordState, RestartPolicy};
-use smolvm::control;
+use smolvm::control::{self, RunInteractiveOptions};
 use smolvm::data::consts::DEFAULT_MACHINE_NAME;
 use smolvm::data::disk::{DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
 use smolvm::data::network::PortMapping;
@@ -486,8 +486,10 @@ impl RunCmd {
                         &vm.spec.env,
                         vm.spec.workdir.as_deref(),
                         &mount_bindings,
-                        self.timeout,
-                        self.tty,
+                        RunInteractiveOptions {
+                            timeout: self.timeout,
+                            tty: self.tty,
+                        },
                     )
                 } else {
                     handle
@@ -843,7 +845,7 @@ impl CreateCmd {
         let db = SmolvmDb::open()?;
         control::create_vm(&db, vm)?;
 
-        println!("Created {}: {}", "machine", name);
+        println!("Created machine: {}", name);
         println!("  CPUs: {}, Memory: {} MiB", cpus, mem);
         if mount_count != 0 {
             println!("  Mounts: {}", mount_count);
@@ -854,10 +856,7 @@ impl CreateCmd {
         if init_count != 0 {
             println!("  Init commands: {}", init_count);
         }
-        println!(
-            "\nUse '{} start {}' to start the {}",
-            "smolvm machine", name, "machine",
-        );
+        println!("\nUse 'smolvm machine start {}' to start the machine", name);
         println!(
             "Then use 'smolvm machine exec --name {} -- <command>' to run commands",
             name
@@ -895,7 +894,7 @@ impl StartCmd {
         let pid = handle.child_pid();
         if !handle.freshly_started() {
             let pid_suffix = format_pid_suffix(pid);
-            println!("{} '{}' already running{}", "Machine", name, pid_suffix);
+            println!("Machine '{}' already running{}", name, pid_suffix);
             handle.detach();
             return Ok(());
         }
@@ -965,9 +964,9 @@ impl StopCmd {
         let name = self.name;
 
         let db = SmolvmDb::open()?;
-        println!("Stopping {} '{}'...", "machine", name);
+        println!("Stopping machine '{}'...", name);
         control::stop_vm(&db, &name)?;
-        println!("Stopped {}: {}", "machine", name);
+        println!("Stopped machine: {}", name);
         Ok(())
     }
 }
@@ -999,7 +998,7 @@ impl DeleteCmd {
 
         // Confirm deletion unless --force
         if !self.force {
-            eprint!("Delete {} '{}'? [y/N] ", "machine", self.name);
+            eprint!("Delete machine '{}'? [y/N] ", self.name);
             let mut input = String::new();
             if std::io::stdin().read_line(&mut input).is_ok() {
                 let input = input.trim().to_lowercase();
@@ -1041,10 +1040,10 @@ impl StatusCmd {
 
         if manager.try_connect_existing().is_some() {
             let pid_suffix = crate::cli::format_pid_suffix(manager.child_pid());
-            println!("{} '{}': running{}", "Machine", name, pid_suffix);
+            println!("Machine '{}': running{}", name, pid_suffix);
             manager.detach();
         } else {
-            println!("{} '{}': not running", "Machine", name);
+            println!("Machine '{}': not running", name);
         }
 
         Ok(())
@@ -1239,7 +1238,7 @@ impl ResizeCmd {
         control::resize_vm(&db, &self.name, self.storage, self.overlay)?;
 
         println!();
-        println!("{} '{}' resized successfully.", "Machine", self.name);
+        println!("Machine '{}' resized successfully.", self.name);
         println!("Disk changes are applied immediately; filesystem will expand on next boot.");
         Ok(())
     }
