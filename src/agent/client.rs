@@ -423,11 +423,16 @@ impl AgentClient {
         self.trace_id = Some(trace_id);
     }
 
+    /// Encode a request wrapped in an Envelope with the current trace_id.
+    fn encode_traced(&self, req: &AgentRequest) -> Result<Vec<u8>> {
+        let envelope = Envelope::with_trace_id(req, self.trace_id.clone());
+        encode_message(&envelope).map_err(|e| Error::agent("encode message", e.to_string()))
+    }
+
     /// Send a request and receive a response.
     fn request(&mut self, req: &AgentRequest) -> Result<AgentResponse> {
         // Encode and send request
-        let data =
-            encode_message(req).map_err(|e| Error::agent("encode message", e.to_string()))?;
+        let data = self.encode_traced(req)?;
         self.stream
             .write_all(&data)
             .map_err(|e| Error::agent("send message", e.to_string()))?;
@@ -544,12 +549,11 @@ impl AgentClient {
         let _timeout_guard = ReadTimeoutGuard::new(&self.stream);
 
         // Send the pull request
-        let data = encode_message(&AgentRequest::Pull {
+        let data = self.encode_traced(&AgentRequest::Pull {
             image: image.to_string(),
             oci_platform: oci_platform.map(String::from),
             auth: auth.cloned(),
-        })
-        .map_err(|e| Error::agent("encode message", e.to_string()))?;
+        })?;
 
         self.stream
             .write_all(&data)
@@ -728,8 +732,7 @@ impl AgentClient {
             .stream
             .set_read_timeout(Some(Duration::from_secs(SHUTDOWN_ACK_TIMEOUT_SECS)));
 
-        let data = encode_message(&AgentRequest::Shutdown)
-            .map_err(|e| Error::agent("encode message", e.to_string()))?;
+        let data = self.encode_traced(&AgentRequest::Shutdown)?;
         self.stream
             .write_all(&data)
             .map_err(|e| Error::agent("send shutdown", e.to_string()))?;
@@ -1193,17 +1196,10 @@ impl AgentClient {
     }
 
     /// Low-level send without waiting for response.
-    /// Wraps the request in an Envelope with the current trace_id.
     fn send(&mut self, request: &AgentRequest) -> Result<()> {
-        let envelope = Envelope::with_trace_id(request, self.trace_id.clone());
-        let json = serde_json::to_vec(&envelope)
-            .map_err(|e| Error::agent("serialize request", e.to_string()))?;
-        let len = json.len() as u32;
-
-        self.stream.write_all(&len.to_be_bytes())?;
-        self.stream.write_all(&json)?;
+        let data = self.encode_traced(request)?;
+        self.stream.write_all(&data)?;
         self.stream.flush()?;
-
         Ok(())
     }
 

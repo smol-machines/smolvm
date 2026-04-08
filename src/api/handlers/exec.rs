@@ -113,10 +113,12 @@ pub async fn exec_stream(
     let timeout = req.timeout_secs.map(Duration::from_secs);
 
     // Run streaming exec via the machine client (vsock is synchronous)
+    let start = std::time::Instant::now();
     let events = with_machine_client_traced(&entry, tid, move |c| {
         c.vm_exec_streaming(command, env, workdir, timeout)
     })
     .await?;
+    metrics::histogram!("smolvm_exec_seconds").record(start.elapsed().as_secs_f64());
 
     // Convert events to SSE stream
     let stream = futures_util::stream::iter(events.into_iter().map(|event| {
@@ -194,6 +196,7 @@ pub async fn run_command(
             .collect::<Vec<_>>()
     };
 
+    let start = std::time::Instant::now();
     let (exit_code, stdout, stderr) = with_machine_client_traced(&entry, tid, move |c| {
         let config = crate::agent::RunConfig::new(image, command)
             .with_env(env)
@@ -203,6 +206,7 @@ pub async fn run_command(
         c.run_non_interactive(config)
     })
     .await?;
+    metrics::histogram!("smolvm_exec_seconds").record(start.elapsed().as_secs_f64());
 
     Ok(Json(ExecResponse {
         exit_code,
@@ -264,6 +268,7 @@ pub async fn stream_logs(
 
     let follow = query.follow;
     let tail = query.tail;
+    let json_only = query.format.as_deref() == Some("json");
 
     // Validate tail value upfront
     const MAX_TAIL_LINES: usize = 10_000;
@@ -308,6 +313,9 @@ pub async fn stream_logs(
 
         // Emit initial tail lines first
         for line in initial_lines {
+            if json_only && serde_json::from_str::<serde_json::Value>(&line).is_err() {
+                continue; // skip non-JSON lines in json mode
+            }
             yield Ok(Event::default().data(line));
         }
 
@@ -339,6 +347,9 @@ pub async fn stream_logs(
                         while let Some(newline_pos) = partial_line.find('\n') {
                             let line = partial_line[..newline_pos].trim_end_matches('\r').to_string();
                             partial_line = partial_line[newline_pos + 1..].to_string();
+                            if json_only && serde_json::from_str::<serde_json::Value>(&line).is_err() {
+                                continue; // skip non-JSON lines in json mode
+                            }
                             yield Ok(Event::default().data(line));
                         }
                         // Flush partial line if it exceeds the safety cap

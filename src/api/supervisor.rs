@@ -63,6 +63,12 @@ impl Supervisor {
             }
         }
 
+        // Reconcile the running gauge with actual state (handles crashed VMs
+        // that never went through stop(), preventing gauge drift).
+        let (total, running) = self.state.machine_counts();
+        metrics::gauge!("smolvm_machines_running").set(running as f64);
+        metrics::gauge!("smolvm_machines_total").set(total as f64);
+
         // Also rotate logs for all machines
         self.rotate_logs_if_needed().await;
     }
