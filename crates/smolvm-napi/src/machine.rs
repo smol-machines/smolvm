@@ -4,6 +4,7 @@
 //! handles live in a process-local runtime registry so multiple JS objects and
 //! worker threads coordinate through the same cached handle per machine name.
 
+use napi::bindgen_prelude::Buffer;
 use napi_derive::napi;
 
 use crate::control::MachineSpec;
@@ -195,6 +196,60 @@ impl NapiMachine {
             .into_napi()?;
 
         Ok(images.into_iter().map(ImageInfo::from).collect())
+    }
+
+    /// Write a file into the running VM.
+    #[napi]
+    pub async fn write_file(
+        &self,
+        path: String,
+        data: Buffer,
+        options: Option<FileWriteOptions>,
+    ) -> napi::Result<()> {
+        let runtime = runtime().into_napi()?;
+        let name = self.name.clone();
+        let mode = options.and_then(|opts| opts.mode);
+        let data = data.to_vec();
+
+        tokio::task::spawn_blocking(move || runtime.write_file(&name, &path, data, mode))
+            .await
+            .map_err(join_error)?
+            .into_napi()
+    }
+
+    /// Read a file from the running VM.
+    #[napi]
+    pub async fn read_file(&self, path: String) -> napi::Result<Buffer> {
+        let runtime = runtime().into_napi()?;
+        let name = self.name.clone();
+
+        let data = tokio::task::spawn_blocking(move || runtime.read_file(&name, &path))
+            .await
+            .map_err(join_error)?
+            .into_napi()?;
+
+        Ok(data.into())
+    }
+
+    /// Execute a command and return streaming stdout/stderr/exit events.
+    #[napi]
+    pub async fn exec_streaming(
+        &self,
+        command: Vec<String>,
+        options: Option<ExecOptions>,
+    ) -> napi::Result<Vec<ExecStreamEvent>> {
+        let runtime = runtime().into_napi()?;
+        let name = self.name.clone();
+        let (env, workdir, timeout) = parse_exec_options(options);
+
+        let events = tokio::task::spawn_blocking(move || {
+            runtime.exec_streaming(&name, command, env, workdir, timeout)
+        })
+        .await
+        .map_err(join_error)?
+        .into_napi()?;
+
+        Ok(events.into_iter().map(ExecStreamEvent::from).collect())
     }
 
     /// Stop the machine VM gracefully.

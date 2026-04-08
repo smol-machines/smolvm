@@ -25,6 +25,7 @@
     "build": "npm run build:ts",
     "dev": "../node_modules/.bin/tsup src/index.ts --format cjs,esm --dts --watch",
     "test": "../node_modules/.bin/vitest run",
+    "test:integration": "../node_modules/.bin/vitest run integration-tests",
     "test:watch": "../node_modules/.bin/vitest",
     "example:basic": "../node_modules/.bin/tsx examples/basic.ts",
     "example:create-and-start": "../node_modules/.bin/tsx examples/create-and-start.ts"

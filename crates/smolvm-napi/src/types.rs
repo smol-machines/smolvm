@@ -4,7 +4,7 @@
 //! conversion impls to/from the corresponding smolvm types.
 
 use napi_derive::napi;
-use smolvm::agent::{HostMount, VmResources};
+use smolvm::agent::{ExecEvent as AgentExecEvent, HostMount, VmResources};
 use smolvm::data::network::PortMapping;
 
 // ============================================================================
@@ -56,7 +56,7 @@ pub struct VmResourcesConfig {
     /// Number of vCPUs (default: 1).
     pub cpus: Option<u8>,
     /// Memory in MiB (default: 512).
-    pub memory_mb: Option<u32>,
+    pub memory_mib: Option<u32>,
     /// Enable outbound network access (default: false).
     pub network: Option<bool>,
     /// Storage disk size in GiB (default: 20).
@@ -75,6 +75,14 @@ pub struct ExecOptions {
     pub workdir: Option<String>,
     /// Timeout in seconds.
     pub timeout_secs: Option<u32>,
+}
+
+/// Options for writing a file into the VM.
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct FileWriteOptions {
+    /// Optional octal file mode (for example, 0o644).
+    pub mode: Option<u32>,
 }
 
 /// An environment variable key-value pair.
@@ -117,6 +125,20 @@ pub struct ImageInfo {
     pub os: String,
 }
 
+/// Event from a streaming exec session.
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct ExecStreamEvent {
+    /// Event kind: stdout, stderr, exit, or error.
+    pub kind: String,
+    /// Text payload for stdout/stderr events.
+    pub data: Option<String>,
+    /// Exit code for exit events.
+    pub exit_code: Option<i32>,
+    /// Error message for error events.
+    pub message: Option<String>,
+}
+
 // ============================================================================
 // Conversion impls
 // ============================================================================
@@ -139,7 +161,7 @@ impl VmResourcesConfig {
     pub fn to_vm_resources(&self) -> VmResources {
         VmResources {
             cpus: self.cpus.unwrap_or(1),
-            memory_mib: self.memory_mb.unwrap_or(512),
+            memory_mib: self.memory_mib.unwrap_or(512),
             network: self.network.unwrap_or(false),
             storage_gib: self.storage_gib.map(|g| g as u64),
             overlay_gib: self.overlay_gib.map(|g| g as u64),
@@ -156,6 +178,37 @@ impl From<smolvm_protocol::ImageInfo> for ImageInfo {
             size: info.size as f64,
             architecture: info.architecture,
             os: info.os,
+        }
+    }
+}
+
+impl From<AgentExecEvent> for ExecStreamEvent {
+    fn from(event: AgentExecEvent) -> Self {
+        match event {
+            AgentExecEvent::Stdout(data) => Self {
+                kind: "stdout".to_string(),
+                data: Some(String::from_utf8_lossy(&data).into_owned()),
+                exit_code: None,
+                message: None,
+            },
+            AgentExecEvent::Stderr(data) => Self {
+                kind: "stderr".to_string(),
+                data: Some(String::from_utf8_lossy(&data).into_owned()),
+                exit_code: None,
+                message: None,
+            },
+            AgentExecEvent::Exit(exit_code) => Self {
+                kind: "exit".to_string(),
+                data: None,
+                exit_code: Some(exit_code),
+                message: None,
+            },
+            AgentExecEvent::Error(message) => Self {
+                kind: "error".to_string(),
+                data: None,
+                exit_code: None,
+                message: Some(message),
+            },
         }
     }
 }

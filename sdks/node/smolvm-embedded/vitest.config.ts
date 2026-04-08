@@ -4,8 +4,12 @@ export default defineConfig({
   test: {
     // Daemonless VM startup is reliable under process workers but not thread workers.
     pool: "forks",
+    fileParallelism: false,
     testTimeout: 120_000, // 2 minutes — VM boot + image pull can be slow
     hookTimeout: 60_000,
-    include: ["__tests__/**/*.test.ts"],
+    include: [
+      "__tests__/**/*.test.ts",
+      "integration-tests/**/*.test.ts",
+    ],
   },
 });

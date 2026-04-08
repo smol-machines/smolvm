@@ -11,6 +11,8 @@ import { loadNativeBinding } from "./native-binding.js";
 import type {
   MachineConfig,
   ExecOptions,
+  ExecStreamEvent,
+  FileWriteOptions,
   ImageInfo,
   MountSpec,
   PortSpec,
@@ -35,6 +37,26 @@ function toNapiExecOptions(
   };
 }
 
+function toSdkExecStreamEvent(event: {
+  kind: string;
+  data?: string;
+  exitCode?: number;
+  message?: string;
+}): ExecStreamEvent {
+  switch (event.kind) {
+    case "stdout":
+      return { kind: "stdout", data: event.data };
+    case "stderr":
+      return { kind: "stderr", data: event.data };
+    case "exit":
+      return { kind: "exit", exitCode: event.exitCode };
+    case "error":
+      return { kind: "error", message: event.message };
+    default:
+      throw new Error(`Unknown exec stream event kind: ${event.kind}`);
+  }
+}
+
 /**
  * Convert SDK config to NAPI format.
  */
@@ -53,7 +75,7 @@ function toNapiConfig(config: MachineConfig) {
     resources: config.resources
       ? {
           cpus: config.resources.cpus,
-          memoryMb: config.resources.memoryMb,
+          memoryMib: config.resources.memoryMb,
           network: config.resources.network,
           storageGib: config.resources.storageGib,
           overlayGib: config.resources.overlayGib,
@@ -200,6 +222,39 @@ export class Machine {
    */
   async listImages(): Promise<ImageInfo[]> {
     return wrapNative(() => this.native.listImages());
+  }
+
+  /**
+   * Write a file into the running VM.
+   */
+  async writeFile(
+    path: string,
+    data: string | Uint8Array,
+    options?: FileWriteOptions
+  ): Promise<void> {
+    const bytes = typeof data === "string" ? Buffer.from(data) : Buffer.from(data);
+    await wrapNative(() => this.native.writeFile(path, bytes, options));
+  }
+
+  /**
+   * Read a file from the running VM.
+   */
+  async readFile(path: string): Promise<Buffer> {
+    const data = await wrapNative<Buffer>(() => this.native.readFile(path));
+    return Buffer.from(data);
+  }
+
+  /**
+   * Execute a command and collect streaming stdout/stderr/exit events.
+   */
+  async execStreaming(
+    command: string[],
+    options?: ExecOptions
+  ): Promise<ExecStreamEvent[]> {
+    const events = await wrapNative<
+      Array<{ kind: string; data?: string; exitCode?: number; message?: string }>
+    >(() => this.native.execStreaming(command, toNapiExecOptions(options)));
+    return events.map(toSdkExecStreamEvent);
   }
 
   /**

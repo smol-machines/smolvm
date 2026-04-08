@@ -80,6 +80,14 @@ export interface ExecOptions {
 }
 
 /**
+ * Options for writing a file into the VM.
+ */
+export interface FileWriteOptions {
+  /** Optional octal file mode, for example `0o644`. */
+  mode?: number;
+}
+
+/**
  * Options for code execution (extends ExecOptions).
  */
 export interface CodeOptions extends ExecOptions {
@@ -105,4 +113,18 @@ export interface ImageInfo {
   architecture: string;
   /** Platform OS (e.g., "linux"). */
   os: string;
+}
+
+/**
+ * Event emitted by a streaming exec session.
+ */
+export interface ExecStreamEvent {
+  /** Event kind. */
+  kind: "stdout" | "stderr" | "exit" | "error";
+  /** Text payload for stdout/stderr events. */
+  data?: string;
+  /** Exit code for exit events. */
+  exitCode?: number;
+  /** Error message for error events. */
+  message?: string;
 }

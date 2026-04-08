@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 use std::time::Duration;
 
+use smolvm::agent::ExecEvent;
 use smolvm::config::RecordState;
 use smolvm::db::SmolvmDb;
 use smolvm::{Error, Result};
@@ -141,6 +142,37 @@ impl NapiRuntime {
         let handle = self.started_handle(name)?;
         let mut handle = lock_handle(&handle)?;
         handle.list_images()
+    }
+
+    pub(crate) fn write_file(
+        &self,
+        name: &str,
+        path: &str,
+        data: Vec<u8>,
+        mode: Option<u32>,
+    ) -> Result<()> {
+        let handle = self.started_handle(name)?;
+        let mut handle = lock_handle(&handle)?;
+        handle.write_file(path, &data, mode)
+    }
+
+    pub(crate) fn read_file(&self, name: &str, path: &str) -> Result<Vec<u8>> {
+        let handle = self.started_handle(name)?;
+        let mut handle = lock_handle(&handle)?;
+        handle.read_file(path)
+    }
+
+    pub(crate) fn exec_streaming(
+        &self,
+        name: &str,
+        command: Vec<String>,
+        env: Vec<(String, String)>,
+        workdir: Option<String>,
+        timeout: Option<Duration>,
+    ) -> Result<Vec<ExecEvent>> {
+        let handle = self.started_handle(name)?;
+        let mut handle = lock_handle(&handle)?;
+        handle.exec_streaming(command, env, workdir, timeout)
     }
 
     pub(crate) fn pid(&self, name: &str) -> Option<i32> {

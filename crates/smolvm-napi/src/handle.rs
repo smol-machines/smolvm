@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use smolvm::agent::{AgentClient, AgentManager};
+use smolvm::agent::{AgentClient, AgentManager, ExecEvent};
 use smolvm::Result;
 use smolvm_protocol::ImageInfo;
 
@@ -83,6 +83,28 @@ impl VmHandle {
     /// List cached OCI images in the VM storage.
     pub(crate) fn list_images(&mut self) -> Result<Vec<ImageInfo>> {
         self.client_mut()?.list_images()
+    }
+
+    /// Write a file into the VM.
+    pub(crate) fn write_file(&mut self, path: &str, data: &[u8], mode: Option<u32>) -> Result<()> {
+        self.client_mut()?.write_file(path, data, mode)
+    }
+
+    /// Read a file from the VM.
+    pub(crate) fn read_file(&mut self, path: &str) -> Result<Vec<u8>> {
+        self.client_mut()?.read_file(path)
+    }
+
+    /// Execute a command with streaming stdout/stderr events.
+    pub(crate) fn exec_streaming(
+        &mut self,
+        command: Vec<String>,
+        env: Vec<(String, String)>,
+        workdir: Option<String>,
+        timeout: Option<Duration>,
+    ) -> Result<Vec<ExecEvent>> {
+        self.client_mut()?
+            .vm_exec_streaming(command, env, workdir, timeout)
     }
 
     /// Stop the VM and drop the cached agent client.

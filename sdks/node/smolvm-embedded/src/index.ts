@@ -50,6 +50,8 @@ export type {
   PortSpec,
   ResourceSpec,
   ExecOptions,
+  ExecStreamEvent,
+  FileWriteOptions,
   CodeOptions,
   ImageInfo,
 } from "./types.js";
