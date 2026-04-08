@@ -6,6 +6,7 @@
 use napi_derive::napi;
 use smolvm::agent::{ExecEvent as AgentExecEvent, HostMount, VmResources};
 use smolvm::data::network::PortMapping;
+use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
 
 // ============================================================================
 // Input types (JS → Rust)
@@ -53,9 +54,9 @@ pub struct PortMappingConfig {
 #[napi(object)]
 #[derive(Debug, Clone)]
 pub struct VmResourcesConfig {
-    /// Number of vCPUs (default: 1).
+    /// Number of vCPUs (default: src/data/resources.rs default).
     pub cpus: Option<u8>,
-    /// Memory in MiB (default: 512).
+    /// Memory in MiB (default: src/data/resources.rs default).
     pub memory_mib: Option<u32>,
     /// Enable outbound network access (default: false).
     pub network: Option<bool>,
@@ -160,8 +161,8 @@ impl From<&PortMappingConfig> for PortMapping {
 impl VmResourcesConfig {
     pub fn to_vm_resources(&self) -> VmResources {
         VmResources {
-            cpus: self.cpus.unwrap_or(1),
-            memory_mib: self.memory_mib.unwrap_or(512),
+            cpus: self.cpus.unwrap_or(DEFAULT_MICROVM_CPU_COUNT),
+            memory_mib: self.memory_mib.unwrap_or(DEFAULT_MICROVM_MEMORY_MIB),
             network: self.network.unwrap_or(false),
             storage_gib: self.storage_gib.map(|g| g as u64),
             overlay_gib: self.overlay_gib.map(|g| g as u64),

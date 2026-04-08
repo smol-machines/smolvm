@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use smolvm::agent::{AgentClient, AgentManager, ExecEvent};
+use smolvm::agent::{AgentClient, AgentManager, ExecEvent, RunConfig};
 use smolvm::Result;
 use smolvm_protocol::ImageInfo;
 
@@ -72,7 +72,11 @@ impl VmHandle {
     ) -> Result<(i32, String, String)> {
         let client = self.client_mut()?;
         client.pull_with_registry_config(image)?;
-        client.run_with_mounts_and_timeout(image, command, env, workdir, Vec::new(), timeout)
+        let config = RunConfig::new(image, command)
+            .with_env(env)
+            .with_workdir(workdir)
+            .with_timeout(timeout);
+        client.run_non_interactive(config)
     }
 
     /// Pull an OCI image into the VM storage.

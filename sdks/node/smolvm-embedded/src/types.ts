@@ -51,9 +51,9 @@ export interface PortSpec {
  * VM resource allocation.
  */
 export interface ResourceSpec {
-  /** Number of vCPUs (default: 1). */
+  /** Number of vCPUs (default: 4). */
   cpus?: number;
-  /** Memory in MiB (default: 512). */
+  /** Memory in MiB (default: 8192). */
   memoryMb?: number;
   /** Enable outbound network access (default: false). */
   network?: boolean;

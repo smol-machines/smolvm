@@ -37,72 +37,66 @@ impl NapiRuntime {
 
     /// Create a persisted machine record.
     pub(crate) fn create_machine(&self, spec: MachineSpec) -> Result<()> {
-        let lock = self.lock_for_name(&spec.name)?;
-        let _guard = lock_name(&lock)?;
-        control::create_vm(&self.db, &spec)
+        self.with_name_lock(&spec.name, || control::create_vm(&self.db, &spec))
     }
 
     /// Start or reconnect to a persisted machine and cache its handle.
     pub(crate) fn start_machine(&self, name: &str) -> Result<()> {
-        let lock = self.lock_for_name(name)?;
-        let _guard = lock_name(&lock)?;
-
-        if let Some(handle) = self.cached_handle(name)? {
-            let alive = lock_handle(&handle)?.is_process_alive();
-            if alive {
-                return Ok(());
+        self.with_name_lock(name, || {
+            if let Some(handle) = self.cached_handle(name)? {
+                let alive = lock_handle(&handle)?.is_process_alive();
+                if alive {
+                    return Ok(());
+                }
+                self.remove_cached_handle(name)?;
             }
-            self.remove_cached_handle(name)?;
-        }
 
-        let handle = control::start_vm(&self.db, name)?;
-        self.insert_handle(name, handle)?;
-        Ok(())
+            let handle = control::start_vm(&self.db, name)?;
+            self.insert_handle(name, handle)?;
+            Ok(())
+        })
     }
 
     /// Connect to an already-running machine and cache its handle.
     pub(crate) fn connect_machine(&self, name: &str) -> Result<()> {
-        let lock = self.lock_for_name(name)?;
-        let _guard = lock_name(&lock)?;
-
-        if let Some(handle) = self.cached_handle(name)? {
-            if lock_handle(&handle)?.is_process_alive() {
-                return Ok(());
+        self.with_name_lock(name, || {
+            if let Some(handle) = self.cached_handle(name)? {
+                if lock_handle(&handle)?.is_process_alive() {
+                    return Ok(());
+                }
+                self.remove_cached_handle(name)?;
             }
-            self.remove_cached_handle(name)?;
-        }
 
-        let handle = control::connect_vm(&self.db, name)?;
-        self.insert_handle(name, handle)?;
-        Ok(())
+            let handle = control::connect_vm(&self.db, name)?;
+            self.insert_handle(name, handle)?;
+            Ok(())
+        })
     }
 
     /// Stop a machine and persist stopped state.
     pub(crate) fn stop_machine(&self, name: &str) -> Result<()> {
-        let lock = self.lock_for_name(name)?;
-        let _guard = lock_name(&lock)?;
+        self.with_name_lock(name, || {
+            if let Some(handle) = self.remove_cached_handle(name)? {
+                lock_handle(&handle)?.stop()?;
+                control::mark_stopped(&self.db, name)?;
+                return Ok(());
+            }
 
-        if let Some(handle) = self.remove_cached_handle(name)? {
-            lock_handle(&handle)?.stop()?;
-            control::mark_stopped(&self.db, name)?;
-            return Ok(());
-        }
-
-        control::stop_vm(&self.db, name)
+            control::stop_vm(&self.db, name)
+        })
     }
 
     /// Stop best-effort, remove from the registry and DB, and delete storage.
     pub(crate) fn delete_machine(&self, name: &str) -> Result<()> {
-        let lock = self.lock_for_name(name)?;
-        let _guard = lock_name(&lock)?;
+        self.with_name_lock(name, || {
+            if let Some(handle) = self.remove_cached_handle(name)? {
+                let _ = lock_handle(&handle)?.stop();
+            } else {
+                let _ = control::stop_vm(&self.db, name);
+            }
 
-        if let Some(handle) = self.remove_cached_handle(name)? {
-            let _ = lock_handle(&handle)?.stop();
-        } else {
-            let _ = control::stop_vm(&self.db, name);
-        }
-
-        control::delete_vm(&self.db, name)
+            control::delete_vm(&self.db, name)
+        })
     }
 
     pub(crate) fn exec(
@@ -252,6 +246,24 @@ impl NapiRuntime {
         Ok(registry.remove(name))
     }
 
+    fn with_name_lock<T, F>(&self, name: &str, op: F) -> Result<T>
+    where
+        F: FnOnce() -> Result<T>,
+    {
+        let lock = self.lock_for_name(name)?;
+        let result = {
+            let _guard = lock_name(&lock)?;
+            op()
+        };
+        let cleanup = self.cleanup_name_lock(name, &lock);
+
+        match (result, cleanup) {
+            (Err(err), _) => Err(err),
+            (Ok(value), Ok(())) => Ok(value),
+            (Ok(_), Err(err)) => Err(err),
+        }
+    }
+
     fn lock_for_name(&self, name: &str) -> Result<Arc<Mutex<()>>> {
         if let Some(lock) = self
             .name_locks
@@ -271,6 +283,23 @@ impl NapiRuntime {
             .entry(name.to_string())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone())
+    }
+
+    fn cleanup_name_lock(&self, name: &str, lock: &Arc<Mutex<()>>) -> Result<()> {
+        let mut locks = self
+            .name_locks
+            .write()
+            .map_err(|e| Error::agent("runtime name locks", e.to_string()))?;
+
+        let should_remove = locks
+            .get(name)
+            .is_some_and(|entry| Arc::ptr_eq(entry, lock) && Arc::strong_count(entry) == 2);
+
+        if should_remove {
+            locks.remove(name);
+        }
+
+        Ok(())
     }
 }
 
@@ -330,11 +359,62 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_name_lock_removes_unused_entry() {
+        let runtime = NapiRuntime::with_db(test_db());
+        let lock = runtime.lock_for_name("runtime-cleanup-unused").unwrap();
+
+        runtime
+            .cleanup_name_lock("runtime-cleanup-unused", &lock)
+            .unwrap();
+
+        assert!(runtime
+            .name_locks
+            .read()
+            .expect("name locks should not be poisoned")
+            .is_empty());
+    }
+
+    #[test]
+    fn cleanup_name_lock_keeps_entry_while_other_clones_exist() {
+        let runtime = NapiRuntime::with_db(test_db());
+        let lock = runtime.lock_for_name("runtime-cleanup-retained").unwrap();
+        let extra = lock.clone();
+
+        runtime
+            .cleanup_name_lock("runtime-cleanup-retained", &lock)
+            .unwrap();
+
+        assert!(runtime
+            .name_locks
+            .read()
+            .expect("name locks should not be poisoned")
+            .contains_key("runtime-cleanup-retained"));
+
+        drop(extra);
+
+        runtime
+            .cleanup_name_lock("runtime-cleanup-retained", &lock)
+            .unwrap();
+
+        assert!(runtime
+            .name_locks
+            .read()
+            .expect("name locks should not be poisoned")
+            .is_empty());
+    }
+
+    #[test]
     fn runtime_rejects_duplicate_create() {
         let runtime = NapiRuntime::with_db(test_db());
         runtime
             .create_machine(test_spec("runtime-duplicate", false))
             .unwrap();
+
+        assert!(runtime
+            .name_locks
+            .read()
+            .expect("name locks should not be poisoned")
+            .is_empty());
 
         let err = runtime
             .create_machine(test_spec("runtime-duplicate", false))
@@ -346,6 +426,11 @@ mod tests {
                 ..
             }
         ));
+        assert!(runtime
+            .name_locks
+            .read()
+            .expect("name locks should not be poisoned")
+            .is_empty());
     }
 
     #[test]
@@ -354,6 +439,12 @@ mod tests {
         runtime
             .create_machine(test_spec("runtime-state", true))
             .unwrap();
+
+        assert!(runtime
+            .name_locks
+            .read()
+            .expect("name locks should not be poisoned")
+            .is_empty());
 
         assert_eq!(runtime.state("runtime-state"), "stopped");
         assert!(!runtime.is_running("runtime-state"));
