@@ -184,7 +184,12 @@ pub async fn run_command(
     };
 
     let (exit_code, stdout, stderr) = with_machine_client(&entry, move |c| {
-        c.run_with_mounts_and_timeout(&image, command, env, workdir, mounts_config, timeout)
+        let config = crate::agent::RunConfig::new(image, command)
+            .with_env(env)
+            .with_workdir(workdir)
+            .with_mounts(mounts_config)
+            .with_timeout(timeout);
+        c.run_non_interactive(config)
     })
     .await?;
 

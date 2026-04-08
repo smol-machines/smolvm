@@ -4,7 +4,7 @@
 
 - Rust toolchain
 - [git-lfs](https://git-lfs.com) (required for library binaries)
-- Docker (for cross-compiling the agent)
+- smolvm itself (for cross-compiling the agent — builds inside a `rust:alpine` VM)
 - e2fsprogs (for storage template creation; `mkfs.ext4`)
 - LLVM (macOS only, for building libkrun: `brew install llvm`)
 - [cargo-make](https://github.com/sagiegurari/cargo-make): `cargo install cargo-make`

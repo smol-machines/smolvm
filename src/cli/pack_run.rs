@@ -649,7 +649,7 @@ fn build_env(manifest: &smolvm_pack::PackManifest, cli_env: &[String]) -> Vec<(S
 
 /// Execute the command in the VM using the existing AgentClient.
 ///
-/// In Container mode, runs via `client.run()` / `client.run_interactive()` (crun container).
+/// In Container mode, runs via `client.run_non_interactive()` / `client.run_interactive()` (crun container).
 /// In VM mode, runs via `client.vm_exec()` / `client.vm_exec_interactive()` (direct in rootfs).
 fn execute_command(
     client: &mut AgentClient,
@@ -729,14 +729,12 @@ fn execute_packed_command(
                     .with_tty(tty);
                 client.run_interactive(config)
             } else {
-                let (exit_code, stdout, stderr) = client.run_with_mounts_and_timeout(
-                    &manifest.image,
-                    command,
-                    env,
-                    workdir,
-                    mount_bindings,
-                    timeout,
-                )?;
+                let config = RunConfig::new(&manifest.image, command)
+                    .with_env(env)
+                    .with_workdir(workdir)
+                    .with_mounts(mount_bindings)
+                    .with_timeout(timeout);
+                let (exit_code, stdout, stderr) = client.run_non_interactive(config)?;
 
                 if !stdout.is_empty() {
                     print!("{}", stdout);

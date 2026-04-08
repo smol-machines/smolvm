@@ -10,13 +10,21 @@ smolvm machine run --net --image alpine -- echo hello
 smolvm machine run --net -it --image alpine -- /bin/sh   # interactive shell
 smolvm machine run --net --image python:3.12-alpine -- python3 script.py
 
-# Persistent (survives stop/start)
+# Persistent (survives across exec sessions and stop/start)
 smolvm machine create --net myvm
 smolvm machine start --name myvm
-smolvm machine exec --name myvm -- apk add python3
+smolvm machine exec --name myvm -- apk add python3   # installs persist
+smolvm machine exec --name myvm -- which python3      # still there
 smolvm machine exec --name myvm -it -- /bin/sh
 smolvm machine stop --name myvm
 smolvm machine delete myvm
+
+# Image-based persistent (filesystem changes persist across exec sessions)
+smolvm machine create --net --image ubuntu myvm
+smolvm machine start --name myvm
+smolvm machine exec --name myvm -- apt-get update
+smolvm machine exec --name myvm -- apt-get install -y python3
+smolvm machine exec --name myvm -- which python3      # still there after exit+re-exec
 
 # SSH agent forwarding (git/ssh without exposing keys)
 smolvm machine run --ssh-agent --net --image alpine -- ssh-add -l
@@ -38,6 +46,12 @@ smolvm pack create --image python:3.12-alpine -o ./my-python
 | Use git/ssh with private keys safely | Add `--ssh-agent` to run or create |
 | Minimal VM without image | `smolvm machine run -s Smolfile` (bare VM) |
 | Declarative VM config | Create a Smolfile, use `--smolfile`/`-s` flag |
+
+### Persistence Model
+
+- **`machine run`** — ephemeral. All changes are discarded when the command exits.
+- **`machine exec`** — persistent. Filesystem changes (package installs, config edits) persist across exec sessions for the same machine, whether bare or image-based. Changes are stored in an overlay on the machine's storage disk.
+- **`machine stop` + `start`** — bare VMs persist changes across restarts. Image-based VMs remount the persistent overlay, preserving previous changes.
 
 ## CLI Structure
 

@@ -120,6 +120,9 @@ pub struct RunConfig {
     pub timeout: Option<Duration>,
     /// Whether to allocate a TTY.
     pub tty: bool,
+    /// Persistent overlay ID. If set, the overlay persists across exec sessions
+    /// so filesystem changes (e.g. package installs) survive.
+    pub persistent_overlay_id: Option<String>,
 }
 
 impl RunConfig {
@@ -133,6 +136,7 @@ impl RunConfig {
             mounts: Vec::new(),
             timeout: None,
             tty: false,
+            persistent_overlay_id: None,
         }
     }
 
@@ -163,6 +167,12 @@ impl RunConfig {
     /// Enable TTY mode.
     pub fn with_tty(mut self, tty: bool) -> Self {
         self.tty = tty;
+        self
+    }
+
+    /// Set persistent overlay ID for cross-session filesystem persistence.
+    pub fn with_persistent_overlay(mut self, id: Option<String>) -> Self {
+        self.persistent_overlay_id = id;
         self
     }
 }
@@ -971,87 +981,28 @@ impl AgentClient {
         )
     }
 
-    /// Run a command in an image's rootfs.
+    /// Run a command in an image's rootfs (non-interactive).
     ///
-    /// # Arguments
-    ///
-    /// * `image` - Image reference (must be pulled first)
-    /// * `command` - Command and arguments
-    /// * `env` - Environment variables
-    /// * `workdir` - Working directory inside the rootfs
+    /// This is the non-interactive counterpart to `run_interactive()`.
+    /// Both accept a `RunConfig` for consistency.
     ///
     /// # Returns
     ///
     /// A tuple of (exit_code, stdout, stderr)
-    pub fn run(
-        &mut self,
-        image: &str,
-        command: Vec<String>,
-        env: Vec<(String, String)>,
-        workdir: Option<String>,
-    ) -> Result<(i32, String, String)> {
-        self.run_with_mounts(image, command, env, workdir, Vec::new())
-    }
-
-    /// Run a command in an image's rootfs with volume mounts.
-    ///
-    /// # Arguments
-    ///
-    /// * `image` - Image reference (must be pulled first)
-    /// * `command` - Command and arguments
-    /// * `env` - Environment variables
-    /// * `workdir` - Working directory inside the rootfs
-    /// * `mounts` - Volume mounts as (virtiofs_tag, container_path, read_only)
-    ///
-    /// # Returns
-    ///
-    /// A tuple of (exit_code, stdout, stderr)
-    pub fn run_with_mounts(
-        &mut self,
-        image: &str,
-        command: Vec<String>,
-        env: Vec<(String, String)>,
-        workdir: Option<String>,
-        mounts: Vec<(String, String, bool)>,
-    ) -> Result<(i32, String, String)> {
-        self.run_with_mounts_and_timeout(image, command, env, workdir, mounts, None)
-    }
-
-    /// Run a command in an image's rootfs with volume mounts and optional timeout.
-    ///
-    /// # Arguments
-    ///
-    /// * `image` - Image reference (must be pulled first)
-    /// * `command` - Command and arguments
-    /// * `env` - Environment variables
-    /// * `workdir` - Working directory inside the rootfs
-    /// * `mounts` - Volume mounts as (virtiofs_tag, container_path, read_only)
-    /// * `timeout` - Optional timeout duration. If exceeded, command is killed with exit code 124.
-    ///
-    /// # Returns
-    ///
-    /// A tuple of (exit_code, stdout, stderr)
-    pub fn run_with_mounts_and_timeout(
-        &mut self,
-        image: &str,
-        command: Vec<String>,
-        env: Vec<(String, String)>,
-        workdir: Option<String>,
-        mounts: Vec<(String, String, bool)>,
-        timeout: Option<Duration>,
-    ) -> Result<(i32, String, String)> {
-        let _timeout_guard = self.set_exec_timeout(timeout)?;
-        let timeout_ms = timeout.map(|t| t.as_millis() as u64);
+    pub fn run_non_interactive(&mut self, config: RunConfig) -> Result<(i32, String, String)> {
+        let _timeout_guard = self.set_exec_timeout(config.timeout)?;
+        let timeout_ms = config.timeout.map(|t| t.as_millis() as u64);
 
         let resp = self.request(&AgentRequest::Run {
-            image: image.to_string(),
-            command,
-            env,
-            workdir,
-            mounts,
+            image: config.image,
+            command: config.command,
+            env: config.env,
+            workdir: config.workdir,
+            mounts: config.mounts,
             timeout_ms,
             interactive: false,
             tty: false,
+            persistent_overlay_id: config.persistent_overlay_id,
         })?;
 
         expect_completed(resp, "run command")
@@ -1082,6 +1033,7 @@ impl AgentClient {
                 timeout_ms,
                 interactive: true,
                 tty,
+                persistent_overlay_id: config.persistent_overlay_id,
             },
             tty,
             "run interactive",
