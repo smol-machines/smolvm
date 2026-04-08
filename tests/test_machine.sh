@@ -1369,4 +1369,60 @@ assert 'level' in line, 'missing level'
 
 run_test "Agent: structured JSON logs" test_agent_json_logs || true
 
+# =============================================================================
+# Observational commands should not stop a running VM
+# =============================================================================
+
+# Helper: verify a command doesn't stop an already-running VM.
+# Usage: assert_vm_stays_running "description" command [args...]
+assert_vm_stays_running() {
+    local desc="$1"; shift
+
+    ensure_machine_running
+
+    local status
+    status=$($SMOLVM machine status 2>&1)
+    [[ "$status" == *"running"* ]] || { echo "VM not running before '$desc'"; return 1; }
+
+    "$@" 2>&1 || return 1
+
+    status=$($SMOLVM machine status 2>&1)
+    [[ "$status" == *"running"* ]] || { echo "VM stopped after '$desc'"; return 1; }
+}
+
+test_images_does_not_stop_running_vm() {
+    assert_vm_stays_running "machine images" $SMOLVM machine images
+}
+
+test_prune_refuses_on_running_vm() {
+    ensure_machine_running
+
+    local status
+    status=$($SMOLVM machine status 2>&1)
+    [[ "$status" == *"running"* ]] || { echo "VM not running before test"; return 1; }
+
+    # Prune should refuse while VM is running
+    local output exit_code=0
+    output=$($SMOLVM machine prune 2>&1) || exit_code=$?
+    [[ $exit_code -ne 0 ]] || { echo "prune should have failed on running VM"; return 1; }
+    [[ "$output" == *"cannot prune while the machine is running"* ]] || { echo "unexpected error: $output"; return 1; }
+
+    # VM should still be running
+    status=$($SMOLVM machine status 2>&1)
+    [[ "$status" == *"running"* ]] || { echo "VM stopped after rejected prune"; return 1; }
+}
+
+test_prune_dry_run_refuses_on_running_vm() {
+    ensure_machine_running
+
+    local output exit_code=0
+    output=$($SMOLVM machine prune --dry-run 2>&1) || exit_code=$?
+    [[ $exit_code -ne 0 ]] || { echo "prune --dry-run should have failed on running VM"; return 1; }
+    [[ "$output" == *"cannot prune while the machine is running"* ]]
+}
+
+run_test "Images: does not stop running VM" test_images_does_not_stop_running_vm || true
+run_test "Prune: refuses on running VM" test_prune_refuses_on_running_vm || true
+run_test "Prune --dry-run: refuses on running VM" test_prune_dry_run_refuses_on_running_vm || true
+
 print_summary "Machine Tests"

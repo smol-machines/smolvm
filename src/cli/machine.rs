@@ -1075,7 +1075,8 @@ impl NetworkTestCmd {
         let label = vm_common::vm_label(&self.name);
 
         // Ensure machine is running
-        if manager.try_connect_existing().is_none() {
+        let already_running = manager.try_connect_existing().is_some();
+        if !already_running {
             println!("Starting machine '{}'...", label);
             manager.ensure_running()?;
         }
@@ -1090,7 +1091,10 @@ impl NetworkTestCmd {
             serde_json::to_string_pretty(&result).unwrap_or_default()
         );
 
-        manager.detach();
+        // VM was already running — don't stop it when we're done
+        if already_running {
+            manager.detach();
+        }
         Ok(())
     }
 }
@@ -1119,6 +1123,8 @@ impl ImagesCmd {
         let manager = AgentManager::new_default()?;
 
         let mut client = if manager.try_connect_existing().is_some() {
+            // VM was already running — don't stop it when we're done
+            manager.detach();
             AgentClient::connect_with_retry(manager.vsock_socket())?
         } else {
             println!("Starting machine to query storage...");
@@ -1207,13 +1213,16 @@ impl PruneCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let manager = AgentManager::new_default()?;
 
-        let mut client = if manager.try_connect_existing().is_some() {
-            AgentClient::connect_with_retry(manager.vsock_socket())?
-        } else {
-            println!("Starting machine...");
-            manager.start()?;
-            AgentClient::connect_with_retry(manager.vsock_socket())?
-        };
+        if manager.try_connect_existing().is_some() {
+            return Err(smolvm::Error::agent(
+                "prune",
+                "cannot prune while the machine is running. Stop it first with 'smolvm machine stop'",
+            ));
+        }
+
+        println!("Starting machine...");
+        manager.start()?;
+        let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
 
         if self.all {
             let images = client.list_images()?;

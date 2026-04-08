@@ -51,7 +51,8 @@ smolvm pack create --image python:3.12-alpine -o ./my-python
 
 - **`machine run`** — ephemeral. All changes are discarded when the command exits.
 - **`machine exec`** — persistent. Filesystem changes (package installs, config edits) persist across exec sessions for the same machine, whether bare or image-based. Changes are stored in an overlay on the machine's storage disk.
-- **`machine stop` + `start`** — bare VMs persist changes across restarts. Image-based VMs remount the persistent overlay, preserving previous changes.
+- **`machine stop` + `start`** — changes persist across restarts. The persistent overlay is remounted preserving previous changes.
+- **`pack run`** / **`pack exec`** — ephemeral. Each exec starts fresh from the packed image.
 
 ## CLI Structure
 
@@ -284,6 +285,13 @@ OpenAPI spec: `smolvm serve openapi`
 
 - Machine name defaults to `"default"` when `--name` is omitted
 - Network is **off** by default (security-first)
-- CPUs: 4, Memory: 8192 MiB (elastic via virtio balloon), Storage: 20 GiB, Overlay: 2 GiB
-- Packed binary CPUs: 1, Memory: 256 MiB (lighter defaults for single-purpose workloads)
-- Memory is elastic — the host only commits what the guest actually uses and reclaims the rest via virtio balloon
+- CPUs: 4, Memory: 8192 MiB, Storage: 20 GiB, Overlay: 2 GiB
+- Packed binaries use the same defaults (CPUs: 4, Memory: 8192 MiB)
+- Memory and CPU are elastic via virtio balloon — the host only commits what the guest actually uses and reclaims the rest
+
+## Important Behaviors
+
+- **Observational commands don't stop running VMs.** `machine images`, `machine status`, `machine ls` and similar read-only commands leave a running VM in its current state. If the VM was already running before the command, it stays running after.
+- **`machine prune` requires the VM to be stopped.** Pruning layers while a VM has active containers could break things. Stop the VM first with `machine stop`, then prune.
+- **`machine exec` persists filesystem changes.** Package installs, config edits, and file writes inside `exec` survive across sessions. This works for both bare VMs and image-based VMs (created with `--image`).
+- **`machine run` is always ephemeral.** The VM is created, the command runs, and everything is cleaned up. No state carries over.
