@@ -55,10 +55,11 @@ function toNapiConfig(config: MachineConfig) {
           cpus: config.resources.cpus,
           memoryMb: config.resources.memoryMb,
           network: config.resources.network,
-          storageGb: config.resources.storageGb,
-          overlayGb: config.resources.overlayGb,
+          storageGib: config.resources.storageGib,
+          overlayGib: config.resources.overlayGib,
         }
       : undefined,
+    persistent: config.persistent,
   };
 }
 
@@ -89,6 +90,17 @@ export class Machine {
     this.native = new NapiMachine(toNapiConfig(config));
   }
 
+  private static fromNative(
+    name: string,
+    native: InstanceType<typeof NapiMachine>
+  ): Machine {
+    const machine = Object.create(Machine.prototype) as Machine;
+    (machine as any).name = name;
+    (machine as any).native = native;
+    (machine as any).started = true;
+    return machine;
+  }
+
   /**
    * Create a new machine. Auto-starts unless `persistent: true` is set.
    */
@@ -107,12 +119,7 @@ export class Machine {
    */
   static async connect(name: string): Promise<Machine> {
     try {
-      const config: MachineConfig = { name };
-      const machine = new Machine(config);
-      // Replace native with a connected instance
-      (machine as any).native = NapiMachine.connect(name);
-      machine.started = true;
-      return machine;
+      return Machine.fromNative(name, NapiMachine.connect(name));
     } catch (err) {
       throw parseNativeError(err as Error);
     }

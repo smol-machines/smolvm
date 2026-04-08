@@ -58,9 +58,9 @@ export interface ResourceSpec {
   /** Enable outbound network access (default: false). */
   network?: boolean;
   /** Storage disk size in GiB (default: 20). */
-  storageGb?: number;
+  storageGib?: number;
   /** Overlay disk size in GiB (default: 10). */
-  overlayGb?: number;
+  overlayGib?: number;
 }
 
 // ============================================================================

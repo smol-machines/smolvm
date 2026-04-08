@@ -23,6 +23,8 @@ pub struct MachineConfig {
     pub ports: Option<Vec<PortMappingConfig>>,
     /// VM resource allocation.
     pub resources: Option<VmResourcesConfig>,
+    /// If true, the DB record is kept as a persistent machine.
+    pub persistent: Option<bool>,
 }
 
 /// A host directory mount specification.
@@ -58,9 +60,9 @@ pub struct VmResourcesConfig {
     /// Enable outbound network access (default: false).
     pub network: Option<bool>,
     /// Storage disk size in GiB (default: 20).
-    pub storage_gb: Option<f64>,
+    pub storage_gib: Option<f64>,
     /// Overlay disk size in GiB (default: 10).
-    pub overlay_gb: Option<f64>,
+    pub overlay_gib: Option<f64>,
 }
 
 /// Options for executing a command.
@@ -139,8 +141,9 @@ impl VmResourcesConfig {
             cpus: self.cpus.unwrap_or(1),
             memory_mib: self.memory_mb.unwrap_or(512),
             network: self.network.unwrap_or(false),
-            storage_gib: self.storage_gb.map(|g| g as u64),
-            overlay_gib: self.overlay_gb.map(|g| g as u64),
+            storage_gib: self.storage_gib.map(|g| g as u64),
+            overlay_gib: self.overlay_gib.map(|g| g as u64),
+            allowed_cidrs: None,
         }
     }
 }
@@ -159,7 +162,7 @@ impl From<smolvm_protocol::ImageInfo> for ImageInfo {
 
 /// Parse ExecOptions into the components needed by AgentClient::vm_exec().
 pub fn parse_exec_options(
-    options: &Option<ExecOptions>,
+    options: Option<ExecOptions>,
 ) -> (
     Vec<(String, String)>,
     Option<String>,
@@ -169,21 +172,14 @@ pub fn parse_exec_options(
         Some(opts) => {
             let env = opts
                 .env
-                .as_ref()
-                .map(|vars| {
-                    vars.iter()
-                        .map(|v| (v.key.clone(), v.value.clone()))
-                        .collect()
-                })
+                .map(|vars| vars.into_iter().map(|v| (v.key, v.value)).collect())
                 .unwrap_or_default();
-
-            let workdir = opts.workdir.clone();
 
             let timeout = opts
                 .timeout_secs
                 .map(|s| std::time::Duration::from_secs(s as u64));
 
-            (env, workdir, timeout)
+            (env, opts.workdir, timeout)
         }
         None => (Vec::new(), None, None),
     }
