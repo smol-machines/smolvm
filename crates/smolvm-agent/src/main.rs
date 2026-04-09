@@ -1109,6 +1109,7 @@ fn handle_request(request: AgentRequest) -> AgentResponse {
             timeout_ms,
             interactive: false,
             tty: false,
+            persistent_overlay_id,
         } => handle_run(
             &image,
             &command,
@@ -1116,6 +1117,7 @@ fn handle_request(request: AgentRequest) -> AgentResponse {
             workdir.as_deref(),
             &mounts,
             timeout_ms,
+            persistent_overlay_id.as_deref(),
         ),
 
         AgentRequest::Run { .. } => {
@@ -1218,30 +1220,46 @@ fn handle_interactive_run(
     stream: &mut impl ReadWrite,
     request: AgentRequest,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (image, command, env, workdir, mounts, timeout_ms, tty) = match request {
-        AgentRequest::Run {
-            image,
-            command,
-            env,
-            workdir,
-            mounts,
-            timeout_ms,
-            tty,
-            ..
-        } => (image, command, env, workdir, mounts, timeout_ms, tty),
-        _ => {
-            send_response(
-                stream,
-                &AgentResponse::error("expected Run request", error_codes::INVALID_REQUEST),
-            )?;
-            return Ok(());
-        }
-    };
+    let (image, command, env, workdir, mounts, timeout_ms, tty, persistent_overlay_id) =
+        match request {
+            AgentRequest::Run {
+                image,
+                command,
+                env,
+                workdir,
+                mounts,
+                timeout_ms,
+                tty,
+                persistent_overlay_id,
+                ..
+            } => (
+                image,
+                command,
+                env,
+                workdir,
+                mounts,
+                timeout_ms,
+                tty,
+                persistent_overlay_id,
+            ),
+            _ => {
+                send_response(
+                    stream,
+                    &AgentResponse::error("expected Run request", error_codes::INVALID_REQUEST),
+                )?;
+                return Ok(());
+            }
+        };
 
-    info!(image = %image, command = ?command, tty = tty, "starting interactive run");
+    let is_persistent = persistent_overlay_id.is_some();
+    info!(image = %image, command = ?command, tty = tty, persistent = is_persistent, "starting interactive run");
 
     // Prepare the overlay and get the rootfs path
-    let prepared = match storage::prepare_for_run(&image) {
+    let prepared = match &persistent_overlay_id {
+        Some(id) => storage::prepare_for_run_persistent(&image, id),
+        None => storage::prepare_for_run(&image),
+    };
+    let prepared = match prepared {
         Ok(prepared) => prepared,
         Err(e) => {
             send_response(stream, &AgentResponse::from_err(e, error_codes::RUN_FAILED))?;
@@ -1250,8 +1268,15 @@ fn handle_interactive_run(
     };
 
     // Setup virtiofs mounts at staging area (crun will bind-mount them via OCI spec)
+    // Helper: only clean up ephemeral overlays, not persistent ones
+    let maybe_cleanup = |wid: &str| {
+        if !is_persistent {
+            let _ = storage::cleanup_overlay(wid);
+        }
+    };
+
     if let Err(e) = storage::setup_mounts(&prepared.rootfs_path, &mounts) {
-        let _ = storage::cleanup_overlay(&prepared.workload_id);
+        maybe_cleanup(&prepared.workload_id);
         send_response(
             stream,
             &AgentResponse::from_err(e, error_codes::MOUNT_FAILED),
@@ -1270,7 +1295,7 @@ fn handle_interactive_run(
     ) {
         Ok(result) => result,
         Err(e) => {
-            let _ = storage::cleanup_overlay(&prepared.workload_id);
+            maybe_cleanup(&prepared.workload_id);
             send_response(
                 stream,
                 &AgentResponse::from_err(e, error_codes::SPAWN_FAILED),
@@ -1288,14 +1313,14 @@ fn handle_interactive_run(
         Some(pty) => match run_interactive_loop_pty(stream, &mut child, pty, timeout_ms) {
             Ok(exit_code) => exit_code,
             Err(e) => {
-                let _ = storage::cleanup_overlay(&prepared.workload_id);
+                maybe_cleanup(&prepared.workload_id);
                 return Err(e);
             }
         },
         _ => match run_interactive_loop(stream, &mut child, timeout_ms) {
             Ok(exit_code) => exit_code,
             Err(e) => {
-                let _ = storage::cleanup_overlay(&prepared.workload_id);
+                maybe_cleanup(&prepared.workload_id);
                 return Err(e);
             }
         },
@@ -1303,7 +1328,7 @@ fn handle_interactive_run(
 
     // Send Exited response
     send_response(stream, &AgentResponse::Exited { exit_code })?;
-    let _ = storage::cleanup_overlay(&prepared.workload_id);
+    maybe_cleanup(&prepared.workload_id);
 
     Ok(())
 }
@@ -2129,10 +2154,19 @@ fn handle_run(
     workdir: Option<&str>,
     mounts: &[(String, String, bool)],
     timeout_ms: Option<u64>,
+    persistent_overlay_id: Option<&str>,
 ) -> AgentResponse {
-    info!(image = %image, command = ?command, mounts = ?mounts, timeout_ms = ?timeout_ms, "running command");
+    info!(image = %image, command = ?command, mounts = ?mounts, timeout_ms = ?timeout_ms, persistent = persistent_overlay_id.is_some(), "running command");
 
-    match storage::run_command(image, command, env, workdir, mounts, timeout_ms) {
+    match storage::run_command(
+        image,
+        command,
+        env,
+        workdir,
+        mounts,
+        timeout_ms,
+        persistent_overlay_id,
+    ) {
         Ok(result) => AgentResponse::Completed {
             exit_code: result.exit_code,
             stdout: result.stdout,

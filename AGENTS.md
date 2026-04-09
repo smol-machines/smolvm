@@ -10,13 +10,21 @@ smolvm machine run --net --image alpine -- echo hello
 smolvm machine run --net -it --image alpine -- /bin/sh   # interactive shell
 smolvm machine run --net --image python:3.12-alpine -- python3 script.py
 
-# Persistent (survives stop/start)
+# Persistent (survives across exec sessions and stop/start)
 smolvm machine create --net myvm
 smolvm machine start --name myvm
-smolvm machine exec --name myvm -- apk add python3
+smolvm machine exec --name myvm -- apk add python3   # installs persist
+smolvm machine exec --name myvm -- which python3      # still there
 smolvm machine exec --name myvm -it -- /bin/sh
 smolvm machine stop --name myvm
 smolvm machine delete myvm
+
+# Image-based persistent (filesystem changes persist across exec sessions)
+smolvm machine create --net --image ubuntu myvm
+smolvm machine start --name myvm
+smolvm machine exec --name myvm -- apt-get update
+smolvm machine exec --name myvm -- apt-get install -y python3
+smolvm machine exec --name myvm -- which python3      # still there after exit+re-exec
 
 # SSH agent forwarding (git/ssh without exposing keys)
 smolvm machine run --ssh-agent --net --image alpine -- ssh-add -l
@@ -38,6 +46,13 @@ smolvm pack create --image python:3.12-alpine -o ./my-python
 | Use git/ssh with private keys safely | Add `--ssh-agent` to run or create |
 | Minimal VM without image | `smolvm machine run -s Smolfile` (bare VM) |
 | Declarative VM config | Create a Smolfile, use `--smolfile`/`-s` flag |
+
+### Persistence Model
+
+- **`machine run`** — ephemeral. All changes are discarded when the command exits.
+- **`machine exec`** — persistent. Filesystem changes (package installs, config edits) persist across exec sessions for the same machine, whether bare or image-based. Changes are stored in an overlay on the machine's storage disk.
+- **`machine stop` + `start`** — changes persist across restarts. The persistent overlay is remounted preserving previous changes.
+- **`pack run`** / **`pack exec`** — ephemeral. Each exec starts fresh from the packed image.
 
 ## CLI Structure
 
@@ -270,6 +285,13 @@ OpenAPI spec: `smolvm serve openapi`
 
 - Machine name defaults to `"default"` when `--name` is omitted
 - Network is **off** by default (security-first)
-- CPUs: 4, Memory: 8192 MiB (elastic via virtio balloon), Storage: 20 GiB, Overlay: 2 GiB
-- Packed binary CPUs: 1, Memory: 256 MiB (lighter defaults for single-purpose workloads)
-- Memory is elastic — the host only commits what the guest actually uses and reclaims the rest via virtio balloon
+- CPUs: 4, Memory: 8192 MiB, Storage: 20 GiB, Overlay: 2 GiB
+- Packed binaries use the same defaults (CPUs: 4, Memory: 8192 MiB)
+- Memory and CPU are elastic via virtio balloon — the host only commits what the guest actually uses and reclaims the rest
+
+## Important Behaviors
+
+- **Observational commands don't stop running VMs.** `machine images`, `machine status`, `machine ls` and similar read-only commands leave a running VM in its current state. If the VM was already running before the command, it stays running after.
+- **`machine prune` requires the VM to be stopped.** Pruning layers while a VM has active containers could break things. Stop the VM first with `machine stop`, then prune.
+- **`machine exec` persists filesystem changes.** Package installs, config edits, and file writes inside `exec` survive across sessions. This works for both bare VMs and image-based VMs (created with `--image`).
+- **`machine run` is always ephemeral.** The VM is created, the command runs, and everything is cleaned up. No state carries over.

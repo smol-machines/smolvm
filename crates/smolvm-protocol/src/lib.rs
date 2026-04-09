@@ -209,6 +209,12 @@ pub enum AgentRequest {
         /// Enables terminal features like colors, line editing, and signal handling.
         #[serde(default)]
         tty: bool,
+        /// If set, use a persistent overlay that survives across exec sessions.
+        /// The overlay is identified by this ID (typically the machine name)
+        /// and reused on subsequent runs. If not set, an ephemeral overlay is
+        /// created and destroyed after the run.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        persistent_overlay_id: Option<String>,
     },
 
     /// Send stdin data to a running interactive command.

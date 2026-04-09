@@ -11,9 +11,9 @@ use clap::{Args, Subcommand};
 use smolvm::agent::{AgentClient, AgentManager, PullOptions, VmResources};
 use smolvm::data::resources::DEFAULT_MICROVM_CPU_COUNT;
 
-/// Default memory for packed VMs (lower than machine create because
-/// packed VMs are typically single-purpose, minimal workloads).
-pub(crate) const PACK_DEFAULT_MEMORY_MIB: u32 = 256;
+/// Default memory for packed VMs. Same as machine create — memory is elastic
+/// via virtio balloon, so the host only commits what the guest actually uses.
+pub(crate) const PACK_DEFAULT_MEMORY_MIB: u32 = 8192;
 use smolvm::config::{RecordState, SmolvmConfig};
 use smolvm::platform::{Arch, Os, VmExecutor};
 use smolvm::Error;
@@ -86,8 +86,7 @@ pub struct PackCreateCmd {
     #[arg(long, default_value_t = DEFAULT_MICROVM_CPU_COUNT, value_name = "N")]
     pub cpus: u8,
 
-    /// Default memory in MiB for the packed VM (lower than machine create
-    /// because packed VMs are typically single-purpose, minimal workloads)
+    /// Default memory in MiB for the packed VM
     #[arg(long, default_value_t = PACK_DEFAULT_MEMORY_MIB, value_name = "MiB")]
     pub mem: u32,
 

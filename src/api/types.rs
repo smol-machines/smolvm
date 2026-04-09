@@ -239,6 +239,9 @@ pub struct LogsQuery {
     #[serde(default)]
     #[schema(example = 100)]
     pub tail: Option<usize>,
+    /// Output format: "raw" (default) or "json" (only emit valid JSON lines).
+    #[serde(default)]
+    pub format: Option<String>,
 }
 
 // ============================================================================

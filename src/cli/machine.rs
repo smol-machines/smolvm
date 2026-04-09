@@ -495,14 +495,12 @@ impl RunCmd {
                         .with_tty(tty);
                     client.run_interactive(config)?
                 } else {
-                    let (exit_code, stdout, stderr) = client.run_with_mounts_and_timeout(
-                        img,
-                        command,
-                        env,
-                        params.workdir.clone(),
-                        mount_bindings,
-                        self.timeout,
-                    )?;
+                    let config = RunConfig::new(img, command)
+                        .with_env(env)
+                        .with_workdir(params.workdir.clone())
+                        .with_mounts(mount_bindings)
+                        .with_timeout(self.timeout);
+                    let (exit_code, stdout, stderr) = client.run_non_interactive(config)?;
                     if !stdout.is_empty() {
                         print!("{}", stdout);
                     }
@@ -703,7 +701,7 @@ impl ExecCmd {
         }
 
         // Check if this machine has an image — if so, exec inside the image's
-        // rootfs via client.run() instead of bare vm_exec().
+        // rootfs via client.run_interactive()/run_non_interactive() instead of bare vm_exec().
         let record_image = {
             let name = self.name.clone().unwrap_or_else(|| "default".to_string());
             smolvm::db::SmolvmDb::open()
@@ -714,6 +712,9 @@ impl ExecCmd {
 
         if let Some(ref image) = record_image {
             // Image-based machine: exec inside the image's rootfs via crun.
+            // Use machine name as persistent overlay ID so filesystem changes
+            // (e.g. package installs) survive across exec sessions.
+            let machine_name = self.name.clone().unwrap_or_else(|| "default".to_string());
             let mount_bindings = vec![]; // mounts were set at create time
             if self.interactive || self.tty {
                 let config = smolvm::agent::RunConfig::new(image, self.command.clone())
@@ -721,20 +722,20 @@ impl ExecCmd {
                     .with_workdir(self.workdir.clone())
                     .with_mounts(mount_bindings)
                     .with_timeout(self.timeout)
-                    .with_tty(self.tty);
+                    .with_tty(self.tty)
+                    .with_persistent_overlay(Some(machine_name.clone()));
                 let exit_code = client.run_interactive(config)?;
                 manager.detach();
                 std::process::exit(exit_code);
             }
 
-            let (exit_code, stdout, stderr) = client.run_with_mounts_and_timeout(
-                image,
-                self.command.clone(),
-                env,
-                self.workdir.clone(),
-                mount_bindings,
-                self.timeout,
-            )?;
+            let config = smolvm::agent::RunConfig::new(image, self.command.clone())
+                .with_env(env)
+                .with_workdir(self.workdir.clone())
+                .with_mounts(mount_bindings)
+                .with_timeout(self.timeout)
+                .with_persistent_overlay(Some(machine_name));
+            let (exit_code, stdout, stderr) = client.run_non_interactive(config)?;
             vm_common::print_output_and_exit(&manager, exit_code, &stdout, &stderr);
         } else {
             // Bare VM: exec directly in the VM rootfs.
@@ -1074,7 +1075,8 @@ impl NetworkTestCmd {
         let label = vm_common::vm_label(&self.name);
 
         // Ensure machine is running
-        if manager.try_connect_existing().is_none() {
+        let already_running = manager.try_connect_existing().is_some();
+        if !already_running {
             println!("Starting machine '{}'...", label);
             manager.ensure_running()?;
         }
@@ -1089,7 +1091,10 @@ impl NetworkTestCmd {
             serde_json::to_string_pretty(&result).unwrap_or_default()
         );
 
-        manager.detach();
+        // VM was already running — don't stop it when we're done
+        if already_running {
+            manager.detach();
+        }
         Ok(())
     }
 }
@@ -1117,8 +1122,9 @@ impl ImagesCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let manager = AgentManager::new_default()?;
 
-        let attached_to_existing = manager.try_connect_existing().is_some();
-        let mut client = if attached_to_existing {
+        let mut client = if manager.try_connect_existing().is_some() {
+            // VM was already running — don't stop it when we're done
+            manager.detach();
             AgentClient::connect_with_retry(manager.vsock_socket())?
         } else {
             println!("Starting machine to query storage...");
@@ -1175,9 +1181,6 @@ impl ImagesCmd {
             }
         }
 
-        if attached_to_existing {
-            manager.detach();
-        }
         Ok(())
     }
 }

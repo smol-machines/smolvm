@@ -1487,6 +1487,46 @@ impl OverlaySetup {
         self.create_bundle()?;
         Ok(self.into_overlay_info())
     }
+
+    /// Reuse an existing persistent overlay or create a new one.
+    ///
+    /// If the overlay is already mounted, returns it immediately.
+    /// If the overlay directory exists but is not mounted (e.g. after VM restart),
+    /// remounts it preserving the upper layer (which contains previous changes).
+    /// If the overlay does not exist at all, creates it fresh.
+    fn execute_or_remount(self, lowerdirs: Vec<String>) -> Result<OverlayInfo> {
+        // Already mounted — just reuse it
+        if self.merged_path.exists() && is_mountpoint(&self.merged_path) {
+            info!(workload_id = %self.workload_id, "reusing existing persistent overlay");
+            self.create_bundle()?;
+            return Ok(self.into_overlay_info());
+        }
+
+        // Upper layer exists from a previous session — remount preserving it
+        if self.upper_path.exists() {
+            info!(workload_id = %self.workload_id, "remounting persistent overlay with existing upper layer");
+
+            // overlayfs requires an empty work directory at mount time
+            if self.work_path.exists() {
+                let _ = std::fs::remove_dir_all(&self.work_path);
+            }
+            std::fs::create_dir_all(&self.work_path)?;
+            std::fs::create_dir_all(&self.merged_path)?;
+
+            self.verify_layers(&lowerdirs)?;
+            self.mount(&lowerdirs)?;
+
+            let entry_count = self.verify_mount();
+            info!(workload_id = %self.workload_id, entry_count = entry_count, "persistent overlay remounted");
+
+            self.create_bundle()?;
+            return Ok(self.into_overlay_info());
+        }
+
+        // First time — full setup
+        info!(workload_id = %self.workload_id, "creating new persistent overlay");
+        self.execute(lowerdirs)
+    }
 }
 
 /// Prepare an overlay filesystem for a workload.
@@ -1572,6 +1612,56 @@ fn prepare_overlay_from_packed(
 
     // Use shared overlay setup logic
     OverlaySetup::new(workload_id).execute(lowerdirs)
+}
+
+/// Build lowerdir list from a pulled OCI image's layers.
+fn get_image_lowerdirs(image: &str) -> Result<Vec<String>> {
+    let info = query_image(image)?
+        .ok_or_else(|| StorageError::new(format!("image not found: {}", image)))?;
+
+    let root = Path::new(STORAGE_ROOT);
+    Ok(info
+        .layers
+        .iter()
+        .rev()
+        .map(|digest| {
+            let id = digest.strip_prefix("sha256:").unwrap_or(digest);
+            root.join(LAYERS_DIR).join(id).display().to_string()
+        })
+        .collect())
+}
+
+/// Build lowerdir list from pre-packed layer directories.
+fn get_packed_lowerdirs(packed_dir: &Path) -> Result<Vec<String>> {
+    let mut layer_dirs: Vec<PathBuf> = Vec::new();
+
+    let entries = std::fs::read_dir(packed_dir)
+        .map_err(|e| StorageError::read_error(packed_dir.display().to_string(), e))?;
+
+    for entry in entries {
+        let entry: std::fs::DirEntry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.ends_with(".tar") {
+                layer_dirs.push(path);
+            }
+        }
+    }
+
+    if layer_dirs.is_empty() {
+        return Err(StorageError::new(format!(
+            "no layer directories found in {}",
+            packed_dir.display()
+        )));
+    }
+
+    layer_dirs.sort();
+    Ok(layer_dirs
+        .iter()
+        .rev()
+        .map(|path| path.display().to_string())
+        .collect())
 }
 
 /// Clean up an overlay filesystem.
@@ -1678,7 +1768,10 @@ fn prepare_rootfs_for_ephemeral_run(image: &str) -> Result<PreparedOverlayRootfs
 }
 
 /// Run a command in an image's overlay rootfs using crun OCI runtime.
-/// Uses a persistent overlay per image for fast repeated execution.
+///
+/// When `persistent_overlay_id` is `Some`, the overlay persists across runs
+/// (filesystem changes accumulate). When `None`, an ephemeral overlay is
+/// created and destroyed after the run.
 pub fn run_command(
     image: &str,
     command: &[String],
@@ -1686,13 +1779,17 @@ pub fn run_command(
     workdir: Option<&str>,
     mounts: &[(String, String, bool)],
     timeout_ms: Option<u64>,
+    persistent_overlay_id: Option<&str>,
 ) -> Result<RunResult> {
     // Validate inputs
     crate::oci::validate_image_reference(image).map_err(StorageError::new)?;
     crate::oci::validate_env_vars(env).map_err(StorageError::new)?;
 
-    let prepared = prepare_rootfs_for_ephemeral_run(image)?;
-    debug!(rootfs = %prepared.rootfs_path, "using overlay for command execution");
+    let prepared = match persistent_overlay_id {
+        Some(id) => prepare_for_run_persistent(image, id)?,
+        None => prepare_rootfs_for_ephemeral_run(image)?,
+    };
+    debug!(rootfs = %prepared.rootfs_path, persistent = persistent_overlay_id.is_some(), "using overlay for command execution");
 
     // Gather all steps to run a command in a single anon function
     let result = (|| {
@@ -1736,7 +1833,10 @@ pub fn run_command(
         result
     })();
 
-    let _ = cleanup_overlay(&prepared.workload_id);
+    // Only clean up ephemeral overlays; persistent ones survive across runs
+    if persistent_overlay_id.is_none() {
+        let _ = cleanup_overlay(&prepared.workload_id);
+    }
     result
 }
 
@@ -1744,6 +1844,36 @@ pub fn run_command(
 /// This is used by interactive mode which spawns the command separately.
 pub fn prepare_for_run(image: &str) -> Result<PreparedOverlayRootfs> {
     prepare_rootfs_for_ephemeral_run(image)
+}
+
+/// Prepare a persistent overlay that survives across exec sessions.
+///
+/// Uses a deterministic workload ID derived from `overlay_id` (typically the
+/// machine name). If the overlay already exists and is mounted, reuses it.
+/// If it exists but is unmounted (e.g. after VM restart), remounts preserving
+/// the upper layer that contains previous changes.
+pub fn prepare_for_run_persistent(image: &str, overlay_id: &str) -> Result<PreparedOverlayRootfs> {
+    let workload_id = format!("persistent-{}", overlay_id);
+
+    // Resolve image layers (same logic as prepare_overlay)
+    let lowerdirs = if let Some(packed_dir) = get_packed_layers_dir() {
+        get_packed_lowerdirs(&packed_dir)?
+    } else {
+        get_image_lowerdirs(image)?
+    };
+
+    let setup = OverlaySetup::new(&workload_id);
+    let overlay = setup.execute_or_remount(lowerdirs)?;
+
+    debug!(
+        workload_id = %workload_id,
+        rootfs = %overlay.rootfs_path,
+        "prepared persistent overlay for command execution"
+    );
+    Ok(PreparedOverlayRootfs {
+        workload_id,
+        rootfs_path: overlay.rootfs_path,
+    })
 }
 
 /// Setup volume mounts for a rootfs (public wrapper).
