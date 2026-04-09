@@ -1117,7 +1117,8 @@ impl ImagesCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let manager = AgentManager::new_default()?;
 
-        let mut client = if manager.try_connect_existing().is_some() {
+        let attached_to_existing = manager.try_connect_existing().is_some();
+        let mut client = if attached_to_existing {
             AgentClient::connect_with_retry(manager.vsock_socket())?
         } else {
             println!("Starting machine to query storage...");
@@ -1174,6 +1175,9 @@ impl ImagesCmd {
             }
         }
 
+        if attached_to_existing {
+            manager.detach();
+        }
         Ok(())
     }
 }
@@ -1206,7 +1210,8 @@ impl PruneCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let manager = AgentManager::new_default()?;
 
-        let mut client = if manager.try_connect_existing().is_some() {
+        let attached_to_existing = manager.try_connect_existing().is_some();
+        let mut client = if attached_to_existing {
             AgentClient::connect_with_retry(manager.vsock_socket())?
         } else {
             println!("Starting machine...");
@@ -1219,6 +1224,9 @@ impl PruneCmd {
 
             if images.is_empty() {
                 println!("No cached images to remove.");
+                if attached_to_existing {
+                    manager.detach();
+                }
                 return Ok(());
             }
 
@@ -1266,6 +1274,9 @@ impl PruneCmd {
             }
         }
 
+        if attached_to_existing {
+            manager.detach();
+        }
         Ok(())
     }
 }

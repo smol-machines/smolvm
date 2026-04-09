@@ -926,14 +926,18 @@ test_machine_images() {
     $SMOLVM machine create --net default 2>/dev/null || true
     $SMOLVM machine start --name default 2>/dev/null || true
 
-    local output
+    local output list_after
     output=$($SMOLVM machine images 2>&1)
+
+    # Observational command must not stop a VM we attached to (#81)
+    list_after=$($SMOLVM machine ls --json 2>&1)
 
     $SMOLVM machine stop 2>/dev/null || true
     $SMOLVM machine delete default -f 2>/dev/null || true
 
     # Should show storage info
     [[ "$output" == *"Storage"* ]] || [[ "$output" == *"storage"* ]]
+    [[ "$list_after" == *'"state": "running"'* ]]
 }
 
 test_machine_prune_dry_run() {
@@ -942,14 +946,17 @@ test_machine_prune_dry_run() {
     $SMOLVM machine create --net default 2>/dev/null || true
     $SMOLVM machine start --name default 2>/dev/null || true
 
-    local output
+    local output list_after
     output=$($SMOLVM machine prune --dry-run 2>&1)
+
+    list_after=$($SMOLVM machine ls --json 2>&1)
 
     $SMOLVM machine stop 2>/dev/null || true
     $SMOLVM machine delete default -f 2>/dev/null || true
 
     # Should complete without error
     [[ $? -eq 0 ]] || [[ "$output" == *"unreferenced"* ]] || [[ "$output" == *"No unreferenced"* ]]
+    [[ "$list_after" == *'"state": "running"'* ]]
 }
 
 # =============================================================================
