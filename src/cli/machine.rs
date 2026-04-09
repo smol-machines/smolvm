@@ -20,9 +20,41 @@ use smolvm::agent::{docker_config_mount, AgentClient, AgentManager, RunConfig, V
 use smolvm::data::network::PortMapping;
 use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
 use smolvm::data::storage::HostMount;
+use smolvm::network::{plan_launch_network, NetworkBackend};
 use smolvm::{DEFAULT_IDLE_CMD, DEFAULT_SHELL_CMD};
 use std::path::PathBuf;
 use std::time::Duration;
+
+fn warn_backend_fallback(
+    requested_backend: Option<NetworkBackend>,
+    resources: &VmResources,
+    dns_filter_hosts: Option<&[String]>,
+    port_count: usize,
+) {
+    if requested_backend != Some(NetworkBackend::VirtioNet) {
+        return;
+    }
+
+    let plan = plan_launch_network(resources, dns_filter_hosts, port_count);
+    if let Some(reason) = plan.fallback_reason {
+        eprintln!("warning: {}", reason.user_message());
+    }
+}
+
+fn validate_network_backend_request(
+    requested_backend: Option<NetworkBackend>,
+    net_enabled: bool,
+    port_count: usize,
+) -> smolvm::Result<()> {
+    if requested_backend == Some(NetworkBackend::VirtioNet) && !net_enabled && port_count == 0 {
+        return Err(smolvm::Error::config(
+            "--net-backend",
+            "--net-backend virtio requires --net",
+        ));
+    }
+
+    Ok(())
+}
 
 /// Resolve `--allow-cidr`, `--allow-host`, and `--outbound-localhost-only` into a CIDR list,
 /// net flag, and the original hostname list (for DNS filtering).
@@ -215,6 +247,15 @@ pub struct RunCmd {
     #[arg(long, help_heading = "Network")]
     pub net: bool,
 
+    /// Select the networking backend.
+    #[arg(
+        long = "net-backend",
+        value_enum,
+        hide = true,
+        help_heading = "Network"
+    )]
+    pub net_backend: Option<NetworkBackend>,
+
     /// Allow egress to specific CIDR range (can be used multiple times, implies --net)
     #[arg(long = "allow-cidr", value_parser = parse_cidr, value_name = "CIDR", help_heading = "Network")]
     pub allow_cidr: Vec<String>,
@@ -265,7 +306,7 @@ impl RunCmd {
     pub fn run(self) -> smolvm::Result<()> {
         use smolvm::Error;
 
-        let (cli_allow_cidrs, net, dns_filter_hosts) = resolve_egress_flags(
+        let (cli_allow_cidrs, net, cli_dns_filter_hosts) = resolve_egress_flags(
             self.allow_cidr,
             self.allow_host,
             self.outbound_localhost_only,
@@ -282,6 +323,7 @@ impl RunCmd {
             self.volume,
             self.port,
             net,
+            self.net_backend,
             vec![],
             self.env,
             self.workdir,
@@ -290,6 +332,17 @@ impl RunCmd {
             self.overlay,
             cli_allow_cidrs,
         )?;
+
+        let mut params = params;
+        params.dns_filter_hosts = match (params.dns_filter_hosts.take(), cli_dns_filter_hosts) {
+            (Some(mut from_smolfile), Some(mut from_cli)) => {
+                from_smolfile.append(&mut from_cli);
+                Some(from_smolfile)
+            }
+            (Some(from_smolfile), None) => Some(from_smolfile),
+            (None, some) => some,
+        };
+        validate_network_backend_request(params.network_backend, params.net, params.port.len())?;
 
         let mut mounts = HostMount::parse(&params.volume)?;
         let ports = params.port.clone();
@@ -325,10 +378,17 @@ impl RunCmd {
             cpus: params.cpus,
             memory_mib: params.mem,
             network: params.net,
+            network_backend: params.network_backend,
             storage_gib: params.storage_gb,
             overlay_gib: params.overlay_gb,
             allowed_cidrs: params.allowed_cidrs.clone(),
         };
+        warn_backend_fallback(
+            params.network_backend,
+            &resources,
+            params.dns_filter_hosts.as_deref(),
+            params.port.len(),
+        );
 
         let manager = AgentManager::new_default_with_sizes(params.storage_gb, params.overlay_gb)
             .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
@@ -356,7 +416,7 @@ impl RunCmd {
 
         let features = smolvm::agent::LaunchFeatures {
             ssh_agent_socket,
-            dns_filter_hosts,
+            dns_filter_hosts: params.dns_filter_hosts.clone(),
         };
 
         let freshly_started = manager
@@ -475,8 +535,10 @@ impl RunCmd {
                                 mounts: mount_tuples,
                                 ports: port_tuples,
                                 network: params.net,
+                                network_backend: params.network_backend,
                                 storage_gb: params.storage_gb,
                                 overlay_gb: params.overlay_gb,
+                                allowed_cidrs: params.allowed_cidrs.clone(),
                                 init: params.init.clone(),
                                 env: parse_env_list(&params.env),
                                 workdir: params.workdir.clone(),
@@ -484,6 +546,7 @@ impl RunCmd {
                                 entrypoint: params.entrypoint.clone(),
                                 cmd: params.cmd.clone(),
                                 ssh_agent: self.ssh_agent || params.ssh_agent,
+                                dns_filter_hosts: params.dns_filter_hosts.clone(),
                             }),
                         );
                     }
@@ -581,8 +644,10 @@ impl RunCmd {
                                 mounts: mount_tuples,
                                 ports: port_tuples,
                                 network: params.net,
+                                network_backend: params.network_backend,
                                 storage_gb: params.storage_gb,
                                 overlay_gb: params.overlay_gb,
+                                allowed_cidrs: params.allowed_cidrs.clone(),
                                 init: params.init.clone(),
                                 env: parse_env_list(&params.env),
                                 workdir: params.workdir.clone(),
@@ -590,6 +655,7 @@ impl RunCmd {
                                 entrypoint: params.entrypoint.clone(),
                                 cmd: params.cmd.clone(),
                                 ssh_agent: self.ssh_agent || params.ssh_agent,
+                                dns_filter_hosts: params.dns_filter_hosts.clone(),
                             }),
                         );
                     }
@@ -837,6 +903,10 @@ pub struct CreateCmd {
     #[arg(long)]
     pub net: bool,
 
+    /// Select the networking backend.
+    #[arg(long = "net-backend", value_enum, hide = true)]
+    pub net_backend: Option<NetworkBackend>,
+
     /// Allow egress to specific CIDR range (can be used multiple times, implies --net)
     #[arg(long = "allow-cidr", value_parser = parse_cidr, value_name = "CIDR")]
     pub allow_cidr: Vec<String>,
@@ -872,7 +942,7 @@ pub struct CreateCmd {
 
 impl CreateCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        let (cli_allow_cidrs, net, _dns_filter_hosts) = resolve_egress_flags(
+        let (cli_allow_cidrs, net, cli_dns_filter_hosts) = resolve_egress_flags(
             self.allow_cidr,
             self.allow_host,
             self.outbound_localhost_only,
@@ -893,6 +963,7 @@ impl CreateCmd {
             self.volume,
             self.port,
             net,
+            self.net_backend,
             self.init,
             self.env,
             self.workdir,
@@ -902,6 +973,30 @@ impl CreateCmd {
             cli_allow_cidrs,
         )?;
         let mut params = params;
+        params.dns_filter_hosts = match (params.dns_filter_hosts.take(), cli_dns_filter_hosts) {
+            (Some(mut from_smolfile), Some(mut from_cli)) => {
+                from_smolfile.append(&mut from_cli);
+                Some(from_smolfile)
+            }
+            (Some(from_smolfile), None) => Some(from_smolfile),
+            (None, some) => some,
+        };
+        validate_network_backend_request(params.network_backend, params.net, params.port.len())?;
+        let resources = VmResources {
+            cpus: params.cpus,
+            memory_mib: params.mem,
+            network: params.net,
+            network_backend: params.network_backend,
+            storage_gib: params.storage_gb,
+            overlay_gib: params.overlay_gb,
+            allowed_cidrs: params.allowed_cidrs.clone(),
+        };
+        warn_backend_fallback(
+            params.network_backend,
+            &resources,
+            params.dns_filter_hosts.as_deref(),
+            params.port.len(),
+        );
         if self.ssh_agent {
             params.ssh_agent = true;
         }

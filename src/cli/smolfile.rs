@@ -8,6 +8,7 @@ use crate::cli::parsers::parse_cidr;
 use crate::cli::vm_common::CreateVmParams;
 use smolvm::data::network::PortMapping;
 use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
+use smolvm::network::NetworkBackend;
 use std::path::PathBuf;
 
 // Re-export from the library
@@ -40,6 +41,7 @@ pub fn build_create_params(
     cli_volume: Vec<String>,
     cli_port: Vec<PortMapping>,
     cli_net: bool,
+    cli_network_backend: Option<NetworkBackend>,
     cli_init: Vec<String>,
     cli_env: Vec<String>,
     cli_workdir: Option<String>,
@@ -64,6 +66,7 @@ pub fn build_create_params(
                 volume: cli_volume,
                 port: cli_port,
                 net,
+                network_backend: cli_network_backend,
                 init: cli_init,
                 env: cli_env,
                 workdir: cli_workdir,
@@ -251,6 +254,7 @@ pub fn build_create_params(
         volume: volumes,
         port: ports,
         net,
+        network_backend: cli_network_backend,
         init,
         env,
         workdir,

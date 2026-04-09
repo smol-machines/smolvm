@@ -7,6 +7,8 @@ pub const DEFAULT_MICROVM_CPU_COUNT: u8 = 4;
 /// reservation — the host only consumes what the guest actually uses.
 pub const DEFAULT_MICROVM_MEMORY_MIB: u32 = 8192;
 
+use crate::network::NetworkBackend;
+
 /// Resources available to a micro vm.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct VmResources {
@@ -16,6 +18,9 @@ pub struct VmResources {
     pub memory_mib: u32,
     /// Enable outbound network access (TSI).
     pub network: bool,
+    /// Preferred network backend override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_backend: Option<NetworkBackend>,
     /// Storage disk size in GiB (None = default 20 GiB).
     pub storage_gib: Option<u64>,
     /// Overlay disk size in GiB (None = default 10 GiB).
@@ -31,6 +36,7 @@ impl Default for VmResources {
             cpus: DEFAULT_MICROVM_CPU_COUNT,
             memory_mib: DEFAULT_MICROVM_MEMORY_MIB,
             network: false,
+            network_backend: None,
             storage_gib: None,
             overlay_gib: None,
             allowed_cidrs: None,
