@@ -4,6 +4,7 @@
 //! which runs the smolvm-agent for OCI image management and command execution.
 
 use crate::data::validate_vm_name;
+use crate::embedded::configured_paths;
 use crate::error::{Error, Result};
 use crate::process::{self, ChildProcess};
 use crate::storage::{OverlayDisk, StorageDisk};
@@ -451,6 +452,12 @@ impl AgentManager {
     /// platform data directory (`~/.local/share/smolvm/agent-rootfs` on Linux,
     /// `~/Library/Application Support/smolvm/agent-rootfs` on macOS).
     pub fn default_rootfs_path() -> Result<PathBuf> {
+        if let Ok(configured) = configured_paths() {
+            if let Some(path) = configured.rootfs_path {
+                return Ok(path);
+            }
+        }
+
         if let Ok(path) = std::env::var("SMOLVM_AGENT_ROOTFS") {
             return Ok(PathBuf::from(path));
         }
@@ -1108,8 +1115,17 @@ impl AgentManager {
             .map_err(|e| Error::agent("write boot config", e.to_string()))?;
 
         // Spawn fresh subprocess (posix_spawn on macOS — safe for multi-threaded parents)
-        let exe = std::env::current_exe()
-            .map_err(|e| Error::agent("find smolvm binary", e.to_string()))?;
+        let exe = if let Ok(configured) = configured_paths() {
+            if let Some(path) = configured.boot_bin {
+                path
+            } else {
+                std::env::current_exe()
+                    .map_err(|e| Error::agent("find smolvm binary", e.to_string()))?
+            }
+        } else {
+            std::env::current_exe()
+                .map_err(|e| Error::agent("find smolvm binary", e.to_string()))?
+        };
         let child = std::process::Command::new(&exe)
             .args(["_boot-vm", &config_path.to_string_lossy()])
             .stdin(std::process::Stdio::null())

@@ -5,6 +5,8 @@ use crate::config::{RecordState, VmRecord};
 use crate::data::network::PortMapping;
 use crate::data::validate_vm_name;
 use crate::db::SmolvmDb;
+#[cfg(target_os = "macos")]
+use crate::embedded::configured_paths;
 use crate::embedded::handle::VmHandle;
 use crate::{Error, Result};
 
@@ -78,14 +80,42 @@ fn start_vm_from_record(record: &VmRecord) -> Result<VmHandle> {
         AgentManager::for_vm_with_sizes(&record.name, record.storage_gb, record.overlay_gb)
             .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
 
-    manager
-        .ensure_running_with_full_config(
-            record.host_mounts(),
-            record.port_mappings(),
-            record.vm_resources(),
-            LaunchFeatures::default(),
-        )
-        .map_err(|e| Error::agent("start machine", e.to_string()))?;
+    #[cfg(target_os = "macos")]
+    {
+        let start_result = if configured_paths()
+            .ok()
+            .and_then(|paths| paths.boot_bin)
+            .is_some()
+        {
+            manager.ensure_running_via_subprocess(
+                record.host_mounts(),
+                record.port_mappings(),
+                record.vm_resources(),
+                LaunchFeatures::default(),
+            )
+        } else {
+            manager.ensure_running_with_full_config(
+                record.host_mounts(),
+                record.port_mappings(),
+                record.vm_resources(),
+                LaunchFeatures::default(),
+            )
+        };
+
+        start_result.map_err(|e| Error::agent("start machine", e.to_string()))?;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        manager
+            .ensure_running_with_full_config(
+                record.host_mounts(),
+                record.port_mappings(),
+                record.vm_resources(),
+                LaunchFeatures::default(),
+            )
+            .map_err(|e| Error::agent("start machine", e.to_string()))?;
+    }
 
     Ok(VmHandle::new(manager, None))
 }

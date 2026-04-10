@@ -1,6 +1,6 @@
 import { getPlatformPackageName } from "./platform-package.js";
 import { getPlatformPackageRoot } from "./platform-package.js";
-import { prepareNativeRuntime } from "./runtime-env.js";
+import { configureNativeRuntime } from "./runtime-env.js";
 import { resolve } from "node:path";
 
 let nativeBinding: any;
@@ -12,10 +12,10 @@ export function loadNativeBinding(): any {
 
   const packageName = getPlatformPackageName();
   const packageRoot = getPlatformPackageRoot();
-  prepareNativeRuntime();
 
   try {
     nativeBinding = require(resolve(packageRoot, "native/index.js"));
+    configureNativeRuntime(nativeBinding);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     throw new Error(

@@ -8,6 +8,7 @@ use crate::data::consts::{
     ENV_SMOLVM_GPU, ENV_SMOLVM_KRUN_LOG_LEVEL, ENV_SMOLVM_LIB_DIR, ENV_VALUE_ON,
 };
 use crate::data::storage::HostMount;
+use crate::embedded::configured_paths;
 use crate::error::{Error, Result};
 use crate::network::backend::{COMPAT_NET_FEATURES, TSI_FEATURE_HIJACK_INET};
 use crate::network::{plan_launch_network, EffectiveNetworkBackend};
@@ -149,6 +150,14 @@ const VIRGLRENDERER_RENDER_SERVER: u32 = 1 << 9;
 /// - `<exe_dir>/../../lib/linux-<arch>/` (source tree dev builds)
 pub fn find_lib_dir() -> Option<PathBuf> {
     let lib_name = libkrunfw_filename();
+    if let Ok(configured) = configured_paths() {
+        if let Some(path) = configured.lib_dir {
+            if path.join(lib_name).exists() {
+                return Some(path);
+            }
+        }
+    }
+
     if let Ok(explicit_dir) = std::env::var(ENV_SMOLVM_LIB_DIR) {
         let path = PathBuf::from(explicit_dir);
         if path.join(lib_name).exists() {

@@ -1,0 +1,18 @@
+[package]
+name = "smolvm-py"
+version = "0.5.5"
+edition = "2021"
+description = "PyO3 bindings for smolvm — embed microVMs directly in Python"
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+smolvm = { path = "../.." }
+smolvm-protocol = { path = "../smolvm-protocol" }
+pyo3 = { version = "0.24", features = ["extension-module", "abi3-py38"] }
+
+[build-dependencies]
+pyo3-build-config = "0.24"
+pkg-config = "0.3"
