@@ -12,7 +12,15 @@ cd sdks/node
 npm install
 npm run build
 npm test
+npm run --workspace smolvm-embedded test:integration
 npm run smoke
+```
+
+To run only the embedded SDK integration suite:
+
+```bash
+cd sdks/node
+npm run --workspace smolvm-embedded test:integration
 ```
 
 Example:

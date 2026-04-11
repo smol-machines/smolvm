@@ -1,33 +1,34 @@
-//! Process-local runtime registry for NAPI machines.
+//! Process-local runtime registry for embedded machines.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 use std::time::Duration;
 
-use smolvm::agent::ExecEvent;
-use smolvm::config::RecordState;
-use smolvm::db::SmolvmDb;
-use smolvm::{Error, Result};
+use crate::agent::ExecEvent;
+use crate::config::RecordState;
+use crate::db::SmolvmDb;
+use crate::embedded::control::{self, MachineSpec};
+use crate::embedded::handle::VmHandle;
+use crate::{Error, Result};
 use smolvm_protocol::ImageInfo;
-
-use crate::control::{self, MachineSpec};
-use crate::handle::VmHandle;
 
 type SharedHandle = Arc<Mutex<VmHandle>>;
 
-/// Stateful runtime shared by all NAPI machine objects in this process.
-pub(crate) struct NapiRuntime {
+/// Stateful runtime shared by all embedded machine objects in this process.
+pub struct EmbeddedRuntime {
     db: SmolvmDb,
     registry: RwLock<HashMap<String, SharedHandle>>,
     name_locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
 }
 
-impl NapiRuntime {
-    pub(crate) fn new() -> Result<Self> {
+impl EmbeddedRuntime {
+    /// Create a runtime backed by the default smolvm database.
+    pub fn new() -> Result<Self> {
         Ok(Self::with_db(SmolvmDb::open()?))
     }
 
-    pub(crate) fn with_db(db: SmolvmDb) -> Self {
+    /// Create a runtime backed by an explicit database handle.
+    pub fn with_db(db: SmolvmDb) -> Self {
         Self {
             db,
             registry: RwLock::new(HashMap::new()),
@@ -36,19 +37,19 @@ impl NapiRuntime {
     }
 
     /// Create a persisted machine record.
-    pub(crate) fn create_machine(&self, spec: MachineSpec) -> Result<()> {
+    pub fn create_machine(&self, spec: MachineSpec) -> Result<()> {
         self.with_name_lock(&spec.name, || control::create_vm(&self.db, &spec))
     }
 
     /// Start or reconnect to a persisted machine and cache its handle.
-    pub(crate) fn start_machine(&self, name: &str) -> Result<()> {
+    pub fn start_machine(&self, name: &str) -> Result<()> {
         self.with_name_lock(name, || {
             if let Some(handle) = self.cached_handle(name)? {
                 let alive = lock_handle(&handle)?.is_process_alive();
                 if alive {
                     return Ok(());
                 }
-                self.remove_cached_handle(name)?;
+                self.remove_cached_handle_and_lock(name)?;
             }
 
             let handle = control::start_vm(&self.db, name)?;
@@ -58,13 +59,13 @@ impl NapiRuntime {
     }
 
     /// Connect to an already-running machine and cache its handle.
-    pub(crate) fn connect_machine(&self, name: &str) -> Result<()> {
+    pub fn connect_machine(&self, name: &str) -> Result<()> {
         self.with_name_lock(name, || {
             if let Some(handle) = self.cached_handle(name)? {
                 if lock_handle(&handle)?.is_process_alive() {
                     return Ok(());
                 }
-                self.remove_cached_handle(name)?;
+                self.remove_cached_handle_and_lock(name)?;
             }
 
             let handle = control::connect_vm(&self.db, name)?;
@@ -74,9 +75,9 @@ impl NapiRuntime {
     }
 
     /// Stop a machine and persist stopped state.
-    pub(crate) fn stop_machine(&self, name: &str) -> Result<()> {
+    pub fn stop_machine(&self, name: &str) -> Result<()> {
         self.with_name_lock(name, || {
-            if let Some(handle) = self.remove_cached_handle(name)? {
+            if let Some(handle) = self.remove_cached_handle_and_lock(name)? {
                 lock_handle(&handle)?.stop()?;
                 control::mark_stopped(&self.db, name)?;
                 return Ok(());
@@ -87,9 +88,9 @@ impl NapiRuntime {
     }
 
     /// Stop best-effort, remove from the registry and DB, and delete storage.
-    pub(crate) fn delete_machine(&self, name: &str) -> Result<()> {
+    pub fn delete_machine(&self, name: &str) -> Result<()> {
         self.with_name_lock(name, || {
-            if let Some(handle) = self.remove_cached_handle(name)? {
+            if let Some(handle) = self.remove_cached_handle_and_lock(name)? {
                 let _ = lock_handle(&handle)?.stop();
             } else {
                 let _ = control::stop_vm(&self.db, name);
@@ -99,7 +100,8 @@ impl NapiRuntime {
         })
     }
 
-    pub(crate) fn exec(
+    /// Execute a command directly in the VM.
+    pub fn exec(
         &self,
         name: &str,
         command: Vec<String>,
@@ -112,7 +114,8 @@ impl NapiRuntime {
         handle.exec(command, env, workdir, timeout)
     }
 
-    pub(crate) fn run(
+    /// Pull an OCI image and run a command inside it.
+    pub fn run(
         &self,
         name: &str,
         image: &str,
@@ -126,19 +129,22 @@ impl NapiRuntime {
         handle.run(image, command, env, workdir, timeout)
     }
 
-    pub(crate) fn pull_image(&self, name: &str, image: &str) -> Result<ImageInfo> {
+    /// Pull an OCI image into the machine's storage.
+    pub fn pull_image(&self, name: &str, image: &str) -> Result<ImageInfo> {
         let handle = self.started_handle(name)?;
         let mut handle = lock_handle(&handle)?;
         handle.pull_image(image)
     }
 
-    pub(crate) fn list_images(&self, name: &str) -> Result<Vec<ImageInfo>> {
+    /// List cached OCI images in the machine's storage.
+    pub fn list_images(&self, name: &str) -> Result<Vec<ImageInfo>> {
         let handle = self.started_handle(name)?;
         let mut handle = lock_handle(&handle)?;
         handle.list_images()
     }
 
-    pub(crate) fn write_file(
+    /// Write a file into the machine.
+    pub fn write_file(
         &self,
         name: &str,
         path: &str,
@@ -150,13 +156,15 @@ impl NapiRuntime {
         handle.write_file(path, &data, mode)
     }
 
-    pub(crate) fn read_file(&self, name: &str, path: &str) -> Result<Vec<u8>> {
+    /// Read a file from the machine.
+    pub fn read_file(&self, name: &str, path: &str) -> Result<Vec<u8>> {
         let handle = self.started_handle(name)?;
         let mut handle = lock_handle(&handle)?;
         handle.read_file(path)
     }
 
-    pub(crate) fn exec_streaming(
+    /// Execute a command and collect streaming output events.
+    pub fn exec_streaming(
         &self,
         name: &str,
         command: Vec<String>,
@@ -169,7 +177,8 @@ impl NapiRuntime {
         handle.exec_streaming(command, env, workdir, timeout)
     }
 
-    pub(crate) fn pid(&self, name: &str) -> Option<i32> {
+    /// Get the child PID if the machine is running.
+    pub fn pid(&self, name: &str) -> Option<i32> {
         if let Ok(Some(handle)) = self.cached_handle(name) {
             if let Ok(handle) = handle.lock() {
                 if let Some(pid) = handle.child_pid() {
@@ -185,7 +194,8 @@ impl NapiRuntime {
             .and_then(|record| record.pid)
     }
 
-    pub(crate) fn is_running(&self, name: &str) -> bool {
+    /// Return whether the machine process is currently running.
+    pub fn is_running(&self, name: &str) -> bool {
         if let Ok(Some(handle)) = self.cached_handle(name) {
             if let Ok(handle) = handle.lock() {
                 return handle.is_process_alive();
@@ -199,7 +209,8 @@ impl NapiRuntime {
             .is_some_and(|record| record.actual_state() == RecordState::Running)
     }
 
-    pub(crate) fn state(&self, name: &str) -> String {
+    /// Get the current machine state as a string.
+    pub fn state(&self, name: &str) -> String {
         if let Ok(Some(handle)) = self.cached_handle(name) {
             if let Ok(handle) = handle.lock() {
                 return handle.state();
@@ -238,12 +249,20 @@ impl NapiRuntime {
         Ok(())
     }
 
-    fn remove_cached_handle(&self, name: &str) -> Result<Option<SharedHandle>> {
-        let mut registry = self
-            .registry
-            .write()
-            .map_err(|e| Error::agent("runtime registry", e.to_string()))?;
-        Ok(registry.remove(name))
+    fn remove_cached_handle_and_lock(&self, name: &str) -> Result<Option<SharedHandle>> {
+        let removed = {
+            let mut registry = self
+                .registry
+                .write()
+                .map_err(|e| Error::agent("runtime registry", e.to_string()))?;
+            registry.remove(name)
+        };
+
+        if removed.is_some() {
+            self.remove_name_lock(name)?;
+        }
+
+        Ok(removed)
     }
 
     fn with_name_lock<T, F>(&self, name: &str, op: F) -> Result<T>
@@ -251,17 +270,8 @@ impl NapiRuntime {
         F: FnOnce() -> Result<T>,
     {
         let lock = self.lock_for_name(name)?;
-        let result = {
-            let _guard = lock_name(&lock)?;
-            op()
-        };
-        let cleanup = self.cleanup_name_lock(name, &lock);
-
-        match (result, cleanup) {
-            (Err(err), _) => Err(err),
-            (Ok(value), Ok(())) => Ok(value),
-            (Ok(_), Err(err)) => Err(err),
-        }
+        let _guard = lock_name(&lock)?;
+        op()
     }
 
     fn lock_for_name(&self, name: &str) -> Result<Arc<Mutex<()>>> {
@@ -285,20 +295,12 @@ impl NapiRuntime {
             .clone())
     }
 
-    fn cleanup_name_lock(&self, name: &str, lock: &Arc<Mutex<()>>) -> Result<()> {
+    fn remove_name_lock(&self, name: &str) -> Result<()> {
         let mut locks = self
             .name_locks
             .write()
             .map_err(|e| Error::agent("runtime name locks", e.to_string()))?;
-
-        let should_remove = locks
-            .get(name)
-            .is_some_and(|entry| Arc::ptr_eq(entry, lock) && Arc::strong_count(entry) == 2);
-
-        if should_remove {
-            locks.remove(name);
-        }
-
+        locks.remove(name);
         Ok(())
     }
 }
@@ -314,14 +316,15 @@ fn lock_handle(handle: &SharedHandle) -> Result<MutexGuard<'_, VmHandle>> {
         .map_err(|e| Error::agent("runtime handle", e.to_string()))
 }
 
-pub(crate) fn runtime() -> Result<Arc<NapiRuntime>> {
-    static RUNTIME: OnceLock<Arc<NapiRuntime>> = OnceLock::new();
+/// Return the process-local embedded runtime singleton.
+pub fn runtime() -> Result<Arc<EmbeddedRuntime>> {
+    static RUNTIME: OnceLock<Arc<EmbeddedRuntime>> = OnceLock::new();
 
     if let Some(runtime) = RUNTIME.get() {
         return Ok(runtime.clone());
     }
 
-    let runtime = Arc::new(NapiRuntime::new()?);
+    let runtime = Arc::new(EmbeddedRuntime::new()?);
     match RUNTIME.set(runtime.clone()) {
         Ok(()) => Ok(runtime),
         Err(_) => Ok(RUNTIME
@@ -341,7 +344,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "smolvm-napi-runtime-{}-{}.redb",
+            "smolvm-embedded-runtime-{}-{}.redb",
             std::process::id(),
             unique
         ));
@@ -353,19 +356,17 @@ mod tests {
             name: name.to_string(),
             mounts: Vec::new(),
             ports: Vec::new(),
-            resources: smolvm::agent::VmResources::default(),
+            resources: crate::agent::VmResources::default(),
             persistent,
         }
     }
 
     #[test]
-    fn cleanup_name_lock_removes_unused_entry() {
-        let runtime = NapiRuntime::with_db(test_db());
-        let lock = runtime.lock_for_name("runtime-cleanup-unused").unwrap();
+    fn remove_name_lock_removes_entry() {
+        let runtime = EmbeddedRuntime::with_db(test_db());
+        runtime.lock_for_name("runtime-remove-lock").unwrap();
 
-        runtime
-            .cleanup_name_lock("runtime-cleanup-unused", &lock)
-            .unwrap();
+        runtime.remove_name_lock("runtime-remove-lock").unwrap();
 
         assert!(runtime
             .name_locks
@@ -375,26 +376,9 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_name_lock_keeps_entry_while_other_clones_exist() {
-        let runtime = NapiRuntime::with_db(test_db());
-        let lock = runtime.lock_for_name("runtime-cleanup-retained").unwrap();
-        let extra = lock.clone();
-
-        runtime
-            .cleanup_name_lock("runtime-cleanup-retained", &lock)
-            .unwrap();
-
-        assert!(runtime
-            .name_locks
-            .read()
-            .expect("name locks should not be poisoned")
-            .contains_key("runtime-cleanup-retained"));
-
-        drop(extra);
-
-        runtime
-            .cleanup_name_lock("runtime-cleanup-retained", &lock)
-            .unwrap();
+    fn remove_name_lock_ignores_missing_entry() {
+        let runtime = EmbeddedRuntime::with_db(test_db());
+        runtime.remove_name_lock("runtime-missing-lock").unwrap();
 
         assert!(runtime
             .name_locks
@@ -405,16 +389,10 @@ mod tests {
 
     #[test]
     fn runtime_rejects_duplicate_create() {
-        let runtime = NapiRuntime::with_db(test_db());
+        let runtime = EmbeddedRuntime::with_db(test_db());
         runtime
             .create_machine(test_spec("runtime-duplicate", false))
             .unwrap();
-
-        assert!(runtime
-            .name_locks
-            .read()
-            .expect("name locks should not be poisoned")
-            .is_empty());
 
         let err = runtime
             .create_machine(test_spec("runtime-duplicate", false))
@@ -422,29 +400,18 @@ mod tests {
         assert!(matches!(
             err,
             Error::Agent {
-                kind: smolvm::error::AgentErrorKind::Conflict,
+                kind: crate::error::AgentErrorKind::Conflict,
                 ..
             }
         ));
-        assert!(runtime
-            .name_locks
-            .read()
-            .expect("name locks should not be poisoned")
-            .is_empty());
     }
 
     #[test]
     fn runtime_state_defaults_to_stopped_for_created_record() {
-        let runtime = NapiRuntime::with_db(test_db());
+        let runtime = EmbeddedRuntime::with_db(test_db());
         runtime
             .create_machine(test_spec("runtime-state", true))
             .unwrap();
-
-        assert!(runtime
-            .name_locks
-            .read()
-            .expect("name locks should not be poisoned")
-            .is_empty());
 
         assert_eq!(runtime.state("runtime-state"), "stopped");
         assert!(!runtime.is_running("runtime-state"));

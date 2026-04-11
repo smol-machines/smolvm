@@ -7,10 +7,9 @@
 use napi::bindgen_prelude::Buffer;
 use napi_derive::napi;
 
-use crate::control::MachineSpec;
 use crate::error::IntoNapiResult;
-use crate::runtime::runtime;
 use crate::types::*;
+use smolvm::embedded::{runtime, MachineSpec};
 
 fn join_error(err: tokio::task::JoinError) -> napi::Error {
     napi::Error::from_reason(format!("Task join error: {}", err))

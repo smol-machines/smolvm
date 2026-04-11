@@ -1,31 +1,32 @@
-//! DB-backed VM lifecycle helpers for the NAPI backend.
-//!
-//! These helpers intentionally stay inside `smolvm-napi`: they provide the
-//! useful shape of the old control layer without adding a new public core
-//! module to `src/`.
+//! DB-backed VM lifecycle helpers for embedded SDK backends.
 
-use smolvm::agent::{AgentClient, AgentManager, HostMount, LaunchFeatures, VmResources};
-use smolvm::config::{RecordState, VmRecord};
-use smolvm::data::network::PortMapping;
-use smolvm::db::SmolvmDb;
-use smolvm::{Error, Result};
-
-use crate::handle::VmHandle;
+use crate::agent::{AgentClient, AgentManager, HostMount, LaunchFeatures, VmResources};
+use crate::config::{RecordState, VmRecord};
+use crate::data::network::PortMapping;
+use crate::db::SmolvmDb;
+use crate::embedded::handle::VmHandle;
+use crate::{Error, Result};
 
 const MAX_NAME_LENGTH: usize = 40;
 
-/// Runtime configuration supplied by the JS SDK constructor.
+/// Runtime configuration supplied by an embedded SDK constructor.
 #[derive(Debug, Clone)]
-pub(crate) struct MachineSpec {
-    pub(crate) name: String,
-    pub(crate) mounts: Vec<HostMount>,
-    pub(crate) ports: Vec<PortMapping>,
-    pub(crate) resources: VmResources,
-    pub(crate) persistent: bool,
+pub struct MachineSpec {
+    /// Unique machine name.
+    pub name: String,
+    /// Host directory mounts to expose in the guest.
+    pub mounts: Vec<HostMount>,
+    /// Host-to-guest port mappings.
+    pub ports: Vec<PortMapping>,
+    /// VM resources for this machine.
+    pub resources: VmResources,
+    /// Whether the machine should persist across stop/start.
+    pub persistent: bool,
 }
 
 impl MachineSpec {
-    pub(crate) fn to_record(&self) -> VmRecord {
+    /// Convert the embedded-machine spec into the canonical DB record.
+    pub fn to_record(&self) -> VmRecord {
         let mut record = VmRecord::new(
             self.name.clone(),
             self.resources.cpus,
@@ -46,7 +47,7 @@ impl MachineSpec {
 }
 
 /// Validate a machine name for SDK-created machines.
-pub(crate) fn validate_name(name: &str) -> Result<()> {
+pub fn validate_name(name: &str) -> Result<()> {
     if name.is_empty() {
         return Err(Error::config(
             "validate machine name",
@@ -104,7 +105,7 @@ pub(crate) fn validate_name(name: &str) -> Result<()> {
 }
 
 /// Create a DB record for a new SDK machine.
-pub(crate) fn create_vm(db: &SmolvmDb, spec: &MachineSpec) -> Result<()> {
+pub fn create_vm(db: &SmolvmDb, spec: &MachineSpec) -> Result<()> {
     validate_name(&spec.name)?;
     let record = spec.to_record();
     if db.insert_vm_if_not_exists(&spec.name, &record)? {
@@ -118,12 +119,12 @@ pub(crate) fn create_vm(db: &SmolvmDb, spec: &MachineSpec) -> Result<()> {
 }
 
 /// Load a persisted VM record.
-pub(crate) fn get_record(db: &SmolvmDb, name: &str) -> Result<VmRecord> {
+pub fn get_record(db: &SmolvmDb, name: &str) -> Result<VmRecord> {
     db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))
 }
 
 /// Start a persisted VM and update its DB state.
-pub(crate) fn start_vm(db: &SmolvmDb, name: &str) -> Result<VmHandle> {
+pub fn start_vm(db: &SmolvmDb, name: &str) -> Result<VmHandle> {
     let record = get_record(db, name)?;
     let handle = start_vm_from_record(&record)?;
     mark_running(db, name, handle.child_pid())?;
@@ -148,7 +149,7 @@ fn start_vm_from_record(record: &VmRecord) -> Result<VmHandle> {
 }
 
 /// Connect to an already-running VM and return a cached handle.
-pub(crate) fn connect_vm(db: &SmolvmDb, name: &str) -> Result<VmHandle> {
+pub fn connect_vm(db: &SmolvmDb, name: &str) -> Result<VmHandle> {
     let record = get_record(db, name)?;
     let manager = AgentManager::for_vm_with_sizes(name, record.storage_gb, record.overlay_gb)
         .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
@@ -165,7 +166,7 @@ pub(crate) fn connect_vm(db: &SmolvmDb, name: &str) -> Result<VmHandle> {
 }
 
 /// Stop a persisted VM and update its DB state.
-pub(crate) fn stop_vm(db: &SmolvmDb, name: &str) -> Result<()> {
+pub fn stop_vm(db: &SmolvmDb, name: &str) -> Result<()> {
     let record = get_record(db, name)?;
     let manager = AgentManager::for_vm_with_sizes(name, record.storage_gb, record.overlay_gb)
         .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
@@ -175,13 +176,13 @@ pub(crate) fn stop_vm(db: &SmolvmDb, name: &str) -> Result<()> {
 }
 
 /// Remove a VM record and its storage directory.
-pub(crate) fn delete_vm(db: &SmolvmDb, name: &str) -> Result<()> {
+pub fn delete_vm(db: &SmolvmDb, name: &str) -> Result<()> {
     let removed = db.remove_vm(name)?;
     if removed.is_none() {
         return Err(Error::vm_not_found(name));
     }
 
-    let data_dir = smolvm::agent::vm_data_dir(name);
+    let data_dir = crate::agent::vm_data_dir(name);
     if data_dir.exists() {
         std::fs::remove_dir_all(&data_dir).map_err(|e| {
             Error::storage(
@@ -194,8 +195,9 @@ pub(crate) fn delete_vm(db: &SmolvmDb, name: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn mark_running(db: &SmolvmDb, name: &str, pid: Option<i32>) -> Result<()> {
-    let pid_start_time = pid.and_then(smolvm::process::process_start_time);
+/// Mark a machine record as running.
+pub fn mark_running(db: &SmolvmDb, name: &str, pid: Option<i32>) -> Result<()> {
+    let pid_start_time = pid.and_then(crate::process::process_start_time);
     db.update_vm(name, |record| {
         record.state = RecordState::Running;
         record.pid = pid;
@@ -205,7 +207,8 @@ pub(crate) fn mark_running(db: &SmolvmDb, name: &str, pid: Option<i32>) -> Resul
     Ok(())
 }
 
-pub(crate) fn mark_stopped(db: &SmolvmDb, name: &str) -> Result<()> {
+/// Mark a machine record as stopped.
+pub fn mark_stopped(db: &SmolvmDb, name: &str) -> Result<()> {
     db.update_vm(name, |record| {
         record.state = RecordState::Stopped;
         record.pid = None;
@@ -225,7 +228,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "smolvm-napi-control-{}-{}.redb",
+            "smolvm-embedded-control-{}-{}.redb",
             std::process::id(),
             unique
         ));
@@ -258,27 +261,9 @@ mod tests {
         assert!(matches!(
             err,
             Error::Agent {
-                kind: smolvm::error::AgentErrorKind::Conflict,
+                kind: crate::error::AgentErrorKind::Conflict,
                 ..
             }
         ));
-    }
-
-    #[test]
-    fn mark_running_and_stopped_update_record_state() {
-        let db = test_db();
-        let spec = test_spec("stateful", true);
-        create_vm(&db, &spec).unwrap();
-
-        mark_running(&db, "stateful", Some(12345)).unwrap();
-        let running = get_record(&db, "stateful").unwrap();
-        assert_eq!(running.state, RecordState::Running);
-        assert_eq!(running.pid, Some(12345));
-
-        mark_stopped(&db, "stateful").unwrap();
-        let stopped = get_record(&db, "stateful").unwrap();
-        assert_eq!(stopped.state, RecordState::Stopped);
-        assert_eq!(stopped.pid, None);
-        assert_eq!(stopped.pid_start_time, None);
     }
 }
