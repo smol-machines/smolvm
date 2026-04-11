@@ -10,6 +10,7 @@ use smolvm::config::{RecordState, SmolvmConfig, VmRecord};
 use smolvm::data::network::PortMapping;
 use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
 use smolvm::data::storage::HostMount;
+use smolvm::data::validate_vm_name;
 use smolvm::db::SmolvmDb;
 use smolvm::storage::{DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
 
@@ -132,69 +133,11 @@ pub struct CreateVmParams {
     pub dns_filter_hosts: Option<Vec<String>>,
 }
 
-/// Maximum length for machine names.
-const MAX_NAME_LENGTH: usize = 40;
-
-/// Validate a machine name for CLI commands.
-///
-/// Same rules as the API validation but returns `smolvm::Error` instead of `ApiError`.
-fn validate_name(name: &str) -> smolvm::Result<()> {
-    if name.is_empty() {
-        return Err(smolvm::Error::config(
-            "create machine",
-            "machine name cannot be empty",
-        ));
-    }
-    if name.len() > MAX_NAME_LENGTH {
-        return Err(smolvm::Error::config(
-            "create machine",
-            format!(
-                "machine name too long: {} characters (max {})",
-                name.len(),
-                MAX_NAME_LENGTH
-            ),
-        ));
-    }
-    let first_char = name.chars().next().unwrap();
-    if !first_char.is_ascii_alphanumeric() {
-        return Err(smolvm::Error::config(
-            "create machine",
-            "machine name must start with a letter or digit",
-        ));
-    }
-    if name.ends_with('-') {
-        return Err(smolvm::Error::config(
-            "create machine",
-            "machine name cannot end with a hyphen",
-        ));
-    }
-    let mut prev_was_hyphen = false;
-    for c in name.chars() {
-        if c == '-' {
-            if prev_was_hyphen {
-                return Err(smolvm::Error::config(
-                    "create machine",
-                    "machine name cannot contain consecutive hyphens",
-                ));
-            }
-            prev_was_hyphen = true;
-        } else {
-            prev_was_hyphen = false;
-        }
-        if !c.is_ascii_alphanumeric() && c != '-' && c != '_' {
-            return Err(smolvm::Error::config(
-                "create machine",
-                format!("machine name contains invalid character: '{}'", c),
-            ));
-        }
-    }
-    Ok(())
-}
-
 /// Create a named machine configuration (does not start it).
 pub fn create_vm(params: CreateVmParams) -> smolvm::Result<()> {
     // Validate name before touching the database
-    validate_name(&params.name)?;
+    validate_vm_name(&params.name, "machine name")
+        .map_err(|reason| smolvm::Error::config("create machine", reason))?;
 
     let mut config = SmolvmConfig::load()?;
 

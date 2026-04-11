@@ -34,18 +34,10 @@ use crate::api::types::{
     ListMachinesResponse, MachineExecRequest, MachineInfo, MountSpec, PortSpec,
     ResizeMachineRequest, ResourceSpec,
 };
-use crate::api::validation::validate_command;
-use crate::api::validation::validate_resource_name;
+use crate::api::validate_command;
 use crate::api::TraceId;
 use crate::config::{RecordState, RestartConfig, VmRecord};
-
-/// Maximum machine name length.
-///
-/// This is limited to 40 characters to ensure the Unix domain socket path
-/// (~/Library/Caches/smolvm/vms/{name}/agent.sock) stays under the 104-byte
-/// limit on macOS. With a typical home directory path of ~30 chars, a name
-/// of 40 chars results in a socket path of ~90 chars, leaving some margin.
-const MAX_NAME_LENGTH: usize = 40;
+use crate::data::validate_vm_name;
 
 /// Resolve the actual machine state, using vsock as a fallback.
 ///
@@ -227,7 +219,7 @@ pub async fn create_machine(
         .name
         .clone()
         .unwrap_or_else(crate::util::generate_machine_name);
-    validate_resource_name(&name, "machine", MAX_NAME_LENGTH)?;
+    validate_vm_name(&name, "machine name").map_err(ApiError::BadRequest)?;
 
     // Validate mount paths
     for mount_spec in &req.mounts {

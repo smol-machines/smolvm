@@ -21,7 +21,6 @@ pub mod handlers;
 pub mod state;
 pub mod supervisor;
 pub mod types;
-pub mod validation;
 
 use axum::{
     extract::Request,
@@ -41,6 +40,7 @@ use tower_http::{
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
+use self::error::ApiError;
 use state::ApiState;
 
 /// OpenAPI documentation for the smolvm API.
@@ -121,6 +121,14 @@ pub struct ApiDoc;
 /// Long-running operations like image pulls may need longer, but this
 /// provides a reasonable upper bound for most requests.
 const API_REQUEST_TIMEOUT_SECS: u64 = 300;
+
+/// Validate that an API command payload is not empty.
+pub fn validate_command(cmd: &[String]) -> Result<(), ApiError> {
+    if cmd.is_empty() {
+        return Err(ApiError::BadRequest("command cannot be empty".into()));
+    }
+    Ok(())
+}
 
 /// Create the API router with all endpoints.
 ///
@@ -290,4 +298,16 @@ async fn trace_id_middleware(mut req: Request, next: Next) -> Response {
         response.headers_mut().insert("x-trace-id", val);
     }
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_command;
+
+    #[test]
+    fn test_validate_command() {
+        assert!(validate_command(&[]).is_err());
+        assert!(validate_command(&["echo".to_string()]).is_ok());
+        assert!(validate_command(&["echo".to_string(), "hello".to_string()]).is_ok());
+    }
 }

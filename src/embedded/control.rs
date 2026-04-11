@@ -3,11 +3,10 @@
 use crate::agent::{AgentClient, AgentManager, HostMount, LaunchFeatures, VmResources};
 use crate::config::{RecordState, VmRecord};
 use crate::data::network::PortMapping;
+use crate::data::validate_vm_name;
 use crate::db::SmolvmDb;
 use crate::embedded::handle::VmHandle;
 use crate::{Error, Result};
-
-const MAX_NAME_LENGTH: usize = 40;
 
 /// Runtime configuration supplied by an embedded SDK constructor.
 #[derive(Debug, Clone)]
@@ -46,67 +45,10 @@ impl MachineSpec {
     }
 }
 
-/// Validate a machine name for SDK-created machines.
-pub fn validate_name(name: &str) -> Result<()> {
-    if name.is_empty() {
-        return Err(Error::config(
-            "validate machine name",
-            "name cannot be empty",
-        ));
-    }
-    if name.len() > MAX_NAME_LENGTH {
-        return Err(Error::config(
-            "validate machine name",
-            format!(
-                "name too long: {} characters (max {})",
-                name.len(),
-                MAX_NAME_LENGTH
-            ),
-        ));
-    }
-
-    let first_char = name.chars().next().unwrap();
-    if !first_char.is_ascii_alphanumeric() {
-        return Err(Error::config(
-            "validate machine name",
-            "name must start with a letter or digit",
-        ));
-    }
-    if name.ends_with('-') {
-        return Err(Error::config(
-            "validate machine name",
-            "name cannot end with a hyphen",
-        ));
-    }
-
-    let mut prev_was_hyphen = false;
-    for c in name.chars() {
-        if c == '-' {
-            if prev_was_hyphen {
-                return Err(Error::config(
-                    "validate machine name",
-                    "name cannot contain consecutive hyphens",
-                ));
-            }
-            prev_was_hyphen = true;
-        } else {
-            prev_was_hyphen = false;
-        }
-
-        if !c.is_ascii_alphanumeric() && c != '-' && c != '_' {
-            return Err(Error::config(
-                "validate machine name",
-                format!("name contains invalid character: '{}'", c),
-            ));
-        }
-    }
-
-    Ok(())
-}
-
 /// Create a DB record for a new SDK machine.
 pub fn create_vm(db: &SmolvmDb, spec: &MachineSpec) -> Result<()> {
-    validate_name(&spec.name)?;
+    validate_vm_name(&spec.name, "name")
+        .map_err(|reason| Error::config("validate machine name", reason))?;
     let record = spec.to_record();
     if db.insert_vm_if_not_exists(&spec.name, &record)? {
         Ok(())

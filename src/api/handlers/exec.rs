@@ -16,7 +16,7 @@ use crate::api::state::{ensure_running_and_persist, with_machine_client_traced, 
 use crate::api::types::{
     ApiErrorResponse, EnvVar, ExecRequest, ExecResponse, LogsQuery, RunRequest,
 };
-use crate::api::validation::validate_command;
+use crate::api::validate_command;
 use crate::api::TraceId;
 use crate::data::consts::BYTES_PER_MIB;
 use crate::data::storage::HostMount;
