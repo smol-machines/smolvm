@@ -49,7 +49,7 @@ impl EmbeddedRuntime {
                 if alive {
                     return Ok(());
                 }
-                self.remove_cached_handle_and_lock(name)?;
+                self.remove_cached_handle(name)?;
             }
 
             let handle = control::start_vm(&self.db, name)?;
@@ -65,7 +65,7 @@ impl EmbeddedRuntime {
                 if lock_handle(&handle)?.is_process_alive() {
                     return Ok(());
                 }
-                self.remove_cached_handle_and_lock(name)?;
+                self.remove_cached_handle(name)?;
             }
 
             let handle = control::connect_vm(&self.db, name)?;
@@ -77,7 +77,7 @@ impl EmbeddedRuntime {
     /// Stop a machine and persist stopped state.
     pub fn stop_machine(&self, name: &str) -> Result<()> {
         self.with_name_lock(name, || {
-            if let Some(handle) = self.remove_cached_handle_and_lock(name)? {
+            if let Some(handle) = self.remove_cached_handle(name)? {
                 lock_handle(&handle)?.stop()?;
                 control::mark_stopped(&self.db, name)?;
                 return Ok(());
@@ -90,13 +90,15 @@ impl EmbeddedRuntime {
     /// Stop best-effort, remove from the registry and DB, and delete storage.
     pub fn delete_machine(&self, name: &str) -> Result<()> {
         self.with_name_lock(name, || {
-            if let Some(handle) = self.remove_cached_handle_and_lock(name)? {
+            if let Some(handle) = self.remove_cached_handle(name)? {
                 let _ = lock_handle(&handle)?.stop();
             } else {
                 let _ = control::stop_vm(&self.db, name);
             }
 
-            control::delete_vm(&self.db, name)
+            control::delete_vm(&self.db, name)?;
+            self.remove_name_lock(name)?;
+            Ok(())
         })
     }
 
@@ -249,20 +251,12 @@ impl EmbeddedRuntime {
         Ok(())
     }
 
-    fn remove_cached_handle_and_lock(&self, name: &str) -> Result<Option<SharedHandle>> {
-        let removed = {
-            let mut registry = self
-                .registry
-                .write()
-                .map_err(|e| Error::agent("runtime registry", e.to_string()))?;
-            registry.remove(name)
-        };
-
-        if removed.is_some() {
-            self.remove_name_lock(name)?;
-        }
-
-        Ok(removed)
+    fn remove_cached_handle(&self, name: &str) -> Result<Option<SharedHandle>> {
+        let mut registry = self
+            .registry
+            .write()
+            .map_err(|e| Error::agent("runtime registry", e.to_string()))?;
+        Ok(registry.remove(name))
     }
 
     fn with_name_lock<T, F>(&self, name: &str, op: F) -> Result<T>
@@ -416,5 +410,27 @@ mod tests {
         assert_eq!(runtime.state("runtime-state"), "stopped");
         assert!(!runtime.is_running("runtime-state"));
         assert_eq!(runtime.pid("runtime-state"), None);
+    }
+
+    #[test]
+    fn delete_machine_removes_name_lock_entry() {
+        let runtime = EmbeddedRuntime::with_db(test_db());
+        runtime
+            .create_machine(test_spec("runtime-delete-lock", true))
+            .unwrap();
+
+        assert!(runtime
+            .name_locks
+            .read()
+            .expect("name locks should not be poisoned")
+            .contains_key("runtime-delete-lock"));
+
+        runtime.delete_machine("runtime-delete-lock").unwrap();
+
+        assert!(!runtime
+            .name_locks
+            .read()
+            .expect("name locks should not be poisoned")
+            .contains_key("runtime-delete-lock"));
     }
 }
