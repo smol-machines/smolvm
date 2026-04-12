@@ -7,6 +7,7 @@ pub mod openapi;
 pub mod pack;
 pub mod pack_run;
 pub mod parsers;
+pub mod secret;
 pub mod serve;
 pub mod smolfile;
 pub mod vm_common;

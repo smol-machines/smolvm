@@ -40,7 +40,9 @@ pub enum PackCmd {
     /// Pull a .smolmachine artifact from a registry
     Pull(PackPullCmd),
 
-    /// Inspect a .smolmachine artifact in a registry (without downloading)
+    /// Inspect a .smolmachine artifact — either in a registry (without
+    /// downloading) or a local file via --file. Prints image, platform,
+    /// resources, entrypoint/cmd, env keys, and required secret names.
     Inspect(PackInspectCmd),
 
     /// Clean up cached pack extractions to free disk space
@@ -341,6 +343,16 @@ impl PackCreateCmd {
             manifest.cmd = pack_config.cmd;
         }
 
+        // Validate and copy Smolfile `[secrets]` into the manifest.
+        // A pack is a portable artifact: it must not bake plaintext,
+        // and it must not reference host-specific sources (env vars or
+        // file paths) that are meaningless on the destination host.
+        // `Untrusted` scope enforces both: `from_store` passes,
+        // `from_env`/`from_file` are rejected. Values are not resolved
+        // here — resolution happens at `pack run`/`pack exec` time,
+        // against whatever host the pack lands on.
+        install_secret_refs(&mut manifest, pack_config.secret_refs)?;
+
         self.finalize_pack(manifest, collector, staging_dir)
     }
 
@@ -455,6 +467,15 @@ impl PackCreateCmd {
         if !pack_config.cmd.is_empty() {
             manifest.cmd = pack_config.cmd;
         }
+
+        // Pack the Smolfile `[secrets]` references — see the
+        // `install_secret_refs` doc for the enforcement contract.
+        // Secrets declared on the VmRecord itself are not brought
+        // forward; only the Smolfile is authoritative for pack output
+        // (the record's secret_refs may include host-specific sources
+        // from `smolvm machine create`, which are valid there but not
+        // in a portable pack).
+        install_secret_refs(&mut manifest, pack_config.secret_refs)?;
 
         self.finalize_pack(manifest, collector, staging_dir)
     }
@@ -1075,9 +1096,17 @@ impl PackPullCmd {
 ///   smolvm pack inspect myapp:v1 --json
 #[derive(Args, Debug)]
 pub struct PackInspectCmd {
-    /// Artifact reference (e.g., myapp:v1, registry.example.com/myapp:latest)
-    #[arg(value_name = "REFERENCE")]
-    pub reference: String,
+    /// Artifact reference (e.g., myapp:v1, registry.example.com/myapp:latest).
+    /// Ignored if --file is given.
+    #[arg(value_name = "REFERENCE", required_unless_present = "file")]
+    pub reference: Option<String>,
+
+    /// Inspect a local .smolmachine sidecar file instead of a registry
+    /// reference. Useful after `pack create` to review what a packed
+    /// artifact contains — including which secrets it will require at
+    /// `pack run` time — before distributing it.
+    #[arg(long, short = 'f', value_name = "PATH", conflicts_with = "reference")]
+    pub file: Option<PathBuf>,
 
     /// Output as JSON
     #[arg(long)]
@@ -1086,7 +1115,11 @@ pub struct PackInspectCmd {
 
 impl PackInspectCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        let parsed = smolvm::registry::Reference::parse(&self.reference)
+        if let Some(path) = self.file {
+            return inspect_local_pack(&path, self.json);
+        }
+        let reference = self.reference.expect("clap requires one of reference/file");
+        let parsed = smolvm::registry::Reference::parse(&reference)
             .map_err(|e| Error::agent("parse reference", e.to_string()))?;
         let config = smolvm::registry::RegistryConfig::load()?;
         let client = build_registry_client(&parsed.registry, &config)?;
@@ -1109,6 +1142,100 @@ impl PackInspectCmd {
             self.json,
         ))
     }
+}
+
+/// Read the manifest out of a local `.smolmachine` sidecar (or the
+/// binary with embedded footer) and print it. Never resolves secret
+/// values — a downstream user can use this to discover which secrets
+/// a pack requires without running it.
+fn inspect_local_pack(path: &std::path::Path, json_output: bool) -> smolvm::Result<()> {
+    let pack_manifest = smolvm_pack::read_manifest(path)
+        .map_err(|e| Error::agent("read pack manifest", e.to_string()))?;
+
+    if json_output {
+        let json = serde_json::to_string_pretty(&pack_manifest)
+            .map_err(|e| Error::agent("serialize manifest", e.to_string()))?;
+        println!("{}", json);
+        return Ok(());
+    }
+
+    print!("{}", format_local_pack_inspect(&pack_manifest, path));
+    Ok(())
+}
+
+/// Render the human-readable `pack inspect --file` output as a string.
+///
+/// Extracted from I/O so it can be unit-tested: the output format is
+/// security-relevant (it's the sole discovery mechanism for a pack's
+/// secret requirements), and a display bug would silently mislead pack
+/// recipients about what their host needs to run the pack.
+fn format_local_pack_inspect(m: &PackManifest, path: &std::path::Path) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(out, "File:       {}", path.display());
+    let _ = writeln!(out, "Image:      {}", m.image);
+    let _ = writeln!(out, "Digest:     {}", m.digest);
+    let _ = writeln!(out, "Platform:   {}", m.platform);
+    let _ = writeln!(out, "Host:       {}", m.host_platform);
+    let _ = writeln!(out, "CPUs:       {}", m.cpus);
+    let _ = writeln!(out, "Memory:     {} MiB", m.mem);
+    if !m.entrypoint.is_empty() {
+        let _ = writeln!(out, "Entrypoint: {}", m.entrypoint.join(" "));
+    }
+    if !m.cmd.is_empty() {
+        let _ = writeln!(out, "Cmd:        {}", m.cmd.join(" "));
+    }
+    if let Some(ref wd) = m.workdir {
+        let _ = writeln!(out, "Workdir:    {}", wd);
+    }
+    if !m.env.is_empty() {
+        // Print env *keys* only — values are plaintext defaults but
+        // there's no reason to dump them unless the user asks via
+        // `--json`. Keeps the inspect output scannable.
+        let keys: Vec<&str> = m
+            .env
+            .iter()
+            .filter_map(|e| e.split_once('=').map(|(k, _)| k))
+            .collect();
+        let _ = writeln!(out, "Env keys:   {}", keys.join(", "));
+    }
+    let _ = writeln!(out, "Created:    {}", m.created);
+    let _ = writeln!(out, "Version:    {}", m.smolvm_version);
+
+    // The security-critical part of inspect: tell the user exactly
+    // which secrets the pack expects to find in the host's secret
+    // store at `pack run` time.
+    if m.secret_refs.is_empty() {
+        let _ = writeln!(out, "Secrets:    (none required)");
+    } else {
+        let _ = writeln!(out, "Secrets:    {} required", m.secret_refs.len());
+        for (name, r) in &m.secret_refs {
+            let source = r.source_kind().map(|k| k.as_str()).unwrap_or("invalid");
+            let detail = r
+                .from_store
+                .as_deref()
+                .or(r.from_env.as_deref())
+                .or_else(|| r.from_file.as_ref().and_then(|p| p.to_str()));
+            match detail {
+                Some(d) => {
+                    let _ = writeln!(out, "  {:<20} {} ({})", name, source, d);
+                }
+                None => {
+                    let _ = writeln!(out, "  {:<20} {} (unresolved)", name, source);
+                }
+            }
+        }
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "To run this pack, the host must have the named secrets in its store:"
+        );
+        for name in m.secret_refs.keys() {
+            let _ = writeln!(out, "  smolvm secret set {}", name);
+        }
+    }
+
+    out
 }
 
 async fn run_inspect(
@@ -1187,6 +1314,61 @@ async fn run_inspect(
     Ok(())
 }
 
+/// Install Smolfile `[secrets]` refs into a pack manifest.
+///
+/// Enforcement (all failures abort `pack create`):
+///
+/// - Each ref is validated under `ResolutionScope::Untrusted`. This
+///   means `from_store` is accepted and `from_env`/`from_file` are
+///   rejected. A pack is a portable artifact; host-specific sources
+///   don't travel with it and would silently break on any other host.
+/// - Any key that collides with an entry in `manifest.env` is rejected.
+///   Otherwise a user could set `DB_URL=public-default` in their env
+///   list and `DB_URL = { from_store = "..." }` in `[secrets]` and
+///   wind up shipping the plaintext default while thinking the secret
+///   version is active. Pick one.
+///
+/// Values are not resolved here — the store isn't even loaded — so the
+/// produced manifest is a function of the input only. This is the
+/// property the byte-identity test exercises.
+fn install_secret_refs(
+    manifest: &mut PackManifest,
+    refs: std::collections::BTreeMap<String, smolvm::secrets::SecretRef>,
+) -> smolvm::Result<()> {
+    use smolvm::secrets::{validate_ref, ResolutionScope};
+
+    for (name, r) in &refs {
+        validate_ref(r, ResolutionScope::Untrusted).map_err(|e| {
+            Error::config(
+                "pack create",
+                format!(
+                    "secret '{}': {} (packs require `from_store` for portability)",
+                    name, e
+                ),
+            )
+        })?;
+    }
+
+    // Conflict detection: plaintext env key must not also be a secret.
+    for env_entry in &manifest.env {
+        if let Some((key, _)) = env_entry.split_once('=') {
+            if refs.contains_key(key) {
+                return Err(Error::config(
+                    "pack create",
+                    format!(
+                        "key '{}' appears in both `env` (plaintext default) and \
+                         `[secrets]`; remove the plaintext entry or rename the secret",
+                        key
+                    ),
+                ));
+            }
+        }
+    }
+
+    manifest.secret_refs = refs;
+    Ok(())
+}
+
 /// Build a `RegistryClient` from a registry hostname, applying auth from config.
 fn build_registry_client(
     registry: &str,
@@ -1258,5 +1440,287 @@ mod tests {
         }
         // If None, libkrun wasn't loaded (e.g., weak link + library not found).
         // This is expected in some CI environments and is not a failure.
+    }
+
+    // ============================================================================
+    // install_secret_refs — validation, conflict detection, byte identity
+    // ============================================================================
+
+    use smolvm::secrets::SecretRef;
+    use std::collections::BTreeMap;
+
+    fn fresh_manifest() -> PackManifest {
+        PackManifest::new(
+            "alpine:latest".to_string(),
+            "sha256:abc".to_string(),
+            "linux/arm64".to_string(),
+            "linux/arm64".to_string(),
+        )
+    }
+
+    fn store_ref(name: &str) -> SecretRef {
+        SecretRef {
+            from_store: Some(name.to_string()),
+            from_env: None,
+            from_file: None,
+        }
+    }
+
+    #[test]
+    fn install_secret_refs_accepts_store_refs() {
+        let mut m = fresh_manifest();
+        let mut refs = BTreeMap::new();
+        refs.insert("API_KEY".to_string(), store_ref("API_KEY"));
+        refs.insert("DB_URL".to_string(), store_ref("DB_URL"));
+        install_secret_refs(&mut m, refs).unwrap();
+        assert_eq!(m.secret_refs.len(), 2);
+    }
+
+    #[test]
+    fn install_secret_refs_rejects_from_env() {
+        let mut m = fresh_manifest();
+        let mut refs = BTreeMap::new();
+        refs.insert(
+            "X".to_string(),
+            SecretRef {
+                from_store: None,
+                from_env: Some("HOST_VAR".to_string()),
+                from_file: None,
+            },
+        );
+        let err = install_secret_refs(&mut m, refs).unwrap_err();
+        // Error should be clear that packs require from_store.
+        let msg = format!("{}", err);
+        assert!(msg.contains("from_store"), "unexpected error: {}", msg);
+    }
+
+    #[test]
+    fn install_secret_refs_rejects_from_file() {
+        let mut m = fresh_manifest();
+        let mut refs = BTreeMap::new();
+        refs.insert(
+            "X".to_string(),
+            SecretRef {
+                from_store: None,
+                from_env: None,
+                from_file: Some("/absolute/path".into()),
+            },
+        );
+        let err = install_secret_refs(&mut m, refs).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("from_store"), "unexpected error: {}", msg);
+    }
+
+    #[test]
+    fn install_secret_refs_rejects_env_secret_key_collision() {
+        let mut m = fresh_manifest();
+        // Plaintext default for DB_URL...
+        m.env.push("DB_URL=public-default".to_string());
+        // ...and a secret ref with the same key. `install_secret_refs`
+        // must reject this because otherwise the user could ship the
+        // plaintext thinking the secret was in effect.
+        let mut refs = BTreeMap::new();
+        refs.insert("DB_URL".to_string(), store_ref("DB_URL"));
+        let err = install_secret_refs(&mut m, refs).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("DB_URL"), "error should name the key: {}", msg);
+    }
+
+    #[test]
+    fn install_secret_refs_is_a_pure_function_of_the_input() {
+        // Weak version of the byte-identity test — feeds identical
+        // input twice and asserts identical output. This proves the
+        // signature-level purity (no hidden side channels taken from
+        // `&refs`) but can't catch a side read from the SecretStore.
+        // The stronger test below exercises that.
+
+        let mut refs = BTreeMap::new();
+        refs.insert("DECOY".to_string(), store_ref("DECOY"));
+
+        let mut m1 = fresh_manifest();
+        install_secret_refs(&mut m1, refs.clone()).unwrap();
+        let mut m2 = fresh_manifest();
+        install_secret_refs(&mut m2, refs).unwrap();
+
+        // `created` differs by RFC-3339 sub-second timestamp. Normalize.
+        m2.created = m1.created.clone();
+
+        let j1 = m1.to_json().unwrap();
+        let j2 = m2.to_json().unwrap();
+        assert_eq!(j1, j2, "install_secret_refs is not a pure function");
+    }
+
+    /// Serialized HOME override used by `byte_identity_no_plaintext_leak`.
+    /// Tests can't share process HOME with other threads because
+    /// `SecretStore` resolves paths from it. We take a mutex so the
+    /// whole-process mutation is safe.
+    fn home_mutex() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static M: OnceLock<Mutex<()>> = OnceLock::new();
+        M.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    struct HomeSandbox {
+        _dir: tempfile::TempDir,
+        prev: Option<std::ffi::OsString>,
+    }
+    impl HomeSandbox {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let prev = std::env::var_os("HOME");
+            std::env::set_var("HOME", dir.path());
+            Self { _dir: dir, prev }
+        }
+    }
+    impl Drop for HomeSandbox {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(p) => std::env::set_var("HOME", p),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn inspect_format_lists_no_secrets_when_empty() {
+        let m = fresh_manifest();
+        let s = format_local_pack_inspect(&m, std::path::Path::new("/p"));
+        assert!(s.contains("Secrets:    (none required)"));
+        // Empty secret_refs must not emit the "To run this pack" block
+        // — there's nothing for the user to do.
+        assert!(!s.contains("smolvm secret set"));
+    }
+
+    #[test]
+    fn inspect_format_names_every_required_secret() {
+        let mut m = fresh_manifest();
+        m.secret_refs.insert("API_KEY".into(), store_ref("API_KEY"));
+        m.secret_refs.insert("DB_URL".into(), store_ref("DB_URL"));
+
+        let s = format_local_pack_inspect(&m, std::path::Path::new("/p"));
+        assert!(s.contains("Secrets:    2 required"));
+        assert!(s.contains("API_KEY"));
+        assert!(s.contains("DB_URL"));
+        // Source kind is reported; BTreeMap iteration order is
+        // deterministic (sorted), so the listing is stable.
+        assert!(s.contains("store"));
+        // Copy-pasteable bootstrap commands are emitted.
+        assert!(s.contains("smolvm secret set API_KEY"));
+        assert!(s.contains("smolvm secret set DB_URL"));
+    }
+
+    #[test]
+    fn inspect_format_prints_env_keys_only_not_values() {
+        let mut m = fresh_manifest();
+        m.env
+            .push("PUBLIC_DEFAULT=visible-to-pack-recipients".to_string());
+        m.env.push("PATH=/usr/bin".to_string());
+
+        let s = format_local_pack_inspect(&m, std::path::Path::new("/p"));
+        assert!(s.contains("Env keys:"));
+        assert!(s.contains("PUBLIC_DEFAULT"));
+        assert!(s.contains("PATH"));
+        // Values are intentionally omitted from the human output —
+        // user wants `--json` for full content. This keeps a long
+        // baked value from flooding the display.
+        assert!(!s.contains("visible-to-pack-recipients"));
+    }
+
+    #[test]
+    fn inspect_format_reports_path_of_artifact() {
+        let m = fresh_manifest();
+        let s = format_local_pack_inspect(&m, std::path::Path::new("/tmp/my.smolmachine"));
+        assert!(s.contains("/tmp/my.smolmachine"));
+    }
+
+    #[test]
+    fn inspect_format_secrets_summary_count_matches_list() {
+        // Regression guard: if the formatter ever reports `N required`
+        // where N differs from the actual number of entries listed
+        // below it, a pack recipient would be misled. Parse both
+        // values from the output and assert they agree.
+        let mut m = fresh_manifest();
+        for i in 0..5 {
+            m.secret_refs
+                .insert(format!("KEY_{}", i), store_ref(&format!("KEY_{}", i)));
+        }
+        let s = format_local_pack_inspect(&m, std::path::Path::new("/p"));
+
+        let listed = s.matches("  KEY_").count();
+        assert_eq!(
+            listed, 5,
+            "expected 5 KEY_ entries in output, got {}",
+            listed
+        );
+        assert!(s.contains("Secrets:    5 required"));
+    }
+
+    #[test]
+    fn byte_identity_no_plaintext_leak_into_manifest() {
+        // The *real* byte-identity test called for in the plan:
+        //
+        //   1. Populate the host store with a recognizable sentinel.
+        //   2. Run `install_secret_refs` with a ref to the sentinel.
+        //   3. Serialize the manifest to JSON.
+        //   4. Assert the sentinel plaintext does NOT appear anywhere
+        //      in the serialized output.
+        //   5. Assert the serialized output is byte-identical to a
+        //      second run *without* the sentinel in the store
+        //      (proving the function doesn't peek at the store).
+        //
+        // If a future edit adds a "cache the resolved value to speed up
+        // inspect" optimization, the sentinel will leak into
+        // `manifest.env` or similar and step 4 will fail.
+        let _lock = home_mutex();
+        let _home = HomeSandbox::new();
+
+        let sentinel = "SENTINEL_1234567890_RECOGNIZABLE_PLAINTEXT";
+
+        // Populate the store with the sentinel under key DECOY.
+        smolvm::secrets::SecretStore::with_lock(|store| store.set_value("DECOY", sentinel))
+            .unwrap();
+
+        let mut refs = BTreeMap::new();
+        refs.insert("DECOY".to_string(), store_ref("DECOY"));
+
+        // Pass 1: store populated.
+        let mut m1 = fresh_manifest();
+        install_secret_refs(&mut m1, refs.clone()).unwrap();
+        let j1 = m1.to_json().unwrap();
+
+        // The plaintext must never appear in a pack manifest.
+        let text1 = std::str::from_utf8(&j1).unwrap();
+        assert!(
+            !text1.contains(sentinel),
+            "plaintext leaked into manifest: {}",
+            text1
+        );
+
+        // Pass 2: store cleared. If `install_secret_refs` is a pure
+        // function of its refs argument (as it should be), the output
+        // is identical. If it secretly reads the store, j2 differs
+        // from j1.
+        smolvm::secrets::SecretStore::with_lock(|store| {
+            store.delete("DECOY");
+            Ok(())
+        })
+        .unwrap();
+
+        let mut m2 = fresh_manifest();
+        install_secret_refs(&mut m2, refs).unwrap();
+        // Normalize `created` (RFC-3339 sub-second differs between runs).
+        m2.created = m1.created.clone();
+        let j2 = m2.to_json().unwrap();
+
+        assert_eq!(
+            j1, j2,
+            "install_secret_refs output depends on the store — \
+             plaintext can leak"
+        );
+
+        let text2 = std::str::from_utf8(&j2).unwrap();
+        assert!(!text2.contains(sentinel));
     }
 }

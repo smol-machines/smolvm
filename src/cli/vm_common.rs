@@ -12,7 +12,9 @@ use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_
 use smolvm::data::storage::HostMount;
 use smolvm::data::validate_vm_name;
 use smolvm::db::SmolvmDb;
+use smolvm::secrets::SecretRef;
 use smolvm::storage::{DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
+use std::collections::BTreeMap;
 
 // ============================================================================
 // Shared helpers
@@ -135,6 +137,42 @@ pub struct CreateVmParams {
     pub ssh_agent: bool,
     /// Hostnames for DNS filtering (from --allow-host / [network].allow_hosts).
     pub dns_filter_hosts: Option<Vec<String>>,
+    /// Secret refs from Smolfile `[secrets]`. The refs themselves are
+    /// persisted to the VM record (they are not sensitive); resolved
+    /// plaintext values are produced per-launch and never touch the DB.
+    pub secret_refs: BTreeMap<String, SecretRef>,
+}
+
+/// Resolve Smolfile `[secrets]` refs and return them as `(name, value)`
+/// tuples ready to append to an agent-bound env vector.
+///
+/// Returns an empty vec if there are no refs, so callers can unconditionally
+/// `.extend()` with the result.
+///
+/// The concrete value strings live inside `Zeroizing<String>` inside
+/// `resolve_secrets`, so they are scrubbed as soon as this helper returns.
+/// The caller is responsible for not logging the output.
+/// Resolve refs supplied by a trusted-local caller (CLI with a
+/// Smolfile passed by the host user). Emits per-secret audit records.
+pub fn resolve_secret_refs_for_env(
+    refs: &BTreeMap<String, SecretRef>,
+) -> smolvm::Result<Vec<(String, String)>> {
+    smolvm::secrets::resolve_refs_to_env(refs, smolvm::secrets::ResolutionScope::TrustedLocal)
+}
+
+/// Build the exec-time env vector for a persistent VM: the record's own
+/// `env` plus freshly resolved values for each `secret_refs` entry.
+///
+/// Called at `machine start` (init + entrypoint) and `machine exec`.
+/// Scope is `RecordReplay` — the refs were written by a trusted-local
+/// actor at create time, so their trust is preserved across sessions.
+pub fn record_env_with_secrets(record: &VmRecord) -> smolvm::Result<Vec<(String, String)>> {
+    let mut env = record.env.clone();
+    env.extend(smolvm::secrets::resolve_refs_to_env(
+        &record.secret_refs,
+        smolvm::secrets::ResolutionScope::RecordReplay,
+    )?);
+    Ok(env)
 }
 
 /// Create a named machine configuration (does not start it).
@@ -165,6 +203,16 @@ pub fn create_vm(params: CreateVmParams) -> smolvm::Result<()> {
     // Parse environment variables for init
     let env = smolvm::util::parse_env_list(&params.env);
 
+    // Validate every ref against the CLI trust scope before persisting.
+    // The CLI caller is `TrustedLocal`, so all source kinds are allowed,
+    // but structural rules (exactly one source, absolute from_file paths)
+    // still apply and catch Smolfile typos before they reach the DB.
+    for (name, r) in &params.secret_refs {
+        smolvm::secrets::validate_ref(r, smolvm::secrets::ResolutionScope::TrustedLocal).map_err(
+            |e| smolvm::Error::config("create machine", format!("secret '{}': {}", name, e)),
+        )?;
+    }
+
     // Create record with restart policy if configured
     let restart = smolvm::config::RestartConfig {
         policy: params
@@ -185,6 +233,7 @@ pub fn create_vm(params: CreateVmParams) -> smolvm::Result<()> {
     );
     record.init = params.init.clone();
     record.env = env;
+    record.secret_refs = params.secret_refs.clone();
     record.workdir = params.workdir.clone();
     record.storage_gb = params.storage_gb;
     record.overlay_gb = params.overlay_gb;
@@ -301,14 +350,17 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
     // instead of orphaning it. Disarmed before detach.
     let _sigint_guard = pid.map(smolvm::process::SigintGuard::new);
 
-    // Run init commands if configured (before reporting success)
+    // Run init commands if configured (before reporting success).
+    // Resolve Smolfile [secrets] once and share across init + entrypoint
+    // exec. Plaintext values never touch the record or the DB.
+    let exec_env = record_env_with_secrets(&record)?;
     if !record.init.is_empty() {
         println!("Running {} init command(s)...", record.init.len());
         let mut client = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
         for (i, cmd) in record.init.iter().enumerate() {
             let argv = vec!["sh".into(), "-c".into(), cmd.clone()];
             let (exit_code, _stdout, stderr) =
-                client.vm_exec(argv, record.env.clone(), record.workdir.clone(), None)?;
+                client.vm_exec(argv, exec_env.clone(), record.workdir.clone(), None)?;
             if exit_code != 0 {
                 if let Err(e) = manager.stop() {
                     tracing::warn!(error = %e, "failed to stop machine after init failure");
@@ -340,9 +392,8 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
         if !bare_cmd.is_empty() {
             let mut client =
                 smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
-            let env = record.env.clone();
             let (exit_code, stdout, stderr) =
-                client.vm_exec(bare_cmd, env, record.workdir.clone(), None)?;
+                client.vm_exec(bare_cmd, exec_env.clone(), record.workdir.clone(), None)?;
             if !stdout.is_empty() {
                 print!("{}", stdout);
             }
@@ -410,6 +461,7 @@ pub fn persist_default_running(
                 r.overlay_gb = o.overlay_gb;
                 r.init = o.init.clone();
                 r.env = o.env.clone();
+                r.secret_refs = o.secret_refs.clone();
                 r.workdir = o.workdir.clone();
                 r.image = o.image.clone();
                 r.entrypoint = o.entrypoint.clone();
@@ -434,6 +486,7 @@ pub struct DefaultVmOverrides {
     pub overlay_gb: Option<u64>,
     pub init: Vec<String>,
     pub env: Vec<(String, String)>,
+    pub secret_refs: BTreeMap<String, SecretRef>,
     pub workdir: Option<String>,
     pub image: Option<String>,
     pub entrypoint: Vec<String>,
@@ -466,10 +519,11 @@ pub fn start_vm_default() -> smolvm::Result<()> {
             println!("Running {} init command(s)...", record.init.len());
             let mut client =
                 smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
+            let init_env = record_env_with_secrets(&record)?;
             for (i, cmd) in record.init.iter().enumerate() {
                 let argv = vec!["sh".into(), "-c".into(), cmd.clone()];
                 let (exit_code, _stdout, stderr) =
-                    client.vm_exec(argv, record.env.clone(), record.workdir.clone(), None)?;
+                    client.vm_exec(argv, init_env.clone(), record.workdir.clone(), None)?;
                 if exit_code != 0 {
                     if let Err(e) = manager.stop() {
                         tracing::warn!(error = %e, "failed to stop machine after init failure");

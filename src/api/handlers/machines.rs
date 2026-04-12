@@ -137,6 +137,7 @@ fn machine_entry_from_record(record: &VmRecord, manager: AgentManager) -> Machin
         resources: crate::api::state::vm_resources_to_spec(record.vm_resources()),
         restart: record.restart.clone(),
         network: record.network,
+        secret_refs: record.secret_refs.clone(),
     }
 }
 
@@ -251,6 +252,11 @@ pub async fn create_machine(
         allowed_cidrs: req.allowed_cidrs.clone(),
     };
 
+    // Validate request-body secret refs before persisting. Untrusted
+    // scope — only `from_store` survives; `from_env`/`from_file` on
+    // the API surface are refused regardless of server binding.
+    crate::api::handlers::validate_request_secrets(&req.secrets)?;
+
     // Complete registration: persists to DB + registers in ApiState
     guard.complete(MachineRegistration {
         manager,
@@ -259,6 +265,7 @@ pub async fn create_machine(
         resources: resources.clone(),
         restart: RestartConfig::default(),
         network: req.network,
+        secret_refs: req.secrets.clone(),
     })?;
 
     // Fetch the persisted record for the response
@@ -585,15 +592,19 @@ pub async fn exec_machine(
     let tid = trace_id.map(|t| t.0 .0.clone());
     validate_command(&req.command)?;
 
-    // Check if VM exists
-    let db = state.db();
-    if db.get_vm(&name).map_err(ApiError::database)?.is_none() {
-        return Err(ApiError::NotFound(format!("machine '{}' not found", name)));
-    }
+    // Load the in-memory machine entry; its `secret_refs` were
+    // populated at create time and updated via start/stop handlers.
+    // This avoids a second DB read per request.
+    let entry = state.get_machine(&name)?;
+    crate::api::handlers::validate_request_secrets(&req.secrets)?;
+    let record_env = crate::api::handlers::record_secret_refs_env(&entry)?;
+    let req_env = crate::api::handlers::resolve_request_secrets(&req.secrets)?;
 
     let name_clone = name.clone();
     let command = req.command.clone();
-    let env = EnvVar::to_tuples(&req.env);
+    let mut env = EnvVar::to_tuples(&req.env);
+    env.extend(record_env);
+    env.extend(req_env);
     let workdir = req.workdir.clone();
     let timeout = req.timeout_secs.map(Duration::from_secs);
 

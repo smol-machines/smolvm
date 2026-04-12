@@ -395,10 +395,19 @@ impl RunCmd {
             None
         };
 
+        // Resolve Smolfile [secrets] for this launch. Tuples are plaintext;
+        // do not log them. Zeroizing buffers were scrubbed inside the helper.
+        // These are merged into `env`/`init_env` below but never flow into
+        // `params.env`, so the plaintext values never touch the persisted
+        // VM record — only the refs are stored (via DefaultVmOverrides), and
+        // they get re-resolved at each subsequent `machine start`.
+        let resolved_secrets = vm_common::resolve_secret_refs_for_env(&params.secret_refs)?;
+
         if freshly_started && !params.init.is_empty() {
             for (i, cmd) in params.init.iter().enumerate() {
                 let argv = vec!["sh".into(), "-c".into(), cmd.clone()];
-                let init_env = parse_env_list(&params.env);
+                let mut init_env = parse_env_list(&params.env);
+                init_env.extend(resolved_secrets.iter().cloned());
                 let (exit_code, _stdout, stderr) =
                     client.vm_exec(argv, init_env, params.workdir.clone(), None)?;
                 if exit_code != 0 {
@@ -438,7 +447,8 @@ impl RunCmd {
             vec![DEFAULT_SHELL_CMD.to_string()]
         };
 
-        let env = parse_env_list(&params.env);
+        let mut env = parse_env_list(&params.env);
+        env.extend(resolved_secrets.iter().cloned());
         let mount_bindings = mounts_to_virtiofs_bindings(&mounts);
 
         // Two modes: with image or bare VM (no image)
@@ -479,6 +489,7 @@ impl RunCmd {
                                 overlay_gb: params.overlay_gb,
                                 init: params.init.clone(),
                                 env: parse_env_list(&params.env),
+                                secret_refs: params.secret_refs.clone(),
                                 workdir: params.workdir.clone(),
                                 image: Some(img.clone()),
                                 entrypoint: params.entrypoint.clone(),
@@ -585,6 +596,7 @@ impl RunCmd {
                                 overlay_gb: params.overlay_gb,
                                 init: params.init.clone(),
                                 env: parse_env_list(&params.env),
+                                secret_refs: params.secret_refs.clone(),
                                 workdir: params.workdir.clone(),
                                 image: None,
                                 entrypoint: params.entrypoint.clone(),
@@ -688,7 +700,21 @@ impl ExecCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let (manager, mut client) = vm_common::ensure_running_and_connect(&self.name)?;
 
-        let env = parse_env_list(&self.env);
+        // Load the persistent VM record once so we can reuse it for image
+        // detection and for resolving the machine's stored [secrets] refs.
+        let record = {
+            let name = self.name.clone().unwrap_or_else(|| "default".to_string());
+            smolvm::db::SmolvmDb::open()
+                .ok()
+                .and_then(|db| db.get_vm(&name).ok().flatten())
+        };
+
+        // CLI `-e KEY=VALUE` + machine's stored secrets. Resolution is
+        // per-exec; plaintext values never touch the DB.
+        let mut env = parse_env_list(&self.env);
+        if let Some(ref r) = record {
+            env.extend(vm_common::resolve_secret_refs_for_env(&r.secret_refs)?);
+        }
 
         // Streaming mode — print output as it arrives, no buffering
         if self.stream {
@@ -726,13 +752,7 @@ impl ExecCmd {
 
         // Check if this machine has an image — if so, exec inside the image's
         // rootfs via client.run_interactive()/run_non_interactive() instead of bare vm_exec().
-        let record_image = {
-            let name = self.name.clone().unwrap_or_else(|| "default".to_string());
-            smolvm::db::SmolvmDb::open()
-                .ok()
-                .and_then(|db| db.get_vm(&name).ok().flatten())
-                .and_then(|r| r.image.clone())
-        };
+        let record_image = record.as_ref().and_then(|r| r.image.clone());
 
         if let Some(ref image) = record_image {
             // Image-based machine: exec inside the image's rootfs via crun.

@@ -36,6 +36,10 @@ pub struct MachineEntry {
     pub restart: RestartConfig,
     /// Whether outbound network access is enabled.
     pub network: bool,
+    /// Secret refs persisted on the VM record, cached in memory so
+    /// exec handlers don't need a second DB read per request. Exec
+    /// handlers resolve these under `RecordReplay` scope.
+    pub secret_refs: std::collections::BTreeMap<String, smolvm_protocol::SecretRef>,
 }
 
 /// Parameters for registering a new machine.
@@ -52,6 +56,9 @@ pub struct MachineRegistration {
     pub restart: RestartConfig,
     /// Whether outbound network access is enabled.
     pub network: bool,
+    /// Secret refs to attach to this machine (from a Smolfile or
+    /// `CreateMachineRequest.secrets`).
+    pub secret_refs: std::collections::BTreeMap<String, smolvm_protocol::SecretRef>,
 }
 
 /// RAII guard for machine name reservation.
@@ -225,6 +232,7 @@ impl ApiState {
                             resources,
                             restart: record.restart.clone(),
                             network: record.network,
+                            secret_refs: record.secret_refs.clone(),
                         })),
                     );
                     loaded.push(name.clone());
@@ -454,6 +462,7 @@ impl ApiState {
         );
         record.storage_gb = reg.resources.storage_gb;
         record.overlay_gb = reg.resources.overlay_gb;
+        record.secret_refs = reg.secret_refs.clone();
 
         // Use insert_vm_if_not_exists for atomic database insert
         match self.db.insert_vm_if_not_exists(&name, &record) {
@@ -469,6 +478,7 @@ impl ApiState {
                         resources: reg.resources,
                         restart: reg.restart,
                         network: reg.network,
+                        secret_refs: reg.secret_refs,
                     })),
                 );
                 Ok(())

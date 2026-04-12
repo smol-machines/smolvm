@@ -627,24 +627,61 @@ fn build_command(manifest: &smolvm_pack::PackManifest, cli_command: &[String]) -
     }
 }
 
-/// Build environment variables from manifest defaults and CLI overrides.
-fn build_env(manifest: &smolvm_pack::PackManifest, cli_env: &[String]) -> Vec<(String, String)> {
+/// Build environment variables from manifest defaults, CLI overrides,
+/// and resolved secret refs.
+///
+/// Merge order (lowest → highest precedence):
+///
+/// 1. `manifest.env` — plaintext defaults baked at `pack create` time.
+///    By `pack create` policy (§5.6), no key from here overlaps with a
+///    `secret_refs` entry, so secrets always win cleanly.
+/// 2. CLI `-e KEY=VALUE` flags. Override any matching manifest.env key.
+/// 3. Resolved `manifest.secret_refs`. Scope is `RecordReplay` — the
+///    pack was built by a trusted-local actor at a prior time; the ref
+///    metadata carries that trust forward.
+///
+/// Resolution happens here, at pack-run time, against **this host's**
+/// secret store. A pack shipped to a host that doesn't have the named
+/// secrets fails here with a clear per-secret error.
+fn build_env(
+    manifest: &smolvm_pack::PackManifest,
+    cli_env: &[String],
+) -> smolvm::Result<Vec<(String, String)>> {
     let mut env: Vec<(String, String)> = manifest
         .env
         .iter()
         .filter_map(|e| parse_env_spec(e))
         .collect();
 
-    // CLI env overrides manifest env
+    // CLI env overrides manifest env (same-key retain-then-push).
     for spec in cli_env {
         if let Some((key, value)) = parse_env_spec(spec) {
-            // Remove existing key if present
             env.retain(|(k, _)| k != &key);
             env.push((key, value));
         }
     }
 
-    env
+    // Resolve manifest.secret_refs at pack-run time, against the host
+    // running the pack. Scope is RecordReplay: the refs were persisted
+    // by a trusted `pack create` invocation, and we trust the pack's
+    // declared source kinds. Note: `pack create` already refused
+    // `from_env` and `from_file` under Untrusted scope, so in practice
+    // every ref here is `from_store`.
+    if !manifest.secret_refs.is_empty() {
+        let resolved = smolvm::secrets::resolve_refs_to_env(
+            &manifest.secret_refs,
+            smolvm::secrets::ResolutionScope::RecordReplay,
+        )?;
+        // Secrets override env (they are declared separately and win on
+        // conflict; pack create forbids conflicts, but enforcing the
+        // order here is cheap insurance against future edits).
+        for (k, v) in resolved {
+            env.retain(|(ek, _)| ek != &k);
+            env.push((k, v));
+        }
+    }
+
+    Ok(env)
 }
 
 /// Execute the command in the VM using the existing AgentClient.
@@ -658,7 +695,7 @@ fn execute_command(
     mounts: &[smolvm::data::storage::HostMount],
 ) -> smolvm::Result<i32> {
     let command = build_command(manifest, &args.command);
-    let env = build_env(manifest, &args.env);
+    let env = build_env(manifest, &args.env)?;
     let workdir = args.workdir.clone().or_else(|| manifest.workdir.clone());
 
     let params = ExecParams {
@@ -1207,7 +1244,7 @@ fn run_from_cache(
 
     let params = ExecParams {
         command: build_command(manifest, &args.command),
-        env: build_env(manifest, &args.env),
+        env: build_env(manifest, &args.env)?,
         workdir: args.workdir.or_else(|| manifest.workdir.clone()),
         interactive: args.interactive,
         tty: args.tty,
@@ -1578,7 +1615,7 @@ fn daemon_exec(
     let mounts: Vec<smolvm::data::storage::HostMount> = Vec::new();
     let params = ExecParams {
         command: build_command(manifest, &args.command),
-        env: build_env(manifest, &args.env),
+        env: build_env(manifest, &args.env)?,
         workdir: args.workdir.or_else(|| manifest.workdir.clone()),
         interactive: args.interactive,
         tty: args.tty,

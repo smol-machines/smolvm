@@ -8,6 +8,7 @@ use crate::cli::parsers::parse_cidr;
 use crate::cli::vm_common::CreateVmParams;
 use smolvm::data::network::PortMapping;
 use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 // Re-export from the library
@@ -80,6 +81,7 @@ pub fn build_create_params(
                 health_startup_grace_secs: None,
                 ssh_agent: false,
                 dns_filter_hosts: None,
+                secret_refs: BTreeMap::new(),
             });
         }
     };
@@ -271,6 +273,7 @@ pub fn build_create_params(
         } else {
             Some(sf_allow_hosts)
         },
+        secret_refs: sf.secrets,
     })
 }
 
@@ -292,6 +295,12 @@ pub struct PackConfig {
     pub env: Vec<String>,
     /// Resolved working directory.
     pub workdir: Option<String>,
+    /// Secret refs declared by the Smolfile's `[secrets]` section.
+    /// Only the refs flow into the pack manifest; values are never
+    /// resolved at pack-create time. `pack create` rejects refs that
+    /// use `from_env` or `from_file` — portability requires store-
+    /// based refs only.
+    pub secret_refs: BTreeMap<String, smolvm::secrets::SecretRef>,
 }
 
 /// Resolve pack configuration by merging CLI flags with an optional Smolfile.
@@ -327,6 +336,7 @@ pub fn resolve_pack_config(
                 oci_platform: cli_oci_platform,
                 env: vec![],
                 workdir: None,
+                secret_refs: BTreeMap::new(),
             });
         }
     };
@@ -378,5 +388,10 @@ pub fn resolve_pack_config(
         oci_platform,
         env: sf.env.into_iter().map(|e| e.trim().to_string()).collect(),
         workdir: sf.workdir,
+        // Smolfile `[secrets]` travel as-is into the pack manifest.
+        // `pack create` validates each ref under `Untrusted` scope,
+        // rejecting `from_env` and `from_file` because they are host-
+        // specific and break portability.
+        secret_refs: sf.secrets,
     })
 }

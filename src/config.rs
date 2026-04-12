@@ -370,6 +370,13 @@ pub struct VmRecord {
     #[serde(default)]
     pub env: Vec<(String, String)>,
 
+    /// Secret references declared by a Smolfile `[secrets]` section, keyed
+    /// by the guest-side env var name. Resolved to plaintext at each VM
+    /// start (and for `machine exec`) and appended to the env vector — the
+    /// plaintext values never touch this record or the DB.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub secret_refs: std::collections::BTreeMap<String, crate::secrets::SecretRef>,
+
     /// Working directory for init commands.
     #[serde(default)]
     pub workdir: Option<String>,
@@ -465,6 +472,7 @@ impl VmRecord {
             last_exit_code: None,
             init: Vec::new(),
             env: Vec::new(),
+            secret_refs: std::collections::BTreeMap::new(),
             workdir: None,
             storage_gb: None,
             overlay_gb: None,
@@ -508,6 +516,7 @@ impl VmRecord {
             last_exit_code: None,
             init: Vec::new(),
             env: Vec::new(),
+            secret_refs: std::collections::BTreeMap::new(),
             workdir: None,
             storage_gb: None,
             overlay_gb: None,
@@ -603,6 +612,44 @@ mod tests {
         let deserialized: VmRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.name, record.name);
         assert_eq!(deserialized.mounts, record.mounts);
+    }
+
+    #[test]
+    fn test_vm_record_secret_refs_roundtrip() {
+        use crate::secrets::SecretRef;
+        let mut record = VmRecord::new("r".into(), 1, 256, vec![], vec![], false);
+        record.secret_refs.insert(
+            "API_KEY".into(),
+            SecretRef {
+                from_store: Some("API_KEY".into()),
+                from_env: None,
+                from_file: None,
+            },
+        );
+        record.secret_refs.insert(
+            "DB_URL".into(),
+            SecretRef {
+                from_store: None,
+                from_env: Some("PROD_DB".into()),
+                from_file: None,
+            },
+        );
+
+        let json = serde_json::to_string(&record).unwrap();
+        // Ref metadata — not sensitive — roundtrips through serde_json.
+        assert!(json.contains("API_KEY"));
+        assert!(json.contains("PROD_DB"));
+
+        let back: VmRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.secret_refs.len(), 2);
+        assert_eq!(
+            back.secret_refs["API_KEY"].from_store.as_deref(),
+            Some("API_KEY")
+        );
+        assert_eq!(
+            back.secret_refs["DB_URL"].from_env.as_deref(),
+            Some("PROD_DB")
+        );
     }
 
     #[test]

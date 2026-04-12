@@ -30,6 +30,10 @@ smolvm machine exec --name myvm -- which python3      # still there after exit+r
 smolvm machine run --ssh-agent --net --image alpine -- ssh-add -l
 smolvm machine create myvm --ssh-agent --net
 
+# Inject encrypted secrets into workload env
+smolvm secret set OPENAI_API_KEY          # prompts with echo off
+smolvm machine run -s Smolfile -- ./app   # Smolfile [secrets] resolves at launch
+
 # Pack into portable executable
 smolvm pack create --image python:3.12-alpine -o ./my-python
 ./my-python run -- python3 -c "print('hello')"
@@ -44,6 +48,7 @@ smolvm pack create --image python:3.12-alpine -o ./my-python
 | Persistent dev environment | `machine create` → `machine start` → `machine exec` |
 | Ship software as a binary | `smolvm pack create --image IMAGE -o OUTPUT` |
 | Use git/ssh with private keys safely | Add `--ssh-agent` to run or create |
+| Inject API keys / tokens without putting them on the command line | `smolvm secret set` + Smolfile `[secrets]` |
 | Minimal VM without image | `smolvm machine run -s Smolfile` (bare VM) |
 | Declarative VM config | Create a Smolfile, use `--smolfile`/`-s` flag |
 
@@ -77,6 +82,13 @@ smolvm pack run [--sidecar PATH] [-- CMD]         # run .smolmachine
 
 smolvm serve start [--listen ADDR:PORT]           # HTTP API
 smolvm config registries edit                     # registry auth
+
+smolvm secret set NAME [VALUE]                    # store encrypted (prompts if no value)
+smolvm secret set NAME --from-env VAR             # store indirection to host env var
+smolvm secret set NAME --from-file PATH           # store indirection to host file
+smolvm secret list                                # names + sources (never values)
+smolvm secret delete NAME
+smolvm secret show NAME --yes                     # print plaintext (requires --yes)
 ```
 
 ## Artifact References
@@ -160,6 +172,12 @@ startup_grace = "20s"
 # Credential forwarding
 [auth]
 ssh_agent = true                      # forward host SSH agent into the VM
+
+# Secrets — resolved at workload launch, injected into process env
+[secrets]
+OPENAI_API_KEY = { from_store = "OPENAI_API_KEY" }  # encrypted host store
+DATABASE_URL   = { from_env   = "PROD_DB_URL" }      # host env var (at launch)
+GCP_CREDS      = { from_file  = "./creds.json" }     # host file (at launch)
 ```
 
 ### Merge Precedence
@@ -212,6 +230,41 @@ smolvm machine exec --name myvm -- ssh deploy@server "systemctl restart app"
 The host SSH agent signs challenges but never sends private keys across the boundary. Even with root inside the VM, keys cannot be extracted — this is enforced by the SSH agent protocol and the hypervisor isolation.
 
 Requires `SSH_AUTH_SOCK` to be set on the host. If missing, smolvm exits with an error and remediation instructions.
+
+## Secrets
+
+Store API keys, tokens, and other credentials encrypted on the host and inject them into the workload's process environment at launch time. Secrets never appear on the command line, in shell history, or on disk outside the encrypted store.
+
+```bash
+# Store a secret (prompts with echo off when no value is given)
+smolvm secret set OPENAI_API_KEY
+
+# Or store an indirection to a host env var / file (resolved at launch)
+smolvm secret set AWS_ACCESS_KEY --from-env AWS_ACCESS_KEY_ID
+smolvm secret set GCP_CREDS      --from-file ~/.config/gcloud/creds.json
+
+# List (never prints values), delete, reveal
+smolvm secret list
+smolvm secret delete OPENAI_API_KEY
+smolvm secret show OPENAI_API_KEY --yes     # --yes required to print plaintext
+```
+
+Reference secrets from a Smolfile. The left-hand key becomes the env var name in the guest workload:
+
+```toml
+[secrets]
+OPENAI_API_KEY = { from_store = "OPENAI_API_KEY" }
+DATABASE_URL   = { from_env   = "PROD_DB_URL" }
+GCP_CREDS      = { from_file  = "./creds.json" }
+```
+
+Exactly one of `from_store`, `from_env`, `from_file` must be set per entry. Resolved values are appended *after* top-level `env` and CLI `-e` flags.
+
+**Storage:** encrypted in `~/.config/smolvm/secrets.toml` (AES-256-GCM) with a master key at `~/.local/share/smolvm/secrets.key` (mode `0600`, auto-generated).
+
+**Threat model:** this is defense-in-depth, not zero-knowledge. The target process sees plaintext in its own environment, and root inside the guest can read any `/proc/*/environ`. Use SSH agent forwarding instead when a secret must never leave the host.
+
+**Where they're injected:** every exec surface now resolves `[secrets]` at launch/exec time — `machine run`, `machine create` + `machine start`, `machine exec`, HTTP API exec/run/create endpoints, and `.smolmachine` packs. The VM record, pack manifest, and HTTP request bodies carry only refs; rotating a secret in the store takes effect at the next start/exec/pack-run with no extra command. HTTP request bodies and pack manifests accept only `from_store` refs; `from_env`/`from_file` are rejected (would expose the server's env or arbitrary host files to untrusted callers). HTTP `req.secrets` is capped at 64 refs per request. Use `smolvm pack inspect --file PATH` to list a pack's required secrets before running it. See `docs/secrets.md` for details.
 
 ## File Copy
 

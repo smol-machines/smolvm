@@ -42,9 +42,16 @@
 //!
 //! [auth]
 //! ssh_agent = true
+//!
+//! [secrets]
+//! OPENAI_API_KEY = { from_store = "OPENAI_API_KEY" }
+//! DATABASE_URL   = { from_env   = "PROD_DATABASE_URL" }
+//! GCP_CREDS      = { from_file  = "./creds.json" }
 //! ```
 
+use crate::secrets::SecretRef;
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 // ============================================================================
@@ -120,6 +127,14 @@ pub struct Smolfile {
     pub auth: Option<AuthConfig>,
     /// Service metadata for deployment.
     pub service: Option<ServiceConfig>,
+    /// Named secrets injected into the workload process env at exec time.
+    ///
+    /// Each entry maps a guest-side env var name to a source: the encrypted
+    /// host secret store (`from_store`), a host env var (`from_env`), or a
+    /// host file (`from_file`). Resolved values are added *after* regular
+    /// `env = [...]` entries so they take precedence.
+    #[serde(default)]
+    pub secrets: BTreeMap<String, SecretRef>,
 }
 
 /// Network policy — egress filtering by hostname and/or CIDR.
@@ -230,8 +245,27 @@ pub fn load(path: &Path) -> crate::Result<Smolfile> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| crate::Error::config("load smolfile", format!("{}: {}", path.display(), e)))?;
 
-    toml::from_str(&content)
-        .map_err(|e| crate::Error::config("parse smolfile", format!("{}: {}", path.display(), e)))
+    let mut sf: Smolfile = toml::from_str(&content).map_err(|e| {
+        crate::Error::config("parse smolfile", format!("{}: {}", path.display(), e))
+    })?;
+
+    // Resolve `[secrets].*.from_file` relative paths against the Smolfile's
+    // directory so callers downstream see a stable absolute path. Leave
+    // absolute paths untouched. We don't call `canonicalize` — the file
+    // might not exist at parse time (it's read lazily at workload launch).
+    let base = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
+    for r in sf.secrets.values_mut() {
+        if let Some(p) = r.from_file.take() {
+            let resolved = if p.is_absolute() { p } else { base.join(p) };
+            r.from_file = Some(resolved);
+        }
+    }
+
+    Ok(sf)
 }
 
 // ============================================================================

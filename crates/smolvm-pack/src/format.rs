@@ -329,6 +329,23 @@ pub struct PackManifest {
     /// smolvm version that built this machine (e.g., "0.1.15").
     pub smolvm_version: String,
 
+    /// Secret references declared by the source Smolfile's `[secrets]`
+    /// section. The values themselves are **never** baked into the
+    /// pack; refs are late-binding identifiers (store names) that the
+    /// runtime resolves against whatever host the pack lands on.
+    ///
+    /// Enforcement at `pack create`: every entry must use `from_store`.
+    /// `from_env` and `from_file` are rejected because they are host-
+    /// specific and would silently break portability.
+    ///
+    /// `BTreeMap` is chosen deliberately: it preserves key order across
+    /// serializations, so two `pack create` runs with the same input
+    /// produce byte-identical manifest output. This is load-bearing for
+    /// the byte-identity test that proves `pack create` never resolves
+    /// values at build time.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub secret_refs: std::collections::BTreeMap<String, smolvm_protocol::SecretRef>,
+
     /// Asset inventory - files included in the assets blob.
     pub assets: AssetInventory,
 }
@@ -403,6 +420,7 @@ impl PackManifest {
             host_platform,
             created: rfc3339_now(),
             smolvm_version: env!("CARGO_PKG_VERSION").to_string(),
+            secret_refs: std::collections::BTreeMap::new(),
             assets: AssetInventory {
                 libraries: Vec::new(),
                 agent_rootfs: AssetEntry {
@@ -517,6 +535,113 @@ mod tests {
         assert!(json.contains("\"host_platform\": \"linux/amd64\""));
         assert!(json.contains("\"smolvm_version\""));
         assert!(json.contains("\"created\""));
+    }
+
+    #[test]
+    fn test_manifest_secret_refs_roundtrip() {
+        use smolvm_protocol::SecretRef;
+        let mut manifest = PackManifest::new(
+            "alpine:latest".to_string(),
+            "sha256:abc".to_string(),
+            "linux/arm64".to_string(),
+            "linux/arm64".to_string(),
+        );
+        manifest.secret_refs.insert(
+            "API_KEY".to_string(),
+            SecretRef {
+                from_store: Some("API_KEY".to_string()),
+                from_env: None,
+                from_file: None,
+            },
+        );
+        manifest.secret_refs.insert(
+            "DB_URL".to_string(),
+            SecretRef {
+                from_store: Some("DB_URL".to_string()),
+                from_env: None,
+                from_file: None,
+            },
+        );
+
+        let json = manifest.to_json().unwrap();
+        let text = std::str::from_utf8(&json).unwrap();
+        // Ref metadata — not sensitive — present in the manifest.
+        assert!(text.contains("secret_refs"));
+        assert!(text.contains("API_KEY"));
+        assert!(text.contains("DB_URL"));
+
+        let back = PackManifest::from_json(&json).unwrap();
+        assert_eq!(back.secret_refs.len(), 2);
+        assert_eq!(
+            back.secret_refs["API_KEY"].from_store.as_deref(),
+            Some("API_KEY")
+        );
+    }
+
+    #[test]
+    fn test_manifest_empty_secret_refs_omitted_from_json() {
+        let manifest = PackManifest::new(
+            "alpine:latest".to_string(),
+            "sha256:abc".to_string(),
+            "linux/arm64".to_string(),
+            "linux/arm64".to_string(),
+        );
+        let json = String::from_utf8(manifest.to_json().unwrap()).unwrap();
+        // `skip_serializing_if = BTreeMap::is_empty` keeps the field
+        // out of the JSON entirely when empty, so existing packs
+        // aren't bloated with a pointless `"secret_refs": {}`.
+        assert!(!json.contains("secret_refs"));
+    }
+
+    #[test]
+    fn test_manifest_secret_refs_deterministic_ordering() {
+        // The byte-identity test in the host crate depends on this
+        // ordering guarantee. BTreeMap iterates in key order; insert
+        // in reverse and confirm the serialized output still comes
+        // out alphabetical.
+        use smolvm_protocol::SecretRef;
+        let mut m1 = PackManifest::new(
+            "x".into(),
+            "y".into(),
+            "linux/arm64".into(),
+            "linux/arm64".into(),
+        );
+        let mut m2 = m1.clone();
+        m1.secret_refs.insert(
+            "Z".into(),
+            SecretRef {
+                from_store: Some("z".into()),
+                from_env: None,
+                from_file: None,
+            },
+        );
+        m1.secret_refs.insert(
+            "A".into(),
+            SecretRef {
+                from_store: Some("a".into()),
+                from_env: None,
+                from_file: None,
+            },
+        );
+        m2.secret_refs.insert(
+            "A".into(),
+            SecretRef {
+                from_store: Some("a".into()),
+                from_env: None,
+                from_file: None,
+            },
+        );
+        m2.secret_refs.insert(
+            "Z".into(),
+            SecretRef {
+                from_store: Some("z".into()),
+                from_env: None,
+                from_file: None,
+            },
+        );
+        // Everything else is identical (same `created` timestamp from
+        // cloning the freshly-constructed manifest).
+        assert_eq!(m1.to_json().unwrap(), m2.to_json().unwrap());
     }
 
     #[test]

@@ -39,6 +39,10 @@ enum Commands {
     #[command(subcommand)]
     Config(cli::config::ConfigCmd),
 
+    /// Manage host-side secrets injected into workload env
+    #[command(subcommand)]
+    Secret(cli::secret::SecretCmd),
+
     /// Internal: boot a VM subprocess (not for direct use)
     #[command(name = "_boot-vm", hide = true)]
     BootVm {
@@ -69,6 +73,7 @@ fn main() {
         Commands::Serve(cmd) => cmd.run(),
         Commands::Pack(cmd) => cmd.run(),
         Commands::Config(cmd) => cmd.run(),
+        Commands::Secret(cmd) => cmd.run(),
         Commands::BootVm { config } => cli::internal_boot::run(config),
     };
 

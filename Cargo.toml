@@ -45,6 +45,14 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 humantime = "2"
 tempfile = "3"
 
+# Secrets management.
+aes-gcm = "0.10"
+rand = "0.8"
+zeroize = { version = "1", features = ["zeroize_derive"] }
+rpassword = "7"
+base64 = { workspace = true }
+fs2 = "0.4"
+
 # HTTP API server
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.7", features = ["macros"] }
