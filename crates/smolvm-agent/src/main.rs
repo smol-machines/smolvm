@@ -107,6 +107,50 @@ fn uptime_ms() -> u64 {
     0
 }
 
+/// Emit a structured log record reporting whether virtio-gpu appeared
+/// in the guest, for a VM that was started with `--gpu`.
+///
+/// Called only when `SMOLVM_GPU=1`. The `target: "smolvm::agent::gpu"`
+/// makes it easy to filter (`RUST_LOG=smolvm::agent::gpu=info`) or to
+/// surface in host status output. A `warn!` fires when the device is
+/// missing so the mismatch is loud — libkrun accepts the GPU config
+/// call regardless of kernel support, so this is the *only* place the
+/// failure becomes visible at boot.
+fn log_gpu_status() {
+    // Look for any /dev/dri/renderD* node. These are exposed by
+    // the virtio-gpu DRM driver when the kernel has
+    // CONFIG_DRM_VIRTIO_GPU; their absence means either the device
+    // wasn't attached or the kernel has no driver bound.
+    let dri_entries: Vec<String> = match std::fs::read_dir("/dev/dri") {
+        Ok(dir) => dir
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+
+    let has_render = dri_entries.iter().any(|n| n.starts_with("renderD"));
+    let has_card = dri_entries.iter().any(|n| n.starts_with("card"));
+
+    if has_render || has_card {
+        info!(
+            target: "smolvm::agent::gpu",
+            render_nodes = %dri_entries.iter().filter(|n| n.starts_with("renderD")).cloned().collect::<Vec<_>>().join(","),
+            card_nodes = %dri_entries.iter().filter(|n| n.starts_with("card")).cloned().collect::<Vec<_>>().join(","),
+            "GPU available in guest"
+        );
+    } else {
+        warn!(
+            target: "smolvm::agent::gpu",
+            "GPU was requested (SMOLVM_GPU=1) but no /dev/dri/* nodes appeared in the guest. \
+             Likely cause: the libkrunfw kernel blob lacks CONFIG_DRM_VIRTIO_GPU / \
+             CONFIG_VIRTIO_GPU. The libkrun GPU API call succeeded but the guest kernel \
+             has no driver to bind the virtio-gpu PCI device. Rebuild libkrunfw with the \
+             virtio-gpu driver enabled, or remove --gpu."
+        );
+    }
+}
+
 fn main() {
     // Quick --version check (used by init script to detect rootfs updates)
     if std::env::args().any(|a| a == "--version") {
@@ -206,6 +250,17 @@ fn main() {
     if dns_proxy::is_enabled() {
         info!("DNS filtering enabled, starting guest proxy");
         dns_proxy::start();
+    }
+
+    // If the host started us with --gpu, sanity-check that the guest
+    // kernel actually sees a virtio-gpu device. libkrun accepts the
+    // GPU config call regardless of whether the embedded kernel has
+    // the `virtio-gpu` driver compiled in, so the only place this
+    // mismatch surfaces is here. Without this log, the user discovers
+    // the missing GPU much later — when their workload makes a
+    // rendering call and crashes with a confused EGL/Vulkan error.
+    if std::env::var("SMOLVM_GPU").as_deref() == Ok("1") {
+        log_gpu_status();
     }
 
     info!(
@@ -1633,6 +1688,7 @@ fn spawn_interactive_command(
     let workdir_str = workdir.unwrap_or("/");
     // terminal: true tells crun to set up a controlling terminal (setsid + TIOCSCTTY)
     let mut spec = oci::OciSpec::new(command, env, workdir_str, tty);
+    spec.add_gpu_devices_if_available();
 
     for (tag, container_path, read_only) in mounts {
         let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
@@ -1714,6 +1770,7 @@ fn spawn_interactive_command(
 
     let workdir_str = workdir.unwrap_or("/");
     let mut spec = oci::OciSpec::new(command, env, workdir_str, false);
+    spec.add_gpu_devices_if_available();
 
     for (tag, container_path, read_only) in mounts {
         let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);

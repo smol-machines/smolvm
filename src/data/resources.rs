@@ -16,6 +16,9 @@ pub struct VmResources {
     pub memory_mib: u32,
     /// Enable outbound network access (TSI).
     pub network: bool,
+    /// Enable GPU acceleration (virtio-gpu with Venus/Vulkan).
+    #[serde(default)]
+    pub gpu: bool,
     /// Storage disk size in GiB (None = default 20 GiB).
     pub storage_gib: Option<u64>,
     /// Overlay disk size in GiB (None = default 10 GiB).
@@ -31,6 +34,7 @@ impl Default for VmResources {
             cpus: DEFAULT_MICROVM_CPU_COUNT,
             memory_mib: DEFAULT_MICROVM_MEMORY_MIB,
             network: false,
+            gpu: false,
             storage_gib: None,
             overlay_gib: None,
             allowed_cidrs: None,

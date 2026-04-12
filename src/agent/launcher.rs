@@ -59,8 +59,29 @@ extern "C" {
     fn krun_add_vsock(ctx: u32, tsi_features: u32) -> i32;
 }
 
+/// Dynamically resolve krun_set_gpu_options2 at runtime via dlsym.
+/// Returns None if libkrun was built without GPU support.
+unsafe fn resolve_krun_set_gpu_options2() -> Option<unsafe extern "C" fn(u32, u32, u64) -> i32> {
+    let name = c"krun_set_gpu_options2";
+    let ptr = libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr());
+    if ptr.is_null() {
+        None
+    } else {
+        Some(std::mem::transmute::<
+            *mut libc::c_void,
+            unsafe extern "C" fn(u32, u32, u64) -> i32,
+        >(ptr))
+    }
+}
+
 // TSI (Transparent Socket Impersonation) feature flags
 const KRUN_TSI_HIJACK_INET: u32 = 1 << 0;
+
+// virglrenderer flags for krun_set_gpu_options.
+// Venus provides Vulkan inside the guest via virtio-gpu transport.
+// On macOS, Venus → MoltenVK → Metal gives near-native GPU access.
+const VIRGLRENDERER_VENUS: u32 = 1 << 6;
+const VIRGLRENDERER_NO_VIRGL: u32 = 1 << 7;
 
 /// Find the directory containing libkrunfw by checking explicit overrides and
 /// paths relative to the current executable.
@@ -222,6 +243,48 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         if krun_set_vm_config(ctx, resources.cpus, resources.memory_mib) < 0 {
             krun_free_ctx(ctx);
             return Err(Error::agent("configure vm", "krun_set_vm_config failed"));
+        }
+
+        // Enable GPU if requested (Venus for Vulkan via virtio-gpu).
+        // Requires libkrun built with `gpu` feature and host virglrenderer.
+        // On macOS, also requires MoltenVK (Vulkan → Metal translation).
+        if resources.gpu {
+            let virgl_flags = VIRGLRENDERER_VENUS | VIRGLRENDERER_NO_VIRGL;
+            // Allocate 4 GiB VRAM for GPU shared memory.
+            let vram_bytes: u64 = 4 * 1024 * 1024 * 1024;
+
+            // Resolve krun_set_gpu_options2 dynamically — it may not exist
+            // if libkrun was built without the `gpu` feature.
+            let set_gpu = match resolve_krun_set_gpu_options2() {
+                Some(f) => f,
+                None => {
+                    krun_free_ctx(ctx);
+                    let install_hint = if cfg!(target_os = "macos") {
+                        "Install GPU dependencies with:\n  brew install virglrenderer molten-vk\n\n\
+                         Then rebuild libkrun with: make BLK=1 NET=1 GPU=1 TIMESYNC=1"
+                    } else {
+                        "Install GPU dependencies with:\n  apt install virglrenderer0 mesa-vulkan-drivers\n\n\
+                         Then rebuild libkrun with: make BLK=1 NET=1 GPU=1"
+                    };
+                    return Err(Error::agent(
+                        "configure gpu",
+                        format!(
+                            "GPU not available: libkrun was built without GPU support.\n\n{}",
+                            install_hint
+                        ),
+                    ));
+                }
+            };
+
+            let ret = set_gpu(ctx, virgl_flags, vram_bytes);
+            if ret < 0 {
+                krun_free_ctx(ctx);
+                return Err(Error::agent(
+                    "configure gpu",
+                    format!("krun_set_gpu_options2 failed (ret={}). Check that virglrenderer is installed.", ret),
+                ));
+            }
+            tracing::info!("GPU enabled (Venus/Vulkan via virtio-gpu)");
         }
 
         // Helper: evaluate a fallible expression, freeing ctx if it fails.
@@ -529,6 +592,16 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // Tell the agent to start SSH agent forwarding bridge
         if ssh_agent_socket.is_some() {
             env_strings.push(cstr("SMOLVM_SSH_AGENT=1"));
+        }
+
+        // Tell the agent GPU was requested so it can sanity-check the
+        // virtio-gpu device actually appeared in the guest. libkrun
+        // happily accepts `krun_set_gpu_options2` even if the embedded
+        // kernel lacks the driver; without this check the user sees
+        // "VM started" and discovers missing GPU only when their
+        // workload hits a rendering call.
+        if resources.gpu {
+            env_strings.push(cstr("SMOLVM_GPU=1"));
         }
 
         // Tell the agent to start DNS filtering proxy

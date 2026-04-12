@@ -76,6 +76,9 @@ pub struct ResourceSpec {
     /// Note: Only TCP/UDP supported, not ICMP (ping).
     #[serde(default)]
     pub network: Option<bool>,
+    /// Enable GPU acceleration (Vulkan via virtio-gpu).
+    #[serde(default)]
+    pub gpu: Option<bool>,
     /// Storage disk size in GiB (default: 20).
     #[serde(default)]
     #[schema(example = 20)]
@@ -340,6 +343,9 @@ pub struct CreateMachineRequest {
     /// Note: Only TCP/UDP supported, not ICMP (ping).
     #[serde(default)]
     pub network: bool,
+    /// Enable GPU acceleration (Vulkan via virtio-gpu).
+    #[serde(default)]
+    pub gpu: bool,
     /// Storage disk size in GiB (default: 20).
     #[serde(default)]
     pub storage_gb: Option<u64>,

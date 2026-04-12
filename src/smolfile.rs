@@ -85,6 +85,8 @@ pub struct Smolfile {
     pub memory: Option<u32>,
     /// Enable outbound networking.
     pub net: Option<bool>,
+    /// Enable GPU acceleration (Vulkan via virtio-gpu).
+    pub gpu: Option<bool>,
     /// Storage disk size in GiB.
     pub storage: Option<u64>,
     /// Overlay disk size in GiB.
@@ -368,5 +370,28 @@ init = ["echo hello"]
         assert_eq!(sf.image.as_deref(), Some("alpine"));
         assert_eq!(sf.cpus, Some(2));
         assert_eq!(sf.dev.unwrap().volumes, vec!["./src:/app"]);
+    }
+
+    #[test]
+    fn smolfile_gpu_field() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // With gpu = true
+        let path = dir.path().join("gpu.smolfile");
+        std::fs::write(&path, "image = \"alpine\"\ngpu = true\n").unwrap();
+        let sf = load(&path).unwrap();
+        assert_eq!(sf.gpu, Some(true));
+
+        // Without gpu field (defaults to None)
+        let path = dir.path().join("nogpu.smolfile");
+        std::fs::write(&path, "image = \"alpine\"\n").unwrap();
+        let sf = load(&path).unwrap();
+        assert_eq!(sf.gpu, None);
+
+        // With gpu = false
+        let path = dir.path().join("gpuoff.smolfile");
+        std::fs::write(&path, "image = \"alpine\"\ngpu = false\n").unwrap();
+        let sf = load(&path).unwrap();
+        assert_eq!(sf.gpu, Some(false));
     }
 }

@@ -29,8 +29,37 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
     // Clean up the config file — it's no longer needed
     let _ = std::fs::remove_file(&config_path);
 
-    // Redirect stdio to /dev/null first (needs to open /dev/null).
-    smolvm::process::detach_stdio();
+    // Redirect stdio. When SMOLVM_GPU_DEBUG=1, keep stderr pointed at a
+    // debug log file so virglrenderer/MoltenVK errors are captured.
+    if std::env::var_os("SMOLVM_GPU_DEBUG").is_some() {
+        if let Some(ref log) = config.console_log {
+            let debug_path = log.with_file_name("gpu-debug.log");
+            if let Ok(cpath) = std::ffi::CString::new(debug_path.to_string_lossy().as_bytes()) {
+                unsafe {
+                    let fd = libc::open(
+                        cpath.as_ptr(),
+                        libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+                        0o644,
+                    );
+                    if fd >= 0 {
+                        libc::dup2(fd, 2);
+                        libc::close(fd);
+                    }
+                }
+            }
+        }
+        // Detach stdin/stdout only — keep stderr for debug
+        unsafe {
+            let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
+            if devnull >= 0 {
+                libc::dup2(devnull, 0);
+                libc::dup2(devnull, 1);
+                libc::close(devnull);
+            }
+        }
+    } else {
+        smolvm::process::detach_stdio();
+    }
 
     // Close ALL inherited file descriptors from the parent (server).
     // Without this, the subprocess holds database locks, network sockets, etc.

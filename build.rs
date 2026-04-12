@@ -63,6 +63,11 @@ fn is_lfs_pointer(path: &Path) -> bool {
     false
 }
 
+/// Check if a library is available on the system via pkg-config.
+fn has_library(name: &str) -> bool {
+    pkg_config::Config::new().probe(name).is_ok()
+}
+
 /// Link libkrun — weak on macOS so the binary can start without it
 /// (packed binary mode uses dlopen instead of link-time symbols).
 fn link_krun() {
@@ -325,7 +330,6 @@ fn build_libkrun_from_submodule() -> Option<PathBuf> {
     );
 
     // Build libkrun using cargo directly (make has issues on macOS)
-    // Note: blk,net features require additional setup and are optional
     let libkrun_manifest = libkrun_dir.join("src/libkrun/Cargo.toml");
     let mut cmd = Command::new("cargo");
     cmd.arg("build")
@@ -334,6 +338,26 @@ fn build_libkrun_from_submodule() -> Option<PathBuf> {
 
     if profile == "release" {
         cmd.arg("--release");
+    }
+
+    // Auto-detect GPU support: enable if virglrenderer is installed on the host.
+    // GPU feature requires virglrenderer + libclang (for krun_display bindgen).
+    // On macOS, also needs MoltenVK for Vulkan → Metal translation.
+    let gpu_available = has_library("virglrenderer");
+    if gpu_available {
+        cmd.arg("--features").arg("gpu");
+
+        // krun_display uses bindgen which needs libclang.
+        // Help it find libclang on macOS (Homebrew LLVM).
+        #[cfg(target_os = "macos")]
+        {
+            let llvm_lib = std::path::Path::new("/opt/homebrew/opt/llvm/lib");
+            if llvm_lib.exists() {
+                cmd.env("LIBCLANG_PATH", llvm_lib);
+            }
+        }
+
+        println!("cargo:warning=GPU support enabled (virglrenderer found)");
     }
 
     let status = cmd.status();

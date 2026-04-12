@@ -274,6 +274,45 @@ impl OciSpec {
         });
     }
 
+    /// Expose GPU render nodes to the container if /dev/dri exists in the VM.
+    ///
+    /// Detects virtio-gpu devices at runtime and adds them to the OCI spec.
+    /// This allows containers to use Vulkan (via Mesa Venus) without any
+    /// special configuration — if the VM was started with `--gpu`, the
+    /// devices appear automatically.
+    pub fn add_gpu_devices_if_available(&mut self) {
+        let dri_path = std::path::Path::new("/dev/dri");
+        if !dri_path.exists() {
+            return;
+        }
+
+        // DRM card device (for modesetting, display)
+        if std::path::Path::new("/dev/dri/card0").exists() {
+            self.linux.devices.push(OciDevice {
+                device_type: "c".to_string(),
+                path: "/dev/dri/card0".to_string(),
+                major: 226,
+                minor: 0,
+                file_mode: Some(0o666),
+                uid: Some(0),
+                gid: Some(0),
+            });
+        }
+
+        // Render node (for Vulkan/OpenGL compute — no modesetting privileges)
+        if std::path::Path::new("/dev/dri/renderD128").exists() {
+            self.linux.devices.push(OciDevice {
+                device_type: "c".to_string(),
+                path: "/dev/dri/renderD128".to_string(),
+                major: 226,
+                minor: 128,
+                file_mode: Some(0o666),
+                uid: Some(0),
+                gid: Some(0),
+            });
+        }
+    }
+
     /// Write the OCI spec to a config.json file in the bundle directory.
     pub fn write_to(&self, bundle_dir: &Path) -> std::io::Result<()> {
         let config_path = bundle_dir.join("config.json");
@@ -773,5 +812,53 @@ mod tests {
         // Values just under limit should pass
         let ok_value = "x".repeat(32 * 1024);
         assert!(validate_env_vars(&[("KEY".to_string(), ok_value)]).is_ok());
+    }
+
+    #[test]
+    fn test_gpu_devices_added_when_dri_exists() {
+        // On a system with /dev/dri (GPU-enabled VM), devices should be added
+        let mut spec = OciSpec::new(&["echo".to_string()], &[], "/", false);
+        let before = spec.linux.devices.len();
+        spec.add_gpu_devices_if_available();
+
+        if std::path::Path::new("/dev/dri/renderD128").exists() {
+            // GPU present — devices were added
+            assert!(spec.linux.devices.len() > before);
+            assert!(spec
+                .linux
+                .devices
+                .iter()
+                .any(|d| d.path == "/dev/dri/renderD128"));
+            assert!(spec.linux.devices.iter().any(|d| d.major == 226));
+        } else {
+            // No GPU — no devices added (no-op)
+            assert_eq!(spec.linux.devices.len(), before);
+        }
+    }
+
+    #[test]
+    fn test_gpu_devices_correct_properties() {
+        let mut spec = OciSpec::new(&["echo".to_string()], &[], "/", false);
+        // Manually add GPU devices to verify properties
+        spec.linux.devices.push(super::OciDevice {
+            device_type: "c".to_string(),
+            path: "/dev/dri/renderD128".to_string(),
+            major: 226,
+            minor: 128,
+            file_mode: Some(0o666),
+            uid: Some(0),
+            gid: Some(0),
+        });
+
+        let dev = spec
+            .linux
+            .devices
+            .iter()
+            .find(|d| d.path == "/dev/dri/renderD128")
+            .unwrap();
+        assert_eq!(dev.device_type, "c");
+        assert_eq!(dev.major, 226);
+        assert_eq!(dev.minor, 128);
+        assert_eq!(dev.file_mode, Some(0o666)); // world-readable for non-root Vulkan
     }
 }

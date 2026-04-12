@@ -79,6 +79,7 @@ pub fn build_create_params(
                 health_retries: None,
                 health_startup_grace_secs: None,
                 ssh_agent: false,
+                gpu: false,
                 dns_filter_hosts: None,
             });
         }
@@ -160,6 +161,8 @@ pub fn build_create_params(
     } else {
         sf.net.unwrap_or(false)
     };
+
+    let gpu = sf.gpu.unwrap_or(false);
 
     let workdir = cli_workdir.or(dev_workdir).or(sf.workdir);
 
@@ -266,6 +269,7 @@ pub fn build_create_params(
         health_retries,
         health_startup_grace_secs,
         ssh_agent: sf.auth.as_ref().and_then(|a| a.ssh_agent).unwrap_or(false),
+        gpu,
         dns_filter_hosts: if sf_allow_hosts.is_empty() {
             None
         } else {

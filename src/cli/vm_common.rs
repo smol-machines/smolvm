@@ -82,6 +82,51 @@ pub fn ensure_running_and_connect(
     Ok((manager, client))
 }
 
+/// Post-boot sanity check: confirm the guest kernel actually saw the
+/// virtio-gpu device for a VM started with `--gpu`.
+///
+/// `krun_set_gpu_options2` succeeds regardless of whether the
+/// libkrunfw kernel blob has the `virtio-gpu` driver. Without this
+/// probe the operator sees a green "Machine running" and only
+/// discovers the missing GPU when a workload makes a rendering call.
+///
+/// This runs a tiny `ls -1 /dev/dri 2>/dev/null` via the agent after
+/// boot, prints a one-line status, and returns. Failures are
+/// non-fatal — they just print a warning so the operator has a chance
+/// to react before running workloads.
+fn probe_gpu_and_report(socket: &std::path::Path, name: &str) {
+    use smolvm::agent::AgentClient;
+
+    let mut client = match AgentClient::connect_with_retry(socket) {
+        Ok(c) => c,
+        Err(_) => return, // start path will fail on its own terms
+    };
+    let argv = vec![
+        "sh".into(),
+        "-c".into(),
+        "ls -1 /dev/dri 2>/dev/null".into(),
+    ];
+    let (code, stdout, _) =
+        match client.vm_exec(argv, vec![], None, Some(std::time::Duration::from_secs(2))) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+    if code != 0 || stdout.trim().is_empty() {
+        // Loud, single-line, actionable. We intentionally do not
+        // fail `machine start` — the VM is running, the operator
+        // may still want to exec into it to investigate.
+        eprintln!(
+            "warning: --gpu requested for '{}' but no /dev/dri nodes appeared in the guest. \
+             The libkrunfw kernel blob likely lacks CONFIG_DRM_VIRTIO_GPU / CONFIG_VIRTIO_GPU. \
+             Rebuild libkrunfw with the virtio-gpu driver, or drop --gpu.",
+            name
+        );
+    } else {
+        let nodes: Vec<&str> = stdout.lines().collect();
+        println!("GPU: virtio-gpu available in guest ({})", nodes.join(", "));
+    }
+}
+
 /// Print command output and exit with the given code.
 ///
 /// Prints stdout to stdout, stderr to stderr, detaches the manager
@@ -133,6 +178,8 @@ pub struct CreateVmParams {
     pub health_retries: Option<u32>,
     pub health_startup_grace_secs: Option<u64>,
     pub ssh_agent: bool,
+    /// Enable GPU acceleration (virtio-gpu with Venus/Vulkan).
+    pub gpu: bool,
     /// Hostnames for DNS filtering (from --allow-host / [network].allow_hosts).
     pub dns_filter_hosts: Option<Vec<String>>,
 }
@@ -189,6 +236,7 @@ pub fn create_vm(params: CreateVmParams) -> smolvm::Result<()> {
     record.storage_gb = params.storage_gb;
     record.overlay_gb = params.overlay_gb;
     record.allowed_cidrs = params.allowed_cidrs.clone();
+    record.gpu = if params.gpu { Some(true) } else { None };
     record.image = params.image.clone();
     record.entrypoint = params.entrypoint.clone();
     record.cmd = params.cmd.clone();
@@ -300,6 +348,15 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
     // Install SIGINT guard so Ctrl+C during init/pull kills the VM process
     // instead of orphaning it. Disarmed before detach.
     let _sigint_guard = pid.map(smolvm::process::SigintGuard::new);
+
+    // If --gpu was requested, verify the guest kernel actually exposed
+    // virtio-gpu. `krun_set_gpu_options2` silently accepts the call
+    // even if the embedded kernel lacks the driver, so a green VM
+    // start is not evidence of a working GPU. Run a quick `ls` in the
+    // guest and print a clear status line.
+    if record.gpu.unwrap_or(false) {
+        probe_gpu_and_report(manager.vsock_socket(), name);
+    }
 
     // Run init commands if configured (before reporting success)
     if !record.init.is_empty() {
@@ -460,6 +517,12 @@ pub fn start_vm_default() -> smolvm::Result<()> {
 
     // Run init commands if the default record has them (persisted from machine run -d -s)
     let record = config.get_vm("default").cloned();
+
+    if let Some(ref r) = record {
+        if r.gpu.unwrap_or(false) {
+            probe_gpu_and_report(manager.vsock_socket(), "default");
+        }
+    }
 
     if let Some(record) = record {
         if !record.init.is_empty() {

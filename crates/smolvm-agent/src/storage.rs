@@ -1811,6 +1811,7 @@ pub fn run_command(
         // Create OCI spec
         let workdir_str = workdir.unwrap_or("/");
         let mut spec = OciSpec::new(command, env, workdir_str, false);
+        spec.add_gpu_devices_if_available();
 
         // Add virtiofs bind mounts to OCI spec
         for (tag, container_path, read_only) in mounts {

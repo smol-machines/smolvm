@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::launcher::{self, launch_agent_vm};
+use super::launcher;
 use super::{HostMount, PortMapping, VmResources};
 
 // ============================================================================
@@ -188,8 +188,6 @@ pub struct AgentManager {
     overlay_disk: OverlayDisk,
     /// vsock socket path for control channel.
     vsock_socket: PathBuf,
-    /// Unix socket path for DNS filter proxy.
-    dns_filter_socket: PathBuf,
     /// PID file path for tracking the VM process across CLI invocations.
     pid_file: PathBuf,
     /// Config file path for persisting running VM config across CLI invocations.
@@ -256,7 +254,6 @@ impl AgentManager {
         std::fs::create_dir_all(&smolvm_runtime)?;
 
         let vsock_socket = smolvm_runtime.join("agent.sock");
-        let dns_filter_socket = smolvm_runtime.join("dns-filter.sock");
         let pid_file = smolvm_runtime.join("agent.pid");
         let config_file = smolvm_runtime.join("agent.config.json");
         let console_log = Some(smolvm_runtime.join("agent-console.log"));
@@ -268,7 +265,6 @@ impl AgentManager {
             storage_disk,
             overlay_disk,
             vsock_socket,
-            dns_filter_socket,
             pid_file,
             config_file,
             console_log,
@@ -926,9 +922,13 @@ impl AgentManager {
 
     /// Start the agent VM with specified mounts, ports, and resources.
     ///
-    /// Uses `fork()` to create a child process that runs `krun_start_enter`.
-    /// Safe for single-threaded callers (CLI). For multi-threaded callers
-    /// (API server), use `start_via_subprocess` instead.
+    /// Spawns a fresh subprocess (`smolvm _boot-vm`) via `posix_spawn` to run
+    /// the VM. This gives the child a completely clean process with no inherited
+    /// Hypervisor.framework state, preventing VM context leaks when the child
+    /// crashes (e.g., during GPU device setup).
+    ///
+    /// Previously used `fork()` which inherited parent state and caused
+    /// unreliable GPU launches on macOS.
     pub fn start_with_full_config(
         &self,
         mounts: Vec<HostMount>,
@@ -936,138 +936,9 @@ impl AgentManager {
         resources: VmResources,
         features: launcher::LaunchFeatures,
     ) -> Result<()> {
-        let resources_for_fork = resources.clone();
-        self.prepare_for_launch(&mounts, &ports, resources)?;
-
-        // Install SIGCHLD handler to automatically reap zombie children.
-        // Must be done AFTER prepare_for_launch (which calls ensure_formatted
-        // via Command::output that needs child reaping to not interfere).
-        crate::process::install_sigchld_handler();
-
-        // Clone mounts/ports for finalize_launch (originals move into fork closure)
-        let mounts_for_finalize = mounts.clone();
-        let ports_for_finalize = ports.clone();
-
-        // Start DNS filter listener if hostnames are configured.
-        // This must happen BEFORE the VM boots so the Unix socket is ready
-        // when the guest agent tries to connect.
-        let dns_filter_socket_path: Option<std::path::PathBuf> =
-            if let Some(ref hosts) = features.dns_filter_hosts {
-                if !hosts.is_empty() {
-                    let socket_path = self.dns_filter_socket.clone();
-                    if let Err(e) = crate::dns_filter_listener::start(&socket_path, hosts.clone()) {
-                        tracing::warn!(error = %e, "failed to start DNS filter listener");
-                        None
-                    } else {
-                        Some(socket_path)
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-        // Clone paths for the child process (originals are borrowed from self)
-        let rootfs_path = self.rootfs_path.clone();
-        let storage_disk_path = self.storage_disk.path().to_path_buf();
-        let overlay_disk_path = self.overlay_disk.path().to_path_buf();
-        let vsock_socket = self.vsock_socket.clone();
-        let console_log = self.console_log.clone();
-        let storage_size_gb = resources_for_fork
-            .storage_gib
-            .unwrap_or(crate::storage::DEFAULT_STORAGE_SIZE_GIB);
-        let overlay_size_gb = resources_for_fork
-            .overlay_gib
-            .unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GIB);
-        let resources_for_finalize = resources_for_fork.clone();
-
-        // Fork child process. The child becomes a session leader so the VM
-        // survives if the parent process is killed.
-        let child_pid = match process::fork_session_leader(move || {
-            // Inherited file descriptors (including database locks) are closed
-            // by fork_session_leader before this closure runs.
-
-            // All libkrun setup happens here in the child, same as the regular run path.
-            // This ensures DYLD_LIBRARY_PATH is still available (inherited from parent).
-
-            // Re-create StorageDisk in child (we only have the path)
-            let storage_disk = match crate::storage::StorageDisk::open_or_create_at(
-                &storage_disk_path,
-                storage_size_gb,
-            ) {
-                Ok(d) => d,
-                Err(e) => {
-                    let _ = std::fs::write(
-                        &self.startup_error_log,
-                        format!("failed to open storage disk: {}", e),
-                    );
-                    eprintln!("failed to open storage disk: {}", e);
-                    process::exit_child(1);
-                }
-            };
-
-            // Re-create OverlayDisk in child
-            let overlay_disk = match crate::storage::OverlayDisk::open_or_create_at(
-                &overlay_disk_path,
-                overlay_size_gb,
-            ) {
-                Ok(d) => d,
-                Err(e) => {
-                    let _ = std::fs::write(
-                        &self.startup_error_log,
-                        format!("failed to open overlay disk: {}", e),
-                    );
-                    eprintln!("failed to open overlay disk: {}", e);
-                    process::exit_child(1);
-                }
-            };
-
-            // Detach from parent's terminal before launching the VM.
-            // Without this, libkrun's threads inherit stdin and steal
-            // keystrokes from the user's shell.
-            process::detach_stdio();
-
-            // Launch the agent VM (never returns on success)
-            let disks = launcher::VmDisks {
-                storage: &storage_disk,
-                overlay: Some(&overlay_disk),
-            };
-            let result = launch_agent_vm(&launcher::LaunchConfig {
-                rootfs_path: &rootfs_path,
-                disks: &disks,
-                vsock_socket: &vsock_socket,
-                console_log: console_log.as_deref(),
-                mounts: &mounts,
-                port_mappings: &ports,
-                resources: resources_for_fork,
-                ssh_agent_socket: features.ssh_agent_socket.as_deref(),
-                dns_filter_socket: dns_filter_socket_path.as_deref(),
-            });
-
-            // If we get here, something went wrong (stderr is /dev/null,
-            // but the error is also logged to agent-startup-error.log)
-            if let Err(ref e) = result {
-                let _ = std::fs::write(&self.startup_error_log, e.to_string());
-            }
-
-            process::exit_child(1);
-        }) {
-            Ok(pid) => pid,
-            Err(e) => {
-                let mut inner = self.inner.lock();
-                inner.state = AgentState::Stopped;
-                return Err(Error::agent("fork process", e.to_string()));
-            }
-        };
-
-        tracing::debug!(pid = child_pid, "forked agent VM process");
-        self.finalize_launch(
-            child_pid,
-            &mounts_for_finalize,
-            &ports_for_finalize,
-            &resources_for_finalize,
-        )
+        // Delegate to subprocess launch — safe for both single-threaded (CLI)
+        // and multi-threaded (API server) callers.
+        self.start_via_subprocess(mounts, ports, resources, features)
     }
 
     /// Start the VM by spawning a fresh subprocess instead of fork().

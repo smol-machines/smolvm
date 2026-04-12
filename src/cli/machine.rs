@@ -227,6 +227,10 @@ pub struct RunCmd {
     #[arg(long, help_heading = "Network")]
     pub outbound_localhost_only: bool,
 
+    /// Enable GPU acceleration (Vulkan via virtio-gpu)
+    #[arg(long, help_heading = "Resources")]
+    pub gpu: bool,
+
     /// Number of virtual CPUs
     #[arg(long, default_value_t = DEFAULT_MICROVM_CPU_COUNT, value_name = "N", help_heading = "Resources")]
     pub cpus: u8,
@@ -325,6 +329,7 @@ impl RunCmd {
             cpus: params.cpus,
             memory_mib: params.mem,
             network: params.net,
+            gpu: self.gpu,
             storage_gib: params.storage_gb,
             overlay_gib: params.overlay_gb,
             allowed_cidrs: params.allowed_cidrs.clone(),
@@ -849,6 +854,10 @@ pub struct CreateCmd {
     #[arg(long)]
     pub outbound_localhost_only: bool,
 
+    /// Enable GPU acceleration (Vulkan via virtio-gpu)
+    #[arg(long)]
+    pub gpu: bool,
+
     /// Run command on every VM start (can be used multiple times)
     #[arg(long = "init", value_name = "COMMAND")]
     pub init: Vec<String>,
@@ -904,6 +913,9 @@ impl CreateCmd {
         let mut params = params;
         if self.ssh_agent {
             params.ssh_agent = true;
+        }
+        if self.gpu {
+            params.gpu = true;
         }
         vm_common::create_vm(params)
     }

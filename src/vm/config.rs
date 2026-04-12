@@ -281,6 +281,9 @@ pub struct VmConfig {
     /// Enable Rosetta for x86_64 binaries on Apple Silicon.
     pub rosetta: bool,
 
+    /// Enable GPU acceleration (virtio-gpu with Venus/Vulkan).
+    pub gpu: bool,
+
     /// Command to execute (None = use rootfs default).
     pub command: Option<Vec<String>>,
 
@@ -320,6 +323,7 @@ impl VmConfigBuilder {
                 vsock_ports: Vec::new(),
                 console_log: None,
                 rosetta: false,
+                gpu: false,
                 command: None,
                 workdir: None,
                 env: Vec::new(),
