@@ -908,6 +908,7 @@ fn ext4_already_full_size(device: &str) -> bool {
 }
 
 /// Check /proc/mounts to see if anything is mounted at the given path.
+#[cfg(target_os = "linux")]
 fn is_mounted_at(mount_point: &str) -> bool {
     if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
         return mounts
@@ -936,6 +937,7 @@ fn create_storage_dirs(mount_point: &str) {
 }
 
 /// Mount ext4 /dev/vda at /storage using direct syscall (avoids ~3-5ms fork+exec).
+#[cfg(target_os = "linux")]
 fn try_mount_storage_ext4() -> bool {
     let dev = cstr("/dev/vda");
     let mnt = cstr("/storage");
@@ -958,6 +960,7 @@ fn try_mount_storage_ext4() -> bool {
 /// 1. resize + mount (works on subsequent boots with Linux-native FS)
 /// 2. fsck + resize + mount (may fix minor corruption)
 /// 3. mkfs + mount (first boot from macOS template, or unrecoverable)
+#[cfg(target_os = "linux")]
 fn mount_storage_disk() -> bool {
     use std::process::Command;
 
@@ -1057,6 +1060,12 @@ fn mount_storage_disk() -> bool {
     }
 
     error!("CRITICAL: could not mount storage disk after all recovery attempts");
+    false
+}
+
+/// Stub for non-Linux platforms (agent only runs on Linux inside the VM).
+#[cfg(not(target_os = "linux"))]
+fn mount_storage_disk() -> bool {
     false
 }
 

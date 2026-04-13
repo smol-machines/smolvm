@@ -64,19 +64,26 @@ pub fn init_packed_layers() -> Option<PathBuf> {
     }
 
     // Mount virtiofs using direct syscall (avoids ~3-5ms fork+exec overhead)
-    let src = std::ffi::CString::new(tag).ok()?;
-    let dst = std::ffi::CString::new(mount_point.to_str()?).ok()?;
-    let fstype = std::ffi::CString::new("virtiofs").unwrap();
-    // SAFETY: mount virtiofs with valid CString arguments
-    let rc = unsafe {
-        libc::mount(
-            src.as_ptr(),
-            dst.as_ptr(),
-            fstype.as_ptr(),
-            0,
-            std::ptr::null(),
-        )
+    let _src = std::ffi::CString::new(tag).ok()?;
+    let _dst = std::ffi::CString::new(mount_point.to_str()?).ok()?;
+
+    #[cfg(target_os = "linux")]
+    let rc = {
+        let fstype = std::ffi::CString::new("virtiofs").unwrap();
+        // SAFETY: mount virtiofs with valid CString arguments
+        unsafe {
+            libc::mount(
+                src.as_ptr(),
+                dst.as_ptr(),
+                fstype.as_ptr(),
+                0,
+                std::ptr::null(),
+            )
+        }
     };
+    // virtiofs mount is only meaningful on Linux (inside the VM)
+    #[cfg(not(target_os = "linux"))]
+    let rc: libc::c_int = -1;
 
     if rc != 0 {
         let err = std::io::Error::last_os_error();
@@ -1935,27 +1942,32 @@ fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Resul
 
             // Mount virtiofs using direct syscall (avoids ~3-5ms fork+exec overhead).
             // Use sync option to ensure writes are persisted immediately.
-            let src = std::ffi::CString::new(tag.as_str()).map_err(|e| StorageError::Internal {
+            let _src = std::ffi::CString::new(tag.as_str()).map_err(|e| StorageError::Internal {
                 message: format!("invalid tag: {}", e),
             })?;
-            let dst =
+            let _dst =
                 std::ffi::CString::new(virtiofs_mount.to_string_lossy().as_ref()).map_err(|e| {
                     StorageError::Internal {
                         message: format!("invalid mount point: {}", e),
                     }
                 })?;
-            let fstype = std::ffi::CString::new("virtiofs").unwrap();
-            let opts = std::ffi::CString::new("sync").unwrap();
-            // SAFETY: mount virtiofs with valid CString arguments
-            let rc = unsafe {
-                libc::mount(
-                    src.as_ptr(),
-                    dst.as_ptr(),
-                    fstype.as_ptr(),
-                    0,
-                    opts.as_ptr() as *const libc::c_void,
-                )
+            // SAFETY: mount virtiofs with valid CString arguments (Linux only)
+            #[cfg(target_os = "linux")]
+            let rc = {
+                let fstype = std::ffi::CString::new("virtiofs").unwrap();
+                let opts = std::ffi::CString::new("sync").unwrap();
+                unsafe {
+                    libc::mount(
+                        _src.as_ptr(),
+                        _dst.as_ptr(),
+                        fstype.as_ptr(),
+                        0,
+                        opts.as_ptr() as *const libc::c_void,
+                    )
+                }
             };
+            #[cfg(not(target_os = "linux"))]
+            let rc: libc::c_int = -1;
             if rc != 0 {
                 let err = std::io::Error::last_os_error();
                 warn!(error = %err, tag = %tag, "failed to mount virtiofs device");
@@ -1977,38 +1989,43 @@ fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Resul
             );
 
             // Bind mount using direct syscall
-            let bind_src = std::ffi::CString::new(virtiofs_mount.to_string_lossy().as_ref())
+            let _bind_src = std::ffi::CString::new(virtiofs_mount.to_string_lossy().as_ref())
                 .map_err(|e| StorageError::Internal {
                     message: format!("invalid source: {}", e),
                 })?;
-            let bind_dst = std::ffi::CString::new(target_path.as_str()).map_err(|e| {
+            let _bind_dst = std::ffi::CString::new(target_path.as_str()).map_err(|e| {
                 StorageError::Internal {
                     message: format!("invalid target: {}", e),
                 }
             })?;
-            // SAFETY: bind mount with MS_BIND flag
+            // SAFETY: bind mount with MS_BIND flag (Linux only)
+            #[cfg(target_os = "linux")]
             let rc = unsafe {
                 libc::mount(
-                    bind_src.as_ptr(),
-                    bind_dst.as_ptr(),
+                    _bind_src.as_ptr(),
+                    _bind_dst.as_ptr(),
                     std::ptr::null(),
                     libc::MS_BIND,
                     std::ptr::null(),
                 )
             };
+            #[cfg(not(target_os = "linux"))]
+            let rc: libc::c_int = -1;
+
             if rc != 0 {
                 let err = std::io::Error::last_os_error();
                 warn!(error = %err, target = %target_path, "failed to bind-mount");
                 continue;
             }
 
-            // Remount read-only if requested
+            // Remount read-only if requested (Linux only — MS_BIND/MS_REMOUNT are Linux-specific)
+            #[cfg(target_os = "linux")]
             if *read_only {
                 // SAFETY: remount with MS_BIND|MS_RDONLY|MS_REMOUNT
                 unsafe {
                     libc::mount(
                         std::ptr::null(),
-                        bind_dst.as_ptr(),
+                        _bind_dst.as_ptr(),
                         std::ptr::null(),
                         libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
                         std::ptr::null(),
