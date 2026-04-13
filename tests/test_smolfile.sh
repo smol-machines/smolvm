@@ -1279,4 +1279,57 @@ run_test "Smolfile: [network] allow_hosts egress filtering" test_smolfile_networ
 run_test "Smolfile: [network] allow_cidrs egress filtering" test_smolfile_network_allow_cidrs || true
 run_test "Smolfile: [network] mixed hosts + cidrs" test_smolfile_network_mixed || true
 
+# =============================================================================
+# Workdir applied to machine exec (issue #107 related)
+# =============================================================================
+
+test_exec_inherits_smolfile_workdir() {
+    local vm_name="smolfile-exec-wd-$$"
+    cleanup_vm "$vm_name"
+
+    cat > "$SMOLFILE_TMPDIR/Smolfile.execwd" <<'EOF'
+cpus = 1
+memory = 512
+workdir = "/tmp"
+EOF
+
+    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.execwd" 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
+
+    # exec without --workdir should inherit Smolfile workdir
+    local output
+    output=$($SMOLVM machine exec --name "$vm_name" -- pwd 2>&1)
+
+    cleanup_vm "$vm_name"
+    [[ "$output" == *"/tmp"* ]]
+}
+
+test_exec_cli_workdir_overrides_smolfile() {
+    local vm_name="smolfile-exec-wdover-$$"
+    cleanup_vm "$vm_name"
+
+    cat > "$SMOLFILE_TMPDIR/Smolfile.execwdover" <<'EOF'
+cpus = 1
+memory = 512
+workdir = "/tmp"
+EOF
+
+    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.execwdover" 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
+
+    # exec with explicit -w should override Smolfile workdir
+    local output
+    output=$($SMOLVM machine exec --name "$vm_name" -w /var -- pwd 2>&1)
+
+    cleanup_vm "$vm_name"
+    [[ "$output" == *"/var"* ]]
+}
+
+echo ""
+echo "--- Exec Workdir Tests ---"
+echo ""
+
+run_test "Exec inherits Smolfile workdir" test_exec_inherits_smolfile_workdir || true
+run_test "Exec CLI --workdir overrides Smolfile" test_exec_cli_workdir_overrides_smolfile || true
+
 print_summary "Smolfile Tests"

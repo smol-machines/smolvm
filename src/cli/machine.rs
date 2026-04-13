@@ -721,12 +721,25 @@ impl ExecCmd {
 
         let env = parse_env_list(&self.env);
 
+        // Load machine record for workdir and image info
+        let name = self.name.clone().unwrap_or_else(|| "default".to_string());
+        let record = smolvm::db::SmolvmDb::open()
+            .ok()
+            .and_then(|db| db.get_vm(&name).ok().flatten());
+
+        // Resolve workdir: CLI --workdir flag takes priority over Smolfile/machine config
+        let workdir = self
+            .workdir
+            .clone()
+            .or_else(|| record.as_ref().and_then(|r| r.workdir.clone()));
+        let record_image = record.as_ref().and_then(|r| r.image.clone());
+
         // Streaming mode — print output as it arrives, no buffering
         if self.stream {
             let events = client.vm_exec_streaming(
                 self.command.clone(),
                 env,
-                self.workdir.clone(),
+                workdir.clone(),
                 self.timeout,
             )?;
             let mut exit_code = 0;
@@ -757,26 +770,20 @@ impl ExecCmd {
 
         // Check if this machine has an image — if so, exec inside the image's
         // rootfs via client.run_interactive()/run_non_interactive() instead of bare vm_exec().
-        let machine_name = self.name.clone().unwrap_or_else(|| "default".to_string());
-        let (record_image, mount_bindings) = {
-            smolvm::db::SmolvmDb::open()
-                .ok()
-                .and_then(|db| db.get_vm(&machine_name).ok().flatten())
-                .map(|r| {
-                    let bindings = mounts_to_virtiofs_bindings(&r.host_mounts());
-                    (r.image.clone(), bindings)
-                })
-                .unwrap_or((None, vec![]))
-        };
+        let mount_bindings = record
+            .as_ref()
+            .map(|r| mounts_to_virtiofs_bindings(&r.host_mounts()))
+            .unwrap_or_default();
 
         if let Some(ref image) = record_image {
             // Image-based machine: exec inside the image's rootfs via crun.
             // Use machine name as persistent overlay ID so filesystem changes
             // (e.g. package installs) survive across exec sessions.
+            let machine_name = name.clone();
             if self.interactive || self.tty {
                 let config = smolvm::agent::RunConfig::new(image, self.command.clone())
                     .with_env(env)
-                    .with_workdir(self.workdir.clone())
+                    .with_workdir(workdir.clone())
                     .with_mounts(mount_bindings)
                     .with_timeout(self.timeout)
                     .with_tty(self.tty)
@@ -788,7 +795,7 @@ impl ExecCmd {
 
             let config = smolvm::agent::RunConfig::new(image, self.command.clone())
                 .with_env(env)
-                .with_workdir(self.workdir.clone())
+                .with_workdir(workdir.clone())
                 .with_mounts(mount_bindings)
                 .with_timeout(self.timeout)
                 .with_persistent_overlay(Some(machine_name));
@@ -800,7 +807,7 @@ impl ExecCmd {
                 let exit_code = client.vm_exec_interactive(
                     self.command.clone(),
                     env,
-                    self.workdir.clone(),
+                    workdir.clone(),
                     self.timeout,
                     self.tty,
                 )?;
@@ -808,12 +815,8 @@ impl ExecCmd {
                 std::process::exit(exit_code);
             }
 
-            let (exit_code, stdout, stderr) = client.vm_exec(
-                self.command.clone(),
-                env,
-                self.workdir.clone(),
-                self.timeout,
-            )?;
+            let (exit_code, stdout, stderr) =
+                client.vm_exec(self.command.clone(), env, workdir.clone(), self.timeout)?;
             vm_common::print_output_and_exit(&manager, exit_code, &stdout, &stderr);
         }
     }
