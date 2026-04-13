@@ -757,20 +757,22 @@ impl ExecCmd {
 
         // Check if this machine has an image — if so, exec inside the image's
         // rootfs via client.run_interactive()/run_non_interactive() instead of bare vm_exec().
-        let record_image = {
-            let name = self.name.clone().unwrap_or_else(|| "default".to_string());
+        let machine_name = self.name.clone().unwrap_or_else(|| "default".to_string());
+        let (record_image, mount_bindings) = {
             smolvm::db::SmolvmDb::open()
                 .ok()
-                .and_then(|db| db.get_vm(&name).ok().flatten())
-                .and_then(|r| r.image.clone())
+                .and_then(|db| db.get_vm(&machine_name).ok().flatten())
+                .map(|r| {
+                    let bindings = mounts_to_virtiofs_bindings(&r.host_mounts());
+                    (r.image.clone(), bindings)
+                })
+                .unwrap_or((None, vec![]))
         };
 
         if let Some(ref image) = record_image {
             // Image-based machine: exec inside the image's rootfs via crun.
             // Use machine name as persistent overlay ID so filesystem changes
             // (e.g. package installs) survive across exec sessions.
-            let machine_name = self.name.clone().unwrap_or_else(|| "default".to_string());
-            let mount_bindings = vec![]; // mounts were set at create time
             if self.interactive || self.tty {
                 let config = smolvm::agent::RunConfig::new(image, self.command.clone())
                     .with_env(env)

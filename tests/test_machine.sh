@@ -1189,12 +1189,109 @@ test_create_with_image_and_env() {
     $SMOLVM machine delete "$vm_name" -f 2>/dev/null
 }
 
+# Regression test: volume mounts declared at create time must be visible
+# inside the container on every subsequent `machine exec` call.
+#
+# The bug: exec built an empty mount_bindings list, so crun never received
+# the virtiofs tag→container path mapping and the guest path was absent.
+# Covered path: image-based machine → run_non_interactive(RunConfig) branch.
+# The bare-VM path (no image) is covered by test_machine_volume_mount_visible_to_exec.
+test_image_exec_volume_mount_visible() {
+    local vm_name="imgexec-vol-test-$$"
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    echo "exec-volume-regression-marker" > "$tmpdir/marker.txt"
+
+    $SMOLVM machine create "$vm_name" --image alpine:latest --net \
+        -v "$tmpdir:/hostdata" 2>&1 || { rm -rf "$tmpdir"; return 1; }
+
+    local start_out
+    start_out=$(run_with_timeout 90 $SMOLVM machine start --name "$vm_name" 2>&1)
+    if [[ $? -eq 124 ]]; then
+        echo "TIMEOUT on start"
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        rm -rf "$tmpdir"
+        return 1
+    fi
+
+    local exec_out
+    exec_out=$(run_with_timeout 30 $SMOLVM machine exec --name "$vm_name" -- cat /hostdata/marker.txt 2>&1)
+    local exec_rc=$?
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    rm -rf "$tmpdir"
+
+    [[ $exec_rc -eq 124 ]] && { echo "TIMEOUT on exec"; return 1; }
+    [[ "$exec_out" == *"exec-volume-regression-marker"* ]]
+}
+
+# Smolfile variant of the exec-volume regression test.
+#
+# Mirrors the user's exact repro: `machine create -s Smolfile.toml` with a
+# relative `volumes = [".:/app"]` entry. Canonicalization happens at create
+# time, so the stored record always holds an absolute host path — the fix
+# must work regardless of whether mounts came from CLI flags or a Smolfile.
+test_image_exec_volume_mount_visible_smolfile() {
+    local vm_name="imgexec-sf-vol-test-$$"
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    echo "smolfile-exec-volume-regression-marker" > "$tmpdir/marker.txt"
+
+    # Write a Smolfile that uses a relative path (.:/app) — same shape as the
+    # user's repro. We cd into tmpdir so "." resolves to it.
+    cat > "$tmpdir/Smolfile.toml" <<'EOF'
+image = "alpine:latest"
+net = true
+cpus = 1
+memory = 512
+
+[dev]
+volumes = [".:/app"]
+EOF
+
+    (
+        cd "$tmpdir"
+        $SMOLVM machine create "$vm_name" -s Smolfile.toml 2>&1
+    ) || { rm -rf "$tmpdir"; return 1; }
+
+    local start_out
+    start_out=$(run_with_timeout 90 $SMOLVM machine start --name "$vm_name" 2>&1)
+    if [[ $? -eq 124 ]]; then
+        echo "TIMEOUT on start"
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        rm -rf "$tmpdir"
+        return 1
+    fi
+
+    local exec_out
+    exec_out=$(run_with_timeout 30 $SMOLVM machine exec --name "$vm_name" -- cat /app/marker.txt 2>&1)
+    local exec_rc=$?
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    rm -rf "$tmpdir"
+
+    [[ $exec_rc -eq 124 ]] && { echo "TIMEOUT on exec"; return 1; }
+    [[ "$exec_out" == *"smolfile-exec-volume-regression-marker"* ]]
+}
+
 echo ""
 echo "--- Create --image Tests ---"
 echo ""
 
 run_test "Create with --image" test_create_with_image || true
 run_test "Create with --image + env" test_create_with_image_and_env || true
+run_test "Create with --image: volume mount visible to exec" test_image_exec_volume_mount_visible || true
+run_test "Create with --image: Smolfile volumes visible to exec" test_image_exec_volume_mount_visible_smolfile || true
 
 # =============================================================================
 # File I/O (machine cp)
