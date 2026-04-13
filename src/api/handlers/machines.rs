@@ -39,29 +39,12 @@ use crate::api::TraceId;
 use crate::config::{RecordState, RestartConfig, VmRecord};
 use crate::data::validate_vm_name;
 
-/// Resolve the actual machine state, using vsock as a fallback.
-///
-/// `VmRecord::actual_state()` checks PID liveness, but on macOS the
-/// session-leader VM process may not be visible via `kill(pid, 0)`.
-/// When the DB says Running but the PID check says Stopped, probe
-/// the agent socket to determine the real state.
-fn resolve_machine_state(name: &str, record: &VmRecord) -> RecordState {
-    let state = record.actual_state();
-
-    if record.state == RecordState::Running && state == RecordState::Stopped {
-        if let Ok(manager) = AgentManager::for_vm(name) {
-            if let Ok(mut client) =
-                crate::agent::AgentClient::connect_with_short_timeout(manager.vsock_socket())
-            {
-                if client.ping().is_ok() {
-                    return RecordState::Running;
-                }
-            }
-        }
-    }
-
-    state
-}
+/// Re-export of the shared resolver. The CLI and API list endpoints
+/// must compute state the same way, otherwise `machine list` (CLI)
+/// and `GET /api/v1/machines` (API) can disagree about whether a VM
+/// is `Running`, `Stopped`, or `Unreachable`. Single source of truth
+/// lives in `agent::state_probe`.
+use crate::agent::state_probe::resolve_state as resolve_machine_state;
 
 /// Convert VmRecord to MachineInfo (pure mapping, no I/O).
 fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
@@ -346,9 +329,23 @@ pub async fn start_machine(
         .map_err(ApiError::database)?
         .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
 
-    // Check state — if already running, ensure it's in the registry
-    let actual_state = record.actual_state();
-    if actual_state == RecordState::Running {
+    // Resolve via the shared probe (PID + vsock ping) so we don't
+    // mistake a zombie VMM (live PID, dead agent) for Running — the
+    // CLI's `start --name` handles this same case; the API must
+    // match or a REST caller ends up with "start succeeded" followed
+    // by every subsequent /exec failing.
+    //
+    // `resolve_state` does a short vsock ping, so run it on the
+    // blocking pool rather than in the async task.
+    let name_probe = name.clone();
+    let record_probe = record.clone();
+    let resolved = tokio::task::spawn_blocking(move || {
+        crate::agent::state_probe::resolve_state(&name_probe, &record_probe)
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
+
+    if resolved == RecordState::Running {
         if !state.machine_exists(&name) {
             // Running in DB but not in registry (startup recovery case).
             let name_for_repair = name.clone();
@@ -369,6 +366,19 @@ pub async fn start_machine(
             state.insert_machine(&name, machine_entry_from_record(&record, manager));
         }
         return Ok(Json(record_to_info(&name, &record)));
+    }
+
+    if resolved == RecordState::Unreachable {
+        // Zombie: verified-kill the VMM and clear the DB record
+        // before falling through to a clean fresh start. Any stale
+        // in-memory registry entry gets overwritten by the
+        // `insert_machine` call later in this handler.
+        let name_recover = name.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::agent::state_probe::recover_if_unreachable(&name_recover);
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
     }
 
     let mounts = record.host_mounts();

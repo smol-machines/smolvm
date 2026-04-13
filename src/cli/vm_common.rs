@@ -69,6 +69,15 @@ pub fn ensure_running_and_connect(
     };
 
     if manager.try_connect_existing().is_none() {
+        // Best-effort reconcile: if we can't connect to the agent
+        // but the libkrun PID is alive, we're in the bug 2 zombie
+        // state — record says "running" but agent is dead. Mark
+        // the record `Unreachable` so subsequent `machine list`
+        // calls reflect truth without re-pinging. DB write is
+        // best-effort: we ignore failures so a bad DB doesn't mask
+        // the real "can't connect" error the user is about to see.
+        mark_unreachable_if_zombie(&label);
+
         return Err(smolvm::Error::agent(
             "connect",
             format!(
@@ -80,6 +89,65 @@ pub fn ensure_running_and_connect(
 
     let client = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
     Ok((manager, client))
+}
+
+/// CLI wrapper around `state_probe::recover_if_unreachable` that
+/// prints a one-line notice when recovery actually runs. The shared
+/// helper is silent (the HTTP API doesn't have a stdout to write
+/// to); CLI callers want the operator to see the zombie teardown.
+fn cli_recover_if_unreachable(name: &str) {
+    // Peek at the record before recovery so we can show the PID in
+    // the notice. Losing the PID after recovery is fine — the DB
+    // gets cleared — but we want the operator to know *which*
+    // process got killed.
+    let pid_for_notice = SmolvmDb::open()
+        .ok()
+        .and_then(|db| db.get_vm(name).ok().flatten())
+        .and_then(|r| r.pid);
+
+    if smolvm::agent::state_probe::recover_if_unreachable(name) {
+        println!(
+            "Machine '{}' is unreachable (PID {} alive but agent unresponsive); \
+             cleaning up.",
+            name,
+            pid_for_notice.unwrap_or(0)
+        );
+    }
+}
+
+/// If the VM record says `Running` and the libkrun PID is alive but
+/// the agent isn't responding, transition the record to
+/// `Unreachable`. Caller invokes this on `ensure_running_and_connect`
+/// failure so the next `machine list` is honest.
+///
+/// All errors are swallowed (logged at debug level) — this is a
+/// best-effort cleanup, not a critical path.
+fn mark_unreachable_if_zombie(name: &str) {
+    let Ok(mut config) = SmolvmConfig::load() else {
+        return;
+    };
+    let Some(record) = config.get_vm(name) else {
+        return;
+    };
+    // Only transition Running → Unreachable. Stopped/Created/Failed
+    // are already accurate.
+    if record.state != RecordState::Running {
+        return;
+    }
+    if !record.is_process_alive() {
+        // PID dead → next list will see Stopped without our help.
+        return;
+    }
+    // PID alive + ensure_running_and_connect failed → zombie. Persist
+    // the new state. Update via the closure-based helper if available;
+    // fall back to nothing on failure (best-effort).
+    let _ = config.update_vm(name, |r| {
+        r.state = RecordState::Unreachable;
+    });
+    tracing::debug!(
+        machine = %name,
+        "marked machine Unreachable: PID alive but agent not responding"
+    );
 }
 
 /// Print command output and exit with the given code.
@@ -242,12 +310,25 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
     let db = SmolvmDb::open()?;
     let record = db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))?;
 
-    // Check state
-    let actual_state = record.actual_state();
-    if actual_state == RecordState::Running {
-        let pid_suffix = format_pid_suffix(record.pid);
-        println!("Machine '{}' already running{}", name, pid_suffix);
-        return Ok(());
+    // Resolve via the shared probe (PID + vsock ping). The plain
+    // `actual_state()` is PID-only and would treat a zombie VMM
+    // (alive process, dead agent) as Running — exactly the bug 2
+    // case where `start` later said "already running" but every
+    // `exec` failed.
+    match smolvm::agent::state_probe::resolve_state(name, &record) {
+        RecordState::Running => {
+            let pid_suffix = format_pid_suffix(record.pid);
+            println!("Machine '{}' already running{}", name, pid_suffix);
+            return Ok(());
+        }
+        RecordState::Unreachable => {
+            // Zombie VMM: kill it, clear the record, fall through to
+            // a clean fresh start.
+            cli_recover_if_unreachable(name);
+        }
+        RecordState::Stopped | RecordState::Created | RecordState::Failed => {
+            // Normal start path.
+        }
     }
 
     let mounts = record.host_mounts();
@@ -452,6 +533,11 @@ pub fn start_vm_default() -> smolvm::Result<()> {
         return Ok(());
     }
 
+    // try_connect_existing failed — could be "really stopped" or
+    // "zombie VMM with dead agent". Recover the zombie case before
+    // starting fresh; no-op otherwise.
+    cli_recover_if_unreachable("default");
+
     println!("Starting machine 'default'...");
     manager.ensure_running()?;
 
@@ -518,13 +604,25 @@ pub fn stop_vm_named(name: &str) -> smolvm::Result<()> {
         }
     };
 
-    let actual_state = record.actual_state();
-    if actual_state != RecordState::Running {
-        println!(
-            "Machine '{}' is not running (state: {})",
-            name, actual_state,
-        );
-        return Ok(());
+    // Resolve via the shared probe so an `Unreachable` VM (live PID,
+    // dead agent) is correctly stopped instead of skipped with a
+    // misleading "not running" message. `cli_recover_if_unreachable`
+    // handles that case by killing the zombie VMM; after it runs the
+    // record is `Stopped` and `manager.stop()` becomes a no-op.
+    let resolved = smolvm::agent::state_probe::resolve_state(name, &record);
+    match resolved {
+        RecordState::Unreachable => {
+            cli_recover_if_unreachable(name);
+            println!("Stopped machine: {}", name);
+            return Ok(());
+        }
+        RecordState::Running => {
+            // fall through to the normal stop path
+        }
+        other => {
+            println!("Machine '{}' is not running (state: {})", name, other);
+            return Ok(());
+        }
     }
 
     println!("Stopping machine '{}'...", name);
@@ -587,13 +685,24 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
         .ok_or_else(|| smolvm::Error::vm_not_found(name))?
         .clone();
 
-    // Stop if running (machine run does this)
-    if options.stop_if_running && record.actual_state() == RecordState::Running {
-        if let Ok(manager) = AgentManager::for_vm(name) {
-            println!("Stopping machine '{}'...", name);
-            if let Err(e) = manager.stop() {
-                tracing::warn!(error = %e, "failed to stop machine");
+    // Stop if running (machine run does this). Use the shared
+    // resolver so an `Unreachable` VM (live PID, dead agent) is also
+    // torn down — otherwise the record gets deleted while the zombie
+    // libkrun process keeps running, orphaned forever.
+    if options.stop_if_running {
+        match smolvm::agent::state_probe::resolve_state(name, &record) {
+            RecordState::Running => {
+                if let Ok(manager) = AgentManager::for_vm(name) {
+                    println!("Stopping machine '{}'...", name);
+                    if let Err(e) = manager.stop() {
+                        tracing::warn!(error = %e, "failed to stop machine");
+                    }
+                }
             }
+            RecordState::Unreachable => {
+                cli_recover_if_unreachable(name);
+            }
+            _ => {}
         }
     }
 
@@ -679,7 +788,10 @@ pub fn list_vms(verbose: bool, json: bool) -> smolvm::Result<()> {
         let json_vms: Vec<_> = vms
             .iter()
             .map(|(name, record)| {
-                let actual_state = record.actual_state();
+                // Resolve via vsock probe so the JSON output reflects
+                // truth (Unreachable vs Running) instead of trusting
+                // the PID-only check that fooled bug 2 victims.
+                let actual_state = smolvm::agent::state_probe::resolve_state(name, record);
                 let mut obj = serde_json::json!({
                     "name": name,
                     "state": actual_state.to_string(),
@@ -713,7 +825,7 @@ pub fn list_vms(verbose: bool, json: bool) -> smolvm::Result<()> {
         println!("{}", "-".repeat(88));
 
         for (name, record) in vms {
-            let actual_state = record.actual_state();
+            let actual_state = smolvm::agent::state_probe::resolve_state(name, record);
             let state_display = if record.ephemeral {
                 format!("{} (eph)", actual_state)
             } else {

@@ -8,6 +8,7 @@ mod client;
 mod launcher;
 pub mod launcher_dynamic;
 mod manager;
+pub mod state_probe;
 pub mod terminal;
 
 pub use crate::data::network::PortMapping;

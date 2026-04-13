@@ -27,6 +27,14 @@ pub enum RecordState {
     Stopped,
     /// VM crashed or error.
     Failed,
+    /// libkrun VMM process is alive but the guest agent is not
+    /// responding to vsock pings. Typical cause: the agent crashed
+    /// (OOM, panic, kernel issue) while the VMM stayed up — common
+    /// aftermath of a workload that exhausted guest resources.
+    /// `machine list` shows this so operators see the truth instead
+    /// of a misleading "running"; `machine start` recovers by
+    /// killing the zombie VMM and starting fresh.
+    Unreachable,
 }
 
 impl std::fmt::Display for RecordState {
@@ -36,6 +44,7 @@ impl std::fmt::Display for RecordState {
             RecordState::Running => write!(f, "running"),
             RecordState::Stopped => write!(f, "stopped"),
             RecordState::Failed => write!(f, "failed"),
+            RecordState::Unreachable => write!(f, "unreachable"),
         }
     }
 }
