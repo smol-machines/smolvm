@@ -761,7 +761,7 @@ test_packed_rbase_run() {
     local exit_code=$?
 
     [[ $exit_code -eq 124 ]] && { echo "TIMEOUT"; return 1; }
-    [[ "$result" == *"R version"* ]]
+    [[ "$result" == *"GNU R Version"* ]] || [[ "$result" == *"r ('littler') version"* ]]
 }
 
 test_packed_rbase_auto_storage() {

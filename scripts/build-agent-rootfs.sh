@@ -146,6 +146,34 @@ install_packages_apk_static() {
     echo "Packages installed successfully"
 }
 
+repair_executable_modes() {
+    local rootfs_dir="$1"
+    local dirs=(
+        "$rootfs_dir/bin"
+        "$rootfs_dir/sbin"
+        "$rootfs_dir/usr/bin"
+        "$rootfs_dir/usr/sbin"
+        "$rootfs_dir/usr/local/bin"
+        "$rootfs_dir/usr/local/sbin"
+    )
+
+    echo "Normalizing executable permissions..."
+    for dir in "${dirs[@]}"; do
+        if [[ ! -d "$dir" ]]; then
+            continue
+        fi
+
+        # On the macOS build path, apk install into the host-mounted rootfs can
+        # strip execute bits from package-installed guest tools. We observed
+        # this on crun, resize2fs, and e2fsck, and the failures only surfaced
+        # later during packed/container execution. These directories are the
+        # standard executable locations in the guest rootfs, so normalize their
+        # contents before install/pack preserves the bad modes.
+        find "$dir" -type d -exec chmod 755 {} +
+        find "$dir" -type f -exec chmod 755 {} +
+    done
+}
+
 if [[ "$(uname -s)" == "Linux" ]]; then
     # On Linux, apk.static is preferred — it handles cross-arch correctly
     install_packages_apk_static
@@ -164,6 +192,8 @@ else
     echo "Install smolvm first: https://github.com/smolvm/smolvm"
     exit 1
 fi
+
+repair_executable_modes "$OUTPUT_DIR"
 
 # Create necessary directories
 mkdir -p "$OUTPUT_DIR/storage"
