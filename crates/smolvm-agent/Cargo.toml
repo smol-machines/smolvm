@@ -23,3 +23,13 @@ tempfile = "3"
 # Linux-specific dependencies for vsock
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.27", features = ["socket", "fs"] }
+
+[package.metadata]
+# smolvm-agent only compiles and runs on Linux (inside the VM).
+# Build using: ./scripts/rebuild-agent.sh
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+# This crate does not support non-Linux targets.
+# Attempting to compile it directly on other OS will produce errors.
+# Use ./scripts/rebuild-agent.sh instead.
+"smolvm-agent-is-linux-only-run-scripts-rebuild-agent-sh" = { version = "0.0.0" }
