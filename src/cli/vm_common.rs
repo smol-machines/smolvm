@@ -172,6 +172,120 @@ pub fn print_output_and_exit(
 }
 
 // ============================================================================
+// Init runner
+// ============================================================================
+
+/// Run a machine's `init` commands list against the agent.
+///
+/// Branches on `image`:
+///
+/// - `Some(img)`: each command runs *inside* the container's rootfs via
+///   `client.run_non_interactive`. `record_mounts` are bind-mounted into
+///   the container (so `[dev].volumes` like `.:/app` are visible to init,
+///   not just to later `machine exec` calls). `overlay_id` ensures
+///   filesystem changes (e.g. `pacman -Syu` package installs) persist
+///   across this init invocation and into future `machine exec` calls —
+///   matches the convention `machine exec` already uses
+///   (`src/cli/machine.rs:750`).
+///
+/// - `None`: each command runs in the agent's bare VM filesystem via
+///   `client.vm_exec`. There's no container, so `record_mounts` and
+///   `overlay_id` are unused on this branch.
+///
+/// On the first non-zero exit, returns an error containing the command
+/// index, exit code, and any stdout/stderr the command produced.
+/// **Both** streams are surfaced because package managers often write
+/// the actual failure reason to stdout (`pacman`'s "target not found",
+/// `apt`'s resolver diagnostics) — surfacing only stderr would leave
+/// the operator with an exit code and no explanation. The caller is
+/// responsible for stopping the VM if appropriate.
+pub(crate) fn run_init_commands(
+    client: &mut smolvm::agent::AgentClient,
+    init: &[String],
+    image: Option<&str>,
+    env: &[(String, String)],
+    workdir: Option<&str>,
+    record_mounts: &[(String, String, bool)],
+    overlay_id: &str,
+) -> smolvm::Result<()> {
+    if init.is_empty() {
+        return Ok(());
+    }
+    println!("Running {} init command(s)...", init.len());
+    for (i, cmd) in init.iter().enumerate() {
+        let (exit_code, stdout, stderr) = if let Some(image) = image {
+            let config = build_init_run_config(image, cmd, env, workdir, record_mounts, overlay_id);
+            client.run_non_interactive(config)?
+        } else {
+            client.vm_exec(
+                init_argv(cmd),
+                env.to_vec(),
+                workdir.map(|s| s.to_string()),
+                None,
+            )?
+        };
+        if exit_code != 0 {
+            return Err(smolvm::Error::agent(
+                "init",
+                format_init_failure(i, exit_code, &stdout, &stderr),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Wrap a single init command line in `sh -c` argv form. Init commands
+/// are user-supplied shell snippets (e.g. `"pacman -Sy && pacman -S git"`)
+/// — we intentionally route them through `sh` so operators can use shell
+/// features (`&&`, `|`, env expansion) without quoting gymnastics.
+fn init_argv(cmd: &str) -> Vec<String> {
+    vec!["sh".into(), "-c".into(), cmd.to_string()]
+}
+
+/// Build the `RunConfig` an image-based init command runs under.
+///
+/// Pure function so the *shape* of the request (overlay ID, mount tags,
+/// env, workdir, the `sh -c` wrap) can be unit-tested without mocking
+/// `AgentClient`. Any of these silently regressing — e.g. mounts not
+/// flowing through, or overlay ID drifting from the machine name —
+/// would leave init working but `machine exec` no longer seeing init's
+/// effects, exactly the class of bug that would lurk for months.
+fn build_init_run_config(
+    image: &str,
+    cmd: &str,
+    env: &[(String, String)],
+    workdir: Option<&str>,
+    record_mounts: &[(String, String, bool)],
+    overlay_id: &str,
+) -> smolvm::agent::RunConfig {
+    let mounts = crate::cli::parsers::record_mounts_to_runconfig_bindings(record_mounts);
+    smolvm::agent::RunConfig::new(image, init_argv(cmd))
+        .with_env(env.to_vec())
+        .with_workdir(workdir.map(|s| s.to_string()))
+        .with_mounts(mounts)
+        .with_persistent_overlay(Some(overlay_id.to_string()))
+}
+
+/// Compose the user-facing init-failure message. Pure function — split
+/// out for testability and so the formatting choice (which stream goes
+/// in which order, separators, trimming) is in one place.
+fn format_init_failure(index: usize, exit_code: i32, stdout: &str, stderr: &str) -> String {
+    let so = stdout.trim();
+    let se = stderr.trim();
+    let suffix = match (so, se) {
+        ("", "") => String::new(),
+        (so, "") => format!(": {}", so),
+        ("", se) => format!(": {}", se),
+        // Both populated: keep stderr first (canonical error channel)
+        // but include stdout because `pacman`/`apt`/`dnf` often put the
+        // real reason there. Single line, semicolon-separated, so the
+        // message stays grep-friendly.
+        (so, se) => format!(": {}; stdout: {}", se, so),
+    };
+    format!("init[{}] failed (exit {}){}", index, exit_code, suffix)
+}
+
+// ============================================================================
 // Create
 // ============================================================================
 
@@ -382,45 +496,46 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
     // instead of orphaning it. Disarmed before detach.
     let _sigint_guard = pid.map(smolvm::process::SigintGuard::new);
 
-    // Run init commands if configured (before reporting success)
-    if !record.init.is_empty() {
-        println!("Running {} init command(s)...", record.init.len());
-        let mut client = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
-        for (i, cmd) in record.init.iter().enumerate() {
-            let argv = vec!["sh".into(), "-c".into(), cmd.clone()];
-            let (exit_code, _stdout, stderr) =
-                client.vm_exec(argv, record.env.clone(), record.workdir.clone(), None)?;
-            if exit_code != 0 {
-                if let Err(e) = manager.stop() {
-                    tracing::warn!(error = %e, "failed to stop machine after init failure");
-                }
-                return Err(smolvm::Error::agent(
-                    "init",
-                    format!("init[{}] failed (exit {}): {}", i, exit_code, stderr.trim()),
-                ));
-            }
-        }
-    }
+    // Pull image first (if configured), then run init. Init can
+    // target the container's rootfs (via `run_non_interactive`) when
+    // an image is set, so the container layers must be in place
+    // before init runs — otherwise any init command referencing the
+    // image's filesystem (package managers, distro-specific paths)
+    // would hit the bare Alpine agent and fail with "not found".
+    let mut client = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
 
-    // Auto-create container if image is configured (from Smolfile)
     if let Some(ref image) = record.image {
-        let mut client = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
-
         println!("Pulling {}...", image);
         let _image_info = crate::cli::pull_with_progress(&mut client, image, None)?;
+    }
 
-        // Image is pulled and cached. The VM is running and ready for
-        // `machine exec` commands. No background process is started — the
-        // VM sits idle until the user execs into it.
+    // Run init commands if configured (before reporting success).
+    // `run_init_commands` branches on image: container path for
+    // image-based VMs, bare-agent path for plain VMs.
+    if let Err(e) = run_init_commands(
+        &mut client,
+        &record.init,
+        record.image.as_deref(),
+        &record.env,
+        record.workdir.as_deref(),
+        &record.mounts,
+        name,
+    ) {
+        if let Err(stop_err) = manager.stop() {
+            tracing::warn!(error = %stop_err, "failed to stop machine after init failure");
+        }
+        return Err(e);
+    }
 
+    if record.image.is_some() {
+        // Image-based machine: VM is running, image pulled and cached,
+        // init done. Sits idle until `machine exec` is called.
         println!("Machine '{}' running (PID: {})", name, pid.unwrap_or(0));
     } else {
         // No image — bare VM mode. Run entrypoint+cmd if configured.
         let mut bare_cmd = record.entrypoint.clone();
         bare_cmd.extend(record.cmd.clone());
         if !bare_cmd.is_empty() {
-            let mut client =
-                smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
             let env = record.env.clone();
             let (exit_code, stdout, stderr) =
                 client.vm_exec(bare_cmd, env, record.workdir.clone(), None)?;
@@ -544,27 +659,38 @@ pub fn start_vm_default() -> smolvm::Result<()> {
     let mut config = SmolvmConfig::load()?;
     persist_default_running(&mut config, manager.child_pid(), None);
 
-    // Run init commands if the default record has them (persisted from machine run -d -s)
+    // Pull image (if persisted via `machine run -d -s`) before running
+    // init, then run init through the shared runner — same fix as
+    // `start_vm_named`. Both paths must agree so an init that works on
+    // a named machine also works on the default one.
     let record = config.get_vm("default").cloned();
 
     if let Some(record) = record {
-        if !record.init.is_empty() {
-            println!("Running {} init command(s)...", record.init.len());
+        let needs_pull = record.image.is_some();
+        let needs_init = !record.init.is_empty();
+
+        if needs_pull || needs_init {
             let mut client =
                 smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
-            for (i, cmd) in record.init.iter().enumerate() {
-                let argv = vec!["sh".into(), "-c".into(), cmd.clone()];
-                let (exit_code, _stdout, stderr) =
-                    client.vm_exec(argv, record.env.clone(), record.workdir.clone(), None)?;
-                if exit_code != 0 {
-                    if let Err(e) = manager.stop() {
-                        tracing::warn!(error = %e, "failed to stop machine after init failure");
-                    }
-                    return Err(smolvm::Error::agent(
-                        "init",
-                        format!("init[{}] failed (exit {}): {}", i, exit_code, stderr.trim()),
-                    ));
+
+            if let Some(ref image) = record.image {
+                println!("Pulling {}...", image);
+                let _ = crate::cli::pull_with_progress(&mut client, image, None)?;
+            }
+
+            if let Err(e) = run_init_commands(
+                &mut client,
+                &record.init,
+                record.image.as_deref(),
+                &record.env,
+                record.workdir.as_deref(),
+                &record.mounts,
+                "default",
+            ) {
+                if let Err(stop_err) = manager.stop() {
+                    tracing::warn!(error = %stop_err, "failed to stop machine after init failure");
                 }
+                return Err(e);
             }
         }
     }
@@ -1066,5 +1192,139 @@ pub fn cleanup_orphaned_ephemeral_vms() {
             tracing::debug!(name = %name, pid = ?record.pid, "cleaning up orphaned ephemeral VM");
             let _ = db.remove_vm(name);
         }
+    }
+}
+
+#[cfg(test)]
+mod init_runner_tests {
+    use super::*;
+
+    #[test]
+    fn format_init_failure_includes_stderr_only() {
+        // Single stream → no "stdout:" / "stderr:" labels needed; the
+        // colon-prefixed form keeps the message compact for the common
+        // case of a tool writing only to stderr.
+        let msg = format_init_failure(0, 1, "", "command not found");
+        assert_eq!(msg, "init[0] failed (exit 1): command not found");
+    }
+
+    #[test]
+    fn format_init_failure_includes_stdout_only() {
+        // Some tools emit their failure reason on stdout instead of
+        // stderr (curl with -s, certain pacman/apt failure modes).
+        // Dropping stdout would leave the operator with just an exit
+        // code and no explanation.
+        let msg = format_init_failure(2, 127, "could not resolve mirror", "");
+        assert_eq!(msg, "init[2] failed (exit 127): could not resolve mirror");
+    }
+
+    #[test]
+    fn format_init_failure_combines_both_streams() {
+        // Both populated: stderr leads (canonical error channel) but
+        // stdout follows so package-manager errors that put the real
+        // reason on stdout are still visible. Single-line for greppability.
+        let msg = format_init_failure(0, 2, "saw 3 errors", "fatal: aborting");
+        assert_eq!(
+            msg,
+            "init[0] failed (exit 2): fatal: aborting; stdout: saw 3 errors"
+        );
+    }
+
+    #[test]
+    fn format_init_failure_handles_empty_streams() {
+        // Some commands exit non-zero with no output (e.g. `false`).
+        // The error must still be informative — the index + exit code
+        // alone tell the user which command failed and how.
+        let msg = format_init_failure(5, 1, "", "");
+        assert_eq!(msg, "init[5] failed (exit 1)");
+    }
+
+    #[test]
+    fn format_init_failure_trims_whitespace() {
+        // Subprocess output usually ends in a trailing newline; the
+        // formatter trims so the assembled message doesn't have weird
+        // mid-line breaks.
+        let msg = format_init_failure(0, 1, "  ", "  bad thing happened  \n");
+        assert_eq!(msg, "init[0] failed (exit 1): bad thing happened");
+    }
+
+    #[test]
+    fn init_argv_routes_through_sh_dash_c() {
+        // Shell wrapping is load-bearing: user init strings commonly
+        // chain commands with `&&`, pipe through tools, rely on env
+        // expansion. If a future refactor "simplifies" by passing the
+        // command argv directly to exec, those features break silently.
+        assert_eq!(
+            init_argv("pacman -Sy && pacman -S git"),
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "pacman -Sy && pacman -S git".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_init_run_config_overlay_matches_machine_name() {
+        // The overlay ID is what makes init's filesystem changes visible
+        // to subsequent `machine exec`. If this drifts (e.g. someone
+        // hardcodes "init-overlay"), `pacman -S git` during init would
+        // succeed but `git --version` post-start would fail with "not
+        // found" — exactly the user-confusing regression we're guarding
+        // against.
+        let config = build_init_run_config("alpine", "true", &[], None, &[], "my-vm");
+        assert_eq!(config.persistent_overlay_id.as_deref(), Some("my-vm"));
+    }
+
+    #[test]
+    fn build_init_run_config_threads_env_workdir_image() {
+        // Each input must reach the agent untouched. The runner passes
+        // record values verbatim; if a `with_*` call gets dropped in a
+        // refactor, the user's `[dev].env` or `[dev].workdir` would
+        // silently stop applying to init.
+        let env = vec![("HTTP_PROXY".to_string(), "http://proxy:3128".to_string())];
+        let config =
+            build_init_run_config("debian:slim", "apt update", &env, Some("/work"), &[], "vm");
+        assert_eq!(config.image, "debian:slim");
+        assert_eq!(config.env, env);
+        assert_eq!(config.workdir.as_deref(), Some("/work"));
+        // Command is sh-wrapped; assert the wrapped form arrives.
+        assert_eq!(
+            config.command,
+            vec!["sh".to_string(), "-c".to_string(), "apt update".to_string(),]
+        );
+    }
+
+    #[test]
+    fn build_init_run_config_assigns_virtiofs_tags_to_mounts() {
+        // Mount tags are positional and must align with the virtiofs
+        // devices libkrun set up at VM start. If the converter were
+        // skipped (or renamed and not rewired), init would still run
+        // but mounted volumes wouldn't be visible inside the container.
+        let mounts = vec![
+            ("/host/src".to_string(), "/app".to_string(), false),
+            ("/host/data".to_string(), "/data".to_string(), true),
+        ];
+        let config = build_init_run_config("alpine", "true", &[], None, &mounts, "vm");
+        assert_eq!(
+            config.mounts,
+            vec![
+                ("smolvm0".to_string(), "/app".to_string(), false),
+                ("smolvm1".to_string(), "/data".to_string(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_init_run_config_no_mounts_no_workdir() {
+        // The image path is also the bare-minimum path: image + cmd is
+        // a valid init invocation. No mounts, no workdir, no env — must
+        // still produce a usable RunConfig (vs. e.g. panicking on
+        // `unwrap` somewhere in the builder).
+        let config = build_init_run_config("alpine", "echo hi", &[], None, &[], "vm");
+        assert!(config.mounts.is_empty());
+        assert!(config.workdir.is_none());
+        assert!(config.env.is_empty());
+        assert_eq!(config.persistent_overlay_id.as_deref(), Some("vm"));
     }
 }

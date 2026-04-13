@@ -396,20 +396,51 @@ impl RunCmd {
         };
 
         if freshly_started && !params.init.is_empty() {
-            for (i, cmd) in params.init.iter().enumerate() {
-                let argv = vec!["sh".into(), "-c".into(), cmd.clone()];
-                let init_env = parse_env_list(&params.env);
-                let (exit_code, _stdout, stderr) =
-                    client.vm_exec(argv, init_env, params.workdir.clone(), None)?;
-                if exit_code != 0 {
-                    if let Err(e) = manager.stop() {
-                        tracing::warn!(error = %e, "failed to stop machine after init failure");
-                    }
-                    return Err(Error::agent(
-                        "init",
-                        format!("init[{}] failed (exit {}): {}", i, exit_code, stderr.trim()),
-                    ));
-                }
+            // Route through `run_init_commands` so init runs inside the
+            // container when an image is set (so package managers like
+            // pacman/apt/dnf resolve against the image's rootfs), and
+            // in the bare agent otherwise. The persistent `start_*`
+            // paths use the same helper — keep parity.
+            //
+            // Convert the parsed HostMount list into the record-shape
+            // tuples the runner expects. This is a thin local conversion;
+            // the runner does its own tag assignment internally so call
+            // sites don't have to track which form the agent wants.
+            let record_mounts: Vec<(String, String, bool)> = mounts
+                .iter()
+                .map(|m| {
+                    (
+                        m.source.to_string_lossy().into_owned(),
+                        m.target.to_string_lossy().into_owned(),
+                        m.read_only,
+                    )
+                })
+                .collect();
+            let init_env = parse_env_list(&params.env);
+            // Use "default" as the overlay ID so any rootfs changes
+            // init makes (e.g. `pacman -S git`) are visible to a
+            // subsequent `machine exec`. The exec path resolves the
+            // overlay from the machine name, falling back to "default"
+            // when no `--name` is given (`src/cli/machine.rs:741`), so
+            // matching that constant here is what makes init's effects
+            // observable to the user.
+            if let Err(e) = vm_common::run_init_commands(
+                &mut client,
+                &params.init,
+                image.as_deref(),
+                &init_env,
+                params.workdir.as_deref(),
+                &record_mounts,
+                "default",
+            ) {
+                // Ephemeral VMs have no state to preserve — `kill()`
+                // matches the success path's lifetime semantics
+                // (manager.kill() at line ~563/655) and avoids the
+                // graceful-shutdown latency `stop()` adds when no one
+                // is going to use this VM again.
+                vm_common::deregister_ephemeral_vm(&ephemeral_name);
+                manager.kill();
+                return Err(e);
             }
         }
 

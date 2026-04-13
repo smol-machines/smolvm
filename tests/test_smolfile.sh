@@ -155,6 +155,169 @@ test_init_runs_on_every_start() {
 }
 
 # =============================================================================
+# Init in container (image-based machines)
+# =============================================================================
+#
+# When a machine is created with an image AND init commands, init runs
+# inside the container's rootfs (not the bare Alpine agent), and the
+# image is pulled before init runs. The bare-VM init tests above don't
+# cover this — they pass even with init routed through the agent
+# because they have no image. These tests boot a real VM, pull a real
+# image, and observe init's actual execution context.
+
+# Init runs inside the container's rootfs, not the Alpine agent. Uses
+# `command -v pacman` because pacman exists in archlinux but not in
+# Alpine — if init ever regressed to running against the agent, this
+# would fail with "command not found".
+test_init_in_container_uses_image_rootfs() {
+    local vm_name="smolfile-init-container-$$"
+    cleanup_vm "$vm_name"
+
+    cat > "$SMOLFILE_TMPDIR/Smolfile.initcontainer" <<'EOF'
+image = "archlinux"
+cpus = 2
+memory = 1024
+net = true
+
+[dev]
+init = ["command -v pacman > /tmp/pacman-path.txt"]
+EOF
+
+    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.initcontainer" 2>&1 || return 1
+
+    # Start should pull archlinux, then run init *in* the container.
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
+
+    # Init wrote pacman's path inside the container's overlay. Verify
+    # via exec that it's there and points at *some* pacman (the binary
+    # lives at /usr/sbin/pacman in current archlinux but distros vary
+    # the bin/sbin split — match on the suffix, not the full path).
+    # An empty result would mean `command -v` exited non-zero, which
+    # would itself surface as an init failure earlier.
+    local output
+    output=$($SMOLVM machine exec --name "$vm_name" -- cat /tmp/pacman-path.txt 2>&1)
+
+    cleanup_vm "$vm_name"
+
+    [[ "$output" == */pacman ]]
+}
+
+# Image pull happens before init, not after. The init command below
+# depends on a file that only exists in the archlinux rootfs — the
+# container layers must be in place when init runs, or `test -f` would
+# hit the bare Alpine agent and fail. Also asserts the user-visible
+# ordering: "Pulling..." line precedes "Running N init command(s)..."
+# in the start output.
+test_init_runs_after_image_pull() {
+    local vm_name="smolfile-init-after-pull-$$"
+    cleanup_vm "$vm_name"
+
+    cat > "$SMOLFILE_TMPDIR/Smolfile.initafter" <<'EOF'
+image = "archlinux"
+cpus = 2
+memory = 1024
+net = true
+
+[dev]
+init = ["test -f /etc/arch-release"]
+EOF
+
+    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.initafter" 2>&1 || return 1
+
+    # Capture start output — must show pull happens before init runs.
+    local start_output
+    start_output=$($SMOLVM machine start --name "$vm_name" 2>&1)
+    local start_exit=$?
+
+    cleanup_vm "$vm_name"
+
+    # Either the start succeeded (init found arch-release, post-fix
+    # behavior), or the output contains "Pulling" before "Running".
+    if [[ $start_exit -ne 0 ]]; then
+        return 1
+    fi
+
+    # Sanity: pull line must precede init line in the output stream.
+    local pull_line init_line
+    pull_line=$(echo "$start_output" | grep -n "^Pulling " | head -1 | cut -d: -f1)
+    init_line=$(echo "$start_output" | grep -n "^Running .* init command" | head -1 | cut -d: -f1)
+    [[ -n "$pull_line" && -n "$init_line" && "$pull_line" -lt "$init_line" ]]
+}
+
+# Init's filesystem changes persist into subsequent `machine exec`.
+# A `pacman -S git` during init must leave git installed for follow-up
+# exec calls — this is the whole point of running init at start time
+# rather than expecting the operator to script it themselves. The
+# persistent-overlay wiring in `build_init_run_config` is what makes
+# this work; if the overlay ID ever drifts from the machine name,
+# init's writes land in an overlay exec never sees.
+test_init_in_container_persists_filesystem_changes() {
+    local vm_name="smolfile-init-persist-$$"
+    cleanup_vm "$vm_name"
+
+    cat > "$SMOLFILE_TMPDIR/Smolfile.initpersist" <<'EOF'
+image = "archlinux"
+cpus = 2
+memory = 2048
+net = true
+
+[dev]
+init = [
+  "pacman -Sy --noconfirm",
+  "pacman -S --noconfirm git",
+]
+EOF
+
+    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.initpersist" 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
+
+    # Exec must see the package installed by init. If the overlay ID
+    # is wrong, this exec runs in a fresh overlay and `git --version`
+    # returns "command not found".
+    local output
+    output=$($SMOLVM machine exec --name "$vm_name" -- git --version 2>&1)
+
+    cleanup_vm "$vm_name"
+
+    [[ "$output" == *"git version"* ]]
+}
+
+# Init failure surfaces *both* stdout and stderr in the error message.
+# Package managers commonly write failure diagnostics to stdout
+# (pacman's "target not found", apt's dependency resolver output) —
+# if the error only included stderr, the operator would be left with
+# an exit code and no explanation. Asks pacman for a package that
+# doesn't exist; the error must contain "target not found".
+test_init_failure_surfaces_full_error() {
+    local vm_name="smolfile-init-fail-$$"
+    cleanup_vm "$vm_name"
+
+    cat > "$SMOLFILE_TMPDIR/Smolfile.initfail" <<'EOF'
+image = "archlinux"
+cpus = 2
+memory = 1024
+net = true
+
+[dev]
+init = ["pacman -S --noconfirm bogus-pkg-does-not-exist-xyz"]
+EOF
+
+    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.initfail" 2>&1 || return 1
+
+    # Start must fail; the error must include pacman's output explaining
+    # why. Capture stderr too — the error prints there.
+    local output
+    output=$($SMOLVM machine start --name "$vm_name" 2>&1)
+    local start_exit=$?
+
+    cleanup_vm "$vm_name"
+
+    # Failure expected, with pacman's "target not found" diagnostic
+    # surfaced (was previously swallowed).
+    [[ $start_exit -ne 0 ]] && [[ "$output" == *"target not found"* ]]
+}
+
+# =============================================================================
 # --smolfile flag
 # =============================================================================
 
@@ -848,6 +1011,14 @@ run_test "Init flag multiple commands" test_init_flag_multiple_commands || true
 run_test "Init flag with env" test_init_flag_with_env || true
 run_test "Init flag with workdir" test_init_flag_with_workdir || true
 run_test "Init runs on every start" test_init_runs_on_every_start || true
+# Container-init behavioral contract: init runs inside the container
+# rootfs, after the image is pulled, with a persistent overlay shared
+# with `machine exec`, and failure messages surface both stdout and
+# stderr. Each test pins one of those four properties.
+run_test "Init in container: runs inside image rootfs" test_init_in_container_uses_image_rootfs || true
+run_test "Init in container: pull precedes init" test_init_runs_after_image_pull || true
+run_test "Init in container: filesystem changes visible to exec" test_init_in_container_persists_filesystem_changes || true
+run_test "Init in container: failure surfaces full error output" test_init_failure_surfaces_full_error || true
 run_test "Smolfile basic (cpus + init)" test_smolfile_basic || true
 run_test "Smolfile with env" test_smolfile_with_env || true
 run_test "Smolfile CLI overrides scalars" test_smolfile_cli_overrides_scalars || true
