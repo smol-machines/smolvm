@@ -63,6 +63,104 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// Throttled byte-transfer progress bar for streaming operations.
+///
+/// Used by `machine cp` (upload + download). The producer calls
+/// [`ProgressBar::update`] on every chunk; output is emitted at most
+/// every `THROTTLE_MS` to avoid drowning the terminal on fast
+/// transfers. [`ProgressBar::finish`] prints the final summary line
+/// (with rate) and a newline.
+///
+/// Output goes to **stderr** so a `cp ... > somefile` redirect
+/// doesn't capture progress noise.
+pub struct ProgressBar {
+    label: String,
+    /// Known total in bytes. `None` for streams of unknown length
+    /// (we still report bytes-so-far + rate).
+    total: Option<u64>,
+    started_at: std::time::Instant,
+    last_print: std::time::Instant,
+    /// Set to true when at least one progress line has been printed,
+    /// so `finish` knows to emit a leading `\r` to overwrite it.
+    printed: bool,
+}
+
+impl ProgressBar {
+    const THROTTLE_MS: u128 = 250;
+
+    /// `label` is shown at the start of every line ("Uploading",
+    /// "Downloading", etc.). `total` is `Some(bytes)` for known-size
+    /// transfers (uploads where we read the file first), `None` for
+    /// streaming-source cases.
+    pub fn new(label: impl Into<String>, total: Option<u64>) -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            label: label.into(),
+            total,
+            started_at: now,
+            // Initialize so the first update() prints immediately —
+            // gives the user feedback that something started.
+            last_print: now - std::time::Duration::from_millis(THROTTLE_INITIAL_MS),
+            printed: false,
+        }
+    }
+
+    /// Report the running total of bytes transferred. Throttled —
+    /// callers can invoke this on every chunk without flooding
+    /// stderr.
+    pub fn update(&mut self, bytes_so_far: u64) {
+        let now = std::time::Instant::now();
+        if now.duration_since(self.last_print).as_millis() < Self::THROTTLE_MS {
+            return;
+        }
+        self.last_print = now;
+        self.printed = true;
+        let line = self.format_line(bytes_so_far);
+        eprint!("\r{}", line);
+        let _ = std::io::stderr().flush();
+    }
+
+    /// Print the final summary and a newline. Consumes self.
+    pub fn finish(self, bytes_total: u64) {
+        let line = self.format_line(bytes_total);
+        if self.printed {
+            // Overwrite the last throttled line.
+            eprintln!("\r{}", line);
+        } else {
+            eprintln!("{}", line);
+        }
+    }
+
+    fn format_line(&self, bytes_so_far: u64) -> String {
+        let elapsed = self.started_at.elapsed().as_secs_f64().max(0.001);
+        let rate = bytes_so_far as f64 / elapsed;
+        let rate_str = format!("{}/s", format_bytes(rate as u64));
+        match self.total {
+            Some(total) if total > 0 => {
+                let pct = (bytes_so_far as f64 * 100.0 / total as f64).min(100.0);
+                format!(
+                    "{}: {} / {} ({:.1}%, {})",
+                    self.label,
+                    format_bytes(bytes_so_far),
+                    format_bytes(total),
+                    pct,
+                    rate_str
+                )
+            }
+            _ => format!(
+                "{}: {} ({})",
+                self.label,
+                format_bytes(bytes_so_far),
+                rate_str
+            ),
+        }
+    }
+}
+
+/// Initial throttle offset — ensures the first `update()` call
+/// always prints, so the user sees activity immediately.
+const THROTTLE_INITIAL_MS: u64 = 1000;
+
 /// Pull an image with a CLI progress bar.
 pub fn pull_with_progress(
     client: &mut smolvm::agent::AgentClient,

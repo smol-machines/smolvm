@@ -50,6 +50,48 @@ pub const MAX_FRAME_SIZE: u32 = 32 * 1024 * 1024;
 /// Chunk size for streaming layer data (~16 MB raw, ~21 MB as base64 JSON).
 pub const LAYER_CHUNK_SIZE: usize = 16 * 1024 * 1024;
 
+/// Files at or below this size are written with a single `FileWrite`
+/// message. Larger files must stream via
+/// `FileWriteBegin` + `FileWriteChunk` so no single frame approaches
+/// [`MAX_FRAME_SIZE`] (base64 + JSON inflation is ~1.4x).
+///
+/// Chosen to keep the single-shot frame comfortably under the frame
+/// limit while preserving the fast-path latency for small config
+/// files / scripts / keys.
+pub const FILE_WRITE_SINGLE_SHOT_MAX: usize = 1024 * 1024;
+
+/// Payload bytes per streaming upload chunk. Deliberately small —
+/// equal to [`FILE_WRITE_SINGLE_SHOT_MAX`] — so each chunk's encoded
+/// frame (~1.4 MB) fits inside typical kernel Unix-socket send
+/// buffers (`SO_SNDBUF` defaults on the order of 200–256 KiB but
+/// can grow). Larger chunks would force `write_all` to spin waiting
+/// for the agent to drain, and any latency spike trips the 10 s
+/// write timeout with `EAGAIN` — exactly the failure David
+/// reproduced before this fix landed.
+///
+/// Note: [`LAYER_CHUNK_SIZE`] is 16 MiB for agent→host (download)
+/// streaming, which works because the host side of the socket has
+/// more headroom than the guest side. Upload streaming is the
+/// asymmetric case and needs a smaller chunk.
+pub const FILE_WRITE_CHUNK_SIZE: usize = FILE_WRITE_SINGLE_SHOT_MAX;
+
+/// Hard ceiling on a single file transfer in either direction.
+///
+/// On the write path: enforced at `FileWriteBegin` by the agent —
+/// `total_size > FILE_TRANSFER_MAX_TOTAL` is rejected before any
+/// staging file is created.
+///
+/// On the read path: enforced by the host's `read_file` loop —
+/// after the first chunk that pushes the accumulated total past the
+/// cap, the call bails with an error and the partial buffer is
+/// dropped. This protects the host process from OOM if the guest
+/// (compromised or merely buggy) streams unbounded data.
+///
+/// 4 GiB matches the order-of-magnitude of the default overlay disk
+/// and the `gpu_vram_mib` cap. Callers that need to move larger
+/// blobs should stage via a virtiofs mount instead of `cp`.
+pub const FILE_TRANSFER_MAX_TOTAL: u64 = 4 * 1024 * 1024 * 1024;
+
 /// Well-known vsock ports.
 pub mod ports {
     /// Control channel for workload VMs.
@@ -235,7 +277,12 @@ pub enum AgentRequest {
     // ========================================================================
     // File I/O
     // ========================================================================
-    /// Write a file inside the VM.
+    /// Write a file inside the VM in a single message.
+    ///
+    /// Use only for files up to [`FILE_WRITE_SINGLE_SHOT_MAX`]. Larger
+    /// files must stream via [`Self::FileWriteBegin`] +
+    /// [`Self::FileWriteChunk`] to avoid exceeding [`MAX_FRAME_SIZE`]
+    /// after base64 + JSON inflation.
     FileWrite {
         /// Absolute path in the VM filesystem.
         path: String,
@@ -245,6 +292,41 @@ pub enum AgentRequest {
         /// File mode (e.g., 0o644). None = default (0644).
         #[serde(default)]
         mode: Option<u32>,
+    },
+
+    /// Open a streaming file upload session on this connection.
+    ///
+    /// Must be followed by one or more [`Self::FileWriteChunk`]
+    /// requests. The final chunk sets `done: true` to finalize.
+    /// Dropping the connection (or sending any non-chunk request)
+    /// before `done` aborts the session and leaves no partial file
+    /// at `path`.
+    ///
+    /// Sessions are per-connection — one session at a time.
+    FileWriteBegin {
+        /// Absolute path in the VM filesystem.
+        path: String,
+        /// File mode (e.g., 0o644). None = default (0644).
+        #[serde(default)]
+        mode: Option<u32>,
+        /// Expected total size in bytes. Rejected if it exceeds
+        /// [`FILE_TRANSFER_MAX_TOTAL`]. The agent uses this for an
+        /// early-fail check only; the actual size written is the sum
+        /// of chunk byte lengths.
+        total_size: u64,
+    },
+
+    /// Append a chunk to the currently open streaming upload.
+    /// If `done` is true, the agent fsyncs and atomically renames the
+    /// staging file onto the target path.
+    FileWriteChunk {
+        /// Chunk bytes. Typically [`FILE_WRITE_CHUNK_SIZE`] except
+        /// for the last chunk.
+        #[serde(with = "base64_bytes")]
+        data: Vec<u8>,
+        /// True on the final chunk; closes and renames the staging
+        /// file. False on intermediate chunks.
+        done: bool,
     },
 
     /// Read a file from the VM.
@@ -326,24 +408,24 @@ pub enum AgentResponse {
         exit_code: i32,
     },
 
-    /// Layer data chunk (for ExportLayer).
-    LayerData {
-        /// Binary data chunk.
+    /// Streaming binary-data chunk.
+    ///
+    /// Used by every streaming download direction: the agent sends
+    /// one or more `DataChunk` responses in sequence, with `done: true`
+    /// on the final chunk. Current producers: `ExportLayer` and
+    /// `FileRead`.
+    ///
+    /// Payload size per chunk should stay under
+    /// [`LAYER_CHUNK_SIZE`] so the encoded frame (~1.33× after
+    /// base64) fits inside [`MAX_FRAME_SIZE`] with JSON overhead to
+    /// spare.
+    DataChunk {
+        /// Chunk bytes. Empty allowed on the final frame (common for
+        /// EOF-on-clean-boundary cases).
         #[serde(with = "base64_bytes")]
         data: Vec<u8>,
-        /// Whether this is the last chunk.
+        /// True on the final chunk of the stream.
         done: bool,
-    },
-
-    /// File contents (response to FileRead).
-    FileData {
-        /// Path that was read.
-        path: String,
-        /// File contents.
-        #[serde(with = "base64_bytes")]
-        data: Vec<u8>,
-        /// File size in bytes.
-        size: u64,
     },
 }
 
@@ -867,6 +949,77 @@ mod tests {
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("progress"));
+    }
+
+    #[test]
+    fn file_write_begin_roundtrips() {
+        let req = AgentRequest::FileWriteBegin {
+            path: "/tmp/target".into(),
+            mode: Some(0o600),
+            total_size: 123_456_789,
+        };
+        let bytes = encode_message(&req).unwrap();
+        let back: AgentRequest = decode_message(&bytes).unwrap();
+        match back {
+            AgentRequest::FileWriteBegin {
+                path,
+                mode,
+                total_size,
+            } => {
+                assert_eq!(path, "/tmp/target");
+                assert_eq!(mode, Some(0o600));
+                assert_eq!(total_size, 123_456_789);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn file_write_chunk_roundtrips_binary_data() {
+        // Binary data (bytes outside UTF-8) must survive the base64
+        // trip intact. If the encoding ever silently lossifies, this
+        // fires.
+        let payload: Vec<u8> = (0u8..=255).collect();
+        let req = AgentRequest::FileWriteChunk {
+            data: payload.clone(),
+            done: true,
+        };
+        let bytes = encode_message(&req).unwrap();
+        let back: AgentRequest = decode_message(&bytes).unwrap();
+        match back {
+            AgentRequest::FileWriteChunk { data, done } => {
+                assert_eq!(data, payload);
+                assert!(done);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn file_write_size_constants_are_frame_safe() {
+        // Sanity: a single streaming chunk at FILE_WRITE_CHUNK_SIZE
+        // must fit inside MAX_FRAME_SIZE after base64 (+ ~33%) and
+        // JSON overhead. If anyone bumps CHUNK_SIZE past the limit,
+        // this test fires before production does.
+        let chunk_bytes = FILE_WRITE_CHUNK_SIZE as u64;
+        let base64_bytes = chunk_bytes.div_ceil(3) * 4; // ceil(n/3)*4
+        let json_overhead = 256u64; // method tag, done bool, quotes
+        let total = base64_bytes + json_overhead;
+        assert!(
+            total < MAX_FRAME_SIZE as u64,
+            "FILE_WRITE_CHUNK_SIZE of {} bytes would produce a frame \
+             of ~{} bytes which exceeds MAX_FRAME_SIZE of {}",
+            chunk_bytes,
+            total,
+            MAX_FRAME_SIZE
+        );
+
+        // Single-shot threshold must be <= chunk size. They can be
+        // equal (a 1 MiB file is a single shot; a 1 MiB + 1 byte
+        // file streams as two chunks); but SINGLE_SHOT > CHUNK would
+        // be incoherent — a file slightly over the shot threshold
+        // would need to stream as... a single oversized chunk.
+        assert!(FILE_WRITE_SINGLE_SHOT_MAX <= FILE_WRITE_CHUNK_SIZE);
     }
 
     #[test]

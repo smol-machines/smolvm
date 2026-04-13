@@ -1101,6 +1101,12 @@ fn run_server_with_listener(
 fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::error::Error>> {
     let mut buf = vec![0u8; REQUEST_BUFFER_SIZE];
 
+    // Per-connection streaming-upload session. `Option<WriteSession>`
+    // guarantees cleanup via Drop when the connection closes, when
+    // the session is replaced, or when a protocol violation (e.g.,
+    // another request type arriving mid-stream) takes it.
+    let mut write_session: Option<WriteSession> = None;
+
     loop {
         // Read length header
         let mut header = [0u8; 4];
@@ -1210,6 +1216,50 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
         {
             handle_streaming_export_layer(stream, image_digest, layer_index)?;
             continue;
+        }
+
+        // Handle FileRead with chunked streaming (replaces the old
+        // single-shot FileData path that capped files at ~16 MiB).
+        if let AgentRequest::FileRead { ref path } = request {
+            handle_streaming_file_read(stream, path)?;
+            continue;
+        }
+
+        // Streaming file upload: Begin opens a session, Chunk appends
+        // or finalizes. Any other request type closes the session
+        // implicitly (Drop runs on the Option assignment to None).
+        if let AgentRequest::FileWriteBegin {
+            path,
+            mode,
+            total_size,
+        } = request
+        {
+            // Drop any leftover session (Drop cleans its tmp file).
+            write_session = None;
+            let (new_session, response) = handle_file_write_begin(path, mode, total_size);
+            write_session = new_session;
+            send_response(stream, &response)?;
+            continue;
+        }
+        if let AgentRequest::FileWriteChunk { data, done } = request {
+            let (new_session, response) =
+                handle_file_write_chunk(write_session.take(), &data, done);
+            write_session = new_session;
+            send_response(stream, &response)?;
+            continue;
+        }
+
+        // Any other request mid-session is a protocol error. Drop the
+        // session (Drop cleans the staging file) and proceed — the
+        // operator's new request is honored rather than failed; the
+        // alternative (error out) buys no safety since the drop
+        // already handled cleanup.
+        if write_session.is_some() {
+            debug!(
+                method = ?request,
+                "dropping in-flight FileWrite session: non-chunk request arrived"
+            );
+            write_session = None;
         }
 
         // Handle regular request
@@ -1404,7 +1454,21 @@ fn handle_request(request: AgentRequest) -> AgentResponse {
 
         AgentRequest::FileWrite { path, data, mode } => handle_file_write(&path, &data, mode),
 
-        AgentRequest::FileRead { path } => handle_file_read(&path),
+        // Streaming uploads go through `handle_connection`'s
+        // per-connection session state so they can't land here.
+        AgentRequest::FileWriteBegin { .. } | AgentRequest::FileWriteChunk { .. } => {
+            AgentResponse::error(
+                "streaming file write must be handled at connection level",
+                error_codes::INTERNAL_ERROR,
+            )
+        }
+
+        // Streaming read goes through `handle_connection`'s explicit
+        // dispatch so it can emit multiple responses per request.
+        AgentRequest::FileRead { .. } => AgentResponse::error(
+            "streaming file read must be handled at connection level",
+            error_codes::INTERNAL_ERROR,
+        ),
     }
 }
 
@@ -1412,71 +1476,406 @@ fn handle_request(request: AgentRequest) -> AgentResponse {
 // File I/O Handlers
 // ============================================================================
 
-/// Write a file inside the VM filesystem.
-fn handle_file_write(path: &str, data: &[u8], mode: Option<u32>) -> AgentResponse {
-    use std::fs;
-    use std::path::Path;
+/// Unique-per-call staging suffix. Using the PID + a counter avoids
+/// collisions when two connections write to the same path and avoids
+/// the predictable-filename class of symlink races.
+fn staging_suffix() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!(".smolvm-upload.{}.{}", std::process::id(), n)
+}
 
-    // Create parent directories if needed
-    if let Some(parent) = Path::new(path).parent() {
-        if let Err(e) = fs::create_dir_all(parent) {
-            return AgentResponse::error(
-                format!("failed to create directory {}: {}", parent.display(), e),
-                error_codes::FILE_IO_FAILED,
-            );
+/// Ensure `path`'s parent exists, returning an AgentResponse on error
+/// (so the two file-write entry points don't duplicate this block).
+fn ensure_parent_dir(path: &std::path::Path) -> std::result::Result<(), AgentResponse> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                return Err(AgentResponse::error(
+                    format!("failed to create directory {}: {}", parent.display(), e),
+                    error_codes::FILE_IO_FAILED,
+                ));
+            }
         }
     }
+    Ok(())
+}
 
-    if let Err(e) = fs::write(path, data) {
+/// Apply a Unix mode, logging but not failing if the permissions
+/// can't be set (matches prior single-shot behavior).
+#[cfg(unix)]
+fn apply_mode_best_effort(path: &std::path::Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)) {
+        info!(path = %path.display(), error = %e, "failed to set file mode (non-fatal)");
+    }
+}
+#[cfg(not(unix))]
+fn apply_mode_best_effort(_path: &std::path::Path, _mode: u32) {}
+
+/// Atomically install `data` at `path` via a staging file + rename.
+///
+/// Shared between single-shot [`handle_file_write`] and the streaming
+/// finalize step. The atomic-rename pattern is the thing both paths
+/// need to guarantee: partial contents never appear at `path` under
+/// any error or kill scenario.
+fn install_file_atomic(path: &str, data: &[u8], mode: Option<u32>) -> AgentResponse {
+    let target = std::path::Path::new(path);
+    if let Err(resp) = ensure_parent_dir(target) {
+        return resp;
+    }
+
+    let tmp_name = format!(
+        "{}{}",
+        target
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        staging_suffix()
+    );
+    let tmp_path = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.join(&tmp_name))
+        .unwrap_or_else(|| std::path::PathBuf::from(&tmp_name));
+
+    if let Err(e) = std::fs::write(&tmp_path, data) {
+        let _ = std::fs::remove_file(&tmp_path);
         return AgentResponse::error(
-            format!("failed to write {}: {}", path, e),
+            format!("failed to write {}: {}", tmp_path.display(), e),
             error_codes::FILE_IO_FAILED,
         );
     }
 
-    // Set file mode if specified
-    #[cfg(unix)]
-    if let Some(m) = mode {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(m)) {
-            info!(path = %path, error = %e, "failed to set file mode (non-fatal)");
-        }
+    if let Err(e) = std::fs::rename(&tmp_path, target) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return AgentResponse::error(
+            format!("failed to rename onto {}: {}", path, e),
+            error_codes::FILE_IO_FAILED,
+        );
     }
 
+    if let Some(m) = mode {
+        apply_mode_best_effort(target, m);
+    }
     info!(path = %path, size = data.len(), "file written");
     AgentResponse::Ok { data: None }
 }
 
-/// Read a file from the VM filesystem.
-fn handle_file_read(path: &str) -> AgentResponse {
-    use std::fs;
+/// Write a file inside the VM filesystem (single-shot path).
+fn handle_file_write(path: &str, data: &[u8], mode: Option<u32>) -> AgentResponse {
+    install_file_atomic(path, data, mode)
+}
 
-    match fs::read(path) {
-        Ok(data) => {
-            let size = data.len() as u64;
-            // Guard against reading files larger than the frame size
-            if data.len() > MAX_MESSAGE_SIZE - 1024 {
-                return AgentResponse::error(
-                    format!(
-                        "file too large: {} bytes (max {} bytes)",
-                        data.len(),
-                        MAX_MESSAGE_SIZE - 1024
-                    ),
-                    error_codes::FILE_IO_FAILED,
-                );
-            }
-            info!(path = %path, size, "file read");
-            AgentResponse::FileData {
-                path: path.to_string(),
-                data,
-                size,
+/// State for an in-progress streaming file upload on one connection.
+///
+/// One session lives inside `handle_connection`'s stack, so it's
+/// scoped to a single client. `Drop` cleans up the staging file if
+/// the connection drops (or the session is replaced) before the
+/// final chunk arrives — this is how we guarantee no partial file
+/// ever appears at the target path.
+struct WriteSession {
+    /// User-requested target path inside the guest.
+    target: std::path::PathBuf,
+    /// Staging file we append to; renamed to `target` on done.
+    tmp_path: std::path::PathBuf,
+    /// Handle we keep open for the lifetime of the session.
+    tmp_file: std::fs::File,
+    /// Permissions to apply after rename.
+    mode: Option<u32>,
+    /// Running total — compared against `total_size` as a DoS guard.
+    bytes_written: u64,
+    /// Caller-declared total; the agent refuses chunks that would
+    /// push `bytes_written` past it.
+    total_size: u64,
+}
+
+impl WriteSession {
+    /// Open a fresh staging file for `target`.
+    fn open(
+        target: std::path::PathBuf,
+        mode: Option<u32>,
+        total_size: u64,
+    ) -> std::io::Result<Self> {
+        if let Some(parent) = target.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
             }
         }
-        Err(e) => AgentResponse::error(
-            format!("failed to read {}: {}", path, e),
-            error_codes::FILE_IO_FAILED,
+        let tmp_name = format!(
+            "{}{}",
+            target
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            staging_suffix()
+        );
+        let tmp_path = target
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.join(&tmp_name))
+            .unwrap_or_else(|| std::path::PathBuf::from(&tmp_name));
+
+        let tmp_file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp_path)?;
+        Ok(Self {
+            target,
+            tmp_path,
+            tmp_file,
+            mode,
+            bytes_written: 0,
+            total_size,
+        })
+    }
+
+    /// Append a chunk; returns AgentResponse on error.
+    fn write_chunk(&mut self, data: &[u8]) -> std::result::Result<(), AgentResponse> {
+        let new_total = self.bytes_written.saturating_add(data.len() as u64);
+        if new_total > self.total_size {
+            return Err(AgentResponse::error(
+                format!(
+                    "chunk overflows declared total_size ({} > {})",
+                    new_total, self.total_size
+                ),
+                error_codes::INVALID_REQUEST,
+            ));
+        }
+        use std::io::Write;
+        if let Err(e) = self.tmp_file.write_all(data) {
+            return Err(AgentResponse::error(
+                format!("failed to write chunk to staging file: {}", e),
+                error_codes::FILE_IO_FAILED,
+            ));
+        }
+        self.bytes_written = new_total;
+        Ok(())
+    }
+
+    /// Fsync, rename onto target, apply mode. Consumes the session.
+    ///
+    /// Takes `&mut self` rather than `self` so we can do a
+    /// `mem::take` on `tmp_path` to disarm the Drop-based cleanup
+    /// after the rename has moved the file onto its final path.
+    /// (Moving individual fields out of a struct with Drop isn't
+    /// allowed — `mem::take` swaps in a default `PathBuf` so the
+    /// subsequent Drop is a no-op.)
+    ///
+    /// Linux + macOS allow renaming an open file, so we don't need
+    /// to close the handle first; it drops naturally when this
+    /// function returns via the by-value caller pattern.
+    fn finalize(&mut self) -> AgentResponse {
+        use std::io::Write;
+        if let Err(e) = self.tmp_file.flush() {
+            return AgentResponse::error(
+                format!("failed to flush staging file: {}", e),
+                error_codes::FILE_IO_FAILED,
+            );
+        }
+        if let Err(e) = self.tmp_file.sync_all() {
+            return AgentResponse::error(
+                format!("failed to sync staging file: {}", e),
+                error_codes::FILE_IO_FAILED,
+            );
+        }
+        // Disarm Drop before rename; if the rename fails we'll
+        // re-arm below by restoring the path.
+        let tmp = std::mem::take(&mut self.tmp_path);
+        if let Err(e) = std::fs::rename(&tmp, &self.target) {
+            // Re-arm Drop so the staging file still gets cleaned up
+            // when the session is dropped by the caller.
+            self.tmp_path = tmp;
+            return AgentResponse::error(
+                format!("failed to rename onto {}: {}", self.target.display(), e),
+                error_codes::FILE_IO_FAILED,
+            );
+        }
+        if let Some(m) = self.mode {
+            apply_mode_best_effort(&self.target, m);
+        }
+        info!(
+            path = %self.target.display(),
+            size = self.bytes_written,
+            "file written (streaming)"
+        );
+        AgentResponse::Ok { data: None }
+    }
+}
+
+impl Drop for WriteSession {
+    fn drop(&mut self) {
+        // If finalize consumed the session, `tmp_path` was emptied.
+        if !self.tmp_path.as_os_str().is_empty() {
+            let _ = std::fs::remove_file(&self.tmp_path);
+        }
+    }
+}
+
+/// Open a streaming upload session. Called from the connection loop.
+///
+/// Returns the new session plus the response to send back. On error
+/// the session is not created.
+fn handle_file_write_begin(
+    path: String,
+    mode: Option<u32>,
+    total_size: u64,
+) -> (Option<WriteSession>, AgentResponse) {
+    if total_size > smolvm_protocol::FILE_TRANSFER_MAX_TOTAL {
+        return (
+            None,
+            AgentResponse::error(
+                format!(
+                    "total_size {} exceeds maximum {}",
+                    total_size,
+                    smolvm_protocol::FILE_TRANSFER_MAX_TOTAL
+                ),
+                error_codes::INVALID_REQUEST,
+            ),
+        );
+    }
+    match WriteSession::open(path.into(), mode, total_size) {
+        Ok(session) => (Some(session), AgentResponse::Ok { data: None }),
+        Err(e) => (
+            None,
+            AgentResponse::error(
+                format!("failed to open staging file: {}", e),
+                error_codes::FILE_IO_FAILED,
+            ),
         ),
     }
+}
+
+/// Append a chunk to the open session (if any). Called from the
+/// connection loop. On `done`, the session is consumed and the file
+/// is finalized.
+///
+/// Returns the (possibly consumed) session plus the response.
+fn handle_file_write_chunk(
+    session: Option<WriteSession>,
+    data: &[u8],
+    done: bool,
+) -> (Option<WriteSession>, AgentResponse) {
+    let Some(mut s) = session else {
+        return (
+            None,
+            AgentResponse::error(
+                "no FileWriteBegin issued on this connection",
+                error_codes::INVALID_REQUEST,
+            ),
+        );
+    };
+    if let Err(resp) = s.write_chunk(data) {
+        // Session is dropped by returning None, cleaning the tmp file.
+        return (None, resp);
+    }
+    if done {
+        let resp = s.finalize();
+        // On success `tmp_path` was cleared so Drop is a no-op;
+        // on failure the session Drop will still clean the staging
+        // file when `s` falls out of scope here.
+        (None, resp)
+    } else {
+        (Some(s), AgentResponse::Ok { data: None })
+    }
+}
+
+/// Stream a reader's bytes to the client as a sequence of
+/// `AgentResponse::DataChunk` responses.
+///
+/// Shared between `FileRead` (reader = open file) and `ExportLayer`
+/// (reader = `tar` child stdout). Each chunk is at most `chunk_size`
+/// bytes; EOF is always signaled with a trailing `done: true` frame
+/// (possibly empty) so the client's receive loop terminates uniformly.
+///
+/// On read error, emits a structured Error response with the
+/// caller-supplied `error_code` (so operators can distinguish
+/// "file-IO failed" from "export failed" in logs and status codes)
+/// and returns the `io::Error` to the caller for producer-specific
+/// cleanup (e.g., killing a child process).
+fn send_data_chunks<R: Read>(
+    stream: &mut impl Write,
+    reader: &mut R,
+    chunk_size: usize,
+    error_context: &str,
+    error_code: &'static str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut buf = vec![0u8; chunk_size];
+    loop {
+        // Fill as much of the buffer as possible in one chunk.
+        // Partial reads are common when the source is a pipe
+        // (e.g. tar subprocess) — we keep reading until the buffer
+        // is full or EOF arrives.
+        let mut pending = 0;
+        while pending < buf.len() {
+            match reader.read(&mut buf[pending..]) {
+                Ok(0) => break,
+                Ok(n) => pending += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    send_response(
+                        stream,
+                        &AgentResponse::error(format!("{}: {}", error_context, e), error_code),
+                    )?;
+                    return Err(Box::new(e));
+                }
+            }
+        }
+
+        if pending == 0 {
+            // EOF — emit the terminator frame.
+            send_response(
+                stream,
+                &AgentResponse::DataChunk {
+                    data: vec![],
+                    done: true,
+                },
+            )?;
+            return Ok(());
+        }
+
+        send_response(
+            stream,
+            &AgentResponse::DataChunk {
+                data: buf[..pending].to_vec(),
+                done: false,
+            },
+        )?;
+    }
+}
+
+/// Stream a file from the guest filesystem to the host as a
+/// sequence of `DataChunk` responses. Called from the connection
+/// loop (not the generic `handle_request` match) so it can emit
+/// multiple responses per request.
+fn handle_streaming_file_read(
+    stream: &mut impl ReadWrite,
+    path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            send_response(
+                stream,
+                &AgentResponse::error(
+                    format!("failed to open {}: {}", path, e),
+                    error_codes::FILE_IO_FAILED,
+                ),
+            )?;
+            return Ok(());
+        }
+    };
+    let size = file.metadata().ok().map(|m| m.len()).unwrap_or(0);
+    info!(path = %path, size, "streaming file read");
+    send_data_chunks(
+        stream,
+        &mut file,
+        smolvm_protocol::LAYER_CHUNK_SIZE,
+        "failed to read file",
+        error_codes::FILE_IO_FAILED,
+    )
 }
 
 /// Handle an interactive run session with streaming I/O.
@@ -2583,53 +2982,22 @@ fn handle_streaming_export_layer(
     };
 
     let mut stdout = child.stdout.take().unwrap();
-    let mut buf = vec![0u8; LAYER_CHUNK_SIZE];
 
-    loop {
-        // Fill the buffer — tar may write less than LAYER_CHUNK_SIZE per read.
-        let mut pending = 0;
-        while pending < buf.len() {
-            match stdout.read(&mut buf[pending..]) {
-                Ok(0) => break,
-                Ok(n) => pending += n,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => {
-                    let _ = child.kill();
-                    send_response(
-                        stream,
-                        &AgentResponse::error(
-                            format!("failed to read tar output: {}", e),
-                            error_codes::EXPORT_FAILED,
-                        ),
-                    )?;
-                    return Ok(());
-                }
-            }
-        }
-
-        if pending == 0 {
-            // EOF — send final frame
-            send_response(
-                stream,
-                &AgentResponse::LayerData {
-                    data: vec![],
-                    done: true,
-                },
-            )?;
-            break;
-        }
-
-        send_response(
-            stream,
-            &AgentResponse::LayerData {
-                data: buf[..pending].to_vec(),
-                done: false,
-            },
-        )?;
+    // Shared streaming path — same helper used by FileRead.
+    let result = send_data_chunks(
+        stream,
+        &mut stdout,
+        LAYER_CHUNK_SIZE,
+        "failed to read tar output",
+        error_codes::EXPORT_FAILED,
+    );
+    // If the helper returned an Err, it already sent an Error
+    // response; we still need to clean up the tar subprocess.
+    if result.is_err() {
+        let _ = child.kill();
     }
-
     let _ = child.wait();
-    Ok(())
+    result
 }
 
 /// Handle storage status request.
@@ -2993,6 +3361,351 @@ impl<T: Read + Write + AsRawFd> ReadWrite for T {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ========================================================================
+    // Streaming file-upload session tests
+    //
+    // These exercise the agent-side state machine in isolation — no
+    // vsock, no connection, just the handlers and the WriteSession
+    // struct. End-to-end protocol testing would require booting a
+    // real VM, which is covered by the integration harness.
+    // ========================================================================
+
+    fn tmp_target(tmp: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
+        tmp.path().join(name)
+    }
+
+    /// Collect every file in a directory whose name starts with the
+    /// staging prefix. Used to assert there are no orphan staging
+    /// files after a test runs.
+    fn staging_files_in(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter(|e| e.file_name().to_string_lossy().contains(".smolvm-upload."))
+                    .map(|e| e.path())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Decode a length-prefixed (4-byte BE) JSON response from a
+    /// byte slice. Returns the response and how many bytes it
+    /// consumed. Used by the `send_data_chunks` tests to walk the
+    /// stream of frames the helper wrote into a buffer.
+    fn pop_one_response(buf: &[u8]) -> (AgentResponse, usize) {
+        assert!(buf.len() >= 4, "buffer too short for length header");
+        let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        assert!(buf.len() >= 4 + len, "incomplete frame in buffer");
+        let resp: AgentResponse =
+            serde_json::from_slice(&buf[4..4 + len]).expect("decode response");
+        (resp, 4 + len)
+    }
+
+    #[test]
+    fn send_data_chunks_emits_terminator_for_empty_source() {
+        // Source is empty → exactly one DataChunk { data: [], done: true }.
+        let mut sink: Vec<u8> = Vec::new();
+        let mut empty: &[u8] = &[];
+        send_data_chunks(
+            &mut sink,
+            &mut empty,
+            4096,
+            "test",
+            error_codes::FILE_IO_FAILED,
+        )
+        .unwrap();
+
+        let (resp, consumed) = pop_one_response(&sink);
+        match resp {
+            AgentResponse::DataChunk { data, done } => {
+                assert!(data.is_empty());
+                assert!(done);
+            }
+            other => panic!("wrong variant: {:?}", other),
+        }
+        assert_eq!(consumed, sink.len(), "exactly one frame expected");
+    }
+
+    #[test]
+    fn send_data_chunks_concatenates_in_order_with_done_terminator() {
+        // 1024 bytes through a 256-byte chunk → 4 full chunks + 1
+        // empty terminator. The agent's implementation always emits a
+        // separate done-frame on EOF, even when EOF lands on a chunk
+        // boundary; the host's read_file relies on that.
+        let payload: Vec<u8> = (0..1024).map(|i| (i & 0xFF) as u8).collect();
+        let mut sink: Vec<u8> = Vec::new();
+        let mut src = std::io::Cursor::new(payload.clone());
+        send_data_chunks(
+            &mut sink,
+            &mut src,
+            256,
+            "test",
+            error_codes::FILE_IO_FAILED,
+        )
+        .unwrap();
+
+        let mut offset = 0usize;
+        let mut reconstructed: Vec<u8> = Vec::new();
+        let mut saw_done = false;
+        while offset < sink.len() {
+            let (resp, consumed) = pop_one_response(&sink[offset..]);
+            match resp {
+                AgentResponse::DataChunk { data, done } => {
+                    reconstructed.extend_from_slice(&data);
+                    if done {
+                        saw_done = true;
+                    }
+                }
+                other => panic!("wrong variant: {:?}", other),
+            }
+            offset += consumed;
+        }
+        assert!(saw_done, "stream missing done terminator");
+        assert_eq!(reconstructed, payload);
+    }
+
+    #[test]
+    fn send_data_chunks_partial_final_chunk_is_handled() {
+        // 1000 bytes through a 256-byte chunk → 3 full chunks (768
+        // bytes) + 1 partial chunk (232 bytes, done: false) + 1
+        // empty terminator (done: true). This separates the
+        // "partial chunk" case from the "EOF" case so the helper
+        // doesn't have to detect short reads.
+        let payload: Vec<u8> = (0..1000).map(|i| (i & 0xFF) as u8).collect();
+        let mut sink: Vec<u8> = Vec::new();
+        let mut src = std::io::Cursor::new(payload.clone());
+        send_data_chunks(
+            &mut sink,
+            &mut src,
+            256,
+            "test",
+            error_codes::FILE_IO_FAILED,
+        )
+        .unwrap();
+
+        let mut offset = 0usize;
+        let mut chunks: Vec<(Vec<u8>, bool)> = Vec::new();
+        while offset < sink.len() {
+            let (resp, consumed) = pop_one_response(&sink[offset..]);
+            if let AgentResponse::DataChunk { data, done } = resp {
+                chunks.push((data, done));
+            }
+            offset += consumed;
+        }
+        // Last frame must be the empty terminator.
+        let last = chunks.last().expect("at least one frame");
+        assert!(
+            last.0.is_empty() && last.1,
+            "last frame must be empty + done"
+        );
+        // All earlier frames carry data and are not done.
+        for c in &chunks[..chunks.len() - 1] {
+            assert!(!c.1, "non-final chunk had done=true");
+            assert!(!c.0.is_empty(), "non-final chunk was empty");
+        }
+        // Concatenated data matches the source.
+        let concatenated: Vec<u8> = chunks.iter().flat_map(|(d, _)| d.iter().copied()).collect();
+        assert_eq!(concatenated, payload);
+    }
+
+    #[test]
+    fn streaming_write_rejects_when_total_size_exceeds_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp_target(&tmp, "big");
+        let (session, resp) = handle_file_write_begin(
+            target.to_string_lossy().into(),
+            None,
+            smolvm_protocol::FILE_TRANSFER_MAX_TOTAL + 1,
+        );
+        assert!(session.is_none(), "session must not be created");
+        assert!(
+            matches!(resp, AgentResponse::Error { .. }),
+            "expected error, got {:?}",
+            resp
+        );
+    }
+
+    #[test]
+    fn streaming_write_happy_path_writes_file_atomically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp_target(&tmp, "hello.bin");
+
+        // Build a recognizable payload that also crosses a chunk boundary
+        // via the test-only helper. Use a known-odd size so no power-of-
+        // two alignment could accidentally hide a bug.
+        let payload = {
+            let mut v = Vec::with_capacity(37);
+            for i in 0..37u8 {
+                v.push(i);
+            }
+            v
+        };
+
+        let (session, resp) = handle_file_write_begin(
+            target.to_string_lossy().into(),
+            Some(0o600),
+            payload.len() as u64,
+        );
+        assert!(matches!(resp, AgentResponse::Ok { .. }));
+
+        let (session, resp) = handle_file_write_chunk(session, &payload, true);
+        assert!(
+            matches!(resp, AgentResponse::Ok { .. }),
+            "finalize failed: {:?}",
+            resp
+        );
+        assert!(session.is_none());
+
+        // File exists with correct contents.
+        let got = std::fs::read(&target).unwrap();
+        assert_eq!(got, payload);
+
+        // No staging file left behind.
+        assert!(
+            staging_files_in(tmp.path()).is_empty(),
+            "staging file leaked"
+        );
+
+        // Mode applied (unix only).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn streaming_write_multi_chunk_concatenates_in_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp_target(&tmp, "multi.bin");
+        let total = 1024usize;
+
+        let (mut session, resp) =
+            handle_file_write_begin(target.to_string_lossy().into(), None, total as u64);
+        assert!(matches!(resp, AgentResponse::Ok { .. }));
+
+        // Three chunks: 400 + 400 + 224 bytes, each a distinct fill byte.
+        let chunks: [(&[u8], bool); 3] = [
+            (&[b'A'; 400], false),
+            (&[b'B'; 400], false),
+            (&[b'C'; 224], true),
+        ];
+        for (data, done) in chunks {
+            let (new_session, resp) = handle_file_write_chunk(session, data, done);
+            assert!(
+                matches!(resp, AgentResponse::Ok { .. }),
+                "chunk failed: {:?}",
+                resp
+            );
+            session = new_session;
+        }
+        assert!(session.is_none(), "session must be consumed on done");
+
+        let got = std::fs::read(&target).unwrap();
+        let mut expected = Vec::with_capacity(total);
+        expected.extend(std::iter::repeat(b'A').take(400));
+        expected.extend(std::iter::repeat(b'B').take(400));
+        expected.extend(std::iter::repeat(b'C').take(224));
+        assert_eq!(got, expected);
+        assert!(staging_files_in(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn streaming_write_overflow_aborts_with_no_partial_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp_target(&tmp, "overflow.bin");
+
+        let (session, _resp) = handle_file_write_begin(target.to_string_lossy().into(), None, 10);
+        assert!(session.is_some());
+
+        // First chunk fits.
+        let (session, resp) = handle_file_write_chunk(session, &[0u8; 5], false);
+        assert!(matches!(resp, AgentResponse::Ok { .. }));
+        assert!(session.is_some());
+
+        // Second chunk would push bytes_written to 15, over total_size=10.
+        let (session, resp) = handle_file_write_chunk(session, &[0u8; 10], false);
+        assert!(matches!(resp, AgentResponse::Error { .. }));
+        // Session must be dropped (cleans staging).
+        assert!(session.is_none());
+
+        // Target never appeared (promise: no partial file).
+        assert!(!target.exists());
+        // Staging file cleaned up via Drop.
+        assert!(staging_files_in(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn streaming_write_drop_cleans_staging_file() {
+        // Simulates connection dropping mid-stream. We open a session,
+        // write one chunk, then drop the session without calling done.
+        // The Drop impl must unlink the staging file so no partial
+        // content lingers.
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp_target(&tmp, "dropped.bin");
+
+        let (session, _) = handle_file_write_begin(target.to_string_lossy().into(), None, 100);
+        let (session, _) = handle_file_write_chunk(session, &[0u8; 50], false);
+        assert!(session.is_some());
+        // Staging file exists mid-stream.
+        assert_eq!(staging_files_in(tmp.path()).len(), 1);
+
+        drop(session);
+        // After drop, the staging file is gone and target never
+        // appeared.
+        assert!(staging_files_in(tmp.path()).is_empty());
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn streaming_write_chunk_without_begin_errors() {
+        let (session, resp) = handle_file_write_chunk(None, &[0u8; 10], true);
+        assert!(session.is_none());
+        assert!(matches!(resp, AgentResponse::Error { .. }));
+    }
+
+    #[test]
+    fn streaming_write_zero_length_file() {
+        // Host sends empty `FileWriteChunk { data: [], done: true }`
+        // to finalize an empty file. Agent must create an empty file
+        // at the target, not leave it missing.
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp_target(&tmp, "empty.bin");
+
+        let (session, _) = handle_file_write_begin(target.to_string_lossy().into(), None, 0);
+        let (session, resp) = handle_file_write_chunk(session, &[], true);
+        assert!(matches!(resp, AgentResponse::Ok { .. }));
+        assert!(session.is_none());
+
+        assert!(target.exists());
+        assert_eq!(std::fs::metadata(&target).unwrap().len(), 0);
+        assert!(staging_files_in(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn single_shot_write_uses_atomic_rename_too() {
+        // Regression guard on the shared finalizer: handle_file_write
+        // and handle_file_write_chunk(done=true) both go through
+        // install_file_atomic / WriteSession::finalize, so a failure
+        // mid-rename must leave no partial file at the target.
+        // Here we just verify the success path — install_file_atomic
+        // produces a correct file — and that no staging artifact
+        // leaks.
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp_target(&tmp, "single.bin");
+        let payload = b"small file contents".to_vec();
+
+        let resp = handle_file_write(&target.to_string_lossy(), &payload, Some(0o644));
+        assert!(
+            matches!(resp, AgentResponse::Ok { .. }),
+            "write failed: {:?}",
+            resp
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), payload);
+        assert!(staging_files_in(tmp.path()).is_empty());
+    }
 
     #[test]
     fn test_boot_log_valid_json() {

@@ -7,7 +7,8 @@ use crate::error::{Error, Result};
 use crate::registry::{extract_registry, rewrite_image_registry, RegistryAuth, RegistryConfig};
 use smolvm_protocol::{
     encode_message, AgentRequest, AgentResponse, Envelope, ImageInfo, OverlayInfo, StorageStatus,
-    MAX_FRAME_SIZE, PROTOCOL_VERSION,
+    FILE_TRANSFER_MAX_TOTAL, FILE_WRITE_CHUNK_SIZE, FILE_WRITE_SINGLE_SHOT_MAX, MAX_FRAME_SIZE,
+    PROTOCOL_VERSION,
 };
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -1071,24 +1072,270 @@ impl AgentClient {
     // ========================================================================
 
     /// Write a file into the VM.
+    ///
+    /// Transparently dispatches between single-shot and streaming
+    /// based on `data.len()`:
+    ///
+    /// - Files ≤ [`FILE_WRITE_SINGLE_SHOT_MAX`] (1 MiB): one
+    ///   [`AgentRequest::FileWrite`] message — the lowest-latency
+    ///   path and what 99% of `cp` calls hit.
+    /// - Files larger than that: a sequence of
+    ///   [`AgentRequest::FileWriteBegin`] +
+    ///   [`AgentRequest::FileWriteChunk`] messages, each under
+    ///   [`MAX_FRAME_SIZE`]. This is the only correct way to upload
+    ///   files whose base64-encoded form would exceed the frame
+    ///   limit — without it the send blocks the socket (EAGAIN
+    ///   after write timeout) and risks OOMing the guest agent.
     pub fn write_file(&mut self, path: &str, data: &[u8], mode: Option<u32>) -> Result<()> {
-        let resp = self.request(&AgentRequest::FileWrite {
-            path: path.to_string(),
-            data: data.to_vec(),
+        self.write_file_with_progress(path, data, mode, |_| {})
+    }
+
+    /// Write a file into the VM with a progress callback.
+    ///
+    /// `on_progress` is called after each chunk is acked by the
+    /// agent, with the running byte total. Single-shot writes (small
+    /// files) call it once at the end. Callers who don't need
+    /// progress should use [`Self::write_file`] which passes a no-op.
+    pub fn write_file_with_progress<F: FnMut(u64)>(
+        &mut self,
+        path: &str,
+        data: &[u8],
+        mode: Option<u32>,
+        mut on_progress: F,
+    ) -> Result<()> {
+        if data.len() <= FILE_WRITE_SINGLE_SHOT_MAX {
+            let resp = self.request(&AgentRequest::FileWrite {
+                path: path.to_string(),
+                data: data.to_vec(),
+                mode,
+            })?;
+            expect_ok(resp, "write file")?;
+            on_progress(data.len() as u64);
+            Ok(())
+        } else {
+            self.write_file_streaming(path, data, mode, &mut on_progress)
+        }
+    }
+
+    /// Streaming file upload from a `&[u8]` slice.
+    fn write_file_streaming<F: FnMut(u64)>(
+        &mut self,
+        path: &str,
+        data: &[u8],
+        mode: Option<u32>,
+        on_progress: &mut F,
+    ) -> Result<()> {
+        self.write_file_streaming_from_reader(
+            path,
+            &mut std::io::Cursor::new(data),
+            data.len() as u64,
             mode,
+            on_progress,
+        )
+    }
+
+    /// Stream a file from a [`Read`] source into the VM.
+    ///
+    /// Reads `FILE_WRITE_CHUNK_SIZE` bytes at a time from `reader`,
+    /// sending each chunk over the protocol. Only one chunk is in
+    /// memory at a time — the caller doesn't need to buffer the
+    /// entire file.
+    pub fn write_file_from_reader<R: std::io::Read>(
+        &mut self,
+        path: &str,
+        reader: R,
+        total_size: u64,
+        mode: Option<u32>,
+    ) -> Result<()> {
+        self.write_file_from_reader_with_progress(path, reader, total_size, mode, |_| {})
+    }
+
+    /// Stream a file from a [`Read`] source with progress callback.
+    pub fn write_file_from_reader_with_progress<R: std::io::Read, F: FnMut(u64)>(
+        &mut self,
+        path: &str,
+        reader: R,
+        total_size: u64,
+        mode: Option<u32>,
+        mut on_progress: F,
+    ) -> Result<()> {
+        if total_size <= FILE_WRITE_SINGLE_SHOT_MAX as u64 {
+            // Small file: read into memory and use single-shot path.
+            let mut data = Vec::with_capacity(total_size as usize);
+            std::io::Read::read_to_end(&mut std::io::Read::take(reader, total_size + 1), &mut data)
+                .map_err(|e| Error::agent("read source file", e.to_string()))?;
+            return self.write_file_with_progress(path, &data, mode, on_progress);
+        }
+        self.write_file_streaming_from_reader(
+            path,
+            &mut { reader },
+            total_size,
+            mode,
+            &mut on_progress,
+        )
+    }
+
+    /// Core streaming upload loop. Reads chunks from `reader` and
+    /// sends them over the protocol. Only one chunk buffer is live
+    /// at a time (~1 MiB).
+    fn write_file_streaming_from_reader<R: std::io::Read, F: FnMut(u64)>(
+        &mut self,
+        path: &str,
+        reader: &mut R,
+        total_size: u64,
+        mode: Option<u32>,
+        on_progress: &mut F,
+    ) -> Result<()> {
+        let resp = self.request(&AgentRequest::FileWriteBegin {
+            path: path.to_string(),
+            mode,
+            total_size,
         })?;
-        expect_ok(resp, "write file")
+        expect_ok(resp, "begin streaming write")?;
+
+        let mut buf = vec![0u8; FILE_WRITE_CHUNK_SIZE];
+        let mut bytes_sent = 0u64;
+
+        loop {
+            // Fill the chunk buffer.
+            let mut filled = 0;
+            while filled < buf.len() {
+                match reader.read(&mut buf[filled..]) {
+                    Ok(0) => break,
+                    Ok(n) => filled += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(Error::agent("read source file", e.to_string())),
+                }
+            }
+
+            if filled == 0 {
+                // EOF — send final empty chunk to finalize.
+                let resp = self.request(&AgentRequest::FileWriteChunk {
+                    data: Vec::new(),
+                    done: true,
+                })?;
+                expect_ok(resp, "finalize streaming write")?;
+                break;
+            }
+
+            bytes_sent += filled as u64;
+            let done = bytes_sent >= total_size;
+
+            let resp = self.request(&AgentRequest::FileWriteChunk {
+                data: buf[..filled].to_vec(),
+                done,
+            })?;
+            expect_ok(resp, "stream write chunk")?;
+            on_progress(bytes_sent);
+
+            if done {
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// Read a file from the VM.
+    ///
+    /// Consumes the streamed `DataChunk` responses the agent emits
+    /// (see `handle_streaming_file_read` in the agent). The agent
+    /// sends one or more chunks, with `done: true` on the final
+    /// frame — possibly empty. This method concatenates chunks and
+    /// returns the full contents.
+    ///
+    /// Two safety bounds:
+    /// - Receive timeout extended to 600 s so large files don't
+    ///   spuriously fail on slow storage; a 200 MB file at 10 MB/s
+    ///   would exceed the default 30 s receive timeout otherwise.
+    /// - Total size capped at [`FILE_TRANSFER_MAX_TOTAL`] (4 GiB) —
+    ///   symmetric with the write path. A misbehaving or compromised
+    ///   guest can't OOM the host by streaming unbounded data.
     pub fn read_file(&mut self, path: &str) -> Result<Vec<u8>> {
-        let resp = self.request(&AgentRequest::FileRead {
+        self.read_file_with_progress(path, |_| {})
+    }
+
+    /// Read a file from the VM with a progress callback.
+    ///
+    /// `on_progress` is called with the running byte total after
+    /// each `DataChunk` is received. Use [`Self::read_file`] if you
+    /// don't need progress.
+    pub fn read_file_with_progress<F: FnMut(u64)>(
+        &mut self,
+        path: &str,
+        on_progress: F,
+    ) -> Result<Vec<u8>> {
+        const FILE_READ_TIMEOUT: Duration = Duration::from_secs(600);
+
+        let _timeout_guard = self.set_extended_read_timeout(FILE_READ_TIMEOUT)?;
+        self.send_raw(&AgentRequest::FileRead {
             path: path.to_string(),
         })?;
-        match resp {
-            AgentResponse::FileData { data, .. } => Ok(data),
-            AgentResponse::Error { message, .. } => Err(Error::agent("read file", message)),
-            _ => Err(Error::agent("read file", "unexpected response")),
+
+        consume_streamed_read_with_progress(|| self.recv_raw(), on_progress)
+    }
+
+    /// Download a file from the VM directly to a local path.
+    ///
+    /// Unlike [`Self::read_file`] which accumulates the entire file
+    /// in memory, this writes each chunk to disk as it arrives —
+    /// only one 16 MiB chunk is in memory at a time.
+    pub fn read_file_to_path<F: FnMut(u64)>(
+        &mut self,
+        guest_path: &str,
+        local_path: &std::path::Path,
+        mut on_progress: F,
+    ) -> Result<u64> {
+        use std::io::Write;
+        const FILE_READ_TIMEOUT: Duration = Duration::from_secs(600);
+
+        let _timeout_guard = self.set_extended_read_timeout(FILE_READ_TIMEOUT)?;
+        self.send_raw(&AgentRequest::FileRead {
+            path: guest_path.to_string(),
+        })?;
+
+        let mut file = std::fs::File::create(local_path).map_err(|e| {
+            Error::agent(
+                "write local file",
+                format!("{}: {}", local_path.display(), e),
+            )
+        })?;
+
+        let mut total = 0u64;
+        loop {
+            match self.recv_raw()? {
+                AgentResponse::DataChunk { data, done } => {
+                    let next_total = total.saturating_add(data.len() as u64);
+                    if next_total > FILE_TRANSFER_MAX_TOTAL {
+                        let _ = std::fs::remove_file(local_path);
+                        return Err(Error::agent(
+                            "read file",
+                            format!(
+                                "guest streamed {} bytes, exceeding the {} byte cap",
+                                next_total, FILE_TRANSFER_MAX_TOTAL
+                            ),
+                        ));
+                    }
+                    if !data.is_empty() {
+                        file.write_all(&data)
+                            .map_err(|e| Error::agent("write local file", e.to_string()))?;
+                        total = next_total;
+                        on_progress(total);
+                    }
+                    if done {
+                        file.flush()
+                            .map_err(|e| Error::agent("flush local file", e.to_string()))?;
+                        return Ok(total);
+                    }
+                }
+                AgentResponse::Error { message, .. } => {
+                    let _ = std::fs::remove_file(local_path);
+                    return Err(Error::agent("read file", message));
+                }
+                _ => {
+                    let _ = std::fs::remove_file(local_path);
+                    return Err(Error::agent("read file", "unexpected response"));
+                }
+            }
         }
     }
 
@@ -1282,5 +1529,183 @@ impl AgentClient {
         let resp: AgentResponse = serde_json::from_slice(&buf)
             .map_err(|e| Error::agent("deserialize response", e.to_string()))?;
         Ok(resp)
+    }
+}
+
+/// Consume streamed `DataChunk` responses, enforcing the per-transfer
+/// size cap and returning the concatenated bytes.
+///
+/// Pulled out of `AgentClient::read_file` so it can be unit-tested
+/// against synthetic response sequences without booting a VM, and
+/// against a small cap so the test doesn't have to allocate 4 GiB
+/// just to exercise the cap branch.
+///
+/// Two small variants on the same loop:
+/// - [`consume_streamed_read_with_progress`]: production cap, with
+///   a progress callback (used by [`AgentClient::read_file`] +
+///   [`AgentClient::read_file_with_progress`]).
+/// - [`consume_streamed_read_with_cap`]: parameterized cap, no
+///   progress (used by tests so they can exercise the cap branch
+///   with kilobytes instead of gigabytes).
+///
+/// Both delegate to [`consume_streamed_read_inner`].
+fn consume_streamed_read_with_progress<F, P>(next_response: F, on_progress: P) -> Result<Vec<u8>>
+where
+    F: FnMut() -> Result<AgentResponse>,
+    P: FnMut(u64),
+{
+    consume_streamed_read_inner(next_response, FILE_TRANSFER_MAX_TOTAL, on_progress)
+}
+
+#[cfg(test)]
+fn consume_streamed_read_with_cap<F>(next_response: F, cap: u64) -> Result<Vec<u8>>
+where
+    F: FnMut() -> Result<AgentResponse>,
+{
+    consume_streamed_read_inner(next_response, cap, |_| {})
+}
+
+fn consume_streamed_read_inner<F, P>(
+    mut next_response: F,
+    cap: u64,
+    mut on_progress: P,
+) -> Result<Vec<u8>>
+where
+    F: FnMut() -> Result<AgentResponse>,
+    P: FnMut(u64),
+{
+    let mut out: Vec<u8> = Vec::new();
+    let mut total: u64 = 0;
+    loop {
+        match next_response()? {
+            AgentResponse::DataChunk { data, done } => {
+                // Cap *before* extending so a single oversized chunk
+                // can't push us past the limit.
+                let next_total = total.saturating_add(data.len() as u64);
+                if next_total > cap {
+                    return Err(Error::agent(
+                        "read file",
+                        format!(
+                            "guest streamed {} bytes, exceeding the {} byte cap; \
+                             use a virtiofs mount for larger files",
+                            next_total, cap
+                        ),
+                    ));
+                }
+                out.extend_from_slice(&data);
+                total = next_total;
+                on_progress(total);
+                if done {
+                    return Ok(out);
+                }
+            }
+            AgentResponse::Error { message, .. } => {
+                return Err(Error::agent("read file", message));
+            }
+            other => {
+                return Err(Error::agent(
+                    "read file",
+                    format!("unexpected response: {:?}", other),
+                ));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod read_cap_tests {
+    use super::*;
+
+    /// Build a `DataChunk` response with `n` zero bytes.
+    fn chunk(n: usize, done: bool) -> AgentResponse {
+        AgentResponse::DataChunk {
+            data: vec![0u8; n],
+            done,
+        }
+    }
+
+    /// Drive the consumer over a fixed list of responses with a
+    /// small (1 KiB) cap. Tests only need to exercise the size
+    /// arithmetic; the production cap of 4 GiB would need the test
+    /// to allocate a Vec that big to trip — wasteful and unnecessary.
+    /// The cap is parameterized on the internal helper precisely so
+    /// this test can scale down.
+    const TEST_CAP: u64 = 1024;
+
+    fn drive(responses: Vec<AgentResponse>) -> Result<Vec<u8>> {
+        let mut iter = responses.into_iter();
+        consume_streamed_read_with_cap(
+            || {
+                iter.next()
+                    .ok_or_else(|| Error::agent("test", "no more responses"))
+            },
+            TEST_CAP,
+        )
+    }
+
+    #[test]
+    fn read_cap_terminator_returns_full_buffer() {
+        let out = drive(vec![chunk(100, false), chunk(50, true)]).unwrap();
+        assert_eq!(out.len(), 150);
+    }
+
+    #[test]
+    fn read_cap_empty_terminator_is_valid_eof() {
+        let out = drive(vec![chunk(100, false), chunk(0, true)]).unwrap();
+        assert_eq!(out.len(), 100);
+    }
+
+    #[test]
+    fn read_cap_rejects_single_chunk_at_or_above_limit() {
+        // Single chunk that on its own pushes past the cap. We're at
+        // 1024-byte cap so this chunk is 1025 bytes — trivial to
+        // allocate in tests, exercises the same arithmetic that
+        // would catch a 4 GiB+ chunk in production.
+        let err = drive(vec![chunk(TEST_CAP as usize + 1, true)]).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("exceeding") && msg.contains("byte cap"),
+            "expected size-cap error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn read_cap_rejects_when_accumulated_chunks_exceed_limit() {
+        // Two chunks under the cap individually but exceeding it
+        // combined. This is the realistic exhaustion vector — a
+        // misbehaving guest streaming "fine-sized" chunks forever.
+        let half = (TEST_CAP / 2) as usize;
+        let err = drive(vec![
+            chunk(half, false),
+            chunk(half, false),
+            chunk(half, false), // would push past the cap
+        ])
+        .unwrap_err();
+        assert!(format!("{}", err).contains("byte cap"));
+    }
+
+    #[test]
+    fn read_cap_chunk_at_exactly_limit_is_accepted() {
+        // Boundary: a chunk that lands the accumulated total at
+        // exactly the cap is fine. Only > cap is rejected.
+        let out = drive(vec![chunk(TEST_CAP as usize, true)]).unwrap();
+        assert_eq!(out.len(), TEST_CAP as usize);
+    }
+
+    #[test]
+    fn read_cap_propagates_agent_error_response() {
+        let err = drive(vec![AgentResponse::Error {
+            message: "no such file".to_string(),
+            code: None,
+        }])
+        .unwrap_err();
+        assert!(format!("{}", err).contains("no such file"));
+    }
+
+    #[test]
+    fn read_cap_rejects_unexpected_response_type() {
+        let err = drive(vec![AgentResponse::Pong { version: 1 }]).unwrap_err();
+        assert!(format!("{}", err).contains("unexpected response"));
     }
 }

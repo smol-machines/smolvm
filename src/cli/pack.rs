@@ -793,7 +793,7 @@ impl PackCreateCmd {
 
             let response = client.recv_raw()?;
             match response {
-                AgentResponse::LayerData { data, done } => {
+                AgentResponse::DataChunk { data, done } => {
                     if !data.is_empty() {
                         file.write_all(&data).map_err(|e| {
                             Error::agent("export layer", format!("write failed: {}", e))

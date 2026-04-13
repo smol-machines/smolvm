@@ -1348,23 +1348,31 @@ impl CpCmd {
         manager.detach();
 
         if is_upload {
-            let data = std::fs::read(&local_path).map_err(|e| {
+            // Stream from file — only one chunk (~1 MiB) in memory at a time.
+            let file = std::fs::File::open(&local_path).map_err(|e| {
                 smolvm::Error::agent("read local file", format!("{}: {}", local_path, e))
             })?;
-            let size = data.len();
-            client.write_file(&guest_path, &data, None)?;
-            eprintln!("Uploaded {} ({} bytes) -> {}", local_path, size, guest_path);
-        } else {
-            let data = client.read_file(&guest_path)?;
-            std::fs::write(&local_path, &data).map_err(|e| {
-                smolvm::Error::agent("write local file", format!("{}: {}", local_path, e))
+            let size = file.metadata().map(|m| m.len()).map_err(|e| {
+                smolvm::Error::agent("stat local file", format!("{}: {}", local_path, e))
             })?;
-            eprintln!(
-                "Downloaded {} ({} bytes) -> {}",
-                guest_path,
-                data.len(),
-                local_path
+            let mut bar = crate::cli::ProgressBar::new(
+                format!("Uploading {} -> {}", local_path, guest_path),
+                Some(size),
             );
+            client.write_file_from_reader_with_progress(&guest_path, file, size, None, |sent| {
+                bar.update(sent)
+            })?;
+            bar.finish(size);
+        } else {
+            // Stream to file — only one chunk (~16 MiB) in memory at a time.
+            let mut bar = crate::cli::ProgressBar::new(
+                format!("Downloading {} -> {}", guest_path, local_path),
+                None,
+            );
+            let local = std::path::Path::new(&local_path);
+            let size =
+                client.read_file_to_path(&guest_path, local, |received| bar.update(received))?;
+            bar.finish(size);
         }
 
         Ok(())

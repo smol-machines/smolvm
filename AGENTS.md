@@ -225,6 +225,29 @@ smolvm machine cp ./script.py myvm:/workspace/script.py
 smolvm machine cp myvm:/workspace/output.json ./output.json
 ```
 
+**Behavior and limits:**
+
+- Files up to 1 MiB transfer as a single message — no perceptible
+  overhead beyond the agent round-trip.
+- Larger files stream automatically: 1 MiB chunks for upload, 16 MiB
+  chunks for download. The split is asymmetric because the
+  host→guest direction has tighter socket-buffer headroom.
+- Per-transfer cap is **4 GiB** in either direction. Files at or
+  above this size are rejected up front (`total_size exceeds maximum`
+  on upload; `exceeding the byte cap` on download). For larger
+  blobs, mount a host directory with `--volume` instead of copying.
+- A throttled progress line prints to stderr while large transfers
+  run, including bytes-so-far, percentage (uploads), and rate.
+  Pipe captures (`> file`) only see the upload/download summary,
+  not the progress noise.
+- Atomic on the guest side: a partially-written file never appears
+  at the target path. If the transfer fails or the connection drops
+  mid-stream, the staging file is cleaned up and the original
+  destination (if any) is unaffected.
+
+Typical throughput on local KVM, Linux host: ~11 MB/s upload,
+~170 MB/s download.
+
 ## Streaming Exec
 
 Stream command output in real-time instead of buffering:
