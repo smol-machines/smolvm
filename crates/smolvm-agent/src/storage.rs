@@ -1136,16 +1136,19 @@ pub fn list_images() -> Result<Vec<ImageInfo>> {
 ///
 /// Used by `smolvm pack` to extract layers for packaging.
 /// Returns the path to the created tar file.
-pub fn export_layer(image_digest: &str, layer_index: usize) -> Result<PathBuf> {
+/// Find the directory path for a specific layer of an image.
+///
+/// Scans manifests to find the image by digest, then resolves the layer
+/// directory. Used by the streaming export handler to pipe tar directly
+/// without creating a temp file.
+pub fn find_layer_path(image_digest: &str, layer_index: usize) -> Result<PathBuf> {
     let root = Path::new(STORAGE_ROOT);
 
-    // Find image by digest - need to scan manifests
     let manifests_dir = root.join(MANIFESTS_DIR);
     if !manifests_dir.exists() {
         return Err(StorageError::NoImagesFound);
     }
 
-    // Find manifest with matching digest
     let mut layers: Option<Vec<String>> = None;
 
     for entry in std::fs::read_dir(&manifests_dir)? {
@@ -1190,20 +1193,32 @@ pub fn export_layer(image_digest: &str, layer_index: usize) -> Result<PathBuf> {
         )));
     }
 
-    // Create tar archive on the storage disk (/tmp is on virtiofs which is
-    // read-only on Linux — ENOTSUP)
+    Ok(layer_dir)
+}
+
+/// Export a layer as a tar file on the storage disk.
+///
+/// DEPRECATED: Prefer streaming export via `find_layer_path()` + piped tar.
+/// This function creates a temp tar file that can fill the storage disk for
+/// large layers. Kept for backward compatibility.
+pub fn export_layer(image_digest: &str, layer_index: usize) -> Result<PathBuf> {
+    let layer_dir = find_layer_path(image_digest, layer_index)?;
+    let layer_id = layer_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown");
+
+    let root = Path::new(STORAGE_ROOT);
     let tmp_dir = root.join("tmp");
     std::fs::create_dir_all(&tmp_dir)?;
-    let tar_path = tmp_dir.join(format!("layer-{}.tar", &layer_id[..12]));
+    let tar_path = tmp_dir.join(format!("layer-{}.tar", &layer_id[..12.min(layer_id.len())]));
 
     info!(
         layer_id = %layer_id,
-        layer_index = layer_index,
         output = %tar_path.display(),
-        "exporting layer as tar"
+        "exporting layer as tar (temp file)"
     );
 
-    // Use tar command to create archive
     let status = Command::new("tar")
         .args(["-cf"])
         .arg(&tar_path)

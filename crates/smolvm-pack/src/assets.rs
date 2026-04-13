@@ -159,6 +159,35 @@ impl AssetCollector {
         Ok(())
     }
 
+    /// Get the staging path where a layer file should be written.
+    ///
+    /// Call this before streaming the layer to get the destination path,
+    /// then call `register_layer()` after writing to register it in the inventory.
+    pub fn layer_staging_path(&self, digest: &str) -> PathBuf {
+        let short_digest = digest.strip_prefix("sha256:").unwrap_or(digest);
+        let filename = format!("{}.tar", &short_digest[..12]);
+        self.staging_dir.join(format!("layers/{}", filename))
+    }
+
+    /// Register a layer that was already written to its staging path.
+    ///
+    /// Use after streaming a layer directly to `layer_staging_path()`.
+    pub fn register_layer(&mut self, digest: &str) -> Result<()> {
+        let short_digest = digest.strip_prefix("sha256:").unwrap_or(digest);
+        let filename = format!("{}.tar", &short_digest[..12]);
+        let path = format!("layers/{}", filename);
+        let dst = self.staging_dir.join(&path);
+
+        let metadata = fs::metadata(&dst)?;
+        self.inventory.layers.push(LayerEntry {
+            digest: digest.to_string(),
+            path,
+            size: metadata.len(),
+        });
+
+        Ok(())
+    }
+
     /// Add an OCI layer from a file path.
     pub fn add_layer_from_file(&mut self, digest: &str, layer_path: &Path) -> Result<()> {
         let short_digest = digest.strip_prefix("sha256:").unwrap_or(digest);

@@ -279,19 +279,22 @@ impl PackCreateCmd {
         // Export and collect layers
         println!("Exporting {} layers...", image_info.layer_count);
         for (i, layer_digest) in image_info.layers.iter().enumerate() {
-            println!(
-                "  Layer {}/{}: {}...",
+            let prefix = format!(
+                "  Layer {}/{}: {}",
                 i + 1,
                 image_info.layer_count,
                 &layer_digest[..19]
             );
+            print!("{}...", prefix);
+            let _ = std::io::Write::flush(&mut std::io::stdout());
 
-            // Export layer via agent
-            let layer_data = self.export_layer(&mut client, &image_info.digest, i)?;
+            // Export layer via agent — streamed directly to staging disk (zero memory buffering)
+            let layer_file = collector.layer_staging_path(layer_digest);
+            self.export_layer_to_file(&mut client, &image_info.digest, i, &layer_file, &prefix)?;
 
-            // Add to collector
+            // Register the already-written file in the collector's inventory
             collector
-                .add_layer(layer_digest, &layer_data)
+                .register_layer(layer_digest)
                 .map_err(|e| Error::agent("collect layers", e.to_string()))?;
         }
 
@@ -500,17 +503,22 @@ impl PackCreateCmd {
             .with_stub(&stub_path)
             .with_asset_collector(collector);
 
+        let label = if self.single_file {
+            "Assembling single-file packed binary"
+        } else {
+            "Assembling packed binary"
+        };
+        let spinner = Spinner::start(label);
         let info = if self.single_file {
-            println!("Assembling single-file packed binary...");
             packer
                 .pack_embedded(&self.output)
                 .map_err(|e| Error::agent("pack binary", e.to_string()))?
         } else {
-            println!("Assembling packed binary...");
             packer
                 .pack(&self.output)
                 .map_err(|e| Error::agent("pack binary", e.to_string()))?
         };
+        spinner.stop();
 
         println!(
             "Packed: {} (stub: {}KB, total: {}KB)",
@@ -735,14 +743,20 @@ impl PackCreateCmd {
     /// Export a layer from the agent.
     ///
     /// The agent streams the layer as a sequence of `LayerData` chunks.
-    /// We accumulate them into a single `Vec<u8>`.
-    fn export_layer(
+    /// Export a layer from the agent, streaming chunks directly to a file on disk.
+    ///
+    /// No memory buffering — each 16MB chunk is written to disk as it arrives.
+    /// This supports layers of any size without hitting host memory limits.
+    fn export_layer_to_file(
         &self,
         client: &mut AgentClient,
         image_digest: &str,
         layer_index: usize,
-    ) -> smolvm::Result<Vec<u8>> {
+        dest: &std::path::Path,
+        progress_prefix: &str,
+    ) -> smolvm::Result<()> {
         use smolvm_protocol::AgentRequest;
+        use std::io::Write;
         use std::time::{Duration, Instant};
 
         const LAYER_EXPORT_TIMEOUT: Duration = Duration::from_secs(600); // 10 minutes
@@ -752,15 +766,19 @@ impl PackCreateCmd {
             layer_index,
         };
 
-        // Extend socket read timeout for the duration of the export.
-        // The default 30s timeout would fire before our wall-clock guard
-        // if the agent stalls between chunks.
         let _timeout_guard = client.set_extended_read_timeout(LAYER_EXPORT_TIMEOUT)?;
-
         client.send_raw(&request)?;
 
+        let mut file = std::fs::File::create(dest).map_err(|e| {
+            Error::agent(
+                "export layer",
+                format!("failed to create {}: {}", dest.display(), e),
+            )
+        })?;
+
         let start = Instant::now();
-        let mut result = Vec::new();
+        let mut total_bytes = 0u64;
+        let mut last_progress = Instant::now();
         loop {
             if start.elapsed() > LAYER_EXPORT_TIMEOUT {
                 return Err(Error::agent(
@@ -768,7 +786,7 @@ impl PackCreateCmd {
                     format!(
                         "layer export timed out after {}s (received {} bytes so far)",
                         LAYER_EXPORT_TIMEOUT.as_secs(),
-                        result.len()
+                        total_bytes
                     ),
                 ));
             }
@@ -776,9 +794,25 @@ impl PackCreateCmd {
             let response = client.recv_raw()?;
             match response {
                 AgentResponse::LayerData { data, done } => {
-                    result.extend_from_slice(&data);
+                    if !data.is_empty() {
+                        file.write_all(&data).map_err(|e| {
+                            Error::agent("export layer", format!("write failed: {}", e))
+                        })?;
+                        total_bytes += data.len() as u64;
+
+                        // Update progress every 500ms
+                        if last_progress.elapsed() >= Duration::from_millis(500) {
+                            print!("\r{}... {}", progress_prefix, fmt_bytes(total_bytes));
+                            let _ = std::io::stdout().flush();
+                            last_progress = Instant::now();
+                        }
+                    }
                     if done {
-                        return Ok(result);
+                        file.flush().map_err(|e| {
+                            Error::agent("export layer", format!("flush failed: {}", e))
+                        })?;
+                        println!("\r{}... {} done", progress_prefix, fmt_bytes(total_bytes));
+                        return Ok(());
                     }
                 }
                 AgentResponse::Error { message, .. } => {
@@ -1205,6 +1239,65 @@ fn build_registry_client(
     }
 
     Ok(client)
+}
+
+/// Format a byte count as a human-readable string (KB for < 1 MB, MB otherwise).
+fn fmt_bytes(bytes: u64) -> String {
+    if bytes < 1024 * 1024 {
+        format!("{} KB", bytes / 1024)
+    } else {
+        format!("{} MB", bytes / (1024 * 1024))
+    }
+}
+
+/// A simple terminal spinner that prints a rotating character every 200ms.
+/// Stops automatically on drop (error paths) or via explicit `stop()`.
+struct Spinner {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Spinner {
+    fn start(label: &str) -> Self {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop.clone();
+        let label = label.to_string();
+
+        let handle = std::thread::spawn(move || {
+            let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+            let mut i = 0;
+            while !stop_clone.load(Ordering::Relaxed) {
+                print!("\r{} {}\x1b[K", frames[i % frames.len()], label);
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+                i += 1;
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            print!("\r\x1b[K");
+            println!("{} done", label);
+        });
+
+        Spinner {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn stop(self) {
+        // Drop impl handles the actual shutdown
+        drop(self);
+    }
+}
+
+impl Drop for Spinner {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
 }
 
 /// Calculate the total size of a directory (recursive).

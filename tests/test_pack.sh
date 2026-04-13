@@ -724,6 +724,48 @@ test_packed_python_run() {
 }
 
 # =============================================================================
+# Large Image: r-base
+#
+# Regression test for streaming layer export. r-base:latest is ~9 GB with 6
+# layers. Previously failed with "connection closed" because the agent wrote
+# a temp tar file that filled the 20 GB storage disk. The fix pipes tar stdout
+# directly to the vsock stream with zero temp files.
+# =============================================================================
+
+test_pack_rbase() {
+    if [[ "$QUICK_MODE" == "true" ]]; then
+        echo "SKIP: --quick mode"
+        return 0
+    fi
+
+    local output="$TEST_DIR/test-rbase"
+    $SMOLVM pack create --image r-base:latest -o "$output" 2>&1
+
+    [[ -f "$output" ]] && [[ -f "$output.smolmachine" ]]
+}
+
+test_packed_rbase_run() {
+    if [[ "$QUICK_MODE" == "true" ]]; then
+        echo "SKIP: --quick mode"
+        return 0
+    fi
+
+    local output="$TEST_DIR/test-rbase"
+
+    if [[ ! -f "$output" ]]; then
+        echo "SKIP: no packed binary (pack failed)"
+        return 1
+    fi
+
+    local result
+    result=$(run_with_timeout 120 "$output" run -- R --version 2>&1)
+    local exit_code=$?
+
+    [[ $exit_code -eq 124 ]] && { echo "TIMEOUT"; return 1; }
+    [[ "$result" == *"R version"* ]]
+}
+
+# =============================================================================
 # Run Tests
 # =============================================================================
 
@@ -974,6 +1016,8 @@ if [[ "$QUICK_MODE" != "true" ]]; then
     run_test "Pack Python image" test_pack_python || true
     run_test "Packed Python run" test_packed_python_run || true
     run_test "pack run Python" test_pack_run_python || true
+    run_test "Pack r-base (large image, streaming export)" test_pack_rbase || true
+    run_test "Packed r-base run" test_packed_rbase_run || true
 fi
 
 print_summary "Pack Tests"

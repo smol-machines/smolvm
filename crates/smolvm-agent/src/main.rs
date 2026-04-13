@@ -2537,19 +2537,19 @@ fn handle_format_storage() -> AgentResponse {
 
 /// Handle export layer request with chunked streaming.
 ///
-/// Reads the layer tar file and sends it in LAYER_CHUNK_SIZE chunks,
-/// each as a separate LayerData response. This avoids hitting MAX_FRAME_SIZE
-/// for large layers.
+/// Pipes `tar -cf -` stdout directly to the vsock stream in LAYER_CHUNK_SIZE
+/// chunks. No temp tar file is created — this allows exporting layers of any
+/// size without filling the storage disk.
 fn handle_streaming_export_layer(
     stream: &mut impl Write,
     image_digest: &str,
     layer_index: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     ensure_storage_mounted();
-    info!(image_digest = %image_digest, layer_index = layer_index, "exporting layer (chunked)");
+    info!(image_digest = %image_digest, layer_index = layer_index, "exporting layer (streamed)");
 
-    // Export layer to tar file
-    let tar_path = match storage::export_layer(image_digest, layer_index) {
+    // Find the layer directory without creating a temp tar file.
+    let layer_dir = match storage::find_layer_path(image_digest, layer_index) {
         Ok(path) => path,
         Err(e) => {
             send_response(
@@ -2560,25 +2560,21 @@ fn handle_streaming_export_layer(
         }
     };
 
-    // Verify layer exists
-    if let Err(e) = storage::get_layer_digest(image_digest, layer_index) {
-        let _ = std::fs::remove_file(&tar_path);
-        send_response(
-            stream,
-            &AgentResponse::from_err(e, error_codes::EXPORT_FAILED),
-        )?;
-        return Ok(());
-    }
-
-    // Open tar file for streaming
-    let mut file = match std::fs::File::open(&tar_path) {
-        Ok(f) => f,
+    // Pipe tar stdout directly — no temp file on disk.
+    let mut child = match std::process::Command::new("tar")
+        .args(["-cf", "-", "-C"])
+        .arg(&layer_dir)
+        .arg(".")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
         Err(e) => {
-            let _ = std::fs::remove_file(&tar_path);
             send_response(
                 stream,
                 &AgentResponse::error(
-                    format!("failed to open tar file: {}", e),
+                    format!("failed to spawn tar: {}", e),
                     error_codes::EXPORT_FAILED,
                 ),
             )?;
@@ -2586,63 +2582,53 @@ fn handle_streaming_export_layer(
         }
     };
 
-    // Stream in chunks. Read ahead one chunk so we can mark the last
-    // data-carrying frame with done=true, avoiding an empty final frame.
+    let mut stdout = child.stdout.take().unwrap();
     let mut buf = vec![0u8; LAYER_CHUNK_SIZE];
-    let mut pending = match file.read(&mut buf) {
-        Ok(n) => n,
-        Err(e) => {
-            let _ = std::fs::remove_file(&tar_path);
-            send_response(
-                stream,
-                &AgentResponse::error(
-                    format!("failed to read tar file: {}", e),
-                    error_codes::EXPORT_FAILED,
-                ),
-            )?;
-            return Ok(());
-        }
-    };
 
     loop {
-        // Read the next chunk to determine if `pending` is the last one.
-        let mut next_buf = vec![0u8; LAYER_CHUNK_SIZE];
-        let next_n = match file.read(&mut next_buf) {
-            Ok(n) => n,
-            Err(e) => {
-                let _ = std::fs::remove_file(&tar_path);
-                send_response(
-                    stream,
-                    &AgentResponse::error(
-                        format!("failed to read tar file: {}", e),
-                        error_codes::EXPORT_FAILED,
-                    ),
-                )?;
-                return Ok(());
+        // Fill the buffer — tar may write less than LAYER_CHUNK_SIZE per read.
+        let mut pending = 0;
+        while pending < buf.len() {
+            match stdout.read(&mut buf[pending..]) {
+                Ok(0) => break,
+                Ok(n) => pending += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    let _ = child.kill();
+                    send_response(
+                        stream,
+                        &AgentResponse::error(
+                            format!("failed to read tar output: {}", e),
+                            error_codes::EXPORT_FAILED,
+                        ),
+                    )?;
+                    return Ok(());
+                }
             }
-        };
+        }
 
-        let done = next_n == 0;
+        if pending == 0 {
+            // EOF — send final frame
+            send_response(
+                stream,
+                &AgentResponse::LayerData {
+                    data: vec![],
+                    done: true,
+                },
+            )?;
+            break;
+        }
+
         send_response(
             stream,
             &AgentResponse::LayerData {
                 data: buf[..pending].to_vec(),
-                done,
+                done: false,
             },
         )?;
-
-        if done {
-            break;
-        }
-
-        // Swap buffers: next becomes pending.
-        std::mem::swap(&mut buf, &mut next_buf);
-        pending = next_n;
     }
 
-    // Clean up temp file
-    let _ = std::fs::remove_file(&tar_path);
-
+    let _ = child.wait();
     Ok(())
 }
 
