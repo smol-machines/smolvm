@@ -96,6 +96,19 @@ const NETWORK_TEST_TIMEOUT_SECS: u64 = 10;
 /// Poll interval for checking process completion in VM exec.
 const PROCESS_POLL_INTERVAL_MS: u64 = 10;
 
+/// Env var the host sets on guest init to signal GPU was requested.
+///
+/// This literal must match `smolvm::data::consts::ENV_SMOLVM_GPU` on
+/// the host. The agent crate does not depend on the host crate, so we
+/// redeclare the string here; a unit test on the host
+/// (`agent_env_constants_match`) asserts the two are in sync so a
+/// rename on one side can't silently desync the other.
+const ENV_SMOLVM_GPU: &str = "SMOLVM_GPU";
+
+/// Value signaling "on" for boolean SMOLVM_* sentinel env vars.
+/// Matches `smolvm::data::consts::ENV_VALUE_ON`.
+const ENV_VALUE_ON: &str = "1";
+
 /// Get system uptime in milliseconds (for timing relative to boot).
 fn uptime_ms() -> u64 {
     if let Ok(contents) = std::fs::read_to_string("/proc/uptime") {
@@ -246,6 +259,17 @@ fn main() {
     if dns_proxy::is_enabled() {
         info!("DNS filtering enabled, starting guest proxy");
         dns_proxy::start();
+    }
+
+    // If the host started us with --gpu, sanity-check that the guest
+    // kernel actually sees a virtio-gpu device. libkrun accepts the
+    // GPU config call regardless of whether the embedded kernel has
+    // the `virtio-gpu` driver compiled in, so the only place this
+    // mismatch surfaces is here. Without this log, the user discovers
+    // the missing GPU much later — when their workload makes a
+    // rendering call and crashes with a confused EGL/Vulkan error.
+    if std::env::var(ENV_SMOLVM_GPU).as_deref() == Ok(ENV_VALUE_ON) {
+        log_gpu_status();
     }
 
     info!(
@@ -4288,6 +4312,21 @@ mod tests {
         .unwrap();
 
         assert_eq!(resolved, merged.join("etc").join("hosts"));
+    }
+
+    /// Symmetric with `smolvm::data::consts::tests::host_guest_env_literals_are_stable`.
+    ///
+    /// The host declares `ENV_SMOLVM_GPU = "SMOLVM_GPU"` in
+    /// `src/data/consts.rs` and the agent redeclares the same literal
+    /// locally (the agent crate doesn't depend on the host crate).
+    /// Both tests pin the string; if either side is renamed alone,
+    /// its test fires and forces the other side to update in the
+    /// same change. Without the drift guard, a rename in the agent
+    /// would silently break the host→guest GPU-request signaling.
+    #[test]
+    fn host_guest_env_literals_are_stable() {
+        assert_eq!(ENV_SMOLVM_GPU, "SMOLVM_GPU");
+        assert_eq!(ENV_VALUE_ON, "1");
     }
 
     #[test]

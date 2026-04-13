@@ -4,7 +4,9 @@
 //! All setup is done in the child process after fork, where
 //! DYLD_LIBRARY_PATH is still available for dlopen.
 
-use crate::data::consts::{ENV_SMOLVM_KRUN_LOG_LEVEL, ENV_SMOLVM_LIB_DIR};
+use crate::data::consts::{
+    ENV_SMOLVM_GPU, ENV_SMOLVM_KRUN_LOG_LEVEL, ENV_SMOLVM_LIB_DIR, ENV_VALUE_ON,
+};
 use crate::data::storage::HostMount;
 use crate::error::{Error, Result};
 use crate::network::backend::{COMPAT_NET_FEATURES, TSI_FEATURE_HIJACK_INET};
@@ -290,8 +292,11 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // On macOS, also requires MoltenVK (Vulkan → Metal translation).
         if resources.gpu {
             let virgl_flags = VIRGLRENDERER_VENUS | VIRGLRENDERER_NO_VIRGL;
-            // Allocate 4 GiB VRAM for GPU shared memory.
-            let vram_bytes: u64 = 4 * 1024 * 1024 * 1024;
+            // Size the GPU shared-memory region. Caller may override
+            // via `--gpu-vram <MiB>` (CLI) or `gpu_vram = N` (Smolfile);
+            // default is `DEFAULT_GPU_VRAM_MIB`.
+            let vram_mib = resources.effective_gpu_vram_mib();
+            let vram_bytes: u64 = (vram_mib as u64) * crate::data::consts::BYTES_PER_MIB;
 
             // Resolve krun_set_gpu_options2 dynamically — it may not exist
             // if libkrun was built without the `gpu` feature.
@@ -710,6 +715,19 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // Tell the agent to start SSH agent forwarding bridge
         if ssh_agent_socket.is_some() {
             env_strings.push(cstr("SMOLVM_SSH_AGENT=1"));
+        }
+
+        // Tell the agent GPU was requested so it can sanity-check the
+        // virtio-gpu device actually appeared in the guest. libkrun
+        // happily accepts `krun_set_gpu_options2` even if the embedded
+        // kernel lacks the driver; without this check the user sees
+        // "VM started" and discovers missing GPU only when their
+        // workload hits a rendering call.
+        if resources.gpu {
+            let gpu_env = format!("{}={}", ENV_SMOLVM_GPU, ENV_VALUE_ON);
+            if let Ok(cs) = CString::new(gpu_env) {
+                env_strings.push(cs);
+            }
         }
 
         // Tell the agent to start DNS filtering proxy

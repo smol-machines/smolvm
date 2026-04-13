@@ -83,6 +83,7 @@ pub fn build_create_params(
                 health_startup_grace_secs: None,
                 ssh_agent: false,
                 gpu: false,
+                gpu_vram_mib: None,
                 dns_filter_hosts: None,
                 source_smolmachine: None,
             });
@@ -271,6 +272,7 @@ pub fn build_create_params(
         health_startup_grace_secs,
         ssh_agent: sf.auth.as_ref().and_then(|a| a.ssh_agent).unwrap_or(false),
         gpu,
+        gpu_vram_mib: sf.gpu_vram,
         dns_filter_hosts: if sf_allow_hosts.is_empty() {
             None
         } else {

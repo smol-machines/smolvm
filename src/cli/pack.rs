@@ -254,6 +254,7 @@ impl PackCreateCmd {
                 gpu: false,
                 storage_gib: None,
                 overlay_gib: None,
+                gpu_vram_mib: None,
                 allowed_cidrs: None,
             },
         )?;
@@ -518,6 +519,7 @@ impl PackCreateCmd {
                     network: true,
                     network_backend: None,
                     gpu: false,
+                    gpu_vram_mib: None,
                     storage_gib: None,
                     overlay_gib: None,
                     allowed_cidrs: None,

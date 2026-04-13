@@ -368,6 +368,11 @@ pub struct VmRecord {
     #[serde(default)]
     pub gpu: Option<bool>,
 
+    /// GPU shared-memory region size in MiB. `None` → default
+    /// (`DEFAULT_GPU_VRAM_MIB`). Ignored unless `gpu` is true.
+    #[serde(default)]
+    pub gpu_vram_mib: Option<u32>,
+
     /// Restart configuration.
     #[serde(default)]
     pub restart: RestartConfig,
@@ -486,7 +491,8 @@ impl VmRecord {
             ports,
             network,
             gpu: None,
-            restart: RestartConfig::default(),
+            gpu_vram_mib: None,
+            restart:RestartConfig::default(),
             last_exit_code: None,
             init: Vec::new(),
             env: Vec::new(),
@@ -532,6 +538,7 @@ impl VmRecord {
             ports,
             network,
             gpu: None,
+            gpu_vram_mib: None,
             restart,
             last_exit_code: None,
             init: Vec::new(),
@@ -609,6 +616,7 @@ impl VmRecord {
             network: self.network,
             network_backend: self.network_backend,
             gpu: self.gpu.unwrap_or(false),
+            gpu_vram_mib: self.gpu_vram_mib,
             storage_gib: self.storage_gb,
             overlay_gib: self.overlay_gb,
             allowed_cidrs: self.allowed_cidrs.clone(),
@@ -934,5 +942,55 @@ mod tests {
         let default_record = VmRecord::new("default".to_string(), 1, 512, vec![], vec![], false);
         assert_eq!(default_record.gpu, None);
         assert!(!default_record.vm_resources().gpu);
+    }
+
+    #[test]
+    fn vm_record_gpu_vram_mib_flows_through_full_persistence_cycle() {
+        // End-to-end plumbing test:
+        //   CreateVmParams-like assignment → VmRecord → serde_json (DB)
+        //   → deserialized VmRecord → vm_resources() → effective
+        //
+        // This is the chain that runs every time a user creates a
+        // machine with `--gpu-vram N`, stops it, and starts it again.
+        // A silent break anywhere in the chain (e.g., someone drops
+        // the assignment, adds a new field and forgets to copy it,
+        // changes the Option<u32> shape) fires this test.
+
+        use crate::agent::VmResources;
+
+        // 1. Start with a record, set the field the way `create_vm` does.
+        let mut record = VmRecord::new("vramtest".into(), 2, 1024, vec![], vec![], false);
+        record.gpu = Some(true);
+        record.gpu_vram_mib = Some(1024);
+
+        // 2. Roundtrip through JSON (the redb value format).
+        let json = serde_json::to_vec(&record).unwrap();
+        let back: VmRecord = serde_json::from_slice(&json).unwrap();
+        assert_eq!(
+            back.gpu_vram_mib,
+            Some(1024),
+            "gpu_vram_mib must survive DB roundtrip"
+        );
+
+        // 3. Convert to VmResources the way `start_vm_named` does.
+        let res: VmResources = back.vm_resources();
+        assert_eq!(res.gpu_vram_mib, Some(1024));
+        assert_eq!(
+            res.effective_gpu_vram_mib(),
+            1024,
+            "launcher will pass 1024 MiB to krun_set_gpu_options2"
+        );
+
+        // 4. And the unset path: default in, default out.
+        let mut record = VmRecord::new("vramdefault".into(), 1, 512, vec![], vec![], false);
+        record.gpu = Some(true);
+        // gpu_vram_mib left as None
+        let json = serde_json::to_vec(&record).unwrap();
+        let back: VmRecord = serde_json::from_slice(&json).unwrap();
+        assert_eq!(back.gpu_vram_mib, None);
+        assert_eq!(
+            back.vm_resources().effective_gpu_vram_mib(),
+            crate::data::resources::DEFAULT_GPU_VRAM_MIB,
+        );
     }
 }

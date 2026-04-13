@@ -111,6 +111,7 @@ Default registry: `registry.smolmachines.com`. Digest references require `sha256
 | `--name` | `-n` | start, stop, status, exec, resize | Machine name (default: "default") |
 | `--net` | | run, create | Enable outbound networking (off by default) |
 | `--gpu` | | run, create | Enable GPU acceleration (Vulkan via virtio-gpu) |
+| `--gpu-vram` | | run, create | GPU shared-memory region size in MiB (default: 4096). Ignored without `--gpu`. |
 | `--volume` | `-v` | run, create | Mount host dir: `HOST:GUEST[:ro]` |
 | `--port` | `-p` | run, create | Port mapping: `HOST:GUEST` |
 | `--smolfile` | `-s` | run, create, pack create | Load config from Smolfile |
@@ -137,6 +138,7 @@ cpus = 2                              # vCPUs (default: 4)
 memory = 1024                         # MiB (default: 8192, elastic via balloon)
 net = true                            # outbound networking (default: false)
 gpu = true                            # GPU acceleration (default: false)
+gpu_vram = 4096                       # GPU VRAM MiB (default: 4096, ignored unless gpu=true)
 storage = 40                          # storage disk GiB (default: 20)
 overlay = 4                           # overlay disk GiB (default: 2)
 

@@ -402,6 +402,8 @@ pub struct CreateVmParams {
     pub ssh_agent: bool,
     /// Enable GPU acceleration (virtio-gpu with Venus/Vulkan).
     pub gpu: bool,
+    /// GPU VRAM size in MiB (None = default). Ignored when gpu is false.
+    pub gpu_vram_mib: Option<u32>,
     /// Hostnames for DNS filtering (from --allow-host / [network].allow_hosts).
     pub dns_filter_hosts: Option<Vec<String>>,
     /// Absolute path to .smolmachine sidecar (for machines created with --from).
@@ -465,6 +467,11 @@ pub fn create_vm(params: CreateVmParams) -> smolvm::Result<()> {
     record.allowed_cidrs = params.allowed_cidrs.clone();
     record.network_backend = params.network_backend;
     record.gpu = if params.gpu { Some(true) } else { None };
+    // Same invariant the CLI enforces, applied again here because
+    // Smolfile values arrive through `params.gpu_vram_mib` without
+    // passing through the clap value_parser.
+    record.gpu_vram_mib = smolvm::data::resources::validate_gpu_vram_mib(params.gpu_vram_mib)
+        .map_err(|e| smolvm::Error::config("create machine", format!("gpu_vram: {}", e)))?;
     record.image = params.image.clone();
     record.entrypoint = params.entrypoint.clone();
     record.cmd = params.cmd.clone();

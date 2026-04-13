@@ -313,7 +313,7 @@ impl PackRunCmd {
             gpu: manifest.gpu,
             storage_gib,
             overlay_gib: self.overlay,
-            allowed_cidrs: None,
+            gpu_vram_mib: None, allowed_cidrs: None,
         };
         validate_requested_network_backend(&resources, None, self.port.len())?;
 
@@ -1169,7 +1169,7 @@ fn run_from_cache(
         gpu: manifest.gpu,
         storage_gib,
         overlay_gib: args.overlay,
-        allowed_cidrs: None,
+        gpu_vram_mib: None, allowed_cidrs: None,
     };
     validate_requested_network_backend(&resources, None, args.port.len())?;
 
@@ -1493,7 +1493,7 @@ fn daemon_start(
         gpu: manifest.gpu,
         storage_gib,
         overlay_gib: args.overlay,
-        allowed_cidrs: None,
+        gpu_vram_mib: None, allowed_cidrs: None,
     };
     validate_requested_network_backend(&resources, None, args.port.len())?;
 
