@@ -2,6 +2,8 @@
 
 /// Shared constants used across the runtime and adapters.
 pub mod consts;
+/// Canonical disk type metadata shared by storage helpers.
+pub mod disk;
 /// Canonical error types used by the shared data layer.
 #[path = "errors.rs"]
 pub mod error;

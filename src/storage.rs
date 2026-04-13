@@ -16,6 +16,7 @@
 //! and overlay filesystem management.
 
 use crate::data::consts::BYTES_PER_GIB;
+pub use crate::data::disk::{DiskType, Overlay, Storage};
 pub use crate::data::storage::{
     DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB, OVERLAY_DISK_FILENAME,
     STORAGE_DISK_FILENAME,
@@ -60,44 +61,6 @@ impl DiskVersion {
     pub fn is_compatible(&self) -> bool {
         self.format_version <= Self::CURRENT_VERSION
     }
-}
-
-/// Marker type for the persistent rootfs overlay disk.
-#[derive(Debug, Clone, Copy)]
-pub enum Overlay {}
-
-/// Marker type for the shared storage disk.
-#[derive(Debug, Clone, Copy)]
-pub enum Storage {}
-
-/// Compile-time metadata for a typed VM disk.
-pub trait DiskType {
-    /// Human-readable disk type name used in logs and errors.
-    const NAME: &'static str;
-    /// Default filename for this disk type.
-    const DEFAULT_FILENAME: &'static str;
-    /// Default size for this disk type, in GiB.
-    const DEFAULT_SIZE_GIB: u64;
-    /// Preformatted template filename for this disk type.
-    const TEMPLATE_FILENAME: &'static str;
-    /// ext4 volume label used when formatting this disk type.
-    const VOLUME_LABEL: &'static str;
-}
-
-impl DiskType for Overlay {
-    const NAME: &'static str = "overlay";
-    const DEFAULT_FILENAME: &'static str = OVERLAY_DISK_FILENAME;
-    const DEFAULT_SIZE_GIB: u64 = DEFAULT_OVERLAY_SIZE_GIB;
-    const TEMPLATE_FILENAME: &'static str = "overlay-template.ext4";
-    const VOLUME_LABEL: &'static str = "smolvm-overlay";
-}
-
-impl DiskType for Storage {
-    const NAME: &'static str = "storage";
-    const DEFAULT_FILENAME: &'static str = STORAGE_DISK_FILENAME;
-    const DEFAULT_SIZE_GIB: u64 = DEFAULT_STORAGE_SIZE_GIB;
-    const TEMPLATE_FILENAME: &'static str = "storage-template.ext4";
-    const VOLUME_LABEL: &'static str = "smolvm";
 }
 
 /// Shared disk implementation for storage and overlay disks.
@@ -198,7 +161,7 @@ impl<K: DiskType> VmDisk<K> {
     }
 
     /// Get the disk size in GiB.
-    pub fn size_gb(&self) -> u64 {
+    pub fn size_gib(&self) -> u64 {
         self.size_bytes / BYTES_PER_GIB
     }
 
@@ -381,7 +344,7 @@ mod tests {
         let disk = StorageDisk::open_or_create_at(&disk_path, 1).unwrap();
 
         assert!(disk_path.exists());
-        assert_eq!(disk.size_gb(), 1);
+        assert_eq!(disk.size_gib(), 1);
         assert!(disk.needs_format());
 
         write_ext4_magic(&disk_path);
@@ -509,7 +472,7 @@ mod tests {
         expand_disk::<Storage>(&disk_path, 2).unwrap();
 
         let disk = StorageDisk::open_or_create_at(&disk_path, 2).unwrap();
-        assert_eq!(disk.size_gb(), 2);
+        assert_eq!(disk.size_gib(), 2);
         let metadata = std::fs::metadata(&disk_path).unwrap();
         assert_eq!(metadata.len(), 2 * BYTES_PER_GIB);
 

@@ -39,14 +39,13 @@ use crate::api::types::{
 use crate::api::validate_command;
 use crate::api::TraceId;
 use crate::config::{RecordState, RestartConfig, VmRecord};
+use crate::data::disk::{Overlay, Storage};
 use crate::data::validate_vm_name;
 use crate::process::{
     is_alive, is_our_process_strict, process_start_time, stop_vm_process, VM_SIGKILL_TIMEOUT,
     VM_SIGTERM_TIMEOUT,
 };
-use crate::storage::{
-    expand_disk, Overlay, Storage, DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB,
-};
+use crate::storage::{expand_disk, DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
 use crate::util::generate_machine_name;
 use crate::Error as SmolvmError;
 

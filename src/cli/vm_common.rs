@@ -1017,10 +1017,9 @@ pub fn resize_vm(
     new_overlay_gb: Option<u64>,
 ) -> smolvm::Result<()> {
     use smolvm::config::RecordState;
+    use smolvm::data::disk::{Overlay, Storage};
     use smolvm::db::SmolvmDb;
-    use smolvm::storage::{
-        expand_disk, Overlay, Storage, DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB,
-    };
+    use smolvm::storage::{expand_disk, DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
 
     // Get VM record from database
     let db = SmolvmDb::open()?;
