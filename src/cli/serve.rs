@@ -30,7 +30,7 @@ API ENDPOINTS:
   DELETE /api/v1/machines/:id         Delete machine
 
 EXAMPLES:
-  smolvm serve start                         Listen on 127.0.0.1:8080 (default)
+  smolvm serve start                         Listen on the default Unix socket
   smolvm serve start -l 0.0.0.0:9000         Listen on all interfaces, port 9000
   smolvm serve start -l /tmp/smol.sock       Listen on a Unix domain socket
   smolvm serve start -v                      Enable verbose logging")]
@@ -55,7 +55,7 @@ pub struct ServeStartCmd {
     #[arg(
         short,
         long,
-        default_value = "127.0.0.1:8080",
+        default_value_t = default_listen_value(),
         value_name = "ADDR:PORT|PATH"
     )]
     listen: String,
@@ -108,7 +108,7 @@ impl ServeStartCmd {
                     addr.ip()
                 );
                 eprintln!("         The API has no authentication - any network client can control this host.");
-                eprintln!("         Consider using --listen 127.0.0.1:8080 for local-only access.");
+                eprintln!("         Consider using the default Unix socket or --listen 127.0.0.1:8080 for local-only access.");
             }
         }
 
@@ -222,6 +222,18 @@ impl ListenTarget {
                 format!("invalid address '{}': expected ADDR:PORT", value),
             ))
         }
+    }
+}
+
+fn default_listen_value() -> String {
+    #[cfg(unix)]
+    {
+        String::from("/var/run/smolvm.sock")
+    }
+
+    #[cfg(not(unix))]
+    {
+        String::from("127.0.0.1:8080")
     }
 }
 

@@ -6,8 +6,11 @@
 //! # Example
 //!
 //! ```bash
-//! # Start the server
-//! smolvm serve --listen 127.0.0.1:8080
+//! # Start the server on the default Unix socket
+//! smolvm serve start
+//!
+//! # Or start the server on TCP explicitly
+//! smolvm serve start --listen 127.0.0.1:8080
 //!
 //! # Create a machine
 //! curl -X POST http://localhost:8080/api/v1/machines \
