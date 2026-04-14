@@ -678,6 +678,114 @@ test_from_vm_cleanup() {
 }
 
 # =============================================================================
+# Case-Insensitive Collision Test (macOS regression)
+#
+# Regression test for macOS case-insensitive APFS. Linux OCI layers may
+# contain paths that differ only in case (e.g., "gdebi" script vs "GDebi/"
+# directory). On case-insensitive macOS, these collide during host-side layer
+# extraction and previously caused a fatal "failed to unpack" error.
+#
+# This test builds a minimal Docker image with intentional case-conflicting
+# paths, pushes it to a local registry, packs it, and verifies the packed
+# binary runs successfully.
+# =============================================================================
+
+test_pack_case_collision() {
+    if [[ "$(uname)" != "Darwin" ]]; then
+        echo "SKIP: case-insensitive collision test only relevant on macOS"
+        return 0
+    fi
+
+    # Check if docker is available
+    if ! command -v docker >/dev/null 2>&1; then
+        echo "SKIP: docker not installed"
+        return 0
+    fi
+
+    local img_tag="smolvm-case-test:latest"
+    local registry_port=5051
+    local registry_name="smolvm-test-registry-$$"
+    local registry_img="localhost:${registry_port}/smolvm-case-test:latest"
+    local output="$TEST_DIR/test-case-collision"
+
+    # 1. Build a minimal image with case-conflicting paths.
+    # Creates both "mymod" (file) and "MyMod/" (directory) under /usr/share/pkg/ —
+    # these are identical on case-insensitive APFS.
+    local dockerfile_dir
+    dockerfile_dir=$(mktemp -d)
+    cat > "$dockerfile_dir/Dockerfile" <<'DOCKERFILE'
+FROM alpine:latest
+RUN mkdir -p /usr/share/pkg/MyMod && \
+    echo '#!/bin/sh' > /usr/share/pkg/mymod && \
+    chmod +x /usr/share/pkg/mymod && \
+    echo 'print("init")' > /usr/share/pkg/MyMod/__init__.py && \
+    echo 'print("module")' > /usr/share/pkg/MyMod/Core.py
+DOCKERFILE
+
+    echo "  Building test image with case-conflicting paths..."
+    docker build --platform linux/arm64 -t "$img_tag" "$dockerfile_dir" >/dev/null 2>&1 || {
+        echo "SKIP: docker build failed"
+        rm -rf "$dockerfile_dir"
+        return 0
+    }
+    rm -rf "$dockerfile_dir"
+
+    # 2. Start a temporary local registry to push the image to.
+    echo "  Starting temporary registry on port $registry_port..."
+    docker run -d -p "${registry_port}:5000" --name "$registry_name" registry:2 >/dev/null 2>&1 || {
+        echo "SKIP: could not start local registry"
+        return 0
+    }
+
+    # Ensure cleanup on exit (registry container + image)
+    local cleanup_done=false
+    cleanup_case_test() {
+        if [[ "$cleanup_done" == "true" ]]; then return; fi
+        cleanup_done=true
+        docker stop "$registry_name" >/dev/null 2>&1 || true
+        docker rm "$registry_name" >/dev/null 2>&1 || true
+        docker rmi "$img_tag" "$registry_img" >/dev/null 2>&1 || true
+    }
+    trap cleanup_case_test RETURN
+
+    # 3. Push to the local registry.
+    docker tag "$img_tag" "$registry_img" >/dev/null 2>&1
+    docker push "$registry_img" >/dev/null 2>&1 || {
+        echo "SKIP: could not push to local registry"
+        cleanup_case_test
+        return 0
+    }
+
+    # 4. Pack the image.
+    echo "  Packing image from local registry..."
+    $SMOLVM pack create --image "$registry_img" -o "$output" 2>&1 || {
+        echo "FAIL: pack create failed"
+        cleanup_case_test
+        return 1
+    }
+
+    [[ -f "$output" ]] || { echo "FAIL: packed binary not created"; return 1; }
+    [[ -f "$output.smolmachine" ]] || { echo "FAIL: sidecar not created"; return 1; }
+
+    # 5. Run the packed binary — this is the critical test.
+    # Previously this failed with: "failed to unpack .../GDebi"
+    # Verify BOTH case-conflicting paths exist in the guest filesystem.
+    # Just proving "echo works" is not enough — we need to confirm the
+    # image contents are faithful (both mymod file AND MyMod/ directory).
+    echo "  Running packed binary (verifying filesystem fidelity)..."
+    local result
+    result=$(run_with_timeout 60 "$output" run -- /bin/sh -c \
+        "test -f /usr/share/pkg/mymod && test -d /usr/share/pkg/MyMod && test -f /usr/share/pkg/MyMod/__init__.py && echo 'case-fidelity-ok'" 2>&1)
+    local exit_code=$?
+
+    [[ $exit_code -eq 124 ]] && { echo "TIMEOUT: packed binary hung"; return 1; }
+    [[ "$result" == *"case-fidelity-ok"* ]] || {
+        echo "FAIL: case-conflicting paths not preserved in guest. Output: $result"
+        return 1
+    }
+}
+
+# =============================================================================
 # Error Handling Tests
 # =============================================================================
 
@@ -1031,6 +1139,12 @@ echo "Running Error Handling Tests..."
 echo ""
 
 run_test "Pack nonexistent image" test_pack_nonexistent_image || true
+
+echo ""
+echo "Running Case-Insensitive Collision Tests (macOS)..."
+echo ""
+
+run_test "Pack image with case-conflicting paths" test_pack_case_collision || true
 
 if [[ "$QUICK_MODE" != "true" ]]; then
     echo ""

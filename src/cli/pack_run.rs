@@ -283,7 +283,9 @@ impl PackRunCmd {
         //    directory that survives PID reuse and abrupt termination.
         let rootfs_path = cache_dir.join("agent-rootfs");
         let lib_dir = resolve_lib_dir(&cache_dir, self.debug)?;
-        let layers_dir = cache_dir.join("layers");
+        let layers_lease = extract::acquire_layers_lease(&cache_dir, self.debug)
+            .map_err(|e| Error::agent("acquire layers lease", e.to_string()))?;
+        let layers_dir = &layers_lease.path;
         let runtime_parent = cache_dir.join("runtime");
         std::fs::create_dir_all(&runtime_parent)
             .map_err(|e| Error::agent("create runtime parent", e.to_string()))?;
@@ -293,13 +295,17 @@ impl PackRunCmd {
         let storage_path = runtime_dir.path().join("storage.ext4");
         let vsock_path = runtime_dir.path().join("agent.sock");
 
+        // Compute auto-sized storage before creating the disk so both the
+        // disk file and VmResources use the same value.
+        let storage_gib = storage_gib_for_manifest(self.storage, &manifest);
+
         // Create storage disk (each invocation gets its own copy)
         let template = manifest
             .assets
             .storage_template
             .as_ref()
             .map(|t| t.path.as_str());
-        extract::create_or_copy_storage_disk(&cache_dir, template, &storage_path, self.storage)
+        extract::create_or_copy_storage_disk(&cache_dir, template, &storage_path, storage_gib)
             .map_err(|e| Error::agent("create storage disk", e.to_string()))?;
 
         let overlay_runtime_path = setup_vm_overlay(
@@ -316,8 +322,8 @@ impl PackRunCmd {
         let resources = VmResources {
             cpus: self.cpus.unwrap_or(manifest.cpus),
             memory_mib: self.mem.unwrap_or(manifest.mem),
-            network: self.net || !self.port.is_empty(),
-            storage_gib: storage_gib_for_manifest(self.storage, &manifest),
+            network: self.net || manifest.network || !self.port.is_empty(),
+            storage_gib,
             overlay_gib: self.overlay,
             allowed_cidrs: None,
         };
@@ -355,7 +361,7 @@ impl PackRunCmd {
                 rootfs_path: &rootfs_path,
                 storage_path: &storage_path,
                 vsock_socket: &vsock_path_clone,
-                layers_dir: &layers_dir,
+                layers_dir,
                 mounts: &packed_mounts,
                 port_mappings: &port_mappings,
                 resources,
@@ -433,6 +439,7 @@ impl PackRunCmd {
 
         // std::process::exit skips destructors, so drop explicitly first.
         drop(child_guard);
+        drop(layers_lease); // releases layers volume lease (detaches if last)
         std::process::exit(exit_code);
     }
 }
@@ -1122,7 +1129,9 @@ fn run_from_cache(
 ) -> smolvm::Result<()> {
     let rootfs_path = cache_dir.join("agent-rootfs");
     let lib_dir = resolve_lib_dir(cache_dir, debug)?;
-    let layers_dir = cache_dir.join("layers");
+    let layers_lease = extract::acquire_layers_lease(cache_dir, debug)
+        .map_err(|e| Error::agent("acquire layers lease", e.to_string()))?;
+    let layers_dir = &layers_lease.path;
     let runtime_parent = cache_dir.join("runtime");
     std::fs::create_dir_all(&runtime_parent)
         .map_err(|e| Error::agent("create runtime parent", e.to_string()))?;
@@ -1132,12 +1141,14 @@ fn run_from_cache(
     let storage_path = runtime_dir.path().join("storage.ext4");
     let vsock_path = runtime_dir.path().join("agent.sock");
 
+    let storage_gib = storage_gib_for_manifest(args.storage, manifest);
+
     let template = manifest
         .assets
         .storage_template
         .as_ref()
         .map(|t| t.path.as_str());
-    extract::create_or_copy_storage_disk(cache_dir, template, &storage_path, args.storage)
+    extract::create_or_copy_storage_disk(cache_dir, template, &storage_path, storage_gib)
         .map_err(|e| Error::agent("create storage disk", e.to_string()))?;
 
     let overlay_runtime_path = setup_vm_overlay(
@@ -1153,8 +1164,8 @@ fn run_from_cache(
     let resources = VmResources {
         cpus: args.cpus.unwrap_or(manifest.cpus),
         memory_mib: args.mem.unwrap_or(manifest.mem),
-        network: args.net || !args.port.is_empty(),
-        storage_gib: storage_gib_for_manifest(args.storage, manifest),
+        network: args.net || manifest.network || !args.port.is_empty(),
+        storage_gib,
         overlay_gib: args.overlay,
         allowed_cidrs: None,
     };
@@ -1178,7 +1189,7 @@ fn run_from_cache(
             rootfs_path: &rootfs_path,
             storage_path: &storage_path,
             vsock_socket: &vsock_path_clone,
-            layers_dir: &layers_dir,
+            layers_dir,
             mounts: &packed_mounts,
             port_mappings: &port_mappings,
             resources,
@@ -1241,6 +1252,7 @@ fn run_from_cache(
     let exit_code = execute_packed_command(&mut client, manifest, params, &mounts)?;
 
     drop(child_guard);
+    drop(layers_lease);
     std::process::exit(exit_code);
 }
 
@@ -1441,6 +1453,7 @@ fn daemon_start(
     }
 
     // Create storage disk if not exists (preserves existing disk on restart)
+    let storage_gib = storage_gib_for_manifest(args.storage, &manifest);
     let storage_path = daemon.join("storage.ext4");
     if !storage_path.exists() {
         let template = manifest
@@ -1448,7 +1461,7 @@ fn daemon_start(
             .storage_template
             .as_ref()
             .map(|t| t.path.as_str());
-        extract::create_or_copy_storage_disk(&cache_dir, template, &storage_path, args.storage)
+        extract::create_or_copy_storage_disk(&cache_dir, template, &storage_path, storage_gib)
             .map_err(|e| Error::agent("create storage disk", e.to_string()))?;
     }
 
@@ -1470,8 +1483,8 @@ fn daemon_start(
     let resources = VmResources {
         cpus: args.cpus.unwrap_or(manifest.cpus),
         memory_mib: args.mem.unwrap_or(manifest.mem),
-        network: args.net || !args.port.is_empty(),
-        storage_gib: storage_gib_for_manifest(args.storage, &manifest),
+        network: args.net || manifest.network || !args.port.is_empty(),
+        storage_gib,
         overlay_gib: args.overlay,
         allowed_cidrs: None,
     };
@@ -1480,7 +1493,14 @@ fn daemon_start(
 
     let rootfs_path = cache_dir.join("agent-rootfs");
     let lib_dir = resolve_lib_dir(&cache_dir, debug)?;
-    let layers_dir = cache_dir.join("layers");
+    // Use a temporary RAII lease to mount the volume for the launch config.
+    // The persistent daemon lease is created after fork with the real child
+    // PID. If fork fails, the RAII lease cleans up normally. If fork
+    // succeeds, the daemon lease keeps the volume mounted after the RAII
+    // lease drops.
+    let layers_lease = extract::acquire_layers_lease(&cache_dir, debug)
+        .map_err(|e| Error::agent("acquire layers lease", e.to_string()))?;
+    let layers_dir = layers_lease.path.clone();
 
     if debug {
         eprintln!("debug: daemon dir={}", daemon.display());
@@ -1560,6 +1580,12 @@ fn daemon_start(
 
     // Write PID file
     write_daemon_pid(checksum, child_pid, child_start_time)?;
+
+    // Create the persistent daemon lease with the real child PID.
+    // This must happen before the RAII layers_lease drops — otherwise the
+    // volume would be detached between Drop and this call.
+    extract::acquire_daemon_lease(&cache_dir, child_pid, debug)
+        .map_err(|e| Error::agent("acquire daemon lease", e.to_string()))?;
 
     if debug {
         eprintln!("debug: forked VM process with PID {}", child_pid);
@@ -1664,6 +1690,12 @@ fn daemon_stop(checksum: u32, debug: bool) -> smolvm::Result<()> {
     if let Err(e) = std::fs::remove_file(dir.join("agent.sock")) {
         tracing::debug!(error = %e, "cleanup: remove daemon socket");
     }
+
+    // Release the persistent daemon lease. Detaches the case-sensitive
+    // volume if no other leases remain.
+    let cache_dir = extract::get_cache_dir(checksum)
+        .map_err(|e| Error::agent("get cache dir", e.to_string()))?;
+    extract::release_daemon_lease(&cache_dir);
 
     println!("Daemon stopped");
     Ok(())

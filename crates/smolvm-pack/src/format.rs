@@ -323,6 +323,10 @@ pub struct PackManifest {
     #[serde(default)]
     pub image_size: u64,
 
+    /// Whether outbound networking is enabled by default.
+    #[serde(default)]
+    pub network: bool,
+
     /// Host platform this .smolmachine runs on (e.g., "darwin/arm64").
     /// Distinct from `platform` which is the guest architecture (always linux).
     /// Used for registry Image Index resolution.
@@ -406,6 +410,7 @@ impl PackManifest {
             cpus: 1,
             mem: 256,
             image_size: 0,
+            network: false,
             host_platform,
             created: rfc3339_now(),
             smolvm_version: env!("CARGO_PKG_VERSION").to_string(),

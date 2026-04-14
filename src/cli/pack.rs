@@ -309,6 +309,7 @@ impl PackCreateCmd {
         manifest.image_size = image_info.size;
         manifest.cpus = pack_config.cpus;
         manifest.mem = pack_config.mem;
+        manifest.network = pack_config.net.unwrap_or(false);
 
         // Start with OCI image config as baseline
         manifest.entrypoint = image_info.entrypoint.clone();
@@ -419,6 +420,8 @@ impl PackCreateCmd {
         manifest.mode = PackMode::Vm;
         manifest.cpus = pack_config.cpus;
         manifest.mem = pack_config.mem;
+        // Smolfile > source VM record > default
+        manifest.network = pack_config.net.unwrap_or(vm.network);
 
         // Entrypoint baseline: VmRecord > /bin/sh default
         manifest.entrypoint = if !vm.entrypoint.is_empty() {
@@ -953,6 +956,12 @@ impl PackPruneCmd {
         let mut removed: usize = 0;
 
         for (path, _, size) in to_remove {
+            // Skip caches that have active leases (running VMs or daemons).
+            if smolvm_pack::extract::has_active_leases(path) {
+                println!("  skipping in-use cache: {} (active lease)", path.display());
+                continue;
+            }
+
             if self.dry_run {
                 println!(
                     "  would remove: {} ({})",
@@ -960,6 +969,9 @@ impl PackPruneCmd {
                     crate::cli::format_bytes(*size)
                 );
             } else {
+                // Detach any mounted case-sensitive volume before removing.
+                // Safe because we verified no active leases above.
+                smolvm_pack::extract::force_detach_layers_volume(path);
                 if let Err(e) = std::fs::remove_dir_all(path) {
                     tracing::warn!(error = %e, path = %path.display(), "failed to remove {}", label);
                     continue;
