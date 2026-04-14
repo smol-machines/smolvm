@@ -204,6 +204,9 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         dns_filter_socket,
         packed_layers_dir,
     } = config;
+
+    crate::network::validate_requested_network_backend(resources, None, port_mappings.len())?;
+
     // Raise file descriptor limits
     raise_fd_limits();
 

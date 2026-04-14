@@ -206,6 +206,13 @@ pub fn launch_agent_vm_dynamic(
     krun: &KrunFunctions,
     config: &PackedLaunchConfig,
 ) -> Result<(), String> {
+    crate::network::validate_requested_network_backend(
+        &config.resources,
+        None,
+        config.port_mappings.len(),
+    )
+    .map_err(|e| e.to_string())?;
+
     // Raise file descriptor limits
     raise_fd_limits();
 

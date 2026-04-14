@@ -746,6 +746,7 @@ pub fn resource_spec_to_vm_resources(spec: &ResourceSpec, network: bool) -> VmRe
         cpus: spec.cpus.unwrap_or(DEFAULT_MICROVM_CPU_COUNT),
         memory_mib: spec.memory_mb.unwrap_or(DEFAULT_MICROVM_MEMORY_MIB),
         network,
+        network_backend: None,
         storage_gib: spec.storage_gb,
         overlay_gib: spec.overlay_gb,
         allowed_cidrs: spec.allowed_cidrs.clone(),

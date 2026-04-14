@@ -12,6 +12,7 @@ use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_
 use smolvm::data::storage::HostMount;
 use smolvm::data::validate_vm_name;
 use smolvm::db::SmolvmDb;
+use smolvm::network::NetworkBackend;
 use smolvm::storage::{DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
 
 // ============================================================================
@@ -300,6 +301,7 @@ pub struct CreateVmParams {
     pub volume: Vec<String>,
     pub port: Vec<PortMapping>,
     pub net: bool,
+    pub network_backend: Option<NetworkBackend>,
     pub init: Vec<String>,
     pub env: Vec<String>,
     pub workdir: Option<String>,
@@ -373,6 +375,7 @@ pub fn create_vm(params: CreateVmParams) -> smolvm::Result<()> {
     record.storage_gb = params.storage_gb;
     record.overlay_gb = params.overlay_gb;
     record.allowed_cidrs = params.allowed_cidrs.clone();
+    record.network_backend = params.network_backend;
     record.image = params.image.clone();
     record.entrypoint = params.entrypoint.clone();
     record.cmd = params.cmd.clone();
@@ -641,8 +644,10 @@ pub fn persist_default_running(
                 r.mounts = o.mounts.clone();
                 r.ports = o.ports.clone();
                 r.network = o.network;
+                r.network_backend = o.network_backend;
                 r.storage_gb = o.storage_gb;
                 r.overlay_gb = o.overlay_gb;
+                r.allowed_cidrs = o.allowed_cidrs.clone();
                 r.init = o.init.clone();
                 r.env = o.env.clone();
                 r.workdir = o.workdir.clone();
@@ -650,6 +655,7 @@ pub fn persist_default_running(
                 r.entrypoint = o.entrypoint.clone();
                 r.cmd = o.cmd.clone();
                 r.ssh_agent = o.ssh_agent;
+                r.dns_filter_hosts = o.dns_filter_hosts.clone();
             }
         })
         .is_none()
@@ -665,8 +671,10 @@ pub struct DefaultVmOverrides {
     pub mounts: Vec<(String, String, bool)>,
     pub ports: Vec<(u16, u16)>,
     pub network: bool,
+    pub network_backend: Option<NetworkBackend>,
     pub storage_gb: Option<u64>,
     pub overlay_gb: Option<u64>,
+    pub allowed_cidrs: Option<Vec<String>>,
     pub init: Vec<String>,
     pub env: Vec<(String, String)>,
     pub workdir: Option<String>,
@@ -674,6 +682,7 @@ pub struct DefaultVmOverrides {
     pub entrypoint: Vec<String>,
     pub cmd: Vec<String>,
     pub ssh_agent: bool,
+    pub dns_filter_hosts: Option<Vec<String>>,
 }
 
 /// Check if any running VM already binds to the same host ports.

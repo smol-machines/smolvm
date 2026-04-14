@@ -16,6 +16,7 @@ use smolvm::agent::launcher_dynamic::{
 use smolvm::agent::{AgentClient, RunConfig, VmResources};
 use smolvm::data::network::PortMapping;
 use smolvm::data::storage::HostMount;
+use smolvm::network::{validate_requested_network_backend, NetworkBackend};
 use smolvm::Error;
 use smolvm::DEFAULT_SHELL_CMD;
 use smolvm_pack::detect::PackedMode;
@@ -162,6 +163,15 @@ pub struct PackRunCmd {
     #[arg(long, help_heading = "Network")]
     pub net: bool,
 
+    /// Select the networking backend.
+    #[arg(
+        long = "net-backend",
+        value_enum,
+        hide = true,
+        help_heading = "Network"
+    )]
+    pub net_backend: Option<NetworkBackend>,
+
     /// Number of virtual CPUs (overrides manifest default)
     #[arg(long, value_name = "N", help_heading = "Resources")]
     pub cpus: Option<u8>,
@@ -298,10 +308,12 @@ impl PackRunCmd {
             cpus: self.cpus.unwrap_or(manifest.cpus),
             memory_mib: self.mem.unwrap_or(manifest.mem),
             network: self.net || manifest.network || !self.port.is_empty(),
+            network_backend: self.net_backend,
             storage_gib,
             overlay_gib: self.overlay,
             allowed_cidrs: None,
         };
+        validate_requested_network_backend(&resources, None, self.port.len())?;
 
         // Build packed mounts for the launcher
         let packed_mounts = mounts_to_packed(&mounts);
@@ -841,6 +853,10 @@ struct PackedRunArgs {
     #[arg(long)]
     net: bool,
 
+    /// Select the networking backend.
+    #[arg(long = "net-backend", value_enum, hide = true)]
+    net_backend: Option<NetworkBackend>,
+
     /// Number of vCPUs (overrides default)
     #[arg(long, value_name = "N")]
     cpus: Option<u8>,
@@ -888,6 +904,10 @@ struct PackedStartArgs {
     /// Enable outbound network access
     #[arg(long)]
     net: bool,
+
+    /// Select the networking backend.
+    #[arg(long = "net-backend", value_enum, hide = true)]
+    net_backend: Option<NetworkBackend>,
 }
 
 /// Arguments for the `exec` subcommand (run in existing VM).
@@ -1014,6 +1034,7 @@ fn run_ephemeral(
                 volume: args.volume,
                 port: args.port,
                 net: args.net,
+                net_backend: args.net_backend,
                 cpus: args.cpus,
                 mem: args.mem,
                 storage: args.storage,
@@ -1138,15 +1159,16 @@ fn run_from_cache(
 
     let mounts = HostMount::parse(&args.volume)?;
     let port_mappings = PortMapping::to_tuples(&args.port);
-
     let resources = VmResources {
         cpus: args.cpus.unwrap_or(manifest.cpus),
         memory_mib: args.mem.unwrap_or(manifest.mem),
         network: args.net || manifest.network || !args.port.is_empty(),
+        network_backend: args.net_backend,
         storage_gib,
         overlay_gib: args.overlay,
         allowed_cidrs: None,
     };
+    validate_requested_network_backend(&resources, None, args.port.len())?;
 
     let packed_mounts = mounts_to_packed(&mounts);
 
@@ -1460,15 +1482,16 @@ fn daemon_start(
     // Parse CLI args
     let mounts = HostMount::parse(&args.volume)?;
     let port_mappings = PortMapping::to_tuples(&args.port);
-
     let resources = VmResources {
         cpus: args.cpus.unwrap_or(manifest.cpus),
         memory_mib: args.mem.unwrap_or(manifest.mem),
         network: args.net || manifest.network || !args.port.is_empty(),
+        network_backend: args.net_backend,
         storage_gib,
         overlay_gib: args.overlay,
         allowed_cidrs: None,
     };
+    validate_requested_network_backend(&resources, None, args.port.len())?;
 
     let packed_mounts = mounts_to_packed(&mounts);
 
