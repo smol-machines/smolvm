@@ -665,7 +665,7 @@ impl RunCmd {
                     )?
                 } else {
                     let (exit_code, stdout, stderr) =
-                        client.vm_exec(command, env, params.workdir.clone(), None)?;
+                        client.vm_exec(command, env, params.workdir.clone(), self.timeout)?;
                     if !stdout.is_empty() {
                         print!("{}", stdout);
                     }

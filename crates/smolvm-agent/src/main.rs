@@ -168,6 +168,18 @@ fn main() {
     // before this point, ensure_storage_mounted() handles the mount on demand.
     ensure_storage_mounted();
 
+    // Create /workspace symlink for bare VMs. Image-based VMs get /workspace
+    // via a bind mount in the container spec, but bare VMs run directly in the
+    // VM rootfs where /workspace doesn't exist. The symlink makes /workspace
+    // available in both modes.
+    {
+        let workspace_link = std::path::Path::new("/workspace");
+        let workspace_target = std::path::Path::new("/storage/workspace");
+        if !workspace_link.exists() && workspace_target.exists() {
+            let _ = std::os::unix::fs::symlink(workspace_target, workspace_link);
+        }
+    }
+
     // Initialize packed layers support (if SMOLVM_PACKED_LAYERS env var is set)
     let t0 = uptime_ms();
     if let Some(packed_dir) = storage::get_packed_layers_dir() {

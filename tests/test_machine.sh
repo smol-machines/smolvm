@@ -963,6 +963,19 @@ test_machine_run_timeout() {
     [[ "$output" == *"timed out"* ]] || [[ "$output" == *"Killed"* ]] || [[ $? -ne 0 ]]
 }
 
+# Regression: /workspace must exist on bare VMs (not just image-based).
+test_bare_vm_workspace() {
+    ensure_machine_running
+    local output
+    output=$($SMOLVM machine exec -- ls -d /workspace 2>&1)
+    [[ "$output" == *"/workspace"* ]] || { echo "FAIL: /workspace missing on bare VM"; return 1; }
+
+    # Write and read back
+    $SMOLVM machine exec -- sh -c 'echo ws-bare > /workspace/bare.txt' 2>&1 || return 1
+    output=$($SMOLVM machine exec -- cat /workspace/bare.txt 2>&1)
+    [[ "$output" == *"ws-bare"* ]]
+}
+
 test_machine_run_pipeline() {
     local output
     output=$($SMOLVM machine run --net --image alpine:latest -- sh -c "echo 'hello world' | wc -w" 2>&1)
@@ -1055,6 +1068,7 @@ run_test "Machine run: volume readonly" test_machine_run_volume_readonly || true
 run_test "Machine run: workdir" test_machine_run_workdir || true
 run_test "Machine run: detached" test_machine_run_detached || true
 run_test "Machine run: timeout" test_machine_run_timeout || true
+run_test "Bare VM: /workspace exists" test_bare_vm_workspace || true
 run_test "Machine images" test_machine_images || true
 run_test "Machine prune --dry-run" test_machine_prune_dry_run || true
 
