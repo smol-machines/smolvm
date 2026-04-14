@@ -349,6 +349,13 @@ pub struct CreateMachineRequest {
     /// Allowed egress CIDR ranges.
     #[serde(default)]
     pub allowed_cidrs: Option<Vec<String>>,
+    /// OCI image reference (e.g., "alpine:latest"). Mutually exclusive with `from`.
+    #[serde(default)]
+    pub image: Option<String>,
+    /// Path to a .smolmachine sidecar file. Creates the machine from pre-packed
+    /// layers instead of pulling from a registry. Mutually exclusive with `image`.
+    #[serde(default)]
+    pub from: Option<String>,
 }
 
 /// Request to execute a command in a machine.

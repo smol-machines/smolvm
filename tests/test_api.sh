@@ -391,4 +391,92 @@ test_health_enriched() {
 run_test "Prometheus: /metrics endpoint" test_metrics_endpoint || true
 run_test "Health: enriched response" test_health_enriched || true
 
+# =============================================================================
+# Create from .smolmachine via API
+# =============================================================================
+
+test_api_create_from_smolmachine() {
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    local pack_output="$tmpdir/api-from-pack"
+
+    # Pack alpine
+    $SMOLVM pack create --image alpine:latest -o "$pack_output" --cpus 1 --mem 512 2>&1 >/dev/null || {
+        echo "SKIP: pack create failed"
+        rm -rf "$tmpdir"
+        return 0
+    }
+    local sidecar
+    sidecar=$(cd "$tmpdir" && pwd)/api-from-pack.smolmachine
+    [[ -f "$sidecar" ]] || { echo "FAIL: no sidecar"; rm -rf "$tmpdir"; return 1; }
+
+    local vm_name="api-from-$$"
+
+    # Create via API with from field
+    local create_resp
+    create_resp=$(curl -s -X POST "$API_URL/api/v1/machines" \
+        -H "Content-Type: application/json" \
+        -d "{\"name\": \"$vm_name\", \"from\": \"$sidecar\", \"memoryMb\": 512}")
+    echo "$create_resp" | grep -q "$vm_name" || {
+        echo "FAIL: create response missing name: $create_resp"
+        rm -rf "$tmpdir"; return 1
+    }
+
+    # Start
+    local start_resp
+    start_resp=$(curl -s -X POST "$API_URL/api/v1/machines/$vm_name/start")
+    echo "$start_resp" | grep -q "running" || {
+        echo "FAIL: start failed: $start_resp"
+        curl -s -X DELETE "$API_URL/api/v1/machines/$vm_name" >/dev/null
+        rm -rf "$tmpdir"; return 1
+    }
+
+    # Exec
+    local exec_resp
+    exec_resp=$(curl -s -X POST "$API_URL/api/v1/machines/$vm_name/exec" \
+        -H "Content-Type: application/json" \
+        -d '{"command": ["echo", "api-from-ok"]}')
+    echo "$exec_resp" | grep -q "api-from-ok" || {
+        echo "FAIL: exec failed: $exec_resp"
+        curl -s -X POST "$API_URL/api/v1/machines/$vm_name/stop" >/dev/null
+        curl -s -X DELETE "$API_URL/api/v1/machines/$vm_name" >/dev/null
+        rm -rf "$tmpdir"; return 1
+    }
+
+    # Cleanup
+    curl -s -X POST "$API_URL/api/v1/machines/$vm_name/stop" >/dev/null
+    curl -s -X DELETE "$API_URL/api/v1/machines/$vm_name" >/dev/null
+    rm -rf "$tmpdir"
+}
+
+test_api_from_and_image_conflict() {
+    local resp
+    resp=$(curl -s -X POST "$API_URL/api/v1/machines" \
+        -H "Content-Type: application/json" \
+        -d '{"from": "/tmp/test.smolmachine", "image": "alpine"}')
+    echo "$resp" | grep -q "mutually exclusive" || {
+        echo "FAIL: expected conflict error: $resp"
+        return 1
+    }
+}
+
+test_api_from_nonexistent_sidecar() {
+    local resp
+    resp=$(curl -s -X POST "$API_URL/api/v1/machines" \
+        -H "Content-Type: application/json" \
+        -d '{"from": "/nonexistent/file.smolmachine"}')
+    echo "$resp" | grep -q "not found" || {
+        echo "FAIL: expected not found error: $resp"
+        return 1
+    }
+}
+
+echo ""
+echo "--- Create from .smolmachine via API ---"
+echo ""
+
+run_test "API: create from .smolmachine" test_api_create_from_smolmachine || true
+run_test "API: from + image conflict" test_api_from_and_image_conflict || true
+run_test "API: from nonexistent sidecar" test_api_from_nonexistent_sidecar || true
+
 print_summary "HTTP API Tests"

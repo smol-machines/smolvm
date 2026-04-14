@@ -52,6 +52,18 @@ pub struct MachineRegistration {
     pub restart: RestartConfig,
     /// Whether outbound network access is enabled.
     pub network: bool,
+    /// OCI image reference (e.g., "alpine:latest").
+    pub image: Option<String>,
+    /// Path to .smolmachine sidecar this machine was created from.
+    pub source_smolmachine: Option<String>,
+    /// Container entrypoint (from manifest).
+    pub entrypoint: Vec<String>,
+    /// Container cmd (from manifest).
+    pub cmd: Vec<String>,
+    /// Environment variables (from manifest).
+    pub env: Vec<(String, String)>,
+    /// Working directory (from manifest).
+    pub workdir: Option<String>,
 }
 
 /// RAII guard for machine name reservation.
@@ -454,6 +466,12 @@ impl ApiState {
         );
         record.storage_gb = reg.resources.storage_gb;
         record.overlay_gb = reg.resources.overlay_gb;
+        record.image = reg.image;
+        record.source_smolmachine = reg.source_smolmachine;
+        record.entrypoint = reg.entrypoint;
+        record.cmd = reg.cmd;
+        record.env = reg.env;
+        record.workdir = reg.workdir;
 
         // Use insert_vm_if_not_exists for atomic database insert
         match self.db.insert_vm_if_not_exists(&name, &record) {

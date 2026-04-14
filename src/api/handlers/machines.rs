@@ -198,6 +198,13 @@ pub async fn create_machine(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<CreateMachineRequest>,
 ) -> Result<Json<MachineInfo>, ApiError> {
+    // Validate: --from and --image are mutually exclusive
+    if req.from.is_some() && req.image.is_some() {
+        return Err(ApiError::BadRequest(
+            "'from' and 'image' are mutually exclusive".to_string(),
+        ));
+    }
+
     // Generate name if not provided, then validate.
     let name = req.name.clone().unwrap_or_else(generate_machine_name);
     validate_vm_name(&name, "machine name").map_err(ApiError::BadRequest)?;
@@ -206,6 +213,86 @@ pub async fn create_machine(
     for mount_spec in &req.mounts {
         HostMount::try_from(mount_spec).map_err(|e| ApiError::BadRequest(e.to_string()))?;
     }
+
+    // If --from is set, read manifest and extract sidecar
+    let (
+        image,
+        source_smolmachine,
+        entrypoint,
+        cmd,
+        env,
+        workdir,
+        manifest_cpus,
+        manifest_mem,
+        manifest_net,
+    ) = if let Some(ref sidecar_path) = req.from {
+        let path = std::path::Path::new(sidecar_path);
+        if !path.exists() {
+            return Err(ApiError::BadRequest(format!(
+                "sidecar file not found: {}",
+                sidecar_path
+            )));
+        }
+        let manifest = smolvm_pack::packer::read_manifest_from_sidecar(path)
+            .map_err(|e| ApiError::internal(format!("read .smolmachine: {}", e)))?;
+        let footer = smolvm_pack::packer::read_footer_from_sidecar(path)
+            .map_err(|e| ApiError::internal(format!("read sidecar footer: {}", e)))?;
+        let cache_dir = smolvm_pack::extract::get_cache_dir(footer.checksum)
+            .map_err(|e| ApiError::internal(format!("get cache dir: {}", e)))?;
+        smolvm_pack::extract::extract_sidecar(path, &cache_dir, &footer, false, false)
+            .map_err(|e| ApiError::internal(format!("extract sidecar: {}", e)))?;
+        let canonical = path
+            .canonicalize()
+            .unwrap_or_else(|_| path.to_path_buf())
+            .to_string_lossy()
+            .into_owned();
+        let env_parsed: Vec<(String, String)> = manifest
+            .env
+            .iter()
+            .filter_map(|e| {
+                e.split_once('=')
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+            })
+            .collect();
+        (
+            Some(manifest.image),
+            Some(canonical),
+            manifest.entrypoint,
+            manifest.cmd,
+            env_parsed,
+            manifest.workdir,
+            manifest.cpus,
+            manifest.mem,
+            manifest.network,
+        )
+    } else {
+        (
+            req.image.clone(),
+            None,
+            vec![],
+            vec![],
+            vec![],
+            None,
+            req.cpus,
+            req.mem,
+            req.network,
+        )
+    };
+
+    // Use manifest defaults if user didn't override
+    let cpus =
+        if req.from.is_some() && req.cpus == crate::data::resources::DEFAULT_MICROVM_CPU_COUNT {
+            manifest_cpus
+        } else {
+            req.cpus
+        };
+    let mem = if req.from.is_some() && req.mem == crate::data::resources::DEFAULT_MICROVM_MEMORY_MIB
+    {
+        manifest_mem
+    } else {
+        req.mem
+    };
+    let network = req.network || manifest_net;
 
     // Reserve the name atomically (prevents concurrent creation)
     let guard = ReservationGuard::new(&state, name.clone())?;
@@ -224,9 +311,9 @@ pub async fn create_machine(
     .map_err(|e| ApiError::internal(format!("task error: {}", e)))??;
 
     let resources = ResourceSpec {
-        cpus: Some(req.cpus),
-        memory_mb: Some(req.mem),
-        network: Some(req.network),
+        cpus: Some(cpus),
+        memory_mb: Some(mem),
+        network: Some(network),
         storage_gb: req.storage_gb,
         overlay_gb: req.overlay_gb,
         allowed_cidrs: req.allowed_cidrs.clone(),
@@ -239,7 +326,13 @@ pub async fn create_machine(
         ports: req.ports.clone(),
         resources: resources.clone(),
         restart: RestartConfig::default(),
-        network: req.network,
+        network,
+        image,
+        source_smolmachine,
+        entrypoint,
+        cmd,
+        env,
+        workdir,
     })?;
 
     // Fetch the persisted record for the response
