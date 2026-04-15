@@ -125,13 +125,14 @@ pub struct VirtioNetworkRuntime {
 /// - `guest_network`: the static guest/gateway addressing and MAC plan for this
 ///   NIC.
 ///
-///
 /// Outcome:
-/// 3 threads are started:
-/// - reader thread, which reads raw Ethernet framesfrom the unix socket and put it into guest_to_host queue
-/// - writer thread, which pops raw Ethernet frames in the host_to_guest queue, and write it to the unix socket
-/// - poll thread, uns the host-side smoltcp gateway/runtime, consumes guest frames, emits response frames,
-/// and handles protocol-specific logic such as DNS forwarding and TCP relay setup
+/// - reader thread: reads raw Ethernet frames from the Unix socket and pushes
+///   them into `guest_to_host`
+/// - writer thread: pops raw Ethernet frames from `host_to_guest` and writes
+///   them back to the Unix socket
+/// - poll thread: runs the host-side smoltcp gateway/runtime, consumes guest
+///   frames, emits response frames, and handles protocol-specific logic such as
+///   DNS forwarding and TCP relay setup
 pub fn start_virtio_network(
     host_fd: RawFd,
     guest_network: GuestNetworkConfig,
@@ -163,18 +164,6 @@ pub fn start_virtio_network(
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::format_network_log_line;
-    use std::time::UNIX_EPOCH;
-
-    #[test]
-    fn formats_timestamped_network_log_prefix() {
-        let line = format_network_log_line(UNIX_EPOCH, "virtio-net: smoke test");
-        assert_eq!(line, "[1970-01-01T00:00:00Z]: virtio-net: smoke test");
-    }
-}
-
 impl Drop for VirtioNetworkRuntime {
     /// Shut down the worker threads in a bounded, cooperative way.
     ///
@@ -186,5 +175,17 @@ impl Drop for VirtioNetworkRuntime {
         if let Some(handle) = self.poll_handle.take() {
             let _ = handle.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_network_log_line;
+    use std::time::UNIX_EPOCH;
+
+    #[test]
+    fn formats_timestamped_network_log_prefix() {
+        let line = format_network_log_line(UNIX_EPOCH, "virtio-net: smoke test");
+        assert_eq!(line, "[1970-01-01T00:00:00Z]: virtio-net: smoke test");
     }
 }

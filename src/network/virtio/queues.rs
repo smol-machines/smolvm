@@ -49,9 +49,6 @@
 //!   -> to_smoltcp.send(payload)
 //!   -> relay_wake.wake()
 //! ```
-//!
-//! There is no direct shell equivalent for the queue side. The `WakePipe`
-//! behaves like a very small eventfd-style signal built from a Unix pipe.
 
 use crossbeam_queue::ArrayQueue;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};

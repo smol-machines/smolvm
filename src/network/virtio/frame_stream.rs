@@ -37,9 +37,6 @@
 //!   <-> NetworkFrameQueues
 //!   <-> VirtioNetworkDevice / smoltcp poll loop
 //! ```
-//!
-//! There is no useful shell equivalent for this file. The nearest mental model
-//! is "a daemon speaking a small binary framing protocol over a Unix socket".
 
 use crate::network::virtio::queues::NetworkFrameQueues;
 use std::io::{self, Read, Write};

@@ -25,10 +25,6 @@
 //! - smoltcp owns the guest-facing TCP state machine
 //! - the relay thread owns the host-facing TCP socket
 //! - channels bridge payloads between them
-//!
-//! There is no shell equivalent for most of this file. The closest analogy is
-//! a tiny per-connection TCP proxy implemented partly in a userspace TCP stack
-//! and partly with normal host sockets.
 
 use crate::network::virtio::queues::WakePipe;
 use crate::network::virtio::virtio_net_log;
