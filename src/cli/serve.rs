@@ -20,7 +20,7 @@ pub enum ServeCmd {
 Machines persist independently of the server - they continue running even if the server stops.
 
 API ENDPOINTS:
-  GET    /health                       Health check
+  GET    /health                      Health check
   POST   /api/v1/machines             Create machine
   GET    /api/v1/machines             List machines
   GET    /api/v1/machines/:id         Get machine status
@@ -30,10 +30,10 @@ API ENDPOINTS:
   DELETE /api/v1/machines/:id         Delete machine
 
 EXAMPLES:
-  smolvm serve start                         Listen on the default Unix socket
-  smolvm serve start -l 0.0.0.0:9000         Listen on all interfaces, port 9000
-  smolvm serve start -l /tmp/smol.sock       Listen on a Unix domain socket
-  smolvm serve start -v                      Enable verbose logging")]
+  smolvm serve start                                Listen on the default Unix socket (unix:///$XDG_RUNTIME_DIR/smolvm.sock)
+  smolvm serve start -l 0.0.0.0:9000                Listen on all interfaces, port 9000
+  smolvm serve start -l unix:///tmp/smol.sock       Listen on a Unix domain socket
+  smolvm serve start -v                             Enable verbose logging")]
     Start(ServeStartCmd),
 
     /// Export OpenAPI specification for SDK generation
@@ -212,7 +212,10 @@ impl ListenTarget {
 
         #[cfg(unix)]
         {
-            Ok(Self::Unix(PathBuf::from(value)))
+            let path = value
+                .strip_prefix("unix://")
+                .unwrap_or(value);
+            Ok(Self::Unix(PathBuf::from(path)))
         }
 
         #[cfg(not(unix))]
@@ -228,11 +231,12 @@ impl ListenTarget {
 fn default_listen_value() -> String {
     #[cfg(unix)]
     {
-        dirs::runtime_dir()
+        let path = dirs::runtime_dir()
             .unwrap_or_else(|| PathBuf::from("/tmp"))
             .join("smolvm.sock")
             .display()
-            .to_string()
+            .to_string();
+        format!("unix://{path}")
     }
 
     #[cfg(not(unix))]
@@ -331,6 +335,19 @@ mod tests {
     #[test]
     fn parse_unix_listen_target() {
         let target = ListenTarget::parse("/tmp/smol.sock").expect("unix target should parse");
+        match target {
+            ListenTarget::Unix(path) => {
+                assert_eq!(path, std::path::PathBuf::from("/tmp/smol.sock"))
+            }
+            ListenTarget::Tcp(addr) => panic!("expected unix, got tcp address {addr}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_unix_listen_target_with_prefix() {
+        let target =
+            ListenTarget::parse("unix:///tmp/smol.sock").expect("unix target should parse");
         match target {
             ListenTarget::Unix(path) => {
                 assert_eq!(path, std::path::PathBuf::from("/tmp/smol.sock"))
