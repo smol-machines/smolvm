@@ -1006,6 +1006,101 @@ test_packed_rbase_auto_storage() {
 }
 
 # =============================================================================
+# Multi-Layer First Exec Performance Regression Test
+#
+# Regression test: images with many layers (e.g., rocker/tidyverse has 20)
+# caused a 16-second first exec because overlayfs multi-lowerdir mount fails
+# on virtiofs-backed layers. The fallback physically merged all layers on
+# every first exec after restart. Fix: pre-merge layers at pack time so the
+# packed binary has a single lowerdir that mounts instantly.
+#
+# Uses python:3.12 (7 layers) — enough to verify multi-layer handling while
+# keeping test time reasonable. The threshold is 5 seconds; the old path
+# took 10-16s, the fixed path takes <1s.
+# =============================================================================
+
+test_multi_layer_first_exec_fast() {
+    local pack_output="$TEST_DIR/test-multilayer"
+    local vm_name="multilayer-perf-$$"
+    local MAX_FIRST_EXEC_SECS=5
+
+    # Pack a multi-layer image (python:3.12 has 7 layers)
+    if [[ ! -f "$pack_output.smolmachine" ]]; then
+        $SMOLVM pack create --image python:3.12 -o "$pack_output" 2>&1 || {
+            echo "SKIP: pack create failed"
+            return 0
+        }
+    fi
+    [[ -f "$pack_output.smolmachine" ]] || { echo "SKIP: no sidecar"; return 0; }
+
+    # Create machine from .smolmachine
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine create "$vm_name" --from "$pack_output.smolmachine" --net 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || {
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+    }
+    sleep 2
+
+    # Time the first exec (the critical measurement)
+    local t_start t_end elapsed
+    t_start=$(python3 -c 'import time; print(time.time())' 2>/dev/null || date +%s)
+    local result
+    result=$($SMOLVM machine exec --name "$vm_name" -- python3 -c "print('fast')" 2>&1)
+    t_end=$(python3 -c 'import time; print(time.time())' 2>/dev/null || date +%s)
+    elapsed=$(python3 -c "print(f'{$t_end - $t_start:.1f}')" 2>/dev/null || echo "?")
+
+    echo "  First exec: ${elapsed}s (threshold: ${MAX_FIRST_EXEC_SECS}s)"
+
+    # Verify it worked
+    [[ "$result" == *"fast"* ]] || {
+        echo "FAIL: exec failed: $result"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+    }
+
+    # Verify it was fast
+    local over_threshold
+    over_threshold=$(python3 -c "print('yes' if $t_end - $t_start > $MAX_FIRST_EXEC_SECS else 'no')" 2>/dev/null || echo "no")
+    if [[ "$over_threshold" == "yes" ]]; then
+        echo "FAIL: first exec took ${elapsed}s (>${MAX_FIRST_EXEC_SECS}s) — multi-layer overlay merge regression?"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+    fi
+
+    # Also verify stop/start doesn't regress
+    $SMOLVM machine stop --name "$vm_name" 2>&1 || true
+    $SMOLVM machine start --name "$vm_name" 2>&1 || {
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+    }
+    sleep 2
+
+    t_start=$(python3 -c 'import time; print(time.time())' 2>/dev/null || date +%s)
+    result=$($SMOLVM machine exec --name "$vm_name" -- python3 -c "print('still-fast')" 2>&1)
+    t_end=$(python3 -c 'import time; print(time.time())' 2>/dev/null || date +%s)
+    elapsed=$(python3 -c "print(f'{$t_end - $t_start:.1f}')" 2>/dev/null || echo "?")
+
+    echo "  After restart: ${elapsed}s"
+
+    [[ "$result" == *"still-fast"* ]] || {
+        echo "FAIL: exec after restart failed: $result"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+    }
+
+    over_threshold=$(python3 -c "print('yes' if $t_end - $t_start > $MAX_FIRST_EXEC_SECS else 'no')" 2>/dev/null || echo "no")
+    if [[ "$over_threshold" == "yes" ]]; then
+        echo "FAIL: exec after restart took ${elapsed}s (>${MAX_FIRST_EXEC_SECS}s)"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+    fi
+
+    # Cleanup
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+}
+
+# =============================================================================
 # Run Tests
 # =============================================================================
 
@@ -1271,6 +1366,7 @@ if [[ "$QUICK_MODE" != "true" ]]; then
     run_test "Pack r-base (large image, streaming export)" test_pack_rbase || true
     run_test "Packed r-base run" test_packed_rbase_run || true
     run_test "Packed r-base auto-sized storage (force-extract)" test_packed_rbase_auto_storage || true
+    run_test "First exec instant on multi-layer .smolmachine" test_multi_layer_first_exec_fast || true
 fi
 
 print_summary "Pack Tests"
