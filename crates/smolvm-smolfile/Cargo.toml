@@ -1,6 +1,6 @@
 [package]
 name = "smolfile"
-version = "0.5.14"
+version = "0.5.15"
 edition = "2021"
 description = "Smolfile specification and parser for smolvm microVM workloads"
 license = "Apache-2.0"
