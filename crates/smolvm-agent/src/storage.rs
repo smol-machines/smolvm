@@ -173,7 +173,10 @@ fn ensure_mount_target_under_root(rootfs: &Path, container_path: &str) -> Result
                 if !meta.is_dir() {
                     return Err(StorageError::ValidationFailed {
                         context: "mount destination".to_string(),
-                        reason: format!("destination component is not a directory: {}", current.display()),
+                        reason: format!(
+                            "destination component is not a directory: {}",
+                            current.display()
+                        ),
                     });
                 }
             }
@@ -2160,11 +2163,12 @@ fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Resul
                 .map_err(|e| StorageError::Internal {
                     message: format!("invalid source: {}", e),
                 })?;
-            let bind_dst = std::ffi::CString::new(target_path.to_string_lossy().as_ref()).map_err(|e| {
-                StorageError::Internal {
-                    message: format!("invalid target: {}", e),
-                }
-            })?;
+            let bind_dst =
+                std::ffi::CString::new(target_path.to_string_lossy().as_ref()).map_err(|e| {
+                    StorageError::Internal {
+                        message: format!("invalid target: {}", e),
+                    }
+                })?;
             // SAFETY: bind mount with MS_BIND flag
             let rc = unsafe {
                 libc::mount(

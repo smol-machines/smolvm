@@ -1596,13 +1596,22 @@ fn normalize_guest_path(path: &str) -> std::result::Result<String, AgentResponse
     for component in p.components() {
         match component {
             std::path::Component::ParentDir => {
-                return Err(invalid_guest_path_error(path, "parent traversal is not allowed"));
+                return Err(invalid_guest_path_error(
+                    path,
+                    "parent traversal is not allowed",
+                ));
             }
             std::path::Component::CurDir => {
-                return Err(invalid_guest_path_error(path, "current-dir segments are not allowed"));
+                return Err(invalid_guest_path_error(
+                    path,
+                    "current-dir segments are not allowed",
+                ));
             }
             std::path::Component::Prefix(_) => {
-                return Err(invalid_guest_path_error(path, "path prefixes are not allowed"));
+                return Err(invalid_guest_path_error(
+                    path,
+                    "path prefixes are not allowed",
+                ));
             }
             std::path::Component::RootDir | std::path::Component::Normal(_) => {}
         }
@@ -1615,7 +1624,11 @@ fn active_persistent_overlay_merged_root() -> Option<std::path::PathBuf> {
     let overlays_dir = std::path::Path::new("/storage/overlays");
     let entries = std::fs::read_dir(overlays_dir).ok()?;
     for entry in entries.flatten() {
-        if !entry.file_name().to_string_lossy().starts_with("persistent-") {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("persistent-")
+        {
             continue;
         }
         let merged = entry.path().join("merged");
@@ -1720,19 +1733,19 @@ fn resolve_guest_io_path_with_roots(
         return Ok(std::path::PathBuf::from(normalized));
     };
 
-    let (target, allowed_root): (std::path::PathBuf, &std::path::Path) =
-        if let Some(relative) = normalized.strip_prefix("/workspace/").or_else(|| {
+    let (target, allowed_root): (std::path::PathBuf, &std::path::Path) = if let Some(relative) =
+        normalized.strip_prefix("/workspace/").or_else(|| {
             if normalized == "/workspace" {
                 Some("")
             } else {
                 None
             }
         }) {
-            (workspace_root.join(relative), workspace_root)
-        } else {
-            let relative = normalized.strip_prefix('/').unwrap_or(&normalized);
-            (overlay_root.join(relative), overlay_root)
-        };
+        (workspace_root.join(relative), workspace_root)
+    } else {
+        let relative = normalized.strip_prefix('/').unwrap_or(&normalized);
+        (overlay_root.join(relative), overlay_root)
+    };
 
     ensure_descendant_after_canonicalize(&target, allowed_root, &normalized, access)?;
     Ok(target)
