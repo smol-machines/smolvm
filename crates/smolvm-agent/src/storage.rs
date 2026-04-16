@@ -11,7 +11,7 @@
 use crate::crun::CrunCommand;
 use crate::oci::{generate_container_id, OciSpec};
 use crate::paths;
-use crate::process::{wait_with_timeout_and_cleanup, WaitResult, TIMEOUT_EXIT_CODE};
+use crate::process::{WaitResult, TIMEOUT_EXIT_CODE};
 use smolvm_protocol::{ImageInfo, OverlayInfo, RegistryAuth, StorageStatus};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -1810,6 +1810,7 @@ pub fn run_command(
     mounts: &[(String, String, bool)],
     timeout_ms: Option<u64>,
     persistent_overlay_id: Option<&str>,
+    client_fd: Option<std::os::unix::io::RawFd>,
 ) -> Result<RunResult> {
     // Validate inputs
     crate::oci::validate_image_reference(image).map_err(StorageError::new)?;
@@ -1860,7 +1861,7 @@ pub fn run_command(
         let container_id = generate_container_id();
 
         // Run with crun
-        let result = run_with_crun(&bundle_path, &container_id, timeout_ms);
+        let result = run_with_crun(&bundle_path, &container_id, timeout_ms, client_fd);
 
         // Note: virtiofs mounts are left in place for reuse
         // They will be cleaned up when the overlay is cleaned up or the VM shuts down
@@ -2037,6 +2038,7 @@ fn run_with_crun(
     bundle_dir: &Path,
     container_id: &str,
     timeout_ms: Option<u64>,
+    client_fd: Option<std::os::unix::io::RawFd>,
 ) -> Result<RunResult> {
     info!(
         container_id = %container_id,
@@ -2063,12 +2065,19 @@ fn run_with_crun(
     // Capture container_id for the cleanup closure
     let cid = container_id.to_string();
 
-    // Wait with timeout, cleaning up container on timeout
-    let result = wait_with_timeout_and_cleanup(&mut child, timeout_ms, || {
-        // Kill and delete the container on timeout
-        let _ = CrunCommand::kill(&cid, "SIGKILL").status();
-        let _ = CrunCommand::delete(&cid, true).status();
-    })?;
+    // Wait with timeout + client liveness, cleaning up container on timeout.
+    // If the client disconnects mid-exec, we kill the container so the agent's
+    // accept loop is free to serve the next request.
+    let result = crate::process::wait_with_timeout_cleanup_and_liveness(
+        &mut child,
+        timeout_ms,
+        client_fd,
+        || {
+            // Kill and delete the container on timeout
+            let _ = CrunCommand::kill(&cid, "SIGKILL").status();
+            let _ = CrunCommand::delete(&cid, true).status();
+        },
+    )?;
 
     // Convert WaitResult to RunResult
     match result {
@@ -2099,6 +2108,21 @@ fn run_with_crun(
                     "{}\ncontainer timed out after {}ms",
                     output.stderr, timeout_ms
                 ),
+            })
+        }
+        WaitResult::ClientDisconnected { output } => {
+            // Client gave up before the container finished. Also clean up the
+            // crun container state so the next exec starts fresh.
+            let _ = CrunCommand::kill(container_id, "SIGKILL").status();
+            let _ = CrunCommand::delete(container_id, true).status();
+            warn!(
+                container_id = %container_id,
+                "container killed — client disconnected"
+            );
+            Ok(RunResult {
+                exit_code: 129, // SIGHUP convention for disconnect
+                stdout: output.stdout,
+                stderr: format!("{}\ncontainer killed: client disconnected", output.stderr),
             })
         }
     }

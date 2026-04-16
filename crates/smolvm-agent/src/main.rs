@@ -1291,9 +1291,25 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
             write_session = None;
         }
 
-        // Handle regular request
-        let response = handle_request(request);
-        send_response(stream, &response)?;
+        // Handle regular request. Pass the stream's fd so long-running
+        // commands (exec, run) can detect client disconnect and kill their
+        // children instead of blocking the accept loop.
+        let client_fd = stream.as_raw_fd();
+        let response = handle_request(request, Some(client_fd));
+
+        // Check for client disconnection BEFORE writing — if the peer is gone,
+        // write_all may succeed (kernel buffers) but the next read_exact would
+        // block forever waiting for bytes that will never arrive. Close the
+        // connection now and let the accept loop pick up the next client.
+        if process::is_peer_closed(client_fd) {
+            debug!("client disconnected during request, closing connection");
+            return Ok(());
+        }
+
+        if let Err(e) = send_response(stream, &response) {
+            debug!(error = %e, "send_response failed (client disconnected?)");
+            return Ok(());
+        }
 
         // Check for shutdown
         if matches!(response, AgentResponse::Ok { .. }) {
@@ -1308,7 +1324,15 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
 }
 
 /// Handle a single non-interactive request.
-fn handle_request(request: AgentRequest) -> AgentResponse {
+///
+/// `client_fd` is the vsock file descriptor of the requesting client. It's
+/// used by long-running handlers (Run, VmExec) to detect when the client
+/// disconnects so the child process can be killed promptly — freeing the
+/// accept loop for the next request instead of waiting for the orphan.
+fn handle_request(
+    request: AgentRequest,
+    client_fd: Option<std::os::unix::io::RawFd>,
+) -> AgentResponse {
     // Ensure storage is mounted for operations that need it.
     // Ping, NetworkTest, VmExec, and Shutdown don't access /storage.
     match &request {
@@ -1433,7 +1457,7 @@ fn handle_request(request: AgentRequest) -> AgentResponse {
             interactive: false,
             tty: false,
             ..
-        } => handle_vm_exec(&command, &env, workdir.as_deref(), timeout_ms),
+        } => handle_vm_exec(&command, &env, workdir.as_deref(), timeout_ms, client_fd),
 
         AgentRequest::VmExec { .. } => {
             // Interactive mode should be handled by handle_interactive_vm_exec
@@ -1461,6 +1485,7 @@ fn handle_request(request: AgentRequest) -> AgentResponse {
             &mounts,
             timeout_ms,
             persistent_overlay_id.as_deref(),
+            client_fd,
         ),
 
         AgentRequest::Run { .. } => {
@@ -2956,6 +2981,7 @@ fn handle_run(
     mounts: &[(String, String, bool)],
     timeout_ms: Option<u64>,
     persistent_overlay_id: Option<&str>,
+    client_fd: Option<std::os::unix::io::RawFd>,
 ) -> AgentResponse {
     info!(image = %image, command = ?command, mounts = ?mounts, timeout_ms = ?timeout_ms, persistent = persistent_overlay_id.is_some(), "running command");
 
@@ -2967,6 +2993,7 @@ fn handle_run(
         mounts,
         timeout_ms,
         persistent_overlay_id,
+        client_fd,
     ) {
         Ok(result) => AgentResponse::Completed {
             exit_code: result.exit_code,
@@ -3223,6 +3250,7 @@ fn handle_vm_exec(
     env: &[(String, String)],
     workdir: Option<&str>,
     timeout_ms: Option<u64>,
+    client_fd: Option<std::os::unix::io::RawFd>,
 ) -> AgentResponse {
     info!(command = ?command, "executing directly in VM");
 
@@ -3245,6 +3273,24 @@ fn handle_vm_exec(
 
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+
+    // Put the child in its own process group so we can signal the whole
+    // tree (e.g., `sh -c 'sleep 30'` — killing sh alone leaves sleep
+    // orphaned and holding the stdout pipe, blocking reader threads).
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                // setsid creates a new session and process group rooted at
+                // this child. killpg(pgid, SIGKILL) later hits all descendants.
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
 
     // Spawn the command
     let mut child = match cmd.spawn() {
@@ -3292,9 +3338,35 @@ fn handle_vm_exec(
         match child.try_wait() {
             Ok(Some(status)) => break status.code().unwrap_or(-1),
             Ok(None) => {
+                // Client disconnected — kill the orphan child so the accept
+                // loop isn't blocked waiting for it. Fixes BUG-12/20: SIGTERM
+                // on the host-side exec client used to leave the agent stuck.
+                if let Some(fd) = client_fd {
+                    if process::is_peer_closed(fd) {
+                        warn!(
+                            pid = child.id(),
+                            "client disconnected during VM exec, killing child group"
+                        );
+                        // Kill the entire process group — `sh -c 'sleep 30'`
+                        // creates child processes that inherit the stdout pipe.
+                        // Killing just `sh` leaves `sleep` holding the pipe,
+                        // blocking the reader threads' EOF. killpg hits them all.
+                        #[cfg(target_os = "linux")]
+                        unsafe {
+                            libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+                        }
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break 129; // SIGHUP convention: killed by disconnect
+                    }
+                }
                 if let Some(deadline) = deadline {
                     if std::time::Instant::now() >= deadline {
-                        warn!("VM exec command timed out, killing process");
+                        warn!("VM exec command timed out, killing process group");
+                        #[cfg(target_os = "linux")]
+                        unsafe {
+                            libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+                        }
                         let _ = child.kill();
                         let _ = child.wait();
                         break 124; // Standard timeout exit code
@@ -3311,7 +3383,8 @@ fn handle_vm_exec(
         }
     };
 
-    // Join reader threads (they'll finish now that the child has exited or been killed)
+    // Join reader threads — they return EOF because the child and all its
+    // descendants in the process group have been killed (pipes closed).
     let stdout = stdout_handle
         .and_then(|h| h.ok())
         .and_then(|h| h.join().ok())

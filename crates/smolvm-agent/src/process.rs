@@ -27,6 +27,53 @@ pub enum WaitResult {
         output: ChildOutput,
         timeout_ms: u64,
     },
+    /// Process was killed because the requesting client disconnected.
+    /// Used to free the accept loop when the client gives up mid-exec.
+    ClientDisconnected { output: ChildOutput },
+}
+
+/// Check whether the peer on `fd` has closed the connection.
+///
+/// Uses `recv(MSG_PEEK | MSG_DONTWAIT)` which is more reliable than `poll()`
+/// on vsock — vsock's poll implementation doesn't always propagate POLLHUP
+/// when the peer closes, but a zero-length peek is the canonical way to
+/// detect half-closed sockets.
+///
+/// Returns `true` if the peer has closed OR the socket is in an error state.
+/// Returns `false` if the socket is still alive OR we can't determine (fail
+/// open — a bogus fd shouldn't cause us to kill a healthy child).
+#[cfg(target_os = "linux")]
+pub fn is_peer_closed(fd: std::os::unix::io::RawFd) -> bool {
+    if fd < 0 {
+        return false;
+    }
+    let mut buf = [0u8; 1];
+    // SAFETY: buf is a valid write target, MSG_PEEK doesn't consume data.
+    let rc = unsafe {
+        libc::recv(
+            fd,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len(),
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    if rc == 0 {
+        // Peer performed orderly shutdown (FIN received).
+        return true;
+    }
+    if rc < 0 {
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        // EAGAIN/EWOULDBLOCK = no data but connection alive → peer still there.
+        // Any other error (ECONNRESET, ENOTCONN, EBADF, etc.) → peer gone.
+        return !matches!(errno, libc::EAGAIN | libc::EWOULDBLOCK);
+    }
+    // rc > 0: there's data in the buffer — connection is alive.
+    false
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn is_peer_closed(_fd: std::os::unix::io::RawFd) -> bool {
+    false
 }
 
 /// Capture stdout and stderr from a child process.
@@ -128,6 +175,27 @@ pub fn wait_with_timeout_and_cleanup<F>(
 where
     F: FnOnce(),
 {
+    wait_with_timeout_cleanup_and_liveness(child, timeout_ms, None, on_timeout)
+}
+
+/// Wait for a child process, killing it if the timeout expires OR if the
+/// requesting client disconnects (indicated by `client_fd`, which is polled
+/// each iteration).
+///
+/// The client-disconnect check is the short-term mitigation for BUG-12/20:
+/// when the host-side exec client is SIGTERM'd or times out, the agent's
+/// accept loop was left blocked on the still-running child. Now we kill the
+/// child as soon as we detect the peer has closed the connection, freeing
+/// the accept loop for the next request.
+pub fn wait_with_timeout_cleanup_and_liveness<F>(
+    child: &mut Child,
+    timeout_ms: Option<u64>,
+    client_fd: Option<std::os::unix::io::RawFd>,
+    on_timeout: F,
+) -> std::io::Result<WaitResult>
+where
+    F: FnOnce(),
+{
     let poll_interval = Duration::from_millis(10);
     let deadline = timeout_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
 
@@ -139,6 +207,17 @@ where
                 return Ok(WaitResult::Completed { exit_code, output });
             }
             Ok(None) => {
+                // Client disconnected — kill the child and return early so
+                // the accept loop can move on to the next request.
+                if let Some(fd) = client_fd {
+                    if is_peer_closed(fd) {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        let output = capture_child_output(child);
+                        return Ok(WaitResult::ClientDisconnected { output });
+                    }
+                }
+
                 if let Some(deadline) = deadline {
                     if Instant::now() >= deadline {
                         // Call custom cleanup before killing

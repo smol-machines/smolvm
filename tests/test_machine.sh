@@ -142,6 +142,114 @@ test_machine_exec_failed_does_not_kill_vm() {
     [[ "$output" == *"still-alive"* ]]
 }
 
+# Regression test for BUG-12: SIGTERM on the exec client used to leave the
+# agent stuck waiting for the orphan child (e.g., `sleep 30`) to finish,
+# blocking the accept loop. The VM would show "unreachable" and the next
+# exec would wait ~30s for the orphan to exit or trigger a recovery kill.
+#
+# Fix: agent detects client disconnect via recv(MSG_PEEK|MSG_DONTWAIT), kills
+# the child's process group (killpg) to also kill descendants like `sleep`,
+# and closes the connection without looping back to read_exact.
+test_sigterm_during_exec_does_not_stall_vm() {
+    local name="bug12-sigterm-$$"
+    $SMOLVM machine stop --name "$name" 2>/dev/null || true
+    $SMOLVM machine delete "$name" -f 2>/dev/null || true
+    $SMOLVM machine create "$name" 2>&1 | tail -1 || return 1
+    $SMOLVM machine start --name "$name" 2>&1 | tail -1 || {
+        $SMOLVM machine delete "$name" -f 2>/dev/null; return 1
+    }
+    sleep 2
+
+    # Start a long-running exec, then SIGTERM the client mid-flight.
+    $SMOLVM machine exec --name "$name" -- sh -c 'sleep 30' &
+    local client_pid=$!
+    sleep 3
+    kill -TERM "$client_pid" 2>/dev/null
+    wait "$client_pid" 2>/dev/null
+    # Give the agent's 10ms poll loop a moment to detect the disconnect
+    sleep 1
+
+    # VM must still be reachable. Before the fix, state would be "unreachable"
+    # and the next exec would take ~30s. Time the exec to detect the stall.
+    local t_start t_end elapsed
+    t_start=$(python3 -c 'import time; print(time.time())' 2>/dev/null || date +%s)
+    local result
+    result=$($SMOLVM machine exec --name "$name" -- echo "survived" 2>&1)
+    t_end=$(python3 -c 'import time; print(time.time())' 2>/dev/null || date +%s)
+    elapsed=$(python3 -c "print(f'{$t_end - $t_start:.1f}')" 2>/dev/null || echo "?")
+
+    echo "  Next exec after SIGTERM: ${elapsed}s"
+
+    [[ "$result" == *"survived"* ]] || {
+        echo "FAIL: exec after SIGTERM failed: $result"
+        $SMOLVM machine stop --name "$name" 2>/dev/null
+        $SMOLVM machine delete "$name" -f 2>/dev/null
+        return 1
+    }
+
+    # Must be fast — the old path took ~30s while the orphan sleep finished.
+    local over_threshold
+    over_threshold=$(python3 -c "print('yes' if $t_end - $t_start > 5 else 'no')" 2>/dev/null || echo "no")
+    if [[ "$over_threshold" == "yes" ]]; then
+        echo "FAIL: next exec took ${elapsed}s (>5s) — agent stalled on orphan child?"
+        $SMOLVM machine stop --name "$name" 2>/dev/null
+        $SMOLVM machine delete "$name" -f 2>/dev/null
+        return 1
+    fi
+
+    $SMOLVM machine stop --name "$name" 2>/dev/null || true
+    $SMOLVM machine delete "$name" -f 2>/dev/null || true
+}
+
+# Regression test for BUG-20: `exec --timeout` used to kill not just the
+# child but leave the agent in an unreachable state. Same root cause as
+# BUG-12 — orphan child processes held the stdout pipe. Now killpg hits
+# the whole process group on timeout.
+test_exec_timeout_does_not_stall_vm() {
+    local name="bug20-timeout-$$"
+    $SMOLVM machine stop --name "$name" 2>/dev/null || true
+    $SMOLVM machine delete "$name" -f 2>/dev/null || true
+    $SMOLVM machine create "$name" 2>&1 | tail -1 || return 1
+    $SMOLVM machine start --name "$name" 2>&1 | tail -1 || {
+        $SMOLVM machine delete "$name" -f 2>/dev/null; return 1
+    }
+    sleep 2
+
+    # Short timeout, long-running command with sub-processes — timeout should
+    # kill the whole tree without stalling the agent.
+    local result
+    result=$($SMOLVM machine exec --name "$name" --timeout 2s -- sh -c 'sleep 30' 2>&1)
+    # Exit code 124 = timeout, expected behavior (don't assert — just note)
+
+    # Next exec must be fast. If the agent stalled, this will take ~30s.
+    local t_start t_end elapsed
+    t_start=$(python3 -c 'import time; print(time.time())' 2>/dev/null || date +%s)
+    result=$($SMOLVM machine exec --name "$name" -- echo "alive" 2>&1)
+    t_end=$(python3 -c 'import time; print(time.time())' 2>/dev/null || date +%s)
+    elapsed=$(python3 -c "print(f'{$t_end - $t_start:.1f}')" 2>/dev/null || echo "?")
+
+    echo "  Next exec after timeout: ${elapsed}s"
+
+    [[ "$result" == *"alive"* ]] || {
+        echo "FAIL: exec after timeout failed: $result"
+        $SMOLVM machine stop --name "$name" 2>/dev/null
+        $SMOLVM machine delete "$name" -f 2>/dev/null
+        return 1
+    }
+
+    local over_threshold
+    over_threshold=$(python3 -c "print('yes' if $t_end - $t_start > 5 else 'no')" 2>/dev/null || echo "no")
+    if [[ "$over_threshold" == "yes" ]]; then
+        echo "FAIL: next exec took ${elapsed}s (>5s) — agent stalled after timeout?"
+        $SMOLVM machine stop --name "$name" 2>/dev/null
+        $SMOLVM machine delete "$name" -f 2>/dev/null
+        return 1
+    fi
+
+    $SMOLVM machine stop --name "$name" 2>/dev/null || true
+    $SMOLVM machine delete "$name" -f 2>/dev/null || true
+}
+
 # =============================================================================
 # Named VMs
 # =============================================================================
@@ -1030,6 +1138,8 @@ run_test "Machine start/stop cycle" test_machine_start_stop_cycle || true
 run_test "Machine exec" test_machine_exec || true
 run_test "Machine exec exit code" test_machine_exec_exit_code || true
 run_test "Failed exec does not kill VM" test_machine_exec_failed_does_not_kill_vm || true
+run_test "SIGTERM during exec does not stall VM" test_sigterm_during_exec_does_not_stall_vm || true
+run_test "Exec timeout does not stall VM" test_exec_timeout_does_not_stall_vm || true
 run_test "Named machine" test_machine_named_vm || true
 run_test "Create prints named start hint" test_machine_create_prints_named_start_hint || true
 run_test "Exec when stopped fails" test_machine_exec_when_stopped || true
