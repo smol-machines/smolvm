@@ -42,6 +42,8 @@ toml = "0.8"
 redb = "2"
 libc = "0.2"
 dirs = "5"
+sha2 = "0.10"
+hex = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 humantime = "2"

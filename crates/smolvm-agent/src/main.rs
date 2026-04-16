@@ -3234,8 +3234,8 @@ fn handle_vm_exec_background(
             info!(pid = pid, "background process started");
             AgentResponse::Completed {
                 exit_code: 0,
-                stdout: format!("{}", pid),
-                stderr: String::new(),
+                stdout: format!("{}", pid).into_bytes(),
+                stderr: Vec::new(),
             }
         }
         Err(e) => AgentResponse::error(
@@ -3310,12 +3310,15 @@ fn handle_vm_exec(
     // long-term fix (streaming exec).
     const MAX_OUTPUT: usize = 16 * 1024 * 1024;
 
+    // Use read_to_end (not read_to_string) so binary output (image bytes,
+    // tarballs, any non-UTF-8 data) is preserved through the protocol.
+    // The protocol serializes Vec<u8> as base64 JSON string.
     let stdout_handle = child.stdout.take().map(|out| {
         std::thread::Builder::new()
             .name("exec-stdout".into())
             .spawn(move || {
-                let mut buf = String::new();
-                let _ = out.take(MAX_OUTPUT as u64).read_to_string(&mut buf);
+                let mut buf = Vec::new();
+                let _ = out.take(MAX_OUTPUT as u64).read_to_end(&mut buf);
                 buf
             })
     });
@@ -3324,8 +3327,8 @@ fn handle_vm_exec(
         std::thread::Builder::new()
             .name("exec-stderr".into())
             .spawn(move || {
-                let mut buf = String::new();
-                let _ = err.take(MAX_OUTPUT as u64).read_to_string(&mut buf);
+                let mut buf = Vec::new();
+                let _ = err.take(MAX_OUTPUT as u64).read_to_end(&mut buf);
                 buf
             })
     });

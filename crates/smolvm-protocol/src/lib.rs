@@ -378,10 +378,15 @@ pub enum AgentResponse {
     Completed {
         /// Exit code from the command.
         exit_code: i32,
-        /// Standard output (may be truncated).
-        stdout: String,
+        /// Standard output (may be truncated). `Vec<u8>` preserves binary
+        /// output (image bytes, tarballs, etc.) that would be truncated by
+        /// `String` at the first non-UTF-8 byte. Serialized as base64 JSON
+        /// string — the same format as the streaming `Stdout` variant.
+        #[serde(with = "base64_bytes")]
+        stdout: Vec<u8>,
         /// Standard error (may be truncated).
-        stderr: String,
+        #[serde(with = "base64_bytes")]
+        stderr: Vec<u8>,
     },
 
     /// Command started (interactive mode).

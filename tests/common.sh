@@ -199,16 +199,13 @@ print_summary() {
 }
 
 # Get the data directory for a named machine.
-# Mirrors the logic in src/agent/manager.rs vm_data_dir().
-#   macOS:  ~/Library/Caches/smolvm/vms/<name>
-#   Linux:  ${XDG_CACHE_HOME:-~/.cache}/smolvm/vms/<name>
+#
+# Delegates to `smolvm machine data-dir <name>` so the test helper never
+# duplicates the hash logic. If Rust changes the on-disk layout, the test
+# suite automatically picks it up via this CLI call.
 vm_data_dir() {
     local name="${1:-default}"
-    if [[ "$(uname -s)" == "Darwin" ]]; then
-        echo "$HOME/Library/Caches/smolvm/vms/$name"
-    else
-        echo "${XDG_CACHE_HOME:-$HOME/.cache}/smolvm/vms/$name"
-    fi
+    $SMOLVM machine data-dir "$name" 2>/dev/null
 }
 
 # Cleanup helper - stop machine and remove named "default" from DB

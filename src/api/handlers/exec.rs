@@ -70,8 +70,8 @@ pub async fn exec_command(
 
     Ok(Json(ExecResponse {
         exit_code,
-        stdout,
-        stderr,
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
     }))
 }
 
@@ -210,8 +210,8 @@ pub async fn run_command(
 
     Ok(Json(ExecResponse {
         exit_code,
-        stdout,
-        stderr,
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
     }))
 }
 

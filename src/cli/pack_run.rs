@@ -25,6 +25,7 @@ use smolvm_pack::format::PackMode;
 use smolvm_pack::packer::{
     read_footer_from_sidecar, read_manifest_from_sidecar, verify_sidecar_checksum,
 };
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -727,10 +728,10 @@ fn execute_packed_command(
                 let (exit_code, stdout, stderr) = client.vm_exec(command, env, workdir, timeout)?;
 
                 if !stdout.is_empty() {
-                    print!("{}", stdout);
+                    let _ = std::io::stdout().write_all(&stdout);
                 }
                 if !stderr.is_empty() {
-                    eprint!("{}", stderr);
+                    let _ = std::io::stderr().write_all(&stderr);
                 }
                 crate::cli::flush_output();
                 Ok(exit_code)
@@ -759,10 +760,10 @@ fn execute_packed_command(
                 let (exit_code, stdout, stderr) = client.run_non_interactive(config)?;
 
                 if !stdout.is_empty() {
-                    print!("{}", stdout);
+                    let _ = std::io::stdout().write_all(&stdout);
                 }
                 if !stderr.is_empty() {
-                    eprint!("{}", stderr);
+                    let _ = std::io::stderr().write_all(&stderr);
                 }
                 crate::cli::flush_output();
                 Ok(exit_code)

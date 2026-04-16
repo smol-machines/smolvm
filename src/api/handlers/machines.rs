@@ -7,17 +7,20 @@
 //!
 //! ### Name Length Limit
 //!
-//! Machine names are limited to 40 characters due to Unix domain socket path
-//! length limits (~104 bytes on macOS). The full socket path is:
+//! Machine name length is bounded by the kernel's `sockaddr_un.sun_path`
+//! limit (104 bytes on macOS, 108 on Linux). The full socket path is:
 //!
 //! ```text
 //! ~/Library/Caches/smolvm/vms/{name}/agent.sock
 //! ```
 //!
-//! With a typical macOS home directory path of ~30 chars, a name of 40 chars
-//! results in a socket path of ~90 chars, leaving some margin.
+//! Maximum usable name length therefore depends on the user's home directory.
+//! For a typical macOS home (`/Users/<username>/`, ~20 chars), names can be
+//! 50+ characters. The actual socket path is validated at create time via
+//! [`crate::data::validate_socket_path_fits`] so overly-long names are
+//! rejected with a clear error up front.
 //!
-//! Recommended: Use short, descriptive names (e.g., "dev-vm", "test-1").
+//! Recommended: keep names short and descriptive (e.g., "dev-vm", "test-1").
 
 use axum::{
     extract::{Path, State},
@@ -205,7 +208,10 @@ pub async fn create_machine(
         ));
     }
 
-    // Generate name if not provided, then validate.
+    // Generate name if not provided, then validate. The on-disk layout uses
+    // a hash-derived directory (see `vm_data_dir`) so name length doesn't
+    // affect the socket path — only character sanity + a generous length
+    // cap are needed.
     let name = req.name.clone().unwrap_or_else(generate_machine_name);
     validate_vm_name(&name, "machine name").map_err(ApiError::BadRequest)?;
 
@@ -726,8 +732,8 @@ pub async fn exec_machine(
 
         Ok(ExecResponse {
             exit_code,
-            stdout,
-            stderr,
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
         })
     })
     .await

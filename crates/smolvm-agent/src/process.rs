@@ -13,8 +13,8 @@ pub const TIMEOUT_EXIT_CODE: i32 = 124;
 /// Captured output from a child process.
 #[derive(Debug, Default)]
 pub struct ChildOutput {
-    pub stdout: String,
-    pub stderr: String,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
 }
 
 /// Result of waiting for a child process.
@@ -78,16 +78,16 @@ pub fn is_peer_closed(_fd: std::os::unix::io::RawFd) -> bool {
 
 /// Capture stdout and stderr from a child process.
 ///
-/// This takes ownership of the stdout/stderr handles from the child
-/// and reads them to strings.
+/// Reads raw bytes — preserves binary output (image bytes, tarballs, etc.)
+/// that `read_to_string` would truncate at the first non-UTF-8 byte.
 pub fn capture_child_output(child: &mut Child) -> ChildOutput {
     let mut output = ChildOutput::default();
 
     if let Some(mut stdout) = child.stdout.take() {
-        let _ = stdout.read_to_string(&mut output.stdout);
+        let _ = stdout.read_to_end(&mut output.stdout);
     }
     if let Some(mut stderr) = child.stderr.take() {
-        let _ = stderr.read_to_string(&mut output.stderr);
+        let _ = stderr.read_to_end(&mut output.stderr);
     }
 
     output

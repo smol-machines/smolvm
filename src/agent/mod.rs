@@ -16,7 +16,10 @@ pub use crate::data::resources::VmResources;
 pub use crate::data::storage::HostMount;
 pub use client::{AgentClient, ExecEvent, PullOptions, RunConfig};
 pub use launcher::{find_lib_dir, launch_agent_vm, LaunchConfig, LaunchFeatures, VmDisks};
-pub use manager::{docker_config_dir, docker_config_mount, vm_data_dir, AgentManager, AgentState};
+pub use manager::{
+    docker_config_dir, docker_config_mount, ensure_vm_dir, vm_cache_root, vm_data_dir, vm_dir_hash,
+    AgentManager, AgentState,
+};
 
 /// Agent VM name.
 pub const AGENT_VM_NAME: &str = "smolvm-agent";

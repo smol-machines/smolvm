@@ -159,15 +159,105 @@ struct AgentInner {
 
 /// Get the data directory for a named VM.
 ///
-/// Returns `~/.cache/smolvm/vms/{name}/` (macOS) or equivalent on other platforms.
-/// This is the canonical location for a VM's storage disk, overlay disk, and socket.
+/// Uses a fixed-length hash of the name as the directory name so the socket
+/// path length is constant regardless of the name. This lets us support
+/// arbitrary-length VM names portably across hosts — the kernel's
+/// `sockaddr_un.sun_path` limit (~104 bytes) applies to the full socket
+/// path, and a 16-char hash keeps that path bounded.
+///
+/// Layout: `<cache_dir>/smolvm/vms/<hash16>/`
+///   - `<hash16>` = first 16 hex chars (8 bytes) of SHA-256 of the name
+///   - A plaintext `name` file inside the directory records the original
+///     name. This is load-bearing: [`ensure_vm_dir`] reads it to detect
+///     hash collisions. External tooling can use it for debugging too.
+///
+/// **No legacy fallback, no migration**: smolvm is alpha. VMs created under
+/// any older layout scheme are not readable by this version — users recreate
+/// them. Dual-path support would silently expire VMs when their legacy
+/// name-path exceeds the kernel socket budget, so we don't offer it.
 pub fn vm_data_dir(name: &str) -> PathBuf {
+    vm_cache_root().join(vm_dir_hash(name))
+}
+
+/// Cache root: `<cache_dir>/smolvm/vms/`.
+pub fn vm_cache_root() -> PathBuf {
     dirs::cache_dir()
         .or_else(dirs::data_local_dir)
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join("smolvm")
         .join("vms")
-        .join(name)
+}
+
+/// Compute the 16-hex-char directory name for a VM.
+///
+/// Uses SHA-256 truncated to 8 bytes. The specific hash function doesn't
+/// matter much — we need stability (same input → same output across runs
+/// and hosts) and collision resistance; SHA-256 was already in the dep
+/// tree via smolvm-pack and smolvm-registry.
+///
+/// **Threat model**: 8 bytes = 64 bits. Accidental collisions among
+/// non-adversarial names become likely around 2^32 distinct VMs — not a
+/// concern. Adversarial collisions (an attacker picking a name that
+/// hashes to the same directory as an existing VM) take ~2^32 work, a
+/// few hours on a laptop. This is acceptable for single-user smolvm. A
+/// future multi-tenant deployment (smolcloud) should add per-tenant
+/// namespacing or a longer hash.
+pub fn vm_dir_hash(name: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(name.as_bytes());
+    hex::encode(&digest[..8])
+}
+
+/// Create the VM data directory and commit the `name → hash` binding.
+///
+/// Writes (or verifies) a plaintext `name` file inside the hash directory.
+/// The file is the ground truth for collision detection: if we open a hash
+/// directory whose `name` file doesn't match the requested name, it means
+/// two distinct VMs have hashed to the same directory — a hard error.
+///
+/// Returns the created/verified directory path.
+///
+/// Called from the same paths that create VM storage (manager construction,
+/// agent launch setup). Safe to call repeatedly: the `name` file is written
+/// once and verified on subsequent calls.
+pub fn ensure_vm_dir(name: &str) -> std::io::Result<PathBuf> {
+    ensure_vm_dir_at(&vm_data_dir(name), name)
+}
+
+/// Lower-level form of [`ensure_vm_dir`] that operates on an explicit
+/// directory path. Factored out for testability — callers in production
+/// should use [`ensure_vm_dir`].
+pub fn ensure_vm_dir_at(dir: &std::path::Path, name: &str) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+
+    let name_file = dir.join("name");
+    match std::fs::read_to_string(&name_file) {
+        Ok(existing) if existing == name => {
+            // Already committed — no-op.
+        }
+        Ok(existing) => {
+            // Collision: the hash directory already belongs to a different
+            // name. Refuse with a clear error; silent sharing would corrupt
+            // both VMs' storage.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "VM directory hash collision: requested name '{}' hashes \
+                     to the same directory as existing VM '{}' at {}. \
+                     Rename one of them.",
+                    name,
+                    existing.trim_end(),
+                    dir.display(),
+                ),
+            ));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // First time — write the binding. Done once, never overwritten.
+            std::fs::write(&name_file, name.as_bytes())?;
+        }
+        Err(e) => return Err(e),
+    }
+    Ok(dir.to_path_buf())
 }
 
 /// Agent VM manager.
@@ -321,9 +411,11 @@ impl AgentManager {
         let sg = storage_gb.unwrap_or(crate::storage::DEFAULT_STORAGE_SIZE_GIB);
         let og = overlay_gb.unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GIB);
 
-        // Named VMs get their own storage disk
-        let storage_dir = vm_data_dir(&name);
-        std::fs::create_dir_all(&storage_dir)?;
+        // Named VMs get their own storage disk. `ensure_vm_dir` commits the
+        // name→hash binding on first call and detects collisions on
+        // subsequent calls (refusing to open a hash dir that belongs to a
+        // different name).
+        let storage_dir = ensure_vm_dir(&name)?;
 
         let storage_path = storage_dir.join(crate::storage::STORAGE_DISK_FILENAME);
         let storage_disk = StorageDisk::open_or_create_at(&storage_path, sg)?;
@@ -1532,5 +1624,111 @@ impl Drop for AgentManager {
                 tracing::debug!(error = %e, "failed to stop agent in drop");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vm_dir_hash_is_deterministic() {
+        // Stability guarantee: the same name always maps to the same hash.
+        // Callers rely on this to locate existing VM data across processes.
+        assert_eq!(vm_dir_hash("sandbox-1"), vm_dir_hash("sandbox-1"));
+        assert_eq!(vm_dir_hash("default"), vm_dir_hash("default"));
+    }
+
+    #[test]
+    fn vm_dir_hash_is_16_hex_chars() {
+        let h = vm_dir_hash("anything");
+        assert_eq!(h.len(), 16, "expected 16 hex chars, got {}: {}", h.len(), h);
+        assert!(
+            h.chars().all(|c| c.is_ascii_hexdigit()),
+            "hash contains non-hex chars: {}",
+            h
+        );
+    }
+
+    #[test]
+    fn vm_dir_hash_differs_for_different_names() {
+        assert_ne!(vm_dir_hash("a"), vm_dir_hash("b"));
+        assert_ne!(vm_dir_hash("sandbox-1"), vm_dir_hash("sandbox-2"));
+    }
+
+    #[test]
+    fn vm_data_dir_path_length_is_bounded_regardless_of_name() {
+        // Core correctness property: socket-path overflow is impossible
+        // because the variable section is fixed at 16 chars. A 200-char name
+        // produces the same-length path as a 1-char name. No legacy fallback
+        // means this holds deterministically, regardless of filesystem state.
+        let short = vm_data_dir("x");
+        let long = vm_data_dir(&"a".repeat(200));
+        assert_eq!(
+            short.as_os_str().len(),
+            long.as_os_str().len(),
+            "path length must be independent of name length"
+        );
+    }
+
+    #[test]
+    fn ensure_vm_dir_writes_name_file_on_first_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("abc123");
+        let result = ensure_vm_dir_at(&dir, "my-vm").unwrap();
+        assert_eq!(result, dir);
+        assert_eq!(std::fs::read_to_string(dir.join("name")).unwrap(), "my-vm");
+    }
+
+    #[test]
+    fn ensure_vm_dir_is_idempotent_for_matching_name() {
+        // Second call with the same name must succeed (every machine start,
+        // exec, etc. re-enters this path). Must not touch the name file.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("abc123");
+        ensure_vm_dir_at(&dir, "my-vm").unwrap();
+
+        // Tamper with the mtime semantics: if we were rewriting, we'd clobber
+        // any user edit. Write a sentinel and confirm it survives.
+        let name_file = dir.join("name");
+        let before = std::fs::metadata(&name_file).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        ensure_vm_dir_at(&dir, "my-vm").unwrap();
+        let after = std::fs::metadata(&name_file).unwrap().modified().unwrap();
+        assert_eq!(
+            before, after,
+            "name file must not be rewritten on repeat calls"
+        );
+    }
+
+    #[test]
+    fn ensure_vm_dir_rejects_hash_collision() {
+        // Simulate two distinct VM names hashing to the same directory.
+        // ensure_vm_dir_at is parameterized on the directory so we can
+        // exercise this without needing a real SHA-256 collision.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("collision-dir");
+
+        ensure_vm_dir_at(&dir, "first-vm").unwrap();
+
+        let err = ensure_vm_dir_at(&dir, "second-vm")
+            .expect_err("expected collision error for different name at same dir");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("hash collision"),
+            "error should identify collision: {msg}"
+        );
+        assert!(
+            msg.contains("first-vm") && msg.contains("second-vm"),
+            "error should name both VMs: {msg}"
+        );
+
+        // The name file must still point to the first VM — we must NOT have
+        // clobbered it during the failed attempt.
+        assert_eq!(
+            std::fs::read_to_string(dir.join("name")).unwrap(),
+            "first-vm",
+        );
     }
 }

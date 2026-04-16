@@ -343,13 +343,21 @@ impl PackCreateCmd {
                 None,
             )?;
 
-            if exit_code != 0 || !stdout.contains("MERGE_OK") {
+            // stdout/stderr from vm_exec are now Vec<u8>; convert lossily
+            // for content checks and error messages (merge output is ASCII).
+            let stdout_str = String::from_utf8_lossy(&stdout);
+            let stderr_str = String::from_utf8_lossy(&stderr);
+            if exit_code != 0 || !stdout_str.contains("MERGE_OK") {
                 return Err(Error::agent(
                     "merge layers",
                     format!(
                         "layer merge failed (exit {}): {}",
                         exit_code,
-                        if stderr.is_empty() { &stdout } else { &stderr }
+                        if stderr_str.is_empty() {
+                            &stdout_str
+                        } else {
+                            &stderr_str
+                        }
                     ),
                 ));
             }
@@ -530,7 +538,11 @@ impl PackCreateCmd {
                 if exit_code != 0 {
                     return Err(Error::agent(
                         "mount source storage in temp VM",
-                        format!("mount failed (exit {}): {}", exit_code, stderr),
+                        format!(
+                            "mount failed (exit {}): {}",
+                            exit_code,
+                            String::from_utf8_lossy(&stderr)
+                        ),
                     ));
                 }
 
@@ -600,7 +612,7 @@ impl PackCreateCmd {
                         println!("  Overlay layer: {} bytes", tar_data.len());
                     }
                 } else {
-                    tracing::debug!(stderr = %stderr, "overlay export: no container changes found");
+                    tracing::debug!(stderr = %String::from_utf8_lossy(&stderr), "overlay export: no container changes found");
                 }
 
                 Ok(())
@@ -1174,7 +1186,7 @@ impl PackPruneCmd {
         }
 
         // Sort by most recently modified (newest first)
-        entries.sort_by(|a, b| b.1.cmp(&a.1));
+        entries.sort_by_key(|b| std::cmp::Reverse(b.1));
 
         // Remove entries beyond keep count
         let to_remove = if entries.len() > keep {

@@ -110,7 +110,7 @@ impl EmbeddedRuntime {
         env: Vec<(String, String)>,
         workdir: Option<String>,
         timeout: Option<Duration>,
-    ) -> Result<(i32, String, String)> {
+    ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
         let handle = self.started_handle(name)?;
         let mut handle = lock_handle(&handle)?;
         handle.exec(command, env, workdir, timeout)
@@ -125,7 +125,7 @@ impl EmbeddedRuntime {
         env: Vec<(String, String)>,
         workdir: Option<String>,
         timeout: Option<Duration>,
-    ) -> Result<(i32, String, String)> {
+    ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
         let handle = self.started_handle(name)?;
         let mut handle = lock_handle(&handle)?;
         handle.run(image, command, env, workdir, timeout)

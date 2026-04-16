@@ -42,11 +42,13 @@ impl From<&str> for VmTarget {
     }
 }
 
-/// Maximum VM name length.
+/// Sanity upper bound on VM name length.
 ///
-/// The 40-character limit keeps derived Unix socket paths within the macOS
-/// path length budget used by the runtime.
-pub const MAX_VM_NAME_LENGTH: usize = 40;
+/// The on-disk layout uses a fixed-length hash of the name as the directory
+/// name (see [`crate::agent::vm_data_dir`]), so name length doesn't affect
+/// the socket path or any other filesystem budget. This constant is purely
+/// a UX cap to reject obviously-absurd input (500+ char names).
+pub const MAX_VM_NAME_LENGTH: usize = 128;
 
 /// Validate a persisted VM name.
 pub fn validate_vm_name(name: &str, label: &str) -> Result<(), String> {

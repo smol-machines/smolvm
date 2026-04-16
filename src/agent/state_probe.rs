@@ -148,7 +148,12 @@ fn probe_agent(name: &str) -> bool {
     // Detach immediately — this manager is only used to locate the vsock
     // socket. Without detach, Drop sends Shutdown and kills the VM.
     manager.detach();
-    let Ok(mut client) = AgentClient::connect_with_short_timeout(manager.vsock_socket()) else {
+    // Use a moderate 3s timeout (not the 100ms boot probe) so a busy agent
+    // — e.g., processing a Run request's overlayfs setup or a container
+    // operation — isn't falsely reported as Unreachable. The 100ms timeout
+    // caused `machine ls` / `machine status` to flap to Unreachable any
+    // time the agent happened to be processing another request.
+    let Ok(mut client) = AgentClient::connect_for_state_probe(manager.vsock_socket()) else {
         return false;
     };
     client.ping().is_ok()

@@ -14,6 +14,7 @@ use smolvm::data::validate_vm_name;
 use smolvm::db::SmolvmDb;
 use smolvm::network::NetworkBackend;
 use smolvm::storage::{DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
+use std::io::Write;
 
 // ============================================================================
 // Shared helpers
@@ -158,14 +159,16 @@ fn mark_unreachable_if_zombie(name: &str) {
 pub fn print_output_and_exit(
     manager: &AgentManager,
     exit_code: i32,
-    stdout: &str,
-    stderr: &str,
+    stdout: &[u8],
+    stderr: &[u8],
 ) -> ! {
+    // write_all on raw bytes preserves binary output (image bytes, tarballs,
+    // etc.) that print!("{}", ...) would corrupt or refuse to write.
     if !stdout.is_empty() {
-        print!("{}", stdout);
+        let _ = std::io::stdout().write_all(stdout);
     }
     if !stderr.is_empty() {
-        eprint!("{}", stderr);
+        let _ = std::io::stderr().write_all(stderr);
     }
     crate::cli::flush_output();
     manager.detach();
@@ -226,9 +229,16 @@ pub(crate) fn run_init_commands(
             )?
         };
         if exit_code != 0 {
+            // Init output is generally text — lossy conversion is fine for
+            // error messages. Binary init output isn't a real use case.
             return Err(smolvm::Error::agent(
                 "init",
-                format_init_failure(i, exit_code, &stdout, &stderr),
+                format_init_failure(
+                    i,
+                    exit_code,
+                    &String::from_utf8_lossy(&stdout),
+                    &String::from_utf8_lossy(&stderr),
+                ),
             ));
         }
     }
@@ -325,7 +335,10 @@ pub struct CreateVmParams {
 
 /// Create a named machine configuration (does not start it).
 pub fn create_vm(params: CreateVmParams) -> smolvm::Result<()> {
-    // Validate name before touching the database
+    // Validate name before touching the database. The on-disk layout uses
+    // a hash-derived directory (see `vm_data_dir`), so the name itself has
+    // no impact on socket path length — only character sanity + a generous
+    // length cap are needed here.
     validate_vm_name(&params.name, "machine name")
         .map_err(|reason| smolvm::Error::config("create machine", reason))?;
 
@@ -583,10 +596,10 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
             let (exit_code, stdout, stderr) =
                 client.vm_exec(bare_cmd, env, record.workdir.clone(), None)?;
             if !stdout.is_empty() {
-                print!("{}", stdout);
+                let _ = std::io::stdout().write_all(&stdout);
             }
             if !stderr.is_empty() {
-                eprint!("{}", stderr);
+                let _ = std::io::stderr().write_all(&stderr);
             }
             if exit_code != 0 {
                 eprintln!("workload exited with code {}", exit_code);

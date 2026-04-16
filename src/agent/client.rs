@@ -303,7 +303,7 @@ fn expect_ok(resp: AgentResponse, op: &str) -> Result<()> {
 }
 
 /// Extract exit code, stdout, stderr from a `Completed` response.
-fn expect_completed(resp: AgentResponse, op: &str) -> Result<(i32, String, String)> {
+fn expect_completed(resp: AgentResponse, op: &str) -> Result<(i32, Vec<u8>, Vec<u8>)> {
     match resp {
         AgentResponse::Completed {
             exit_code,
@@ -377,6 +377,15 @@ impl AgentClient {
     /// to detect a ready agent without wasting time on a full 1s timeout.
     pub fn connect_with_short_timeout(socket_path: impl AsRef<Path>) -> Result<Self> {
         Self::connect_with_timeouts_ms(socket_path.as_ref(), 100, 100)
+    }
+
+    /// Connect with a moderate timeout, for state-probe "is this agent alive"
+    /// checks from `machine ls` / `machine status`. 3 seconds is long enough
+    /// to avoid false "unreachable" readings when the agent is momentarily
+    /// busy (e.g., processing a Run request's overlayfs setup), but short
+    /// enough to not make `ls` feel sluggish when the agent is truly dead.
+    pub fn connect_for_state_probe(socket_path: impl AsRef<Path>) -> Result<Self> {
+        Self::connect_with_timeouts_ms(socket_path.as_ref(), 3000, 3000)
     }
 
     /// Connect with a very short timeout for boot-time probe cycles.
@@ -766,26 +775,17 @@ impl AgentClient {
 
     /// Execute a command directly in the VM (not in a container).
     ///
-    /// This runs the command in the agent's Alpine rootfs without any
-    /// container isolation. Useful for VM-level operations and debugging.
-    ///
-    /// # Arguments
-    ///
-    /// * `command` - Command and arguments
-    /// * `env` - Environment variables
-    /// * `workdir` - Working directory in the VM
-    /// * `timeout` - Optional timeout duration
-    ///
-    /// # Returns
-    ///
-    /// A tuple of (exit_code, stdout, stderr)
+    /// Runs the command in the agent's Alpine rootfs without container
+    /// isolation. Returns `(exit_code, stdout_bytes, stderr_bytes)`. Output
+    /// is raw bytes — binary data (image bytes, tarballs) is preserved.
+    /// Callers that need a string can use `String::from_utf8_lossy(&bytes)`.
     pub fn vm_exec(
         &mut self,
         command: Vec<String>,
         env: Vec<(String, String)>,
         workdir: Option<String>,
         timeout: Option<Duration>,
-    ) -> Result<(i32, String, String)> {
+    ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
         let _timeout_guard = self.set_exec_timeout(timeout)?;
         let timeout_ms = timeout.map(|t| t.as_millis() as u64);
 
@@ -826,7 +826,8 @@ impl AgentClient {
         if exit_code != 0 {
             return Err(Error::agent("vm exec background", "spawn failed"));
         }
-        let pid: u32 = stdout
+        // PID output is always ASCII digits — lossy conversion is safe.
+        let pid: u32 = String::from_utf8_lossy(&stdout)
             .trim()
             .parse()
             .map_err(|_| Error::agent("vm exec background", "invalid PID in response"))?;
@@ -1004,7 +1005,7 @@ impl AgentClient {
     /// # Returns
     ///
     /// A tuple of (exit_code, stdout, stderr)
-    pub fn run_non_interactive(&mut self, config: RunConfig) -> Result<(i32, String, String)> {
+    pub fn run_non_interactive(&mut self, config: RunConfig) -> Result<(i32, Vec<u8>, Vec<u8>)> {
         let _timeout_guard = self.set_exec_timeout(config.timeout)?;
         let timeout_ms = config.timeout.map(|t| t.as_millis() as u64);
 

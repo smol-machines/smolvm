@@ -95,6 +95,32 @@ test_machine_exec_echo() {
     [[ "$output" == *"test-marker-xyz"* ]]
 }
 
+# Regression: BUG-23 — binary output from exec was silently truncated at the
+# first non-UTF-8 byte because the protocol serialized stdout as `String`
+# (which requires valid UTF-8). Now uses `Vec<u8>` with base64 serde, and the
+# CLI writes bytes via `write_all` instead of `print!`. This test reads the
+# first 4 bytes of `/bin/busybox` (or another known binary), which begins with
+# the ELF magic `\x7fELF` — the `\x7f` byte would have been rejected by the
+# old path.
+test_machine_exec_binary_output_preserved() {
+    ensure_machine_running
+
+    # Fetch first 4 bytes of /bin/busybox — the ELF magic.
+    # Pipe through xxd to render as hex so we're comparing ASCII strings
+    # (bash can't easily compare binary blobs, but the agent→client→CLI
+    # path is what we're exercising; the xxd happens host-side after the
+    # bytes are already through the protocol).
+    local hex
+    hex=$($SMOLVM machine exec -- head -c 4 /bin/busybox 2>&1 | xxd -p | tr -d '\n')
+
+    # ELF magic: 7f 45 4c 46  (.ELF)
+    # If the 0x7f byte was dropped/replaced, we'd see "454c46" or "efbfbd454c46".
+    [[ "$hex" == "7f454c46" ]] || {
+        echo "expected ELF magic '7f454c46', got '$hex' — binary output corrupted"
+        return 1
+    }
+}
+
 test_machine_exec_exit_code() {
     ensure_machine_running
 
@@ -1136,6 +1162,7 @@ run_test "Machine stop" test_machine_stop || true
 run_test "Machine status (running)" test_machine_status_running || true
 run_test "Machine start/stop cycle" test_machine_start_stop_cycle || true
 run_test "Machine exec" test_machine_exec || true
+run_test "Machine exec: binary output preserved (BUG-23)" test_machine_exec_binary_output_preserved || true
 run_test "Machine exec exit code" test_machine_exec_exit_code || true
 run_test "Failed exec does not kill VM" test_machine_exec_failed_does_not_kill_vm || true
 run_test "SIGTERM during exec does not stall VM" test_sigterm_during_exec_does_not_stall_vm || true
@@ -1272,6 +1299,59 @@ test_resource_mem_below_minimum_rejected() {
     [[ "$output" == *"at least"* ]] || return 1
 }
 
+# Regression: the old 40-char name limit was rejecting reasonable names like
+# "sandbox-<uuid>" (44 chars). The VM data directory is now hash-derived
+# (16 hex chars) so socket path length is constant — names of any length
+# up to the sanity cap are accepted, portably across hosts.
+test_name_length_44_chars_accepted() {
+    local name="sandbox-7f3e2d1c-9a8b-4e5f-b123-456789abcdef"
+    [[ ${#name} -eq 44 ]] || { echo "test bug: expected 44 chars, got ${#name}"; return 1; }
+    $SMOLVM machine delete "$name" -f 2>/dev/null || true
+
+    local output exit_code=0
+    output=$($SMOLVM machine create "$name" 2>&1) || exit_code=$?
+    if [[ $exit_code -ne 0 ]]; then
+        echo "expected 44-char name to succeed, got error: $output"
+        return 1
+    fi
+    $SMOLVM machine delete "$name" -f 2>/dev/null || true
+}
+
+# With hash-derived paths, long names that would have overflowed the socket
+# path budget on a typical host are now accepted. 75 chars used to fail —
+# now it's just another valid name because the on-disk directory is a
+# 16-char hash regardless.
+test_name_length_75_chars_accepted_via_hash_path() {
+    local name
+    name=$(printf 'a%.0s' {1..75})
+    [[ ${#name} -eq 75 ]] || return 1
+    $SMOLVM machine delete "$name" -f 2>/dev/null || true
+
+    local output exit_code=0
+    output=$($SMOLVM machine create "$name" 2>&1) || exit_code=$?
+    if [[ $exit_code -ne 0 ]]; then
+        echo "expected 75-char name to succeed (hash path keeps socket bounded), got: $output"
+        return 1
+    fi
+    $SMOLVM machine delete "$name" -f 2>/dev/null || true
+}
+
+# The sanity cap (128 chars) is UX-only: reject absurdly long names before
+# they reach any lower layer. Not a socket-path constraint anymore.
+test_name_length_sanity_cap_rejects_absurd_names() {
+    local name
+    name=$(printf 'a%.0s' {1..200})
+    [[ ${#name} -eq 200 ]] || return 1
+
+    local output exit_code=0
+    output=$($SMOLVM machine create "$name" 2>&1) || exit_code=$?
+    [[ $exit_code -ne 0 ]] || { echo "expected 200-char name to be rejected"; return 1; }
+    [[ "$output" == *"too long"* ]] || {
+        echo "expected length-cap error, got: $output"
+        return 1
+    }
+}
+
 # Regression: `machine start --name X` where X doesn't exist used to silently
 # create and start a "default" VM. Now it correctly returns an error.
 test_start_nonexistent_name_rejected() {
@@ -1287,6 +1367,9 @@ test_start_nonexistent_name_rejected() {
 
 run_test "Resource: --cpus 0 rejected" test_resource_cpus_zero_rejected || true
 run_test "Resource: --mem 0 rejected" test_resource_mem_zero_rejected || true
+run_test "Name length: 44-char UUID name accepted (was rejected by old 40-char cap)" test_name_length_44_chars_accepted || true
+run_test "Name length: 75-char name accepted via hash-derived socket path" test_name_length_75_chars_accepted_via_hash_path || true
+run_test "Name length: absurd names rejected by sanity cap" test_name_length_sanity_cap_rejects_absurd_names || true
 run_test "Resource: --mem below minimum rejected" test_resource_mem_below_minimum_rejected || true
 run_test "Start --name nonexistent rejected" test_start_nonexistent_name_rejected || true
 
@@ -1942,6 +2025,44 @@ test_named_vm_survives_ls() {
     $SMOLVM machine delete "$name" -f 2>&1 || true
 }
 
+# Regression: state_probe's ping used a 100ms timeout (intended for boot-time
+# fail-fast) even for user-facing state queries. When the agent was processing
+# a slow request (e.g., overlayfs setup for a multi-layer image), the 100ms
+# ping would time out → state_probe returned Unreachable → `machine ls` and
+# `machine status` flapped to "unreachable" during legitimate busy periods.
+# Fixed by bumping the state-probe timeout to 3s.
+#
+# This test simulates a busy agent by running a sleeping exec in the background
+# and verifying that concurrent `machine ls` calls still report "running".
+# Before the fix, they'd show "unreachable". The sleep is only 1s so the test
+# is fast, but 1s > 100ms → would trigger the old bug; 1s < 3s → passes new.
+test_state_probe_tolerates_busy_agent() {
+    ensure_machine_running
+
+    # Fire a 1-second sleep exec in the background. The agent will be busy
+    # with `sh -c 'sleep 1'` → crun startup → child wait.
+    $SMOLVM machine exec -- sh -c 'sleep 1' &
+    local exec_pid=$!
+
+    # Give the exec time to reach the agent's busy-with-request state.
+    sleep 0.2
+
+    # While the exec is still running, `machine ls` must show "running".
+    # With the old 100ms ping, it would show "unreachable".
+    local state
+    state=$($SMOLVM machine ls 2>&1 | grep "^default " | awk '{print $2}')
+
+    # Wait for the background exec to finish before asserting, so we don't
+    # leave a zombie if the test fails.
+    wait "$exec_pid" 2>/dev/null
+
+    [[ "$state" == "running" ]] || {
+        echo "expected 'running' during busy agent, got '$state' — state probe regressed?"
+        return 1
+    }
+}
+
+run_test "State probe tolerates busy agent (no false unreachable)" test_state_probe_tolerates_busy_agent || true
 run_test "Listing: machine ls does not kill VM" test_machine_ls_does_not_kill_vm || true
 run_test "Listing: named VM survives repeated ls" test_named_vm_survives_ls || true
 run_test "Images: does not stop running VM" test_images_does_not_stop_running_vm || true

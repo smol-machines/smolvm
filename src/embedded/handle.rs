@@ -53,11 +53,14 @@ impl VmHandle {
         env: Vec<(String, String)>,
         workdir: Option<String>,
         timeout: Option<Duration>,
-    ) -> Result<(i32, String, String)> {
+    ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
         self.client_mut()?.vm_exec(command, env, workdir, timeout)
     }
 
     /// Pull an OCI image and run a command inside it.
+    ///
+    /// Returns `(exit_code, stdout_bytes, stderr_bytes)`. Bytes are raw
+    /// to preserve binary output.
     pub fn run(
         &mut self,
         image: &str,
@@ -65,7 +68,7 @@ impl VmHandle {
         env: Vec<(String, String)>,
         workdir: Option<String>,
         timeout: Option<Duration>,
-    ) -> Result<(i32, String, String)> {
+    ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
         let client = self.client_mut()?;
         client.pull_with_registry_config(image)?;
         let config = RunConfig::new(image, command)

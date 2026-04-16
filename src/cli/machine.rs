@@ -22,6 +22,7 @@ use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_
 use smolvm::data::storage::HostMount;
 use smolvm::network::{validate_requested_network_backend, NetworkBackend};
 use smolvm::{DEFAULT_IDLE_CMD, DEFAULT_SHELL_CMD};
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -107,6 +108,14 @@ pub enum MachineCmd {
     /// Test network connectivity from inside the VM
     #[command(hide = true)]
     NetworkTest(NetworkTestCmd),
+
+    /// Print the on-disk data directory path for a named machine.
+    ///
+    /// Useful for scripting and debugging — returns the path where the VM's
+    /// storage disk, overlay disk, and agent socket live. The path is
+    /// hash-derived, not name-derived.
+    #[command(name = "data-dir")]
+    DataDir(DataDirCmd),
 }
 
 impl MachineCmd {
@@ -133,6 +142,7 @@ impl MachineCmd {
             MachineCmd::Cp(cmd) => cmd.run(),
             MachineCmd::Monitor(cmd) => cmd.run(),
             MachineCmd::NetworkTest(cmd) => cmd.run(),
+            MachineCmd::DataDir(cmd) => cmd.run(),
         }
     }
 }
@@ -600,10 +610,10 @@ impl RunCmd {
                         .with_timeout(self.timeout);
                     let (exit_code, stdout, stderr) = client.run_non_interactive(config)?;
                     if !stdout.is_empty() {
-                        print!("{}", stdout);
+                        let _ = std::io::stdout().write_all(&stdout);
                     }
                     if !stderr.is_empty() {
-                        eprint!("{}", stderr);
+                        let _ = std::io::stderr().write_all(&stderr);
                     }
                     flush_output();
                     exit_code
@@ -700,10 +710,10 @@ impl RunCmd {
                     let (exit_code, stdout, stderr) =
                         client.vm_exec(command, env, params.workdir.clone(), self.timeout)?;
                     if !stdout.is_empty() {
-                        print!("{}", stdout);
+                        let _ = std::io::stdout().write_all(&stdout);
                     }
                     if !stderr.is_empty() {
-                        eprint!("{}", stderr);
+                        let _ = std::io::stderr().write_all(&stderr);
                     }
                     flush_output();
                     exit_code
@@ -801,12 +811,10 @@ impl ExecCmd {
             for event in events {
                 match event {
                     smolvm::agent::ExecEvent::Stdout(data) => {
-                        use std::io::Write;
                         let _ = std::io::stdout().write_all(&data);
                         let _ = std::io::stdout().flush();
                     }
                     smolvm::agent::ExecEvent::Stderr(data) => {
-                        use std::io::Write;
                         let _ = std::io::stderr().write_all(&data);
                         let _ = std::io::stderr().flush();
                     }
@@ -1303,6 +1311,30 @@ impl ResizeCmd {
                 e
             }
         })
+    }
+}
+
+// ============================================================================
+// Data Dir Command
+// ============================================================================
+
+/// Print the on-disk data directory for a named machine.
+///
+/// Equivalent to calling `smolvm::agent::vm_data_dir(name)` — exposed as a
+/// CLI command so shell scripts and external tooling have a single source
+/// of truth for the path computation (which is hash-derived, not
+/// name-derived).
+#[derive(Args, Debug)]
+pub struct DataDirCmd {
+    /// Machine name.
+    pub name: String,
+}
+
+impl DataDirCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        let dir = smolvm::agent::vm_data_dir(&self.name);
+        println!("{}", dir.display());
+        Ok(())
     }
 }
 
@@ -1812,7 +1844,7 @@ impl MonitorCmd {
                                         code,
                                         consecutive_health_failures,
                                         health_retries,
-                                        stderr.trim()
+                                        String::from_utf8_lossy(&stderr).trim()
                                     );
                                 }
                                 Err(e) => {
