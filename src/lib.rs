@@ -63,6 +63,7 @@
 
 pub mod agent;
 pub mod api;
+pub mod auth;
 pub mod config;
 /// Canonical shared data models and constants used across adapters.
 pub mod data;

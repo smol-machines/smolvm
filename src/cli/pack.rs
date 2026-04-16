@@ -1469,14 +1469,26 @@ fn build_registry_client(
     registry: &str,
     config: &smolvm::registry::RegistryConfig,
 ) -> smolvm::Result<smolvm_registry::RegistryClient> {
-    let base_url = if registry.starts_with("localhost") || registry.contains("127.0.0.1") {
-        format!("http://{}", registry)
+    let effective_registry = config.get_mirror(registry).unwrap_or(registry);
+
+    let base_url = if effective_registry.starts_with("localhost")
+        || effective_registry.contains("127.0.0.1")
+    {
+        format!("http://{}", effective_registry)
     } else {
-        format!("https://{}", registry)
+        format!("https://{}", effective_registry)
     };
 
     let mut client = smolvm_registry::RegistryClient::new(base_url);
 
+    // Priority 1: JWT from auth.json (OIDC tokens)
+    if let Ok(auth_config) = smolvm::auth::AuthConfig::load() {
+        if let Some(token) = auth_config.get_token(registry) {
+            return Ok(client.with_token(token.to_string()));
+        }
+    }
+
+    // Priority 2: Basic auth from registries.toml
     if let Some(auth) = config.get_credentials(registry) {
         client = client.with_token(auth.password);
     }

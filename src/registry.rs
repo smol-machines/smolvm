@@ -179,6 +179,32 @@ impl RegistryConfig {
     pub fn has_registries(&self) -> bool {
         !self.registries.is_empty()
     }
+
+    /// Set credentials for a registry, creating the entry if needed.
+    pub fn set_credentials(&mut self, registry: &str, username: String, password: String) {
+        let entry = self.registries.entry(registry.to_string()).or_default();
+        entry.username = Some(username);
+        entry.password = Some(password);
+        entry.password_env = None;
+    }
+
+    /// Save the configuration back to disk.
+    pub fn save(&self) -> Result<()> {
+        let config_path = Self::config_path()?;
+        if let Some(parent) = config_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| Error::config("create config directory", e.to_string()))?;
+        }
+        let contents = toml::to_string_pretty(self)
+            .map_err(|e| Error::config("serialize registry config", e.to_string()))?;
+        std::fs::write(&config_path, contents).map_err(|e| {
+            Error::config(
+                format!("write registry config to {}", config_path.display()),
+                e.to_string(),
+            )
+        })?;
+        Ok(())
+    }
 }
 
 /// Default registry when none specified in image reference.
@@ -824,5 +850,89 @@ mirror = "ghcr-mirror.example.com"
     fn test_reference_error_too_many_components() {
         let err = Reference::parse("a.com/b/c/d:latest").unwrap_err();
         assert!(err.reason.contains("too many path components"));
+    }
+
+    #[test]
+    fn test_set_credentials_new_entry() {
+        let mut config = RegistryConfig::default();
+        config.set_credentials("registry.example.com", "user".into(), "pass".into());
+
+        let creds = config.get_credentials("registry.example.com").unwrap();
+        assert_eq!(creds.username, "user");
+        assert_eq!(creds.password, "pass");
+    }
+
+    #[test]
+    fn test_set_credentials_overwrites_existing() {
+        let mut config = RegistryConfig::default();
+        config.registries.insert(
+            "registry.example.com".to_string(),
+            RegistryEntry {
+                username: Some("old_user".to_string()),
+                password: None,
+                password_env: Some("OLD_TOKEN".to_string()),
+                mirror: Some("mirror.example.com".to_string()),
+            },
+        );
+
+        config.set_credentials("registry.example.com", "new_user".into(), "new_pass".into());
+
+        let entry = config.registries.get("registry.example.com").unwrap();
+        assert_eq!(entry.username.as_deref(), Some("new_user"));
+        assert_eq!(entry.password.as_deref(), Some("new_pass"));
+        // password_env should be cleared when setting direct password
+        assert_eq!(entry.password_env, None);
+        // mirror should be preserved
+        assert_eq!(entry.mirror.as_deref(), Some("mirror.example.com"));
+    }
+
+    #[test]
+    fn test_save_and_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("registries.toml");
+
+        let mut config = RegistryConfig::default();
+        config.set_credentials(
+            "registry.smolmachines.com",
+            "testuser".into(),
+            "testpass".into(),
+        );
+
+        // Write manually to the temp path (save() uses the real config path)
+        let contents = toml::to_string_pretty(&config).unwrap();
+        std::fs::write(&config_path, &contents).unwrap();
+
+        // Reload and verify
+        let reloaded: RegistryConfig =
+            toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        let creds = reloaded
+            .get_credentials("registry.smolmachines.com")
+            .unwrap();
+        assert_eq!(creds.username, "testuser");
+        assert_eq!(creds.password, "testpass");
+    }
+
+    #[test]
+    fn test_save_roundtrip_preserves_all_fields() {
+        let mut config = RegistryConfig::default();
+        config.defaults.registry = Some("custom.io".to_string());
+        config.registries.insert(
+            "ghcr.io".to_string(),
+            RegistryEntry {
+                username: Some("gh_user".to_string()),
+                password: Some("gh_pass".to_string()),
+                password_env: None,
+                mirror: Some("ghcr-mirror.example.com".to_string()),
+            },
+        );
+
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let reloaded: RegistryConfig = toml::from_str(&serialized).unwrap();
+
+        assert_eq!(reloaded.default_registry(), "custom.io");
+        let entry = reloaded.registries.get("ghcr.io").unwrap();
+        assert_eq!(entry.username.as_deref(), Some("gh_user"));
+        assert_eq!(entry.password.as_deref(), Some("gh_pass"));
+        assert_eq!(entry.mirror.as_deref(), Some("ghcr-mirror.example.com"));
     }
 }
