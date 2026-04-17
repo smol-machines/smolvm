@@ -952,6 +952,22 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
     // Remove from config (persists immediately to database)
     config.remove_vm(name);
 
+    // If the machine was created from a .smolmachine sidecar, release the
+    // case-sensitive volume (macOS hdiutil mount). The lease was intentionally
+    // leaked with `std::mem::forget` at start time so the volume stayed
+    // mounted while the VM ran. On delete we must detach it, otherwise
+    // `rm -rf` of the pack cache fails with "Resource busy".
+    if let Some(ref sidecar_path) = record.source_smolmachine {
+        let sidecar = std::path::Path::new(sidecar_path);
+        if sidecar.exists() {
+            if let Ok(footer) = smolvm_pack::packer::read_footer_from_sidecar(sidecar) {
+                if let Ok(cache_dir) = smolvm_pack::extract::get_cache_dir(footer.checksum) {
+                    smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
+                }
+            }
+        }
+    }
+
     let data_dir = vm_data_dir(name);
     if data_dir.exists() {
         println!("Cleaning up data directory for vm: {}", name);

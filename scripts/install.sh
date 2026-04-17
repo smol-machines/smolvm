@@ -507,6 +507,12 @@ uninstall_smolvm() {
         success "Removed cache directory $cache_dir"
     fi
     if [[ -d "$cache_pack_dir" ]]; then
+        # On macOS, detach any hdiutil-mounted case-sensitive volumes
+        # (layers-cs) before removing the directory. Without this, rm
+        # fails with "Resource busy" on active mount points.
+        if [[ "$(uname -s)" == "Darwin" ]]; then
+            find "$cache_pack_dir" -name layers-cs -type d -exec hdiutil detach {} -force \; 2>/dev/null || true
+        fi
         rm -rf "$cache_pack_dir"
         success "Removed pack cache directory $cache_pack_dir"
     fi

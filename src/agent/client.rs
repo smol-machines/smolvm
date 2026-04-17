@@ -49,10 +49,8 @@ const DEFAULT_WRITE_TIMEOUT_SECS: u64 = 10;
 /// Image pulls can take a long time for large images over slow connections.
 const IMAGE_PULL_TIMEOUT_SECS: u64 = 600;
 
-/// Read timeout for interactive/long-running sessions (1 hour).
-/// Used for exec, run, and container exec operations where the user may be
-/// running long commands or interactive shells.
-const INTERACTIVE_TIMEOUT_SECS: u64 = 3600;
+// (Removed INTERACTIVE_TIMEOUT_SECS — no-user-timeout execs now disable
+// the socket read timeout entirely, matching interactive_session behavior.)
 
 /// Buffer time added to user-specified timeouts (5 seconds).
 /// When users specify a command timeout, we add this buffer to the socket
@@ -1424,13 +1422,26 @@ impl AgentClient {
     /// Set a command-execution timeout and return a guard that resets it on drop.
     ///
     /// If `timeout` is Some, the socket deadline is `timeout + TIMEOUT_BUFFER_SECS`.
-    /// If None, it uses `INTERACTIVE_TIMEOUT_SECS` (the long-running default).
+    /// If None, the socket read timeout is disabled entirely — the command runs
+    /// until completion (or the VM dies, triggering EOF). This matches
+    /// `interactive_session`'s behavior and avoids any implicit ceiling on how
+    /// long a non-interactive command can run. The `ReadTimeoutGuard` restores
+    /// `DEFAULT_READ_TIMEOUT_SECS` on drop so subsequent operations get the
+    /// normal 30-second timeout.
     fn set_exec_timeout(&self, timeout: Option<Duration>) -> Result<Option<ReadTimeoutGuard>> {
-        let socket_timeout = match timeout {
-            Some(t) => t + Duration::from_secs(TIMEOUT_BUFFER_SECS),
-            None => Duration::from_secs(INTERACTIVE_TIMEOUT_SECS),
-        };
-        self.set_read_timeout(socket_timeout)?;
+        match timeout {
+            Some(t) => {
+                self.set_read_timeout(t + Duration::from_secs(TIMEOUT_BUFFER_SECS))?;
+            }
+            None => {
+                self.stream.set_read_timeout(None).map_err(|e| {
+                    Error::agent(
+                        "set read timeout",
+                        format!("failed to clear socket read timeout: {}", e),
+                    )
+                })?;
+            }
+        }
         Ok(ReadTimeoutGuard::new(&self.stream))
     }
 
