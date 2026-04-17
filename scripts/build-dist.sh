@@ -298,30 +298,30 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
     # Create symlink for compatibility
     ln -sf libkrunfw.5.dylib "$DIST_DIR/lib/libkrunfw.dylib"
 else
-    # Copy only the current version of each library (resolved via symlinks)
-    # and recreate the symlink chain in the dist directory.
+    # Copy each library's real file plus all symlinks that reference it.
+    # Only copies files in the active symlink chain — stale old versions
+    # (e.g. libkrunfw.so.5.2.0 when current is 5.3.0) are excluded.
     for lib_name in libkrun libkrunfw; do
         local_so="$WORK_LIB_DIR/${lib_name}.so"
         if [[ ! -e "$local_so" ]]; then
             echo "Error: ${lib_name}.so not found in $WORK_LIB_DIR"
             exit 1
         fi
-        # Resolve to the actual versioned file (e.g. libkrunfw.so -> libkrunfw.so.5 -> libkrunfw.so.5.3.0)
+
+        # Find the real file backing the .so (follows all symlinks)
         real_file="$(readlink -f "$local_so")"
         real_name="$(basename "$real_file")"
         cp "$real_file" "$DIST_DIR/lib/$real_name"
-        # Recreate intermediate symlinks (e.g. libkrunfw.so.5 -> libkrunfw.so.5.3.0)
-        cur="$local_so"
-        while [[ -L "$cur" ]]; do
-            link_name="$(basename "$cur")"
-            target="$(readlink "$cur")"
-            target_name="$(basename "$target")"
-            ln -sf "$target_name" "$DIST_DIR/lib/$link_name"
-            # Follow to next level
-            if [[ "$target" == /* ]]; then
-                cur="$target"
-            else
-                cur="$(dirname "$cur")/$target"
+
+        # Copy every symlink in the directory that ultimately points to
+        # the same real file. This catches both directions:
+        #   libkrun.so.1 → libkrun.so  (SONAME → real)
+        #   libkrunfw.so → libkrunfw.so.5 → libkrunfw.so.5.3.0
+        for candidate in "$WORK_LIB_DIR"/${lib_name}.so*; do
+            [[ -L "$candidate" ]] || continue
+            candidate_real="$(readlink -f "$candidate")"
+            if [[ "$candidate_real" == "$real_file" ]]; then
+                cp -a "$candidate" "$DIST_DIR/lib/"
             fi
         done
     done
