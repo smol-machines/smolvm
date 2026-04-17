@@ -1,0 +1,8 @@
+.venv/
+build/
+dist/
+*.egg-info/
+python/smolvm_embedded/__pycache__/
+python/smolvm_embedded/lib/
+python/smolvm_embedded/smolvm
+python/smolvm_embedded/smolvm-bin
