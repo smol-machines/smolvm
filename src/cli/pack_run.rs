@@ -420,12 +420,21 @@ impl PackRunCmd {
             runtime_dir,
         };
 
+        // Ensure Ctrl+C tears down the forked VM child rather than
+        // orphaning it. Without this guard the default SIGINT handler
+        // exits the parent immediately and skips ChildGuard::Drop — the
+        // setsid()-detached VM keeps running and holds its sockets. Same
+        // fix applied in run_ephemeral below; both fork sites had the
+        // gap.
+        let sigint_guard = smolvm::process::SigintGuard::new(child_pid);
+
         // 9. Parent: wait for agent, connect, execute command
         let mut client = wait_for_agent(&vsock_path, self.debug)?;
 
         let exit_code = execute_command(&mut client, &manifest, &self, &mounts)?;
 
         // std::process::exit skips destructors, so drop explicitly first.
+        drop(sigint_guard);
         drop(child_guard);
         drop(layers_lease); // releases layers volume lease (detaches if last)
         std::process::exit(exit_code);
@@ -1239,6 +1248,16 @@ fn run_from_cache(
         start_time: child_start_time,
         runtime_dir,
     };
+
+    // Ensure Ctrl+C tears down the forked VM child rather than orphaning
+    // it. Without this guard, the default SIGINT handler exits the parent
+    // immediately and skips ChildGuard::Drop, so the setsid()-detached VM
+    // process keeps running and keeps the port bound. Mirrors the pattern
+    // machine.rs already uses for persistent VMs. Declared AFTER
+    // child_guard so Drop order (reverse of declaration) fires
+    // SigintGuard first on normal exit — harmless since it only restores
+    // the default handler.
+    let _sigint_guard = smolvm::process::SigintGuard::new(child_pid);
 
     let mut client = wait_for_agent(&vsock_path, debug)?;
 
