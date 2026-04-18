@@ -17,8 +17,7 @@ pub enum NetworkBackend {
     #[value(name = "tsi")]
     Tsi,
     /// Use virtio-net with the host-side smolvm network stack.
-    #[serde(alias = "virtio")]
-    #[value(name = "virtio-net", alias = "virtio")]
+    #[value(name = "virtio-net")]
     VirtioNet,
 }
 
@@ -57,8 +56,8 @@ mod tests {
     }
 
     #[test]
-    fn virtio_net_deserializes_legacy_alias() {
-        let value: NetworkBackend = serde_json::from_str("\"virtio\"").unwrap();
-        assert_eq!(value, NetworkBackend::VirtioNet);
+    fn legacy_virtio_name_is_rejected() {
+        let value = serde_json::from_str::<NetworkBackend>("\"virtio\"");
+        assert!(value.is_err());
     }
 }
