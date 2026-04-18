@@ -135,8 +135,8 @@ impl NapiMachine {
 
         Ok(ExecResult {
             exit_code: result.0,
-            stdout: result.1,
-            stderr: result.2,
+            stdout: String::from_utf8_lossy(&result.1).into_owned(),
+            stderr: String::from_utf8_lossy(&result.2).into_owned(),
         })
     }
 
@@ -164,8 +164,8 @@ impl NapiMachine {
 
         Ok(ExecResult {
             exit_code: result.0,
-            stdout: result.1,
-            stderr: result.2,
+            stdout: String::from_utf8_lossy(&result.1).into_owned(),
+            stderr: String::from_utf8_lossy(&result.2).into_owned(),
         })
     }
 
