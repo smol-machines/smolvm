@@ -3,6 +3,7 @@
 //! This module provides utilities for managing child processes,
 //! including signal handling and graceful shutdown.
 
+use std::os::fd::IntoRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -668,6 +669,39 @@ pub fn detach_stdio() {
             }
         }
     }
+}
+
+/// Redirect stdin/stdout to `/dev/null` and stderr to a log file.
+///
+/// This keeps background children detached from the user's terminal while
+/// preserving boot-time diagnostics for later inspection.
+pub fn detach_stdio_to_stderr_file(path: &std::path::Path) -> std::io::Result<()> {
+    let stderr_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    let stderr_fd = stderr_file.into_raw_fd();
+
+    unsafe {
+        let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
+        if devnull < 0 {
+            libc::close(stderr_fd);
+            return Err(std::io::Error::last_os_error());
+        }
+
+        libc::dup2(devnull, 0); // stdin
+        libc::dup2(devnull, 1); // stdout
+        libc::dup2(stderr_fd, 2); // stderr
+
+        if devnull > 2 {
+            libc::close(devnull);
+        }
+        if stderr_fd > 2 {
+            libc::close(stderr_fd);
+        }
+    }
+
+    Ok(())
 }
 
 /// Exit the current process immediately without cleanup.

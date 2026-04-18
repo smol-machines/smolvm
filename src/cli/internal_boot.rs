@@ -30,7 +30,13 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
     let _ = std::fs::remove_file(&config_path);
 
     // Redirect stdio to /dev/null first (needs to open /dev/null).
-    smolvm::process::detach_stdio();
+    if let Err(e) = smolvm::process::detach_stdio_to_stderr_file(&config.startup_error_log) {
+        let _ = std::fs::write(
+            &config.startup_error_log,
+            format!("failed to redirect stdio: {}", e),
+        );
+        smolvm::process::exit_child(1);
+    }
 
     // Close ALL inherited file descriptors from the parent (server).
     // Without this, the subprocess holds database locks, network sockets, etc.
@@ -111,11 +117,22 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
         dns_filter_socket: dns_filter_socket_path.as_deref(),
         packed_layers_dir: config.packed_layers_dir.as_deref(),
         extra_disks: &config.extra_disks,
+        dns_filter_enabled: config
+            .dns_filter_hosts
+            .as_ref()
+            .is_some_and(|hosts| !hosts.is_empty()),
     });
 
     // If we get here, launch_agent_vm returned (should only happen on error)
     if let Err(ref e) = result {
-        let _ = std::fs::write(&config.startup_error_log, e.to_string());
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&config.startup_error_log)
+            .and_then(|mut file| {
+                use std::io::Write;
+                writeln!(file, "{e}")
+            });
     }
 
     smolvm::process::exit_child(1);

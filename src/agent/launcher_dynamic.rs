@@ -6,15 +6,16 @@
 //!
 //! The static FFI path in `launcher.rs` remains untouched for normal operations.
 
+use crate::network::backend::{COMPAT_NET_FEATURES, TSI_FEATURE_HIJACK_INET};
+use crate::network::{plan_launch_network, EffectiveNetworkBackend};
 use crate::util::{libkrun_filename, libkrunfw_filename};
+use smolvm_network::{guest_env, start_virtio_network, GuestNetworkConfig, VirtioNetworkRuntime};
 use smolvm_protocol::ports;
 use std::ffi::{CStr, CString};
+use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 
 use super::VmResources;
-
-// TSI (Transparent Socket Impersonation) feature flags
-const KRUN_TSI_HIJACK_INET: u32 = 1 << 0;
 
 /// Function pointers for libkrun, loaded via dlopen.
 ///
@@ -46,6 +47,9 @@ pub struct KrunFunctions {
     pub add_vsock: unsafe extern "C" fn(u32, u32) -> i32,
     pub set_console_output: unsafe extern "C" fn(u32, *const libc::c_char) -> i32,
     pub set_egress_policy: Option<unsafe extern "C" fn(u32, *const *const libc::c_char) -> i32>,
+    pub add_net_unixstream: Option<
+        unsafe extern "C" fn(u32, *const libc::c_char, libc::c_int, *mut u8, u32, u32) -> i32,
+    >,
 }
 
 impl KrunFunctions {
@@ -135,6 +139,17 @@ impl KrunFunctions {
             set_egress_policy: {
                 let sym_name =
                     CString::new("krun_set_egress_policy").expect("symbol name is static");
+                let sym = libc::dlsym(handle, sym_name.as_ptr());
+                if sym.is_null() {
+                    None
+                } else {
+                    #[allow(clippy::missing_transmute_annotations)]
+                    Some(std::mem::transmute(sym))
+                }
+            },
+            add_net_unixstream: {
+                let sym_name =
+                    CString::new("krun_add_net_unixstream").expect("symbol name is static");
                 let sym = libc::dlsym(handle, sym_name.as_ptr());
                 if sym.is_null() {
                     None
@@ -286,74 +301,116 @@ pub fn launch_agent_vm_dynamic(
         free_ctx_on_err!("krun_set_root failed");
     }
 
-    // Configure TSI networking
-    // SAFETY: ctx is valid
-    if unsafe { (krun.disable_implicit_vsock)(ctx) } < 0 {
-        free_ctx_on_err!("krun_disable_implicit_vsock failed");
+    let network_plan = plan_launch_network(&config.resources, None, config.port_mappings.len());
+    if let Some(reason) = network_plan.fallback_reason {
+        tracing::warn!(reason = %reason.user_message(), "network backend fell back to TSI");
     }
 
-    let has_egress_policy = config
-        .resources
-        .allowed_cidrs
-        .as_ref()
-        .is_some_and(|c| !c.is_empty());
-    if config.resources.network || !config.port_mappings.is_empty() || has_egress_policy {
-        // SAFETY: ctx is valid, KRUN_TSI_HIJACK_INET is a valid flag
-        if unsafe { (krun.add_vsock)(ctx, KRUN_TSI_HIJACK_INET) } < 0 {
-            free_ctx_on_err!("krun_add_vsock with TSI failed");
+    let mut virtio_network_runtime: Option<VirtioNetworkRuntime> = None;
+    let guest_network = match network_plan.backend {
+        EffectiveNetworkBackend::None => {
+            if unsafe { (krun.disable_implicit_vsock)(ctx) } < 0 {
+                free_ctx_on_err!("krun_disable_implicit_vsock failed");
+            }
+            if unsafe { (krun.add_vsock)(ctx, 0) } < 0 {
+                free_ctx_on_err!("krun_add_vsock failed");
+            }
+            tracing::debug!("configured vsock without guest networking");
+            None
         }
+        EffectiveNetworkBackend::Tsi => {
+            if unsafe { (krun.disable_implicit_vsock)(ctx) } < 0 {
+                free_ctx_on_err!("krun_disable_implicit_vsock failed");
+            }
+            if unsafe { (krun.add_vsock)(ctx, TSI_FEATURE_HIJACK_INET) } < 0 {
+                free_ctx_on_err!("krun_add_vsock with TSI failed");
+            }
 
-        // Set port mappings
-        let port_cstrings: Vec<CString> = config
-            .port_mappings
-            .iter()
-            .map(|(host, guest)| {
-                CString::new(format!("{}:{}", host, guest))
-                    .expect("port mapping cannot contain null bytes")
-            })
-            .collect();
-        let mut port_ptrs: Vec<*const libc::c_char> =
-            port_cstrings.iter().map(|s| s.as_ptr()).collect();
-        port_ptrs.push(std::ptr::null());
+            let port_cstrings: Vec<CString> = config
+                .port_mappings
+                .iter()
+                .map(|(host, guest)| {
+                    CString::new(format!("{}:{}", host, guest))
+                        .expect("port mapping cannot contain null bytes")
+                })
+                .collect();
+            let mut port_ptrs: Vec<*const libc::c_char> =
+                port_cstrings.iter().map(|s| s.as_ptr()).collect();
+            port_ptrs.push(std::ptr::null());
 
-        // SAFETY: ctx is valid, port_ptrs is a null-terminated array of valid C strings
-        if unsafe { (krun.set_port_map)(ctx, port_ptrs.as_ptr()) } < 0 {
-            free_ctx_on_err!("krun_set_port_map failed");
-        }
+            if unsafe { (krun.set_port_map)(ctx, port_ptrs.as_ptr()) } < 0 {
+                free_ctx_on_err!("krun_set_port_map failed");
+            }
 
-        // Set egress policy if CIDRs are specified
-        if let Some(ref cidrs) = config.resources.allowed_cidrs {
-            if !cidrs.is_empty() {
-                let set_egress = krun.set_egress_policy.ok_or_else(|| {
-                    "libkrun does not support egress policy (krun_set_egress_policy not found). \
-                     Update libkrun or remove --allow-cidr flags."
-                        .to_string()
-                })?;
+            if let Some(ref cidrs) = config.resources.allowed_cidrs {
+                if !cidrs.is_empty() {
+                    let set_egress = krun.set_egress_policy.ok_or_else(|| {
+                        "libkrun does not support egress policy (krun_set_egress_policy not found). \
+                         Update libkrun or remove --allow-cidr flags."
+                            .to_string()
+                    })?;
 
-                let mut all_cidrs = cidrs.clone();
-                crate::data::network::ensure_dns_in_cidrs(&mut all_cidrs);
+                    let mut all_cidrs = cidrs.clone();
+                    crate::data::network::ensure_dns_in_cidrs(&mut all_cidrs);
 
-                let cidr_cstrings: Vec<CString> = all_cidrs
-                    .iter()
-                    .map(|c| CString::new(c.as_str()).expect("CIDR cannot contain null bytes"))
-                    .collect();
-                let mut cidr_ptrs: Vec<*const libc::c_char> =
-                    cidr_cstrings.iter().map(|s| s.as_ptr()).collect();
-                cidr_ptrs.push(std::ptr::null());
+                    let cidr_cstrings: Vec<CString> = all_cidrs
+                        .iter()
+                        .map(|c| CString::new(c.as_str()).expect("CIDR cannot contain null bytes"))
+                        .collect();
+                    let mut cidr_ptrs: Vec<*const libc::c_char> =
+                        cidr_cstrings.iter().map(|s| s.as_ptr()).collect();
+                    cidr_ptrs.push(std::ptr::null());
 
-                // SAFETY: ctx is valid, cidr_ptrs is a null-terminated array of valid C strings
-                if unsafe { (set_egress)(ctx, cidr_ptrs.as_ptr()) } < 0 {
-                    free_ctx_on_err!("krun_set_egress_policy failed");
+                    if unsafe { (set_egress)(ctx, cidr_ptrs.as_ptr()) } < 0 {
+                        free_ctx_on_err!("krun_set_egress_policy failed");
+                    }
                 }
             }
+
+            tracing::info!("network backend: tsi");
+            None
         }
-    } else {
-        // Control-only vsock, no network
-        // SAFETY: ctx is valid
-        if unsafe { (krun.add_vsock)(ctx, 0) } < 0 {
-            free_ctx_on_err!("krun_add_vsock failed");
+        EffectiveNetworkBackend::VirtioNet => {
+            let add_net_unixstream = krun.add_net_unixstream.ok_or_else(|| {
+                "libkrun does not expose krun_add_net_unixstream; update libkrun or use --net-backend tsi"
+                    .to_string()
+            })?;
+            let guest_network = GuestNetworkConfig::default();
+            let mut guest_mac = guest_network.guest_mac;
+            let (host_fd, guest_fd) =
+                create_unix_stream_pair().map_err(|e| format!("socketpair failed: {e}"))?;
+
+            let runtime = match start_virtio_network(host_fd, guest_network) {
+                Ok(runtime) => runtime,
+                Err(err) => {
+                    // SAFETY: guest_fd was created by socketpair above and not moved elsewhere.
+                    unsafe { libc::close(guest_fd) };
+                    return Err(format!("failed to start virtio network runtime: {err}"));
+                }
+            };
+
+            if unsafe {
+                (add_net_unixstream)(
+                    ctx,
+                    std::ptr::null(),
+                    guest_fd,
+                    guest_mac.as_mut_ptr(),
+                    COMPAT_NET_FEATURES,
+                    0,
+                )
+            } < 0
+            {
+                // SAFETY: guest_fd was created by socketpair above and not moved elsewhere.
+                unsafe { libc::close(guest_fd) };
+                free_ctx_on_err!("krun_add_net_unixstream failed");
+            }
+
+            virtio_network_runtime = Some(runtime);
+
+            tracing::info!("network backend: virtio-net");
+            Some(guest_network)
         }
-    }
+    };
 
     // Add storage disk
     let block_id = cstr("storage");
@@ -437,6 +494,35 @@ pub fn launch_agent_vm_dynamic(
         }
     }
 
+    if let Some(network) = guest_network {
+        env_strings.push(cstr(&format!(
+            "{}={}",
+            guest_env::BACKEND,
+            guest_env::BACKEND_VIRTIO_NET
+        )));
+        env_strings.push(cstr(&format!(
+            "{}={}",
+            guest_env::GUEST_IP,
+            network.guest_ip
+        )));
+        env_strings.push(cstr(&format!(
+            "{}={}",
+            guest_env::GATEWAY,
+            network.gateway_ip
+        )));
+        env_strings.push(cstr(&format!(
+            "{}={}",
+            guest_env::PREFIX_LEN,
+            network.prefix_len
+        )));
+        env_strings.push(cstr(&format!(
+            "{}={}",
+            guest_env::GUEST_MAC,
+            format_mac(network.guest_mac)
+        )));
+        env_strings.push(cstr(&format!("{}={}", guest_env::DNS, network.dns_server)));
+    }
+
     let mut envp: Vec<*const libc::c_char> = env_strings.iter().map(|s| s.as_ptr()).collect();
     envp.push(std::ptr::null());
 
@@ -491,6 +577,7 @@ pub fn launch_agent_vm_dynamic(
     // If we get here, something went wrong — free the context before returning
     // SAFETY: ctx is a valid context from krun_create_ctx
     unsafe { (krun.free_ctx)(ctx) };
+    drop(virtio_network_runtime);
     Err(format!("krun_start_enter returned: {}", ret))
 }
 
@@ -503,6 +590,23 @@ fn cstr(s: &str) -> CString {
 fn path_to_cstring(path: &Path) -> Result<CString, String> {
     CString::new(path.to_string_lossy().as_bytes())
         .map_err(|_| "path contains null byte".to_string())
+}
+
+fn create_unix_stream_pair() -> std::io::Result<(RawFd, RawFd)> {
+    let mut fds = [0; 2];
+    // SAFETY: `socketpair` initializes both descriptors on success.
+    let result = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+    if result < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((fds[0], fds[1]))
+}
+
+fn format_mac(mac: [u8; 6]) -> String {
+    format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+    )
 }
 
 /// Raise file descriptor limits (required by libkrun).

@@ -1,7 +1,13 @@
 use clap::ValueEnum;
 
-/// libkrun's compatibility feature set for unixstream-backed virtio-net.
+/// Feature set advertised to libkrun for unixstream-backed virtio-net.
+///
+/// The current smoltcp-backed MVP expects ordinary packets from the guest.
+/// Leave checksum and segmentation offloads disabled until the host path
+/// explicitly handles those packet shapes.
 pub const COMPAT_NET_FEATURES: u32 = 0;
+/// TSI feature bit that enables INET socket hijacking.
+pub const TSI_FEATURE_HIJACK_INET: u32 = 1 << 0;
 
 /// Network backend override for machine launch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, ValueEnum)]

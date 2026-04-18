@@ -12,6 +12,7 @@ use crate::crun::CrunCommand;
 use crate::oci::{generate_container_id, OciSpec};
 use crate::paths;
 use crate::process::{WaitResult, TIMEOUT_EXIT_CODE};
+use smolvm_network::guest_env;
 use smolvm_protocol::{ImageInfo, OverlayInfo, RegistryAuth, StorageStatus};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -1560,11 +1561,15 @@ impl OverlaySetup {
 
     /// Set up the upper layer with DNS resolution and /dev directory.
     fn setup_upper_layer(&self) -> Result<()> {
-        // Set up DNS resolution BEFORE mounting (TSI intercepts writes to mounted overlays)
+        // Set up DNS resolution BEFORE mounting. Image-backed workloads read
+        // `/etc/resolv.conf` from the overlay upper layer, so this file must
+        // match the active networking mode rather than always hardcoding
+        // public resolvers.
         let upper_etc = self.upper_path.join("etc");
         std::fs::create_dir_all(&upper_etc)?;
         let resolv_path = upper_etc.join("resolv.conf");
-        if let Err(e) = std::fs::write(&resolv_path, "nameserver 8.8.8.8\nnameserver 1.1.1.1\n") {
+        let resolv_contents = overlay_resolv_conf_contents();
+        if let Err(e) = std::fs::write(&resolv_path, resolv_contents) {
             warn!(error = %e, "failed to write resolv.conf to upper layer");
         }
 
@@ -1733,6 +1738,22 @@ impl OverlaySetup {
         info!(workload_id = %self.workload_id, "creating new persistent overlay");
         self.execute(lowerdirs)
     }
+}
+
+fn overlay_resolv_conf_contents() -> String {
+    if std::env::var(guest_env::DNS_FILTER).as_deref() == Ok("1") {
+        return "nameserver 127.0.0.1\n".to_string();
+    }
+
+    if std::env::var(guest_env::BACKEND).as_deref() == Ok(guest_env::BACKEND_VIRTIO_NET) {
+        if let Ok(dns_server) = std::env::var(guest_env::DNS) {
+            if !dns_server.is_empty() {
+                return format!("nameserver {}\n", dns_server);
+            }
+        }
+    }
+
+    "nameserver 8.8.8.8\nnameserver 1.1.1.1\n".to_string()
 }
 
 /// Prepare an overlay filesystem for a workload.
@@ -2764,6 +2785,12 @@ fn dir_size(path: &Path) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn test_oci_platform_to_arch_linux_arm64() {
@@ -2798,6 +2825,44 @@ mod tests {
         assert_eq!(
             sanitize_image_name("ghcr.io/owner/repo@sha256:abc123"),
             "ghcr.io_owner_repo_sha256_abc123"
+        );
+    }
+
+    #[test]
+    fn overlay_resolv_conf_uses_localhost_when_dns_filter_enabled() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var(guest_env::DNS_FILTER, "1");
+        std::env::remove_var(guest_env::BACKEND);
+        std::env::remove_var(guest_env::DNS);
+
+        assert_eq!(overlay_resolv_conf_contents(), "nameserver 127.0.0.1\n");
+
+        std::env::remove_var(guest_env::DNS_FILTER);
+    }
+
+    #[test]
+    fn overlay_resolv_conf_uses_virtio_dns_server() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::remove_var(guest_env::DNS_FILTER);
+        std::env::set_var(guest_env::BACKEND, guest_env::BACKEND_VIRTIO_NET);
+        std::env::set_var(guest_env::DNS, "100.96.0.1");
+
+        assert_eq!(overlay_resolv_conf_contents(), "nameserver 100.96.0.1\n");
+
+        std::env::remove_var(guest_env::BACKEND);
+        std::env::remove_var(guest_env::DNS);
+    }
+
+    #[test]
+    fn overlay_resolv_conf_defaults_to_public_resolvers() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::remove_var(guest_env::DNS_FILTER);
+        std::env::remove_var(guest_env::BACKEND);
+        std::env::remove_var(guest_env::DNS);
+
+        assert_eq!(
+            overlay_resolv_conf_contents(),
+            "nameserver 8.8.8.8\nnameserver 1.1.1.1\n"
         );
     }
 
