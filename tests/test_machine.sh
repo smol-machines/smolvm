@@ -915,6 +915,113 @@ test_machine_volume_mount_visible_to_exec() {
     [[ "$output" == *"volume-mount-marker-54321"* ]]
 }
 
+# Regression: -v host:/workspace must bind-mount the virtiofs share, NOT
+# create a symlink to /storage/workspace. Two bugs combined to break this:
+#   1. setup_volume_mounts("", ...) → Path("").canonicalize() → ENOENT on Linux
+#   2. /workspace symlink created BEFORE init_volume_mounts() stomped the path
+# See: https://github.com/smol-machines/smolvm/issues/155
+test_volume_mount_workspace_is_virtiofs_not_symlink() {
+    local vm_name="vol-ws-virtiofs-$$"
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    echo "host-workspace-content" > "$tmpdir/host.txt"
+
+    $SMOLVM machine create "$vm_name" -v "$tmpdir:/workspace" 2>&1 || {
+        rm -rf "$tmpdir"; return 1
+    }
+    $SMOLVM machine start --name "$vm_name" 2>&1 || {
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        rm -rf "$tmpdir"; return 1
+    }
+
+    # /workspace must NOT be a symlink
+    local link_check
+    link_check=$($SMOLVM machine exec --name "$vm_name" -- sh -c '[ -L /workspace ] && echo SYMLINK || echo MOUNT' 2>&1)
+    if [[ "$link_check" == *"SYMLINK"* ]]; then
+        echo "FAIL: /workspace is a symlink, expected virtiofs bind mount"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null; $SMOLVM machine delete "$vm_name" -f 2>/dev/null; rm -rf "$tmpdir"
+        return 1
+    fi
+
+    # Host file must be visible
+    local content
+    content=$($SMOLVM machine exec --name "$vm_name" -- cat /workspace/host.txt 2>&1)
+    if [[ "$content" != *"host-workspace-content"* ]]; then
+        echo "FAIL: host file not visible at /workspace: $content"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null; $SMOLVM machine delete "$vm_name" -f 2>/dev/null; rm -rf "$tmpdir"
+        return 1
+    fi
+
+    # Guest write must propagate to host
+    $SMOLVM machine exec --name "$vm_name" -- sh -c 'echo guest-wrote > /workspace/guest.txt' 2>&1
+    if [[ ! -f "$tmpdir/guest.txt" ]] || [[ "$(cat "$tmpdir/guest.txt")" != *"guest-wrote"* ]]; then
+        echo "FAIL: guest write not visible on host"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null; $SMOLVM machine delete "$vm_name" -f 2>/dev/null; rm -rf "$tmpdir"
+        return 1
+    fi
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    rm -rf "$tmpdir"
+}
+
+# Regression: non-/workspace mount paths (e.g., /data) must also work.
+# The canonicalize("") bug affected ALL mount targets, not just /workspace.
+test_volume_mount_arbitrary_path() {
+    local vm_name="vol-arb-path-$$"
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    echo "arbitrary-path-content" > "$tmpdir/data.txt"
+
+    $SMOLVM machine create "$vm_name" -v "$tmpdir:/data" 2>&1 || {
+        rm -rf "$tmpdir"; return 1
+    }
+    $SMOLVM machine start --name "$vm_name" 2>&1 || {
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        rm -rf "$tmpdir"; return 1
+    }
+
+    local content
+    content=$($SMOLVM machine exec --name "$vm_name" -- cat /data/data.txt 2>&1)
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    rm -rf "$tmpdir"
+
+    [[ "$content" == *"arbitrary-path-content"* ]]
+}
+
+# Regression: bare VMs without -v /workspace should still get the default
+# /workspace -> /storage/workspace symlink for convenience.
+test_default_workspace_symlink_without_volume() {
+    local vm_name="vol-ws-default-$$"
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+
+    $SMOLVM machine create "$vm_name" 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || {
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+    }
+
+    # /workspace should be a symlink to /storage/workspace
+    local target
+    target=$($SMOLVM machine exec --name "$vm_name" -- readlink /workspace 2>&1)
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+
+    [[ "$target" == *"/storage/workspace"* ]]
+}
+
 # =============================================================================
 # Port Mapping
 # =============================================================================
@@ -1190,6 +1297,9 @@ run_test "DNS filter: allow-host persists across restart" test_machine_allow_hos
 run_test "Overlay: root is overlayfs" test_machine_overlay_root_active || true
 run_test "Overlay: rootfs persists across reboot" test_machine_rootfs_persists_across_reboot || true
 run_test "Volume: mount visible to exec" test_machine_volume_mount_visible_to_exec || true
+run_test "Volume: -v host:/workspace is virtiofs not symlink" test_volume_mount_workspace_is_virtiofs_not_symlink || true
+run_test "Volume: arbitrary mount path (/data)" test_volume_mount_arbitrary_path || true
+run_test "Volume: default /workspace symlink without -v" test_default_workspace_symlink_without_volume || true
 run_test "Port: mapping host to guest HTTP" test_machine_port_mapping_http || true
 run_test "Overlay: custom size via --overlay" test_machine_overlay_size || true
 

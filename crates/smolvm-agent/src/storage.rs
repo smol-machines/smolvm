@@ -337,7 +337,7 @@ pub fn init_volume_mounts() -> &'static [(String, String, bool)] {
         // Mount using existing logic with empty rootfs prefix so bind mounts
         // go to absolute guest paths (e.g., "/data"), visible to VmExec.
         if !mounts.is_empty() {
-            if let Err(e) = setup_volume_mounts("", &mounts) {
+            if let Err(e) = setup_volume_mounts("/", &mounts) {
                 warn!(error = %e, "failed to setup boot volume mounts");
             }
         }
