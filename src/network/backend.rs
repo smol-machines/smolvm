@@ -1,7 +1,13 @@
 use clap::ValueEnum;
 
-/// libkrun's compatibility feature set for unixstream-backed virtio-net.
+/// Feature set advertised to libkrun for unixstream-backed virtio-net.
+///
+/// The current smoltcp-backed MVP expects ordinary packets from the guest.
+/// Leave checksum and segmentation offloads disabled until the host path
+/// explicitly handles those packet shapes.
 pub const COMPAT_NET_FEATURES: u32 = 0;
+/// TSI feature bit that enables INET socket hijacking.
+pub const TSI_FEATURE_HIJACK_INET: u32 = 1 << 0;
 
 /// Network backend override for machine launch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, ValueEnum)]
@@ -11,8 +17,7 @@ pub enum NetworkBackend {
     #[value(name = "tsi")]
     Tsi,
     /// Use virtio-net with the host-side smolvm network stack.
-    #[serde(alias = "virtio")]
-    #[value(name = "virtio-net", alias = "virtio")]
+    #[value(name = "virtio-net")]
     VirtioNet,
 }
 
@@ -51,8 +56,8 @@ mod tests {
     }
 
     #[test]
-    fn virtio_net_deserializes_legacy_alias() {
-        let value: NetworkBackend = serde_json::from_str("\"virtio\"").unwrap();
-        assert_eq!(value, NetworkBackend::VirtioNet);
+    fn legacy_virtio_name_is_rejected() {
+        let value = serde_json::from_str::<NetworkBackend>("\"virtio\"");
+        assert!(value.is_err());
     }
 }

@@ -1026,7 +1026,6 @@ impl AgentManager {
                 let mut inner = self.inner.lock();
                 inner.state = AgentState::Stopped;
                 inner.child = None;
-                let _ = std::fs::remove_file(&self.startup_error_log);
                 Err(e)
             }
         }
@@ -1134,7 +1133,13 @@ impl AgentManager {
             // Detach from parent's terminal before launching the VM.
             // Without this, libkrun's threads inherit stdin and steal
             // keystrokes from the user's shell.
-            process::detach_stdio();
+            if let Err(e) = process::detach_stdio_to_stderr_file(&self.startup_error_log) {
+                let _ = std::fs::write(
+                    &self.startup_error_log,
+                    format!("failed to redirect stdio: {}", e),
+                );
+                process::exit_child(1);
+            }
 
             // Launch the agent VM (never returns on success)
             let disks = launcher::VmDisks {
@@ -1153,12 +1158,23 @@ impl AgentManager {
                 dns_filter_socket: dns_filter_socket_path.as_deref(),
                 packed_layers_dir: features.packed_layers_dir.as_deref(),
                 extra_disks: &features.extra_disks,
+                dns_filter_enabled: features
+                    .dns_filter_hosts
+                    .as_ref()
+                    .is_some_and(|hosts| !hosts.is_empty()),
             });
 
             // If we get here, something went wrong (stderr is /dev/null,
             // but the error is also logged to agent-startup-error.log)
             if let Err(ref e) = result {
-                let _ = std::fs::write(&self.startup_error_log, e.to_string());
+                let _ = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.startup_error_log)
+                    .and_then(|mut file| {
+                        use std::io::Write;
+                        writeln!(file, "{e}")
+                    });
             }
 
             process::exit_child(1);

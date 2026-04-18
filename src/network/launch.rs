@@ -2,7 +2,7 @@ use crate::data::resources::VmResources;
 use crate::network::backend::NetworkBackend;
 
 /// Current staged-transplant support for plain virtio-net egress.
-const VIRTIO_NET_SUPPORTS_PLAIN_EGRESS: bool = false;
+const VIRTIO_NET_SUPPORTS_PLAIN_EGRESS: bool = true;
 /// Current staged-transplant support for published ports on virtio-net.
 const VIRTIO_NET_SUPPORTS_PUBLISHED_PORTS: bool = false;
 /// Current staged-transplant support for in-process policy on virtio-net.
@@ -189,16 +189,13 @@ mod tests {
     }
 
     #[test]
-    fn test_plain_virtio_currently_falls_back_until_implemented() {
+    fn test_plain_virtio_selects_virtio_backend() {
         let mut resources = resources();
         resources.network = true;
         resources.network_backend = Some(NetworkBackend::VirtioNet);
         let plan = plan_launch_network(&resources, None, 0);
-        assert_eq!(plan.backend, EffectiveNetworkBackend::Tsi);
-        assert_eq!(
-            plan.fallback_reason,
-            Some(NetworkFallbackReason::VirtioNetNotYetImplemented)
-        );
+        assert_eq!(plan.backend, EffectiveNetworkBackend::VirtioNet);
+        assert_eq!(plan.fallback_reason, None);
     }
 
     #[test]
@@ -229,14 +226,11 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_plain_virtio_rejected_until_implemented() {
+    fn test_validate_plain_virtio_allowed() {
         let mut resources = resources();
         resources.network = true;
         resources.network_backend = Some(NetworkBackend::VirtioNet);
-        let err = validate_requested_network_backend(&resources, None, 0).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("current virtio-net implementation is not ready yet"));
+        validate_requested_network_backend(&resources, None, 0).unwrap();
     }
 
     #[test]

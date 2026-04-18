@@ -1,8 +1,14 @@
 #!/bin/bash
 #
-# virtio-net backend selection tests for smolvm.
+# virtio-net tests for smolvm.
 #
-# Covers the part-1 backend-selection plumbing from the user-visible CLI paths.
+# This suite covers the user-visible launcher/runtime behavior from the staged
+# virtio-net transplant:
+# - part 3: the guest sees a configured virtio NIC and can use the host-side
+#   gateway for DNS and outbound TCP
+# - part 4: the `create -> start -> exec`, `machine run`, and `pack run` flows
+#   all drive real virtio-backed guest networking
+# - unsupported features like published ports and policy still fail clearly
 
 source "$(dirname "$0")/common.sh"
 init_smolvm
@@ -18,6 +24,42 @@ echo "=========================================="
 echo "  smolvm Virtio-Net Tests"
 echo "=========================================="
 echo ""
+
+VIRTIO_TEST_IMAGE="${VIRTIO_TEST_IMAGE:-alpine:latest}"
+
+virtio_guest_probe_script() {
+    cat <<'EOF'
+ip route | grep -F 'default via 100.96.0.1 dev eth0' &&
+ip route | grep -F '100.96.0.0/30 dev eth0' &&
+ip addr show dev eth0 | grep -F 'link/ether 02:53:4d:00:00:02' &&
+ip addr show dev eth0 | grep -F 'inet 100.96.0.2/30' &&
+nslookup example.com >/tmp/virtio-nslookup.out &&
+grep -F '100.96.0.1' /tmp/virtio-nslookup.out &&
+apk add --no-cache curl bash >/dev/null &&
+command -v curl >/dev/null &&
+command -v bash >/dev/null &&
+echo virtio-net-ok
+EOF
+}
+
+probe_running_virtio_guest_network() {
+    local vm_name="$1"
+    local output
+    local script
+    script=$(virtio_guest_probe_script)
+
+    output=$($SMOLVM machine exec --name "$vm_name" -- sh -c "$script" 2>&1) || {
+        echo "virtio-net guest networking probe failed"
+        echo "$output"
+        return 1
+    }
+
+    [[ "$output" == *"virtio-net-ok"* ]] || {
+        echo "expected guest networking probe to finish successfully"
+        echo "$output"
+        return 1
+    }
+}
 
 test_machine_create_virtio_net_works() {
     cleanup_machine
@@ -42,18 +84,59 @@ test_machine_create_virtio_net_works() {
     $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
 }
 
-test_machine_run_virtio_net_rejected_until_implemented() {
+test_machine_create_start_exec_virtio_net_works() {
     cleanup_machine
-    local exit_code=0
-    local output
+    local vm_name="virtio-create-start-exec-test-$$"
 
-    output=$($SMOLVM machine run --net --net-backend virtio-net -- true 2>&1) || exit_code=$?
-    [[ $exit_code -ne 0 ]] || {
-        echo "expected run failure for unsupported virtio-net backend"
+    $SMOLVM machine create "$vm_name" --image "$VIRTIO_TEST_IMAGE" --net --net-backend virtio-net >/dev/null 2>&1 || {
+        echo "expected virtio-net machine create to succeed before start"
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
         return 1
     }
-    [[ "$output" == *"not ready yet on this branch"* ]] || {
-        echo "unexpected output: $output"
+
+    $SMOLVM machine start --name "$vm_name" >/dev/null 2>&1 || {
+        $SMOLVM machine delete "$vm_name" -f >/dev/null 2>&1 || true
+        return 1
+    }
+    probe_running_virtio_guest_network "$vm_name" || {
+        $SMOLVM machine stop --name "$vm_name" >/dev/null 2>&1 || true
+        $SMOLVM machine delete "$vm_name" -f >/dev/null 2>&1 || true
+        return 1
+    }
+
+    $SMOLVM machine stop --name "$vm_name" >/dev/null 2>&1 || {
+        $SMOLVM machine delete "$vm_name" -f >/dev/null 2>&1 || true
+        return 1
+    }
+    $SMOLVM machine start --name "$vm_name" >/dev/null 2>&1 || {
+        $SMOLVM machine delete "$vm_name" -f >/dev/null 2>&1 || true
+        return 1
+    }
+    probe_running_virtio_guest_network "$vm_name" || {
+        $SMOLVM machine stop --name "$vm_name" >/dev/null 2>&1 || true
+        $SMOLVM machine delete "$vm_name" -f >/dev/null 2>&1 || true
+        return 1
+    }
+
+    $SMOLVM machine stop --name "$vm_name" >/dev/null 2>&1 || true
+    $SMOLVM machine delete "$vm_name" -f >/dev/null 2>&1 || true
+}
+
+test_machine_run_virtio_net_works() {
+    cleanup_machine
+    local output
+    local script
+    script=$(virtio_guest_probe_script)
+
+    output=$($SMOLVM machine run --image "$VIRTIO_TEST_IMAGE" --net --net-backend virtio-net -- sh -c "$script" 2>&1) || {
+        echo "virtio-net machine run probe failed"
+        echo "$output"
+        return 1
+    }
+
+    [[ "$output" == *"virtio-net-ok"* ]] || {
+        echo "expected machine run virtio-net probe to finish successfully"
+        echo "$output"
         return 1
     }
 }
@@ -71,7 +154,7 @@ test_machine_create_virtio_net_ports_rejected() {
         return 1
     }
     [[ "$output" == *"published ports are not supported"* ]] || {
-        echo "unexpected output: $output"
+        echo "$output"
         return 1
     }
 }
@@ -94,30 +177,37 @@ test_machine_create_virtio_net_policy_rejected() {
     }
 }
 
-test_pack_run_virtio_net_rejected_until_implemented() {
+test_pack_run_virtio_net_works() {
     local output_path="$TEST_DIR/virtio-pack"
-    local exit_code=0
     local output
+    local script
+    script=$(virtio_guest_probe_script)
 
     if [[ ! -f "$output_path.smolmachine" ]]; then
-        $SMOLVM pack create --image alpine:latest -o "$output_path" >/dev/null 2>&1 || return 1
+        $SMOLVM pack create --image "$VIRTIO_TEST_IMAGE" -o "$output_path" >/dev/null 2>&1 || {
+            echo "expected pack create to succeed before pack run"
+            return 1
+        }
     fi
 
-    output=$($SMOLVM pack run --sidecar "$output_path.smolmachine" --net --net-backend virtio-net -- true 2>&1) || exit_code=$?
-    [[ $exit_code -ne 0 ]] || {
-        echo "expected pack run failure for unsupported virtio-net backend"
+    output=$($SMOLVM pack run --sidecar "$output_path.smolmachine" --net --net-backend virtio-net -- sh -c "$script" 2>&1) || {
+        echo "virtio-net pack run probe failed"
+        echo "$output"
         return 1
     }
-    [[ "$output" == *"not ready yet on this branch"* ]] || {
-        echo "unexpected output: $output"
+
+    [[ "$output" == *"virtio-net-ok"* ]] || {
+        echo "expected pack run virtio-net probe to finish successfully"
+        echo "$output"
         return 1
     }
 }
 
 run_test "Machine create: virtio-net works" test_machine_create_virtio_net_works || true
-run_test "Machine run: virtio-net rejected until implemented" test_machine_run_virtio_net_rejected_until_implemented || true
+run_test "Machine create/start/exec: virtio-net guest networking works" test_machine_create_start_exec_virtio_net_works || true
+run_test "Machine run: virtio-net guest networking works" test_machine_run_virtio_net_works || true
 run_test "Machine create: virtio-net + published ports rejected" test_machine_create_virtio_net_ports_rejected || true
 run_test "Machine create: virtio-net + policy rejected" test_machine_create_virtio_net_policy_rejected || true
-run_test "Pack run: virtio-net rejected until implemented" test_pack_run_virtio_net_rejected_until_implemented || true
+run_test "Pack run: virtio-net guest networking works" test_pack_run_virtio_net_works || true
 
 print_summary "Virtio-Net Tests"
