@@ -1,0 +1,1 @@
+Hello from a local file copied into the image.
