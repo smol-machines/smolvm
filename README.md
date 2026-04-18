@@ -68,6 +68,14 @@ smolvm pack create --image python:3.12-alpine -o ./python312
 # Python 3.12.x — isolated, no pyenv/venv/conda needed
 ```
 
+**Pack a local Docker image** — route a locally available Docker image through a temporary local registry before packing.
+
+```bash
+./scripts/pack-local-image.sh --image "$your_local_image" --output "$output_path"
+```
+
+See [examples/pack-local-image](examples/pack-local-image) for the full example and sample files.
+
 **Persistent machines for development** — create, stop, start. Installed packages survive restarts.
 
 ```bash
