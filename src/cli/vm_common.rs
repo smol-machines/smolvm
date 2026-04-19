@@ -14,6 +14,7 @@ use smolvm::data::validate_vm_name;
 use smolvm::db::SmolvmDb;
 use smolvm::network::NetworkBackend;
 use smolvm::storage::{DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
+use smolvm_protocol::ImageInfo;
 use std::io::Write;
 
 // ============================================================================
@@ -207,6 +208,7 @@ pub(crate) fn run_init_commands(
     client: &mut smolvm::agent::AgentClient,
     init: &[String],
     image: Option<&str>,
+    image_info: Option<&ImageInfo>,
     env: &[(String, String)],
     workdir: Option<&str>,
     record_mounts: &[(String, String, bool)],
@@ -218,7 +220,16 @@ pub(crate) fn run_init_commands(
     println!("Running {} init command(s)...", init.len());
     for (i, cmd) in init.iter().enumerate() {
         let (exit_code, stdout, stderr) = if let Some(image) = image {
-            let config = build_init_run_config(image, cmd, env, workdir, record_mounts, overlay_id);
+            let (effective_env, effective_workdir) =
+                resolve_image_runtime_defaults(image_info, env, workdir);
+            let config = build_init_run_config(
+                image,
+                cmd,
+                &effective_env,
+                effective_workdir.as_deref(),
+                record_mounts,
+                overlay_id,
+            );
             client.run_non_interactive(config)?
         } else {
             client.vm_exec(
@@ -251,6 +262,52 @@ pub(crate) fn run_init_commands(
 /// features (`&&`, `|`, env expansion) without quoting gymnastics.
 fn init_argv(cmd: &str) -> Vec<String> {
     vec!["sh".into(), "-c".into(), cmd.to_string()]
+}
+
+/// Resolve effective env/workdir for image-backed execution.
+///
+/// Image metadata provides the baseline defaults. Explicit values from the
+/// CLI/Smolfile/persisted machine config override those defaults by key, while
+/// workdir uses the explicit value when present and otherwise falls back to the
+/// image's `WorkingDir`.
+pub(crate) fn resolve_image_runtime_defaults(
+    image_info: Option<&ImageInfo>,
+    explicit_env: &[(String, String)],
+    explicit_workdir: Option<&str>,
+) -> (Vec<(String, String)>, Option<String>) {
+    let mut env = Vec::new();
+
+    if let Some(image_info) = image_info {
+        for spec in &image_info.env {
+            if let Some((key, value)) = smolvm::util::parse_env_spec(spec) {
+                apply_env_override(&mut env, key, value);
+            }
+        }
+    }
+
+    env = merge_env_overrides(&env, explicit_env);
+
+    let workdir = explicit_workdir
+        .map(str::to_string)
+        .or_else(|| image_info.and_then(|info| info.workdir.clone()));
+
+    (env, workdir)
+}
+
+pub(crate) fn merge_env_overrides(
+    base_env: &[(String, String)],
+    overrides: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut env = base_env.to_vec();
+    for (key, value) in overrides {
+        apply_env_override(&mut env, key.clone(), value.clone());
+    }
+    env
+}
+
+fn apply_env_override(env: &mut Vec<(String, String)>, key: String, value: String) {
+    env.retain(|(existing, _)| existing != &key);
+    env.push((key, value));
 }
 
 /// Build the `RunConfig` an image-based init command runs under.
@@ -558,12 +615,15 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
     // would hit the bare Alpine agent and fail with "not found".
     let mut client = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
 
-    if record.source_smolmachine.is_some() {
+    let image_info = if record.source_smolmachine.is_some() {
         // Layers already mounted via virtiofs — no pull needed.
+        None
     } else if let Some(ref image) = record.image {
         println!("Pulling {}...", image);
-        let _image_info = crate::cli::pull_with_progress(&mut client, image, None)?;
-    }
+        Some(crate::cli::pull_with_progress(&mut client, image, None)?)
+    } else {
+        None
+    };
 
     // Run init commands if configured (before reporting success).
     // `run_init_commands` branches on image: container path for
@@ -572,6 +632,7 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
         &mut client,
         &record.init,
         record.image.as_deref(),
+        image_info.as_ref(),
         &record.env,
         record.workdir.as_deref(),
         &record.mounts,
@@ -774,15 +835,18 @@ pub fn start_vm_default() -> smolvm::Result<()> {
             let mut client =
                 smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
 
-            if let Some(ref image) = record.image {
+            let image_info = if let Some(ref image) = record.image {
                 println!("Pulling {}...", image);
-                let _ = crate::cli::pull_with_progress(&mut client, image, None)?;
-            }
+                Some(crate::cli::pull_with_progress(&mut client, image, None)?)
+            } else {
+                None
+            };
 
             if let Err(e) = run_init_commands(
                 &mut client,
                 &record.init,
                 record.image.as_deref(),
+                image_info.as_ref(),
                 &record.env,
                 record.workdir.as_deref(),
                 &record.mounts,
@@ -1317,6 +1381,23 @@ pub fn cleanup_orphaned_ephemeral_vms() {
 mod init_runner_tests {
     use super::*;
 
+    fn sample_image_info(env: Vec<&str>, workdir: Option<&str>) -> ImageInfo {
+        ImageInfo {
+            reference: "alpine:latest".to_string(),
+            digest: "sha256:test".to_string(),
+            size: 0,
+            created: None,
+            architecture: "x86_64".to_string(),
+            os: "linux".to_string(),
+            layer_count: 0,
+            layers: Vec::new(),
+            entrypoint: Vec::new(),
+            cmd: Vec::new(),
+            env: env.into_iter().map(str::to_string).collect(),
+            workdir: workdir.map(str::to_string),
+        }
+    }
+
     #[test]
     fn format_init_failure_includes_stderr_only() {
         // Single stream → no "stdout:" / "stderr:" labels needed; the
@@ -1444,5 +1525,109 @@ mod init_runner_tests {
         assert!(config.workdir.is_none());
         assert!(config.env.is_empty());
         assert_eq!(config.persistent_overlay_id.as_deref(), Some("vm"));
+    }
+
+    #[test]
+    fn resolve_image_runtime_defaults_uses_image_env_and_workdir() {
+        let image_info = sample_image_info(
+            vec!["FOO=from-image", "BAR=from-image"],
+            Some("/image-workdir"),
+        );
+
+        let (env, workdir) = resolve_image_runtime_defaults(Some(&image_info), &[], None);
+
+        assert_eq!(
+            env,
+            vec![
+                ("FOO".to_string(), "from-image".to_string()),
+                ("BAR".to_string(), "from-image".to_string()),
+            ]
+        );
+        assert_eq!(workdir.as_deref(), Some("/image-workdir"));
+    }
+
+    #[test]
+    fn resolve_image_runtime_defaults_explicit_values_override_image_defaults() {
+        let image_info = sample_image_info(
+            vec!["FOO=from-image", "BAR=from-image"],
+            Some("/image-workdir"),
+        );
+        let explicit_env = vec![
+            ("BAR".to_string(), "from-cli".to_string()),
+            ("BAZ".to_string(), "from-cli".to_string()),
+        ];
+
+        let (env, workdir) = resolve_image_runtime_defaults(
+            Some(&image_info),
+            &explicit_env,
+            Some("/explicit-workdir"),
+        );
+
+        assert_eq!(
+            env,
+            vec![
+                ("FOO".to_string(), "from-image".to_string()),
+                ("BAR".to_string(), "from-cli".to_string()),
+                ("BAZ".to_string(), "from-cli".to_string()),
+            ]
+        );
+        assert_eq!(workdir.as_deref(), Some("/explicit-workdir"));
+    }
+
+    #[test]
+    fn resolve_image_runtime_defaults_ignores_invalid_image_env_and_last_value_wins() {
+        let image_info = sample_image_info(
+            vec!["BROKEN", "=empty-key", "FOO=from-image", "FOO=last-image"],
+            Some("/image-workdir"),
+        );
+        let explicit_env = vec![
+            ("BAR".to_string(), "from-cli".to_string()),
+            ("BAR".to_string(), "last-cli".to_string()),
+        ];
+
+        let (env, workdir) = resolve_image_runtime_defaults(Some(&image_info), &explicit_env, None);
+
+        assert_eq!(
+            env,
+            vec![
+                ("FOO".to_string(), "last-image".to_string()),
+                ("BAR".to_string(), "last-cli".to_string()),
+            ]
+        );
+        assert_eq!(workdir.as_deref(), Some("/image-workdir"));
+    }
+
+    #[test]
+    fn resolve_image_runtime_defaults_falls_back_to_explicit_values_without_image_info() {
+        let explicit_env = vec![("FOO".to_string(), "from-explicit".to_string())];
+
+        let (env, workdir) =
+            resolve_image_runtime_defaults(None, &explicit_env, Some("/explicit-workdir"));
+
+        assert_eq!(env, explicit_env);
+        assert_eq!(workdir.as_deref(), Some("/explicit-workdir"));
+    }
+
+    #[test]
+    fn merge_env_overrides_last_value_wins_by_key() {
+        let base_env = vec![
+            ("FOO".to_string(), "from-record".to_string()),
+            ("BAR".to_string(), "from-record".to_string()),
+        ];
+        let overrides = vec![
+            ("BAR".to_string(), "from-cli".to_string()),
+            ("BAZ".to_string(), "from-cli".to_string()),
+        ];
+
+        let merged = merge_env_overrides(&base_env, &overrides);
+
+        assert_eq!(
+            merged,
+            vec![
+                ("FOO".to_string(), "from-record".to_string()),
+                ("BAR".to_string(), "from-cli".to_string()),
+                ("BAZ".to_string(), "from-cli".to_string()),
+            ]
+        );
     }
 }

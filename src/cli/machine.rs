@@ -482,6 +482,7 @@ impl RunCmd {
                 &mut client,
                 &params.init,
                 image.as_deref(),
+                image_info.as_ref(),
                 &init_env,
                 params.workdir.as_deref(),
                 &record_mounts,
@@ -523,11 +524,16 @@ impl RunCmd {
             vec![DEFAULT_SHELL_CMD.to_string()]
         };
 
-        let env = parse_env_list(&params.env);
+        let explicit_env = parse_env_list(&params.env);
         let mount_bindings = mounts_to_virtiofs_bindings(&mounts);
 
         // Two modes: with image or bare VM (no image)
         if let Some(ref img) = image {
+            let (resolved_env, resolved_workdir) = vm_common::resolve_image_runtime_defaults(
+                image_info.as_ref(),
+                &explicit_env,
+                params.workdir.as_deref(),
+            );
             if self.detach {
                 // Detach mode: persist the record with image info.
                 // The VM is already running. The image will be pulled and
@@ -565,7 +571,7 @@ impl RunCmd {
                                 overlay_gb: params.overlay_gb,
                                 allowed_cidrs: params.allowed_cidrs.clone(),
                                 init: params.init.clone(),
-                                env: parse_env_list(&params.env),
+                                env: explicit_env.clone(),
                                 workdir: params.workdir.clone(),
                                 image: Some(img.clone()),
                                 entrypoint: params.entrypoint.clone(),
@@ -596,16 +602,16 @@ impl RunCmd {
 
                 let exit_code = if interactive || tty {
                     let config = RunConfig::new(img, command)
-                        .with_env(env)
-                        .with_workdir(params.workdir.clone())
+                        .with_env(resolved_env.clone())
+                        .with_workdir(resolved_workdir.clone())
                         .with_mounts(mount_bindings)
                         .with_timeout(self.timeout)
                         .with_tty(tty);
                     client.run_interactive(config)?
                 } else {
                     let config = RunConfig::new(img, command)
-                        .with_env(env)
-                        .with_workdir(params.workdir.clone())
+                        .with_env(resolved_env)
+                        .with_workdir(resolved_workdir)
                         .with_mounts(mount_bindings)
                         .with_timeout(self.timeout);
                     let (exit_code, stdout, stderr) = client.run_non_interactive(config)?;
@@ -639,7 +645,11 @@ impl RunCmd {
                             .map(|s| s.to_string())
                             .collect::<Vec<_>>();
                 if !is_idle {
-                    let pid = client.vm_exec_background(command, env, params.workdir.clone())?;
+                    let pid = client.vm_exec_background(
+                        command,
+                        explicit_env,
+                        params.workdir.clone(),
+                    )?;
                     tracing::info!(pid = pid, "background workload started");
                 }
 
@@ -701,14 +711,14 @@ impl RunCmd {
                 let exit_code = if interactive || tty {
                     client.vm_exec_interactive(
                         command,
-                        env,
+                        explicit_env,
                         params.workdir.clone(),
                         self.timeout,
                         tty,
                     )?
                 } else {
                     let (exit_code, stdout, stderr) =
-                        client.vm_exec(command, env, params.workdir.clone(), self.timeout)?;
+                        client.vm_exec(command, explicit_env, params.workdir.clone(), self.timeout)?;
                     if !stdout.is_empty() {
                         let _ = std::io::stdout().write_all(&stdout);
                     }
@@ -784,7 +794,7 @@ impl ExecCmd {
         // AgentManager::Drop which calls stop() and kills the VM.
         manager.detach();
 
-        let env = parse_env_list(&self.env);
+        let explicit_env = parse_env_list(&self.env);
 
         // Load machine record for workdir and image info
         let name = self.name.clone().unwrap_or_else(|| "default".to_string());
@@ -803,7 +813,7 @@ impl ExecCmd {
         if self.stream {
             let events = client.vm_exec_streaming(
                 self.command.clone(),
-                env,
+                explicit_env.clone(),
                 workdir.clone(),
                 self.timeout,
             )?;
@@ -838,14 +848,37 @@ impl ExecCmd {
             .unwrap_or_default();
 
         if let Some(ref image) = record_image {
+            let image_info = match client.query(image) {
+                Ok(info) => info,
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        image = %image,
+                        "failed to query local image metadata"
+                    );
+                    None
+                }
+            };
+            let configured_env = vm_common::merge_env_overrides(
+                record
+                    .as_ref()
+                    .map(|r| r.env.as_slice())
+                    .unwrap_or(&[]),
+                &explicit_env,
+            );
+            let (resolved_env, resolved_workdir) = vm_common::resolve_image_runtime_defaults(
+                image_info.as_ref(),
+                &configured_env,
+                workdir.as_deref(),
+            );
             // Image-based machine: exec inside the image's rootfs via crun.
             // Use machine name as persistent overlay ID so filesystem changes
             // (e.g. package installs) survive across exec sessions.
             let machine_name = name.clone();
             if self.interactive || self.tty {
                 let config = smolvm::agent::RunConfig::new(image, self.command.clone())
-                    .with_env(env)
-                    .with_workdir(workdir.clone())
+                    .with_env(resolved_env.clone())
+                    .with_workdir(resolved_workdir.clone())
                     .with_mounts(mount_bindings)
                     .with_timeout(self.timeout)
                     .with_tty(self.tty)
@@ -855,8 +888,8 @@ impl ExecCmd {
             }
 
             let config = smolvm::agent::RunConfig::new(image, self.command.clone())
-                .with_env(env)
-                .with_workdir(workdir.clone())
+                .with_env(resolved_env)
+                .with_workdir(resolved_workdir)
                 .with_mounts(mount_bindings)
                 .with_timeout(self.timeout)
                 .with_persistent_overlay(Some(machine_name));
@@ -867,7 +900,7 @@ impl ExecCmd {
             if self.interactive || self.tty {
                 let exit_code = client.vm_exec_interactive(
                     self.command.clone(),
-                    env,
+                    explicit_env.clone(),
                     workdir.clone(),
                     self.timeout,
                     self.tty,
@@ -876,7 +909,12 @@ impl ExecCmd {
             }
 
             let (exit_code, stdout, stderr) =
-                client.vm_exec(self.command.clone(), env, workdir.clone(), self.timeout)?;
+                client.vm_exec(
+                    self.command.clone(),
+                    explicit_env,
+                    workdir.clone(),
+                    self.timeout,
+                )?;
             vm_common::print_output_and_exit(&manager, exit_code, &stdout, &stderr);
         }
     }
