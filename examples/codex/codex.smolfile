@@ -1,0 +1,26 @@
+# OpenAI Codex CLI in a hardware-isolated microVM
+#
+# Mounts your existing ~/.codex auth so no API key is needed:
+#
+#   smolvm machine run -it -s examples/codex/codex.smolfile \
+#     -v ~/.codex:/root/.codex -v ./my-project:/workspace
+#
+# Or pass a key explicitly (no config mount needed):
+#
+#   OPENAI_API_KEY=sk-... smolvm machine run -it -s examples/codex/codex.smolfile \
+#     -v ./my-project:/workspace
+#
+# Codex runs with full-auto mode since VM isolation replaces
+# the need for Docker/sandbox — the microVM IS the sandbox.
+
+image = "node:22-alpine"
+entrypoint = ["sh", "-c", "npm install -g @openai/codex > /dev/null 2>&1 && exec codex \"$@\"", "--"]
+cmd = ["--full-auto"]
+workdir = "/workspace"
+
+cpus = 4
+memory = 8192
+net = true
+
+[dev]
+volumes = [".:/workspace"]
