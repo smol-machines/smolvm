@@ -49,12 +49,10 @@ jobs:
           key: macos-arm64-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: macos-arm64-cargo-
 
-      - name: Setup Git LFS
-        run: |
-          git lfs install
-          git lfs pull
+      - name: Fetch native libraries
+        run: ./scripts/ensure-libs.sh
 
-      - name: Verify LFS dylibs
+      - name: Verify native libraries
         run: |
           ls -la lib/
           file lib/*.dylib

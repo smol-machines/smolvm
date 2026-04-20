@@ -83,10 +83,12 @@ fi
 
 echo "Building smolvm distribution: ${DIST_NAME}"
 
-# Check for git-lfs (required for library binaries)
-if ! command -v git-lfs &> /dev/null && ! git lfs version &> /dev/null 2>&1; then
-    echo "Error: git-lfs is required to build smolvm distributions"
-    exit 1
+# Fetch native libraries from pinned GitHub Release asset unless the caller
+# opted into a local libkrun build. The --with-local-libkrun path builds
+# libkrun from a checkout and still expects libkrunfw to be staged, which
+# ensure-libs.sh populates from the release asset.
+if [[ -z "${LIB_DIR:-}" ]]; then
+    "$SCRIPT_DIR/ensure-libs.sh"
 fi
 
 # Resolve bundled library directory

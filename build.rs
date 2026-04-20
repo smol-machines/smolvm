@@ -36,30 +36,23 @@
 //! LIBKRUN_STATIC=/path/to/libkrun.a cargo build
 //! ```
 
-#[cfg(target_os = "linux")]
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
-/// Check if a file is a Git LFS pointer (not the actual binary).
-///
-/// LFS pointer files start with "version https://git-lfs.github.com/spec/v1"
-/// and are small text files. This prevents the build from trying to link
-/// against LFS pointers when the actual files haven't been fetched.
-#[cfg(target_os = "linux")]
+/// Legacy defense-in-depth check: detect a stale Git LFS pointer file left
+/// behind from older clones. The repo no longer tracks native libraries via
+/// LFS; `scripts/ensure-libs.sh` fetches them from GitHub Release assets.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn is_lfs_pointer(path: &Path) -> bool {
-    // LFS pointers are small text files (typically < 200 bytes)
     if let Ok(metadata) = std::fs::metadata(path) {
         if metadata.len() > 500 {
-            return false; // Too large to be an LFS pointer
+            return false;
         }
     }
-
-    // Check if the file starts with the LFS version header
     if let Ok(content) = std::fs::read_to_string(path) {
         return content.starts_with("version https://git-lfs.github.com/spec/v1");
     }
-
     false
 }
 
@@ -127,15 +120,22 @@ fn link_libkrun() {
 
     // Option 1: Bundle libraries with the binary
     if let Ok(bundle_path) = std::env::var("LIBKRUN_BUNDLE") {
-        // On Linux, check that the library is not an LFS pointer before linking
+        // Defense-in-depth: detect a stale Git LFS pointer from a legacy clone.
+        // The repo no longer uses LFS for native libs; run scripts/ensure-libs.sh
+        // to populate lib/ from the pinned GitHub Release asset.
+        #[cfg(target_os = "macos")]
+        let candidate = std::path::Path::new(&bundle_path).join("libkrun.dylib");
         #[cfg(target_os = "linux")]
-        {
-            let lib_path = std::path::Path::new(&bundle_path).join("libkrun.so");
-            if lib_path.exists() && is_lfs_pointer(&lib_path) {
-                println!("cargo:error=libkrun.so is a Git LFS pointer, not the actual library.");
-                println!("cargo:error=Run 'git lfs pull' to fetch the actual library binary.");
-                panic!("Git LFS pointer detected");
-            }
+        let candidate = std::path::Path::new(&bundle_path).join("libkrun.so");
+        if candidate.exists() && is_lfs_pointer(&candidate) {
+            println!(
+                "cargo:error={} is a stale Git LFS pointer, not the actual library.",
+                candidate.display()
+            );
+            println!(
+                "cargo:error=Run scripts/ensure-libs.sh to fetch native libraries from GitHub Releases."
+            );
+            panic!("Git LFS pointer detected");
         }
 
         println!("cargo:rustc-link-search=native={}", bundle_path);
@@ -147,16 +147,30 @@ fn link_libkrun() {
             println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path/lib");
             println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path/../lib");
 
-            // Change the library's install_name to use @rpath and re-sign
+            // Ensure libkrun.dylib's install_name is @rpath-based so the linker
+            // finds it at runtime via the rpaths above. This has to be idempotent:
+            // running install_name_tool + codesign mutates the file bytes every
+            // time, which would invalidate the pinned SHA256 in lib/manifest.toml
+            // on every build and force ensure-libs.sh to re-fetch.
             let lib_path = std::path::Path::new(&bundle_path).join("libkrun.dylib");
             if lib_path.exists() {
-                let _ = Command::new("install_name_tool")
-                    .args(["-id", "@rpath/libkrun.dylib", lib_path.to_str().unwrap()])
-                    .status();
-                // Re-sign after modification (macOS requires valid signature)
-                let _ = Command::new("codesign")
-                    .args(["--force", "--sign", "-", lib_path.to_str().unwrap()])
-                    .status();
+                let current_id = Command::new("otool")
+                    .args(["-D", lib_path.to_str().unwrap()])
+                    .output()
+                    .ok()
+                    .and_then(|o| String::from_utf8(o.stdout).ok())
+                    .unwrap_or_default();
+                let already_rpath = current_id
+                    .lines()
+                    .any(|l| l.trim() == "@rpath/libkrun.dylib");
+                if !already_rpath {
+                    let _ = Command::new("install_name_tool")
+                        .args(["-id", "@rpath/libkrun.dylib", lib_path.to_str().unwrap()])
+                        .status();
+                    let _ = Command::new("codesign")
+                        .args(["--force", "--sign", "-", lib_path.to_str().unwrap()])
+                        .status();
+                }
             }
         }
         #[cfg(target_os = "linux")]

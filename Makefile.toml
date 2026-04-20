@@ -17,9 +17,16 @@ skip_core_tasks = true
 # Development Tasks
 # =============================================================================
 
+[tasks.ensure-libs]
+description = "Fetch native libkrun/libkrunfw binaries pinned in lib/manifest.toml"
+category = "Development"
+script_runner = "bash"
+script = ["./scripts/ensure-libs.sh"]
+
 [tasks.dev]
 description = "Build and codesign dev binary (macOS auto-signs)"
 category = "Development"
+dependencies = ["ensure-libs"]
 env = { LIBKRUN_BUNDLE = "${CARGO_MAKE_WORKING_DIRECTORY}/lib" }
 
 script_runner = "bash"
@@ -42,6 +49,7 @@ echo "  cargo make smolvm sandbox run --net alpine:latest -- echo hello"
 [tasks.ensure-binary-signed]
 description = "Ensure binary is built and signed (macOS)"
 category = "Development"
+dependencies = ["ensure-libs"]
 script_runner = "bash"
 script = [
 '''
@@ -99,6 +107,7 @@ fi
 [tasks.dist]
 description = "Build distribution package"
 category = "Distribution"
+dependencies = ["ensure-libs"]
 script_runner = "bash"
 script = [
 '''
@@ -189,8 +198,34 @@ script = [
 [tasks.test-lib]
 description = "Run unit tests (no VM required)"
 category = "Test"
-command = "cargo"
-args = ["test", "--lib"]
+dependencies = ["ensure-libs"]
+script_runner = "bash"
+script = [
+'''
+case "$(uname -s)" in
+  Darwin)
+    export LIBKRUN_BUNDLE="${CARGO_MAKE_WORKING_DIRECTORY}/lib"
+    export DYLD_LIBRARY_PATH="${CARGO_MAKE_WORKING_DIRECTORY}/lib"
+    ;;
+  Linux)
+    case "$(uname -m)" in
+      x86_64|amd64) larch=x86_64 ;;
+      aarch64|arm64) larch=aarch64 ;;
+      *) larch="$(uname -m)" ;;
+    esac
+    libdir="${CARGO_MAKE_WORKING_DIRECTORY}/lib/linux-${larch}"
+    export LIBKRUN_BUNDLE="$libdir"
+    export LD_LIBRARY_PATH="$libdir"
+    export LIBRARY_PATH="$libdir"
+    ;;
+  *)
+    echo "test-lib: unsupported OS $(uname -s)" >&2
+    exit 1
+    ;;
+esac
+cargo test --lib
+'''
+]
 
 # =============================================================================
 # Install Tasks

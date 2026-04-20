@@ -137,11 +137,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          lfs: true
           submodules: ${{ matrix.platform == 'linux-x86_64' && 'recursive' || 'false' }}
 
-      - name: Pull LFS files
-        run: git lfs pull
+      - name: Fetch native libraries
+        run: ./scripts/ensure-libs.sh
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -172,7 +171,7 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install e2fsprogs
 
-      - name: Verify LFS libraries
+      - name: Verify native libraries
         run: |
           echo "Library directory: ${{ matrix.lib_dir }}"
           ls -la ${{ matrix.lib_dir }}/
