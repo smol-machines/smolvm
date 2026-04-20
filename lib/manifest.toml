@@ -1,0 +1,51 @@
+# Pinned smolvm release used by scripts/ensure-libs.sh to fetch the native
+# libkrun/libkrunfw binaries into lib/ at build time.
+#
+# Bump release_tag and the tarball/file sha256 values together whenever the
+# bundled native libraries change. Do not commit the binaries themselves.
+#
+# Manifest consumed by scripts/ensure-libs.sh.
+
+release_tag = "v0.5.19"
+repo = "smol-machines/smolvm"
+
+# --- macOS arm64 -----------------------------------------------------------
+[platform."darwin-arm64"]
+tarball = "smolvm-0.5.19-darwin-arm64.tar.gz"
+tarball_sha256 = "47ccf081e368d3f8867a53a9e887eb3212f2cc68da98d706cc99c9022ddcceaa"
+# Where to put the extracted library files, relative to the repo root.
+extract_to = "lib"
+# Where the `lib/` directory lives inside the extracted tarball, relative to
+# the top-level tarball directory (e.g. smolvm-0.5.19-darwin-arm64/).
+tarball_lib_dir = "lib"
+files = [
+    { name = "libkrun.dylib", kind = "file", sha256 = "9d6113d26b4490a2efba4a68eb623ff88702313e6c53b47c68e767ccec3b16eb" },
+    { name = "libkrunfw.5.dylib", kind = "file", sha256 = "e5510a71b5c6581a03cc46af89574413d1566380064477b6cda563df0a86fe38" },
+    { name = "libkrunfw.dylib", kind = "symlink", target = "libkrunfw.5.dylib" },
+]
+
+# --- Linux x86_64 ----------------------------------------------------------
+[platform."linux-x86_64"]
+tarball = "smolvm-0.5.19-linux-x86_64.tar.gz"
+tarball_sha256 = "7acee4ad8e2ade57b74420b0aa173e126b65053f89b2461a00dfa5831f1757b2"
+extract_to = "lib/linux-x86_64"
+tarball_lib_dir = "lib"
+files = [
+    { name = "libkrun.so", kind = "file", sha256 = "64e623a2c281a920ac50391e1d010eb200714f52e7ce81b6cbb37a34e8d9efe4" },
+    { name = "libkrunfw.so.5.3.0", kind = "file", sha256 = "2edb8a0686e3f01d47503dabe73594a530a9fa4ef332d6a603f2fdc8db9dfc3a" },
+    { name = "libkrun.so.1", kind = "symlink", target = "libkrun.so" },
+    { name = "libkrunfw.so.5", kind = "symlink", target = "libkrunfw.so.5.3.0" },
+    { name = "libkrunfw.so", kind = "symlink", target = "libkrunfw.so.5" },
+]
+
+# --- Linux aarch64 ---------------------------------------------------------
+# No release tarball for linux-aarch64 is published yet. When the owner adds
+# one, populate this section by downloading the tarball, computing SHA256 of
+# the tarball and each extracted library file, and mirroring the darwin-arm64
+# and linux-x86_64 entries above.
+# [platform."linux-aarch64"]
+# tarball = "smolvm-<version>-linux-aarch64.tar.gz"
+# tarball_sha256 = "..."
+# extract_to = "lib/linux-aarch64"
+# tarball_lib_dir = "lib"
+# files = [ ... ]

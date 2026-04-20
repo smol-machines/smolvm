@@ -20,8 +20,13 @@ Cargo.lock
 /dist/smolvm-*/
 /dist/*.tar.gz
 
-# Bundled libraries are in the /lib (large binaries - download or build locally)
-# These are bundled into release tarballs by build-dist.sh
+# Native libraries populated by scripts/ensure-libs.sh from GitHub Release assets.
+# Only lib/manifest.toml is tracked; everything else under lib/ is fetched at
+# build time and must never be committed.
+/lib/libkrun*
+/lib/libkrunfw*
+/lib/linux-*/
+/lib/darwin-*/
 
 # Agent rootfs is generated in target/ by build-agent-rootfs.sh
 

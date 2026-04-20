@@ -16,8 +16,12 @@ Layout convention:
 Bundled native library rule:
 
 - Embedded SDKs ship package-local copies of `libkrun` and `libkrunfw`.
-- Those libraries are always staged from the `smolvm` repo's bundled `./lib`
-  directory, not from Homebrew or other system locations.
+- Those libraries are always staged from the `smolvm` repo's `./lib` directory,
+  not from Homebrew or other system locations.
+- `./lib` is populated by `scripts/ensure-libs.sh`, which fetches the pinned
+  binaries from the `smolvm` GitHub Release assets listed in
+  `lib/manifest.toml`. Run it (or `cargo make ensure-libs`) before building
+  SDK packages.
 - Shared helpers in `sdks/scripts/` should be used to copy the current host's
   libraries into each SDK package's `lib/` directory.
 
