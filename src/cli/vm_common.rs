@@ -282,7 +282,7 @@ pub(crate) struct ImageRuntimeDefaults {
 
 pub(crate) fn resolve_image_runtime_defaults(
     image_info: Option<&ImageInfo>,
-    explicit_env: &[(String, String)],
+    provided_env: &[(String, String)],
     explicit_workdir: Option<&str>,
 ) -> ImageRuntimeDefaults {
     let mut env = Vec::new();
@@ -295,7 +295,7 @@ pub(crate) fn resolve_image_runtime_defaults(
         }
     }
 
-    env = merge_env_overrides(&env, explicit_env);
+    env = merge_env_overrides(&env, provided_env);
 
     let workdir = explicit_workdir
         .map(str::to_string)
@@ -1631,14 +1631,14 @@ mod init_runner_tests {
             Some("/image-workdir"),
             Some("steam"),
         );
-        let explicit_env = vec![
+        let provided_env = vec![
             ("BAR".to_string(), "from-cli".to_string()),
             ("BAZ".to_string(), "from-cli".to_string()),
         ];
 
         let defaults = resolve_image_runtime_defaults(
             Some(&image_info),
-            &explicit_env,
+            &provided_env,
             Some("/explicit-workdir"),
         );
 
@@ -1661,12 +1661,12 @@ mod init_runner_tests {
             Some("/image-workdir"),
             Some("1000:1000"),
         );
-        let explicit_env = vec![
+        let provided_env = vec![
             ("BAR".to_string(), "from-cli".to_string()),
             ("BAR".to_string(), "last-cli".to_string()),
         ];
 
-        let defaults = resolve_image_runtime_defaults(Some(&image_info), &explicit_env, None);
+        let defaults = resolve_image_runtime_defaults(Some(&image_info), &provided_env, None);
 
         assert_eq!(
             defaults.env,
@@ -1681,12 +1681,12 @@ mod init_runner_tests {
 
     #[test]
     fn resolve_image_runtime_defaults_falls_back_to_explicit_values_without_image_info() {
-        let explicit_env = vec![("FOO".to_string(), "from-explicit".to_string())];
+        let provided_env = vec![("FOO".to_string(), "from-explicit".to_string())];
 
         let defaults =
-            resolve_image_runtime_defaults(None, &explicit_env, Some("/explicit-workdir"));
+            resolve_image_runtime_defaults(None, &provided_env, Some("/explicit-workdir"));
 
-        assert_eq!(defaults.env, explicit_env);
+        assert_eq!(defaults.env, provided_env);
         assert_eq!(defaults.workdir.as_deref(), Some("/explicit-workdir"));
         assert!(defaults.user.is_none());
     }

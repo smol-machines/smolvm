@@ -526,14 +526,14 @@ impl RunCmd {
             vec![DEFAULT_SHELL_CMD.to_string()]
         };
 
-        let explicit_env = parse_env_list(&params.env);
+        let provided_env = parse_env_list(&params.env);
         let mount_bindings = mounts_to_virtiofs_bindings(&mounts);
 
         // Two modes: with image or bare VM (no image)
         if let Some(ref img) = image {
             let defaults = vm_common::resolve_image_runtime_defaults(
                 image_info.as_ref(),
-                &explicit_env,
+                &provided_env,
                 params.workdir.as_deref(),
             );
             if self.detach {
@@ -573,7 +573,7 @@ impl RunCmd {
                                 overlay_gb: params.overlay_gb,
                                 allowed_cidrs: params.allowed_cidrs.clone(),
                                 init: params.init.clone(),
-                                env: explicit_env.clone(),
+                                env: provided_env.clone(),
                                 workdir: params.workdir.clone(),
                                 image: Some(img.clone()),
                                 entrypoint: params.entrypoint.clone(),
@@ -650,7 +650,7 @@ impl RunCmd {
                             .collect::<Vec<_>>();
                 if !is_idle {
                     let pid =
-                        client.vm_exec_background(command, explicit_env, params.workdir.clone())?;
+                        client.vm_exec_background(command, provided_env, params.workdir.clone())?;
                     tracing::info!(pid = pid, "background workload started");
                 }
 
@@ -712,7 +712,7 @@ impl RunCmd {
                 let exit_code = if interactive || tty {
                     client.vm_exec_interactive(
                         command,
-                        explicit_env,
+                        provided_env,
                         params.workdir.clone(),
                         self.timeout,
                         tty,
@@ -720,7 +720,7 @@ impl RunCmd {
                 } else {
                     let (exit_code, stdout, stderr) = client.vm_exec(
                         command,
-                        explicit_env,
+                        provided_env,
                         params.workdir.clone(),
                         self.timeout,
                     )?;
@@ -799,7 +799,7 @@ impl ExecCmd {
         // AgentManager::Drop which calls stop() and kills the VM.
         manager.detach();
 
-        let explicit_env = parse_env_list(&self.env);
+        let provided_env = parse_env_list(&self.env);
 
         // Load machine record for workdir and image info
         let name = self.name.clone().unwrap_or_else(|| "default".to_string());
@@ -818,7 +818,7 @@ impl ExecCmd {
         if self.stream {
             let events = client.vm_exec_streaming(
                 self.command.clone(),
-                explicit_env.clone(),
+                provided_env.clone(),
                 workdir.clone(),
                 self.timeout,
             )?;
@@ -866,7 +866,7 @@ impl ExecCmd {
             };
             let configured_env = vm_common::merge_env_overrides(
                 record.as_ref().map(|r| r.env.as_slice()).unwrap_or(&[]),
-                &explicit_env,
+                &provided_env,
             );
             let defaults = vm_common::resolve_image_runtime_defaults(
                 image_info.as_ref(),
@@ -904,7 +904,7 @@ impl ExecCmd {
             if self.interactive || self.tty {
                 let exit_code = client.vm_exec_interactive(
                     self.command.clone(),
-                    explicit_env.clone(),
+                    provided_env.clone(),
                     workdir.clone(),
                     self.timeout,
                     self.tty,
@@ -914,7 +914,7 @@ impl ExecCmd {
 
             let (exit_code, stdout, stderr) = client.vm_exec(
                 self.command.clone(),
-                explicit_env,
+                provided_env,
                 workdir.clone(),
                 self.timeout,
             )?;
