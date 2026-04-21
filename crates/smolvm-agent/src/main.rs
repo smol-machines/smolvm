@@ -18,6 +18,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
 use tracing::{debug, error, info, warn};
 
+mod console_socket;
 mod crun;
 
 /// Ensures storage disk is mounted exactly once. The mount happens either during
