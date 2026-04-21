@@ -2273,12 +2273,22 @@ fn handle_interactive_run(
     Ok(())
 }
 
+/// How long the agent waits for crun to connect to the console socket
+/// and hand over the container PTY master fd before giving up.
+#[cfg(target_os = "linux")]
+const CONSOLE_SOCKET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Spawn a command for interactive execution using crun OCI runtime.
 ///
-/// When `tty` is true, allocates a PTY pair and attaches the slave to crun's
-/// stdio. The OCI spec sets `terminal: true` so that crun handles the
-/// controlling terminal setup (setsid + TIOCSCTTY) inside the container.
-/// In foreground `crun run` mode, this doesn't require `--console-socket`.
+/// When `tty` is true, the OCI spec sets `terminal: true` and the agent
+/// asks crun to allocate the container's PTY via `--console-socket`.
+/// crun sends the PTY master fd back to the agent over an AF_UNIX socket
+/// using `SCM_RIGHTS`; the agent then reads, writes, and resizes that
+/// master directly. This is the only way to make `TIOCSWINSZ` reach the
+/// process inside the container. Without `--console-socket` crun
+/// allocates its own PTY that the agent has no handle on, and every
+/// resize message is silently applied to the wrong terminal. See GH
+/// #156.
 #[cfg(target_os = "linux")]
 fn spawn_interactive_command(
     rootfs: &str,
@@ -2288,7 +2298,6 @@ fn spawn_interactive_command(
     mounts: &[(String, String, bool)],
     tty: bool,
 ) -> Result<(Child, Option<pty::PtyMaster>), Box<dyn std::error::Error>> {
-    use std::os::unix::io::{AsRawFd as _, FromRawFd as _};
     use std::path::Path;
 
     if command.is_empty() {
@@ -2306,8 +2315,16 @@ fn spawn_interactive_command(
     }
 
     let workdir_str = workdir.unwrap_or("/");
-    // terminal: true tells crun to set up a controlling terminal (setsid + TIOCSCTTY)
     let mut spec = oci::OciSpec::new(command, env, workdir_str, tty);
+    if tty {
+        // Give the PTY a non-zero starting size. The host follows up with a
+        // Resize message carrying the real terminal dimensions as soon as
+        // the interactive session starts.
+        spec.process.console_size = Some(oci::OciConsoleSize {
+            height: 24,
+            width: 80,
+        });
+    }
 
     for (tag, container_path, read_only) in mounts {
         let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
@@ -2342,24 +2359,41 @@ fn spawn_interactive_command(
     );
 
     if tty {
-        // Allocate a PTY pair — slave goes to crun's stdio, master returned to caller.
-        // With terminal:true in the OCI spec, crun sets up the controlling terminal
-        // for the container process.
-        let (pty_master, slave_fd) = pty::open_pty(80, 24)?;
-        let slave_raw = slave_fd.as_raw_fd();
+        // Bind a unix socket for crun's --console-socket handshake before
+        // spawning crun; otherwise crun will fail to connect.
+        let console_dir = tempfile::Builder::new()
+            .prefix("smolvm-console-")
+            .tempdir()
+            .map_err(|e| format!("failed to create console socket dir: {}", e))?;
+        let socket_path = console_dir.path().join("console.sock");
+        let console = console_socket::ConsoleSocket::new(&socket_path)
+            .map_err(|e| format!("failed to bind console socket: {}", e))?;
 
-        // SAFETY: slave_fd is a valid open fd from openpty.
-        let child = unsafe {
-            crun::CrunCommand::run(&bundle_path, &container_id)
-                .stdin_from_fd(libc::dup(slave_raw))
-                .stdout_from_fd(libc::dup(slave_raw))
-                .stderr_from_fd(libc::dup(slave_raw))
-                .spawn()?
+        let mut child = crun::CrunCommand::run(&bundle_path, &container_id)
+            .console_socket(&socket_path)
+            .stdin_null()
+            .spawn()?;
+
+        let pty_master = match console.recv_pty_master(CONSOLE_SOCKET_TIMEOUT) {
+            Ok(m) => m,
+            Err(e) => {
+                // crun died before handing us a PTY master. Report what it
+                // was doing so we do not just see a bare timeout.
+                let status = child.try_wait().ok().flatten();
+                error!(
+                    error = %e,
+                    crun_status = ?status,
+                    "failed to receive PTY master from crun"
+                );
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("failed to receive PTY master from crun: {}", e).into());
+            }
         };
 
-        // Close slave in parent — crun has its own copies.
-        drop(slave_fd);
-
+        // `console` and `console_dir` drop at end of scope (after the
+        // tail return moves `child` and `pty_master` out), removing the
+        // socket file and temp dir once the handshake is done.
         Ok((child, Some(pty_master)))
     } else {
         let child = crun::CrunCommand::run(&bundle_path, &container_id)
