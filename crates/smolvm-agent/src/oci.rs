@@ -36,6 +36,9 @@ pub struct OciProcess {
     /// Whether to allocate a pseudo-terminal.
     #[serde(default)]
     pub terminal: bool,
+    /// Initial size of the container's pseudo-terminal (when `terminal: true`).
+    #[serde(rename = "consoleSize", skip_serializing_if = "Option::is_none")]
+    pub console_size: Option<OciConsoleSize>,
     /// User and group IDs.
     pub user: OciUser,
     /// Command and arguments to execute.
@@ -54,6 +57,18 @@ pub struct OciProcess {
     /// Do not create a new session for the process.
     #[serde(rename = "noNewPrivileges", default)]
     pub no_new_privileges: bool,
+}
+
+/// Initial size of a container's pseudo-terminal.
+///
+/// Serialises as OCI `consoleSize: { height, width }`. The host sends a
+/// `Resize` message with the real host terminal dimensions right after the
+/// container starts, so this is just the size seen by the very first
+/// frame the container draws.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct OciConsoleSize {
+    pub height: u32,
+    pub width: u32,
 }
 
 /// User configuration.
@@ -194,6 +209,7 @@ impl OciSpec {
             },
             process: OciProcess {
                 terminal: tty,
+                console_size: None,
                 user: OciUser {
                     uid: 0,
                     gid: 0,
@@ -731,6 +747,35 @@ mod tests {
         assert_eq!(spec.process.args, vec!["echo", "hello"]);
         assert!(spec.process.env.contains(&"FOO=bar".to_string()));
         assert!(!spec.process.terminal);
+        assert!(spec.process.console_size.is_none());
+    }
+
+    #[test]
+    fn test_oci_console_size_serialises_as_camel_case() {
+        let mut spec = OciSpec::new(&["sh".to_string()], &[], "/", true);
+        spec.process.console_size = Some(OciConsoleSize {
+            height: 24,
+            width: 80,
+        });
+        let json = serde_json::to_value(&spec).unwrap();
+        let cs = json
+            .get("process")
+            .and_then(|p| p.get("consoleSize"))
+            .expect("consoleSize should serialise as camelCase under process");
+        assert_eq!(cs.get("height").and_then(|v| v.as_u64()), Some(24));
+        assert_eq!(cs.get("width").and_then(|v| v.as_u64()), Some(80));
+    }
+
+    #[test]
+    fn test_oci_console_size_omitted_when_none() {
+        let spec = OciSpec::new(&["sh".to_string()], &[], "/", true);
+        let json = serde_json::to_value(&spec).unwrap();
+        assert!(
+            json.get("process")
+                .and_then(|p| p.get("consoleSize"))
+                .is_none(),
+            "consoleSize must be omitted when unset"
+        );
     }
 
     #[test]
