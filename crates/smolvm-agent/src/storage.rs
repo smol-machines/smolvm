@@ -2012,6 +2012,7 @@ pub fn run_command(
     mounts: &[(String, String, bool)],
     timeout_ms: Option<u64>,
     persistent_overlay_id: Option<&str>,
+    container_id: Option<&str>,
     client_fd: Option<std::os::unix::io::RawFd>,
 ) -> Result<RunResult> {
     // Validate inputs
@@ -2062,8 +2063,11 @@ pub fn run_command(
         spec.write_to(&bundle_path)
             .map_err(|e| StorageError::new(format!("failed to write OCI spec: {}", e)))?;
 
-        // Generate unique container ID for this execution
-        let container_id = generate_container_id();
+        // Deterministic container ID (so later `crun exec` can target it)
+        // or a freshly-generated one when the caller didn't supply one.
+        let container_id = container_id
+            .map(|s| s.to_string())
+            .unwrap_or_else(generate_container_id);
 
         // Run with crun
         let result = run_with_crun(&bundle_path, &container_id, timeout_ms, client_fd);
@@ -2099,6 +2103,7 @@ pub fn spawn_in_overlay(
     workdir: Option<&str>,
     mounts: &[(String, String, bool)],
     persistent_overlay_id: &str,
+    container_id: Option<&str>,
 ) -> Result<u32> {
     crate::oci::validate_image_reference(image).map_err(StorageError::new)?;
     crate::oci::validate_env_vars(env).map_err(StorageError::new)?;
@@ -2135,7 +2140,11 @@ pub fn spawn_in_overlay(
     spec.write_to(&bundle_path)
         .map_err(|e| StorageError::new(format!("failed to write OCI spec: {}", e)))?;
 
-    let container_id = generate_container_id();
+    // Deterministic ID (so `machine exec` can `crun exec` this container)
+    // or a fresh random one for callers that don't need addressability.
+    let container_id = container_id
+        .map(|s| s.to_string())
+        .unwrap_or_else(generate_container_id);
 
     let child = CrunCommand::run(&bundle_path, &container_id)
         .stdin_null()

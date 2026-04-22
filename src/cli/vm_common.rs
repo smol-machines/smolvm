@@ -583,9 +583,40 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
         return Err(e);
     }
 
-    if record.image.is_some() {
-        // Image-based machine: VM is running, image pulled and cached,
-        // init done. Sits idle until `machine exec` is called.
+    if let Some(ref image) = record.image {
+        // Image-based machine: spawn the single long-lived container the
+        // README describes ("one container per VM"). `machine exec` joins
+        // it via `crun exec`, so the container must exist before the
+        // first exec. Use the stored entrypoint+cmd if present; otherwise
+        // fall back to `sleep infinity` so exec has something to attach to.
+        let container_cmd = {
+            let mut c = record.entrypoint.clone();
+            c.extend(record.cmd.clone());
+            if c.is_empty() {
+                smolvm::DEFAULT_IDLE_CMD
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect()
+            } else {
+                c
+            }
+        };
+        let mount_bindings =
+            crate::cli::parsers::record_mounts_to_runconfig_bindings(&record.mounts);
+        let bg_config = smolvm::agent::RunConfig::new(image, container_cmd)
+            .with_env(record.env.clone())
+            .with_workdir(record.workdir.clone())
+            .with_mounts(mount_bindings)
+            .with_persistent_overlay(Some(name.to_string()))
+            .with_container_id(Some(format!("smolvm-{}", name)));
+        match client.run_background(bg_config) {
+            Ok(container_pid) => {
+                tracing::info!(pid = container_pid, container = %name, "main container started");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to start main container — `machine exec` will fail until the VM is restarted");
+            }
+        }
         println!("Machine '{}' running (PID: {})", name, pid.unwrap_or(0));
     } else {
         // No image — bare VM mode. Run entrypoint+cmd if configured.

@@ -537,24 +537,20 @@ impl RunCmd {
                 // same filesystem (same overlay ID as the exec path below).
                 crate::cli::pull_with_progress(&mut client, img, self.oci_platform.as_deref())?;
 
-                // Run the resolved command in the background inside the image.
-                // Skip when the command is just the idle default — there's
-                // nothing useful to dispatch.
-                let is_idle = command.is_empty()
-                    || command
-                        == DEFAULT_IDLE_CMD
-                            .iter()
-                            .map(|s| s.to_string())
-                            .collect::<Vec<_>>();
-                if !is_idle {
-                    let bg_config = smolvm::agent::RunConfig::new(img, command.clone())
-                        .with_env(env.clone())
-                        .with_workdir(params.workdir.clone())
-                        .with_mounts(mount_bindings.clone())
-                        .with_persistent_overlay(Some("default".to_string()));
-                    let pid = client.run_background(bg_config)?;
-                    tracing::info!(pid = pid, "background workload started");
-                }
+                // Always spawn the main container — `machine exec` joins it
+                // via `crun exec`, so the container must exist even when
+                // the user didn't supply a command. DEFAULT_IDLE_CMD
+                // ("sleep infinity") keeps the container alive so later
+                // execs have something to attach to. This is the
+                // one-container-per-VM model the README describes.
+                let bg_config = smolvm::agent::RunConfig::new(img, command.clone())
+                    .with_env(env.clone())
+                    .with_workdir(params.workdir.clone())
+                    .with_mounts(mount_bindings.clone())
+                    .with_persistent_overlay(Some("default".to_string()))
+                    .with_container_id(Some("smolvm-default".to_string()));
+                let pid = client.run_background(bg_config)?;
+                tracing::info!(pid = pid, "main container started");
 
                 {
                     use smolvm::config::SmolvmConfig;
@@ -851,37 +847,42 @@ impl ExecCmd {
             std::process::exit(exit_code);
         }
 
-        // Check if this machine has an image — if so, exec inside the image's
-        // rootfs via client.run_interactive()/run_non_interactive() instead of bare vm_exec().
-        let mount_bindings = record
+        // Image-backed machines have a single long-lived container named
+        // `smolvm-{name}` that was started by `machine run -d` (or
+        // `machine start`). Exec joins that container via `crun exec` so
+        // all execs share the same PID / mount / cgroup namespaces as the
+        // main workload — `ps -ef` sees the whole picture, signals cross
+        // exec boundaries, env set in the container is visible, etc.
+        //
+        // Bare-VM machines (no image) still use the direct `vm_exec`
+        // path, which runs commands in the agent's own rootfs without any
+        // container isolation.
+        let _mount_bindings = record
             .as_ref()
             .map(|r| mounts_to_virtiofs_bindings(&r.host_mounts()))
             .unwrap_or_default();
 
-        if let Some(ref image) = record_image {
-            // Image-based machine: exec inside the image's rootfs via crun.
-            // Use machine name as persistent overlay ID so filesystem changes
-            // (e.g. package installs) survive across exec sessions.
-            let machine_name = name.clone();
+        if record_image.is_some() {
+            let container_id = format!("smolvm-{}", name);
             if self.interactive || self.tty {
-                let config = smolvm::agent::RunConfig::new(image, self.command.clone())
-                    .with_env(env)
-                    .with_workdir(workdir.clone())
-                    .with_mounts(mount_bindings)
-                    .with_timeout(self.timeout)
-                    .with_tty(self.tty)
-                    .with_persistent_overlay(Some(machine_name.clone()));
-                let exit_code = client.run_interactive(config)?;
+                let exit_code = client.exec_container_interactive(
+                    &container_id,
+                    self.command.clone(),
+                    env,
+                    workdir.clone(),
+                    self.timeout,
+                    self.tty,
+                )?;
                 std::process::exit(exit_code);
             }
 
-            let config = smolvm::agent::RunConfig::new(image, self.command.clone())
-                .with_env(env)
-                .with_workdir(workdir.clone())
-                .with_mounts(mount_bindings)
-                .with_timeout(self.timeout)
-                .with_persistent_overlay(Some(machine_name));
-            let (exit_code, stdout, stderr) = client.run_non_interactive(config)?;
+            let (exit_code, stdout, stderr) = client.exec_container(
+                &container_id,
+                self.command.clone(),
+                env,
+                workdir.clone(),
+                self.timeout,
+            )?;
             vm_common::print_output_and_exit(&manager, exit_code, &stdout, &stderr);
         } else {
             // Bare VM: exec directly in the VM rootfs.

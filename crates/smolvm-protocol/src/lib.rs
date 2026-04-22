@@ -257,11 +257,45 @@ pub enum AgentRequest {
         /// created and destroyed after the run.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         persistent_overlay_id: Option<String>,
+        /// Explicit crun container ID. When `None` the agent generates a
+        /// random one (old behavior). When `Some`, the container is named
+        /// deterministically so a later `ExecContainer` can join it — the
+        /// "one container per VM" semantics promised by the README.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        container_id: Option<String>,
         /// Spawn the container and return immediately with the crun PID.
         /// The container runs detached; stdout/stderr go to /dev/null.
         /// Incompatible with `interactive` and `tty`.
         #[serde(default)]
         background: bool,
+    },
+
+    /// Execute a command inside an already-running container.
+    ///
+    /// Uses `crun exec <container_id>` so the command joins the
+    /// container's PID / mount / cgroup namespaces. This is the agent-
+    /// side behavior that `docker exec` models: `ps -ef` shows the
+    /// main workload, signals reach it, env variables survive, and
+    /// sibling execs see each other's processes.
+    ExecContainer {
+        /// The container to join.
+        container_id: String,
+        /// Command and arguments.
+        command: Vec<String>,
+        /// Environment variables.
+        #[serde(default)]
+        env: Vec<(String, String)>,
+        /// Working directory inside the container.
+        workdir: Option<String>,
+        /// Timeout in milliseconds.
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+        /// Interactive mode — stream I/O instead of buffering.
+        #[serde(default)]
+        interactive: bool,
+        /// Allocate a pseudo-TTY.
+        #[serde(default)]
+        tty: bool,
     },
 
     /// Send stdin data to a running interactive command.

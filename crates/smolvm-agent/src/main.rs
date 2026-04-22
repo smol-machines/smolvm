@@ -1489,6 +1489,7 @@ fn handle_request(
             interactive: false,
             tty: false,
             persistent_overlay_id,
+            container_id,
             background,
         } => {
             if background {
@@ -1499,6 +1500,7 @@ fn handle_request(
                     workdir.as_deref(),
                     &mounts,
                     persistent_overlay_id.as_deref(),
+                    container_id.as_deref(),
                 )
             } else {
                 handle_run(
@@ -1509,9 +1511,35 @@ fn handle_request(
                     &mounts,
                     timeout_ms,
                     persistent_overlay_id.as_deref(),
+                    container_id.as_deref(),
                     client_fd,
                 )
             }
+        }
+
+        AgentRequest::ExecContainer {
+            container_id,
+            command,
+            env,
+            workdir,
+            timeout_ms,
+            interactive: false,
+            tty: false,
+        } => handle_exec_container(
+            &container_id,
+            &command,
+            &env,
+            workdir.as_deref(),
+            timeout_ms,
+            client_fd,
+        ),
+
+        AgentRequest::ExecContainer { .. } => {
+            // Interactive mode is handled separately by handle_interactive_exec_container
+            AgentResponse::error(
+                "interactive exec must be handled by handle_interactive_exec_container",
+                error_codes::INTERNAL_ERROR,
+            )
         }
 
         AgentRequest::Run { .. } => {
@@ -3182,8 +3210,9 @@ fn handle_run_background(
     workdir: Option<&str>,
     mounts: &[(String, String, bool)],
     persistent_overlay_id: Option<&str>,
+    container_id: Option<&str>,
 ) -> AgentResponse {
-    info!(image = %image, command = ?command, mounts = ?mounts, "running command in background");
+    info!(image = %image, command = ?command, mounts = ?mounts, container_id = ?container_id, "running command in background");
 
     let Some(overlay_id) = persistent_overlay_id else {
         return AgentResponse::error(
@@ -3192,7 +3221,8 @@ fn handle_run_background(
         );
     };
 
-    match storage::spawn_in_overlay(image, command, env, workdir, mounts, overlay_id) {
+    match storage::spawn_in_overlay(image, command, env, workdir, mounts, overlay_id, container_id)
+    {
         Ok(pid) => {
             // The crun process is now an orphaned child of the agent.
             // Register it so reap_background_children() collects its
@@ -3208,6 +3238,96 @@ fn handle_run_background(
     }
 }
 
+/// Handle `ExecContainer` — `crun exec <container_id> <command>`.
+///
+/// The command joins the main container's PID / mount / cgroup namespaces,
+/// so `ps -ef` sees the container's init process and sibling execs, and
+/// signals cross process boundaries. This is the "one container per VM"
+/// model that matches the project README — `machine exec` joins the
+/// workload started by `machine run -d`, it doesn't spawn a sibling.
+fn handle_exec_container(
+    container_id: &str,
+    command: &[String],
+    env: &[(String, String)],
+    workdir: Option<&str>,
+    timeout_ms: Option<u64>,
+    client_fd: Option<std::os::unix::io::RawFd>,
+) -> AgentResponse {
+    info!(container_id = %container_id, command = ?command, timeout_ms = ?timeout_ms, "exec in container");
+
+    if command.is_empty() {
+        return AgentResponse::error("command cannot be empty", error_codes::INVALID_REQUEST);
+    }
+
+    let mut child = match crate::crun::CrunCommand::exec(container_id, env, command, workdir, false)
+        .stdin_null()
+        .capture_output()
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return AgentResponse::error(
+                format!("failed to spawn crun exec: {}", e),
+                error_codes::SPAWN_FAILED,
+            );
+        }
+    };
+
+    // Wait with timeout + client liveness. No container-level teardown on
+    // timeout — that would kill the whole main container; we only kill
+    // the exec invocation. `child.kill()` is captured via raw libc since
+    // we can't re-borrow `child` inside the closure.
+    let child_pid = child.id() as libc::pid_t;
+    let result = match crate::process::wait_with_timeout_cleanup_and_liveness(
+        &mut child,
+        timeout_ms,
+        client_fd,
+        || {
+            // SAFETY: kill() with SIGKILL on a PID we just spawned is
+            // safe; the PID is valid until we waitpid() it below.
+            unsafe {
+                libc::kill(child_pid, libc::SIGKILL);
+            }
+        },
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            return AgentResponse::error(
+                format!("wait for crun exec failed: {}", e),
+                error_codes::RUN_FAILED,
+            );
+        }
+    };
+
+    match result {
+        crate::process::WaitResult::Completed { exit_code, output } => AgentResponse::Completed {
+            exit_code,
+            stdout: output.stdout,
+            stderr: output.stderr,
+        },
+        crate::process::WaitResult::TimedOut { output, timeout_ms } => {
+            let mut stderr = output.stderr;
+            stderr.extend_from_slice(
+                format!("\nexec timed out after {}ms", timeout_ms).as_bytes(),
+            );
+            AgentResponse::Completed {
+                exit_code: 124,
+                stdout: output.stdout,
+                stderr,
+            }
+        }
+        crate::process::WaitResult::ClientDisconnected { output } => {
+            let mut stderr = output.stderr;
+            stderr.extend_from_slice(b"\nexec killed: client disconnected");
+            AgentResponse::Completed {
+                exit_code: 129,
+                stdout: output.stdout,
+                stderr,
+            }
+        }
+    }
+}
+
 fn handle_run(
     image: &str,
     command: &[String],
@@ -3216,9 +3336,10 @@ fn handle_run(
     mounts: &[(String, String, bool)],
     timeout_ms: Option<u64>,
     persistent_overlay_id: Option<&str>,
+    container_id: Option<&str>,
     client_fd: Option<std::os::unix::io::RawFd>,
 ) -> AgentResponse {
-    info!(image = %image, command = ?command, mounts = ?mounts, timeout_ms = ?timeout_ms, persistent = persistent_overlay_id.is_some(), "running command");
+    info!(image = %image, command = ?command, mounts = ?mounts, timeout_ms = ?timeout_ms, persistent = persistent_overlay_id.is_some(), container_id = ?container_id, "running command");
 
     match storage::run_command(
         image,
@@ -3228,6 +3349,7 @@ fn handle_run(
         mounts,
         timeout_ms,
         persistent_overlay_id,
+        container_id,
         client_fd,
     ) {
         Ok(result) => AgentResponse::Completed {

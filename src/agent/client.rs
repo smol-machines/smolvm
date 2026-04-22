@@ -122,6 +122,12 @@ pub struct RunConfig {
     /// Persistent overlay ID. If set, the overlay persists across exec sessions
     /// so filesystem changes (e.g. package installs) survive.
     pub persistent_overlay_id: Option<String>,
+    /// Explicit crun container ID. When set, the container is named
+    /// deterministically so a later `exec_container` can join it —
+    /// the "one container per VM" semantics the README promises.
+    /// Leave `None` for session-scoped runs that don't need to be
+    /// addressable by later execs.
+    pub container_id: Option<String>,
 }
 
 impl RunConfig {
@@ -136,6 +142,7 @@ impl RunConfig {
             timeout: None,
             tty: false,
             persistent_overlay_id: None,
+            container_id: None,
         }
     }
 
@@ -172,6 +179,13 @@ impl RunConfig {
     /// Set persistent overlay ID for cross-session filesystem persistence.
     pub fn with_persistent_overlay(mut self, id: Option<String>) -> Self {
         self.persistent_overlay_id = id;
+        self
+    }
+
+    /// Set an explicit crun container ID so the spawned container is
+    /// addressable by a later `exec_container` call.
+    pub fn with_container_id(mut self, id: Option<String>) -> Self {
+        self.container_id = id;
         self
     }
 }
@@ -1032,6 +1046,7 @@ impl AgentClient {
             interactive: false,
             tty: false,
             persistent_overlay_id: config.persistent_overlay_id,
+            container_id: config.container_id,
             background: false,
         })?;
 
@@ -1054,6 +1069,7 @@ impl AgentClient {
             interactive: false,
             tty: false,
             persistent_overlay_id: config.persistent_overlay_id,
+            container_id: config.container_id,
             background: true,
         })?;
 
@@ -1066,6 +1082,61 @@ impl AgentClient {
             .parse()
             .map_err(|_| Error::agent("run background", "invalid PID in response"))?;
         Ok(pid)
+    }
+
+    /// Execute a command inside an already-running container.
+    ///
+    /// Sends an `ExecContainer` request so the agent calls
+    /// `crun exec <container_id>`. The command joins the container's
+    /// PID / mount / cgroup namespaces — so `ps`, signals, and env
+    /// work the way Docker users expect.
+    pub fn exec_container(
+        &mut self,
+        container_id: &str,
+        command: Vec<String>,
+        env: Vec<(String, String)>,
+        workdir: Option<String>,
+        timeout: Option<Duration>,
+    ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
+        let _timeout_guard = self.set_exec_timeout(timeout)?;
+        let timeout_ms = timeout.map(|t| t.as_millis() as u64);
+        let resp = self.request(&AgentRequest::ExecContainer {
+            container_id: container_id.to_string(),
+            command,
+            env,
+            workdir,
+            timeout_ms,
+            interactive: false,
+            tty: false,
+        })?;
+        expect_completed(resp, "exec container")
+    }
+
+    /// Interactive variant of `exec_container` — streams stdin/stdout
+    /// to the terminal and returns the exit code.
+    pub fn exec_container_interactive(
+        &mut self,
+        container_id: &str,
+        command: Vec<String>,
+        env: Vec<(String, String)>,
+        workdir: Option<String>,
+        timeout: Option<Duration>,
+        tty: bool,
+    ) -> Result<i32> {
+        let timeout_ms = timeout.map(|t| t.as_millis() as u64);
+        self.interactive_session(
+            AgentRequest::ExecContainer {
+                container_id: container_id.to_string(),
+                command,
+                env,
+                workdir,
+                timeout_ms,
+                interactive: true,
+                tty,
+            },
+            tty,
+            "exec container interactive",
+        )
     }
 
     /// Run a command interactively with streaming I/O.
@@ -1094,6 +1165,7 @@ impl AgentClient {
                 interactive: true,
                 tty,
                 persistent_overlay_id: config.persistent_overlay_id,
+                container_id: config.container_id,
                 background: false,
             },
             tty,
@@ -1893,6 +1965,140 @@ mod run_background_tests {
             "unexpected error: {}",
             err
         );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn run_background_passes_through_container_id() {
+        // The "one container per VM" model depends on the CLI naming the
+        // container deterministically via `with_container_id(...)`. If the
+        // field stops flowing to the wire, `machine exec` can't find the
+        // container to join — and we silently regress to the sibling-
+        // container model the README explicitly contrasts smolvm against.
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+
+        let server = thread::spawn(move || {
+            let mut len_buf = [0u8; 4];
+            server_stream.read_exact(&mut len_buf).unwrap();
+            let len = u32::from_be_bytes(len_buf) as usize;
+            let mut payload = vec![0u8; len];
+            server_stream.read_exact(&mut payload).unwrap();
+
+            let envelope: Envelope<AgentRequest> =
+                serde_json::from_slice(&payload).expect("valid Envelope<AgentRequest>");
+
+            match envelope.body {
+                AgentRequest::Run {
+                    container_id,
+                    background,
+                    ..
+                } => {
+                    assert!(background);
+                    assert_eq!(
+                        container_id,
+                        Some("smolvm-default".to_string()),
+                        "container_id must flow through RunConfig → AgentRequest::Run"
+                    );
+                }
+                other => panic!("expected AgentRequest::Run, got {:?}", other),
+            }
+
+            let resp = AgentResponse::Completed {
+                exit_code: 0,
+                stdout: b"999".to_vec(),
+                stderr: Vec::new(),
+            };
+            server_stream
+                .write_all(&encode_message(&resp).unwrap())
+                .unwrap();
+        });
+
+        let mut client = AgentClient::from_stream(client_stream);
+        let config = RunConfig::new("alpine:3.19", vec!["true".to_string()])
+            .with_persistent_overlay(Some("default".to_string()))
+            .with_container_id(Some("smolvm-default".to_string()));
+        let pid = client.run_background(config).expect("run_background ok");
+        assert_eq!(pid, 999);
+        server.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod exec_container_tests {
+    //! Regression test for Fix #4 — `machine exec` joins the running
+    //! container instead of spawning a sibling.
+    //!
+    //! If this test fails, the client stopped issuing `ExecContainer`
+    //! requests (or stopped targeting the right container_id). The
+    //! observable symptom is that `machine exec ... ps -ef` no longer
+    //! sees the main workload — the "one container per VM" model the
+    //! README promises is broken.
+    use super::*;
+    use smolvm_protocol::{encode_message, AgentRequest, AgentResponse, Envelope};
+    use std::io::{Read, Write};
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn exec_container_sends_exec_container_request_to_named_container() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+
+        let server = thread::spawn(move || {
+            let mut len_buf = [0u8; 4];
+            server_stream.read_exact(&mut len_buf).unwrap();
+            let len = u32::from_be_bytes(len_buf) as usize;
+            let mut payload = vec![0u8; len];
+            server_stream.read_exact(&mut payload).unwrap();
+
+            let envelope: Envelope<AgentRequest> =
+                serde_json::from_slice(&payload).expect("valid Envelope<AgentRequest>");
+
+            match envelope.body {
+                AgentRequest::ExecContainer {
+                    container_id,
+                    command,
+                    workdir,
+                    timeout_ms,
+                    interactive,
+                    tty,
+                    ..
+                } => {
+                    assert_eq!(
+                        container_id, "smolvm-default",
+                        "exec_container must target the deterministic container name"
+                    );
+                    assert_eq!(command, vec!["ps", "-ef"]);
+                    assert_eq!(workdir, Some("/app".to_string()));
+                    assert_eq!(timeout_ms, Some(5000));
+                    assert!(!interactive);
+                    assert!(!tty);
+                }
+                other => panic!("expected AgentRequest::ExecContainer, got {:?}", other),
+            }
+
+            let resp = AgentResponse::Completed {
+                exit_code: 0,
+                stdout: b"  PID  USER     COMMAND\n    1 root     sleep infinity\n".to_vec(),
+                stderr: Vec::new(),
+            };
+            server_stream
+                .write_all(&encode_message(&resp).unwrap())
+                .unwrap();
+        });
+
+        let mut client = AgentClient::from_stream(client_stream);
+        let (exit_code, stdout, _stderr) = client
+            .exec_container(
+                "smolvm-default",
+                vec!["ps".to_string(), "-ef".to_string()],
+                Vec::new(),
+                Some("/app".to_string()),
+                Some(Duration::from_secs(5)),
+            )
+            .expect("exec_container should succeed");
+
+        assert_eq!(exit_code, 0);
+        assert!(String::from_utf8_lossy(&stdout).contains("sleep infinity"));
         server.join().unwrap();
     }
 }
