@@ -172,7 +172,9 @@ pub struct RunCmd {
     #[arg(trailing_var_arg = true, value_name = "COMMAND")]
     pub command: Vec<String>,
 
-    /// Run in background and keep machine alive after command exits
+    /// Start the command in the background and detach, leaving the VM
+    /// running. Use `machine exec` to run further commands against the VM
+    /// and `machine stop` to tear it down.
     #[arg(short = 'd', long, help_heading = "Execution")]
     pub detach: bool,
 
@@ -537,11 +539,30 @@ impl RunCmd {
                 params.workdir.as_deref(),
             );
             if self.detach {
-                // Detach mode: persist the record with image info.
-                // The VM is already running. The image will be pulled and
-                // command started on subsequent `machine start` if stopped/restarted.
-                // For now, pull the image so it's cached for exec.
+                // Detach mode: pull the image, kick the command off in the
+                // background inside the image's overlay rootfs, and persist
+                // the record so subsequent `machine exec` sessions see the
+                // same filesystem (same overlay ID as the exec path below).
                 crate::cli::pull_with_progress(&mut client, img, self.oci_platform.as_deref())?;
+
+                // Run the resolved command in the background inside the image.
+                // Skip when the command is just the idle default — there's
+                // nothing useful to dispatch.
+                let is_idle = command.is_empty()
+                    || command
+                        == DEFAULT_IDLE_CMD
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect::<Vec<_>>();
+                if !is_idle {
+                    let bg_config = smolvm::agent::RunConfig::new(img, command.clone())
+                        .with_env(env.clone())
+                        .with_workdir(params.workdir.clone())
+                        .with_mounts(mount_bindings.clone())
+                        .with_persistent_overlay(Some("default".to_string()));
+                    let pid = client.run_background(bg_config)?;
+                    tracing::info!(pid = pid, "background workload started");
+                }
 
                 {
                     use smolvm::config::SmolvmConfig;
