@@ -1105,7 +1105,7 @@ fn run_server_with_listener(
     info!(uptime_ms = uptime_ms(), "entering vsock accept loop");
 
     loop {
-        // Reap any exited background children to prevent zombie accumulation
+        // Reap any exited background children to prevent zombie accumulation.
         reap_background_children();
 
         match listener.accept() {
@@ -1120,9 +1120,16 @@ fn run_server_with_listener(
                 }
                 info!("accepted connection");
 
-                if let Err(e) = handle_connection(&mut stream) {
-                    warn!(error = %e, "connection error");
-                }
+                // Service the connection in its own thread so a long-running
+                // exec doesn't block subsequent requests on the same listener.
+                // Before this landed, a single held-open `machine exec` would
+                // stall the 250ms state probe, flip the VM to Unreachable,
+                // and make every following exec fail with "not running".
+                std::thread::spawn(move || {
+                    if let Err(e) = handle_connection(&mut stream) {
+                        warn!(error = %e, "connection error");
+                    }
+                });
             }
             Err(e) => {
                 warn!(error = %e, "accept error");
@@ -3186,11 +3193,17 @@ fn handle_run_background(
     };
 
     match storage::spawn_in_overlay(image, command, env, workdir, mounts, overlay_id) {
-        Ok(pid) => AgentResponse::Completed {
-            exit_code: 0,
-            stdout: format!("{}", pid).into_bytes(),
-            stderr: Vec::new(),
-        },
+        Ok(pid) => {
+            // The crun process is now an orphaned child of the agent.
+            // Register it so reap_background_children() collects its
+            // exit status once the container's init terminates.
+            register_background_child(pid);
+            AgentResponse::Completed {
+                exit_code: 0,
+                stdout: format!("{}", pid).into_bytes(),
+                stderr: Vec::new(),
+            }
+        }
         Err(e) => AgentResponse::from_err(e, error_codes::RUN_FAILED),
     }
 }
@@ -3395,22 +3408,55 @@ fn handle_storage_status() -> AgentResponse {
 // VM-Level Exec Handlers (Direct Execution in VM)
 // ============================================================================
 
-/// Handle VM-level exec (non-interactive).
-/// Executes command directly in the VM's rootfs without any container isolation.
+/// PIDs of background children the agent owns and must reap.
+///
+/// Populated by [`register_background_child`] when a background-mode
+/// handler (`handle_vm_exec_background`, `handle_run_background`)
+/// spawns + forgets a process. Cleared by [`reap_background_children`].
+///
+/// Scoping to known PIDs is required once the accept loop is
+/// multi-threaded: an unscoped `waitpid(-1, WNOHANG)` would steal the
+/// exit status from *any* exited child — including the foreground
+/// crun processes that per-request handlers are actively waiting on —
+/// and produce ECHILD races under concurrent load.
+static BG_CHILDREN: OnceLock<std::sync::Mutex<Vec<u32>>> = OnceLock::new();
+
+fn bg_children() -> &'static std::sync::Mutex<Vec<u32>> {
+    BG_CHILDREN.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Track a PID so a later [`reap_background_children`] waits on it.
+///
+/// Callers should pair this with `std::mem::forget(child)` so the
+/// Rust `Child` doesn't also race to reap the process on drop.
+fn register_background_child(pid: u32) {
+    bg_children().lock().unwrap().push(pid);
+}
+
 /// Reap any exited background children to prevent zombie accumulation.
 ///
-/// Called periodically in the accept loop. Uses `waitpid(-1, WNOHANG)`
-/// to collect all exited children without blocking. Safe to call even
-/// when no background children exist.
+/// Called periodically in the accept loop. Walks the registered PID
+/// list and issues a per-PID `waitpid(..., WNOHANG)` — non-blocking
+/// and scoped, so it never steals exit statuses from foreground
+/// handlers running in sibling threads.
 #[cfg(target_os = "linux")]
 fn reap_background_children() {
-    loop {
-        let ret = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
-        if ret <= 0 {
-            break;
+    let mut guard = bg_children().lock().unwrap();
+    guard.retain(|&pid| {
+        let ret = unsafe { libc::waitpid(pid as i32, std::ptr::null_mut(), libc::WNOHANG) };
+        match ret {
+            // >0 = child was reaped; drop from tracking.
+            r if r > 0 => {
+                debug!(pid, "reaped background child");
+                false
+            }
+            // 0 = still running; keep tracking for the next sweep.
+            0 => true,
+            // <0 = error (typically ECHILD — already reaped elsewhere or the
+            // PID was detached in a way we don't own). Drop either way.
+            _ => false,
         }
-        debug!(pid = ret, "reaped background child");
-    }
+    });
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -3450,9 +3496,12 @@ fn handle_vm_exec_background(
     match cmd.spawn() {
         Ok(child) => {
             let pid = child.id();
-            // Don't wait — let the child run independently.
-            // reap_background_children() in the accept loop collects the exit status.
+            // Don't wait — let the child run independently. The Rust
+            // `Child` is forgotten so drop doesn't race our reaper, and
+            // the PID is registered so reap_background_children()
+            // collects the eventual exit status.
             std::mem::forget(child);
+            register_background_child(pid);
             info!(pid = pid, "background process started");
             AgentResponse::Completed {
                 exit_code: 0,
@@ -3792,6 +3841,98 @@ fn send_response(
 /// Trait for read+write streams with raw fd access.
 trait ReadWrite: Read + Write + AsRawFd {}
 impl<T: Read + Write + AsRawFd> ReadWrite for T {}
+
+/// Regression tests for the scoped background-child reaper.
+///
+/// These are the companion to the accept-loop threading change. The bug
+/// they guard against: once the accept loop spawns a thread per
+/// connection, an unscoped `waitpid(-1, WNOHANG)` in the reaper steals
+/// exit statuses from any foreground crun process that a sibling thread
+/// is waiting on, producing ECHILD races and "command died mid-run"
+/// failures. Scoped reaping must only touch PIDs registered as
+/// background.
+///
+/// Linux-only because `waitpid` behavior + the agent crate as a whole
+/// is Linux-specific. `cargo test -p smolvm-agent --target
+/// aarch64-unknown-linux-musl` on a Linux runner.
+#[cfg(test)]
+#[cfg(target_os = "linux")]
+mod bg_reap_tests {
+    use super::*;
+    use std::process::Command;
+    use std::time::Duration;
+
+    #[test]
+    fn reaper_leaves_unregistered_children_waitable() {
+        // Foreground child: the test owns it and will wait on it. The
+        // reaper must NOT steal it.
+        let mut foreground = Command::new("/bin/true")
+            .spawn()
+            .expect("spawn foreground /bin/true");
+        let fg_pid = foreground.id();
+
+        // Background child: registered, and the Rust Child handle is
+        // forgotten so drop doesn't race the reaper.
+        let background = Command::new("/bin/true")
+            .spawn()
+            .expect("spawn background /bin/true");
+        let bg_pid = background.id();
+        register_background_child(bg_pid);
+        std::mem::forget(background);
+
+        // Let both exit before we reap.
+        std::thread::sleep(Duration::from_millis(150));
+
+        reap_background_children();
+
+        // Foreground must still be reapable via the Rust Child. If the
+        // unscoped reaper stole it, wait() returns ECHILD and this
+        // expect() fires — that's exactly the concurrent-exec bug.
+        let status = foreground
+            .wait()
+            .expect("foreground child must still be waitable — reaper must not touch unregistered PIDs");
+        assert!(status.success(), "foreground /bin/true should succeed");
+
+        // Background PID should be gone from tracking (reaped). Check
+        // only this test's PID so parallel tests don't interfere.
+        let tracked = bg_children().lock().unwrap().clone();
+        assert!(
+            !tracked.contains(&bg_pid),
+            "reaped bg PID {} must be removed from tracking",
+            bg_pid
+        );
+        assert!(
+            !tracked.contains(&fg_pid),
+            "unregistered fg PID {} must never enter tracking",
+            fg_pid
+        );
+    }
+
+    #[test]
+    fn reaper_retains_still_running_background_children() {
+        // A registered but still-alive child must stay in tracking so a
+        // subsequent sweep collects it after it exits.
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep 30");
+        let pid = child.id();
+        register_background_child(pid);
+
+        reap_background_children();
+
+        let tracked = bg_children().lock().unwrap().clone();
+        assert!(
+            tracked.contains(&pid),
+            "still-running bg PID {} must remain in tracking",
+            pid
+        );
+
+        // Clean up so the test doesn't leak a 30-second sleep.
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
 
 #[cfg(test)]
 mod tests {
