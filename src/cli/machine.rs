@@ -178,6 +178,13 @@ pub struct RunCmd {
     #[arg(short = 'd', long, help_heading = "Execution")]
     pub detach: bool,
 
+    /// Name the persistent machine. Defaults to "default" when used with
+    /// `-d`. Equivalent to `docker run --name <NAME>` — later
+    /// `smolvm machine exec --name <NAME>` targets the same container.
+    /// Ignored in foreground mode (use `machine create <NAME>` for that).
+    #[arg(long, value_name = "NAME", help_heading = "Execution")]
+    pub name: Option<String>,
+
     /// Keep stdin open for interactive input
     #[arg(short = 'i', long, help_heading = "Execution")]
     pub interactive: bool,
@@ -374,8 +381,25 @@ impl RunCmd {
             params.port.len(),
         )?;
 
-        let manager = AgentManager::new_default_with_sizes(params.storage_gb, params.overlay_gb)
-            .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
+        // --name is docker-style: names the persistent machine so a
+        // later `machine exec --name <NAME>` can target it. Without
+        // --name, the old hardcoded "default" machine is used. --name
+        // is only meaningful with -d; foreground runs are ephemeral
+        // and use an auto-generated name regardless.
+        let persistent_name = self.name.clone();
+        let manager = match persistent_name.as_deref() {
+            Some(n) if self.detach => {
+                AgentManager::for_vm_with_sizes(n, params.storage_gb, params.overlay_gb)
+                    .map_err(|e| Error::agent("create agent manager", e.to_string()))?
+            }
+            _ => AgentManager::new_default_with_sizes(params.storage_gb, params.overlay_gb)
+                .map_err(|e| Error::agent("create agent manager", e.to_string()))?,
+        };
+        if persistent_name.is_some() && !self.detach {
+            eprintln!(
+                "warning: --name is ignored in foreground mode; use `machine create <NAME>` to define a persistent machine"
+            );
+        }
 
         let mode = if self.detach {
             "persistent"
@@ -473,13 +497,12 @@ impl RunCmd {
                 })
                 .collect();
             let init_env = parse_env_list(&params.env);
-            // Use "default" as the overlay ID so any rootfs changes
-            // init makes (e.g. `pacman -S git`) are visible to a
-            // subsequent `machine exec`. The exec path resolves the
-            // overlay from the machine name, falling back to "default"
-            // when no `--name` is given (`src/cli/machine.rs:741`), so
-            // matching that constant here is what makes init's effects
-            // observable to the user.
+            // Init must land on the same overlay that `machine exec`
+            // will later resolve — the machine name if `-d --name`
+            // was used, "default" otherwise. Drift here would leave
+            // init's effects (e.g. `pacman -S git`) invisible to
+            // subsequent execs.
+            let init_overlay_id = persistent_name.as_deref().unwrap_or("default");
             if let Err(e) = vm_common::run_init_commands(
                 &mut client,
                 &params.init,
@@ -487,7 +510,7 @@ impl RunCmd {
                 &init_env,
                 params.workdir.as_deref(),
                 &record_mounts,
-                "default",
+                init_overlay_id,
             ) {
                 // Ephemeral VMs have no state to preserve — `kill()`
                 // matches the success path's lifetime semantics
@@ -543,14 +566,19 @@ impl RunCmd {
                 // ("sleep infinity") keeps the container alive so later
                 // execs have something to attach to. This is the
                 // one-container-per-VM model the README describes.
+                //
+                // Container ID is derived from the chosen machine name so
+                // `machine exec --name <n>` can target it directly
+                // (see `ExecCmd::run`).
+                let detach_name = persistent_name.as_deref().unwrap_or("default");
                 let bg_config = smolvm::agent::RunConfig::new(img, command.clone())
                     .with_env(env.clone())
                     .with_workdir(params.workdir.clone())
                     .with_mounts(mount_bindings.clone())
-                    .with_persistent_overlay(Some("default".to_string()))
-                    .with_container_id(Some("smolvm-default".to_string()));
+                    .with_persistent_overlay(Some(detach_name.to_string()))
+                    .with_container_id(Some(format!("smolvm-{}", detach_name)));
                 let pid = client.run_background(bg_config)?;
-                tracing::info!(pid = pid, "main container started");
+                tracing::info!(pid = pid, container_name = %detach_name, "main container started");
 
                 {
                     use smolvm::config::SmolvmConfig;
@@ -568,8 +596,9 @@ impl RunCmd {
                     let port_tuples: Vec<(u16, u16)> =
                         params.port.iter().map(|p| (p.host, p.guest)).collect();
                     if let Ok(mut config) = SmolvmConfig::load() {
-                        vm_common::persist_default_running(
+                        vm_common::persist_vm_running(
                             &mut config,
+                            detach_name,
                             manager.child_pid(),
                             Some(DefaultVmOverrides {
                                 cpus: params.cpus,
@@ -597,11 +626,16 @@ impl RunCmd {
                 // Disarm SIGINT guard — detaching, VM stays running.
                 drop(sigint_guard);
 
-                println!("Machine running in background");
+                println!("Machine '{}' running in background", detach_name);
+                let name_flag = if detach_name == "default" {
+                    String::new()
+                } else {
+                    format!(" --name {}", detach_name)
+                };
                 println!("\nTo interact:");
-                println!("  smolvm machine exec -- <command>");
+                println!("  smolvm machine exec{} -- <command>", name_flag);
                 println!("\nTo stop:");
-                println!("  smolvm machine stop");
+                println!("  smolvm machine stop{}", name_flag);
 
                 manager.detach();
                 Ok(())
@@ -660,7 +694,9 @@ impl RunCmd {
                     tracing::info!(pid = pid, "background workload started");
                 }
 
-                // Persist the default VM state so it survives stop/start.
+                let detach_name = persistent_name.as_deref().unwrap_or("default");
+
+                // Persist the named (or default) VM state so it survives stop/start.
                 {
                     use smolvm::config::SmolvmConfig;
                     use vm_common::DefaultVmOverrides;
@@ -677,8 +713,9 @@ impl RunCmd {
                     let port_tuples: Vec<(u16, u16)> =
                         params.port.iter().map(|p| (p.host, p.guest)).collect();
                     if let Ok(mut config) = SmolvmConfig::load() {
-                        vm_common::persist_default_running(
+                        vm_common::persist_vm_running(
                             &mut config,
+                            detach_name,
                             manager.child_pid(),
                             Some(DefaultVmOverrides {
                                 cpus: params.cpus,
@@ -704,13 +741,19 @@ impl RunCmd {
                 }
 
                 println!(
-                    "Machine running (PID: {})",
+                    "Machine '{}' running (PID: {})",
+                    detach_name,
                     manager.child_pid().unwrap_or(0)
                 );
+                let name_flag = if detach_name == "default" {
+                    String::new()
+                } else {
+                    format!(" --name {}", detach_name)
+                };
                 println!("\nTo interact:");
-                println!("  smolvm machine exec -- <command>");
+                println!("  smolvm machine exec{} -- <command>", name_flag);
                 println!("\nTo stop:");
-                println!("  smolvm machine stop");
+                println!("  smolvm machine stop{}", name_flag);
 
                 manager.detach();
                 Ok(())
