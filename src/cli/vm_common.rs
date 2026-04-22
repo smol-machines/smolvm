@@ -614,7 +614,24 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
                 tracing::info!(pid = container_pid, container = %name, "main container started");
             }
             Err(e) => {
-                tracing::warn!(error = %e, "failed to start main container — `machine exec` will fail until the VM is restarted");
+                // Silent failure here was the `stop + start` bug — the
+                // VM came up fine, state flipped to `running`, but the
+                // workload was gone and the user only noticed when
+                // `machine exec` failed. Tear the VM back down and
+                // surface a real error so the state doesn't lie.
+                if let Err(stop_err) = manager.stop() {
+                    tracing::warn!(
+                        error = %stop_err,
+                        "failed to stop VM after main container startup failure"
+                    );
+                }
+                return Err(Error::agent(
+                    "start main container",
+                    format!(
+                        "failed to start main container '{}' after VM boot: {}",
+                        name, e
+                    ),
+                ));
             }
         }
         println!("Machine '{}' running (PID: {})", name, pid.unwrap_or(0));

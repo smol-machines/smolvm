@@ -2146,7 +2146,25 @@ pub fn spawn_in_overlay(
         .map(|s| s.to_string())
         .unwrap_or_else(generate_container_id);
 
-    let child = CrunCommand::run(&bundle_path, &container_id)
+    // Clear any stale crun state for this ID before spawning a new
+    // container with the same name. After `machine stop` + `machine
+    // start` on a `run -d`-created VM, the persistent storage disk
+    // still holds `/var/lib/crun/<id>` from the previous run — `crun
+    // run <id>` would fail immediately with "container already
+    // exists" and the new spawn would silently die. `-f` is safe
+    // because the state is from a prior VM lifetime; the VM is fresh
+    // and no live process holds the container.
+    let delete_status = CrunCommand::delete(&container_id, true)
+        .stdin_null()
+        .discard_output()
+        .status();
+    if let Ok(s) = delete_status {
+        if s.success() {
+            debug!(container_id = %container_id, "cleared stale crun state from prior run");
+        }
+    }
+
+    let mut child = CrunCommand::run(&bundle_path, &container_id)
         .stdin_null()
         .discard_output()
         .spawn()
@@ -2157,6 +2175,27 @@ pub fn spawn_in_overlay(
                 paths::CRUN_PATH
             ))
         })?;
+
+    // Check if crun died immediately. When `crun run` fails — stale
+    // state, malformed bundle, missing binaries in the rootfs — it
+    // exits within a few milliseconds. Catching that here turns the
+    // previous silent failure ("command dies under the agent log,
+    // `machine start` still prints success, first exec fails with a
+    // confusing error") into a reported error the caller can act on.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    match child.try_wait() {
+        Ok(Some(status)) => {
+            return Err(StorageError::new(format!(
+                "crun exited immediately with {:?} — container did not start. \
+                 Check the agent log for crun output.",
+                status.code()
+            )));
+        }
+        Ok(None) => {} // still running, good
+        Err(e) => {
+            debug!(error = %e, "try_wait on crun child failed; assuming alive");
+        }
+    }
 
     let pid = child.id();
     // Don't wait on the child; it reaps itself when the container exits.
