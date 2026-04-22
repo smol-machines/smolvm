@@ -296,6 +296,7 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
     cp "$WORK_LIB_DIR/libkrun.dylib" "$DIST_DIR/lib/"
     cp "$WORK_LIB_DIR/libkrunfw.5.dylib" "$DIST_DIR/lib/"
     # Create symlink for compatibility
+    ln -sf libkrun.dylib "$DIST_DIR/lib/libkrun.1.dylib"
     ln -sf libkrunfw.5.dylib "$DIST_DIR/lib/libkrunfw.dylib"
 else
     # Copy each library's real file plus all symlinks that reference it.

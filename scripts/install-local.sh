@@ -106,6 +106,10 @@ install_from_dir() {
     cp "$src_dir/smolvm-bin" "$INSTALL_PREFIX/"
     chmod +x "$INSTALL_PREFIX/smolvm" "$INSTALL_PREFIX/smolvm-bin"
 
+    if [[ "$(uname -s)" == "Darwin" ]] && [[ -f "$INSTALL_PREFIX/lib/libkrun.dylib" ]] && [[ ! -e "$INSTALL_PREFIX/lib/libkrun.1.dylib" ]]; then
+        ln -sf libkrun.dylib "$INSTALL_PREFIX/lib/libkrun.1.dylib"
+    fi
+
     # Install agent-rootfs to data directory
     local data_dir
     if [[ "$(uname -s)" == "Darwin" ]]; then

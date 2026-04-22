@@ -367,6 +367,10 @@ install_smolvm() {
     chmod +x "$prefix/smolvm"
     chmod +x "$prefix/smolvm-bin"
 
+    if [[ "$(uname -s)" == "Darwin" ]] && [[ -f "$prefix/lib/libkrun.dylib" ]] && [[ ! -e "$prefix/lib/libkrun.1.dylib" ]]; then
+        ln -sf libkrun.dylib "$prefix/lib/libkrun.1.dylib"
+    fi
+
     # Copy disk templates if present
     if [[ -f "$extracted_dir/storage-template.ext4" ]]; then
         cp "$extracted_dir/storage-template.ext4" "$prefix/"
