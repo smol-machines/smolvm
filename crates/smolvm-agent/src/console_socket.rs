@@ -9,7 +9,7 @@
 //! See the OCI runtime spec and crun(1) for protocol details.
 
 use std::io;
-use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -138,6 +138,7 @@ impl Drop for ConsoleSocket {
 mod tests {
     use super::*;
     use crate::pty::open_pty;
+    use std::os::unix::io::RawFd;
     use std::os::unix::net::UnixStream;
 
     /// Send `fd` to `stream` via SCM_RIGHTS. Mirrors what crun does with

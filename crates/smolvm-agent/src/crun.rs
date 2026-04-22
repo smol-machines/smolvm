@@ -84,7 +84,8 @@ impl CrunCommand {
     /// `console_socket`) can still insert options before the positional.
     pub fn run(bundle_dir: &Path, container_id: &str) -> Self {
         let mut c = Self::new();
-        c.cmd.args(["run", "--bundle", &bundle_dir.to_string_lossy()]);
+        c.cmd
+            .args(["run", "--bundle", &bundle_dir.to_string_lossy()]);
         c.pending_run_id = Some(container_id.to_string());
         c
     }

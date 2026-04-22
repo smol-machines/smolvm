@@ -295,10 +295,7 @@ mod tests {
         let output = capture_child_output(&mut child);
 
         assert!(output.stdout.is_empty());
-        assert_eq!(
-            std::str::from_utf8(&output.stderr).unwrap().trim(),
-            "error"
-        );
+        assert_eq!(std::str::from_utf8(&output.stderr).unwrap().trim(), "error");
     }
 
     #[test]
