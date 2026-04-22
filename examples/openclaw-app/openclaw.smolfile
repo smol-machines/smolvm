@@ -1,12 +1,25 @@
-# OpenClaw gateway in a hardware-isolated microVM
+# OpenClaw — LLM gateway in a hardware-isolated microVM
 #
-# Run:
-#   smolvm machine run -d -s examples/openclaw-app/openclaw.smolfile
+# OpenClaw proxies requests to OpenAI, Anthropic, Google, Mistral, etc.
+# Running it inside a microVM means all outbound traffic is restricted
+# to only the LLM provider APIs listed below — no data exfiltration possible.
+#
+# ── Quick start ──────────────────────────────────────────────────────
+#
+#   smolvm machine run -d -s openclaw.smolfile
 #   curl http://localhost:18789/health
+#   curl http://localhost:18789/v1/chat/completions \
+#     -H "Authorization: Bearer $OPENAI_API_KEY" \
+#     -H "Content-Type: application/json" \
+#     -d '{"model":"gpt-4o","messages":[{"role":"user","content":"hello"}]}'
 #
-# Persistent:
-#   smolvm machine create openclaw -s examples/openclaw-app/openclaw.smolfile
-#   smolvm machine start --name openclaw
+# ── Interact with the running machine ────────────────────────────────
+#
+#   smolvm machine ls              # see running machines
+#   smolvm machine exec -it -- sh  # open a shell inside the VM
+#   smolvm machine stop            # shut it down
+#
+# ─────────────────────────────────────────────────────────────────────
 
 image = "alpine/openclaw:main"
 entrypoint = ["openclaw"]
@@ -16,8 +29,11 @@ cpus = 2
 memory = 1024
 net = true
 
-# Network policy: OpenClaw only needs to reach LLM provider APIs.
-# All other outbound traffic (including exfiltration attempts) is blocked.
+[dev]
+ports = ["18789:18789"]
+
+# Network policy: only LLM provider APIs are reachable.
+# All other outbound traffic is blocked at the VM level.
 [network]
 allow_hosts = [
     "api.openai.com",
@@ -27,6 +43,3 @@ allow_hosts = [
     "api.groq.com",
     "api.together.xyz",
 ]
-
-[dev]
-ports = ["18789:18789"]
