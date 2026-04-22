@@ -224,6 +224,23 @@ impl CrunCommand {
         self
     }
 
+    /// Register a closure to run in the child after `fork` but before
+    /// `exec`. Only async-signal-safe calls are permitted inside.
+    ///
+    /// # Safety
+    /// The closure must only call async-signal-safe functions — see
+    /// `signal-safety(7)`. Violating that can deadlock or corrupt the
+    /// child process.
+    #[cfg(unix)]
+    pub unsafe fn pre_exec<F>(mut self, f: F) -> Self
+    where
+        F: FnMut() -> std::io::Result<()> + Send + Sync + 'static,
+    {
+        use std::os::unix::process::CommandExt;
+        self.cmd.pre_exec(f);
+        self
+    }
+
     /// Spawn the command.
     pub fn spawn(mut self) -> std::io::Result<std::process::Child> {
         self.cmd.spawn()

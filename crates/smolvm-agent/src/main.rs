@@ -1238,6 +1238,16 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
             continue;
         }
 
+        // Interactive exec-into-container (`crun exec --tty` style).
+        if let AgentRequest::ExecContainer {
+            interactive: true, ..
+        }
+        | AgentRequest::ExecContainer { tty: true, .. } = &request
+        {
+            handle_interactive_exec_container(stream, request)?;
+            continue;
+        }
+
         // Handle Pull with progress streaming
         if let AgentRequest::Pull {
             ref image,
@@ -3795,6 +3805,135 @@ fn handle_vm_exec(
         stdout,
         stderr,
     }
+}
+
+/// Handle interactive `exec` inside an already-running container.
+///
+/// Mirrors `handle_interactive_vm_exec` but spawns `crun exec` so the
+/// command joins the container's namespaces. Allocates a PTY on the
+/// agent side when `tty` is set and attaches the slave to crun's stdio
+/// so terminal features (controlling tty, signal-forwarding, SIGWINCH)
+/// work as expected for `machine exec -it -- /bin/sh`.
+fn handle_interactive_exec_container(
+    stream: &mut impl ReadWrite,
+    request: AgentRequest,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (container_id, command, env, workdir, timeout_ms, tty) = match request {
+        AgentRequest::ExecContainer {
+            container_id,
+            command,
+            env,
+            workdir,
+            timeout_ms,
+            tty,
+            ..
+        } => (container_id, command, env, workdir, timeout_ms, tty),
+        _ => {
+            send_response(
+                stream,
+                &AgentResponse::error(
+                    "expected ExecContainer request",
+                    error_codes::INVALID_REQUEST,
+                ),
+            )?;
+            return Ok(());
+        }
+    };
+
+    info!(container_id = %container_id, command = ?command, tty = tty, "starting interactive exec in container");
+
+    if command.is_empty() {
+        send_response(
+            stream,
+            &AgentResponse::error("command cannot be empty", error_codes::INVALID_REQUEST),
+        )?;
+        return Ok(());
+    }
+
+    let (mut child, pty_master) = match spawn_crun_exec_interactive(
+        &container_id,
+        &command,
+        &env,
+        workdir.as_deref(),
+        tty,
+    ) {
+        Ok(result) => result,
+        Err(e) => {
+            send_response(
+                stream,
+                &AgentResponse::from_err(e, error_codes::SPAWN_FAILED),
+            )?;
+            return Ok(());
+        }
+    };
+
+    send_response(stream, &AgentResponse::Started)?;
+
+    let exit_code = match pty_master {
+        #[cfg(target_os = "linux")]
+        Some(pty) => run_interactive_loop_pty(stream, &mut child, pty, timeout_ms)?,
+        _ => run_interactive_loop(stream, &mut child, timeout_ms)?,
+    };
+
+    send_response(stream, &AgentResponse::Exited { exit_code })?;
+    Ok(())
+}
+
+/// Spawn `crun exec` with an optional PTY attached to the child's stdio.
+///
+/// Mirrors `spawn_direct_interactive_command` but routes through
+/// `CrunCommand::exec` so the command joins an existing container.
+#[cfg(target_os = "linux")]
+fn spawn_crun_exec_interactive(
+    container_id: &str,
+    command: &[String],
+    env: &[(String, String)],
+    workdir: Option<&str>,
+    tty: bool,
+) -> Result<(Child, Option<pty::PtyMaster>), Box<dyn std::error::Error>> {
+    use std::os::unix::io::AsRawFd as _;
+
+    let builder = crate::crun::CrunCommand::exec(container_id, env, command, workdir, tty);
+
+    if tty {
+        let (pty_master, slave_fd) = pty::open_pty(80, 24)?;
+        let slave_raw = slave_fd.as_raw_fd();
+
+        // SAFETY: slave_raw comes from `open_pty` so it's a valid open fd.
+        // dup() three times so each stdio handle owns its own copy; the
+        // original slave_fd is dropped after spawn so only the child holds
+        // references.
+        let child = unsafe {
+            builder
+                .stdin_from_fd(libc::dup(slave_raw))
+                .stdout_from_fd(libc::dup(slave_raw))
+                .stderr_from_fd(libc::dup(slave_raw))
+                .pre_exec(pty::slave_pre_exec(slave_raw))
+                .spawn()
+        }?;
+
+        drop(slave_fd);
+        Ok((child, Some(pty_master)))
+    } else {
+        let child = builder.stdin_piped().capture_output().spawn()?;
+        Ok((child, None))
+    }
+}
+
+/// Stub for non-Linux platforms. PTY work only happens on Linux since
+/// the agent is Linux-only in production; this keeps the code compilable
+/// when `cargo check`ing from a macOS host.
+#[cfg(not(target_os = "linux"))]
+fn spawn_crun_exec_interactive(
+    container_id: &str,
+    command: &[String],
+    env: &[(String, String)],
+    workdir: Option<&str>,
+    _tty: bool,
+) -> Result<(Child, Option<()>), Box<dyn std::error::Error>> {
+    let builder = crate::crun::CrunCommand::exec(container_id, env, command, workdir, false);
+    let child = builder.stdin_piped().capture_output().spawn()?;
+    Ok((child, None))
 }
 
 /// Handle interactive VM-level exec with streaming I/O.
