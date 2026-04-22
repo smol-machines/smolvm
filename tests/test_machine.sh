@@ -1451,6 +1451,41 @@ test_machine_run_detached() {
     [[ "$list_output" == *'"state": "running"'* ]]
 }
 
+# Regression test for https://github.com/smol-machines/smolvm/issues/198
+# `machine run -d --image X -- cmd` was silently dropping the command: the
+# image path had no equivalent of the bare-VM vm_exec_background path, so
+# the VM started but the workload never ran.
+test_machine_run_detached_with_command() {
+    $SMOLVM machine stop 2>/dev/null || true
+    $SMOLVM machine delete default -f 2>/dev/null || true
+
+    local run_output exit_code=0
+    run_output=$($SMOLVM machine run -d --net --image alpine:latest -- \
+        sh -c "echo issue198_fixed > /tmp/run-d-cmd-test.txt" 2>&1) || exit_code=$?
+
+    if [[ $exit_code -ne 0 ]]; then
+        $SMOLVM machine stop 2>/dev/null || true
+        $SMOLVM machine delete default -f 2>/dev/null || true
+        echo "Setup failed: machine run -d returned $exit_code: $run_output"
+        return 1
+    fi
+
+    # Give the background command time to execute inside the container.
+    sleep 3
+
+    local file_output
+    file_output=$($SMOLVM machine exec -- cat /tmp/run-d-cmd-test.txt 2>&1)
+
+    $SMOLVM machine stop 2>/dev/null || true
+    $SMOLVM machine delete default -f 2>/dev/null || true
+
+    if [[ "$file_output" != *"issue198_fixed"* ]]; then
+        echo "FAIL: command was not executed by 'machine run -d --image X -- cmd'"
+        echo "Expected file contents containing 'issue198_fixed', got: $file_output"
+        return 1
+    fi
+}
+
 test_machine_run_timeout() {
     local output
     output=$($SMOLVM machine run --net --timeout 5s --image alpine:latest -- sleep 60 2>&1 || true)
@@ -1639,6 +1674,7 @@ run_test "Machine run: workdir" test_machine_run_workdir || true
 run_test "Machine run: image default workdir" test_machine_run_image_default_workdir || true
 run_test "Machine run: image default user" test_machine_run_image_default_user || true
 run_test "Machine run: detached" test_machine_run_detached || true
+run_test "Machine run: detached with command (issue #198)" test_machine_run_detached_with_command || true
 run_test "Machine run: timeout" test_machine_run_timeout || true
 run_test "Bare VM: /workspace exists" test_bare_vm_workspace || true
 run_test "Machine images" test_machine_images || true
