@@ -275,7 +275,7 @@ mod tests {
         child.wait().unwrap();
         let output = capture_child_output(&mut child);
 
-        assert!(output.stdout.contains("hello world"));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("hello world"));
         assert!(output.stderr.is_empty());
     }
 
@@ -292,7 +292,7 @@ mod tests {
         let output = capture_child_output(&mut child);
 
         assert!(output.stdout.is_empty());
-        assert!(output.stderr.contains("error"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("error"));
     }
 
     #[test]
@@ -309,7 +309,7 @@ mod tests {
         match result {
             WaitResult::Completed { exit_code, output } => {
                 assert_eq!(exit_code, 0);
-                assert!(output.stdout.contains("hello"));
+                assert!(String::from_utf8_lossy(&output.stdout).contains("hello"));
             }
             WaitResult::TimedOut { .. } => panic!("unexpected timeout"),
             WaitResult::ClientDisconnected { .. } => panic!("unexpected client disconnect"),
@@ -351,7 +351,7 @@ mod tests {
         match result {
             WaitResult::Completed { exit_code, output } => {
                 assert_eq!(exit_code, 0);
-                assert!(output.stdout.contains("quick"));
+                assert!(String::from_utf8_lossy(&output.stdout).contains("quick"));
             }
             WaitResult::TimedOut { .. } => panic!("unexpected timeout"),
             WaitResult::ClientDisconnected { .. } => panic!("unexpected client disconnect"),
