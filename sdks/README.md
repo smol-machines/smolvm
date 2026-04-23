@@ -10,7 +10,6 @@ Layout convention:
 - `sdks/scripts/` contains shared helpers used by all embedded SDKs.
 - `sdks/node/` contains the Node.js embedded SDK and its internal platform
   packages.
-- `sdks/python/` contains the Python implementation.   
 - Future embedded SDKs should live in sibling directories such as `sdks/go/`, and `sdks/c/`.
 
 Bundled native library rule:
@@ -23,8 +22,17 @@ Bundled native library rule:
 
 Current status:
 
-- **The embedded SDK currently creates a machine without involving the DB storage. This means machines created via the embedded SDK are not visible via the smolvm CLI. This is a bug, and we are actively working on a fix**
+- **The embedded SDK currently creates a machine without involving the DB storage.  
+This means machines created via the embedded SDK are not visible via the smolvm CLI.  
+This is a bug, and we are actively working on a fix.**
 
+## Hint
+
+This directory contains the **embedded SDKs** explicitly:  
+That means those that run in the same process as smolvm itself. 
+There is no external daemon to run, making it easier and safer to script. 
+
+For the currently only other SDK - that follows the traditional approach with a separate process - see [here.](https://github.com/smol-machines/smolvm-sdk) 
 
 ## Development
 

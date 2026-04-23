@@ -20,11 +20,18 @@ skip_core_tasks = true
 [tasks.dev]
 description = "Build and codesign dev binary (macOS auto-signs)"
 category = "Development"
-env = { LIBKRUN_BUNDLE = "${CARGO_MAKE_WORKING_DIRECTORY}/lib" }
 
 script_runner = "bash"
 script = [
 '''
+if [ -z "${LIBKRUN_BUNDLE:-}" ]; then
+  if [ "$(uname -s)" = "Linux" ]; then
+    export LIBKRUN_BUNDLE="${CARGO_MAKE_WORKING_DIRECTORY}/lib/linux-$(uname -m)"
+  else
+    export LIBKRUN_BUNDLE="${CARGO_MAKE_WORKING_DIRECTORY}/lib"
+  fi
+fi
+
 cargo build --release
 if [ "$(uname -s)" = "Darwin" ]; then
   codesign --force --sign - --entitlements smolvm.entitlements ./target/release/smolvm
