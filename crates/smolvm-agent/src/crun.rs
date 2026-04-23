@@ -36,6 +36,10 @@ fn ensure_path_in_env(env: &[(String, String)]) -> Vec<(String, String)> {
 /// and other common options.
 pub struct CrunCommand {
     cmd: Command,
+    /// Positional container id for `crun run`. Appended at the very end in
+    /// `spawn`/`output`/`status` so options added later (e.g. `--console-socket`
+    /// via `console_socket()`) still land before the positional.
+    pending_run_id: Option<String>,
 }
 
 impl CrunCommand {
@@ -48,7 +52,10 @@ impl CrunCommand {
         let mut cmd = Command::new(paths::CRUN_PATH);
         cmd.args(["--root", paths::CRUN_ROOT_DIR]);
         cmd.args(["--cgroup-manager", paths::CRUN_CGROUP_MANAGER]);
-        Self { cmd }
+        Self {
+            cmd,
+            pending_run_id: None,
+        }
     }
 
     /// Create a container: `crun create --bundle <path> <id>`
@@ -70,17 +77,16 @@ impl CrunCommand {
         c
     }
 
-    /// Run a container: `crun run --bundle <path> <id>`
+    /// Run a container: `crun run [options] --bundle <path> <id>`
     ///
-    /// This creates, starts, waits, and deletes the container in one operation.
+    /// Creates, starts, waits, and deletes the container in one operation.
+    /// The container id is deferred so later builder calls (e.g.
+    /// `console_socket`) can still insert options before the positional.
     pub fn run(bundle_dir: &Path, container_id: &str) -> Self {
         let mut c = Self::new();
-        c.cmd.args([
-            "run",
-            "--bundle",
-            &bundle_dir.to_string_lossy(),
-            container_id,
-        ]);
+        c.cmd
+            .args(["run", "--bundle", &bundle_dir.to_string_lossy()]);
+        c.pending_run_id = Some(container_id.to_string());
         c
     }
 
@@ -155,6 +161,17 @@ impl CrunCommand {
         c
     }
 
+    /// Pass `--console-socket <path>` to the crun subcommand.
+    ///
+    /// With `process.terminal = true` in the OCI spec, crun will connect to
+    /// this AF_UNIX socket and send the container's PTY master fd via
+    /// `SCM_RIGHTS`. The caller must be listening on `path` before the crun
+    /// process starts.
+    pub fn console_socket(mut self, path: &Path) -> Self {
+        self.cmd.args(["--console-socket", &path.to_string_lossy()]);
+        self
+    }
+
     /// Set stdin to null.
     pub fn stdin_null(mut self) -> Self {
         self.cmd.stdin(Stdio::null());
@@ -224,18 +241,30 @@ impl CrunCommand {
         self
     }
 
+    /// Append the deferred `crun run` container id (if any) right before the
+    /// command is launched, so any options added by the caller land before
+    /// the positional argument.
+    fn apply_pending(&mut self) {
+        if let Some(id) = self.pending_run_id.take() {
+            self.cmd.arg(id);
+        }
+    }
+
     /// Spawn the command.
     pub fn spawn(mut self) -> std::io::Result<std::process::Child> {
+        self.apply_pending();
         self.cmd.spawn()
     }
 
     /// Run and wait for output.
     pub fn output(mut self) -> std::io::Result<std::process::Output> {
+        self.apply_pending();
         self.cmd.output()
     }
 
     /// Run and wait for status.
     pub fn status(mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.apply_pending();
         self.cmd.status()
     }
 }

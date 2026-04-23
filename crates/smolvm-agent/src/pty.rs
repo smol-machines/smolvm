@@ -15,6 +15,15 @@ pub struct PtyMaster {
 }
 
 impl PtyMaster {
+    /// Wrap an already-open PTY master fd.
+    ///
+    /// Used by modules that obtain a master from outside the agent (e.g.
+    /// the crun console-socket handshake) so they can return a `PtyMaster`
+    /// without reaching into the private `fd` field.
+    pub(crate) fn from_fd(fd: OwnedFd) -> Self {
+        Self { fd }
+    }
+
     /// Read bytes from the PTY master.
     pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
         let n = unsafe { libc::read(self.fd.as_raw_fd(), buf.as_mut_ptr() as *mut _, buf.len()) };
