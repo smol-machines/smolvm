@@ -23,6 +23,14 @@ use std::path::{Path, PathBuf};
 
 use super::{PortMapping, VmResources};
 
+/// Maximum number of CIDR entries held in the live egress allow-list.
+/// Protects the muxer's per-packet O(n) scan from unbounded growth when
+/// a host resolves to many IPs across many refresh cycles.
+const EGRESS_CIDR_CAP: usize = 512;
+
+/// The Arc type shared between the egress-refresh thread and libkrun's vsock muxer.
+type EgressArc = std::sync::Arc<std::sync::RwLock<Vec<(std::net::IpAddr, u8)>>>;
+
 /// Disks to attach to the agent VM.
 pub struct VmDisks<'a> {
     /// Storage disk for OCI layers (/dev/vda in guest).
@@ -198,6 +206,12 @@ pub struct LaunchConfig<'a> {
     /// Whether DNS filtering was configured for this launch, even if the
     /// host-side proxy socket could not be created.
     pub dns_filter_enabled: bool,
+    /// Hostnames to periodically re-resolve for the live egress policy.
+    /// When set, a background thread re-resolves these every 5 minutes and
+    /// atomically replaces the CIDR list via the Arc handle obtained from
+    /// libkrun. This keeps the egress allow-list accurate for long-running VMs
+    /// hitting CDN-backed hosts whose IPs rotate.
+    pub egress_refresh_hosts: Option<Vec<String>>,
 }
 
 /// Launch the agent VM using libkrun.
@@ -217,6 +231,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         packed_layers_dir,
         extra_disks,
         dns_filter_enabled,
+        egress_refresh_hosts,
     } = config;
 
     crate::network::validate_requested_network_backend(resources, None, port_mappings.len())?;
@@ -687,6 +702,87 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             return Err(Error::agent("set exec command", "krun_set_exec failed"));
         }
 
+        // Egress CIDR live-refresh thread.
+        //
+        // Re-resolves DNS filter hostnames every SMOLVM_EGRESS_REFRESH_SECS
+        // (default 5 min) and atomically replaces the Arc<RwLock<Vec<...>>>
+        // that the vsock muxer reads on every packet. The Arc is borrowed from
+        // libkrun via `krun_get_egress_handle` — see libkrun/src/libkrun/src/lib.rs.
+        //
+        // Each cycle: resolve all hosts → build fresh list → single write-lock
+        // swap. If all hosts fail to resolve, the previous list is kept intact.
+        if let Some(hosts) = egress_refresh_hosts.as_ref().filter(|h| !h.is_empty()) {
+            type GetHandleFn = unsafe extern "C" fn(u32) -> *mut libc::c_void;
+            let get_sym = CString::new("krun_get_egress_handle").expect("symbol name is static");
+            let get_ptr = libc::dlsym(libc::RTLD_DEFAULT, get_sym.as_ptr());
+
+            if !get_ptr.is_null() {
+                #[allow(clippy::missing_transmute_annotations)]
+                let krun_get_egress_handle: GetHandleFn = std::mem::transmute(get_ptr);
+                let raw_handle = krun_get_egress_handle(ctx);
+
+                if !raw_handle.is_null() {
+                    let arc: EgressArc = *Box::from_raw(raw_handle as *mut EgressArc);
+                    let hosts_copy = hosts.clone();
+                    if let Err(e) = std::thread::Builder::new()
+                        .name("egress-refresh".into())
+                        .spawn(move || {
+                            let refresh_secs: u64 = std::env::var("SMOLVM_EGRESS_REFRESH_SECS")
+                                .ok()
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(5 * 60);
+                            let refresh_interval = std::time::Duration::from_secs(refresh_secs);
+                            loop {
+                                std::thread::sleep(refresh_interval);
+                                // Resolve all hosts into a fresh list, then swap
+                                // the shared Vec in a single write-lock acquisition.
+                                // This ensures old rotated-away IPs are removed.
+                                let mut fresh: Vec<(std::net::IpAddr, u8)> = Vec::new();
+                                'hosts: for host in &hosts_copy {
+                                    match resolve_host_subprocess(host) {
+                                        Ok(new_cidrs) => {
+                                            for cidr_str in new_cidrs {
+                                                if fresh.len() >= EGRESS_CIDR_CAP {
+                                                    break 'hosts;
+                                                }
+                                                if let Some((ip_str, prefix_str)) =
+                                                    cidr_str.split_once('/')
+                                                {
+                                                    if let (Ok(ip), Ok(prefix)) = (
+                                                        ip_str.parse::<std::net::IpAddr>(),
+                                                        prefix_str.parse::<u8>(),
+                                                    ) {
+                                                        if !fresh.contains(&(ip, prefix)) {
+                                                            fresh.push((ip, prefix));
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                host = %host,
+                                                error = %e,
+                                                "egress-refresh: resolve failed"
+                                            );
+                                        }
+                                    }
+                                }
+                                // Only replace if at least one host resolved
+                                // successfully; keeps the old list on total failure.
+                                if !fresh.is_empty() {
+                                    let mut guard = arc.write().unwrap_or_else(|e| e.into_inner());
+                                    *guard = fresh;
+                                }
+                            }
+                        })
+                    {
+                        tracing::warn!(error = %e, "egress-refresh spawn failed");
+                    }
+                }
+            }
+        }
+
         // Start VM (this replaces the process on success)
         let ret = krun_start_enter(ctx);
 
@@ -751,6 +847,62 @@ fn format_mac(mac: [u8; 6]) -> String {
         "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
     )
+}
+
+/// Resolve a hostname to /32 CIDR strings for the egress-refresh thread.
+///
+/// ## Why not `getaddrinfo`?
+///
+/// The `egress-refresh` thread runs inside the `_boot-vm` subprocess. Before
+/// `krun_start_enter` is called, `internal_boot.rs` closes every inherited FD
+/// from 3 up to `max_fd`. Apple's Network framework maps shared memory at
+/// process launch and accesses it via FD-derived handles. After the mass close,
+/// those handles are invalid, so any call to `getaddrinfo` (which routes
+/// through the Network framework on macOS) crashes with SIGBUS at
+/// `_os_log_preferences_refresh` inside `nw_path_libinfo_path_check`.
+///
+/// Spawning an external `dig` process sidesteps this: `exec()` gives the child
+/// a completely fresh address space, so it never touches the broken inherited
+/// shared memory. On non-macOS platforms `getaddrinfo` via glibc is safe and
+/// is used directly.
+#[cfg(target_os = "macos")]
+#[inline(never)]
+fn resolve_host_subprocess(host: &str) -> std::result::Result<Vec<String>, String> {
+    // `/usr/bin/dig` is always present on macOS (part of BIND-tools in the
+    // base system). `+short` prints one result per line (IPs and CNAMEs);
+    // `+timeout=5 +tries=2` keeps the refresh loop from stalling the VM on
+    // a flaky network.
+    let output = std::process::Command::new("/usr/bin/dig")
+        .args(["+short", "+timeout=5", "+tries=2", host])
+        .output()
+        .map_err(|e| format!("dig subprocess failed for '{}': {}", host, e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // `+short` emits CNAMEs (ending in '.') interleaved with IPs; parse::<IpAddr>
+    // silently skips the CNAME lines, leaving only valid addresses.
+    let cidrs: Vec<String> = stdout
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .parse::<std::net::IpAddr>()
+                .ok()
+                .map(|ip| format!("{}/32", ip))
+        })
+        .collect();
+
+    if cidrs.is_empty() {
+        return Err(format!("dig resolved '{}' to no IP addresses", host));
+    }
+    Ok(cidrs)
+}
+
+/// On non-macOS (Linux), `getaddrinfo` is safe to call from background threads
+/// in child processes — glibc does not use shared-memory handles that become
+/// invalid after a mass FD close. Delegate directly to the standard resolver.
+#[cfg(not(target_os = "macos"))]
+#[inline(never)]
+fn resolve_host_subprocess(host: &str) -> std::result::Result<Vec<String>, String> {
+    crate::smolfile::resolve_host_to_cidrs(host)
 }
 
 /// Raise file descriptor limits (required by libkrun).

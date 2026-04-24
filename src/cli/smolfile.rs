@@ -12,7 +12,7 @@ use smolvm::network::NetworkBackend;
 use std::path::PathBuf;
 
 // Re-export from the library
-pub use smolvm::smolfile::{parse_duration_secs, resolve_host_to_cidrs, Smolfile};
+pub use smolvm::smolfile::{parse_duration_secs, Smolfile};
 
 /// Load and parse a Smolfile from the given path.
 pub fn load(path: &std::path::Path) -> smolvm::Result<Smolfile> {
@@ -174,18 +174,14 @@ pub fn build_create_params(
     // Merge network policy: [network] section, then CLI extends
     let network = sf.network.unwrap_or_default();
 
-    // Preserve original hostnames for DNS filtering
+    // Preserve original hostnames for DNS filtering.
+    // Do NOT resolve these to CIDRs here — CDN-backed hosts rotate IPs and the
+    // resolved addresses would be stale by the time the machine is started.
+    // Re-resolution happens at `machine start` time (see start_vm_named).
     let sf_allow_hosts = network.allow_hosts;
 
-    // Resolve hostnames to CIDRs for egress policy
+    // Parse [network].allow_cidrs — these are explicit stable CIDRs, stored as-is.
     let mut allowed_cidrs_vec: Vec<String> = Vec::new();
-    for host in &sf_allow_hosts {
-        let cidrs = resolve_host_to_cidrs(host)
-            .map_err(|e| smolvm::Error::config("smolfile [network] allow_hosts", e))?;
-        allowed_cidrs_vec.extend(cidrs);
-    }
-
-    // Parse [network].allow_cidrs
     let sf_cidrs: Vec<String> = network
         .allow_cidrs
         .iter()
@@ -198,7 +194,7 @@ pub fn build_create_params(
     allowed_cidrs_vec.extend(cli_allow_cidr);
 
     // --allow-cidr / --allow-host / [network] implies --net
-    let net = if !allowed_cidrs_vec.is_empty() {
+    let net = if !allowed_cidrs_vec.is_empty() || !sf_allow_hosts.is_empty() {
         true
     } else {
         net

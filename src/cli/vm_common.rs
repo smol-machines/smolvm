@@ -539,7 +539,35 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
 
     let mounts = record.host_mounts();
     let ports = record.port_mappings();
-    let resources = record.vm_resources();
+    let mut resources = record.vm_resources();
+
+    // Re-resolve allow_hosts to fresh CIDRs at start time.
+    // Hostnames for CDN-backed services (e.g. dl-cdn.alpinelinux.org) rotate
+    // IPs — storing resolved CIDRs at `machine create` time means the egress
+    // policy goes stale. We re-resolve here so the policy always reflects
+    // current DNS, then merge with any explicit allow_cidrs stored in the DB.
+    //
+    // IMPORTANT: always initialize allowed_cidrs (even to an empty Vec) when
+    // dns_filter_hosts is set. This ensures launcher.rs always calls
+    // krun_set_egress_policy, even when every hostname fails to resolve.
+    // Without this, a DNS outage at start time causes the VM to boot with no
+    // egress restriction at all (fail-open). With it, the policy starts as
+    // deny-all and launcher.rs's ensure_dns_in_cidrs adds 1.1.1.1/32 as the
+    // minimum (fail-closed: only DNS reachable until resolution succeeds).
+    if let Some(ref hosts) = record.dns_filter_hosts {
+        if !hosts.is_empty() {
+            let existing = resources.allowed_cidrs.get_or_insert_with(Vec::new);
+            for host in hosts {
+                match crate::cli::parsers::resolve_host_to_cidrs(host) {
+                    Ok(cidrs) => existing.extend(cidrs),
+                    Err(e) => eprintln!(
+                        "Warning: could not resolve '{}' for egress policy: {}",
+                        host, e
+                    ),
+                }
+            }
+        }
+    }
 
     // Check for host port conflicts with other running VMs.
     if !ports.is_empty() {

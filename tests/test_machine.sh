@@ -724,6 +724,198 @@ test_machine_allow_host_persists_across_restart() {
     [[ $exit_code_after -ne 0 ]]
 }
 
+# Regression test for GitHub issue #124:
+# Smolfile [network].allow_hosts should work on persistent machines even after
+# IP rotation (CDN-backed hosts). Tests that egress policy is re-resolved at
+# `machine start` time using fresh DNS, not stale CIDRs from create time.
+#
+# Strategy: create via Smolfile, then use sqlite3 to overwrite allowed_cidrs
+# with a bogus RFC-5737 TEST-NET address (192.0.2.0/24) — simulating stale
+# CDN IPs. With the fix, start must re-resolve allow_hosts and override the
+# stale stored value; without it, egress would be blocked.
+test_smolfile_allow_hosts_stale_cidr_regression() {
+    local vm_name="allow-hosts-stale-test-$$"
+
+    # sqlite3 is required to inject stale CIDRs into the DB
+    if ! command -v sqlite3 >/dev/null 2>&1; then
+        echo "SKIP: sqlite3 not available"
+        return 0
+    fi
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+
+    # Smolfile with allow_hosts — no explicit allow_cidrs.
+    # one.one.one.one resolves to 1.1.1.1 / 1.0.0.1 (Cloudflare DNS).
+    cat > "$tmpdir/Smolfile.toml" <<'EOF'
+[network]
+allow_hosts = ["one.one.one.one"]
+EOF
+
+    (
+        cd "$tmpdir"
+        $SMOLVM machine create "$vm_name" -s Smolfile.toml 2>&1
+    ) || { rm -rf "$tmpdir"; return 1; }
+
+    # Determine DB path (matches SmolvmDb::default_path logic)
+    local db_path
+    if [[ "$(uname)" == "Darwin" ]]; then
+        db_path="$HOME/Library/Application Support/smolvm/server/smolvm.db"
+    else
+        db_path="$HOME/.local/share/smolvm/server/smolvm.db"
+    fi
+
+    # Inject stale CIDRs — 192.0.2.0/24 is RFC 5737 TEST-NET, never routed.
+    # This simulates the old bug: CIDRs resolved at create time that are now
+    # stale due to CDN IP rotation.
+    # The data column is stored as BLOB. json_set returns TEXT, so we must
+    # CAST both ways: TEXT for JSON manipulation, then back to BLOB for storage.
+    sqlite3 "$db_path" \
+        "UPDATE vms SET data = CAST(json_set(CAST(data AS TEXT), '$.allowed_cidrs', json('[\"192.0.2.0/24\"]')) AS BLOB) WHERE name = '$vm_name'" \
+        2>&1 || { echo "sqlite3 update failed"; rm -rf "$tmpdir"; $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+
+    # Start — fix must re-resolve allow_hosts and override the stale CIDRs
+    $SMOLVM machine start --name "$vm_name" 2>&1 \
+        || { rm -rf "$tmpdir"; $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+
+    # Probe egress using 1.0.0.1 as the resolver — also a valid IP for
+    # one.one.one.one, but NOT auto-added by ensure_dns_in_cidrs (which only
+    # injects 1.1.1.1). With stale CIDRs and no re-resolution, 1.0.0.1 is
+    # blocked; with the fix, fresh resolution adds it and the query succeeds.
+    local exit_code=0
+    $SMOLVM machine exec --name "$vm_name" -- nslookup one.one.one.one 1.0.0.1 2>&1 || exit_code=$?
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    # Fallback: if machine delete failed due to a corrupt DB row (e.g. from a
+    # botched sqlite3 update), remove the row directly so it doesn't poison
+    # subsequent test runs that scan all rows.
+    sqlite3 "$db_path" "DELETE FROM vms WHERE name = '$vm_name'" 2>/dev/null || true
+    rm -rf "$tmpdir"
+    ensure_data_dir_deleted "$vm_name"
+
+    [[ $exit_code -eq 0 ]]
+}
+
+# Basic e2e: Smolfile [network].allow_hosts permits egress to the named host
+# and blocks egress to hosts not in the list. This verifies the Smolfile path
+# (distinct from --allow-host CLI flag) works end-to-end at start time.
+test_smolfile_allow_hosts_egress_basic() {
+    local vm_name="allow-hosts-sf-basic-$$"
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+
+    cat > "$tmpdir/Smolfile.toml" <<'EOF'
+[network]
+allow_hosts = ["one.one.one.one"]
+EOF
+
+    (
+        cd "$tmpdir"
+        $SMOLVM machine create "$vm_name" -s Smolfile.toml 2>&1
+    ) || { rm -rf "$tmpdir"; return 1; }
+
+    $SMOLVM machine start --name "$vm_name" 2>&1 \
+        || { rm -rf "$tmpdir"; $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+
+    # Probe 1: 1.1.1.1 — always in the egress policy via ensure_dns_in_cidrs.
+    # Verifies the policy doesn't block what it should allow, but does NOT
+    # prove that hostname resolution ran (1.1.1.1 is auto-added regardless).
+    local exit_code_allowed=0
+    $SMOLVM machine exec --name "$vm_name" -- nslookup one.one.one.one 1.1.1.1 2>&1 || exit_code_allowed=$?
+
+    # Probe 2: 1.0.0.1 — a real IP of one.one.one.one, but NOT auto-added by
+    # ensure_dns_in_cidrs. This probe passes only if allow_hosts DNS resolution
+    # actually ran and added 1.0.0.1 to the CIDR list. It is the definitive
+    # proof that the hostname-to-CIDR path works end-to-end.
+    local exit_code_resolution=0
+    $SMOLVM machine exec --name "$vm_name" -- nslookup one.one.one.one 1.0.0.1 2>&1 || exit_code_resolution=$?
+
+    # Egress to a non-allowed resolver (8.8.8.8) must be blocked
+    local exit_code_blocked=0
+    $SMOLVM machine exec --name "$vm_name" -- nslookup cloudflare.com 8.8.8.8 2>&1 || exit_code_blocked=$?
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    rm -rf "$tmpdir"
+    ensure_data_dir_deleted "$vm_name"
+
+    [[ $exit_code_allowed -eq 0 ]] && [[ $exit_code_resolution -eq 0 ]] && [[ $exit_code_blocked -ne 0 ]]
+}
+
+# Stability smoke test for the egress refresh thread.
+#
+# Why we can't do a full e2e regression test for the refresh thread:
+#   `dns_filter_hosts` in VmRecord drives BOTH start-time re-resolution (in
+#   start_vm_named) AND the refresh thread. If dns_filter_hosts is set, start
+#   time already resolves both 1.1.1.1 and 1.0.0.1 into the policy — leaving
+#   nothing for the refresh thread to newly add. If dns_filter_hosts is null,
+#   the refresh thread also has no hosts to resolve. There is no external
+#   interface to inject stale state into the running muxer's Arc.
+#
+# What this test verifies instead:
+#   The machine starts with allow_hosts and SMOLVM_EGRESS_REFRESH_SECS=10.
+#   After waiting for 2 refresh cycles, egress to the allowed host still works.
+#   This confirms: (1) the refresh thread does not crash, (2) it does not corrupt
+#   the egress policy, and (3) existing CIDRs are preserved across refreshes.
+#
+# The true "adds new CIDR" behavior requires a unit test with controlled DNS.
+#
+# Note: this test takes ~25 seconds due to the sleep.
+test_egress_refresh_thread_stability() {
+    local vm_name="egress-refresh-smoke-$$"
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+
+    cat > "$tmpdir/Smolfile.toml" <<'EOF'
+[network]
+allow_hosts = ["one.one.one.one"]
+EOF
+
+    (
+        cd "$tmpdir"
+        $SMOLVM machine create "$vm_name" -s Smolfile.toml 2>&1
+    ) || { rm -rf "$tmpdir"; return 1; }
+
+    # Start with a 10-second refresh interval so the thread fires twice during
+    # the test window without making the test slow.
+    SMOLVM_EGRESS_REFRESH_SECS=10 $SMOLVM machine start --name "$vm_name" 2>&1 \
+        || { rm -rf "$tmpdir"; $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+
+    # Verify egress works immediately after start.
+    local exit_code_before=0
+    $SMOLVM machine exec --name "$vm_name" -- nslookup one.one.one.one 1.1.1.1 2>&1 \
+        || exit_code_before=$?
+
+    # Wait for two refresh cycles to fire (2 × 10 s + 5 s buffer).
+    echo "  Waiting 25s for two egress refresh cycles..."
+    sleep 25
+
+    # Egress must still work after refreshes — the thread must not have
+    # wiped or corrupted the existing CIDR list.
+    local exit_code_after=0
+    $SMOLVM machine exec --name "$vm_name" -- nslookup one.one.one.one 1.1.1.1 2>&1 \
+        || exit_code_after=$?
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    rm -rf "$tmpdir"
+    ensure_data_dir_deleted "$vm_name"
+
+    [[ $exit_code_before -eq 0 ]] && [[ $exit_code_after -eq 0 ]]
+}
+
 # =============================================================================
 # Persistent Rootfs (Overlay)
 # Tests verify that the overlayfs root is active and persists across reboots.
@@ -1356,6 +1548,9 @@ run_test "Egress: invalid hostname rejected at create" test_machine_egress_allow
 run_test "Egress: host:port syntax rejected" test_machine_egress_allow_host_port_rejected || true
 run_test "DNS filter: blocks resolution of non-allowed domains" test_machine_dns_filter_blocks_resolution || true
 run_test "DNS filter: allow-host persists across restart" test_machine_allow_host_persists_across_restart || true
+run_test "Smolfile: allow_hosts basic egress permitted/blocked" test_smolfile_allow_hosts_egress_basic || true
+run_test "Smolfile: allow_hosts re-resolves stale CIDRs on start (issue #124)" test_smolfile_allow_hosts_stale_cidr_regression || true
+run_test "Egress refresh thread: stability across refresh cycles" test_egress_refresh_thread_stability || true
 run_test "Overlay: root is overlayfs" test_machine_overlay_root_active || true
 run_test "Overlay: rootfs persists across reboot" test_machine_rootfs_persists_across_reboot || true
 run_test "Volume: mount visible to exec" test_machine_volume_mount_visible_to_exec || true

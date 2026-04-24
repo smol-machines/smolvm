@@ -1162,6 +1162,7 @@ impl AgentManager {
                     .dns_filter_hosts
                     .as_ref()
                     .is_some_and(|hosts| !hosts.is_empty()),
+                egress_refresh_hosts: features.dns_filter_hosts.clone(),
             });
 
             // If we get here, something went wrong (stderr is /dev/null,
