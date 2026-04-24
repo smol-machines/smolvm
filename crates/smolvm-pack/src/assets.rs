@@ -76,6 +76,13 @@ impl AssetCollector {
     /// Looks for:
     /// - libkrun.dylib (macOS) or libkrun.so (Linux)
     /// - libkrunfw.5.dylib (macOS) or libkrunfw.so.5 (Linux)
+    ///
+    /// On macOS, also includes the virglrenderer chain when present:
+    /// - libvirglrenderer.1.dylib, libMoltenVK.dylib, libepoxy.0.dylib
+    ///
+    /// These enable GPU passthrough (virtio-gpu/Venus) for guests with `gpu = true`.
+    /// When bundled, loading them adds ~3ms overhead even for non-GPU workloads
+    /// (dylib load is unavoidable; virglrenderer init itself is deferred until GPU use).
     pub fn collect_libraries(&mut self, lib_dir: &Path) -> Result<()> {
         fs::create_dir_all(self.staging_dir.join("lib"))?;
 
@@ -102,6 +109,31 @@ impl AssetCollector {
                 path: format!("lib/{}", name),
                 size: metadata.len(),
             });
+        }
+
+        // On macOS, bundle GPU rendering libraries when present in the lib dir.
+        // The virglrenderer chain (Venus/Vulkan) enables hardware-accelerated GPU
+        // passthrough for guests using virtio-gpu. All paths use @loader_path so
+        // they resolve relative to where libkrun.dylib is loaded from.
+        #[cfg(target_os = "macos")]
+        {
+            let gpu_libs = [
+                "libvirglrenderer.1.dylib",
+                "libMoltenVK.dylib",
+                "libepoxy.0.dylib",
+            ];
+            for name in &gpu_libs {
+                let src = lib_dir.join(name);
+                if src.exists() {
+                    let dst = self.staging_dir.join("lib").join(name);
+                    fs::copy(&src, &dst)?;
+                    let metadata = fs::metadata(&dst)?;
+                    self.inventory.libraries.push(AssetEntry {
+                        path: format!("lib/{}", name),
+                        size: metadata.len(),
+                    });
+                }
+            }
         }
 
         Ok(())

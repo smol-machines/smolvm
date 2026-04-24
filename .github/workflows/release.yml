@@ -122,6 +122,7 @@ jobs:
     needs: [build-agent, build-rootfs]
     runs-on: ${{ matrix.runner }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - platform: darwin-arm64
@@ -252,11 +253,13 @@ jobs:
           ls -la ${{ matrix.lib_dir }}/
           echo "Bundled libraries:"
           ls -la "$DIST_LIB"/
-          # Verify sizes match (catches stale LFS or copy issues)
-          for lib in "$DIST_LIB"/libkrun*; do
+          # Verify sizes match for all bundled libraries (catches stale LFS or copy issues).
+          # Covers both required libs (libkrun, libkrunfw) and optional GPU libs.
+          for lib in "$DIST_LIB"/lib*; do
+            [[ -L "$lib" ]] && continue  # skip symlinks
             name=$(basename "$lib")
             src="${{ matrix.lib_dir }}/$name"
-            if [[ -f "$src" ]] && [[ ! -L "$lib" ]]; then
+            if [[ -f "$src" ]]; then
               src_size=$(wc -c < "$src")
               dst_size=$(wc -c < "$lib")
               if [[ "$src_size" != "$dst_size" ]]; then

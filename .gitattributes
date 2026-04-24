@@ -1,4 +1,7 @@
 lib/libkrun.dylib filter=lfs diff=lfs merge=lfs -text
 lib/libkrunfw.5.dylib filter=lfs diff=lfs merge=lfs -text
+lib/libvirglrenderer.1.dylib filter=lfs diff=lfs merge=lfs -text
+lib/libMoltenVK.dylib filter=lfs diff=lfs merge=lfs -text
+lib/libepoxy.0.dylib filter=lfs diff=lfs merge=lfs -text
 lib/linux-x86_64/*.so filter=lfs diff=lfs merge=lfs -text
 lib/linux-aarch64/*.so filter=lfs diff=lfs merge=lfs -text

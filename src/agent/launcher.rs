@@ -91,8 +91,10 @@ extern "C" {
 /// macOS:  make BLK=1 NET=1 GPU=1 TIMESYNC=1
 /// ```
 ///
-/// At runtime the host also needs virglrenderer and a Vulkan driver installed.
-/// See the project README for platform-specific package names.
+/// At runtime the host needs virglrenderer and a Vulkan driver. On macOS these
+/// are bundled in the smolvm distribution (`lib/libvirglrenderer.1.dylib` and
+/// `lib/libMoltenVK.dylib`). On Linux, install the system packages and rebuild
+/// libkrun with `GPU=1`.
 unsafe fn resolve_krun_set_gpu_options2() -> Option<unsafe extern "C" fn(u32, u32, u64) -> i32> {
     let name = c"krun_set_gpu_options2";
     let ptr = libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr());
@@ -129,6 +131,11 @@ const VIRGLRENDERER_USE_EGL: u32 = 1 << 0;
 #[cfg(target_os = "linux")]
 const VIRGLRENDERER_USE_SURFACELESS: u32 = 1 << 3;
 const VIRGLRENDERER_VENUS: u32 = 1 << 6;
+// Skip OpenGL (vrend) init on macOS — without EGL, vrend_renderer_init crashes
+// because it calls through NULL platform function pointers.  Venus (Vulkan) works
+// fine without vrend; DRI2/OpenGL in the guest is not needed for Venus workloads.
+#[cfg(not(target_os = "linux"))]
+const VIRGLRENDERER_NO_VIRGL: u32 = 1 << 7;
 #[cfg(target_os = "linux")]
 const VIRGLRENDERER_RENDER_SERVER: u32 = 1 << 9;
 
@@ -325,18 +332,17 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // Enable GPU if requested (virgl for OpenGL + Venus for Vulkan via virtio-gpu).
         // Requires libkrun built with `gpu` feature and host virglrenderer.
         // On macOS, also requires MoltenVK (Vulkan → Metal translation).
-        // VIRGLRENDERER_NO_VIRGL is intentionally omitted — virgl3D (OpenGL) must
-        // remain enabled alongside Venus so the guest virtio_gpu_dri.so driver can
-        // create rendering contexts.  Without it, DRI2 screen creation fails with
-        // VIRTIO_GPU_RESP_ERR_UNSPEC and EGL falls back to software (kms_swrast).
         if resources.gpu {
             #[cfg(target_os = "linux")]
             let virgl_flags = VIRGLRENDERER_USE_EGL
                 | VIRGLRENDERER_USE_SURFACELESS
                 | VIRGLRENDERER_VENUS
                 | VIRGLRENDERER_RENDER_SERVER;
+            // NO_VIRGL skips OpenGL (vrend) init on macOS — without EGL, vrend_renderer_init
+            // crashes on null platform function pointers.  Venus (Vulkan) is sufficient for
+            // all supported GPU workloads (vulkaninfo, WebGL uses SwiftShader anyway).
             #[cfg(not(target_os = "linux"))]
-            let virgl_flags = VIRGLRENDERER_VENUS;
+            let virgl_flags = VIRGLRENDERER_VENUS | VIRGLRENDERER_NO_VIRGL;
             // Size the GPU shared-memory region. Caller may override
             // via `--gpu-vram <MiB>` (CLI) or `gpu_vram = N` (Smolfile);
             // default is `DEFAULT_GPU_VRAM_MIB`.
