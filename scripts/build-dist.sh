@@ -9,6 +9,13 @@
 
 set -e
 
+if [[ -f "$HOME/.cargo/env" ]]; then
+    # Prefer rustup-managed cargo/rustc when available so rust-toolchain.toml
+    # and installed cross targets are honored even in non-login shells.
+    # shellcheck source=/dev/null
+    . "$HOME/.cargo/env"
+fi
+
 # Options
 WITH_LOCAL_LIBKRUN=0
 SKIP_AGENT_BUILD=0
@@ -76,6 +83,32 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 WORKSPACE_SRC_ROOT="$(cd "$PROJECT_ROOT/.." && pwd)"
 LOCAL_STAGE_DIR="$PROJECT_ROOT/target/local-lib-stage"
 LOCAL_INIT_KRUN=""
+HOST_ARCH="$(uname -m)"
+
+case "$HOST_ARCH" in
+    x86_64|amd64)
+        AGENT_RUST_TARGET="x86_64-unknown-linux-musl"
+        ;;
+    aarch64|arm64)
+        AGENT_RUST_TARGET="aarch64-unknown-linux-musl"
+        ;;
+    *)
+        echo "Error: unsupported architecture for smolvm-agent build: $HOST_ARCH"
+        exit 1
+        ;;
+esac
+
+# Use Rust's bundled linker for musl targets. Without this, Cargo can fall back
+# to the host C compiler as the linker; that breaks on hosts without a matching
+# musl/cross toolchain, such as aarch64 machines building static musl agents.
+case "$AGENT_RUST_TARGET" in
+    x86_64-unknown-linux-musl)
+        export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="${CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER:-rust-lld}"
+        ;;
+    aarch64-unknown-linux-musl)
+        export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="${CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER:-rust-lld}"
+        ;;
+esac
 
 if [[ -z "$LOCAL_LIBKRUN_DIR" ]]; then
     LOCAL_LIBKRUN_DIR="$WORKSPACE_SRC_ROOT/libkrun"
@@ -248,11 +281,11 @@ else
     if [[ "$(uname -s)" == "Linux" ]]; then
         # On Linux, build natively with musl for static linking
         if command -v cargo &> /dev/null; then
-            if rustup target list --installed 2>/dev/null | grep -q musl; then
-                cargo build --profile release-small -p smolvm-agent --target x86_64-unknown-linux-musl
+            if rustup target list --installed 2>/dev/null | grep -qx "$AGENT_RUST_TARGET"; then
+                cargo build --profile release-small -p smolvm-agent --target "$AGENT_RUST_TARGET"
                 # Copy to the non-target-triple path that the rest of the script expects
                 mkdir -p ./target/release-small
-                cp "./target/x86_64-unknown-linux-musl/release-small/smolvm-agent" \
+                cp "./target/$AGENT_RUST_TARGET/release-small/smolvm-agent" \
                    "./target/release-small/smolvm-agent"
             fi
         fi
@@ -266,7 +299,7 @@ else
                 -- sh -c ". /usr/local/cargo/env && apk add musl-dev && cd /work && cargo build --profile release-small -p smolvm-agent"
         else
             echo "Error: Cannot build smolvm-agent."
-            echo "  Install smolvm or the musl target (rustup target add x86_64-unknown-linux-musl)"
+            echo "  Install smolvm or the musl target (rustup target add $AGENT_RUST_TARGET)"
             exit 1
         fi
     fi
@@ -344,6 +377,12 @@ else
                 cp -a "$candidate" "$DIST_DIR/lib/"
             fi
         done
+
+        soname="$(readelf -d "$real_file" 2>/dev/null | sed -n 's/.*Library soname: \[\(.*\)\].*/\1/p' | head -1)"
+        if [[ -n "$soname" && "$soname" != "$real_name" && ! -e "$DIST_DIR/lib/$soname" ]]; then
+            ln -sf "$real_name" "$DIST_DIR/lib/$soname"
+        fi
+
         echo "Bundled library: ${lib_prefix} ($(du -h "$DIST_DIR/lib/$real_name" | cut -f1))"
     }
 
@@ -521,7 +560,14 @@ EOF
 
 # Generate checksums
 echo "Generating checksums..."
-(cd "$DIST_DIR" && shasum -a 256 smolvm smolvm-bin lib/* > checksums.txt)
+if command -v shasum &> /dev/null; then
+    (cd "$DIST_DIR" && shasum -a 256 smolvm smolvm-bin lib/* > checksums.txt)
+elif command -v sha256sum &> /dev/null; then
+    (cd "$DIST_DIR" && sha256sum smolvm smolvm-bin lib/* > checksums.txt)
+else
+    echo "Error: shasum or sha256sum is required to generate checksums"
+    exit 1
+fi
 
 # Delete existing tarball. This is because when a new release is created, there could be 
 # tarball of the old release left in dist/, and ./install-local.sh may pick up the wrong tarball

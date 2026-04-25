@@ -92,7 +92,22 @@ script_runner = "bash"
 script = [
 '''
 if [ "$(uname -s)" = "Linux" ]; then
-  cargo build --profile release-small -p smolvm-agent --target x86_64-unknown-linux-musl
+  case "$(uname -m)" in
+    x86_64|amd64) target="x86_64-unknown-linux-musl" ;;
+    aarch64|arm64) target="aarch64-unknown-linux-musl" ;;
+    *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+  esac
+  # Use Rust's bundled linker for musl targets. Otherwise Cargo may invoke the
+  # host C compiler as the linker, which fails without a matching musl/cross toolchain.
+  case "$target" in
+    x86_64-unknown-linux-musl)
+      export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="${CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER:-rust-lld}"
+      ;;
+    aarch64-unknown-linux-musl)
+      export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="${CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER:-rust-lld}"
+      ;;
+  esac
+  cargo build --profile release-small -p smolvm-agent --target "$target"
 else
   docker run --rm -v "$(pwd):/work" -w /work rust:alpine sh -c 'apk add musl-dev && cargo build --profile release-small -p smolvm-agent'
 fi
