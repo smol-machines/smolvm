@@ -33,14 +33,14 @@ jobs:
             linker_pkg: gcc-aarch64-linux-gnu
             linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/bin/
@@ -71,7 +71,7 @@ jobs:
       - name: Verify static binary
         run: file target/${{ matrix.target }}/release-small/smolvm-agent
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: agent-${{ matrix.arch }}
           path: target/${{ matrix.target }}/release-small/smolvm-agent
@@ -89,10 +89,10 @@ jobs:
           - arch: aarch64
           - arch: x86_64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Download agent binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: agent-${{ matrix.arch }}
           path: /tmp/agent/
@@ -109,7 +109,7 @@ jobs:
           # to restricted dirs like /var/run/chrony (owned by chrony:chrony 700)
           sudo tar -cf target/agent-rootfs.tar -C target/agent-rootfs .
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: rootfs-${{ matrix.arch }}
           path: target/agent-rootfs.tar
@@ -135,7 +135,7 @@ jobs:
             agent_arch: x86_64
             lib_dir: lib/linux-x86_64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           lfs: true
           submodules: ${{ matrix.platform == 'linux-x86_64' && 'recursive' || 'false' }}
@@ -146,7 +146,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/bin/
@@ -179,7 +179,7 @@ jobs:
           file ${{ matrix.lib_dir }}/*
 
       - name: Download rootfs
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: rootfs-${{ matrix.rootfs_arch }}
           path: /tmp/rootfs-dl/
@@ -190,7 +190,7 @@ jobs:
           sudo tar -xf /tmp/rootfs-dl/agent-rootfs.tar -C target/agent-rootfs
 
       - name: Download agent binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: agent-${{ matrix.agent_arch }}
           path: /tmp/agent/
@@ -272,7 +272,7 @@ jobs:
           VERSION="$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)"
           ls -la "dist/smolvm-${VERSION}-"*/
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist-${{ matrix.platform }}
           path: dist/smolvm-*.tar.gz
@@ -287,10 +287,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Download all dist artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: dist-*
           path: dist/
