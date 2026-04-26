@@ -9,11 +9,11 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     libkrunfw-src = {
-      url = "github:smol-machines/libkrunfw";
+      url = "github:smol-machines/libkrunfw/351d354b4b3b3e45f38e29897af8acec9966fd41";
       flake = false;
     };
     libkrun-src = {
-      url = "github:smol-machines/libkrun";
+      url = "github:smol-machines/libkrun/0d3a0f61de7ec4713c09ca737a53709ebdeccf09";
       flake = false;
     };
   };
