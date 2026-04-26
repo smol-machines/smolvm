@@ -1,0 +1,100 @@
+{
+  "nodes": {
+    "flake-utils": {
+      "locked": {
+        "lastModified": 1731530180,
+        "narHash": "sha256-2Oqlv+MB2e4eA8qLXg8a1MqhIgbmsUzc/YjsmSFGLjM=",
+        "owner": "numtide",
+        "repo": "flake-utils",
+        "rev": "11707dc2f618dd54ca8739b309ec4fc024de578b",
+        "type": "github"
+      },
+      "original": {
+        "owner": "numtide",
+        "repo": "flake-utils",
+        "type": "github"
+      }
+    },
+    "libkrun-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1746060114,
+        "narHash": "sha256-Hv5x2pOvLND3FJaKzCjNi9x6t3K/4QQRjB8n8GxbOcE=",
+        "owner": "smol-machines",
+        "repo": "libkrun",
+        "rev": "0d3a0f61de7ec4713c09ca737a53709ebdeccf09",
+        "type": "github"
+      },
+      "original": {
+        "owner": "smol-machines",
+        "repo": "libkrun",
+        "rev": "0d3a0f61de7ec4713c09ca737a53709ebdeccf09",
+        "type": "github"
+      }
+    },
+    "libkrunfw-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1744226685,
+        "narHash": "sha256-5Xo6kG/9y0ZPvBWIl6CWKN6LEZvp7Me9iTKBO0pzCHM=",
+        "owner": "smol-machines",
+        "repo": "libkrunfw",
+        "rev": "351d354b4b3b3e45f38e29897af8acec9966fd41",
+        "type": "github"
+      },
+      "original": {
+        "owner": "smol-machines",
+        "repo": "libkrunfw",
+        "rev": "351d354b4b3b3e45f38e29897af8acec9966fd41",
+        "type": "github"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1745414167,
+        "narHash": "sha256-s/GePMMYDXNNwfVxipkE1JQDa2opWtW3NqW0hH4MNmw=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "01fbdeef22b76df85ea168fbfe1bfd9e63681b30",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixpkgs-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "flake-utils": "flake-utils",
+        "libkrun-src": "libkrun-src",
+        "libkrunfw-src": "libkrunfw-src",
+        "nixpkgs": "nixpkgs",
+        "rust-overlay": "rust-overlay"
+      }
+    },
+    "rust-overlay": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1745637002,
+        "narHash": "sha256-Np3jBq0nA6qMqJ1WdI2VqM2GkxJ2nKxK2KxKxKxKxKk=",
+        "owner": "oxalica",
+        "repo": "rust-overlay",
+        "rev": "aaec8c50baeaf2f2ba653e8aae71778a2bbbac94",
+        "type": "github"
+      },
+      "original": {
+        "owner": "oxalica",
+        "repo": "rust-overlay",
+        "type": "github"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}
