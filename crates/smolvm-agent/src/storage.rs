@@ -2762,6 +2762,13 @@ fn run_crane_once(
         cmd.arg("--platform").arg(p);
     }
 
+    if let Ok(cert_file) = std::env::var("SSL_CERT_FILE") {
+        cmd.env("SSL_CERT_FILE", cert_file);
+    }
+    if let Ok(cert_dir) = std::env::var("SSL_CERT_DIR") {
+        cmd.env("SSL_CERT_DIR", cert_dir);
+    }
+
     // Set up auth if provided (temp_dir must stay alive until command completes)
     let _temp_dir = setup_docker_auth(image, auth)?;
     if let Some(ref td) = _temp_dir {

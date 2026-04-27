@@ -683,6 +683,16 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             env_strings.push(cstr("SMOLVM_PACKED_LAYERS=smolvm_layers:/packed_layers"));
         }
 
+        // Forward TLS certificate config so the agent (and crane) can verify
+        // custom CAs (e.g. corporate TLS-intercepting proxies).
+        for var in ["SSL_CERT_FILE", "SSL_CERT_DIR"] {
+            if let Ok(val) = std::env::var(var) {
+                if let Ok(cs) = CString::new(format!("{}={}", var, val)) {
+                    env_strings.push(cs);
+                }
+            }
+        }
+
         let mut envp: Vec<*const libc::c_char> = env_strings.iter().map(|s| s.as_ptr()).collect();
         envp.push(std::ptr::null());
 
