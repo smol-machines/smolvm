@@ -23,45 +23,8 @@ pub use crate::data::storage::{
 };
 use crate::disk_utils;
 use crate::error::{Error, Result};
-use serde::{Deserialize, Serialize};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
-
-/// Disk format version info (stored at `/.smolvm/version.json` in ext4 disk).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiskVersion {
-    /// Format version (currently: 1).
-    pub format_version: u32,
-
-    /// Timestamp when the disk was created.
-    pub created_at: String,
-
-    /// Digest of the base rootfs image.
-    pub base_digest: String,
-
-    /// smolvm version that created this disk.
-    pub smolvm_version: String,
-}
-
-impl DiskVersion {
-    /// Current format version.
-    pub const CURRENT_VERSION: u32 = 1;
-
-    /// Create a new disk version with current settings.
-    pub fn new(base_digest: impl Into<String>) -> Self {
-        Self {
-            format_version: Self::CURRENT_VERSION,
-            created_at: crate::util::current_timestamp(),
-            base_digest: base_digest.into(),
-            smolvm_version: env!("CARGO_PKG_VERSION").to_string(),
-        }
-    }
-
-    /// Check if this version is compatible with the current smolvm.
-    pub fn is_compatible(&self) -> bool {
-        self.format_version <= Self::CURRENT_VERSION
-    }
-}
 
 /// Shared disk implementation for storage and overlay disks.
 #[derive(Debug, Clone)]
@@ -308,29 +271,6 @@ pub fn expand_disk<D: DiskType>(path: &Path, new_size_gb: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_disk_version_compatibility() {
-        let version = DiskVersion::new("sha256:abc123");
-        assert!(version.is_compatible());
-
-        let future_version = DiskVersion {
-            format_version: 999,
-            created_at: "0".to_string(),
-            base_digest: "sha256:abc123".to_string(),
-            smolvm_version: "99.0.0".to_string(),
-        };
-        assert!(!future_version.is_compatible());
-    }
-
-    #[test]
-    fn test_disk_version_serialization() {
-        let version = DiskVersion::new("sha256:abc123");
-        let json = serde_json::to_string(&version).unwrap();
-        let deserialized: DiskVersion = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.format_version, version.format_version);
-        assert_eq!(deserialized.base_digest, version.base_digest);
-    }
 
     #[test]
     fn test_storage_disk_create_and_delete() {
