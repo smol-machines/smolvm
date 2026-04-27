@@ -12,18 +12,18 @@ use crate::error::{Error, Result};
 use crate::network::backend::{COMPAT_NET_FEATURES, TSI_FEATURE_HIJACK_INET};
 use crate::network::{plan_launch_network, EffectiveNetworkBackend};
 use crate::storage::{OverlayDisk, StorageDisk};
-use crate::util::libkrunfw_filename;
+use crate::util::{libkrun_filename, libkrunfw_filename};
 
 use smolvm_network::{
     guest_env, start_virtio_network, GuestNetworkConfig, PortMapping as VirtioPortMapping,
     VirtioNetworkRuntime,
 };
 use smolvm_protocol::ports;
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 
-use super::{PortMapping, VmResources};
+use super::{KrunFunctions, PortMapping, VmResources};
 
 /// Maximum number of CIDR entries held in the live egress allow-list.
 /// Protects the muxer's per-packet O(n) scan from unbounded growth when
@@ -41,105 +41,7 @@ pub struct VmDisks<'a> {
     pub overlay: Option<&'a OverlayDisk>,
 }
 
-// FFI bindings to libkrun
-extern "C" {
-    fn krun_set_log_level(level: u32) -> i32;
-    fn krun_create_ctx() -> i32;
-    fn krun_free_ctx(ctx: u32);
-    fn krun_set_vm_config(ctx: u32, num_vcpus: u8, ram_mib: u32) -> i32;
-    fn krun_set_root(ctx: u32, root_path: *const libc::c_char) -> i32;
-    fn krun_set_workdir(ctx: u32, workdir: *const libc::c_char) -> i32;
-    fn krun_set_exec(
-        ctx: u32,
-        exec_path: *const libc::c_char,
-        argv: *const *const libc::c_char,
-        envp: *const *const libc::c_char,
-    ) -> i32;
-    fn krun_add_disk2(
-        ctx: u32,
-        block_id: *const libc::c_char,
-        disk_path: *const libc::c_char,
-        disk_format: u32,
-        read_only: bool,
-    ) -> i32;
-    fn krun_add_vsock_port2(
-        ctx: u32,
-        port: u32,
-        filepath: *const libc::c_char,
-        listen: bool,
-    ) -> i32;
-    fn krun_set_console_output(ctx: u32, filepath: *const libc::c_char) -> i32;
-    fn krun_set_port_map(ctx: u32, port_map: *const *const libc::c_char) -> i32;
-    fn krun_add_virtiofs(ctx: u32, tag: *const libc::c_char, path: *const libc::c_char) -> i32;
-    fn krun_start_enter(ctx: u32) -> i32;
-    fn krun_disable_implicit_vsock(ctx: u32) -> i32;
-    fn krun_add_vsock(ctx: u32, tsi_features: u32) -> i32;
-}
-
-/// Dynamically resolve `krun_set_gpu_options2` at runtime via dlsym.
-///
-/// Returns `None` when libkrun was built without the `gpu` feature (the symbol
-/// is absent from the binary). Callers must treat `None` as a hard error and
-/// surface a clear message — GPU cannot be emulated in software.
-///
-/// # Build requirements
-///
-/// libkrun must be compiled with `GPU=1`:
-///
-/// ```text
-/// Linux:  make BLK=1 NET=1 GPU=1
-/// macOS:  make BLK=1 NET=1 GPU=1 TIMESYNC=1
-/// ```
-///
-/// At runtime the host needs virglrenderer and a Vulkan driver. On macOS these
-/// are bundled in the smolvm distribution (`lib/libvirglrenderer.1.dylib` and
-/// `lib/libMoltenVK.dylib`). On Linux, install the system packages and rebuild
-/// libkrun with `GPU=1`.
-unsafe fn resolve_krun_set_gpu_options2() -> Option<unsafe extern "C" fn(u32, u32, u64) -> i32> {
-    let name = c"krun_set_gpu_options2";
-    let ptr = libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr());
-    if ptr.is_null() {
-        None
-    } else {
-        // ABI: krun_set_gpu_options2(ctx_id: u32, virgl_flags: u32, shm_size: u64) -> i32
-        // Source: libkrun/include/libkrun.h:609-611
-        Some(std::mem::transmute::<
-            *mut libc::c_void,
-            unsafe extern "C" fn(u32, u32, u64) -> i32,
-        >(ptr))
-    }
-}
-
-// virglrenderer flags for krun_set_gpu_options2.
-// Flag values from libkrun/include/libkrun.h:573-584 (virglrenderer bindings).
-//
-// Venus provides Vulkan inside the guest via virtio-gpu transport.
-//
-// Linux: EGL + surfaceless lets virglrenderer create a Vulkan device without a
-// display server.  RENDER_SERVER tells virglrenderer to call get_server_fd and
-// communicate with the virgl_render_server subprocess for Venus Vulkan; without
-// it virglrenderer ignores the render-server socket and vkEnumeratePhysicalDevices
-// returns 0 physical devices.  RENDER_SERVER is Linux-only because the render
-// server subprocess is only spawned on Linux (see virtio_gpu.rs:367,
-// #[cfg(target_os = "linux")]); on other platforms render_server_fd is always
-// None and get_server_fd would return -1.
-//
-// macOS: Venus uses MoltenVK directly (not EGL), so EGL and RENDER_SERVER are
-// omitted.
-#[cfg(target_os = "linux")]
-const VIRGLRENDERER_USE_EGL: u32 = 1 << 0;
-#[cfg(target_os = "linux")]
-const VIRGLRENDERER_USE_SURFACELESS: u32 = 1 << 3;
-const VIRGLRENDERER_VENUS: u32 = 1 << 6;
-// Skip OpenGL (vrend) init on macOS — without EGL, vrend_renderer_init crashes
-// because it calls through NULL platform function pointers.  Venus (Vulkan) works
-// fine without vrend; DRI2/OpenGL in the guest is not needed for Venus workloads.
-#[cfg(not(target_os = "linux"))]
-const VIRGLRENDERER_NO_VIRGL: u32 = 1 << 7;
-#[cfg(target_os = "linux")]
-const VIRGLRENDERER_RENDER_SERVER: u32 = 1 << 9;
-
-/// Find the directory containing libkrunfw by checking explicit overrides and
+/// Find the directory containing libkrun/libkrunfw by checking explicit overrides and
 /// paths relative to the current executable.
 ///
 /// Checks:
@@ -148,17 +50,16 @@ const VIRGLRENDERER_RENDER_SERVER: u32 = 1 << 9;
 /// - `<exe_dir>/../lib/` (alternative layout)
 /// - `<exe_dir>/../../lib/linux-<arch>/` (source tree dev builds)
 pub fn find_lib_dir() -> Option<PathBuf> {
-    let lib_name = libkrunfw_filename();
+    let lib_names = [libkrun_filename(), libkrunfw_filename()];
     if let Ok(explicit_dir) = std::env::var(ENV_SMOLVM_LIB_DIR) {
         let path = PathBuf::from(explicit_dir);
-        if path.join(lib_name).exists() {
+        if lib_names.iter().all(|lib| path.join(lib).exists()) {
             return path.canonicalize().ok().or(Some(path));
         }
 
         tracing::warn!(
             path = %path.display(),
-            lib = lib_name,
-            "{} does not contain the expected libkrunfw library", ENV_SMOLVM_LIB_DIR
+            "{} does not contain the expected libkrun/libkrunfw libraries", ENV_SMOLVM_LIB_DIR
         );
     }
 
@@ -173,89 +74,12 @@ pub fn find_lib_dir() -> Option<PathBuf> {
     ];
 
     for dir in &candidates {
-        if dir.join(lib_name).exists() {
+        if lib_names.iter().all(|lib| dir.join(lib).exists()) {
             return dir.canonicalize().ok();
         }
     }
 
     None
-}
-
-/// Load a single library into the global symbol namespace via `dlopen(RTLD_GLOBAL)`.
-///
-/// Makes the library visible to all subsequent `dlopen` calls by soname, without
-/// requiring `LD_LIBRARY_PATH` (which glibc caches at process startup and never re-reads).
-/// The handle is intentionally leaked — the library must remain resident.
-///
-/// Returns `true` if the library was loaded successfully.
-fn dlopen_global(path: &Path) -> bool {
-    let Ok(path_c) = CString::new(path.to_string_lossy().as_bytes()) else {
-        return false;
-    };
-    unsafe {
-        let handle = libc::dlopen(path_c.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL);
-        if handle.is_null() {
-            let err = libc::dlerror();
-            let msg = if err.is_null() {
-                "unknown error".to_string()
-            } else {
-                CStr::from_ptr(err).to_string_lossy().to_string()
-            };
-            tracing::warn!(path = %path.display(), error = %msg, "failed to preload library");
-            return false;
-        }
-        // Intentionally leak — library must stay loaded.
-        true
-    }
-}
-
-/// Preload libkrunfw with `RTLD_GLOBAL` so libkrun's internal `dlopen("libkrunfw.so.5")` finds it.
-///
-/// Setting `LD_LIBRARY_PATH` via `std::env::set_var` is insufficient because glibc caches
-/// library search paths at process startup and `dlopen()` never re-reads the environment.
-/// Instead, we load libkrunfw ourselves with `RTLD_GLOBAL`, which makes it visible to all
-/// subsequent `dlopen()` calls by soname — matching how `launcher_dynamic.rs` handles this.
-///
-/// This is a no-op if libkrunfw is not found in any candidate directory (e.g., it's already
-/// in a system library path).
-fn preload_libkrunfw() {
-    let Some(lib_dir) = find_lib_dir() else {
-        return;
-    };
-    dlopen_global(&lib_dir.join(libkrunfw_filename()));
-}
-
-/// Preload bundled libepoxy and libvirglrenderer with `RTLD_GLOBAL` so libkrun's
-/// virglrenderer usage resolves them before searching system library paths.
-/// Also sets `VIRGL_RENDER_SERVER_PATH` to the bundled render server binary if present.
-///
-/// `virtio_gpu.rs` reads `VIRGL_RENDER_SERVER_PATH` via `env::var` in the same process,
-/// so `set_var` here wires the bundled path without modifying libkrun source.
-///
-/// No-op if libvirglrenderer is not found in the bundled lib dir (falls back to system install).
-#[cfg(target_os = "linux")]
-fn preload_libvirglrenderer() {
-    let Some(lib_dir) = find_lib_dir() else {
-        return;
-    };
-
-    // libepoxy must be loaded before libvirglrenderer (it's a runtime dependency).
-    for lib_name in &["libepoxy.so.0", "libvirglrenderer.so.1"] {
-        let path = lib_dir.join(lib_name);
-        if path.exists() {
-            dlopen_global(&path);
-        }
-    }
-
-    // Point libkrun at the bundled render server subprocess.
-    // set_var is safe here: this runs in the single-threaded child process after fork.
-    let server = lib_dir.join("virgl_render_server");
-    if server.exists() && std::env::var("VIRGL_RENDER_SERVER_PATH").is_err() {
-        if let Some(s) = server.to_str() {
-            #[allow(deprecated)]
-            std::env::set_var("VIRGL_RENDER_SERVER_PATH", s);
-        }
-    }
 }
 
 /// Launch the agent VM (call in the forked child process).
@@ -347,14 +171,32 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
     // Raise file descriptor limits
     raise_fd_limits();
 
-    // Preload bundled virglrenderer libs and wire the render server path.
-    #[cfg(target_os = "linux")]
-    preload_libvirglrenderer();
-
-    // Preload libkrunfw so libkrun's internal dlopen can find it
-    preload_libkrunfw();
+    let lib_dir = find_lib_dir().ok_or_else(|| {
+        Error::agent(
+            "find libraries",
+            "libkrun/libkrunfw not found. Install smolvm with bundled libraries or set SMOLVM_LIB_DIR.",
+        )
+    })?;
+    let krun =
+        unsafe { KrunFunctions::load(&lib_dir) }.map_err(|e| Error::agent("load libkrun", e))?;
 
     unsafe {
+        let krun_set_log_level = krun.set_log_level;
+        let krun_create_ctx = krun.create_ctx;
+        let krun_free_ctx = krun.free_ctx;
+        let krun_set_vm_config = krun.set_vm_config;
+        let krun_set_root = krun.set_root;
+        let krun_set_workdir = krun.set_workdir;
+        let krun_set_exec = krun.set_exec;
+        let krun_add_disk2 = krun.add_disk2;
+        let krun_add_vsock_port2 = krun.add_vsock_port2;
+        let krun_set_console_output = krun.set_console_output;
+        let krun_set_port_map = krun.set_port_map;
+        let krun_add_virtiofs = krun.add_virtiofs;
+        let krun_start_enter = krun.start_enter;
+        let krun_disable_implicit_vsock = krun.disable_implicit_vsock;
+        let krun_add_vsock = krun.add_vsock;
+
         // Set log level (0 = off, 1 = error, 2 = warn, 3 = info, 4 = debug)
         // Enable debug logging to trace vsock timing issues
         let log_level = std::env::var(ENV_SMOLVM_KRUN_LOG_LEVEL)
@@ -380,16 +222,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // Requires libkrun built with `gpu` feature and host virglrenderer.
         // On macOS, also requires MoltenVK (Vulkan → Metal translation).
         if resources.gpu {
-            #[cfg(target_os = "linux")]
-            let virgl_flags = VIRGLRENDERER_USE_EGL
-                | VIRGLRENDERER_USE_SURFACELESS
-                | VIRGLRENDERER_VENUS
-                | VIRGLRENDERER_RENDER_SERVER;
-            // NO_VIRGL skips OpenGL (vrend) init on macOS — without EGL, vrend_renderer_init
-            // crashes on null platform function pointers.  Venus (Vulkan) is sufficient for
-            // all supported GPU workloads (vulkaninfo, WebGL uses SwiftShader anyway).
-            #[cfg(not(target_os = "linux"))]
-            let virgl_flags = VIRGLRENDERER_VENUS | VIRGLRENDERER_NO_VIRGL;
+            let virgl_flags = super::gpu_virgl_flags();
             // Size the GPU shared-memory region. Caller may override
             // via `--gpu-vram <MiB>` (CLI) or `gpu_vram = N` (Smolfile);
             // default is `DEFAULT_GPU_VRAM_MIB`.
@@ -398,7 +231,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
 
             // Resolve krun_set_gpu_options2 dynamically — it may not exist
             // if libkrun was built without the `gpu` feature.
-            let set_gpu = match resolve_krun_set_gpu_options2() {
+            let set_gpu = match krun.set_gpu_options2 {
                 Some(f) => f,
                 None => {
                     krun_free_ctx(ctx);
@@ -502,22 +335,14 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 }
 
                 if let Some(ref cidrs) = resources.allowed_cidrs {
-                    type SetEgressPolicyFn =
-                        unsafe extern "C" fn(u32, *const *const libc::c_char) -> i32;
-
-                    let sym_name =
-                        CString::new("krun_set_egress_policy").expect("symbol name is static");
-                    let sym = libc::dlsym(libc::RTLD_DEFAULT, sym_name.as_ptr());
-                    if sym.is_null() {
+                    let Some(set_egress) = krun.set_egress_policy else {
                         krun_free_ctx(ctx);
                         return Err(Error::agent(
                             "set egress policy",
                             "libkrun does not support egress policy (krun_set_egress_policy not found). \
                              Update libkrun or remove --allow-cidr flags.",
                         ));
-                    }
-                    #[allow(clippy::missing_transmute_annotations)]
-                    let set_egress: SetEgressPolicyFn = std::mem::transmute(sym);
+                    };
 
                     let mut all_cidrs = cidrs.clone();
                     crate::data::network::ensure_dns_in_cidrs(&mut all_cidrs);
@@ -543,7 +368,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 None
             }
             EffectiveNetworkBackend::VirtioNet => {
-                let add_net_unixstream = load_krun_add_net_unixstream().ok_or_else(|| {
+                let add_net_unixstream = krun.add_net_unixstream.ok_or_else(|| {
                     Error::agent(
                         "configure virtio-net",
                         "libkrun does not expose krun_add_net_unixstream; update libkrun or use --net-backend tsi",
@@ -882,13 +707,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // Each cycle: resolve all hosts → build fresh list → single write-lock
         // swap. If all hosts fail to resolve, the previous list is kept intact.
         if let Some(hosts) = egress_refresh_hosts.as_ref().filter(|h| !h.is_empty()) {
-            type GetHandleFn = unsafe extern "C" fn(u32) -> *mut libc::c_void;
-            let get_sym = CString::new("krun_get_egress_handle").expect("symbol name is static");
-            let get_ptr = libc::dlsym(libc::RTLD_DEFAULT, get_sym.as_ptr());
-
-            if !get_ptr.is_null() {
-                #[allow(clippy::missing_transmute_annotations)]
-                let krun_get_egress_handle: GetHandleFn = std::mem::transmute(get_ptr);
+            if let Some(krun_get_egress_handle) = krun.get_egress_handle {
                 let raw_handle = krun_get_egress_handle(ctx);
 
                 if !raw_handle.is_null() {
@@ -975,21 +794,6 @@ fn cstr(s: &str) -> CString {
 fn path_to_cstring(path: &Path) -> Result<CString> {
     CString::new(path.to_string_lossy().as_bytes())
         .map_err(|_| Error::agent("convert path", "path contains null byte"))
-}
-
-type AddNetUnixstreamFn =
-    unsafe extern "C" fn(u32, *const libc::c_char, libc::c_int, *mut u8, u32, u32) -> i32;
-
-fn load_krun_add_net_unixstream() -> Option<AddNetUnixstreamFn> {
-    let sym_name = CString::new("krun_add_net_unixstream").expect("symbol name is static");
-    // SAFETY: `RTLD_DEFAULT` searches already loaded libraries.
-    let sym = unsafe { libc::dlsym(libc::RTLD_DEFAULT, sym_name.as_ptr()) };
-    if sym.is_null() {
-        None
-    } else {
-        #[allow(clippy::missing_transmute_annotations)]
-        Some(unsafe { std::mem::transmute(sym) })
-    }
 }
 
 fn create_unix_stream_pair() -> std::io::Result<(RawFd, RawFd)> {

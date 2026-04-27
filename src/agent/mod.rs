@@ -5,6 +5,7 @@
 
 pub mod boot_config;
 mod client;
+mod krun;
 mod launcher;
 pub mod launcher_dynamic;
 mod manager;
@@ -15,6 +16,7 @@ pub use crate::data::network::PortMapping;
 pub use crate::data::resources::VmResources;
 pub use crate::data::storage::HostMount;
 pub use client::{AgentClient, ExecEvent, PullOptions, RunConfig};
+pub use krun::KrunFunctions;
 pub use launcher::{find_lib_dir, launch_agent_vm, LaunchConfig, LaunchFeatures, VmDisks};
 pub use manager::{
     docker_config_dir, docker_config_mount, ensure_vm_dir, vm_cache_root, vm_data_dir, vm_dir_hash,
