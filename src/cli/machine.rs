@@ -544,7 +544,7 @@ impl RunCmd {
                 crate::cli::pull_with_progress(&mut client, img, self.oci_platform.as_deref())?;
 
                 {
-                    use smolvm::config::SmolvmConfig;
+                    use smolvm::db::SmolvmDb;
                     use vm_common::DefaultVmOverrides;
                     let mount_tuples: Vec<(String, String, bool)> = mounts
                         .iter()
@@ -558,9 +558,9 @@ impl RunCmd {
                         .collect();
                     let port_tuples: Vec<(u16, u16)> =
                         params.port.iter().map(|p| (p.host, p.guest)).collect();
-                    if let Ok(mut config) = SmolvmConfig::load() {
+                    if let Ok(db) = SmolvmDb::open() {
                         vm_common::persist_default_running(
-                            &mut config,
+                            &db,
                             manager.child_pid(),
                             Some(DefaultVmOverrides {
                                 cpus: params.cpus,
@@ -655,7 +655,7 @@ impl RunCmd {
 
                 // Persist the default VM state so it survives stop/start.
                 {
-                    use smolvm::config::SmolvmConfig;
+                    use smolvm::db::SmolvmDb;
                     use vm_common::DefaultVmOverrides;
                     let mount_tuples: Vec<(String, String, bool)> = mounts
                         .iter()
@@ -669,9 +669,9 @@ impl RunCmd {
                         .collect();
                     let port_tuples: Vec<(u16, u16)> =
                         params.port.iter().map(|p| (p.host, p.guest)).collect();
-                    if let Ok(mut config) = SmolvmConfig::load() {
+                    if let Ok(db) = SmolvmDb::open() {
                         vm_common::persist_default_running(
-                            &mut config,
+                            &db,
                             manager.child_pid(),
                             Some(DefaultVmOverrides {
                                 cpus: params.cpus,

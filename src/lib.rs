@@ -104,7 +104,7 @@ pub const DEFAULT_IDLE_CMD: &[&str] = &["sleep", "infinity"];
 // Re-export main types for convenience
 pub use agent::{AgentClient, AgentManager};
 pub use api::ApiDoc;
-pub use config::{RecordState, RestartConfig, RestartPolicy, SmolvmConfig, VmRecord};
+pub use config::{RecordState, RestartConfig, RestartPolicy, VmRecord};
 pub use data::resources::VmResources;
 pub use data::storage::HostMount;
 pub use db::SmolvmDb;

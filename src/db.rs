@@ -13,7 +13,6 @@ use crate::config::VmRecord;
 use crate::error::{Error, Result};
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -287,81 +286,6 @@ impl SmolvmDb {
 
             tx.commit().db_err("commit vm update")?;
             Ok(updated)
-        })
-    }
-
-    /// Load all VMs into an in-memory HashMap (for compatibility layer).
-    pub fn load_all_vms(&self) -> Result<HashMap<String, VmRecord>> {
-        let vms = self.list_vms()?;
-        Ok(vms.into_iter().collect())
-    }
-
-    /// Load all config settings and VM records in a single transaction.
-    pub fn load_all(&self) -> Result<(HashMap<String, String>, HashMap<String, VmRecord>)> {
-        self.with_conn(|conn| {
-            let tx = conn.transaction().db_err("begin read transaction")?;
-
-            let mut config = HashMap::new();
-            {
-                let mut stmt = tx
-                    .prepare_cached("SELECT key, value FROM config")
-                    .db_err("prepare list config")?;
-                let rows = stmt
-                    .query_map([], |row| {
-                        let k: String = row.get(0)?;
-                        let v: String = row.get(1)?;
-                        Ok((k, v))
-                    })
-                    .db_err("query config")?;
-                for row in rows {
-                    let (k, v) = row.db_err("read config row")?;
-                    config.insert(k, v);
-                }
-            }
-
-            let mut vms = HashMap::new();
-            {
-                let mut stmt = tx
-                    .prepare_cached("SELECT name, data FROM vms")
-                    .db_err("prepare list vms")?;
-                let rows = stmt
-                    .query_map([], |row| {
-                        let name: String = row.get(0)?;
-                        let data: Vec<u8> = row.get(1)?;
-                        Ok((name, data))
-                    })
-                    .db_err("query vms")?;
-                for row in rows {
-                    let (name, data) = row.db_err("read vms row")?;
-                    let record: VmRecord = serde_json::from_slice(&data)
-                        .db_err(format!("deserialize vm record '{}'", name))?;
-                    vms.insert(name, record);
-                }
-            }
-
-            tx.commit().db_err("commit read transaction")?;
-            Ok((config, vms))
-        })
-    }
-
-    /// Save multiple config key-value pairs in a single transaction.
-    pub fn save_config(&self, settings: &[(&str, &str)]) -> Result<()> {
-        self.with_conn(|conn| {
-            let tx = conn.transaction().db_err("begin transaction")?;
-            {
-                let mut stmt = tx
-                    .prepare_cached(
-                        "INSERT INTO config (key, value) VALUES (?1, ?2)
-                         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                    )
-                    .db_err("prepare set config")?;
-                for (k, v) in settings {
-                    stmt.execute(params![k, v])
-                        .db_err(format!("set config '{}'", k))?;
-                }
-            }
-            tx.commit().db_err("commit config save")?;
-            Ok(())
         })
     }
 

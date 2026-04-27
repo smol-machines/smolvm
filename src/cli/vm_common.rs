@@ -6,7 +6,7 @@
 
 use crate::cli::{format_pid_suffix, truncate};
 use smolvm::agent::{vm_data_dir, AgentManager};
-use smolvm::config::{RecordState, SmolvmConfig, VmRecord};
+use smolvm::config::{RecordState, VmRecord};
 use smolvm::data::network::PortMapping;
 use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
 use smolvm::data::storage::HostMount;
@@ -29,8 +29,8 @@ pub fn resolve_vm_name(name: Option<String>) -> smolvm::Result<Option<String>> {
     if name.is_some() {
         return Ok(name);
     }
-    // Use direct DB lookup instead of SmolvmConfig::load() to avoid
-    // loading all config + all VMs just to check if "default" exists.
+    // Use direct DB lookup to avoid loading all VMs just to check if
+    // "default" exists.
     let db = SmolvmDb::open()?;
     if db.get_vm("default")?.is_some() {
         Ok(Some("default".to_string()))
@@ -126,10 +126,10 @@ fn cli_recover_if_unreachable(name: &str) {
 /// All errors are swallowed (logged at debug level) — this is a
 /// best-effort cleanup, not a critical path.
 fn mark_unreachable_if_zombie(name: &str) {
-    let Ok(mut config) = SmolvmConfig::load() else {
+    let Ok(db) = SmolvmDb::open() else {
         return;
     };
-    let Some(record) = config.get_vm(name) else {
+    let Ok(Some(record)) = db.get_vm(name) else {
         return;
     };
     // Only transition Running → Unreachable. Stopped/Created/Failed
@@ -144,7 +144,7 @@ fn mark_unreachable_if_zombie(name: &str) {
     // PID alive + ensure_running_and_connect failed → zombie. Persist
     // the new state. Update via the closure-based helper if available;
     // fall back to nothing on failure (best-effort).
-    let _ = config.update_vm(name, |r| {
+    let _ = db.update_vm(name, |r| {
         r.state = RecordState::Unreachable;
     });
     tracing::debug!(
@@ -415,10 +415,10 @@ pub fn create_vm(params: CreateVmParams) -> smolvm::Result<()> {
     validate_vm_name(&params.name, "machine name")
         .map_err(|reason| smolvm::Error::config("create machine", reason))?;
 
-    let mut config = SmolvmConfig::load()?;
+    let db = SmolvmDb::open()?;
 
     // Check if already exists
-    if config.get_vm(&params.name).is_some() {
+    if db.get_vm(&params.name)?.is_some() {
         return Err(smolvm::Error::config(
             "create machine",
             format!("machine '{}' already exists", params.name),
@@ -474,8 +474,8 @@ pub fn create_vm(params: CreateVmParams) -> smolvm::Result<()> {
     record.dns_filter_hosts = params.dns_filter_hosts.clone();
     record.source_smolmachine = params.source_smolmachine.clone();
 
-    // Store in config (persisted immediately to database)
-    config.insert_vm(params.name.clone(), record)?;
+    // Store in database.
+    db.insert_vm(&params.name, &record)?;
 
     println!("Created machine: {}", params.name);
     println!("  CPUs: {}, Memory: {} MiB", params.cpus, params.mem);
@@ -506,9 +506,8 @@ pub fn create_vm(params: CreateVmParams) -> smolvm::Result<()> {
 
 /// Start a named machine that has a config record.
 ///
-/// Uses direct DB operations instead of SmolvmConfig::load() to avoid
-/// loading all config settings and all VM records. Only reads the single
-/// named record (1 DB cycle) and updates it after start (1 DB cycle).
+/// Uses direct DB operations. Only reads the single named record and updates
+/// it after start.
 pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
     use smolvm::Error;
 
@@ -735,53 +734,53 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
 /// Creates the record if it doesn't exist, then updates state to Running
 /// with the current PID and optional config overrides (cpus, mem, etc.).
 pub fn persist_default_running(
-    config: &mut SmolvmConfig,
+    db: &SmolvmDb,
     pid: Option<i32>,
     overrides: Option<DefaultVmOverrides>,
 ) {
-    if config.get_vm("default").is_none() {
-        let record = VmRecord::new(
-            "default".to_string(),
-            DEFAULT_MICROVM_CPU_COUNT,
-            DEFAULT_MICROVM_MEMORY_MIB,
-            vec![],
-            vec![],
-            false,
-        );
-        if let Err(e) = config.insert_vm("default".to_string(), record) {
-            tracing::warn!(error = %e, "failed to insert default VM record");
-            return;
-        }
+    let record = VmRecord::new(
+        "default".to_string(),
+        DEFAULT_MICROVM_CPU_COUNT,
+        DEFAULT_MICROVM_MEMORY_MIB,
+        vec![],
+        vec![],
+        false,
+    );
+    if let Err(e) = db.insert_vm_if_not_exists("default", &record) {
+        tracing::warn!(error = %e, "failed to insert default VM record");
+        return;
     }
+
     let pid_start_time = pid.and_then(smolvm::process::process_start_time);
-    if config
-        .update_vm("default", |r| {
-            r.state = RecordState::Running;
-            r.pid = pid;
-            r.pid_start_time = pid_start_time;
-            if let Some(ref o) = overrides {
-                r.cpus = o.cpus;
-                r.mem = o.mem;
-                r.mounts = o.mounts.clone();
-                r.ports = o.ports.clone();
-                r.network = o.network;
-                r.network_backend = o.network_backend;
-                r.storage_gb = o.storage_gb;
-                r.overlay_gb = o.overlay_gb;
-                r.allowed_cidrs = o.allowed_cidrs.clone();
-                r.init = o.init.clone();
-                r.env = o.env.clone();
-                r.workdir = o.workdir.clone();
-                r.image = o.image.clone();
-                r.entrypoint = o.entrypoint.clone();
-                r.cmd = o.cmd.clone();
-                r.ssh_agent = o.ssh_agent;
-                r.dns_filter_hosts = o.dns_filter_hosts.clone();
-            }
-        })
-        .is_none()
-    {
-        tracing::warn!("failed to update default VM record (record missing after insert)");
+    match db.update_vm("default", |r| {
+        r.state = RecordState::Running;
+        r.pid = pid;
+        r.pid_start_time = pid_start_time;
+        if let Some(ref o) = overrides {
+            r.cpus = o.cpus;
+            r.mem = o.mem;
+            r.mounts = o.mounts.clone();
+            r.ports = o.ports.clone();
+            r.network = o.network;
+            r.network_backend = o.network_backend;
+            r.storage_gb = o.storage_gb;
+            r.overlay_gb = o.overlay_gb;
+            r.allowed_cidrs = o.allowed_cidrs.clone();
+            r.init = o.init.clone();
+            r.env = o.env.clone();
+            r.workdir = o.workdir.clone();
+            r.image = o.image.clone();
+            r.entrypoint = o.entrypoint.clone();
+            r.cmd = o.cmd.clone();
+            r.ssh_agent = o.ssh_agent;
+            r.dns_filter_hosts = o.dns_filter_hosts.clone();
+        }
+    }) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            tracing::warn!("failed to update default VM record (record missing after insert)")
+        }
+        Err(e) => tracing::warn!(error = %e, "failed to update default VM record"),
     }
 }
 
@@ -864,14 +863,14 @@ pub fn start_vm_default() -> smolvm::Result<()> {
     println!("Starting machine 'default'...");
     manager.ensure_running()?;
 
-    let mut config = SmolvmConfig::load()?;
-    persist_default_running(&mut config, manager.child_pid(), None);
+    let db = SmolvmDb::open()?;
+    persist_default_running(&db, manager.child_pid(), None);
 
     // Pull image (if persisted via `machine run -d -s`) before running
     // init, then run init through the shared runner — same fix as
     // `start_vm_named`. Both paths must agree so an init that works on
     // a named machine also works on the default one.
-    let record = config.get_vm("default").cloned();
+    let record = db.get_vm("default")?;
 
     if let Some(record) = record {
         let needs_pull = record.image.is_some();
@@ -924,11 +923,11 @@ pub fn start_vm_default() -> smolvm::Result<()> {
 /// Stop a named machine that has a config record (or fall back to
 /// agent-only stop if the name is not in config).
 pub fn stop_vm_named(name: &str) -> smolvm::Result<()> {
-    let mut config = SmolvmConfig::load()?;
+    let db = SmolvmDb::open()?;
 
     // Check config for the named VM
-    let record = match config.get_vm(name) {
-        Some(r) => r.clone(),
+    let record = match db.get_vm(name)? {
+        Some(r) => r,
         None => {
             // Not in config — try to stop a running VM with this name directly
             let manager = AgentManager::for_vm(name)?;
@@ -970,11 +969,13 @@ pub fn stop_vm_named(name: &str) -> smolvm::Result<()> {
         .map_err(|e| smolvm::Error::agent("create agent manager", e.to_string()))?;
     manager.stop()?;
 
-    config.update_vm(name, |r| {
+    if let Err(e) = db.update_vm(name, |r| {
         r.state = RecordState::Stopped;
         r.pid = None;
         r.pid_start_time = None;
-    });
+    }) {
+        tracing::warn!(error = %e, vm = %name, "failed to persist stopped state");
+    }
 
     println!("Stopped machine: {}", name);
     Ok(())
@@ -991,12 +992,14 @@ pub fn stop_vm_default() -> smolvm::Result<()> {
     manager.stop()?;
 
     // Update database record if it exists
-    if let Ok(mut config) = SmolvmConfig::load() {
-        config.update_vm("default", |r| {
+    if let Ok(db) = SmolvmDb::open() {
+        if let Err(e) = db.update_vm("default", |r| {
             r.state = RecordState::Stopped;
             r.pid = None;
             r.pid_start_time = None;
-        });
+        }) {
+            tracing::warn!(error = %e, "failed to persist stopped state for default VM");
+        }
     }
 
     println!("Machine 'default' stopped");
@@ -1016,13 +1019,12 @@ pub struct DeleteVmOptions {
 
 /// Delete a named machine configuration.
 pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::Result<()> {
-    let mut config = SmolvmConfig::load()?;
+    let db = SmolvmDb::open()?;
 
     // Check if exists
-    let record = config
-        .get_vm(name)
-        .ok_or_else(|| smolvm::Error::vm_not_found(name))?
-        .clone();
+    let record = db
+        .get_vm(name)?
+        .ok_or_else(|| smolvm::Error::vm_not_found(name))?;
 
     // Stop if running (machine run does this). Use the shared
     // resolver so an `Unreachable` VM (live PID, dead agent) is also
@@ -1061,8 +1063,8 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
         }
     }
 
-    // Remove from config (persists immediately to database)
-    config.remove_vm(name);
+    // Remove from database.
+    let _ = db.remove_vm(name)?;
 
     // If the machine was created from a .smolmachine sidecar, release the
     // case-sensitive volume (macOS hdiutil mount). The lease was intentionally
@@ -1125,8 +1127,8 @@ where
 
 /// List all machines.
 pub fn list_vms(verbose: bool, json: bool) -> smolvm::Result<()> {
-    let config = SmolvmConfig::load()?;
-    let vms: Vec<_> = config.list_vms().collect();
+    let db = SmolvmDb::open()?;
+    let vms = db.list_vms()?;
 
     let empty_label = "No machines found";
 
@@ -1180,7 +1182,7 @@ pub fn list_vms(verbose: bool, json: bool) -> smolvm::Result<()> {
         println!("{}", "-".repeat(88));
 
         for (name, record) in vms {
-            let actual_state = smolvm::agent::state_probe::resolve_state(name, record);
+            let actual_state = smolvm::agent::state_probe::resolve_state(&name, &record);
             let state_display = if record.ephemeral {
                 format!("{} (eph)", actual_state)
             } else {
@@ -1190,7 +1192,7 @@ pub fn list_vms(verbose: bool, json: bool) -> smolvm::Result<()> {
             let overlay_gb = record.overlay_gb.unwrap_or(DEFAULT_OVERLAY_SIZE_GIB);
             println!(
                 "{:<20} {:<12} {:>5} {:>10} {:>7} {:>7} {:>8} {:>8}",
-                truncate(name, 18),
+                truncate(&name, 18),
                 state_display,
                 record.cpus,
                 format!("{} MiB", record.mem),

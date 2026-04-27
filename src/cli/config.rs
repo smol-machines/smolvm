@@ -3,6 +3,9 @@
 //! Commands for managing smolvm configuration, including registry settings.
 
 use clap::{Args, Subcommand};
+use smolvm::data::network::DEFAULT_DNS;
+use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
+use smolvm::db::SmolvmDb;
 use smolvm::registry::RegistryConfig;
 use smolvm::Result;
 
@@ -37,11 +40,23 @@ pub struct ShowCmd {}
 impl ShowCmd {
     pub fn run(self) -> Result<()> {
         // Load and display global config
-        let config = smolvm::SmolvmConfig::load()?;
+        let db = SmolvmDb::open()?;
+        let default_cpus = db
+            .get_config("default_cpus")?
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_MICROVM_CPU_COUNT);
+        let default_mem = db
+            .get_config("default_mem")?
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_MICROVM_MEMORY_MIB);
+        let default_dns = db
+            .get_config("default_dns")?
+            .unwrap_or_else(|| DEFAULT_DNS.to_string());
+
         println!("Global Configuration:");
-        println!("  Default CPUs: {}", config.default_cpus);
-        println!("  Default Memory: {} MiB", config.default_mem);
-        println!("  Default DNS: {}", config.default_dns);
+        println!("  Default CPUs: {}", default_cpus);
+        println!("  Default Memory: {} MiB", default_mem);
+        println!("  Default DNS: {}", default_dns);
 
         // Load and display registry config
         let registry_config = RegistryConfig::load().unwrap_or_default();

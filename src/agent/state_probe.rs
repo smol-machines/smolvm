@@ -102,9 +102,7 @@ pub fn recover_unreachable_machine(record: &VmRecord) {
         }
     }
 
-    // Best-effort DB clear. We write via SmolvmDb (not SmolvmConfig)
-    // to avoid pulling the full in-memory config load; the db update
-    // is targeted to the one record.
+    // Best-effort DB clear. The update is targeted to the one record.
     if let Ok(db) = SmolvmDb::open() {
         let _ = db.update_vm(&record.name, |r| {
             r.state = RecordState::Stopped;
@@ -118,8 +116,7 @@ pub fn recover_unreachable_machine(record: &VmRecord) {
 /// zombie VMM, clear the record). No-op for any other state.
 ///
 /// Loads the record via `SmolvmDb` so callers on either side of the
-/// CLI/API boundary can share the helper without coupling to
-/// `SmolvmConfig`.
+/// CLI/API boundary can share the helper.
 ///
 /// Returns `true` when recovery actually ran, so callers can print
 /// a user-facing notice (start/stop/delete all want to mention the

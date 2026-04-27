@@ -14,7 +14,8 @@ use smolvm::data::resources::DEFAULT_MICROVM_CPU_COUNT;
 /// Default memory for packed VMs. Same as machine create — memory is elastic
 /// via virtio balloon, so the host only commits what the guest actually uses.
 pub(crate) const PACK_DEFAULT_MEMORY_MIB: u32 = 8192;
-use smolvm::config::{RecordState, SmolvmConfig};
+use smolvm::config::RecordState;
+use smolvm::db::SmolvmDb;
 use smolvm::platform::{Arch, Os, Platform, VmExecutor};
 use smolvm::Error;
 use smolvm_pack::assets::AssetCollector;
@@ -437,11 +438,10 @@ impl PackCreateCmd {
 
     /// Pack from a stopped VM's overlay disk.
     fn pack_from_vm(self, vm_name: String) -> smolvm::Result<()> {
-        // 1. Load config and verify VM exists and is stopped
-        let config = SmolvmConfig::load()?;
-        let vm = config
-            .vms
-            .get(&vm_name)
+        // 1. Load VM record and verify the VM exists and is stopped.
+        let db = SmolvmDb::open()?;
+        let vm = db
+            .get_vm(&vm_name)?
             .ok_or_else(|| Error::agent("pack from VM", format!("VM '{}' not found", vm_name)))?;
 
         if vm.actual_state() == RecordState::Running {
