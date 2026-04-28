@@ -1,42 +1,26 @@
 /**
- * Runtime environment setup for bundled native libraries.
+ * Runtime path setup for bundled embedded SDK assets.
  *
- * The embedded SDK runs inside `node`, so Rust-side `current_exe()` points
- * at the Node executable rather than this package. Expose an explicit library
- * directory so smolvm can find bundled libkrun/libkrunfw assets reliably.
+ * The addon itself can load `libkrun` via rpath, but the Rust runtime still
+ * needs explicit package-relative paths for bundled assets such as
+ * `libkrunfw`. Configure those paths directly in Rust instead of mutating
+ * process-global environment variables.
  */
 
 import { existsSync } from "node:fs";
-import { delimiter, resolve } from "node:path";
+import { resolve } from "node:path";
 
 import { getPlatformPackageRoot } from "./platform-package.js";
 
-function prependEnvPath(name: string, entry: string): void {
-  const current = process.env[name];
-  if (!current) {
-    process.env[name] = entry;
+export function configureNativeRuntime(binding: any): void {
+  if (typeof binding?.configureEmbeddedPaths !== "function") {
     return;
   }
 
-  const parts = current.split(delimiter);
-  if (!parts.includes(entry)) {
-    process.env[name] = `${entry}${delimiter}${current}`;
-  }
-}
+  const packageRoot = getPlatformPackageRoot();
+  const bundledLibDir = resolve(packageRoot, "lib");
 
-export function prepareNativeRuntime(): void {
-  const bundledLibDir = resolve(getPlatformPackageRoot(), "lib");
-  if (!existsSync(bundledLibDir)) {
-    return;
-  }
-
-  if (!process.env.SMOLVM_LIB_DIR) {
-    process.env.SMOLVM_LIB_DIR = bundledLibDir;
-  }
-
-  if (process.platform === "darwin") {
-    prependEnvPath("DYLD_LIBRARY_PATH", bundledLibDir);
-  } else if (process.platform === "linux") {
-    prependEnvPath("LD_LIBRARY_PATH", bundledLibDir);
-  }
+  binding.configureEmbeddedPaths({
+    libDir: existsSync(bundledLibDir) ? bundledLibDir : undefined,
+  });
 }

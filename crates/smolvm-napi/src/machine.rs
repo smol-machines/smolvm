@@ -6,13 +6,24 @@
 
 use napi::bindgen_prelude::Buffer;
 use napi_derive::napi;
+use std::path::PathBuf;
 
 use crate::error::IntoNapiResult;
 use crate::types::*;
-use smolvm::embedded::{runtime, MachineSpec};
+use smolvm::embedded::{configure_paths, runtime, EmbeddedPaths, MachineSpec};
 
 fn join_error(err: tokio::task::JoinError) -> napi::Error {
     napi::Error::from_reason(format!("Task join error: {}", err))
+}
+
+#[napi]
+pub fn configure_embedded_paths(config: EmbeddedPathsConfig) -> napi::Result<()> {
+    configure_paths(EmbeddedPaths {
+        lib_dir: config.lib_dir.map(PathBuf::from),
+        boot_bin: config.boot_bin.map(PathBuf::from),
+        rootfs_path: config.rootfs_path.map(PathBuf::from),
+    })
+    .into_napi()
 }
 
 #[napi]

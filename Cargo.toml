@@ -4,6 +4,7 @@ members = [
     "crates/smolvm-agent",
     "crates/smolvm-network",
     "crates/smolvm-napi",
+    "crates/smolvm-py",
     "crates/smolvm-pack",
     "crates/smolvm-protocol",
     "crates/smolvm-registry",

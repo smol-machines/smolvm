@@ -28,6 +28,18 @@ pub struct MachineConfig {
     pub persistent: Option<bool>,
 }
 
+/// Bundled path overrides for embedded SDK runtimes.
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct EmbeddedPathsConfig {
+    /// Directory containing bundled libkrun/libkrunfw libraries.
+    pub lib_dir: Option<String>,
+    /// Optional helper executable that can run `smolvm _boot-vm`.
+    pub boot_bin: Option<String>,
+    /// Optional explicit rootfs path for the embedded runtime.
+    pub rootfs_path: Option<String>,
+}
+
 /// A host directory mount specification.
 #[napi(object)]
 #[derive(Debug, Clone)]

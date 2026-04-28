@@ -22,9 +22,11 @@ Bundled native library rule:
 
 Current status:
 
-- **The embedded SDK currently creates a machine without involving the DB storage.  
-This means machines created via the embedded SDK are not visible via the smolvm CLI.  
-This is a bug, and we are actively working on a fix.**
+- `sdks/node/` is the first complete embedded SDK implementation.
+- `sdks/python/` contains the Python embedded SDK built on the shared
+  `smolvm::embedded` runtime.
+- Embedded SDK machines are backed by the normal smolvm VM database and storage
+  paths, so CLI/API lifecycle tools can inspect and manage them by name.
 
 ## Hint
 
@@ -53,6 +55,16 @@ cd ../..
 
 If you are already inside `sdks/node`, `npm run build` rebuilds the current-host
 platform package plus the public package without leaving the workspace.
+
+For Python, use a virtualenv and the Python build helper:
+
+```bash
+cd sdks/python
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install --upgrade pip maturin
+./scripts/build-current-platform.sh
+```
 
 ### Test
 
