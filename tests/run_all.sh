@@ -11,6 +11,7 @@
 #   ./tests/run_all.sh api          # Run only HTTP API tests
 #   ./tests/run_all.sh pack         # Run only pack tests
 #   ./tests/run_all.sh pack-quick   # Run pack tests (quick mode, skips large images)
+#   ./tests/run_all.sh gpu           # Run GPU acceleration tests (skipped if GPU unavailable)
 #   ./tests/run_all.sh bench        # Run performance benchmarks
 #   ./tests/run_all.sh bench-vm     # Run VM startup benchmark only
 #   ./tests/run_all.sh bench-container # Run container benchmark only
@@ -122,6 +123,9 @@ case "$TESTS_TO_RUN" in
         bash "$SCRIPT_DIR/test_smolfile.sh"
         exit 0
         ;;
+    gpu)
+        run_suite "GPU Tests" "$SCRIPT_DIR/test_gpu.sh"
+        ;;
     all)
         run_suite "CLI Tests" "$SCRIPT_DIR/test_cli.sh"
         run_suite "Machine Tests" "$SCRIPT_DIR/test_machine.sh"
@@ -132,7 +136,7 @@ case "$TESTS_TO_RUN" in
         ;;
     *)
         echo "Unknown test suite: $TESTS_TO_RUN"
-        echo "Available: cli, machine, virtio-net, smolfile, api, pack, pack-quick, bench, bench-vm, all"
+        echo "Available: cli, machine, virtio-net, smolfile, api, pack, pack-quick, gpu, bench, bench-vm, all"
         exit 1
         ;;
 esac
