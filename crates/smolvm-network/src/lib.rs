@@ -60,6 +60,7 @@
 pub mod device;
 pub mod frame_stream;
 pub mod guest_env;
+pub mod policy;
 pub mod queues;
 pub mod stack;
 pub mod tcp_listeners;
@@ -73,6 +74,7 @@ use std::thread::JoinHandle;
 use std::time::SystemTime;
 
 use frame_stream::{start_frame_stream_bridge, FrameStreamBridge};
+pub use policy::EgressPolicy;
 use queues::{NetworkFrameQueues, DEFAULT_FRAME_QUEUE_CAPACITY};
 use stack::{start_network_stack, VirtioPollConfig};
 use tcp_listeners::{create_tcp_channel, TcpPortListeners};
@@ -223,6 +225,7 @@ pub fn start_virtio_network(
     host_fd: RawFd,
     guest_network: GuestNetworkConfig,
     published_ports: &[PortMapping],
+    egress_policy: EgressPolicy,
 ) -> io::Result<VirtioNetworkRuntime> {
     virtio_net_log!(
         "virtio-net: starting runtime host_fd={} guest_ip={} gateway_ip={} dns_server={}",
@@ -255,6 +258,7 @@ pub fn start_virtio_network(
             mtu: 1500,
         },
         tcp_listeners.as_ref().map(|_| tcp_receiver),
+        egress_policy,
     )?;
 
     Ok(VirtioNetworkRuntime {

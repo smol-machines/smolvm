@@ -8,6 +8,7 @@
 
 use smolvm::agent::boot_config::BootConfig;
 use smolvm::agent::{launch_agent_vm, LaunchConfig, VmDisks};
+use smolvm::network::NetworkBackend;
 use std::path::PathBuf;
 
 /// Run the boot subprocess.
@@ -111,9 +112,11 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
         overlay: Some(&overlay_disk),
     };
 
-    // Start DNS filter listener if configured
+    // Start the guest-side DNS filter listener only for TSI launches.
+    // Virtio-net enforces hostname policy inside the host gateway.
+    let use_guest_dns_filter = config.resources.network_backend != Some(NetworkBackend::VirtioNet);
     let dns_filter_socket_path = if let Some(ref hosts) = config.dns_filter_hosts {
-        if !hosts.is_empty() {
+        if use_guest_dns_filter && !hosts.is_empty() {
             let socket_path = config
                 .vsock_socket
                 .parent()

@@ -9,8 +9,8 @@
 use crate::network::backend::{COMPAT_NET_FEATURES, TSI_FEATURE_HIJACK_INET};
 use crate::network::{plan_launch_network, EffectiveNetworkBackend};
 use smolvm_network::{
-    guest_env, start_virtio_network, GuestNetworkConfig, PortMapping as VirtioPortMapping,
-    VirtioNetworkRuntime,
+    guest_env, start_virtio_network, EgressPolicy, GuestNetworkConfig,
+    PortMapping as VirtioPortMapping, VirtioNetworkRuntime,
 };
 use smolvm_protocol::ports;
 use std::ffi::CString;
@@ -179,9 +179,6 @@ pub fn launch_agent_vm_dynamic(
     }
 
     let network_plan = plan_launch_network(&config.resources, None, config.port_mappings.len());
-    if let Some(reason) = network_plan.fallback_reason {
-        tracing::warn!(reason = %reason.user_message(), "network backend fell back to TSI");
-    }
 
     let mut virtio_network_runtime: Option<VirtioNetworkRuntime> = None;
     let guest_network = match network_plan.backend {
@@ -262,7 +259,15 @@ pub fn launch_agent_vm_dynamic(
                 .map(|(host, guest)| VirtioPortMapping::new(*host, *guest))
                 .collect();
 
-            let runtime = match start_virtio_network(host_fd, guest_network, &port_mappings) {
+            let runtime = match start_virtio_network(
+                host_fd,
+                guest_network,
+                &port_mappings,
+                EgressPolicy {
+                    allowed_cidrs: config.resources.allowed_cidrs.clone(),
+                    dns_filter_hosts: None, // launching packed stub does not support allow-host setting at this moment.
+                },
+            ) {
                 Ok(runtime) => runtime,
                 Err(err) => {
                     // SAFETY: guest_fd was created by socketpair above and not moved elsewhere.
