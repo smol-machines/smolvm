@@ -14,6 +14,7 @@ use smolvm::data::validate_vm_name;
 use smolvm::db::SmolvmDb;
 use smolvm::network::NetworkBackend;
 use smolvm::storage::{DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
+use smolvm::DEFAULT_IDLE_CMD;
 use smolvm_protocol::ImageInfo;
 use std::io::Write;
 
@@ -700,9 +701,26 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
         return Err(e);
     }
 
-    if record.image.is_some() {
-        // Image-based machine: VM is running, image pulled and cached,
-        // init done. Sits idle until `machine exec` is called.
+    if let Some(ref image) = record.image {
+        let mut bg_cmd = record.entrypoint.clone();
+        bg_cmd.extend(record.cmd.clone());
+        if bg_cmd.is_empty() {
+            if let Some(image_info) = image_info.as_ref() {
+                bg_cmd = image_info.entrypoint.clone();
+                bg_cmd.extend(image_info.cmd.clone());
+            }
+        }
+        if should_dispatch_background_workload(&bg_cmd) {
+            let bg_config = smolvm::agent::RunConfig::new(image, bg_cmd)
+                .with_env(record.env.clone())
+                .with_workdir(record.workdir.clone())
+                .with_mounts(crate::cli::parsers::record_mounts_to_runconfig_bindings(
+                    &record.mounts,
+                ))
+                .with_persistent_overlay(Some(name.to_string()));
+            let bg_pid = client.run_background(bg_config)?;
+            tracing::info!(pid = bg_pid, "background workload restarted");
+        }
         println!("Machine '{}' running (PID: {})", name, pid.unwrap_or(0));
     } else {
         // No image — bare VM mode. Run entrypoint+cmd if configured.
@@ -738,6 +756,18 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
     // Keep VM running (persistent)
     manager.detach();
     Ok(())
+}
+
+fn should_dispatch_background_workload(command: &[String]) -> bool {
+    !command.is_empty() && !is_default_idle_command(command)
+}
+
+fn is_default_idle_command(command: &[String]) -> bool {
+    command.len() == DEFAULT_IDLE_CMD.len()
+        && command
+            .iter()
+            .map(String::as_str)
+            .eq(DEFAULT_IDLE_CMD.iter().copied())
 }
 
 /// Persist the "default" VM as running in the database.
@@ -1520,6 +1550,25 @@ mod init_runner_tests {
                 "pacman -Sy && pacman -S git".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn background_workload_dispatch_skips_empty_and_idle_commands() {
+        let cases = [
+            (Vec::<String>::new(), false),
+            (
+                DEFAULT_IDLE_CMD
+                    .iter()
+                    .map(|part| part.to_string())
+                    .collect(),
+                false,
+            ),
+            (vec!["echo".to_string(), "hello".to_string()], true),
+        ];
+
+        for (command, expected) in cases {
+            assert_eq!(should_dispatch_background_workload(&command), expected);
+        }
     }
 
     #[test]
