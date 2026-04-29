@@ -322,6 +322,21 @@ fn expect_completed(resp: AgentResponse, op: &str) -> Result<(i32, Vec<u8>, Vec<
     }
 }
 
+#[cfg(test)]
+impl AgentClient {
+    /// Build an `AgentClient` from a pre-connected `UnixStream`.
+    ///
+    /// Test-only: production code must go through [`AgentClient::connect`]
+    /// so socket timeouts are configured correctly. Used by the regression
+    /// tests that drive the client against a `UnixStream::pair()`.
+    pub(crate) fn from_stream(stream: UnixStream) -> Self {
+        Self {
+            stream,
+            trace_id: None,
+        }
+    }
+}
+
 impl AgentClient {
     /// Set socket read timeout, returning an error if it fails.
     ///
@@ -1027,9 +1042,41 @@ impl AgentClient {
             interactive: false,
             tty: false,
             persistent_overlay_id: config.persistent_overlay_id,
+            background: false,
         })?;
 
         expect_completed(resp, "run command")
+    }
+
+    /// Run a command in an image's rootfs in the background.
+    ///
+    /// Spawns the container and returns immediately with the crun PID.
+    /// stdout/stderr go to /dev/null inside the guest. Use a persistent
+    /// overlay ID so subsequent `exec` sessions see the same filesystem.
+    pub fn run_background(&mut self, config: RunConfig) -> Result<u32> {
+        let resp = self.request(&AgentRequest::Run {
+            image: config.image,
+            command: config.command,
+            env: config.env,
+            workdir: config.workdir,
+            user: config.user,
+            mounts: config.mounts,
+            timeout_ms: None,
+            interactive: false,
+            tty: false,
+            persistent_overlay_id: config.persistent_overlay_id,
+            background: true,
+        })?;
+
+        let (exit_code, stdout, _stderr) = expect_completed(resp, "run background")?;
+        if exit_code != 0 {
+            return Err(Error::agent("run background", "spawn failed"));
+        }
+        let pid: u32 = String::from_utf8_lossy(&stdout)
+            .trim()
+            .parse()
+            .map_err(|_| Error::agent("run background", "invalid PID in response"))?;
+        Ok(pid)
     }
 
     /// Run a command interactively with streaming I/O.
@@ -1059,6 +1106,7 @@ impl AgentClient {
                 interactive: true,
                 tty,
                 persistent_overlay_id: config.persistent_overlay_id,
+                background: false,
             },
             tty,
             "run interactive",
@@ -1730,5 +1778,133 @@ mod read_cap_tests {
     fn read_cap_rejects_unexpected_response_type() {
         let err = drive(vec![AgentResponse::Pong { version: 1 }]).unwrap_err();
         assert!(format!("{}", err).contains("unexpected response"));
+    }
+}
+
+#[cfg(test)]
+mod run_background_tests {
+    //! Regression test for image-backed `machine run -d`.
+    //!
+    //! The original bug: the CLI's image + `--detach` path pulled the image
+    //! and persisted the VM record but silently dropped the command. The
+    //! fix wires in `AgentClient::run_background`, which must send a
+    //! `Run { background: true }` over the wire and parse the returned PID.
+    //!
+    //! If this test fails, the detach path either lost its `background`
+    //! plumbing or stopped parsing the PID response — either way, the
+    //! original "command never runs" regression is back.
+    use super::*;
+    use smolvm_protocol::{encode_message, AgentRequest, AgentResponse, Envelope};
+    use std::io::{Read, Write};
+    use std::thread;
+
+    #[test]
+    fn run_background_sends_background_true_and_returns_pid() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+
+        // Fake agent: read one request, assert it's a background Run, respond
+        // with a Completed PID. Mirrors what the real agent does in
+        // `handle_run_background`.
+        let server = thread::spawn(move || {
+            let mut len_buf = [0u8; 4];
+            server_stream.read_exact(&mut len_buf).unwrap();
+            let len = u32::from_be_bytes(len_buf) as usize;
+
+            let mut payload = vec![0u8; len];
+            server_stream.read_exact(&mut payload).unwrap();
+
+            let envelope: Envelope<AgentRequest> =
+                serde_json::from_slice(&payload).expect("valid Envelope<AgentRequest>");
+
+            match envelope.body {
+                AgentRequest::Run {
+                    image,
+                    command,
+                    persistent_overlay_id,
+                    background,
+                    interactive,
+                    tty,
+                    ..
+                } => {
+                    assert!(
+                        background,
+                        "run_background must send background: true — the image+detach CLI path \
+                         depends on this field to dispatch the command inside the container"
+                    );
+                    assert!(!interactive, "background runs are never interactive");
+                    assert!(!tty, "background runs never allocate a TTY");
+                    assert_eq!(image, "alpine:3.19");
+                    assert_eq!(command, vec!["sh", "-c", "echo hi"]);
+                    assert_eq!(
+                        persistent_overlay_id,
+                        Some("default".to_string()),
+                        "background runs must use a persistent overlay so subsequent execs \
+                         see the same filesystem"
+                    );
+                }
+                other => panic!("expected AgentRequest::Run, got {:?}", other),
+            }
+
+            let resp = AgentResponse::Completed {
+                exit_code: 0,
+                stdout: b"12345".to_vec(),
+                stderr: Vec::new(),
+            };
+            let encoded = encode_message(&resp).expect("encode response");
+            server_stream.write_all(&encoded).expect("write response");
+        });
+
+        let mut client = AgentClient::from_stream(client_stream);
+        let config = RunConfig::new(
+            "alpine:3.19",
+            vec!["sh".to_string(), "-c".to_string(), "echo hi".to_string()],
+        )
+        .with_persistent_overlay(Some("default".to_string()));
+
+        let pid = client
+            .run_background(config)
+            .expect("run_background should succeed on a Completed response");
+
+        assert_eq!(pid, 12345, "client must parse the PID from stdout");
+        server.join().expect("server thread joined cleanly");
+    }
+
+    #[test]
+    fn run_background_rejects_nonzero_exit_code() {
+        // If the agent fails to spawn the container, it returns a non-zero
+        // exit_code. The client must turn that into an error rather than
+        // silently returning a bogus PID.
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+
+        let server = thread::spawn(move || {
+            let mut len_buf = [0u8; 4];
+            server_stream.read_exact(&mut len_buf).unwrap();
+            let len = u32::from_be_bytes(len_buf) as usize;
+            let mut payload = vec![0u8; len];
+            server_stream.read_exact(&mut payload).unwrap();
+
+            let resp = AgentResponse::Completed {
+                exit_code: 1,
+                stdout: Vec::new(),
+                stderr: b"spawn failed".to_vec(),
+            };
+            let encoded = encode_message(&resp).unwrap();
+            server_stream.write_all(&encoded).unwrap();
+        });
+
+        let mut client = AgentClient::from_stream(client_stream);
+        let config = RunConfig::new("alpine:3.19", vec!["true".to_string()])
+            .with_persistent_overlay(Some("default".to_string()));
+
+        let err = client
+            .run_background(config)
+            .expect_err("non-zero exit must surface as an error");
+        assert!(
+            format!("{}", err).contains("spawn failed")
+                || format!("{}", err).contains("run background"),
+            "unexpected error: {}",
+            err
+        );
+        server.join().unwrap();
     }
 }

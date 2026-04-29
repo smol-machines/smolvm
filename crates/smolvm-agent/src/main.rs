@@ -1666,17 +1666,32 @@ fn handle_request(
             interactive: false,
             tty: false,
             persistent_overlay_id,
-        } => handle_run(
-            &image,
-            &command,
-            &env,
-            workdir.as_deref(),
-            user.as_deref(),
-            &mounts,
-            timeout_ms,
-            persistent_overlay_id.as_deref(),
-            client_fd,
-        ),
+            background,
+        } => {
+            if background {
+                handle_run_background(
+                    &image,
+                    &command,
+                    &env,
+                    workdir.as_deref(),
+                    user.as_deref(),
+                    &mounts,
+                    persistent_overlay_id.as_deref(),
+                )
+            } else {
+                handle_run(
+                    &image,
+                    &command,
+                    &env,
+                    workdir.as_deref(),
+                    user.as_deref(),
+                    &mounts,
+                    timeout_ms,
+                    persistent_overlay_id.as_deref(),
+                    client_fd,
+                )
+            }
+        }
 
         AgentRequest::Run { .. } => {
             // Interactive mode should be handled by handle_interactive_run
@@ -3342,6 +3357,40 @@ fn test_tcp_syscall(target: &str) -> serde_json::Value {
 }
 
 /// Handle command execution request (non-interactive).
+/// Handle a background `Run` request — spawn the container and return its PID.
+///
+/// Background mode requires a persistent overlay ID; an ephemeral overlay
+/// would leak because nothing waits for the container to exit to clean it
+/// up. The returned PID is the crun process, which stays alive as long as
+/// the container's init process runs.
+fn handle_run_background(
+    image: &str,
+    command: &[String],
+    env: &[(String, String)],
+    workdir: Option<&str>,
+    user: Option<&str>,
+    mounts: &[(String, String, bool)],
+    persistent_overlay_id: Option<&str>,
+) -> AgentResponse {
+    info!(image = %image, command = ?command, mounts = ?mounts, "running command in background");
+
+    let Some(overlay_id) = persistent_overlay_id else {
+        return AgentResponse::error(
+            "background run requires persistent_overlay_id",
+            error_codes::INVALID_REQUEST,
+        );
+    };
+
+    match storage::spawn_in_overlay(image, command, env, workdir, user, mounts, overlay_id) {
+        Ok(pid) => AgentResponse::Completed {
+            exit_code: 0,
+            stdout: format!("{}", pid).into_bytes(),
+            stderr: Vec::new(),
+        },
+        Err(e) => AgentResponse::from_err(e, error_codes::RUN_FAILED),
+    }
+}
+
 fn handle_run(
     image: &str,
     command: &[String],

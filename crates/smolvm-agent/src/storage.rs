@@ -2106,6 +2106,87 @@ pub fn run_command(
     result
 }
 
+/// Spawn a command in an image's overlay rootfs and return the crun PID.
+///
+/// Unlike `run_command`, this does not wait for the container to exit. The
+/// container runs detached under crun with stdout/stderr redirected to
+/// /dev/null; the returned PID is the crun process, which stays alive as
+/// long as the container init runs.
+///
+/// Requires a persistent overlay ID — ephemeral overlays would leak their
+/// upper/work/merged directories because nothing is waiting to clean them
+/// up after the container exits.
+pub fn spawn_in_overlay(
+    image: &str,
+    command: &[String],
+    env: &[(String, String)],
+    workdir: Option<&str>,
+    user: Option<&str>,
+    mounts: &[(String, String, bool)],
+    persistent_overlay_id: &str,
+) -> Result<u32> {
+    crate::oci::validate_image_reference(image).map_err(StorageError::new)?;
+    crate::oci::validate_env_vars(env).map_err(StorageError::new)?;
+
+    let prepared = prepare_for_run_persistent(image, persistent_overlay_id)?;
+    debug!(rootfs = %prepared.rootfs_path, "using persistent overlay for background command");
+
+    let mounted_paths = setup_volume_mounts(&prepared.rootfs_path, mounts)?;
+
+    let overlay_root = Path::new(STORAGE_ROOT)
+        .join(OVERLAYS_DIR)
+        .join(&prepared.workload_id);
+    let bundle_path = overlay_root.join("bundle");
+
+    let workdir_str = workdir.unwrap_or("/");
+    let identity = crate::oci::resolve_process_identity(Path::new(&prepared.rootfs_path), user)
+        .map_err(StorageError::new)?;
+    let mut spec = OciSpec::new(command, env, workdir_str, false, &identity);
+
+    for (tag, container_path, read_only) in mounts {
+        let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
+        spec.add_bind_mount(
+            &virtiofs_mount.to_string_lossy(),
+            container_path,
+            *read_only,
+        );
+    }
+
+    let workspace_src = Path::new(STORAGE_ROOT).join(WORKSPACE_DIR);
+    if workspace_src.exists() {
+        spec.add_bind_mount(&workspace_src.to_string_lossy(), "/workspace", false);
+    }
+
+    crate::ssh_agent::inject_into_container(&mut spec);
+
+    spec.write_to(&bundle_path)
+        .map_err(|e| StorageError::new(format!("failed to write OCI spec: {}", e)))?;
+
+    let container_id = generate_container_id();
+
+    let child = CrunCommand::run(&bundle_path, &container_id)
+        .stdin_null()
+        .discard_output()
+        .spawn()
+        .map_err(|e| {
+            StorageError::new(format!(
+                "failed to spawn crun: {}. Is crun installed at {}?",
+                e,
+                paths::CRUN_PATH
+            ))
+        })?;
+
+    let pid = child.id();
+    // Don't wait on the child; it reaps itself when the container exits.
+    // reap_background_children() in the agent's accept loop collects the
+    // eventual zombie.
+    std::mem::forget(child);
+
+    let _ = mounted_paths; // suppress unused warning; mounts persist with the overlay
+    info!(container_id = %container_id, pid = pid, "background container started");
+    Ok(pid)
+}
+
 /// Prepare for running a command - returns the rootfs path.
 /// This is used by interactive mode which spawns the command separately.
 pub fn prepare_for_run(image: &str) -> Result<PreparedOverlayRootfs> {
