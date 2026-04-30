@@ -26,7 +26,7 @@ const { NapiMachine } = loadNativeBinding();
  */
 function toNapiExecOptions(
   options?: ExecOptions
-): { env?: Array<{ key: string; value: string }>; workdir?: string; timeoutSecs?: number } | undefined {
+): { env?: Array<{ key: string; value: string }>; workdir?: string; timeoutSecs?: number; mounts?: Array<{ source: string; target: string; readOnly?: boolean }> } | undefined {
   if (!options) return undefined;
   return {
     env: options.env
@@ -34,6 +34,7 @@ function toNapiExecOptions(
       : undefined,
     workdir: options.workdir,
     timeoutSecs: options.timeout,
+    mounts: options.mounts,
   };
 }
 

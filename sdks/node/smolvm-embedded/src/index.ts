@@ -49,6 +49,7 @@ export type {
   MountSpec,
   PortSpec,
   ResourceSpec,
+  ContainerMount,
   ExecOptions,
   ExecStreamEvent,
   FileWriteOptions,

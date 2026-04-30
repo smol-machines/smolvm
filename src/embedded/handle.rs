@@ -68,13 +68,15 @@ impl VmHandle {
         env: Vec<(String, String)>,
         workdir: Option<String>,
         timeout: Option<Duration>,
+        mounts: Vec<(String, String, bool)>,
     ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
         let client = self.client_mut()?;
         client.pull_with_registry_config(image)?;
         let config = RunConfig::new(image, command)
             .with_env(env)
             .with_workdir(workdir)
-            .with_timeout(timeout);
+            .with_timeout(timeout)
+            .with_mounts(mounts);
         client.run_non_interactive(config)
     }
 

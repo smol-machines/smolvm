@@ -125,10 +125,11 @@ impl EmbeddedRuntime {
         env: Vec<(String, String)>,
         workdir: Option<String>,
         timeout: Option<Duration>,
+        mounts: Vec<(String, String, bool)>,
     ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
         let handle = self.started_handle(name)?;
         let mut handle = lock_handle(&handle)?;
-        handle.run(image, command, env, workdir, timeout)
+        handle.run(image, command, env, workdir, timeout, mounts)
     }
 
     /// Pull an OCI image into the machine's storage.

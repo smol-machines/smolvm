@@ -231,6 +231,7 @@ if [[ -n "${SSL_CERT_FILE:-}" ]] && [[ -f "${SSL_CERT_FILE}" ]]; then
     echo "Installing CA bundle from SSL_CERT_FILE into rootfs..."
     mkdir -p "$OUTPUT_DIR/etc/ssl/certs"
     cp "$SSL_CERT_FILE" "$OUTPUT_DIR/etc/ssl/certs/ca-certificates.crt"
+    chmod 644 "$OUTPUT_DIR/etc/ssl/certs/ca-certificates.crt"
 fi
 
 PROFILE="release-small"

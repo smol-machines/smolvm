@@ -3277,10 +3277,10 @@ fn spawn_interactive_command(
     let mut spec = oci::OciSpec::new(command, env, workdir_str, false, &identity);
     spec.add_gpu_devices_if_available();
 
-    for (tag, container_path, read_only) in mounts {
-        let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
+    for (source, container_path, read_only) in mounts {
+        let host_path = storage::resolve_mount_source(source);
         spec.add_bind_mount(
-            &virtiofs_mount.to_string_lossy(),
+            &host_path.to_string_lossy(),
             container_path,
             *read_only,
         );
