@@ -103,7 +103,7 @@ tar -xzf "$CRANE_TAR" -C "$OUTPUT_DIR/usr/local/bin" crane
 #   1. apk.static (Linux only) — runs natively, supports cross-arch via --arch
 #   2. smolvm (any host) — only for native-arch builds (pulls host-arch image)
 echo "Installing additional packages..."
-APK_PACKAGES="jq e2fsprogs e2fsprogs-extra crun util-linux libcap"
+APK_PACKAGES="jq e2fsprogs e2fsprogs-extra crun util-linux libcap s3fs-fuse"
 
 # Determine if this is a cross-arch build
 HOST_ARCH="$(uname -m)"
@@ -222,6 +222,7 @@ if [[ -n "${SSL_CERT_FILE:-}" ]] && [[ -f "${SSL_CERT_FILE}" ]]; then
     echo "Installing CA bundle from SSL_CERT_FILE into rootfs..."
     mkdir -p "$OUTPUT_DIR/etc/ssl/certs"
     cp "$SSL_CERT_FILE" "$OUTPUT_DIR/etc/ssl/certs/ca-certificates.crt"
+    chmod 644 "$OUTPUT_DIR/etc/ssl/certs/ca-certificates.crt"
 fi
 
 PROFILE="release-small"

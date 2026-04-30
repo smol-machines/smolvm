@@ -66,6 +66,18 @@ pub struct VmResourcesConfig {
     pub overlay_gib: Option<f64>,
 }
 
+/// A bind mount from a VM-internal path into the container.
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct ContainerMount {
+    /// Source path inside the VM (absolute path, e.g. "/storage/workspace/user-a").
+    pub source: String,
+    /// Target path inside the container (e.g. "/workspace").
+    pub target: String,
+    /// Mount as read-only.
+    pub read_only: Option<bool>,
+}
+
 /// Options for executing a command.
 #[napi(object)]
 #[derive(Debug, Clone)]
@@ -76,6 +88,8 @@ pub struct ExecOptions {
     pub workdir: Option<String>,
     /// Timeout in seconds.
     pub timeout_secs: Option<u32>,
+    /// Bind mounts from VM paths into the container (only used with run()).
+    pub mounts: Option<Vec<ContainerMount>>,
 }
 
 /// Options for writing a file into the VM.
@@ -222,6 +236,7 @@ pub fn parse_exec_options(
     Vec<(String, String)>,
     Option<String>,
     Option<std::time::Duration>,
+    Vec<(String, String, bool)>,
 ) {
     match options {
         Some(opts) => {
@@ -234,8 +249,17 @@ pub fn parse_exec_options(
                 .timeout_secs
                 .map(|s| std::time::Duration::from_secs(s as u64));
 
-            (env, opts.workdir, timeout)
+            let mounts = opts
+                .mounts
+                .map(|m| {
+                    m.into_iter()
+                        .map(|mount| (mount.source, mount.target, mount.read_only.unwrap_or(false)))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            (env, opts.workdir, timeout, mounts)
         }
-        None => (Vec::new(), None, None),
+        None => (Vec::new(), None, None, Vec::new()),
     }
 }

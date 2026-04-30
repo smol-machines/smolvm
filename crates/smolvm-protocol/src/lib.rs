@@ -238,7 +238,8 @@ pub enum AgentRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         user: Option<String>,
         /// Volume mounts to bind into the container.
-        /// Each tuple is (virtiofs_tag, container_path, read_only).
+        /// Each tuple is (source, container_path, read_only).
+        /// Source is a virtiofs tag or a VM-internal absolute path (starts with '/').
         #[serde(default)]
         mounts: Vec<(String, String, bool)>,
         /// Timeout in milliseconds. If the command exceeds this duration,

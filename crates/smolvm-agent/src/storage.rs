@@ -31,6 +31,16 @@ const WORKSPACE_DIR: &str = "workspace";
 const DOCKER_HUB_AUTH_CONFIG_KEY: &str = "https://index.docker.io/v1/";
 const DOCKER_HUB_REGISTRY_ALIASES: &[&str] = &["docker.io", "index.docker.io"];
 
+/// Resolve a mount source to a filesystem path.
+/// If source starts with '/', it's a VM-internal absolute path; otherwise a virtiofs tag.
+pub fn resolve_mount_source(source: &str) -> PathBuf {
+    if source.starts_with('/') {
+        PathBuf::from(source)
+    } else {
+        Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(source)
+    }
+}
+
 fn validate_storage_id(value: &str, context: &str) -> Result<()> {
     if value.is_empty() {
         return Err(StorageError::ValidationFailed {
@@ -2063,11 +2073,11 @@ pub fn run_command(
         let mut spec = OciSpec::new(command, env, workdir_str, false, &identity);
         spec.add_gpu_devices_if_available();
 
-        // Add virtiofs bind mounts to OCI spec
-        for (tag, container_path, read_only) in mounts {
-            let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
+        // Add bind mounts to OCI spec (virtiofs tags or VM-internal paths)
+        for (source, container_path, read_only) in mounts {
+            let host_path = resolve_mount_source(source);
             spec.add_bind_mount(
-                &virtiofs_mount.to_string_lossy(),
+                &host_path.to_string_lossy(),
                 container_path,
                 *read_only,
             );

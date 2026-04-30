@@ -70,6 +70,16 @@ export interface ResourceSpec {
 /**
  * Options for command execution.
  */
+/** A bind mount from a VM-internal path into the container. */
+export interface ContainerMount {
+  /** Source path inside the VM (absolute path, e.g. "/storage/workspace/user-a"). */
+  source: string;
+  /** Target path inside the container (e.g. "/workspace"). */
+  target: string;
+  /** Mount as read-only (default: false). */
+  readOnly?: boolean;
+}
+
 export interface ExecOptions {
   /** Environment variables as key-value pairs. */
   env?: Record<string, string>;
@@ -77,6 +87,8 @@ export interface ExecOptions {
   workdir?: string;
   /** Timeout in seconds. */
   timeout?: number;
+  /** Bind mounts from VM paths into the container (only used with run()). */
+  mounts?: ContainerMount[];
 }
 
 /**

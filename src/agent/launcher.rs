@@ -685,11 +685,17 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
 
         // Forward TLS certificate config so the agent (and crane) can verify
         // custom CAs (e.g. corporate TLS-intercepting proxies).
-        for var in ["SSL_CERT_FILE", "SSL_CERT_DIR"] {
-            if let Ok(val) = std::env::var(var) {
-                if let Ok(cs) = CString::new(format!("{}={}", var, val)) {
-                    env_strings.push(cs);
-                }
+        // Remap host paths to guest-internal paths — the host filesystem
+        // is not visible inside the VM, so forwarding the host path as-is
+        // would cause OpenSSL to fail (and not fall back to the default bundle).
+        if std::env::var("SSL_CERT_FILE").is_ok() {
+            if let Ok(cs) = CString::new("SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt") {
+                env_strings.push(cs);
+            }
+        }
+        if let Ok(val) = std::env::var("SSL_CERT_DIR") {
+            if let Ok(cs) = CString::new(format!("SSL_CERT_DIR={}", val)) {
+                env_strings.push(cs);
             }
         }
 
