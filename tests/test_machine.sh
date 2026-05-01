@@ -2468,6 +2468,48 @@ test_state_probe_tolerates_busy_agent() {
 }
 
 run_test "State probe tolerates busy agent (no false unreachable)" test_state_probe_tolerates_busy_agent || true
+
+# Regression test for https://github.com/smol-machines/smolvm/issues/199
+# The agent's vsock accept loop was single-threaded: a long-running exec held
+# the handler, the 250ms state probe timed out, the record flipped to
+# "unreachable", and every subsequent exec failed with "machine is not running".
+# Fix: each accepted connection is handed to its own thread.
+test_concurrent_exec_does_not_flip_unreachable() {
+    ensure_machine_running
+
+    # Hold a long-running exec open in the background.
+    $SMOLVM machine exec -- sh -c 'sleep 5' &
+    local hold_pid=$!
+
+    # Give it time to be accepted by the agent and block the old single thread.
+    sleep 1
+
+    # A second exec must succeed while the first is still running.
+    local second_output
+    second_output=$($SMOLVM machine exec -- echo concurrent_ok 2>&1)
+    local second_exit=$?
+
+    # Also verify state did not flip to unreachable.
+    local state
+    state=$($SMOLVM machine ls 2>&1 | grep "^default " | awk '{print $2}')
+
+    wait "$hold_pid" 2>/dev/null
+
+    if [[ $second_exit -ne 0 ]]; then
+        echo "FAIL: second concurrent exec failed (exit $second_exit): $second_output"
+        return 1
+    fi
+    if [[ "$second_output" != *"concurrent_ok"* ]]; then
+        echo "FAIL: second exec output unexpected: $second_output"
+        return 1
+    fi
+    if [[ "$state" != "running" ]]; then
+        echo "FAIL: VM flipped to '$state' during concurrent exec (expected 'running')"
+        return 1
+    fi
+}
+
+run_test "Concurrent exec does not flip VM to unreachable" test_concurrent_exec_does_not_flip_unreachable || true
 run_test "Listing: machine ls does not kill VM" test_machine_ls_does_not_kill_vm || true
 run_test "Listing: named VM survives repeated ls" test_named_vm_survives_ls || true
 run_test "Images: does not stop running VM" test_images_does_not_stop_running_vm || true
