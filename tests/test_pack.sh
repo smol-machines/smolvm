@@ -409,6 +409,74 @@ test_packed_workdir() {
     [[ "$result" == *"/tmp"* ]]
 }
 
+ensure_packed_curl() {
+    local output="$TEST_DIR/smol-curl"
+
+    if [[ ! -f "$output" ]] || [[ ! -f "$output.smolmachine" ]]; then
+        $SMOLVM pack create --image curlimages/curl:latest -o "$output" >&2 || return 1
+    fi
+
+    echo "$output"
+}
+
+test_packed_stub_allow_host_apk_install() {
+    local output
+    output=$(ensure_packed_curl) || return 1
+
+    local result
+    local exit_code=0
+    result=$(run_with_timeout 180 "$output" run --net \
+        --allow-host dl-cdn.alpinelinux.org \
+        -- /bin/sh -c 'apk add --no-cache bash libstdc++ libgcc git >/tmp/apk.log && bash -lc "git --version >/dev/null && echo packed-allow-host-apk-ok"' 2>&1) || exit_code=$?
+
+    [[ $exit_code -eq 124 ]] && { echo "TIMEOUT: packed allow-host apk install hung"; echo "$result"; return 1; }
+    [[ $exit_code -eq 0 ]] || { echo "$result"; return 1; }
+    [[ "$result" == *"packed-allow-host-apk-ok"* ]]
+}
+
+test_packed_stub_allow_host_blocks_other_hosts() {
+    local output
+    output=$(ensure_packed_curl) || return 1
+
+    local result
+    local exit_code=0
+    result=$(run_with_timeout 90 "$output" run --net \
+        --allow-host dl-cdn.alpinelinux.org \
+        -- /bin/sh -c '
+            set +e
+            curl --connect-timeout 3 --max-time 8 -sS http://example.com >/tmp/example.out 2>/tmp/example.err
+            curl_exit=$?
+            nslookup example.com >/tmp/nslookup.out 2>&1
+            nslookup_exit=$?
+            cat /tmp/example.err
+            cat /tmp/nslookup.out
+            if [ "$curl_exit" -eq 0 ] || [ "$nslookup_exit" -eq 0 ]; then
+                exit 1
+            fi
+            echo packed-allow-host-block-ok
+        ' 2>&1) || exit_code=$?
+
+    [[ $exit_code -eq 124 ]] && { echo "TIMEOUT: packed allow-host blocked test hung"; echo "$result"; return 1; }
+    [[ $exit_code -eq 0 ]] || { echo "$result"; return 1; }
+    [[ "$result" == *"packed-allow-host-block-ok"* ]] && \
+    [[ "$result" == *"example.com"* ]]
+}
+
+test_packed_stub_allow_cidr_dns() {
+    local output
+    output=$(ensure_packed_curl) || return 1
+
+    local result
+    local exit_code=0
+    result=$(run_with_timeout 90 "$output" run \
+        --allow-cidr 1.1.1.1/32 \
+        -- /bin/sh -c 'nslookup cloudflare.com 1.1.1.1 && echo packed-allow-cidr-dns-ok' 2>&1) || exit_code=$?
+
+    [[ $exit_code -eq 124 ]] && { echo "TIMEOUT: packed allow-cidr DNS test hung"; echo "$result"; return 1; }
+    [[ $exit_code -eq 0 ]] || { echo "$result"; return 1; }
+    [[ "$result" == *"packed-allow-cidr-dns-ok"* ]]
+}
+
 # =============================================================================
 # Sidecar File Tests
 # =============================================================================
@@ -1215,6 +1283,14 @@ run_test "pack run --force-extract" test_pack_run_force_extract || true
 run_test "pack run cached fast" test_pack_run_cached_fast || true
 
 if [[ "$QUICK_MODE" != "true" ]]; then
+    echo ""
+    echo "Running Packed Egress Policy Tests (requires VM + network)..."
+    echo ""
+
+    run_test "Packed stub: allow-host permits apk install" test_packed_stub_allow_host_apk_install || true
+    run_test "Packed stub: allow-host blocks other hostnames" test_packed_stub_allow_host_blocks_other_hosts || true
+    run_test "Packed stub: allow-cidr permits DNS resolver" test_packed_stub_allow_cidr_dns || true
+
     echo ""
     echo "Running --from-vm Tests (requires VM + network)..."
     echo ""

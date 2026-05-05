@@ -265,6 +265,7 @@ impl PackCreateCmd {
                 overlay_gib: None,
                 gpu_vram_mib: None,
                 allowed_cidrs: None,
+                allowed_hosts: None,
             },
         )?;
         let mut guard = PackVmGuard {
@@ -408,6 +409,8 @@ impl PackCreateCmd {
         manifest.cpus = pack_config.cpus;
         manifest.mem = pack_config.mem;
         manifest.network = pack_config.net.unwrap_or(false);
+        manifest.allowed_cidrs = pack_config.allowed_cidrs.clone();
+        manifest.allowed_hosts = pack_config.allowed_hosts.clone();
         manifest.gpu = pack_config.gpu;
 
         // Start with OCI image config as baseline
@@ -533,6 +536,7 @@ impl PackCreateCmd {
                     storage_gib: None,
                     overlay_gib: None,
                     allowed_cidrs: None,
+                    allowed_hosts: None,
                 },
                 features,
             )?;
@@ -685,8 +689,18 @@ impl PackCreateCmd {
         }
         manifest.cpus = pack_config.cpus;
         manifest.mem = pack_config.mem;
+        manifest.allowed_cidrs = pack_config
+            .allowed_cidrs
+            .clone()
+            .or_else(|| vm.allowed_cidrs.clone());
+        manifest.allowed_hosts = pack_config
+            .allowed_hosts
+            .clone()
+            .or_else(|| vm.allowed_hosts.clone());
         // Smolfile > source VM record > default
-        manifest.network = pack_config.net.unwrap_or(vm.network);
+        manifest.network = pack_config.net.unwrap_or(
+            vm.network || manifest.allowed_cidrs.is_some() || manifest.allowed_hosts.is_some(),
+        );
         // CLI --gpu > Smolfile gpu > source VM record gpu > false
         manifest.gpu = pack_config.gpu || vm.gpu.unwrap_or(false);
 

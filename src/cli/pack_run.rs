@@ -8,7 +8,7 @@
 //!
 //! Both paths converge on the same VM launch infrastructure.
 
-use crate::cli::parsers::{mounts_to_virtiofs_bindings, parse_env_spec};
+use crate::cli::parsers::{mounts_to_virtiofs_bindings, parse_cidr, parse_env_spec};
 use clap::{Args, Parser, Subcommand};
 use smolvm::agent::launcher_dynamic::{
     launch_agent_vm_dynamic, KrunFunctions, PackedLaunchConfig, PackedMount,
@@ -86,6 +86,53 @@ fn mounts_to_packed(mounts: &[smolvm::data::storage::HostMount]) -> Vec<PackedMo
             read_only: m.read_only,
         })
         .collect()
+}
+
+fn validate_allow_hosts(hosts: &[String]) -> smolvm::Result<()> {
+    for host in hosts {
+        if host.is_empty() || host.contains(':') {
+            return Err(Error::config(
+                "--allow-host",
+                format!(
+                    "invalid hostname '{}': use a hostname only; port suffixes are not supported",
+                    host
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn merge_packed_egress_policy(
+    manifest: &smolvm_pack::PackManifest,
+    cli_allowed_cidrs: &[String],
+    cli_allowed_hosts: &[String],
+    base_network: bool,
+) -> smolvm::Result<(bool, Option<Vec<String>>, Option<Vec<String>>)> {
+    validate_allow_hosts(manifest.allowed_hosts.as_deref().unwrap_or(&[]))?;
+    validate_allow_hosts(cli_allowed_hosts)?;
+
+    let has_cidr_policy = manifest.allowed_cidrs.is_some() || !cli_allowed_cidrs.is_empty();
+    let has_host_policy = manifest.allowed_hosts.is_some() || !cli_allowed_hosts.is_empty();
+
+    let allowed_cidrs = if has_cidr_policy {
+        let mut cidrs = manifest.allowed_cidrs.clone().unwrap_or_default();
+        cidrs.extend(cli_allowed_cidrs.iter().cloned());
+        Some(cidrs)
+    } else {
+        None
+    };
+
+    let allowed_hosts = if has_host_policy {
+        let mut hosts = manifest.allowed_hosts.clone().unwrap_or_default();
+        hosts.extend(cli_allowed_hosts.iter().cloned());
+        Some(hosts)
+    } else {
+        None
+    };
+
+    let network = base_network || allowed_cidrs.is_some() || allowed_hosts.is_some();
+    Ok((network, allowed_cidrs, allowed_hosts))
 }
 
 /// Run a VM from a packed `.smolmachine` sidecar file.
@@ -172,6 +219,14 @@ pub struct PackRunCmd {
         help_heading = "Network"
     )]
     pub net_backend: Option<NetworkBackend>,
+
+    /// Allow egress to a CIDR range (can be used multiple times, implies --net)
+    #[arg(long = "allow-cidr", value_parser = parse_cidr, value_name = "CIDR", help_heading = "Network")]
+    pub allow_cidr: Vec<String>,
+
+    /// Allow egress to a hostname (can be used multiple times, implies --net)
+    #[arg(long = "allow-host", value_name = "HOSTNAME", help_heading = "Network")]
+    pub allow_host: Vec<String>,
 
     /// Number of virtual CPUs (overrides manifest default)
     #[arg(long, value_name = "N", help_heading = "Resources")]
@@ -304,19 +359,26 @@ impl PackRunCmd {
         // 7. Parse CLI args
         let mounts = HostMount::parse(&self.volume)?;
         let port_mappings = PortMapping::to_tuples(&self.port);
+        let (network, allowed_cidrs, allowed_hosts) = merge_packed_egress_policy(
+            &manifest,
+            &self.allow_cidr,
+            &self.allow_host,
+            self.net || manifest.network || !self.port.is_empty(),
+        )?;
 
         let resources = VmResources {
             cpus: self.cpus.unwrap_or(manifest.cpus),
             memory_mib: self.mem.unwrap_or(manifest.mem),
-            network: self.net || manifest.network || !self.port.is_empty(),
+            network,
             network_backend: self.net_backend,
             gpu: manifest.gpu,
             storage_gib,
             overlay_gib: self.overlay,
             gpu_vram_mib: None,
-            allowed_cidrs: None,
+            allowed_cidrs,
+            allowed_hosts,
         };
-        validate_requested_network_backend(&resources, None, self.port.len())?;
+        validate_requested_network_backend(&resources, self.port.len())?;
 
         // Build packed mounts for the launcher
         let packed_mounts = mounts_to_packed(&mounts);
@@ -860,6 +922,14 @@ struct PackedRunArgs {
     #[arg(long = "net-backend", value_enum, hide = true)]
     net_backend: Option<NetworkBackend>,
 
+    /// Allow egress to a CIDR range (can be used multiple times, implies --net)
+    #[arg(long = "allow-cidr", value_parser = parse_cidr, value_name = "CIDR")]
+    allow_cidr: Vec<String>,
+
+    /// Allow egress to a hostname (can be used multiple times, implies --net)
+    #[arg(long = "allow-host", value_name = "HOSTNAME")]
+    allow_host: Vec<String>,
+
     /// Number of vCPUs (overrides default)
     #[arg(long, value_name = "N")]
     cpus: Option<u8>,
@@ -911,6 +981,14 @@ struct PackedStartArgs {
     /// Select the networking backend.
     #[arg(long = "net-backend", value_enum, hide = true)]
     net_backend: Option<NetworkBackend>,
+
+    /// Allow egress to a CIDR range (can be used multiple times, implies --net)
+    #[arg(long = "allow-cidr", value_parser = parse_cidr, value_name = "CIDR")]
+    allow_cidr: Vec<String>,
+
+    /// Allow egress to a hostname (can be used multiple times, implies --net)
+    #[arg(long = "allow-host", value_name = "HOSTNAME")]
+    allow_host: Vec<String>,
 }
 
 /// Arguments for the `exec` subcommand (run in existing VM).
@@ -1038,6 +1116,8 @@ fn run_ephemeral(
                 port: args.port,
                 net: args.net,
                 net_backend: args.net_backend,
+                allow_cidr: args.allow_cidr,
+                allow_host: args.allow_host,
                 cpus: args.cpus,
                 mem: args.mem,
                 storage: args.storage,
@@ -1162,18 +1242,25 @@ fn run_from_cache(
 
     let mounts = HostMount::parse(&args.volume)?;
     let port_mappings = PortMapping::to_tuples(&args.port);
+    let (network, allowed_cidrs, allowed_hosts) = merge_packed_egress_policy(
+        &manifest,
+        &args.allow_cidr,
+        &args.allow_host,
+        args.net || manifest.network || !args.port.is_empty(),
+    )?;
     let resources = VmResources {
         cpus: args.cpus.unwrap_or(manifest.cpus),
         memory_mib: args.mem.unwrap_or(manifest.mem),
-        network: args.net || manifest.network || !args.port.is_empty(),
+        network,
         network_backend: args.net_backend,
         gpu: manifest.gpu,
         storage_gib,
         overlay_gib: args.overlay,
         gpu_vram_mib: None,
-        allowed_cidrs: None,
+        allowed_cidrs,
+        allowed_hosts,
     };
-    validate_requested_network_backend(&resources, None, args.port.len())?;
+    validate_requested_network_backend(&resources, args.port.len())?;
 
     let packed_mounts = mounts_to_packed(&mounts);
 
@@ -1274,6 +1361,16 @@ fn print_manifest_info(manifest: &smolvm_pack::PackManifest, checksum: u32) {
     println!("Memory:     {} MiB", manifest.mem);
     if manifest.network {
         println!("Network:    enabled");
+    }
+    if let Some(ref cidrs) = manifest.allowed_cidrs {
+        if !cidrs.is_empty() {
+            println!("Allow CIDR: {}", cidrs.join(", "));
+        }
+    }
+    if let Some(ref hosts) = manifest.allowed_hosts {
+        if !hosts.is_empty() {
+            println!("Allow Host: {}", hosts.join(", "));
+        }
     }
     if !manifest.entrypoint.is_empty() {
         println!("Entrypoint: {}", manifest.entrypoint.join(" "));
@@ -1487,18 +1584,25 @@ fn daemon_start(
     // Parse CLI args
     let mounts = HostMount::parse(&args.volume)?;
     let port_mappings = PortMapping::to_tuples(&args.port);
+    let (network, allowed_cidrs, allowed_hosts) = merge_packed_egress_policy(
+        &manifest,
+        &args.allow_cidr,
+        &args.allow_host,
+        args.net || manifest.network || !args.port.is_empty(),
+    )?;
     let resources = VmResources {
         cpus: args.cpus.unwrap_or(manifest.cpus),
         memory_mib: args.mem.unwrap_or(manifest.mem),
-        network: args.net || manifest.network || !args.port.is_empty(),
+        network,
         network_backend: args.net_backend,
         gpu: manifest.gpu,
         storage_gib,
         overlay_gib: args.overlay,
         gpu_vram_mib: None,
-        allowed_cidrs: None,
+        allowed_cidrs,
+        allowed_hosts,
     };
-    validate_requested_network_backend(&resources, None, args.port.len())?;
+    validate_requested_network_backend(&resources, args.port.len())?;
 
     let packed_mounts = mounts_to_packed(&mounts);
 
@@ -1753,4 +1857,82 @@ fn daemon_status(checksum: u32) -> smolvm::Result<()> {
 
     println!("Status: running (PID: {}, agent not responding)", pid);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packed_stub_run_accepts_egress_policy_flags() {
+        let cli = PackedCli::try_parse_from([
+            "app",
+            "run",
+            "--net",
+            "--allow-cidr",
+            "10.0.0.0/8",
+            "--allow-host",
+            "example.com",
+            "--",
+            "true",
+        ])
+        .unwrap();
+
+        let Some(PackedCmd::Run(args)) = cli.command else {
+            panic!("expected run subcommand");
+        };
+        assert!(args.net);
+        assert_eq!(args.allow_cidr, vec!["10.0.0.0/8"]);
+        assert_eq!(args.allow_host, vec!["example.com"]);
+        assert_eq!(args.command, vec!["true"]);
+    }
+
+    #[test]
+    fn packed_stub_start_accepts_egress_policy_flags() {
+        let cli = PackedCli::try_parse_from([
+            "app",
+            "start",
+            "--allow-cidr",
+            "192.168.0.0/16",
+            "--allow-host",
+            "api.example.com",
+        ])
+        .unwrap();
+
+        let Some(PackedCmd::Start(args)) = cli.command else {
+            panic!("expected start subcommand");
+        };
+        assert_eq!(args.allow_cidr, vec!["192.168.0.0/16"]);
+        assert_eq!(args.allow_host, vec!["api.example.com"]);
+    }
+
+    #[test]
+    fn packed_egress_policy_merges_manifest_and_cli() {
+        let mut manifest = smolvm_pack::PackManifest::new(
+            "alpine".to_string(),
+            "sha256:abc".to_string(),
+            "linux/arm64".to_string(),
+            "darwin/arm64".to_string(),
+        );
+        manifest.allowed_cidrs = Some(vec!["10.0.0.0/8".to_string()]);
+        manifest.allowed_hosts = Some(vec!["example.com".to_string()]);
+
+        let (network, allowed_cidrs, allowed_hosts) = merge_packed_egress_policy(
+            &manifest,
+            &["192.168.0.0/16".to_string()],
+            &["api.example.com".to_string()],
+            false,
+        )
+        .unwrap();
+
+        assert!(network);
+        assert_eq!(
+            allowed_cidrs,
+            Some(vec!["10.0.0.0/8".to_string(), "192.168.0.0/16".to_string()])
+        );
+        assert_eq!(
+            allowed_hosts,
+            Some(vec!["example.com".to_string(), "api.example.com".to_string()])
+        );
+    }
 }

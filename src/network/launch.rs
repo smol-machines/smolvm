@@ -15,7 +15,7 @@ pub enum EffectiveNetworkBackend {
 /// Reason a requested backend was downgraded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkFallbackReason {
-    /// Current egress policies and DNS filtering are only implemented on TSI.
+    /// Current egress policies are only implemented on TSI.
     PolicyRequiresTsi,
 }
 
@@ -56,18 +56,11 @@ impl LaunchNetworkPlan {
 }
 
 /// Compute the effective launch backend from user intent and current feature support.
-pub fn plan_launch_network(
-    resources: &VmResources,
-    dns_filter_hosts: Option<&[String]>,
-    port_count: usize,
-) -> LaunchNetworkPlan {
+pub fn plan_launch_network(resources: &VmResources, port_count: usize) -> LaunchNetworkPlan {
     let has_ports = port_count > 0;
-    let has_cidr_policy = resources
-        .allowed_cidrs
-        .as_ref()
-        .is_some_and(|cidrs| !cidrs.is_empty());
-    let has_dns_filter = dns_filter_hosts.is_some_and(|hosts| !hosts.is_empty());
-    let has_policy = has_cidr_policy || has_dns_filter;
+    let has_cidr_policy = resources.allowed_cidrs.is_some();
+    let has_host_policy = resources.allowed_hosts.is_some();
+    let has_policy = has_cidr_policy || has_host_policy;
     let wants_network = resources.network || has_ports || has_policy;
 
     if !wants_network {
@@ -96,19 +89,15 @@ pub fn plan_launch_network(
 /// Reject explicit virtio-net requests that the current branch cannot honor.
 pub fn validate_requested_network_backend(
     resources: &VmResources,
-    dns_filter_hosts: Option<&[String]>,
     port_count: usize,
 ) -> crate::Result<()> {
     if resources.network_backend != Some(NetworkBackend::VirtioNet) {
         return Ok(());
     }
 
-    let has_cidr_policy = resources
-        .allowed_cidrs
-        .as_ref()
-        .is_some_and(|cidrs| !cidrs.is_empty());
-    let has_dns_filter = dns_filter_hosts.is_some_and(|hosts| !hosts.is_empty());
-    let wants_network = resources.network || port_count > 0 || has_cidr_policy || has_dns_filter;
+    let has_cidr_policy = resources.allowed_cidrs.is_some();
+    let has_host_policy = resources.allowed_hosts.is_some();
+    let wants_network = resources.network || port_count > 0 || has_cidr_policy || has_host_policy;
 
     if !wants_network {
         return Err(crate::Error::config(
@@ -117,7 +106,7 @@ pub fn validate_requested_network_backend(
         ));
     }
 
-    let plan = plan_launch_network(resources, dns_filter_hosts, port_count);
+    let plan = plan_launch_network(resources, port_count);
     if plan.backend != EffectiveNetworkBackend::VirtioNet {
         let reason = plan
             .fallback_reason
@@ -141,7 +130,7 @@ mod tests {
 
     #[test]
     fn test_no_network_plan() {
-        let plan = plan_launch_network(&resources(), None, 0);
+        let plan = plan_launch_network(&resources(), 0);
         assert_eq!(plan.backend, EffectiveNetworkBackend::None);
     }
 
@@ -149,7 +138,7 @@ mod tests {
     fn test_default_network_uses_tsi() {
         let mut resources = resources();
         resources.network = true;
-        let plan = plan_launch_network(&resources, None, 0);
+        let plan = plan_launch_network(&resources, 0);
         assert_eq!(plan.backend, EffectiveNetworkBackend::Tsi);
     }
 
@@ -158,7 +147,7 @@ mod tests {
         let mut resources = resources();
         resources.network = true;
         resources.network_backend = Some(NetworkBackend::VirtioNet);
-        let plan = plan_launch_network(&resources, None, 0);
+        let plan = plan_launch_network(&resources, 0);
         assert_eq!(plan.backend, EffectiveNetworkBackend::VirtioNet);
         assert_eq!(plan.fallback_reason, None);
     }
@@ -168,7 +157,7 @@ mod tests {
         let mut resources = resources();
         resources.network = true;
         resources.network_backend = Some(NetworkBackend::VirtioNet);
-        let plan = plan_launch_network(&resources, None, 1);
+        let plan = plan_launch_network(&resources, 1);
         assert_eq!(plan.backend, EffectiveNetworkBackend::VirtioNet);
         assert_eq!(plan.fallback_reason, None);
     }
@@ -179,7 +168,7 @@ mod tests {
         resources.network = true;
         resources.network_backend = Some(NetworkBackend::VirtioNet);
         resources.allowed_cidrs = Some(vec!["1.1.1.1/32".into()]);
-        let plan = plan_launch_network(&resources, None, 0);
+        let plan = plan_launch_network(&resources, 0);
         assert_eq!(plan.backend, EffectiveNetworkBackend::Tsi);
         assert_eq!(
             plan.fallback_reason,
@@ -188,11 +177,39 @@ mod tests {
     }
 
     #[test]
+    fn test_host_policy_forces_tsi() {
+        let mut resources = resources();
+        resources.network_backend = Some(NetworkBackend::VirtioNet);
+        resources.allowed_hosts = Some(vec!["example.com".into()]);
+        let plan = plan_launch_network(&resources, 0);
+        assert_eq!(plan.backend, EffectiveNetworkBackend::Tsi);
+        assert_eq!(
+            plan.fallback_reason,
+            Some(NetworkFallbackReason::PolicyRequiresTsi)
+        );
+    }
+
+    #[test]
+    fn test_empty_policy_still_counts_as_policy() {
+        let mut cidr_resources = resources();
+        cidr_resources.network_backend = Some(NetworkBackend::VirtioNet);
+        cidr_resources.allowed_cidrs = Some(Vec::new());
+        let plan = plan_launch_network(&cidr_resources, 0);
+        assert_eq!(plan.backend, EffectiveNetworkBackend::Tsi);
+
+        let mut host_resources = resources();
+        host_resources.network_backend = Some(NetworkBackend::VirtioNet);
+        host_resources.allowed_hosts = Some(Vec::new());
+        let plan = plan_launch_network(&host_resources, 0);
+        assert_eq!(plan.backend, EffectiveNetworkBackend::Tsi);
+    }
+
+    #[test]
     fn test_validate_plain_virtio_allowed() {
         let mut resources = resources();
         resources.network = true;
         resources.network_backend = Some(NetworkBackend::VirtioNet);
-        validate_requested_network_backend(&resources, None, 0).unwrap();
+        validate_requested_network_backend(&resources, 0).unwrap();
     }
 
     #[test]
@@ -200,7 +217,7 @@ mod tests {
         let mut resources = resources();
         resources.network = true;
         resources.network_backend = Some(NetworkBackend::VirtioNet);
-        validate_requested_network_backend(&resources, None, 1).unwrap();
+        validate_requested_network_backend(&resources, 1).unwrap();
     }
 
     #[test]
@@ -209,7 +226,7 @@ mod tests {
         resources.network = true;
         resources.network_backend = Some(NetworkBackend::VirtioNet);
         resources.allowed_cidrs = Some(vec!["1.1.1.1/32".into()]);
-        let err = validate_requested_network_backend(&resources, None, 0).unwrap_err();
+        let err = validate_requested_network_backend(&resources, 0).unwrap_err();
         assert!(err
             .to_string()
             .contains("allow-cidr/allow-host policies are not supported"));

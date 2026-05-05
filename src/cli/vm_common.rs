@@ -404,8 +404,8 @@ pub struct CreateVmParams {
     pub gpu: bool,
     /// GPU VRAM size in MiB (None = default). Ignored when gpu is false.
     pub gpu_vram_mib: Option<u32>,
-    /// Hostnames for DNS filtering (from --allow-host / [network].allow_hosts).
-    pub dns_filter_hosts: Option<Vec<String>>,
+    /// Hostnames for egress filtering (from --allow-host / [network].allow_hosts).
+    pub allowed_hosts: Option<Vec<String>>,
     /// Absolute path to .smolmachine sidecar (for machines created with --from).
     pub source_smolmachine: Option<String>,
 }
@@ -465,6 +465,7 @@ pub fn create_vm(params: CreateVmParams) -> smolvm::Result<()> {
     record.storage_gb = params.storage_gb;
     record.overlay_gb = params.overlay_gb;
     record.allowed_cidrs = params.allowed_cidrs.clone();
+    record.allowed_hosts = params.allowed_hosts.clone();
     record.network_backend = params.network_backend;
     record.gpu = if params.gpu { Some(true) } else { None };
     // Same invariant the CLI enforces, applied again here because
@@ -481,7 +482,6 @@ pub fn create_vm(params: CreateVmParams) -> smolvm::Result<()> {
     record.health_retries = params.health_retries;
     record.health_startup_grace_secs = params.health_startup_grace_secs;
     record.ssh_agent = params.ssh_agent;
-    record.dns_filter_hosts = params.dns_filter_hosts.clone();
     record.source_smolmachine = params.source_smolmachine.clone();
 
     // Store in config (persisted immediately to database)
@@ -549,35 +549,7 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
 
     let mounts = record.host_mounts();
     let ports = record.port_mappings();
-    let mut resources = record.vm_resources();
-
-    // Re-resolve allow_hosts to fresh CIDRs at start time.
-    // Hostnames for CDN-backed services (e.g. dl-cdn.alpinelinux.org) rotate
-    // IPs — storing resolved CIDRs at `machine create` time means the egress
-    // policy goes stale. We re-resolve here so the policy always reflects
-    // current DNS, then merge with any explicit allow_cidrs stored in the DB.
-    //
-    // IMPORTANT: always initialize allowed_cidrs (even to an empty Vec) when
-    // dns_filter_hosts is set. This ensures launcher.rs always calls
-    // krun_set_egress_policy, even when every hostname fails to resolve.
-    // Without this, a DNS outage at start time causes the VM to boot with no
-    // egress restriction at all (fail-open). With it, the policy starts as
-    // deny-all and launcher.rs's ensure_dns_in_cidrs adds 1.1.1.1/32 as the
-    // minimum (fail-closed: only DNS reachable until resolution succeeds).
-    if let Some(ref hosts) = record.dns_filter_hosts {
-        if !hosts.is_empty() {
-            let existing = resources.allowed_cidrs.get_or_insert_with(Vec::new);
-            for host in hosts {
-                match crate::cli::parsers::resolve_host_to_cidrs(host) {
-                    Ok(cidrs) => existing.extend(cidrs),
-                    Err(e) => eprintln!(
-                        "Warning: could not resolve '{}' for egress policy: {}",
-                        host, e
-                    ),
-                }
-            }
-        }
-    }
+    let resources = record.vm_resources();
 
     // Check for host port conflicts with other running VMs.
     if !ports.is_empty() {
@@ -617,7 +589,6 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
 
     let mut features = smolvm::agent::LaunchFeatures {
         ssh_agent_socket,
-        dns_filter_hosts: record.dns_filter_hosts.clone(),
         packed_layers_dir: None,
         extra_disks: Vec::new(),
     };
@@ -780,6 +751,7 @@ pub fn persist_named_running(
                 r.storage_gb = o.storage_gb;
                 r.overlay_gb = o.overlay_gb;
                 r.allowed_cidrs = o.allowed_cidrs.clone();
+                r.allowed_hosts = o.allowed_hosts.clone();
                 r.init = o.init.clone();
                 r.env = o.env.clone();
                 r.workdir = o.workdir.clone();
@@ -787,7 +759,6 @@ pub fn persist_named_running(
                 r.entrypoint = o.entrypoint.clone();
                 r.cmd = o.cmd.clone();
                 r.ssh_agent = o.ssh_agent;
-                r.dns_filter_hosts = o.dns_filter_hosts.clone();
             }
         })
         .is_none()
@@ -807,6 +778,7 @@ pub struct DefaultVmOverrides {
     pub storage_gb: Option<u64>,
     pub overlay_gb: Option<u64>,
     pub allowed_cidrs: Option<Vec<String>>,
+    pub allowed_hosts: Option<Vec<String>>,
     pub init: Vec<String>,
     pub env: Vec<(String, String)>,
     pub workdir: Option<String>,
@@ -814,7 +786,6 @@ pub struct DefaultVmOverrides {
     pub entrypoint: Vec<String>,
     pub cmd: Vec<String>,
     pub ssh_agent: bool,
-    pub dns_filter_hosts: Option<Vec<String>>,
 }
 
 /// Check if any running VM already binds to the same host ports.

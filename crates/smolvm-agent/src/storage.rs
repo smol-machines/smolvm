@@ -1761,10 +1761,6 @@ impl OverlaySetup {
 }
 
 fn overlay_resolv_conf_contents() -> String {
-    if std::env::var(guest_env::DNS_FILTER).as_deref() == Ok("1") {
-        return "nameserver 127.0.0.1\n".to_string();
-    }
-
     if std::env::var(guest_env::BACKEND).as_deref() == Ok(guest_env::BACKEND_VIRTIO_NET) {
         if let Ok(dns_server) = std::env::var(guest_env::DNS) {
             if !dns_server.is_empty() {
@@ -2974,21 +2970,8 @@ mod tests {
     }
 
     #[test]
-    fn overlay_resolv_conf_uses_localhost_when_dns_filter_enabled() {
-        let _guard = env_lock().lock().unwrap();
-        std::env::set_var(guest_env::DNS_FILTER, "1");
-        std::env::remove_var(guest_env::BACKEND);
-        std::env::remove_var(guest_env::DNS);
-
-        assert_eq!(overlay_resolv_conf_contents(), "nameserver 127.0.0.1\n");
-
-        std::env::remove_var(guest_env::DNS_FILTER);
-    }
-
-    #[test]
     fn overlay_resolv_conf_uses_virtio_dns_server() {
         let _guard = env_lock().lock().unwrap();
-        std::env::remove_var(guest_env::DNS_FILTER);
         std::env::set_var(guest_env::BACKEND, guest_env::BACKEND_VIRTIO_NET);
         std::env::set_var(guest_env::DNS, "100.96.0.1");
 
@@ -3001,7 +2984,6 @@ mod tests {
     #[test]
     fn overlay_resolv_conf_defaults_to_public_resolvers() {
         let _guard = env_lock().lock().unwrap();
-        std::env::remove_var(guest_env::DNS_FILTER);
         std::env::remove_var(guest_env::BACKEND);
         std::env::remove_var(guest_env::DNS);
 

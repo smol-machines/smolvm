@@ -26,39 +26,39 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// Resolve `--allow-cidr`, `--allow-host`, and `--outbound-localhost-only` into a CIDR list,
-/// net flag, and the original hostname list (for DNS filtering).
-///
-/// Resolution failure for `--allow-host` is a hard error — a typo or DNS outage
-/// should not silently weaken the security policy.
+/// Split `--allow-cidr`, `--allow-host`, and `--outbound-localhost-only` into
+/// explicit CIDR policy plus the original hostname list for libkrun egress filtering.
 fn resolve_egress_flags(
     mut allow_cidr: Vec<String>,
     allow_host: Vec<String>,
     outbound_localhost_only: bool,
     net: bool,
 ) -> smolvm::Result<(Vec<String>, bool, Option<Vec<String>>)> {
-    // Resolve hostnames to CIDRs — fail hard on resolution errors
     for host in &allow_host {
-        let cidrs = crate::cli::parsers::resolve_host_to_cidrs(host)
-            .map_err(|e| smolvm::Error::config("--allow-host", e))?;
-        tracing::info!(host, ?cidrs, "resolved hostname for egress policy");
-        allow_cidr.extend(cidrs);
+        if host.is_empty() || host.contains(':') {
+            return Err(smolvm::Error::config(
+                "--allow-host",
+                format!(
+                    "invalid hostname '{}': use a hostname only; port suffixes are not supported",
+                    host
+                ),
+            ));
+        }
     }
 
     if outbound_localhost_only {
         allow_cidr.push("127.0.0.0/8".to_string());
         allow_cidr.push("::1/128".to_string());
     }
-    let net = net || !allow_cidr.is_empty();
+    let net = net || !allow_cidr.is_empty() || !allow_host.is_empty();
 
-    // Preserve original hostnames for DNS filtering (None if no --allow-host was used)
-    let dns_filter_hosts = if allow_host.is_empty() {
+    let allowed_hosts = if allow_host.is_empty() {
         None
     } else {
         Some(allow_host)
     };
 
-    Ok((allow_cidr, net, dns_filter_hosts))
+    Ok((allow_cidr, net, allowed_hosts))
 }
 
 /// Manage machines
@@ -247,7 +247,7 @@ pub struct RunCmd {
     #[arg(long = "allow-cidr", value_parser = parse_cidr, value_name = "CIDR", help_heading = "Network")]
     pub allow_cidr: Vec<String>,
 
-    /// Allow egress to specific hostname, resolved at VM start (can be used multiple times, implies --net)
+    /// Allow egress to specific hostname (can be used multiple times, implies --net)
     #[arg(long = "allow-host", value_name = "HOSTNAME", help_heading = "Network")]
     pub allow_host: Vec<String>,
 
@@ -330,7 +330,7 @@ impl RunCmd {
             }
         }
 
-        let (cli_allow_cidrs, net, cli_dns_filter_hosts) = resolve_egress_flags(
+        let (cli_allow_cidrs, net, cli_allowed_hosts) = resolve_egress_flags(
             self.allow_cidr,
             self.allow_host,
             self.outbound_localhost_only,
@@ -358,7 +358,7 @@ impl RunCmd {
         )?;
 
         let mut params = params;
-        params.dns_filter_hosts = match (params.dns_filter_hosts.take(), cli_dns_filter_hosts) {
+        params.allowed_hosts = match (params.allowed_hosts.take(), cli_allowed_hosts) {
             (Some(mut from_smolfile), Some(mut from_cli)) => {
                 from_smolfile.append(&mut from_cli);
                 Some(from_smolfile)
@@ -412,12 +412,9 @@ impl RunCmd {
             storage_gib: params.storage_gb,
             overlay_gib: params.overlay_gb,
             allowed_cidrs: params.allowed_cidrs.clone(),
+            allowed_hosts: params.allowed_hosts.clone(),
         };
-        validate_requested_network_backend(
-            &resources,
-            params.dns_filter_hosts.as_deref(),
-            params.port.len(),
-        )?;
+        validate_requested_network_backend(&resources, params.port.len())?;
 
         let manager =
             AgentManager::for_vm_with_sizes(&vm_name, params.storage_gb, params.overlay_gb)
@@ -446,7 +443,6 @@ impl RunCmd {
 
         let features = smolvm::agent::LaunchFeatures {
             ssh_agent_socket,
-            dns_filter_hosts: params.dns_filter_hosts.clone(),
             packed_layers_dir: None,
             extra_disks: Vec::new(),
         };
@@ -639,6 +635,7 @@ impl RunCmd {
                                 storage_gb: params.storage_gb,
                                 overlay_gb: params.overlay_gb,
                                 allowed_cidrs: params.allowed_cidrs.clone(),
+                                allowed_hosts: params.allowed_hosts.clone(),
                                 init: params.init.clone(),
                                 env: env.clone(),
                                 workdir: params.workdir.clone(),
@@ -646,7 +643,6 @@ impl RunCmd {
                                 entrypoint: params.entrypoint.clone(),
                                 cmd: params.cmd.clone(),
                                 ssh_agent: self.ssh_agent || params.ssh_agent,
-                                dns_filter_hosts: params.dns_filter_hosts.clone(),
                             }),
                         );
                     }
@@ -759,6 +755,7 @@ impl RunCmd {
                                 storage_gb: params.storage_gb,
                                 overlay_gb: params.overlay_gb,
                                 allowed_cidrs: params.allowed_cidrs.clone(),
+                                allowed_hosts: params.allowed_hosts.clone(),
                                 init: params.init.clone(),
                                 env: parse_env_list(&params.env),
                                 workdir: params.workdir.clone(),
@@ -766,7 +763,6 @@ impl RunCmd {
                                 entrypoint: params.entrypoint.clone(),
                                 cmd: params.cmd.clone(),
                                 ssh_agent: self.ssh_agent || params.ssh_agent,
-                                dns_filter_hosts: params.dns_filter_hosts.clone(),
                             }),
                         );
                     }
@@ -1087,7 +1083,7 @@ pub struct CreateCmd {
     #[arg(long = "allow-cidr", value_parser = parse_cidr, value_name = "CIDR")]
     pub allow_cidr: Vec<String>,
 
-    /// Allow egress to specific hostname, resolved at VM start (can be used multiple times, implies --net)
+    /// Allow egress to specific hostname (can be used multiple times, implies --net)
     #[arg(long = "allow-host", value_name = "HOSTNAME")]
     pub allow_host: Vec<String>,
 
@@ -1141,7 +1137,7 @@ impl CreateCmd {
             return self.run_from_smolmachine(sidecar_path);
         }
 
-        let (cli_allow_cidrs, net, cli_dns_filter_hosts) = resolve_egress_flags(
+        let (cli_allow_cidrs, net, cli_allowed_hosts) = resolve_egress_flags(
             self.allow_cidr,
             self.allow_host,
             self.outbound_localhost_only,
@@ -1172,7 +1168,7 @@ impl CreateCmd {
             cli_allow_cidrs,
         )?;
         let mut params = params;
-        params.dns_filter_hosts = match (params.dns_filter_hosts.take(), cli_dns_filter_hosts) {
+        params.allowed_hosts = match (params.allowed_hosts.take(), cli_allowed_hosts) {
             (Some(mut from_smolfile), Some(mut from_cli)) => {
                 from_smolfile.append(&mut from_cli);
                 Some(from_smolfile)
@@ -1190,12 +1186,9 @@ impl CreateCmd {
             storage_gib: params.storage_gb,
             overlay_gib: params.overlay_gb,
             allowed_cidrs: params.allowed_cidrs.clone(),
+            allowed_hosts: params.allowed_hosts.clone(),
         };
-        validate_requested_network_backend(
-            &resources,
-            params.dns_filter_hosts.as_deref(),
-            params.port.len(),
-        )?;
+        validate_requested_network_backend(&resources, params.port.len())?;
         if self.ssh_agent {
             params.ssh_agent = true;
         }
@@ -1223,7 +1216,7 @@ impl CreateCmd {
         }
 
         // Read manifest from the sidecar to get image metadata.
-        let manifest = smolvm_pack::packer::read_manifest_from_sidecar(sidecar_path)
+        let mut manifest = smolvm_pack::packer::read_manifest_from_sidecar(sidecar_path)
             .map_err(|e| smolvm::Error::agent("read .smolmachine", e.to_string()))?;
 
         // Pre-extract the sidecar so first `machine start` is fast.
@@ -1259,6 +1252,32 @@ impl CreateCmd {
             manifest.mem
         };
 
+        let (cli_allow_cidrs, cli_net, cli_allowed_hosts) = resolve_egress_flags(
+            self.allow_cidr.clone(),
+            self.allow_host.clone(),
+            self.outbound_localhost_only,
+            self.net,
+        )?;
+        let allowed_cidrs = match (manifest.allowed_cidrs.take(), cli_allow_cidrs.is_empty()) {
+            (Some(mut from_manifest), false) => {
+                from_manifest.extend(cli_allow_cidrs);
+                Some(from_manifest)
+            }
+            (Some(from_manifest), true) => Some(from_manifest),
+            (None, false) => Some(cli_allow_cidrs),
+            (None, true) => None,
+        };
+        let allowed_hosts = match (manifest.allowed_hosts.take(), cli_allowed_hosts) {
+            (Some(mut from_manifest), Some(mut from_cli)) => {
+                from_manifest.append(&mut from_cli);
+                Some(from_manifest)
+            }
+            (Some(from_manifest), None) => Some(from_manifest),
+            (None, some) => some,
+        };
+        let net =
+            cli_net || manifest.network || allowed_cidrs.is_some() || allowed_hosts.is_some();
+
         let params = vm_common::CreateVmParams {
             name,
             image: Some(manifest.image),
@@ -1268,7 +1287,7 @@ impl CreateCmd {
             mem,
             volume: self.volume.clone(),
             port: self.port.clone(),
-            net: self.net || manifest.network,
+            net,
             network_backend: self.net_backend,
             init: self.init.clone(),
             env: {
@@ -1279,7 +1298,8 @@ impl CreateCmd {
             workdir: manifest.workdir,
             storage_gb: self.storage,
             overlay_gb: self.overlay,
-            allowed_cidrs: None,
+            allowed_cidrs,
+            allowed_hosts,
             restart_policy: None,
             restart_max_retries: None,
             restart_max_backoff_secs: None,
@@ -1289,7 +1309,6 @@ impl CreateCmd {
             health_retries: None,
             health_startup_grace_secs: None,
             ssh_agent: self.ssh_agent,
-            dns_filter_hosts: None,
             gpu: manifest.gpu,
             gpu_vram_mib: None,
             source_smolmachine: Some(canonical_path),

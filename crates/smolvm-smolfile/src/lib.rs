@@ -61,7 +61,7 @@
 //!
 //! | Field | Type | Description |
 //! |-------|------|-------------|
-//! | `allow_hosts` | string[] | Allowed hostnames (resolved to IPs at start) |
+//! | `allow_hosts` | string[] | Allowed hostnames for egress filtering |
 //! | `allow_cidrs` | string[] | Allowed CIDR ranges (`"10.0.0.0/8"`) |
 //!
 //! ### `[health]` — Health checks
@@ -254,7 +254,7 @@ pub struct Smolfile {
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
-    /// Allowed egress hostnames (resolved to IPs at VM start).
+    /// Allowed egress hostnames.
     #[serde(default)]
     pub allow_hosts: Vec<String>,
     /// Allowed egress CIDR ranges (e.g., `["10.0.0.0/8", "1.1.1.1"]`).

@@ -364,6 +364,14 @@ pub struct PackManifest {
     #[serde(default)]
     pub network: bool,
 
+    /// Allowed egress CIDR ranges.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_cidrs: Option<Vec<String>>,
+
+    /// Allowed egress hostnames.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_hosts: Option<Vec<String>>,
+
     /// Enable GPU acceleration (Vulkan via virtio-gpu).
     #[serde(default)]
     pub gpu: bool,
@@ -452,6 +460,8 @@ impl PackManifest {
             mem: 256,
             image_size: 0,
             network: false,
+            allowed_cidrs: None,
+            allowed_hosts: None,
             gpu: false,
             host_platform,
             created: rfc3339_now(),
@@ -536,6 +546,8 @@ mod tests {
         );
         manifest.cpus = 2;
         manifest.mem = 1024;
+        manifest.allowed_cidrs = Some(vec!["10.0.0.0/8".to_string()]);
+        manifest.allowed_hosts = Some(vec!["example.com".to_string()]);
         manifest.entrypoint = vec!["/bin/sh".to_string()];
         manifest.env = vec!["PATH=/usr/local/bin:/usr/bin:/bin".to_string()];
         manifest.assets.libraries.push(AssetEntry {
@@ -550,6 +562,8 @@ mod tests {
         assert_eq!(restored.digest, "sha256:abc123");
         assert_eq!(restored.cpus, 2);
         assert_eq!(restored.mem, 1024);
+        assert_eq!(restored.allowed_cidrs, Some(vec!["10.0.0.0/8".to_string()]));
+        assert_eq!(restored.allowed_hosts, Some(vec!["example.com".to_string()]));
         assert_eq!(restored.entrypoint, vec!["/bin/sh"]);
         assert_eq!(restored.assets.libraries.len(), 1);
     }

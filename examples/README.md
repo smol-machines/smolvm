@@ -64,7 +64,7 @@ overlay = 4                          # overlay disk GiB (default: 2)
 
 # Network policy — egress filtering by hostname and/or CIDR
 [network]
-allow_hosts = ["api.stripe.com", "db.example.com"]  # resolved at VM start
+allow_hosts = ["api.stripe.com", "db.example.com"]  # DNS-filtered by libkrun
 allow_cidrs = ["10.0.0.0/8"]                        # IP/CIDR ranges
 
 # Health checks

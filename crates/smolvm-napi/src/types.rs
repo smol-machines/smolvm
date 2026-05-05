@@ -64,6 +64,10 @@ pub struct VmResourcesConfig {
     pub storage_gib: Option<f64>,
     /// Overlay disk size in GiB (default: 10).
     pub overlay_gib: Option<f64>,
+    /// Allowed egress CIDR ranges.
+    pub allowed_cidrs: Option<Vec<String>>,
+    /// Allowed egress hostnames.
+    pub allowed_hosts: Option<Vec<String>>,
 }
 
 /// Options for executing a command.
@@ -165,9 +169,12 @@ impl VmResourcesConfig {
             memory_mib: self.memory_mib.unwrap_or(DEFAULT_MICROVM_MEMORY_MIB),
             network: self.network.unwrap_or(false),
             network_backend: None,
+            gpu: false,
+            gpu_vram_mib: None,
             storage_gib: self.storage_gib.map(|g| g as u64),
             overlay_gib: self.overlay_gib.map(|g| g as u64),
-            allowed_cidrs: None,
+            allowed_cidrs: self.allowed_cidrs.clone(),
+            allowed_hosts: self.allowed_hosts.clone(),
         }
     }
 }

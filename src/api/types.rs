@@ -91,6 +91,9 @@ pub struct ResourceSpec {
     /// Omit for unrestricted egress. Empty list denies all egress.
     #[serde(default)]
     pub allowed_cidrs: Option<Vec<String>>,
+    /// Allowed egress hostnames. When set, libkrun filters DNS and egress for these names.
+    #[serde(default)]
+    pub allowed_hosts: Option<Vec<String>>,
 }
 
 // ============================================================================
@@ -363,6 +366,9 @@ pub struct CreateMachineRequest {
     /// Allowed egress CIDR ranges.
     #[serde(default)]
     pub allowed_cidrs: Option<Vec<String>>,
+    /// Allowed egress hostnames.
+    #[serde(default)]
+    pub allowed_hosts: Option<Vec<String>>,
     /// OCI image reference (e.g., "alpine:latest"). Mutually exclusive with `from`.
     #[serde(default)]
     pub image: Option<String>,

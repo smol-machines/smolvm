@@ -1092,7 +1092,6 @@ impl AgentManager {
             ports: ports.clone(),
             resources: resources_for_config.clone(),
             ssh_agent_socket: features.ssh_agent_socket,
-            dns_filter_hosts: features.dns_filter_hosts,
             packed_layers_dir: features.packed_layers_dir,
             extra_disks: features.extra_disks,
         };

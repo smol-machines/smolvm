@@ -609,13 +609,13 @@ test_machine_egress_allow_host_permitted() {
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
     $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
 
-    # Create VM allowing only one.one.one.one (resolves to 1.1.1.1)
+    # Create VM allowing only one.one.one.one.
     $SMOLVM machine create "$vm_name" --allow-host one.one.one.one 2>&1 || return 1
     $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
 
-    # DNS lookup to allowed host's IP should succeed
+    # DNS lookup for the allowed hostname should succeed.
     local output exit_code=0
-    output=$($SMOLVM machine exec --name "$vm_name" -- nslookup cloudflare.com 1.1.1.1 2>&1) || exit_code=$?
+    output=$($SMOLVM machine exec --name "$vm_name" -- nslookup one.one.one.one 1.1.1.1 2>&1) || exit_code=$?
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
     $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
@@ -630,7 +630,7 @@ test_machine_egress_allow_host_blocked() {
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
     $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
 
-    # Create VM allowing only one.one.one.one — 8.8.8.8 should be blocked
+    # Create VM allowing only one.one.one.one. DNS for other hostnames should be blocked.
     $SMOLVM machine create "$vm_name" --allow-host one.one.one.one 2>&1 || return 1
     $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
 
@@ -644,15 +644,18 @@ test_machine_egress_allow_host_blocked() {
     [[ $exit_code -ne 0 ]]
 }
 
-test_machine_egress_allow_host_invalid_rejected() {
+test_machine_egress_allow_host_unresolved_accepted() {
     local vm_name="egress-host-invalid-test-$$"
     local output exit_code=0
     output=$($SMOLVM machine create "$vm_name" --allow-host "this-does-not-exist.invalid" 2>&1) || exit_code=$?
 
     $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
 
-    # Should fail with a resolution error (hard error, not warning)
-    [[ $exit_code -ne 0 ]] && [[ "$output" == *"failed to resolve"* ]]
+    # Hostnames are preserved for libkrun DNS interception and are no longer
+    # resolved by smolvm at create time. Unresolved but syntactically valid names
+    # should therefore be accepted here and fail later only if DNS cannot resolve
+    # them inside the VM.
+    [[ $exit_code -eq 0 ]] && [[ "$output" == *"Created machine:"* ]]
 }
 
 test_machine_egress_allow_host_port_rejected() {
@@ -666,9 +669,9 @@ test_machine_egress_allow_host_port_rejected() {
     [[ $exit_code -ne 0 ]] && [[ "$output" == *"port suffixes are not supported"* ]]
 }
 
-# DNS filtering end-to-end: when --allow-host is used with a new agent that
-# has the DNS proxy, queries for non-allowed domains should fail.
-test_machine_dns_filter_blocks_resolution() {
+# Egress DNS filtering end-to-end: when --allow-host is used, libkrun intercepts
+# DNS queries to port 53 and rejects names outside the allowlist.
+test_machine_egress_dns_blocks_resolution() {
     local vm_name="dns-filter-test-$$"
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
@@ -682,8 +685,7 @@ test_machine_dns_filter_blocks_resolution() {
     local exit_code_allowed=0
     $SMOLVM machine exec --name "$vm_name" -- nslookup one.one.one.one 1.1.1.1 2>&1 || exit_code_allowed=$?
 
-    # Resolving a non-allowed domain should fail (DNS proxy returns NXDOMAIN,
-    # or if agent doesn't have DNS proxy, TSI still blocks the IP)
+    # Resolving a non-allowed domain should fail with a filtered DNS response.
     local exit_code_blocked=0
     $SMOLVM machine exec --name "$vm_name" -- nslookup attacker-test.example 2>&1 || exit_code_blocked=$?
 
@@ -725,9 +727,10 @@ test_machine_allow_host_persists_across_restart() {
 }
 
 # Regression test for GitHub issue #124:
-# Smolfile [network].allow_hosts should work on persistent machines even after
-# IP rotation (CDN-backed hosts). Tests that egress policy is re-resolved at
-# `machine start` time using fresh DNS, not stale CIDRs from create time.
+# Smolfile [network].allow_hosts should work on persistent machines even if
+# old stored CIDRs are stale. The hostname allowlist must be preserved and
+# passed to libkrun, where DNS interception and refresh keep hostname policy
+# independent from stale smolvm-side CIDRs.
 #
 # Strategy: create via Smolfile, then use sqlite3 to overwrite allowed_cidrs
 # with a bogus RFC-5737 TEST-NET address (192.0.2.0/24) — simulating stale
@@ -777,14 +780,13 @@ EOF
         "UPDATE vms SET data = CAST(json_set(CAST(data AS TEXT), '$.allowed_cidrs', json('[\"192.0.2.0/24\"]')) AS BLOB) WHERE name = '$vm_name'" \
         2>&1 || { echo "sqlite3 update failed"; rm -rf "$tmpdir"; $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
 
-    # Start — fix must re-resolve allow_hosts and override the stale CIDRs
+    # Start — hostname policy must still be handed to libkrun even with stale CIDRs.
     $SMOLVM machine start --name "$vm_name" 2>&1 \
         || { rm -rf "$tmpdir"; $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
 
-    # Probe egress using 1.0.0.1 as the resolver — also a valid IP for
-    # one.one.one.one, but NOT auto-added by ensure_dns_in_cidrs (which only
-    # injects 1.1.1.1). With stale CIDRs and no re-resolution, 1.0.0.1 is
-    # blocked; with the fix, fresh resolution adds it and the query succeeds.
+    # Probe using 1.0.0.1 as the resolver. It is not in the injected stale CIDR
+    # range, so this succeeds only if libkrun handles allowed DNS queries by
+    # hostname instead of depending on the stale smolvm-side CIDR value.
     local exit_code=0
     $SMOLVM machine exec --name "$vm_name" -- nslookup one.one.one.one 1.0.0.1 2>&1 || exit_code=$?
 
@@ -825,20 +827,17 @@ EOF
     $SMOLVM machine start --name "$vm_name" 2>&1 \
         || { rm -rf "$tmpdir"; $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
 
-    # Probe 1: 1.1.1.1 — always in the egress policy via ensure_dns_in_cidrs.
-    # Verifies the policy doesn't block what it should allow, but does NOT
-    # prove that hostname resolution ran (1.1.1.1 is auto-added regardless).
+    # Probe 1: query an allowed hostname through one DNS server.
     local exit_code_allowed=0
     $SMOLVM machine exec --name "$vm_name" -- nslookup one.one.one.one 1.1.1.1 2>&1 || exit_code_allowed=$?
 
-    # Probe 2: 1.0.0.1 — a real IP of one.one.one.one, but NOT auto-added by
-    # ensure_dns_in_cidrs. This probe passes only if allow_hosts DNS resolution
-    # actually ran and added 1.0.0.1 to the CIDR list. It is the definitive
-    # proof that the hostname-to-CIDR path works end-to-end.
+    # Probe 2: query the same allowed hostname through a different DNS server.
+    # This proves the policy is based on the DNS question name, not on a single
+    # hard-coded resolver IP.
     local exit_code_resolution=0
     $SMOLVM machine exec --name "$vm_name" -- nslookup one.one.one.one 1.0.0.1 2>&1 || exit_code_resolution=$?
 
-    # Egress to a non-allowed resolver (8.8.8.8) must be blocked
+    # DNS for a non-allowed hostname must be blocked.
     local exit_code_blocked=0
     $SMOLVM machine exec --name "$vm_name" -- nslookup cloudflare.com 8.8.8.8 2>&1 || exit_code_blocked=$?
 
@@ -850,26 +849,12 @@ EOF
     [[ $exit_code_allowed -eq 0 ]] && [[ $exit_code_resolution -eq 0 ]] && [[ $exit_code_blocked -ne 0 ]]
 }
 
-# Stability smoke test for the egress refresh thread.
+# Stability smoke test for libkrun-managed allow-host policy.
 #
-# Why we can't do a full e2e regression test for the refresh thread:
-#   `dns_filter_hosts` in VmRecord drives BOTH start-time re-resolution (in
-#   start_vm_named) AND the refresh thread. If dns_filter_hosts is set, start
-#   time already resolves both 1.1.1.1 and 1.0.0.1 into the policy — leaving
-#   nothing for the refresh thread to newly add. If dns_filter_hosts is null,
-#   the refresh thread also has no hosts to resolve. There is no external
-#   interface to inject stale state into the running muxer's Arc.
-#
-# What this test verifies instead:
-#   The machine starts with allow_hosts and SMOLVM_EGRESS_REFRESH_SECS=10.
-#   After waiting for 2 refresh cycles, egress to the allowed host still works.
-#   This confirms: (1) the refresh thread does not crash, (2) it does not corrupt
-#   the egress policy, and (3) existing CIDRs are preserved across refreshes.
-#
-# The true "adds new CIDR" behavior requires a unit test with controlled DNS.
-#
-# Note: this test takes ~25 seconds due to the sleep.
-test_egress_refresh_thread_stability() {
+# Full refresh behavior is covered best in libkrun with controlled DNS. This
+# smolvm test verifies that a VM launched with allow_hosts remains usable after
+# a short idle window and that smolvm keeps passing hostnames to libkrun.
+test_allow_host_policy_stability() {
     local vm_name="egress-refresh-smoke-$$"
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
@@ -888,9 +873,7 @@ EOF
         $SMOLVM machine create "$vm_name" -s Smolfile.toml 2>&1
     ) || { rm -rf "$tmpdir"; return 1; }
 
-    # Start with a 10-second refresh interval so the thread fires twice during
-    # the test window without making the test slow.
-    SMOLVM_EGRESS_REFRESH_SECS=10 $SMOLVM machine start --name "$vm_name" 2>&1 \
+    $SMOLVM machine start --name "$vm_name" 2>&1 \
         || { rm -rf "$tmpdir"; $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
 
     # Verify egress works immediately after start.
@@ -898,12 +881,10 @@ EOF
     $SMOLVM machine exec --name "$vm_name" -- nslookup one.one.one.one 1.1.1.1 2>&1 \
         || exit_code_before=$?
 
-    # Wait for two refresh cycles to fire (2 × 10 s + 5 s buffer).
-    echo "  Waiting 25s for two egress refresh cycles..."
-    sleep 25
+    echo "  Waiting briefly before rechecking allow-host policy..."
+    sleep 2
 
-    # Egress must still work after refreshes — the thread must not have
-    # wiped or corrupted the existing CIDR list.
+    # Egress must still work after the VM has been running for a bit.
     local exit_code_after=0
     $SMOLVM machine exec --name "$vm_name" -- nslookup one.one.one.one 1.1.1.1 2>&1 \
         || exit_code_after=$?
@@ -1579,13 +1560,13 @@ run_test "Egress: --outbound-localhost-only blocks external" test_machine_egress
 run_test "Egress: invalid CIDR rejected at create" test_machine_egress_invalid_cidr_rejected || true
 run_test "Egress: allow-host permits matching traffic" test_machine_egress_allow_host_permitted || true
 run_test "Egress: allow-host blocks non-matching traffic" test_machine_egress_allow_host_blocked || true
-run_test "Egress: invalid hostname rejected at create" test_machine_egress_allow_host_invalid_rejected || true
+run_test "Egress: unresolved allow-host accepted at create" test_machine_egress_allow_host_unresolved_accepted || true
 run_test "Egress: host:port syntax rejected" test_machine_egress_allow_host_port_rejected || true
-run_test "DNS filter: blocks resolution of non-allowed domains" test_machine_dns_filter_blocks_resolution || true
-run_test "DNS filter: allow-host persists across restart" test_machine_allow_host_persists_across_restart || true
+run_test "Egress DNS: blocks resolution of non-allowed domains" test_machine_egress_dns_blocks_resolution || true
+run_test "Egress DNS: allow-host persists across restart" test_machine_allow_host_persists_across_restart || true
 run_test "Smolfile: allow_hosts basic egress permitted/blocked" test_smolfile_allow_hosts_egress_basic || true
-run_test "Smolfile: allow_hosts re-resolves stale CIDRs on start (issue #124)" test_smolfile_allow_hosts_stale_cidr_regression || true
-run_test "Egress refresh thread: stability across refresh cycles" test_egress_refresh_thread_stability || true
+run_test "Smolfile: allow_hosts survives stale CIDRs (issue #124)" test_smolfile_allow_hosts_stale_cidr_regression || true
+run_test "Egress DNS: allow-host policy remains stable" test_allow_host_policy_stability || true
 run_test "Overlay: root is overlayfs" test_machine_overlay_root_active || true
 run_test "Overlay: rootfs persists across reboot" test_machine_rootfs_persists_across_reboot || true
 run_test "Volume: mount visible to exec" test_machine_volume_mount_visible_to_exec || true

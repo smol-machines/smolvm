@@ -14,6 +14,14 @@ use std::path::PathBuf;
 // Re-export from the library
 pub use smolvm::smolfile::{parse_duration_secs, Smolfile};
 
+fn cidrs_to_option(v: Vec<String>) -> Option<Vec<String>> {
+    if v.is_empty() {
+        None
+    } else {
+        Some(v)
+    }
+}
+
 /// Load and parse a Smolfile from the given path.
 pub fn load(path: &std::path::Path) -> smolvm::Result<Smolfile> {
     smolvm::smolfile::load(path)
@@ -50,8 +58,6 @@ pub fn build_create_params(
     cli_overlay_gb: Option<u64>,
     cli_allow_cidr: Vec<String>,
 ) -> smolvm::Result<CreateVmParams> {
-    let cidrs_to_option = |v: Vec<String>| if v.is_empty() { None } else { Some(v) };
-
     let sf = match smolfile_path {
         Some(path) => load(&path)?,
         None => {
@@ -84,7 +90,7 @@ pub fn build_create_params(
                 ssh_agent: false,
                 gpu: false,
                 gpu_vram_mib: None,
-                dns_filter_hosts: None,
+                allowed_hosts: None,
                 source_smolmachine: None,
             });
         }
@@ -178,10 +184,8 @@ pub fn build_create_params(
     // Merge network policy: [network] section, then CLI extends
     let network = sf.network.unwrap_or_default();
 
-    // Preserve original hostnames for DNS filtering.
-    // Do NOT resolve these to CIDRs here — CDN-backed hosts rotate IPs and the
-    // resolved addresses would be stale by the time the machine is started.
-    // Re-resolution happens at `machine start` time (see start_vm_named).
+    // Preserve original hostnames for libkrun egress filtering. Do not resolve
+    // these to CIDRs in smolvm; libkrun learns allowed IPs from guest DNS answers.
     let sf_allow_hosts = network.allow_hosts;
 
     // Parse [network].allow_cidrs — these are explicit stable CIDRs, stored as-is.
@@ -273,7 +277,7 @@ pub fn build_create_params(
         ssh_agent: sf.auth.as_ref().and_then(|a| a.ssh_agent).unwrap_or(false),
         gpu,
         gpu_vram_mib: sf.gpu_vram,
-        dns_filter_hosts: if sf_allow_hosts.is_empty() {
+        allowed_hosts: if sf_allow_hosts.is_empty() {
             None
         } else {
             Some(sf_allow_hosts)
@@ -306,6 +310,10 @@ pub struct PackConfig {
     /// so `--from-vm` can distinguish "Smolfile says net = false" from "no
     /// Smolfile, fall back to source VM's setting".
     pub net: Option<bool>,
+    /// Allowed egress CIDR ranges from [network].allow_cidrs.
+    pub allowed_cidrs: Option<Vec<String>>,
+    /// Allowed egress hostnames from [network].allow_hosts.
+    pub allowed_hosts: Option<Vec<String>>,
     /// Whether GPU acceleration is enabled in the packed VM.
     pub gpu: bool,
 }
@@ -346,6 +354,8 @@ pub fn resolve_pack_config(
                 env: vec![],
                 workdir: None,
                 net: None,
+                allowed_cidrs: None,
+                allowed_hosts: None,
                 gpu: cli_gpu,
             });
         }
@@ -389,6 +399,20 @@ pub fn resolve_pack_config(
     // oci_platform: CLI > [artifact]
     let oci_platform = cli_oci_platform.or(artifact.oci_platform);
 
+    let network = sf.network.unwrap_or_default();
+    let allowed_cidrs_vec: Vec<String> = network
+        .allow_cidrs
+        .iter()
+        .map(|s| parse_cidr(s))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| smolvm::Error::config("smolfile [network] allow_cidrs", e))?;
+    let allowed_hosts = if network.allow_hosts.is_empty() {
+        None
+    } else {
+        Some(network.allow_hosts)
+    };
+    let allowed_cidrs = cidrs_to_option(allowed_cidrs_vec);
+
     Ok(PackConfig {
         image,
         entrypoint,
@@ -402,17 +426,56 @@ pub fn resolve_pack_config(
         // matching the same logic in build_create_params().
         // Preserve the tri-state: None = unspecified, Some = explicit.
         net: {
-            let network_section_implies_net = sf
-                .network
-                .as_ref()
-                .is_some_and(|n| !n.allow_hosts.is_empty() || !n.allow_cidrs.is_empty());
+            let network_section_implies_net = allowed_hosts.is_some() || allowed_cidrs.is_some();
             if network_section_implies_net {
                 Some(true)
             } else {
                 sf.net // None if key absent, Some(true/false) if explicit
             }
         },
+        allowed_cidrs,
+        allowed_hosts,
         // CLI --gpu wins; Smolfile gpu = true also enables it.
         gpu: cli_gpu || sf.gpu.unwrap_or(false),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pack_config_carries_network_policy_from_smolfile() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Smolfile");
+        std::fs::write(
+            &path,
+            r#"
+image = "alpine"
+
+[network]
+allow_cidrs = ["1.1.1.1", "10.0.0.0/8"]
+allow_hosts = ["example.com"]
+"#,
+        )
+        .unwrap();
+
+        let config = resolve_pack_config(
+            None,
+            None,
+            DEFAULT_MICROVM_CPU_COUNT,
+            crate::cli::pack::PACK_DEFAULT_MEMORY_MIB,
+            None,
+            false,
+            Some(path),
+        )
+        .unwrap();
+
+        assert_eq!(config.net, Some(true));
+        assert_eq!(
+            config.allowed_cidrs,
+            Some(vec!["1.1.1.1/32".to_string(), "10.0.0.0/8".to_string()])
+        );
+        assert_eq!(config.allowed_hosts, Some(vec!["example.com".to_string()]));
+    }
 }

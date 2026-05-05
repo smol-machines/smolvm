@@ -21,5 +21,3 @@ pub const PREFIX_LEN: &str = "SMOLVM_NETWORK_PREFIX_LEN";
 pub const GUEST_MAC: &str = "SMOLVM_NETWORK_GUEST_MAC";
 /// Guest-visible DNS server IPv4 address.
 pub const DNS: &str = "SMOLVM_NETWORK_DNS";
-/// Enables the guest-side DNS filtering proxy.
-pub const DNS_FILTER: &str = "SMOLVM_DNS_FILTER";

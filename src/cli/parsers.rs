@@ -84,7 +84,7 @@ pub fn record_mounts_to_runconfig_bindings(
 }
 
 // Network helpers delegated to the library.
-pub use smolvm::smolfile::{parse_cidr, resolve_host_to_cidrs};
+pub use smolvm::smolfile::parse_cidr;
 
 #[cfg(test)]
 mod tests {
@@ -112,42 +112,6 @@ mod tests {
     fn parse_gpu_vram_mib_accepts_positive() {
         assert_eq!(parse_gpu_vram_mib("1").unwrap(), 1);
         assert_eq!(parse_gpu_vram_mib("4096").unwrap(), 4096);
-    }
-
-    #[test]
-    fn resolve_host_bare_ip() {
-        let cidrs = resolve_host_to_cidrs("1.2.3.4").unwrap();
-        assert_eq!(cidrs, vec!["1.2.3.4/32"]);
-    }
-
-    #[test]
-    fn resolve_host_rejects_port_suffix() {
-        let err = resolve_host_to_cidrs("example.com:443").unwrap_err();
-        assert!(err.contains("port suffixes are not supported"), "{}", err);
-    }
-
-    #[test]
-    fn resolve_host_rejects_ipv6_with_port() {
-        let err = resolve_host_to_cidrs("[::1]:80").unwrap_err();
-        assert!(err.contains("port suffixes are not supported"), "{}", err);
-    }
-
-    #[test]
-    fn resolve_host_real_hostname() {
-        // Resolve a well-known hostname — should return at least one IP
-        let cidrs = resolve_host_to_cidrs("one.one.one.one").unwrap();
-        assert!(!cidrs.is_empty());
-        // All results should be /32 CIDRs
-        for cidr in &cidrs {
-            assert!(cidr.ends_with("/32"), "expected /32 CIDR, got {}", cidr);
-        }
-    }
-
-    #[test]
-    fn resolve_host_nonexistent_domain() {
-        let err =
-            resolve_host_to_cidrs("this-domain-does-not-exist-smolvm-test.invalid").unwrap_err();
-        assert!(err.contains("failed to resolve"), "{}", err);
     }
 
     #[test]
