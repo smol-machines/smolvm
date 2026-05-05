@@ -2084,8 +2084,10 @@ pub fn run_command(
         }
 
         // Shared workspace: /storage/workspace → /workspace inside container
+        // Skip if the user already mounted something to /workspace explicitly.
+        let user_mounted_workspace = mounts.iter().any(|(_, target, _)| target == "/workspace");
         let workspace_src = Path::new(STORAGE_ROOT).join(WORKSPACE_DIR);
-        if workspace_src.exists() {
+        if !user_mounted_workspace && workspace_src.exists() {
             spec.add_bind_mount(&workspace_src.to_string_lossy(), "/workspace", false);
         }
 
@@ -2246,6 +2248,12 @@ fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Resul
     let rootfs_path = Path::new(rootfs);
 
     for (tag, container_path, read_only) in mounts {
+        // VM-internal absolute paths don't need virtiofs mounting — they're
+        // handled as OCI bind mounts in the caller via resolve_mount_source().
+        if tag.starts_with('/') {
+            debug!(path = %tag, container_path = %container_path, "skipping virtiofs setup for VM-internal path");
+            continue;
+        }
         validate_storage_id(tag, "mount tag")?;
         debug!(tag = %tag, container_path = %container_path, read_only = %read_only, "setting up volume mount");
 
