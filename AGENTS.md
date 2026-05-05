@@ -108,7 +108,7 @@ Default registry: `registry.smolmachines.com`. Digest references require `sha256
 | Flag | Short | Used on | Description |
 |------|-------|---------|-------------|
 | `--image` | `-I` | run, create, pack create | OCI image |
-| `--name` | `-n` | start, stop, status, exec, resize | Machine name (default: "default") |
+| `--name` | `-n` | run, start, stop, status, exec, resize | Machine name (default: "default") |
 | `--net` | | run, create | Enable outbound networking (off by default) |
 | `--gpu` | | run, create | Enable GPU acceleration (Vulkan via virtio-gpu) |
 | `--gpu-vram` | | run, create | GPU shared-memory region size in MiB (default: 4096). Ignored without `--gpu`. |

@@ -168,6 +168,12 @@ pub struct RunCmd {
     #[arg(short = 'I', long, value_name = "IMAGE")]
     pub image: Option<String>,
 
+    /// Name a persistent machine when used with --detach.
+    /// Matches the --name flag on start/stop/exec/status/resize. In foreground
+    /// mode (no -d), --name is ignored with a warning.
+    #[arg(short = 'n', long, value_name = "NAME", help_heading = "Execution")]
+    pub name: Option<String>,
+
     /// Command and arguments to run (default: image entrypoint or /bin/sh)
     #[arg(trailing_var_arg = true, value_name = "COMMAND")]
     pub command: Vec<String>,
@@ -301,6 +307,29 @@ impl RunCmd {
     pub fn run(self) -> smolvm::Result<()> {
         use smolvm::Error;
 
+        let requested_name = self.name.clone();
+        if !self.detach && requested_name.is_some() {
+            eprintln!("warning: --name is ignored without -d");
+        }
+        let vm_name = if self.detach {
+            requested_name.unwrap_or_else(|| "default".to_string())
+        } else {
+            "default".to_string()
+        };
+
+        if self.name.is_some() && vm_name != "default" && self.detach {
+            let config = smolvm::config::SmolvmConfig::load()?;
+            if config.get_vm(&vm_name).is_some() {
+                return Err(Error::config(
+                    "machine run -d --name",
+                    format!(
+                        "a machine named '{}' already exists. Use 'machine start --name {}' to start it, or 'machine delete {} -f' to remove it.",
+                        vm_name, vm_name, vm_name
+                    ),
+                ));
+            }
+        }
+
         let (cli_allow_cidrs, net, cli_dns_filter_hosts) = resolve_egress_flags(
             self.allow_cidr,
             self.allow_host,
@@ -309,7 +338,7 @@ impl RunCmd {
         )?;
 
         let params = crate::cli::smolfile::build_create_params(
-            "default".to_string(),
+            vm_name.clone(),
             self.image.clone(),
             None,
             self.command.clone(),
@@ -390,8 +419,9 @@ impl RunCmd {
             params.port.len(),
         )?;
 
-        let manager = AgentManager::new_default_with_sizes(params.storage_gb, params.overlay_gb)
-            .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
+        let manager =
+            AgentManager::for_vm_with_sizes(&vm_name, params.storage_gb, params.overlay_gb)
+                .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
 
         let mode = if self.detach {
             "persistent"
@@ -489,12 +519,11 @@ impl RunCmd {
                 })
                 .collect();
             let init_env = parse_env_list(&params.env);
-            // Use "default" as the overlay ID so any rootfs changes
+            // Use the machine name as the overlay ID so any rootfs changes
             // init makes (e.g. `pacman -S git`) are visible to a
             // subsequent `machine exec`. The exec path resolves the
-            // overlay from the machine name, falling back to "default"
-            // when no `--name` is given (`src/cli/machine.rs:741`), so
-            // matching that constant here is what makes init's effects
+            // overlay from the machine name, falling back to "default",
+            // so matching that name here is what makes init's effects
             // observable to the user.
             if let Err(e) = vm_common::run_init_commands(
                 &mut client,
@@ -505,7 +534,7 @@ impl RunCmd {
                     env: &init_env,
                     workdir: params.workdir.as_deref(),
                     record_mounts: &record_mounts,
-                    overlay_id: "default",
+                    overlay_id: &vm_name,
                 },
             ) {
                 // Ephemeral VMs have no state to preserve — `kill()`
@@ -596,8 +625,9 @@ impl RunCmd {
                     let port_tuples: Vec<(u16, u16)> =
                         params.port.iter().map(|p| (p.host, p.guest)).collect();
                     if let Ok(mut config) = SmolvmConfig::load() {
-                        vm_common::persist_default_running(
+                        vm_common::persist_named_running(
                             &mut config,
+                            &vm_name,
                             manager.child_pid(),
                             Some(DefaultVmOverrides {
                                 cpus: params.cpus,
@@ -625,11 +655,19 @@ impl RunCmd {
                 // Disarm SIGINT guard — detaching, VM stays running.
                 drop(sigint_guard);
 
-                println!("Machine running in background");
-                println!("\nTo interact:");
-                println!("  smolvm machine exec -- <command>");
-                println!("\nTo stop:");
-                println!("  smolvm machine stop");
+                if vm_name == "default" {
+                    println!("Machine running in background");
+                    println!("\nTo interact:");
+                    println!("  smolvm machine exec -- <command>");
+                    println!("\nTo stop:");
+                    println!("  smolvm machine stop");
+                } else {
+                    println!("Machine '{}' running in background", vm_name);
+                    println!("\nTo interact:");
+                    println!("  smolvm machine exec --name {} -- <command>", vm_name);
+                    println!("\nTo stop:");
+                    println!("  smolvm machine stop --name {}", vm_name);
+                }
 
                 manager.detach();
                 Ok(())
@@ -690,7 +728,7 @@ impl RunCmd {
                     tracing::info!(pid = pid, "background workload started");
                 }
 
-                // Persist the default VM state so it survives stop/start.
+                // Persist the VM state so it survives stop/start.
                 {
                     use smolvm::config::SmolvmConfig;
                     use vm_common::DefaultVmOverrides;
@@ -707,8 +745,9 @@ impl RunCmd {
                     let port_tuples: Vec<(u16, u16)> =
                         params.port.iter().map(|p| (p.host, p.guest)).collect();
                     if let Ok(mut config) = SmolvmConfig::load() {
-                        vm_common::persist_default_running(
+                        vm_common::persist_named_running(
                             &mut config,
+                            &vm_name,
                             manager.child_pid(),
                             Some(DefaultVmOverrides {
                                 cpus: params.cpus,
@@ -733,14 +772,26 @@ impl RunCmd {
                     }
                 }
 
-                println!(
-                    "Machine running (PID: {})",
-                    manager.child_pid().unwrap_or(0)
-                );
-                println!("\nTo interact:");
-                println!("  smolvm machine exec -- <command>");
-                println!("\nTo stop:");
-                println!("  smolvm machine stop");
+                if vm_name == "default" {
+                    println!(
+                        "Machine running (PID: {})",
+                        manager.child_pid().unwrap_or(0)
+                    );
+                    println!("\nTo interact:");
+                    println!("  smolvm machine exec -- <command>");
+                    println!("\nTo stop:");
+                    println!("  smolvm machine stop");
+                } else {
+                    println!(
+                        "Machine '{}' running (PID: {})",
+                        vm_name,
+                        manager.child_pid().unwrap_or(0)
+                    );
+                    println!("\nTo interact:");
+                    println!("  smolvm machine exec --name {} -- <command>", vm_name);
+                    println!("\nTo stop:");
+                    println!("  smolvm machine stop --name {}", vm_name);
+                }
 
                 manager.detach();
                 Ok(())
@@ -771,6 +822,32 @@ impl RunCmd {
                 std::process::exit(exit_code);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser, Debug)]
+    #[command(name = "machine")]
+    struct TestMachineCli {
+        #[command(subcommand)]
+        command: MachineCmd,
+    }
+
+    #[test]
+    fn run_detach_accepts_name_flag() {
+        let cli = TestMachineCli::parse_from([
+            "machine", "run", "-d", "--name", "foo", "--image", "alpine",
+        ]);
+
+        let MachineCmd::Run(cmd) = cli.command else {
+            panic!("expected machine run command");
+        };
+        assert_eq!(cmd.name, Some("foo".to_string()));
+        assert!(cmd.detach);
     }
 }
 

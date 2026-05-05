@@ -740,32 +740,33 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
     Ok(())
 }
 
-/// Persist the "default" VM as running in the database.
+/// Persist a named VM as running in the database.
 ///
 /// Creates the record if it doesn't exist, then updates state to Running
 /// with the current PID and optional config overrides (cpus, mem, etc.).
-pub fn persist_default_running(
+pub fn persist_named_running(
     config: &mut SmolvmConfig,
+    name: &str,
     pid: Option<i32>,
     overrides: Option<DefaultVmOverrides>,
 ) {
-    if config.get_vm("default").is_none() {
+    if config.get_vm(name).is_none() {
         let record = VmRecord::new(
-            "default".to_string(),
+            name.to_string(),
             DEFAULT_MICROVM_CPU_COUNT,
             DEFAULT_MICROVM_MEMORY_MIB,
             vec![],
             vec![],
             false,
         );
-        if let Err(e) = config.insert_vm("default".to_string(), record) {
-            tracing::warn!(error = %e, "failed to insert default VM record");
+        if let Err(e) = config.insert_vm(name.to_string(), record) {
+            tracing::warn!(error = %e, vm = %name, "failed to insert VM record");
             return;
         }
     }
     let pid_start_time = pid.and_then(smolvm::process::process_start_time);
     if config
-        .update_vm("default", |r| {
+        .update_vm(name, |r| {
             r.state = RecordState::Running;
             r.pid = pid;
             r.pid_start_time = pid_start_time;
@@ -791,11 +792,11 @@ pub fn persist_default_running(
         })
         .is_none()
     {
-        tracing::warn!("failed to update default VM record (record missing after insert)");
+        tracing::warn!(vm = %name, "failed to update VM record (record missing after insert)");
     }
 }
 
-/// Config overrides for the default VM record.
+/// Config overrides for a VM record.
 pub struct DefaultVmOverrides {
     pub cpus: u8,
     pub mem: u32,
@@ -875,7 +876,7 @@ pub fn start_vm_default() -> smolvm::Result<()> {
     manager.ensure_running()?;
 
     let mut config = SmolvmConfig::load()?;
-    persist_default_running(&mut config, manager.child_pid(), None);
+    persist_named_running(&mut config, "default", manager.child_pid(), None);
 
     // Pull image (if persisted via `machine run -d -s`) before running
     // init, then run init through the shared runner — same fix as
