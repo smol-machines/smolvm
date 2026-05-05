@@ -2332,6 +2332,12 @@ fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Resul
     let rootfs_path = Path::new(rootfs);
 
     for (tag, container_path, read_only) in mounts {
+        // VM-internal absolute paths don't need virtiofs mounting — they're
+        // handled as OCI bind mounts in the caller via resolve_mount_source().
+        if tag.starts_with('/') {
+            debug!(path = %tag, container_path = %container_path, "skipping virtiofs setup for VM-internal path");
+            continue;
+        }
         validate_storage_id(tag, "mount tag")?;
         debug!(tag = %tag, container_path = %container_path, read_only = %read_only, "setting up volume mount");
 
