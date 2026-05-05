@@ -231,6 +231,8 @@ pub async fn create_machine(
         manifest_cpus,
         manifest_mem,
         manifest_net,
+        manifest_allowed_cidrs,
+        manifest_allowed_hosts,
     ) = if let Some(ref sidecar_path) = req.from {
         let path = std::path::Path::new(sidecar_path);
         if !path.exists() {
@@ -270,6 +272,8 @@ pub async fn create_machine(
             manifest.cpus,
             manifest.mem,
             manifest.network,
+            manifest.allowed_cidrs,
+            manifest.allowed_hosts,
         )
     } else {
         (
@@ -282,6 +286,8 @@ pub async fn create_machine(
             req.cpus,
             req.mem,
             req.network,
+            None,
+            None,
         )
     };
 
@@ -298,7 +304,23 @@ pub async fn create_machine(
     } else {
         req.mem
     };
-    let network = req.network || manifest_net;
+    let allowed_cidrs = match (manifest_allowed_cidrs, req.allowed_cidrs.clone()) {
+        (Some(mut from_manifest), Some(from_request)) => {
+            from_manifest.extend(from_request);
+            Some(from_manifest)
+        }
+        (Some(from_manifest), None) => Some(from_manifest),
+        (None, from_request) => from_request,
+    };
+    let allowed_hosts = match (manifest_allowed_hosts, req.allowed_hosts.clone()) {
+        (Some(mut from_manifest), Some(mut from_request)) => {
+            from_manifest.append(&mut from_request);
+            Some(from_manifest)
+        }
+        (Some(from_manifest), None) => Some(from_manifest),
+        (None, from_request) => from_request,
+    };
+    let network = req.network || manifest_net || allowed_cidrs.is_some() || allowed_hosts.is_some();
 
     // Reserve the name atomically (prevents concurrent creation)
     let guard = ReservationGuard::new(&state, name.clone())?;
@@ -323,7 +345,8 @@ pub async fn create_machine(
         gpu: Some(req.gpu),
         storage_gb: req.storage_gb,
         overlay_gb: req.overlay_gb,
-        allowed_cidrs: req.allowed_cidrs.clone(),
+        allowed_cidrs,
+        allowed_hosts,
     };
 
     // Complete registration: persists to DB + registers in ApiState

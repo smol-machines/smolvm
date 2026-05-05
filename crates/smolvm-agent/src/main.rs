@@ -8,6 +8,7 @@
 //!
 //! Communication is via vsock on port 6000.
 
+use smolvm_network::guest_env;
 use smolvm_protocol::{
     error_codes, ports, AgentRequest, AgentResponse, Envelope, RegistryAuth, LAYER_CHUNK_SIZE,
     PROTOCOL_VERSION,
@@ -72,7 +73,6 @@ fn boot_log(level: &str, msg: &str) {
         }
     }
 }
-mod dns_proxy;
 mod network;
 mod oci;
 mod paths;
@@ -130,6 +130,23 @@ fn uptime_ms() -> u64 {
         }
     }
     0
+}
+
+fn configure_resolv_conf() {
+    let resolv_conf =
+        if std::env::var(guest_env::BACKEND).as_deref() == Ok(guest_env::BACKEND_VIRTIO_NET) {
+            match std::env::var(guest_env::DNS) {
+                Ok(dns_server) if !dns_server.is_empty() => format!("nameserver {}\n", dns_server),
+                _ => "nameserver 8.8.8.8\nnameserver 1.1.1.1\n".to_string(),
+            }
+        } else {
+            "nameserver 8.8.8.8\nnameserver 1.1.1.1\n".to_string()
+        };
+
+    match std::fs::write("/etc/resolv.conf", resolv_conf) {
+        Ok(()) => info!("guest resolv.conf configured"),
+        Err(err) => warn!(error = %err, "failed to configure guest resolv.conf"),
+    }
 }
 
 fn main() {
@@ -210,6 +227,7 @@ fn main() {
             std::process::exit(1);
         }
     }
+    configure_resolv_conf();
 
     // Mount storage disk eagerly during deferred init. If a request arrives
     // before this point, ensure_storage_mounted() handles the mount on demand.
@@ -264,12 +282,6 @@ fn main() {
         ssh_agent::start();
         // Set env so all child processes (git, ssh, etc.) find the agent socket
         std::env::set_var("SSH_AUTH_SOCK", ssh_agent::GUEST_SSH_AUTH_SOCK);
-    }
-
-    // Start DNS filtering proxy if enabled by host (when --allow-host is used)
-    if dns_proxy::is_enabled() {
-        info!("DNS filtering enabled, starting guest proxy");
-        dns_proxy::start();
     }
 
     // If the host started us with --gpu, sanity-check that the guest

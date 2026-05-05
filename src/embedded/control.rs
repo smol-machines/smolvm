@@ -40,6 +40,7 @@ impl MachineSpec {
         record.storage_gb = self.resources.storage_gib;
         record.overlay_gb = self.resources.overlay_gib;
         record.allowed_cidrs = self.resources.allowed_cidrs.clone();
+        record.allowed_hosts = self.resources.allowed_hosts.clone();
         record.ephemeral = !self.persistent;
         record
     }

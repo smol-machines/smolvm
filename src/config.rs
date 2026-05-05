@@ -445,10 +445,13 @@ pub struct VmRecord {
     #[serde(default)]
     pub ssh_agent: bool,
 
-    /// Hostnames for DNS filtering. When set, the guest DNS proxy filters
-    /// queries against this allowlist.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dns_filter_hosts: Option<Vec<String>>,
+    /// Allowed egress hostnames.
+    #[serde(
+        default,
+        alias = "dns_filter_hosts",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub allowed_hosts: Option<Vec<String>>,
 
     /// True for `machine run` VMs. Auto-deleted on exit or cleanup sweep.
     #[serde(default)]
@@ -510,7 +513,7 @@ impl VmRecord {
             health_retries: None,
             health_startup_grace_secs: None,
             ssh_agent: false,
-            dns_filter_hosts: None,
+            allowed_hosts: None,
             ephemeral: false,
             source_smolmachine: None,
         }
@@ -557,7 +560,7 @@ impl VmRecord {
             health_retries: None,
             health_startup_grace_secs: None,
             ssh_agent: false,
-            dns_filter_hosts: None,
+            allowed_hosts: None,
             ephemeral: false,
             source_smolmachine: None,
         }
@@ -620,6 +623,7 @@ impl VmRecord {
             storage_gib: self.storage_gb,
             overlay_gib: self.overlay_gb,
             allowed_cidrs: self.allowed_cidrs.clone(),
+            allowed_hosts: self.allowed_hosts.clone(),
         }
     }
 }
@@ -899,6 +903,45 @@ mod tests {
         assert_eq!(resources.memory_mib, 1024);
         assert_eq!(resources.storage_gib, Some(50));
         assert_eq!(resources.overlay_gib, Some(20));
+    }
+
+    #[test]
+    fn test_vm_record_allowed_hosts_flow_to_resources() {
+        let mut record = VmRecord::new("test-vm".to_string(), 2, 1024, vec![], vec![], true);
+        record.allowed_cidrs = Some(vec!["10.0.0.0/8".to_string()]);
+        record.allowed_hosts = Some(vec!["example.com".to_string()]);
+
+        let json = serde_json::to_vec(&record).unwrap();
+        let deserialized: VmRecord = serde_json::from_slice(&json).unwrap();
+        let resources = deserialized.vm_resources();
+
+        assert_eq!(
+            resources.allowed_cidrs,
+            Some(vec!["10.0.0.0/8".to_string()])
+        );
+        assert_eq!(
+            resources.allowed_hosts,
+            Some(vec!["example.com".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_vm_record_accepts_legacy_dns_filter_hosts_alias() {
+        let mut record = VmRecord::new("test-vm".to_string(), 2, 1024, vec![], vec![], true);
+        record.allowed_hosts = Some(vec!["example.com".to_string()]);
+        let mut json = serde_json::to_value(&record).unwrap();
+        let hosts = json
+            .as_object_mut()
+            .unwrap()
+            .remove("allowed_hosts")
+            .unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .insert("dns_filter_hosts".to_string(), hosts);
+
+        let record: VmRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(record.allowed_hosts, Some(vec!["example.com".to_string()]));
+        assert_eq!(record.vm_resources().allowed_hosts, record.allowed_hosts);
     }
 
     #[test]

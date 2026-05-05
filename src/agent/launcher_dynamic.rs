@@ -72,7 +72,6 @@ pub fn launch_agent_vm_dynamic(
 ) -> Result<(), String> {
     crate::network::validate_requested_network_backend(
         &config.resources,
-        None,
         config.port_mappings.len(),
     )
     .map_err(|e| e.to_string())?;
@@ -178,7 +177,7 @@ pub fn launch_agent_vm_dynamic(
         free_ctx_on_err!("krun_set_root failed");
     }
 
-    let network_plan = plan_launch_network(&config.resources, None, config.port_mappings.len());
+    let network_plan = plan_launch_network(&config.resources, config.port_mappings.len());
     if let Some(reason) = network_plan.fallback_reason {
         tracing::warn!(reason = %reason.user_message(), "network backend fell back to TSI");
     }
@@ -219,28 +218,49 @@ pub fn launch_agent_vm_dynamic(
                 free_ctx_on_err!("krun_set_port_map failed");
             }
 
-            if let Some(ref cidrs) = config.resources.allowed_cidrs {
-                if !cidrs.is_empty() {
-                    let set_egress = krun.set_egress_policy.ok_or_else(|| {
-                        "libkrun does not support egress policy (krun_set_egress_policy not found). \
-                         Update libkrun or remove --allow-cidr flags."
-                            .to_string()
-                    })?;
+            let allowed_hosts = config.resources.allowed_hosts.as_deref().unwrap_or(&[]);
+            let has_host_policy = config.resources.allowed_hosts.is_some();
+            if config.resources.allowed_cidrs.is_some() || has_host_policy {
+                let cidrs = config.resources.allowed_cidrs.clone().unwrap_or_default();
+                let set_egress = krun.set_egress_policy.ok_or_else(|| {
+                    "libkrun does not support egress policy (krun_set_egress_policy not found). \
+                     Update libkrun or remove --allow-cidr/--allow-host flags."
+                        .to_string()
+                })?;
 
-                    let mut all_cidrs = cidrs.clone();
+                let mut all_cidrs = cidrs;
+                if !has_host_policy {
                     crate::data::network::ensure_dns_in_cidrs(&mut all_cidrs);
+                }
 
-                    let cidr_cstrings: Vec<CString> = all_cidrs
-                        .iter()
-                        .map(|c| CString::new(c.as_str()).expect("CIDR cannot contain null bytes"))
-                        .collect();
-                    let mut cidr_ptrs: Vec<*const libc::c_char> =
-                        cidr_cstrings.iter().map(|s| s.as_ptr()).collect();
-                    cidr_ptrs.push(std::ptr::null());
+                let cidr_cstrings: Vec<CString> = all_cidrs
+                    .iter()
+                    .map(|c| CString::new(c.as_str()).expect("CIDR cannot contain null bytes"))
+                    .collect();
+                let mut cidr_ptrs: Vec<*const libc::c_char> =
+                    cidr_cstrings.iter().map(|s| s.as_ptr()).collect();
+                cidr_ptrs.push(std::ptr::null());
+                let cidr_arg = if config.resources.allowed_cidrs.is_some() {
+                    cidr_ptrs.as_ptr()
+                } else {
+                    std::ptr::null()
+                };
 
-                    if unsafe { (set_egress)(ctx, cidr_ptrs.as_ptr()) } < 0 {
-                        free_ctx_on_err!("krun_set_egress_policy failed");
-                    }
+                let host_cstrings: Vec<CString> = allowed_hosts
+                    .iter()
+                    .map(|h| CString::new(h.as_str()).expect("hostname cannot contain null bytes"))
+                    .collect();
+                let mut host_ptrs: Vec<*const libc::c_char> =
+                    host_cstrings.iter().map(|s| s.as_ptr()).collect();
+                host_ptrs.push(std::ptr::null());
+                let host_arg = if has_host_policy {
+                    host_ptrs.as_ptr()
+                } else {
+                    std::ptr::null()
+                };
+
+                if unsafe { (set_egress)(ctx, cidr_arg, host_arg, std::ptr::null()) } < 0 {
+                    free_ctx_on_err!("krun_set_egress_policy failed");
                 }
             }
 

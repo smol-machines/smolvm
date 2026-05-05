@@ -25,14 +25,6 @@ use std::path::{Path, PathBuf};
 
 use super::{KrunFunctions, PortMapping, VmResources};
 
-/// Maximum number of CIDR entries held in the live egress allow-list.
-/// Protects the muxer's per-packet O(n) scan from unbounded growth when
-/// a host resolves to many IPs across many refresh cycles.
-const EGRESS_CIDR_CAP: usize = 512;
-
-/// The Arc type shared between the egress-refresh thread and libkrun's vsock muxer.
-type EgressArc = std::sync::Arc<std::sync::RwLock<Vec<(std::net::IpAddr, u8)>>>;
-
 /// Disks to attach to the agent VM.
 pub struct VmDisks<'a> {
     /// Storage disk for OCI layers (/dev/vda in guest).
@@ -88,7 +80,7 @@ pub fn find_lib_dir() -> Option<PathBuf> {
 /// It should be called in the child process after fork, where
 /// DYLD_LIBRARY_PATH is still available for dlopen to find libkrunfw.
 ///
-/// Optional features for VM launch (SSH agent, DNS filtering, etc.).
+/// Optional features for VM launch (SSH agent, packed layers, etc.).
 ///
 /// Groups optional capabilities that don't affect core VM operation.
 /// New features should be added here rather than as additional parameters
@@ -97,9 +89,6 @@ pub fn find_lib_dir() -> Option<PathBuf> {
 pub struct LaunchFeatures {
     /// Host SSH agent socket path for forwarding into the guest.
     pub ssh_agent_socket: Option<std::path::PathBuf>,
-    /// Hostnames for DNS filtering. When set, the host starts a DNS filter
-    /// listener and the guest agent proxies DNS queries through it.
-    pub dns_filter_hosts: Option<Vec<String>>,
     /// Pre-extracted OCI layer directory for machines created from .smolmachine.
     /// When set, the launcher mounts this directory via virtiofs so the agent
     /// can use pre-extracted layers instead of pulling from a registry.
@@ -127,23 +116,11 @@ pub struct LaunchConfig<'a> {
     pub resources: VmResources,
     /// Host SSH agent socket path for forwarding into the guest.
     pub ssh_agent_socket: Option<&'a Path>,
-    /// Host DNS filter socket path. When set, the guest DNS proxy forwards
-    /// queries over vsock to this socket for filtering.
-    pub dns_filter_socket: Option<&'a Path>,
     /// Pre-extracted OCI layers directory for .smolmachine-sourced machines.
     /// Mounted via virtiofs as "smolvm_layers" so the agent uses packed layers.
     pub packed_layers_dir: Option<&'a Path>,
     /// Additional disk images (path, read_only). Appear as /dev/vdc, /dev/vdd, ...
     pub extra_disks: &'a [(std::path::PathBuf, bool)],
-    /// Whether DNS filtering was configured for this launch, even if the
-    /// host-side proxy socket could not be created.
-    pub dns_filter_enabled: bool,
-    /// Hostnames to periodically re-resolve for the live egress policy.
-    /// When set, a background thread re-resolves these every 5 minutes and
-    /// atomically replaces the CIDR list via the Arc handle obtained from
-    /// libkrun. This keeps the egress allow-list accurate for long-running VMs
-    /// hitting CDN-backed hosts whose IPs rotate.
-    pub egress_refresh_hosts: Option<Vec<String>>,
 }
 
 /// Launch the agent VM using libkrun.
@@ -159,14 +136,11 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         port_mappings,
         resources,
         ssh_agent_socket,
-        dns_filter_socket,
         packed_layers_dir,
         extra_disks,
-        dns_filter_enabled,
-        egress_refresh_hosts,
     } = config;
 
-    crate::network::validate_requested_network_backend(resources, None, port_mappings.len())?;
+    crate::network::validate_requested_network_backend(resources, port_mappings.len())?;
 
     // Raise file descriptor limits
     raise_fd_limits();
@@ -279,7 +253,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             return Err(Error::agent("set rootfs", "krun_set_root failed"));
         }
 
-        let network_plan = select_network_plan(resources, *dns_filter_enabled, port_mappings.len());
+        let network_plan = plan_launch_network(resources, port_mappings.len());
         if let Some(reason) = network_plan.fallback_reason {
             tracing::warn!(reason = %reason.user_message(), "network backend fell back to TSI");
         }
@@ -334,18 +308,23 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     return Err(Error::agent("set port mapping", "krun_set_port_map failed"));
                 }
 
-                if let Some(ref cidrs) = resources.allowed_cidrs {
+                let allowed_hosts = resources.allowed_hosts.as_deref().unwrap_or(&[]);
+                let has_host_policy = resources.allowed_hosts.is_some();
+
+                if resources.allowed_cidrs.is_some() || has_host_policy {
                     let Some(set_egress) = krun.set_egress_policy else {
                         krun_free_ctx(ctx);
                         return Err(Error::agent(
                             "set egress policy",
                             "libkrun does not support egress policy (krun_set_egress_policy not found). \
-                             Update libkrun or remove --allow-cidr flags.",
+                             Update libkrun or remove --allow-cidr/--allow-host flags.",
                         ));
                     };
 
-                    let mut all_cidrs = cidrs.clone();
-                    crate::data::network::ensure_dns_in_cidrs(&mut all_cidrs);
+                    let mut all_cidrs = resources.allowed_cidrs.clone().unwrap_or_default();
+                    if !has_host_policy {
+                        crate::data::network::ensure_dns_in_cidrs(&mut all_cidrs);
+                    }
 
                     let cidr_cstrings: Vec<CString> = all_cidrs
                         .iter()
@@ -354,14 +333,41 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     let mut cidr_ptrs: Vec<*const libc::c_char> =
                         cidr_cstrings.iter().map(|s| s.as_ptr()).collect();
                     cidr_ptrs.push(std::ptr::null());
+                    let cidr_arg = if resources.allowed_cidrs.is_some() {
+                        cidr_ptrs.as_ptr()
+                    } else {
+                        std::ptr::null()
+                    };
 
-                    if set_egress(ctx, cidr_ptrs.as_ptr()) < 0 {
+                    let mut host_cstrings = Vec::with_capacity(allowed_hosts.len());
+                    for host in allowed_hosts {
+                        host_cstrings.push(try_or_free_ctx!(
+                            CString::new(host.as_str()),
+                            "set egress policy",
+                            "hostname contains null byte"
+                        ));
+                    }
+                    let mut host_ptrs: Vec<*const libc::c_char> =
+                        host_cstrings.iter().map(|s| s.as_ptr()).collect();
+                    host_ptrs.push(std::ptr::null());
+                    let host_arg = if has_host_policy {
+                        host_ptrs.as_ptr()
+                    } else {
+                        std::ptr::null()
+                    };
+
+                    if set_egress(ctx, cidr_arg, host_arg, std::ptr::null()) < 0 {
                         krun_free_ctx(ctx);
                         return Err(Error::agent(
                             "set egress policy",
                             "krun_set_egress_policy failed",
                         ));
                     }
+
+                    tracing::info!(
+                        host_count = allowed_hosts.len(),
+                        "libkrun egress policy set"
+                    );
                 }
 
                 tracing::info!("network backend: tsi");
@@ -511,21 +517,6 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             }
         }
 
-        // Add vsock port for DNS filter proxy (optional)
-        if let Some(dns_socket) = dns_filter_socket {
-            let dns_path = try_or_free_ctx!(
-                path_to_cstring(dns_socket),
-                "add dns filter vsock port",
-                "path contains null byte"
-            );
-            // listen=false: guest connects out to this port, host listens via Unix socket
-            if krun_add_vsock_port2(ctx, ports::DNS_FILTER, dns_path.as_ptr(), false) < 0 {
-                tracing::warn!("failed to add DNS filter vsock port — DNS filtering disabled");
-            } else {
-                tracing::info!("DNS filtering enabled on vsock port {}", ports::DNS_FILTER);
-            }
-        }
-
         // Set console output if specified
         if let Some(log_path) = console_log {
             let console_path = try_or_free_ctx!(
@@ -644,11 +635,6 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             }
         }
 
-        // Tell the agent to start DNS filtering proxy
-        if dns_filter_socket.is_some() {
-            env_strings.push(cstr(&format!("{}=1", guest_env::DNS_FILTER)));
-        }
-
         if let Some(network) = guest_network {
             env_strings.push(cstr(&format!(
                 "{}={}",
@@ -697,81 +683,6 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             return Err(Error::agent("set exec command", "krun_set_exec failed"));
         }
 
-        // Egress CIDR live-refresh thread.
-        //
-        // Re-resolves DNS filter hostnames every SMOLVM_EGRESS_REFRESH_SECS
-        // (default 5 min) and atomically replaces the Arc<RwLock<Vec<...>>>
-        // that the vsock muxer reads on every packet. The Arc is borrowed from
-        // libkrun via `krun_get_egress_handle` — see libkrun/src/libkrun/src/lib.rs.
-        //
-        // Each cycle: resolve all hosts → build fresh list → single write-lock
-        // swap. If all hosts fail to resolve, the previous list is kept intact.
-        if let Some(hosts) = egress_refresh_hosts.as_ref().filter(|h| !h.is_empty()) {
-            if let Some(krun_get_egress_handle) = krun.get_egress_handle {
-                let raw_handle = krun_get_egress_handle(ctx);
-
-                if !raw_handle.is_null() {
-                    let arc: EgressArc = *Box::from_raw(raw_handle as *mut EgressArc);
-                    let hosts_copy = hosts.clone();
-                    if let Err(e) = std::thread::Builder::new()
-                        .name("egress-refresh".into())
-                        .spawn(move || {
-                            let refresh_secs: u64 = std::env::var("SMOLVM_EGRESS_REFRESH_SECS")
-                                .ok()
-                                .and_then(|s| s.parse().ok())
-                                .unwrap_or(5 * 60);
-                            let refresh_interval = std::time::Duration::from_secs(refresh_secs);
-                            loop {
-                                std::thread::sleep(refresh_interval);
-                                // Resolve all hosts into a fresh list, then swap
-                                // the shared Vec in a single write-lock acquisition.
-                                // This ensures old rotated-away IPs are removed.
-                                let mut fresh: Vec<(std::net::IpAddr, u8)> = Vec::new();
-                                'hosts: for host in &hosts_copy {
-                                    match resolve_host_subprocess(host) {
-                                        Ok(new_cidrs) => {
-                                            for cidr_str in new_cidrs {
-                                                if fresh.len() >= EGRESS_CIDR_CAP {
-                                                    break 'hosts;
-                                                }
-                                                if let Some((ip_str, prefix_str)) =
-                                                    cidr_str.split_once('/')
-                                                {
-                                                    if let (Ok(ip), Ok(prefix)) = (
-                                                        ip_str.parse::<std::net::IpAddr>(),
-                                                        prefix_str.parse::<u8>(),
-                                                    ) {
-                                                        if !fresh.contains(&(ip, prefix)) {
-                                                            fresh.push((ip, prefix));
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                host = %host,
-                                                error = %e,
-                                                "egress-refresh: resolve failed"
-                                            );
-                                        }
-                                    }
-                                }
-                                // Only replace if at least one host resolved
-                                // successfully; keeps the old list on total failure.
-                                if !fresh.is_empty() {
-                                    let mut guard = arc.write().unwrap_or_else(|e| e.into_inner());
-                                    *guard = fresh;
-                                }
-                            }
-                        })
-                    {
-                        tracing::warn!(error = %e, "egress-refresh spawn failed");
-                    }
-                }
-            }
-        }
-
         // Start VM (this replaces the process on success)
         let ret = krun_start_enter(ctx);
 
@@ -806,77 +717,11 @@ fn create_unix_stream_pair() -> std::io::Result<(RawFd, RawFd)> {
     Ok((fds[0], fds[1]))
 }
 
-fn select_network_plan(
-    resources: &VmResources,
-    dns_filter_enabled: bool,
-    port_count: usize,
-) -> crate::network::LaunchNetworkPlan {
-    let dns_filter_placeholder = [String::from("configured")];
-    let dns_filter_hosts = dns_filter_enabled.then_some(dns_filter_placeholder.as_slice());
-    plan_launch_network(resources, dns_filter_hosts, port_count)
-}
-
 fn format_mac(mac: [u8; 6]) -> String {
     format!(
         "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
     )
-}
-
-/// Resolve a hostname to /32 CIDR strings for the egress-refresh thread.
-///
-/// ## Why not `getaddrinfo`?
-///
-/// The `egress-refresh` thread runs inside the `_boot-vm` subprocess. Before
-/// `krun_start_enter` is called, `internal_boot.rs` closes every inherited FD
-/// from 3 up to `max_fd`. Apple's Network framework maps shared memory at
-/// process launch and accesses it via FD-derived handles. After the mass close,
-/// those handles are invalid, so any call to `getaddrinfo` (which routes
-/// through the Network framework on macOS) crashes with SIGBUS at
-/// `_os_log_preferences_refresh` inside `nw_path_libinfo_path_check`.
-///
-/// Spawning an external `dig` process sidesteps this: `exec()` gives the child
-/// a completely fresh address space, so it never touches the broken inherited
-/// shared memory. On non-macOS platforms `getaddrinfo` via glibc is safe and
-/// is used directly.
-#[cfg(target_os = "macos")]
-#[inline(never)]
-fn resolve_host_subprocess(host: &str) -> std::result::Result<Vec<String>, String> {
-    // `/usr/bin/dig` is always present on macOS (part of BIND-tools in the
-    // base system). `+short` prints one result per line (IPs and CNAMEs);
-    // `+timeout=5 +tries=2` keeps the refresh loop from stalling the VM on
-    // a flaky network.
-    let output = std::process::Command::new("/usr/bin/dig")
-        .args(["+short", "+timeout=5", "+tries=2", host])
-        .output()
-        .map_err(|e| format!("dig subprocess failed for '{}': {}", host, e))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // `+short` emits CNAMEs (ending in '.') interleaved with IPs; parse::<IpAddr>
-    // silently skips the CNAME lines, leaving only valid addresses.
-    let cidrs: Vec<String> = stdout
-        .lines()
-        .filter_map(|line| {
-            line.trim()
-                .parse::<std::net::IpAddr>()
-                .ok()
-                .map(|ip| format!("{}/32", ip))
-        })
-        .collect();
-
-    if cidrs.is_empty() {
-        return Err(format!("dig resolved '{}' to no IP addresses", host));
-    }
-    Ok(cidrs)
-}
-
-/// On non-macOS (Linux), `getaddrinfo` is safe to call from background threads
-/// in child processes — glibc does not use shared-memory handles that become
-/// invalid after a mass FD close. Delegate directly to the standard resolver.
-#[cfg(not(target_os = "macos"))]
-#[inline(never)]
-fn resolve_host_subprocess(host: &str) -> std::result::Result<Vec<String>, String> {
-    crate::smolfile::resolve_host_to_cidrs(host)
 }
 
 /// Raise file descriptor limits (required by libkrun).

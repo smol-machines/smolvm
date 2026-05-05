@@ -46,6 +46,9 @@ pub struct VmResources {
     /// Allowed egress CIDR ranges. None = unrestricted, Some([]) = deny all.
     #[serde(default)]
     pub allowed_cidrs: Option<Vec<String>>,
+    /// Allowed egress hostnames. None = no hostname policy, Some([]) = deny all hostnames.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_hosts: Option<Vec<String>>,
 }
 
 /// Minimum memory required for the VM to boot (kernel + agent).
@@ -97,6 +100,7 @@ impl Default for VmResources {
             storage_gib: None,
             overlay_gib: None,
             allowed_cidrs: None,
+            allowed_hosts: None,
         }
     }
 }

@@ -2,7 +2,7 @@
 //!
 //! Re-exports all types and parsing from the standalone [`smolfile`] crate,
 //! plus smolvm-specific helpers (file loading with smolvm error types,
-//! network policy resolution).
+//! CIDR validation).
 //!
 //! See the [`smolfile`] crate documentation for the full Smolfile specification.
 
@@ -26,41 +26,6 @@ pub fn load(path: &Path) -> crate::Result<Smolfile> {
 // ============================================================================
 // Network helpers (smolvm-specific, depend on ipnet and std::net)
 // ============================================================================
-
-/// Resolve a hostname to IP addresses and return as /32 CIDRs.
-///
-/// Resolution happens on the host at VM start time. Rejects hostnames with
-/// `:port` suffixes — port filtering is not supported by the TSI egress policy.
-pub fn resolve_host_to_cidrs(host: &str) -> Result<Vec<String>, String> {
-    use std::net::{IpAddr, ToSocketAddrs};
-
-    // Reject host:port syntax
-    if host.contains(':') {
-        return Err(format!(
-            "invalid hostname '{}': port suffixes are not supported. \
-             Use the hostname only (all ports are allowed to resolved IPs).",
-            host
-        ));
-    }
-
-    // Try parsing as bare IP first
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return Ok(vec![format!("{}/32", ip)]);
-    }
-
-    // Resolve hostname
-    let addrs: Vec<String> = format!("{}:0", host)
-        .to_socket_addrs()
-        .map_err(|e| format!("failed to resolve '{}': {}", host, e))?
-        .map(|addr| format!("{}/32", addr.ip()))
-        .collect();
-
-    if addrs.is_empty() {
-        return Err(format!("'{}' resolved to no addresses", host));
-    }
-
-    Ok(addrs)
-}
 
 /// Parse and validate a CIDR specification (e.g., `"10.0.0.0/8"`, `"1.1.1.1"`).
 ///
@@ -89,18 +54,6 @@ pub fn parse_cidr(s: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn resolve_host_bare_ip() {
-        let cidrs = resolve_host_to_cidrs("1.2.3.4").unwrap();
-        assert_eq!(cidrs, vec!["1.2.3.4/32"]);
-    }
-
-    #[test]
-    fn resolve_host_rejects_port_suffix() {
-        let err = resolve_host_to_cidrs("example.com:443").unwrap_err();
-        assert!(err.contains("port suffixes are not supported"), "{}", err);
-    }
 
     #[test]
     fn parse_cidr_valid() {

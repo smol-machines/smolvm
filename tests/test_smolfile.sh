@@ -1258,19 +1258,20 @@ net = true
 
 [network]
 allow_hosts = ["one.one.one.one"]
+allow_cidrs = ["1.1.1.1/32"]
 EOF
 
     # Create VM from Smolfile with [network] section
     $SMOLVM machine create "$vm_name" -s "$SMOLFILE_TMPDIR/network.smolfile" 2>&1 || return 1
     $SMOLVM machine start --name "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
 
-    # Allowed host's IP should be reachable
+    # Allowed hostname should resolve through the configured resolver.
     local exit_code_allowed=0
-    $SMOLVM machine exec --name "$vm_name" -- nslookup cloudflare.com 1.1.1.1 2>&1 || exit_code_allowed=$?
+    $SMOLVM machine exec --name "$vm_name" -- nslookup one.one.one.one 1.1.1.1 2>&1 || exit_code_allowed=$?
 
-    # Non-allowed IP should be blocked
+    # Non-allowed hostname should be filtered as NXDOMAIN.
     local exit_code_blocked=0
-    $SMOLVM machine exec --name "$vm_name" -- nslookup cloudflare.com 8.8.8.8 2>&1 || exit_code_blocked=$?
+    $SMOLVM machine exec --name "$vm_name" -- nslookup cloudflare.com 1.1.1.1 2>&1 || exit_code_blocked=$?
 
     cleanup_vm "$vm_name"
 
@@ -1313,22 +1314,27 @@ net = true
 
 [network]
 allow_hosts = ["one.one.one.one"]
-allow_cidrs = ["8.8.8.0/24"]
+allow_cidrs = ["1.1.1.1/32", "8.8.8.0/24"]
 EOF
 
     $SMOLVM machine create "$vm_name" -s "$SMOLFILE_TMPDIR/network-mixed.smolfile" 2>&1 || return 1
     $SMOLVM machine start --name "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
 
-    # Both should be reachable
+    # Host policy allows one.one.one.one through the default resolver.
     local exit_code_host=0
-    $SMOLVM machine exec --name "$vm_name" -- nslookup cloudflare.com 1.1.1.1 2>&1 || exit_code_host=$?
+    $SMOLVM machine exec --name "$vm_name" -- nslookup one.one.one.one 1.1.1.1 2>&1 || exit_code_host=$?
 
+    # CIDR policy also allows the alternate resolver.
     local exit_code_cidr=0
-    $SMOLVM machine exec --name "$vm_name" -- nslookup cloudflare.com 8.8.8.8 2>&1 || exit_code_cidr=$?
+    $SMOLVM machine exec --name "$vm_name" -- nslookup one.one.one.one 8.8.8.8 2>&1 || exit_code_cidr=$?
+
+    # Host filtering still rejects names outside allow_hosts.
+    local exit_code_blocked=0
+    $SMOLVM machine exec --name "$vm_name" -- nslookup cloudflare.com 8.8.8.8 2>&1 || exit_code_blocked=$?
 
     cleanup_vm "$vm_name"
 
-    [[ $exit_code_host -eq 0 ]] && [[ $exit_code_cidr -eq 0 ]]
+    [[ $exit_code_host -eq 0 ]] && [[ $exit_code_cidr -eq 0 ]] && [[ $exit_code_blocked -ne 0 ]]
 }
 
 echo ""
