@@ -42,6 +42,11 @@ impl RegistryClient {
         }
     }
 
+    /// Return the base URL this client is configured for.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     /// Set a Bearer token for authenticated requests.
     pub fn with_token(mut self, token: String) -> Self {
         self.auth_token = Some(token);
