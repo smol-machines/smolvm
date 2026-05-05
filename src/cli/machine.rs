@@ -1275,8 +1275,7 @@ impl CreateCmd {
             (Some(from_manifest), None) => Some(from_manifest),
             (None, some) => some,
         };
-        let net =
-            cli_net || manifest.network || allowed_cidrs.is_some() || allowed_hosts.is_some();
+        let net = cli_net || manifest.network || allowed_cidrs.is_some() || allowed_hosts.is_some();
 
         let params = vm_common::CreateVmParams {
             name,

@@ -133,16 +133,15 @@ fn uptime_ms() -> u64 {
 }
 
 fn configure_resolv_conf() {
-    let resolv_conf = if std::env::var(guest_env::BACKEND).as_deref()
-        == Ok(guest_env::BACKEND_VIRTIO_NET)
-    {
-        match std::env::var(guest_env::DNS) {
-            Ok(dns_server) if !dns_server.is_empty() => format!("nameserver {}\n", dns_server),
-            _ => "nameserver 8.8.8.8\nnameserver 1.1.1.1\n".to_string(),
-        }
-    } else {
-        "nameserver 8.8.8.8\nnameserver 1.1.1.1\n".to_string()
-    };
+    let resolv_conf =
+        if std::env::var(guest_env::BACKEND).as_deref() == Ok(guest_env::BACKEND_VIRTIO_NET) {
+            match std::env::var(guest_env::DNS) {
+                Ok(dns_server) if !dns_server.is_empty() => format!("nameserver {}\n", dns_server),
+                _ => "nameserver 8.8.8.8\nnameserver 1.1.1.1\n".to_string(),
+            }
+        } else {
+            "nameserver 8.8.8.8\nnameserver 1.1.1.1\n".to_string()
+        };
 
     match std::fs::write("/etc/resolv.conf", resolv_conf) {
         Ok(()) => info!("guest resolv.conf configured"),

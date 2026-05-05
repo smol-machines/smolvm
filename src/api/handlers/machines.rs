@@ -320,10 +320,7 @@ pub async fn create_machine(
         (Some(from_manifest), None) => Some(from_manifest),
         (None, from_request) => from_request,
     };
-    let network = req.network
-        || manifest_net
-        || allowed_cidrs.is_some()
-        || allowed_hosts.is_some();
+    let network = req.network || manifest_net || allowed_cidrs.is_some() || allowed_hosts.is_some();
 
     // Reserve the name atomically (prevents concurrent creation)
     let guard = ReservationGuard::new(&state, name.clone())?;

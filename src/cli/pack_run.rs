@@ -1932,7 +1932,10 @@ mod tests {
         );
         assert_eq!(
             allowed_hosts,
-            Some(vec!["example.com".to_string(), "api.example.com".to_string()])
+            Some(vec![
+                "example.com".to_string(),
+                "api.example.com".to_string()
+            ])
         );
     }
 }

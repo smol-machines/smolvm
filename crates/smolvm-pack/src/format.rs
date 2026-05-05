@@ -563,7 +563,10 @@ mod tests {
         assert_eq!(restored.cpus, 2);
         assert_eq!(restored.mem, 1024);
         assert_eq!(restored.allowed_cidrs, Some(vec!["10.0.0.0/8".to_string()]));
-        assert_eq!(restored.allowed_hosts, Some(vec!["example.com".to_string()]));
+        assert_eq!(
+            restored.allowed_hosts,
+            Some(vec!["example.com".to_string()])
+        );
         assert_eq!(restored.entrypoint, vec!["/bin/sh"]);
         assert_eq!(restored.assets.libraries.len(), 1);
     }

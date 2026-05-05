@@ -915,8 +915,14 @@ mod tests {
         let deserialized: VmRecord = serde_json::from_slice(&json).unwrap();
         let resources = deserialized.vm_resources();
 
-        assert_eq!(resources.allowed_cidrs, Some(vec!["10.0.0.0/8".to_string()]));
-        assert_eq!(resources.allowed_hosts, Some(vec!["example.com".to_string()]));
+        assert_eq!(
+            resources.allowed_cidrs,
+            Some(vec!["10.0.0.0/8".to_string()])
+        );
+        assert_eq!(
+            resources.allowed_hosts,
+            Some(vec!["example.com".to_string()])
+        );
     }
 
     #[test]
@@ -924,7 +930,11 @@ mod tests {
         let mut record = VmRecord::new("test-vm".to_string(), 2, 1024, vec![], vec![], true);
         record.allowed_hosts = Some(vec!["example.com".to_string()]);
         let mut json = serde_json::to_value(&record).unwrap();
-        let hosts = json.as_object_mut().unwrap().remove("allowed_hosts").unwrap();
+        let hosts = json
+            .as_object_mut()
+            .unwrap()
+            .remove("allowed_hosts")
+            .unwrap();
         json.as_object_mut()
             .unwrap()
             .insert("dns_filter_hosts".to_string(), hosts);
