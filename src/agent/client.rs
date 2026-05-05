@@ -4,7 +4,8 @@
 //! and receiving responses.
 
 use crate::error::{Error, Result};
-use crate::registry::{extract_registry, rewrite_image_registry, RegistryAuth, RegistryConfig};
+use crate::registry::{extract_registry, rewrite_image_registry, RegistryAuth};
+use crate::settings::SmolSettings;
 use smolvm_protocol::{
     encode_message, AgentRequest, AgentResponse, Envelope, ImageInfo, OverlayInfo, StorageStatus,
     FILE_TRANSFER_MAX_TOTAL, FILE_WRITE_CHUNK_SIZE, FILE_WRITE_SINGLE_SHOT_MAX, MAX_FRAME_SIZE,
@@ -526,7 +527,7 @@ impl AgentClient {
     ) -> Result<ImageInfo> {
         // Resolve effective image and auth based on options
         let (effective_image, effective_auth) = if options.use_registry_config {
-            let registry_config = RegistryConfig::load().unwrap_or_default();
+            let registry_config = SmolSettings::load().unwrap_or_default().images;
             let registry = extract_registry(image);
 
             // Get credentials from config if not explicitly provided

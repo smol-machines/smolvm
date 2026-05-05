@@ -1286,8 +1286,8 @@ impl PackPushCmd {
 
         let parsed = smolvm::registry::Reference::parse(&self.reference)
             .map_err(|e| Error::agent("parse reference", e.to_string()))?;
-        let config = smolvm::registry::RegistryConfig::load()?;
-        let client = build_registry_client(&parsed.registry, &config)?;
+        let settings = smolvm::SmolSettings::load()?;
+        let client = build_registry_client(&parsed.registry, &settings.machines)?;
 
         let repo = parsed.repository();
         let tag = parsed.tag.as_deref().unwrap_or("latest");
@@ -1336,8 +1336,8 @@ impl PackPullCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let parsed = smolvm::registry::Reference::parse(&self.reference)
             .map_err(|e| Error::agent("parse reference", e.to_string()))?;
-        let config = smolvm::registry::RegistryConfig::load()?;
-        let client = build_registry_client(&parsed.registry, &config)?;
+        let settings = smolvm::SmolSettings::load()?;
+        let client = build_registry_client(&parsed.registry, &settings.machines)?;
 
         let repo = parsed.repository();
         let tag_or_digest = parsed
@@ -1401,8 +1401,8 @@ impl PackInspectCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let parsed = smolvm::registry::Reference::parse(&self.reference)
             .map_err(|e| Error::agent("parse reference", e.to_string()))?;
-        let config = smolvm::registry::RegistryConfig::load()?;
-        let client = build_registry_client(&parsed.registry, &config)?;
+        let settings = smolvm::SmolSettings::load()?;
+        let client = build_registry_client(&parsed.registry, &settings.machines)?;
 
         let repo = parsed.repository();
         let tag_or_digest = parsed

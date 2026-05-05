@@ -3,7 +3,7 @@
 //! Commands for managing smolvm configuration, including registry settings.
 
 use clap::{Args, Subcommand};
-use smolvm::registry::RegistryConfig;
+use smolvm::settings::SmolSettings;
 use smolvm::Result;
 
 /// Configuration commands
@@ -43,11 +43,11 @@ impl ShowCmd {
         println!("  Default Memory: {} MiB", config.default_mem);
         println!("  Default DNS: {}", config.default_dns);
 
-        // Load and display registry config
-        let registry_config = RegistryConfig::load().unwrap_or_default();
+        // Load and display unified settings
+        let settings = SmolSettings::load().unwrap_or_default();
         println!();
-        println!("Registry Configuration:");
-        if let Ok(path) = RegistryConfig::config_path() {
+        println!("Settings:");
+        if let Ok(path) = SmolSettings::config_path() {
             println!("  Config file: {}", path.display());
             if path.exists() {
                 println!("  Status: configured");
@@ -55,37 +55,45 @@ impl ShowCmd {
                 println!("  Status: not configured (using defaults)");
             }
         }
-        println!("  Default registry: {}", registry_config.default_registry());
-        println!(
-            "  Configured registries: {}",
-            registry_config.registries.len()
-        );
 
-        if !registry_config.registries.is_empty() {
-            println!();
-            println!("  Registries:");
-            for (name, entry) in &registry_config.registries {
-                let auth_status = if entry.username.is_some() {
-                    if entry.password_env.is_some() {
-                        "auth (env var)"
-                    } else if entry.password.is_some() {
-                        "auth (direct)"
-                    } else {
-                        "no password"
-                    }
-                } else {
-                    "no auth"
-                };
-                let mirror_status = entry
-                    .mirror
-                    .as_ref()
-                    .map(|m| format!(" -> {}", m))
-                    .unwrap_or_default();
-                println!("    {}: {}{}", name, auth_status, mirror_status);
-            }
+        println!();
+        println!("  [machines] (smolmachine artifact registries):");
+        println!("    Default: {}", settings.machines.default_registry());
+        println!("    Configured: {}", settings.machines.registries.len());
+        for (name, entry) in &settings.machines.registries {
+            let auth_status = format_auth_status(entry);
+            println!("      {}: {}", name, auth_status);
+        }
+
+        println!();
+        println!("  [images] (container image registries):");
+        println!("    Default: {}", settings.images.default_registry());
+        println!("    Configured: {}", settings.images.registries.len());
+        for (name, entry) in &settings.images.registries {
+            let auth_status = format_auth_status(entry);
+            let mirror_status = entry
+                .mirror
+                .as_ref()
+                .map(|m| format!(" -> {}", m))
+                .unwrap_or_default();
+            println!("      {}: {}{}", name, auth_status, mirror_status);
         }
 
         Ok(())
+    }
+}
+
+fn format_auth_status(entry: &smolvm::registry::RegistryEntry) -> &'static str {
+    if entry.username.is_some() {
+        if entry.password_env.is_some() {
+            "auth (env var)"
+        } else if entry.password.is_some() {
+            "auth (direct)"
+        } else {
+            "no password"
+        }
+    } else {
+        "no auth"
     }
 }
 
@@ -113,12 +121,12 @@ impl RegistriesCmd {
     pub fn run(self) -> Result<()> {
         match self {
             RegistriesCmd::Path => {
-                let path = RegistryConfig::config_path()?;
+                let path = SmolSettings::config_path()?;
                 println!("{}", path.display());
                 Ok(())
             }
             RegistriesCmd::Edit => {
-                let path = RegistryConfig::config_path()?;
+                let path = SmolSettings::config_path()?;
 
                 // Create parent directory if needed
                 if let Some(parent) = path.parent() {
@@ -143,11 +151,12 @@ impl RegistriesCmd {
                 }
 
                 // Validate the config after editing
-                match RegistryConfig::load() {
-                    Ok(config) => {
+                match SmolSettings::load() {
+                    Ok(settings) => {
                         println!(
-                            "Configuration valid: {} registries configured",
-                            config.registries.len()
+                            "Configuration valid: {} machine registries, {} image registries configured",
+                            settings.machines.registries.len(),
+                            settings.images.registries.len(),
                         );
                     }
                     Err(e) => {
@@ -158,11 +167,13 @@ impl RegistriesCmd {
                 Ok(())
             }
             RegistriesCmd::Show => {
-                let config = RegistryConfig::load().unwrap_or_default();
+                let settings = SmolSettings::load().unwrap_or_default();
+                let has_machines = !settings.machines.registries.is_empty();
+                let has_images = !settings.images.registries.is_empty();
 
-                if config.registries.is_empty() {
+                if !has_machines && !has_images {
                     println!("No registries configured.");
-                    if let Ok(path) = RegistryConfig::config_path() {
+                    if let Ok(path) = SmolSettings::config_path() {
                         println!();
                         println!("To configure registries, create: {}", path.display());
                         println!("Or run: smolvm config registries init");
@@ -170,39 +181,25 @@ impl RegistriesCmd {
                     return Ok(());
                 }
 
-                println!("Configured registries:");
-                println!();
-
-                for (name, entry) in &config.registries {
-                    println!("  [{}]", name);
-
-                    if let Some(ref username) = entry.username {
-                        println!("    username: {}", username);
-                    }
-
-                    if let Some(ref password_env) = entry.password_env {
-                        // Check if env var is set
-                        let status = if std::env::var(password_env).is_ok() {
-                            " (set)"
-                        } else {
-                            " (NOT SET)"
-                        };
-                        println!("    password_env: {}{}", password_env, status);
-                    } else if entry.password.is_some() {
-                        println!("    password: <configured>");
-                    }
-
-                    if let Some(ref mirror) = entry.mirror {
-                        println!("    mirror: {}", mirror);
-                    }
-
+                if has_machines {
+                    println!("[machines] (smolmachine artifact registries):");
                     println!();
+                    print_registry_entries(&settings.machines.registries);
+                }
+
+                if has_images {
+                    if has_machines {
+                        println!();
+                    }
+                    println!("[images] (container image registries):");
+                    println!();
+                    print_registry_entries(&settings.images.registries);
                 }
 
                 Ok(())
             }
             RegistriesCmd::Init => {
-                let path = RegistryConfig::config_path()?;
+                let path = SmolSettings::config_path()?;
 
                 if path.exists() {
                     eprintln!("Configuration file already exists at {}", path.display());
@@ -227,36 +224,70 @@ impl RegistriesCmd {
     }
 }
 
+fn print_registry_entries(
+    registries: &std::collections::HashMap<String, smolvm::registry::RegistryEntry>,
+) {
+    for (name, entry) in registries {
+        println!("  [{}]", name);
+
+        if let Some(ref username) = entry.username {
+            println!("    username: {}", username);
+        }
+
+        if let Some(ref password_env) = entry.password_env {
+            let status = if std::env::var(password_env).is_ok() {
+                " (set)"
+            } else {
+                " (NOT SET)"
+            };
+            println!("    password_env: {}{}", password_env, status);
+        } else if entry.password.is_some() {
+            println!("    password: <configured>");
+        }
+
+        if let Some(ref mirror) = entry.mirror {
+            println!("    mirror: {}", mirror);
+        }
+
+        println!();
+    }
+}
+
 /// Example configuration file content
-const EXAMPLE_CONFIG: &str = r#"# smolvm Registry Configuration
+const EXAMPLE_CONFIG: &str = r#"# smolvm Configuration
 #
-# This file configures authentication for OCI registries.
-# Location: ~/.config/smolvm/registries.toml
+# Location: ~/.config/smolvm/config.toml
+#
+# [cloud]        — smolcloud API settings
+# [machines]     — credentials for .smolmachine artifact registries
+# [images]       — credentials for container image registries (base images for VMs)
 #
 # For security, use password_env to reference environment variables
 # instead of storing passwords directly in this file.
 
-[defaults]
-# Default registry when none specified (default: docker.io)
+# [cloud]
+# endpoint = "https://api.smolmachines.com"
+# api_key = "smk_..."
+
+# [machines.defaults]
+# registry = "registry.smolmachines.com"
+
+# [machines.registries."registry.smolmachines.com"]
+# username = "token"
+# password = "your-jwt-token"
+
+# [images.defaults]
 # registry = "docker.io"
 
-# Docker Hub authentication
-# [registries."docker.io"]
+# [images.registries."docker.io"]
 # username = "your-username"
 # password_env = "DOCKER_HUB_TOKEN"  # Set: export DOCKER_HUB_TOKEN="your-token"
 
-# GitHub Container Registry
-# [registries."ghcr.io"]
+# [images.registries."ghcr.io"]
 # username = "your-github-username"
 # password_env = "GHCR_TOKEN"  # Set: export GHCR_TOKEN="your-pat"
 
-# Google Container Registry
-# [registries."gcr.io"]
-# username = "_json_key"
-# password_env = "GCR_KEY"  # Set: export GCR_KEY="$(cat key.json)"
-
-# Private registry with mirror
-# [registries."registry.example.com"]
+# [images.registries."registry.example.com"]
 # username = "user"
 # password_env = "REGISTRY_PASSWORD"
 # mirror = "mirror.example.com"  # Optional: pull from mirror instead
