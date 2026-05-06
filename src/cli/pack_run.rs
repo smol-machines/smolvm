@@ -8,7 +8,7 @@
 //!
 //! Both paths converge on the same VM launch infrastructure.
 
-use crate::cli::parsers::{mounts_to_virtiofs_bindings, parse_env_spec};
+use crate::cli::parsers::{mounts_to_virtiofs_bindings, parse_env_spec, resolve_egress_flags};
 use clap::{Args, Parser, Subcommand};
 use smolvm::agent::launcher_dynamic::{
     launch_agent_vm_dynamic, KrunFunctions, PackedLaunchConfig, PackedMount,
@@ -164,6 +164,14 @@ pub struct PackRunCmd {
     #[arg(long, help_heading = "Network")]
     pub net: bool,
 
+    /// Allow egress to specific CIDR range (implies --net)
+    #[arg(long = "allow-cidr", value_parser = crate::cli::parsers::parse_cidr, value_name = "CIDR", help_heading = "Network")]
+    pub allow_cidr: Vec<String>,
+
+    /// Allow egress to specific hostname, resolved at VM start (implies --net)
+    #[arg(long = "allow-host", value_name = "HOSTNAME", help_heading = "Network")]
+    pub allow_host: Vec<String>,
+
     /// Select the networking backend.
     #[arg(
         long = "net-backend",
@@ -305,16 +313,22 @@ impl PackRunCmd {
         let mounts = HostMount::parse(&self.volume)?;
         let port_mappings = PortMapping::to_tuples(&self.port);
 
+        let (allowed_cidrs, net, _dns_filter_hosts) = resolve_egress_flags(
+            self.allow_cidr.clone(),
+            self.allow_host.clone(),
+            false,
+            self.net || manifest.network || !self.port.is_empty(),
+        )?;
         let resources = VmResources {
             cpus: self.cpus.unwrap_or(manifest.cpus),
             memory_mib: self.mem.unwrap_or(manifest.mem),
-            network: self.net || manifest.network || !self.port.is_empty(),
+            network: net,
             network_backend: self.net_backend,
             gpu: manifest.gpu,
             storage_gib,
             overlay_gib: self.overlay,
             gpu_vram_mib: None,
-            allowed_cidrs: None,
+            allowed_cidrs: if allowed_cidrs.is_empty() { None } else { Some(allowed_cidrs) },
         };
         validate_requested_network_backend(&resources, None, self.port.len())?;
 
@@ -856,6 +870,14 @@ struct PackedRunArgs {
     #[arg(long)]
     net: bool,
 
+    /// Allow egress to specific CIDR range (implies --net)
+    #[arg(long = "allow-cidr", value_parser = crate::cli::parsers::parse_cidr, value_name = "CIDR")]
+    allow_cidr: Vec<String>,
+
+    /// Allow egress to specific hostname, resolved at VM start (implies --net)
+    #[arg(long = "allow-host", value_name = "HOSTNAME")]
+    allow_host: Vec<String>,
+
     /// Select the networking backend.
     #[arg(long = "net-backend", value_enum, hide = true)]
     net_backend: Option<NetworkBackend>,
@@ -907,6 +929,14 @@ struct PackedStartArgs {
     /// Enable outbound network access
     #[arg(long)]
     net: bool,
+
+    /// Allow egress to specific CIDR range (implies --net)
+    #[arg(long = "allow-cidr", value_parser = crate::cli::parsers::parse_cidr, value_name = "CIDR")]
+    allow_cidr: Vec<String>,
+
+    /// Allow egress to specific hostname, resolved at VM start (implies --net)
+    #[arg(long = "allow-host", value_name = "HOSTNAME")]
+    allow_host: Vec<String>,
 
     /// Select the networking backend.
     #[arg(long = "net-backend", value_enum, hide = true)]
@@ -1037,6 +1067,8 @@ fn run_ephemeral(
                 volume: args.volume,
                 port: args.port,
                 net: args.net,
+                allow_cidr: args.allow_cidr,
+                allow_host: args.allow_host,
                 net_backend: args.net_backend,
                 cpus: args.cpus,
                 mem: args.mem,
@@ -1162,16 +1194,22 @@ fn run_from_cache(
 
     let mounts = HostMount::parse(&args.volume)?;
     let port_mappings = PortMapping::to_tuples(&args.port);
+    let (allowed_cidrs, net, _dns_filter_hosts) = resolve_egress_flags(
+        args.allow_cidr.clone(),
+        args.allow_host.clone(),
+        false,
+        args.net || manifest.network || !args.port.is_empty(),
+    )?;
     let resources = VmResources {
         cpus: args.cpus.unwrap_or(manifest.cpus),
         memory_mib: args.mem.unwrap_or(manifest.mem),
-        network: args.net || manifest.network || !args.port.is_empty(),
+        network: net,
         network_backend: args.net_backend,
         gpu: manifest.gpu,
         storage_gib,
         overlay_gib: args.overlay,
         gpu_vram_mib: None,
-        allowed_cidrs: None,
+        allowed_cidrs: if allowed_cidrs.is_empty() { None } else { Some(allowed_cidrs) },
     };
     validate_requested_network_backend(&resources, None, args.port.len())?;
 
@@ -1487,16 +1525,22 @@ fn daemon_start(
     // Parse CLI args
     let mounts = HostMount::parse(&args.volume)?;
     let port_mappings = PortMapping::to_tuples(&args.port);
+    let (allowed_cidrs, net, _dns_filter_hosts) = resolve_egress_flags(
+        args.allow_cidr.clone(),
+        args.allow_host.clone(),
+        false,
+        args.net || manifest.network || !args.port.is_empty(),
+    )?;
     let resources = VmResources {
         cpus: args.cpus.unwrap_or(manifest.cpus),
         memory_mib: args.mem.unwrap_or(manifest.mem),
-        network: args.net || manifest.network || !args.port.is_empty(),
+        network: net,
         network_backend: args.net_backend,
         gpu: manifest.gpu,
         storage_gib,
         overlay_gib: args.overlay,
         gpu_vram_mib: None,
-        allowed_cidrs: None,
+        allowed_cidrs: if allowed_cidrs.is_empty() { None } else { Some(allowed_cidrs) },
     };
     validate_requested_network_backend(&resources, None, args.port.len())?;
 
