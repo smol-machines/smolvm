@@ -828,6 +828,107 @@ test_from_vm_image_overlay() {
 }
 
 # =============================================================================
+# Debian Pack Roundtrip (issue #235 regression)
+#
+# Debian's update-alternatives creates Char device entries in /etc/alternatives/
+# in the overlayfs upper layer. These entries caused safe_unpack() to abort
+# mid-stream, silently dropping files that appeared after the Char entry in the
+# tar. This test verifies the full round-trip:
+#   1. Create image-based VM with Debian image
+#   2. Install a package that triggers update-alternatives (creates Char entries)
+#   3. Write a test file
+#   4. Pack the VM
+#   5. Create a new machine from the pack
+#   6. Verify the test file survived (it appears after Char entries in the tar)
+# =============================================================================
+
+test_from_vm_debian_roundtrip() {
+    local vm_name="debian-pack-$$"
+    local from_name="debian-from-$$"
+    local pack_output="$TEST_DIR/test-debian-roundtrip"
+
+    # Cleanup any leftovers
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine stop --name "$from_name" 2>/dev/null || true
+    $SMOLVM machine delete "$from_name" -f 2>/dev/null || true
+
+    # 1. Create a Debian-based VM
+    echo "  Step 1: Creating Debian VM..."
+    $SMOLVM machine create "$vm_name" --image python:3.12-slim --net 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || {
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+    }
+
+    # 2. Install a package that creates Char entries via update-alternatives
+    echo "  Step 2: Installing man-db (creates Char entries in /etc/alternatives/)..."
+    $SMOLVM machine exec --name "$vm_name" -- \
+        bash -c "apt-get update -qq && apt-get install -y -qq man-db >/dev/null 2>&1" || {
+        echo "FAIL: apt-get install failed"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+    }
+
+    # 3. Write a test file (appears late in tar stream — after Char entries)
+    echo "  Step 3: Writing test marker..."
+    $SMOLVM machine exec --name "$vm_name" -- \
+        bash -c "echo 'debian-roundtrip-ok' > /test-marker.txt"
+
+    local content
+    content=$($SMOLVM machine exec --name "$vm_name" -- cat /test-marker.txt 2>&1)
+    [[ "$content" == *"debian-roundtrip-ok"* ]] || {
+        echo "FAIL: test marker not written (got: '$content')"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+    }
+
+    # 4. Stop and pack
+    echo "  Step 4: Packing VM..."
+    $SMOLVM machine stop --name "$vm_name" 2>&1
+    $SMOLVM pack create --from-vm "$vm_name" -o "$pack_output" 2>&1 || {
+        echo "FAIL: pack create --from-vm failed"
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+    }
+
+    # 5. Create a new machine from the pack
+    echo "  Step 5: Creating machine from pack..."
+    $SMOLVM machine create "$from_name" --from "$pack_output.smolmachine" 2>&1 || {
+        echo "FAIL: machine create --from failed (this was the #235 bug)"
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+    }
+    $SMOLVM machine start --name "$from_name" 2>&1 || {
+        echo "FAIL: machine start failed"
+        $SMOLVM machine delete "$from_name" -f 2>/dev/null
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+    }
+
+    # 6. Verify test file survived the roundtrip
+    echo "  Step 6: Verifying test marker survived..."
+    local result
+    result=$($SMOLVM machine exec --name "$from_name" -- cat /test-marker.txt 2>&1) || {
+        echo "FAIL: test marker missing after roundtrip (this was the #235 data loss)"
+        $SMOLVM machine stop --name "$from_name" 2>/dev/null
+        $SMOLVM machine delete "$from_name" -f 2>/dev/null
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+    }
+
+    [[ "$result" == *"debian-roundtrip-ok"* ]] || {
+        echo "FAIL: test marker content mismatch (got: '$result')"
+        $SMOLVM machine stop --name "$from_name" 2>/dev/null
+        $SMOLVM machine delete "$from_name" -f 2>/dev/null
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+    }
+
+    echo "  Test marker survived Debian pack/unpack roundtrip"
+
+    # Cleanup
+    $SMOLVM machine stop --name "$from_name" 2>/dev/null || true
+    $SMOLVM machine delete "$from_name" -f 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    rm -f "$pack_output" "$pack_output.smolmachine"
+}
+
+# =============================================================================
 # Case-Insensitive Collision Test (macOS regression)
 #
 # Regression test for macOS case-insensitive APFS. Linux OCI layers may
@@ -1230,6 +1331,12 @@ if [[ "$QUICK_MODE" != "true" ]]; then
     echo ""
 
     run_test "from-vm-image: container overlay captured" test_from_vm_image_overlay || true
+
+    echo ""
+    echo "Running Debian Pack Roundtrip Tests (issue #235)..."
+    echo ""
+
+    run_test "from-vm-debian: Char device entries don't break extraction" test_from_vm_debian_roundtrip || true
 fi
 
 # =============================================================================

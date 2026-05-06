@@ -73,6 +73,13 @@ fn safe_unpack<R: Read>(archive: &mut tar::Archive<R>, dest: &Path) -> std::io::
                     }
                 }
             }
+            tar::EntryType::Char | tar::EntryType::Block => {
+                // Device nodes appear in overlayfs upper-layer exports from
+                // Debian-based images (e.g., update-alternatives creates char
+                // entries in /etc/alternatives/). These cannot be created
+                // without root and aren't needed on the host — skip them.
+                continue;
+            }
             other => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -283,7 +290,17 @@ pub fn extract_sidecar(
         let _ = fs::remove_dir_all(cache_dir);
     }
 
-    extract_sidecar_inner(sidecar_path, cache_dir, footer, debug)
+    let result = extract_sidecar_inner(sidecar_path, cache_dir, footer, debug);
+
+    // If extraction failed mid-stream, partially extracted files remain on
+    // disk without a completion marker. Subsequent retries hit the same
+    // error at the same tar entry, never completing. Clean up the partial
+    // directory so the next attempt starts fresh.
+    if result.is_err() && cache_dir.exists() && !is_extracted(cache_dir) {
+        let _ = fs::remove_dir_all(cache_dir);
+    }
+
+    result
     // Lock released on drop of lock_file
 }
 
@@ -1532,5 +1549,82 @@ mod tests {
             result.unwrap_err().to_string().contains("disallowed type"),
             "error should mention disallowed type"
         );
+    }
+
+    #[test]
+    fn test_safe_unpack_skips_char_and_block_devices() {
+        // Char/Block entries appear in overlayfs exports from Debian images
+        // (e.g., update-alternatives). They should be skipped, not rejected.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dest_raw = temp_dir.path().join("out");
+        fs::create_dir_all(&dest_raw).unwrap();
+        let dest = dest_raw.canonicalize().unwrap();
+
+        let mut builder = tar::Builder::new(Vec::new());
+
+        // Regular file before device entries
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(5);
+        header.set_mode(0o644);
+        header.set_path("before.txt").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "before.txt", &b"hello"[..])
+            .unwrap();
+
+        // Char device entry (should be skipped)
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Char);
+        header.set_size(0);
+        header.set_mode(0o644);
+        header.set_path("etc/alternatives/pager.1.gz").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "etc/alternatives/pager.1.gz", &b""[..])
+            .unwrap();
+
+        // Block device entry (should be skipped)
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Block);
+        header.set_size(0);
+        header.set_mode(0o644);
+        header.set_path("dev/sda").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "dev/sda", &b""[..])
+            .unwrap();
+
+        // Regular file after device entries (must survive)
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(5);
+        header.set_mode(0o644);
+        header.set_path("after.txt").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "after.txt", &b"world"[..])
+            .unwrap();
+
+        let tar_data = builder.into_inner().unwrap();
+
+        let mut archive = tar::Archive::new(tar_data.as_slice());
+        let result = safe_unpack(&mut archive, &dest);
+        assert!(
+            result.is_ok(),
+            "Char/Block entries should be skipped: {:?}",
+            result.err()
+        );
+
+        // Files before AND after device entries are extracted
+        assert_eq!(
+            fs::read_to_string(dest.join("before.txt")).unwrap(),
+            "hello"
+        );
+        assert_eq!(fs::read_to_string(dest.join("after.txt")).unwrap(), "world");
+
+        // Device entries are not created
+        assert!(!dest.join("etc/alternatives/pager.1.gz").exists());
+        assert!(!dest.join("dev/sda").exists());
     }
 }
