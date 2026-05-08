@@ -685,8 +685,9 @@ impl AgentClient {
     /// # Arguments
     ///
     /// * `dry_run` - If true, only report what would be deleted
-    pub fn garbage_collect(&mut self, dry_run: bool) -> Result<u64> {
-        let resp = self.request(&AgentRequest::GarbageCollect { dry_run })?;
+    /// * `purge_all` - If true, delete all manifests/configs first so all layers are collected
+    pub fn garbage_collect(&mut self, dry_run: bool, purge_all: bool) -> Result<u64> {
+        let resp = self.request(&AgentRequest::GarbageCollect { dry_run, purge_all })?;
 
         match resp {
             AgentResponse::Ok { data: Some(data) } => {

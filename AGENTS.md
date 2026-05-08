@@ -418,6 +418,6 @@ OpenAPI spec: `smolvm serve openapi`
 ## Important Behaviors
 
 - **Observational commands don't stop running VMs.** `machine images`, `machine status`, `machine ls` and similar read-only commands leave a running VM in its current state. If the VM was already running before the command, it stays running after.
-- **`machine prune` requires the VM to be stopped.** Pruning layers while a VM has active containers could break things. Stop the VM first with `machine stop`, then prune.
+- **`machine prune` works on a running VM.** Regular prune only removes unreferenced layers and is safe while containers are active. `prune --all` requires the VM to be stopped first since it deletes manifests for layers that may be in use.
 - **`machine exec` persists filesystem changes.** Package installs, config edits, and file writes inside `exec` survive across sessions. This works for both bare VMs and image-based VMs (created with `--image`).
 - **`machine run` is always ephemeral.** The VM is created, the command runs, and everything is cleaned up. No state carries over.

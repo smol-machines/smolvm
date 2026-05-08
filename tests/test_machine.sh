@@ -2350,31 +2350,115 @@ test_images_does_not_stop_running_vm() {
     assert_vm_stays_running "machine images" $SMOLVM machine images
 }
 
-test_prune_refuses_on_running_vm() {
+test_prune_on_running_vm() {
     ensure_machine_running
 
     local status
     status=$($SMOLVM machine status 2>&1)
     [[ "$status" == *"running"* ]] || { echo "VM not running before test"; return 1; }
 
-    # Prune should refuse while VM is running
+    # Regular prune should work without stopping the VM
+    local output
+    output=$($SMOLVM machine prune 2>&1) || true
+    [[ "$output" == *"unreferenced"* ]] || [[ "$output" == *"No unreferenced"* ]] || {
+        echo "unexpected prune output: $output"
+        return 1
+    }
+
+    # VM should still be running after prune
+    status=$($SMOLVM machine status 2>&1)
+    [[ "$status" == *"running"* ]] || { echo "VM stopped after prune"; return 1; }
+}
+
+test_prune_dry_run_on_running_vm() {
+    ensure_machine_running
+
+    local output
+    output=$($SMOLVM machine prune --dry-run 2>&1) || true
+    [[ "$output" == *"unreferenced"* ]] || [[ "$output" == *"No unreferenced"* ]] || {
+        echo "unexpected prune --dry-run output: $output"
+        return 1
+    }
+
+    # VM should still be running
+    local status
+    status=$($SMOLVM machine status 2>&1)
+    [[ "$status" == *"running"* ]] || { echo "VM stopped after prune --dry-run"; return 1; }
+}
+
+test_prune_all_refuses_on_running_vm() {
+    ensure_machine_running "true"
+
+    local status
+    status=$($SMOLVM machine status 2>&1)
+    [[ "$status" == *"running"* ]] || { echo "VM not running before test"; return 1; }
+
+    # --all should refuse while the VM is running
     local output exit_code=0
-    output=$($SMOLVM machine prune 2>&1) || exit_code=$?
-    [[ $exit_code -ne 0 ]] || { echo "prune should have failed on running VM"; return 1; }
-    [[ "$output" == *"cannot prune while the machine is running"* ]] || { echo "unexpected error: $output"; return 1; }
+    output=$($SMOLVM machine prune --all 2>&1) || exit_code=$?
+    [[ $exit_code -ne 0 ]] || { echo "prune --all should have failed on running VM"; return 1; }
+    [[ "$output" == *"cannot prune --all while the machine is running"* ]] || {
+        echo "unexpected error: $output"
+        return 1
+    }
 
     # VM should still be running
     status=$($SMOLVM machine status 2>&1)
-    [[ "$status" == *"running"* ]] || { echo "VM stopped after rejected prune"; return 1; }
+    [[ "$status" == *"running"* ]] || { echo "VM stopped after rejected prune --all"; return 1; }
 }
 
-test_prune_dry_run_refuses_on_running_vm() {
-    ensure_machine_running
+# Regression: prune --all said "Removing all cached images" but never
+# actually deleted the manifests, so images survived. This test verifies
+# images are gone after prune --all.
+test_prune_all_removes_images() {
+    # Start with a clean machine that has an image cached
+    $SMOLVM machine stop 2>/dev/null || true
+    $SMOLVM machine delete default -f 2>/dev/null || true
+    $SMOLVM machine create --image alpine --net default 2>&1 || return 1
+    $SMOLVM machine start 2>&1 || return 1
 
-    local output exit_code=0
-    output=$($SMOLVM machine prune --dry-run 2>&1) || exit_code=$?
-    [[ $exit_code -ne 0 ]] || { echo "prune --dry-run should have failed on running VM"; return 1; }
-    [[ "$output" == *"cannot prune while the machine is running"* ]]
+    # Verify the image is cached
+    $SMOLVM machine exec -- true 2>&1 || { echo "VM not reachable"; return 1; }
+
+    # Check images before prune
+    local images_before
+    images_before=$($SMOLVM machine images 2>&1)
+
+    # Stop the VM (prune requires it)
+    $SMOLVM machine stop 2>&1
+
+    # Run prune --all
+    local output
+    output=$($SMOLVM machine prune --all 2>&1) || {
+        echo "prune --all failed: $output"
+        $SMOLVM machine delete default -f 2>/dev/null
+        return 1
+    }
+    [[ "$output" == *"Removed"* ]] || [[ "$output" == *"No cached images"* ]] || {
+        echo "unexpected prune output: $output"
+        $SMOLVM machine delete default -f 2>/dev/null
+        return 1
+    }
+
+    # Restart and verify images are gone
+    $SMOLVM machine start 2>&1 || {
+        $SMOLVM machine delete default -f 2>/dev/null
+        return 1
+    }
+
+    local images_after
+    images_after=$($SMOLVM machine images 2>&1)
+
+    $SMOLVM machine stop 2>/dev/null || true
+    $SMOLVM machine delete default -f 2>/dev/null || true
+
+    # After prune --all, no images should remain
+    if echo "$images_after" | grep -qE "^[a-z].*[0-9]+ MB"; then
+        echo "FAIL: images still present after prune --all"
+        echo "Before: $images_before"
+        echo "After: $images_after"
+        return 1
+    fi
 }
 
 test_machine_ls_does_not_kill_vm() {
@@ -2513,8 +2597,10 @@ run_test "Concurrent exec does not flip VM to unreachable" test_concurrent_exec_
 run_test "Listing: machine ls does not kill VM" test_machine_ls_does_not_kill_vm || true
 run_test "Listing: named VM survives repeated ls" test_named_vm_survives_ls || true
 run_test "Images: does not stop running VM" test_images_does_not_stop_running_vm || true
-run_test "Prune: refuses on running VM" test_prune_refuses_on_running_vm || true
-run_test "Prune --dry-run: refuses on running VM" test_prune_dry_run_refuses_on_running_vm || true
+run_test "Prune: works on running VM without stopping it" test_prune_on_running_vm || true
+run_test "Prune --dry-run: works on running VM" test_prune_dry_run_on_running_vm || true
+run_test "Prune --all: refuses on running VM" test_prune_all_refuses_on_running_vm || true
+run_test "Prune --all: removes cached images" test_prune_all_removes_images || true
 
 # =============================================================================
 # grpcio / TSI SOL_SOCKET round-trip test

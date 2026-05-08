@@ -1479,6 +1479,24 @@ pub fn get_layer_digest(image_digest: &str, layer_index: usize) -> Result<String
     )))
 }
 
+/// Remove all image manifests and configs, making all layers unreferenced.
+///
+/// Call this before `garbage_collect()` to implement `prune --all`.
+pub fn purge_all_images() -> Result<()> {
+    let root = Path::new(STORAGE_ROOT);
+    let manifests_dir = root.join(MANIFESTS_DIR);
+    let configs_dir = root.join(CONFIGS_DIR);
+
+    if manifests_dir.exists() {
+        std::fs::remove_dir_all(&manifests_dir)?;
+    }
+    if configs_dir.exists() {
+        std::fs::remove_dir_all(&configs_dir)?;
+    }
+
+    Ok(())
+}
+
 /// Run garbage collection.
 pub fn garbage_collect(dry_run: bool) -> Result<u64> {
     let root = Path::new(STORAGE_ROOT);

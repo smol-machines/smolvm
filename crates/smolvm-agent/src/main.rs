@@ -1602,7 +1602,7 @@ fn handle_request(
 
         AgentRequest::ListImages => handle_list_images(),
 
-        AgentRequest::GarbageCollect { dry_run } => handle_gc(dry_run),
+        AgentRequest::GarbageCollect { dry_run, purge_all } => handle_gc(dry_run, purge_all),
 
         AgentRequest::PrepareOverlay { image, workload_id } => {
             handle_prepare_overlay(&image, &workload_id)
@@ -3538,7 +3538,12 @@ fn handle_list_images() -> AgentResponse {
 }
 
 /// Handle garbage collection request.
-fn handle_gc(dry_run: bool) -> AgentResponse {
+fn handle_gc(dry_run: bool, purge_all: bool) -> AgentResponse {
+    if purge_all && !dry_run {
+        if let Err(e) = storage::purge_all_images() {
+            return AgentResponse::from_err(e, error_codes::GC_FAILED);
+        }
+    }
     match storage::garbage_collect(dry_run) {
         Ok(freed) => AgentResponse::ok_with_data(serde_json::json!({
             "freed_bytes": freed,

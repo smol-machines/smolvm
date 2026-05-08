@@ -1668,15 +1668,25 @@ impl PruneCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let manager = AgentManager::new_default()?;
 
-        if manager.try_connect_existing().is_some() {
+        // Regular prune (unreferenced layers only) is safe on a running VM —
+        // referenced layers can't be collected. --all deletes manifests for
+        // layers that may be in active use, so it requires a stop first.
+        let already_running = manager.try_connect_existing().is_some();
+        let started_for_prune;
+
+        if already_running && self.all {
             return Err(smolvm::Error::agent(
                 "prune",
-                "cannot prune while the machine is running. Stop it first with 'smolvm machine stop'",
+                "cannot prune --all while the machine is running. Stop it first with 'smolvm machine stop'",
             ));
+        } else if already_running {
+            started_for_prune = false;
+        } else {
+            println!("Starting machine...");
+            manager.start()?;
+            started_for_prune = true;
         }
 
-        println!("Starting machine...");
-        manager.start()?;
         let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
 
         if self.all {
@@ -1705,12 +1715,16 @@ impl PruneCmd {
                 }
             } else {
                 println!("Removing all cached images...");
-                let freed = client.garbage_collect(false)?;
-                println!("Freed {} of unreferenced layers", format_bytes(freed));
+                let freed = client.garbage_collect(false, true)?;
+                println!(
+                    "Removed {} images, freed {}",
+                    images.len(),
+                    format_bytes(freed)
+                );
             }
         } else if self.dry_run {
             println!("Scanning for unreferenced layers...");
-            let would_free = client.garbage_collect(true)?;
+            let would_free = client.garbage_collect(true, false)?;
 
             if would_free > 0 {
                 println!(
@@ -1722,13 +1736,19 @@ impl PruneCmd {
             }
         } else {
             println!("Removing unreferenced layers...");
-            let freed = client.garbage_collect(false)?;
+            let freed = client.garbage_collect(false, false)?;
 
             if freed > 0 {
                 println!("Freed {}", format_bytes(freed));
             } else {
                 println!("No unreferenced layers to remove.");
             }
+        }
+
+        // Only stop the VM if we started it for this prune operation.
+        // If the user's machine was already running, leave it running.
+        if started_for_prune {
+            let _ = manager.stop();
         }
 
         Ok(())

@@ -151,6 +151,10 @@ pub enum AgentRequest {
     GarbageCollect {
         /// If true, only report what would be deleted.
         dry_run: bool,
+        /// If true, delete all image manifests and configs first,
+        /// making all layers unreferenced so they get collected.
+        #[serde(default)]
+        purge_all: bool,
     },
 
     /// Prepare overlay rootfs for a workload.
