@@ -104,6 +104,50 @@ The `cargo make dist` task wraps `scripts/build-dist.sh`. Other scripts:
 ./scripts/install-local.sh
 ```
 
+## Corporate Proxy / Custom CA Certificates
+
+If you're behind a corporate TLS-intercepting proxy, you need to configure CA certificates at multiple levels for image pulls and package installs to work.
+
+### 1. Install CA bundle into the system-level agent rootfs
+
+The installed smolvm's agent rootfs needs your CA bundle so crane (OCI image pulls) can verify TLS:
+
+```bash
+cp /path/to/your/ca-bundle.pem "$HOME/Library/Application Support/smolvm/agent-rootfs/etc/ssl/certs/ca-certificates.crt"
+```
+
+Your CA bundle should contain both Mozilla root certificates and your corporate CA certificate(s).
+
+### 2. Build agent rootfs with SSL_CERT_FILE
+
+Set `SSL_CERT_FILE` so the build script injects the CA bundle into VMs it spawns (for `apk` package installs and the rust:alpine agent build):
+
+```bash
+export SSL_CERT_FILE=/path/to/your/ca-bundle.pem
+cargo make agent-rootfs
+```
+
+The build script automatically mounts the cert directory into VMs and copies the bundle into the built rootfs.
+
+### 3. Run smolvm with SSL_CERT_FILE
+
+Set `SSL_CERT_FILE` when running smolvm so it gets forwarded into the guest VM for crane to use:
+
+```bash
+export SSL_CERT_FILE=/path/to/your/ca-bundle.pem
+cargo make smolvm machine run --net --image alpine:latest -- echo hello
+```
+
+### 4. Clear stale VM cache if needed
+
+If you see `agent process exited during startup` after rebuilding the agent rootfs, clear the cached VM disks:
+
+```bash
+rm -rf ~/Library/Caches/smolvm/vms/*
+```
+
+This removes stale storage/overlay disks that may contain an incompatible agent version.
+
 ## Troubleshooting
 
 **Database lock errors** ("Database already open"):

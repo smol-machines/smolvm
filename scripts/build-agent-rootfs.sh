@@ -103,7 +103,7 @@ tar -xzf "$CRANE_TAR" -C "$OUTPUT_DIR/usr/local/bin" crane
 #   1. apk.static (Linux only) — runs natively, supports cross-arch via --arch
 #   2. smolvm (any host) — only for native-arch builds (pulls host-arch image)
 echo "Installing additional packages..."
-APK_PACKAGES="jq e2fsprogs e2fsprogs-extra crun util-linux libcap"
+APK_PACKAGES="jq e2fsprogs e2fsprogs-extra crun util-linux libcap s3fs-fuse"
 
 # Determine if this is a cross-arch build
 HOST_ARCH="$(uname -m)"
@@ -184,8 +184,16 @@ elif [[ "$CROSS_ARCH" == "1" ]]; then
     exit 1
 elif command -v smolvm &> /dev/null; then
     echo "  Using smolvm..."
-    smolvm machine run --net -v "$OUTPUT_DIR:/rootfs" --image "alpine:${ALPINE_VERSION}" \
-        -- sh -c "apk add --root /rootfs --initdb --no-cache $APK_PACKAGES"
+    SMOLVM_CERT_ARGS=()
+    SMOLVM_CERT_CMD=""
+    if [[ -n "${SSL_CERT_FILE:-}" ]] && [[ -f "${SSL_CERT_FILE}" ]]; then
+        CERT_DIR="$(dirname "$SSL_CERT_FILE")"
+        CERT_NAME="$(basename "$SSL_CERT_FILE")"
+        SMOLVM_CERT_ARGS=(-v "${CERT_DIR}:/mnt/certs:ro")
+        SMOLVM_CERT_CMD="mkdir -p /etc/ssl/certs && cp /mnt/certs/${CERT_NAME} /etc/ssl/certs/ca-certificates.crt; mkdir -p /rootfs/etc/ssl/certs && cp /mnt/certs/${CERT_NAME} /rootfs/etc/ssl/certs/ca-certificates.crt; "
+    fi
+    smolvm machine run --net "${SMOLVM_CERT_ARGS[@]}" -v "$OUTPUT_DIR:/rootfs" --image "alpine:${ALPINE_VERSION}" \
+        -- sh -c "${SMOLVM_CERT_CMD}apk add --root /rootfs --initdb --no-cache $APK_PACKAGES"
     echo "Packages installed successfully"
 else
     echo "Error: smolvm is required to build the agent rootfs on macOS"
@@ -208,6 +216,14 @@ ln -sf /usr/local/bin/smolvm-agent "$OUTPUT_DIR/sbin/init"
 
 # Create resolv.conf
 echo "nameserver 1.1.1.1" > "$OUTPUT_DIR/etc/resolv.conf"
+
+# Install custom CA bundle into rootfs when SSL_CERT_FILE is set
+if [[ -n "${SSL_CERT_FILE:-}" ]] && [[ -f "${SSL_CERT_FILE}" ]]; then
+    echo "Installing CA bundle from SSL_CERT_FILE into rootfs..."
+    mkdir -p "$OUTPUT_DIR/etc/ssl/certs"
+    cp "$SSL_CERT_FILE" "$OUTPUT_DIR/etc/ssl/certs/ca-certificates.crt"
+    chmod 644 "$OUTPUT_DIR/etc/ssl/certs/ca-certificates.crt"
+fi
 
 PROFILE="release-small"
 
@@ -232,8 +248,16 @@ else
     if [[ -z "$AGENT_BINARY" ]] || [[ ! -f "$AGENT_BINARY" ]]; then
         if command -v smolvm &> /dev/null; then
             echo "Building via smolvm (rust:alpine)..."
-            smolvm machine run --net --mem 2048 -v "$PROJECT_ROOT:/work" --image rust:alpine \
-                -- sh -c ". /usr/local/cargo/env && apk add musl-dev && cd /work && cargo build --profile $PROFILE -p smolvm-agent"
+            SMOLVM_BUILD_CERT_ARGS=()
+            SMOLVM_BUILD_CERT_CMD=""
+            if [[ -n "${SSL_CERT_FILE:-}" ]] && [[ -f "${SSL_CERT_FILE}" ]]; then
+                BUILD_CERT_DIR="$(dirname "$SSL_CERT_FILE")"
+                BUILD_CERT_NAME="$(basename "$SSL_CERT_FILE")"
+                SMOLVM_BUILD_CERT_ARGS=(-v "${BUILD_CERT_DIR}:/mnt/certs:ro")
+                SMOLVM_BUILD_CERT_CMD="cp /mnt/certs/${BUILD_CERT_NAME} /etc/ssl/certs/ca-certificates.crt && "
+            fi
+            smolvm machine run --net --mem 2048 "${SMOLVM_BUILD_CERT_ARGS[@]}" -v "$PROJECT_ROOT:/work" --image rust:alpine \
+                -- sh -c "${SMOLVM_BUILD_CERT_CMD}. /usr/local/cargo/env && apk add musl-dev && cd /work && cargo build --profile $PROFILE -p smolvm-agent"
             AGENT_BINARY="$PROJECT_ROOT/target/$PROFILE/smolvm-agent"
         else
             echo "Error: Cannot build smolvm-agent"

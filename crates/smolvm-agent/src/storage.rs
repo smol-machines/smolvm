@@ -31,6 +31,16 @@ const WORKSPACE_DIR: &str = "workspace";
 const DOCKER_HUB_AUTH_CONFIG_KEY: &str = "https://index.docker.io/v1/";
 const DOCKER_HUB_REGISTRY_ALIASES: &[&str] = &["docker.io", "index.docker.io"];
 
+/// Resolve a mount source to a filesystem path.
+/// If source starts with '/', it's a VM-internal absolute path; otherwise a virtiofs tag.
+pub fn resolve_mount_source(source: &str) -> PathBuf {
+    if source.starts_with('/') {
+        PathBuf::from(source)
+    } else {
+        Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(source)
+    }
+}
+
 fn validate_storage_id(value: &str, context: &str) -> Result<()> {
     if value.is_empty() {
         return Err(StorageError::ValidationFailed {
@@ -2081,19 +2091,21 @@ pub fn run_command(
         let mut spec = OciSpec::new(command, env, workdir_str, false, &identity);
         spec.add_gpu_devices_if_available();
 
-        // Add virtiofs bind mounts to OCI spec
-        for (tag, container_path, read_only) in mounts {
-            let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
+        // Add bind mounts to OCI spec (virtiofs tags or VM-internal paths)
+        for (source, container_path, read_only) in mounts {
+            let host_path = resolve_mount_source(source);
             spec.add_bind_mount(
-                &virtiofs_mount.to_string_lossy(),
+                &host_path.to_string_lossy(),
                 container_path,
                 *read_only,
             );
         }
 
         // Shared workspace: /storage/workspace → /workspace inside container
+        // Skip if the user already mounted something to /workspace explicitly.
+        let user_mounted_workspace = mounts.iter().any(|(_, target, _)| target == "/workspace");
         let workspace_src = Path::new(STORAGE_ROOT).join(WORKSPACE_DIR);
-        if workspace_src.exists() {
+        if !user_mounted_workspace && workspace_src.exists() {
             spec.add_bind_mount(&workspace_src.to_string_lossy(), "/workspace", false);
         }
 
@@ -2254,6 +2266,12 @@ fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Resul
     let rootfs_path = Path::new(rootfs);
 
     for (tag, container_path, read_only) in mounts {
+        // VM-internal absolute paths don't need virtiofs mounting — they're
+        // handled as OCI bind mounts in the caller via resolve_mount_source().
+        if tag.starts_with('/') {
+            debug!(path = %tag, container_path = %container_path, "skipping virtiofs setup for VM-internal path");
+            continue;
+        }
         validate_storage_id(tag, "mount tag")?;
         debug!(tag = %tag, container_path = %container_path, read_only = %read_only, "setting up volume mount");
 
@@ -2778,6 +2796,13 @@ fn run_crane_once(
 
     if let Some(p) = oci_platform {
         cmd.arg("--platform").arg(p);
+    }
+
+    if let Ok(cert_file) = std::env::var("SSL_CERT_FILE") {
+        cmd.env("SSL_CERT_FILE", cert_file);
+    }
+    if let Ok(cert_dir) = std::env::var("SSL_CERT_DIR") {
+        cmd.env("SSL_CERT_DIR", cert_dir);
     }
 
     // Set up auth if provided (temp_dir must stay alive until command completes)

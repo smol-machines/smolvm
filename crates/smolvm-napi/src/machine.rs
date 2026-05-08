@@ -124,7 +124,7 @@ impl NapiMachine {
     ) -> napi::Result<ExecResult> {
         let runtime = runtime().into_napi()?;
         let name = self.name.clone();
-        let (env, workdir, timeout) = parse_exec_options(options);
+        let (env, workdir, timeout, _mounts) = parse_exec_options(options);
 
         let result = tokio::task::spawn_blocking(move || {
             runtime.exec(&name, command, env, workdir, timeout)
@@ -153,10 +153,10 @@ impl NapiMachine {
     ) -> napi::Result<ExecResult> {
         let runtime = runtime().into_napi()?;
         let name = self.name.clone();
-        let (env, workdir, timeout) = parse_exec_options(options);
+        let (env, workdir, timeout, mounts) = parse_exec_options(options);
 
         let result = tokio::task::spawn_blocking(move || {
-            runtime.run(&name, &image, command, env, workdir, timeout)
+            runtime.run(&name, &image, command, env, workdir, timeout, mounts)
         })
         .await
         .map_err(join_error)?
@@ -239,7 +239,7 @@ impl NapiMachine {
     ) -> napi::Result<Vec<ExecStreamEvent>> {
         let runtime = runtime().into_napi()?;
         let name = self.name.clone();
-        let (env, workdir, timeout) = parse_exec_options(options);
+        let (env, workdir, timeout, _mounts) = parse_exec_options(options);
 
         let events = tokio::task::spawn_blocking(move || {
             runtime.exec_streaming(&name, command, env, workdir, timeout)

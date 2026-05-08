@@ -71,6 +71,7 @@ script_runner = "bash"
 script = [
 '''
 IFS=';' read -ra ARGS <<< "${CARGO_MAKE_TASK_ARGS}"
+export DYLD_LIBRARY_PATH="${CARGO_MAKE_WORKING_DIRECTORY}/lib"
 exec ./target/release/smolvm "${ARGS[@]}"
 '''
 ]
