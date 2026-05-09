@@ -73,6 +73,7 @@ fn boot_log(level: &str, msg: &str) {
     }
 }
 mod dns_proxy;
+mod name;
 mod network;
 mod oci;
 mod paths;
@@ -531,6 +532,9 @@ fn setup_gpu_dev_nodes() {
         }
     }
 }
+
+#[cfg(not(target_os = "linux"))]
+fn log_gpu_status() {}
 
 /// Log whether the GPU is accessible in the guest.
 ///
@@ -1152,6 +1156,7 @@ fn create_storage_dirs(mount_point: &str) {
 }
 
 /// Mount ext4 /dev/vda at /storage using direct syscall (avoids ~3-5ms fork+exec).
+#[cfg(target_os = "linux")]
 fn try_mount_storage_ext4() -> bool {
     let dev = cstr("/dev/vda");
     let mnt = cstr("/storage");
@@ -1168,12 +1173,19 @@ fn try_mount_storage_ext4() -> bool {
     }
 }
 
+// looks like try_mount_storage is only used in mount_storage_disk, so we don't need the stub
+// #[cfg(not(target_os = "linux"))]
+// fn try_mount_storage_ext4() -> bool {
+//     false
+// }
+
 /// Mount the storage disk at /storage. Returns true if successfully mounted.
 ///
 /// Three-attempt fallback chain:
 /// 1. resize + mount (works on subsequent boots with Linux-native FS)
 /// 2. fsck + resize + mount (may fix minor corruption)
 /// 3. mkfs + mount (first boot from macOS template, or unrecoverable)
+#[cfg(target_os = "linux")]
 fn mount_storage_disk() -> bool {
     use std::process::Command;
 
@@ -1273,6 +1285,11 @@ fn mount_storage_disk() -> bool {
     }
 
     error!("CRITICAL: could not mount storage disk after all recovery attempts");
+    false
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mount_storage_disk() -> bool {
     false
 }
 
