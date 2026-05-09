@@ -272,6 +272,15 @@ impl PackCreateCmd {
             data_dir: vm_data_dir,
             finalized: false,
         };
+        // Ensure Ctrl+C during a long pack create tears down the agent
+        // VM rather than orphaning it. Default SIGINT exits immediately
+        // and skips PackVmGuard::Drop, leaving the setsid()-detached
+        // VM plus a ~500 MB overlay disk on the host. Same gap fixed
+        // in pack_run's ephemeral/run paths.
+        let _sigint_guard = guard
+            .manager
+            .child_pid()
+            .map(smolvm::process::SigintGuard::new);
         let mut client = guard.manager.connect()?;
 
         // Pull image
