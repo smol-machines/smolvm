@@ -9,6 +9,7 @@
 //! - Support for pre-packed OCI layers (smolvm pack)
 
 use crate::crun::CrunCommand;
+use crate::name::{parse_image_ref, unsanitize_image_name};
 use crate::oci::{generate_container_id, OciSpec};
 use crate::paths;
 use crate::process::{WaitResult, TIMEOUT_EXIT_CODE};
@@ -230,6 +231,7 @@ static BOOT_VOLUME_MOUNTS: OnceLock<Vec<(String, String, bool)>> = OnceLock::new
 /// Initialize packed layers support by checking SMOLVM_PACKED_LAYERS env var.
 /// Format: "virtiofs_tag:mount_point" (e.g., "smolvm_layers:/packed_layers")
 /// Returns the mount point path if successfully mounted.
+#[cfg(target_os = "linux")]
 pub fn init_packed_layers() -> Option<PathBuf> {
     let env_val = match std::env::var("SMOLVM_PACKED_LAYERS") {
         Ok(v) => v,
@@ -288,6 +290,11 @@ pub fn init_packed_layers() -> Option<PathBuf> {
     }
 
     Some(mount_point)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn init_packed_layers() -> Option<PathBuf> {
+    None
 }
 
 /// Get the packed layers directory if available.
@@ -976,9 +983,8 @@ where
             );
             // Clean up the mismatched cached manifest
             let root = Path::new(STORAGE_ROOT);
-            let manifest_path = root
-                .join(MANIFESTS_DIR)
-                .join(sanitize_image_name(image) + ".json");
+            let sanitized_image_ref = sanitized_image_from(image)?;
+            let manifest_path = root.join(MANIFESTS_DIR).join(sanitized_image_ref + ".json");
             let _ = std::fs::remove_file(&manifest_path);
         }
     }
@@ -1030,9 +1036,8 @@ where
     let total_layers = layers.len();
 
     // Save manifest
-    let manifest_path = root
-        .join(MANIFESTS_DIR)
-        .join(sanitize_image_name(image) + ".json");
+    let sanitized_image_ref = sanitized_image_from(image)?;
+    let manifest_path = root.join(MANIFESTS_DIR).join(sanitized_image_ref + ".json");
     std::fs::write(&manifest_path, &manifest)?;
 
     // Fetch and save config
@@ -1209,12 +1214,30 @@ where
     })
 }
 
+enum CacheDecision {
+    UseCache,
+    Pull,
+    PullForArch,
+    Fail(String),
+}
+
+fn resolve_cache_decision(query_result: Result<Option<ImageInfo>>) -> Result<CacheDecision> {
+    // TODO: do we need to manually parse error here or should callsite unwrap the result?
+    // I think we need to unwrap it and then we can default to Fail(String) or Pull...
+    // match query_result? {
+    //     // TODO: parse info
+    //     Some(info) => Ok(CacheDecision::UseCache),
+    //     None => Ok(CacheDecision::Pull),
+    // }
+    //
+    todo!()
+}
+
 /// Query if an image exists locally.
 pub fn query_image(image: &str) -> Result<Option<ImageInfo>> {
     let root = Path::new(STORAGE_ROOT);
-    let manifest_path = root
-        .join(MANIFESTS_DIR)
-        .join(sanitize_image_name(image) + ".json");
+    let sanitized_ref = sanitized_image_from(image)?;
+    let manifest_path = root.join(MANIFESTS_DIR).join(sanitized_ref + ".json");
 
     if !manifest_path.exists() {
         return Ok(None);
@@ -2002,11 +2025,8 @@ pub struct PreparedOverlayRootfs {
 }
 
 fn prepare_rootfs_for_ephemeral_run(image: &str) -> Result<PreparedOverlayRootfs> {
-    let workload_id = format!(
-        "run-{}-{}",
-        sanitize_image_name(image),
-        generate_container_id()
-    );
+    let sanitized_ref = sanitized_image_from(image)?;
+    let workload_id = format!("run-{}-{}", sanitized_ref, generate_container_id());
     let overlay = prepare_overlay(image, &workload_id)?;
     debug!(
         workload_id = %workload_id,
@@ -2230,7 +2250,8 @@ pub fn setup_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Result<(
     Ok(())
 }
 
-/// Setup volume mounts by mounting virtiofs and bind-mounting into the rootfs.
+/// Setup volume mounts by mounting virtiofs and bind-mounting into the rootfs
+#[cfg(target_os = "linux")]
 fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Result<Vec<PathBuf>> {
     let mut mounted_paths = Vec::new();
     let rootfs_path = Path::new(rootfs);
@@ -2335,6 +2356,13 @@ fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Resul
     }
 
     Ok(mounted_paths)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn setup_volume_mounts(_rootfs: &str, _mounts: &[(String, String, bool)]) -> Result<Vec<PathBuf>> {
+    Err(StorageError::Internal {
+        message: "Bind mounts on non-linux unsupported".to_string(),
+    })
 }
 
 /// Check if a path is a mountpoint.
@@ -2799,15 +2827,16 @@ fn crane_config(
     run_crane("config", image, oci_platform, auth)
 }
 
-/// Sanitize image name for use as filename.
-fn sanitize_image_name(image: &str) -> String {
-    image.replace(['/', ':', '@'], "_")
-}
-
-/// Reverse sanitization.
-fn unsanitize_image_name(name: &str) -> String {
-    // This is approximate - we lose some info
-    name.replacen('_', "/", 1).replacen('_', ":", 1)
+fn sanitized_image_from(image: &str) -> Result<String> {
+    match parse_image_ref(image) {
+        Ok(r) => return Ok(r.sanitized()),
+        Err(e) => {
+            return Err(StorageError::InvalidImageReference {
+                reference: image.to_string(),
+                reason: e.to_string(),
+            })
+        }
+    };
 }
 
 /// Get disk usage for a path.
@@ -2905,6 +2934,72 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    fn sample_image_info(architecture: &str) -> ImageInfo {
+        ImageInfo {
+            reference: "docker.io/library/alpine:3.20".to_string(),
+            digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+                .to_string(),
+            size: 42,
+            created: Some("2026-01-01T00:00:00Z".to_string()),
+            architecture: architecture.to_string(),
+            os: "linux".to_string(),
+            layer_count: 1,
+            layers: vec![
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+            ],
+            entrypoint: vec![],
+            cmd: vec![],
+            env: vec![],
+            workdir: None,
+            user: None,
+        }
+    }
+
+    #[test]
+    fn test_resolve_cache_decision_uses_cache_on_hit() {
+        let result = resolve_cache_decision(Ok(Some(sample_image_info("amd64"))));
+
+        match result {
+            Ok(CacheDecision::UseCache) => {}
+            Ok(other) => panic!(
+                "expected UseCache, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+            Err(e) => panic!("expected UseCache, got error: {e}"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_cache_decision_pulls_on_cache_miss() {
+        let result = resolve_cache_decision(Ok(None));
+
+        match result {
+            Ok(CacheDecision::Pull) => {}
+            Ok(other) => panic!("expected Pull, got {:?}", std::mem::discriminant(&other)),
+            Err(e) => panic!("expected Pull, got error: {e}"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_cache_decision_returns_fail_on_query_error() {
+        let query_error = StorageError::parse_error(
+            "manifest",
+            serde_json::from_str::<serde_json::Value>("{").unwrap_err(),
+        );
+
+        let result = resolve_cache_decision(Err(query_error));
+
+        match result {
+            Ok(CacheDecision::Fail(_)) => {}
+            Ok(other) => panic!(
+                "expected Fail decision, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+            Err(e) => panic!("expected Fail decision, got error instead: {e}"),
+        }
+    }
+
     #[test]
     fn test_oci_platform_to_arch_linux_arm64() {
         assert_eq!(oci_platform_to_arch("linux/arm64"), "arm64");
@@ -2926,19 +3021,6 @@ mod tests {
         // If not in expected format, return as-is
         assert_eq!(oci_platform_to_arch("arm64"), "arm64");
         assert_eq!(oci_platform_to_arch("unknown"), "unknown");
-    }
-
-    #[test]
-    fn test_sanitize_image_name() {
-        assert_eq!(sanitize_image_name("alpine:latest"), "alpine_latest");
-        assert_eq!(
-            sanitize_image_name("docker.io/library/alpine:3.18"),
-            "docker.io_library_alpine_3.18"
-        );
-        assert_eq!(
-            sanitize_image_name("ghcr.io/owner/repo@sha256:abc123"),
-            "ghcr.io_owner_repo_sha256_abc123"
-        );
     }
 
     #[test]
