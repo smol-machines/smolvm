@@ -1266,6 +1266,24 @@ impl AgentManager {
         self.cleanup_marker_files();
     }
 
+    /// Remove the VM's entire data directory (storage, overlay, socket, logs).
+    ///
+    /// Only safe for ephemeral VMs after the process is confirmed dead.
+    pub fn cleanup_data_dir(&self) {
+        if let Some(ref name) = self.name {
+            let dir = vm_data_dir(name);
+            if dir.exists() {
+                if let Err(e) = std::fs::remove_dir_all(&dir) {
+                    tracing::debug!(
+                        error = %e,
+                        path = %dir.display(),
+                        "failed to remove ephemeral VM data directory"
+                    );
+                }
+            }
+        }
+    }
+
     /// Stop the agent VM.
     pub fn stop(&self) -> Result<()> {
         let state = {

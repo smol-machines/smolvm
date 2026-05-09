@@ -308,13 +308,10 @@ impl RunCmd {
         use smolvm::Error;
 
         let requested_name = self.name.clone();
-        if !self.detach && requested_name.is_some() {
-            eprintln!("warning: --name is ignored without -d");
-        }
         let vm_name = if self.detach {
             requested_name.unwrap_or_else(|| "default".to_string())
         } else {
-            "default".to_string()
+            smolvm::util::generate_machine_name()
         };
 
         if self.name.is_some() && vm_name != "default" && self.detach {
@@ -423,12 +420,11 @@ impl RunCmd {
             AgentManager::for_vm_with_sizes(&vm_name, params.storage_gb, params.overlay_gb)
                 .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
 
-        let mode = if self.detach {
-            "persistent"
+        if self.detach {
+            println!("Starting persistent machine...");
         } else {
-            "ephemeral"
-        };
-        println!("Starting {} machine...", mode);
+            println!("Starting ephemeral machine ({})...", vm_name);
+        }
 
         let ssh_agent_socket = if self.ssh_agent || params.ssh_agent {
             match std::env::var("SSH_AUTH_SOCK") {
@@ -701,9 +697,10 @@ impl RunCmd {
                     exit_code
                 };
 
-                // Ephemeral run — command finished, kill VM immediately.
+                // Ephemeral run — tear down VM and its data directory.
                 vm_common::deregister_ephemeral_vm(&ephemeral_name);
                 manager.kill();
+                manager.cleanup_data_dir();
                 std::process::exit(exit_code);
             }
         } else {
@@ -812,9 +809,10 @@ impl RunCmd {
                     flush_output();
                     exit_code
                 };
-                // Ephemeral run — command finished, kill VM immediately.
+                // Ephemeral run — tear down VM and its data directory.
                 vm_common::deregister_ephemeral_vm(&ephemeral_name);
                 manager.kill();
+                manager.cleanup_data_dir();
                 std::process::exit(exit_code);
             }
         }

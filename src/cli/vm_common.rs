@@ -1433,6 +1433,10 @@ pub fn cleanup_orphaned_ephemeral_vms() {
         if is_orphan {
             tracing::debug!(name = %name, pid = ?record.pid, "cleaning up orphaned ephemeral VM");
             let _ = db.remove_vm(name);
+            let dir = smolvm::agent::vm_data_dir(name);
+            if dir.exists() {
+                let _ = std::fs::remove_dir_all(&dir);
+            }
         }
     }
 }

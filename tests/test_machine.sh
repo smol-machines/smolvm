@@ -3003,4 +3003,46 @@ test_storage_mounted_as_ext4() {
 run_test "Storage: resize + large image pull (fresh disk)" test_storage_resize_and_large_pull || true
 run_test "Storage: /dev/vda mounted as ext4 with correct size" test_storage_mounted_as_ext4 || true
 
+# =============================================================================
+# Ephemeral VM Isolation
+# =============================================================================
+
+test_ephemeral_runs_do_not_share_state() {
+    # Run 1: create a marker file
+    $SMOLVM machine run --net --image alpine:latest -- \
+        sh -c 'echo ephemeral-leak-test > /tmp/ephemeral-marker.txt' 2>&1
+
+    # Run 2: marker must not exist
+    local output exit_code=0
+    output=$($SMOLVM machine run --net --image alpine:latest -- \
+        sh -c 'cat /tmp/ephemeral-marker.txt 2>&1 || echo MARKER_NOT_FOUND' 2>&1) || exit_code=$?
+
+    [[ "$output" == *"MARKER_NOT_FOUND"* ]] || {
+        echo "FAIL: ephemeral run found file from previous run"
+        echo "$output"
+        return 1
+    }
+}
+
+test_ephemeral_volume_mount_reflects_host() {
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    echo "file-a" > "$tmpdir/a.txt"
+    echo "file-b" > "$tmpdir/b.txt"
+    echo "file-c" > "$tmpdir/c.txt"
+
+    local output
+    output=$($SMOLVM machine run --net -v "$tmpdir:/hostmnt" --image alpine:latest -- \
+        ls /hostmnt 2>&1)
+
+    rm -rf "$tmpdir"
+
+    [[ "$output" == *"a.txt"* ]] || { echo "missing a.txt: $output"; return 1; }
+    [[ "$output" == *"b.txt"* ]] || { echo "missing b.txt: $output"; return 1; }
+    [[ "$output" == *"c.txt"* ]] || { echo "missing c.txt: $output"; return 1; }
+}
+
+run_test "Ephemeral run: no state leaks between runs" test_ephemeral_runs_do_not_share_state || true
+run_test "Ephemeral run: volume mount shows correct host contents" test_ephemeral_volume_mount_reflects_host || true
+
 print_summary "Machine Tests"
