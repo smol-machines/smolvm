@@ -20,6 +20,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 libc = "0.2"
 parking_lot = "0.12"
 tempfile = "3"
+regex = "1.12.3"
 
 # Linux-specific dependencies for vsock
 [target.'cfg(target_os = "linux")'.dependencies]

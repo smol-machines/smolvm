@@ -9,6 +9,7 @@
 //! - Support for pre-packed OCI layers (smolvm pack)
 
 use crate::crun::CrunCommand;
+use crate::name::{parse_image_ref, unsanitize_image_name};
 use crate::oci::{generate_container_id, OciSpec};
 use crate::paths;
 use crate::process::{WaitResult, TIMEOUT_EXIT_CODE};
@@ -230,6 +231,7 @@ static BOOT_VOLUME_MOUNTS: OnceLock<Vec<(String, String, bool)>> = OnceLock::new
 /// Initialize packed layers support by checking SMOLVM_PACKED_LAYERS env var.
 /// Format: "virtiofs_tag:mount_point" (e.g., "smolvm_layers:/packed_layers")
 /// Returns the mount point path if successfully mounted.
+#[cfg(target_os = "linux")]
 pub fn init_packed_layers() -> Option<PathBuf> {
     let env_val = match std::env::var("SMOLVM_PACKED_LAYERS") {
         Ok(v) => v,
@@ -288,6 +290,11 @@ pub fn init_packed_layers() -> Option<PathBuf> {
     }
 
     Some(mount_point)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn init_packed_layers() -> Option<PathBuf> {
+    None
 }
 
 /// Get the packed layers directory if available.
@@ -951,36 +958,15 @@ where
         }
     });
 
-    // Check if already cached with correct architecture
-    if let Ok(Some(info)) = query_image(image) {
-        // Verify cached image architecture matches requested OCI platform
-        let cached_arch = &info.architecture;
-        let requested_arch = oci_platform
-            .map(oci_platform_to_arch)
-            .unwrap_or_else(|| cached_arch.clone());
+    let cache_strategy =
+        resolve_cache_decision(query_image(image), oci_platform.map(oci_platform_to_arch));
 
-        if cached_arch == &requested_arch {
-            debug!(
-                image = %image,
-                architecture = %cached_arch,
-                "image already cached with correct architecture, skipping pull"
-            );
-            return Ok(info);
-        } else {
-            // Architecture mismatch - need to re-pull
-            info!(
-                image = %image,
-                cached_arch = %cached_arch,
-                requested_arch = %requested_arch,
-                "cached image has wrong architecture, will re-pull"
-            );
-            // Clean up the mismatched cached manifest
-            let root = Path::new(STORAGE_ROOT);
-            let manifest_path = root
-                .join(MANIFESTS_DIR)
-                .join(sanitize_image_name(image) + ".json");
-            let _ = std::fs::remove_file(&manifest_path);
-        }
+    if let CacheDecision::UseCache(info) = cache_strategy {
+        return Ok(info);
+    }
+
+    if let CacheDecision::Fail(message) = cache_strategy {
+        return Err(StorageError::Internal { message });
     }
 
     let root = Path::new(STORAGE_ROOT);
@@ -1030,9 +1016,7 @@ where
     let total_layers = layers.len();
 
     // Save manifest
-    let manifest_path = root
-        .join(MANIFESTS_DIR)
-        .join(sanitize_image_name(image) + ".json");
+    let manifest_path = image_manifest_path(image)?;
     std::fs::write(&manifest_path, &manifest)?;
 
     // Fetch and save config
@@ -1209,13 +1193,70 @@ where
     })
 }
 
+#[derive(Debug)]
+enum CacheDecision {
+    UseCache(ImageInfo),
+    Pull,
+    Fail(String),
+}
+
+/// Get the fully-qualified and sanitized path to an image's manifest
+fn image_manifest_path_at(root: &Path, image: &str) -> Result<PathBuf> {
+    let sanitized_image = sanitized_image_from(image)?;
+    Ok(root.join(MANIFESTS_DIR).join(sanitized_image + ".json"))
+}
+
+/// Get the fully-qualified and sanitized path to an image's manifest
+fn image_manifest_path(image: &str) -> Result<PathBuf> {
+    image_manifest_path_at(Path::new(STORAGE_ROOT), image)
+}
+
+/// Use query image result to determine if cache can be used,
+/// pull is needed, or if the process should fail
+fn resolve_cache_decision(
+    query_result: Result<Option<ImageInfo>>,
+    requested_arch: Option<String>,
+) -> CacheDecision {
+    match query_result {
+        Ok(None) => return CacheDecision::Pull,
+        Ok(Some(info)) => {
+            let cached_arch = &info.architecture;
+            let next_arch = requested_arch.unwrap_or_else(|| cached_arch.clone());
+
+            if cached_arch != &next_arch {
+                let image = &info.reference;
+                // Architecture mismatch - need to re-pull
+                info!(
+                    image = %image,
+                    cached_arch = %cached_arch,
+                    requested_arch = %next_arch,
+                    "cached image has wrong architecture, will re-pull"
+                );
+                // Clean up the mismatched cached manifest
+                if let Ok(manifest_path) = image_manifest_path(image) {
+                    let _ = std::fs::remove_file(&manifest_path);
+                }
+                return CacheDecision::Pull;
+            }
+            // cache hit with a valid arch and parsed ImageInfo
+            debug!(
+                image = %info.reference,
+                architecture = %cached_arch,
+                "image already cached with correct architecture, skipping pull"
+            );
+            return CacheDecision::UseCache(info);
+        }
+        Err(e) => CacheDecision::Fail(format!("cache query failed: {e}")),
+    }
+}
+
 /// Query if an image exists locally.
 pub fn query_image(image: &str) -> Result<Option<ImageInfo>> {
-    let root = Path::new(STORAGE_ROOT);
-    let manifest_path = root
-        .join(MANIFESTS_DIR)
-        .join(sanitize_image_name(image) + ".json");
+    query_image_at(Path::new(STORAGE_ROOT), image)
+}
 
+fn query_image_at(root: &Path, image: &str) -> Result<Option<ImageInfo>> {
+    let manifest_path = image_manifest_path_at(root, image)?;
     if !manifest_path.exists() {
         return Ok(None);
     }
@@ -2020,11 +2061,8 @@ pub struct PreparedOverlayRootfs {
 }
 
 fn prepare_rootfs_for_ephemeral_run(image: &str) -> Result<PreparedOverlayRootfs> {
-    let workload_id = format!(
-        "run-{}-{}",
-        sanitize_image_name(image),
-        generate_container_id()
-    );
+    let sanitized_ref = sanitized_image_from(image)?;
+    let workload_id = format!("run-{}-{}", sanitized_ref, generate_container_id());
     let overlay = prepare_overlay(image, &workload_id)?;
     debug!(
         workload_id = %workload_id,
@@ -2256,7 +2294,8 @@ pub fn setup_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Result<(
     Ok(())
 }
 
-/// Setup volume mounts by mounting virtiofs and bind-mounting into the rootfs.
+/// Setup volume mounts by mounting virtiofs and bind-mounting into the rootfs
+#[cfg(target_os = "linux")]
 fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Result<Vec<PathBuf>> {
     let mut mounted_paths = Vec::new();
     let rootfs_path = Path::new(rootfs);
@@ -2361,6 +2400,13 @@ fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Resul
     }
 
     Ok(mounted_paths)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn setup_volume_mounts(_rootfs: &str, _mounts: &[(String, String, bool)]) -> Result<Vec<PathBuf>> {
+    Err(StorageError::Internal {
+        message: "Bind mounts on non-linux unsupported".to_string(),
+    })
 }
 
 /// Check if a path is a mountpoint.
@@ -2884,15 +2930,18 @@ fn crane_config(
     run_crane("config", image, oci_platform, auth)
 }
 
-/// Sanitize image name for use as filename.
-fn sanitize_image_name(image: &str) -> String {
-    image.replace(['/', ':', '@'], "_")
-}
-
-/// Reverse sanitization.
-fn unsanitize_image_name(name: &str) -> String {
-    // This is approximate - we lose some info
-    name.replacen('_', "/", 1).replacen('_', ":", 1)
+/// Convert a string to a fully-qualified image reference
+/// sanitized for use as a file name
+fn sanitized_image_from(image: &str) -> Result<String> {
+    match parse_image_ref(image) {
+        Ok(r) => return Ok(r.sanitized()),
+        Err(e) => {
+            return Err(StorageError::InvalidImageReference {
+                reference: image.to_string(),
+                reason: e.to_string(),
+            })
+        }
+    };
 }
 
 /// Get disk usage for a path.
@@ -2990,6 +3039,190 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    fn sample_image_info(architecture: &str) -> ImageInfo {
+        ImageInfo {
+            reference: "docker.io/library/alpine:3.20".to_string(),
+            digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+                .to_string(),
+            size: 42,
+            created: Some("2026-01-01T00:00:00Z".to_string()),
+            architecture: architecture.to_string(),
+            os: "linux".to_string(),
+            layer_count: 1,
+            layers: vec![
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+            ],
+            entrypoint: vec![],
+            cmd: vec![],
+            env: vec![],
+            workdir: None,
+            user: None,
+        }
+    }
+
+    #[test]
+    fn test_resolve_cache_decision_uses_cache_on_hit() {
+        let result = resolve_cache_decision(
+            Ok(Some(sample_image_info("amd64"))),
+            Some("amd64".to_string()),
+        );
+
+        match result {
+            CacheDecision::UseCache(_) => {}
+            _ => panic!("expected cache hit to use cache"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_cache_decision_pulls_on_arch_mismatch() {
+        let result = resolve_cache_decision(
+            Ok(Some(sample_image_info("arm64"))),
+            Some("amd64".to_string()),
+        );
+        match result {
+            CacheDecision::Pull => {}
+            _ => panic!("expected arch mismatch to pull"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_cache_decision_pulls_on_cache_miss() {
+        let result = resolve_cache_decision(Ok(None), None);
+
+        match result {
+            CacheDecision::Pull => {}
+            _ => panic!("expected cache miss to pull"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_cache_decision_returns_fail_on_query_error() {
+        let query_error = StorageError::parse_error(
+            "manifest",
+            serde_json::from_str::<serde_json::Value>("{").unwrap_err(),
+        );
+
+        let result = resolve_cache_decision(Err(query_error), None);
+
+        match result {
+            CacheDecision::Fail(_) => {}
+            _ => panic!("expected query error to fail"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_cache_decision_returns_fail_on_io_query_error() {
+        let query_error: StorageError =
+            std::io::Error::new(std::io::ErrorKind::NotFound, "manifest missing").into();
+
+        let result = resolve_cache_decision(Err(query_error), None);
+
+        match result {
+            CacheDecision::Fail(_) => {}
+            _ => panic!("expected query error to fail"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_cache_decision_never_bubbles_query_errors() {
+        let parse_error = StorageError::parse_error(
+            "config",
+            serde_json::from_str::<serde_json::Value>("{").unwrap_err(),
+        );
+
+        let io_error: StorageError =
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied").into();
+
+        let parse_result = resolve_cache_decision(Err(parse_error), None);
+        let io_result = resolve_cache_decision(Err(io_error), None);
+        match parse_result {
+            CacheDecision::Fail(_) => {}
+            _ => panic!("query parse errors should resolve to CacheDecision::Fail"),
+        };
+
+        match io_result {
+            CacheDecision::Fail(_) => {}
+            _ => panic!("query IO errors should resolve to CacheDecision::Fail"),
+        };
+    }
+
+    #[test]
+    fn test_query_image_alias_shorthands_resolve_same_cached_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let manifests_dir = root.join(MANIFESTS_DIR);
+        let configs_dir = root.join(CONFIGS_DIR);
+        let layers_dir = root.join(LAYERS_DIR);
+
+        std::fs::create_dir_all(&manifests_dir).unwrap();
+        std::fs::create_dir_all(&configs_dir).unwrap();
+        std::fs::create_dir_all(&layers_dir).unwrap();
+
+        let config_id = "1111111111111111111111111111111111111111111111111111111111111111";
+        let layer_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        // Static canonical manifest filename
+        let canonical_manifest_filename = "docker.io_library_alpine_3.20.json";
+        let manifest_path = manifests_dir.join(canonical_manifest_filename);
+        let manifest = format!(
+            r#"{{
+  "schemaVersion": 2,
+  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+  "config": {{
+    "mediaType": "application/vnd.oci.image.config.v1+json",
+    "digest": "sha256:{config_id}",
+    "size": 123
+  }},
+  "layers": [
+    {{
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "digest": "sha256:{layer_id}",
+      "size": 42
+    }}
+  ]
+}}"#
+        );
+        let config = r#"{
+  "architecture": "amd64",
+  "os": "linux",
+  "created": "2026-01-01T00:00:00Z",
+  "config": {
+    "Entrypoint": ["/bin/sh"],
+    "Cmd": ["-c", "echo ok"],
+    "Env": ["PATH=/usr/bin"],
+    "WorkingDir": "/",
+    "User": ""
+  }
+}"#;
+
+        std::fs::write(&manifest_path, manifest).unwrap();
+        std::fs::write(configs_dir.join(format!("{config_id}.json")), config).unwrap();
+        std::fs::create_dir_all(layers_dir.join(layer_id)).unwrap();
+
+        // Assert shorthand-specific filename is absent; lookup must normalize to canonical path.
+        assert!(!manifests_dir.join("alpine_3.20.json").exists());
+
+        let by_short = query_image_at(root, "alpine:3.20").unwrap();
+        let by_canonical = query_image_at(root, "docker.io/library/alpine:3.20").unwrap();
+
+        assert!(
+            by_short.is_some(),
+            "short ref should resolve cached manifest"
+        );
+        assert!(
+            by_canonical.is_some(),
+            "canonical ref should resolve cached manifest"
+        );
+
+        let short_info = by_short.unwrap();
+        let canonical_info = by_canonical.unwrap();
+
+        assert_eq!(short_info.digest, canonical_info.digest);
+        assert_eq!(short_info.layer_count, canonical_info.layer_count);
+        assert_eq!(short_info.layers, canonical_info.layers);
+    }
+
     #[test]
     fn test_oci_platform_to_arch_linux_arm64() {
         assert_eq!(oci_platform_to_arch("linux/arm64"), "arm64");
@@ -3011,19 +3244,6 @@ mod tests {
         // If not in expected format, return as-is
         assert_eq!(oci_platform_to_arch("arm64"), "arm64");
         assert_eq!(oci_platform_to_arch("unknown"), "unknown");
-    }
-
-    #[test]
-    fn test_sanitize_image_name() {
-        assert_eq!(sanitize_image_name("alpine:latest"), "alpine_latest");
-        assert_eq!(
-            sanitize_image_name("docker.io/library/alpine:3.18"),
-            "docker.io_library_alpine_3.18"
-        );
-        assert_eq!(
-            sanitize_image_name("ghcr.io/owner/repo@sha256:abc123"),
-            "ghcr.io_owner_repo_sha256_abc123"
-        );
     }
 
     #[test]
