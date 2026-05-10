@@ -1201,11 +1201,14 @@ enum CacheDecision {
 }
 
 /// Get the fully-qualified and sanitized path to an image's manifest
-fn image_manifest_path(image: &str) -> Result<PathBuf> {
+fn image_manifest_path_at(root: &Path, image: &str) -> Result<PathBuf> {
     let sanitized_image = sanitized_image_from(image)?;
-    return Ok(Path::new(STORAGE_ROOT)
-        .join(MANIFESTS_DIR)
-        .join(sanitized_image + ".json"));
+    Ok(root.join(MANIFESTS_DIR).join(sanitized_image + ".json"))
+}
+
+/// Get the fully-qualified and sanitized path to an image's manifest
+fn image_manifest_path(image: &str) -> Result<PathBuf> {
+    image_manifest_path_at(Path::new(STORAGE_ROOT), image)
 }
 
 /// Use query image result to determine if cache can be used,
@@ -1249,7 +1252,11 @@ fn resolve_cache_decision(
 
 /// Query if an image exists locally.
 pub fn query_image(image: &str) -> Result<Option<ImageInfo>> {
-    let manifest_path = image_manifest_path(image)?;
+    query_image_at(Path::new(STORAGE_ROOT), image)
+}
+
+fn query_image_at(root: &Path, image: &str) -> Result<Option<ImageInfo>> {
+    let manifest_path = image_manifest_path_at(root, image)?;
     if !manifest_path.exists() {
         return Ok(None);
     }
@@ -1281,7 +1288,6 @@ pub fn query_image(image: &str) -> Result<Option<ImageInfo>> {
     let config_id = config_digest
         .strip_prefix("sha256:")
         .unwrap_or(config_digest);
-    let root = Path::new(STORAGE_ROOT);
     let config_path = root.join(CONFIGS_DIR).join(format!("{}.json", config_id));
     let config = std::fs::read_to_string(&config_path)?;
     let config_json: serde_json::Value =
@@ -3054,6 +3060,82 @@ mod tests {
             CacheDecision::Fail(_) => {}
             _ => panic!("query IO errors should resolve to CacheDecision::Fail"),
         };
+    }
+
+    #[test]
+    fn test_query_image_alias_shorthands_resolve_same_cached_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let manifests_dir = root.join(MANIFESTS_DIR);
+        let configs_dir = root.join(CONFIGS_DIR);
+        let layers_dir = root.join(LAYERS_DIR);
+
+        std::fs::create_dir_all(&manifests_dir).unwrap();
+        std::fs::create_dir_all(&configs_dir).unwrap();
+        std::fs::create_dir_all(&layers_dir).unwrap();
+
+        let config_id = "1111111111111111111111111111111111111111111111111111111111111111";
+        let layer_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        // Static canonical manifest filename
+        let canonical_manifest_filename = "docker.io_library_alpine_3.20.json";
+        let manifest_path = manifests_dir.join(canonical_manifest_filename);
+        let manifest = format!(
+            r#"{{
+  "schemaVersion": 2,
+  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+  "config": {{
+    "mediaType": "application/vnd.oci.image.config.v1+json",
+    "digest": "sha256:{config_id}",
+    "size": 123
+  }},
+  "layers": [
+    {{
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "digest": "sha256:{layer_id}",
+      "size": 42
+    }}
+  ]
+}}"#
+        );
+        let config = r#"{
+  "architecture": "amd64",
+  "os": "linux",
+  "created": "2026-01-01T00:00:00Z",
+  "config": {
+    "Entrypoint": ["/bin/sh"],
+    "Cmd": ["-c", "echo ok"],
+    "Env": ["PATH=/usr/bin"],
+    "WorkingDir": "/",
+    "User": ""
+  }
+}"#;
+
+        std::fs::write(&manifest_path, manifest).unwrap();
+        std::fs::write(configs_dir.join(format!("{config_id}.json")), config).unwrap();
+        std::fs::create_dir_all(layers_dir.join(layer_id)).unwrap();
+
+        // Assert shorthand-specific filename is absent; lookup must normalize to canonical path.
+        assert!(!manifests_dir.join("alpine_3.20.json").exists());
+
+        let by_short = query_image_at(root, "alpine:3.20").unwrap();
+        let by_canonical = query_image_at(root, "docker.io/library/alpine:3.20").unwrap();
+
+        assert!(
+            by_short.is_some(),
+            "short ref should resolve cached manifest"
+        );
+        assert!(
+            by_canonical.is_some(),
+            "canonical ref should resolve cached manifest"
+        );
+
+        let short_info = by_short.unwrap();
+        let canonical_info = by_canonical.unwrap();
+
+        assert_eq!(short_info.digest, canonical_info.digest);
+        assert_eq!(short_info.layer_count, canonical_info.layer_count);
+        assert_eq!(short_info.layers, canonical_info.layers);
     }
 
     #[test]
