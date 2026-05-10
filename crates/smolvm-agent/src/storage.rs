@@ -958,35 +958,15 @@ where
         }
     });
 
-    // Check if already cached with correct architecture
-    if let Ok(Some(info)) = query_image(image) {
-        // Verify cached image architecture matches requested OCI platform
-        let cached_arch = &info.architecture;
-        let requested_arch = oci_platform
-            .map(oci_platform_to_arch)
-            .unwrap_or_else(|| cached_arch.clone());
+    let cache_strategy =
+        resolve_cache_decision(query_image(image), oci_platform.map(oci_platform_to_arch));
 
-        if cached_arch == &requested_arch {
-            debug!(
-                image = %image,
-                architecture = %cached_arch,
-                "image already cached with correct architecture, skipping pull"
-            );
-            return Ok(info);
-        } else {
-            // Architecture mismatch - need to re-pull
-            info!(
-                image = %image,
-                cached_arch = %cached_arch,
-                requested_arch = %requested_arch,
-                "cached image has wrong architecture, will re-pull"
-            );
-            // Clean up the mismatched cached manifest
-            let root = Path::new(STORAGE_ROOT);
-            let sanitized_image_ref = sanitized_image_from(image)?;
-            let manifest_path = root.join(MANIFESTS_DIR).join(sanitized_image_ref + ".json");
-            let _ = std::fs::remove_file(&manifest_path);
-        }
+    if let CacheDecision::UseCache(info) = cache_strategy {
+        return Ok(info);
+    }
+
+    if let CacheDecision::Fail(message) = cache_strategy {
+        return Err(StorageError::Internal { message });
     }
 
     let root = Path::new(STORAGE_ROOT);
@@ -1036,8 +1016,7 @@ where
     let total_layers = layers.len();
 
     // Save manifest
-    let sanitized_image_ref = sanitized_image_from(image)?;
-    let manifest_path = root.join(MANIFESTS_DIR).join(sanitized_image_ref + ".json");
+    let manifest_path = image_manifest_path(image)?;
     std::fs::write(&manifest_path, &manifest)?;
 
     // Fetch and save config
@@ -1214,31 +1193,63 @@ where
     })
 }
 
+#[derive(Debug)]
 enum CacheDecision {
-    UseCache,
+    UseCache(ImageInfo),
     Pull,
-    PullForArch,
     Fail(String),
 }
 
-fn resolve_cache_decision(query_result: Result<Option<ImageInfo>>) -> Result<CacheDecision> {
-    // TODO: do we need to manually parse error here or should callsite unwrap the result?
-    // I think we need to unwrap it and then we can default to Fail(String) or Pull...
-    // match query_result? {
-    //     // TODO: parse info
-    //     Some(info) => Ok(CacheDecision::UseCache),
-    //     None => Ok(CacheDecision::Pull),
-    // }
-    //
-    todo!()
+/// Get the fully-qualified and sanitized path to an image's manifest
+fn image_manifest_path(image: &str) -> Result<PathBuf> {
+    let sanitized_image = sanitized_image_from(image)?;
+    return Ok(Path::new(STORAGE_ROOT)
+        .join(MANIFESTS_DIR)
+        .join(sanitized_image + ".json"));
+}
+
+/// Use query image result to determine if cache can be used,
+/// pull is needed, or if the process should fail
+fn resolve_cache_decision(
+    query_result: Result<Option<ImageInfo>>,
+    requested_arch: Option<String>,
+) -> CacheDecision {
+    match query_result {
+        Ok(None) => return CacheDecision::Pull,
+        Ok(Some(info)) => {
+            let cached_arch = &info.architecture;
+            let next_arch = requested_arch.unwrap_or_else(|| cached_arch.clone());
+
+            if cached_arch != &next_arch {
+                let image = &info.reference;
+                // Architecture mismatch - need to re-pull
+                info!(
+                    image = %image,
+                    cached_arch = %cached_arch,
+                    requested_arch = %next_arch,
+                    "cached image has wrong architecture, will re-pull"
+                );
+                // Clean up the mismatched cached manifest
+                if let Ok(manifest_path) = image_manifest_path(image) {
+                    let _ = std::fs::remove_file(&manifest_path);
+                }
+                return CacheDecision::Pull;
+            }
+            // cache hit with a valid arch and parsed ImageInfo
+            debug!(
+                image = %info.reference,
+                architecture = %cached_arch,
+                "image already cached with correct architecture, skipping pull"
+            );
+            return CacheDecision::UseCache(info);
+        }
+        Err(e) => CacheDecision::Fail(format!("cache query failed: {e}")),
+    }
 }
 
 /// Query if an image exists locally.
 pub fn query_image(image: &str) -> Result<Option<ImageInfo>> {
-    let root = Path::new(STORAGE_ROOT);
-    let sanitized_ref = sanitized_image_from(image)?;
-    let manifest_path = root.join(MANIFESTS_DIR).join(sanitized_ref + ".json");
-
+    let manifest_path = image_manifest_path(image)?;
     if !manifest_path.exists() {
         return Ok(None);
     }
@@ -1270,6 +1281,7 @@ pub fn query_image(image: &str) -> Result<Option<ImageInfo>> {
     let config_id = config_digest
         .strip_prefix("sha256:")
         .unwrap_or(config_digest);
+    let root = Path::new(STORAGE_ROOT);
     let config_path = root.join(CONFIGS_DIR).join(format!("{}.json", config_id));
     let config = std::fs::read_to_string(&config_path)?;
     let config_json: serde_json::Value =
@@ -2827,6 +2839,8 @@ fn crane_config(
     run_crane("config", image, oci_platform, auth)
 }
 
+/// Convert a string to a fully-qualified image reference
+/// sanitized for use as a file name
 fn sanitized_image_from(image: &str) -> Result<String> {
     match parse_image_ref(image) {
         Ok(r) => return Ok(r.sanitized()),
@@ -2958,26 +2972,36 @@ mod tests {
 
     #[test]
     fn test_resolve_cache_decision_uses_cache_on_hit() {
-        let result = resolve_cache_decision(Ok(Some(sample_image_info("amd64"))));
+        let result = resolve_cache_decision(
+            Ok(Some(sample_image_info("amd64"))),
+            Some("amd64".to_string()),
+        );
 
         match result {
-            Ok(CacheDecision::UseCache) => {}
-            Ok(other) => panic!(
-                "expected UseCache, got {:?}",
-                std::mem::discriminant(&other)
-            ),
-            Err(e) => panic!("expected UseCache, got error: {e}"),
+            CacheDecision::UseCache(_) => {}
+            _ => panic!("expected cache hit to use cache"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_cache_decision_pulls_on_arch_mismatch() {
+        let result = resolve_cache_decision(
+            Ok(Some(sample_image_info("arm64"))),
+            Some("amd64".to_string()),
+        );
+        match result {
+            CacheDecision::Pull => {}
+            _ => panic!("expected arch mismatch to pull"),
         }
     }
 
     #[test]
     fn test_resolve_cache_decision_pulls_on_cache_miss() {
-        let result = resolve_cache_decision(Ok(None));
+        let result = resolve_cache_decision(Ok(None), None);
 
         match result {
-            Ok(CacheDecision::Pull) => {}
-            Ok(other) => panic!("expected Pull, got {:?}", std::mem::discriminant(&other)),
-            Err(e) => panic!("expected Pull, got error: {e}"),
+            CacheDecision::Pull => {}
+            _ => panic!("expected cache miss to pull"),
         }
     }
 
@@ -2988,16 +3012,48 @@ mod tests {
             serde_json::from_str::<serde_json::Value>("{").unwrap_err(),
         );
 
-        let result = resolve_cache_decision(Err(query_error));
+        let result = resolve_cache_decision(Err(query_error), None);
 
         match result {
-            Ok(CacheDecision::Fail(_)) => {}
-            Ok(other) => panic!(
-                "expected Fail decision, got {:?}",
-                std::mem::discriminant(&other)
-            ),
-            Err(e) => panic!("expected Fail decision, got error instead: {e}"),
+            CacheDecision::Fail(_) => {}
+            _ => panic!("expected query error to fail"),
         }
+    }
+
+    #[test]
+    fn test_resolve_cache_decision_returns_fail_on_io_query_error() {
+        let query_error: StorageError =
+            std::io::Error::new(std::io::ErrorKind::NotFound, "manifest missing").into();
+
+        let result = resolve_cache_decision(Err(query_error), None);
+
+        match result {
+            CacheDecision::Fail(_) => {}
+            _ => panic!("expected query error to fail"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_cache_decision_never_bubbles_query_errors() {
+        let parse_error = StorageError::parse_error(
+            "config",
+            serde_json::from_str::<serde_json::Value>("{").unwrap_err(),
+        );
+
+        let io_error: StorageError =
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied").into();
+
+        let parse_result = resolve_cache_decision(Err(parse_error), None);
+        let io_result = resolve_cache_decision(Err(io_error), None);
+        match parse_result {
+            CacheDecision::Fail(_) => {}
+            _ => panic!("query parse errors should resolve to CacheDecision::Fail"),
+        };
+
+        match io_result {
+            CacheDecision::Fail(_) => {}
+            _ => panic!("query IO errors should resolve to CacheDecision::Fail"),
+        };
     }
 
     #[test]
