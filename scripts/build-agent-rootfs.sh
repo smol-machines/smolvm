@@ -136,11 +136,17 @@ install_packages_apk_static() {
     echo "${ALPINE_MIRROR}/v${ALPINE_VERSION}/main" > "$OUTPUT_DIR/etc/apk/repositories"
     echo "${ALPINE_MIRROR}/v${ALPINE_VERSION}/community" >> "$OUTPUT_DIR/etc/apk/repositories"
 
+    # --no-scripts: skip pre/post-install scripts and triggers.
+    # When cross-building (e.g. aarch64 rootfs on x86_64 host), those scripts
+    # are aarch64 ELF binaries that the host kernel can't exec, causing exit
+    # code 127. The minirootfs already ships busybox symlinks, and seatd runs
+    # as root in the VM so the 'seat' group creation is not required.
     /tmp/apk-static/sbin/apk.static \
         --root "$OUTPUT_DIR" \
         --initdb \
         --no-cache \
         --allow-untrusted \
+        --no-scripts \
         --arch "$ALPINE_ARCH" \
         add $APK_PACKAGES
     echo "Packages installed successfully"
