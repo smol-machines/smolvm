@@ -1,0 +1,98 @@
+# Local LLM inference with GPU acceleration
+#
+# Runs llama.cpp with the Vulkan backend inside a microVM, forwarding compute
+# to the host GPU via virtio-gpu → virglrenderer → MoltenVK → Metal.
+#
+# Confirmed on Apple M4 Max:
+#   Vulkan0: Virtio-GPU Venus (Apple M4 Max) (36864 MiB, 36864 MiB free)
+#   Prompt: 634.3 t/s  |  Generation: 170.2 t/s  (Qwen2-0.5B Q4_K_M, -ngl 99)
+#
+# ── Setup (runs once, takes ~5 min to build llama.cpp) ───────────────────────
+#
+#   smolvm machine create llm -s examples/local-llm/local-llm.smolfile
+#   smolvm machine start --name llm
+#
+# ── Download a model ────────────────────────────────────────────────────────
+#
+#   # Download directly into the VM (stored on its persistent overlay disk):
+#
+#   smolvm machine exec --name llm -- sh -c \
+#     'mkdir -p /models && curl -L -o /models/qwen2-0.5b-q4_k_m.gguf \
+#     https://huggingface.co/Qwen/Qwen2-0.5B-Instruct-GGUF/resolve/main/qwen2-0_5b-instruct-q4_k_m.gguf'
+#
+#   # Or for Llama 3.2 3B (better quality, ~2 GB):
+#   smolvm machine exec --name llm -- sh -c \
+#     'mkdir -p /models && curl -L -o /models/llama-3.2-3b-q4_k_m.gguf \
+#     https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf'
+#
+# ── Run inference ────────────────────────────────────────────────────────────
+#
+#   smolvm machine exec --name llm -- sh -c \
+#     '/opt/llama.cpp/build/bin/llama-completion \
+#       -m /models/qwen2-0.5b-q4_k_m.gguf \
+#       -ngl 99 --temp 0.8 -n 256 \
+#       -p "Explain the Venus Vulkan driver in one paragraph." \
+#       2>&1 1>/tmp/resp.txt | grep -E "prompt eval|eval time"; cat /tmp/resp.txt'
+#
+#   # Prints prompt and generation speed (tokens/sec), then the response.
+#   # Drop the grep pipe and use 2>/dev/null instead to suppress all stats.
+#
+# ── Verify GPU is active ─────────────────────────────────────────────────────
+#
+#   smolvm machine exec --name llm -- vulkaninfo --summary
+#   # → deviceName = Virtio-GPU Venus (Apple M4 Max)
+#
+# ── Stop ─────────────────────────────────────────────────────────────────────
+#
+#   smolvm machine stop --name llm
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+image = "fedora:42"
+
+cpus = 8
+memory = 8192
+gpu = true
+gpu_vram = 4096
+net = true
+
+# Venus Vulkan ICD — tells the Vulkan loader to use the virtio GPU driver.
+# The path is architecture-specific:
+#
+#   aarch64 (Apple Silicon, ARM):  virtio_icd.aarch64.json  ← default below
+#   x86_64  (Intel/AMD):           virtio_icd.x86_64.json
+#
+env = [
+    "VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/virtio_icd.aarch64.json",
+]
+
+[dev]
+# Mount your local model directory into /models inside the VM.
+# Set the host path to wherever you store .gguf files, for example:
+#
+#   volumes = ["~/.cache/smolvm/models:/models"]
+#
+# Without this, copy models in with:
+#   smolvm machine exec --name llm -- sh -c 'cat > /tmp/model.gguf' < ./model.gguf
+
+init = [
+    # Enable the patched Mesa Venus driver from COPR.
+    # Required for Apple Silicon (fixes 16 KB page-size alignment in virglrenderer).
+    "dnf copr enable -y slp/mesa-libkrun-vulkan",
+
+    # Install Mesa Vulkan driver + llama.cpp build dependencies.
+    # vulkan-loader-devel provides libvulkan.so and <vulkan/vulkan.h> for CMake's FindVulkan.
+    # glslc and spirv-*-devel are needed to compile Vulkan compute shaders.
+    "dnf install -y --allowerasing --quiet mesa-vulkan-drivers vulkan-loader-devel vulkan-tools git cmake gcc gcc-c++ glslc spirv-headers-devel spirv-tools-devel",
+
+    # Swap the stock mesa-vulkan-drivers for the slp COPR build so the Apple
+    # Silicon 16 KB page-size patch is active.
+    "dnf swap -y --quiet mesa-vulkan-drivers mesa-vulkan-drivers --repo 'copr:copr.fedorainfracloud.org:slp:mesa-libkrun-vulkan'",
+
+    # Clone llama.cpp (skip if already present).
+    "test -d /opt/llama.cpp || git clone --depth 1 https://github.com/ggml-org/llama.cpp /opt/llama.cpp",
+
+    # Build llama.cpp with the Vulkan backend (skip if binary already exists).
+    # First run takes ~5 minutes; subsequent starts are instant.
+    "test -x /opt/llama.cpp/build/bin/llama-cli || (cmake -B /opt/llama.cpp/build -S /opt/llama.cpp -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_TESTS=OFF && cmake --build /opt/llama.cpp/build --target llama-cli llama-completion llama-server -j$(nproc))",
+]
