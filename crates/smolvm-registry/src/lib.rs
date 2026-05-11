@@ -52,6 +52,9 @@ pub enum RegistryError {
     #[error("registry returned {status}: {body}")]
     ApiError { status: u16, body: String },
 
+    #[error("registry authentication failed: {message}")]
+    Authentication { message: String },
+
     #[error("digest mismatch: expected {expected}, got {actual}")]
     DigestMismatch { expected: String, actual: String },
 

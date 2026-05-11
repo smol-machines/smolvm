@@ -122,6 +122,11 @@ impl RegistryConfig {
         entry.username = Some(username);
         entry.password = Some(password);
         entry.password_env = None;
+        // Clear OAuth fields — caller supplies them explicitly if needed.
+        // Leaving stale refresh_token/expires_at would cause spurious refresh
+        // attempts after switching from OAuth to static credentials.
+        entry.refresh_token = None;
+        entry.expires_at = None;
     }
 
     /// Set a token for a registry using the `username="token"` convention.
@@ -131,7 +136,6 @@ impl RegistryConfig {
     pub fn set_token(&mut self, registry: &str, token: &str) {
         self.set_credentials(registry, "token".to_string(), token.to_string());
     }
-
 }
 
 /// Default registry when none specified in image reference.
@@ -817,7 +821,11 @@ mirror = "ghcr-mirror.example.com"
         assert_eq!(entry.username.as_deref(), Some("new"));
         assert_eq!(entry.password.as_deref(), Some("newpass"));
         assert_eq!(entry.password_env, None, "password_env must be cleared");
-        assert_eq!(entry.mirror.as_deref(), Some("mirror.example.com"), "mirror must be preserved");
+        assert_eq!(
+            entry.mirror.as_deref(),
+            Some("mirror.example.com"),
+            "mirror must be preserved"
+        );
     }
 
     #[test]

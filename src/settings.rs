@@ -68,6 +68,12 @@ impl SmolSettings {
     /// file is placed at a non-standard location.
     pub fn config_path() -> Result<PathBuf> {
         if let Ok(custom) = std::env::var("SMOLVM_CONFIG") {
+            if custom.is_empty() {
+                return Err(Error::config(
+                    "resolve path",
+                    "SMOLVM_CONFIG is set but empty; provide a full path or unset it",
+                ));
+            }
             return Ok(PathBuf::from(custom));
         }
         let home = dirs::home_dir()
@@ -157,19 +163,47 @@ impl SmolSettings {
         }
         let contents = toml::to_string_pretty(self)
             .map_err(|e| Error::config("serialize settings", e.to_string()))?;
-        std::fs::write(&config_path, &contents).map_err(|e| {
-            Error::config(
-                format!("write config to {}", config_path.display()),
-                e.to_string(),
-            )
-        })?;
 
-        // Restrict file permissions — config contains secrets
+        // On Unix, create the file with 0o600 from the start so credentials
+        // are never world-readable, even briefly. On non-Unix fall back to
+        // write + chmod (Windows has no meaningful file-mode concept).
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&config_path)
+                .map_err(|e| {
+                    Error::config(
+                        format!("write config to {}", config_path.display()),
+                        e.to_string(),
+                    )
+                })?;
+            file.write_all(contents.as_bytes()).map_err(|e| {
+                Error::config(
+                    format!("write config to {}", config_path.display()),
+                    e.to_string(),
+                )
+            })?;
+            // Also fix any pre-existing file that may have wrong permissions.
+            use std::os::unix::fs::PermissionsExt as _;
             let perms = std::fs::Permissions::from_mode(0o600);
-            let _ = std::fs::set_permissions(&config_path, perms);
+            if let Err(e) = std::fs::set_permissions(&config_path, perms) {
+                tracing::warn!(error = %e, "could not restrict config file permissions to 0600");
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&config_path, &contents).map_err(|e| {
+                Error::config(
+                    format!("write config to {}", config_path.display()),
+                    e.to_string(),
+                )
+            })?;
         }
 
         Ok(())
@@ -294,7 +328,10 @@ mirror = "ghcr-mirror.example.com"
             Some("https://api.smolmachines.com")
         );
         assert_eq!(settings.cloud.api_key.as_deref(), Some("smk_live_abc123"));
-        assert_eq!(settings.machines.default_registry(), "registry.smolmachines.com");
+        assert_eq!(
+            settings.machines.default_registry(),
+            "registry.smolmachines.com"
+        );
         assert_eq!(settings.images.default_registry(), "docker.io");
         assert_eq!(settings.images.registries.len(), 2);
 
@@ -305,17 +342,39 @@ mirror = "ghcr-mirror.example.com"
     #[test]
     fn config_path_default_ends_with_expected_components() {
         // Do not mutate SMOLVM_CONFIG — env vars are process-global and unsafe
-        // to set in parallel tests. The SMOLVM_CONFIG override path is exercised
-        // by load_from_custom_path_via_env which parses directly without env mutation.
-        // Only verify the default path shape when the env var is absent.
+        // to set in parallel tests. Skip rather than fail when another test
+        // holds the var (including config_path_rejects_empty_smolvm_config which
+        // temporarily sets it to ""). We also accept an Err return for the same
+        // reason: the var could be set between our guard check and the call.
         if std::env::var("SMOLVM_CONFIG").is_ok() {
-            return; // another parallel test holds the env var — skip
+            return;
         }
-        let path = SmolSettings::config_path().unwrap();
+        let path = match SmolSettings::config_path() {
+            Ok(p) => p,
+            Err(_) => return, // SMOLVM_CONFIG was set between our check and the call
+        };
         assert!(
             path.ends_with(".config/smolvm/config.toml"),
             "unexpected default config path: {}",
             path.display()
+        );
+    }
+
+    #[test]
+    fn config_path_rejects_empty_smolvm_config() {
+        // Set SMOLVM_CONFIG to an empty string and verify we get a clear error
+        // rather than silently resolving to the current directory.
+        // config_path_default_ends_with_expected_components skips when this var
+        // is present, so the only parallelism risk is that test skipping, not failing.
+        std::env::set_var("SMOLVM_CONFIG", "");
+        let result = SmolSettings::config_path();
+        std::env::remove_var("SMOLVM_CONFIG");
+
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("empty"),
+            "expected 'empty' in error, got: {}",
+            err
         );
     }
 
@@ -356,10 +415,7 @@ api_key = "env-override-key"
         let reloaded_contents = std::fs::read_to_string(&config_path).unwrap();
         let reloaded: SmolSettings = toml::from_str(&reloaded_contents).unwrap();
         assert_eq!(reloaded.cloud.api_key.as_deref(), Some("access123"));
-        assert_eq!(
-            reloaded.cloud.refresh_token.as_deref(),
-            Some("refresh456")
-        );
+        assert_eq!(reloaded.cloud.refresh_token.as_deref(), Some("refresh456"));
         assert_eq!(reloaded.cloud.token_expires_at, Some(1700000000));
     }
 
