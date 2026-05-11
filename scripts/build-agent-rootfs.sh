@@ -103,7 +103,7 @@ tar -xzf "$CRANE_TAR" -C "$OUTPUT_DIR/usr/local/bin" crane
 #   1. apk.static (Linux only) — runs natively, supports cross-arch via --arch
 #   2. smolvm (any host) — only for native-arch builds (pulls host-arch image)
 echo "Installing additional packages..."
-APK_PACKAGES="jq e2fsprogs e2fsprogs-extra crun util-linux libcap"
+APK_PACKAGES="jq e2fsprogs e2fsprogs-extra crun util-linux libcap seatd"
 
 # Determine if this is a cross-arch build
 HOST_ARCH="$(uname -m)"
@@ -208,6 +208,9 @@ ln -sf /usr/local/bin/smolvm-agent "$OUTPUT_DIR/sbin/init"
 
 # Create resolv.conf
 echo "nameserver 1.1.1.1" > "$OUTPUT_DIR/etc/resolv.conf"
+
+# Remove seatd socket if baked in during build (build artifact, not runtime state)
+rm -f "$OUTPUT_DIR/run/seatd.sock"
 
 PROFILE="release-small"
 
