@@ -100,7 +100,7 @@ jobs:
       - name: Build rootfs
         run: |
           chmod +x /tmp/agent/smolvm-agent
-          AGENT_BINARY=/tmp/agent/smolvm-agent \
+          sudo env AGENT_BINARY=/tmp/agent/smolvm-agent \
             ./scripts/build-agent-rootfs.sh --arch ${{ matrix.arch }} --no-build-agent
 
       - name: Package rootfs as tarball
