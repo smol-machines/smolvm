@@ -567,41 +567,30 @@ impl OciSpec {
 
     /// Expose GPU render nodes to the container if /dev/dri exists in the VM.
     ///
-    /// Detects virtio-gpu devices at runtime and adds them to the OCI spec.
-    /// This allows containers to use Vulkan (via Mesa Venus) without any
-    /// special configuration — if the VM was started with `--gpu`, the
-    /// devices appear automatically.
+    /// Detects virtio-gpu devices at runtime and adds a bind mount to the OCI
+    /// spec. This allows containers to use Vulkan (via Mesa Venus) without any
+    /// special configuration — if the VM was started with `--gpu`, the devices
+    /// appear automatically inside every container.
     pub fn add_gpu_devices_if_available(&mut self) {
         let dri_path = std::path::Path::new("/dev/dri");
         if !dri_path.exists() {
             return;
         }
 
-        // DRM card device (for modesetting, display)
-        if std::path::Path::new("/dev/dri/card0").exists() {
-            self.linux.devices.push(OciDevice {
-                device_type: "c".to_string(),
-                path: "/dev/dri/card0".to_string(),
-                major: 226,
-                minor: 0,
-                file_mode: Some(0o666),
-                uid: Some(0),
-                gid: Some(0),
-            });
-        }
-
-        // Render node (for Vulkan/OpenGL compute — no modesetting privileges)
-        if std::path::Path::new("/dev/dri/renderD128").exists() {
-            self.linux.devices.push(OciDevice {
-                device_type: "c".to_string(),
-                path: "/dev/dri/renderD128".to_string(),
-                major: 226,
-                minor: 128,
-                file_mode: Some(0o666),
-                uid: Some(0),
-                gid: Some(0),
-            });
-        }
+        // Bind-mount /dev/dri from the VM's devtmpfs into the container.
+        //
+        // A bind mount is used rather than linux.devices entries because crun
+        // sets up a fresh tmpfs at /dev; the /dev/dri sub-directory does not
+        // exist in that tmpfs, so mknod silently fails for any device node
+        // whose parent directory is missing.  A bind mount is equivalent to
+        // `--device /dev/dri` in Docker/Podman, and crun creates the
+        // destination directory automatically when it does not yet exist.
+        self.mounts.push(OciMount {
+            destination: "/dev/dri".to_string(),
+            mount_type: Some("bind".to_string()),
+            source: "/dev/dri".to_string(),
+            options: vec!["bind".to_string(), "rprivate".to_string()],
+        });
     }
 
     /// Write the OCI spec to a config.json file in the bundle directory.
@@ -1190,24 +1179,23 @@ mod tests {
 
     #[test]
     fn test_gpu_devices_added_when_dri_exists() {
-        // On a system with /dev/dri (GPU-enabled VM), devices should be added
+        // On a system with /dev/dri (GPU-enabled VM), a bind mount is added
         let identity = ProcessIdentity::root();
         let mut spec = OciSpec::new(&["echo".to_string()], &[], "/", false, &identity);
-        let before = spec.linux.devices.len();
+        let mounts_before = spec.mounts.len();
         spec.add_gpu_devices_if_available();
 
-        if std::path::Path::new("/dev/dri/renderD128").exists() {
-            // GPU present — devices were added
-            assert!(spec.linux.devices.len() > before);
+        if std::path::Path::new("/dev/dri").exists() {
+            // GPU present — /dev/dri bind mount was added
+            assert!(spec.mounts.len() > mounts_before);
+            assert!(spec.mounts.iter().any(|m| m.destination == "/dev/dri"));
             assert!(spec
-                .linux
-                .devices
+                .mounts
                 .iter()
-                .any(|d| d.path == "/dev/dri/renderD128"));
-            assert!(spec.linux.devices.iter().any(|d| d.major == 226));
+                .any(|m| m.destination == "/dev/dri" && m.options.contains(&"bind".to_string())));
         } else {
-            // No GPU — no devices added (no-op)
-            assert_eq!(spec.linux.devices.len(), before);
+            // No GPU — no extra mounts added (no-op)
+            assert_eq!(spec.mounts.len(), mounts_before);
         }
     }
 
@@ -1215,26 +1203,23 @@ mod tests {
     fn test_gpu_devices_correct_properties() {
         let identity = ProcessIdentity::root();
         let mut spec = OciSpec::new(&["echo".to_string()], &[], "/", false, &identity);
-        // Manually add GPU devices to verify properties
-        spec.linux.devices.push(super::OciDevice {
-            device_type: "c".to_string(),
-            path: "/dev/dri/renderD128".to_string(),
-            major: 226,
-            minor: 128,
-            file_mode: Some(0o666),
-            uid: Some(0),
-            gid: Some(0),
+        // Manually push a GPU bind mount to verify expected properties
+        spec.mounts.push(super::OciMount {
+            destination: "/dev/dri".to_string(),
+            mount_type: Some("bind".to_string()),
+            source: "/dev/dri".to_string(),
+            options: vec!["bind".to_string(), "rprivate".to_string()],
         });
 
-        let dev = spec
-            .linux
-            .devices
+        let mount = spec
+            .mounts
             .iter()
-            .find(|d| d.path == "/dev/dri/renderD128")
+            .find(|m| m.destination == "/dev/dri")
             .unwrap();
-        assert_eq!(dev.device_type, "c");
-        assert_eq!(dev.major, 226);
-        assert_eq!(dev.minor, 128);
-        assert_eq!(dev.file_mode, Some(0o666)); // world-readable for non-root Vulkan
+        assert_eq!(mount.mount_type, Some("bind".to_string()));
+        assert_eq!(mount.source, "/dev/dri");
+        // rprivate prevents the host from seeing any new mounts inside the
+        // container's /dev/dri subtree.
+        assert!(mount.options.contains(&"rprivate".to_string()));
     }
 }

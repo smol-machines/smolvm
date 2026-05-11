@@ -700,9 +700,25 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
         return Err(e);
     }
 
-    if record.image.is_some() {
-        // Image-based machine: VM is running, image pulled and cached,
-        // init done. Sits idle until `machine exec` is called.
+    if let Some(ref img) = record.image {
+        // Image-based machine: start background CMD if configured.
+        let mut cmd = record.entrypoint.clone();
+        cmd.extend(record.cmd.clone());
+        if !cmd.is_empty() {
+            let mount_bindings =
+                crate::cli::parsers::record_mounts_to_runconfig_bindings(&record.mounts);
+            let bg_config = smolvm::agent::RunConfig::new(img, cmd)
+                .with_env(record.env.clone())
+                .with_workdir(record.workdir.clone())
+                .with_mounts(mount_bindings)
+                .with_persistent_overlay(Some(name.to_string()));
+            if let Err(e) = client.run_background(bg_config) {
+                if let Err(stop_err) = manager.stop() {
+                    tracing::warn!(error = %stop_err, "failed to stop machine after CMD launch failure");
+                }
+                return Err(smolvm::Error::agent("start background CMD", format!("{e}")));
+            }
+        }
         println!("Machine '{}' running (PID: {})", name, pid.unwrap_or(0));
     } else {
         // No image — bare VM mode. Run entrypoint+cmd if configured.
@@ -785,6 +801,8 @@ pub fn persist_named_running(
                 r.cmd = o.cmd.clone();
                 r.ssh_agent = o.ssh_agent;
                 r.dns_filter_hosts = o.dns_filter_hosts.clone();
+                r.gpu = if o.gpu { Some(true) } else { None };
+                r.gpu_vram_mib = o.gpu_vram_mib;
             }
         })
         .ok_or_else(|| smolvm::Error::config(
@@ -816,6 +834,8 @@ pub struct DefaultVmOverrides {
     pub cmd: Vec<String>,
     pub ssh_agent: bool,
     pub dns_filter_hosts: Option<Vec<String>>,
+    pub gpu: bool,
+    pub gpu_vram_mib: Option<u32>,
 }
 
 /// Check if any running VM already binds to the same host ports.

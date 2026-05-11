@@ -214,7 +214,19 @@ fn main() {
                 "guest virtio network configured"
             );
         }
-        Ok(false) => {}
+        Ok(false) => {
+            // TSI mode or no network. The overlay may contain a stale
+            // "nameserver 127.0.0.1" written by a previous --allow-host run.
+            // TSI forwards UDP to 1.1.1.1 directly, so reset resolv.conf to a
+            // known-good value unless the DNS filter proxy is about to
+            // overwrite it with 127.0.0.1 anyway.
+            if !dns_proxy::is_enabled() {
+                let _ = std::fs::write(
+                    "/etc/resolv.conf",
+                    "nameserver 1.1.1.1\nnameserver 8.8.8.8\n",
+                );
+            }
+        }
         Err(err) => {
             error!(error = %err, "failed to configure guest network");
             std::process::exit(1);
@@ -486,18 +498,48 @@ fn setup_gpu_dev_nodes() {
         return;
     }
 
-    let Ok(entries) = std::fs::read_dir(sysfs_drm) else {
-        return;
+    // The virtio-gpu driver may not have finished probing when the agent
+    // starts — sysfs entries appear only after probe() completes.  Poll
+    // for up to ~500 ms in 10 ms increments rather than racing with the
+    // driver.  On fast boots the first read already wins; the loop just
+    // handles the small window where the driver is still initialising.
+    let entries = {
+        let mut found = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        loop {
+            let Ok(rd) = std::fs::read_dir(sysfs_drm) else {
+                break;
+            };
+            let candidates: Vec<_> = rd
+                .flatten()
+                .filter(|e| {
+                    let n = e.file_name();
+                    let s = n.to_string_lossy();
+                    s.starts_with("renderD") || s.starts_with("card")
+                })
+                .collect();
+            if !candidates.is_empty() {
+                found = candidates;
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            // SAFETY: nanosleep — always safe
+            unsafe {
+                libc::nanosleep(
+                    &libc::timespec {
+                        tv_sec: 0,
+                        tv_nsec: 10_000_000,
+                    },
+                    std::ptr::null_mut(),
+                );
+            }
+        }
+        found
     };
-    let entries: Vec<_> = entries.flatten().collect();
 
-    // Only proceed if there are DRM nodes (render nodes or cards)
-    let has_nodes = entries.iter().any(|e| {
-        let n = e.file_name();
-        let s = n.to_string_lossy();
-        s.starts_with("renderD") || s.starts_with("card")
-    });
-    if !has_nodes {
+    if entries.is_empty() {
         return;
     }
 
@@ -506,9 +548,6 @@ fn setup_gpu_dev_nodes() {
     for entry in &entries {
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        if !name_str.starts_with("renderD") && !name_str.starts_with("card") {
-            continue;
-        }
 
         // Read major:minor from sysfs (e.g. "226:128\n")
         let dev_file = sysfs_drm.join(&*name_str).join("dev");

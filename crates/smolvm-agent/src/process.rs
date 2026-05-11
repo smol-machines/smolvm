@@ -90,6 +90,14 @@ pub fn is_peer_closed(_fd: std::os::unix::io::RawFd) -> bool {
 ///
 /// Reads raw bytes — preserves binary output (image bytes, tarballs, etc.)
 /// that `read_to_string` would truncate at the first non-UTF-8 byte.
+///
+/// # Safety note
+///
+/// Call this only AFTER the process has already exited (or been killed).
+/// If the process is still running and has filled the pipe buffer (~64 KB on
+/// Linux), reading blocks until the process exits — which it cannot do while
+/// the pipe is full.  Prefer `spawn_pipe_drains` + `join_pipe_drains` when
+/// the process is still running.
 pub fn capture_child_output(child: &mut Child) -> ChildOutput {
     let mut output = ChildOutput::default();
 
@@ -101,6 +109,53 @@ pub fn capture_child_output(child: &mut Child) -> ChildOutput {
     }
 
     output
+}
+
+/// Start background threads that drain the child's stdout and stderr pipes.
+///
+/// This must be called BEFORE the wait loop so the pipes are continuously
+/// drained while the process runs.  If a process fills the ~64 KB Linux pipe
+/// buffer and nobody is reading, its next `write(2)` blocks and the process
+/// can never exit — a classic pipe-deadlock.
+///
+/// Returns `(stdout_drain, stderr_drain)` join handles.  Call
+/// `join_pipe_drains` to collect the output after the process has exited.
+pub fn spawn_pipe_drains(
+    child: &mut Child,
+) -> (
+    Option<std::thread::JoinHandle<Vec<u8>>>,
+    Option<std::thread::JoinHandle<Vec<u8>>>,
+) {
+    let stdout_handle = child.stdout.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            buf
+        })
+    });
+    let stderr_handle = child.stderr.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            buf
+        })
+    });
+    (stdout_handle, stderr_handle)
+}
+
+/// Collect output from pipe-drain threads started by `spawn_pipe_drains`.
+pub fn join_pipe_drains(
+    stdout_handle: Option<std::thread::JoinHandle<Vec<u8>>>,
+    stderr_handle: Option<std::thread::JoinHandle<Vec<u8>>>,
+) -> ChildOutput {
+    ChildOutput {
+        stdout: stdout_handle
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default(),
+        stderr: stderr_handle
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default(),
+    }
 }
 
 /// Wait for a child process with optional timeout.
@@ -120,11 +175,14 @@ pub fn wait_with_timeout(
     let poll_interval = Duration::from_millis(poll_interval_ms.unwrap_or(10));
     let deadline = timeout_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
 
+    // Drain pipes in background threads so they never fill up and deadlock the child.
+    let (stdout_drain, stderr_drain) = spawn_pipe_drains(child);
+
     loop {
         match try_wait_with_eintr(child) {
             Ok(Some(status)) => {
-                // Process completed
-                let output = capture_child_output(child);
+                // Process completed — join drains to get full output.
+                let output = join_pipe_drains(stdout_drain, stderr_drain);
                 let exit_code = status.code().unwrap_or(-1);
                 return Ok(WaitResult::Completed { exit_code, output });
             }
@@ -136,8 +194,8 @@ pub fn wait_with_timeout(
                         let _ = child.kill();
                         let _ = child.wait();
 
-                        // Capture any partial output
-                        let output = capture_child_output(child);
+                        // Collect any partial output from the drain threads.
+                        let output = join_pipe_drains(stdout_drain, stderr_drain);
 
                         return Ok(WaitResult::TimedOut {
                             output,

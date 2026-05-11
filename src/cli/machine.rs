@@ -404,7 +404,8 @@ impl RunCmd {
             memory_mib: params.mem,
             network: params.net,
             network_backend: params.network_backend,
-            gpu: self.gpu,
+            // CLI --gpu wins; Smolfile gpu = true also enables it.
+            gpu: self.gpu || params.gpu,
             gpu_vram_mib: self.gpu_vram_mib.or(params.gpu_vram_mib),
             storage_gib: params.storage_gb,
             overlay_gib: params.overlay_gb,
@@ -633,6 +634,8 @@ impl RunCmd {
                                 cmd: params.cmd.clone(),
                                 ssh_agent: self.ssh_agent || params.ssh_agent,
                                 dns_filter_hosts: params.dns_filter_hosts.clone(),
+                                gpu: self.gpu || params.gpu,
+                                gpu_vram_mib: self.gpu_vram_mib.or(params.gpu_vram_mib),
                             }),
                         )
                     });
@@ -761,6 +764,8 @@ impl RunCmd {
                             cmd: params.cmd.clone(),
                             ssh_agent: self.ssh_agent || params.ssh_agent,
                             dns_filter_hosts: params.dns_filter_hosts.clone(),
+                            gpu: self.gpu || params.gpu,
+                            gpu_vram_mib: self.gpu_vram_mib.or(params.gpu_vram_mib),
                         }),
                     )?;
                 }

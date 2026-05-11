@@ -37,8 +37,12 @@ pub const AGENT_VM_NAME: &str = "smolvm-agent";
 ///   bit 6  — VIRGLRENDERER_VENUS           (both): Vulkan-over-virtio-gpu (Venus ICD)
 ///   bit 7  — VIRGLRENDERER_NO_VIRGL        (macOS): skip OpenGL (vrend) init — without
 ///             EGL, vrend_renderer_init crashes on null platform function pointers
-///   bit 9  — VIRGLRENDERER_RENDER_SERVER   (Linux): required for the Venus render-server
-///             subprocess (spawn is Linux-only; on macOS render_server_fd is always None)
+///   bit 9  — VIRGLRENDERER_RENDER_SERVER   (Linux): REQUIRED for render-server mode.
+///             Enables virglrenderer to call the get_server_fd callback and use an
+///             external render server.  Without this bit, virglrenderer attempts
+///             in-process Venus which fails (version stays 0).  With get_server_fd
+///             provided in the callbacks struct, virglrenderer uses the externally
+///             spawned virgl_render_server instead of fork/exec-ing its own process.
 fn gpu_virgl_flags() -> u32 {
     #[cfg(target_os = "linux")]
     {

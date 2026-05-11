@@ -2184,6 +2184,7 @@ pub fn spawn_in_overlay(
     }
 
     crate::ssh_agent::inject_into_container(&mut spec);
+    spec.add_gpu_devices_if_available();
 
     spec.write_to(&bundle_path)
         .map_err(|e| StorageError::new(format!("failed to write OCI spec: {}", e)))?;
