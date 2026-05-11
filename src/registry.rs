@@ -25,20 +25,38 @@ pub struct RegistryConfig {
 }
 
 /// Configuration for a single registry.
+///
+/// Two distinct auth paths — only one should be set per entry:
+///
+/// **Identity token path** (`identity_token`): an upstream credential (e.g. Auth0 JWT)
+/// exchanged with a token service per-operation to obtain a short-lived OCI bearer token.
+/// Used for smolmachines registries where a Cloudflare token service sits in front.
+/// `RegistryClient::with_identity_token` implements the exchange.
+///
+/// **Direct bearer path** (`password` / `password_env`): an OCI bearer token sent
+/// directly to the registry. Used for Docker Hub, GHCR, and other standard OCI
+/// registries that accept static credentials.
+///
+/// `identity_token` takes precedence over `password`/`password_env` when both are set.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RegistryEntry {
-    /// Username for authentication.
+    /// Username for authentication (direct bearer path only).
     pub username: Option<String>,
-    /// Password (plaintext - not recommended, use password_env instead).
+    /// Direct OCI bearer token or password (not recommended for secrets; use password_env).
     pub password: Option<String>,
-    /// Environment variable containing the password.
+    /// Environment variable containing the direct OCI bearer token or password.
     pub password_env: Option<String>,
     /// Mirror URL to use instead of this registry.
     pub mirror: Option<String>,
-    /// OAuth refresh token for silent token renewal.
+    /// Upstream identity credential (e.g. Auth0 JWT) exchanged with a token service
+    /// to obtain a short-lived OCI bearer token per-operation.
+    /// When set, takes precedence over password/password_env.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_token: Option<String>,
+    /// OAuth refresh token used to silently renew identity_token when it expires.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_token: Option<String>,
-    /// Unix timestamp when the access token expires.
+    /// Unix timestamp when identity_token expires.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<i64>,
 }
@@ -122,6 +140,12 @@ impl RegistryConfig {
         entry.username = Some(username);
         entry.password = Some(password);
         entry.password_env = None;
+        // Clear all upstream-credential fields. identity_token takes precedence
+        // over password in build_registry_client(); leaving a stale identity_token
+        // would silently ignore the new direct credentials.
+        entry.identity_token = None;
+        entry.refresh_token = None;
+        entry.expires_at = None;
     }
 
     /// Set a token for a registry using the `username="token"` convention.
@@ -131,7 +155,6 @@ impl RegistryConfig {
     pub fn set_token(&mut self, registry: &str, token: &str) {
         self.set_credentials(registry, "token".to_string(), token.to_string());
     }
-
 }
 
 /// Default registry when none specified in image reference.
@@ -817,7 +840,46 @@ mirror = "ghcr-mirror.example.com"
         assert_eq!(entry.username.as_deref(), Some("new"));
         assert_eq!(entry.password.as_deref(), Some("newpass"));
         assert_eq!(entry.password_env, None, "password_env must be cleared");
-        assert_eq!(entry.mirror.as_deref(), Some("mirror.example.com"), "mirror must be preserved");
+        assert_eq!(
+            entry.mirror.as_deref(),
+            Some("mirror.example.com"),
+            "mirror must be preserved"
+        );
+    }
+
+    #[test]
+    fn test_set_credentials_clears_identity_token() {
+        // If an entry previously had an identity_token, switching to direct credentials
+        // via set_credentials must clear it. identity_token takes precedence in
+        // build_registry_client(); a stale one would silently ignore the new password.
+        let mut config = RegistryConfig::default();
+        config.registries.insert(
+            "registry.smolmachines.com".to_string(),
+            RegistryEntry {
+                identity_token: Some("eyJ_old_jwt".to_string()),
+                refresh_token: Some("old_refresh".to_string()),
+                expires_at: Some(9999999999),
+                ..Default::default()
+            },
+        );
+
+        config.set_credentials(
+            "registry.smolmachines.com",
+            "user".into(),
+            "direct_bearer".into(),
+        );
+
+        let entry = config.registries.get("registry.smolmachines.com").unwrap();
+        assert_eq!(entry.password.as_deref(), Some("direct_bearer"));
+        assert_eq!(
+            entry.identity_token, None,
+            "stale identity_token must be cleared"
+        );
+        assert_eq!(
+            entry.refresh_token, None,
+            "stale refresh_token must be cleared"
+        );
+        assert_eq!(entry.expires_at, None, "stale expires_at must be cleared");
     }
 
     #[test]

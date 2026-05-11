@@ -7,7 +7,7 @@ license = "Apache-2.0"
 
 [dependencies]
 smolvm-pack = { path = "../smolvm-pack" }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
 sha2 = "0.10"
 bytes = "1"
 hex = "0.4"

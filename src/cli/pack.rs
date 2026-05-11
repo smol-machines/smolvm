@@ -1519,8 +1519,15 @@ fn build_registry_client(
 
     let mut client = smolvm_registry::RegistryClient::new(base_url);
 
-    if let Some(auth) = config.get_credentials(registry) {
-        client = client.with_token(auth.password);
+    if let Some(entry) = config.registries.get(registry) {
+        if let Some(identity_token) = &entry.identity_token {
+            // Upstream credential (e.g. Auth0 JWT): exchanged with the token service
+            // per-operation to obtain a short-lived OCI bearer token.
+            client = client.with_identity_token(identity_token.clone());
+        } else if let Some(auth) = config.get_credentials(registry) {
+            // Direct OCI bearer token sent straight to the registry.
+            client = client.with_token(auth.password);
+        }
     }
 
     Ok(client)
@@ -1636,5 +1643,69 @@ mod tests {
         }
         // If None, libkrun wasn't loaded (e.g., weak link + library not found).
         // This is expected in some CI environments and is not a failure.
+    }
+
+    // ── build_registry_client auth path selection ────────────────────────────
+
+    #[test]
+    fn build_registry_client_uses_identity_token_when_set() {
+        let mut config = smolvm::registry::RegistryConfig::default();
+        config.registries.insert(
+            "registry.smolmachines.com".to_string(),
+            smolvm::registry::RegistryEntry {
+                identity_token: Some("eyJ_upstream_jwt".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let client = build_registry_client("registry.smolmachines.com", &config).unwrap();
+        assert_eq!(
+            client.identity_token(),
+            Some("eyJ_upstream_jwt"),
+            "identity_token must be passed to with_identity_token()"
+        );
+    }
+
+    #[test]
+    fn build_registry_client_falls_back_to_password_when_no_identity_token() {
+        let mut config = smolvm::registry::RegistryConfig::default();
+        config.registries.insert(
+            "registry.example.com".to_string(),
+            smolvm::registry::RegistryEntry {
+                username: Some("user".to_string()),
+                password: Some("direct_bearer".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let client = build_registry_client("registry.example.com", &config).unwrap();
+        assert_eq!(
+            client.identity_token(),
+            None,
+            "direct-bearer path must not set an identity_token"
+        );
+    }
+
+    #[test]
+    fn build_registry_client_identity_token_wins_over_password() {
+        // When both are set (shouldn't happen in practice after set_credentials clears
+        // identity_token, but we verify the precedence rule is enforced).
+        let mut config = smolvm::registry::RegistryConfig::default();
+        config.registries.insert(
+            "registry.smolmachines.com".to_string(),
+            smolvm::registry::RegistryEntry {
+                username: Some("user".to_string()),
+                password: Some("stale_password".to_string()),
+                identity_token: Some("eyJ_identity".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let client = build_registry_client("registry.smolmachines.com", &config).unwrap();
+        assert_eq!(
+            client.identity_token(),
+            Some("eyJ_identity"),
+            "identity_token must take precedence over password"
+        );
     }
 }
