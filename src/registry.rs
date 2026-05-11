@@ -1,38 +1,19 @@
-//! Registry configuration for OCI image authentication.
+//! OCI registry credentials and reference parsing.
 //!
-//! This module provides support for:
-//! - Loading registry credentials from a TOML configuration file
-//! - Environment variable-based password resolution
+//! This module provides:
+//! - [`RegistryConfig`] — per-registry credential storage with env-var resolution
+//! - [`Reference`] — OCI image reference parsing (registry/repo:tag@digest)
 //! - Registry mirrors for pull-through caching
 //!
-//! # Configuration File
-//!
-//! The configuration file is located at `~/.config/smolvm/registries.toml`:
-//!
-//! ```toml
-//! [defaults]
-//! # registry = "docker.io"  # Optional: default registry
-//!
-//! [registries."docker.io"]
-//! username = "myuser"
-//! password_env = "DOCKER_HUB_TOKEN"  # Reads from env var
-//!
-//! [registries."ghcr.io"]
-//! username = "github_user"
-//! password_env = "GHCR_TOKEN"
-//!
-//! [registries."registry.example.com"]
-//! username = "user"
-//! password = "secret"  # Direct password (not recommended)
-//! mirror = "mirror.example.com"  # Optional mirror
-//! ```
+//! Configuration is stored in `~/.config/smolvm/config.toml` under the
+//! `[machines]` and `[images]` sections. See [`crate::settings::SmolSettings`].
 
-use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
 
-/// Registry configuration loaded from `~/.config/smolvm/registries.toml`.
+/// Registry credentials and defaults for a set of OCI registries.
+///
+/// Used as the `[machines]` and `[images]` sections within [`SmolSettings`](crate::settings::SmolSettings).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RegistryConfig {
     /// Per-registry configuration entries.
@@ -54,6 +35,12 @@ pub struct RegistryEntry {
     pub password_env: Option<String>,
     /// Mirror URL to use instead of this registry.
     pub mirror: Option<String>,
+    /// OAuth refresh token for silent token renewal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+    /// Unix timestamp when the access token expires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
 }
 
 /// Default registry settings.
@@ -67,60 +54,6 @@ pub struct RegistryDefaults {
 pub use smolvm_protocol::RegistryAuth;
 
 impl RegistryConfig {
-    /// Load registry configuration from the default config file.
-    ///
-    /// If the config file doesn't exist, returns an empty configuration.
-    /// Errors are logged but don't cause failure - we fall back to empty config.
-    pub fn load() -> Result<Self> {
-        let config_path = match Self::config_path() {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::debug!(error = %e, "could not determine registry config path");
-                return Ok(Self::default());
-            }
-        };
-
-        if !config_path.exists() {
-            tracing::debug!(
-                path = %config_path.display(),
-                "registry config file not found, using defaults"
-            );
-            return Ok(Self::default());
-        }
-
-        let contents = std::fs::read_to_string(&config_path).map_err(|e| {
-            Error::config(
-                format!("read registry config at {}", config_path.display()),
-                e.to_string(),
-            )
-        })?;
-
-        let config: Self = toml::from_str(&contents).map_err(|e| {
-            Error::config(
-                format!("parse registry config at {}", config_path.display()),
-                e.to_string(),
-            )
-        })?;
-
-        tracing::debug!(
-            path = %config_path.display(),
-            registry_count = config.registries.len(),
-            "loaded registry configuration"
-        );
-
-        Ok(config)
-    }
-
-    /// Get the path to the registry configuration file.
-    ///
-    /// Always uses `~/.config/smolvm/registries.toml` regardless of platform
-    /// for consistent behavior across macOS and Linux.
-    pub fn config_path() -> Result<PathBuf> {
-        let home = dirs::home_dir()
-            .ok_or_else(|| Error::config("resolve path", "no home directory found"))?;
-        Ok(home.join(".config").join("smolvm").join("registries.toml"))
-    }
-
     /// Get credentials for a registry, resolving environment variables.
     ///
     /// Returns `Some((username, password))` if credentials are configured and available.
@@ -178,6 +111,30 @@ impl RegistryConfig {
     /// Check if any registries are configured.
     pub fn has_registries(&self) -> bool {
         !self.registries.is_empty()
+    }
+
+    /// Set credentials for a registry, creating or updating the entry.
+    ///
+    /// Clears `password_env` when a direct password is provided. Preserves any
+    /// existing `mirror` setting so callers do not need to re-supply it.
+    pub fn set_credentials(&mut self, registry: &str, username: String, password: String) {
+        let entry = self.registries.entry(registry.to_string()).or_default();
+        entry.username = Some(username);
+        entry.password = Some(password);
+        entry.password_env = None;
+        // Clear OAuth fields — caller supplies them explicitly if needed.
+        // Leaving stale refresh_token/expires_at would cause spurious refresh
+        // attempts after switching from OAuth to static credentials.
+        entry.refresh_token = None;
+        entry.expires_at = None;
+    }
+
+    /// Set a token for a registry using the `username="token"` convention.
+    ///
+    /// Suitable for API keys and short-lived JWTs produced by `smol login`.
+    /// Delegates to [`Self::set_credentials`] so mirror is preserved.
+    pub fn set_token(&mut self, registry: &str, token: &str) {
+        self.set_credentials(registry, "token".to_string(), token.to_string());
     }
 }
 
@@ -507,6 +464,7 @@ mod tests {
                 password: Some("testpass".to_string()),
                 password_env: None,
                 mirror: None,
+                ..Default::default()
             },
         );
 
@@ -527,6 +485,7 @@ mod tests {
                 password: Some("testpass".to_string()),
                 password_env: None,
                 mirror: None,
+                ..Default::default()
             },
         );
 
@@ -543,6 +502,7 @@ mod tests {
                 password: None,
                 password_env: None,
                 mirror: None,
+                ..Default::default()
             },
         );
 
@@ -559,6 +519,7 @@ mod tests {
                 password: None,
                 password_env: None,
                 mirror: Some("mirror.example.com".to_string()),
+                ..Default::default()
             },
         );
 
@@ -612,6 +573,7 @@ mirror = "ghcr-mirror.example.com"
                 password: None,
                 password_env: Some("SMOLVM_TEST_TOKEN".to_string()),
                 mirror: None,
+                ..Default::default()
             },
         );
 
@@ -635,6 +597,7 @@ mirror = "ghcr-mirror.example.com"
                 password: None,
                 password_env: Some("SMOLVM_NONEXISTENT_VAR".to_string()),
                 mirror: None,
+                ..Default::default()
             },
         );
 
@@ -824,5 +787,79 @@ mirror = "ghcr-mirror.example.com"
     fn test_reference_error_too_many_components() {
         let err = Reference::parse("a.com/b/c/d:latest").unwrap_err();
         assert!(err.reason.contains("too many path components"));
+    }
+
+    // ── set_credentials / set_token / save ──────────────────────────────────
+
+    #[test]
+    fn test_set_credentials_new_entry() {
+        let mut config = RegistryConfig::default();
+        config.set_credentials("registry.example.com", "user".into(), "pass".into());
+
+        let creds = config.get_credentials("registry.example.com").unwrap();
+        assert_eq!(creds.username, "user");
+        assert_eq!(creds.password, "pass");
+    }
+
+    #[test]
+    fn test_set_credentials_overwrites_password_env() {
+        let mut config = RegistryConfig::default();
+        config.registries.insert(
+            "registry.example.com".to_string(),
+            RegistryEntry {
+                username: Some("old".to_string()),
+                password: None,
+                password_env: Some("OLD_TOKEN_ENV".to_string()),
+                mirror: Some("mirror.example.com".to_string()),
+                ..Default::default()
+            },
+        );
+
+        config.set_credentials("registry.example.com", "new".into(), "newpass".into());
+
+        let entry = config.registries.get("registry.example.com").unwrap();
+        assert_eq!(entry.username.as_deref(), Some("new"));
+        assert_eq!(entry.password.as_deref(), Some("newpass"));
+        assert_eq!(entry.password_env, None, "password_env must be cleared");
+        assert_eq!(
+            entry.mirror.as_deref(),
+            Some("mirror.example.com"),
+            "mirror must be preserved"
+        );
+    }
+
+    #[test]
+    fn test_set_token_uses_token_username() {
+        let mut config = RegistryConfig::default();
+        config.set_token("registry.smolmachines.com", "eyJhbGci.test");
+
+        let creds = config.get_credentials("registry.smolmachines.com").unwrap();
+        assert_eq!(creds.username, "token");
+        assert_eq!(creds.password, "eyJhbGci.test");
+    }
+
+    #[test]
+    fn test_save_roundtrip_preserves_all_fields() {
+        let mut config = RegistryConfig::default();
+        config.defaults.registry = Some("custom.io".to_string());
+        config.registries.insert(
+            "ghcr.io".to_string(),
+            RegistryEntry {
+                username: Some("gh_user".to_string()),
+                password: Some("gh_pass".to_string()),
+                password_env: None,
+                mirror: Some("ghcr-mirror.example.com".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let reloaded: RegistryConfig = toml::from_str(&serialized).unwrap();
+
+        assert_eq!(reloaded.default_registry(), "custom.io");
+        let entry = reloaded.registries.get("ghcr.io").unwrap();
+        assert_eq!(entry.username.as_deref(), Some("gh_user"));
+        assert_eq!(entry.password.as_deref(), Some("gh_pass"));
+        assert_eq!(entry.mirror.as_deref(), Some("ghcr-mirror.example.com"));
     }
 }

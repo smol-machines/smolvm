@@ -8,8 +8,10 @@
 //! - Manifest put/get (PUT/GET)
 
 use crate::{RegistryError, Result, MANIFEST_MEDIA_TYPE};
-use reqwest::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
+use reqwest::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, LOCATION, WWW_AUTHENTICATE};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 /// Validate that a digest string matches the expected `sha256:<64 hex chars>` format.
 pub(crate) fn validate_digest(digest: &str) -> Result<()> {
@@ -28,8 +30,12 @@ pub struct RegistryClient {
     http: reqwest::Client,
     /// Base URL including scheme (e.g., "http://localhost:5000" or "https://registry.smolmachines.com").
     base_url: String,
-    /// Optional Bearer token for authenticated requests.
+    /// Optional Bearer token sent directly to the registry for authenticated requests.
     auth_token: Option<String>,
+    /// Optional identity token exchanged with a registry token service after
+    /// a `WWW-Authenticate: Bearer ...` challenge.
+    identity_token: Option<String>,
+    token_cache: Mutex<HashMap<TokenCacheKey, String>>,
 }
 
 impl RegistryClient {
@@ -39,7 +45,14 @@ impl RegistryClient {
             http: reqwest::Client::new(),
             base_url,
             auth_token: None,
+            identity_token: None,
+            token_cache: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Return the base URL this client is configured for.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
     }
 
     /// Set a Bearer token for authenticated requests.
@@ -48,10 +61,17 @@ impl RegistryClient {
         self
     }
 
+    /// Set an identity token used only to fetch OCI bearer tokens from a
+    /// registry token service. This token is not sent directly to the registry.
+    pub fn with_identity_token(mut self, token: String) -> Self {
+        self.identity_token = Some(token);
+        self
+    }
+
     /// Check connectivity: `GET /v2/` must return 200.
     pub async fn ping(&self) -> Result<()> {
         let url = format!("{}/v2/", self.base_url);
-        let resp = self.request(reqwest::Method::GET, &url).send().await?;
+        let resp = self.send(self.request(reqwest::Method::GET, &url)).await?;
         if !resp.status().is_success() {
             return Err(RegistryError::ApiError {
                 status: resp.status().as_u16(),
@@ -65,7 +85,7 @@ impl RegistryClient {
     pub async fn blob_exists(&self, repo: &str, digest: &str) -> Result<bool> {
         validate_digest(digest)?;
         let url = format!("{}/v2/{}/blobs/{}", self.base_url, repo, digest);
-        let resp = self.request(reqwest::Method::HEAD, &url).send().await?;
+        let resp = self.send(self.request(reqwest::Method::HEAD, &url)).await?;
         Ok(resp.status() == reqwest::StatusCode::OK)
     }
 
@@ -84,9 +104,10 @@ impl RegistryClient {
         // Step 1: POST to initiate upload.
         let post_url = format!("{}/v2/{}/blobs/uploads/", self.base_url, repo);
         let resp = self
-            .request(reqwest::Method::POST, &post_url)
-            .header(CONTENT_LENGTH, 0)
-            .send()
+            .send(
+                self.request(reqwest::Method::POST, &post_url)
+                    .header(CONTENT_LENGTH, 0),
+            )
             .await?;
 
         if resp.status() != reqwest::StatusCode::ACCEPTED {
@@ -115,11 +136,12 @@ impl RegistryClient {
         let put_url = format!("{}{}digest={}", put_url, separator, digest);
 
         let resp = self
-            .request(reqwest::Method::PUT, &put_url)
-            .header(CONTENT_TYPE, "application/octet-stream")
-            .header(CONTENT_LENGTH, data.len())
-            .body(data.to_vec())
-            .send()
+            .send(
+                self.request(reqwest::Method::PUT, &put_url)
+                    .header(CONTENT_TYPE, "application/octet-stream")
+                    .header(CONTENT_LENGTH, data.len())
+                    .body(data.to_vec()),
+            )
             .await?;
 
         if resp.status() != reqwest::StatusCode::CREATED {
@@ -139,7 +161,7 @@ impl RegistryClient {
     pub async fn pull_blob(&self, repo: &str, digest: &str) -> Result<Vec<u8>> {
         validate_digest(digest)?;
         let url = format!("{}/v2/{}/blobs/{}", self.base_url, repo, digest);
-        let resp = self.request(reqwest::Method::GET, &url).send().await?;
+        let resp = self.send(self.request(reqwest::Method::GET, &url)).await?;
 
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(RegistryError::BlobNotFound(digest.to_string()));
@@ -188,9 +210,10 @@ impl RegistryClient {
         // Step 1: POST to initiate upload.
         let post_url = format!("{}/v2/{}/blobs/uploads/", self.base_url, repo);
         let resp = self
-            .request(reqwest::Method::POST, &post_url)
-            .header(CONTENT_LENGTH, 0)
-            .send()
+            .send(
+                self.request(reqwest::Method::POST, &post_url)
+                    .header(CONTENT_LENGTH, 0),
+            )
             .await?;
 
         if resp.status() != reqwest::StatusCode::ACCEPTED {
@@ -220,11 +243,12 @@ impl RegistryClient {
         // Set Content-Length explicitly — reqwest defaults to chunked transfer
         // for streamed bodies, which some registries reject.
         let resp = self
-            .request(reqwest::Method::PUT, &put_url)
-            .header(CONTENT_TYPE, "application/octet-stream")
-            .header(CONTENT_LENGTH, size)
-            .body(body)
-            .send()
+            .send(
+                self.request(reqwest::Method::PUT, &put_url)
+                    .header(CONTENT_TYPE, "application/octet-stream")
+                    .header(CONTENT_LENGTH, size)
+                    .body(body),
+            )
             .await?;
 
         if resp.status() != reqwest::StatusCode::CREATED {
@@ -248,7 +272,7 @@ impl RegistryClient {
     ) -> Result<impl futures_util::Stream<Item = reqwest::Result<bytes::Bytes>>> {
         validate_digest(digest)?;
         let url = format!("{}/v2/{}/blobs/{}", self.base_url, repo, digest);
-        let resp = self.request(reqwest::Method::GET, &url).send().await?;
+        let resp = self.send(self.request(reqwest::Method::GET, &url)).await?;
 
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(RegistryError::BlobNotFound(digest.to_string()));
@@ -268,10 +292,11 @@ impl RegistryClient {
     pub async fn put_manifest(&self, repo: &str, reference: &str, manifest: &[u8]) -> Result<()> {
         let url = format!("{}/v2/{}/manifests/{}", self.base_url, repo, reference);
         let resp = self
-            .request(reqwest::Method::PUT, &url)
-            .header(CONTENT_TYPE, MANIFEST_MEDIA_TYPE)
-            .body(manifest.to_vec())
-            .send()
+            .send(
+                self.request(reqwest::Method::PUT, &url)
+                    .header(CONTENT_TYPE, MANIFEST_MEDIA_TYPE)
+                    .body(manifest.to_vec()),
+            )
             .await?;
 
         if !resp.status().is_success() {
@@ -287,9 +312,10 @@ impl RegistryClient {
     pub async fn get_manifest(&self, repo: &str, reference: &str) -> Result<Vec<u8>> {
         let url = format!("{}/v2/{}/manifests/{}", self.base_url, repo, reference);
         let resp = self
-            .request(reqwest::Method::GET, &url)
-            .header(ACCEPT, MANIFEST_MEDIA_TYPE)
-            .send()
+            .send(
+                self.request(reqwest::Method::GET, &url)
+                    .header(ACCEPT, MANIFEST_MEDIA_TYPE),
+            )
             .await?;
 
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
@@ -352,6 +378,208 @@ impl RegistryClient {
         }
         req
     }
+
+    async fn send(&self, req: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+        let retry_req = req.try_clone();
+        let resp = req.send().await?;
+
+        if resp.status() != reqwest::StatusCode::UNAUTHORIZED {
+            return Ok(resp);
+        }
+
+        if self.identity_token.is_none() || self.auth_token.is_some() {
+            return Ok(resp);
+        }
+
+        let Some(header) = resp
+            .headers()
+            .get(WWW_AUTHENTICATE)
+            .and_then(|v| v.to_str().ok())
+        else {
+            return Ok(resp);
+        };
+
+        let challenge = BearerChallenge::parse(header)?;
+        let token = self.oci_token(&challenge).await?;
+        let retry_req = retry_req.ok_or_else(|| RegistryError::Authentication {
+            message: "registry requested authentication for a non-retryable request".into(),
+        })?;
+
+        Ok(retry_req.bearer_auth(token).send().await?)
+    }
+
+    async fn oci_token(&self, challenge: &BearerChallenge) -> Result<String> {
+        let key = TokenCacheKey {
+            realm: challenge.realm.clone(),
+            service: challenge.service.clone(),
+            scope: challenge.scope.clone(),
+        };
+
+        if let Some(token) = self
+            .token_cache
+            .lock()
+            .map_err(|_| RegistryError::Authentication {
+                message: "registry token cache lock poisoned".into(),
+            })?
+            .get(&key)
+            .cloned()
+        {
+            return Ok(token);
+        }
+
+        let identity_token =
+            self.identity_token
+                .as_deref()
+                .ok_or_else(|| RegistryError::Authentication {
+                    message: "registry requested authentication but no identity token is configured"
+                        .into(),
+                })?;
+
+        let mut url =
+            reqwest::Url::parse(&challenge.realm).map_err(|e| RegistryError::Authentication {
+                message: format!("invalid token service realm: {e}"),
+            })?;
+        {
+            let mut pairs = url.query_pairs_mut();
+            if let Some(service) = &challenge.service {
+                pairs.append_pair("service", service);
+            }
+            if let Some(scope) = &challenge.scope {
+                pairs.append_pair("scope", scope);
+            }
+        }
+
+        let resp = self
+            .http
+            .get(url)
+            .bearer_auth(identity_token)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(RegistryError::Authentication {
+                message: format!(
+                    "token service returned {}: {}",
+                    resp.status(),
+                    resp.text().await.unwrap_or_default()
+                ),
+            });
+        }
+
+        let token_response: TokenResponse = resp.json().await?;
+        let token = token_response
+            .token
+            .or(token_response.access_token)
+            .ok_or_else(|| RegistryError::Authentication {
+                message: "token service response did not include token".into(),
+            })?;
+
+        self.token_cache
+            .lock()
+            .map_err(|_| RegistryError::Authentication {
+                message: "registry token cache lock poisoned".into(),
+            })?
+            .insert(key, token.clone());
+
+        Ok(token)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TokenCacheKey {
+    realm: String,
+    service: Option<String>,
+    scope: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BearerChallenge {
+    realm: String,
+    service: Option<String>,
+    scope: Option<String>,
+}
+
+impl BearerChallenge {
+    fn parse(header: &str) -> Result<Self> {
+        let header = header.trim();
+        let params = header
+            .strip_prefix("Bearer ")
+            .or_else(|| header.strip_prefix("bearer "))
+            .ok_or_else(|| RegistryError::Authentication {
+                message: format!("unsupported authenticate challenge: {header}"),
+            })?;
+
+        let mut values = HashMap::new();
+        for part in split_auth_params(params) {
+            let Some((key, value)) = part.split_once('=') else {
+                continue;
+            };
+            values.insert(key.trim().to_ascii_lowercase(), unquote(value.trim()));
+        }
+
+        let realm = values
+            .remove("realm")
+            .ok_or_else(|| RegistryError::Authentication {
+                message: "bearer challenge missing realm".into(),
+            })?;
+
+        Ok(Self {
+            realm,
+            service: values.remove("service"),
+            scope: values.remove("scope"),
+        })
+    }
+}
+
+fn split_auth_params(params: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut in_quote = false;
+    let mut escaped = false;
+
+    for (idx, ch) in params.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_quote => escaped = true,
+            '"' => in_quote = !in_quote,
+            ',' if !in_quote => {
+                parts.push(params[start..idx].trim());
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(params[start..].trim());
+    parts
+}
+
+fn unquote(value: &str) -> String {
+    let Some(value) = value.strip_prefix('"').and_then(|v| v.strip_suffix('"')) else {
+        return value.to_string();
+    };
+
+    let mut out = String::with_capacity(value.len());
+    let mut escaped = false;
+    for ch in value.chars() {
+        if escaped {
+            out.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TokenResponse {
+    token: Option<String>,
+    access_token: Option<String>,
 }
 
 #[cfg(test)]
@@ -441,5 +669,35 @@ mod tests {
         assert!(c.auth_token.is_none());
         let c = c.with_token("secret".to_string());
         assert_eq!(c.auth_token.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn bearer_challenge_parses_registry_params() {
+        let challenge = BearerChallenge::parse(
+            r#"Bearer realm="https://token.smolmachines.com/v2/auth",service="registry.smolmachines.com",scope="repository:binsquare/app:pull,push""#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            challenge.realm,
+            "https://token.smolmachines.com/v2/auth"
+        );
+        assert_eq!(
+            challenge.service.as_deref(),
+            Some("registry.smolmachines.com")
+        );
+        assert_eq!(
+            challenge.scope.as_deref(),
+            Some("repository:binsquare/app:pull,push")
+        );
+    }
+
+    #[test]
+    fn bearer_challenge_handles_quoted_commas() {
+        let parts = split_auth_params(r#"realm="https://t.example/auth",scope="a:b:c,d""#);
+        assert_eq!(
+            parts,
+            vec![r#"realm="https://t.example/auth""#, r#"scope="a:b:c,d""#]
+        );
     }
 }
