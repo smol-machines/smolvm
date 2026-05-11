@@ -31,15 +31,3 @@ net = true
 
 [dev]
 ports = ["18789:18789"]
-
-# Network policy: only LLM provider APIs are reachable.
-# All other outbound traffic is blocked at the VM level.
-[network]
-allow_hosts = [
-    "api.openai.com",
-    "api.anthropic.com",
-    "generativelanguage.googleapis.com",
-    "api.mistral.ai",
-    "api.groq.com",
-    "api.together.xyz",
-]
