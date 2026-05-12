@@ -828,7 +828,7 @@ test_from_vm_image_overlay() {
 }
 
 # =============================================================================
-# Debian Pack Roundtrip (issue #235 regression)
+# Debian Pack Roundtrip (Char device entry regression)
 #
 # Debian's update-alternatives creates Char device entries in /etc/alternatives/
 # in the overlayfs upper layer. These entries caused safe_unpack() to abort
@@ -893,7 +893,7 @@ test_from_vm_debian_roundtrip() {
     # 5. Create a new machine from the pack
     echo "  Step 5: Creating machine from pack..."
     $SMOLVM machine create "$from_name" --from "$pack_output.smolmachine" 2>&1 || {
-        echo "FAIL: machine create --from failed (this was the #235 bug)"
+        echo "FAIL: machine create --from failed (Char device extraction bug)"
         $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
     }
     $SMOLVM machine start --name "$from_name" 2>&1 || {
@@ -906,7 +906,7 @@ test_from_vm_debian_roundtrip() {
     echo "  Step 6: Verifying test marker survived..."
     local result
     result=$($SMOLVM machine exec --name "$from_name" -- cat /test-marker.txt 2>&1) || {
-        echo "FAIL: test marker missing after roundtrip (this was the #235 data loss)"
+        echo "FAIL: test marker missing after roundtrip (Char device data loss)"
         $SMOLVM machine stop --name "$from_name" 2>/dev/null
         $SMOLVM machine delete "$from_name" -f 2>/dev/null
         $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
@@ -928,6 +928,9 @@ test_from_vm_debian_roundtrip() {
     rm -f "$pack_output" "$pack_output.smolmachine"
 }
 
+# =============================================================================
+# Case-Insensitive Collision Test (macOS regression)
+#
 # =============================================================================
 # Case-Insensitive Collision Test (macOS regression)
 #
@@ -1333,7 +1336,7 @@ if [[ "$QUICK_MODE" != "true" ]]; then
     run_test "from-vm-image: container overlay captured" test_from_vm_image_overlay || true
 
     echo ""
-    echo "Running Debian Pack Roundtrip Tests (issue #235)..."
+    echo "Running Debian Pack Roundtrip Tests..."
     echo ""
 
     run_test "from-vm-debian: Char device entries don't break extraction" test_from_vm_debian_roundtrip || true

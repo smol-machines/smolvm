@@ -24,6 +24,14 @@ use std::os::unix::io::AsRawFd;
 fn safe_unpack<R: Read>(archive: &mut tar::Archive<R>, dest: &Path) -> std::io::Result<()> {
     let canonical_dest = dest.canonicalize().unwrap_or_else(|_| dest.to_path_buf());
 
+    // Track directories with restrictive permissions. We extract all entries
+    // with directories temporarily set to 0o755, then apply final permissions
+    // after all children are written. This matches GNU tar / bsdtar behavior
+    // and prevents extraction failures when a read-only directory appears
+    // before its children in the tar stream (e.g., Fedora's mode-555
+    // /usr/lib64/pm-utils/*.d directories).
+    let mut deferred_dir_modes: Vec<(PathBuf, u32)> = Vec::new();
+
     for entry_result in archive.entries()? {
         let mut entry = entry_result?;
         let entry_type = entry.header().entry_type();
@@ -105,21 +113,40 @@ fn safe_unpack<R: Read>(archive: &mut tar::Archive<R>, dest: &Path) -> std::io::
             ));
         }
 
-        // Unpack the individual entry.
-        // Ensure parent directories are writable before extracting. OCI layer
-        // tars may set restrictive directory modes (e.g., dr-xr-xr-x) before
-        // child entries, which prevents creating files under them on macOS
-        // where we're not root.
-        if entry_type != tar::EntryType::Directory {
-            if let Some(parent) = full_path.parent() {
-                if parent.is_dir() {
-                    let _ =
-                        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755));
-                }
+        // Ensure parent directories are writable before extracting any entry.
+        // OCI layer tars may set restrictive directory modes (e.g., dr-xr-xr-x)
+        // before child entries, which prevents creating files or subdirectories.
+        if let Some(parent) = full_path.parent() {
+            if parent.is_dir() {
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755));
             }
         }
+
+        // Save the tar's intended directory mode for deferred application.
+        if entry_type == tar::EntryType::Directory {
+            let mode = entry.header().mode().unwrap_or(0o755);
+            if mode & 0o200 == 0 {
+                deferred_dir_modes.push((full_path.clone(), mode));
+            }
+        }
+
         entry.unpack_in(dest)?;
+
+        // After extracting a directory, force it writable so subsequent
+        // entries (children) can be created inside it. Final permissions
+        // are applied after the loop.
+        if entry_type == tar::EntryType::Directory && full_path.is_dir() {
+            let _ = std::fs::set_permissions(&full_path, std::fs::Permissions::from_mode(0o755));
+        }
     }
+
+    // Apply deferred directory permissions now that all children are written.
+    for (path, mode) in deferred_dir_modes {
+        if path.is_dir() {
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode));
+        }
+    }
+
     Ok(())
 }
 
@@ -1626,5 +1653,86 @@ mod tests {
         // Device entries are not created
         assert!(!dest.join("etc/alternatives/pager.1.gz").exists());
         assert!(!dest.join("dev/sda").exists());
+    }
+
+    #[test]
+    fn test_safe_unpack_readonly_parent_dir_does_not_block_children() {
+        // Reproduces the Fedora extraction bug: a mode-555 directory entry
+        // appears before its children in the tar. Without deferred permissions,
+        // creating files inside the read-only directory fails.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dest_raw = temp_dir.path().join("out");
+        fs::create_dir_all(&dest_raw).unwrap();
+        let dest = dest_raw.canonicalize().unwrap();
+
+        let mut builder = tar::Builder::new(Vec::new());
+
+        // Parent directory with restrictive mode (read-only, no write)
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_size(0);
+        header.set_mode(0o555); // read + execute only, no write
+        header.set_path("usr/lib64/pm-utils/").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "usr/lib64/pm-utils/", &b""[..])
+            .unwrap();
+
+        // Child directory inside the read-only parent
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_size(0);
+        header.set_mode(0o555);
+        header.set_path("usr/lib64/pm-utils/module.d/").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "usr/lib64/pm-utils/module.d/", &b""[..])
+            .unwrap();
+
+        // File inside the nested read-only directory
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(4);
+        header.set_mode(0o644);
+        header
+            .set_path("usr/lib64/pm-utils/module.d/test.conf")
+            .unwrap();
+        header.set_cksum();
+        builder
+            .append_data(
+                &mut header,
+                "usr/lib64/pm-utils/module.d/test.conf",
+                &b"data"[..],
+            )
+            .unwrap();
+
+        let tar_data = builder.into_inner().unwrap();
+
+        let mut archive = tar::Archive::new(tar_data.as_slice());
+        let result = safe_unpack(&mut archive, &dest);
+        assert!(
+            result.is_ok(),
+            "read-only parent should not block children: {:?}",
+            result.err()
+        );
+
+        // Child directory and file must exist
+        assert!(dest.join("usr/lib64/pm-utils/module.d").is_dir());
+        assert_eq!(
+            fs::read_to_string(dest.join("usr/lib64/pm-utils/module.d/test.conf")).unwrap(),
+            "data"
+        );
+
+        // Final permissions should be restored to the tar's mode (555)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(dest.join("usr/lib64/pm-utils"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o555, "deferred directory mode should be 555");
+        }
     }
 }
