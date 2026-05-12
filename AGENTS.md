@@ -15,7 +15,7 @@ smolvm machine create --net myvm
 smolvm machine start --name myvm
 smolvm machine exec --name myvm -- apk add python3   # installs persist
 smolvm machine exec --name myvm -- which python3      # still there
-smolvm machine exec --name myvm -it -- /bin/sh
+smolvm machine shell --name myvm               # interactive shell (auto-starts if stopped)
 smolvm machine stop --name myvm
 smolvm machine delete myvm
 
@@ -45,7 +45,8 @@ smolvm machine exec --name my-vm -- pip install requests
 | Goal | Command |
 |------|---------|
 | Run a one-off command in isolation | `smolvm machine run --net --image IMAGE -- CMD` |
-| Interactive shell | `smolvm machine run --net -it --image IMAGE -- /bin/sh` |
+| Interactive shell (ephemeral) | `smolvm machine run --net -it --image IMAGE -- /bin/sh` |
+| Interactive shell (persistent) | `smolvm machine shell --name NAME` |
 | Persistent dev environment | `machine create` → `machine start` → `machine exec` |
 | Ship software as a binary | `smolvm pack create --image IMAGE -o OUTPUT` |
 | Fast persistent machine from packed artifact | `machine create NAME --from FILE.smolmachine` |
@@ -70,6 +71,7 @@ All commands use named flags (no positional args except `machine create NAME` an
 ```
 smolvm machine run --image IMAGE [-- COMMAND]     # ephemeral
 smolvm machine exec --name NAME [-- COMMAND]      # run in existing VM
+smolvm machine shell [--name NAME]                # interactive shell (auto-starts)
 smolvm machine create NAME [OPTIONS]              # create persistent
 smolvm machine create NAME --from FILE.smolmachine  # from packed artifact
 smolvm machine start [--name NAME]                # start (default: "default")
