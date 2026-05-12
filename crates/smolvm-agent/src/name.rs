@@ -31,6 +31,7 @@ const DEFAULT_REGISTRY_ALIAS: &str = "docker.io";
 const DEFAULT_REPOSITORY: &str = "library";
 const DEFAULT_TAG: &str = "latest";
 
+/// Error variants returned when parsing or validating image references.
 pub enum ImageRefError {
     InvalidReference,
     InvalidDigestAlgorithm,
@@ -62,18 +63,18 @@ impl fmt::Display for ImageRefError {
     }
 }
 
+/// Canonical image reference split into registry, repository, tag, and digest.
 pub struct Reference {
     tag: String,
     registry: String,
     repository: String,
-    // TODO: swap this to an Option<>
-    digest: String,
+    digest: Option<String>,
 }
 
 impl Reference {
     pub fn to_fqdn(&self) -> String {
-        if self.digest != "" {
-            return format!("{}/{}@{}", self.registry, self.repository, self.digest);
+        if let Some(dig) = &self.digest {
+            return format!("{}/{}@{}", self.registry, self.repository, dig);
         }
         return format!("{}/{}:{}", self.registry, self.repository, self.tag);
     }
@@ -83,6 +84,7 @@ impl Reference {
     }
 }
 
+/// Parse and normalize an image reference into canonical components.
 pub fn parse_image_ref(img: &str) -> Result<Reference, ImageRefError> {
     if img == "" {
         return Err(ImageRefError::InvalidReference);
@@ -92,7 +94,9 @@ pub fn parse_image_ref(img: &str) -> Result<Reference, ImageRefError> {
         let reference = canonicalize(registry, repository, tag, digest);
         validate_registry(&reference.registry)?;
         validate_tag(&reference.tag)?;
-        validate_dig(&reference.digest)?;
+        if let Some(dig) = &reference.digest {
+            validate_dig(dig)?;
+        }
         validate_repo(&reference.repository)?;
         Ok(reference)
     } else {
@@ -105,6 +109,7 @@ pub fn parse_image_ref(img: &str) -> Result<Reference, ImageRefError> {
     }
 }
 
+/// Split a reference into registry/repository and optional tag.
 fn parse_tag(root_no_dig: &str) -> (Option<&str>, &str, Option<&str>) {
     let last_slash = root_no_dig.rfind("/");
     let last_colon = root_no_dig.rfind(":");
@@ -118,6 +123,7 @@ fn parse_tag(root_no_dig: &str) -> (Option<&str>, &str, Option<&str>) {
     (registry, repository, None)
 }
 
+/// Detect registry host prefix and return the remaining repository path.
 fn parse_remote(root: &str) -> (Option<&str>, &str) {
     if let Some((first, rest)) = root.split_once("/") {
         if first.contains(".") || first.contains(":") || first == "localhost" {
@@ -127,6 +133,7 @@ fn parse_remote(root: &str) -> (Option<&str>, &str) {
     (None, root)
 }
 
+/// Apply defaults and Docker Hub normalization to parsed reference parts.
 fn canonicalize(
     registry: Option<&str>,
     repository: &str,
@@ -143,7 +150,11 @@ fn canonicalize(
     };
 
     let rslvd_tag = tag.unwrap_or(DEFAULT_TAG).to_string();
-    let rslvd_dig = digest.to_string();
+    let rslvd_dig = if digest.is_empty() {
+        None
+    } else {
+        Some(digest.to_string())
+    };
     Reference {
         registry: rslvd_registry,
         repository: rslvd_repo,
@@ -152,6 +163,7 @@ fn canonicalize(
     }
 }
 
+/// Validate that a registry value exists.
 fn validate_registry(registry: &str) -> Result<(), ImageRefError> {
     if registry.len() < 1 {
         return Err(ImageRefError::InvalidReference);
@@ -159,6 +171,7 @@ fn validate_registry(registry: &str) -> Result<(), ImageRefError> {
     Ok(())
 }
 
+/// Validate tag length and character set.
 fn validate_tag(tag: &str) -> Result<(), ImageRefError> {
     let length = tag.len();
     if length < 1 || length > 128 {
@@ -171,6 +184,7 @@ fn validate_tag(tag: &str) -> Result<(), ImageRefError> {
     Ok(())
 }
 
+/// Validate repository path length constraints.
 fn validate_repo(repo: &str) -> Result<(), ImageRefError> {
     let length = repo.len();
     if length < 1 || length > 255 {
@@ -184,6 +198,7 @@ fn validate_repo(repo: &str) -> Result<(), ImageRefError> {
     Ok(())
 }
 
+/// Validate digest format and enforce sha256 with 64 hex chars.
 fn validate_dig(dig: &str) -> Result<(), ImageRefError> {
     if dig == "" {
         return Ok(());
@@ -199,7 +214,7 @@ fn validate_dig(dig: &str) -> Result<(), ImageRefError> {
     }
 }
 
-/// Reverse sanitization
+/// Reverse a sanitized filename back into an approximate image reference.
 pub fn unsanitize_image_name(name: &str) -> String {
     // This is approximate - we lose some info
     name.replacen('_', "/", 1).replacen('_', ":", 1)
@@ -234,14 +249,42 @@ mod tests {
             tag: "latest".to_string(),
             registry: "docker.io".to_string(),
             repository: "library/alpine".to_string(),
-            digest: "".to_string(),
+            digest: None,
         };
 
         assert_eq!(image.sanitized(), "docker.io_library_alpine_latest");
     }
 
     #[test]
-    fn test_parser_handles_digest_refs() {}
+    fn test_parser_handles_digest_refs() {
+        let digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let cases = [
+            (
+                format!("alpine@{digest}"),
+                format!("docker.io/library/alpine@{digest}"),
+            ),
+            (
+                format!("docker.io/library/alpine@{digest}"),
+                format!("docker.io/library/alpine@{digest}"),
+            ),
+            (
+                format!("ghcr.io/owner/repo@{digest}"),
+                format!("ghcr.io/owner/repo@{digest}"),
+            ),
+            (
+                format!("alpine:3.20@{digest}"),
+                format!("docker.io/library/alpine@{digest}"),
+            ),
+        ];
+
+        for (image, expected) in cases {
+            let parsed = parse_image_ref(&image);
+            match parsed {
+                Ok(reference) => assert_eq!(reference.to_fqdn(), expected),
+                _ => panic!("Failed to parse digest reference"),
+            }
+        }
+    }
 
     #[test]
     fn test_parser_handles_subdomains() {
@@ -339,7 +382,7 @@ mod tests {
             "alpine@sha256:wrong",
             "alpine:latest@sha123:deadbeef",
             "alpine:latest@sha256:deadbeef",
-            "alpine:bad tag@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "alpine:bad tag@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdefc",
             "alpine:@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         ];
 

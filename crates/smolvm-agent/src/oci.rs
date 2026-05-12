@@ -616,6 +616,7 @@ impl OciSpec {
 /// Maximum allowed length for an image reference.
 const MAX_IMAGE_REF_LENGTH: usize = 512;
 
+// TODO: consider moving oci image ref validation to `name`
 /// Validate an OCI image reference format.
 ///
 /// This validates that the image reference follows the expected format:
