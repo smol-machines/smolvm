@@ -809,6 +809,9 @@ enum PackedCmd {
     Start(PackedStartArgs),
     /// Execute a command in a running VM
     Exec(PackedExecArgs),
+    /// Open an interactive shell in a running VM
+    #[command(visible_alias = "sh")]
+    Shell,
     /// Stop the VM
     Stop,
     /// Show VM status
@@ -914,7 +917,7 @@ struct PackedStartArgs {
 }
 
 /// Arguments for the `exec` subcommand (run in existing VM).
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Default)]
 struct PackedExecArgs {
     /// Command to run
     #[arg(trailing_var_arg = true, value_name = "COMMAND")]
@@ -995,6 +998,21 @@ fn pack_run_inner(mode: PackedMode, cli: PackedCli) -> smolvm::Result<()> {
             let checksum = mode_checksum(&mode);
             let manifest = read_manifest_for_mode(&mode)?;
             daemon_exec(checksum, args, debug, &manifest)
+        }
+        PackedCmd::Shell => {
+            let checksum = mode_checksum(&mode);
+            let manifest = read_manifest_for_mode(&mode)?;
+            daemon_exec(
+                checksum,
+                PackedExecArgs {
+                    command: vec!["/bin/sh".to_string()],
+                    interactive: true,
+                    tty: true,
+                    ..Default::default()
+                },
+                debug,
+                &manifest,
+            )
         }
         PackedCmd::Stop => {
             let checksum = mode_checksum(&mode);

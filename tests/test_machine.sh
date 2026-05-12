@@ -2603,6 +2603,34 @@ run_test "Prune --all: refuses on running VM" test_prune_all_refuses_on_running_
 run_test "Prune --all: removes cached images" test_prune_all_removes_images || true
 
 # =============================================================================
+# Shell Shortcut Tests
+# =============================================================================
+
+test_machine_shell() {
+    ensure_machine_running
+
+    # shell opens an interactive PTY. Pipe "echo X; exit" through it.
+    # Use a subshell with a watchdog kill to avoid hanging if the PTY blocks.
+    local tmpout
+    tmpout=$(mktemp)
+    (echo "echo shell-test-ok; exit" | $SMOLVM machine shell > "$tmpout" 2>&1) &
+    local pid=$!
+    sleep 5
+    kill $pid 2>/dev/null; wait $pid 2>/dev/null
+
+    local output
+    output=$(cat "$tmpout")
+    rm -f "$tmpout"
+
+    [[ "$output" == *"shell-test-ok"* ]] || {
+        echo "FAIL: expected shell-test-ok, got: $output"
+        return 1
+    }
+}
+
+run_test "Shell: machine shell opens interactive shell" test_machine_shell || true
+
+# =============================================================================
 # Machine Update Tests
 #
 # Verifies that `machine update` modifies settings on stopped machines and

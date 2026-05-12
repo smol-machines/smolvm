@@ -103,6 +103,10 @@ pub enum MachineCmd {
     /// Remove unused images and layers to free disk space
     Prune(PruneCmd),
 
+    /// Open an interactive shell in a machine (starts it if stopped)
+    #[command(visible_alias = "sh")]
+    Shell(ShellCmd),
+
     /// Copy files between host and machine
     Cp(CpCmd),
 
@@ -144,6 +148,7 @@ impl MachineCmd {
             MachineCmd::Update(cmd) => cmd.run(),
             MachineCmd::Images(cmd) => cmd.run(),
             MachineCmd::Prune(cmd) => cmd.run(),
+            MachineCmd::Shell(cmd) => cmd.run(),
             MachineCmd::Cp(cmd) => cmd.run(),
             MachineCmd::Monitor(cmd) => cmd.run(),
             MachineCmd::NetworkTest(cmd) => cmd.run(),
@@ -1034,6 +1039,42 @@ impl ExecCmd {
                 client.vm_exec(self.command.clone(), env, workdir.clone(), self.timeout)?;
             vm_common::print_output_and_exit(&manager, exit_code, &stdout, &stderr);
         }
+    }
+}
+
+// ============================================================================
+// Shell Command
+// ============================================================================
+
+/// Open an interactive shell in a machine.
+///
+/// Shortcut for `machine exec -it -- /bin/sh`. Starts the machine if stopped.
+///
+/// Examples:
+///   smolvm machine shell
+///   smolvm machine shell --name myvm
+///   smolvm machine sh --name myvm
+#[derive(Args, Debug)]
+pub struct ShellCmd {
+    /// Target machine (default: "default")
+    #[arg(long, short = 'n', value_name = "NAME")]
+    pub name: Option<String>,
+}
+
+impl ShellCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        // Delegate to exec with -it -- /bin/sh
+        ExecCmd {
+            command: vec!["/bin/sh".to_string()],
+            name: self.name,
+            workdir: None,
+            env: vec![],
+            timeout: None,
+            interactive: true,
+            tty: true,
+            stream: false,
+        }
+        .run()
     }
 }
 
