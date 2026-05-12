@@ -527,7 +527,7 @@ mod tests {
     }
 
     #[test]
-    fn test_expand_disk_same_size_rejected() {
+    fn test_expand_disk_same_size_is_idempotent() {
         let temp_dir = std::env::temp_dir().join("smolvm_test_same");
         std::fs::create_dir_all(&temp_dir).unwrap();
         let disk_path = temp_dir.join("same_test.raw");
@@ -537,7 +537,12 @@ mod tests {
         let initial_size = 10 * BYTES_PER_GIB;
         disk_utils::create_sparse_disk::<Storage>(&disk_path, initial_size).unwrap();
 
+        // Same size is a no-op (idempotent for retry after partial failure)
         let result = expand_disk::<Storage>(&disk_path, 10);
+        assert!(result.is_ok());
+
+        // Shrink is still rejected
+        let result = expand_disk::<Storage>(&disk_path, 5);
         assert!(result.is_err());
 
         let _ = std::fs::remove_file(&disk_path);

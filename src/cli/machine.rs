@@ -90,8 +90,12 @@ pub enum MachineCmd {
     #[command(visible_alias = "list")]
     Ls(LsCmd),
 
-    /// Resize a machine's disk resources
+    /// Resize a machine's disk resources (use `update` instead)
+    #[command(hide = true)]
     Resize(ResizeCmd),
+
+    /// Modify settings on a stopped machine (mounts, ports, resources, disks)
+    Update(UpdateCmd),
 
     /// List cached images and storage usage
     Images(ImagesCmd),
@@ -137,6 +141,7 @@ impl MachineCmd {
             MachineCmd::Status(cmd) => cmd.run(),
             MachineCmd::Ls(cmd) => cmd.run(),
             MachineCmd::Resize(cmd) => cmd.run(),
+            MachineCmd::Update(cmd) => cmd.run(),
             MachineCmd::Images(cmd) => cmd.run(),
             MachineCmd::Prune(cmd) => cmd.run(),
             MachineCmd::Cp(cmd) => cmd.run(),
@@ -1009,6 +1014,11 @@ impl ExecCmd {
             vm_common::print_output_and_exit(&manager, exit_code, &stdout, &stderr);
         } else {
             // Bare VM: exec directly in the VM rootfs.
+            // Merge record env (from create/update) with CLI env, same as image path.
+            let env = vm_common::merge_env_overrides(
+                record.as_ref().map(|r| r.env.as_slice()).unwrap_or(&[]),
+                &env,
+            );
             if self.interactive || self.tty {
                 let exit_code = client.vm_exec_interactive(
                     self.command.clone(),
@@ -1480,6 +1490,309 @@ impl ResizeCmd {
                 e
             }
         })
+    }
+}
+
+// ============================================================================
+// Update Command
+// ============================================================================
+
+/// Modify settings on a stopped machine.
+///
+/// Changes are applied to the DB record and take effect on the next
+/// `machine start`. The machine must be stopped.
+///
+/// Examples:
+///   smolvm machine update myvm -v ./src:/app -p 8080:8080
+///   smolvm machine update myvm --cpus 4 --mem 4096
+///   smolvm machine update myvm --remove-volume ./src:/app
+///   smolvm machine update myvm --net -e DEBUG=1
+#[derive(Args, Debug)]
+pub struct UpdateCmd {
+    /// Machine to update
+    #[arg(value_name = "NAME")]
+    pub name: String,
+
+    /// Add volume mount (HOST:GUEST[:ro])
+    #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro]")]
+    pub volume: Vec<String>,
+
+    /// Remove volume mount (HOST:GUEST)
+    #[arg(long, value_name = "HOST:GUEST")]
+    pub remove_volume: Vec<String>,
+
+    /// Add port mapping (HOST:GUEST)
+    #[arg(short = 'p', long = "port", value_parser = PortMapping::parse, value_name = "HOST:GUEST")]
+    pub port: Vec<PortMapping>,
+
+    /// Remove port mapping (HOST:GUEST)
+    #[arg(long, value_parser = PortMapping::parse, value_name = "HOST:GUEST")]
+    pub remove_port: Vec<PortMapping>,
+
+    /// Set vCPU count
+    #[arg(long, value_name = "N")]
+    pub cpus: Option<u8>,
+
+    /// Set memory in MiB
+    #[arg(long, value_name = "MiB")]
+    pub mem: Option<u32>,
+
+    /// Enable outbound network access
+    #[arg(long)]
+    pub net: bool,
+
+    /// Disable outbound network access
+    #[arg(long, conflicts_with = "net")]
+    pub no_net: bool,
+
+    /// Add/replace environment variable (KEY=VALUE)
+    #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
+    pub env: Vec<String>,
+
+    /// Remove environment variable by key
+    #[arg(long, value_name = "KEY")]
+    pub remove_env: Vec<String>,
+
+    /// Set working directory
+    #[arg(short = 'w', long, value_name = "DIR")]
+    pub workdir: Option<String>,
+
+    /// Enable GPU acceleration
+    #[arg(long)]
+    pub gpu: bool,
+
+    /// Disable GPU acceleration
+    #[arg(long, conflicts_with = "gpu")]
+    pub no_gpu: bool,
+
+    /// Storage disk size in GiB (expand only)
+    #[arg(long, value_name = "GiB")]
+    pub storage: Option<u64>,
+
+    /// Overlay disk size in GiB (expand only)
+    #[arg(long, value_name = "GiB")]
+    pub overlay: Option<u64>,
+}
+
+impl UpdateCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        use smolvm::config::RecordState;
+        use smolvm::data::storage::HostMount;
+
+        let db = smolvm::db::SmolvmDb::open()?;
+        let record = db.get_vm(&self.name)?.ok_or_else(|| {
+            smolvm::Error::config("update", format!("machine '{}' not found", self.name))
+        })?;
+
+        // Must be stopped (same check as resize)
+        let state = record.actual_state();
+        match state {
+            RecordState::Stopped | RecordState::Created => {}
+            _ => {
+                return Err(smolvm::Error::InvalidState {
+                    expected: "stopped".into(),
+                    actual: format!("{:?}", state),
+                });
+            }
+        }
+
+        // Validate proposed resource values using the same logic as machine start.
+        // Construct a temporary VmResources with the new values (falling back to
+        // the record's current values) and run validate() — single source of truth.
+        let proposed = smolvm::agent::VmResources {
+            cpus: self.cpus.unwrap_or(record.cpus),
+            memory_mib: self.mem.unwrap_or(record.mem),
+            ..record.vm_resources()
+        };
+        proposed.validate()?;
+
+        // Validate env specs have KEY=VALUE format with non-empty key
+        for spec in &self.env {
+            match spec.split_once('=') {
+                Some((key, _)) if !key.is_empty() => {}
+                _ => {
+                    return Err(smolvm::Error::config(
+                        "update",
+                        format!("invalid env format '{}': expected KEY=VALUE", spec),
+                    ));
+                }
+            }
+        }
+
+        // Parse and validate new mounts (after state check so
+        // "machine is running" takes priority over "directory not found")
+        let new_mounts = HostMount::parse(&self.volume)?;
+
+        // Validate no duplicate host ports after proposed changes
+        {
+            let mut final_ports: Vec<PortMapping> = record
+                .ports
+                .iter()
+                .filter(|&&(h, g)| {
+                    !self
+                        .remove_port
+                        .iter()
+                        .any(|rm| rm.host == h && rm.guest == g)
+                })
+                .map(|&(h, g)| PortMapping::new(h, g))
+                .collect();
+            for p in &self.port {
+                if !final_ports
+                    .iter()
+                    .any(|existing| existing.host == p.host && existing.guest == p.guest)
+                {
+                    final_ports.push(*p);
+                }
+            }
+            PortMapping::check_duplicates(&final_ports)
+                .map_err(|e| smolvm::Error::config("update", e))?;
+        }
+
+        // Expand physical disk files before the DB write. If expansion fails,
+        // no DB changes are made — the record stays consistent.
+        let mut changes: Vec<String> = Vec::new();
+        if self.storage.is_some() || self.overlay.is_some() {
+            let disk_changes =
+                vm_common::expand_disks(&self.name, &record, self.storage, self.overlay)?;
+            changes.extend(disk_changes);
+        }
+
+        // Single DB transaction: all settings + disk sizes together.
+        db.update_vm(&self.name, |r| {
+            // Disk sizes (must match the physical expansion above)
+            if let Some(s) = self.storage {
+                r.storage_gb = Some(s);
+            }
+            if let Some(o) = self.overlay {
+                r.overlay_gb = Some(o);
+            }
+            // Volumes: add new, remove specified.
+            // Canonicalize the remove spec's source path so ./src matches
+            // the stored /absolute/path/to/src.
+            for rm in &self.remove_volume {
+                let canonical_rm = if let Some((rm_src, rm_tgt)) = rm.split_once(':') {
+                    let resolved = std::fs::canonicalize(rm_src)
+                        .unwrap_or_else(|_| std::path::PathBuf::from(rm_src));
+                    format!("{}:{}", resolved.display(), rm_tgt)
+                } else {
+                    rm.clone()
+                };
+                let before = r.mounts.len();
+                r.mounts.retain(|(src, tgt, _)| {
+                    let spec = format!("{}:{}", src, tgt);
+                    spec != canonical_rm && spec != *rm
+                });
+                if r.mounts.len() < before {
+                    changes.push(format!("  removed volume: {}", rm));
+                }
+            }
+            for m in &new_mounts {
+                let tuple = m.to_storage_tuple();
+                if !r
+                    .mounts
+                    .iter()
+                    .any(|(s, t, _)| *s == tuple.0 && *t == tuple.1)
+                {
+                    changes.push(format!(
+                        "  added volume: {}:{}{}",
+                        tuple.0,
+                        tuple.1,
+                        if tuple.2 { ":ro" } else { "" }
+                    ));
+                    r.mounts.push(tuple);
+                }
+            }
+
+            // Ports: add new, remove specified
+            for rm in &self.remove_port {
+                let before = r.ports.len();
+                r.ports.retain(|&(h, g)| h != rm.host || g != rm.guest);
+                if r.ports.len() < before {
+                    changes.push(format!("  removed port: {}:{}", rm.host, rm.guest));
+                }
+            }
+            for p in &self.port {
+                let tuple = p.to_tuple();
+                if !r.ports.contains(&tuple) {
+                    changes.push(format!("  added port: {}:{}", tuple.0, tuple.1));
+                    r.ports.push(tuple);
+                }
+            }
+
+            // Resources
+            if let Some(cpus) = self.cpus {
+                changes.push(format!("  cpus: {} → {}", r.cpus, cpus));
+                r.cpus = cpus;
+            }
+            if let Some(mem) = self.mem {
+                changes.push(format!("  memory: {} MiB → {} MiB", r.mem, mem));
+                r.mem = mem;
+            }
+
+            // Network
+            if self.net {
+                changes.push("  network: enabled".to_string());
+                r.network = true;
+            }
+            if self.no_net {
+                changes.push("  network: disabled".to_string());
+                r.network = false;
+                // Clear egress policy — allow_cidrs and dns_filter_hosts imply
+                // networking. Leaving them set would re-enable egress on start.
+                if r.allowed_cidrs.is_some() {
+                    changes.push("  cleared allow_cidrs".to_string());
+                    r.allowed_cidrs = None;
+                }
+                if r.dns_filter_hosts.is_some() {
+                    changes.push("  cleared dns_filter_hosts".to_string());
+                    r.dns_filter_hosts = None;
+                }
+            }
+
+            // Env vars
+            for rm_key in &self.remove_env {
+                let before = r.env.len();
+                r.env.retain(|(k, _)| k != rm_key);
+                if r.env.len() < before {
+                    changes.push(format!("  removed env: {}", rm_key));
+                }
+            }
+            for spec in &self.env {
+                if let Some((key, val)) = spec.split_once('=') {
+                    r.env.retain(|(k, _)| k != key);
+                    r.env.push((key.to_string(), val.to_string()));
+                    changes.push(format!("  env: {}={}", key, val));
+                }
+            }
+
+            // Workdir
+            if let Some(ref wd) = self.workdir {
+                changes.push(format!("  workdir: {}", wd));
+                r.workdir = Some(wd.clone());
+            }
+
+            // GPU
+            if self.gpu {
+                changes.push("  gpu: enabled".to_string());
+                r.gpu = Some(true);
+            }
+            if self.no_gpu {
+                changes.push("  gpu: disabled".to_string());
+                r.gpu = Some(false);
+            }
+        })?;
+
+        if changes.is_empty() {
+            println!("No changes specified.");
+        } else {
+            println!("Updated machine '{}':", self.name);
+            for change in &changes {
+                println!("{}", change);
+            }
+            println!("\nStart with: smolvm machine start --name {}", self.name);
+        }
+
+        Ok(())
     }
 }
 

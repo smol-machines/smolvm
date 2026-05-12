@@ -1272,27 +1272,98 @@ pub fn list_vms(verbose: bool, json: bool) -> smolvm::Result<()> {
 ///
 /// The VM must be stopped before resizing. Only expansion is supported
 /// (no shrinking to prevent data loss).
+/// Expand physical disk files for a VM. Does NOT update the DB record —
+/// the caller is responsible for persisting the new sizes.
+///
+/// Returns a list of human-readable change descriptions for display.
+/// Validates no-shrink and performs the physical I/O.
+pub fn expand_disks(
+    name: &str,
+    record: &smolvm::config::VmRecord,
+    new_storage_gb: Option<u64>,
+    new_overlay_gb: Option<u64>,
+) -> smolvm::Result<Vec<String>> {
+    use smolvm::data::disk::{Overlay, Storage};
+    use smolvm::storage::{expand_disk, DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
+
+    let current_storage_gb = record.storage_gb.unwrap_or(DEFAULT_STORAGE_SIZE_GIB);
+    let current_overlay_gb = record.overlay_gb.unwrap_or(DEFAULT_OVERLAY_SIZE_GIB);
+
+    // Validate no shrinking
+    if let Some(s) = new_storage_gb {
+        if s < current_storage_gb {
+            return Err(smolvm::Error::config(
+                "resize",
+                format!(
+                    "storage disk cannot be shrunk from {} GiB to {} GiB. Only expanding is supported to prevent data loss.",
+                    current_storage_gb, s
+                ),
+            ));
+        }
+    }
+    if let Some(o) = new_overlay_gb {
+        if o < current_overlay_gb {
+            return Err(smolvm::Error::config(
+                "resize",
+                format!(
+                    "overlay disk cannot be shrunk from {} GiB to {} GiB. Only expanding is supported to prevent data loss.",
+                    current_overlay_gb, o
+                ),
+            ));
+        }
+    }
+
+    let manager = AgentManager::for_vm(name)
+        .map_err(|e| smolvm::Error::agent("get agent manager", e.to_string()))?;
+
+    let mut changes = Vec::new();
+
+    if let Some(storage_gb) = new_storage_gb {
+        if storage_gb > current_storage_gb {
+            let storage_path = manager.storage_path();
+            expand_disk::<Storage>(storage_path, storage_gb)
+                .map_err(|e| smolvm::Error::storage("expand storage disk", e.to_string()))?;
+            changes.push(format!(
+                "  storage: {} GiB → {} GiB",
+                current_storage_gb, storage_gb
+            ));
+        }
+    }
+
+    if let Some(overlay_gb) = new_overlay_gb {
+        if overlay_gb > current_overlay_gb {
+            let overlay_path = manager.overlay_path();
+            expand_disk::<Overlay>(overlay_path, overlay_gb)
+                .map_err(|e| smolvm::Error::storage("expand overlay disk", e.to_string()))?;
+            changes.push(format!(
+                "  overlay: {} GiB → {} GiB",
+                current_overlay_gb, overlay_gb
+            ));
+        }
+    }
+
+    Ok(changes)
+}
+
+/// Legacy wrapper: expand disks AND update the DB in one call.
+/// Used by the hidden `machine resize` backward-compat command.
 pub fn resize_vm(
     name: &str,
     new_storage_gb: Option<u64>,
     new_overlay_gb: Option<u64>,
 ) -> smolvm::Result<()> {
     use smolvm::config::RecordState;
-    use smolvm::data::disk::{Overlay, Storage};
     use smolvm::db::SmolvmDb;
-    use smolvm::storage::{expand_disk, DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
 
-    // Get VM record from database
     let db = SmolvmDb::open()?;
     let record = db
         .get_vm(name)?
         .ok_or_else(|| smolvm::Error::vm_not_found(name))?
         .clone();
 
-    // Check state - VM must be stopped (Created state also allowed for never-started VMs)
     let actual_state = record.actual_state();
     match actual_state {
-        RecordState::Stopped | RecordState::Created => {} // OK to resize
+        RecordState::Stopped | RecordState::Created => {}
         _ => {
             return Err(smolvm::Error::InvalidState {
                 expected: "stopped".into(),
@@ -1301,74 +1372,8 @@ pub fn resize_vm(
         }
     }
 
-    // Get current disk sizes (use defaults if not set)
-    let current_storage_gb = record.storage_gb.unwrap_or(DEFAULT_STORAGE_SIZE_GIB);
-    let current_overlay_gb = record.overlay_gb.unwrap_or(DEFAULT_OVERLAY_SIZE_GIB);
+    let changes = expand_disks(name, &record, new_storage_gb, new_overlay_gb)?;
 
-    // Determine target sizes
-    let target_storage_gb = new_storage_gb.unwrap_or(current_storage_gb);
-    let target_overlay_gb = new_overlay_gb.unwrap_or(current_overlay_gb);
-
-    // Validate no shrinking
-    if target_storage_gb < current_storage_gb {
-        return Err(smolvm::Error::config(
-            "resize",
-            format!(
-                "storage disk cannot be shrunk from {} GiB to {} GiB. Only expanding is supported to prevent data loss.",
-                current_storage_gb, target_storage_gb
-            ),
-        ));
-    }
-    if target_overlay_gb < current_overlay_gb {
-        return Err(smolvm::Error::config(
-            "resize",
-            format!(
-                "overlay disk cannot be shrunk from {} GiB to {} GiB. Only expanding is supported to prevent data loss.",
-                current_overlay_gb, target_overlay_gb
-            ),
-        ));
-    }
-
-    // Get agent manager for disk paths
-    let manager = AgentManager::for_vm(name)
-        .map_err(|e| smolvm::Error::agent("get agent manager", e.to_string()))?;
-
-    // Print resize header
-    println!("Resizing machine '{}'...", name);
-
-    // Expand storage disk if requested and changed
-    if let Some(storage_gb) = new_storage_gb {
-        if storage_gb > current_storage_gb {
-            print!(
-                "  Storage: {} GiB → {} GiB (expanding disk...)",
-                current_storage_gb, storage_gb
-            );
-            std::io::Write::flush(&mut std::io::stdout()).ok();
-
-            let storage_path = manager.storage_path();
-            expand_disk::<Storage>(storage_path, storage_gb)
-                .map_err(|e| smolvm::Error::storage("expand storage disk", e.to_string()))?;
-            println!(" done");
-        }
-    }
-
-    // Expand overlay disk if requested and changed
-    if let Some(overlay_gb) = new_overlay_gb {
-        if overlay_gb > current_overlay_gb {
-            print!(
-                "  Overlay: {} GiB → {} GiB (expanding disk...)",
-                current_overlay_gb, overlay_gb
-            );
-            std::io::Write::flush(&mut std::io::stdout()).ok();
-
-            let overlay_path = manager.overlay_path();
-            expand_disk::<Overlay>(overlay_path, overlay_gb)
-                .map_err(|e| smolvm::Error::storage("expand overlay disk", e.to_string()))?;
-            println!(" done");
-        }
-    }
-
-    // Update database record with new sizes
     db.update_vm(name, |r| {
         if let Some(s) = new_storage_gb {
             r.storage_gb = Some(s);
@@ -1378,9 +1383,15 @@ pub fn resize_vm(
         }
     })?;
 
-    println!();
-    println!("Machine '{}' resized successfully.", name);
-    println!("Disk changes are applied immediately; filesystem will expand on next boot.");
+    if changes.is_empty() {
+        println!("No disk changes needed.");
+    } else {
+        println!("Resized machine '{}':", name);
+        for c in &changes {
+            println!("{}", c);
+        }
+        println!("Filesystem will expand on next boot.");
+    }
 
     Ok(())
 }

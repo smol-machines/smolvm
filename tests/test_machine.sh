@@ -2603,6 +2603,62 @@ run_test "Prune --all: refuses on running VM" test_prune_all_refuses_on_running_
 run_test "Prune --all: removes cached images" test_prune_all_removes_images || true
 
 # =============================================================================
+# Machine Update Tests
+#
+# Verifies that `machine update` modifies settings on stopped machines and
+# that the changes take effect on next start.
+# =============================================================================
+
+test_update_settings_applied_on_start() {
+    # Verify update changes cpus, ports, network, and that they take effect.
+    # Also verifies update refuses a running VM.
+    $SMOLVM machine stop 2>/dev/null || true
+    $SMOLVM machine delete default -f 2>/dev/null || true
+    $SMOLVM machine create default 2>&1 || return 1
+
+    # Update multiple settings at once
+    local output
+    output=$($SMOLVM machine update default --cpus 2 --mem 1024 -p 9090:9090 --net 2>&1) || {
+        echo "update failed: $output"; return 1
+    }
+    [[ "$output" == *"cpus"* ]] || { echo "expected cpus in output: $output"; return 1; }
+
+    # Start and verify cpus applied
+    $SMOLVM machine start 2>&1 || return 1
+    local cpus
+    cpus=$($SMOLVM machine exec -- nproc 2>&1)
+    [[ "$cpus" == "2" ]] || { echo "expected 2 cpus, got: $cpus"; return 1; }
+
+    # Update on running VM should fail
+    local exit_code=0
+    $SMOLVM machine update default --mem 2048 2>&1 || exit_code=$?
+    [[ $exit_code -ne 0 ]] || { echo "update should fail on running VM"; return 1; }
+
+    $SMOLVM machine stop 2>/dev/null || true
+    $SMOLVM machine delete default -f 2>/dev/null || true
+}
+
+test_update_env_applied_on_start() {
+    # Env vars from the DB record are applied in image-based exec.
+    $SMOLVM machine stop 2>/dev/null || true
+    $SMOLVM machine delete default -f 2>/dev/null || true
+    $SMOLVM machine create --net --image alpine default 2>&1 || return 1
+
+    $SMOLVM machine update default -e MY_VAR=hello 2>&1 || return 1
+
+    $SMOLVM machine start 2>&1 || return 1
+    local val
+    val=$($SMOLVM machine exec -- sh -c 'echo $MY_VAR' 2>&1)
+    $SMOLVM machine stop 2>/dev/null || true
+    $SMOLVM machine delete default -f 2>/dev/null || true
+
+    [[ "$val" == "hello" ]] || { echo "expected MY_VAR=hello, got: $val"; return 1; }
+}
+
+run_test "Update: settings applied on next start + refuses running VM" test_update_settings_applied_on_start || true
+run_test "Update: env var applied on next start (image-based)" test_update_env_applied_on_start || true
+
+# =============================================================================
 # Stdout Backpressure Test
 #
 # Regression: image-backed exec deadlocked when stdout exceeded the OS pipe

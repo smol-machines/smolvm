@@ -121,11 +121,16 @@ pub(crate) fn expand_sparse_disk<D: DiskType>(path: &Path, new_size_gb: u64) -> 
         .map_err(|e| Error::storage("get disk metadata", e.to_string()))?
         .len();
 
-    if new_size_bytes <= current_size {
+    if new_size_bytes == current_size {
+        // Already at target size — idempotent. This handles retries after a
+        // partial failure where the disk was expanded but the DB wasn't updated.
+        return Ok(());
+    }
+    if new_size_bytes < current_size {
         return Err(Error::storage(
             "expand disk",
             format!(
-                "new size ({} GiB) must be larger than current size ({} GiB)",
+                "new size ({} GiB) must be larger than current size ({} GiB). Shrinking is not supported.",
                 new_size_gb,
                 current_size / BYTES_PER_GIB
             ),
