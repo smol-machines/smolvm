@@ -16,6 +16,13 @@ class Smolvm < Formula
 
   depends_on "e2fsprogs"
 
+  on_linux do
+    # The Linux x86_64 release links against Linuxbrew's libbz2.so.1.0. Without
+    # this dep, smolvm-bin fails at startup with "libbz2.so.1.0 => not found"
+    # (reported on Fedora, PR #223).
+    depends_on "bzip2"
+  end
+
   def install
     libexec.install Dir["*"]
 
