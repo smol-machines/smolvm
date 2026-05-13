@@ -1886,8 +1886,10 @@ fn prepare_overlay_from_packed(
         .map(|path| path.display().to_string())
         .collect();
 
-    // Use shared overlay setup logic
-    OverlaySetup::new(workload_id)?.execute(lowerdirs)
+    // Use shared overlay setup logic — execute_or_remount preserves the
+    // upper layer from a previous session (e.g., packages installed via exec)
+    // instead of recreating the overlay from scratch.
+    OverlaySetup::new(workload_id)?.execute_or_remount(lowerdirs)
 }
 
 /// Build lowerdir list from a pulled OCI image's layers.

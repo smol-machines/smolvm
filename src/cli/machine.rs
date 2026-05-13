@@ -2194,7 +2194,7 @@ impl CpCmd {
             .and_then(|r| r.image.clone())
         {
             let overlay_id = format!("persistent-{}", machine_name);
-            let _ = client.prepare_overlay(&image, &overlay_id);
+            client.prepare_overlay(&image, &overlay_id)?;
         }
 
         if is_upload {
