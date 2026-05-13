@@ -46,7 +46,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: macos-arm64-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: macos-arm64-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
           restore-keys: macos-arm64-cargo-
 
       - name: Setup Git LFS
@@ -71,6 +71,12 @@ jobs:
 
       - name: Run unit tests
         run: cargo test --lib
+        env:
+          LIBRARY_PATH: ${{ github.workspace }}/lib
+          DYLD_LIBRARY_PATH: ${{ github.workspace }}/lib
+
+      - name: Run agent unit tests
+        run: cargo test -p smolvm-agent --bins
         env:
           LIBRARY_PATH: ${{ github.workspace }}/lib
           DYLD_LIBRARY_PATH: ${{ github.workspace }}/lib
@@ -116,7 +122,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: linux-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: linux-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
           restore-keys: linux-${{ matrix.arch }}-cargo-
 
       - name: Install build dependencies
@@ -172,6 +178,12 @@ jobs:
 
       - name: Run unit tests
         run: cargo test --lib --target ${{ matrix.target }}
+        env:
+          LIBRARY_PATH: /usr/local/lib
+          LD_LIBRARY_PATH: /usr/local/lib
+
+      - name: Run agent unit tests
+        run: cargo test -p smolvm-agent --bins --target ${{ matrix.target }}
         env:
           LIBRARY_PATH: /usr/local/lib
           LD_LIBRARY_PATH: /usr/local/lib

@@ -301,6 +301,7 @@ fn main() {
     // mismatch surfaces is here. Without this log, the user discovers
     // the missing GPU much later — when their workload makes a
     // rendering call and crashes with a confused EGL/Vulkan error.
+    #[cfg(target_os = "linux")]
     if std::env::var(ENV_SMOLVM_GPU).as_deref() == Ok(ENV_VALUE_ON) {
         log_gpu_status();
     }
@@ -1042,6 +1043,7 @@ fn setup_signal_handlers() {
     // No-op on non-Linux platforms
 }
 
+#[cfg(target_os = "linux")]
 /// Resize an ext4 filesystem on an unmounted device to fill the block device.
 ///
 /// The host creates disks by copying a small pre-formatted template (~512MB)
@@ -1161,6 +1163,7 @@ fn resize_ext4_if_needed(device: &str, label: &str) -> bool {
     }
 }
 
+#[cfg(target_os = "linux")]
 /// Check if ext4 filesystem already fills the block device.
 ///
 /// Reads the ext4 superblock (at offset 1024) to get block_count and block_size,
@@ -1215,6 +1218,7 @@ fn ext4_already_full_size(device: &str) -> bool {
     fs_size + block_size >= dev_size
 }
 
+#[cfg(target_os = "linux")]
 /// Check /proc/mounts to see if anything is mounted at the given path.
 fn is_mounted_at(mount_point: &str) -> bool {
     if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
@@ -1225,6 +1229,7 @@ fn is_mounted_at(mount_point: &str) -> bool {
     false
 }
 
+#[cfg(target_os = "linux")]
 /// Create required subdirectories under the storage mount point.
 fn create_storage_dirs(mount_point: &str) {
     let dirs = [
@@ -1244,6 +1249,7 @@ fn create_storage_dirs(mount_point: &str) {
 }
 
 /// Mount ext4 /dev/vda at /storage using direct syscall (avoids ~3-5ms fork+exec).
+#[cfg(target_os = "linux")]
 fn try_mount_storage_ext4() -> bool {
     let dev = cstr("/dev/vda");
     let mnt = cstr("/storage");
@@ -1266,6 +1272,7 @@ fn try_mount_storage_ext4() -> bool {
 /// 1. resize + mount (works on subsequent boots with Linux-native FS)
 /// 2. fsck + resize + mount (may fix minor corruption)
 /// 3. mkfs + mount (first boot from macOS template, or unrecoverable)
+#[cfg(target_os = "linux")]
 fn mount_storage_disk() -> bool {
     use std::process::Command;
 
@@ -1365,6 +1372,12 @@ fn mount_storage_disk() -> bool {
     }
 
     error!("CRITICAL: could not mount storage disk after all recovery attempts");
+    false
+}
+
+/// Stub for non-Linux platforms.
+#[cfg(not(target_os = "linux"))]
+fn mount_storage_disk() -> bool {
     false
 }
 
