@@ -168,8 +168,11 @@ impl ApiState {
         let mut loaded = Vec::new();
 
         for (name, record) in vms {
-            // Check if VM process is still alive
-            if !record.is_process_alive() {
+            // Only clean up machines that have a PID (were started) but whose
+            // process is no longer alive.  Machines in "created" state (pid=None)
+            // have never been started and must be preserved — they are valid
+            // configs waiting for a start call.  See BUG-29.
+            if record.pid.is_some() && !record.is_process_alive() {
                 tracing::info!(machine = %name, "cleaning up dead machine from database");
                 if let Err(e) = self.db.remove_vm(&name) {
                     tracing::warn!(machine = %name, error = %e, "failed to remove dead machine from database");
@@ -937,21 +940,20 @@ mod tests {
     }
 
     #[test]
-    fn test_load_persisted_machines_dead_record_does_not_block_name() {
+    fn test_load_persisted_machines_preserves_created_no_pid() {
         let (_dir, state) = temp_api_state();
 
-        // Insert a dead record with no PID (definitely dead)
+        // Insert a record with no PID (created but never started).
+        // These must be preserved — they are valid configs waiting for
+        // a start call.  See BUG-29.
         let record = VmRecord::new("ghost".into(), 1, 512, vec![], vec![], false);
         state.db.insert_vm("ghost", &record).unwrap();
 
-        // Load should remove it (no PID = dead)
-        let loaded = state.load_persisted_machines();
-        assert!(loaded.is_empty());
-
-        // Name should not be blocked
+        // Load should NOT remove it — no PID means "never started", not "dead".
+        let _loaded = state.load_persisted_machines();
         assert!(
-            state.reserve_machine_name("ghost").is_ok(),
-            "cleaned-up name should be available for reuse"
+            state.db.get_vm("ghost").unwrap().is_some(),
+            "created (no-PID) machine must be preserved across server restart"
         );
     }
 
