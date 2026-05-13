@@ -1524,7 +1524,7 @@ test_machine_images() {
     $SMOLVM machine start --name default 2>/dev/null || true
 
     local output
-    output=$($SMOLVM machine images 2>&1)
+    output=$($SMOLVM machine images --name default 2>&1)
 
     $SMOLVM machine stop 2>/dev/null || true
     $SMOLVM machine delete default -f 2>/dev/null || true
@@ -1540,7 +1540,7 @@ test_machine_prune_dry_run() {
     $SMOLVM machine start --name default 2>/dev/null || true
 
     local output
-    output=$($SMOLVM machine prune --dry-run 2>&1)
+    output=$($SMOLVM machine prune --name default --dry-run 2>&1)
 
     $SMOLVM machine stop 2>/dev/null || true
     $SMOLVM machine delete default -f 2>/dev/null || true
@@ -2347,7 +2347,7 @@ assert_vm_stays_running() {
 }
 
 test_images_does_not_stop_running_vm() {
-    assert_vm_stays_running "machine images" $SMOLVM machine images
+    assert_vm_stays_running "machine images" $SMOLVM machine images --name default
 }
 
 test_prune_on_running_vm() {
@@ -2359,7 +2359,7 @@ test_prune_on_running_vm() {
 
     # Regular prune should work without stopping the VM
     local output
-    output=$($SMOLVM machine prune 2>&1) || true
+    output=$($SMOLVM machine prune --name default 2>&1) || true
     [[ "$output" == *"unreferenced"* ]] || [[ "$output" == *"No unreferenced"* ]] || {
         echo "unexpected prune output: $output"
         return 1
@@ -2374,7 +2374,7 @@ test_prune_dry_run_on_running_vm() {
     ensure_machine_running
 
     local output
-    output=$($SMOLVM machine prune --dry-run 2>&1) || true
+    output=$($SMOLVM machine prune --name default --dry-run 2>&1) || true
     [[ "$output" == *"unreferenced"* ]] || [[ "$output" == *"No unreferenced"* ]] || {
         echo "unexpected prune --dry-run output: $output"
         return 1
@@ -2395,9 +2395,9 @@ test_prune_all_refuses_on_running_vm() {
 
     # --all should refuse while the VM is running
     local output exit_code=0
-    output=$($SMOLVM machine prune --all 2>&1) || exit_code=$?
+    output=$($SMOLVM machine prune --name default --all 2>&1) || exit_code=$?
     [[ $exit_code -ne 0 ]] || { echo "prune --all should have failed on running VM"; return 1; }
-    [[ "$output" == *"cannot prune --all while the machine is running"* ]] || {
+    [[ "$output" == *"cannot prune --all while machine"* ]] || {
         echo "unexpected error: $output"
         return 1
     }
@@ -2422,14 +2422,14 @@ test_prune_all_removes_images() {
 
     # Check images before prune
     local images_before
-    images_before=$($SMOLVM machine images 2>&1)
+    images_before=$($SMOLVM machine images --name default 2>&1)
 
-    # Stop the VM (prune requires it)
+    # Stop the VM (prune --all requires it)
     $SMOLVM machine stop 2>&1
 
     # Run prune --all
     local output
-    output=$($SMOLVM machine prune --all 2>&1) || {
+    output=$($SMOLVM machine prune --name default --all 2>&1) || {
         echo "prune --all failed: $output"
         $SMOLVM machine delete default -f 2>/dev/null
         return 1
@@ -2447,7 +2447,7 @@ test_prune_all_removes_images() {
     }
 
     local images_after
-    images_after=$($SMOLVM machine images 2>&1)
+    images_after=$($SMOLVM machine images --name default 2>&1)
 
     $SMOLVM machine stop 2>/dev/null || true
     $SMOLVM machine delete default -f 2>/dev/null || true

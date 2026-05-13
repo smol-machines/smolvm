@@ -1917,10 +1917,14 @@ impl NetworkTestCmd {
 /// sizes and layer counts. Also displays total storage usage.
 ///
 /// Examples:
-///   smolvm machine images
-///   smolvm machine images --json
+///   smolvm machine images --name myvm
+///   smolvm machine images --name myvm --json
 #[derive(Args, Debug)]
 pub struct ImagesCmd {
+    /// Machine to query
+    #[arg(long, required = true, value_name = "NAME")]
+    pub name: String,
+
     /// Output in JSON format
     #[arg(long)]
     pub json: bool,
@@ -1928,17 +1932,28 @@ pub struct ImagesCmd {
 
 impl ImagesCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        let manager = AgentManager::new_default()?;
+        // Validate VM exists before creating storage (for_vm creates dirs).
+        let db = smolvm::db::SmolvmDb::open()?;
+        let record = db.get_vm(&self.name)?.ok_or_else(|| {
+            smolvm::Error::config("images", format!("machine '{}' not found", self.name))
+        })?;
 
-        let mut client = if manager.try_connect_existing().is_some() {
-            // VM was already running — don't stop it when we're done
+        let manager =
+            AgentManager::for_vm_with_sizes(&self.name, record.storage_gb, record.overlay_gb)?;
+
+        let started_for_query = if manager.try_connect_existing().is_some() {
             manager.detach();
-            AgentClient::connect_with_retry(manager.vsock_socket())?
+            false
         } else {
-            println!("Starting machine to query storage...");
+            if self.json {
+                eprintln!("Starting machine '{}' to query storage...", self.name);
+            } else {
+                println!("Starting machine '{}' to query storage...", self.name);
+            }
             manager.start()?;
-            AgentClient::connect_with_retry(manager.vsock_socket())?
+            true
         };
+        let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
 
         let status = client.storage_status()?;
         let images = client.list_images()?;
@@ -1989,6 +2004,10 @@ impl ImagesCmd {
             }
         }
 
+        if started_for_query {
+            let _ = manager.stop();
+        }
+
         Ok(())
     }
 }
@@ -2003,11 +2022,15 @@ impl ImagesCmd {
 /// Use --dry-run to see what would be removed without actually deleting.
 ///
 /// Examples:
-///   smolvm machine prune --dry-run
-///   smolvm machine prune
-///   smolvm machine prune --all
+///   smolvm machine prune --name myvm --dry-run
+///   smolvm machine prune --name myvm
+///   smolvm machine prune --name myvm --all
 #[derive(Args, Debug)]
 pub struct PruneCmd {
+    /// Machine to prune
+    #[arg(long, required = true, value_name = "NAME")]
+    pub name: String,
+
     /// Show what would be removed without actually removing
     #[arg(long)]
     pub dry_run: bool,
@@ -2019,7 +2042,14 @@ pub struct PruneCmd {
 
 impl PruneCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        let manager = AgentManager::new_default()?;
+        // Validate VM exists before creating storage (for_vm creates dirs).
+        let db = smolvm::db::SmolvmDb::open()?;
+        let record = db.get_vm(&self.name)?.ok_or_else(|| {
+            smolvm::Error::config("prune", format!("machine '{}' not found", self.name))
+        })?;
+
+        let manager =
+            AgentManager::for_vm_with_sizes(&self.name, record.storage_gb, record.overlay_gb)?;
 
         // Regular prune (unreferenced layers only) is safe on a running VM —
         // referenced layers can't be collected. --all deletes manifests for
@@ -2028,12 +2058,14 @@ impl PruneCmd {
         let started_for_prune;
 
         if already_running && self.all {
+            manager.detach();
             return Err(smolvm::Error::agent(
                 "prune",
-                "cannot prune --all while the machine is running. Stop it first with 'smolvm machine stop'",
+                format!("cannot prune --all while machine '{}' is running. Stop it first with: smolvm machine stop --name {}", self.name, self.name),
             ));
         } else if already_running {
             started_for_prune = false;
+            manager.detach();
         } else {
             println!("Starting machine...");
             manager.start()?;
