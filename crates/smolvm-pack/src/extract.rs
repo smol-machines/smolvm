@@ -79,6 +79,12 @@ fn safe_unpack<R: Read>(archive: &mut tar::Archive<R>, dest: &Path) -> std::io::
                             ),
                         ));
                     }
+                    // Skip hardlinks whose target was skipped (e.g., overlayfs
+                    // whiteout char devices). The target doesn't exist on disk
+                    // so creating the hardlink would fail.
+                    if !normalized.exists() {
+                        continue;
+                    }
                 }
             }
             tar::EntryType::Char | tar::EntryType::Block => {
@@ -1653,6 +1659,70 @@ mod tests {
         // Device entries are not created
         assert!(!dest.join("etc/alternatives/pager.1.gz").exists());
         assert!(!dest.join("dev/sda").exists());
+    }
+
+    #[test]
+    fn test_safe_unpack_skips_hardlink_to_whiteout() {
+        // Overlayfs exports from Fedora produce hardlinks to char-device
+        // whiteout entries (e.g., .build-id symlinks referencing replaced
+        // base-layer files). The whiteout is skipped, so the hardlink target
+        // doesn't exist — the hardlink must be skipped too.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dest_raw = temp_dir.path().join("out");
+        fs::create_dir_all(&dest_raw).unwrap();
+        let dest = dest_raw.canonicalize().unwrap();
+
+        let mut builder = tar::Builder::new(Vec::new());
+
+        // Char device whiteout (will be skipped)
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Char);
+        header.set_size(0);
+        header.set_mode(0o000);
+        header.set_path("usr/lib/.build-id/84/target").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "usr/lib/.build-id/84/target", &b""[..])
+            .unwrap();
+
+        // Hardlink to the skipped whiteout (should also be skipped)
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Link);
+        header.set_size(0);
+        header.set_mode(0o000);
+        header.set_path("usr/lib/.build-id/d9/link").unwrap();
+        header.set_link_name("usr/lib/.build-id/84/target").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "usr/lib/.build-id/d9/link", &b""[..])
+            .unwrap();
+
+        // Regular file after (must survive)
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(2);
+        header.set_mode(0o644);
+        header.set_path("ok.txt").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "ok.txt", &b"ok"[..])
+            .unwrap();
+
+        let tar_data = builder.into_inner().unwrap();
+
+        let mut archive = tar::Archive::new(tar_data.as_slice());
+        let result = safe_unpack(&mut archive, &dest);
+        assert!(
+            result.is_ok(),
+            "hardlink to skipped whiteout should be skipped: {:?}",
+            result.err()
+        );
+
+        // Whiteout and hardlink are not created
+        assert!(!dest.join("usr/lib/.build-id/84/target").exists());
+        assert!(!dest.join("usr/lib/.build-id/d9/link").exists());
+        // Regular file survives
+        assert_eq!(fs::read_to_string(dest.join("ok.txt")).unwrap(), "ok");
     }
 
     #[test]
