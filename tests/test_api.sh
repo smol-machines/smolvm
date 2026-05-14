@@ -483,4 +483,40 @@ run_test "API: create from .smolmachine" test_api_create_from_smolmachine || tru
 run_test "API: from + image conflict" test_api_from_and_image_conflict || true
 run_test "API: from nonexistent sidecar" test_api_from_nonexistent_sidecar || true
 
+# =============================================================================
+# Created-state machines survive server restart
+# =============================================================================
+
+test_created_machine_survives_restart() {
+    local name="created-survive-$$"
+
+    # Create a machine (never start it)
+    local status
+    status=$("${CURL[@]}" -s -o /dev/null -w "%{http_code}" -X POST "$API_URL/api/v1/machines" \
+        -H "Content-Type: application/json" \
+        -d "{\"name\": \"$name\", \"cpus\": 1, \"memoryMb\": 512}")
+    [[ "$status" == "200" ]] || { echo "FAIL: create returned $status"; return 1; }
+
+    # Verify it exists
+    local get_status
+    get_status=$("${CURL[@]}" -s -o /dev/null -w "%{http_code}" "$API_URL/api/v1/machines/$name")
+    [[ "$get_status" == "200" ]] || { echo "FAIL: machine not found after create"; return 1; }
+
+    # Restart the server
+    stop_server
+    start_server || { echo "FAIL: server restart failed"; return 1; }
+
+    # Machine should still exist
+    get_status=$("${CURL[@]}" -s -o /dev/null -w "%{http_code}" "$API_URL/api/v1/machines/$name")
+    [[ "$get_status" == "200" ]] || {
+        echo "FAIL: created machine deleted on server restart (got $get_status)"
+        return 1
+    }
+
+    # Cleanup
+    "${CURL[@]}" -s -X DELETE "$API_URL/api/v1/machines/$name" >/dev/null 2>&1 || true
+}
+
+run_test "API: created machine survives server restart" test_created_machine_survives_restart || true
+
 print_summary "HTTP API Tests"

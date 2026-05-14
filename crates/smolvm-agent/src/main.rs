@@ -1476,6 +1476,36 @@ fn run_server_with_listener(
     }
 }
 
+/// Patch `timeout_ms` on request variants where serde may have silently dropped
+/// the field due to the flatten + internally-tagged enum limitation.
+/// Re-extracts the value from the raw JSON payload.
+fn patch_timeout_ms(request: &mut AgentRequest, raw: &[u8]) {
+    let needs_patch = matches!(
+        request,
+        AgentRequest::VmExec {
+            timeout_ms: None,
+            ..
+        } | AgentRequest::Run {
+            timeout_ms: None,
+            ..
+        }
+    );
+    if !needs_patch {
+        return;
+    }
+
+    if let Ok(map) = serde_json::from_slice::<serde_json::Value>(raw) {
+        if let Some(ms) = map.get("timeout_ms").and_then(|v| v.as_u64()) {
+            match request {
+                AgentRequest::VmExec { timeout_ms, .. } | AgentRequest::Run { timeout_ms, .. } => {
+                    *timeout_ms = Some(ms);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 /// Handle a single connection.
 fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::error::Error>> {
     let mut buf = vec![0u8; REQUEST_BUFFER_SIZE];
@@ -1526,7 +1556,7 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
 
         // Parse request (Envelope wraps the request with an optional trace_id).
         // Falls back to bare AgentRequest for backward compatibility with old hosts.
-        let (request, trace_id) =
+        let (mut request, trace_id) =
             match serde_json::from_slice::<Envelope<AgentRequest>>(&buf[..len]) {
                 Ok(env) => (env.body, env.trace_id),
                 Err(_) => match serde_json::from_slice::<AgentRequest>(&buf[..len]) {
@@ -1544,6 +1574,11 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
                     }
                 },
             };
+
+        // Work around serde flatten + internally-tagged enum limitation:
+        // fields with #[serde(default)] can be silently dropped during
+        // deserialization. Re-extract timeout_ms from the raw JSON.
+        patch_timeout_ms(&mut request, &buf[..len]);
 
         let _span = if let Some(ref tid) = trace_id {
             tracing::info_span!("request", trace_id = %tid, method = ?request)
@@ -4327,6 +4362,10 @@ fn handle_vm_exec(
         cmd.current_dir(wd);
     }
 
+    // Commands that don't receive interactive stdin should get EOF
+    // immediately, not block on /dev/console (the agent's inherited stdin).
+    // Without this, `exec -- cat` hangs until the connection times out.
+    cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 

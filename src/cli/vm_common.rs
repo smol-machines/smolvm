@@ -598,7 +598,7 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
     } else {
         String::new()
     };
-    println!("Starting machine '{}'{}{}...", name, mount_info, port_info);
+    eprintln!("Starting machine '{}'{}{}...", name, mount_info, port_info);
 
     // Resolve SSH agent socket path if enabled
     let ssh_agent_socket = if record.ssh_agent {
@@ -677,7 +677,7 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
             // Layers already mounted via virtiofs — no pull needed.
             None
         } else if let Some(ref image) = record.image {
-            println!("Pulling {}...", image);
+            eprintln!("Pulling {}...", image);
             Some(crate::cli::pull_with_progress(&mut client, image, None)?)
         } else {
             None
@@ -909,7 +909,7 @@ pub fn start_vm_default() -> smolvm::Result<()> {
     // starting fresh; no-op otherwise.
     cli_recover_if_unreachable("default");
 
-    println!("Starting machine 'default'...");
+    eprintln!("Starting machine 'default'...");
     manager.ensure_running()?;
 
     let mut config = SmolvmConfig::load()?;
@@ -930,7 +930,7 @@ pub fn start_vm_default() -> smolvm::Result<()> {
                 smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
 
             let image_info = if let Some(ref image) = record.image {
-                println!("Pulling {}...", image);
+                eprintln!("Pulling {}...", image);
                 Some(crate::cli::pull_with_progress(&mut client, image, None)?)
             } else {
                 None

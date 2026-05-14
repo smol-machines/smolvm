@@ -432,9 +432,9 @@ impl RunCmd {
                 .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
 
         if self.detach {
-            println!("Starting persistent machine...");
+            eprintln!("Starting persistent machine...");
         } else {
-            println!("Starting ephemeral machine ({})...", vm_name);
+            eprintln!("Starting ephemeral machine ({})...", vm_name);
         }
 
         let ssh_agent_socket = if self.ssh_agent || params.ssh_agent {
@@ -1885,7 +1885,7 @@ impl NetworkTestCmd {
         // Ensure machine is running
         let already_running = manager.try_connect_existing().is_some();
         if !already_running {
-            println!("Starting machine '{}'...", label);
+            eprintln!("Starting machine '{}'...", label);
             manager.ensure_running()?;
         }
 
@@ -1945,11 +1945,7 @@ impl ImagesCmd {
             manager.detach();
             false
         } else {
-            if self.json {
-                eprintln!("Starting machine '{}' to query storage...", self.name);
-            } else {
-                println!("Starting machine '{}' to query storage...", self.name);
-            }
+            eprintln!("Starting machine '{}' to query storage...", self.name);
             manager.start()?;
             true
         };
@@ -2067,7 +2063,7 @@ impl PruneCmd {
             started_for_prune = false;
             manager.detach();
         } else {
-            println!("Starting machine...");
+            eprintln!("Starting machine...");
             manager.start()?;
             started_for_prune = true;
         }

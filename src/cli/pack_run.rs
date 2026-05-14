@@ -365,7 +365,8 @@ impl PackRunCmd {
             smolvm::process::detach_stdio();
 
             if let Err(e) = launch_agent_vm_dynamic(&krun, &config) {
-                let _ = e;
+                let msg = format!("launch_agent_vm_dynamic failed: {}\n", e);
+                let _ = std::fs::write(&config.console_log, &msg);
             }
 
             smolvm::process::exit_child(1);
@@ -1226,7 +1227,8 @@ fn run_from_cache(
         smolvm::process::detach_stdio();
 
         if let Err(e) = launch_agent_vm_dynamic(&krun, &config) {
-            let _ = e;
+            let msg = format!("launch_agent_vm_dynamic failed: {}\n", e);
+            let _ = std::fs::write(&config.console_log, &msg);
         }
         smolvm::process::exit_child(1);
     })
@@ -1576,9 +1578,8 @@ fn daemon_start(
         smolvm::process::detach_stdio();
 
         if let Err(e) = launch_agent_vm_dynamic(&krun, &config) {
-            // stderr is /dev/null here, but the error is also logged
-            // to console.log via set_console_output
-            let _ = e;
+            let msg = format!("launch_agent_vm_dynamic failed: {}\n", e);
+            let _ = std::fs::write(&config.console_log, &msg);
         }
 
         smolvm::process::exit_child(1);

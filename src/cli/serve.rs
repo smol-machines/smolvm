@@ -112,6 +112,9 @@ impl ServeStartCmd {
             }
         }
 
+        // Install SIGCHLD handler to reap zombie VM child processes.
+        smolvm::process::install_sigchld_handler();
+
         // Install Prometheus metrics recorder and mark start time
         if let Some(handle) = smolvm::api::install_metrics_recorder() {
             let _ = smolvm::api::METRICS_HANDLE.set(handle);

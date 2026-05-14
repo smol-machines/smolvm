@@ -53,6 +53,7 @@ pub async fn upload_file(
         .await
         .map_err(classify_ensure_running_error)?;
 
+    let file_path = file_path.trim_start_matches('/');
     let guest_path = format!("/{}", file_path);
     let size = body.len() as u64;
 
@@ -93,6 +94,7 @@ pub async fn download_file(
         .await
         .map_err(classify_ensure_running_error)?;
 
+    let file_path = file_path.trim_start_matches('/');
     let guest_path = format!("/{}", file_path);
 
     let data = with_machine_client_traced(&entry, tid, move |c| c.read_file(&guest_path)).await?;
