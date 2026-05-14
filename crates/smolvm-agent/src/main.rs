@@ -1482,7 +1482,13 @@ fn run_server_with_listener(
 fn patch_timeout_ms(request: &mut AgentRequest, raw: &[u8]) {
     let needs_patch = matches!(
         request,
-        AgentRequest::VmExec { timeout_ms: None, .. } | AgentRequest::Run { timeout_ms: None, .. }
+        AgentRequest::VmExec {
+            timeout_ms: None,
+            ..
+        } | AgentRequest::Run {
+            timeout_ms: None,
+            ..
+        }
     );
     if !needs_patch {
         return;
@@ -1491,8 +1497,7 @@ fn patch_timeout_ms(request: &mut AgentRequest, raw: &[u8]) {
     if let Ok(map) = serde_json::from_slice::<serde_json::Value>(raw) {
         if let Some(ms) = map.get("timeout_ms").and_then(|v| v.as_u64()) {
             match request {
-                AgentRequest::VmExec { timeout_ms, .. }
-                | AgentRequest::Run { timeout_ms, .. } => {
+                AgentRequest::VmExec { timeout_ms, .. } | AgentRequest::Run { timeout_ms, .. } => {
                     *timeout_ms = Some(ms);
                 }
                 _ => {}

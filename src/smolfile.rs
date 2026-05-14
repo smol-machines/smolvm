@@ -52,9 +52,11 @@ pub fn resolve_host_to_cidrs(host: &str) -> Result<Vec<String>, String> {
     let host_owned = host.to_string();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let result = format!("{}:0", host_owned)
-            .to_socket_addrs()
-            .map(|addrs| addrs.map(|addr| format!("{}/32", addr.ip())).collect::<Vec<_>>());
+        let result = format!("{}:0", host_owned).to_socket_addrs().map(|addrs| {
+            addrs
+                .map(|addr| format!("{}/32", addr.ip()))
+                .collect::<Vec<_>>()
+        });
         let _ = tx.send(result);
     });
 
