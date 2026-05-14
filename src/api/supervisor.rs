@@ -167,9 +167,12 @@ impl Supervisor {
         let entry_clone = entry.clone();
         let start_result = tokio::task::spawn_blocking(move || {
             let entry = entry_clone.lock();
-            entry
-                .manager
-                .ensure_running_via_subprocess(mounts, ports, resources, Default::default())
+            entry.manager.ensure_running_via_subprocess(
+                mounts,
+                ports,
+                resources,
+                Default::default(),
+            )
         })
         .await
         .map_err(|e| crate::Error::agent("ensure running", e.to_string()))?;
