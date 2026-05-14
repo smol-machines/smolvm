@@ -1516,10 +1516,22 @@ impl AgentManager {
 
 impl Drop for AgentManager {
     fn drop(&mut self) {
-        // Check if detached before attempting cleanup
-        let detached = self.inner.lock().detached;
+        let inner = self.inner.lock();
+        let detached = inner.detached;
+        let has_child = inner.child.is_some();
+        drop(inner);
 
-        if !detached {
+        if detached {
+            return;
+        }
+
+        // Only stop the VM if this manager actually owns the child process.
+        // Managers created as observers (e.g., API read handlers, monitor
+        // loop iterations) have no child handle and must NOT kill VMs they
+        // didn't start.  Without this guard, dropping an observer manager
+        // triggers the orphan-cleanup path in stop(), which reads the PID
+        // file and kills whatever VM another manager is running.
+        if has_child {
             if let Err(e) = self.stop() {
                 tracing::debug!(error = %e, "failed to stop agent in drop");
             }
