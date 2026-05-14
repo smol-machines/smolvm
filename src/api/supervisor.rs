@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 
-use crate::api::state::{ensure_machine_running, ApiState};
+use crate::api::state::ApiState;
 use crate::config::RecordState;
 
 /// Interval between health checks.
@@ -145,11 +145,38 @@ impl Supervisor {
             }
         };
 
-        let start_result = ensure_machine_running(&entry).await;
+        // Load the authoritative config from the database record rather than
+        // the in-memory MachineEntry, which may have lost fields (e.g.,
+        // network_backend, gpu_vram_mib) during the ResourceSpec round-trip.
+        let record = match self.state.db().get_vm(name) {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                tracing::warn!(machine = %name, "machine not found in database, skipping restart");
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::warn!(machine = %name, error = %e, "failed to read machine record, skipping restart");
+                return Ok(());
+            }
+        };
+
+        let mounts = record.host_mounts();
+        let ports = record.port_mappings();
+        let resources = record.vm_resources();
+
+        let entry_clone = entry.clone();
+        let start_result = tokio::task::spawn_blocking(move || {
+            let entry = entry_clone.lock();
+            entry
+                .manager
+                .ensure_running_via_subprocess(mounts, ports, resources, Default::default())
+        })
+        .await
+        .map_err(|e| crate::Error::agent("ensure running", e.to_string()))?;
 
         // Handle start result
         match start_result {
-            Ok(()) => {
+            Ok(_) => {
                 // Get updated PID and persist state
                 let pid = {
                     let entry = entry.lock();
