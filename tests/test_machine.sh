@@ -3237,4 +3237,91 @@ test_init_skipped_on_restart() {
 
 run_test "Init: skipped on restart after first successful run" test_init_skipped_on_restart || true
 
+# =============================================================================
+# Piped stdin EOF detection
+# =============================================================================
+
+test_piped_stdin_cat() {
+    local out exit_code=0
+    out=$(echo "hello" | run_with_timeout 15 "$SMOLVM" machine run -i -- cat 2>/dev/null) \
+        || exit_code=$?
+    [[ $exit_code -eq 0 ]] || { echo "FAIL: exit $exit_code (expected 0)"; return 1; }
+    [[ "$out" == *"hello"* ]] || { echo "FAIL: expected 'hello', got: $out"; return 1; }
+}
+
+run_test "Stdin: piped 'echo hello | run -i cat' returns data" test_piped_stdin_cat || true
+
+# =============================================================================
+# Status messages go to stderr, not stdout
+# =============================================================================
+
+test_stdout_no_status_messages() {
+    local out
+    out=$("$SMOLVM" machine run --image alpine -- echo PAYLOAD_ONLY 2>/dev/null) || true
+    if echo "$out" | grep -qiE "^Starting|^Pulling"; then
+        echo "FAIL: status messages in stdout: $(echo "$out" | grep -iE 'Starting|Pulling' | head -1)"
+        return 1
+    fi
+    [[ "$out" == *"PAYLOAD_ONLY"* ]] || { echo "FAIL: missing payload in: $out"; return 1; }
+}
+
+run_test "Output: stdout has only command output, no status" test_stdout_no_status_messages || true
+
+# =============================================================================
+# Exec stdin null — stdin-blocking commands exit cleanly
+# =============================================================================
+
+_EXEC_STDIN_MACHINE="exec-stdin-$$"
+
+test_exec_cat_no_interactive() {
+    "$SMOLVM" machine stop --name "$_EXEC_STDIN_MACHINE" 2>/dev/null || true
+    "$SMOLVM" machine delete "$_EXEC_STDIN_MACHINE" -f 2>/dev/null || true
+    "$SMOLVM" machine create "$_EXEC_STDIN_MACHINE" 2>/dev/null || return 1
+    "$SMOLVM" machine start --name "$_EXEC_STDIN_MACHINE" 2>/dev/null || return 1
+
+    local out exit_code=0
+    out=$(run_with_timeout 10 "$SMOLVM" machine exec --name "$_EXEC_STDIN_MACHINE" -- cat 2>&1) \
+        || exit_code=$?
+
+    "$SMOLVM" machine stop --name "$_EXEC_STDIN_MACHINE" 2>/dev/null || true
+    "$SMOLVM" machine delete "$_EXEC_STDIN_MACHINE" -f 2>/dev/null || true
+
+    if echo "$out" | grep -qi "connection closed"; then
+        echo "FAIL: got 'connection closed'"
+        return 1
+    fi
+    [[ $exit_code -eq 0 ]] || { echo "FAIL: exit $exit_code (expected 0)"; return 1; }
+}
+
+run_test "Exec: 'exec -- cat' exits cleanly with null stdin" test_exec_cat_no_interactive || true
+
+# =============================================================================
+# Named machine survives observer Drop
+# =============================================================================
+
+_DROP_MACHINE="drop-safe-$$"
+
+test_machine_survives_rapid_exec() {
+    "$SMOLVM" machine stop --name "$_DROP_MACHINE" 2>/dev/null || true
+    "$SMOLVM" machine delete "$_DROP_MACHINE" -f 2>/dev/null || true
+    "$SMOLVM" machine create "$_DROP_MACHINE" 2>/dev/null || return 1
+    "$SMOLVM" machine start --name "$_DROP_MACHINE" 2>/dev/null || return 1
+
+    local i
+    for i in 1 2 3 4 5; do
+        local out exit_code=0
+        out=$(run_with_timeout 15 "$SMOLVM" machine exec --name "$_DROP_MACHINE" -- echo "alive-$i" 2>/dev/null) \
+            || exit_code=$?
+        [[ $exit_code -eq 0 ]] || {
+            "$SMOLVM" machine delete "$_DROP_MACHINE" -f 2>/dev/null || true
+            echo "FAIL: exec #$i failed (exit $exit_code)"; return 1
+        }
+    done
+
+    "$SMOLVM" machine stop --name "$_DROP_MACHINE" 2>/dev/null || true
+    "$SMOLVM" machine delete "$_DROP_MACHINE" -f 2>/dev/null || true
+}
+
+run_test "Drop-safety: machine survives 5 rapid execs" test_machine_survives_rapid_exec || true
+
 print_summary "Machine Tests"
