@@ -149,7 +149,10 @@ pub fn poll_io(stdin_fd: RawFd, socket_fd: RawFd, timeout_ms: i32) -> io::Result
     }
 
     Ok(PollResult {
-        stdin_ready: fds[0].revents & libc::POLLIN != 0,
+        // POLLHUP: the pipe's write end was closed (e.g., `echo | smolvm exec -i`).
+        // Without this, piped stdin EOF is never detected and the host hangs
+        // forever waiting for more input.
+        stdin_ready: fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0,
         socket_ready: fds[1].revents & libc::POLLIN != 0,
         socket_hangup: fds[1].revents & (libc::POLLHUP | libc::POLLERR) != 0,
     })

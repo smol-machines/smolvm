@@ -986,7 +986,9 @@ impl AgentClient {
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(e) => {
-                        tracing::warn!(error = %e, "error reading stdin");
+                        tracing::debug!(error = %e, "stdin read error, treating as EOF");
+                        stdin_eof = true;
+                        self.send(&AgentRequest::Stdin { data: Vec::new() })?;
                     }
                 }
             }
@@ -1268,7 +1270,7 @@ impl AgentClient {
         if total_size <= FILE_WRITE_SINGLE_SHOT_MAX as u64 {
             // Small file: read into memory and use single-shot path.
             let mut data = Vec::with_capacity(total_size as usize);
-            std::io::Read::read_to_end(&mut std::io::Read::take(reader, total_size + 1), &mut data)
+            std::io::Read::read_to_end(&mut std::io::Read::take(reader, total_size), &mut data)
                 .map_err(|e| Error::agent("read source file", e.to_string()))?;
             return self.write_file_with_progress(path, &data, mode, on_progress);
         }
