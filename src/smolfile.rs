@@ -48,12 +48,20 @@ pub fn resolve_host_to_cidrs(host: &str) -> Result<Vec<String>, String> {
         return Ok(vec![format!("{}/32", ip)]);
     }
 
-    // Resolve hostname
-    let addrs: Vec<String> = format!("{}:0", host)
-        .to_socket_addrs()
-        .map_err(|e| format!("failed to resolve '{}': {}", host, e))?
-        .map(|addr| format!("{}/32", addr.ip()))
-        .collect();
+    // Resolve hostname with a timeout to avoid hanging on slow/unreachable DNS.
+    let host_owned = host.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = format!("{}:0", host_owned)
+            .to_socket_addrs()
+            .map(|addrs| addrs.map(|addr| format!("{}/32", addr.ip())).collect::<Vec<_>>());
+        let _ = tx.send(result);
+    });
+
+    let addrs: Vec<String> = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .map_err(|_| format!("DNS resolution for '{}' timed out after 10 seconds", host))?
+        .map_err(|e| format!("failed to resolve '{}': {}", host, e))?;
 
     if addrs.is_empty() {
         return Err(format!("'{}' resolved to no addresses", host));
