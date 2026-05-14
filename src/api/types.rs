@@ -363,6 +363,9 @@ pub struct CreateMachineRequest {
     /// Allowed egress CIDR ranges.
     #[serde(default)]
     pub allowed_cidrs: Option<Vec<String>>,
+    /// Restart policy configuration.
+    #[serde(default)]
+    pub restart: Option<RestartSpec>,
     /// OCI image reference (e.g., "alpine:latest"). Mutually exclusive with `from`.
     #[serde(default)]
     pub image: Option<String>,

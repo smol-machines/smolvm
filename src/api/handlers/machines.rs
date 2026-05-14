@@ -29,7 +29,7 @@ use axum::{
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::agent::{AgentClient, AgentManager, HostMount};
+use crate::agent::{vm_data_dir, AgentClient, AgentManager, HostMount};
 use crate::api::error::ApiError;
 use crate::api::state::{
     vm_resources_to_spec, ApiState, MachineEntry, MachineRegistration, ReservationGuard,
@@ -332,7 +332,22 @@ pub async fn create_machine(
         mounts: req.mounts.clone(),
         ports: req.ports.clone(),
         resources: resources.clone(),
-        restart: RestartConfig::default(),
+        restart: match req.restart {
+            Some(ref spec) => {
+                let policy = spec
+                    .policy
+                    .as_deref()
+                    .unwrap_or("never")
+                    .parse()
+                    .map_err(|e: String| ApiError::BadRequest(e))?;
+                RestartConfig {
+                    policy,
+                    max_retries: spec.max_retries.unwrap_or(0),
+                    ..Default::default()
+                }
+            }
+            None => RestartConfig::default(),
+        },
         network,
         image,
         source_smolmachine,
@@ -662,6 +677,14 @@ pub async fn delete_machine(
             }
         }
         Err(e) => return Err(e),
+    }
+
+    // Remove VM data directory (disk images, sockets, etc.)
+    let data_dir = vm_data_dir(&name);
+    if data_dir.exists() {
+        if let Err(e) = std::fs::remove_dir_all(&data_dir) {
+            tracing::warn!(error = %e, "failed to remove VM data directory: {}", data_dir.display());
+        }
     }
 
     Ok(Json(DeleteResponse { deleted: name }))
