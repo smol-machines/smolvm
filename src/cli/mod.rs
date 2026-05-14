@@ -167,8 +167,8 @@ pub fn pull_with_progress(
     image: &str,
     oci_platform: Option<&str>,
 ) -> smolvm::Result<smolvm_protocol::ImageInfo> {
-    print!("Pulling image {}...", image);
-    let _ = std::io::stdout().flush();
+    eprint!("Pulling image {}...", image);
+    let _ = std::io::stderr().flush();
 
     let mut last_percent = 0u8;
     let mut syncing = false;
@@ -178,35 +178,35 @@ pub fn pull_with_progress(
         |percent, _total, layer| {
             if layer == "syncing" {
                 if !syncing {
-                    print!(
+                    eprint!(
                         "\rPulling image {}... [====================] 100% — syncing...",
                         image
                     );
-                    let _ = std::io::stdout().flush();
+                    let _ = std::io::stderr().flush();
                     syncing = true;
                 }
                 return;
             }
             let percent = percent as u8;
             if percent != last_percent && percent <= 100 {
-                print!("\rPulling image {}... [", image);
+                eprint!("\rPulling image {}... [", image);
                 let filled = (percent as usize) / 5;
                 for i in 0..20 {
                     if i < filled {
-                        print!("=");
+                        eprint!("=");
                     } else if i == filled {
-                        print!(">");
+                        eprint!(">");
                     } else {
-                        print!(" ");
+                        eprint!(" ");
                     }
                 }
-                print!("] {}%", percent);
-                let _ = std::io::stdout().flush();
+                eprint!("] {}%", percent);
+                let _ = std::io::stderr().flush();
                 last_percent = percent;
             }
         },
     );
-    println!(
+    eprintln!(
         "\rPulling image {}... done.                              ",
         image
     );
