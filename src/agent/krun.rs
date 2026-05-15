@@ -42,6 +42,8 @@ pub struct KrunFunctions {
     pub add_net_unixstream: Option<
         unsafe extern "C" fn(u32, *const libc::c_char, libc::c_int, *mut u8, u32, u32) -> i32,
     >,
+    pub add_net_tap:
+        Option<unsafe extern "C" fn(u32, *const libc::c_char, *const u8, u32, u32) -> i32>,
     pub get_egress_handle: Option<unsafe extern "C" fn(u32) -> *mut libc::c_void>,
     pub set_gpu_options2: Option<unsafe extern "C" fn(u32, u32, u64) -> i32>,
 }
@@ -131,6 +133,7 @@ impl KrunFunctions {
             set_console_output: load_sym!(krun_set_console_output),
             set_egress_policy: load_optional_sym!("krun_set_egress_policy"),
             add_net_unixstream: load_optional_sym!("krun_add_net_unixstream"),
+            add_net_tap: load_optional_sym!("krun_add_net_tap"),
             get_egress_handle: load_optional_sym!("krun_get_egress_handle"),
             set_gpu_options2: load_optional_sym!("krun_set_gpu_options2"),
         })

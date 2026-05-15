@@ -86,6 +86,11 @@ pub fn build_create_params(
                 gpu_vram_mib: None,
                 dns_filter_hosts: None,
                 source_smolmachine: None,
+                tap_device: None,
+                tap_mac: None,
+                tap_subnet: None,
+                tap_guest_ip: None,
+                tap_bandwidth: None,
             });
         }
     };
@@ -279,6 +284,11 @@ pub fn build_create_params(
             Some(sf_allow_hosts)
         },
         source_smolmachine: None,
+        tap_device: None,
+        tap_mac: None,
+        tap_subnet: None,
+        tap_guest_ip: None,
+        tap_bandwidth: None,
     })
 }
 

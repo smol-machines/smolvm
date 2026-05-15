@@ -46,6 +46,22 @@ pub struct VmResources {
     /// Allowed egress CIDR ranges. None = unrestricted, Some([]) = deny all.
     #[serde(default)]
     pub allowed_cidrs: Option<Vec<String>>,
+    /// TAP device name to pass to krun_add_net_tap (only used with NetworkBackend::Tap).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tap_device: Option<String>,
+    /// Guest MAC address for the TAP virtio-net interface (colon-separated hex).
+    /// None = random locally-administered MAC generated at launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tap_mac: Option<String>,
+    /// Subnet CIDR for managed TAP networking (e.g. "10.0.0.0/24").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tap_subnet: Option<String>,
+    /// Guest IP address for managed TAP networking (e.g. "10.0.0.2").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tap_guest_ip: Option<String>,
+    /// Bandwidth limit for managed TAP networking (e.g. "1gbit").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tap_bandwidth: Option<String>,
 }
 
 /// Minimum memory required for the VM to boot (kernel + agent).
@@ -97,6 +113,11 @@ impl Default for VmResources {
             storage_gib: None,
             overlay_gib: None,
             allowed_cidrs: None,
+            tap_device: None,
+            tap_mac: None,
+            tap_subnet: None,
+            tap_guest_ip: None,
+            tap_bandwidth: None,
         }
     }
 }

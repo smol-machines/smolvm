@@ -253,6 +253,27 @@ pub struct RunCmd {
     )]
     pub net_backend: Option<NetworkBackend>,
 
+    /// Pre-created host TAP device name to use with --net-backend tap.
+    #[arg(long = "tap-device", value_name = "NAME", help_heading = "Network")]
+    pub tap_device: Option<String>,
+
+    /// Guest MAC address for the TAP virtio-net interface (aa:bb:cc:dd:ee:ff).
+    /// Requires --net-backend tap. Omit to generate a random locally-administered MAC.
+    #[arg(long = "tap-mac", value_name = "MAC", help_heading = "Network")]
+    pub tap_mac: Option<String>,
+
+    /// Subnet CIDR for managed TAP networking (e.g. "10.0.0.0/24").
+    #[arg(long = "tap-subnet", value_name = "CIDR", help_heading = "Network")]
+    pub tap_subnet: Option<String>,
+
+    /// Guest IP address for managed TAP networking (e.g. "10.0.0.2").
+    #[arg(long = "tap-guest-ip", value_name = "IP", help_heading = "Network")]
+    pub tap_guest_ip: Option<String>,
+
+    /// Bandwidth limit for managed TAP networking (e.g. "1gbit").
+    #[arg(long = "tap-bandwidth", value_name = "RATE", help_heading = "Network")]
+    pub tap_bandwidth: Option<String>,
+
     /// Allow egress to specific CIDR range (can be used multiple times, implies --net)
     #[arg(long = "allow-cidr", value_parser = parse_cidr, value_name = "CIDR", help_heading = "Network")]
     pub allow_cidr: Vec<String>,
@@ -373,6 +394,11 @@ impl RunCmd {
             (Some(from_smolfile), None) => Some(from_smolfile),
             (None, some) => some,
         };
+        params.tap_device = self.tap_device.clone();
+        params.tap_mac = self.tap_mac.clone();
+        params.tap_subnet = self.tap_subnet.clone();
+        params.tap_guest_ip = self.tap_guest_ip.clone();
+        params.tap_bandwidth = self.tap_bandwidth.clone();
         let mut mounts = HostMount::parse(&params.volume)?;
         let ports = params.port.clone();
         PortMapping::check_duplicates(&ports)
@@ -420,6 +446,11 @@ impl RunCmd {
             storage_gib: params.storage_gb,
             overlay_gib: params.overlay_gb,
             allowed_cidrs: params.allowed_cidrs.clone(),
+            tap_device: params.tap_device.clone(),
+            tap_mac: params.tap_mac.clone(),
+            tap_subnet: params.tap_subnet.clone(),
+            tap_guest_ip: params.tap_guest_ip.clone(),
+            tap_bandwidth: params.tap_bandwidth.clone(),
         };
         validate_requested_network_backend(
             &resources,
@@ -1133,6 +1164,27 @@ pub struct CreateCmd {
     #[arg(long = "net-backend", value_enum, hide = true)]
     pub net_backend: Option<NetworkBackend>,
 
+    /// Pre-created host TAP device name to use with --net-backend tap.
+    #[arg(long = "tap-device", value_name = "NAME")]
+    pub tap_device: Option<String>,
+
+    /// Guest MAC address for the TAP virtio-net interface (aa:bb:cc:dd:ee:ff).
+    /// Requires --net-backend tap. Omit to generate a random locally-administered MAC.
+    #[arg(long = "tap-mac", value_name = "MAC")]
+    pub tap_mac: Option<String>,
+
+    /// Subnet CIDR for managed TAP networking (e.g. "10.0.0.0/24").
+    #[arg(long = "tap-subnet", value_name = "CIDR")]
+    pub tap_subnet: Option<String>,
+
+    /// Guest IP address for managed TAP networking (e.g. "10.0.0.2").
+    #[arg(long = "tap-guest-ip", value_name = "IP")]
+    pub tap_guest_ip: Option<String>,
+
+    /// Bandwidth limit for managed TAP networking (e.g. "1gbit").
+    #[arg(long = "tap-bandwidth", value_name = "RATE")]
+    pub tap_bandwidth: Option<String>,
+
     /// Allow egress to specific CIDR range (can be used multiple times, implies --net)
     #[arg(long = "allow-cidr", value_parser = parse_cidr, value_name = "CIDR")]
     pub allow_cidr: Vec<String>,
@@ -1230,6 +1282,11 @@ impl CreateCmd {
             (Some(from_smolfile), None) => Some(from_smolfile),
             (None, some) => some,
         };
+        params.tap_device = self.tap_device.clone();
+        params.tap_mac = self.tap_mac.clone();
+        params.tap_subnet = self.tap_subnet.clone();
+        params.tap_guest_ip = self.tap_guest_ip.clone();
+        params.tap_bandwidth = self.tap_bandwidth.clone();
         let resources = VmResources {
             cpus: params.cpus,
             memory_mib: params.mem,
@@ -1240,6 +1297,11 @@ impl CreateCmd {
             storage_gib: params.storage_gb,
             overlay_gib: params.overlay_gb,
             allowed_cidrs: params.allowed_cidrs.clone(),
+            tap_device: params.tap_device.clone(),
+            tap_mac: params.tap_mac.clone(),
+            tap_subnet: params.tap_subnet.clone(),
+            tap_guest_ip: params.tap_guest_ip.clone(),
+            tap_bandwidth: params.tap_bandwidth.clone(),
         };
         validate_requested_network_backend(
             &resources,
@@ -1343,6 +1405,11 @@ impl CreateCmd {
             gpu: manifest.gpu,
             gpu_vram_mib: None,
             source_smolmachine: Some(canonical_path),
+            tap_device: None,
+            tap_mac: None,
+            tap_subnet: None,
+            tap_guest_ip: None,
+            tap_bandwidth: None,
         };
 
         vm_common::create_vm(params)

@@ -408,6 +408,16 @@ pub struct CreateVmParams {
     pub dns_filter_hosts: Option<Vec<String>>,
     /// Absolute path to .smolmachine sidecar (for machines created with --from).
     pub source_smolmachine: Option<String>,
+    /// TAP device name (required with NetworkBackend::Tap).
+    pub tap_device: Option<String>,
+    /// Guest MAC for the TAP virtio-net interface. None = random.
+    pub tap_mac: Option<String>,
+    /// Subnet CIDR for managed TAP networking.
+    pub tap_subnet: Option<String>,
+    /// Guest IP address for managed TAP networking.
+    pub tap_guest_ip: Option<String>,
+    /// Bandwidth limit for managed TAP networking.
+    pub tap_bandwidth: Option<String>,
 }
 
 /// Create a named machine configuration (does not start it).
@@ -466,6 +476,11 @@ pub fn create_vm(params: CreateVmParams) -> smolvm::Result<()> {
     record.overlay_gb = params.overlay_gb;
     record.allowed_cidrs = params.allowed_cidrs.clone();
     record.network_backend = params.network_backend;
+    record.tap_device = params.tap_device.clone();
+    record.tap_mac = params.tap_mac.clone();
+    record.tap_subnet = params.tap_subnet.clone();
+    record.tap_guest_ip = params.tap_guest_ip.clone();
+    record.tap_bandwidth = params.tap_bandwidth.clone();
     record.gpu = if params.gpu { Some(true) } else { None };
     // Same invariant the CLI enforces, applied again here because
     // Smolfile values arrive through `params.gpu_vram_mib` without

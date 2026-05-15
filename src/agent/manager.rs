@@ -156,6 +156,9 @@ struct AgentInner {
     config_state: ConfigState,
     /// If true, the agent has been detached and should not be stopped on drop.
     detached: bool,
+    /// Managed TAP network config (Linux only). Stored so we can teardown on stop.
+    #[cfg(target_os = "linux")]
+    tap_config: Option<crate::network::tap::TapConfig>,
 }
 
 /// Get the data directory for a named VM.
@@ -380,6 +383,8 @@ impl AgentManager {
                 resources: VmResources::default(),
                 config_state: ConfigState::Unknown,
                 detached: false,
+                #[cfg(target_os = "linux")]
+                tap_config: None,
             })),
         })
     }
@@ -1068,8 +1073,42 @@ impl AgentManager {
     ) -> Result<()> {
         use super::boot_config::BootConfig;
 
-        let resources_for_config = resources.clone();
+        let mut resources_for_config = resources.clone();
         self.prepare_for_launch(&mounts, &ports, resources)?;
+
+        // Managed TAP: set up the TAP network stack before writing boot config.
+        // Lock ordering: don't hold self.inner across the setup_managed_tap call
+        // (it does I/O). Check conditions first, then setup, then lock to store.
+        #[cfg(target_os = "linux")]
+        {
+            let needs_managed_tap = resources_for_config.network_backend
+                == Some(crate::network::NetworkBackend::Tap)
+                && resources_for_config.tap_device.is_none();
+
+            if needs_managed_tap {
+                let vm_name = self.name.as_deref().unwrap_or("default");
+                let config = crate::network::tap::setup_managed_tap(
+                    vm_name,
+                    None, // no pre-existing device
+                    resources_for_config.tap_mac.as_deref(),
+                    resources_for_config.tap_subnet.as_deref(),
+                    resources_for_config.tap_guest_ip.as_deref(),
+                    resources_for_config.tap_bandwidth.as_deref(),
+                    resources_for_config.allowed_cidrs.as_deref().unwrap_or(&[]),
+                )?;
+
+                // Update resources so the launcher picks up the TAP device by name
+                resources_for_config.tap_device = Some(config.tap_name.clone());
+                resources_for_config.tap_mac = Some(crate::network::tap::format_mac(&config.mac));
+                resources_for_config.tap_guest_ip = Some(config.guest_ip.clone());
+                resources_for_config.tap_subnet = Some(config.subnet_cidr.clone());
+
+                // Also update the inner resources so stop() knows the device name
+                let mut inner = self.inner.lock();
+                inner.resources = resources_for_config.clone();
+                inner.tap_config = Some(config);
+            }
+        }
 
         let storage_size_gb = resources_for_config
             .storage_gib
@@ -1353,6 +1392,21 @@ impl AgentManager {
             if let Ok(file) = std::fs::File::open(path) {
                 if file.sync_all().is_ok() {
                     tracing::debug!("{} disk synced to host", label);
+                }
+            }
+        }
+
+        // Tear down managed TAP network (must happen while process is dead,
+        // before we drop state). Don't hold the lock across teardown I/O.
+        #[cfg(target_os = "linux")]
+        {
+            let tap_config = {
+                let mut inner = self.inner.lock();
+                inner.tap_config.take()
+            };
+            if let Some(ref tc) = tap_config {
+                if let Err(e) = crate::network::tap::teardown(tc) {
+                    tracing::warn!(error = %e, "TAP teardown failed");
                 }
             }
         }
