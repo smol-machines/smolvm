@@ -315,6 +315,11 @@ impl PackRunCmd {
             overlay_gib: self.overlay,
             gpu_vram_mib: None,
             allowed_cidrs: None,
+            tap_device: None,
+            tap_mac: None,
+            tap_subnet: None,
+            tap_guest_ip: None,
+            tap_bandwidth: None,
         };
         validate_requested_network_backend(&resources, None, self.port.len())?;
 
@@ -1190,6 +1195,11 @@ fn run_from_cache(
         overlay_gib: args.overlay,
         gpu_vram_mib: None,
         allowed_cidrs: None,
+        tap_device: None,
+        tap_mac: None,
+        tap_subnet: None,
+        tap_guest_ip: None,
+        tap_bandwidth: None,
     };
     validate_requested_network_backend(&resources, None, args.port.len())?;
 
@@ -1515,6 +1525,11 @@ fn daemon_start(
         overlay_gib: args.overlay,
         gpu_vram_mib: None,
         allowed_cidrs: None,
+        tap_device: None,
+        tap_mac: None,
+        tap_subnet: None,
+        tap_guest_ip: None,
+        tap_bandwidth: None,
     };
     validate_requested_network_backend(&resources, None, args.port.len())?;
 

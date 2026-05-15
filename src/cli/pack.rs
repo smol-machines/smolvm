@@ -265,6 +265,11 @@ impl PackCreateCmd {
                 overlay_gib: None,
                 gpu_vram_mib: None,
                 allowed_cidrs: None,
+                tap_device: None,
+                tap_mac: None,
+                tap_subnet: None,
+                tap_guest_ip: None,
+                tap_bandwidth: None,
             },
         )?;
         let mut guard = PackVmGuard {
@@ -533,6 +538,11 @@ impl PackCreateCmd {
                     storage_gib: None,
                     overlay_gib: None,
                     allowed_cidrs: None,
+                    tap_device: None,
+                    tap_mac: None,
+                    tap_subnet: None,
+                    tap_guest_ip: None,
+                    tap_bandwidth: None,
                 },
                 features,
             )?;

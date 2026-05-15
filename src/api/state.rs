@@ -774,6 +774,11 @@ pub fn resource_spec_to_vm_resources(spec: &ResourceSpec, network: bool) -> VmRe
         storage_gib: spec.storage_gb,
         overlay_gib: spec.overlay_gb,
         allowed_cidrs: spec.allowed_cidrs.clone(),
+        tap_device: None,
+        tap_mac: None,
+        tap_subnet: None,
+        tap_guest_ip: None,
+        tap_bandwidth: None,
     }
 }
 

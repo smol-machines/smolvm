@@ -292,6 +292,31 @@ pub fn launch_agent_vm_dynamic(
             tracing::info!("network backend: virtio-net");
             Some(guest_network)
         }
+        EffectiveNetworkBackend::Tap => {
+            let add_net_tap = krun.add_net_tap.ok_or_else(|| {
+                "libkrun does not expose krun_add_net_tap; update libkrun or use --net-backend tsi"
+                    .to_string()
+            })?;
+            let tap_device = config
+                .resources
+                .tap_device
+                .as_deref()
+                .ok_or_else(|| "--net-backend tap requires --tap-device <name>".to_string())?;
+            let tap_name_c = try_or_free_ctx!(
+                CString::new(tap_device),
+                "tap device name contains null byte"
+            );
+
+            let mac = parse_or_generate_mac(config.resources.tap_mac.as_deref())
+                .map_err(|e| format!("invalid --tap-mac: {}", e))?;
+
+            if unsafe { (add_net_tap)(ctx, tap_name_c.as_ptr(), mac.as_ptr(), 0u32, 0u32) } < 0 {
+                free_ctx_on_err!("krun_add_net_tap failed — check that the TAP device exists");
+            }
+
+            tracing::info!(device = tap_device, "network backend: tap");
+            None
+        }
     };
 
     // Add storage disk
@@ -405,6 +430,45 @@ pub fn launch_agent_vm_dynamic(
         env_strings.push(cstr(&format!("{}={}", guest_env::DNS, network.dns_server)));
     }
 
+    // For TAP mode, tell the guest the virtio-net MAC so entrypoints
+    // can identify the interface.
+    if network_plan.backend == EffectiveNetworkBackend::Tap {
+        if let Some(mac_str) = &config.resources.tap_mac {
+            let mac_env = format!("{}={}", guest_env::GUEST_MAC, mac_str);
+            if let Ok(cs) = CString::new(mac_env) {
+                env_strings.push(cs);
+            }
+        }
+
+        // Managed TAP: tell guest to configure eth0 with our assigned IP/gateway.
+        // Reuses the same env vars as the virtio-net path so the guest agent
+        // configures eth0 identically regardless of transport.
+        if config.resources.tap_guest_ip.is_some() {
+            let guest_ip = config.resources.tap_guest_ip.as_deref().unwrap();
+            let subnet = config
+                .resources
+                .tap_subnet
+                .as_deref()
+                .unwrap_or("100.64.0.0/30");
+            let prefix = subnet.split('/').nth(1).unwrap_or("30");
+            let parts: Vec<&str> = subnet.split('/').collect();
+            let base: std::net::Ipv4Addr = parts[0]
+                .parse()
+                .unwrap_or(std::net::Ipv4Addr::new(100, 64, 0, 0));
+            let gw = std::net::Ipv4Addr::from(u32::from(base) + 1);
+
+            env_strings.push(cstr(&format!(
+                "{}={}",
+                guest_env::BACKEND,
+                guest_env::BACKEND_VIRTIO_NET
+            )));
+            env_strings.push(cstr(&format!("{}={}", guest_env::GUEST_IP, guest_ip)));
+            env_strings.push(cstr(&format!("{}={}", guest_env::GATEWAY, gw)));
+            env_strings.push(cstr(&format!("{}={}", guest_env::PREFIX_LEN, prefix)));
+            env_strings.push(cstr(&format!("{}={}", guest_env::DNS, "1.1.1.1")));
+        }
+    }
+
     let mut envp: Vec<*const libc::c_char> = env_strings.iter().map(|s| s.as_ptr()).collect();
     envp.push(std::ptr::null());
 
@@ -489,6 +553,29 @@ fn format_mac(mac: [u8; 6]) -> String {
         "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
     )
+}
+
+fn parse_or_generate_mac(mac_str: Option<&str>) -> Result<[u8; 6], String> {
+    if let Some(s) = mac_str {
+        let parts: Vec<&str> = s.split(':').collect();
+        if parts.len() != 6 {
+            return Err(format!("expected 6 colon-separated hex bytes, got: {}", s));
+        }
+        let mut mac = [0u8; 6];
+        for (i, part) in parts.iter().enumerate() {
+            mac[i] = u8::from_str_radix(part, 16)
+                .map_err(|_| format!("invalid hex byte '{}' in MAC", part))?;
+        }
+        return Ok(mac);
+    }
+    let mut mac = [0u8; 6];
+    let mut f = std::fs::File::open("/dev/urandom")
+        .map_err(|e| format!("cannot open /dev/urandom: {}", e))?;
+    use std::io::Read;
+    f.read_exact(&mut mac)
+        .map_err(|e| format!("read /dev/urandom: {}", e))?;
+    mac[0] = (mac[0] & 0xfe) | 0x02;
+    Ok(mac)
 }
 
 /// Raise file descriptor limits (required by libkrun).

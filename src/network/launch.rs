@@ -10,6 +10,9 @@ pub enum EffectiveNetworkBackend {
     Tsi,
     /// Virtio-net networking.
     VirtioNet,
+    /// TAP device networking (Linux only). Guest virtio-net is backed by a
+    /// pre-created host TAP device; IP/routing managed externally by the caller.
+    Tap,
 }
 
 /// Reason a requested backend was downgraded.
@@ -70,6 +73,15 @@ pub fn plan_launch_network(
     let has_policy = has_cidr_policy || has_dns_filter;
     let wants_network = resources.network || has_ports || has_policy;
 
+    // TAP bypasses all TSI/VirtioNet policy checks — the caller owns the
+    // entire network stack (bridge, NAT, tc shaping, DHCP, etc.).
+    if resources.network_backend == Some(NetworkBackend::Tap) {
+        return LaunchNetworkPlan {
+            backend: EffectiveNetworkBackend::Tap,
+            fallback_reason: None,
+        };
+    }
+
     if !wants_network {
         return LaunchNetworkPlan {
             backend: EffectiveNetworkBackend::None,
@@ -90,6 +102,7 @@ pub fn plan_launch_network(
             backend: EffectiveNetworkBackend::VirtioNet,
             fallback_reason: None,
         },
+        NetworkBackend::Tap => unreachable!("Tap handled above"),
     }
 }
 
@@ -99,6 +112,25 @@ pub fn validate_requested_network_backend(
     dns_filter_hosts: Option<&[String]>,
     port_count: usize,
 ) -> crate::Result<()> {
+    if resources.network_backend == Some(NetworkBackend::Tap) {
+        if resources.tap_device.is_some() {
+            // Passthrough mode: caller supplies a pre-created TAP device.
+            return Ok(());
+        }
+        // Managed mode: smolvm creates the TAP device. Only supported on Linux.
+        #[cfg(target_os = "linux")]
+        {
+            return Ok(());
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            return Err(crate::Error::config(
+                "--net-backend",
+                "managed TAP networking (--net-backend tap without --tap-device) is only supported on Linux",
+            ));
+        }
+    }
+
     if resources.network_backend != Some(NetworkBackend::VirtioNet) {
         return Ok(());
     }

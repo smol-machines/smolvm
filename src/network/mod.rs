@@ -5,6 +5,9 @@ pub mod backend;
 /// Launch-time backend planning and request validation rules.
 pub mod launch;
 pub mod policy;
+/// Managed TAP networking: device creation, bridge, NAT, tc, lifecycle cleanup.
+#[cfg(target_os = "linux")]
+pub mod tap;
 
 pub use backend::NetworkBackend;
 pub use launch::{

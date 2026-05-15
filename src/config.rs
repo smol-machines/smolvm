@@ -415,6 +415,26 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_backend: Option<NetworkBackend>,
 
+    /// TAP device name for the tap backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tap_device: Option<String>,
+
+    /// Guest MAC address for the TAP virtio-net interface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tap_mac: Option<String>,
+
+    /// Subnet CIDR for managed TAP networking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tap_subnet: Option<String>,
+
+    /// Guest IP address for managed TAP networking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tap_guest_ip: Option<String>,
+
+    /// Bandwidth limit for managed TAP networking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tap_bandwidth: Option<String>,
+
     /// OCI image for auto-container creation on start.
     #[serde(default)]
     pub image: Option<String>,
@@ -508,6 +528,11 @@ impl VmRecord {
             overlay_gb: None,
             allowed_cidrs: None,
             network_backend: None,
+            tap_device: None,
+            tap_mac: None,
+            tap_subnet: None,
+            tap_guest_ip: None,
+            tap_bandwidth: None,
             image: None,
             entrypoint: Vec::new(),
             cmd: Vec::new(),
@@ -556,6 +581,11 @@ impl VmRecord {
             overlay_gb: None,
             allowed_cidrs: None,
             network_backend: None,
+            tap_device: None,
+            tap_mac: None,
+            tap_subnet: None,
+            tap_guest_ip: None,
+            tap_bandwidth: None,
             image: None,
             entrypoint: Vec::new(),
             cmd: Vec::new(),
@@ -628,6 +658,11 @@ impl VmRecord {
             storage_gib: self.storage_gb,
             overlay_gib: self.overlay_gb,
             allowed_cidrs: self.allowed_cidrs.clone(),
+            tap_device: self.tap_device.clone(),
+            tap_mac: self.tap_mac.clone(),
+            tap_subnet: self.tap_subnet.clone(),
+            tap_guest_ip: self.tap_guest_ip.clone(),
+            tap_bandwidth: self.tap_bandwidth.clone(),
         }
     }
 }

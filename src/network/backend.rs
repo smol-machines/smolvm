@@ -19,6 +19,10 @@ pub enum NetworkBackend {
     /// Use virtio-net with the host-side smolvm network stack.
     #[value(name = "virtio-net")]
     VirtioNet,
+    /// Pass a pre-created host TAP device directly to the guest virtio-net.
+    /// Requires `--tap-device <name>`. Linux only.
+    #[value(name = "tap")]
+    Tap,
 }
 
 impl NetworkBackend {
@@ -27,6 +31,7 @@ impl NetworkBackend {
         match self {
             Self::Tsi => "tsi",
             Self::VirtioNet => "virtio-net",
+            Self::Tap => "tap",
         }
     }
 
@@ -35,6 +40,7 @@ impl NetworkBackend {
         match self {
             Self::Tsi => "tsi",
             Self::VirtioNet => "virtio-net",
+            Self::Tap => "tap",
         }
     }
 }
