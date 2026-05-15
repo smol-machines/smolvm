@@ -117,6 +117,8 @@ pub struct LaunchConfig<'a> {
     pub disks: &'a VmDisks<'a>,
     /// Path to the vsock Unix socket for the control channel.
     pub vsock_socket: &'a Path,
+    /// Path to the libkrun runtime control socket for host VM lifecycle control.
+    pub control_socket: Option<&'a Path>,
     /// Optional path to write console output.
     pub console_log: Option<&'a Path>,
     /// Host directory mounts to expose to the guest.
@@ -154,6 +156,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         rootfs_path,
         disks,
         vsock_socket,
+        control_socket,
         console_log,
         mounts,
         port_mappings,
@@ -191,6 +194,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         let krun_add_disk2 = krun.add_disk2;
         let krun_add_vsock_port2 = krun.add_vsock_port2;
         let krun_set_console_output = krun.set_console_output;
+        let krun_set_control_socket = krun.set_control_socket;
         let krun_set_port_map = krun.set_port_map;
         let krun_add_virtiofs = krun.add_virtiofs;
         let krun_start_enter = krun.start_enter;
@@ -211,6 +215,25 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             return Err(Error::agent("create vm context", "krun_create_ctx failed"));
         }
         let ctx = ctx as u32;
+
+        if let Some(control_socket) = control_socket {
+            let Some(krun_set_control_socket) = krun_set_control_socket else {
+                krun_free_ctx(ctx);
+                return Err(Error::agent(
+                    "configure control socket",
+                    "libkrun does not support krun_set_control_socket; update bundled libkrun",
+                ));
+            };
+            let control_socket =
+                path_to_cstring(control_socket).inspect_err(|_| krun_free_ctx(ctx))?;
+            if krun_set_control_socket(ctx, control_socket.as_ptr()) < 0 {
+                krun_free_ctx(ctx);
+                return Err(Error::agent(
+                    "configure control socket",
+                    "krun_set_control_socket failed",
+                ));
+            }
+        }
 
         // Set VM config
         if krun_set_vm_config(ctx, resources.cpus, resources.memory_mib) < 0 {

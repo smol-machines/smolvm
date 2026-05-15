@@ -8,6 +8,9 @@ use crate::error::{Error, Result};
 use crate::process::{self, ChildProcess};
 use crate::storage::{OverlayDisk, StorageDisk};
 use parking_lot::Mutex;
+use std::io::{Read, Write};
+use std::net::Shutdown;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -279,6 +282,8 @@ pub struct AgentManager {
     overlay_disk: OverlayDisk,
     /// vsock socket path for control channel.
     vsock_socket: PathBuf,
+    /// libkrun runtime control socket path for VM pause/resume.
+    control_socket: PathBuf,
     /// PID file path for tracking the VM process across CLI invocations.
     pid_file: PathBuf,
     /// Config file path for persisting running VM config across CLI invocations.
@@ -357,6 +362,7 @@ impl AgentManager {
         std::fs::create_dir_all(&smolvm_runtime)?;
 
         let vsock_socket = smolvm_runtime.join("agent.sock");
+        let control_socket = smolvm_runtime.join("krun-control.sock");
         let pid_file = smolvm_runtime.join("agent.pid");
         let config_file = smolvm_runtime.join("agent.config.json");
         let console_log = Some(smolvm_runtime.join("agent-console.log"));
@@ -368,6 +374,7 @@ impl AgentManager {
             storage_disk,
             overlay_disk,
             vsock_socket,
+            control_socket,
             pid_file,
             config_file,
             console_log,
@@ -508,6 +515,11 @@ impl AgentManager {
         &self.vsock_socket
     }
 
+    /// Path to the libkrun runtime control socket.
+    pub fn control_socket(&self) -> &Path {
+        &self.control_socket
+    }
+
     /// Get the console log path.
     pub fn console_log(&self) -> Option<&Path> {
         self.console_log.as_deref()
@@ -616,6 +628,25 @@ impl AgentManager {
         }
 
         None
+    }
+
+    /// Resolve the VM process PID and its captured start time.
+    ///
+    /// Tries the in-memory child handle first (set when this process launched
+    /// the VM), then falls back to the PID file (needed when a fresh
+    /// AgentManager reconnects to a VM started by a previous CLI invocation).
+    fn vm_pid(&self) -> (Option<libc::pid_t>, Option<u64>) {
+        let inner = self.inner.lock();
+        if let Some(child) = inner.child.as_ref() {
+            // Use the start time captured at fork — not recomputed from the
+            // current PID, which would be self-fulfilling if the OS recycled it.
+            (Some(child.pid()), child.start_time())
+        } else {
+            match self.read_pid_file_with_start_time() {
+                Some((pid, start_time)) => (Some(pid), start_time),
+                None => (None, None),
+            }
+        }
     }
 
     /// Read PID and start time from the PID file.
@@ -964,6 +995,7 @@ impl AgentManager {
 
         // Clean up old socket and stale markers
         let _ = std::fs::remove_file(&self.vsock_socket);
+        let _ = std::fs::remove_file(&self.control_socket);
         let ready_marker = self.rootfs_path.join(READY_MARKER_FILENAME);
         let _ = std::fs::remove_file(&ready_marker);
         let _ = std::fs::remove_file(&self.startup_error_log);
@@ -1084,6 +1116,7 @@ impl AgentManager {
             storage_disk_path: self.storage_disk.path().to_path_buf(),
             overlay_disk_path: self.overlay_disk.path().to_path_buf(),
             vsock_socket: self.vsock_socket.clone(),
+            control_socket: Some(self.control_socket.clone()),
             console_log: self.console_log.clone(),
             startup_error_log: self.startup_error_log.clone(),
             storage_size_gb,
@@ -1230,7 +1263,12 @@ impl AgentManager {
     ///
     /// Only call after the VM process is confirmed dead.
     fn cleanup_marker_files(&self) {
-        for path in [&self.pid_file, &self.config_file, &self.vsock_socket] {
+        for path in [
+            &self.pid_file,
+            &self.config_file,
+            &self.vsock_socket,
+            &self.control_socket,
+        ] {
             if let Err(e) = std::fs::remove_file(path) {
                 if e.kind() != std::io::ErrorKind::NotFound {
                     tracing::debug!(error = %e, path = %path.display(), "failed to remove marker file");
@@ -1314,23 +1352,7 @@ impl AgentManager {
 
         tracing::info!("stopping agent VM");
 
-        // Get the child PID and start time — try in-memory first, then PID file.
-        // The PID file fallback is critical for default VMs where a fresh
-        // AgentManager doesn't know the PID from a previous CLI invocation.
-        let (child_pid, pid_start_time) = {
-            let inner = self.inner.lock();
-            if let Some(child) = inner.child.as_ref() {
-                // Use the start time captured when the child handle was created,
-                // not recomputed from the PID (which would be self-fulfilling
-                // if the PID was recycled by the OS).
-                (Some(child.pid()), child.start_time())
-            } else {
-                match self.read_pid_file_with_start_time() {
-                    Some((pid, start_time)) => (Some(pid), start_time),
-                    None => (None, None),
-                }
-            }
-        };
+        let (child_pid, pid_start_time) = self.vm_pid();
 
         if let Some(pid) = child_pid {
             if let Err(e) = self.stop_vm_process(pid, pid_start_time) {
@@ -1367,6 +1389,60 @@ impl AgentManager {
         self.cleanup_marker_files();
         metrics::gauge!("smolvm_machines_running").decrement(1.0);
 
+        Ok(())
+    }
+
+    /// Send a one-line command to the libkrun runtime control socket and return
+    /// the response line.
+    ///
+    /// The socket is served by the VMM child process, so this works across CLI
+    /// invocations where the parent no longer has an in-process libkrun context.
+    /// Returns `Ok(response)` when the VMM replies with `"OK ..."`, and `Err`
+    /// for `"ERR ..."` or connection failures.
+    fn send_control_command(&self, command: &str) -> Result<String> {
+        let mut stream = UnixStream::connect(&self.control_socket).map_err(|e| {
+            Error::agent(
+                "connect control socket",
+                format!("{}: {}", self.control_socket.display(), e),
+            )
+        })?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .map_err(|e| Error::agent("configure control socket", e.to_string()))?;
+        stream
+            .write_all(format!("{command}\n").as_bytes())
+            .map_err(|e| Error::agent("write control command", e.to_string()))?;
+        let _ = stream.shutdown(Shutdown::Write);
+
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .map_err(|e| Error::agent("read control response", e.to_string()))?;
+
+        if response.starts_with("OK ") {
+            Ok(response)
+        } else {
+            Err(Error::agent("control command", response.trim().to_string()))
+        }
+    }
+
+    /// Pause the agent VM through libkrun's runtime control path.
+    ///
+    /// libkrun coordinates vCPU pause inside the VMM process. The DB record
+    /// must be updated to `Paused` by the caller after this succeeds.
+    pub fn pause(&self) -> Result<()> {
+        tracing::info!("pausing VM through libkrun control socket");
+        self.send_control_command("PAUSE")?;
+        Ok(())
+    }
+
+    /// Resume the agent VM through libkrun's runtime control path.
+    ///
+    /// The VM continues exactly where it was paused, with all state intact.
+    /// The DB record must be updated back to `Running` by the caller.
+    pub fn resume(&self) -> Result<()> {
+        tracing::info!("resuming VM through libkrun control socket");
+        self.send_control_command("RESUME")?;
         Ok(())
     }
 
