@@ -27,6 +27,9 @@ pub struct BootConfig {
     pub overlay_disk_path: PathBuf,
     /// Path to the vsock Unix socket.
     pub vsock_socket: PathBuf,
+    /// Path to the libkrun runtime control socket.
+    #[serde(default)]
+    pub control_socket: Option<PathBuf>,
     /// Optional path to console log file.
     pub console_log: Option<PathBuf>,
     /// Path to write startup errors.

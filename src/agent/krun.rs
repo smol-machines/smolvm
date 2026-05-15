@@ -38,6 +38,7 @@ pub struct KrunFunctions {
     pub disable_implicit_vsock: unsafe extern "C" fn(u32) -> i32,
     pub add_vsock: unsafe extern "C" fn(u32, u32) -> i32,
     pub set_console_output: unsafe extern "C" fn(u32, *const libc::c_char) -> i32,
+    pub set_control_socket: Option<unsafe extern "C" fn(u32, *const libc::c_char) -> i32>,
     pub set_egress_policy: Option<unsafe extern "C" fn(u32, *const *const libc::c_char) -> i32>,
     pub add_net_unixstream: Option<
         unsafe extern "C" fn(u32, *const libc::c_char, libc::c_int, *mut u8, u32, u32) -> i32,
@@ -129,6 +130,7 @@ impl KrunFunctions {
             disable_implicit_vsock: load_sym!(krun_disable_implicit_vsock),
             add_vsock: load_sym!(krun_add_vsock),
             set_console_output: load_sym!(krun_set_console_output),
+            set_control_socket: load_optional_sym!("krun_set_control_socket"),
             set_egress_policy: load_optional_sym!("krun_set_egress_policy"),
             add_net_unixstream: load_optional_sym!("krun_add_net_unixstream"),
             get_egress_handle: load_optional_sym!("krun_get_egress_handle"),

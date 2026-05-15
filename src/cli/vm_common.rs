@@ -545,6 +545,13 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
         RecordState::Stopped | RecordState::Created | RecordState::Failed => {
             // Normal start path.
         }
+        RecordState::Paused => {
+            println!(
+                "Machine '{}' is paused; use 'machine resume' to resume it",
+                name
+            );
+            return Ok(());
+        }
     }
 
     let mounts = record.host_mounts();
@@ -874,8 +881,11 @@ fn check_port_conflicts(
         if name == self_name {
             continue;
         }
-        // Only check running VMs (PID-based quick check).
-        if record.actual_state() != smolvm::config::RecordState::Running {
+        // Running and paused VMs both own their host resources.
+        if !matches!(
+            record.actual_state(),
+            smolvm::config::RecordState::Running | smolvm::config::RecordState::Paused
+        ) {
             continue;
         }
         for (host, _guest) in &record.ports {
@@ -1003,7 +1013,7 @@ pub fn stop_vm_named(name: &str) -> smolvm::Result<()> {
             println!("Stopped machine: {}", name);
             return Ok(());
         }
-        RecordState::Running => {
+        RecordState::Running | RecordState::Paused => {
             // fall through to the normal stop path
         }
         other => {
@@ -1025,6 +1035,83 @@ pub fn stop_vm_named(name: &str) -> smolvm::Result<()> {
     });
 
     println!("Stopped machine: {}", name);
+    Ok(())
+}
+
+// ============================================================================
+// Pause / Resume
+// ============================================================================
+
+/// Pause a named machine through libkrun.
+pub fn pause_vm_named(name: &str) -> smolvm::Result<()> {
+    let db = SmolvmDb::open()?;
+    let record = db
+        .get_vm(name)?
+        .ok_or_else(|| smolvm::Error::vm_not_found(name))?;
+
+    match smolvm::agent::state_probe::resolve_state(name, &record) {
+        RecordState::Running => {}
+        RecordState::Paused => {
+            println!("Machine '{}' is already paused", name);
+            return Ok(());
+        }
+        other => {
+            println!(
+                "Machine '{}' is not running (state: {}); cannot pause",
+                name, other
+            );
+            return Ok(());
+        }
+    }
+
+    let manager = AgentManager::for_vm(name)
+        .map_err(|e| smolvm::Error::agent("create agent manager", e.to_string()))?;
+    manager.pause()?;
+    manager.detach();
+
+    db.update_vm(name, |r| {
+        r.state = RecordState::Paused;
+    })?;
+
+    println!("Paused machine: {}", name);
+    Ok(())
+}
+
+/// Resume a named machine through libkrun.
+pub fn resume_vm_named(name: &str) -> smolvm::Result<()> {
+    let db = SmolvmDb::open()?;
+    let record = db
+        .get_vm(name)?
+        .ok_or_else(|| smolvm::Error::vm_not_found(name))?;
+
+    // actual_state() is sufficient here: resolve_state() would short-circuit
+    // anyway since record.state == Paused (non-Running), and the PID-alive
+    // check tells us whether the paused VM process still exists.
+    match record.actual_state() {
+        RecordState::Paused => {}
+        RecordState::Running => {
+            println!("Machine '{}' is already running", name);
+            return Ok(());
+        }
+        other => {
+            println!(
+                "Machine '{}' is not paused (state: {}); cannot resume",
+                name, other
+            );
+            return Ok(());
+        }
+    }
+
+    let manager = AgentManager::for_vm(name)
+        .map_err(|e| smolvm::Error::agent("create agent manager", e.to_string()))?;
+    manager.resume()?;
+    manager.detach();
+
+    db.update_vm(name, |r| {
+        r.state = RecordState::Running;
+    })?;
+
+    println!("Resumed machine: {}", name);
     Ok(())
 }
 
@@ -1078,7 +1165,7 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
     // libkrun process keeps running, orphaned forever.
     if options.stop_if_running {
         match smolvm::agent::state_probe::resolve_state(name, &record) {
-            RecordState::Running => {
+            RecordState::Running | RecordState::Paused => {
                 if let Ok(manager) = AgentManager::for_vm(name) {
                     println!("Stopping machine '{}'...", name);
                     if let Err(e) = manager.stop() {
