@@ -51,6 +51,7 @@
 //! ```
 
 use crate::device::VirtioNetworkDevice;
+use crate::policy::{DnsQueryAction, EgressPolicy, ResolvedEgressPolicy};
 use crate::queues::NetworkFrameQueues;
 use crate::tcp_listeners::AcceptedTcpConnection;
 use crate::tcp_relay::{spawn_tcp_relay, TcpRelayTable};
@@ -74,6 +75,7 @@ use std::time::{Duration, Instant as StdInstant};
 const DNS_SOCKET_PORT: u16 = 53;
 const DNS_PACKET_SLOTS: usize = 8;
 const DNS_BUFFER_BYTES: usize = 2048;
+const DNS_TRANSACTION_ID_LEN: usize = 2;
 const DEFAULT_IDLE_TIMEOUT_MS: i32 = 100;
 
 /// Resolved network parameters for one guest NIC.
@@ -119,6 +121,7 @@ pub fn start_network_stack(
     queues: Arc<NetworkFrameQueues>,
     config: VirtioPollConfig,
     tcp_receiver: Option<Receiver<AcceptedTcpConnection>>,
+    policy: EgressPolicy,
 ) -> std::io::Result<JoinHandle<()>> {
     virtio_net_log!(
         "virtio-net: spawning poll thread guest_ip={} gateway_ip={} mtu={}",
@@ -126,15 +129,28 @@ pub fn start_network_stack(
         config.gateway_ipv4,
         config.mtu
     );
+    let upstream_dns = match DEFAULT_DNS_ADDR {
+        std::net::IpAddr::V4(ip) => ip,
+        std::net::IpAddr::V6(_) => {
+            return Err(std::io::Error::other(
+                "virtio DNS policy currently requires an IPv4 upstream resolver",
+            ));
+        }
+    };
+    let policy = ResolvedEgressPolicy::compile(policy).map_err(std::io::Error::other)?;
+    let dns_forwarder = HostDnsForwarder::new(upstream_dns)?;
+
     thread::Builder::new()
         .name("smolvm-net-poll".into())
-        .spawn(move || run_network_stack(queues, config, tcp_receiver))
+        .spawn(move || run_network_stack(queues, config, tcp_receiver, policy, dns_forwarder))
 }
 
 fn run_network_stack(
     queues: Arc<NetworkFrameQueues>,
     config: VirtioPollConfig,
     mut tcp_receiver: Option<Receiver<AcceptedTcpConnection>>,
+    policy: ResolvedEgressPolicy,
+    mut dns_forwarder: HostDnsForwarder,
 ) {
     // Poll loop overview:
     //
@@ -200,6 +216,15 @@ fn run_network_stack(
                         source,
                         destination
                     );
+                    if !policy.allows_ip(destination.ip()) {
+                        tracing::warn!(
+                            source = %source,
+                            destination = %destination,
+                            "dropping guest TCP SYN because destination is blocked by policy"
+                        );
+                        device.drop_staged_frame();
+                        continue;
+                    }
                     if !relays.has_socket_for(&source, &destination) {
                         relays.create_tcp_socket(source, destination, &mut sockets);
                     }
@@ -245,7 +270,7 @@ fn run_network_stack(
         // Move payloads between established smoltcp TCP sockets and host relay
         // threads, and service the DNS gateway socket.
         relays.relay_data(&mut sockets);
-        process_dns_queries(dns_socket_handle, &mut sockets);
+        process_dns_queries(dns_socket_handle, &policy, &mut dns_forwarder, &mut sockets);
 
         // Once the guest-side TCP handshake is established inside smoltcp, we
         // can spawn the corresponding host relay thread.
@@ -403,14 +428,16 @@ fn relay_accepted_tcp_connection(
     }
 }
 
-fn process_dns_queries(dns_socket_handle: SocketHandle, sockets: &mut SocketSet<'_>) {
+fn process_dns_queries(
+    dns_socket_handle: SocketHandle,
+    policy: &ResolvedEgressPolicy,
+    dns_forwarder: &mut HostDnsForwarder,
+    sockets: &mut SocketSet<'_>,
+) {
     // Phase 1 DNS model:
     // guest UDP/53 -> smoltcp gateway socket -> host UDP socket -> upstream DNS
     //               <-               response bytes               <-
-    let upstream_dns = match DEFAULT_DNS_ADDR {
-        std::net::IpAddr::V4(ip) => ip,
-        std::net::IpAddr::V6(_) => return,
-    };
+    let upstream_dns = dns_forwarder.upstream_dns();
 
     let socket = sockets.get_mut::<UdpSocket>(dns_socket_handle);
     while socket.can_recv() {
@@ -425,12 +452,15 @@ fn process_dns_queries(dns_socket_handle: SocketHandle, sockets: &mut SocketSet<
             query.len(),
             upstream_dns
         );
-        let response = match forward_dns_query(upstream_dns, query) {
-            Ok(response) => response,
-            Err(err) => {
-                virtio_net_log!("virtio-net: host DNS forwarding failed error={}", err);
-                continue;
-            }
+        let response = match policy.filter_dns_query(query) {
+            Some(DnsQueryAction::Respond(response)) => response,
+            Some(DnsQueryAction::Forward) | None => match dns_forwarder.forward(query) {
+                Ok(response) => response,
+                Err(err) => {
+                    virtio_net_log!("virtio-net: host DNS forwarding failed error={}", err);
+                    continue;
+                }
+            },
         };
         virtio_net_log!(
             "virtio-net: forwarded DNS response back to guest guest={} response_len={}",
@@ -447,34 +477,71 @@ fn process_dns_queries(dns_socket_handle: SocketHandle, sockets: &mut SocketSet<
     }
 }
 
-fn forward_dns_query(upstream_dns: Ipv4Addr, query: &[u8]) -> std::io::Result<Vec<u8>> {
-    // This is intentionally a plain host UDP exchange rather than a smoltcp
-    // socket-to-socket relay. Once the guest packet reaches the gateway, the
-    // simplest MVP path is to proxy it with the host kernel's UDP stack.
-    //
-    // Rough shell equivalent:
-    //   send raw DNS message to `<upstream_dns>:53`
-    //   wait up to 2 seconds for one reply
-    let socket = HostUdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
-    socket.set_read_timeout(Some(Duration::from_secs(2)))?;
-    let local_addr = socket.local_addr()?;
-    virtio_net_log!(
-        "virtio-net: sending DNS query to upstream resolver local_addr={} upstream_dns={} query_len={}",
-        local_addr,
-        upstream_dns,
-        query.len()
-    );
-    socket.send_to(query, (upstream_dns, DNS_SOCKET_PORT))?;
+struct HostDnsForwarder {
+    upstream_dns: Ipv4Addr,
+    socket: HostUdpSocket,
+}
 
-    let mut buffer = vec![0u8; DNS_BUFFER_BYTES];
-    let (bytes_read, _) = socket.recv_from(&mut buffer)?;
-    buffer.truncate(bytes_read);
-    virtio_net_log!(
-        "virtio-net: received DNS response from upstream resolver upstream_dns={} response_len={}",
-        upstream_dns,
-        buffer.len()
-    );
-    Ok(buffer)
+impl HostDnsForwarder {
+    fn new(upstream_dns: Ipv4Addr) -> std::io::Result<Self> {
+        let socket = HostUdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+        socket.connect((upstream_dns, DNS_SOCKET_PORT))?;
+        socket.set_read_timeout(Some(Duration::from_secs(2)))?;
+        Ok(Self {
+            upstream_dns,
+            socket,
+        })
+    }
+
+    fn upstream_dns(&self) -> Ipv4Addr {
+        self.upstream_dns
+    }
+
+    fn forward(&mut self, query: &[u8]) -> std::io::Result<Vec<u8>> {
+        // This is intentionally a plain host UDP exchange rather than a
+        // smoltcp socket-to-socket relay. The socket is reusable for the
+        // runtime, so DNS inspection does not bind a fresh host socket per
+        // query.
+        let local_addr = self.socket.local_addr()?;
+        virtio_net_log!(
+            "virtio-net: sending DNS query to upstream resolver local_addr={} upstream_dns={} query_len={}",
+            local_addr,
+            self.upstream_dns,
+            query.len()
+        );
+        self.socket.send(query)?;
+
+        let mut buffer = vec![0u8; DNS_BUFFER_BYTES];
+        loop {
+            let bytes_read = self.socket.recv(&mut buffer)?;
+            let response = &buffer[..bytes_read];
+            if dns_response_matches_query(query, response) {
+                virtio_net_log!(
+                    "virtio-net: received DNS response from upstream resolver upstream_dns={} response_len={}",
+                    self.upstream_dns,
+                    response.len()
+                );
+                return Ok(response.to_vec());
+            }
+
+            virtio_net_log!(
+                "virtio-net: ignored stale DNS response upstream_dns={} response_len={}",
+                self.upstream_dns,
+                bytes_read
+            );
+        }
+    }
+}
+
+fn dns_response_matches_query(query: &[u8], response: &[u8]) -> bool {
+    // The upstream socket is reused, so a delayed UDP response for an older
+    // query can arrive while we are waiting for the current query. DNS
+    // transaction IDs are the first two bytes and let us discard stale replies.
+    if query.len() < DNS_TRANSACTION_ID_LEN || response.len() < DNS_TRANSACTION_ID_LEN {
+        return false;
+    }
+
+    query[..DNS_TRANSACTION_ID_LEN] == response[..DNS_TRANSACTION_ID_LEN]
 }
 
 fn flush_interface_egress(

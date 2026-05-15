@@ -9,7 +9,7 @@
 # - part 4: the `create -> start -> exec`, `machine run`, and `pack run` flows
 #   all drive real virtio-backed guest networking
 # - part 5: published TCP ports work end-to-end on the virtio gateway
-# - unsupported policy features still fail clearly
+# - part 6: CIDR egress policy is enforced in the virtio gateway
 
 source "$(dirname "$0")/common.sh"
 init_smolvm
@@ -28,6 +28,23 @@ echo ""
 
 VIRTIO_TEST_IMAGE="${VIRTIO_TEST_IMAGE:-alpine:latest}"
 VIRTIO_PUBLISH_TEST_IMAGE="${VIRTIO_PUBLISH_TEST_IMAGE:-python:3.12-alpine}"
+
+detect_host_ipv4() {
+    if command -v route >/dev/null 2>&1 && command -v ipconfig >/dev/null 2>&1; then
+        local iface
+        iface=$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')
+        if [[ -n "$iface" ]]; then
+            ipconfig getifaddr "$iface" 2>/dev/null && return 0
+        fi
+    fi
+
+    if command -v ip >/dev/null 2>&1; then
+        ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "src") { print $(i + 1); exit }}'
+        return 0
+    fi
+
+    return 1
+}
 
 virtio_guest_probe_script() {
     cat <<'EOF'
@@ -200,22 +217,108 @@ test_machine_run_virtio_net_port_publishing_works() {
     cleanup_machine
 }
 
-test_machine_create_virtio_net_policy_rejected() {
+test_machine_create_virtio_net_policy_allowed() {
     cleanup_machine
     local vm_name="virtio-policy-test-$$"
     local exit_code=0
     local output
 
     output=$($SMOLVM machine create "$vm_name" --net --net-backend virtio-net --allow-cidr 1.1.1.1/32 2>&1) || exit_code=$?
-    [[ $exit_code -ne 0 ]] || {
-        echo "expected create failure for virtio-net policy request"
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    [[ ${exit_code:-0} -eq 0 ]] || {
+        echo "expected create success for virtio-net policy request"
+        echo "$output"
         return 1
     }
-    [[ "$output" == *"allow-cidr/allow-host policies are not supported"* ]] || {
+
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+}
+
+test_machine_run_virtio_net_allow_cidr_allows_tcp() {
+    cleanup_machine
+    local host_ip
+    host_ip=$(detect_host_ipv4 || true)
+    if [[ -z "$host_ip" ]]; then
+        log_skip "could not detect host IPv4 for virtio-net CIDR test"
+        return 0
+    fi
+
+    local host_port=$((43000 + ($$ % 10000)))
+    local serve_dir="$TEST_DIR/virtio-policy-allow"
+    local server_log="$TEST_DIR/virtio-policy-allow.log"
+    local server_pid=0
+    local output
+
+    mkdir -p "$serve_dir"
+    printf 'virtio-policy-ok\n' >"$serve_dir/index.html"
+
+    trap 'if [[ ${server_pid:-0} -ne 0 ]]; then kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; fi; cleanup_machine' RETURN
+    python3 -m http.server "$host_port" --bind "$host_ip" --directory "$serve_dir" >"$server_log" 2>&1 &
+    server_pid=$!
+    sleep 1
+
+    output=$($SMOLVM machine run \
+        --image "$VIRTIO_PUBLISH_TEST_IMAGE" \
+        --net \
+        --net-backend virtio-net \
+        --allow-cidr "${host_ip}/32" \
+        -- python -c "import urllib.request; print(urllib.request.urlopen('http://${host_ip}:${host_port}', timeout=5).read().decode().strip())" 2>&1) || {
+        echo "$output"
+        tail -20 "$server_log" 2>/dev/null || true
+        return 1
+    }
+
+    [[ "$output" == *"virtio-policy-ok"* ]] || {
         echo "unexpected output: $output"
         return 1
     }
+
+    trap - RETURN
+    kill "$server_pid" 2>/dev/null || true
+    wait "$server_pid" 2>/dev/null || true
+    cleanup_machine
+}
+
+test_machine_run_virtio_net_allow_cidr_blocks_tcp() {
+    cleanup_machine
+    local host_ip
+    host_ip=$(detect_host_ipv4 || true)
+    if [[ -z "$host_ip" ]]; then
+        log_skip "could not detect host IPv4 for virtio-net CIDR test"
+        return 0
+    fi
+
+    local host_port=$((44000 + ($$ % 10000)))
+    local serve_dir="$TEST_DIR/virtio-policy-block"
+    local server_log="$TEST_DIR/virtio-policy-block.log"
+    local server_pid=0
+    local output
+    local exit_code=0
+
+    mkdir -p "$serve_dir"
+    printf 'virtio-policy-block\n' >"$serve_dir/index.html"
+
+    trap 'if [[ ${server_pid:-0} -ne 0 ]]; then kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; fi; cleanup_machine' RETURN
+    python3 -m http.server "$host_port" --bind "$host_ip" --directory "$serve_dir" >"$server_log" 2>&1 &
+    server_pid=$!
+    sleep 1
+
+    output=$($SMOLVM machine run \
+        --image "$VIRTIO_PUBLISH_TEST_IMAGE" \
+        --net \
+        --net-backend virtio-net \
+        --allow-cidr 203.0.113.1/32 \
+        -- python -c "import urllib.request; urllib.request.urlopen('http://${host_ip}:${host_port}', timeout=3)" 2>&1) || exit_code=$?
+
+    [[ $exit_code -ne 0 ]] || {
+        echo "expected blocked virtio-net TCP request to fail"
+        echo "$output"
+        return 1
+    }
+
+    trap - RETURN
+    kill "$server_pid" 2>/dev/null || true
+    wait "$server_pid" 2>/dev/null || true
+    cleanup_machine
 }
 
 test_pack_run_virtio_net_works() {
@@ -248,7 +351,9 @@ run_test "Machine create: virtio-net works" test_machine_create_virtio_net_works
 run_test "Machine create/start/exec: virtio-net guest networking works" test_machine_create_start_exec_virtio_net_works || true
 run_test "Machine run: virtio-net guest networking works" test_machine_run_virtio_net_works || true
 run_test "Machine run: virtio-net published TCP ports work" test_machine_run_virtio_net_port_publishing_works || true
-run_test "Machine create: virtio-net + policy rejected" test_machine_create_virtio_net_policy_rejected || true
+run_test "Machine create: virtio-net + policy allowed" test_machine_create_virtio_net_policy_allowed || true
+run_test "Machine run: virtio-net allow-cidr allows TCP" test_machine_run_virtio_net_allow_cidr_allows_tcp || true
+run_test "Machine run: virtio-net allow-cidr blocks TCP" test_machine_run_virtio_net_allow_cidr_blocks_tcp || true
 run_test "Pack run: virtio-net guest networking works" test_pack_run_virtio_net_works || true
 
 print_summary "Virtio-Net Tests"

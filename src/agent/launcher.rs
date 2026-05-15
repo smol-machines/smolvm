@@ -15,8 +15,8 @@ use crate::storage::{OverlayDisk, StorageDisk};
 use crate::util::{libkrun_filename, libkrunfw_filename};
 
 use smolvm_network::{
-    guest_env, start_virtio_network, GuestNetworkConfig, PortMapping as VirtioPortMapping,
-    VirtioNetworkRuntime,
+    guest_env, start_virtio_network, EgressPolicy, GuestNetworkConfig,
+    PortMapping as VirtioPortMapping, VirtioNetworkRuntime,
 };
 use smolvm_protocol::ports;
 use std::ffi::CString;
@@ -138,11 +138,9 @@ pub struct LaunchConfig<'a> {
     /// Whether DNS filtering was configured for this launch, even if the
     /// host-side proxy socket could not be created.
     pub dns_filter_enabled: bool,
-    /// Hostnames to periodically re-resolve for the live egress policy.
-    /// When set, a background thread re-resolves these every 5 minutes and
-    /// atomically replaces the CIDR list via the Arc handle obtained from
-    /// libkrun. This keeps the egress allow-list accurate for long-running VMs
-    /// hitting CDN-backed hosts whose IPs rotate.
+    /// Hostnames configured by allow-host policy.
+    /// TSI uses these for DNS filtering and live CIDR refresh; virtio-net uses
+    /// them for in-process DNS filtering in the host gateway.
     pub egress_refresh_hosts: Option<Vec<String>>,
 }
 
@@ -166,7 +164,11 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         egress_refresh_hosts,
     } = config;
 
-    crate::network::validate_requested_network_backend(resources, None, port_mappings.len())?;
+    crate::network::validate_requested_network_backend(
+        resources,
+        egress_refresh_hosts.as_deref(),
+        port_mappings.len(),
+    )?;
 
     // Raise file descriptor limits
     raise_fd_limits();
@@ -279,10 +281,17 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             return Err(Error::agent("set rootfs", "krun_set_root failed"));
         }
 
-        let network_plan = select_network_plan(resources, *dns_filter_enabled, port_mappings.len());
-        if let Some(reason) = network_plan.fallback_reason {
-            tracing::warn!(reason = %reason.user_message(), "network backend fell back to TSI");
-        }
+        let network_plan = select_network_plan(
+            resources,
+            egress_refresh_hosts.as_deref(),
+            *dns_filter_enabled,
+            port_mappings.len(),
+        );
+        let dns_filter_socket = if network_plan.backend == EffectiveNetworkBackend::Tsi {
+            *dns_filter_socket
+        } else {
+            None
+        };
 
         let mut virtio_network_runtime: Option<VirtioNetworkRuntime> = None;
         let guest_network = match network_plan.backend {
@@ -384,18 +393,26 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     .iter()
                     .map(|mapping| VirtioPortMapping::new(mapping.host, mapping.guest))
                     .collect();
-                let runtime =
-                    match start_virtio_network(host_fd, guest_network, &virtio_port_mappings) {
-                        Ok(runtime) => runtime,
-                        Err(err) => {
-                            libc::close(guest_fd);
-                            krun_free_ctx(ctx);
-                            return Err(Error::agent(
-                                "configure virtio-net",
-                                format!("failed to start virtio network runtime: {err}"),
-                            ));
-                        }
-                    };
+                let virtio_policy = EgressPolicy {
+                    allowed_cidrs: resources.allowed_cidrs.clone(),
+                    dns_filter_hosts: (*egress_refresh_hosts).clone(),
+                };
+                let runtime = match start_virtio_network(
+                    host_fd,
+                    guest_network,
+                    &virtio_port_mappings,
+                    virtio_policy,
+                ) {
+                    Ok(runtime) => runtime,
+                    Err(err) => {
+                        libc::close(guest_fd);
+                        krun_free_ctx(ctx);
+                        return Err(Error::agent(
+                            "configure virtio-net",
+                            format!("failed to start virtio network runtime: {err}"),
+                        ));
+                    }
+                };
 
                 if add_net_unixstream(
                     ctx,
@@ -706,67 +723,70 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         //
         // Each cycle: resolve all hosts → build fresh list → single write-lock
         // swap. If all hosts fail to resolve, the previous list is kept intact.
-        if let Some(hosts) = egress_refresh_hosts.as_ref().filter(|h| !h.is_empty()) {
-            if let Some(krun_get_egress_handle) = krun.get_egress_handle {
-                let raw_handle = krun_get_egress_handle(ctx);
+        if network_plan.backend == EffectiveNetworkBackend::Tsi {
+            if let Some(hosts) = egress_refresh_hosts.as_ref().filter(|h| !h.is_empty()) {
+                if let Some(krun_get_egress_handle) = krun.get_egress_handle {
+                    let raw_handle = krun_get_egress_handle(ctx);
 
-                if !raw_handle.is_null() {
-                    let arc: EgressArc = *Box::from_raw(raw_handle as *mut EgressArc);
-                    let hosts_copy = hosts.clone();
-                    if let Err(e) = std::thread::Builder::new()
-                        .name("egress-refresh".into())
-                        .spawn(move || {
-                            let refresh_secs: u64 = std::env::var("SMOLVM_EGRESS_REFRESH_SECS")
-                                .ok()
-                                .and_then(|s| s.parse().ok())
-                                .unwrap_or(5 * 60);
-                            let refresh_interval = std::time::Duration::from_secs(refresh_secs);
-                            loop {
-                                std::thread::sleep(refresh_interval);
-                                // Resolve all hosts into a fresh list, then swap
-                                // the shared Vec in a single write-lock acquisition.
-                                // This ensures old rotated-away IPs are removed.
-                                let mut fresh: Vec<(std::net::IpAddr, u8)> = Vec::new();
-                                'hosts: for host in &hosts_copy {
-                                    match resolve_host_subprocess(host) {
-                                        Ok(new_cidrs) => {
-                                            for cidr_str in new_cidrs {
-                                                if fresh.len() >= EGRESS_CIDR_CAP {
-                                                    break 'hosts;
-                                                }
-                                                if let Some((ip_str, prefix_str)) =
-                                                    cidr_str.split_once('/')
-                                                {
-                                                    if let (Ok(ip), Ok(prefix)) = (
-                                                        ip_str.parse::<std::net::IpAddr>(),
-                                                        prefix_str.parse::<u8>(),
-                                                    ) {
-                                                        if !fresh.contains(&(ip, prefix)) {
-                                                            fresh.push((ip, prefix));
+                    if !raw_handle.is_null() {
+                        let arc: EgressArc = *Box::from_raw(raw_handle as *mut EgressArc);
+                        let hosts_copy = hosts.clone();
+                        if let Err(e) = std::thread::Builder::new()
+                            .name("egress-refresh".into())
+                            .spawn(move || {
+                                let refresh_secs: u64 = std::env::var("SMOLVM_EGRESS_REFRESH_SECS")
+                                    .ok()
+                                    .and_then(|s| s.parse().ok())
+                                    .unwrap_or(5 * 60);
+                                let refresh_interval = std::time::Duration::from_secs(refresh_secs);
+                                loop {
+                                    std::thread::sleep(refresh_interval);
+                                    // Resolve all hosts into a fresh list, then swap
+                                    // the shared Vec in a single write-lock acquisition.
+                                    // This ensures old rotated-away IPs are removed.
+                                    let mut fresh: Vec<(std::net::IpAddr, u8)> = Vec::new();
+                                    'hosts: for host in &hosts_copy {
+                                        match resolve_host_subprocess(host) {
+                                            Ok(new_cidrs) => {
+                                                for cidr_str in new_cidrs {
+                                                    if fresh.len() >= EGRESS_CIDR_CAP {
+                                                        break 'hosts;
+                                                    }
+                                                    if let Some((ip_str, prefix_str)) =
+                                                        cidr_str.split_once('/')
+                                                    {
+                                                        if let (Ok(ip), Ok(prefix)) = (
+                                                            ip_str.parse::<std::net::IpAddr>(),
+                                                            prefix_str.parse::<u8>(),
+                                                        ) {
+                                                            if !fresh.contains(&(ip, prefix)) {
+                                                                fresh.push((ip, prefix));
+                                                            }
                                                         }
                                                     }
                                                 }
                                             }
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                host = %host,
-                                                error = %e,
-                                                "egress-refresh: resolve failed"
-                                            );
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    host = %host,
+                                                    error = %e,
+                                                    "egress-refresh: resolve failed"
+                                                );
+                                            }
                                         }
                                     }
+                                    // Only replace if at least one host resolved
+                                    // successfully; keeps the old list on total failure.
+                                    if !fresh.is_empty() {
+                                        let mut guard =
+                                            arc.write().unwrap_or_else(|e| e.into_inner());
+                                        *guard = fresh;
+                                    }
                                 }
-                                // Only replace if at least one host resolved
-                                // successfully; keeps the old list on total failure.
-                                if !fresh.is_empty() {
-                                    let mut guard = arc.write().unwrap_or_else(|e| e.into_inner());
-                                    *guard = fresh;
-                                }
-                            }
-                        })
-                    {
-                        tracing::warn!(error = %e, "egress-refresh spawn failed");
+                            })
+                        {
+                            tracing::warn!(error = %e, "egress-refresh spawn failed");
+                        }
                     }
                 }
             }
@@ -808,11 +828,13 @@ fn create_unix_stream_pair() -> std::io::Result<(RawFd, RawFd)> {
 
 fn select_network_plan(
     resources: &VmResources,
+    dns_filter_hosts: Option<&[String]>,
     dns_filter_enabled: bool,
     port_count: usize,
 ) -> crate::network::LaunchNetworkPlan {
     let dns_filter_placeholder = [String::from("configured")];
-    let dns_filter_hosts = dns_filter_enabled.then_some(dns_filter_placeholder.as_slice());
+    let dns_filter_hosts = dns_filter_hosts
+        .or_else(|| dns_filter_enabled.then_some(dns_filter_placeholder.as_slice()));
     plan_launch_network(resources, dns_filter_hosts, port_count)
 }
 

@@ -35,7 +35,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -45,7 +45,6 @@ const TCP_TX_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_CONNECTIONS: usize = 256;
 const CHANNEL_CAPACITY: usize = 32;
 const RELAY_BUFFER_BYTES: usize = 16 * 1024;
-const CLOSE_RETRY_LIMIT: u16 = 64;
 const PROXY_IDLE_SLEEP: Duration = Duration::from_millis(10);
 const PUBLISHED_PORT_START: u16 = 49_152;
 const PUBLISHED_PORT_END: u16 = 65_535;
@@ -93,10 +92,11 @@ struct TrackedConnection {
     pending_proxy_endpoints: Option<PendingProxyEndpoints>,
     // once true, a dedicated host relay thread exists
     relay_spawned: bool,
+    // guest->host payload already removed from smoltcp but waiting for relay
+    // channel capacity. This preserves TCP stream bytes under backpressure.
+    buffered_guest_data: Option<Vec<u8>>,
     // partial host->guest payload not yet fully accepted by smoltcp
     buffered_proxy_data: Option<(Vec<u8>, usize)>,
-    // bounded retry count for closing with unsent buffered data
-    close_attempts: u16,
     // relay thread termination mode observed by the poll loop
     exit_state: RelayExitState,
     // reserved local source port for published inbound connections
@@ -242,8 +242,8 @@ impl TcpRelayTable {
                     relay_target: RelayTarget::Connect(destination),
                 }),
                 relay_spawned: false,
+                buffered_guest_data: None,
                 buffered_proxy_data: None,
-                close_attempts: 0,
                 exit_state,
                 reserved_published_port: None,
             },
@@ -332,8 +332,8 @@ impl TcpRelayTable {
                     relay_target: RelayTarget::Attached(host_stream),
                 }),
                 relay_spawned: false,
+                buffered_guest_data: None,
                 buffered_proxy_data: None,
-                close_attempts: 0,
                 exit_state,
                 reserved_published_port: Some(local_port),
             },
@@ -369,29 +369,38 @@ impl TcpRelayTable {
                     flush_proxy_data(socket, connection);
                     if connection.buffered_proxy_data.is_none() {
                         socket.close();
-                    } else {
-                        connection.close_attempts += 1;
-                        if connection.close_attempts >= CLOSE_RETRY_LIMIT {
-                            socket.abort();
-                        }
                     }
                     continue;
                 }
                 RelayExitMode::Running => {}
             }
 
-            while socket.can_recv() {
-                match socket.recv_slice(&mut read_buffer) {
-                    Ok(bytes_read) if bytes_read > 0 => {
-                        let payload = read_buffer[..bytes_read].to_vec();
-                        if connection.to_proxy.try_send(payload).is_err() {
-                            break;
+            // 1. Move the buffered_guest_data to proxy and see if there are still room to read mroe
+            let can_read_more_from_smoltcp = matches!(
+                flush_guest_data_to_proxy(connection),
+                GuestDataFlush::Flushed
+            );
+
+            // 2. If there are still rooms to read more, then receive more from the smoltcp TCP socket
+            if can_read_more_from_smoltcp {
+                while socket.can_recv() {
+                    match socket.recv_slice(&mut read_buffer) {
+                        Ok(bytes_read) if bytes_read > 0 => {
+                            let payload = read_buffer[..bytes_read].to_vec();
+                            match send_guest_data_to_proxy(connection, payload) {
+                                GuestDataFlush::Flushed => {}
+                                // If there is no room to read more, stop reading from the smoltcp TCP socket
+                                GuestDataFlush::Backpressured | GuestDataFlush::Disconnected => {
+                                    break;
+                                }
+                            };
                         }
+                        _ => break,
                     }
-                    _ => break,
                 }
             }
 
+            // 3. Relay the data in the opposite direction.
             flush_proxy_data(socket, connection);
         }
     }
@@ -519,6 +528,8 @@ fn run_tcp_relay(
         "virtio-net: host TCP relay thread started destination={}",
         destination
     );
+    let relay_wake_on_exit = relay_wake.clone();
+
     match tcp_relay_loop(
         destination,
         relay_target,
@@ -532,7 +543,8 @@ fn run_tcp_relay(
                 destination,
                 mode
             );
-            exit_state.store(mode)
+            exit_state.store(mode);
+            relay_wake_on_exit.wake();
         }
         Err(err) => {
             virtio_net_log!(
@@ -541,6 +553,7 @@ fn run_tcp_relay(
                 err
             );
             exit_state.store(RelayExitMode::Abort);
+            relay_wake_on_exit.wake();
         }
     }
 }
@@ -584,48 +597,190 @@ fn tcp_relay_loop(
     stream.set_nonblocking(true)?;
 
     let mut guest_write_closed = false;
+    let mut guest_input_closed = false;
+    let mut pending_guest_write: Option<(Vec<u8>, usize)> = None;
     let mut read_buffer = [0u8; RELAY_BUFFER_BYTES];
 
     loop {
         let mut did_work = false;
 
-        loop {
-            match from_smoltcp.try_recv() {
-                Ok(payload) => {
-                    stream.write_all(&payload)?;
-                    did_work = true;
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    // The guest side closed its write half. Mirror that toward
-                    // the remote peer once, then keep reading until the remote
-                    // side closes too.
-                    if !guest_write_closed {
-                        let _ = stream.shutdown(Shutdown::Write);
-                        guest_write_closed = true;
-                    }
-                    break;
-                }
-            }
-        }
+        // 1. Finish any smoltcp->host payload that previously hit host socket.
+        did_work |= flush_pending_data_from_smoltcp(&mut stream, &mut pending_guest_write)?;
+        // 2. Drain new smoltcp->host payloads into the host TcpStream, and
+        //    remember when the smoltcp side will send no more bytes.
+        did_work |= drain_smoltcp_payloads_to_host(
+            &mut stream,
+            &from_smoltcp,
+            &mut pending_guest_write,
+            &mut guest_input_closed,
+        )?;
+        // 3. Once smoltcp is closed and all pending bytes are written,
+        //    close the host TcpStream write side.
+        did_work |= mirror_smoltcp_close_to_host(
+            &stream,
+            guest_input_closed,
+            &pending_guest_write,
+            &mut guest_write_closed,
+        );
 
-        match stream.read(&mut read_buffer) {
-            Ok(0) => return Ok(RelayExitMode::Graceful),
-            Ok(bytes_read) => {
-                if to_smoltcp.send(read_buffer[..bytes_read].to_vec()).is_err() {
-                    return Ok(RelayExitMode::Graceful);
-                }
-                relay_wake.wake();
-                did_work = true;
-            }
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
-            Err(err) => return Err(err),
+        // 4. Read host->smoltcp payloads from the host TcpStream and wake the poll loop.
+        match read_host_payloads_to_smoltcp(
+            &mut stream,
+            &mut read_buffer,
+            &to_smoltcp,
+            relay_wake.as_ref(),
+        )? {
+            HostReadResult::DidWork => did_work = true,
+            HostReadResult::Idle => {}
+            HostReadResult::GracefulClose => return Ok(RelayExitMode::Graceful),
         }
 
         if !did_work {
             thread::sleep(PROXY_IDLE_SLEEP);
         }
     }
+}
+
+fn flush_pending_data_from_smoltcp<W: Write>(
+    stream: &mut W,
+    pending_guest_write: &mut Option<(Vec<u8>, usize)>,
+) -> io::Result<bool> {
+    if pending_guest_write.is_none() {
+        return Ok(false);
+    }
+
+    flush_pending_stream_write(stream, pending_guest_write)
+}
+
+fn drain_smoltcp_payloads_to_host<W: Write>(
+    stream: &mut W,
+    from_smoltcp: &Receiver<Vec<u8>>,
+    pending_guest_write: &mut Option<(Vec<u8>, usize)>,
+    guest_input_closed: &mut bool,
+) -> io::Result<bool> {
+    if pending_guest_write.is_some() {
+        return Ok(false);
+    }
+
+    let mut did_work = false;
+    loop {
+        match from_smoltcp.try_recv() {
+            Ok(payload) => {
+                *pending_guest_write = Some((payload, 0));
+                did_work = true;
+                if !flush_pending_stream_write(stream, pending_guest_write)? {
+                    break;
+                }
+            }
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => {
+                *guest_input_closed = true;
+                break;
+            }
+        }
+    }
+
+    Ok(did_work)
+}
+
+fn mirror_smoltcp_close_to_host(
+    stream: &TcpStream,
+    guest_input_closed: bool,
+    pending_guest_write: &Option<(Vec<u8>, usize)>,
+    guest_write_closed: &mut bool,
+) -> bool {
+    if guest_input_closed && pending_guest_write.is_none() && !*guest_write_closed {
+        let _ = stream.shutdown(Shutdown::Write);
+        *guest_write_closed = true;
+        return true;
+    }
+
+    false
+}
+
+enum HostReadResult {
+    DidWork,
+    Idle,
+    GracefulClose,
+}
+
+fn read_host_payloads_to_smoltcp<R: Read>(
+    stream: &mut R,
+    read_buffer: &mut [u8],
+    to_smoltcp: &SyncSender<Vec<u8>>,
+    relay_wake: &WakePipe,
+) -> io::Result<HostReadResult> {
+    match stream.read(read_buffer) {
+        Ok(0) => Ok(HostReadResult::GracefulClose),
+        Ok(bytes_read) => {
+            if to_smoltcp.send(read_buffer[..bytes_read].to_vec()).is_err() {
+                return Ok(HostReadResult::GracefulClose);
+            }
+            relay_wake.wake();
+            Ok(HostReadResult::DidWork)
+        }
+        Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(HostReadResult::Idle),
+        Err(err) => Err(err),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum GuestDataFlush {
+    Flushed,
+    Backpressured,
+    Disconnected,
+}
+
+fn flush_guest_data_to_proxy(connection: &mut TrackedConnection) -> GuestDataFlush {
+    let Some(payload) = connection.buffered_guest_data.take() else {
+        return GuestDataFlush::Flushed;
+    };
+
+    send_guest_data_to_proxy(connection, payload)
+}
+
+fn send_guest_data_to_proxy(
+    connection: &mut TrackedConnection,
+    payload: Vec<u8>,
+) -> GuestDataFlush {
+    match connection.to_proxy.try_send(payload) {
+        Ok(()) => GuestDataFlush::Flushed,
+        Err(TrySendError::Full(payload)) => {
+            connection.buffered_guest_data = Some(payload);
+            GuestDataFlush::Backpressured
+        }
+        Err(TrySendError::Disconnected(_)) => GuestDataFlush::Disconnected,
+    }
+}
+
+fn flush_pending_stream_write<W: Write>(
+    stream: &mut W,
+    pending: &mut Option<(Vec<u8>, usize)>,
+) -> io::Result<bool> {
+    let Some((payload, offset)) = pending.as_mut() else {
+        return Ok(false);
+    };
+
+    let mut wrote = false;
+    while *offset < payload.len() {
+        match stream.write(&payload[*offset..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "short write while relaying guest TCP payload",
+                ));
+            }
+            Ok(bytes_written) => {
+                *offset += bytes_written;
+                wrote = true;
+            }
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(wrote),
+            Err(err) => return Err(err),
+        }
+    }
+
+    *pending = None;
+    Ok(wrote)
 }
 
 fn flush_proxy_data(socket: &mut tcp::Socket<'_>, connection: &mut TrackedConnection) {
@@ -667,5 +822,94 @@ fn flush_proxy_data(socket: &mut tcp::Socket<'_>, connection: &mut TrackedConnec
             }
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn test_connection(to_proxy: SyncSender<Vec<u8>>) -> TrackedConnection {
+        let (_from_proxy_tx, from_proxy_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+
+        TrackedConnection {
+            source: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 96, 0, 2)), 40_000),
+            destination: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)), 22),
+            to_proxy,
+            from_proxy: from_proxy_rx,
+            pending_proxy_endpoints: None,
+            relay_spawned: true,
+            buffered_guest_data: None,
+            buffered_proxy_data: None,
+            exit_state: RelayExitState::new(),
+            reserved_published_port: None,
+        }
+    }
+
+    #[test]
+    fn buffers_guest_payload_when_proxy_channel_is_full() {
+        let (to_proxy_tx, to_proxy_rx) = mpsc::sync_channel(1);
+        let mut connection = test_connection(to_proxy_tx);
+
+        connection.to_proxy.send(vec![1]).unwrap();
+
+        assert_eq!(
+            send_guest_data_to_proxy(&mut connection, vec![2, 3]),
+            GuestDataFlush::Backpressured
+        );
+        assert_eq!(connection.buffered_guest_data.as_deref(), Some(&[2, 3][..]));
+
+        assert_eq!(to_proxy_rx.recv().unwrap(), vec![1]);
+        assert_eq!(
+            flush_guest_data_to_proxy(&mut connection),
+            GuestDataFlush::Flushed
+        );
+        assert!(connection.buffered_guest_data.is_none());
+        assert_eq!(to_proxy_rx.recv().unwrap(), vec![2, 3]);
+    }
+
+    struct PartialWouldBlockWriter {
+        writes_before_block: usize,
+        max_per_write: usize,
+        written: Vec<u8>,
+    }
+
+    impl Write for PartialWouldBlockWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.writes_before_block == 0 {
+                return Err(io::Error::from(io::ErrorKind::WouldBlock));
+            }
+
+            self.writes_before_block -= 1;
+            let bytes_to_write = buf.len().min(self.max_per_write);
+            self.written.extend_from_slice(&buf[..bytes_to_write]);
+            Ok(bytes_to_write)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn preserves_partial_nonblocking_socket_writes() {
+        let mut writer = PartialWouldBlockWriter {
+            writes_before_block: 1,
+            max_per_write: 2,
+            written: Vec::new(),
+        };
+        let mut pending = Some((b"abcdef".to_vec(), 0));
+
+        assert!(flush_pending_stream_write(&mut writer, &mut pending).unwrap());
+        assert_eq!(pending.as_ref().map(|(_, offset)| *offset), Some(2));
+        assert_eq!(writer.written, b"ab");
+
+        writer.writes_before_block = 1;
+        writer.max_per_write = 16;
+
+        assert!(flush_pending_stream_write(&mut writer, &mut pending).unwrap());
+        assert!(pending.is_none());
+        assert_eq!(writer.written, b"abcdef");
     }
 }
