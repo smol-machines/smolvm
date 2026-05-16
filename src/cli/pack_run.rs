@@ -32,12 +32,57 @@ use std::time::Duration;
 /// Timeout waiting for the agent to become ready.
 const AGENT_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Find the directory of the libkrun already loaded into this process.
+///
+/// Packed binaries are themselves linked against libkrun. Loading a second
+/// copy from the embedded SMOLLIBS cache can create independent libkrun state
+/// in one process, which breaks virtiofs setup on Linux. Prefer the loaded
+/// instance when available.
+fn loaded_libkrun_dir() -> Option<PathBuf> {
+    let sym_name = std::ffi::CString::new("krun_create_ctx").ok()?;
+    // SAFETY: RTLD_DEFAULT searches symbols in already-loaded libraries.
+    let sym = unsafe { libc::dlsym(libc::RTLD_DEFAULT, sym_name.as_ptr()) };
+    if sym.is_null() {
+        return None;
+    }
+
+    let mut info = std::mem::MaybeUninit::<libc::Dl_info>::uninit();
+    // SAFETY: sym came from dlsym; dladdr initializes info on success.
+    if unsafe { libc::dladdr(sym, info.as_mut_ptr()) } == 0 {
+        return None;
+    }
+
+    // SAFETY: dladdr returned success and initialized info.
+    let info = unsafe { info.assume_init() };
+    if info.dli_fname.is_null() {
+        return None;
+    }
+
+    // SAFETY: dli_fname is a valid NUL-terminated path while the library is loaded.
+    let lib_path = unsafe { std::ffi::CStr::from_ptr(info.dli_fname) }.to_string_lossy();
+    Path::new(lib_path.as_ref())
+        .parent()
+        .map(|p| p.to_path_buf())
+}
+
 /// Resolve the lib directory containing libkrun/libkrunfw.
 ///
 /// Two-file mode: libs embedded in stub binary (SMOLLIBS footer).
 /// Single-file mode: libs extracted from Mach-O section to cache_dir/lib/.
 /// `smolvm pack run`: uses the host-installed libs.
 fn resolve_lib_dir(cache_dir: &Path, debug: bool) -> smolvm::Result<PathBuf> {
+    // Best option: use the exact libkrun instance already loaded into this
+    // process. This avoids dlopening a second byte-identical copy from the
+    // SMOLLIBS cache, which breaks virtiofs setup on Linux.
+    if let Some(lib_dir) = loaded_libkrun_dir() {
+        if lib_dir.join(smolvm::util::libkrunfw_filename()).exists() {
+            if debug {
+                eprintln!("debug: using already-loaded libkrun: {}", lib_dir.display());
+            }
+            return Ok(lib_dir);
+        }
+    }
+
     // Two-file mode: libs embedded in stub binary (SMOLLIBS footer)
     if let Ok(exe_path) = std::env::current_exe() {
         if let Ok(Some(lib_dir)) = extract::extract_libs_from_binary(&exe_path, debug) {
