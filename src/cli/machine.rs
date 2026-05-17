@@ -26,40 +26,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// Resolve `--allow-cidr`, `--allow-host`, and `--outbound-localhost-only` into a CIDR list,
-/// net flag, and the original hostname list (for DNS filtering).
-///
-/// Resolution failure for `--allow-host` is a hard error — a typo or DNS outage
-/// should not silently weaken the security policy.
-fn resolve_egress_flags(
-    mut allow_cidr: Vec<String>,
-    allow_host: Vec<String>,
-    outbound_localhost_only: bool,
-    net: bool,
-) -> smolvm::Result<(Vec<String>, bool, Option<Vec<String>>)> {
-    // Resolve hostnames to CIDRs — fail hard on resolution errors
-    for host in &allow_host {
-        let cidrs = crate::cli::parsers::resolve_host_to_cidrs(host)
-            .map_err(|e| smolvm::Error::config("--allow-host", e))?;
-        tracing::info!(host, ?cidrs, "resolved hostname for egress policy");
-        allow_cidr.extend(cidrs);
-    }
-
-    if outbound_localhost_only {
-        allow_cidr.push("127.0.0.0/8".to_string());
-        allow_cidr.push("::1/128".to_string());
-    }
-    let net = net || !allow_cidr.is_empty();
-
-    // Preserve original hostnames for DNS filtering (None if no --allow-host was used)
-    let dns_filter_hosts = if allow_host.is_empty() {
-        None
-    } else {
-        Some(allow_host)
-    };
-
-    Ok((allow_cidr, net, dns_filter_hosts))
-}
+use crate::cli::parsers::resolve_egress_flags;
 
 /// Manage machines
 #[derive(Subcommand, Debug)]

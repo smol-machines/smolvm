@@ -86,6 +86,35 @@ pub fn record_mounts_to_runconfig_bindings(
 // Network helpers delegated to the library.
 pub use smolvm::smolfile::{parse_cidr, resolve_host_to_cidrs};
 
+/// Resolve `--allow-cidr`, `--allow-host`, and `--outbound-localhost-only` into a
+/// (cidrs, net, dns_filter_hosts) triple.  Shared by `pack run` and `machine run/create`.
+///
+/// Resolution failure for `--allow-host` is a hard error.
+pub fn resolve_egress_flags(
+    mut allow_cidr: Vec<String>,
+    allow_host: Vec<String>,
+    outbound_localhost_only: bool,
+    net: bool,
+) -> smolvm::Result<(Vec<String>, bool, Option<Vec<String>>)> {
+    for host in &allow_host {
+        let cidrs = resolve_host_to_cidrs(host)
+            .map_err(|e| smolvm::Error::config("--allow-host", e))?;
+        tracing::info!(host, ?cidrs, "resolved hostname for egress policy");
+        allow_cidr.extend(cidrs);
+    }
+    if outbound_localhost_only {
+        allow_cidr.push("127.0.0.0/8".to_string());
+        allow_cidr.push("::1/128".to_string());
+    }
+    let net = net || !allow_cidr.is_empty();
+    let dns_filter_hosts = if allow_host.is_empty() {
+        None
+    } else {
+        Some(allow_host)
+    };
+    Ok((allow_cidr, net, dns_filter_hosts))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
