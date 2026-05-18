@@ -136,6 +136,7 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
         rootfs_path: &config.rootfs_path,
         disks: &disks,
         vsock_socket: &config.vsock_socket,
+        control_socket: config.control_socket.as_deref(),
         console_log: config.console_log.as_deref(),
         mounts: &config.mounts,
         port_mappings: &config.ports,

@@ -24,6 +24,9 @@ pub enum RecordState {
     Created,
     /// VM process is running.
     Running,
+    /// VM is paused through libkrun. All in-memory state is preserved; use
+    /// `machine resume` to continue execution instantly.
+    Paused,
     /// VM exited cleanly.
     Stopped,
     /// VM crashed or error.
@@ -43,6 +46,7 @@ impl std::fmt::Display for RecordState {
         match self {
             RecordState::Created => write!(f, "created"),
             RecordState::Running => write!(f, "running"),
+            RecordState::Paused => write!(f, "paused"),
             RecordState::Stopped => write!(f, "stopped"),
             RecordState::Failed => write!(f, "failed"),
             RecordState::Unreachable => write!(f, "unreachable"),
@@ -585,14 +589,25 @@ impl VmRecord {
 
     /// Get the actual state, checking if running process is still alive.
     pub fn actual_state(&self) -> RecordState {
-        if self.state == RecordState::Running {
-            if self.is_process_alive() {
-                RecordState::Running
-            } else {
-                RecordState::Stopped // Process died
+        match self.state {
+            RecordState::Running => {
+                if self.is_process_alive() {
+                    RecordState::Running
+                } else {
+                    RecordState::Stopped // Process died
+                }
             }
-        } else {
-            self.state.clone()
+            // A paused VM's process is still alive. Keep Paused as-is; let the
+            // explicit resume path restore Running.
+            // Keep Paused as-is; let the explicit resume path restore Running.
+            RecordState::Paused => {
+                if self.is_process_alive() {
+                    RecordState::Paused
+                } else {
+                    RecordState::Stopped // Process was killed while paused
+                }
+            }
+            _ => self.state.clone(),
         }
     }
 
@@ -673,8 +688,45 @@ mod tests {
     fn test_record_state_display() {
         assert_eq!(RecordState::Created.to_string(), "created");
         assert_eq!(RecordState::Running.to_string(), "running");
+        assert_eq!(RecordState::Paused.to_string(), "paused");
         assert_eq!(RecordState::Stopped.to_string(), "stopped");
         assert_eq!(RecordState::Failed.to_string(), "failed");
+        assert_eq!(RecordState::Unreachable.to_string(), "unreachable");
+    }
+
+    #[test]
+    fn paused_state_serializes_to_lowercase() {
+        // DB stores state as lowercase JSON string; "paused" must round-trip.
+        let json = serde_json::to_string(&RecordState::Paused).unwrap();
+        assert_eq!(json, "\"paused\"");
+        let back: RecordState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, RecordState::Paused);
+    }
+
+    #[test]
+    fn actual_state_preserves_paused_when_process_alive() {
+        // actual_state() must return Paused (not Running/Stopped) when the
+        // record says Paused and the VM process is alive.
+        // We use the test process's own PID as a stand-in for a live process.
+        let mut record = VmRecord::new("test".to_string(), 1, 512, vec![], vec![], false);
+        record.state = RecordState::Paused;
+        record.pid = Some(unsafe { libc::getpid() });
+        record.pid_start_time = crate::process::process_start_time(unsafe { libc::getpid() });
+
+        assert_eq!(record.actual_state(), RecordState::Paused);
+    }
+
+    #[test]
+    fn actual_state_paused_with_dead_pid_returns_stopped() {
+        // If the process was killed while paused (e.g. SIGKILL from outside),
+        // actual_state() must return Stopped rather than leaving the record
+        // stuck in Paused permanently.
+        let mut record = VmRecord::new("test".to_string(), 1, 512, vec![], vec![], false);
+        record.state = RecordState::Paused;
+        record.pid = Some(99999999); // almost certainly dead
+        record.pid_start_time = Some(1); // start time won't match any real process
+
+        assert_eq!(record.actual_state(), RecordState::Stopped);
     }
 
     #[test]

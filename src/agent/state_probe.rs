@@ -40,6 +40,9 @@ use crate::db::SmolvmDb;
 /// records doesn't take seconds.
 pub fn resolve_state(name: &str, record: &VmRecord) -> RecordState {
     if record.state != RecordState::Running {
+        if record.state == RecordState::Paused {
+            return record.actual_state();
+        }
         return record.state.clone();
     }
 

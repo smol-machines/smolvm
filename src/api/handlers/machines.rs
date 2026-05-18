@@ -466,6 +466,10 @@ pub async fn start_machine(
         return Ok(Json(record_to_info(&name, &record)));
     }
 
+    if resolved == RecordState::Paused {
+        return Ok(Json(record_to_info(&name, &record)));
+    }
+
     if resolved == RecordState::Unreachable {
         // Zombie: verified-kill the VMM and clear the DB record
         // before falling through to a clean fresh start. Any stale
@@ -561,7 +565,7 @@ pub async fn stop_machine(
 
     // Check state
     let actual_state = record.actual_state();
-    if actual_state != RecordState::Running {
+    if !matches!(actual_state, RecordState::Running | RecordState::Paused) {
         // Already stopped, just return current info
         return Ok(Json(record_to_info(&name, &record)));
     }

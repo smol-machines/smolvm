@@ -79,6 +79,12 @@ pub enum MachineCmd {
     /// Stop a running machine
     Stop(StopCmd),
 
+    /// Pause a running machine
+    Pause(PauseCmd),
+
+    /// Resume a paused machine
+    Resume(ResumeCmd),
+
     /// Delete a machine configuration
     #[command(visible_alias = "rm")]
     Delete(DeleteCmd),
@@ -141,6 +147,8 @@ impl MachineCmd {
             MachineCmd::Create(cmd) => cmd.run(),
             MachineCmd::Start(cmd) => cmd.run(),
             MachineCmd::Stop(cmd) => cmd.run(),
+            MachineCmd::Pause(cmd) => cmd.run(),
+            MachineCmd::Resume(cmd) => cmd.run(),
             MachineCmd::Delete(cmd) => cmd.run(),
             MachineCmd::Status(cmd) => cmd.run(),
             MachineCmd::Ls(cmd) => cmd.run(),
@@ -1400,6 +1408,53 @@ impl StopCmd {
             Some(name) => vm_common::stop_vm_named(name),
             None => vm_common::stop_vm_default(),
         }
+    }
+}
+
+// ============================================================================
+// Pause Command
+// ============================================================================
+
+/// Pause a running machine.
+///
+/// Coordinates pause through libkrun. All in-memory state (guest RAM,
+/// vCPU registers, running processes, open connections) is preserved.
+/// Use `machine resume` to continue execution.
+#[derive(Args, Debug)]
+pub struct PauseCmd {
+    /// Machine to pause (default: "default")
+    #[arg(short = 'n', long, value_name = "NAME")]
+    pub name: Option<String>,
+}
+
+impl PauseCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        let name = vm_common::resolve_vm_name(self.name)?;
+        let name_str = name.as_deref().unwrap_or("default");
+        vm_common::pause_vm_named(name_str)
+    }
+}
+
+// ============================================================================
+// Resume Command
+// ============================================================================
+
+/// Resume a paused machine.
+///
+/// Continues the VM through libkrun. Execution picks up exactly where it was
+/// paused: no boot sequence, no state loss.
+#[derive(Args, Debug)]
+pub struct ResumeCmd {
+    /// Machine to resume (default: "default")
+    #[arg(short = 'n', long, value_name = "NAME")]
+    pub name: Option<String>,
+}
+
+impl ResumeCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        let name = vm_common::resolve_vm_name(self.name)?;
+        let name_str = name.as_deref().unwrap_or("default");
+        vm_common::resume_vm_named(name_str)
     }
 }
 
