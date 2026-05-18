@@ -168,6 +168,8 @@ impl VmResourcesConfig {
             storage_gib: self.storage_gib.map(|g| g as u64),
             overlay_gib: self.overlay_gib.map(|g| g as u64),
             allowed_cidrs: None,
+            gpu: false,
+            gpu_vram_mib: None,
         }
     }
 }
