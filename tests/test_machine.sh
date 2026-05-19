@@ -1486,6 +1486,114 @@ test_machine_run_detached_with_command() {
     fi
 }
 
+# Image-based machine run with -v targeting /workspace must see host files,
+# not the storage disk's empty workspace directory. The OCI container spec
+# used to unconditionally append /storage/workspace→/workspace after user
+# virtiofs mounts; being last in the spec, it won over the virtiofs share.
+# This test uses machine run (ephemeral) which goes through storage::run_command.
+test_machine_run_image_volume_workspace() {
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    echo "workspace-volume-marker" > "$tmpdir/probe.txt"
+
+    local output exit_code=0
+    output=$(run_with_timeout 60 $SMOLVM machine run --net \
+        -v "$tmpdir:/workspace" --image alpine:latest -- cat /workspace/probe.txt 2>&1) || exit_code=$?
+
+    rm -rf "$tmpdir"
+
+    if [[ $exit_code -ne 0 ]]; then
+        echo "FAIL: machine run failed (exit $exit_code): $output"
+        return 1
+    fi
+    if ! echo "$output" | grep -q "workspace-volume-marker"; then
+        echo "FAIL: host file not visible at /workspace in image container"
+        echo "output: $output"
+        return 1
+    fi
+}
+
+# Smolfile [dev].volumes targeting /workspace must also see host files.
+# This is the exact shape from the reporter: Smolfile with [dev].volumes = ["./:/workspace"].
+# The bug affected both the machine run path and the Smolfile volumes path identically.
+test_machine_run_image_volume_workspace_smolfile() {
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    echo "smolfile-workspace-marker" > "$tmpdir/probe.txt"
+
+    cat > "$tmpdir/Smolfile.toml" <<'EOF'
+image = "alpine:latest"
+net = true
+
+[dev]
+volumes = [".:/workspace"]
+EOF
+
+    local output exit_code=0
+    output=$(
+        cd "$tmpdir"
+        run_with_timeout 60 $SMOLVM machine run -s Smolfile.toml -- cat /workspace/probe.txt 2>&1
+    ) || exit_code=$?
+
+    rm -rf "$tmpdir"
+
+    if [[ $exit_code -ne 0 ]]; then
+        echo "FAIL: machine run -s Smolfile.toml failed (exit $exit_code): $output"
+        return 1
+    fi
+    if ! echo "$output" | grep -q "smolfile-workspace-marker"; then
+        echo "FAIL: host file not visible at /workspace via Smolfile [dev].volumes"
+        echo "output: $output"
+        return 1
+    fi
+}
+
+# Detached machine run with -v targeting /workspace must see host files via exec.
+# This exercises the spawn_in_overlay code path (machine run -d), which is distinct
+# from the ephemeral run_command path tested above.
+test_machine_run_detached_volume_workspace() {
+    local vm_name="det-vol-ws-$$"
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    echo "detached-workspace-marker" > "$tmpdir/probe.txt"
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+
+    local run_output exit_code=0
+    run_output=$(run_with_timeout 120 $SMOLVM machine run -d --net \
+        --name "$vm_name" \
+        -v "$tmpdir:/workspace" \
+        --image alpine:latest -- sleep infinity 2>&1) || exit_code=$?
+
+    if [[ $exit_code -ne 0 ]]; then
+        echo "FAIL: machine run -d failed: $run_output"
+        rm -rf "$tmpdir"
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        return 1
+    fi
+
+    # Keep tmpdir alive until after exec — the virtiofs mount points to it
+    local exec_out
+    exec_out=$(run_with_timeout 30 $SMOLVM machine exec --name "$vm_name" -- cat /workspace/probe.txt 2>&1) || {
+        echo "FAIL: exec failed: $exec_out"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        rm -rf "$tmpdir"
+        return 1
+    }
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    rm -rf "$tmpdir"
+
+    if ! echo "$exec_out" | grep -q "detached-workspace-marker"; then
+        echo "FAIL: host file not visible at /workspace in detached container"
+        echo "exec output: $exec_out"
+        return 1
+    fi
+}
+
 # After `machine stop` + `machine start`, an image-backed VM created with
 # `machine run -d -- cmd` must re-dispatch the workload so that exec joins it.
 # Previously, start used run_background which does not persist the container ID,
@@ -1834,6 +1942,9 @@ run_test "Machine run: image default workdir" test_machine_run_image_default_wor
 run_test "Machine run: image default user" test_machine_run_image_default_user || true
 run_test "Machine run: detached" test_machine_run_detached || true
 run_test "Machine run: detached with command (issue #198)" test_machine_run_detached_with_command || true
+run_test "Volume: image container -v /workspace not overridden by storage disk" test_machine_run_image_volume_workspace || true
+run_test "Volume: Smolfile [dev] volumes /workspace not overridden by storage disk" test_machine_run_image_volume_workspace_smolfile || true
+run_test "Volume: detached -v /workspace not overridden by storage disk" test_machine_run_detached_volume_workspace || true
 run_test "Machine start: restores workload after stop+start" test_machine_start_restores_workload || true
 run_test "Machine start: restores Smolfile cmd workload after stop+start" test_machine_start_restores_workload_smolfile || true
 run_test "Machine run: timeout" test_machine_run_timeout || true

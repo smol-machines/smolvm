@@ -387,6 +387,32 @@ pub fn init_volume_mounts() -> &'static [(String, String, bool)] {
     })
 }
 
+/// Add the /storage/workspace → /workspace fallback bind mount to an OCI spec,
+/// unless a user-provided volume already claims /workspace.
+///
+/// The fallback exposes the storage disk's workspace directory inside containers
+/// so that persistent files written to /workspace survive across VM restarts.
+/// It must be skipped when the user provides `-v host:/workspace` to avoid
+/// silently overwriting their virtiofs mount (which comes earlier in the spec).
+///
+/// Mount target comparison is slash-normalized to handle trailing slashes.
+pub fn add_workspace_fallback(spec: &mut OciSpec, mounts: &[(String, String, bool)]) {
+    let workspace_src = Path::new(STORAGE_ROOT).join(WORKSPACE_DIR);
+    if !workspace_src.exists() {
+        return;
+    }
+    let user_owns_workspace = mounts
+        .iter()
+        .any(|(_, path, _)| path.trim_end_matches('/') == paths::WORKSPACE_GUEST_PATH);
+    if !user_owns_workspace {
+        spec.add_bind_mount(
+            &workspace_src.to_string_lossy(),
+            paths::WORKSPACE_GUEST_PATH,
+            false,
+        );
+    }
+}
+
 /// Create a synthetic ImageInfo from packed layers.
 /// This is used when running from a packed binary where layers are pre-extracted.
 fn create_packed_image_info(image: &str, packed_dir: &Path) -> Result<ImageInfo> {
@@ -2124,11 +2150,7 @@ pub fn run_command(
             );
         }
 
-        // Shared workspace: /storage/workspace → /workspace inside container
-        let workspace_src = Path::new(STORAGE_ROOT).join(WORKSPACE_DIR);
-        if workspace_src.exists() {
-            spec.add_bind_mount(&workspace_src.to_string_lossy(), "/workspace", false);
-        }
+        add_workspace_fallback(&mut spec, mounts);
 
         // Forward SSH agent into the container if enabled at boot.
         crate::ssh_agent::inject_into_container(&mut spec);
@@ -2211,10 +2233,7 @@ pub fn spawn_in_overlay(
         );
     }
 
-    let workspace_src = Path::new(STORAGE_ROOT).join(WORKSPACE_DIR);
-    if workspace_src.exists() {
-        spec.add_bind_mount(&workspace_src.to_string_lossy(), "/workspace", false);
-    }
+    add_workspace_fallback(&mut spec, mounts);
 
     crate::ssh_agent::inject_into_container(&mut spec);
     spec.add_gpu_devices_if_available();

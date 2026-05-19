@@ -289,7 +289,9 @@ same files.
 directory — bare VMs, image-based VMs, and machines created from
 `.smolmachine` artifacts. It persists across `exec` sessions and
 across `stop`/`start` cycles. It's a good default location for
-scripts, data, and results:
+scripts, data, and results. Passing `-v /host/dir:/workspace` replaces
+the default storage-disk workspace with your host directory for that
+run — the host mount takes priority and the storage workspace is skipped:
 
 ```bash
 # Typical agent workflow: copy code in, execute, extract results
@@ -426,3 +428,4 @@ OpenAPI spec: `smolvm serve openapi`
 - **`machine exec` persists filesystem changes.** Package installs, config edits, and file writes inside `exec` survive across sessions. This works for both bare VMs and image-based VMs (created with `--image`).
 - **`machine update` modifies a stopped machine.** Add/remove mounts, ports, env vars, or change CPU/memory without recreating the VM. Changes take effect on next `machine start`. Requires the machine to be stopped.
 - **`machine run` is always ephemeral.** The VM is created, the command runs, and everything is cleaned up. No state carries over.
+- **`-v host:/workspace` replaces the default workspace.** Every image-based VM exposes `/workspace` backed by the VM's storage disk. Mounting a host directory at `/workspace` takes priority — the host share is used instead and the storage-disk workspace is not mounted. Any other target path (e.g. `/data`, `/app`) does not affect `/workspace`.

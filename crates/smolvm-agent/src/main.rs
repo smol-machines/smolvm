@@ -2720,11 +2720,7 @@ fn write_oci_bundle(
         );
     }
 
-    // Shared workspace: /storage/workspace → /workspace inside container.
-    let workspace_src = Path::new("/storage/workspace");
-    if workspace_src.exists() {
-        spec.add_bind_mount(&workspace_src.to_string_lossy(), "/workspace", false);
-    }
+    storage::add_workspace_fallback(&mut spec, mounts);
 
     ssh_agent::inject_into_container(&mut spec);
     spec.write_to(bundle_path)
@@ -3255,11 +3251,7 @@ fn spawn_interactive_command(
         );
     }
 
-    // Shared workspace: /storage/workspace → /workspace inside container
-    let workspace_src = std::path::Path::new("/storage/workspace");
-    if workspace_src.exists() {
-        spec.add_bind_mount(&workspace_src.to_string_lossy(), "/workspace", false);
-    }
+    storage::add_workspace_fallback(&mut spec, mounts);
 
     // Forward SSH agent into the container if enabled at boot.
     ssh_agent::inject_into_container(&mut spec);
