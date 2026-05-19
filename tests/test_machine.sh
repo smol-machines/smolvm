@@ -1486,6 +1486,165 @@ test_machine_run_detached_with_command() {
     fi
 }
 
+# After `machine stop` + `machine start`, an image-backed VM created with
+# `machine run -d -- cmd` must re-dispatch the workload so that exec joins it.
+# Previously, start used run_background which does not persist the container ID,
+# so exec spawned a fresh isolated container instead of joining the workload.
+test_machine_start_restores_workload() {
+    local vm_name="start-restores-workload-$$"
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+
+    # Create persistent VM with a long-running workload
+    local run_output exit_code=0
+    run_output=$(run_with_timeout 120 $SMOLVM machine run -d --net \
+        --name "$vm_name" --image alpine:latest -- sleep infinity 2>&1) || exit_code=$?
+    if [[ $exit_code -ne 0 ]]; then
+        echo "FAIL: machine run -d failed: $run_output"
+        return 1
+    fi
+
+    # Verify workload is PID 1 before stop
+    local ps_before
+    ps_before=$(run_with_timeout 30 $SMOLVM machine exec --name "$vm_name" -- ps -ef 2>&1) || {
+        echo "FAIL: exec before stop failed: $ps_before"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        return 1
+    }
+    if ! echo "$ps_before" | grep -q "sleep"; then
+        echo "FAIL: expected 'sleep infinity' in ps before stop, got:"
+        echo "$ps_before"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        return 1
+    fi
+
+    # Stop and restart
+    $SMOLVM machine stop --name "$vm_name" 2>&1 || {
+        echo "FAIL: machine stop failed"
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        return 1
+    }
+    local start_output
+    start_output=$(run_with_timeout 120 $SMOLVM machine start --name "$vm_name" 2>&1) || {
+        echo "FAIL: machine start failed: $start_output"
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        return 1
+    }
+
+    # Verify workload is PID 1 after restart — the regression check
+    local ps_after
+    ps_after=$(run_with_timeout 30 $SMOLVM machine exec --name "$vm_name" -- ps -ef 2>&1) || {
+        echo "FAIL: exec after restart failed: $ps_after"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        return 1
+    }
+    if ! echo "$ps_after" | grep -q "sleep"; then
+        echo "FAIL: workload 'sleep infinity' not present after stop+start"
+        echo "ps before stop:"
+        echo "$ps_before"
+        echo "ps after restart:"
+        echo "$ps_after"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        return 1
+    fi
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+}
+
+# Smolfile variant of the workload-restore test.
+#
+# The original bug manifested when the workload came from a Smolfile cmd field
+# rather than CLI trailing args. In that case params.cmd is populated from the
+# Smolfile, but the P1 fix must store the resolved effective command so that
+# stop+start replays it correctly via run_container_detached.
+test_machine_start_restores_workload_smolfile() {
+    local vm_name="start-restores-sf-$$"
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+
+    cat > "$tmpdir/Smolfile.toml" <<'EOF'
+image = "alpine:latest"
+net = true
+cmd = ["sleep", "infinity"]
+EOF
+
+    # Create via Smolfile, then run detached (exact repro shape)
+    local run_output exit_code=0
+    run_output=$(
+        cd "$tmpdir"
+        run_with_timeout 120 $SMOLVM machine run -d --name "$vm_name" -s Smolfile.toml 2>&1
+    ) || exit_code=$?
+
+    rm -rf "$tmpdir"
+
+    if [[ $exit_code -ne 0 ]]; then
+        echo "FAIL: machine run -d -s Smolfile.toml failed: $run_output"
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        return 1
+    fi
+
+    # Verify workload is running before stop
+    local ps_before
+    ps_before=$(run_with_timeout 30 $SMOLVM machine exec --name "$vm_name" -- ps -ef 2>&1) || {
+        echo "FAIL: exec before stop failed: $ps_before"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        return 1
+    }
+    if ! echo "$ps_before" | grep -q "sleep"; then
+        echo "FAIL: expected 'sleep infinity' in ps before stop, got:"
+        echo "$ps_before"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        return 1
+    fi
+
+    # Stop and restart
+    $SMOLVM machine stop --name "$vm_name" 2>&1 || {
+        echo "FAIL: machine stop failed"
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        return 1
+    }
+    local start_output
+    start_output=$(run_with_timeout 120 $SMOLVM machine start --name "$vm_name" 2>&1) || {
+        echo "FAIL: machine start failed: $start_output"
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        return 1
+    }
+
+    # Workload must still be present — the Smolfile cmd regression check
+    local ps_after
+    ps_after=$(run_with_timeout 30 $SMOLVM machine exec --name "$vm_name" -- ps -ef 2>&1) || {
+        echo "FAIL: exec after restart failed: $ps_after"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        return 1
+    }
+    if ! echo "$ps_after" | grep -q "sleep"; then
+        echo "FAIL: Smolfile cmd 'sleep infinity' not present after stop+start"
+        echo "ps before stop:"
+        echo "$ps_before"
+        echo "ps after restart:"
+        echo "$ps_after"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        return 1
+    fi
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+}
+
 test_machine_run_timeout() {
     local output
     output=$($SMOLVM machine run --net --timeout 5s --image alpine:latest -- sleep 60 2>&1 || true)
@@ -1675,6 +1834,8 @@ run_test "Machine run: image default workdir" test_machine_run_image_default_wor
 run_test "Machine run: image default user" test_machine_run_image_default_user || true
 run_test "Machine run: detached" test_machine_run_detached || true
 run_test "Machine run: detached with command (issue #198)" test_machine_run_detached_with_command || true
+run_test "Machine start: restores workload after stop+start" test_machine_start_restores_workload || true
+run_test "Machine start: restores Smolfile cmd workload after stop+start" test_machine_start_restores_workload_smolfile || true
 run_test "Machine run: timeout" test_machine_run_timeout || true
 run_test "Bare VM: /workspace exists" test_bare_vm_workspace || true
 run_test "Machine images" test_machine_images || true

@@ -395,9 +395,14 @@ pub struct VmRecord {
     #[serde(default)]
     pub env: Vec<(String, String)>,
 
-    /// Working directory for init commands.
+    /// Working directory for the container workload.
     #[serde(default)]
     pub workdir: Option<String>,
+
+    /// Container user (UID or username). Resolved from image metadata at first
+    /// launch and stored so restart can replay the same identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
 
     /// Storage disk size in GiB (None = default 20 GiB).
     #[serde(default)]
@@ -504,6 +509,7 @@ impl VmRecord {
             init_completed: false,
             env: Vec::new(),
             workdir: None,
+            user: None,
             storage_gb: None,
             overlay_gb: None,
             allowed_cidrs: None,
@@ -552,6 +558,7 @@ impl VmRecord {
             init_completed: false,
             env: Vec::new(),
             workdir: None,
+            user: None,
             storage_gb: None,
             overlay_gb: None,
             allowed_cidrs: None,

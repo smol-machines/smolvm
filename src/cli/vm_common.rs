@@ -725,9 +725,10 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
             let bg_config = smolvm::agent::RunConfig::new(img, cmd)
                 .with_env(record.env.clone())
                 .with_workdir(record.workdir.clone())
+                .with_user(record.user.clone())
                 .with_mounts(mount_bindings)
                 .with_persistent_overlay(Some(name.to_string()));
-            if let Err(e) = client.run_background(bg_config) {
+            if let Err(e) = client.run_container_detached(bg_config) {
                 if let Err(stop_err) = manager.stop() {
                     tracing::warn!(error = %stop_err, "failed to stop machine after CMD launch failure");
                 }
@@ -813,6 +814,7 @@ pub fn persist_named_running(
                 r.init_completed = false;
                 r.env = o.env.clone();
                 r.workdir = o.workdir.clone();
+                r.user = o.user.clone();
                 r.image = o.image.clone();
                 r.entrypoint = o.entrypoint.clone();
                 r.cmd = o.cmd.clone();
@@ -846,6 +848,7 @@ pub struct DefaultVmOverrides {
     pub init: Vec<String>,
     pub env: Vec<(String, String)>,
     pub workdir: Option<String>,
+    pub user: Option<String>,
     pub image: Option<String>,
     pub entrypoint: Vec<String>,
     pub cmd: Vec<String>,
