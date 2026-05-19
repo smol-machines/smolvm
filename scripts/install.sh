@@ -204,10 +204,15 @@ get_download_url() {
     echo "https://github.com/${GITHUB_REPO}/releases/download/v${version}/smolvm-${version}-${download_platform}.tar.gz"
 }
 
-# Get checksum URL for a version and platform
-get_checksum_url() {
+# Get checksum URLs for a version.
+#
+# Current releases publish checksums.sha256. Keep checksums.txt as a legacy
+# fallback so older releases can still be installed if they used that name.
+get_checksum_urls() {
     local version="$1"
-    echo "https://github.com/${GITHUB_REPO}/releases/download/v${version}/checksums.txt"
+    local base="https://github.com/${GITHUB_REPO}/releases/download/v${version}"
+    echo "${base}/checksums.sha256"
+    echo "${base}/checksums.txt"
 }
 
 # Verify file checksum
@@ -219,11 +224,13 @@ verify_checksum() {
 
     # Extract expected checksum for this file
     local expected
-    expected=$(grep "$filename" "$checksums_file" 2>/dev/null | awk '{print $1}')
+    expected=$(
+        awk -v filename="$filename" '$2 == filename { print $1; exit }' "$checksums_file" 2>/dev/null
+    )
 
     if [[ -z "$expected" ]]; then
-        warn "Checksum not found for $filename, skipping verification"
-        return 0
+        error "Checksum not found for $filename in $checksums_file"
+        return 1
     fi
 
     # Calculate actual checksum
@@ -256,14 +263,12 @@ install_smolvm() {
 
     local url
     url=$(get_download_url "$version" "$platform")
-    local checksums_url
-    checksums_url=$(get_checksum_url "$version")
     local tmp_dir
     tmp_dir=$(mktemp -d)
     local archive_name
     archive_name=$(basename "$url")
     local archive="${tmp_dir}/${archive_name}"
-    local checksums="${tmp_dir}/checksums.txt"
+    local checksums="${tmp_dir}/checksums.sha256"
 
     # Download archive
     download "$url" "$archive" || {
@@ -273,14 +278,23 @@ install_smolvm() {
         exit 1
     }
 
-    # Download and verify checksums (optional - don't fail if checksums unavailable)
-    if download "$checksums_url" "$checksums" 2>/dev/null; then
-        verify_checksum "$archive" "$checksums" || {
-            error "Archive failed checksum verification - aborting for security"
-            rm -rf "$tmp_dir"
-            exit 1
-        }
-    else
+    # Download and verify checksums (optional - don't fail if no checksum asset
+    # exists, but do abort if a checksum file exists and does not match).
+    local checksum_downloaded=false
+    local checksums_url
+    while IFS= read -r checksums_url; do
+        if download "$checksums_url" "$checksums" 2>/dev/null; then
+            checksum_downloaded=true
+            verify_checksum "$archive" "$checksums" || {
+                error "Archive failed checksum verification - aborting for security"
+                rm -rf "$tmp_dir"
+                exit 1
+            }
+            break
+        fi
+    done < <(get_checksum_urls "$version")
+
+    if [[ "$checksum_downloaded" != true ]]; then
         warn "Checksums not available for this release, skipping verification"
     fi
 

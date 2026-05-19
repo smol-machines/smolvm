@@ -152,6 +152,8 @@ Known Limitations
 * macOS: binary must be signed with Hypervisor.framework entitlements.
 * `--ssh-agent` requires an SSH agent running on the host (`SSH_AUTH_SOCK` must be set).
 * GPU acceleration requires libkrun built with `GPU=1` and virglrenderer + a Vulkan driver on the host (see [GPU Acceleration](#gpu-acceleration) below).
+* The VM provides guest workload isolation, but the host-side control plane and VMM run as the invoking user. Use OS-level sandboxing or confinement if you need to restrict the VMM process itself.
+* Release archives are verified against the published SHA-256 checksum file when available. Releases are not currently signed or accompanied by cryptographic attestations.
 
 GPU Acceleration
 ----------------
