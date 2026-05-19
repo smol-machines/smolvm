@@ -1102,37 +1102,6 @@ impl ExecCmd {
             .or_else(|| record.as_ref().and_then(|r| r.workdir.clone()));
         let record_image = record.as_ref().and_then(|r| r.image.clone());
 
-        // Streaming mode — print output as it arrives, no buffering
-        if self.stream {
-            let events = client.vm_exec_streaming(
-                self.command.clone(),
-                env.clone(),
-                workdir.clone(),
-                self.timeout,
-            )?;
-            let mut exit_code = 0;
-            for event in events {
-                match event {
-                    smolvm::agent::ExecEvent::Stdout(data) => {
-                        let _ = std::io::stdout().write_all(&data);
-                        let _ = std::io::stdout().flush();
-                    }
-                    smolvm::agent::ExecEvent::Stderr(data) => {
-                        let _ = std::io::stderr().write_all(&data);
-                        let _ = std::io::stderr().flush();
-                    }
-                    smolvm::agent::ExecEvent::Exit(code) => {
-                        exit_code = code;
-                    }
-                    smolvm::agent::ExecEvent::Error(msg) => {
-                        eprintln!("error: {}", msg);
-                        exit_code = 1;
-                    }
-                }
-            }
-            std::process::exit(exit_code);
-        }
-
         // Check if this machine has an image — if so, exec inside the image's
         // rootfs via client.run_interactive()/run_non_interactive() instead of bare vm_exec().
         let mount_bindings = record
@@ -1178,6 +1147,19 @@ impl ExecCmd {
                 std::process::exit(exit_code);
             }
 
+            if self.stream {
+                let config = smolvm::agent::RunConfig::new(image, self.command.clone())
+                    .with_env(defaults.env.clone())
+                    .with_workdir(defaults.workdir.clone())
+                    .with_user(defaults.user.clone())
+                    .with_mounts(mount_bindings)
+                    .with_timeout(self.timeout)
+                    .with_persistent_overlay(Some(machine_name.clone()));
+                let mut printer = ExecEventPrinter::default();
+                client.run_streaming_with(config, |event| printer.handle(event))?;
+                std::process::exit(printer.exit_code);
+            }
+
             let config = smolvm::agent::RunConfig::new(image, self.command.clone())
                 .with_env(defaults.env)
                 .with_workdir(defaults.workdir)
@@ -1205,9 +1187,48 @@ impl ExecCmd {
                 std::process::exit(exit_code);
             }
 
+            if self.stream {
+                let mut printer = ExecEventPrinter::default();
+                client.vm_exec_streaming_with(
+                    self.command.clone(),
+                    env.clone(),
+                    workdir.clone(),
+                    self.timeout,
+                    |event| printer.handle(event),
+                )?;
+                std::process::exit(printer.exit_code);
+            }
+
             let (exit_code, stdout, stderr) =
                 client.vm_exec(self.command.clone(), env, workdir.clone(), self.timeout)?;
             vm_common::print_output_and_exit(&manager, exit_code, &stdout, &stderr);
+        }
+    }
+}
+
+#[derive(Default)]
+struct ExecEventPrinter {
+    exit_code: i32,
+}
+
+impl ExecEventPrinter {
+    fn handle(&mut self, event: smolvm::agent::ExecEvent) {
+        match event {
+            smolvm::agent::ExecEvent::Stdout(data) => {
+                let _ = std::io::stdout().write_all(&data);
+                let _ = std::io::stdout().flush();
+            }
+            smolvm::agent::ExecEvent::Stderr(data) => {
+                let _ = std::io::stderr().write_all(&data);
+                let _ = std::io::stderr().flush();
+            }
+            smolvm::agent::ExecEvent::Exit(code) => {
+                self.exit_code = code;
+            }
+            smolvm::agent::ExecEvent::Error(msg) => {
+                eprintln!("error: {}", msg);
+                self.exit_code = 1;
+            }
         }
     }
 }
