@@ -29,6 +29,11 @@ pub const CRUN_CGROUP_MANAGER: &str = "disabled";
 /// Root directory for virtiofs mounts from the host.
 pub const VIRTIOFS_MOUNT_ROOT: &str = "/mnt/virtiofs";
 
+/// Guest path at which the shared workspace is exposed inside containers.
+/// Used both when mounting /storage/workspace as the fallback workspace and
+/// when checking whether a user-provided volume already claims this path.
+pub const WORKSPACE_GUEST_PATH: &str = "/workspace";
+
 // =============================================================================
 // Storage Paths
 // =============================================================================
