@@ -1214,6 +1214,8 @@ pub fn list_vms(verbose: bool, json: bool) -> smolvm::Result<()> {
                     "entrypoint": record.entrypoint,
                     "cmd": record.cmd,
                     "ephemeral": record.ephemeral,
+                    "gpu": record.gpu.unwrap_or(false),
+                    "gpu_vram_mib": record.gpu_vram_mib,
                 });
                 obj.as_object_mut()
                     .unwrap()
@@ -1265,6 +1267,12 @@ pub fn list_vms(verbose: bool, json: bool) -> smolvm::Result<()> {
                 }
                 if record.network {
                     println!("  Network: enabled");
+                }
+                if record.gpu.unwrap_or(false) {
+                    match record.gpu_vram_mib {
+                        Some(vram) => println!("  GPU: enabled ({} MiB VRAM)", vram),
+                        None => println!("  GPU: enabled"),
+                    }
                 }
                 for cmd in &record.init {
                     println!("  Init: {}", cmd);
