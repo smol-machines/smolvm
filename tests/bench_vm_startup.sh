@@ -5,7 +5,7 @@
 # This includes: VM creation, kernel boot, init execution, agent ready.
 #
 # Usage: ./tests/bench_vm_startup.sh [iterations]
-#    or: ./tests/run_all.sh bench-vm
+#    or: ./tests/run_tests.sh bench
 
 set -euo pipefail
 

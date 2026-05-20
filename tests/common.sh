@@ -113,12 +113,24 @@ log_info() {
 FAILED_TESTS=()
 
 # Fail-fast mode: stop on first failure.
-# Set FAIL_FAST=1 or pass --fail-fast to run_all.sh.
+# Set FAIL_FAST=1 or use TEST_FILTER with run_tests.sh.
 FAIL_FAST="${FAIL_FAST:-0}"
 
 # Single test filter: only run tests whose name contains this string.
-# Usage: TEST_FILTER="from .smolmachine" bash tests/test_machine.sh
+# Usage: TEST_FILTER="port mapping" ./tests/run_tests.sh ports
 TEST_FILTER="${TEST_FILTER:-}"
+
+# Skip slow tests (≥25s intentional sleeps) when SMOLVM_SKIP_SLOW=1.
+# Usage inside a test function: skip_if_slow && return 0
+SMOLVM_SKIP_SLOW="${SMOLVM_SKIP_SLOW:-0}"
+
+skip_if_slow() {
+    if [[ "$SMOLVM_SKIP_SLOW" == "1" ]]; then
+        log_skip "slow test skipped (SMOLVM_SKIP_SLOW=1)"
+        return 0
+    fi
+    return 1
+}
 
 # Run a test function, capturing output and showing it on failure.
 run_test() {
@@ -254,6 +266,31 @@ ensure_machine_running() {
     fi
 }
 
+# Poll until a VM responds to exec (i.e., the agent is ready to accept commands).
+# Replaces fixed sleep N readiness waits after machine start.
+#
+# Usage: wait_vm_ready [--name NAME] [TIMEOUT_SECS]
+#   --name NAME   Named VM (default: unnamed default VM)
+#   TIMEOUT_SECS  Give up after this many seconds (default: 10)
+#
+# Returns 0 when ready, 1 on timeout.
+wait_vm_ready() {
+    local name_flag="" timeout=10
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name) name_flag="--name $2"; shift 2 ;;
+            *)      timeout="$1"; shift ;;
+        esac
+    done
+    local i=0
+    while [[ $i -lt $((timeout * 2)) ]]; do
+        $SMOLVM machine exec $name_flag -- true 2>/dev/null && return 0
+        sleep 0.5
+        ((i++)) || true
+    done
+    return 1
+}
+
 # Extract container ID from output
 extract_container_id() {
     local output="$1"
@@ -313,8 +350,16 @@ run_with_timeout() {
 #   - smolvm-bin machine start (VM processes from previous test runs)
 #   - Packed binaries running as daemons
 #
+# When SMOLVM_ORCHESTRATED=1 (set by run_tests.sh), this is a no-op: the
+# orchestrator does a single pre-flight kill before launching any suites, so
+# per-suite kills are skipped to avoid parallel suites killing each other's
+# in-flight VM starts.
+#
 # Call this before running tests to ensure clean state.
 kill_orphan_smolvm_processes() {
+    if [[ "${SMOLVM_ORCHESTRATED:-0}" == "1" ]]; then
+        return 0
+    fi
     local killed=0
 
     # Kill any smolvm serve processes

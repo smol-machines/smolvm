@@ -7,7 +7,7 @@
 #
 # Usage:
 #   ./tests/test_scale.sh
-#   ./tests/run_all.sh scale
+#   ./tests/run_tests.sh scale
 
 source "$(dirname "$0")/common.sh"
 init_smolvm

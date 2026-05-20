@@ -12,7 +12,7 @@
 #
 # Usage:
 #   ./tests/test_gpu.sh
-#   ./tests/run_all.sh gpu
+#   ./tests/run_tests.sh gpu
 
 source "$(dirname "$0")/common.sh"
 init_smolvm
