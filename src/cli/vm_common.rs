@@ -1199,6 +1199,19 @@ pub fn list_vms(verbose: bool, json: bool) -> smolvm::Result<()> {
                 // truth (Unreachable vs Running) instead of trusting
                 // the PID-only check that fooled bug 2 victims.
                 let actual_state = smolvm::agent::state_probe::resolve_state(name, record);
+                // Expose the persisted health command as a single shell-friendly
+                // string when it was originally stored as `["sh", "-c", "<cmd>"]`
+                // (the shape produced by `machine monitor --health-cmd ...`).
+                // Otherwise, fall back to a space-joined argv so the field is
+                // still a string suitable for direct display in a UI.
+                let health_cmd_str = record.health_cmd.as_ref().map(|argv| {
+                    if argv.len() == 3 && argv[0] == "sh" && argv[1] == "-c" {
+                        argv[2].clone()
+                    } else {
+                        argv.join(" ")
+                    }
+                });
+
                 let mut obj = serde_json::json!({
                     "name": name,
                     "state": actual_state.to_string(),
@@ -1216,6 +1229,14 @@ pub fn list_vms(verbose: bool, json: bool) -> smolvm::Result<()> {
                     "ephemeral": record.ephemeral,
                     "gpu": record.gpu.unwrap_or(false),
                     "gpu_vram_mib": record.gpu_vram_mib,
+                    "restart_policy": record.restart.policy.to_string(),
+                    "restart_max_retries": record.restart.max_retries,
+                    "restart_count": record.restart.restart_count,
+                    "health_cmd": health_cmd_str,
+                    "health_interval_secs": record.health_interval_secs,
+                    "health_timeout_secs": record.health_timeout_secs,
+                    "health_retries": record.health_retries,
+                    "health_startup_grace_secs": record.health_startup_grace_secs,
                 });
                 obj.as_object_mut()
                     .unwrap()
