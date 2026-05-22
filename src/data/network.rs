@@ -29,10 +29,33 @@ pub fn cidrs_contain_ip(cidrs: &[String], ip: &str) -> bool {
     })
 }
 
+/// Returns true if every CIDR in the list falls entirely within loopback ranges
+/// (127.0.0.0/8 for IPv4, ::1/128 for IPv6).
+///
+/// An empty slice returns false — no CIDRs means no policy at all, which is
+/// distinct from an explicitly loopback-only policy.
+pub fn cidrs_all_loopback(cidrs: &[String]) -> bool {
+    if cidrs.is_empty() {
+        return false;
+    }
+    cidrs.iter().all(|cidr| {
+        cidr.parse::<IpNet>()
+            .or_else(|_| cidr.parse::<IpAddr>().map(IpNet::from))
+            .is_ok_and(|net| net.network().is_loopback())
+    })
+}
+
 /// Ensure the default DNS server is reachable in a CIDR allowlist.
 ///
 /// If none of the existing CIDRs cover the DNS IP, appends it as /32.
+///
+/// Skipped when all CIDRs are loopback ranges — a loopback-only policy
+/// intentionally blocks all external traffic, so auto-adding the DNS server
+/// would violate the user's intent (e.g. `--outbound-localhost-only`).
 pub fn ensure_dns_in_cidrs(cidrs: &mut Vec<String>) {
+    if cidrs_all_loopback(cidrs) {
+        return;
+    }
     if !cidrs_contain_ip(cidrs, DEFAULT_DNS) {
         cidrs.push(format!("{}/32", DEFAULT_DNS));
     }
@@ -139,5 +162,33 @@ mod tests {
         let mut cidrs = vec!["10.0.0.0/8".to_string(), "1.1.1.1/32".to_string()];
         ensure_dns_in_cidrs(&mut cidrs);
         assert_eq!(cidrs.len(), 2);
+    }
+
+    #[test]
+    fn test_ensure_dns_skips_for_loopback_only_policy() {
+        // --outbound-localhost-only sets these two CIDRs; DNS server must NOT
+        // be added since it would punch a hole in the user's explicit policy.
+        let mut cidrs = vec!["127.0.0.0/8".to_string(), "::1/128".to_string()];
+        ensure_dns_in_cidrs(&mut cidrs);
+        assert_eq!(cidrs.len(), 2, "1.1.1.1/32 must not be added for loopback-only policy");
+    }
+
+    #[test]
+    fn test_ensure_dns_adds_when_non_loopback_cidr_present() {
+        // Mixed policy: loopback + a private range → DNS should still be added.
+        let mut cidrs = vec!["127.0.0.0/8".to_string(), "10.0.0.0/8".to_string()];
+        ensure_dns_in_cidrs(&mut cidrs);
+        assert_eq!(cidrs.len(), 3);
+        assert!(cidrs.contains(&"1.1.1.1/32".to_string()));
+    }
+
+    #[test]
+    fn test_cidrs_all_loopback() {
+        assert!(cidrs_all_loopback(&["127.0.0.0/8".into(), "::1/128".into()]));
+        assert!(cidrs_all_loopback(&["127.0.0.1/32".into()]));
+        assert!(!cidrs_all_loopback(&[]));
+        assert!(!cidrs_all_loopback(&["10.0.0.0/8".into()]));
+        assert!(!cidrs_all_loopback(&["127.0.0.0/8".into(), "10.0.0.0/8".into()]));
+        assert!(!cidrs_all_loopback(&["0.0.0.0/0".into()]));
     }
 }
