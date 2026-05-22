@@ -132,6 +132,85 @@ test_auto_generated_names() {
 }
 
 
+test_create_rejects_zero_valued_disks() {
+    # `machine create` must reject zero-sized storage/overlay up front and
+    # NOT persist a machine — otherwise the failure only surfaces later at
+    # `machine start`, leaving an unstartable machine in the list.
+    local name="zero-disk-test-$$"
+    $SMOLVM machine delete "$name" -f 2>/dev/null || true
+
+    local exit_code=0
+    $SMOLVM machine create "$name" --storage 0 2>&1 || exit_code=$?
+    [[ $exit_code -ne 0 ]] || {
+        echo "--storage 0 should be rejected at create"
+        $SMOLVM machine delete "$name" -f 2>/dev/null
+        return 1
+    }
+
+    exit_code=0
+    $SMOLVM machine create "$name" --overlay 0 2>&1 || exit_code=$?
+    [[ $exit_code -ne 0 ]] || {
+        echo "--overlay 0 should be rejected at create"
+        $SMOLVM machine delete "$name" -f 2>/dev/null
+        return 1
+    }
+
+    # Neither rejected create may have persisted the machine.
+    local list
+    list=$($SMOLVM machine ls --json 2>&1)
+    [[ "$list" != *"$name"* ]] || {
+        echo "a rejected create persisted the machine anyway"
+        $SMOLVM machine delete "$name" -f 2>/dev/null
+        return 1
+    }
+}
+
+test_exec_nonexistent_machine_reports_not_found() {
+    # exec/cp on a machine that does not exist must say "not found", not
+    # "is not running" — the latter wrongly tells the user to run `start`.
+    local name="missing-machine-test-$$"
+    local output exit_code=0
+
+    output=$($SMOLVM machine exec --name "$name" -- echo hi 2>&1) || exit_code=$?
+    [[ $exit_code -ne 0 ]] || { echo "exec on a nonexistent machine should fail"; return 1; }
+    [[ "$output" == *"not found"* ]] || { echo "expected 'not found', got: $output"; return 1; }
+    [[ "$output" != *"is not running"* ]] || {
+        echo "must not report 'is not running' for a machine that does not exist"
+        return 1
+    }
+
+    exit_code=0
+    output=$($SMOLVM machine cp /etc/hostname "$name":/tmp/x 2>&1) || exit_code=$?
+    [[ $exit_code -ne 0 ]] || { echo "cp to a nonexistent machine should fail"; return 1; }
+    [[ "$output" == *"not found"* ]] || { echo "cp: expected 'not found', got: $output"; return 1; }
+}
+
+test_status_json_output() {
+    # `machine status` supports `--json`, mirroring `machine list --json`.
+    local name="status-json-test-$$"
+    $SMOLVM machine delete "$name" -f 2>/dev/null || true
+    $SMOLVM machine create "$name" 2>&1 || { echo "setup: create failed"; return 1; }
+
+    local output exit_code=0
+    output=$($SMOLVM machine status --name "$name" --json 2>&1) || exit_code=$?
+    if [[ $exit_code -ne 0 ]]; then
+        echo "status --json should succeed, got: $output"
+        $SMOLVM machine delete "$name" -f 2>/dev/null
+        return 1
+    fi
+    [[ "$output" == "{"* && "$output" == *"\"name\""* && "$output" == *"$name"* ]] || {
+        echo "status --json did not return the expected JSON object: $output"
+        $SMOLVM machine delete "$name" -f 2>/dev/null
+        return 1
+    }
+    $SMOLVM machine delete "$name" -f 2>/dev/null
+
+    # `--json` on a machine that does not exist must error.
+    exit_code=0
+    $SMOLVM machine status --name "missing-$$" --json 2>&1 || exit_code=$?
+    [[ $exit_code -ne 0 ]] || { echo "status --json on a nonexistent machine should fail"; return 1; }
+}
+
 run_test "Resource: --cpus 0 rejected" test_resource_cpus_zero_rejected || true
 run_test "Resource: --mem 0 rejected" test_resource_mem_zero_rejected || true
 run_test "Name length: 44-char UUID name accepted (was rejected by old 40-char cap)" test_name_length_44_chars_accepted || true
@@ -140,5 +219,8 @@ run_test "Name length: absurd names rejected by sanity cap" test_name_length_san
 run_test "Resource: --mem below minimum rejected" test_resource_mem_below_minimum_rejected || true
 run_test "Start --name nonexistent rejected" test_start_nonexistent_name_rejected || true
 run_test "Auto-generated names" test_auto_generated_names || true
+run_test "Create: zero-valued storage/overlay rejected, not persisted" test_create_rejects_zero_valued_disks || true
+run_test "Exec/cp: nonexistent machine reports 'not found'" test_exec_nonexistent_machine_reports_not_found || true
+run_test "Status: --json outputs a JSON object" test_status_json_output || true
 
 print_summary "Resource Tests"

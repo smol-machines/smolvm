@@ -1434,6 +1434,10 @@ impl CreateCmd {
             overlay_gib: params.overlay_gb,
             allowed_cidrs: params.allowed_cidrs.clone(),
         };
+        // Reject zero-valued resources before the machine is persisted.
+        // Without this, `machine create` succeeds and the failure only
+        // surfaces later at `machine start` (see QA BUG-44).
+        resources.validate()?;
         validate_requested_network_backend(
             &resources,
             params.dns_filter_hosts.as_deref(),
@@ -1638,10 +1642,17 @@ pub struct StatusCmd {
     /// Machine to check (default: "default")
     #[arg(short = 'n', long, value_name = "NAME")]
     pub name: Option<String>,
+
+    /// Output in JSON format
+    #[arg(long)]
+    pub json: bool,
 }
 
 impl StatusCmd {
     pub fn run(self) -> smolvm::Result<()> {
+        if self.json {
+            return vm_common::status_vm_json(&self.name);
+        }
         vm_common::status_vm(&self.name, |_| {})
     }
 }

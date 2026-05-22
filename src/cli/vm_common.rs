@@ -81,6 +81,20 @@ pub fn ensure_running_and_connect(
         // the real "can't connect" error the user is about to see.
         mark_unreachable_if_zombie(&label);
 
+        // Distinguish "machine does not exist" from "machine exists but is
+        // stopped". Without this a typo in --name reports "is not running"
+        // and points at `start`, which then fails differently (QA BUG-45).
+        let exists = SmolvmDb::open()
+            .ok()
+            .and_then(|db| db.get_vm(&label).ok().flatten())
+            .is_some();
+        if !exists {
+            return Err(smolvm::Error::agent(
+                "connect",
+                format!("machine '{}' not found", label),
+            ));
+        }
+
         return Err(smolvm::Error::agent(
             "connect",
             format!(
@@ -1171,6 +1185,77 @@ where
     Ok(())
 }
 
+/// Build the per-machine JSON object shared by `machine list --json` and
+/// `machine status --json` so the two outputs never drift apart.
+fn machine_status_json(name: &str, record: &VmRecord) -> serde_json::Value {
+    // Resolve via vsock probe so the JSON reflects truth (Unreachable vs
+    // Running) instead of trusting the PID-only check.
+    let actual_state = smolvm::agent::state_probe::resolve_state(name, record);
+    // Expose the persisted health command as a single shell-friendly string
+    // when it was stored as `["sh", "-c", "<cmd>"]`; otherwise a space-joined
+    // argv so the field is always a string.
+    let health_cmd_str = record.health_cmd.as_ref().map(|argv| {
+        if argv.len() == 3 && argv[0] == "sh" && argv[1] == "-c" {
+            argv[2].clone()
+        } else {
+            argv.join(" ")
+        }
+    });
+
+    let mut obj = serde_json::json!({
+        "name": name,
+        "state": actual_state.to_string(),
+        "cpus": record.cpus,
+        "memory_mib": record.mem,
+        "pid": record.pid,
+        "mounts": record.mounts.len(),
+        "ports": record.ports.len(),
+        "created_at": record.created_at,
+        "storage_gb": record.storage_gb,
+        "overlay_gb": record.overlay_gb,
+        "image": record.image,
+        "entrypoint": record.entrypoint,
+        "cmd": record.cmd,
+        "ephemeral": record.ephemeral,
+        "gpu": record.gpu.unwrap_or(false),
+        "gpu_vram_mib": record.gpu_vram_mib,
+        "restart_policy": record.restart.policy.to_string(),
+        "restart_max_retries": record.restart.max_retries,
+        "restart_count": record.restart.restart_count,
+        "health_cmd": health_cmd_str,
+        "health_interval_secs": record.health_interval_secs,
+        "health_timeout_secs": record.health_timeout_secs,
+        "health_retries": record.health_retries,
+        "health_startup_grace_secs": record.health_startup_grace_secs,
+    });
+    obj.as_object_mut()
+        .unwrap()
+        .insert("network".into(), serde_json::json!(record.network));
+    obj
+}
+
+/// Emit a single machine's status as JSON — the same object shape as
+/// `machine list --json`. Errors if the machine does not exist.
+pub fn status_vm_json(name: &Option<String>) -> smolvm::Result<()> {
+    let label = vm_label(name);
+    let config = SmolvmConfig::load()?;
+    // Build the owned JSON value inside the match so the borrow of `config`
+    // ends before `config` is dropped.
+    let obj = match config.list_vms().find(|(n, _)| *n == &label) {
+        Some((_, record)) => machine_status_json(&label, record),
+        None => {
+            return Err(smolvm::Error::config(
+                "machine status",
+                format!("machine '{}' not found", label),
+            ))
+        }
+    };
+    let json = serde_json::to_string_pretty(&obj)
+        .map_err(|e| smolvm::Error::config("serialize json", e.to_string()))?;
+    println!("{}", json);
+    Ok(())
+}
+
 // ============================================================================
 // List
 // ============================================================================
@@ -1194,55 +1279,7 @@ pub fn list_vms(verbose: bool, json: bool) -> smolvm::Result<()> {
     if json {
         let json_vms: Vec<_> = vms
             .iter()
-            .map(|(name, record)| {
-                // Resolve via vsock probe so the JSON output reflects
-                // truth (Unreachable vs Running) instead of trusting
-                // the PID-only check that fooled bug 2 victims.
-                let actual_state = smolvm::agent::state_probe::resolve_state(name, record);
-                // Expose the persisted health command as a single shell-friendly
-                // string when it was originally stored as `["sh", "-c", "<cmd>"]`
-                // (the shape produced by `machine monitor --health-cmd ...`).
-                // Otherwise, fall back to a space-joined argv so the field is
-                // still a string suitable for direct display in a UI.
-                let health_cmd_str = record.health_cmd.as_ref().map(|argv| {
-                    if argv.len() == 3 && argv[0] == "sh" && argv[1] == "-c" {
-                        argv[2].clone()
-                    } else {
-                        argv.join(" ")
-                    }
-                });
-
-                let mut obj = serde_json::json!({
-                    "name": name,
-                    "state": actual_state.to_string(),
-                    "cpus": record.cpus,
-                    "memory_mib": record.mem,
-                    "pid": record.pid,
-                    "mounts": record.mounts.len(),
-                    "ports": record.ports.len(),
-                    "created_at": record.created_at,
-                    "storage_gb": record.storage_gb,
-                    "overlay_gb": record.overlay_gb,
-                    "image": record.image,
-                    "entrypoint": record.entrypoint,
-                    "cmd": record.cmd,
-                    "ephemeral": record.ephemeral,
-                    "gpu": record.gpu.unwrap_or(false),
-                    "gpu_vram_mib": record.gpu_vram_mib,
-                    "restart_policy": record.restart.policy.to_string(),
-                    "restart_max_retries": record.restart.max_retries,
-                    "restart_count": record.restart.restart_count,
-                    "health_cmd": health_cmd_str,
-                    "health_interval_secs": record.health_interval_secs,
-                    "health_timeout_secs": record.health_timeout_secs,
-                    "health_retries": record.health_retries,
-                    "health_startup_grace_secs": record.health_startup_grace_secs,
-                });
-                obj.as_object_mut()
-                    .unwrap()
-                    .insert("network".into(), serde_json::json!(record.network));
-                obj
-            })
+            .map(|(name, record)| machine_status_json(name, record))
             .collect();
         let json = serde_json::to_string_pretty(&json_vms)
             .map_err(|e| smolvm::Error::config("serialize json", e.to_string()))?;

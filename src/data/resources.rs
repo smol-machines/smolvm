@@ -81,6 +81,21 @@ impl VmResources {
                 ),
             ));
         }
+        // `None` means "use the default size"; only an explicit 0 is invalid.
+        // Caught here so `machine create` rejects it up front instead of
+        // persisting a machine that can never start.
+        if self.storage_gib == Some(0) {
+            return Err(crate::Error::config(
+                "validate resources",
+                "storage disk size must be greater than 0 GiB",
+            ));
+        }
+        if self.overlay_gib == Some(0) {
+            return Err(crate::Error::config(
+                "validate resources",
+                "overlay disk size must be greater than 0 GiB",
+            ));
+        }
         Ok(())
     }
 }
