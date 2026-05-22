@@ -212,6 +212,18 @@ impl ListenTarget {
 
         #[cfg(unix)]
         {
+            // If the value looks like an intended IP:PORT (contains ':'
+            // but failed SocketAddr parsing), report the parse failure
+            // rather than silently treating it as a Unix socket path.
+            if !value.starts_with("unix://") && !value.starts_with('/') && value.contains(':') {
+                return Err(smolvm::error::Error::config(
+                    "parse listen address",
+                    format!(
+                        "invalid address '{}': expected a valid ADDR:PORT or a unix:// path",
+                        value
+                    ),
+                ));
+            }
             let path = value.strip_prefix("unix://").unwrap_or(value);
             Ok(Self::Unix(PathBuf::from(path)))
         }

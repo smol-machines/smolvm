@@ -1307,8 +1307,8 @@ pub fn list_vms(verbose: bool, json: bool) -> smolvm::Result<()> {
                 if let Some(wd) = &record.workdir {
                     println!("  Workdir: {}", wd);
                 }
-                let created = std::time::UNIX_EPOCH
-                    + std::time::Duration::from_secs(record.created_at);
+                let created =
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(record.created_at);
                 println!("  Created: {}", humantime::format_rfc3339_seconds(created));
                 println!();
             }

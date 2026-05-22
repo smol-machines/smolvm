@@ -179,7 +179,11 @@ mod tests {
         // be added since it would punch a hole in the user's explicit policy.
         let mut cidrs = vec!["127.0.0.0/8".to_string(), "::1/128".to_string()];
         ensure_dns_in_cidrs(&mut cidrs);
-        assert_eq!(cidrs.len(), 2, "1.1.1.1/32 must not be added for loopback-only policy");
+        assert_eq!(
+            cidrs.len(),
+            2,
+            "1.1.1.1/32 must not be added for loopback-only policy"
+        );
     }
 
     #[test]
@@ -202,11 +206,17 @@ mod tests {
 
     #[test]
     fn test_cidrs_all_loopback() {
-        assert!(cidrs_all_loopback(&["127.0.0.0/8".into(), "::1/128".into()]));
+        assert!(cidrs_all_loopback(&[
+            "127.0.0.0/8".into(),
+            "::1/128".into()
+        ]));
         assert!(cidrs_all_loopback(&["127.0.0.1/32".into()]));
         assert!(!cidrs_all_loopback(&[]));
         assert!(!cidrs_all_loopback(&["10.0.0.0/8".into()]));
-        assert!(!cidrs_all_loopback(&["127.0.0.0/8".into(), "10.0.0.0/8".into()]));
+        assert!(!cidrs_all_loopback(&[
+            "127.0.0.0/8".into(),
+            "10.0.0.0/8".into()
+        ]));
         assert!(!cidrs_all_loopback(&["0.0.0.0/0".into()]));
     }
 }
