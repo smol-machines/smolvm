@@ -58,6 +58,17 @@ enum Commands {
         /// Ephemeral DB record name (may differ from vm_name)
         ephemeral_name: String,
     },
+
+    /// Internal: wait for an ephemeral detached VM to exit then delete it (not for direct use)
+    #[command(name = "_watch-ephemeral", hide = true)]
+    WatchEphemeral {
+        /// Machine name (used for config lookup and data directory path)
+        vm_name: String,
+        /// VM process PID
+        pid: i32,
+        /// Process start time for PID-reuse detection (0 = unknown)
+        start_time: u64,
+    },
 }
 
 fn main() {
@@ -90,6 +101,14 @@ fn main() {
             ephemeral_name,
         } => {
             cli::cleanup_ephemeral::run(&vm_name, pid, start_time, &ephemeral_name);
+            Ok(())
+        }
+        Commands::WatchEphemeral {
+            vm_name,
+            pid,
+            start_time,
+        } => {
+            cli::watch_ephemeral::run(&vm_name, pid, start_time);
             Ok(())
         }
     };

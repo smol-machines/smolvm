@@ -274,6 +274,12 @@ pub enum AgentRequest {
         /// Returns a `Completed` response with `stdout` containing the container ID.
         #[serde(default)]
         detached: bool,
+        /// When true, the agent exits after the detached container finishes,
+        /// shutting down the guest kernel and the krun process. Used for
+        /// ephemeral `machine run -d` (no --name) so the VM self-terminates
+        /// when the workload completes, letting the host watcher clean up.
+        #[serde(default)]
+        exit_on_complete: bool,
         /// If set, use a persistent overlay that survives across exec sessions.
         /// The overlay is identified by this ID (typically the machine name)
         /// and reused on subsequent runs. If not set, an ephemeral overlay is

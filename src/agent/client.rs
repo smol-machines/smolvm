@@ -125,6 +125,9 @@ pub struct RunConfig {
     /// Persistent overlay ID. If set, the overlay persists across exec sessions
     /// so filesystem changes (e.g. package installs) survive.
     pub persistent_overlay_id: Option<String>,
+    /// If true, tell the agent to exit when the detached container finishes,
+    /// shutting down the VM. Used for ephemeral `machine run -d` (no --name).
+    pub exit_on_complete: bool,
 }
 
 impl RunConfig {
@@ -140,6 +143,7 @@ impl RunConfig {
             timeout: None,
             tty: false,
             persistent_overlay_id: None,
+            exit_on_complete: false,
         }
     }
 
@@ -182,6 +186,13 @@ impl RunConfig {
     /// Set persistent overlay ID for cross-session filesystem persistence.
     pub fn with_persistent_overlay(mut self, id: Option<String>) -> Self {
         self.persistent_overlay_id = id;
+        self
+    }
+
+    /// Signal the agent to exit when the detached container finishes.
+    /// Use for ephemeral `machine run -d` (no --name) so the VM self-terminates.
+    pub fn with_exit_on_complete(mut self) -> Self {
+        self.exit_on_complete = true;
         self
     }
 }
@@ -1050,6 +1061,7 @@ impl AgentClient {
             detached: false,
             persistent_overlay_id: config.persistent_overlay_id,
             background: false,
+            exit_on_complete: false,
         })?;
 
         expect_completed(resp, "run command")
@@ -1074,6 +1086,7 @@ impl AgentClient {
             detached: false,
             persistent_overlay_id: config.persistent_overlay_id,
             background: true,
+            exit_on_complete: false,
         })?;
 
         let (exit_code, stdout, _stderr) = expect_completed(resp, "run background")?;
@@ -1114,6 +1127,7 @@ impl AgentClient {
             detached: false,
             persistent_overlay_id: config.persistent_overlay_id,
             background: false,
+            exit_on_complete: false,
         })?;
 
         collect_exec_events(self, "run streaming", on_event)
@@ -1148,6 +1162,7 @@ impl AgentClient {
                 detached: false,
                 persistent_overlay_id: config.persistent_overlay_id,
                 background: false,
+                exit_on_complete: false,
             },
             tty,
             "run interactive",
@@ -1182,6 +1197,7 @@ impl AgentClient {
             detached: true,
             persistent_overlay_id: config.persistent_overlay_id,
             background: false,
+            exit_on_complete: config.exit_on_complete,
         })?;
         let (exit_code, stdout, _) = expect_completed(resp, "run container detached")?;
         if exit_code != 0 {

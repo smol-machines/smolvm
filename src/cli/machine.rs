@@ -123,6 +123,31 @@ fn try_spawn_detached_cleanup(
     result.is_ok()
 }
 
+/// Spawn a detached `smolvm _watch-ephemeral` helper process that polls until
+/// the ephemeral VM process exits, then deletes the machine record and data dir.
+///
+/// Returns `true` if the helper was spawned. If spawn fails, the caller emits
+/// a warning; the VM stays running and the user can clean up with `machine delete`.
+fn try_spawn_watch_ephemeral(vm_name: &str, pid: i32, start_time: Option<u64>) -> bool {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    // Pass 0 for unknown start_time; watcher falls back to liveness-only check.
+    let start_time_val = start_time.unwrap_or(0);
+    let result = std::process::Command::new(exe)
+        .arg("_watch-ephemeral")
+        .arg(vm_name)
+        .arg(pid.to_string())
+        .arg(start_time_val.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn();
+    result.is_ok()
+}
+
 /// Manage machines
 #[derive(Subcommand, Debug)]
 pub enum MachineCmd {
@@ -380,13 +405,15 @@ impl RunCmd {
         use smolvm::Error;
 
         let requested_name = self.name.clone();
-        let vm_name = if self.detach {
-            requested_name.unwrap_or_else(|| "default".to_string())
-        } else {
-            smolvm::util::generate_machine_name()
+        // Named detach (--name foo -d) → use the given name (persistent machine).
+        // Everything else → generate a unique name (foreground ephemeral or
+        // unnamed detach ephemeral).
+        let vm_name = match (self.detach, requested_name) {
+            (true, Some(name)) => name,
+            _ => smolvm::util::generate_machine_name(),
         };
 
-        if self.name.is_some() && vm_name != "default" && self.detach {
+        if self.detach && self.name.is_some() {
             let config = smolvm::config::SmolvmConfig::load()?;
             if config.get_vm(&vm_name).is_some() {
                 return Err(Error::config(
@@ -528,8 +555,8 @@ impl RunCmd {
             AgentManager::for_vm_with_sizes(&vm_name, params.storage_gb, params.overlay_gb)
                 .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
 
-        if self.detach {
-            println!("Starting persistent machine...");
+        if self.detach && self.name.is_some() {
+            println!("Starting persistent machine '{}'...", vm_name);
         } else {
             println!("Starting ephemeral machine ({})...", vm_name);
         }
@@ -693,23 +720,10 @@ impl RunCmd {
                 params.workdir.as_deref(),
             );
             if self.detach {
-                // Start the main workload container first. If this fails, the
-                // VM is stopped and no DB record is written — a retry won't
-                // hit "machine already exists."
-                {
-                    let run_config = smolvm::agent::RunConfig::new(img.clone(), command.clone())
-                        .with_env(defaults.env.clone())
-                        .with_workdir(defaults.workdir.clone())
-                        .with_user(defaults.user.clone())
-                        .with_mounts(mount_bindings.clone())
-                        .with_persistent_overlay(Some(vm_name.clone()));
-                    client.run_container_detached(run_config)?;
-                }
-
-                // Container started — persist the DB record. If this fails,
-                // stop the VM to avoid an orphan that lifecycle commands can't find.
-                {
-                    use smolvm::config::SmolvmConfig;
+                // Build the persist overrides block (shared by both sub-paths).
+                let make_overrides = |env: Vec<(String, String)>,
+                                      workdir: Option<String>,
+                                      user: Option<String>| {
                     use vm_common::DefaultVmOverrides;
                     let mount_tuples: Vec<(String, String, bool)> = mounts
                         .iter()
@@ -723,61 +737,141 @@ impl RunCmd {
                         .collect();
                     let port_tuples: Vec<(u16, u16)> =
                         params.port.iter().map(|p| (p.host, p.guest)).collect();
+                    DefaultVmOverrides {
+                        cpus: params.cpus,
+                        mem: params.mem,
+                        mounts: mount_tuples,
+                        ports: port_tuples,
+                        network: params.net,
+                        network_backend: params.network_backend,
+                        storage_gb: params.storage_gb,
+                        overlay_gb: params.overlay_gb,
+                        allowed_cidrs: params.allowed_cidrs.clone(),
+                        init: params.init.clone(),
+                        env,
+                        workdir,
+                        user,
+                        image: Some(img.clone()),
+                        entrypoint: Vec::new(),
+                        cmd: command.clone(),
+                        ssh_agent: self.ssh_agent || params.ssh_agent,
+                        dns_filter_hosts: params.dns_filter_hosts.clone(),
+                        gpu: self.gpu || params.gpu,
+                        gpu_vram_mib: self.gpu_vram_mib.or(params.gpu_vram_mib),
+                    }
+                };
+
+                if self.name.is_some() {
+                    // ── Persistent named detach ──────────────────────────────
+                    // Start the main workload container first. If this fails,
+                    // the VM is stopped and no DB record is written.
+                    {
+                        let run_config =
+                            smolvm::agent::RunConfig::new(img.clone(), command.clone())
+                                .with_env(defaults.env.clone())
+                                .with_workdir(defaults.workdir.clone())
+                                .with_user(defaults.user.clone())
+                                .with_mounts(mount_bindings.clone())
+                                .with_persistent_overlay(Some(vm_name.clone()));
+                        client.run_container_detached(run_config)?;
+                    }
+
+                    // Container started — persist the DB record.
+                    {
+                        use smolvm::config::SmolvmConfig;
+                        let persist_result = SmolvmConfig::load().and_then(|mut config| {
+                            vm_common::persist_named_running(
+                                &mut config,
+                                &vm_name,
+                                manager.child_pid(),
+                                Some(make_overrides(
+                                    defaults.env.clone(),
+                                    defaults.workdir.clone(),
+                                    defaults.user.clone(),
+                                )),
+                            )
+                        });
+                        if let Err(e) = persist_result {
+                            let _ = manager.stop();
+                            return Err(Error::config(
+                                "persist machine record",
+                                format!(
+                                    "VM started but record could not be saved: {}. VM stopped to avoid orphan.",
+                                    e
+                                ),
+                            ));
+                        }
+                    }
+
+                    drop(sigint_guard);
+                    println!("Machine '{}' running in background", vm_name);
+                    println!("\nTo interact:");
+                    println!("  smolvm machine exec --name {} -- <command>", vm_name);
+                    println!("\nTo stop:");
+                    println!("  smolvm machine stop --name {}", vm_name);
+                    manager.detach();
+                    return Ok(());
+                }
+
+                // ── Ephemeral detach (no --name) ─────────────────────────────
+                // The agent will call libc::exit() when the container exits
+                // (exit_on_complete), shutting down the VM. The watcher helper
+                // polls for the krun process to die, then deletes the record.
+                {
+                    let run_config = smolvm::agent::RunConfig::new(img.clone(), command.clone())
+                        .with_env(defaults.env.clone())
+                        .with_workdir(defaults.workdir.clone())
+                        .with_user(defaults.user.clone())
+                        .with_mounts(mount_bindings.clone())
+                        .with_persistent_overlay(Some(vm_name.clone()))
+                        .with_exit_on_complete();
+                    client.run_container_detached(run_config)?;
+                }
+
+                // Persist the record so `machine exec/stop --name` work while
+                // the VM is running. The watcher deletes it when the VM exits.
+                {
+                    use smolvm::config::SmolvmConfig;
                     let persist_result = SmolvmConfig::load().and_then(|mut config| {
                         vm_common::persist_named_running(
                             &mut config,
                             &vm_name,
                             manager.child_pid(),
-                            Some(DefaultVmOverrides {
-                                cpus: params.cpus,
-                                mem: params.mem,
-                                mounts: mount_tuples,
-                                ports: port_tuples,
-                                network: params.net,
-                                network_backend: params.network_backend,
-                                storage_gb: params.storage_gb,
-                                overlay_gb: params.overlay_gb,
-                                allowed_cidrs: params.allowed_cidrs.clone(),
-                                init: params.init.clone(),
-                                env: defaults.env.clone(),
-                                workdir: defaults.workdir.clone(),
-                                user: defaults.user.clone(),
-                                image: Some(img.clone()),
-                                entrypoint: Vec::new(),
-                                cmd: command.clone(),
-                                ssh_agent: self.ssh_agent || params.ssh_agent,
-                                dns_filter_hosts: params.dns_filter_hosts.clone(),
-                                gpu: self.gpu || params.gpu,
-                                gpu_vram_mib: self.gpu_vram_mib.or(params.gpu_vram_mib),
-                            }),
+                            Some(make_overrides(
+                                defaults.env.clone(),
+                                defaults.workdir.clone(),
+                                defaults.user.clone(),
+                            )),
                         )
                     });
                     if let Err(e) = persist_result {
                         let _ = manager.stop();
                         return Err(Error::config(
                             "persist machine record",
-                            format!("VM started but record could not be saved: {}. VM stopped to avoid orphan.", e),
+                            format!(
+                                "VM started but record could not be saved: {}. VM stopped to avoid orphan.",
+                                e
+                            ),
                         ));
                     }
                 }
 
-                // Disarm SIGINT guard — detaching, VM stays running.
-                drop(sigint_guard);
-
-                if vm_name == "default" {
-                    println!("Machine running in background");
-                    println!("\nTo interact:");
-                    println!("  smolvm machine exec -- <command>");
-                    println!("\nTo stop:");
-                    println!("  smolvm machine stop");
-                } else {
-                    println!("Machine '{}' running in background", vm_name);
-                    println!("\nTo interact:");
-                    println!("  smolvm machine exec --name {} -- <command>", vm_name);
-                    println!("\nTo stop:");
-                    println!("  smolvm machine stop --name {}", vm_name);
+                // Spawn background watcher — polls until krun exits then cleans up.
+                let (pid, start_time) = manager.pid_and_start_time().unwrap_or((0, None));
+                if pid > 0 && !try_spawn_watch_ephemeral(&vm_name, pid, start_time) {
+                    eprintln!(
+                        "warning: could not spawn background cleaner; \
+                         run 'smolvm machine delete {} -f' when done",
+                        vm_name
+                    );
                 }
 
+                drop(sigint_guard);
+                println!("Ephemeral machine ({}) running in background", vm_name);
+                println!("\nTo interact:");
+                println!("  smolvm machine exec --name {} -- <command>", vm_name);
+                println!("\nTo stop:");
+                println!("  smolvm machine stop --name {}", vm_name);
                 manager.detach();
                 Ok(())
             } else {

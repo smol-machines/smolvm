@@ -1880,6 +1880,7 @@ fn handle_request(
             detached: false,
             persistent_overlay_id,
             background,
+            exit_on_complete: _,
         } => {
             if background {
                 handle_run_background(
@@ -2747,25 +2748,28 @@ fn handle_run_detached(
 
     ensure_storage_mounted();
 
-    let (image, command, env, workdir, user, mounts, persistent_overlay_id) = match request {
-        AgentRequest::Run {
-            image,
-            command,
-            env,
-            workdir,
-            user,
-            mounts,
-            persistent_overlay_id,
-            ..
-        } => (
-            image,
-            command,
-            env,
-            workdir,
-            user,
-            mounts,
-            persistent_overlay_id,
-        ),
+    let (image, command, env, workdir, user, mounts, persistent_overlay_id, exit_on_complete) =
+        match request {
+            AgentRequest::Run {
+                image,
+                command,
+                env,
+                workdir,
+                user,
+                mounts,
+                persistent_overlay_id,
+                exit_on_complete,
+                ..
+            } => (
+                image,
+                command,
+                env,
+                workdir,
+                user,
+                mounts,
+                persistent_overlay_id,
+                exit_on_complete,
+            ),
         _ => {
             send_response(
                 stream,
@@ -2926,6 +2930,8 @@ fn handle_run_detached(
                 container_id = %container_id,
                 "detached container started via create+start"
             );
+            // Clone before into_bytes() moves the string.
+            let container_id_for_wait = container_id.clone();
             send_response(
                 stream,
                 &AgentResponse::Completed {
@@ -2934,6 +2940,34 @@ fn handle_run_detached(
                     stderr: vec![],
                 },
             )?;
+            // For ephemeral detached runs, spawn a thread that waits for the
+            // container to finish then exits the agent process. Since the agent
+            // is PID 1 in the guest, calling libc::exit() shuts down the guest
+            // kernel and terminates krun on the host.
+            if exit_on_complete {
+                std::thread::spawn(move || {
+                    // Poll crun state every 500ms until the container is no
+                    // longer running (status != "running" or crun state fails
+                    // because the container was deleted).
+                    loop {
+                        let done = crun::CrunCommand::state(&container_id_for_wait)
+                            .capture_output()
+                            .output()
+                            .map(|o| {
+                                !o.status.success()
+                                    || !String::from_utf8_lossy(&o.stdout)
+                                        .contains("\"running\"")
+                            })
+                            .unwrap_or(true);
+                        if done {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    }
+                    // SAFETY: agent is PID 1 — exiting here shuts down the VM.
+                    unsafe { libc::exit(0) }
+                });
+            }
         }
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr);

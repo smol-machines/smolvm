@@ -164,7 +164,7 @@ test_exec_joined_large_stdout_does_not_crash_vm() {
     # Same test but through the joined crun exec path (detached main container)
     $SMOLVM machine stop 2>/dev/null || true
     $SMOLVM machine delete default -f 2>/dev/null || true
-    $SMOLVM machine run -d --net --image alpine -- sleep 300 2>&1 || return 1
+    $SMOLVM machine run -d --name default --net --image alpine -- sleep 300 2>&1 || return 1
 
     local output
     output=$(run_with_timeout 30 $SMOLVM machine exec -- sh -c 'dd if=/dev/urandom bs=1024 count=128 2>/dev/null | base64' 2>&1)
@@ -200,7 +200,7 @@ test_exec_joins_main_container() {
 
     log_info "Starting detached workload: sleep 300..."
     local run_output
-    if ! run_output=$(run_with_timeout 120 $SMOLVM machine run -d --net --image alpine -- sleep 300 2>&1); then
+    if ! run_output=$(run_with_timeout 120 $SMOLVM machine run -d --name default --net --image alpine -- sleep 300 2>&1); then
         echo "FAIL: machine run -d failed: $run_output"
         return 1
     fi
@@ -278,7 +278,7 @@ test_exec_recovers_after_main_container_exits() {
     # Start a detached container with a short-lived command
     $SMOLVM machine stop 2>/dev/null || true
     $SMOLVM machine delete default -f 2>/dev/null || true
-    $SMOLVM machine run -d --net --image alpine -- sleep 2 2>&1 || return 1
+    $SMOLVM machine run -d --name default --net --image alpine -- sleep 2 2>&1 || return 1
 
     # Wait for the main container to exit naturally
     sleep 4
@@ -308,7 +308,7 @@ test_exec_join_timeout_does_not_kill_main_container() {
     if ! echo "$ps_before" | grep -q "sleep"; then
         $SMOLVM machine stop 2>/dev/null || true
         $SMOLVM machine delete default -f 2>/dev/null || true
-        $SMOLVM machine run -d --net --image alpine -- sleep 300 2>&1 || return 1
+        $SMOLVM machine run -d --name default --net --image alpine -- sleep 300 2>&1 || return 1
     fi
 
     # Run a command with a short timeout — it will time out
@@ -347,7 +347,7 @@ test_exec_join_documents_user_behavior() {
     # Some crun versions may run joined exec as root unless --user is explicit.
     $SMOLVM machine stop 2>/dev/null || true
     $SMOLVM machine delete default -f 2>/dev/null || true
-    $SMOLVM machine run -d --net --image nginxinc/nginx-unprivileged:stable-alpine -- sleep 300 2>&1 || {
+    $SMOLVM machine run -d --name default --net --image nginxinc/nginx-unprivileged:stable-alpine -- sleep 300 2>&1 || {
         echo "SKIP: could not start nginx-unprivileged image"
         return 0
     }

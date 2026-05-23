@@ -146,55 +146,64 @@ test_machine_run_image_default_user() {
 }
 
 test_machine_run_detached() {
-    $SMOLVM machine stop 2>/dev/null || true
-    $SMOLVM machine delete default -f 2>/dev/null || true
-
     local run_output exit_code=0
-    run_output=$($SMOLVM machine run -d --net --image alpine:latest 2>&1) || exit_code=$?
+    # Use an explicit long-running command so the VM stays up for the ls check.
+    # With no command, alpine's default /bin/sh exits immediately (no TTY),
+    # which is correct exit_on_complete behavior but makes the list check race.
+    run_output=$($SMOLVM machine run -d --net --image alpine:latest -- sleep 30 2>&1) || exit_code=$?
 
     if [[ $exit_code -ne 0 ]]; then
-        $SMOLVM machine stop 2>/dev/null || true
-        $SMOLVM machine delete default -f 2>/dev/null || true
         echo "Setup failed: machine run -d returned $exit_code: $run_output"
         return 1
     fi
 
-    # Should appear in machine ls
+    # Extract the generated vm name from "exec --name <vm_name>" hint in output
+    local vm_name
+    vm_name=$(echo "$run_output" | grep -o 'exec --name [^ ]*' | head -1 | awk '{print $3}')
+    if [[ -z "$vm_name" ]]; then
+        echo "Could not extract vm_name from output: $run_output"
+        return 1
+    fi
+
+    # Should appear in machine ls as running
     local list_output
     list_output=$($SMOLVM machine ls --json 2>&1)
 
-    $SMOLVM machine stop 2>/dev/null || true
-    $SMOLVM machine delete default -f 2>/dev/null || true
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
 
-    [[ "$list_output" == *'"name": "default"'* ]] && \
+    [[ "$list_output" == *"\"name\": \"$vm_name\""* ]] && \
     [[ "$list_output" == *'"state": "running"'* ]]
 }
 
 test_machine_run_detached_with_command() {
-    $SMOLVM machine stop 2>/dev/null || true
-    $SMOLVM machine delete default -f 2>/dev/null || true
-
     local run_output exit_code=0
     run_output=$($SMOLVM machine run -d --net --image alpine:latest -- \
-        sh -c "echo issue198_fixed > /tmp/run-d-cmd-test.txt" 2>&1) || exit_code=$?
+        sh -c "echo issue198_fixed > /tmp/run-d-cmd-test.txt && sleep 30" 2>&1) || exit_code=$?
 
     if [[ $exit_code -ne 0 ]]; then
-        $SMOLVM machine stop 2>/dev/null || true
-        $SMOLVM machine delete default -f 2>/dev/null || true
         echo "Setup failed: machine run -d returned $exit_code: $run_output"
+        return 1
+    fi
+
+    # Extract generated vm name from output hint
+    local vm_name
+    vm_name=$(echo "$run_output" | grep -o 'exec --name [^ ]*' | head -1 | awk '{print $3}')
+    if [[ -z "$vm_name" ]]; then
+        echo "Could not extract vm_name from output: $run_output"
         return 1
     fi
 
     # Poll until the background command has written the file (usually <1s).
     local file_output i=0
     while [[ $i -lt 20 ]]; do
-        file_output=$($SMOLVM machine exec -- cat /tmp/run-d-cmd-test.txt 2>/dev/null) && break
+        file_output=$($SMOLVM machine exec --name "$vm_name" -- cat /tmp/run-d-cmd-test.txt 2>/dev/null) && break
         sleep 0.5
         ((i++)) || true
     done
 
-    $SMOLVM machine stop 2>/dev/null || true
-    $SMOLVM machine delete default -f 2>/dev/null || true
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
 
     if [[ "$file_output" != *"issue198_fixed"* ]]; then
         echo "FAIL: command was not executed by 'machine run -d --image X -- cmd'"
@@ -488,29 +497,38 @@ test_ephemeral_vm_tracking() {
 }
 
 test_ephemeral_shows_in_list_while_running() {
-    # Start a detached ephemeral run and verify it appears in list
-    $SMOLVM machine run --net -d --image alpine -- sleep 30 2>&1 || {
-        echo "Detached run failed"
+    # machine run -d without --name is ephemeral: registered under a generated name,
+    # auto-deleted when the workload exits. Verify it appears in machine ls while running.
+    local run_output
+    run_output=$($SMOLVM machine run --net -d --image alpine -- sleep 30 2>&1) || {
+        echo "Detached run failed: $run_output"
         return 1
     }
 
-    # Poll until the ephemeral VM appears in the list (usually <1s).
+    # Extract generated vm name from output hint
+    local vm_name
+    vm_name=$(echo "$run_output" | grep -o 'exec --name [^ ]*' | head -1 | awk '{print $3}')
+    if [[ -z "$vm_name" ]]; then
+        echo "Could not extract vm_name from output: $run_output"
+        return 1
+    fi
+
+    # Poll until the machine appears in the list as running (usually <1s).
     local list_result i=0
     while [[ $i -lt 20 ]]; do
         list_result=$($SMOLVM machine ls 2>&1)
-        echo "$list_result" | grep -q "eph" && break
+        echo "$list_result" | grep -q "$vm_name.*running" && break
         sleep 0.5
         ((i++)) || true
     done
-    echo "$list_result" | grep -q "eph" || {
-        echo "Detached ephemeral not in list: $list_result"
-        # Clean up any running VMs
-        $SMOLVM machine stop 2>/dev/null || true
+    echo "$list_result" | grep -q "$vm_name.*running" || {
+        echo "Detached run not visible in machine list: $list_result"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
         return 1
     }
 
     # Clean up
-    $SMOLVM machine stop 2>/dev/null || true
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
 }
 
 test_run_no_command_errors() {
@@ -622,7 +640,7 @@ run_test "Machine run: timeout" test_machine_run_timeout || true
 run_test "Machine run: pipeline" test_machine_run_pipeline || true
 run_test "Machine run: cmd not found" test_machine_run_cmd_not_found || true
 run_test "Ephemeral VM: clean exit deregisters" test_ephemeral_vm_tracking || true
-run_test "Ephemeral VM: visible while running" test_ephemeral_shows_in_list_while_running || true
+run_test "Detached run: visible in machine list while running" test_ephemeral_shows_in_list_while_running || true
 run_test "Run with no command errors" test_run_no_command_errors || true
 run_test "Ephemeral run: no state leaks between runs" test_ephemeral_runs_do_not_share_state || true
 run_test "Ephemeral run: volume mount shows correct host contents" test_ephemeral_volume_mount_reflects_host || true
