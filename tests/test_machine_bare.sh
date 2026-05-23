@@ -776,6 +776,29 @@ test_exec_cat_no_interactive() {
 
 run_test "Exec: 'exec -- cat' exits cleanly with null stdin" test_exec_cat_no_interactive || true
 
+test_exec_tty_piped_stdin_terminates() {
+    # `--tty` runs the child on a PTY. A PTY cannot have one direction
+    # closed, so when the feeding pipe (`echo`) closes, end-of-input must
+    # still reach the child. Without EOF propagation a stdin reader (cat)
+    # never terminates and the exec session hangs.
+    "$SMOLVM" machine stop --name "$_EXEC_STDIN_MACHINE" 2>/dev/null || true
+    "$SMOLVM" machine delete "$_EXEC_STDIN_MACHINE" -f 2>/dev/null || true
+    "$SMOLVM" machine create "$_EXEC_STDIN_MACHINE" 2>/dev/null || return 1
+    "$SMOLVM" machine start --name "$_EXEC_STDIN_MACHINE" 2>/dev/null || return 1
+
+    local exit_code=0
+    run_with_timeout 15 sh -c \
+        "echo tty-input | '$SMOLVM' machine exec --name '$_EXEC_STDIN_MACHINE' --tty -i -- cat" \
+        >/dev/null 2>&1 || exit_code=$?
+
+    "$SMOLVM" machine stop --name "$_EXEC_STDIN_MACHINE" 2>/dev/null || true
+    "$SMOLVM" machine delete "$_EXEC_STDIN_MACHINE" -f 2>/dev/null || true
+
+    [[ $exit_code -ne 124 ]] || { echo "FAIL: 'exec --tty -i' with piped stdin timed out (PTY EOF not propagated)"; return 1; }
+}
+
+run_test "Exec: 'exec --tty -i' with piped stdin terminates (PTY EOF)" test_exec_tty_piped_stdin_terminates || true
+
 # =============================================================================
 # Named machine survives observer Drop
 # =============================================================================

@@ -3689,8 +3689,16 @@ fn run_interactive_loop_pty(
 
             match request {
                 AgentRequest::Stdin { data } => {
-                    // For PTY, empty stdin is not EOF (Ctrl+D is a byte).
-                    if !data.is_empty() {
+                    if data.is_empty() {
+                        // Host stdin reached EOF. A PTY cannot have one
+                        // direction closed, so signal end-of-input to the
+                        // child by writing the EOF control character (VEOF,
+                        // Ctrl-D / 0x04). In canonical mode this makes the
+                        // child's next read on the slave return 0. Without
+                        // it, a stdin-reading child (cat, sh, read) never
+                        // terminates and the exec session hangs.
+                        let _ = pty_master.write_all(&[0x04]);
+                    } else {
                         let _ = pty_master.write_all(&data);
                     }
                 }
