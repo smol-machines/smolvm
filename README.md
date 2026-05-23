@@ -28,7 +28,7 @@ curl -sSL https://smolmachines.com/install.sh | bash
 curl -sSL https://smolmachines.com/install.sh | bash && smolvm --help
 ```
 
-Or download from [GitHub Releases](https://github.com/smol-machines/smolvm/releases).
+Or download from [GitHub Releases](https://github.com/smol-machines/smolvm/releases), and place it into `~/.local/share/`.
 
 Quick Start
 -----------
