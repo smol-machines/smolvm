@@ -19,7 +19,9 @@ class Smolvm < Formula
   on_linux do
     # The Linux x86_64 release links against Linuxbrew's libbz2.so.1.0. Without
     # this dep, smolvm-bin fails at startup with "libbz2.so.1.0 => not found"
-    # (reported on Fedora, PR #223).
+    # (reported on Fedora, PR #223). libkrun.so.1 has no RUNPATH set, so
+    # patchelf at install time so it can locate libbz2 from Linuxbrew's lib/.
+    depends_on "patchelf" => :build
     depends_on "bzip2"
   end
 
@@ -28,6 +30,11 @@ class Smolvm < Formula
 
     # The wrapper script in libexec/ resolves symlinks so a bin/ symlink works.
     bin.install_symlink libexec/"smolvm"
+    if OS.linux?
+      system "patchelf",
+             "--set-rpath", "#{libexec}/lib:#{HOMEBREW_PREFIX}/lib",
+             libexec/"lib/libkrun.so.1"
+    end
   end
 
   def caveats
