@@ -7,7 +7,7 @@
 //! For backward compatibility, `SmolvmConfig` maintains an in-memory cache of VMs
 //! and provides the same API as the old confy-based implementation.
 
-use crate::data::network::DEFAULT_DNS;
+use crate::data::network;
 use crate::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
 use crate::db::SmolvmDb;
 use crate::error::Result;
@@ -181,7 +181,7 @@ impl SmolvmConfig {
             version: 1,
             default_cpus: DEFAULT_MICROVM_CPU_COUNT,
             default_mem: DEFAULT_MICROVM_MEMORY_MIB,
-            default_dns: DEFAULT_DNS.to_string(),
+            default_dns: network::default_dns(),
             #[cfg(target_os = "macos")]
             storage_volume: String::new(),
             vms: HashMap::new(),
@@ -215,7 +215,7 @@ impl SmolvmConfig {
         let default_dns = config_map
             .get("default_dns")
             .cloned()
-            .unwrap_or_else(|| DEFAULT_DNS.to_string());
+            .unwrap_or_else(network::default_dns);
 
         #[cfg(target_os = "macos")]
         let storage_volume = config_map

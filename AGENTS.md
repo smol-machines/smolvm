@@ -205,6 +205,31 @@ cpus/mem:   CLI flag > Smolfile > defaults (4 CPU, 8192 MiB)
 - `-p HOST:GUEST` forwards a host port to the VM (TCP)
 - Smolfile: use `[network] allow_hosts` and `[network] allow_cidrs`
 
+### Proxy Support
+
+Pass proxy settings into VMs with `-e` when behind a corporate proxy or VPN:
+
+```bash
+smolvm machine run --net \
+  -e https_proxy=http://proxy.corp:3128 \
+  -e http_proxy=http://proxy.corp:3128 \
+  -e no_proxy=localhost,127.0.0.1 \
+  --image alpine -- wget -q -O /dev/null https://example.com
+```
+
+Or declare them in a Smolfile:
+
+```toml
+net = true
+env = [
+  "https_proxy=http://proxy.corp:3128",
+  "http_proxy=http://proxy.corp:3128",
+  "no_proxy=localhost,127.0.0.1"
+]
+```
+
+Proxy vars are NOT forwarded automatically — each VM gets exactly the env you specify. The VM uses the host's DNS server (from `/etc/resolv.conf`) for name resolution.
+
 ## SSH Agent Forwarding
 
 Forward the host's SSH agent into the VM so git, ssh, and scp work with your keys — without the private keys ever entering the VM.

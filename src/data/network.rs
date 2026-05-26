@@ -1,11 +1,46 @@
 use ipnet::IpNet;
 use std::net::{IpAddr, Ipv4Addr};
 
-/// Default DNS server (Cloudflare) as string.
-pub const DEFAULT_DNS: &str = "1.1.1.1";
+/// Fallback DNS server (Cloudflare) used when the host's resolver cannot be detected.
+pub const FALLBACK_DNS: &str = "1.1.1.1";
 
-/// Default DNS server as `IpAddr`.
-pub const DEFAULT_DNS_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+/// Fallback DNS server as `IpAddr`.
+pub const FALLBACK_DNS_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+
+/// Detect the host's primary DNS server from /etc/resolv.conf.
+/// Falls back to Cloudflare (1.1.1.1) if detection fails.
+pub fn host_dns() -> IpAddr {
+    host_dns_from_resolv("/etc/resolv.conf").unwrap_or(FALLBACK_DNS_ADDR)
+}
+
+/// Parse the first nameserver from a resolv.conf file.
+fn host_dns_from_resolv(path: &str) -> Option<IpAddr> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    for line in contents.lines() {
+        let line = line.trim();
+        if let Some(addr_str) = line.strip_prefix("nameserver") {
+            let addr_str = addr_str.trim();
+            // Skip loopback — it's typically a local resolver (systemd-resolved,
+            // dnsmasq) that isn't reachable from inside the VM.
+            if let Ok(ip) = addr_str.parse::<IpAddr>() {
+                if !ip.is_loopback() {
+                    return Some(ip);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Default DNS as string — prefers host's resolver, falls back to 1.1.1.1.
+pub fn default_dns() -> String {
+    host_dns().to_string()
+}
+
+/// Default DNS as `IpAddr`.
+pub fn default_dns_addr() -> IpAddr {
+    host_dns()
+}
 
 /// TCP port mapping from host to guest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -56,8 +91,9 @@ pub fn ensure_dns_in_cidrs(cidrs: &mut Vec<String>) {
     if cidrs_all_loopback(cidrs) {
         return;
     }
-    if !cidrs_contain_ip(cidrs, DEFAULT_DNS) {
-        cidrs.push(format!("{}/32", DEFAULT_DNS));
+    let dns = default_dns();
+    if !cidrs_contain_ip(cidrs, &dns) {
+        cidrs.push(format!("{}/32", dns));
     }
 }
 
@@ -153,46 +189,53 @@ mod tests {
 
     #[test]
     fn test_ensure_dns_adds_when_missing() {
+        let dns = default_dns();
+        let dns_cidr = format!("{}/32", dns);
         let mut cidrs = vec!["10.0.0.0/8".to_string()];
         ensure_dns_in_cidrs(&mut cidrs);
         assert_eq!(cidrs.len(), 2);
-        assert!(cidrs.contains(&"1.1.1.1/32".to_string()));
+        assert!(cidrs.contains(&dns_cidr));
     }
 
     #[test]
     fn test_ensure_dns_skips_when_covered_by_subnet() {
-        let mut cidrs = vec!["1.0.0.0/8".to_string()];
+        let dns = default_dns_addr();
+        // Use a subnet that covers the detected DNS server
+        let covering_cidr = match dns {
+            IpAddr::V4(v4) => format!("{}.0.0.0/8", v4.octets()[0]),
+            IpAddr::V6(_) => "::0/8".to_string(),
+        };
+        let mut cidrs = vec![covering_cidr];
         ensure_dns_in_cidrs(&mut cidrs);
         assert_eq!(cidrs.len(), 1);
     }
 
     #[test]
     fn test_ensure_dns_skips_when_exact_match() {
-        let mut cidrs = vec!["10.0.0.0/8".to_string(), "1.1.1.1/32".to_string()];
+        let dns_cidr = format!("{}/32", default_dns());
+        let mut cidrs = vec!["10.0.0.0/8".to_string(), dns_cidr];
         ensure_dns_in_cidrs(&mut cidrs);
         assert_eq!(cidrs.len(), 2);
     }
 
     #[test]
     fn test_ensure_dns_skips_for_loopback_only_policy() {
-        // --outbound-localhost-only sets these two CIDRs; DNS server must NOT
-        // be added since it would punch a hole in the user's explicit policy.
         let mut cidrs = vec!["127.0.0.0/8".to_string(), "::1/128".to_string()];
         ensure_dns_in_cidrs(&mut cidrs);
         assert_eq!(
             cidrs.len(),
             2,
-            "1.1.1.1/32 must not be added for loopback-only policy"
+            "DNS must not be added for loopback-only policy"
         );
     }
 
     #[test]
     fn test_ensure_dns_adds_when_non_loopback_cidr_present() {
-        // Mixed policy: loopback + a private range → DNS should still be added.
+        let dns_cidr = format!("{}/32", default_dns());
         let mut cidrs = vec!["127.0.0.0/8".to_string(), "10.0.0.0/8".to_string()];
         ensure_dns_in_cidrs(&mut cidrs);
         assert_eq!(cidrs.len(), 3);
-        assert!(cidrs.contains(&"1.1.1.1/32".to_string()));
+        assert!(cidrs.contains(&dns_cidr));
     }
 
     #[test]
