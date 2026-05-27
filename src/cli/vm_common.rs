@@ -649,6 +649,15 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
         extra_disks: Vec::new(),
     };
 
+    let is_local_image = record.image.as_ref().map_or(false, |img| {
+        img.starts_with("docker:")
+            || img.starts_with("podman:")
+            || img.starts_with("local:")
+            || img.ends_with(".tar")
+            || img.ends_with("Dockerfile")
+            || img.contains("/Dockerfile")
+    });
+
     // If machine was created from .smolmachine, extract layers to cache and
     // mount via virtiofs so the agent uses pre-extracted layers instead of
     // pulling from a registry.
@@ -677,6 +686,15 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
         std::mem::forget(layers_lease);
     }
 
+    let mut resolved_image = record.image.clone();
+    if is_local_image {
+        if let Some(ref img) = record.image {
+            let (layers_dir, resolved_img) = smolvm::local_image::prepare_local_image(img)?;
+            features.packed_layers_dir = Some(layers_dir);
+            resolved_image = Some(resolved_img);
+        }
+    }
+
     let _ = manager
         .ensure_running_with_full_config(mounts, ports, resources, features)
         .map_err(|e| Error::agent("start machine", e.to_string()))?;
@@ -700,7 +718,7 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
     // starts, skip both — image manifests/layers persist on the storage disk
     // and the container overlay is remounted (not recreated).
     if !record.init_completed {
-        let image_info = if record.source_smolmachine.is_some() {
+        let image_info = if record.source_smolmachine.is_some() || is_local_image {
             // Layers already mounted via virtiofs — no pull needed.
             None
         } else if let Some(ref image) = record.image {
@@ -714,7 +732,7 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
             &mut client,
             &record.init,
             InitRunContext {
-                image: record.image.as_deref(),
+                image: resolved_image.as_deref(),
                 image_info: image_info.as_ref(),
                 env: &record.env,
                 workdir: record.workdir.as_deref(),
@@ -742,7 +760,7 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
         );
     }
 
-    if let Some(ref img) = record.image {
+    if let Some(ref img) = resolved_image {
         // Image-based machine: start background CMD if configured.
         let mut cmd = record.entrypoint.clone();
         cmd.extend(record.cmd.clone());
@@ -1711,7 +1729,7 @@ mod init_runner_tests {
             &[],
             "vm",
         );
-        assert_eq!(config.image, "debian:slim");
+        assert_eq!(config.image, "docker.io/library/debian:slim");
         assert_eq!(config.env, env);
         assert_eq!(config.workdir.as_deref(), Some("/work"));
         assert_eq!(config.user.as_deref(), Some("steam"));

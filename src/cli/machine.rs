@@ -548,10 +548,30 @@ impl RunCmd {
             None
         };
 
+        let image = self.image.clone().or(params.image.clone());
+        let is_local_image = image.as_ref().map_or(false, |img| {
+            img.starts_with("docker:")
+                || img.starts_with("podman:")
+                || img.starts_with("local:")
+                || img.ends_with(".tar")
+                || img.ends_with("Dockerfile")
+                || img.contains("/Dockerfile")
+        });
+
+        let mut packed_layers_dir = None;
+        let mut resolved_image = image.clone();
+        if is_local_image {
+            if let Some(ref img) = image {
+                let (layers_dir, resolved_img) = smolvm::local_image::prepare_local_image(img)?;
+                packed_layers_dir = Some(layers_dir);
+                resolved_image = Some(resolved_img);
+            }
+        }
+
         let features = smolvm::agent::LaunchFeatures {
             ssh_agent_socket,
             dns_filter_hosts: params.dns_filter_hosts.clone(),
-            packed_layers_dir: None,
+            packed_layers_dir,
             extra_disks: Vec::new(),
         };
 
@@ -582,25 +602,26 @@ impl RunCmd {
         // exec (which has its own SIGINT handling).
         let sigint_guard = manager.child_pid().map(smolvm::process::SigintGuard::new);
 
-        // Resolve image: CLI > Smolfile > None (bare VM)
-        let image = self.image.clone().or(params.image.clone());
-
         // Pull image if one is specified
-        let image_info = if let Some(ref img) = image {
-            match crate::cli::pull_with_progress(&mut client, img, self.oci_platform.as_deref()) {
-                Ok(info) => Some(info),
-                Err(e) if !params.net => {
-                    // Add a hint when pull fails and networking is disabled —
-                    // this is the most common user error.
-                    return Err(smolvm::Error::agent(
-                        "pull image",
-                        format!(
-                            "{}\n\nHint: networking is disabled. Add --net to enable image pulls:\n  smolvm machine run --net --image {} ...",
-                            e, img
-                        ),
-                    ));
+        let image_info = if let Some(ref img) = resolved_image {
+            if is_local_image {
+                None
+            } else {
+                match crate::cli::pull_with_progress(&mut client, img, self.oci_platform.as_deref()) {
+                    Ok(info) => Some(info),
+                    Err(e) if !params.net => {
+                        // Add a hint when pull fails and networking is disabled —
+                        // this is the most common user error.
+                        return Err(smolvm::Error::agent(
+                            "pull image",
+                            format!(
+                                "{}\n\nHint: networking is disabled. Add --net to enable image pulls:\n  smolvm machine run --net --image {} ...",
+                                e, img
+                            ),
+                        ));
+                    }
+                    Err(e) => return Err(e),
                 }
-                Err(e) => return Err(e),
             }
         } else {
             None
@@ -638,7 +659,7 @@ impl RunCmd {
                 &mut client,
                 &params.init,
                 vm_common::InitRunContext {
-                    image: image.as_deref(),
+                    image: resolved_image.as_deref(),
                     image_info: image_info.as_ref(),
                     env: &init_env,
                     workdir: params.workdir.as_deref(),
@@ -686,7 +707,7 @@ impl RunCmd {
         let mount_bindings = mounts_to_virtiofs_bindings(&mounts);
 
         // Two modes: with image or bare VM (no image)
-        if let Some(ref img) = image {
+        if let Some(ref img) = resolved_image {
             let defaults = vm_common::resolve_image_runtime_defaults(
                 image_info.as_ref(),
                 &env,

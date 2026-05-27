@@ -450,27 +450,60 @@ fn create_packed_image_info(image: &str, packed_dir: &Path) -> Result<ImageInfo>
 
     // Determine architecture from environment or default
     #[cfg(target_arch = "aarch64")]
-    let architecture = "arm64".to_string();
+    let default_architecture = "arm64".to_string();
     #[cfg(target_arch = "x86_64")]
-    let architecture = "amd64".to_string();
+    let default_architecture = "amd64".to_string();
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    let architecture = "unknown".to_string();
+    let default_architecture = "unknown".to_string();
+
+    let mut entrypoint = Vec::new();
+    let mut cmd = Vec::new();
+    let mut env = Vec::new();
+    let mut workdir = None;
+    let mut user = None;
+    let mut created = None;
+    let mut architecture = default_architecture;
+
+    let config_path = packed_dir.join("config.json");
+    if config_path.exists() {
+        if let Ok(config_content) = std::fs::read_to_string(&config_path) {
+            if let Ok(config_json) = serde_json::from_str::<serde_json::Value>(&config_content) {
+                if let Some(arch) = config_json["architecture"].as_str() {
+                    architecture = arch.to_string();
+                }
+                created = config_json["created"].as_str().map(String::from);
+                let oci_config = &config_json["config"];
+                if oci_config.is_object() {
+                    entrypoint = json_string_array(oci_config, "Entrypoint");
+                    cmd = json_string_array(oci_config, "Cmd");
+                    env = json_string_array(oci_config, "Env");
+                    workdir = oci_config["WorkingDir"]
+                        .as_str()
+                        .filter(|s| !s.is_empty())
+                        .map(String::from);
+                    user = oci_config["User"]
+                        .as_str()
+                        .filter(|s| !s.is_empty())
+                        .map(String::from);
+                }
+            }
+        }
+    }
 
     Ok(ImageInfo {
         reference: image.to_string(),
         digest: "packed".to_string(), // No real digest available for packed images
         size: total_size,
-        created: None,
+        created,
         architecture,
         os: "linux".to_string(),
         layer_count: layer_dirs.len(),
         layers: layer_dirs,
-        // Packed mode: config is in the PackManifest, not the image
-        entrypoint: Vec::new(),
-        cmd: Vec::new(),
-        env: Vec::new(),
-        workdir: None,
-        user: None,
+        entrypoint,
+        cmd,
+        env,
+        workdir,
+        user,
     })
 }
 

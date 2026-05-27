@@ -80,6 +80,8 @@ pub mod registry;
 pub mod settings;
 pub mod smolfile;
 pub mod storage;
+/// Local Docker/Podman image and Dockerfile support.
+pub mod local_image;
 pub mod util;
 pub mod vm;
 
