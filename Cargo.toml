@@ -51,6 +51,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 humantime = "2"
 tempfile = "3"
+flate2 = "1.0"
 
 # HTTP API server
 tokio = { version = "1", features = ["full"] }

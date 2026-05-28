@@ -550,12 +550,11 @@ impl RunCmd {
 
         let image = self.image.clone().or(params.image.clone());
         let is_local_image = image.as_ref().map_or(false, |img| {
-            img.starts_with("docker:")
-                || img.starts_with("podman:")
+            img == "-"
                 || img.starts_with("local:")
                 || img.ends_with(".tar")
-                || img.ends_with("Dockerfile")
-                || img.contains("/Dockerfile")
+                || img.ends_with(".tar.gz")
+                || (std::path::Path::new(img).is_dir() && std::path::Path::new(img).join("index.json").exists())
         });
 
         let mut packed_layers_dir = None;

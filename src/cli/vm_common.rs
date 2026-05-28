@@ -650,12 +650,11 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
     };
 
     let is_local_image = record.image.as_ref().map_or(false, |img| {
-        img.starts_with("docker:")
-            || img.starts_with("podman:")
+        img == "-"
             || img.starts_with("local:")
             || img.ends_with(".tar")
-            || img.ends_with("Dockerfile")
-            || img.contains("/Dockerfile")
+            || img.ends_with(".tar.gz")
+            || (std::path::Path::new(img).is_dir() && std::path::Path::new(img).join("index.json").exists())
     });
 
     // If machine was created from .smolmachine, extract layers to cache and

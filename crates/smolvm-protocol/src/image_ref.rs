@@ -37,19 +37,13 @@
 ///            "ghcr.io/owner/repo:v1");
 /// ```
 pub fn normalize_image_ref(image: &str) -> String {
-    let is_local = image.starts_with("docker:")
-        || image.starts_with("podman:")
+    let is_local = image == "-"
         || image.starts_with("local:")
         || image.ends_with(".tar")
-        || image.ends_with("Dockerfile")
-        || image.contains("/Dockerfile");
+        || image.ends_with(".tar.gz")
+        || (std::path::Path::new(image).is_dir() && std::path::Path::new(image).join("index.json").exists());
 
     if is_local {
-        if (image.starts_with("docker:") || image.starts_with("podman:") || image.starts_with("local:"))
-            && (!image.contains(':') || image.find(':') == image.rfind(':'))
-        {
-            return format!("{}:latest", image);
-        }
         return image.to_string();
     }
 
@@ -145,19 +139,12 @@ mod tests {
             ("ghcr.io/owner/repo:v1", "ghcr.io/owner/repo:v1"),
             // Port in registry — colon-detection must not confuse port with tag.
             ("localhost:5000/myimage:dev", "localhost:5000/myimage:dev"),
-            // Local images (docker, podman, local)
-            ("docker:busybox", "docker:busybox:latest"),
-            ("docker:busybox:v1.0", "docker:busybox:v1.0"),
-            ("podman:ubuntu", "podman:ubuntu:latest"),
-            ("podman:ubuntu:22.04", "podman:ubuntu:22.04"),
-            ("local:alpine", "local:alpine:latest"),
-            ("local:alpine:3.18", "local:alpine:3.18"),
-            // Local files/paths (.tar, Dockerfiles)
+            // Local images (stdin, local prefix, and tarballs)
+            ("-", "-"),
+            ("local:stdin-12345", "local:stdin-12345"),
             ("./my-image.tar", "./my-image.tar"),
             ("/absolute/path/to/image.tar", "/absolute/path/to/image.tar"),
-            ("./Dockerfile", "./Dockerfile"),
-            ("/home/user/project/Dockerfile", "/home/user/project/Dockerfile"),
-            ("./src/Dockerfile", "./src/Dockerfile"),
+            ("./my-image.tar.gz", "./my-image.tar.gz"),
         ];
 
         for (input, expected) in cases {
