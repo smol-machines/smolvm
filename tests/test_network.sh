@@ -251,6 +251,86 @@ test_machine_dns_filter_blocks_resolution() {
     [[ $exit_code_allowed -eq 0 ]] && [[ $exit_code_blocked -ne 0 ]]
 }
 
+# Helper: send a raw TCP DNS query to 127.0.0.1:53 inside a running VM and
+# return the RCODE (0–15) from the response, or 255 on error.
+#
+# Usage: dns_tcp_rcode <vm_name> <printf_query_string>
+#
+# The query string must be a printf-compatible byte sequence including the
+# 2-byte big-endian length prefix followed by the raw DNS query bytes.
+# Response RCODE lives in the lower nibble of byte 5 of the TCP stream
+# (= 2-byte length prefix + 3 DNS header bytes: ID×2, flags-byte-0).
+_dns_tcp_rcode() {
+    local vm_name="$1"
+    local query_printf="$2"
+
+    local resp_file
+    resp_file=$(mktemp)
+
+    $SMOLVM machine exec --name "$vm_name" -- sh -c \
+        "printf '$query_printf' | nc -w 2 127.0.0.1 53" \
+        >"$resp_file" 2>/dev/null || true
+
+    local rcode=255
+    if [[ -s "$resp_file" ]]; then
+        local hex
+        hex=$(dd if="$resp_file" bs=1 skip=5 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n')
+        [[ -n "$hex" ]] && rcode=$(( 16#${hex} & 0x0F ))
+    fi
+
+    rm -f "$resp_file"
+    echo "$rcode"
+}
+
+test_dns_filter_tcp_allowed() {
+    local vm_name="dns-tcp-allowed-$$"
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+
+    $SMOLVM machine create "$vm_name" --allow-host one.one.one.one 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 \
+        || { $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+
+    # Minimal A query for "one.one.one.one" (33 DNS bytes = 0x21).
+    # TCP DNS framing: 2-byte BE length prefix + raw DNS query.
+    # Header: ID=0x1234, RD=1, QDCOUNT=1. Name: \x03one×4 + \x00.
+    # Host filter allows one.one.one.one → should return RCODE=0 (NOERROR).
+    local rcode
+    rcode=$(_dns_tcp_rcode "$vm_name" \
+        '\x00\x21\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03one\x03one\x03one\x03one\x00\x00\x01\x00\x01')
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    ensure_data_dir_deleted "$vm_name"
+
+    [[ "$rcode" -eq 0 ]] || { echo "FAIL: expected RCODE=0 (NOERROR), got RCODE=$rcode"; return 1; }
+}
+
+test_dns_filter_tcp_blocked() {
+    local vm_name="dns-tcp-blocked-$$"
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+
+    $SMOLVM machine create "$vm_name" --allow-host one.one.one.one 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 \
+        || { $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+
+    # A query for "attacker.invalid" (34 DNS bytes = 0x22).
+    # Name: \x08attacker (9 bytes) + \x07invalid (8 bytes) + \x00 (1 byte) = 18 bytes.
+    # Not in the allowlist → host filter returns NXDOMAIN → RCODE=3.
+    local rcode
+    rcode=$(_dns_tcp_rcode "$vm_name" \
+        '\x00\x22\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x08attacker\x07invalid\x00\x00\x01\x00\x01')
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    ensure_data_dir_deleted "$vm_name"
+
+    [[ "$rcode" -eq 3 ]] || { echo "FAIL: expected RCODE=3 (NXDOMAIN), got RCODE=$rcode"; return 1; }
+}
+
 test_machine_allow_host_persists_across_restart() {
     local vm_name="dns-persist-test-$$"
 
@@ -474,6 +554,8 @@ run_test "Egress: allow-host blocks non-matching traffic" test_machine_egress_al
 run_test "Egress: invalid hostname rejected at create" test_machine_egress_allow_host_invalid_rejected || true
 run_test "Egress: host:port syntax rejected" test_machine_egress_allow_host_port_rejected || true
 run_test "DNS filter: blocks resolution of non-allowed domains" test_machine_dns_filter_blocks_resolution || true
+run_test "DNS filter: TCP/53 allowed domain returns NOERROR" test_dns_filter_tcp_allowed || true
+run_test "DNS filter: TCP/53 blocked domain returns NXDOMAIN" test_dns_filter_tcp_blocked || true
 run_test "DNS filter: allow-host persists across restart" test_machine_allow_host_persists_across_restart || true
 run_test "Smolfile: allow_hosts basic egress permitted/blocked" test_smolfile_allow_hosts_egress_basic || true
 run_test "Smolfile: allow_hosts re-resolves stale CIDRs on start (issue #124)" test_smolfile_allow_hosts_stale_cidr_regression || true

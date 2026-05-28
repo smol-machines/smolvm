@@ -91,9 +91,9 @@ pub fn ensure_dns_in_cidrs(cidrs: &mut Vec<String>) {
     if cidrs_all_loopback(cidrs) {
         return;
     }
-    let dns = default_dns();
-    if !cidrs_contain_ip(cidrs, &dns) {
-        cidrs.push(format!("{}/32", dns));
+    let dns = host_dns();
+    if !cidrs_contain_ip(cidrs, &dns.to_string()) {
+        cidrs.push(IpNet::from(dns).to_string());
     }
 }
 
@@ -189,8 +189,7 @@ mod tests {
 
     #[test]
     fn test_ensure_dns_adds_when_missing() {
-        let dns = default_dns();
-        let dns_cidr = format!("{}/32", dns);
+        let dns_cidr = IpNet::from(host_dns()).to_string();
         let mut cidrs = vec!["10.0.0.0/8".to_string()];
         ensure_dns_in_cidrs(&mut cidrs);
         assert_eq!(cidrs.len(), 2);
@@ -199,11 +198,15 @@ mod tests {
 
     #[test]
     fn test_ensure_dns_skips_when_covered_by_subnet() {
-        let dns = default_dns_addr();
-        // Use a subnet that covers the detected DNS server
+        // Build a subnet that actually covers the detected DNS server.
+        let dns = host_dns();
         let covering_cidr = match dns {
             IpAddr::V4(v4) => format!("{}.0.0.0/8", v4.octets()[0]),
-            IpAddr::V6(_) => "::0/8".to_string(),
+            IpAddr::V6(v6) => {
+                // Use a /16 covering the detected IPv6 address.
+                let segs = v6.segments();
+                format!("{:x}::/16", segs[0])
+            }
         };
         let mut cidrs = vec![covering_cidr];
         ensure_dns_in_cidrs(&mut cidrs);
@@ -212,7 +215,7 @@ mod tests {
 
     #[test]
     fn test_ensure_dns_skips_when_exact_match() {
-        let dns_cidr = format!("{}/32", default_dns());
+        let dns_cidr = IpNet::from(host_dns()).to_string();
         let mut cidrs = vec!["10.0.0.0/8".to_string(), dns_cidr];
         ensure_dns_in_cidrs(&mut cidrs);
         assert_eq!(cidrs.len(), 2);
@@ -231,7 +234,7 @@ mod tests {
 
     #[test]
     fn test_ensure_dns_adds_when_non_loopback_cidr_present() {
-        let dns_cidr = format!("{}/32", default_dns());
+        let dns_cidr = IpNet::from(host_dns()).to_string();
         let mut cidrs = vec!["127.0.0.0/8".to_string(), "10.0.0.0/8".to_string()];
         ensure_dns_in_cidrs(&mut cidrs);
         assert_eq!(cidrs.len(), 3);

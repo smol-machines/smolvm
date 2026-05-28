@@ -1,28 +1,42 @@
 //! Guest-side DNS filtering proxy.
 //!
-//! Listens on `127.0.0.1:53` inside the VM and forwards raw DNS packets
-//! to the host via vsock for filtering. The host decides whether to resolve
-//! the query (domain is in the allowlist) or return NXDOMAIN.
+//! Listens on `127.0.0.1:53` (both UDP and TCP) inside the VM and forwards
+//! raw DNS packets to the host via vsock for filtering. The host decides
+//! whether to resolve the query (domain is in the allowlist) or return
+//! NXDOMAIN.
 //!
-//! This is a dumb UDP-over-vsock bridge — no DNS parsing happens in the
-//! agent. The host does all filtering, keeping the agent binary small.
+//! This is a dumb bridge — no DNS parsing happens in the agent. The host
+//! does all filtering, keeping the agent binary small.
+//!
+//! TCP/53 is required for:
+//! - Responses that exceed 512 bytes (TC bit set in the UDP reply)
+//! - Clients that prefer TCP (Go's `net` resolver, some systemd-resolved configs)
 //!
 //! Framing over the vsock stream (stream-oriented, so we need packet
 //! boundaries):
 //!   [2-byte BE length] [raw DNS packet bytes]
 //!
-//! The host responds with the same framing.
+//! The host responds with the same framing. This matches the standard TCP DNS
+//! wire format (RFC 1035 §4.2.2) exactly, so no extra wrapping is needed for
+//! the TCP path.
 
 use smolvm_protocol::guest_env;
 use smolvm_protocol::ports;
 use std::io::{self, Read, Write};
-use std::net::UdpSocket;
+use std::net::{TcpListener, UdpSocket};
 use std::thread;
 
-/// Maximum DNS packet size (standard UDP DNS limit).
-const MAX_DNS_PACKET: usize = 512;
+/// Maximum DNS packet size over UDP (RFC 1035 §2.3.4).
+const MAX_DNS_UDP_PACKET: usize = 512;
 
-/// Start the guest-side DNS proxy in a background thread.
+/// Maximum DNS response size over TCP (2-byte length field limit).
+const MAX_DNS_TCP_PACKET: usize = 65535;
+
+/// Start the guest-side DNS proxy in background threads.
+///
+/// Spawns one thread for UDP/53 and one for TCP/53. Both reuse the same
+/// `forward_to_host` path — the vsock channel framing is identical for both
+/// protocols since TCP DNS already uses 2-byte length prefixes.
 ///
 /// Rewrites `/etc/resolv.conf` to point to localhost so all DNS queries
 /// from guest applications go through this proxy.
@@ -34,10 +48,19 @@ pub fn start() {
     }
 
     thread::Builder::new()
-        .name("dns-proxy".into())
+        .name("dns-proxy-udp".into())
         .spawn(|| {
-            if let Err(e) = run_proxy() {
-                tracing::warn!(error = %e, "guest DNS proxy stopped");
+            if let Err(e) = run_udp_proxy() {
+                tracing::warn!(error = %e, "guest UDP DNS proxy stopped");
+            }
+        })
+        .ok();
+
+    thread::Builder::new()
+        .name("dns-proxy-tcp".into())
+        .spawn(|| {
+            if let Err(e) = run_tcp_proxy() {
+                tracing::warn!(error = %e, "guest TCP DNS proxy stopped");
             }
         })
         .ok();
@@ -49,11 +72,11 @@ pub fn is_enabled() -> bool {
     std::env::var(guest_env::DNS_FILTER).as_deref() == Ok("1")
 }
 
-fn run_proxy() -> io::Result<()> {
+fn run_udp_proxy() -> io::Result<()> {
     let udp = UdpSocket::bind("127.0.0.1:53")?;
-    tracing::info!("guest DNS proxy listening on 127.0.0.1:53");
+    tracing::info!("guest DNS proxy listening on UDP 127.0.0.1:53");
 
-    let mut buf = [0u8; MAX_DNS_PACKET];
+    let mut buf = [0u8; MAX_DNS_UDP_PACKET];
 
     loop {
         let (len, src_addr) = udp.recv_from(&mut buf)?;
@@ -61,10 +84,6 @@ fn run_proxy() -> io::Result<()> {
             continue;
         }
 
-        // Open a vsock connection to the host DNS filter for each query.
-        // DNS queries are infrequent (~1-10/sec during package install),
-        // so per-query connections are acceptable. A connection pool can
-        // be added later if this becomes a bottleneck.
         let response = match forward_to_host(&buf[..len]) {
             Ok(resp) => resp,
             Err(e) => {
@@ -79,7 +98,67 @@ fn run_proxy() -> io::Result<()> {
     }
 }
 
+fn run_tcp_proxy() -> io::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:53")?;
+    tracing::info!("guest DNS proxy listening on TCP 127.0.0.1:53");
+
+    for stream in listener.incoming() {
+        match stream {
+            Ok(mut stream) => {
+                thread::spawn(move || {
+                    if let Err(e) = handle_tcp_connection(&mut stream) {
+                        tracing::debug!(error = %e, "TCP DNS connection error");
+                    }
+                });
+            }
+            Err(e) => tracing::debug!(error = %e, "TCP DNS accept error"),
+        }
+    }
+    Ok(())
+}
+
+/// Handle a single TCP DNS connection.
+///
+/// RFC 1035 §4.2.2 allows multiple queries on a single TCP connection
+/// (pipelining). Each query is length-prefixed with a 2-byte BE value,
+/// matching our vsock framing exactly — `forward_to_host` is used unchanged.
+fn handle_tcp_connection(stream: &mut (impl Read + Write)) -> io::Result<()> {
+    loop {
+        let mut len_buf = [0u8; 2];
+        match stream.read_exact(&mut len_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e),
+        }
+        let query_len = u16::from_be_bytes(len_buf) as usize;
+        if query_len == 0 {
+            break;
+        }
+
+        let mut query = vec![0u8; query_len];
+        stream.read_exact(&mut query)?;
+
+        let response = match forward_to_host(&query) {
+            Ok(resp) => resp,
+            Err(e) => {
+                tracing::debug!(error = %e, "DNS forward to host failed, returning SERVFAIL");
+                build_servfail(&query)
+            }
+        };
+
+        let resp_len = response.len() as u16;
+        stream.write_all(&resp_len.to_be_bytes())?;
+        stream.write_all(&response)?;
+        stream.flush()?;
+    }
+    Ok(())
+}
+
 /// Forward a raw DNS packet to the host via vsock and return the response.
+///
+/// One vsock connection per query. The host may return a response larger than
+/// 512 bytes if it performed a TCP retry on the guest's behalf (TC-bit path),
+/// so the cap is the protocol maximum (65535) for both UDP and TCP callers.
 fn forward_to_host(query: &[u8]) -> io::Result<Vec<u8>> {
     let mut stream = super::vsock::connect(ports::DNS_FILTER)?;
 
@@ -94,7 +173,7 @@ fn forward_to_host(query: &[u8]) -> io::Result<Vec<u8>> {
     stream.read_exact(&mut len_buf)?;
     let resp_len = u16::from_be_bytes(len_buf) as usize;
 
-    if resp_len > MAX_DNS_PACKET {
+    if resp_len > MAX_DNS_TCP_PACKET {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("DNS response too large: {resp_len}"),

@@ -27,14 +27,26 @@ pub fn load(path: &Path) -> crate::Result<Smolfile> {
 // Network helpers (smolvm-specific, depend on ipnet and std::net)
 // ============================================================================
 
-/// Resolve a hostname to IP addresses and return as /32 CIDRs.
+/// Resolve a hostname or IP address to CIDRs suitable for TSI egress policy.
 ///
-/// Resolution happens on the host at VM start time. Rejects hostnames with
-/// `:port` suffixes — port filtering is not supported by the TSI egress policy.
+/// IPv4 addresses become `/32` CIDRs; IPv6 addresses become `/128` CIDRs.
+/// Hostnames are resolved via the host DNS at VM start time and each result
+/// address is formatted with the correct prefix length.
+///
+/// Rejects `host:port` syntax — port filtering is not supported by the TSI
+/// egress policy (all ports to a resolved IP are implicitly allowed).
 pub fn resolve_host_to_cidrs(host: &str) -> Result<Vec<String>, String> {
+    use ipnet::IpNet;
     use std::net::{IpAddr, ToSocketAddrs};
 
-    // Reject host:port syntax
+    // Try parsing as a bare IP first — must come before the ':' check so that
+    // IPv6 addresses like "::1" or "2001:db8::1" (which contain ':') are
+    // handled correctly rather than being rejected as host:port syntax.
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(vec![IpNet::from(ip).to_string()]);
+    }
+
+    // Reject host:port syntax (e.g. "example.com:443").
     if host.contains(':') {
         return Err(format!(
             "invalid hostname '{}': port suffixes are not supported. \
@@ -43,18 +55,13 @@ pub fn resolve_host_to_cidrs(host: &str) -> Result<Vec<String>, String> {
         ));
     }
 
-    // Try parsing as bare IP first
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return Ok(vec![format!("{}/32", ip)]);
-    }
-
     // Resolve hostname with a timeout to avoid hanging on slow/unreachable DNS.
     let host_owned = host.to_string();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let result = format!("{}:0", host_owned).to_socket_addrs().map(|addrs| {
             addrs
-                .map(|addr| format!("{}/32", addr.ip()))
+                .map(|addr| IpNet::from(addr.ip()).to_string())
                 .collect::<Vec<_>>()
         });
         let _ = tx.send(result);
@@ -101,14 +108,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolve_host_bare_ip() {
+    fn resolve_host_bare_ipv4() {
         let cidrs = resolve_host_to_cidrs("1.2.3.4").unwrap();
         assert_eq!(cidrs, vec!["1.2.3.4/32"]);
     }
 
     #[test]
+    fn resolve_host_bare_ipv6() {
+        let cidrs = resolve_host_to_cidrs("::1").unwrap();
+        assert_eq!(cidrs, vec!["::1/128"]);
+
+        let cidrs = resolve_host_to_cidrs("2001:db8::1").unwrap();
+        assert_eq!(cidrs, vec!["2001:db8::1/128"]);
+    }
+
+    #[test]
     fn resolve_host_rejects_port_suffix() {
         let err = resolve_host_to_cidrs("example.com:443").unwrap_err();
+        assert!(err.contains("port suffixes are not supported"), "{}", err);
+
+        // Bracketed IPv6 with port must also be rejected.
+        let err = resolve_host_to_cidrs("[::1]:80").unwrap_err();
         assert!(err.contains("port suffixes are not supported"), "{}", err);
     }
 
