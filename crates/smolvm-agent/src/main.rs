@@ -1173,12 +1173,6 @@ fn try_mount_storage_ext4() -> bool {
     }
 }
 
-// looks like try_mount_storage is only used in mount_storage_disk, so we don't need the stub
-// #[cfg(not(target_os = "linux"))]
-// fn try_mount_storage_ext4() -> bool {
-//     false
-// }
-
 /// Mount the storage disk at /storage. Returns true if successfully mounted.
 ///
 /// Three-attempt fallback chain:

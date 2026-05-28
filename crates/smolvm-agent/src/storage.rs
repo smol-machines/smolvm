@@ -965,8 +965,12 @@ where
         return Ok(info);
     }
 
-    if let CacheDecision::Fail(message) = cache_strategy {
-        return Err(StorageError::Internal { message });
+    if let CacheDecision::Fail(_) = cache_strategy {
+        // if querying the cache fails, we try to clean up potentially
+        // malformed metadata before proceeding to pull
+        if let Ok(manifest_path) = image_manifest_path(image) {
+            let _ = std::fs::remove_file(&manifest_path);
+        }
     }
 
     let root = Path::new(STORAGE_ROOT);
