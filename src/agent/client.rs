@@ -4,7 +4,9 @@
 //! and receiving responses.
 
 use crate::error::{Error, Result};
-use crate::registry::{extract_registry, rewrite_image_registry, RegistryAuth, RegistryConfig};
+use crate::registry::{extract_registry, rewrite_image_registry, RegistryAuth};
+use crate::settings::SmolSettings;
+use smolvm_protocol::normalize_image_ref;
 use smolvm_protocol::{
     encode_message, AgentRequest, AgentResponse, Envelope, ImageInfo, OverlayInfo, StorageStatus,
     FILE_TRANSFER_MAX_TOTAL, FILE_WRITE_CHUNK_SIZE, FILE_WRITE_SINGLE_SHOT_MAX, MAX_FRAME_SIZE,
@@ -16,7 +18,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Events from a streaming exec session.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecEvent {
     /// Standard output data.
     Stdout(Vec<u8>),
@@ -113,6 +115,8 @@ pub struct RunConfig {
     pub env: Vec<(String, String)>,
     /// Working directory inside the container.
     pub workdir: Option<String>,
+    /// User to execute as inside the container.
+    pub user: Option<String>,
     /// Volume mounts as (tag, guest_path, read_only) tuples.
     pub mounts: Vec<(String, String, bool)>,
     /// Timeout for command execution.
@@ -126,12 +130,17 @@ pub struct RunConfig {
 
 impl RunConfig {
     /// Create a new run configuration with the given image and command.
+    ///
+    /// The image reference is canonicalized immediately so all downstream
+    /// code (cache keys, logs, protocol messages) sees the same form
+    /// regardless of how the caller spelled it.
     pub fn new(image: impl Into<String>, command: Vec<String>) -> Self {
         Self {
-            image: image.into(),
+            image: normalize_image_ref(&image.into()),
             command,
             env: Vec::new(),
             workdir: None,
+            user: None,
             mounts: Vec::new(),
             timeout: None,
             tty: false,
@@ -148,6 +157,12 @@ impl RunConfig {
     /// Set working directory.
     pub fn with_workdir(mut self, workdir: Option<String>) -> Self {
         self.workdir = workdir;
+        self
+    }
+
+    /// Set container user.
+    pub fn with_user(mut self, user: Option<String>) -> Self {
+        self.user = user;
         self
     }
 
@@ -313,6 +328,21 @@ fn expect_completed(resp: AgentResponse, op: &str) -> Result<(i32, Vec<u8>, Vec<
     }
 }
 
+#[cfg(test)]
+impl AgentClient {
+    /// Build an `AgentClient` from a pre-connected `UnixStream`.
+    ///
+    /// Test-only: production code must go through [`AgentClient::connect`]
+    /// so socket timeouts are configured correctly. Used by the regression
+    /// tests that drive the client against a `UnixStream::pair()`.
+    pub(crate) fn from_stream(stream: UnixStream) -> Self {
+        Self {
+            stream,
+            trace_id: None,
+        }
+    }
+}
+
 impl AgentClient {
     /// Set socket read timeout, returning an error if it fails.
     ///
@@ -358,13 +388,17 @@ impl AgentClient {
             |e| {
                 // Check if this is a transient error worth retrying
                 let error_msg = e.to_string();
-                // Connection refused/reset are transient during VM startup
+                // Connection refused/reset are transient during VM startup.
+                // "No such file or directory" occurs when the vsock socket
+                // file hasn't been created yet by libkrun's muxer thread —
+                // transient under concurrent boot contention.
                 error_msg.contains("Connection refused")
                     || error_msg.contains("connection refused")
                     || error_msg.contains("Connection reset")
                     || error_msg.contains("connection reset")
                     || error_msg.contains("Broken pipe")
                     || error_msg.contains("Resource temporarily unavailable")
+                    || error_msg.contains("No such file or directory")
             },
         )
     }
@@ -502,7 +536,7 @@ impl AgentClient {
     ) -> Result<ImageInfo> {
         // Resolve effective image and auth based on options
         let (effective_image, effective_auth) = if options.use_registry_config {
-            let registry_config = RegistryConfig::load().unwrap_or_default();
+            let registry_config = SmolSettings::load().unwrap_or_default().images;
             let registry = extract_registry(image);
 
             // Get credentials from config if not explicitly provided
@@ -551,6 +585,9 @@ impl AgentClient {
         auth: Option<&RegistryAuth>,
         mut progress: Option<F>,
     ) -> Result<ImageInfo> {
+        let image = normalize_image_ref(image);
+        let image = image.as_str();
+
         // Use a long timeout for pull - large images can take minutes to download/extract.
         // The guard resets the timeout on drop (including error paths).
         self.set_read_timeout(Duration::from_secs(IMAGE_PULL_TIMEOUT_SECS))?;
@@ -661,8 +698,9 @@ impl AgentClient {
     /// # Arguments
     ///
     /// * `dry_run` - If true, only report what would be deleted
-    pub fn garbage_collect(&mut self, dry_run: bool) -> Result<u64> {
-        let resp = self.request(&AgentRequest::GarbageCollect { dry_run })?;
+    /// * `purge_all` - If true, delete all manifests/configs first so all layers are collected
+    pub fn garbage_collect(&mut self, dry_run: bool, purge_all: bool) -> Result<u64> {
+        let resp = self.request(&AgentRequest::GarbageCollect { dry_run, purge_all })?;
 
         match resp {
             AgentResponse::Ok { data: Some(data) } => {
@@ -961,7 +999,9 @@ impl AgentClient {
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(e) => {
-                        tracing::warn!(error = %e, "error reading stdin");
+                        tracing::debug!(error = %e, "stdin read error, treating as EOF");
+                        stdin_eof = true;
+                        self.send(&AgentRequest::Stdin { data: Vec::new() })?;
                     }
                 }
             }
@@ -1012,14 +1052,81 @@ impl AgentClient {
             command: config.command,
             env: config.env,
             workdir: config.workdir,
+            user: config.user,
             mounts: config.mounts,
             timeout_ms,
             interactive: false,
             tty: false,
+            detached: false,
             persistent_overlay_id: config.persistent_overlay_id,
+            background: false,
         })?;
 
         expect_completed(resp, "run command")
+    }
+
+    /// Run a command in an image's rootfs in the background.
+    ///
+    /// Spawns the container and returns immediately with the crun PID.
+    /// stdout/stderr go to /dev/null inside the guest. Use a persistent
+    /// overlay ID so subsequent `exec` sessions see the same filesystem.
+    pub fn run_background(&mut self, config: RunConfig) -> Result<u32> {
+        let resp = self.request(&AgentRequest::Run {
+            image: config.image,
+            command: config.command,
+            env: config.env,
+            workdir: config.workdir,
+            user: config.user,
+            mounts: config.mounts,
+            timeout_ms: None,
+            interactive: false,
+            tty: false,
+            detached: false,
+            persistent_overlay_id: config.persistent_overlay_id,
+            background: true,
+        })?;
+
+        let (exit_code, stdout, _stderr) = expect_completed(resp, "run background")?;
+        if exit_code != 0 {
+            return Err(Error::agent("run background", "spawn failed"));
+        }
+        let pid: u32 = String::from_utf8_lossy(&stdout)
+            .trim()
+            .parse()
+            .map_err(|_| Error::agent("run background", "invalid PID in response"))?;
+        Ok(pid)
+    }
+
+    /// Run a command in an image's rootfs and handle streamed events as they arrive.
+    ///
+    /// Unlike `run_interactive`, this does not forward stdin. It is the
+    /// image-backed counterpart to `vm_exec_streaming_with`.
+    pub fn run_streaming_with<F>(&mut self, config: RunConfig, on_event: F) -> Result<()>
+    where
+        F: FnMut(ExecEvent),
+    {
+        let timeout_ms = config.timeout.map(|t| t.as_millis() as u64);
+
+        self.stream
+            .set_read_timeout(None)
+            .map_err(|e| Error::agent("set read timeout", e.to_string()))?;
+
+        self.send(&AgentRequest::Run {
+            image: config.image,
+            command: config.command,
+            env: config.env,
+            workdir: config.workdir,
+            user: config.user,
+            mounts: config.mounts,
+            timeout_ms,
+            interactive: true,
+            tty: false,
+            detached: false,
+            persistent_overlay_id: config.persistent_overlay_id,
+            background: false,
+        })?;
+
+        collect_exec_events(self, "run streaming", on_event)
     }
 
     /// Run a command interactively with streaming I/O.
@@ -1043,15 +1150,62 @@ impl AgentClient {
                 command: config.command,
                 env: config.env,
                 workdir: config.workdir,
+                user: config.user,
                 mounts: config.mounts,
                 timeout_ms,
                 interactive: true,
                 tty,
+                detached: false,
                 persistent_overlay_id: config.persistent_overlay_id,
+                background: false,
             },
             tty,
             "run interactive",
         )
+    }
+
+    /// Start a container in detached mode and return its container ID.
+    ///
+    /// Sends a `Run { detached: true }` request to the agent, which starts the
+    /// container in the background via `crun run --detach` and immediately
+    /// returns the container ID. Subsequent `machine exec` calls against the
+    /// same `persistent_overlay_id` will join this container's namespaces via
+    /// `crun exec` instead of creating a new isolated container.
+    ///
+    /// Requires `config.persistent_overlay_id` to be set — detached containers
+    /// only make sense when there is a persistent overlay to associate with.
+    pub fn run_container_detached(&mut self, config: RunConfig) -> Result<String> {
+        // Container startup involves overlay setup + crun init which can exceed
+        // the default 30s read timeout on first run (cold overlay, cold image).
+        let _timeout_guard = self.set_extended_read_timeout(Duration::from_secs(120))?;
+
+        let resp = self.request(&AgentRequest::Run {
+            image: config.image,
+            command: config.command,
+            env: config.env,
+            workdir: config.workdir,
+            user: config.user,
+            mounts: config.mounts,
+            timeout_ms: None,
+            interactive: false,
+            tty: false,
+            detached: true,
+            persistent_overlay_id: config.persistent_overlay_id,
+            background: false,
+        })?;
+        let (exit_code, stdout, _) = expect_completed(resp, "run container detached")?;
+        if exit_code != 0 {
+            return Err(Error::agent(
+                "run container detached",
+                format!("agent returned exit code {}", exit_code),
+            ));
+        }
+        String::from_utf8(stdout).map_err(|e| {
+            Error::agent(
+                "run container detached",
+                format!("invalid container ID in response: {}", e),
+            )
+        })
     }
 
     /// Send stdin data to a running interactive command.
@@ -1161,7 +1315,7 @@ impl AgentClient {
         if total_size <= FILE_WRITE_SINGLE_SHOT_MAX as u64 {
             // Small file: read into memory and use single-shot path.
             let mut data = Vec::with_capacity(total_size as usize);
-            std::io::Read::read_to_end(&mut std::io::Read::take(reader, total_size + 1), &mut data)
+            std::io::Read::read_to_end(&mut std::io::Read::take(reader, total_size), &mut data)
                 .map_err(|e| Error::agent("read source file", e.to_string()))?;
             return self.write_file_with_progress(path, &data, mode, on_progress);
         }
@@ -1344,10 +1498,13 @@ impl AgentClient {
 
     /// Execute a command with streaming output.
     ///
+    /// This compatibility wrapper buffers all events before returning. New
+    /// callers that need live output should use `vm_exec_streaming_with`.
+    ///
     /// Sends a VmExec request with interactive=true, tty=false. Reads
-    /// Stdout/Stderr/Exited responses and sends them as `ExecEvent` on
-    /// the returned receiver. Blocks the current thread until the command
-    /// finishes — call from a blocking context (e.g., `spawn_blocking`).
+    /// Stdout/Stderr/Exited responses into a vector and blocks until the
+    /// command finishes — call from a blocking context (e.g.,
+    /// `spawn_blocking`).
     pub fn vm_exec_streaming(
         &mut self,
         command: Vec<String>,
@@ -1355,6 +1512,27 @@ impl AgentClient {
         workdir: Option<String>,
         timeout: Option<Duration>,
     ) -> Result<Vec<ExecEvent>> {
+        let mut events = Vec::new();
+        self.vm_exec_streaming_with(command, env, workdir, timeout, |event| {
+            events.push(event);
+        })?;
+        Ok(events)
+    }
+
+    /// Execute a command with streaming output and handle events as they arrive.
+    ///
+    /// This is the live-output variant of `vm_exec_streaming`.
+    pub fn vm_exec_streaming_with<F>(
+        &mut self,
+        command: Vec<String>,
+        env: Vec<(String, String)>,
+        workdir: Option<String>,
+        timeout: Option<Duration>,
+        on_event: F,
+    ) -> Result<()>
+    where
+        F: FnMut(ExecEvent),
+    {
         let timeout_ms = timeout.map(|t| t.as_millis() as u64);
 
         self.stream
@@ -1371,42 +1549,7 @@ impl AgentClient {
             background: false,
         })?;
 
-        // Wait for Started
-        match self.receive()? {
-            AgentResponse::Started => {}
-            AgentResponse::Error { message, .. } => {
-                return Err(Error::agent("streaming exec", message));
-            }
-            _ => return Err(Error::agent("streaming exec", "expected Started")),
-        }
-
-        let mut events = Vec::new();
-
-        loop {
-            match self.receive() {
-                Ok(AgentResponse::Stdout { data }) => {
-                    events.push(ExecEvent::Stdout(data));
-                }
-                Ok(AgentResponse::Stderr { data }) => {
-                    events.push(ExecEvent::Stderr(data));
-                }
-                Ok(AgentResponse::Exited { exit_code }) => {
-                    events.push(ExecEvent::Exit(exit_code));
-                    break;
-                }
-                Ok(AgentResponse::Error { message, .. }) => {
-                    events.push(ExecEvent::Error(message));
-                    break;
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    events.push(ExecEvent::Error(e.to_string()));
-                    break;
-                }
-            }
-        }
-
-        Ok(events)
+        collect_exec_events(self, "streaming exec", on_event)
     }
 
     /// Low-level send without waiting for response (public).
@@ -1542,6 +1685,44 @@ impl AgentClient {
             .map_err(|e| Error::agent("deserialize response", e.to_string()))?;
         Ok(resp)
     }
+}
+
+fn collect_exec_events<F>(client: &mut AgentClient, op: &str, mut on_event: F) -> Result<()>
+where
+    F: FnMut(ExecEvent),
+{
+    match client.receive()? {
+        AgentResponse::Started => {}
+        AgentResponse::Error { message, .. } => {
+            return Err(Error::agent(op, message));
+        }
+        _ => return Err(Error::agent(op, "expected Started")),
+    }
+
+    loop {
+        match client.receive() {
+            Ok(AgentResponse::Stdout { data }) => {
+                on_event(ExecEvent::Stdout(data));
+            }
+            Ok(AgentResponse::Stderr { data }) => {
+                on_event(ExecEvent::Stderr(data));
+            }
+            Ok(AgentResponse::Exited { exit_code }) => {
+                on_event(ExecEvent::Exit(exit_code));
+                break;
+            }
+            Ok(AgentResponse::Error { message, .. }) => {
+                on_event(ExecEvent::Error(message));
+                break;
+            }
+            Ok(_) => {}
+            Err(err) => {
+                on_event(ExecEvent::Error(err.to_string()));
+                break;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Consume streamed `DataChunk` responses, enforcing the per-transfer
@@ -1719,5 +1900,230 @@ mod read_cap_tests {
     fn read_cap_rejects_unexpected_response_type() {
         let err = drive(vec![AgentResponse::Pong { version: 1 }]).unwrap_err();
         assert!(format!("{}", err).contains("unexpected response"));
+    }
+}
+
+#[cfg(test)]
+mod run_background_tests {
+    //! Regression test for image-backed `machine run -d`.
+    //!
+    //! The original bug: the CLI's image + `--detach` path pulled the image
+    //! and persisted the VM record but silently dropped the command. The
+    //! fix wires in `AgentClient::run_background`, which must send a
+    //! `Run { background: true }` over the wire and parse the returned PID.
+    //!
+    //! If this test fails, the detach path either lost its `background`
+    //! plumbing or stopped parsing the PID response — either way, the
+    //! original "command never runs" regression is back.
+    use super::*;
+    use smolvm_protocol::{encode_message, AgentRequest, AgentResponse, Envelope};
+    use std::io::{Read, Write};
+    use std::thread;
+
+    #[test]
+    fn run_background_sends_background_true_and_returns_pid() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+
+        // Fake agent: read one request, assert it's a background Run, respond
+        // with a Completed PID. Mirrors what the real agent does in
+        // `handle_run_background`.
+        let server = thread::spawn(move || {
+            let mut len_buf = [0u8; 4];
+            server_stream.read_exact(&mut len_buf).unwrap();
+            let len = u32::from_be_bytes(len_buf) as usize;
+
+            let mut payload = vec![0u8; len];
+            server_stream.read_exact(&mut payload).unwrap();
+
+            let envelope: Envelope<AgentRequest> =
+                serde_json::from_slice(&payload).expect("valid Envelope<AgentRequest>");
+
+            match envelope.body {
+                AgentRequest::Run {
+                    image,
+                    command,
+                    persistent_overlay_id,
+                    background,
+                    interactive,
+                    tty,
+                    ..
+                } => {
+                    assert!(
+                        background,
+                        "run_background must send background: true — the image+detach CLI path \
+                         depends on this field to dispatch the command inside the container"
+                    );
+                    assert!(!interactive, "background runs are never interactive");
+                    assert!(!tty, "background runs never allocate a TTY");
+                    assert_eq!(image, "docker.io/library/alpine:3.19");
+                    assert_eq!(command, vec!["sh", "-c", "echo hi"]);
+                    assert_eq!(
+                        persistent_overlay_id,
+                        Some("default".to_string()),
+                        "background runs must use a persistent overlay so subsequent execs \
+                         see the same filesystem"
+                    );
+                }
+                other => panic!("expected AgentRequest::Run, got {:?}", other),
+            }
+
+            let resp = AgentResponse::Completed {
+                exit_code: 0,
+                stdout: b"12345".to_vec(),
+                stderr: Vec::new(),
+            };
+            let encoded = encode_message(&resp).expect("encode response");
+            server_stream.write_all(&encoded).expect("write response");
+        });
+
+        let mut client = AgentClient::from_stream(client_stream);
+        let config = RunConfig::new(
+            "alpine:3.19",
+            vec!["sh".to_string(), "-c".to_string(), "echo hi".to_string()],
+        )
+        .with_persistent_overlay(Some("default".to_string()));
+
+        let pid = client
+            .run_background(config)
+            .expect("run_background should succeed on a Completed response");
+
+        assert_eq!(pid, 12345, "client must parse the PID from stdout");
+        server.join().expect("server thread joined cleanly");
+    }
+
+    #[test]
+    fn run_background_rejects_nonzero_exit_code() {
+        // If the agent fails to spawn the container, it returns a non-zero
+        // exit_code. The client must turn that into an error rather than
+        // silently returning a bogus PID.
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+
+        let server = thread::spawn(move || {
+            let mut len_buf = [0u8; 4];
+            server_stream.read_exact(&mut len_buf).unwrap();
+            let len = u32::from_be_bytes(len_buf) as usize;
+            let mut payload = vec![0u8; len];
+            server_stream.read_exact(&mut payload).unwrap();
+
+            let resp = AgentResponse::Completed {
+                exit_code: 1,
+                stdout: Vec::new(),
+                stderr: b"spawn failed".to_vec(),
+            };
+            let encoded = encode_message(&resp).unwrap();
+            server_stream.write_all(&encoded).unwrap();
+        });
+
+        let mut client = AgentClient::from_stream(client_stream);
+        let config = RunConfig::new("alpine:3.19", vec!["true".to_string()])
+            .with_persistent_overlay(Some("default".to_string()));
+
+        let err = client
+            .run_background(config)
+            .expect_err("non-zero exit must surface as an error");
+        assert!(
+            format!("{}", err).contains("spawn failed")
+                || format!("{}", err).contains("run background"),
+            "unexpected error: {}",
+            err
+        );
+        server.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod run_streaming_tests {
+    //! Regression coverage for image-backed streaming exec.
+    //!
+    //! `machine exec --stream` must preserve the same execution target as
+    //! buffered `machine exec`. For image-backed machines that means sending a
+    //! `Run { interactive: true }` request to the agent, not `VmExec` against
+    //! the bare agent rootfs.
+    use super::*;
+    use smolvm_protocol::{encode_message, AgentRequest, AgentResponse, Envelope};
+    use std::io::{Read, Write};
+    use std::thread;
+
+    #[test]
+    fn run_streaming_sends_interactive_run_and_collects_events() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+
+        let server = thread::spawn(move || {
+            let mut len_buf = [0u8; 4];
+            server_stream.read_exact(&mut len_buf).unwrap();
+            let len = u32::from_be_bytes(len_buf) as usize;
+            let mut payload = vec![0u8; len];
+            server_stream.read_exact(&mut payload).unwrap();
+
+            let envelope: Envelope<AgentRequest> =
+                serde_json::from_slice(&payload).expect("valid Envelope<AgentRequest>");
+            match envelope.body {
+                AgentRequest::Run {
+                    image,
+                    command,
+                    mounts,
+                    interactive,
+                    tty,
+                    detached,
+                    background,
+                    persistent_overlay_id,
+                    ..
+                } => {
+                    assert_eq!(image, "docker.io/library/ubuntu:24.04");
+                    assert_eq!(command, vec!["/bin/bash", "-lc", "echo hi"]);
+                    assert_eq!(
+                        mounts,
+                        vec![("work".to_string(), "/work".to_string(), false)]
+                    );
+                    assert!(interactive, "streaming image exec must use interactive Run");
+                    assert!(!tty, "plain --stream must not allocate a TTY");
+                    assert!(!detached, "streaming exec must not detach");
+                    assert!(!background, "streaming exec must not run in background");
+                    assert_eq!(persistent_overlay_id, Some("dev".to_string()));
+                }
+                other => panic!("expected AgentRequest::Run, got {:?}", other),
+            }
+
+            for response in [
+                AgentResponse::Started,
+                AgentResponse::Stdout {
+                    data: b"hi\n".to_vec(),
+                },
+                AgentResponse::Stderr {
+                    data: b"warn\n".to_vec(),
+                },
+                AgentResponse::Exited { exit_code: 7 },
+            ] {
+                let encoded = encode_message(&response).expect("encode response");
+                server_stream.write_all(&encoded).expect("write response");
+            }
+        });
+
+        let mut client = AgentClient::from_stream(client_stream);
+        let config = RunConfig::new(
+            "ubuntu:24.04",
+            vec![
+                "/bin/bash".to_string(),
+                "-lc".to_string(),
+                "echo hi".to_string(),
+            ],
+        )
+        .with_mounts(vec![("work".to_string(), "/work".to_string(), false)])
+        .with_persistent_overlay(Some("dev".to_string()));
+
+        let mut events = Vec::new();
+        client
+            .run_streaming_with(config, |event| events.push(event))
+            .expect("run_streaming_with should handle streamed events");
+
+        assert_eq!(
+            events,
+            vec![
+                ExecEvent::Stdout(b"hi\n".to_vec()),
+                ExecEvent::Stderr(b"warn\n".to_vec()),
+                ExecEvent::Exit(7),
+            ]
+        );
+        server.join().expect("server thread joined cleanly");
     }
 }

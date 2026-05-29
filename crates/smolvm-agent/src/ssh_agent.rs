@@ -64,11 +64,17 @@ fn inject_into_container_if(spec: &mut crate::oci::OciSpec, enabled: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::oci::OciSpec;
+    use crate::oci::{OciSpec, ProcessIdentity};
 
     #[test]
     fn inject_is_noop_when_disabled() {
-        let mut spec = OciSpec::new(&["true".to_string()], &[], "/", false);
+        let mut spec = OciSpec::new(
+            &["true".to_string()],
+            &[],
+            "/",
+            false,
+            &ProcessIdentity::root(),
+        );
         let mounts_before = spec.mounts.len();
         let envs_before = spec.process.env.len();
 
@@ -85,7 +91,13 @@ mod tests {
 
     #[test]
     fn inject_adds_env_and_mount_when_enabled() {
-        let mut spec = OciSpec::new(&["true".to_string()], &[], "/", false);
+        let mut spec = OciSpec::new(
+            &["true".to_string()],
+            &[],
+            "/",
+            false,
+            &ProcessIdentity::root(),
+        );
 
         inject_into_container_if(&mut spec, true);
 
@@ -114,7 +126,13 @@ mod tests {
         // Simulates an image whose config already exports a stale
         // SSH_AUTH_SOCK: we must replace it, not duplicate it — two entries
         // for the same key leaves the effective value shell-dependent.
-        let mut spec = OciSpec::new(&["true".to_string()], &[], "/", false);
+        let mut spec = OciSpec::new(
+            &["true".to_string()],
+            &[],
+            "/",
+            false,
+            &ProcessIdentity::root(),
+        );
         spec.process
             .env
             .push("SSH_AUTH_SOCK=/stale/path".to_string());
@@ -269,7 +287,6 @@ struct VsockStream {
 #[cfg(target_os = "linux")]
 impl std::os::unix::io::AsRawFd for VsockStream {
     fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
-        use std::os::fd::AsRawFd;
         self.fd.as_raw_fd()
     }
 }

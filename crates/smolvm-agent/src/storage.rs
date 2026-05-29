@@ -12,8 +12,8 @@ use crate::crun::CrunCommand;
 use crate::oci::{generate_container_id, OciSpec};
 use crate::paths;
 use crate::process::{WaitResult, TIMEOUT_EXIT_CODE};
-use smolvm_network::guest_env;
-use smolvm_protocol::{ImageInfo, OverlayInfo, RegistryAuth, StorageStatus};
+use smolvm_protocol::guest_env;
+use smolvm_protocol::{normalize_image_ref, ImageInfo, OverlayInfo, RegistryAuth, StorageStatus};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
@@ -28,6 +28,8 @@ const CONFIGS_DIR: &str = "configs";
 const MANIFESTS_DIR: &str = "manifests";
 const OVERLAYS_DIR: &str = "overlays";
 const WORKSPACE_DIR: &str = "workspace";
+const DOCKER_HUB_AUTH_CONFIG_KEY: &str = "https://index.docker.io/v1/";
+const DOCKER_HUB_REGISTRY_ALIASES: &[&str] = &["docker.io", "index.docker.io"];
 
 fn validate_storage_id(value: &str, context: &str) -> Result<()> {
     if value.is_empty() {
@@ -41,6 +43,13 @@ fn validate_storage_id(value: &str, context: &str) -> Result<()> {
         return Err(StorageError::ValidationFailed {
             context: context.to_string(),
             reason: "too long (max 128 chars)".to_string(),
+        });
+    }
+
+    if value.contains('/') || value.contains('\\') {
+        return Err(StorageError::ValidationFailed {
+            context: context.to_string(),
+            reason: "path separators are not allowed".to_string(),
         });
     }
 
@@ -145,9 +154,11 @@ fn ensure_mount_target_under_root(rootfs: &Path, container_path: &str) -> Result
     })?;
 
     let relative = validate_container_destination_path(container_path)?;
+    let components: Vec<_> = relative.components().collect();
+    let last_idx = components.len().saturating_sub(1);
     let mut current = root_canon.clone();
 
-    for component in relative.components() {
+    for (idx, component) in components.into_iter().enumerate() {
         let std::path::Component::Normal(seg) = component else {
             return Err(StorageError::ValidationFailed {
                 context: "mount destination".to_string(),
@@ -169,9 +180,31 @@ fn ensure_mount_target_under_root(rootfs: &Path, container_path: &str) -> Result
                             reason: "resolved path escapes rootfs".to_string(),
                         });
                     }
-                }
-
-                if !meta.is_dir() {
+                    if idx == last_idx {
+                        // The mount target itself is a symlink within the rootfs.
+                        // Previous VM runs can leave such symlinks (e.g. /workspace →
+                        // /storage/workspace) in the writable agent rootfs. Replace it
+                        // with a real directory so the bind mount claims the path
+                        // directly rather than following through to the symlink target.
+                        std::fs::remove_file(&current).map_err(|e| StorageError::ReadFile {
+                            path: current.display().to_string(),
+                            cause: format!("failed to remove symlink at mount target: {}", e),
+                        })?;
+                        std::fs::create_dir(&current).map_err(|err| StorageError::CreateDir {
+                            path: current.display().to_string(),
+                            cause: err.to_string(),
+                        })?;
+                    } else if !current.is_dir() {
+                        // Intermediate symlink must resolve to a directory.
+                        return Err(StorageError::ValidationFailed {
+                            context: "mount destination".to_string(),
+                            reason: format!(
+                                "destination component is not a directory: {}",
+                                current.display()
+                            ),
+                        });
+                    }
+                } else if !meta.is_dir() {
                     return Err(StorageError::ValidationFailed {
                         context: "mount destination".to_string(),
                         reason: format!(
@@ -246,39 +279,46 @@ pub fn init_packed_layers() -> Option<PathBuf> {
     }
 
     // Mount virtiofs using direct syscall (avoids ~3-5ms fork+exec overhead)
-    let src = std::ffi::CString::new(tag).ok()?;
-    let dst = std::ffi::CString::new(mount_point.to_str()?).ok()?;
-    let fstype = std::ffi::CString::new("virtiofs").unwrap();
-    // SAFETY: mount virtiofs with valid CString arguments
-    let rc = unsafe {
-        libc::mount(
-            src.as_ptr(),
-            dst.as_ptr(),
-            fstype.as_ptr(),
-            0,
-            std::ptr::null(),
-        )
-    };
+    #[cfg(target_os = "linux")]
+    {
+        let src = std::ffi::CString::new(tag).ok()?;
+        let dst = std::ffi::CString::new(mount_point.to_str()?).ok()?;
+        let fstype = std::ffi::CString::new("virtiofs").unwrap();
+        // SAFETY: mount virtiofs with valid CString arguments
+        let rc = unsafe {
+            libc::mount(
+                src.as_ptr(),
+                dst.as_ptr(),
+                fstype.as_ptr(),
+                0,
+                std::ptr::null(),
+            )
+        };
 
-    if rc != 0 {
-        let err = std::io::Error::last_os_error();
-        warn!(error = %err, tag = %tag, "failed to mount packed layers virtiofs");
-        return None;
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            warn!(error = %err, tag = %tag, "failed to mount packed layers virtiofs");
+            return None;
+        }
+        info!(mount_point = %mount_point.display(), "packed layers mounted successfully");
+
+        // List contents for debugging (only at debug level to avoid boot overhead)
+        if let Ok(entries) = std::fs::read_dir(&mount_point) {
+            let layer_dirs: Vec<_> = entries
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_dir())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect();
+            debug!(layer_count = layer_dirs.len(), layers = ?layer_dirs, "packed layers available");
+        }
+
+        Some(mount_point)
     }
-
-    info!(mount_point = %mount_point.display(), "packed layers mounted successfully");
-
-    // List contents for debugging (only at debug level to avoid boot overhead)
-    if let Ok(entries) = std::fs::read_dir(&mount_point) {
-        let layer_dirs: Vec<_> = entries
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().is_dir())
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .collect();
-        debug!(layer_count = layer_dirs.len(), layers = ?layer_dirs, "packed layers available");
+    #[cfg(not(target_os = "linux"))]
+    {
+        warn!("packed layers mount not supported on non-Linux");
+        None
     }
-
-    Some(mount_point)
 }
 
 /// Get the packed layers directory if available.
@@ -347,6 +387,32 @@ pub fn init_volume_mounts() -> &'static [(String, String, bool)] {
     })
 }
 
+/// Add the /storage/workspace → /workspace fallback bind mount to an OCI spec,
+/// unless a user-provided volume already claims /workspace.
+///
+/// The fallback exposes the storage disk's workspace directory inside containers
+/// so that persistent files written to /workspace survive across VM restarts.
+/// It must be skipped when the user provides `-v host:/workspace` to avoid
+/// silently overwriting their virtiofs mount (which comes earlier in the spec).
+///
+/// Mount target comparison is slash-normalized to handle trailing slashes.
+pub fn add_workspace_fallback(spec: &mut OciSpec, mounts: &[(String, String, bool)]) {
+    let workspace_src = Path::new(STORAGE_ROOT).join(WORKSPACE_DIR);
+    if !workspace_src.exists() {
+        return;
+    }
+    let user_owns_workspace = mounts
+        .iter()
+        .any(|(_, path, _)| path.trim_end_matches('/') == paths::WORKSPACE_GUEST_PATH);
+    if !user_owns_workspace {
+        spec.add_bind_mount(
+            &workspace_src.to_string_lossy(),
+            paths::WORKSPACE_GUEST_PATH,
+            false,
+        );
+    }
+}
+
 /// Create a synthetic ImageInfo from packed layers.
 /// This is used when running from a packed binary where layers are pre-extracted.
 fn create_packed_image_info(image: &str, packed_dir: &Path) -> Result<ImageInfo> {
@@ -404,6 +470,7 @@ fn create_packed_image_info(image: &str, packed_dir: &Path) -> Result<ImageInfo>
         cmd: Vec::new(),
         env: Vec::new(),
         workdir: None,
+        user: None,
     })
 }
 
@@ -918,6 +985,10 @@ where
         }
     })?;
 
+    // Canonicalize so all equivalent refs share the same on-disk cache key.
+    let image = normalize_image_ref(image);
+    let image = image.as_str();
+
     // If packed layers are available, return synthetic image info
     if let Some(packed_dir) = get_packed_layers_dir() {
         info!(image = %image, "using packed layers, skipping network pull");
@@ -1099,7 +1170,7 @@ where
             .ok_or_else(|| StorageError::new("failed to capture crane stdout".to_string()))?;
 
         let mut tar_cmd = Command::new("tar");
-        tar_cmd.args(["--no-same-owner", "-xzf", "-", "-C"]);
+        tar_cmd.args(["-xzf", "-", "-C"]);
         tar_cmd.arg(&layer_dir);
         tar_cmd.stdin(crane_stdout);
         tar_cmd.stdout(Stdio::null());
@@ -1168,12 +1239,16 @@ where
     let os = config_json["os"].as_str().unwrap_or("linux").to_string();
     let created = config_json["created"].as_str().map(String::from);
 
-    // Extract OCI config fields (Entrypoint, Cmd, Env, WorkingDir)
+    // Extract OCI config fields (Entrypoint, Cmd, Env, WorkingDir, User)
     let oci_config = &config_json["config"];
     let entrypoint = json_string_array(oci_config, "Entrypoint");
     let cmd = json_string_array(oci_config, "Cmd");
     let env = json_string_array(oci_config, "Env");
     let workdir = oci_config["WorkingDir"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let user = oci_config["User"]
         .as_str()
         .filter(|s| !s.is_empty())
         .map(String::from);
@@ -1191,11 +1266,14 @@ where
         cmd,
         env,
         workdir,
+        user,
     })
 }
 
 /// Query if an image exists locally.
 pub fn query_image(image: &str) -> Result<Option<ImageInfo>> {
+    let image = normalize_image_ref(image);
+    let image = image.as_str();
     let root = Path::new(STORAGE_ROOT);
     let manifest_path = root
         .join(MANIFESTS_DIR)
@@ -1270,6 +1348,10 @@ pub fn query_image(image: &str) -> Result<Option<ImageInfo>> {
         .as_str()
         .filter(|s| !s.is_empty())
         .map(String::from);
+    let user = oci_config["User"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(String::from);
 
     Ok(Some(ImageInfo {
         reference: image.to_string(),
@@ -1284,6 +1366,7 @@ pub fn query_image(image: &str) -> Result<Option<ImageInfo>> {
         cmd,
         env,
         workdir,
+        user,
     }))
 }
 
@@ -1457,6 +1540,24 @@ pub fn get_layer_digest(image_digest: &str, layer_index: usize) -> Result<String
         "layer {} not found for image {}",
         layer_index, image_digest
     )))
+}
+
+/// Remove all image manifests and configs, making all layers unreferenced.
+///
+/// Call this before `garbage_collect()` to implement `prune --all`.
+pub fn purge_all_images() -> Result<()> {
+    let root = Path::new(STORAGE_ROOT);
+    let manifests_dir = root.join(MANIFESTS_DIR);
+    let configs_dir = root.join(CONFIGS_DIR);
+
+    if manifests_dir.exists() {
+        std::fs::remove_dir_all(&manifests_dir)?;
+    }
+    if configs_dir.exists() {
+        std::fs::remove_dir_all(&configs_dir)?;
+    }
+
+    Ok(())
 }
 
 /// Run garbage collection.
@@ -1841,8 +1942,10 @@ fn prepare_overlay_from_packed(
         .map(|path| path.display().to_string())
         .collect();
 
-    // Use shared overlay setup logic
-    OverlaySetup::new(workload_id)?.execute(lowerdirs)
+    // Use shared overlay setup logic — execute_or_remount preserves the
+    // upper layer from a previous session (e.g., packages installed via exec)
+    // instead of recreating the overlay from scratch.
+    OverlaySetup::new(workload_id)?.execute_or_remount(lowerdirs)
 }
 
 /// Build lowerdir list from a pulled OCI image's layers.
@@ -2009,6 +2112,7 @@ pub fn run_command(
     command: &[String],
     env: &[(String, String)],
     workdir: Option<&str>,
+    user: Option<&str>,
     mounts: &[(String, String, bool)],
     timeout_ms: Option<u64>,
     persistent_overlay_id: Option<&str>,
@@ -2037,7 +2141,10 @@ pub fn run_command(
 
         // Create OCI spec
         let workdir_str = workdir.unwrap_or("/");
-        let mut spec = OciSpec::new(command, env, workdir_str, false);
+        let identity = crate::oci::resolve_process_identity(Path::new(&prepared.rootfs_path), user)
+            .map_err(StorageError::new)?;
+        let mut spec = OciSpec::new(command, env, workdir_str, false, &identity);
+        spec.add_gpu_devices_if_available();
 
         // Add virtiofs bind mounts to OCI spec
         for (tag, container_path, read_only) in mounts {
@@ -2049,11 +2156,7 @@ pub fn run_command(
             );
         }
 
-        // Shared workspace: /storage/workspace → /workspace inside container
-        let workspace_src = Path::new(STORAGE_ROOT).join(WORKSPACE_DIR);
-        if workspace_src.exists() {
-            spec.add_bind_mount(&workspace_src.to_string_lossy(), "/workspace", false);
-        }
+        add_workspace_fallback(&mut spec, mounts);
 
         // Forward SSH agent into the container if enabled at boot.
         crate::ssh_agent::inject_into_container(&mut spec);
@@ -2061,6 +2164,14 @@ pub fn run_command(
         // Write config.json to bundle
         spec.write_to(&bundle_path)
             .map_err(|e| StorageError::new(format!("failed to write OCI spec: {}", e)))?;
+
+        // If a main workload container is running for this overlay, join it
+        // via crun exec instead of creating a fresh isolated container.
+        if let Some(cid) = crate::resolve_main_container(persistent_overlay_id) {
+            let result = run_exec_in_container(&cid, command, env, workdir, timeout_ms, client_fd);
+            let _ = mounted_paths;
+            return result;
+        }
 
         // Generate unique container ID for this execution
         let container_id = generate_container_id();
@@ -2080,6 +2191,85 @@ pub fn run_command(
         let _ = cleanup_overlay(&prepared.workload_id);
     }
     result
+}
+
+/// Spawn a command in an image's overlay rootfs and return the crun PID.
+///
+/// Unlike `run_command`, this does not wait for the container to exit. The
+/// container runs detached under crun with stdout/stderr redirected to
+/// /dev/null; the returned PID is the crun process, which stays alive as
+/// long as the container init runs.
+///
+/// Requires a persistent overlay ID — ephemeral overlays would leak their
+/// upper/work/merged directories because nothing is waiting to clean them
+/// up after the container exits.
+pub fn spawn_in_overlay(
+    image: &str,
+    command: &[String],
+    env: &[(String, String)],
+    workdir: Option<&str>,
+    user: Option<&str>,
+    mounts: &[(String, String, bool)],
+    persistent_overlay_id: &str,
+) -> Result<u32> {
+    crate::oci::validate_image_reference(image).map_err(StorageError::new)?;
+    crate::oci::validate_env_vars(env).map_err(StorageError::new)?;
+
+    let prepared = prepare_for_run_persistent(image, persistent_overlay_id)?;
+    debug!(rootfs = %prepared.rootfs_path, "using persistent overlay for background command");
+
+    let mounted_paths = setup_volume_mounts(&prepared.rootfs_path, mounts)?;
+
+    let overlay_root = Path::new(STORAGE_ROOT)
+        .join(OVERLAYS_DIR)
+        .join(&prepared.workload_id);
+    let bundle_path = overlay_root.join("bundle");
+
+    let workdir_str = workdir.unwrap_or("/");
+    let identity = crate::oci::resolve_process_identity(Path::new(&prepared.rootfs_path), user)
+        .map_err(StorageError::new)?;
+    let mut spec = OciSpec::new(command, env, workdir_str, false, &identity);
+
+    for (tag, container_path, read_only) in mounts {
+        let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
+        spec.add_bind_mount(
+            &virtiofs_mount.to_string_lossy(),
+            container_path,
+            *read_only,
+        );
+    }
+
+    add_workspace_fallback(&mut spec, mounts);
+
+    crate::ssh_agent::inject_into_container(&mut spec);
+    spec.add_gpu_devices_if_available();
+
+    spec.write_to(&bundle_path)
+        .map_err(|e| StorageError::new(format!("failed to write OCI spec: {}", e)))?;
+
+    let container_id = generate_container_id();
+
+    let child = CrunCommand::run(&bundle_path, &container_id)
+        .stdin_null()
+        .discard_output()
+        .spawn()
+        .map_err(|e| {
+            StorageError::new(format!(
+                "failed to spawn crun: {}. Is crun installed at {}?",
+                e,
+                paths::CRUN_PATH
+            ))
+        })?;
+
+    let pid = child.id();
+    // Don't wait on the child; it reaps itself when the container exits.
+    // reap_background_children() in the agent's accept loop collects the
+    // eventual zombie.
+    std::mem::forget(child);
+
+    let _ = mounted_paths; // suppress unused warning; mounts persist with the overlay
+    info!(container_id = %container_id, pid = pid, "background container started");
+    Ok(pid)
 }
 
 /// Prepare for running a command - returns the rootfs path.
@@ -2126,6 +2316,7 @@ pub fn setup_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Result<(
 }
 
 /// Setup volume mounts by mounting virtiofs and bind-mounting into the rootfs.
+#[cfg(target_os = "linux")]
 fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Result<Vec<PathBuf>> {
     let mut mounted_paths = Vec::new();
     let rootfs_path = Path::new(rootfs);
@@ -2232,7 +2423,12 @@ fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Resul
     Ok(mounted_paths)
 }
 
-/// Check if a path is a mountpoint.
+/// Stub for non-Linux platforms.
+#[cfg(not(target_os = "linux"))]
+fn setup_volume_mounts(_rootfs: &str, _mounts: &[(String, String, bool)]) -> Result<Vec<PathBuf>> {
+    Ok(Vec::new())
+}
+
 /// Check if a path is a mountpoint (delegates to paths::is_mount_point).
 fn is_mountpoint(path: &Path) -> bool {
     paths::is_mount_point(path)
@@ -2242,6 +2438,65 @@ fn is_mountpoint(path: &Path) -> bool {
 ///
 /// This uses `crun run` which creates, starts, waits, and deletes the container
 /// in a single operation. Stdout and stderr are captured.
+/// Join a running container via `crun exec` (non-interactive).
+fn run_exec_in_container(
+    container_id: &str,
+    command: &[String],
+    env: &[(String, String)],
+    workdir: Option<&str>,
+    timeout_ms: Option<u64>,
+    client_fd: Option<std::os::unix::io::RawFd>,
+) -> Result<RunResult> {
+    info!(container_id = %container_id, command = ?command, "joining container via crun exec");
+
+    let mut child = CrunCommand::exec(container_id, env, command, workdir, false)
+        .stdin_null()
+        .capture_output()
+        .spawn()
+        .map_err(|e| StorageError::new(format!("crun exec failed: {}", e)))?;
+
+    // On timeout/disconnect, kill only the exec'd process — NOT the main
+    // container. The main container hosts the shared namespace for all execs;
+    // a timed-out `exec -- sleep 10` must not destroy the workload.
+    let exec_pid = child.id();
+    let result = crate::process::wait_with_timeout_cleanup_and_liveness(
+        &mut child,
+        timeout_ms,
+        client_fd,
+        || unsafe {
+            libc::kill(exec_pid as libc::pid_t, libc::SIGKILL);
+        },
+    )?;
+
+    match result {
+        WaitResult::Completed { exit_code, output } => Ok(RunResult {
+            exit_code,
+            stdout: output.stdout,
+            stderr: output.stderr,
+        }),
+        WaitResult::TimedOut { output, timeout_ms } => {
+            let mut stderr = output.stderr;
+            stderr.extend_from_slice(
+                format!("\ncommand timed out after {}ms", timeout_ms).as_bytes(),
+            );
+            Ok(RunResult {
+                exit_code: 124,
+                stdout: output.stdout,
+                stderr,
+            })
+        }
+        WaitResult::ClientDisconnected { output } => {
+            let mut stderr = output.stderr;
+            stderr.extend_from_slice(b"\nclient disconnected");
+            Ok(RunResult {
+                exit_code: 137,
+                stdout: output.stdout,
+                stderr,
+            })
+        }
+    }
+}
+
 fn run_with_crun(
     bundle_dir: &Path,
     container_id: &str,
@@ -2526,11 +2781,19 @@ fn extract_registry_from_image(image: &str) -> String {
     if let Some(slash_pos) = image.find('/') {
         let potential_registry = &image[..slash_pos];
         if potential_registry.contains('.') || potential_registry.contains(':') {
-            return potential_registry.to_string();
+            return docker_config_registry_key(potential_registry).to_string();
         }
     }
     // Docker Hub uses this URL in config.json
-    "https://index.docker.io/v1/".to_string()
+    DOCKER_HUB_AUTH_CONFIG_KEY.to_string()
+}
+
+fn docker_config_registry_key(registry: &str) -> &str {
+    if DOCKER_HUB_REGISTRY_ALIASES.contains(&registry) {
+        DOCKER_HUB_AUTH_CONFIG_KEY
+    } else {
+        registry
+    }
 }
 
 /// Simple base64 encoding for auth string.
@@ -2691,10 +2954,37 @@ fn sanitize_image_name(image: &str) -> String {
     image.replace(['/', ':', '@'], "_")
 }
 
-/// Reverse sanitization.
+/// Reverse sanitization of a canonical image filename back to an image reference.
+///
+/// Because we now always store under the canonical form the mapping is
+/// deterministic:
+/// - The last `_`-delimited segment is the tag (or digest hex), except when
+///   the penultimate segment is `sha256`, in which case `sha256_<hex>` is the
+///   digest.
+/// - Everything else is the `registry/path` portion, with `_` reversed to `/`.
+///
+/// The result is passed to `query_image`, which normalizes it before
+/// computing the cache key.
 fn unsanitize_image_name(name: &str) -> String {
-    // This is approximate - we lose some info
-    name.replacen('_', "/", 1).replacen('_', ":", 1)
+    let parts: Vec<&str> = name.split('_').collect();
+    if parts.len() < 2 {
+        return name.to_string();
+    }
+
+    // Detect sha256 digest: penultimate segment is "sha256", last is 64 hex chars.
+    let n = parts.len();
+    if n >= 2
+        && parts[n - 2] == "sha256"
+        && parts[n - 1].len() == 64
+        && parts[n - 1].chars().all(|c| c.is_ascii_hexdigit())
+    {
+        let name_part = parts[..n - 2].join("/");
+        return format!("{name_part}@sha256:{}", parts[n - 1]);
+    }
+
+    // Normal case: last segment is the tag.
+    let name_part = parts[..n - 1].join("/");
+    format!("{name_part}:{}", parts[n - 1])
 }
 
 /// Get disk usage for a path.
@@ -2817,7 +3107,11 @@ mod tests {
 
     #[test]
     fn test_sanitize_image_name() {
-        assert_eq!(sanitize_image_name("alpine:latest"), "alpine_latest");
+        // sanitize_image_name operates on already-canonical refs
+        assert_eq!(
+            sanitize_image_name("docker.io/library/alpine:latest"),
+            "docker.io_library_alpine_latest"
+        );
         assert_eq!(
             sanitize_image_name("docker.io/library/alpine:3.18"),
             "docker.io_library_alpine_3.18"
@@ -2825,6 +3119,57 @@ mod tests {
         assert_eq!(
             sanitize_image_name("ghcr.io/owner/repo@sha256:abc123"),
             "ghcr.io_owner_repo_sha256_abc123"
+        );
+    }
+
+    #[test]
+    fn test_unsanitize_image_name() {
+        // Normal tag case
+        assert_eq!(
+            unsanitize_image_name("docker.io_library_alpine_3.20"),
+            "docker.io/library/alpine:3.20"
+        );
+        assert_eq!(
+            unsanitize_image_name("ghcr.io_owner_repo_v1"),
+            "ghcr.io/owner/repo:v1"
+        );
+        // Digest case
+        let hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            unsanitize_image_name(&format!("docker.io_library_alpine_sha256_{hex}")),
+            format!("docker.io/library/alpine@sha256:{hex}")
+        );
+    }
+
+    #[test]
+    fn test_extract_registry_from_image_normalizes_docker_hub() {
+        assert_eq!(
+            extract_registry_from_image("alpine:latest"),
+            DOCKER_HUB_AUTH_CONFIG_KEY
+        );
+        assert_eq!(
+            extract_registry_from_image("library/alpine:latest"),
+            DOCKER_HUB_AUTH_CONFIG_KEY
+        );
+        assert_eq!(
+            extract_registry_from_image("docker.io/nginxinc/nginx-unprivileged:stable-alpine"),
+            DOCKER_HUB_AUTH_CONFIG_KEY
+        );
+        assert_eq!(
+            extract_registry_from_image("index.docker.io/library/alpine:latest"),
+            DOCKER_HUB_AUTH_CONFIG_KEY
+        );
+    }
+
+    #[test]
+    fn test_extract_registry_from_image_preserves_non_docker_hub_registry() {
+        assert_eq!(
+            extract_registry_from_image("ghcr.io/owner/repo:tag"),
+            "ghcr.io"
+        );
+        assert_eq!(
+            extract_registry_from_image("registry.example.com:5000/image:tag"),
+            "registry.example.com:5000"
         );
     }
 
@@ -2900,5 +3245,37 @@ mod tests {
 
         symlink(outside.path(), rootfs.join("link-out")).unwrap();
         assert!(ensure_mount_target_under_root(&rootfs, "/link-out/dir").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_ensure_mount_target_under_root_replaces_intra_rootfs_symlink_with_dir() {
+        use std::os::unix::fs::symlink;
+
+        // Simulates the agent-rootfs having a pre-baked /workspace symlink from
+        // a previous VM run (via virtiofs write-through). The function must
+        // replace it with a real directory so the bind mount can claim the path.
+        let root = tempfile::tempdir().unwrap();
+        let rootfs = root.path().join("rootfs");
+        let target_dir = rootfs.join("storage").join("workspace");
+        std::fs::create_dir_all(&target_dir).unwrap();
+
+        // /workspace → /storage/workspace (relative to rootfs) — symlink within rootfs
+        let workspace_link = rootfs.join("workspace");
+        symlink(&target_dir, &workspace_link).unwrap();
+        assert!(workspace_link.is_symlink());
+
+        let result = ensure_mount_target_under_root(&rootfs, "/workspace");
+        assert!(result.is_ok(), "expected Ok, got {:?}", result);
+
+        // The symlink must have been replaced with a real directory.
+        assert!(
+            !workspace_link.is_symlink(),
+            "/workspace should no longer be a symlink"
+        );
+        assert!(
+            workspace_link.is_dir(),
+            "/workspace should now be a directory"
+        );
     }
 }

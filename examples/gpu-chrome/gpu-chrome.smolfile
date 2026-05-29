@@ -1,0 +1,38 @@
+# Headless Chrome with GPU acceleration in a hardware-isolated microVM
+#
+# Runs Chromium with Vulkan rendering via virtio-gpu. Useful for
+# Playwright, Puppeteer, or any headless browser workload that needs
+# a real GPU (WebGL, Canvas, CSS transforms, screenshots).
+#
+# ── Quick start ──────────────────────────────────────────────────────
+#
+#   smolvm machine run -it --gpu -s examples/gpu-chrome/gpu-chrome.smolfile
+#
+# ── Verify GPU works ─────────────────────────────────────────────────
+#
+#   smolvm machine run --gpu -s examples/gpu-chrome/gpu-chrome.smolfile \
+#     -- vulkaninfo --summary
+#
+# ── Host requirements (macOS) ────────────────────────────────────────
+#
+#   brew install slp/krun/virglrenderer slp/krun/molten-vk
+#
+#   Then rebuild libkrun with GPU support:
+#     cd libkrun && make BLK=1 NET=1 GPU=1 TIMESYNC=1
+#
+# ─────────────────────────────────────────────────────────────────────
+
+image = "fedora:42"
+entrypoint = ["sh", "-c"]
+cmd = ["echo 'GPU VM ready — use exec to run commands'"]
+
+cpus = 4
+memory = 4096
+net = true
+gpu = true
+
+[dev]
+init = [
+    "dnf copr enable -y slp/mesa-libkrun-vulkan",
+    "dnf install -y --allowerasing mesa-vulkan-drivers vulkan-tools chromium",
+]

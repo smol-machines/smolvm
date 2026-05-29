@@ -100,6 +100,54 @@ fi
 ]
 
 # =============================================================================
+# libkrun Tasks
+# =============================================================================
+
+[tasks.build-libkrunfw]
+description = "Build libkrunfw guest kernel and update lib/ (slow: downloads and compiles Linux 6.x)"
+category = "Build"
+script_runner = "bash"
+script = [
+'''
+set -e
+ARCH=$(uname -m)
+FULL_VERSION=$(grep '^FULL_VERSION' libkrunfw/Makefile | cut -d= -f2 | tr -d ' ')
+KERNEL_SRC=$(grep '^KERNEL_VERSION' libkrunfw/Makefile | cut -d= -f2 | tr -d ' ')
+
+# If the kernel source tree already exists, update its .config and force
+# kernel.c to regenerate — otherwise make skips both steps.
+if [ -d "libkrunfw/${KERNEL_SRC}" ]; then
+  cp libkrunfw/config-libkrunfw_x86_64 libkrunfw/${KERNEL_SRC}/.config
+  make -C libkrunfw/${KERNEL_SRC} olddefconfig
+  rm -f libkrunfw/kernel.c
+fi
+
+make -C libkrunfw
+mkdir -p lib/linux-${ARCH}
+cp libkrunfw/libkrunfw.so.${FULL_VERSION} lib/linux-${ARCH}/libkrunfw.so.${FULL_VERSION}
+cd lib/linux-${ARCH}
+ln -sf libkrunfw.so.${FULL_VERSION} libkrunfw.so.5
+ln -sf libkrunfw.so.5 libkrunfw.so
+echo "✓ libkrunfw ${FULL_VERSION} built and installed to lib/linux-${ARCH}/"
+'''
+]
+
+[tasks.build-libkrun]
+description = "Build libkrun with BLK and GPU support and copy into lib/ (run build-libkrunfw first if kernel config changed)"
+category = "Build"
+script_runner = "bash"
+script = [
+'''
+set -e
+ARCH=$(uname -m)
+make -C libkrun BLK=1 GPU=1
+mkdir -p lib/linux-${ARCH}
+cp libkrun/target/release/libkrun.so lib/linux-${ARCH}/libkrun.so
+echo "✓ libkrun built and copied to lib/linux-${ARCH}/libkrun.so"
+'''
+]
+
+# =============================================================================
 # Distribution Tasks
 # =============================================================================
 
@@ -143,13 +191,13 @@ script = [
 # =============================================================================
 
 [tasks.test]
-description = "Run all tests, including cargo tests"
+description = "Run all feature suites (11 groups, ~10 min)"
 category = "Test"
 dependencies = ["test-lib"]
 script_runner = "bash"
 script = [
 '''
-./tests/run_all.sh
+./tests/run_tests.sh
 '''
 ]
 
@@ -159,27 +207,7 @@ category = "Test"
 script_runner = "bash"
 script = [
 '''
-./tests/run_all.sh cli
-'''
-]
-
-[tasks.test-sandbox]
-description = "Run sandbox tests only"
-category = "Test"
-script_runner = "bash"
-script = [
-'''
-./tests/run_all.sh sandbox
-'''
-]
-
-[tasks.test-microvm]
-description = "Run microVM tests only"
-category = "Test"
-script_runner = "bash"
-script = [
-'''
-./tests/run_all.sh microvm
+./tests/run_tests.sh cli
 '''
 ]
 
@@ -189,7 +217,7 @@ category = "Test"
 script_runner = "bash"
 script = [
 '''
-./tests/run_all.sh pack
+./tests/run_tests.sh pack
 '''
 ]
 

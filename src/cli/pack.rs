@@ -14,6 +14,7 @@ use smolvm::data::resources::DEFAULT_MICROVM_CPU_COUNT;
 /// Default memory for packed VMs. Same as machine create — memory is elastic
 /// via virtio balloon, so the host only commits what the guest actually uses.
 pub(crate) const PACK_DEFAULT_MEMORY_MIB: u32 = 8192;
+use sha2::{Digest, Sha256};
 use smolvm::config::{RecordState, SmolvmConfig};
 use smolvm::platform::{Arch, Os, Platform, VmExecutor};
 use smolvm::Error;
@@ -139,6 +140,14 @@ pub struct PackCreateCmd {
     /// Load workload configuration from a Smolfile (TOML)
     #[arg(long = "smolfile", visible_short_alias = 's', value_name = "PATH")]
     pub smolfile: Option<PathBuf>,
+
+    /// Enable GPU acceleration (Vulkan via virtio-gpu) in the packed VM
+    ///
+    /// The packed binary will launch with a virtio-gpu device. The guest image
+    /// must include a compatible Vulkan ICD (e.g., Mesa Venus on Fedora via
+    /// the slp/mesa-libkrun-vulkan COPR, or standard Mesa on Linux hosts).
+    #[arg(long)]
+    pub gpu: bool,
 }
 
 impl PackCreateCmd {
@@ -158,6 +167,7 @@ impl PackCreateCmd {
             self.cpus,
             self.mem,
             self.oci_platform.clone(),
+            self.gpu,
             self.smolfile.clone(),
         )?;
 
@@ -251,8 +261,10 @@ impl PackCreateCmd {
                 memory_mib: 8192,
                 network: true,
                 network_backend: None,
+                gpu: false,
                 storage_gib: None,
                 overlay_gib: None,
+                gpu_vram_mib: None,
                 allowed_cidrs: None,
             },
         )?;
@@ -371,7 +383,10 @@ impl PackCreateCmd {
             // never holds the full tar in memory).
             print!("  Exporting merged layer...");
             let _ = std::io::Write::flush(&mut std::io::stdout());
-            let merged_digest = format!("sha256:merged-{}", &image_info.digest[..16]);
+            let merged_hash = hex::encode(Sha256::digest(
+                format!("merged-{}", image_info.digest).as_bytes(),
+            ));
+            let merged_digest = format!("sha256:{}", merged_hash);
             let merged_file = collector.layer_staging_path(&merged_digest);
 
             let total_bytes = client
@@ -397,6 +412,7 @@ impl PackCreateCmd {
         manifest.cpus = pack_config.cpus;
         manifest.mem = pack_config.mem;
         manifest.network = pack_config.net.unwrap_or(false);
+        manifest.gpu = pack_config.gpu;
 
         // Start with OCI image config as baseline
         manifest.entrypoint = image_info.entrypoint.clone();
@@ -516,6 +532,8 @@ impl PackCreateCmd {
                     memory_mib: 8192,
                     network: true,
                     network_backend: None,
+                    gpu: false,
+                    gpu_vram_mib: None,
                     storage_gib: None,
                     overlay_gib: None,
                     allowed_cidrs: None,
@@ -586,7 +604,9 @@ impl PackCreateCmd {
                 let overlay_dir =
                     format!("/mnt/source-storage/overlays/persistent-{}/upper", vm_name);
                 println!("Exporting container overlay...");
-                let overlay_digest = format!("sha256:overlay-{}", vm_name);
+                let overlay_hash =
+                    hex::encode(Sha256::digest(format!("overlay-{}", vm_name).as_bytes()));
+                let overlay_digest = format!("sha256:{}", overlay_hash);
                 let overlay_layer_file = collector.layer_staging_path(&overlay_digest);
 
                 // Use the agent to tar the overlay dir
@@ -650,6 +670,7 @@ impl PackCreateCmd {
             self.cpus,
             self.mem,
             self.oci_platform.clone(),
+            self.gpu,
             self.smolfile.clone(),
         )?;
 
@@ -672,6 +693,8 @@ impl PackCreateCmd {
         manifest.mem = pack_config.mem;
         // Smolfile > source VM record > default
         manifest.network = pack_config.net.unwrap_or(vm.network);
+        // CLI --gpu > Smolfile gpu > source VM record gpu > false
+        manifest.gpu = pack_config.gpu || vm.gpu.unwrap_or(false);
 
         // Entrypoint baseline: VmRecord > /bin/sh default
         manifest.entrypoint = if !vm.entrypoint.is_empty() {
@@ -1269,8 +1292,8 @@ impl PackPushCmd {
 
         let parsed = smolvm::registry::Reference::parse(&self.reference)
             .map_err(|e| Error::agent("parse reference", e.to_string()))?;
-        let config = smolvm::registry::RegistryConfig::load()?;
-        let client = build_registry_client(&parsed.registry, &config)?;
+        let settings = smolvm::SmolSettings::load()?;
+        let client = build_registry_client(&parsed.registry, &settings.machines)?;
 
         let repo = parsed.repository();
         let tag = parsed.tag.as_deref().unwrap_or("latest");
@@ -1319,8 +1342,8 @@ impl PackPullCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let parsed = smolvm::registry::Reference::parse(&self.reference)
             .map_err(|e| Error::agent("parse reference", e.to_string()))?;
-        let config = smolvm::registry::RegistryConfig::load()?;
-        let client = build_registry_client(&parsed.registry, &config)?;
+        let settings = smolvm::SmolSettings::load()?;
+        let client = build_registry_client(&parsed.registry, &settings.machines)?;
 
         let repo = parsed.repository();
         let tag_or_digest = parsed
@@ -1357,6 +1380,22 @@ impl PackPullCmd {
             dest.display(),
             result.size,
         );
+
+        // Warn if the artifact targets a different host platform.
+        // This is not an error — the user may be inspecting or transferring
+        // the artifact — but it will not run on this host as-is.
+        if let Ok(manifest) = smolvm_pack::read_manifest_from_sidecar(&dest) {
+            let current = Platform::current().host_oci_platform();
+            if manifest.host_platform != current {
+                eprintln!(
+                    "Warning: this artifact was built for {} and will not run on {} (current platform).\
+                     \nTo run on {}, create a new pack:\
+                     \n\n  smolvm pack create --image {} -o <output>",
+                    manifest.host_platform, current, current, manifest.image,
+                );
+            }
+        }
+
         Ok(())
     }
 }
@@ -1384,8 +1423,8 @@ impl PackInspectCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let parsed = smolvm::registry::Reference::parse(&self.reference)
             .map_err(|e| Error::agent("parse reference", e.to_string()))?;
-        let config = smolvm::registry::RegistryConfig::load()?;
-        let client = build_registry_client(&parsed.registry, &config)?;
+        let settings = smolvm::SmolSettings::load()?;
+        let client = build_registry_client(&parsed.registry, &settings.machines)?;
 
         let repo = parsed.repository();
         let tag_or_digest = parsed
@@ -1462,7 +1501,17 @@ async fn run_inspect(
         println!("Reference:  {}", full_ref);
         println!("Image:      {}", pack_manifest.image);
         println!("Platform:   {}", pack_manifest.platform);
-        println!("Host:       {}", pack_manifest.host_platform);
+        {
+            let current = Platform::current().host_oci_platform();
+            if pack_manifest.host_platform == current {
+                println!("Host:       {}", pack_manifest.host_platform);
+            } else {
+                println!(
+                    "Host:       {}  [incompatible — current platform: {}]",
+                    pack_manifest.host_platform, current
+                );
+            }
+        }
         println!("CPUs:       {}", pack_manifest.cpus);
         println!("Memory:     {} MiB", pack_manifest.mem);
         if !pack_manifest.entrypoint.is_empty() {
@@ -1488,16 +1537,41 @@ fn build_registry_client(
     registry: &str,
     config: &smolvm::registry::RegistryConfig,
 ) -> smolvm::Result<smolvm_registry::RegistryClient> {
-    let base_url = if registry.starts_with("localhost") || registry.contains("127.0.0.1") {
-        format!("http://{}", registry)
+    let effective = config.get_mirror(registry).unwrap_or(registry);
+
+    // Docker Hub: the user-facing name is "docker.io" but the Distribution API
+    // endpoint is "registry-1.docker.io". The config key stays "docker.io" so
+    // credential lookup is consistent; only the HTTP endpoint changes.
+    let api_host = match effective {
+        "docker.io" => "registry-1.docker.io",
+        h => h,
+    };
+
+    let base_url = if smolvm_registry::is_local_registry(api_host) {
+        format!("http://{}", api_host)
     } else {
-        format!("https://{}", registry)
+        format!("https://{}", api_host)
     };
 
     let mut client = smolvm_registry::RegistryClient::new(base_url);
 
-    if let Some(auth) = config.get_credentials(registry) {
-        client = client.with_token(auth.password);
+    if let Some(entry) = config.registries.get(registry) {
+        if let Some(identity_token) = &entry.identity_token {
+            // Upstream credential (e.g. Auth0 JWT): exchanged with the token service
+            // per-operation to obtain a short-lived OCI bearer token.
+            client = client.with_identity_token(identity_token.clone());
+        } else if let Some(auth) = config.get_credentials(registry) {
+            if auth.username == "token" {
+                // Legacy direct-bearer convention: username="token" means the
+                // password value IS the bearer token, sent on every request.
+                client = client.with_token(auth.password);
+            } else {
+                // Standard Docker/OCI path: username+password are sent as Basic auth
+                // to the registry's token endpoint after a 401 Bearer challenge.
+                // Used for Docker Hub, GHCR, ECR, GCR, ACR, Harbor, and Quay.
+                client = client.with_basic_credentials(auth.username, auth.password);
+            }
+        }
     }
 
     Ok(client)
@@ -1613,5 +1687,101 @@ mod tests {
         }
         // If None, libkrun wasn't loaded (e.g., weak link + library not found).
         // This is expected in some CI environments and is not a failure.
+    }
+
+    // ── build_registry_client auth path selection ────────────────────────────
+
+    #[test]
+    fn build_registry_client_uses_identity_token_when_set() {
+        let mut config = smolvm::registry::RegistryConfig::default();
+        config.registries.insert(
+            "registry.smolmachines.com".to_string(),
+            smolvm::registry::RegistryEntry {
+                identity_token: Some("eyJ_upstream_jwt".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let client = build_registry_client("registry.smolmachines.com", &config).unwrap();
+        assert_eq!(
+            client.identity_token(),
+            Some("eyJ_upstream_jwt"),
+            "identity_token must be passed to with_identity_token()"
+        );
+    }
+
+    #[test]
+    fn build_registry_client_standard_credentials_use_basic_auth() {
+        // A real username (not "token") triggers the Docker/OCI Basic challenge path.
+        let mut config = smolvm::registry::RegistryConfig::default();
+        config.registries.insert(
+            "ghcr.io".to_string(),
+            smolvm::registry::RegistryEntry {
+                username: Some("github_user".to_string()),
+                password: Some("ghp_secret".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let client = build_registry_client("ghcr.io", &config).unwrap();
+        assert_eq!(client.identity_token(), None);
+        assert_eq!(
+            client.basic_credentials(),
+            Some(("github_user", "ghp_secret")),
+            "standard username must route to with_basic_credentials()"
+        );
+    }
+
+    #[test]
+    fn build_registry_client_token_username_sends_direct_bearer() {
+        // username="token" is the legacy direct-bearer convention.
+        let mut config = smolvm::registry::RegistryConfig::default();
+        config.registries.insert(
+            "custom.registry.io".to_string(),
+            smolvm::registry::RegistryEntry {
+                username: Some("token".to_string()),
+                password: Some("bearer_value".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let client = build_registry_client("custom.registry.io", &config).unwrap();
+        assert_eq!(client.identity_token(), None);
+        assert_eq!(client.basic_credentials(), None);
+    }
+
+    #[test]
+    fn build_registry_client_docker_hub_uses_api_endpoint() {
+        // docker.io must map to registry-1.docker.io for Distribution API calls.
+        let config = smolvm::registry::RegistryConfig::default();
+        let client = build_registry_client("docker.io", &config).unwrap();
+        assert_eq!(
+            client.base_url(),
+            "https://registry-1.docker.io",
+            "docker.io must map to registry-1.docker.io"
+        );
+    }
+
+    #[test]
+    fn build_registry_client_identity_token_wins_over_password() {
+        // When both are set (shouldn't happen in practice after set_credentials clears
+        // identity_token, but we verify the precedence rule is enforced).
+        let mut config = smolvm::registry::RegistryConfig::default();
+        config.registries.insert(
+            "registry.smolmachines.com".to_string(),
+            smolvm::registry::RegistryEntry {
+                username: Some("user".to_string()),
+                password: Some("stale_password".to_string()),
+                identity_token: Some("eyJ_identity".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let client = build_registry_client("registry.smolmachines.com", &config).unwrap();
+        assert_eq!(
+            client.identity_token(),
+            Some("eyJ_identity"),
+            "identity_token must take precedence over password"
+        );
     }
 }

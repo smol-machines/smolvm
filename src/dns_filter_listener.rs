@@ -24,7 +24,7 @@ pub fn start(socket_path: &Path, allowed_hosts: Vec<String>) -> std::io::Result<
 
     let filter = Arc::new(DnsFilter::new(
         allowed_hosts,
-        crate::data::network::DEFAULT_DNS.to_string(),
+        crate::data::network::default_dns(),
     ));
 
     let path_display = socket_path.display().to_string();

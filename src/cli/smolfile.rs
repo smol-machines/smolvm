@@ -12,7 +12,7 @@ use smolvm::network::NetworkBackend;
 use std::path::PathBuf;
 
 // Re-export from the library
-pub use smolvm::smolfile::{parse_duration_secs, resolve_host_to_cidrs, Smolfile};
+pub use smolvm::smolfile::{parse_duration_secs, Smolfile};
 
 /// Load and parse a Smolfile from the given path.
 pub fn load(path: &std::path::Path) -> smolvm::Result<Smolfile> {
@@ -82,6 +82,8 @@ pub fn build_create_params(
                 health_retries: None,
                 health_startup_grace_secs: None,
                 ssh_agent: false,
+                gpu: false,
+                gpu_vram_mib: None,
                 dns_filter_hosts: None,
                 source_smolmachine: None,
             });
@@ -165,6 +167,8 @@ pub fn build_create_params(
         sf.net.unwrap_or(false)
     };
 
+    let gpu = sf.gpu.unwrap_or(false);
+
     let workdir = cli_workdir.or(dev_workdir).or(sf.workdir);
 
     // Scalars: CLI overrides Smolfile
@@ -174,18 +178,14 @@ pub fn build_create_params(
     // Merge network policy: [network] section, then CLI extends
     let network = sf.network.unwrap_or_default();
 
-    // Preserve original hostnames for DNS filtering
+    // Preserve original hostnames for DNS filtering.
+    // Do NOT resolve these to CIDRs here — CDN-backed hosts rotate IPs and the
+    // resolved addresses would be stale by the time the machine is started.
+    // Re-resolution happens at `machine start` time (see start_vm_named).
     let sf_allow_hosts = network.allow_hosts;
 
-    // Resolve hostnames to CIDRs for egress policy
+    // Parse [network].allow_cidrs — these are explicit stable CIDRs, stored as-is.
     let mut allowed_cidrs_vec: Vec<String> = Vec::new();
-    for host in &sf_allow_hosts {
-        let cidrs = resolve_host_to_cidrs(host)
-            .map_err(|e| smolvm::Error::config("smolfile [network] allow_hosts", e))?;
-        allowed_cidrs_vec.extend(cidrs);
-    }
-
-    // Parse [network].allow_cidrs
     let sf_cidrs: Vec<String> = network
         .allow_cidrs
         .iter()
@@ -198,7 +198,7 @@ pub fn build_create_params(
     allowed_cidrs_vec.extend(cli_allow_cidr);
 
     // --allow-cidr / --allow-host / [network] implies --net
-    let net = if !allowed_cidrs_vec.is_empty() {
+    let net = if !allowed_cidrs_vec.is_empty() || !sf_allow_hosts.is_empty() {
         true
     } else {
         net
@@ -271,6 +271,8 @@ pub fn build_create_params(
         health_retries,
         health_startup_grace_secs,
         ssh_agent: sf.auth.as_ref().and_then(|a| a.ssh_agent).unwrap_or(false),
+        gpu,
+        gpu_vram_mib: sf.gpu_vram,
         dns_filter_hosts: if sf_allow_hosts.is_empty() {
             None
         } else {
@@ -304,6 +306,8 @@ pub struct PackConfig {
     /// so `--from-vm` can distinguish "Smolfile says net = false" from "no
     /// Smolfile, fall back to source VM's setting".
     pub net: Option<bool>,
+    /// Whether GPU acceleration is enabled in the packed VM.
+    pub gpu: bool,
 }
 
 /// Resolve pack configuration by merging CLI flags with an optional Smolfile.
@@ -317,12 +321,14 @@ pub struct PackConfig {
 ///   oci_platform: CLI --oci-platform > [artifact].oci_platform > None
 ///   env:          Smolfile top-level env (trimmed)
 ///   workdir:      Smolfile top-level workdir
+///   gpu:          CLI --gpu (true overrides) > Smolfile gpu > false
 pub fn resolve_pack_config(
     cli_image: Option<String>,
     cli_entrypoint: Option<String>,
     cli_cpus: u8,
     cli_mem: u32,
     cli_oci_platform: Option<String>,
+    cli_gpu: bool,
     smolfile_path: Option<PathBuf>,
 ) -> smolvm::Result<PackConfig> {
     let default_cpus = DEFAULT_MICROVM_CPU_COUNT;
@@ -340,6 +346,7 @@ pub fn resolve_pack_config(
                 env: vec![],
                 workdir: None,
                 net: None,
+                gpu: cli_gpu,
             });
         }
     };
@@ -405,5 +412,7 @@ pub fn resolve_pack_config(
                 sf.net // None if key absent, Some(true/false) if explicit
             }
         },
+        // CLI --gpu wins; Smolfile gpu = true also enables it.
+        gpu: cli_gpu || sf.gpu.unwrap_or(false),
     })
 }

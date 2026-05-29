@@ -51,14 +51,12 @@ const NETWORK_INITIAL_DELAY_MS: u64 = 500;
 /// beyond this, they're likely not transient.
 const NETWORK_MAX_DELAY_SECS: u64 = 5;
 
-/// Initial delay for connection operations (50ms).
-/// Very short because the agent should already be running - we're just handling
-/// brief unavailability during high load or socket setup.
-const CONNECTION_INITIAL_DELAY_MS: u64 = 50;
+/// Initial delay for connection operations (100ms).
+/// Short because the agent should already be running — we're handling brief
+/// unavailability during high load or socket setup under concurrent boot.
+const CONNECTION_INITIAL_DELAY_MS: u64 = 100;
 
 /// Maximum delay for connection operations (2 seconds).
-/// If the agent isn't responding within 2 seconds between retries, something
-/// is likely wrong beyond a transient issue.
 const CONNECTION_MAX_DELAY_SECS: u64 = 2;
 
 /// Configuration for retry behavior.
@@ -105,7 +103,7 @@ impl RetryConfig {
     /// These retries handle brief unavailability during high load.
     pub fn for_connection() -> Self {
         Self {
-            max_attempts: DEFAULT_MAX_ATTEMPTS,
+            max_attempts: 6,
             initial_delay: Duration::from_millis(CONNECTION_INITIAL_DELAY_MS),
             max_delay: Duration::from_secs(CONNECTION_MAX_DELAY_SECS),
             backoff_multiplier: BACKOFF_MULTIPLIER,

@@ -9,8 +9,8 @@
 //! Communication is via vsock on port 6000.
 
 use smolvm_protocol::{
-    error_codes, ports, AgentRequest, AgentResponse, Envelope, RegistryAuth, LAYER_CHUNK_SIZE,
-    PROTOCOL_VERSION,
+    error_codes, guest_env, ports, AgentRequest, AgentResponse, Envelope, RegistryAuth,
+    AGENT_READY_MARKER, LAYER_CHUNK_SIZE, PROTOCOL_VERSION,
 };
 use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
@@ -18,6 +18,9 @@ use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
 use tracing::{debug, error, info, warn};
 
+// console_socket depends on the Linux-only `pty` module and is only used by the
+// crun console-socket handshake, which itself only runs on Linux.
+#[cfg(target_os = "linux")]
 mod console_socket;
 mod crun;
 
@@ -59,8 +62,26 @@ fn format_boot_log(level: &str, msg: &str) -> String {
 /// Write a structured JSON log line to stderr during early boot,
 /// before tracing_subscriber is initialized. This keeps
 /// agent-console.log as valid JSON throughout.
+/// Also mirrors to /dev/kmsg so messages appear in `dmesg` inside the VM.
+///
+/// These timing lines (`boot agent_entry`, `mounts_done`, `rootfs_done`, etc.)
+/// are intentionally permanent support logs — they are not gated on RUST_LOG
+/// because they run before the tracing subscriber exists. Output goes only to
+/// `agent-console.log` (readable via `~/Library/Caches/smolvm/vms/<id>/`) and
+/// the in-VM kernel ring buffer, neither of which is visible to end users in
+/// normal operation.
 fn boot_log(level: &str, msg: &str) {
-    eprintln!("{}", format_boot_log(level, msg));
+    let line = format_boot_log(level, msg);
+    eprintln!("{}", line);
+    // Mirror to /dev/kmsg so dmesg captures early-boot messages even when
+    // the console-log pipe isn't receiving eprintln! output.
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open("/dev/kmsg") {
+            let _ = writeln!(f, "smolvm-agent: {}", line);
+        }
+    }
 }
 mod dns_proxy;
 mod network;
@@ -109,6 +130,19 @@ fn uptime_ms() -> u64 {
     0
 }
 
+/// Get uptime via CLOCK_BOOTTIME syscall — works before /proc is mounted.
+#[cfg(target_os = "linux")]
+fn boottime_ms() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts);
+    }
+    (ts.tv_sec as u64) * 1000 + (ts.tv_nsec as u64) / 1_000_000
+}
+
 fn main() {
     // Quick --version check (used by init script to detect rootfs updates)
     if std::env::args().any(|a| a == "--version") {
@@ -116,14 +150,47 @@ fn main() {
         std::process::exit(0);
     }
 
+    // Earliest possible timing point — CLOCK_BOOTTIME works before /proc exists.
+    #[cfg(target_os = "linux")]
+    boot_log(
+        "INFO",
+        &format!("boot agent_entry uptime_ms={}", boottime_ms()),
+    );
+
     // CRITICAL: Mount essential filesystems FIRST, before anything else.
     // When running as init (PID 1), we need these for the system to function.
     // This must happen before logging (which needs /dev for output).
     mount_essential_filesystems();
+    boot_log(
+        "INFO",
+        &format!("boot mounts_done uptime_ms={}", uptime_ms()),
+    );
+
+    // Create /dev/dri device nodes only when GPU is enabled. The setup
+    // function polls up to 500ms for the virtio-gpu driver to finish probing —
+    // running it on non-GPU machines wastes the full polling window.
+    #[cfg(target_os = "linux")]
+    if std::env::var(guest_env::GPU).as_deref() == Ok(guest_env::VALUE_ON) {
+        setup_gpu_dev_nodes();
+    }
 
     // Set up persistent rootfs overlay (if /dev/vdb exists).
     // This does overlayfs + pivot_root before anything else touches the filesystem.
     setup_persistent_rootfs();
+    boot_log(
+        "INFO",
+        &format!("boot rootfs_done uptime_ms={}", uptime_ms()),
+    );
+
+    // Start seatd AFTER pivot_root so its socket lands at /run/seatd.sock in
+    // the live root. Wayland compositors (Weston, sway) and DRI3-capable X
+    // servers (Xwayland) connect to this socket via libseat to acquire DRM
+    // devices. Without seatd, GPU-accelerated display workloads fail with
+    // "No backend was able to open a seat."
+    #[cfg(target_os = "linux")]
+    if std::env::var(guest_env::GPU).as_deref() == Ok(guest_env::VALUE_ON) {
+        start_seatd();
+    }
 
     // CRITICAL: Create vsock listener IMMEDIATELY after mounts.
     // This must happen before logging setup to minimize time to listener ready.
@@ -135,6 +202,10 @@ fn main() {
             std::process::exit(1);
         }
     };
+    boot_log(
+        "INFO",
+        &format!("boot vsock_bound uptime_ms={}", uptime_ms()),
+    );
 
     // Set up signal handlers for graceful shutdown (sync before exit)
     setup_signal_handlers();
@@ -144,6 +215,10 @@ fn main() {
     // That connection takes ~10-30ms, giving us time to finish deferred init
     // below before the first request arrives.
     signal_ready_to_host();
+    boot_log(
+        "INFO",
+        &format!("boot ready_sent uptime_ms={}", uptime_ms()),
+    );
 
     // --- Deferred init: runs while host is detecting marker + connecting ---
     // Storage mount is behind a OnceLock (ensure_storage_mounted) so it
@@ -174,7 +249,19 @@ fn main() {
                 "guest virtio network configured"
             );
         }
-        Ok(false) => {}
+        Ok(false) => {
+            // TSI mode or no network. The overlay may contain a stale
+            // "nameserver 127.0.0.1" written by a previous --allow-host run.
+            // TSI forwards UDP to 1.1.1.1 directly, so reset resolv.conf to a
+            // known-good value unless the DNS filter proxy is about to
+            // overwrite it with 127.0.0.1 anyway.
+            if !dns_proxy::is_enabled() {
+                let _ = std::fs::write(
+                    "/etc/resolv.conf",
+                    "nameserver 1.1.1.1\nnameserver 8.8.8.8\n",
+                );
+            }
+        }
         Err(err) => {
             error!(error = %err, "failed to configure guest network");
             std::process::exit(1);
@@ -242,6 +329,18 @@ fn main() {
         dns_proxy::start();
     }
 
+    // If the host started us with --gpu, sanity-check that the guest
+    // kernel actually sees a virtio-gpu device. libkrun accepts the
+    // GPU config call regardless of whether the embedded kernel has
+    // the `virtio-gpu` driver compiled in, so the only place this
+    // mismatch surfaces is here. Without this log, the user discovers
+    // the missing GPU much later — when their workload makes a
+    // rendering call and crashes with a confused EGL/Vulkan error.
+    #[cfg(target_os = "linux")]
+    if std::env::var(guest_env::GPU).as_deref() == Ok(guest_env::VALUE_ON) {
+        log_gpu_status();
+    }
+
     info!(
         total_startup_ms = uptime_ms() - start_uptime,
         uptime_ms = uptime_ms(),
@@ -255,20 +354,11 @@ fn main() {
     }
 }
 
-/// Well-known filename for the ready marker.
-/// The agent creates this file in the virtiofs rootfs to signal readiness.
-/// The host watches for it via inotify/kqueue instead of the vsock socket.
-const READY_MARKER_FILENAME: &str = ".smolvm-ready";
-
 /// Signal to the host that the agent is fully initialized and ready.
 ///
-/// Creates a marker file in the virtiofs rootfs directory. Since virtiofs is
-/// shared between host and guest, the host can detect this file instantly
-/// via inotify/kqueue. This is more reliable than watching the vsock socket
-/// file (which is created by libkrun's muxer thread before the agent boots).
-///
-/// After pivot_root, the virtiofs root is mounted at /oldroot.
-/// Without overlay, the virtiofs root is /.
+/// Writes a marker file to the virtiofs rootfs. The host polls for this file.
+/// The virtiofs FUSE write is visible on the host filesystem within ~1ms
+/// (hv_gic_set_spi interrupt injection is 0–15µs; no event_manager involvement).
 fn signal_ready_to_host() {
     use std::path::Path;
 
@@ -277,14 +367,14 @@ fn signal_ready_to_host() {
     // Try /oldroot first (overlay mode: virtiofs is the lower layer after pivot_root)
     // Before pivot_root: virtiofs is at /, so the / path works.
     let paths = [
-        format!("/oldroot/{}", READY_MARKER_FILENAME),
-        format!("/{}", READY_MARKER_FILENAME),
+        format!("/oldroot/{}", AGENT_READY_MARKER),
+        format!("/{}", AGENT_READY_MARKER),
     ];
 
     for path in &paths {
         if Path::new(path).parent().map_or(false, |p| p.exists()) {
             if std::fs::write(path, content.as_bytes()).is_ok() {
-                debug!(path = path, "ready marker written");
+                boot_log("INFO", &format!("ready marker written: {path}"));
                 return;
             }
         }
@@ -422,6 +512,166 @@ fn mount_essential_filesystems() {
     // No-op on non-Linux platforms
 }
 
+/// Create /dev/dri device nodes for virtio-gpu if present.
+///
+/// libkrun's init.c mounts /dev as a basic tmpfs so the kernel's devtmpfs
+/// doesn't auto-populate DRM device nodes. This function reads each render
+/// node and card from /sys/class/drm/ and creates the corresponding
+/// character device node in /dev/dri/ so containers can access the GPU.
+#[cfg(target_os = "linux")]
+fn setup_gpu_dev_nodes() {
+    let sysfs_drm = std::path::Path::new("/sys/class/drm");
+    if !sysfs_drm.exists() {
+        return;
+    }
+
+    // The virtio-gpu driver may not have finished probing when the agent
+    // starts — sysfs entries appear only after probe() completes.  Poll
+    // for up to ~500 ms in 10 ms increments rather than racing with the
+    // driver.  On fast boots the first read already wins; the loop just
+    // handles the small window where the driver is still initialising.
+    let entries = {
+        let mut found = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        loop {
+            let Ok(rd) = std::fs::read_dir(sysfs_drm) else {
+                break;
+            };
+            let candidates: Vec<_> = rd
+                .flatten()
+                .filter(|e| {
+                    let n = e.file_name();
+                    let s = n.to_string_lossy();
+                    s.starts_with("renderD") || s.starts_with("card")
+                })
+                .collect();
+            if !candidates.is_empty() {
+                found = candidates;
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            // SAFETY: nanosleep — always safe
+            unsafe {
+                libc::nanosleep(
+                    &libc::timespec {
+                        tv_sec: 0,
+                        tv_nsec: 10_000_000,
+                    },
+                    std::ptr::null_mut(),
+                );
+            }
+        }
+        found
+    };
+
+    if entries.is_empty() {
+        return;
+    }
+
+    let _ = std::fs::create_dir_all("/dev/dri");
+
+    for entry in &entries {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        // Read major:minor from sysfs (e.g. "226:128\n")
+        let dev_file = sysfs_drm.join(&*name_str).join("dev");
+        let Ok(dev_str) = std::fs::read_to_string(&dev_file) else {
+            continue;
+        };
+        let parts: Vec<&str> = dev_str.trim().split(':').collect();
+        if parts.len() != 2 {
+            continue;
+        }
+        let Ok(major) = parts[0].parse::<u32>() else {
+            continue;
+        };
+        let Ok(minor) = parts[1].parse::<u32>() else {
+            continue;
+        };
+
+        let node_path = format!("/dev/dri/{}", name_str);
+        let Ok(node_cstr) = std::ffi::CString::new(node_path) else {
+            continue;
+        };
+
+        // SAFETY: mknod a character device node with the DRM major:minor from sysfs
+        unsafe {
+            libc::mknod(
+                node_cstr.as_ptr(),
+                libc::S_IFCHR | 0o666,
+                libc::makedev(major, minor),
+            );
+        }
+    }
+}
+
+/// Start the seatd seat manager daemon.
+///
+/// seatd provides the seat management API that Wayland compositors (Weston, sway)
+/// and DRI3-capable X servers (Xwayland) need to access /dev/dri devices.
+/// Without it, GPU-accelerated display workloads fail with:
+///   "No backend was able to open a seat"
+///
+/// seatd runs as a background daemon on a Unix socket at /run/seatd.sock.
+/// It's only started when GPU is enabled — zero overhead otherwise.
+#[cfg(target_os = "linux")]
+fn start_seatd() {
+    use std::process::{Command, Stdio};
+
+    let seatd_path = "/usr/bin/seatd";
+    if !std::path::Path::new(seatd_path).exists() {
+        boot_log(
+            "WARN",
+            "seatd not found in rootfs, GPU display workloads may fail",
+        );
+        return;
+    }
+
+    // seatd needs /run for its socket
+    let _ = std::fs::create_dir_all("/run");
+
+    match Command::new(seatd_path)
+        .args(["-g", "root"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => {
+            boot_log("INFO", &format!("seatd started (PID {})", child.id()));
+            // Detach — seatd runs for the lifetime of the VM
+            std::mem::forget(child);
+        }
+        Err(e) => {
+            boot_log("WARN", &format!("failed to start seatd: {}", e));
+        }
+    }
+}
+
+/// Log whether the GPU is accessible in the guest.
+///
+/// Called at startup when `guest_env::GPU` is set. Checks whether the virtio-gpu
+/// render node appeared in `/dev/dri/` after `setup_gpu_dev_nodes` ran. If not,
+/// the kernel was built without `virtio-gpu` or `drm` support and the workload
+/// will fail at Vulkan/EGL init rather than here — log a clear warning so the
+/// user knows to check the kernel config.
+#[cfg(target_os = "linux")]
+fn log_gpu_status() {
+    let render_node = std::path::Path::new("/dev/dri/renderD128");
+    if render_node.exists() {
+        info!("GPU: virtio-gpu render node present at /dev/dri/renderD128");
+    } else {
+        warn!(
+            "GPU: requested but /dev/dri/renderD128 not found — \
+             the guest kernel may lack virtio-gpu/drm support; \
+             Vulkan/EGL workloads will fail"
+        );
+    }
+}
+
 /// Set up persistent rootfs overlay using overlayfs on /dev/vdb.
 ///
 /// If /dev/vdb exists (overlay disk attached by host), this function:
@@ -445,18 +695,54 @@ fn setup_persistent_rootfs() {
     const STORAGE_TEMP_MOUNT: &str = "/mnt/storage";
     const NEWROOT: &str = "/mnt/newroot";
 
-    // Make root mount private — required for mount --move and pivot_root.
-    // libkrun's init.c sets MS_SHARED; we override with MS_PRIVATE.
+    // pivot_root requires that the current root mount is NOT shared.
+    // The kernel mounts virtiofs as shared:1 by default.  We must make it
+    // private before pivot_root will accept it.
+    //
+    // Strategy:
+    // 1. Try MS_PRIVATE|MS_REC directly (works if CAP_SYS_ADMIN + not locked).
+    // 2. If that fails, unshare the mount namespace first (creates a private
+    //    copy of the namespace for this process), then retry.
     let root = cstr("/");
-    // SAFETY: mount with MS_PRIVATE|MS_REC on root, no filesystem type
-    unsafe {
+    // SAFETY: mount with MS_PRIVATE|MS_REC on root — no fstype needed
+    let ms_private_ret = unsafe {
         libc::mount(
             std::ptr::null(),
             root.as_ptr(),
             std::ptr::null(),
             libc::MS_PRIVATE | libc::MS_REC,
             std::ptr::null(),
+        )
+    };
+    if ms_private_ret != 0 {
+        boot_log(
+            "WARN",
+            &format!(
+                "MS_PRIVATE on / failed ({}), trying unshare",
+                std::io::Error::last_os_error()
+            ),
         );
+        // SAFETY: unshare mount namespace so we get a private copy
+        let unshare_ret = unsafe { libc::unshare(libc::CLONE_NEWNS) };
+        if unshare_ret != 0 {
+            boot_log(
+                "WARN",
+                &format!(
+                    "unshare(CLONE_NEWNS) failed ({}), pivot_root may fail",
+                    std::io::Error::last_os_error()
+                ),
+            );
+        }
+        // Retry MS_PRIVATE after unshare (now we own the namespace)
+        unsafe {
+            libc::mount(
+                std::ptr::null(),
+                root.as_ptr(),
+                std::ptr::null(),
+                libc::MS_PRIVATE | libc::MS_REC,
+                std::ptr::null(),
+            );
+        }
     }
 
     // If overlay device doesn't exist, no overlay disk attached — skip.
@@ -467,6 +753,57 @@ fn setup_persistent_rootfs() {
     }
 
     let _ = std::fs::create_dir_all(OVERLAY_MOUNT);
+
+    // Probe and mount storage disk in parallel with the overlay ext4 operations.
+    // Spawning here (before the /dev/vdb ext4 mount) lets storage work overlap
+    // with both the virtiofs activity between probe and mount (~27ms gap) and
+    // the /dev/vdb ext4 mount itself (~10ms, req=4–17). On warm boots this
+    // removes storage mount latency from the critical path entirely.
+    let storage_handle = if Path::new(STORAGE_DEVICE).exists() {
+        let _ = std::fs::create_dir_all(STORAGE_TEMP_MOUNT);
+        Some(std::thread::spawn(|| {
+            // Resize before mount — template may be smaller than device.
+            // Skip if filesystem already fills the device (subsequent boots).
+            // If resize fails (e.g. macOS-created template with incompatible features),
+            // skip mount — mount_storage_disk() will handle mkfs fallback.
+            if !ext4_already_full_size(STORAGE_DEVICE)
+                && !resize_ext4_if_needed(STORAGE_DEVICE, "storage")
+            {
+                boot_log(
+                    "WARN",
+                    "storage: resize failed, deferring to mount_storage_disk",
+                );
+                return false;
+            }
+
+            let dev = cstr(STORAGE_DEVICE);
+            let mnt = cstr(STORAGE_TEMP_MOUNT);
+            let ext4 = cstr("ext4");
+            // SAFETY: mount /dev/vda as ext4 at /mnt/storage with noatime
+            let mounted = unsafe {
+                libc::mount(
+                    dev.as_ptr(),
+                    mnt.as_ptr(),
+                    ext4.as_ptr(),
+                    libc::MS_NOATIME,
+                    std::ptr::null(),
+                ) == 0
+            };
+            if !mounted {
+                let err = std::io::Error::last_os_error();
+                boot_log(
+                    "WARN",
+                    &format!(
+                        "storage: parallel mount failed ({}), deferring to mount_storage_disk",
+                        err
+                    ),
+                );
+            }
+            mounted
+        }))
+    } else {
+        None
+    };
 
     // Resize ext4 on the UNMOUNTED device before mounting. The host copies
     // from a small template (~512MB) then extends the sparse file. resize2fs
@@ -521,58 +858,20 @@ fn setup_persistent_rootfs() {
         } != 0
         {
             boot_log("ERROR", "failed to mount overlay disk after formatting");
+            // Clean up the parallel storage mount so mount_storage_disk() fallback
+            // does not hit EBUSY from an already-mounted /dev/vda.
+            if let Some(handle) = storage_handle {
+                if handle.join().unwrap_or(false) {
+                    let mnt = cstr(STORAGE_TEMP_MOUNT);
+                    // SAFETY: umount /mnt/storage that the parallel thread mounted
+                    unsafe {
+                        libc::umount(mnt.as_ptr());
+                    }
+                }
+            }
             return;
         }
     }
-
-    // Resize + mount storage disk in parallel while we set up overlayfs.
-    // The resize + ext4 mount of /dev/vda overlaps with overlayfs setup
-    // and overlay dir creation, saving that time from the critical path.
-    let storage_handle = if Path::new(STORAGE_DEVICE).exists() {
-        let _ = std::fs::create_dir_all(STORAGE_TEMP_MOUNT);
-        Some(std::thread::spawn(|| {
-            // Resize before mount — template may be smaller than device.
-            // Skip if filesystem already fills the device (subsequent boots).
-            // If resize fails (e.g. macOS-created template with incompatible features),
-            // skip mount — mount_storage_disk() will handle mkfs fallback.
-            if !ext4_already_full_size(STORAGE_DEVICE)
-                && !resize_ext4_if_needed(STORAGE_DEVICE, "storage")
-            {
-                boot_log(
-                    "WARN",
-                    "storage: resize failed, deferring to mount_storage_disk",
-                );
-                return false;
-            }
-
-            let dev = cstr(STORAGE_DEVICE);
-            let mnt = cstr(STORAGE_TEMP_MOUNT);
-            let ext4 = cstr("ext4");
-            // SAFETY: mount /dev/vda as ext4 at /mnt/storage with noatime
-            let mounted = unsafe {
-                libc::mount(
-                    dev.as_ptr(),
-                    mnt.as_ptr(),
-                    ext4.as_ptr(),
-                    libc::MS_NOATIME,
-                    std::ptr::null(),
-                ) == 0
-            };
-            if !mounted {
-                let err = std::io::Error::last_os_error();
-                boot_log(
-                    "WARN",
-                    &format!(
-                        "storage: parallel mount failed ({}), deferring to mount_storage_disk",
-                        err
-                    ),
-                );
-            }
-            mounted
-        }))
-    } else {
-        None
-    };
 
     // Create overlay directories
     let _ = std::fs::create_dir_all(format!("{}/upper", OVERLAY_MOUNT));
@@ -583,6 +882,15 @@ fn setup_persistent_rootfs() {
     let overlay_src = cstr("overlay");
     let newroot = cstr(NEWROOT);
     let overlay_type = cstr("overlay");
+    // Simple overlayfs without index/redirect_dir/uuid — these options trigger
+    // ext4 xattr writes + journal flushes on every mount. On macOS/HVF each
+    // ext4 journal flush (FUA/barrier) serializes to an APFS fsync (~10-30ms).
+    // With 15-30 flushes per mount, they add 200-900ms to every boot.
+    //
+    // These options also do NOT enable Docker overlay2 on this overlay — the
+    // lower layer is the initramfs (ramfs) which has no file-handle support,
+    // so the kernel falls back to index=off for any overlay2 upper dir on this
+    // root regardless. Docker's data root is on /storage/ (bare ext4), not here.
     let overlay_opts = cstr(&format!(
         "lowerdir=/,upperdir={}/upper,workdir={}/work",
         OVERLAY_MOUNT, OVERLAY_MOUNT
@@ -599,7 +907,7 @@ fn setup_persistent_rootfs() {
     };
     if result != 0 {
         let err = std::io::Error::last_os_error();
-        boot_log("ERROR", &format!("failed to mount overlayfs: {}", err));
+        boot_log("ERROR", &format!("failed to mount overlayfs ({})", err));
         // Clean up parallel storage mount to avoid double-mount in
         // mount_storage_disk() fallback path.
         if let Some(handle) = storage_handle {
@@ -612,6 +920,19 @@ fn setup_persistent_rootfs() {
             }
         }
         return;
+    }
+
+    // pivot_root also requires the new root mount not to be shared.
+    // Make the overlayfs mount private immediately after creating it.
+    // SAFETY: mount(NULL, newroot, NULL, MS_PRIVATE|MS_REC, NULL)
+    unsafe {
+        libc::mount(
+            std::ptr::null(),
+            newroot.as_ptr(),
+            std::ptr::null(),
+            libc::MS_PRIVATE | libc::MS_REC,
+            std::ptr::null(),
+        );
     }
 
     // Create mount point directories in new root and move special mounts
@@ -698,6 +1019,8 @@ fn setup_persistent_rootfs() {
 
     // Set working directory to new root
     let _ = std::env::set_current_dir("/");
+
+    boot_log("INFO", "persistent rootfs overlay active (pivot_root done)");
 }
 
 /// Stub for non-Linux platforms.
@@ -768,6 +1091,7 @@ fn setup_signal_handlers() {
     // No-op on non-Linux platforms
 }
 
+#[cfg(target_os = "linux")]
 /// Resize an ext4 filesystem on an unmounted device to fill the block device.
 ///
 /// The host creates disks by copying a small pre-formatted template (~512MB)
@@ -887,6 +1211,7 @@ fn resize_ext4_if_needed(device: &str, label: &str) -> bool {
     }
 }
 
+#[cfg(target_os = "linux")]
 /// Check if ext4 filesystem already fills the block device.
 ///
 /// Reads the ext4 superblock (at offset 1024) to get block_count and block_size,
@@ -941,6 +1266,7 @@ fn ext4_already_full_size(device: &str) -> bool {
     fs_size + block_size >= dev_size
 }
 
+#[cfg(target_os = "linux")]
 /// Check /proc/mounts to see if anything is mounted at the given path.
 fn is_mounted_at(mount_point: &str) -> bool {
     if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
@@ -951,6 +1277,7 @@ fn is_mounted_at(mount_point: &str) -> bool {
     false
 }
 
+#[cfg(target_os = "linux")]
 /// Create required subdirectories under the storage mount point.
 fn create_storage_dirs(mount_point: &str) {
     let dirs = [
@@ -970,6 +1297,7 @@ fn create_storage_dirs(mount_point: &str) {
 }
 
 /// Mount ext4 /dev/vda at /storage using direct syscall (avoids ~3-5ms fork+exec).
+#[cfg(target_os = "linux")]
 fn try_mount_storage_ext4() -> bool {
     let dev = cstr("/dev/vda");
     let mnt = cstr("/storage");
@@ -992,6 +1320,7 @@ fn try_mount_storage_ext4() -> bool {
 /// 1. resize + mount (works on subsequent boots with Linux-native FS)
 /// 2. fsck + resize + mount (may fix minor corruption)
 /// 3. mkfs + mount (first boot from macOS template, or unrecoverable)
+#[cfg(target_os = "linux")]
 fn mount_storage_disk() -> bool {
     use std::process::Command;
 
@@ -1094,6 +1423,55 @@ fn mount_storage_disk() -> bool {
     false
 }
 
+/// Stub for non-Linux platforms.
+#[cfg(not(target_os = "linux"))]
+fn mount_storage_disk() -> bool {
+    false
+}
+
+/// Maximum number of vsock connections serviced concurrently.
+/// Bounds thread count and prevents vsock channel saturation.
+/// 8 (2^3) gives headroom for several parallel execs plus the state probe.
+const MAX_CONCURRENT_CONNECTIONS: usize = 8;
+
+/// A counting semaphore for bounding concurrent connection handlers.
+struct ConnectionSemaphore {
+    inner: std::sync::Arc<(std::sync::Mutex<usize>, std::sync::Condvar)>,
+}
+
+impl ConnectionSemaphore {
+    fn new(n: usize) -> Self {
+        Self {
+            inner: std::sync::Arc::new((std::sync::Mutex::new(n), std::sync::Condvar::new())),
+        }
+    }
+
+    fn acquire(&self) -> ConnectionPermit {
+        let (lock, cvar) = &*self.inner;
+        let mut count = lock.lock().unwrap();
+        while *count == 0 {
+            count = cvar.wait(count).unwrap();
+        }
+        *count -= 1;
+        ConnectionPermit {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+/// RAII guard that releases a semaphore slot when dropped.
+struct ConnectionPermit {
+    inner: std::sync::Arc<(std::sync::Mutex<usize>, std::sync::Condvar)>,
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        let (lock, cvar) = &*self.inner;
+        *lock.lock().unwrap() += 1;
+        cvar.notify_one();
+    }
+}
+
 /// Run the vsock server with a pre-created listener.
 /// The listener is created early (before initialization) to ensure the kernel
 /// has a listener ready when the host connects.
@@ -1102,11 +1480,12 @@ fn run_server_with_listener(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut first_connection = true;
     let listen_start = uptime_ms();
+    let semaphore = std::sync::Arc::new(ConnectionSemaphore::new(MAX_CONCURRENT_CONNECTIONS));
 
     info!(uptime_ms = uptime_ms(), "entering vsock accept loop");
 
     loop {
-        // Reap any exited background children to prevent zombie accumulation
+        // Reap any exited background children to prevent zombie accumulation.
         reap_background_children();
 
         match listener.accept() {
@@ -1121,12 +1500,55 @@ fn run_server_with_listener(
                 }
                 info!("accepted connection");
 
-                if let Err(e) = handle_connection(&mut stream) {
-                    warn!(error = %e, "connection error");
-                }
+                // Acquire a slot before spawning; blocks if MAX_CONCURRENT_CONNECTIONS
+                // threads are already running. This bounds thread count and prevents
+                // vsock channel saturation under heavy concurrency.
+                let permit = semaphore.acquire();
+
+                // Service the connection in its own thread so a long-running
+                // exec doesn't block subsequent requests on the same listener.
+                // Before this landed, a single held-open `machine exec` would
+                // stall the 250ms state probe, flip the VM to Unreachable,
+                // and make every following exec fail with "not running".
+                std::thread::spawn(move || {
+                    let _permit = permit;
+                    if let Err(e) = handle_connection(&mut stream) {
+                        warn!(error = %e, "connection error");
+                    }
+                });
             }
             Err(e) => {
                 warn!(error = %e, "accept error");
+            }
+        }
+    }
+}
+
+/// Patch `timeout_ms` on request variants where serde may have silently dropped
+/// the field due to the flatten + internally-tagged enum limitation.
+/// Re-extracts the value from the raw JSON payload.
+fn patch_timeout_ms(request: &mut AgentRequest, raw: &[u8]) {
+    let needs_patch = matches!(
+        request,
+        AgentRequest::VmExec {
+            timeout_ms: None,
+            ..
+        } | AgentRequest::Run {
+            timeout_ms: None,
+            ..
+        }
+    );
+    if !needs_patch {
+        return;
+    }
+
+    if let Ok(map) = serde_json::from_slice::<serde_json::Value>(raw) {
+        if let Some(ms) = map.get("timeout_ms").and_then(|v| v.as_u64()) {
+            match request {
+                AgentRequest::VmExec { timeout_ms, .. } | AgentRequest::Run { timeout_ms, .. } => {
+                    *timeout_ms = Some(ms);
+                }
+                _ => {}
             }
         }
     }
@@ -1182,7 +1604,7 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
 
         // Parse request (Envelope wraps the request with an optional trace_id).
         // Falls back to bare AgentRequest for backward compatibility with old hosts.
-        let (request, trace_id) =
+        let (mut request, trace_id) =
             match serde_json::from_slice::<Envelope<AgentRequest>>(&buf[..len]) {
                 Ok(env) => (env.body, env.trace_id),
                 Err(_) => match serde_json::from_slice::<AgentRequest>(&buf[..len]) {
@@ -1201,6 +1623,11 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
                 },
             };
 
+        // Work around serde flatten + internally-tagged enum limitation:
+        // fields with #[serde(default)] can be silently dropped during
+        // deserialization. Re-extract timeout_ms from the raw JSON.
+        patch_timeout_ms(&mut request, &buf[..len]);
+
         let _span = if let Some(ref tid) = trace_id {
             tracing::info_span!("request", trace_id = %tid, method = ?request)
         } else {
@@ -1218,6 +1645,12 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
         {
             // Handle interactive session
             handle_interactive_run(stream, request)?;
+            continue;
+        }
+
+        // Detached run — start container in background and return its container ID.
+        if let AgentRequest::Run { detached: true, .. } = &request {
+            handle_run_detached(stream, request)?;
             continue;
         }
 
@@ -1363,7 +1796,7 @@ fn handle_request(
 
         AgentRequest::ListImages => handle_list_images(),
 
-        AgentRequest::GarbageCollect { dry_run } => handle_gc(dry_run),
+        AgentRequest::GarbageCollect { dry_run, purge_all } => handle_gc(dry_run, purge_all),
 
         AgentRequest::PrepareOverlay { image, workload_id } => {
             handle_prepare_overlay(&image, &workload_id)
@@ -1478,21 +1911,39 @@ fn handle_request(
             command,
             env,
             workdir,
+            user,
             mounts,
             timeout_ms,
             interactive: false,
             tty: false,
+            detached: false,
             persistent_overlay_id,
-        } => handle_run(
-            &image,
-            &command,
-            &env,
-            workdir.as_deref(),
-            &mounts,
-            timeout_ms,
-            persistent_overlay_id.as_deref(),
-            client_fd,
-        ),
+            background,
+        } => {
+            if background {
+                handle_run_background(
+                    &image,
+                    &command,
+                    &env,
+                    workdir.as_deref(),
+                    user.as_deref(),
+                    &mounts,
+                    persistent_overlay_id.as_deref(),
+                )
+            } else {
+                handle_run(
+                    &image,
+                    &command,
+                    &env,
+                    workdir.as_deref(),
+                    user.as_deref(),
+                    &mounts,
+                    timeout_ms,
+                    persistent_overlay_id.as_deref(),
+                    client_fd,
+                )
+            }
+        }
 
         AgentRequest::Run { .. } => {
             // Interactive mode should be handled by handle_interactive_run
@@ -2160,13 +2611,14 @@ fn handle_interactive_run(
     request: AgentRequest,
 ) -> Result<(), Box<dyn std::error::Error>> {
     ensure_storage_mounted();
-    let (image, command, env, workdir, mounts, timeout_ms, tty, persistent_overlay_id) =
+    let (image, command, env, workdir, user, mounts, timeout_ms, tty, persistent_overlay_id) =
         match request {
             AgentRequest::Run {
                 image,
                 command,
                 env,
                 workdir,
+                user,
                 mounts,
                 timeout_ms,
                 tty,
@@ -2177,6 +2629,7 @@ fn handle_interactive_run(
                 command,
                 env,
                 workdir,
+                user,
                 mounts,
                 timeout_ms,
                 tty,
@@ -2230,8 +2683,10 @@ fn handle_interactive_run(
         &command,
         &env,
         workdir.as_deref(),
+        user.as_deref(),
         &mounts,
         tty,
+        persistent_overlay_id.as_deref(),
     ) {
         Ok(result) => result,
         Err(e) => {
@@ -2278,44 +2733,28 @@ fn handle_interactive_run(
 #[cfg(target_os = "linux")]
 const CONSOLE_SOCKET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Spawn a command for interactive execution using crun OCI runtime.
+/// Write an OCI bundle (`config.json`) and return a freshly generated container ID.
 ///
-/// When `tty` is true, the OCI spec sets `terminal: true` and the agent
-/// asks crun to allocate the container's PTY via `--console-socket`.
-/// crun sends the PTY master fd back to the agent over an AF_UNIX socket
-/// using `SCM_RIGHTS`; the agent then reads, writes, and resizes that
-/// master directly. This is the only way to make `TIOCSWINSZ` reach the
-/// process inside the container. Without `--console-socket` crun
-/// allocates its own PTY that the agent has no handle on, and every
-/// resize message is silently applied to the wrong terminal. See GH
-/// #156.
+/// Shared by [`handle_run_detached`] and [`spawn_interactive_command`] to avoid
+/// duplicating the identity-resolve → spec-build → mount-wiring → write sequence.
+/// The only caller-controlled variation is `tty` (detached: always `false`).
 #[cfg(target_os = "linux")]
-fn spawn_interactive_command(
-    rootfs: &str,
+fn write_oci_bundle(
+    rootfs_path: &std::path::Path,
+    bundle_path: &std::path::Path,
     command: &[String],
     env: &[(String, String)],
     workdir: Option<&str>,
+    user: Option<&str>,
     mounts: &[(String, String, bool)],
     tty: bool,
-) -> Result<(Child, Option<pty::PtyMaster>), Box<dyn std::error::Error>> {
+) -> Result<String, Box<dyn std::error::Error>> {
     use std::path::Path;
 
-    if command.is_empty() {
-        return Err("empty command".into());
-    }
-
-    let rootfs_path = Path::new(rootfs);
-    let overlay_root = rootfs_path
-        .parent()
-        .ok_or("invalid rootfs path: no parent")?;
-    let bundle_path = overlay_root.join("bundle");
-
-    if !bundle_path.exists() {
-        return Err(format!("bundle directory not found: {}", bundle_path.display()).into());
-    }
-
     let workdir_str = workdir.unwrap_or("/");
-    let mut spec = oci::OciSpec::new(command, env, workdir_str, tty);
+    let identity = oci::resolve_process_identity(rootfs_path, user)?;
+    let mut spec = oci::OciSpec::new(command, env, workdir_str, tty, &identity);
+
     if tty {
         // Give the PTY a non-zero starting size. The host follows up with a
         // Resize message carrying the real terminal dimensions as soon as
@@ -2335,19 +2774,490 @@ fn spawn_interactive_command(
         );
     }
 
-    // Shared workspace: /storage/workspace → /workspace inside container
-    let workspace_src = std::path::Path::new("/storage/workspace");
-    if workspace_src.exists() {
-        spec.add_bind_mount(&workspace_src.to_string_lossy(), "/workspace", false);
-    }
+    storage::add_workspace_fallback(&mut spec, mounts);
 
-    // Forward SSH agent into the container if enabled at boot.
     ssh_agent::inject_into_container(&mut spec);
-
-    spec.write_to(&bundle_path)
+    spec.write_to(bundle_path)
         .map_err(|e| format!("failed to write OCI spec: {}", e))?;
 
-    let container_id = oci::generate_container_id();
+    Ok(oci::generate_container_id())
+}
+
+/// Handle a detached run request: start a container in the background and
+/// return its container ID to the caller.
+///
+/// The container ID is saved to `main_container_id_path(workload_id)` so that
+/// subsequent `machine exec` calls can join the container via `crun exec`
+/// instead of creating a new isolated container.
+///
+/// Requires `persistent_overlay_id` to be set — detached containers must
+/// persist across exec sessions, which requires a named overlay.
+#[cfg(target_os = "linux")]
+fn handle_run_detached(
+    stream: &mut impl ReadWrite,
+    request: AgentRequest,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::path::Path;
+
+    ensure_storage_mounted();
+
+    let (image, command, env, workdir, user, mounts, persistent_overlay_id) = match request {
+        AgentRequest::Run {
+            image,
+            command,
+            env,
+            workdir,
+            user,
+            mounts,
+            persistent_overlay_id,
+            ..
+        } => (
+            image,
+            command,
+            env,
+            workdir,
+            user,
+            mounts,
+            persistent_overlay_id,
+        ),
+        _ => {
+            send_response(
+                stream,
+                &AgentResponse::error("expected Run request", error_codes::INVALID_REQUEST),
+            )?;
+            return Ok(());
+        }
+    };
+
+    // Validate inputs before creating any overlay state.
+    if command.is_empty() {
+        send_response(
+            stream,
+            &AgentResponse::error("empty command", error_codes::INVALID_REQUEST),
+        )?;
+        return Ok(());
+    }
+
+    let overlay_id = match persistent_overlay_id {
+        Some(id) => id,
+        None => {
+            send_response(
+                stream,
+                &AgentResponse::error(
+                    "detached mode requires persistent_overlay_id",
+                    error_codes::INVALID_REQUEST,
+                ),
+            )?;
+            return Ok(());
+        }
+    };
+
+    info!(
+        image = %image,
+        command = ?command,
+        overlay_id = %overlay_id,
+        "starting detached container"
+    );
+
+    let prepared = match storage::prepare_for_run_persistent(&image, &overlay_id) {
+        Ok(p) => p,
+        Err(e) => {
+            send_response(stream, &AgentResponse::from_err(e, error_codes::RUN_FAILED))?;
+            return Ok(());
+        }
+    };
+
+    if let Err(e) = storage::setup_mounts(&prepared.rootfs_path, &mounts) {
+        send_response(
+            stream,
+            &AgentResponse::from_err(e, error_codes::MOUNT_FAILED),
+        )?;
+        return Ok(());
+    }
+
+    let rootfs_path = Path::new(&prepared.rootfs_path);
+    let bundle_path = match rootfs_path.parent() {
+        Some(p) => p.join("bundle"),
+        None => {
+            send_response(
+                stream,
+                &AgentResponse::error(
+                    "invalid rootfs path: no parent",
+                    error_codes::INTERNAL_ERROR,
+                ),
+            )?;
+            return Ok(());
+        }
+    };
+
+    if !bundle_path.exists() {
+        send_response(
+            stream,
+            &AgentResponse::error(
+                format!("bundle directory not found: {}", bundle_path.display()),
+                error_codes::INTERNAL_ERROR,
+            ),
+        )?;
+        return Ok(());
+    }
+
+    let workload_id = format!("persistent-{}", overlay_id);
+
+    // Detached containers always run non-interactively (tty: false).
+    let container_id = match write_oci_bundle(
+        rootfs_path,
+        &bundle_path,
+        &command,
+        &env,
+        workdir.as_deref(),
+        user.as_deref(),
+        &mounts,
+        false,
+    ) {
+        Ok(id) => id,
+        Err(e) => {
+            send_response(
+                stream,
+                &AgentResponse::from_err(e, error_codes::INTERNAL_ERROR),
+            )?;
+            return Ok(());
+        }
+    };
+
+    info!(
+        container_id = %container_id,
+        workload_id = %workload_id,
+        "running detached container"
+    );
+
+    // Use `crun create` + `crun start` (two-step OCI lifecycle) instead of
+    // `crun run --detach` which hangs in the smolvm VM environment. The
+    // two-step approach registers the container state so `crun exec` can join
+    // it, and `crun start` returns immediately once the container is running.
+    let create_output = crun::CrunCommand::create(&bundle_path, &container_id).output();
+    match create_output {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            send_response(
+                stream,
+                &AgentResponse::error(
+                    format!("crun create failed: {}", stderr.trim()),
+                    error_codes::SPAWN_FAILED,
+                ),
+            )?;
+            return Ok(());
+        }
+        Err(e) => {
+            send_response(
+                stream,
+                &AgentResponse::from_err(e, error_codes::SPAWN_FAILED),
+            )?;
+            return Ok(());
+        }
+    }
+
+    let start_output = crun::CrunCommand::start(&container_id).output();
+    match start_output {
+        Ok(output) if output.status.success() => {
+            // Save the container ID so subsequent execs can join this container.
+            // If the write fails, kill the container and return an error — exec
+            // join won't work without the persisted ID.
+            let id_path = paths::main_container_id_path(&workload_id);
+            if let Err(e) = std::fs::write(&id_path, container_id.as_bytes()) {
+                let _ = crun::CrunCommand::kill(&container_id, "SIGKILL").status();
+                let _ = crun::CrunCommand::delete(&container_id, true).output();
+                send_response(
+                    stream,
+                    &AgentResponse::error(
+                        format!("failed to persist container ID: {}", e),
+                        error_codes::INTERNAL_ERROR,
+                    ),
+                )?;
+                return Ok(());
+            }
+            info!(
+                container_id = %container_id,
+                "detached container started via create+start"
+            );
+            send_response(
+                stream,
+                &AgentResponse::Completed {
+                    exit_code: 0,
+                    stdout: container_id.into_bytes(),
+                    stderr: vec![],
+                },
+            )?;
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // Clean up the created-but-not-started container
+            let _ = crun::CrunCommand::delete(&container_id, true).output();
+            send_response(
+                stream,
+                &AgentResponse::error(
+                    format!("crun start failed: {}", stderr.trim()),
+                    error_codes::SPAWN_FAILED,
+                ),
+            )?;
+        }
+        Err(e) => {
+            let _ = crun::CrunCommand::delete(&container_id, true).output();
+            send_response(
+                stream,
+                &AgentResponse::from_err(e, error_codes::SPAWN_FAILED),
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Non-Linux stub: the agent only runs on Linux; this exists so the host-side
+/// `cargo check` on macOS compiles the dispatch in `handle_connection`.
+#[cfg(not(target_os = "linux"))]
+fn handle_run_detached(
+    stream: &mut impl ReadWrite,
+    _request: AgentRequest,
+) -> Result<(), Box<dyn std::error::Error>> {
+    send_response(
+        stream,
+        &AgentResponse::error(
+            "detached mode not supported on this platform",
+            error_codes::INTERNAL_ERROR,
+        ),
+    )?;
+    Ok(())
+}
+
+/// Check whether a crun container is currently running by querying `crun state`
+/// and verifying the PID is still alive.
+///
+/// Returns `false` on any error (missing state files, parse failures, etc.)
+/// so callers fall through to starting a fresh container.
+#[cfg(target_os = "linux")]
+pub fn is_container_running(container_id: &str) -> bool {
+    let output = match crun::CrunCommand::state(container_id)
+        .capture_output()
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return false,
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let stdout = match std::str::from_utf8(&output.stdout) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let v: serde_json::Value = match serde_json::from_str(stdout) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    let is_running = v
+        .get("status")
+        .and_then(|s| s.as_str())
+        .map(|s| s == "running")
+        .unwrap_or(false);
+    if !is_running {
+        return false;
+    }
+
+    let pid = v.get("pid").and_then(|p| p.as_i64()).unwrap_or(0);
+    if pid <= 0 {
+        return false;
+    }
+
+    // kill(pid, 0) checks process existence without sending a signal.
+    // Handles stale "running" state left after SIGKILL of a container.
+    // SAFETY: signal 0 never terminates a process; checks existence only.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+/// Non-Linux stub.
+#[cfg(not(target_os = "linux"))]
+pub fn is_container_running(_container_id: &str) -> bool {
+    false
+}
+
+/// Spawn a command by joining a running container via `crun exec`.
+///
+/// Used when a main workload container is already running for this overlay —
+/// the new command joins its existing PID/mount/cgroup namespaces rather than
+/// creating an isolated new container.
+///
+/// When `tty` is true the PTY is obtained from crun via `--console-socket`,
+/// exactly like the fresh `crun run` path in [`spawn_interactive_command`].
+/// Letting crun allocate the PTY (rather than handing it a slave from an
+/// agent-owned pair) is what makes `TIOCSWINSZ` resizes reach the process
+/// inside the container; without it TUIs never redraw on host resize. See
+/// GH #156.
+#[cfg(target_os = "linux")]
+fn spawn_exec_in_container(
+    container_id: &str,
+    command: &[String],
+    env: &[(String, String)],
+    workdir: Option<&str>,
+    tty: bool,
+) -> Result<(Child, Option<pty::PtyMaster>), Box<dyn std::error::Error>> {
+    info!(
+        container_id = %container_id,
+        command = ?command,
+        tty = tty,
+        "joining running container via crun exec"
+    );
+
+    if tty {
+        // Bind a unix socket for crun's --console-socket handshake before
+        // spawning crun; otherwise crun will fail to connect.
+        let console_dir = tempfile::Builder::new()
+            .prefix("smolvm-console-")
+            .tempdir()
+            .map_err(|e| format!("failed to create console socket dir: {}", e))?;
+        let socket_path = console_dir.path().join("console.sock");
+        let console = console_socket::ConsoleSocket::new(&socket_path)
+            .map_err(|e| format!("failed to bind console socket: {}", e))?;
+
+        let mut child = crun::CrunCommand::exec(container_id, env, command, workdir, true)
+            .console_socket(&socket_path)
+            .stdin_null()
+            .spawn()?;
+
+        let pty_master = match console.recv_pty_master(CONSOLE_SOCKET_TIMEOUT) {
+            Ok(m) => m,
+            Err(e) => {
+                // crun died before handing us a PTY master. Report what it
+                // was doing so we do not just see a bare timeout.
+                let status = child.try_wait().ok().flatten();
+                error!(
+                    error = %e,
+                    crun_status = ?status,
+                    "failed to receive PTY master from crun exec"
+                );
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("failed to receive PTY master from crun exec: {}", e).into());
+            }
+        };
+
+        // `console` and `console_dir` drop at end of scope (after the tail
+        // return moves `child` and `pty_master` out), removing the socket
+        // file and temp dir once the handshake is done.
+        Ok((child, Some(pty_master)))
+    } else {
+        let child = crun::CrunCommand::exec(container_id, env, command, workdir, false)
+            .stdin_piped()
+            .capture_output()
+            .spawn()?;
+        Ok((child, None))
+    }
+}
+
+/// Look up a running main workload container for the given overlay ID.
+///
+/// Returns `Some(container_id)` if a container is registered and alive.
+/// Cleans up stale state (dead container ID file, orphaned crun state)
+/// and returns `None` so the caller falls through to a fresh `crun run`.
+///
+/// Used by both interactive and non-interactive exec paths.
+#[cfg(target_os = "linux")]
+pub fn resolve_main_container(persistent_overlay_id: Option<&str>) -> Option<String> {
+    let overlay_id = persistent_overlay_id?;
+    let workload_id = format!("persistent-{}", overlay_id);
+    let id_path = paths::main_container_id_path(&workload_id);
+
+    let cid = std::fs::read_to_string(&id_path).ok()?;
+    let cid = cid.trim().to_string();
+    if cid.is_empty() {
+        return None;
+    }
+
+    if is_container_running(&cid) {
+        return Some(cid);
+    }
+
+    // Stale: container died. Clean up the ID file and crun state.
+    info!(container_id = %cid, "main container not running, cleaning up stale state");
+    let _ = std::fs::remove_file(&id_path);
+    let _ = crun::CrunCommand::delete(&cid, true).output();
+    None
+}
+
+/// Non-Linux stub.
+#[cfg(not(target_os = "linux"))]
+pub fn resolve_main_container(_persistent_overlay_id: Option<&str>) -> Option<String> {
+    None
+}
+
+/// Spawn a command for interactive execution using crun OCI runtime.
+///
+/// When `tty` is true, the OCI spec sets `terminal: true` and the agent
+/// asks crun to allocate the container's PTY via `--console-socket`.
+/// crun sends the PTY master fd back to the agent over an AF_UNIX socket
+/// using `SCM_RIGHTS`; the agent then reads, writes, and resizes that
+/// master directly. This is the only way to make `TIOCSWINSZ` reach the
+/// process inside the container. Without `--console-socket` crun
+/// allocates its own PTY that the agent has no handle on, and every
+/// resize message is silently applied to the wrong terminal. See GH
+/// #156.
+#[cfg(target_os = "linux")]
+fn spawn_interactive_command(
+    rootfs: &str,
+    command: &[String],
+    env: &[(String, String)],
+    workdir: Option<&str>,
+    user: Option<&str>,
+    mounts: &[(String, String, bool)],
+    tty: bool,
+    persistent_overlay_id: Option<&str>,
+) -> Result<(Child, Option<pty::PtyMaster>), Box<dyn std::error::Error>> {
+    use std::path::Path;
+
+    if command.is_empty() {
+        return Err("empty command".into());
+    }
+
+    // If a main workload container is running for this overlay, join it.
+    if let Some(cid) = resolve_main_container(persistent_overlay_id) {
+        return spawn_exec_in_container(&cid, command, env, workdir, tty);
+    }
+
+    let rootfs_path = Path::new(rootfs);
+    let overlay_root = rootfs_path
+        .parent()
+        .ok_or("invalid rootfs path: no parent")?;
+    let bundle_path = overlay_root.join("bundle");
+
+    if !bundle_path.exists() {
+        return Err(format!("bundle directory not found: {}", bundle_path.display()).into());
+    }
+
+    // Build the OCI bundle (config.json) and get a fresh container ID. When
+    // tty=true the spec sets terminal:true and a starting consoleSize, and the
+    // PTY master is obtained from crun via --console-socket below.
+    let container_id = write_oci_bundle(
+        rootfs_path,
+        &bundle_path,
+        command,
+        env,
+        workdir,
+        user,
+        mounts,
+        tty,
+    )?;
+
+    // Persist the container ID so subsequent execs join this container.
+    // Written before spawn: if spawn fails the ID is stale, but
+    // is_container_running() will return false and the next exec starts fresh.
+    if let Some(overlay_id) = persistent_overlay_id {
+        let workload_id = format!("persistent-{}", overlay_id);
+        let _ = std::fs::write(
+            paths::main_container_id_path(&workload_id),
+            container_id.as_bytes(),
+        );
+    }
 
     info!(
         command = ?command,
@@ -2411,8 +3321,10 @@ fn spawn_interactive_command(
     command: &[String],
     env: &[(String, String)],
     workdir: Option<&str>,
+    user: Option<&str>,
     mounts: &[(String, String, bool)],
     _tty: bool,
+    _persistent_overlay_id: Option<&str>,
 ) -> Result<(Child, Option<()>), Box<dyn std::error::Error>> {
     use std::path::Path;
 
@@ -2431,7 +3343,9 @@ fn spawn_interactive_command(
     }
 
     let workdir_str = workdir.unwrap_or("/");
-    let mut spec = oci::OciSpec::new(command, env, workdir_str, false);
+    let identity = oci::resolve_process_identity(rootfs_path, user)?;
+    let mut spec = oci::OciSpec::new(command, env, workdir_str, false, &identity);
+    spec.add_gpu_devices_if_available();
 
     for (tag, container_path, read_only) in mounts {
         let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
@@ -2442,11 +3356,7 @@ fn spawn_interactive_command(
         );
     }
 
-    // Shared workspace: /storage/workspace → /workspace inside container
-    let workspace_src = std::path::Path::new("/storage/workspace");
-    if workspace_src.exists() {
-        spec.add_bind_mount(&workspace_src.to_string_lossy(), "/workspace", false);
-    }
+    storage::add_workspace_fallback(&mut spec, mounts);
 
     // Forward SSH agent into the container if enabled at boot.
     ssh_agent::inject_into_container(&mut spec);
@@ -2849,8 +3759,16 @@ fn run_interactive_loop_pty(
 
             match request {
                 AgentRequest::Stdin { data } => {
-                    // For PTY, empty stdin is not EOF (Ctrl+D is a byte).
-                    if !data.is_empty() {
+                    if data.is_empty() {
+                        // Host stdin reached EOF. A PTY cannot have one
+                        // direction closed, so signal end-of-input to the
+                        // child by writing the EOF control character (VEOF,
+                        // Ctrl-D / 0x04). In canonical mode this makes the
+                        // child's next read on the slave return 0. Without
+                        // it, a stdin-reading child (cat, sh, read) never
+                        // terminates and the exec session hangs.
+                        let _ = pty_master.write_all(&[0x04]);
+                    } else {
                         let _ = pty_master.write_all(&data);
                     }
                 }
@@ -3183,11 +4101,46 @@ fn test_tcp_syscall(target: &str) -> serde_json::Value {
 }
 
 /// Handle command execution request (non-interactive).
+/// Handle a background `Run` request — spawn the container and return its PID.
+///
+/// Background mode requires a persistent overlay ID; an ephemeral overlay
+/// would leak because nothing waits for the container to exit to clean it
+/// up. The returned PID is the crun process, which stays alive as long as
+/// the container's init process runs.
+fn handle_run_background(
+    image: &str,
+    command: &[String],
+    env: &[(String, String)],
+    workdir: Option<&str>,
+    user: Option<&str>,
+    mounts: &[(String, String, bool)],
+    persistent_overlay_id: Option<&str>,
+) -> AgentResponse {
+    info!(image = %image, command = ?command, mounts = ?mounts, "running command in background");
+
+    let Some(overlay_id) = persistent_overlay_id else {
+        return AgentResponse::error(
+            "background run requires persistent_overlay_id",
+            error_codes::INVALID_REQUEST,
+        );
+    };
+
+    match storage::spawn_in_overlay(image, command, env, workdir, user, mounts, overlay_id) {
+        Ok(pid) => AgentResponse::Completed {
+            exit_code: 0,
+            stdout: format!("{}", pid).into_bytes(),
+            stderr: Vec::new(),
+        },
+        Err(e) => AgentResponse::from_err(e, error_codes::RUN_FAILED),
+    }
+}
+
 fn handle_run(
     image: &str,
     command: &[String],
     env: &[(String, String)],
     workdir: Option<&str>,
+    user: Option<&str>,
     mounts: &[(String, String, bool)],
     timeout_ms: Option<u64>,
     persistent_overlay_id: Option<&str>,
@@ -3200,6 +4153,7 @@ fn handle_run(
         command,
         env,
         workdir,
+        user,
         mounts,
         timeout_ms,
         persistent_overlay_id,
@@ -3271,7 +4225,12 @@ fn handle_list_images() -> AgentResponse {
 }
 
 /// Handle garbage collection request.
-fn handle_gc(dry_run: bool) -> AgentResponse {
+fn handle_gc(dry_run: bool, purge_all: bool) -> AgentResponse {
+    if purge_all && !dry_run {
+        if let Err(e) = storage::purge_all_images() {
+            return AgentResponse::from_err(e, error_codes::GC_FAILED);
+        }
+    }
     match storage::garbage_collect(dry_run) {
         Ok(freed) => AgentResponse::ok_with_data(serde_json::json!({
             "freed_bytes": freed,
@@ -3383,22 +4342,55 @@ fn handle_storage_status() -> AgentResponse {
 // VM-Level Exec Handlers (Direct Execution in VM)
 // ============================================================================
 
-/// Handle VM-level exec (non-interactive).
-/// Executes command directly in the VM's rootfs without any container isolation.
+/// PIDs of background children the agent owns and must reap.
+///
+/// Populated by [`register_background_child`] when a background-mode
+/// handler (`handle_vm_exec_background`, `handle_run_background`)
+/// spawns + forgets a process. Cleared by [`reap_background_children`].
+///
+/// Scoping to known PIDs is required once the accept loop is
+/// multi-threaded: an unscoped `waitpid(-1, WNOHANG)` would steal the
+/// exit status from *any* exited child — including the foreground
+/// crun processes that per-request handlers are actively waiting on —
+/// and produce ECHILD races under concurrent load.
+static BG_CHILDREN: OnceLock<std::sync::Mutex<Vec<u32>>> = OnceLock::new();
+
+fn bg_children() -> &'static std::sync::Mutex<Vec<u32>> {
+    BG_CHILDREN.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Track a PID so a later [`reap_background_children`] waits on it.
+///
+/// Callers should pair this with `std::mem::forget(child)` so the
+/// Rust `Child` doesn't also race to reap the process on drop.
+fn register_background_child(pid: u32) {
+    bg_children().lock().unwrap().push(pid);
+}
+
 /// Reap any exited background children to prevent zombie accumulation.
 ///
-/// Called periodically in the accept loop. Uses `waitpid(-1, WNOHANG)`
-/// to collect all exited children without blocking. Safe to call even
-/// when no background children exist.
+/// Called periodically in the accept loop. Walks the registered PID
+/// list and issues a per-PID `waitpid(..., WNOHANG)` — non-blocking
+/// and scoped, so it never steals exit statuses from foreground
+/// handlers running in sibling threads.
 #[cfg(target_os = "linux")]
 fn reap_background_children() {
-    loop {
-        let ret = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
-        if ret <= 0 {
-            break;
+    let mut guard = bg_children().lock().unwrap();
+    guard.retain(|&pid| {
+        let ret = unsafe { libc::waitpid(pid as i32, std::ptr::null_mut(), libc::WNOHANG) };
+        match ret {
+            // >0 = child was reaped; drop from tracking.
+            r if r > 0 => {
+                debug!(pid, "reaped background child");
+                false
+            }
+            // 0 = still running; keep tracking for the next sweep.
+            0 => true,
+            // <0 = error (typically ECHILD — already reaped elsewhere or the
+            // PID was detached in a way we don't own). Drop either way.
+            _ => false,
         }
-        debug!(pid = ret, "reaped background child");
-    }
+    });
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -3438,9 +4430,12 @@ fn handle_vm_exec_background(
     match cmd.spawn() {
         Ok(child) => {
             let pid = child.id();
-            // Don't wait — let the child run independently.
-            // reap_background_children() in the accept loop collects the exit status.
+            // Don't wait — let the child run independently. The Rust
+            // `Child` is forgotten so drop doesn't race our reaper, and
+            // the PID is registered so reap_background_children()
+            // collects the eventual exit status.
             std::mem::forget(child);
+            register_background_child(pid);
             info!(pid = pid, "background process started");
             AgentResponse::Completed {
                 exit_code: 0,
@@ -3481,6 +4476,10 @@ fn handle_vm_exec(
         cmd.current_dir(wd);
     }
 
+    // Commands that don't receive interactive stdin should get EOF
+    // immediately, not block on /dev/console (the agent's inherited stdin).
+    // Without this, `exec -- cat` hangs until the connection times out.
+    cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
@@ -3518,7 +4517,7 @@ fn handle_vm_exec(
     // write() while the agent blocks waiting for the child to exit — neither
     // side makes progress. See docs/exec-streaming-unification.md for the
     // long-term fix (streaming exec).
-    const MAX_OUTPUT: usize = 16 * 1024 * 1024;
+    const MAX_OUTPUT: usize = crate::process::MAX_EXEC_OUTPUT;
 
     // Use read_to_end (not read_to_string) so binary output (image bytes,
     // tarballs, any non-UTF-8 data) is preserved through the protocol.
@@ -3780,6 +4779,98 @@ fn send_response(
 /// Trait for read+write streams with raw fd access.
 trait ReadWrite: Read + Write + AsRawFd {}
 impl<T: Read + Write + AsRawFd> ReadWrite for T {}
+
+/// Regression tests for the scoped background-child reaper.
+///
+/// These are the companion to the accept-loop threading change. The bug
+/// they guard against: once the accept loop spawns a thread per
+/// connection, an unscoped `waitpid(-1, WNOHANG)` in the reaper steals
+/// exit statuses from any foreground crun process that a sibling thread
+/// is waiting on, producing ECHILD races and "command died mid-run"
+/// failures. Scoped reaping must only touch PIDs registered as
+/// background.
+///
+/// Linux-only because `waitpid` behavior + the agent crate as a whole
+/// is Linux-specific. `cargo test -p smolvm-agent --target
+/// aarch64-unknown-linux-musl` on a Linux runner.
+#[cfg(test)]
+#[cfg(target_os = "linux")]
+mod bg_reap_tests {
+    use super::*;
+    use std::process::Command;
+    use std::time::Duration;
+
+    #[test]
+    fn reaper_leaves_unregistered_children_waitable() {
+        // Foreground child: the test owns it and will wait on it. The
+        // reaper must NOT steal it.
+        let mut foreground = Command::new("/bin/true")
+            .spawn()
+            .expect("spawn foreground /bin/true");
+        let fg_pid = foreground.id();
+
+        // Background child: registered, and the Rust Child handle is
+        // forgotten so drop doesn't race the reaper.
+        let background = Command::new("/bin/true")
+            .spawn()
+            .expect("spawn background /bin/true");
+        let bg_pid = background.id();
+        register_background_child(bg_pid);
+        std::mem::forget(background);
+
+        // Let both exit before we reap.
+        std::thread::sleep(Duration::from_millis(150));
+
+        reap_background_children();
+
+        // Foreground must still be reapable via the Rust Child. If the
+        // unscoped reaper stole it, wait() returns ECHILD and this
+        // expect() fires — that's exactly the concurrent-exec bug.
+        let status = foreground.wait().expect(
+            "foreground child must still be waitable — reaper must not touch unregistered PIDs",
+        );
+        assert!(status.success(), "foreground /bin/true should succeed");
+
+        // Background PID should be gone from tracking (reaped). Check
+        // only this test's PID so parallel tests don't interfere.
+        let tracked = bg_children().lock().unwrap().clone();
+        assert!(
+            !tracked.contains(&bg_pid),
+            "reaped bg PID {} must be removed from tracking",
+            bg_pid
+        );
+        assert!(
+            !tracked.contains(&fg_pid),
+            "unregistered fg PID {} must never enter tracking",
+            fg_pid
+        );
+    }
+
+    #[test]
+    fn reaper_retains_still_running_background_children() {
+        // A registered but still-alive child must stay in tracking so a
+        // subsequent sweep collects it after it exits.
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep 30");
+        let pid = child.id();
+        register_background_child(pid);
+
+        reap_background_children();
+
+        let tracked = bg_children().lock().unwrap().clone();
+        assert!(
+            tracked.contains(&pid),
+            "still-running bg PID {} must remain in tracking",
+            pid
+        );
+
+        // Clean up so the test doesn't leak a 30-second sleep.
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -29,7 +29,7 @@ use axum::{
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::agent::{AgentClient, AgentManager, HostMount};
+use crate::agent::{vm_data_dir, AgentClient, AgentManager, HostMount};
 use crate::api::error::ApiError;
 use crate::api::state::{
     vm_resources_to_spec, ApiState, MachineEntry, MachineRegistration, ReservationGuard,
@@ -97,7 +97,7 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
         network: record.network,
         storage_gb: record.storage_gb,
         overlay_gb: record.overlay_gb,
-        created_at: record.created_at.clone(),
+        created_at: record.created_at,
     }
 }
 
@@ -320,6 +320,7 @@ pub async fn create_machine(
         cpus: Some(cpus),
         memory_mb: Some(mem),
         network: Some(network),
+        gpu: Some(req.gpu),
         storage_gb: req.storage_gb,
         overlay_gb: req.overlay_gb,
         allowed_cidrs: req.allowed_cidrs.clone(),
@@ -331,7 +332,22 @@ pub async fn create_machine(
         mounts: req.mounts.clone(),
         ports: req.ports.clone(),
         resources: resources.clone(),
-        restart: RestartConfig::default(),
+        restart: match req.restart {
+            Some(ref spec) => {
+                let policy = spec
+                    .policy
+                    .as_deref()
+                    .unwrap_or("never")
+                    .parse()
+                    .map_err(|e: String| ApiError::BadRequest(e))?;
+                RestartConfig {
+                    policy,
+                    max_retries: spec.max_retries.unwrap_or(0),
+                    ..Default::default()
+                }
+            }
+            None => RestartConfig::default(),
+        },
         network,
         image,
         source_smolmachine,
@@ -663,6 +679,14 @@ pub async fn delete_machine(
         Err(e) => return Err(e),
     }
 
+    // Remove VM data directory (disk images, sockets, etc.)
+    let data_dir = vm_data_dir(&name);
+    if data_dir.exists() {
+        if let Err(e) = std::fs::remove_dir_all(&data_dir) {
+            tracing::warn!(error = %e, "failed to remove VM data directory: {}", data_dir.display());
+        }
+    }
+
     Ok(Json(DeleteResponse { deleted: name }))
 }
 
@@ -904,7 +928,7 @@ mod tests {
         assert_eq!(info.ports.len(), 0);
         assert!(!info.network);
         assert!(info.pid.is_none());
-        assert!(!info.created_at.is_empty());
+        assert!(info.created_at > 0);
     }
 
     #[test]
@@ -921,7 +945,7 @@ mod tests {
     #[allow(dead_code)]
     fn setup_test_state() -> (TempDir, Arc<ApiState>) {
         let dir = TempDir::new().expect("failed to create temp dir");
-        let db_path = dir.path().join("test.redb");
+        let db_path = dir.path().join("test.db");
         let db = SmolvmDb::open_at(&db_path).expect("failed to open test db");
         let state = Arc::new(ApiState::with_db(db));
         (dir, state)

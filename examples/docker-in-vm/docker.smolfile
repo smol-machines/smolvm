@@ -1,0 +1,93 @@
+# Docker inside a smolvm microVM
+#
+# Runs Docker Engine in a bare Alpine VM. No OCI image or crun involved —
+# init commands run directly in the VM as root via VmExec, so Docker gets
+# full kernel privileges without any capability restrictions.
+#
+# ── Kernel requirements ───────────────────────────────────────────────────────
+#
+#   Requires libkrunfw built from config-libkrunfw_aarch64_lean (or later) with:
+#     CONFIG_OVERLAY_FS=y               — overlayfs (rootfs overlay)
+#     CONFIG_NETFILTER=y                — iptables/nftables for Docker networking
+#     CONFIG_NF_TABLES=y                — nftables netlink (Alpine's iptables-nft)
+#     CONFIG_NFT_COMPAT=y               — iptables compatibility via nftables
+#     CONFIG_BRIDGE=y                   — docker0 bridge interface
+#
+#   If the current libkrunfw.5.dylib lacks these, see docs/building-libkrunfw-macos.md.
+#
+# ── Storage driver note ───────────────────────────────────────────────────────
+#
+#   Docker's /var/lib/docker MUST be on ext4 (/dev/vda), not on the rootfs
+#   overlayfs. This is a hard requirement, not a workaround.
+#
+#   Why: the smolvm rootfs overlay uses the initramfs (ramfs) as its lower
+#   layer. Ramfs has no file-handle support (no exportfs). This propagates up
+#   through the overlayfs — any directory ON the rootfs overlay (like
+#   /var/lib/docker) also lacks file-handle support. The kernel then falls
+#   back to index=off and rejects it as an upper dir for Docker's nested
+#   overlay, regardless of CONFIG_OVERLAY_FS_REDIRECT_DIR or index=on mount
+#   options.
+#
+#   Fix: bind-mount /storage/docker → /var/lib/docker before starting dockerd.
+#   /storage/ is mounted from /dev/vda (ext4), which supports file handles.
+#   Docker's overlay2 layers then live on ext4 and nest correctly.
+#
+#   This bind-mount must be re-applied after every VM start (mounts don't
+#   persist across stop/start). The init commands create the directory on
+#   first start; the "Start dockerd" exec command does the bind-mount each
+#   time.
+#
+# ── Create and start ─────────────────────────────────────────────────────────
+#
+#   smolvm machine create docker -s examples/docker-in-vm/docker.smolfile --net-backend virtio-net
+#   smolvm machine start --name docker
+#
+# ── Start dockerd ─────────────────────────────────────────────────────────────
+#
+#   smolvm machine exec --name docker -- sh -c '
+#     mkdir -p /storage/docker /var/lib/docker
+#     mount --bind /storage/docker /var/lib/docker
+#     rm -f /var/run/docker.pid
+#     dockerd --storage-driver=overlay2 >/tmp/dockerd.log 2>&1 &
+#     for i in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 1; done
+#     docker info | grep "Storage Driver"'
+#
+# ── Run containers ────────────────────────────────────────────────────────────
+#
+#   # Pull an image
+#   smolvm machine exec --name docker -- docker pull alpine
+#
+#   # Run with bridge networking (default — requires netfilter kernel config)
+#   smolvm machine exec --name docker -- docker run --rm alpine echo "hello from docker"
+#
+#   # Run with host networking (works even without netfilter)
+#   smolvm machine exec --name docker -- docker run --rm --network=host alpine wget -qO- https://example.com
+#
+#   # Build an image
+#   smolvm machine exec --name docker -- sh -c '
+#     printf "FROM alpine\nRUN echo built" > /tmp/Dockerfile
+#     docker build -t myapp /tmp'
+#
+# ── Interactive shell inside a Docker container ───────────────────────────────
+#
+#   smolvm machine exec -i --name docker -- docker run --rm -i alpine sh
+#
+# ── Stop ─────────────────────────────────────────────────────────────────────
+#
+#   smolvm machine stop --name docker
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+cpus = 2
+memory = 2048
+net = true
+storage = 20
+
+init = [
+    "apk update -q",
+    # docker: daemon + CLI
+    "apk add docker -q",
+    # Bind /var/lib/docker to ext4 storage so overlay2 works (avoids overlay-on-overlay)
+    "mkdir -p /storage/docker /var/lib/docker",
+    "mount --bind /storage/docker /var/lib/docker",
+]

@@ -18,7 +18,11 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod guest_env;
+pub mod image_ref;
 pub mod retry;
+
+pub use image_ref::normalize_image_ref;
 
 /// Serde helper for encoding `Vec<u8>` as a base64 string in JSON.
 ///
@@ -92,6 +96,16 @@ pub const FILE_WRITE_CHUNK_SIZE: usize = FILE_WRITE_SINGLE_SHOT_MAX;
 /// blobs should stage via a virtiofs mount instead of `cp`.
 pub const FILE_TRANSFER_MAX_TOTAL: u64 = 4 * 1024 * 1024 * 1024;
 
+/// Filename of the virtiofs-visible marker the agent creates when it is
+/// ready to accept vsock connections.
+///
+/// The host polls for this file through its virtiofs mount of the guest
+/// rootfs. The agent writes it (and optionally a symlink from `/oldroot/`)
+/// during deferred init, just before opening the vsock listener.
+///
+/// Both sides must agree on this name; keeping it here prevents silent drift.
+pub const AGENT_READY_MARKER: &str = ".smolvm-ready";
+
 /// Well-known vsock ports.
 pub mod ports {
     /// Control channel for workload VMs.
@@ -151,6 +165,10 @@ pub enum AgentRequest {
     GarbageCollect {
         /// If true, only report what would be deleted.
         dry_run: bool,
+        /// If true, delete all image manifests and configs first,
+        /// making all layers unreferenced so they get collected.
+        #[serde(default)]
+        purge_all: bool,
     },
 
     /// Prepare overlay rootfs for a workload.
@@ -234,6 +252,9 @@ pub enum AgentRequest {
         env: Vec<(String, String)>,
         /// Working directory inside the rootfs.
         workdir: Option<String>,
+        /// User inside the rootfs. If omitted, the OCI image default applies.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user: Option<String>,
         /// Volume mounts to bind into the container.
         /// Each tuple is (virtiofs_tag, container_path, read_only).
         #[serde(default)]
@@ -251,12 +272,22 @@ pub enum AgentRequest {
         /// Enables terminal features like colors, line editing, and signal handling.
         #[serde(default)]
         tty: bool,
+        /// Detached mode — start the container and return immediately with the
+        /// container ID. Only meaningful when `persistent_overlay_id` is set.
+        /// Returns a `Completed` response with `stdout` containing the container ID.
+        #[serde(default)]
+        detached: bool,
         /// If set, use a persistent overlay that survives across exec sessions.
         /// The overlay is identified by this ID (typically the machine name)
         /// and reused on subsequent runs. If not set, an ephemeral overlay is
         /// created and destroyed after the run.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         persistent_overlay_id: Option<String>,
+        /// Spawn the container and return immediately with the crun PID.
+        /// The container runs detached; stdout/stderr go to /dev/null.
+        /// Incompatible with `interactive` and `tty`.
+        #[serde(default)]
+        background: bool,
     },
 
     /// Send stdin data to a running interactive command.
@@ -599,6 +630,9 @@ pub struct ImageInfo {
     /// Image working directory (from OCI config).
     #[serde(default)]
     pub workdir: Option<String>,
+    /// Image default user (from OCI config).
+    #[serde(default)]
+    pub user: Option<String>,
 }
 
 /// Overlay preparation result.

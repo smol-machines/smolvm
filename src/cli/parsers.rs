@@ -15,6 +15,18 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
     Ok(d)
 }
 
+/// Parse and validate `--gpu-vram <MiB>`. Rejects 0 at CLI parse time
+/// so the user gets a clear error instead of an opaque libkrun
+/// allocation failure later. See
+/// `smolvm::data::resources::validate_gpu_vram_mib`.
+pub fn parse_gpu_vram_mib(s: &str) -> Result<u32, String> {
+    let v: u32 = s
+        .parse()
+        .map_err(|_| format!("'{}' is not a valid MiB value", s))?;
+    smolvm::data::resources::validate_gpu_vram_mib(Some(v)).map_err(|e| e.to_string())?;
+    Ok(v)
+}
+
 // Env parsing delegated to the library.
 pub use smolvm::util::{parse_env_list, parse_env_spec};
 
@@ -77,6 +89,30 @@ pub use smolvm::smolfile::{parse_cidr, resolve_host_to_cidrs};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_gpu_vram_mib_rejects_zero() {
+        let err = parse_gpu_vram_mib("0").unwrap_err();
+        assert!(
+            err.contains("positive") || err.contains("> 0") || err.contains("omit"),
+            "expected actionable message, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn parse_gpu_vram_mib_rejects_nonnumeric() {
+        assert!(parse_gpu_vram_mib("abc").is_err());
+        assert!(parse_gpu_vram_mib("").is_err());
+        assert!(parse_gpu_vram_mib("-1").is_err());
+        assert!(parse_gpu_vram_mib("2.5").is_err());
+    }
+
+    #[test]
+    fn parse_gpu_vram_mib_accepts_positive() {
+        assert_eq!(parse_gpu_vram_mib("1").unwrap(), 1);
+        assert_eq!(parse_gpu_vram_mib("4096").unwrap(), 4096);
+    }
 
     #[test]
     fn resolve_host_bare_ip() {

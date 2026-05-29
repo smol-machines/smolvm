@@ -15,7 +15,7 @@ smolvm machine create --net myvm
 smolvm machine start --name myvm
 smolvm machine exec --name myvm -- apk add python3   # installs persist
 smolvm machine exec --name myvm -- which python3      # still there
-smolvm machine exec --name myvm -it -- /bin/sh
+smolvm machine shell --name myvm               # interactive shell (auto-starts if stopped)
 smolvm machine stop --name myvm
 smolvm machine delete myvm
 
@@ -45,12 +45,14 @@ smolvm machine exec --name my-vm -- pip install requests
 | Goal | Command |
 |------|---------|
 | Run a one-off command in isolation | `smolvm machine run --net --image IMAGE -- CMD` |
-| Interactive shell | `smolvm machine run --net -it --image IMAGE -- /bin/sh` |
+| Interactive shell (ephemeral) | `smolvm machine run --net -it --image IMAGE -- /bin/sh` |
+| Interactive shell (persistent) | `smolvm machine shell --name NAME` |
 | Persistent dev environment | `machine create` → `machine start` → `machine exec` |
 | Ship software as a binary | `smolvm pack create --image IMAGE -o OUTPUT` |
 | Fast persistent machine from packed artifact | `machine create NAME --from FILE.smolmachine` |
 | Use git/ssh with private keys safely | Add `--ssh-agent` to run or create |
 | Minimal VM without image | `smolvm machine run -s Smolfile` (bare VM) |
+| Change mounts/ports/resources on existing VM | `machine update NAME -v ./src:/app -p 8080:8080` |
 | Declarative VM config | Create a Smolfile, use `--smolfile`/`-s` flag |
 
 ### Persistence Model
@@ -69,6 +71,7 @@ All commands use named flags (no positional args except `machine create NAME` an
 ```
 smolvm machine run --image IMAGE [-- COMMAND]     # ephemeral
 smolvm machine exec --name NAME [-- COMMAND]      # run in existing VM
+smolvm machine shell [--name NAME]                # interactive shell (auto-starts)
 smolvm machine create NAME [OPTIONS]              # create persistent
 smolvm machine create NAME --from FILE.smolmachine  # from packed artifact
 smolvm machine start [--name NAME]                # start (default: "default")
@@ -76,6 +79,7 @@ smolvm machine stop [--name NAME]                 # stop
 smolvm machine delete NAME [-f]                   # delete
 smolvm machine status [--name NAME]               # check state
 smolvm machine ls [--json]                        # list all
+smolvm machine update NAME [OPTIONS]              # modify stopped machine settings
 smolvm machine cp SRC DST                         # copy files (host↔VM)
 smolvm machine exec --stream --name NAME -- CMD   # streaming output
 smolvm machine monitor [--name NAME]              # foreground health + restart
@@ -108,10 +112,12 @@ Default registry: `registry.smolmachines.com`. Digest references require `sha256
 | Flag | Short | Used on | Description |
 |------|-------|---------|-------------|
 | `--image` | `-I` | run, create, pack create | OCI image |
-| `--name` | `-n` | start, stop, status, exec, resize | Machine name (default: "default") |
+| `--name` | `-n` | run, start, stop, status, exec, update | Machine name (default: "default") |
 | `--net` | | run, create | Enable outbound networking (off by default) |
-| `--volume` | `-v` | run, create | Mount host dir: `HOST:GUEST[:ro]` |
-| `--port` | `-p` | run, create | Port mapping: `HOST:GUEST` |
+| `--gpu` | | run, create | Enable GPU acceleration (Vulkan via virtio-gpu) |
+| `--gpu-vram` | | run, create | GPU shared-memory region size in MiB (default: 4096). Ignored without `--gpu`. |
+| `--volume` | `-v` | run, create, update | Mount host dir: `HOST:GUEST[:ro]` |
+| `--port` | `-p` | run, create, update | Port mapping: `HOST:GUEST` |
 | `--smolfile` | `-s` | run, create, pack create | Load config from Smolfile |
 | `--interactive` | `-i` | run, exec | Keep stdin open |
 | `--tty` | `-t` | run, exec | Allocate pseudo-TTY |
@@ -135,6 +141,8 @@ workdir = "/app"                      # working directory
 cpus = 2                              # vCPUs (default: 4)
 memory = 1024                         # MiB (default: 8192, elastic via balloon)
 net = true                            # outbound networking (default: false)
+gpu = true                            # GPU acceleration (default: false)
+gpu_vram = 4096                       # GPU VRAM MiB (default: 4096, ignored unless gpu=true)
 storage = 40                          # storage disk GiB (default: 20)
 overlay = 4                           # overlay disk GiB (default: 2)
 
@@ -197,6 +205,31 @@ cpus/mem:   CLI flag > Smolfile > defaults (4 CPU, 8192 MiB)
 - `-p HOST:GUEST` forwards a host port to the VM (TCP)
 - Smolfile: use `[network] allow_hosts` and `[network] allow_cidrs`
 
+### Proxy Support
+
+Pass proxy settings into VMs with `-e` when behind a corporate proxy or VPN:
+
+```bash
+smolvm machine run --net \
+  -e https_proxy=http://proxy.corp:3128 \
+  -e http_proxy=http://proxy.corp:3128 \
+  -e no_proxy=localhost,127.0.0.1 \
+  --image alpine -- wget -q -O /dev/null https://example.com
+```
+
+Or declare them in a Smolfile:
+
+```toml
+net = true
+env = [
+  "https_proxy=http://proxy.corp:3128",
+  "http_proxy=http://proxy.corp:3128",
+  "no_proxy=localhost,127.0.0.1"
+]
+```
+
+Proxy vars are NOT forwarded automatically — each VM gets exactly the env you specify. The VM uses the host's DNS server (from `/etc/resolv.conf`) for name resolution.
+
 ## SSH Agent Forwarding
 
 Forward the host's SSH agent into the VM so git, ssh, and scp work with your keys — without the private keys ever entering the VM.
@@ -222,6 +255,43 @@ The host SSH agent signs challenges but never sends private keys across the boun
 
 Requires `SSH_AUTH_SOCK` to be set on the host. If missing, smolvm exits with an error and remediation instructions.
 
+## GPU Acceleration
+
+Enable the host GPU inside a VM with `--gpu`. Guest Vulkan talks to the host GPU via virtio-gpu/Venus; ANGLE uses it as the WebGL/OpenGL ES backend.
+
+**Host setup:**
+- macOS — bundled, no extra installs needed.
+- Linux — install virglrenderer from the system package manager before use:
+  - Alpine: `apk add virglrenderer mesa-vulkan-intel` (or `mesa-vulkan-ati` for AMD)
+  - Debian/Ubuntu: `apt install virglrenderer0 mesa-vulkan-drivers`
+
+```bash
+# One-shot GPU workload
+smolvm machine run --gpu --image alpine -- sh -c '
+  apk add --no-cache mesa-vulkan-virtio vulkan-tools
+  VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/virtio_icd.x86_64.json \
+  vulkaninfo --summary 2>/dev/null | grep deviceName
+'
+# → deviceName = Virtio-GPU Venus (Intel(R) UHD Graphics ...)
+
+# Persistent GPU machine
+smolvm machine create browser --gpu --gpu-vram 2048
+smolvm machine start --name browser
+smolvm machine exec --name browser -- \
+  chromium --headless=new --no-sandbox --use-gl=angle --use-angle=vulkan \
+    --screenshot=/tmp/out.png --window-size=1280,800 https://example.com
+```
+
+The guest must set `VK_ICD_FILENAMES` so the Vulkan loader finds the virtio ICD. Put it in `env` in a Smolfile to avoid repeating it on every exec:
+
+```toml
+gpu = true
+gpu_vram = 2048
+env = ["VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/virtio_icd.x86_64.json"]
+```
+
+For a complete working example see [`examples/headless-browser/browser.smolfile`](examples/headless-browser/browser.smolfile).
+
 ## File Copy
 
 Copy files between the host and a running machine using `machine:path` syntax:
@@ -244,7 +314,9 @@ same files.
 directory — bare VMs, image-based VMs, and machines created from
 `.smolmachine` artifacts. It persists across `exec` sessions and
 across `stop`/`start` cycles. It's a good default location for
-scripts, data, and results:
+scripts, data, and results. Passing `-v /host/dir:/workspace` replaces
+the default storage-disk workspace with your host directory for that
+run — the host mount takes priority and the storage workspace is skipped:
 
 ```bash
 # Typical agent workflow: copy code in, execute, extract results
@@ -377,6 +449,8 @@ OpenAPI spec: `smolvm serve openapi`
 ## Important Behaviors
 
 - **Observational commands don't stop running VMs.** `machine images`, `machine status`, `machine ls` and similar read-only commands leave a running VM in its current state. If the VM was already running before the command, it stays running after.
-- **`machine prune` requires the VM to be stopped.** Pruning layers while a VM has active containers could break things. Stop the VM first with `machine stop`, then prune.
+- **`machine prune` works on a running VM.** Regular prune only removes unreferenced layers and is safe while containers are active. `prune --all` requires the VM to be stopped first since it deletes manifests for layers that may be in use.
 - **`machine exec` persists filesystem changes.** Package installs, config edits, and file writes inside `exec` survive across sessions. This works for both bare VMs and image-based VMs (created with `--image`).
+- **`machine update` modifies a stopped machine.** Add/remove mounts, ports, env vars, or change CPU/memory without recreating the VM. Changes take effect on next `machine start`. Requires the machine to be stopped.
 - **`machine run` is always ephemeral.** The VM is created, the command runs, and everything is cleaned up. No state carries over.
+- **`-v host:/workspace` replaces the default workspace.** Every image-based VM exposes `/workspace` backed by the VM's storage disk. Mounting a host directory at `/workspace` takes priority — the host share is used instead and the storage-disk workspace is not mounted. Any other target path (e.g. `/data`, `/app`) does not affect `/workspace`.

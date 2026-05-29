@@ -8,168 +8,17 @@
 
 use crate::network::backend::{COMPAT_NET_FEATURES, TSI_FEATURE_HIJACK_INET};
 use crate::network::{plan_launch_network, EffectiveNetworkBackend};
-use crate::util::{libkrun_filename, libkrunfw_filename};
-use smolvm_network::{guest_env, start_virtio_network, GuestNetworkConfig, VirtioNetworkRuntime};
-use smolvm_protocol::ports;
-use std::ffi::{CStr, CString};
+use smolvm_network::{
+    start_virtio_network, GuestNetworkConfig, PortMapping as VirtioPortMapping,
+    VirtioNetworkRuntime,
+};
+use smolvm_protocol::{guest_env, ports};
+use std::ffi::CString;
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 
+pub use super::krun::KrunFunctions;
 use super::VmResources;
-
-/// Function pointers for libkrun, loaded via dlopen.
-///
-/// This struct parallels the `extern "C"` declarations in `launcher.rs`
-/// but loads them dynamically so we can use libkrun from extracted sidecar assets.
-#[allow(missing_docs)]
-pub struct KrunFunctions {
-    _handle: *mut libc::c_void,
-    _fw_handle: *mut libc::c_void,
-    pub set_log_level: unsafe extern "C" fn(u32) -> i32,
-    pub create_ctx: unsafe extern "C" fn() -> i32,
-    pub free_ctx: unsafe extern "C" fn(u32),
-    pub set_vm_config: unsafe extern "C" fn(u32, u8, u32) -> i32,
-    pub set_root: unsafe extern "C" fn(u32, *const libc::c_char) -> i32,
-    pub set_workdir: unsafe extern "C" fn(u32, *const libc::c_char) -> i32,
-    pub set_exec: unsafe extern "C" fn(
-        u32,
-        *const libc::c_char,
-        *const *const libc::c_char,
-        *const *const libc::c_char,
-    ) -> i32,
-    pub set_port_map: unsafe extern "C" fn(u32, *const *const libc::c_char) -> i32,
-    pub add_disk2:
-        unsafe extern "C" fn(u32, *const libc::c_char, *const libc::c_char, u32, bool) -> i32,
-    pub add_vsock_port2: unsafe extern "C" fn(u32, u32, *const libc::c_char, bool) -> i32,
-    pub add_virtiofs: unsafe extern "C" fn(u32, *const libc::c_char, *const libc::c_char) -> i32,
-    pub start_enter: unsafe extern "C" fn(u32) -> i32,
-    pub disable_implicit_vsock: unsafe extern "C" fn(u32) -> i32,
-    pub add_vsock: unsafe extern "C" fn(u32, u32) -> i32,
-    pub set_console_output: unsafe extern "C" fn(u32, *const libc::c_char) -> i32,
-    pub set_egress_policy: Option<unsafe extern "C" fn(u32, *const *const libc::c_char) -> i32>,
-    pub add_net_unixstream: Option<
-        unsafe extern "C" fn(u32, *const libc::c_char, libc::c_int, *mut u8, u32, u32) -> i32,
-    >,
-}
-
-impl KrunFunctions {
-    /// Load libkrun from the given library directory via dlopen.
-    ///
-    /// Preloads libkrunfw with `RTLD_GLOBAL` so libkrun can find it.
-    ///
-    /// # Safety
-    ///
-    /// Caller must ensure `lib_dir` contains valid libkrun and libkrunfw libraries.
-    pub unsafe fn load(lib_dir: &Path) -> Result<Self, String> {
-        // Platform-specific library names
-        let fw_lib_name = libkrunfw_filename();
-        let lib_name = libkrun_filename();
-
-        // Preload libkrunfw with RTLD_GLOBAL so libkrun can find it
-        let fw_lib_path = lib_dir.join(fw_lib_name);
-        let fw_lib_path_c = CString::new(fw_lib_path.to_string_lossy().as_bytes())
-            .map_err(|_| "invalid library path")?;
-
-        let fw_handle = libc::dlopen(fw_lib_path_c.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL);
-        if fw_handle.is_null() {
-            let err = libc::dlerror();
-            let err_msg = if err.is_null() {
-                "unknown error".to_string()
-            } else {
-                CStr::from_ptr(err).to_string_lossy().to_string()
-            };
-            return Err(format!(
-                "failed to load {}: {}",
-                fw_lib_path.display(),
-                err_msg
-            ));
-        }
-
-        // Load libkrun
-        let lib_path = lib_dir.join(lib_name);
-        let lib_path_c = CString::new(lib_path.to_string_lossy().as_bytes())
-            .map_err(|_| "invalid library path")?;
-
-        let handle = libc::dlopen(lib_path_c.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
-        if handle.is_null() {
-            let err = libc::dlerror();
-            let err_msg = if err.is_null() {
-                "unknown error".to_string()
-            } else {
-                CStr::from_ptr(err).to_string_lossy().to_string()
-            };
-            return Err(format!(
-                "failed to load {}: {}",
-                lib_path.display(),
-                err_msg
-            ));
-        }
-
-        macro_rules! load_sym {
-            ($name:ident) => {{
-                let sym_name = CString::new(stringify!($name)).expect("symbol name is static");
-                let sym = libc::dlsym(handle, sym_name.as_ptr());
-                if sym.is_null() {
-                    libc::dlclose(handle);
-                    return Err(format!("symbol not found: {}", stringify!($name)));
-                }
-                #[allow(clippy::missing_transmute_annotations)]
-                std::mem::transmute(sym)
-            }};
-        }
-
-        Ok(Self {
-            _handle: handle,
-            _fw_handle: fw_handle,
-            set_log_level: load_sym!(krun_set_log_level),
-            create_ctx: load_sym!(krun_create_ctx),
-            free_ctx: load_sym!(krun_free_ctx),
-            set_vm_config: load_sym!(krun_set_vm_config),
-            set_root: load_sym!(krun_set_root),
-            set_workdir: load_sym!(krun_set_workdir),
-            set_exec: load_sym!(krun_set_exec),
-            set_port_map: load_sym!(krun_set_port_map),
-            add_disk2: load_sym!(krun_add_disk2),
-            add_vsock_port2: load_sym!(krun_add_vsock_port2),
-            add_virtiofs: load_sym!(krun_add_virtiofs),
-            start_enter: load_sym!(krun_start_enter),
-            disable_implicit_vsock: load_sym!(krun_disable_implicit_vsock),
-            add_vsock: load_sym!(krun_add_vsock),
-            set_console_output: load_sym!(krun_set_console_output),
-            set_egress_policy: {
-                let sym_name =
-                    CString::new("krun_set_egress_policy").expect("symbol name is static");
-                let sym = libc::dlsym(handle, sym_name.as_ptr());
-                if sym.is_null() {
-                    None
-                } else {
-                    #[allow(clippy::missing_transmute_annotations)]
-                    Some(std::mem::transmute(sym))
-                }
-            },
-            add_net_unixstream: {
-                let sym_name =
-                    CString::new("krun_add_net_unixstream").expect("symbol name is static");
-                let sym = libc::dlsym(handle, sym_name.as_ptr());
-                if sym.is_null() {
-                    None
-                } else {
-                    #[allow(clippy::missing_transmute_annotations)]
-                    Some(std::mem::transmute(sym))
-                }
-            },
-        })
-    }
-}
-
-impl Drop for KrunFunctions {
-    fn drop(&mut self) {
-        unsafe {
-            libc::dlclose(self._handle);
-            // Note: _fw_handle intentionally not closed — it needs to stay loaded
-        }
-    }
-}
 
 /// Volume mount for packed binaries.
 #[derive(Debug, Clone)]
@@ -291,6 +140,34 @@ pub fn launch_agent_vm_dynamic(
         free_ctx_on_err!("krun_set_vm_config failed");
     }
 
+    // Enable GPU (virtio-gpu / Venus Vulkan) when requested by the manifest.
+    // Flag logic lives in super::gpu_virgl_flags() — see mod.rs for the full
+    // explanation of each flag's purpose on Linux vs macOS.
+    if config.resources.gpu {
+        let virgl_flags = super::gpu_virgl_flags();
+        let vram_mib = config.resources.effective_gpu_vram_mib();
+        let vram_bytes: u64 = (vram_mib as u64) * crate::data::consts::BYTES_PER_MIB;
+
+        match krun.set_gpu_options2 {
+            Some(set_gpu) => {
+                let ret = unsafe { set_gpu(ctx, virgl_flags, vram_bytes) };
+                if ret < 0 {
+                    free_ctx_on_err!(format!(
+                        "krun_set_gpu_options2 failed (ret={}). Check that virglrenderer is installed.",
+                        ret
+                    ));
+                }
+                tracing::info!("GPU enabled (Venus/Vulkan via virtio-gpu)");
+            }
+            None => {
+                free_ctx_on_err!(
+                    "libkrun was built without GPU support (krun_set_gpu_options2 not found). \
+                     Rebuild libkrun with GPU=1 — see project README for details."
+                );
+            }
+        }
+    }
+
     // Set root filesystem
     let root = try_or_free_ctx!(
         path_to_cstring(config.rootfs_path),
@@ -379,8 +256,13 @@ pub fn launch_agent_vm_dynamic(
             let mut guest_mac = guest_network.guest_mac;
             let (host_fd, guest_fd) =
                 create_unix_stream_pair().map_err(|e| format!("socketpair failed: {e}"))?;
+            let port_mappings: Vec<VirtioPortMapping> = config
+                .port_mappings
+                .iter()
+                .map(|(host, guest)| VirtioPortMapping::new(*host, *guest))
+                .collect();
 
-            let runtime = match start_virtio_network(host_fd, guest_network) {
+            let runtime = match start_virtio_network(host_fd, guest_network, &port_mappings) {
                 Ok(runtime) => runtime,
                 Err(err) => {
                     // SAFETY: guest_fd was created by socketpair above and not moved elsewhere.
@@ -490,6 +372,15 @@ pub fn launch_agent_vm_dynamic(
 
     if !config.mounts.is_empty() {
         if let Ok(cstr) = CString::new(format!("SMOLVM_MOUNT_COUNT={}", config.mounts.len())) {
+            env_strings.push(cstr);
+        }
+    }
+
+    // Tell the agent GPU was requested so it creates /dev/dri nodes and starts
+    // seatd after pivot_root. Keep this in sync with the normal launcher.
+    if config.resources.gpu {
+        let gpu_env = format!("{}={}", guest_env::GPU, guest_env::VALUE_ON);
+        if let Ok(cstr) = CString::new(gpu_env) {
             env_strings.push(cstr);
         }
     }

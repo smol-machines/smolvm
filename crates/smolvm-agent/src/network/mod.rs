@@ -47,7 +47,7 @@
 //! The Linux-specific implementation lives in `linux.rs`. Non-Linux guests
 //! currently return an explicit error instead of attempting a partial setup.
 
-use smolvm_network::guest_env;
+use smolvm_protocol::guest_env;
 use std::net::Ipv4Addr;
 
 /// Configure the guest network interface from host-provided environment.

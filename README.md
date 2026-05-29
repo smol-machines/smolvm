@@ -28,7 +28,7 @@ curl -sSL https://smolmachines.com/install.sh | bash
 curl -sSL https://smolmachines.com/install.sh | bash && smolvm --help
 ```
 
-Or download from [GitHub Releases](https://github.com/smol-machines/smolvm/releases).
+Or download from [GitHub Releases](https://github.com/smol-machines/smolvm/releases), and place it into `~/.local/share/`.
 
 Quick Start
 -----------
@@ -148,10 +148,53 @@ Known Limitations
 -----------------
 
 * Network is opt-in (`--net` on `machine create`). TCP/UDP only, no ICMP.
-* Volume mounts: directories only (no single files).
+* Volume mounts: directories only (no single files). Mounting at `/workspace` (`-v /host/dir:/workspace`) takes priority over the default storage-disk workspace — your host directory is used instead.
 * macOS: binary must be signed with Hypervisor.framework entitlements.
 * `--ssh-agent` requires an SSH agent running on the host (`SSH_AUTH_SOCK` must be set).
-* GPU support is currently being worked on [in a separate branch](https://github.com/smol-machines/smolvm/tree/binbin-gpu-support).
+* GPU acceleration requires libkrun built with `GPU=1` and virglrenderer + a Vulkan driver on the host (see [GPU Acceleration](#gpu-acceleration) below).
+
+GPU Acceleration
+----------------
+
+smolvm exposes the host GPU to guests via **virtio-gpu / Venus** (Vulkan-over-virtio). Guest workloads see a real Vulkan device; on Linux + Intel this renders as:
+
+```
+ANGLE (Intel, Vulkan 1.4 (Virtio-GPU Venus (Intel(R) UHD Graphics ...)), venus)
+```
+
+### Host requirements
+
+**macOS** — virglrenderer and MoltenVK are bundled in the smolvm distribution. No extra installs needed.
+
+**Linux** — virglrenderer and a host Vulkan driver must be installed from the system package manager:
+
+| Distro | Packages |
+|--------|----------|
+| Alpine | `apk add virglrenderer mesa-vulkan-intel` (or `mesa-vulkan-ati` for AMD) |
+| Debian/Ubuntu | `apt install virglrenderer0 mesa-vulkan-drivers` |
+
+> virglrenderer depends on libEGL and libdrm from the host GPU driver stack — these are hardware-specific and cannot be bundled. Any GPU-capable Linux host will already have them installed via its GPU driver.
+
+### Usage
+
+```bash
+# CLI
+smolvm machine run --gpu --image alpine -- vulkaninfo --summary
+
+# Smolfile
+# gpu = true
+# gpu_vram = 2048   # MiB, default 4096
+```
+
+The guest Vulkan loader must be pointed at the virtio ICD:
+
+```bash
+export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/virtio_icd.x86_64.json
+```
+
+### Headless browser example
+
+See [`examples/headless-browser/`](examples/headless-browser/) for a working Chromium setup using ANGLE + Venus for hardware-accelerated WebGL inside a headless VM.
 
 Development
 -----------

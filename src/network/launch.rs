@@ -1,13 +1,6 @@
 use crate::data::resources::VmResources;
 use crate::network::backend::NetworkBackend;
 
-/// Current staged-transplant support for plain virtio-net egress.
-const VIRTIO_NET_SUPPORTS_PLAIN_EGRESS: bool = true;
-/// Current staged-transplant support for published ports on virtio-net.
-const VIRTIO_NET_SUPPORTS_PUBLISHED_PORTS: bool = false;
-/// Current staged-transplant support for in-process policy on virtio-net.
-const VIRTIO_NET_SUPPORTS_POLICY: bool = false;
-
 /// Effective backend selected for a launch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EffectiveNetworkBackend {
@@ -22,10 +15,6 @@ pub enum EffectiveNetworkBackend {
 /// Reason a requested backend was downgraded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkFallbackReason {
-    /// virtio-net has been requested but is not implemented on this branch yet.
-    VirtioNetNotYetImplemented,
-    /// Port publishing is only implemented on TSI.
-    PortsRequireTsi,
     /// Current egress policies and DNS filtering are only implemented on TSI.
     PolicyRequiresTsi,
 }
@@ -34,12 +23,6 @@ impl NetworkFallbackReason {
     /// User-facing explanation for the fallback.
     pub const fn user_message(self) -> &'static str {
         match self {
-            Self::VirtioNetNotYetImplemented => {
-                "virtio-net has not been implemented in this branch yet"
-            }
-            Self::PortsRequireTsi => {
-                "port publishing still uses the TSI backend; falling back from virtio-net"
-            }
             Self::PolicyRequiresTsi => {
                 "allow-cidr/allow-host policies still use the TSI backend; falling back from virtio-net"
             }
@@ -49,12 +32,6 @@ impl NetworkFallbackReason {
     /// User-facing explanation when an explicit virtio-net request must be rejected.
     pub const fn unsupported_message(self) -> &'static str {
         match self {
-            Self::VirtioNetNotYetImplemented => {
-                "the current virtio-net implementation is not ready yet on this branch"
-            }
-            Self::PortsRequireTsi => {
-                "published ports are not supported by the current virtio-net implementation"
-            }
             Self::PolicyRequiresTsi => {
                 "allow-cidr/allow-host policies are not supported by the current virtio-net implementation"
             }
@@ -105,21 +82,9 @@ pub fn plan_launch_network(
             backend: EffectiveNetworkBackend::Tsi,
             fallback_reason: None,
         },
-        NetworkBackend::VirtioNet if has_ports && !VIRTIO_NET_SUPPORTS_PUBLISHED_PORTS => {
-            LaunchNetworkPlan {
-                backend: EffectiveNetworkBackend::Tsi,
-                fallback_reason: Some(NetworkFallbackReason::PortsRequireTsi),
-            }
-        }
-        NetworkBackend::VirtioNet if has_policy && !VIRTIO_NET_SUPPORTS_POLICY => {
-            LaunchNetworkPlan {
-                backend: EffectiveNetworkBackend::Tsi,
-                fallback_reason: Some(NetworkFallbackReason::PolicyRequiresTsi),
-            }
-        }
-        NetworkBackend::VirtioNet if !VIRTIO_NET_SUPPORTS_PLAIN_EGRESS => LaunchNetworkPlan {
+        NetworkBackend::VirtioNet if has_policy => LaunchNetworkPlan {
             backend: EffectiveNetworkBackend::Tsi,
-            fallback_reason: Some(NetworkFallbackReason::VirtioNetNotYetImplemented),
+            fallback_reason: Some(NetworkFallbackReason::PolicyRequiresTsi),
         },
         NetworkBackend::VirtioNet => LaunchNetworkPlan {
             backend: EffectiveNetworkBackend::VirtioNet,
@@ -156,7 +121,7 @@ pub fn validate_requested_network_backend(
     if plan.backend != EffectiveNetworkBackend::VirtioNet {
         let reason = plan
             .fallback_reason
-            .unwrap_or(NetworkFallbackReason::VirtioNetNotYetImplemented);
+            .unwrap_or(NetworkFallbackReason::PolicyRequiresTsi);
         return Err(crate::Error::config(
             "--net-backend",
             reason.unsupported_message(),
@@ -199,16 +164,13 @@ mod tests {
     }
 
     #[test]
-    fn test_ports_force_tsi() {
+    fn test_ports_work_with_virtio() {
         let mut resources = resources();
         resources.network = true;
         resources.network_backend = Some(NetworkBackend::VirtioNet);
         let plan = plan_launch_network(&resources, None, 1);
-        assert_eq!(plan.backend, EffectiveNetworkBackend::Tsi);
-        assert_eq!(
-            plan.fallback_reason,
-            Some(NetworkFallbackReason::PortsRequireTsi)
-        );
+        assert_eq!(plan.backend, EffectiveNetworkBackend::VirtioNet);
+        assert_eq!(plan.fallback_reason, None);
     }
 
     #[test]
@@ -234,14 +196,11 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_ports_rejected_for_virtio() {
+    fn test_validate_ports_allowed_for_virtio() {
         let mut resources = resources();
         resources.network = true;
         resources.network_backend = Some(NetworkBackend::VirtioNet);
-        let err = validate_requested_network_backend(&resources, None, 1).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("published ports are not supported"));
+        validate_requested_network_backend(&resources, None, 1).unwrap();
     }
 
     #[test]

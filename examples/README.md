@@ -15,6 +15,16 @@ smolvm machine run -s examples/python-app/python.smolfile
 # Run Doom in a browser
 smolvm machine run -d -s examples/doom-web/doom.smolfile
 open http://localhost:8080
+
+# Headless Chromium with GPU acceleration
+smolvm machine create browser -s examples/headless-browser/browser.smolfile
+smolvm machine start --name browser
+smolvm machine exec --name browser -- \
+  chromium --headless=new --no-sandbox --disable-dev-shm-usage \
+    --use-gl=angle --use-angle=vulkan \
+    --screenshot=/tmp/out.png --window-size=1280,800 \
+    https://example.com
+smolvm machine exec --name browser -- base64 /tmp/out.png | base64 -d > out.png
 ```
 
 ### Persistent microVMs
@@ -47,6 +57,8 @@ workdir = "/app"                     # working directory
 cpus = 2                             # vCPUs (default: 4)
 memory = 1024                        # MiB (default: 8192)
 net = true                           # outbound networking (default: false)
+gpu = true                           # GPU acceleration via virtio-gpu/Venus (Vulkan)
+gpu_vram = 2048                      # GPU shared-memory region in MiB (default: 4096)
 storage = 40                         # storage disk GiB (default: 20)
 overlay = 4                          # overlay disk GiB (default: 2)
 

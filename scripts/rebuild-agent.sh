@@ -18,11 +18,11 @@ cd "$PROJECT_DIR"
 CLEAN_CMD=""
 if [[ "$1" == "--clean" ]]; then
     echo "Cleaning build artifacts..."
-    CLEAN_CMD="rm -rf target/release/deps/smolvm_protocol* \
-                      target/release/deps/smolvm_agent* \
-                      target/release/.fingerprint/smolvm-protocol* \
-                      target/release/.fingerprint/smolvm-agent* \
-                      target/release/smolvm-agent && "
+    CLEAN_CMD="rm -rf target/release-small/deps/smolvm_protocol* \
+                      target/release-small/deps/smolvm_agent* \
+                      target/release-small/.fingerprint/smolvm-protocol* \
+                      target/release-small/.fingerprint/smolvm-agent* \
+                      target/release-small/smolvm-agent && "
 fi
 
 echo "Building smolvm-agent for Linux..."
@@ -38,7 +38,7 @@ elif [ ! -f "$SMOLVM_BIN" ]; then
 fi
 
 "$SMOLVM_BIN" machine run --net --mem 2048 -v "$PROJECT_DIR:/work" --image rust:alpine \
-    -- sh -c ". /usr/local/cargo/env && apk add musl-dev && cd /work && ${CLEAN_CMD}cargo build --release -p smolvm-agent"
+    -- sh -c ". /usr/local/cargo/env && apk add musl-dev && cd /work && ${CLEAN_CMD}cargo build --profile release-small -p smolvm-agent"
 
 # Check if rootfs directory exists
 if [[ ! -d "$ROOTFS_DIR/usr/local/bin" ]]; then
@@ -48,7 +48,7 @@ if [[ ! -d "$ROOTFS_DIR/usr/local/bin" ]]; then
 fi
 
 echo "Installing agent binary..."
-cp target/release/smolvm-agent "$ROOTFS_DIR/usr/local/bin/"
+cp target/release-small/smolvm-agent "$ROOTFS_DIR/usr/local/bin/"
 
 # /sbin/init is the kernel's entry point — symlink to the agent binary.
 # The agent handles overlayfs setup + pivot_root internally before
@@ -58,7 +58,7 @@ ln -sf /usr/local/bin/smolvm-agent "$ROOTFS_DIR/sbin/init"
 # Also update target/agent-rootfs if it exists — pack create reads from
 # there first, so it must stay in sync with the installed rootfs.
 if [[ -d "$PROJECT_DIR/target/agent-rootfs/usr/local/bin" ]]; then
-    cp target/release/smolvm-agent "$PROJECT_DIR/target/agent-rootfs/usr/local/bin/"
+    cp target/release-small/smolvm-agent "$PROJECT_DIR/target/agent-rootfs/usr/local/bin/"
     echo "Updated: target/agent-rootfs (keeps pack create in sync)"
 fi
 

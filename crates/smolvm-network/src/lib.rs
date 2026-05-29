@@ -24,6 +24,8 @@
 //! ├─ FrameStreamBridge
 //! │  ├─ reader thread
 //! │  └─ writer thread
+//! ├─ TcpPortListeners
+//! │  └─ one non-blocking accept loop per `-p HOST:GUEST`
 //! ├─ Arc<NetworkFrameQueues>
 //! │  ├─ guest_to_host
 //! │  ├─ host_to_guest
@@ -40,6 +42,8 @@
 //! Component roles:
 //! - `FrameStreamBridge`: translates libkrun's Unix-stream frame protocol into
 //!   queue operations
+//! - `TcpPortListeners`: accepts host TCP connections for published ports
+//!   and hands them to the poll loop
 //! - `NetworkFrameQueues`: handoff boundary between threads
 //! - `VirtioNetworkDevice`: adapts those queues to smoltcp's `phy::Device`
 //! - poll thread: acts as the guest-visible gateway and protocol dispatcher
@@ -50,12 +54,14 @@
 //! - presenting a gateway endpoint to the guest
 //! - handling DNS through a gateway UDP socket and host UDP forwarding
 //! - relaying guest TCP connections to host `TcpStream`s
+//! - accepting published host TCP ports and forwarding them into guest TCP
+//!   connections
 
 pub mod device;
 pub mod frame_stream;
-pub mod guest_env;
 pub mod queues;
 pub mod stack;
+pub mod tcp_listeners;
 pub mod tcp_relay;
 
 use std::fmt;
@@ -68,9 +74,30 @@ use std::time::SystemTime;
 use frame_stream::{start_frame_stream_bridge, FrameStreamBridge};
 use queues::{NetworkFrameQueues, DEFAULT_FRAME_QUEUE_CAPACITY};
 use stack::{start_network_stack, VirtioPollConfig};
+use tcp_listeners::{create_tcp_channel, TcpPortListeners};
 
 /// Default upstream DNS resolver used by the gateway runtime.
 pub const DEFAULT_DNS_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+
+/// Host->guest published TCP port mapping serviced by the virtio gateway.
+///
+/// This stays crate-local so the launchers can translate CLI/data-layer port
+/// mappings into the gateway runtime without pulling the gateway logic back
+/// into the main `smolvm` crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortMapping {
+    /// Port bound on the host loopback interface.
+    pub host: u16,
+    /// Port exposed inside the guest.
+    pub guest: u16,
+}
+
+impl PortMapping {
+    /// Create a new published port mapping.
+    pub const fn new(host: u16, guest: u16) -> Self {
+        Self { host, guest }
+    }
+}
 
 /// Static guest network configuration for the virtio-net MVP.
 ///
@@ -136,6 +163,7 @@ pub(crate) use virtio_net_log;
 /// - one runtime instance corresponds to one guest virtio NIC
 /// - it owns the queue set shared by the worker threads
 /// - it owns the libkrun Unix-stream bridge threads
+/// - it owns the published-port listener threads
 /// - it owns the smoltcp poll thread
 ///
 /// Dropping the runtime is the shutdown signal. `Drop` marks the shared queues
@@ -143,6 +171,7 @@ pub(crate) use virtio_net_log;
 pub struct VirtioNetworkRuntime {
     queues: std::sync::Arc<NetworkFrameQueues>,
     _frame_bridge: FrameStreamBridge,
+    published_ports: Option<TcpPortListeners>,
     poll_handle: Option<JoinHandle<()>>,
 }
 
@@ -154,18 +183,45 @@ pub struct VirtioNetworkRuntime {
 ///   `krun_add_net_unixstream()` setup path.
 /// - `guest_network`: the static guest/gateway addressing and MAC plan for this
 ///   NIC.
+/// - `published_ports`: host->guest TCP port mappings that should be serviced
+///   directly by the virtio runtime instead of TSI.
+///
+/// High-level flow:
+///
+/// ```text
+/// start_virtio_network()
+///   -> create shared frame queues + wake pipes
+///   -> start frame reader/writer threads on the Unix stream
+///   -> start host TcpListeners for published ports
+///   -> start the smoltcp poll thread
+///   -> return a handle that owns the whole runtime
+/// ```
+///
+/// Expanded startup picture:
+///
+/// ```text
+/// host_fd from libkrun
+///   -> FrameStreamBridge(host_fd)
+///      -> reader thread
+///      -> writer thread
+///   -> TcpPortListeners
+///      -> accept host TcpStreams
+///      -> send them to the poll loop over a bounded channel
+///   -> NetworkFrameQueues
+///   -> start_network_stack(...)
+///      -> poll thread owns smoltcp Interface + sockets
+///   -> VirtioNetworkRuntime returned to launcher
+/// ```
 ///
 /// Outcome:
-/// - reader thread: reads raw Ethernet frames from the Unix socket and pushes
-///   them into `guest_to_host`
-/// - writer thread: pops raw Ethernet frames from `host_to_guest` and writes
-///   them back to the Unix socket
-/// - poll thread: runs the host-side smoltcp gateway/runtime, consumes guest
-///   frames, emits response frames, and handles protocol-specific logic such as
-///   DNS forwarding and TCP relay setup
+/// - guest->host Ethernet frames start flowing into the queues
+/// - host->guest Ethernet frames emitted by smoltcp are written back to libkrun
+/// - published host TCP connections can be forwarded toward guest listeners
+/// - the poll loop starts acting as the guest-visible gateway
 pub fn start_virtio_network(
     host_fd: RawFd,
     guest_network: GuestNetworkConfig,
+    published_ports: &[PortMapping],
 ) -> io::Result<VirtioNetworkRuntime> {
     virtio_net_log!(
         "virtio-net: starting runtime host_fd={} guest_ip={} gateway_ip={} dns_server={}",
@@ -176,6 +232,18 @@ pub fn start_virtio_network(
     );
     let queues = NetworkFrameQueues::shared(DEFAULT_FRAME_QUEUE_CAPACITY);
     let frame_bridge = start_frame_stream_bridge(host_fd, queues.clone())?;
+    // tcp_sender sends the accepted TCP connections to the channel
+    // tcp_receiver receives the accepted TCP connections via the channel, and let it be consumed in poll thread.
+    let (tcp_sender, tcp_receiver) = create_tcp_channel();
+    let tcp_listeners = if published_ports.is_empty() {
+        None
+    } else {
+        Some(TcpPortListeners::start(
+            published_ports,
+            tcp_sender,
+            queues.relay_wake.clone(),
+        )?)
+    };
     let poll_handle = start_network_stack(
         queues.clone(),
         VirtioPollConfig {
@@ -185,11 +253,13 @@ pub fn start_virtio_network(
             guest_ipv4: guest_network.guest_ip,
             mtu: 1500,
         },
+        tcp_listeners.as_ref().map(|_| tcp_receiver),
     )?;
 
     Ok(VirtioNetworkRuntime {
         queues,
         _frame_bridge: frame_bridge,
+        published_ports: tcp_listeners,
         poll_handle: Some(poll_handle),
     })
 }
@@ -202,6 +272,7 @@ impl Drop for VirtioNetworkRuntime {
     /// here because the frame bridge joins its own threads in its own `Drop`.
     fn drop(&mut self) {
         self.queues.begin_shutdown();
+        self.published_ports = None;
         if let Some(handle) = self.poll_handle.take() {
             let _ = handle.join();
         }

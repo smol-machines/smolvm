@@ -364,6 +364,10 @@ pub struct PackManifest {
     #[serde(default)]
     pub network: bool,
 
+    /// Enable GPU acceleration (Vulkan via virtio-gpu).
+    #[serde(default)]
+    pub gpu: bool,
+
     /// Host platform this .smolmachine runs on (e.g., "darwin/arm64").
     /// Distinct from `platform` which is the guest architecture (always linux).
     /// Used for registry Image Index resolution.
@@ -400,6 +404,14 @@ pub struct AssetInventory {
     /// Contains the VM's persistent rootfs state from a `--from-vm` pack.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlay_template: Option<AssetEntry>,
+
+    /// Original sparse size of the overlay disk, in bytes (optional, VM mode only).
+    ///
+    /// When set, the overlay.raw entry in the archive is a truncated copy with
+    /// the trailing sparse hole removed. On extraction the file is extended to
+    /// this size via `ftruncate`, restoring the sparse skeleton the VM expects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_logical_size: Option<u64>,
 }
 
 /// An asset file entry.
@@ -448,6 +460,7 @@ impl PackManifest {
             mem: 256,
             image_size: 0,
             network: false,
+            gpu: false,
             host_platform,
             created: rfc3339_now(),
             smolvm_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -460,6 +473,7 @@ impl PackManifest {
                 layers: Vec::new(),
                 storage_template: None,
                 overlay_template: None,
+                overlay_logical_size: None,
             },
         }
     }

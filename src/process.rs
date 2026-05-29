@@ -29,6 +29,68 @@ pub const FAST_POLL_COUNT: u32 = 10;
 /// retrieve the exit status (e.g., process was reaped by another handler).
 pub const UNKNOWN_EXIT_CODE: i32 = -1;
 
+/// Close inherited file descriptors starting at `min_fd`.
+///
+/// This is used in freshly spawned/forked VM launcher children to avoid holding
+/// parent database locks, sockets, and other resources. On Linux it uses
+/// `close_range` when available. On other platforms it enumerates `/dev/fd` and
+/// closes only descriptors that are actually open, avoiding an expensive loop to
+/// very large `getdtablesize()` values on macOS.
+pub fn close_inherited_fds_from(min_fd: i32) {
+    if min_fd < 0 {
+        return;
+    }
+
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let ret = libc::syscall(libc::SYS_close_range, min_fd as u32, u32::MAX, 0u32);
+        if ret == 0 {
+            return;
+        }
+    }
+
+    if close_fds_from_dev_fd(min_fd) {
+        return;
+    }
+
+    close_fds_by_range(min_fd);
+}
+
+fn close_fds_from_dev_fd(min_fd: i32) -> bool {
+    let entries = match std::fs::read_dir("/dev/fd") {
+        Ok(entries) => entries,
+        Err(_) => return false,
+    };
+
+    let mut fds: Vec<i32> = entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.file_name().to_string_lossy().parse::<i32>().ok())
+        .filter(|fd| *fd >= min_fd)
+        .collect();
+
+    // Drop the read_dir handle before closing; its fd may have appeared in the
+    // collected list, and closing an already-closed fd is harmless.
+    fds.sort_unstable();
+    fds.dedup();
+
+    for fd in fds {
+        unsafe {
+            libc::close(fd);
+        }
+    }
+
+    true
+}
+
+fn close_fds_by_range(min_fd: i32) {
+    let max_fd = unsafe { libc::getdtablesize() };
+    for fd in min_fd..max_fd {
+        unsafe {
+            libc::close(fd);
+        }
+    }
+}
+
 /// Install a SIGCHLD handler to automatically reap zombie child processes.
 ///
 /// This function installs a signal handler that calls waitpid(-1, WNOHANG) to
@@ -603,30 +665,7 @@ where
             // database locks, sockets, and other resources. Keep stdin(0),
             // stdout(1), stderr(2) for error output during child setup.
             // The child opens fresh fds for everything it needs.
-            unsafe {
-                #[cfg(target_os = "linux")]
-                {
-                    // Use close_range() (Linux 5.9+) for O(1) fd closure instead
-                    // of iterating through potentially 500K+ fds one at a time.
-                    let ret = libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32);
-                    if ret != 0 {
-                        // Fallback for older kernels
-                        let max_fd = libc::getdtablesize();
-                        for fd in 3..max_fd {
-                            libc::close(fd);
-                        }
-                    }
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    // macOS: no close_range syscall, but getdtablesize() is
-                    // typically small (e.g. 1024) so iteration is fast.
-                    let max_fd = libc::getdtablesize();
-                    for fd in 3..max_fd {
-                        libc::close(fd);
-                    }
-                }
-            }
+            close_inherited_fds_from(3);
 
             // Run the user-provided closure
             child_fn();
@@ -823,7 +862,7 @@ static SIGINT_CHILD_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::Atomi
 ///
 /// Without this, SIGINT terminates the parent immediately (default handler)
 /// without running Rust destructors, so [`AgentManager::drop`] never fires
-/// and the `setsid()`-detached VM child is orphaned.
+/// and the separate-process-group VM child is orphaned.
 ///
 /// The signal handler only calls `kill()` and `_exit()` (async-signal-safe).
 pub struct SigintGuard(());

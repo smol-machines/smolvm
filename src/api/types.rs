@@ -76,6 +76,9 @@ pub struct ResourceSpec {
     /// Note: Only TCP/UDP supported, not ICMP (ping).
     #[serde(default)]
     pub network: Option<bool>,
+    /// Enable GPU acceleration (Vulkan via virtio-gpu).
+    #[serde(default)]
+    pub gpu: Option<bool>,
     /// Storage disk size in GiB (default: 20).
     #[serde(default)]
     #[schema(example = 20)]
@@ -348,6 +351,9 @@ pub struct CreateMachineRequest {
     /// Note: Only TCP/UDP supported, not ICMP (ping).
     #[serde(default)]
     pub network: bool,
+    /// Enable GPU acceleration (Vulkan via virtio-gpu).
+    #[serde(default)]
+    pub gpu: bool,
     /// Storage disk size in GiB (default: 20).
     #[serde(default)]
     pub storage_gb: Option<u64>,
@@ -357,6 +363,9 @@ pub struct CreateMachineRequest {
     /// Allowed egress CIDR ranges.
     #[serde(default)]
     pub allowed_cidrs: Option<Vec<String>>,
+    /// Restart policy configuration.
+    #[serde(default)]
+    pub restart: Option<RestartSpec>,
     /// OCI image reference (e.g., "alpine:latest"). Mutually exclusive with `from`.
     #[serde(default)]
     pub image: Option<String>,
@@ -419,8 +428,8 @@ pub struct MachineInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = 2)]
     pub overlay_gb: Option<u64>,
-    /// Creation timestamp.
-    pub created_at: String,
+    /// Creation timestamp (seconds since Unix epoch).
+    pub created_at: u64,
 }
 
 /// List machines response.

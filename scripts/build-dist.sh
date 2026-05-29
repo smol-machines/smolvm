@@ -13,7 +13,7 @@ set -e
 WITH_LOCAL_LIBKRUN=0
 SKIP_AGENT_BUILD=0
 LOCAL_LIBKRUN_DIR=""
-LIBKRUN_MAKE_FLAGS="${LIBKRUN_MAKE_FLAGS:-BLK=1}"
+LIBKRUN_MAKE_FLAGS="${LIBKRUN_MAKE_FLAGS:-BLK=1 NET=1 GPU=1}"
 
 print_help() {
     cat <<'EOF'
@@ -29,7 +29,7 @@ Options:
   -h, --help                 Show this help text
 
 Environment:
-  LIBKRUN_MAKE_FLAGS   make flags for local libkrun build (default: BLK=1)
+  LIBKRUN_MAKE_FLAGS   make flags for local libkrun build (default: BLK=1 NET=1 GPU=1)
   LIBCLANG_PATH        path to libclang.dylib (auto-detected from brew llvm on macOS)
   LIB_DIR              Override bundled library directory used by smolvm build
   CODESIGN_IDENTITY    macOS code signing identity (default: - for ad-hoc)
@@ -200,6 +200,13 @@ if [[ "$WITH_LOCAL_LIBKRUN" == "1" ]]; then
     mkdir -p "$LOCAL_BUNDLE_DIR"
     copy_matching_libraries "$BASE_LIB_DIR" "libkrun*" "$LOCAL_BUNDLE_DIR"
     copy_matching_libraries "$BASE_LIB_DIR" "libkrunfw*" "$LOCAL_BUNDLE_DIR"
+    # GPU rendering libraries are not rebuilt by --with-local-libkrun, but must
+    # be carried over from the base lib dir so the dist stays GPU-capable.
+    copy_matching_libraries "$BASE_LIB_DIR" "libvirglrenderer*" "$LOCAL_BUNDLE_DIR"
+    copy_matching_libraries "$BASE_LIB_DIR" "libMoltenVK*" "$LOCAL_BUNDLE_DIR"
+    copy_matching_libraries "$BASE_LIB_DIR" "libepoxy*" "$LOCAL_BUNDLE_DIR"
+    # Linux render server binary (required for Venus Vulkan).
+    [[ -f "$BASE_LIB_DIR/virgl_render_server" ]] && cp "$BASE_LIB_DIR/virgl_render_server" "$LOCAL_BUNDLE_DIR/"
     WORK_LIB_DIR="$LOCAL_BUNDLE_DIR"
     echo "Staging local build bundle in $WORK_LIB_DIR"
 fi
@@ -297,18 +304,31 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
     cp "$WORK_LIB_DIR/libkrunfw.5.dylib" "$DIST_DIR/lib/"
     # Create symlink for compatibility
     ln -sf libkrunfw.5.dylib "$DIST_DIR/lib/libkrunfw.dylib"
+    # Bundle GPU rendering libraries if present (virglrenderer → MoltenVK + epoxy).
+    # All three dylibs use @loader_path refs so they resolve correctly regardless
+    # of where the lib/ directory is placed after installation.
+    for gpu_lib in libvirglrenderer.1.dylib libMoltenVK.dylib libepoxy.0.dylib; do
+        if [[ -f "$WORK_LIB_DIR/$gpu_lib" ]]; then
+            cp "$WORK_LIB_DIR/$gpu_lib" "$DIST_DIR/lib/"
+            echo "Bundled GPU library: $gpu_lib ($(du -h "$DIST_DIR/lib/$gpu_lib" | cut -f1))"
+        fi
+    done
 else
-    # Copy each library's real file plus all symlinks that reference it.
-    # Only copies files in the active symlink chain — stale old versions
-    # (e.g. libkrunfw.so.5.2.0 when current is 5.3.0) are excluded.
-    for lib_name in libkrun libkrunfw; do
-        local_so="$WORK_LIB_DIR/${lib_name}.so"
+    copy_so_with_symlinks() {
+        local lib_prefix="$1"
+        local required="$2"
+        local local_so="$WORK_LIB_DIR/${lib_prefix}.so"
         if [[ ! -e "$local_so" ]]; then
-            echo "Error: ${lib_name}.so not found in $WORK_LIB_DIR"
-            exit 1
+            if [[ "$required" == "required" ]]; then
+                echo "Error: ${lib_prefix}.so not found in $WORK_LIB_DIR"
+                exit 1
+            fi
+            return 0
         fi
 
-        # Find the real file backing the .so (follows all symlinks)
+        # Copy each library's real file plus all symlinks that reference it.
+        # Only copies files in the active symlink chain — stale old versions
+        # (e.g. libkrunfw.so.5.2.0 when current is 5.3.0) are excluded.
         real_file="$(readlink -f "$local_so")"
         real_name="$(basename "$real_file")"
         cp "$real_file" "$DIST_DIR/lib/$real_name"
@@ -317,14 +337,30 @@ else
         # the same real file. This catches both directions:
         #   libkrun.so.1 → libkrun.so  (SONAME → real)
         #   libkrunfw.so → libkrunfw.so.5 → libkrunfw.so.5.3.0
-        for candidate in "$WORK_LIB_DIR"/${lib_name}.so*; do
+        for candidate in "$WORK_LIB_DIR"/${lib_prefix}.so*; do
             [[ -L "$candidate" ]] || continue
             candidate_real="$(readlink -f "$candidate")"
             if [[ "$candidate_real" == "$real_file" ]]; then
                 cp -a "$candidate" "$DIST_DIR/lib/"
             fi
         done
+        echo "Bundled library: ${lib_prefix} ($(du -h "$DIST_DIR/lib/$real_name" | cut -f1))"
+    }
+
+    copy_so_with_symlinks libkrun required
+    copy_so_with_symlinks libkrunfw required
+
+    # Bundle GPU rendering libraries if present (virglrenderer chain for Venus/Vulkan).
+    # libMoltenVK is macOS-only — not included here.
+    for gpu_lib_prefix in libvirglrenderer libepoxy; do
+        copy_so_with_symlinks "$gpu_lib_prefix" optional
     done
+    # Bundle render server binary (required for Venus Vulkan on Linux).
+    if [[ -f "$WORK_LIB_DIR/virgl_render_server" ]]; then
+        cp "$WORK_LIB_DIR/virgl_render_server" "$DIST_DIR/lib/"
+        chmod +x "$DIST_DIR/lib/virgl_render_server"
+        echo "Bundled: virgl_render_server ($(du -h "$DIST_DIR/lib/virgl_render_server" | cut -f1))"
+    fi
 fi
 
 # Copy init.krun for Linux (required by libkrunfw kernel)
@@ -432,8 +468,8 @@ INSTALLATION
    tar -xzf smolvm-*.tar.gz
    cd smolvm-*
 
-2. smolvm is looking for the rootfs in the app home (on macOS this is typically ~/Application Support/smolvm). 
-   Symlinks are currenlty not supported, so copy agent-rootfs to that location
+2. Run the smolvm wrapper script. It automatically uses the bundled
+   agent-rootfs/ directory when present.
 
 3. (Optional) Add to PATH:
    # Add to ~/.bashrc or ~/.zshrc:

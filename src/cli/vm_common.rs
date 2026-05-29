@@ -14,6 +14,7 @@ use smolvm::data::validate_vm_name;
 use smolvm::db::SmolvmDb;
 use smolvm::network::NetworkBackend;
 use smolvm::storage::{DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
+use smolvm_protocol::ImageInfo;
 use std::io::Write;
 
 // ============================================================================
@@ -71,6 +72,19 @@ pub fn ensure_running_and_connect(
     };
 
     if manager.try_connect_existing().is_none() {
+        // Distinguish "machine not found" from "machine stopped"
+        // so a typo in the name gives a clear error rather than the
+        // generic "not running / use start" message.
+        if let Some(ref n) = name {
+            let exists = SmolvmDb::open()
+                .ok()
+                .and_then(|db| db.get_vm(n).ok().flatten())
+                .is_some();
+            if !exists {
+                return Err(smolvm::Error::vm_not_found(n));
+            }
+        }
+
         // Best-effort reconcile: if we can't connect to the agent
         // but the libkrun PID is alive, we're in the bug 2 zombie
         // state — record says "running" but agent is dead. Mark
@@ -79,6 +93,20 @@ pub fn ensure_running_and_connect(
         // best-effort: we ignore failures so a bad DB doesn't mask
         // the real "can't connect" error the user is about to see.
         mark_unreachable_if_zombie(&label);
+
+        // Distinguish "machine does not exist" from "machine exists but is
+        // stopped". Without this a typo in --name reports "is not running"
+        // and points at `start`, which then fails differently (QA BUG-45).
+        let exists = SmolvmDb::open()
+            .ok()
+            .and_then(|db| db.get_vm(&label).ok().flatten())
+            .is_some();
+        if !exists {
+            return Err(smolvm::Error::agent(
+                "connect",
+                format!("machine '{}' not found", label),
+            ));
+        }
 
         return Err(smolvm::Error::agent(
             "connect",
@@ -196,6 +224,15 @@ pub fn print_output_and_exit(
 ///   `client.vm_exec`. There's no container, so `record_mounts` and
 ///   `overlay_id` are unused on this branch.
 ///
+pub(crate) struct InitRunContext<'a> {
+    pub(crate) image: Option<&'a str>,
+    pub(crate) image_info: Option<&'a ImageInfo>,
+    pub(crate) env: &'a [(String, String)],
+    pub(crate) workdir: Option<&'a str>,
+    pub(crate) record_mounts: &'a [(String, String, bool)],
+    pub(crate) overlay_id: &'a str,
+}
+
 /// On the first non-zero exit, returns an error containing the command
 /// index, exit code, and any stdout/stderr the command produced.
 /// **Both** streams are surfaced because package managers often write
@@ -206,25 +243,29 @@ pub fn print_output_and_exit(
 pub(crate) fn run_init_commands(
     client: &mut smolvm::agent::AgentClient,
     init: &[String],
-    image: Option<&str>,
-    env: &[(String, String)],
-    workdir: Option<&str>,
-    record_mounts: &[(String, String, bool)],
-    overlay_id: &str,
+    context: InitRunContext<'_>,
 ) -> smolvm::Result<()> {
     if init.is_empty() {
         return Ok(());
     }
     println!("Running {} init command(s)...", init.len());
     for (i, cmd) in init.iter().enumerate() {
-        let (exit_code, stdout, stderr) = if let Some(image) = image {
-            let config = build_init_run_config(image, cmd, env, workdir, record_mounts, overlay_id);
+        let (exit_code, stdout, stderr) = if let Some(image) = context.image {
+            let defaults =
+                resolve_image_runtime_defaults(context.image_info, context.env, context.workdir);
+            let config = build_init_run_config(
+                image,
+                cmd,
+                &defaults,
+                context.record_mounts,
+                context.overlay_id,
+            );
             client.run_non_interactive(config)?
         } else {
             client.vm_exec(
                 init_argv(cmd),
-                env.to_vec(),
-                workdir.map(|s| s.to_string()),
+                context.env.to_vec(),
+                context.workdir.map(|s| s.to_string()),
                 None,
             )?
         };
@@ -253,6 +294,65 @@ fn init_argv(cmd: &str) -> Vec<String> {
     vec!["sh".into(), "-c".into(), cmd.to_string()]
 }
 
+/// Resolve effective env/workdir for image-backed execution.
+///
+/// Image metadata provides the baseline defaults. Explicit values from the
+/// CLI/Smolfile/persisted machine config override those defaults by key, while
+/// workdir uses the explicit value when present and otherwise falls back to the
+/// image's `WorkingDir`. Image `User` flows through unchanged because there is
+/// no CLI or persisted override for it today.
+pub(crate) struct ImageRuntimeDefaults {
+    pub(crate) env: Vec<(String, String)>,
+    pub(crate) workdir: Option<String>,
+    pub(crate) user: Option<String>,
+}
+
+pub(crate) fn resolve_image_runtime_defaults(
+    image_info: Option<&ImageInfo>,
+    env: &[(String, String)],
+    explicit_workdir: Option<&str>,
+) -> ImageRuntimeDefaults {
+    let mut resolved_env = Vec::new();
+
+    if let Some(image_info) = image_info {
+        for spec in &image_info.env {
+            if let Some((key, value)) = smolvm::util::parse_env_spec(spec) {
+                apply_env_override(&mut resolved_env, key, value);
+            }
+        }
+    }
+
+    resolved_env = merge_env_overrides(&resolved_env, env);
+
+    let workdir = explicit_workdir
+        .map(str::to_string)
+        .or_else(|| image_info.and_then(|info| info.workdir.clone()));
+
+    let user = image_info.and_then(|info| info.user.clone());
+
+    ImageRuntimeDefaults {
+        env: resolved_env,
+        workdir,
+        user,
+    }
+}
+
+pub(crate) fn merge_env_overrides(
+    base_env: &[(String, String)],
+    overrides: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut env = base_env.to_vec();
+    for (key, value) in overrides {
+        apply_env_override(&mut env, key.clone(), value.clone());
+    }
+    env
+}
+
+fn apply_env_override(env: &mut Vec<(String, String)>, key: String, value: String) {
+    env.retain(|(existing, _)| existing != &key);
+    env.push((key, value));
+}
+
 /// Build the `RunConfig` an image-based init command runs under.
 ///
 /// Pure function so the *shape* of the request (overlay ID, mount tags,
@@ -264,15 +364,15 @@ fn init_argv(cmd: &str) -> Vec<String> {
 fn build_init_run_config(
     image: &str,
     cmd: &str,
-    env: &[(String, String)],
-    workdir: Option<&str>,
+    defaults: &ImageRuntimeDefaults,
     record_mounts: &[(String, String, bool)],
     overlay_id: &str,
 ) -> smolvm::agent::RunConfig {
     let mounts = crate::cli::parsers::record_mounts_to_runconfig_bindings(record_mounts);
     smolvm::agent::RunConfig::new(image, init_argv(cmd))
-        .with_env(env.to_vec())
-        .with_workdir(workdir.map(|s| s.to_string()))
+        .with_env(defaults.env.clone())
+        .with_workdir(defaults.workdir.clone())
+        .with_user(defaults.user.clone())
         .with_mounts(mounts)
         .with_persistent_overlay(Some(overlay_id.to_string()))
 }
@@ -327,6 +427,10 @@ pub struct CreateVmParams {
     pub health_retries: Option<u32>,
     pub health_startup_grace_secs: Option<u64>,
     pub ssh_agent: bool,
+    /// Enable GPU acceleration (virtio-gpu with Venus/Vulkan).
+    pub gpu: bool,
+    /// GPU VRAM size in MiB (None = default). Ignored when gpu is false.
+    pub gpu_vram_mib: Option<u32>,
     /// Hostnames for DNS filtering (from --allow-host / [network].allow_hosts).
     pub dns_filter_hosts: Option<Vec<String>>,
     /// Absolute path to .smolmachine sidecar (for machines created with --from).
@@ -389,6 +493,12 @@ pub fn create_vm(params: CreateVmParams) -> smolvm::Result<()> {
     record.overlay_gb = params.overlay_gb;
     record.allowed_cidrs = params.allowed_cidrs.clone();
     record.network_backend = params.network_backend;
+    record.gpu = if params.gpu { Some(true) } else { None };
+    // Same invariant the CLI enforces, applied again here because
+    // Smolfile values arrive through `params.gpu_vram_mib` without
+    // passing through the clap value_parser.
+    record.gpu_vram_mib = smolvm::data::resources::validate_gpu_vram_mib(params.gpu_vram_mib)
+        .map_err(|e| smolvm::Error::config("create machine", format!("gpu_vram: {}", e)))?;
     record.image = params.image.clone();
     record.entrypoint = params.entrypoint.clone();
     record.cmd = params.cmd.clone();
@@ -466,7 +576,35 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
 
     let mounts = record.host_mounts();
     let ports = record.port_mappings();
-    let resources = record.vm_resources();
+    let mut resources = record.vm_resources();
+
+    // Re-resolve allow_hosts to fresh CIDRs at start time.
+    // Hostnames for CDN-backed services (e.g. dl-cdn.alpinelinux.org) rotate
+    // IPs — storing resolved CIDRs at `machine create` time means the egress
+    // policy goes stale. We re-resolve here so the policy always reflects
+    // current DNS, then merge with any explicit allow_cidrs stored in the DB.
+    //
+    // IMPORTANT: always initialize allowed_cidrs (even to an empty Vec) when
+    // dns_filter_hosts is set. This ensures launcher.rs always calls
+    // krun_set_egress_policy, even when every hostname fails to resolve.
+    // Without this, a DNS outage at start time causes the VM to boot with no
+    // egress restriction at all (fail-open). With it, the policy starts as
+    // deny-all and launcher.rs's ensure_dns_in_cidrs adds 1.1.1.1/32 as the
+    // minimum (fail-closed: only DNS reachable until resolution succeeds).
+    if let Some(ref hosts) = record.dns_filter_hosts {
+        if !hosts.is_empty() {
+            let existing = resources.allowed_cidrs.get_or_insert_with(Vec::new);
+            for host in hosts {
+                match crate::cli::parsers::resolve_host_to_cidrs(host) {
+                    Ok(cidrs) => existing.extend(cidrs),
+                    Err(e) => eprintln!(
+                        "Warning: could not resolve '{}' for egress policy: {}",
+                        host, e
+                    ),
+                }
+            }
+        }
+    }
 
     // Check for host port conflicts with other running VMs.
     if !ports.is_empty() {
@@ -487,7 +625,7 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
     } else {
         String::new()
     };
-    println!("Starting machine '{}'{}{}...", name, mount_info, port_info);
+    eprintln!("Starting machine '{}'{}{}...", name, mount_info, port_info);
 
     // Resolve SSH agent socket path if enabled
     let ssh_agent_socket = if record.ssh_agent {
@@ -558,34 +696,72 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
     // would hit the bare Alpine agent and fail with "not found".
     let mut client = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
 
-    if record.source_smolmachine.is_some() {
-        // Layers already mounted via virtiofs — no pull needed.
-    } else if let Some(ref image) = record.image {
-        println!("Pulling {}...", image);
-        let _image_info = crate::cli::pull_with_progress(&mut client, image, None)?;
-    }
+    // On first boot, pull the image and run init commands. On subsequent
+    // starts, skip both — image manifests/layers persist on the storage disk
+    // and the container overlay is remounted (not recreated).
+    if !record.init_completed {
+        let image_info = if record.source_smolmachine.is_some() {
+            // Layers already mounted via virtiofs — no pull needed.
+            None
+        } else if let Some(ref image) = record.image {
+            eprintln!("Pulling {}...", image);
+            Some(crate::cli::pull_with_progress(&mut client, image, None)?)
+        } else {
+            None
+        };
 
-    // Run init commands if configured (before reporting success).
-    // `run_init_commands` branches on image: container path for
-    // image-based VMs, bare-agent path for plain VMs.
-    if let Err(e) = run_init_commands(
-        &mut client,
-        &record.init,
-        record.image.as_deref(),
-        &record.env,
-        record.workdir.as_deref(),
-        &record.mounts,
-        name,
-    ) {
-        if let Err(stop_err) = manager.stop() {
-            tracing::warn!(error = %stop_err, "failed to stop machine after init failure");
+        if let Err(e) = run_init_commands(
+            &mut client,
+            &record.init,
+            InitRunContext {
+                image: record.image.as_deref(),
+                image_info: image_info.as_ref(),
+                env: &record.env,
+                workdir: record.workdir.as_deref(),
+                record_mounts: &record.mounts,
+                overlay_id: name,
+            },
+        ) {
+            if let Err(stop_err) = manager.stop() {
+                tracing::warn!(error = %stop_err, "failed to stop machine after init failure");
+            }
+            return Err(e);
         }
-        return Err(e);
+
+        // Mark init as completed so subsequent starts skip pull + init.
+        // Done before workload start so a CMD failure doesn't re-trigger init.
+        if !record.init.is_empty() || record.image.is_some() {
+            let _ = db.update_vm(name, |r| {
+                r.init_completed = true;
+            });
+        }
+    } else if !record.init.is_empty() {
+        println!(
+            "Init already completed, skipping {} command(s)",
+            record.init.len()
+        );
     }
 
-    if record.image.is_some() {
-        // Image-based machine: VM is running, image pulled and cached,
-        // init done. Sits idle until `machine exec` is called.
+    if let Some(ref img) = record.image {
+        // Image-based machine: start background CMD if configured.
+        let mut cmd = record.entrypoint.clone();
+        cmd.extend(record.cmd.clone());
+        if !cmd.is_empty() {
+            let mount_bindings =
+                crate::cli::parsers::record_mounts_to_runconfig_bindings(&record.mounts);
+            let bg_config = smolvm::agent::RunConfig::new(img, cmd)
+                .with_env(record.env.clone())
+                .with_workdir(record.workdir.clone())
+                .with_user(record.user.clone())
+                .with_mounts(mount_bindings)
+                .with_persistent_overlay(Some(name.to_string()));
+            if let Err(e) = client.run_container_detached(bg_config) {
+                if let Err(stop_err) = manager.stop() {
+                    tracing::warn!(error = %stop_err, "failed to stop machine after CMD launch failure");
+                }
+                return Err(smolvm::Error::agent("start background CMD", format!("{e}")));
+            }
+        }
         println!("Machine '{}' running (PID: {})", name, pid.unwrap_or(0));
     } else {
         // No image — bare VM mode. Run entrypoint+cmd if configured.
@@ -608,7 +784,8 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
         println!("Machine '{}' running (PID: {})", name, pid.unwrap_or(0));
     }
 
-    // Persist running state after output — 1 write cycle (not on critical path)
+    // Persist running state. The 15s busy_timeout handles SQLite contention
+    // from concurrent starts — no application-level retry needed.
     let pid_start_time = pid.and_then(smolvm::process::process_start_time);
     if let Err(e) = db.update_vm(name, |r| {
         r.state = RecordState::Running;
@@ -623,32 +800,30 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
     Ok(())
 }
 
-/// Persist the "default" VM as running in the database.
+/// Persist a named VM as running in the database.
 ///
 /// Creates the record if it doesn't exist, then updates state to Running
 /// with the current PID and optional config overrides (cpus, mem, etc.).
-pub fn persist_default_running(
+pub fn persist_named_running(
     config: &mut SmolvmConfig,
+    name: &str,
     pid: Option<i32>,
     overrides: Option<DefaultVmOverrides>,
-) {
-    if config.get_vm("default").is_none() {
+) -> smolvm::Result<()> {
+    if config.get_vm(name).is_none() {
         let record = VmRecord::new(
-            "default".to_string(),
+            name.to_string(),
             DEFAULT_MICROVM_CPU_COUNT,
             DEFAULT_MICROVM_MEMORY_MIB,
             vec![],
             vec![],
             false,
         );
-        if let Err(e) = config.insert_vm("default".to_string(), record) {
-            tracing::warn!(error = %e, "failed to insert default VM record");
-            return;
-        }
+        config.insert_vm(name.to_string(), record)?;
     }
     let pid_start_time = pid.and_then(smolvm::process::process_start_time);
-    if config
-        .update_vm("default", |r| {
+    config
+        .update_vm(name, |r| {
             r.state = RecordState::Running;
             r.pid = pid;
             r.pid_start_time = pid_start_time;
@@ -663,22 +838,30 @@ pub fn persist_default_running(
                 r.overlay_gb = o.overlay_gb;
                 r.allowed_cidrs = o.allowed_cidrs.clone();
                 r.init = o.init.clone();
+                r.init_completed = false;
                 r.env = o.env.clone();
                 r.workdir = o.workdir.clone();
+                r.user = o.user.clone();
                 r.image = o.image.clone();
                 r.entrypoint = o.entrypoint.clone();
                 r.cmd = o.cmd.clone();
                 r.ssh_agent = o.ssh_agent;
                 r.dns_filter_hosts = o.dns_filter_hosts.clone();
+                r.gpu = if o.gpu { Some(true) } else { None };
+                r.gpu_vram_mib = o.gpu_vram_mib;
             }
         })
-        .is_none()
-    {
-        tracing::warn!("failed to update default VM record (record missing after insert)");
-    }
+        .ok_or_else(|| smolvm::Error::config(
+            "persist machine record",
+            format!("VM record for '{}' missing after insert", name),
+        ))?
+        // Flatten: Option<Result<()>> → the ok_or_else above handles None,
+        // now propagate the inner Result (DB write failure).
+        ?;
+    Ok(())
 }
 
-/// Config overrides for the default VM record.
+/// Config overrides for a VM record.
 pub struct DefaultVmOverrides {
     pub cpus: u8,
     pub mem: u32,
@@ -692,11 +875,14 @@ pub struct DefaultVmOverrides {
     pub init: Vec<String>,
     pub env: Vec<(String, String)>,
     pub workdir: Option<String>,
+    pub user: Option<String>,
     pub image: Option<String>,
     pub entrypoint: Vec<String>,
     pub cmd: Vec<String>,
     pub ssh_agent: bool,
     pub dns_filter_hosts: Option<Vec<String>>,
+    pub gpu: bool,
+    pub gpu_vram_mib: Option<u32>,
 }
 
 /// Check if any running VM already binds to the same host ports.
@@ -754,11 +940,11 @@ pub fn start_vm_default() -> smolvm::Result<()> {
     // starting fresh; no-op otherwise.
     cli_recover_if_unreachable("default");
 
-    println!("Starting machine 'default'...");
+    eprintln!("Starting machine 'default'...");
     manager.ensure_running()?;
 
     let mut config = SmolvmConfig::load()?;
-    persist_default_running(&mut config, manager.child_pid(), None);
+    persist_named_running(&mut config, "default", manager.child_pid(), None)?;
 
     // Pull image (if persisted via `machine run -d -s`) before running
     // init, then run init through the shared runner — same fix as
@@ -774,19 +960,24 @@ pub fn start_vm_default() -> smolvm::Result<()> {
             let mut client =
                 smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
 
-            if let Some(ref image) = record.image {
-                println!("Pulling {}...", image);
-                let _ = crate::cli::pull_with_progress(&mut client, image, None)?;
-            }
+            let image_info = if let Some(ref image) = record.image {
+                eprintln!("Pulling {}...", image);
+                Some(crate::cli::pull_with_progress(&mut client, image, None)?)
+            } else {
+                None
+            };
 
             if let Err(e) = run_init_commands(
                 &mut client,
                 &record.init,
-                record.image.as_deref(),
-                &record.env,
-                record.workdir.as_deref(),
-                &record.mounts,
-                "default",
+                InitRunContext {
+                    image: record.image.as_deref(),
+                    image_info: image_info.as_ref(),
+                    env: &record.env,
+                    workdir: record.workdir.as_deref(),
+                    record_mounts: &record.mounts,
+                    overlay_id: "default",
+                },
             ) {
                 if let Err(stop_err) = manager.stop() {
                     tracing::warn!(error = %stop_err, "failed to stop machine after init failure");
@@ -1001,9 +1192,91 @@ where
         extra(&manager);
         manager.detach();
     } else {
+        // Only report "not running" when the machine actually exists.
+        // A missing DB record with an explicit name is "not found".
+        if let Some(ref n) = name {
+            let exists = SmolvmDb::open()
+                .ok()
+                .and_then(|db| db.get_vm(n).ok().flatten())
+                .is_some();
+            if !exists {
+                return Err(smolvm::Error::vm_not_found(n));
+            }
+        }
         println!("Machine '{}': not running", label);
     }
 
+    Ok(())
+}
+
+/// Build the per-machine JSON object shared by `machine list --json` and
+/// `machine status --json` so the two outputs never drift apart.
+fn machine_status_json(name: &str, record: &VmRecord) -> serde_json::Value {
+    // Resolve via vsock probe so the JSON reflects truth (Unreachable vs
+    // Running) instead of trusting the PID-only check.
+    let actual_state = smolvm::agent::state_probe::resolve_state(name, record);
+    // Expose the persisted health command as a single shell-friendly string
+    // when it was stored as `["sh", "-c", "<cmd>"]`; otherwise a space-joined
+    // argv so the field is always a string.
+    let health_cmd_str = record.health_cmd.as_ref().map(|argv| {
+        if argv.len() == 3 && argv[0] == "sh" && argv[1] == "-c" {
+            argv[2].clone()
+        } else {
+            argv.join(" ")
+        }
+    });
+
+    let mut obj = serde_json::json!({
+        "name": name,
+        "state": actual_state.to_string(),
+        "cpus": record.cpus,
+        "memory_mib": record.mem,
+        "pid": record.pid,
+        "mounts": record.mounts.len(),
+        "ports": record.ports.len(),
+        "created_at": record.created_at,
+        "storage_gb": record.storage_gb,
+        "overlay_gb": record.overlay_gb,
+        "image": record.image,
+        "entrypoint": record.entrypoint,
+        "cmd": record.cmd,
+        "ephemeral": record.ephemeral,
+        "gpu": record.gpu.unwrap_or(false),
+        "gpu_vram_mib": record.gpu_vram_mib,
+        "restart_policy": record.restart.policy.to_string(),
+        "restart_max_retries": record.restart.max_retries,
+        "restart_count": record.restart.restart_count,
+        "health_cmd": health_cmd_str,
+        "health_interval_secs": record.health_interval_secs,
+        "health_timeout_secs": record.health_timeout_secs,
+        "health_retries": record.health_retries,
+        "health_startup_grace_secs": record.health_startup_grace_secs,
+    });
+    obj.as_object_mut()
+        .unwrap()
+        .insert("network".into(), serde_json::json!(record.network));
+    obj
+}
+
+/// Emit a single machine's status as JSON — the same object shape as
+/// `machine list --json`. Errors if the machine does not exist.
+pub fn status_vm_json(name: &Option<String>) -> smolvm::Result<()> {
+    let label = vm_label(name);
+    let config = SmolvmConfig::load()?;
+    // Build the owned JSON value inside the match so the borrow of `config`
+    // ends before `config` is dropped.
+    let obj = match config.list_vms().find(|(n, _)| *n == &label) {
+        Some((_, record)) => machine_status_json(&label, record),
+        None => {
+            return Err(smolvm::Error::config(
+                "machine status",
+                format!("machine '{}' not found", label),
+            ))
+        }
+    };
+    let json = serde_json::to_string_pretty(&obj)
+        .map_err(|e| smolvm::Error::config("serialize json", e.to_string()))?;
+    println!("{}", json);
     Ok(())
 }
 
@@ -1030,32 +1303,7 @@ pub fn list_vms(verbose: bool, json: bool) -> smolvm::Result<()> {
     if json {
         let json_vms: Vec<_> = vms
             .iter()
-            .map(|(name, record)| {
-                // Resolve via vsock probe so the JSON output reflects
-                // truth (Unreachable vs Running) instead of trusting
-                // the PID-only check that fooled bug 2 victims.
-                let actual_state = smolvm::agent::state_probe::resolve_state(name, record);
-                let mut obj = serde_json::json!({
-                    "name": name,
-                    "state": actual_state.to_string(),
-                    "cpus": record.cpus,
-                    "memory_mib": record.mem,
-                    "pid": record.pid,
-                    "mounts": record.mounts.len(),
-                    "ports": record.ports.len(),
-                    "created_at": record.created_at,
-                    "storage_gb": record.storage_gb,
-                    "overlay_gb": record.overlay_gb,
-                    "image": record.image,
-                    "entrypoint": record.entrypoint,
-                    "cmd": record.cmd,
-                    "ephemeral": record.ephemeral,
-                });
-                obj.as_object_mut()
-                    .unwrap()
-                    .insert("network".into(), serde_json::json!(record.network));
-                obj
-            })
+            .map(|(name, record)| machine_status_json(name, record))
             .collect();
         let json = serde_json::to_string_pretty(&json_vms)
             .map_err(|e| smolvm::Error::config("serialize json", e.to_string()))?;
@@ -1102,6 +1350,12 @@ pub fn list_vms(verbose: bool, json: bool) -> smolvm::Result<()> {
                 if record.network {
                     println!("  Network: enabled");
                 }
+                if record.gpu.unwrap_or(false) {
+                    match record.gpu_vram_mib {
+                        Some(vram) => println!("  GPU: enabled ({} MiB VRAM)", vram),
+                        None => println!("  GPU: enabled"),
+                    }
+                }
                 for cmd in &record.init {
                     println!("  Init: {}", cmd);
                 }
@@ -1111,7 +1365,9 @@ pub fn list_vms(verbose: bool, json: bool) -> smolvm::Result<()> {
                 if let Some(wd) = &record.workdir {
                     println!("  Workdir: {}", wd);
                 }
-                println!("  Created: {}", record.created_at);
+                let created =
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(record.created_at);
+                println!("  Created: {}", humantime::format_rfc3339_seconds(created));
                 println!();
             }
         }
@@ -1128,27 +1384,98 @@ pub fn list_vms(verbose: bool, json: bool) -> smolvm::Result<()> {
 ///
 /// The VM must be stopped before resizing. Only expansion is supported
 /// (no shrinking to prevent data loss).
+/// Expand physical disk files for a VM. Does NOT update the DB record —
+/// the caller is responsible for persisting the new sizes.
+///
+/// Returns a list of human-readable change descriptions for display.
+/// Validates no-shrink and performs the physical I/O.
+pub fn expand_disks(
+    name: &str,
+    record: &smolvm::config::VmRecord,
+    new_storage_gb: Option<u64>,
+    new_overlay_gb: Option<u64>,
+) -> smolvm::Result<Vec<String>> {
+    use smolvm::data::disk::{Overlay, Storage};
+    use smolvm::storage::{expand_disk, DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
+
+    let current_storage_gb = record.storage_gb.unwrap_or(DEFAULT_STORAGE_SIZE_GIB);
+    let current_overlay_gb = record.overlay_gb.unwrap_or(DEFAULT_OVERLAY_SIZE_GIB);
+
+    // Validate no shrinking
+    if let Some(s) = new_storage_gb {
+        if s < current_storage_gb {
+            return Err(smolvm::Error::config(
+                "resize",
+                format!(
+                    "storage disk cannot be shrunk from {} GiB to {} GiB. Only expanding is supported to prevent data loss.",
+                    current_storage_gb, s
+                ),
+            ));
+        }
+    }
+    if let Some(o) = new_overlay_gb {
+        if o < current_overlay_gb {
+            return Err(smolvm::Error::config(
+                "resize",
+                format!(
+                    "overlay disk cannot be shrunk from {} GiB to {} GiB. Only expanding is supported to prevent data loss.",
+                    current_overlay_gb, o
+                ),
+            ));
+        }
+    }
+
+    let manager = AgentManager::for_vm(name)
+        .map_err(|e| smolvm::Error::agent("get agent manager", e.to_string()))?;
+
+    let mut changes = Vec::new();
+
+    if let Some(storage_gb) = new_storage_gb {
+        if storage_gb > current_storage_gb {
+            let storage_path = manager.storage_path();
+            expand_disk::<Storage>(storage_path, storage_gb)
+                .map_err(|e| smolvm::Error::storage("expand storage disk", e.to_string()))?;
+            changes.push(format!(
+                "  storage: {} GiB → {} GiB",
+                current_storage_gb, storage_gb
+            ));
+        }
+    }
+
+    if let Some(overlay_gb) = new_overlay_gb {
+        if overlay_gb > current_overlay_gb {
+            let overlay_path = manager.overlay_path();
+            expand_disk::<Overlay>(overlay_path, overlay_gb)
+                .map_err(|e| smolvm::Error::storage("expand overlay disk", e.to_string()))?;
+            changes.push(format!(
+                "  overlay: {} GiB → {} GiB",
+                current_overlay_gb, overlay_gb
+            ));
+        }
+    }
+
+    Ok(changes)
+}
+
+/// Legacy wrapper: expand disks AND update the DB in one call.
+/// Used by the hidden `machine resize` backward-compat command.
 pub fn resize_vm(
     name: &str,
     new_storage_gb: Option<u64>,
     new_overlay_gb: Option<u64>,
 ) -> smolvm::Result<()> {
     use smolvm::config::RecordState;
-    use smolvm::data::disk::{Overlay, Storage};
     use smolvm::db::SmolvmDb;
-    use smolvm::storage::{expand_disk, DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
 
-    // Get VM record from database
     let db = SmolvmDb::open()?;
     let record = db
         .get_vm(name)?
         .ok_or_else(|| smolvm::Error::vm_not_found(name))?
         .clone();
 
-    // Check state - VM must be stopped (Created state also allowed for never-started VMs)
     let actual_state = record.actual_state();
     match actual_state {
-        RecordState::Stopped | RecordState::Created => {} // OK to resize
+        RecordState::Stopped | RecordState::Created => {}
         _ => {
             return Err(smolvm::Error::InvalidState {
                 expected: "stopped".into(),
@@ -1157,74 +1484,8 @@ pub fn resize_vm(
         }
     }
 
-    // Get current disk sizes (use defaults if not set)
-    let current_storage_gb = record.storage_gb.unwrap_or(DEFAULT_STORAGE_SIZE_GIB);
-    let current_overlay_gb = record.overlay_gb.unwrap_or(DEFAULT_OVERLAY_SIZE_GIB);
+    let changes = expand_disks(name, &record, new_storage_gb, new_overlay_gb)?;
 
-    // Determine target sizes
-    let target_storage_gb = new_storage_gb.unwrap_or(current_storage_gb);
-    let target_overlay_gb = new_overlay_gb.unwrap_or(current_overlay_gb);
-
-    // Validate no shrinking
-    if target_storage_gb < current_storage_gb {
-        return Err(smolvm::Error::config(
-            "resize",
-            format!(
-                "storage disk cannot be shrunk from {} GiB to {} GiB. Only expanding is supported to prevent data loss.",
-                current_storage_gb, target_storage_gb
-            ),
-        ));
-    }
-    if target_overlay_gb < current_overlay_gb {
-        return Err(smolvm::Error::config(
-            "resize",
-            format!(
-                "overlay disk cannot be shrunk from {} GiB to {} GiB. Only expanding is supported to prevent data loss.",
-                current_overlay_gb, target_overlay_gb
-            ),
-        ));
-    }
-
-    // Get agent manager for disk paths
-    let manager = AgentManager::for_vm(name)
-        .map_err(|e| smolvm::Error::agent("get agent manager", e.to_string()))?;
-
-    // Print resize header
-    println!("Resizing machine '{}'...", name);
-
-    // Expand storage disk if requested and changed
-    if let Some(storage_gb) = new_storage_gb {
-        if storage_gb > current_storage_gb {
-            print!(
-                "  Storage: {} GiB → {} GiB (expanding disk...)",
-                current_storage_gb, storage_gb
-            );
-            std::io::Write::flush(&mut std::io::stdout()).ok();
-
-            let storage_path = manager.storage_path();
-            expand_disk::<Storage>(storage_path, storage_gb)
-                .map_err(|e| smolvm::Error::storage("expand storage disk", e.to_string()))?;
-            println!(" done");
-        }
-    }
-
-    // Expand overlay disk if requested and changed
-    if let Some(overlay_gb) = new_overlay_gb {
-        if overlay_gb > current_overlay_gb {
-            print!(
-                "  Overlay: {} GiB → {} GiB (expanding disk...)",
-                current_overlay_gb, overlay_gb
-            );
-            std::io::Write::flush(&mut std::io::stdout()).ok();
-
-            let overlay_path = manager.overlay_path();
-            expand_disk::<Overlay>(overlay_path, overlay_gb)
-                .map_err(|e| smolvm::Error::storage("expand overlay disk", e.to_string()))?;
-            println!(" done");
-        }
-    }
-
-    // Update database record with new sizes
     db.update_vm(name, |r| {
         if let Some(s) = new_storage_gb {
             r.storage_gb = Some(s);
@@ -1234,9 +1495,15 @@ pub fn resize_vm(
         }
     })?;
 
-    println!();
-    println!("Machine '{}' resized successfully.", name);
-    println!("Disk changes are applied immediately; filesystem will expand on next boot.");
+    if changes.is_empty() {
+        println!("No disk changes needed.");
+    } else {
+        println!("Resized machine '{}':", name);
+        for c in &changes {
+            println!("{}", c);
+        }
+        println!("Filesystem will expand on next boot.");
+    }
 
     Ok(())
 }
@@ -1309,6 +1576,10 @@ pub fn cleanup_orphaned_ephemeral_vms() {
         if is_orphan {
             tracing::debug!(name = %name, pid = ?record.pid, "cleaning up orphaned ephemeral VM");
             let _ = db.remove_vm(name);
+            let dir = smolvm::agent::vm_data_dir(name);
+            if dir.exists() {
+                let _ = std::fs::remove_dir_all(&dir);
+            }
         }
     }
 }
@@ -1316,6 +1587,24 @@ pub fn cleanup_orphaned_ephemeral_vms() {
 #[cfg(test)]
 mod init_runner_tests {
     use super::*;
+
+    fn sample_image_info(env: Vec<&str>, workdir: Option<&str>, user: Option<&str>) -> ImageInfo {
+        ImageInfo {
+            reference: "alpine:latest".to_string(),
+            digest: "sha256:test".to_string(),
+            size: 0,
+            created: None,
+            architecture: "x86_64".to_string(),
+            os: "linux".to_string(),
+            layer_count: 0,
+            layers: Vec::new(),
+            entrypoint: Vec::new(),
+            cmd: Vec::new(),
+            env: env.into_iter().map(str::to_string).collect(),
+            workdir: workdir.map(str::to_string),
+            user: user.map(str::to_string),
+        }
+    }
 
     #[test]
     fn format_init_failure_includes_stderr_only() {
@@ -1390,7 +1679,17 @@ mod init_runner_tests {
         // succeed but `git --version` post-start would fail with "not
         // found" — exactly the user-confusing regression we're guarding
         // against.
-        let config = build_init_run_config("alpine", "true", &[], None, &[], "my-vm");
+        let config = build_init_run_config(
+            "alpine",
+            "true",
+            &ImageRuntimeDefaults {
+                env: vec![],
+                workdir: None,
+                user: None,
+            },
+            &[],
+            "my-vm",
+        );
         assert_eq!(config.persistent_overlay_id.as_deref(), Some("my-vm"));
     }
 
@@ -1401,11 +1700,21 @@ mod init_runner_tests {
         // refactor, the user's `[dev].env` or `[dev].workdir` would
         // silently stop applying to init.
         let env = vec![("HTTP_PROXY".to_string(), "http://proxy:3128".to_string())];
-        let config =
-            build_init_run_config("debian:slim", "apt update", &env, Some("/work"), &[], "vm");
+        let config = build_init_run_config(
+            "debian:slim",
+            "apt update",
+            &ImageRuntimeDefaults {
+                env: env.clone(),
+                workdir: Some("/work".to_string()),
+                user: Some("steam".to_string()),
+            },
+            &[],
+            "vm",
+        );
         assert_eq!(config.image, "debian:slim");
         assert_eq!(config.env, env);
         assert_eq!(config.workdir.as_deref(), Some("/work"));
+        assert_eq!(config.user.as_deref(), Some("steam"));
         // Command is sh-wrapped; assert the wrapped form arrives.
         assert_eq!(
             config.command,
@@ -1423,7 +1732,17 @@ mod init_runner_tests {
             ("/host/src".to_string(), "/app".to_string(), false),
             ("/host/data".to_string(), "/data".to_string(), true),
         ];
-        let config = build_init_run_config("alpine", "true", &[], None, &mounts, "vm");
+        let config = build_init_run_config(
+            "alpine",
+            "true",
+            &ImageRuntimeDefaults {
+                env: vec![],
+                workdir: None,
+                user: None,
+            },
+            &mounts,
+            "vm",
+        );
         assert_eq!(
             config.mounts,
             vec![
@@ -1439,10 +1758,146 @@ mod init_runner_tests {
         // a valid init invocation. No mounts, no workdir, no env — must
         // still produce a usable RunConfig (vs. e.g. panicking on
         // `unwrap` somewhere in the builder).
-        let config = build_init_run_config("alpine", "echo hi", &[], None, &[], "vm");
+        let config = build_init_run_config(
+            "alpine",
+            "echo hi",
+            &ImageRuntimeDefaults {
+                env: vec![],
+                workdir: None,
+                user: None,
+            },
+            &[],
+            "vm",
+        );
         assert!(config.mounts.is_empty());
         assert!(config.workdir.is_none());
         assert!(config.env.is_empty());
+        assert!(config.user.is_none());
         assert_eq!(config.persistent_overlay_id.as_deref(), Some("vm"));
+    }
+
+    #[test]
+    fn resolve_image_runtime_defaults_uses_image_env_workdir_and_user() {
+        let image_info = sample_image_info(
+            vec!["FOO=from-image", "BAR=from-image"],
+            Some("/image-workdir"),
+            Some("steam"),
+        );
+
+        let defaults = resolve_image_runtime_defaults(Some(&image_info), &[], None);
+
+        assert_eq!(
+            defaults.env,
+            vec![
+                ("FOO".to_string(), "from-image".to_string()),
+                ("BAR".to_string(), "from-image".to_string()),
+            ]
+        );
+        assert_eq!(defaults.workdir.as_deref(), Some("/image-workdir"));
+        assert_eq!(defaults.user.as_deref(), Some("steam"));
+    }
+
+    #[test]
+    fn image_workdir_flows_into_init_run_config_when_no_explicit_workdir_is_set() {
+        let image_info = sample_image_info(
+            vec!["FOO=from-image"],
+            Some("/image-workdir"),
+            Some("steam"),
+        );
+        let defaults = resolve_image_runtime_defaults(Some(&image_info), &[], None);
+        let config = build_init_run_config("alpine:latest", "pwd", &defaults, &[], "vm");
+
+        assert_eq!(config.workdir.as_deref(), Some("/image-workdir"));
+        assert_eq!(config.user.as_deref(), Some("steam"));
+        assert_eq!(
+            config.env,
+            vec![("FOO".to_string(), "from-image".to_string())]
+        );
+    }
+
+    #[test]
+    fn resolve_image_runtime_defaults_explicit_values_override_image_defaults() {
+        let image_info = sample_image_info(
+            vec!["FOO=from-image", "BAR=from-image"],
+            Some("/image-workdir"),
+            Some("steam"),
+        );
+        let env = vec![
+            ("BAR".to_string(), "from-cli".to_string()),
+            ("BAZ".to_string(), "from-cli".to_string()),
+        ];
+
+        let defaults =
+            resolve_image_runtime_defaults(Some(&image_info), &env, Some("/explicit-workdir"));
+
+        assert_eq!(
+            defaults.env,
+            vec![
+                ("FOO".to_string(), "from-image".to_string()),
+                ("BAR".to_string(), "from-cli".to_string()),
+                ("BAZ".to_string(), "from-cli".to_string()),
+            ]
+        );
+        assert_eq!(defaults.workdir.as_deref(), Some("/explicit-workdir"));
+        assert_eq!(defaults.user.as_deref(), Some("steam"));
+    }
+
+    #[test]
+    fn resolve_image_runtime_defaults_ignores_invalid_image_env_and_last_value_wins() {
+        let image_info = sample_image_info(
+            vec!["BROKEN", "=empty-key", "FOO=from-image", "FOO=last-image"],
+            Some("/image-workdir"),
+            Some("1000:1000"),
+        );
+        let env = vec![
+            ("BAR".to_string(), "from-cli".to_string()),
+            ("BAR".to_string(), "last-cli".to_string()),
+        ];
+
+        let defaults = resolve_image_runtime_defaults(Some(&image_info), &env, None);
+
+        assert_eq!(
+            defaults.env,
+            vec![
+                ("FOO".to_string(), "last-image".to_string()),
+                ("BAR".to_string(), "last-cli".to_string()),
+            ]
+        );
+        assert_eq!(defaults.workdir.as_deref(), Some("/image-workdir"));
+        assert_eq!(defaults.user.as_deref(), Some("1000:1000"));
+    }
+
+    #[test]
+    fn resolve_image_runtime_defaults_falls_back_to_explicit_values_without_image_info() {
+        let env = vec![("FOO".to_string(), "from-explicit".to_string())];
+
+        let defaults = resolve_image_runtime_defaults(None, &env, Some("/explicit-workdir"));
+
+        assert_eq!(defaults.env, env);
+        assert_eq!(defaults.workdir.as_deref(), Some("/explicit-workdir"));
+        assert!(defaults.user.is_none());
+    }
+
+    #[test]
+    fn merge_env_overrides_last_value_wins_by_key() {
+        let base_env = vec![
+            ("FOO".to_string(), "from-record".to_string()),
+            ("BAR".to_string(), "from-record".to_string()),
+        ];
+        let overrides = vec![
+            ("BAR".to_string(), "from-cli".to_string()),
+            ("BAZ".to_string(), "from-cli".to_string()),
+        ];
+
+        let merged = merge_env_overrides(&base_env, &overrides);
+
+        assert_eq!(
+            merged,
+            vec![
+                ("FOO".to_string(), "from-record".to_string()),
+                ("BAR".to_string(), "from-cli".to_string()),
+                ("BAZ".to_string(), "from-cli".to_string()),
+            ]
+        );
     }
 }

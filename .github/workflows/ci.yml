@@ -18,7 +18,7 @@ jobs:
     name: Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -31,22 +31,21 @@ jobs:
     name: macOS (arm64)
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
-            ~/.cargo/bin/
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: macos-arm64-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: macos-arm64-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
           restore-keys: macos-arm64-cargo-
 
       - name: Setup Git LFS
@@ -71,6 +70,12 @@ jobs:
 
       - name: Run unit tests
         run: cargo test --lib
+        env:
+          LIBRARY_PATH: ${{ github.workspace }}/lib
+          DYLD_LIBRARY_PATH: ${{ github.workspace }}/lib
+
+      - name: Run agent unit tests
+        run: cargo test -p smolvm-agent --bins
         env:
           LIBRARY_PATH: ${{ github.workspace }}/lib
           DYLD_LIBRARY_PATH: ${{ github.workspace }}/lib
@@ -100,7 +105,7 @@ jobs:
             target: x86_64-unknown-linux-gnu
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -108,15 +113,14 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
-            ~/.cargo/bin/
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: linux-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: linux-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
           restore-keys: linux-${{ matrix.arch }}-cargo-
 
       - name: Install build dependencies
@@ -175,6 +179,12 @@ jobs:
         env:
           LIBRARY_PATH: /usr/local/lib
           LD_LIBRARY_PATH: /usr/local/lib
+
+      - name: Run agent unit tests
+        run: cargo test -p smolvm-agent --bins --target ${{ matrix.target }}
+        env:
+          LIBRARY_PATH: /usr/local/lib
+          LD_LIBRARY_PATH: /usr/local/lib
       # Note: Full VM integration tests require KVM + real libkrun.
       # Run integration tests locally on a machine with KVM access.
 
@@ -185,7 +195,7 @@ jobs:
     name: Agent (Linux musl)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
         with:

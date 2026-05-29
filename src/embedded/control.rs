@@ -170,7 +170,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "smolvm-embedded-control-{}-{}.redb",
+            "smolvm-embedded-control-{}-{}.db",
             std::process::id(),
             unique
         ));

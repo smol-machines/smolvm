@@ -103,7 +103,7 @@ tar -xzf "$CRANE_TAR" -C "$OUTPUT_DIR/usr/local/bin" crane
 #   1. apk.static (Linux only) — runs natively, supports cross-arch via --arch
 #   2. smolvm (any host) — only for native-arch builds (pulls host-arch image)
 echo "Installing additional packages..."
-APK_PACKAGES="jq e2fsprogs e2fsprogs-extra crun util-linux libcap"
+APK_PACKAGES="jq e2fsprogs e2fsprogs-extra crun util-linux libcap seatd"
 
 # Determine if this is a cross-arch build
 HOST_ARCH="$(uname -m)"
@@ -136,11 +136,17 @@ install_packages_apk_static() {
     echo "${ALPINE_MIRROR}/v${ALPINE_VERSION}/main" > "$OUTPUT_DIR/etc/apk/repositories"
     echo "${ALPINE_MIRROR}/v${ALPINE_VERSION}/community" >> "$OUTPUT_DIR/etc/apk/repositories"
 
+    # --no-scripts: skip pre/post-install scripts and triggers.
+    # When cross-building (e.g. aarch64 rootfs on x86_64 host), those scripts
+    # are aarch64 ELF binaries that the host kernel can't exec, causing exit
+    # code 127. The minirootfs already ships busybox symlinks, and seatd runs
+    # as root in the VM so the 'seat' group creation is not required.
     /tmp/apk-static/sbin/apk.static \
         --root "$OUTPUT_DIR" \
         --initdb \
         --no-cache \
         --allow-untrusted \
+        --no-scripts \
         --arch "$ALPINE_ARCH" \
         add $APK_PACKAGES
     echo "Packages installed successfully"
@@ -208,6 +214,9 @@ ln -sf /usr/local/bin/smolvm-agent "$OUTPUT_DIR/sbin/init"
 
 # Create resolv.conf
 echo "nameserver 1.1.1.1" > "$OUTPUT_DIR/etc/resolv.conf"
+
+# Remove seatd socket if baked in during build (build artifact, not runtime state)
+rm -f "$OUTPUT_DIR/run/seatd.sock"
 
 PROFILE="release-small"
 

@@ -5,13 +5,116 @@
 
 use crate::format::{PackFooter, SIDECAR_EXTENSION};
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
+
+/// Files larger than this threshold are extracted with a sparse write
+/// (ftruncate skeleton + pwrite only non-zero 64 KiB chunks) rather than a
+/// dense sequential write.  Chosen to match typical overlay disk sizes while
+/// staying well above any regular asset file.
+const SPARSE_WRITE_THRESHOLD: u64 = 256 * 1024 * 1024; // 256 MiB
+
+/// Extract a single tar entry as a sparse file.
+///
+/// Creates the destination with `ftruncate(entry_size)` so the OS allocates
+/// no disk blocks for the zero regions, then streams `entry` in 64 KiB
+/// chunks and `pwrite`s only the non-zero ones at their correct offsets.
+///
+/// This keeps a 10 GiB overlay disk (with ~50 MB of real data) from
+/// materialising as a dense file during sidecar extraction.
+fn unpack_sparse<R: Read>(
+    entry: &mut tar::Entry<R>,
+    path: &Path,
+    entry_size: u64,
+    mode: u32,
+) -> std::io::Result<()> {
+    // Ensure the parent directory exists (mirrors what entry.unpack_in does).
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    // Reject symlinks and unexpected directories at the destination.
+    // A prior tar entry may have placed an intra-dest relative symlink at this
+    // path; File::create would follow it, redirecting writes to the symlink
+    // target instead of the intended path.
+    match path.symlink_metadata() {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unpack_sparse: symlink at destination: {}", path.display()),
+            ));
+        }
+        Ok(meta) if meta.file_type().is_dir() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "unpack_sparse: directory at destination: {}",
+                    path.display()
+                ),
+            ));
+        }
+        Ok(_) => {
+            // Regular file: remove it so create_new (O_CREAT|O_EXCL) succeeds.
+            // This handles idempotent re-extraction without silently overwriting.
+            fs::remove_file(path)?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+
+    // Open with O_CREAT|O_EXCL|O_NOFOLLOW: rejects any symlink placed in the
+    // TOCTOU window between the check above and the open (defense in depth).
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?
+    };
+    #[cfg(not(unix))]
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+
+    // ftruncate: on APFS and ext4 this allocates zero disk blocks for the
+    // hole regions — only written bytes consume real space.
+    file.set_len(entry_size)?;
+
+    let mut offset: u64 = 0;
+    let mut buf = vec![0u8; 64 * 1024];
+
+    loop {
+        let n = entry.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        let chunk = &buf[..n];
+        if chunk.iter().any(|&b| b != 0) {
+            file.seek(SeekFrom::Start(offset))?;
+            file.write_all(chunk)?;
+        }
+        offset += n as u64;
+    }
+
+    // Only file mode is restored, not timestamps, uid/gid, or xattrs.
+    // unpack_sparse applies to large cache assets (overlay disks, storage
+    // images) extracted to a host-local cache directory; the extra metadata
+    // does not affect functionality for those assets.
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    #[cfg(not(unix))]
+    let _ = mode;
+
+    Ok(())
+}
 
 /// Safely unpack a tar archive, rejecting symlinks, hardlinks, and entries
 /// that resolve outside `dest`.
@@ -24,13 +127,33 @@ use std::os::unix::io::AsRawFd;
 fn safe_unpack<R: Read>(archive: &mut tar::Archive<R>, dest: &Path) -> std::io::Result<()> {
     let canonical_dest = dest.canonicalize().unwrap_or_else(|_| dest.to_path_buf());
 
+    // Track directories with restrictive permissions. We extract all entries
+    // with directories temporarily set to 0o755, then apply final permissions
+    // after all children are written. This matches GNU tar / bsdtar behavior
+    // and prevents extraction failures when a read-only directory appears
+    // before its children in the tar stream (e.g., Fedora's mode-555
+    // /usr/lib64/pm-utils/*.d directories).
+    let mut deferred_dir_modes: Vec<(PathBuf, u32)> = Vec::new();
+
     for entry_result in archive.entries()? {
         let mut entry = entry_result?;
         let entry_type = entry.header().entry_type();
         let entry_path = entry.path()?.to_path_buf();
 
         match entry_type {
-            tar::EntryType::Regular | tar::EntryType::GNUSparse | tar::EntryType::Directory => {}
+            tar::EntryType::Regular
+            | tar::EntryType::GNUSparse
+            | tar::EntryType::Directory
+            | tar::EntryType::Continuous => {}
+            // GNU/PAX extension headers are metadata for the next entry.
+            // The tar crate normally consumes them internally, but some
+            // archives surface them as explicit entries. Skip them.
+            tar::EntryType::GNULongName
+            | tar::EntryType::GNULongLink
+            | tar::EntryType::XGlobalHeader
+            | tar::EntryType::XHeader => {
+                continue;
+            }
             tar::EntryType::Symlink => {
                 // Allow symlinks but validate the target stays within dest.
                 if let Some(link_target) = entry.link_name()? {
@@ -71,17 +194,29 @@ fn safe_unpack<R: Read>(archive: &mut tar::Archive<R>, dest: &Path) -> std::io::
                             ),
                         ));
                     }
+                    // Skip hardlinks whose target was skipped (e.g., overlayfs
+                    // whiteout char devices). The target doesn't exist on disk
+                    // so creating the hardlink would fail.
+                    if !normalized.exists() {
+                        continue;
+                    }
                 }
             }
-            other => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "tar entry '{}' has disallowed type {:?}",
-                        entry_path.display(),
-                        other
-                    ),
-                ));
+            tar::EntryType::Char | tar::EntryType::Block | tar::EntryType::Fifo => {
+                // Device nodes and FIFOs appear in overlayfs upper-layer
+                // exports (e.g., whiteout char devices from package upgrades,
+                // named pipes from certain RPM scriptlets). These cannot be
+                // created without root on macOS and aren't needed on the
+                // host — skip them.
+                continue;
+            }
+            _other => {
+                // Unknown or unsupported entry types (sockets, vendor
+                // extensions, future tar formats). Skip rather than fail —
+                // the packed image runs inside a Linux VM where the agent
+                // rootfs provides these files; missing non-regular entries
+                // on the host extraction side don't affect functionality.
+                continue;
             }
         }
 
@@ -98,21 +233,71 @@ fn safe_unpack<R: Read>(archive: &mut tar::Archive<R>, dest: &Path) -> std::io::
             ));
         }
 
-        // Unpack the individual entry.
-        // Ensure parent directories are writable before extracting. OCI layer
-        // tars may set restrictive directory modes (e.g., dr-xr-xr-x) before
-        // child entries, which prevents creating files under them on macOS
-        // where we're not root.
-        if entry_type != tar::EntryType::Directory {
-            if let Some(parent) = full_path.parent() {
-                if parent.is_dir() {
-                    let _ =
-                        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755));
-                }
+        // Ensure parent directories are writable before extracting any entry.
+        // OCI layer tars may set restrictive directory modes (e.g., dr-xr-xr-x)
+        // before child entries, which prevents creating files or subdirectories.
+        if let Some(parent) = full_path.parent() {
+            if parent.is_dir() {
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755));
             }
         }
-        entry.unpack_in(dest)?;
+
+        // Save the tar's intended directory mode for deferred application.
+        if entry_type == tar::EntryType::Directory {
+            let mode = entry.header().mode().unwrap_or(0o755);
+            if mode & 0o200 == 0 {
+                deferred_dir_modes.push((full_path.clone(), mode));
+            }
+        }
+
+        let is_regular =
+            entry_type == tar::EntryType::Regular || entry_type == tar::EntryType::GNUSparse;
+
+        // For large regular files use a sparse write: ftruncate creates the
+        // hole skeleton, then we only pwrite non-zero 64 KiB chunks.  This
+        // prevents 10 GiB overlay disks from materialising as dense files on
+        // disk and causing ENOSPC or slow extraction.
+        if is_regular && entry.header().size().unwrap_or(0) >= SPARSE_WRITE_THRESHOLD {
+            let entry_size = entry.header().size()?;
+            let mode = entry.header().mode().unwrap_or(0o644);
+            if let Err(e) = unpack_sparse(&mut entry, &full_path, entry_size, mode) {
+                return Err(std::io::Error::new(
+                    e.kind(),
+                    format!("failed to unpack '{}': {}", entry_path.display(), e),
+                ));
+            }
+        } else {
+            if let Err(e) = entry.unpack_in(dest) {
+                // On macOS, certain entries fail to unpack due to platform
+                // limitations (xattr encoding, uid/gid mapping, resource forks).
+                // For non-Regular entries (symlinks, hardlinks, dirs), skip and
+                // continue rather than aborting the entire extraction.
+                if !is_regular {
+                    continue;
+                }
+                return Err(std::io::Error::new(
+                    e.kind(),
+                    format!("failed to unpack '{}': {}", entry_path.display(), e),
+                ));
+            }
+
+            // After extracting a directory, force it writable so subsequent
+            // entries (children) can be created inside it. Final permissions
+            // are applied after the loop.
+            if entry_type == tar::EntryType::Directory && full_path.is_dir() {
+                let _ =
+                    std::fs::set_permissions(&full_path, std::fs::Permissions::from_mode(0o755));
+            }
+        }
     }
+
+    // Apply deferred directory permissions now that all children are written.
+    for (path, mode) in deferred_dir_modes {
+        if path.is_dir() {
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode));
+        }
+    }
+
     Ok(())
 }
 
@@ -175,7 +360,16 @@ fn resolve_cache_asset_path(
     let resolved = if candidate.exists() {
         candidate.canonicalize()?
     } else {
-        normalize_path(&candidate)
+        // Candidate doesn't exist yet. Canonicalize its parent (which must
+        // exist — it's the cache dir) and join the filename. This avoids
+        // the macOS /tmp → /private/tmp symlink mismatch that would cause
+        // the starts_with check below to fail when cache_root is canonical
+        // but normalize_path is not.
+        let parent = candidate.parent().unwrap_or(&candidate);
+        let canonical_parent = parent
+            .canonicalize()
+            .unwrap_or_else(|_| normalize_path(parent));
+        canonical_parent.join(candidate.file_name().unwrap_or_default())
     };
 
     if !resolved.starts_with(&cache_root) {
@@ -283,7 +477,17 @@ pub fn extract_sidecar(
         let _ = fs::remove_dir_all(cache_dir);
     }
 
-    extract_sidecar_inner(sidecar_path, cache_dir, footer, debug)
+    let result = extract_sidecar_inner(sidecar_path, cache_dir, footer, debug);
+
+    // If extraction failed mid-stream, partially extracted files remain on
+    // disk without a completion marker. Subsequent retries hit the same
+    // error at the same tar entry, never completing. Clean up the partial
+    // directory so the next attempt starts fresh.
+    if result.is_err() && cache_dir.exists() && !is_extracted(cache_dir) {
+        let _ = fs::remove_dir_all(cache_dir);
+    }
+
+    result
     // Lock released on drop of lock_file
 }
 
@@ -1073,8 +1277,10 @@ pub fn create_storage_disk(path: &Path, size: u64) -> std::io::Result<()> {
 
 /// Copy overlay disk template from cache to a runtime directory.
 ///
-/// Copies the overlay template to `dest`, optionally extending the sparse
-/// file if `size_gb_override` is larger than the template.
+/// Copies the overlay template to `dest`, then restores the full sparse
+/// skeleton if `overlay_logical_size` is set (new packs store a truncated
+/// copy with the trailing hole stripped), and optionally extends further
+/// when `size_gb_override` is larger still.
 ///
 /// Returns an error if the template path is `None` or the template file
 /// does not exist in the cache.
@@ -1083,6 +1289,7 @@ pub fn copy_overlay_template(
     template_path: Option<&str>,
     dest: &Path,
     size_gb_override: Option<u64>,
+    overlay_logical_size: Option<u64>,
 ) -> std::io::Result<()> {
     let template = template_path.ok_or_else(|| {
         std::io::Error::new(
@@ -1101,14 +1308,25 @@ pub fn copy_overlay_template(
 
     fs::copy(&src, dest)?;
 
-    // Extend if requested size is larger than template
-    if let Some(gb) = size_gb_override {
-        let desired = gb * 1024 * 1024 * 1024;
-        let current = fs::metadata(dest)?.len();
-        if desired > current {
-            let file = fs::OpenOptions::new().write(true).open(dest)?;
-            file.set_len(desired)?;
-        }
+    // Determine target size: max of the copied size, overlay_logical_size
+    // (original sparse extent before trailing-hole truncation), and
+    // size_gb_override (user-requested larger disk).  A single ftruncate
+    // handles all three cases; ftruncate is instant and allocates no disk
+    // blocks for the extended region.
+    let copied_size = fs::metadata(dest)?.len();
+    let target = [
+        Some(copied_size),
+        overlay_logical_size,
+        size_gb_override.map(|gb| gb * 1024 * 1024 * 1024),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+    .unwrap_or(copied_size);
+
+    if target > copied_size {
+        let file = fs::OpenOptions::new().write(true).open(dest)?;
+        file.set_len(target)?;
     }
 
     Ok(())
@@ -1155,6 +1373,65 @@ pub fn create_or_copy_storage_disk(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a single-file tar archive in memory with the given name and data.
+    fn make_tar(name: &str, data: &[u8]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append_data(&mut header, name, data).unwrap();
+        builder.into_inner().unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_unpack_sparse_rejects_symlink_at_destination() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let outside = temp_dir.path().join("outside.bin");
+        let dest = temp_dir.path().join("overlay.raw");
+
+        fs::write(&outside, b"untouched").unwrap();
+        symlink(&outside, &dest).unwrap(); // dest is now a symlink → outside
+
+        let data = vec![0xFFu8; 512];
+        let tar_bytes = make_tar("overlay.raw", &data);
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        let mut entry = archive.entries().unwrap().next().unwrap().unwrap();
+
+        let result = unpack_sparse(&mut entry, &dest, data.len() as u64, 0o644);
+
+        assert!(result.is_err(), "should reject symlink at destination");
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+        // The symlink target must not be modified
+        assert_eq!(fs::read(&outside).unwrap(), b"untouched");
+    }
+
+    #[test]
+    fn test_unpack_sparse_preserves_data_integrity() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dest = temp_dir.path().join("data.raw");
+
+        // Alternating 64 KiB zero and non-zero blocks: covers the skip-zero
+        // path, the write-nonzero path, correct seek offsets, and the
+        // ftruncate skeleton giving the right final size.
+        let block = 64 * 1024;
+        let mut data = vec![0u8; 8 * block];
+        for i in (0..8).step_by(2) {
+            data[i * block..(i + 1) * block].fill(0xFF);
+        }
+
+        let tar_bytes = make_tar("data.raw", &data);
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        let mut entry = archive.entries().unwrap().next().unwrap().unwrap();
+
+        unpack_sparse(&mut entry, &dest, data.len() as u64, 0o644).unwrap();
+
+        assert_eq!(fs::read(&dest).unwrap(), data);
+    }
 
     #[test]
     fn test_cache_dir_format() {
@@ -1229,7 +1506,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let dest = temp_dir.path().join("overlay.raw");
 
-        let result = copy_overlay_template(temp_dir.path(), None, &dest, None);
+        let result = copy_overlay_template(temp_dir.path(), None, &dest, None, None);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotFound);
     }
@@ -1239,7 +1516,8 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let dest = temp_dir.path().join("overlay.raw");
 
-        let result = copy_overlay_template(temp_dir.path(), Some("nonexistent.raw"), &dest, None);
+        let result =
+            copy_overlay_template(temp_dir.path(), Some("nonexistent.raw"), &dest, None, None);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotFound);
     }
@@ -1254,15 +1532,52 @@ mod tests {
         let template_data = vec![0u8; 1024];
         fs::write(&template, &template_data).unwrap();
 
-        // Copy without size override
-        copy_overlay_template(temp_dir.path(), Some("overlay.raw"), &dest, None).unwrap();
+        // Copy without any size override or logical size
+        copy_overlay_template(temp_dir.path(), Some("overlay.raw"), &dest, None, None).unwrap();
         assert_eq!(fs::metadata(&dest).unwrap().len(), 1024);
 
-        // Copy with size override that extends (use small value for test)
+        // Copy with overlay_logical_size set — dest should be extended
         let dest2 = temp_dir.path().join("output2.raw");
-        // We can't test GiB-sized files, but we can verify the copy works
-        copy_overlay_template(temp_dir.path(), Some("overlay.raw"), &dest2, None).unwrap();
-        assert!(dest2.exists());
+        copy_overlay_template(
+            temp_dir.path(),
+            Some("overlay.raw"),
+            &dest2,
+            None,
+            Some(4096),
+        )
+        .unwrap();
+        assert_eq!(fs::metadata(&dest2).unwrap().len(), 4096);
+    }
+
+    #[test]
+    fn test_copy_overlay_template_size_gb_takes_max() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let template = temp_dir.path().join("overlay.raw");
+        fs::write(&template, vec![0u8; 1024]).unwrap();
+
+        // size_gb_override wins when larger than overlay_logical_size
+        let dest = temp_dir.path().join("out_a.raw");
+        copy_overlay_template(
+            temp_dir.path(),
+            Some("overlay.raw"),
+            &dest,
+            Some(1), // 1 GiB
+            Some(4096),
+        )
+        .unwrap();
+        assert_eq!(fs::metadata(&dest).unwrap().len(), 1024 * 1024 * 1024);
+
+        // overlay_logical_size wins when larger than size_gb_override
+        let dest2 = temp_dir.path().join("out_b.raw");
+        copy_overlay_template(
+            temp_dir.path(),
+            Some("overlay.raw"),
+            &dest2,
+            None,
+            Some(8192), // overlay_logical_size bigger than template but smaller than size_gb_override test above
+        )
+        .unwrap();
+        assert_eq!(fs::metadata(&dest2).unwrap().len(), 8192);
     }
 
     #[test]
@@ -1272,7 +1587,8 @@ mod tests {
         let dest = temp_dir.path().join("overlay.raw");
         fs::write(&outside, b"x").unwrap();
 
-        let result = copy_overlay_template(temp_dir.path(), Some("../outside.raw"), &dest, None);
+        let result =
+            copy_overlay_template(temp_dir.path(), Some("../outside.raw"), &dest, None, None);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
     }
@@ -1507,30 +1823,425 @@ mod tests {
     }
 
     #[test]
-    fn test_safe_unpack_rejects_disallowed_entry_type() {
-        // Build a tar with a FIFO entry (disallowed type)
+    fn test_safe_unpack_skips_char_and_block_devices() {
+        // Char/Block entries appear in overlayfs exports from Debian images
+        // (e.g., update-alternatives). They should be skipped, not rejected.
         let temp_dir = tempfile::tempdir().unwrap();
         let dest_raw = temp_dir.path().join("out");
         fs::create_dir_all(&dest_raw).unwrap();
         let dest = dest_raw.canonicalize().unwrap();
 
         let mut builder = tar::Builder::new(Vec::new());
+
+        // Regular file before device entries
         let mut header = tar::Header::new_gnu();
-        header.set_entry_type(tar::EntryType::Fifo);
-        header.set_size(0);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(5);
         header.set_mode(0o644);
+        header.set_path("before.txt").unwrap();
         header.set_cksum();
         builder
-            .append_data(&mut header, "fifo-entry", &b""[..])
+            .append_data(&mut header, "before.txt", &b"hello"[..])
             .unwrap();
+
+        // Char device entry (should be skipped)
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Char);
+        header.set_size(0);
+        header.set_mode(0o644);
+        header.set_path("etc/alternatives/pager.1.gz").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "etc/alternatives/pager.1.gz", &b""[..])
+            .unwrap();
+
+        // Block device entry (should be skipped)
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Block);
+        header.set_size(0);
+        header.set_mode(0o644);
+        header.set_path("dev/sda").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "dev/sda", &b""[..])
+            .unwrap();
+
+        // Regular file after device entries (must survive)
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(5);
+        header.set_mode(0o644);
+        header.set_path("after.txt").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "after.txt", &b"world"[..])
+            .unwrap();
+
         let tar_data = builder.into_inner().unwrap();
 
         let mut archive = tar::Archive::new(tar_data.as_slice());
         let result = safe_unpack(&mut archive, &dest);
-        assert!(result.is_err(), "FIFO entry type should be rejected");
         assert!(
-            result.unwrap_err().to_string().contains("disallowed type"),
-            "error should mention disallowed type"
+            result.is_ok(),
+            "Char/Block entries should be skipped: {:?}",
+            result.err()
         );
+
+        // Files before AND after device entries are extracted
+        assert_eq!(
+            fs::read_to_string(dest.join("before.txt")).unwrap(),
+            "hello"
+        );
+        assert_eq!(fs::read_to_string(dest.join("after.txt")).unwrap(), "world");
+
+        // Device entries are not created
+        assert!(!dest.join("etc/alternatives/pager.1.gz").exists());
+        assert!(!dest.join("dev/sda").exists());
+    }
+
+    #[test]
+    fn test_safe_unpack_skips_hardlink_to_whiteout() {
+        // Overlayfs exports from Fedora produce hardlinks to char-device
+        // whiteout entries (e.g., .build-id symlinks referencing replaced
+        // base-layer files). The whiteout is skipped, so the hardlink target
+        // doesn't exist — the hardlink must be skipped too.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dest_raw = temp_dir.path().join("out");
+        fs::create_dir_all(&dest_raw).unwrap();
+        let dest = dest_raw.canonicalize().unwrap();
+
+        let mut builder = tar::Builder::new(Vec::new());
+
+        // Char device whiteout (will be skipped)
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Char);
+        header.set_size(0);
+        header.set_mode(0o000);
+        header.set_path("usr/lib/.build-id/84/target").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "usr/lib/.build-id/84/target", &b""[..])
+            .unwrap();
+
+        // Hardlink to the skipped whiteout (should also be skipped)
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Link);
+        header.set_size(0);
+        header.set_mode(0o000);
+        header.set_path("usr/lib/.build-id/d9/link").unwrap();
+        header.set_link_name("usr/lib/.build-id/84/target").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "usr/lib/.build-id/d9/link", &b""[..])
+            .unwrap();
+
+        // Regular file after (must survive)
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(2);
+        header.set_mode(0o644);
+        header.set_path("ok.txt").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "ok.txt", &b"ok"[..])
+            .unwrap();
+
+        let tar_data = builder.into_inner().unwrap();
+
+        let mut archive = tar::Archive::new(tar_data.as_slice());
+        let result = safe_unpack(&mut archive, &dest);
+        assert!(
+            result.is_ok(),
+            "hardlink to skipped whiteout should be skipped: {:?}",
+            result.err()
+        );
+
+        // Whiteout and hardlink are not created
+        assert!(!dest.join("usr/lib/.build-id/84/target").exists());
+        assert!(!dest.join("usr/lib/.build-id/d9/link").exists());
+        // Regular file survives
+        assert_eq!(fs::read_to_string(dest.join("ok.txt")).unwrap(), "ok");
+    }
+
+    #[test]
+    fn test_safe_unpack_readonly_parent_dir_does_not_block_children() {
+        // Reproduces the Fedora extraction bug: a mode-555 directory entry
+        // appears before its children in the tar. Without deferred permissions,
+        // creating files inside the read-only directory fails.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dest_raw = temp_dir.path().join("out");
+        fs::create_dir_all(&dest_raw).unwrap();
+        let dest = dest_raw.canonicalize().unwrap();
+
+        let mut builder = tar::Builder::new(Vec::new());
+
+        // Parent directory with restrictive mode (read-only, no write)
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_size(0);
+        header.set_mode(0o555); // read + execute only, no write
+        header.set_path("usr/lib64/pm-utils/").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "usr/lib64/pm-utils/", &b""[..])
+            .unwrap();
+
+        // Child directory inside the read-only parent
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_size(0);
+        header.set_mode(0o555);
+        header.set_path("usr/lib64/pm-utils/module.d/").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "usr/lib64/pm-utils/module.d/", &b""[..])
+            .unwrap();
+
+        // File inside the nested read-only directory
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(4);
+        header.set_mode(0o644);
+        header
+            .set_path("usr/lib64/pm-utils/module.d/test.conf")
+            .unwrap();
+        header.set_cksum();
+        builder
+            .append_data(
+                &mut header,
+                "usr/lib64/pm-utils/module.d/test.conf",
+                &b"data"[..],
+            )
+            .unwrap();
+
+        let tar_data = builder.into_inner().unwrap();
+
+        let mut archive = tar::Archive::new(tar_data.as_slice());
+        let result = safe_unpack(&mut archive, &dest);
+        assert!(
+            result.is_ok(),
+            "read-only parent should not block children: {:?}",
+            result.err()
+        );
+
+        // Child directory and file must exist
+        assert!(dest.join("usr/lib64/pm-utils/module.d").is_dir());
+        assert_eq!(
+            fs::read_to_string(dest.join("usr/lib64/pm-utils/module.d/test.conf")).unwrap(),
+            "data"
+        );
+
+        // Final permissions should be restored to the tar's mode (555)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(dest.join("usr/lib64/pm-utils"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o555, "deferred directory mode should be 555");
+        }
+    }
+
+    #[test]
+    fn test_safe_unpack_mixed_fedora_overlay_layer() {
+        // Realistic Fedora overlay layer: regular files interspersed with
+        // whiteout char devices and hardlinks to those whiteouts.
+        // All good files should extract; bad entries should be skipped.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dest_raw = temp_dir.path().join("out");
+        fs::create_dir_all(&dest_raw).unwrap();
+        let dest = dest_raw.canonicalize().unwrap();
+
+        let mut builder = tar::Builder::new(Vec::new());
+
+        // Directory
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_size(0);
+        header.set_mode(0o755);
+        header.set_path("usr/").unwrap();
+        header.set_cksum();
+        builder.append_data(&mut header, "usr/", &b""[..]).unwrap();
+
+        // Good file 1
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(11);
+        header.set_mode(0o644);
+        header.set_path("usr/good1.txt").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "usr/good1.txt", &b"good file 1"[..])
+            .unwrap();
+
+        // Char device whiteout
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Char);
+        header.set_size(0);
+        header.set_mode(0o000);
+        header.set_device_major(0).unwrap();
+        header.set_device_minor(0).unwrap();
+        header.set_path("usr/.wh.removed-pkg").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "usr/.wh.removed-pkg", &b""[..])
+            .unwrap();
+
+        // Good file 2
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(11);
+        header.set_mode(0o644);
+        header.set_path("usr/good2.txt").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "usr/good2.txt", &b"good file 2"[..])
+            .unwrap();
+
+        // Hardlink to the whiteout (should be skipped)
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Link);
+        header.set_size(0);
+        header.set_mode(0o000);
+        header.set_path("usr/link-to-removed").unwrap();
+        header.set_link_name("usr/.wh.removed-pkg").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "usr/link-to-removed", &b""[..])
+            .unwrap();
+
+        // Good file 3
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(11);
+        header.set_mode(0o755);
+        header.set_path("usr/good3.sh").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "usr/good3.sh", &b"#!/bin/bash"[..])
+            .unwrap();
+
+        // Another char device whiteout
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Char);
+        header.set_size(0);
+        header.set_mode(0o000);
+        header.set_device_major(0).unwrap();
+        header.set_device_minor(0).unwrap();
+        header.set_path("usr/.wh.another-removed").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "usr/.wh.another-removed", &b""[..])
+            .unwrap();
+
+        // Good file 4 (final entry)
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(5);
+        header.set_mode(0o644);
+        header.set_path("usr/good4.dat").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "usr/good4.dat", &b"final"[..])
+            .unwrap();
+
+        let tar_data = builder.into_inner().unwrap();
+
+        let mut archive = tar::Archive::new(tar_data.as_slice());
+        let result = safe_unpack(&mut archive, &dest);
+        assert!(
+            result.is_ok(),
+            "mixed Fedora overlay should extract cleanly: {:?}",
+            result.err()
+        );
+
+        // Good files are all extracted
+        assert_eq!(
+            fs::read_to_string(dest.join("usr/good1.txt")).unwrap(),
+            "good file 1"
+        );
+        assert_eq!(
+            fs::read_to_string(dest.join("usr/good2.txt")).unwrap(),
+            "good file 2"
+        );
+        assert_eq!(
+            fs::read_to_string(dest.join("usr/good3.sh")).unwrap(),
+            "#!/bin/bash"
+        );
+        assert_eq!(
+            fs::read_to_string(dest.join("usr/good4.dat")).unwrap(),
+            "final"
+        );
+
+        // Bad entries are not created
+        assert!(!dest.join("usr/.wh.removed-pkg").exists());
+        assert!(!dest.join("usr/link-to-removed").exists());
+        assert!(!dest.join("usr/.wh.another-removed").exists());
+    }
+
+    #[test]
+    fn test_safe_unpack_unknown_tar_type_byte() {
+        // Entry with unknown tar type byte (0x41 = 'A') — a vendor extension
+        // not recognized by the tar crate (maps to __Nonexhaustive).
+        // Should be skipped gracefully by safe_unpack's catch-all arm.
+        // Note: byte '7' maps to EntryType::Continuous which is allowed.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dest_raw = temp_dir.path().join("out");
+        fs::create_dir_all(&dest_raw).unwrap();
+        let dest = dest_raw.canonicalize().unwrap();
+
+        let mut builder = tar::Builder::new(Vec::new());
+
+        // Regular file before the unknown entry
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(6);
+        header.set_mode(0o644);
+        header.set_path("before.txt").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "before.txt", &b"before"[..])
+            .unwrap();
+
+        // Unknown type byte entry ('A' = 0x41, truly unrecognized)
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::new(b'A'));
+        header.set_size(0);
+        header.set_mode(0o644);
+        header.set_path("unknown-type-entry").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "unknown-type-entry", &b""[..])
+            .unwrap();
+
+        // Regular file after
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(5);
+        header.set_mode(0o644);
+        header.set_path("after.txt").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "after.txt", &b"after"[..])
+            .unwrap();
+
+        let tar_data = builder.into_inner().unwrap();
+
+        let mut archive = tar::Archive::new(tar_data.as_slice());
+        let result = safe_unpack(&mut archive, &dest);
+        assert!(
+            result.is_ok(),
+            "unknown tar type should be skipped: {:?}",
+            result.err()
+        );
+
+        assert_eq!(
+            fs::read_to_string(dest.join("before.txt")).unwrap(),
+            "before"
+        );
+        assert_eq!(fs::read_to_string(dest.join("after.txt")).unwrap(), "after");
+        assert!(!dest.join("unknown-type-entry").exists());
     }
 }

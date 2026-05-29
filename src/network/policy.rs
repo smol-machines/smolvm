@@ -1,6 +1,6 @@
 //! Network policy helpers.
 
-use crate::data::network::DEFAULT_DNS_ADDR;
+use crate::data::network;
 use crate::vm::config::NetworkPolicy;
 use std::net::IpAddr;
 
@@ -8,7 +8,7 @@ use std::net::IpAddr;
 pub fn get_dns_server(policy: &NetworkPolicy) -> Option<IpAddr> {
     match policy {
         NetworkPolicy::None => None,
-        NetworkPolicy::Egress { dns, .. } => Some(dns.unwrap_or(DEFAULT_DNS_ADDR)),
+        NetworkPolicy::Egress { dns, .. } => Some(dns.unwrap_or_else(network::default_dns_addr)),
     }
 }
 
@@ -25,7 +25,7 @@ mod tests {
             allowed_cidrs: None,
         })
         .unwrap();
-        assert_eq!(dns.to_string(), crate::data::network::DEFAULT_DNS);
+        assert_eq!(dns, crate::data::network::default_dns_addr());
 
         let custom: IpAddr = "8.8.8.8".parse().unwrap();
         let dns = get_dns_server(&NetworkPolicy::Egress {

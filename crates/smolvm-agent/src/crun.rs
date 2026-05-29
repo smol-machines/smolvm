@@ -36,10 +36,11 @@ fn ensure_path_in_env(env: &[(String, String)]) -> Vec<(String, String)> {
 /// and other common options.
 pub struct CrunCommand {
     cmd: Command,
-    /// Positional container id for `crun run`. Appended at the very end in
-    /// `spawn`/`output`/`status` so options added later (e.g. `--console-socket`
-    /// via `console_socket()`) still land before the positional.
-    pending_run_id: Option<String>,
+    /// Trailing positional arguments (e.g. the container id for `crun run`, or
+    /// the container id followed by the command for `crun exec`). Appended at
+    /// the very end in `spawn`/`output`/`status` so options added later (e.g.
+    /// `--console-socket` via `console_socket()`) still land before them.
+    pending_positionals: Vec<String>,
 }
 
 impl CrunCommand {
@@ -54,7 +55,7 @@ impl CrunCommand {
         cmd.args(["--cgroup-manager", paths::CRUN_CGROUP_MANAGER]);
         Self {
             cmd,
-            pending_run_id: None,
+            pending_positionals: Vec::new(),
         }
     }
 
@@ -86,7 +87,26 @@ impl CrunCommand {
         let mut c = Self::new();
         c.cmd
             .args(["run", "--bundle", &bundle_dir.to_string_lossy()]);
-        c.pending_run_id = Some(container_id.to_string());
+        c.pending_positionals = vec![container_id.to_string()];
+        c
+    }
+
+    /// Run a container detached: `crun run --detach --bundle <path> <id>`
+    ///
+    /// Returns immediately after the container process is started. The container
+    /// continues running independently. Use `crun state` to check status.
+    pub fn run_detach(bundle_dir: &Path, container_id: &str) -> Self {
+        let mut c = Self::new();
+        c.cmd.args([
+            "run",
+            "--detach",
+            "--bundle",
+            &bundle_dir.to_string_lossy(),
+            container_id,
+        ]);
+        c.cmd.stdin(Stdio::null());
+        c.cmd.stdout(Stdio::null());
+        c.cmd.stderr(Stdio::null());
         c
     }
 
@@ -102,6 +122,10 @@ impl CrunCommand {
     /// Supports optional working directory and TTY allocation.
     /// Automatically ensures PATH is set if not provided, because crun doesn't
     /// search PATH for executables when `--env` is used.
+    ///
+    /// The container id and command are deferred (see `pending_positionals`) so
+    /// later builder calls — notably `console_socket()` for the interactive TTY
+    /// path — still insert their options before the positional arguments.
     pub fn exec(
         container_id: &str,
         env: &[(String, String)],
@@ -122,7 +146,9 @@ impl CrunCommand {
         if let Some(wd) = workdir {
             c.cmd.args(["--cwd", wd]);
         }
-        c.cmd.arg(container_id).args(command);
+        c.pending_positionals = std::iter::once(container_id.to_string())
+            .chain(command.iter().cloned())
+            .collect();
         c
     }
 
@@ -184,39 +210,6 @@ impl CrunCommand {
         self
     }
 
-    /// Set stdin from a raw fd (e.g., PTY slave).
-    ///
-    /// # Safety
-    /// The fd must be a valid open file descriptor. Ownership is transferred.
-    #[cfg(unix)]
-    pub unsafe fn stdin_from_fd(mut self, fd: std::os::unix::io::RawFd) -> Self {
-        use std::os::unix::io::FromRawFd;
-        self.cmd.stdin(Stdio::from_raw_fd(fd));
-        self
-    }
-
-    /// Set stdout from a raw fd (e.g., PTY slave).
-    ///
-    /// # Safety
-    /// The fd must be a valid open file descriptor. Ownership is transferred.
-    #[cfg(unix)]
-    pub unsafe fn stdout_from_fd(mut self, fd: std::os::unix::io::RawFd) -> Self {
-        use std::os::unix::io::FromRawFd;
-        self.cmd.stdout(Stdio::from_raw_fd(fd));
-        self
-    }
-
-    /// Set stderr from a raw fd (e.g., PTY slave).
-    ///
-    /// # Safety
-    /// The fd must be a valid open file descriptor. Ownership is transferred.
-    #[cfg(unix)]
-    pub unsafe fn stderr_from_fd(mut self, fd: std::os::unix::io::RawFd) -> Self {
-        use std::os::unix::io::FromRawFd;
-        self.cmd.stderr(Stdio::from_raw_fd(fd));
-        self
-    }
-
     /// Capture stdout.
     pub fn stdout_piped(mut self) -> Self {
         self.cmd.stdout(Stdio::piped());
@@ -241,12 +234,12 @@ impl CrunCommand {
         self
     }
 
-    /// Append the deferred `crun run` container id (if any) right before the
-    /// command is launched, so any options added by the caller land before
-    /// the positional argument.
+    /// Append any deferred positional arguments right before the command is
+    /// launched, so options added by the caller (e.g. `--console-socket`) land
+    /// before them.
     fn apply_pending(&mut self) {
-        if let Some(id) = self.pending_run_id.take() {
-            self.cmd.arg(id);
+        for arg in std::mem::take(&mut self.pending_positionals) {
+            self.cmd.arg(arg);
         }
     }
 

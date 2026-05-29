@@ -1,13 +1,13 @@
 [package]
 name = "smolvm-registry"
-version = "0.5.19"
+version = "0.8.0"
 edition = "2021"
 description = "OCI Distribution client for smolmachines registry"
 license = "Apache-2.0"
 
 [dependencies]
 smolvm-pack = { path = "../smolvm-pack" }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
 sha2 = "0.10"
 bytes = "1"
 hex = "0.4"
@@ -24,3 +24,4 @@ futures-util = "0.3"
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
+wiremock = "0.6"

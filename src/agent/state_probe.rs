@@ -218,7 +218,7 @@ mod tests {
     #[test]
     fn unreachable_variant_round_trips_through_serde() {
         // The Unreachable variant must serialize cleanly so a record
-        // marked Unreachable in memory persists to redb correctly.
+        // marked Unreachable in memory persists to the database correctly.
         let r = record(RecordState::Unreachable, Some(12345));
         let json = serde_json::to_string(&r).unwrap();
         assert!(json.contains("\"state\":\"unreachable\""));

@@ -14,6 +14,30 @@
 source "$(dirname "$0")/common.sh"
 init_smolvm
 
+# Pack tests must not inherit the repo-local libkrun search path from
+# common.sh. Packed stubs are expected to start without host-provided libkrun.
+if [[ "$(uname -s)" == "Linux" ]]; then
+    repo_lib_dir="$PROJECT_ROOT/lib/linux-$(uname -m)"
+    if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
+        filtered_ld_library_path=""
+        IFS=':' read -r -a ld_library_path_entries <<< "$LD_LIBRARY_PATH"
+        for entry in "${ld_library_path_entries[@]}"; do
+            [[ "$entry" == "$repo_lib_dir" ]] && continue
+            if [[ -z "$filtered_ld_library_path" ]]; then
+                filtered_ld_library_path="$entry"
+            else
+                filtered_ld_library_path="${filtered_ld_library_path}:$entry"
+            fi
+        done
+
+        if [[ -n "$filtered_ld_library_path" ]]; then
+            export LD_LIBRARY_PATH="$filtered_ld_library_path"
+        else
+            unset LD_LIBRARY_PATH
+        fi
+    fi
+fi
+
 # Pre-flight: Kill any existing smolvm processes that might hold database lock
 log_info "Pre-flight cleanup: killing orphan processes..."
 kill_orphan_smolvm_processes
@@ -262,12 +286,30 @@ test_pack_bundled_libkrun_has_required_symbols() {
     # Verify all required symbols exist in the bundled library.
     # This catches the bug where an older system libkrun gets bundled
     # instead of the one smolvm was built against.
-    local symbols
-    symbols=$(nm -gU "$libkrun" 2>/dev/null) || { echo "FAIL: nm failed on $libkrun"; return 1; }
+    #
+    # Symbol inspection is platform-specific here:
+    # - macOS uses Mach-O, where `nm -gU` lists external symbols and C exports
+    #   appear with a leading underscore (for example `_krun_create_ctx`)
+    # - Linux uses ELF, where `nm -D --defined-only` lists dynamic exports and
+    #   the same symbol appears without the underscore (`krun_create_ctx`)
+    local symbols nm_prefix
+    if [[ "$(uname)" == "Darwin" ]]; then
+        symbols=$(nm -gU "$libkrun" 2>/dev/null) || {
+            echo "FAIL: nm failed on $libkrun"
+            return 1
+        }
+        nm_prefix="_"
+    else
+        symbols=$(nm -D --defined-only "$libkrun" 2>/dev/null) || {
+            echo "FAIL: nm failed on $libkrun"
+            return 1
+        }
+        nm_prefix=""
+    fi
 
     local missing=0
     for sym in krun_create_ctx krun_add_disk2 krun_add_vsock_port2 krun_start_enter; do
-        if ! echo "$symbols" | grep -q "_${sym}$"; then
+        if ! echo "$symbols" | grep -q "${nm_prefix}${sym}$"; then
             echo "FAIL: bundled libkrun missing required symbol: $sym"
             missing=1
         fi
@@ -786,6 +828,143 @@ test_from_vm_image_overlay() {
 }
 
 # =============================================================================
+# Debian Pack Roundtrip (Char device entry regression)
+#
+# Debian's update-alternatives creates Char device entries in /etc/alternatives/
+# in the overlayfs upper layer. These entries caused safe_unpack() to abort
+# mid-stream, silently dropping files that appeared after the Char entry in the
+# tar. This test verifies the full round-trip:
+#   1. Create image-based VM with Debian image
+#   2. Install a package that triggers update-alternatives (creates Char entries)
+#   3. Write a test file
+#   4. Pack the VM
+#   5. Create a new machine from the pack
+#   6. Verify the test file survived (it appears after Char entries in the tar)
+# =============================================================================
+
+test_from_vm_debian_roundtrip() {
+    local vm_name="debian-pack-$$"
+    local from_name="debian-from-$$"
+    local pack_output="$TEST_DIR/test-debian-roundtrip"
+
+    # Cleanup any leftovers
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine stop --name "$from_name" 2>/dev/null || true
+    $SMOLVM machine delete "$from_name" -f 2>/dev/null || true
+
+    # 1. Create a Debian-based VM
+    echo "  Step 1: Creating Debian VM..."
+    $SMOLVM machine create "$vm_name" --image python:3.12-slim --net 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || {
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+    }
+
+    # 2. Install a package that creates Char entries via update-alternatives
+    echo "  Step 2: Installing man-db (creates Char entries in /etc/alternatives/)..."
+    $SMOLVM machine exec --name "$vm_name" -- \
+        bash -c "apt-get update -qq && apt-get install -y -qq man-db >/dev/null 2>&1" || {
+        echo "FAIL: apt-get install failed"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+    }
+
+    # 3. Write a test file (appears late in tar stream — after Char entries)
+    echo "  Step 3: Writing test marker..."
+    $SMOLVM machine exec --name "$vm_name" -- \
+        bash -c "echo 'debian-roundtrip-ok' > /test-marker.txt"
+
+    local content
+    content=$($SMOLVM machine exec --name "$vm_name" -- cat /test-marker.txt 2>&1)
+    [[ "$content" == *"debian-roundtrip-ok"* ]] || {
+        echo "FAIL: test marker not written (got: '$content')"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+    }
+
+    # 4. Stop and pack
+    echo "  Step 4: Packing VM..."
+    $SMOLVM machine stop --name "$vm_name" 2>&1
+    $SMOLVM pack create --from-vm "$vm_name" -o "$pack_output" 2>&1 || {
+        echo "FAIL: pack create --from-vm failed"
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+    }
+
+    # 5. Create a new machine from the pack
+    echo "  Step 5: Creating machine from pack..."
+    $SMOLVM machine create "$from_name" --from "$pack_output.smolmachine" 2>&1 || {
+        echo "FAIL: machine create --from failed (Char device extraction bug)"
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+    }
+    $SMOLVM machine start --name "$from_name" 2>&1 || {
+        echo "FAIL: machine start failed"
+        $SMOLVM machine delete "$from_name" -f 2>/dev/null
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+    }
+
+    # 6. Verify test file survived the roundtrip
+    echo "  Step 6: Verifying test marker survived..."
+    local result
+    result=$($SMOLVM machine exec --name "$from_name" -- cat /test-marker.txt 2>&1) || {
+        echo "FAIL: test marker missing after roundtrip (Char device data loss)"
+        $SMOLVM machine stop --name "$from_name" 2>/dev/null
+        $SMOLVM machine delete "$from_name" -f 2>/dev/null
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+    }
+
+    [[ "$result" == *"debian-roundtrip-ok"* ]] || {
+        echo "FAIL: test marker content mismatch (got: '$result')"
+        $SMOLVM machine stop --name "$from_name" 2>/dev/null
+        $SMOLVM machine delete "$from_name" -f 2>/dev/null
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+    }
+
+    echo "  Test marker survived Debian pack/unpack roundtrip"
+
+    # Cleanup
+    $SMOLVM machine stop --name "$from_name" 2>/dev/null || true
+    $SMOLVM machine delete "$from_name" -f 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    rm -f "$pack_output" "$pack_output.smolmachine"
+}
+
+# Regression: short VM names (1-3 chars) must not panic in pack create --from-vm.
+# The overlay layer digest is derived from the VM name via SHA-256, so any length works.
+test_from_vm_short_name() {
+    local vm_name="x"
+    local pack_output="$TEST_DIR/from-vm-short"
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    rm -f "$pack_output" "$pack_output.smolmachine"
+
+    # Create, start, modify, stop
+    $SMOLVM machine create "$vm_name" --image alpine:latest --net 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || {
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+    }
+    $SMOLVM machine exec --name "$vm_name" -- touch /etc/short-name-marker 2>&1 || true
+    $SMOLVM machine stop --name "$vm_name" 2>&1 || {
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+    }
+
+    # Pack — this is where the panic used to occur
+    local exit_code=0
+    $SMOLVM pack create --from-vm "$vm_name" -o "$pack_output" 2>&1 || exit_code=$?
+
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    rm -f "$pack_output" "$pack_output.smolmachine"
+
+    [[ $exit_code -eq 0 ]] || {
+        echo "FAIL: pack create --from-vm with 1-char name failed (exit $exit_code)"
+        return 1
+    }
+}
+
+# =============================================================================
+# Case-Insensitive Collision Test (macOS regression)
+#
+# =============================================================================
 # Case-Insensitive Collision Test (macOS regression)
 #
 # Regression test for macOS case-insensitive APFS. Linux OCI layers may
@@ -1188,6 +1367,18 @@ if [[ "$QUICK_MODE" != "true" ]]; then
     echo ""
 
     run_test "from-vm-image: container overlay captured" test_from_vm_image_overlay || true
+
+    echo ""
+    echo "Running Debian Pack Roundtrip Tests..."
+    echo ""
+
+    run_test "from-vm-debian: Char device entries don't break extraction" test_from_vm_debian_roundtrip || true
+
+    echo ""
+    echo "Running --from-vm Short Name Tests..."
+    echo ""
+
+    run_test "from-vm: short VM name (1 char) does not panic" test_from_vm_short_name || true
 fi
 
 # =============================================================================

@@ -4,6 +4,8 @@
 //! config.json files used by crun to execute containers.
 
 use serde::{Deserialize, Serialize};
+use std::fs;
+use std::io::ErrorKind;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -72,12 +74,284 @@ pub struct OciConsoleSize {
 }
 
 /// User configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OciUser {
     pub uid: u32,
     pub gid: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub additional_gids: Vec<u32>,
+}
+
+/// Resolved process identity for container execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessIdentity {
+    pub user: OciUser,
+    pub home: Option<String>,
+}
+
+impl ProcessIdentity {
+    pub fn root() -> Self {
+        Self {
+            user: OciUser {
+                uid: 0,
+                gid: 0,
+                additional_gids: vec![],
+            },
+            home: Some("/root".to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PasswdEntry {
+    username: String,
+    uid: u32,
+    gid: u32,
+    home: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GroupEntry {
+    name: String,
+    gid: u32,
+    members: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedUser {
+    uid: u32,
+    username: Option<String>,
+    primary_gid: Option<u32>,
+    home: Option<String>,
+}
+
+pub fn resolve_process_identity(
+    rootfs: &Path,
+    user_spec: Option<&str>,
+) -> Result<ProcessIdentity, String> {
+    let normalized = user_spec.map(str::trim).filter(|s| !s.is_empty());
+    let passwd_entries = load_passwd_entries(rootfs)?;
+    let group_entries = load_group_entries(rootfs)?;
+
+    if normalized.is_none() {
+        return Ok(resolve_default_root_identity(
+            &passwd_entries,
+            &group_entries,
+        ));
+    }
+
+    let spec = normalized.expect("checked above");
+    let (user_token, group_token) = parse_user_spec(spec)?;
+
+    let resolved_user = resolve_user_token(user_token, &passwd_entries)?;
+    let primary_gid = match group_token {
+        Some(group) => resolve_group_token(group, &group_entries)?,
+        None => resolved_user.primary_gid.unwrap_or(0),
+    };
+
+    let additional_gids = supplemental_group_ids(
+        &group_entries,
+        resolved_user.username.as_deref(),
+        primary_gid,
+    );
+    let home = resolved_user.home.or_else(|| {
+        if resolved_user.uid == 0 {
+            Some("/root".to_string())
+        } else {
+            None
+        }
+    });
+
+    Ok(ProcessIdentity {
+        user: OciUser {
+            uid: resolved_user.uid,
+            gid: primary_gid,
+            additional_gids,
+        },
+        home,
+    })
+}
+
+fn parse_user_spec(spec: &str) -> Result<(&str, Option<&str>), String> {
+    match spec.split_once(':') {
+        Some((user, group)) => {
+            if user.is_empty() {
+                return Err("invalid empty user in OCI image config".to_string());
+            }
+            if group.is_empty() {
+                return Err("invalid empty group in OCI image config".to_string());
+            }
+            Ok((user, Some(group)))
+        }
+        None => Ok((spec, None)),
+    }
+}
+
+fn resolve_default_root_identity(
+    passwd_entries: &[PasswdEntry],
+    group_entries: &[GroupEntry],
+) -> ProcessIdentity {
+    if let Some(root) = passwd_entries.iter().find(|entry| entry.username == "root") {
+        return ProcessIdentity {
+            user: OciUser {
+                uid: root.uid,
+                gid: root.gid,
+                additional_gids: supplemental_group_ids(
+                    group_entries,
+                    Some(root.username.as_str()),
+                    root.gid,
+                ),
+            },
+            home: Some(root.home.clone()),
+        };
+    }
+
+    ProcessIdentity::root()
+}
+
+fn resolve_user_token(user: &str, passwd_entries: &[PasswdEntry]) -> Result<ResolvedUser, String> {
+    if let Ok(uid) = user.parse::<u32>() {
+        if let Some(entry) = passwd_entries.iter().find(|entry| entry.uid == uid) {
+            return Ok(ResolvedUser {
+                uid,
+                username: Some(entry.username.clone()),
+                primary_gid: Some(entry.gid),
+                home: Some(entry.home.clone()),
+            });
+        }
+
+        return Ok(ResolvedUser {
+            uid,
+            username: None,
+            primary_gid: None,
+            home: None,
+        });
+    }
+
+    let entry = passwd_entries
+        .iter()
+        .find(|entry| entry.username == user)
+        .ok_or_else(|| format!("user '{}' not found in container rootfs", user))?;
+
+    Ok(ResolvedUser {
+        uid: entry.uid,
+        username: Some(entry.username.clone()),
+        primary_gid: Some(entry.gid),
+        home: Some(entry.home.clone()),
+    })
+}
+
+fn resolve_group_token(group: &str, group_entries: &[GroupEntry]) -> Result<u32, String> {
+    if let Ok(gid) = group.parse::<u32>() {
+        return Ok(gid);
+    }
+
+    group_entries
+        .iter()
+        .find(|entry| entry.name == group)
+        .map(|entry| entry.gid)
+        .ok_or_else(|| format!("group '{}' not found in container rootfs", group))
+}
+
+fn supplemental_group_ids(
+    group_entries: &[GroupEntry],
+    username: Option<&str>,
+    primary_gid: u32,
+) -> Vec<u32> {
+    let Some(username) = username else {
+        return Vec::new();
+    };
+
+    let mut gids = Vec::new();
+    for entry in group_entries {
+        if entry.gid != primary_gid
+            && entry.members.iter().any(|member| member == username)
+            && !gids.contains(&entry.gid)
+        {
+            gids.push(entry.gid);
+        }
+    }
+    gids
+}
+
+fn load_passwd_entries(rootfs: &Path) -> Result<Vec<PasswdEntry>, String> {
+    load_entries(rootfs.join("etc/passwd"), parse_passwd_entries)
+}
+
+fn load_group_entries(rootfs: &Path) -> Result<Vec<GroupEntry>, String> {
+    load_entries(rootfs.join("etc/group"), parse_group_entries)
+}
+
+fn load_entries<T>(
+    path: std::path::PathBuf,
+    parse: impl FnOnce(&str) -> Vec<T>,
+) -> Result<Vec<T>, String> {
+    match fs::read_to_string(&path) {
+        Ok(contents) => Ok(parse(&contents)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(format!("failed to read {}: {}", path.display(), error)),
+    }
+}
+
+fn parse_passwd_entries(contents: &str) -> Vec<PasswdEntry> {
+    contents
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+
+            let mut parts = line.splitn(7, ':');
+            let username = parts.next()?;
+            let _password = parts.next()?;
+            let uid = parts.next()?.parse().ok()?;
+            let gid = parts.next()?.parse().ok()?;
+            let _gecos = parts.next()?;
+            let home = parts.next()?;
+            let _shell = parts.next()?;
+
+            Some(PasswdEntry {
+                username: username.to_string(),
+                uid,
+                gid,
+                home: home.to_string(),
+            })
+        })
+        .collect()
+}
+
+fn parse_group_entries(contents: &str) -> Vec<GroupEntry> {
+    contents
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+
+            let mut parts = line.splitn(4, ':');
+            let name = parts.next()?;
+            let _password = parts.next()?;
+            let gid = parts.next()?.parse().ok()?;
+            let members = parts
+                .next()
+                .map(|field| {
+                    field
+                        .split(',')
+                        .filter(|member| !member.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            Some(GroupEntry {
+                name: name.to_string(),
+                gid,
+                members,
+            })
+        })
+        .collect()
 }
 
 /// Linux capabilities configuration.
@@ -181,16 +455,25 @@ impl OciSpec {
     /// * `env` - Environment variables as (key, value) pairs
     /// * `workdir` - Working directory inside the container
     /// * `tty` - Whether to allocate a pseudo-terminal
-    pub fn new(command: &[String], env: &[(String, String)], workdir: &str, tty: bool) -> Self {
+    /// * `identity` - Resolved process uid/gid/home for the container
+    pub fn new(
+        command: &[String],
+        env: &[(String, String)],
+        workdir: &str,
+        tty: bool,
+        identity: &ProcessIdentity,
+    ) -> Self {
         // Build environment variables
-        let env_strings: Vec<String> = [
+        let mut env_strings = vec![
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
-            "HOME=/root".to_string(),
             "TERM=xterm-256color".to_string(),
-        ]
-        .into_iter()
-        .chain(env.iter().map(|(k, v)| format!("{}={}", k, v)))
-        .collect();
+        ];
+        if !env.iter().any(|(key, _)| key == "HOME") {
+            if let Some(home) = &identity.home {
+                env_strings.push(format!("HOME={home}"));
+            }
+        }
+        env_strings.extend(env.iter().map(|(k, v)| format!("{}={}", k, v)));
 
         // Default capabilities for root containers
         let capabilities = OciCapabilities {
@@ -210,11 +493,7 @@ impl OciSpec {
             process: OciProcess {
                 terminal: tty,
                 console_size: None,
-                user: OciUser {
-                    uid: 0,
-                    gid: 0,
-                    additional_gids: vec![],
-                },
+                user: identity.user.clone(),
                 args: command.to_vec(),
                 env: env_strings,
                 cwd: workdir.to_string(),
@@ -300,6 +579,34 @@ impl OciSpec {
         let prefix = format!("{}=", name);
         self.process.env.retain(|entry| !entry.starts_with(&prefix));
         self.process.env.push(format!("{}{}", prefix, value));
+    }
+
+    /// Expose GPU render nodes to the container if /dev/dri exists in the VM.
+    ///
+    /// Detects virtio-gpu devices at runtime and adds a bind mount to the OCI
+    /// spec. This allows containers to use Vulkan (via Mesa Venus) without any
+    /// special configuration — if the VM was started with `--gpu`, the devices
+    /// appear automatically inside every container.
+    pub fn add_gpu_devices_if_available(&mut self) {
+        let dri_path = std::path::Path::new("/dev/dri");
+        if !dri_path.exists() {
+            return;
+        }
+
+        // Bind-mount /dev/dri from the VM's devtmpfs into the container.
+        //
+        // A bind mount is used rather than linux.devices entries because crun
+        // sets up a fresh tmpfs at /dev; the /dev/dri sub-directory does not
+        // exist in that tmpfs, so mknod silently fails for any device node
+        // whose parent directory is missing.  A bind mount is equivalent to
+        // `--device /dev/dri` in Docker/Podman, and crun creates the
+        // destination directory automatically when it does not yet exist.
+        self.mounts.push(OciMount {
+            destination: "/dev/dri".to_string(),
+            mount_type: Some("bind".to_string()),
+            source: "/dev/dri".to_string(),
+            options: vec!["bind".to_string(), "rprivate".to_string()],
+        });
     }
 
     /// Write the OCI spec to a config.json file in the bundle directory.
@@ -672,6 +979,7 @@ fn default_mounts() -> Vec<OciMount> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn test_validate_image_reference_valid() {
@@ -741,18 +1049,26 @@ mod tests {
             &[("FOO".to_string(), "bar".to_string())],
             "/",
             false,
+            &ProcessIdentity::root(),
         );
 
         assert_eq!(spec.oci_version, "1.0.2");
         assert_eq!(spec.process.args, vec!["echo", "hello"]);
         assert!(spec.process.env.contains(&"FOO=bar".to_string()));
+        assert!(spec.process.env.contains(&"HOME=/root".to_string()));
         assert!(!spec.process.terminal);
         assert!(spec.process.console_size.is_none());
     }
 
     #[test]
     fn test_oci_console_size_serialises_as_camel_case() {
-        let mut spec = OciSpec::new(&["sh".to_string()], &[], "/", true);
+        let mut spec = OciSpec::new(
+            &["sh".to_string()],
+            &[],
+            "/",
+            true,
+            &ProcessIdentity::root(),
+        );
         spec.process.console_size = Some(OciConsoleSize {
             height: 24,
             width: 80,
@@ -768,7 +1084,13 @@ mod tests {
 
     #[test]
     fn test_oci_console_size_omitted_when_none() {
-        let spec = OciSpec::new(&["sh".to_string()], &[], "/", true);
+        let spec = OciSpec::new(
+            &["sh".to_string()],
+            &[],
+            "/",
+            true,
+            &ProcessIdentity::root(),
+        );
         let json = serde_json::to_value(&spec).unwrap();
         assert!(
             json.get("process")
@@ -780,7 +1102,13 @@ mod tests {
 
     #[test]
     fn test_add_bind_mount() {
-        let mut spec = OciSpec::new(&["sh".to_string()], &[], "/", false);
+        let mut spec = OciSpec::new(
+            &["sh".to_string()],
+            &[],
+            "/",
+            false,
+            &ProcessIdentity::root(),
+        );
         spec.add_bind_mount("/host/path", "/container/path", true);
 
         let mount = spec.mounts.last().unwrap();
@@ -818,6 +1146,80 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_process_identity_named_user_uses_passwd_and_groups() {
+        let rootfs = tempdir().unwrap();
+        let etc = rootfs.path().join("etc");
+        std::fs::create_dir_all(&etc).unwrap();
+        std::fs::write(
+            etc.join("passwd"),
+            "root:x:0:0:root:/root:/bin/sh\nsteam:x:1000:1000::/home/steam:/bin/sh\n",
+        )
+        .unwrap();
+        std::fs::write(
+            etc.join("group"),
+            "root:x:0:\nsteam:x:1000:\naudio:x:29:steam\nvideo:x:44:steam\n",
+        )
+        .unwrap();
+
+        let identity = resolve_process_identity(rootfs.path(), Some("steam")).unwrap();
+
+        assert_eq!(identity.user.uid, 1000);
+        assert_eq!(identity.user.gid, 1000);
+        assert_eq!(identity.user.additional_gids, vec![29, 44]);
+        assert_eq!(identity.home.as_deref(), Some("/home/steam"));
+    }
+
+    #[test]
+    fn test_resolve_process_identity_numeric_uid_gid_without_passwd() {
+        let rootfs = tempdir().unwrap();
+        std::fs::create_dir_all(rootfs.path().join("etc")).unwrap();
+
+        let identity = resolve_process_identity(rootfs.path(), Some("1234:2345")).unwrap();
+
+        assert_eq!(identity.user.uid, 1234);
+        assert_eq!(identity.user.gid, 2345);
+        assert!(identity.user.additional_gids.is_empty());
+        assert!(identity.home.is_none());
+    }
+
+    #[test]
+    fn test_parse_user_spec_rejects_empty_user_or_group() {
+        assert_eq!(
+            parse_user_spec(":1000"),
+            Err("invalid empty user in OCI image config".to_string())
+        );
+        assert_eq!(
+            parse_user_spec("steam:"),
+            Err("invalid empty group in OCI image config".to_string())
+        );
+        assert_eq!(parse_user_spec("steam"), Ok(("steam", None)));
+        assert_eq!(parse_user_spec("steam:audio"), Ok(("steam", Some("audio"))));
+    }
+
+    #[test]
+    fn test_oci_spec_uses_identity_home_when_env_does_not_override_it() {
+        let spec = OciSpec::new(
+            &["id".to_string()],
+            &[("FOO".to_string(), "bar".to_string())],
+            "/home/steam",
+            false,
+            &ProcessIdentity {
+                user: OciUser {
+                    uid: 1000,
+                    gid: 1000,
+                    additional_gids: vec![29],
+                },
+                home: Some("/home/steam".to_string()),
+            },
+        );
+
+        assert!(spec.process.env.contains(&"HOME=/home/steam".to_string()));
+        assert_eq!(spec.process.user.uid, 1000);
+        assert_eq!(spec.process.user.gid, 1000);
+        assert_eq!(spec.process.user.additional_gids, vec![29]);
+    }
+
+    #[test]
     fn test_validate_env_vars_length_limits() {
         // Key too long (> 256 chars)
         let long_key = "A".repeat(300);
@@ -830,5 +1232,51 @@ mod tests {
         // Values just under limit should pass
         let ok_value = "x".repeat(32 * 1024);
         assert!(validate_env_vars(&[("KEY".to_string(), ok_value)]).is_ok());
+    }
+
+    #[test]
+    fn test_gpu_devices_added_when_dri_exists() {
+        // On a system with /dev/dri (GPU-enabled VM), a bind mount is added
+        let identity = ProcessIdentity::root();
+        let mut spec = OciSpec::new(&["echo".to_string()], &[], "/", false, &identity);
+        let mounts_before = spec.mounts.len();
+        spec.add_gpu_devices_if_available();
+
+        if std::path::Path::new("/dev/dri").exists() {
+            // GPU present — /dev/dri bind mount was added
+            assert!(spec.mounts.len() > mounts_before);
+            assert!(spec.mounts.iter().any(|m| m.destination == "/dev/dri"));
+            assert!(spec
+                .mounts
+                .iter()
+                .any(|m| m.destination == "/dev/dri" && m.options.contains(&"bind".to_string())));
+        } else {
+            // No GPU — no extra mounts added (no-op)
+            assert_eq!(spec.mounts.len(), mounts_before);
+        }
+    }
+
+    #[test]
+    fn test_gpu_devices_correct_properties() {
+        let identity = ProcessIdentity::root();
+        let mut spec = OciSpec::new(&["echo".to_string()], &[], "/", false, &identity);
+        // Manually push a GPU bind mount to verify expected properties
+        spec.mounts.push(super::OciMount {
+            destination: "/dev/dri".to_string(),
+            mount_type: Some("bind".to_string()),
+            source: "/dev/dri".to_string(),
+            options: vec!["bind".to_string(), "rprivate".to_string()],
+        });
+
+        let mount = spec
+            .mounts
+            .iter()
+            .find(|m| m.destination == "/dev/dri")
+            .unwrap();
+        assert_eq!(mount.mount_type, Some("bind".to_string()));
+        assert_eq!(mount.source, "/dev/dri");
+        // rprivate prevents the host from seeing any new mounts inside the
+        // container's /dev/dri subtree.
+        assert!(mount.options.contains(&"rprivate".to_string()));
     }
 }

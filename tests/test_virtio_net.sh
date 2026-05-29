@@ -8,7 +8,8 @@
 #   gateway for DNS and outbound TCP
 # - part 4: the `create -> start -> exec`, `machine run`, and `pack run` flows
 #   all drive real virtio-backed guest networking
-# - unsupported features like published ports and policy still fail clearly
+# - part 5: published TCP ports work end-to-end on the virtio gateway
+# - unsupported policy features still fail clearly
 
 source "$(dirname "$0")/common.sh"
 init_smolvm
@@ -26,6 +27,7 @@ echo "=========================================="
 echo ""
 
 VIRTIO_TEST_IMAGE="${VIRTIO_TEST_IMAGE:-alpine:latest}"
+VIRTIO_PUBLISH_TEST_IMAGE="${VIRTIO_PUBLISH_TEST_IMAGE:-python:3.12-alpine}"
 
 virtio_guest_probe_script() {
     cat <<'EOF'
@@ -141,22 +143,61 @@ test_machine_run_virtio_net_works() {
     }
 }
 
-test_machine_create_virtio_net_ports_rejected() {
+test_machine_run_virtio_net_port_publishing_works() {
     cleanup_machine
-    local vm_name="virtio-ports-test-$$"
-    local exit_code=0
-    local output
+    local host_port=$((41000 + ($$ % 10000)))
+    local serve_dir="$TEST_DIR/virtio-port-publish"
+    local run_log="$TEST_DIR/virtio-port-publish.log"
+    local run_pid=0
+    local curl_output=""
+    local ready=0
 
-    output=$($SMOLVM machine create "$vm_name" --net --net-backend virtio-net -p 18080:80 2>&1) || exit_code=$?
-    [[ $exit_code -ne 0 ]] || {
-        echo "expected create failure for virtio-net published port request"
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    mkdir -p "$serve_dir"
+    printf 'virtio-port-ok\n' >"$serve_dir/index.html"
+
+    trap 'if [[ ${run_pid:-0} -ne 0 ]]; then kill "$run_pid" 2>/dev/null || true; wait "$run_pid" 2>/dev/null || true; fi; cleanup_machine' RETURN
+
+    $SMOLVM machine run \
+        --image "$VIRTIO_PUBLISH_TEST_IMAGE" \
+        --net \
+        --net-backend virtio-net \
+        -v "$serve_dir:/srv:ro" \
+        -p "${host_port}:8080" \
+        -- python -m http.server 8080 --directory /srv >"$run_log" 2>&1 &
+    run_pid=$!
+
+    for _ in $(seq 1 30); do
+        if curl_output=$(curl -fsS --connect-timeout 2 "http://127.0.0.1:${host_port}/" 2>&1); then
+            ready=1
+            break
+        fi
+        if ! kill -0 "$run_pid" 2>/dev/null; then
+            echo "virtio-net machine run exited before published port became reachable"
+            tail -20 "$run_log" 2>/dev/null || true
+            return 1
+        fi
+        sleep 1
+    done
+
+    [[ $ready -eq 1 ]] || {
+        echo "virtio-net published TCP port did not become reachable"
+        if [[ -n "$curl_output" ]]; then
+            echo "$curl_output"
+        fi
+        tail -20 "$run_log" 2>/dev/null || true
         return 1
     }
-    [[ "$output" == *"published ports are not supported"* ]] || {
-        echo "$output"
+
+    [[ "$curl_output" == *"virtio-port-ok"* ]] || {
+        echo "unexpected HTTP response from virtio-net published port"
+        echo "$curl_output"
         return 1
     }
+
+    trap - RETURN
+    kill "$run_pid" 2>/dev/null || true
+    wait "$run_pid" 2>/dev/null || true
+    cleanup_machine
 }
 
 test_machine_create_virtio_net_policy_rejected() {
@@ -206,7 +247,7 @@ test_pack_run_virtio_net_works() {
 run_test "Machine create: virtio-net works" test_machine_create_virtio_net_works || true
 run_test "Machine create/start/exec: virtio-net guest networking works" test_machine_create_start_exec_virtio_net_works || true
 run_test "Machine run: virtio-net guest networking works" test_machine_run_virtio_net_works || true
-run_test "Machine create: virtio-net + published ports rejected" test_machine_create_virtio_net_ports_rejected || true
+run_test "Machine run: virtio-net published TCP ports work" test_machine_run_virtio_net_port_publishing_works || true
 run_test "Machine create: virtio-net + policy rejected" test_machine_create_virtio_net_policy_rejected || true
 run_test "Pack run: virtio-net guest networking works" test_pack_run_virtio_net_works || true
 

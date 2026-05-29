@@ -7,6 +7,7 @@ use std::ffi::CString;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+use crate::agent::{find_lib_dir, KrunFunctions};
 use crate::data::storage::HostMount;
 use crate::error::{Error, Result};
 use crate::platform::{self, VmExecutor};
@@ -14,64 +15,6 @@ use crate::vm::config::{NetworkPolicy, RootfsSource, VmConfig};
 use crate::vm::rosetta;
 use crate::vm::state::{ExitReason, VmState};
 use crate::vm::{VmBackend, VmHandle, VmId};
-
-// FFI bindings to libkrun
-// Linking is handled by build.rs
-extern "C" {
-    // Logging
-    fn krun_set_log_level(level: u32) -> i32;
-
-    // Context management
-    fn krun_create_ctx() -> i32;
-    fn krun_free_ctx(ctx: u32);
-
-    // VM configuration
-    fn krun_set_vm_config(ctx: u32, num_vcpus: u8, ram_mib: u32) -> i32;
-
-    // Root filesystem
-    fn krun_set_root(ctx: u32, root_path: *const libc::c_char) -> i32;
-
-    // Working directory
-    fn krun_set_workdir(ctx: u32, workdir: *const libc::c_char) -> i32;
-
-    // Execution
-    fn krun_set_exec(
-        ctx: u32,
-        exec_path: *const libc::c_char,
-        argv: *const *const libc::c_char,
-        envp: *const *const libc::c_char,
-    ) -> i32;
-
-    // Filesystem sharing (virtiofs)
-    fn krun_add_virtiofs(ctx: u32, tag: *const libc::c_char, path: *const libc::c_char) -> i32;
-
-    // Networking
-    fn krun_set_port_map(ctx: u32, port_map: *const *const libc::c_char) -> i32;
-
-    // Block devices (virtio-blk)
-    // format: 0 = Raw, 1 = Qcow2
-    fn krun_add_disk2(
-        ctx: u32,
-        block_id: *const libc::c_char,
-        disk_path: *const libc::c_char,
-        disk_format: u32,
-        read_only: bool,
-    ) -> i32;
-
-    // vsock ports for host-guest communication
-    fn krun_add_vsock_port2(
-        ctx: u32,
-        port: u32,
-        filepath: *const libc::c_char,
-        listen: bool,
-    ) -> i32;
-
-    // Console output redirection
-    fn krun_set_console_output(ctx: u32, filepath: *const libc::c_char) -> i32;
-
-    // Start VM (blocks until exit)
-    fn krun_start_enter(ctx: u32) -> i32;
-}
 
 /// libkrun backend for VM creation.
 pub struct LibkrunBackend {
@@ -82,9 +25,9 @@ pub struct LibkrunBackend {
 impl LibkrunBackend {
     /// Create a new libkrun backend.
     pub fn new() -> Result<Self> {
-        // For now, assume libkrun is available if we're on a supported platform.
-        // A more robust check would try to load the library dynamically.
-        Ok(Self { available: true })
+        Ok(Self {
+            available: find_lib_dir().is_some(),
+        })
     }
 }
 
@@ -159,7 +102,26 @@ impl LibkrunVm {
         // Raise file descriptor limits (required by libkrun)
         set_rlimits();
 
+        let lib_dir =
+            find_lib_dir().ok_or_else(|| Error::vm_creation("libkrun/libkrunfw not found"))?;
+        let krun = unsafe { KrunFunctions::load(&lib_dir) }
+            .map_err(|e| Error::vm_creation(format!("failed to load libkrun: {e}")))?;
+
         unsafe {
+            let krun_set_log_level = krun.set_log_level;
+            let krun_create_ctx = krun.create_ctx;
+            let krun_free_ctx = krun.free_ctx;
+            let krun_set_vm_config = krun.set_vm_config;
+            let krun_set_root = krun.set_root;
+            let krun_set_workdir = krun.set_workdir;
+            let krun_set_exec = krun.set_exec;
+            let krun_add_virtiofs = krun.add_virtiofs;
+            let krun_set_port_map = krun.set_port_map;
+            let krun_add_disk2 = krun.add_disk2;
+            let krun_add_vsock_port2 = krun.add_vsock_port2;
+            let krun_set_console_output = krun.set_console_output;
+            let krun_start_enter = krun.start_enter;
+
             // Initialize libkrun logging (0 = off, 1 = error, 2 = warn, 3 = info, 4 = debug)
             // Use 0 (off) in production - smolvm has its own logging via tracing
             krun_set_log_level(0);

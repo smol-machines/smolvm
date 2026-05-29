@@ -46,11 +46,13 @@
 //! ```text
 //! new guest frame         -> guest_wake  -> poll loop
 //! host relay has data     -> relay_wake  -> poll loop
+//! published host connect  -> relay_wake  -> poll loop
 //! smoltcp emitted frames  -> host_wake   -> frame writer
 //! ```
 
 use crate::device::VirtioNetworkDevice;
 use crate::queues::NetworkFrameQueues;
+use crate::tcp_listeners::AcceptedTcpConnection;
 use crate::tcp_relay::{spawn_tcp_relay, TcpRelayTable};
 use crate::{virtio_net_log, DEFAULT_DNS_ADDR};
 use smoltcp::iface::{
@@ -64,6 +66,7 @@ use smoltcp::wire::{
 };
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket as HostUdpSocket};
 use std::sync::atomic::Ordering;
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant as StdInstant};
@@ -115,6 +118,7 @@ enum FrameAction {
 pub fn start_network_stack(
     queues: Arc<NetworkFrameQueues>,
     config: VirtioPollConfig,
+    tcp_receiver: Option<Receiver<AcceptedTcpConnection>>,
 ) -> std::io::Result<JoinHandle<()>> {
     virtio_net_log!(
         "virtio-net: spawning poll thread guest_ip={} gateway_ip={} mtu={}",
@@ -124,10 +128,14 @@ pub fn start_network_stack(
     );
     thread::Builder::new()
         .name("smolvm-net-poll".into())
-        .spawn(move || run_network_stack(queues, config))
+        .spawn(move || run_network_stack(queues, config, tcp_receiver))
 }
 
-fn run_network_stack(queues: Arc<NetworkFrameQueues>, config: VirtioPollConfig) {
+fn run_network_stack(
+    queues: Arc<NetworkFrameQueues>,
+    config: VirtioPollConfig,
+    mut tcp_receiver: Option<Receiver<AcceptedTcpConnection>>,
+) {
     // Poll loop overview:
     //
     // 1. Drain staged guest Ethernet frames from the guest_to_host queue.
@@ -219,6 +227,15 @@ fn run_network_stack(queues: Arc<NetworkFrameQueues>, config: VirtioPollConfig) 
             }
         }
 
+        relay_accepted_tcp_connection(
+            &mut tcp_receiver,
+            &mut relays,
+            &mut interface,
+            &mut sockets,
+            config.gateway_ipv4,
+            config.guest_ipv4,
+        );
+
         // First egress pass: let smoltcp emit any packets caused by the most
         // recent ingress work before we service higher-level relays.
         flush_interface_egress(&mut interface, &mut device, &mut sockets, now);
@@ -235,6 +252,7 @@ fn run_network_stack(queues: Arc<NetworkFrameQueues>, config: VirtioPollConfig) 
         for connection in relays.take_new_connections(&mut sockets) {
             spawn_tcp_relay(
                 connection.destination,
+                connection.relay_target,
                 connection.from_smoltcp,
                 connection.to_smoltcp,
                 relay_wake.clone(),
@@ -321,6 +339,68 @@ fn add_dns_socket(sockets: &mut SocketSet<'_>, gateway_ipv4: Ipv4Addr) -> Socket
         })
         .expect("failed to bind gateway DNS socket");
     sockets.add(socket)
+}
+
+/// Receive the accepted TCP connection from the tcp_channel, and then relay it to
+/// the TcpRelayTable where the TCP network packets will be relayed to the guest.
+fn relay_accepted_tcp_connection(
+    tcp_receiver: &mut Option<Receiver<AcceptedTcpConnection>>,
+    relays: &mut TcpRelayTable,
+    interface: &mut Interface,
+    sockets: &mut SocketSet<'_>,
+    gateway_ipv4: Ipv4Addr,
+    guest_ipv4: Ipv4Addr,
+) {
+    // Published-port model:
+    //
+    // host client -> accepted host TcpStream
+    //             -> create guest-facing smoltcp socket from gateway_ip:ephemeral
+    //             -> guest sees a normal inbound TCP connection to guest_port
+    //             -> once Established, the relay thread bridges payloads
+    //
+    // The guest does not see the original host peer address here. This path is
+    // effectively a small userspace TCP proxy/NAT at the gateway boundary.
+    let mut disconnected = false;
+
+    if let Some(receiver) = tcp_receiver.as_mut() {
+        loop {
+            match receiver.try_recv() {
+                Ok(connection) => {
+                    let guest_destination =
+                        SocketAddr::new(std::net::IpAddr::V4(guest_ipv4), connection.guest_port);
+                    virtio_net_log!(
+                        "virtio-net: accepted published TCP connection peer={} host_port={} guest_destination={}",
+                        connection.peer_addr,
+                        connection.host_port,
+                        guest_destination
+                    );
+                    if !relays.create_published_socket(
+                        interface,
+                        gateway_ipv4,
+                        guest_destination,
+                        connection.stream,
+                        sockets,
+                    ) {
+                        tracing::warn!(
+                            host_port = connection.host_port,
+                            guest_port = connection.guest_port,
+                            peer_addr = %connection.peer_addr,
+                            "dropping published TCP connection because the guest relay path could not be created"
+                        );
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if disconnected {
+        *tcp_receiver = None;
+    }
 }
 
 fn process_dns_queries(dns_socket_handle: SocketHandle, sockets: &mut SocketSet<'_>) {
@@ -423,74 +503,57 @@ fn wake_guest_if_needed(queues: &NetworkFrameQueues, device: &VirtioNetworkDevic
     }
 }
 
-fn smoltcp_now(start: StdInstant) -> Instant {
-    Instant::from_micros(start.elapsed().as_micros() as i64)
+fn smoltcp_now(clock: StdInstant) -> Instant {
+    let elapsed = clock.elapsed();
+    Instant::from_millis(elapsed.as_millis() as i64)
 }
 
 fn classify_guest_frame(frame: &[u8]) -> FrameAction {
-    // This pre-parser is intentionally shallow. It only looks far enough to
-    // decide whether the poll loop needs special handling before smoltcp sees
-    // the frame.
-    //
-    // Current policy:
-    // - TCP SYN  -> create relay/socket state before ingress
-    // - UDP/53   -> allow as DNS
-    // - other UDP-> drop in Phase 1
-    // - anything else -> normal smoltcp ingress path
-    let Ok(ethernet) = EthernetFrame::new_checked(frame) else {
-        return FrameAction::Passthrough;
+    let ethernet = match EthernetFrame::new_checked(frame) {
+        Ok(frame) => frame,
+        Err(_) => return FrameAction::Passthrough,
     };
 
     if ethernet.ethertype() != EthernetProtocol::Ipv4 {
         return FrameAction::Passthrough;
     }
 
-    let Ok(ipv4) = Ipv4Packet::new_checked(ethernet.payload()) else {
-        return FrameAction::Passthrough;
+    let ipv4 = match Ipv4Packet::new_checked(ethernet.payload()) {
+        Ok(packet) => packet,
+        Err(_) => return FrameAction::Passthrough,
     };
 
     match ipv4.next_header() {
         smoltcp::wire::IpProtocol::Tcp => {
-            classify_tcp(ipv4.payload(), ipv4.src_addr(), ipv4.dst_addr())
+            let tcp = match TcpPacket::new_checked(ipv4.payload()) {
+                Ok(packet) => packet,
+                Err(_) => return FrameAction::Passthrough,
+            };
+
+            if tcp.syn() && !tcp.ack() {
+                FrameAction::TcpSyn {
+                    source: SocketAddr::new(std::net::IpAddr::V4(ipv4.src_addr()), tcp.src_port()),
+                    destination: SocketAddr::new(
+                        std::net::IpAddr::V4(ipv4.dst_addr()),
+                        tcp.dst_port(),
+                    ),
+                }
+            } else {
+                FrameAction::Passthrough
+            }
         }
-        smoltcp::wire::IpProtocol::Udp => classify_udp(ipv4.payload()),
+        smoltcp::wire::IpProtocol::Udp => {
+            let udp = match UdpPacket::new_checked(ipv4.payload()) {
+                Ok(packet) => packet,
+                Err(_) => return FrameAction::Passthrough,
+            };
+
+            if udp.dst_port() == DNS_SOCKET_PORT {
+                FrameAction::DnsQuery
+            } else {
+                FrameAction::UnsupportedUdp
+            }
+        }
         _ => FrameAction::Passthrough,
-    }
-}
-
-fn classify_tcp(payload: &[u8], source: Ipv4Addr, destination: Ipv4Addr) -> FrameAction {
-    // New outgoing guest TCP connections are identified by the initial
-    // SYN-without-ACK packet. That is the moment where we need a matching
-    // smoltcp socket and later a host relay thread.
-    let Ok(tcp) = TcpPacket::new_checked(payload) else {
-        return FrameAction::Passthrough;
-    };
-
-    if tcp.syn() && !tcp.ack() && !tcp.rst() {
-        FrameAction::TcpSyn {
-            source: SocketAddr::new(source.into(), tcp.src_port()),
-            destination: SocketAddr::new(destination.into(), tcp.dst_port()),
-        }
-    } else {
-        FrameAction::Passthrough
-    }
-}
-
-fn classify_udp(payload: &[u8]) -> FrameAction {
-    // Phase 1 treats DNS as the only supported guest UDP protocol.
-    let Ok(udp) = UdpPacket::new_checked(payload) else {
-        return FrameAction::Passthrough;
-    };
-
-    if udp.dst_port() == DNS_SOCKET_PORT {
-        virtio_net_log!(
-            "virtio-net: guest DNS UDP datagram received src_port={} dst_port={} payload_len={}",
-            udp.src_port(),
-            udp.dst_port(),
-            udp.payload().len()
-        );
-        FrameAction::DnsQuery
-    } else {
-        FrameAction::UnsupportedUdp
     }
 }

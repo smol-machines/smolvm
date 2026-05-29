@@ -26,6 +26,11 @@ SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 # The actual binary and libraries are in the same directory
 SMOLVM_BIN="$SCRIPT_DIR/smolvm-bin"
 SMOLVM_LIB="$SCRIPT_DIR/lib"
+SMOLVM_BUNDLED_ROOTFS="$SCRIPT_DIR/agent-rootfs"
+
+if [[ -d "$SMOLVM_BUNDLED_ROOTFS" ]]; then
+    export SMOLVM_AGENT_ROOTFS="${SMOLVM_AGENT_ROOTFS:-$SMOLVM_BUNDLED_ROOTFS}"
+fi
 
 # Check if binary exists
 if [[ ! -x "$SMOLVM_BIN" ]]; then

@@ -6,11 +6,30 @@
 //! - OCI image layers
 
 use std::fs::{self, File};
-use std::io::{BufWriter, Read};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::format::{AssetEntry, AssetInventory, LayerEntry};
 use crate::{PackError, Result};
+
+/// Convert a digest string to a short filename for layer tars.
+///
+/// Expects `sha256:<64-hex-chars>` format. Returns error if the digest
+/// portion (after prefix strip) is shorter than 12 characters.
+fn digest_to_filename(digest: &str) -> Result<String> {
+    let short = digest.strip_prefix("sha256:").unwrap_or(digest);
+    if short.len() < 12 {
+        return Err(PackError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "digest too short for filename: '{}' ({} chars, need 12)",
+                digest,
+                short.len()
+            ),
+        )));
+    }
+    Ok(format!("{}.tar", &short[..12]))
+}
 
 /// Compression level for zstd (3 = zstd default, fast with good ratio).
 /// Level 19 was ~100x slower for only ~10% better compression.
@@ -62,6 +81,7 @@ impl AssetCollector {
                 layers: Vec::new(),
                 storage_template: None,
                 overlay_template: None,
+                overlay_logical_size: None,
             },
         })
     }
@@ -73,9 +93,17 @@ impl AssetCollector {
 
     /// Discover and copy runtime libraries from the given lib directory.
     ///
-    /// Looks for:
-    /// - libkrun.dylib (macOS) or libkrun.so (Linux)
-    /// - libkrunfw.5.dylib (macOS) or libkrunfw.so.5 (Linux)
+    /// Always copies:
+    /// - libkrun.dylib / libkrun.so — VM runtime
+    /// - libkrunfw.5.dylib / libkrunfw.so.5 — kernel firmware
+    ///
+    /// Copies when present (GPU passthrough for `gpu = true` guests):
+    /// - macOS: libvirglrenderer.1.dylib, libMoltenVK.dylib, libepoxy.0.dylib
+    /// - Linux: libvirglrenderer.so.1, libepoxy.so.0, virgl_render_server binary
+    ///
+    /// GPU Vulkan ICDs (ANV, RADV) are hardware-specific and cannot be bundled.
+    /// When GPU libs are bundled, loading them adds ~3ms overhead even for non-GPU
+    /// workloads (lib load is unavoidable; virglrenderer init is deferred to GPU use).
     pub fn collect_libraries(&mut self, lib_dir: &Path) -> Result<()> {
         fs::create_dir_all(self.staging_dir.join("lib"))?;
 
@@ -102,6 +130,64 @@ impl AssetCollector {
                 path: format!("lib/{}", name),
                 size: metadata.len(),
             });
+        }
+
+        // On macOS, bundle GPU rendering libraries when present in the lib dir.
+        // The virglrenderer chain (Venus/Vulkan) enables hardware-accelerated GPU
+        // passthrough for guests using virtio-gpu. All paths use @loader_path so
+        // they resolve relative to where libkrun.dylib is loaded from.
+        #[cfg(target_os = "macos")]
+        {
+            let gpu_libs = [
+                "libvirglrenderer.1.dylib",
+                "libMoltenVK.dylib",
+                "libepoxy.0.dylib",
+            ];
+            for name in &gpu_libs {
+                let src = lib_dir.join(name);
+                if src.exists() {
+                    let dst = self.staging_dir.join("lib").join(name);
+                    fs::copy(&src, &dst)?;
+                    let metadata = fs::metadata(&dst)?;
+                    self.inventory.libraries.push(AssetEntry {
+                        path: format!("lib/{}", name),
+                        size: metadata.len(),
+                    });
+                }
+            }
+        }
+
+        // On Linux, bundle GPU rendering libraries and render server when present.
+        // virglrenderer + epoxy enable Venus/Vulkan via virtio-gpu.
+        // virgl_render_server is the subprocess libkrun spawns during Venus init.
+        // GPU Vulkan ICDs (ANV, RADV) are hardware-specific and cannot be bundled.
+        #[cfg(target_os = "linux")]
+        {
+            let gpu_libs = ["libvirglrenderer.so.1", "libepoxy.so.0"];
+            for name in &gpu_libs {
+                let src = lib_dir.join(name);
+                if src.exists() {
+                    let dst = self.staging_dir.join("lib").join(name);
+                    fs::copy(&src, &dst)?;
+                    let metadata = fs::metadata(&dst)?;
+                    self.inventory.libraries.push(AssetEntry {
+                        path: format!("lib/{}", name),
+                        size: metadata.len(),
+                    });
+                }
+            }
+            let server_src = lib_dir.join("virgl_render_server");
+            if server_src.exists() {
+                let server_dst = self.staging_dir.join("lib").join("virgl_render_server");
+                fs::copy(&server_src, &server_dst)?;
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&server_dst, fs::Permissions::from_mode(0o755))?;
+                let metadata = fs::metadata(&server_dst)?;
+                self.inventory.libraries.push(AssetEntry {
+                    path: "lib/virgl_render_server".to_string(),
+                    size: metadata.len(),
+                });
+            }
         }
 
         Ok(())
@@ -143,9 +229,7 @@ impl AssetCollector {
 
     /// Add an OCI layer tarball.
     pub fn add_layer(&mut self, digest: &str, layer_data: &[u8]) -> Result<()> {
-        // Create filename from digest (remove sha256: prefix)
-        let short_digest = digest.strip_prefix("sha256:").unwrap_or(digest);
-        let filename = format!("{}.tar", &short_digest[..12]);
+        let filename = digest_to_filename(digest)?;
         let path = format!("layers/{}", filename);
 
         let dst = self.staging_dir.join(&path);
@@ -165,8 +249,8 @@ impl AssetCollector {
     /// Call this before streaming the layer to get the destination path,
     /// then call `register_layer()` after writing to register it in the inventory.
     pub fn layer_staging_path(&self, digest: &str) -> PathBuf {
-        let short_digest = digest.strip_prefix("sha256:").unwrap_or(digest);
-        let filename = format!("{}.tar", &short_digest[..12]);
+        let filename = digest_to_filename(digest)
+            .expect("layer digest must be sha256:<hex> with at least 12 hex chars");
         self.staging_dir.join(format!("layers/{}", filename))
     }
 
@@ -174,8 +258,7 @@ impl AssetCollector {
     ///
     /// Use after streaming a layer directly to `layer_staging_path()`.
     pub fn register_layer(&mut self, digest: &str) -> Result<()> {
-        let short_digest = digest.strip_prefix("sha256:").unwrap_or(digest);
-        let filename = format!("{}.tar", &short_digest[..12]);
+        let filename = digest_to_filename(digest)?;
         let path = format!("layers/{}", filename);
         let dst = self.staging_dir.join(&path);
 
@@ -191,8 +274,7 @@ impl AssetCollector {
 
     /// Add an OCI layer from a file path.
     pub fn add_layer_from_file(&mut self, digest: &str, layer_path: &Path) -> Result<()> {
-        let short_digest = digest.strip_prefix("sha256:").unwrap_or(digest);
-        let filename = format!("{}.tar", &short_digest[..12]);
+        let filename = digest_to_filename(digest)?;
         let path = format!("layers/{}", filename);
 
         let dst = self.staging_dir.join(&path);
@@ -320,9 +402,13 @@ impl AssetCollector {
 
     /// Add an overlay disk template from an existing VM.
     ///
-    /// Copies the VM's overlay disk (overlay.raw) to the staging directory
-    /// as `overlay.raw`. This preserves the VM's persistent rootfs state
-    /// for use in packed VM-mode binaries.
+    /// Copies the VM's overlay disk (overlay.raw) to the staging directory as
+    /// `overlay.raw`, stripping trailing sparse holes so only actual data bytes
+    /// enter the tar/zstd pipeline.  For a typical 10 GiB overlay with ~50 MB
+    /// of real ext4 data this reduces pack time by ~100x.
+    ///
+    /// The original full size is recorded in `overlay_logical_size` so that
+    /// the extraction path can restore the sparse skeleton with `ftruncate`.
     pub fn add_overlay_template(&mut self, path: &Path) -> Result<()> {
         if !path.exists() {
             return Err(PackError::AssetNotFound(format!(
@@ -333,13 +419,18 @@ impl AssetCollector {
 
         const OVERLAY_NAME: &str = "overlay.raw";
         let dst = self.staging_dir.join(OVERLAY_NAME);
-        fs::copy(path, &dst)?;
 
-        let metadata = fs::metadata(&dst)?;
+        let (logical_size, truncated_size) = sparse_copy_overlay(path, &dst)?;
+
         self.inventory.overlay_template = Some(AssetEntry {
             path: OVERLAY_NAME.to_string(),
-            size: metadata.len(),
+            size: truncated_size,
         });
+
+        // Record the original full disk size so extract can restore it.
+        if logical_size > truncated_size {
+            self.inventory.overlay_logical_size = Some(logical_size);
+        }
 
         Ok(())
     }
@@ -398,6 +489,100 @@ impl AssetCollector {
         let metadata = fs::metadata(output)?;
         Ok(metadata.len())
     }
+}
+
+// =============================================================================
+// Sparse-aware overlay copy
+// =============================================================================
+
+/// Copy a sparse overlay disk to `dst`, stripping trailing zeros.
+///
+/// Scans backwards from the end of the source to find the last non-zero byte,
+/// then copies only bytes `[0, last_nonzero+1]` to `dst`, skipping zero
+/// chunks in the forward pass.
+///
+/// `SEEK_DATA`/`SEEK_HOLE` is avoided because APFS reports zero-fill extents
+/// (efficiently stored but containing zeros) as "data", making lseek-based
+/// hole detection return the full file size even when 90%+ is zeros.
+/// Content scanning works correctly on both APFS and Linux ext4/xfs.
+///
+/// Returns the original full (logical) size so the caller can record it for
+/// the extraction side to restore the sparse skeleton via `ftruncate`.
+/// Returns `(logical_size, truncated_size)`.
+fn sparse_copy_overlay(src: &Path, dst: &Path) -> std::io::Result<(u64, u64)> {
+    let mut src_file = File::open(src)?;
+    let logical_size = src_file.metadata()?.len();
+
+    // Scan backwards to find the last non-zero byte (= safe truncation point).
+    // On APFS, zero-fill regions are served from page cache without disk I/O,
+    // so even scanning 8+ GiB of trailing zeros takes only ~100–200 ms.
+    let truncated_size = find_last_data_byte(&mut src_file, logical_size)?;
+
+    // Create destination as a sparse skeleton; keep the handle for writing.
+    let mut dst_file = File::create(dst)?;
+    dst_file.set_len(truncated_size)?;
+
+    if truncated_size == 0 {
+        return Ok((logical_size, 0));
+    }
+
+    // Forward copy: read [0, truncated_size) in 512 KiB chunks,
+    // writing only non-zero chunks (zero chunks remain as holes).
+    src_file.seek(SeekFrom::Start(0))?;
+    let mut buf = vec![0u8; 512 * 1024];
+    let mut offset: u64 = 0;
+
+    while offset < truncated_size {
+        let to_read = (truncated_size - offset).min(buf.len() as u64) as usize;
+        let n = src_file.read(&mut buf[..to_read])?;
+        if n == 0 {
+            break;
+        }
+        let chunk = &buf[..n];
+        if chunk.iter().any(|&b| b != 0) {
+            dst_file.seek(SeekFrom::Start(offset))?;
+            dst_file.write_all(chunk)?;
+        }
+        offset += n as u64;
+    }
+
+    Ok((logical_size, truncated_size))
+}
+
+/// Find the truncation point: offset of the last non-zero byte + 1.
+///
+/// Reads the file backwards in 1 MiB chunks until a non-zero byte is found.
+/// Returns 0 if the entire file is zeros.
+fn find_last_data_byte(file: &mut File, logical_size: u64) -> std::io::Result<u64> {
+    if logical_size == 0 {
+        return Ok(0);
+    }
+
+    const CHUNK: u64 = 1024 * 1024; // 1 MiB scan chunk
+    let mut buf = vec![0u8; CHUNK as usize];
+    let mut pos = logical_size;
+
+    while pos > 0 {
+        let chunk_start = pos.saturating_sub(CHUNK);
+        let chunk_size = (pos - chunk_start) as usize;
+
+        file.seek(SeekFrom::Start(chunk_start))?;
+        let n = file.read(&mut buf[..chunk_size])?;
+        if n == 0 {
+            break;
+        }
+
+        // Scan backwards for the last non-zero byte in this chunk.
+        for i in (0..n).rev() {
+            if buf[i] != 0 {
+                return Ok(chunk_start + i as u64 + 1);
+            }
+        }
+
+        pos = chunk_start;
+    }
+
+    Ok(0) // Entire file is zeros
 }
 
 /// Decompress a zstd-compressed assets blob.
@@ -480,6 +665,72 @@ pub fn crc32_file_range(path: &Path, offset: u64, size: u64) -> Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_find_last_data_byte_all_zero() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        fs::write(temp.path(), vec![0u8; 4096]).unwrap();
+        let mut file = File::open(temp.path()).unwrap();
+        assert_eq!(find_last_data_byte(&mut file, 4096).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_find_last_data_byte_trailing_zeros() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let mut data = vec![0u8; 4100];
+        data[99] = 0xAB; // non-zero at 99, then 4000 trailing zeros
+        fs::write(temp.path(), &data).unwrap();
+        let mut file = File::open(temp.path()).unwrap();
+        assert_eq!(find_last_data_byte(&mut file, 4100).unwrap(), 100);
+    }
+
+    #[test]
+    fn test_find_last_data_byte_nonzero_at_end() {
+        // Boundary: no trailing zeros — function must return full length.
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let mut data = vec![0u8; 1024];
+        data[1023] = 1;
+        fs::write(temp.path(), &data).unwrap();
+        let mut file = File::open(temp.path()).unwrap();
+        assert_eq!(find_last_data_byte(&mut file, 1024).unwrap(), 1024);
+    }
+
+    #[test]
+    fn test_sparse_copy_overlay_all_zero() {
+        // All-zero source: truncated_size=0, early exit before forward copy.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let src = temp_dir.path().join("src.raw");
+        let dst = temp_dir.path().join("dst.raw");
+        fs::write(&src, vec![0u8; 8192]).unwrap();
+
+        let (logical, truncated) = sparse_copy_overlay(&src, &dst).unwrap();
+        assert_eq!(logical, 8192);
+        assert_eq!(truncated, 0);
+        assert_eq!(fs::metadata(&dst).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_sparse_copy_overlay_trailing_zeros_and_interior_holes() {
+        // Verifies: trailing zeros are stripped, sizes are returned, interior
+        // holes (zero chunks in the forward pass) are preserved in the copy.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let src = temp_dir.path().join("src.raw");
+        let dst = temp_dir.path().join("dst.raw");
+
+        let mut data = vec![0u8; 8192];
+        data[0] = 0x01; // non-zero at start
+        data[511] = 0xFF; // last non-zero byte; trailing 7680 bytes are zeros
+        fs::write(&src, &data).unwrap();
+
+        let (logical, truncated) = sparse_copy_overlay(&src, &dst).unwrap();
+        assert_eq!(logical, 8192);
+        assert_eq!(truncated, 512);
+
+        let dst_data = fs::read(&dst).unwrap();
+        assert_eq!(dst_data[0], 0x01);
+        assert_eq!(dst_data[511], 0xFF);
+        assert_eq!(dst_data[256], 0x00); // interior zero is preserved
+    }
 
     #[test]
     fn test_crc32_basic() {

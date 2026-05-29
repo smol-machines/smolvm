@@ -17,6 +17,7 @@ use smolvm::agent::{AgentClient, RunConfig, VmResources};
 use smolvm::data::network::PortMapping;
 use smolvm::data::storage::HostMount;
 use smolvm::network::{validate_requested_network_backend, NetworkBackend};
+use smolvm::platform::Platform;
 use smolvm::Error;
 use smolvm::DEFAULT_SHELL_CMD;
 use smolvm_pack::detect::PackedMode;
@@ -250,7 +251,27 @@ impl PackRunCmd {
             return Ok(());
         }
 
-        // 5. Extract assets to cache (locked to prevent concurrent extraction races)
+        // 5. Platform compatibility check — fail before extraction so the error
+        //    is immediate and actionable rather than a cryptic dlopen failure.
+        {
+            let current = Platform::current().host_oci_platform();
+            if manifest.host_platform != current {
+                return Err(Error::agent(
+                    "platform mismatch",
+                    format!(
+                        "this artifact was built for {} but the current platform is {}\
+                         \n\nTo run on {}, create a new pack:\
+                         \n\n  smolvm pack create --image <image> -o <output>\
+                         \n\nOr push platform-specific artifacts under separate tags:\
+                         \n\n  smolvm pack push myrepo:v1-darwin-arm64 -f myapp-darwin.smolmachine\
+                         \n  smolvm pack push myrepo:v1-linux-amd64  -f myapp-linux.smolmachine",
+                        manifest.host_platform, current, current,
+                    ),
+                ));
+            }
+        }
+
+        // 6. Extract assets to cache (locked to prevent concurrent extraction races)
         let cache_dir = extract::get_cache_dir(footer.checksum)
             .map_err(|e| Error::agent("get cache dir", e.to_string()))?;
 
@@ -263,7 +284,7 @@ impl PackRunCmd {
         )
         .map_err(|e| Error::agent("extract assets", e.to_string()))?;
 
-        // 6. Set up paths — use a unique runtime directory per invocation so
+        // 7. Set up paths — use a unique runtime directory per invocation so
         //    concurrent runs of the same checksum don't conflict on
         //    storage.ext4 / agent.sock.  tempdir_in gives us a truly unique
         //    directory that survives PID reuse and abrupt termination.
@@ -301,7 +322,7 @@ impl PackRunCmd {
             self.overlay,
         )?;
 
-        // 7. Parse CLI args
+        // 8. Parse CLI args
         let mounts = HostMount::parse(&self.volume)?;
         let port_mappings = PortMapping::to_tuples(&self.port);
 
@@ -310,8 +331,10 @@ impl PackRunCmd {
             memory_mib: self.mem.unwrap_or(manifest.mem),
             network: self.net || manifest.network || !self.port.is_empty(),
             network_backend: self.net_backend,
+            gpu: manifest.gpu,
             storage_gib,
             overlay_gib: self.overlay,
+            gpu_vram_mib: None,
             allowed_cidrs: None,
         };
         validate_requested_network_backend(&resources, None, self.port.len())?;
@@ -325,12 +348,12 @@ impl PackRunCmd {
             eprintln!("debug: storage={}", storage_path.display());
             eprintln!("debug: vsock={}", vsock_path.display());
             eprintln!(
-                "debug: resources cpus={} mem={} net={}",
-                resources.cpus, resources.memory_mib, resources.network
+                "debug: resources cpus={} mem={} net={} gpu={}",
+                resources.cpus, resources.memory_mib, resources.network, resources.gpu
             );
         }
 
-        // 8. Fork child → launch VM with dynamically loaded libkrun
+        // 9. Fork child → launch VM with dynamically loaded libkrun
         smolvm::process::install_sigchld_handler();
 
         let console_log_path = runtime_dir.path().join("console.log");
@@ -363,7 +386,8 @@ impl PackRunCmd {
             smolvm::process::detach_stdio();
 
             if let Err(e) = launch_agent_vm_dynamic(&krun, &config) {
-                let _ = e;
+                let msg = format!("launch_agent_vm_dynamic failed: {}\n", e);
+                let _ = std::fs::write(&config.console_log, &msg);
             }
 
             smolvm::process::exit_child(1);
@@ -420,7 +444,7 @@ impl PackRunCmd {
             runtime_dir,
         };
 
-        // 9. Parent: wait for agent, connect, execute command
+        // 10. Parent: wait for agent, connect, execute command
         let mut client = wait_for_agent(&vsock_path, self.debug)?;
 
         let exit_code = execute_command(&mut client, &manifest, &self, &mounts)?;
@@ -530,18 +554,23 @@ fn setup_vm_overlay(
             .as_ref()
             .map(|t| t.path.as_str());
 
-        extract::copy_overlay_template(cache_dir, overlay_template, dest, overlay_gb).map_err(
-            |e| {
-                Error::agent(
-                    "setup overlay",
-                    format!(
-                        "VM mode overlay template is missing or corrupt: {}. \
+        extract::copy_overlay_template(
+            cache_dir,
+            overlay_template,
+            dest,
+            overlay_gb,
+            manifest.assets.overlay_logical_size,
+        )
+        .map_err(|e| {
+            Error::agent(
+                "setup overlay",
+                format!(
+                    "VM mode overlay template is missing or corrupt: {}. \
                          Try re-packing with `smolvm pack --from-vm`.",
-                        e
-                    ),
-                )
-            },
-        )?;
+                    e
+                ),
+            )
+        })?;
 
         return Ok(Some(dest.to_path_buf()));
     }
@@ -807,6 +836,9 @@ enum PackedCmd {
     Start(PackedStartArgs),
     /// Execute a command in a running VM
     Exec(PackedExecArgs),
+    /// Open an interactive shell in a running VM
+    #[command(visible_alias = "sh")]
+    Shell,
     /// Stop the VM
     Stop,
     /// Show VM status
@@ -912,7 +944,7 @@ struct PackedStartArgs {
 }
 
 /// Arguments for the `exec` subcommand (run in existing VM).
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Default)]
 struct PackedExecArgs {
     /// Command to run
     #[arg(trailing_var_arg = true, value_name = "COMMAND")]
@@ -993,6 +1025,21 @@ fn pack_run_inner(mode: PackedMode, cli: PackedCli) -> smolvm::Result<()> {
             let checksum = mode_checksum(&mode);
             let manifest = read_manifest_for_mode(&mode)?;
             daemon_exec(checksum, args, debug, &manifest)
+        }
+        PackedCmd::Shell => {
+            let checksum = mode_checksum(&mode);
+            let manifest = read_manifest_for_mode(&mode)?;
+            daemon_exec(
+                checksum,
+                PackedExecArgs {
+                    command: vec!["/bin/sh".to_string()],
+                    interactive: true,
+                    tty: true,
+                    ..Default::default()
+                },
+                debug,
+                &manifest,
+            )
         }
         PackedCmd::Stop => {
             let checksum = mode_checksum(&mode);
@@ -1165,8 +1212,10 @@ fn run_from_cache(
         memory_mib: args.mem.unwrap_or(manifest.mem),
         network: args.net || manifest.network || !args.port.is_empty(),
         network_backend: args.net_backend,
+        gpu: manifest.gpu,
         storage_gib,
         overlay_gib: args.overlay,
+        gpu_vram_mib: None,
         allowed_cidrs: None,
     };
     validate_requested_network_backend(&resources, None, args.port.len())?;
@@ -1204,7 +1253,8 @@ fn run_from_cache(
         smolvm::process::detach_stdio();
 
         if let Err(e) = launch_agent_vm_dynamic(&krun, &config) {
-            let _ = e;
+            let msg = format!("launch_agent_vm_dynamic failed: {}\n", e);
+            let _ = std::fs::write(&config.console_log, &msg);
         }
         smolvm::process::exit_child(1);
     })
@@ -1488,8 +1538,10 @@ fn daemon_start(
         memory_mib: args.mem.unwrap_or(manifest.mem),
         network: args.net || manifest.network || !args.port.is_empty(),
         network_backend: args.net_backend,
+        gpu: manifest.gpu,
         storage_gib,
         overlay_gib: args.overlay,
+        gpu_vram_mib: None,
         allowed_cidrs: None,
     };
     validate_requested_network_backend(&resources, None, args.port.len())?;
@@ -1552,9 +1604,8 @@ fn daemon_start(
         smolvm::process::detach_stdio();
 
         if let Err(e) = launch_agent_vm_dynamic(&krun, &config) {
-            // stderr is /dev/null here, but the error is also logged
-            // to console.log via set_console_output
-            let _ = e;
+            let msg = format!("launch_agent_vm_dynamic failed: {}\n", e);
+            let _ = std::fs::write(&config.console_log, &msg);
         }
 
         smolvm::process::exit_child(1);

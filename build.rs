@@ -1,11 +1,14 @@
 //! Build script for smolvm.
 //!
-//! Handles finding and linking libkrun.
+//! Handles macOS weak-link setup for libkrun.
+//!
+//! Linux loads libkrun at runtime with `dlopen` so packed stubs can start
+//! before bundled libraries are extracted.
 //!
 //! # Linking Options
 //!
 //! ## Dynamic (default)
-//! Requires libkrun installed on the system:
+//! macOS can weak-link against libkrun installed on the system:
 //! ```sh
 //! brew install libkrun  # macOS
 //! cargo build
@@ -36,40 +39,24 @@
 //! LIBKRUN_STATIC=/path/to/libkrun.a cargo build
 //! ```
 
-#[cfg(target_os = "linux")]
-use std::path::Path;
+#[cfg(target_os = "macos")]
 use std::path::PathBuf;
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
-/// Check if a file is a Git LFS pointer (not the actual binary).
+/// Link libkrun for legacy macOS weak-link behavior.
 ///
-/// LFS pointer files start with "version https://git-lfs.github.com/spec/v1"
-/// and are small text files. This prevents the build from trying to link
-/// against LFS pointers when the actual files haven't been fetched.
-#[cfg(target_os = "linux")]
-fn is_lfs_pointer(path: &Path) -> bool {
-    // LFS pointers are small text files (typically < 200 bytes)
-    if let Ok(metadata) = std::fs::metadata(path) {
-        if metadata.len() > 500 {
-            return false; // Too large to be an LFS pointer
-        }
-    }
-
-    // Check if the file starts with the LFS version header
-    if let Ok(content) = std::fs::read_to_string(path) {
-        return content.starts_with("version https://git-lfs.github.com/spec/v1");
-    }
-
-    false
+/// Linux intentionally does not link libkrun at build time: packed stubs must
+/// be able to start before bundled libraries are extracted, so Linux VM launch
+/// paths use `dlopen` instead.
+#[cfg(target_os = "macos")]
+fn link_krun() {
+    println!("cargo:rustc-link-arg=-Wl,-weak-lkrun");
 }
 
-/// Link libkrun — weak on macOS so the binary can start without it
-/// (packed binary mode uses dlopen instead of link-time symbols).
-fn link_krun() {
-    #[cfg(target_os = "macos")]
-    println!("cargo:rustc-link-arg=-Wl,-weak-lkrun");
-    #[cfg(not(target_os = "macos"))]
-    println!("cargo:rustc-link-lib=krun");
+#[cfg(target_os = "macos")]
+fn has_library(name: &str) -> bool {
+    pkg_config::Config::new().probe(name).is_ok()
 }
 
 fn main() {
@@ -91,11 +78,11 @@ fn main() {
         );
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     link_libkrun();
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "macos")]
 fn link_libkrun() {
     println!("cargo:rerun-if-env-changed=LIBKRUN_STATIC");
     println!("cargo:rerun-if-env-changed=LIBKRUN_BUNDLE");
@@ -283,7 +270,7 @@ fn link_libkrun() {
 /// Build libkrun from the vendored submodule.
 ///
 /// Returns the path to the directory containing the built library.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "macos")]
 fn build_libkrun_from_submodule() -> Option<PathBuf> {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").ok()?);
     let libkrun_dir = manifest_dir.join("libkrun");
@@ -325,7 +312,6 @@ fn build_libkrun_from_submodule() -> Option<PathBuf> {
     );
 
     // Build libkrun using cargo directly (make has issues on macOS)
-    // Note: blk,net features require additional setup and are optional
     let libkrun_manifest = libkrun_dir.join("src/libkrun/Cargo.toml");
     let mut cmd = Command::new("cargo");
     cmd.arg("build")
@@ -334,6 +320,26 @@ fn build_libkrun_from_submodule() -> Option<PathBuf> {
 
     if profile == "release" {
         cmd.arg("--release");
+    }
+
+    // Auto-detect GPU support: enable if virglrenderer is installed on the host.
+    // GPU feature requires virglrenderer + libclang (for krun_display bindgen).
+    // On macOS, also needs MoltenVK for Vulkan → Metal translation.
+    let gpu_available = has_library("virglrenderer");
+    if gpu_available {
+        cmd.arg("--features").arg("gpu");
+
+        // krun_display uses bindgen which needs libclang.
+        // Help it find libclang on macOS (Homebrew LLVM).
+        #[cfg(target_os = "macos")]
+        {
+            let llvm_lib = std::path::Path::new("/opt/homebrew/opt/llvm/lib");
+            if llvm_lib.exists() {
+                cmd.env("LIBCLANG_PATH", llvm_lib);
+            }
+        }
+
+        println!("cargo:warning=GPU support enabled (virglrenderer found)");
     }
 
     let status = cmd.status();

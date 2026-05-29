@@ -3,11 +3,11 @@
 //! This module handles persistent configuration storage for smolvm,
 //! including default settings and VM registry.
 //!
-//! State is persisted to a redb database at `~/.local/share/smolvm/server/smolvm.redb`.
+//! State is persisted to a SQLite database at `~/.local/share/smolvm/server/smolvm.db`.
 //! For backward compatibility, `SmolvmConfig` maintains an in-memory cache of VMs
 //! and provides the same API as the old confy-based implementation.
 
-use crate::data::network::DEFAULT_DNS;
+use crate::data::network;
 use crate::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
 use crate::db::SmolvmDb;
 use crate::error::Result;
@@ -149,7 +149,7 @@ impl RestartConfig {
 /// Global smolvm configuration with database-backed persistence.
 ///
 /// This struct provides backward-compatible access to VM records while
-/// using redb for ACID-compliant storage. The `vms` field is an in-memory
+/// using SQLite for ACID-compliant storage. The `vms` field is an in-memory
 /// cache that is kept in sync with the database.
 #[derive(Debug, Clone)]
 pub struct SmolvmConfig {
@@ -181,7 +181,7 @@ impl SmolvmConfig {
             version: 1,
             default_cpus: DEFAULT_MICROVM_CPU_COUNT,
             default_mem: DEFAULT_MICROVM_MEMORY_MIB,
-            default_dns: DEFAULT_DNS.to_string(),
+            default_dns: network::default_dns(),
             #[cfg(target_os = "macos")]
             storage_volume: String::new(),
             vms: HashMap::new(),
@@ -215,7 +215,7 @@ impl SmolvmConfig {
         let default_dns = config_map
             .get("default_dns")
             .cloned()
-            .unwrap_or_else(|| DEFAULT_DNS.to_string());
+            .unwrap_or_else(network::default_dns);
 
         #[cfg(target_os = "macos")]
         let storage_volume = config_map
@@ -297,17 +297,18 @@ impl SmolvmConfig {
     }
 
     /// Update a VM record in place (persists immediately to database).
-    pub fn update_vm<F>(&mut self, id: &str, f: F) -> Option<()>
+    ///
+    /// Returns `None` if the record doesn't exist, `Some(Err)` if the DB write
+    /// fails, `Some(Ok)` on success. Callers that need fail-closed semantics
+    /// should check both.
+    pub fn update_vm<F>(&mut self, id: &str, f: F) -> Option<crate::Result<()>>
     where
         F: FnOnce(&mut VmRecord),
     {
         if let Some(record) = self.vms.get_mut(id) {
             f(record);
             // Persist to database
-            if let Err(e) = self.db.insert_vm(id, record) {
-                tracing::warn!(error = %e, vm = %id, "failed to persist VM update");
-            }
-            Some(())
+            Some(self.db.insert_vm(id, record))
         } else {
             None
         }
@@ -328,8 +329,9 @@ pub struct VmRecord {
     /// VM name/ID.
     pub name: String,
 
-    /// Creation timestamp.
-    pub created_at: String,
+    /// Creation timestamp (seconds since Unix epoch).
+    #[serde(deserialize_with = "deserialize_timestamp", default)]
+    pub created_at: u64,
 
     /// VM lifecycle state.
     #[serde(default)]
@@ -364,6 +366,15 @@ pub struct VmRecord {
     #[serde(default)]
     pub network: bool,
 
+    /// Enable GPU acceleration (virtio-gpu with Venus/Vulkan).
+    #[serde(default)]
+    pub gpu: Option<bool>,
+
+    /// GPU shared-memory region size in MiB. `None` → default
+    /// (`DEFAULT_GPU_VRAM_MIB`). Ignored unless `gpu` is true.
+    #[serde(default)]
+    pub gpu_vram_mib: Option<u32>,
+
     /// Restart configuration.
     #[serde(default)]
     pub restart: RestartConfig,
@@ -372,17 +383,27 @@ pub struct VmRecord {
     #[serde(default)]
     pub last_exit_code: Option<i32>,
 
-    /// Commands to run on every VM start (via `sh -c`).
+    /// Commands to run on first VM start (via `sh -c`).
     #[serde(default)]
     pub init: Vec<String>,
+
+    /// Whether init commands have already completed successfully.
+    /// Set to true after first successful run; reset when init commands change.
+    #[serde(default)]
+    pub init_completed: bool,
 
     /// Environment variables for init commands.
     #[serde(default)]
     pub env: Vec<(String, String)>,
 
-    /// Working directory for init commands.
+    /// Working directory for the container workload.
     #[serde(default)]
     pub workdir: Option<String>,
+
+    /// Container user (UID or username). Resolved from image metadata at first
+    /// launch and stored so restart can replay the same identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
 
     /// Storage disk size in GiB (None = default 20 GiB).
     #[serde(default)]
@@ -452,6 +473,25 @@ pub struct VmRecord {
     pub source_smolmachine: Option<String>,
 }
 
+/// Deserialize `created_at` from either a legacy JSON string `"1705312345"` or
+/// the current integer `1705312345`. Old DB records stored it as a string.
+fn deserialize_timestamp<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StrOrU64 {
+        Str(String),
+        U64(u64),
+    }
+    match StrOrU64::deserialize(deserializer)? {
+        StrOrU64::U64(n) => Ok(n),
+        StrOrU64::Str(s) => s.parse::<u64>().map_err(serde::de::Error::custom),
+    }
+}
+
 fn default_cpus() -> u8 {
     1
 }
@@ -481,11 +521,15 @@ impl VmRecord {
             mounts,
             ports,
             network,
+            gpu: None,
+            gpu_vram_mib: None,
             restart: RestartConfig::default(),
             last_exit_code: None,
             init: Vec::new(),
+            init_completed: false,
             env: Vec::new(),
             workdir: None,
+            user: None,
             storage_gb: None,
             overlay_gb: None,
             allowed_cidrs: None,
@@ -526,11 +570,15 @@ impl VmRecord {
             mounts,
             ports,
             network,
+            gpu: None,
+            gpu_vram_mib: None,
             restart,
             last_exit_code: None,
             init: Vec::new(),
+            init_completed: false,
             env: Vec::new(),
             workdir: None,
+            user: None,
             storage_gb: None,
             overlay_gb: None,
             allowed_cidrs: None,
@@ -602,6 +650,8 @@ impl VmRecord {
             memory_mib: self.mem,
             network: self.network,
             network_backend: self.network_backend,
+            gpu: self.gpu.unwrap_or(false),
+            gpu_vram_mib: self.gpu_vram_mib,
             storage_gib: self.storage_gb,
             overlay_gib: self.overlay_gb,
             allowed_cidrs: self.allowed_cidrs.clone(),
@@ -904,5 +954,78 @@ mod tests {
         let deserialized: VmRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.storage_gb, Some(50));
         assert_eq!(deserialized.overlay_gb, Some(20));
+    }
+
+    #[test]
+    fn test_vm_record_gpu_field() {
+        // GPU defaults to None (not set)
+        let record = VmRecord::new("test".to_string(), 2, 1024, vec![], vec![], false);
+        assert_eq!(record.gpu, None);
+        assert!(!record.vm_resources().gpu);
+
+        // GPU set to true
+        let mut record = VmRecord::new("test".to_string(), 2, 1024, vec![], vec![], false);
+        record.gpu = Some(true);
+        assert!(record.vm_resources().gpu);
+
+        // GPU serializes/deserializes
+        let json = serde_json::to_string(&record).unwrap();
+        let deserialized: VmRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.gpu, Some(true));
+
+        // New records default to gpu = None → vm_resources().gpu = false
+        let default_record = VmRecord::new("default".to_string(), 1, 512, vec![], vec![], false);
+        assert_eq!(default_record.gpu, None);
+        assert!(!default_record.vm_resources().gpu);
+    }
+
+    #[test]
+    fn vm_record_gpu_vram_mib_flows_through_full_persistence_cycle() {
+        // End-to-end plumbing test:
+        //   CreateVmParams-like assignment → VmRecord → serde_json (DB)
+        //   → deserialized VmRecord → vm_resources() → effective
+        //
+        // This is the chain that runs every time a user creates a
+        // machine with `--gpu-vram N`, stops it, and starts it again.
+        // A silent break anywhere in the chain (e.g., someone drops
+        // the assignment, adds a new field and forgets to copy it,
+        // changes the Option<u32> shape) fires this test.
+
+        use crate::agent::VmResources;
+
+        // 1. Start with a record, set the field the way `create_vm` does.
+        let mut record = VmRecord::new("vramtest".into(), 2, 1024, vec![], vec![], false);
+        record.gpu = Some(true);
+        record.gpu_vram_mib = Some(1024);
+
+        // 2. Roundtrip through JSON (the redb value format).
+        let json = serde_json::to_vec(&record).unwrap();
+        let back: VmRecord = serde_json::from_slice(&json).unwrap();
+        assert_eq!(
+            back.gpu_vram_mib,
+            Some(1024),
+            "gpu_vram_mib must survive DB roundtrip"
+        );
+
+        // 3. Convert to VmResources the way `start_vm_named` does.
+        let res: VmResources = back.vm_resources();
+        assert_eq!(res.gpu_vram_mib, Some(1024));
+        assert_eq!(
+            res.effective_gpu_vram_mib(),
+            1024,
+            "launcher will pass 1024 MiB to krun_set_gpu_options2"
+        );
+
+        // 4. And the unset path: default in, default out.
+        let mut record = VmRecord::new("vramdefault".into(), 1, 512, vec![], vec![], false);
+        record.gpu = Some(true);
+        // gpu_vram_mib left as None
+        let json = serde_json::to_vec(&record).unwrap();
+        let back: VmRecord = serde_json::from_slice(&json).unwrap();
+        assert_eq!(back.gpu_vram_mib, None);
+        assert_eq!(
+            back.vm_resources().effective_gpu_vram_mib(),
+            crate::data::resources::DEFAULT_GPU_VRAM_MIB,
+        );
     }
 }

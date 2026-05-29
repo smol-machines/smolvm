@@ -65,13 +65,20 @@ pub async fn push(
     let manifest = smolvm_pack::read_manifest_from_sidecar(smolmachine_path)?;
     let config_json = serde_json::to_vec_pretty(&manifest)?;
 
-    // 3. Stream-upload sidecar as the layer blob (pass 2: re-read file as stream).
+    // 3. Stream-upload sidecar as the layer blob.
+    //
+    // The factory reopens the file on each call so that a 401 mid-upload can be
+    // retried with a fresh stream. The OS page cache makes repeated opens cheap.
     tracing::info!("uploading sidecar blob...");
-    let file = tokio::fs::File::open(smolmachine_path).await?;
-    let stream = tokio_util::io::ReaderStream::with_capacity(file, 256 * 1024);
-    let body = reqwest::Body::wrap_stream(stream);
+    let path = smolmachine_path.to_path_buf();
     client
-        .push_blob_stream(repo, &layer_digest, layer_size, body)
+        .push_blob_stream(repo, &layer_digest, layer_size, move || {
+            // std::fs::File::open is synchronous but fast (just a syscall).
+            let file = std::fs::File::open(&path).map_err(crate::RegistryError::from)?;
+            let async_file = tokio::fs::File::from_std(file);
+            let stream = tokio_util::io::ReaderStream::with_capacity(async_file, 256 * 1024);
+            Ok(reqwest::Body::wrap_stream(stream))
+        })
         .await?;
 
     // 4. Upload config blob (small, buffered is fine).

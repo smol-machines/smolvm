@@ -1,38 +1,19 @@
-//! Registry configuration for OCI image authentication.
+//! OCI registry credentials and reference parsing.
 //!
-//! This module provides support for:
-//! - Loading registry credentials from a TOML configuration file
-//! - Environment variable-based password resolution
+//! This module provides:
+//! - [`RegistryConfig`] — per-registry credential storage with env-var resolution
+//! - [`Reference`] — OCI image reference parsing (registry/repo:tag@digest)
 //! - Registry mirrors for pull-through caching
 //!
-//! # Configuration File
-//!
-//! The configuration file is located at `~/.config/smolvm/registries.toml`:
-//!
-//! ```toml
-//! [defaults]
-//! # registry = "docker.io"  # Optional: default registry
-//!
-//! [registries."docker.io"]
-//! username = "myuser"
-//! password_env = "DOCKER_HUB_TOKEN"  # Reads from env var
-//!
-//! [registries."ghcr.io"]
-//! username = "github_user"
-//! password_env = "GHCR_TOKEN"
-//!
-//! [registries."registry.example.com"]
-//! username = "user"
-//! password = "secret"  # Direct password (not recommended)
-//! mirror = "mirror.example.com"  # Optional mirror
-//! ```
+//! Configuration is stored in `~/.config/smolvm/config.toml` under the
+//! `[machines]` and `[images]` sections. See [`crate::settings::SmolSettings`].
 
-use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
 
-/// Registry configuration loaded from `~/.config/smolvm/registries.toml`.
+/// Registry credentials and defaults for a set of OCI registries.
+///
+/// Used as the `[machines]` and `[images]` sections within [`SmolSettings`](crate::settings::SmolSettings).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RegistryConfig {
     /// Per-registry configuration entries.
@@ -44,16 +25,40 @@ pub struct RegistryConfig {
 }
 
 /// Configuration for a single registry.
+///
+/// Two distinct auth paths — only one should be set per entry:
+///
+/// **Identity token path** (`identity_token`): an upstream credential (e.g. Auth0 JWT)
+/// exchanged with a token service per-operation to obtain a short-lived OCI bearer token.
+/// Used for smolmachines registries where a Cloudflare token service sits in front.
+/// `RegistryClient::with_identity_token` implements the exchange.
+///
+/// **Direct bearer path** (`password` / `password_env`): an OCI bearer token sent
+/// directly to the registry. Used for Docker Hub, GHCR, and other standard OCI
+/// registries that accept static credentials.
+///
+/// `identity_token` takes precedence over `password`/`password_env` when both are set.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RegistryEntry {
-    /// Username for authentication.
+    /// Username for authentication (direct bearer path only).
     pub username: Option<String>,
-    /// Password (plaintext - not recommended, use password_env instead).
+    /// Direct OCI bearer token or password (not recommended for secrets; use password_env).
     pub password: Option<String>,
-    /// Environment variable containing the password.
+    /// Environment variable containing the direct OCI bearer token or password.
     pub password_env: Option<String>,
     /// Mirror URL to use instead of this registry.
     pub mirror: Option<String>,
+    /// Upstream identity credential (e.g. Auth0 JWT) exchanged with a token service
+    /// to obtain a short-lived OCI bearer token per-operation.
+    /// When set, takes precedence over password/password_env.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_token: Option<String>,
+    /// OAuth refresh token used to silently renew identity_token when it expires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+    /// Unix timestamp when identity_token expires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
 }
 
 /// Default registry settings.
@@ -67,60 +72,6 @@ pub struct RegistryDefaults {
 pub use smolvm_protocol::RegistryAuth;
 
 impl RegistryConfig {
-    /// Load registry configuration from the default config file.
-    ///
-    /// If the config file doesn't exist, returns an empty configuration.
-    /// Errors are logged but don't cause failure - we fall back to empty config.
-    pub fn load() -> Result<Self> {
-        let config_path = match Self::config_path() {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::debug!(error = %e, "could not determine registry config path");
-                return Ok(Self::default());
-            }
-        };
-
-        if !config_path.exists() {
-            tracing::debug!(
-                path = %config_path.display(),
-                "registry config file not found, using defaults"
-            );
-            return Ok(Self::default());
-        }
-
-        let contents = std::fs::read_to_string(&config_path).map_err(|e| {
-            Error::config(
-                format!("read registry config at {}", config_path.display()),
-                e.to_string(),
-            )
-        })?;
-
-        let config: Self = toml::from_str(&contents).map_err(|e| {
-            Error::config(
-                format!("parse registry config at {}", config_path.display()),
-                e.to_string(),
-            )
-        })?;
-
-        tracing::debug!(
-            path = %config_path.display(),
-            registry_count = config.registries.len(),
-            "loaded registry configuration"
-        );
-
-        Ok(config)
-    }
-
-    /// Get the path to the registry configuration file.
-    ///
-    /// Always uses `~/.config/smolvm/registries.toml` regardless of platform
-    /// for consistent behavior across macOS and Linux.
-    pub fn config_path() -> Result<PathBuf> {
-        let home = dirs::home_dir()
-            .ok_or_else(|| Error::config("resolve path", "no home directory found"))?;
-        Ok(home.join(".config").join("smolvm").join("registries.toml"))
-    }
-
     /// Get credentials for a registry, resolving environment variables.
     ///
     /// Returns `Some((username, password))` if credentials are configured and available.
@@ -178,6 +129,31 @@ impl RegistryConfig {
     /// Check if any registries are configured.
     pub fn has_registries(&self) -> bool {
         !self.registries.is_empty()
+    }
+
+    /// Set credentials for a registry, creating or updating the entry.
+    ///
+    /// Clears `password_env` when a direct password is provided. Preserves any
+    /// existing `mirror` setting so callers do not need to re-supply it.
+    pub fn set_credentials(&mut self, registry: &str, username: String, password: String) {
+        let entry = self.registries.entry(registry.to_string()).or_default();
+        entry.username = Some(username);
+        entry.password = Some(password);
+        entry.password_env = None;
+        // Clear all upstream-credential fields. identity_token takes precedence
+        // over password in build_registry_client(); leaving a stale identity_token
+        // would silently ignore the new direct credentials.
+        entry.identity_token = None;
+        entry.refresh_token = None;
+        entry.expires_at = None;
+    }
+
+    /// Set a token for a registry using the `username="token"` convention.
+    ///
+    /// Suitable for API keys and short-lived JWTs produced by `smol login`.
+    /// Delegates to [`Self::set_credentials`] so mirror is preserved.
+    pub fn set_token(&mut self, registry: &str, token: &str) {
+        self.set_credentials(registry, "token".to_string(), token.to_string());
     }
 }
 
@@ -370,13 +346,41 @@ impl Reference {
                     parts[2].to_string(),
                 )
             }
-            _ => {
-                return Err(err("too many path components"));
+            n => {
+                // 4+ components — only valid when the first component is an explicit
+                // registry hostname (contains '.' or ':'). All middle components
+                // become the namespace, preserving arbitrary repository depth.
+                // Examples:
+                //   ghcr.io/org/team/machine:latest  → ns="org/team", name="machine"
+                //   us-docker.pkg.dev/proj/repo/img  → ns="proj/repo", name="img"
+                //   localhost:5000/a/b/c:dev         → ns="a/b",       name="c"
+                let first = parts[0];
+                if !first.contains('.') && !first.contains(':') {
+                    return Err(ReferenceError {
+                        input: raw_input.to_string(),
+                        reason: format!(
+                            "first component '{}' doesn't look like a registry hostname",
+                            first
+                        ),
+                    });
+                }
+                let name = parts[n - 1].to_string();
+                let namespace = parts[1..n - 1].join("/");
+                (first.to_string(), Some(namespace), name)
             }
         };
 
         if name.is_empty() {
             return Err(err("empty name"));
+        }
+
+        // Reject empty path components (e.g. ghcr.io/org//machine from a double slash).
+        if let Some(ns) = &namespace {
+            for component in ns.split('/') {
+                if component.is_empty() {
+                    return Err(err("empty repository component (check for double slashes)"));
+                }
+            }
         }
 
         Ok(Reference {
@@ -507,6 +511,7 @@ mod tests {
                 password: Some("testpass".to_string()),
                 password_env: None,
                 mirror: None,
+                ..Default::default()
             },
         );
 
@@ -527,6 +532,7 @@ mod tests {
                 password: Some("testpass".to_string()),
                 password_env: None,
                 mirror: None,
+                ..Default::default()
             },
         );
 
@@ -543,6 +549,7 @@ mod tests {
                 password: None,
                 password_env: None,
                 mirror: None,
+                ..Default::default()
             },
         );
 
@@ -559,6 +566,7 @@ mod tests {
                 password: None,
                 password_env: None,
                 mirror: Some("mirror.example.com".to_string()),
+                ..Default::default()
             },
         );
 
@@ -612,6 +620,7 @@ mirror = "ghcr-mirror.example.com"
                 password: None,
                 password_env: Some("SMOLVM_TEST_TOKEN".to_string()),
                 mirror: None,
+                ..Default::default()
             },
         );
 
@@ -635,6 +644,7 @@ mirror = "ghcr-mirror.example.com"
                 password: None,
                 password_env: Some("SMOLVM_NONEXISTENT_VAR".to_string()),
                 mirror: None,
+                ..Default::default()
             },
         );
 
@@ -821,8 +831,165 @@ mirror = "ghcr-mirror.example.com"
     }
 
     #[test]
-    fn test_reference_error_too_many_components() {
-        let err = Reference::parse("a.com/b/c/d:latest").unwrap_err();
-        assert!(err.reason.contains("too many path components"));
+    fn test_reference_deep_path_ghcr() {
+        // ghcr.io/org/team/machine:latest
+        let r = Reference::parse("ghcr.io/org/team/machine:latest").unwrap();
+        assert_eq!(r.registry, "ghcr.io");
+        assert_eq!(r.namespace, Some("org/team".to_string()));
+        assert_eq!(r.name, "machine");
+        assert_eq!(r.tag, Some("latest".to_string()));
+        assert_eq!(r.repository(), "org/team/machine");
+    }
+
+    #[test]
+    fn test_reference_deep_path_gcr() {
+        // us-docker.pkg.dev/project/repo/image:tag (GCR Artifact Registry style)
+        let r = Reference::parse("us-docker.pkg.dev/project/repo/image:v2").unwrap();
+        assert_eq!(r.registry, "us-docker.pkg.dev");
+        assert_eq!(r.namespace, Some("project/repo".to_string()));
+        assert_eq!(r.name, "image");
+        assert_eq!(r.tag, Some("v2".to_string()));
+        assert_eq!(r.repository(), "project/repo/image");
+    }
+
+    #[test]
+    fn test_reference_deep_path_localhost() {
+        // localhost:5000/a/b/c:dev
+        let r = Reference::parse("localhost:5000/a/b/c:dev").unwrap();
+        assert_eq!(r.registry, "localhost:5000");
+        assert_eq!(r.namespace, Some("a/b".to_string()));
+        assert_eq!(r.name, "c");
+        assert_eq!(r.tag, Some("dev".to_string()));
+    }
+
+    #[test]
+    fn test_reference_deep_path_explicit_registry_required() {
+        // 4+ components without a registry hostname — must fail
+        let err = Reference::parse("org/team/repo/image:latest").unwrap_err();
+        assert!(
+            err.reason.contains("doesn't look like a registry hostname"),
+            "unexpected reason: {}",
+            err.reason
+        );
+    }
+
+    #[test]
+    fn test_reference_rejects_empty_path_components() {
+        // Double slashes produce empty components — must be caught
+        let err = Reference::parse("ghcr.io/org//machine:latest").unwrap_err();
+        assert!(
+            err.reason.contains("empty repository component"),
+            "unexpected reason: {}",
+            err.reason
+        );
+    }
+
+    // ── set_credentials / set_token / save ──────────────────────────────────
+
+    #[test]
+    fn test_set_credentials_new_entry() {
+        let mut config = RegistryConfig::default();
+        config.set_credentials("registry.example.com", "user".into(), "pass".into());
+
+        let creds = config.get_credentials("registry.example.com").unwrap();
+        assert_eq!(creds.username, "user");
+        assert_eq!(creds.password, "pass");
+    }
+
+    #[test]
+    fn test_set_credentials_overwrites_password_env() {
+        let mut config = RegistryConfig::default();
+        config.registries.insert(
+            "registry.example.com".to_string(),
+            RegistryEntry {
+                username: Some("old".to_string()),
+                password: None,
+                password_env: Some("OLD_TOKEN_ENV".to_string()),
+                mirror: Some("mirror.example.com".to_string()),
+                ..Default::default()
+            },
+        );
+
+        config.set_credentials("registry.example.com", "new".into(), "newpass".into());
+
+        let entry = config.registries.get("registry.example.com").unwrap();
+        assert_eq!(entry.username.as_deref(), Some("new"));
+        assert_eq!(entry.password.as_deref(), Some("newpass"));
+        assert_eq!(entry.password_env, None, "password_env must be cleared");
+        assert_eq!(
+            entry.mirror.as_deref(),
+            Some("mirror.example.com"),
+            "mirror must be preserved"
+        );
+    }
+
+    #[test]
+    fn test_set_credentials_clears_identity_token() {
+        // If an entry previously had an identity_token, switching to direct credentials
+        // via set_credentials must clear it. identity_token takes precedence in
+        // build_registry_client(); a stale one would silently ignore the new password.
+        let mut config = RegistryConfig::default();
+        config.registries.insert(
+            "registry.smolmachines.com".to_string(),
+            RegistryEntry {
+                identity_token: Some("eyJ_old_jwt".to_string()),
+                refresh_token: Some("old_refresh".to_string()),
+                expires_at: Some(9999999999),
+                ..Default::default()
+            },
+        );
+
+        config.set_credentials(
+            "registry.smolmachines.com",
+            "user".into(),
+            "direct_bearer".into(),
+        );
+
+        let entry = config.registries.get("registry.smolmachines.com").unwrap();
+        assert_eq!(entry.password.as_deref(), Some("direct_bearer"));
+        assert_eq!(
+            entry.identity_token, None,
+            "stale identity_token must be cleared"
+        );
+        assert_eq!(
+            entry.refresh_token, None,
+            "stale refresh_token must be cleared"
+        );
+        assert_eq!(entry.expires_at, None, "stale expires_at must be cleared");
+    }
+
+    #[test]
+    fn test_set_token_uses_token_username() {
+        let mut config = RegistryConfig::default();
+        config.set_token("registry.smolmachines.com", "eyJhbGci.test");
+
+        let creds = config.get_credentials("registry.smolmachines.com").unwrap();
+        assert_eq!(creds.username, "token");
+        assert_eq!(creds.password, "eyJhbGci.test");
+    }
+
+    #[test]
+    fn test_save_roundtrip_preserves_all_fields() {
+        let mut config = RegistryConfig::default();
+        config.defaults.registry = Some("custom.io".to_string());
+        config.registries.insert(
+            "ghcr.io".to_string(),
+            RegistryEntry {
+                username: Some("gh_user".to_string()),
+                password: Some("gh_pass".to_string()),
+                password_env: None,
+                mirror: Some("ghcr-mirror.example.com".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let reloaded: RegistryConfig = toml::from_str(&serialized).unwrap();
+
+        assert_eq!(reloaded.default_registry(), "custom.io");
+        let entry = reloaded.registries.get("ghcr.io").unwrap();
+        assert_eq!(entry.username.as_deref(), Some("gh_user"));
+        assert_eq!(entry.password.as_deref(), Some("gh_pass"));
+        assert_eq!(entry.mirror.as_deref(), Some("ghcr-mirror.example.com"));
     }
 }

@@ -1,11 +1,27 @@
-//! Shared environment-variable contract for guest virtio networking.
+//! Shared environment-variable contract between the host launcher and guest agent.
 //!
 //! These names form the protocol boundary between:
-//! - the host-side launcher, which decides the guest/gateway plan
-//! - the guest agent, which configures the in-guest NIC from that plan
+//! - the host-side launcher, which decides what features to enable
+//! - the guest agent, which reads these vars on startup and acts accordingly
 //!
 //! They should be treated as stable protocol constants rather than ad hoc
 //! launcher strings.
+
+/// Standard "enabled" value for boolean `SMOLVM_*` sentinel env vars.
+///
+/// The host writes this when a feature is enabled; the guest agent
+/// compares against it. A single canonical value prevents `true` / `yes` /
+/// `1` mismatches between the two sides.
+pub const VALUE_ON: &str = "1";
+
+/// Env var the host sets on guest init to signal GPU acceleration was requested.
+///
+/// Present means "host asked for GPU"; the guest agent reads this and emits a
+/// post-boot sanity log confirming whether `/dev/dri/*` nodes actually appeared.
+/// Absent means no GPU was requested.
+///
+/// This is a boolean sentinel — the value is [`VALUE_ON`] when set.
+pub const GPU: &str = "SMOLVM_GPU";
 
 /// Selects whether the guest should configure a real virtio NIC.
 pub const BACKEND: &str = "SMOLVM_NETWORK_BACKEND";

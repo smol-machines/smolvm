@@ -15,10 +15,7 @@ use std::path::PathBuf;
 /// Reads the boot config from the given path, sets up libkrun, and calls
 /// `krun_start_enter` which blocks forever (or until the VM exits).
 pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
-    // Become a session leader (detach from parent's terminal session)
-    unsafe {
-        libc::setsid();
-    }
+    let t_proc = std::time::Instant::now();
 
     // Read boot config
     let config_data = std::fs::read(&config_path)
@@ -29,8 +26,35 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
     // Clean up the config file — it's no longer needed
     let _ = std::fs::remove_file(&config_path);
 
-    // Redirect stdio to /dev/null first (needs to open /dev/null).
-    if let Err(e) = smolvm::process::detach_stdio_to_stderr_file(&config.startup_error_log) {
+    // Redirect stdio. When SMOLVM_GPU_DEBUG=1, keep stderr pointed at a
+    // debug log file so virglrenderer/MoltenVK errors are captured.
+    if std::env::var_os("SMOLVM_GPU_DEBUG").is_some() {
+        if let Some(ref log) = config.console_log {
+            let debug_path = log.with_file_name("gpu-debug.log");
+            if let Ok(cpath) = std::ffi::CString::new(debug_path.to_string_lossy().as_bytes()) {
+                unsafe {
+                    let fd = libc::open(
+                        cpath.as_ptr(),
+                        libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+                        0o644,
+                    );
+                    if fd >= 0 {
+                        libc::dup2(fd, 2);
+                        libc::close(fd);
+                    }
+                }
+            }
+        }
+        // Detach stdin/stdout only — keep stderr for GPU debug output
+        unsafe {
+            let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
+            if devnull >= 0 {
+                libc::dup2(devnull, 0);
+                libc::dup2(devnull, 1);
+                libc::close(devnull);
+            }
+        }
+    } else if let Err(e) = smolvm::process::detach_stdio_to_stderr_file(&config.startup_error_log) {
         let _ = std::fs::write(
             &config.startup_error_log,
             format!("failed to redirect stdio: {}", e),
@@ -38,16 +62,28 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
         smolvm::process::exit_child(1);
     }
 
-    // Close ALL inherited file descriptors from the parent (server).
+    // Close inherited file descriptors from the parent (server).
     // Without this, the subprocess holds database locks, network sockets, etc.
     // that can interfere with libkrun's operation. Keep stdin/stdout/stderr (0-2)
     // which now point to /dev/null.
-    unsafe {
-        let max_fd = libc::getdtablesize();
-        for fd in 3..max_fd {
-            libc::close(fd);
-        }
+    smolvm::process::close_inherited_fds_from(3);
+
+    // Emit subprocess startup timing to the startup error log (stderr after
+    // the stdio redirect above). These lines decompose the dark window between
+    // parent's spawn() returning and launch_agent_vm() being called.
+    // Emit when RUST_LOG contains "info" — check env var directly since the
+    // tracing dispatch may be unusable after close_inherited_fds_from invalidates
+    // macOS framework file descriptors held by the parent process.
+    let rust_log = std::env::var("RUST_LOG").unwrap_or_default();
+    let proc_timing_on = rust_log.contains("info");
+    macro_rules! proc_timing {
+        ($label:expr) => {
+            if proc_timing_on {
+                eprintln!("[proc] {:25} {}ms", $label, t_proc.elapsed().as_millis());
+            }
+        };
     }
+    proc_timing!("fds closed");
 
     // Open storage and overlay disks
     let storage_disk = match smolvm::storage::StorageDisk::open_or_create_at(
@@ -63,6 +99,7 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
             smolvm::process::exit_child(1);
         }
     };
+    proc_timing!("storage opened");
 
     let overlay_disk = match smolvm::storage::OverlayDisk::open_or_create_at(
         &config.overlay_disk_path,
@@ -77,6 +114,7 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
             smolvm::process::exit_child(1);
         }
     };
+    proc_timing!("overlay opened");
 
     // Launch the VM (never returns on success)
     let disks = VmDisks {
@@ -105,6 +143,8 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
         None
     };
 
+    proc_timing!("ready to launch");
+
     let result = launch_agent_vm(&LaunchConfig {
         rootfs_path: &config.rootfs_path,
         disks: &disks,
@@ -121,6 +161,7 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
             .dns_filter_hosts
             .as_ref()
             .is_some_and(|hosts| !hosts.is_empty()),
+        egress_refresh_hosts: config.dns_filter_hosts.clone(),
     });
 
     // If we get here, launch_agent_vm returned (should only happen on error)

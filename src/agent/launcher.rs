@@ -10,15 +10,33 @@ use crate::error::{Error, Result};
 use crate::network::backend::{COMPAT_NET_FEATURES, TSI_FEATURE_HIJACK_INET};
 use crate::network::{plan_launch_network, EffectiveNetworkBackend};
 use crate::storage::{OverlayDisk, StorageDisk};
-use crate::util::libkrunfw_filename;
+use crate::util::{libkrun_filename, libkrunfw_filename};
 
-use smolvm_network::{guest_env, start_virtio_network, GuestNetworkConfig, VirtioNetworkRuntime};
-use smolvm_protocol::ports;
-use std::ffi::{CStr, CString};
+use smolvm_network::{
+    start_virtio_network, GuestNetworkConfig, PortMapping as VirtioPortMapping,
+    VirtioNetworkRuntime,
+};
+use smolvm_protocol::{guest_env, ports};
+use std::ffi::CString;
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 
-use super::{PortMapping, VmResources};
+use super::{KrunFunctions, PortMapping, VmResources};
+
+/// Maximum number of CIDR entries held in the live egress allow-list.
+/// Protects the muxer's per-packet O(n) scan from unbounded growth when
+/// a host resolves to many IPs across many refresh cycles.
+const EGRESS_CIDR_CAP: usize = 512;
+
+/// Hidden benchmark knob for root virtiofs DAX.
+///
+/// Default behavior uses `krun_set_root`, which configures the root virtiofs
+/// device with libkrun's default DAX window. Set `SMOLVM_ROOTFS_DAX=0` to use
+/// `krun_add_virtiofs3("/dev/root", ..., shm_size=0, read_only=false)` instead.
+const ENV_SMOLVM_ROOTFS_DAX: &str = "SMOLVM_ROOTFS_DAX";
+
+/// The Arc type shared between the egress-refresh thread and libkrun's vsock muxer.
+type EgressArc = std::sync::Arc<std::sync::RwLock<Vec<(std::net::IpAddr, u8)>>>;
 
 /// Disks to attach to the agent VM.
 pub struct VmDisks<'a> {
@@ -28,42 +46,7 @@ pub struct VmDisks<'a> {
     pub overlay: Option<&'a OverlayDisk>,
 }
 
-// FFI bindings to libkrun
-extern "C" {
-    fn krun_set_log_level(level: u32) -> i32;
-    fn krun_create_ctx() -> i32;
-    fn krun_free_ctx(ctx: u32);
-    fn krun_set_vm_config(ctx: u32, num_vcpus: u8, ram_mib: u32) -> i32;
-    fn krun_set_root(ctx: u32, root_path: *const libc::c_char) -> i32;
-    fn krun_set_workdir(ctx: u32, workdir: *const libc::c_char) -> i32;
-    fn krun_set_exec(
-        ctx: u32,
-        exec_path: *const libc::c_char,
-        argv: *const *const libc::c_char,
-        envp: *const *const libc::c_char,
-    ) -> i32;
-    fn krun_add_disk2(
-        ctx: u32,
-        block_id: *const libc::c_char,
-        disk_path: *const libc::c_char,
-        disk_format: u32,
-        read_only: bool,
-    ) -> i32;
-    fn krun_add_vsock_port2(
-        ctx: u32,
-        port: u32,
-        filepath: *const libc::c_char,
-        listen: bool,
-    ) -> i32;
-    fn krun_set_console_output(ctx: u32, filepath: *const libc::c_char) -> i32;
-    fn krun_set_port_map(ctx: u32, port_map: *const *const libc::c_char) -> i32;
-    fn krun_add_virtiofs(ctx: u32, tag: *const libc::c_char, path: *const libc::c_char) -> i32;
-    fn krun_start_enter(ctx: u32) -> i32;
-    fn krun_disable_implicit_vsock(ctx: u32) -> i32;
-    fn krun_add_vsock(ctx: u32, tsi_features: u32) -> i32;
-}
-
-/// Find the directory containing libkrunfw by checking explicit overrides and
+/// Find the directory containing libkrun/libkrunfw by checking explicit overrides and
 /// paths relative to the current executable.
 ///
 /// Checks:
@@ -72,17 +55,16 @@ extern "C" {
 /// - `<exe_dir>/../lib/` (alternative layout)
 /// - `<exe_dir>/../../lib/linux-<arch>/` (source tree dev builds)
 pub fn find_lib_dir() -> Option<PathBuf> {
-    let lib_name = libkrunfw_filename();
+    let lib_names = [libkrun_filename(), libkrunfw_filename()];
     if let Ok(explicit_dir) = std::env::var(ENV_SMOLVM_LIB_DIR) {
         let path = PathBuf::from(explicit_dir);
-        if path.join(lib_name).exists() {
+        if lib_names.iter().all(|lib| path.join(lib).exists()) {
             return path.canonicalize().ok().or(Some(path));
         }
 
         tracing::warn!(
             path = %path.display(),
-            lib = lib_name,
-            "{} does not contain the expected libkrunfw library", ENV_SMOLVM_LIB_DIR
+            "{} does not contain the expected libkrun/libkrunfw libraries", ENV_SMOLVM_LIB_DIR
         );
     }
 
@@ -97,46 +79,12 @@ pub fn find_lib_dir() -> Option<PathBuf> {
     ];
 
     for dir in &candidates {
-        if dir.join(lib_name).exists() {
+        if lib_names.iter().all(|lib| dir.join(lib).exists()) {
             return dir.canonicalize().ok();
         }
     }
 
     None
-}
-
-/// Preload libkrunfw with `RTLD_GLOBAL` so libkrun's internal `dlopen("libkrunfw.so.5")` finds it.
-///
-/// Setting `LD_LIBRARY_PATH` via `std::env::set_var` is insufficient because glibc caches
-/// library search paths at process startup and `dlopen()` never re-reads the environment.
-/// Instead, we load libkrunfw ourselves with `RTLD_GLOBAL`, which makes it visible to all
-/// subsequent `dlopen()` calls by soname — matching how `launcher_dynamic.rs` handles this.
-///
-/// This is a no-op if libkrunfw is not found in any candidate directory (e.g., it's already
-/// in a system library path).
-fn preload_libkrunfw() {
-    let Some(lib_dir) = find_lib_dir() else {
-        return;
-    };
-
-    let lib_path = lib_dir.join(libkrunfw_filename());
-    let Ok(lib_path_c) = CString::new(lib_path.to_string_lossy().as_bytes()) else {
-        return;
-    };
-
-    unsafe {
-        let handle = libc::dlopen(lib_path_c.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL);
-        if handle.is_null() {
-            let err = libc::dlerror();
-            let err_msg = if err.is_null() {
-                "unknown error".to_string()
-            } else {
-                CStr::from_ptr(err).to_string_lossy().to_string()
-            };
-            tracing::warn!(path = %lib_path.display(), error = %err_msg, "failed to preload libkrunfw");
-        }
-        // Intentionally leak the handle — libkrunfw must stay loaded for libkrun to use it.
-    }
 }
 
 /// Launch the agent VM (call in the forked child process).
@@ -195,12 +143,32 @@ pub struct LaunchConfig<'a> {
     /// Whether DNS filtering was configured for this launch, even if the
     /// host-side proxy socket could not be created.
     pub dns_filter_enabled: bool,
+    /// Hostnames to periodically re-resolve for the live egress policy.
+    /// When set, a background thread re-resolves these every 5 minutes and
+    /// atomically replaces the CIDR list via the Arc handle obtained from
+    /// libkrun. This keeps the egress allow-list accurate for long-running VMs
+    /// hitting CDN-backed hosts whose IPs rotate.
+    pub egress_refresh_hosts: Option<Vec<String>>,
 }
 
 /// Launch the agent VM using libkrun.
 ///
 /// This function never returns on success.
 pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
+    let t0 = std::time::Instant::now();
+
+    // Emit boot timing to stderr (captured in the startup error log by the
+    // subprocess's stdio redirect) when INFO logging is enabled.
+    // tracing_subscriber writes to stdout by default, but the subprocess has
+    // stdout=/dev/null; stderr is the only channel that reaches the log file.
+    macro_rules! boot_timing {
+        ($label:expr) => {
+            if tracing::enabled!(tracing::Level::INFO) {
+                eprintln!("[boot] {:25} {}ms", $label, t0.elapsed().as_millis());
+            }
+        };
+    }
+
     let LaunchConfig {
         rootfs_path,
         disks,
@@ -214,6 +182,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         packed_layers_dir,
         extra_disks,
         dns_filter_enabled,
+        egress_refresh_hosts,
     } = config;
 
     crate::network::validate_requested_network_backend(resources, None, port_mappings.len())?;
@@ -221,10 +190,49 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
     // Raise file descriptor limits
     raise_fd_limits();
 
-    // Preload libkrunfw so libkrun's internal dlopen can find it
-    preload_libkrunfw();
+    let lib_dir = find_lib_dir().ok_or_else(|| {
+        Error::agent(
+            "find libraries",
+            "libkrun/libkrunfw not found. Install smolvm with bundled libraries or set SMOLVM_LIB_DIR.",
+        )
+    })?;
+    let krun =
+        unsafe { KrunFunctions::load(&lib_dir) }.map_err(|e| Error::agent("load libkrun", e))?;
+    boot_timing!("dylib loaded");
+
+    // Pre-read the agent binary into the OS page cache so the virtiofs thread
+    // can serve the guest's first exec without waiting for disk I/O.
+    // Runs concurrently with krun context setup below — by the time
+    // krun_start_enter is called, the file is already in page cache.
+    {
+        let agent_bin = rootfs_path.join("usr/local/bin/smolvm-agent");
+        if agent_bin.exists() {
+            let _ = std::thread::Builder::new()
+                .name("agent-preread".into())
+                .spawn(move || {
+                    let _ = std::fs::read(&agent_bin);
+                });
+        }
+    }
 
     unsafe {
+        let krun_set_log_level = krun.set_log_level;
+        let krun_create_ctx = krun.create_ctx;
+        let krun_free_ctx = krun.free_ctx;
+        let krun_set_vm_config = krun.set_vm_config;
+        let krun_set_root = krun.set_root;
+        let krun_set_workdir = krun.set_workdir;
+        let krun_set_exec = krun.set_exec;
+        let krun_add_disk2 = krun.add_disk2;
+        let krun_add_vsock_port2 = krun.add_vsock_port2;
+        let krun_set_console_output = krun.set_console_output;
+        let krun_set_port_map = krun.set_port_map;
+        let krun_add_virtiofs = krun.add_virtiofs;
+        let krun_add_virtiofs3 = krun.add_virtiofs3;
+        let krun_start_enter = krun.start_enter;
+        let krun_disable_implicit_vsock = krun.disable_implicit_vsock;
+        let krun_add_vsock = krun.add_vsock;
+
         // Set log level (0 = off, 1 = error, 2 = warn, 3 = info, 4 = debug)
         // Enable debug logging to trace vsock timing issues
         let log_level = std::env::var(ENV_SMOLVM_KRUN_LOG_LEVEL)
@@ -239,11 +247,48 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             return Err(Error::agent("create vm context", "krun_create_ctx failed"));
         }
         let ctx = ctx as u32;
+        boot_timing!("ctx created");
 
         // Set VM config
         if krun_set_vm_config(ctx, resources.cpus, resources.memory_mib) < 0 {
             krun_free_ctx(ctx);
             return Err(Error::agent("configure vm", "krun_set_vm_config failed"));
+        }
+
+        // Enable GPU if requested (virgl for OpenGL + Venus for Vulkan via virtio-gpu).
+        // Requires libkrun built with `gpu` feature and host virglrenderer.
+        // On macOS, also requires MoltenVK (Vulkan → Metal translation).
+        if resources.gpu {
+            let virgl_flags = super::gpu_virgl_flags();
+            // Size the GPU shared-memory region. Caller may override
+            // via `--gpu-vram <MiB>` (CLI) or `gpu_vram = N` (Smolfile);
+            // default is `DEFAULT_GPU_VRAM_MIB`.
+            let vram_mib = resources.effective_gpu_vram_mib();
+            let vram_bytes: u64 = (vram_mib as u64) * crate::data::consts::BYTES_PER_MIB;
+
+            // Resolve krun_set_gpu_options2 dynamically — it may not exist
+            // if libkrun was built without the `gpu` feature.
+            let set_gpu = match krun.set_gpu_options2 {
+                Some(f) => f,
+                None => {
+                    krun_free_ctx(ctx);
+                    return Err(Error::agent(
+                        "configure gpu",
+                        "libkrun was built without GPU support (krun_set_gpu_options2 not found). \
+                         Rebuild libkrun with GPU=1 — see project README for details.",
+                    ));
+                }
+            };
+
+            let ret = set_gpu(ctx, virgl_flags, vram_bytes);
+            if ret < 0 {
+                krun_free_ctx(ctx);
+                return Err(Error::agent(
+                    "configure gpu",
+                    format!("krun_set_gpu_options2 failed (ret={}). Check that virglrenderer is installed.", ret),
+                ));
+            }
+            tracing::info!("GPU enabled (Venus/Vulkan via virtio-gpu)");
         }
 
         // Helper: evaluate a fallible expression, freeing ctx if it fails.
@@ -260,13 +305,36 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             };
         }
 
-        // Set root filesystem
+        // Set root filesystem.
+        //
+        // Default path: krun_set_root, preserving libkrun's established rootfs
+        // behavior and DAX defaults. Benchmark path: SMOLVM_ROOTFS_DAX=0 uses
+        // krun_add_virtiofs3 with shm_size=0, disabling the root DAX region
+        // while keeping the root read-write.
         let root = try_or_free_ctx!(
             path_to_cstring(rootfs_path),
             "set rootfs",
             "path contains null byte"
         );
-        if krun_set_root(ctx, root.as_ptr()) < 0 {
+        if rootfs_dax_disabled() {
+            let Some(add_virtiofs3) = krun_add_virtiofs3 else {
+                krun_free_ctx(ctx);
+                return Err(Error::agent(
+                    "set rootfs",
+                    "SMOLVM_ROOTFS_DAX=0 requires libkrun with krun_add_virtiofs3",
+                ));
+            };
+
+            let root_tag = cstr("/dev/root");
+            if add_virtiofs3(ctx, root_tag.as_ptr(), root.as_ptr(), 0, false) < 0 {
+                krun_free_ctx(ctx);
+                return Err(Error::agent(
+                    "set rootfs",
+                    "krun_add_virtiofs3 failed for root filesystem",
+                ));
+            }
+            tracing::info!("rootfs configured via virtiofs without DAX");
+        } else if krun_set_root(ctx, root.as_ptr()) < 0 {
             krun_free_ctx(ctx);
             return Err(Error::agent("set rootfs", "krun_set_root failed"));
         }
@@ -327,22 +395,14 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 }
 
                 if let Some(ref cidrs) = resources.allowed_cidrs {
-                    type SetEgressPolicyFn =
-                        unsafe extern "C" fn(u32, *const *const libc::c_char) -> i32;
-
-                    let sym_name =
-                        CString::new("krun_set_egress_policy").expect("symbol name is static");
-                    let sym = libc::dlsym(libc::RTLD_DEFAULT, sym_name.as_ptr());
-                    if sym.is_null() {
+                    let Some(set_egress) = krun.set_egress_policy else {
                         krun_free_ctx(ctx);
                         return Err(Error::agent(
                             "set egress policy",
                             "libkrun does not support egress policy (krun_set_egress_policy not found). \
                              Update libkrun or remove --allow-cidr flags.",
                         ));
-                    }
-                    #[allow(clippy::missing_transmute_annotations)]
-                    let set_egress: SetEgressPolicyFn = std::mem::transmute(sym);
+                    };
 
                     let mut all_cidrs = cidrs.clone();
                     crate::data::network::ensure_dns_in_cidrs(&mut all_cidrs);
@@ -368,7 +428,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 None
             }
             EffectiveNetworkBackend::VirtioNet => {
-                let add_net_unixstream = load_krun_add_net_unixstream().ok_or_else(|| {
+                let add_net_unixstream = krun.add_net_unixstream.ok_or_else(|| {
                     Error::agent(
                         "configure virtio-net",
                         "libkrun does not expose krun_add_net_unixstream; update libkrun or use --net-backend tsi",
@@ -380,17 +440,22 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     Error::agent("configure virtio-net", format!("socketpair failed: {e}"))
                 })?;
 
-                let runtime = match start_virtio_network(host_fd, guest_network) {
-                    Ok(runtime) => runtime,
-                    Err(err) => {
-                        libc::close(guest_fd);
-                        krun_free_ctx(ctx);
-                        return Err(Error::agent(
-                            "configure virtio-net",
-                            format!("failed to start virtio network runtime: {err}"),
-                        ));
-                    }
-                };
+                let virtio_port_mappings: Vec<VirtioPortMapping> = port_mappings
+                    .iter()
+                    .map(|mapping| VirtioPortMapping::new(mapping.host, mapping.guest))
+                    .collect();
+                let runtime =
+                    match start_virtio_network(host_fd, guest_network, &virtio_port_mappings) {
+                        Ok(runtime) => runtime,
+                        Err(err) => {
+                            libc::close(guest_fd);
+                            krun_free_ctx(ctx);
+                            return Err(Error::agent(
+                                "configure virtio-net",
+                                format!("failed to start virtio network runtime: {err}"),
+                            ));
+                        }
+                    };
 
                 if add_net_unixstream(
                     ctx,
@@ -586,6 +651,8 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             }
         }
 
+        boot_timing!("devices configured");
+
         // Set working directory
         let workdir = cstr("/");
         krun_set_workdir(ctx, workdir.as_ptr());
@@ -624,6 +691,19 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // Tell the agent to start SSH agent forwarding bridge
         if ssh_agent_socket.is_some() {
             env_strings.push(cstr("SMOLVM_SSH_AGENT=1"));
+        }
+
+        // Tell the agent GPU was requested so it can sanity-check the
+        // virtio-gpu device actually appeared in the guest. libkrun
+        // happily accepts `krun_set_gpu_options2` even if the embedded
+        // kernel lacks the driver; without this check the user sees
+        // "VM started" and discovers missing GPU only when their
+        // workload hits a rendering call.
+        if resources.gpu {
+            let gpu_env = format!("{}={}", guest_env::GPU, guest_env::VALUE_ON);
+            if let Ok(cs) = CString::new(gpu_env) {
+                env_strings.push(cs);
+            }
         }
 
         // Tell the agent to start DNS filtering proxy
@@ -679,7 +759,83 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             return Err(Error::agent("set exec command", "krun_set_exec failed"));
         }
 
+        // Egress CIDR live-refresh thread.
+        //
+        // Re-resolves DNS filter hostnames every SMOLVM_EGRESS_REFRESH_SECS
+        // (default 5 min) and atomically replaces the Arc<RwLock<Vec<...>>>
+        // that the vsock muxer reads on every packet. The Arc is borrowed from
+        // libkrun via `krun_get_egress_handle` — see libkrun/src/libkrun/src/lib.rs.
+        //
+        // Each cycle: resolve all hosts → build fresh list → single write-lock
+        // swap. If all hosts fail to resolve, the previous list is kept intact.
+        if let Some(hosts) = egress_refresh_hosts.as_ref().filter(|h| !h.is_empty()) {
+            if let Some(krun_get_egress_handle) = krun.get_egress_handle {
+                let raw_handle = krun_get_egress_handle(ctx);
+
+                if !raw_handle.is_null() {
+                    let arc: EgressArc = *Box::from_raw(raw_handle as *mut EgressArc);
+                    let hosts_copy = hosts.clone();
+                    if let Err(e) = std::thread::Builder::new()
+                        .name("egress-refresh".into())
+                        .spawn(move || {
+                            let refresh_secs: u64 = std::env::var("SMOLVM_EGRESS_REFRESH_SECS")
+                                .ok()
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(5 * 60);
+                            let refresh_interval = std::time::Duration::from_secs(refresh_secs);
+                            loop {
+                                std::thread::sleep(refresh_interval);
+                                // Resolve all hosts into a fresh list, then swap
+                                // the shared Vec in a single write-lock acquisition.
+                                // This ensures old rotated-away IPs are removed.
+                                let mut fresh: Vec<(std::net::IpAddr, u8)> = Vec::new();
+                                'hosts: for host in &hosts_copy {
+                                    match resolve_host_subprocess(host) {
+                                        Ok(new_cidrs) => {
+                                            for cidr_str in new_cidrs {
+                                                if fresh.len() >= EGRESS_CIDR_CAP {
+                                                    break 'hosts;
+                                                }
+                                                if let Some((ip_str, prefix_str)) =
+                                                    cidr_str.split_once('/')
+                                                {
+                                                    if let (Ok(ip), Ok(prefix)) = (
+                                                        ip_str.parse::<std::net::IpAddr>(),
+                                                        prefix_str.parse::<u8>(),
+                                                    ) {
+                                                        if !fresh.contains(&(ip, prefix)) {
+                                                            fresh.push((ip, prefix));
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                host = %host,
+                                                error = %e,
+                                                "egress-refresh: resolve failed"
+                                            );
+                                        }
+                                    }
+                                }
+                                // Only replace if at least one host resolved
+                                // successfully; keeps the old list on total failure.
+                                if !fresh.is_empty() {
+                                    let mut guard = arc.write().unwrap_or_else(|e| e.into_inner());
+                                    *guard = fresh;
+                                }
+                            }
+                        })
+                    {
+                        tracing::warn!(error = %e, "egress-refresh spawn failed");
+                    }
+                }
+            }
+        }
+
         // Start VM (this replaces the process on success)
+        boot_timing!("entering vm");
         let ret = krun_start_enter(ctx);
 
         // If we get here, something went wrong — free the context before returning
@@ -703,19 +859,15 @@ fn path_to_cstring(path: &Path) -> Result<CString> {
         .map_err(|_| Error::agent("convert path", "path contains null byte"))
 }
 
-type AddNetUnixstreamFn =
-    unsafe extern "C" fn(u32, *const libc::c_char, libc::c_int, *mut u8, u32, u32) -> i32;
-
-fn load_krun_add_net_unixstream() -> Option<AddNetUnixstreamFn> {
-    let sym_name = CString::new("krun_add_net_unixstream").expect("symbol name is static");
-    // SAFETY: `RTLD_DEFAULT` searches already loaded libraries.
-    let sym = unsafe { libc::dlsym(libc::RTLD_DEFAULT, sym_name.as_ptr()) };
-    if sym.is_null() {
-        None
-    } else {
-        #[allow(clippy::missing_transmute_annotations)]
-        Some(unsafe { std::mem::transmute(sym) })
-    }
+fn rootfs_dax_disabled() -> bool {
+    std::env::var(ENV_SMOLVM_ROOTFS_DAX)
+        .map(|value| {
+            matches!(
+                value.as_str(),
+                "0" | "false" | "False" | "FALSE" | "no" | "off"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn create_unix_stream_pair() -> std::io::Result<(RawFd, RawFd)> {
@@ -743,6 +895,62 @@ fn format_mac(mac: [u8; 6]) -> String {
         "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
     )
+}
+
+/// Resolve a hostname to /32 CIDR strings for the egress-refresh thread.
+///
+/// ## Why not `getaddrinfo`?
+///
+/// The `egress-refresh` thread runs inside the `_boot-vm` subprocess. Before
+/// `krun_start_enter` is called, `internal_boot.rs` closes every inherited FD
+/// from 3 up to `max_fd`. Apple's Network framework maps shared memory at
+/// process launch and accesses it via FD-derived handles. After the mass close,
+/// those handles are invalid, so any call to `getaddrinfo` (which routes
+/// through the Network framework on macOS) crashes with SIGBUS at
+/// `_os_log_preferences_refresh` inside `nw_path_libinfo_path_check`.
+///
+/// Spawning an external `dig` process sidesteps this: `exec()` gives the child
+/// a completely fresh address space, so it never touches the broken inherited
+/// shared memory. On non-macOS platforms `getaddrinfo` via glibc is safe and
+/// is used directly.
+#[cfg(target_os = "macos")]
+#[inline(never)]
+fn resolve_host_subprocess(host: &str) -> std::result::Result<Vec<String>, String> {
+    // `/usr/bin/dig` is always present on macOS (part of BIND-tools in the
+    // base system). `+short` prints one result per line (IPs and CNAMEs);
+    // `+timeout=5 +tries=2` keeps the refresh loop from stalling the VM on
+    // a flaky network.
+    let output = std::process::Command::new("/usr/bin/dig")
+        .args(["+short", "+timeout=5", "+tries=2", host])
+        .output()
+        .map_err(|e| format!("dig subprocess failed for '{}': {}", host, e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // `+short` emits CNAMEs (ending in '.') interleaved with IPs; parse::<IpAddr>
+    // silently skips the CNAME lines, leaving only valid addresses.
+    let cidrs: Vec<String> = stdout
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .parse::<std::net::IpAddr>()
+                .ok()
+                .map(|ip| format!("{}/32", ip))
+        })
+        .collect();
+
+    if cidrs.is_empty() {
+        return Err(format!("dig resolved '{}' to no IP addresses", host));
+    }
+    Ok(cidrs)
+}
+
+/// On non-macOS (Linux), `getaddrinfo` is safe to call from background threads
+/// in child processes — glibc does not use shared-memory handles that become
+/// invalid after a mass FD close. Delegate directly to the standard resolver.
+#[cfg(not(target_os = "macos"))]
+#[inline(never)]
+fn resolve_host_subprocess(host: &str) -> std::result::Result<Vec<String>, String> {
+    crate::smolfile::resolve_host_to_cidrs(host)
 }
 
 /// Raise file descriptor limits (required by libkrun).

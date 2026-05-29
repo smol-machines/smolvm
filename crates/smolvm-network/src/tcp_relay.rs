@@ -28,12 +28,12 @@
 
 use crate::queues::WakePipe;
 use crate::virtio_net_log;
-use smoltcp::iface::{SocketHandle, SocketSet};
+use smoltcp::iface::{Interface, SocketHandle, SocketSet};
 use smoltcp::socket::tcp;
 use smoltcp::wire::IpListenEndpoint;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpStream};
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::sync::Arc;
@@ -47,6 +47,8 @@ const CHANNEL_CAPACITY: usize = 32;
 const RELAY_BUFFER_BYTES: usize = 16 * 1024;
 const CLOSE_RETRY_LIMIT: u16 = 64;
 const PROXY_IDLE_SLEEP: Duration = Duration::from_millis(10);
+const PUBLISHED_PORT_START: u16 = 49_152;
+const PUBLISHED_PORT_END: u16 = 65_535;
 
 /// Track all active guest TCP connections bridged through host sockets.
 ///
@@ -55,6 +57,8 @@ const PROXY_IDLE_SLEEP: Duration = Duration::from_millis(10);
 pub struct TcpRelayTable {
     connections: HashMap<SocketHandle, TrackedConnection>,
     connection_keys: HashSet<(SocketAddr, SocketAddr)>,
+    used_published_ports: HashSet<u16>,
+    next_published_port: u16,
     max_connections: usize,
 }
 
@@ -66,6 +70,8 @@ pub struct TcpRelayTable {
 pub struct NewTcpConnection {
     /// Destination originally requested by the guest.
     pub destination: SocketAddr,
+    /// How the host-side relay should be started.
+    pub relay_target: RelayTarget,
     /// Guest-to-host payloads read from the smoltcp socket.
     pub from_smoltcp: Receiver<Vec<u8>>,
     /// Host-to-guest payloads written back into the smoltcp socket.
@@ -93,12 +99,24 @@ struct TrackedConnection {
     close_attempts: u16,
     // relay thread termination mode observed by the poll loop
     exit_state: RelayExitState,
+    // reserved local source port for published inbound connections
+    reserved_published_port: Option<u16>,
 }
 
 #[derive(Debug)]
 struct PendingProxyEndpoints {
     from_smoltcp: Receiver<Vec<u8>>,
     to_smoltcp: SyncSender<Vec<u8>>,
+    relay_target: RelayTarget,
+}
+
+/// How a host-side TCP relay should obtain its remote socket.
+#[derive(Debug)]
+pub enum RelayTarget {
+    /// Open a new outbound host `TcpStream` to the destination.
+    Connect(SocketAddr),
+    /// Use an already-accepted host `TcpStream` from a published port listener.
+    Attached(TcpStream),
 }
 
 /// Host relay termination state shared between the poll loop and the relay thread.
@@ -151,6 +169,8 @@ impl TcpRelayTable {
         Self {
             connections: HashMap::new(),
             connection_keys: HashSet::new(),
+            used_published_ports: HashSet::new(),
+            next_published_port: PUBLISHED_PORT_START,
             max_connections: max_connections.unwrap_or(MAX_CONNECTIONS),
         }
     }
@@ -219,11 +239,103 @@ impl TcpRelayTable {
                 pending_proxy_endpoints: Some(PendingProxyEndpoints {
                     from_smoltcp: to_proxy_rx,
                     to_smoltcp: from_proxy_tx,
+                    relay_target: RelayTarget::Connect(destination),
                 }),
                 relay_spawned: false,
                 buffered_proxy_data: None,
                 close_attempts: 0,
                 exit_state,
+                reserved_published_port: None,
+            },
+        );
+
+        true
+    }
+
+    /// Create a guest-facing TCP connection for a published host socket.
+    ///
+    /// This is the host->guest mirror of `create_tcp_socket`:
+    ///
+    /// ```text
+    /// host client connects to published port
+    ///   -> host listener accepts TcpStream
+    ///   -> poll loop creates smoltcp TCP socket from gateway_ip:ephemeral
+    ///      to guest_ip:guest_port
+    ///   -> guest kernel sees a normal inbound TCP connection on guest_port
+    /// ```
+    ///
+    /// The guest-visible source address is the gateway IP, not the original
+    /// host peer address. That keeps the first version simple and matches the
+    /// fact that this runtime is acting as a userspace gateway/proxy.
+    pub fn create_published_socket(
+        &mut self,
+        interface: &mut Interface,
+        gateway_ip: Ipv4Addr,
+        destination: SocketAddr,
+        host_stream: TcpStream,
+        sockets: &mut SocketSet<'_>,
+    ) -> bool {
+        if self.connections.len() >= self.max_connections {
+            tracing::warn!("dropping published TCP connection because the relay table is full");
+            return false;
+        }
+
+        let Some(local_port) = self.allocate_published_port() else {
+            tracing::warn!(
+                "dropping published TCP connection because no gateway source port is available"
+            );
+            return false;
+        };
+
+        let std::net::IpAddr::V4(destination_ip) = destination.ip() else {
+            self.used_published_ports.remove(&local_port);
+            return false;
+        };
+
+        let rx_buffer = tcp::SocketBuffer::new(vec![0u8; TCP_RX_BUFFER_BYTES]);
+        let tx_buffer = tcp::SocketBuffer::new(vec![0u8; TCP_TX_BUFFER_BYTES]);
+        let mut socket = tcp::Socket::new(rx_buffer, tx_buffer);
+        let local_endpoint = IpListenEndpoint {
+            addr: Some(gateway_ip.into()),
+            port: local_port,
+        };
+        if socket
+            .connect(
+                interface.context(),
+                (destination_ip, destination.port()),
+                local_endpoint,
+            )
+            .is_err()
+        {
+            self.used_published_ports.remove(&local_port);
+            return false;
+        }
+
+        let handle = sockets.add(socket);
+        let source = SocketAddr::new(std::net::IpAddr::V4(gateway_ip), local_port);
+
+        let (to_proxy_tx, to_proxy_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+        let (from_proxy_tx, from_proxy_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+        let exit_state = RelayExitState::new();
+
+        self.connection_keys.insert((source, destination));
+        self.connections.insert(
+            handle,
+            TrackedConnection {
+                source,
+                destination,
+                to_proxy: to_proxy_tx,
+                from_proxy: from_proxy_rx,
+                pending_proxy_endpoints: Some(PendingProxyEndpoints {
+                    from_smoltcp: to_proxy_rx,
+                    to_smoltcp: from_proxy_tx,
+                    relay_target: RelayTarget::Attached(host_stream),
+                }),
+                relay_spawned: false,
+                buffered_proxy_data: None,
+                close_attempts: 0,
+                exit_state,
+                reserved_published_port: Some(local_port),
             },
         );
 
@@ -304,6 +416,7 @@ impl TcpRelayTable {
                 if let Some(endpoints) = connection.pending_proxy_endpoints.take() {
                     new_connections.push(NewTcpConnection {
                         destination: connection.destination,
+                        relay_target: endpoints.relay_target,
                         from_smoltcp: endpoints.from_smoltcp,
                         to_smoltcp: endpoints.to_smoltcp,
                         exit_state: connection.exit_state.clone(),
@@ -320,16 +433,41 @@ impl TcpRelayTable {
     /// This is the final ownership cleanup step for a guest TCP flow.
     pub fn cleanup_closed(&mut self, sockets: &mut SocketSet<'_>) {
         let keys = &mut self.connection_keys;
+        let published_ports = &mut self.used_published_ports;
         self.connections.retain(|&handle, connection| {
             let socket = sockets.get::<tcp::Socket>(handle);
             if socket.state() == tcp::State::Closed {
                 keys.remove(&(connection.source, connection.destination));
+                if let Some(port) = connection.reserved_published_port {
+                    published_ports.remove(&port);
+                }
                 sockets.remove(handle);
                 false
             } else {
                 true
             }
         });
+    }
+
+    fn allocate_published_port(&mut self) -> Option<u16> {
+        let start = self.next_published_port;
+
+        loop {
+            let candidate = self.next_published_port;
+            self.next_published_port = if candidate == PUBLISHED_PORT_END {
+                PUBLISHED_PORT_START
+            } else {
+                candidate + 1
+            };
+
+            if self.used_published_ports.insert(candidate) {
+                return Some(candidate);
+            }
+
+            if self.next_published_port == start {
+                return None;
+            }
+        }
     }
 }
 
@@ -343,6 +481,7 @@ impl TcpRelayTable {
 /// - report termination mode through `exit_state`
 pub fn spawn_tcp_relay(
     destination: SocketAddr,
+    relay_target: RelayTarget,
     from_smoltcp: Receiver<Vec<u8>>,
     to_smoltcp: SyncSender<Vec<u8>>,
     relay_wake: Arc<WakePipe>,
@@ -357,6 +496,7 @@ pub fn spawn_tcp_relay(
     let _ = thread::Builder::new().name(thread_name).spawn(move || {
         run_tcp_relay(
             destination,
+            relay_target,
             from_smoltcp,
             to_smoltcp,
             relay_wake,
@@ -367,6 +507,7 @@ pub fn spawn_tcp_relay(
 
 fn run_tcp_relay(
     destination: SocketAddr,
+    relay_target: RelayTarget,
     from_smoltcp: Receiver<Vec<u8>>,
     to_smoltcp: SyncSender<Vec<u8>>,
     relay_wake: Arc<WakePipe>,
@@ -378,7 +519,13 @@ fn run_tcp_relay(
         "virtio-net: host TCP relay thread started destination={}",
         destination
     );
-    match tcp_relay_loop(destination, from_smoltcp, to_smoltcp, relay_wake) {
+    match tcp_relay_loop(
+        destination,
+        relay_target,
+        from_smoltcp,
+        to_smoltcp,
+        relay_wake,
+    ) {
         Ok(mode) => {
             virtio_net_log!(
                 "virtio-net: host TCP relay thread exited destination={} mode={:?}",
@@ -400,6 +547,7 @@ fn run_tcp_relay(
 
 fn tcp_relay_loop(
     destination: SocketAddr,
+    relay_target: RelayTarget,
     from_smoltcp: Receiver<Vec<u8>>,
     to_smoltcp: SyncSender<Vec<u8>>,
     relay_wake: Arc<WakePipe>,
@@ -410,16 +558,30 @@ fn tcp_relay_loop(
     // 2. Non-blockingly drain guest payloads from the channel into the socket.
     // 3. Non-blockingly read remote payloads from the socket into the channel.
     // 4. If neither side made progress, sleep briefly to avoid a hot spin loop.
-    virtio_net_log!(
-        "virtio-net: connecting host TCP relay socket destination={}",
-        destination
-    );
-    let mut stream = TcpStream::connect(destination)?;
+    let mut stream = match relay_target {
+        RelayTarget::Connect(destination) => {
+            virtio_net_log!(
+                "virtio-net: connecting host TCP relay socket destination={}",
+                destination
+            );
+            let stream = TcpStream::connect(destination)?;
+            virtio_net_log!(
+                "virtio-net: host TCP relay socket connected destination={}",
+                destination
+            );
+            stream
+        }
+        RelayTarget::Attached(stream) => {
+            virtio_net_log!(
+                "virtio-net: using accepted host TCP socket for published port guest_destination={} peer_addr={:?} local_addr={:?}",
+                destination,
+                stream.peer_addr().ok(),
+                stream.local_addr().ok()
+            );
+            stream
+        }
+    };
     stream.set_nonblocking(true)?;
-    virtio_net_log!(
-        "virtio-net: host TCP relay socket connected destination={}",
-        destination
-    );
 
     let mut guest_write_closed = false;
     let mut read_buffer = [0u8; RELAY_BUFFER_BYTES];

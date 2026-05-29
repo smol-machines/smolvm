@@ -168,8 +168,11 @@ impl ApiState {
         let mut loaded = Vec::new();
 
         for (name, record) in vms {
-            // Check if VM process is still alive
-            if !record.is_process_alive() {
+            // Only clean up machines that have a PID (were started) but whose
+            // process is no longer alive.  Machines in "created" state (pid=None)
+            // have never been started and must be preserved — they are valid
+            // configs waiting for a start call.
+            if record.pid.is_some() && !record.is_process_alive() {
                 tracing::info!(machine = %name, "cleaning up dead machine from database");
                 if let Err(e) = self.db.remove_vm(&name) {
                     tracing::warn!(machine = %name, error = %e, "failed to remove dead machine from database");
@@ -201,6 +204,7 @@ impl ApiState {
                 cpus: Some(record.cpus),
                 memory_mb: Some(record.mem),
                 network: Some(record.network),
+                gpu: record.gpu,
                 storage_gb: record.storage_gb,
                 overlay_gb: record.overlay_gb,
                 allowed_cidrs: record.allowed_cidrs.clone(),
@@ -765,6 +769,11 @@ pub fn resource_spec_to_vm_resources(spec: &ResourceSpec, network: bool) -> VmRe
         memory_mib: spec.memory_mb.unwrap_or(DEFAULT_MICROVM_MEMORY_MIB),
         network,
         network_backend: None,
+        gpu: spec.gpu.unwrap_or(false),
+        // gpu_vram_mib not currently on ResourceSpec — API callers
+        // inherit the default. Add to ResourceSpec if the API ever
+        // needs to expose it.
+        gpu_vram_mib: None,
         storage_gib: spec.storage_gb,
         overlay_gib: spec.overlay_gb,
         allowed_cidrs: spec.allowed_cidrs.clone(),
@@ -777,6 +786,7 @@ pub fn vm_resources_to_spec(res: VmResources) -> ResourceSpec {
         cpus: Some(res.cpus),
         memory_mb: Some(res.memory_mib),
         network: Some(res.network),
+        gpu: Some(res.gpu),
         storage_gb: res.storage_gib,
         overlay_gb: res.overlay_gib,
         allowed_cidrs: res.allowed_cidrs,
@@ -831,7 +841,7 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
         network: entry.network,
         storage_gb: entry.resources.storage_gb,
         overlay_gb: entry.resources.overlay_gb,
-        created_at: String::new(),
+        created_at: 0,
     }
 }
 
@@ -843,7 +853,7 @@ mod tests {
     /// Create an ApiState with a temporary database for testing.
     fn temp_api_state() -> (TempDir, ApiState) {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("test.redb");
+        let path = dir.path().join("test.db");
         let db = SmolvmDb::open_at(&path).unwrap();
         (dir, ApiState::with_db(db))
     }
@@ -870,6 +880,7 @@ mod tests {
             cpus: None,
             memory_mb: None,
             network: None,
+            gpu: None,
             storage_gb: None,
             overlay_gb: None,
             allowed_cidrs: None,
@@ -929,21 +940,20 @@ mod tests {
     }
 
     #[test]
-    fn test_load_persisted_machines_dead_record_does_not_block_name() {
+    fn test_load_persisted_machines_preserves_created_no_pid() {
         let (_dir, state) = temp_api_state();
 
-        // Insert a dead record with no PID (definitely dead)
+        // Insert a record with no PID (created but never started).
+        // These must be preserved — they are valid configs waiting for
+        // a start call.
         let record = VmRecord::new("ghost".into(), 1, 512, vec![], vec![], false);
         state.db.insert_vm("ghost", &record).unwrap();
 
-        // Load should remove it (no PID = dead)
-        let loaded = state.load_persisted_machines();
-        assert!(loaded.is_empty());
-
-        // Name should not be blocked
+        // Load should NOT remove it — no PID means "never started", not "dead".
+        let _loaded = state.load_persisted_machines();
         assert!(
-            state.reserve_machine_name("ghost").is_ok(),
-            "cleaned-up name should be available for reuse"
+            state.db.get_vm("ghost").unwrap().is_some(),
+            "created (no-PID) machine must be preserved across server restart"
         );
     }
 
