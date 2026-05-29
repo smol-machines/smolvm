@@ -523,6 +523,120 @@ EOF
     [[ $exit_code_before -eq 0 ]] && [[ $exit_code_after -eq 0 ]]
 }
 
+test_proxy_flag_routes_pull_through_proxy() {
+    skip_if_slow && return 0
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "SKIP: python3 not available"
+        return 0
+    fi
+
+    local proxy_log proxy_pid proxy_port pull_output pull_exit
+    proxy_log=$(mktemp)
+    proxy_port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
+
+    # Real CONNECT-tunneling proxy: logs each request line, opens a TCP
+    # connection to the target host:port, returns 200, and bidirectionally
+    # relays bytes. Exercises the full path the user hits in production —
+    # a corporate forward proxy doing CONNECT for TLS image pulls.
+    python3 - "$proxy_port" "$proxy_log" <<'PYEOF' &
+import socketserver, socket, sys, threading
+port = int(sys.argv[1]); log_path = sys.argv[2]
+
+def relay(src, dst):
+    try:
+        while True:
+            data = src.recv(65536)
+            if not data:
+                break
+            dst.sendall(data)
+    except (BrokenPipeError, ConnectionResetError, OSError):
+        pass
+    finally:
+        try: dst.shutdown(socket.SHUT_WR)
+        except OSError: pass
+
+class P(socketserver.StreamRequestHandler):
+    timeout = 60
+    def handle(self):
+        line = self.rfile.readline().decode('ascii', errors='replace').strip()
+        with open(log_path, 'a') as f:
+            f.write(line + "\n"); f.flush()
+        while True:
+            h = self.rfile.readline()
+            if not h or h in (b"\r\n", b"\n"): break
+        parts = line.split()
+        if len(parts) < 2 or parts[0].upper() != "CONNECT":
+            self.wfile.write(b"HTTP/1.1 400 Bad Request\r\n\r\n"); return
+        host, _, port_s = parts[1].rpartition(":")
+        try:
+            target = socket.create_connection((host, int(port_s)), timeout=30)
+        except Exception:
+            self.wfile.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n"); return
+        self.wfile.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        self.wfile.flush()
+        client = self.request
+        t1 = threading.Thread(target=relay, args=(client, target), daemon=True)
+        t2 = threading.Thread(target=relay, args=(target, client), daemon=True)
+        t1.start(); t2.start()
+        t1.join(); t2.join()
+        target.close()
+
+class S(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+S(("127.0.0.1", port), P).serve_forever()
+PYEOF
+    proxy_pid=$!
+
+    # Wait for the proxy to bind (up to ~1s).
+    local ready=0 i
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        if (echo > /dev/tcp/127.0.0.1/$proxy_port) 2>/dev/null; then
+            ready=1; break
+        fi
+        sleep 0.1
+    done
+    if [[ $ready -ne 1 ]]; then
+        kill $proxy_pid 2>/dev/null
+        rm -f "$proxy_log"
+        echo "FAIL: proxy never bound to 127.0.0.1:$proxy_port"
+        return 1
+    fi
+
+    # Run the pull. With a real tunneling proxy, this must succeed —
+    # both the manifest fetch and the blob downloads flow through CONNECT.
+    pull_output=$($SMOLVM machine run --net \
+        --proxy "http://127.0.0.1:$proxy_port" \
+        --image alpine -- echo ok 2>&1)
+    pull_exit=$?
+
+    kill $proxy_pid 2>/dev/null
+    wait $proxy_pid 2>/dev/null
+
+    # Two conditions must hold for the feature to be considered working:
+    #   1. The pull succeeded (exit 0 + workload printed "ok")
+    #   2. The proxy log contains a CONNECT for a docker registry, proving
+    #      the request actually went through the proxy (not direct DNS).
+    local connect_seen=0
+    if grep -qiE '^CONNECT[[:space:]]+([a-z0-9.-]*\.)?docker\.io:443' "$proxy_log"; then
+        connect_seen=1
+    fi
+
+    local result=0
+    if [[ $pull_exit -ne 0 ]] || [[ "$pull_output" != *"ok"* ]] || [[ $connect_seen -ne 1 ]]; then
+        result=1
+        echo "  pull exit code:    $pull_exit"
+        echo "  workload output:   $(echo "$pull_output" | tail -1)"
+        echo "  CONNECT logged:    $connect_seen"
+        echo "  proxy log contents:"
+        sed 's/^/    /' "$proxy_log"
+    fi
+    rm -f "$proxy_log"
+    return $result
+}
+
 test_grpcio_channel_ready() {
     skip_if_slow && return 0
     local output
@@ -560,6 +674,7 @@ run_test "DNS filter: allow-host persists across restart" test_machine_allow_hos
 run_test "Smolfile: allow_hosts basic egress permitted/blocked" test_smolfile_allow_hosts_egress_basic || true
 run_test "Smolfile: allow_hosts re-resolves stale CIDRs on start (issue #124)" test_smolfile_allow_hosts_stale_cidr_regression || true
 run_test "Egress refresh thread: stability across refresh cycles" test_egress_refresh_thread_stability || true
+run_test "Proxy: --proxy flag routes image pull through proxy" test_proxy_flag_routes_pull_through_proxy || true
 run_test "grpcio: secure channel ready (ilyaterin grpc test)" test_grpcio_channel_ready || true
 
 

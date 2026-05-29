@@ -227,6 +227,15 @@ pub struct PullImageRequest {
     #[serde(default)]
     #[schema(example = "linux/arm64")]
     pub oci_platform: Option<String>,
+    /// Proxy URL applied to the in-VM registry client
+    /// (sets HTTP_PROXY and HTTPS_PROXY).
+    #[serde(default)]
+    #[schema(example = "http://192.168.127.254:3128")]
+    pub proxy: Option<String>,
+    /// Comma-separated NO_PROXY list of hosts/CIDRs that bypass the proxy.
+    #[serde(default)]
+    #[schema(example = "127.0.0.1,localhost,.internal")]
+    pub no_proxy: Option<String>,
 }
 
 /// Pull image response.

@@ -373,6 +373,9 @@ pub struct RunCmd {
     /// Mount ~/.docker/ config into VM for registry authentication
     #[arg(long, help_heading = "Registry")]
     pub docker_config: bool,
+
+    #[command(flatten, next_help_heading = "Network")]
+    pub proxy_opts: crate::cli::proxy_opts::ProxyOpts,
 }
 
 impl RunCmd {
@@ -587,7 +590,13 @@ impl RunCmd {
 
         // Pull image if one is specified
         let image_info = if let Some(ref img) = image {
-            match crate::cli::pull_with_progress(&mut client, img, self.oci_platform.as_deref()) {
+            match crate::cli::pull_with_progress(
+                &mut client,
+                img,
+                self.oci_platform.as_deref(),
+                self.proxy_opts.proxy(),
+                self.proxy_opts.no_proxy(),
+            ) {
                 Ok(info) => Some(info),
                 Err(e) if !params.net => {
                     // Add a hint when pull fails and networking is disabled —
@@ -1563,18 +1572,23 @@ pub struct StartCmd {
     /// Machine to start (default: "default")
     #[arg(short = 'n', long, value_name = "NAME")]
     pub name: Option<String>,
+
+    #[command(flatten, next_help_heading = "Network")]
+    pub proxy_opts: crate::cli::proxy_opts::ProxyOpts,
 }
 
 impl StartCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let explicit_name = self.name.is_some();
         let name = self.name.unwrap_or_else(|| "default".to_string());
-        match vm_common::start_vm_named(&name) {
+        let proxy = self.proxy_opts.proxy();
+        let no_proxy = self.proxy_opts.no_proxy();
+        match vm_common::start_vm_named(&name, proxy, no_proxy) {
             Ok(()) => Ok(()),
             Err(smolvm::Error::VmNotFound { .. }) if !explicit_name => {
                 // Only fall back to creating a default VM when no --name was given.
                 // With an explicit --name, VmNotFound is a real error.
-                vm_common::start_vm_default()
+                vm_common::start_vm_default(proxy, no_proxy)
             }
             Err(e) => Err(e),
         }
@@ -2524,7 +2538,7 @@ impl MonitorCmd {
 
         if !manager.is_process_alive() {
             println!("Machine '{}' is not running, starting...", name);
-            vm_common::start_vm_named(&name)?;
+            vm_common::start_vm_named(&name, None, None)?;
         }
 
         println!(
@@ -2695,7 +2709,7 @@ impl MonitorCmd {
                         break;
                     }
 
-                    match vm_common::start_vm_named(&name) {
+                    match vm_common::start_vm_named(&name, None, None) {
                         Ok(()) => {
                             println!("  machine restarted");
                             last_start = std::time::Instant::now();

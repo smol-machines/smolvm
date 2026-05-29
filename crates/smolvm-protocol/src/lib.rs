@@ -150,6 +150,12 @@ pub enum AgentRequest {
         /// Optional registry authentication credentials.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         auth: Option<RegistryAuth>,
+        /// Proxy URL applied to the registry client (sets HTTP_PROXY and HTTPS_PROXY).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proxy: Option<String>,
+        /// Comma-separated NO_PROXY list of hosts/CIDRs that bypass the proxy.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        no_proxy: Option<String>,
     },
 
     /// Query if an image exists locally.
@@ -897,6 +903,8 @@ mod tests {
             image: "alpine:latest".to_string(),
             oci_platform: Some("linux/arm64".to_string()),
             auth: None,
+            proxy: None,
+            no_proxy: None,
         };
 
         let encoded = encode_message(&req).unwrap();
@@ -906,6 +914,8 @@ mod tests {
             image,
             oci_platform,
             auth,
+            proxy,
+            no_proxy,
         } = decoded
         else {
             panic!("expected Pull variant, got {:?}", decoded);
@@ -913,6 +923,8 @@ mod tests {
         assert_eq!(image, "alpine:latest");
         assert_eq!(oci_platform, Some("linux/arm64".to_string()));
         assert!(auth.is_none());
+        assert!(proxy.is_none());
+        assert!(no_proxy.is_none());
     }
 
     #[test]
@@ -924,6 +936,8 @@ mod tests {
                 username: "testuser".to_string(),
                 password: "testpass".to_string(),
             }),
+            proxy: None,
+            no_proxy: None,
         };
 
         let encoded = encode_message(&req).unwrap();
@@ -933,6 +947,8 @@ mod tests {
             image,
             oci_platform,
             auth,
+            proxy: _,
+            no_proxy: _,
         } = decoded
         else {
             panic!("expected Pull variant, got {:?}", decoded);
@@ -942,6 +958,29 @@ mod tests {
         let auth = auth.expect("auth should be Some");
         assert_eq!(auth.username, "testuser");
         assert_eq!(auth.password, "testpass");
+    }
+
+    #[test]
+    fn test_encode_decode_with_proxy() {
+        let req = AgentRequest::Pull {
+            image: "alpine:latest".to_string(),
+            oci_platform: None,
+            auth: None,
+            proxy: Some("http://192.168.127.254:3128".to_string()),
+            no_proxy: Some("127.0.0.1,localhost,.internal".to_string()),
+        };
+
+        let encoded = encode_message(&req).unwrap();
+        let decoded: AgentRequest = decode_message(&encoded).unwrap();
+
+        let AgentRequest::Pull {
+            proxy, no_proxy, ..
+        } = decoded
+        else {
+            panic!("expected Pull variant, got {:?}", decoded);
+        };
+        assert_eq!(proxy.as_deref(), Some("http://192.168.127.254:3128"));
+        assert_eq!(no_proxy.as_deref(), Some("127.0.0.1,localhost,.internal"));
     }
 
     #[test]

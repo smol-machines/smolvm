@@ -217,6 +217,10 @@ where
     pub auth: Option<RegistryAuth>,
     /// Whether to load credentials from registry config file.
     pub use_registry_config: bool,
+    /// Proxy URL applied to the in-VM registry client (HTTP_PROXY/HTTPS_PROXY).
+    pub proxy: Option<String>,
+    /// Comma-separated NO_PROXY list of hosts/CIDRs that bypass the proxy.
+    pub no_proxy: Option<String>,
     /// Progress callback: (current, total, layer_id).
     pub progress: Option<F>,
 }
@@ -228,6 +232,8 @@ impl PullOptions<fn(usize, usize, &str)> {
             oci_platform: None,
             auth: None,
             use_registry_config: false,
+            proxy: None,
+            no_proxy: None,
             progress: None,
         }
     }
@@ -256,6 +262,18 @@ impl<F: FnMut(usize, usize, &str)> PullOptions<F> {
         self
     }
 
+    /// Set the proxy URL applied to the in-VM registry client.
+    pub fn proxy(mut self, proxy: impl Into<String>) -> Self {
+        self.proxy = Some(proxy.into());
+        self
+    }
+
+    /// Set the NO_PROXY list for the in-VM registry client.
+    pub fn no_proxy(mut self, no_proxy: impl Into<String>) -> Self {
+        self.no_proxy = Some(no_proxy.into());
+        self
+    }
+
     /// Set a progress callback.
     ///
     /// The callback receives (current_percent, total=100, layer_id) for each layer.
@@ -264,6 +282,8 @@ impl<F: FnMut(usize, usize, &str)> PullOptions<F> {
             oci_platform: self.oci_platform,
             auth: self.auth,
             use_registry_config: self.use_registry_config,
+            proxy: self.proxy,
+            no_proxy: self.no_proxy,
             progress: Some(callback),
         }
     }
@@ -573,6 +593,8 @@ impl AgentClient {
             &effective_image,
             options.oci_platform.as_deref(),
             effective_auth.as_ref(),
+            options.proxy.as_deref(),
+            options.no_proxy.as_deref(),
             options.progress,
         )
     }
@@ -583,6 +605,8 @@ impl AgentClient {
         image: &str,
         oci_platform: Option<&str>,
         auth: Option<&RegistryAuth>,
+        proxy: Option<&str>,
+        no_proxy: Option<&str>,
         mut progress: Option<F>,
     ) -> Result<ImageInfo> {
         let image = normalize_image_ref(image);
@@ -598,6 +622,8 @@ impl AgentClient {
             image: image.to_string(),
             oci_platform: oci_platform.map(String::from),
             auth: auth.cloned(),
+            proxy: proxy.map(String::from),
+            no_proxy: no_proxy.map(String::from),
         })?;
 
         self.stream
@@ -658,6 +684,8 @@ impl AgentClient {
         &mut self,
         image: &str,
         oci_platform: Option<&str>,
+        proxy: Option<&str>,
+        no_proxy: Option<&str>,
         progress: F,
     ) -> Result<ImageInfo> {
         let mut opts = PullOptions::new()
@@ -665,6 +693,12 @@ impl AgentClient {
             .progress(progress);
         if let Some(p) = oci_platform {
             opts = opts.oci_platform(p);
+        }
+        if let Some(p) = proxy {
+            opts = opts.proxy(p);
+        }
+        if let Some(np) = no_proxy {
+            opts = opts.no_proxy(np);
         }
         self.pull(image, opts)
     }

@@ -1670,9 +1670,18 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
             ref image,
             ref oci_platform,
             ref auth,
+            ref proxy,
+            ref no_proxy,
         } = request
         {
-            handle_streaming_pull(stream, image, oci_platform.as_deref(), auth.as_ref())?;
+            handle_streaming_pull(
+                stream,
+                image,
+                oci_platform.as_deref(),
+                auth.as_ref(),
+                proxy.as_deref(),
+                no_proxy.as_deref(),
+            )?;
             continue;
         }
 
@@ -4174,12 +4183,15 @@ fn handle_streaming_pull<S: Read + Write>(
     image: &str,
     oci_platform: Option<&str>,
     auth: Option<&RegistryAuth>,
+    proxy: Option<&str>,
+    no_proxy: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     ensure_storage_mounted();
     info!(
         image = %image,
         ?oci_platform,
         has_auth = auth.is_some(),
+        has_proxy = proxy.is_some(),
         "pulling image with progress"
     );
 
@@ -4200,7 +4212,14 @@ fn handle_streaming_pull<S: Read + Write>(
     };
 
     let response = AgentResponse::from_result(
-        storage::pull_image_with_progress_and_auth(image, oci_platform, auth, progress_callback),
+        storage::pull_image_with_progress_and_auth(
+            image,
+            oci_platform,
+            auth,
+            proxy,
+            no_proxy,
+            progress_callback,
+        ),
         error_codes::PULL_FAILED,
     );
 

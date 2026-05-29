@@ -8,6 +8,7 @@ pub mod openapi;
 pub mod pack;
 pub mod pack_run;
 pub mod parsers;
+pub mod proxy_opts;
 pub mod serve;
 pub mod smolfile;
 pub mod vm_common;
@@ -167,6 +168,8 @@ pub fn pull_with_progress(
     client: &mut smolvm::agent::AgentClient,
     image: &str,
     oci_platform: Option<&str>,
+    proxy: Option<&str>,
+    no_proxy: Option<&str>,
 ) -> smolvm::Result<smolvm_protocol::ImageInfo> {
     eprint!("Pulling image {}...", image);
     let _ = std::io::stderr().flush();
@@ -176,6 +179,8 @@ pub fn pull_with_progress(
     let result = client.pull_with_registry_config_and_progress(
         image,
         oci_platform,
+        proxy,
+        no_proxy,
         |percent, _total, layer| {
             if layer == "syncing" {
                 if !syncing {

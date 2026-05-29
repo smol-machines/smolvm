@@ -546,7 +546,11 @@ pub fn create_vm(params: CreateVmParams) -> smolvm::Result<()> {
 /// Uses direct DB operations instead of SmolvmConfig::load() to avoid
 /// loading all config settings and all VM records. Only reads the single
 /// named record (1 DB cycle) and updates it after start (1 DB cycle).
-pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
+pub fn start_vm_named(
+    name: &str,
+    proxy: Option<&str>,
+    no_proxy: Option<&str>,
+) -> smolvm::Result<()> {
     use smolvm::Error;
 
     // Direct DB lookup — 1 read cycle instead of loading everything
@@ -705,7 +709,13 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
             None
         } else if let Some(ref image) = record.image {
             eprintln!("Pulling {}...", image);
-            Some(crate::cli::pull_with_progress(&mut client, image, None)?)
+            Some(crate::cli::pull_with_progress(
+                &mut client,
+                image,
+                None,
+                proxy,
+                no_proxy,
+            )?)
         } else {
             None
         };
@@ -925,7 +935,7 @@ fn check_port_conflicts(
 }
 
 /// Start the default machine.
-pub fn start_vm_default() -> smolvm::Result<()> {
+pub fn start_vm_default(proxy: Option<&str>, no_proxy: Option<&str>) -> smolvm::Result<()> {
     let manager = AgentManager::new_default()?;
 
     if manager.try_connect_existing().is_some() {
@@ -962,7 +972,13 @@ pub fn start_vm_default() -> smolvm::Result<()> {
 
             let image_info = if let Some(ref image) = record.image {
                 eprintln!("Pulling {}...", image);
-                Some(crate::cli::pull_with_progress(&mut client, image, None)?)
+                Some(crate::cli::pull_with_progress(
+                    &mut client,
+                    image,
+                    None,
+                    proxy,
+                    no_proxy,
+                )?)
             } else {
                 None
             };

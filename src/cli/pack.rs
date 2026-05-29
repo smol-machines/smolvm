@@ -148,6 +148,9 @@ pub struct PackCreateCmd {
     /// the slp/mesa-libkrun-vulkan COPR, or standard Mesa on Linux hosts).
     #[arg(long)]
     pub gpu: bool,
+
+    #[command(flatten, next_help_heading = "Network")]
+    pub proxy_opts: crate::cli::proxy_opts::ProxyOpts,
 }
 
 impl PackCreateCmd {
@@ -280,6 +283,8 @@ impl PackCreateCmd {
             &mut client,
             &image,
             pack_config.oci_platform.as_deref(),
+            self.proxy_opts.proxy(),
+            self.proxy_opts.no_proxy(),
         )?;
         debug!(image_info = ?image_info, "image pulled");
 
@@ -573,7 +578,13 @@ impl PackCreateCmd {
 
                 // Pull the same image (layers are cached on the source storage,
                 // but the agent needs the manifest to know the layer list).
-                let image_info = crate::cli::pull_with_progress(&mut client, &image, None)?;
+                let image_info = crate::cli::pull_with_progress(
+                    &mut client,
+                    &image,
+                    None,
+                    self.proxy_opts.proxy(),
+                    self.proxy_opts.no_proxy(),
+                )?;
 
                 // Export base image layers
                 println!("Exporting {} layers...", image_info.layer_count);
