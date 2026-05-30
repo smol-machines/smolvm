@@ -124,7 +124,28 @@ impl HostMount {
 
     /// Parse multiple mount specifications.
     pub fn parse(specs: &[String]) -> Result<Vec<Self>> {
-        specs.iter().map(|spec| Self::_parse(spec)).collect()
+        let mounts: Vec<Self> = specs
+            .iter()
+            .map(|spec| Self::_parse(spec))
+            .collect::<Result<_>>()?;
+
+        // Reject duplicate guest targets. Silently letting a later `-v`
+        // shadow an earlier one (second-wins) hides a likely user mistake
+        // and makes the effective mount ambiguous.
+        let mut seen = std::collections::HashSet::new();
+        for m in &mounts {
+            if !seen.insert(&m.target) {
+                return Err(Error::mount(
+                    "validate mounts",
+                    format!(
+                        "duplicate mount target: {} is specified more than once",
+                        m.target.display()
+                    ),
+                ));
+            }
+        }
+
+        Ok(mounts)
     }
 
     fn validate(mount: &Self) -> Result<()> {
@@ -189,6 +210,26 @@ impl HostMount {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn parse_rejects_duplicate_target() {
+        // Sources must exist (HostMount::_parse validates source presence),
+        // so use real temp directories.
+        let base = std::env::temp_dir();
+        let a = base.join("smolvm_dup_a");
+        let b = base.join("smolvm_dup_b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let (a, b) = (a.to_string_lossy(), b.to_string_lossy());
+
+        let err = HostMount::parse(&[format!("{a}:/app"), format!("{b}:/app")]).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate mount target"),
+            "expected duplicate-target error, got: {err}"
+        );
+        // Distinct targets are fine.
+        assert!(HostMount::parse(&[format!("{a}:/app"), format!("{b}:/data")]).is_ok());
+    }
 
     fn parse_one(spec: &str) -> HostMount {
         HostMount::parse(&[spec.to_string()]).unwrap().remove(0)

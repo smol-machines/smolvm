@@ -62,15 +62,29 @@ pub fn libkrun_filename() -> &'static str {
     lib_name
 }
 
-/// Parse a single `KEY=VALUE` environment variable specification.
+/// Parse a single environment variable specification.
 ///
-/// Returns `None` if the string has no `=` or the key is empty.
+/// - `KEY=VALUE` → `Some((KEY, VALUE))`.
+/// - `KEY` (no `=`) → forwards the host's current value for `KEY` (Docker
+///   `-e KEY` semantics); `None` if the host variable is unset.
+/// - empty key (`=VALUE`) or empty spec → `None`.
 pub fn parse_env_spec(spec: &str) -> Option<(String, String)> {
-    let (key, value) = spec.split_once('=')?;
-    if key.is_empty() {
-        None
-    } else {
-        Some((key.to_string(), value.to_string()))
+    match spec.split_once('=') {
+        Some((key, value)) => {
+            if key.is_empty() {
+                None
+            } else {
+                Some((key.to_string(), value.to_string()))
+            }
+        }
+        None => {
+            if spec.is_empty() {
+                None
+            } else {
+                // Key-only form: forward the value from the host environment.
+                std::env::var(spec).ok().map(|v| (spec.to_string(), v))
+            }
+        }
     }
 }
 
@@ -85,6 +99,35 @@ pub fn parse_env_list(env_args: &[String]) -> Vec<(String, String)> {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn parse_env_spec_key_value() {
+        assert_eq!(
+            parse_env_spec("FOO=bar"),
+            Some(("FOO".to_string(), "bar".to_string()))
+        );
+        // Empty value is allowed.
+        assert_eq!(
+            parse_env_spec("FOO="),
+            Some(("FOO".to_string(), String::new()))
+        );
+        // Empty key is rejected.
+        assert_eq!(parse_env_spec("=bar"), None);
+        assert_eq!(parse_env_spec(""), None);
+    }
+
+    #[test]
+    fn parse_env_spec_key_only_forwards_host_value() {
+        let key = "SMOLVM_TEST_ENV_FWD_XYZ";
+        std::env::set_var(key, "host_value");
+        assert_eq!(
+            parse_env_spec(key),
+            Some((key.to_string(), "host_value".to_string()))
+        );
+        std::env::remove_var(key);
+        // Unset host var → skipped.
+        assert_eq!(parse_env_spec(key), None);
+    }
 
     #[test]
     fn test_generate_ids() {
