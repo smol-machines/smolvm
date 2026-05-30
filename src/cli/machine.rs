@@ -1643,7 +1643,12 @@ impl DeleteCmd {
             &self.name,
             self.force,
             DeleteVmOptions {
-                stop_if_running: false,
+                // Stop the VM before removing its config and data dir.
+                // Without this, deleting a running machine orphans the
+                // `_boot-vm` process (leaking host RAM) and removes the data
+                // dir out from under the live VM. The API delete handler and
+                // `delete_vm`'s own teardown already do this.
+                stop_if_running: true,
             },
         )
     }
