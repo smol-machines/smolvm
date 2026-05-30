@@ -677,6 +677,15 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
         std::mem::forget(layers_lease);
     }
 
+    // Image archive: the record stores a `local:<hash>` reference whose layers
+    // were extracted into the content-addressed cache at create time. Resolve
+    // it from the cache and mount via virtiofs instead of pulling.
+    let archive = smolvm::image_archive::resolve_if_archive(record.image.as_deref())?;
+    let is_image_archive = archive.is_some();
+    if let Some((layers_dir, _resolved)) = archive {
+        features.packed_layers_dir = Some(layers_dir);
+    }
+
     let _ = manager
         .ensure_running_with_full_config(mounts, ports, resources, features)
         .map_err(|e| Error::agent("start machine", e.to_string()))?;
@@ -700,7 +709,7 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
     // starts, skip both — image manifests/layers persist on the storage disk
     // and the container overlay is remounted (not recreated).
     if !record.init_completed {
-        let image_info = if record.source_smolmachine.is_some() {
+        let image_info = if record.source_smolmachine.is_some() || is_image_archive {
             // Layers already mounted via virtiofs — no pull needed.
             None
         } else if let Some(ref image) = record.image {

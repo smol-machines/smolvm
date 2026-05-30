@@ -37,6 +37,16 @@
 ///            "ghcr.io/owner/repo:v1");
 /// ```
 pub fn normalize_image_ref(image: &str) -> String {
+    // `local:<hash>` references denote a local image archive that the CLI has
+    // already extracted into its content-addressed cache. These are not
+    // registry references, so pass them through untouched. The host transport
+    // spellings (stdin `-`, `.tar`/`.tar.gz` files) are classified and resolved
+    // to `local:<hash>` CLI-side before they ever reach this function, so only
+    // the resolved scheme needs handling here.
+    if image.starts_with("local:") {
+        return image.to_string();
+    }
+
     // 1. Resolve index.docker.io alias.
     let owned;
     let image = if let Some(rest) = image.strip_prefix("index.docker.io/") {
@@ -129,6 +139,9 @@ mod tests {
             ("ghcr.io/owner/repo:v1", "ghcr.io/owner/repo:v1"),
             // Port in registry — colon-detection must not confuse port with tag.
             ("localhost:5000/myimage:dev", "localhost:5000/myimage:dev"),
+            // Resolved local image archive — passed through verbatim, no
+            // normalization (the CLI owns transport-form classification).
+            ("local:0123456789abcdef", "local:0123456789abcdef"),
         ];
 
         for (input, expected) in cases {

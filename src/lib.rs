@@ -72,6 +72,8 @@ pub mod dns_filter;
 pub mod dns_filter_listener;
 /// Language-neutral embedded runtime support shared by SDK adapters.
 pub mod embedded;
+/// Docker/OCI image archive support (stdin pipe and `.tar` files).
+pub mod image_archive;
 pub mod log_rotation;
 pub mod network;
 pub mod platform;

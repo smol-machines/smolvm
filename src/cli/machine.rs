@@ -548,10 +548,32 @@ impl RunCmd {
             None
         };
 
+        // Resolve image: CLI > Smolfile > None (bare VM)
+        let image = self.image.clone().or(params.image.clone());
+
+        // Reading the image from stdin consumes the same stream an interactive
+        // session needs, so the two are mutually exclusive.
+        if image.as_deref() == Some("-") && (interactive || tty) {
+            return Err(Error::config(
+                "machine run",
+                "cannot read an image from stdin (--image -) together with -i/-t; \
+                 stdin is consumed by the image archive",
+            ));
+        }
+
+        // Image archives (stdin pipe / `.tar` files) are extracted on the host
+        // and mounted via virtiofs instead of being pulled from a registry.
+        let archive = smolvm::image_archive::resolve_if_archive(image.as_deref())?;
+        let is_image_archive = archive.is_some();
+        let (packed_layers_dir, resolved_image) = match archive {
+            Some((layers_dir, resolved)) => (Some(layers_dir), Some(resolved)),
+            None => (None, image.clone()),
+        };
+
         let features = smolvm::agent::LaunchFeatures {
             ssh_agent_socket,
             dns_filter_hosts: params.dns_filter_hosts.clone(),
-            packed_layers_dir: None,
+            packed_layers_dir,
             extra_disks: Vec::new(),
         };
 
@@ -582,11 +604,11 @@ impl RunCmd {
         // exec (which has its own SIGINT handling).
         let sigint_guard = manager.child_pid().map(smolvm::process::SigintGuard::new);
 
-        // Resolve image: CLI > Smolfile > None (bare VM)
-        let image = self.image.clone().or(params.image.clone());
-
-        // Pull image if one is specified
-        let image_info = if let Some(ref img) = image {
+        // Pull image if one is specified. Image archives are already mounted via
+        // virtiofs (packed layers), so no registry pull is performed.
+        let image_info = if is_image_archive {
+            None
+        } else if let Some(ref img) = resolved_image {
             match crate::cli::pull_with_progress(&mut client, img, self.oci_platform.as_deref()) {
                 Ok(info) => Some(info),
                 Err(e) if !params.net => {
@@ -638,7 +660,7 @@ impl RunCmd {
                 &mut client,
                 &params.init,
                 vm_common::InitRunContext {
-                    image: image.as_deref(),
+                    image: resolved_image.as_deref(),
                     image_info: image_info.as_ref(),
                     env: &init_env,
                     workdir: params.workdir.as_deref(),
@@ -686,7 +708,7 @@ impl RunCmd {
         let mount_bindings = mounts_to_virtiofs_bindings(&mounts);
 
         // Two modes: with image or bare VM (no image)
-        if let Some(ref img) = image {
+        if let Some(ref img) = resolved_image {
             let defaults = vm_common::resolve_image_runtime_defaults(
                 image_info.as_ref(),
                 &env,
@@ -1460,6 +1482,17 @@ impl CreateCmd {
         }
         PortMapping::check_duplicates(&params.port)
             .map_err(|e| smolvm::Error::config("validate ports", e))?;
+
+        // Image archives must be consumed now: a stdin pipe is only available at
+        // create time, not on later `machine start`. Extract into the
+        // content-addressed cache and persist the resolved `local:<hash>`
+        // reference so subsequent starts resolve straight from the cache.
+        if let Some((_layers_dir, resolved)) =
+            smolvm::image_archive::resolve_if_archive(params.image.as_deref())?
+        {
+            params.image = Some(resolved);
+        }
+
         vm_common::create_vm(params)
     }
 
