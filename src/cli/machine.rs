@@ -1492,14 +1492,11 @@ impl CreateCmd {
         let manifest = smolvm_pack::packer::read_manifest_from_sidecar(sidecar_path)
             .map_err(|e| smolvm::Error::agent("read .smolmachine", e.to_string()))?;
 
-        // Pre-extract the sidecar so first `machine start` is fast.
+        // Read the footer now; the bundle is extracted into the machine's own
+        // data dir after `create_vm` succeeds (below), so a duplicate-name create
+        // cannot clobber an existing machine's layers.
         let footer = smolvm_pack::packer::read_footer_from_sidecar(sidecar_path)
             .map_err(|e| smolvm::Error::agent("read sidecar footer", e.to_string()))?;
-        let cache_dir = smolvm_pack::extract::get_cache_dir(footer.checksum)
-            .map_err(|e| smolvm::Error::agent("get cache dir", e.to_string()))?;
-        println!("Extracting .smolmachine assets...");
-        smolvm_pack::extract::extract_sidecar(sidecar_path, &cache_dir, &footer, false, false)
-            .map_err(|e| smolvm::Error::agent("extract sidecar", e.to_string()))?;
 
         // Resolve the canonical path for storage in VmRecord.
         let canonical_path = sidecar_path
@@ -1512,6 +1509,9 @@ impl CreateCmd {
             .name
             .clone()
             .unwrap_or_else(smolvm::util::generate_machine_name);
+        // `name` is moved into `params` below; keep a copy for the post-create
+        // extraction that targets this machine's own data dir.
+        let name_for_layers = name.clone();
 
         // CLI flags override manifest defaults.
         let cpus = if self.cpus != DEFAULT_MICROVM_CPU_COUNT {
@@ -1561,7 +1561,71 @@ impl CreateCmd {
             source_smolmachine: Some(canonical_path),
         };
 
-        vm_common::create_vm(params)
+        let record = vm_common::build_vm_record(&params)?;
+        let reservation = vm_common::CreateVmReservation::reserve(&name_for_layers)?;
+
+        // Create the machine data dir while the DB reservation is held, then
+        // extract before publishing the VM row. Other processes either see the
+        // reservation conflict or the finished VM, never a half-created record.
+        let create_result = (|| -> smolvm::Result<()> {
+            let _manager = AgentManager::for_vm_with_sizes(
+                &name_for_layers,
+                params.storage_gb,
+                params.overlay_gb,
+            )?;
+
+            let cache_dir = smolvm::agent::machine_layers_cache_dir(&name_for_layers);
+            smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
+            match std::fs::remove_dir_all(&cache_dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(smolvm::Error::agent(
+                        "clear packed layers cache",
+                        e.to_string(),
+                    ));
+                }
+            }
+
+            println!("Extracting .smolmachine assets...");
+            let result = smolvm_pack::extract::extract_sidecar(
+                sidecar_path,
+                &cache_dir,
+                &footer,
+                false,
+                false,
+            )
+            .map_err(|e| smolvm::Error::agent("extract sidecar", e.to_string()));
+            // Detach unconditionally: extraction mounts the case-sensitive volume on
+            // macOS even when it later fails, so the detach must run on both success
+            // and failure paths to honor the "mounted iff running" invariant.
+            smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
+            result?;
+
+            reservation.commit(&record)?;
+            Ok(())
+        })();
+
+        if let Err(e) = create_result {
+            smolvm_pack::extract::force_detach_layers_volume(
+                &smolvm::agent::machine_layers_cache_dir(&name_for_layers),
+            );
+            let data_dir = smolvm::agent::vm_data_dir(&name_for_layers);
+            if let Err(remove_err) = std::fs::remove_dir_all(&data_dir) {
+                if remove_err.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        machine = %name_for_layers,
+                        dir = %data_dir.display(),
+                        error = %remove_err,
+                        "failed to remove machine data dir after create failure"
+                    );
+                }
+            }
+            return Err(e);
+        }
+
+        vm_common::print_create_success(&params);
+        Ok(())
     }
 }
 

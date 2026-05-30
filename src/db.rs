@@ -23,6 +23,10 @@ use std::time::Duration;
 /// from concurrent CLI processes (e.g., 10-20 VMs starting simultaneously).
 const BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Long enough for a legitimate slow create/extract, short enough that a
+/// crashed creator does not reserve a name forever.
+const CREATE_RESERVATION_TTL_SECS: u64 = 60 * 60;
+
 /// Extension trait to convert errors into `Error::database`.
 trait DbResultExt<T> {
     fn db_err(self, operation: impl Into<String>) -> Result<T>;
@@ -83,6 +87,12 @@ impl SmolvmDb {
             "CREATE TABLE IF NOT EXISTS vms (
                  name TEXT PRIMARY KEY NOT NULL,
                  data BLOB NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS vm_create_reservations (
+                 name TEXT PRIMARY KEY NOT NULL,
+                 owner_token TEXT NOT NULL,
+                 owner_pid INTEGER NOT NULL,
+                 created_at INTEGER NOT NULL
              );
              CREATE TABLE IF NOT EXISTS config (
                  key TEXT PRIMARY KEY NOT NULL,
@@ -155,17 +165,160 @@ impl SmolvmDb {
     /// Insert a VM record only if it doesn't already exist.
     ///
     /// Returns `Ok(true)` if inserted, `Ok(false)` if the name already exists.
-    /// Atomicity is provided by SQLite's `INSERT OR IGNORE`.
+    /// Atomicity is provided by SQLite's `INSERT OR IGNORE`. A name with an
+    /// active create reservation is treated as already taken so older callers
+    /// that have not been threaded through the reservation API cannot clobber a
+    /// machine whose per-machine data directory is being prepared.
     pub fn insert_vm_if_not_exists(&self, name: &str, record: &VmRecord) -> Result<bool> {
         let json = serde_json::to_vec(record).db_err("serialize vm record")?;
         self.with_conn(|conn| {
             let changed = conn
                 .execute(
-                    "INSERT OR IGNORE INTO vms (name, data) VALUES (?1, ?2)",
+                    "INSERT OR IGNORE INTO vms (name, data)
+                     SELECT ?1, ?2
+                     WHERE NOT EXISTS (
+                         SELECT 1 FROM vm_create_reservations WHERE name = ?1
+                     )",
                     params![name, json],
                 )
                 .db_err(format!("insert vm '{}'", name))?;
             Ok(changed == 1)
+        })
+    }
+
+    /// Generate an opaque token identifying this process's create reservation.
+    pub fn create_reservation_token() -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        format!(
+            "{}-{}-{}",
+            std::process::id(),
+            crate::util::current_timestamp(),
+            nanos
+        )
+    }
+
+    /// Reserve a VM name across processes before touching its data directory.
+    ///
+    /// Returns `Ok(false)` when the VM already exists or another live creator
+    /// owns the reservation. Dead/stale reservations are reaped before the
+    /// insert attempt so a crashed creator does not permanently wedge a name.
+    pub fn reserve_vm_create(&self, name: &str, owner_token: &str) -> Result<bool> {
+        let owner_pid = i64::from(std::process::id());
+        let now = crate::util::current_timestamp();
+        let stale_before = now.saturating_sub(CREATE_RESERVATION_TTL_SECS);
+
+        self.with_conn(|conn| {
+            let tx = conn.transaction().db_err("begin create reservation")?;
+
+            if let Some((existing_pid, created_at)) = tx
+                .query_row(
+                    "SELECT owner_pid, created_at
+                     FROM vm_create_reservations
+                     WHERE name = ?1",
+                    params![name],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, u64>(1)?)),
+                )
+                .optional()
+                .db_err(format!("read create reservation '{}'", name))?
+            {
+                let pid_alive =
+                    existing_pid > 0 && crate::process::is_alive(existing_pid as libc::pid_t);
+                if !pid_alive || created_at <= stale_before {
+                    tx.execute(
+                        "DELETE FROM vm_create_reservations WHERE name = ?1",
+                        params![name],
+                    )
+                    .db_err(format!("remove stale create reservation '{}'", name))?;
+                }
+            }
+
+            let exists: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM vms WHERE name = ?1)",
+                    params![name],
+                    |row| row.get(0),
+                )
+                .db_err(format!("check vm '{}'", name))?;
+            if exists {
+                tx.commit().db_err("commit create reservation check")?;
+                return Ok(false);
+            }
+
+            let changed = tx
+                .execute(
+                    "INSERT OR IGNORE INTO vm_create_reservations
+                     (name, owner_token, owner_pid, created_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![name, owner_token, owner_pid, now],
+                )
+                .db_err(format!("reserve vm '{}'", name))?;
+
+            tx.commit().db_err("commit create reservation")?;
+            Ok(changed == 1)
+        })
+    }
+
+    /// Persist a VM record and release the matching create reservation atomically.
+    ///
+    /// Returns `Ok(false)` if the caller does not own the reservation or if the
+    /// VM row already exists.
+    pub fn commit_reserved_vm(
+        &self,
+        name: &str,
+        owner_token: &str,
+        record: &VmRecord,
+    ) -> Result<bool> {
+        let json = serde_json::to_vec(record).db_err("serialize vm record")?;
+        self.with_conn(|conn| {
+            let tx = conn.transaction().db_err("begin reserved vm commit")?;
+
+            let owns_reservation: bool = tx
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM vm_create_reservations
+                         WHERE name = ?1 AND owner_token = ?2
+                     )",
+                    params![name, owner_token],
+                    |row| row.get(0),
+                )
+                .db_err(format!("check create reservation '{}'", name))?;
+            if !owns_reservation {
+                tx.commit().db_err("commit reservation ownership check")?;
+                return Ok(false);
+            }
+
+            let changed = tx
+                .execute(
+                    "INSERT OR IGNORE INTO vms (name, data) VALUES (?1, ?2)",
+                    params![name, json],
+                )
+                .db_err(format!("insert reserved vm '{}'", name))?;
+
+            tx.execute(
+                "DELETE FROM vm_create_reservations
+                 WHERE name = ?1 AND owner_token = ?2",
+                params![name, owner_token],
+            )
+            .db_err(format!("release create reservation '{}'", name))?;
+
+            tx.commit().db_err("commit reserved vm")?;
+            Ok(changed == 1)
+        })
+    }
+
+    /// Release a create reservation if it is still owned by `owner_token`.
+    pub fn release_vm_create_reservation(&self, name: &str, owner_token: &str) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM vm_create_reservations
+                 WHERE name = ?1 AND owner_token = ?2",
+                params![name, owner_token],
+            )
+            .db_err(format!("release create reservation '{}'", name))?;
+            Ok(())
         })
     }
 
@@ -521,6 +674,48 @@ mod tests {
 
         let vms = db.list_vms().unwrap();
         assert_eq!(vms.len(), 2);
+    }
+
+    #[test]
+    fn test_create_reservation_blocks_unreserved_insert() {
+        let (_dir, db) = temp_db();
+        let token = SmolvmDb::create_reservation_token();
+        let record = VmRecord::new("reserved-vm".to_string(), 1, 512, vec![], vec![], false);
+
+        assert!(db.reserve_vm_create("reserved-vm", &token).unwrap());
+        assert!(
+            !db.insert_vm_if_not_exists("reserved-vm", &record).unwrap(),
+            "legacy unreserved insert must not publish a reserved name"
+        );
+        assert!(
+            db.get_vm("reserved-vm").unwrap().is_none(),
+            "reservation must not create a visible VM row"
+        );
+
+        assert!(db
+            .commit_reserved_vm("reserved-vm", &token, &record)
+            .unwrap());
+        assert!(db.get_vm("reserved-vm").unwrap().is_some());
+    }
+
+    #[test]
+    fn test_create_reservation_is_exclusive_and_releasable() {
+        let (_dir, db) = temp_db();
+        let first = SmolvmDb::create_reservation_token();
+        let second = SmolvmDb::create_reservation_token();
+
+        assert!(db.reserve_vm_create("contested", &first).unwrap());
+        assert!(
+            !db.reserve_vm_create("contested", &second).unwrap(),
+            "second live creator must not reserve the same name"
+        );
+
+        db.release_vm_create_reservation("contested", &first)
+            .unwrap();
+        assert!(
+            db.reserve_vm_create("contested", &second).unwrap(),
+            "released reservation should make the name available"
+        );
     }
 
     #[test]

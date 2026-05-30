@@ -453,6 +453,86 @@ test_api_create_from_smolmachine() {
     rm -rf "$tmpdir"
 }
 
+# Regression test for the .smolmachine layer-drop bug. Unlike the /exec test
+# above (which runs in the base agent rootfs and passes even when the bundled
+# layers are dropped — a false negative), /run enters an overlay built from the
+# bundled image, so it requires the packed layers to be mounted into the guest.
+# The machine has no network, so /run cannot fall back to a registry pull: if the
+# start path drops packed_layers_dir, /run hard-fails "image not found". This is
+# RED on a start path that passes Default::default() and GREEN once the packed
+# layers are wired through. It also proves the image tag resolves *through* the
+# packed layers, not merely that packed_layers_dir is set.
+test_api_run_from_smolmachine_offline() {
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    local pack_output="$tmpdir/api-run-from-pack"
+
+    # Pack alpine:latest into a .smolmachine bundle.
+    $SMOLVM pack create --image alpine:latest -o "$pack_output" --cpus 1 --mem 512 2>&1 >/dev/null || {
+        echo "SKIP: pack create failed"
+        rm -rf "$tmpdir"
+        return 0
+    }
+    local sidecar
+    sidecar=$(cd "$tmpdir" && pwd)/api-run-from-pack.smolmachine
+    [[ -f "$sidecar" ]] || { echo "FAIL: no sidecar"; rm -rf "$tmpdir"; return 1; }
+
+    local vm_name="api-run-from-$$"
+
+    # Create from bundle (network defaults off → no registry fallback for /run).
+    local create_resp
+    create_resp=$("${CURL[@]}" -s -X POST "$API_URL/api/v1/machines" \
+        -H "Content-Type: application/json" \
+        -d "{\"name\": \"$vm_name\", \"from\": \"$sidecar\", \"memoryMb\": 512}")
+    echo "$create_resp" | grep -q "$vm_name" || {
+        echo "FAIL: create response missing name: $create_resp"
+        rm -rf "$tmpdir"; return 1
+    }
+
+    # Start
+    local start_resp
+    start_resp=$("${CURL[@]}" -s -X POST "$API_URL/api/v1/machines/$vm_name/start")
+    echo "$start_resp" | grep -q "running" || {
+        echo "FAIL: start failed: $start_resp"
+        "${CURL[@]}" -s -X DELETE "$API_URL/api/v1/machines/$vm_name" >/dev/null
+        rm -rf "$tmpdir"; return 1
+    }
+
+    # Bug 1 (layer-drop on start): /run the bundled image offline. Reaches the
+    # guest's image overlay, which needs the packed layers mounted.
+    local run_resp
+    run_resp=$("${CURL[@]}" -s -X POST "$API_URL/api/v1/machines/$vm_name/run" \
+        -H "Content-Type: application/json" \
+        -d '{"image": "alpine:latest", "command": ["cat", "/etc/os-release"]}')
+
+    # Bug 2 (eager sidecar extraction on the running-VM preflight): remove the
+    # .smolmachine while the VM is running, then exercise the implicit-start
+    # preflight again. The running guest already has its layers mounted, so
+    # losing the original bundle must NOT fail the request.
+    rm -f "$sidecar"
+    local rerun_resp
+    rerun_resp=$("${CURL[@]}" -s -X POST "$API_URL/api/v1/machines/$vm_name/run" \
+        -H "Content-Type: application/json" \
+        -d '{"image": "alpine:latest", "command": ["true"]}')
+
+    "${CURL[@]}" -s -X POST "$API_URL/api/v1/machines/$vm_name/stop" >/dev/null
+    "${CURL[@]}" -s -X DELETE "$API_URL/api/v1/machines/$vm_name" >/dev/null
+    rm -rf "$tmpdir"
+
+    if echo "$run_resp" | grep -qi "image not found"; then
+        echo "FAIL: bundled layers were dropped on start — /run could not find the image offline: $run_resp"
+        return 1
+    fi
+    echo "$run_resp" | grep -qi "alpine" || {
+        echo "FAIL: /run did not enter the bundled image overlay: $run_resp"
+        return 1
+    }
+    if echo "$rerun_resp" | grep -qi "source .smolmachine not found"; then
+        echo "FAIL: running-VM preflight re-extracted the .smolmachine and failed after the bundle was removed: $rerun_resp"
+        return 1
+    fi
+}
+
 test_api_from_and_image_conflict() {
     local resp
     resp=$("${CURL[@]}" -s -X POST "$API_URL/api/v1/machines" \
@@ -480,6 +560,7 @@ echo "--- Create from .smolmachine via API ---"
 echo ""
 
 run_test "API: create from .smolmachine" test_api_create_from_smolmachine || true
+run_test "API: run from .smolmachine (offline)" test_api_run_from_smolmachine_offline || true
 run_test "API: from + image conflict" test_api_from_and_image_conflict || true
 run_test "API: from nonexistent sidecar" test_api_from_nonexistent_sidecar || true
 

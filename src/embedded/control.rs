@@ -114,6 +114,13 @@ pub fn stop_vm(db: &SmolvmDb, name: &str) -> Result<()> {
         .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
     manager.try_connect_existing();
     manager.stop()?;
+    // Detach the per-machine layers volume if a (possibly cross-tool) bundle start
+    // left it mounted. Unconditional on purpose: the embedded record may carry no
+    // source_smolmachine even when a CLI/API `machine create <bundle>` extracted and
+    // mounted this name's volume in the shared DB, so we cannot gate on it.
+    // force_detach is infallible and no-ops when unmounted; macOS hdiutil detach, a
+    // compile-time no-op on Linux.
+    smolvm_pack::extract::force_detach_layers_volume(&crate::agent::machine_layers_cache_dir(name));
     mark_stopped(db, name)
 }
 
@@ -125,6 +132,13 @@ pub fn delete_vm(db: &SmolvmDb, name: &str) -> Result<()> {
     }
 
     let data_dir = crate::agent::vm_data_dir(name);
+    // Detach the per-machine layers volume before removing the data dir, else on
+    // macOS the live mountpoint under it makes remove_dir_all fail with "Resource
+    // busy", stranding both the mount and the data dir. Unconditional on purpose:
+    // the embedded record may carry no source_smolmachine even when a CLI/API create
+    // mounted this name's volume. hdiutil detach; a no-op on Linux and when nothing
+    // is mounted.
+    smolvm_pack::extract::force_detach_layers_volume(&crate::agent::machine_layers_cache_dir(name));
     if data_dir.exists() {
         std::fs::remove_dir_all(&data_dir).map_err(|e| {
             Error::storage(

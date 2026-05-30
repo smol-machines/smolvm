@@ -114,6 +114,76 @@ pub struct LaunchFeatures {
     pub extra_disks: Vec<(std::path::PathBuf, bool)>,
 }
 
+impl LaunchFeatures {
+    /// Wire pre-extracted OCI layers for a machine created from a `.smolmachine`.
+    ///
+    /// `layers_cache_dir` is the machine's OWN extraction directory (under its
+    /// [`vm_data_dir`](crate::agent::vm_data_dir), via
+    /// [`machine_layers_cache_dir`](crate::agent::machine_layers_cache_dir)), not
+    /// the shared content-addressed pack cache. The bundle is extracted there
+    /// once at create time, so every subsequent start is independent of the
+    /// original `.smolmachine` file. When `source_smolmachine` is `None` the
+    /// machine is image/registry-sourced and `self` is returned unchanged.
+    ///
+    /// Normal path: the layers are already extracted, so this only acquires a
+    /// lease (re-mounting the case-sensitive volume on macOS; a no-op on Linux)
+    /// and points `packed_layers_dir` at it — no dependency on the sidecar.
+    /// Fallback path: if the per-machine directory has no extracted layers (a
+    /// machine created before this layout, or an interrupted create), extract
+    /// from the `source_smolmachine` sidecar, which must still exist in that case.
+    ///
+    /// This is the single source of truth shared by every start path — the CLI
+    /// `machine start` and the API start/ensure/restart handlers — so they
+    /// cannot drift apart and silently drop the bundled layers.
+    ///
+    /// Performs blocking filesystem work; on async paths call it from within a
+    /// `spawn_blocking` context.
+    pub fn with_packed_layers(
+        mut self,
+        layers_cache_dir: &Path,
+        source_smolmachine: Option<&str>,
+    ) -> Result<Self> {
+        let Some(sidecar_path) = source_smolmachine else {
+            return Ok(self);
+        };
+
+        if !smolvm_pack::extract::is_extracted(layers_cache_dir) {
+            // Fallback: layers not yet extracted into this machine's own dir
+            // (pre-this-layout machine, or an interrupted create). Extract from
+            // the source bundle, which must still be present in that case.
+            let sidecar = Path::new(sidecar_path);
+            if !sidecar.exists() {
+                return Err(Error::agent(
+                    "start machine",
+                    format!(
+                        "packed layers are not extracted for this machine and its \
+                         source .smolmachine is missing: {}\nRe-create the machine \
+                         from the bundle.",
+                        sidecar_path
+                    ),
+                ));
+            }
+            let footer = smolvm_pack::packer::read_footer_from_sidecar(sidecar)
+                .map_err(|e| Error::agent("read sidecar footer", e.to_string()))?;
+            smolvm_pack::extract::extract_sidecar(sidecar, layers_cache_dir, &footer, false, false)
+                .map_err(|e| Error::agent("extract sidecar", e.to_string()))?;
+        }
+
+        let layers_lease = smolvm_pack::extract::acquire_layers_lease(layers_cache_dir, false)
+            .map_err(|e| Error::agent("acquire layers lease", e.to_string()))?;
+        self.packed_layers_dir = Some(layers_lease.path.clone());
+        // Leak the lease so the case-sensitive layers volume stays mounted for
+        // the VM's lifetime (macOS only; a no-op on Linux). Unlike the previous
+        // shared-cache design, this volume is owned 1:1 by the machine: the stop
+        // and delete handlers detach it unconditionally via
+        // `force_detach_layers_volume`, so no co-tenant can be relying on it and
+        // no lease outlives the machine.
+        std::mem::forget(layers_lease);
+
+        Ok(self)
+    }
+}
+
 /// Configuration for launching an agent VM.
 pub struct LaunchConfig<'a> {
     /// Path to the agent rootfs directory.
@@ -702,6 +772,27 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                         "krun_add_virtiofs failed for packed layers",
                     ));
                 }
+            } else {
+                // packed_layers_dir was set — which only happens after
+                // `with_packed_layers` acquired the lease — but the directory is
+                // not on disk at mount time. On macOS that means the per-machine
+                // case-sensitive layers volume isn't mounted (e.g. a concurrent
+                // stop/delete detached it). Mounting nothing would silently fall
+                // the guest back to a registry pull and break offline runs, and the
+                // launcher has no path to re-extract or re-mount here. Rather than
+                // boot a VM that is doomed to fail offline, free the context and
+                // fail fast with an actionable error.
+                krun_free_ctx(ctx);
+                return Err(Error::agent(
+                    "add packed layers virtiofs",
+                    format!(
+                        "packed layers directory not found at {}: this machine's \
+                         layers volume is not mounted, so the guest cannot use its \
+                         bundled image and an offline run would fail. Restart the \
+                         machine, or re-create it from the .smolmachine bundle.",
+                        layers_dir.display()
+                    ),
+                ));
             }
         }
 

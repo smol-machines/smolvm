@@ -27,6 +27,28 @@ pub struct ApiState {
     /// Reserved machine names (creation in progress).
     /// This prevents race conditions during machine creation.
     reserved_names: RwLock<HashSet<String>>,
+    /// Per-machine lifecycle locks serializing start/stop/delete/restart.
+    ///
+    /// On macOS, stop/delete `hdiutil`-detach a machine's case-sensitive
+    /// packed-layers volume while a concurrent start acquires+mounts+launches
+    /// against it. Without exclusion a detach can pull the volume out from under
+    /// a freshly-launched VM serving it over virtiofs, or a guest launched in the
+    /// detach window hits the launcher's missing-dir error (review finding #3).
+    /// Each lifecycle handler `.lock().await`s this per-name async mutex as its
+    /// outermost lock — before any DB read or `MachineEntry` mutex — and holds it
+    /// for the whole operation, so mount and detach can never interleave for one
+    /// machine. Lock order is lifecycle (tokio, async) → entry (parking_lot,
+    /// inside `spawn_blocking`); no entry-holding path ever takes lifecycle, so
+    /// there is no inversion. On Linux the guarded detach/mount are compile-time
+    /// no-ops, making this harmless serialization. Scope: the API server only —
+    /// the embedded (`control.rs`) and CLI (`vm_common.rs`) paths are separate
+    /// processes with no shared in-process lock.
+    ///
+    /// Entries are created on first use and never removed: the map is bounded by
+    /// the number of distinct machine names, so a retained `Arc<Mutex<()>>` per
+    /// deleted name is negligible, and never removing avoids handing two callers
+    /// different mutexes for the same name (which would defeat the exclusion).
+    lifecycle_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Database for persistent state.
     db: SmolvmDb,
     /// Previous CPU samples per VM PID, used to compute the fractional-CPU
@@ -48,6 +70,11 @@ pub struct MachineEntry {
     pub restart: RestartConfig,
     /// Whether outbound network access is enabled.
     pub network: bool,
+    /// Path to the `.smolmachine` sidecar this machine was created from, if any.
+    /// When set, the start paths mount the bundle's pre-extracted OCI layers via
+    /// virtiofs instead of having the guest pull from a registry. `None` for
+    /// image/registry-sourced machines. Mirrors `VmRecord::source_smolmachine`.
+    pub source_smolmachine: Option<String>,
 }
 
 /// Parameters for registering a new machine.
@@ -97,16 +124,19 @@ pub struct MachineRegistration {
 pub struct ReservationGuard<'a> {
     state: &'a ApiState,
     name: String,
+    token: String,
     completed: bool,
 }
 
 impl<'a> ReservationGuard<'a> {
     /// Reserve a machine name. Returns a guard that auto-releases on drop.
     pub fn new(state: &'a ApiState, name: String) -> Result<Self, ApiError> {
-        state.reserve_machine_name(&name)?;
+        let token = SmolvmDb::create_reservation_token();
+        state.reserve_machine_name(&name, &token)?;
         Ok(Self {
             state,
             name,
+            token,
             completed: false,
         })
     }
@@ -120,18 +150,18 @@ impl<'a> ReservationGuard<'a> {
     ///
     /// This transfers ownership of the name to the machine registry.
     pub fn complete(mut self, registration: MachineRegistration) -> Result<(), ApiError> {
-        // Mark as completed before calling complete_machine_registration
-        // (which will remove from reservations internally)
-        self.completed = true;
         self.state
-            .complete_machine_registration(self.name.clone(), registration)
+            .complete_machine_registration(self.name.clone(), &self.token, registration)?;
+        self.completed = true;
+        Ok(())
     }
 }
 
 impl Drop for ReservationGuard<'_> {
     fn drop(&mut self) {
         if !self.completed {
-            self.state.release_machine_reservation(&self.name);
+            self.state
+                .release_machine_reservation(&self.name, &self.token);
             tracing::debug!(machine = %self.name, "reservation guard released on drop");
         }
     }
@@ -151,6 +181,7 @@ impl ApiState {
         Ok(Self {
             machines: RwLock::new(HashMap::new()),
             reserved_names: RwLock::new(HashSet::new()),
+            lifecycle_locks: RwLock::new(HashMap::new()),
             db,
             cpu_samples: parking_lot::Mutex::new(HashMap::new()),
         })
@@ -163,6 +194,7 @@ impl ApiState {
         Self {
             machines: RwLock::new(HashMap::new()),
             reserved_names: RwLock::new(HashSet::new()),
+            lifecycle_locks: RwLock::new(HashMap::new()),
             db,
             cpu_samples: parking_lot::Mutex::new(HashMap::new()),
         }
@@ -255,6 +287,7 @@ impl ApiState {
                             resources,
                             restart: record.restart.clone(),
                             network: record.network,
+                            source_smolmachine: record.source_smolmachine.clone(),
                         })),
                     );
                     loaded.push(name.clone());
@@ -281,6 +314,28 @@ impl ApiState {
             .get(name)
             .cloned()
             .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))
+    }
+
+    /// Get the per-machine lifecycle lock for `name`, creating it on first use.
+    ///
+    /// Callers `.lock().await` the returned mutex at the top of
+    /// start/stop/delete/restart and hold the guard for the whole operation so
+    /// the macOS layers-volume mount (start) and detach (stop/delete) can never
+    /// interleave for one machine. See the `lifecycle_locks` field docs for the
+    /// lock-ordering and scope contract.
+    pub fn lifecycle_lock(&self, name: &str) -> Arc<tokio::sync::Mutex<()>> {
+        // Fast path: the lock already exists (the common case after first use).
+        if let Some(lock) = self.lifecycle_locks.read().get(name) {
+            return lock.clone();
+        }
+        // Slow path: create it under the write lock. `or_insert_with` collapses
+        // the race where two callers reach here for the same name concurrently —
+        // both end up with the same `Arc`, preserving mutual exclusion.
+        self.lifecycle_locks
+            .write()
+            .entry(name.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// Remove a machine from the registry (also removes from database).
@@ -488,7 +543,7 @@ impl ApiState {
     /// - `release_machine_reservation()` is called (failure/cleanup)
     ///
     /// Returns `Err(Conflict)` if the name is already taken or reserved.
-    pub fn reserve_machine_name(&self, name: &str) -> Result<(), ApiError> {
+    pub fn reserve_machine_name(&self, name: &str, token: &str) -> Result<(), ApiError> {
         // First check: machine existence (early exit for common case).
         // Use separate scope to release read lock before acquiring write lock.
         // This prevents lock-order inversion with complete_machine_registration.
@@ -522,16 +577,23 @@ impl ApiState {
             )));
         }
 
-        // Also check database for persisted machines not yet loaded
-        if let Ok(Some(_)) = self.db.get_vm(name) {
-            return Err(ApiError::Conflict(format!(
-                "machine '{}' already exists in database",
-                name
-            )));
+        reserved.insert(name.to_string());
+
+        match self.db.reserve_vm_create(name, token) {
+            Ok(true) => {}
+            Ok(false) => {
+                reserved.remove(name);
+                return Err(ApiError::Conflict(format!(
+                    "machine '{}' already exists or is being created",
+                    name
+                )));
+            }
+            Err(e) => {
+                reserved.remove(name);
+                return Err(ApiError::database(e));
+            }
         }
 
-        // Reserve the name
-        reserved.insert(name.to_string());
         tracing::debug!(machine = %name, "reserved machine name");
         Ok(())
     }
@@ -539,10 +601,13 @@ impl ApiState {
     /// Release a machine name reservation.
     ///
     /// Call this if machine creation fails after `reserve_machine_name()`.
-    pub fn release_machine_reservation(&self, name: &str) {
+    pub fn release_machine_reservation(&self, name: &str, token: &str) {
         let mut reserved = self.reserved_names.write();
         if reserved.remove(name) {
             tracing::debug!(machine = %name, "released machine name reservation");
+        }
+        if let Err(e) = self.db.release_vm_create_reservation(name, token) {
+            tracing::warn!(machine = %name, error = %e, "failed to release DB create reservation");
         }
     }
 
@@ -553,17 +618,9 @@ impl ApiState {
     pub fn complete_machine_registration(
         &self,
         name: String,
+        token: &str,
         reg: MachineRegistration,
     ) -> Result<(), ApiError> {
-        // Remove from reservations
-        {
-            let mut reserved = self.reserved_names.write();
-            if !reserved.remove(&name) {
-                // Name wasn't reserved - this is a programming error
-                tracing::warn!(machine = %name, "completing registration for non-reserved name");
-            }
-        }
-
         // Persist to database (with conflict detection)
         let mut record = VmRecord::new_with_restart(
             name.clone(),
@@ -582,15 +639,23 @@ impl ApiState {
         record.storage_gb = reg.resources.storage_gb;
         record.overlay_gb = reg.resources.overlay_gb;
         record.image = reg.image;
-        record.source_smolmachine = reg.source_smolmachine;
+        record.source_smolmachine = reg.source_smolmachine.clone();
         record.entrypoint = reg.entrypoint;
         record.cmd = reg.cmd;
         record.env = reg.env;
         record.workdir = reg.workdir;
 
-        // Use insert_vm_if_not_exists for atomic database insert
-        match self.db.insert_vm_if_not_exists(&name, &record) {
+        // Complete the cross-process create reservation and insert the VM row
+        // atomically. Only after that succeeds do we publish the in-memory entry.
+        match self.db.commit_reserved_vm(&name, token, &record) {
             Ok(true) => {
+                {
+                    let mut reserved = self.reserved_names.write();
+                    if !reserved.remove(&name) {
+                        // Name wasn't reserved - this is a programming error
+                        tracing::warn!(machine = %name, "completing registration for non-reserved name");
+                    }
+                }
                 // Successfully inserted, now add to in-memory registry
                 let mut machines = self.machines.write();
                 machines.insert(
@@ -602,14 +667,15 @@ impl ApiState {
                         resources: reg.resources,
                         restart: reg.restart,
                         network: reg.network,
+                        source_smolmachine: reg.source_smolmachine,
                     })),
                 );
                 Ok(())
             }
             Ok(false) => {
-                // Name already exists in database (shouldn't happen with reservation)
+                // Name already exists or the DB reservation was lost.
                 Err(ApiError::Conflict(format!(
-                    "machine '{}' already exists in database",
+                    "machine '{}' already exists or is no longer reserved",
                     name
                 )))
             }
@@ -758,11 +824,43 @@ where
 // Shared Machine Helpers
 // ============================================================================
 
+/// Build `LaunchFeatures` for an API-driven machine start.
+///
+/// Thin wrapper over [`crate::agent::LaunchFeatures::with_packed_layers`]
+/// — the single source of truth shared with the CLI and embedded start paths.
+/// When the machine was created from a `.smolmachine` artifact
+/// (`source_smolmachine` is set), its pre-extracted OCI layers — extracted into
+/// the machine's own data dir at create time, keyed by `machine_name` — are
+/// mounted via virtiofs so the guest uses them instead of pulling from a
+/// registry; otherwise default features are returned. Without it the three API
+/// start entrypoints (`start_machine`, `ensure_machine_running`, supervisor
+/// restart) would pass `packed_layers_dir = None` and the guest would fall back
+/// to a network pull. Performs blocking filesystem work — call from within a
+/// `spawn_blocking` context.
+pub fn build_launch_features(
+    machine_name: Option<&str>,
+    source_smolmachine: Option<&str>,
+) -> crate::Result<crate::agent::LaunchFeatures> {
+    let features = crate::agent::LaunchFeatures::default();
+    match machine_name {
+        Some(name) => features.with_packed_layers(
+            &crate::agent::machine_layers_cache_dir(name),
+            source_smolmachine,
+        ),
+        None => Ok(features),
+    }
+}
+
 /// Ensure a machine is running, starting it if needed.
 ///
 /// This is the shared preflight check used by exec, container, and image handlers.
 /// It converts the machine's mount/port/resource config and calls
 /// `ensure_running_with_full_config` in a blocking task.
+///
+/// On the not-already-up path this mounts the machine's macOS layers volume, so
+/// callers MUST hold the per-machine lifecycle lock (see `ensure_running_and_persist`,
+/// the only caller) for the duration, or the mount can race a concurrent
+/// stop/delete detach (review finding #3).
 pub async fn ensure_machine_running(
     entry: &Arc<parking_lot::Mutex<MachineEntry>>,
 ) -> crate::Result<()> {
@@ -778,12 +876,28 @@ pub async fn ensure_machine_running(
         let resources = resource_spec_to_vm_resources(&entry.resources, entry.network);
 
         // Use subprocess launch to avoid macOS fork-in-multithreaded-process issue.
-        entry.manager.ensure_running_via_subprocess(
-            mounts,
-            ports,
-            resources,
-            Default::default(),
-        )?;
+        //
+        // Build the packed-layers features only when the VM is not already up.
+        // This preflight runs on every implicit-start request (exec/run/files/
+        // images); when the VM is already running `ensure_running_via_subprocess`
+        // returns early (discarding `features`) as long as the mount/port/resource
+        // config is unchanged. Acquiring the layers lease on that hot path is
+        // wasted work — on macOS it re-mounts the case-sensitive volume via
+        // hdiutil — so gate it on the same already-running check.
+        //
+        // The gated `default()` is safe across the relaunch branch too: if the
+        // preflight detects a mount/port/resource change and restarts the VM,
+        // `ensure_running_via_subprocess` re-attaches this machine's pre-extracted
+        // packed layers itself (see `rewire_packed_layers_if_extracted`), so the
+        // restart keeps using them instead of falling back to a registry pull.
+        let features = if entry.manager.try_connect_existing().is_some() {
+            crate::agent::LaunchFeatures::default()
+        } else {
+            build_launch_features(entry.manager.name(), entry.source_smolmachine.as_deref())?
+        };
+        entry
+            .manager
+            .ensure_running_via_subprocess(mounts, ports, resources, features)?;
         Ok(())
     })
     .await
@@ -800,6 +914,17 @@ pub async fn ensure_running_and_persist(
     name: &str,
     entry: &Arc<parking_lot::Mutex<MachineEntry>>,
 ) -> crate::Result<()> {
+    // Hold the per-machine lifecycle lock across the implicit-start preflight.
+    // ensure_machine_running mounts the macOS layers volume (via with_packed_layers)
+    // when the VM is not already up — exactly like the explicit start_machine — so
+    // it must exclude against a concurrent stop/delete detach the same way (review
+    // finding #3 covers "start/ensure"). Acquired before ensure_machine_running's
+    // spawn_blocking takes the entry mutex, preserving the lifecycle → entry order;
+    // released before the caller's actual exec/file/image op, which neither mounts
+    // nor detaches. On Linux the guarded mount is a no-op, so this is harmless.
+    let lifecycle = state.lifecycle_lock(name);
+    let _guard = lifecycle.lock().await;
+
     ensure_machine_running(entry).await?;
 
     let pid = {
@@ -1047,7 +1172,8 @@ mod tests {
         );
 
         // Name should be available for reuse
-        assert!(state.reserve_machine_name("dead-machine").is_ok());
+        let token = SmolvmDb::create_reservation_token();
+        assert!(state.reserve_machine_name("dead-machine", &token).is_ok());
     }
 
     #[test]

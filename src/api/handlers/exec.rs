@@ -477,14 +477,14 @@ pub async fn exec_interactive(
         let input_pump = tokio::spawn(async move {
             while let Some(Ok(msg)) = ws_rx.next().await {
                 match msg {
-                    Message::Binary(b) => {
+                    Message::Binary(b)
                         if in_tx
                             .send(crate::agent::InteractiveInput::Stdin(b.to_vec()))
-                            .is_err()
-                        {
-                            break;
-                        }
+                            .is_err() =>
+                    {
+                        break;
                     }
+                    Message::Binary(_) => {}
                     Message::Text(t) => {
                         // Control frames are JSON; anything else is treated as raw stdin.
                         match serde_json::from_str::<serde_json::Value>(t.as_str()) {

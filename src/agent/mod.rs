@@ -21,8 +21,8 @@ pub use client::{
 pub use krun::KrunFunctions;
 pub use launcher::{find_lib_dir, launch_agent_vm, LaunchConfig, LaunchFeatures, VmDisks};
 pub use manager::{
-    docker_config_dir, docker_config_mount, ensure_vm_dir, vm_cache_root, vm_data_dir, vm_dir_hash,
-    AgentManager, AgentState,
+    docker_config_dir, docker_config_mount, ensure_vm_dir, machine_layers_cache_dir, vm_cache_root,
+    vm_data_dir, vm_dir_hash, AgentManager, AgentState,
 };
 
 /// Agent VM name.

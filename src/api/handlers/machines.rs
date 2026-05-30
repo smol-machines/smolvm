@@ -131,6 +131,7 @@ fn machine_entry_from_record(record: &VmRecord, manager: AgentManager) -> Machin
         resources: vm_resources_to_spec(record.vm_resources()),
         restart: record.restart.clone(),
         network: record.network,
+        source_smolmachine: record.source_smolmachine.clone(),
     }
 }
 
@@ -257,12 +258,8 @@ pub async fn create_machine(
         }
         let manifest = smolvm_pack::packer::read_manifest_from_sidecar(path)
             .map_err(|e| ApiError::internal(format!("read .smolmachine: {}", e)))?;
-        let footer = smolvm_pack::packer::read_footer_from_sidecar(path)
-            .map_err(|e| ApiError::internal(format!("read sidecar footer: {}", e)))?;
-        let cache_dir = smolvm_pack::extract::get_cache_dir(footer.checksum)
-            .map_err(|e| ApiError::internal(format!("get cache dir: {}", e)))?;
-        smolvm_pack::extract::extract_sidecar(path, &cache_dir, &footer, false, false)
-            .map_err(|e| ApiError::internal(format!("extract sidecar: {}", e)))?;
+        // Extraction happens after the agent manager creates this machine's data
+        // dir (below), so the layers land in the machine's own dir, not here.
         let canonical = path
             .canonicalize()
             .unwrap_or_else(|_| path.to_path_buf())
@@ -324,6 +321,59 @@ pub async fn create_machine(
     .await
     .map_err(|e| ApiError::internal(format!("task error: {}", e)))??;
 
+    // Extract the bundle's OCI layers into this machine's own data dir (created
+    // by the manager above) rather than the shared pack cache, so every start is
+    // independent of the .smolmachine file surviving and the macOS layers volume
+    // is owned 1:1 by the machine. Extraction mounts the case-sensitive volume on
+    // macOS; detach it immediately so a created-but-unstarted machine leaves
+    // nothing mounted (invariant: the per-machine layers volume is mounted iff
+    // the VM is running). The name was reserved above, so this never clobbers
+    // another machine's layers.
+    if let Some(ref sidecar_path) = source_smolmachine {
+        let name = name.clone();
+        let sidecar_path = sidecar_path.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), ApiError> {
+            let path = std::path::Path::new(&sidecar_path);
+            let cache_dir = crate::agent::machine_layers_cache_dir(&name);
+            let result = (|| {
+                smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
+                match std::fs::remove_dir_all(&cache_dir) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        return Err(ApiError::internal(format!(
+                            "clear packed layers cache: {}",
+                            e
+                        )));
+                    }
+                }
+                let footer = smolvm_pack::packer::read_footer_from_sidecar(path)
+                    .map_err(|e| ApiError::internal(format!("read sidecar footer: {}", e)))?;
+                smolvm_pack::extract::extract_sidecar(path, &cache_dir, &footer, false, false)
+                    .map_err(|e| ApiError::internal(format!("extract sidecar: {}", e)))
+            })();
+            // Detach the case-sensitive volume mounted during extraction so a
+            // created-but-unstarted machine leaves nothing mounted, and so the
+            // rollback below can remove the data dir cleanly (macOS; no-op on Linux).
+            smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
+            if let Err(e) = result {
+                // Extraction failed after the manager created the machine's data
+                // dir. guard.complete() will not run, so no DB record persists and
+                // the name is released on drop — but the on-disk dir would be left
+                // orphaned. Roll it back so a retry starts clean. Best-effort: a
+                // remove failure only leaves the orphan, never a worse state.
+                // cache_dir is <vm_data_dir>/pack, so its parent is the data dir.
+                if let Some(vm_dir) = cache_dir.parent() {
+                    let _ = std::fs::remove_dir_all(vm_dir);
+                }
+                return Err(e);
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("task error: {}", e)))??;
+    }
+
     let resources = ResourceSpec {
         cpus: Some(cpus),
         memory_mb: Some(mem),
@@ -335,7 +385,7 @@ pub async fn create_machine(
     };
 
     // Complete registration: persists to DB + registers in ApiState
-    guard.complete(MachineRegistration {
+    let complete_result = guard.complete(MachineRegistration {
         manager,
         mounts: req.mounts.clone(),
         ports: req.ports.clone(),
@@ -363,7 +413,24 @@ pub async fn create_machine(
         cmd,
         env,
         workdir,
-    })?;
+    });
+    if let Err(e) = complete_result {
+        let data_dir = vm_data_dir(&name);
+        smolvm_pack::extract::force_detach_layers_volume(&crate::agent::machine_layers_cache_dir(
+            &name,
+        ));
+        if let Err(remove_err) = std::fs::remove_dir_all(&data_dir) {
+            if remove_err.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    machine = %name,
+                    dir = %data_dir.display(),
+                    error = %remove_err,
+                    "failed to remove machine data dir after create commit failure"
+                );
+            }
+        }
+        return Err(e);
+    }
 
     // Fetch the persisted record for the response
     let db = state.db();
@@ -443,6 +510,16 @@ pub async fn start_machine(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
 ) -> Result<Json<MachineInfo>, ApiError> {
+    // Hold the per-machine lifecycle lock across the whole start so a concurrent
+    // stop/delete cannot detach the macOS layers volume between our acquire+mount
+    // and the launch, nor launch a guest into the launcher's missing-dir error
+    // (review finding #3). Acquired before the DB read and resolve_state probe
+    // below so the "is it running?" decision and the launch happen under one held
+    // lock; it is the outermost lock (the entry mutex is taken later, inside the
+    // spawn_blocking). Linux: the guarded detach/mount are no-ops.
+    let lifecycle = state.lifecycle_lock(&name);
+    let _guard = lifecycle.lock().await;
+
     // Get VM record from database
     let db = state.db();
     let record = db
@@ -511,12 +588,19 @@ pub async fn start_machine(
     let name_clone = name.clone();
     let storage_gb = record.storage_gb;
     let overlay_gb = record.overlay_gb;
+    let source_smolmachine = record.source_smolmachine.clone();
     let (manager, pid) = tokio::task::spawn_blocking(move || {
         let manager = AgentManager::for_vm_with_sizes(&name_clone, storage_gb, overlay_gb)
             .map_err(|e| format!("failed to create agent manager: {}", e))?;
 
+        // Wire pre-extracted layers if this machine was created from a .smolmachine.
+        let features = crate::api::state::build_launch_features(
+            Some(&name_clone),
+            source_smolmachine.as_deref(),
+        )
+        .map_err(|e| format!("failed to prepare packed layers: {}", e))?;
         let _ = manager
-            .ensure_running_via_subprocess(mounts, ports, resources, Default::default())
+            .ensure_running_via_subprocess(mounts, ports, resources, features)
             .map_err(|e| format!("failed to start machine: {}", e))?;
 
         let pid = manager.child_pid();
@@ -575,6 +659,16 @@ pub async fn stop_machine(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
 ) -> Result<Json<MachineInfo>, ApiError> {
+    // Hold the per-machine lifecycle lock across the whole stop so the layers
+    // volume detach below cannot race a concurrent start's acquire+mount+launch
+    // (review finding #3). Acquired before the DB read and actual_state() probe
+    // so the liveness check and the detach act on the same held lock — without
+    // it, stop could decide "running" off a snapshot a concurrent start has
+    // already superseded, then detach a volume that start just mounted. Outermost
+    // lock; the entry mutex is not taken here. Linux: detach is a no-op.
+    let lifecycle = state.lifecycle_lock(&name);
+    let _guard = lifecycle.lock().await;
+
     // Get VM record from database
     let db = state.db();
     let record = db
@@ -585,7 +679,23 @@ pub async fn stop_machine(
     // Check state
     let actual_state = record.actual_state();
     if actual_state != RecordState::Running {
-        // Already stopped, just return current info
+        // Not running. If a prior start mounted the layers volume but the VM
+        // then failed to boot (or the server crashed while running), the volume
+        // could still be mounted — detach it so a stopped machine never holds a
+        // mount (invariant: the per-machine layers volume is mounted iff the VM
+        // is running). Safe: actual_state() probed liveness, so the process is
+        // confirmed dead and nothing is using the volume. macOS hdiutil detach;
+        // a no-op on Linux.
+        if record.source_smolmachine.is_some() {
+            let name_clone = name.clone();
+            tokio::task::spawn_blocking(move || {
+                smolvm_pack::extract::force_detach_layers_volume(
+                    &crate::agent::machine_layers_cache_dir(&name_clone),
+                );
+            })
+            .await
+            .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
+        }
         return Ok(Json(record_to_info(&name, &record)));
     }
 
@@ -599,7 +709,7 @@ pub async fn stop_machine(
     let entry = state.get_machine(&name).ok();
     let name_clone = name.clone();
     let stopped = tokio::task::spawn_blocking(move || {
-        if let Some(ref entry) = entry {
+        let ok = if let Some(ref entry) = entry {
             let e = entry.lock();
             match e.manager.stop() {
                 Ok(()) => true,
@@ -610,7 +720,17 @@ pub async fn stop_machine(
             }
         } else {
             shutdown_machine_process(&name_clone, pid, pid_start_time)
+        };
+        if ok {
+            // Process is gone — detach this machine's case-sensitive layers
+            // volume (macOS hdiutil mount; no-op on Linux). The volume lives
+            // under the machine's own data dir and is owned 1:1 by it, so the
+            // detach is unconditional and re-acquired on the next start.
+            smolvm_pack::extract::force_detach_layers_volume(
+                &crate::agent::machine_layers_cache_dir(&name_clone),
+            );
         }
+        ok
     })
     .await
     .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
@@ -658,6 +778,15 @@ pub async fn delete_machine(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
 ) -> Result<Json<DeleteResponse>, ApiError> {
+    // Hold the per-machine lifecycle lock across the whole delete so the layers
+    // volume detach (before the data-dir removal) cannot race a concurrent
+    // start's acquire+mount+launch (review finding #3). Acquired before the DB
+    // read so the existence check, shutdown, detach, and removal all happen under
+    // one held lock. Outermost lock; the entry mutex is not taken here. Linux:
+    // detach is a no-op.
+    let lifecycle = state.lifecycle_lock(&name);
+    let _guard = lifecycle.lock().await;
+
     let db = state.db();
 
     // Check if VM exists and get its state
@@ -673,7 +802,17 @@ pub async fn delete_machine(
     // Stop if running (in blocking task)
     let name_clone = name.clone();
     let stopped = tokio::task::spawn_blocking(move || {
-        shutdown_machine_process(&name_clone, pid, pid_start_time)
+        let ok = shutdown_machine_process(&name_clone, pid, pid_start_time);
+        if ok {
+            // Process is gone — detach this machine's case-sensitive layers
+            // volume (macOS hdiutil mount; no-op on Linux) before the data dir is
+            // removed below, otherwise `rm -rf` fails with "Resource busy". The
+            // volume is owned 1:1 by this machine, so the detach is unconditional.
+            smolvm_pack::extract::force_detach_layers_volume(
+                &crate::agent::machine_layers_cache_dir(&name_clone),
+            );
+        }
+        ok
     })
     .await
     .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;

@@ -440,22 +440,83 @@ pub struct CreateVmParams {
 
 /// Create a named machine configuration (does not start it).
 pub fn create_vm(params: CreateVmParams) -> smolvm::Result<()> {
+    let record = build_vm_record(&params)?;
+    let reservation = CreateVmReservation::reserve(&params.name)?;
+    reservation.commit(&record)?;
+    print_create_success(&params);
+    Ok(())
+}
+
+/// Cross-process reservation held while a create operation prepares any
+/// name-derived on-disk state. Dropping it releases the DB reservation unless
+/// it was committed.
+pub(crate) struct CreateVmReservation {
+    db: SmolvmDb,
+    name: String,
+    token: String,
+    completed: bool,
+}
+
+impl CreateVmReservation {
+    pub(crate) fn reserve(name: &str) -> smolvm::Result<Self> {
+        let db = SmolvmDb::open()?;
+        let token = SmolvmDb::create_reservation_token();
+        if !db.reserve_vm_create(name, &token)? {
+            return Err(smolvm::Error::config(
+                "create machine",
+                format!("machine '{}' already exists or is being created", name),
+            ));
+        }
+        Ok(Self {
+            db,
+            name: name.to_string(),
+            token,
+            completed: false,
+        })
+    }
+
+    pub(crate) fn commit(mut self, record: &VmRecord) -> smolvm::Result<()> {
+        if !self
+            .db
+            .commit_reserved_vm(&self.name, &self.token, record)?
+        {
+            return Err(smolvm::Error::config(
+                "create machine",
+                format!(
+                    "machine '{}' already exists or is no longer reserved",
+                    self.name
+                ),
+            ));
+        }
+        self.completed = true;
+        Ok(())
+    }
+}
+
+impl Drop for CreateVmReservation {
+    fn drop(&mut self) {
+        if !self.completed {
+            if let Err(e) = self
+                .db
+                .release_vm_create_reservation(&self.name, &self.token)
+            {
+                tracing::warn!(
+                    machine = %self.name,
+                    error = %e,
+                    "failed to release DB create reservation"
+                );
+            }
+        }
+    }
+}
+
+pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecord> {
     // Validate name before touching the database. The on-disk layout uses
     // a hash-derived directory (see `vm_data_dir`), so the name itself has
     // no impact on socket path length — only character sanity + a generous
     // length cap are needed here.
     validate_vm_name(&params.name, "machine name")
         .map_err(|reason| smolvm::Error::config("create machine", reason))?;
-
-    let mut config = SmolvmConfig::load()?;
-
-    // Check if already exists
-    if config.get_vm(&params.name).is_some() {
-        return Err(smolvm::Error::config(
-            "create machine",
-            format!("machine '{}' already exists", params.name),
-        ));
-    }
 
     // Parse and validate volume mounts
     let mounts = HostMount::parse(&params.volume)?
@@ -473,6 +534,7 @@ pub fn create_vm(params: CreateVmParams) -> smolvm::Result<()> {
     let restart = smolvm::config::RestartConfig {
         policy: params
             .restart_policy
+            .clone()
             .unwrap_or(smolvm::config::RestartPolicy::Never),
         max_retries: params.restart_max_retries.unwrap_or(0),
         max_backoff_secs: params.restart_max_backoff_secs.unwrap_or(0),
@@ -512,9 +574,10 @@ pub fn create_vm(params: CreateVmParams) -> smolvm::Result<()> {
     record.dns_filter_hosts = params.dns_filter_hosts.clone();
     record.source_smolmachine = params.source_smolmachine.clone();
 
-    // Store in config (persisted immediately to database)
-    config.insert_vm(params.name.clone(), record)?;
+    Ok(record)
+}
 
+pub(crate) fn print_create_success(params: &CreateVmParams) {
     println!("Created machine: {}", params.name);
     println!("  CPUs: {}, Memory: {} MiB", params.cpus, params.mem);
     if !params.volume.is_empty() {
@@ -534,8 +597,6 @@ pub fn create_vm(params: CreateVmParams) -> smolvm::Result<()> {
         "Then use 'smolvm machine exec --name {} -- <command>' to run commands",
         params.name
     );
-
-    Ok(())
 }
 
 // ============================================================================
@@ -647,40 +708,20 @@ pub fn start_vm_named(
         None
     };
 
-    let mut features = smolvm::agent::LaunchFeatures {
+    // If the machine was created from a .smolmachine, this acquires a lease on
+    // the machine's own pre-extracted layers (extracted at create time) and sets
+    // packed_layers_dir so the launcher mounts them via virtiofs — the guest uses
+    // the pre-extracted layers instead of pulling, with no dependency on the
+    // original bundle file. Shared with the API and embedded start paths.
+    let features = smolvm::agent::LaunchFeatures {
         ssh_agent_socket,
         dns_filter_hosts: record.dns_filter_hosts.clone(),
-        packed_layers_dir: None,
-        extra_disks: Vec::new(),
-    };
-
-    // If machine was created from .smolmachine, extract layers to cache and
-    // mount via virtiofs so the agent uses pre-extracted layers instead of
-    // pulling from a registry.
-    if let Some(ref sidecar_path) = record.source_smolmachine {
-        let sidecar = std::path::Path::new(sidecar_path);
-        if !sidecar.exists() {
-            return Err(Error::agent(
-                "start machine",
-                format!(
-                    "source .smolmachine not found: {}\nThe file may have been moved or deleted.",
-                    sidecar_path
-                ),
-            ));
-        }
-        let footer = smolvm_pack::packer::read_footer_from_sidecar(sidecar)
-            .map_err(|e| Error::agent("read sidecar footer", e.to_string()))?;
-        let cache_dir = smolvm_pack::extract::get_cache_dir(footer.checksum)
-            .map_err(|e| Error::agent("get cache dir", e.to_string()))?;
-        smolvm_pack::extract::extract_sidecar(sidecar, &cache_dir, &footer, false, false)
-            .map_err(|e| Error::agent("extract sidecar", e.to_string()))?;
-        let layers_lease = smolvm_pack::extract::acquire_layers_lease(&cache_dir, false)
-            .map_err(|e| Error::agent("acquire layers lease", e.to_string()))?;
-        features.packed_layers_dir = Some(layers_lease.path.clone());
-        // Leak the lease — the volume must stay mounted while the VM runs.
-        // Cleanup happens via `pack prune` or on next `machine start`.
-        std::mem::forget(layers_lease);
+        ..Default::default()
     }
+    .with_packed_layers(
+        &smolvm::agent::machine_layers_cache_dir(name),
+        record.source_smolmachine.as_deref(),
+    )?;
 
     let _ = manager
         .ensure_running_with_full_config(mounts, ports, resources, features)
@@ -1052,6 +1093,14 @@ pub fn stop_vm_named(name: &str) -> smolvm::Result<()> {
     match resolved {
         RecordState::Unreachable => {
             cli_recover_if_unreachable(name);
+            // Process is gone — detach the layers volume so a non-running
+            // machine never holds a mount (invariant: mounted iff running).
+            // macOS hdiutil detach; a no-op on Linux.
+            if record.source_smolmachine.is_some() {
+                smolvm_pack::extract::force_detach_layers_volume(
+                    &smolvm::agent::machine_layers_cache_dir(name),
+                );
+            }
             println!("Stopped machine: {}", name);
             return Ok(());
         }
@@ -1059,6 +1108,15 @@ pub fn stop_vm_named(name: &str) -> smolvm::Result<()> {
             // fall through to the normal stop path
         }
         other => {
+            // Not running. If a prior start mounted the layers volume but the
+            // VM failed to boot, it could still be mounted — detach it. Safe:
+            // resolve_state() probed liveness, so the process is confirmed dead.
+            // macOS hdiutil detach; a no-op on Linux.
+            if record.source_smolmachine.is_some() {
+                smolvm_pack::extract::force_detach_layers_volume(
+                    &smolvm::agent::machine_layers_cache_dir(name),
+                );
+            }
             println!("Machine '{}' is not running (state: {})", name, other);
             return Ok(());
         }
@@ -1069,6 +1127,15 @@ pub fn stop_vm_named(name: &str) -> smolvm::Result<()> {
     let manager = AgentManager::for_vm(name)
         .map_err(|e| smolvm::Error::agent("create agent manager", e.to_string()))?;
     manager.stop()?;
+
+    // Detach the machine's case-sensitive layers volume now that its process is
+    // gone (macOS hdiutil mount; no-op on Linux). The volume is owned 1:1 by this
+    // machine, so the detach is safe and re-acquired on the next start.
+    if record.source_smolmachine.is_some() {
+        smolvm_pack::extract::force_detach_layers_volume(&smolvm::agent::machine_layers_cache_dir(
+            name,
+        ));
+    }
 
     config.update_vm(name, |r| {
         r.state = RecordState::Stopped;
@@ -1092,6 +1159,19 @@ pub fn stop_vm_default() -> smolvm::Result<()> {
 
     // Update database record if it exists
     if let Ok(mut config) = SmolvmConfig::load() {
+        // Detach the per-machine layers volume now that the process is gone, so a
+        // bundle-sourced default machine never holds a mount while stopped (macOS
+        // hdiutil; no-op on Linux). Gated on the record so non-bundle machines are
+        // untouched; the volume is owned 1:1 by "default" and re-acquired on start.
+        let is_bundle = config
+            .get_vm("default")
+            .map(|r| r.source_smolmachine.is_some())
+            .unwrap_or(false);
+        if is_bundle {
+            smolvm_pack::extract::force_detach_layers_volume(
+                &smolvm::agent::machine_layers_cache_dir("default"),
+            );
+        }
         config.update_vm("default", |r| {
             r.state = RecordState::Stopped;
             r.pid = None;
@@ -1164,20 +1244,17 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
     // Remove from config (persists immediately to database)
     config.remove_vm(name);
 
-    // If the machine was created from a .smolmachine sidecar, release the
-    // case-sensitive volume (macOS hdiutil mount). The lease was intentionally
-    // leaked with `std::mem::forget` at start time so the volume stayed
-    // mounted while the VM ran. On delete we must detach it, otherwise
-    // `rm -rf` of the pack cache fails with "Resource busy".
-    if let Some(ref sidecar_path) = record.source_smolmachine {
-        let sidecar = std::path::Path::new(sidecar_path);
-        if sidecar.exists() {
-            if let Ok(footer) = smolvm_pack::packer::read_footer_from_sidecar(sidecar) {
-                if let Ok(cache_dir) = smolvm_pack::extract::get_cache_dir(footer.checksum) {
-                    smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
-                }
-            }
-        }
+    // If the machine was created from a .smolmachine, detach its case-sensitive
+    // layers volume (macOS hdiutil mount; no-op on Linux) before removing the
+    // data dir below — otherwise the `rm -rf` fails with "Resource busy". The
+    // lease was intentionally leaked with `std::mem::forget` at start time so the
+    // volume stayed mounted while the VM ran. The volume lives under this
+    // machine's own data dir and is owned 1:1 by it, so the detach is
+    // unconditional and cannot affect any other machine.
+    if record.source_smolmachine.is_some() {
+        smolvm_pack::extract::force_detach_layers_volume(&smolvm::agent::machine_layers_cache_dir(
+            name,
+        ));
     }
 
     let data_dir = vm_data_dir(name);

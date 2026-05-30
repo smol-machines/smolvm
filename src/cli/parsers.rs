@@ -147,9 +147,13 @@ mod tests {
         // Resolve a well-known hostname — should return at least one IP
         let cidrs = resolve_host_to_cidrs("one.one.one.one").unwrap();
         assert!(!cidrs.is_empty());
-        // All results should be /32 CIDRs
+        // IPv4 results should be /32 CIDRs; IPv6 results should be /128 CIDRs.
         for cidr in &cidrs {
-            assert!(cidr.ends_with("/32"), "expected /32 CIDR, got {}", cidr);
+            assert!(
+                cidr.ends_with("/32") || cidr.ends_with("/128"),
+                "expected host CIDR, got {}",
+                cidr
+            );
         }
     }
 

@@ -181,6 +181,21 @@ pub fn vm_data_dir(name: &str) -> PathBuf {
     vm_cache_root().join(vm_dir_hash(name))
 }
 
+/// Per-machine extraction directory for a `.smolmachine` bundle's OCI layers.
+///
+/// Unlike the shared content-addressed pack cache (`smolvm-pack/<checksum>`),
+/// this lives *under* the machine's own [`vm_data_dir`], which means:
+/// - it is reclaimed for free when the data dir is removed on delete;
+/// - it is outside `pack prune`'s scope (never reaped while the machine exists);
+/// - the macOS case-sensitive layers volume is owned 1:1 by the machine, so the
+///   stop/delete paths can detach it unconditionally with no co-tenant risk.
+///
+/// The subdir is `pack` (deliberately not `layers`) so it cannot collide with
+/// the `layers/` subtree that `extract_sidecar` creates *inside* this directory.
+pub fn machine_layers_cache_dir(name: &str) -> PathBuf {
+    vm_data_dir(name).join("pack")
+}
+
 /// Cache root: `<cache_dir>/smolvm/vms/`.
 pub fn vm_cache_root() -> PathBuf {
     dirs::cache_dir()
@@ -790,6 +805,56 @@ impl AgentManager {
         self.ensure_running_with_full_config(mounts, Vec::new(), resources, Default::default())
     }
 
+    /// Re-attach this machine's pre-extracted packed layers if the caller did
+    /// not already wire them.
+    ///
+    /// The implicit-start preflight (`ensure_machine_running`) passes
+    /// `default()` features when the VM is already up, to skip the macOS hdiutil
+    /// mount on the exec hot path. If that preflight then detects a config
+    /// change and restarts, the relaunch would otherwise drop the packed layers
+    /// and the guest would fall back to a registry pull (broken offline). The
+    /// layers are discoverable from the machine name alone — derive the
+    /// per-machine directory, re-acquire the lease, and set `packed_layers_dir`.
+    /// A no-op when layers are already wired (an explicit-start path set
+    /// `packed_layers_dir` and its mount is still live), when this is not a named
+    /// machine, or when nothing was extracted (image/registry-sourced machine).
+    /// macOS mount cost only; a compile-time no-op on Linux.
+    fn rewire_packed_layers_if_extracted(
+        &self,
+        features: &mut launcher::LaunchFeatures,
+    ) -> Result<()> {
+        if features.packed_layers_dir.is_some() {
+            return Ok(());
+        }
+        let Some(name) = self.name.as_deref() else {
+            return Ok(());
+        };
+        let cache_dir = machine_layers_cache_dir(name);
+        if !smolvm_pack::extract::is_extracted(&cache_dir) {
+            return Ok(());
+        }
+        // This runs only on the relaunch path, after stop()/reset_stale_running_state,
+        // so no live VM is using the volume. The original start leaked a lease to keep
+        // it mounted; drop that stale mount (and its lease files) before acquiring a
+        // fresh one, so a config-change restart doesn't stack a second lease/mount on
+        // the first. Gated by the same conditions as the re-acquire below, so the
+        // explicit-start paths (features already `Some`, mount still live) return
+        // early above and never detach. macOS hdiutil detach; a no-op on Linux.
+        smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
+        match smolvm_pack::extract::acquire_layers_lease(&cache_dir, false) {
+            Ok(lease) => {
+                features.packed_layers_dir = Some(lease.path.clone());
+                // Keep the volume mounted for the VM's lifetime; the stop/delete
+                // handlers detach it (see `machine_layers_cache_dir`).
+                std::mem::forget(lease);
+            }
+            Err(e) => {
+                return Err(Error::agent("re-attach packed layers", e.to_string()));
+            }
+        }
+        Ok(())
+    }
+
     /// Ensure the agent is running with the specified mounts, ports, and resources.
     ///
     /// If the agent is running with different configuration, it will be restarted.
@@ -799,7 +864,7 @@ impl AgentManager {
         mounts: Vec<HostMount>,
         ports: Vec<PortMapping>,
         resources: VmResources,
-        features: launcher::LaunchFeatures,
+        mut features: launcher::LaunchFeatures,
     ) -> Result<bool> {
         // Check if agent is already running with the same configuration.
         // try_connect_existing restores config from disk on reconnect,
@@ -846,6 +911,10 @@ impl AgentManager {
             // Reset to Stopped so start_with_full_config can proceed.
             self.reset_stale_running_state();
         }
+
+        // Re-attach packed layers if a config-change restart dropped them
+        // (see `rewire_packed_layers_if_extracted`).
+        self.rewire_packed_layers_if_extracted(&mut features)?;
 
         // Start with new config
         self.start_with_full_config(mounts, ports, resources, features)?;
@@ -1237,7 +1306,7 @@ impl AgentManager {
         mounts: Vec<HostMount>,
         ports: Vec<PortMapping>,
         resources: VmResources,
-        features: launcher::LaunchFeatures,
+        mut features: launcher::LaunchFeatures,
     ) -> Result<bool> {
         // Check if agent is already running (same logic as ensure_running_with_full_config)
         if self.try_connect_existing().is_some() {
@@ -1274,6 +1343,10 @@ impl AgentManager {
         } else {
             self.reset_stale_running_state();
         }
+
+        // Re-attach packed layers if a config-change restart dropped them
+        // (see `rewire_packed_layers_if_extracted`).
+        self.rewire_packed_layers_if_extracted(&mut features)?;
 
         self.start_via_subprocess(mounts, ports, resources, features)?;
         Ok(true)
@@ -1752,5 +1825,51 @@ mod tests {
             std::fs::read_to_string(dir.join("name")).unwrap(),
             "first-vm",
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn rewire_packed_layers_returns_lease_failure() {
+        let temp = tempfile::tempdir().unwrap();
+
+        let name = format!(
+            "review-rewire-lease-failure-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        struct VmDataCleanup(String);
+        impl Drop for VmDataCleanup {
+            fn drop(&mut self) {
+                smolvm_pack::extract::force_detach_layers_volume(&machine_layers_cache_dir(
+                    &self.0,
+                ));
+                let _ = std::fs::remove_dir_all(vm_data_dir(&self.0));
+            }
+        }
+        let _cleanup = VmDataCleanup(name.clone());
+
+        let storage = StorageDisk::open_or_create_at(&temp.path().join("storage.img"), 1).unwrap();
+        let overlay = OverlayDisk::open_or_create_at(&temp.path().join("overlay.img"), 1).unwrap();
+        let manager =
+            AgentManager::new_named(&name, temp.path().join("rootfs"), storage, overlay).unwrap();
+
+        let cache_dir = machine_layers_cache_dir(&name);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(cache_dir.join(".smolvm-extracted"), "").unwrap();
+        std::fs::write(cache_dir.join("layers-cs.sparseimage"), b"not a disk image").unwrap();
+
+        let mut features = launcher::LaunchFeatures::default();
+        let err = manager
+            .rewire_packed_layers_if_extracted(&mut features)
+            .expect_err("restart must fail when packed layers cannot be reattached");
+
+        assert!(
+            err.to_string().contains("re-attach packed layers"),
+            "unexpected error: {err}"
+        );
+        assert!(features.packed_layers_dir.is_none());
     }
 }
