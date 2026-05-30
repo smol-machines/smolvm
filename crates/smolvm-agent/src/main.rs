@@ -3772,11 +3772,21 @@ fn run_interactive_loop_pty(
                         // Host stdin reached EOF. A PTY cannot have one
                         // direction closed, so signal end-of-input to the
                         // child by writing the EOF control character (VEOF,
-                        // Ctrl-D / 0x04). In canonical mode this makes the
-                        // child's next read on the slave return 0. Without
-                        // it, a stdin-reading child (cat, sh, read) never
-                        // terminates and the exec session hangs.
-                        let _ = pty_master.write_all(&[0x04]);
+                        // Ctrl-D / 0x04). In canonical mode VEOF makes the
+                        // pending line available to the child's read()
+                        // immediately; a read() that finds an empty line
+                        // buffer returns 0, which is the EOF the child waits
+                        // for. Without it a stdin-reading child (cat, sh,
+                        // read) never terminates and the exec session hangs.
+                        //
+                        // Send it twice: if the host's final stdin chunk was
+                        // not newline-terminated, the first VEOF only flushes
+                        // that partial line (delivered as data, not EOF), so a
+                        // second VEOF — now at an empty line buffer — is what
+                        // produces the zero-length read. When the buffer is
+                        // already empty the first VEOF yields EOF and the
+                        // second is harmlessly consumed after the child exits.
+                        let _ = pty_master.write_all(&[0x04, 0x04]);
                     } else {
                         let _ = pty_master.write_all(&data);
                     }

@@ -786,15 +786,26 @@ test_exec_tty_piped_stdin_terminates() {
     "$SMOLVM" machine create "$_EXEC_STDIN_MACHINE" 2>/dev/null || return 1
     "$SMOLVM" machine start --name "$_EXEC_STDIN_MACHINE" 2>/dev/null || return 1
 
+    # Newline-terminated input: the PTY line buffer is empty when EOF
+    # arrives, so a single VEOF would already yield the zero-length read.
     local exit_code=0
     run_with_timeout 15 sh -c \
         "echo tty-input | '$SMOLVM' machine exec --name '$_EXEC_STDIN_MACHINE' --tty -i -- cat" \
         >/dev/null 2>&1 || exit_code=$?
 
+    # Unterminated input (no trailing newline): the first VEOF only flushes
+    # the partial line as data, so a second VEOF is required to deliver the
+    # zero-length read. This is the case a single VEOF fails to terminate.
+    local exit_code_partial=0
+    run_with_timeout 15 sh -c \
+        "printf no-newline | '$SMOLVM' machine exec --name '$_EXEC_STDIN_MACHINE' --tty -i -- cat" \
+        >/dev/null 2>&1 || exit_code_partial=$?
+
     "$SMOLVM" machine stop --name "$_EXEC_STDIN_MACHINE" 2>/dev/null || true
     "$SMOLVM" machine delete "$_EXEC_STDIN_MACHINE" -f 2>/dev/null || true
 
     [[ $exit_code -ne 124 ]] || { echo "FAIL: 'exec --tty -i' with piped stdin timed out (PTY EOF not propagated)"; return 1; }
+    [[ $exit_code_partial -ne 124 ]] || { echo "FAIL: 'exec --tty -i' with unterminated stdin timed out (PTY EOF not propagated)"; return 1; }
 }
 
 run_test "Exec: 'exec --tty -i' with piped stdin terminates (PTY EOF)" test_exec_tty_piped_stdin_terminates || true
