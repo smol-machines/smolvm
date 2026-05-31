@@ -735,6 +735,7 @@ pub fn fork_vm(golden: &str, clone: &str, clone_forkable: bool) -> smolvm::Resul
     let result = start_vm_named(clone, None, None);
     std::env::remove_var("SMOLVM_SNAPSHOT_DIR");
     if result.is_ok() {
+        rejuvenate_clone(clone);
         eprintln!(
             "Forked '{golden}' -> '{clone}'. Golden stays frozen as the fork base \
              (do not start it again while clones exist)."
@@ -743,6 +744,61 @@ pub fn fork_vm(golden: &str, clone: &str, clone_forkable: bool) -> smolvm::Resul
         let _ = db.remove_vm(clone);
     }
     result
+}
+
+/// Best-effort per-clone identity rejuvenation after a fork. A clone inherits
+/// the golden's hostname, machine-id, and (critically) RNG state, so without
+/// this every clone would share the golden's random stream — a security
+/// problem and a source of duplicate-identity bugs across a pool. Run over the
+/// freshly-booted clone's agent: set a unique hostname, mint a fresh
+/// machine-id, and stir the kernel RNG with fresh host entropy so the streams
+/// diverge. Failures are warnings, not fatal (the clone still works).
+///
+/// Note: this stirs but does not *credit* entropy (no `RNDADDENTROPY`/VMGENID
+/// yet), and does not re-address the network (MAC/IP) — both are follow-ups.
+fn rejuvenate_clone(clone: &str) {
+    let sock = vm_data_dir(clone).join("agent.sock");
+    let seed = host_random_hex(64);
+    // Names are validated (alphanumeric + dashes), so single-quoting is safe.
+    let script = format!(
+        "hostname '{c}' 2>/dev/null; printf '%s\\n' '{c}' > /etc/hostname 2>/dev/null; \
+         (cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-' > /etc/machine-id) 2>/dev/null; \
+         printf '%s' '{s}' > /dev/urandom 2>/dev/null; true",
+        c = clone,
+        s = seed,
+    );
+    let mut client = match smolvm::agent::AgentClient::connect_with_retry(&sock) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Warning: clone '{clone}' rejuvenation skipped (agent connect: {e})");
+            return;
+        }
+    };
+    match client.vm_exec(
+        vec!["/bin/sh".into(), "-c".into(), script],
+        vec![],
+        None,
+        Some(std::time::Duration::from_secs(10)),
+        None,
+    ) {
+        Ok((0, _, _)) => {}
+        Ok((code, _, stderr)) => eprintln!(
+            "Warning: clone '{clone}' rejuvenation exited {code}: {}",
+            String::from_utf8_lossy(&stderr).trim()
+        ),
+        Err(e) => eprintln!("Warning: clone '{clone}' rejuvenation failed: {e}"),
+    }
+}
+
+/// Read `hex_len/2` random bytes from the host RNG, hex-encoded. Used to seed
+/// each clone's RNG with distinct host entropy.
+fn host_random_hex(hex_len: usize) -> String {
+    use std::io::Read;
+    let mut buf = vec![0u8; hex_len / 2];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        let _ = f.read_exact(&mut buf);
+    }
+    buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 // ============================================================================
