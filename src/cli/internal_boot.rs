@@ -68,6 +68,139 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
     // which now point to /dev/null.
     smolvm::process::close_inherited_fds_from(3);
 
+    // Defense-in-depth before this process becomes the VMM host for an untrusted
+    // guest: block setuid privilege escalation and core dumps (which would leak
+    // guest RAM). See docs/runtime-isolation-hardening.md for the full roadmap.
+    smolvm::process::harden_self();
+
+    // If the supervisor delegated a cgroup v2 root (via SMOLVM_CGROUP_ROOT),
+    // place this VMM in a per-VM cgroup with cpu/pids/memory caps so an untrusted
+    // guest can't peg host CPU, fork-bomb the host, or balloon VMM memory. Inert
+    // when the env var is unset (no delegation) — never blocks boot.
+    #[cfg(target_os = "linux")]
+    if let Some(cgroup_root) = std::env::var_os("SMOLVM_CGROUP_ROOT") {
+        smolvm::process::place_in_cgroup(
+            std::path::Path::new(&cgroup_root),
+            config.resources.cpus,
+            config.resources.memory_mib,
+        );
+    }
+
+    // P0: drop to an unprivileged uid before touching the guest, so a guest→VMM
+    // escape can't signal/ptrace the supervisor or neighbor VMs nor reach
+    // root-owned host files. Gated by SMOLVM_VM_UID (+ optional SMOLVM_VM_GID,
+    // default = uid). Requires a privileged supervisor and this VM's data
+    // dir/disks owned by the uid (see docs/runtime-isolation-hardening.md).
+    // Fails closed. Placed AFTER cgroup placement (needs privilege), BEFORE
+    // Landlock/seccomp (work unprivileged once no_new_privs is set).
+    #[cfg(target_os = "linux")]
+    if let Some(uid_str) = std::env::var_os("SMOLVM_VM_UID") {
+        let uid: u32 = match uid_str.to_str().and_then(|s| s.parse().ok()) {
+            Some(u) => u,
+            None => {
+                eprintln!("[uid-drop] invalid SMOLVM_VM_UID; refusing to boot");
+                smolvm::process::exit_child(1);
+            }
+        };
+        let gid: u32 = std::env::var("SMOLVM_VM_GID")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(uid);
+        if let Err(e) = smolvm::process::drop_privileges(uid, gid) {
+            eprintln!("[uid-drop] failed, refusing to boot over-privileged: {e}");
+            smolvm::process::exit_child(1);
+        }
+    }
+
+    // P0: confine the VMM's filesystem view via Landlock — BEFORE seccomp (whose
+    // allowlist omits the landlock_* syscalls) and before libkrun loads. Granted:
+    // read+exec on rootfs/libs/system dirs, read-write on this VM's own data dir
+    // and the device nodes a VMM needs; the rest of the host fs is denied so a
+    // guest→VMM escape can't read other tenants' data or host secrets. Paths are
+    // derived per-VM from the boot config. Gated by SMOLVM_LANDLOCK=enforce
+    // (unset = off); fails closed. See docs/runtime-isolation-hardening.md.
+    #[cfg(target_os = "linux")]
+    if std::env::var("SMOLVM_LANDLOCK").as_deref() == Ok("enforce") {
+        let mut read_exec: Vec<std::path::PathBuf> = [
+            "/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc", "/opt", "/proc", "/sys",
+        ]
+        .iter()
+        .map(std::path::PathBuf::from)
+        .collect();
+        read_exec.push(config.rootfs_path.clone());
+        if let Some(ref d) = config.packed_layers_dir {
+            read_exec.push(d.clone());
+        }
+        if let Some(libdir) = std::env::var_os("SMOLVM_LIB_DIR") {
+            read_exec.push(std::path::PathBuf::from(libdir));
+        }
+
+        let mut read_write: Vec<std::path::PathBuf> = [
+            "/dev/kvm", "/dev/null", "/dev/zero", "/dev/full", "/dev/urandom",
+            "/dev/random", "/dev/dri", "/dev/ptmx", "/tmp",
+        ]
+        .iter()
+        .map(std::path::PathBuf::from)
+        .collect();
+        for p in [
+            &config.storage_disk_path,
+            &config.overlay_disk_path,
+            &config.vsock_socket,
+            &config.startup_error_log,
+        ] {
+            if let Some(parent) = p.parent() {
+                read_write.push(parent.to_path_buf());
+            }
+        }
+        if let Some(parent) = config.console_log.as_ref().and_then(|c| c.parent()) {
+            read_write.push(parent.to_path_buf());
+        }
+        if let Some(parent) = config.ssh_agent_socket.as_ref().and_then(|s| s.parent()) {
+            read_write.push(parent.to_path_buf());
+        }
+        for (path, read_only) in &config.extra_disks {
+            if *read_only {
+                read_exec.push(path.clone());
+            } else {
+                read_write.push(path.clone());
+            }
+        }
+        for m in &config.mounts {
+            if m.read_only {
+                read_exec.push(m.source.clone());
+            } else {
+                read_write.push(m.source.clone());
+            }
+        }
+
+        if let Err(e) = smolvm::process::restrict_filesystem(&read_exec, &read_write) {
+            eprintln!("[landlock] restriction failed, refusing to boot unconfined: {e}");
+            smolvm::process::exit_child(1);
+        }
+    }
+
+    // P0: confine this VMM to a syscall allowlist before it loads libkrun and
+    // enters the guest run loop, so a guest→VMM escape can't reach dangerous host
+    // syscalls. Gated by SMOLVM_SECCOMP=audit|enforce (unset = off). Installed
+    // while single-threaded so libkrun's vCPU/worker threads inherit the filter.
+    // Enforce mode fails closed (a filter that won't install must not silently run
+    // unconfined). See docs/runtime-isolation-hardening.md.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    match std::env::var("SMOLVM_SECCOMP").as_deref() {
+        Ok("enforce") => {
+            if let Err(e) = smolvm::process::install_seccomp_filter(true) {
+                eprintln!("[seccomp] enforce install failed, refusing to boot unconfined: {e}");
+                smolvm::process::exit_child(1);
+            }
+        }
+        Ok("audit") => {
+            if let Err(e) = smolvm::process::install_seccomp_filter(false) {
+                eprintln!("[seccomp] audit install failed: {e}");
+            }
+        }
+        _ => {}
+    }
+
     // Emit subprocess startup timing to the startup error log (stderr after
     // the stdio redirect above). These lines decompose the dark window between
     // parent's spawn() returning and launch_agent_vm() being called.
