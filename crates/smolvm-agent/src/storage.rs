@@ -17,7 +17,7 @@ use smolvm_protocol::{normalize_image_ref, ImageInfo, OverlayInfo, RegistryAuth,
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Storage root path (where the ext4 disk is mounted).
 const STORAGE_ROOT: &str = "/storage";
@@ -28,6 +28,7 @@ const CONFIGS_DIR: &str = "configs";
 const MANIFESTS_DIR: &str = "manifests";
 const OVERLAYS_DIR: &str = "overlays";
 const WORKSPACE_DIR: &str = "workspace";
+
 const DOCKER_HUB_AUTH_CONFIG_KEY: &str = "https://index.docker.io/v1/";
 const DOCKER_HUB_REGISTRY_ALIASES: &[&str] = &["docker.io", "index.docker.io"];
 
@@ -302,6 +303,25 @@ pub fn init_packed_layers() -> Option<PathBuf> {
         }
         info!(mount_point = %mount_point.display(), "packed layers mounted successfully");
 
+        // Archive-ingest mode: the host staged a raw image archive instead of
+        // pre-extracted layers. Delegate extraction to `crane` and use the
+        // flattened rootfs as the packed-layers directory.
+        if mount_point
+            .join(crate::image_archive::IMAGE_ARCHIVE_FILE)
+            .exists()
+        {
+            return match crate::image_archive::materialize_image_archive(&mount_point) {
+                Ok(dir) => {
+                    info!(layers_dir = %dir.display(), "image archive flattened via crane");
+                    Some(dir)
+                }
+                Err(e) => {
+                    error!(error = %e, "failed to flatten image archive with crane");
+                    None
+                }
+            };
+        }
+
         // List contents for debugging (only at debug level to avoid boot overhead)
         if let Ok(entries) = std::fs::read_dir(&mount_point) {
             let layer_dirs: Vec<_> = entries
@@ -324,6 +344,44 @@ pub fn init_packed_layers() -> Option<PathBuf> {
 /// Get the packed layers directory if available.
 pub fn get_packed_layers_dir() -> Option<&'static PathBuf> {
     PACKED_LAYERS_DIR.get_or_init(init_packed_layers).as_ref()
+}
+
+/// OCI image-config fields needed to populate an [`ImageInfo`]. Shared by the
+/// registry-pull, cached-image, and packed/archive paths so config parsing
+/// lives in exactly one place.
+struct ImageConfigFields {
+    architecture: String,
+    os: String,
+    created: Option<String>,
+    entrypoint: Vec<String>,
+    cmd: Vec<String>,
+    env: Vec<String>,
+    workdir: Option<String>,
+    user: Option<String>,
+}
+
+/// Parse the OCI image-config JSON into the fields used by [`ImageInfo`].
+fn parse_image_config_fields(config_json: &serde_json::Value) -> ImageConfigFields {
+    let oci_config = &config_json["config"];
+    ImageConfigFields {
+        architecture: config_json["architecture"]
+            .as_str()
+            .unwrap_or("unknown")
+            .to_string(),
+        os: config_json["os"].as_str().unwrap_or("linux").to_string(),
+        created: config_json["created"].as_str().map(String::from),
+        entrypoint: json_string_array(oci_config, "Entrypoint"),
+        cmd: json_string_array(oci_config, "Cmd"),
+        env: json_string_array(oci_config, "Env"),
+        workdir: oci_config["WorkingDir"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(String::from),
+        user: oci_config["User"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(String::from),
+    }
 }
 
 /// Initialize volume mounts at boot by reading SMOLVM_MOUNT_* env vars.
@@ -448,67 +506,55 @@ fn create_packed_image_info(image: &str, packed_dir: &Path) -> Result<ImageInfo>
         }
     }
 
-    // Determine architecture from environment or default
+    // Architecture defaults to the build target when no config is present
+    // (e.g. bare `.smolmachine` layers without an image config).
     #[cfg(target_arch = "aarch64")]
-    let default_architecture = "arm64".to_string();
+    let default_architecture = "arm64";
     #[cfg(target_arch = "x86_64")]
-    let default_architecture = "amd64".to_string();
+    let default_architecture = "amd64";
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    let default_architecture = "unknown".to_string();
+    let default_architecture = "unknown";
 
     // Recover the OCI image config when present. `.smolmachine` packs carry it
-    // in the PackManifest, but local image archives (docker/podman save) drop a
-    // `config.json` beside the layers. Parse the same fields the registry-pull
-    // path reads so Entrypoint/Cmd/Env/WorkingDir/User actually take effect.
-    let mut entrypoint = Vec::new();
-    let mut cmd = Vec::new();
-    let mut env = Vec::new();
-    let mut workdir = None;
-    let mut user = None;
-    let mut created = None;
-    let mut architecture = default_architecture;
-
-    let config_path = packed_dir.join("config.json");
-    if config_path.exists() {
-        if let Ok(config_content) = std::fs::read_to_string(&config_path) {
-            if let Ok(config_json) = serde_json::from_str::<serde_json::Value>(&config_content) {
-                if let Some(arch) = config_json["architecture"].as_str() {
-                    architecture = arch.to_string();
-                }
-                created = config_json["created"].as_str().map(String::from);
-                let oci_config = &config_json["config"];
-                if oci_config.is_object() {
-                    entrypoint = json_string_array(oci_config, "Entrypoint");
-                    cmd = json_string_array(oci_config, "Cmd");
-                    env = json_string_array(oci_config, "Env");
-                    workdir = oci_config["WorkingDir"]
-                        .as_str()
-                        .filter(|s| !s.is_empty())
-                        .map(String::from);
-                    user = oci_config["User"]
-                        .as_str()
-                        .filter(|s| !s.is_empty())
-                        .map(String::from);
-                }
-            }
-        }
-    }
+    // in the PackManifest, but local image archives drop a `config.json` beside
+    // the flattened layer (written by `write_archive_config`). Parse it with the
+    // same helper the registry-pull path uses so Entrypoint/Cmd/Env/WorkingDir/
+    // User take effect identically.
+    let config = packed_image_config(packed_dir);
+    let architecture = config
+        .as_ref()
+        .map(|c| c.architecture.clone())
+        .unwrap_or_else(|| default_architecture.to_string());
 
     Ok(ImageInfo {
         reference: image.to_string(),
         digest: "packed".to_string(), // No real digest available for packed images
         size: total_size,
-        created,
+        created: config.as_ref().and_then(|c| c.created.clone()),
         architecture,
-        os: "linux".to_string(),
+        os: config
+            .as_ref()
+            .map(|c| c.os.clone())
+            .unwrap_or_else(|| "linux".to_string()),
         layer_count: layer_dirs.len(),
         layers: layer_dirs,
-        entrypoint,
-        cmd,
-        env,
-        workdir,
-        user,
+        entrypoint: config
+            .as_ref()
+            .map(|c| c.entrypoint.clone())
+            .unwrap_or_default(),
+        cmd: config.as_ref().map(|c| c.cmd.clone()).unwrap_or_default(),
+        env: config.as_ref().map(|c| c.env.clone()).unwrap_or_default(),
+        workdir: config.as_ref().and_then(|c| c.workdir.clone()),
+        user: config.and_then(|c| c.user),
     })
+}
+
+/// Read and parse `<packed_dir>/config.json` if present (best-effort).
+fn packed_image_config(packed_dir: &Path) -> Option<ImageConfigFields> {
+    let config_path = packed_dir.join("config.json");
+    let content = std::fs::read_to_string(&config_path).ok()?;
+    let config_json = serde_json::from_str::<serde_json::Value>(&content).ok()?;
+    Some(parse_image_config_fields(&config_json))
 }
 
 /// Error type for storage operations.
@@ -1269,41 +1315,22 @@ where
     }
 
     // Build ImageInfo
-    let architecture = config_json["architecture"]
-        .as_str()
-        .unwrap_or("unknown")
-        .to_string();
-    let os = config_json["os"].as_str().unwrap_or("linux").to_string();
-    let created = config_json["created"].as_str().map(String::from);
-
-    // Extract OCI config fields (Entrypoint, Cmd, Env, WorkingDir, User)
-    let oci_config = &config_json["config"];
-    let entrypoint = json_string_array(oci_config, "Entrypoint");
-    let cmd = json_string_array(oci_config, "Cmd");
-    let env = json_string_array(oci_config, "Env");
-    let workdir = oci_config["WorkingDir"]
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .map(String::from);
-    let user = oci_config["User"]
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .map(String::from);
+    let fields = parse_image_config_fields(&config_json);
 
     Ok(ImageInfo {
         reference: image.to_string(),
         digest: config_digest.to_string(),
         size: total_size,
-        created,
-        architecture,
-        os,
+        created: fields.created,
+        architecture: fields.architecture,
+        os: fields.os,
         layer_count: layers.len(),
         layers,
-        entrypoint,
-        cmd,
-        env,
-        workdir,
-        user,
+        entrypoint: fields.entrypoint,
+        cmd: fields.cmd,
+        env: fields.env,
+        workdir: fields.workdir,
+        user: fields.user,
     })
 }
 
@@ -1352,12 +1379,7 @@ pub fn query_image(image: &str) -> Result<Option<ImageInfo>> {
     let config_json: serde_json::Value =
         serde_json::from_str(&config).map_err(|e| StorageError::parse_error("config", e))?;
 
-    let architecture = config_json["architecture"]
-        .as_str()
-        .unwrap_or("unknown")
-        .to_string();
-    let os = config_json["os"].as_str().unwrap_or("linux").to_string();
-    let created = config_json["created"].as_str().map(String::from);
+    let fields = parse_image_config_fields(&config_json);
 
     // Verify all layers exist and calculate total size
     let mut total_size = 0u64;
@@ -1376,34 +1398,20 @@ pub fn query_image(image: &str) -> Result<Option<ImageInfo>> {
         }
     }
 
-    // Extract OCI config fields
-    let oci_config = &config_json["config"];
-    let entrypoint = json_string_array(oci_config, "Entrypoint");
-    let cmd = json_string_array(oci_config, "Cmd");
-    let env = json_string_array(oci_config, "Env");
-    let workdir = oci_config["WorkingDir"]
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .map(String::from);
-    let user = oci_config["User"]
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .map(String::from);
-
     Ok(Some(ImageInfo {
         reference: image.to_string(),
         digest: config_digest.to_string(),
         size: total_size,
-        created,
-        architecture,
-        os,
+        created: fields.created,
+        architecture: fields.architecture,
+        os: fields.os,
         layer_count: layers.len(),
         layers,
-        entrypoint,
-        cmd,
-        env,
-        workdir,
-        user,
+        entrypoint: fields.entrypoint,
+        cmd: fields.cmd,
+        env: fields.env,
+        workdir: fields.workdir,
+        user: fields.user,
     }))
 }
 
@@ -3314,5 +3322,46 @@ mod tests {
             workspace_link.is_dir(),
             "/workspace should now be a directory"
         );
+    }
+
+    #[test]
+    fn test_parse_image_config_fields_extracts_oci_config() {
+        let config = serde_json::json!({
+            "architecture": "arm64",
+            "os": "linux",
+            "created": "2024-01-01T00:00:00Z",
+            "config": {
+                "Entrypoint": ["/app/run"],
+                "Cmd": ["serve", "--port", "8080"],
+                "Env": ["PATH=/usr/bin", "APP=1"],
+                "WorkingDir": "/app",
+                "User": "app",
+            }
+        });
+
+        let fields = parse_image_config_fields(&config);
+        assert_eq!(fields.architecture, "arm64");
+        assert_eq!(fields.os, "linux");
+        assert_eq!(fields.created.as_deref(), Some("2024-01-01T00:00:00Z"));
+        assert_eq!(fields.entrypoint, vec!["/app/run"]);
+        assert_eq!(fields.cmd, vec!["serve", "--port", "8080"]);
+        assert_eq!(fields.env, vec!["PATH=/usr/bin", "APP=1"]);
+        assert_eq!(fields.workdir.as_deref(), Some("/app"));
+        assert_eq!(fields.user.as_deref(), Some("app"));
+    }
+
+    #[test]
+    fn test_parse_image_config_fields_applies_defaults() {
+        // Missing config/architecture/os fall back to sane defaults; empty
+        // WorkingDir/User are treated as absent.
+        let config = serde_json::json!({ "config": { "WorkingDir": "", "User": "" } });
+        let fields = parse_image_config_fields(&config);
+        assert_eq!(fields.architecture, "unknown");
+        assert_eq!(fields.os, "linux");
+        assert!(fields.created.is_none());
+        assert!(fields.entrypoint.is_empty());
+        assert!(fields.cmd.is_empty());
+        assert!(fields.workdir.is_none());
+        assert!(fields.user.is_none());
     }
 }

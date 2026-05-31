@@ -80,6 +80,7 @@ fn boot_log(level: &str, msg: &str) {
     }
 }
 mod dns_proxy;
+mod image_archive;
 mod network;
 mod oci;
 mod paths;

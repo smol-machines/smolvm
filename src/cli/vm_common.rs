@@ -709,9 +709,18 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
     // starts, skip both — image manifests/layers persist on the storage disk
     // and the container overlay is remounted (not recreated).
     if !record.init_completed {
-        let image_info = if record.source_smolmachine.is_some() || is_image_archive {
-            // Layers already mounted via virtiofs — no pull needed.
+        let image_info = if record.source_smolmachine.is_some() {
+            // .smolmachine layers already mounted via virtiofs; config travels
+            // in the PackManifest, so no pull is needed.
             None
+        } else if is_image_archive {
+            // Archive flattened in-VM by crane; recover its config (no network).
+            match record.image {
+                Some(ref image) => {
+                    Some(crate::cli::resolve_archive_image_info(&mut client, image)?)
+                }
+                None => None,
+            }
         } else if let Some(ref image) = record.image {
             eprintln!("Pulling {}...", image);
             Some(crate::cli::pull_with_progress(&mut client, image, None)?)
@@ -1720,7 +1729,7 @@ mod init_runner_tests {
             &[],
             "vm",
         );
-        assert_eq!(config.image, "debian:slim");
+        assert_eq!(config.image, "docker.io/library/debian:slim");
         assert_eq!(config.env, env);
         assert_eq!(config.workdir.as_deref(), Some("/work"));
         assert_eq!(config.user.as_deref(), Some("steam"));

@@ -604,10 +604,14 @@ impl RunCmd {
         // exec (which has its own SIGINT handling).
         let sigint_guard = manager.child_pid().map(smolvm::process::SigintGuard::new);
 
-        // Pull image if one is specified. Image archives are already mounted via
-        // virtiofs (packed layers), so no registry pull is performed.
+        // Pull image if one is specified. Image archives are flattened in-VM by
+        // crane (packed layers) rather than pulled from a registry, but still
+        // return ImageInfo so the archive's Entrypoint/Cmd/Env take effect.
         let image_info = if is_image_archive {
-            None
+            match resolved_image {
+                Some(ref img) => Some(crate::cli::resolve_archive_image_info(&mut client, img)?),
+                None => None,
+            }
         } else if let Some(ref img) = resolved_image {
             match crate::cli::pull_with_progress(&mut client, img, self.oci_platform.as_deref()) {
                 Ok(info) => Some(info),

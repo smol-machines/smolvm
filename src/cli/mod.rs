@@ -213,3 +213,17 @@ pub fn pull_with_progress(
     );
     result
 }
+
+/// Resolve image metadata for a locally-staged image archive (`local:<hash>`).
+///
+/// The agent short-circuits to the crane-flattened packed layers instead of
+/// contacting a registry, so this recovers the archive's Entrypoint/Cmd/Env
+/// without any network access — and without the registry-pull progress output,
+/// which would otherwise print a misleading "Pulling image local:<hash>".
+pub fn resolve_archive_image_info(
+    client: &mut smolvm::agent::AgentClient,
+    image: &str,
+) -> smolvm::Result<smolvm_protocol::ImageInfo> {
+    eprintln!("Preparing image archive...");
+    client.pull_with_registry_config_and_progress(image, None, |_, _, _| {})
+}
