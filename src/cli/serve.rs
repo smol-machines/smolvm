@@ -105,7 +105,7 @@ impl ServeStartCmd {
             tracing::info!("verbose logging enabled");
         }
 
-        // Untrusted multi-tenant hardening (P1): when this serve process runs
+        // Untrusted multi-tenant hardening: when this serve process runs
         // under a cgroup v2 delegation (a systemd unit with `Delegate=yes`),
         // establish a delegated root and advertise it via SMOLVM_CGROUP_ROOT so
         // every VM boot subprocess places itself in a per-VM cgroup with
@@ -118,7 +118,7 @@ impl ServeStartCmd {
             std::env::set_var("SMOLVM_CGROUP_ROOT", &root);
         }
 
-        // P0 (default-on): enable the seccomp syscall allowlist on every VM boot
+        // Default-on: enable the seccomp syscall allowlist on every VM boot
         // subprocess. `--seccomp` selects enforce|audit|off (default enforce); a
         // pre-set SMOLVM_SECCOMP env wins for ad-hoc overrides. Inherited by the
         // spawned `_boot-vm`. See docs/runtime-isolation-hardening.md.
@@ -130,7 +130,7 @@ impl ServeStartCmd {
             }
         }
 
-        // P0 (default-on): confine each VM boot subprocess's filesystem view via
+        // Default-on: confine each VM boot subprocess's filesystem view via
         // Landlock. `--landlock` selects enforce|off (default enforce); a pre-set
         // SMOLVM_LANDLOCK env wins. Inherited by the spawned `_boot-vm`.
         #[cfg(target_os = "linux")]

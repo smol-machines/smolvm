@@ -86,7 +86,7 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
         );
     }
 
-    // P0: drop to an unprivileged uid before touching the guest, so a guest→VMM
+    // Drop to an unprivileged uid before touching the guest, so a guest→VMM
     // escape can't signal/ptrace the supervisor or neighbor VMs nor reach
     // root-owned host files. Gated by SMOLVM_VM_UID (+ optional SMOLVM_VM_GID,
     // default = uid). Requires a privileged supervisor and this VM's data
@@ -112,7 +112,7 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
         }
     }
 
-    // P0: confine the VMM's filesystem view via Landlock — BEFORE seccomp (whose
+    // Confine the VMM's filesystem view via Landlock — BEFORE seccomp (whose
     // allowlist omits the landlock_* syscalls) and before libkrun loads. Granted:
     // read+exec on rootfs/libs/system dirs, read-write on this VM's own data dir
     // and the device nodes a VMM needs; the rest of the host fs is denied so a
@@ -186,7 +186,7 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
         }
     }
 
-    // P0: confine this VMM to a syscall allowlist before it loads libkrun and
+    // Confine this VMM to a syscall allowlist before it loads libkrun and
     // enters the guest run loop, so a guest→VMM escape can't reach dangerous host
     // syscalls. Gated by SMOLVM_SECCOMP=audit|enforce (unset = off). Installed
     // while single-threaded so libkrun's vCPU/worker threads inherit the filter.

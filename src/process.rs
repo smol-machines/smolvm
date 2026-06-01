@@ -92,9 +92,8 @@ fn close_fds_by_range(min_fd: i32) {
 }
 
 /// Apply best-effort, low-risk hardening to *this* process before it becomes the
-/// VMM host for an untrusted guest. This is the P2 "info-leak / escalation"
-/// down-payment from `docs/runtime-isolation-hardening.md`; the heavier P0/P1
-/// work (seccomp, cgroup caps, privilege drop) builds on top.
+/// VMM host for an untrusted guest — the info-leak / escalation baseline that the
+/// heavier work (seccomp, cgroup caps, privilege drop) builds on top of.
 ///
 /// Effects (Linux; a near-no-op on macOS dev, which is single-tenant):
 /// - `PR_SET_NO_NEW_PRIVS`: a guest→VMM escape cannot regain privileges via a
@@ -130,7 +129,7 @@ pub fn harden_self() {
 }
 
 // ============================================================================
-// P1 — per-VM cgroup v2 resource caps (noisy-neighbor / host-DoS containment)
+// Per-VM cgroup v2 resource caps (noisy-neighbor / host-DoS containment)
 //
 // Each VMM subprocess is placed in its own cgroup v2 leaf with cpu/pids/memory
 // limits so an untrusted guest cannot peg host CPU, fork-bomb the host, or
@@ -268,7 +267,7 @@ pub fn place_in_cgroup(root: &std::path::Path, vcpus: u8, memory_mib: u32) {
 }
 
 // ============================================================================
-// P0 — seccomp-BPF syscall allowlist for the VM boot subprocess
+// Seccomp-BPF syscall allowlist for the VM boot subprocess
 //
 // libkrun (unlike Firecracker) installs no seccomp filter, so a guest→VMM escape
 // would inherit the host's full syscall surface. This installs a Firecracker-style
@@ -390,7 +389,7 @@ pub fn install_seccomp_filter(_enforce: bool) -> std::result::Result<(), String>
 }
 
 // ============================================================================
-// P0 — Landlock filesystem restriction for the VM boot subprocess
+// Landlock filesystem restriction for the VM boot subprocess
 //
 // Confines the VMM's filesystem view so a guest→VMM escape cannot read or write
 // host files outside what this specific VM needs: read+exec on the rootfs / libs
@@ -458,7 +457,7 @@ pub fn restrict_filesystem(
 }
 
 // ============================================================================
-// P0 — drop the VMM to an unprivileged uid (bounds escape blast radius)
+// Drop the VMM to an unprivileged uid (bounds escape blast radius)
 //
 // Run each VMM as a powerless, ideally per-VM uid so a guest→VMM escape can't
 // signal/ptrace the serve process or other tenants' VMs, nor touch root-owned
