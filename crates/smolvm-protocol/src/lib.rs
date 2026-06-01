@@ -802,6 +802,9 @@ pub struct Envelope<T> {
     /// Trace ID for correlating host API requests to agent operations.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub trace_id: Option<String>,
+    /// Optional host timestamp (unix time in milliseconds) for clock sync.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub host_timestamp: Option<i64>,
     /// The wrapped message.
     #[serde(flatten)]
     pub body: T,
@@ -810,15 +813,32 @@ pub struct Envelope<T> {
 impl<T> Envelope<T> {
     /// Create an envelope with no trace ID.
     pub fn new(body: T) -> Self {
+        let host_timestamp = Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64,
+        );
         Self {
             trace_id: None,
+            host_timestamp,
             body,
         }
     }
 
     /// Create an envelope with an optional trace ID.
     pub fn with_trace_id(body: T, trace_id: Option<String>) -> Self {
-        Self { trace_id, body }
+        let host_timestamp = Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64,
+        );
+        Self {
+            trace_id,
+            host_timestamp,
+            body,
+        }
     }
 }
 
@@ -1127,6 +1147,24 @@ mod tests {
         // Deserialize back — Envelope<AgentRequest> with flatten
         let parsed: Envelope<AgentRequest> = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.trace_id.as_deref(), Some("abc123"));
+        assert!(matches!(parsed.body, AgentRequest::Ping));
+    }
+
+    #[test]
+    fn test_envelope_serialization_with_host_timestamp() {
+        let req = AgentRequest::Ping;
+        let envelope = Envelope::with_trace_id(&req, Some("abc123".to_string()));
+        let json = serde_json::to_string(&envelope).unwrap();
+
+        // trace_id and host_timestamp should be flattened alongside the method tag
+        assert!(json.contains("\"trace_id\":\"abc123\""));
+        assert!(json.contains("\"host_timestamp\":"));
+        assert!(json.contains("\"method\":\"ping\""));
+
+        // Deserialize back — Envelope<AgentRequest> with flatten
+        let parsed: Envelope<AgentRequest> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.trace_id.as_deref(), Some("abc123"));
+        assert!(parsed.host_timestamp.is_some());
         assert!(matches!(parsed.body, AgentRequest::Ping));
     }
 

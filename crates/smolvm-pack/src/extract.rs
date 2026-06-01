@@ -236,6 +236,7 @@ fn safe_unpack<R: Read>(archive: &mut tar::Archive<R>, dest: &Path) -> std::io::
         // Ensure parent directories are writable before extracting any entry.
         // OCI layer tars may set restrictive directory modes (e.g., dr-xr-xr-x)
         // before child entries, which prevents creating files or subdirectories.
+        #[cfg(unix)]
         if let Some(parent) = full_path.parent() {
             if parent.is_dir() {
                 let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755));
@@ -284,6 +285,7 @@ fn safe_unpack<R: Read>(archive: &mut tar::Archive<R>, dest: &Path) -> std::io::
             // After extracting a directory, force it writable so subsequent
             // entries (children) can be created inside it. Final permissions
             // are applied after the loop.
+            #[cfg(unix)]
             if entry_type == tar::EntryType::Directory && full_path.is_dir() {
                 let _ =
                     std::fs::set_permissions(&full_path, std::fs::Permissions::from_mode(0o755));
@@ -292,6 +294,7 @@ fn safe_unpack<R: Read>(archive: &mut tar::Archive<R>, dest: &Path) -> std::io::
     }
 
     // Apply deferred directory permissions now that all children are written.
+    #[cfg(unix)]
     for (path, mode) in deferred_dir_modes {
         if path.is_dir() {
             let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode));

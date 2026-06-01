@@ -1604,11 +1604,11 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
 
         // Parse request (Envelope wraps the request with an optional trace_id).
         // Falls back to bare AgentRequest for backward compatibility with old hosts.
-        let (mut request, trace_id) =
+        let (mut request, trace_id, host_timestamp) =
             match serde_json::from_slice::<Envelope<AgentRequest>>(&buf[..len]) {
-                Ok(env) => (env.body, env.trace_id),
+                Ok(env) => (env.body, env.trace_id, env.host_timestamp),
                 Err(_) => match serde_json::from_slice::<AgentRequest>(&buf[..len]) {
-                    Ok(req) => (req, None),
+                    Ok(req) => (req, None, None),
                     Err(e) => {
                         warn!(error = %e, "invalid request");
                         send_response(
@@ -1622,6 +1622,11 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
                     }
                 },
             };
+
+        // Synchronize guest clock with host if host_timestamp is provided
+        if let Some(host_ts) = host_timestamp {
+            sync_clock(host_ts);
+        }
 
         // Work around serde flatten + internally-tagged enum limitation:
         // fields with #[serde(default)] can be silently dropped during
@@ -4402,6 +4407,50 @@ fn handle_streaming_export_layer(
     }
     let _ = child.wait();
     result
+}
+
+/// Synchronize guest system clock with host system clock.
+///
+/// Compares guest time with the host time (in milliseconds). If they differ
+/// by more than a threshold (500ms), adjusts the guest clock to match the host.
+fn sync_clock(host_timestamp_ms: i64) {
+    let mut guest_ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: guest_ts is a valid, mutable timespec structure allocated on the stack.
+    let ret = unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut guest_ts) };
+    if ret == 0 {
+        let guest_ms = (guest_ts.tv_sec as i64 * 1000) + (guest_ts.tv_nsec as i64 / 1_000_000);
+        let diff = (host_timestamp_ms - guest_ms).abs();
+        if diff > 500 {
+            let secs = host_timestamp_ms / 1000;
+            let nsecs = (host_timestamp_ms % 1000) * 1_000_000;
+            let ts = libc::timespec {
+                tv_sec: secs as _,
+                tv_nsec: nsecs as _,
+            };
+            // SAFETY: ts is a valid timespec, and smolvm-agent runs with root capabilities
+            // (specifically CAP_SYS_TIME) in the VM.
+            let ret = unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &ts) };
+            if ret < 0 {
+                let err = std::io::Error::last_os_error();
+                warn!(
+                    error = %err,
+                    host = host_timestamp_ms,
+                    guest = guest_ms,
+                    "failed to sync guest clock with host"
+                );
+            } else {
+                info!(
+                    host = host_timestamp_ms,
+                    guest_before = guest_ms,
+                    drift_ms = host_timestamp_ms - guest_ms,
+                    "guest clock synchronized with host"
+                );
+            }
+        }
+    } else {
+        let err = std::io::Error::last_os_error();
+        warn!(error = %err, "failed to read guest system clock");
+    }
 }
 
 /// Handle storage status request.
