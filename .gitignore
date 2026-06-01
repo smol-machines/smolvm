@@ -15,6 +15,10 @@ Cargo.lock
 # Build artifacts
 *.so
 *.a
+!lib/linux-x86_64/libkrun.so
+!lib/linux-x86_64/libkrunfw.so
+!lib/linux-aarch64/libkrun.so
+!lib/linux-aarch64/libkrunfw.so
 
 # Distribution build output
 /dist/smolvm-*/
