@@ -1,5 +1,9 @@
 # Headless Chromium with GPU acceleration
 #
+# For pre-warmed browser pools via fork (warm-state preservation, the required
+# --no-zygote/--no-sandbox flags, persistent-workload setup, and CDP access),
+# see README.md in this directory.
+#
 # Guest Vulkan (Venus/virtio-gpu) forwards calls over the virtio-gpu transport
 # to the host GPU.  ANGLE inside Chromium uses Venus as its Vulkan backend, so
 # WebGL and compositing run on real hardware — no SwiftShader fallback.
