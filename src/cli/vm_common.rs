@@ -638,7 +638,12 @@ fn control_socket_cmd(sock: &std::path::Path, cmd: &str) -> smolvm::Result<Strin
 /// guest RAM is mapped `MAP_PRIVATE` by clones, so it must not run again while
 /// clones exist), copy-on-write clones its disks, and boots the clone from the
 /// golden's in-memory snapshot.
-pub fn fork_vm(golden: &str, clone: &str, clone_forkable: bool) -> smolvm::Result<()> {
+pub fn fork_vm(
+    golden: &str,
+    clone: &str,
+    clone_forkable: bool,
+    pinned_ports: &[(u16, u16)],
+) -> smolvm::Result<()> {
     use smolvm::Error;
 
     validate_vm_name(clone, "clone name").map_err(|e| Error::config("clone name", e))?;
@@ -692,7 +697,13 @@ pub fn fork_vm(golden: &str, clone: &str, clone_forkable: bool) -> smolvm::Resul
     clone_rec.name = clone.to_string();
     clone_rec.pid = None;
     clone_rec.pid_start_time = None;
-    if !clone_rec.ports.is_empty() {
+    if !pinned_ports.is_empty() {
+        // User pinned the clone's forwards explicitly — use them as-is.
+        clone_rec.ports = pinned_ports.to_vec();
+        for (h, g) in &clone_rec.ports {
+            eprintln!("  port {h}->{g} (pinned)");
+        }
+    } else if !clone_rec.ports.is_empty() {
         let mut remapped = Vec::with_capacity(clone_rec.ports.len());
         for (golden_host, guest) in &clone_rec.ports {
             match alloc_free_host_port() {

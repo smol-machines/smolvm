@@ -1690,11 +1690,17 @@ pub struct ForkCmd {
     /// in turn be forked.
     #[arg(long)]
     pub forkable: bool,
+
+    /// Pin the clone's inbound port forwards (repeatable). Without this, the
+    /// golden's forwards are remapped to freshly-allocated host ports.
+    #[arg(short = 'p', long = "port", value_parser = PortMapping::parse, value_name = "HOST:GUEST", help_heading = "Network")]
+    pub port: Vec<PortMapping>,
 }
 
 impl ForkCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        vm_common::fork_vm(&self.golden, &self.clone, self.forkable)
+        let ports: Vec<(u16, u16)> = self.port.iter().map(|p| (p.host, p.guest)).collect();
+        vm_common::fork_vm(&self.golden, &self.clone, self.forkable, &ports)
     }
 }
 
