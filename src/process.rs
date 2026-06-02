@@ -290,7 +290,10 @@ pub fn place_in_cgroup(root: &std::path::Path, vcpus: u8, memory_mib: u32) {
 /// `enforce = true`  → a non-allowlisted syscall kills the process (KillProcess).
 /// `enforce = false` → audit mode: non-allowlisted syscalls are logged but allowed
 ///   (SECCOMP Log), so a run surfaces any missing syscalls without breaking the VM.
-#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 pub fn install_seccomp_filter(enforce: bool) -> std::result::Result<(), String> {
     // Build the BPF program (allocates) and apply it (a single seccomp syscall,
     // allocation-free). Split out so tests can build in the parent and apply in a
@@ -302,7 +305,10 @@ pub fn install_seccomp_filter(enforce: bool) -> std::result::Result<(), String> 
 
 /// Compile the syscall allowlist into a seccomp BPF program. See
 /// [`install_seccomp_filter`] for the policy.
-#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 fn build_seccomp_program(enforce: bool) -> std::result::Result<seccompiler::BpfProgram, String> {
     use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, TargetArch};
     use std::collections::BTreeMap;
@@ -365,14 +371,18 @@ fn build_seccomp_program(enforce: bool) -> std::result::Result<seccompiler::BpfP
     // arch-gated. The arm64 set is a starting point — refine from an audit run.
     #[cfg(target_arch = "x86_64")]
     allowed.extend_from_slice(&[
-        libc::SYS_dup2, libc::SYS_readlink, libc::SYS_unlink, libc::SYS_rename,
-        libc::SYS_mkdir, libc::SYS_access, libc::SYS_epoll_wait, libc::SYS_poll,
+        libc::SYS_dup2,
+        libc::SYS_readlink,
+        libc::SYS_unlink,
+        libc::SYS_rename,
+        libc::SYS_mkdir,
+        libc::SYS_access,
+        libc::SYS_epoll_wait,
+        libc::SYS_poll,
         libc::SYS_arch_prctl,
     ]);
     #[cfg(target_arch = "aarch64")]
-    allowed.extend_from_slice(&[
-        libc::SYS_unlinkat, libc::SYS_renameat2, libc::SYS_mkdirat,
-    ]);
+    allowed.extend_from_slice(&[libc::SYS_unlinkat, libc::SYS_renameat2, libc::SYS_mkdirat]);
 
     let rules: BTreeMap<i64, Vec<seccompiler::SeccompRule>> =
         allowed.iter().map(|&nr| (nr, Vec::new())).collect();
@@ -387,13 +397,8 @@ fn build_seccomp_program(enforce: bool) -> std::result::Result<seccompiler::BpfP
     } else {
         TargetArch::x86_64
     };
-    let filter = SeccompFilter::new(
-        rules,
-        mismatch_action,
-        SeccompAction::Allow,
-        target_arch,
-    )
-    .map_err(|e| e.to_string())?;
+    let filter = SeccompFilter::new(rules, mismatch_action, SeccompAction::Allow, target_arch)
+        .map_err(|e| e.to_string())?;
     let program: BpfProgram = match filter.try_into() {
         Ok(prog) => prog,
         Err(e) => return Err(e.to_string()),
@@ -403,7 +408,10 @@ fn build_seccomp_program(enforce: bool) -> std::result::Result<seccompiler::BpfP
 
 /// No-op stub where seccomp isn't applicable (macOS dev, Linux arches other
 /// than x86_64/aarch64).
-#[cfg(not(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+#[cfg(not(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
 pub fn install_seccomp_filter(_enforce: bool) -> std::result::Result<(), String> {
     Ok(())
 }
@@ -1567,7 +1575,10 @@ mod tests {
     /// (`kexec_load`, an escape-amplifying one we never allow) must kill the
     /// process with SIGSYS. The allowed-path is covered by the live boot+exec
     /// test on a Linux/KVM host.
-    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn seccomp_denies_forbidden_syscall() {
         // Build the filter in the parent (allocating), then fork a child that
