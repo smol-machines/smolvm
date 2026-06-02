@@ -151,6 +151,48 @@ pub struct LaunchConfig<'a> {
     pub egress_refresh_hosts: Option<Vec<String>>,
 }
 
+/// Build the `SSL_CERT_*` envp entries that get forwarded into the guest.
+///
+/// Reads from the process environment. Wraps [`ssl_cert_envp_entries_from`].
+fn ssl_cert_envp_entries() -> Vec<CString> {
+    ssl_cert_envp_entries_from(|key| std::env::var(key).ok())
+}
+
+/// Pure form of [`ssl_cert_envp_entries`]: takes a host-env lookup closure
+/// and returns the `SSL_CERT_*` envp entries to forward into the guest.
+///
+/// Behavior pinned by tests:
+///
+/// - `SSL_CERT_FILE` is **not** forwarded as-is. The host path is invisible
+///   inside the VM, and forwarding it would make OpenSSL silently fail (it
+///   does NOT fall back to the default bundle when `SSL_CERT_FILE` points
+///   at a missing path). The build pipeline copies the user-provided bundle
+///   into the rootfs at `/etc/ssl/certs/ca-certificates.crt`, so we
+///   replace the value with that fixed guest path whenever the host has
+///   `SSL_CERT_FILE` set.
+/// - `SSL_CERT_DIR` is forwarded verbatim — callers who set it are expected
+///   to have mounted a matching directory into the guest themselves.
+/// - Both unset → empty Vec, so the guest uses its default trust store.
+fn ssl_cert_envp_entries_from<F>(host_env: F) -> Vec<CString>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    const GUEST_CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
+
+    let mut out = Vec::new();
+    if host_env("SSL_CERT_FILE").is_some() {
+        if let Ok(cs) = CString::new(format!("SSL_CERT_FILE={GUEST_CA_BUNDLE}")) {
+            out.push(cs);
+        }
+    }
+    if let Some(val) = host_env("SSL_CERT_DIR") {
+        if let Ok(cs) = CString::new(format!("SSL_CERT_DIR={val}")) {
+            out.push(cs);
+        }
+    }
+    out
+}
+
 /// Launch the agent VM using libkrun.
 ///
 /// This function never returns on success.
@@ -747,19 +789,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
 
         // Forward TLS certificate config so the agent (and crane) can verify
         // custom CAs (e.g. corporate TLS-intercepting proxies).
-        // Remap host paths to guest-internal paths — the host filesystem
-        // is not visible inside the VM, so forwarding the host path as-is
-        // would cause OpenSSL to fail (and not fall back to the default bundle).
-        if std::env::var("SSL_CERT_FILE").is_ok() {
-            if let Ok(cs) = CString::new("SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt") {
-                env_strings.push(cs);
-            }
-        }
-        if let Ok(val) = std::env::var("SSL_CERT_DIR") {
-            if let Ok(cs) = CString::new(format!("SSL_CERT_DIR={}", val)) {
-                env_strings.push(cs);
-            }
-        }
+        env_strings.extend(ssl_cert_envp_entries());
 
         let mut envp: Vec<*const libc::c_char> = env_strings.iter().map(|s| s.as_ptr()).collect();
         envp.push(std::ptr::null());
@@ -981,5 +1011,101 @@ fn raise_fd_limits() {
             limit.rlim_cur = limit.rlim_max;
             libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the host→guest TLS trust-store env-forwarding logic.
+    //!
+    //! `ssl_cert_envp_entries_from` is a pure function that takes a host-env
+    //! lookup closure and returns the `SSL_CERT_*` envp entries we hand to
+    //! libkrun. The closure-injection seam means the tests don't touch
+    //! `std::env`, so they're hermetic and parallel-safe.
+
+    use super::*;
+
+    /// Fixed guest path the helper substitutes for SSL_CERT_FILE.
+    /// build-agent-rootfs.sh installs the user's bundle at this path inside
+    /// the rootfs. Pinned here so accidental drift breaks the test, not
+    /// production.
+    const EXPECTED_GUEST_CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
+
+    fn entries(env: &[(&str, &str)]) -> Vec<String> {
+        let owned: std::collections::HashMap<String, String> = env
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        ssl_cert_envp_entries_from(|key| owned.get(key).cloned())
+            .into_iter()
+            .map(|cs| cs.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn ssl_cert_envp_entries_returns_empty_when_neither_set() {
+        let got = entries(&[]);
+        assert!(got.is_empty(), "expected empty envp, got {got:?}");
+    }
+
+    #[test]
+    fn ssl_cert_envp_entries_remaps_cert_file_to_fixed_guest_path() {
+        // The host path could be anything — /etc, /usr/local, $HOME, … —
+        // but inside the guest it MUST become the well-known guest path
+        // because build-agent-rootfs.sh always installs the bundle there.
+        let got = entries(&[("SSL_CERT_FILE", "/some/host/only/path/ca.pem")]);
+        assert_eq!(
+            got,
+            vec![format!("SSL_CERT_FILE={EXPECTED_GUEST_CA_BUNDLE}")]
+        );
+    }
+
+    #[test]
+    fn ssl_cert_envp_entries_remaps_cert_file_regardless_of_host_value() {
+        // Two different host paths must collapse to the same guest path —
+        // the *presence* of SSL_CERT_FILE on the host is the signal, the
+        // value isn't useful inside the guest.
+        let a = entries(&[("SSL_CERT_FILE", "/a/host/ca.pem")]);
+        let b = entries(&[("SSL_CERT_FILE", "/b/host/different.pem")]);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn ssl_cert_envp_entries_passes_cert_dir_through_unchanged() {
+        // SSL_CERT_DIR is forwarded as-is. Caller is expected to mount a
+        // matching directory into the guest themselves; we don't second-
+        // guess the path.
+        let got = entries(&[("SSL_CERT_DIR", "/etc/ssl/certs")]);
+        assert_eq!(got, vec!["SSL_CERT_DIR=/etc/ssl/certs".to_string()]);
+    }
+
+    #[test]
+    fn ssl_cert_envp_entries_emits_both_in_stable_order() {
+        // The agent / OpenSSL doesn't actually care about order, but
+        // pinning it to (FILE, DIR) makes test assertions easy and any
+        // future reordering surfaces here.
+        let got = entries(&[
+            ("SSL_CERT_FILE", "/host/ca.pem"),
+            ("SSL_CERT_DIR", "/host/certs"),
+        ]);
+        assert_eq!(
+            got,
+            vec![
+                format!("SSL_CERT_FILE={EXPECTED_GUEST_CA_BUNDLE}"),
+                "SSL_CERT_DIR=/host/certs".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn ssl_cert_envp_entries_does_not_invent_unset_var() {
+        // If only SSL_CERT_FILE is set, SSL_CERT_DIR must not appear at
+        // all (and vice versa). Inventing a value would silently shadow
+        // any platform default the agent would otherwise pick up.
+        let only_file = entries(&[("SSL_CERT_FILE", "/host/ca.pem")]);
+        assert!(only_file.iter().all(|e| !e.starts_with("SSL_CERT_DIR=")));
+
+        let only_dir = entries(&[("SSL_CERT_DIR", "/host/certs")]);
+        assert!(only_dir.iter().all(|e| !e.starts_with("SSL_CERT_FILE=")));
     }
 }

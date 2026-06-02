@@ -2898,6 +2898,26 @@ fn run_crane(
     )
 }
 
+/// Forward host-side TLS trust-store overrides to a child process.
+///
+/// `crane` (and any TLS-using binary it invokes) reads `SSL_CERT_FILE` and
+/// `SSL_CERT_DIR` to find a custom trust store. When the smolvm host is
+/// behind a corporate TLS-intercepting proxy the user sets these to point
+/// at the corporate CA bundle; we forward them verbatim — `crane` runs on
+/// the host, not in the guest, so guest paths would be wrong here.
+///
+/// If a variable is unset on the host we leave the child's environment
+/// untouched (don't shadow with empty), so `crane` can fall back to the
+/// system default trust store.
+fn apply_ssl_cert_env(cmd: &mut Command) {
+    if let Ok(cert_file) = std::env::var("SSL_CERT_FILE") {
+        cmd.env("SSL_CERT_FILE", cert_file);
+    }
+    if let Ok(cert_dir) = std::env::var("SSL_CERT_DIR") {
+        cmd.env("SSL_CERT_DIR", cert_dir);
+    }
+}
+
 /// Execute a single crane command attempt.
 fn run_crane_once(
     operation: &str,
@@ -2912,12 +2932,7 @@ fn run_crane_once(
         cmd.arg("--platform").arg(p);
     }
 
-    if let Ok(cert_file) = std::env::var("SSL_CERT_FILE") {
-        cmd.env("SSL_CERT_FILE", cert_file);
-    }
-    if let Ok(cert_dir) = std::env::var("SSL_CERT_DIR") {
-        cmd.env("SSL_CERT_DIR", cert_dir);
-    }
+    apply_ssl_cert_env(&mut cmd);
 
     // Set up auth if provided (temp_dir must stay alive until command completes)
     let _temp_dir = setup_docker_auth(image, auth)?;
@@ -3254,7 +3269,126 @@ mod tests {
         assert!(ensure_mount_target_under_root(&rootfs, "/link-out/dir").is_err());
     }
 
-    #[cfg(unix)]
+    // --- apply_ssl_cert_env ---------------------------------------------
+    //
+    // These tests pin the SSL trust-store env-forwarding behavior used by
+    // the host-side `crane` invocations. Because Command's configured env
+    // can't be inspected directly via the public API, we run a tiny child
+    // shell (`/bin/sh -c 'env'`) and grep the output. The command is the
+    // built-in `/bin/sh`/`env` pair, available on every macOS+Linux dev
+    // machine and CI image, so the test stays hermetic.
+
+    fn collect_command_env(cmd: &mut Command) -> std::collections::HashMap<String, String> {
+        // Run an empty shell and dump the env Command actually applied.
+        let out = cmd
+            .arg("-c")
+            .arg("env")
+            .output()
+            .expect("spawning /bin/sh -c env should succeed");
+        assert!(
+            out.status.success(),
+            "child shell failed: stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| {
+                let (k, v) = line.split_once('=')?;
+                Some((k.to_string(), v.to_string()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn apply_ssl_cert_env_forwards_cert_file_when_set() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var("SSL_CERT_FILE", "/host/path/ca-bundle.pem");
+        std::env::remove_var("SSL_CERT_DIR");
+
+        let mut cmd = Command::new("/bin/sh");
+        // env_clear so we read only what apply_ssl_cert_env added; the
+        // real run_crane_once call site doesn't clear, but for assertion
+        // purposes this isolates the helper's contribution.
+        cmd.env_clear();
+        apply_ssl_cert_env(&mut cmd);
+        let env = collect_command_env(&mut cmd);
+
+        assert_eq!(
+            env.get("SSL_CERT_FILE").map(String::as_str),
+            Some("/host/path/ca-bundle.pem")
+        );
+        assert!(
+            !env.contains_key("SSL_CERT_DIR"),
+            "SSL_CERT_DIR was unset on the host; helper must not invent it"
+        );
+
+        std::env::remove_var("SSL_CERT_FILE");
+    }
+
+    #[test]
+    fn apply_ssl_cert_env_forwards_cert_dir_when_set() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::remove_var("SSL_CERT_FILE");
+        std::env::set_var("SSL_CERT_DIR", "/host/path/certs");
+
+        let mut cmd = Command::new("/bin/sh");
+        cmd.env_clear();
+        apply_ssl_cert_env(&mut cmd);
+        let env = collect_command_env(&mut cmd);
+
+        assert!(
+            !env.contains_key("SSL_CERT_FILE"),
+            "SSL_CERT_FILE was unset on the host; helper must not invent it"
+        );
+        assert_eq!(
+            env.get("SSL_CERT_DIR").map(String::as_str),
+            Some("/host/path/certs")
+        );
+
+        std::env::remove_var("SSL_CERT_DIR");
+    }
+
+    #[test]
+    fn apply_ssl_cert_env_forwards_both_when_both_set() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var("SSL_CERT_FILE", "/host/path/ca-bundle.pem");
+        std::env::set_var("SSL_CERT_DIR", "/host/path/certs");
+
+        let mut cmd = Command::new("/bin/sh");
+        cmd.env_clear();
+        apply_ssl_cert_env(&mut cmd);
+        let env = collect_command_env(&mut cmd);
+
+        assert_eq!(
+            env.get("SSL_CERT_FILE").map(String::as_str),
+            Some("/host/path/ca-bundle.pem")
+        );
+        assert_eq!(
+            env.get("SSL_CERT_DIR").map(String::as_str),
+            Some("/host/path/certs")
+        );
+
+        std::env::remove_var("SSL_CERT_FILE");
+        std::env::remove_var("SSL_CERT_DIR");
+    }
+
+    #[test]
+    fn apply_ssl_cert_env_is_a_no_op_when_neither_is_set() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::remove_var("SSL_CERT_FILE");
+        std::env::remove_var("SSL_CERT_DIR");
+
+        let mut cmd = Command::new("/bin/sh");
+        cmd.env_clear();
+        apply_ssl_cert_env(&mut cmd);
+        let env = collect_command_env(&mut cmd);
+
+        // Neither override should appear, leaving the child to use the
+        // platform's default trust store.
+        assert!(!env.contains_key("SSL_CERT_FILE"));
+        assert!(!env.contains_key("SSL_CERT_DIR"));
+    }
+
     #[test]
     fn test_ensure_mount_target_under_root_replaces_intra_rootfs_symlink_with_dir() {
         use std::os::unix::fs::symlink;
