@@ -648,6 +648,72 @@ pub async fn stop_machine(
     Ok(Json(record_to_info(&name, &record)))
 }
 
+/// Gracefully stop every running VM before the server exits. Opt-in via
+/// `SMOLVM_DRAIN_ON_SHUTDOWN` (set by cloud workers); off by default so a dev
+/// Ctrl-C or `serve` restart leaves VMs running for reconnect. Without draining,
+/// a host teardown (e.g. autoscaler scale-in) hard-kills running VMs; draining
+/// stops them cleanly — flushing disk state and marking them stopped so the
+/// control plane can reschedule. Best-effort, concurrent, and bounded so it fits
+/// inside the host's termination grace period.
+pub async fn drain_machines(state: &Arc<ApiState>) {
+    let running: Vec<(String, Option<i32>, Option<u64>)> = match state.db().list_vms() {
+        Ok(vms) => vms
+            .into_iter()
+            .filter(|(_, r)| r.actual_state() == RecordState::Running && r.is_process_alive())
+            .map(|(name, r)| (name, r.pid, r.pid_start_time))
+            .collect(),
+        Err(e) => {
+            tracing::error!(error = %e, "drain: failed to list machines");
+            return;
+        }
+    };
+    if running.is_empty() {
+        return;
+    }
+    tracing::info!(count = running.len(), "draining running machines before shutdown");
+
+    let mut handles = Vec::with_capacity(running.len());
+    for (name, pid, pid_start_time) in running {
+        let state = state.clone();
+        handles.push(tokio::spawn(async move {
+            let name_for_kill = name.clone();
+            let entry = state.get_machine(&name).ok();
+            let stopped = tokio::task::spawn_blocking(move || {
+                // Prefer the registered manager (holds the flock); fall back to a
+                // PID-verified signal — same path as the stop handler.
+                let via_manager = entry
+                    .as_ref()
+                    .map(|e| e.lock().manager.stop().is_ok())
+                    .unwrap_or(false);
+                via_manager || shutdown_machine_process(&name_for_kill, pid, pid_start_time)
+            })
+            .await
+            .unwrap_or(false);
+            if let Ok(entry) = state.get_machine(&name) {
+                entry.lock().manager.mark_stopped();
+            }
+            let _ = state.db().update_vm(&name, |r| {
+                r.state = RecordState::Stopped;
+                r.pid = None;
+                r.pid_start_time = None;
+            });
+            tracing::info!(machine = %name, stopped, "drain: machine stopped");
+        }));
+    }
+
+    let drain_all = async {
+        for h in handles {
+            let _ = h.await;
+        }
+    };
+    if tokio::time::timeout(std::time::Duration::from_secs(25), drain_all)
+        .await
+        .is_err()
+    {
+        tracing::warn!("drain: deadline reached before all machines stopped");
+    }
+}
+
 /// Delete a machine.
 #[utoipa::path(
     delete,

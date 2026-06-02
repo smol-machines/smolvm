@@ -197,6 +197,7 @@ impl ServeStartCmd {
         });
 
         // Create router
+        let drain_state = state.clone();
         let app = smolvm::api::create_router(state, self.cors_origins.clone());
 
         // Listen server on TCP or Unix socket
@@ -204,6 +205,18 @@ impl ServeStartCmd {
             ListenTarget::Tcp(addr) => self.serve_tcp(addr, app).await?,
             #[cfg(unix)]
             ListenTarget::Unix(path) => self.serve_unix(path, app).await?,
+        }
+
+        // The HTTP server has stopped accepting (graceful shutdown on SIGTERM).
+        // VMs survive a normal `serve` restart (reconnect on next start), so this
+        // is opt-in: on a host teardown (autoscaler scale-in) set
+        // SMOLVM_DRAIN_ON_SHUTDOWN to stop running VMs cleanly — flushing disk
+        // state — instead of letting the host hard-kill them.
+        let drain = std::env::var("SMOLVM_DRAIN_ON_SHUTDOWN")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(false);
+        if drain {
+            smolvm::api::handlers::machines::drain_machines(&drain_state).await;
         }
 
         // Signal all background tasks to stop
@@ -346,7 +359,8 @@ impl Drop for UnixSocketGuard {
 }
 
 /// Wait for shutdown signal.
-/// Note: VMs are NOT stopped on server shutdown - they run independently.
+/// Note: VMs run independently and survive a normal shutdown/restart; they are
+/// only stopped when SMOLVM_DRAIN_ON_SHUTDOWN is set (see run_server).
 /// Use DELETE /api/v1/machines/:id to stop specific VMs.
 async fn shutdown_signal() {
     let ctrl_c = async {
