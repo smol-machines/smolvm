@@ -45,8 +45,8 @@ if [[ "${SKIP_DEPS:-0}" != "1" ]] && command -v apt-get >/dev/null 2>&1; then
     # kernel build (libkrunfw)        + libkrun (rust/bindgen) + git-lfs/runtime
     sudo apt-get install -y -q \
         build-essential flex bison libelf-dev libssl-dev bc cpio rsync kmod \
-        python3 pkg-config clang llvm libclang-dev curl git git-lfs \
-        $([[ "$GPU" == "1" ]] && echo libvirglrenderer-dev || true)
+        python3 python3-pyelftools pkg-config clang llvm libclang-dev curl git git-lfs \
+        $([[ "$GPU" == "1" ]] && echo "libvirglrenderer-dev libepoxy-dev libdrm-dev libgbm-dev" || true)
     if ! command -v cargo >/dev/null 2>&1; then
         echo "--- installing rust toolchain ---"
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
@@ -57,8 +57,14 @@ fi
 command -v cargo >/dev/null 2>&1 || { source "$HOME/.cargo/env" 2>/dev/null || true; }
 
 # Ensure the submodules + LFS are present (the kernel config lives in-tree).
-git submodule update --init libkrun libkrunfw
-git lfs pull 2>/dev/null || true
+# Tolerate running on rsync'd working trees (no parent .git) — the libkrun /
+# libkrunfw dirs just need to already contain the patched source.
+if [ -d .git ]; then
+    git submodule update --init libkrun libkrunfw || true
+    git lfs pull 2>/dev/null || true
+fi
+[ -f libkrunfw/Makefile ] && [ -d libkrun/src ] \
+    || { echo "ERROR: libkrun/ and libkrunfw/ source must be present (clone or rsync them here)." >&2; exit 1; }
 
 # bindgen needs to find libclang at runtime on some distros.
 if [[ -z "${LIBCLANG_PATH:-}" ]]; then
@@ -68,8 +74,10 @@ fi
 
 # --- 2. libkrunfw (guest kernel) ---------------------------------------------
 echo "--- building libkrunfw (kernel ${ARCH}; this is the slow step) ---"
-make -C libkrunfw clean 2>/dev/null || true
-make -C libkrunfw GUESTARCH="${ARCH}"
+# Build from INSIDE the dir, NOT `make -C`: `-C` auto-enables -w (print-dir),
+# which lands in MAKEFLAGS as a bare `w`; the kernel's `$(MAKE) $(MAKEFLAGS)`
+# recipe then dies with "No rule to make target 'w'". -j scales the kernel build.
+( cd libkrunfw && make clean >/dev/null 2>&1 || true; make -j"$(nproc)" GUESTARCH="${ARCH}" )
 KRUNFW_SO="$(ls -1 libkrunfw/libkrunfw.so.*.*.* 2>/dev/null | head -1)"
 [[ -n "$KRUNFW_SO" ]] || { echo "ERROR: libkrunfw build produced no .so" >&2; exit 1; }
 
@@ -81,9 +89,8 @@ file libkrun/init/init | grep -q 'statically linked' \
 
 # --- 4. libkrun (VMM) --------------------------------------------------------
 echo "--- building libkrun (BLK=1 NET=1 ${GPU_FLAG}) ---"
-make -C libkrun clean 2>/dev/null || true
-KRUN_INIT_BINARY_PATH="$(realpath libkrun/init/init)" \
-    make -C libkrun BLK=1 NET=1 "${GPU_FLAG}"
+( cd libkrun && make clean >/dev/null 2>&1 || true; \
+  KRUN_INIT_BINARY_PATH="$(realpath init/init)" make --no-print-directory BLK=1 NET=1 "${GPU_FLAG}" )
 KRUN_SO="$(ls -1 libkrun/target/release/libkrun.so.*.*.* 2>/dev/null | head -1)"
 [[ -n "$KRUN_SO" ]] || { echo "ERROR: libkrun build produced no .so" >&2; exit 1; }
 
