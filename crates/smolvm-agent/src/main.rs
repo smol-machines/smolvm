@@ -1644,13 +1644,13 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
         patch_timeout_ms(&mut request, &buf[..len]);
 
         let _span = if let Some(ref tid) = trace_id {
-            tracing::info_span!("request", trace_id = %tid, method = ?request)
+            tracing::info_span!("request", trace_id = %tid, method = %request.log_summary())
         } else {
-            tracing::info_span!("request", method = ?request)
+            tracing::info_span!("request", method = %request.log_summary())
         };
         let _guard = _span.enter();
 
-        debug!(?request, "received request");
+        debug!(method = %request.log_summary(), "received request");
 
         // Check if this is an interactive run request
         if let AgentRequest::Run {
@@ -1748,7 +1748,7 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
         // already handled cleanup.
         if write_session.is_some() {
             debug!(
-                method = ?request,
+                method = %request.log_summary(),
                 "dropping in-flight FileWrite session: non-chunk request arrived"
             );
             write_session = None;

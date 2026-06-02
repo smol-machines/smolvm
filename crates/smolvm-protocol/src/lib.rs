@@ -376,6 +376,44 @@ pub enum AgentRequest {
     },
 }
 
+impl AgentRequest {
+    /// A log-safe one-line summary of the request.
+    ///
+    /// This string is written to the machine's console log, which is exposed
+    /// over the logs API — so it must NEVER include credential- or data-bearing
+    /// fields: registry `auth`, `env` (which can carry host-resolved secrets),
+    /// `proxy` (may embed credentials), or `data` (file/stdin bytes). Only the
+    /// variant name plus a non-secret identifier (image) is emitted.
+    ///
+    /// The match is exhaustive with no catch-all on purpose: adding a new
+    /// variant forces a compile error here, so redaction is a deliberate
+    /// decision rather than an accidental leak in some future request type.
+    pub fn log_summary(&self) -> String {
+        match self {
+            AgentRequest::Ping => "Ping".into(),
+            AgentRequest::Pull { image, .. } => format!("Pull {{ image: {image} }}"),
+            AgentRequest::Query { image, .. } => format!("Query {{ image: {image} }}"),
+            AgentRequest::ListImages => "ListImages".into(),
+            AgentRequest::GarbageCollect { .. } => "GarbageCollect".into(),
+            AgentRequest::PrepareOverlay { .. } => "PrepareOverlay".into(),
+            AgentRequest::CleanupOverlay { .. } => "CleanupOverlay".into(),
+            AgentRequest::FormatStorage => "FormatStorage".into(),
+            AgentRequest::StorageStatus => "StorageStatus".into(),
+            AgentRequest::NetworkTest { .. } => "NetworkTest".into(),
+            AgentRequest::Shutdown => "Shutdown".into(),
+            AgentRequest::ExportLayer { .. } => "ExportLayer".into(),
+            AgentRequest::VmExec { .. } => "VmExec".into(),
+            AgentRequest::Run { image, .. } => format!("Run {{ image: {image} }}"),
+            AgentRequest::Stdin { .. } => "Stdin".into(),
+            AgentRequest::Resize { .. } => "Resize".into(),
+            AgentRequest::FileWrite { .. } => "FileWrite".into(),
+            AgentRequest::FileWriteBegin { .. } => "FileWriteBegin".into(),
+            AgentRequest::FileWriteChunk { .. } => "FileWriteChunk".into(),
+            AgentRequest::FileRead { .. } => "FileRead".into(),
+        }
+    }
+}
+
 /// Agent response types.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -671,12 +709,26 @@ pub struct StorageStatus {
 }
 
 /// Registry authentication credentials for pulling images.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written to redact the password: this value is carried inside
+/// `AgentRequest::Pull`, and any `{:?}` of that request (e.g. a tracing span)
+/// would otherwise serialize the token verbatim into the machine's console log,
+/// which is exposed over the logs API.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct RegistryAuth {
     /// Username for authentication.
     pub username: String,
     /// Password or token for authentication.
     pub password: String,
+}
+
+impl std::fmt::Debug for RegistryAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegistryAuth")
+            .field("username", &self.username)
+            .field("password", &"***")
+            .finish()
+    }
 }
 
 // ============================================================================
