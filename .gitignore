@@ -24,6 +24,11 @@ Cargo.lock
 /dist/smolvm-*/
 /dist/*.tar.gz
 
+# Nix/devshell artifacts
+/.direnv/
+/result
+/result-*
+
 # Bundled libraries are in the /lib (large binaries - download or build locally)
 # These are bundled into release tarballs by build-dist.sh
 
