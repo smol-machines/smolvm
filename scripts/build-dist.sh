@@ -250,6 +250,20 @@ fi
 echo "Building release binaries..."
 LIBKRUN_BUNDLE="$WORK_LIB_DIR" cargo build --release --bin smolvm
 
+# Build the unified `smol` CLI if its source is present (it lives in a sibling
+# repo checked out at ./smol). It is a separate cargo workspace that depends on
+# the engine by path, so build it from inside ./smol with an ABSOLUTE
+# LIBKRUN_BUNDLE so its build.rs finds the same bundled libraries we ship.
+BUILD_SMOL=0
+if [[ -f "./smol/Cargo.toml" ]]; then
+    echo "Building unified smol CLI..."
+    _ABS_LIB_BUNDLE="$(cd "$WORK_LIB_DIR" && pwd)"
+    ( cd ./smol && LIBKRUN_BUNDLE="$_ABS_LIB_BUNDLE" cargo build --release --bin smol )
+    BUILD_SMOL=1
+else
+    echo "smol CLI source (./smol) not found — building engine-only distribution"
+fi
+
 # Build smolvm-agent for Linux (size-optimized)
 if [[ "$SKIP_AGENT_BUILD" == "1" ]]; then
     echo "Skipping agent build (--skip-agent-build)"
@@ -299,6 +313,11 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
     fi
     echo "Signing binary (identity: $IDENTITY)..."
     codesign "${CODESIGN_ARGS[@]}" ./target/release/smolvm
+    # The smol binary also calls the macOS hypervisor, so it needs the same
+    # entitlements + signature (otherwise it cannot start a VM).
+    if [[ "$BUILD_SMOL" == "1" ]]; then
+        codesign "${CODESIGN_ARGS[@]}" ./smol/target/release/smol
+    fi
 fi
 
 # Create distribution directory
@@ -312,6 +331,15 @@ cp ./target/release/smolvm "$DIST_DIR/smolvm-bin"
 # Copy wrapper script
 cp ./scripts/smolvm-wrapper.sh "$DIST_DIR/smolvm"
 chmod +x "$DIST_DIR/smolvm"
+
+# Copy the unified smol CLI (binary renamed to smol-bin + its own wrapper).
+# The wrapper points at the same lib/ and agent-rootfs, so one tarball serves
+# both `smol` (the user-facing CLI) and `smolvm` (the lower-level engine).
+if [[ "$BUILD_SMOL" == "1" ]]; then
+    cp ./smol/target/release/smol "$DIST_DIR/smol-bin"
+    cp ./scripts/smol-wrapper.sh "$DIST_DIR/smol"
+    chmod +x "$DIST_DIR/smol"
+fi
 
 # Copy libraries
 if [[ "$(uname -s)" == "Darwin" ]]; then
