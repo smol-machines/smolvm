@@ -290,7 +290,7 @@ pub fn place_in_cgroup(root: &std::path::Path, vcpus: u8, memory_mib: u32) {
 /// `enforce = true`  → a non-allowlisted syscall kills the process (KillProcess).
 /// `enforce = false` → audit mode: non-allowlisted syscalls are logged but allowed
 ///   (SECCOMP Log), so a run surfaces any missing syscalls without breaking the VM.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub fn install_seccomp_filter(enforce: bool) -> std::result::Result<(), String> {
     // Build the BPF program (allocates) and apply it (a single seccomp syscall,
     // allocation-free). Split out so tests can build in the parent and apply in a
@@ -302,7 +302,7 @@ pub fn install_seccomp_filter(enforce: bool) -> std::result::Result<(), String> 
 
 /// Compile the syscall allowlist into a seccomp BPF program. See
 /// [`install_seccomp_filter`] for the policy.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn build_seccomp_program(enforce: bool) -> std::result::Result<seccompiler::BpfProgram, String> {
     use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, TargetArch};
     use std::collections::BTreeMap;
@@ -315,16 +315,15 @@ fn build_seccomp_program(enforce: bool) -> std::result::Result<seccompiler::BpfP
     // a security allowlist is far easier to audit when related syscalls sit
     // together under a category comment.
     #[rustfmt::skip]
-    let allowed: &[libc::c_long] = &[
+    let mut allowed: Vec<libc::c_long> = vec![
         // file & block I/O (storage/overlay disks, virtio-blk, layer files)
         libc::SYS_read, libc::SYS_write, libc::SYS_pread64, libc::SYS_pwrite64,
         libc::SYS_preadv, libc::SYS_pwritev, libc::SYS_openat, libc::SYS_close,
         libc::SYS_close_range, libc::SYS_lseek, libc::SYS_fsync, libc::SYS_fallocate,
         libc::SYS_ftruncate, libc::SYS_fstat, libc::SYS_newfstatat, libc::SYS_statx,
         libc::SYS_fstatfs, libc::SYS_statfs, libc::SYS_fcntl, libc::SYS_flock,
-        libc::SYS_dup, libc::SYS_dup2, libc::SYS_dup3, libc::SYS_getdents64,
-        libc::SYS_readlink, libc::SYS_readlinkat, libc::SYS_unlink, libc::SYS_rename,
-        libc::SYS_mkdir, libc::SYS_access, libc::SYS_faccessat, libc::SYS_umask,
+        libc::SYS_dup, libc::SYS_dup3, libc::SYS_getdents64,
+        libc::SYS_readlinkat, libc::SYS_faccessat, libc::SYS_umask,
         libc::SYS_fgetxattr, libc::SYS_flistxattr, libc::SYS_pipe2,
         // memory (guest RAM, dlopen of libkrun)
         libc::SYS_mmap, libc::SYS_munmap, libc::SYS_mremap, libc::SYS_mprotect,
@@ -332,8 +331,8 @@ fn build_seccomp_program(enforce: bool) -> std::result::Result<seccompiler::BpfP
         // KVM + device ioctls, eventfd plumbing
         libc::SYS_ioctl, libc::SYS_eventfd2,
         // epoll / poll event loops (virtio, vsock/TSI)
-        libc::SYS_epoll_create1, libc::SYS_epoll_ctl, libc::SYS_epoll_wait,
-        libc::SYS_epoll_pwait, libc::SYS_poll, libc::SYS_ppoll,
+        libc::SYS_epoll_create1, libc::SYS_epoll_ctl,
+        libc::SYS_epoll_pwait, libc::SYS_ppoll,
         // sockets (vsock/TSI data path, host networking)
         libc::SYS_socket, libc::SYS_socketpair, libc::SYS_connect, libc::SYS_bind,
         libc::SYS_listen, libc::SYS_accept, libc::SYS_sendto, libc::SYS_recvfrom,
@@ -354,11 +353,26 @@ fn build_seccomp_program(enforce: bool) -> std::result::Result<seccompiler::BpfP
         libc::SYS_gettimeofday,
         // process lifecycle & misc identity/limits
         libc::SYS_wait4, libc::SYS_exit, libc::SYS_exit_group, libc::SYS_restart_syscall,
-        libc::SYS_prctl, libc::SYS_arch_prctl, libc::SYS_prlimit64, libc::SYS_getrusage,
+        libc::SYS_prctl, libc::SYS_prlimit64, libc::SYS_getrusage,
         libc::SYS_sysinfo, libc::SYS_uname, libc::SYS_getrandom,
         libc::SYS_getuid, libc::SYS_geteuid, libc::SYS_getgid, libc::SYS_getegid,
         libc::SYS_capget, libc::SYS_setpgid,
     ];
+
+    // Legacy syscalls present only on x86_64; aarch64 exposes only the *at/p
+    // variants (already in the common list above) plus a few of its own. These
+    // libc::SYS_* constants don't exist on the other arch, so they must be
+    // arch-gated. The arm64 set is a starting point — refine from an audit run.
+    #[cfg(target_arch = "x86_64")]
+    allowed.extend_from_slice(&[
+        libc::SYS_dup2, libc::SYS_readlink, libc::SYS_unlink, libc::SYS_rename,
+        libc::SYS_mkdir, libc::SYS_access, libc::SYS_epoll_wait, libc::SYS_poll,
+        libc::SYS_arch_prctl,
+    ]);
+    #[cfg(target_arch = "aarch64")]
+    allowed.extend_from_slice(&[
+        libc::SYS_unlinkat, libc::SYS_renameat2, libc::SYS_mkdirat,
+    ]);
 
     let rules: BTreeMap<i64, Vec<seccompiler::SeccompRule>> =
         allowed.iter().map(|&nr| (nr, Vec::new())).collect();
@@ -368,11 +382,16 @@ fn build_seccomp_program(enforce: bool) -> std::result::Result<seccompiler::BpfP
     } else {
         SeccompAction::Log
     };
+    let target_arch = if cfg!(target_arch = "aarch64") {
+        TargetArch::aarch64
+    } else {
+        TargetArch::x86_64
+    };
     let filter = SeccompFilter::new(
         rules,
         mismatch_action,
         SeccompAction::Allow,
-        TargetArch::x86_64,
+        target_arch,
     )
     .map_err(|e| e.to_string())?;
     let program: BpfProgram = match filter.try_into() {
@@ -382,8 +401,9 @@ fn build_seccomp_program(enforce: bool) -> std::result::Result<seccompiler::BpfP
     Ok(program)
 }
 
-/// No-op stub where seccomp isn't applicable (macOS dev, non-x86_64 Linux).
-#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+/// No-op stub where seccomp isn't applicable (macOS dev, Linux arches other
+/// than x86_64/aarch64).
+#[cfg(not(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))))]
 pub fn install_seccomp_filter(_enforce: bool) -> std::result::Result<(), String> {
     Ok(())
 }
@@ -1547,7 +1567,7 @@ mod tests {
     /// (`kexec_load`, an escape-amplifying one we never allow) must kill the
     /// process with SIGSYS. The allowed-path is covered by the live boot+exec
     /// test on a Linux/KVM host.
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
     fn seccomp_denies_forbidden_syscall() {
         // Build the filter in the parent (allocating), then fork a child that
