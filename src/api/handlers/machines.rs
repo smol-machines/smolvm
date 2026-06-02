@@ -670,7 +670,10 @@ pub async fn drain_machines(state: &Arc<ApiState>) {
     if running.is_empty() {
         return;
     }
-    tracing::info!(count = running.len(), "draining running machines before shutdown");
+    tracing::info!(
+        count = running.len(),
+        "draining running machines before shutdown"
+    );
 
     let mut handles = Vec::with_capacity(running.len());
     for (name, pid, pid_start_time) in running {
