@@ -249,6 +249,7 @@ pub async fn create_machine(
         manifest_cpus,
         manifest_mem,
         manifest_net,
+        manifest_secret_refs,
     ) = if let Some(ref sidecar_path) = req.from {
         let path = std::path::Path::new(sidecar_path);
         if !path.exists() {
@@ -278,6 +279,19 @@ pub async fn create_machine(
                     .map(|(k, v)| (k.to_string(), v.to_string()))
             })
             .collect();
+        // A .smolmachine is an untrusted, portable artifact: validate its secret
+        // refs Untrusted (store-only) so a packed from_env/from_file can't read
+        // this host's env/files at exec time. Reject rather than carry/exfil.
+        for (key, r) in &manifest.secret_refs {
+            crate::secrets::validate_ref(r, crate::secrets::ResolutionScope::Untrusted).map_err(
+                |e| {
+                    ApiError::BadRequest(format!(
+                        "packed secret '{}': {} (packs may only carry from_store refs)",
+                        key, e
+                    ))
+                },
+            )?;
+        }
         (
             Some(manifest.image),
             Some(canonical),
@@ -288,6 +302,7 @@ pub async fn create_machine(
             manifest.cpus,
             manifest.mem,
             manifest.network,
+            manifest.secret_refs,
         )
     } else {
         (
@@ -300,6 +315,7 @@ pub async fn create_machine(
             crate::data::resources::DEFAULT_MICROVM_CPU_COUNT,
             crate::data::resources::DEFAULT_MICROVM_MEMORY_MIB,
             req.network,
+            Default::default(),
         )
     };
 
@@ -370,7 +386,15 @@ pub async fn create_machine(
         cmd,
         env,
         workdir,
-        secret_refs: req.secrets.clone(),
+        // Record secrets = packed refs from --from (validated Untrusted above)
+        // merged with request refs (validated Untrusted at ~line 333); request
+        // refs win on key collision. Both sources are store-only, so RecordReplay
+        // resolution at exec time stays safe.
+        secret_refs: {
+            let mut s = manifest_secret_refs;
+            s.extend(req.secrets.clone());
+            s
+        },
     })?;
 
     // Fetch the persisted record for the response

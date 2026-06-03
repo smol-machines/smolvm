@@ -748,7 +748,10 @@ impl RunCmd {
                             &vm_name,
                             manager.child_pid(),
                             Some(DefaultVmOverrides {
-                                secret_refs: Default::default(),
+                                // Persist the REFS (re-resolved at each start via
+                                // record_env_with_secrets), never the resolved
+                                // plaintext — see `env` below.
+                                secret_refs: params.secret_refs.clone(),
                                 cpus: params.cpus,
                                 mem: params.mem,
                                 mounts: mount_tuples,
@@ -759,7 +762,16 @@ impl RunCmd {
                                 overlay_gb: params.overlay_gb,
                                 allowed_cidrs: params.allowed_cidrs.clone(),
                                 init: params.init.clone(),
-                                env: defaults.env.clone(),
+                                // Strip resolved secret values so plaintext never
+                                // reaches the DB/pack record. defaults.env still
+                                // carries them for RUNNING the container above; the
+                                // record keeps only refs + non-secret env.
+                                env: defaults
+                                    .env
+                                    .iter()
+                                    .filter(|(k, _)| !params.secret_refs.contains_key(k))
+                                    .cloned()
+                                    .collect(),
                                 workdir: defaults.workdir.clone(),
                                 user: defaults.user.clone(),
                                 image: Some(img.clone()),
@@ -888,7 +900,9 @@ impl RunCmd {
                         &vm_name,
                         manager.child_pid(),
                         Some(DefaultVmOverrides {
-                            secret_refs: Default::default(),
+                            // Persist the refs so secrets re-resolve on restart
+                            // (env below is already secret-free: parse_env_list).
+                            secret_refs: params.secret_refs.clone(),
                             cpus: params.cpus,
                             mem: params.mem,
                             mounts: mount_tuples,
@@ -1541,8 +1555,23 @@ impl CreateCmd {
             manifest.mem
         };
 
+        // A .smolmachine is an untrusted, portable artifact: validate its secret
+        // refs under the Untrusted scope so only `from_store` survives. A packed
+        // `from_env`/`from_file` ref would otherwise read THIS host's env/files at
+        // exec time — reject at create rather than carry an exfil primitive.
+        for (key, r) in &manifest.secret_refs {
+            smolvm::secrets::validate_ref(r, smolvm::secrets::ResolutionScope::Untrusted).map_err(
+                |e| {
+                    smolvm::Error::config(
+                        "create from .smolmachine",
+                        format!("secret '{}': {} (packs may only carry from_store refs)", key, e),
+                    )
+                },
+            )?;
+        }
+
         let params = vm_common::CreateVmParams {
-            secret_refs: Default::default(),
+            secret_refs: manifest.secret_refs,
             name,
             image: Some(manifest.image),
             entrypoint: manifest.entrypoint,

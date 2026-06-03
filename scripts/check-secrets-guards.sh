@@ -47,13 +47,29 @@ else
 fi
 
 # 4. Resolved plaintext must never be assigned back onto a persisted record's
-#    env. Persisted `*.env` assignments may only come from plain sources
-#    (parse_env_list, the request, an override) — never from the resolver.
-if git grep -nE '\.env\s*=' -- 'src/**/*.rs' \
-     | grep -E 'resolve_refs_to_env|record_env_with_secrets|resolve_secret_ref'; then
+#    env. Persisted `*.env =` assignments may only come from plain sources
+#    (parse_env_list, the request, an override) — never from a resolver.
+#    NOTE: this catches the DIRECT case only; multi-hop laundering (resolver ->
+#    local -> defaults.env -> persist) is NOT visible to grep and still needs
+#    review — the durable fix is a non-Serialize `Secret<String>` newtype.
+#    (Earlier this used a literal `**` pathspec + `\s`, which git grep silently
+#    matches against nothing, so the check never ran. Use real dir pathspecs and
+#    POSIX-ERE ` *`, and scan the pack crate too.)
+if git grep -nE '\.env *=' -- src crates \
+     | grep -E 'resolve_refs_to_env|record_env_with_secrets|resolve_secret_ref|resolve_secret_refs_for_env'; then
   note "a persisted .env is assigned from a secret resolver — plaintext would reach the DB"
 else
-  ok "no persisted .env is assigned from a secret resolver"
+  ok "no persisted .env directly assigned from a secret resolver"
+fi
+
+# 5. A .smolmachine is a portable, untrusted artifact: its packed secret refs
+#    must resolve under the Untrusted scope (from_store only) so a downloaded
+#    pack cannot read the running host's env/files via from_env/from_file.
+if git grep -nE 'manifest\.secret_refs' -- src/cli/pack_run.rs \
+     | grep -qE 'RecordReplay|TrustedLocal'; then
+  note "pack_run resolves manifest secret refs under a trusting scope — host env/file exfil risk"
+else
+  ok "packed secret refs resolve under Untrusted scope"
 fi
 
 if [ "$fail" -ne 0 ]; then

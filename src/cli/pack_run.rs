@@ -690,10 +690,14 @@ fn build_env(
     // Resolve the packed secret refs to plaintext on this host and inject
     // them. Only refs travel inside the `.smolmachine`; the plaintext is
     // produced here, at run time, and never written back into the pack.
-    // Scope is RecordReplay — the refs were fixed by whoever built the pack.
+    // Scope is Untrusted: a .smolmachine is a portable artifact that may have
+    // been authored on another host or by another party, so only `from_store`
+    // refs (resolved against THIS host's own secret store) are honored. A
+    // `from_env`/`from_file` ref in a pack would read the running host's env or
+    // arbitrary files — reject it (fail closed) rather than exfiltrate.
     env.extend(smolvm::secrets::resolve_refs_to_env(
         &manifest.secret_refs,
-        smolvm::secrets::ResolutionScope::RecordReplay,
+        smolvm::secrets::ResolutionScope::Untrusted,
     )?);
 
     // CLI env overrides manifest env and resolved secrets
