@@ -60,13 +60,26 @@ pub async fn exec_command(
         .await
         .map_err(classify_ensure_running_error)?;
 
+    // Resolve secrets ONCE, before the background/foreground split, so a
+    // detached workload gets them too (a long-lived daemon usually needs its
+    // credentials more than a one-shot exec does). Env precedence (low → high):
+    // req.env (caller-plaintext) → record.secret_refs (persisted by a
+    // TrustedLocal actor) → req.secrets (ad-hoc, Untrusted). Validation runs
+    // before resolution so structural/scope violations surface as 400 without
+    // the resolution audit firing.
+    crate::api::handlers::validate_request_secrets(&req.secrets)?;
+    let record_env = crate::api::handlers::record_secret_refs_env(&entry)?;
+    let req_env = crate::api::handlers::resolve_request_secrets(&req.secrets)?;
+    let mut env = EnvVar::to_tuples(&req.env);
+    env.extend(crate::secrets::expose_into_env(record_env));
+    env.extend(crate::secrets::expose_into_env(req_env));
+
     // Detached/background: spawn the process and return its PID immediately, so a
     // long-lived daemon (dev server, agent runner) keeps running after the
     // request returns. Image machines run it in their container (persistent
     // overlay); plain machines run it in the VM.
     if req.background {
         let command = req.command.clone();
-        let env = EnvVar::to_tuples(&req.env);
         let workdir = req.workdir.clone();
         let machine_image = state
             .db()
@@ -108,19 +121,9 @@ pub async fn exec_command(
         }));
     }
 
-    // Env precedence (low → high): req.env (caller-plaintext) →
-    // record.secret_refs (persisted by a TrustedLocal actor) →
-    // req.secrets (ad-hoc, Untrusted). Validation of req.secrets
-    // happens before resolution so structural/scope violations
-    // surface as 400 without the resolution audit firing.
-    crate::api::handlers::validate_request_secrets(&req.secrets)?;
-    let record_env = crate::api::handlers::record_secret_refs_env(&entry)?;
-    let req_env = crate::api::handlers::resolve_request_secrets(&req.secrets)?;
-
+    // Secrets already resolved into `env` above (shared with the background
+    // path); env precedence is req.env < record.secret_refs < req.secrets.
     let command = req.command.clone();
-    let mut env = EnvVar::to_tuples(&req.env);
-    env.extend(crate::secrets::expose_into_env(record_env));
-    env.extend(crate::secrets::expose_into_env(req_env));
     let workdir = req.workdir.clone();
     let timeout = req.timeout_secs.map(Duration::from_secs);
     let stdin_data = req.stdin.clone();
