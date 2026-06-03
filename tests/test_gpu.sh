@@ -119,6 +119,16 @@ test_renderD128_world_readable() {
     [[ "$out" == *"renderD128"* ]] || { echo "FAIL: stat output unexpected (got: $out)"; return 1; }
 }
 
+test_interactive_run_has_dri() {
+    # `-i`/`-t` uses the agent's interactive OCI bundle path. It must wire
+    # GPU devices just like non-interactive runs, otherwise shells started with
+    # `-it` cannot use Vulkan even though the VM itself has virtio-gpu.
+    local out
+    out=$(run_with_timeout 120 "$SMOLVM" machine run --gpu --net -i --image alpine:latest -- \
+        ls /dev/dri/renderD128 2>&1) || { echo "FAIL: interactive run missing renderD128 (got: $out)"; return 1; }
+    [[ "$out" == *"renderD128"* ]] || { echo "FAIL: interactive run output unexpected (got: $out)"; return 1; }
+}
+
 test_no_dri_without_gpu() {
     # Without --gpu, no virtio-gpu device → no /dev/dri in guest → no DRI
     # devices in OCI container spec. ls /dev/dri should fail or produce nothing.
@@ -169,6 +179,7 @@ test_named_machine_gpu_persists() {
 run_test "GPU: /dev/dri/renderD128 present with --gpu" test_dri_renderD128_present || true
 run_test "GPU: /dev/dri/card0 present with --gpu" test_dri_card0_present || true
 run_test "GPU: renderD128 accessible (stat succeeds)" test_renderD128_world_readable || true
+run_test "GPU: interactive run exposes /dev/dri" test_interactive_run_has_dri || true
 run_test "GPU: no /dev/dri without --gpu (isolation)" test_no_dri_without_gpu || true
 run_test "GPU: --gpu-vram 0 rejected by validation" test_gpu_vram_zero_rejected || true
 run_test "GPU: named machine DB persistence of --gpu flag" test_named_machine_gpu_persists || true

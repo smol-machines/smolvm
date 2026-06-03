@@ -2822,6 +2822,11 @@ fn write_oci_bundle(
         });
     }
 
+    // Interactive and detached containers use this bundle writer instead of
+    // storage::run_command(). Mirror that path's GPU wiring so `-i`/`-t`
+    // shells see /dev/dri when the VM was started with --gpu.
+    spec.add_gpu_devices_if_available();
+
     for (tag, container_path, read_only) in mounts {
         let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
         spec.add_bind_mount(
