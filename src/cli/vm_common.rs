@@ -831,11 +831,11 @@ pub fn start_vm_named(
         let mut bare_cmd = record.entrypoint.clone();
         bare_cmd.extend(record.cmd.clone());
         if !bare_cmd.is_empty() {
-            // Inject resolved secrets into the entrypoint env. The plaintext
-            // stays in this vector and never touches the record or the DB.
-            let env = record_env_with_secrets(&record)?;
+            // Reuse the secrets already resolved into `exec_env` above — avoids
+            // a second store load + decrypt and a duplicate audit-log record.
+            // The plaintext stays in this vector and never touches the record/DB.
             let (exit_code, stdout, stderr) =
-                client.vm_exec(bare_cmd, env.clone(), record.workdir.clone(), None, None)?;
+                client.vm_exec(bare_cmd, exec_env, record.workdir.clone(), None, None)?;
             if !stdout.is_empty() {
                 let _ = std::io::stdout().write_all(&stdout);
             }

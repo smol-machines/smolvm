@@ -326,25 +326,22 @@ impl SecretStore {
         Ok(())
     }
 
-    /// Path to the secret store TOML file.
+    /// Path to the secret store TOML file. Uses the platform config dir
+    /// (`dirs::config_dir`) so the location is correct on macOS too, rather than
+    /// a hard-coded `~/.config` (which only matches Linux).
     pub fn store_path() -> Result<PathBuf> {
-        let home = dirs::home_dir()
-            .ok_or_else(|| Error::config("resolve path", "no home directory found"))?;
-        Ok(home
-            .join(".config")
-            .join("smolvm")
-            .join(DEFAULT_STORE_FILENAME))
+        let dir = dirs::config_dir()
+            .ok_or_else(|| Error::config("resolve path", "no config directory found"))?;
+        Ok(dir.join("smolvm").join(DEFAULT_STORE_FILENAME))
     }
 
-    /// Path to the master encryption key file.
+    /// Path to the master encryption key file. Uses the platform data dir
+    /// (`dirs::data_local_dir`, matching `db.rs`) so the key sits beside the DB
+    /// it protects on every platform, not a hard-coded `~/.local/share`.
     pub fn key_path() -> Result<PathBuf> {
-        let home = dirs::home_dir()
-            .ok_or_else(|| Error::config("resolve path", "no home directory found"))?;
-        Ok(home
-            .join(".local")
-            .join("share")
-            .join("smolvm")
-            .join(DEFAULT_KEY_FILENAME))
+        let dir = dirs::data_local_dir()
+            .ok_or_else(|| Error::config("resolve path", "no data directory found"))?;
+        Ok(dir.join("smolvm").join(DEFAULT_KEY_FILENAME))
     }
 
     /// Store a literal value, encrypting it with AES-256-GCM.
