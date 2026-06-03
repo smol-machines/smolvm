@@ -7,7 +7,7 @@
 //! - Blob download (GET)
 //! - Manifest put/get (PUT/GET)
 
-use crate::{RegistryError, Result, MANIFEST_MEDIA_TYPE};
+use crate::{RegistryError, Result, INDEX_MEDIA_TYPE, MANIFEST_MEDIA_TYPE};
 use reqwest::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, LOCATION, WWW_AUTHENTICATE};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -350,11 +350,17 @@ impl RegistryClient {
 
     /// Upload a manifest for the given reference (tag or digest).
     pub async fn put_manifest(&self, repo: &str, reference: &str, manifest: &[u8]) -> Result<()> {
+        // Honor the document's own `mediaType` so this also PUTs an image index
+        // (the registry validates the Content-Type against the body's mediaType).
+        let media_type = serde_json::from_slice::<serde_json::Value>(manifest)
+            .ok()
+            .and_then(|v| v.get("mediaType").and_then(|m| m.as_str()).map(String::from))
+            .unwrap_or_else(|| MANIFEST_MEDIA_TYPE.to_string());
         let url = format!("{}/v2/{}/manifests/{}", self.base_url, repo, reference);
         let resp = self
             .send_replayable(
                 self.request(reqwest::Method::PUT, &url)
-                    .header(CONTENT_TYPE, MANIFEST_MEDIA_TYPE)
+                    .header(CONTENT_TYPE, media_type)
                     .body(manifest.to_vec()),
             )
             .await?;
@@ -411,6 +417,40 @@ impl RegistryClient {
         }
 
         Ok(resp.bytes().await?.to_vec())
+    }
+
+    /// Fetch a manifest OR image index by reference, returning the raw bytes and
+    /// the document's media type. Unlike [`get_manifest`], this accepts (and does
+    /// not reject) an image index — the caller decides whether to resolve it to a
+    /// platform manifest. Used by `pull` for multi-arch fan-out.
+    pub async fn get_manifest_raw(&self, repo: &str, reference: &str) -> Result<(Vec<u8>, String)> {
+        let url = format!("{}/v2/{}/manifests/{}", self.base_url, repo, reference);
+        let resp = self
+            .send_replayable(
+                self.request(reqwest::Method::GET, &url)
+                    // Advertise BOTH so the registry hands back an index as an
+                    // index (not a server-side-selected manifest).
+                    .header(ACCEPT, format!("{INDEX_MEDIA_TYPE}, {MANIFEST_MEDIA_TYPE}")),
+            )
+            .await?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(RegistryError::BlobNotFound(format!("{}:{}", repo, reference)));
+        }
+        if !resp.status().is_success() {
+            return Err(RegistryError::ApiError {
+                status: resp.status().as_u16(),
+                body: resp.text().await.unwrap_or_default(),
+            });
+        }
+
+        let content_type = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        Ok((resp.bytes().await?.to_vec(), content_type))
     }
 
     /// Resolve a Location header value against the registry base URL.

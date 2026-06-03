@@ -9,7 +9,9 @@
 
 use crate::cache::BlobCache;
 use crate::client::RegistryClient;
-use crate::{OciManifest, RegistryError, Result, LAYER_MEDIA_TYPE};
+use crate::{
+    OciIndex, OciManifest, OciPlatform, RegistryError, Result, INDEX_MEDIA_TYPE, LAYER_MEDIA_TYPE,
+};
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -40,9 +42,37 @@ pub async fn pull(
     output: Option<&Path>,
     cache: &BlobCache,
 ) -> Result<PullResult> {
-    // 1. Fetch manifest.
+    // 1. Fetch the manifest OR image index at the reference.
     tracing::info!(repo = %repo, reference = %reference, "fetching manifest...");
-    let manifest_bytes = client.get_manifest(repo, reference).await?;
+    let (doc_bytes, content_type) = client.get_manifest_raw(repo, reference).await?;
+
+    // If it's a multi-platform index, pick the entry for THIS machine's host
+    // platform and resolve to that single-platform manifest (Docker-style fan-out).
+    let manifest_bytes = if content_type.contains(INDEX_MEDIA_TYPE) || is_index(&doc_bytes) {
+        let index: OciIndex = serde_json::from_slice(&doc_bytes)?;
+        let want = OciPlatform::current();
+        let entry = index
+            .manifests
+            .iter()
+            .find(|m| m.platform.as_ref() == Some(&want))
+            .ok_or_else(|| {
+                let available: Vec<String> = index
+                    .manifests
+                    .iter()
+                    .filter_map(|m| m.platform.as_ref().map(|p| p.label()))
+                    .collect();
+                RegistryError::InvalidManifest(format!(
+                    "no {} build available for this machine; the registry has: {}",
+                    want.label(),
+                    if available.is_empty() { "(none)".into() } else { available.join(", ") }
+                ))
+            })?;
+        tracing::info!(platform = %want.label(), digest = %entry.digest, "selected index entry");
+        client.get_manifest_raw(repo, &entry.digest).await?.0
+    } else {
+        doc_bytes
+    };
+
     let manifest: OciManifest = serde_json::from_slice(&manifest_bytes)?;
 
     // 2. Find the smolmachine layer.
@@ -131,4 +161,17 @@ pub async fn pull(
         size: total_bytes,
         cached: false,
     })
+}
+
+/// Body-level fallback for detecting an image index when the registry didn't set
+/// a reliable `Content-Type` — an index has a `manifests` array (and/or the index
+/// `mediaType`), where a single manifest has `config`/`layers`.
+fn is_index(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()
+        .map(|v| {
+            v.get("manifests").is_some()
+                || v.get("mediaType").and_then(|m| m.as_str()) == Some(INDEX_MEDIA_TYPE)
+        })
+        .unwrap_or(false)
 }

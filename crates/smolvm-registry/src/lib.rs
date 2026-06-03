@@ -43,6 +43,80 @@ pub struct OciDescriptor {
     pub size: u64,
 }
 
+/// OCI image index media type — a multi-platform "fan-out" manifest that points
+/// at one single-platform manifest per (os, arch). A single tag (e.g.
+/// `alpine:latest`) can carry an index so `pull` auto-selects the caller's
+/// platform, exactly like a Docker manifest list.
+pub const INDEX_MEDIA_TYPE: &str = "application/vnd.oci.image.index.v1+json";
+
+/// The platform a manifest targets, as it appears in an index entry. For
+/// smolmachines this is the **host** platform the artifact runs on (it bundles
+/// host-specific libkrun), e.g. `os=linux, architecture=amd64`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OciPlatform {
+    pub os: String,
+    pub architecture: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub variant: Option<String>,
+}
+
+impl OciPlatform {
+    /// The platform of the process running right now, in OCI form (`darwin`/
+    /// `linux`, `arm64`/`amd64`) — matches `PackManifest.host_platform`.
+    pub fn current() -> Self {
+        let os = match std::env::consts::OS {
+            "macos" => "darwin",
+            other => other,
+        };
+        let architecture = match std::env::consts::ARCH {
+            "aarch64" => "arm64",
+            "x86_64" => "amd64",
+            other => other,
+        };
+        Self { os: os.to_string(), architecture: architecture.to_string(), variant: None }
+    }
+
+    /// Parse a `host_platform` string (`"darwin/arm64"`, `"linux/x86_64"`) into a
+    /// platform descriptor, normalizing the arch (`x86_64`→`amd64`,
+    /// `aarch64`→`arm64`) so index entries and `current()` always agree.
+    pub fn parse(host_platform: &str) -> Self {
+        let (os, arch) = host_platform.split_once('/').unwrap_or(("linux", host_platform));
+        let architecture = match arch {
+            "x86_64" => "amd64",
+            "aarch64" => "arm64",
+            other => other,
+        };
+        Self { os: os.to_string(), architecture: architecture.to_string(), variant: None }
+    }
+
+    /// Human label, e.g. `linux/amd64`.
+    pub fn label(&self) -> String {
+        format!("{}/{}", self.os, self.architecture)
+    }
+}
+
+/// One entry in an [`OciIndex`]: a manifest descriptor plus the platform it
+/// targets.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OciIndexManifest {
+    pub media_type: String,
+    pub digest: String,
+    pub size: u64,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub platform: Option<OciPlatform>,
+}
+
+/// OCI image index — references one manifest per platform so a single tag fans
+/// out by architecture.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OciIndex {
+    pub schema_version: u32,
+    pub media_type: String,
+    pub manifests: Vec<OciIndexManifest>,
+}
+
 /// Error type for registry operations.
 #[derive(Debug, thiserror::Error)]
 pub enum RegistryError {
@@ -114,6 +188,69 @@ fn is_loopback_ipv4(s: &str) -> bool {
         return false;
     }
     parts[0] == "127" && parts[1..].iter().all(|p| p.parse::<u8>().is_ok())
+}
+
+#[cfg(test)]
+mod platform_tests {
+    use super::*;
+
+    #[test]
+    fn parse_normalizes_arch_and_os() {
+        // host_platform strings (as written into PackManifest) → OCI platform.
+        let p = OciPlatform::parse("darwin/arm64");
+        assert_eq!((p.os.as_str(), p.architecture.as_str()), ("darwin", "arm64"));
+        // x86_64/aarch64 normalize to amd64/arm64 so index entries and current()
+        // always compare equal.
+        assert_eq!(OciPlatform::parse("linux/x86_64").architecture, "amd64");
+        assert_eq!(OciPlatform::parse("linux/aarch64").architecture, "arm64");
+        assert_eq!(OciPlatform::parse("linux/amd64").label(), "linux/amd64");
+        // Missing slash → defaults os to linux.
+        assert_eq!(OciPlatform::parse("amd64").os, "linux");
+    }
+
+    #[test]
+    fn current_matches_parse_of_its_own_label() {
+        // The selection in pull compares an index entry to current(); a manifest
+        // pushed FROM this machine must therefore round-trip equal.
+        let cur = OciPlatform::current();
+        assert_eq!(OciPlatform::parse(&cur.label()), cur);
+        assert!(matches!(cur.architecture.as_str(), "arm64" | "amd64"));
+        assert!(matches!(cur.os.as_str(), "darwin" | "linux" | "windows"));
+    }
+
+    #[test]
+    fn index_round_trips_and_entry_selection_works() {
+        let index = OciIndex {
+            schema_version: 2,
+            media_type: INDEX_MEDIA_TYPE.to_string(),
+            manifests: vec![
+                OciIndexManifest {
+                    media_type: MANIFEST_MEDIA_TYPE.to_string(),
+                    digest: "sha256:aaa".into(),
+                    size: 10,
+                    platform: Some(OciPlatform::parse("linux/arm64")),
+                },
+                OciIndexManifest {
+                    media_type: MANIFEST_MEDIA_TYPE.to_string(),
+                    digest: "sha256:bbb".into(),
+                    size: 20,
+                    platform: Some(OciPlatform::parse("linux/amd64")),
+                },
+            ],
+        };
+        // serde round-trip (camelCase mediaType/schemaVersion).
+        let json = serde_json::to_vec(&index).unwrap();
+        assert!(String::from_utf8_lossy(&json).contains("\"mediaType\""));
+        let back: OciIndex = serde_json::from_slice(&json).unwrap();
+        assert_eq!(back.manifests.len(), 2);
+        // pull's selection: find the entry whose platform == the wanted one.
+        let want = OciPlatform::parse("linux/amd64");
+        let hit = back.manifests.iter().find(|m| m.platform.as_ref() == Some(&want)).unwrap();
+        assert_eq!(hit.digest, "sha256:bbb");
+        // a platform not present → no match (pull would 404 with the available list).
+        let miss = OciPlatform::parse("windows/amd64");
+        assert!(back.manifests.iter().all(|m| m.platform.as_ref() != Some(&miss)));
+    }
 }
 
 #[cfg(test)]
