@@ -167,9 +167,15 @@ impl SecretStore {
 
         // Bounded read against a live-growing file. We do not trust
         // `metadata().len()` alone because the file could grow between
-        // stat and read — `read_file_bounded_size` enforces the cap on
+        // stat and read — `read_file_bounded` enforces the cap on
         // actual bytes read, not on the size reported by stat.
-        let contents = read_file_bounded_size(&path, MAX_STORE_FILE_BYTES).map_err(|e| {
+        let store_file = std::fs::File::open(&path).map_err(|e| {
+            Error::config(
+                format!("open secret store at {}", path.display()),
+                e.to_string(),
+            )
+        })?;
+        let contents = read_file_bounded(store_file, MAX_STORE_FILE_BYTES).map_err(|e| {
             Error::config(
                 format!("read secret store at {}", path.display()),
                 e.to_string(),
@@ -613,33 +619,45 @@ impl From<std::io::Error> for FileSourceError {
 /// bytes. The cap is enforced against *bytes actually read*, not against
 /// the length reported by `metadata()` — this closes a TOCTOU where the
 /// file grows between stat and read.
-fn read_file_bounded_size(
-    path: &std::path::Path,
+fn read_file_bounded(
+    mut f: std::fs::File,
     cap: u64,
 ) -> std::result::Result<String, FileSourceError> {
     use std::io::Read;
-    let f = std::fs::File::open(path)?;
     let mut buf = String::new();
     // `take` caps the actual read. We request `cap + 1` so an over-cap
     // file fills the reader by one byte, letting us detect the breach.
-    f.take(cap + 1).read_to_string(&mut buf)?;
+    (&mut f).take(cap + 1).read_to_string(&mut buf)?;
     if buf.len() as u64 > cap {
         return Err(FileSourceError::TooLarge);
     }
     Ok(buf)
 }
 
-/// Read a `from_file` source with both the size cap and a symlink
-/// refusal. Symlinks are rejected at resolve time so a stored path whose
-/// target gets replaced by a symlink post-persistence can't redirect the
-/// read elsewhere (e.g., `/etc/shadow`). If a user needs a symlink for
-/// legitimate reasons, they can store the canonicalized target.
+/// Read a `from_file` source with both the size cap and a symlink refusal.
+///
+/// The leaf is opened with `O_NOFOLLOW` so a symlink at the final path
+/// component is refused ATOMICALLY at open time — there is no lstat-then-open
+/// window where the target could be swapped for a symlink to (e.g.)
+/// `/etc/shadow`. We then read from that fd only, never re-opening by path, so
+/// the bytes come from exactly what we opened. (Parent-directory symlinks are
+/// not covered — that would need a component-by-component `openat` walk.)
 fn read_from_file_source(path: &std::path::Path) -> std::result::Result<String, FileSourceError> {
-    let meta = std::fs::symlink_metadata(path)?;
-    if meta.file_type().is_symlink() {
-        return Err(FileSourceError::Symlink);
-    }
-    read_file_bounded_size(path, MAX_FROM_FILE_BYTES)
+    use std::os::unix::fs::OpenOptionsExt;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| {
+            // O_NOFOLLOW on a symlink leaf fails with ELOOP — surface it as the
+            // dedicated Symlink class rather than a generic I/O error.
+            if e.raw_os_error() == Some(libc::ELOOP) {
+                FileSourceError::Symlink
+            } else {
+                FileSourceError::Io(e)
+            }
+        })?;
+    read_file_bounded(f, MAX_FROM_FILE_BYTES)
 }
 
 fn kind_of(s: &StoredSecret) -> SecretKind {

@@ -57,7 +57,8 @@ impl SecretCmd {
 /// By default, stores a literal value encrypted at rest. Use `--from-env` or
 /// `--from-file` to store an indirection — the actual value is read from the
 /// host environment or filesystem at workload launch time.
-#[derive(Args, Debug)]
+// Debug is implemented manually (below) to redact the inline plaintext `value`.
+#[derive(Args)]
 pub struct SetCmd {
     /// Secret name (used as the guest env var when referenced as
     /// `{ from_store = "NAME" }` in a Smolfile).
@@ -77,6 +78,21 @@ pub struct SetCmd {
     /// workload launch time, not stored on disk).
     #[arg(long, value_name = "PATH")]
     pub from_file: Option<PathBuf>,
+}
+
+/// Manual `Debug` so the inline plaintext `value` is never printed — clap
+/// derives `Debug` on the parent `SecretCmd` enum, so a `{:?}` on a parse-error
+/// path (or any future tracing of parsed args) would otherwise leak it. The ref
+/// fields (env-var name, file path) are not secret values.
+impl std::fmt::Debug for SetCmd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SetCmd")
+            .field("name", &self.name)
+            .field("value", &self.value.as_ref().map(|_| "<redacted>"))
+            .field("from_env", &self.from_env)
+            .field("from_file", &self.from_file)
+            .finish()
+    }
 }
 
 impl SetCmd {
