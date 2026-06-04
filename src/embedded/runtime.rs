@@ -96,7 +96,13 @@ impl EmbeddedRuntime {
                 let _ = control::stop_vm(&self.db, name);
             }
 
-            control::delete_vm(&self.db, name)?;
+            // Idempotent: deleting an already-deleted machine is a no-op success
+            // (the desired end state — gone — already holds). Lets SDK callers
+            // call delete() more than once without an error.
+            match control::delete_vm(&self.db, name) {
+                Ok(()) | Err(crate::Error::VmNotFound { .. }) => {}
+                Err(e) => return Err(e),
+            }
             self.remove_name_lock(name)?;
             Ok(())
         })
