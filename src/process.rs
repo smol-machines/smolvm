@@ -117,7 +117,16 @@ pub fn harden_self() {
         // (cross-tenant memory leak). Self-access to /proc/self stays permitted,
         // so libkrun still reads its own maps and boots normally (verified on
         // Linux/KVM across bare/network/GPU VMs).
-        libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+        //
+        // EXCEPTION: a forkable golden must stay dumpable. Its CoW clones map the
+        // golden's guest RAM by opening /proc/<golden_pid>/fd/<memfd>, which
+        // PR_SET_DUMPABLE=0 would deny (EACCES → clone can't boot). The
+        // RLIMIT_CORE=0 below still prevents a core dump from leaking the
+        // golden's RAM, so only same-uid /proc access + ptrace are relaxed —
+        // acceptable for a fork pool whose clones legitimately share its memory.
+        if std::env::var_os("SMOLVM_FORKABLE").is_none() {
+            libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+        }
     }
     unsafe {
         let lim = libc::rlimit {

@@ -280,13 +280,14 @@ pub async fn create_machine(
             })
             .collect();
         // A .smolmachine is an untrusted, portable artifact: validate its secret
-        // refs Untrusted (store-only) so a packed from_env/from_file can't read
-        // this host's env/files at exec time. Reject rather than carry/exfil.
+        // refs Untrusted, which rejects every source kind, so a packed
+        // from_env/from_file can't read this host's env/files at exec time.
+        // Reject rather than carry/exfil.
         for (key, r) in &manifest.secret_refs {
             crate::secrets::validate_ref(r, crate::secrets::ResolutionScope::Untrusted).map_err(
                 |e| {
                     ApiError::BadRequest(format!(
-                        "packed secret '{}': {} (packs may only carry from_store refs)",
+                        "packed secret '{}': {} (packs may not carry secret refs)",
                         key, e
                     ))
                 },
@@ -353,8 +354,9 @@ pub async fn create_machine(
     };
 
     // Validate request-body secret refs before persisting. Untrusted
-    // scope — only `from_store` survives; `from_env`/`from_file` on
-    // the API surface are refused regardless of server binding.
+    // scope rejects every source kind, so any non-empty `secrets` map on
+    // the API surface is refused regardless of server binding — secrets
+    // must be configured locally via the CLI.
     crate::api::handlers::validate_request_secrets(&req.secrets)?;
 
     // Complete registration: persists to DB + registers in ApiState

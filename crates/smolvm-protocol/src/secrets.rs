@@ -1,8 +1,12 @@
 //! Secret reference types shared across smolvm surfaces.
 //!
-//! A [`SecretRef`] is a *pointer* to a secret. Refs travel across trust
+//! A [`SecretRef`] is a *pointer* to a secret on the host: either a host
+//! environment variable or a host file. Refs travel across trust
 //! boundaries (HTTP request bodies, persisted VM records, `.smolmachine`
-//! pack manifests); resolved plaintext values do not.
+//! pack manifests); resolved plaintext values do not. smolvm itself does
+//! not store secret material — it only references whatever secrets
+//! manager already holds it (your shell env, Vault/1Password/etc. rendered
+//! to an env var or file).
 //!
 //! This crate carries only the *shape* of a ref — the on-the-wire and
 //! on-disk representation plus trivial introspection. The validation
@@ -18,8 +22,6 @@ use std::path::PathBuf;
 /// env-var name (which can themselves be revealing).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecretSourceKind {
-    /// The ref points at an entry in the host secret store.
-    Store,
     /// The ref points at a host environment variable.
     Env,
     /// The ref points at a host file path.
@@ -30,14 +32,13 @@ impl SecretSourceKind {
     /// Human-readable label.
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Store => "store",
             Self::Env => "env",
             Self::File => "file",
         }
     }
 }
 
-/// A reference to a secret. Exactly one of the three sources must be
+/// A reference to a secret. Exactly one of the two sources must be
 /// populated; validation is performed by the host crate's
 /// `validate_ref` (policy lives where it's enforced).
 ///
@@ -48,10 +49,6 @@ impl SecretSourceKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecretRef {
-    /// Look up the secret by name in the host secret store.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub from_store: Option<String>,
-
     /// Read the secret from a host environment variable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_env: Option<String>,
@@ -69,14 +66,9 @@ impl SecretRef {
     /// crate's `validate_ref` before calling this; this function is
     /// primarily for audit logging of a known-good ref.
     pub fn source_kind(&self) -> Option<SecretSourceKind> {
-        match (
-            self.from_store.is_some(),
-            self.from_env.is_some(),
-            self.from_file.is_some(),
-        ) {
-            (true, false, false) => Some(SecretSourceKind::Store),
-            (false, true, false) => Some(SecretSourceKind::Env),
-            (false, false, true) => Some(SecretSourceKind::File),
+        match (self.from_env.is_some(), self.from_file.is_some()) {
+            (true, false) => Some(SecretSourceKind::Env),
+            (false, true) => Some(SecretSourceKind::File),
             _ => None,
         }
     }
@@ -90,16 +82,6 @@ mod tests {
     fn source_kind_reports_variant() {
         assert_eq!(
             SecretRef {
-                from_store: Some("x".into()),
-                from_env: None,
-                from_file: None,
-            }
-            .source_kind(),
-            Some(SecretSourceKind::Store)
-        );
-        assert_eq!(
-            SecretRef {
-                from_store: None,
                 from_env: Some("Y".into()),
                 from_file: None,
             }
@@ -108,7 +90,6 @@ mod tests {
         );
         assert_eq!(
             SecretRef {
-                from_store: None,
                 from_env: None,
                 from_file: Some(PathBuf::from("/z")),
             }
@@ -116,16 +97,21 @@ mod tests {
             Some(SecretSourceKind::File)
         );
         let empty = SecretRef {
-            from_store: None,
             from_env: None,
             from_file: None,
         };
         assert_eq!(empty.source_kind(), None);
+        let both = SecretRef {
+            from_env: Some("Y".into()),
+            from_file: Some(PathBuf::from("/z")),
+        };
+        assert_eq!(both.source_kind(), None);
     }
 
     #[test]
     fn deny_unknown_fields() {
-        let bad = r#"{ "from_stor": "typo" }"#;
+        // `from_store` was removed; it must now be rejected like any typo.
+        let bad = r#"{ "from_store": "gone" }"#;
         let res: Result<SecretRef, _> = serde_json::from_str(bad);
         assert!(res.is_err());
     }
@@ -133,8 +119,7 @@ mod tests {
     #[test]
     fn roundtrip_json() {
         let r = SecretRef {
-            from_store: Some("API_KEY".into()),
-            from_env: None,
+            from_env: Some("API_KEY".into()),
             from_file: None,
         };
         let json = serde_json::to_string(&r).unwrap();
@@ -145,13 +130,11 @@ mod tests {
     #[test]
     fn serialization_omits_empty_fields() {
         let r = SecretRef {
-            from_store: Some("X".into()),
-            from_env: None,
+            from_env: Some("X".into()),
             from_file: None,
         };
         let json = serde_json::to_string(&r).unwrap();
-        assert!(json.contains("from_store"));
-        assert!(!json.contains("from_env"));
+        assert!(json.contains("from_env"));
         assert!(!json.contains("from_file"));
     }
 }

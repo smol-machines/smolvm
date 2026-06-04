@@ -478,6 +478,14 @@ pub struct VmRecord {
     /// them via virtiofs instead of pulling the image from a registry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_smolmachine: Option<String>,
+
+    /// Name of the golden VM this machine was forked from, if any. A clone's
+    /// block disks are copy-on-write overlays backed by the golden's disks, so
+    /// the golden must outlive its clones. The disk *format* is not recorded
+    /// here — it is derived from the on-disk file (`.qcow2` vs `.raw`), which is
+    /// the single source of truth (see `agent::resolve_disk_image`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub golden: Option<String>,
 }
 
 /// Deserialize `created_at` from either a legacy JSON string `"1705312345"` or
@@ -554,6 +562,7 @@ impl VmRecord {
             dns_filter_hosts: None,
             ephemeral: false,
             source_smolmachine: None,
+            golden: None,
         }
     }
 
@@ -604,6 +613,7 @@ impl VmRecord {
             dns_filter_hosts: None,
             ephemeral: false,
             source_smolmachine: None,
+            golden: None,
         }
     }
 
@@ -694,17 +704,15 @@ mod tests {
         use crate::secrets::SecretRef;
         let mut record = VmRecord::new("r".into(), 1, 256, vec![], vec![], false);
         record.secret_refs.insert(
-            "API_KEY".into(),
+            "TLS_KEY".into(),
             SecretRef {
-                from_store: Some("API_KEY".into()),
                 from_env: None,
-                from_file: None,
+                from_file: Some("/run/secrets/tls.key".into()),
             },
         );
         record.secret_refs.insert(
             "DB_URL".into(),
             SecretRef {
-                from_store: None,
                 from_env: Some("PROD_DB".into()),
                 from_file: None,
             },
@@ -712,14 +720,17 @@ mod tests {
 
         let json = serde_json::to_string(&record).unwrap();
         // Ref metadata — not sensitive — roundtrips through serde_json.
-        assert!(json.contains("API_KEY"));
+        assert!(json.contains("TLS_KEY"));
         assert!(json.contains("PROD_DB"));
 
         let back: VmRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(back.secret_refs.len(), 2);
         assert_eq!(
-            back.secret_refs["API_KEY"].from_store.as_deref(),
-            Some("API_KEY")
+            back.secret_refs["TLS_KEY"]
+                .from_file
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+            Some("/run/secrets/tls.key".to_string())
         );
         assert_eq!(
             back.secret_refs["DB_URL"].from_env.as_deref(),

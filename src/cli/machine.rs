@@ -80,6 +80,55 @@ fn resolve_egress_flags(
     Ok((allow_cidr, net, dns_filter_hosts))
 }
 
+/// Parse `--secret-env KEY=HOST_VAR` and `--secret-file KEY=PATH` flag values
+/// into validated [`SecretRef`]s keyed by the guest-side env var name.
+///
+/// CLI-supplied refs are `TrustedLocal` (the host user invoked the command), so
+/// both source kinds are allowed; `validate_ref` still enforces structure and
+/// absolute `from_file` paths. A key that appears more than once — across or
+/// within the two flags — is a hard error, since silently keeping the last
+/// occurrence would mask a typo.
+fn parse_cli_secret_refs(
+    secret_env: &[String],
+    secret_file: &[String],
+) -> smolvm::Result<std::collections::BTreeMap<String, smolvm::secrets::SecretRef>> {
+    use smolvm::secrets::{env_ref, file_ref, validate_ref, ResolutionScope, SecretRef};
+    use std::collections::BTreeMap;
+
+    let mut out: BTreeMap<String, SecretRef> = BTreeMap::new();
+
+    let mut add =
+        |flag: &str, spec: &str, make: &dyn Fn(&str) -> SecretRef| -> smolvm::Result<()> {
+            let (key, value) = spec.split_once('=').ok_or_else(|| {
+                smolvm::Error::config(flag, format!("expected KEY=VALUE, got '{}'", spec))
+            })?;
+            if key.is_empty() {
+                return Err(smolvm::Error::config(
+                    flag,
+                    format!("empty secret name in '{}'", spec),
+                ));
+            }
+            let r = make(value);
+            validate_ref(&r, ResolutionScope::TrustedLocal)
+                .map_err(|e| smolvm::Error::config(flag, format!("secret '{}': {}", key, e)))?;
+            if out.insert(key.to_string(), r).is_some() {
+                return Err(smolvm::Error::config(
+                    flag,
+                    format!("secret '{}' specified more than once", key),
+                ));
+            }
+            Ok(())
+        };
+
+    for spec in secret_env {
+        add("--secret-env", spec, &|v| env_ref(v))?;
+    }
+    for spec in secret_file {
+        add("--secret-file", spec, &|v| file_ref(v))?;
+    }
+    Ok(out)
+}
+
 /// Spawn a detached `smolvm _cleanup-ephemeral` helper process so the parent
 /// CLI can exit immediately after flushing output.
 ///
@@ -137,6 +186,9 @@ pub enum MachineCmd {
 
     /// Start a machine
     Start(StartCmd),
+
+    /// Fork a running forkable machine into a new clone (CoW memory + disks)
+    Fork(ForkCmd),
 
     /// Stop a running machine
     Stop(StopCmd),
@@ -202,6 +254,7 @@ impl MachineCmd {
             MachineCmd::Exec(cmd) => cmd.run(),
             MachineCmd::Create(cmd) => cmd.run(),
             MachineCmd::Start(cmd) => cmd.run(),
+            MachineCmd::Fork(cmd) => cmd.run(),
             MachineCmd::Stop(cmd) => cmd.run(),
             MachineCmd::Delete(cmd) => cmd.run(),
             MachineCmd::Status(cmd) => cmd.run(),
@@ -374,6 +427,24 @@ pub struct RunCmd {
     #[arg(long, help_heading = "Registry")]
     pub docker_config: bool,
 
+    /// Inject a secret from a host env var (GUEST_VAR=HOST_VAR), resolved at
+    /// launch. The value is never persisted to the machine record or a pack.
+    #[arg(
+        long = "secret-env",
+        value_name = "GUEST_VAR=HOST_VAR",
+        help_heading = "Security"
+    )]
+    pub secret_env: Vec<String>,
+
+    /// Inject a secret from a host file (GUEST_VAR=/abs/path), resolved at
+    /// launch. The value is never persisted to the machine record or a pack.
+    #[arg(
+        long = "secret-file",
+        value_name = "GUEST_VAR=PATH",
+        help_heading = "Security"
+    )]
+    pub secret_file: Vec<String>,
+
     #[command(flatten, next_help_heading = "Network")]
     pub proxy_opts: crate::cli::proxy_opts::ProxyOpts,
 }
@@ -438,6 +509,11 @@ impl RunCmd {
             (Some(from_smolfile), None) => Some(from_smolfile),
             (None, some) => some,
         };
+        // CLI `--secret-env`/`--secret-file` refs merge over any Smolfile
+        // `[secrets]` of the same name (CLI wins).
+        for (key, r) in parse_cli_secret_refs(&self.secret_env, &self.secret_file)? {
+            params.secret_refs.insert(key, r);
+        }
         let mut mounts = HostMount::parse(&params.volume)?;
         let ports = params.port.clone();
         PortMapping::check_duplicates(&ports)
@@ -1019,6 +1095,38 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    #[test]
+    fn parse_cli_secret_refs_builds_env_and_file_refs() {
+        let refs = parse_cli_secret_refs(
+            &["GUEST_TOKEN=HOST_TOKEN".to_string()],
+            &["GUEST_KEY=/abs/key".to_string()],
+        )
+        .unwrap();
+        assert_eq!(refs["GUEST_TOKEN"].from_env.as_deref(), Some("HOST_TOKEN"));
+        assert_eq!(
+            refs["GUEST_KEY"]
+                .from_file
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+            Some("/abs/key".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_cli_secret_refs_rejects_bad_specs() {
+        // Missing '='.
+        assert!(parse_cli_secret_refs(&["NO_EQUALS".to_string()], &[]).is_err());
+        // Empty key.
+        assert!(parse_cli_secret_refs(&["=HOST".to_string()], &[]).is_err());
+        // Relative from_file path (validate_ref under TrustedLocal).
+        assert!(parse_cli_secret_refs(&[], &["K=relative/path".to_string()]).is_err());
+        // Duplicate key across the two flags.
+        assert!(
+            parse_cli_secret_refs(&["DUP=HOST".to_string()], &["DUP=/abs/path".to_string()])
+                .is_err()
+        );
+    }
+
     #[derive(Parser, Debug)]
     #[command(name = "machine")]
     struct TestMachineCli {
@@ -1053,6 +1161,39 @@ mod tests {
         assert_eq!(cmd.command, ["ubuntu:22.04", "--", "bash"]);
         // is_likely_image_ref catches this before the VM starts
         assert!(is_likely_image_ref(&cmd.command[0]));
+    }
+
+    #[test]
+    fn create_accepts_trailing_workload_command() {
+        let cli = TestMachineCli::parse_from([
+            "machine", "create", "golden", "--image", "alpine", "--", "echo", "hi",
+        ]);
+        let MachineCmd::Create(cmd) = cli.command else {
+            panic!("expected machine create command");
+        };
+        assert_eq!(cmd.name, Some("golden".to_string()));
+        assert_eq!(cmd.image, Some("alpine".to_string()));
+        // The trailing command is captured (clap may include the "--" separator).
+        let words: Vec<&str> = cmd
+            .command
+            .iter()
+            .map(String::as_str)
+            .filter(|s| *s != "--")
+            .collect();
+        assert_eq!(words, ["echo", "hi"]);
+    }
+
+    #[test]
+    fn create_without_command_leaves_command_empty() {
+        // Regression: adding the trailing COMMAND arg must not break the common
+        // no-command form `machine create <name> --net`.
+        let cli = TestMachineCli::parse_from(["machine", "create", "golden", "--net"]);
+        let MachineCmd::Create(cmd) = cli.command else {
+            panic!("expected machine create command");
+        };
+        assert_eq!(cmd.name, Some("golden".to_string()));
+        assert!(cmd.command.is_empty());
+        assert!(cmd.net);
     }
 
     #[test]
@@ -1102,6 +1243,16 @@ pub struct ExecCmd {
     /// Set environment variable (can be used multiple times)
     #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
     pub env: Vec<String>,
+
+    /// Inject a secret from a host env var (GUEST_VAR=HOST_VAR) for this exec,
+    /// resolved on the host. The value never persists to the record.
+    #[arg(long = "secret-env", value_name = "GUEST_VAR=HOST_VAR")]
+    pub secret_env: Vec<String>,
+
+    /// Inject a secret from a host file (GUEST_VAR=/abs/path) for this exec,
+    /// resolved on the host. The value never persists to the record.
+    #[arg(long = "secret-file", value_name = "GUEST_VAR=PATH")]
+    pub secret_file: Vec<String>,
 
     /// Kill command after duration (e.g., "30s", "5m")
     #[arg(long, value_parser = parse_duration, value_name = "DURATION")]
@@ -1156,10 +1307,20 @@ impl ExecCmd {
         // CLI `--env` flags are layered on top via `merge_env_overrides`. The
         // resolved plaintext lives only in this local for the exec's duration —
         // it is never written back to the record or the DB.
-        let record_env: Vec<(String, String)> = match record.as_ref() {
+        let mut record_env: Vec<(String, String)> = match record.as_ref() {
             Some(r) => vm_common::record_env_with_secrets(r)?,
             None => Vec::new(),
         };
+        // Ad-hoc `--secret-env`/`--secret-file` refs for this exec only. The CLI
+        // user is TrustedLocal; resolved plaintext lives only in this local and
+        // is layered under any explicit `--env` overrides below.
+        let exec_secret_refs = parse_cli_secret_refs(&self.secret_env, &self.secret_file)?;
+        record_env.extend(smolvm::secrets::expose_into_env(
+            smolvm::secrets::resolve_refs_to_env(
+                &exec_secret_refs,
+                smolvm::secrets::ResolutionScope::TrustedLocal,
+            )?,
+        ));
 
         if let Some(ref image) = record_image {
             let image_info = match client.query(image) {
@@ -1311,6 +1472,8 @@ impl ShellCmd {
             name: self.name,
             workdir: None,
             env: vec![],
+            secret_env: vec![],
+            secret_file: vec![],
             timeout: None,
             interactive: true,
             tty: true,
@@ -1416,6 +1579,16 @@ pub struct CreateCmd {
     #[arg(long)]
     pub ssh_agent: bool,
 
+    /// Inject a secret from a host env var (GUEST_VAR=HOST_VAR), resolved at
+    /// each launch. Only the reference is persisted, never the value.
+    #[arg(long = "secret-env", value_name = "GUEST_VAR=HOST_VAR")]
+    pub secret_env: Vec<String>,
+
+    /// Inject a secret from a host file (GUEST_VAR=/abs/path), resolved at
+    /// each launch. Only the reference is persisted, never the value.
+    #[arg(long = "secret-file", value_name = "GUEST_VAR=PATH")]
+    pub secret_file: Vec<String>,
+
     /// Load configuration from a Smolfile (TOML)
     #[arg(long = "smolfile", visible_short_alias = 's', value_name = "PATH")]
     pub smolfile: Option<PathBuf>,
@@ -1424,6 +1597,13 @@ pub struct CreateCmd {
     /// Uses pre-extracted layers instead of pulling from a registry.
     #[arg(long, value_name = "PATH", conflicts_with_all = ["image", "smolfile"])]
     pub from: Option<PathBuf>,
+
+    /// Command to run as the machine's persistent workload (image machines).
+    /// Launched as a detached container on every `start`, so it stays running
+    /// (e.g. a pre-warmed browser to be forked). Without this, an image machine
+    /// boots to a bare agent and the image's CMD is not run.
+    #[arg(trailing_var_arg = true, value_name = "COMMAND")]
+    pub command: Vec<String>,
 }
 
 impl CreateCmd {
@@ -1447,8 +1627,8 @@ impl CreateCmd {
         let params = crate::cli::smolfile::build_create_params(
             name,
             self.image,
-            None,   // entrypoint: from Smolfile only
-            vec![], // cmd: from Smolfile only
+            None,         // entrypoint: from Smolfile only
+            self.command, // persistent-workload command (detached container on start)
             self.cpus,
             self.mem,
             self.volume,
@@ -1472,6 +1652,11 @@ impl CreateCmd {
             (Some(from_smolfile), None) => Some(from_smolfile),
             (None, some) => some,
         };
+        // CLI `--secret-env`/`--secret-file` refs merge over any Smolfile
+        // `[secrets]` of the same name (CLI wins). Only refs are persisted.
+        for (key, r) in parse_cli_secret_refs(&self.secret_env, &self.secret_file)? {
+            params.secret_refs.insert(key, r);
+        }
         let resources = VmResources {
             cpus: params.cpus,
             memory_mib: params.mem,
@@ -1556,18 +1741,16 @@ impl CreateCmd {
         };
 
         // A .smolmachine is an untrusted, portable artifact: validate its secret
-        // refs under the Untrusted scope so only `from_store` survives. A packed
-        // `from_env`/`from_file` ref would otherwise read THIS host's env/files at
-        // exec time — reject at create rather than carry an exfil primitive.
+        // refs under the Untrusted scope, which rejects every source kind. A
+        // packed `from_env`/`from_file` ref would otherwise read THIS host's
+        // env/files at exec time — reject at create rather than carry an exfil
+        // primitive. Configure secrets locally via the CLI instead.
         for (key, r) in &manifest.secret_refs {
             smolvm::secrets::validate_ref(r, smolvm::secrets::ResolutionScope::Untrusted).map_err(
                 |e| {
                     smolvm::Error::config(
                         "create from .smolmachine",
-                        format!(
-                            "secret '{}': {} (packs may only carry from_store refs)",
-                            key, e
-                        ),
+                        format!("secret '{}': {} (packs may not carry secret refs)", key, e),
                     )
                 },
             )?;
@@ -1627,6 +1810,11 @@ pub struct StartCmd {
     #[arg(short = 'n', long, value_name = "NAME")]
     pub name: Option<String>,
 
+    /// Start as a fork base: back guest RAM with a memfd (CoW-cloneable) and
+    /// expose a control socket so the machine can be forked with `machine fork`.
+    #[arg(long)]
+    pub forkable: bool,
+
     #[command(flatten, next_help_heading = "Network")]
     pub proxy_opts: crate::cli::proxy_opts::ProxyOpts,
 }
@@ -1637,7 +1825,13 @@ impl StartCmd {
         let name = self.name.unwrap_or_else(|| "default".to_string());
         let proxy = self.proxy_opts.proxy();
         let no_proxy = self.proxy_opts.no_proxy();
-        match vm_common::start_vm_named(&name, proxy, no_proxy) {
+        if self.forkable {
+            // Read by launcher.rs in the spawned _boot-vm (inherits our env):
+            // memfd-back guest RAM and register a control socket at a known path
+            // so `machine fork` can later freeze this machine as a CoW base.
+            vm_common::enable_forkable_env(&name);
+        }
+        match vm_common::start_vm_named(&name, proxy, no_proxy, /* from_snapshot */ false) {
             Ok(()) => Ok(()),
             Err(smolvm::Error::VmNotFound { .. }) if !explicit_name => {
                 // Only fall back to creating a default VM when no --name was given.
@@ -1646,6 +1840,46 @@ impl StartCmd {
             }
             Err(e) => Err(e),
         }
+    }
+}
+
+// ============================================================================
+// Fork Command
+// ============================================================================
+
+/// Fork a running forkable machine into a new clone.
+///
+/// Freezes the source (the "golden") via its control socket, copy-on-write
+/// clones its disks, and boots the new machine from the golden's in-memory
+/// snapshot instead of cold-booting — so the clone comes up already warm
+/// (same processes, same filesystem state), in well under a second.
+///
+/// The golden must have been started with `--forkable`.
+#[derive(Args, Debug)]
+pub struct ForkCmd {
+    /// The running, forkable source machine to clone from.
+    #[arg(value_name = "GOLDEN")]
+    pub golden: String,
+
+    /// Name for the new clone machine.
+    #[arg(value_name = "CLONE")]
+    pub clone: String,
+
+    /// Make the clone itself forkable (memfd RAM + control socket), so it can
+    /// in turn be forked.
+    #[arg(long)]
+    pub forkable: bool,
+
+    /// Pin the clone's inbound port forwards (repeatable). Without this, the
+    /// golden's forwards are remapped to freshly-allocated host ports.
+    #[arg(short = 'p', long = "port", value_parser = PortMapping::parse, value_name = "HOST:GUEST", help_heading = "Network")]
+    pub port: Vec<PortMapping>,
+}
+
+impl ForkCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        let ports: Vec<(u16, u16)> = self.port.iter().map(|p| (p.host, p.guest)).collect();
+        vm_common::fork_vm(&self.golden, &self.clone, self.forkable, &ports)
     }
 }
 
@@ -2604,7 +2838,7 @@ impl MonitorCmd {
 
         if !manager.is_process_alive() {
             println!("Machine '{}' is not running, starting...", name);
-            vm_common::start_vm_named(&name, None, None)?;
+            vm_common::start_vm_named(&name, None, None, /* from_snapshot */ false)?;
         }
 
         println!(
@@ -2781,7 +3015,9 @@ impl MonitorCmd {
                         break;
                     }
 
-                    match vm_common::start_vm_named(&name, None, None) {
+                    match vm_common::start_vm_named(
+                        &name, None, None, /* from_snapshot */ false,
+                    ) {
                         Ok(()) => {
                             println!("  machine restarted");
                             last_start = std::time::Instant::now();

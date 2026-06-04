@@ -30,8 +30,8 @@ smolvm machine exec --name myvm -- which python3      # still there after exit+r
 smolvm machine run --ssh-agent --net --image alpine -- ssh-add -l
 smolvm machine create myvm --ssh-agent --net
 
-# Inject encrypted secrets into workload env
-smolvm secret set OPENAI_API_KEY          # prompts with echo off
+# Inject secrets into workload env (referenced from host env var / file)
+smolvm machine run --secret-env OPENAI_API_KEY=OPENAI_API_KEY -- ./app
 smolvm machine run -s Smolfile -- ./app   # Smolfile [secrets] resolves at launch
 
 # Pack into portable executable
@@ -55,7 +55,7 @@ smolvm machine exec --name my-vm -- pip install requests
 | Ship software as a binary | `smolvm pack create --image IMAGE -o OUTPUT` |
 | Fast persistent machine from packed artifact | `machine create NAME --from FILE.smolmachine` |
 | Use git/ssh with private keys safely | Add `--ssh-agent` to run or create |
-| Inject API keys / tokens without putting them on the command line | `smolvm secret set` + Smolfile `[secrets]` |
+| Inject API keys / tokens without putting them on the command line | `--secret-env`/`--secret-file` flags or Smolfile `[secrets]` |
 | Minimal VM without image | `smolvm machine run -s Smolfile` (bare VM) |
 | Change mounts/ports/resources on existing VM | `machine update NAME -v ./src:/app -p 8080:8080` |
 | Declarative VM config | Create a Smolfile, use `--smolfile`/`-s` flag |
@@ -96,12 +96,12 @@ smolvm pack run [--sidecar PATH] [-- CMD]         # run .smolmachine
 smolvm serve start [--listen ADDR:PORT|PATH]      # HTTP API
 smolvm config registries edit                     # registry auth
 
-smolvm secret set NAME [VALUE]                    # store encrypted (prompts if no value)
-smolvm secret set NAME --from-env VAR             # store indirection to host env var
-smolvm secret set NAME --from-file PATH           # store indirection to host file
-smolvm secret list                                # names + sources (never values)
-smolvm secret delete NAME
-smolvm secret show NAME --yes                     # print plaintext (requires --yes)
+# Secrets are references to host env vars / files, resolved at launch — no
+# built-in store. Attach them on the command line or in a Smolfile [secrets].
+smolvm machine run    --secret-env GUEST_VAR=HOST_VAR     # from host env var
+smolvm machine run    --secret-file GUEST_VAR=/abs/path   # from host file
+smolvm machine create NAME --secret-env GUEST_VAR=HOST_VAR  # persists the ref
+smolvm machine exec --name NAME --secret-env GUEST_VAR=HOST_VAR -- cmd
 ```
 
 ## Artifact References
@@ -190,11 +190,10 @@ startup_grace = "20s"
 [auth]
 ssh_agent = true                      # forward host SSH agent into the VM
 
-# Secrets — resolved at workload launch, injected into process env
+# Secrets — references to host sources, resolved at workload launch
 [secrets]
-OPENAI_API_KEY = { from_store = "OPENAI_API_KEY" }  # encrypted host store
 DATABASE_URL   = { from_env   = "PROD_DB_URL" }      # host env var (at launch)
-GCP_CREDS      = { from_file  = "./creds.json" }     # host file (at launch)
+GCP_CREDS      = { from_file  = "/abs/creds.json" }  # host file (at launch)
 ```
 
 ### Merge Precedence
@@ -311,38 +310,54 @@ env = ["VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/virtio_icd.x86_64.json"]
 For a complete working example see [`examples/headless-browser/browser.smolfile`](examples/headless-browser/browser.smolfile).
 ## Secrets
 
-Store API keys, tokens, and other credentials encrypted on the host and inject them into the workload's process environment at launch time. Secrets never appear on the command line, in shell history, or on disk outside the encrypted store.
+smolvm stores no secret material. A secret is a *reference* to a value that
+already lives on the host — a host environment variable or a host file — and is
+resolved into the workload's process environment at launch time. Bring your own
+secrets manager (Vault, 1Password, AWS, sops, your shell): render the value into
+an env var or file, then point a ref at it. Only the reference is ever
+persisted; the resolved value never lands in the VM record, the database, or a
+`.smolmachine` pack.
+
+Attach refs on the command line:
 
 ```bash
-# Store a secret (prompts with echo off when no value is given)
-smolvm secret set OPENAI_API_KEY
+# From a host environment variable (GUEST_VAR=HOST_VAR)
+smolvm machine run    --secret-env OPENAI_API_KEY=OPENAI_API_KEY -- ./app
+smolvm machine create web --secret-env DATABASE_URL=PROD_DB_URL   # persists the ref
+smolvm machine exec --name web --secret-env TOKEN=CI_TOKEN -- ./deploy
 
-# Or store an indirection to a host env var / file (resolved at launch)
-smolvm secret set AWS_ACCESS_KEY --from-env AWS_ACCESS_KEY_ID
-smolvm secret set GCP_CREDS      --from-file ~/.config/gcloud/creds.json
+# From a host file (GUEST_VAR=/absolute/path)
+smolvm machine run --secret-file GCP_CREDS=/abs/creds.json -- ./app
 
-# List (never prints values), delete, reveal
-smolvm secret list
-smolvm secret delete OPENAI_API_KEY
-smolvm secret show OPENAI_API_KEY --yes     # --yes required to print plaintext
+# Bridge any external manager through the env/file seam, e.g. 1Password:
+op run --env-file=secrets.env -- smolvm machine run -- ./app
 ```
 
-Reference secrets from a Smolfile. The left-hand key becomes the env var name in the guest workload:
+Or reference them from a Smolfile. The left-hand key becomes the env var name in
+the guest workload:
 
 ```toml
 [secrets]
-OPENAI_API_KEY = { from_store = "OPENAI_API_KEY" }
-DATABASE_URL   = { from_env   = "PROD_DB_URL" }
-GCP_CREDS      = { from_file  = "./creds.json" }
+DATABASE_URL = { from_env  = "PROD_DB_URL" }    # host env var (at launch)
+GCP_CREDS    = { from_file = "/abs/creds.json" } # absolute host file (at launch)
 ```
 
-Exactly one of `from_store`, `from_env`, `from_file` must be set per entry. Resolved values are appended *after* top-level `env` and CLI `-e` flags.
+Exactly one of `from_env`, `from_file` must be set per entry; `from_file` paths
+must be absolute. Resolved values are appended *after* top-level `env` and CLI
+`-e` flags. Resolution is late-bound, so rotating the underlying env var or file
+takes effect at the next launch with nothing to re-sync.
 
-**Storage:** encrypted in `~/.config/smolvm/secrets.toml` (AES-256-GCM) with a master key at `~/.local/share/smolvm/secrets.key` (mode `0600`, auto-generated).
+**Threat model:** this is defense-in-depth, not zero-knowledge. The target
+process sees plaintext in its own environment, and root inside the guest can
+read any `/proc/*/environ`. Use SSH agent forwarding instead when a secret must
+never leave the host.
 
-**Threat model:** this is defense-in-depth, not zero-knowledge. The target process sees plaintext in its own environment, and root inside the guest can read any `/proc/*/environ`. Use SSH agent forwarding instead when a secret must never leave the host.
-
-**Where they're injected:** every exec surface now resolves `[secrets]` at launch/exec time — `machine run`, `machine create` + `machine start`, `machine exec`, HTTP API exec/run/create endpoints, and `.smolmachine` packs. The VM record, pack manifest, and HTTP request bodies carry only refs; rotating a secret in the store takes effect at the next start/exec/pack-run with no extra command. HTTP request bodies and pack manifests accept only `from_store` refs; `from_env`/`from_file` are rejected (would expose the server's env or arbitrary host files to untrusted callers). HTTP `req.secrets` is capped at 64 refs per request. Use `smolvm pack inspect --file PATH` to list a pack's required secrets before running it. See `docs/secrets.md` for details.
+**Where they're resolved:** `machine run`, `machine create` + `machine start`,
+and `machine exec` resolve refs against *this host* under a trusted-local scope.
+Untrusted surfaces — HTTP API request bodies and portable `.smolmachine` packs —
+are treated as untrusted callers and may carry **no** resolvable secret ref:
+`from_env` would expose the server's env and `from_file` would be an arbitrary
+host-file read, so both are rejected. Configure secrets locally instead.
 
 ## File Copy
 

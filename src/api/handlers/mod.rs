@@ -43,9 +43,9 @@ pub(crate) fn record_secret_refs_env(
 /// Map a classified [`ResolutionError`] to an [`ApiError`] per the
 /// status-code table in `docs/secrets-api-pack-plan.md` §4.3.
 ///
-/// Client-fixable failures (`StoreMiss`, `EnvUnset`, `FileReadFailed`,
-/// `FileTooLarge`) → 400; server-state failures (`CryptoFailed`,
-/// `Internal`) → 500. Body always includes the secret key and the
+/// Client-fixable failures (`EnvUnset`, `FileReadFailed`,
+/// `FileTooLarge`) → 400; server-state failures (`Internal`) → 500.
+/// Body always includes the secret key and the
 /// failure class, never the raw error message (which may include the
 /// `from_file` path or `from_env` variable name).
 pub(crate) fn classify_resolution_error(e: ResolutionError) -> ApiError {
@@ -94,7 +94,10 @@ fn check_env_key_shape(key: &str) -> Result<(), String> {
 ///
 /// - the per-request size cap (`MAX_REQ_SECRETS_PER_REQUEST`),
 /// - the POSIX env-var key rule for the map key, and
-/// - the untrusted-source ref policy (`from_store` only).
+/// - the untrusted-source ref policy: an HTTP caller is `Untrusted`, and
+///   no ref source kind (`from_env`/`from_file`) is resolvable in that
+///   scope, so any non-empty `secrets` map is rejected. Secrets must be
+///   configured locally via the CLI instead.
 ///
 /// On failure, produces a `BadRequest` response body naming the
 /// specific key and rule. Used by exec/run/create handlers before
@@ -157,38 +160,32 @@ mod tests {
     use smolvm_protocol::SecretRef;
     use std::collections::BTreeMap;
 
-    fn store_ref(name: &str) -> SecretRef {
+    fn env_ref(name: &str) -> SecretRef {
         SecretRef {
-            from_store: Some(name.to_string()),
-            from_env: None,
+            from_env: Some(name.to_string()),
             from_file: None,
         }
     }
 
     #[test]
-    fn validate_request_secrets_accepts_store_refs() {
-        let mut refs = BTreeMap::new();
-        refs.insert("API_KEY".to_string(), store_ref("API_KEY"));
+    fn validate_request_secrets_accepts_empty_map() {
+        // The HTTP API can no longer carry resolvable secret refs (an
+        // untrusted caller must not read this host's env/files), so the
+        // only request that passes secret validation is one with none.
+        let refs = BTreeMap::new();
         assert!(validate_request_secrets(&refs).is_ok());
     }
 
     #[test]
     fn validate_request_secrets_rejects_from_env() {
         let mut refs = BTreeMap::new();
-        refs.insert(
-            "X".to_string(),
-            SecretRef {
-                from_store: None,
-                from_env: Some("HOST_VAR".to_string()),
-                from_file: None,
-            },
-        );
+        refs.insert("X".to_string(), env_ref("HOST_VAR"));
         let err = validate_request_secrets(&refs).unwrap_err();
         match err {
             ApiError::BadRequest(msg) => {
                 assert!(msg.contains("X"), "body must name the bad key: {}", msg);
                 assert!(
-                    msg.contains("from_store") || msg.contains("env"),
+                    msg.contains("env") || msg.contains("trusted local host"),
                     "body must explain rule: {}",
                     msg
                 );
@@ -203,7 +200,6 @@ mod tests {
         refs.insert(
             "X".to_string(),
             SecretRef {
-                from_store: None,
                 from_env: None,
                 from_file: Some("/absolute/path".into()),
             },
@@ -230,7 +226,7 @@ mod tests {
         ];
         for bad in bad_keys {
             let mut refs = BTreeMap::new();
-            refs.insert(bad.to_string(), store_ref("K"));
+            refs.insert(bad.to_string(), env_ref("K"));
             let err = validate_request_secrets(&refs)
                 .expect_err(&format!("key '{}' must be rejected", bad.escape_default()));
             assert!(
@@ -246,27 +242,16 @@ mod tests {
     fn validate_request_secrets_rejects_oversized_keys() {
         let huge_key = "A".repeat(MAX_SECRET_KEY_LEN + 1);
         let mut refs = BTreeMap::new();
-        refs.insert(huge_key, store_ref("K"));
+        refs.insert(huge_key, env_ref("K"));
         let err = validate_request_secrets(&refs).unwrap_err();
         assert!(matches!(err, ApiError::BadRequest(_)));
-    }
-
-    #[test]
-    fn validate_request_secrets_accepts_valid_keys() {
-        let ok_keys = ["FOO", "foo", "_FOO", "_", "FOO_BAR_123", "x1"];
-        for ok in ok_keys {
-            let mut refs = BTreeMap::new();
-            refs.insert(ok.to_string(), store_ref("K"));
-            validate_request_secrets(&refs)
-                .unwrap_or_else(|e| panic!("key '{}' rejected: {:?}", ok, e));
-        }
     }
 
     #[test]
     fn validate_request_secrets_enforces_size_cap() {
         let mut refs = BTreeMap::new();
         for i in 0..=MAX_REQ_SECRETS_PER_REQUEST {
-            refs.insert(format!("K{}", i), store_ref(&format!("K{}", i)));
+            refs.insert(format!("K{}", i), env_ref(&format!("K{}", i)));
         }
         let err = validate_request_secrets(&refs).unwrap_err();
         match err {
@@ -283,27 +268,27 @@ mod tests {
 
         let e = ResolutionError {
             key: "MY_KEY".to_string(),
-            kind: ResolutionFailure::StoreMiss,
+            kind: ResolutionFailure::EnvUnset,
         };
         match classify_resolution_error(e) {
             ApiError::BadRequest(body) => {
                 assert!(body.contains("MY_KEY"));
-                assert!(body.contains("store_miss"));
+                assert!(body.contains("env_unset"));
             }
-            other => panic!("StoreMiss must be 4xx, got {:?}", other),
+            other => panic!("EnvUnset must be 4xx, got {:?}", other),
         }
 
         let e = ResolutionError {
             key: "MY_KEY".to_string(),
-            kind: ResolutionFailure::CryptoFailed,
+            kind: ResolutionFailure::Internal,
         };
-        // CryptoFailed is a server-state issue → 5xx. We can't easily
+        // Internal is a server-state issue → 5xx. We can't easily
         // pattern-match ApiError's internal variant name, but we can
         // verify it's not a client error.
         let mapped = classify_resolution_error(e);
         assert!(
             !matches!(mapped, ApiError::BadRequest(_)),
-            "CryptoFailed must not map to 4xx: {:?}",
+            "Internal must not map to 4xx: {:?}",
             mapped
         );
     }

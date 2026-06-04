@@ -5,6 +5,7 @@
 //! DYLD_LIBRARY_PATH is still available for dlopen.
 
 use crate::data::consts::{ENV_SMOLVM_KRUN_LOG_LEVEL, ENV_SMOLVM_LIB_DIR};
+use crate::data::disk::DiskFormat;
 use crate::data::storage::HostMount;
 use crate::error::{Error, Result};
 use crate::network::backend::{COMPAT_NET_FEATURES, TSI_FEATURE_HIJACK_INET};
@@ -85,6 +86,57 @@ pub fn find_lib_dir() -> Option<PathBuf> {
     }
 
     None
+}
+
+/// A qcow2 copy-on-write overlay to create: `(overlay_path, base_path, base_format)`.
+/// `base_path` must be absolute — it is written verbatim into the overlay header,
+/// and imago resolves a relative backing path against the overlay's own directory.
+pub type DiskOverlaySpec = (PathBuf, PathBuf, DiskFormat);
+
+/// Create the given qcow2 copy-on-write overlays, loading libkrun once for the
+/// whole batch (overlay creation is a pure filesystem op, but the only place the
+/// `krun_create_disk_overlay` symbol lives is libkrun). Stops at the first error.
+pub fn create_disk_overlays(specs: &[DiskOverlaySpec]) -> Result<()> {
+    if specs.is_empty() {
+        return Ok(());
+    }
+    let lib_dir = find_lib_dir().ok_or_else(|| {
+        Error::agent(
+            "create disk overlay",
+            "could not locate the libkrun library directory",
+        )
+    })?;
+    let krun = unsafe { KrunFunctions::load(&lib_dir) }
+        .map_err(|e| Error::agent("create disk overlay", e))?;
+    let create = krun.create_disk_overlay.ok_or_else(|| {
+        Error::agent(
+            "create disk overlay",
+            "libkrun is missing krun_create_disk_overlay (rebuild libkrun)",
+        )
+    })?;
+
+    for (overlay, base, base_format) in specs {
+        let overlay_c = path_to_cstring(overlay)?;
+        let base_c = path_to_cstring(base)?;
+        let rc = unsafe {
+            create(
+                overlay_c.as_ptr(),
+                base_c.as_ptr(),
+                base_format.to_krun_u32(),
+            )
+        };
+        if rc < 0 {
+            return Err(Error::agent(
+                "create disk overlay",
+                format!(
+                    "krun_create_disk_overlay failed (rc={rc}) for {} <- {}",
+                    overlay.display(),
+                    base.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Launch the agent VM (call in the forked child process).
@@ -518,7 +570,15 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             "add storage disk",
             "path contains null byte"
         );
-        if krun_add_disk2(ctx, block_id.as_ptr(), disk_path.as_ptr(), 0, false) < 0 {
+        let storage_format = disks.storage.format().to_krun_u32();
+        if krun_add_disk2(
+            ctx,
+            block_id.as_ptr(),
+            disk_path.as_ptr(),
+            storage_format,
+            false,
+        ) < 0
+        {
             krun_free_ctx(ctx);
             return Err(Error::agent(
                 "add storage disk",
@@ -535,7 +595,15 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 "add overlay disk",
                 "path contains null byte"
             );
-            if krun_add_disk2(ctx, overlay_id.as_ptr(), overlay_path.as_ptr(), 0, false) < 0 {
+            let overlay_format = overlay.format().to_krun_u32();
+            if krun_add_disk2(
+                ctx,
+                overlay_id.as_ptr(),
+                overlay_path.as_ptr(),
+                overlay_format,
+                false,
+            ) < 0
+            {
                 krun_free_ctx(ctx);
                 return Err(Error::agent(
                     "add overlay disk",
@@ -647,6 +715,29 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     },
                     None => tracing::warn!(
                         "SMOLVM_CONTROL_SOCKET set but libkrun lacks krun_set_control_socket"
+                    ),
+                }
+            }
+        }
+
+        // Fork clone: boot from a snapshot dir (CoW-map a golden VM's RAM +
+        // restore state) instead of cold-booting, when SMOLVM_SNAPSHOT_DIR is set.
+        if let Ok(snap_dir) = std::env::var("SMOLVM_SNAPSHOT_DIR") {
+            if !snap_dir.is_empty() {
+                match krun.set_snapshot {
+                    Some(set_snapshot) => match CString::new(snap_dir.clone()) {
+                        Ok(dir_c) => {
+                            let ret = set_snapshot(ctx, dir_c.as_ptr());
+                            if ret < 0 {
+                                tracing::error!("krun_set_snapshot failed: {ret}");
+                            } else {
+                                tracing::info!(dir = %snap_dir, "booting as fork clone from snapshot");
+                            }
+                        }
+                        Err(_) => tracing::warn!("snapshot dir contains null byte"),
+                    },
+                    None => tracing::warn!(
+                        "SMOLVM_SNAPSHOT_DIR set but libkrun lacks krun_set_snapshot"
                     ),
                 }
             }

@@ -67,7 +67,7 @@ pub mod config;
 /// Canonical shared data models and constants used across adapters.
 pub mod data;
 pub mod db;
-mod disk_utils;
+pub mod disk_utils;
 pub mod dns_filter;
 pub mod dns_filter_listener;
 /// Language-neutral embedded runtime support shared by SDK adapters.

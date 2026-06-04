@@ -8,7 +8,21 @@
 
 use smolvm::agent::boot_config::BootConfig;
 use smolvm::agent::{launch_agent_vm, LaunchConfig, VmDisks};
-use std::path::PathBuf;
+use smolvm::data::disk::{DiskFormat, DiskType};
+use smolvm::storage::VmDisk;
+use std::path::{Path, PathBuf};
+
+/// Open a boot disk honoring its on-disk format. A fork clone's disk path ends
+/// in `.qcow2` (a copy-on-write overlay, opened as-is over its backing image);
+/// every other disk is a raw image that may need creating/formatting. The path
+/// is the single source of truth for the format — see `agent::resolve_disk_image`.
+fn open_boot_disk<K: DiskType>(path: &Path, size_gb: u64) -> smolvm::Result<VmDisk<K>> {
+    if path.extension().and_then(|e| e.to_str()) == Some("qcow2") {
+        VmDisk::<K>::open_existing_with_format(path, DiskFormat::Qcow2)
+    } else {
+        VmDisk::<K>::open_or_create_at(path, size_gb)
+    }
+}
 
 /// Run the boot subprocess.
 ///
@@ -16,6 +30,40 @@ use std::path::PathBuf;
 /// `krun_start_enter` which blocks forever (or until the VM exits).
 pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
     let t_proc = std::time::Instant::now();
+
+    // --- Parent-death watchdog ---------------------------------------------
+    // This VMM (`smol-vmm _boot-vm`) is always spawned by an embedding parent:
+    // the API server, a fleet node, or — for the SDKs — the Node/Python
+    // in-process runtime. If that parent dies *abnormally* (panic, uncaught
+    // exception, `process.exit`/`os._exit`, crash, or SIGKILL) it never runs
+    // teardown, so without this watchdog the VMM would be reparented to init and
+    // keep running forever, holding the VM's full RAM — an orphaned-process leak.
+    //
+    // Detection is by reparenting: when the real parent dies the kernel reparents
+    // this process (to init/launchd, or a subreaper), so `getppid()` changes from
+    // the value captured here at startup. The watcher polls for that change and
+    // exits; the OS then tears the VM down with us. Polling (rather than an
+    // inherited-pipe EOF) needs no fd plumbing, survives the
+    // `close_inherited_fds_from(3)` call below, and uses only syscalls already in
+    // the seccomp allowlist (`getppid`, `nanosleep`). Catches every death mode,
+    // including SIGKILL, which no parent-side exit handler can. Started first so
+    // it also covers a parent dying mid-boot.
+    //
+    // Armed only when an in-process embedder (the SDK) owns the VM's lifetime —
+    // the manager signals this via SMOLVM_BOOT_WATCH_PARENT=1. The CLI detaches
+    // its VM on purpose and `serve` reconnects to surviving VMs, so for those the
+    // parent exiting is normal and the watchdog stays off.
+    if std::env::var_os("SMOLVM_BOOT_WATCH_PARENT").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        let original_ppid = unsafe { libc::getppid() };
+        let _ = std::thread::Builder::new()
+            .name("parent-death-watch".into())
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                if unsafe { libc::getppid() } != original_ppid {
+                    smolvm::process::exit_child(0);
+                }
+            });
+    }
 
     // Read boot config
     let config_data = std::fs::read(&config_path)
@@ -225,8 +273,8 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
     }
     proc_timing!("fds closed");
 
-    // Open storage and overlay disks
-    let storage_disk = match smolvm::storage::StorageDisk::open_or_create_at(
+    // Open storage and overlay disks, honoring qcow2 fork-clone overlays.
+    let storage_disk = match open_boot_disk::<smolvm::storage::Storage>(
         &config.storage_disk_path,
         config.storage_size_gb,
     ) {
@@ -241,7 +289,7 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
     };
     proc_timing!("storage opened");
 
-    let overlay_disk = match smolvm::storage::OverlayDisk::open_or_create_at(
+    let overlay_disk = match open_boot_disk::<smolvm::storage::Overlay>(
         &config.overlay_disk_path,
         config.overlay_size_gb,
     ) {

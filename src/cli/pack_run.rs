@@ -687,14 +687,23 @@ fn build_env(
         .filter_map(|e| parse_env_spec(e))
         .collect();
 
-    // Resolve the packed secret refs to plaintext on this host and inject
-    // them. Only refs travel inside the `.smolmachine`; the plaintext is
-    // produced here, at run time, and never written back into the pack.
-    // Scope is Untrusted: a .smolmachine is a portable artifact that may have
-    // been authored on another host or by another party, so only `from_store`
-    // refs (resolved against THIS host's own secret store) are honored. A
-    // `from_env`/`from_file` ref in a pack would read the running host's env or
-    // arbitrary files — reject it (fail closed) rather than exfiltrate.
+    // A .smolmachine is a portable artifact that may have been authored on
+    // another host or by another party. Validate every packed ref under the
+    // Untrusted scope FIRST — which now rejects every source kind — so a packed
+    // `from_env`/`from_file` ref cannot be resolved against the running host's
+    // env or files (an exfil primitive). Resolution does not enforce scope on
+    // its own, so this gate is what makes the path fail closed. In practice a
+    // pack carries no resolvable secret; configure secrets locally instead.
+    for (key, r) in &manifest.secret_refs {
+        smolvm::secrets::validate_ref(r, smolvm::secrets::ResolutionScope::Untrusted).map_err(
+            |e| {
+                smolvm::Error::config(
+                    "run packed machine",
+                    format!("secret '{}': {} (packs may not carry secret refs)", key, e),
+                )
+            },
+        )?;
+    }
     env.extend(smolvm::secrets::expose_into_env(
         smolvm::secrets::resolve_refs_to_env(
             &manifest.secret_refs,

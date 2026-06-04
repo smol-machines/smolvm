@@ -50,12 +50,9 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 
 base64 = { workspace = true }
 
-# Secrets management.
-aes-gcm = "0.10"
-rand = "0.8"
+# Secrets management. Resolved plaintext is scrubbed on drop; smolvm stores no
+# secret material itself (refs only), so no at-rest crypto/store deps are needed.
 zeroize = { version = "1", features = ["zeroize_derive"] }
-rpassword = "7"
-fs2 = "0.4"
 humantime = "2"
 tempfile = "3"
 

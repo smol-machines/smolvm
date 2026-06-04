@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 #
-# Static guardrails for the host-side secret store.
+# Static guardrails for host-side secret references.
 #
-# The whole point of the secret store is that secret *plaintext* is resolved
-# on the host at exec time and never persists anywhere a guest, a record, or
-# the database can see it. Only opaque *references* (which store/env/file a
-# value comes from) are persisted. These greps fail CI the moment a change
-# breaks one of those invariants, so a reviewer doesn't have to spot it by eye.
+# The whole point of secret refs is that secret *plaintext* is resolved on the
+# host at exec time and never persists anywhere a guest, a record, or the
+# database can see it. smolvm stores no secret material itself; only opaque
+# *references* (which env var / file a value comes from) are persisted. These
+# greps fail CI the moment a change breaks one of those invariants, so a
+# reviewer doesn't have to spot it by eye.
 #
 # The checks are deliberately conservative: they match on patterns that are
 # never legitimate, so a green run means "no known-bad pattern present", not
@@ -31,7 +32,7 @@ fi
 
 # 2. resolve_secret_ref must hand back a Zeroizing buffer so resolved plaintext
 #    is scrubbed from memory on drop rather than lingering on the heap.
-if grep -A6 'pub fn resolve_secret_ref(' src/secrets.rs | grep -q 'Zeroizing<String>'; then
+if grep -A6 'fn resolve_secret_ref(' src/secrets.rs | grep -q 'Zeroizing<String>'; then
   ok "resolve_secret_ref returns a Zeroizing buffer"
 else
   note "resolve_secret_ref no longer returns Zeroizing<String> — plaintext would not be scrubbed"
@@ -63,8 +64,9 @@ else
 fi
 
 # 5. A .smolmachine is a portable, untrusted artifact: its packed secret refs
-#    must resolve under the Untrusted scope (from_store only) so a downloaded
-#    pack cannot read the running host's env/files via from_env/from_file.
+#    must be validated/resolved under the Untrusted scope (which rejects every
+#    source kind) so a downloaded pack cannot read the running host's env/files
+#    via from_env/from_file.
 if git grep -nE 'manifest\.secret_refs' -- src/cli/pack_run.rs \
      | grep -qE 'RecordReplay|TrustedLocal'; then
   note "pack_run resolves manifest secret refs under a trusting scope — host env/file exfil risk"

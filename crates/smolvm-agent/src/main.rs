@@ -2626,7 +2626,35 @@ fn handle_streaming_file_read(
             return Ok(());
         }
     };
-    let size = file.metadata().ok().map(|m| m.len()).unwrap_or(0);
+    // Only stream regular files. Directories and special files (e.g. /dev/zero,
+    // FIFOs) `open()` successfully but misbehave on read — a directory fails with
+    // EISDIR *after* the chunk stream has started (desyncing the wire and bricking
+    // the connection), and an unbounded device never EOFs (hangs the caller). We
+    // must reject them with a clean error BEFORE the first DataChunk frame.
+    let metadata = match file.metadata() {
+        Ok(m) => m,
+        Err(e) => {
+            send_response(
+                stream,
+                &AgentResponse::error(
+                    format!("failed to stat {}: {}", path, e),
+                    error_codes::FILE_IO_FAILED,
+                ),
+            )?;
+            return Ok(());
+        }
+    };
+    if !metadata.is_file() {
+        send_response(
+            stream,
+            &AgentResponse::error(
+                format!("not a regular file: {}", path),
+                error_codes::FILE_IO_FAILED,
+            ),
+        )?;
+        return Ok(());
+    }
+    let size = metadata.len();
     info!(path = %path, size, "streaming file read");
     send_data_chunks(
         stream,

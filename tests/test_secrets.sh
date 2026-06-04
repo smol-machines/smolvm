@@ -1,14 +1,16 @@
 #!/bin/bash
 #
-# End-to-end tests for the host-side secret store.
+# End-to-end tests for host-side secret references.
 #
-# The whole point of the secret store is a security INVARIANT: a referenced
-# secret's PLAINTEXT is resolved on the host at launch time and reaches the
-# guest workload's environment, but NEVER persists in the machine's DB record
-# or a portable `.smolmachine` pack — only the opaque ref does. These tests
-# boot real VMs and verify both halves end to end (the unit tests cover the
-# resolution logic; only an e2e run can prove the plaintext actually crosses to
-# the guest and actually stays out of the persisted artifacts).
+# smolvm stores no secret material itself: a `[secrets]` entry references a
+# value that already lives on the host (here, a host environment variable). The
+# security INVARIANT is that the referenced PLAINTEXT is resolved on the host at
+# launch time and reaches the guest workload's environment, but NEVER persists
+# in the machine's DB record or a portable `.smolmachine` pack — only the opaque
+# ref does. These tests boot real VMs and verify both halves end to end (the
+# unit tests cover the resolution logic; only an e2e run can prove the plaintext
+# actually crosses to the guest and actually stays out of the persisted
+# artifacts).
 #
 # Usage:
 #   ./tests/test_secrets.sh
@@ -21,7 +23,7 @@ kill_orphan_smolvm_processes
 
 echo ""
 echo "=========================================="
-echo "  smolvm Secret Store E2E Tests"
+echo "  smolvm Secret Reference E2E Tests"
 echo "=========================================="
 echo ""
 
@@ -30,6 +32,10 @@ SECRET_TMPDIR=$(mktemp -d)
 # in the DB / pack, and parallel runs never collide.
 SECRET_NAME="E2ESECRET_$$"
 SECRET_VALUE="plaintext-needle-$$-do-not-leak"
+# The host env var the ref points at. smolvm is launched as a child of this
+# shell, so exporting it puts the value in smolvm's own environment, where the
+# `from_env` ref resolves it at launch time. The value is never persisted.
+export "$SECRET_NAME=$SECRET_VALUE"
 
 cleanup_vm() {
     local name="$1"
@@ -38,7 +44,6 @@ cleanup_vm() {
 }
 
 cleanup_secrets_test() {
-    $SMOLVM secret rm "$SECRET_NAME" 2>/dev/null || true
     rm -rf "$SECRET_TMPDIR"
     cleanup_machine
 }
@@ -55,7 +60,7 @@ memory = 512
 $extra
 
 [secrets]
-$SECRET_NAME = { from_store = "$SECRET_NAME" }
+$SECRET_NAME = { from_env = "$SECRET_NAME" }
 EOF
 }
 
@@ -153,12 +158,7 @@ test_secret_reresolves_after_restart() {
 # =============================================================================
 # Run
 # =============================================================================
-log_info "Storing test secret '$SECRET_NAME'..."
-$SMOLVM secret rm "$SECRET_NAME" 2>/dev/null || true
-if ! $SMOLVM secret set "$SECRET_NAME" "$SECRET_VALUE" 2>&1; then
-    log_fail "could not store test secret — aborting suite"
-    exit 1
-fi
+log_info "Test secret exported as host env var '$SECRET_NAME' (from_env source)"
 
 run_test "Secret plaintext reaches guest via exec" test_secret_reaches_guest_exec || true
 run_test "Secret plaintext reaches guest via init" test_secret_reaches_guest_init || true
@@ -166,4 +166,4 @@ run_test "INVARIANT: plaintext never in DB record" test_plaintext_not_in_db || t
 run_test "INVARIANT: plaintext never in .smolmachine pack" test_plaintext_not_in_pack || true
 run_test "Secret re-resolves after restart" test_secret_reresolves_after_restart || true
 
-print_summary "Secret Store E2E Tests"
+print_summary "Secret Reference E2E Tests"

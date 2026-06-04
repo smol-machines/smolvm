@@ -9,8 +9,9 @@ use utoipa::ToSchema;
 /// Present on every exec-like endpoint and on `CreateMachineRequest`.
 /// Every entry is validated under `ResolutionScope::Untrusted` before
 /// it's acted on — the HTTP API treats every caller as untrusted
-/// regardless of where the server is bound, so only `from_store` refs
-/// are accepted. `from_env` and `from_file` are rejected with 400.
+/// regardless of where the server is bound, so no ref source kind is
+/// accepted — `from_env` and `from_file` are both rejected with 400.
+/// Configure secrets locally via the CLI instead.
 ///
 /// Capped at `MAX_REQ_SECRETS_PER_REQUEST` entries per request.
 pub type RequestSecretRefs = BTreeMap<String, smolvm_protocol::SecretRef>;
@@ -119,8 +120,8 @@ pub struct ExecRequest {
     /// Environment variables.
     #[serde(default)]
     pub env: Vec<EnvVar>,
-    /// Ad-hoc secret refs. Only `from_store` is honored; other source
-    /// kinds return 400. See `RequestSecretRefs`.
+    /// Ad-hoc secret refs. Rejected unless empty: an untrusted HTTP
+    /// caller cannot read this host's env/files. See `RequestSecretRefs`.
     #[serde(default)]
     #[schema(value_type = Object)]
     pub secrets: RequestSecretRefs,
@@ -198,7 +199,7 @@ pub struct RunRequest {
     /// Environment variables.
     #[serde(default)]
     pub env: Vec<EnvVar>,
-    /// Ad-hoc secret refs. Only `from_store` is honored.
+    /// Ad-hoc secret refs. Rejected unless empty (untrusted scope).
     #[serde(default)]
     #[schema(value_type = Object)]
     pub secrets: RequestSecretRefs,
@@ -433,7 +434,7 @@ pub struct CreateMachineRequest {
     #[serde(default)]
     pub registry_identity_token: Option<String>,
     /// Secret refs attached to the machine. Resolved at every
-    /// subsequent exec against the host's store. Only `from_store` is
+    /// subsequent exec against the host's env/files. Rejected unless empty;
     /// accepted — `from_env`/`from_file` on the API surface would let
     /// an untrusted caller exfiltrate the server process's env or
     /// read arbitrary host files; use the CLI `machine create` path
@@ -453,7 +454,7 @@ pub struct MachineExecRequest {
     /// Environment variables.
     #[serde(default)]
     pub env: Vec<EnvVar>,
-    /// Ad-hoc secret refs. Only `from_store` is honored.
+    /// Ad-hoc secret refs. Rejected unless empty (untrusted scope).
     #[serde(default)]
     #[schema(value_type = Object)]
     pub secrets: RequestSecretRefs,

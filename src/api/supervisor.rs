@@ -160,6 +160,25 @@ impl Supervisor {
             }
         };
 
+        // Never auto-restart a fork base: clones CoW-read its disks by path, so
+        // relaunching it writable would corrupt them. Clones keep working
+        // without the base process, so skipping is safe (and avoids thrashing,
+        // since `prepare_for_launch` would refuse the launch anyway).
+        match self.state.db().dependent_clones(name) {
+            Ok(clones) if !clones.is_empty() => {
+                tracing::warn!(
+                    machine = %name,
+                    clones = %clones.join(", "),
+                    "not auto-restarting: machine is a fork base with live clones"
+                );
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(machine = %name, error = %e, "could not check dependent clones; proceeding")
+            }
+        }
+
         let mounts = record.host_mounts();
         let ports = record.port_mappings();
         let resources = record.vm_resources();

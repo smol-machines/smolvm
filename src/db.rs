@@ -249,6 +249,18 @@ impl SmolvmDb {
         })
     }
 
+    /// Names of VMs forked from `golden`. Their block disks are copy-on-write
+    /// overlays backed by the golden's disks, so the golden must outlive them
+    /// and must not be re-run with writable disks while they exist.
+    pub fn dependent_clones(&self, golden: &str) -> Result<Vec<String>> {
+        Ok(self
+            .list_vms()?
+            .into_iter()
+            .filter(|(_, r)| r.golden.as_deref() == Some(golden))
+            .map(|(name, _)| name)
+            .collect())
+    }
+
     /// Update a VM record in place using a closure.
     ///
     /// Returns the updated record if found, `None` if not found. Read +

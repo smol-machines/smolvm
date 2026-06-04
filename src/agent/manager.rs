@@ -6,7 +6,7 @@
 use crate::data::validate_vm_name;
 use crate::error::{Error, Result};
 use crate::process::{self, ChildProcess};
-use crate::storage::{OverlayDisk, StorageDisk};
+use crate::storage::{DiskFormat, OverlayDisk, StorageDisk};
 use parking_lot::Mutex;
 use smolvm_protocol::AGENT_READY_MARKER;
 use std::os::unix::process::CommandExt as _;
@@ -179,6 +179,19 @@ struct AgentInner {
 /// name-path exceeds the kernel socket budget, so we don't offer it.
 pub fn vm_data_dir(name: &str) -> PathBuf {
     vm_cache_root().join(vm_dir_hash(name))
+}
+
+/// Resolve the on-disk image for a `.raw` disk filename in `dir`. A fork clone
+/// has a `.qcow2` copy-on-write overlay in place of the raw disk, so prefer that
+/// when present; otherwise fall back to the raw disk. The file on disk is the
+/// single source of truth for the format (no format is stored in the record).
+pub fn resolve_disk_image(dir: &Path, raw_filename: &str) -> (PathBuf, DiskFormat) {
+    let qcow2 = dir.join(Path::new(raw_filename).with_extension("qcow2"));
+    if qcow2.exists() {
+        (qcow2, DiskFormat::Qcow2)
+    } else {
+        (dir.join(raw_filename), DiskFormat::Raw)
+    }
 }
 
 /// Cache root: `<cache_dir>/smolvm/vms/`.
@@ -440,11 +453,26 @@ impl AgentManager {
         // different name).
         let storage_dir = ensure_vm_dir(&name)?;
 
-        let storage_path = storage_dir.join(crate::storage::STORAGE_DISK_FILENAME);
-        let storage_disk = StorageDisk::open_or_create_at(&storage_path, sg)?;
+        // A fork clone has a `.qcow2` copy-on-write overlay in place of the
+        // `.raw` disk; detect it by file presence (the on-disk file is the
+        // source of truth) and open it as-is rather than creating/formatting.
+        let (storage_path, storage_format) =
+            resolve_disk_image(&storage_dir, crate::storage::STORAGE_DISK_FILENAME);
+        let storage_disk = match storage_format {
+            DiskFormat::Qcow2 => {
+                StorageDisk::open_existing_with_format(&storage_path, storage_format)?
+            }
+            DiskFormat::Raw => StorageDisk::open_or_create_at(&storage_path, sg)?,
+        };
 
-        let overlay_path = storage_dir.join(crate::storage::OVERLAY_DISK_FILENAME);
-        let overlay_disk = OverlayDisk::open_or_create_at(&overlay_path, og)?;
+        let (overlay_path, overlay_format) =
+            resolve_disk_image(&storage_dir, crate::storage::OVERLAY_DISK_FILENAME);
+        let overlay_disk = match overlay_format {
+            DiskFormat::Qcow2 => {
+                OverlayDisk::open_existing_with_format(&overlay_path, overlay_format)?
+            }
+            DiskFormat::Raw => OverlayDisk::open_or_create_at(&overlay_path, og)?,
+        };
 
         Self::new_named(name, rootfs_path, storage_disk, overlay_disk)
     }
@@ -457,6 +485,23 @@ impl AgentManager {
     /// Get the VM name if this is a named agent.
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
+    }
+
+    /// Names of VMs forked from this one. Their block disks are copy-on-write
+    /// overlays backed by this VM's disks, so it must not be re-launched with
+    /// writable disks while they exist. Best-effort: on a registry read error,
+    /// returns empty rather than blocking the launch.
+    fn dependent_clones(&self) -> Vec<String> {
+        let Some(name) = self.name() else {
+            return Vec::new(); // the unnamed/default manager is never a fork base
+        };
+        match crate::db::SmolvmDb::open().and_then(|db| db.dependent_clones(name)) {
+            Ok(clones) => clones,
+            Err(e) => {
+                tracing::warn!(vm = name, error = %e, "could not check for dependent clones");
+                Vec::new()
+            }
+        }
     }
 
     /// Get the default path for the agent rootfs.
@@ -943,6 +988,27 @@ impl AgentManager {
         ports: &[PortMapping],
         resources: VmResources,
     ) -> Result<()> {
+        // Refuse to (re)launch a fork base while clones depend on it. Clones
+        // CoW-read this VM's disks by path; re-running it would reopen them
+        // writable and silently corrupt every clone. Clones don't need the base
+        // process alive, so refusing is safe — delete the clones first to reuse
+        // the name. Covers every launch path (CLI fork + subprocess) since both
+        // funnel through here.
+        let clones = self.dependent_clones();
+        if !clones.is_empty() {
+            return Err(Error::agent(
+                "start agent",
+                format!(
+                    "'{}' is a fork base for {} live clone(s) ({}); their disks are \
+                     copy-on-write overlays backed by its disks, so it cannot be \
+                     re-launched while they exist — delete the clones first",
+                    self.name().unwrap_or_default(),
+                    clones.len(),
+                    clones.join(", ")
+                ),
+            ));
+        }
+
         // Validate resources before doing anything else.
         resources.validate()?;
 
@@ -1210,11 +1276,24 @@ impl AgentManager {
         let spawn_start = Instant::now();
         // Embedders (e.g. the Node SDK, where current_exe is `node`) can point the
         // boot subprocess at a `_boot-vm`-capable, signed helper binary instead of self.
-        let boot_exe = std::env::var_os("SMOLVM_BOOT_BINARY")
+        let boot_binary = std::env::var_os("SMOLVM_BOOT_BINARY");
+        // An in-process embedder (the Node/Python SDK) sets SMOLVM_BOOT_BINARY and
+        // owns the VM's lifetime — when that host process dies, the VM must die
+        // too, or it leaks as an orphan holding the VM's full RAM. The CLI (which
+        // detaches the VM on purpose) and `serve` (which reconnects to surviving
+        // VMs) don't set it, so they keep today's behavior. We pass the resulting
+        // flag down so the boot subprocess only arms its parent-death watchdog in
+        // the embedder case. See `cli/internal_boot::run`.
+        let watch_parent = boot_binary.is_some();
+        let boot_exe = boot_binary
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| exe.clone());
         let child = std::process::Command::new(&boot_exe)
             .args(["_boot-vm", &config_path.to_string_lossy()])
+            .env(
+                "SMOLVM_BOOT_WATCH_PARENT",
+                if watch_parent { "1" } else { "0" },
+            )
             .stdin(std::process::Stdio::null())
             // SMOLVM_BOOT_DEBUG=1 surfaces the boot subprocess's stdout/stderr so
             // embedded-host launch failures can be diagnosed (normally silenced).
@@ -1527,6 +1606,44 @@ impl AgentManager {
         let socket_probe_grace = Duration::from_secs(5);
 
         tracing::debug!("waiting for agent to be ready");
+
+        // Fork clone: the guest resumes past boot, so it never (re)writes the
+        // `.smolvm-ready` marker. Detect readiness by pinging the restored agent
+        // directly (it is already in its accept loop) — no marker, no grace.
+        let is_clone = std::env::var_os("SMOLVM_SNAPSHOT_DIR").is_some_and(|v| !v.is_empty());
+        if is_clone {
+            while start.elapsed() < timeout {
+                {
+                    let mut inner = self.inner.lock();
+                    if let Some(ref mut child) = inner.child {
+                        if !child.is_running() {
+                            return Err(Error::agent(
+                                "monitor agent",
+                                "clone agent process exited during startup".to_string(),
+                            ));
+                        }
+                    }
+                }
+                if self.vsock_socket.exists() {
+                    if let Ok(mut client) =
+                        super::AgentClient::connect_with_boot_probe_timeout(&self.vsock_socket)
+                    {
+                        if client.ping().is_ok() {
+                            tracing::info!(
+                                elapsed_ms = start.elapsed().as_millis(),
+                                "clone agent ready (ping)"
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            return Err(Error::agent(
+                "wait for ready",
+                "clone agent did not respond to ping within timeout".to_string(),
+            ));
+        }
 
         let ready_marker = self.rootfs_path.join(AGENT_READY_MARKER);
 

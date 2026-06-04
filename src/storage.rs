@@ -16,7 +16,7 @@
 //! and overlay filesystem management.
 
 use crate::data::consts::BYTES_PER_GIB;
-pub use crate::data::disk::{DiskType, Overlay, Storage};
+pub use crate::data::disk::{DiskFormat, DiskType, Overlay, Storage};
 pub use crate::data::storage::{
     DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB, OVERLAY_DISK_FILENAME,
     STORAGE_DISK_FILENAME,
@@ -68,6 +68,7 @@ impl DiskVersion {
 pub struct VmDisk<K> {
     path: PathBuf,
     size_bytes: u64,
+    format: DiskFormat,
     _kind: PhantomData<K>,
 }
 
@@ -112,6 +113,7 @@ impl<K: DiskType> VmDisk<K> {
             Ok(Self {
                 path: path.to_path_buf(),
                 size_bytes: metadata.len(),
+                format: DiskFormat::Raw,
                 _kind: PhantomData,
             })
         } else {
@@ -119,9 +121,24 @@ impl<K: DiskType> VmDisk<K> {
             Ok(Self {
                 path: path.to_path_buf(),
                 size_bytes,
+                format: DiskFormat::Raw,
                 _kind: PhantomData,
             })
         }
+    }
+
+    /// Open an existing disk image with an explicit on-disk format, without
+    /// creating or formatting it. Used for fork-clone qcow2 overlays, which are
+    /// created up front by the fork path and inherit the backing disk's
+    /// already-formatted filesystem.
+    pub fn open_existing_with_format(path: &Path, format: DiskFormat) -> Result<Self> {
+        let metadata = std::fs::metadata(path)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            size_bytes: metadata.len(),
+            format,
+            _kind: PhantomData,
+        })
     }
 
     /// Pre-format the disk with ext4 on the host.
@@ -132,6 +149,13 @@ impl<K: DiskType> VmDisk<K> {
     ///
     /// The template approach eliminates the e2fsprogs dependency for end users.
     pub fn ensure_formatted(&self) -> Result<()> {
+        if self.format == DiskFormat::Qcow2 {
+            // A qcow2 CoW overlay inherits its backing disk's already-formatted
+            // filesystem; formatting it would write a fresh fs into the overlay
+            // and diverge from the backing image.
+            return Ok(());
+        }
+
         if !self.needs_format() {
             tracing::debug!(
                 path = %self.path.display(),
@@ -153,6 +177,11 @@ impl<K: DiskType> VmDisk<K> {
     /// Get the path to the disk image.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Get the on-disk image format (raw, or qcow2 for fork-clone overlays).
+    pub fn format(&self) -> DiskFormat {
+        self.format
     }
 
     /// Get the disk size in bytes.

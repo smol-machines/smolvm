@@ -520,18 +520,17 @@ mod tests {
 
         let mut m = empty;
         m.secret_refs.insert(
-            "API_TOKEN".to_string(),
+            "DB_PASSWORD".to_string(),
             smolvm_protocol::SecretRef {
-                from_store: Some("prod-token".to_string()),
-                from_env: None,
+                from_env: Some("PGPASSWORD".to_string()),
                 from_file: None,
             },
         );
         let restored = PackManifest::from_json(&m.to_json().unwrap()).unwrap();
         assert_eq!(restored.secret_refs.len(), 1);
         assert_eq!(
-            restored.secret_refs["API_TOKEN"].from_store.as_deref(),
-            Some("prod-token")
+            restored.secret_refs["DB_PASSWORD"].from_env.as_deref(),
+            Some("PGPASSWORD")
         );
     }
 
