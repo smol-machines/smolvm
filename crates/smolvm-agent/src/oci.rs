@@ -588,6 +588,10 @@ impl OciSpec {
     /// special configuration — if the VM was started with `--gpu`, the devices
     /// appear automatically inside every container.
     pub fn add_gpu_devices_if_available(&mut self) {
+        if self.mounts.iter().any(|m| m.destination == "/dev/dri") {
+            return;
+        }
+
         let dri_path = std::path::Path::new("/dev/dri");
         if !dri_path.exists() {
             return;
@@ -1254,6 +1258,28 @@ mod tests {
             // No GPU — no extra mounts added (no-op)
             assert_eq!(spec.mounts.len(), mounts_before);
         }
+    }
+
+    #[test]
+    fn test_gpu_devices_are_not_added_twice() {
+        let identity = ProcessIdentity::root();
+        let mut spec = OciSpec::new(&["echo".to_string()], &[], "/", false, &identity);
+        spec.mounts.push(super::OciMount {
+            destination: "/dev/dri".to_string(),
+            mount_type: Some("bind".to_string()),
+            source: "/dev/dri".to_string(),
+            options: vec!["bind".to_string(), "rprivate".to_string()],
+        });
+
+        spec.add_gpu_devices_if_available();
+
+        assert_eq!(
+            spec.mounts
+                .iter()
+                .filter(|m| m.destination == "/dev/dri")
+                .count(),
+            1
+        );
     }
 
     #[test]
