@@ -514,11 +514,83 @@ impl AgentManager {
             return Ok(PathBuf::from(path));
         }
 
+        // SDKs bundle the rootfs as a tarball (they can't ship a dir tree with
+        // symlinks/modes through a wheel) and point us at it. Extract it once to a
+        // cache dir and use that, so `npm i` / `pip install` is self-contained
+        // with no separate engine install. Re-extracts when the tarball changes
+        // (a new SDK version ships a newer agent).
+        if let Some(tar) = std::env::var_os("SMOLVM_AGENT_ROOTFS_TAR") {
+            return Self::ensure_extracted_rootfs(Path::new(&tar));
+        }
+
         let data_dir = dirs::data_local_dir()
             .or_else(dirs::data_dir)
             .ok_or_else(|| Error::storage("resolve path", "could not determine data directory"))?;
 
         Ok(data_dir.join("smolvm").join("agent-rootfs"))
+    }
+
+    /// Extract a bundled agent-rootfs tarball to a cache dir (idempotent) and
+    /// return that dir. Keyed by the tarball's size+mtime so a newer SDK build
+    /// re-extracts; extraction is staged in a temp dir then atomically renamed so
+    /// concurrent SDK processes never see a half-extracted rootfs.
+    fn ensure_extracted_rootfs(tar: &Path) -> Result<PathBuf> {
+        let meta =
+            std::fs::metadata(tar).map_err(|e| Error::storage("stat rootfs tar", e.to_string()))?;
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let key = format!("{:x}-{:x}", meta.len(), mtime);
+
+        let base = dirs::cache_dir()
+            .ok_or_else(|| Error::storage("resolve cache dir", "no cache directory"))?
+            .join("smolvm")
+            .join("rootfs");
+        let dest = base.join(&key);
+        if dest.join(".extracted").exists() {
+            return Ok(dest);
+        }
+
+        std::fs::create_dir_all(&base)
+            .map_err(|e| Error::storage("create rootfs cache", e.to_string()))?;
+        let tmp = base.join(format!(".tmp-{}-{}", std::process::id(), key));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp)
+            .map_err(|e| Error::storage("create rootfs staging", e.to_string()))?;
+
+        // Use the system `tar` — it preserves symlinks (e.g. /sbin/init) and modes
+        // (the executable agent), which the tar crate handling here would not need
+        // to reimplement. Extraction runs on the host before VM boot (unsandboxed).
+        let status = std::process::Command::new("tar")
+            .arg("-xpf")
+            .arg(tar)
+            .arg("-C")
+            .arg(&tmp)
+            .status()
+            .map_err(|e| Error::storage("extract rootfs tar", e.to_string()))?;
+        if !status.success() {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err(Error::storage(
+                "extract rootfs tar",
+                format!("tar exited with {status}"),
+            ));
+        }
+        let _ = std::fs::write(tmp.join(".extracted"), b"");
+        // Atomic publish; if another process won the race, just use theirs.
+        match std::fs::rename(&tmp, &dest) {
+            Ok(()) => {}
+            Err(_) if dest.join(".extracted").exists() => {
+                let _ = std::fs::remove_dir_all(&tmp);
+            }
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&tmp);
+                return Err(Error::storage("publish extracted rootfs", e.to_string()));
+            }
+        }
+        Ok(dest)
     }
 
     /// Get the current state of the agent.

@@ -7,7 +7,7 @@
 //! - Blob download (GET)
 //! - Manifest put/get (PUT/GET)
 
-use crate::{RegistryError, Result, INDEX_MEDIA_TYPE, MANIFEST_MEDIA_TYPE};
+use crate::{OciIndex, OciPlatform, RegistryError, Result, INDEX_MEDIA_TYPE, MANIFEST_MEDIA_TYPE};
 use reqwest::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, LOCATION, WWW_AUTHENTICATE};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -458,6 +458,51 @@ impl RegistryClient {
             .unwrap_or("")
             .to_string();
         Ok((resp.bytes().await?.to_vec(), content_type))
+    }
+
+    /// Fetch the manifest at `reference`, resolving an OCI image index to THIS
+    /// machine's host-platform entry (Docker-style fan-out), and return the
+    /// single-platform manifest bytes. Shared by `pull` and `inspect` so both
+    /// resolve a multi-arch tag identically (a plain manifest passes through).
+    pub async fn get_manifest_resolved(&self, repo: &str, reference: &str) -> Result<Vec<u8>> {
+        let (doc_bytes, content_type) = self.get_manifest_raw(repo, reference).await?;
+
+        let is_index = content_type.contains(INDEX_MEDIA_TYPE)
+            || serde_json::from_slice::<serde_json::Value>(&doc_bytes)
+                .ok()
+                .map(|v| {
+                    v.get("manifests").is_some()
+                        || v.get("mediaType").and_then(|m| m.as_str()) == Some(INDEX_MEDIA_TYPE)
+                })
+                .unwrap_or(false);
+        if !is_index {
+            return Ok(doc_bytes);
+        }
+
+        let index: OciIndex = serde_json::from_slice(&doc_bytes)?;
+        let want = OciPlatform::current();
+        let entry = index
+            .manifests
+            .iter()
+            .find(|m| m.platform.as_ref() == Some(&want))
+            .ok_or_else(|| {
+                let available: Vec<String> = index
+                    .manifests
+                    .iter()
+                    .filter_map(|m| m.platform.as_ref().map(|p| p.label()))
+                    .collect();
+                RegistryError::InvalidManifest(format!(
+                    "no {} build available for this machine; the registry has: {}",
+                    want.label(),
+                    if available.is_empty() {
+                        "(none)".into()
+                    } else {
+                        available.join(", ")
+                    }
+                ))
+            })?;
+        tracing::info!(platform = %want.label(), digest = %entry.digest, "selected index entry");
+        Ok(self.get_manifest_raw(repo, &entry.digest).await?.0)
     }
 
     /// Resolve a Location header value against the registry base URL.
