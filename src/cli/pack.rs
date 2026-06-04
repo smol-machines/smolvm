@@ -1477,9 +1477,11 @@ async fn run_inspect(
     tag_or_digest: &str,
     json_output: bool,
 ) -> smolvm::Result<()> {
-    // Fetch OCI manifest (~200 bytes).
+    // Fetch the OCI manifest (~200 bytes), resolving a multi-platform index to
+    // this machine's host-platform entry — same as `pull`, so inspect agrees with
+    // what pull would actually download instead of rejecting multi-arch tags.
     let manifest_bytes = client
-        .get_manifest(repo, tag_or_digest)
+        .get_manifest_resolved(repo, tag_or_digest)
         .await
         .map_err(|e| Error::agent("fetch manifest", e.to_string()))?;
 
