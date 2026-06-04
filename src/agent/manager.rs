@@ -1276,11 +1276,24 @@ impl AgentManager {
         let spawn_start = Instant::now();
         // Embedders (e.g. the Node SDK, where current_exe is `node`) can point the
         // boot subprocess at a `_boot-vm`-capable, signed helper binary instead of self.
-        let boot_exe = std::env::var_os("SMOLVM_BOOT_BINARY")
+        let boot_binary = std::env::var_os("SMOLVM_BOOT_BINARY");
+        // An in-process embedder (the Node/Python SDK) sets SMOLVM_BOOT_BINARY and
+        // owns the VM's lifetime — when that host process dies, the VM must die
+        // too, or it leaks as an orphan holding the VM's full RAM. The CLI (which
+        // detaches the VM on purpose) and `serve` (which reconnects to surviving
+        // VMs) don't set it, so they keep today's behavior. We pass the resulting
+        // flag down so the boot subprocess only arms its parent-death watchdog in
+        // the embedder case. See `cli/internal_boot::run`.
+        let watch_parent = boot_binary.is_some();
+        let boot_exe = boot_binary
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| exe.clone());
         let child = std::process::Command::new(&boot_exe)
             .args(["_boot-vm", &config_path.to_string_lossy()])
+            .env(
+                "SMOLVM_BOOT_WATCH_PARENT",
+                if watch_parent { "1" } else { "0" },
+            )
             .stdin(std::process::Stdio::null())
             // SMOLVM_BOOT_DEBUG=1 surfaces the boot subprocess's stdout/stderr so
             // embedded-host launch failures can be diagnosed (normally silenced).
