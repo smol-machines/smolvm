@@ -480,11 +480,27 @@ impl RegistryClient {
         }
 
         let index: OciIndex = serde_json::from_slice(&doc_bytes)?;
-        let want = OciPlatform::current();
+        // .smolmachine sidecars are cross-platform — libkrun is provided by the
+        // installed CLI, not bundled — so only the GUEST architecture matters, and
+        // the guest is always linux. Select by architecture: prefer an os=linux
+        // entry, but fall back to architecture alone so an index whose `os` was
+        // mislabeled with the build host (e.g. darwin/arm64 for an arm64 pack) still
+        // resolves. The host OS is irrelevant to which sidecar to pull.
+        let arch = OciPlatform::current().architecture;
         let entry = index
             .manifests
             .iter()
-            .find(|m| m.platform.as_ref() == Some(&want))
+            .find(|m| {
+                m.platform
+                    .as_ref()
+                    .is_some_and(|p| p.os == "linux" && p.architecture == arch)
+            })
+            .or_else(|| {
+                index
+                    .manifests
+                    .iter()
+                    .find(|m| m.platform.as_ref().is_some_and(|p| p.architecture == arch))
+            })
             .ok_or_else(|| {
                 let available: Vec<String> = index
                     .manifests
@@ -492,8 +508,7 @@ impl RegistryClient {
                     .filter_map(|m| m.platform.as_ref().map(|p| p.label()))
                     .collect();
                 RegistryError::InvalidManifest(format!(
-                    "no {} build available for this machine; the registry has: {}",
-                    want.label(),
+                    "no linux/{arch} build available for this machine; the registry has: {}",
                     if available.is_empty() {
                         "(none)".into()
                     } else {
@@ -501,7 +516,7 @@ impl RegistryClient {
                     }
                 ))
             })?;
-        tracing::info!(platform = %want.label(), digest = %entry.digest, "selected index entry");
+        tracing::info!(arch = %arch, digest = %entry.digest, "selected index entry");
         Ok(self.get_manifest_raw(repo, &entry.digest).await?.0)
     }
 
