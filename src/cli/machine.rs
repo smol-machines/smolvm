@@ -293,6 +293,17 @@ pub struct RunCmd {
     #[arg(short = 'I', long, value_name = "IMAGE", value_parser = parse_image)]
     pub image: Option<String>,
 
+    /// Run a packed `.smolmachine` artifact ephemerally (the VM is discarded on
+    /// exit) — the one-shot equivalent of `machine create --from … + start`.
+    /// CPU/memory fall back to the artifact's baked manifest unless overridden.
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with_all = ["image", "smolfile", "detach", "name", "gpu", "gpu_vram_mib", "oci_platform", "allow_cidr", "allow_host", "outbound_localhost_only", "secret_env", "secret_file"],
+        help_heading = "Machine source"
+    )]
+    pub from: Option<PathBuf>,
+
     /// Name a persistent machine when used with --detach.
     /// Matches the --name flag on start/stop/exec/status/resize. In foreground
     /// mode (no -d), --name is ignored with a warning.
@@ -452,6 +463,35 @@ pub struct RunCmd {
 impl RunCmd {
     pub fn run(self) -> smolvm::Result<()> {
         use smolvm::Error;
+
+        // `--from`: run a packed .smolmachine artifact ephemerally, reusing the
+        // proven pack-run path. Resource flags fall back to the artifact's baked
+        // manifest values (matching `machine create --from`); the remaining run
+        // flags pass through. Flags the sidecar runner can't honor are rejected
+        // at parse time via `conflicts_with_all` on `from`.
+        if let Some(from) = self.from {
+            return crate::cli::pack_run::PackRunCmd {
+                sidecar: Some(from),
+                command: self.command,
+                interactive: self.interactive,
+                tty: self.tty,
+                timeout: self.timeout,
+                workdir: self.workdir,
+                env: self.env,
+                volume: self.volume,
+                port: self.port,
+                net: self.net,
+                net_backend: self.net_backend,
+                cpus: (self.cpus != DEFAULT_MICROVM_CPU_COUNT).then_some(self.cpus),
+                mem: (self.mem != DEFAULT_MICROVM_MEMORY_MIB).then_some(self.mem),
+                storage: self.storage,
+                overlay: self.overlay,
+                force_extract: false,
+                info: false,
+                debug: false,
+            }
+            .run();
+        }
 
         let requested_name = self.name.clone();
         let vm_name = if self.detach {
