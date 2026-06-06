@@ -130,16 +130,26 @@ jobs:
             rootfs_arch: aarch64
             agent_arch: aarch64
             lib_dir: lib
+          # Linux dist binaries build on 22.04 (glibc 2.35), NOT ubuntu-latest
+          # (24.04 = glibc 2.39). Symbol versioning is backward-compatible only,
+          # so the build host's glibc is the MINIMUM a user needs at runtime —
+          # a 2.39-built binary dies on 22.04 with "GLIBC_2.39 not found". 2.35
+          # covers Ubuntu 22.04+ / Debian 12+ / RHEL 9+.
           - platform: linux-x86_64
-            runner: ubuntu-latest
+            runner: ubuntu-22.04
             rootfs_arch: x86_64
             agent_arch: x86_64
             lib_dir: lib/linux-x86_64
+          - platform: linux-arm64
+            runner: ubuntu-22.04-arm
+            rootfs_arch: aarch64
+            agent_arch: aarch64
+            lib_dir: lib/linux-aarch64
     steps:
       - uses: actions/checkout@v6
         with:
           lfs: true
-          submodules: ${{ matrix.platform == 'linux-x86_64' && 'recursive' || 'false' }}
+          submodules: ${{ startsWith(matrix.platform, 'linux-') && 'recursive' || 'false' }}
 
       - name: Pull LFS files
         run: git lfs pull
@@ -167,7 +177,11 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libssl-dev pkg-config e2fsprogs
+          # patchelf: build-dist.sh strips libkrun's hard libvirglrenderer NEEDED
+          # so non-GPU Linux hosts can dlopen it (GPU stays optional at runtime).
+          # Without patchelf the strip is silently skipped and `smolvm run` fails
+          # with "libvirglrenderer.so.1: cannot open shared object file".
+          sudo apt-get install -y build-essential libssl-dev pkg-config e2fsprogs patchelf
 
       - name: Install build dependencies (macOS)
         if: runner.os == 'macOS'
@@ -221,6 +235,23 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple: \
             -s -k "$KEYCHAIN_PASSWORD" build.keychain
           rm /tmp/certificate.p12
+
+      # Check out the unified `smol` CLI (a separate repo) into ./smol so
+      # build-dist.sh builds and bundles it alongside the engine — one tarball
+      # serves both `smol` and `smolvm`. Requires repo secret SMOL_REPO_TOKEN
+      # with read access to smol-machines/smol. If unset, the step is skipped and
+      # an engine-only tarball is produced. Ref is left at the smol default
+      # branch (its versioning is independent of the engine tag); pin a ref here
+      # if you want reproducible smol-CLI releases.
+      - name: Check out smol CLI source
+        if: env.SMOL_REPO_TOKEN != ''
+        uses: actions/checkout@v6
+        with:
+          repository: smol-machines/smol
+          path: smol
+          token: ${{ secrets.SMOL_REPO_TOKEN }}
+        env:
+          SMOL_REPO_TOKEN: ${{ secrets.SMOL_REPO_TOKEN }}
 
       - name: Build distribution tarball
         run: ./scripts/build-dist.sh --skip-agent-build

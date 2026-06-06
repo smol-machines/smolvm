@@ -57,6 +57,7 @@ use state::ApiState;
     ),
     tags(
         (name = "Health", description = "Health check endpoints"),
+        (name = "Node", description = "Node capacity introspection"),
         (name = "Machines", description = "Machine lifecycle management"),
         (name = "Execution", description = "Command execution in machines"),
         (name = "Logs", description = "Log streaming"),
@@ -66,6 +67,8 @@ use state::ApiState;
     paths(
         // Health
         handlers::health::health,
+        // Node
+        handlers::node::capacity,
         // Execution
         handlers::exec::exec_command,
         handlers::exec::exec_stream,
@@ -104,6 +107,7 @@ use state::ApiState;
         types::ResizeMachineRequest,
         // Response types
         types::HealthResponse,
+        types::CapacityResponse,
         types::MachineInfo,
         types::MountInfo,
         types::ListMachinesResponse,
@@ -141,8 +145,17 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
     // Health check route
     let health_route = Router::new().route("/health", get(handlers::health::health));
 
-    // SSE logs route (no timeout - streams indefinitely)
-    let logs_route = Router::new().route("/{id}/logs", get(handlers::exec::stream_logs));
+    // Node capacity introspection (polled by a fleet node-agent over HTTP).
+    let capacity_route = Router::new().route("/capacity", get(handlers::node::capacity));
+
+    // Long-lived streaming routes (no request timeout): SSE logs and the
+    // interactive PTY WebSocket both outlive the 5-minute API timeout.
+    let logs_route = Router::new()
+        .route("/{id}/logs", get(handlers::exec::stream_logs))
+        .route(
+            "/{id}/exec/interactive",
+            get(handlers::exec::exec_interactive),
+        );
 
     // Machine routes with timeout
     let machine_routes_with_timeout = Router::new()
@@ -228,6 +241,7 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
     // Combine all routes
     Router::new()
         .merge(health_route)
+        .merge(capacity_route)
         .merge(metrics_route)
         .nest("/api/v1", api_v1)
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))

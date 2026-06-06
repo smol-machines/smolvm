@@ -30,6 +30,10 @@ smolvm machine exec --name myvm -- which python3      # still there after exit+r
 smolvm machine run --ssh-agent --net --image alpine -- ssh-add -l
 smolvm machine create myvm --ssh-agent --net
 
+# Inject secrets into workload env (referenced from host env var / file)
+smolvm machine run --secret-env OPENAI_API_KEY=OPENAI_API_KEY -- ./app
+smolvm machine run -s Smolfile -- ./app   # Smolfile [secrets] resolves at launch
+
 # Pack into portable executable
 smolvm pack create --image python:3.12-alpine -o ./my-python
 ./my-python run -- python3 -c "print('hello')"
@@ -51,6 +55,7 @@ smolvm machine exec --name my-vm -- pip install requests
 | Ship software as a binary | `smolvm pack create --image IMAGE -o OUTPUT` |
 | Fast persistent machine from packed artifact | `machine create NAME --from FILE.smolmachine` |
 | Use git/ssh with private keys safely | Add `--ssh-agent` to run or create |
+| Inject API keys / tokens without putting them on the command line | `--secret-env`/`--secret-file` flags or Smolfile `[secrets]` |
 | Minimal VM without image | `smolvm machine run -s Smolfile` (bare VM) |
 | Change mounts/ports/resources on existing VM | `machine update NAME -v ./src:/app -p 8080:8080` |
 | Declarative VM config | Create a Smolfile, use `--smolfile`/`-s` flag |
@@ -90,6 +95,13 @@ smolvm pack run [--sidecar PATH] [-- CMD]         # run .smolmachine
 
 smolvm serve start [--listen ADDR:PORT|PATH]      # HTTP API
 smolvm config registries edit                     # registry auth
+
+# Secrets are references to host env vars / files, resolved at launch — no
+# built-in store. Attach them on the command line or in a Smolfile [secrets].
+smolvm machine run    --secret-env GUEST_VAR=HOST_VAR     # from host env var
+smolvm machine run    --secret-file GUEST_VAR=/abs/path   # from host file
+smolvm machine create NAME --secret-env GUEST_VAR=HOST_VAR  # persists the ref
+smolvm machine exec --name NAME --secret-env GUEST_VAR=HOST_VAR -- cmd
 ```
 
 ## Artifact References
@@ -177,6 +189,11 @@ startup_grace = "20s"
 # Credential forwarding
 [auth]
 ssh_agent = true                      # forward host SSH agent into the VM
+
+# Secrets — references to host sources, resolved at workload launch
+[secrets]
+DATABASE_URL   = { from_env   = "PROD_DB_URL" }      # host env var (at launch)
+GCP_CREDS      = { from_file  = "/abs/creds.json" }  # host file (at launch)
 ```
 
 ### Merge Precedence
@@ -291,6 +308,56 @@ env = ["VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/virtio_icd.x86_64.json"]
 ```
 
 For a complete working example see [`examples/headless-browser/browser.smolfile`](examples/headless-browser/browser.smolfile).
+## Secrets
+
+smolvm stores no secret material. A secret is a *reference* to a value that
+already lives on the host — a host environment variable or a host file — and is
+resolved into the workload's process environment at launch time. Bring your own
+secrets manager (Vault, 1Password, AWS, sops, your shell): render the value into
+an env var or file, then point a ref at it. Only the reference is ever
+persisted; the resolved value never lands in the VM record, the database, or a
+`.smolmachine` pack.
+
+Attach refs on the command line:
+
+```bash
+# From a host environment variable (GUEST_VAR=HOST_VAR)
+smolvm machine run    --secret-env OPENAI_API_KEY=OPENAI_API_KEY -- ./app
+smolvm machine create web --secret-env DATABASE_URL=PROD_DB_URL   # persists the ref
+smolvm machine exec --name web --secret-env TOKEN=CI_TOKEN -- ./deploy
+
+# From a host file (GUEST_VAR=/absolute/path)
+smolvm machine run --secret-file GCP_CREDS=/abs/creds.json -- ./app
+
+# Bridge any external manager through the env/file seam, e.g. 1Password:
+op run --env-file=secrets.env -- smolvm machine run -- ./app
+```
+
+Or reference them from a Smolfile. The left-hand key becomes the env var name in
+the guest workload:
+
+```toml
+[secrets]
+DATABASE_URL = { from_env  = "PROD_DB_URL" }    # host env var (at launch)
+GCP_CREDS    = { from_file = "/abs/creds.json" } # absolute host file (at launch)
+```
+
+Exactly one of `from_env`, `from_file` must be set per entry; `from_file` paths
+must be absolute. Resolved values are appended *after* top-level `env` and CLI
+`-e` flags. Resolution is late-bound, so rotating the underlying env var or file
+takes effect at the next launch with nothing to re-sync.
+
+**Threat model:** this is defense-in-depth, not zero-knowledge. The target
+process sees plaintext in its own environment, and root inside the guest can
+read any `/proc/*/environ`. Use SSH agent forwarding instead when a secret must
+never leave the host.
+
+**Where they're resolved:** `machine run`, `machine create` + `machine start`,
+and `machine exec` resolve refs against *this host* under a trusted-local scope.
+Untrusted surfaces — HTTP API request bodies and portable `.smolmachine` packs —
+are treated as untrusted callers and may carry **no** resolvable secret ref:
+`from_env` would expose the server's env and `from_file` would be an arbitrary
+host-file read, so both are rejected. Configure secrets locally instead.
 
 ## File Copy
 

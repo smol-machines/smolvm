@@ -21,8 +21,10 @@ use serde::{Deserialize, Serialize};
 pub mod guest_env;
 pub mod image_ref;
 pub mod retry;
+pub mod secrets;
 
 pub use image_ref::normalize_image_ref;
+pub use secrets::{SecretRef, SecretSourceKind};
 
 /// Serde helper for encoding `Vec<u8>` as a base64 string in JSON.
 ///
@@ -150,6 +152,12 @@ pub enum AgentRequest {
         /// Optional registry authentication credentials.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         auth: Option<RegistryAuth>,
+        /// Proxy URL applied to the registry client (sets HTTP_PROXY and HTTPS_PROXY).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proxy: Option<String>,
+        /// Comma-separated NO_PROXY list of hosts/CIDRs that bypass the proxy.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        no_proxy: Option<String>,
     },
 
     /// Query if an image exists locally.
@@ -236,6 +244,9 @@ pub enum AgentRequest {
         /// Background mode - spawn and return PID immediately without waiting.
         #[serde(default)]
         background: bool,
+        /// Data to pipe to the command's stdin.
+        #[serde(default)]
+        stdin_data: Option<String>,
     },
 
     /// Run a command in an image's rootfs.
@@ -365,6 +376,44 @@ pub enum AgentRequest {
         /// Absolute path in the VM filesystem.
         path: String,
     },
+}
+
+impl AgentRequest {
+    /// A log-safe one-line summary of the request.
+    ///
+    /// This string is written to the machine's console log, which is exposed
+    /// over the logs API — so it must NEVER include credential- or data-bearing
+    /// fields: registry `auth`, `env` (which can carry host-resolved secrets),
+    /// `proxy` (may embed credentials), or `data` (file/stdin bytes). Only the
+    /// variant name plus a non-secret identifier (image) is emitted.
+    ///
+    /// The match is exhaustive with no catch-all on purpose: adding a new
+    /// variant forces a compile error here, so redaction is a deliberate
+    /// decision rather than an accidental leak in some future request type.
+    pub fn log_summary(&self) -> String {
+        match self {
+            AgentRequest::Ping => "Ping".into(),
+            AgentRequest::Pull { image, .. } => format!("Pull {{ image: {image} }}"),
+            AgentRequest::Query { image, .. } => format!("Query {{ image: {image} }}"),
+            AgentRequest::ListImages => "ListImages".into(),
+            AgentRequest::GarbageCollect { .. } => "GarbageCollect".into(),
+            AgentRequest::PrepareOverlay { .. } => "PrepareOverlay".into(),
+            AgentRequest::CleanupOverlay { .. } => "CleanupOverlay".into(),
+            AgentRequest::FormatStorage => "FormatStorage".into(),
+            AgentRequest::StorageStatus => "StorageStatus".into(),
+            AgentRequest::NetworkTest { .. } => "NetworkTest".into(),
+            AgentRequest::Shutdown => "Shutdown".into(),
+            AgentRequest::ExportLayer { .. } => "ExportLayer".into(),
+            AgentRequest::VmExec { .. } => "VmExec".into(),
+            AgentRequest::Run { image, .. } => format!("Run {{ image: {image} }}"),
+            AgentRequest::Stdin { .. } => "Stdin".into(),
+            AgentRequest::Resize { .. } => "Resize".into(),
+            AgentRequest::FileWrite { .. } => "FileWrite".into(),
+            AgentRequest::FileWriteBegin { .. } => "FileWriteBegin".into(),
+            AgentRequest::FileWriteChunk { .. } => "FileWriteChunk".into(),
+            AgentRequest::FileRead { .. } => "FileRead".into(),
+        }
+    }
 }
 
 /// Agent response types.
@@ -662,12 +711,26 @@ pub struct StorageStatus {
 }
 
 /// Registry authentication credentials for pulling images.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written to redact the password: this value is carried inside
+/// `AgentRequest::Pull`, and any `{:?}` of that request (e.g. a tracing span)
+/// would otherwise serialize the token verbatim into the machine's console log,
+/// which is exposed over the logs API.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct RegistryAuth {
     /// Username for authentication.
     pub username: String,
     /// Password or token for authentication.
     pub password: String,
+}
+
+impl std::fmt::Debug for RegistryAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegistryAuth")
+            .field("username", &self.username)
+            .field("password", &"***")
+            .finish()
+    }
 }
 
 // ============================================================================
@@ -897,6 +960,8 @@ mod tests {
             image: "alpine:latest".to_string(),
             oci_platform: Some("linux/arm64".to_string()),
             auth: None,
+            proxy: None,
+            no_proxy: None,
         };
 
         let encoded = encode_message(&req).unwrap();
@@ -906,6 +971,8 @@ mod tests {
             image,
             oci_platform,
             auth,
+            proxy,
+            no_proxy,
         } = decoded
         else {
             panic!("expected Pull variant, got {:?}", decoded);
@@ -913,6 +980,8 @@ mod tests {
         assert_eq!(image, "alpine:latest");
         assert_eq!(oci_platform, Some("linux/arm64".to_string()));
         assert!(auth.is_none());
+        assert!(proxy.is_none());
+        assert!(no_proxy.is_none());
     }
 
     #[test]
@@ -924,6 +993,8 @@ mod tests {
                 username: "testuser".to_string(),
                 password: "testpass".to_string(),
             }),
+            proxy: None,
+            no_proxy: None,
         };
 
         let encoded = encode_message(&req).unwrap();
@@ -933,6 +1004,8 @@ mod tests {
             image,
             oci_platform,
             auth,
+            proxy: _,
+            no_proxy: _,
         } = decoded
         else {
             panic!("expected Pull variant, got {:?}", decoded);
@@ -942,6 +1015,29 @@ mod tests {
         let auth = auth.expect("auth should be Some");
         assert_eq!(auth.username, "testuser");
         assert_eq!(auth.password, "testpass");
+    }
+
+    #[test]
+    fn test_encode_decode_with_proxy() {
+        let req = AgentRequest::Pull {
+            image: "alpine:latest".to_string(),
+            oci_platform: None,
+            auth: None,
+            proxy: Some("http://192.168.127.254:3128".to_string()),
+            no_proxy: Some("127.0.0.1,localhost,.internal".to_string()),
+        };
+
+        let encoded = encode_message(&req).unwrap();
+        let decoded: AgentRequest = decode_message(&encoded).unwrap();
+
+        let AgentRequest::Pull {
+            proxy, no_proxy, ..
+        } = decoded
+        else {
+            panic!("expected Pull variant, got {:?}", decoded);
+        };
+        assert_eq!(proxy.as_deref(), Some("http://192.168.127.254:3128"));
+        assert_eq!(no_proxy.as_deref(), Some("127.0.0.1,localhost,.internal"));
     }
 
     #[test]

@@ -238,7 +238,13 @@ pub fn launch_agent_vm_dynamic(
                         cidr_cstrings.iter().map(|s| s.as_ptr()).collect();
                     cidr_ptrs.push(std::ptr::null());
 
-                    if unsafe { (set_egress)(ctx, cidr_ptrs.as_ptr()) } < 0 {
+                    // The dynamic path enforces CIDR-only egress; DNS allow-host
+                    // filtering (hosts + resolver args) is wired in the main
+                    // launcher path.
+                    if unsafe {
+                        (set_egress)(ctx, cidr_ptrs.as_ptr(), std::ptr::null(), std::ptr::null())
+                    } < 0
+                    {
                         free_ctx_on_err!("krun_set_egress_policy failed");
                     }
                 }

@@ -91,6 +91,476 @@ fn close_fds_by_range(min_fd: i32) {
     }
 }
 
+/// Apply best-effort, low-risk hardening to *this* process before it becomes the
+/// VMM host for an untrusted guest — the info-leak / escalation baseline that the
+/// heavier work (seccomp, cgroup caps, privilege drop) builds on top of.
+///
+/// Effects (Linux; a near-no-op on macOS dev, which is single-tenant):
+/// - `PR_SET_NO_NEW_PRIVS`: a guest→VMM escape cannot regain privileges via a
+///   setuid binary. Affects nothing the VMM legitimately does.
+/// - `PR_SET_DUMPABLE = 0`: not ptrace-able, and `/proc/<pid>/{mem,maps,…}`
+///   become root-owned, so a compromised VMM can't read a neighbor VM's guest
+///   RAM. Self-access to `/proc/self` is unaffected, so libkrun boots normally
+///   (verified on Linux/KVM across bare/network/GPU VMs).
+/// - `RLIMIT_CORE = 0`: never write a core dump, which would contain guest RAM
+///   (the main on-crash memory-disclosure vector). POSIX — both OSes.
+///
+/// All calls are best-effort: failures are ignored (hardening is additive and
+/// must never block boot).
+pub fn harden_self() {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        // Block setuid privilege escalation after a guest→VMM escape.
+        libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+        // Non-dumpable: not ptrace-able, and /proc/<pid>/{mem,maps,…} become
+        // root-owned so another same-uid VMM can't read this VM's guest RAM
+        // (cross-tenant memory leak). Self-access to /proc/self stays permitted,
+        // so libkrun still reads its own maps and boots normally (verified on
+        // Linux/KVM across bare/network/GPU VMs).
+        //
+        // EXCEPTION: a forkable golden must stay dumpable. Its CoW clones map the
+        // golden's guest RAM by opening /proc/<golden_pid>/fd/<memfd>, which
+        // PR_SET_DUMPABLE=0 would deny (EACCES → clone can't boot). The
+        // RLIMIT_CORE=0 below still prevents a core dump from leaking the
+        // golden's RAM, so only same-uid /proc access + ptrace are relaxed —
+        // acceptable for a fork pool whose clones legitimately share its memory.
+        if std::env::var_os("SMOLVM_FORKABLE").is_none() {
+            libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+        }
+    }
+    unsafe {
+        let lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        libc::setrlimit(libc::RLIMIT_CORE, &lim);
+    }
+}
+
+// ============================================================================
+// Per-VM cgroup v2 resource caps (noisy-neighbor / host-DoS containment)
+//
+// Each VMM subprocess is placed in its own cgroup v2 leaf with cpu/pids/memory
+// limits so an untrusted guest cannot peg host CPU, fork-bomb the host, or
+// balloon VMM memory to harm neighbors. See docs/runtime-isolation-hardening.md.
+//
+// Two pieces, because of the cgroup v2 "no internal processes" rule (a cgroup
+// may hold processes OR delegate controllers to children, not both):
+//   1. `setup_cgroup_delegation_root` (supervisor): vacate our own process into
+//      a leaf so the parent can become a delegated root that distributes
+//      cpu/memory/pids to per-VM children.
+//   2. `place_in_cgroup` (VMM subprocess): create a capped `vm-<pid>` leaf under
+//      that root and join it.
+// Both are best-effort and Linux-only — a near-no-op on macOS dev (single
+// tenant), and on Linux they degrade to "uncapped but still booting" whenever
+// cgroup v2 isn't delegated to us, since hardening must never block boot.
+// ============================================================================
+
+/// CPU accounting period for `cpu.max` (cgroup v2 default, 100 ms).
+#[cfg(target_os = "linux")]
+const CGROUP_CPU_PERIOD_US: u64 = 100_000;
+
+/// Cap on host tasks (threads/processes) a single VMM may spawn. Guest processes
+/// run *inside* the VM and are not host tasks, so the VMM itself needs only a few
+/// dozen (one per vCPU plus virtio/vsock/gpu workers). 1024 is generous headroom
+/// that still severs a host-side fork bomb after a guest→VMM escape.
+#[cfg(target_os = "linux")]
+const CGROUP_PIDS_MAX: u32 = 1024;
+
+/// Extra MiB granted on top of guest RAM for VMM/virtio/gpu overhead when sizing
+/// `memory.max`. This is defense-in-depth atop the guest RAM bound already
+/// enforced by `krun_set_vm_config`, not the primary memory control.
+#[cfg(target_os = "linux")]
+const CGROUP_MEM_OVERHEAD_MIB: u64 = 768;
+
+/// Resolve this process's cgroup v2 directory from `/proc/self/cgroup`.
+///
+/// Returns `None` on a cgroup v1 / hybrid host (no unified `0::` line) or if the
+/// path can't be read — callers then skip cgroup caps.
+#[cfg(target_os = "linux")]
+fn cgroup_v2_self_dir() -> Option<std::path::PathBuf> {
+    let content = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    // The unified-hierarchy entry is the line beginning with "0::".
+    let rel = content.lines().find_map(|l| l.strip_prefix("0::"))?.trim();
+    if rel.is_empty() {
+        return None;
+    }
+    Some(std::path::Path::new("/sys/fs/cgroup").join(rel.trim_start_matches('/')))
+}
+
+/// Write a single cgroup control file (no trailing newline needed by the kernel).
+#[cfg(target_os = "linux")]
+fn write_cgroup(dir: &std::path::Path, file: &str, val: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join(file))?;
+    f.write_all(val.as_bytes())
+}
+
+/// Supervisor-side: turn our current cgroup into a delegated root under which
+/// per-VM subprocesses can be capped.
+///
+/// Because of the "no internal processes" rule, we first move *our own* process
+/// into a `supervisor` leaf, then enable `cpu`/`memory`/`pids` distribution on
+/// the now-empty parent. That parent is returned as the root to pass to
+/// [`place_in_cgroup`]. Pass the returned path to each VMM subprocess (e.g. via
+/// the `SMOLVM_CGROUP_ROOT` env var) so it can self-place.
+///
+/// Returns `None` (and changes nothing observable) when cgroup v2 isn't
+/// delegated to us — e.g. the process isn't under a systemd unit with
+/// `Delegate=yes`, or we lack write access. The caller proceeds without caps.
+#[cfg(target_os = "linux")]
+pub fn setup_cgroup_delegation_root() -> Option<std::path::PathBuf> {
+    let root = cgroup_v2_self_dir()?;
+    // Vacate our process into a leaf so `root` may distribute controllers.
+    let supervisor = root.join("supervisor");
+    let _ = std::fs::create_dir(&supervisor);
+    let pid = unsafe { libc::getpid() };
+    if write_cgroup(&supervisor, "cgroup.procs", &pid.to_string()).is_err() {
+        // Not delegated / no permission — no per-VM caps available.
+        return None;
+    }
+    // Now that `root` holds no processes, enable the controllers we cap on.
+    if write_cgroup(&root, "cgroup.subtree_control", "+cpu +memory +pids").is_err() {
+        return None;
+    }
+    Some(root)
+}
+
+/// VMM-subprocess-side: place THIS process into a capped `vm-<pid>` leaf under
+/// `root`, deriving limits from the VM's resources.
+///
+/// Caps applied (best-effort, each independently):
+/// - `cpu.max` = `vcpus * 100ms / 100ms` → bounds CPU to ~`vcpus` cores.
+/// - `pids.max` = [`CGROUP_PIDS_MAX`] → caps host tasks (fork-bomb containment).
+/// - `memory.max` = guest RAM + [`CGROUP_MEM_OVERHEAD_MIB`] → defense-in-depth.
+///
+/// `root` must be a delegated root with `cpu`/`memory`/`pids` enabled in its
+/// `subtree_control` (see [`setup_cgroup_delegation_root`]); otherwise the limit
+/// files won't exist and the caps silently degrade while the process still runs.
+/// Never blocks boot.
+#[cfg(target_os = "linux")]
+pub fn place_in_cgroup(root: &std::path::Path, vcpus: u8, memory_mib: u32) {
+    let pid = unsafe { libc::getpid() };
+    let vm = root.join(format!("vm-{pid}"));
+    if let Err(e) = std::fs::create_dir(&vm) {
+        if e.kind() != std::io::ErrorKind::AlreadyExists {
+            tracing::debug!(error = %e, dir = %vm.display(),
+                "could not create per-VM cgroup; VMM running uncapped");
+            return;
+        }
+    }
+
+    // Set limits on the leaf *before* joining it.
+    let quota_us = (vcpus.max(1) as u64) * CGROUP_CPU_PERIOD_US;
+    let _ = write_cgroup(
+        &vm,
+        "cpu.max",
+        &format!("{quota_us} {CGROUP_CPU_PERIOD_US}"),
+    );
+    let _ = write_cgroup(&vm, "pids.max", &CGROUP_PIDS_MAX.to_string());
+    let mem_bytes = (memory_mib as u64 + CGROUP_MEM_OVERHEAD_MIB) * 1024 * 1024;
+    let _ = write_cgroup(&vm, "memory.max", &mem_bytes.to_string());
+
+    // Join the leaf last; from here the caps above govern this process tree.
+    if let Err(e) = write_cgroup(&vm, "cgroup.procs", &pid.to_string()) {
+        tracing::debug!(error = %e, "failed to join per-VM cgroup; VMM running uncapped");
+        let _ = std::fs::remove_dir(&vm); // leave no empty cgroup behind
+        return;
+    }
+    tracing::info!(
+        vcpus, memory_mib, cgroup = %vm.display(),
+        "placed VMM subprocess in per-VM cgroup with cpu/pids/memory caps"
+    );
+}
+
+// ============================================================================
+// Seccomp-BPF syscall allowlist for the VM boot subprocess
+//
+// libkrun (unlike Firecracker) installs no seccomp filter, so a guest→VMM escape
+// would inherit the host's full syscall surface. This installs a Firecracker-style
+// allowlist (via the `seccompiler` crate) on the boot subprocess before it enters
+// the guest run loop, confining a compromised VMM to the ~dozens of syscalls a
+// running microVM legitimately needs — and denying the escape-amplifying ones
+// (ptrace, kexec_load, *_module, mount, bpf, perf_event_open, process_vm_*,
+// setns, unshare, …), none of which appear in a real VM's syscall trace.
+//
+// The allowlist was derived empirically by stracing a full VM lifecycle
+// (boot + exec + stop) on a Linux/KVM host; see docs/runtime-isolation-hardening.md.
+// x86_64-Linux only for now (the production target); a no-op stub elsewhere.
+// Gated by SMOLVM_SECCOMP=audit|enforce so rollout is opt-in.
+// ============================================================================
+
+/// Install the seccomp allowlist on the calling thread (and, by inheritance, on
+/// every thread it later spawns — the vCPU/worker threads libkrun creates). Must
+/// be called while still single-threaded, before `krun_start_enter`.
+///
+/// `enforce = true`  → a non-allowlisted syscall kills the process (KillProcess).
+/// `enforce = false` → audit mode: non-allowlisted syscalls are logged but allowed
+///   (SECCOMP Log), so a run surfaces any missing syscalls without breaking the VM.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub fn install_seccomp_filter(enforce: bool) -> std::result::Result<(), String> {
+    // Build the BPF program (allocates) and apply it (a single seccomp syscall,
+    // allocation-free). Split out so tests can build in the parent and apply in a
+    // forked child without allocating post-fork.
+    let program = build_seccomp_program(enforce)?;
+    seccompiler::apply_filter(&program).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Compile the syscall allowlist into a seccomp BPF program. See
+/// [`install_seccomp_filter`] for the policy.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn build_seccomp_program(enforce: bool) -> std::result::Result<seccompiler::BpfProgram, String> {
+    use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, TargetArch};
+    use std::collections::BTreeMap;
+
+    // Syscalls observed across a full VM lifecycle (boot + exec + stop), plus a
+    // small margin of common runtime syscalls that vDSO/timing can hide from a
+    // single trace. An empty rule vec allows the syscall unconditionally.
+    //
+    // Kept as a hand-grouped table (rustfmt would explode it one-per-line):
+    // a security allowlist is far easier to audit when related syscalls sit
+    // together under a category comment.
+    #[rustfmt::skip]
+    let mut allowed: Vec<libc::c_long> = vec![
+        // file & block I/O (storage/overlay disks, virtio-blk, layer files)
+        libc::SYS_read, libc::SYS_write, libc::SYS_pread64, libc::SYS_pwrite64,
+        libc::SYS_preadv, libc::SYS_pwritev, libc::SYS_openat, libc::SYS_close,
+        libc::SYS_close_range, libc::SYS_lseek, libc::SYS_fsync, libc::SYS_fallocate,
+        libc::SYS_ftruncate, libc::SYS_fstat, libc::SYS_newfstatat, libc::SYS_statx,
+        libc::SYS_fstatfs, libc::SYS_statfs, libc::SYS_fcntl, libc::SYS_flock,
+        libc::SYS_dup, libc::SYS_dup3, libc::SYS_getdents64,
+        libc::SYS_readlinkat, libc::SYS_faccessat, libc::SYS_umask,
+        libc::SYS_fgetxattr, libc::SYS_flistxattr, libc::SYS_pipe2,
+        // memory (guest RAM, dlopen of libkrun)
+        libc::SYS_mmap, libc::SYS_munmap, libc::SYS_mremap, libc::SYS_mprotect,
+        libc::SYS_madvise, libc::SYS_brk,
+        // KVM + device ioctls, eventfd plumbing
+        libc::SYS_ioctl, libc::SYS_eventfd2,
+        // epoll / poll event loops (virtio, vsock/TSI)
+        libc::SYS_epoll_create1, libc::SYS_epoll_ctl,
+        libc::SYS_epoll_pwait, libc::SYS_ppoll,
+        // sockets (vsock/TSI data path, host networking)
+        libc::SYS_socket, libc::SYS_socketpair, libc::SYS_connect, libc::SYS_bind,
+        libc::SYS_listen, libc::SYS_accept, libc::SYS_sendto, libc::SYS_recvfrom,
+        libc::SYS_sendmsg, libc::SYS_recvmsg, libc::SYS_setsockopt,
+        libc::SYS_getsockopt, libc::SYS_shutdown,
+        // threads & synchronization (vCPU/worker threads, render-thread priority)
+        libc::SYS_clone, libc::SYS_clone3, libc::SYS_futex, libc::SYS_set_robust_list,
+        libc::SYS_set_tid_address, libc::SYS_rseq, libc::SYS_sched_yield,
+        libc::SYS_sched_getaffinity, libc::SYS_sched_setaffinity, libc::SYS_sched_getparam,
+        libc::SYS_sched_setscheduler, libc::SYS_setpriority, libc::SYS_membarrier,
+        libc::SYS_gettid, libc::SYS_getpid, libc::SYS_getppid,
+        // signals
+        libc::SYS_rt_sigaction, libc::SYS_rt_sigprocmask, libc::SYS_rt_sigreturn,
+        libc::SYS_sigaltstack, libc::SYS_signalfd4, libc::SYS_kill, libc::SYS_tgkill,
+        libc::SYS_tkill,
+        // time
+        libc::SYS_clock_nanosleep, libc::SYS_nanosleep, libc::SYS_clock_gettime,
+        libc::SYS_gettimeofday,
+        // process lifecycle & misc identity/limits
+        libc::SYS_wait4, libc::SYS_exit, libc::SYS_exit_group, libc::SYS_restart_syscall,
+        libc::SYS_prctl, libc::SYS_prlimit64, libc::SYS_getrusage,
+        libc::SYS_sysinfo, libc::SYS_uname, libc::SYS_getrandom,
+        libc::SYS_getuid, libc::SYS_geteuid, libc::SYS_getgid, libc::SYS_getegid,
+        libc::SYS_capget, libc::SYS_setpgid,
+    ];
+
+    // Legacy syscalls present only on x86_64; aarch64 exposes only the *at/p
+    // variants (already in the common list above) plus a few of its own. These
+    // libc::SYS_* constants don't exist on the other arch, so they must be
+    // arch-gated. The arm64 set is a starting point — refine from an audit run.
+    #[cfg(target_arch = "x86_64")]
+    allowed.extend_from_slice(&[
+        libc::SYS_dup2,
+        libc::SYS_readlink,
+        libc::SYS_unlink,
+        libc::SYS_rename,
+        libc::SYS_mkdir,
+        libc::SYS_access,
+        libc::SYS_epoll_wait,
+        libc::SYS_poll,
+        libc::SYS_arch_prctl,
+    ]);
+    #[cfg(target_arch = "aarch64")]
+    allowed.extend_from_slice(&[libc::SYS_unlinkat, libc::SYS_renameat2, libc::SYS_mkdirat]);
+
+    let rules: BTreeMap<i64, Vec<seccompiler::SeccompRule>> =
+        allowed.iter().map(|&nr| (nr, Vec::new())).collect();
+
+    let mismatch_action = if enforce {
+        SeccompAction::KillProcess
+    } else {
+        SeccompAction::Log
+    };
+    let target_arch = if cfg!(target_arch = "aarch64") {
+        TargetArch::aarch64
+    } else {
+        TargetArch::x86_64
+    };
+    let filter = SeccompFilter::new(rules, mismatch_action, SeccompAction::Allow, target_arch)
+        .map_err(|e| e.to_string())?;
+    let program: BpfProgram = match filter.try_into() {
+        Ok(prog) => prog,
+        Err(e) => return Err(e.to_string()),
+    };
+    Ok(program)
+}
+
+/// No-op stub where seccomp isn't applicable (macOS dev, Linux arches other
+/// than x86_64/aarch64).
+#[cfg(not(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
+pub fn install_seccomp_filter(_enforce: bool) -> std::result::Result<(), String> {
+    Ok(())
+}
+
+// ============================================================================
+// Landlock filesystem restriction for the VM boot subprocess
+//
+// Confines the VMM's filesystem view so a guest→VMM escape cannot read or write
+// host files outside what this specific VM needs: read+exec on the rootfs / libs
+// / system dirs, read-write on this VM's own data dir + the device nodes a VMM
+// uses. Other tenants' VM data, host secrets, and the rest of the filesystem
+// become inaccessible. Best-effort and Linux-only (Landlock LSM); a no-op stub
+// elsewhere. Paths are derived per-VM from the boot config by the caller.
+//
+// MUST be installed AFTER cgroup placement (which writes /sys/fs/cgroup) and
+// BEFORE the seccomp filter (whose allowlist omits the landlock_* syscalls).
+// ============================================================================
+
+/// Restrict this process and its descendants to the given filesystem paths via
+/// Landlock: `read_exec` paths get read+execute, `read_write` paths get full
+/// access; everything else on the host becomes inaccessible. Missing paths are
+/// silently skipped. Returns `Err` only if the ruleset can't be created/applied
+/// at all (e.g. kernel without Landlock) — the caller decides fail-open/closed.
+#[cfg(target_os = "linux")]
+pub fn restrict_filesystem(
+    read_exec: &[std::path::PathBuf],
+    read_write: &[std::path::PathBuf],
+) -> std::result::Result<(), String> {
+    use landlock::{
+        Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, ABI,
+    };
+
+    // ABI V1 is supported on every Landlock-capable kernel; it governs
+    // read/write/execute and directory mutation — enough to confine file access.
+    let abi = ABI::V1;
+    let ro = AccessFs::from_read(abi);
+    let rw = AccessFs::from_all(abi);
+
+    let mut ruleset = Ruleset::default()
+        .handle_access(AccessFs::from_all(abi))
+        .map_err(|e| e.to_string())?
+        .create()
+        .map_err(|e| e.to_string())?;
+
+    for p in read_exec {
+        if let Ok(fd) = PathFd::new(p) {
+            ruleset = ruleset
+                .add_rule(PathBeneath::new(fd, ro))
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    for p in read_write {
+        if let Ok(fd) = PathFd::new(p) {
+            ruleset = ruleset
+                .add_rule(PathBeneath::new(fd, rw))
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
+    ruleset.restrict_self().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// No-op stub where Landlock isn't applicable (macOS dev).
+#[cfg(not(target_os = "linux"))]
+pub fn restrict_filesystem(
+    _read_exec: &[std::path::PathBuf],
+    _read_write: &[std::path::PathBuf],
+) -> std::result::Result<(), String> {
+    Ok(())
+}
+
+// ============================================================================
+// Drop the VMM to an unprivileged uid (bounds escape blast radius)
+//
+// Run each VMM as a powerless, ideally per-VM uid so a guest→VMM escape can't
+// signal/ptrace the serve process or other tenants' VMs, nor touch root-owned
+// host files. Requires the spawning supervisor to be privileged
+// (CAP_SETUID/SETGID — i.e. serve as root) AND this VM's data dir + disks +
+// socket dir to be owned by `uid` (the VMM opens them after the drop). The
+// `kvm` group is kept (supplementary) so /dev/kvm stays openable.
+//
+// Order in the boot path: AFTER cgroup placement (which needs privilege to write
+// cgroup.procs) and BEFORE Landlock/seccomp (which work unprivileged once
+// no_new_privs is set). See docs/runtime-isolation-hardening.md.
+// ============================================================================
+
+/// Look up the `kvm` group's gid, so it can be kept as a supplementary group
+/// across the privilege drop (the VMM needs `/dev/kvm`).
+#[cfg(target_os = "linux")]
+fn kvm_group_gid() -> Option<libc::gid_t> {
+    let grp = unsafe { libc::getgrnam(c"kvm".as_ptr()) };
+    if grp.is_null() {
+        None
+    } else {
+        Some(unsafe { (*grp).gr_gid })
+    }
+}
+
+/// Irreversibly drop this process to (`uid`, `gid`), keeping only the `kvm`
+/// supplementary group. Returns `Err` if any step fails so the caller can fail
+/// closed — the VMM must never run with more privilege than requested.
+///
+/// Uses `setgroups` → `setgid` → `setuid` (gid before uid, since `setgid` needs
+/// privilege the `setuid` would shed), then verifies uid 0 cannot be regained.
+#[cfg(target_os = "linux")]
+pub fn drop_privileges(uid: u32, gid: u32) -> std::result::Result<(), String> {
+    unsafe {
+        // Keep only kvm as a supplementary group (drop all others).
+        let groups: Vec<libc::gid_t> = kvm_group_gid().into_iter().collect();
+        if libc::setgroups(groups.len(), groups.as_ptr()) != 0 {
+            return Err(format!("setgroups: {}", std::io::Error::last_os_error()));
+        }
+        if libc::setgid(gid as libc::gid_t) != 0 {
+            return Err(format!(
+                "setgid({gid}): {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        if libc::setuid(uid as libc::uid_t) != 0 {
+            return Err(format!(
+                "setuid({uid}): {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // Defense-in-depth: a complete drop (real+effective+saved) means uid 0
+        // can no longer be regained. If it can, the drop was partial — fail.
+        if uid != 0 && libc::setuid(0) == 0 {
+            return Err("privilege drop incomplete: regained uid 0".into());
+        }
+    }
+    Ok(())
+}
+
+/// No-op stub where privilege dropping isn't applicable (macOS dev).
+#[cfg(not(target_os = "linux"))]
+pub fn drop_privileges(_uid: u32, _gid: u32) -> std::result::Result<(), String> {
+    Ok(())
+}
+
 /// Install a SIGCHLD handler to automatically reap zombie child processes.
 ///
 /// This function installs a signal handler that calls waitpid(-1, WNOHANG) to
@@ -310,6 +780,106 @@ pub fn process_start_time(pid: libc::pid_t) -> Option<u64> {
 /// Get the start time of a process (stub for unsupported platforms).
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn process_start_time(_pid: libc::pid_t) -> Option<u64> {
+    None
+}
+
+/// Sampled stats for one process.
+#[derive(Debug, Clone, Copy)]
+pub struct ProcessStats {
+    /// Cumulative CPU time (user + system) in nanoseconds since process start.
+    pub cpu_time_ns: u64,
+    /// Resident set size in bytes (physical memory currently held by the process).
+    pub rss_bytes: u64,
+}
+
+/// Sample CPU time and RSS for a single process. Returns None if the PID is
+/// dead or stats cannot be read. Both values are cumulative — caller must
+/// compute deltas across samples to derive a rate (e.g., fractional CPUs).
+#[cfg(target_os = "macos")]
+pub fn process_stats(pid: libc::pid_t) -> Option<ProcessStats> {
+    extern "C" {
+        fn proc_pidinfo(
+            pid: libc::c_int,
+            flavor: libc::c_int,
+            arg: u64,
+            buffer: *mut libc::c_void,
+            buffersize: libc::c_int,
+        ) -> libc::c_int;
+    }
+
+    const PROC_PIDTASKINFO: libc::c_int = 4;
+
+    /// Subset of `struct proc_taskinfo` from <libproc.h>. CPU times are in
+    /// mach_absolute_time units, which on Apple Silicon equal 1 nanosecond.
+    /// (For full portability we'd convert via mach_timebase_info; on arm64
+    /// macOS the ratio is 1:1, and smolvm targets Apple Silicon.)
+    #[repr(C)]
+    struct ProcTaskInfo {
+        pti_virtual_size: u64,
+        pti_resident_size: u64,
+        pti_total_user: u64,
+        pti_total_system: u64,
+        pti_threads_user: u64,
+        pti_threads_system: u64,
+        pti_policy: i32,
+        pti_faults: i32,
+        pti_pageins: i32,
+        pti_cow_faults: i32,
+        pti_messages_sent: i32,
+        pti_messages_received: i32,
+        pti_syscalls_mach: i32,
+        pti_syscalls_unix: i32,
+        pti_csw: i32,
+        pti_threadnum: i32,
+        pti_numrunning: i32,
+        pti_priority: i32,
+    }
+
+    let mut info: ProcTaskInfo = unsafe { std::mem::zeroed() };
+    let ret = unsafe {
+        proc_pidinfo(
+            pid,
+            PROC_PIDTASKINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            std::mem::size_of::<ProcTaskInfo>() as libc::c_int,
+        )
+    };
+    if ret <= 0 {
+        return None;
+    }
+    Some(ProcessStats {
+        cpu_time_ns: info.pti_total_user.saturating_add(info.pti_total_system),
+        rss_bytes: info.pti_resident_size,
+    })
+}
+
+/// Sample CPU time and RSS for a single process on Linux via /proc/<pid>/{stat,statm}.
+#[cfg(target_os = "linux")]
+pub fn process_stats(pid: libc::pid_t) -> Option<ProcessStats> {
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+    // Field 14 (utime) and 15 (stime) — both in clock ticks since process start.
+    let after_comm = stat.rfind(')')? + 2;
+    let fields: Vec<&str> = stat[after_comm..].split_whitespace().collect();
+    let utime: u64 = fields.get(11)?.parse().ok()?;
+    let stime: u64 = fields.get(12)?.parse().ok()?;
+    let clock_ticks_per_sec = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
+    if clock_ticks_per_sec == 0 {
+        return None;
+    }
+    let cpu_time_ns = (utime + stime).saturating_mul(1_000_000_000) / clock_ticks_per_sec;
+
+    let statm = std::fs::read_to_string(format!("/proc/{}/statm", pid)).ok()?;
+    let rss_pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    Some(ProcessStats {
+        cpu_time_ns,
+        rss_bytes: rss_pages.saturating_mul(page_size),
+    })
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn process_stats(_pid: libc::pid_t) -> Option<ProcessStats> {
     None
 }
 
@@ -1008,5 +1578,97 @@ mod tests {
 
         // Different second should not match
         assert!(!start_time_matches(new_micros, old_seconds + 1));
+    }
+
+    /// The seccomp allowlist must actually *deny* — a syscall outside it
+    /// (`kexec_load`, an escape-amplifying one we never allow) must kill the
+    /// process with SIGSYS. The allowed-path is covered by the live boot+exec
+    /// test on a Linux/KVM host.
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn seccomp_denies_forbidden_syscall() {
+        // Build the filter in the parent (allocating), then fork a child that
+        // applies it (allocation-free) and attempts the forbidden syscall.
+        let program = build_seccomp_program(true).expect("build seccomp program");
+        unsafe {
+            let pid = libc::fork();
+            assert!(pid >= 0, "fork failed");
+            if pid == 0 {
+                if seccompiler::apply_filter(&program).is_err() {
+                    libc::_exit(2);
+                }
+                libc::syscall(libc::SYS_kexec_load, 0, 0, 0, 0);
+                // Reached only if the filter did NOT kill us.
+                libc::_exit(0);
+            }
+            let mut status: libc::c_int = 0;
+            libc::waitpid(pid, &mut status, 0);
+            assert!(
+                libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSYS,
+                "forbidden syscall (kexec_load) should trigger SIGSYS, status={status:#x}"
+            );
+        }
+    }
+
+    /// Landlock must actually *deny* — after restricting to `/usr` only, opening
+    /// an ungranted path (`/etc/hostname`) must fail with EACCES. Runs in a forked
+    /// child so the restriction doesn't affect the test runner.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn landlock_denies_ungranted_path() {
+        use std::path::PathBuf;
+        unsafe {
+            let pid = libc::fork();
+            assert!(pid >= 0, "fork failed");
+            if pid == 0 {
+                // Landlock requires no_new_privs (set in production by harden_self).
+                libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+                let ro = [PathBuf::from("/usr")];
+                if restrict_filesystem(&ro, &[]).is_err() {
+                    libc::_exit(3); // Landlock unavailable on this kernel — tolerate.
+                }
+                // /etc is NOT granted -> opening it must be denied.
+                let path = c"/etc/hostname";
+                let fd = libc::open(path.as_ptr(), libc::O_RDONLY);
+                if fd < 0 {
+                    let err = *libc::__errno_location();
+                    libc::_exit(if err == libc::EACCES { 0 } else { 4 });
+                }
+                libc::_exit(5); // opened -> NOT restricted -> failure
+            }
+            let mut status: libc::c_int = 0;
+            libc::waitpid(pid, &mut status, 0);
+            let code = libc::WEXITSTATUS(status);
+            assert!(
+                code == 0 || code == 3,
+                "expected EACCES denial (0) or no-landlock (3), got exit {code}"
+            );
+        }
+    }
+
+    /// `drop_privileges` must fail closed: an unprivileged caller cannot drop to
+    /// another identity, so it returns Err (the boot path then refuses to run
+    /// over-privileged). `setgroups` fails first, so the test process's own
+    /// identity is left unchanged. Skipped when running as root (where it could
+    /// actually drop and disrupt the test runner).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn drop_privileges_fails_closed_without_capability() {
+        if unsafe { libc::geteuid() } == 0 {
+            return; // privileged runner — skip to avoid dropping the test process
+        }
+        assert!(
+            drop_privileges(1, 1).is_err(),
+            "unprivileged drop_privileges must fail (fail-closed contract)"
+        );
+        // Sanity: our identity is unchanged (setgroups failed before any setuid).
+        assert_ne!(
+            unsafe { libc::getuid() },
+            1,
+            "drop must not have taken effect"
+        );
     }
 }

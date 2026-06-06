@@ -258,7 +258,7 @@ const EXAMPLE_CONFIG: &str = r#"# smolvm Configuration
 #
 # Location: ~/.config/smolvm/config.toml
 #
-# [cloud]        — smolcloud API settings
+# [cloud]        — smolfleet API settings
 # [machines]     — credentials for .smolmachine artifact registries
 # [images]       — credentials for container image registries (base images for VMs)
 #

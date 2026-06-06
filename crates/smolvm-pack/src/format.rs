@@ -345,6 +345,13 @@ pub struct PackManifest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env: Vec<String>,
 
+    /// Secret references carried with the pack. Each maps an env var name to a
+    /// reference (host store entry, host env var, or file) — never an inline
+    /// value. The plaintext is resolved on the run host at exec time, so a
+    /// `.smolmachine` never contains secret material at rest.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub secret_refs: std::collections::BTreeMap<String, smolvm_protocol::SecretRef>,
+
     /// Working directory (from image config or override).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workdir: Option<String>,
@@ -455,6 +462,7 @@ impl PackManifest {
             entrypoint: Vec::new(),
             cmd: Vec::new(),
             env: Vec::new(),
+            secret_refs: std::collections::BTreeMap::new(),
             workdir: None,
             cpus: 1,
             mem: 256,
@@ -492,6 +500,39 @@ impl PackManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_manifest_secret_refs_roundtrip() {
+        // Secret refs survive a JSON round-trip through the manifest, and are
+        // omitted entirely when empty (skip_serializing_if) so existing packs
+        // stay byte-compatible.
+        let empty = PackManifest::new(
+            "alpine".to_string(),
+            "sha256:abc".to_string(),
+            "linux/arm64".to_string(),
+            "linux/arm64".to_string(),
+        );
+        let json = String::from_utf8(empty.to_json().unwrap()).unwrap();
+        assert!(
+            !json.contains("secret_refs"),
+            "empty secret_refs must not be serialized"
+        );
+
+        let mut m = empty;
+        m.secret_refs.insert(
+            "DB_PASSWORD".to_string(),
+            smolvm_protocol::SecretRef {
+                from_env: Some("PGPASSWORD".to_string()),
+                from_file: None,
+            },
+        );
+        let restored = PackManifest::from_json(&m.to_json().unwrap()).unwrap();
+        assert_eq!(restored.secret_refs.len(), 1);
+        assert_eq!(
+            restored.secret_refs["DB_PASSWORD"].from_env.as_deref(),
+            Some("PGPASSWORD")
+        );
+    }
 
     #[test]
     fn test_footer_roundtrip() {

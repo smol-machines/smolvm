@@ -317,6 +317,30 @@ impl LibkrunVm {
                 }
             }
 
+            // Register a control socket (pause/resume/checkpoint/restore) when
+            // requested via SMOLVM_CONTROL_SOCKET. Best-effort: a missing symbol
+            // (older libkrun) or failure just leaves the VM without a control
+            // channel rather than failing the boot.
+            if let Ok(ctl_path) = std::env::var("SMOLVM_CONTROL_SOCKET") {
+                if !ctl_path.is_empty() {
+                    match krun.set_control_socket {
+                        Some(set_control_socket) => {
+                            if let Ok(ctl_c) = std::ffi::CString::new(ctl_path.clone()) {
+                                let ret = set_control_socket(ctx, ctl_c.as_ptr());
+                                if ret < 0 {
+                                    tracing::warn!("krun_set_control_socket failed: {ret}");
+                                } else {
+                                    tracing::info!(socket = %ctl_path, "control socket enabled");
+                                }
+                            }
+                        }
+                        None => tracing::warn!(
+                            "SMOLVM_CONTROL_SOCKET set but libkrun lacks krun_set_control_socket"
+                        ),
+                    }
+                }
+            }
+
             // Update state to running
             self.state = VmState::Running;
 

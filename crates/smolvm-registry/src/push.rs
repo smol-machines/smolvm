@@ -9,7 +9,8 @@
 
 use crate::client::RegistryClient;
 use crate::{
-    OciDescriptor, OciManifest, Result, CONFIG_MEDIA_TYPE, LAYER_MEDIA_TYPE, MANIFEST_MEDIA_TYPE,
+    OciDescriptor, OciIndex, OciIndexManifest, OciManifest, OciPlatform, Result, CONFIG_MEDIA_TYPE,
+    INDEX_MEDIA_TYPE, LAYER_MEDIA_TYPE, MANIFEST_MEDIA_TYPE,
 };
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -24,6 +25,11 @@ pub struct PushResult {
     pub layer_size: u64,
     /// Digest of the OCI manifest.
     pub manifest_digest: String,
+    /// Host platform this artifact targets (e.g. `linux/amd64`).
+    pub platform: String,
+    /// The per-platform tag the manifest was also tagged under (e.g.
+    /// `latest-linux-amd64`).
+    pub platform_tag: String,
 }
 
 /// Push a `.smolmachine` sidecar to the registry.
@@ -103,21 +109,57 @@ pub async fn push(
     };
 
     let manifest_json = serde_json::to_vec_pretty(&oci_manifest)?;
+    let manifest_size = manifest_json.len() as u64;
     let manifest_digest = format!("sha256:{}", hex::encode(Sha256::digest(&manifest_json)));
 
-    // 6. PUT manifest.
-    tracing::info!(reference = %reference, "uploading manifest...");
-    client.put_manifest(repo, reference, &manifest_json).await?;
+    // 6. Store the single-platform manifest content-addressably (by digest), and
+    //    also tag it per platform (e.g. `latest-linux-amd64`) so a specific
+    //    platform is directly pullable.
+    let platform = OciPlatform::parse(&manifest.host_platform);
+    let platform_tag = format!("{reference}-{}-{}", platform.os, platform.architecture);
+    tracing::info!(digest = %manifest_digest, platform = %platform.label(), "uploading manifest...");
+    client
+        .put_manifest(repo, &manifest_digest, &manifest_json)
+        .await?;
+    client
+        .put_manifest(repo, &platform_tag, &manifest_json)
+        .await?;
 
-    tracing::info!(
-        digest = %manifest_digest,
-        layer_size,
-        "push complete"
-    );
+    // 7. Maintain an image index at `reference` so the tag fans out by platform.
+    //    Merge with any existing index (replacing this platform's entry); a
+    //    legacy single-manifest tag is replaced by a fresh index.
+    let entry = OciIndexManifest {
+        media_type: MANIFEST_MEDIA_TYPE.to_string(),
+        digest: manifest_digest.clone(),
+        size: manifest_size,
+        platform: Some(platform.clone()),
+    };
+    let mut manifests = match client.get_manifest_raw(repo, reference).await {
+        Ok((bytes, ct)) if ct.contains(INDEX_MEDIA_TYPE) => {
+            serde_json::from_slice::<OciIndex>(&bytes)
+                .map(|i| i.manifests)
+                .unwrap_or_default()
+        }
+        _ => Vec::new(),
+    };
+    manifests.retain(|m| m.platform.as_ref() != Some(&platform));
+    manifests.push(entry);
+    let index = OciIndex {
+        schema_version: 2,
+        media_type: INDEX_MEDIA_TYPE.to_string(),
+        manifests,
+    };
+    let index_json = serde_json::to_vec_pretty(&index)?;
+    tracing::info!(reference = %reference, platforms = index.manifests.len(), "updating image index...");
+    client.put_manifest(repo, reference, &index_json).await?;
+
+    tracing::info!(digest = %manifest_digest, layer_size, "push complete");
 
     Ok(PushResult {
         layer_digest,
         layer_size,
         manifest_digest,
+        platform: platform.label(),
+        platform_tag,
     })
 }

@@ -131,6 +131,8 @@ fn machine_entry_from_record(record: &VmRecord, manager: AgentManager) -> Machin
         resources: vm_resources_to_spec(record.vm_resources()),
         restart: record.restart.clone(),
         network: record.network,
+        secret_refs: record.secret_refs.clone(),
+        source_smolmachine: record.source_smolmachine.clone(),
     }
 }
 
@@ -201,11 +203,28 @@ pub async fn create_machine(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<CreateMachineRequest>,
 ) -> Result<Json<MachineInfo>, ApiError> {
-    // Validate: --from and --image are mutually exclusive
-    if req.from.is_some() && req.image.is_some() {
+    // Validate: registry_ref, from, and image are mutually exclusive
+    let source_count = [
+        req.registry_ref.is_some(),
+        req.from.is_some(),
+        req.image.is_some(),
+    ]
+    .iter()
+    .filter(|&&b| b)
+    .count();
+    if source_count > 1 {
         return Err(ApiError::BadRequest(
-            "'from' and 'image' are mutually exclusive".to_string(),
+            "'registryRef', 'from', and 'image' are mutually exclusive".to_string(),
         ));
+    }
+
+    // If registry_ref is set, pull the artifact from the registry and treat as `from`
+    let mut req = req;
+    if let Some(ref registry_ref) = req.registry_ref.clone() {
+        let pulled_path =
+            pull_from_registry(registry_ref, req.registry_identity_token.as_deref()).await?;
+        req.from = Some(pulled_path);
+        req.registry_ref = None;
     }
 
     // Generate name if not provided, then validate. The on-disk layout uses
@@ -231,6 +250,7 @@ pub async fn create_machine(
         manifest_cpus,
         manifest_mem,
         manifest_net,
+        manifest_secret_refs,
     ) = if let Some(ref sidecar_path) = req.from {
         let path = std::path::Path::new(sidecar_path);
         if !path.exists() {
@@ -241,12 +261,8 @@ pub async fn create_machine(
         }
         let manifest = smolvm_pack::packer::read_manifest_from_sidecar(path)
             .map_err(|e| ApiError::internal(format!("read .smolmachine: {}", e)))?;
-        let footer = smolvm_pack::packer::read_footer_from_sidecar(path)
-            .map_err(|e| ApiError::internal(format!("read sidecar footer: {}", e)))?;
-        let cache_dir = smolvm_pack::extract::get_cache_dir(footer.checksum)
-            .map_err(|e| ApiError::internal(format!("get cache dir: {}", e)))?;
-        smolvm_pack::extract::extract_sidecar(path, &cache_dir, &footer, false, false)
-            .map_err(|e| ApiError::internal(format!("extract sidecar: {}", e)))?;
+        // Extraction happens after the agent manager creates this machine's data
+        // dir (below), so the layers land in the machine's own dir, not here.
         let canonical = path
             .canonicalize()
             .unwrap_or_else(|_| path.to_path_buf())
@@ -260,6 +276,20 @@ pub async fn create_machine(
                     .map(|(k, v)| (k.to_string(), v.to_string()))
             })
             .collect();
+        // A .smolmachine is an untrusted, portable artifact: validate its secret
+        // refs Untrusted, which rejects every source kind, so a packed
+        // from_env/from_file can't read this host's env/files at exec time.
+        // Reject rather than carry/exfil.
+        for (key, r) in &manifest.secret_refs {
+            crate::secrets::validate_ref(r, crate::secrets::ResolutionScope::Untrusted).map_err(
+                |e| {
+                    ApiError::BadRequest(format!(
+                        "packed secret '{}': {} (packs may not carry secret refs)",
+                        key, e
+                    ))
+                },
+            )?;
+        }
         (
             Some(manifest.image),
             Some(canonical),
@@ -270,6 +300,7 @@ pub async fn create_machine(
             manifest.cpus,
             manifest.mem,
             manifest.network,
+            manifest.secret_refs,
         )
     } else {
         (
@@ -279,25 +310,18 @@ pub async fn create_machine(
             vec![],
             vec![],
             None,
-            req.cpus,
-            req.mem,
+            crate::data::resources::DEFAULT_MICROVM_CPU_COUNT,
+            crate::data::resources::DEFAULT_MICROVM_MEMORY_MIB,
             req.network,
+            Default::default(),
         )
     };
 
-    // Use manifest defaults if user didn't override
-    let cpus =
-        if req.from.is_some() && req.cpus == crate::data::resources::DEFAULT_MICROVM_CPU_COUNT {
-            manifest_cpus
-        } else {
-            req.cpus
-        };
-    let mem = if req.from.is_some() && req.mem == crate::data::resources::DEFAULT_MICROVM_MEMORY_MIB
-    {
-        manifest_mem
-    } else {
-        req.mem
-    };
+    // Use explicit API resources when provided. Otherwise, preserve packed
+    // artifact manifest defaults, or the high VM defaults for non-artifact
+    // machines. Memory is ballooned, so a generous default does not imply
+    // immediate host commitment.
+    let (cpus, mem) = resolve_create_resources(&req, manifest_cpus, manifest_mem);
     let network = req.network || manifest_net;
 
     // Reserve the name atomically (prevents concurrent creation)
@@ -316,6 +340,59 @@ pub async fn create_machine(
     .await
     .map_err(|e| ApiError::internal(format!("task error: {}", e)))??;
 
+    // Extract the bundle's OCI layers into this machine's own data dir (created
+    // by the manager above) rather than the shared pack cache, so every start is
+    // independent of the .smolmachine file surviving and the macOS layers volume
+    // is owned 1:1 by the machine. Extraction mounts the case-sensitive volume on
+    // macOS; detach it immediately so a created-but-unstarted machine leaves
+    // nothing mounted (invariant: the per-machine layers volume is mounted iff
+    // the VM is running). The name was reserved above, so this never clobbers
+    // another machine's layers.
+    if let Some(ref sidecar_path) = source_smolmachine {
+        let name = name.clone();
+        let sidecar_path = sidecar_path.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), ApiError> {
+            let path = std::path::Path::new(&sidecar_path);
+            let cache_dir = crate::agent::machine_layers_cache_dir(&name);
+            let result = (|| {
+                smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
+                match std::fs::remove_dir_all(&cache_dir) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        return Err(ApiError::internal(format!(
+                            "clear packed layers cache: {}",
+                            e
+                        )));
+                    }
+                }
+                let footer = smolvm_pack::packer::read_footer_from_sidecar(path)
+                    .map_err(|e| ApiError::internal(format!("read sidecar footer: {}", e)))?;
+                smolvm_pack::extract::extract_sidecar(path, &cache_dir, &footer, false, false)
+                    .map_err(|e| ApiError::internal(format!("extract sidecar: {}", e)))
+            })();
+            // Detach the case-sensitive volume mounted during extraction so a
+            // created-but-unstarted machine leaves nothing mounted, and so the
+            // rollback below can remove the data dir cleanly (macOS; no-op on Linux).
+            smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
+            if let Err(e) = result {
+                // Extraction failed after the manager created the machine's data
+                // dir. guard.complete() will not run, so no DB record persists and
+                // the name is released on drop — but the on-disk dir would be left
+                // orphaned. Roll it back so a retry starts clean. Best-effort: a
+                // remove failure only leaves the orphan, never a worse state.
+                // cache_dir is <vm_data_dir>/pack, so its parent is the data dir.
+                if let Some(vm_dir) = cache_dir.parent() {
+                    let _ = std::fs::remove_dir_all(vm_dir);
+                }
+                return Err(e);
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("task error: {}", e)))??;
+    }
+
     let resources = ResourceSpec {
         cpus: Some(cpus),
         memory_mb: Some(mem),
@@ -326,8 +403,14 @@ pub async fn create_machine(
         allowed_cidrs: req.allowed_cidrs.clone(),
     };
 
+    // Validate request-body secret refs before persisting. Untrusted
+    // scope rejects every source kind, so any non-empty `secrets` map on
+    // the API surface is refused regardless of server binding — secrets
+    // must be configured locally via the CLI.
+    crate::api::handlers::validate_request_secrets(&req.secrets)?;
+
     // Complete registration: persists to DB + registers in ApiState
-    guard.complete(MachineRegistration {
+    let complete_result = guard.complete(MachineRegistration {
         manager,
         mounts: req.mounts.clone(),
         ports: req.ports.clone(),
@@ -355,7 +438,33 @@ pub async fn create_machine(
         cmd,
         env,
         workdir,
-    })?;
+        // Record secrets = packed refs from --from (validated Untrusted above)
+        // merged with request refs (validated Untrusted at ~line 333); request
+        // refs win on key collision. Both sources are store-only, so RecordReplay
+        // resolution at exec time stays safe.
+        secret_refs: {
+            let mut s = manifest_secret_refs;
+            s.extend(req.secrets.clone());
+            s
+        },
+    });
+    if let Err(e) = complete_result {
+        let data_dir = vm_data_dir(&name);
+        smolvm_pack::extract::force_detach_layers_volume(&crate::agent::machine_layers_cache_dir(
+            &name,
+        ));
+        if let Err(remove_err) = std::fs::remove_dir_all(&data_dir) {
+            if remove_err.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    machine = %name,
+                    dir = %data_dir.display(),
+                    error = %remove_err,
+                    "failed to remove machine data dir after create commit failure"
+                );
+            }
+        }
+        return Err(e);
+    }
 
     // Fetch the persisted record for the response
     let db = state.db();
@@ -435,6 +544,16 @@ pub async fn start_machine(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
 ) -> Result<Json<MachineInfo>, ApiError> {
+    // Hold the per-machine lifecycle lock across the whole start so a concurrent
+    // stop/delete cannot detach the macOS layers volume between our acquire+mount
+    // and the launch, nor launch a guest into the launcher's missing-dir error
+    // (review finding #3). Acquired before the DB read and resolve_state probe
+    // below so the "is it running?" decision and the launch happen under one held
+    // lock; it is the outermost lock (the entry mutex is taken later, inside the
+    // spawn_blocking). Linux: the guarded detach/mount are no-ops.
+    let lifecycle = state.lifecycle_lock(&name);
+    let _guard = lifecycle.lock().await;
+
     // Get VM record from database
     let db = state.db();
     let record = db
@@ -503,12 +622,19 @@ pub async fn start_machine(
     let name_clone = name.clone();
     let storage_gb = record.storage_gb;
     let overlay_gb = record.overlay_gb;
+    let source_smolmachine = record.source_smolmachine.clone();
     let (manager, pid) = tokio::task::spawn_blocking(move || {
         let manager = AgentManager::for_vm_with_sizes(&name_clone, storage_gb, overlay_gb)
             .map_err(|e| format!("failed to create agent manager: {}", e))?;
 
+        // Wire pre-extracted layers if this machine was created from a .smolmachine.
+        let features = crate::api::state::build_launch_features(
+            Some(&name_clone),
+            source_smolmachine.as_deref(),
+        )
+        .map_err(|e| format!("failed to prepare packed layers: {}", e))?;
         let _ = manager
-            .ensure_running_via_subprocess(mounts, ports, resources, Default::default())
+            .ensure_running_via_subprocess(mounts, ports, resources, features)
             .map_err(|e| format!("failed to start machine: {}", e))?;
 
         let pid = manager.child_pid();
@@ -567,6 +693,16 @@ pub async fn stop_machine(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
 ) -> Result<Json<MachineInfo>, ApiError> {
+    // Hold the per-machine lifecycle lock across the whole stop so the layers
+    // volume detach below cannot race a concurrent start's acquire+mount+launch
+    // (review finding #3). Acquired before the DB read and actual_state() probe
+    // so the liveness check and the detach act on the same held lock — without
+    // it, stop could decide "running" off a snapshot a concurrent start has
+    // already superseded, then detach a volume that start just mounted. Outermost
+    // lock; the entry mutex is not taken here. Linux: detach is a no-op.
+    let lifecycle = state.lifecycle_lock(&name);
+    let _guard = lifecycle.lock().await;
+
     // Get VM record from database
     let db = state.db();
     let record = db
@@ -577,7 +713,23 @@ pub async fn stop_machine(
     // Check state
     let actual_state = record.actual_state();
     if actual_state != RecordState::Running {
-        // Already stopped, just return current info
+        // Not running. If a prior start mounted the layers volume but the VM
+        // then failed to boot (or the server crashed while running), the volume
+        // could still be mounted — detach it so a stopped machine never holds a
+        // mount (invariant: the per-machine layers volume is mounted iff the VM
+        // is running). Safe: actual_state() probed liveness, so the process is
+        // confirmed dead and nothing is using the volume. macOS hdiutil detach;
+        // a no-op on Linux.
+        if record.source_smolmachine.is_some() {
+            let name_clone = name.clone();
+            tokio::task::spawn_blocking(move || {
+                smolvm_pack::extract::force_detach_layers_volume(
+                    &crate::agent::machine_layers_cache_dir(&name_clone),
+                );
+            })
+            .await
+            .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
+        }
         return Ok(Json(record_to_info(&name, &record)));
     }
 
@@ -585,10 +737,34 @@ pub async fn stop_machine(
     let pid = record.pid;
     let pid_start_time = record.pid_start_time;
 
-    // Stop VM in blocking task
+    // Stop VM — prefer using the registered manager (which holds the flock)
+    // over creating a throwaway one. This ensures the flock is released so
+    // a subsequent start can re-acquire it.
+    let entry = state.get_machine(&name).ok();
     let name_clone = name.clone();
     let stopped = tokio::task::spawn_blocking(move || {
-        shutdown_machine_process(&name_clone, pid, pid_start_time)
+        let ok = if let Some(ref entry) = entry {
+            let e = entry.lock();
+            match e.manager.stop() {
+                Ok(()) => true,
+                Err(err) => {
+                    tracing::warn!(name = %name_clone, error = %err, "manager.stop() failed, falling back to process kill");
+                    shutdown_machine_process(&name_clone, pid, pid_start_time)
+                }
+            }
+        } else {
+            shutdown_machine_process(&name_clone, pid, pid_start_time)
+        };
+        if ok {
+            // Process is gone — detach this machine's case-sensitive layers
+            // volume (macOS hdiutil mount; no-op on Linux). The volume lives
+            // under the machine's own data dir and is owned 1:1 by it, so the
+            // detach is unconditional and re-acquired on the next start.
+            smolvm_pack::extract::force_detach_layers_volume(
+                &crate::agent::machine_layers_cache_dir(&name_clone),
+            );
+        }
+        ok
     })
     .await
     .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
@@ -598,6 +774,14 @@ pub async fn stop_machine(
             "machine '{}' process may still be running after stop attempt",
             name
         )));
+    }
+
+    // The VM process is confirmed dead, but the long-lived registry manager for
+    // this machine still holds the per-VM `vm.lock` flock in this serve process.
+    // Release it so a subsequent start can re-acquire the lock; otherwise start
+    // fails with "another process is already starting or running this VM".
+    if let Ok(entry) = state.get_machine(&name) {
+        entry.lock().manager.mark_stopped();
     }
 
     // Persist state to database and get updated record — only after confirmed stop
@@ -618,6 +802,75 @@ pub async fn stop_machine(
     Ok(Json(record_to_info(&name, &record)))
 }
 
+/// Gracefully stop every running VM before the server exits. Opt-in via
+/// `SMOLVM_DRAIN_ON_SHUTDOWN` (set by cloud workers); off by default so a dev
+/// Ctrl-C or `serve` restart leaves VMs running for reconnect. Without draining,
+/// a host teardown (e.g. autoscaler scale-in) hard-kills running VMs; draining
+/// stops them cleanly — flushing disk state and marking them stopped so the
+/// control plane can reschedule. Best-effort, concurrent, and bounded so it fits
+/// inside the host's termination grace period.
+pub async fn drain_machines(state: &Arc<ApiState>) {
+    let running: Vec<(String, Option<i32>, Option<u64>)> = match state.db().list_vms() {
+        Ok(vms) => vms
+            .into_iter()
+            .filter(|(_, r)| r.actual_state() == RecordState::Running && r.is_process_alive())
+            .map(|(name, r)| (name, r.pid, r.pid_start_time))
+            .collect(),
+        Err(e) => {
+            tracing::error!(error = %e, "drain: failed to list machines");
+            return;
+        }
+    };
+    if running.is_empty() {
+        return;
+    }
+    tracing::info!(
+        count = running.len(),
+        "draining running machines before shutdown"
+    );
+
+    let mut handles = Vec::with_capacity(running.len());
+    for (name, pid, pid_start_time) in running {
+        let state = state.clone();
+        handles.push(tokio::spawn(async move {
+            let name_for_kill = name.clone();
+            let entry = state.get_machine(&name).ok();
+            let stopped = tokio::task::spawn_blocking(move || {
+                // Prefer the registered manager (holds the flock); fall back to a
+                // PID-verified signal — same path as the stop handler.
+                let via_manager = entry
+                    .as_ref()
+                    .map(|e| e.lock().manager.stop().is_ok())
+                    .unwrap_or(false);
+                via_manager || shutdown_machine_process(&name_for_kill, pid, pid_start_time)
+            })
+            .await
+            .unwrap_or(false);
+            if let Ok(entry) = state.get_machine(&name) {
+                entry.lock().manager.mark_stopped();
+            }
+            let _ = state.db().update_vm(&name, |r| {
+                r.state = RecordState::Stopped;
+                r.pid = None;
+                r.pid_start_time = None;
+            });
+            tracing::info!(machine = %name, stopped, "drain: machine stopped");
+        }));
+    }
+
+    let drain_all = async {
+        for h in handles {
+            let _ = h.await;
+        }
+    };
+    if tokio::time::timeout(std::time::Duration::from_secs(25), drain_all)
+        .await
+        .is_err()
+    {
+        tracing::warn!("drain: deadline reached before all machines stopped");
+    }
+}
+
 /// Delete a machine.
 #[utoipa::path(
     delete,
@@ -636,6 +889,15 @@ pub async fn delete_machine(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
 ) -> Result<Json<DeleteResponse>, ApiError> {
+    // Hold the per-machine lifecycle lock across the whole delete so the layers
+    // volume detach (before the data-dir removal) cannot race a concurrent
+    // start's acquire+mount+launch (review finding #3). Acquired before the DB
+    // read so the existence check, shutdown, detach, and removal all happen under
+    // one held lock. Outermost lock; the entry mutex is not taken here. Linux:
+    // detach is a no-op.
+    let lifecycle = state.lifecycle_lock(&name);
+    let _guard = lifecycle.lock().await;
+
     let db = state.db();
 
     // Check if VM exists and get its state
@@ -651,7 +913,17 @@ pub async fn delete_machine(
     // Stop if running (in blocking task)
     let name_clone = name.clone();
     let stopped = tokio::task::spawn_blocking(move || {
-        shutdown_machine_process(&name_clone, pid, pid_start_time)
+        let ok = shutdown_machine_process(&name_clone, pid, pid_start_time);
+        if ok {
+            // Process is gone — detach this machine's case-sensitive layers
+            // volume (macOS hdiutil mount; no-op on Linux) before the data dir is
+            // removed below, otherwise `rm -rf` fails with "Resource busy". The
+            // volume is owned 1:1 by this machine, so the detach is unconditional.
+            smolvm_pack::extract::force_detach_layers_volume(
+                &crate::agent::machine_layers_cache_dir(&name_clone),
+            );
+        }
+        ok
     })
     .await
     .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
@@ -716,17 +988,22 @@ pub async fn exec_machine(
     let tid = trace_id.map(|t| t.0 .0.clone());
     validate_command(&req.command)?;
 
-    // Check if VM exists
-    let db = state.db();
-    if db.get_vm(&name).map_err(ApiError::database)?.is_none() {
-        return Err(ApiError::NotFound(format!("machine '{}' not found", name)));
-    }
+    // Load the in-memory machine entry; its `secret_refs` were
+    // populated at create time and updated via start/stop handlers.
+    // This avoids a second DB read per request.
+    let entry = state.get_machine(&name)?;
+    crate::api::handlers::validate_request_secrets(&req.secrets)?;
+    let record_env = crate::api::handlers::record_secret_refs_env(&entry)?;
+    let req_env = crate::api::handlers::resolve_request_secrets(&req.secrets)?;
 
     let name_clone = name.clone();
     let command = req.command.clone();
-    let env = EnvVar::to_tuples(&req.env);
+    let mut env = EnvVar::to_tuples(&req.env);
+    env.extend(crate::secrets::expose_into_env(record_env));
+    env.extend(crate::secrets::expose_into_env(req_env));
     let workdir = req.workdir.clone();
     let timeout = req.timeout_secs.map(Duration::from_secs);
+    let stdin_data = req.stdin.clone();
 
     let result = tokio::task::spawn_blocking(move || {
         // Get manager and check if running
@@ -748,7 +1025,7 @@ pub async fn exec_machine(
             client.set_trace_id(tid);
         }
         let (exit_code, stdout, stderr) = client
-            .vm_exec(command, env, workdir, timeout)
+            .vm_exec(command, env, workdir, timeout, stdin_data)
             .map_err(|e| SmolvmError::agent("exec", e.to_string()))?;
 
         // Keep VM running (persistent)
@@ -865,6 +1142,83 @@ pub async fn resize_machine(
     Ok(Json(record_to_info(&name, &record)))
 }
 
+async fn pull_from_registry(
+    registry_ref: &str,
+    identity_token: Option<&str>,
+) -> Result<String, ApiError> {
+    let parsed = crate::registry::Reference::parse(registry_ref)
+        .map_err(|e| ApiError::BadRequest(format!("invalid registry reference: {}", e)))?;
+
+    let settings = crate::settings::SmolSettings::load()
+        .map_err(|e| ApiError::internal(format!("load settings: {}", e)))?;
+
+    let effective_registry = settings
+        .machines
+        .get_mirror(&parsed.registry)
+        .unwrap_or(&parsed.registry);
+    let api_host = match effective_registry {
+        "docker.io" => "registry-1.docker.io",
+        h => h,
+    };
+    let base_url = if smolvm_registry::is_local_registry(api_host) {
+        format!("http://{}", api_host)
+    } else {
+        format!("https://{}", api_host)
+    };
+
+    let mut client = smolvm_registry::RegistryClient::new(base_url);
+
+    // A request-supplied identity token (the control plane's short-lived,
+    // tenant-scoped pull token) takes precedence over any persisted credential.
+    if let Some(token) = identity_token {
+        client = client.with_identity_token(token.to_string());
+    } else if let Some(entry) = settings.machines.registries.get(effective_registry) {
+        if let Some(ref token) = entry.identity_token {
+            client = client.with_identity_token(token.clone());
+        }
+    }
+
+    let cache = smolvm_registry::BlobCache::open_default()
+        .map_err(|e| ApiError::internal(format!("blob cache: {}", e)))?;
+
+    let repo = parsed.repository();
+    let tag_or_digest = registry_reference_tag_or_digest(&parsed);
+
+    tracing::info!(
+        registry_ref = %registry_ref,
+        repo = %repo,
+        reference = %tag_or_digest,
+        "pulling .smolmachine from registry"
+    );
+
+    let result = smolvm_registry::pull(&client, &repo, tag_or_digest, None, &cache)
+        .await
+        .map_err(|e| ApiError::internal(format!("registry pull failed: {}", e)))?;
+
+    tracing::info!(path = %result.path.display(), cached = result.cached, "pull complete");
+
+    Ok(result.path.to_string_lossy().into_owned())
+}
+
+fn registry_reference_tag_or_digest(parsed: &crate::registry::Reference) -> &str {
+    parsed
+        .digest
+        .as_deref()
+        .or(parsed.tag.as_deref())
+        .unwrap_or("latest")
+}
+
+fn resolve_create_resources(
+    req: &CreateMachineRequest,
+    manifest_cpus: u8,
+    manifest_mem: u32,
+) -> (u8, u32) {
+    (
+        req.cpus.unwrap_or(manifest_cpus),
+        req.mem.unwrap_or(manifest_mem),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -939,6 +1293,96 @@ mod tests {
 
         assert_eq!(info.name, "network-vm");
         assert!(info.network);
+    }
+
+    #[test]
+    fn registry_reference_uses_digest_before_tag_or_latest() {
+        let digest = "sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+        let digest_ref =
+            crate::registry::Reference::parse(&format!("python-dev@{digest}")).unwrap();
+        assert_eq!(registry_reference_tag_or_digest(&digest_ref), digest);
+
+        let tagged_ref = crate::registry::Reference::parse("python-dev:v1").unwrap();
+        assert_eq!(registry_reference_tag_or_digest(&tagged_ref), "v1");
+
+        let latest_ref = crate::registry::Reference::parse("python-dev").unwrap();
+        assert_eq!(registry_reference_tag_or_digest(&latest_ref), "latest");
+    }
+
+    fn minimal_create_request() -> CreateMachineRequest {
+        CreateMachineRequest {
+            name: Some("test-vm".to_string()),
+            cpus: None,
+            mem: None,
+            mounts: vec![],
+            ports: vec![],
+            network: false,
+            gpu: false,
+            storage_gb: None,
+            overlay_gb: None,
+            allowed_cidrs: None,
+            restart: None,
+            image: None,
+            from: None,
+            registry_ref: None,
+            registry_identity_token: None,
+            secrets: Default::default(),
+        }
+    }
+
+    #[test]
+    fn create_resources_use_high_defaults_when_omitted() {
+        let req = minimal_create_request();
+
+        assert_eq!(
+            resolve_create_resources(
+                &req,
+                crate::data::resources::DEFAULT_MICROVM_CPU_COUNT,
+                crate::data::resources::DEFAULT_MICROVM_MEMORY_MIB,
+            ),
+            (
+                crate::data::resources::DEFAULT_MICROVM_CPU_COUNT,
+                crate::data::resources::DEFAULT_MICROVM_MEMORY_MIB,
+            )
+        );
+    }
+
+    #[test]
+    fn create_resources_preserve_manifest_defaults_when_omitted() {
+        let req = minimal_create_request();
+
+        assert_eq!(resolve_create_resources(&req, 6, 12_288), (6, 12_288));
+    }
+
+    #[test]
+    fn create_resources_explicit_api_values_override_manifest_defaults() {
+        let mut req = minimal_create_request();
+        req.cpus = Some(2);
+        req.mem = Some(2048);
+
+        assert_eq!(resolve_create_resources(&req, 6, 12_288), (2, 2048));
+    }
+
+    #[test]
+    fn create_request_deserialization_keeps_resource_omission_distinct() {
+        let req: CreateMachineRequest = serde_json::from_value(serde_json::json!({
+            "name": "api-vm"
+        }))
+        .unwrap();
+
+        assert_eq!(req.cpus, None);
+        assert_eq!(req.mem, None);
+
+        let req: CreateMachineRequest = serde_json::from_value(serde_json::json!({
+            "name": "api-vm",
+            "cpus": 2,
+            "memoryMb": 2048
+        }))
+        .unwrap();
+
+        assert_eq!(req.cpus, Some(2));
+        assert_eq!(req.mem, Some(2048));
     }
 
     /// Helper to create a test database and API state.

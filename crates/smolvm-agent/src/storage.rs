@@ -972,6 +972,8 @@ pub fn pull_image_with_progress_and_auth<F>(
     image: &str,
     oci_platform: Option<&str>,
     auth: Option<&RegistryAuth>,
+    proxy: Option<&str>,
+    no_proxy: Option<&str>,
     mut progress: F,
 ) -> Result<ImageInfo>
 where
@@ -1049,7 +1051,7 @@ where
     // Get manifest with OCI platform specified
     progress(0, 0, "fetching manifest");
     info!(image = %image, oci_platform = ?oci_platform, "fetching manifest");
-    let manifest = crane_manifest(image, oci_platform, auth)?;
+    let manifest = crane_manifest(image, oci_platform, auth, proxy, no_proxy)?;
 
     // Parse manifest to get config and layers
     let manifest_json: serde_json::Value =
@@ -1097,7 +1099,7 @@ where
     std::fs::write(&manifest_path, &manifest)?;
 
     // Fetch and save config
-    let config = crane_config(image, oci_platform, auth)?;
+    let config = crane_config(image, oci_platform, auth, proxy, no_proxy)?;
     let config_id = config_digest
         .strip_prefix("sha256:")
         .unwrap_or(config_digest);
@@ -1157,6 +1159,8 @@ where
         if let Some(ref td) = temp_dir {
             crane_cmd.env("DOCKER_CONFIG", td.path());
         }
+
+        apply_proxy_env(&mut crane_cmd, proxy, no_proxy);
 
         // Spawn crane process
         let mut crane = crane_cmd
@@ -2843,9 +2847,14 @@ fn setup_docker_auth(
 
     let registry = extract_registry_from_image(image);
 
-    let temp_dir = tempfile::TempDir::new().map_err(|e| {
-        StorageError::new(format!("failed to create temp directory for auth: {}", e))
-    })?;
+    // The guest root filesystem (and thus the default temp dir, /tmp) is
+    // read-only, so create the auth config under the writable storage disk.
+    let temp_dir = tempfile::Builder::new()
+        .prefix("smolauth")
+        .tempdir_in(STORAGE_ROOT)
+        .map_err(|e| {
+            StorageError::new(format!("failed to create temp directory for auth: {}", e))
+        })?;
 
     let auth_b64 = base64_encode(&format!("{}:{}", a.username, a.password));
     let config_json = format!(
@@ -2866,6 +2875,18 @@ fn setup_docker_auth(
     Ok(Some(temp_dir))
 }
 
+/// Set HTTP_PROXY / HTTPS_PROXY / NO_PROXY on a crane subprocess so the
+/// in-VM registry client can reach the registry through a corporate proxy.
+fn apply_proxy_env(cmd: &mut Command, proxy: Option<&str>, no_proxy: Option<&str>) {
+    if let Some(p) = proxy {
+        cmd.env("HTTP_PROXY", p);
+        cmd.env("HTTPS_PROXY", p);
+    }
+    if let Some(np) = no_proxy {
+        cmd.env("NO_PROXY", np);
+    }
+}
+
 /// Run a crane command with the given operation.
 ///
 /// If auth is provided, creates a temporary Docker config for crane to use.
@@ -2875,6 +2896,8 @@ fn run_crane(
     image: &str,
     oci_platform: Option<&str>,
     auth: Option<&RegistryAuth>,
+    proxy: Option<&str>,
+    no_proxy: Option<&str>,
 ) -> Result<String> {
     use crate::retry::{
         is_permanent_error, is_transient_network_error, retry_with_backoff, RetryConfig,
@@ -2885,7 +2908,7 @@ fn run_crane(
     retry_with_backoff(
         RetryConfig::for_network(),
         &op_name,
-        || run_crane_once(operation, image, oci_platform, auth),
+        || run_crane_once(operation, image, oci_platform, auth, proxy, no_proxy),
         |e| {
             let error_msg = e.to_string();
             // Don't retry permanent errors
@@ -2924,6 +2947,8 @@ fn run_crane_once(
     image: &str,
     oci_platform: Option<&str>,
     auth: Option<&RegistryAuth>,
+    proxy: Option<&str>,
+    no_proxy: Option<&str>,
 ) -> Result<String> {
     let mut cmd = Command::new("crane");
     cmd.arg(operation).arg(image);
@@ -2939,6 +2964,8 @@ fn run_crane_once(
     if let Some(ref td) = _temp_dir {
         cmd.env("DOCKER_CONFIG", td.path());
     }
+
+    apply_proxy_env(&mut cmd, proxy, no_proxy);
 
     let output = cmd.output()?;
 
@@ -2958,8 +2985,10 @@ fn crane_manifest(
     image: &str,
     oci_platform: Option<&str>,
     auth: Option<&RegistryAuth>,
+    proxy: Option<&str>,
+    no_proxy: Option<&str>,
 ) -> Result<String> {
-    run_crane("manifest", image, oci_platform, auth)
+    run_crane("manifest", image, oci_platform, auth, proxy, no_proxy)
 }
 
 /// Run crane config command.
@@ -2967,8 +2996,10 @@ fn crane_config(
     image: &str,
     oci_platform: Option<&str>,
     auth: Option<&RegistryAuth>,
+    proxy: Option<&str>,
+    no_proxy: Option<&str>,
 ) -> Result<String> {
-    run_crane("config", image, oci_platform, auth)
+    run_crane("config", image, oci_platform, auth, proxy, no_proxy)
 }
 
 /// Sanitize image name for use as filename.
@@ -3125,6 +3156,92 @@ mod tests {
         // If not in expected format, return as-is
         assert_eq!(oci_platform_to_arch("arm64"), "arm64");
         assert_eq!(oci_platform_to_arch("unknown"), "unknown");
+    }
+
+    /// Collect (name, value) for env vars explicitly set on a Command, with
+    /// inherited vars filtered out. `Command::get_envs()` yields a tuple per
+    /// explicit `.env()` / `.env_remove()` call: the value is `None` for
+    /// removals and `Some(_)` for sets. We only care about sets here.
+    fn explicit_envs(cmd: &Command) -> Vec<(String, String)> {
+        cmd.get_envs()
+            .filter_map(|(k, v)| {
+                v.map(|val| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        val.to_string_lossy().into_owned(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn apply_proxy_env_sets_http_and_https_when_proxy_present() {
+        let mut cmd = Command::new("crane");
+        apply_proxy_env(&mut cmd, Some("http://proxy.example.com:3128"), None);
+
+        let envs = explicit_envs(&cmd);
+        assert!(envs.contains(&(
+            "HTTP_PROXY".to_string(),
+            "http://proxy.example.com:3128".to_string()
+        )));
+        assert!(envs.contains(&(
+            "HTTPS_PROXY".to_string(),
+            "http://proxy.example.com:3128".to_string()
+        )));
+        // No NO_PROXY when not asked for — silent overreach would be a bug.
+        assert!(!envs.iter().any(|(k, _)| k == "NO_PROXY"));
+    }
+
+    #[test]
+    fn apply_proxy_env_sets_no_proxy_when_present() {
+        let mut cmd = Command::new("crane");
+        apply_proxy_env(&mut cmd, None, Some("127.0.0.1,.internal"));
+
+        let envs = explicit_envs(&cmd);
+        assert!(envs.contains(&("NO_PROXY".to_string(), "127.0.0.1,.internal".to_string())));
+        // proxy=None must not set HTTP_PROXY / HTTPS_PROXY.
+        assert!(!envs.iter().any(|(k, _)| k == "HTTP_PROXY"));
+        assert!(!envs.iter().any(|(k, _)| k == "HTTPS_PROXY"));
+    }
+
+    #[test]
+    fn apply_proxy_env_with_both_sets_all_three() {
+        let mut cmd = Command::new("crane");
+        apply_proxy_env(
+            &mut cmd,
+            Some("http://192.168.127.254:3128"),
+            Some("127.0.0.1,localhost"),
+        );
+
+        let envs = explicit_envs(&cmd);
+        assert_eq!(
+            envs.len(),
+            3,
+            "expected exactly HTTP_PROXY, HTTPS_PROXY, NO_PROXY"
+        );
+        let map: std::collections::HashMap<_, _> = envs.into_iter().collect();
+        assert_eq!(
+            map.get("HTTP_PROXY").map(String::as_str),
+            Some("http://192.168.127.254:3128")
+        );
+        assert_eq!(
+            map.get("HTTPS_PROXY").map(String::as_str),
+            Some("http://192.168.127.254:3128")
+        );
+        assert_eq!(
+            map.get("NO_PROXY").map(String::as_str),
+            Some("127.0.0.1,localhost")
+        );
+    }
+
+    #[test]
+    fn apply_proxy_env_with_none_is_noop() {
+        let mut cmd = Command::new("crane");
+        apply_proxy_env(&mut cmd, None, None);
+
+        // Without explicit envs the iterator is empty — no accidental fallbacks.
+        assert_eq!(explicit_envs(&cmd).len(), 0);
     }
 
     #[test]

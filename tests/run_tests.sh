@@ -25,6 +25,7 @@
 #   api             test_api.sh
 #   virtio-net      test_virtio_net.sh
 #   smolfile        test_smolfile.sh
+#   secrets         test_secrets.sh
 #   pack            test_pack.sh
 #   pack-quick      test_pack.sh --quick
 #   gpu             test_gpu.sh  (requires GPU hardware)
@@ -62,6 +63,7 @@ get_suite() {
         api)         echo "$SCRIPT_DIR/test_api.sh" ;;
         virtio-net)  echo "$SCRIPT_DIR/test_virtio_net.sh" ;;
         smolfile)    echo "$SCRIPT_DIR/test_smolfile.sh" ;;
+        secrets)     echo "$SCRIPT_DIR/test_secrets.sh" ;;
         pack)        echo "$SCRIPT_DIR/test_pack.sh" ;;
         pack-quick)  echo "$SCRIPT_DIR/test_pack.sh --quick" ;;
         gpu)         echo "$SCRIPT_DIR/test_gpu.sh" ;;

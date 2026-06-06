@@ -137,6 +137,17 @@ impl Supervisor {
 
     /// Attempt to restart a machine.
     async fn restart_machine(&self, name: &str) -> crate::Result<()> {
+        // Hold the per-machine lifecycle lock across the acquire+mount+launch so a
+        // concurrent user-initiated stop/delete cannot detach the macOS layers
+        // volume out from under this restart (review finding #3). Acquired before
+        // get_machine and the entry-mutex lock taken inside the spawn_blocking
+        // below, keeping the lifecycle → entry lock order that start/stop/delete
+        // also follow. If a user op holds it, this restart blocks until that op
+        // completes (operations are bounded), then re-derives state from the DB.
+        // Linux: the guarded mount is a no-op.
+        let lifecycle = self.state.lifecycle_lock(name);
+        let _guard = lifecycle.lock().await;
+
         let entry = match self.state.get_machine(name) {
             Ok(entry) => entry,
             Err(_) => {
@@ -160,19 +171,42 @@ impl Supervisor {
             }
         };
 
+        // Never auto-restart a fork base: clones CoW-read its disks by path, so
+        // relaunching it writable would corrupt them. Clones keep working
+        // without the base process, so skipping is safe (and avoids thrashing,
+        // since `prepare_for_launch` would refuse the launch anyway).
+        match self.state.db().dependent_clones(name) {
+            Ok(clones) if !clones.is_empty() => {
+                tracing::warn!(
+                    machine = %name,
+                    clones = %clones.join(", "),
+                    "not auto-restarting: machine is a fork base with live clones"
+                );
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(machine = %name, error = %e, "could not check dependent clones; proceeding")
+            }
+        }
+
         let mounts = record.host_mounts();
         let ports = record.port_mappings();
         let resources = record.vm_resources();
+        let source_smolmachine = record.source_smolmachine.clone();
+        let name_for_features = name.to_string();
 
         let entry_clone = entry.clone();
         let start_result = tokio::task::spawn_blocking(move || {
             let entry = entry_clone.lock();
-            entry.manager.ensure_running_via_subprocess(
-                mounts,
-                ports,
-                resources,
-                Default::default(),
-            )
+            // Wire pre-extracted layers if this machine was created from a .smolmachine.
+            let features = crate::api::state::build_launch_features(
+                Some(&name_for_features),
+                source_smolmachine.as_deref(),
+            )?;
+            entry
+                .manager
+                .ensure_running_via_subprocess(mounts, ports, resources, features)
         })
         .await
         .map_err(|e| crate::Error::agent("ensure running", e.to_string()))?;

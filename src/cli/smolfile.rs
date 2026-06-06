@@ -57,6 +57,7 @@ pub fn build_create_params(
         None => {
             let net = cli_net || !cli_allow_cidr.is_empty();
             return Ok(CreateVmParams {
+                secret_refs: Default::default(),
                 name,
                 image: cli_image,
                 entrypoint: cli_entrypoint.map(|e| vec![e]).unwrap_or_default(),
@@ -246,6 +247,7 @@ pub fn build_create_params(
         .and_then(|s| parse_duration_secs(s));
 
     Ok(CreateVmParams {
+        secret_refs: sf.secrets,
         name,
         image,
         entrypoint,
@@ -308,6 +310,10 @@ pub struct PackConfig {
     pub net: Option<bool>,
     /// Whether GPU acceleration is enabled in the packed VM.
     pub gpu: bool,
+    /// Secrets carried into the pack manifest as references. They are resolved
+    /// to plaintext on the run host at exec time and are never packed as
+    /// values.
+    pub secret_refs: std::collections::BTreeMap<String, smolvm::secrets::SecretRef>,
 }
 
 /// Resolve pack configuration by merging CLI flags with an optional Smolfile.
@@ -347,6 +353,7 @@ pub fn resolve_pack_config(
                 workdir: None,
                 net: None,
                 gpu: cli_gpu,
+                secret_refs: Default::default(),
             });
         }
     };
@@ -414,5 +421,6 @@ pub fn resolve_pack_config(
         },
         // CLI --gpu wins; Smolfile gpu = true also enables it.
         gpu: cli_gpu || sf.gpu.unwrap_or(false),
+        secret_refs: sf.secrets,
     })
 }

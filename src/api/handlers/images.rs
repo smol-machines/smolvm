@@ -98,11 +98,19 @@ pub async fn pull_image(
 
     let image = req.image.clone();
     let oci_platform = req.oci_platform.clone();
+    let proxy = req.proxy.clone();
+    let no_proxy = req.no_proxy.clone();
     let start = std::time::Instant::now();
     let image_info = with_machine_client_traced(&entry, tid, move |c| {
         let mut opts = PullOptions::new().use_registry_config(true);
         if let Some(p) = oci_platform {
             opts = opts.oci_platform(p);
+        }
+        if let Some(p) = proxy {
+            opts = opts.proxy(p);
+        }
+        if let Some(np) = no_proxy {
+            opts = opts.no_proxy(np);
         }
         c.pull(&image, opts)
     })

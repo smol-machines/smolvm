@@ -1,3 +1,6 @@
+//! Disk image helpers: sparse creation, template/copy-on-write cloning, and
+//! resizing of the raw VM disk images.
+
 use crate::data::consts::BYTES_PER_GIB;
 use crate::data::disk::DiskType;
 use crate::error::{Error, Result};
@@ -272,7 +275,7 @@ pub(crate) fn write_last_byte(
 /// Disk templates are sparse files (~500KB actual data in a 512MB logical file).
 /// `std::fs::copy()` copies all bytes including zero regions. The sparse copy
 /// path skips holes, reducing copy time from ~400ms to ~5ms.
-pub(crate) fn clone_or_copy_file(src: &Path, dst: &Path) -> Result<()> {
+pub fn clone_or_copy_file(src: &Path, dst: &Path) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         use std::ffi::CString;
@@ -301,6 +304,10 @@ pub(crate) fn clone_or_copy_file(src: &Path, dst: &Path) -> Result<()> {
 
     #[cfg(target_os = "linux")]
     {
+        // TODO(reflink): try a FICLONE ioctl before sparse_copy for true
+        // copy-on-write on btrfs/XFS hosts. (Fork clones already get
+        // filesystem-independent block CoW via qcow2 overlays; this would only
+        // speed up the remaining full-copy callers on reflink-capable hosts.)
         match sparse_copy(src, dst) {
             Ok(bytes) => {
                 tracing::debug!(

@@ -67,14 +67,49 @@ impl DnsFilter {
     }
 
     /// Forward a DNS query to the upstream resolver and return the response.
+    ///
+    /// Tries UDP first. If the upstream sets the TC (truncated) bit in the
+    /// response, retries via TCP to retrieve the full answer.
     fn resolve_upstream(&self, raw_query: &[u8]) -> io::Result<Vec<u8>> {
+        let resp = self.resolve_upstream_udp(raw_query)?;
+        // TC bit is flags byte 2 bit 1. When set the response was truncated
+        // and the caller should retry over TCP (RFC 1035 §4.2.1).
+        if resp.len() >= 3 && resp[2] & 0x02 != 0 {
+            tracing::debug!("upstream UDP response truncated (TC=1), retrying via TCP");
+            return self.resolve_upstream_tcp(raw_query);
+        }
+        Ok(resp)
+    }
+
+    fn resolve_upstream_udp(&self, raw_query: &[u8]) -> io::Result<Vec<u8>> {
         let socket = UdpSocket::bind("0.0.0.0:0")?;
         socket.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
         socket.send_to(raw_query, format!("{}:53", self.upstream))?;
-
-        let mut buf = [0u8; 1024];
+        // 4096 bytes covers standard EDNS0 payloads; responses larger than
+        // this will have TC=1 set by the upstream, triggering TCP retry.
+        let mut buf = [0u8; 4096];
         let (len, _) = socket.recv_from(&mut buf)?;
         Ok(buf[..len].to_vec())
+    }
+
+    fn resolve_upstream_tcp(&self, raw_query: &[u8]) -> io::Result<Vec<u8>> {
+        use std::net::{SocketAddr, TcpStream};
+        let addr: SocketAddr = format!("{}:53", self.upstream)
+            .parse()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let mut stream = TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(5))?;
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+        // TCP DNS framing: 2-byte BE length prefix (RFC 1035 §4.2.2).
+        let len = raw_query.len() as u16;
+        stream.write_all(&len.to_be_bytes())?;
+        stream.write_all(raw_query)?;
+        stream.flush()?;
+        let mut len_buf = [0u8; 2];
+        stream.read_exact(&mut len_buf)?;
+        let resp_len = u16::from_be_bytes(len_buf) as usize;
+        let mut resp = vec![0u8; resp_len];
+        stream.read_exact(&mut resp)?;
+        Ok(resp)
     }
 }
 
@@ -302,6 +337,24 @@ mod tests {
         let response = filter.handle_query(&query);
         assert!(response.len() >= 12);
         assert_eq!(response[3] & 0x0F, 0x03); // RCODE=NXDOMAIN
+    }
+
+    #[test]
+    fn test_tc_bit_detection() {
+        // Verify the TC (truncated) bit position: flags byte 2, bit 1 (0x02).
+        // A UDP response with TC=1 should trigger TCP retry in resolve_upstream.
+        let mut resp = build_query("example.com");
+        resp[2] = 0x80; // QR=1, TC=0
+        assert_eq!(resp[2] & 0x02, 0x00); // TC clear
+
+        resp[2] |= 0x02; // Set TC=1
+        assert_eq!(resp[2] & 0x02, 0x02); // TC set — would trigger TCP retry
+
+        // Sanity: NXDOMAIN and SERVFAIL responses have TC=0 (we build them).
+        let nxdomain = build_nxdomain(&build_query("example.com"));
+        assert_eq!(nxdomain[2] & 0x02, 0x00);
+        let servfail = build_servfail(&build_query("example.com"));
+        assert_eq!(servfail[2] & 0x02, 0x00);
     }
 
     #[test]

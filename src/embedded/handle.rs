@@ -54,7 +54,8 @@ impl VmHandle {
         workdir: Option<String>,
         timeout: Option<Duration>,
     ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
-        self.client_mut()?.vm_exec(command, env, workdir, timeout)
+        self.client_mut()?
+            .vm_exec(command, env, workdir, timeout, None)
     }
 
     /// Pull an OCI image and run a command inside it.
@@ -108,6 +109,21 @@ impl VmHandle {
     ) -> Result<Vec<ExecEvent>> {
         self.client_mut()?
             .vm_exec_streaming(command, env, workdir, timeout)
+    }
+
+    /// Execute a command, delivering stdout/stderr/exit events LIVE via the
+    /// callback as each frame arrives (no buffering). SDKs bridge this to a
+    /// language-native iterator (Python generator / JS async iterator).
+    pub fn exec_streaming_with<F: FnMut(ExecEvent)>(
+        &mut self,
+        command: Vec<String>,
+        env: Vec<(String, String)>,
+        workdir: Option<String>,
+        timeout: Option<Duration>,
+        on_event: F,
+    ) -> Result<()> {
+        self.client_mut()?
+            .vm_exec_streaming_with(command, env, workdir, timeout, on_event)
     }
 
     /// Stop the VM and drop the cached agent client.

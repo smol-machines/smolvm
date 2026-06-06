@@ -6,7 +6,7 @@
 use crate::data::validate_vm_name;
 use crate::error::{Error, Result};
 use crate::process::{self, ChildProcess};
-use crate::storage::{OverlayDisk, StorageDisk};
+use crate::storage::{DiskFormat, OverlayDisk, StorageDisk};
 use parking_lot::Mutex;
 use smolvm_protocol::AGENT_READY_MARKER;
 use std::os::unix::process::CommandExt as _;
@@ -181,6 +181,34 @@ pub fn vm_data_dir(name: &str) -> PathBuf {
     vm_cache_root().join(vm_dir_hash(name))
 }
 
+/// Resolve the on-disk image for a `.raw` disk filename in `dir`. A fork clone
+/// has a `.qcow2` copy-on-write overlay in place of the raw disk, so prefer that
+/// when present; otherwise fall back to the raw disk. The file on disk is the
+/// single source of truth for the format (no format is stored in the record).
+pub fn resolve_disk_image(dir: &Path, raw_filename: &str) -> (PathBuf, DiskFormat) {
+    let qcow2 = dir.join(Path::new(raw_filename).with_extension("qcow2"));
+    if qcow2.exists() {
+        (qcow2, DiskFormat::Qcow2)
+    } else {
+        (dir.join(raw_filename), DiskFormat::Raw)
+    }
+}
+
+/// Per-machine extraction directory for a `.smolmachine` bundle's OCI layers.
+///
+/// Unlike the shared content-addressed pack cache (`smolvm-pack/<checksum>`),
+/// this lives *under* the machine's own [`vm_data_dir`], which means:
+/// - it is reclaimed for free when the data dir is removed on delete;
+/// - it is outside `pack prune`'s scope (never reaped while the machine exists);
+/// - the macOS case-sensitive layers volume is owned 1:1 by the machine, so the
+///   stop/delete paths can detach it unconditionally with no co-tenant risk.
+///
+/// The subdir is `pack` (deliberately not `layers`) so it cannot collide with
+/// the `layers/` subtree that `extract_sidecar` creates *inside* this directory.
+pub fn machine_layers_cache_dir(name: &str) -> PathBuf {
+    vm_data_dir(name).join("pack")
+}
+
 /// Cache root: `<cache_dir>/smolvm/vms/`.
 pub fn vm_cache_root() -> PathBuf {
     dirs::cache_dir()
@@ -202,7 +230,7 @@ pub fn vm_cache_root() -> PathBuf {
 /// concern. Adversarial collisions (an attacker picking a name that
 /// hashes to the same directory as an existing VM) take ~2^32 work, a
 /// few hours on a laptop. This is acceptable for single-user smolvm. A
-/// future multi-tenant deployment (smolcloud) should add per-tenant
+/// future multi-tenant deployment (smolfleet) should add per-tenant
 /// namespacing or a longer hash.
 pub fn vm_dir_hash(name: &str) -> String {
     use sha2::{Digest, Sha256};
@@ -440,11 +468,26 @@ impl AgentManager {
         // different name).
         let storage_dir = ensure_vm_dir(&name)?;
 
-        let storage_path = storage_dir.join(crate::storage::STORAGE_DISK_FILENAME);
-        let storage_disk = StorageDisk::open_or_create_at(&storage_path, sg)?;
+        // A fork clone has a `.qcow2` copy-on-write overlay in place of the
+        // `.raw` disk; detect it by file presence (the on-disk file is the
+        // source of truth) and open it as-is rather than creating/formatting.
+        let (storage_path, storage_format) =
+            resolve_disk_image(&storage_dir, crate::storage::STORAGE_DISK_FILENAME);
+        let storage_disk = match storage_format {
+            DiskFormat::Qcow2 => {
+                StorageDisk::open_existing_with_format(&storage_path, storage_format)?
+            }
+            DiskFormat::Raw => StorageDisk::open_or_create_at(&storage_path, sg)?,
+        };
 
-        let overlay_path = storage_dir.join(crate::storage::OVERLAY_DISK_FILENAME);
-        let overlay_disk = OverlayDisk::open_or_create_at(&overlay_path, og)?;
+        let (overlay_path, overlay_format) =
+            resolve_disk_image(&storage_dir, crate::storage::OVERLAY_DISK_FILENAME);
+        let overlay_disk = match overlay_format {
+            DiskFormat::Qcow2 => {
+                OverlayDisk::open_existing_with_format(&overlay_path, overlay_format)?
+            }
+            DiskFormat::Raw => OverlayDisk::open_or_create_at(&overlay_path, og)?,
+        };
 
         Self::new_named(name, rootfs_path, storage_disk, overlay_disk)
     }
@@ -459,6 +502,23 @@ impl AgentManager {
         self.name.as_deref()
     }
 
+    /// Names of VMs forked from this one. Their block disks are copy-on-write
+    /// overlays backed by this VM's disks, so it must not be re-launched with
+    /// writable disks while they exist. Best-effort: on a registry read error,
+    /// returns empty rather than blocking the launch.
+    fn dependent_clones(&self) -> Vec<String> {
+        let Some(name) = self.name() else {
+            return Vec::new(); // the unnamed/default manager is never a fork base
+        };
+        match crate::db::SmolvmDb::open().and_then(|db| db.dependent_clones(name)) {
+            Ok(clones) => clones,
+            Err(e) => {
+                tracing::warn!(vm = name, error = %e, "could not check for dependent clones");
+                Vec::new()
+            }
+        }
+    }
+
     /// Get the default path for the agent rootfs.
     ///
     /// Checks `SMOLVM_AGENT_ROOTFS` env var first, then falls back to the
@@ -469,11 +529,83 @@ impl AgentManager {
             return Ok(PathBuf::from(path));
         }
 
+        // SDKs bundle the rootfs as a tarball (they can't ship a dir tree with
+        // symlinks/modes through a wheel) and point us at it. Extract it once to a
+        // cache dir and use that, so `npm i` / `pip install` is self-contained
+        // with no separate engine install. Re-extracts when the tarball changes
+        // (a new SDK version ships a newer agent).
+        if let Some(tar) = std::env::var_os("SMOLVM_AGENT_ROOTFS_TAR") {
+            return Self::ensure_extracted_rootfs(Path::new(&tar));
+        }
+
         let data_dir = dirs::data_local_dir()
             .or_else(dirs::data_dir)
             .ok_or_else(|| Error::storage("resolve path", "could not determine data directory"))?;
 
         Ok(data_dir.join("smolvm").join("agent-rootfs"))
+    }
+
+    /// Extract a bundled agent-rootfs tarball to a cache dir (idempotent) and
+    /// return that dir. Keyed by the tarball's size+mtime so a newer SDK build
+    /// re-extracts; extraction is staged in a temp dir then atomically renamed so
+    /// concurrent SDK processes never see a half-extracted rootfs.
+    fn ensure_extracted_rootfs(tar: &Path) -> Result<PathBuf> {
+        let meta =
+            std::fs::metadata(tar).map_err(|e| Error::storage("stat rootfs tar", e.to_string()))?;
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let key = format!("{:x}-{:x}", meta.len(), mtime);
+
+        let base = dirs::cache_dir()
+            .ok_or_else(|| Error::storage("resolve cache dir", "no cache directory"))?
+            .join("smolvm")
+            .join("rootfs");
+        let dest = base.join(&key);
+        if dest.join(".extracted").exists() {
+            return Ok(dest);
+        }
+
+        std::fs::create_dir_all(&base)
+            .map_err(|e| Error::storage("create rootfs cache", e.to_string()))?;
+        let tmp = base.join(format!(".tmp-{}-{}", std::process::id(), key));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp)
+            .map_err(|e| Error::storage("create rootfs staging", e.to_string()))?;
+
+        // Use the system `tar` — it preserves symlinks (e.g. /sbin/init) and modes
+        // (the executable agent), which the tar crate handling here would not need
+        // to reimplement. Extraction runs on the host before VM boot (unsandboxed).
+        let status = std::process::Command::new("tar")
+            .arg("-xpf")
+            .arg(tar)
+            .arg("-C")
+            .arg(&tmp)
+            .status()
+            .map_err(|e| Error::storage("extract rootfs tar", e.to_string()))?;
+        if !status.success() {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err(Error::storage(
+                "extract rootfs tar",
+                format!("tar exited with {status}"),
+            ));
+        }
+        let _ = std::fs::write(tmp.join(".extracted"), b"");
+        // Atomic publish; if another process won the race, just use theirs.
+        match std::fs::rename(&tmp, &dest) {
+            Ok(()) => {}
+            Err(_) if dest.join(".extracted").exists() => {
+                let _ = std::fs::remove_dir_all(&tmp);
+            }
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&tmp);
+                return Err(Error::storage("publish extracted rootfs", e.to_string()));
+            }
+        }
+        Ok(dest)
     }
 
     /// Get the current state of the agent.
@@ -499,6 +631,25 @@ impl AgentManager {
             {
                 inner.vm_lock_handle = None;
             }
+        }
+    }
+
+    /// Force the in-memory state back to `Stopped` and release the per-VM lock,
+    /// after the VM process has already been stopped out-of-band (the HTTP stop
+    /// path kills the recorded PID directly rather than via this manager).
+    ///
+    /// The serve process holds the `vm.lock` flock for the lifetime of the
+    /// registry's `AgentManager`; if `vm_lock_handle` is not dropped here, the
+    /// serve process keeps holding the lock and a subsequent start fails to
+    /// re-acquire it ("another process is already starting or running this VM").
+    /// Only call once the process is confirmed dead.
+    pub fn mark_stopped(&self) {
+        let mut inner = self.inner.lock();
+        inner.state = AgentState::Stopped;
+        inner.child = None;
+        #[cfg(unix)]
+        {
+            inner.vm_lock_handle = None;
         }
     }
 
@@ -790,6 +941,56 @@ impl AgentManager {
         self.ensure_running_with_full_config(mounts, Vec::new(), resources, Default::default())
     }
 
+    /// Re-attach this machine's pre-extracted packed layers if the caller did
+    /// not already wire them.
+    ///
+    /// The implicit-start preflight (`ensure_machine_running`) passes
+    /// `default()` features when the VM is already up, to skip the macOS hdiutil
+    /// mount on the exec hot path. If that preflight then detects a config
+    /// change and restarts, the relaunch would otherwise drop the packed layers
+    /// and the guest would fall back to a registry pull (broken offline). The
+    /// layers are discoverable from the machine name alone — derive the
+    /// per-machine directory, re-acquire the lease, and set `packed_layers_dir`.
+    /// A no-op when layers are already wired (an explicit-start path set
+    /// `packed_layers_dir` and its mount is still live), when this is not a named
+    /// machine, or when nothing was extracted (image/registry-sourced machine).
+    /// macOS mount cost only; a compile-time no-op on Linux.
+    fn rewire_packed_layers_if_extracted(
+        &self,
+        features: &mut launcher::LaunchFeatures,
+    ) -> Result<()> {
+        if features.packed_layers_dir.is_some() {
+            return Ok(());
+        }
+        let Some(name) = self.name.as_deref() else {
+            return Ok(());
+        };
+        let cache_dir = machine_layers_cache_dir(name);
+        if !smolvm_pack::extract::is_extracted(&cache_dir) {
+            return Ok(());
+        }
+        // This runs only on the relaunch path, after stop()/reset_stale_running_state,
+        // so no live VM is using the volume. The original start leaked a lease to keep
+        // it mounted; drop that stale mount (and its lease files) before acquiring a
+        // fresh one, so a config-change restart doesn't stack a second lease/mount on
+        // the first. Gated by the same conditions as the re-acquire below, so the
+        // explicit-start paths (features already `Some`, mount still live) return
+        // early above and never detach. macOS hdiutil detach; a no-op on Linux.
+        smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
+        match smolvm_pack::extract::acquire_layers_lease(&cache_dir, false) {
+            Ok(lease) => {
+                features.packed_layers_dir = Some(lease.path.clone());
+                // Keep the volume mounted for the VM's lifetime; the stop/delete
+                // handlers detach it (see `machine_layers_cache_dir`).
+                std::mem::forget(lease);
+            }
+            Err(e) => {
+                return Err(Error::agent("re-attach packed layers", e.to_string()));
+            }
+        }
+        Ok(())
+    }
+
     /// Ensure the agent is running with the specified mounts, ports, and resources.
     ///
     /// If the agent is running with different configuration, it will be restarted.
@@ -799,7 +1000,7 @@ impl AgentManager {
         mounts: Vec<HostMount>,
         ports: Vec<PortMapping>,
         resources: VmResources,
-        features: launcher::LaunchFeatures,
+        mut features: launcher::LaunchFeatures,
     ) -> Result<bool> {
         // Check if agent is already running with the same configuration.
         // try_connect_existing restores config from disk on reconnect,
@@ -846,6 +1047,10 @@ impl AgentManager {
             // Reset to Stopped so start_with_full_config can proceed.
             self.reset_stale_running_state();
         }
+
+        // Re-attach packed layers if a config-change restart dropped them
+        // (see `rewire_packed_layers_if_extracted`).
+        self.rewire_packed_layers_if_extracted(&mut features)?;
 
         // Start with new config
         self.start_with_full_config(mounts, ports, resources, features)?;
@@ -924,6 +1129,27 @@ impl AgentManager {
         ports: &[PortMapping],
         resources: VmResources,
     ) -> Result<()> {
+        // Refuse to (re)launch a fork base while clones depend on it. Clones
+        // CoW-read this VM's disks by path; re-running it would reopen them
+        // writable and silently corrupt every clone. Clones don't need the base
+        // process alive, so refusing is safe — delete the clones first to reuse
+        // the name. Covers every launch path (CLI fork + subprocess) since both
+        // funnel through here.
+        let clones = self.dependent_clones();
+        if !clones.is_empty() {
+            return Err(Error::agent(
+                "start agent",
+                format!(
+                    "'{}' is a fork base for {} live clone(s) ({}); their disks are \
+                     copy-on-write overlays backed by its disks, so it cannot be \
+                     re-launched while they exist — delete the clones first",
+                    self.name().unwrap_or_default(),
+                    clones.len(),
+                    clones.join(", ")
+                ),
+            ));
+        }
+
         // Validate resources before doing anything else.
         resources.validate()?;
 
@@ -1189,11 +1415,39 @@ impl AgentManager {
         let exe = std::env::current_exe()
             .map_err(|e| Error::agent("find smolvm binary", e.to_string()))?;
         let spawn_start = Instant::now();
-        let child = std::process::Command::new(&exe)
+        // Embedders (e.g. the Node SDK, where current_exe is `node`) can point the
+        // boot subprocess at a `_boot-vm`-capable, signed helper binary instead of self.
+        let boot_binary = std::env::var_os("SMOLVM_BOOT_BINARY");
+        // An in-process embedder (the Node/Python SDK) sets SMOLVM_BOOT_BINARY and
+        // owns the VM's lifetime — when that host process dies, the VM must die
+        // too, or it leaks as an orphan holding the VM's full RAM. The CLI (which
+        // detaches the VM on purpose) and `serve` (which reconnects to surviving
+        // VMs) don't set it, so they keep today's behavior. We pass the resulting
+        // flag down so the boot subprocess only arms its parent-death watchdog in
+        // the embedder case. See `cli/internal_boot::run`.
+        let watch_parent = boot_binary.is_some();
+        let boot_exe = boot_binary
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| exe.clone());
+        let child = std::process::Command::new(&boot_exe)
             .args(["_boot-vm", &config_path.to_string_lossy()])
+            .env(
+                "SMOLVM_BOOT_WATCH_PARENT",
+                if watch_parent { "1" } else { "0" },
+            )
             .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            // SMOLVM_BOOT_DEBUG=1 surfaces the boot subprocess's stdout/stderr so
+            // embedded-host launch failures can be diagnosed (normally silenced).
+            .stdout(if std::env::var_os("SMOLVM_BOOT_DEBUG").is_some() {
+                std::process::Stdio::inherit()
+            } else {
+                std::process::Stdio::null()
+            })
+            .stderr(if std::env::var_os("SMOLVM_BOOT_DEBUG").is_some() {
+                std::process::Stdio::inherit()
+            } else {
+                std::process::Stdio::null()
+            })
             // Own process group (pgid = child pid) so the VM is immune to
             // SIGHUP from the parent's terminal closing, without making it a
             // session leader. Session-leader status causes proc_pidinfo to
@@ -1222,7 +1476,7 @@ impl AgentManager {
         mounts: Vec<HostMount>,
         ports: Vec<PortMapping>,
         resources: VmResources,
-        features: launcher::LaunchFeatures,
+        mut features: launcher::LaunchFeatures,
     ) -> Result<bool> {
         // Check if agent is already running (same logic as ensure_running_with_full_config)
         if self.try_connect_existing().is_some() {
@@ -1259,6 +1513,10 @@ impl AgentManager {
         } else {
             self.reset_stale_running_state();
         }
+
+        // Re-attach packed layers if a config-change restart dropped them
+        // (see `rewire_packed_layers_if_extracted`).
+        self.rewire_packed_layers_if_extracted(&mut features)?;
 
         self.start_via_subprocess(mounts, ports, resources, features)?;
         Ok(true)
@@ -1493,6 +1751,44 @@ impl AgentManager {
         let socket_probe_grace = Duration::from_secs(5);
 
         tracing::debug!("waiting for agent to be ready");
+
+        // Fork clone: the guest resumes past boot, so it never (re)writes the
+        // `.smolvm-ready` marker. Detect readiness by pinging the restored agent
+        // directly (it is already in its accept loop) — no marker, no grace.
+        let is_clone = std::env::var_os("SMOLVM_SNAPSHOT_DIR").is_some_and(|v| !v.is_empty());
+        if is_clone {
+            while start.elapsed() < timeout {
+                {
+                    let mut inner = self.inner.lock();
+                    if let Some(ref mut child) = inner.child {
+                        if !child.is_running() {
+                            return Err(Error::agent(
+                                "monitor agent",
+                                "clone agent process exited during startup".to_string(),
+                            ));
+                        }
+                    }
+                }
+                if self.vsock_socket.exists() {
+                    if let Ok(mut client) =
+                        super::AgentClient::connect_with_boot_probe_timeout(&self.vsock_socket)
+                    {
+                        if client.ping().is_ok() {
+                            tracing::info!(
+                                elapsed_ms = start.elapsed().as_millis(),
+                                "clone agent ready (ping)"
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            return Err(Error::agent(
+                "wait for ready",
+                "clone agent did not respond to ping within timeout".to_string(),
+            ));
+        }
 
         let ready_marker = self.rootfs_path.join(AGENT_READY_MARKER);
 
@@ -1737,5 +2033,51 @@ mod tests {
             std::fs::read_to_string(dir.join("name")).unwrap(),
             "first-vm",
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn rewire_packed_layers_returns_lease_failure() {
+        let temp = tempfile::tempdir().unwrap();
+
+        let name = format!(
+            "review-rewire-lease-failure-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        struct VmDataCleanup(String);
+        impl Drop for VmDataCleanup {
+            fn drop(&mut self) {
+                smolvm_pack::extract::force_detach_layers_volume(&machine_layers_cache_dir(
+                    &self.0,
+                ));
+                let _ = std::fs::remove_dir_all(vm_data_dir(&self.0));
+            }
+        }
+        let _cleanup = VmDataCleanup(name.clone());
+
+        let storage = StorageDisk::open_or_create_at(&temp.path().join("storage.img"), 1).unwrap();
+        let overlay = OverlayDisk::open_or_create_at(&temp.path().join("overlay.img"), 1).unwrap();
+        let manager =
+            AgentManager::new_named(&name, temp.path().join("rootfs"), storage, overlay).unwrap();
+
+        let cache_dir = machine_layers_cache_dir(&name);
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(cache_dir.join(".smolvm-extracted"), "").unwrap();
+        std::fs::write(cache_dir.join("layers-cs.sparseimage"), b"not a disk image").unwrap();
+
+        let mut features = launcher::LaunchFeatures::default();
+        let err = manager
+            .rewire_packed_layers_if_extracted(&mut features)
+            .expect_err("restart must fail when packed layers cannot be reattached");
+
+        assert!(
+            err.to_string().contains("re-attach packed layers"),
+            "unexpected error: {err}"
+        );
+        assert!(features.packed_layers_dir.is_none());
     }
 }

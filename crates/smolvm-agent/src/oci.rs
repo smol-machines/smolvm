@@ -38,6 +38,9 @@ pub struct OciProcess {
     /// Whether to allocate a pseudo-terminal.
     #[serde(default)]
     pub terminal: bool,
+    /// Initial size of the container's pseudo-terminal (when `terminal: true`).
+    #[serde(rename = "consoleSize", skip_serializing_if = "Option::is_none")]
+    pub console_size: Option<OciConsoleSize>,
     /// User and group IDs.
     pub user: OciUser,
     /// Command and arguments to execute.
@@ -56,6 +59,18 @@ pub struct OciProcess {
     /// Do not create a new session for the process.
     #[serde(rename = "noNewPrivileges", default)]
     pub no_new_privileges: bool,
+}
+
+/// Initial size of a container's pseudo-terminal.
+///
+/// Serialises as OCI `consoleSize: { height, width }`. The host sends a
+/// `Resize` message with the real host terminal dimensions right after the
+/// container starts, so this is just the size seen by the very first
+/// frame the container draws.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct OciConsoleSize {
+    pub height: u32,
+    pub width: u32,
 }
 
 /// User configuration.
@@ -477,6 +492,7 @@ impl OciSpec {
             },
             process: OciProcess {
                 terminal: tty,
+                console_size: None,
                 user: identity.user.clone(),
                 args: command.to_vec(),
                 env: env_strings,
@@ -572,6 +588,10 @@ impl OciSpec {
     /// special configuration — if the VM was started with `--gpu`, the devices
     /// appear automatically inside every container.
     pub fn add_gpu_devices_if_available(&mut self) {
+        if self.mounts.iter().any(|m| m.destination == "/dev/dri") {
+            return;
+        }
+
         let dri_path = std::path::Path::new("/dev/dri");
         if !dri_path.exists() {
             return;
@@ -1041,6 +1061,47 @@ mod tests {
         assert!(spec.process.env.contains(&"FOO=bar".to_string()));
         assert!(spec.process.env.contains(&"HOME=/root".to_string()));
         assert!(!spec.process.terminal);
+        assert!(spec.process.console_size.is_none());
+    }
+
+    #[test]
+    fn test_oci_console_size_serialises_as_camel_case() {
+        let mut spec = OciSpec::new(
+            &["sh".to_string()],
+            &[],
+            "/",
+            true,
+            &ProcessIdentity::root(),
+        );
+        spec.process.console_size = Some(OciConsoleSize {
+            height: 24,
+            width: 80,
+        });
+        let json = serde_json::to_value(&spec).unwrap();
+        let cs = json
+            .get("process")
+            .and_then(|p| p.get("consoleSize"))
+            .expect("consoleSize should serialise as camelCase under process");
+        assert_eq!(cs.get("height").and_then(|v| v.as_u64()), Some(24));
+        assert_eq!(cs.get("width").and_then(|v| v.as_u64()), Some(80));
+    }
+
+    #[test]
+    fn test_oci_console_size_omitted_when_none() {
+        let spec = OciSpec::new(
+            &["sh".to_string()],
+            &[],
+            "/",
+            true,
+            &ProcessIdentity::root(),
+        );
+        let json = serde_json::to_value(&spec).unwrap();
+        assert!(
+            json.get("process")
+                .and_then(|p| p.get("consoleSize"))
+                .is_none(),
+            "consoleSize must be omitted when unset"
+        );
     }
 
     #[test]
@@ -1197,6 +1258,28 @@ mod tests {
             // No GPU — no extra mounts added (no-op)
             assert_eq!(spec.mounts.len(), mounts_before);
         }
+    }
+
+    #[test]
+    fn test_gpu_devices_are_not_added_twice() {
+        let identity = ProcessIdentity::root();
+        let mut spec = OciSpec::new(&["echo".to_string()], &[], "/", false, &identity);
+        spec.mounts.push(super::OciMount {
+            destination: "/dev/dri".to_string(),
+            mount_type: Some("bind".to_string()),
+            source: "/dev/dri".to_string(),
+            options: vec!["bind".to_string(), "rprivate".to_string()],
+        });
+
+        spec.add_gpu_devices_if_available();
+
+        assert_eq!(
+            spec.mounts
+                .iter()
+                .filter(|m| m.destination == "/dev/dri")
+                .count(),
+            1
+        );
     }
 
     #[test]

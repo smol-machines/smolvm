@@ -7,7 +7,7 @@
 //! - Blob download (GET)
 //! - Manifest put/get (PUT/GET)
 
-use crate::{RegistryError, Result, MANIFEST_MEDIA_TYPE};
+use crate::{OciIndex, OciPlatform, RegistryError, Result, INDEX_MEDIA_TYPE, MANIFEST_MEDIA_TYPE};
 use reqwest::header::{ACCEPT, CONTENT_LENGTH, CONTENT_TYPE, LOCATION, WWW_AUTHENTICATE};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -350,11 +350,21 @@ impl RegistryClient {
 
     /// Upload a manifest for the given reference (tag or digest).
     pub async fn put_manifest(&self, repo: &str, reference: &str, manifest: &[u8]) -> Result<()> {
+        // Honor the document's own `mediaType` so this also PUTs an image index
+        // (the registry validates the Content-Type against the body's mediaType).
+        let media_type = serde_json::from_slice::<serde_json::Value>(manifest)
+            .ok()
+            .and_then(|v| {
+                v.get("mediaType")
+                    .and_then(|m| m.as_str())
+                    .map(String::from)
+            })
+            .unwrap_or_else(|| MANIFEST_MEDIA_TYPE.to_string());
         let url = format!("{}/v2/{}/manifests/{}", self.base_url, repo, reference);
         let resp = self
             .send_replayable(
                 self.request(reqwest::Method::PUT, &url)
-                    .header(CONTENT_TYPE, MANIFEST_MEDIA_TYPE)
+                    .header(CONTENT_TYPE, media_type)
                     .body(manifest.to_vec()),
             )
             .await?;
@@ -411,6 +421,97 @@ impl RegistryClient {
         }
 
         Ok(resp.bytes().await?.to_vec())
+    }
+
+    /// Fetch a manifest OR image index by reference, returning the raw bytes and
+    /// the document's media type. Unlike [`get_manifest`], this accepts (and does
+    /// not reject) an image index — the caller decides whether to resolve it to a
+    /// platform manifest. Used by `pull` for multi-arch fan-out.
+    pub async fn get_manifest_raw(&self, repo: &str, reference: &str) -> Result<(Vec<u8>, String)> {
+        let url = format!("{}/v2/{}/manifests/{}", self.base_url, repo, reference);
+        let resp = self
+            .send_replayable(
+                self.request(reqwest::Method::GET, &url)
+                    // Advertise BOTH so the registry hands back an index as an
+                    // index (not a server-side-selected manifest).
+                    .header(ACCEPT, format!("{INDEX_MEDIA_TYPE}, {MANIFEST_MEDIA_TYPE}")),
+            )
+            .await?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(RegistryError::BlobNotFound(format!(
+                "{}:{}",
+                repo, reference
+            )));
+        }
+        if !resp.status().is_success() {
+            return Err(RegistryError::ApiError {
+                status: resp.status().as_u16(),
+                body: resp.text().await.unwrap_or_default(),
+            });
+        }
+
+        let content_type = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        Ok((resp.bytes().await?.to_vec(), content_type))
+    }
+
+    /// Fetch the manifest at `reference`, resolving an OCI image index to THIS
+    /// machine's host-platform entry (Docker-style fan-out), and return the
+    /// single-platform manifest bytes. Shared by `pull` and `inspect` so both
+    /// resolve a multi-arch tag identically (a plain manifest passes through).
+    pub async fn get_manifest_resolved(&self, repo: &str, reference: &str) -> Result<Vec<u8>> {
+        let (doc_bytes, content_type) = self.get_manifest_raw(repo, reference).await?;
+
+        let is_index = content_type.contains(INDEX_MEDIA_TYPE)
+            || serde_json::from_slice::<serde_json::Value>(&doc_bytes)
+                .ok()
+                .map(|v| {
+                    v.get("manifests").is_some()
+                        || v.get("mediaType").and_then(|m| m.as_str()) == Some(INDEX_MEDIA_TYPE)
+                })
+                .unwrap_or(false);
+        if !is_index {
+            return Ok(doc_bytes);
+        }
+
+        let index: OciIndex = serde_json::from_slice(&doc_bytes)?;
+        // .smolmachine sidecars are cross-platform — libkrun is provided by the
+        // installed CLI, not bundled — so only the GUEST architecture matters, and
+        // the guest is always Linux. An index entry must therefore be keyed
+        // `linux/<arch>`; match it strictly. A wrong/missing `os` is bad index data
+        // and must fail loudly (the error below lists what was published) rather than
+        // be silently tolerated. The host OS is irrelevant to which sidecar to pull.
+        let arch = OciPlatform::current().architecture;
+        let entry = index
+            .manifests
+            .iter()
+            .find(|m| {
+                m.platform
+                    .as_ref()
+                    .is_some_and(|p| p.os == "linux" && p.architecture == arch)
+            })
+            .ok_or_else(|| {
+                let available: Vec<String> = index
+                    .manifests
+                    .iter()
+                    .filter_map(|m| m.platform.as_ref().map(|p| p.label()))
+                    .collect();
+                RegistryError::InvalidManifest(format!(
+                    "no linux/{arch} build available for this machine; the registry has: {}",
+                    if available.is_empty() {
+                        "(none)".into()
+                    } else {
+                        available.join(", ")
+                    }
+                ))
+            })?;
+        tracing::info!(arch = %arch, digest = %entry.digest, "selected index entry");
+        Ok(self.get_manifest_raw(repo, &entry.digest).await?.0)
     }
 
     /// Resolve a Location header value against the registry base URL.

@@ -441,6 +441,25 @@ impl MountEntry {
 /// Uses direct syscalls to avoid any overhead.
 #[cfg(target_os = "linux")]
 fn mount_essential_filesystems() {
+    // The guest root filesystem is read-only, and neither libkrun's init.c nor
+    // the kernel mounts /tmp. A writable /tmp is the idiomatic home for
+    // ephemeral runtime files (the registry-auth config, crun console sockets,
+    // the ssh-agent socket, …), so mount a tmpfs over it. Best-effort: a
+    // failure here must not abort boot, and the individual writers that target
+    // /storage still work without it. Runs unconditionally — before the
+    // init.c-already-mounted early return below — because init.c never mounts
+    // /tmp.
+    let tmp = MountEntry {
+        source: "tmpfs",
+        target: "/tmp",
+        fstype: "tmpfs",
+        flags: libc::MS_NOSUID | libc::MS_NODEV,
+        data: Some("mode=1777"),
+    };
+    if let Err(e) = tmp.mount() {
+        warn!("smolvm-agent: failed to mount tmpfs on /tmp: {}", e);
+    }
+
     // libkrun's init.c mounts /proc, /sys, /dev, /dev/pts before exec'ing
     // the agent. Skip redundant mounts if already present.
     if std::path::Path::new("/proc/uptime").exists() {
@@ -1625,13 +1644,13 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
         patch_timeout_ms(&mut request, &buf[..len]);
 
         let _span = if let Some(ref tid) = trace_id {
-            tracing::info_span!("request", trace_id = %tid, method = ?request)
+            tracing::info_span!("request", trace_id = %tid, method = %request.log_summary())
         } else {
-            tracing::info_span!("request", method = ?request)
+            tracing::info_span!("request", method = %request.log_summary())
         };
         let _guard = _span.enter();
 
-        debug!(?request, "received request");
+        debug!(method = %request.log_summary(), "received request");
 
         // Check if this is an interactive run request
         if let AgentRequest::Run {
@@ -1666,9 +1685,18 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
             ref image,
             ref oci_platform,
             ref auth,
+            ref proxy,
+            ref no_proxy,
         } = request
         {
-            handle_streaming_pull(stream, image, oci_platform.as_deref(), auth.as_ref())?;
+            handle_streaming_pull(
+                stream,
+                image,
+                oci_platform.as_deref(),
+                auth.as_ref(),
+                proxy.as_deref(),
+                no_proxy.as_deref(),
+            )?;
             continue;
         }
 
@@ -1720,7 +1748,7 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
         // already handled cleanup.
         if write_session.is_some() {
             debug!(
-                method = ?request,
+                method = %request.log_summary(),
                 "dropping in-flight FileWrite session: non-chunk request arrived"
             );
             write_session = None;
@@ -1891,8 +1919,16 @@ fn handle_request(
             timeout_ms,
             interactive: false,
             tty: false,
+            stdin_data,
             ..
-        } => handle_vm_exec(&command, &env, workdir.as_deref(), timeout_ms, client_fd),
+        } => handle_vm_exec(
+            &command,
+            &env,
+            workdir.as_deref(),
+            timeout_ms,
+            client_fd,
+            stdin_data.as_deref(),
+        ),
 
         AgentRequest::VmExec { .. } => {
             // Interactive mode should be handled by handle_interactive_vm_exec
@@ -2590,7 +2626,35 @@ fn handle_streaming_file_read(
             return Ok(());
         }
     };
-    let size = file.metadata().ok().map(|m| m.len()).unwrap_or(0);
+    // Only stream regular files. Directories and special files (e.g. /dev/zero,
+    // FIFOs) `open()` successfully but misbehave on read — a directory fails with
+    // EISDIR *after* the chunk stream has started (desyncing the wire and bricking
+    // the connection), and an unbounded device never EOFs (hangs the caller). We
+    // must reject them with a clean error BEFORE the first DataChunk frame.
+    let metadata = match file.metadata() {
+        Ok(m) => m,
+        Err(e) => {
+            send_response(
+                stream,
+                &AgentResponse::error(
+                    format!("failed to stat {}: {}", path, e),
+                    error_codes::FILE_IO_FAILED,
+                ),
+            )?;
+            return Ok(());
+        }
+    };
+    if !metadata.is_file() {
+        send_response(
+            stream,
+            &AgentResponse::error(
+                format!("not a regular file: {}", path),
+                error_codes::FILE_IO_FAILED,
+            ),
+        )?;
+        return Ok(());
+    }
+    let size = metadata.len();
     info!(path = %path, size, "streaming file read");
     send_data_chunks(
         stream,
@@ -2724,6 +2788,36 @@ fn handle_interactive_run(
     Ok(())
 }
 
+/// Resolve the command for a container run.
+///
+/// If the caller supplied a command, use it verbatim. Otherwise fall back to
+/// the image's OCI `ENTRYPOINT` + `CMD` (read from the stored image config),
+/// so an image can run its own init without the caller having to know it.
+/// Errors if no command was given and the image defines neither.
+#[cfg(target_os = "linux")]
+fn resolve_image_command(
+    image: &str,
+    command: Vec<String>,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    if !command.is_empty() {
+        return Ok(command);
+    }
+    match storage::query_image(image)? {
+        Some(info) => {
+            let mut resolved = info.entrypoint;
+            resolved.extend(info.cmd);
+            if resolved.is_empty() {
+                return Err(format!(
+                    "no command given and image '{image}' defines no entrypoint or cmd"
+                )
+                .into());
+            }
+            Ok(resolved)
+        }
+        None => Err(format!("image not found: {image}").into()),
+    }
+}
+
 /// Write an OCI bundle (`config.json`) and return a freshly generated container ID.
 ///
 /// Shared by [`handle_run_detached`] and [`spawn_interactive_command`] to avoid
@@ -2745,6 +2839,21 @@ fn write_oci_bundle(
     let workdir_str = workdir.unwrap_or("/");
     let identity = oci::resolve_process_identity(rootfs_path, user)?;
     let mut spec = oci::OciSpec::new(command, env, workdir_str, tty, &identity);
+
+    if tty {
+        // Give the PTY a non-zero starting size. The host follows up with a
+        // Resize message carrying the real terminal dimensions as soon as
+        // the interactive session starts.
+        spec.process.console_size = Some(oci::OciConsoleSize {
+            height: 24,
+            width: 80,
+        });
+    }
+
+    // Interactive and detached containers use this bundle writer instead of
+    // storage::run_command(). Mirror that path's GPU wiring so `-i`/`-t`
+    // shells see /dev/dri when the VM was started with --gpu.
+    spec.add_gpu_devices_if_available();
 
     for (tag, container_path, read_only) in mounts {
         let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
@@ -2782,7 +2891,7 @@ fn handle_run_detached(
 
     ensure_storage_mounted();
 
-    let (image, command, env, workdir, user, mounts, persistent_overlay_id) = match request {
+    let (image, mut command, env, workdir, user, mounts, persistent_overlay_id) = match request {
         AgentRequest::Run {
             image,
             command,
@@ -2810,14 +2919,9 @@ fn handle_run_detached(
         }
     };
 
-    // Validate inputs before creating any overlay state.
-    if command.is_empty() {
-        send_response(
-            stream,
-            &AgentResponse::error("empty command", error_codes::INVALID_REQUEST),
-        )?;
-        return Ok(());
-    }
+    // An empty command is allowed here: it means "run the image's own
+    // ENTRYPOINT/CMD". We resolve it from the image config below, after the
+    // image has been prepared (so its config is guaranteed present).
 
     let overlay_id = match persistent_overlay_id {
         Some(id) => id,
@@ -2847,6 +2951,23 @@ fn handle_run_detached(
             return Ok(());
         }
     };
+
+    // Resolve the command from the image's OCI ENTRYPOINT+CMD when the caller
+    // gave none — this is what lets service-style images (whose ENTRYPOINT
+    // orchestrates a supervised stack) run as their authors intended.
+    if command.is_empty() {
+        command = match resolve_image_command(&image, command) {
+            Ok(c) => c,
+            Err(e) => {
+                send_response(
+                    stream,
+                    &AgentResponse::error(e.to_string(), error_codes::INVALID_REQUEST),
+                )?;
+                return Ok(());
+            }
+        };
+        info!(image = %image, command = ?command, "resolved command from image config");
+    }
 
     if let Err(e) = storage::setup_mounts(&prepared.rootfs_path, &mounts) {
         send_response(
@@ -3068,6 +3189,13 @@ pub fn is_container_running(_container_id: &str) -> bool {
 /// Used when a main workload container is already running for this overlay —
 /// the new command joins its existing PID/mount/cgroup namespaces rather than
 /// creating an isolated new container.
+///
+/// When `tty` is true the PTY is obtained from crun via `--console-socket`,
+/// exactly like the fresh `crun run` path in [`spawn_interactive_command`].
+/// Letting crun allocate the PTY (rather than handing it a slave from an
+/// agent-owned pair) is what makes `TIOCSWINSZ` resizes reach the process
+/// inside the container; without it TUIs never redraw on host resize. See
+/// GH #156.
 #[cfg(target_os = "linux")]
 fn spawn_exec_in_container(
     container_id: &str,
@@ -3076,7 +3204,9 @@ fn spawn_exec_in_container(
     workdir: Option<&str>,
     tty: bool,
 ) -> Result<(Child, Option<pty::PtyMaster>), Box<dyn std::error::Error>> {
+    use std::io::Read as _;
     use std::os::unix::io::AsRawFd as _;
+    use std::sync::atomic::Ordering;
 
     info!(
         container_id = %container_id,
@@ -3086,6 +3216,54 @@ fn spawn_exec_in_container(
     );
 
     if tty {
+        // Preferred: console socket (resizable). Mirrors the create path.
+        if CONSOLE_SOCKET_WORKS.load(Ordering::Relaxed) {
+            let console = pty::ConsoleSocket::bind(container_id)?;
+            let mut child = crun::CrunCommand::exec_with_console(
+                container_id,
+                env,
+                command,
+                workdir,
+                console.path(),
+            )
+            .spawn()?;
+            match console.recv_master(std::time::Duration::from_secs(3)) {
+                Ok(pty_master) => {
+                    let _ = pty_master.set_window_size(80, 24);
+                    if let Some(mut err) = child.stderr.take() {
+                        std::thread::spawn(move || {
+                            let mut sink = Vec::new();
+                            let _ = err.read_to_end(&mut sink);
+                        });
+                    }
+                    return Ok((child, Some(pty_master)));
+                }
+                Err(e) => {
+                    // A transient timeout (crun slow to hand back the console)
+                    // must not permanently disable console sockets for the rest
+                    // of the VM's life — that would silently lose resize on
+                    // every later session. Only latch off when the runtime
+                    // genuinely doesn't support them (a non-timeout failure).
+                    if e.kind() != std::io::ErrorKind::TimedOut {
+                        CONSOLE_SOCKET_WORKS.store(false, Ordering::Relaxed);
+                    }
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let stderr = child
+                        .stderr
+                        .take()
+                        .map(|mut s| {
+                            let mut buf = String::new();
+                            let _ = s.read_to_string(&mut buf);
+                            buf
+                        })
+                        .unwrap_or_default();
+                    warn!(error = %e, crun_stderr = %stderr.trim(), "exec console socket unavailable; falling back to stdio PTY");
+                }
+            }
+        }
+
+        // Fallback: attach the agent's PTY slave as crun exec's stdio.
         let (pty_master, slave_fd) = pty::open_pty(80, 24)?;
         let slave_raw = slave_fd.as_raw_fd();
         // SAFETY: slave_fd is a valid open fd from openpty.
@@ -3143,12 +3321,27 @@ pub fn resolve_main_container(_persistent_overlay_id: Option<&str>) -> Option<St
     None
 }
 
+/// Whether the runtime's `--console-socket` handshake works in this environment.
+/// We attempt it once; if the runtime never hands back the console master (older
+/// crun, or a guest where it doesn't work), we flip this off and use the
+/// stdio-PTY fallback for the rest of the process's life — so only the first
+/// interactive session pays the connect timeout. The console path gives dynamic
+/// terminal resize; the fallback works everywhere but doesn't propagate resize.
+#[cfg(target_os = "linux")]
+static CONSOLE_SOCKET_WORKS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
 /// Spawn a command for interactive execution using crun OCI runtime.
 ///
-/// When `tty` is true, allocates a PTY pair and attaches the slave to crun's
-/// stdio. The OCI spec sets `terminal: true` so that crun handles the
-/// controlling terminal setup (setsid + TIOCSCTTY) inside the container.
-/// In foreground `crun run` mode, this doesn't require `--console-socket`.
+/// When `tty` is true, the OCI spec sets `terminal: true` and the agent
+/// asks crun to allocate the container's PTY via `--console-socket`.
+/// crun sends the PTY master fd back to the agent over an AF_UNIX socket
+/// using `SCM_RIGHTS`; the agent then reads, writes, and resizes that
+/// master directly. This is the only way to make `TIOCSWINSZ` reach the
+/// process inside the container. Without `--console-socket` crun
+/// allocates its own PTY that the agent has no handle on, and every
+/// resize message is silently applied to the wrong terminal. See GH
+/// #156.
 #[cfg(target_os = "linux")]
 fn spawn_interactive_command(
     rootfs: &str,
@@ -3160,8 +3353,10 @@ fn spawn_interactive_command(
     tty: bool,
     persistent_overlay_id: Option<&str>,
 ) -> Result<(Child, Option<pty::PtyMaster>), Box<dyn std::error::Error>> {
+    use std::io::Read as _;
     use std::os::unix::io::AsRawFd as _;
     use std::path::Path;
+    use std::sync::atomic::Ordering;
 
     if command.is_empty() {
         return Err("empty command".into());
@@ -3182,8 +3377,9 @@ fn spawn_interactive_command(
         return Err(format!("bundle directory not found: {}", bundle_path.display()).into());
     }
 
-    // Build the OCI bundle (config.json) and get a fresh container ID.
-    // When tty=true, the spec sets terminal:true so crun handles setsid + TIOCSCTTY.
+    // Build the OCI bundle (config.json) and get a fresh container ID. When
+    // tty=true the spec sets terminal:true and a starting consoleSize, and the
+    // PTY master is obtained from crun via --console-socket below.
     let container_id = write_oci_bundle(
         rootfs_path,
         &bundle_path,
@@ -3216,12 +3412,57 @@ fn spawn_interactive_command(
     );
 
     if tty {
-        // Allocate a PTY pair — slave goes to crun's stdio, master returned to caller.
-        // With terminal:true in the OCI spec, crun sets up the controlling terminal
-        // for the container process.
+        // Preferred path: take the container's console over a socket so the
+        // master we hold is the process's real tty (resize works).
+        if CONSOLE_SOCKET_WORKS.load(Ordering::Relaxed) {
+            let console = pty::ConsoleSocket::bind(&container_id)?;
+            let mut child =
+                crun::CrunCommand::run_with_console(&bundle_path, &container_id, console.path())
+                    .spawn()?;
+            match console.recv_master(std::time::Duration::from_secs(3)) {
+                Ok(pty_master) => {
+                    let _ = pty_master.set_window_size(80, 24);
+                    // Drain crun's stderr so a chatty runtime can't fill the pipe.
+                    if let Some(mut err) = child.stderr.take() {
+                        std::thread::spawn(move || {
+                            let mut sink = Vec::new();
+                            let _ = err.read_to_end(&mut sink);
+                        });
+                    }
+                    return Ok((child, Some(pty_master)));
+                }
+                Err(e) => {
+                    // A transient timeout (crun slow to hand back the console)
+                    // must not permanently disable console sockets for the rest
+                    // of the VM's life — that would silently lose resize on
+                    // every later session. Only latch off when the runtime
+                    // genuinely doesn't support them (a non-timeout failure).
+                    if e.kind() != std::io::ErrorKind::TimedOut {
+                        CONSOLE_SOCKET_WORKS.store(false, Ordering::Relaxed);
+                    }
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let stderr = child
+                        .stderr
+                        .take()
+                        .map(|mut s| {
+                            let mut buf = String::new();
+                            let _ = s.read_to_string(&mut buf);
+                            buf
+                        })
+                        .unwrap_or_default();
+                    warn!(error = %e, crun_stderr = %stderr.trim(), "console socket unavailable; falling back to stdio PTY (resize will not propagate)");
+                    // The failed `crun run --console-socket` may have registered
+                    // container state under this id; clear it so the fallback
+                    // `crun run` with the same id doesn't hit "already exists".
+                    let _ = crun::CrunCommand::delete(&container_id, true).output();
+                }
+            }
+        }
+
+        // Fallback: attach the agent's PTY slave as crun's stdio.
         let (pty_master, slave_fd) = pty::open_pty(80, 24)?;
         let slave_raw = slave_fd.as_raw_fd();
-
         // SAFETY: slave_fd is a valid open fd from openpty.
         let child = unsafe {
             crun::CrunCommand::run(&bundle_path, &container_id)
@@ -3230,10 +3471,7 @@ fn spawn_interactive_command(
                 .stderr_from_fd(libc::dup(slave_raw))
                 .spawn()?
         };
-
-        // Close slave in parent — crun has its own copies.
         drop(slave_fd);
-
         Ok((child, Some(pty_master)))
     } else {
         let child = crun::CrunCommand::run(&bundle_path, &container_id)
@@ -3357,7 +3595,7 @@ fn run_interactive_loop(
                 &mut stdout_buf,
                 &mut stderr_buf,
             )?;
-            return Ok(status.code().unwrap_or(-1));
+            return Ok(process::exit_code_from_status(&status));
         }
 
         // Check timeout
@@ -3572,7 +3810,7 @@ fn run_interactive_loop_pty(
                     Err(_) => break,
                 }
             }
-            return Ok(status.code().unwrap_or(-1));
+            return Ok(process::exit_code_from_status(&status));
         }
 
         // Check timeout.
@@ -3664,7 +3902,7 @@ fn run_interactive_loop_pty(
         // If the slave closed, the process is exiting — reap it now.
         if slave_closed {
             let status = child.wait()?;
-            return Ok(status.code().unwrap_or(-1));
+            return Ok(process::exit_code_from_status(&status));
         }
 
         // Read incoming request from host — only when poll confirms data
@@ -3693,11 +3931,21 @@ fn run_interactive_loop_pty(
                         // Host stdin reached EOF. A PTY cannot have one
                         // direction closed, so signal end-of-input to the
                         // child by writing the EOF control character (VEOF,
-                        // Ctrl-D / 0x04). In canonical mode this makes the
-                        // child's next read on the slave return 0. Without
-                        // it, a stdin-reading child (cat, sh, read) never
-                        // terminates and the exec session hangs.
-                        let _ = pty_master.write_all(&[0x04]);
+                        // Ctrl-D / 0x04). In canonical mode VEOF makes the
+                        // pending line available to the child's read()
+                        // immediately; a read() that finds an empty line
+                        // buffer returns 0, which is the EOF the child waits
+                        // for. Without it a stdin-reading child (cat, sh,
+                        // read) never terminates and the exec session hangs.
+                        //
+                        // Send it twice: if the host's final stdin chunk was
+                        // not newline-terminated, the first VEOF only flushes
+                        // that partial line (delivered as data, not EOF), so a
+                        // second VEOF — now at an empty line buffer — is what
+                        // produces the zero-length read. When the buffer is
+                        // already empty the first VEOF yields EOF and the
+                        // second is harmlessly consumed after the child exits.
+                        let _ = pty_master.write_all(&[0x04, 0x04]);
                     } else {
                         let _ = pty_master.write_all(&data);
                     }
@@ -4065,6 +4313,27 @@ fn handle_run_background(
     }
 }
 
+/// Non-streaming exec/run returns the whole output in a single wire frame. If it
+/// would exceed the frame budget, return a clear error instead of attempting an
+/// oversized frame — which otherwise fails mid-send and surfaces to the caller as
+/// a confusing connection drop / SIGPIPE-truncated result. Large output should
+/// use streaming exec (`exec_stream`/`execStream`). The budget leaves headroom
+/// under MAX_FRAME_SIZE for base64 of the byte fields (~4/3) plus the JSON envelope.
+fn oversized_output_error(stdout: &[u8], stderr: &[u8]) -> Option<AgentResponse> {
+    const BUDGET: usize = 20 * 1024 * 1024; // ~20 MiB raw → ~27 MiB base64, under the 32 MiB frame
+    let total = stdout.len() + stderr.len();
+    if total > BUDGET {
+        return Some(AgentResponse::error(
+            format!(
+                "command output too large ({total} bytes; limit {BUDGET}). \
+                 Use streaming exec (exec_stream / execStream) for large output."
+            ),
+            error_codes::EXEC_FAILED,
+        ));
+    }
+    None
+}
+
 fn handle_run(
     image: &str,
     command: &[String],
@@ -4089,11 +4358,13 @@ fn handle_run(
         persistent_overlay_id,
         client_fd,
     ) {
-        Ok(result) => AgentResponse::Completed {
-            exit_code: result.exit_code,
-            stdout: result.stdout,
-            stderr: result.stderr,
-        },
+        Ok(result) => oversized_output_error(&result.stdout, &result.stderr).unwrap_or(
+            AgentResponse::Completed {
+                exit_code: result.exit_code,
+                stdout: result.stdout,
+                stderr: result.stderr,
+            },
+        ),
         Err(e) => AgentResponse::from_err(e, error_codes::RUN_FAILED),
     }
 }
@@ -4104,12 +4375,15 @@ fn handle_streaming_pull<S: Read + Write>(
     image: &str,
     oci_platform: Option<&str>,
     auth: Option<&RegistryAuth>,
+    proxy: Option<&str>,
+    no_proxy: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     ensure_storage_mounted();
     info!(
         image = %image,
         ?oci_platform,
         has_auth = auth.is_some(),
+        has_proxy = proxy.is_some(),
         "pulling image with progress"
     );
 
@@ -4130,7 +4404,14 @@ fn handle_streaming_pull<S: Read + Write>(
     };
 
     let response = AgentResponse::from_result(
-        storage::pull_image_with_progress_and_auth(image, oci_platform, auth, progress_callback),
+        storage::pull_image_with_progress_and_auth(
+            image,
+            oci_platform,
+            auth,
+            proxy,
+            no_proxy,
+            progress_callback,
+        ),
         error_codes::PULL_FAILED,
     );
 
@@ -4386,6 +4667,7 @@ fn handle_vm_exec(
     workdir: Option<&str>,
     timeout_ms: Option<u64>,
     client_fd: Option<std::os::unix::io::RawFd>,
+    stdin_data: Option<&str>,
 ) -> AgentResponse {
     info!(command = ?command, "executing directly in VM");
 
@@ -4406,10 +4688,13 @@ fn handle_vm_exec(
         cmd.current_dir(wd);
     }
 
-    // Commands that don't receive interactive stdin should get EOF
-    // immediately, not block on /dev/console (the agent's inherited stdin).
-    // Without this, `exec -- cat` hangs until the connection times out.
-    cmd.stdin(Stdio::null());
+    // If stdin data is provided, pipe it to the command.
+    // Otherwise, give the command immediate EOF via /dev/null.
+    if stdin_data.is_some() {
+        cmd.stdin(Stdio::piped());
+    } else {
+        cmd.stdin(Stdio::null());
+    }
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
@@ -4456,8 +4741,11 @@ fn handle_vm_exec(
         std::thread::Builder::new()
             .name("exec-stdout".into())
             .spawn(move || {
+                // Read ONE byte past the cap so the handler can tell "exactly at
+                // cap" from "overflowed" and return a clear error instead of a
+                // silently truncated result (+ a SIGPIPE exit on the child).
                 let mut buf = Vec::new();
-                let _ = out.take(MAX_OUTPUT as u64).read_to_end(&mut buf);
+                let _ = out.take(MAX_OUTPUT as u64 + 1).read_to_end(&mut buf);
                 buf
             })
     });
@@ -4467,9 +4755,25 @@ fn handle_vm_exec(
             .name("exec-stderr".into())
             .spawn(move || {
                 let mut buf = Vec::new();
-                let _ = err.take(MAX_OUTPUT as u64).read_to_end(&mut buf);
+                let _ = err.take(MAX_OUTPUT as u64 + 1).read_to_end(&mut buf);
                 buf
             })
+    });
+
+    // Write stdin on a separate thread after stdout/stderr drains are live.
+    // This keeps the timeout/disconnect loop below active even when the child
+    // never reads stdin and the pipe buffer fills.
+    let stdin_handle = stdin_data.and_then(|data| {
+        child.stdin.take().map(|mut child_stdin| {
+            let data = data.to_owned();
+            std::thread::Builder::new()
+                .name("exec-stdin".into())
+                .spawn(move || {
+                    use std::io::Write;
+                    child_stdin.write_all(data.as_bytes())
+                    // child_stdin is dropped here, closing the pipe → child sees EOF.
+                })
+        })
     });
 
     // Wait for exit with timeout
@@ -4478,7 +4782,7 @@ fn handle_vm_exec(
 
     let exit_code = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break status.code().unwrap_or(-1),
+            Ok(Some(status)) => break process::exit_code_from_status(&status),
             Ok(None) => {
                 // Client disconnected — kill the orphan child so the accept
                 // loop isn't blocked waiting for it. Fixes BUG-12/20: SIGTERM
@@ -4536,6 +4840,31 @@ fn handle_vm_exec(
         .and_then(|h| h.join().ok())
         .unwrap_or_default();
 
+    if let Some(Ok(handle)) = stdin_handle {
+        if handle.is_finished() {
+            match handle.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+                Ok(Err(e)) => debug!(error = %e, "stdin writer finished with error"),
+                Err(_) => debug!("stdin writer thread panicked"),
+            }
+        } else {
+            debug!("stdin writer still blocked after command exit; detaching");
+        }
+    }
+
+    // If either stream exceeded the cap (we read one byte past it), the output
+    // was truncated and the child likely took a SIGPIPE — return a clear error
+    // instead of a silently-truncated success. Large output should stream.
+    if stdout.len() > MAX_OUTPUT || stderr.len() > MAX_OUTPUT {
+        return AgentResponse::error(
+            format!(
+                "command output exceeded {MAX_OUTPUT} bytes and was truncated. \
+                 Use streaming exec (exec_stream / execStream) for large output."
+            ),
+            error_codes::EXEC_FAILED,
+        );
+    }
     AgentResponse::Completed {
         exit_code,
         stdout,
@@ -4805,6 +5134,31 @@ mod bg_reap_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn vm_exec_timeout_is_not_blocked_by_unread_stdin() {
+        let stdin_data = "x".repeat(8 * 1024 * 1024);
+        let start = std::time::Instant::now();
+
+        let response = handle_vm_exec(
+            &["sleep".to_string(), "5".to_string()],
+            &[],
+            None,
+            Some(100),
+            None,
+            Some(&stdin_data),
+        );
+
+        let AgentResponse::Completed { exit_code, .. } = response else {
+            panic!("expected completed response");
+        };
+        assert_eq!(exit_code, 124);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "blocked stdin must not prevent timeout handling"
+        );
+    }
 
     // ========================================================================
     // Streaming file-upload session tests

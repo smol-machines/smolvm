@@ -400,6 +400,109 @@ pub fn is_extracted(cache_dir: &Path) -> bool {
     cache_dir.join(EXTRACTION_MARKER).exists()
 }
 
+/// Maximum total size of the pack extraction cache before LRU eviction kicks in.
+/// Override with `SMOLVM_PACK_CACHE_MAX_BYTES` (in bytes); default 5 GiB.
+pub fn pack_cache_max_bytes() -> u64 {
+    const DEFAULT: u64 = 5 * 1024 * 1024 * 1024;
+    std::env::var("SMOLVM_PACK_CACHE_MAX_BYTES")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT)
+}
+
+/// Real (sparse-aware) disk usage of a single file. Extraction dirs contain
+/// large *sparse* overlay disks (e.g. a 10 GiB disk holding ~50 MB), so we must
+/// count allocated blocks, not the apparent length — otherwise the cap would
+/// over-count by orders of magnitude and evict far too aggressively.
+#[cfg(unix)]
+fn file_disk_usage(meta: &fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    meta.blocks().saturating_mul(512)
+}
+#[cfg(not(unix))]
+fn file_disk_usage(meta: &fs::Metadata) -> u64 {
+    meta.len()
+}
+
+/// Recursive real disk usage of a directory tree (best-effort; unreadable
+/// entries count as zero). Does not follow symlinks.
+fn dir_disk_usage(path: &Path) -> u64 {
+    let mut total = 0u64;
+    let entries = match fs::read_dir(path) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    for entry in entries.flatten() {
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if meta.is_dir() {
+            total = total.saturating_add(dir_disk_usage(&entry.path()));
+        } else if meta.is_file() {
+            total = total.saturating_add(file_disk_usage(&meta));
+        }
+    }
+    total
+}
+
+/// Evict least-recently-modified extraction directories under `cache_root` until
+/// the cache's total real disk usage is at or below `max_bytes`. Skips
+/// directories with active leases (a running pack/VM) — they are never evicted,
+/// even if that leaves the cache over the cap. Best-effort: per-entry errors are
+/// skipped. Returns the number of bytes freed.
+///
+/// This is what bounds the otherwise-unbounded extraction cache; it runs
+/// automatically after a new (cache-miss) extraction, and keeps the newest
+/// entries (including the one just written) by evicting oldest-first.
+pub fn evict_cache_to_size(cache_root: &Path, max_bytes: u64) -> u64 {
+    let mut entries: Vec<(PathBuf, std::time::SystemTime, u64)> = Vec::new();
+    let read_dir = match fs::read_dir(cache_root) {
+        Ok(rd) => rd,
+        Err(_) => return 0,
+    };
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        let meta = match fs::metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !meta.is_dir() {
+            continue; // skip *.lock files and other non-extraction entries
+        }
+        let modified = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        entries.push((path, modified, dir_disk_usage(&entry.path())));
+    }
+
+    let total: u64 = entries.iter().map(|(_, _, s)| *s).sum();
+    if total <= max_bytes {
+        return 0;
+    }
+
+    // Oldest first — evict least-recently-used.
+    entries.sort_by_key(|(_, modified, _)| *modified);
+
+    let mut over = total - max_bytes;
+    let mut freed = 0u64;
+    for (path, _, size) in entries {
+        if over == 0 {
+            break;
+        }
+        if has_active_leases(&path) {
+            continue; // never evict a running pack/VM
+        }
+        force_detach_layers_volume(&path);
+        if fs::remove_dir_all(&path).is_ok() {
+            // Also drop the adjacent <checksum>.lock file, if any.
+            let _ = fs::remove_file(path.with_extension("lock"));
+            freed = freed.saturating_add(size);
+            over = over.saturating_sub(size);
+        }
+    }
+    freed
+}
+
 /// Check if footer indicates sidecar mode.
 fn is_sidecar_mode(footer: &PackFooter) -> bool {
     footer.assets_offset == 0
@@ -485,6 +588,19 @@ pub fn extract_sidecar(
     // directory so the next attempt starts fresh.
     if result.is_err() && cache_dir.exists() && !is_extracted(cache_dir) {
         let _ = fs::remove_dir_all(cache_dir);
+    }
+
+    // After a successful new extraction (cache miss — the early-return above
+    // handles cache hits), cap the cache so old, unused extractions don't grow
+    // without bound. LRU + lease-aware: keeps the newest (incl. what we just
+    // wrote) and never evicts a running pack.
+    if result.is_ok() {
+        if let Some(root) = cache_dir.parent() {
+            let freed = evict_cache_to_size(root, pack_cache_max_bytes());
+            if freed > 0 && debug {
+                eprintln!("debug: pack cache evicted {freed} bytes to stay under cap");
+            }
+        }
     }
 
     result
@@ -2243,5 +2359,61 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(dest.join("after.txt")).unwrap(), "after");
         assert!(!dest.join("unknown-type-entry").exists());
+    }
+
+    #[test]
+    fn test_evict_cache_to_size_lru() {
+        use std::ffi::CString;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mk = |name: &str, mtime_secs: i64| {
+            let d = root.join(name);
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("data"), vec![0u8; 1024 * 1024]).unwrap(); // ~1 MiB real
+            let c = CString::new(d.to_string_lossy().as_bytes()).unwrap();
+            let tv = libc::timeval {
+                tv_sec: mtime_secs,
+                tv_usec: 0,
+            };
+            let times = [tv, tv];
+            unsafe {
+                libc::utimes(c.as_ptr(), times.as_ptr());
+            }
+            d
+        };
+        let old = mk("aaaa", 1_000_000);
+        let mid = mk("bbbb", 2_000_000);
+        let new = mk("cccc", 3_000_000);
+
+        // Total (~3 MiB) is under the cap → nothing evicted.
+        assert_eq!(evict_cache_to_size(root, 100 * 1024 * 1024), 0);
+        assert!(old.exists() && mid.exists() && new.exists());
+
+        // Cap (~2.5 MiB) forces evicting the single oldest entry, LRU-first.
+        let freed = evict_cache_to_size(root, 5 * 1024 * 1024 / 2);
+        assert!(freed > 0, "expected some bytes freed");
+        assert!(!old.exists(), "oldest extraction should be evicted");
+        assert!(mid.exists() && new.exists(), "newer extractions kept");
+    }
+
+    // Lease tracking is a macOS case-sensitive-volume concept; on Linux
+    // `has_active_leases` is always false (layers live at cache_dir/layers).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_evict_cache_skips_active_lease() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let d = root.join("aaaa");
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("data"), vec![0u8; 2 * 1024 * 1024]).unwrap();
+        // Simulate a running pack: a live daemon lease file (current PID).
+        let leases = d.join(LEASES_DIR);
+        fs::create_dir_all(&leases).unwrap();
+        fs::write(leases.join("daemon"), format!("{}", std::process::id())).unwrap();
+        assert!(has_active_leases(&d), "live lease should be detected");
+        // Cap of 0 would evict everything — but the active lease must be spared.
+        let freed = evict_cache_to_size(root, 0);
+        assert_eq!(freed, 0, "leased extraction must not be evicted");
+        assert!(d.exists());
     }
 }

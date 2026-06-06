@@ -95,6 +95,20 @@
 //! | `port` | int | Service listen port inside the VM |
 //! | `protocol` | string | `"http"` or `"tcp"` |
 //!
+//! ### `[secrets]` — Secret injection
+//!
+//! Maps an environment variable name to a *reference*, never an inline value.
+//! Each ref names exactly one source. The plaintext is resolved on the host
+//! at exec time and is never written to the VM record, the database, or a
+//! packed `.smolmachine` — only the reference travels. smolvm stores no
+//! secret material itself; bring your own manager (Vault, 1Password, your
+//! shell) and render it into an env var or file for the ref to point at.
+//!
+//! | Source | Type | Description |
+//! |--------|------|-------------|
+//! | `from_env` | string | Host environment variable to read at exec time |
+//! | `from_file` | string | Absolute host file path to read at exec time |
+//!
 //! # Command Model
 //!
 //! Follows Docker/OCI semantics:
@@ -143,6 +157,10 @@
 //!
 //! [auth]
 //! ssh_agent = true
+//!
+//! [secrets]
+//! DB_PASSWORD = { from_env = "PGPASSWORD" }
+//! TLS_KEY = { from_file = "/run/secrets/tls.key" }
 //! ```
 
 use serde::Deserialize;
@@ -198,6 +216,12 @@ pub struct Smolfile {
     /// Environment variables as `KEY=VALUE` strings.
     #[serde(default)]
     pub env: Vec<String>,
+    /// Secrets injected as environment variables at workload launch. Each
+    /// entry maps an env var name to a reference (a host store entry, host
+    /// env var, or file) — never an inline value. The plaintext is resolved
+    /// on the host at exec time and never written to the VM record or DB.
+    #[serde(default)]
+    pub secrets: std::collections::BTreeMap<String, smolvm_protocol::SecretRef>,
     /// Working directory inside the VM.
     pub workdir: Option<String>,
 
@@ -398,6 +422,47 @@ mod tests {
         let sf: Smolfile = parse("").unwrap();
         assert_eq!(sf.image, None);
         assert_eq!(sf.cpus, None);
+    }
+
+    #[test]
+    fn parse_secrets_section() {
+        // The [secrets] section deserializes into SecretRef references for both
+        // source kinds. Refs carry no inline value.
+        let sf = parse(
+            r#"
+image = "alpine:latest"
+
+[secrets]
+FROM_ENV   = { from_env = "HOST_VAR" }
+FROM_FILE  = { from_file = "/etc/secret" }
+"#,
+        )
+        .unwrap();
+        assert_eq!(sf.secrets.len(), 2);
+        assert_eq!(sf.secrets["FROM_ENV"].from_env.as_deref(), Some("HOST_VAR"));
+        assert_eq!(
+            sf.secrets["FROM_FILE"]
+                .from_file
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+            Some("/etc/secret".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_rejects_unknown_secret_field() {
+        // deny_unknown_fields on SecretRef makes a typo (`from_stor`) a hard
+        // parse error instead of a silently-ignored empty ref.
+        let res = parse(
+            r#"
+[secrets]
+X = { from_stor = "typo" }
+"#,
+        );
+        assert!(
+            res.is_err(),
+            "expected parse error for unknown secret field"
+        );
     }
 
     #[test]

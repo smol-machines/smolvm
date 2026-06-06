@@ -148,6 +148,9 @@ pub struct PackCreateCmd {
     /// the slp/mesa-libkrun-vulkan COPR, or standard Mesa on Linux hosts).
     #[arg(long)]
     pub gpu: bool,
+
+    #[command(flatten, next_help_heading = "Network")]
+    pub proxy_opts: crate::cli::proxy_opts::ProxyOpts,
 }
 
 impl PackCreateCmd {
@@ -280,6 +283,8 @@ impl PackCreateCmd {
             &mut client,
             &image,
             pack_config.oci_platform.as_deref(),
+            self.proxy_opts.proxy(),
+            self.proxy_opts.no_proxy(),
         )?;
         debug!(image_info = ?image_info, "image pulled");
 
@@ -358,6 +363,7 @@ impl PackCreateCmd {
                 vec![],
                 None,
                 None,
+                None,
             )?;
 
             // stdout/stderr from vm_exec are now Vec<u8>; convert lossily
@@ -432,6 +438,10 @@ impl PackCreateCmd {
                 manifest.env.push(e.clone());
             }
         }
+
+        // Carry Smolfile [secrets] refs into the manifest. Refs only — the
+        // plaintext is resolved on the run host at exec time, never packed.
+        manifest.secret_refs = pack_config.secret_refs.clone();
 
         // Smolfile workdir overrides image workdir
         if pack_config.workdir.is_some() {
@@ -559,6 +569,7 @@ impl PackCreateCmd {
                     vec![],
                     None,
                     None,
+                    None,
                 )?;
                 if exit_code != 0 {
                     return Err(Error::agent(
@@ -573,7 +584,13 @@ impl PackCreateCmd {
 
                 // Pull the same image (layers are cached on the source storage,
                 // but the agent needs the manifest to know the layer list).
-                let image_info = crate::cli::pull_with_progress(&mut client, &image, None)?;
+                let image_info = crate::cli::pull_with_progress(
+                    &mut client,
+                    &image,
+                    None,
+                    self.proxy_opts.proxy(),
+                    self.proxy_opts.no_proxy(),
+                )?;
 
                 // Export base image layers
                 println!("Exporting {} layers...", image_info.layer_count);
@@ -623,6 +640,7 @@ impl PackCreateCmd {
                         ),
                     ],
                     vec![],
+                    None,
                     None,
                     None,
                 )?;
@@ -719,6 +737,12 @@ impl PackCreateCmd {
                 manifest.env.push(e.clone());
             }
         }
+
+        // Baseline secret refs from the source VM record, then layer the
+        // Smolfile [secrets] on top (Smolfile wins on key collisions). Refs
+        // only — plaintext is resolved on the run host, never packed.
+        manifest.secret_refs = vm.secret_refs.clone();
+        manifest.secret_refs.extend(pack_config.secret_refs.clone());
 
         // Smolfile workdir overrides VmRecord workdir
         if pack_config.workdir.is_some() {
@@ -845,15 +869,28 @@ impl PackCreateCmd {
             return Ok(dir.clone());
         }
 
-        // Best option: use the exact libkrun that this process has loaded.
-        // This guarantees the packed binary gets a library with all required symbols,
-        // avoiding mismatches when multiple libkrun versions are installed.
+        // Use the same canonical resolver as the launcher and embedded runtime so
+        // `pack create` finds libkrun anywhere the rest of smolvm does: it honors
+        // the explicit `$SMOLVM_LIB_DIR` override (e.g. a distro libkrun, or a
+        // non-standard install dir) and the installed/exe-relative `lib/` layout.
+        // Without this, packing a build whose libs live outside the hardcoded
+        // candidates below required `--lib-dir`, even though the env var was set.
+        if let Some(dir) = smolvm::agent::find_lib_dir() {
+            debug!(lib_dir = %dir.display(), "found library directory via canonical resolver");
+            return Ok(dir);
+        }
+
+        // Next best: use the exact libkrun that this process has loaded, which
+        // guarantees the packed binary gets a library with all required symbols.
+        // (Rarely fires for `pack create`: the builder VM boots in a subprocess,
+        // so the packer process itself never dlopens libkrun.)
         if let Some(dir) = Self::find_loaded_libkrun_dir() {
             debug!(lib_dir = %dir.display(), "using libkrun from running process");
             return Ok(dir);
         }
 
-        // Fallback: check common locations
+        // Fallback: a few well-known locations the canonical resolver does not
+        // check (Homebrew, /usr/local/lib, and the current working directory).
         let platform_lib = format!("lib/linux-{}", std::env::consts::ARCH);
         let candidates = [
             // Relative to executable
@@ -892,7 +929,7 @@ impl PackCreateCmd {
 
         Err(Error::agent(
             "find libkrun",
-            "could not find libkrun library. Use --lib-dir to specify the location.",
+            "could not find libkrun library. Set SMOLVM_LIB_DIR or pass --lib-dir to specify the location.",
         ))
     }
 
@@ -1453,9 +1490,11 @@ async fn run_inspect(
     tag_or_digest: &str,
     json_output: bool,
 ) -> smolvm::Result<()> {
-    // Fetch OCI manifest (~200 bytes).
+    // Fetch the OCI manifest (~200 bytes), resolving a multi-platform index to
+    // this machine's host-platform entry — same as `pull`, so inspect agrees with
+    // what pull would actually download instead of rejecting multi-arch tags.
     let manifest_bytes = client
-        .get_manifest(repo, tag_or_digest)
+        .get_manifest_resolved(repo, tag_or_digest)
         .await
         .map_err(|e| Error::agent("fetch manifest", e.to_string()))?;
 

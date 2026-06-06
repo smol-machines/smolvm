@@ -36,6 +36,11 @@ fn ensure_path_in_env(env: &[(String, String)]) -> Vec<(String, String)> {
 /// and other common options.
 pub struct CrunCommand {
     cmd: Command,
+    /// Trailing positional arguments (e.g. the container id for `crun run`, or
+    /// the container id followed by the command for `crun exec`). Appended at
+    /// the very end in `spawn`/`output`/`status` so options added later (e.g.
+    /// `--console-socket` via `console_socket()`) still land before them.
+    pending_positionals: Vec<String>,
 }
 
 impl CrunCommand {
@@ -48,7 +53,10 @@ impl CrunCommand {
         let mut cmd = Command::new(paths::CRUN_PATH);
         cmd.args(["--root", paths::CRUN_ROOT_DIR]);
         cmd.args(["--cgroup-manager", paths::CRUN_CGROUP_MANAGER]);
-        Self { cmd }
+        Self {
+            cmd,
+            pending_positionals: Vec::new(),
+        }
     }
 
     /// Create a container: `crun create --bundle <path> <id>`
@@ -70,17 +78,69 @@ impl CrunCommand {
         c
     }
 
-    /// Run a container: `crun run --bundle <path> <id>`
+    /// Run a container: `crun run [options] --bundle <path> <id>`
     ///
-    /// This creates, starts, waits, and deletes the container in one operation.
+    /// Creates, starts, waits, and deletes the container in one operation.
+    /// The container id is deferred so later builder calls (e.g.
+    /// `console_socket`) can still insert options before the positional.
     pub fn run(bundle_dir: &Path, container_id: &str) -> Self {
+        let mut c = Self::new();
+        c.cmd
+            .args(["run", "--bundle", &bundle_dir.to_string_lossy()]);
+        c.pending_positionals = vec![container_id.to_string()];
+        c
+    }
+
+    /// Run a container with its console handed back over a socket:
+    /// `crun run --bundle <path> --console-socket <sock> <id>`.
+    ///
+    /// crun creates the container's PTY and sends its master fd to `console_socket`
+    /// (via SCM_RIGHTS), instead of relaying through crun's own stdio. This is the
+    /// only way the agent can own the real console — and therefore drive window
+    /// size / resize, which crun does not propagate in stdio-relay mode. crun's own
+    /// stdio is unused, so it's nulled.
+    pub fn run_with_console(bundle_dir: &Path, container_id: &str, console_socket: &Path) -> Self {
         let mut c = Self::new();
         c.cmd.args([
             "run",
             "--bundle",
             &bundle_dir.to_string_lossy(),
+            "--console-socket",
+            &console_socket.to_string_lossy(),
             container_id,
         ]);
+        c.cmd.stdin(Stdio::null());
+        c.cmd.stdout(Stdio::null());
+        // Pipe stderr so the caller can surface crun's reason if the console
+        // handshake fails (and it falls back to a stdio PTY).
+        c.cmd.stderr(Stdio::piped());
+        c
+    }
+
+    /// `crun exec --tty --console-socket <sock> [--env ...] [--cwd <wd>] <id> <cmd...>`.
+    /// The TTY counterpart to [`Self::exec`] that takes the console over a socket
+    /// so the agent owns the real PTY master (for resize). crun's stdio is nulled.
+    pub fn exec_with_console(
+        container_id: &str,
+        env: &[(String, String)],
+        command: &[String],
+        workdir: Option<&str>,
+        console_socket: &Path,
+    ) -> Self {
+        let mut c = Self::new();
+        c.cmd.arg("exec").arg("--tty");
+        c.cmd.arg("--console-socket").arg(console_socket);
+        let env_with_path = ensure_path_in_env(env);
+        for (key, value) in &env_with_path {
+            c.cmd.arg("--env").arg(format!("{}={}", key, value));
+        }
+        if let Some(wd) = workdir {
+            c.cmd.args(["--cwd", wd]);
+        }
+        c.cmd.arg(container_id).args(command);
+        c.cmd.stdin(Stdio::null());
+        c.cmd.stdout(Stdio::null());
+        c.cmd.stderr(Stdio::piped());
         c
     }
 
@@ -115,6 +175,10 @@ impl CrunCommand {
     /// Supports optional working directory and TTY allocation.
     /// Automatically ensures PATH is set if not provided, because crun doesn't
     /// search PATH for executables when `--env` is used.
+    ///
+    /// The container id and command are deferred (see `pending_positionals`) so
+    /// later builder calls — notably `console_socket()` for the interactive TTY
+    /// path — still insert their options before the positional arguments.
     pub fn exec(
         container_id: &str,
         env: &[(String, String)],
@@ -135,7 +199,9 @@ impl CrunCommand {
         if let Some(wd) = workdir {
             c.cmd.args(["--cwd", wd]);
         }
-        c.cmd.arg(container_id).args(command);
+        c.pending_positionals = std::iter::once(container_id.to_string())
+            .chain(command.iter().cloned())
+            .collect();
         c
     }
 
@@ -243,18 +309,30 @@ impl CrunCommand {
         self
     }
 
+    /// Append any deferred positional arguments right before the command is
+    /// launched, so options added by the caller (e.g. `--console-socket`) land
+    /// before them.
+    fn apply_pending(&mut self) {
+        for arg in std::mem::take(&mut self.pending_positionals) {
+            self.cmd.arg(arg);
+        }
+    }
+
     /// Spawn the command.
     pub fn spawn(mut self) -> std::io::Result<std::process::Child> {
+        self.apply_pending();
         self.cmd.spawn()
     }
 
     /// Run and wait for output.
     pub fn output(mut self) -> std::io::Result<std::process::Output> {
+        self.apply_pending();
         self.cmd.output()
     }
 
     /// Run and wait for status.
     pub fn status(mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.apply_pending();
         self.cmd.status()
     }
 }

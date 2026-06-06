@@ -207,7 +207,7 @@ get_download_url() {
 # Get checksum URL for a version and platform
 get_checksum_url() {
     local version="$1"
-    echo "https://github.com/${GITHUB_REPO}/releases/download/v${version}/checksums.txt"
+    echo "https://github.com/${GITHUB_REPO}/releases/download/v${version}/checksums.sha256"
 }
 
 # Verify file checksum
@@ -263,7 +263,7 @@ install_smolvm() {
     local archive_name
     archive_name=$(basename "$url")
     local archive="${tmp_dir}/${archive_name}"
-    local checksums="${tmp_dir}/checksums.txt"
+    local checksums="${tmp_dir}/checksums.sha256"
 
     # Download archive
     download "$url" "$archive" || {
@@ -350,6 +350,12 @@ install_smolvm() {
     if [[ -f "$prefix/smolvm-bin" ]]; then
         rm -f "$prefix/smolvm-bin"
     fi
+    if [[ -f "$prefix/smol" ]]; then
+        rm -f "$prefix/smol"
+    fi
+    if [[ -f "$prefix/smol-bin" ]]; then
+        rm -f "$prefix/smol-bin"
+    fi
     if [[ -f "$prefix/smolvm-stub" ]]; then
         rm -f "$prefix/smolvm-stub"
     fi
@@ -366,6 +372,17 @@ install_smolvm() {
     cp "$extracted_dir/smolvm-bin" "$prefix/"
     chmod +x "$prefix/smolvm"
     chmod +x "$prefix/smolvm-bin"
+
+    # Copy the unified `smol` CLI if the distribution includes it. Older
+    # engine-only tarballs won't have it; newer ones ship both.
+    local has_smol=false
+    if [[ -f "$extracted_dir/smol" ]] && [[ -f "$extracted_dir/smol-bin" ]]; then
+        cp "$extracted_dir/smol" "$prefix/"
+        cp "$extracted_dir/smol-bin" "$prefix/"
+        chmod +x "$prefix/smol"
+        chmod +x "$prefix/smol-bin"
+        has_smol=true
+    fi
 
     # Copy disk templates if present
     if [[ -f "$extracted_dir/storage-template.ext4" ]]; then
@@ -406,11 +423,37 @@ install_smolvm() {
     # Cleanup
     rm -rf "$tmp_dir"
 
-    # Create symlink in bin directory
+    # macOS: files downloaded via curl carry a com.apple.quarantine attribute,
+    # and Gatekeeper will refuse to run the binaries (which call the hypervisor)
+    # until it's cleared. Strip it from the whole install tree, then check the
+    # code signature so we can warn clearly instead of failing cryptically.
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        if command -v xattr &> /dev/null; then
+            xattr -dr com.apple.quarantine "$prefix" 2>/dev/null || true
+        fi
+        if command -v codesign &> /dev/null; then
+            local _sig_bin="$prefix/smolvm-bin"
+            [[ "$has_smol" == true ]] && _sig_bin="$prefix/smol-bin"
+            if ! codesign --verify --deep "$_sig_bin" 2>/dev/null; then
+                warn "The installed binary is not validly code-signed."
+                warn "It needs the com.apple.security.hypervisor entitlement to start VMs."
+            elif command -v spctl &> /dev/null && ! spctl --assess --type execute "$_sig_bin" &> /dev/null; then
+                warn "Binary is signed but not notarized by Apple."
+                warn "It will run (quarantine was cleared), but Gatekeeper may warn on first launch."
+            fi
+        fi
+    fi
+
+    # Create symlinks in bin directory. `smol` is the primary, user-facing CLI;
+    # `smolvm` remains available as the lower-level engine command.
     mkdir -p "$BIN_DIR"
     ln -sf "$prefix/smolvm" "$BIN_DIR/smolvm"
-
-    success "smolvm $version installed to $prefix"
+    if [[ "$has_smol" == true ]]; then
+        ln -sf "$prefix/smol" "$BIN_DIR/smol"
+        success "smol $version installed to $prefix (also installed: smolvm)"
+    else
+        success "smolvm $version installed to $prefix"
+    fi
 }
 
 # Modify shell profile to add to PATH

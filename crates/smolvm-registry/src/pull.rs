@@ -40,9 +40,11 @@ pub async fn pull(
     output: Option<&Path>,
     cache: &BlobCache,
 ) -> Result<PullResult> {
-    // 1. Fetch manifest.
+    // 1. Fetch the manifest, resolving a multi-platform index to this machine's
+    //    host-platform entry (Docker-style fan-out). Shared with `inspect`.
     tracing::info!(repo = %repo, reference = %reference, "fetching manifest...");
-    let manifest_bytes = client.get_manifest(repo, reference).await?;
+    let manifest_bytes = client.get_manifest_resolved(repo, reference).await?;
+
     let manifest: OciManifest = serde_json::from_slice(&manifest_bytes)?;
 
     // 2. Find the smolmachine layer.

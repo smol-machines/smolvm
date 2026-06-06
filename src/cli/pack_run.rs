@@ -677,14 +677,41 @@ fn build_command(manifest: &smolvm_pack::PackManifest, cli_command: &[String]) -
 }
 
 /// Build environment variables from manifest defaults and CLI overrides.
-fn build_env(manifest: &smolvm_pack::PackManifest, cli_env: &[String]) -> Vec<(String, String)> {
+fn build_env(
+    manifest: &smolvm_pack::PackManifest,
+    cli_env: &[String],
+) -> smolvm::Result<Vec<(String, String)>> {
     let mut env: Vec<(String, String)> = manifest
         .env
         .iter()
         .filter_map(|e| parse_env_spec(e))
         .collect();
 
-    // CLI env overrides manifest env
+    // A .smolmachine is a portable artifact that may have been authored on
+    // another host or by another party. Validate every packed ref under the
+    // Untrusted scope FIRST — which now rejects every source kind — so a packed
+    // `from_env`/`from_file` ref cannot be resolved against the running host's
+    // env or files (an exfil primitive). Resolution does not enforce scope on
+    // its own, so this gate is what makes the path fail closed. In practice a
+    // pack carries no resolvable secret; configure secrets locally instead.
+    for (key, r) in &manifest.secret_refs {
+        smolvm::secrets::validate_ref(r, smolvm::secrets::ResolutionScope::Untrusted).map_err(
+            |e| {
+                smolvm::Error::config(
+                    "run packed machine",
+                    format!("secret '{}': {} (packs may not carry secret refs)", key, e),
+                )
+            },
+        )?;
+    }
+    env.extend(smolvm::secrets::expose_into_env(
+        smolvm::secrets::resolve_refs_to_env(
+            &manifest.secret_refs,
+            smolvm::secrets::ResolutionScope::Untrusted,
+        )?,
+    ));
+
+    // CLI env overrides manifest env and resolved secrets
     for spec in cli_env {
         if let Some((key, value)) = parse_env_spec(spec) {
             // Remove existing key if present
@@ -693,7 +720,7 @@ fn build_env(manifest: &smolvm_pack::PackManifest, cli_env: &[String]) -> Vec<(S
         }
     }
 
-    env
+    Ok(env)
 }
 
 /// Execute the command in the VM using the existing AgentClient.
@@ -707,7 +734,7 @@ fn execute_command(
     mounts: &[smolvm::data::storage::HostMount],
 ) -> smolvm::Result<i32> {
     let command = build_command(manifest, &args.command);
-    let env = build_env(manifest, &args.env);
+    let env = build_env(manifest, &args.env)?;
     let workdir = args.workdir.clone().or_else(|| manifest.workdir.clone());
 
     let params = ExecParams {
@@ -754,7 +781,8 @@ fn execute_packed_command(
             if interactive || tty {
                 client.vm_exec_interactive(command, env, workdir, timeout, tty)
             } else {
-                let (exit_code, stdout, stderr) = client.vm_exec(command, env, workdir, timeout)?;
+                let (exit_code, stdout, stderr) =
+                    client.vm_exec(command, env, workdir, timeout, None)?;
 
                 if !stdout.is_empty() {
                     let _ = std::io::stdout().write_all(&stdout);
@@ -1294,7 +1322,7 @@ fn run_from_cache(
 
     let params = ExecParams {
         command: build_command(manifest, &args.command),
-        env: build_env(manifest, &args.env),
+        env: build_env(manifest, &args.env)?,
         workdir: args.workdir.or_else(|| manifest.workdir.clone()),
         interactive: args.interactive,
         tty: args.tty,
@@ -1685,7 +1713,7 @@ fn daemon_exec(
     let mounts: Vec<smolvm::data::storage::HostMount> = Vec::new();
     let params = ExecParams {
         command: build_command(manifest, &args.command),
-        env: build_env(manifest, &args.env),
+        env: build_env(manifest, &args.env)?,
         workdir: args.workdir.or_else(|| manifest.workdir.clone()),
         interactive: args.interactive,
         tty: args.tty,

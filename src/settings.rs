@@ -22,7 +22,7 @@
 //! password_env = "DOCKER_HUB_TOKEN"
 //! ```
 //!
-//! - `[cloud]` — smolcloud API credentials
+//! - `[cloud]` — smolfleet API credentials
 //! - `[machines]` — credentials for OCI registries storing .smolmachine artifacts
 //! - `[images]` — credentials for container image registries (base images for VMs)
 
@@ -34,7 +34,7 @@ use std::path::PathBuf;
 /// Unified settings loaded from `~/.config/smolvm/config.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SmolSettings {
-    /// smolcloud API configuration.
+    /// smolfleet API configuration.
     #[serde(default)]
     pub cloud: CloudSection,
     /// Credentials for .smolmachine artifact registries.
@@ -45,10 +45,10 @@ pub struct SmolSettings {
     pub images: RegistryConfig,
 }
 
-/// smolcloud API configuration.
+/// smolfleet API configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CloudSection {
-    /// smolcloud API endpoint (e.g., "https://api.smolmachines.com").
+    /// smolfleet API endpoint (e.g., "https://api.smolmachines.com").
     pub endpoint: Option<String>,
     /// API key for authentication (e.g., "smk_..." or a JWT).
     pub api_key: Option<String>,
@@ -219,7 +219,7 @@ impl CloudSection {
         self.endpoint.as_deref().ok_or_else(|| {
             Error::config(
                 "cloud endpoint",
-                "No smolcloud endpoint configured. Set one with: smol config set cloud <url>",
+                "No smolfleet endpoint configured. Set one with: smol config set cloud <url>",
             )
         })
     }

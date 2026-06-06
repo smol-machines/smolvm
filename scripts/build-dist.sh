@@ -68,7 +68,12 @@ done
 
 # Configuration
 VERSION="${VERSION:-$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)}"
-PLATFORM="$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m)"
+# Normalize architecture: aarch64 -> arm64 for consistent naming across platforms
+_ARCH="$(uname -m)"
+if [[ "$_ARCH" == "aarch64" ]]; then
+    _ARCH="arm64"
+fi
+PLATFORM="$(uname -s | tr '[:upper:]' '[:lower:]')-${_ARCH}"
 DIST_NAME="smolvm-${VERSION}-${PLATFORM}"
 DIST_DIR="dist/${DIST_NAME}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -173,7 +178,16 @@ refresh_bundled_libs_from_local() {
     rm -rf "$LOCAL_STAGE_DIR"
     mkdir -p "$LOCAL_STAGE_DIR"
 
-    run_make "$repo" "$flags"
+    # On Linux, link with partial RELRO so libkrun's symbols bind lazily. Full
+    # RELRO forces BIND_NOW, which would defeat the lazy virglrenderer loading
+    # (RTLD_LAZY in src/agent/krun.rs + the patchelf --remove-needed below) that
+    # lets one GPU-enabled libkrun load on non-GPU hosts. Harmless for the
+    # install step and non-cargo builds; not applicable to macOS dylibs.
+    if [[ "$(uname -s)" == "Linux" ]]; then
+        RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C relro-level=partial" run_make "$repo" "$flags"
+    else
+        run_make "$repo" "$flags"
+    fi
     run_make "$repo" "$flags" install "DESTDIR=$LOCAL_STAGE_DIR" "PREFIX=/usr/local"
 
     if [[ ! -d "$STAGED_LIB_DIR" ]]; then
@@ -236,6 +250,20 @@ fi
 echo "Building release binaries..."
 LIBKRUN_BUNDLE="$WORK_LIB_DIR" cargo build --release --bin smolvm
 
+# Build the unified `smol` CLI if its source is present (it lives in a sibling
+# repo checked out at ./smol). It is a separate cargo workspace that depends on
+# the engine by path, so build it from inside ./smol with an ABSOLUTE
+# LIBKRUN_BUNDLE so its build.rs finds the same bundled libraries we ship.
+BUILD_SMOL=0
+if [[ -f "./smol/Cargo.toml" ]]; then
+    echo "Building unified smol CLI..."
+    _ABS_LIB_BUNDLE="$(cd "$WORK_LIB_DIR" && pwd)"
+    ( cd ./smol && LIBKRUN_BUNDLE="$_ABS_LIB_BUNDLE" cargo build --release --bin smol )
+    BUILD_SMOL=1
+else
+    echo "smol CLI source (./smol) not found — building engine-only distribution"
+fi
+
 # Build smolvm-agent for Linux (size-optimized)
 if [[ "$SKIP_AGENT_BUILD" == "1" ]]; then
     echo "Skipping agent build (--skip-agent-build)"
@@ -247,12 +275,13 @@ else
     echo "Building smolvm-agent for Linux (optimized for size)..."
     if [[ "$(uname -s)" == "Linux" ]]; then
         # On Linux, build natively with musl for static linking
+        MUSL_TARGET="$(uname -m)-unknown-linux-musl"
         if command -v cargo &> /dev/null; then
-            if rustup target list --installed 2>/dev/null | grep -q musl; then
-                cargo build --profile release-small -p smolvm-agent --target x86_64-unknown-linux-musl
+            if rustup target list --installed 2>/dev/null | grep -q "$MUSL_TARGET"; then
+                cargo build --profile release-small -p smolvm-agent --target "$MUSL_TARGET"
                 # Copy to the non-target-triple path that the rest of the script expects
                 mkdir -p ./target/release-small
-                cp "./target/x86_64-unknown-linux-musl/release-small/smolvm-agent" \
+                cp "./target/${MUSL_TARGET}/release-small/smolvm-agent" \
                    "./target/release-small/smolvm-agent"
             fi
         fi
@@ -284,6 +313,11 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
     fi
     echo "Signing binary (identity: $IDENTITY)..."
     codesign "${CODESIGN_ARGS[@]}" ./target/release/smolvm
+    # The smol binary also calls the macOS hypervisor, so it needs the same
+    # entitlements + signature (otherwise it cannot start a VM).
+    if [[ "$BUILD_SMOL" == "1" ]]; then
+        codesign "${CODESIGN_ARGS[@]}" ./smol/target/release/smol
+    fi
 fi
 
 # Create distribution directory
@@ -297,6 +331,15 @@ cp ./target/release/smolvm "$DIST_DIR/smolvm-bin"
 # Copy wrapper script
 cp ./scripts/smolvm-wrapper.sh "$DIST_DIR/smolvm"
 chmod +x "$DIST_DIR/smolvm"
+
+# Copy the unified smol CLI (binary renamed to smol-bin + its own wrapper).
+# The wrapper points at the same lib/ and agent-rootfs, so one tarball serves
+# both `smol` (the user-facing CLI) and `smolvm` (the lower-level engine).
+if [[ "$BUILD_SMOL" == "1" ]]; then
+    cp ./smol/target/release/smol "$DIST_DIR/smol-bin"
+    cp ./scripts/smol-wrapper.sh "$DIST_DIR/smol"
+    chmod +x "$DIST_DIR/smol"
+fi
 
 # Copy libraries
 if [[ "$(uname -s)" == "Darwin" ]]; then
@@ -349,6 +392,23 @@ else
 
     copy_so_with_symlinks libkrun required
     copy_so_with_symlinks libkrunfw required
+
+    # Strip the hard NEEDED on virglrenderer from the GPU-enabled libkrun so a
+    # host without it can still dlopen libkrun (paired with the RTLD_LAZY load in
+    # src/agent/krun.rs). virglrenderer is loaded by soname at runtime only when
+    # the GPU path actually runs — so one build serves both GPU and non-GPU hosts.
+    if command -v patchelf >/dev/null 2>&1; then
+        for lk in "$DIST_DIR"/lib/libkrun.so*; do
+            [[ -f "$lk" && ! -L "$lk" ]] || continue
+            if patchelf --print-needed "$lk" 2>/dev/null | grep -q libvirglrenderer; then
+                patchelf --remove-needed libvirglrenderer.so.1 "$lk"
+                echo "Stripped libvirglrenderer NEEDED from $(basename "$lk") — GPU stays optional at runtime"
+            fi
+        done
+    else
+        echo "Warning: patchelf not found — libkrun keeps its hard virglrenderer NEEDED;"
+        echo "         non-GPU Linux hosts will fail to load it. Install patchelf in the build env."
+    fi
 
     # Bundle GPU rendering libraries if present (virglrenderer chain for Venus/Vulkan).
     # libMoltenVK is macOS-only — not included here.

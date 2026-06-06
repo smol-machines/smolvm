@@ -404,7 +404,7 @@ mod tests {
         assert_eq!(network.initial_delay, Duration::from_millis(500));
 
         let connection = RetryConfig::for_connection();
-        assert_eq!(connection.max_attempts, 3);
-        assert_eq!(connection.initial_delay, Duration::from_millis(50));
+        assert_eq!(connection.max_attempts, 6);
+        assert_eq!(connection.initial_delay, Duration::from_millis(100));
     }
 }

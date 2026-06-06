@@ -1,7 +1,20 @@
 //! JSON request and response types for the API.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use utoipa::ToSchema;
+
+/// Map of guest-side env var names to secret refs.
+///
+/// Present on every exec-like endpoint and on `CreateMachineRequest`.
+/// Every entry is validated under `ResolutionScope::Untrusted` before
+/// it's acted on — the HTTP API treats every caller as untrusted
+/// regardless of where the server is bound, so no ref source kind is
+/// accepted — `from_env` and `from_file` are both rejected with 400.
+/// Configure secrets locally via the CLI instead.
+///
+/// Capped at `MAX_REQ_SECRETS_PER_REQUEST` entries per request.
+pub type RequestSecretRefs = BTreeMap<String, smolvm_protocol::SecretRef>;
 
 // ============================================================================
 // Machine Types
@@ -107,6 +120,11 @@ pub struct ExecRequest {
     /// Environment variables.
     #[serde(default)]
     pub env: Vec<EnvVar>,
+    /// Ad-hoc secret refs. Rejected unless empty: an untrusted HTTP
+    /// caller cannot read this host's env/files. See `RequestSecretRefs`.
+    #[serde(default)]
+    #[schema(value_type = Object)]
+    pub secrets: RequestSecretRefs,
     /// Working directory.
     #[serde(default)]
     #[schema(example = "/workspace")]
@@ -115,6 +133,14 @@ pub struct ExecRequest {
     #[serde(default)]
     #[schema(example = 30)]
     pub timeout_secs: Option<u64>,
+    /// Data to pipe to the command's stdin.
+    #[serde(default)]
+    pub stdin: Option<String>,
+    /// Run the command detached: spawn it in the background and return its PID
+    /// immediately instead of waiting. The process keeps running (a long-lived
+    /// daemon — dev server, agent runner) until it exits or the machine stops.
+    #[serde(default)]
+    pub background: bool,
 }
 
 /// Environment variable.
@@ -173,6 +199,10 @@ pub struct RunRequest {
     /// Environment variables.
     #[serde(default)]
     pub env: Vec<EnvVar>,
+    /// Ad-hoc secret refs. Rejected unless empty (untrusted scope).
+    #[serde(default)]
+    #[schema(value_type = Object)]
+    pub secrets: RequestSecretRefs,
     /// Working directory.
     #[serde(default)]
     pub workdir: Option<String>,
@@ -227,6 +257,15 @@ pub struct PullImageRequest {
     #[serde(default)]
     #[schema(example = "linux/arm64")]
     pub oci_platform: Option<String>,
+    /// Proxy URL applied to the in-VM registry client
+    /// (sets HTTP_PROXY and HTTPS_PROXY).
+    #[serde(default)]
+    #[schema(example = "http://192.168.127.254:3128")]
+    pub proxy: Option<String>,
+    /// Comma-separated NO_PROXY list of hosts/CIDRs that bypass the proxy.
+    #[serde(default)]
+    #[schema(example = "127.0.0.1,localhost,.internal")]
+    pub no_proxy: Option<String>,
 }
 
 /// Pull image response.
@@ -298,6 +337,24 @@ pub struct MachineCountsResponse {
     pub running: usize,
 }
 
+/// Live node capacity: current allocations and real utilization across all
+/// running machines on this host. Read-only introspection — a fleet control
+/// plane (or any operator) polls this to gauge node load. The reporter owns
+/// totals/reserved; this endpoint reports only what the runtime itself knows.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CapacityResponse {
+    /// CPUs allocated to running machines (sum of per-machine cpu requests).
+    pub allocated_cpus: u32,
+    /// Memory (MB) allocated to running machines.
+    pub allocated_memory_mb: u64,
+    /// Real fractional CPU load across VM processes (e.g. 2.5 = 2.5 CPUs).
+    pub used_cpus: f64,
+    /// Real resident memory (MB) across VM processes.
+    pub used_memory_mb: u64,
+    /// Real disk (GB) consumed by VM storage + overlay files.
+    pub used_disk_gb: u64,
+}
+
 // ============================================================================
 // Error Types
 // ============================================================================
@@ -317,14 +374,6 @@ pub struct ApiErrorResponse {
 // Machine Types
 // ============================================================================
 
-fn default_cpus() -> u8 {
-    1
-}
-
-fn default_mem() -> u32 {
-    512
-}
-
 /// Request to create a new machine.
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -334,13 +383,13 @@ pub struct CreateMachineRequest {
     #[schema(example = "my-vm")]
     pub name: Option<String>,
     /// Number of vCPUs.
-    #[serde(default = "default_cpus")]
-    #[schema(example = 2)]
-    pub cpus: u8,
+    #[serde(default)]
+    #[schema(example = 4)]
+    pub cpus: Option<u8>,
     /// Memory in MiB.
-    #[serde(default = "default_mem", rename = "memoryMb")]
-    #[schema(example = 1024)]
-    pub mem: u32,
+    #[serde(default, rename = "memoryMb")]
+    #[schema(example = 8192)]
+    pub mem: Option<u32>,
     /// Host mounts to attach.
     #[serde(default)]
     pub mounts: Vec<MountSpec>,
@@ -373,6 +422,26 @@ pub struct CreateMachineRequest {
     /// layers instead of pulling from a registry. Mutually exclusive with `image`.
     #[serde(default)]
     pub from: Option<String>,
+    /// Registry reference to a .smolmachine artifact (e.g., "myapp:v1").
+    /// Pulls from the registry before creating the VM.
+    /// Mutually exclusive with `image` and `from`.
+    #[serde(default)]
+    pub registry_ref: Option<String>,
+    /// Bearer credential (an OCI Distribution `identity_token`) to present when
+    /// pulling `registry_ref`. The control plane supplies a short-lived,
+    /// tenant-scoped token here so a node can fetch a tenant's private
+    /// `.smolmachine`. Takes precedence over any persisted registry credential.
+    #[serde(default)]
+    pub registry_identity_token: Option<String>,
+    /// Secret refs attached to the machine. Resolved at every
+    /// subsequent exec against the host's env/files. Rejected unless empty;
+    /// accepted — `from_env`/`from_file` on the API surface would let
+    /// an untrusted caller exfiltrate the server process's env or
+    /// read arbitrary host files; use the CLI `machine create` path
+    /// for those source kinds.
+    #[serde(default)]
+    #[schema(value_type = Object)]
+    pub secrets: RequestSecretRefs,
 }
 
 /// Request to execute a command in a machine.
@@ -385,12 +454,19 @@ pub struct MachineExecRequest {
     /// Environment variables.
     #[serde(default)]
     pub env: Vec<EnvVar>,
+    /// Ad-hoc secret refs. Rejected unless empty (untrusted scope).
+    #[serde(default)]
+    #[schema(value_type = Object)]
+    pub secrets: RequestSecretRefs,
     /// Working directory.
     #[serde(default)]
     pub workdir: Option<String>,
     /// Timeout in seconds.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    /// Data to pipe to the command's stdin.
+    #[serde(default)]
+    pub stdin: Option<String>,
 }
 
 /// Machine status information.

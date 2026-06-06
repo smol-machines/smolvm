@@ -396,6 +396,13 @@ pub struct VmRecord {
     #[serde(default)]
     pub env: Vec<(String, String)>,
 
+    /// Secret references declared by a Smolfile `[secrets]` section, keyed
+    /// by the guest-side env var name. Resolved to plaintext at each VM
+    /// start (and for `machine exec`) and appended to the env vector — the
+    /// plaintext values never touch this record or the DB.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub secret_refs: std::collections::BTreeMap<String, crate::secrets::SecretRef>,
+
     /// Working directory for the container workload.
     #[serde(default)]
     pub workdir: Option<String>,
@@ -471,6 +478,14 @@ pub struct VmRecord {
     /// them via virtiofs instead of pulling the image from a registry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_smolmachine: Option<String>,
+
+    /// Name of the golden VM this machine was forked from, if any. A clone's
+    /// block disks are copy-on-write overlays backed by the golden's disks, so
+    /// the golden must outlive its clones. The disk *format* is not recorded
+    /// here — it is derived from the on-disk file (`.qcow2` vs `.raw`), which is
+    /// the single source of truth (see `agent::resolve_disk_image`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub golden: Option<String>,
 }
 
 /// Deserialize `created_at` from either a legacy JSON string `"1705312345"` or
@@ -528,6 +543,7 @@ impl VmRecord {
             init: Vec::new(),
             init_completed: false,
             env: Vec::new(),
+            secret_refs: std::collections::BTreeMap::new(),
             workdir: None,
             user: None,
             storage_gb: None,
@@ -546,6 +562,7 @@ impl VmRecord {
             dns_filter_hosts: None,
             ephemeral: false,
             source_smolmachine: None,
+            golden: None,
         }
     }
 
@@ -577,6 +594,7 @@ impl VmRecord {
             init: Vec::new(),
             init_completed: false,
             env: Vec::new(),
+            secret_refs: std::collections::BTreeMap::new(),
             workdir: None,
             user: None,
             storage_gb: None,
@@ -595,6 +613,7 @@ impl VmRecord {
             dns_filter_hosts: None,
             ephemeral: false,
             source_smolmachine: None,
+            golden: None,
         }
     }
 
@@ -678,6 +697,45 @@ mod tests {
         let deserialized: VmRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.name, record.name);
         assert_eq!(deserialized.mounts, record.mounts);
+    }
+
+    #[test]
+    fn test_vm_record_secret_refs_roundtrip() {
+        use crate::secrets::SecretRef;
+        let mut record = VmRecord::new("r".into(), 1, 256, vec![], vec![], false);
+        record.secret_refs.insert(
+            "TLS_KEY".into(),
+            SecretRef {
+                from_env: None,
+                from_file: Some("/run/secrets/tls.key".into()),
+            },
+        );
+        record.secret_refs.insert(
+            "DB_URL".into(),
+            SecretRef {
+                from_env: Some("PROD_DB".into()),
+                from_file: None,
+            },
+        );
+
+        let json = serde_json::to_string(&record).unwrap();
+        // Ref metadata — not sensitive — roundtrips through serde_json.
+        assert!(json.contains("TLS_KEY"));
+        assert!(json.contains("PROD_DB"));
+
+        let back: VmRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.secret_refs.len(), 2);
+        assert_eq!(
+            back.secret_refs["TLS_KEY"]
+                .from_file
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+            Some("/run/secrets/tls.key".to_string())
+        );
+        assert_eq!(
+            back.secret_refs["DB_URL"].from_env.as_deref(),
+            Some("PROD_DB")
+        );
     }
 
     #[test]

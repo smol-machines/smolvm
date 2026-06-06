@@ -488,29 +488,33 @@ test_ephemeral_vm_tracking() {
 }
 
 test_ephemeral_shows_in_list_while_running() {
-    # Start a detached ephemeral run and verify it appears in list
-    $SMOLVM machine run --net -d --image alpine -- sleep 30 2>&1 || {
+    # Start a detached run with an explicit name and verify it appears in list.
+    # An unnamed `-d` run lands as "default"; naming it makes the assertion
+    # deterministic (grep the exact name) and the cleanup unambiguous.
+    local name="run-visible-$$"
+    $SMOLVM machine run --net -d --name "$name" --image alpine -- sleep 30 2>&1 || {
         echo "Detached run failed"
         return 1
     }
 
-    # Poll until the ephemeral VM appears in the list (usually <1s).
+    # Poll until the detached VM appears in the list (usually <1s).
     local list_result i=0
     while [[ $i -lt 20 ]]; do
         list_result=$($SMOLVM machine ls 2>&1)
-        echo "$list_result" | grep -q "eph" && break
+        echo "$list_result" | grep -q "$name" && break
         sleep 0.5
         ((i++)) || true
     done
-    echo "$list_result" | grep -q "eph" || {
-        echo "Detached ephemeral not in list: $list_result"
-        # Clean up any running VMs
-        $SMOLVM machine stop 2>/dev/null || true
+    echo "$list_result" | grep -q "$name" || {
+        echo "Detached run not in list: $list_result"
+        $SMOLVM machine stop --name "$name" 2>/dev/null || true
+        $SMOLVM machine delete "$name" -f 2>/dev/null || true
         return 1
     }
 
     # Clean up
-    $SMOLVM machine stop 2>/dev/null || true
+    $SMOLVM machine stop --name "$name" 2>/dev/null || true
+    $SMOLVM machine delete "$name" -f 2>/dev/null || true
 }
 
 test_run_no_command_errors() {
@@ -648,7 +652,11 @@ run_test "Stdin: piped 'echo hello | run -i cat' returns data" test_piped_stdin_
 
 test_stdout_no_status_messages() {
     local out
-    out=$("$SMOLVM" machine run --image alpine -- echo PAYLOAD_ONLY 2>/dev/null) || true
+    # Pass --net so the run can pull alpine if it isn't already cached. Without
+    # it this test depends on a warm image cache, which an earlier suite's
+    # `prune --all` can wipe (suites share the host image cache) — making the
+    # run fail to pull and the assertion flake on ordering.
+    out=$("$SMOLVM" machine run --net --image alpine -- echo PAYLOAD_ONLY 2>/dev/null) || true
     if echo "$out" | grep -qiE "^Starting|^Pulling"; then
         echo "FAIL: status messages in stdout: $(echo "$out" | grep -iE 'Starting|Pulling' | head -1)"
         return 1

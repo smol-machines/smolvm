@@ -3,7 +3,6 @@ members = [
     ".",
     "crates/smolvm-agent",
     "crates/smolvm-network",
-    "crates/smolvm-napi",
     "crates/smolvm-pack",
     "crates/smolvm-protocol",
     "crates/smolvm-registry",
@@ -13,11 +12,11 @@ resolver = "2"
 
 [package]
 name = "smolvm"
-version = "0.8.0"
+version = "1.0.1"
 edition = "2021"
 description = "OCI-native microVM runtime"
 license = "Apache-2.0"
-repository = "https://github.com/smolvm/smolvm"
+repository = "https://github.com/smol-machines/smolvm"
 keywords = ["microvm", "container", "virtualization"]
 categories = ["virtualization", "command-line-utilities"]
 
@@ -30,11 +29,11 @@ name = "smolvm"
 path = "src/main.rs"
 
 [dependencies]
-smolvm-network = { path = "crates/smolvm-network" }
-smolvm-protocol = { path = "crates/smolvm-protocol" }
-smolvm-pack = { path = "crates/smolvm-pack" }
-smolvm-registry = { path = "crates/smolvm-registry" }
-smolfile = { path = "crates/smolvm-smolfile" }
+smolvm-network = { path = "crates/smolvm-network", version = "1.0.0" }
+smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.0.0" }
+smolvm-pack = { path = "crates/smolvm-pack", version = "1.0.0" }
+smolvm-registry = { path = "crates/smolvm-registry", version = "1.0.0" }
+smolfile = { path = "crates/smolvm-smolfile", version = "1.0.0" }
 thiserror = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
@@ -48,12 +47,18 @@ sha2 = "0.10"
 hex = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
+base64 = { workspace = true }
+
+# Secrets management. Resolved plaintext is scrubbed on drop; smolvm stores no
+# secret material itself (refs only), so no at-rest crypto/store deps are needed.
+zeroize = { version = "1", features = ["zeroize_derive"] }
 humantime = "2"
 tempfile = "3"
 
 # HTTP API server
 tokio = { version = "1", features = ["full"] }
-axum = { version = "0.8", features = ["macros"] }
+axum = { version = "0.8", features = ["macros", "ws"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "timeout"] }
 tokio-stream = "0.1"
 parking_lot = "0.12"
@@ -66,11 +71,18 @@ utoipa-axum = "0.2"
 utoipa-swagger-ui = { version = "9", features = ["axum", "vendored"] }
 ipnet = "2.12.0"
 metrics = "0.24"
+
 metrics-exporter-prometheus = { version = "0.16", default-features = false }
+
+# Seccomp + Landlock for the VM boot subprocess (runtime isolation). Linux-only
+# — macOS/HVF has neither; the code is cfg-gated to linux (seccomp also to x86_64).
+[target.'cfg(target_os = "linux")'.dependencies]
+seccompiler = "0.4"
+landlock = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
-smolvm-protocol = { path = "crates/smolvm-protocol" }
+smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.0.0" }
 regex = "1"
 
 [build-dependencies]
