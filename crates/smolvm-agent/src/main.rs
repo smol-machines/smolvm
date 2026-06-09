@@ -206,23 +206,28 @@ fn main() {
     // Set up signal handlers for graceful shutdown (sync before exit)
     setup_signal_handlers();
 
-    // Signal readiness to host IMMEDIATELY after vsock listener is active.
-    // The host detects this marker, then connects and sends its first request.
-    // That connection takes ~10-30ms, giving us time to finish deferred init
-    // below before the first request arrives.
-    signal_ready_to_host();
-    boot_log(
-        "INFO",
-        &format!("boot ready_sent uptime_ms={}", uptime_ms()),
-    );
-
-    // --- Deferred init: runs while host is detecting marker + connecting ---
+    // --- Deferred init: runs before the host is allowed to send requests ---
+    //
+    // Keep the ready marker hidden until the guest has completed the boot-time
+    // work that init commands may depend on:
+    // - guest networking
+    // - storage mount
+    // - packed layers
+    // - volume mounts and /workspace setup
+    // - SSH agent / DNS proxy bridges
+    //
+    // `machine run` can reach init very quickly, so signaling readiness too
+    // early creates a race where init starts before the guest is actually ready
+    // to resolve or connect to the network. Named-machine startup has enough
+    // extra host-side work to mostly hide this, but the guest itself should not
+    // report "ready" until the boot prerequisites are complete.
     // Storage mount is behind a OnceLock (ensure_storage_mounted) so it
     // happens exactly once — either here or on first storage-dependent request.
 
     let start_uptime = uptime_ms();
 
-    // Initialize logging (deferred past ready signal — uses boot_log before this).
+    // Initialize logging after deferred boot work begins; boot_log is still
+    // used for the earliest readiness breadcrumbs.
     tracing_subscriber::fmt()
         .json()
         .with_env_filter(
@@ -234,7 +239,7 @@ fn main() {
     info!(
         version = env!("CARGO_PKG_VERSION"),
         uptime_ms = start_uptime,
-        "smolvm-agent started, vsock listener already ready"
+        "smolvm-agent started, deferred boot work in progress"
     );
 
     let t0 = uptime_ms();
@@ -341,6 +346,13 @@ fn main() {
         total_startup_ms = uptime_ms() - start_uptime,
         uptime_ms = uptime_ms(),
         "agent init complete, entering accept loop"
+    );
+
+    // Only now is the guest safe to accept host requests for init/exec.
+    signal_ready_to_host();
+    boot_log(
+        "INFO",
+        &format!("boot ready_sent uptime_ms={}", uptime_ms()),
     );
 
     // Start accepting connections (listener already bound)
