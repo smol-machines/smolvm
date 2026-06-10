@@ -462,9 +462,6 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         }
 
         let network_plan = select_network_plan(resources, *dns_filter_enabled, port_mappings.len());
-        if let Some(reason) = network_plan.fallback_reason {
-            tracing::warn!(reason = %reason.user_message(), "network backend fell back to TSI");
-        }
 
         let mut virtio_network_runtime: Option<VirtioNetworkRuntime> = None;
         let guest_network = match network_plan.backend {
@@ -595,18 +592,26 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     .iter()
                     .map(|mapping| VirtioPortMapping::new(mapping.host, mapping.guest))
                     .collect();
-                let runtime =
-                    match start_virtio_network(host_fd, guest_network, &virtio_port_mappings) {
-                        Ok(runtime) => runtime,
-                        Err(err) => {
-                            libc::close(guest_fd);
-                            krun_free_ctx(ctx);
-                            return Err(Error::agent(
-                                "configure virtio-net",
-                                format!("failed to start virtio network runtime: {err}"),
-                            ));
-                        }
-                    };
+                let egress = smolvm_network::EgressPolicy::new(
+                    resources.allowed_cidrs.as_deref(),
+                    egress_refresh_hosts.as_deref(),
+                );
+                let runtime = match start_virtio_network(
+                    host_fd,
+                    guest_network,
+                    &virtio_port_mappings,
+                    egress,
+                ) {
+                    Ok(runtime) => runtime,
+                    Err(err) => {
+                        libc::close(guest_fd);
+                        krun_free_ctx(ctx);
+                        return Err(Error::agent(
+                            "configure virtio-net",
+                            format!("failed to start virtio network runtime: {err}"),
+                        ));
+                    }
+                };
 
                 if add_net_unixstream(
                     ctx,
@@ -975,6 +980,21 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 "{}={}",
                 guest_env::GUEST_MAC,
                 format_mac(network.guest_mac)
+            )));
+            env_strings.push(cstr(&format!(
+                "{}={}",
+                guest_env::GUEST_IP6,
+                network.guest_ip6
+            )));
+            env_strings.push(cstr(&format!(
+                "{}={}",
+                guest_env::GATEWAY6,
+                network.gateway_ip6
+            )));
+            env_strings.push(cstr(&format!(
+                "{}={}",
+                guest_env::PREFIX_LEN6,
+                network.prefix_len6
             )));
             env_strings.push(cstr(&format!("{}={}", guest_env::DNS, network.dns_server)));
         }

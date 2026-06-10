@@ -51,6 +51,8 @@
 //! ```
 
 use crate::device::VirtioNetworkDevice;
+use crate::dns;
+use crate::egress::EgressPolicy;
 use crate::queues::NetworkFrameQueues;
 use crate::tcp_listeners::AcceptedTcpConnection;
 use crate::tcp_relay::{spawn_tcp_relay, TcpRelayTable};
@@ -62,9 +64,9 @@ use smoltcp::socket::udp::{PacketBuffer, PacketMetadata, Socket as UdpSocket, Ud
 use smoltcp::time::Instant;
 use smoltcp::wire::{
     EthernetAddress, EthernetFrame, EthernetProtocol, HardwareAddress, IpAddress, IpCidr,
-    Ipv4Packet, TcpPacket, UdpPacket,
+    Ipv4Packet, Ipv6Packet, TcpPacket, UdpPacket,
 };
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket as HostUdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket as HostUdpSocket};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::Arc;
@@ -91,6 +93,12 @@ pub struct VirtioPollConfig {
     pub gateway_ipv4: Ipv4Addr,
     /// Guest IPv4 address.
     pub guest_ipv4: Ipv4Addr,
+    /// Gateway IPv6 (ULA) address.
+    pub gateway_ipv6: Ipv6Addr,
+    /// Guest IPv6 (ULA) address.
+    pub guest_ipv6: Ipv6Addr,
+    /// IPv6 prefix length for the virtual link.
+    pub prefix_len6: u8,
     /// IP-level MTU.
     pub mtu: usize,
 }
@@ -119,6 +127,7 @@ pub fn start_network_stack(
     queues: Arc<NetworkFrameQueues>,
     config: VirtioPollConfig,
     tcp_receiver: Option<Receiver<AcceptedTcpConnection>>,
+    egress: EgressPolicy,
 ) -> std::io::Result<JoinHandle<()>> {
     virtio_net_log!(
         "virtio-net: spawning poll thread guest_ip={} gateway_ip={} mtu={}",
@@ -128,13 +137,14 @@ pub fn start_network_stack(
     );
     thread::Builder::new()
         .name("smolvm-net-poll".into())
-        .spawn(move || run_network_stack(queues, config, tcp_receiver))
+        .spawn(move || run_network_stack(queues, config, tcp_receiver, egress))
 }
 
 fn run_network_stack(
     queues: Arc<NetworkFrameQueues>,
     config: VirtioPollConfig,
     mut tcp_receiver: Option<Receiver<AcceptedTcpConnection>>,
+    egress: EgressPolicy,
 ) {
     // Poll loop overview:
     //
@@ -158,9 +168,9 @@ fn run_network_stack(
     let mut device = VirtioNetworkDevice::new(queues.clone(), config.mtu);
     let mut interface = create_interface(&mut device, &config);
     let mut sockets = SocketSet::new(vec![]);
-    let dns_socket_handle = add_dns_socket(&mut sockets, config.gateway_ipv4);
+    let dns_socket_handle = add_dns_socket(&mut sockets);
     let relay_wake = Arc::new(queues.relay_wake.clone());
-    let mut relays = TcpRelayTable::new(None);
+    let mut relays = TcpRelayTable::new(None, egress.clone());
 
     // The smoltcp loop is driven by fd-based wakeups rather than busy spinning.
     // guest_wake  -> new guest frame or shutdown
@@ -245,7 +255,7 @@ fn run_network_stack(
         // Move payloads between established smoltcp TCP sockets and host relay
         // threads, and service the DNS gateway socket.
         relays.relay_data(&mut sockets);
-        process_dns_queries(dns_socket_handle, &mut sockets);
+        process_dns_queries(dns_socket_handle, &mut sockets, &egress);
 
         // Once the guest-side TCP handshake is established inside smoltcp, we
         // can spawn the corresponding host relay thread.
@@ -296,6 +306,7 @@ fn create_interface(device: &mut VirtioNetworkDevice, config: &VirtioPollConfig)
     // Equivalent conceptual state:
     //   MAC: config.gateway_mac
     //   IP : config.gateway_ipv4/30
+    //        config.gateway_ipv6/64 (ULA) + fe80 link-local
     //
     // The guest IP exists as a peer on the same virtual link; it is not an
     // address owned by this interface.
@@ -310,6 +321,21 @@ fn create_interface(device: &mut VirtioNetworkDevice, config: &VirtioPollConfig)
         addresses
             .push(IpCidr::new(IpAddress::Ipv4(config.gateway_ipv4), 30))
             .expect("failed to add gateway IPv4 address");
+        addresses
+            .push(IpCidr::new(
+                IpAddress::Ipv6(config.gateway_ipv6),
+                config.prefix_len6,
+            ))
+            .expect("failed to add gateway IPv6 address");
+        // RFC-clean NDP wants a link-local peer on the segment; derive the
+        // standard EUI-64 link-local from the gateway MAC so the guest kernel
+        // can talk NDP to fe80::… as well as to the ULA.
+        addresses
+            .push(IpCidr::new(
+                IpAddress::Ipv6(link_local_from_mac(config.gateway_mac)),
+                64,
+            ))
+            .expect("failed to add gateway IPv6 link-local address");
     });
     // The interface acts as the gateway and may need to answer packets for
     // destinations other than its directly assigned IP, so the route table and
@@ -318,15 +344,40 @@ fn create_interface(device: &mut VirtioNetworkDevice, config: &VirtioPollConfig)
         .routes_mut()
         .add_default_ipv4_route(config.gateway_ipv4)
         .expect("failed to add default IPv4 route");
+    interface
+        .routes_mut()
+        .add_default_ipv6_route(config.gateway_ipv6)
+        .expect("failed to add default IPv6 route");
     interface.set_any_ip(true);
     interface
+}
+
+/// Derive the EUI-64 IPv6 link-local address for a MAC (RFC 4291 appendix A):
+/// flip the universal/local bit, insert `ff:fe` in the middle.
+fn link_local_from_mac(mac: [u8; 6]) -> Ipv6Addr {
+    Ipv6Addr::new(
+        0xfe80,
+        0,
+        0,
+        0,
+        u16::from_be_bytes([mac[0] ^ 0x02, mac[1]]),
+        u16::from_be_bytes([mac[2], 0xff]),
+        u16::from_be_bytes([0xfe, mac[3]]),
+        u16::from_be_bytes([mac[4], mac[5]]),
+    )
 }
 
 /// add_dns_socket is adding an UDP socket inside smoltcp, so that the guest DNS packet will
 /// hit this socket first. It is then proxied to the resolver. Note that this will not cause
 /// a host side :53 collesion, because the smoltcp Interface, SocketSet is per VM, and the
 /// gateway:53 is for that set of Interface and SocketSet, it is not bind to a host-kernel UDP socket.
-fn add_dns_socket(sockets: &mut SocketSet<'_>, gateway_ipv4: Ipv4Addr) -> SocketHandle {
+///
+/// The bind is wildcard (port-only) on purpose: combined with `set_any_ip`, every
+/// guest UDP datagram to port 53 — whatever its destination address or family
+/// (the v4 gateway, the v6 gateway, or an external resolver IP) — lands on this
+/// socket and is answered from that same destination address. That transparently
+/// intercepts hardcoded external resolvers too, matching TSI's DNS handling.
+fn add_dns_socket(sockets: &mut SocketSet<'_>) -> SocketHandle {
     let rx_meta = vec![PacketMetadata::EMPTY; DNS_PACKET_SLOTS];
     let tx_meta = vec![PacketMetadata::EMPTY; DNS_PACKET_SLOTS];
     let rx_buffer = PacketBuffer::new(rx_meta, vec![0u8; DNS_BUFFER_BYTES]);
@@ -334,7 +385,7 @@ fn add_dns_socket(sockets: &mut SocketSet<'_>, gateway_ipv4: Ipv4Addr) -> Socket
     let mut socket = UdpSocket::new(rx_buffer, tx_buffer);
     socket
         .bind(smoltcp::wire::IpListenEndpoint {
-            addr: Some(gateway_ipv4.into()),
+            addr: None,
             port: DNS_SOCKET_PORT,
         })
         .expect("failed to bind gateway DNS socket");
@@ -403,7 +454,11 @@ fn relay_accepted_tcp_connection(
     }
 }
 
-fn process_dns_queries(dns_socket_handle: SocketHandle, sockets: &mut SocketSet<'_>) {
+fn process_dns_queries(
+    dns_socket_handle: SocketHandle,
+    sockets: &mut SocketSet<'_>,
+    egress: &EgressPolicy,
+) {
     // Phase 1 DNS model:
     // guest UDP/53 -> smoltcp gateway socket -> host UDP socket -> upstream DNS
     //               <-               response bytes               <-
@@ -425,11 +480,40 @@ fn process_dns_queries(dns_socket_handle: SocketHandle, sockets: &mut SocketSet<
             query.len(),
             upstream_dns
         );
-        let response = match forward_dns_query(upstream_dns, query) {
-            Ok(response) => response,
-            Err(err) => {
-                virtio_net_log!("virtio-net: host DNS forwarding failed error={}", err);
-                continue;
+        // allow-host filtering: only forward queries whose name is allow-listed;
+        // others get NXDOMAIN. A/AAAA records of allowed answers are learned as
+        // temporary egress IPs so the follow-up connection passes the filter.
+        // Mirrors libkrun's TSI DNS filter.
+        let response = if egress.dns_filter_active() {
+            match dns::question_name(query) {
+                Some(name) if egress.hostname_allowed(&name) => {
+                    match forward_dns_query(upstream_dns, query) {
+                        Ok(response) => {
+                            egress.learn_ip_records(&dns::answer_ip_records(&response));
+                            response
+                        }
+                        Err(err) => {
+                            virtio_net_log!("virtio-net: host DNS forwarding failed error={}", err);
+                            continue;
+                        }
+                    }
+                }
+                Some(name) => {
+                    virtio_net_log!(
+                        "virtio-net: blocking DNS query by allow-host policy name={}",
+                        name
+                    );
+                    dns::error_response(query, dns::DNS_RCODE_NXDOMAIN)
+                }
+                None => dns::error_response(query, dns::DNS_RCODE_SERVFAIL),
+            }
+        } else {
+            match forward_dns_query(upstream_dns, query) {
+                Ok(response) => response,
+                Err(err) => {
+                    virtio_net_log!("virtio-net: host DNS forwarding failed error={}", err);
+                    continue;
+                }
             }
         };
         virtio_net_log!(
@@ -514,36 +598,56 @@ fn classify_guest_frame(frame: &[u8]) -> FrameAction {
         Err(_) => return FrameAction::Passthrough,
     };
 
-    if ethernet.ethertype() != EthernetProtocol::Ipv4 {
-        return FrameAction::Passthrough;
-    }
-
-    let ipv4 = match Ipv4Packet::new_checked(ethernet.payload()) {
-        Ok(packet) => packet,
-        Err(_) => return FrameAction::Passthrough,
+    // Extract (src, dst, transport protocol, transport payload) from either IP
+    // family. Anything that isn't plain IPv4/IPv6 — ARP, and IPv6 packets with
+    // extension headers (which guest TCP/UDP traffic doesn't use) — passes
+    // through to smoltcp untouched; that also covers ICMPv6/NDP.
+    let (src_ip, dst_ip, protocol, transport): (IpAddr, IpAddr, _, _) = match ethernet.ethertype() {
+        EthernetProtocol::Ipv4 => {
+            let ipv4 = match Ipv4Packet::new_checked(ethernet.payload()) {
+                Ok(packet) => packet,
+                Err(_) => return FrameAction::Passthrough,
+            };
+            (
+                IpAddr::V4(ipv4.src_addr()),
+                IpAddr::V4(ipv4.dst_addr()),
+                ipv4.next_header(),
+                ipv4.payload(),
+            )
+        }
+        EthernetProtocol::Ipv6 => {
+            let ipv6 = match Ipv6Packet::new_checked(ethernet.payload()) {
+                Ok(packet) => packet,
+                Err(_) => return FrameAction::Passthrough,
+            };
+            (
+                IpAddr::V6(ipv6.src_addr()),
+                IpAddr::V6(ipv6.dst_addr()),
+                ipv6.next_header(),
+                ipv6.payload(),
+            )
+        }
+        _ => return FrameAction::Passthrough,
     };
 
-    match ipv4.next_header() {
+    match protocol {
         smoltcp::wire::IpProtocol::Tcp => {
-            let tcp = match TcpPacket::new_checked(ipv4.payload()) {
+            let tcp = match TcpPacket::new_checked(transport) {
                 Ok(packet) => packet,
                 Err(_) => return FrameAction::Passthrough,
             };
 
             if tcp.syn() && !tcp.ack() {
                 FrameAction::TcpSyn {
-                    source: SocketAddr::new(std::net::IpAddr::V4(ipv4.src_addr()), tcp.src_port()),
-                    destination: SocketAddr::new(
-                        std::net::IpAddr::V4(ipv4.dst_addr()),
-                        tcp.dst_port(),
-                    ),
+                    source: SocketAddr::new(src_ip, tcp.src_port()),
+                    destination: SocketAddr::new(dst_ip, tcp.dst_port()),
                 }
             } else {
                 FrameAction::Passthrough
             }
         }
         smoltcp::wire::IpProtocol::Udp => {
-            let udp = match UdpPacket::new_checked(ipv4.payload()) {
+            let udp = match UdpPacket::new_checked(transport) {
                 Ok(packet) => packet,
                 Err(_) => return FrameAction::Passthrough,
             };

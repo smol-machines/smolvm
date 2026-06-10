@@ -35,6 +35,12 @@ pub const GATEWAY: &str = "SMOLVM_NETWORK_GATEWAY";
 pub const PREFIX_LEN: &str = "SMOLVM_NETWORK_PREFIX_LEN";
 /// Guest MAC address in colon-separated string form.
 pub const GUEST_MAC: &str = "SMOLVM_NETWORK_GUEST_MAC";
+/// Guest IPv6 (ULA) address. Optional: absent means IPv4-only guest config.
+pub const GUEST_IP6: &str = "SMOLVM_NETWORK_GUEST_IP6";
+/// Guest-visible default gateway IPv6 address.
+pub const GATEWAY6: &str = "SMOLVM_NETWORK_GATEWAY6";
+/// Guest IPv6 prefix length.
+pub const PREFIX_LEN6: &str = "SMOLVM_NETWORK_PREFIX_LEN6";
 /// Guest-visible DNS server IPv4 address.
 pub const DNS: &str = "SMOLVM_NETWORK_DNS";
 /// Enables the guest-side DNS filtering proxy.

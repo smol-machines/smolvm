@@ -1,6 +1,12 @@
 //! Linux network configuration helpers for a given host NIC.
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
+
+/// `IFA_F_NODAD` from `linux/if_addr.h`: skip Duplicate Address Detection for a
+/// statically assigned IPv6 address. On the two-node virtual link the addresses
+/// are deterministic, and skipping DAD avoids the ~1s "tentative" window before
+/// the guest can use its IPv6 address.
+const IFA_F_NODAD: u8 = 0x02;
 
 /// Configure a guest interface for the virtio-net.
 ///
@@ -52,6 +58,7 @@ use std::net::Ipv4Addr;
 ///   we can set `IFF_UP`.
 /// - `RTM_NEWADDR`: asks the kernel routing stack to add an IPv4 address.
 /// - `RTM_NEWROUTE`: asks the kernel routing stack to install the default route.
+#[allow(clippy::too_many_arguments)]
 pub fn configure_interface(
     ifname: &str,
     mac: [u8; 6],
@@ -59,6 +66,7 @@ pub fn configure_interface(
     address: Ipv4Addr,
     prefix_len: u8,
     gateway: Ipv4Addr,
+    ipv6: Option<(Ipv6Addr, u8, Ipv6Addr)>,
     dns_server: Ipv4Addr,
 ) -> Result<(), String> {
     let ifindex = get_ifindex(ifname)?;
@@ -67,6 +75,10 @@ pub fn configure_interface(
     add_address_v4(ifindex, address, prefix_len)?;
     bring_interface_up(ifname)?;
     add_default_route_v4(gateway)?;
+    if let Some((address6, prefix_len6, gateway6)) = ipv6 {
+        add_address_v6(ifindex, address6, prefix_len6)?;
+        add_default_route_v6(gateway6)?;
+    }
     write_resolv_conf(dns_server)?;
     Ok(())
 }
@@ -233,9 +245,28 @@ fn bring_interface_up(ifname: &str) -> Result<(), String> {
 ///   routes
 fn add_address_v4(ifindex: u32, address: Ipv4Addr, prefix_len: u8) -> Result<(), String> {
     let address_bytes = address.octets();
-    netlink_newaddr(ifindex, prefix_len, &address_bytes).map_err(|err| {
+    netlink_newaddr(ifindex, libc::AF_INET as u8, 0, prefix_len, &address_bytes).map_err(|err| {
         format!(
             "failed to add IPv4 address {}/{}: {}",
+            address, prefix_len, err
+        )
+    })
+}
+
+/// Add the guest IPv6 address through rtnetlink (`ip -6 addr add ...`), with
+/// DAD skipped (see [`IFA_F_NODAD`]).
+fn add_address_v6(ifindex: u32, address: Ipv6Addr, prefix_len: u8) -> Result<(), String> {
+    let address_bytes = address.octets();
+    netlink_newaddr(
+        ifindex,
+        libc::AF_INET6 as u8,
+        IFA_F_NODAD,
+        prefix_len,
+        &address_bytes,
+    )
+    .map_err(|err| {
+        format!(
+            "failed to add IPv6 address {}/{}: {}",
             address, prefix_len, err
         )
     })
@@ -259,8 +290,16 @@ fn add_address_v4(ifindex: u32, address: Ipv4Addr, prefix_len: u8) -> Result<(),
 ///   resolve that gateway as reachable on the connected subnet
 fn add_default_route_v4(gateway: Ipv4Addr) -> Result<(), String> {
     let gateway_bytes = gateway.octets();
-    netlink_newroute(&gateway_bytes)
+    netlink_newroute(libc::AF_INET as u8, &gateway_bytes)
         .map_err(|err| format!("failed to add default route via {}: {}", gateway, err))
+}
+
+/// Install the default IPv6 route through the provided gateway
+/// (`ip -6 route add default via ...`).
+fn add_default_route_v6(gateway: Ipv6Addr) -> Result<(), String> {
+    let gateway_bytes = gateway.octets();
+    netlink_newroute(libc::AF_INET6 as u8, &gateway_bytes)
+        .map_err(|err| format!("failed to add default IPv6 route via {}: {}", gateway, err))
 }
 
 /// Replace `/etc/resolv.conf` with the gateway-side resolver.
@@ -405,10 +444,19 @@ const _: () = assert!(std::mem::size_of::<RtMsg>() == RTMSG_LEN);
 ///
 /// Why both `IFA_ADDRESS` and `IFA_LOCAL` are present:
 /// - for a plain unicast interface address, both effectively describe the same
-///   IPv4 address
+///   address
 /// - including both matches the common shape produced by tools like `ip`
 ///   for local interface address assignment
-fn netlink_newaddr(ifindex: u32, prefix_len: u8, address: &[u8]) -> std::io::Result<()> {
+///
+/// `family` selects IPv4 (`AF_INET`, 4-byte address) or IPv6 (`AF_INET6`,
+/// 16-byte address); `flags` carries e.g. [`IFA_F_NODAD`].
+fn netlink_newaddr(
+    ifindex: u32,
+    family: u8,
+    flags: u8,
+    prefix_len: u8,
+    address: &[u8],
+) -> std::io::Result<()> {
     let rta_len = rta_space(address.len());
     let msg_len = NLMSG_HDRLEN + IFADDRMSG_LEN + (rta_len * 2);
     let mut buf = vec![0u8; nlmsg_align(msg_len)];
@@ -426,9 +474,9 @@ fn netlink_newaddr(ifindex: u32, prefix_len: u8, address: &[u8]) -> std::io::Res
     let ifa = unsafe { buf.as_mut_ptr().add(NLMSG_HDRLEN).cast::<IfAddrMsg>() };
     // SAFETY: `buf` is large enough for `IfAddrMsg`.
     unsafe {
-        (*ifa).ifa_family = libc::AF_INET as u8;
+        (*ifa).ifa_family = family;
         (*ifa).ifa_prefixlen = prefix_len;
-        (*ifa).ifa_flags = 0;
+        (*ifa).ifa_flags = flags;
         (*ifa).ifa_scope = libc::RT_SCOPE_UNIVERSE;
         (*ifa).ifa_index = ifindex;
     }
@@ -463,9 +511,12 @@ fn netlink_newaddr(ifindex: u32, prefix_len: u8, address: &[u8]) -> std::io::Res
 ///   protocol = RTPROT_BOOT
 ///   scope    = RT_SCOPE_UNIVERSE
 ///   type     = RTN_UNICAST
-/// rtattr RTA_GATEWAY = <gateway IPv4 bytes>
+/// rtattr RTA_GATEWAY = <gateway address bytes>
 /// ```
-fn netlink_newroute(gateway: &[u8]) -> std::io::Result<()> {
+///
+/// `family` selects IPv4 (`AF_INET`, 4-byte gateway) or IPv6 (`AF_INET6`,
+/// 16-byte gateway).
+fn netlink_newroute(family: u8, gateway: &[u8]) -> std::io::Result<()> {
     let rta_len = rta_space(gateway.len());
     let msg_len = NLMSG_HDRLEN + RTMSG_LEN + rta_len;
     let mut buf = vec![0u8; nlmsg_align(msg_len)];
@@ -483,7 +534,7 @@ fn netlink_newroute(gateway: &[u8]) -> std::io::Result<()> {
     let rtm = unsafe { buf.as_mut_ptr().add(NLMSG_HDRLEN).cast::<RtMsg>() };
     // SAFETY: `buf` is large enough for `RtMsg`.
     unsafe {
-        (*rtm).rtm_family = libc::AF_INET as u8;
+        (*rtm).rtm_family = family;
         (*rtm).rtm_dst_len = 0;
         (*rtm).rtm_src_len = 0;
         (*rtm).rtm_tos = 0;

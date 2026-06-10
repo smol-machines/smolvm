@@ -48,7 +48,7 @@
 //! currently return an explicit error instead of attempting a partial setup.
 
 use smolvm_protocol::guest_env;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 /// Configure the guest network interface from host-provided environment.
 ///
@@ -64,6 +64,8 @@ use std::net::Ipv4Addr;
 /// - `SMOLVM_NETWORK_PREFIX_LEN`
 /// - `SMOLVM_NETWORK_GUEST_MAC`
 /// - `SMOLVM_NETWORK_DNS`
+/// - `SMOLVM_NETWORK_GUEST_IP6` / `SMOLVM_NETWORK_GATEWAY6` /
+///   `SMOLVM_NETWORK_PREFIX_LEN6` (optional trio — absent means IPv4-only)
 ///
 /// Example:
 ///
@@ -74,6 +76,9 @@ use std::net::Ipv4Addr;
 /// SMOLVM_NETWORK_PREFIX_LEN=24
 /// SMOLVM_NETWORK_GUEST_MAC=02:53:4d:00:00:02
 /// SMOLVM_NETWORK_DNS=10.0.2.2
+/// SMOLVM_NETWORK_GUEST_IP6=fd53:4d00::2
+/// SMOLVM_NETWORK_GATEWAY6=fd53:4d00::1
+/// SMOLVM_NETWORK_PREFIX_LEN6=64
 /// ```
 ///
 /// What this function does
@@ -111,11 +116,41 @@ pub fn configure_from_env() -> Result<bool, String> {
     let prefix_len = env_u8(guest_env::PREFIX_LEN)?;
     let guest_mac = env_mac(guest_env::GUEST_MAC)?;
     let dns_server = env_ipv4(guest_env::DNS)?;
+    let ipv6 = env_ipv6_config()?;
 
     linux::configure_interface(
-        "eth0", guest_mac, 1500, guest_ip, prefix_len, gateway, dns_server,
+        "eth0", guest_mac, 1500, guest_ip, prefix_len, gateway, ipv6, dns_server,
     )?;
     Ok(true)
+}
+
+/// Parse the optional IPv6 trio. All three vars must be present together; a
+/// partial set is a malformed contract and fails the boot rather than leaving a
+/// half-configured stack.
+fn env_ipv6_config() -> Result<Option<(Ipv6Addr, u8, Ipv6Addr)>, String> {
+    let vars = [
+        guest_env::GUEST_IP6,
+        guest_env::GATEWAY6,
+        guest_env::PREFIX_LEN6,
+    ];
+    let present = vars
+        .iter()
+        .filter(|name| std::env::var(name).is_ok_and(|v| !v.is_empty()))
+        .count();
+    match present {
+        0 => Ok(None),
+        3 => Ok(Some((
+            env_ipv6(guest_env::GUEST_IP6)?,
+            env_u8(guest_env::PREFIX_LEN6)?,
+            env_ipv6(guest_env::GATEWAY6)?,
+        ))),
+        _ => Err(format!(
+            "incomplete IPv6 network config: {} / {} / {} must be set together",
+            guest_env::GUEST_IP6,
+            guest_env::GATEWAY6,
+            guest_env::PREFIX_LEN6
+        )),
+    }
 }
 
 fn env_ipv4(name: &str) -> Result<Ipv4Addr, String> {
@@ -123,6 +158,13 @@ fn env_ipv4(name: &str) -> Result<Ipv4Addr, String> {
     value
         .parse::<Ipv4Addr>()
         .map_err(|_| format!("invalid IPv4 address for {}: {}", name, value))
+}
+
+fn env_ipv6(name: &str) -> Result<Ipv6Addr, String> {
+    let value = std::env::var(name).map_err(|_| format!("missing {}", name))?;
+    value
+        .parse::<Ipv6Addr>()
+        .map_err(|_| format!("invalid IPv6 address for {}: {}", name, value))
 }
 
 fn env_u8(name: &str) -> Result<u8, String> {
@@ -171,7 +213,7 @@ mod linux;
 
 #[cfg(not(target_os = "linux"))]
 mod linux {
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     #[allow(clippy::too_many_arguments)]
     pub fn configure_interface(
@@ -181,6 +223,7 @@ mod linux {
         _address: Ipv4Addr,
         _prefix_len: u8,
         _gateway: Ipv4Addr,
+        _ipv6: Option<(Ipv6Addr, u8, Ipv6Addr)>,
         _dns_server: Ipv4Addr,
     ) -> Result<(), String> {
         Err("guest virtio networking is only supported on Linux".to_string())

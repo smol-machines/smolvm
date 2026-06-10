@@ -26,6 +26,7 @@
 //! - the relay thread owns the host-facing TCP socket
 //! - channels bridge payloads between them
 
+use crate::egress::EgressPolicy;
 use crate::queues::WakePipe;
 use crate::virtio_net_log;
 use smoltcp::iface::{Interface, SocketHandle, SocketSet};
@@ -60,6 +61,9 @@ pub struct TcpRelayTable {
     used_published_ports: HashSet<u16>,
     next_published_port: u16,
     max_connections: usize,
+    /// Outbound allow-list applied before opening a host connection for a
+    /// guest-initiated flow. Inbound published-port connections bypass it.
+    egress: EgressPolicy,
 }
 
 /// Newly established guest connection ready for a host relay thread.
@@ -168,13 +172,14 @@ impl RelayExitState {
 
 impl TcpRelayTable {
     /// Create a new relay table.
-    pub fn new(max_connections: Option<usize>) -> Self {
+    pub fn new(max_connections: Option<usize>, egress: EgressPolicy) -> Self {
         Self {
             connections: HashMap::new(),
             connection_keys: HashSet::new(),
             used_published_ports: HashSet::new(),
             next_published_port: PUBLISHED_PORT_START,
             max_connections: max_connections.unwrap_or(MAX_CONNECTIONS),
+            egress,
         }
     }
 
@@ -210,15 +215,23 @@ impl TcpRelayTable {
             return false;
         }
 
+        // Egress policy: drop the guest SYN before any socket is created when the
+        // destination isn't allowed, so the guest just sees the connection fail.
+        // Inbound published-port flows take a separate path and are unaffected.
+        if !self.egress.allows(destination.ip()) {
+            tracing::debug!(
+                %destination,
+                "virtio-net: blocking outbound connection by egress policy"
+            );
+            return false;
+        }
+
         let rx_buffer = tcp::SocketBuffer::new(vec![0u8; TCP_RX_BUFFER_BYTES]);
         let tx_buffer = tcp::SocketBuffer::new(vec![0u8; TCP_TX_BUFFER_BYTES]);
         let mut socket = tcp::Socket::new(rx_buffer, tx_buffer);
-        let std::net::IpAddr::V4(destination_ip) = destination.ip() else {
-            return false;
-        };
 
         let listen_endpoint = IpListenEndpoint {
-            addr: Some(destination_ip.into()),
+            addr: Some(destination.ip().into()),
             port: destination.port(),
         };
         if socket.listen(listen_endpoint).is_err() {
@@ -291,6 +304,8 @@ impl TcpRelayTable {
             return false;
         };
 
+        // Inbound published connections always target the guest's IPv4 on the
+        // internal link (the host listener family is independent of this).
         let std::net::IpAddr::V4(destination_ip) = destination.ip() else {
             self.used_published_ports.remove(&local_port);
             return false;

@@ -179,9 +179,6 @@ pub fn launch_agent_vm_dynamic(
     }
 
     let network_plan = plan_launch_network(&config.resources, None, config.port_mappings.len());
-    if let Some(reason) = network_plan.fallback_reason {
-        tracing::warn!(reason = %reason.user_message(), "network backend fell back to TSI");
-    }
 
     let mut virtio_network_runtime: Option<VirtioNetworkRuntime> = None;
     let guest_network = match network_plan.backend {
@@ -267,8 +264,12 @@ pub fn launch_agent_vm_dynamic(
                 .iter()
                 .map(|(host, guest)| VirtioPortMapping::new(*host, *guest))
                 .collect();
+            let egress = smolvm_network::EgressPolicy::from_allowed_cidrs(
+                config.resources.allowed_cidrs.as_deref(),
+            );
 
-            let runtime = match start_virtio_network(host_fd, guest_network, &port_mappings) {
+            let runtime = match start_virtio_network(host_fd, guest_network, &port_mappings, egress)
+            {
                 Ok(runtime) => runtime,
                 Err(err) => {
                     // SAFETY: guest_fd was created by socketpair above and not moved elsewhere.
@@ -416,6 +417,21 @@ pub fn launch_agent_vm_dynamic(
             "{}={}",
             guest_env::GUEST_MAC,
             format_mac(network.guest_mac)
+        )));
+        env_strings.push(cstr(&format!(
+            "{}={}",
+            guest_env::GUEST_IP6,
+            network.guest_ip6
+        )));
+        env_strings.push(cstr(&format!(
+            "{}={}",
+            guest_env::GATEWAY6,
+            network.gateway_ip6
+        )));
+        env_strings.push(cstr(&format!(
+            "{}={}",
+            guest_env::PREFIX_LEN6,
+            network.prefix_len6
         )));
         env_strings.push(cstr(&format!("{}={}", guest_env::DNS, network.dns_server)));
     }

@@ -15,7 +15,11 @@ smoltcp = { version = "0.13", default-features = false, features = [
     "log",
     "medium-ethernet",
     "proto-ipv4",
+    "proto-ipv6",
     "socket-tcp",
     "socket-udp",
+    # The gateway interface owns three addresses: IPv4, IPv6 ULA, and the
+    # IPv6 link-local (default cap is 2).
+    "iface-max-addr-count-3",
 ] }
 tracing = { workspace = true }

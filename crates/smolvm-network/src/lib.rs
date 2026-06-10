@@ -58,15 +58,19 @@
 //!   connections
 
 pub mod device;
+pub mod dns;
+pub mod egress;
 pub mod frame_stream;
 pub mod queues;
 pub mod stack;
 pub mod tcp_listeners;
 pub mod tcp_relay;
 
+pub use egress::EgressPolicy;
+
 use std::fmt;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::RawFd;
 use std::thread::JoinHandle;
 use std::time::SystemTime;
@@ -104,6 +108,9 @@ impl PortMapping {
 /// This struct describes the two endpoints of the single virtual Ethernet link:
 /// - the guest NIC (`guest_*`)
 /// - the host-side gateway implemented by smolvm (`gateway_*`)
+///
+/// The link is dual-stack: a /30 IPv4 point-to-point pair and a /64 ULA IPv6
+/// pair (`fd53:4d00::/64` — `53:4d` = "SM", matching the MAC OUI scheme).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GuestNetworkConfig {
     /// Guest IPv4 address.
@@ -112,6 +119,12 @@ pub struct GuestNetworkConfig {
     pub gateway_ip: Ipv4Addr,
     /// Prefix length.
     pub prefix_len: u8,
+    /// Guest IPv6 (ULA) address.
+    pub guest_ip6: Ipv6Addr,
+    /// Gateway IPv6 (ULA) address.
+    pub gateway_ip6: Ipv6Addr,
+    /// IPv6 prefix length.
+    pub prefix_len6: u8,
     /// Guest MAC address.
     pub guest_mac: [u8; 6],
     /// Gateway MAC address.
@@ -127,6 +140,9 @@ impl GuestNetworkConfig {
             guest_ip: Ipv4Addr::new(100, 96, 0, 2),
             gateway_ip: Ipv4Addr::new(100, 96, 0, 1),
             prefix_len: 30,
+            guest_ip6: Ipv6Addr::new(0xfd53, 0x4d00, 0, 0, 0, 0, 0, 2),
+            gateway_ip6: Ipv6Addr::new(0xfd53, 0x4d00, 0, 0, 0, 0, 0, 1),
+            prefix_len6: 64,
             guest_mac: [0x02, 0x53, 0x4d, 0x00, 0x00, 0x02],
             gateway_mac: [0x02, 0x53, 0x4d, 0x00, 0x00, 0x01],
             dns_server: Ipv4Addr::new(100, 96, 0, 1),
@@ -222,6 +238,7 @@ pub fn start_virtio_network(
     host_fd: RawFd,
     guest_network: GuestNetworkConfig,
     published_ports: &[PortMapping],
+    egress: EgressPolicy,
 ) -> io::Result<VirtioNetworkRuntime> {
     virtio_net_log!(
         "virtio-net: starting runtime host_fd={} guest_ip={} gateway_ip={} dns_server={}",
@@ -251,9 +268,13 @@ pub fn start_virtio_network(
             guest_mac: guest_network.guest_mac,
             gateway_ipv4: guest_network.gateway_ip,
             guest_ipv4: guest_network.guest_ip,
+            gateway_ipv6: guest_network.gateway_ip6,
+            guest_ipv6: guest_network.guest_ip6,
+            prefix_len6: guest_network.prefix_len6,
             mtu: 1500,
         },
         tcp_listeners.as_ref().map(|_| tcp_receiver),
+        egress,
     )?;
 
     Ok(VirtioNetworkRuntime {
