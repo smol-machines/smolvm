@@ -312,8 +312,44 @@ fn add_default_route_v6(gateway: Ipv6Addr) -> Result<(), String> {
 /// DNS configuration in a minimal Linux guest is usually conveyed through
 /// `/etc/resolv.conf`, and that is enough for the MVP.
 fn write_resolv_conf(dns_server: Ipv4Addr) -> Result<(), String> {
-    std::fs::write("/etc/resolv.conf", format!("nameserver {}\n", dns_server))
-        .map_err(|err| format!("failed to write /etc/resolv.conf: {}", err))
+    let contents = format!("nameserver {}\n", dns_server);
+    let direct_err = match std::fs::write("/etc/resolv.conf", &contents) {
+        Ok(()) => return Ok(()),
+        Err(err) => err,
+    };
+
+    // Read-only /etc (the Linux agent rootfs boots read-only — same trap class
+    // as the read-only /tmp): stage the file on the tmpfs /tmp and bind-mount
+    // it over /etc/resolv.conf. And in NO case may DNS config kill the boot —
+    // the interface, routes, and egress NAT are already up; a guest without
+    // resolv.conf still serves published ports and numeric egress — so any
+    // residual failure degrades to a WARN instead of an Err (which the caller
+    // treats as fatal for PID 1).
+    let staged = "/tmp/.smolvm-resolv.conf";
+    if let Err(e) = std::fs::write(staged, &contents) {
+        tracing::warn!(error = %e, original = %direct_err,
+            "resolv.conf unwritable and tmpfs staging failed; continuing without DNS config");
+        return Ok(());
+    }
+    let src = std::ffi::CString::new(staged).expect("static path");
+    let dst = std::ffi::CString::new("/etc/resolv.conf").expect("static path");
+    let rc = unsafe {
+        libc::mount(
+            src.as_ptr(),
+            dst.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND,
+            std::ptr::null(),
+        )
+    };
+    if rc != 0 {
+        tracing::warn!(
+            error = %std::io::Error::last_os_error(),
+            original = %direct_err,
+            "resolv.conf bind-mount fallback failed; continuing without DNS config"
+        );
+    }
+    Ok(())
 }
 
 /// Create a datagram socket used only as an ioctl control handle.

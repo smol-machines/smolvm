@@ -60,6 +60,15 @@ fn has_library(name: &str) -> bool {
 }
 
 fn main() {
+    // Build scripts run on the HOST: `cfg!(target_os)` here describes the
+    // build machine, not the artifact. Cross-compiling smolvm from macOS to
+    // Linux (zigbuild) must NOT emit macOS-only linker args (-sectcreate,
+    // -weak-lkrun) — gate every emission on the actual compile target.
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os != "macos" {
+        return;
+    }
+
     // On macOS, create a placeholder __SMOLVM,__smolvm Mach-O section.
     // This section is replaced with real data by `smolvm pack --single-file`.
     // The placeholder marker is NOT the SMOLSECT magic, so detect.rs won't
