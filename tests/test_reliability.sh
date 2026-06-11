@@ -23,8 +23,8 @@ test_concurrent_machine_start() {
     local vm_a="conc-start-a-$$"
     local vm_b="conc-start-b-$$"
 
-    $SMOLVM machine create "$vm_a" --cpus 1 --mem 256 2>&1 >/dev/null || return 1
-    $SMOLVM machine create "$vm_b" --cpus 1 --mem 256 2>&1 >/dev/null || return 1
+    $SMOLVM machine create --name "$vm_a" --cpus 1 --mem 256 2>&1 >/dev/null || return 1
+    $SMOLVM machine create --name "$vm_b" --cpus 1 --mem 256 2>&1 >/dev/null || return 1
 
     # Start both simultaneously — previously the second would fail with DB lock error
     $SMOLVM machine start --name "$vm_a" 2>&1 >/dev/null &
@@ -45,8 +45,8 @@ test_concurrent_machine_start() {
 
     $SMOLVM machine stop --name "$vm_a" 2>/dev/null || true
     $SMOLVM machine stop --name "$vm_b" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_a" -f 2>/dev/null || true
-    $SMOLVM machine delete "$vm_b" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_a" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_b" -f 2>/dev/null || true
 
     [[ "$status_a" == *"running"* ]] && [[ "$status_b" == *"running"* ]]
 }
@@ -79,12 +79,12 @@ test_machine_ls_does_not_kill_vm() {
 test_named_vm_survives_ls() {
     skip_if_slow && return 0
     # Same regression test but with a named VM — the customer's exact scenario:
-    # machine create X --from .smolmachine → machine start → machine ls shows stopped.
+    # machine create --name X --from .smolmachine → machine start → machine ls shows stopped.
     # Verify over 60 seconds with interleaved ls + exec.
     local name="ls-probe-test"
     $SMOLVM machine stop --name "$name" 2>/dev/null || true
-    $SMOLVM machine delete "$name" -f 2>/dev/null || true
-    $SMOLVM machine create "$name" 2>&1 || return 1
+    $SMOLVM machine delete --name "$name" -f 2>/dev/null || true
+    $SMOLVM machine create --name "$name" 2>&1 || return 1
     $SMOLVM machine start --name "$name" 2>&1 || return 1
 
     # Wait for agent to be fully ready
@@ -93,17 +93,17 @@ test_named_vm_survives_ls() {
     for i in 1 2 3 4 5 6; do
         local state
         state=$($SMOLVM machine ls 2>&1 | grep "$name" | awk '{print $2}')
-        [[ "$state" == "running" ]] || { echo "VM '$name' died after ls #$i (state: $state)"; $SMOLVM machine delete "$name" -f 2>/dev/null; return 1; }
+        [[ "$state" == "running" ]] || { echo "VM '$name' died after ls #$i (state: $state)"; $SMOLVM machine delete --name "$name" -f 2>/dev/null; return 1; }
         sleep 10
     done
 
     # Exec must work after 60 seconds of ls probing
     local result
     result=$($SMOLVM machine exec --name "$name" -- echo "alive" 2>&1)
-    [[ "$result" == *"alive"* ]] || { echo "exec failed: $result"; $SMOLVM machine delete "$name" -f 2>/dev/null; return 1; }
+    [[ "$result" == *"alive"* ]] || { echo "exec failed: $result"; $SMOLVM machine delete --name "$name" -f 2>/dev/null; return 1; }
 
     $SMOLVM machine stop --name "$name" 2>&1 || true
-    $SMOLVM machine delete "$name" -f 2>&1 || true
+    $SMOLVM machine delete --name "$name" -f 2>&1 || true
 }
 
 test_state_probe_tolerates_busy_agent() {

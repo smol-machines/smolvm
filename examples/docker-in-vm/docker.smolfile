@@ -39,7 +39,7 @@
 #
 # ── Create and start ─────────────────────────────────────────────────────────
 #
-#   smolvm machine create docker -s examples/docker-in-vm/docker.smolfile --net-backend virtio-net
+#   smolvm machine create --name docker -s examples/docker-in-vm/docker.smolfile --net-backend virtio-net
 #   smolvm machine start --name docker
 #
 # ── Start dockerd ─────────────────────────────────────────────────────────────

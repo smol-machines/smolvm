@@ -69,11 +69,11 @@ test_machine_network_disabled_by_default() {
 
     # Clean up any existing
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
     # Create VM without --net (network disabled by default)
-    $SMOLVM machine create "$vm_name" 2>&1 || return 1
-    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+    $SMOLVM machine create --name "$vm_name" 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1; }
 
     # DNS resolution should fail when network is disabled
     local exit_code=0
@@ -81,7 +81,7 @@ test_machine_network_disabled_by_default() {
 
     # Clean up
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
     ensure_data_dir_deleted "$vm_name"
 
     # Should fail (non-zero exit code) because network is disabled
@@ -93,11 +93,11 @@ test_machine_network_dns_resolution() {
 
     # Clean up any existing
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
     # Create VM with --net (network enabled)
-    $SMOLVM machine create "$vm_name" --net 2>&1 || return 1
-    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+    $SMOLVM machine create --name "$vm_name" --net 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1; }
 
     # Test DNS resolution
     local output exit_code=0
@@ -105,7 +105,7 @@ test_machine_network_dns_resolution() {
 
     # Clean up
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
     ensure_data_dir_deleted "$vm_name"
 
     # Should succeed and contain resolved address info
@@ -117,11 +117,11 @@ test_machine_network_multiple_dns_lookups() {
 
     # Clean up any existing
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
     # Create VM with --net (network enabled)
-    $SMOLVM machine create "$vm_name" --net 2>&1 || return 1
-    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+    $SMOLVM machine create --name "$vm_name" --net 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1; }
 
     # Test multiple DNS lookups
     local output exit_code=0
@@ -129,7 +129,7 @@ test_machine_network_multiple_dns_lookups() {
 
     # Clean up
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
     ensure_data_dir_deleted "$vm_name"
 
     # Should succeed and contain addresses for both
@@ -140,18 +140,18 @@ test_machine_egress_allow_cidr_permitted() {
     local vm_name="egress-allow-test-$$"
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
     # Create VM allowing only Cloudflare DNS
-    $SMOLVM machine create "$vm_name" --allow-cidr 1.1.1.1/32 2>&1 || return 1
-    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+    $SMOLVM machine create --name "$vm_name" --allow-cidr 1.1.1.1/32 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1; }
 
     # DNS lookup to allowed IP should succeed
     local output exit_code=0
     output=$($SMOLVM machine exec --name "$vm_name" -- nslookup cloudflare.com 1.1.1.1 2>&1) || exit_code=$?
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
     ensure_data_dir_deleted "$vm_name"
 
     [[ $exit_code -eq 0 ]] && [[ "$output" == *"Address"* ]]
@@ -161,19 +161,19 @@ test_machine_egress_allow_cidr_blocked() {
     local vm_name="egress-block-test-$$"
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
     # Create VM allowing only a private range. ensure_dns_in_cidrs also
     # auto-adds the host's DNS resolver so the VM can still resolve names.
-    $SMOLVM machine create "$vm_name" --allow-cidr 10.0.0.0/8 2>&1 || return 1
-    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+    $SMOLVM machine create --name "$vm_name" --allow-cidr 10.0.0.0/8 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1; }
 
     # A destination outside 10.0.0.0/8 (and not the auto-added resolver) blocked.
     local blocked_rc=0
     assert_egress_blocked "$vm_name" || blocked_rc=1
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
     ensure_data_dir_deleted "$vm_name"
 
     [[ $blocked_rc -eq 0 ]]
@@ -183,17 +183,17 @@ test_machine_egress_outbound_localhost_only() {
     local vm_name="egress-localhost-test-$$"
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
-    $SMOLVM machine create "$vm_name" --outbound-localhost-only 2>&1 || return 1
-    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+    $SMOLVM machine create --name "$vm_name" --outbound-localhost-only 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1; }
 
     # Loopback-only egress: every external destination must be blocked.
     local blocked_rc=0
     assert_egress_blocked "$vm_name" || blocked_rc=1
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
     ensure_data_dir_deleted "$vm_name"
 
     [[ $blocked_rc -eq 0 ]]
@@ -202,9 +202,9 @@ test_machine_egress_outbound_localhost_only() {
 test_machine_egress_invalid_cidr_rejected() {
     local vm_name="egress-invalid-test-$$"
     local output exit_code=0
-    output=$($SMOLVM machine create "$vm_name" --allow-cidr "not-a-cidr" 2>&1) || exit_code=$?
+    output=$($SMOLVM machine create --name "$vm_name" --allow-cidr "not-a-cidr" 2>&1) || exit_code=$?
 
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
     [[ $exit_code -ne 0 ]] && [[ "$output" == *"invalid"* ]]
 }
@@ -213,18 +213,18 @@ test_machine_egress_allow_host_permitted() {
     local vm_name="egress-host-allow-test-$$"
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
     # Create VM allowing only one.one.one.one (resolves to 1.1.1.1)
-    $SMOLVM machine create "$vm_name" --allow-host one.one.one.one 2>&1 || return 1
-    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+    $SMOLVM machine create --name "$vm_name" --allow-host one.one.one.one 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1; }
 
     # DNS lookup to allowed host's IP should succeed
     local output exit_code=0
     output=$($SMOLVM machine exec --name "$vm_name" -- nslookup cloudflare.com 1.1.1.1 2>&1) || exit_code=$?
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
     ensure_data_dir_deleted "$vm_name"
 
     [[ $exit_code -eq 0 ]] && [[ "$output" == *"Address"* ]]
@@ -234,18 +234,18 @@ test_machine_egress_allow_host_blocked() {
     local vm_name="egress-host-block-test-$$"
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
     # Create VM allowing only one.one.one.one. A host outside the allowlist
     # (and not the auto-added resolver) must be blocked.
-    $SMOLVM machine create "$vm_name" --allow-host one.one.one.one 2>&1 || return 1
-    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+    $SMOLVM machine create --name "$vm_name" --allow-host one.one.one.one 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1; }
 
     local blocked_rc=0
     assert_egress_blocked "$vm_name" || blocked_rc=1
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
     ensure_data_dir_deleted "$vm_name"
 
     [[ $blocked_rc -eq 0 ]]
@@ -254,9 +254,9 @@ test_machine_egress_allow_host_blocked() {
 test_machine_egress_allow_host_invalid_rejected() {
     local vm_name="egress-host-invalid-test-$$"
     local output exit_code=0
-    output=$($SMOLVM machine create "$vm_name" --allow-host "this-does-not-exist.invalid" 2>&1) || exit_code=$?
+    output=$($SMOLVM machine create --name "$vm_name" --allow-host "this-does-not-exist.invalid" 2>&1) || exit_code=$?
 
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
     # Should fail with a resolution error (hard error, not warning)
     [[ $exit_code -ne 0 ]] && [[ "$output" == *"failed to resolve"* ]]
@@ -265,9 +265,9 @@ test_machine_egress_allow_host_invalid_rejected() {
 test_machine_egress_allow_host_port_rejected() {
     local vm_name="egress-host-port-test-$$"
     local output exit_code=0
-    output=$($SMOLVM machine create "$vm_name" --allow-host "example.com:443" 2>&1) || exit_code=$?
+    output=$($SMOLVM machine create --name "$vm_name" --allow-host "example.com:443" 2>&1) || exit_code=$?
 
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
     # Should fail — port suffixes are not supported
     [[ $exit_code -ne 0 ]] && [[ "$output" == *"port suffixes are not supported"* ]]
@@ -277,11 +277,11 @@ test_machine_dns_filter_blocks_resolution() {
     local vm_name="dns-filter-test-$$"
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
     # Create VM allowing only one.one.one.one
-    $SMOLVM machine create "$vm_name" --allow-host one.one.one.one 2>&1 || return 1
-    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+    $SMOLVM machine create --name "$vm_name" --allow-host one.one.one.one 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1; }
 
     # Resolving an allowed domain should work
     local exit_code_allowed=0
@@ -293,7 +293,7 @@ test_machine_dns_filter_blocks_resolution() {
     $SMOLVM machine exec --name "$vm_name" -- nslookup attacker-test.example 2>&1 || exit_code_blocked=$?
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
     ensure_data_dir_deleted "$vm_name"
 
     [[ $exit_code_allowed -eq 0 ]] && [[ $exit_code_blocked -ne 0 ]]
@@ -334,11 +334,11 @@ test_dns_filter_tcp_allowed() {
     local vm_name="dns-tcp-allowed-$$"
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
-    $SMOLVM machine create "$vm_name" --allow-host one.one.one.one 2>&1 || return 1
+    $SMOLVM machine create --name "$vm_name" --allow-host one.one.one.one 2>&1 || return 1
     $SMOLVM machine start --name "$vm_name" 2>&1 \
-        || { $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+        || { $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1; }
 
     # Minimal A query for "one.one.one.one" (33 DNS bytes = 0x21).
     # TCP DNS framing: 2-byte BE length prefix + raw DNS query.
@@ -349,7 +349,7 @@ test_dns_filter_tcp_allowed() {
         '\x00\x21\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03one\x03one\x03one\x03one\x00\x00\x01\x00\x01')
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
     ensure_data_dir_deleted "$vm_name"
 
     [[ "$rcode" -eq 0 ]] || { echo "FAIL: expected RCODE=0 (NOERROR), got RCODE=$rcode"; return 1; }
@@ -359,11 +359,11 @@ test_dns_filter_tcp_blocked() {
     local vm_name="dns-tcp-blocked-$$"
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
-    $SMOLVM machine create "$vm_name" --allow-host one.one.one.one 2>&1 || return 1
+    $SMOLVM machine create --name "$vm_name" --allow-host one.one.one.one 2>&1 || return 1
     $SMOLVM machine start --name "$vm_name" 2>&1 \
-        || { $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+        || { $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1; }
 
     # A query for "attacker.invalid" (34 DNS bytes = 0x22).
     # Name: \x08attacker (9 bytes) + \x07invalid (8 bytes) + \x00 (1 byte) = 18 bytes.
@@ -373,7 +373,7 @@ test_dns_filter_tcp_blocked() {
         '\x00\x22\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x08attacker\x07invalid\x00\x00\x01\x00\x01')
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
     ensure_data_dir_deleted "$vm_name"
 
     [[ "$rcode" -eq 3 ]] || { echo "FAIL: expected RCODE=3 (NXDOMAIN), got RCODE=$rcode"; return 1; }
@@ -383,27 +383,27 @@ test_machine_allow_host_persists_across_restart() {
     local vm_name="dns-persist-test-$$"
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
     # Create with --allow-host, start, stop, start again
-    $SMOLVM machine create "$vm_name" --allow-host one.one.one.one 2>&1 || return 1
-    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+    $SMOLVM machine create --name "$vm_name" --allow-host one.one.one.one 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1; }
 
     # Verify egress works
     local exit_code=0
     $SMOLVM machine exec --name "$vm_name" -- nslookup one.one.one.one 1.1.1.1 2>&1 || exit_code=$?
-    [[ $exit_code -ne 0 ]] && { $SMOLVM machine stop --name "$vm_name" 2>/dev/null; $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+    [[ $exit_code -ne 0 ]] && { $SMOLVM machine stop --name "$vm_name" 2>/dev/null; $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1; }
 
     # Stop and restart — config should persist from VmRecord
     $SMOLVM machine stop --name "$vm_name" 2>&1 || return 1
-    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1; }
 
     # Egress restriction must still hold after the restart.
     local blocked_rc=0
     assert_egress_blocked "$vm_name" || blocked_rc=1
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
     ensure_data_dir_deleted "$vm_name"
 
     [[ $blocked_rc -eq 0 ]]
@@ -419,7 +419,7 @@ test_smolfile_allow_hosts_stale_cidr_regression() {
     fi
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
     local tmpdir
     tmpdir=$(mktemp -d)
@@ -433,7 +433,7 @@ EOF
 
     (
         cd "$tmpdir"
-        $SMOLVM machine create "$vm_name" -s Smolfile.toml 2>&1
+        $SMOLVM machine create --name "$vm_name" -s Smolfile.toml 2>&1
     ) || { rm -rf "$tmpdir"; return 1; }
 
     # Determine DB path (matches SmolvmDb::default_path logic)
@@ -451,11 +451,11 @@ EOF
     # CAST both ways: TEXT for JSON manipulation, then back to BLOB for storage.
     sqlite3 "$db_path" \
         "UPDATE vms SET data = CAST(json_set(CAST(data AS TEXT), '$.allowed_cidrs', json('[\"192.0.2.0/24\"]')) AS BLOB) WHERE name = '$vm_name'" \
-        2>&1 || { echo "sqlite3 update failed"; rm -rf "$tmpdir"; $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+        2>&1 || { echo "sqlite3 update failed"; rm -rf "$tmpdir"; $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1; }
 
     # Start — fix must re-resolve allow_hosts and override the stale CIDRs
     $SMOLVM machine start --name "$vm_name" 2>&1 \
-        || { rm -rf "$tmpdir"; $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+        || { rm -rf "$tmpdir"; $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1; }
 
     # Probe egress using 1.0.0.1 as the resolver — also a valid IP for
     # one.one.one.one, but NOT auto-added by ensure_dns_in_cidrs (which only
@@ -465,8 +465,8 @@ EOF
     $SMOLVM machine exec --name "$vm_name" -- nslookup one.one.one.one 1.0.0.1 2>&1 || exit_code=$?
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
-    # Fallback: if machine delete failed due to a corrupt DB row (e.g. from a
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
+    # Fallback: if machine delete --name failed due to a corrupt DB row (e.g. from a
     # botched sqlite3 update), remove the row directly so it doesn't poison
     # subsequent test runs that scan all rows.
     sqlite3 "$db_path" "DELETE FROM vms WHERE name = '$vm_name'" 2>/dev/null || true
@@ -480,7 +480,7 @@ test_smolfile_allow_hosts_egress_basic() {
     local vm_name="allow-hosts-sf-basic-$$"
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
     local tmpdir
     tmpdir=$(mktemp -d)
@@ -492,11 +492,11 @@ EOF
 
     (
         cd "$tmpdir"
-        $SMOLVM machine create "$vm_name" -s Smolfile.toml 2>&1
+        $SMOLVM machine create --name "$vm_name" -s Smolfile.toml 2>&1
     ) || { rm -rf "$tmpdir"; return 1; }
 
     $SMOLVM machine start --name "$vm_name" 2>&1 \
-        || { rm -rf "$tmpdir"; $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+        || { rm -rf "$tmpdir"; $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1; }
 
     # Probe 1: 1.1.1.1 — always in the egress policy via ensure_dns_in_cidrs.
     # Verifies the policy doesn't block what it should allow, but does NOT
@@ -516,7 +516,7 @@ EOF
     assert_egress_blocked "$vm_name" || blocked_rc=1
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
     rm -rf "$tmpdir"
     ensure_data_dir_deleted "$vm_name"
 
@@ -528,7 +528,7 @@ test_egress_refresh_thread_stability() {
     local vm_name="egress-refresh-smoke-$$"
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
     local tmpdir
     tmpdir=$(mktemp -d)
@@ -540,13 +540,13 @@ EOF
 
     (
         cd "$tmpdir"
-        $SMOLVM machine create "$vm_name" -s Smolfile.toml 2>&1
+        $SMOLVM machine create --name "$vm_name" -s Smolfile.toml 2>&1
     ) || { rm -rf "$tmpdir"; return 1; }
 
     # Start with a 10-second refresh interval so the thread fires twice during
     # the test window without making the test slow.
     SMOLVM_EGRESS_REFRESH_SECS=10 $SMOLVM machine start --name "$vm_name" 2>&1 \
-        || { rm -rf "$tmpdir"; $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+        || { rm -rf "$tmpdir"; $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1; }
 
     # Verify egress works immediately after start.
     local exit_code_before=0
@@ -564,7 +564,7 @@ EOF
         || exit_code_after=$?
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
     rm -rf "$tmpdir"
     ensure_data_dir_deleted "$vm_name"
 

@@ -40,7 +40,7 @@ export "$SECRET_NAME=$SECRET_VALUE"
 cleanup_vm() {
     local name="$1"
     $SMOLVM machine stop --name "$name" 2>/dev/null || true
-    $SMOLVM machine delete "$name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$name" -f 2>/dev/null || true
 }
 
 cleanup_secrets_test() {
@@ -71,7 +71,7 @@ test_secret_reaches_guest_exec() {
     local vm="secret-exec-$$"
     cleanup_vm "$vm"
     write_smolfile "$SECRET_TMPDIR/Smolfile.exec"
-    $SMOLVM machine create "$vm" --smolfile "$SECRET_TMPDIR/Smolfile.exec" 2>&1 || return 1
+    $SMOLVM machine create --name "$vm" --smolfile "$SECRET_TMPDIR/Smolfile.exec" 2>&1 || return 1
     $SMOLVM machine start --name "$vm" 2>&1 || { cleanup_vm "$vm"; return 1; }
     # `env` (busybox) prints the whole environment — robust across rootfs builds.
     local output
@@ -88,7 +88,7 @@ test_secret_reaches_guest_init() {
     cleanup_vm "$vm"
     write_smolfile "$SECRET_TMPDIR/Smolfile.init" \
         "init = [\"printenv $SECRET_NAME > /tmp/secret-out.txt\"]"
-    $SMOLVM machine create "$vm" --smolfile "$SECRET_TMPDIR/Smolfile.init" 2>&1 || return 1
+    $SMOLVM machine create --name "$vm" --smolfile "$SECRET_TMPDIR/Smolfile.init" 2>&1 || return 1
     $SMOLVM machine start --name "$vm" 2>&1 || { cleanup_vm "$vm"; return 1; }
     local output
     output=$($SMOLVM machine exec --name "$vm" -- cat /tmp/secret-out.txt 2>&1)
@@ -103,7 +103,7 @@ test_plaintext_not_in_db() {
     local vm="secret-nodb-$$"
     cleanup_vm "$vm"
     write_smolfile "$SECRET_TMPDIR/Smolfile.nodb"
-    $SMOLVM machine create "$vm" --smolfile "$SECRET_TMPDIR/Smolfile.nodb" 2>&1 || return 1
+    $SMOLVM machine create --name "$vm" --smolfile "$SECRET_TMPDIR/Smolfile.nodb" 2>&1 || return 1
     # Start too, so any persist-on-run path also executes.
     $SMOLVM machine start --name "$vm" 2>&1 || { cleanup_vm "$vm"; return 1; }
     # The ref NAME may legitimately appear in the record; the VALUE must not.
@@ -124,7 +124,7 @@ test_plaintext_not_in_pack() {
     local vm="secret-nopack-$$"
     cleanup_vm "$vm"
     write_smolfile "$SECRET_TMPDIR/Smolfile.nopack"
-    $SMOLVM machine create "$vm" --smolfile "$SECRET_TMPDIR/Smolfile.nopack" 2>&1 || return 1
+    $SMOLVM machine create --name "$vm" --smolfile "$SECRET_TMPDIR/Smolfile.nopack" 2>&1 || return 1
     $SMOLVM machine start --name "$vm" 2>&1 || { cleanup_vm "$vm"; return 1; }
     $SMOLVM machine stop --name "$vm" 2>&1 || true
     local pack="$SECRET_TMPDIR/out.smolmachine"
@@ -145,7 +145,7 @@ test_secret_reresolves_after_restart() {
     local vm="secret-restart-$$"
     cleanup_vm "$vm"
     write_smolfile "$SECRET_TMPDIR/Smolfile.restart"
-    $SMOLVM machine create "$vm" --smolfile "$SECRET_TMPDIR/Smolfile.restart" 2>&1 || return 1
+    $SMOLVM machine create --name "$vm" --smolfile "$SECRET_TMPDIR/Smolfile.restart" 2>&1 || return 1
     $SMOLVM machine start --name "$vm" 2>&1 || { cleanup_vm "$vm"; return 1; }
     $SMOLVM machine stop --name "$vm" 2>&1 || true
     $SMOLVM machine start --name "$vm" 2>&1 || { cleanup_vm "$vm"; return 1; }

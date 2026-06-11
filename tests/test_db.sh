@@ -24,10 +24,10 @@ test_db_persistence_across_restart() {
 
     # Clean up any existing
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
     # Create a named VM with specific configuration
-    $SMOLVM machine create "$vm_name" --cpus 2 --mem 1024 2>&1
+    $SMOLVM machine create --name "$vm_name" --cpus 2 --mem 1024 2>&1
 
     # Verify it was created with correct config
     local list_output
@@ -39,12 +39,12 @@ test_db_persistence_across_restart() {
 
     if [[ "$list_output" != *'"cpus": 2'* ]] || [[ "$list_output" != *'"memory_mib": 1024'* ]]; then
         echo "VM configuration not persisted correctly"
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     fi
 
     # Clean up
-    $SMOLVM machine delete "$vm_name" -f 2>&1
+    $SMOLVM machine delete --name "$vm_name" -f 2>&1
     ensure_data_dir_deleted "$vm_name"
 }
 
@@ -53,17 +53,17 @@ test_db_vm_state_update() {
 
     # Clean up any existing
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
     # Create a named VM
-    $SMOLVM machine create "$vm_name" 2>&1
+    $SMOLVM machine create --name "$vm_name" 2>&1
 
     # Check initial state is "created"
     local initial_state
     initial_state=$($SMOLVM machine ls --json 2>&1)
     if [[ "$initial_state" != *'"state": "created"'* ]]; then
         echo "Initial state should be 'created'"
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     fi
 
@@ -76,7 +76,7 @@ test_db_vm_state_update() {
     if [[ "$running_state" != *'"state": "running"'* ]]; then
         echo "State should be 'running' after start"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     fi
 
@@ -88,7 +88,7 @@ test_db_vm_state_update() {
     stopped_state=$($SMOLVM machine ls --json 2>&1)
 
     # Clean up
-    $SMOLVM machine delete "$vm_name" -f 2>&1
+    $SMOLVM machine delete --name "$vm_name" -f 2>&1
     ensure_data_dir_deleted "$vm_name"
 
     [[ "$stopped_state" == *'"state": "stopped"'* ]]
@@ -98,10 +98,10 @@ test_db_delete_removes_from_db() {
     local vm_name="db-delete-test-$$"
 
     # Clean up any existing
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
     # Create a VM
-    $SMOLVM machine create "$vm_name" 2>&1
+    $SMOLVM machine create --name "$vm_name" 2>&1
 
     # Verify it exists
     local before_delete
@@ -112,7 +112,7 @@ test_db_delete_removes_from_db() {
     fi
 
     # Delete it
-    $SMOLVM machine delete "$vm_name" -f 2>&1
+    $SMOLVM machine delete --name "$vm_name" -f 2>&1
     ensure_data_dir_deleted "$vm_name"
 
     # Verify it's gone

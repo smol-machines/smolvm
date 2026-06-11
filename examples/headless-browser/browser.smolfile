@@ -14,7 +14,7 @@
 #
 # ── Setup (one time) ─────────────────────────────────────────────────────────
 #
-#   smolvm machine create browser -s examples/headless-browser/browser.smolfile
+#   smolvm machine create --name browser -s examples/headless-browser/browser.smolfile
 #   smolvm machine start --name browser
 #
 # ── Take a screenshot ────────────────────────────────────────────────────────

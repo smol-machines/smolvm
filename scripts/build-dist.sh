@@ -555,12 +555,12 @@ USAGE
 Run the 'smolvm' script (not smolvm-bin directly):
 
   ./smolvm machine run --net --image alpine -- echo "Hello World"
-  ./smolvm machine create --net myvm
+  ./smolvm machine create --net --name myvm
   ./smolvm machine start --name myvm
   ./smolvm machine exec --name myvm -- /bin/sh
   ./smolvm machine ls
   ./smolvm machine stop --name myvm
-  ./smolvm machine delete myvm
+  ./smolvm machine delete --name myvm
 
 TROUBLESHOOTING
 ===============

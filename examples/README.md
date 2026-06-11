@@ -17,7 +17,7 @@ smolvm machine run -d -s examples/doom-web/doom.smolfile
 open http://localhost:8080
 
 # Headless Chromium with GPU acceleration
-smolvm machine create browser -s examples/headless-browser/browser.smolfile
+smolvm machine create --name browser -s examples/headless-browser/browser.smolfile
 smolvm machine start --name browser
 smolvm machine exec --name browser -- \
   chromium --headless=new --no-sandbox --disable-dev-shm-usage \
@@ -30,7 +30,7 @@ smolvm machine exec --name browser -- base64 /tmp/out.png | base64 -d > out.png
 ### Persistent microVMs
 
 ```bash
-smolvm machine create dev -s examples/python-app/python.smolfile
+smolvm machine create --name dev -s examples/python-app/python.smolfile
 smolvm machine start --name dev
 smolvm machine exec --name dev -- python3 --version
 smolvm machine stop --name dev

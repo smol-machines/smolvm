@@ -71,7 +71,7 @@ smolvm pack create --image python:3.12-alpine -o ./python312
 **Persistent machines for development** — create, stop, start. Installed packages survive restarts.
 
 ```bash
-smolvm machine create --net myvm
+smolvm machine create --net --name myvm
 smolvm machine start --name myvm
 smolvm machine exec --name myvm -- apk add sl
 smolvm machine exec --name myvm -it -- /bin/sh
@@ -106,7 +106,7 @@ ssh_agent = true
 ```
 
 ```bash
-smolvm machine create myvm -s Smolfile
+smolvm machine create --name myvm -s Smolfile
 smolvm machine start --name myvm
 ```
 

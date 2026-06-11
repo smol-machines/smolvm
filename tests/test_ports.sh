@@ -23,12 +23,12 @@ test_machine_port_mapping_http() {
     local vm_name="test-vm-portmap"
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
     # Create and start VM with port mapping (host 18199 -> guest 8080)
-    $SMOLVM machine create "$vm_name" -p 18199:8080 2>&1 || return 1
+    $SMOLVM machine create --name "$vm_name" -p 18199:8080 2>&1 || return 1
     $SMOLVM machine start --name "$vm_name" 2>&1 || {
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null
         return 1
     }
 
@@ -50,7 +50,7 @@ test_machine_port_mapping_http() {
 
     # Cleanup
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
     ensure_data_dir_deleted "$vm_name"
 
     [[ $curl_rc -eq 0 ]] && [[ "$output" == *"ok"* ]]
@@ -60,12 +60,12 @@ test_port_conflict_across_vms() {
     local vm_a="port-conflict-a-$$"
     local vm_b="port-conflict-b-$$"
 
-    $SMOLVM machine create "$vm_a" -p 19876:80 --net 2>&1 >/dev/null || return 1
-    $SMOLVM machine create "$vm_b" -p 19876:80 --net 2>&1 >/dev/null || return 1
+    $SMOLVM machine create --name "$vm_a" -p 19876:80 --net 2>&1 >/dev/null || return 1
+    $SMOLVM machine create --name "$vm_b" -p 19876:80 --net 2>&1 >/dev/null || return 1
 
     $SMOLVM machine start --name "$vm_a" 2>&1 >/dev/null || {
-        $SMOLVM machine delete "$vm_a" -f 2>/dev/null
-        $SMOLVM machine delete "$vm_b" -f 2>/dev/null
+        $SMOLVM machine delete --name "$vm_a" -f 2>/dev/null
+        $SMOLVM machine delete --name "$vm_b" -f 2>/dev/null
         return 1
     }
 
@@ -77,8 +77,8 @@ test_port_conflict_across_vms() {
     [[ "$output" == *"already in use"* ]] || { echo "expected 'already in use' message"; }
 
     $SMOLVM machine stop --name "$vm_a" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_a" -f 2>/dev/null || true
-    $SMOLVM machine delete "$vm_b" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_a" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_b" -f 2>/dev/null || true
 
     [[ $exit_code -ne 0 ]]
 }

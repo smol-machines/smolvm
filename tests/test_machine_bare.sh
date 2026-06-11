@@ -147,13 +147,13 @@ test_machine_exec_failed_does_not_kill_vm() {
 test_sigterm_during_exec_does_not_stall_vm() {
     local name="bug12-sigterm-$$"
     $SMOLVM machine stop --name "$name" 2>/dev/null || true
-    $SMOLVM machine delete "$name" -f 2>/dev/null || true
-    $SMOLVM machine create "$name" 2>&1 | tail -1 || return 1
+    $SMOLVM machine delete --name "$name" -f 2>/dev/null || true
+    $SMOLVM machine create --name "$name" 2>&1 | tail -1 || return 1
     $SMOLVM machine start --name "$name" 2>&1 | tail -1 || {
-        $SMOLVM machine delete "$name" -f 2>/dev/null; return 1
+        $SMOLVM machine delete --name "$name" -f 2>/dev/null; return 1
     }
     wait_vm_ready --name "$name" || {
-        $SMOLVM machine delete "$name" -f 2>/dev/null; return 1
+        $SMOLVM machine delete --name "$name" -f 2>/dev/null; return 1
     }
 
     # Start a long-running exec, then SIGTERM the client mid-flight.
@@ -180,7 +180,7 @@ test_sigterm_during_exec_does_not_stall_vm() {
     [[ "$result" == *"survived"* ]] || {
         echo "FAIL: exec after SIGTERM failed: $result"
         $SMOLVM machine stop --name "$name" 2>/dev/null
-        $SMOLVM machine delete "$name" -f 2>/dev/null
+        $SMOLVM machine delete --name "$name" -f 2>/dev/null
         return 1
     }
 
@@ -190,24 +190,24 @@ test_sigterm_during_exec_does_not_stall_vm() {
     if [[ "$over_threshold" == "yes" ]]; then
         echo "FAIL: next exec took ${elapsed}s (>5s) — agent stalled on orphan child?"
         $SMOLVM machine stop --name "$name" 2>/dev/null
-        $SMOLVM machine delete "$name" -f 2>/dev/null
+        $SMOLVM machine delete --name "$name" -f 2>/dev/null
         return 1
     fi
 
     $SMOLVM machine stop --name "$name" 2>/dev/null || true
-    $SMOLVM machine delete "$name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$name" -f 2>/dev/null || true
 }
 
 test_exec_timeout_does_not_stall_vm() {
     local name="bug20-timeout-$$"
     $SMOLVM machine stop --name "$name" 2>/dev/null || true
-    $SMOLVM machine delete "$name" -f 2>/dev/null || true
-    $SMOLVM machine create "$name" 2>&1 | tail -1 || return 1
+    $SMOLVM machine delete --name "$name" -f 2>/dev/null || true
+    $SMOLVM machine create --name "$name" 2>&1 | tail -1 || return 1
     $SMOLVM machine start --name "$name" 2>&1 | tail -1 || {
-        $SMOLVM machine delete "$name" -f 2>/dev/null; return 1
+        $SMOLVM machine delete --name "$name" -f 2>/dev/null; return 1
     }
     wait_vm_ready --name "$name" || {
-        $SMOLVM machine delete "$name" -f 2>/dev/null; return 1
+        $SMOLVM machine delete --name "$name" -f 2>/dev/null; return 1
     }
 
     # Short timeout, long-running command with sub-processes — timeout should
@@ -228,7 +228,7 @@ test_exec_timeout_does_not_stall_vm() {
     [[ "$result" == *"alive"* ]] || {
         echo "FAIL: exec after timeout failed: $result"
         $SMOLVM machine stop --name "$name" 2>/dev/null
-        $SMOLVM machine delete "$name" -f 2>/dev/null
+        $SMOLVM machine delete --name "$name" -f 2>/dev/null
         return 1
     }
 
@@ -237,12 +237,12 @@ test_exec_timeout_does_not_stall_vm() {
     if [[ "$over_threshold" == "yes" ]]; then
         echo "FAIL: next exec took ${elapsed}s (>5s) — agent stalled after timeout?"
         $SMOLVM machine stop --name "$name" 2>/dev/null
-        $SMOLVM machine delete "$name" -f 2>/dev/null
+        $SMOLVM machine delete --name "$name" -f 2>/dev/null
         return 1
     fi
 
     $SMOLVM machine stop --name "$name" 2>/dev/null || true
-    $SMOLVM machine delete "$name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$name" -f 2>/dev/null || true
 }
 
 test_machine_named_vm() {
@@ -250,26 +250,26 @@ test_machine_named_vm() {
 
     # Clean up any existing
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
     # Create the named VM first
-    $SMOLVM machine create "$vm_name" 2>&1 || return 1
+    $SMOLVM machine create --name "$vm_name" 2>&1 || return 1
 
     # Start
-    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1; }
 
     # Check status
     local status
     status=$($SMOLVM machine status --name "$vm_name" 2>&1)
     if [[ "$status" != *"running"* ]]; then
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     fi
 
     # Stop and delete
     $SMOLVM machine stop --name "$vm_name" 2>&1
-    $SMOLVM machine delete "$vm_name" -f 2>&1
+    $SMOLVM machine delete --name "$vm_name" -f 2>&1
     ensure_data_dir_deleted "$vm_name"
 }
 
@@ -278,17 +278,17 @@ test_machine_create_prints_named_start_hint() {
     local output
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
-    output=$($SMOLVM machine create "$vm_name" 2>&1) || return 1
+    output=$($SMOLVM machine create --name "$vm_name" 2>&1) || return 1
 
     [[ "$output" == *"Use 'smolvm machine start --name $vm_name' to start the machine"* ]] || {
         echo "$output"
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     }
 
-    $SMOLVM machine delete "$vm_name" -f 2>&1
+    $SMOLVM machine delete --name "$vm_name" -f 2>&1
     ensure_data_dir_deleted "$vm_name"
 }
 
@@ -318,9 +318,9 @@ test_file_upload_download() {
     local vm_name="cp-test-$$"
 
     # Create and start a machine
-    $SMOLVM machine create "$vm_name" 2>&1 || return 1
+    $SMOLVM machine create --name "$vm_name" 2>&1 || return 1
     run_with_timeout 30 $SMOLVM machine start --name "$vm_name" 2>&1 || {
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1
     }
 
     # Upload a file
@@ -329,7 +329,7 @@ test_file_upload_download() {
     $SMOLVM machine cp /tmp/smolvm-cp-test.txt "$vm_name":/tmp/uploaded.txt 2>&1 || {
         echo "Upload failed"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null
         rm -f /tmp/smolvm-cp-test.txt
         return 1
     }
@@ -339,14 +339,14 @@ test_file_upload_download() {
     exec_result=$($SMOLVM machine exec --name "$vm_name" -- cat /tmp/uploaded.txt 2>&1) || {
         echo "Exec after upload failed"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null
         rm -f /tmp/smolvm-cp-test.txt
         return 1
     }
     [[ "$exec_result" == *"$upload_content"* ]] || {
         echo "Upload content mismatch: expected '$upload_content', got '$exec_result'"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null
         rm -f /tmp/smolvm-cp-test.txt
         return 1
     }
@@ -356,7 +356,7 @@ test_file_upload_download() {
     $SMOLVM machine cp "$vm_name":/tmp/to-download.txt /tmp/smolvm-downloaded.txt 2>&1 || {
         echo "Download failed"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null
         rm -f /tmp/smolvm-cp-test.txt /tmp/smolvm-downloaded.txt
         return 1
     }
@@ -365,14 +365,14 @@ test_file_upload_download() {
     [[ "$downloaded" == *"hello from VM"* ]] || {
         echo "Download content mismatch: '$downloaded'"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null
         rm -f /tmp/smolvm-cp-test.txt /tmp/smolvm-downloaded.txt
         return 1
     }
 
     # Cleanup
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null
     rm -f /tmp/smolvm-cp-test.txt /tmp/smolvm-downloaded.txt
 }
 
@@ -380,36 +380,36 @@ test_streaming_exec() {
     # Start a machine, run a command with --stream, verify output arrives
     $SMOLVM machine stop 2>/dev/null || true
 
-    $SMOLVM machine create stream-test-$$ 2>&1 || return 1
+    $SMOLVM machine create --name stream-test-$$ 2>&1 || return 1
     run_with_timeout 30 $SMOLVM machine start --name stream-test-$$ 2>&1 || {
-        $SMOLVM machine delete stream-test-$$ -f 2>/dev/null; return 1
+        $SMOLVM machine delete --name stream-test-$$ -f 2>/dev/null; return 1
     }
 
     # Streaming exec — output should contain the echoed text
     local result
     result=$(run_with_timeout 15 $SMOLVM machine exec --stream --name stream-test-$$ -- sh -c "echo 'stream-line-1' && echo 'stream-line-2' && echo 'done'" 2>&1)
-    [[ $? -eq 124 ]] && { echo "TIMEOUT"; $SMOLVM machine stop --name stream-test-$$ 2>/dev/null; $SMOLVM machine delete stream-test-$$ -f 2>/dev/null; return 1; }
+    [[ $? -eq 124 ]] && { echo "TIMEOUT"; $SMOLVM machine stop --name stream-test-$$ 2>/dev/null; $SMOLVM machine delete --name stream-test-$$ -f 2>/dev/null; return 1; }
 
     [[ "$result" == *"stream-line-1"* ]] && [[ "$result" == *"stream-line-2"* ]] && [[ "$result" == *"done"* ]] || {
         echo "Missing streaming output: $result"
         $SMOLVM machine stop --name stream-test-$$ 2>/dev/null
-        $SMOLVM machine delete stream-test-$$ -f 2>/dev/null
+        $SMOLVM machine delete --name stream-test-$$ -f 2>/dev/null
         return 1
     }
 
     # Cleanup
     $SMOLVM machine stop --name stream-test-$$ 2>/dev/null
-    $SMOLVM machine delete stream-test-$$ -f 2>/dev/null
+    $SMOLVM machine delete --name stream-test-$$ -f 2>/dev/null
 }
 
 test_agent_json_logs() {
     local vm_name="observability-test-$$"
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
-    $SMOLVM machine create "$vm_name" 2>&1 || return 1
-    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+    $SMOLVM machine create --name "$vm_name" 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1; }
 
     # Run a command to generate agent log entries
     $SMOLVM machine exec --name "$vm_name" -- echo "observability-test" 2>&1 || true
@@ -425,7 +425,7 @@ test_agent_json_logs() {
     cp "$console_log" "$saved_log" 2>/dev/null || true
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
     if [[ ! -s "$saved_log" ]]; then
         echo "Console log not found or empty at $console_log"
@@ -534,20 +534,20 @@ test_docker_in_vm() {
 
     echo "phase: pre-cleanup"
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
     # ── Create ────────────────────────────────────────────────────────────────
     echo "phase: create"
     local output
-    output=$($SMOLVM machine create "$vm_name" \
+    output=$($SMOLVM machine create --name "$vm_name" \
         -s "$smolfile" --net-backend virtio-net 2>&1) || {
-        echo "FAIL: machine create failed"
+        echo "FAIL: machine create --name failed"
         echo "$output"
         return 1
     }
     [[ "$output" == *"Init commands: 4"* ]] || {
         echo "FAIL: expected 4 init commands, got: $output"
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     }
 
@@ -556,14 +556,14 @@ test_docker_in_vm() {
     output=$($SMOLVM machine start --name "$vm_name" 2>&1) || {
         echo "FAIL: first machine start failed"
         echo "$output"
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     }
     [[ "$output" == *"Running 4 init command"* ]] || {
         echo "FAIL: expected 4 init commands to run on first start"
         echo "$output"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     }
 
@@ -573,14 +573,14 @@ test_docker_in_vm() {
         echo "FAIL: dockerd failed to start"
         echo "$output"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     }
     [[ "$output" == *"dockerd-ready"* ]] || {
         echo "FAIL: dockerd did not report ready"
         echo "$output"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     }
 
@@ -600,11 +600,11 @@ test_docker_in_vm() {
         echo "FAIL: storage driver or bind-mount check failed"
         echo "$output"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     }
-    [[ "$output" == *"storage-driver-ok"* ]] || { echo "FAIL: $output"; $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true; $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true; return 1; }
-    [[ "$output" == *"bind-mount-ok"* ]]    || { echo "FAIL: $output"; $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true; $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true; return 1; }
+    [[ "$output" == *"storage-driver-ok"* ]] || { echo "FAIL: $output"; $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true; $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true; return 1; }
+    [[ "$output" == *"bind-mount-ok"* ]]    || { echo "FAIL: $output"; $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true; $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true; return 1; }
 
     # ── Assert: docker run executes a container ───────────────────────────────
     echo "phase: docker-run"
@@ -613,13 +613,13 @@ test_docker_in_vm() {
         echo "FAIL: docker run failed"
         echo "$output"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     }
     [[ "$output" == *"docker-in-vm-ok"* ]] || {
         echo "FAIL: expected docker-in-vm-ok, got: $output"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     }
 
@@ -630,13 +630,13 @@ test_docker_in_vm() {
         echo "FAIL: docker bridge networking failed"
         echo "$output"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     }
     [[ "$output" == *'"url"'* ]] || {
         echo "FAIL: expected JSON response with url field, got: $output"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     }
 
@@ -650,13 +650,13 @@ test_docker_in_vm() {
         echo "FAIL: docker build or run of built image failed"
         echo "$output"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     }
     [[ "$output" == *"built-image-run-ok"* ]] || {
         echo "FAIL: expected built-image-run-ok, got: $output"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     }
 
@@ -664,7 +664,7 @@ test_docker_in_vm() {
     echo "phase: stop"
     $SMOLVM machine stop --name "$vm_name" 2>&1 || {
         echo "FAIL: machine stop failed"
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     }
 
@@ -672,13 +672,13 @@ test_docker_in_vm() {
     output=$($SMOLVM machine start --name "$vm_name" 2>&1) || {
         echo "FAIL: machine restart failed"
         echo "$output"
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     }
     [[ "$output" == *"Init already completed"* ]] || {
         echo "FAIL: init should be skipped on restart, got: $output"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     }
 
@@ -688,14 +688,14 @@ test_docker_in_vm() {
         echo "FAIL: dockerd failed to start after VM restart"
         echo "$output"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     }
     [[ "$output" == *"dockerd-ready"* ]] || {
         echo "FAIL: dockerd not ready after VM restart"
         echo "$output"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     }
 
@@ -711,17 +711,17 @@ test_docker_in_vm() {
         echo "FAIL: post-restart image persistence check failed"
         echo "$output"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     }
-    [[ "$output" == *"alpine-persists"* ]]      || { echo "FAIL: $output"; $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true; $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true; return 1; }
-    [[ "$output" == *"built-image-persists"* ]] || { echo "FAIL: $output"; $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true; $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true; return 1; }
-    [[ "$output" == *"post-restart-run-ok"* ]]  || { echo "FAIL: $output"; $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true; $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true; return 1; }
+    [[ "$output" == *"alpine-persists"* ]]      || { echo "FAIL: $output"; $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true; $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true; return 1; }
+    [[ "$output" == *"built-image-persists"* ]] || { echo "FAIL: $output"; $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true; $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true; return 1; }
+    [[ "$output" == *"post-restart-run-ok"* ]]  || { echo "FAIL: $output"; $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true; $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true; return 1; }
 
     # ── Cleanup ───────────────────────────────────────────────────────────────
     echo "phase: cleanup"
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 }
 
 
@@ -756,8 +756,8 @@ _EXEC_STDIN_MACHINE="exec-stdin-$$"
 
 test_exec_cat_no_interactive() {
     "$SMOLVM" machine stop --name "$_EXEC_STDIN_MACHINE" 2>/dev/null || true
-    "$SMOLVM" machine delete "$_EXEC_STDIN_MACHINE" -f 2>/dev/null || true
-    "$SMOLVM" machine create "$_EXEC_STDIN_MACHINE" 2>/dev/null || return 1
+    "$SMOLVM" machine delete --name "$_EXEC_STDIN_MACHINE" -f 2>/dev/null || true
+    "$SMOLVM" machine create --name "$_EXEC_STDIN_MACHINE" 2>/dev/null || return 1
     "$SMOLVM" machine start --name "$_EXEC_STDIN_MACHINE" 2>/dev/null || return 1
 
     local out exit_code=0
@@ -765,7 +765,7 @@ test_exec_cat_no_interactive() {
         || exit_code=$?
 
     "$SMOLVM" machine stop --name "$_EXEC_STDIN_MACHINE" 2>/dev/null || true
-    "$SMOLVM" machine delete "$_EXEC_STDIN_MACHINE" -f 2>/dev/null || true
+    "$SMOLVM" machine delete --name "$_EXEC_STDIN_MACHINE" -f 2>/dev/null || true
 
     if echo "$out" | grep -qi "connection closed"; then
         echo "FAIL: got 'connection closed'"
@@ -782,8 +782,8 @@ test_exec_tty_piped_stdin_terminates() {
     # still reach the child. Without EOF propagation a stdin reader (cat)
     # never terminates and the exec session hangs.
     "$SMOLVM" machine stop --name "$_EXEC_STDIN_MACHINE" 2>/dev/null || true
-    "$SMOLVM" machine delete "$_EXEC_STDIN_MACHINE" -f 2>/dev/null || true
-    "$SMOLVM" machine create "$_EXEC_STDIN_MACHINE" 2>/dev/null || return 1
+    "$SMOLVM" machine delete --name "$_EXEC_STDIN_MACHINE" -f 2>/dev/null || true
+    "$SMOLVM" machine create --name "$_EXEC_STDIN_MACHINE" 2>/dev/null || return 1
     "$SMOLVM" machine start --name "$_EXEC_STDIN_MACHINE" 2>/dev/null || return 1
 
     # Newline-terminated input: the PTY line buffer is empty when EOF
@@ -802,7 +802,7 @@ test_exec_tty_piped_stdin_terminates() {
         >/dev/null 2>&1 || exit_code_partial=$?
 
     "$SMOLVM" machine stop --name "$_EXEC_STDIN_MACHINE" 2>/dev/null || true
-    "$SMOLVM" machine delete "$_EXEC_STDIN_MACHINE" -f 2>/dev/null || true
+    "$SMOLVM" machine delete --name "$_EXEC_STDIN_MACHINE" -f 2>/dev/null || true
 
     [[ $exit_code -ne 124 ]] || { echo "FAIL: 'exec --tty -i' with piped stdin timed out (PTY EOF not propagated)"; return 1; }
     [[ $exit_code_partial -ne 124 ]] || { echo "FAIL: 'exec --tty -i' with unterminated stdin timed out (PTY EOF not propagated)"; return 1; }
@@ -818,8 +818,8 @@ _DROP_MACHINE="drop-safe-$$"
 
 test_machine_survives_rapid_exec() {
     "$SMOLVM" machine stop --name "$_DROP_MACHINE" 2>/dev/null || true
-    "$SMOLVM" machine delete "$_DROP_MACHINE" -f 2>/dev/null || true
-    "$SMOLVM" machine create "$_DROP_MACHINE" 2>/dev/null || return 1
+    "$SMOLVM" machine delete --name "$_DROP_MACHINE" -f 2>/dev/null || true
+    "$SMOLVM" machine create --name "$_DROP_MACHINE" 2>/dev/null || return 1
     "$SMOLVM" machine start --name "$_DROP_MACHINE" 2>/dev/null || return 1
 
     local i
@@ -828,13 +828,13 @@ test_machine_survives_rapid_exec() {
         out=$(run_with_timeout 15 "$SMOLVM" machine exec --name "$_DROP_MACHINE" -- echo "alive-$i" 2>/dev/null) \
             || exit_code=$?
         [[ $exit_code -eq 0 ]] || {
-            "$SMOLVM" machine delete "$_DROP_MACHINE" -f 2>/dev/null || true
+            "$SMOLVM" machine delete --name "$_DROP_MACHINE" -f 2>/dev/null || true
             echo "FAIL: exec #$i failed (exit $exit_code)"; return 1
         }
     done
 
     "$SMOLVM" machine stop --name "$_DROP_MACHINE" 2>/dev/null || true
-    "$SMOLVM" machine delete "$_DROP_MACHINE" -f 2>/dev/null || true
+    "$SMOLVM" machine delete --name "$_DROP_MACHINE" -f 2>/dev/null || true
 }
 
 run_test "Drop-safety: machine survives 5 rapid execs" test_machine_survives_rapid_exec || true

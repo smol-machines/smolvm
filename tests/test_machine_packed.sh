@@ -33,12 +33,12 @@ test_create_from_smolmachine() {
     [[ -f "$pack_output.smolmachine" ]] || { echo "FAIL: no sidecar"; return 1; }
 
     # 2. Create a named machine from it
-    $SMOLVM machine create "$vm_name" --from "$pack_output.smolmachine" 2>&1 || return 1
+    $SMOLVM machine create --name "$vm_name" --from "$pack_output.smolmachine" 2>&1 || return 1
 
     # 3. Start the machine (should NOT pull — uses extracted layers)
     $SMOLVM machine start --name "$vm_name" 2>&1 || {
         echo "FAIL: start failed"
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; rm -rf "$tmpdir"; return 1
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; rm -rf "$tmpdir"; return 1
     }
 
     # 4. Exec works
@@ -47,7 +47,7 @@ test_create_from_smolmachine() {
     [[ "$exec_result" == *"from-sm-ok"* ]] || {
         echo "FAIL: exec failed: $exec_result"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; rm -rf "$tmpdir"; return 1
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; rm -rf "$tmpdir"; return 1
     }
 
     # 5. Persistence: write then read
@@ -57,32 +57,32 @@ test_create_from_smolmachine() {
     [[ "$read_result" == *"persist"* ]] || {
         echo "FAIL: persistence failed"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; rm -rf "$tmpdir"; return 1
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; rm -rf "$tmpdir"; return 1
     }
 
     # 6. Stop and restart — persistence survives
     $SMOLVM machine stop --name "$vm_name" 2>&1 || true
     $SMOLVM machine start --name "$vm_name" 2>&1 || {
         echo "FAIL: restart failed"
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; rm -rf "$tmpdir"; return 1
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; rm -rf "$tmpdir"; return 1
     }
     read_result=$($SMOLVM machine exec --name "$vm_name" -- cat /tmp/sm.txt 2>&1)
     [[ "$read_result" == *"persist"* ]] || {
         echo "FAIL: persistence across restart failed"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; rm -rf "$tmpdir"; return 1
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; rm -rf "$tmpdir"; return 1
     }
 
     # 7. Shows in ls
     $SMOLVM machine ls --json 2>&1 | grep -q "$vm_name" || {
         echo "FAIL: not in ls"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; rm -rf "$tmpdir"; return 1
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; rm -rf "$tmpdir"; return 1
     }
 
     # 8. Cleanup
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
     rm -rf "$tmpdir"
 }
 
@@ -92,36 +92,36 @@ test_cp_preserves_state_on_packed_vm() {
     pack_dir=$(mktemp -d)
 
     # Create source VM, write marker, pack it
-    $SMOLVM machine create "cp-pack-src-$$" --image alpine:latest --net 2>&1 || return 1
+    $SMOLVM machine create --name "cp-pack-src-$$" --image alpine:latest --net 2>&1 || return 1
     $SMOLVM machine start --name "cp-pack-src-$$" 2>&1 || {
-        $SMOLVM machine delete "cp-pack-src-$$" -f 2>/dev/null; return 1
+        $SMOLVM machine delete --name "cp-pack-src-$$" -f 2>/dev/null; return 1
     }
     $SMOLVM machine exec --name "cp-pack-src-$$" -- sh -c 'echo marker > /etc/pack-marker' 2>&1
     $SMOLVM machine stop --name "cp-pack-src-$$" 2>&1
     $SMOLVM pack create --from-vm "cp-pack-src-$$" -o "$pack_dir/packed" 2>&1 || {
-        $SMOLVM machine delete "cp-pack-src-$$" -f 2>/dev/null; rm -rf "$pack_dir"; return 1
+        $SMOLVM machine delete --name "cp-pack-src-$$" -f 2>/dev/null; rm -rf "$pack_dir"; return 1
     }
-    $SMOLVM machine delete "cp-pack-src-$$" -f 2>/dev/null
+    $SMOLVM machine delete --name "cp-pack-src-$$" -f 2>/dev/null
 
     # Create destination from pack, start, mutate via exec
-    $SMOLVM machine create "$vm_name" --from "$pack_dir/packed.smolmachine" --net 2>&1 || {
+    $SMOLVM machine create --name "$vm_name" --from "$pack_dir/packed.smolmachine" --net 2>&1 || {
         rm -rf "$pack_dir"; return 1
     }
     $SMOLVM machine start --name "$vm_name" 2>&1 || {
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; rm -rf "$pack_dir"; return 1
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; rm -rf "$pack_dir"; return 1
     }
     $SMOLVM machine exec --name "$vm_name" -- adduser -D alice 2>&1
 
     # Verify alice exists before cp
     local before
     before=$($SMOLVM machine exec --name "$vm_name" -- id alice 2>&1) || {
-        echo "alice not found before cp"; $SMOLVM machine delete "$vm_name" -f 2>/dev/null; rm -rf "$pack_dir"; return 1
+        echo "alice not found before cp"; $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; rm -rf "$pack_dir"; return 1
     }
 
     # Run cp
     echo "probe" > "$pack_dir/probe.txt"
     $SMOLVM machine cp "$pack_dir/probe.txt" "$vm_name":/tmp/probe.txt 2>&1 || {
-        echo "cp failed"; $SMOLVM machine delete "$vm_name" -f 2>/dev/null; rm -rf "$pack_dir"; return 1
+        echo "cp failed"; $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; rm -rf "$pack_dir"; return 1
     }
 
     # Verify alice STILL exists after cp
@@ -129,7 +129,7 @@ test_cp_preserves_state_on_packed_vm() {
     after=$($SMOLVM machine exec --name "$vm_name" -- id alice 2>&1) || {
         echo "FAIL: alice gone after cp"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null
         rm -rf "$pack_dir"
         return 1
     }
@@ -140,13 +140,13 @@ test_cp_preserves_state_on_packed_vm() {
     [[ "$probe" == *"probe"* ]] || {
         echo "FAIL: probe file missing after cp"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null
         rm -rf "$pack_dir"
         return 1
     }
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null
     rm -rf "$pack_dir"
 }
 

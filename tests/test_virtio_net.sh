@@ -68,10 +68,10 @@ test_machine_create_virtio_net_works() {
     local vm_name="virtio-create-test-$$"
     local output
 
-    output=$($SMOLVM machine create "$vm_name" --net --net-backend virtio-net 2>&1) || {
-        echo "expected virtio-net machine create to succeed"
+    output=$($SMOLVM machine create --name "$vm_name" --net --net-backend virtio-net 2>&1) || {
+        echo "expected virtio-net machine create --name to succeed"
         echo "$output"
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     }
 
@@ -79,49 +79,49 @@ test_machine_create_virtio_net_works() {
     list_output=$($SMOLVM machine ls --json 2>&1)
     [[ "$list_output" == *"$vm_name"* ]] || {
         echo "virtio-net create should persist machine state"
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     }
 
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 }
 
 test_machine_create_start_exec_virtio_net_works() {
     cleanup_machine
     local vm_name="virtio-create-start-exec-test-$$"
 
-    $SMOLVM machine create "$vm_name" --image "$VIRTIO_TEST_IMAGE" --net --net-backend virtio-net >/dev/null 2>&1 || {
-        echo "expected virtio-net machine create to succeed before start"
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine create --name "$vm_name" --image "$VIRTIO_TEST_IMAGE" --net --net-backend virtio-net >/dev/null 2>&1 || {
+        echo "expected virtio-net machine create --name to succeed before start"
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     }
 
     $SMOLVM machine start --name "$vm_name" >/dev/null 2>&1 || {
-        $SMOLVM machine delete "$vm_name" -f >/dev/null 2>&1 || true
+        $SMOLVM machine delete --name "$vm_name" -f >/dev/null 2>&1 || true
         return 1
     }
     probe_running_virtio_guest_network "$vm_name" || {
         $SMOLVM machine stop --name "$vm_name" >/dev/null 2>&1 || true
-        $SMOLVM machine delete "$vm_name" -f >/dev/null 2>&1 || true
+        $SMOLVM machine delete --name "$vm_name" -f >/dev/null 2>&1 || true
         return 1
     }
 
     $SMOLVM machine stop --name "$vm_name" >/dev/null 2>&1 || {
-        $SMOLVM machine delete "$vm_name" -f >/dev/null 2>&1 || true
+        $SMOLVM machine delete --name "$vm_name" -f >/dev/null 2>&1 || true
         return 1
     }
     $SMOLVM machine start --name "$vm_name" >/dev/null 2>&1 || {
-        $SMOLVM machine delete "$vm_name" -f >/dev/null 2>&1 || true
+        $SMOLVM machine delete --name "$vm_name" -f >/dev/null 2>&1 || true
         return 1
     }
     probe_running_virtio_guest_network "$vm_name" || {
         $SMOLVM machine stop --name "$vm_name" >/dev/null 2>&1 || true
-        $SMOLVM machine delete "$vm_name" -f >/dev/null 2>&1 || true
+        $SMOLVM machine delete --name "$vm_name" -f >/dev/null 2>&1 || true
         return 1
     }
 
     $SMOLVM machine stop --name "$vm_name" >/dev/null 2>&1 || true
-    $SMOLVM machine delete "$vm_name" -f >/dev/null 2>&1 || true
+    $SMOLVM machine delete --name "$vm_name" -f >/dev/null 2>&1 || true
 }
 
 test_machine_run_virtio_net_works() {
@@ -206,10 +206,10 @@ test_machine_create_virtio_net_policy_rejected() {
     local exit_code=0
     local output
 
-    output=$($SMOLVM machine create "$vm_name" --net --net-backend virtio-net --allow-cidr 1.1.1.1/32 2>&1) || exit_code=$?
+    output=$($SMOLVM machine create --name "$vm_name" --net --net-backend virtio-net --allow-cidr 1.1.1.1/32 2>&1) || exit_code=$?
     [[ $exit_code -ne 0 ]] || {
         echo "expected create failure for virtio-net policy request"
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     }
     [[ "$output" == *"allow-cidr/allow-host policies are not supported"* ]] || {

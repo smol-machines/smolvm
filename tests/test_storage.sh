@@ -24,11 +24,11 @@ test_machine_overlay_root_active() {
 
     # Clean up any existing
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
     # Create and start VM
-    $SMOLVM machine create "$vm_name" 2>&1 || return 1
-    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+    $SMOLVM machine create --name "$vm_name" 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1; }
 
     # Check that root is an overlay mount
     local output exit_code=0
@@ -36,7 +36,7 @@ test_machine_overlay_root_active() {
 
     # Clean up
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
     ensure_data_dir_deleted "$vm_name"
 
     [[ $exit_code -eq 0 ]] && [[ "$output" == *"overlay on / type overlay"* ]]
@@ -47,18 +47,18 @@ test_machine_rootfs_persists_across_reboot() {
 
     # Clean up any existing
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
     # Create and start VM
-    $SMOLVM machine create "$vm_name" 2>&1 || return 1
-    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+    $SMOLVM machine create --name "$vm_name" 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1; }
 
     # Write a marker file to the rootfs
     local exit_code=0
     $SMOLVM machine exec --name "$vm_name" -- sh -c "echo persistence-test-ok > /tmp/overlay-test-marker" 2>&1 || exit_code=$?
     if [[ $exit_code -ne 0 ]]; then
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     fi
 
@@ -66,18 +66,18 @@ test_machine_rootfs_persists_across_reboot() {
     local output
     output=$($SMOLVM machine exec --name "$vm_name" -- cat /tmp/overlay-test-marker 2>&1) || {
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     }
     if [[ "$output" != *"persistence-test-ok"* ]]; then
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     fi
 
     # Stop and restart the VM
-    $SMOLVM machine stop --name "$vm_name" 2>&1 || { $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
-    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+    $SMOLVM machine stop --name "$vm_name" 2>&1 || { $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1; }
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1; }
 
     # Verify the file survived the reboot
     exit_code=0
@@ -85,7 +85,7 @@ test_machine_rootfs_persists_across_reboot() {
 
     # Clean up
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
     ensure_data_dir_deleted "$vm_name"
 
     [[ $exit_code -eq 0 ]] && [[ "$output" == *"persistence-test-ok"* ]]
@@ -95,12 +95,12 @@ test_machine_overlay_size() {
     local vm_name="test-vm-overlay-size"
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
     # Create VM with custom overlay size (4 GiB)
-    $SMOLVM machine create "$vm_name" --overlay 4 2>&1 || return 1
+    $SMOLVM machine create --name "$vm_name" --overlay 4 2>&1 || return 1
     $SMOLVM machine start --name "$vm_name" 2>&1 || {
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null
         return 1
     }
 
@@ -110,7 +110,7 @@ test_machine_overlay_size() {
 
     # Cleanup
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
     ensure_data_dir_deleted "$vm_name"
 
     # The 4GB overlay should show ~3800-4096 MB total (ext4 overhead)
@@ -123,15 +123,15 @@ test_machine_overlay_size() {
 test_machine_images() {
     # Start default machine and check images command
     $SMOLVM machine stop 2>/dev/null || true
-    $SMOLVM machine delete default -f 2>/dev/null || true
-    $SMOLVM machine create --net default 2>/dev/null || true
+    $SMOLVM machine delete --name default -f 2>/dev/null || true
+    $SMOLVM machine create --net --name default 2>/dev/null || true
     $SMOLVM machine start --name default 2>/dev/null || true
 
     local output
     output=$($SMOLVM machine images --name default 2>&1)
 
     $SMOLVM machine stop 2>/dev/null || true
-    $SMOLVM machine delete default -f 2>/dev/null || true
+    $SMOLVM machine delete --name default -f 2>/dev/null || true
 
     # Should show storage info
     [[ "$output" == *"Storage"* ]] || [[ "$output" == *"storage"* ]]
@@ -139,15 +139,15 @@ test_machine_images() {
 
 test_machine_prune_dry_run() {
     $SMOLVM machine stop 2>/dev/null || true
-    $SMOLVM machine delete default -f 2>/dev/null || true
-    $SMOLVM machine create --net default 2>/dev/null || true
+    $SMOLVM machine delete --name default -f 2>/dev/null || true
+    $SMOLVM machine create --net --name default 2>/dev/null || true
     $SMOLVM machine start --name default 2>/dev/null || true
 
     local output
     output=$($SMOLVM machine prune --name default --dry-run 2>&1)
 
     $SMOLVM machine stop 2>/dev/null || true
-    $SMOLVM machine delete default -f 2>/dev/null || true
+    $SMOLVM machine delete --name default -f 2>/dev/null || true
 
     # Should complete without error
     [[ $? -eq 0 ]] || [[ "$output" == *"unreferenced"* ]] || [[ "$output" == *"No unreferenced"* ]]
@@ -232,8 +232,8 @@ test_prune_all_refuses_on_running_vm() {
 test_prune_all_removes_images() {
     # Start with a clean machine that has an image cached
     $SMOLVM machine stop 2>/dev/null || true
-    $SMOLVM machine delete default -f 2>/dev/null || true
-    $SMOLVM machine create --image alpine --net default 2>&1 || return 1
+    $SMOLVM machine delete --name default -f 2>/dev/null || true
+    $SMOLVM machine create --image alpine --net --name default 2>&1 || return 1
     $SMOLVM machine start 2>&1 || return 1
 
     # Verify the image is cached
@@ -250,18 +250,18 @@ test_prune_all_removes_images() {
     local output
     output=$($SMOLVM machine prune --name default --all 2>&1) || {
         echo "prune --all failed: $output"
-        $SMOLVM machine delete default -f 2>/dev/null
+        $SMOLVM machine delete --name default -f 2>/dev/null
         return 1
     }
     [[ "$output" == *"Removed"* ]] || [[ "$output" == *"No cached images"* ]] || {
         echo "unexpected prune output: $output"
-        $SMOLVM machine delete default -f 2>/dev/null
+        $SMOLVM machine delete --name default -f 2>/dev/null
         return 1
     }
 
     # Restart and verify images are gone
     $SMOLVM machine start 2>&1 || {
-        $SMOLVM machine delete default -f 2>/dev/null
+        $SMOLVM machine delete --name default -f 2>/dev/null
         return 1
     }
 
@@ -269,7 +269,7 @@ test_prune_all_removes_images() {
     images_after=$($SMOLVM machine images --name default 2>&1)
 
     $SMOLVM machine stop 2>/dev/null || true
-    $SMOLVM machine delete default -f 2>/dev/null || true
+    $SMOLVM machine delete --name default -f 2>/dev/null || true
 
     # After prune --all, no images should remain
     if echo "$images_after" | grep -qE "^[a-z].*[0-9]+ MB"; then

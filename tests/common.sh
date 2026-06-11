@@ -212,12 +212,12 @@ print_summary() {
 
 # Get the data directory for a named machine.
 #
-# Delegates to `smolvm machine data-dir <name>` so the test helper never
+# Delegates to `smolvm machine data-dir --name <name>` so the test helper never
 # duplicates the hash logic. If Rust changes the on-disk layout, the test
 # suite automatically picks it up via this CLI call.
 vm_data_dir() {
     local name="${1:-default}"
-    $SMOLVM machine data-dir "$name" 2>/dev/null
+    $SMOLVM machine data-dir --name "$name" 2>/dev/null
 }
 
 # Cleanup helper - stop machine and remove named "default" from DB
@@ -225,7 +225,7 @@ vm_data_dir() {
 # manual testing or previous test runs).
 cleanup_machine() {
     $SMOLVM machine stop 2>/dev/null || true
-    $SMOLVM machine delete default -f 2>/dev/null || true
+    $SMOLVM machine delete --name default -f 2>/dev/null || true
 }
 
 # Verify that a VM's data directory was removed after deletion.
@@ -249,8 +249,8 @@ ensure_machine_running() {
     if [[ "$with_net" == "true" ]]; then
         # Stop and delete existing default VM, recreate with --net
         $SMOLVM machine stop 2>/dev/null || true
-        $SMOLVM machine delete default -f 2>/dev/null || true
-        $SMOLVM machine create default --net 2>/dev/null || true
+        $SMOLVM machine delete --name default -f 2>/dev/null || true
+        $SMOLVM machine create --name default --net 2>/dev/null || true
     fi
     $SMOLVM machine start 2>/dev/null || true
 
@@ -258,9 +258,9 @@ ensure_machine_running() {
     # the process is dead (stale PID), do a full cleanup and restart.
     if ! $SMOLVM machine exec -- true 2>/dev/null; then
         $SMOLVM machine stop 2>/dev/null || true
-        $SMOLVM machine delete default -f 2>/dev/null || true
+        $SMOLVM machine delete --name default -f 2>/dev/null || true
         if [[ "$with_net" == "true" ]]; then
-            $SMOLVM machine create default --net 2>/dev/null || true
+            $SMOLVM machine create --name default --net 2>/dev/null || true
         fi
         $SMOLVM machine start 2>/dev/null || true
     fi

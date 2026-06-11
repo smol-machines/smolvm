@@ -147,14 +147,14 @@ test_machine_run_image_default_user() {
 
 test_machine_run_detached() {
     $SMOLVM machine stop 2>/dev/null || true
-    $SMOLVM machine delete default -f 2>/dev/null || true
+    $SMOLVM machine delete --name default -f 2>/dev/null || true
 
     local run_output exit_code=0
     run_output=$($SMOLVM machine run -d --net --image alpine:latest 2>&1) || exit_code=$?
 
     if [[ $exit_code -ne 0 ]]; then
         $SMOLVM machine stop 2>/dev/null || true
-        $SMOLVM machine delete default -f 2>/dev/null || true
+        $SMOLVM machine delete --name default -f 2>/dev/null || true
         echo "Setup failed: machine run -d returned $exit_code: $run_output"
         return 1
     fi
@@ -164,7 +164,7 @@ test_machine_run_detached() {
     list_output=$($SMOLVM machine ls --json 2>&1)
 
     $SMOLVM machine stop 2>/dev/null || true
-    $SMOLVM machine delete default -f 2>/dev/null || true
+    $SMOLVM machine delete --name default -f 2>/dev/null || true
 
     [[ "$list_output" == *'"name": "default"'* ]] && \
     [[ "$list_output" == *'"state": "running"'* ]]
@@ -172,7 +172,7 @@ test_machine_run_detached() {
 
 test_machine_run_detached_with_command() {
     $SMOLVM machine stop 2>/dev/null || true
-    $SMOLVM machine delete default -f 2>/dev/null || true
+    $SMOLVM machine delete --name default -f 2>/dev/null || true
 
     local run_output exit_code=0
     run_output=$($SMOLVM machine run -d --net --image alpine:latest -- \
@@ -180,7 +180,7 @@ test_machine_run_detached_with_command() {
 
     if [[ $exit_code -ne 0 ]]; then
         $SMOLVM machine stop 2>/dev/null || true
-        $SMOLVM machine delete default -f 2>/dev/null || true
+        $SMOLVM machine delete --name default -f 2>/dev/null || true
         echo "Setup failed: machine run -d returned $exit_code: $run_output"
         return 1
     fi
@@ -194,7 +194,7 @@ test_machine_run_detached_with_command() {
     done
 
     $SMOLVM machine stop 2>/dev/null || true
-    $SMOLVM machine delete default -f 2>/dev/null || true
+    $SMOLVM machine delete --name default -f 2>/dev/null || true
 
     if [[ "$file_output" != *"issue198_fixed"* ]]; then
         echo "FAIL: command was not executed by 'machine run -d --image X -- cmd'"
@@ -264,7 +264,7 @@ test_machine_run_detached_volume_workspace() {
     echo "detached-workspace-marker" > "$tmpdir/probe.txt"
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
     local run_output exit_code=0
     run_output=$(run_with_timeout 120 $SMOLVM machine run -d --net \
@@ -275,7 +275,7 @@ test_machine_run_detached_volume_workspace() {
     if [[ $exit_code -ne 0 ]]; then
         echo "FAIL: machine run -d failed: $run_output"
         rm -rf "$tmpdir"
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     fi
 
@@ -284,13 +284,13 @@ test_machine_run_detached_volume_workspace() {
     exec_out=$(run_with_timeout 30 $SMOLVM machine exec --name "$vm_name" -- cat /workspace/probe.txt 2>&1) || {
         echo "FAIL: exec failed: $exec_out"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         rm -rf "$tmpdir"
         return 1
     }
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
     rm -rf "$tmpdir"
 
     if ! echo "$exec_out" | grep -q "detached-workspace-marker"; then
@@ -304,7 +304,7 @@ test_machine_start_restores_workload() {
     local vm_name="start-restores-workload-$$"
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
     # Create persistent VM with a long-running workload
     local run_output exit_code=0
@@ -320,27 +320,27 @@ test_machine_start_restores_workload() {
     ps_before=$(run_with_timeout 30 $SMOLVM machine exec --name "$vm_name" -- ps -ef 2>&1) || {
         echo "FAIL: exec before stop failed: $ps_before"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     }
     if ! echo "$ps_before" | grep -q "sleep"; then
         echo "FAIL: expected 'sleep infinity' in ps before stop, got:"
         echo "$ps_before"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     fi
 
     # Stop and restart
     $SMOLVM machine stop --name "$vm_name" 2>&1 || {
         echo "FAIL: machine stop failed"
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     }
     local start_output
     start_output=$(run_with_timeout 120 $SMOLVM machine start --name "$vm_name" 2>&1) || {
         echo "FAIL: machine start failed: $start_output"
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     }
 
@@ -349,7 +349,7 @@ test_machine_start_restores_workload() {
     ps_after=$(run_with_timeout 30 $SMOLVM machine exec --name "$vm_name" -- ps -ef 2>&1) || {
         echo "FAIL: exec after restart failed: $ps_after"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     }
     if ! echo "$ps_after" | grep -q "sleep"; then
@@ -359,19 +359,19 @@ test_machine_start_restores_workload() {
         echo "ps after restart:"
         echo "$ps_after"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     fi
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 }
 
 test_machine_start_restores_workload_smolfile() {
     local vm_name="start-restores-sf-$$"
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
     local tmpdir
     tmpdir=$(mktemp -d)
@@ -393,7 +393,7 @@ EOF
 
     if [[ $exit_code -ne 0 ]]; then
         echo "FAIL: machine run -d -s Smolfile.toml failed: $run_output"
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     fi
 
@@ -402,27 +402,27 @@ EOF
     ps_before=$(run_with_timeout 30 $SMOLVM machine exec --name "$vm_name" -- ps -ef 2>&1) || {
         echo "FAIL: exec before stop failed: $ps_before"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     }
     if ! echo "$ps_before" | grep -q "sleep"; then
         echo "FAIL: expected 'sleep infinity' in ps before stop, got:"
         echo "$ps_before"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     fi
 
     # Stop and restart
     $SMOLVM machine stop --name "$vm_name" 2>&1 || {
         echo "FAIL: machine stop failed"
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     }
     local start_output
     start_output=$(run_with_timeout 120 $SMOLVM machine start --name "$vm_name" 2>&1) || {
         echo "FAIL: machine start failed: $start_output"
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     }
 
@@ -431,7 +431,7 @@ EOF
     ps_after=$(run_with_timeout 30 $SMOLVM machine exec --name "$vm_name" -- ps -ef 2>&1) || {
         echo "FAIL: exec after restart failed: $ps_after"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     }
     if ! echo "$ps_after" | grep -q "sleep"; then
@@ -441,12 +441,12 @@ EOF
         echo "ps after restart:"
         echo "$ps_after"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     fi
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 }
 
 test_machine_run_timeout() {
@@ -508,13 +508,13 @@ test_ephemeral_shows_in_list_while_running() {
     echo "$list_result" | grep -q "$name" || {
         echo "Detached run not in list: $list_result"
         $SMOLVM machine stop --name "$name" 2>/dev/null || true
-        $SMOLVM machine delete "$name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$name" -f 2>/dev/null || true
         return 1
     }
 
     # Clean up
     $SMOLVM machine stop --name "$name" 2>/dev/null || true
-    $SMOLVM machine delete "$name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$name" -f 2>/dev/null || true
 }
 
 test_run_no_command_errors() {
@@ -572,17 +572,17 @@ test_init_skipped_on_restart() {
     local vm_name="init-skip-$$"
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
     # Create with init command and start — first boot should run init
-    $SMOLVM machine create "$vm_name" --net --init "echo INIT_RAN" 2>&1
+    $SMOLVM machine create --name "$vm_name" --net --init "echo INIT_RAN" 2>&1
     local first_start
     first_start=$($SMOLVM machine start --name "$vm_name" 2>&1)
     echo "$first_start"
 
     if [[ "$first_start" != *"Running 1 init command"* ]]; then
         echo "FAIL: first start should run init"
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     fi
 
@@ -593,7 +593,7 @@ test_init_skipped_on_restart() {
     echo "$second_start"
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
     if [[ "$second_start" == *"Running"*"init command"* ]]; then
         echo "FAIL: second start should NOT re-run init"

@@ -42,30 +42,30 @@ test_resource_mem_below_minimum_rejected() {
 test_name_length_44_chars_accepted() {
     local name="sandbox-7f3e2d1c-9a8b-4e5f-b123-456789abcdef"
     [[ ${#name} -eq 44 ]] || { echo "test bug: expected 44 chars, got ${#name}"; return 1; }
-    $SMOLVM machine delete "$name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$name" -f 2>/dev/null || true
 
     local output exit_code=0
-    output=$($SMOLVM machine create "$name" 2>&1) || exit_code=$?
+    output=$($SMOLVM machine create --name "$name" 2>&1) || exit_code=$?
     if [[ $exit_code -ne 0 ]]; then
         echo "expected 44-char name to succeed, got error: $output"
         return 1
     fi
-    $SMOLVM machine delete "$name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$name" -f 2>/dev/null || true
 }
 
 test_name_length_75_chars_accepted_via_hash_path() {
     local name
     name=$(printf 'a%.0s' {1..75})
     [[ ${#name} -eq 75 ]] || return 1
-    $SMOLVM machine delete "$name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$name" -f 2>/dev/null || true
 
     local output exit_code=0
-    output=$($SMOLVM machine create "$name" 2>&1) || exit_code=$?
+    output=$($SMOLVM machine create --name "$name" 2>&1) || exit_code=$?
     if [[ $exit_code -ne 0 ]]; then
         echo "expected 75-char name to succeed (hash path keeps socket bounded), got: $output"
         return 1
     fi
-    $SMOLVM machine delete "$name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$name" -f 2>/dev/null || true
 }
 
 test_name_length_sanity_cap_rejects_absurd_names() {
@@ -74,7 +74,7 @@ test_name_length_sanity_cap_rejects_absurd_names() {
     [[ ${#name} -eq 200 ]] || return 1
 
     local output exit_code=0
-    output=$($SMOLVM machine create "$name" 2>&1) || exit_code=$?
+    output=$($SMOLVM machine create --name "$name" 2>&1) || exit_code=$?
     [[ $exit_code -ne 0 ]] || { echo "expected 200-char name to be rejected"; return 1; }
     [[ "$output" == *"too long"* ]] || {
         echo "expected length-cap error, got: $output"
@@ -96,8 +96,8 @@ test_start_nonexistent_name_rejected() {
 test_auto_generated_names() {
     # Auto-generate: create with no name, verify format + appears in list
     local result1 result2
-    result1=$($SMOLVM machine create 2>&1) || return 1
-    result2=$($SMOLVM machine create 2>&1) || return 1
+    result1=$($SMOLVM machine create --name 2>&1) || return 1
+    result2=$($SMOLVM machine create --name 2>&1) || return 1
 
     local name1 name2
     name1=$(echo "$result1" | grep "Created machine:" | grep -oE "vm-[a-f0-9]{8}" | head -1)
@@ -114,21 +114,21 @@ test_auto_generated_names() {
     list_result=$($SMOLVM machine ls --json 2>&1)
     [[ "$list_result" == *"$name1"* ]] && [[ "$list_result" == *"$name2"* ]] || {
         echo "Auto-named machines not in list"
-        $SMOLVM machine delete "$name1" -f 2>/dev/null
-        $SMOLVM machine delete "$name2" -f 2>/dev/null
+        $SMOLVM machine delete --name "$name1" -f 2>/dev/null
+        $SMOLVM machine delete --name "$name2" -f 2>/dev/null
         return 1
     }
 
     # Explicit name still works
     local explicit="explicit-test-$$"
-    $SMOLVM machine create "$explicit" 2>&1 || { echo "Explicit name failed"; return 1; }
+    $SMOLVM machine create --name "$explicit" 2>&1 || { echo "Explicit name failed"; return 1; }
     list_result=$($SMOLVM machine ls --json 2>&1)
     [[ "$list_result" == *"$explicit"* ]] || { echo "Explicit name not in list"; return 1; }
 
     # Cleanup
-    $SMOLVM machine delete "$name1" -f 2>/dev/null
-    $SMOLVM machine delete "$name2" -f 2>/dev/null
-    $SMOLVM machine delete "$explicit" -f 2>/dev/null
+    $SMOLVM machine delete --name "$name1" -f 2>/dev/null
+    $SMOLVM machine delete --name "$name2" -f 2>/dev/null
+    $SMOLVM machine delete --name "$explicit" -f 2>/dev/null
 }
 
 
@@ -137,21 +137,21 @@ test_create_rejects_zero_valued_disks() {
     # NOT persist a machine — otherwise the failure only surfaces later at
     # `machine start`, leaving an unstartable machine in the list.
     local name="zero-disk-test-$$"
-    $SMOLVM machine delete "$name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$name" -f 2>/dev/null || true
 
     local exit_code=0
-    $SMOLVM machine create "$name" --storage 0 2>&1 || exit_code=$?
+    $SMOLVM machine create --name "$name" --storage 0 2>&1 || exit_code=$?
     [[ $exit_code -ne 0 ]] || {
         echo "--storage 0 should be rejected at create"
-        $SMOLVM machine delete "$name" -f 2>/dev/null
+        $SMOLVM machine delete --name "$name" -f 2>/dev/null
         return 1
     }
 
     exit_code=0
-    $SMOLVM machine create "$name" --overlay 0 2>&1 || exit_code=$?
+    $SMOLVM machine create --name "$name" --overlay 0 2>&1 || exit_code=$?
     [[ $exit_code -ne 0 ]] || {
         echo "--overlay 0 should be rejected at create"
-        $SMOLVM machine delete "$name" -f 2>/dev/null
+        $SMOLVM machine delete --name "$name" -f 2>/dev/null
         return 1
     }
 
@@ -160,7 +160,7 @@ test_create_rejects_zero_valued_disks() {
     list=$($SMOLVM machine ls --json 2>&1)
     [[ "$list" != *"$name"* ]] || {
         echo "a rejected create persisted the machine anyway"
-        $SMOLVM machine delete "$name" -f 2>/dev/null
+        $SMOLVM machine delete --name "$name" -f 2>/dev/null
         return 1
     }
 }
@@ -188,22 +188,22 @@ test_exec_nonexistent_machine_reports_not_found() {
 test_status_json_output() {
     # `machine status` supports `--json`, mirroring `machine list --json`.
     local name="status-json-test-$$"
-    $SMOLVM machine delete "$name" -f 2>/dev/null || true
-    $SMOLVM machine create "$name" 2>&1 || { echo "setup: create failed"; return 1; }
+    $SMOLVM machine delete --name "$name" -f 2>/dev/null || true
+    $SMOLVM machine create --name "$name" 2>&1 || { echo "setup: create failed"; return 1; }
 
     local output exit_code=0
     output=$($SMOLVM machine status --name "$name" --json 2>&1) || exit_code=$?
     if [[ $exit_code -ne 0 ]]; then
         echo "status --json should succeed, got: $output"
-        $SMOLVM machine delete "$name" -f 2>/dev/null
+        $SMOLVM machine delete --name "$name" -f 2>/dev/null
         return 1
     fi
     [[ "$output" == "{"* && "$output" == *"\"name\""* && "$output" == *"$name"* ]] || {
         echo "status --json did not return the expected JSON object: $output"
-        $SMOLVM machine delete "$name" -f 2>/dev/null
+        $SMOLVM machine delete --name "$name" -f 2>/dev/null
         return 1
     }
-    $SMOLVM machine delete "$name" -f 2>/dev/null
+    $SMOLVM machine delete --name "$name" -f 2>/dev/null
 
     # `--json` on a machine that does not exist must error.
     exit_code=0

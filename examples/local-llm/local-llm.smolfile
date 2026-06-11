@@ -9,7 +9,7 @@
 #
 # ── Setup (runs once, takes ~5 min to build llama.cpp) ───────────────────────
 #
-#   smolvm machine create llm -s examples/local-llm/local-llm.smolfile
+#   smolvm machine create --name llm -s examples/local-llm/local-llm.smolfile
 #   smolvm machine start --name llm
 #
 # ── Download a model ────────────────────────────────────────────────────────

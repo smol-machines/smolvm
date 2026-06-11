@@ -53,7 +53,7 @@ the exec returns). Pass the command at `create` (an image machine with no
 command instead adopts the image's OCI `CMD`/`ENTRYPOINT`):
 
 ```sh
-smolvm machine create browser-golden \
+smolvm machine create --name browser-golden \
     --image chromedp/headless-shell:latest --net \
     --workdir /headless-shell \
     -- ./headless-shell --headless=new --no-zygote --no-sandbox \
@@ -63,8 +63,8 @@ smolvm machine create browser-golden \
 smolvm machine start --name browser-golden --forkable
 
 # Fork a warm clone on demand (one golden → N clones):
-smolvm machine fork browser-golden worker-1
-smolvm machine fork browser-golden worker-2
+smolvm machine fork --golden browser-golden --name worker-1
+smolvm machine fork --golden browser-golden --name worker-2
 
 # Each clone's browser is already up; exec / drive it:
 smolvm machine exec --name worker-1 -- /bin/sh -c 'echo ready'

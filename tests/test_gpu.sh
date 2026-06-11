@@ -25,7 +25,7 @@ GPU_FEDORA_MACHINE="gpu-fedora-$$"
 
 cleanup_gpu() {
     "$SMOLVM" machine stop --name "$GPU_FEDORA_MACHINE" 2>/dev/null || true
-    "$SMOLVM" machine delete "$GPU_FEDORA_MACHINE" -f 2>/dev/null || true
+    "$SMOLVM" machine delete --name "$GPU_FEDORA_MACHINE" -f 2>/dev/null || true
 }
 trap cleanup_gpu EXIT
 
@@ -157,18 +157,18 @@ test_named_machine_gpu_persists() {
     # deserialise → launcher → krun_set_gpu_options2.
     local name="gpu-named-$$"
     "$SMOLVM" machine stop --name "$name" 2>/dev/null || true
-    "$SMOLVM" machine delete "$name" -f 2>/dev/null || true
+    "$SMOLVM" machine delete --name "$name" -f 2>/dev/null || true
 
-    "$SMOLVM" machine create "$name" --gpu --net --image alpine:latest 2>&1 || return 1
+    "$SMOLVM" machine create --name "$name" --gpu --net --image alpine:latest 2>&1 || return 1
     "$SMOLVM" machine start --name "$name" 2>&1 || {
-        "$SMOLVM" machine delete "$name" -f 2>/dev/null; return 1
+        "$SMOLVM" machine delete --name "$name" -f 2>/dev/null; return 1
     }
 
     local out rc=0
     out=$("$SMOLVM" machine exec --name "$name" -- ls /dev/dri/renderD128 2>&1) || rc=$?
 
     "$SMOLVM" machine stop --name "$name" 2>/dev/null || true
-    "$SMOLVM" machine delete "$name" -f 2>/dev/null || true
+    "$SMOLVM" machine delete --name "$name" -f 2>/dev/null || true
 
     [[ $rc -eq 0 ]] && [[ "$out" == *"renderD128"* ]] || {
         echo "FAIL: renderD128 absent in named GPU machine (got: $out, exit $rc)"
@@ -275,15 +275,15 @@ echo "Running Vulkan workload tests (Fedora 42 + patched Mesa)..."
 
 test_fedora_gpu_setup() {
     "$SMOLVM" machine stop --name "$GPU_FEDORA_MACHINE" 2>/dev/null || true
-    "$SMOLVM" machine delete "$GPU_FEDORA_MACHINE" -f 2>/dev/null || true
+    "$SMOLVM" machine delete --name "$GPU_FEDORA_MACHINE" -f 2>/dev/null || true
 
     echo "  Creating Fedora 42 GPU machine (this pulls ~600 MB on first run)..."
-    "$SMOLVM" machine create "$GPU_FEDORA_MACHINE" \
+    "$SMOLVM" machine create --name "$GPU_FEDORA_MACHINE" \
         --image fedora:42 --gpu --net 2>&1 || return 1
 
     echo "  Starting machine..."
     "$SMOLVM" machine start --name "$GPU_FEDORA_MACHINE" 2>&1 || {
-        "$SMOLVM" machine delete "$GPU_FEDORA_MACHINE" -f 2>/dev/null
+        "$SMOLVM" machine delete --name "$GPU_FEDORA_MACHINE" -f 2>/dev/null
         return 1
     }
 
@@ -359,7 +359,7 @@ test_render_node_in_fedora_container() {
 
 test_fedora_gpu_cleanup() {
     "$SMOLVM" machine stop --name "$GPU_FEDORA_MACHINE" 2>&1 || true
-    "$SMOLVM" machine delete "$GPU_FEDORA_MACHINE" -f 2>/dev/null || true
+    "$SMOLVM" machine delete --name "$GPU_FEDORA_MACHINE" -f 2>/dev/null || true
 }
 
 run_test "GPU: Fedora 42 + patched Mesa setup" test_fedora_gpu_setup || true

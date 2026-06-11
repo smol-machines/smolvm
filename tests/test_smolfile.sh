@@ -3,7 +3,7 @@
 # Smolfile tests for smolvm.
 #
 # Tests the `--smolfile` and `--init` functionality for both
-# machine create commands.
+# machine create --name commands.
 #
 # Usage:
 #   ./tests/test_smolfile.sh
@@ -33,7 +33,7 @@ trap 'rm -rf "$SMOLFILE_TMPDIR"; cleanup_machine' EXIT
 cleanup_vm() {
     local name="$1"
     $SMOLVM machine stop --name "$name" 2>/dev/null || true
-    $SMOLVM machine delete "$name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$name" -f 2>/dev/null || true
 }
 
 # =============================================================================
@@ -45,7 +45,7 @@ test_init_flag_creates_file() {
     cleanup_vm "$vm_name"
 
     # Create VM with --init that creates a marker file
-    $SMOLVM machine create "$vm_name" --init "echo 'init-ran' > /tmp/init-marker.txt" 2>&1 || return 1
+    $SMOLVM machine create --name "$vm_name" --init "echo 'init-ran' > /tmp/init-marker.txt" 2>&1 || return 1
 
     # Start VM (init should run)
     $SMOLVM machine start --name "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
@@ -63,7 +63,7 @@ test_init_flag_multiple_commands() {
     cleanup_vm "$vm_name"
 
     # Create VM with multiple --init flags
-    $SMOLVM machine create "$vm_name" \
+    $SMOLVM machine create --name "$vm_name" \
         --init "echo 'first' > /tmp/init1.txt" \
         --init "echo 'second' > /tmp/init2.txt" \
         2>&1 || return 1
@@ -85,7 +85,7 @@ test_init_flag_with_env() {
     cleanup_vm "$vm_name"
 
     # Create VM with --init and -e
-    $SMOLVM machine create "$vm_name" \
+    $SMOLVM machine create --name "$vm_name" \
         -e MY_VAR=hello_from_env \
         --init 'echo "$MY_VAR" > /tmp/env-test.txt' \
         2>&1 || return 1
@@ -106,7 +106,7 @@ test_init_flag_with_workdir() {
     cleanup_vm "$vm_name"
 
     # Create VM with --init and -w
-    $SMOLVM machine create "$vm_name" \
+    $SMOLVM machine create --name "$vm_name" \
         -w /tmp \
         --init "pwd > cwd.txt" \
         2>&1 || return 1
@@ -127,7 +127,7 @@ test_init_runs_on_every_start() {
     cleanup_vm "$vm_name"
 
     # Create VM with --init that appends to a file
-    $SMOLVM machine create "$vm_name" \
+    $SMOLVM machine create --name "$vm_name" \
         --init 'echo "boot" >> /tmp/boot-count.txt' \
         2>&1 || return 1
 
@@ -186,7 +186,7 @@ net = true
 init = ["command -v dpkg > /tmp/dpkg-path.txt"]
 EOF
 
-    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.initcontainer" 2>&1 || return 1
+    $SMOLVM machine create --name "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.initcontainer" 2>&1 || return 1
 
     # Start should pull the image, then run init *in* the container.
     $SMOLVM machine start --name "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
@@ -221,7 +221,7 @@ net = true
 init = ["test -f /etc/debian_version"]
 EOF
 
-    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.initafter" 2>&1 || return 1
+    $SMOLVM machine create --name "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.initafter" 2>&1 || return 1
 
     # Capture start output — must show pull happens before init runs.
     local start_output
@@ -267,7 +267,7 @@ init = [
 ]
 EOF
 
-    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.initpersist" 2>&1 || return 1
+    $SMOLVM machine create --name "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.initpersist" 2>&1 || return 1
     $SMOLVM machine start --name "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
 
     # Exec must see the package installed by init. If the overlay ID
@@ -301,7 +301,7 @@ net = true
 init = ["apt-get install -y bogus-pkg-does-not-exist-xyz"]
 EOF
 
-    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.initfail" 2>&1 || return 1
+    $SMOLVM machine create --name "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.initfail" 2>&1 || return 1
 
     # Start must fail; the error must include pacman's output explaining
     # why. Capture stderr too — the error prints there.
@@ -335,7 +335,7 @@ init = [
 EOF
 
     # Create VM from Smolfile
-    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.basic" 2>&1 || return 1
+    $SMOLVM machine create --name "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.basic" 2>&1 || return 1
 
     # Verify config was applied
     local list_output
@@ -368,7 +368,7 @@ init = [
 ]
 EOF
 
-    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.env" 2>&1 || return 1
+    $SMOLVM machine create --name "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.env" 2>&1 || return 1
     $SMOLVM machine start --name "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
 
     local output
@@ -388,7 +388,7 @@ memory = 256
 EOF
 
     # CLI --mem should override Smolfile memory
-    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.override" --mem 1024 2>&1 || return 1
+    $SMOLVM machine create --name "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.override" --mem 1024 2>&1 || return 1
 
     local list_output
     list_output=$($SMOLVM machine ls --json 2>&1)
@@ -410,7 +410,7 @@ init = [
 EOF
 
     # CLI --init should extend, not replace
-    $SMOLVM machine create "$vm_name" \
+    $SMOLVM machine create --name "$vm_name" \
         --smolfile "$SMOLFILE_TMPDIR/Smolfile.extend" \
         --init "echo 'from-cli' > /tmp/cli-source.txt" \
         2>&1 || return 1
@@ -430,7 +430,7 @@ test_smolfile_not_found_errors() {
     cleanup_vm "$vm_name"
 
     local exit_code=0
-    $SMOLVM machine create "$vm_name" --smolfile "/nonexistent/Smolfile" 2>&1 || exit_code=$?
+    $SMOLVM machine create --name "$vm_name" --smolfile "/nonexistent/Smolfile" 2>&1 || exit_code=$?
 
     cleanup_vm "$vm_name"
     [[ $exit_code -ne 0 ]]
@@ -445,7 +445,7 @@ this is not valid toml {{{
 EOF
 
     local exit_code=0
-    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.bad" 2>&1 || exit_code=$?
+    $SMOLVM machine create --name "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.bad" 2>&1 || exit_code=$?
 
     cleanup_vm "$vm_name"
     [[ $exit_code -ne 0 ]]
@@ -461,7 +461,7 @@ typo_field = "oops"
 EOF
 
     local exit_code=0
-    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.unknown" 2>&1 || exit_code=$?
+    $SMOLVM machine create --name "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.unknown" 2>&1 || exit_code=$?
 
     cleanup_vm "$vm_name"
     [[ $exit_code -ne 0 ]]
@@ -480,7 +480,7 @@ EOF
 
     # Create VM WITHOUT --smolfile, even though Smolfile exists in CWD
     # The Smolfile should NOT be auto-detected
-    (cd "$SMOLFILE_TMPDIR" && $SMOLVM machine create "$vm_name" 2>&1) || return 1
+    (cd "$SMOLFILE_TMPDIR" && $SMOLVM machine create --name "$vm_name" 2>&1) || return 1
 
     # Verify default config was used (not Smolfile config)
     local list_output
@@ -510,7 +510,7 @@ net = true
 EOF
 
     # Create + start — image from Smolfile should be picked up
-    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.image" 2>&1 || return 1
+    $SMOLVM machine create --name "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.image" 2>&1 || return 1
 
     # Verify image is persisted in the record
     local list_output
@@ -532,7 +532,7 @@ EOF
     local exit_code=0
     local vm_name="smolfile-ep-$$"
     cleanup_vm "$vm_name"
-    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.ep" 2>&1 || exit_code=$?
+    $SMOLVM machine create --name "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.ep" 2>&1 || exit_code=$?
 
     cleanup_vm "$vm_name"
     [[ $exit_code -eq 0 ]]
@@ -548,7 +548,7 @@ EOF
     local exit_code=0
     local vm_name="smolfile-cmd-$$"
     cleanup_vm "$vm_name"
-    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.cmd" 2>&1 || exit_code=$?
+    $SMOLVM machine create --name "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.cmd" 2>&1 || exit_code=$?
 
     cleanup_vm "$vm_name"
     [[ $exit_code -eq 0 ]]
@@ -574,7 +574,7 @@ EOF
     local exit_code=0
     local vm_name="smolfile-artifact-$$"
     cleanup_vm "$vm_name"
-    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.artifact" 2>&1 || exit_code=$?
+    $SMOLVM machine create --name "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.artifact" 2>&1 || exit_code=$?
 
     cleanup_vm "$vm_name"
     [[ $exit_code -eq 0 ]]
@@ -592,7 +592,7 @@ EOF
     local exit_code=0
     local vm_name="smolfile-pack-$$"
     cleanup_vm "$vm_name"
-    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.pack" 2>&1 || exit_code=$?
+    $SMOLVM machine create --name "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.pack" 2>&1 || exit_code=$?
 
     cleanup_vm "$vm_name"
     [[ $exit_code -eq 0 ]]
@@ -616,7 +616,7 @@ EOF
     local exit_code=0
     local vm_name="smolfile-dev-$$"
     cleanup_vm "$vm_name"
-    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.dev" 2>&1 || exit_code=$?
+    $SMOLVM machine create --name "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.dev" 2>&1 || exit_code=$?
 
     cleanup_vm "$vm_name"
     [[ $exit_code -eq 0 ]]
@@ -636,7 +636,7 @@ init = [
 ]
 EOF
 
-    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.devinit" 2>&1 || return 1
+    $SMOLVM machine create --name "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.devinit" 2>&1 || return 1
     $SMOLVM machine start --name "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
 
     local output
@@ -695,7 +695,7 @@ EOF
     local exit_code=0
     local vm_name="smolfile-full-$$"
     cleanup_vm "$vm_name"
-    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.full" 2>&1 || exit_code=$?
+    $SMOLVM machine create --name "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.full" 2>&1 || exit_code=$?
 
     cleanup_vm "$vm_name"
     [[ $exit_code -eq 0 ]]
@@ -830,7 +830,7 @@ memory = 512
 net = true
 EOF
 
-    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.autoct" 2>&1 || return 1
+    $SMOLVM machine create --name "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.autoct" 2>&1 || return 1
 
     # Start should auto-pull image and create container
     local start_output
@@ -888,7 +888,7 @@ EOF
     local exit_code=0
     local vm_name="smolfile-badsec-$$"
     cleanup_vm "$vm_name"
-    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.badsection" 2>&1 || exit_code=$?
+    $SMOLVM machine create --name "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.badsection" 2>&1 || exit_code=$?
 
     cleanup_vm "$vm_name"
     [[ $exit_code -ne 0 ]]
@@ -902,7 +902,7 @@ test_ls_verbose_shows_init() {
     local vm_name="smolfile-verbose-$$"
     cleanup_vm "$vm_name"
 
-    $SMOLVM machine create "$vm_name" \
+    $SMOLVM machine create --name "$vm_name" \
         --init "echo hello" \
         --init "echo world" \
         -e FOO=bar \
@@ -942,7 +942,7 @@ EOF
     cleanup_vm "$vm_name"
 
     # Create should succeed (restart config stored in VmRecord)
-    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.restart" 2>&1 || return 1
+    $SMOLVM machine create --name "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.restart" 2>&1 || return 1
 
     # Verify machine was created
     $SMOLVM machine ls --json 2>&1 | grep -q "$vm_name" || return 1
@@ -969,7 +969,7 @@ EOF
     cleanup_vm "$vm_name"
 
     # Create should succeed (health + restart config stored)
-    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.health" 2>&1 || return 1
+    $SMOLVM machine create --name "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.health" 2>&1 || return 1
 
     # Verify machine was created
     $SMOLVM machine ls --json 2>&1 | grep -q "$vm_name" || return 1
@@ -985,7 +985,7 @@ test_smolfile_monitor_basic() {
     $SMOLVM machine stop 2>/dev/null || true
 
     # Create and start a machine
-    $SMOLVM machine create --net "$vm_name" 2>&1 || return 1
+    $SMOLVM machine create --net --name "$vm_name" 2>&1 || return 1
     $SMOLVM machine start --name "$vm_name" 2>&1 || return 1
 
     # Verify the VM is running before testing monitor
@@ -1067,7 +1067,7 @@ test_ssh_agent_flag_creates_socket() {
     cleanup_vm "$vm_name"
 
     # Create VM with --ssh-agent
-    $SMOLVM machine create "$vm_name" --ssh-agent --net 2>&1 || return 1
+    $SMOLVM machine create --name "$vm_name" --ssh-agent --net 2>&1 || return 1
 
     # Start VM
     $SMOLVM machine start --name "$vm_name" 2>&1 || return 1
@@ -1094,7 +1094,7 @@ test_ssh_agent_lists_host_keys() {
         return 0
     fi
 
-    $SMOLVM machine create "$vm_name" --ssh-agent --net 2>&1 || return 1
+    $SMOLVM machine create --name "$vm_name" --ssh-agent --net 2>&1 || return 1
     $SMOLVM machine start --name "$vm_name" 2>&1 || return 1
 
     # Install openssh-client. apk may return non-zero from trigger
@@ -1121,7 +1121,7 @@ test_ssh_agent_not_present_without_flag() {
     cleanup_vm "$vm_name"
 
     # Create VM WITHOUT --ssh-agent
-    $SMOLVM machine create "$vm_name" --net 2>&1 || return 1
+    $SMOLVM machine create --name "$vm_name" --net 2>&1 || return 1
     $SMOLVM machine start --name "$vm_name" 2>&1 || return 1
 
     # Socket should NOT exist
@@ -1145,7 +1145,7 @@ EOF
     local vm_name="ssh-agent-smolfile-$$"
     cleanup_vm "$vm_name"
 
-    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.ssh" 2>&1 || return 1
+    $SMOLVM machine create --name "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.ssh" 2>&1 || return 1
     $SMOLVM machine start --name "$vm_name" 2>&1 || return 1
 
     # Socket should exist (enabled via Smolfile)
@@ -1165,7 +1165,7 @@ test_ssh_agent_fails_without_host_socket() {
     unset SSH_AUTH_SOCK
 
     # Create should succeed (flag is just stored)
-    $SMOLVM machine create "$vm_name" --ssh-agent 2>&1 || { export SSH_AUTH_SOCK="$saved_sock"; return 1; }
+    $SMOLVM machine create --name "$vm_name" --ssh-agent 2>&1 || { export SSH_AUTH_SOCK="$saved_sock"; return 1; }
 
     # Start should fail with clear error
     local output
@@ -1195,7 +1195,7 @@ test_ssh_agent_forwarded_to_container_exec() {
     fi
 
     # Image-based machine: exec goes through crun container, not direct VM exec.
-    $SMOLVM machine create "$vm_name" --image alpine:latest --ssh-agent --net 2>&1 || return 1
+    $SMOLVM machine create --name "$vm_name" --image alpine:latest --ssh-agent --net 2>&1 || return 1
     $SMOLVM machine start --name "$vm_name" 2>&1 || return 1
 
     # SSH_AUTH_SOCK must be set inside the container.
@@ -1261,7 +1261,7 @@ allow_hosts = ["one.one.one.one"]
 EOF
 
     # Create VM from Smolfile with [network] section
-    $SMOLVM machine create "$vm_name" -s "$SMOLFILE_TMPDIR/network.smolfile" 2>&1 || return 1
+    $SMOLVM machine create --name "$vm_name" -s "$SMOLFILE_TMPDIR/network.smolfile" 2>&1 || return 1
     $SMOLVM machine start --name "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
 
     # Allowed host's IP should be reachable
@@ -1288,7 +1288,7 @@ net = true
 allow_cidrs = ["1.1.1.1/32"]
 EOF
 
-    $SMOLVM machine create "$vm_name" -s "$SMOLFILE_TMPDIR/network-cidr.smolfile" 2>&1 || return 1
+    $SMOLVM machine create --name "$vm_name" -s "$SMOLFILE_TMPDIR/network-cidr.smolfile" 2>&1 || return 1
     $SMOLVM machine start --name "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
 
     # Allowed CIDR should work
@@ -1316,7 +1316,7 @@ allow_hosts = ["one.one.one.one"]
 allow_cidrs = ["8.8.8.0/24"]
 EOF
 
-    $SMOLVM machine create "$vm_name" -s "$SMOLFILE_TMPDIR/network-mixed.smolfile" 2>&1 || return 1
+    $SMOLVM machine create --name "$vm_name" -s "$SMOLFILE_TMPDIR/network-mixed.smolfile" 2>&1 || return 1
     $SMOLVM machine start --name "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
 
     # Both should be reachable
@@ -1353,7 +1353,7 @@ memory = 512
 workdir = "/tmp"
 EOF
 
-    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.execwd" 2>&1 || return 1
+    $SMOLVM machine create --name "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.execwd" 2>&1 || return 1
     $SMOLVM machine start --name "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
 
     # exec without --workdir should inherit Smolfile workdir
@@ -1374,7 +1374,7 @@ memory = 512
 workdir = "/tmp"
 EOF
 
-    $SMOLVM machine create "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.execwdover" 2>&1 || return 1
+    $SMOLVM machine create --name "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.execwdover" 2>&1 || return 1
     $SMOLVM machine start --name "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
 
     # exec with explicit -w should override Smolfile workdir

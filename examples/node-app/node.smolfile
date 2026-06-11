@@ -1,7 +1,7 @@
 # Node.js dev environment in a hardware-isolated microVM
 #
 #   smolvm machine run -s examples/node-app/node.smolfile
-#   smolvm machine create dev -s node.smolfile
+#   smolvm machine create --name dev -s node.smolfile
 #   smolvm machine start --name dev
 #   smolvm machine exec --name dev -- node -e "console.log('hello')"
 

@@ -23,73 +23,73 @@ test_create_with_image() {
     local vm_name="create-image-test-$$"
 
     # Create with --image (new feature), start, exec, verify, cleanup
-    $SMOLVM machine create "$vm_name" --image alpine:latest --net 2>&1 || return 1
+    $SMOLVM machine create --name "$vm_name" --image alpine:latest --net 2>&1 || return 1
 
     # Should appear in list (use --json for full names)
     $SMOLVM machine ls --json 2>&1 | grep -q "$vm_name" || {
         echo "Machine not in list"
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null
         return 1
     }
 
     # Start — should auto-pull the image
     local start_result
     start_result=$(run_with_timeout 60 $SMOLVM machine start --name "$vm_name" 2>&1)
-    [[ $? -eq 124 ]] && { echo "TIMEOUT on start"; $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+    [[ $? -eq 124 ]] && { echo "TIMEOUT on start"; $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1; }
     [[ "$start_result" == *"Pulling"* ]] || [[ "$start_result" == *"Started"* ]] || [[ "$start_result" == *"already running"* ]] || {
         echo "Start failed: $start_result"
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null
         return 1
     }
 
     # Exec — verify we're in the right image
     local exec_result
     exec_result=$(run_with_timeout 30 $SMOLVM machine exec --name "$vm_name" -- cat /etc/os-release 2>&1)
-    [[ $? -eq 124 ]] && { echo "TIMEOUT on exec"; $SMOLVM machine stop --name "$vm_name" 2>/dev/null; $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+    [[ $? -eq 124 ]] && { echo "TIMEOUT on exec"; $SMOLVM machine stop --name "$vm_name" 2>/dev/null; $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1; }
     [[ "$exec_result" == *"Alpine"* ]] || {
         echo "Not running Alpine: $exec_result"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null
         return 1
     }
 
     # Cleanup
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null
 }
 
 test_create_with_image_and_env() {
     local vm_name="create-env-test-$$"
 
     # Create with --image + env + workdir
-    $SMOLVM machine create "$vm_name" --image alpine:latest --net \
+    $SMOLVM machine create --name "$vm_name" --image alpine:latest --net \
         -e TEST_VAR=from_create -w /tmp 2>&1 || return 1
 
     run_with_timeout 60 $SMOLVM machine start --name "$vm_name" 2>&1 || {
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null
         return 1
     }
 
     # Verify workdir was persisted (init commands run in /tmp)
     local pwd_result
     pwd_result=$(run_with_timeout 30 $SMOLVM machine exec --name "$vm_name" -- pwd 2>&1)
-    [[ $? -eq 124 ]] && { echo "TIMEOUT"; $SMOLVM machine stop --name "$vm_name" 2>/dev/null; $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
+    [[ $? -eq 124 ]] && { echo "TIMEOUT"; $SMOLVM machine stop --name "$vm_name" 2>/dev/null; $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1; }
 
     # Cleanup
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null
 }
 
 test_update_settings_applied_on_start() {
     # Verify update changes cpus, ports, network, and that they take effect.
     # Also verifies update refuses a running VM.
     $SMOLVM machine stop 2>/dev/null || true
-    $SMOLVM machine delete default -f 2>/dev/null || true
-    $SMOLVM machine create default 2>&1 || return 1
+    $SMOLVM machine delete --name default -f 2>/dev/null || true
+    $SMOLVM machine create --name default 2>&1 || return 1
 
     # Update multiple settings at once
     local output
-    output=$($SMOLVM machine update default --cpus 2 --mem 1024 -p 9090:9090 --net 2>&1) || {
+    output=$($SMOLVM machine update --name default --cpus 2 --mem 1024 -p 9090:9090 --net 2>&1) || {
         echo "update failed: $output"; return 1
     }
     [[ "$output" == *"cpus"* ]] || { echo "expected cpus in output: $output"; return 1; }
@@ -102,26 +102,26 @@ test_update_settings_applied_on_start() {
 
     # Update on running VM should fail
     local exit_code=0
-    $SMOLVM machine update default --mem 2048 2>&1 || exit_code=$?
+    $SMOLVM machine update --name default --mem 2048 2>&1 || exit_code=$?
     [[ $exit_code -ne 0 ]] || { echo "update should fail on running VM"; return 1; }
 
     $SMOLVM machine stop 2>/dev/null || true
-    $SMOLVM machine delete default -f 2>/dev/null || true
+    $SMOLVM machine delete --name default -f 2>/dev/null || true
 }
 
 test_update_env_applied_on_start() {
     # Env vars from the DB record are applied in image-based exec.
     $SMOLVM machine stop 2>/dev/null || true
-    $SMOLVM machine delete default -f 2>/dev/null || true
-    $SMOLVM machine create --net --image alpine default 2>&1 || return 1
+    $SMOLVM machine delete --name default -f 2>/dev/null || true
+    $SMOLVM machine create --net --image alpine --name default 2>&1 || return 1
 
-    $SMOLVM machine update default -e MY_VAR=hello 2>&1 || return 1
+    $SMOLVM machine update --name default -e MY_VAR=hello 2>&1 || return 1
 
     $SMOLVM machine start 2>&1 || return 1
     local val
     val=$($SMOLVM machine exec -- sh -c 'echo $MY_VAR' 2>&1)
     $SMOLVM machine stop 2>/dev/null || true
-    $SMOLVM machine delete default -f 2>/dev/null || true
+    $SMOLVM machine delete --name default -f 2>/dev/null || true
 
     [[ "$val" == "hello" ]] || { echo "expected MY_VAR=hello, got: $val"; return 1; }
 }
@@ -129,8 +129,8 @@ test_update_env_applied_on_start() {
 test_exec_image_large_stdout_does_not_crash_vm() {
     # Same test but for image-backed exec (the actual bug path)
     $SMOLVM machine stop 2>/dev/null || true
-    $SMOLVM machine delete default -f 2>/dev/null || true
-    $SMOLVM machine create --net --image alpine default 2>&1 || return 1
+    $SMOLVM machine delete --name default -f 2>/dev/null || true
+    $SMOLVM machine create --net --image alpine --name default 2>&1 || return 1
     $SMOLVM machine start 2>&1 || return 1
 
     local output
@@ -157,13 +157,13 @@ test_exec_image_large_stdout_does_not_crash_vm() {
     }
 
     $SMOLVM machine stop 2>/dev/null || true
-    $SMOLVM machine delete default -f 2>/dev/null || true
+    $SMOLVM machine delete --name default -f 2>/dev/null || true
 }
 
 test_exec_joined_large_stdout_does_not_crash_vm() {
     # Same test but through the joined crun exec path (detached main container)
     $SMOLVM machine stop 2>/dev/null || true
-    $SMOLVM machine delete default -f 2>/dev/null || true
+    $SMOLVM machine delete --name default -f 2>/dev/null || true
     $SMOLVM machine run -d --net --image alpine -- sleep 300 2>&1 || return 1
 
     local output
@@ -190,13 +190,13 @@ test_exec_joined_large_stdout_does_not_crash_vm() {
     }
 
     $SMOLVM machine stop 2>/dev/null || true
-    $SMOLVM machine delete default -f 2>/dev/null || true
+    $SMOLVM machine delete --name default -f 2>/dev/null || true
 }
 
 test_exec_joins_main_container() {
     # machine run -d creates a fresh VM, so no need for ensure_machine_running
     $SMOLVM machine stop 2>/dev/null || true
-    $SMOLVM machine delete default -f 2>/dev/null || true
+    $SMOLVM machine delete --name default -f 2>/dev/null || true
 
     log_info "Starting detached workload: sleep 300..."
     local run_output
@@ -277,7 +277,7 @@ test_ephemeral_run_is_isolated() {
 test_exec_recovers_after_main_container_exits() {
     # Start a detached container with a short-lived command
     $SMOLVM machine stop 2>/dev/null || true
-    $SMOLVM machine delete default -f 2>/dev/null || true
+    $SMOLVM machine delete --name default -f 2>/dev/null || true
     $SMOLVM machine run -d --net --image alpine -- sleep 2 2>&1 || return 1
 
     # Wait for the main container to exit naturally
@@ -307,7 +307,7 @@ test_exec_join_timeout_does_not_kill_main_container() {
     ps_before=$(run_with_timeout 10 $SMOLVM machine exec -- ps -ef 2>&1) || true
     if ! echo "$ps_before" | grep -q "sleep"; then
         $SMOLVM machine stop 2>/dev/null || true
-        $SMOLVM machine delete default -f 2>/dev/null || true
+        $SMOLVM machine delete --name default -f 2>/dev/null || true
         $SMOLVM machine run -d --net --image alpine -- sleep 300 2>&1 || return 1
     fi
 
@@ -346,7 +346,7 @@ test_exec_join_documents_user_behavior() {
     # Document current crun exec user behavior for images with a non-root USER.
     # Some crun versions may run joined exec as root unless --user is explicit.
     $SMOLVM machine stop 2>/dev/null || true
-    $SMOLVM machine delete default -f 2>/dev/null || true
+    $SMOLVM machine delete --name default -f 2>/dev/null || true
     $SMOLVM machine run -d --net --image nginxinc/nginx-unprivileged:stable-alpine -- sleep 300 2>&1 || {
         echo "SKIP: could not start nginx-unprivileged image"
         return 0

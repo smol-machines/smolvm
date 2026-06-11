@@ -24,7 +24,7 @@ test_machine_volume_mount_visible_to_exec() {
 
     # Clean up any existing
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
     # Create a host directory with a test file
     local tmpdir
@@ -32,12 +32,12 @@ test_machine_volume_mount_visible_to_exec() {
     echo "volume-mount-marker-54321" > "$tmpdir/testfile.txt"
 
     # Create and start VM with volume mount
-    $SMOLVM machine create "$vm_name" -v "$tmpdir:/mnt/hostdata" 2>&1 || {
+    $SMOLVM machine create --name "$vm_name" -v "$tmpdir:/mnt/hostdata" 2>&1 || {
         rm -rf "$tmpdir"
         return 1
     }
     $SMOLVM machine start --name "$vm_name" 2>&1 || {
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null
         rm -rf "$tmpdir"
         return 1
     }
@@ -48,7 +48,7 @@ test_machine_volume_mount_visible_to_exec() {
 
     # Cleanup
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
     rm -rf "$tmpdir"
     ensure_data_dir_deleted "$vm_name"
 
@@ -59,17 +59,17 @@ test_volume_mount_workspace_is_virtiofs_not_symlink() {
     local vm_name="vol-ws-virtiofs-$$"
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
     local tmpdir
     tmpdir=$(mktemp -d)
     echo "host-workspace-content" > "$tmpdir/host.txt"
 
-    $SMOLVM machine create "$vm_name" -v "$tmpdir:/workspace" 2>&1 || {
+    $SMOLVM machine create --name "$vm_name" -v "$tmpdir:/workspace" 2>&1 || {
         rm -rf "$tmpdir"; return 1
     }
     $SMOLVM machine start --name "$vm_name" 2>&1 || {
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null
         rm -rf "$tmpdir"; return 1
     }
 
@@ -78,7 +78,7 @@ test_volume_mount_workspace_is_virtiofs_not_symlink() {
     link_check=$($SMOLVM machine exec --name "$vm_name" -- sh -c '[ -L /workspace ] && echo SYMLINK || echo MOUNT' 2>&1)
     if [[ "$link_check" == *"SYMLINK"* ]]; then
         echo "FAIL: /workspace is a symlink, expected virtiofs bind mount"
-        $SMOLVM machine stop --name "$vm_name" 2>/dev/null; $SMOLVM machine delete "$vm_name" -f 2>/dev/null; rm -rf "$tmpdir"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null; $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; rm -rf "$tmpdir"
         return 1
     fi
 
@@ -87,7 +87,7 @@ test_volume_mount_workspace_is_virtiofs_not_symlink() {
     content=$($SMOLVM machine exec --name "$vm_name" -- cat /workspace/host.txt 2>&1)
     if [[ "$content" != *"host-workspace-content"* ]]; then
         echo "FAIL: host file not visible at /workspace: $content"
-        $SMOLVM machine stop --name "$vm_name" 2>/dev/null; $SMOLVM machine delete "$vm_name" -f 2>/dev/null; rm -rf "$tmpdir"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null; $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; rm -rf "$tmpdir"
         return 1
     fi
 
@@ -95,12 +95,12 @@ test_volume_mount_workspace_is_virtiofs_not_symlink() {
     $SMOLVM machine exec --name "$vm_name" -- sh -c 'echo guest-wrote > /workspace/guest.txt' 2>&1
     if [[ ! -f "$tmpdir/guest.txt" ]] || [[ "$(cat "$tmpdir/guest.txt")" != *"guest-wrote"* ]]; then
         echo "FAIL: guest write not visible on host"
-        $SMOLVM machine stop --name "$vm_name" 2>/dev/null; $SMOLVM machine delete "$vm_name" -f 2>/dev/null; rm -rf "$tmpdir"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null; $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; rm -rf "$tmpdir"
         return 1
     fi
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
     rm -rf "$tmpdir"
 }
 
@@ -108,17 +108,17 @@ test_volume_mount_arbitrary_path() {
     local vm_name="vol-arb-path-$$"
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
     local tmpdir
     tmpdir=$(mktemp -d)
     echo "arbitrary-path-content" > "$tmpdir/data.txt"
 
-    $SMOLVM machine create "$vm_name" -v "$tmpdir:/data" 2>&1 || {
+    $SMOLVM machine create --name "$vm_name" -v "$tmpdir:/data" 2>&1 || {
         rm -rf "$tmpdir"; return 1
     }
     $SMOLVM machine start --name "$vm_name" 2>&1 || {
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null
         rm -rf "$tmpdir"; return 1
     }
 
@@ -126,7 +126,7 @@ test_volume_mount_arbitrary_path() {
     content=$($SMOLVM machine exec --name "$vm_name" -- cat /data/data.txt 2>&1)
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
     rm -rf "$tmpdir"
 
     [[ "$content" == *"arbitrary-path-content"* ]]
@@ -136,11 +136,11 @@ test_default_workspace_symlink_without_volume() {
     local vm_name="vol-ws-default-$$"
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
-    $SMOLVM machine create "$vm_name" 2>&1 || return 1
+    $SMOLVM machine create --name "$vm_name" 2>&1 || return 1
     $SMOLVM machine start --name "$vm_name" 2>&1 || {
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1
     }
 
     # /workspace should be a symlink to /storage/workspace
@@ -148,7 +148,7 @@ test_default_workspace_symlink_without_volume() {
     target=$($SMOLVM machine exec --name "$vm_name" -- readlink /workspace 2>&1)
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
     [[ "$target" == *"/storage/workspace"* ]]
 }
@@ -157,20 +157,20 @@ test_image_exec_volume_mount_visible() {
     local vm_name="imgexec-vol-test-$$"
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
     local tmpdir
     tmpdir=$(mktemp -d)
     echo "exec-volume-regression-marker" > "$tmpdir/marker.txt"
 
-    $SMOLVM machine create "$vm_name" --image alpine:latest --net \
+    $SMOLVM machine create --name "$vm_name" --image alpine:latest --net \
         -v "$tmpdir:/hostdata" 2>&1 || { rm -rf "$tmpdir"; return 1; }
 
     local start_out
     start_out=$(run_with_timeout 90 $SMOLVM machine start --name "$vm_name" 2>&1)
     if [[ $? -eq 124 ]]; then
         echo "TIMEOUT on start"
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null
         rm -rf "$tmpdir"
         return 1
     fi
@@ -180,7 +180,7 @@ test_image_exec_volume_mount_visible() {
     local exec_rc=$?
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
     rm -rf "$tmpdir"
 
     [[ $exec_rc -eq 124 ]] && { echo "TIMEOUT on exec"; return 1; }
@@ -191,7 +191,7 @@ test_image_exec_volume_mount_visible_smolfile() {
     local vm_name="imgexec-sf-vol-test-$$"
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
     local tmpdir
     tmpdir=$(mktemp -d)
@@ -211,14 +211,14 @@ EOF
 
     (
         cd "$tmpdir"
-        $SMOLVM machine create "$vm_name" -s Smolfile.toml 2>&1
+        $SMOLVM machine create --name "$vm_name" -s Smolfile.toml 2>&1
     ) || { rm -rf "$tmpdir"; return 1; }
 
     local start_out
     start_out=$(run_with_timeout 90 $SMOLVM machine start --name "$vm_name" 2>&1)
     if [[ $? -eq 124 ]]; then
         echo "TIMEOUT on start"
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null
         rm -rf "$tmpdir"
         return 1
     fi
@@ -228,7 +228,7 @@ EOF
     local exec_rc=$?
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
     rm -rf "$tmpdir"
 
     [[ $exec_rc -eq 124 ]] && { echo "TIMEOUT on exec"; return 1; }

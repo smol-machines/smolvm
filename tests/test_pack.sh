@@ -634,11 +634,11 @@ FROM_VM_OUTPUT="$TEST_DIR/test-from-vm"
 test_from_vm_setup() {
     # Create a named VM with network, install a package, then stop it
     $SMOLVM machine stop --name "$FROM_VM_NAME" 2>/dev/null || true
-    $SMOLVM machine delete "$FROM_VM_NAME" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$FROM_VM_NAME" -f 2>/dev/null || true
 
-    $SMOLVM machine create "$FROM_VM_NAME" --net 2>&1 || return 1
+    $SMOLVM machine create --name "$FROM_VM_NAME" --net 2>&1 || return 1
     $SMOLVM machine start --name "$FROM_VM_NAME" 2>&1 || {
-        $SMOLVM machine delete "$FROM_VM_NAME" -f 2>/dev/null
+        $SMOLVM machine delete --name "$FROM_VM_NAME" -f 2>/dev/null
         return 1
     }
 
@@ -652,12 +652,12 @@ test_from_vm_setup() {
     local which_output
     which_output=$($SMOLVM machine exec --name "$FROM_VM_NAME" -- which curl 2>&1) || {
         $SMOLVM machine stop --name "$FROM_VM_NAME" 2>/dev/null || true
-        $SMOLVM machine delete "$FROM_VM_NAME" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$FROM_VM_NAME" -f 2>/dev/null || true
         return 1
     }
     [[ "$which_output" == *"/usr/bin/curl"* ]] || {
         $SMOLVM machine stop --name "$FROM_VM_NAME" 2>/dev/null || true
-        $SMOLVM machine delete "$FROM_VM_NAME" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "$FROM_VM_NAME" -f 2>/dev/null || true
         return 1
     }
 
@@ -669,11 +669,11 @@ test_from_vm_rejects_running() {
     # --from-vm should fail if the VM is still running
     local vm_name="pack-running-test-$$"
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
-    $SMOLVM machine create "$vm_name" 2>&1 || return 1
+    $SMOLVM machine create --name "$vm_name" 2>&1 || return 1
     $SMOLVM machine start --name "$vm_name" 2>&1 || {
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null
         return 1
     }
 
@@ -682,7 +682,7 @@ test_from_vm_rejects_running() {
 
     # Clean up
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
     [[ $exit_code -ne 0 ]]
 }
@@ -714,7 +714,7 @@ test_from_vm_run_finds_installed_package() {
 
 test_from_vm_cleanup() {
     $SMOLVM machine stop --name "$FROM_VM_NAME" 2>/dev/null || true
-    $SMOLVM machine delete "$FROM_VM_NAME" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$FROM_VM_NAME" -f 2>/dev/null || true
     rm -f "$FROM_VM_OUTPUT" "$FROM_VM_OUTPUT.smolmachine"
     return 0
 }
@@ -737,16 +737,16 @@ test_from_vm_image_overlay() {
 
     # Cleanup any leftovers
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
     $SMOLVM machine stop --name "$machine_name" 2>/dev/null || true
-    $SMOLVM machine delete "$machine_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$machine_name" -f 2>/dev/null || true
     rm -f "$pack_output" "$pack_output.smolmachine"
 
     # 1. Create image-based VM, install curl, verify, stop
     echo "  Step 1: Create image-based VM and install curl..."
-    $SMOLVM machine create "$vm_name" --image alpine:latest --net 2>&1 || return 1
+    $SMOLVM machine create --name "$vm_name" --image alpine:latest --net 2>&1 || return 1
     $SMOLVM machine start --name "$vm_name" 2>&1 || {
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1
     }
     $SMOLVM machine exec --name "$vm_name" -- apk add --no-cache curl 2>&1 || true
     local which_result
@@ -754,7 +754,7 @@ test_from_vm_image_overlay() {
     [[ "$which_result" == *"/usr/bin/curl"* ]] || {
         echo "FAIL: curl not installed in source VM"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1
     }
     $SMOLVM machine stop --name "$vm_name" 2>&1 || return 1
 
@@ -762,11 +762,11 @@ test_from_vm_image_overlay() {
     echo "  Step 2: Pack image-based VM with --from-vm..."
     $SMOLVM pack create --from-vm "$vm_name" -o "$pack_output" 2>&1 || {
         echo "FAIL: pack --from-vm failed"
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1
     }
     [[ -f "$pack_output.smolmachine" ]] || {
         echo "FAIL: no .smolmachine sidecar produced"
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1
     }
 
     # 3. Run packed binary — curl must be present
@@ -775,21 +775,21 @@ test_from_vm_image_overlay() {
     run_result=$(run_with_timeout 60 $SMOLVM pack run --sidecar "$pack_output.smolmachine" -- which curl 2>&1)
     [[ "$run_result" == *"/usr/bin/curl"* ]] || {
         echo "FAIL: curl not found in packed binary (got: $run_result)"
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null
         rm -f "$pack_output" "$pack_output.smolmachine"; return 1
     }
 
     # 4. Create machine from .smolmachine — curl must be present
     echo "  Step 4: Create machine from .smolmachine and verify curl..."
-    $SMOLVM machine create "$machine_name" --from "$pack_output.smolmachine" --net 2>&1 || {
+    $SMOLVM machine create --name "$machine_name" --from "$pack_output.smolmachine" --net 2>&1 || {
         echo "FAIL: machine create --from failed"
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null
         rm -f "$pack_output" "$pack_output.smolmachine"; return 1
     }
     $SMOLVM machine start --name "$machine_name" 2>&1 || {
         echo "FAIL: machine start failed"
-        $SMOLVM machine delete "$machine_name" -f 2>/dev/null
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        $SMOLVM machine delete --name "$machine_name" -f 2>/dev/null
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null
         rm -f "$pack_output" "$pack_output.smolmachine"; return 1
     }
     local exec_result
@@ -797,8 +797,8 @@ test_from_vm_image_overlay() {
     [[ "$exec_result" == *"/usr/bin/curl"* ]] || {
         echo "FAIL: curl not found in machine from .smolmachine (got: $exec_result)"
         $SMOLVM machine stop --name "$machine_name" 2>/dev/null
-        $SMOLVM machine delete "$machine_name" -f 2>/dev/null
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        $SMOLVM machine delete --name "$machine_name" -f 2>/dev/null
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null
         rm -f "$pack_output" "$pack_output.smolmachine"; return 1
     }
 
@@ -807,23 +807,23 @@ test_from_vm_image_overlay() {
     $SMOLVM machine stop --name "$machine_name" 2>&1 || true
     $SMOLVM machine start --name "$machine_name" 2>&1 || {
         echo "FAIL: restart failed"
-        $SMOLVM machine delete "$machine_name" -f 2>/dev/null
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        $SMOLVM machine delete --name "$machine_name" -f 2>/dev/null
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null
         rm -f "$pack_output" "$pack_output.smolmachine"; return 1
     }
     exec_result=$($SMOLVM machine exec --name "$machine_name" -- which curl 2>&1)
     [[ "$exec_result" == *"/usr/bin/curl"* ]] || {
         echo "FAIL: curl not found after restart (got: $exec_result)"
         $SMOLVM machine stop --name "$machine_name" 2>/dev/null
-        $SMOLVM machine delete "$machine_name" -f 2>/dev/null
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        $SMOLVM machine delete --name "$machine_name" -f 2>/dev/null
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null
         rm -f "$pack_output" "$pack_output.smolmachine"; return 1
     }
 
     # Cleanup
     $SMOLVM machine stop --name "$machine_name" 2>/dev/null || true
-    $SMOLVM machine delete "$machine_name" -f 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$machine_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
     rm -f "$pack_output" "$pack_output.smolmachine"
 }
 
@@ -849,15 +849,15 @@ test_from_vm_debian_roundtrip() {
 
     # Cleanup any leftovers
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
     $SMOLVM machine stop --name "$from_name" 2>/dev/null || true
-    $SMOLVM machine delete "$from_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$from_name" -f 2>/dev/null || true
 
     # 1. Create a Debian-based VM
     echo "  Step 1: Creating Debian VM..."
-    $SMOLVM machine create "$vm_name" --image python:3.12-slim --net 2>&1 || return 1
+    $SMOLVM machine create --name "$vm_name" --image python:3.12-slim --net 2>&1 || return 1
     $SMOLVM machine start --name "$vm_name" 2>&1 || {
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1
     }
 
     # 2. Install a package that creates Char entries via update-alternatives
@@ -866,7 +866,7 @@ test_from_vm_debian_roundtrip() {
         bash -c "apt-get update -qq && apt-get install -y -qq man-db >/dev/null 2>&1" || {
         echo "FAIL: apt-get install failed"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1
     }
 
     # 3. Write a test file (appears late in tar stream — after Char entries)
@@ -879,7 +879,7 @@ test_from_vm_debian_roundtrip() {
     [[ "$content" == *"debian-roundtrip-ok"* ]] || {
         echo "FAIL: test marker not written (got: '$content')"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1
     }
 
     # 4. Stop and pack
@@ -887,19 +887,19 @@ test_from_vm_debian_roundtrip() {
     $SMOLVM machine stop --name "$vm_name" 2>&1
     $SMOLVM pack create --from-vm "$vm_name" -o "$pack_output" 2>&1 || {
         echo "FAIL: pack create --from-vm failed"
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1
     }
 
     # 5. Create a new machine from the pack
     echo "  Step 5: Creating machine from pack..."
-    $SMOLVM machine create "$from_name" --from "$pack_output.smolmachine" 2>&1 || {
+    $SMOLVM machine create --name "$from_name" --from "$pack_output.smolmachine" 2>&1 || {
         echo "FAIL: machine create --from failed (Char device extraction bug)"
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1
     }
     $SMOLVM machine start --name "$from_name" 2>&1 || {
         echo "FAIL: machine start failed"
-        $SMOLVM machine delete "$from_name" -f 2>/dev/null
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+        $SMOLVM machine delete --name "$from_name" -f 2>/dev/null
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1
     }
 
     # 6. Verify test file survived the roundtrip
@@ -908,23 +908,23 @@ test_from_vm_debian_roundtrip() {
     result=$($SMOLVM machine exec --name "$from_name" -- cat /test-marker.txt 2>&1) || {
         echo "FAIL: test marker missing after roundtrip (Char device data loss)"
         $SMOLVM machine stop --name "$from_name" 2>/dev/null
-        $SMOLVM machine delete "$from_name" -f 2>/dev/null
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+        $SMOLVM machine delete --name "$from_name" -f 2>/dev/null
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1
     }
 
     [[ "$result" == *"debian-roundtrip-ok"* ]] || {
         echo "FAIL: test marker content mismatch (got: '$result')"
         $SMOLVM machine stop --name "$from_name" 2>/dev/null
-        $SMOLVM machine delete "$from_name" -f 2>/dev/null
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+        $SMOLVM machine delete --name "$from_name" -f 2>/dev/null
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1
     }
 
     echo "  Test marker survived Debian pack/unpack roundtrip"
 
     # Cleanup
     $SMOLVM machine stop --name "$from_name" 2>/dev/null || true
-    $SMOLVM machine delete "$from_name" -f 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$from_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
     rm -f "$pack_output" "$pack_output.smolmachine"
 }
 
@@ -935,24 +935,24 @@ test_from_vm_short_name() {
     local pack_output="$TEST_DIR/from-vm-short"
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
     rm -f "$pack_output" "$pack_output.smolmachine"
 
     # Create, start, modify, stop
-    $SMOLVM machine create "$vm_name" --image alpine:latest --net 2>&1 || return 1
+    $SMOLVM machine create --name "$vm_name" --image alpine:latest --net 2>&1 || return 1
     $SMOLVM machine start --name "$vm_name" 2>&1 || {
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1
     }
     $SMOLVM machine exec --name "$vm_name" -- touch /etc/short-name-marker 2>&1 || true
     $SMOLVM machine stop --name "$vm_name" 2>&1 || {
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1
     }
 
     # Pack — this is where the panic used to occur
     local exit_code=0
     $SMOLVM pack create --from-vm "$vm_name" -o "$pack_output" 2>&1 || exit_code=$?
 
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
     rm -f "$pack_output" "$pack_output.smolmachine"
 
     [[ $exit_code -eq 0 ]] || {
@@ -1214,10 +1214,10 @@ test_multi_layer_first_exec_fast() {
 
     # Create machine from .smolmachine
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
-    $SMOLVM machine create "$vm_name" --from "$pack_output.smolmachine" --net 2>&1 || return 1
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine create --name "$vm_name" --from "$pack_output.smolmachine" --net 2>&1 || return 1
     $SMOLVM machine start --name "$vm_name" 2>&1 || {
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1
     }
     sleep 2
 
@@ -1235,7 +1235,7 @@ test_multi_layer_first_exec_fast() {
     [[ "$result" == *"fast"* ]] || {
         echo "FAIL: exec failed: $result"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1
     }
 
     # Verify it was fast
@@ -1244,13 +1244,13 @@ test_multi_layer_first_exec_fast() {
     if [[ "$over_threshold" == "yes" ]]; then
         echo "FAIL: first exec took ${elapsed}s (>${MAX_FIRST_EXEC_SECS}s) — multi-layer overlay merge regression?"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1
     fi
 
     # Also verify stop/start doesn't regress
     $SMOLVM machine stop --name "$vm_name" 2>&1 || true
     $SMOLVM machine start --name "$vm_name" 2>&1 || {
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1
     }
     sleep 2
 
@@ -1264,19 +1264,19 @@ test_multi_layer_first_exec_fast() {
     [[ "$result" == *"still-fast"* ]] || {
         echo "FAIL: exec after restart failed: $result"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1
     }
 
     over_threshold=$(python3 -c "print('yes' if $t_end - $t_start > $MAX_FIRST_EXEC_SECS else 'no')" 2>/dev/null || echo "no")
     if [[ "$over_threshold" == "yes" ]]; then
         echo "FAIL: exec after restart took ${elapsed}s (>${MAX_FIRST_EXEC_SECS}s)"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null
-        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1
     fi
 
     # Cleanup
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
-    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 }
 
 # =============================================================================

@@ -735,13 +735,13 @@ pub fn fork_vm(
     if !ctl.exists() {
         return Err(Error::agent(
             "fork",
-            format!("golden '{golden}' is not running forkable; start it with `machine start --forkable {golden}`"),
+            format!("golden '{golden}' is not running forkable; start it with `machine start --forkable --name {golden}`"),
         ));
     }
     let status = control_socket_cmd(&ctl, "STATUS").map_err(|e| {
         Error::agent(
             "fork",
-            format!("golden '{golden}' control socket not responding ({e}); start it with `machine start --forkable {golden}`"),
+            format!("golden '{golden}' control socket not responding ({e}); start it with `machine start --forkable --name {golden}`"),
         )
     })?;
     if !status.starts_with("OK") {

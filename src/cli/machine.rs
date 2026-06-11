@@ -506,7 +506,7 @@ impl RunCmd {
                 return Err(Error::config(
                     "machine run -d --name",
                     format!(
-                        "a machine named '{}' already exists. Use 'machine start --name {}' to start it, or 'machine delete {} -f' to remove it.",
+                        "a machine named '{}' already exists. Use 'machine start --name {}' to start it, or 'machine delete --name {} -f' to remove it.",
                         vm_name, vm_name, vm_name
                     ),
                 ));
@@ -1206,7 +1206,7 @@ mod tests {
     #[test]
     fn create_accepts_trailing_workload_command() {
         let cli = TestMachineCli::parse_from([
-            "machine", "create", "golden", "--image", "alpine", "--", "echo", "hi",
+            "machine", "create", "--name", "golden", "--image", "alpine", "--", "echo", "hi",
         ]);
         let MachineCmd::Create(cmd) = cli.command else {
             panic!("expected machine create command");
@@ -1226,14 +1226,22 @@ mod tests {
     #[test]
     fn create_without_command_leaves_command_empty() {
         // Regression: adding the trailing COMMAND arg must not break the common
-        // no-command form `machine create <name> --net`.
-        let cli = TestMachineCli::parse_from(["machine", "create", "golden", "--net"]);
+        // no-command form `machine create --name <name> --net`.
+        let cli = TestMachineCli::parse_from(["machine", "create", "--name", "golden", "--net"]);
         let MachineCmd::Create(cmd) = cli.command else {
             panic!("expected machine create command");
         };
         assert_eq!(cmd.name, Some("golden".to_string()));
         assert!(cmd.command.is_empty());
         assert!(cmd.net);
+    }
+
+    #[test]
+    fn create_rejects_bare_positional_name() {
+        // Machine names are flags everywhere (issue #370). A bare positional —
+        // the old `machine create myvm` habit — must error, not be silently
+        // captured as the workload command.
+        assert!(TestMachineCli::try_parse_from(["machine", "create", "myvm"]).is_err());
     }
 
     #[test]
@@ -1534,12 +1542,12 @@ impl ShellCmd {
 /// `smolvm machine exec --name <name> -- <command>` to run commands inside.
 ///
 /// Examples:
-///   smolvm machine create myvm
-///   smolvm machine create webserver --cpus 2 --mem 1024 -p 80:80
+///   smolvm machine create --name myvm
+///   smolvm machine create --name webserver --cpus 2 --mem 1024 -p 80:80
 #[derive(Args, Debug)]
 pub struct CreateCmd {
     /// Name for the machine (auto-generated if omitted)
-    #[arg(value_name = "NAME")]
+    #[arg(short = 'n', long, value_name = "NAME")]
     pub name: Option<String>,
 
     /// Container image (e.g., alpine, python:3.12-alpine)
@@ -1642,7 +1650,11 @@ pub struct CreateCmd {
     /// Launched as a detached container on every `start`, so it stays running
     /// (e.g. a pre-warmed browser to be forked). Without this, an image machine
     /// boots to a bare agent and the image's CMD is not run.
-    #[arg(trailing_var_arg = true, value_name = "COMMAND")]
+    ///
+    /// `last = true` requires the `--` separator. With the machine name now a
+    /// flag, a bare positional (an old-style `machine create myvm`) must fail
+    /// loudly instead of being silently captured as the workload command.
+    #[arg(last = true, value_name = "COMMAND")]
     pub command: Vec<String>,
 }
 
@@ -1962,11 +1974,11 @@ impl StartCmd {
 #[derive(Args, Debug)]
 pub struct ForkCmd {
     /// The running, forkable source machine to clone from.
-    #[arg(value_name = "GOLDEN")]
+    #[arg(long, value_name = "NAME")]
     pub golden: String,
 
     /// Name for the new clone machine.
-    #[arg(value_name = "CLONE")]
+    #[arg(short = 'n', long = "name", value_name = "NAME")]
     pub clone: String,
 
     /// Make the clone itself forkable (memfd RAM + control socket), so it can
@@ -2021,7 +2033,7 @@ impl StopCmd {
 #[derive(Args, Debug)]
 pub struct DeleteCmd {
     /// Machine to delete
-    #[arg(value_name = "NAME")]
+    #[arg(short = 'n', long, value_name = "NAME")]
     pub name: String,
 
     /// Skip confirmation prompt
@@ -2164,14 +2176,14 @@ impl ResizeCmd {
 /// `machine start`. The machine must be stopped.
 ///
 /// Examples:
-///   smolvm machine update myvm -v ./src:/app -p 8080:8080
-///   smolvm machine update myvm --cpus 4 --mem 4096
-///   smolvm machine update myvm --remove-volume ./src:/app
-///   smolvm machine update myvm --net -e DEBUG=1
+///   smolvm machine update --name myvm -v ./src:/app -p 8080:8080
+///   smolvm machine update --name myvm --cpus 4 --mem 4096
+///   smolvm machine update --name myvm --remove-volume ./src:/app
+///   smolvm machine update --name myvm --net -e DEBUG=1
 #[derive(Args, Debug)]
 pub struct UpdateCmd {
     /// Machine to update
-    #[arg(value_name = "NAME")]
+    #[arg(short = 'n', long, value_name = "NAME")]
     pub name: String,
 
     /// Add volume mount (HOST:GUEST[:ro])
@@ -2470,6 +2482,7 @@ impl UpdateCmd {
 #[derive(Args, Debug)]
 pub struct DataDirCmd {
     /// Machine name.
+    #[arg(short = 'n', long, value_name = "NAME")]
     pub name: String,
 }
 

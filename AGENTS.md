@@ -11,16 +11,16 @@ smolvm machine run --net -it --image alpine -- /bin/sh   # interactive shell
 smolvm machine run --net --image python:3.12-alpine -- python3 script.py
 
 # Persistent (survives across exec sessions and stop/start)
-smolvm machine create --net myvm
+smolvm machine create --net --name myvm
 smolvm machine start --name myvm
 smolvm machine exec --name myvm -- apk add python3   # installs persist
 smolvm machine exec --name myvm -- which python3      # still there
 smolvm machine shell --name myvm               # interactive shell (auto-starts if stopped)
 smolvm machine stop --name myvm
-smolvm machine delete myvm
+smolvm machine delete --name myvm
 
 # Image-based persistent (filesystem changes persist across exec sessions)
-smolvm machine create --net --image ubuntu myvm
+smolvm machine create --net --image ubuntu --name myvm
 smolvm machine start --name myvm
 smolvm machine exec --name myvm -- apt-get update
 smolvm machine exec --name myvm -- apt-get install -y python3
@@ -28,7 +28,7 @@ smolvm machine exec --name myvm -- which python3      # still there after exit+r
 
 # SSH agent forwarding (git/ssh without exposing keys)
 smolvm machine run --ssh-agent --net --image alpine -- ssh-add -l
-smolvm machine create myvm --ssh-agent --net
+smolvm machine create --name myvm --ssh-agent --net
 
 # Inject secrets into workload env (referenced from host env var / file)
 smolvm machine run --secret-env OPENAI_API_KEY=OPENAI_API_KEY -- ./app
@@ -39,7 +39,7 @@ smolvm pack create --image python:3.12-alpine -o ./my-python
 ./my-python run -- python3 -c "print('hello')"
 
 # Create machine from packed artifact (fast start, no pull)
-smolvm machine create my-vm --from ./my-python.smolmachine
+smolvm machine create --name my-vm --from ./my-python.smolmachine
 smolvm machine start --name my-vm
 smolvm machine exec --name my-vm -- pip install requests
 ```
@@ -53,11 +53,11 @@ smolvm machine exec --name my-vm -- pip install requests
 | Interactive shell (persistent) | `smolvm machine shell --name NAME` |
 | Persistent dev environment | `machine create` → `machine start` → `machine exec` |
 | Ship software as a binary | `smolvm pack create --image IMAGE -o OUTPUT` |
-| Fast persistent machine from packed artifact | `machine create NAME --from FILE.smolmachine` |
+| Fast persistent machine from packed artifact | `machine create --name NAME --from FILE.smolmachine` |
 | Use git/ssh with private keys safely | Add `--ssh-agent` to run or create |
 | Inject API keys / tokens without putting them on the command line | `--secret-env`/`--secret-file` flags or Smolfile `[secrets]` |
 | Minimal VM without image | `smolvm machine run -s Smolfile` (bare VM) |
-| Change mounts/ports/resources on existing VM | `machine update NAME -v ./src:/app -p 8080:8080` |
+| Change mounts/ports/resources on existing VM | `machine update --name NAME -v ./src:/app -p 8080:8080` |
 | Declarative VM config | Create a Smolfile, use `--smolfile`/`-s` flag |
 
 ### Persistence Model
@@ -71,20 +71,20 @@ smolvm machine exec --name my-vm -- pip install requests
 
 ## CLI Structure
 
-All commands use named flags (no positional args except `machine create NAME` and `machine delete NAME`).
+All commands use named flags (no positional args except `machine create --name NAME` and `machine delete --name NAME`).
 
 ```
 smolvm machine run --image IMAGE [-- COMMAND]     # ephemeral
 smolvm machine exec --name NAME [-- COMMAND]      # run in existing VM
 smolvm machine shell [--name NAME]                # interactive shell (auto-starts)
-smolvm machine create NAME [OPTIONS]              # create persistent
-smolvm machine create NAME --from FILE.smolmachine  # from packed artifact
+smolvm machine create --name NAME [OPTIONS]              # create persistent
+smolvm machine create --name NAME --from FILE.smolmachine  # from packed artifact
 smolvm machine start [--name NAME]                # start (default: "default")
 smolvm machine stop [--name NAME]                 # stop
-smolvm machine delete NAME [-f]                   # delete
+smolvm machine delete --name NAME [-f]                   # delete
 smolvm machine status [--name NAME]               # check state
 smolvm machine ls [--json]                        # list all
-smolvm machine update NAME [OPTIONS]              # modify stopped machine settings
+smolvm machine update --name NAME [OPTIONS]              # modify stopped machine settings
 smolvm machine cp SRC DST                         # copy files (host↔VM)
 smolvm machine exec --stream --name NAME -- CMD   # streaming output
 smolvm machine monitor [--name NAME]              # foreground health + restart
@@ -100,7 +100,7 @@ smolvm config registries edit                     # registry auth
 # built-in store. Attach them on the command line or in a Smolfile [secrets].
 smolvm machine run    --secret-env GUEST_VAR=HOST_VAR     # from host env var
 smolvm machine run    --secret-file GUEST_VAR=/abs/path   # from host file
-smolvm machine create NAME --secret-env GUEST_VAR=HOST_VAR  # persists the ref
+smolvm machine create --name NAME --secret-env GUEST_VAR=HOST_VAR  # persists the ref
 smolvm machine exec --name NAME --secret-env GUEST_VAR=HOST_VAR -- cmd
 ```
 
@@ -254,7 +254,7 @@ Forward the host's SSH agent into the VM so git, ssh, and scp work with your key
 ```bash
 # CLI flag
 smolvm machine run --ssh-agent --net --image alpine -- ssh-add -l
-smolvm machine create myvm --ssh-agent --net
+smolvm machine create --name myvm --ssh-agent --net
 
 # Smolfile
 # [auth]
@@ -292,7 +292,7 @@ smolvm machine run --gpu --image alpine -- sh -c '
 # → deviceName = Virtio-GPU Venus (Intel(R) UHD Graphics ...)
 
 # Persistent GPU machine
-smolvm machine create browser --gpu --gpu-vram 2048
+smolvm machine create --name browser --gpu --gpu-vram 2048
 smolvm machine start --name browser
 smolvm machine exec --name browser -- \
   chromium --headless=new --no-sandbox --use-gl=angle --use-angle=vulkan \
@@ -323,7 +323,7 @@ Attach refs on the command line:
 ```bash
 # From a host environment variable (GUEST_VAR=HOST_VAR)
 smolvm machine run    --secret-env OPENAI_API_KEY=OPENAI_API_KEY -- ./app
-smolvm machine create web --secret-env DATABASE_URL=PROD_DB_URL   # persists the ref
+smolvm machine create --name web --secret-env DATABASE_URL=PROD_DB_URL   # persists the ref
 smolvm machine exec --name web --secret-env TOKEN=CI_TOKEN -- ./deploy
 
 # From a host file (GUEST_VAR=/absolute/path)
@@ -387,7 +387,7 @@ run — the host mount takes priority and the storage workspace is skipped:
 
 ```bash
 # Typical agent workflow: copy code in, execute, extract results
-smolvm machine create r-sandbox --image r-base:latest --net
+smolvm machine create --name r-sandbox --image r-base:latest --net
 smolvm machine start --name r-sandbox
 
 smolvm machine cp analysis.R r-sandbox:/workspace/analysis.R
@@ -472,7 +472,7 @@ The packed binary runs as a normal executable:
 
 Alternatively, create a named machine from the `.smolmachine` for full lifecycle management:
 ```bash
-smolvm machine create my-vm --from my-app.smolmachine
+smolvm machine create --name my-vm --from my-app.smolmachine
 smolvm machine start --name my-vm            # ~250ms boot, no image pull
 smolvm machine exec --name my-vm -- pip install x   # fully persistent
 smolvm machine stop --name my-vm

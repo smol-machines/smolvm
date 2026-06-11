@@ -31,12 +31,12 @@ test_10_concurrent_vms() {
 
     for i in $(seq 1 $COUNT); do
         $SMOLVM machine stop --name "scale-$i" 2>/dev/null || true
-        $SMOLVM machine delete "scale-$i" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "scale-$i" -f 2>/dev/null || true
     done
 
     # Create
     for i in $(seq 1 $COUNT); do
-        $SMOLVM machine create "scale-$i" --mem 512 --cpus 1 2>/dev/null || {
+        $SMOLVM machine create --name "scale-$i" --mem 512 --cpus 1 2>/dev/null || {
             echo "FAIL: create scale-$i failed"; return 1
         }
     done
@@ -74,7 +74,7 @@ test_10_concurrent_vms() {
     # Cleanup
     for i in $(seq 1 $COUNT); do
         $SMOLVM machine stop --name "scale-$i" 2>/dev/null || true
-        $SMOLVM machine delete "scale-$i" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "scale-$i" -f 2>/dev/null || true
     done
 
     echo "  running: $running/$COUNT, exec: $exec_pass/$COUNT, start_fails: $start_fails"
@@ -95,12 +95,12 @@ test_concurrent_exec_storm() {
 
     for i in $(seq 1 $COUNT); do
         $SMOLVM machine stop --name "storm-$i" 2>/dev/null || true
-        $SMOLVM machine delete "storm-$i" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "storm-$i" -f 2>/dev/null || true
     done
 
     # Create and start sequentially (scale test above covers concurrent start)
     for i in $(seq 1 $COUNT); do
-        $SMOLVM machine create "storm-$i" --mem 512 --cpus 1 2>/dev/null || return 1
+        $SMOLVM machine create --name "storm-$i" --mem 512 --cpus 1 2>/dev/null || return 1
         $SMOLVM machine start --name "storm-$i" 2>/dev/null || return 1
     done
 
@@ -125,7 +125,7 @@ test_concurrent_exec_storm() {
     # Cleanup
     for i in $(seq 1 $COUNT); do
         $SMOLVM machine stop --name "storm-$i" 2>/dev/null || true
-        $SMOLVM machine delete "storm-$i" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "storm-$i" -f 2>/dev/null || true
     done
 
     local total=$((COUNT * EXECS_PER_VM))
@@ -142,15 +142,15 @@ run_test "Scale: 50 concurrent execs across 10 VMs" test_concurrent_exec_storm |
 test_rapid_lifecycle() {
     local i
     for i in $(seq 1 5); do
-        $SMOLVM machine create "rapid-$$" --mem 512 --cpus 1 2>/dev/null || {
+        $SMOLVM machine create --name "rapid-$$" --mem 512 --cpus 1 2>/dev/null || {
             echo "FAIL: create iteration $i"; return 1
         }
         $SMOLVM machine start --name "rapid-$$" 2>/dev/null || {
             echo "FAIL: start iteration $i"
-            $SMOLVM machine delete "rapid-$$" -f 2>/dev/null; return 1
+            $SMOLVM machine delete --name "rapid-$$" -f 2>/dev/null; return 1
         }
         $SMOLVM machine stop --name "rapid-$$" 2>/dev/null || true
-        $SMOLVM machine delete "rapid-$$" -f 2>/dev/null || true
+        $SMOLVM machine delete --name "rapid-$$" -f 2>/dev/null || true
     done
     echo "  5 create-start-stop-delete cycles completed"
 }
