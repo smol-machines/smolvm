@@ -520,9 +520,11 @@ mod tests {
         assert!(should_relay_udp("1.2.3.4:123".parse().unwrap(), &open));
         assert!(!should_relay_udp("1.2.3.4:53".parse().unwrap(), &open));
 
-        let restricted = EgressPolicy::from_allowed_cidrs(Some(&["10.0.0.0/8".into()]));
+        // Public CIDR — a private allow-list entry would be overridden by the
+        // egress hard-floor (see egress.rs tests).
+        let restricted = EgressPolicy::from_allowed_cidrs(Some(&["8.8.8.0/24".into()]));
         assert!(should_relay_udp(
-            "10.1.2.3:123".parse().unwrap(),
+            "8.8.8.3:123".parse().unwrap(),
             &restricted
         ));
         assert!(!should_relay_udp(
