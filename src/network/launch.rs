@@ -50,7 +50,18 @@ pub fn plan_launch_network(
         };
     }
 
-    match resources.network_backend.unwrap_or(NetworkBackend::Tsi) {
+    // Published ports need the inbound path, which only virtio-net provides.
+    // When the caller didn't pick a backend explicitly, default to virtio-net
+    // IFF there are ports (TSI otherwise — it's lighter for outbound-only VMs).
+    // This is ONE rule in the shared launch path, so a machine that's reachable
+    // on a laptop is reachable in the fleet by construction — no per-deployment
+    // backend wiring to drift between local and cloud.
+    let backend = resources.network_backend.unwrap_or(if has_ports {
+        NetworkBackend::VirtioNet
+    } else {
+        NetworkBackend::Tsi
+    });
+    match backend {
         NetworkBackend::Tsi => LaunchNetworkPlan {
             backend: EffectiveNetworkBackend::Tsi,
         },
@@ -70,14 +81,21 @@ pub fn validate_requested_network_backend(
     dns_filter_hosts: Option<&[String]>,
     port_count: usize,
 ) -> crate::Result<()> {
-    let backend = resources.network_backend.unwrap_or(NetworkBackend::Tsi);
+    // Mirror plan_launch_network's default: unset backend + ports ⇒ virtio-net.
+    // So only an EXPLICIT `--net-backend tsi` alongside ports is a misconfig.
+    let backend = resources.network_backend.unwrap_or(if port_count > 0 {
+        NetworkBackend::VirtioNet
+    } else {
+        NetworkBackend::Tsi
+    });
 
-    // Published ports require the inbound path that only virtio-net has.
+    // Published ports require the inbound path that only virtio-net has. With the
+    // default above this only fires when the caller EXPLICITLY forced TSI + ports.
     if port_count > 0 && backend != NetworkBackend::VirtioNet {
         return Err(crate::Error::config(
             "ports",
             "published ports require the virtio-net backend (TSI is outbound-only); \
-             set network backend to virtio-net",
+             remove --net-backend tsi or set it to virtio-net",
         ));
     }
 
@@ -183,11 +201,36 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_ports_require_virtio() {
-        // Ports on the default (TSI) backend are rejected — TSI has no inbound path.
-        let resources = resources();
+    fn test_ports_default_to_virtio() {
+        // Ports with NO explicit backend now auto-select virtio-net (the inbound
+        // path) — both in the plan and in validation, so it "just works".
+        let mut resources = resources();
+        resources.network = true;
+        let plan = plan_launch_network(&resources, None, 1);
+        assert_eq!(plan.backend, EffectiveNetworkBackend::VirtioNet);
+        validate_requested_network_backend(&resources, None, 1).unwrap();
+    }
+
+    #[test]
+    fn test_validate_ports_explicit_tsi_rejected() {
+        // Only an EXPLICIT TSI choice alongside ports is a misconfig (TSI has no
+        // inbound path); the auto-default case above is allowed.
+        let mut resources = resources();
+        resources.network = true;
+        resources.network_backend = Some(NetworkBackend::Tsi);
         let err = validate_requested_network_backend(&resources, None, 1).unwrap_err();
         assert!(err.to_string().contains("require the virtio-net backend"));
+    }
+
+    #[test]
+    fn test_no_ports_defaults_to_tsi() {
+        // Outbound-only VMs keep the lighter TSI default — no virtio overhead.
+        let mut resources = resources();
+        resources.network = true;
+        assert_eq!(
+            plan_launch_network(&resources, None, 0).backend,
+            EffectiveNetworkBackend::Tsi
+        );
     }
 
     #[test]
