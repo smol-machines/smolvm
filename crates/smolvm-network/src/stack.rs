@@ -693,3 +693,13 @@ fn classify_guest_frame(frame: &[u8]) -> FrameAction {
         _ => FrameAction::Passthrough,
     }
 }
+
+/// Fuzz-only entrypoint for `classify_guest_frame`.
+///
+/// A malicious guest sends arbitrary ethernet frames over virtio-net, and the
+/// host parses every one here — so this MUST NOT panic on any input. Gated
+/// behind the `fuzzing` feature so it never ships in a normal build.
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_classify_guest_frame(frame: &[u8]) {
+    let _ = classify_guest_frame(frame);
+}
