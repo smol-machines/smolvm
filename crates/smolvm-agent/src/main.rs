@@ -269,10 +269,6 @@ fn main() {
         }
     }
 
-    // Mount storage disk eagerly during deferred init. If a request arrives
-    // before this point, ensure_storage_mounted() handles the mount on demand.
-    ensure_storage_mounted();
-
     // Initialize packed layers support (if SMOLVM_PACKED_LAYERS env var is set)
     let t0 = uptime_ms();
     if let Some(packed_dir) = storage::get_packed_layers_dir() {
@@ -349,11 +345,20 @@ fn main() {
     );
 
     // Only now is the guest safe to accept host requests for init/exec.
+    // Network is configured above; storage is mounted below while the host is
+    // establishing its vsock connection (~10-30ms), so the accept loop always
+    // sees storage ready without that mount adding to the user-visible boot time.
     signal_ready_to_host();
     boot_log(
         "INFO",
         &format!("boot ready_sent uptime_ms={}", uptime_ms()),
     );
+
+    // Mount storage after signaling ready. The accept loop has not started yet,
+    // so no request can arrive before this completes. The OnceLock in
+    // ensure_storage_mounted() also guards any concurrent call from a request
+    // that races in the brief window on very fast hosts.
+    ensure_storage_mounted();
 
     // Start accepting connections (listener already bound)
     if let Err(e) = run_server_with_listener(listener) {
