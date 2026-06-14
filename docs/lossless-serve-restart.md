@@ -169,6 +169,13 @@ subsequent restart is lossless. Codify unit/TF changes.
   POST impl; autoscaler drains before `provider.terminate()` (best-effort, never
   blocks decommission). Ops half (remove `SMOLVM_DRAIN_ON_SHUTDOWN` from units + TF)
   pairs with the Phase 7 binary rollout.
-- Pending: Phase 3 (optional retry hardening), Phase 4 ops (env removal), Phase 6
-  busy-VM + crash-sim live cases, Phase 7 PR + fleet rollout. Code uncommitted
-  across both repos; worker-1 reverted to fleet-standard `d8f57614`. See task #210.
+- **Phase 6 VALIDATED live on worker-1 (binary `3eece290`):** (a) busy VM — guest
+  `/proc/uptime` advanced `87.81s → 103.64s` *across* a serve restart (kernel ran
+  continuously, no reset → workload unaffected); (b) crash-sim — `kill -9` serve →
+  systemd auto-restarted clean (no `219`), VM survived, reconnected
+  `pid=Some(<vm>)`, exec returned `CRASH_RECOVER_OK`. `POST /drain` also smoke-
+  tested: `200`, drained the running VM cleanly.
+- **PRs open:** smolvm #394, smolfleet #18.
+- Pending: Phase 4 ops (remove `SMOLVM_DRAIN_ON_SHUTDOWN` from units + TF), Phase 7
+  fleet rollout — both after the PRs merge. Optional: Phase 3 retry hardening.
+  worker-1 reverted to fleet-standard `d8f57614`. See task #210.
