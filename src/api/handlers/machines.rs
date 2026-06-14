@@ -872,13 +872,25 @@ pub async fn stop_machine(
     Ok(Json(record_to_info(&name, &record)))
 }
 
-/// Gracefully stop every running VM before the server exits. Opt-in via
-/// `SMOLVM_DRAIN_ON_SHUTDOWN` (set by cloud workers); off by default so a dev
-/// Ctrl-C or `serve` restart leaves VMs running for reconnect. Without draining,
-/// a host teardown (e.g. autoscaler scale-in) hard-kills running VMs; draining
-/// stops them cleanly — flushing disk state and marking them stopped so the
-/// control plane can reschedule. Best-effort, concurrent, and bounded so it fits
-/// inside the host's termination grace period.
+/// `POST /drain` — explicit, control-initiated node drain (decommission).
+///
+/// Once serve restarts are lossless (per-VM systemd scopes + detach), drain is no
+/// longer a side-effect of process shutdown — it's a deliberate decommission step.
+/// The control plane (autoscaler scale-in) calls this BEFORE terminating the host
+/// so VMs flush cleanly. Control-only by construction: the serve listener is mTLS-
+/// gated, and the loopback door is localhost. See docs/lossless-serve-restart.md.
+pub async fn drain_node(State(state): State<Arc<ApiState>>) -> axum::http::StatusCode {
+    tracing::info!("drain requested via API (node decommission)");
+    drain_machines(&state).await;
+    axum::http::StatusCode::OK
+}
+
+/// Gracefully stop every running VM. Two callers: the opt-in shutdown path
+/// (`SMOLVM_DRAIN_ON_SHUTDOWN`, legacy — being retired now that restart is
+/// lossless) and the explicit `POST /drain` decommission endpoint ([`drain_node`]).
+/// Draining stops VMs cleanly — flushing disk state and marking them stopped so
+/// the control plane can reschedule. Best-effort, concurrent, and bounded so it
+/// fits inside the host's termination grace period.
 pub async fn drain_machines(state: &Arc<ApiState>) {
     let running: Vec<(String, Option<i32>, Option<u64>)> = match state.db().list_vms() {
         Ok(vms) => vms

@@ -443,6 +443,28 @@ impl ApiState {
         (total, running)
     }
 
+    /// Disarm every machine manager's `Drop` so a non-draining `serve` shutdown
+    /// (e.g. a binary-upgrade restart) leaves running VMs alive for the next
+    /// process to reconnect to, instead of `AgentManager::drop` tearing each one
+    /// down via `stop()`. Mirrors the CLI's detach-before-exit (`SigintGuard`
+    /// disarm + `manager.detach()`). The drain path does the opposite — it stops
+    /// VMs cleanly — so this is invoked ONLY on the survive-and-reconnect path.
+    /// Uses a blocking lock per entry: missing one would let its VM be killed.
+    pub fn detach_all(&self) {
+        let machines = self.machines.read();
+        let mut detached = 0usize;
+        for entry in machines.values() {
+            entry.lock().manager.detach();
+            detached += 1;
+        }
+        if detached > 0 {
+            tracing::info!(
+                count = detached,
+                "detached machine managers on shutdown; VMs left running for reconnect"
+            );
+        }
+    }
+
     /// Compute total allocated resources across all running machines.
     /// Returns (allocated_cpus, allocated_memory_mb).
     pub fn allocated_resources(&self) -> (u32, u64) {

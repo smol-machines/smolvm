@@ -1464,6 +1464,40 @@ impl AgentManager {
             "boot: subprocess spawned"
         );
 
+        // Lossless-restart placement: on a systemd host, adopt the just-forked VM
+        // into its own `smolvm-vm-<id>.scope` (sibling unit, owned by PID1) so a
+        // later `serve` restart can't kill or `219/CGROUP`-crash on it. Serve set
+        // SMOLVM_VM_USE_SCOPE at startup and did NOT set SMOLVM_CGROUP_ROOT, so the
+        // boot subprocess skipped self-placement and the VM is still in serve's
+        // cgroup for this microsecond window — the adopt moves it out. Caps mirror
+        // process::place_in_cgroup (CGROUP_MEM_OVERHEAD_MIB=768, CGROUP_PIDS_MAX
+        // =1024) as scope properties. Best-effort: on failure the VM keeps running
+        // (just not restart-safe), same as an uncapped cgroup join.
+        #[cfg(target_os = "linux")]
+        if std::env::var_os("SMOLVM_VM_USE_SCOPE").is_some() {
+            if let Some(name) = self.name() {
+                let caps = crate::systemd_scope::ScopeCaps {
+                    memory_max_bytes: Some(
+                        (resources_for_config.memory_mib as u64 + 768) * 1024 * 1024,
+                    ),
+                    cpu_quota_usec_per_sec: Some(
+                        (resources_for_config.cpus.max(1) as u64) * 1_000_000,
+                    ),
+                    tasks_max: Some(1024),
+                };
+                if let Err(e) = crate::systemd_scope::adopt_into_scope(name, child_pid, &caps) {
+                    // Only reachable when is_available() said yes (root + systemd +
+                    // busctl) but the bus call still failed — effectively a broken
+                    // D-Bus. The VM keeps running but stays in serve's cgroup,
+                    // uncapped and not restart-safe. Loud so the operator notices.
+                    tracing::warn!(
+                        error = %e, pid = child_pid,
+                        "failed to adopt VM into systemd scope; VM left in service cgroup — uncapped and NOT restart-safe"
+                    );
+                }
+            }
+        }
+
         self.finalize_launch(child_pid, &mounts, &ports, &resources_for_config)
     }
 

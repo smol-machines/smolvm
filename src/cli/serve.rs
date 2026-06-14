@@ -105,15 +105,26 @@ impl ServeStartCmd {
             tracing::info!("verbose logging enabled");
         }
 
-        // Untrusted multi-tenant hardening: when this serve process runs
-        // under a cgroup v2 delegation (a systemd unit with `Delegate=yes`),
-        // establish a delegated root and advertise it via SMOLVM_CGROUP_ROOT so
-        // every VM boot subprocess places itself in a per-VM cgroup with
-        // cpu/pids/memory caps. Best-effort: a no-op (None) when not delegated.
+        // Per-VM resource isolation + lossless-restart placement. Two paths:
+        //
+        // - systemd host: adopt each VM into its OWN `smolvm-vm-<id>.scope` after
+        //   fork (a sibling unit owned by PID1), so a `serve` restart doesn't kill
+        //   or orphan it — the VM isn't in the service cgroup, so systemd won't hit
+        //   `219/CGROUP` recreating the unit. Caps become scope properties. We do
+        //   NOT set SMOLVM_CGROUP_ROOT here so the VM boot subprocess skips
+        //   self-placement; the parent adopts it instead. See
+        //   docs/lossless-serve-restart.md.
+        // - non-systemd (dev/containers): fall back to a delegated cgroup root
+        //   advertised via SMOLVM_CGROUP_ROOT so every VM boot subprocess places
+        //   itself in a per-VM cgroup. No lossless restart there, which is fine.
+        //
         // Done here — single-threaded, before the tokio runtime — so set_var is
         // safe. See docs/runtime-isolation-hardening.md.
         #[cfg(target_os = "linux")]
-        if let Some(root) = smolvm::process::setup_cgroup_delegation_root() {
+        if smolvm::systemd_scope::is_available() {
+            std::env::set_var("SMOLVM_VM_USE_SCOPE", "1");
+            tracing::info!("per-VM systemd transient scopes enabled (lossless serve restart)");
+        } else if let Some(root) = smolvm::process::setup_cgroup_delegation_root() {
             tracing::info!(cgroup_root = %root.display(), "per-VM cgroup resource caps enabled");
             std::env::set_var("SMOLVM_CGROUP_ROOT", &root);
         }
@@ -225,6 +236,13 @@ impl ServeStartCmd {
             .unwrap_or(false);
         if drain {
             smolvm::api::handlers::machines::drain_machines(&drain_state).await;
+        } else {
+            // Non-draining shutdown (a binary-upgrade restart): VMs must survive
+            // for the next `serve` process to reconnect to. Skipping drain isn't
+            // enough — `AgentManager::drop` stops any VM it owns, so tearing down
+            // `ApiState` would kill every running VM. Disarm each manager's Drop
+            // first, mirroring the CLI's detach-before-exit.
+            drain_state.detach_all();
         }
 
         // Signal all background tasks to stop

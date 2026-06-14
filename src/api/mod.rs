@@ -148,6 +148,11 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
     // Node capacity introspection (polled by a fleet node-agent over HTTP).
     let capacity_route = Router::new().route("/capacity", get(handlers::node::capacity));
 
+    // Explicit, control-initiated node drain (decommission). Stops all VMs
+    // cleanly. Control-only by construction (the listener is mTLS-gated; the
+    // loopback door is localhost). See docs/lossless-serve-restart.md.
+    let drain_route = Router::new().route("/drain", post(handlers::machines::drain_node));
+
     // Long-lived streaming routes (no request timeout): SSE logs and the
     // interactive PTY WebSocket both outlive the 5-minute API timeout.
     let logs_route = Router::new()
@@ -242,6 +247,7 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
     Router::new()
         .merge(health_route)
         .merge(capacity_route)
+        .merge(drain_route)
         .merge(metrics_route)
         .nest("/api/v1", api_v1)
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))

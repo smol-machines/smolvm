@@ -81,6 +81,7 @@ pub mod secrets;
 pub mod settings;
 pub mod smolfile;
 pub mod storage;
+pub mod systemd_scope;
 pub mod util;
 pub mod vm;
 
