@@ -40,6 +40,8 @@ impl MachineSpec {
         record.storage_gb = self.resources.storage_gib;
         record.overlay_gb = self.resources.overlay_gib;
         record.allowed_cidrs = self.resources.allowed_cidrs.clone();
+        record.gpu = Some(self.resources.gpu);
+        record.gpu_vram_mib = self.resources.gpu_vram_mib;
         record.ephemeral = !self.persistent;
         record
     }
@@ -205,6 +207,24 @@ mod tests {
     fn record_ephemeral_follows_persistent_flag() {
         assert!(test_spec("ephemeral", false).to_record().ephemeral);
         assert!(!test_spec("persistent", true).to_record().ephemeral);
+    }
+
+    #[test]
+    fn record_carries_gpu_resources() {
+        // GPU must survive MachineSpec -> VmRecord (the `_boot-vm` config),
+        // otherwise the SDK's `resources.gpu` is silently dropped before launch.
+        let mut spec = test_spec("gpu", false);
+        spec.resources.gpu = true;
+        spec.resources.gpu_vram_mib = Some(512);
+        let record = spec.to_record();
+        assert_eq!(record.gpu, Some(true));
+        assert_eq!(record.gpu_vram_mib, Some(512));
+        assert!(record.vm_resources().gpu);
+
+        // Default (no GPU) records leave gpu off.
+        let plain = test_spec("plain", false).to_record();
+        assert_eq!(plain.gpu, Some(false));
+        assert!(!plain.vm_resources().gpu);
     }
 
     #[test]
