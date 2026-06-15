@@ -13,7 +13,9 @@ use crate::oci::{generate_container_id, OciSpec};
 use crate::paths;
 use crate::process::{WaitResult, TIMEOUT_EXIT_CODE};
 use smolvm_protocol::guest_env;
-use smolvm_protocol::{normalize_image_ref, ImageInfo, OverlayInfo, RegistryAuth, StorageStatus};
+use smolvm_protocol::{
+    image_repo, normalize_image_ref, ImageInfo, OverlayInfo, RegistryAuth, StorageStatus,
+};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
@@ -1148,7 +1150,7 @@ where
         // Build crane command
         let mut crane_cmd = Command::new("crane");
         crane_cmd.arg("blob");
-        crane_cmd.arg(format!("{}@{}", image, layer_digest));
+        crane_cmd.arg(format!("{}@{}", image_repo(image), layer_digest));
         if let Some(p) = oci_platform {
             crane_cmd.arg("--platform").arg(p);
         }
