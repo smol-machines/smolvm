@@ -2,7 +2,6 @@
 
 pub mod exec;
 pub mod files;
-pub mod gcp_pd;
 pub mod health;
 pub mod images;
 pub mod machines;
