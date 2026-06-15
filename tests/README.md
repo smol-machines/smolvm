@@ -10,7 +10,7 @@ against real VMs — no mocking.
 Single entry point for all test suites.
 
 ```bash
-./tests/run_tests.sh                      # all 11 feature suites (~10 min)
+./tests/run_tests.sh                      # all 12 feature suites (~10 min)
 SMOLVM_SKIP_SLOW=1 ./tests/run_tests.sh   # skip tests with long sleeps (~5 min)
 ./tests/run_tests.sh bare network         # specific groups only
 ```
@@ -29,6 +29,7 @@ SMOLVM_SKIP_SLOW=1 ./tests/run_tests.sh   # skip tests with long sleeps (~5 min)
 | `reliability` | `test_reliability.sh` | 5 | Concurrency, state probe, ls-does-not-kill-vm |
 | `run` | `test_machine_run.sh` | 25 | Ephemeral `machine run` scenarios |
 | `image` | `test_machine_image.sh` | 13 | Image-based VMs, exec-join, large stdout |
+| `local-image` | `test_machine_local_image.sh` | 5 | Offline boot: save-archive (file/stdin), rootfs dir, stdin guard (needs docker) |
 | `packed` | `test_machine_packed.sh` | 2 | `.smolmachine` create and cp |
 
 ### Extended suites (opt-in only)
