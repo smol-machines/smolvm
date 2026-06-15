@@ -54,29 +54,6 @@ pub struct ApiState {
     /// Previous CPU samples per VM PID, used to compute the fractional-CPU
     /// rate as a delta over wall time. Pruned on each sample to drop dead PIDs.
     cpu_samples: parking_lot::Mutex<HashMap<i32, CpuSample>>,
-    /// Bounds concurrent VM boots on this node. Each boot full-copies (or, with
-    /// CoW overlays, prepares) its disks; unbounded concurrency thrashes the host
-    /// disk so each copy balloons (3.8s → 50s under ~13 concurrent boots) and the
-    /// start request times out. A small bound serializes enough that every boot
-    /// takes the fast path. Acquired in `start_machine` around disk-prep + launch
-    /// only (NOT held across the workload container start). Override via
-    /// `SMOLVM_BOOT_CONCURRENCY`. Scope: this API server only (the per-machine
-    /// `lifecycle_locks` above bound a single name; this bounds across names).
-    boot_semaphore: Arc<tokio::sync::Semaphore>,
-}
-
-/// Default max concurrent VM boots per node (overridable via
-/// `SMOLVM_BOOT_CONCURRENCY`). Mirrors the smolfleet op-queue's 4-worker throttle.
-const DEFAULT_BOOT_CONCURRENCY: usize = 4;
-
-/// Resolve the boot-concurrency bound from `SMOLVM_BOOT_CONCURRENCY`, clamped to
-/// at least 1, falling back to [`DEFAULT_BOOT_CONCURRENCY`].
-fn boot_concurrency() -> usize {
-    std::env::var("SMOLVM_BOOT_CONCURRENCY")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n >= 1)
-        .unwrap_or(DEFAULT_BOOT_CONCURRENCY)
 }
 
 /// Internal machine entry with manager and configuration.
@@ -214,7 +191,6 @@ impl ApiState {
             lifecycle_locks: RwLock::new(HashMap::new()),
             db,
             cpu_samples: parking_lot::Mutex::new(HashMap::new()),
-            boot_semaphore: Arc::new(tokio::sync::Semaphore::new(boot_concurrency())),
         })
     }
 
@@ -228,15 +204,7 @@ impl ApiState {
             lifecycle_locks: RwLock::new(HashMap::new()),
             db,
             cpu_samples: parking_lot::Mutex::new(HashMap::new()),
-            boot_semaphore: Arc::new(tokio::sync::Semaphore::new(boot_concurrency())),
         }
-    }
-
-    /// Permit pool bounding concurrent VM boots on this node. Acquire an owned
-    /// permit (`state.boot_semaphore().acquire_owned()`) around disk-prep + launch
-    /// in `start_machine`; hold it only until the VMM is spawned.
-    pub fn boot_semaphore(&self) -> Arc<tokio::sync::Semaphore> {
-        self.boot_semaphore.clone()
     }
 
     /// Load existing machines from persistent database.

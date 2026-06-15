@@ -5,7 +5,7 @@
 
 use std::os::fd::IntoRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
@@ -576,6 +576,66 @@ pub fn drop_privileges(uid: u32, gid: u32) -> std::result::Result<(), String> {
 #[cfg(not(target_os = "linux"))]
 pub fn drop_privileges(_uid: u32, _gid: u32) -> std::result::Result<(), String> {
     Ok(())
+}
+
+/// Process-wide gate bounding concurrent VM disk-prep / boot. Every boot path —
+/// the API `start_machine`, the supervisor's restart/reconnect, and startup
+/// reconnect — funnels through `AgentManager::start_via_subprocess`, which
+/// acquires a [`BootPermit`] around `prepare_for_launch` (the per-boot disk
+/// copy). Unbounded concurrency thrashes the host disk so each copy balloons
+/// (3.8s → 50s under ~13 simultaneous boots) and the start request times out;
+/// bounding to a few in-flight keeps every copy on the fast path. A synchronous
+/// gate (Mutex + Condvar) because the acquire happens in blocking context (inside
+/// `spawn_blocking`), where an async `tokio::sync::Semaphore` does not fit.
+struct BootGate {
+    /// Available permits.
+    permits: Mutex<usize>,
+    cv: Condvar,
+}
+
+static BOOT_GATE: OnceLock<BootGate> = OnceLock::new();
+
+/// Max concurrent VM boots per node (overridable via `SMOLVM_BOOT_CONCURRENCY`,
+/// clamped to ≥1). Mirrors the smolfleet op-queue's 4-worker throttle.
+fn boot_concurrency() -> usize {
+    std::env::var("SMOLVM_BOOT_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(4)
+}
+
+fn boot_gate() -> &'static BootGate {
+    BOOT_GATE.get_or_init(|| BootGate {
+        permits: Mutex::new(boot_concurrency()),
+        cv: Condvar::new(),
+    })
+}
+
+/// RAII permit from [`acquire_boot_permit`]; returns the permit to the gate on
+/// drop.
+pub struct BootPermit {
+    _private: (),
+}
+
+impl Drop for BootPermit {
+    fn drop(&mut self) {
+        let gate = boot_gate();
+        *gate.permits.lock().unwrap() += 1;
+        gate.cv.notify_one();
+    }
+}
+
+/// Acquire a permit from the process-wide boot gate, blocking until one is free.
+/// Hold it across the contended disk-prep, then let it drop. See [`BootGate`].
+pub fn acquire_boot_permit() -> BootPermit {
+    let gate = boot_gate();
+    let mut permits = gate.permits.lock().unwrap();
+    while *permits == 0 {
+        permits = gate.cv.wait(permits).unwrap();
+    }
+    *permits -= 1;
+    BootPermit { _private: () }
 }
 
 /// PIDs of detached VM boot subprocesses to reap. Registered by
@@ -1741,6 +1801,25 @@ mod tests {
             1,
             "drop must not have taken effect"
         );
+    }
+
+    /// The boot gate hands out permits, returns them on drop, and lets multiple
+    /// permits (up to the bound, default ≥4) coexist without deadlocking.
+    #[test]
+    fn boot_gate_acquire_release_roundtrip() {
+        // Roundtrip: acquire then drop then re-acquire must not deadlock.
+        let p = acquire_boot_permit();
+        drop(p);
+        let _p2 = acquire_boot_permit();
+        // A second concurrent permit coexists (default bound is 4).
+        let _p3 = acquire_boot_permit();
+        // Returning a permit from another thread wakes a waiter — exercise the
+        // notify path by dropping on a thread while the main thread holds permits.
+        let h = std::thread::spawn(|| {
+            let p = acquire_boot_permit();
+            drop(p);
+        });
+        h.join().unwrap();
     }
 
     /// The selective reaper drains registered VM PIDs once they exit, and a

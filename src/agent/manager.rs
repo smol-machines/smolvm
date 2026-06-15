@@ -1365,7 +1365,16 @@ impl AgentManager {
         let t_launch = Instant::now();
 
         let resources_for_config = resources.clone();
-        self.prepare_for_launch(&mounts, &ports, resources)?;
+        // Bound concurrent disk-prep across ALL boot paths (this is the chokepoint
+        // they share): unbounded parallel template copies thrash the host disk so
+        // each balloons (3.8s → 50s under ~13 concurrent boots) and the start
+        // times out. The permit is held only across `prepare_for_launch` (the disk
+        // copy), then released before the VMM spawn. Process-wide; tune with
+        // SMOLVM_BOOT_CONCURRENCY.
+        {
+            let _boot_permit = crate::process::acquire_boot_permit();
+            self.prepare_for_launch(&mounts, &ports, resources)?;
+        }
         tracing::info!(
             elapsed_ms = t_launch.elapsed().as_millis(),
             "boot: disks ready"

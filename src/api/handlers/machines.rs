@@ -635,19 +635,10 @@ pub async fn start_machine(
     let ports = record.port_mappings();
     let resources = record.vm_resources();
 
-    // Bound concurrent boots on this node: each boot's disk prep contends for the
-    // host disk, so unbounded concurrency thrashes it (a single boot's ~3.8s disk
-    // copy balloons past the request timeout under ~13 simultaneous boots). Hold
-    // this permit only across disk-prep + VMM spawn below; it is released before
-    // the workload-container launch so throughput doesn't collapse to serial.
-    // Acquired AFTER the running/zombie short-circuits so a no-op start never
-    // consumes a permit, and after the lifecycle lock so a `stop` (which takes no
-    // permit) of this machine is never blocked behind a boot queue.
-    let boot_permit = state
-        .boot_semaphore()
-        .acquire_owned()
-        .await
-        .map_err(|_| ApiError::internal("boot semaphore closed"))?;
+    // Note: concurrent-boot bounding lives at the chokepoint all boot paths share
+    // (`AgentManager::start_via_subprocess` → a process-wide sync gate), not here,
+    // so the supervisor + reconnect boot paths are bounded too. See
+    // `smolvm::process::acquire_boot_permit`.
 
     // Start agent VM in blocking task.
     // Uses subprocess launch to avoid macOS fork-in-multithreaded-process issue.
@@ -675,10 +666,6 @@ pub async fn start_machine(
     .await
     .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
     .map_err(ApiError::internal)?;
-
-    // Disk prep + VMM spawn are done; release the boot permit so the next queued
-    // boot proceeds while this handler finishes the (non-disk) workload launch.
-    drop(boot_permit);
 
     // Register in ApiState so exec/run/container endpoints can find it
     state.insert_machine(&name, machine_entry_from_record(&record, manager));
