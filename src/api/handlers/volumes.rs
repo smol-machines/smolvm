@@ -1,10 +1,13 @@
 //! Volume provisioning endpoints — node-side storage for the control plane.
 //!
-//! smolfleet's `create_volume`/`delete_volume` call these to materialize a volume
-//! ON the worker (not on the control plane's own disk, which the worker can't
-//! see). For the `local` backend a volume is simply a directory under the smolvm
-//! data dir; the worker virtiofs-shares it into a guest at mount time. Future
-//! backends (PD, NFS) attach real storage here. See smolfleet
+//! smolfleet's `create_volume`/`delete_volume` call these to materialize a `local`
+//! volume ON the worker (not on the control plane's own disk, which the worker
+//! can't see): a directory under the smolvm data dir that the worker
+//! virtiofs-shares into a guest at mount time.
+//!
+//! Persistent-disk (`pd`) volumes are NOT handled here — disk create/format/attach
+//! run on the control plane (which has cloud credentials and no `serve` syscall
+//! reaper), and the node-agent does the final mount out-of-band. See smolfleet
 //! docs/d3-replicated-volumes.md.
 
 use axum::{extract::Path, http::StatusCode, Json};
@@ -17,12 +20,12 @@ use crate::api::error::ApiError;
 pub struct ProvisionVolumeRequest {
     /// Control-plane volume id (e.g. `vol-<hex>`); names the on-node directory.
     pub id: String,
-    /// Requested size. Advisory for the `local` backend (a plain directory has no
-    /// hard quota); the disk size for `pd`.
+    /// Requested size. Advisory for the `local` backend — a plain directory has no
+    /// hard quota.
     #[serde(default)]
     pub size_gb: u64,
-    /// Storage backend: `local` (default — a worker dir) or `pd` (a GCP
-    /// persistent disk that survives node loss and can re-attach elsewhere).
+    /// Storage backend. Only `local` (a worker dir, the default) is handled on the
+    /// node; `pd` volumes are driven from the control plane, not here.
     #[serde(default)]
     pub backend: Option<String>,
 }
@@ -33,19 +36,6 @@ pub struct ProvisionVolumeResponse {
     /// Host path the volume is mounted at on this node — becomes a workload mount
     /// `source`.
     pub node_path: String,
-    /// Backend storage handle (the GCP disk name for `pd`); the control plane
-    /// stores it to re-attach the disk on failover. `None` for `local`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub handle: Option<String>,
-}
-
-/// Request body for `POST /api/v1/volumes/attach` (failover re-home).
-#[derive(Deserialize)]
-pub struct AttachVolumeRequest {
-    /// Control-plane volume id.
-    pub id: String,
-    /// Backend storage handle to re-attach (the GCP disk name).
-    pub handle: String,
 }
 
 /// Base directory for node-local volumes: `<data_local_dir>/smolvm/volumes`.
@@ -82,35 +72,12 @@ pub async fn provision_volume(
             std::fs::create_dir_all(&path).map_err(ApiError::internal)?;
             let node_path = path.to_string_lossy().to_string();
             tracing::info!(volume_id = %req.id, node_path = %node_path, size_gb = req.size_gb, "provisioned local volume");
-            Ok(Json(ProvisionVolumeResponse {
-                node_path,
-                handle: None,
-            }))
-        }
-        "pd" => {
-            let (node_path, handle) = super::gcp_pd::provision(&req.id, req.size_gb).await?;
-            Ok(Json(ProvisionVolumeResponse {
-                node_path,
-                handle: Some(handle),
-            }))
+            Ok(Json(ProvisionVolumeResponse { node_path }))
         }
         other => Err(ApiError::BadRequest(format!(
-            "unsupported volume backend: {other:?}"
+            "unsupported node volume backend: {other:?} (pd volumes are driven from the control plane)"
         ))),
     }
-}
-
-/// `POST /api/v1/volumes/attach` — attach an existing PD (the failover re-home)
-/// onto this node and mount it, returning the host path. No format (data intact).
-pub async fn attach_volume(
-    Json(req): Json<AttachVolumeRequest>,
-) -> Result<Json<ProvisionVolumeResponse>, ApiError> {
-    safe_volume_id(&req.id)?;
-    let node_path = super::gcp_pd::attach(&req.handle, &req.id).await?;
-    Ok(Json(ProvisionVolumeResponse {
-        node_path,
-        handle: Some(req.handle),
-    }))
 }
 
 /// `DELETE /api/v1/volumes/{id}` — tear down the backing storage. Idempotent:

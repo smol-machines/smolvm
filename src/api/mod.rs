@@ -196,7 +196,6 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
     // handlers::volumes.
     let volume_routes = Router::new()
         .route("/", post(handlers::volumes::provision_volume))
-        .route("/attach", post(handlers::volumes::attach_volume))
         .route("/{id}", delete(handlers::volumes::deprovision_volume));
 
     // API v1 routes
