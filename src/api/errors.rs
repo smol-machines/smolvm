@@ -15,6 +15,11 @@ pub enum ApiError {
     NotFound(String),
     /// Conflict - resource already exists or invalid state (409).
     Conflict(String),
+    /// A published host port could not be bound because it is already in use
+    /// (409). Distinct from `Conflict` so the control plane can recognize this
+    /// specific, retryable failure (reallocate a different port and retry)
+    /// instead of treating it as a generic 500/409.
+    PortConflict(String),
     /// Bad request - invalid input (400).
     BadRequest(String),
     /// Request timeout (408).
@@ -47,6 +52,7 @@ impl IntoResponse for ApiError {
         let (status, code, message) = match self {
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, "NOT_FOUND", msg),
             ApiError::Conflict(msg) => (StatusCode::CONFLICT, "CONFLICT", msg),
+            ApiError::PortConflict(msg) => (StatusCode::CONFLICT, "PORT_IN_USE", msg),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, "BAD_REQUEST", msg),
             ApiError::Timeout => (
                 StatusCode::REQUEST_TIMEOUT,

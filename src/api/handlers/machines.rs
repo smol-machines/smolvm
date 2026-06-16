@@ -544,6 +544,21 @@ pub async fn get_machine(
     Ok(Json(record_to_info(&name, &record)))
 }
 
+/// Classify a VM launch/boot failure. A published host-port bind conflict — the
+/// virtio-net runtime couldn't bind `0.0.0.0:<hostPort>` because something
+/// (typically an orphaned VMM) still holds it — is surfaced as `PortConflict`
+/// (409 `PORT_IN_USE`), which the control plane recognizes and retries on a
+/// freshly-allocated port. Everything else stays a 500. Matching is scoped to
+/// the virtio-net path so an unrelated AddrInUse can't be mistaken for it.
+fn classify_launch_error(e: String) -> ApiError {
+    let lc = e.to_ascii_lowercase();
+    if lc.contains("address already in use") && lc.contains("virtio") {
+        ApiError::PortConflict(e)
+    } else {
+        ApiError::Internal(e)
+    }
+}
+
 /// Start a machine.
 #[utoipa::path(
     post,
@@ -555,6 +570,7 @@ pub async fn get_machine(
     responses(
         (status = 200, description = "Machine started", body = MachineInfo),
         (status = 404, description = "Machine not found", body = ApiErrorResponse),
+        (status = 409, description = "A published host port is already in use (PORT_IN_USE)", body = ApiErrorResponse),
         (status = 500, description = "Failed to start", body = ApiErrorResponse)
     )
 )]
@@ -665,7 +681,7 @@ pub async fn start_machine(
     })
     .await
     .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
-    .map_err(ApiError::internal)?;
+    .map_err(classify_launch_error)?;
 
     // Register in ApiState so exec/run/container endpoints can find it
     state.insert_machine(&name, machine_entry_from_record(&record, manager));
@@ -1311,6 +1327,33 @@ mod tests {
     use super::*;
     use crate::db::SmolvmDb;
     use tempfile::TempDir;
+
+    #[test]
+    fn classify_launch_error_flags_virtio_port_conflict() {
+        // The real virtio-net host-port bind failure → retryable PortConflict.
+        let e = "agent operation failed: configure virtio-net: failed to start virtio network \
+                 runtime: Address already in use (os error 98)"
+            .to_string();
+        assert!(matches!(
+            classify_launch_error(e),
+            ApiError::PortConflict(_)
+        ));
+    }
+
+    #[test]
+    fn classify_launch_error_keeps_others_internal() {
+        // An unrelated AddrInUse (no virtio context) must NOT be treated as a
+        // published-port conflict — reallocating a port wouldn't help.
+        assert!(matches!(
+            classify_launch_error("bind vsock: Address already in use".to_string()),
+            ApiError::Internal(_)
+        ));
+        // A generic boot failure stays a 500.
+        assert!(matches!(
+            classify_launch_error("failed to start machine: kernel panic".to_string()),
+            ApiError::Internal(_)
+        ));
+    }
 
     #[test]
     fn test_record_to_info() {
