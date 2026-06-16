@@ -213,15 +213,17 @@ impl SmolSettings {
 /// Buffer in seconds before actual expiry to trigger refresh.
 const TOKEN_EXPIRY_BUFFER_SECS: i64 = 60;
 
+/// Hosted smolfleet endpoint used when none is configured. The CLI targets the
+/// managed cloud by default; self-hosters override with `smol config set cloud <url>`.
+pub const DEFAULT_CLOUD_ENDPOINT: &str = "https://api.smolmachines.com";
+
 impl CloudSection {
-    /// Get the endpoint, or error with a helpful message.
+    /// Get the configured endpoint, falling back to the hosted default
+    /// ([`DEFAULT_CLOUD_ENDPOINT`]) so a fresh install talks to the managed
+    /// cloud without any `config set`. Self-hosters override via
+    /// `smol config set cloud <url>`.
     pub fn endpoint(&self) -> Result<&str> {
-        self.endpoint.as_deref().ok_or_else(|| {
-            Error::config(
-                "cloud endpoint",
-                "No smolfleet endpoint configured. Set one with: smol config set cloud <url>",
-            )
-        })
+        Ok(self.endpoint.as_deref().unwrap_or(DEFAULT_CLOUD_ENDPOINT))
     }
 
     /// Check if the stored access token has expired or will expire within 60 seconds.
