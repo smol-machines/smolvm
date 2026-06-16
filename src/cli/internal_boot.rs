@@ -182,6 +182,14 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
         if let Some(libdir) = std::env::var_os("SMOLVM_LIB_DIR") {
             read_exec.push(std::path::PathBuf::from(libdir));
         }
+        // A fresh VM's storage/overlay disk may be a qcow2 copy-on-write overlay
+        // backed by a read-only disk template in ~/.smolvm; the confined VMM must
+        // be able to open that backing file. Grant the template directory
+        // read-only — it is the install dir (same trust level as SMOLVM_LIB_DIR,
+        // which lives under it) and holds no secrets. A no-op for the copy path.
+        if let Some(home) = dirs::home_dir() {
+            read_exec.push(home.join(".smolvm"));
+        }
 
         let mut read_write: Vec<std::path::PathBuf> = [
             "/dev/kvm",
