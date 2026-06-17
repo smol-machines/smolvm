@@ -1865,7 +1865,15 @@ impl AgentManager {
                 }
             }
 
-            if ready_marker.exists() {
+            // Ready when the marker is present AND non-empty. The guest writes
+            // its uptime (always non-empty) into it. Under SMOLVM_LANDLOCK the
+            // confined VMM pre-creates this file empty so Landlock can grant
+            // write on just this one file (see internal_boot.rs) — so existence
+            // alone would false-positive; require content.
+            if std::fs::metadata(&ready_marker)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false)
+            {
                 let elapsed = start.elapsed();
                 tracing::info!(elapsed_ms = elapsed.as_millis(), "agent ready (marker)");
                 return Ok(());

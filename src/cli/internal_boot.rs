@@ -236,6 +236,18 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
             }
         }
 
+        // The guest agent signals boot-readiness by writing a marker file into
+        // the virtiofs rootfs, which the host polls. The rootfs is granted
+        // read-exec above, so that FUSE write would be denied here. Carve out
+        // write on JUST that one marker file — never the rootfs dir, which
+        // holds the shared agent binary/init/libs a guest→VMM escape must not
+        // be able to tamper with. Landlock needs an existing path to build the
+        // rule, so pre-create it empty; the guest overwrites it with content
+        // and the host treats non-empty as ready (see manager.rs wait loop).
+        let ready_marker = config.rootfs_path.join(smolvm_protocol::AGENT_READY_MARKER);
+        let _ = std::fs::File::create(&ready_marker);
+        read_write.push(ready_marker);
+
         if let Err(e) = smolvm::process::restrict_filesystem(&read_exec, &read_write) {
             eprintln!("[landlock] restriction failed, refusing to boot unconfined: {e}");
             smolvm::process::exit_child(1);
