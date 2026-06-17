@@ -439,6 +439,26 @@ if [[ "$(uname -s)" == "Linux" ]]; then
         echo "Copying init.krun from $INIT_KRUN..."
         cp "$INIT_KRUN" "$DIST_DIR/init.krun"
         chmod +x "$DIST_DIR/init.krun"
+
+        # init.krun runs as the guest PID 1, so it must match the target arch.
+        # libkrun/init/init is a committed binary that does NOT track the build
+        # host's arch, so a native dist build can silently ship a wrong-arch init
+        # (the x86_64 release once shipped the aarch64 init). Linux dist builds
+        # run natively, so the correct arch is `uname -m`; fail loudly otherwise.
+        host_arch="$(uname -m)"
+        case "$host_arch" in
+            x86_64)  want="x86-64" ;;
+            aarch64|arm64) want="aarch64" ;;
+            *)       want="" ;;
+        esac
+        init_desc="$(file -b "$DIST_DIR/init.krun")"
+        if [[ -n "$want" ]] && [[ "$init_desc" != *"$want"* ]]; then
+            echo "ERROR: init.krun is the wrong architecture for a $host_arch build." >&2
+            echo "       expected '$want', got: $init_desc" >&2
+            echo "       source: $INIT_KRUN — rebuild it for $host_arch (see scripts/build-libkrun-linux.sh)." >&2
+            exit 1
+        fi
+        echo "init.krun arch OK ($init_desc)"
     else
         echo "Warning: init.krun not found - users may need to build libkrun init"
     fi
