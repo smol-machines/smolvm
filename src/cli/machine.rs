@@ -2761,33 +2761,60 @@ impl PruneCmd {
 
             if images.is_empty() {
                 println!("No cached images to remove.");
-                return Ok(());
-            }
-
-            let total_size: u64 = images.iter().map(|i| i.size).sum();
-
-            if self.dry_run {
-                println!(
-                    "Would remove {} images ({})",
-                    images.len(),
-                    format_bytes(total_size)
-                );
-                for image in &images {
+            } else if record.image.is_some() {
+                // An image-backed machine needs its cached image to restart, so
+                // purging it would brick a *stopped* machine ("image not found"
+                // on the next start). Keep the cache and reclaim only
+                // unreferenced layers; to reclaim everything, delete the machine.
+                let total_size: u64 = images.iter().map(|i| i.size).sum();
+                if self.dry_run {
+                    let would_free = client.garbage_collect(true, false)?;
                     println!(
-                        "  - {} ({}, {} layers)",
-                        image.reference,
-                        format_bytes(image.size),
-                        image.layer_count
+                        "Machine '{}' is image-backed: would keep {} cached image(s) ({}) it needs to restart, and free {} of unreferenced layers.",
+                        self.name,
+                        images.len(),
+                        format_bytes(total_size),
+                        format_bytes(would_free)
+                    );
+                } else {
+                    let freed = client.garbage_collect(false, false)?;
+                    println!(
+                        "Kept {} cached image(s) in use by machine '{}'; freed {} of unreferenced layers.",
+                        images.len(),
+                        self.name,
+                        format_bytes(freed)
+                    );
+                    eprintln!(
+                        "(--all keeps images a machine needs to restart; to reclaim everything: smolvm machine delete --name {})",
+                        self.name
                     );
                 }
             } else {
-                println!("Removing all cached images...");
-                let freed = client.garbage_collect(false, true)?;
-                println!(
-                    "Removed {} images, freed {}",
-                    images.len(),
-                    format_bytes(freed)
-                );
+                // Bare VM: nothing depends on the image cache, so purge all.
+                let total_size: u64 = images.iter().map(|i| i.size).sum();
+                if self.dry_run {
+                    println!(
+                        "Would remove {} images ({})",
+                        images.len(),
+                        format_bytes(total_size)
+                    );
+                    for image in &images {
+                        println!(
+                            "  - {} ({}, {} layers)",
+                            image.reference,
+                            format_bytes(image.size),
+                            image.layer_count
+                        );
+                    }
+                } else {
+                    println!("Removing all cached images...");
+                    let freed = client.garbage_collect(false, true)?;
+                    println!(
+                        "Removed {} images, freed {}",
+                        images.len(),
+                        format_bytes(freed)
+                    );
+                }
             }
         } else if self.dry_run {
             println!("Scanning for unreferenced layers...");

@@ -229,55 +229,48 @@ test_prune_all_refuses_on_running_vm() {
     [[ "$status" == *"running"* ]] || { echo "VM stopped after rejected prune --all"; return 1; }
 }
 
-test_prune_all_removes_images() {
-    # Start with a clean machine that has an image cached
+test_prune_all_keeps_in_use_image() {
+    # An image-backed machine needs its cached image to restart, so `prune --all`
+    # must keep it (and reclaim only unreferenced layers) rather than brick a
+    # stopped machine with "image not found" on the next start.
     $SMOLVM machine stop 2>/dev/null || true
     $SMOLVM machine delete --name default -f 2>/dev/null || true
     $SMOLVM machine create --image alpine --net --name default 2>&1 || return 1
     $SMOLVM machine start 2>&1 || return 1
 
-    # Verify the image is cached
+    # Verify the image is cached and the VM is reachable
     $SMOLVM machine exec -- true 2>&1 || { echo "VM not reachable"; return 1; }
-
-    # Check images before prune
-    local images_before
-    images_before=$($SMOLVM machine images --name default 2>&1)
 
     # Stop the VM (prune --all requires it)
     $SMOLVM machine stop 2>&1
 
-    # Run prune --all
+    # Run prune --all: it must keep the in-use image, not remove it.
     local output
     output=$($SMOLVM machine prune --name default --all 2>&1) || {
         echo "prune --all failed: $output"
         $SMOLVM machine delete --name default -f 2>/dev/null
         return 1
     }
-    [[ "$output" == *"Removed"* ]] || [[ "$output" == *"No cached images"* ]] || {
-        echo "unexpected prune output: $output"
+    [[ "$output" == *"Kept"* ]] || [[ "$output" == *"image-backed"* ]] || {
+        echo "expected prune --all to keep the in-use image, got: $output"
         $SMOLVM machine delete --name default -f 2>/dev/null
         return 1
     }
 
-    # Restart and verify images are gone
+    # The machine must still restart — its image was kept, not pruned.
     $SMOLVM machine start 2>&1 || {
+        echo "FAIL: machine could not restart after prune --all (image was pruned)"
         $SMOLVM machine delete --name default -f 2>/dev/null
         return 1
     }
-
-    local images_after
-    images_after=$($SMOLVM machine images --name default 2>&1)
+    $SMOLVM machine exec -- true 2>&1 || {
+        echo "FAIL: VM not reachable after prune + restart"
+        $SMOLVM machine delete --name default -f 2>/dev/null
+        return 1
+    }
 
     $SMOLVM machine stop 2>/dev/null || true
     $SMOLVM machine delete --name default -f 2>/dev/null || true
-
-    # After prune --all, no images should remain
-    if echo "$images_after" | grep -qE "^[a-z].*[0-9]+ MB"; then
-        echo "FAIL: images still present after prune --all"
-        echo "Before: $images_before"
-        echo "After: $images_after"
-        return 1
-    fi
 }
 
 test_storage_resize_and_large_pull() {
@@ -336,7 +329,7 @@ run_test "Images: does not stop running VM" test_images_does_not_stop_running_vm
 run_test "Prune: works on running VM without stopping it" test_prune_on_running_vm || true
 run_test "Prune --dry-run: works on running VM" test_prune_dry_run_on_running_vm || true
 run_test "Prune --all: refuses on running VM" test_prune_all_refuses_on_running_vm || true
-run_test "Prune --all: removes cached images" test_prune_all_removes_images || true
+run_test "Prune --all: keeps in-use image, machine still restarts" test_prune_all_keeps_in_use_image || true
 run_test "Storage: resize + large image pull (fresh disk)" test_storage_resize_and_large_pull || true
 run_test "Storage: /dev/vda mounted as ext4 with correct size" test_storage_mounted_as_ext4 || true
 
