@@ -167,7 +167,7 @@ struct AgentInner {
 /// `sockaddr_un.sun_path` limit (~104 bytes) applies to the full socket
 /// path, and a 16-char hash keeps that path bounded.
 ///
-/// Layout: `<cache_dir>/smolvm/vms/<hash16>/`
+/// Layout: `<data_dir>/smolvm/vms/<hash16>/`
 ///   - `<hash16>` = first 16 hex chars (8 bytes) of SHA-256 of the name
 ///   - A plaintext `name` file inside the directory records the original
 ///     name. This is load-bearing: [`ensure_vm_dir`] reads it to detect
@@ -209,10 +209,15 @@ pub fn machine_layers_cache_dir(name: &str) -> PathBuf {
     vm_data_dir(name).join("pack")
 }
 
-/// Cache root: `<cache_dir>/smolvm/vms/`.
+/// Root for persistent VM data: `<data_dir>/smolvm/vms/`.
+///
+/// Uses `XDG_DATA_HOME` (`~/.local/share`) because this contains
+/// *persistent* data — overlay disks, storage disks, config files,
+/// PID files — that must survive cache directory deletion. The XDG
+/// Base Directory Specification defines `~/.cache` as expendable.
 pub fn vm_cache_root() -> PathBuf {
-    dirs::cache_dir()
-        .or_else(dirs::data_local_dir)
+    dirs::data_local_dir()
+        .or_else(dirs::cache_dir)
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join("smolvm")
         .join("vms")
@@ -296,7 +301,7 @@ pub fn ensure_vm_dir_at(dir: &std::path::Path, name: &str) -> std::io::Result<Pa
 /// and command execution.
 ///
 /// Each VM gets its own agent with isolated paths under
-/// `~/.cache/smolvm/vms/{name}/` (socket, PID file, storage, overlay).
+/// `~/.local/share/smolvm/vms/{name}/` (socket, PID file, storage, overlay).
 pub struct AgentManager {
     /// VM name (None only for low-level `new()` callers; CLI always sets a name).
     name: Option<String>,
