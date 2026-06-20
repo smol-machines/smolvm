@@ -23,13 +23,16 @@
 //! Recommended: keep names short and descriptive (e.g., "dev-vm", "test-1").
 
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
     Json,
 };
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::agent::{vm_data_dir, AgentClient, AgentManager, HostMount};
+use crate::agent::{
+    vm_data_dir, AgentClient, AgentManager, HostMount, LaunchFeatures, VmResources,
+};
 use crate::api::error::ApiError;
 use crate::api::state::{
     vm_resources_to_spec, with_machine_client_traced, ApiState, MachineEntry, MachineRegistration,
@@ -1748,6 +1751,202 @@ pub async fn export_machine(
     }))
 }
 
+/// Guard for [`snapshot_machine`]: a machine is snapshottable iff it is
+/// image-based (the container overlay only exists for image machines; bare VMs
+/// persist via their overlay disk) and not currently running (the capture
+/// mounts its ext4 disk, which would corrupt a disk a live VMM holds open).
+/// Pure over the resolved state so the branches are unit-testable.
+fn check_snapshottable(name: &str, record: &VmRecord, state: RecordState) -> Result<(), ApiError> {
+    if record.image.is_none() {
+        return Err(ApiError::BadRequest(
+            "snapshot is only supported for image-based machines".into(),
+        ));
+    }
+    if state == RecordState::Running {
+        return Err(ApiError::Conflict(format!(
+            "machine '{}' must be stopped before snapshot (capture mounts its disk)",
+            name
+        )));
+    }
+    Ok(())
+}
+
+/// Capture a stopped image-machine's container overlay (the filesystem delta
+/// over its base image) and stream it back as a tar archive.
+///
+/// This is the node-side half of cloud machine snapshots (durability + fork):
+/// the control plane calls it through the driver, then uploads the bytes to
+/// object storage. We return ONLY the overlay delta — the base image is
+/// reproducible from the registry, so a snapshot is just the delta plus the
+/// recorded base-image pointer (kept in the control plane's
+/// `machine_snapshots` row).
+///
+/// Mechanism: the overlay's upper dir lives inside the machine's ext4 storage
+/// disk, which `serve` (running unprivileged) cannot host-mount. So we boot a
+/// short-lived helper VM with that disk attached as `/dev/vdc`, mount it inside
+/// the guest, and `tar` the overlay upper dir — the same idiom
+/// `pack create --from-vm` uses, minus the OCI-layer export.
+///
+/// The machine MUST be stopped (409 otherwise): the helper VM mounts the
+/// machine's ext4 disk, and doing that while the machine's own VMM still holds
+/// it open risks filesystem corruption.
+#[utoipa::path(
+    post,
+    path = "/api/v1/machines/{id}/snapshot",
+    tag = "Machines",
+    params(("id" = String, Path, description = "Machine name")),
+    responses(
+        (status = 200, description = "Overlay tar archive", content_type = "application/octet-stream"),
+        (status = 400, description = "Not an image-based machine"),
+        (status = 404, description = "Machine not found"),
+        (status = 409, description = "Machine is running (must be stopped)"),
+        (status = 500, description = "Capture failed")
+    )
+)]
+pub async fn snapshot_machine(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Result<Bytes, ApiError> {
+    let record = state
+        .db()
+        .get_vm(&id)
+        .map_err(ApiError::database)?
+        .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", id)))?;
+
+    // `actual_state()` probes liveness, so a machine the DB thinks is stopped
+    // but whose process is still alive is correctly rejected below.
+    check_snapshottable(&id, &record, record.actual_state())?;
+
+    let name = id.clone();
+    let tar = tokio::task::spawn_blocking(move || capture_overlay_blocking(&name))
+        .await
+        .map_err(|e| ApiError::internal(format!("snapshot task failed: {}", e)))??;
+
+    Ok(Bytes::from(tar))
+}
+
+/// Boot a short-lived helper VM, mount the source machine's storage disk, tar
+/// its container overlay upper dir, and return the tar bytes. A missing/empty
+/// overlay yields a valid empty (single `./` entry) archive rather than an
+/// error, so a never-modified machine still snapshots cleanly. The helper VM is
+/// always stopped and its data dir removed, even on error.
+fn capture_overlay_blocking(vm_name: &str) -> Result<Vec<u8>, ApiError> {
+    let storage_path = vm_data_dir(vm_name).join("storage.raw");
+    if !storage_path.exists() {
+        return Err(ApiError::NotFound(format!(
+            "machine '{}' has no storage disk to snapshot",
+            vm_name
+        )));
+    }
+
+    // Unique helper-VM name (pid + nanos); first char alphanumeric — same
+    // constraint the pack-from-vm path documents.
+    let helper_name = format!(
+        "snap-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let helper_data = vm_data_dir(&helper_name);
+
+    let manager = AgentManager::for_vm(&helper_name)
+        .map_err(|e| ApiError::internal(format!("helper VM manager: {}", e)))?;
+
+    // No network needed — we only mount + tar a local disk. The source storage
+    // disk is attached read-only as the 3rd block device (/dev/vdc), after the
+    // helper's own storage + overlay disks.
+    let features = LaunchFeatures {
+        extra_disks: vec![(storage_path.clone(), false)],
+        ..Default::default()
+    };
+    manager
+        .start_with_full_config(
+            Vec::new(),
+            Vec::new(),
+            VmResources {
+                cpus: 2,
+                memory_mib: 2048,
+                network: false,
+                network_backend: None,
+                gpu: false,
+                gpu_vram_mib: None,
+                storage_gib: None,
+                overlay_gib: None,
+                allowed_cidrs: None,
+            },
+            features,
+        )
+        .map_err(|e| ApiError::internal(format!("start helper VM: {}", e)))?;
+
+    // Closure so the helper VM is always stopped/cleaned, even on early error.
+    let result: Result<Vec<u8>, ApiError> = (|| {
+        let mut client = manager
+            .connect()
+            .map_err(|e| ApiError::internal(format!("connect helper VM: {}", e)))?;
+
+        // Mount the source storage disk (/dev/vdc) read-only.
+        let (code, _, stderr) = client
+            .vm_exec(
+                vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "mkdir -p /mnt/src && mount -o ro /dev/vdc /mnt/src".into(),
+                ],
+                vec![],
+                None,
+                None,
+                None,
+            )
+            .map_err(|e| ApiError::internal(format!("mount exec: {}", e)))?;
+        if code != 0 {
+            return Err(ApiError::internal(format!(
+                "mount source disk failed (exit {}): {}",
+                code,
+                String::from_utf8_lossy(&stderr)
+            )));
+        }
+
+        // Tar the container overlay upper dir. Missing/empty → tar an empty dir
+        // so the result is always a valid archive.
+        let upper = format!("/mnt/src/overlays/persistent-{}/upper", vm_name);
+        let script = format!(
+            "mkdir -p /tmp/empty && \
+             if [ -d '{u}' ]; then tar cf /tmp/snap.tar -C '{u}' . ; \
+             else tar cf /tmp/snap.tar -C /tmp/empty . ; fi",
+            u = upper
+        );
+        let (code, _, stderr) = client
+            .vm_exec(
+                vec!["sh".into(), "-c".into(), script],
+                vec![],
+                None,
+                None,
+                None,
+            )
+            .map_err(|e| ApiError::internal(format!("tar exec: {}", e)))?;
+        if code != 0 {
+            return Err(ApiError::internal(format!(
+                "tar overlay failed (exit {}): {}",
+                code,
+                String::from_utf8_lossy(&stderr)
+            )));
+        }
+
+        client
+            .read_file("/tmp/snap.tar")
+            .map_err(|e| ApiError::internal(format!("read snapshot tar: {}", e)))
+    })();
+
+    if let Err(e) = manager.stop() {
+        tracing::warn!(helper = %helper_name, error = %e, "failed to stop snapshot helper VM");
+    }
+    let _ = std::fs::remove_dir_all(&helper_data);
+
+    result
+}
+
 async fn pull_from_registry(
     registry_ref: &str,
     identity_token: Option<&str>,
@@ -1867,6 +2066,36 @@ mod tests {
             classify_launch_error("failed to start machine: kernel panic".to_string()),
             ApiError::Internal(_)
         ));
+    }
+
+    #[test]
+    fn check_snapshottable_rejects_bare_vm() {
+        // A bare VM has no container overlay to capture → BadRequest, even when
+        // stopped.
+        let record = VmRecord::new("bare".into(), 2, 1024, vec![], vec![], false);
+        let err = check_snapshottable("bare", &record, RecordState::Stopped).unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    #[test]
+    fn check_snapshottable_rejects_running_image_machine() {
+        // Capturing mounts the machine's ext4 disk, so a running machine must be
+        // refused with a 409 (not silently corrupt the live disk).
+        let mut record = VmRecord::new("img".into(), 2, 1024, vec![], vec![], false);
+        record.image = Some("alpine:3.20".into());
+        let err = check_snapshottable("img", &record, RecordState::Running).unwrap_err();
+        match err {
+            ApiError::Conflict(msg) => assert!(msg.contains("stopped"), "msg: {}", msg),
+            other => panic!("expected Conflict, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn check_snapshottable_accepts_stopped_image_machine() {
+        let mut record = VmRecord::new("img".into(), 2, 1024, vec![], vec![], false);
+        record.image = Some("alpine:3.20".into());
+        assert!(check_snapshottable("img", &record, RecordState::Stopped).is_ok());
+        assert!(check_snapshottable("img", &record, RecordState::Created).is_ok());
     }
 
     #[test]
