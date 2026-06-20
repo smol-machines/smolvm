@@ -26,7 +26,7 @@ pub mod supervisor;
 pub mod types;
 
 use axum::{
-    extract::Request,
+    extract::{DefaultBodyLimit, Request},
     http::{HeaderValue, StatusCode},
     middleware::{self, Next},
     response::Response,
@@ -92,6 +92,7 @@ use state::ApiState;
         handlers::machines::resize_machine,
         handlers::machines::export_machine,
         handlers::machines::snapshot_machine,
+        handlers::machines::restore_machine,
     ),
     components(schemas(
         // Request types
@@ -182,7 +183,16 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
             "/{id}/exec/interactive",
             get(handlers::exec::exec_interactive),
         )
-        .route("/{id}/snapshot", post(handlers::machines::snapshot_machine));
+        .route("/{id}/snapshot", post(handlers::machines::snapshot_machine))
+        // Restore seeds a machine's overlay from an uploaded snapshot tar; the
+        // body is the whole overlay archive, so lift the 2 MB default body limit
+        // (4 GiB cap). The listener is mTLS-gated in prod, so the caller is the
+        // trusted control plane.
+        .route(
+            "/{id}/restore",
+            post(handlers::machines::restore_machine)
+                .layer(DefaultBodyLimit::max(4 * 1024 * 1024 * 1024)),
+        );
 
     // Machine routes with timeout
     let machine_routes_with_timeout = Router::new()

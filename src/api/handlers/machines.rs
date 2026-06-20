@@ -1825,20 +1825,16 @@ pub async fn snapshot_machine(
     Ok(Bytes::from(tar))
 }
 
-/// Boot a short-lived helper VM, mount the source machine's storage disk, tar
-/// its container overlay upper dir, and return the tar bytes. A missing/empty
-/// overlay yields a valid empty (single `./` entry) archive rather than an
-/// error, so a never-modified machine still snapshots cleanly. The helper VM is
-/// always stopped and its data dir removed, even on error.
-fn capture_overlay_blocking(vm_name: &str) -> Result<Vec<u8>, ApiError> {
-    let storage_path = vm_data_dir(vm_name).join("storage.raw");
-    if !storage_path.exists() {
-        return Err(ApiError::NotFound(format!(
-            "machine '{}' has no storage disk to snapshot",
-            vm_name
-        )));
-    }
-
+/// Boot a short-lived, network-less helper VM with `storage_path` attached as
+/// the 3rd block device (`/dev/vdc`, after the helper's own storage + overlay
+/// disks). Used by both snapshot capture and restore to reach a stopped
+/// machine's ext4 storage disk that unprivileged `serve` can't host-mount.
+/// `read_only` sets the virtio-blk attachment mode. Returns the manager plus
+/// the helper's name + data dir so the caller can stop and clean it up.
+fn start_overlay_helper_vm(
+    storage_path: &std::path::Path,
+    read_only: bool,
+) -> Result<(AgentManager, String, std::path::PathBuf), ApiError> {
     // Unique helper-VM name (pid + nanos); first char alphanumeric — same
     // constraint the pack-from-vm path documents.
     let helper_name = format!(
@@ -1854,11 +1850,12 @@ fn capture_overlay_blocking(vm_name: &str) -> Result<Vec<u8>, ApiError> {
     let manager = AgentManager::for_vm(&helper_name)
         .map_err(|e| ApiError::internal(format!("helper VM manager: {}", e)))?;
 
-    // No network needed — we only mount + tar a local disk. The source storage
-    // disk is attached read-only as the 3rd block device (/dev/vdc), after the
-    // helper's own storage + overlay disks.
     let features = LaunchFeatures {
-        extra_disks: vec![(storage_path.clone(), false)],
+        extra_disks: vec![(
+            storage_path.to_path_buf(),
+            read_only,
+            crate::data::disk::DiskFormat::Raw,
+        )],
         ..Default::default()
     };
     manager
@@ -1872,13 +1869,36 @@ fn capture_overlay_blocking(vm_name: &str) -> Result<Vec<u8>, ApiError> {
                 network_backend: None,
                 gpu: false,
                 gpu_vram_mib: None,
+                cuda: false,
+                rosetta: false,
                 storage_gib: None,
                 overlay_gib: None,
                 allowed_cidrs: None,
+                dns: None,
             },
             features,
         )
         .map_err(|e| ApiError::internal(format!("start helper VM: {}", e)))?;
+
+    Ok((manager, helper_name, helper_data))
+}
+
+/// Boot a short-lived helper VM, mount the source machine's storage disk, tar
+/// its container overlay upper dir, and return the tar bytes. A missing/empty
+/// overlay yields a valid empty (single `./` entry) archive rather than an
+/// error, so a never-modified machine still snapshots cleanly. The helper VM is
+/// always stopped and its data dir removed, even on error.
+fn capture_overlay_blocking(vm_name: &str) -> Result<Vec<u8>, ApiError> {
+    let storage_path = vm_data_dir(vm_name).join("storage.raw");
+    if !storage_path.exists() {
+        return Err(ApiError::NotFound(format!(
+            "machine '{}' has no storage disk to snapshot",
+            vm_name
+        )));
+    }
+
+    // Capture never writes the source disk → attach it read-only.
+    let (manager, helper_name, helper_data) = start_overlay_helper_vm(&storage_path, true)?;
 
     // Closure so the helper VM is always stopped/cleaned, even on early error.
     let result: Result<Vec<u8>, ApiError> = (|| {
@@ -1941,6 +1961,150 @@ fn capture_overlay_blocking(vm_name: &str) -> Result<Vec<u8>, ApiError> {
 
     if let Err(e) = manager.stop() {
         tracing::warn!(helper = %helper_name, error = %e, "failed to stop snapshot helper VM");
+    }
+    let _ = std::fs::remove_dir_all(&helper_data);
+
+    result
+}
+
+/// Seed a stopped image-machine's container overlay from a snapshot tar (the
+/// inverse of [`snapshot_machine`]).
+///
+/// This is the restore/fork half of cloud machine snapshots: the control plane
+/// downloads a snapshot's overlay bytes from object storage and POSTs them here
+/// to seed the machine's persistent overlay BEFORE its first boot. On the next
+/// start, the agent's overlay setup finds the existing upper layer and remounts
+/// it (preserving the restored state) instead of creating a blank overlay. For
+/// **rehydrate**, the target is a freshly-rescheduled machine; for **fork**, a
+/// brand-new machine with its own identity — both reduce to seeding
+/// `overlays/persistent-{id}/upper`.
+///
+/// Same constraints as snapshot: image-based (400 for bare) and stopped (409),
+/// since the helper VM mounts the machine's ext4 disk read-write.
+#[utoipa::path(
+    post,
+    path = "/api/v1/machines/{id}/restore",
+    tag = "Machines",
+    request_body(content = Vec<u8>, description = "Overlay tar archive", content_type = "application/octet-stream"),
+    params(("id" = String, Path, description = "Machine name")),
+    responses(
+        (status = 200, description = "Overlay restored"),
+        (status = 400, description = "Not an image-based machine"),
+        (status = 404, description = "Machine not found"),
+        (status = 409, description = "Machine is running (must be stopped)"),
+        (status = 500, description = "Restore failed")
+    )
+)]
+pub async fn restore_machine(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let record = state
+        .db()
+        .get_vm(&id)
+        .map_err(ApiError::database)?
+        .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", id)))?;
+
+    check_snapshottable(&id, &record, record.actual_state())?;
+
+    let name = id.clone();
+    let tar = body.to_vec();
+    let bytes = tar.len() as u64;
+    tokio::task::spawn_blocking(move || apply_overlay_blocking(&name, tar))
+        .await
+        .map_err(|e| ApiError::internal(format!("restore task failed: {}", e)))??;
+
+    Ok(Json(
+        serde_json::json!({ "restored": true, "id": id, "bytes": bytes }),
+    ))
+}
+
+/// Boot a helper VM, mount the source machine's storage disk read-write, and
+/// untar `tar` into a fresh `overlays/persistent-{vm_name}/upper`, replacing any
+/// prior overlay state. Syncs + unmounts inside the guest before stopping so the
+/// write reaches the host disk image. The helper VM is always stopped and its
+/// data dir removed, even on error.
+fn apply_overlay_blocking(vm_name: &str, tar: Vec<u8>) -> Result<(), ApiError> {
+    let storage_path = vm_data_dir(vm_name).join("storage.raw");
+    if !storage_path.exists() {
+        return Err(ApiError::NotFound(format!(
+            "machine '{}' has no storage disk to restore into",
+            vm_name
+        )));
+    }
+
+    // Restore writes the source disk → attach it read-write.
+    let (manager, helper_name, helper_data) = start_overlay_helper_vm(&storage_path, false)?;
+
+    let result: Result<(), ApiError> = (|| {
+        let mut client = manager
+            .connect()
+            .map_err(|e| ApiError::internal(format!("connect helper VM: {}", e)))?;
+
+        // Mount the source storage disk (/dev/vdc) read-write.
+        let (code, _, stderr) = client
+            .vm_exec(
+                vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "mkdir -p /mnt/src && mount /dev/vdc /mnt/src".into(),
+                ],
+                vec![],
+                None,
+                None,
+                None,
+            )
+            .map_err(|e| ApiError::internal(format!("mount exec: {}", e)))?;
+        if code != 0 {
+            return Err(ApiError::internal(format!(
+                "mount source disk failed (exit {}): {}",
+                code,
+                String::from_utf8_lossy(&stderr)
+            )));
+        }
+
+        // Push the snapshot tar into the helper VM (auto-chunked over vsock).
+        client
+            .write_file("/tmp/restore.tar", &tar, None)
+            .map_err(|e| ApiError::internal(format!("write restore tar: {}", e)))?;
+
+        // Replace the persistent overlay's upper dir with the snapshot contents.
+        // Removing the whole overlay root first guarantees the agent's overlay
+        // setup takes the "existing upper → remount preserving it" path (not a
+        // stale-merged-mount reuse) on the next start. `work`/`merged` are
+        // recreated by the agent at mount time. sync + umount so the write lands
+        // on the host disk image before the helper VM is torn down.
+        let overlay_root = format!("/mnt/src/overlays/persistent-{}", vm_name);
+        let script = format!(
+            "set -e; \
+             rm -rf '{root}'; \
+             mkdir -p '{root}/upper'; \
+             tar xf /tmp/restore.tar -C '{root}/upper'; \
+             sync; umount /mnt/src",
+            root = overlay_root
+        );
+        let (code, _, stderr) = client
+            .vm_exec(
+                vec!["sh".into(), "-c".into(), script],
+                vec![],
+                None,
+                None,
+                None,
+            )
+            .map_err(|e| ApiError::internal(format!("untar exec: {}", e)))?;
+        if code != 0 {
+            return Err(ApiError::internal(format!(
+                "apply overlay failed (exit {}): {}",
+                code,
+                String::from_utf8_lossy(&stderr)
+            )));
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = manager.stop() {
+        tracing::warn!(helper = %helper_name, error = %e, "failed to stop restore helper VM");
     }
     let _ = std::fs::remove_dir_all(&helper_data);
 
