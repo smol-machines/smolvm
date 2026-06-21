@@ -547,6 +547,13 @@ pub struct MachineInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = 128)]
     pub rss_mb: Option<u64>,
+    /// Actual host disk consumed by this machine's data dir, in MiB (real blocks of
+    /// the sparse disk images, not provisioned capacity). An instantaneous gauge the
+    /// control integrates over time for active-disk billing. Omitted when the data
+    /// dir can't be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 256)]
+    pub disk_used_mb: Option<u64>,
     /// Creation timestamp (seconds since Unix epoch).
     pub created_at: u64,
 }

@@ -181,6 +181,43 @@ pub fn vm_data_dir(name: &str) -> PathBuf {
     vm_cache_root().join(vm_dir_hash(name))
 }
 
+/// Actual host disk consumed by a machine's data dir, in MiB. Sums *real blocks*
+/// (`st_blocks × 512`), not apparent file lengths — the disk images are sparse, so
+/// a 20 GiB image that the guest has barely written to consumes only a few MiB.
+/// This is the gauge the control integrates over time for active-disk billing.
+/// `None` if the dir can't be read (machine gone / not yet created).
+#[cfg(target_os = "linux")]
+pub fn disk_used_mb(name: &str) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    fn walk_blocks(dir: &Path) -> u64 {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        let mut total = 0u64;
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() {
+                total = total.saturating_add(walk_blocks(&entry.path()));
+            } else {
+                // st_blocks is in 512-byte units regardless of the fs block size.
+                total = total.saturating_add(meta.blocks().saturating_mul(512));
+            }
+        }
+        total
+    }
+    let dir = vm_data_dir(name);
+    if !dir.exists() {
+        return None;
+    }
+    Some(walk_blocks(&dir) / (1024 * 1024))
+}
+
+/// macOS host has no VMs (dev stub) — no disk to measure.
+#[cfg(not(target_os = "linux"))]
+pub fn disk_used_mb(_name: &str) -> Option<u64> {
+    None
+}
+
 /// Resolve the on-disk image for a `.raw` disk filename in `dir`. A fork clone
 /// has a `.qcow2` copy-on-write overlay in place of the raw disk, so prefer that
 /// when present; otherwise fall back to the raw disk. The file on disk is the

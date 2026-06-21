@@ -127,6 +127,9 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
         rss_mb: pid
             .and_then(crate::process::process_stats)
             .map(|s| s.rss_bytes / (1024 * 1024)),
+        // Actual used disk (sparse-image blocks) — a gauge for active-disk billing,
+        // measured from the data dir regardless of whether the VMM is running.
+        disk_used_mb: crate::agent::disk_used_mb(name),
         created_at: record.created_at,
     }
 }
