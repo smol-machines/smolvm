@@ -98,8 +98,14 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
         network: record.network,
         network_backend: record.network_backend,
         allowed_cidrs: record.allowed_cidrs.clone(),
-        storage_gb: record.storage_gb,
-        overlay_gb: record.overlay_gb,
+        // Report the RESOLVED provisioned disk sizes, not the request echo: a
+        // machine created without an explicit size still gets a real disk at the
+        // node default, and billing/telemetry need the actual allocated GiB, not
+        // `None`. `open_or_create` provisions every VM a storage disk at
+        // `DEFAULT_STORAGE_SIZE_GIB` (and an overlay at `DEFAULT_OVERLAY_SIZE_GIB`)
+        // when unset.
+        storage_gb: Some(record.storage_gb.unwrap_or(DEFAULT_STORAGE_SIZE_GIB)),
+        overlay_gb: Some(record.overlay_gb.unwrap_or(DEFAULT_OVERLAY_SIZE_GIB)),
         created_at: record.created_at,
     }
 }
@@ -1413,6 +1419,11 @@ mod tests {
         assert!(!info.network);
         assert!(info.pid.is_none());
         assert!(info.created_at > 0);
+        // A machine created without explicit disk sizes still reports the RESOLVED
+        // provisioned sizes (the node default), not None — billing/telemetry need
+        // the actual allocated GiB.
+        assert_eq!(info.storage_gb, Some(DEFAULT_STORAGE_SIZE_GIB));
+        assert_eq!(info.overlay_gb, Some(DEFAULT_OVERLAY_SIZE_GIB));
     }
 
     #[test]
