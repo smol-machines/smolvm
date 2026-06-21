@@ -117,6 +117,11 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
         cpu_seconds: pid
             .and_then(crate::process::process_stats)
             .map(|s| s.cpu_time_ns / 1_000_000_000),
+        // Current RSS (MiB) of the VMM process — an instantaneous gauge the
+        // control plane integrates over time for active-memory billing.
+        rss_mb: pid
+            .and_then(crate::process::process_stats)
+            .map(|s| s.rss_bytes / (1024 * 1024)),
         created_at: record.created_at,
     }
 }

@@ -1097,11 +1097,12 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
     // Live consumed CPU-seconds for the VMM child (host-sampled, resets on
     // restart); the control plane accumulates the durable total. None when there
     // is no live process to sample.
-    let cpu_seconds = entry
+    let stats = entry
         .manager
         .child_pid()
-        .and_then(crate::process::process_stats)
-        .map(|s| s.cpu_time_ns / 1_000_000_000);
+        .and_then(crate::process::process_stats);
+    let cpu_seconds = stats.map(|s| s.cpu_time_ns / 1_000_000_000);
+    let rss_mb = stats.map(|s| s.rss_bytes / (1024 * 1024));
 
     MachineInfo {
         name,
@@ -1128,6 +1129,7 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
         overlay_gb: entry.resources.overlay_gb,
         egress_bytes,
         cpu_seconds,
+        rss_mb,
         created_at: 0,
     }
 }

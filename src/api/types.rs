@@ -533,6 +533,13 @@ pub struct MachineInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = 42)]
     pub cpu_seconds: Option<u64>,
+    /// Current resident memory (RSS) of the machine's VMM process, in MiB, sampled
+    /// live from the host. Unlike CPU this is an instantaneous gauge (not a
+    /// counter); the control plane integrates it over time for active-memory
+    /// billing. Omitted for stopped machines (no live process to sample).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 128)]
+    pub rss_mb: Option<u64>,
     /// Creation timestamp (seconds since Unix epoch).
     pub created_at: u64,
 }
