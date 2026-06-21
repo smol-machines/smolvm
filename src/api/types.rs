@@ -533,6 +533,13 @@ pub struct MachineInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = 42)]
     pub cpu_seconds: Option<u64>,
+    /// Same consumed CPU but in MILLISECONDS — sub-second precision so consumers
+    /// integrating this don't quantize a barely-busy process up to a whole second.
+    /// Derived from the same nanosecond sample as `cpu_seconds`. Omitted for
+    /// stopped machines (no live process to sample).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 42830)]
+    pub cpu_millis: Option<u64>,
     /// Current resident memory (RSS) of the machine's VMM process, in MiB, sampled
     /// live from the host. Unlike CPU this is an instantaneous gauge (not a
     /// counter); the control plane integrates it over time for active-memory

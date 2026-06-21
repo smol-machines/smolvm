@@ -1102,6 +1102,7 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
         .child_pid()
         .and_then(crate::process::process_stats);
     let cpu_seconds = stats.map(|s| s.cpu_time_ns / 1_000_000_000);
+    let cpu_millis = stats.map(|s| s.cpu_time_ns / 1_000_000);
     let rss_mb = stats.map(|s| s.rss_bytes / (1024 * 1024));
 
     MachineInfo {
@@ -1129,6 +1130,7 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
         overlay_gb: entry.resources.overlay_gb,
         egress_bytes,
         cpu_seconds,
+        cpu_millis,
         rss_mb,
         created_at: 0,
     }
