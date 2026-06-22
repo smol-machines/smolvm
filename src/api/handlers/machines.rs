@@ -1070,19 +1070,34 @@ pub async fn delete_machine(
         )));
     }
 
-    // Remove from registry (in-memory + database)
-    match state.remove_machine(&name) {
-        Ok(_) => {}
-        Err(ApiError::NotFound(_)) => {
-            // Machine exists in DB but not in registry (startup recovery case).
-            // Remove directly from DB.
-            let removed = db.remove_vm(&name).map_err(ApiError::database)?;
-            if removed.is_none() {
-                return Err(ApiError::NotFound(format!("machine '{}' not found", name)));
+    // Remove from registry (in-memory + database) in a blocking task: the DB
+    // delete is synchronous disk I/O and must not run on an async worker thread,
+    // where it would starve the small per-node reactor under delete churn.
+    let state_rm = state.clone();
+    let name_rm = name.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), ApiError> {
+        match state_rm.remove_machine(&name_rm) {
+            Ok(_) => Ok(()),
+            Err(ApiError::NotFound(_)) => {
+                // Machine exists in DB but not in registry (startup recovery case).
+                // Remove directly from DB.
+                let removed = state_rm
+                    .db()
+                    .remove_vm(&name_rm)
+                    .map_err(ApiError::database)?;
+                if removed.is_none() {
+                    return Err(ApiError::NotFound(format!(
+                        "machine '{}' not found",
+                        name_rm
+                    )));
+                }
+                Ok(())
             }
+            Err(e) => Err(e),
         }
-        Err(e) => return Err(e),
-    }
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("task error: {}", e)))??;
 
     // Remove VM data directory (disk images, sockets, etc.)
     let data_dir = vm_data_dir(&name);

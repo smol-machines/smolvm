@@ -348,19 +348,27 @@ impl ApiState {
     }
 
     /// Remove a machine from the registry (also removes from database).
+    ///
+    /// Must NOT hold the registry write lock across the DB delete: `db.remove_vm`
+    /// is synchronous disk I/O (SQLite, which under churn waits on `busy_timeout`),
+    /// and spanning it with the write lock blocks every reader — including the
+    /// `/health` probe (`machine_counts` takes `machines.read()`). Under delete
+    /// churn on a small (2-core) worker that wedges the whole node: the reactor's
+    /// threads park on the registry lock and can no longer `accept()`. The real
+    /// per-machine mutual exclusion is the caller's `lifecycle_lock` (held across
+    /// the entire start/stop/delete), so releasing the registry lock between the
+    /// existence check, the DB delete, and the in-memory remove is safe.
     pub fn remove_machine(
         &self,
         name: &str,
     ) -> Result<Arc<parking_lot::Mutex<MachineEntry>>, ApiError> {
-        // Hold write lock across the entire operation to prevent concurrent
-        // delete races (check + DB delete + in-memory remove must be atomic).
-        let mut machines = self.machines.write();
-
-        if !machines.contains_key(name) {
+        // Existence check under a brief read lock (released immediately).
+        if !self.machines.read().contains_key(name) {
             return Err(ApiError::NotFound(format!("machine '{}' not found", name)));
         }
 
-        // Remove from database first — if this fails, in-memory state stays consistent
+        // Remove from the database first, WITHOUT the registry lock held — if this
+        // fails, in-memory state stays consistent (the entry is still in the map).
         match self.db.remove_vm(name) {
             Ok(Some(_)) => {} // expected: row existed and was deleted
             Ok(None) => {
@@ -377,12 +385,14 @@ impl ApiState {
             }
         }
 
-        // Remove from in-memory registry (guaranteed to succeed — we hold the write lock)
-        let entry = machines
+        // Brief write lock: swap the entry out of the registry (O(1)). If a
+        // concurrent path already removed it, degrade to NotFound rather than
+        // panicking — correctness for the same name is guaranteed by the caller's
+        // lifecycle lock, so this only fires on misuse.
+        self.machines
+            .write()
             .remove(name)
-            .expect("machine disappeared while holding write lock");
-
-        Ok(entry)
+            .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))
     }
 
     /// Update machine state in database (call after start/stop).
@@ -1200,6 +1210,63 @@ mod tests {
         ));
         assert!(matches!(
             state.remove_machine("nope"),
+            Err(ApiError::NotFound(_))
+        ));
+    }
+
+    // remove_machine must clear BOTH the DB row and the in-memory registry entry
+    // even though it no longer holds the registry write lock across the DB delete
+    // (the reorder that keeps `/health` from wedging under delete churn).
+    #[test]
+    fn test_remove_machine_clears_db_and_registry() {
+        let (_dir, state) = temp_api_state();
+
+        // Put a machine in BOTH the DB and the in-memory registry.
+        let record = VmRecord::new("remove-test-m1".into(), 1, 512, vec![], vec![], false);
+        state.db.insert_vm("remove-test-m1", &record).unwrap();
+        let manager = AgentManager::for_vm("remove-test-m1").unwrap();
+        state.insert_machine(
+            "remove-test-m1",
+            MachineEntry {
+                manager,
+                mounts: vec![],
+                ports: vec![],
+                resources: ResourceSpec {
+                    cpus: None,
+                    memory_mb: None,
+                    network: None,
+                    gpu: None,
+                    storage_gb: None,
+                    overlay_gb: None,
+                    allowed_cidrs: None,
+                    network_backend: None,
+                },
+                restart: RestartConfig::default(),
+                network: false,
+                secret_refs: Default::default(),
+                source_smolmachine: None,
+            },
+        );
+
+        // Remove succeeds and returns the entry.
+        assert!(state.remove_machine("remove-test-m1").is_ok());
+
+        // Gone from BOTH stores.
+        assert!(
+            state.db.get_vm("remove-test-m1").unwrap().is_none(),
+            "DB row should be deleted"
+        );
+        assert!(
+            matches!(
+                state.get_machine("remove-test-m1"),
+                Err(ApiError::NotFound(_))
+            ),
+            "registry entry should be removed"
+        );
+
+        // Second remove → NotFound, not a panic.
+        assert!(matches!(
+            state.remove_machine("remove-test-m1"),
             Err(ApiError::NotFound(_))
         ));
     }
