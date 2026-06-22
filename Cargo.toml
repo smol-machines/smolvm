@@ -12,7 +12,7 @@ resolver = "2"
 
 [package]
 name = "smolvm"
-version = "1.1.2"
+version = "1.1.3"
 edition = "2021"
 description = "OCI-native microVM runtime"
 license = "Apache-2.0"
@@ -29,11 +29,11 @@ name = "smolvm"
 path = "src/main.rs"
 
 [dependencies]
-smolvm-network = { path = "crates/smolvm-network", version = "1.1.2" }
-smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.1.2" }
-smolvm-pack = { path = "crates/smolvm-pack", version = "1.1.2" }
-smolvm-registry = { path = "crates/smolvm-registry", version = "1.1.2" }
-smolfile = { path = "crates/smolvm-smolfile", version = "1.1.2" }
+smolvm-network = { path = "crates/smolvm-network", version = "1.1.3" }
+smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.1.3" }
+smolvm-pack = { path = "crates/smolvm-pack", version = "1.1.3" }
+smolvm-registry = { path = "crates/smolvm-registry", version = "1.1.3" }
+smolfile = { path = "crates/smolvm-smolfile", version = "1.1.3" }
 thiserror = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
@@ -89,7 +89,7 @@ landlock = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
-smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.1.2" }
+smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.1.3" }
 regex = "1"
 
 [build-dependencies]
