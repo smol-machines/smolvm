@@ -1,0 +1,69 @@
+name: Build libkrun (linux, glibc 2.35)
+
+# Rebuild the bundled linux libkrun.so on ubuntu-22.04 so its glibc floor is
+# 2.35 — the same floor the release binaries get (they also build on 22.04, see
+# release.yml). A libkrun built on a newer distro (e.g. Ubuntu 24.04 / glibc
+# 2.39) loads fine there but fails on 22.04 with "GLIBC_2.39 not found", which is
+# exactly how a hand-built lib slipped a 2.39 floor into v1.2.0.
+#
+# SKIP_LIBKRUNFW=1: reuse the committed lib/linux-<arch>/libkrunfw.so (it wraps a
+# guest-kernel blob, floor GLIBC_2.2 — host-glibc-independent), so we skip the
+# multi-minute kernel rebuild and only recompile libkrun itself.
+#
+# Dispatch-only. Uploads lib/linux-<arch>/ as an artifact; the rebuilt .so is
+# then committed into the repo (git-LFS) and shipped in the next release.
+
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: Which arch(es) to build
+        type: choice
+        options: [both, x86_64, aarch64]
+        default: both
+
+jobs:
+  build:
+    name: libkrun ${{ matrix.arch }}
+    if: ${{ inputs.arch == 'both' || inputs.arch == matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive   # libkrun links against the libkrunfw source
+          lfs: true               # committed libkrunfw.so reused under SKIP_LIBKRUNFW
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+          df -h / | tail -1
+
+      - name: Build libkrun (SKIP_LIBKRUNFW, GPU=1)
+        run: SKIP_LIBKRUNFW=1 GPU=1 ./scripts/build-libkrun-linux.sh
+
+      - name: Assert glibc floor <= 2.35
+        run: |
+          so="lib/linux-${{ matrix.arch }}/libkrun.so"
+          maxv=$(objdump -T "$so" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' \
+            | sed 's/GLIBC_//' | sort -V | tail -1)
+          echo "max GLIBC required by $so: ${maxv:-none}"
+          if [ -n "$maxv" ] && [ "$(printf '%s\n2.35\n' "$maxv" | sort -V | tail -1)" != "2.35" ]; then
+            echo "::error::$so requires glibc $maxv (> 2.35) — floor not lowered"
+            exit 1
+          fi
+          echo "OK: glibc floor is <= 2.35"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libkrun-linux-${{ matrix.arch }}
+          path: lib/linux-${{ matrix.arch }}/
+          if-no-files-found: error
