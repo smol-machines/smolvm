@@ -27,6 +27,41 @@ pub fn parse_gpu_vram_mib(s: &str) -> Result<u32, String> {
     Ok(v)
 }
 
+/// Parse a byte size like `16GiB`, `16G`, `512M`, or a plain byte count
+/// (`17179869184`). Suffixes are binary (1K = 1024); `K/M/G/T`, optionally with
+/// a trailing `i` and/or `B`, are accepted case-insensitively. Used for
+/// `--max-image-size`.
+pub fn parse_size_bytes(s: &str) -> Result<u64, String> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Err("size must not be empty".to_string());
+    }
+    let split = t
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(t.len());
+    let (num, unit) = t.split_at(split);
+    let value: f64 = num
+        .parse()
+        .map_err(|_| format!("'{s}' is not a valid size (expected a number, optional K/M/G/T)"))?;
+    let mult: u64 = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "ki" | "kib" | "kb" => 1 << 10,
+        "m" | "mi" | "mib" | "mb" => 1 << 20,
+        "g" | "gi" | "gib" | "gb" => 1 << 30,
+        "t" | "ti" | "tib" | "tb" => 1u64 << 40,
+        other => {
+            return Err(format!(
+                "invalid size unit '{other}' in '{s}' (use K, M, G, or T)"
+            ))
+        }
+    };
+    let bytes = (value * mult as f64) as u64;
+    if bytes == 0 {
+        return Err(format!("size '{s}' must be greater than zero"));
+    }
+    Ok(bytes)
+}
+
 /// Parse and validate an image reference. Rejects empty/whitespace-only
 /// values at CLI parse time so `--image ""` errors immediately instead of
 /// creating an unusable machine that only fails once the VM starts.
@@ -238,5 +273,22 @@ mod tests {
         let from_record =
             record_mounts_to_runconfig_bindings(&[("/tmp".to_string(), "/app".to_string(), true)]);
         assert_eq!(from_parsed, from_record);
+    }
+
+    #[test]
+    fn parse_size_bytes_units_and_errors() {
+        assert_eq!(parse_size_bytes("1024"), Ok(1024));
+        assert_eq!(parse_size_bytes("16GiB"), Ok(16 * 1024 * 1024 * 1024));
+        assert_eq!(parse_size_bytes("16G"), Ok(16 * 1024 * 1024 * 1024));
+        assert_eq!(parse_size_bytes("512M"), Ok(512 * 1024 * 1024));
+        assert_eq!(parse_size_bytes("2k"), Ok(2048));
+        assert_eq!(
+            parse_size_bytes("1.5G"),
+            Ok(1024 * 1024 * 1024 + 512 * 1024 * 1024)
+        );
+        assert!(parse_size_bytes("").is_err());
+        assert!(parse_size_bytes("0").is_err());
+        assert!(parse_size_bytes("abc").is_err());
+        assert!(parse_size_bytes("10X").is_err());
     }
 }

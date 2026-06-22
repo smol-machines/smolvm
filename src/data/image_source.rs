@@ -139,9 +139,21 @@ pub enum ResolvedImage {
 }
 
 /// Largest archive accepted. The staged copy plus the guest's flattened rootfs
-/// both consume disk, so this guards against runaway/hostile inputs while still
-/// covering very large dev images.
-const MAX_ARCHIVE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// both consume disk, so the default guards against runaway/hostile inputs while
+/// still covering very large dev images.
+///
+/// Override with `SMOLVM_MAX_IMAGE_BYTES` (in bytes), or per-invocation with the
+/// `--max-image-size` flag on `machine run`/`machine create` (which sets that
+/// env var). A legitimate large image is a valid reason to raise it; the cap
+/// only exists to bound disk use for untrusted inputs.
+pub fn max_archive_bytes() -> u64 {
+    const DEFAULT: u64 = 8 * 1024 * 1024 * 1024;
+    std::env::var("SMOLVM_MAX_IMAGE_BYTES")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT)
+}
 /// Streaming hash/copy buffer.
 const COPY_CHUNK: usize = 1 << 20;
 /// Filename the staged archive is stored under inside its cache dir.
@@ -220,7 +232,7 @@ fn stage_from_file(path: &Path, cache_base: &Path) -> Result<String> {
             ),
         ));
     }
-    if meta.len() > MAX_ARCHIVE_BYTES {
+    if meta.len() > max_archive_bytes() {
         return Err(too_large(meta.len()));
     }
     let hash = hash_file(path)?;
@@ -246,7 +258,7 @@ fn stage_from_stdin(cache_base: &Path) -> Result<String> {
             break;
         }
         total += n as u64;
-        if total > MAX_ARCHIVE_BYTES {
+        if total > max_archive_bytes() {
             return Err(too_large(total));
         }
         hasher.update(&buf[..n]);
@@ -316,9 +328,14 @@ fn archive_cache_base() -> Result<PathBuf> {
 }
 
 fn too_large(bytes: u64) -> Error {
+    let limit = max_archive_bytes();
     Error::config(
         "--image",
-        format!("image archive is {bytes} bytes, over the {MAX_ARCHIVE_BYTES}-byte limit"),
+        format!(
+            "image archive is {bytes} bytes, over the {limit}-byte limit. \
+             Raise it with --max-image-size (e.g. --max-image-size 16GiB) or the \
+             SMOLVM_MAX_IMAGE_BYTES env var if this is a legitimate large image."
+        ),
     )
 }
 

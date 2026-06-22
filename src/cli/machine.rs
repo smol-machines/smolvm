@@ -293,6 +293,13 @@ pub struct RunCmd {
     #[arg(short = 'I', long, value_name = "IMAGE", value_parser = parse_image)]
     pub image: Option<String>,
 
+    /// Raise the max accepted local image-archive size (e.g. 16GiB, 512M, or a
+    /// raw byte count); default 8GiB. For legitimately large images — sets
+    /// SMOLVM_MAX_IMAGE_BYTES for this run.
+    #[arg(long = "max-image-size", value_name = "SIZE",
+          value_parser = crate::cli::parsers::parse_size_bytes, help_heading = "Execution")]
+    pub max_image_size: Option<u64>,
+
     /// Run a packed `.smolmachine` artifact ephemerally (the VM is discarded on
     /// exit) — the one-shot equivalent of `machine create --from … + start`.
     /// CPU/memory fall back to the artifact's baked manifest unless overridden.
@@ -458,6 +465,12 @@ pub struct RunCmd {
 impl RunCmd {
     pub fn run(self) -> smolvm::Result<()> {
         use smolvm::Error;
+
+        // --max-image-size raises the archive cap for this invocation by setting
+        // the env var the resolver reads (image_source::max_archive_bytes).
+        if let Some(bytes) = self.max_image_size {
+            std::env::set_var("SMOLVM_MAX_IMAGE_BYTES", bytes.to_string());
+        }
 
         // `--from`: run a packed .smolmachine artifact ephemerally, reusing the
         // proven pack-run path. Resource flags fall back to the artifact's baked
@@ -1585,6 +1598,13 @@ pub struct CreateCmd {
     #[arg(short = 'I', long, value_name = "IMAGE", value_parser = parse_image)]
     pub image: Option<String>,
 
+    /// Raise the max accepted local image-archive size (e.g. 16GiB, 512M, or a
+    /// raw byte count); default 8GiB. For legitimately large images — sets
+    /// SMOLVM_MAX_IMAGE_BYTES for this run.
+    #[arg(long = "max-image-size", value_name = "SIZE",
+          value_parser = crate::cli::parsers::parse_size_bytes)]
+    pub max_image_size: Option<u64>,
+
     /// Number of virtual CPUs
     #[arg(long, default_value_t = DEFAULT_MICROVM_CPU_COUNT, value_name = "N")]
     pub cpus: u8,
@@ -1691,6 +1711,11 @@ pub struct CreateCmd {
 
 impl CreateCmd {
     pub fn run(self) -> smolvm::Result<()> {
+        // --max-image-size raises the archive cap for this invocation by setting
+        // the env var the resolver reads (image_source::max_archive_bytes).
+        if let Some(bytes) = self.max_image_size {
+            std::env::set_var("SMOLVM_MAX_IMAGE_BYTES", bytes.to_string());
+        }
         // Branch for --from: create machine from .smolmachine artifact.
         if let Some(ref sidecar_path) = self.from {
             return self.run_from_smolmachine(sidecar_path);
