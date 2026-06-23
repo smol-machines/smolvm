@@ -831,17 +831,6 @@ impl RunCmd {
             params.secret_refs.insert(key, r);
         }
 
-        // Warn when caching is explicitly disabled but there's init to run: the
-        // un-baked ephemeral path runs init, but its filesystem changes are not
-        // reliably visible to the workload, so init may appear to "do nothing".
-        if self.no_init_cache && !self.detach && params.image.is_some() && !params.init.is_empty() {
-            eprintln!(
-                "warning: --no-init-cache skips baking init into a reusable layer. init still \
-                 runs, but in an un-baked ephemeral run its changes may not reach the workload. \
-                 Drop --no-init-cache to bake init once and reuse it."
-            );
-        }
-
         // Init-layer cache (prototype): for an ephemeral run of an IMAGE with `init`
         // commands, bake `image + init` once into a cached `.smolmachine` and run from
         // that artifact, so init's cost (e.g. `apt install`) is paid once and reused
@@ -1299,6 +1288,10 @@ impl RunCmd {
                     guard.disarm();
                 }
 
+                // Use the machine's persistent overlay so the foreground workload
+                // sees init's filesystem changes (init ran with the same overlay id).
+                // Without this the workload runs in a fresh overlay and init appears
+                // to "do nothing" (e.g. `apt install`ed binaries are missing).
                 let exit_code = if interactive || tty {
                     let config = RunConfig::new(img, command)
                         .with_env(defaults.env.clone())
@@ -1306,7 +1299,8 @@ impl RunCmd {
                         .with_user(defaults.user.clone())
                         .with_mounts(mount_bindings)
                         .with_timeout(self.timeout)
-                        .with_tty(tty);
+                        .with_tty(tty)
+                        .with_persistent_overlay(Some(vm_name.clone()));
                     client.run_interactive(config)?
                 } else {
                     let config = RunConfig::new(img, command)
@@ -1314,7 +1308,8 @@ impl RunCmd {
                         .with_workdir(defaults.workdir)
                         .with_user(defaults.user)
                         .with_mounts(mount_bindings)
-                        .with_timeout(self.timeout);
+                        .with_timeout(self.timeout)
+                        .with_persistent_overlay(Some(vm_name.clone()));
                     let (exit_code, stdout, stderr) = client.run_non_interactive(config)?;
                     if !stdout.is_empty() {
                         let _ = std::io::stdout().write_all(&stdout);
