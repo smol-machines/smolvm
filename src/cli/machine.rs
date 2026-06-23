@@ -1836,6 +1836,30 @@ impl CreateCmd {
         let footer = smolvm_pack::packer::read_footer_from_sidecar(sidecar_path)
             .map_err(|e| smolvm::Error::agent("read sidecar footer", e.to_string()))?;
 
+        // A VM-mode pack (`--from-vm`) carries the source VM's overlay+storage
+        // DISKS (the real rootfs), not OCI layers. Capture the templates before
+        // `manifest` is moved into `params`; the disks are seeded from them after
+        // extraction below, or the machine boots the bare agent-rootfs with no
+        // /bin/sh (mirrors pack_run + the serve API create path).
+        let vm_seed: Option<(Option<String>, Option<String>, Option<u64>)> =
+            if manifest.mode == smolvm_pack::format::PackMode::Vm {
+                Some((
+                    manifest
+                        .assets
+                        .overlay_template
+                        .as_ref()
+                        .map(|t| t.path.clone()),
+                    manifest
+                        .assets
+                        .storage_template
+                        .as_ref()
+                        .map(|t| t.path.clone()),
+                    manifest.assets.overlay_logical_size,
+                ))
+            } else {
+                None
+            };
+
         // Resolve the canonical path for storage in VmRecord.
         let canonical_path = sidecar_path
             .canonicalize()
@@ -1882,7 +1906,15 @@ impl CreateCmd {
         let params = vm_common::CreateVmParams {
             secret_refs: manifest.secret_refs,
             name,
-            image: Some(manifest.image),
+            // A VM-mode pack is a VM, not a container: its synthetic `vm://<name>`
+            // label would make exec/start/re-pack treat it as a pullable image
+            // (the /bin/sh-not-found bug). None routes every `image.is_some()`
+            // consumer to VM behavior; provenance is in `source_smolmachine`.
+            image: if vm_seed.is_some() {
+                None
+            } else {
+                Some(manifest.image)
+            },
             entrypoint: manifest.entrypoint,
             cmd: manifest.cmd,
             cpus,
@@ -1923,7 +1955,7 @@ impl CreateCmd {
         // extract before publishing the VM row. Other processes either see the
         // reservation conflict or the finished VM, never a half-created record.
         let create_result = (|| -> smolvm::Result<()> {
-            let _manager = AgentManager::for_vm_with_sizes(
+            let manager = AgentManager::for_vm_with_sizes(
                 &name_for_layers,
                 params.storage_gb,
                 params.overlay_gb,
@@ -1956,6 +1988,32 @@ impl CreateCmd {
             // and failure paths to honor the "mounted iff running" invariant.
             smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
             result?;
+
+            // VM-mode pack: seed this machine's overlay+storage disks from the
+            // packed templates so a start boots the source VM's rootfs rather than
+            // the bare agent-rootfs. Shared with the serve API create path: it
+            // resizes the truncated templates into valid raw disks and removes the
+            // manager's default `.qcow2` overlays so the start resolves these.
+            // (Writing the resized copy onto `manager.overlay_path()` — the default
+            // `.qcow2` — handed the guest raw bytes named `.qcow2`, the /bin/sh-missing
+            // bug's disk counterpart.)
+            if let Some((overlay_template, storage_template, overlay_logical_size)) = &vm_seed {
+                let disk_dir = manager
+                    .storage_path()
+                    .parent()
+                    .map(std::path::Path::to_path_buf)
+                    .unwrap_or_else(|| smolvm::agent::vm_data_dir(&name_for_layers));
+                smolvm::storage::seed_vm_mode_disks(
+                    &disk_dir,
+                    &cache_dir,
+                    overlay_template.as_deref(),
+                    storage_template.as_deref(),
+                    *overlay_logical_size,
+                    params.overlay_gb,
+                    params.storage_gb,
+                )
+                .map_err(|e| smolvm::Error::agent("seed VM-mode disks", e.to_string()))?;
+            }
 
             reservation.commit(&record)?;
             Ok(())

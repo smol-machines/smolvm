@@ -27,6 +27,66 @@ use serde::{Deserialize, Serialize};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
+/// Seed a VM-mode machine's overlay+storage disks from extracted pack templates so
+/// it boots the source VM's filesystem rather than a freshly-mkfs'd empty overlay.
+///
+/// VM-mode (`--from-vm`) packs carry the source VM's rootfs DISKS, but the packed
+/// template has its trailing zero extent stripped — it is NOT a usable disk until
+/// [`smolvm_pack::extract::copy_overlay_template`] ftruncates it back to
+/// `overlay_logical_size`. The caller's [`AgentManager`] has already created default
+/// `.qcow2` overlays backed by the EMPTY default template; this removes them and
+/// writes the resized RAW disks under their place so [`resolve_disk_image`] picks
+/// these at start. A `.formatted` marker stops the host from reformatting the
+/// inherited (already-formatted) filesystem; the guest still grows it with resize2fs.
+///
+/// `disk_dir` is the machine's data dir (the parent of `manager.storage_path()`).
+/// Shared by both the serve API create path and the `smolvm machine create --from`
+/// CLI path so a VM-mode pack restores identically through either entry point.
+///
+/// [`AgentManager`]: crate::agent::AgentManager
+/// [`resolve_disk_image`]: crate::agent::manager::resolve_disk_image
+pub fn seed_vm_mode_disks(
+    disk_dir: &Path,
+    cache_dir: &Path,
+    overlay_template: Option<&str>,
+    storage_template: Option<&str>,
+    overlay_logical_size: Option<u64>,
+    overlay_gb: Option<u64>,
+    storage_gb: Option<u64>,
+) -> std::io::Result<()> {
+    // Drop the manager's default qcow2 overlays (backed by the empty default
+    // template) so the resized raw disks below are what start resolves.
+    for raw_filename in [STORAGE_DISK_FILENAME, OVERLAY_DISK_FILENAME] {
+        let stem = Path::new(raw_filename);
+        let _ = std::fs::remove_file(disk_dir.join(stem.with_extension("qcow2")));
+    }
+
+    // Resize the packed templates into valid raw disks, exactly like `pack_run`'s
+    // `setup_vm_overlay`. The overlay template is ftruncated back to its logical
+    // size; the storage template is copied (or an empty disk created) verbatim.
+    smolvm_pack::extract::copy_overlay_template(
+        cache_dir,
+        overlay_template,
+        &disk_dir.join(OVERLAY_DISK_FILENAME),
+        overlay_gb,
+        overlay_logical_size,
+    )?;
+    smolvm_pack::extract::create_or_copy_storage_disk(
+        cache_dir,
+        storage_template,
+        &disk_dir.join(STORAGE_DISK_FILENAME),
+        storage_gb,
+    )?;
+
+    // The copied disks carry the source VM's already-formatted ext4; mark them so
+    // neither host nor guest reformats (the guest still grows them with resize2fs).
+    for raw_filename in [STORAGE_DISK_FILENAME, OVERLAY_DISK_FILENAME] {
+        let stem = Path::new(raw_filename);
+        std::fs::write(disk_dir.join(stem.with_extension("formatted")), b"")?;
+    }
+    Ok(())
+}
+
 /// Disk format version info (stored at `/.smolvm/version.json` in ext4 disk).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiskVersion {

@@ -220,6 +220,24 @@ fn shutdown_machine_process(name: &str, pid: Option<i32>, pid_start_time: Option
     true
 }
 
+/// Disks to restore for a VM-mode (`--from-vm`) pack. Unlike an image pack (OCI
+/// layers), a VM-mode `.smolmachine` carries the source VM's overlay + storage
+/// DISKS — the actual rootfs (`/bin/sh`, files written before packing). They must
+/// be seeded onto the new machine's disks or it boots with only the bare
+/// agent-rootfs. `pack run` does this; the API create path must too.
+struct VmModeSeed {
+    overlay_template: Option<String>,
+    storage_template: Option<String>,
+    /// Original (pre-truncation) virtual size of the overlay disk. The packed
+    /// template has its trailing zero extent stripped, so the disk must be
+    /// ftruncated back to this before boot or it isn't a valid full filesystem.
+    overlay_logical_size: Option<u64>,
+    /// Requested disk sizes (GiB) from the create request, honored as a lower
+    /// bound on the seeded disks (the guest grows the inherited fs with resize2fs).
+    storage_gb: Option<u64>,
+    overlay_gb: Option<u64>,
+}
+
 /// Create a new machine.
 #[utoipa::path(
     post,
@@ -298,6 +316,7 @@ pub async fn create_machine(
         manifest_mem,
         manifest_net,
         manifest_secret_refs,
+        vm_seed,
     ) = if let Some(ref sidecar_path) = req.from {
         let path = std::path::Path::new(sidecar_path);
         if !path.exists() {
@@ -337,8 +356,41 @@ pub async fn create_machine(
                 },
             )?;
         }
+        // VM-mode packs carry disks, not layers — capture the templates so the
+        // machine's overlay/storage disks can be seeded from them below.
+        let vm_seed = if manifest.mode == smolvm_pack::format::PackMode::Vm {
+            Some(VmModeSeed {
+                overlay_template: manifest
+                    .assets
+                    .overlay_template
+                    .as_ref()
+                    .map(|t| t.path.clone()),
+                storage_template: manifest
+                    .assets
+                    .storage_template
+                    .as_ref()
+                    .map(|t| t.path.clone()),
+                overlay_logical_size: manifest.assets.overlay_logical_size,
+                storage_gb: req.storage_gb,
+                overlay_gb: req.overlay_gb,
+            })
+        } else {
+            None
+        };
+        // A VM-mode pack is NOT a container/image machine: its `image` is the
+        // synthetic `vm://<name>` label, not a pullable ref. `record.image.is_some()`
+        // is the universal "container machine" signal (exec routing, workload
+        // launch, pull-on-start, re-pack), so storing the vm:// label would make
+        // exec run `crun` over a nonexistent image instead of `vm_exec` in the VM
+        // (the /bin/sh-not-found bug). Store None so every consumer treats it as a
+        // VM; provenance lives in `source_smolmachine`.
+        let image = if vm_seed.is_some() {
+            None
+        } else {
+            Some(manifest.image)
+        };
         (
-            Some(manifest.image),
+            image,
             Some(canonical),
             manifest.entrypoint,
             manifest.cmd,
@@ -348,6 +400,7 @@ pub async fn create_machine(
             manifest.mem,
             manifest.network,
             manifest.secret_refs,
+            vm_seed,
         )
     } else {
         (
@@ -361,6 +414,7 @@ pub async fn create_machine(
             crate::data::resources::DEFAULT_MICROVM_MEMORY_MIB,
             req.network,
             Default::default(),
+            None,
         )
     };
 
@@ -438,6 +492,42 @@ pub async fn create_machine(
         })
         .await
         .map_err(|e| ApiError::internal(format!("task error: {}", e)))??;
+    }
+
+    // VM-mode pack: seed this machine's overlay + storage disks from the packed
+    // templates (extracted above) so a start boots the source VM's rootfs rather
+    // than the bare agent-rootfs (the /bin/sh-missing bug). `open_or_create_at`
+    // reuses an existing disk, so seeding once at create persists across starts.
+    // Mirrors `pack_run`'s VM-mode disk restore (`setup_vm_overlay` +
+    // `create_or_copy_storage_disk`).
+    if let Some(seed) = vm_seed {
+        let name2 = name.clone();
+        let disk_dir = manager
+            .storage_path()
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| vm_data_dir(&name));
+        let seed_result = tokio::task::spawn_blocking(move || -> Result<(), ApiError> {
+            let cache_dir = crate::agent::machine_layers_cache_dir(&name2);
+            crate::storage::seed_vm_mode_disks(
+                &disk_dir,
+                &cache_dir,
+                seed.overlay_template.as_deref(),
+                seed.storage_template.as_deref(),
+                seed.overlay_logical_size,
+                seed.overlay_gb,
+                seed.storage_gb,
+            )
+            .map_err(|e| ApiError::internal(format!("seed VM-mode disks: {}", e)))
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
+        // On failure roll back the data dir the manager created, so a retry starts
+        // clean (the reservation guard releases the name but leaves the dir).
+        if let Err(e) = seed_result {
+            let _ = std::fs::remove_dir_all(vm_data_dir(&name));
+            return Err(e);
+        }
     }
 
     let resources = ResourceSpec {
