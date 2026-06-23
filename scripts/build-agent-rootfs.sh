@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Build the agent VM rootfs
 #
 # This script creates an Alpine-based rootfs with:

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # run_tests.sh -- primary test runner for smolvm
 #

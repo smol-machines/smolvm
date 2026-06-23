@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Install smolvm from a local tarball or build directory
 #
 # Usage:

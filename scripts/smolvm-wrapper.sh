@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # smolvm - OCI-native microVM runtime
 # This wrapper sets up the library path and runs the smolvm binary.
 

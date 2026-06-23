@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # smol - the unified Smol Machines CLI (local microVMs + cloud)
 # This wrapper sets up the library path and runs the smol binary.
 #

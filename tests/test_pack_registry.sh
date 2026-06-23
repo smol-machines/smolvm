@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # Registry push/pull integration tests for smolvm pack.
 #

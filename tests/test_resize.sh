@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # Resize feature tests for smolvm.
 # Runs only the resize-related integration tests.

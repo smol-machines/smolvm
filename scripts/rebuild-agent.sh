@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Rebuild the smolvm-agent binary for Linux and install it
 #
 # Usage: ./scripts/rebuild-agent.sh [--clean]

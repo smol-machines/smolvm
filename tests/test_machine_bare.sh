@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # Bare VM Tests (lifecycle, exec, shell, file I/O, observability)
 #

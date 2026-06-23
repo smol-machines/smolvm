@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # End-to-end HTTP API tests for smolvm.
 #

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # Wrapper tests for release archive behavior.
 #
@@ -21,7 +21,7 @@ make_release_fixture() {
     chmod +x "$release_dir/smolvm"
 
     cat > "$release_dir/smolvm-bin" <<'EOF'
-#!/bin/bash
+#!/usr/bin/env bash
 printf 'SMOLVM_AGENT_ROOTFS=%s\n' "${SMOLVM_AGENT_ROOTFS-}"
 EOF
     chmod +x "$release_dir/smolvm-bin"

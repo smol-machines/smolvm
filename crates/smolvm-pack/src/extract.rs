@@ -2288,7 +2288,7 @@ mod tests {
         header.set_path("usr/good3.sh").unwrap();
         header.set_cksum();
         builder
-            .append_data(&mut header, "usr/good3.sh", &b"#!/bin/bash"[..])
+            .append_data(&mut header, "usr/good3.sh", &b"#!/usr/bin/env bash"[..])
             .unwrap();
 
         // Another char device whiteout
@@ -2336,7 +2336,7 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(dest.join("usr/good3.sh")).unwrap(),
-            "#!/bin/bash"
+            "#!/usr/bin/env bash"
         );
         assert_eq!(
             fs::read_to_string(dest.join("usr/good4.dat")).unwrap(),

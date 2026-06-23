@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Update the Homebrew formula with SHA256 hashes from dist/ tarballs
 #
 # Usage: ./scripts/update-formula.sh

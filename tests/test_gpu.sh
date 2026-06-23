@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # GPU acceleration integration tests for smolvm.
 #

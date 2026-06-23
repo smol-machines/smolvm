@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Benchmark: microVM startup time
 #
 # Measures the time to start the smolvm agent VM from cold state.
