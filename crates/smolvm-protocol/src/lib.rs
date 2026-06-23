@@ -288,6 +288,13 @@ pub enum AgentRequest {
         /// Returns a `Completed` response with `stdout` containing the container ID.
         #[serde(default)]
         detached: bool,
+        /// Run the workload as an unprivileged container: restricted capabilities,
+        /// read-only cgroup, and no extra tmpfs. The default (false) is "VM-grade"
+        /// — since the microVM is the isolation boundary, the workload gets a full
+        /// capability set and the mounts an init system needs (so any image, incl.
+        /// systemd, boots). Opt in for defense-in-depth when running untrusted code.
+        #[serde(default)]
+        unprivileged: bool,
         /// If set, use a persistent overlay that survives across exec sessions.
         /// The overlay is identified by this ID (typically the machine name)
         /// and reused on subsequent runs. If not set, an ephemeral overlay is

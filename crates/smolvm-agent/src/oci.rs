@@ -462,6 +462,7 @@ impl OciSpec {
         workdir: &str,
         tty: bool,
         identity: &ProcessIdentity,
+        unprivileged: bool,
     ) -> Self {
         // Build environment variables
         let mut env_strings = vec![
@@ -475,15 +476,21 @@ impl OciSpec {
         }
         env_strings.extend(env.iter().map(|(k, v)| format!("{}={}", k, v)));
 
-        // VM-grade capabilities: the microVM is the security boundary, so the
-        // in-VM workload gets a full capability set (see `full_capabilities`). This
-        // is what lets init systems (systemd as PID 1) and tmpfs-mounting workloads
-        // run — the README's "boot any image" promise.
+        // Capabilities. Default is VM-grade (full set): the microVM is the security
+        // boundary, so the in-VM workload runs privileged — that's what lets init
+        // systems (systemd as PID 1) and tmpfs-mounting workloads boot (the "boot
+        // any image" promise). `unprivileged` opts into the restricted set for
+        // defense-in-depth with untrusted code.
+        let caps = if unprivileged {
+            default_capabilities()
+        } else {
+            full_capabilities()
+        };
         let capabilities = OciCapabilities {
-            bounding: full_capabilities(),
-            effective: full_capabilities(),
+            bounding: caps.clone(),
+            effective: caps.clone(),
             inheritable: vec![],
-            permitted: full_capabilities(),
+            permitted: caps,
             ambient: vec![],
         };
 
@@ -548,7 +555,7 @@ impl OciSpec {
                     "/proc/sysrq-trigger".to_string(),
                 ],
             },
-            mounts: default_mounts(),
+            mounts: default_mounts(unprivileged),
             hostname: Some("container".to_string()),
         }
     }
@@ -952,8 +959,8 @@ fn default_devices() -> Vec<OciDevice> {
 }
 
 /// Default mounts for container execution.
-fn default_mounts() -> Vec<OciMount> {
-    vec![
+fn default_mounts(unprivileged: bool) -> Vec<OciMount> {
+    let mut mounts = vec![
         // /proc - process information
         OciMount {
             destination: "/proc".to_string(),
@@ -1026,24 +1033,26 @@ fn default_mounts() -> Vec<OciMount> {
                 "ro".to_string(),
             ],
         },
-        // /sys/fs/cgroup - cgroup2, writable so an init system (systemd) can manage
-        // its own cgroup subtree. Safe: the VM is the boundary and is single-tenant.
-        OciMount {
-            destination: "/sys/fs/cgroup".to_string(),
-            mount_type: Some("cgroup2".to_string()),
-            source: "cgroup".to_string(),
-            options: vec![
-                "nosuid".to_string(),
-                "noexec".to_string(),
-                "nodev".to_string(),
-                "rw".to_string(),
-            ],
-        },
-        // /run, /run/lock, /tmp - tmpfs that init systems and many services expect
-        // to set up at boot. Pre-providing them means the workload doesn't have to
-        // mount them itself (and lets read-only-rootfs images still have writable
-        // runtime dirs).
-        OciMount {
+    ];
+    // /sys/fs/cgroup — cgroup2. Writable by default so an init system (systemd) can
+    // manage its own cgroup subtree; read-only in unprivileged mode.
+    mounts.push(OciMount {
+        destination: "/sys/fs/cgroup".to_string(),
+        mount_type: Some("cgroup2".to_string()),
+        source: "cgroup".to_string(),
+        options: vec![
+            "nosuid".to_string(),
+            "noexec".to_string(),
+            "nodev".to_string(),
+            if unprivileged { "ro" } else { "rw" }.to_string(),
+        ],
+    });
+    if !unprivileged {
+        // tmpfs that init systems and many services set up at boot. Pre-providing
+        // them means the workload doesn't have to mount them itself, and read-only
+        // rootfs images still get writable runtime dirs. Omitted when unprivileged
+        // (the workload can't mount, but also isn't expected to be an init system).
+        mounts.push(OciMount {
             destination: "/run".to_string(),
             mount_type: Some("tmpfs".to_string()),
             source: "tmpfs".to_string(),
@@ -1053,8 +1062,8 @@ fn default_mounts() -> Vec<OciMount> {
                 "mode=0755".to_string(),
                 "size=65536k".to_string(),
             ],
-        },
-        OciMount {
+        });
+        mounts.push(OciMount {
             destination: "/run/lock".to_string(),
             mount_type: Some("tmpfs".to_string()),
             source: "tmpfs".to_string(),
@@ -1065,8 +1074,8 @@ fn default_mounts() -> Vec<OciMount> {
                 "mode=1777".to_string(),
                 "size=5120k".to_string(),
             ],
-        },
-        OciMount {
+        });
+        mounts.push(OciMount {
             destination: "/tmp".to_string(),
             mount_type: Some("tmpfs".to_string()),
             source: "tmpfs".to_string(),
@@ -1075,8 +1084,9 @@ fn default_mounts() -> Vec<OciMount> {
                 "nodev".to_string(),
                 "mode=1777".to_string(),
             ],
-        },
-    ]
+        });
+    }
+    mounts
 }
 
 #[cfg(test)]

@@ -469,6 +469,14 @@ pub struct RunCmd {
     #[arg(long, help_heading = "Resources")]
     pub rebuild_init_cache: bool,
 
+    /// Run the workload as an unprivileged container: restricted capabilities,
+    /// read-only cgroup, and no extra tmpfs. By default the workload is "VM-grade"
+    /// (the microVM is the isolation boundary, so it gets full privileges and any
+    /// image — incl. systemd — boots). Use this for defense-in-depth with untrusted
+    /// code. `init` always runs VM-grade (it needs privileges for apt/mounts).
+    #[arg(long, help_heading = "Security")]
+    pub unprivileged: bool,
+
     #[command(flatten, next_help_heading = "Network")]
     pub proxy_opts: crate::cli::proxy_opts::ProxyOpts,
 }
@@ -1191,7 +1199,8 @@ impl RunCmd {
                         .with_workdir(defaults.workdir.clone())
                         .with_user(defaults.user.clone())
                         .with_mounts(mount_bindings.clone())
-                        .with_persistent_overlay(Some(vm_name.clone()));
+                        .with_persistent_overlay(Some(vm_name.clone()))
+                        .with_unprivileged(self.unprivileged);
                     client.run_container_detached(run_config)?;
                 }
 
@@ -1300,7 +1309,8 @@ impl RunCmd {
                         .with_mounts(mount_bindings)
                         .with_timeout(self.timeout)
                         .with_tty(tty)
-                        .with_persistent_overlay(Some(vm_name.clone()));
+                        .with_persistent_overlay(Some(vm_name.clone()))
+                        .with_unprivileged(self.unprivileged);
                     client.run_interactive(config)?
                 } else {
                     let config = RunConfig::new(img, command)
@@ -1309,7 +1319,8 @@ impl RunCmd {
                         .with_user(defaults.user)
                         .with_mounts(mount_bindings)
                         .with_timeout(self.timeout)
-                        .with_persistent_overlay(Some(vm_name.clone()));
+                        .with_persistent_overlay(Some(vm_name.clone()))
+                        .with_unprivileged(self.unprivileged);
                     let (exit_code, stdout, stderr) = client.run_non_interactive(config)?;
                     if !stdout.is_empty() {
                         let _ = std::io::stdout().write_all(&stdout);

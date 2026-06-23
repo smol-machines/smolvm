@@ -2569,6 +2569,7 @@ pub fn run_command(
     persistent_overlay_id: Option<&str>,
     stdin_data: Option<&str>,
     client_fd: Option<std::os::unix::io::RawFd>,
+    unprivileged: bool,
 ) -> Result<RunResult> {
     // Validate inputs
     crate::oci::validate_image_reference(image).map_err(StorageError::new)?;
@@ -2595,7 +2596,7 @@ pub fn run_command(
         let workdir_str = workdir.unwrap_or("/");
         let identity = crate::oci::resolve_process_identity(Path::new(&prepared.rootfs_path), user)
             .map_err(StorageError::new)?;
-        let mut spec = OciSpec::new(command, env, workdir_str, false, &identity);
+        let mut spec = OciSpec::new(command, env, workdir_str, false, &identity, unprivileged);
         spec.add_gpu_devices_if_available();
 
         // Add virtiofs bind mounts to OCI spec
@@ -2669,6 +2670,7 @@ pub fn spawn_in_overlay(
     user: Option<&str>,
     mounts: &[(String, String, bool)],
     persistent_overlay_id: &str,
+    unprivileged: bool,
 ) -> Result<u32> {
     crate::oci::validate_image_reference(image).map_err(StorageError::new)?;
     crate::oci::validate_env_vars(env).map_err(StorageError::new)?;
@@ -2686,7 +2688,7 @@ pub fn spawn_in_overlay(
     let workdir_str = workdir.unwrap_or("/");
     let identity = crate::oci::resolve_process_identity(Path::new(&prepared.rootfs_path), user)
         .map_err(StorageError::new)?;
-    let mut spec = OciSpec::new(command, env, workdir_str, false, &identity);
+    let mut spec = OciSpec::new(command, env, workdir_str, false, &identity, unprivileged);
 
     for (tag, container_path, read_only) in mounts {
         let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);

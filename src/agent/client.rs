@@ -162,6 +162,9 @@ pub struct RunConfig {
     /// Data to pipe to the command's stdin (non-interactive runs only). The
     /// pipe is closed after writing so the command sees EOF.
     pub stdin: Option<String>,
+    /// Run as an unprivileged container (restricted caps, ro cgroup, no extra
+    /// tmpfs). Default false = "VM-grade" (the microVM is the boundary).
+    pub unprivileged: bool,
 }
 
 impl RunConfig {
@@ -182,6 +185,7 @@ impl RunConfig {
             tty: false,
             persistent_overlay_id: None,
             stdin: None,
+            unprivileged: false,
         }
     }
 
@@ -230,6 +234,12 @@ impl RunConfig {
     /// Set persistent overlay ID for cross-session filesystem persistence.
     pub fn with_persistent_overlay(mut self, id: Option<String>) -> Self {
         self.persistent_overlay_id = id;
+        self
+    }
+
+    /// Run as an unprivileged container (defense-in-depth for untrusted code).
+    pub fn with_unprivileged(mut self, unprivileged: bool) -> Self {
+        self.unprivileged = unprivileged;
         self
     }
 }
@@ -1139,6 +1149,7 @@ impl AgentClient {
             interactive: false,
             tty: false,
             detached: false,
+            unprivileged: config.unprivileged,
             persistent_overlay_id: config.persistent_overlay_id,
             stdin_data: config.stdin,
             background: false,
@@ -1164,6 +1175,7 @@ impl AgentClient {
             interactive: false,
             tty: false,
             detached: false,
+            unprivileged: config.unprivileged,
             persistent_overlay_id: config.persistent_overlay_id,
             stdin_data: None,
             background: true,
@@ -1205,6 +1217,7 @@ impl AgentClient {
             interactive: true,
             tty: false,
             detached: false,
+            unprivileged: config.unprivileged,
             persistent_overlay_id: config.persistent_overlay_id,
             stdin_data: None,
             background: false,
@@ -1240,6 +1253,7 @@ impl AgentClient {
                 interactive: true,
                 tty,
                 detached: false,
+                unprivileged: config.unprivileged,
                 persistent_overlay_id: config.persistent_overlay_id,
                 stdin_data: None,
                 background: false,
@@ -1275,6 +1289,7 @@ impl AgentClient {
             interactive: false,
             tty: false,
             detached: true,
+            unprivileged: config.unprivileged,
             persistent_overlay_id: config.persistent_overlay_id,
             stdin_data: None,
             background: false,
@@ -1471,6 +1486,7 @@ impl AgentClient {
                 interactive: true,
                 tty,
                 detached: false,
+                unprivileged: config.unprivileged,
                 persistent_overlay_id: config.persistent_overlay_id,
                 stdin_data: None,
                 background: false,

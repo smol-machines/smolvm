@@ -2004,6 +2004,7 @@ fn handle_request(
             interactive: false,
             tty: false,
             detached: false,
+            unprivileged,
             persistent_overlay_id,
             stdin_data,
             background,
@@ -2017,6 +2018,7 @@ fn handle_request(
                     user.as_deref(),
                     &mounts,
                     persistent_overlay_id.as_deref(),
+                    unprivileged,
                 )
             } else {
                 handle_run(
@@ -2030,6 +2032,7 @@ fn handle_request(
                     persistent_overlay_id.as_deref(),
                     stdin_data.as_deref(),
                     client_fd,
+                    unprivileged,
                 )
             }
         }
@@ -2728,38 +2731,50 @@ fn handle_interactive_run(
     request: AgentRequest,
 ) -> Result<(), Box<dyn std::error::Error>> {
     ensure_storage_mounted();
-    let (image, command, env, workdir, user, mounts, timeout_ms, tty, persistent_overlay_id) =
-        match request {
-            AgentRequest::Run {
-                image,
-                command,
-                env,
-                workdir,
-                user,
-                mounts,
-                timeout_ms,
-                tty,
-                persistent_overlay_id,
-                ..
-            } => (
-                image,
-                command,
-                env,
-                workdir,
-                user,
-                mounts,
-                timeout_ms,
-                tty,
-                persistent_overlay_id,
-            ),
-            _ => {
-                send_response(
-                    stream,
-                    &AgentResponse::error("expected Run request", error_codes::INVALID_REQUEST),
-                )?;
-                return Ok(());
-            }
-        };
+    let (
+        image,
+        command,
+        env,
+        workdir,
+        user,
+        mounts,
+        timeout_ms,
+        tty,
+        persistent_overlay_id,
+        unprivileged,
+    ) = match request {
+        AgentRequest::Run {
+            image,
+            command,
+            env,
+            workdir,
+            user,
+            mounts,
+            timeout_ms,
+            tty,
+            persistent_overlay_id,
+            unprivileged,
+            ..
+        } => (
+            image,
+            command,
+            env,
+            workdir,
+            user,
+            mounts,
+            timeout_ms,
+            tty,
+            persistent_overlay_id,
+            unprivileged,
+        ),
+        _ => {
+            send_response(
+                stream,
+                &AgentResponse::error("expected Run request", error_codes::INVALID_REQUEST),
+            )?;
+            return Ok(());
+        }
+    };
 
     let is_persistent = persistent_overlay_id.is_some();
     info!(image = %image, command = ?command, tty = tty, persistent = is_persistent, "starting interactive run");
@@ -2804,6 +2819,7 @@ fn handle_interactive_run(
         &mounts,
         tty,
         persistent_overlay_id.as_deref(),
+        unprivileged,
     ) {
         Ok(result) => result,
         Err(e) => {
@@ -2881,6 +2897,7 @@ fn resolve_image_command(
 /// duplicating the identity-resolve → spec-build → mount-wiring → write sequence.
 /// The only caller-controlled variation is `tty` (detached: always `false`).
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 fn write_oci_bundle(
     rootfs_path: &std::path::Path,
     bundle_path: &std::path::Path,
@@ -2890,12 +2907,13 @@ fn write_oci_bundle(
     user: Option<&str>,
     mounts: &[(String, String, bool)],
     tty: bool,
+    unprivileged: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
     use std::path::Path;
 
     let workdir_str = workdir.unwrap_or("/");
     let identity = oci::resolve_process_identity(rootfs_path, user)?;
-    let mut spec = oci::OciSpec::new(command, env, workdir_str, tty, &identity);
+    let mut spec = oci::OciSpec::new(command, env, workdir_str, tty, &identity, unprivileged);
 
     if tty {
         // Give the PTY a non-zero starting size. The host follows up with a
@@ -2948,33 +2966,36 @@ fn handle_run_detached(
 
     ensure_storage_mounted();
 
-    let (image, mut command, env, workdir, user, mounts, persistent_overlay_id) = match request {
-        AgentRequest::Run {
-            image,
-            command,
-            env,
-            workdir,
-            user,
-            mounts,
-            persistent_overlay_id,
-            ..
-        } => (
-            image,
-            command,
-            env,
-            workdir,
-            user,
-            mounts,
-            persistent_overlay_id,
-        ),
-        _ => {
-            send_response(
-                stream,
-                &AgentResponse::error("expected Run request", error_codes::INVALID_REQUEST),
-            )?;
-            return Ok(());
-        }
-    };
+    let (image, mut command, env, workdir, user, mounts, persistent_overlay_id, unprivileged) =
+        match request {
+            AgentRequest::Run {
+                image,
+                command,
+                env,
+                workdir,
+                user,
+                mounts,
+                persistent_overlay_id,
+                unprivileged,
+                ..
+            } => (
+                image,
+                command,
+                env,
+                workdir,
+                user,
+                mounts,
+                persistent_overlay_id,
+                unprivileged,
+            ),
+            _ => {
+                send_response(
+                    stream,
+                    &AgentResponse::error("expected Run request", error_codes::INVALID_REQUEST),
+                )?;
+                return Ok(());
+            }
+        };
 
     // An empty command is allowed here: it means "run the image's own
     // ENTRYPOINT/CMD". We resolve it from the image config below, after the
@@ -3072,6 +3093,7 @@ fn handle_run_detached(
         user.as_deref(),
         &mounts,
         false,
+        unprivileged,
     ) {
         Ok(id) => id,
         Err(e) => {
@@ -3400,6 +3422,7 @@ static CONSOLE_SOCKET_WORKS: std::sync::atomic::AtomicBool =
 /// resize message is silently applied to the wrong terminal. See GH
 /// #156.
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 fn spawn_interactive_command(
     rootfs: &str,
     command: &[String],
@@ -3409,6 +3432,7 @@ fn spawn_interactive_command(
     mounts: &[(String, String, bool)],
     tty: bool,
     persistent_overlay_id: Option<&str>,
+    unprivileged: bool,
 ) -> Result<(Child, Option<pty::PtyMaster>), Box<dyn std::error::Error>> {
     use std::io::Read as _;
     use std::os::unix::io::AsRawFd as _;
@@ -3446,6 +3470,7 @@ fn spawn_interactive_command(
         user,
         mounts,
         tty,
+        unprivileged,
     )?;
 
     // Persist the container ID so subsequent execs join this container.
@@ -3541,6 +3566,7 @@ fn spawn_interactive_command(
 
 /// Non-Linux stub for spawn_interactive_command.
 #[cfg(not(target_os = "linux"))]
+#[allow(clippy::too_many_arguments)]
 fn spawn_interactive_command(
     rootfs: &str,
     command: &[String],
@@ -3550,6 +3576,7 @@ fn spawn_interactive_command(
     mounts: &[(String, String, bool)],
     _tty: bool,
     _persistent_overlay_id: Option<&str>,
+    unprivileged: bool,
 ) -> Result<(Child, Option<()>), Box<dyn std::error::Error>> {
     use std::path::Path;
 
@@ -3569,7 +3596,7 @@ fn spawn_interactive_command(
 
     let workdir_str = workdir.unwrap_or("/");
     let identity = oci::resolve_process_identity(rootfs_path, user)?;
-    let mut spec = oci::OciSpec::new(command, env, workdir_str, false, &identity);
+    let mut spec = oci::OciSpec::new(command, env, workdir_str, false, &identity, unprivileged);
     spec.add_gpu_devices_if_available();
 
     for (tag, container_path, read_only) in mounts {
@@ -4342,6 +4369,7 @@ fn test_tcp_syscall(target: &str) -> serde_json::Value {
 /// would leak because nothing waits for the container to exit to clean it
 /// up. The returned PID is the crun process, which stays alive as long as
 /// the container's init process runs.
+#[allow(clippy::too_many_arguments)]
 fn handle_run_background(
     image: &str,
     command: &[String],
@@ -4350,6 +4378,7 @@ fn handle_run_background(
     user: Option<&str>,
     mounts: &[(String, String, bool)],
     persistent_overlay_id: Option<&str>,
+    unprivileged: bool,
 ) -> AgentResponse {
     info!(image = %image, command = ?command, mounts = ?mounts, "running command in background");
 
@@ -4360,7 +4389,16 @@ fn handle_run_background(
         );
     };
 
-    match storage::spawn_in_overlay(image, command, env, workdir, user, mounts, overlay_id) {
+    match storage::spawn_in_overlay(
+        image,
+        command,
+        env,
+        workdir,
+        user,
+        mounts,
+        overlay_id,
+        unprivileged,
+    ) {
         Ok(pid) => AgentResponse::Completed {
             exit_code: 0,
             stdout: format!("{}", pid).into_bytes(),
@@ -4391,6 +4429,7 @@ fn oversized_output_error(stdout: &[u8], stderr: &[u8]) -> Option<AgentResponse>
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_run(
     image: &str,
     command: &[String],
@@ -4402,6 +4441,7 @@ fn handle_run(
     persistent_overlay_id: Option<&str>,
     stdin_data: Option<&str>,
     client_fd: Option<std::os::unix::io::RawFd>,
+    unprivileged: bool,
 ) -> AgentResponse {
     info!(image = %image, command = ?command, mounts = ?mounts, timeout_ms = ?timeout_ms, persistent = persistent_overlay_id.is_some(), stdin = stdin_data.is_some(), "running command");
 
@@ -4416,6 +4456,7 @@ fn handle_run(
         persistent_overlay_id,
         stdin_data,
         client_fd,
+        unprivileged,
     ) {
         Ok(result) => oversized_output_error(&result.stdout, &result.stderr).unwrap_or(
             AgentResponse::Completed {
