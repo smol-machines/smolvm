@@ -415,30 +415,69 @@ pub fn add_workspace_fallback(spec: &mut OciSpec, mounts: &[(String, String, boo
     }
 }
 
-/// Create a synthetic ImageInfo from packed layers.
-/// This is used when running from a packed binary where layers are pre-extracted.
-fn create_packed_image_info(image: &str, packed_dir: &Path) -> Result<ImageInfo> {
-    // Find all layer directories in packed_dir
-    let mut layer_dirs: Vec<String> = Vec::new();
+/// Name of the optional index file (written into the packed-layers dir at
+/// extraction time) recording the layers in OCI order, bottom-most first, one
+/// short layer id per line.
+///
+/// Packed layer subdirs are content-addressed (named by digest), so sorting
+/// their names does NOT reproduce the manifest's stacking order. That is fine
+/// for the common single-flattened-layer image, but a multi-layer pack (e.g. an
+/// init-cache base + init-overlay layer from `pack create --from-vm`) gets
+/// mis-stacked: the base can sort above the overlay, so overlayfs shadows the
+/// overlay's in-place edits to base files (`/etc/ld.so.cache`,
+/// `/var/lib/dpkg/status`) while keeping its new files — installed packages then
+/// appear on disk but unregistered, and libs in multiarch dirs fail to load.
+/// Honoring this index restores the true order; absent (older packs) we fall
+/// back to a name sort.
+const LAYER_ORDER_FILE: &str = "layer-order";
 
+/// Packed layer directory names in OCI order, **bottom-most layer first**.
+///
+/// Honors [`LAYER_ORDER_FILE`] when present and self-consistent; otherwise falls
+/// back to a lexical name sort (correct for the single-flattened-layer case).
+/// Only names backed by an existing subdirectory are returned, which also drops
+/// stray non-layer dirs (e.g. macOS `.fseventsd`) when the index is present.
+fn ordered_packed_layer_names(packed_dir: &Path) -> Result<Vec<String>> {
+    // The layer subdirs actually present (excluding source `.tar` files and the
+    // order index itself, which is a plain file).
+    let mut present: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let entries = std::fs::read_dir(packed_dir)
         .map_err(|e| StorageError::read_error(packed_dir.display().to_string(), e))?;
-
     for entry in entries {
-        let entry: std::fs::DirEntry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
+        let entry = entry?;
+        if entry.path().is_dir() {
             let name = entry.file_name().to_string_lossy().to_string();
-            // Skip .tar files, only use directories
             if !name.ends_with(".tar") {
-                // Store as sha256:{short_digest} for consistency
-                layer_dirs.push(format!("sha256:{}", name));
+                present.insert(name);
             }
         }
     }
 
-    // Sort for consistent ordering
-    layer_dirs.sort();
+    // Prefer the explicit order index when it resolves to layers we actually have.
+    if let Ok(contents) = std::fs::read_to_string(packed_dir.join(LAYER_ORDER_FILE)) {
+        let ordered: Vec<String> = contents
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| present.contains(l))
+            .collect();
+        if !ordered.is_empty() {
+            return Ok(ordered);
+        }
+    }
+
+    // Fallback: name sort (BTreeSet is already ascending = bottom→top by the
+    // legacy "stub creates layers in order" convention).
+    Ok(present.into_iter().collect())
+}
+
+/// Create a synthetic ImageInfo from packed layers.
+/// This is used when running from a packed binary where layers are pre-extracted.
+fn create_packed_image_info(image: &str, packed_dir: &Path) -> Result<ImageInfo> {
+    // Layer dirs in OCI order (bottom→top), as sha256:{short_digest} ids.
+    let layer_dirs: Vec<String> = ordered_packed_layer_names(packed_dir)?
+        .into_iter()
+        .map(|name| format!("sha256:{}", name))
+        .collect();
 
     // Calculate approximate size
     let mut total_size = 0u64;
@@ -2333,26 +2372,12 @@ fn prepare_overlay_from_packed(
             .execute_or_remount(vec![packed_dir.display().to_string()]);
     }
 
-    // Find layer directories in packed_dir
-    // Packed layers are named by short digest (first 12 chars of sha256)
-    let mut layer_dirs: Vec<PathBuf> = Vec::new();
+    // Packed layers are named by short digest (first 12 chars of sha256).
+    // Order is taken from the layer-order index (manifest order, bottom→top),
+    // falling back to a name sort — see `ordered_packed_layer_names`.
+    let layer_names = ordered_packed_layer_names(packed_dir)?;
 
-    let entries = std::fs::read_dir(packed_dir)
-        .map_err(|e| StorageError::read_error(packed_dir.display().to_string(), e))?;
-
-    for entry in entries {
-        let entry: std::fs::DirEntry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            // Skip .tar files, only use directories
-            if !name.ends_with(".tar") {
-                layer_dirs.push(path);
-            }
-        }
-    }
-
-    if layer_dirs.is_empty() {
+    if layer_names.is_empty() {
         return Err(StorageError::new(format!(
             "no layer directories found in {}",
             packed_dir.display()
@@ -2361,20 +2386,17 @@ fn prepare_overlay_from_packed(
 
     info!(
         image = %image,
-        layer_count = layer_dirs.len(),
-        layers = ?layer_dirs.iter().map(|p| p.file_name().unwrap_or_default().to_string_lossy().to_string()).collect::<Vec<_>>(),
+        layer_count = layer_names.len(),
+        layers = ?layer_names,
         "found packed layers"
     );
 
-    // Sort layer directories by name for consistent ordering
-    // The stub creates layers in order, so alphabetical sort should work
-    layer_dirs.sort();
-
-    // Build lowerdir from layers (reversed for overlay order - top layer first)
-    let lowerdirs: Vec<String> = layer_dirs
+    // Build lowerdir from layers (reversed so the top-most layer is leftmost,
+    // as overlayfs gives leftmost lowerdir the highest priority).
+    let lowerdirs: Vec<String> = layer_names
         .iter()
         .rev()
-        .map(|path| path.display().to_string())
+        .map(|name| packed_dir.join(name).display().to_string())
         .collect();
 
     // Use shared overlay setup logic — execute_or_remount preserves the
@@ -2418,34 +2440,22 @@ fn get_packed_lowerdirs(packed_dir: &Path) -> Result<Vec<String>> {
         return Ok(vec![packed_dir.display().to_string()]);
     }
 
-    let mut layer_dirs: Vec<PathBuf> = Vec::new();
+    // Order from the layer-order index (manifest order, bottom→top), falling
+    // back to a name sort — see `ordered_packed_layer_names`.
+    let layer_names = ordered_packed_layer_names(packed_dir)?;
 
-    let entries = std::fs::read_dir(packed_dir)
-        .map_err(|e| StorageError::read_error(packed_dir.display().to_string(), e))?;
-
-    for entry in entries {
-        let entry: std::fs::DirEntry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if !name.ends_with(".tar") {
-                layer_dirs.push(path);
-            }
-        }
-    }
-
-    if layer_dirs.is_empty() {
+    if layer_names.is_empty() {
         return Err(StorageError::new(format!(
             "no layer directories found in {}",
             packed_dir.display()
         )));
     }
 
-    layer_dirs.sort();
-    Ok(layer_dirs
+    // Reversed so the top-most layer is leftmost (overlayfs priority order).
+    Ok(layer_names
         .iter()
         .rev()
-        .map(|path| path.display().to_string())
+        .map(|name| packed_dir.join(name).display().to_string())
         .collect())
 }
 
@@ -4004,5 +4014,56 @@ mod tests {
             workspace_link.is_dir(),
             "/workspace should now be a directory"
         );
+    }
+
+    #[test]
+    fn ordered_packed_layers_honor_index_over_name_sort() {
+        // Two layers whose digest-named dirs sort base-above-overlay (the bug):
+        // base "fff…" sorts after overlay "4c8…", so a plain name sort + rev
+        // would stack the base on top and shadow the overlay's modified files.
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["fff3795b4371", "4c857248e0e2"] {
+            std::fs::create_dir_all(dir.path().join(name)).unwrap();
+        }
+        // A stray non-layer dir (e.g. macOS .fseventsd) must be excluded when an
+        // index is present.
+        std::fs::create_dir_all(dir.path().join(".fseventsd")).unwrap();
+
+        // Index records true OCI order, bottom→top: base then overlay.
+        std::fs::write(
+            dir.path().join(LAYER_ORDER_FILE),
+            "fff3795b4371\n4c857248e0e2\n",
+        )
+        .unwrap();
+
+        let ordered = ordered_packed_layer_names(dir.path()).unwrap();
+        assert_eq!(
+            ordered,
+            vec!["fff3795b4371".to_string(), "4c857248e0e2".to_string()],
+            "must follow the index (base→overlay), not the name sort, and drop .fseventsd"
+        );
+    }
+
+    #[test]
+    fn ordered_packed_layers_fall_back_to_name_sort_without_index() {
+        // No index → legacy behavior: ascending name sort (correct for the
+        // single-flattened-layer common case).
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["bbb", "aaa"] {
+            std::fs::create_dir_all(dir.path().join(name)).unwrap();
+        }
+        let ordered = ordered_packed_layer_names(dir.path()).unwrap();
+        assert_eq!(ordered, vec!["aaa".to_string(), "bbb".to_string()]);
+    }
+
+    #[test]
+    fn ordered_packed_layers_ignore_index_entries_without_a_dir() {
+        // An index naming a missing layer falls back to the name sort rather
+        // than silently dropping real layers.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("aaa")).unwrap();
+        std::fs::write(dir.path().join(LAYER_ORDER_FILE), "does-not-exist\n").unwrap();
+        let ordered = ordered_packed_layer_names(dir.path()).unwrap();
+        assert_eq!(ordered, vec!["aaa".to_string()]);
     }
 }

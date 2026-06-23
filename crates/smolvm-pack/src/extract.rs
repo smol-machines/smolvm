@@ -637,7 +637,20 @@ fn extract_sidecar_inner(
         eprintln!("debug: extracted assets to {}", cache_dir.display());
     }
 
-    post_process_extraction(cache_dir, debug)?;
+    // Layer order from the sidecar manifest (bottom→top). Best-effort: if the
+    // manifest can't be read the agent falls back to a name sort.
+    let layer_order = crate::packer::read_manifest_from_sidecar(sidecar_path)
+        .ok()
+        .map(|m| {
+            m.assets
+                .layers
+                .iter()
+                .filter_map(|l| short_layer_id(&l.digest))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    post_process_extraction(cache_dir, &layer_order, debug)?;
     Ok(())
 }
 
@@ -680,7 +693,9 @@ pub fn extract_from_binary(
             eprintln!("debug: extracted assets to {}", cache_dir.display());
         }
 
-        post_process_extraction(cache_dir, debug)?;
+        // Embedded self-exec stub: no separate sidecar manifest to source layer
+        // order from here, so let the agent fall back to a name sort.
+        post_process_extraction(cache_dir, &[], debug)?;
         Ok(())
     }
 }
@@ -720,12 +735,35 @@ pub unsafe fn extract_from_section(
         eprintln!("debug: extracted assets to {}", cache_dir.display());
     }
 
-    post_process_extraction(cache_dir, debug)?;
+    // Mach-O section self-exec stub: same as embedded mode — name-sort fallback.
+    post_process_extraction(cache_dir, &[], debug)?;
     Ok(())
 }
 
-/// Post-process extracted assets: unpack agent rootfs, OCI layers, fix permissions.
-fn post_process_extraction(cache_dir: &Path, debug: bool) -> std::io::Result<()> {
+/// Name of the index file written into the extracted-layers dir recording the
+/// layers in OCI order (bottom-most first), one short layer id per line. The
+/// guest agent honors it when stacking overlayfs lowerdirs; without it, layers
+/// (which are named by content digest) sort arbitrarily and a multi-layer pack
+/// can be mis-stacked. Must match the agent's `LAYER_ORDER_FILE`.
+const LAYER_ORDER_FILE: &str = "layer-order";
+
+/// Short layer id (first 12 hex of the digest) used as the on-disk layer dir
+/// name — mirrors `assets::digest_to_filename` minus the `.tar`. Returns `None`
+/// for a digest too short to form a valid id.
+fn short_layer_id(digest: &str) -> Option<String> {
+    let hex = digest.strip_prefix("sha256:").unwrap_or(digest);
+    (hex.len() >= 12).then(|| hex[..12].to_string())
+}
+
+/// Post-process extracted assets: unpack agent rootfs, OCI layers, fix
+/// permissions, and (when `layer_order` is non-empty) write the layer-order
+/// index so the guest stacks the layers in true OCI order rather than by their
+/// content-addressed names. `layer_order` is the short layer ids bottom→top.
+fn post_process_extraction(
+    cache_dir: &Path,
+    layer_order: &[String],
+    debug: bool,
+) -> std::io::Result<()> {
     // Extract agent-rootfs.tar to agent-rootfs directory
     let rootfs_tar = cache_dir.join("agent-rootfs.tar");
     let rootfs_dir = cache_dir.join("agent-rootfs");
@@ -777,6 +815,20 @@ fn post_process_extraction(cache_dir: &Path, debug: bool) -> std::io::Result<()>
                     let mut archive = tar::Archive::new(tar_file);
                     safe_unpack(&mut archive, &layer_dir)?;
                 }
+            }
+        }
+
+        // Record the manifest's layer order so the guest stacks overlayfs
+        // lowerdirs correctly (layer dirs are named by digest and don't sort
+        // into stack order). Only ids backed by an extracted dir are written.
+        if !layer_order.is_empty() {
+            let lines: Vec<&str> = layer_order
+                .iter()
+                .filter(|id| extract_dir.join(id).is_dir())
+                .map(String::as_str)
+                .collect();
+            if !lines.is_empty() {
+                fs::write(extract_dir.join(LAYER_ORDER_FILE), lines.join("\n"))?;
             }
         }
     }
