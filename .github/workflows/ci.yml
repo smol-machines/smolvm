@@ -41,6 +41,18 @@ jobs:
       - name: Bundled libkrun matches the pinned submodule
         run: ./scripts/check-libkrun-provenance.sh
 
+  audit:
+    name: Cargo Audit
+    runs-on: ubuntu-latest
+    # Scans Cargo.lock for RustSec advisories — no engine/libkrun needed. Honors
+    # .cargo/audit.toml, which ignores documented unmaintained-transitive notices
+    # so a real vulnerability stands out instead of hiding in warning noise.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-audit
+      - run: cargo audit
+
   # ==========================================================================
   # macOS Build & Test (Apple Silicon)
   # ==========================================================================
