@@ -596,7 +596,25 @@ impl RegistryClient {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        Ok((resp.bytes().await?.to_vec(), content_type))
+        let data = resp.bytes().await?.to_vec();
+
+        // When the reference is a content digest (e.g. an image-index entry being
+        // resolved to its platform manifest), the bytes MUST hash to it — else a
+        // malicious or MITM'd registry could swap manifest content while keeping
+        // the digest the caller trusted. Tags are mutable and carry no such
+        // guarantee, so only digest references are verifiable here. Mirrors the
+        // check `pull_blob` already performs for blobs.
+        if reference.starts_with("sha256:") {
+            let actual = format!("sha256:{}", hex::encode(Sha256::digest(&data)));
+            if actual != reference {
+                return Err(RegistryError::DigestMismatch {
+                    expected: reference.to_string(),
+                    actual,
+                });
+            }
+        }
+
+        Ok((data, content_type))
     }
 
     /// Fetch the manifest at `reference`, resolving an OCI image index to THIS
@@ -1819,5 +1837,65 @@ mod http_tests {
 
         std::fs::remove_dir_all(&dir).ok();
         // MockServer drop asserts PATCH expect(4) and PUT expect(1) were satisfied.
+    }
+
+    // -----------------------------------------------------------------------
+    // A digest-addressed manifest whose bytes don't hash to the requested
+    // digest must be rejected (registry tamper / MITM on index→manifest
+    // resolution), mirroring the blob-digest check `pull_blob` performs.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_manifest_digest_mismatch_rejected() {
+        let server = MockServer::start().await;
+
+        let honest = br#"{"schemaVersion":2}"#.to_vec();
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(&honest)));
+
+        // Registry serves DIFFERENT bytes under the digest-addressed URL.
+        let tampered = br#"{"schemaVersion":2,"x":"evil"}"#.to_vec();
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/myrepo/manifests/{digest}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", MANIFEST_MEDIA_TYPE)
+                    .set_body_bytes(tampered),
+            )
+            .mount(&server)
+            .await;
+
+        let client = RegistryClient::new(server.uri().to_string());
+        let err = client
+            .get_manifest_raw("myrepo", &digest)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RegistryError::DigestMismatch { .. }),
+            "tampered digest-addressed manifest must be rejected, got {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The honest case still passes through: bytes that hash to the requested
+    // digest are returned unchanged.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_manifest_digest_match_accepted() {
+        let server = MockServer::start().await;
+
+        let body = br#"{"schemaVersion":2}"#.to_vec();
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(&body)));
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/myrepo/manifests/{digest}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", MANIFEST_MEDIA_TYPE)
+                    .set_body_bytes(body.clone()),
+            )
+            .mount(&server)
+            .await;
+
+        let client = RegistryClient::new(server.uri().to_string());
+        let (bytes, _ct) = client.get_manifest_raw("myrepo", &digest).await.unwrap();
+        assert_eq!(bytes, body);
     }
 }
