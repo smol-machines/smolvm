@@ -334,14 +334,6 @@ _dns_tcp_rcode() {
 }
 
 test_dns_filter_tcp_allowed() {
-    # KNOWN GAP: the virtio-net gateway DNS filter is UDP-only ("Phase 1 DNS
-    # model" in crates/smolvm-network/src/stack.rs) — TCP/53 is not served, so a
-    # TCP query gets no response. The guest 127.0.0.1:53 proxy (dns_proxy.rs) does
-    # handle TCP but is currently dormant. Re-enable once TCP/53 DNS filtering
-    # lands at the gateway.
-    log_skip "TCP/53 DNS filtering not yet implemented (gateway is UDP-only)"
-    return 0
-
     local vm_name="dns-tcp-allowed-$$"
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
@@ -367,10 +359,6 @@ test_dns_filter_tcp_allowed() {
 }
 
 test_dns_filter_tcp_blocked() {
-    # KNOWN GAP: gateway DNS filter is UDP-only (see test_dns_filter_tcp_allowed).
-    log_skip "TCP/53 DNS filtering not yet implemented (gateway is UDP-only)"
-    return 0
-
     local vm_name="dns-tcp-blocked-$$"
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
