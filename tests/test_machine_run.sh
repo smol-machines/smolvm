@@ -174,27 +174,37 @@ test_machine_run_detached_with_command() {
     $SMOLVM machine stop 2>/dev/null || true
     $SMOLVM machine delete --name default -f 2>/dev/null || true
 
+    # The detached command writes to a host-mounted volume so execution is
+    # verified on the host. Do NOT write to the container's /tmp and read it back
+    # via `machine exec`: /tmp is a per-container tmpfs, and once the detached
+    # workload exits a later `machine exec` runs in a fresh container, so the
+    # tmpfs file would not be visible (false failure).
+    local outdir
+    outdir=$(mktemp -d)
+
     local run_output exit_code=0
-    run_output=$($SMOLVM machine run -d --net --image alpine:latest -- \
-        sh -c "echo issue198_fixed > /tmp/run-d-cmd-test.txt" 2>&1) || exit_code=$?
+    run_output=$($SMOLVM machine run -d --net -v "$outdir:/out" --image alpine:latest -- \
+        sh -c "echo issue198_fixed > /out/run-d-cmd-test.txt" 2>&1) || exit_code=$?
 
     if [[ $exit_code -ne 0 ]]; then
         $SMOLVM machine stop 2>/dev/null || true
         $SMOLVM machine delete --name default -f 2>/dev/null || true
+        rm -rf "$outdir"
         echo "Setup failed: machine run -d returned $exit_code: $run_output"
         return 1
     fi
 
     # Poll until the background command has written the file (usually <1s).
-    local file_output i=0
+    local file_output="" i=0
     while [[ $i -lt 20 ]]; do
-        file_output=$($SMOLVM machine exec -- cat /tmp/run-d-cmd-test.txt 2>/dev/null) && break
+        file_output=$(cat "$outdir/run-d-cmd-test.txt" 2>/dev/null) && [[ -n "$file_output" ]] && break
         sleep 0.5
         ((i++)) || true
     done
 
     $SMOLVM machine stop 2>/dev/null || true
     $SMOLVM machine delete --name default -f 2>/dev/null || true
+    rm -rf "$outdir"
 
     if [[ "$file_output" != *"issue198_fixed"* ]]; then
         echo "FAIL: command was not executed by 'machine run -d --image X -- cmd'"

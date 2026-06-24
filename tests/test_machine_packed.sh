@@ -50,10 +50,13 @@ test_create_from_smolmachine() {
         $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; rm -rf "$tmpdir"; return 1
     }
 
-    # 5. Persistence: write then read
-    $SMOLVM machine exec --name "$vm_name" -- sh -c 'echo persist > /tmp/sm.txt' 2>&1 || true
+    # 5. Persistence: write then read. Write to the container's persistent
+    # overlay (/sm-persist.txt), NOT /tmp — /tmp is a per-container tmpfs that is
+    # reset for each `machine exec` once the workload has exited, so it cannot
+    # test overlay persistence.
+    $SMOLVM machine exec --name "$vm_name" -- sh -c 'echo persist > /sm-persist.txt' 2>&1 || true
     local read_result
-    read_result=$($SMOLVM machine exec --name "$vm_name" -- cat /tmp/sm.txt 2>&1)
+    read_result=$($SMOLVM machine exec --name "$vm_name" -- cat /sm-persist.txt 2>&1)
     [[ "$read_result" == *"persist"* ]] || {
         echo "FAIL: persistence failed"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null
@@ -66,7 +69,7 @@ test_create_from_smolmachine() {
         echo "FAIL: restart failed"
         $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; rm -rf "$tmpdir"; return 1
     }
-    read_result=$($SMOLVM machine exec --name "$vm_name" -- cat /tmp/sm.txt 2>&1)
+    read_result=$($SMOLVM machine exec --name "$vm_name" -- cat /sm-persist.txt 2>&1)
     [[ "$read_result" == *"persist"* ]] || {
         echo "FAIL: persistence across restart failed"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null
