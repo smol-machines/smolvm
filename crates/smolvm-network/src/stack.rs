@@ -65,12 +65,14 @@ use smoltcp::iface::{
 use smoltcp::socket::raw::{
     PacketBuffer as RawPacketBuffer, PacketMetadata as RawPacketMetadata, Socket as RawSocket,
 };
+use smoltcp::socket::tcp;
 use smoltcp::socket::udp::{PacketBuffer, PacketMetadata, Socket as UdpSocket, UdpMetadata};
 use smoltcp::time::Instant;
 use smoltcp::wire::{
     EthernetAddress, EthernetFrame, EthernetProtocol, HardwareAddress, IpAddress, IpCidr,
-    IpProtocol, IpVersion, Ipv4Packet, Ipv6Packet, TcpPacket, UdpPacket,
+    IpListenEndpoint, IpProtocol, IpVersion, Ipv4Packet, Ipv6Packet, TcpPacket, UdpPacket,
 };
+use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket as HostUdpSocket};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError};
@@ -81,6 +83,18 @@ use std::time::{Duration, Instant as StdInstant};
 const DNS_SOCKET_PORT: u16 = 53;
 const DNS_PACKET_SLOTS: usize = 8;
 const DNS_BUFFER_BYTES: usize = 2048;
+// DNS-over-TCP to the gateway. Real resolvers (and resolv.conf clients) fall
+// back to TCP for truncated answers and EDNS, so the gateway filter must serve
+// TCP/53 in addition to UDP/53. A small pool of listening sockets handles
+// concurrent queries; DNS/TCP is rare and short-lived (one query per
+// connection), so a few suffice.
+const DNS_TCP_LISTENERS: usize = 4;
+const DNS_TCP_RX_BYTES: usize = 4096;
+const DNS_TCP_TX_BYTES: usize = 8192;
+// A length-prefixed DNS message is bounded by a 16-bit length, but the gateway
+// only needs to handle ordinary queries/responses; cap to keep buffers small
+// and reject a guest that sends a bogus oversized prefix.
+const DNS_TCP_MAX_MSG: usize = 4096;
 const DEFAULT_IDLE_TIMEOUT_MS: i32 = 100;
 /// Packet slots per ICMP raw socket buffer (per direction).
 const ICMP_PACKET_SLOTS: usize = 16;
@@ -181,6 +195,10 @@ fn run_network_stack(
     let mut interface = create_interface(&mut device, &config);
     let mut sockets = SocketSet::new(vec![]);
     let dns_socket_handle = add_dns_socket(&mut sockets);
+    let dns_tcp_handles = add_dns_tcp_sockets(&mut sockets);
+    let mut dns_tcp_conns: Vec<DnsTcpConn> = (0..dns_tcp_handles.len())
+        .map(|_| DnsTcpConn::default())
+        .collect();
     let (icmp4_handle, icmp6_handle) = add_icmp_raw_sockets(&mut sockets);
     // Gateway addresses answer their own pings locally; everything else is
     // relayed out to real host ICMP sockets.
@@ -235,7 +253,7 @@ fn run_network_stack(
             // - TCP SYN: pre-create a matching smoltcp socket + relay entry
             // - DNS UDP: allow through for gateway-side forwarding
             // - other UDP: pre-create the destination-keyed relay socket
-            match classify_guest_frame(frame) {
+            match classify_guest_frame(frame, &gateway_addrs) {
                 FrameAction::TcpSyn {
                     source,
                     destination,
@@ -301,6 +319,7 @@ fn run_network_stack(
         // threads, and service the DNS gateway socket.
         relays.relay_data(&mut sockets);
         process_dns_queries(dns_socket_handle, &mut sockets, &egress);
+        process_dns_tcp(&dns_tcp_handles, &mut dns_tcp_conns, &mut sockets, &egress);
 
         // General UDP: forward staged guest datagrams to the relay thread,
         // deliver any replies it produced, and expire idle destination sockets.
@@ -672,7 +691,7 @@ fn process_dns_queries(
     let socket = sockets.get_mut::<UdpSocket>(dns_socket_handle);
     while socket.can_recv() {
         let (query, metadata) = match socket.recv() {
-            Ok(result) => result,
+            Ok((q, m)) => (q.to_vec(), m),
             Err(_) => break,
         };
         virtio_net_log!(
@@ -682,42 +701,13 @@ fn process_dns_queries(
             query.len(),
             upstream_dns
         );
-        // allow-host filtering: only forward queries whose name is allow-listed;
-        // others get NXDOMAIN. A/AAAA records of allowed answers are learned as
-        // temporary egress IPs so the follow-up connection passes the filter.
-        // Mirrors libkrun's TSI DNS filter.
-        let response = if egress.dns_filter_active() {
-            match dns::question_name(query) {
-                Some(name) if egress.hostname_allowed(&name) => {
-                    match forward_dns_query(upstream_dns, query) {
-                        Ok(response) => {
-                            egress.learn_ip_records(&dns::answer_ip_records(&response));
-                            response
-                        }
-                        Err(err) => {
-                            virtio_net_log!("virtio-net: host DNS forwarding failed error={}", err);
-                            continue;
-                        }
-                    }
-                }
-                Some(name) => {
-                    virtio_net_log!(
-                        "virtio-net: blocking DNS query by allow-host policy name={}",
-                        name
-                    );
-                    dns::error_response(query, dns::DNS_RCODE_NXDOMAIN)
-                }
-                None => dns::error_response(query, dns::DNS_RCODE_SERVFAIL),
-            }
-        } else {
-            match forward_dns_query(upstream_dns, query) {
-                Ok(response) => response,
-                Err(err) => {
-                    virtio_net_log!("virtio-net: host DNS forwarding failed error={}", err);
-                    continue;
-                }
-            }
-        };
+        // Apply the same allow-host filter as TCP (see `filtered_dns_response`),
+        // forwarding allowed queries over the host's UDP stack.
+        let response =
+            match filtered_dns_response(&query, egress, |q| forward_dns_query(upstream_dns, q)) {
+                Some(response) => response,
+                None => continue,
+            };
         virtio_net_log!(
             "virtio-net: forwarded DNS response back to guest guest={} response_len={}",
             metadata.endpoint,
@@ -763,6 +753,215 @@ fn forward_dns_query(upstream_dns: Ipv4Addr, query: &[u8]) -> std::io::Result<Ve
     Ok(buffer)
 }
 
+/// Apply the allow-host DNS policy to a single query and produce the response
+/// bytes to return to the guest, or `None` to drop (a forwarding error on an
+/// allowed query — the guest sees a normal DNS timeout).
+///
+/// Shared by the UDP and TCP gateway paths so both enforce identical policy:
+/// only allow-listed names are forwarded (`forward`); others get NXDOMAIN; an
+/// unparseable query gets SERVFAIL. Answer A/AAAA records of allowed queries are
+/// learned as temporary egress IPs so the follow-up connection passes the
+/// filter. Mirrors libkrun's TSI DNS filter.
+fn filtered_dns_response(
+    query: &[u8],
+    egress: &EgressPolicy,
+    forward: impl FnOnce(&[u8]) -> std::io::Result<Vec<u8>>,
+) -> Option<Vec<u8>> {
+    if !egress.dns_filter_active() {
+        return match forward(query) {
+            Ok(response) => Some(response),
+            Err(err) => {
+                virtio_net_log!("virtio-net: host DNS forwarding failed error={}", err);
+                None
+            }
+        };
+    }
+    match dns::question_name(query) {
+        Some(name) if egress.hostname_allowed(&name) => match forward(query) {
+            Ok(response) => {
+                egress.learn_ip_records(&dns::answer_ip_records(&response));
+                Some(response)
+            }
+            Err(err) => {
+                virtio_net_log!("virtio-net: host DNS forwarding failed error={}", err);
+                None
+            }
+        },
+        Some(name) => {
+            virtio_net_log!(
+                "virtio-net: blocking DNS query by allow-host policy name={}",
+                name
+            );
+            Some(dns::error_response(query, dns::DNS_RCODE_NXDOMAIN))
+        }
+        None => Some(dns::error_response(query, dns::DNS_RCODE_SERVFAIL)),
+    }
+}
+
+/// Forward one DNS query to the upstream resolver over TCP (length-prefixed, per
+/// RFC 1035 §4.2.2) and return the raw response message. Synchronous host TCP
+/// exchange with a short timeout, matching the UDP path's MVP shape.
+fn forward_dns_query_tcp(upstream_dns: Ipv4Addr, query: &[u8]) -> std::io::Result<Vec<u8>> {
+    use std::io::{Error, ErrorKind};
+    let len = u16::try_from(query.len())
+        .map_err(|_| Error::new(ErrorKind::InvalidInput, "DNS query too large for TCP"))?;
+    let mut stream = std::net::TcpStream::connect_timeout(
+        &SocketAddr::new(IpAddr::V4(upstream_dns), DNS_SOCKET_PORT),
+        Duration::from_secs(2),
+    )?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    stream.write_all(&len.to_be_bytes())?;
+    stream.write_all(query)?;
+    stream.flush()?;
+
+    let mut len_buf = [0u8; 2];
+    stream.read_exact(&mut len_buf)?;
+    let resp_len = u16::from_be_bytes(len_buf) as usize;
+    if resp_len == 0 || resp_len > DNS_TCP_MAX_MSG {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "upstream DNS/TCP response length out of range",
+        ));
+    }
+    let mut response = vec![0u8; resp_len];
+    stream.read_exact(&mut response)?;
+    Ok(response)
+}
+
+/// Create the pool of smoltcp TCP listening sockets bound to the gateway's
+/// port 53. Each accepts one DNS-over-TCP connection at a time and is re-armed
+/// by [`process_dns_tcp`] after the connection closes.
+fn add_dns_tcp_sockets(sockets: &mut SocketSet<'_>) -> Vec<SocketHandle> {
+    (0..DNS_TCP_LISTENERS)
+        .map(|_| {
+            let rx_buffer = tcp::SocketBuffer::new(vec![0u8; DNS_TCP_RX_BYTES]);
+            let tx_buffer = tcp::SocketBuffer::new(vec![0u8; DNS_TCP_TX_BYTES]);
+            let mut socket = tcp::Socket::new(rx_buffer, tx_buffer);
+            socket
+                .listen(IpListenEndpoint {
+                    addr: None,
+                    port: DNS_SOCKET_PORT,
+                })
+                .expect("failed to listen on gateway DNS TCP socket");
+            sockets.add(socket)
+        })
+        .collect()
+}
+
+/// Per-listener state for an in-flight DNS-over-TCP connection: the
+/// accumulating length-prefixed query, and the framed response we still owe the
+/// guest.
+#[derive(Default)]
+struct DnsTcpConn {
+    /// Guest -> gateway bytes received so far (2-byte length prefix + query).
+    rx: Vec<u8>,
+    /// Framed response (2-byte length prefix + message) to send to the guest.
+    tx: Vec<u8>,
+    /// Bytes of `tx` already written to the socket.
+    tx_sent: usize,
+    /// The query has been answered (or rejected); drain `tx` then close.
+    done: bool,
+}
+
+/// Service the DNS-over-TCP listening sockets: accept a connection, read the
+/// length-prefixed query, apply the allow-host filter, forward allowed queries
+/// upstream over TCP, write the length-prefixed response, and close. Closed
+/// sockets are re-armed to listen again.
+fn process_dns_tcp(
+    handles: &[SocketHandle],
+    conns: &mut [DnsTcpConn],
+    sockets: &mut SocketSet<'_>,
+    egress: &EgressPolicy,
+) {
+    let upstream_dns = match DEFAULT_DNS_ADDR {
+        IpAddr::V4(ip) => ip,
+        IpAddr::V6(_) => return,
+    };
+
+    for (handle, conn) in handles.iter().zip(conns.iter_mut()) {
+        let socket = sockets.get_mut::<tcp::Socket>(*handle);
+
+        // A closed/finished socket: reset state and re-arm to accept the next
+        // connection. `listen` only succeeds from the CLOSED state; if the
+        // socket is still draining (e.g. TIME-WAIT) the error is ignored and the
+        // next poll retries.
+        if !socket.is_open() {
+            if !conn.rx.is_empty() || !conn.tx.is_empty() || conn.done {
+                *conn = DnsTcpConn::default();
+            }
+            let _ = socket.listen(IpListenEndpoint {
+                addr: None,
+                port: DNS_SOCKET_PORT,
+            });
+            continue;
+        }
+
+        // Already answered: flush whatever response remains, then close.
+        if conn.done {
+            drain_dns_tcp_tx(socket, conn);
+            continue;
+        }
+
+        // Accumulate the length-prefixed query.
+        while socket.can_recv() {
+            let appended = socket.recv(|data| (data.len(), data.to_vec()));
+            match appended {
+                Ok(bytes) if !bytes.is_empty() => conn.rx.extend_from_slice(&bytes),
+                _ => break,
+            }
+        }
+
+        // Reject a guest that floods without ever completing a message.
+        if conn.rx.len() > DNS_TCP_MAX_MSG + 2 {
+            conn.done = true;
+            socket.close();
+            continue;
+        }
+
+        if conn.rx.len() >= 2 {
+            let msg_len = u16::from_be_bytes([conn.rx[0], conn.rx[1]]) as usize;
+            if msg_len == 0 || msg_len > DNS_TCP_MAX_MSG {
+                conn.done = true;
+                socket.close();
+                continue;
+            }
+            if conn.rx.len() >= 2 + msg_len {
+                let query = conn.rx[2..2 + msg_len].to_vec();
+                virtio_net_log!(
+                    "virtio-net: DNS/TCP query query_len={} upstream_dns={}",
+                    query.len(),
+                    upstream_dns
+                );
+                if let Some(response) = filtered_dns_response(&query, egress, |q| {
+                    forward_dns_query_tcp(upstream_dns, q)
+                }) {
+                    if let Ok(resp_len) = u16::try_from(response.len()) {
+                        conn.tx.extend_from_slice(&resp_len.to_be_bytes());
+                        conn.tx.extend_from_slice(&response);
+                    }
+                }
+                conn.done = true;
+                drain_dns_tcp_tx(socket, conn);
+            }
+        }
+    }
+}
+
+/// Write as much of the pending framed response as the socket will accept; once
+/// fully sent, close the connection (the guest reads the answer then sees EOF).
+fn drain_dns_tcp_tx(socket: &mut tcp::Socket<'_>, conn: &mut DnsTcpConn) {
+    while conn.tx_sent < conn.tx.len() && socket.can_send() {
+        match socket.send_slice(&conn.tx[conn.tx_sent..]) {
+            Ok(n) if n > 0 => conn.tx_sent += n,
+            _ => break,
+        }
+    }
+    if conn.tx_sent >= conn.tx.len() {
+        socket.close();
+    }
+}
+
 fn flush_interface_egress(
     interface: &mut Interface,
     device: &mut VirtioNetworkDevice,
@@ -794,7 +993,7 @@ fn smoltcp_now(clock: StdInstant) -> Instant {
     Instant::from_millis(elapsed.as_millis() as i64)
 }
 
-fn classify_guest_frame(frame: &[u8]) -> FrameAction {
+fn classify_guest_frame(frame: &[u8], gateway_addrs: &[IpAddr]) -> FrameAction {
     let ethernet = match EthernetFrame::new_checked(frame) {
         Ok(frame) => frame,
         Err(_) => return FrameAction::Passthrough,
@@ -840,9 +1039,17 @@ fn classify_guest_frame(frame: &[u8]) -> FrameAction {
             };
 
             if tcp.syn() && !tcp.ack() {
-                FrameAction::TcpSyn {
-                    source: SocketAddr::new(src_ip, tcp.src_port()),
-                    destination: SocketAddr::new(dst_ip, tcp.dst_port()),
+                // DNS-over-TCP to the gateway itself is intercepted by the local
+                // listening sockets (process_dns_tcp), not relayed. TCP/53 to an
+                // external resolver (an allow-listed IP) is left to the egress
+                // relay so the policy still applies.
+                if tcp.dst_port() == DNS_SOCKET_PORT && gateway_addrs.contains(&dst_ip) {
+                    FrameAction::Passthrough
+                } else {
+                    FrameAction::TcpSyn {
+                        source: SocketAddr::new(src_ip, tcp.src_port()),
+                        destination: SocketAddr::new(dst_ip, tcp.dst_port()),
+                    }
                 }
             } else {
                 FrameAction::Passthrough
@@ -873,5 +1080,5 @@ fn classify_guest_frame(frame: &[u8]) -> FrameAction {
 /// behind the `fuzzing` feature so it never ships in a normal build.
 #[cfg(feature = "fuzzing")]
 pub fn fuzz_classify_guest_frame(frame: &[u8]) {
-    let _ = classify_guest_frame(frame);
+    let _ = classify_guest_frame(frame, &[]);
 }

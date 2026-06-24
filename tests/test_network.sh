@@ -315,8 +315,12 @@ _dns_tcp_rcode() {
     local resp_file
     resp_file=$(mktemp)
 
+    # Query the configured resolver (resolv.conf nameserver = the smolvm gateway,
+    # which enforces allow-host filtering) over TCP, exactly as a real client
+    # would on DNS/TCP fallback. The dst is resolved inside the guest so the test
+    # is independent of the gateway IP.
     $SMOLVM machine exec --name "$vm_name" -- sh -c \
-        "printf '$query_printf' | nc -w 2 127.0.0.1 53" \
+        "ns=\$(awk '/^nameserver/{print \$2; exit}' /etc/resolv.conf); printf '$query_printf' | nc -w 2 \"\$ns\" 53" \
         >"$resp_file" 2>/dev/null || true
 
     local rcode=255
