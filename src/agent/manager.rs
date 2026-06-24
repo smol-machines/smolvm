@@ -1727,24 +1727,53 @@ impl AgentManager {
     /// and there's no state to preserve. Much faster than `stop()` which
     /// attempts a graceful vsock shutdown + SIGTERM + poll.
     pub fn kill(&self) {
-        let pid = {
+        // Two PID sources with very different PID-reuse risk:
+        //   - the in-memory child: a direct child we still own, so the kernel
+        //     cannot recycle its PID until we reap it → safe to SIGKILL by PID.
+        //   - the pid-file: a process we did NOT spawn as our child (recovered
+        //     after a re-attach), so between the pid-file write and now the OS
+        //     may have reused the PID. Verify the recorded start-time before
+        //     SIGKILL (`kill_verified`) so we never signal an unrelated process.
+        let owned_child = {
             let inner = self.inner.lock();
             inner.child.as_ref().map(|c| c.pid())
         };
-        let pid = pid.or_else(|| self.read_pid_file_with_start_time().map(|(p, _)| p));
 
-        if let Some(pid) = pid {
-            if process::is_alive(pid) {
-                process::kill(pid);
-                // Brief wait for the kernel to reap (SIGKILL is near-instant).
-                // try_wait reaps zombie children; is_alive catches non-children
-                // that have been reparented to init/launchd.
-                for _ in 0..10 {
-                    if process::try_wait(pid).is_some() || !process::is_alive(pid) {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(5));
+        let killed_pid = match owned_child {
+            Some(pid) => {
+                if process::is_alive(pid) {
+                    process::kill(pid);
                 }
+                Some(pid)
+            }
+            None => match self.read_pid_file_with_start_time() {
+                Some((pid, start_time)) => {
+                    if process::kill_verified(pid, start_time) {
+                        Some(pid)
+                    } else {
+                        if process::is_alive(pid) {
+                            tracing::warn!(
+                                pid,
+                                "skipping kill: pid-file PID is alive but start-time \
+                                 unverified (possible PID reuse)"
+                            );
+                        }
+                        None
+                    }
+                }
+                None => None,
+            },
+        };
+
+        if let Some(pid) = killed_pid {
+            // Brief wait for the kernel to reap (SIGKILL is near-instant).
+            // try_wait reaps zombie children; is_alive catches non-children
+            // that have been reparented to init/launchd.
+            for _ in 0..10 {
+                if process::try_wait(pid).is_some() || !process::is_alive(pid) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
             }
         }
         self.cleanup_marker_files();

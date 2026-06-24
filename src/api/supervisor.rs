@@ -16,16 +16,39 @@ const CHECK_INTERVAL: Duration = Duration::from_secs(5);
 /// Minimum delay between restart attempts.
 const MIN_RESTART_DELAY: Duration = Duration::from_secs(1);
 
+/// Outcome of [`Supervisor::restart_timing`] for a dead, restart-eligible machine.
+#[derive(Debug, PartialEq, Eq)]
+enum RestartTiming {
+    /// Restart now (fast-path backoff, or the armed time has arrived).
+    Fire,
+    /// Just armed the backoff timer this tick; do not restart yet.
+    Armed,
+    /// Timer armed on an earlier tick and not yet due; keep waiting.
+    Waiting,
+}
+
 /// Machine supervisor for health monitoring and automatic restarts.
 pub struct Supervisor {
     state: Arc<ApiState>,
     shutdown_rx: watch::Receiver<bool>,
+    /// Per-machine instant at which a scheduled restart becomes due. Lets the
+    /// supervisor honor restart backoff WITHOUT sleeping inside the shared
+    /// health-check loop: a crash-looping machine with a long exponential
+    /// backoff must not stall every other machine's liveness check, gauge
+    /// reconcile, and log rotation. The supervisor is the single task that owns
+    /// the loop, so a plain map needs no synchronization. Entries are cleared
+    /// when a machine is alive again, its restart fires, or its policy stops it.
+    next_restart_at: std::collections::HashMap<String, tokio::time::Instant>,
 }
 
 impl Supervisor {
     /// Create a new supervisor.
     pub fn new(state: Arc<ApiState>, shutdown_rx: watch::Receiver<bool>) -> Self {
-        Self { state, shutdown_rx }
+        Self {
+            state,
+            shutdown_rx,
+            next_restart_at: std::collections::HashMap::new(),
+        }
     }
 
     /// Run the supervisor loop.
@@ -58,8 +81,13 @@ impl Supervisor {
     }
 
     /// Check all machines and restart any that need it.
-    async fn check_all_machines(&self) {
+    async fn check_all_machines(&mut self) {
         let machine_names = self.state.list_machine_names();
+
+        // Drop schedule entries for machines that no longer exist so the map
+        // can't grow without bound across deletes.
+        self.next_restart_at
+            .retain(|name, _| machine_names.iter().any(|n| n == name));
 
         for name in machine_names {
             if let Err(e) = self.check_machine(&name).await {
@@ -78,12 +106,14 @@ impl Supervisor {
     }
 
     /// Check a single machine and restart if needed.
-    async fn check_machine(&self, name: &str) -> crate::Result<()> {
+    async fn check_machine(&mut self, name: &str) -> crate::Result<()> {
         // Check if machine is alive
         let is_alive = self.state.is_machine_alive(name);
 
         if is_alive {
-            // Machine is running, nothing to do
+            // Running again (recovered, or a prior restart took hold) — drop any
+            // pending restart schedule so a future death re-arms from scratch.
+            self.next_restart_at.remove(name);
             return Ok(());
         }
 
@@ -101,11 +131,15 @@ impl Supervisor {
         // Machine is dead, check restart policy
         let restart_config = match self.state.get_restart_config(name) {
             Some(config) => config,
-            None => return Ok(()), // Machine doesn't exist anymore
+            None => {
+                self.next_restart_at.remove(name);
+                return Ok(()); // Machine doesn't exist anymore
+            }
         };
 
         // Determine if we should restart (delegate to RestartConfig)
         if !restart_config.should_restart(last_exit_code) {
+            self.next_restart_at.remove(name);
             tracing::debug!(machine = %name, policy = %restart_config.policy, "machine dead, not restarting per policy");
             // Update state to stopped (best-effort in supervisor)
             if let Err(e) = self
@@ -117,19 +151,22 @@ impl Supervisor {
             return Ok(());
         }
 
-        // Calculate backoff delay (delegate to RestartConfig)
+        // Honor the backoff by SCHEDULING, not sleeping: blocking here would
+        // stall every other machine's check this tick. See `restart_timing`.
         let backoff = restart_config.backoff_duration();
-
-        tracing::info!(
-            machine = %name,
-            restart_count = restart_config.restart_count,
-            backoff_secs = backoff.as_secs(),
-            "machine dead, scheduling restart"
-        );
-
-        // Wait for backoff (but check for shutdown during wait)
-        if backoff > MIN_RESTART_DELAY {
-            tokio::time::sleep(backoff).await;
+        let now = tokio::time::Instant::now();
+        match Self::restart_timing(&mut self.next_restart_at, name, backoff, now) {
+            RestartTiming::Waiting => return Ok(()),
+            RestartTiming::Armed => {
+                tracing::info!(
+                    machine = %name,
+                    restart_count = restart_config.restart_count,
+                    backoff_secs = backoff.as_secs(),
+                    "machine dead, scheduling restart"
+                );
+                return Ok(());
+            }
+            RestartTiming::Fire => {}
         }
 
         // Increment restart count
@@ -137,6 +174,42 @@ impl Supervisor {
 
         // Attempt restart
         self.restart_machine(name).await
+    }
+
+    /// Decide, for a dead machine that should restart, whether its restart fires
+    /// on this tick — without ever sleeping. Mutates the schedule map in place:
+    ///
+    /// - backoff ≤ [`MIN_RESTART_DELAY`]: [`RestartTiming::Fire`] immediately
+    ///   (the previous fast-path; nothing to schedule).
+    /// - first dead tick with a longer backoff: arm `now + backoff` and return
+    ///   [`RestartTiming::Armed`].
+    /// - a later tick before the armed time: [`RestartTiming::Waiting`].
+    /// - a tick at/after the armed time: clear the entry and [`RestartTiming::Fire`].
+    ///
+    /// Pulled out as a pure function (no `ApiState`) so the backoff scheduling is
+    /// unit-testable; the live ticker's resolution bounds how promptly `Armed`
+    /// transitions to `Fire`.
+    fn restart_timing(
+        schedule: &mut std::collections::HashMap<String, tokio::time::Instant>,
+        name: &str,
+        backoff: Duration,
+        now: tokio::time::Instant,
+    ) -> RestartTiming {
+        if backoff <= MIN_RESTART_DELAY {
+            schedule.remove(name);
+            return RestartTiming::Fire;
+        }
+        match schedule.get(name).copied() {
+            Some(due) if now < due => RestartTiming::Waiting,
+            Some(_) => {
+                schedule.remove(name);
+                RestartTiming::Fire
+            }
+            None => {
+                schedule.insert(name.to_string(), now + backoff);
+                RestartTiming::Armed
+            }
+        }
     }
 
     /// Attempt to restart a machine.
@@ -291,3 +364,81 @@ impl Supervisor {
 
 // Tests for should_restart and backoff_duration live in src/config.rs
 // since the logic now lives on RestartConfig directly.
+
+#[cfg(test)]
+mod restart_timing_tests {
+    use super::{RestartTiming, Supervisor, MIN_RESTART_DELAY};
+    use std::collections::HashMap;
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    // A backoff at or below the minimum restarts immediately and schedules nothing.
+    #[test]
+    fn fast_path_fires_immediately() {
+        let mut sched = HashMap::new();
+        let now = Instant::now();
+        assert_eq!(
+            Supervisor::restart_timing(&mut sched, "m", MIN_RESTART_DELAY, now),
+            RestartTiming::Fire
+        );
+        assert!(sched.is_empty(), "fast-path must not arm a timer");
+    }
+
+    // A longer backoff arms on the first dead tick and waits on the next, but does
+    // NOT fire — proving one crash-looping machine never blocks the loop here.
+    #[test]
+    fn long_backoff_arms_then_waits_then_fires() {
+        let mut sched = HashMap::new();
+        let backoff = Duration::from_secs(8);
+        let t0 = Instant::now();
+
+        // First dead tick: arm, don't fire.
+        assert_eq!(
+            Supervisor::restart_timing(&mut sched, "m", backoff, t0),
+            RestartTiming::Armed
+        );
+        assert!(sched.contains_key("m"));
+
+        // A later tick still before the due time: keep waiting, schedule intact.
+        let before_due = t0 + Duration::from_secs(5);
+        assert_eq!(
+            Supervisor::restart_timing(&mut sched, "m", backoff, before_due),
+            RestartTiming::Waiting
+        );
+        assert!(sched.contains_key("m"));
+
+        // A tick at/after the due time: fire and clear the schedule.
+        let after_due = t0 + Duration::from_secs(9);
+        assert_eq!(
+            Supervisor::restart_timing(&mut sched, "m", backoff, after_due),
+            RestartTiming::Fire
+        );
+        assert!(
+            !sched.contains_key("m"),
+            "firing must clear the schedule so a later death re-arms"
+        );
+    }
+
+    // Independent machines don't interfere: a long-backoff machine waiting must
+    // not stop a fast-path machine from firing on the same tick.
+    #[test]
+    fn machines_are_scheduled_independently() {
+        let mut sched = HashMap::new();
+        let now = Instant::now();
+        // Arm "slow" with a long backoff.
+        assert_eq!(
+            Supervisor::restart_timing(&mut sched, "slow", Duration::from_secs(30), now),
+            RestartTiming::Armed
+        );
+        // "fast" still fires immediately despite "slow" being parked.
+        assert_eq!(
+            Supervisor::restart_timing(&mut sched, "fast", MIN_RESTART_DELAY, now),
+            RestartTiming::Fire
+        );
+        // "slow" is still parked, not due.
+        assert_eq!(
+            Supervisor::restart_timing(&mut sched, "slow", Duration::from_secs(30), now),
+            RestartTiming::Waiting
+        );
+    }
+}
