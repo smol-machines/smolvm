@@ -86,6 +86,27 @@ init_smolvm() {
     echo "Using smolvm: $SMOLVM"
 }
 
+# Resolve a hostname to a single IPv4 address on the host, portably across
+# Linux and macOS. Linux glibc has `getent`; macOS does not, so fall back to
+# dig/python3/host (all present on a stock macOS or with bind tools). Prints the
+# IP on stdout, or nothing if resolution fails.
+resolve_host_ipv4() {
+    local host="$1" ip=""
+    if command -v getent >/dev/null 2>&1; then
+        ip=$(getent ahostsv4 "$host" 2>/dev/null | awk 'NR==1{print $1}')
+    fi
+    if [[ -z "$ip" ]] && command -v dig >/dev/null 2>&1; then
+        ip=$(dig +short "$host" A 2>/dev/null | grep -m1 -E '^[0-9]+(\.[0-9]+){3}$')
+    fi
+    if [[ -z "$ip" ]] && command -v python3 >/dev/null 2>&1; then
+        ip=$(python3 -c 'import socket,sys; print(socket.gethostbyname(sys.argv[1]))' "$host" 2>/dev/null)
+    fi
+    if [[ -z "$ip" ]] && command -v host >/dev/null 2>&1; then
+        ip=$(host -t A "$host" 2>/dev/null | awk '/has address/{print $NF; exit}')
+    fi
+    printf '%s' "$ip"
+}
+
 # Log helpers
 log_test() {
     echo -e "${YELLOW}[TEST]${NC} $1"

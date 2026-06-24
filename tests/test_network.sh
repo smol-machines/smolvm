@@ -36,7 +36,7 @@ assert_egress_blocked() {
     local vm_name="$1"
 
     local web_ip
-    web_ip=$(getent ahostsv4 example.com | awk 'NR==1{print $1}')
+    web_ip=$(resolve_host_ipv4 example.com)
     if [[ -z "$web_ip" ]]; then
         echo "FAIL: could not resolve a non-resolver block-probe target on host"
         return 1
