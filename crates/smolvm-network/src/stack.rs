@@ -1082,3 +1082,60 @@ fn classify_guest_frame(frame: &[u8], gateway_addrs: &[IpAddr]) -> FrameAction {
 pub fn fuzz_classify_guest_frame(frame: &[u8]) {
     let _ = classify_guest_frame(frame, &[]);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal Ethernet(IPv4(TCP SYN)) frame with no payload. `new_checked`
+    /// validates lengths/header fields (not checksums), so dummy checksums are
+    /// fine for exercising `classify_guest_frame`.
+    fn tcp_syn_frame(dst_ip: [u8; 4], dst_port: u16) -> Vec<u8> {
+        let mut f = Vec::new();
+        // Ethernet: dst MAC, src MAC, ethertype IPv4.
+        f.extend_from_slice(&[0xff; 6]);
+        f.extend_from_slice(&[0x02, 0, 0, 0, 0, 1]);
+        f.extend_from_slice(&[0x08, 0x00]);
+        // IPv4: v4/IHL5, DSCP, total_len=40, id, flags/frag, ttl, proto=TCP, csum, src, dst.
+        f.extend_from_slice(&[0x45, 0x00, 0x00, 0x28, 0, 0, 0, 0, 0x40, 0x06, 0, 0]);
+        f.extend_from_slice(&[10, 0, 0, 2]); // src ip
+        f.extend_from_slice(&dst_ip);
+        // TCP: src/dst port, seq, ack, data-offset(5)/flags(SYN), window, csum, urg.
+        f.extend_from_slice(&54321u16.to_be_bytes());
+        f.extend_from_slice(&dst_port.to_be_bytes());
+        f.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]); // seq + ack
+        f.extend_from_slice(&[0x50, 0x02, 0xff, 0xff, 0, 0, 0, 0]); // offset/SYN/window/csum/urg
+        f
+    }
+
+    #[test]
+    fn dns_tcp_to_gateway_is_intercepted_not_relayed() {
+        let gw = IpAddr::V4(Ipv4Addr::new(100, 96, 0, 1));
+        // TCP/53 to the gateway -> handled by the local DNS listeners (Passthrough).
+        assert_eq!(
+            classify_guest_frame(&tcp_syn_frame([100, 96, 0, 1], 53), &[gw]),
+            FrameAction::Passthrough
+        );
+    }
+
+    #[test]
+    fn dns_tcp_to_external_resolver_still_relayed() {
+        let gw = IpAddr::V4(Ipv4Addr::new(100, 96, 0, 1));
+        // TCP/53 to an external (allow-listed) resolver must go through the egress
+        // relay, NOT be swallowed by the gateway DNS listeners.
+        assert!(matches!(
+            classify_guest_frame(&tcp_syn_frame([1, 1, 1, 1], 53), &[gw]),
+            FrameAction::TcpSyn { .. }
+        ));
+    }
+
+    #[test]
+    fn non_dns_tcp_to_gateway_still_relayed() {
+        let gw = IpAddr::V4(Ipv4Addr::new(100, 96, 0, 1));
+        // Only port 53 is intercepted; other gateway ports relay as usual.
+        assert!(matches!(
+            classify_guest_frame(&tcp_syn_frame([100, 96, 0, 1], 443), &[gw]),
+            FrameAction::TcpSyn { .. }
+        ));
+    }
+}
