@@ -395,7 +395,12 @@ fn build_seccomp_program(enforce: bool) -> std::result::Result<seccompiler::BpfP
         libc::SYS_prctl, libc::SYS_prlimit64, libc::SYS_getrusage,
         libc::SYS_sysinfo, libc::SYS_uname, libc::SYS_getrandom,
         libc::SYS_getuid, libc::SYS_geteuid, libc::SYS_getgid, libc::SYS_getegid,
-        libc::SYS_capget, libc::SYS_setpgid,
+        // capget/capset: virtiofs drops CAP_FSETID around a passthrough write/
+        // create (`drop_effective_cap`, via the `caps` crate) so the kernel
+        // strips setuid/setgid bits on non-owner writes — same root-VMM /
+        // non-root-guest passthrough path as setres{u,g}id below. A cap-dropped
+        // VMM can't raise caps outside its bounding set, so this grants nothing.
+        libc::SYS_capget, libc::SYS_capset, libc::SYS_setpgid,
         // accept4 + sock{name,peername}: the published-port listener threads
         // (smolvm-tcp-*) and virtio-net path. Rust's TcpListener uses accept4,
         // not accept — the audit run logged these (288/51/52 on x86_64) because
