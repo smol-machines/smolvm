@@ -626,7 +626,10 @@ fn flatten_archive(archive: &Path, rootfs: &Path) -> Result<()> {
     crane
         .args(["export", "-", "-"])
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        // Capture (don't discard) crane's stderr so a failure reports the REAL
+        // reason — e.g. "file manifest.json not found in tar" for an empty or
+        // truncated archive — instead of a misleading guess.
+        .stderr(Stdio::piped());
     let gunzip = pipe_archive_into(&mut crane, archive)?;
 
     let mut crane_child = crane
@@ -636,6 +639,10 @@ fn flatten_archive(archive: &Path, rootfs: &Path) -> Result<()> {
         .stdout
         .take()
         .ok_or_else(|| StorageError::new("failed to capture crane stdout".to_string()))?;
+    let mut crane_err = crane_child
+        .stderr
+        .take()
+        .ok_or_else(|| StorageError::new("failed to capture crane stderr".to_string()))?;
 
     let tar_out = Command::new("tar")
         .arg("-x")
@@ -655,9 +662,19 @@ fn flatten_archive(archive: &Path, rootfs: &Path) -> Result<()> {
     }
 
     if !crane_status.success() {
-        return Err(StorageError::new(
-            "crane export failed (is this a docker/podman `save` archive?)".to_string(),
-        ));
+        // crane's stderr is a single short line; reading it after the process
+        // exits (its stdout was drained by `tar`) cannot deadlock.
+        let mut stderr = String::new();
+        let _ = std::io::Read::read_to_string(&mut crane_err, &mut stderr);
+        let stderr = stderr.trim();
+        return Err(StorageError::new(format!(
+            "crane export failed{} (is the image a valid `docker save` / OCI archive?)",
+            if stderr.is_empty() {
+                String::new()
+            } else {
+                format!(": {stderr}")
+            }
+        )));
     }
     if !tar_out.status.success() {
         return Err(StorageError::new(format!(

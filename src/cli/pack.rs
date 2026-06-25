@@ -546,6 +546,23 @@ impl PackCreateCmd {
         // storage disk which can't be read on macOS — a temp VM mounts it for us.
         if is_image_based {
             let image = vm.image.clone().unwrap();
+            // A locally-sourced image (`--image -` / `--image file.tar` / a rootfs
+            // dir) is flattened on boot and has no registry manifest, so the
+            // layer-export path below — which pulls that manifest to enumerate base
+            // layers — cannot source it. Fail with a clear, actionable message
+            // instead of a confusing registry "UNAUTHORIZED" on `local:<hash>`.
+            if smolvm::data::image_source::is_local_ref(&image) {
+                return Err(Error::agent(
+                    "pack from VM",
+                    format!(
+                        "VM '{vm_name}' was created from a local image ({image}). \
+                         `pack create --from-vm` can only snapshot VMs created from a \
+                         REGISTRY image — local archives and rootfs directories are \
+                         flattened on boot and have no registry manifest to re-pull. \
+                         Recreate the machine from a registry reference to pack it."
+                    ),
+                ));
+            }
             // Attach the source storage disk with its real on-disk format so a
             // qcow2 (default-size) disk is presented correctly and mounts in the
             // temp VM — hardcoding raw would hand libkrun qcow2 bytes as raw.

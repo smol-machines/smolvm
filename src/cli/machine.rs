@@ -588,6 +588,18 @@ fn init_layer_key(image: Option<&str>, init: &[String], env: &[String]) -> Strin
     hex::encode(h.finalize())[..16].to_string()
 }
 
+/// Whether a `--image` value is an init-cache-bakeable source. Only registry
+/// refs are: the bake snapshots via `pack create --from-vm`, which sources base
+/// layers by pulling the image's registry manifest. A local archive or rootfs
+/// dir has no registry manifest (it is flattened on boot), so it takes the
+/// direct, uncached init path instead of a broken bake (#459).
+fn image_bakeable(image: Option<&str>) -> bool {
+    matches!(
+        image.map(smolvm::data::image_source::classify),
+        Some(smolvm::data::image_source::ImageSource::Registry(_))
+    )
+}
+
 /// Bake `image + init` into a cached `.smolmachine` (or reuse an existing one) and
 /// return its path. Runs the well-tested `machine create/start/stop` + `pack create
 /// --from-vm` flow as subprocesses of this same binary: create a temp machine from
@@ -599,6 +611,10 @@ fn ensure_init_layer(
     smolfile: Option<&Path>,
     rebuild: bool,
 ) -> smolvm::Result<PathBuf> {
+    // The bake here only ever receives a registry image: `ensure_init_layer` is
+    // gated on `image_bakeable()` (local archives/dirs take the direct path),
+    // because the `pack create --from-vm` snapshot below cannot source a local
+    // image's layers (they're flattened, with no registry manifest to pull).
     let key = init_layer_key(params.image.as_deref(), &params.init, &params.env);
     let dir = init_layer_cache_dir();
     std::fs::create_dir_all(&dir)
@@ -844,7 +860,17 @@ impl RunCmd {
         // that artifact, so init's cost (e.g. `apt install`) is paid once and reused
         // on every later run instead of re-running on each ephemeral boot. Skipped for
         // detached/persistent runs (`-d`) and when `--no-init-cache` is set.
-        if !self.no_init_cache && !self.detach && params.image.is_some() && !params.init.is_empty()
+        //
+        // Only REGISTRY images are baked. A local image (`--image -` / `--image
+        // file.tar` / a rootfs dir) is flattened with no registry manifest, so the
+        // bake's `pack create --from-vm` snapshot can't source its layers; and a
+        // `--image -` archive can't be re-read by the bake's child subprocess
+        // (null stdin) anyway. Local images take the direct path below, which
+        // stages the archive once in this process and runs init inline (#459).
+        if !self.no_init_cache
+            && !self.detach
+            && image_bakeable(params.image.as_deref())
+            && !params.init.is_empty()
         {
             let cached =
                 ensure_init_layer(&params, self.smolfile.as_deref(), self.rebuild_init_cache)?;
