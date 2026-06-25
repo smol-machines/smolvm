@@ -976,6 +976,13 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             }
         }
 
+        // Forward this VM's per-VM readiness-marker name into the guest env (the
+        // manager set it on this boot subprocess) so the agent writes the marker
+        // the host pre-created and polls. See manager::ready_marker_name.
+        if let Ok(marker) = std::env::var(guest_env::READY_MARKER) {
+            env_strings.push(cstr(&format!("{}={}", guest_env::READY_MARKER, marker)));
+        }
+
         // DNS allow-host filtering is now enforced inside libkrun (see the
         // egress policy above). The guest-side DNS proxy is intentionally NOT
         // started: the guest keeps its default resolv.conf (1.1.1.1/8.8.8.8) so

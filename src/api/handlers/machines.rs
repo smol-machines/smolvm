@@ -23,7 +23,7 @@
 //! Recommended: keep names short and descriptive (e.g., "dev-vm", "test-1").
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     Json,
 };
 use std::sync::Arc;
@@ -36,9 +36,9 @@ use crate::api::state::{
     ReservationGuard,
 };
 use crate::api::types::{
-    ApiErrorResponse, CreateMachineRequest, DeleteResponse, EnvVar, ExecResponse,
+    ApiErrorResponse, CreateMachineRequest, DeleteResponse, EnvVar, ExecResponse, ForkRequest,
     ListMachinesResponse, MachineExecRequest, MachineInfo, MountInfo, MountSpec, PortSpec,
-    ResizeMachineRequest, ResourceSpec,
+    ResizeMachineRequest, ResourceSpec, StartMachineQuery,
 };
 use crate::api::validate_command;
 use crate::api::TraceId;
@@ -690,7 +690,8 @@ fn classify_launch_error(e: String) -> ApiError {
     path = "/api/v1/machines/{name}/start",
     tag = "Machines",
     params(
-        ("name" = String, Path, description = "Machine name")
+        ("name" = String, Path, description = "Machine name"),
+        ("forkable" = Option<bool>, Query, description = "Start as a fork base (memfd RAM + control socket)")
     ),
     responses(
         (status = 200, description = "Machine started", body = MachineInfo),
@@ -702,6 +703,7 @@ fn classify_launch_error(e: String) -> ApiError {
 pub async fn start_machine(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
+    Query(query): Query<StartMachineQuery>,
 ) -> Result<Json<MachineInfo>, ApiError> {
     // Hold the per-machine lifecycle lock across the whole start so a concurrent
     // stop/delete cannot detach the macOS layers volume between our acquire+mount
@@ -787,16 +789,23 @@ pub async fn start_machine(
     let storage_gb = record.storage_gb;
     let overlay_gb = record.overlay_gb;
     let source_smolmachine = record.source_smolmachine.clone();
+    let forkable = query.forkable;
     let (manager, pid) = tokio::task::spawn_blocking(move || {
         let manager = AgentManager::for_vm_with_sizes(&name_clone, storage_gb, overlay_gb)
             .map_err(|e| format!("failed to create agent manager: {}", e))?;
 
         // Wire pre-extracted layers if this machine was created from a .smolmachine.
-        let features = crate::api::state::build_launch_features(
+        let mut features = crate::api::state::build_launch_features(
             Some(&name_clone),
             source_smolmachine.as_deref(),
         )
         .map_err(|e| format!("failed to prepare packed layers: {}", e))?;
+        // Forkable start: memfd-back guest RAM and expose a control socket at the
+        // machine's known path so it can later be forked via the fork endpoint.
+        if forkable {
+            features.forkable = true;
+            features.control_socket = Some(crate::agent::fork::control_socket_path(&name_clone));
+        }
         let _ = manager
             .ensure_running_via_subprocess(mounts, ports, resources, features)
             .map_err(|e| format!("failed to start machine: {}", e))?;
@@ -886,6 +895,148 @@ pub async fn start_machine(
     // may falsely report "stopped" on macOS due to setsid/session-leader
     // PID visibility issues.
     let mut info = record_to_info(&name, &record);
+    info.state = "running".to_string();
+    info.pid = pid;
+    Ok(Json(info))
+}
+
+/// Classify a fork-preparation failure into the right HTTP status. The golden
+/// missing is a 404; the golden not being forkable / not yet ready, or the clone
+/// name already being taken, is a 409; a nested-fork request is a 400; anything
+/// else is a 500.
+fn classify_fork_error(e: SmolvmError) -> ApiError {
+    let msg = e.to_string();
+    let lc = msg.to_ascii_lowercase();
+    if lc.contains("nested fork") {
+        ApiError::BadRequest(msg)
+    } else if lc.contains("already exists")
+        || lc.contains("not running forkable")
+        || lc.contains("control socket not responding")
+        || lc.contains("not ready to fork")
+    {
+        // Clone name taken, or the golden isn't a ready fork base — both 409.
+        ApiError::Conflict(msg)
+    } else if lc.contains("not found") {
+        ApiError::NotFound(msg)
+    } else {
+        ApiError::Internal(msg)
+    }
+}
+
+/// Fork a running, forkable golden machine into a new clone (copy-on-write
+/// memory + disks).
+#[utoipa::path(
+    post,
+    path = "/api/v1/machines/{name}/fork",
+    tag = "Machines",
+    params(
+        ("name" = String, Path, description = "Golden (source) machine name")
+    ),
+    request_body = ForkRequest,
+    responses(
+        (status = 200, description = "Clone forked and running", body = MachineInfo),
+        (status = 400, description = "Invalid request (e.g. nested fork)", body = ApiErrorResponse),
+        (status = 404, description = "Golden machine not found", body = ApiErrorResponse),
+        (status = 409, description = "Golden not forkable, or clone name already exists", body = ApiErrorResponse),
+        (status = 500, description = "Fork failed", body = ApiErrorResponse)
+    )
+)]
+pub async fn fork_machine(
+    State(state): State<Arc<ApiState>>,
+    Path(golden): Path<String>,
+    Json(req): Json<ForkRequest>,
+) -> Result<Json<MachineInfo>, ApiError> {
+    let clone = req.name.clone();
+    let pinned_ports: Vec<(u16, u16)> = req.ports.iter().map(|p| (p.host, p.guest)).collect();
+
+    // Serialize lifecycle on the CLONE name so a concurrent start/stop/delete of
+    // the same clone can't race the fork's register + boot. The golden is only
+    // read + frozen via its control socket, which tolerates concurrent forks.
+    let lifecycle = state.lifecycle_lock(&clone);
+    let _guard = lifecycle.lock().await;
+
+    // Phase 1: freeze + snapshot the golden, register the clone with CoW disks.
+    // This is unix-socket IO + disk work, so it runs on the blocking pool. Its
+    // failures carry precondition semantics (404/409/400), mapped distinctly
+    // from the boot failures below.
+    let prep = {
+        let db = state.db().clone();
+        let golden_b = golden.clone();
+        let clone_b = clone.clone();
+        let ports = pinned_ports.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::agent::fork::prepare_fork(
+                &db, &golden_b, &clone_b, &ports, /* clone_forkable */ false,
+            )
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+        .map_err(classify_fork_error)?
+    };
+
+    // Phase 2: boot the clone from the golden's in-memory snapshot (warm — its
+    // processes are already running in the restored RAM, so unlike a cold start
+    // there is no image workload to launch), then rejuvenate its identity.
+    let clone_b = clone.clone();
+    let db = state.db().clone();
+    let (manager, pid, clone_record) = tokio::task::spawn_blocking(move || {
+        let record = prep.clone_record;
+        let mounts = record.host_mounts();
+        let ports = record.port_mappings();
+        let resources = record.vm_resources();
+
+        let manager =
+            AgentManager::for_vm_with_sizes(&clone_b, record.storage_gb, record.overlay_gb)
+                .map_err(|e| format!("failed to create agent manager: {}", e))?;
+
+        let mut features = crate::api::state::build_launch_features(
+            Some(&clone_b),
+            record.source_smolmachine.as_deref(),
+        )
+        .map_err(|e| format!("failed to prepare packed layers: {}", e))?;
+        // Boot from the golden's snapshot instead of cold-booting.
+        features.snapshot_dir = Some(prep.snapshot_dir);
+
+        if let Err(e) = manager.ensure_running_via_subprocess(mounts, ports, resources, features) {
+            // Boot failed: roll back the clone registration so a failed fork
+            // leaves nothing half-created.
+            let _ = db.remove_vm(&clone_b);
+            let _ = std::fs::remove_dir_all(vm_data_dir(&clone_b));
+            return Err(format!("failed to boot clone: {}", e));
+        }
+
+        // Give the clone a fresh identity (hostname, machine-id, RNG) so it does
+        // not share the golden's random stream.
+        crate::agent::fork::rejuvenate_clone(&clone_b);
+
+        let pid = manager.child_pid();
+        Ok::<_, String>((manager, pid, record))
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+    .map_err(classify_launch_error)?;
+
+    // Register the clone so exec/run endpoints can reach it.
+    state.insert_machine(&clone, machine_entry_from_record(&clone_record, manager));
+
+    // Persist the running state.
+    let pid_start_time = pid.and_then(process_start_time);
+    let record = state
+        .db()
+        .update_vm(&clone, |r| {
+            r.state = RecordState::Running;
+            r.pid = pid;
+            r.pid_start_time = pid_start_time;
+        })
+        .map_err(ApiError::database)?
+        .ok_or_else(|| {
+            ApiError::NotFound(format!(
+                "clone '{}' disappeared from database during fork",
+                clone
+            ))
+        })?;
+
+    let mut info = record_to_info(&clone, &record);
     info.state = "running".to_string();
     info.pid = pid;
     Ok(Json(info))
@@ -1197,6 +1348,11 @@ pub async fn delete_machine(
     // Remove VM data directory (disk images, sockets, etc.)
     let data_dir = vm_data_dir(&name);
     if data_dir.exists() {
+        // Release this VM's per-VM uid (if any) back to the allocator before the
+        // dir holding its `.vm-uid` record is removed, so a high-churn cloud node
+        // doesn't leak the uid range. A fork clone has no uid of its own (it
+        // shares its golden's). See process::free_vm_uid.
+        crate::process::free_vm_uid(&crate::agent::vm_uid_registry_dir(), &data_dir);
         if let Err(e) = std::fs::remove_dir_all(&data_dir) {
             tracing::warn!(error = %e, "failed to remove VM data directory: {}", data_dir.display());
         }

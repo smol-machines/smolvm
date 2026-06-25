@@ -95,6 +95,36 @@ impl ServeStartCmd {
             std::env::set_var("SMOLVM_LOG_FORMAT", "json");
         }
 
+        // Data root. Per-VM uid isolation needs every smolvm path traversable by
+        // the dropped uids; XDG-under-a-700-home isn't, a system data root is.
+        // serve additionally auto-defaults to /var/lib/smolvm when privileged
+        // (allow_auto = true). An explicit SMOLVM_DATA_DIR was already applied for
+        // every command in main(); calling again is idempotent. Single-threaded
+        // before the tokio runtime, so set_var is safe.
+        smolvm::process::apply_system_data_root(/* allow_auto */ true);
+
+        // Lock the state dirs holding machine records / credentials / config down
+        // to 0700 so a Landlock-exempt fork clone (which runs as its golden's uid)
+        // can't read other tenants' data through the now world-traversable data
+        // root. These sit OUTSIDE the traversable VM-data/rootfs chains, so this
+        // doesn't affect VM boots.
+        #[cfg(target_os = "linux")]
+        if smolvm::process::vm_uid_drop_active() {
+            use std::os::unix::fs::PermissionsExt;
+            let mut sensitive: Vec<std::path::PathBuf> = Vec::new();
+            if let Some(d) = dirs::data_local_dir().or_else(dirs::data_dir) {
+                sensitive.push(d.join("smolvm").join("server"));
+                sensitive.push(d.join("smolvm").join("node-credentials"));
+            }
+            if let Some(h) = dirs::home_dir() {
+                sensitive.push(h.join(".config").join("smolvm"));
+            }
+            for dir in sensitive {
+                let _ = std::fs::create_dir_all(&dir);
+                let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+
         let listen_target = ListenTarget::parse(&self.listen)?;
 
         // Set up verbose logging if requested
@@ -149,6 +179,30 @@ impl ServeStartCmd {
             std::env::set_var("SMOLVM_LANDLOCK", &self.landlock);
             if self.landlock != "off" {
                 tracing::info!(mode = %self.landlock, "VM filesystem confinement (Landlock) enabled");
+            }
+        }
+
+        // Per-VM uid isolation preflight. When serve is privileged each VMM drops
+        // to its own unprivileged uid (process::vm_drop_ids), containing a
+        // guest→VMM escape to one VM. That only works if the data root is
+        // traversable (others-execute) by the drop uid — an XDG-under-a-700-home
+        // layout is not, and the VMM would die with a cryptic readiness timeout.
+        // Warn loudly with the fix instead. Opt out with SMOLVM_VM_UID_DROP=off.
+        #[cfg(target_os = "linux")]
+        if smolvm::process::vm_uid_drop_active() {
+            let cache_root = smolvm::agent::vm_cache_root();
+            match smolvm::process::first_nontraversable_ancestor(&cache_root) {
+                Some(blocker) => tracing::warn!(
+                    blocker = %blocker.display(),
+                    "per-VM uid isolation is active but {b} is not traversable (o+x) by \
+                     unprivileged uids — VMMs will fail to start. Use a world-traversable data \
+                     root (e.g. run serve with HOME=/var/lib/smolvm) or `chmod o+x {b}`, or \
+                     disable with SMOLVM_VM_UID_DROP=off",
+                    b = blocker.display(),
+                ),
+                None => tracing::info!(
+                    "per-VM uid isolation active (each VMM drops to its own unprivileged uid)"
+                ),
             }
         }
 

@@ -138,6 +138,23 @@ pub fn harden_self() {
     }
 }
 
+/// (Re)assert the process's `PR_SET_DUMPABLE` flag.
+///
+/// `setuid()` clears dumpable, after which `ptrace_may_access` denies even a
+/// same-uid reader of `/proc/<pid>/{mem,fd}` without `CAP_SYS_PTRACE`. A forkable
+/// golden's clones map its guest-RAM memfd via `/proc/<golden>/fd`, so the
+/// forkable boot re-asserts dumpable *after* its per-VM uid drop — without this,
+/// fork breaks under uid isolation. Only the golden's own uid (under per-VM uids,
+/// exactly its clones) can reach it. Linux-only; no-op elsewhere.
+#[cfg(target_os = "linux")]
+pub fn set_dumpable(dumpable: bool) {
+    unsafe { libc::prctl(libc::PR_SET_DUMPABLE, i32::from(dumpable), 0, 0, 0) };
+}
+
+/// No-op where `prctl` isn't applicable (macOS dev).
+#[cfg(not(target_os = "linux"))]
+pub fn set_dumpable(_dumpable: bool) {}
+
 // ============================================================================
 // Per-VM cgroup v2 resource caps (noisy-neighbor / host-DoS containment)
 //
@@ -339,11 +356,17 @@ fn build_seccomp_program(enforce: bool) -> std::result::Result<seccompiler::BpfP
         libc::SYS_ftruncate, libc::SYS_fstat, libc::SYS_newfstatat, libc::SYS_statx,
         libc::SYS_fstatfs, libc::SYS_statfs, libc::SYS_fcntl, libc::SYS_flock,
         libc::SYS_dup, libc::SYS_dup3, libc::SYS_getdents64,
-        libc::SYS_readlinkat, libc::SYS_faccessat, libc::SYS_umask,
+        libc::SYS_readlinkat, libc::SYS_faccessat, libc::SYS_faccessat2, libc::SYS_umask,
         libc::SYS_fgetxattr, libc::SYS_flistxattr, libc::SYS_pipe2,
         // memory (guest RAM, dlopen of libkrun)
         libc::SYS_mmap, libc::SYS_munmap, libc::SYS_mremap, libc::SYS_mprotect,
         libc::SYS_madvise, libc::SYS_brk,
+        // memfd_create: a forkable machine (`machine start --forkable`) backs its
+        // guest RAM with a memfd so clones can MAP_PRIVATE it copy-on-write. Used
+        // only on the fork base, but harmless (anonymous in-memory file, no host
+        // fs reach) to allow for every VM. Without it a forkable boot is SIGSYS-
+        // killed under `seccomp=enforce`.
+        libc::SYS_memfd_create,
         // KVM + device ioctls, eventfd plumbing
         libc::SYS_ioctl, libc::SYS_eventfd2,
         // epoll / poll event loops (virtio, vsock/TSI)
@@ -352,7 +375,7 @@ fn build_seccomp_program(enforce: bool) -> std::result::Result<seccompiler::BpfP
         // sockets (vsock/TSI data path, host networking)
         libc::SYS_socket, libc::SYS_socketpair, libc::SYS_connect, libc::SYS_bind,
         libc::SYS_listen, libc::SYS_accept, libc::SYS_sendto, libc::SYS_recvfrom,
-        libc::SYS_sendmsg, libc::SYS_recvmsg, libc::SYS_setsockopt,
+        libc::SYS_sendmsg, libc::SYS_sendmmsg, libc::SYS_recvmsg, libc::SYS_setsockopt,
         libc::SYS_getsockopt, libc::SYS_shutdown,
         // threads & synchronization (vCPU/worker threads, render-thread priority)
         libc::SYS_clone, libc::SYS_clone3, libc::SYS_futex, libc::SYS_set_robust_list,
@@ -372,7 +395,12 @@ fn build_seccomp_program(enforce: bool) -> std::result::Result<seccompiler::BpfP
         libc::SYS_prctl, libc::SYS_prlimit64, libc::SYS_getrusage,
         libc::SYS_sysinfo, libc::SYS_uname, libc::SYS_getrandom,
         libc::SYS_getuid, libc::SYS_geteuid, libc::SYS_getgid, libc::SYS_getegid,
-        libc::SYS_capget, libc::SYS_setpgid,
+        // capget/capset: virtiofs drops CAP_FSETID around a passthrough write/
+        // create (`drop_effective_cap`, via the `caps` crate) so the kernel
+        // strips setuid/setgid bits on non-owner writes — same root-VMM /
+        // non-root-guest passthrough path as setres{u,g}id below. A cap-dropped
+        // VMM can't raise caps outside its bounding set, so this grants nothing.
+        libc::SYS_capget, libc::SYS_capset, libc::SYS_setpgid,
         // accept4 + sock{name,peername}: the published-port listener threads
         // (smolvm-tcp-*) and virtio-net path. Rust's TcpListener uses accept4,
         // not accept — the audit run logged these (288/51/52 on x86_64) because
@@ -389,6 +417,18 @@ fn build_seccomp_program(enforce: bool) -> std::result::Result<seccompiler::BpfP
         libc::SYS_fchmod, libc::SYS_fdatasync, libc::SYS_utimensat, libc::SYS_copy_file_range,
         libc::SYS_fsetxattr, libc::SYS_fremovexattr,
         libc::SYS_lgetxattr, libc::SYS_lsetxattr, libc::SYS_llistxattr, libc::SYS_lremovexattr,
+        // virtiofs scopes each request to the guest process's uid/gid before
+        // touching the host fs (so DAC checks run as the guest user, not as a
+        // root VMM) via per-thread setres{u,g}id — passthrough.rs `scoped_cred!`
+        // / `set_creds`. Reached only when the VMM keeps CAP_SETUID (root, no
+        // per-VM uid drop) AND a NON-root guest process does fs I/O: a path a
+        // single-uid (all-root) trace never exercises, which is why a diverse-
+        // workload review caught it and the original audit didn't. Without these
+        // an unprivileged guest writing through virtiofs SIGSYS-kills the VMM
+        // under `enforce`. Safe to allow: a capability-dropped (uid-isolated)
+        // VMM still can't escalate — the kernel enforces CAP_SETUID regardless,
+        // so the syscall just EPERMs. Matches virtiofsd's own allowlist.
+        libc::SYS_setresuid, libc::SYS_setresgid,
     ];
 
     // Legacy syscalls present only on x86_64; aarch64 exposes only the *at/p
@@ -575,6 +615,329 @@ pub fn drop_privileges(uid: u32, gid: u32) -> std::result::Result<(), String> {
 /// No-op stub where privilege dropping isn't applicable (macOS dev).
 #[cfg(not(target_os = "linux"))]
 pub fn drop_privileges(_uid: u32, _gid: u32) -> std::result::Result<(), String> {
+    Ok(())
+}
+
+// ============================================================================
+// Per-VM uid allocation (defense-in-depth for a guest→VMM escape)
+//
+// When the launcher runs privileged (root `serve`), each VMM is dropped to its
+// own dedicated unprivileged uid so a guest→VMM escape is contained to that one
+// VM: it can't ptrace/read other tenants' VMMs (different uid), reach their
+// disks (different ownership), or touch root/host files. The uid is derived
+// deterministically from the VM's data dir (stable across restarts, no
+// allocation state), mapped into a high range well clear of system, regular,
+// `nobody`, and systemd-DynamicUser uids. A fork clone uses its GOLDEN's uid so
+// it can map the golden's guest-RAM memfd via /proc/<golden>/fd (same uid).
+// ============================================================================
+
+/// Base of the reserved per-VM uid range. Above normal system (<1000), user
+/// (1000–60000), `nobody` (65534), and systemd DynamicUser (61184–65519) uids.
+#[cfg(target_os = "linux")]
+const VM_UID_BASE: u32 = 2_000_000;
+/// Span of the per-VM uid range: the allocator hands out the lowest free uid in
+/// `[BASE, BASE+SPAN)`. 100M is far more than any node hosts at once.
+#[cfg(target_os = "linux")]
+const VM_UID_SPAN: u32 = 100_000_000;
+
+/// Whether per-VM uid isolation applies here: the launcher is privileged (so it
+/// can chown + setuid) and the operator hasn't opted out with
+/// `SMOLVM_VM_UID_DROP=off`.
+#[cfg(target_os = "linux")]
+pub fn vm_uid_drop_active() -> bool {
+    let is_root = unsafe { libc::geteuid() } == 0;
+    let opted_out =
+        std::env::var_os("SMOLVM_VM_UID_DROP").as_deref() == Some(std::ffi::OsStr::new("off"));
+    is_root && !opted_out
+}
+
+/// No-op where the uid drop isn't applicable (macOS dev).
+#[cfg(not(target_os = "linux"))]
+pub fn vm_uid_drop_active() -> bool {
+    false
+}
+
+/// Relocate all smolvm state under a single system data root by pointing `HOME`
+/// at it before any path is computed — every `dirs::`-derived path (VM dirs,
+/// agent rootfs, templates, server DB) follows. This is what lets per-VM uid
+/// isolation's dropped uids traverse to their data (an XDG-under-a-700-home
+/// layout can't). `SMOLVM_DATA_DIR` is honored for **every** command (so the CLI
+/// and serve agree); `allow_auto` additionally defaults to `/var/lib/smolvm` when
+/// privileged with the uid drop active and no XDG override (serve only — a
+/// one-off root CLI invocation shouldn't silently switch roots). Must be called
+/// single-threaded, before the tokio runtime, so `set_var` is safe.
+#[cfg(target_os = "linux")]
+pub fn apply_system_data_root(allow_auto: bool) {
+    let root = if let Some(explicit) = std::env::var_os("SMOLVM_DATA_DIR") {
+        std::path::PathBuf::from(explicit)
+    } else if allow_auto
+        && vm_uid_drop_active()
+        && std::env::var_os("XDG_CACHE_HOME").is_none()
+        && std::env::var_os("XDG_DATA_HOME").is_none()
+    {
+        std::path::PathBuf::from("/var/lib/smolvm")
+    } else {
+        return;
+    };
+    match std::fs::create_dir_all(&root) {
+        Ok(()) => {
+            use std::os::unix::fs::PermissionsExt;
+            // 0755 so dropped VMM uids can traverse to their data.
+            let _ = std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755));
+        }
+        Err(e) => {
+            tracing::warn!(root = %root.display(), error = %e, "failed to create smolvm data root")
+        }
+    }
+    // Registry auth (crane/docker) falls back to `$HOME/.docker`, which we're about
+    // to move off the operator's real home — pin DOCKER_CONFIG to the ORIGINAL
+    // `~/.docker` (if it exists and the operator hasn't set DOCKER_CONFIG) so
+    // private image pulls keep finding their credentials after the relocation.
+    if std::env::var_os("DOCKER_CONFIG").is_none() {
+        if let Some(dir) = dirs::home_dir()
+            .map(|h| h.join(".docker"))
+            .filter(|d| d.is_dir())
+        {
+            std::env::set_var("DOCKER_CONFIG", dir);
+        }
+    }
+    std::env::set_var("HOME", &root);
+    std::env::remove_var("XDG_CACHE_HOME");
+    std::env::remove_var("XDG_DATA_HOME");
+    std::env::remove_var("XDG_CONFIG_HOME");
+    tracing::info!(data_root = %root.display(), "smolvm state rooted at a system data dir");
+}
+
+/// No-op where the data root isn't applicable (macOS dev).
+#[cfg(not(target_os = "linux"))]
+pub fn apply_system_data_root(_allow_auto: bool) {}
+
+/// Per-VM uid isolation needs every ancestor of the data root to be traversable
+/// (others-execute) by the drop uid, or the dropped VMM can't reach its own
+/// files (it fails with a cryptic readiness timeout). Returns the first ancestor
+/// of `path` (walking up) that a non-owner can't traverse, or `None` if the whole
+/// chain is fine. `serve` uses it to warn the operator up front.
+#[cfg(target_os = "linux")]
+pub fn first_nontraversable_ancestor(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut cur = Some(path);
+    while let Some(dir) = cur {
+        if let Ok(meta) = std::fs::metadata(dir) {
+            if meta.is_dir() && meta.permissions().mode() & 0o001 == 0 {
+                return Some(dir.to_path_buf());
+            }
+        }
+        cur = dir.parent();
+    }
+    None
+}
+
+/// No-op where the uid drop isn't applicable (macOS dev).
+#[cfg(not(target_os = "linux"))]
+pub fn first_nontraversable_ancestor(_path: &std::path::Path) -> Option<std::path::PathBuf> {
+    None
+}
+
+/// The VM key recorded in registry marker `registry_dir/<uid>`, if present.
+#[cfg(target_os = "linux")]
+fn uid_marker_key(registry_dir: &std::path::Path, uid: u32) -> Option<String> {
+    std::fs::read_to_string(registry_dir.join(uid.to_string()))
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
+/// The uid already registered to `vm_key` (scan), or `None` if unallocated.
+#[cfg(target_os = "linux")]
+fn registered_uid(registry_dir: &std::path::Path, vm_key: &str) -> Option<u32> {
+    for e in std::fs::read_dir(registry_dir).ok()?.flatten() {
+        let uid = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok());
+        if let Some(uid) = uid {
+            if uid_marker_key(registry_dir, uid).as_deref() == Some(vm_key) {
+                return Some(uid);
+            }
+        }
+    }
+    None
+}
+
+/// Allocate a stable, **collision-free** unprivileged uid for the VM identified
+/// by `vm_key` (its data-dir hash), recording the assignment in `registry_dir`
+/// so no two live VMs ever share a uid. Idempotent — the same key returns the
+/// same uid until [`free_vm_uid`] releases it; the result is cached in
+/// `key_dir/.vm-uid` to skip the scan on restart. Claims the lowest free uid in
+/// the reserved range atomically (`O_EXCL`) so concurrent boots can't collide.
+#[cfg(target_os = "linux")]
+pub fn allocate_vm_uid(
+    registry_dir: &std::path::Path,
+    key_dir: &std::path::Path,
+    vm_key: &str,
+) -> std::io::Result<u32> {
+    std::fs::create_dir_all(registry_dir)?;
+    let cache = key_dir.join(".vm-uid");
+    // Fast path: a cached uid whose marker still belongs to us.
+    if let Some(uid) = std::fs::read_to_string(&cache)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+    {
+        if uid_marker_key(registry_dir, uid).as_deref() == Some(vm_key) {
+            return Ok(uid);
+        }
+    }
+    // Registered under our key already (cache lost)?
+    if let Some(uid) = registered_uid(registry_dir, vm_key) {
+        let _ = std::fs::write(&cache, uid.to_string());
+        return Ok(uid);
+    }
+    // Claim the lowest free uid atomically. A uid whose marker points at a VM
+    // whose data dir is gone is STALE — a delete path that didn't free it, or a
+    // crash — so reclaim it. This makes the registry self-healing across every
+    // delete path (no leak even if some path forgets to call `free_vm_uid`). The
+    // VM data dirs are the registry's sibling (`<…>/smolvm/uids` ⇄ `…/vms`); a
+    // marker only exists after its VM's data dir was created, so "marker present
+    // but data dir absent" reliably means deleted, never mid-boot.
+    let vms_dir = registry_dir.parent().map(|p| p.join("vms"));
+    for uid in VM_UID_BASE..VM_UID_BASE.saturating_add(VM_UID_SPAN) {
+        let marker = registry_dir.join(uid.to_string());
+        if let Some(key) = uid_marker_key(registry_dir, uid) {
+            let live = vms_dir
+                .as_ref()
+                .map(|v| v.join(&key).exists())
+                .unwrap_or(true);
+            if live {
+                continue; // held by a live VM
+            }
+            let _ = std::fs::remove_file(&marker); // stale → reclaim below
+        }
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker)
+        {
+            Ok(mut f) => {
+                use std::io::Write;
+                f.write_all(vm_key.as_bytes())?;
+                let _ = std::fs::write(&cache, uid.to_string());
+                return Ok(uid);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue, // raced
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other("per-VM uid range exhausted"))
+}
+
+/// Release the uid registered to the VM at `key_dir` (on VM delete) so it can be
+/// reused. No-op if the VM had no uid (drop inactive, or a fork clone — which
+/// shares its golden's uid and never claims its own). Linux-only.
+#[cfg(target_os = "linux")]
+pub fn free_vm_uid(registry_dir: &std::path::Path, key_dir: &std::path::Path) {
+    if let Some(uid) = std::fs::read_to_string(key_dir.join(".vm-uid"))
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+    {
+        let _ = std::fs::remove_file(registry_dir.join(uid.to_string()));
+    }
+}
+
+/// No-op where the uid drop isn't applicable (macOS dev).
+#[cfg(not(target_os = "linux"))]
+pub fn free_vm_uid(_registry_dir: &std::path::Path, _key_dir: &std::path::Path) {}
+
+/// The `(uid, gid)` a VM's VMM should drop to, allocated **collision-free** from
+/// `registry_dir`. Returns:
+/// - `None` — the drop doesn't apply (unprivileged launcher, or
+///   `SMOLVM_VM_UID_DROP=off`); boot proceeds without a drop.
+/// - `Some(Err(_))` — the drop is **active but allocation failed**; the caller
+///   MUST refuse to boot (fail closed — never silently run the VMM over-
+///   privileged, the same contract as `drop_privileges`).
+/// - `Some(Ok((uid, gid)))` — drop to this id.
+///
+/// A fork clone (`snapshot_dir` set, laid out as
+/// `<golden_dir>/fork-snapshots/<clone>`) resolves to the GOLDEN's uid so it can
+/// map the golden's memfd. gid mirrors uid (a per-VM group).
+#[cfg(target_os = "linux")]
+pub fn vm_drop_ids(
+    registry_dir: &std::path::Path,
+    data_dir: &std::path::Path,
+    snapshot_dir: Option<&std::path::Path>,
+) -> Option<std::io::Result<(u32, u32)>> {
+    if !vm_uid_drop_active() {
+        return None;
+    }
+    let key_dir = match snapshot_dir {
+        Some(snap) => snap.parent().and_then(|p| p.parent()).unwrap_or(data_dir),
+        None => data_dir,
+    };
+    let Some(vm_key) = key_dir.file_name().and_then(|n| n.to_str()) else {
+        return Some(Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "VM data dir name is not valid UTF-8",
+        )));
+    };
+    Some(allocate_vm_uid(registry_dir, key_dir, vm_key).map(|uid| (uid, uid)))
+}
+
+/// No-op where the uid drop isn't applicable (macOS dev).
+#[cfg(not(target_os = "linux"))]
+pub fn vm_drop_ids(
+    _registry_dir: &std::path::Path,
+    _data_dir: &std::path::Path,
+    _snapshot_dir: Option<&std::path::Path>,
+) -> Option<std::io::Result<(u32, u32)>> {
+    None
+}
+
+/// Add others-execute to `dir` and every ancestor that lacks it, so a dropped
+/// VMM uid can traverse to it. Execute-only (no read): traversal works but the
+/// dirs can't be listed and file contents stay governed by their own perms.
+/// Used under uid isolation for the data/rootfs/template path chains. Idempotent,
+/// best-effort. Linux-only.
+#[cfg(target_os = "linux")]
+pub fn ensure_traversable(dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut cur = Some(dir);
+    while let Some(d) = cur {
+        if d.as_os_str().is_empty() {
+            break;
+        }
+        if let Ok(meta) = std::fs::metadata(d) {
+            let mode = meta.permissions().mode();
+            if meta.is_dir() && mode & 0o001 == 0 {
+                let _ = std::fs::set_permissions(d, std::fs::Permissions::from_mode(mode | 0o001));
+            }
+        }
+        cur = d.parent();
+    }
+}
+
+/// No-op where the uid drop isn't applicable (macOS dev).
+#[cfg(not(target_os = "linux"))]
+pub fn ensure_traversable(_dir: &std::path::Path) {}
+
+/// Recursively `lchown` `path` to `(uid, gid)` (symlinks not followed). Used by
+/// the privileged launcher to hand a VM's data dir + disks + sockets to the uid
+/// its VMM will drop to. Linux-only; the caller is root.
+#[cfg(target_os = "linux")]
+pub fn chown_tree(path: &std::path::Path, uid: u32, gid: u32) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    if unsafe { libc::lchown(c.as_ptr(), uid, gid) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // Recurse into real directories only (not symlinked ones).
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.file_type().is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            chown_tree(&entry?.path(), uid, gid)?;
+        }
+    }
+    Ok(())
+}
+
+/// No-op where chown isn't applicable (macOS dev).
+#[cfg(not(target_os = "linux"))]
+pub fn chown_tree(_path: &std::path::Path, _uid: u32, _gid: u32) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -1801,6 +2164,93 @@ mod tests {
             1,
             "drop must not have taken effect"
         );
+    }
+
+    /// `(base, registry, vms)` laid out as production: `<base>/smolvm/{uids,vms}`,
+    /// so the allocator's `registry.parent()/vms` resolves to `vms`. A VM's data
+    /// dir is `vms/<vm_key>`.
+    #[cfg(target_os = "linux")]
+    fn tmp_uid_dirs(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let base =
+            std::env::temp_dir().join(format!("smolvm-uidtest-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let reg = base.join("smolvm").join("uids");
+        let vms = base.join("smolvm").join("vms");
+        std::fs::create_dir_all(&reg).unwrap();
+        std::fs::create_dir_all(&vms).unwrap();
+        (base, reg, vms)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn allocate_vm_uid_is_stable_collision_free_and_freeable() {
+        let (base, reg, vms) = tmp_uid_dirs("alloc");
+        let a = vms.join("aaaa");
+        let b = vms.join("bbbb");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+
+        let ua = allocate_vm_uid(&reg, &a, "aaaa").unwrap();
+        let ub = allocate_vm_uid(&reg, &b, "bbbb").unwrap();
+        // In range, distinct (collision-free), and stable on re-allocation.
+        assert!((VM_UID_BASE..VM_UID_BASE + VM_UID_SPAN).contains(&ua));
+        assert_ne!(ua, ub, "distinct VMs must get distinct uids");
+        assert_eq!(
+            ua,
+            allocate_vm_uid(&reg, &a, "aaaa").unwrap(),
+            "must be stable"
+        );
+
+        // Free A, then a new VM reuses A's released uid (lowest-free).
+        free_vm_uid(&reg, &a);
+        let c = vms.join("cccc");
+        std::fs::create_dir_all(&c).unwrap();
+        assert_eq!(
+            allocate_vm_uid(&reg, &c, "cccc").unwrap(),
+            ua,
+            "freed uid is reused"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn registered_uid_recovers_assignment_when_cache_lost() {
+        let (base, reg, vms) = tmp_uid_dirs("recover");
+        let a = vms.join("key-a");
+        std::fs::create_dir_all(&a).unwrap();
+        let ua = allocate_vm_uid(&reg, &a, "key-a").unwrap();
+        // Drop the per-VM cache; the registry still maps key -> uid.
+        let _ = std::fs::remove_file(a.join(".vm-uid"));
+        assert_eq!(allocate_vm_uid(&reg, &a, "key-a").unwrap(), ua);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn allocator_self_heals_leaked_uid_when_vm_dir_gone() {
+        let (base, reg, vms) = tmp_uid_dirs("selfheal");
+        let a = vms.join("aaaa");
+        std::fs::create_dir_all(&a).unwrap();
+        let ua = allocate_vm_uid(&reg, &a, "aaaa").unwrap();
+
+        // Simulate a delete path that removed the VM's data dir WITHOUT calling
+        // free_vm_uid: the registry marker is now leaked.
+        std::fs::remove_dir_all(&a).unwrap();
+        assert!(reg.join(ua.to_string()).exists(), "marker is leaked");
+
+        // A new VM reclaims that stale uid (its VM dir is gone) — no permanent
+        // leak even though the delete path forgot to free it.
+        let b = vms.join("bbbb");
+        std::fs::create_dir_all(&b).unwrap();
+        assert_eq!(
+            allocate_vm_uid(&reg, &b, "bbbb").unwrap(),
+            ua,
+            "stale (data-dir-gone) uid must be reclaimed"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// The boot gate hands out permits, returns them on drop, and lets multiple

@@ -385,12 +385,16 @@ fn signal_ready_to_host() {
 
     let content = uptime_ms().to_string();
 
+    // The host gives each VM its own marker name (SMOLVM_READY_MARKER) so
+    // concurrent boots don't race on one shared rootfs file and, under uid
+    // isolation, the host can pre-create it owned by this VM's uid. Fall back to
+    // the shared protocol constant if the host didn't set it (older host).
+    let marker =
+        std::env::var(guest_env::READY_MARKER).unwrap_or_else(|_| AGENT_READY_MARKER.to_string());
+
     // Try /oldroot first (overlay mode: virtiofs is the lower layer after pivot_root)
     // Before pivot_root: virtiofs is at /, so the / path works.
-    let paths = [
-        format!("/oldroot/{}", AGENT_READY_MARKER),
-        format!("/{}", AGENT_READY_MARKER),
-    ];
+    let paths = [format!("/oldroot/{}", marker), format!("/{}", marker)];
 
     for path in &paths {
         if Path::new(path).parent().map_or(false, |p| p.exists()) {

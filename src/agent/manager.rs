@@ -307,6 +307,16 @@ pub fn vm_cache_root() -> PathBuf {
         .join("vms")
 }
 
+/// Per-node registry for the collision-free per-VM uid allocator
+/// (`<cache_dir>/smolvm/uids/`), a sibling of the VM data dirs. Root-managed; the
+/// dropped VMMs never touch it. See `process::allocate_vm_uid`.
+pub fn vm_uid_registry_dir() -> PathBuf {
+    vm_cache_root()
+        .parent()
+        .map(|p| p.join("uids"))
+        .unwrap_or_else(|| PathBuf::from("/tmp/smolvm-uids"))
+}
+
 /// Compute the 16-hex-char directory name for a VM.
 ///
 /// Uses SHA-256 truncated to 8 bytes. The specific hash function doesn't
@@ -1211,6 +1221,28 @@ impl AgentManager {
         self.start_with_full_config(mounts, Vec::new(), resources, Default::default())
     }
 
+    /// This VM's readiness-marker filename — **per VM** (`<base>.<vm-hash>`), not
+    /// the shared protocol constant. A per-VM marker means concurrent boots can't
+    /// race on one shared file, and under uid isolation each marker is pre-created
+    /// 0600 owned by that VM's uid instead of world-writable. The host passes this
+    /// name to the guest agent via the `SMOLVM_READY_MARKER` guest env var so both
+    /// sides agree.
+    fn ready_marker_name(&self) -> String {
+        let hash = self
+            .storage_disk
+            .path()
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("default");
+        format!("{}.{}", AGENT_READY_MARKER, hash)
+    }
+
+    /// Host path of this VM's per-VM readiness marker.
+    fn ready_marker_path(&self) -> PathBuf {
+        self.rootfs_path.join(self.ready_marker_name())
+    }
+
     /// Common pre-launch setup: validate state, pre-format disks, clean markers.
     ///
     /// Called by both `start_with_full_config` (fork) and `start_via_subprocess`.
@@ -1345,10 +1377,9 @@ impl AgentManager {
             });
         }
 
-        // Clean up old socket and stale markers
+        // Clean up old socket and this VM's stale (per-VM) readiness marker.
         let _ = std::fs::remove_file(&self.vsock_socket);
-        let ready_marker = self.rootfs_path.join(AGENT_READY_MARKER);
-        let _ = std::fs::remove_file(&ready_marker);
+        let _ = std::fs::remove_file(self.ready_marker_path());
         let _ = std::fs::remove_file(&self.startup_error_log);
 
         Ok(())
@@ -1500,6 +1531,85 @@ impl AgentManager {
         };
         self.inner.lock().is_clone = features.snapshot_dir.is_some();
 
+        // Per-VM uid isolation: when running privileged (root `serve`), give this
+        // VMM its own dedicated, collision-free unprivileged uid so a guest→VMM
+        // escape is contained to one VM. We're still root here, so chown the VM's
+        // data dir (disks, sockets, logs) to that uid and tighten it to 0700 (so
+        // a sibling VM's uid — or a Landlock-exempt clone — can't read its disks);
+        // `internal_boot` does the actual setuid drop from the inherited
+        // SMOLVM_VM_UID. A fork clone shares its golden's uid (resolved from the
+        // snapshot path) so it can map the golden's memfd. No-op unless privileged;
+        // opt out with SMOLVM_VM_UID_DROP=off. See process::vm_drop_ids.
+        let data_dir = self.storage_disk.path().parent().map(|p| p.to_path_buf());
+        let registry = vm_uid_registry_dir();
+        let mut uid_env: Vec<(&str, String)> = Vec::new();
+        if let Some(d) = data_dir.as_deref() {
+            if let Some(result) =
+                crate::process::vm_drop_ids(&registry, d, features.snapshot_dir.as_deref())
+            {
+                // The drop is active — allocation MUST succeed or we refuse to boot
+                // (fail closed; never silently run the VMM over-privileged).
+                let (uid, gid) = result.map_err(|e| {
+                    Error::agent(
+                        "allocate per-VM uid (refusing to boot over-privileged)",
+                        e.to_string(),
+                    )
+                })?;
+                crate::process::chown_tree(d, uid, gid)
+                    .map_err(|e| Error::agent("chown vm data dir for uid drop", e.to_string()))?;
+                #[cfg(target_os = "linux")]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    // 0700: a sibling VM's uid — or a Landlock-exempt clone — must
+                    // not be able to read this VM's disks.
+                    let _ = std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700));
+                }
+                // The dropped uid must traverse to its 0700 data dir, the shared
+                // rootfs, and the disk templates. The data dir itself stays 0700;
+                // widen only the ancestor chains (execute-only). Resilient to a
+                // restrictive umask on the runtime-created intermediates.
+                crate::process::ensure_traversable(&registry);
+                if let Some(parent) = d.parent() {
+                    crate::process::ensure_traversable(parent);
+                }
+                crate::process::ensure_traversable(&self.rootfs_path);
+                if let Some(home) = dirs::home_dir() {
+                    crate::process::ensure_traversable(&home.join(".smolvm"));
+                }
+                // Pre-create this VM's per-VM readiness marker owned by its uid
+                // (0600): the dropped guest can overwrite it but couldn't create a
+                // file in the shared, host-user-owned rootfs. Per-VM name + 0600 =
+                // no shared-marker race and no world-writable file.
+                #[cfg(target_os = "linux")]
+                {
+                    use std::os::unix::ffi::OsStrExt;
+                    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+                    let marker = self.ready_marker_path();
+                    if std::fs::OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .truncate(true)
+                        .mode(0o600)
+                        .open(&marker)
+                        .is_ok()
+                    {
+                        let _ = std::fs::set_permissions(
+                            &marker,
+                            std::fs::Permissions::from_mode(0o600),
+                        );
+                        if let Ok(c) = std::ffi::CString::new(marker.as_os_str().as_bytes()) {
+                            unsafe { libc::lchown(c.as_ptr(), uid, uid) };
+                        }
+                    }
+                }
+                tracing::info!(uid, vm_dir = %d.display(), "per-VM uid isolation enabled");
+                uid_env = vec![
+                    ("SMOLVM_VM_UID", uid.to_string()),
+                    ("SMOLVM_VM_GID", gid.to_string()),
+                ];
+            }
+        }
+
         // Write boot config to a file the subprocess will read
         let config = BootConfig {
             rootfs_path: self.rootfs_path.clone(),
@@ -1560,6 +1670,15 @@ impl AgentManager {
             // Forkable / fork-clone vars set explicitly on the child (not via
             // inherited process-global env) — see fork_env above.
             .envs(fork_env)
+            // Per-VM uid drop (privileged launcher only) — see uid_env above.
+            .envs(uid_env)
+            // Per-VM readiness marker name — forwarded by the launcher into the
+            // guest env so the agent writes this VM's own marker (no shared-marker
+            // race). The host polls the same path.
+            .env(
+                smolvm_protocol::guest_env::READY_MARKER,
+                self.ready_marker_name(),
+            )
             .stdin(std::process::Stdio::null())
             // SMOLVM_BOOT_DEBUG=1 surfaces the boot subprocess's stdout/stderr so
             // embedded-host launch failures can be diagnosed (normally silenced).
@@ -1743,7 +1862,15 @@ impl AgentManager {
     ///
     /// Only call after the VM process is confirmed dead.
     fn cleanup_marker_files(&self) {
-        for path in [&self.pid_file, &self.config_file, &self.vsock_socket] {
+        // Include the per-VM readiness marker so the shared rootfs doesn't
+        // accumulate one stale marker per VM ever booted.
+        let ready_marker = self.ready_marker_path();
+        for path in [
+            &self.pid_file,
+            &self.config_file,
+            &self.vsock_socket,
+            &ready_marker,
+        ] {
             if let Err(e) = std::fs::remove_file(path) {
                 if e.kind() != std::io::ErrorKind::NotFound {
                     tracing::debug!(error = %e, path = %path.display(), "failed to remove marker file");
@@ -1816,6 +1943,11 @@ impl AgentManager {
     pub fn cleanup_data_dir(&self) {
         if let Some(ref name) = self.name {
             let dir = vm_data_dir(name);
+            // Release this VM's per-VM uid (if any) back to the allocator before
+            // the dir — which holds the `.vm-uid` record — is removed. A fork
+            // clone has no uid of its own (it shares its golden's), so this is a
+            // no-op for it. See process::free_vm_uid.
+            crate::process::free_vm_uid(&vm_uid_registry_dir(), &dir);
             if dir.exists() {
                 if let Err(e) = std::fs::remove_dir_all(&dir) {
                     tracing::debug!(
@@ -1985,7 +2117,7 @@ impl AgentManager {
             ));
         }
 
-        let ready_marker = self.rootfs_path.join(AGENT_READY_MARKER);
+        let ready_marker = self.ready_marker_path();
 
         while start.elapsed() < timeout {
             // Check if child process is still alive

@@ -32,6 +32,12 @@ pub fn run(vm_name: &str, pid: i32, start_time: u64, ephemeral_name: &str) {
                 return false;
             }
             if data_dir.is_dir() {
+                // Release this VM's per-VM uid before its `.vm-uid` record goes
+                // with the dir. `machine run` is the highest-churn path, so
+                // freeing it here keeps the uid registry small (the allocator
+                // self-heals stale entries too, but proactively freeing avoids
+                // buildup).
+                smolvm::process::free_vm_uid(&smolvm::agent::vm_uid_registry_dir(), &data_dir);
                 std::fs::remove_dir_all(&data_dir).is_ok()
             } else {
                 !data_dir.exists()

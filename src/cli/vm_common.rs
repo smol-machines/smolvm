@@ -649,11 +649,6 @@ pub(crate) fn print_create_success(params: &CreateVmParams) {
 // Fork
 // ============================================================================
 
-/// Path to a forkable machine's control socket (pause/resume/checkpoint/FORK).
-fn control_socket_path(name: &str) -> std::path::PathBuf {
-    vm_data_dir(name).join("control.sock")
-}
-
 /// Per-launch fork parameters, threaded into `start_vm_named` instead of mutating
 /// process-global env vars. The launcher (in the spawned `_boot-vm`) reads these
 /// from its own env, which the manager now sets explicitly on the child — so the
@@ -673,40 +668,9 @@ pub struct ForkLaunch {
 pub fn forkable_launch(name: &str) -> ForkLaunch {
     ForkLaunch {
         forkable: true,
-        control_socket: Some(control_socket_path(name)),
+        control_socket: Some(smolvm::agent::fork::control_socket_path(name)),
         snapshot_dir: None,
     }
-}
-
-/// Send a single line command to a VM control socket and return its reply line.
-fn control_socket_cmd(sock: &std::path::Path, cmd: &str) -> smolvm::Result<String> {
-    use smolvm::Error;
-    use std::io::{Read, Write};
-    use std::os::unix::net::UnixStream;
-
-    let mut stream = UnixStream::connect(sock)
-        .map_err(|e| Error::agent("connect control socket", e.to_string()))?;
-    stream
-        .set_read_timeout(Some(std::time::Duration::from_secs(60)))
-        .ok();
-    stream
-        .write_all(format!("{cmd}\n").as_bytes())
-        .map_err(|e| Error::agent("write control socket", e.to_string()))?;
-    let mut reply = String::new();
-    let mut byte = [0u8; 1];
-    loop {
-        match stream.read(&mut byte) {
-            Ok(0) => break,
-            Ok(_) => {
-                if byte[0] == b'\n' {
-                    break;
-                }
-                reply.push(byte[0] as char);
-            }
-            Err(e) => return Err(Error::agent("read control socket", e.to_string())),
-        }
-    }
-    Ok(reply)
 }
 
 /// Fork a running, forkable `golden` machine into a new `clone`.
@@ -721,180 +685,21 @@ pub fn fork_vm(
     clone_forkable: bool,
     pinned_ports: &[(u16, u16)],
 ) -> smolvm::Result<()> {
-    use smolvm::Error;
-
-    validate_vm_name(clone, "clone name").map_err(|e| Error::config("clone name", e))?;
-
-    // Nested fork is unsupported: a clone boots from a copy-on-write MAP_PRIVATE
-    // mapping of the golden's RAM, not a fresh memfd, so it cannot itself be
-    // re-forked (its FORK would fail with "no memfd-backed RAM"). Reject
-    // `--forkable` up front instead of producing a clone that looks forkable but
-    // isn't.
-    if clone_forkable {
-        return Err(Error::agent(
-            "fork",
-            "nested fork is not supported: a clone cannot be re-forked, so `--forkable` \
-             on a fork has no effect (drop it)",
-        ));
-    }
-
     let db = SmolvmDb::open()?;
-    let golden_rec = db
-        .get_vm(golden)?
-        .ok_or_else(|| Error::vm_not_found(golden))?;
 
-    // The golden must be alive and forkable. We probe the control socket rather
-    // than the vsock agent: after its first fork the golden is frozen (paused)
-    // as the shared base, so an agent ping would fail — but STATUS still answers
-    // (running or paused), and we can fork it again.
-    let ctl = control_socket_path(golden);
-    if !ctl.exists() {
-        return Err(Error::agent(
-            "fork",
-            format!("golden '{golden}' is not running forkable; start it with `machine start --forkable --name {golden}`"),
-        ));
-    }
-    let status = control_socket_cmd(&ctl, "STATUS").map_err(|e| {
-        Error::agent(
-            "fork",
-            format!("golden '{golden}' control socket not responding ({e}); start it with `machine start --forkable --name {golden}`"),
-        )
-    })?;
-    if !status.starts_with("OK") {
-        return Err(Error::agent(
-            "fork",
-            format!("golden '{golden}' is not ready to fork: {status}"),
-        ));
-    }
-    if db.get_vm(clone)?.is_some() {
-        return Err(Error::agent(
-            "fork",
-            format!("machine '{clone}' already exists"),
-        ));
-    }
-
-    // Clone dir + snapshot dir.
-    let clone_dir = vm_data_dir(clone);
-    let snapshot_dir = clone_dir.join("snapshot");
-    std::fs::create_dir_all(&snapshot_dir)
-        .map_err(|e| Error::agent("create clone dir", e.to_string()))?;
-
-    // Register the clone in the DB with the golden's config, no running-state,
-    // and its port forwards remapped to fresh host ports. With the default TSI
-    // backend outbound is proxied per-process (each clone gets it for free, no
-    // guest MAC/IP involved); only inbound host ports must be made distinct so
-    // the clone is reachable without colliding with the still-running golden or
-    // sibling clones.
-    let mut clone_rec = golden_rec.clone();
-    clone_rec.name = clone.to_string();
-    clone_rec.pid = None;
-    clone_rec.pid_start_time = None;
-    if !pinned_ports.is_empty() {
-        // User pinned the clone's forwards explicitly — use them as-is.
-        clone_rec.ports = pinned_ports.to_vec();
-        for (h, g) in &clone_rec.ports {
-            eprintln!("  port {h}->{g} (pinned)");
-        }
-    } else if !clone_rec.ports.is_empty() {
-        let mut remapped = Vec::with_capacity(clone_rec.ports.len());
-        for (golden_host, guest) in &clone_rec.ports {
-            match alloc_free_host_port() {
-                Some(h) => {
-                    eprintln!(
-                        "  port {golden_host}->{guest} (golden) remapped to {h}->{guest} (clone)"
-                    );
-                    remapped.push((h, *guest));
-                }
-                None => eprintln!(
-                    "  warning: could not allocate a host port for guest port {guest}; dropping it"
-                ),
-            }
-        }
-        clone_rec.ports = remapped;
-    }
-    clone_rec.golden = Some(golden.to_string());
-    let gdir = vm_data_dir(golden);
-    db.insert_vm(clone, &clone_rec)?;
-
-    // Freeze the golden and write its snapshot (checkpoint + memfd manifest).
+    // Freeze + snapshot the golden, register the clone (CoW disks + DB record).
+    // The launch-agnostic mechanics live in the lib (`agent::fork`) so the CLI
+    // and the serve API share one implementation.
     eprintln!("Freezing golden '{golden}' as fork base...");
-    let reply = control_socket_cmd(&ctl, &format!("FORK {}", snapshot_dir.display()))?;
-    if !reply.starts_with("OK") {
-        let _ = db.remove_vm(clone);
-        let _ = std::fs::remove_dir_all(&clone_dir);
-        return Err(Error::agent("fork", format!("golden FORK failed: {reply}")));
-    }
-
-    // Give the clone its own disks. The golden is frozen with its block workers
-    // quiesced and flushed, so its images are a consistent backing. On Linux
-    // each disk is a qcow2 copy-on-write overlay over the golden's — filesystem
-    // independent, so the overlay starts near-empty and the fork is O(metadata)
-    // regardless of how much data the golden holds. macOS clonefiles the disks
-    // (APFS CoW). Either way the `.formatted` marker is copied so the clone
-    // never reformats and wipes the inherited filesystem.
-    let clone_disks = || -> smolvm::Result<()> {
-        // The golden's actual disks that exist, resolved by file presence
-        // (`.qcow2` if the golden is itself a clone, else `.raw`) — the same
-        // single source of truth the agent manager uses. Each entry pairs the
-        // canonical `.raw` filename (for naming the clone's disk) with the
-        // golden's real backing file and its format.
-        let disks: Vec<(&str, std::path::PathBuf, smolvm::data::disk::DiskFormat)> = [
-            smolvm::data::storage::STORAGE_DISK_FILENAME,
-            smolvm::data::storage::OVERLAY_DISK_FILENAME,
-        ]
-        .into_iter()
-        .map(|raw| {
-            let (src, fmt) = smolvm::agent::resolve_disk_image(&gdir, raw);
-            (raw, src, fmt)
-        })
-        .filter(|(_, src, _)| src.exists())
-        .collect();
-
-        #[cfg(target_os = "linux")]
-        {
-            // Each clone disk is a qcow2 CoW overlay over the golden's disk.
-            // Build all overlay specs first so libkrun is loaded once for the
-            // batch (absolute backing path: it's written verbatim into the
-            // overlay header), then copy the `.formatted` markers so the clone
-            // never reformats and wipes the inherited filesystem.
-            let mut specs = Vec::with_capacity(disks.len());
-            for (raw, src, fmt) in &disks {
-                let base = src
-                    .canonicalize()
-                    .map_err(|e| Error::agent("clone disk", format!("{}: {e}", src.display())))?;
-                let overlay = clone_dir.join(std::path::Path::new(raw).with_extension("qcow2"));
-                specs.push((overlay, base, *fmt));
-            }
-            smolvm::agent::create_disk_overlays(&specs)?;
-            for (raw, _, _) in &disks {
-                // Marker basename is the disk stem + ".formatted" (same for the
-                // golden's `.raw`/`.qcow2` and the clone's `.qcow2`).
-                let marker = std::path::Path::new(raw).with_extension("formatted");
-                let src_marker = gdir.join(&marker);
-                if src_marker.exists() {
-                    let _ = std::fs::copy(&src_marker, clone_dir.join(&marker));
-                }
-            }
+    let prep = smolvm::agent::fork::prepare_fork(&db, golden, clone, pinned_ports, clone_forkable)?;
+    for (golden_host, guest, clone_host) in &prep.port_remaps {
+        if pinned_ports.is_empty() {
+            eprintln!(
+                "  port {golden_host}->{guest} (golden) remapped to {clone_host}->{guest} (clone)"
+            );
+        } else {
+            eprintln!("  port {clone_host}->{guest} (pinned)");
         }
-        #[cfg(target_os = "macos")]
-        {
-            // macOS uses clonefile (APFS CoW), keeping the golden's disk format.
-            for (_, src, _) in &disks {
-                let dst = clone_dir.join(src.file_name().unwrap());
-                smolvm::disk_utils::clone_or_copy_file(src, &dst)
-                    .map_err(|e| Error::agent("clone disk", format!("{}: {e}", src.display())))?;
-                let src_marker = src.with_extension("formatted");
-                if src_marker.exists() {
-                    let _ = std::fs::copy(&src_marker, dst.with_extension("formatted"));
-                }
-            }
-        }
-        Ok(())
-    };
-    if let Err(e) = clone_disks() {
-        let _ = db.remove_vm(clone);
-        let _ = std::fs::remove_dir_all(&clone_dir);
-        return Err(e);
     }
 
     // Boot the clone from the golden's snapshot instead of cold-booting.
@@ -905,85 +710,21 @@ pub fn fork_vm(
         None,
         /* from_snapshot */ true,
         ForkLaunch {
-            snapshot_dir: Some(snapshot_dir.clone()),
+            snapshot_dir: Some(prep.snapshot_dir.clone()),
             ..Default::default()
         },
     );
     if result.is_ok() {
-        rejuvenate_clone(clone);
+        smolvm::agent::fork::rejuvenate_clone(clone);
         eprintln!(
             "Forked '{golden}' -> '{clone}'. Golden stays frozen as the fork base \
              (do not start it again while clones exist)."
         );
     } else {
         let _ = db.remove_vm(clone);
-        let _ = std::fs::remove_dir_all(&clone_dir);
+        let _ = std::fs::remove_dir_all(vm_data_dir(clone));
     }
     result
-}
-
-/// Best-effort per-clone identity rejuvenation after a fork. A clone inherits
-/// the golden's hostname, machine-id, and (critically) RNG state, so without
-/// this every clone would share the golden's random stream — a security
-/// problem and a source of duplicate-identity bugs across a pool. Run over the
-/// freshly-booted clone's agent: set a unique hostname, mint a fresh
-/// machine-id, and stir the kernel RNG with fresh host entropy so the streams
-/// diverge. Failures are warnings, not fatal (the clone still works).
-///
-/// Note: this stirs but does not *credit* entropy (no `RNDADDENTROPY`/VMGENID
-/// yet), and does not re-address the network (MAC/IP) — both are follow-ups.
-fn rejuvenate_clone(clone: &str) {
-    let sock = vm_data_dir(clone).join("agent.sock");
-    let seed = host_random_hex(64);
-    // Names are validated (alphanumeric + dashes), so single-quoting is safe.
-    let script = format!(
-        "hostname '{c}' 2>/dev/null; printf '%s\\n' '{c}' > /etc/hostname 2>/dev/null; \
-         (cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-' > /etc/machine-id) 2>/dev/null; \
-         printf '%s' '{s}' > /dev/urandom 2>/dev/null; true",
-        c = clone,
-        s = seed,
-    );
-    let mut client = match smolvm::agent::AgentClient::connect_with_retry(&sock) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Warning: clone '{clone}' rejuvenation skipped (agent connect: {e})");
-            return;
-        }
-    };
-    match client.vm_exec(
-        vec!["/bin/sh".into(), "-c".into(), script],
-        vec![],
-        None,
-        Some(std::time::Duration::from_secs(10)),
-        None,
-    ) {
-        Ok((0, _, _)) => {}
-        Ok((code, _, stderr)) => eprintln!(
-            "Warning: clone '{clone}' rejuvenation exited {code}: {}",
-            String::from_utf8_lossy(&stderr).trim()
-        ),
-        Err(e) => eprintln!("Warning: clone '{clone}' rejuvenation failed: {e}"),
-    }
-}
-
-/// Allocate a currently-free host TCP port by binding to port 0 and reading
-/// back the OS-assigned port. Used to give each clone distinct inbound forwards.
-fn alloc_free_host_port() -> Option<u16> {
-    std::net::TcpListener::bind(("127.0.0.1", 0))
-        .ok()
-        .and_then(|l| l.local_addr().ok())
-        .map(|addr| addr.port())
-}
-
-/// Read `hex_len/2` random bytes from the host RNG, hex-encoded. Used to seed
-/// each clone's RNG with distinct host entropy.
-fn host_random_hex(hex_len: usize) -> String {
-    use std::io::Read;
-    let mut buf = vec![0u8; hex_len / 2];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        let _ = f.read_exact(&mut buf);
-    }
-    buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 // ============================================================================
@@ -1757,6 +1498,9 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
     let data_dir = vm_data_dir(name);
     if data_dir.exists() {
         println!("Cleaning up data directory for vm: {}", name);
+        // Release this VM's per-VM uid (if any) before the dir holding its
+        // `.vm-uid` record is removed. See process::free_vm_uid.
+        smolvm::process::free_vm_uid(&smolvm::agent::vm_uid_registry_dir(), &data_dir);
         if let Err(e) = std::fs::remove_dir_all(&data_dir) {
             tracing::warn!(error = %e, "Failed to remove VM data directory: {}", data_dir.display());
         }

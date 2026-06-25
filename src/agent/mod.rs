@@ -5,6 +5,7 @@
 
 pub mod boot_config;
 mod client;
+pub mod fork;
 mod krun;
 mod launcher;
 pub mod launcher_dynamic;
@@ -26,7 +27,7 @@ pub use launcher::{
 pub use manager::{
     disk_used_mb, docker_config_dir, docker_config_mount, ensure_vm_dir, machine_layers_cache_dir,
     read_egress_telemetry, resolve_disk_image, vm_cache_root, vm_data_dir, vm_dir_hash,
-    AgentManager, AgentState,
+    vm_uid_registry_dir, AgentManager, AgentState,
 };
 
 /// Agent VM name.

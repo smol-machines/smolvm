@@ -23,6 +23,12 @@ pub const VALUE_ON: &str = "1";
 /// This is a boolean sentinel — the value is [`VALUE_ON`] when set.
 pub const GPU: &str = "SMOLVM_GPU";
 
+/// Filename of this VM's readiness marker, written by the agent into the virtiofs
+/// rootfs when boot completes. Per VM (so concurrent boots don't race on one
+/// shared file); the host pre-creates and polls the same name. Unset → the agent
+/// falls back to the shared [`crate::AGENT_READY_MARKER`] constant.
+pub const READY_MARKER: &str = "SMOLVM_READY_MARKER";
+
 /// Selects whether the guest should configure a real virtio NIC.
 pub const BACKEND: &str = "SMOLVM_NETWORK_BACKEND";
 /// Canonical backend value meaning "configure guest virtio-net".

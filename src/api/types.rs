@@ -606,3 +606,27 @@ pub struct ResizeMachineRequest {
     #[schema(example = 20)]
     pub overlay_gb: Option<u64>,
 }
+
+/// Query string for `POST /machines/{name}/start`.
+#[derive(Debug, Default, Deserialize, ToSchema)]
+pub struct StartMachineQuery {
+    /// Start as a fork base: back the guest RAM with a memfd (copy-on-write
+    /// cloneable) and expose a control socket so the machine can later be forked
+    /// with `POST /machines/{name}/fork`. The golden freezes after its first fork.
+    #[serde(default)]
+    pub forkable: bool,
+}
+
+/// Request to fork a running, forkable golden machine into a new clone.
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ForkRequest {
+    /// Name for the new clone machine.
+    #[schema(example = "clone-1")]
+    pub name: String,
+    /// Pin the clone's inbound port forwards. Without this, the golden's
+    /// forwards are remapped to freshly-allocated host ports so the clone does
+    /// not collide with the still-running golden or sibling clones.
+    #[serde(default)]
+    pub ports: Vec<PortSpec>,
+}
