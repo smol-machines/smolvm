@@ -76,6 +76,12 @@ pub fn start_vm(db: &SmolvmDb, name: &str) -> Result<VmHandle> {
 }
 
 fn start_vm_from_record(record: &VmRecord) -> Result<VmHandle> {
+    launch_from_record(record, LaunchFeatures::default())
+}
+
+/// Boot `record` with the given launch features and return a handle. Shared by
+/// the plain, forkable-golden, and fork-clone start paths so they can't drift.
+fn launch_from_record(record: &VmRecord, features: LaunchFeatures) -> Result<VmHandle> {
     let manager =
         AgentManager::for_vm_with_sizes(&record.name, record.storage_gb, record.overlay_gb)
             .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
@@ -85,11 +91,64 @@ fn start_vm_from_record(record: &VmRecord) -> Result<VmHandle> {
             record.host_mounts(),
             record.port_mappings(),
             record.vm_resources(),
-            LaunchFeatures::default(),
+            features,
         )
         .map_err(|e| Error::agent("start machine", e.to_string()))?;
 
     Ok(VmHandle::new(manager, None))
+}
+
+/// Start a persisted VM as a FORKABLE fork base: its guest RAM is backed by a
+/// memfd (copy-on-write cloneable) and a control socket is exposed so the machine
+/// can later be forked with [`fork_vm`]. Same mechanics as the CLI's
+/// `machine start --forkable`, surfaced for the embedded SDK.
+pub fn start_forkable_vm(db: &SmolvmDb, name: &str) -> Result<VmHandle> {
+    let record = get_record(db, name)?;
+    let features = LaunchFeatures {
+        forkable: true,
+        control_socket: Some(crate::agent::fork::control_socket_path(name)),
+        ..LaunchFeatures::default()
+    };
+    let handle = launch_from_record(&record, features)?;
+    mark_running(db, name, handle.child_pid())?;
+    Ok(handle)
+}
+
+/// Fork a running, forkable `golden` into a new `clone` via copy-on-write guest
+/// RAM + disks (same host). Freezes the golden (it stays paused as the shared
+/// base — clones map its RAM `MAP_PRIVATE`, so it must not run again while clones
+/// exist), boots the clone from the golden's snapshot, and returns the clone's
+/// handle. `pinned_ports` are `(host, guest)` inbound forwards for the clone;
+/// empty means the golden's forwards are remapped to freshly-allocated host
+/// ports. Shares `agent::fork` with the CLI/serve fork paths.
+pub fn fork_vm(
+    db: &SmolvmDb,
+    golden: &str,
+    clone: &str,
+    pinned_ports: &[(u16, u16)],
+) -> Result<VmHandle> {
+    // Freeze + snapshot the golden, register the clone (CoW disks + DB record).
+    // `clone_forkable = false`: a clone can't itself be re-forked (nested fork).
+    let prep = crate::agent::fork::prepare_fork(db, golden, clone, pinned_ports, false)?;
+
+    // Boot the clone from the golden's in-memory snapshot instead of cold-booting.
+    let features = LaunchFeatures {
+        snapshot_dir: Some(prep.snapshot_dir.clone()),
+        ..LaunchFeatures::default()
+    };
+    match launch_from_record(&prep.clone_record, features) {
+        Ok(handle) => {
+            crate::agent::fork::rejuvenate_clone(clone);
+            mark_running(db, clone, handle.child_pid())?;
+            Ok(handle)
+        }
+        Err(e) => {
+            // prepare_fork already registered the clone; roll it back on boot failure.
+            let _ = db.remove_vm(clone);
+            let _ = std::fs::remove_dir_all(crate::agent::vm_data_dir(clone));
+            Err(e)
+        }
+    }
 }
 
 /// Connect to an already-running VM and return a cached handle.
