@@ -415,6 +415,7 @@ pub struct CreateVmParams {
     pub port: Vec<PortMapping>,
     pub net: bool,
     pub network_backend: Option<NetworkBackend>,
+    pub dns: Option<std::net::Ipv4Addr>,
     pub init: Vec<String>,
     pub env: Vec<String>,
     pub workdir: Option<String>,
@@ -602,6 +603,7 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
     record.overlay_gb = params.overlay_gb;
     record.allowed_cidrs = params.allowed_cidrs.clone();
     record.network_backend = params.network_backend;
+    record.dns = params.dns;
     record.gpu = if params.gpu { Some(true) } else { None };
     // Same invariant the CLI enforces, applied again here because
     // Smolfile values arrive through `params.gpu_vram_mib` without
@@ -1098,6 +1100,7 @@ pub fn persist_named_running(
                 r.ports = o.ports.clone();
                 r.network = o.network;
                 r.network_backend = o.network_backend;
+                r.dns = o.dns;
                 r.storage_gb = o.storage_gb;
                 r.overlay_gb = o.overlay_gb;
                 r.allowed_cidrs = o.allowed_cidrs.clone();
@@ -1134,6 +1137,7 @@ pub struct DefaultVmOverrides {
     pub ports: Vec<(u16, u16)>,
     pub network: bool,
     pub network_backend: Option<NetworkBackend>,
+    pub dns: Option<std::net::Ipv4Addr>,
     pub storage_gb: Option<u64>,
     pub overlay_gb: Option<u64>,
     pub allowed_cidrs: Option<Vec<String>>,

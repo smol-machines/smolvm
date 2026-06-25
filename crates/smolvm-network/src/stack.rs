@@ -58,7 +58,7 @@ use crate::queues::NetworkFrameQueues;
 use crate::tcp_listeners::AcceptedTcpConnection;
 use crate::tcp_relay::{spawn_tcp_relay, TcpRelayTable};
 use crate::udp_relay;
-use crate::{virtio_net_log, DEFAULT_DNS_ADDR};
+use crate::virtio_net_log;
 use smoltcp::iface::{
     Config, Interface, PollIngressSingleResult, PollResult, SocketHandle, SocketSet,
 };
@@ -122,6 +122,8 @@ pub struct VirtioPollConfig {
     pub guest_ipv6: Ipv6Addr,
     /// IPv6 prefix length for the virtual link.
     pub prefix_len6: u8,
+    /// Upstream resolver the gateway forwards guest DNS queries to.
+    pub upstream_dns: Ipv4Addr,
     /// IP-level MTU.
     pub mtu: usize,
 }
@@ -318,8 +320,19 @@ fn run_network_stack(
         // Move payloads between established smoltcp TCP sockets and host relay
         // threads, and service the DNS gateway socket.
         relays.relay_data(&mut sockets);
-        process_dns_queries(dns_socket_handle, &mut sockets, &egress);
-        process_dns_tcp(&dns_tcp_handles, &mut dns_tcp_conns, &mut sockets, &egress);
+        process_dns_queries(
+            dns_socket_handle,
+            &mut sockets,
+            &egress,
+            config.upstream_dns,
+        );
+        process_dns_tcp(
+            &dns_tcp_handles,
+            &mut dns_tcp_conns,
+            &mut sockets,
+            &egress,
+            config.upstream_dns,
+        );
 
         // General UDP: forward staged guest datagrams to the relay thread,
         // deliver any replies it produced, and expire idle destination sockets.
@@ -679,15 +692,11 @@ fn process_dns_queries(
     dns_socket_handle: SocketHandle,
     sockets: &mut SocketSet<'_>,
     egress: &EgressPolicy,
+    upstream_dns: Ipv4Addr,
 ) {
     // Phase 1 DNS model:
     // guest UDP/53 -> smoltcp gateway socket -> host UDP socket -> upstream DNS
     //               <-               response bytes               <-
-    let upstream_dns = match DEFAULT_DNS_ADDR {
-        std::net::IpAddr::V4(ip) => ip,
-        std::net::IpAddr::V6(_) => return,
-    };
-
     let socket = sockets.get_mut::<UdpSocket>(dns_socket_handle);
     while socket.can_recv() {
         let (query, metadata) = match socket.recv() {
@@ -873,12 +882,8 @@ fn process_dns_tcp(
     conns: &mut [DnsTcpConn],
     sockets: &mut SocketSet<'_>,
     egress: &EgressPolicy,
+    upstream_dns: Ipv4Addr,
 ) {
-    let upstream_dns = match DEFAULT_DNS_ADDR {
-        IpAddr::V4(ip) => ip,
-        IpAddr::V6(_) => return,
-    };
-
     for (handle, conn) in handles.iter().zip(conns.iter_mut()) {
         let socket = sockets.get_mut::<tcp::Socket>(*handle);
 

@@ -132,7 +132,17 @@ pub struct GuestNetworkConfig {
     /// Gateway MAC address.
     pub gateway_mac: [u8; 6],
     /// DNS server address presented to the guest.
+    ///
+    /// For virtio-net this is the gateway's own address (`gateway_ip`): the
+    /// guest sends DNS to the gateway, which forwards upstream to
+    /// [`Self::upstream_dns`].
     pub dns_server: Ipv4Addr,
+    /// Upstream resolver the gateway forwards guest DNS queries to.
+    ///
+    /// Defaults to [`DEFAULT_DNS_ADDR`]; the launcher overrides it when the
+    /// caller passes `--dns <ip>` so a VM on a network that blocks the default
+    /// resolver can still resolve names.
+    pub upstream_dns: Ipv4Addr,
 }
 
 impl GuestNetworkConfig {
@@ -148,6 +158,10 @@ impl GuestNetworkConfig {
             guest_mac: [0x02, 0x53, 0x4d, 0x00, 0x00, 0x02],
             gateway_mac: [0x02, 0x53, 0x4d, 0x00, 0x00, 0x01],
             dns_server: Ipv4Addr::new(100, 96, 0, 1),
+            upstream_dns: match DEFAULT_DNS_ADDR {
+                IpAddr::V4(ip) => ip,
+                IpAddr::V6(_) => Ipv4Addr::new(1, 1, 1, 1),
+            },
         }
     }
 }
@@ -273,6 +287,7 @@ pub fn start_virtio_network(
             gateway_ipv6: guest_network.gateway_ip6,
             guest_ipv6: guest_network.guest_ip6,
             prefix_len6: guest_network.prefix_len6,
+            upstream_dns: guest_network.upstream_dns,
             mtu: 1500,
         },
         tcp_listeners.as_ref().map(|_| tcp_receiver),

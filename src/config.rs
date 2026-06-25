@@ -428,6 +428,10 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_backend: Option<NetworkBackend>,
 
+    /// Custom DNS resolver for the guest. None = backend default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns: Option<std::net::Ipv4Addr>,
+
     /// OCI image for auto-container creation on start.
     #[serde(default)]
     pub image: Option<String>,
@@ -550,6 +554,7 @@ impl VmRecord {
             overlay_gb: None,
             allowed_cidrs: None,
             network_backend: None,
+            dns: None,
             image: None,
             entrypoint: Vec::new(),
             cmd: Vec::new(),
@@ -601,6 +606,7 @@ impl VmRecord {
             overlay_gb: None,
             allowed_cidrs: None,
             network_backend: None,
+            dns: None,
             image: None,
             entrypoint: Vec::new(),
             cmd: Vec::new(),
@@ -674,6 +680,7 @@ impl VmRecord {
             storage_gib: self.storage_gb,
             overlay_gib: self.overlay_gb,
             allowed_cidrs: self.allowed_cidrs.clone(),
+            dns: self.dns,
         }
     }
 }

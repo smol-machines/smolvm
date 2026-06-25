@@ -46,6 +46,14 @@ pub struct VmResources {
     /// Allowed egress CIDR ranges. None = unrestricted, Some([]) = deny all.
     #[serde(default)]
     pub allowed_cidrs: Option<Vec<String>>,
+    /// Custom DNS resolver for the guest. None = backend default.
+    ///
+    /// Under TSI this becomes the guest's `/etc/resolv.conf` nameserver (the
+    /// guest's datagrams are proxied to it directly). Under virtio-net it
+    /// becomes the gateway's upstream resolver. Lets a VM on a network that
+    /// blocks the default resolver (e.g. 8.8.8.8) still resolve names.
+    #[serde(default)]
+    pub dns: Option<std::net::Ipv4Addr>,
 }
 
 /// Minimum memory required for the VM to boot (kernel + agent).
@@ -112,6 +120,7 @@ impl Default for VmResources {
             storage_gib: None,
             overlay_gib: None,
             allowed_cidrs: None,
+            dns: None,
         }
     }
 }

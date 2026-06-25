@@ -172,6 +172,12 @@ pub struct LaunchFeatures {
     pub snapshot_dir: Option<std::path::PathBuf>,
     /// Control socket path for a forkable machine (pause/resume/checkpoint/FORK).
     pub control_socket: Option<std::path::PathBuf>,
+    /// Override the parent-death watchdog. `None` = default (arm it iff a
+    /// separate boot binary is used, i.e. an in-process SDK embedder whose VM
+    /// must die with it). `Some(false)` forces it off — for a CLI that sets
+    /// `SMOLVM_BOOT_BINARY` (so `current_exe` need not handle `_boot-vm`) yet
+    /// DETACHES the VM to persist after the CLI exits (e.g. `smol start`/`fork`).
+    pub watch_parent: Option<bool>,
 }
 
 impl LaunchFeatures {
@@ -596,7 +602,13 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                         "libkrun does not expose krun_add_net_unixstream; update libkrun or use --net-backend tsi",
                     )
                 })?;
-                let guest_network = GuestNetworkConfig::default();
+                let mut guest_network = GuestNetworkConfig::default();
+                // A custom resolver (--dns) becomes the gateway's upstream: the
+                // guest still points at the gateway (100.96.0.1), which forwards
+                // queries to this address instead of the default.
+                if let Some(dns) = resources.dns {
+                    guest_network.upstream_dns = dns;
+                }
                 let mut guest_mac = guest_network.guest_mac;
                 let (host_fd, guest_fd) = create_unix_stream_pair().map_err(|e| {
                     Error::agent("configure virtio-net", format!("socketpair failed: {e}"))
@@ -1033,6 +1045,16 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 network.prefix_len6
             )));
             env_strings.push(cstr(&format!("{}={}", guest_env::DNS, network.dns_server)));
+        }
+
+        // TSI has no host-side gateway: the guest's datagrams are proxied to
+        // their real destination, so a custom resolver (--dns) must become the
+        // guest's resolv.conf nameserver directly. (virtio-net already pushed
+        // its gateway address above and routes the override as the upstream.)
+        if guest_network.is_none() {
+            if let Some(dns) = resources.dns {
+                env_strings.push(cstr(&format!("{}={}", guest_env::DNS, dns)));
+            }
         }
 
         // Tell the agent about pre-extracted packed layers
