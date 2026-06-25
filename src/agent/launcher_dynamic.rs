@@ -144,7 +144,7 @@ pub fn launch_agent_vm_dynamic(
     // Flag logic lives in super::gpu_virgl_flags() — see mod.rs for the full
     // explanation of each flag's purpose on Linux vs macOS.
     if config.resources.gpu {
-        let virgl_flags = super::gpu_virgl_flags();
+        let virgl_flags = super::gpu_virgl_flags(false);
         let vram_mib = config.resources.effective_gpu_vram_mib();
         let vram_bytes: u64 = (vram_mib as u64) * crate::data::consts::BYTES_PER_MIB;
 

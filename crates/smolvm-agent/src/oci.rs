@@ -125,6 +125,25 @@ struct ResolvedUser {
     home: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct GraphicsDeviceAvailability {
+    dri: bool,
+    input: bool,
+    seatd: bool,
+    udev_data: bool,
+}
+
+impl GraphicsDeviceAvailability {
+    fn detect() -> Self {
+        Self {
+            dri: Path::new("/dev/dri").exists(),
+            input: Path::new("/dev/input").exists(),
+            seatd: Path::new("/run/seatd.sock").exists(),
+            udev_data: Path::new("/run/udev/data").exists(),
+        }
+    }
+}
+
 pub fn resolve_process_identity(
     rootfs: &Path,
     user_spec: Option<&str>,
@@ -598,29 +617,60 @@ impl OciSpec {
     /// special configuration — if the VM was started with `--gpu`, the devices
     /// appear automatically inside every container.
     pub fn add_gpu_devices_if_available(&mut self) {
-        if self.mounts.iter().any(|m| m.destination == "/dev/dri") {
-            return;
+        self.add_graphics_devices(GraphicsDeviceAvailability::detect());
+    }
+
+    fn add_graphics_devices(&mut self, available: GraphicsDeviceAvailability) {
+        if available.dri && !self.mounts.iter().any(|m| m.destination == "/dev/dri") {
+            self.mounts.push(OciMount {
+                destination: "/dev/dri".to_string(),
+                mount_type: Some("bind".to_string()),
+                source: "/dev/dri".to_string(),
+                options: vec!["bind".to_string(), "rprivate".to_string()],
+            });
         }
 
-        let dri_path = std::path::Path::new("/dev/dri");
-        if !dri_path.exists() {
-            return;
+        if available.input && !self.mounts.iter().any(|m| m.destination == "/dev/input") {
+            self.mounts.push(OciMount {
+                destination: "/dev/input".to_string(),
+                mount_type: Some("bind".to_string()),
+                source: "/dev/input".to_string(),
+                options: vec!["bind".to_string(), "rprivate".to_string()],
+            });
         }
 
-        // Bind-mount /dev/dri from the VM's devtmpfs into the container.
-        //
-        // A bind mount is used rather than linux.devices entries because crun
-        // sets up a fresh tmpfs at /dev; the /dev/dri sub-directory does not
-        // exist in that tmpfs, so mknod silently fails for any device node
-        // whose parent directory is missing.  A bind mount is equivalent to
-        // `--device /dev/dri` in Docker/Podman, and crun creates the
-        // destination directory automatically when it does not yet exist.
-        self.mounts.push(OciMount {
-            destination: "/dev/dri".to_string(),
-            mount_type: Some("bind".to_string()),
-            source: "/dev/dri".to_string(),
-            options: vec!["bind".to_string(), "rprivate".to_string()],
-        });
+        // libinput reads udev's runtime database to discover ID_INPUT_* and
+        // seat tags. The agent synthesizes those records for the virtio input
+        // devices because this minimal guest does not run systemd-udevd.
+        if available.input
+            && available.udev_data
+            && !self.mounts.iter().any(|m| m.destination == "/run/udev")
+        {
+            self.mounts.push(OciMount {
+                destination: "/run/udev".to_string(),
+                mount_type: Some("bind".to_string()),
+                source: "/run/udev".to_string(),
+                options: vec!["bind".to_string(), "ro".to_string(), "rprivate".to_string()],
+            });
+        }
+
+        if available.seatd
+            && !self
+                .mounts
+                .iter()
+                .any(|m| m.destination == "/run/seatd.sock")
+        {
+            self.mounts.push(OciMount {
+                destination: "/run/seatd.sock".to_string(),
+                mount_type: Some("bind".to_string()),
+                source: "/run/seatd.sock".to_string(),
+                options: vec!["bind".to_string()],
+            });
+        }
+        if available.seatd {
+            self.add_env("LIBSEAT_BACKEND", "seatd");
+            self.add_env("SEATD_SOCK", "/run/seatd.sock");
+        }
     }
 
     /// Write the OCI spec to a config.json file in the bundle directory.
@@ -952,6 +1002,34 @@ fn default_devices() -> Vec<OciDevice> {
             major: 5,
             minor: 0,
             file_mode: Some(0o666),
+            uid: Some(0),
+            gid: Some(0),
+        },
+        // Linux virtual terminals used by direct DRM compositors.
+        OciDevice {
+            device_type: "c".to_string(),
+            path: "/dev/tty0".to_string(),
+            major: 4,
+            minor: 0,
+            file_mode: Some(0o666),
+            uid: Some(0),
+            gid: Some(0),
+        },
+        OciDevice {
+            device_type: "c".to_string(),
+            path: "/dev/tty1".to_string(),
+            major: 4,
+            minor: 1,
+            file_mode: Some(0o666),
+            uid: Some(0),
+            gid: Some(0),
+        },
+        OciDevice {
+            device_type: "c".to_string(),
+            path: "/dev/console".to_string(),
+            major: 5,
+            minor: 1,
+            file_mode: Some(0o600),
             uid: Some(0),
             gid: Some(0),
         },
@@ -1350,6 +1428,92 @@ mod tests {
         // Values just under limit should pass
         let ok_value = "x".repeat(32 * 1024);
         assert!(validate_env_vars(&[("KEY".to_string(), ok_value)]).is_ok());
+    }
+
+    #[test]
+    fn graphics_devices_add_input_metadata_as_read_only() {
+        let identity = ProcessIdentity::root();
+        let mut spec = OciSpec::new(&["echo".to_string()], &[], "/", false, &identity, false);
+
+        spec.add_graphics_devices(GraphicsDeviceAvailability {
+            dri: true,
+            input: true,
+            seatd: true,
+            udev_data: true,
+        });
+
+        let udev = spec
+            .mounts
+            .iter()
+            .find(|mount| mount.destination == "/run/udev")
+            .expect("udev metadata mount");
+        assert_eq!(udev.source, "/run/udev");
+        assert!(udev.options.contains(&"ro".to_string()));
+        assert!(spec
+            .mounts
+            .iter()
+            .any(|mount| mount.destination == "/dev/input"));
+        assert!(spec
+            .process
+            .env
+            .contains(&"LIBSEAT_BACKEND=seatd".to_string()));
+        assert!(spec
+            .process
+            .env
+            .contains(&"SEATD_SOCK=/run/seatd.sock".to_string()));
+    }
+
+    #[test]
+    fn graphics_devices_do_not_expose_udev_without_input_devices() {
+        let identity = ProcessIdentity::root();
+        let mut spec = OciSpec::new(&["echo".to_string()], &[], "/", false, &identity, false);
+
+        spec.add_graphics_devices(GraphicsDeviceAvailability {
+            udev_data: true,
+            ..GraphicsDeviceAvailability::default()
+        });
+
+        assert!(!spec
+            .mounts
+            .iter()
+            .any(|mount| mount.destination == "/run/udev"));
+    }
+
+    #[test]
+    fn graphics_device_mounts_and_environment_are_idempotent() {
+        let identity = ProcessIdentity::root();
+        let mut spec = OciSpec::new(&["echo".to_string()], &[], "/", false, &identity, false);
+        let available = GraphicsDeviceAvailability {
+            dri: true,
+            input: true,
+            seatd: true,
+            udev_data: true,
+        };
+
+        spec.add_graphics_devices(available);
+        spec.add_graphics_devices(available);
+
+        for destination in ["/dev/dri", "/dev/input", "/run/udev", "/run/seatd.sock"] {
+            assert_eq!(
+                spec.mounts
+                    .iter()
+                    .filter(|mount| mount.destination == destination)
+                    .count(),
+                1,
+                "duplicate mount for {destination}"
+            );
+        }
+        for variable in ["LIBSEAT_BACKEND=", "SEATD_SOCK="] {
+            assert_eq!(
+                spec.process
+                    .env
+                    .iter()
+                    .filter(|entry| entry.starts_with(variable))
+                    .count(),
+                1,
+                "duplicate environment variable for {variable}"
+            );
+        }
     }
 
     #[test]

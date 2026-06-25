@@ -1,0 +1,42 @@
+# Persistent Debian desktop for smolvm's native display transport.
+#
+# Create once:
+#   smolvm machine create --name debian-gui \
+#     -s examples/weston-desktop/weston.smolfile
+#
+# Start (including after every explicit stop):
+#   smolvm machine start --name debian-gui --display
+
+image = "debian:bookworm-slim"
+entrypoint = ["/bin/sh", "-lc"]
+cmd = ["""
+set -eu
+rm -rf /tmp/weston-runtime
+install -d -m 700 /tmp/weston-runtime
+install -d -m 1777 /tmp/.X11-unix
+exec dbus-run-session -- weston \
+  --backend=drm-backend.so \
+  --tty=1 \
+  --use-pixman \
+  --current-mode \
+  --idle-time=0 \
+  --xwayland \
+  --log=/var/log/weston.log
+"""]
+env = [
+    "XDG_RUNTIME_DIR=/tmp/weston-runtime",
+    "LIBSEAT_BACKEND=seatd",
+    "SEATD_SOCK=/run/seatd.sock",
+]
+
+cpus = 2
+memory = 2048
+storage = 20
+overlay = 4
+net = true
+gpu = true
+
+[dev]
+init = [
+    "command -v weston >/dev/null 2>&1 || { mkdir -p /var/lib/apt/lists/partial; apt-get update; DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends weston xwayland dbus-x11 fonts-dejavu-core adwaita-icon-theme udev; }",
+]

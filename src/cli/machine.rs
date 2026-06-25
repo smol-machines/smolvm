@@ -188,6 +188,9 @@ pub enum MachineCmd {
     /// Start a machine
     Start(StartCmd),
 
+    /// Read the live native-display endpoint without starting the machine
+    Display(DisplayCmd),
+
     /// Fork a running forkable machine into a new clone (CoW memory + disks)
     Fork(ForkCmd),
 
@@ -255,6 +258,7 @@ impl MachineCmd {
             MachineCmd::Exec(cmd) => cmd.run(),
             MachineCmd::Create(cmd) => cmd.run(),
             MachineCmd::Start(cmd) => cmd.run(),
+            MachineCmd::Display(cmd) => cmd.run(),
             MachineCmd::Fork(cmd) => cmd.run(),
             MachineCmd::Stop(cmd) => cmd.run(),
             MachineCmd::Delete(cmd) => cmd.run(),
@@ -1033,6 +1037,7 @@ impl RunCmd {
             dns_filter_hosts: params.dns_filter_hosts.clone(),
             packed_layers_dir,
             extra_disks: Vec::new(),
+            display: false,
         };
 
         let freshly_started = manager
@@ -1640,6 +1645,20 @@ mod tests {
         // the old `machine create myvm` habit — must error, not be silently
         // captured as the workload command.
         assert!(TestMachineCli::try_parse_from(["machine", "create", "myvm"]).is_err());
+    }
+
+    #[test]
+    fn start_parses_display_for_named_and_default_machine() {
+        for arguments in [
+            vec!["machine", "start", "--display"],
+            vec!["machine", "start", "--name", "gui", "--display"],
+        ] {
+            let cli = TestMachineCli::parse_from(arguments);
+            let MachineCmd::Start(command) = cli.command else {
+                panic!("expected machine start command");
+            };
+            assert!(command.display);
+        }
     }
 
     #[test]
@@ -2419,6 +2438,10 @@ pub struct StartCmd {
     #[arg(long)]
     pub forkable: bool,
 
+    /// Start with a native display and keyboard/pointer input bridge.
+    #[arg(long)]
+    pub display: bool,
+
     #[command(flatten, next_help_heading = "Network")]
     pub proxy_opts: crate::cli::proxy_opts::ProxyOpts,
 }
@@ -2435,15 +2458,58 @@ impl StartCmd {
             // so `machine fork` can later freeze this machine as a CoW base.
             vm_common::enable_forkable_env(&name);
         }
-        match vm_common::start_vm_named(&name, proxy, no_proxy, /* from_snapshot */ false) {
-            Ok(()) => Ok(()),
-            Err(smolvm::Error::VmNotFound { .. }) if !explicit_name => {
-                // Only fall back to creating a default VM when no --name was given.
-                // With an explicit --name, VmNotFound is a real error.
-                vm_common::start_vm_default(proxy, no_proxy)
-            }
-            Err(e) => Err(e),
+        let previous_display = self
+            .display
+            .then(|| std::env::var_os(smolvm::agent::display::DISPLAY_ENV));
+        if self.display {
+            std::env::set_var(smolvm::agent::display::DISPLAY_ENV, "1");
         }
+        let result =
+            match vm_common::start_vm_named(&name, proxy, no_proxy, /* from_snapshot */ false) {
+                Ok(()) => Ok(()),
+                Err(smolvm::Error::VmNotFound { .. }) if !explicit_name => {
+                    // Only fall back to creating a default VM when no --name was given.
+                    // With an explicit --name, VmNotFound is a real error.
+                    vm_common::start_vm_default(proxy, no_proxy, self.display)
+                }
+                Err(e) => Err(e),
+            };
+        if let Some(previous_display) = previous_display {
+            match previous_display {
+                Some(value) => std::env::set_var(smolvm::agent::display::DISPLAY_ENV, value),
+                None => std::env::remove_var(smolvm::agent::display::DISPLAY_ENV),
+            }
+        }
+        result
+    }
+}
+
+/// Read a running machine's native-display endpoint.
+#[derive(Args, Debug)]
+pub struct DisplayCmd {
+    /// Running machine name.
+    #[arg(short = 'n', long, value_name = "NAME")]
+    pub name: String,
+
+    /// Print the credential-bearing endpoint as JSON for a local client.
+    #[arg(long)]
+    pub json: bool,
+}
+
+impl DisplayCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        let endpoint = smolvm::agent::display::read_endpoint(&self.name)
+            .map_err(|error| smolvm::Error::agent("read display endpoint", error))?;
+        if self.json {
+            let output = serde_json::to_string(&endpoint).map_err(|error| {
+                smolvm::Error::agent("encode display endpoint", error.to_string())
+            })?;
+            println!("{output}");
+        } else {
+            println!("Display ready on {}:{}", endpoint.host, endpoint.port);
+            println!("Use --json to retrieve credentials for a local display client.");
+        }
+        Ok(())
     }
 }
 

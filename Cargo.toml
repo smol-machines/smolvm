@@ -71,6 +71,12 @@ tokio-stream = "0.1"
 parking_lot = "0.12"
 async-stream = "0.3"
 futures-util = "0.3"
+crossbeam-channel = "0.5"
+rand = "0.8"
+rustvncserver = { path = "../rustvncserver" }
+krun_display = { path = "libkrun/src/krun_display", features = ["bindgen_clang_runtime"] }
+krun_input = { path = "libkrun/src/krun_input", features = ["bindgen_clang_runtime"] }
+krun_utils = { package = "utils", path = "libkrun/src/utils" }
 
 # OpenAPI documentation
 utoipa = { version = "5", features = ["axum_extras"] }

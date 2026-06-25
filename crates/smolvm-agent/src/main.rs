@@ -8,9 +8,11 @@
 //!
 //! Communication is via vsock on port 6000.
 
+#[cfg(target_os = "linux")]
+use smolvm_protocol::guest_env;
 use smolvm_protocol::{
-    error_codes, guest_env, ports, AgentRequest, AgentResponse, Envelope, RegistryAuth,
-    AGENT_READY_MARKER, LAYER_CHUNK_SIZE, PROTOCOL_VERSION,
+    error_codes, ports, AgentRequest, AgentResponse, Envelope, RegistryAuth, AGENT_READY_MARKER,
+    LAYER_CHUNK_SIZE, PROTOCOL_VERSION,
 };
 use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
@@ -168,6 +170,7 @@ fn main() {
     #[cfg(target_os = "linux")]
     if std::env::var(guest_env::GPU).as_deref() == Ok(guest_env::VALUE_ON) {
         setup_gpu_dev_nodes();
+        setup_input_dev_nodes();
     }
 
     // Set up persistent rootfs overlay (if /dev/vdb exists).
@@ -185,6 +188,7 @@ fn main() {
     // "No backend was able to open a seat."
     #[cfg(target_os = "linux")]
     if std::env::var(guest_env::GPU).as_deref() == Ok(guest_env::VALUE_ON) {
+        setup_input_udev_metadata();
         start_seatd();
     }
 
@@ -648,6 +652,177 @@ fn setup_gpu_dev_nodes() {
     }
 }
 
+/// Create `/dev/input/event*` nodes for the host-provided virtio input devices.
+///
+/// The initramfs uses a plain tmpfs for `/dev`, so devtmpfs does not populate
+/// the keyboard and pointer nodes even though the kernel registered them in
+/// sysfs. Graphical containers need the real nodes for libinput/evdev.
+#[cfg(target_os = "linux")]
+fn setup_input_dev_nodes() {
+    let sysfs_input = std::path::Path::new("/sys/class/input");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    let events = loop {
+        let events: Vec<_> = std::fs::read_dir(sysfs_input)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|entry| entry.file_name().to_string_lossy().starts_with("event"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !events.is_empty() || std::time::Instant::now() >= deadline {
+            break events;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    if events.is_empty() {
+        return;
+    }
+
+    let _ = std::fs::create_dir_all("/dev/input");
+    for entry in events {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Ok(device) = std::fs::read_to_string(entry.path().join("dev")) else {
+            continue;
+        };
+        let Some((major, minor)) = parse_device_number(&device) else {
+            continue;
+        };
+        let Ok(path) = std::ffi::CString::new(format!("/dev/input/{name}")) else {
+            continue;
+        };
+        unsafe {
+            libc::mknod(
+                path.as_ptr(),
+                libc::S_IFCHR | 0o666,
+                libc::makedev(major, minor),
+            );
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputDeviceKind {
+    Keyboard,
+    Pointer,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn input_capability_enabled(capabilities: &str, event_type: u32) -> bool {
+    let word_index = (event_type / 64) as usize;
+    let bit_index = event_type % 64;
+    capabilities
+        .split_whitespace()
+        .rev()
+        .nth(word_index)
+        .and_then(|word| u64::from_str_radix(word, 16).ok())
+        .is_some_and(|word| word & (1_u64 << bit_index) != 0)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn classify_input_device(name: &str, event_capabilities: &str) -> Option<InputDeviceKind> {
+    let name = name.to_ascii_lowercase();
+    if name.contains("keyboard") {
+        return Some(InputDeviceKind::Keyboard);
+    }
+    if ["mouse", "pointer", "touchpad", "tablet"]
+        .iter()
+        .any(|kind| name.contains(kind))
+    {
+        return Some(InputDeviceKind::Pointer);
+    }
+
+    // EV_REL (2) and EV_ABS (3) identify pointer-like devices. Check them
+    // before EV_KEY (1), because mice also advertise EV_KEY for buttons.
+    if input_capability_enabled(event_capabilities, 2)
+        || input_capability_enabled(event_capabilities, 3)
+    {
+        Some(InputDeviceKind::Pointer)
+    } else if input_capability_enabled(event_capabilities, 1) {
+        Some(InputDeviceKind::Keyboard)
+    } else {
+        None
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn input_udev_metadata(kind: InputDeviceKind) -> &'static str {
+    match kind {
+        InputDeviceKind::Keyboard => {
+            "E:ID_INPUT=1\nE:ID_INPUT_KEY=1\nE:ID_INPUT_KEYBOARD=1\nE:ID_SEAT=seat0\nG:seat\nQ:seat\nV:1\n"
+        }
+        InputDeviceKind::Pointer => {
+            "E:ID_INPUT=1\nE:ID_INPUT_MOUSE=1\nE:ID_SEAT=seat0\nG:seat\nQ:seat\nV:1\n"
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_device_number(device: &str) -> Option<(u32, u32)> {
+    let (major, minor) = device.trim().split_once(':')?;
+    Some((major.parse().ok()?, minor.parse().ok()?))
+}
+
+/// Populate the minimal udev database records libinput uses for seat discovery.
+///
+/// The guest does not run systemd-udevd, so the normal `input_id` builtin never
+/// tags the virtio keyboard and pointer. Weston can open the event nodes only
+/// after their `ID_INPUT_*` and `seat` properties exist under `/run/udev/data`.
+/// This runs after `pivot_root`, ensuring the records live in the active root
+/// and can be bind-mounted into graphical OCI workloads.
+#[cfg(target_os = "linux")]
+fn setup_input_udev_metadata() {
+    let sysfs_input = std::path::Path::new("/sys/class/input");
+    let Ok(entries) = std::fs::read_dir(sysfs_input) else {
+        return;
+    };
+    let data_dir = std::path::Path::new("/run/udev/data");
+    if let Err(error) = std::fs::create_dir_all(data_dir) {
+        boot_log(
+            "WARN",
+            &format!("failed to create {}: {error}", data_dir.display()),
+        );
+        return;
+    }
+
+    let mut records_written = 0_u32;
+    for entry in entries
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("event"))
+    {
+        let device_dir = entry.path().join("device");
+        let Ok(device) = std::fs::read_to_string(entry.path().join("dev")) else {
+            continue;
+        };
+        let Some((major, minor)) = parse_device_number(&device) else {
+            continue;
+        };
+        let name = std::fs::read_to_string(device_dir.join("name")).unwrap_or_default();
+        let capabilities =
+            std::fs::read_to_string(device_dir.join("capabilities/ev")).unwrap_or_default();
+        let Some(kind) = classify_input_device(name.trim(), capabilities.trim()) else {
+            continue;
+        };
+        let record_path = data_dir.join(format!("c{major}:{minor}"));
+        match std::fs::write(&record_path, input_udev_metadata(kind)) {
+            Ok(()) => records_written += 1,
+            Err(error) => boot_log(
+                "WARN",
+                &format!("failed to write {}: {error}", record_path.display()),
+            ),
+        }
+    }
+
+    if records_written > 0 {
+        boot_log(
+            "INFO",
+            &format!("installed {records_written} input udev metadata record(s)"),
+        );
+    }
+}
+
 /// Start the seatd seat manager daemon.
 ///
 /// seatd provides the seat management API that Wayland compositors (Weston, sway)
@@ -682,6 +857,12 @@ fn start_seatd() {
     {
         Ok(child) => {
             boot_log("INFO", &format!("seatd started (PID {})", child.id()));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+            while !std::path::Path::new("/run/seatd.sock").exists()
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
             // Detach — seatd runs for the lifetime of the VM
             std::mem::forget(child);
         }
@@ -5234,6 +5415,50 @@ mod bg_reap_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_device_classification_prefers_pointer_axes_over_button_keys() {
+        assert_eq!(
+            classify_input_device("unknown virtio device", "b"),
+            Some(InputDeviceKind::Pointer)
+        );
+    }
+
+    #[test]
+    fn input_device_classification_uses_device_identity() {
+        assert_eq!(
+            classify_input_device("SmolVM Virtual Keyboard", "0"),
+            Some(InputDeviceKind::Keyboard)
+        );
+        assert_eq!(
+            classify_input_device("SmolVM Absolute Pointer", "0"),
+            Some(InputDeviceKind::Pointer)
+        );
+    }
+
+    #[test]
+    fn input_device_classification_ignores_non_input_event_sources() {
+        assert_eq!(classify_input_device("Power Button", "1"), None);
+    }
+
+    #[test]
+    fn input_udev_metadata_matches_libinput_contract() {
+        assert_eq!(
+            input_udev_metadata(InputDeviceKind::Keyboard),
+            "E:ID_INPUT=1\nE:ID_INPUT_KEY=1\nE:ID_INPUT_KEYBOARD=1\nE:ID_SEAT=seat0\nG:seat\nQ:seat\nV:1\n"
+        );
+        assert_eq!(
+            input_udev_metadata(InputDeviceKind::Pointer),
+            "E:ID_INPUT=1\nE:ID_INPUT_MOUSE=1\nE:ID_SEAT=seat0\nG:seat\nQ:seat\nV:1\n"
+        );
+    }
+
+    #[test]
+    fn parse_device_number_rejects_malformed_sysfs_values() {
+        assert_eq!(parse_device_number("13:64\n"), Some((13, 64)));
+        assert_eq!(parse_device_number("13"), None);
+        assert_eq!(parse_device_number("input:keyboard"), None);
+    }
 
     #[test]
     #[cfg(unix)]

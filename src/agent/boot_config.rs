@@ -57,4 +57,7 @@ pub struct BootConfig {
     /// lets the `pack --from-vm` exporter attach a source qcow2 disk read-only.
     #[serde(default)]
     pub extra_disks: Vec<(PathBuf, bool, DiskFormat)>,
+    /// Optional mode-0600 rendezvous socket for a native display launch.
+    #[serde(default)]
+    pub display_socket: Option<PathBuf>,
 }

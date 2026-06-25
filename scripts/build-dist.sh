@@ -13,7 +13,7 @@ set -e
 WITH_LOCAL_LIBKRUN=0
 SKIP_AGENT_BUILD=0
 LOCAL_LIBKRUN_DIR=""
-LIBKRUN_MAKE_FLAGS="${LIBKRUN_MAKE_FLAGS:-BLK=1 NET=1 GPU=1}"
+LIBKRUN_MAKE_FLAGS="${LIBKRUN_MAKE_FLAGS:-BLK=1 NET=1 GPU=1 INPUT=1}"
 
 print_help() {
     cat <<'EOF'
@@ -29,7 +29,7 @@ Options:
   -h, --help                 Show this help text
 
 Environment:
-  LIBKRUN_MAKE_FLAGS   make flags for local libkrun build (default: BLK=1 NET=1 GPU=1)
+  LIBKRUN_MAKE_FLAGS   make flags for local libkrun build (default: BLK=1 NET=1 GPU=1 INPUT=1)
   LIBCLANG_PATH        path to libclang.dylib (auto-detected from brew llvm on macOS)
   LIB_DIR              Override bundled library directory used by smolvm build
   CODESIGN_IDENTITY    macOS code signing identity (default: - for ad-hoc)

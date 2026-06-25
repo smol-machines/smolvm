@@ -18,7 +18,8 @@ use smolvm_network::{
     VirtioNetworkRuntime,
 };
 use smolvm_protocol::{guest_env, ports};
-use std::ffi::CString;
+use std::ffi::{c_void, CString};
+use std::mem::size_of_val;
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 
@@ -164,6 +165,8 @@ pub struct LaunchFeatures {
     /// Additional disk images to attach to the VM (path, read_only, format).
     /// Appear as /dev/vdc, /dev/vdd, ... after the storage and overlay disks.
     pub extra_disks: Vec<(std::path::PathBuf, bool, DiskFormat)>,
+    /// Expose a native scanout and input bridge for this VM launch.
+    pub display: bool,
 }
 
 impl LaunchFeatures {
@@ -276,6 +279,8 @@ pub struct LaunchConfig<'a> {
     /// surface `egressBytes` in the machine info, the same per-VM-dir bridge the
     /// vsock/console paths use. `None` disables egress telemetry (e.g. TSI).
     pub egress_telemetry: Option<&'a Path>,
+    /// Mode-0600 Unix rendezvous socket used to obtain the loopback display endpoint.
+    pub display_socket: Option<&'a Path>,
 }
 
 /// Launch the agent VM using libkrun.
@@ -311,6 +316,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         dns_filter_enabled,
         egress_refresh_hosts,
         egress_telemetry,
+        display_socket,
     } = config;
 
     crate::network::validate_requested_network_backend(resources, None, port_mappings.len())?;
@@ -386,8 +392,8 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // Enable GPU if requested (virgl for OpenGL + Venus for Vulkan via virtio-gpu).
         // Requires libkrun built with `gpu` feature and host virglrenderer.
         // On macOS, also requires MoltenVK (Vulkan → Metal translation).
-        if resources.gpu {
-            let virgl_flags = super::gpu_virgl_flags();
+        if resources.gpu || display_socket.is_some() {
+            let virgl_flags = super::gpu_virgl_flags(display_socket.is_some());
             // Size the GPU shared-memory region. Caller may override
             // via `--gpu-vram <MiB>` (CLI) or `gpu_vram = N` (Smolfile);
             // default is `DEFAULT_GPU_VRAM_MIB`.
@@ -418,6 +424,93 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             }
             tracing::info!("GPU enabled (Venus/Vulkan via virtio-gpu)");
         }
+
+        // A display backend and input devices must be installed before
+        // krun_start_enter consumes the configuration context. The bridge stays
+        // alive on this stack for the VM process lifetime.
+        let _display_bridge = if let Some(endpoint_socket) = display_socket {
+            macro_rules! required_display_symbol {
+                ($symbol:expr, $name:literal) => {
+                    match $symbol {
+                        Some(symbol) => symbol,
+                        None => {
+                            krun_free_ctx(ctx);
+                            return Err(Error::agent(
+                                "configure display",
+                                concat!("libkrun does not expose ", $name),
+                            ));
+                        }
+                    }
+                };
+            }
+
+            let has_feature = required_display_symbol!(krun.has_feature, "krun_has_feature");
+            if has_feature(4) != 1 {
+                krun_free_ctx(ctx);
+                return Err(Error::agent(
+                    "configure display",
+                    "libkrun was built without INPUT=1",
+                ));
+            }
+            let add_display = required_display_symbol!(krun.add_display, "krun_add_display");
+            let set_display_backend =
+                required_display_symbol!(krun.set_display_backend, "krun_set_display_backend");
+            let add_input_device =
+                required_display_symbol!(krun.add_input_device, "krun_add_input_device");
+
+            let bridge = super::display::DisplayBridge::start(endpoint_socket)
+                .map_err(|error| Error::agent("start display bridge", error))?;
+            let display_id = add_display(
+                ctx,
+                super::display::DISPLAY_WIDTH,
+                super::display::DISPLAY_HEIGHT,
+            );
+            if display_id < 0 {
+                krun_free_ctx(ctx);
+                return Err(Error::agent(
+                    "configure display",
+                    format!("krun_add_display failed (ret={display_id})"),
+                ));
+            }
+
+            let display_backend = bridge.display_backend();
+            let result = set_display_backend(
+                ctx,
+                std::ptr::from_ref(&display_backend).cast::<c_void>(),
+                size_of_val(&display_backend),
+            );
+            if result < 0 {
+                krun_free_ctx(ctx);
+                return Err(Error::agent(
+                    "configure display",
+                    format!("krun_set_display_backend failed (ret={result})"),
+                ));
+            }
+
+            for (config_backend, events_backend) in [
+                (bridge.keyboard_config(), bridge.keyboard_events()),
+                (bridge.pointer_config(), bridge.pointer_events()),
+            ] {
+                let result = add_input_device(
+                    ctx,
+                    std::ptr::from_ref(&config_backend).cast::<c_void>(),
+                    size_of_val(&config_backend),
+                    std::ptr::from_ref(&events_backend).cast::<c_void>(),
+                    size_of_val(&events_backend),
+                );
+                if result < 0 {
+                    krun_free_ctx(ctx);
+                    return Err(Error::agent(
+                        "configure display input",
+                        format!("krun_add_input_device failed (ret={result})"),
+                    ));
+                }
+            }
+            tracing::info!(display_id, "native display and input enabled");
+            Some(bridge)
+        } else {
+            None
+        };
 
         // Helper: evaluate a fallible expression, freeing ctx if it fails.
         // Replaces bare `?` which would leak the libkrun context.
@@ -961,7 +1054,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // kernel lacks the driver; without this check the user sees
         // "VM started" and discovers missing GPU only when their
         // workload hits a rendering call.
-        if resources.gpu {
+        if resources.gpu || display_socket.is_some() {
             let gpu_env = format!("{}={}", guest_env::GPU, guest_env::VALUE_ON);
             if let Ok(cs) = CString::new(gpu_env) {
                 env_strings.push(cs);

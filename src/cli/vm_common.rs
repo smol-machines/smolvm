@@ -663,16 +663,19 @@ pub fn enable_forkable_env(name: &str) {
 }
 
 /// Send a single line command to a VM control socket and return its reply line.
-fn control_socket_cmd(sock: &std::path::Path, cmd: &str) -> smolvm::Result<String> {
+fn control_socket_cmd_with_timeout(
+    sock: &std::path::Path,
+    cmd: &str,
+    timeout: std::time::Duration,
+) -> smolvm::Result<String> {
     use smolvm::Error;
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
 
     let mut stream = UnixStream::connect(sock)
         .map_err(|e| Error::agent("connect control socket", e.to_string()))?;
-    stream
-        .set_read_timeout(Some(std::time::Duration::from_secs(60)))
-        .ok();
+    stream.set_read_timeout(Some(timeout)).ok();
+    stream.set_write_timeout(Some(timeout)).ok();
     stream
         .write_all(format!("{cmd}\n").as_bytes())
         .map_err(|e| Error::agent("write control socket", e.to_string()))?;
@@ -691,6 +694,29 @@ fn control_socket_cmd(sock: &std::path::Path, cmd: &str) -> smolvm::Result<Strin
         }
     }
     Ok(reply)
+}
+
+fn control_socket_cmd(sock: &std::path::Path, cmd: &str) -> smolvm::Result<String> {
+    control_socket_cmd_with_timeout(sock, cmd, std::time::Duration::from_secs(60))
+}
+
+fn fork_base_state_from_status(status: &str) -> Option<&'static str> {
+    match status.trim() {
+        "OK running" => Some("running"),
+        "OK paused" => Some("frozen"),
+        _ => None,
+    }
+}
+
+fn probe_fork_base_state(name: &str) -> Option<&'static str> {
+    let socket = control_socket_path(name);
+    if !socket.exists() {
+        return None;
+    }
+    let status =
+        control_socket_cmd_with_timeout(&socket, "STATUS", std::time::Duration::from_millis(250))
+            .ok()?;
+    fork_base_state_from_status(&status)
 }
 
 /// Fork a running, forkable `golden` machine into a new `clone`.
@@ -1008,6 +1034,14 @@ pub fn start_vm_named(
     // `exec` failed.
     match smolvm::agent::state_probe::resolve_state(name, &record) {
         RecordState::Running => {
+            if std::env::var_os(smolvm::agent::display::DISPLAY_ENV).is_some()
+                && !smolvm::agent::display::endpoint_is_ready(name)
+            {
+                return Err(Error::agent(
+                    "start machine with display",
+                    "machine is already running without a display; stop it before starting with --display",
+                ));
+            }
             let pid_suffix = format_pid_suffix(record.pid);
             println!("Machine '{}' already running{}", name, pid_suffix);
             return Ok(());
@@ -1098,6 +1132,7 @@ pub fn start_vm_named(
     let mut features = smolvm::agent::LaunchFeatures {
         ssh_agent_socket,
         dns_filter_hosts: record.dns_filter_hosts.clone(),
+        display: std::env::var_os(smolvm::agent::display::DISPLAY_ENV).is_some(),
         ..Default::default()
     }
     .with_packed_layers(
@@ -1421,10 +1456,20 @@ fn check_port_conflicts(
 }
 
 /// Start the default machine.
-pub fn start_vm_default(proxy: Option<&str>, no_proxy: Option<&str>) -> smolvm::Result<()> {
+pub fn start_vm_default(
+    proxy: Option<&str>,
+    no_proxy: Option<&str>,
+    display: bool,
+) -> smolvm::Result<()> {
     let manager = AgentManager::new_default()?;
 
     if manager.try_connect_existing().is_some() {
+        if display && !smolvm::agent::display::endpoint_is_ready("default") {
+            return Err(smolvm::Error::agent(
+                "start machine with display",
+                "machine is already running without a display; stop it before starting with --display",
+            ));
+        }
         let pid_suffix = format_pid_suffix(manager.child_pid());
         println!("Machine 'default' already running{}", pid_suffix);
         manager.detach();
@@ -1437,7 +1482,15 @@ pub fn start_vm_default(proxy: Option<&str>, no_proxy: Option<&str>) -> smolvm::
     cli_recover_if_unreachable("default");
 
     eprintln!("Starting machine 'default'...");
-    manager.ensure_running()?;
+    manager.ensure_running_with_full_config(
+        Vec::new(),
+        Vec::new(),
+        smolvm::data::resources::VmResources::default(),
+        smolvm::agent::LaunchFeatures {
+            display,
+            ..Default::default()
+        },
+    )?;
 
     let mut config = SmolvmConfig::load()?;
     persist_named_running(&mut config, "default", manager.child_pid(), None)?;
@@ -1782,7 +1835,11 @@ where
 
 /// Build the per-machine JSON object shared by `machine list --json` and
 /// `machine status --json` so the two outputs never drift apart.
-fn machine_status_json(name: &str, record: &VmRecord) -> serde_json::Value {
+fn machine_status_json(
+    name: &str,
+    record: &VmRecord,
+    dependent_clones: &[String],
+) -> serde_json::Value {
     // Resolve via vsock probe so the JSON reflects truth (Unreachable vs
     // Running) instead of trusting the PID-only check.
     let actual_state = smolvm::agent::state_probe::resolve_state(name, record);
@@ -1796,6 +1853,7 @@ fn machine_status_json(name: &str, record: &VmRecord) -> serde_json::Value {
             argv.join(" ")
         }
     });
+    let fork_base_state = probe_fork_base_state(name);
 
     let mut obj = serde_json::json!({
         "name": name,
@@ -1814,6 +1872,12 @@ fn machine_status_json(name: &str, record: &VmRecord) -> serde_json::Value {
         "ephemeral": record.ephemeral,
         "gpu": record.gpu.unwrap_or(false),
         "gpu_vram_mib": record.gpu_vram_mib,
+        "display_ready": actual_state == RecordState::Running
+            && smolvm::agent::display::endpoint_is_ready(name),
+        "forkable": fork_base_state.is_some(),
+        "fork_base_state": fork_base_state,
+        "golden": record.golden,
+        "dependent_clones": dependent_clones,
         "restart_policy": record.restart.policy.to_string(),
         "restart_max_retries": record.restart.max_retries,
         "restart_count": record.restart.restart_count,
@@ -1836,8 +1900,14 @@ pub fn status_vm_json(name: &Option<String>) -> smolvm::Result<()> {
     let config = SmolvmConfig::load()?;
     // Build the owned JSON value inside the match so the borrow of `config`
     // ends before `config` is dropped.
-    let obj = match config.list_vms().find(|(n, _)| *n == &label) {
-        Some((_, record)) => machine_status_json(&label, record),
+    let vms: Vec<_> = config.list_vms().collect();
+    let dependent_clones = vms
+        .iter()
+        .filter(|(_, candidate)| candidate.golden.as_deref() == Some(label.as_str()))
+        .map(|(name, _)| (*name).clone())
+        .collect::<Vec<_>>();
+    let obj = match vms.iter().find(|(name, _)| *name == &label) {
+        Some((_, record)) => machine_status_json(&label, record, &dependent_clones),
         None => {
             return Err(smolvm::Error::config(
                 "machine status",
@@ -1874,7 +1944,14 @@ pub fn list_vms(verbose: bool, json: bool) -> smolvm::Result<()> {
     if json {
         let json_vms: Vec<_> = vms
             .iter()
-            .map(|(name, record)| machine_status_json(name, record))
+            .map(|(name, record)| {
+                let dependent_clones = vms
+                    .iter()
+                    .filter(|(_, candidate)| candidate.golden.as_deref() == Some(name.as_str()))
+                    .map(|(clone_name, _)| (*clone_name).clone())
+                    .collect::<Vec<_>>();
+                machine_status_json(name, record, &dependent_clones)
+            })
             .collect();
         let json = serde_json::to_string_pretty(&json_vms)
             .map_err(|e| smolvm::Error::config("serialize json", e.to_string()))?;
@@ -2505,5 +2582,13 @@ mod init_runner_tests {
                 ("BAZ".to_string(), "from-cli".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn fork_base_status_maps_only_healthy_control_states() {
+        assert_eq!(fork_base_state_from_status("OK running\n"), Some("running"));
+        assert_eq!(fork_base_state_from_status("OK paused\n"), Some("frozen"));
+        assert_eq!(fork_base_state_from_status("ERR EIO unavailable\n"), None);
+        assert_eq!(fork_base_state_from_status("OK stopped\n"), None);
     }
 }

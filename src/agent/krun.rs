@@ -54,6 +54,16 @@ pub struct KrunFunctions {
     >,
     pub get_egress_handle: Option<unsafe extern "C" fn(u32) -> *mut libc::c_void>,
     pub set_gpu_options2: Option<unsafe extern "C" fn(u32, u32, u64) -> i32>,
+    /// Reports whether an optional libkrun feature was compiled in.
+    pub has_feature: Option<unsafe extern "C" fn(u64) -> i32>,
+    /// Adds a host-visible scanout to the virtio-gpu device.
+    pub add_display: Option<unsafe extern "C" fn(u32, u32, u32) -> i32>,
+    /// Installs the callback vtable used to receive guest framebuffer updates.
+    pub set_display_backend: Option<unsafe extern "C" fn(u32, *const libc::c_void, usize) -> i32>,
+    /// Adds a custom virtio-input device backed by callback vtables.
+    pub add_input_device: Option<
+        unsafe extern "C" fn(u32, *const libc::c_void, usize, *const libc::c_void, usize) -> i32,
+    >,
     /// Register a Unix control socket for the VM (pause/resume/checkpoint/restore).
     pub set_control_socket: Option<unsafe extern "C" fn(u32, *const libc::c_char) -> i32>,
     /// Boot the VM as a fork clone from a snapshot directory (CoW-map a golden
@@ -159,6 +169,10 @@ impl KrunFunctions {
             add_net_unixstream: load_optional_sym!("krun_add_net_unixstream"),
             get_egress_handle: load_optional_sym!("krun_get_egress_handle"),
             set_gpu_options2: load_optional_sym!("krun_set_gpu_options2"),
+            has_feature: load_optional_sym!("krun_has_feature"),
+            add_display: load_optional_sym!("krun_add_display"),
+            set_display_backend: load_optional_sym!("krun_set_display_backend"),
+            add_input_device: load_optional_sym!("krun_add_input_device"),
             set_control_socket: load_optional_sym!("krun_set_control_socket"),
             set_snapshot: load_optional_sym!("krun_set_snapshot"),
             create_disk_overlay: load_optional_sym!("krun_create_disk_overlay"),

@@ -5,6 +5,7 @@
 
 pub mod boot_config;
 mod client;
+pub mod display;
 mod krun;
 mod launcher;
 pub mod launcher_dynamic;
@@ -49,13 +50,13 @@ pub const AGENT_VM_NAME: &str = "smolvm-agent";
 ///             in-process Venus which fails (version stays 0).  With get_server_fd
 ///             provided in the callbacks struct, virglrenderer uses the externally
 ///             spawned virgl_render_server instead of fork/exec-ing its own process.
-fn gpu_virgl_flags() -> u32 {
+fn gpu_virgl_flags(software_display: bool) -> u32 {
     #[cfg(target_os = "linux")]
     {
-        (1 << 0) | (1 << 3) | (1 << 6) | (1 << 9)
+        (1 << 0) | (1 << 3) | (1 << 6) | (1 << 9) | if software_display { 1 << 31 } else { 0 }
     }
     #[cfg(not(target_os = "linux"))]
     {
-        (1 << 6) | (1 << 7)
+        (1 << 6) | (1 << 7) | if software_display { 1 << 31 } else { 0 }
     }
 }

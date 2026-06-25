@@ -9,6 +9,7 @@ use crate::process::{self, ChildProcess};
 use crate::storage::{DiskFormat, OverlayDisk, StorageDisk};
 use parking_lot::Mutex;
 use smolvm_protocol::AGENT_READY_MARKER;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1472,6 +1473,23 @@ impl AgentManager {
             .overlay_gib
             .unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GIB);
 
+        let display_socket = if features.display {
+            let runtime_dir = self
+                .vsock_socket
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("/tmp"))
+                .join("display-runtime");
+            std::fs::create_dir_all(&runtime_dir)
+                .map_err(|e| Error::agent("create display runtime", e.to_string()))?;
+            std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| Error::agent("secure display runtime", e.to_string()))?;
+            let socket = runtime_dir.join("endpoint.sock");
+            let _ = std::fs::remove_file(&socket);
+            Some(socket)
+        } else {
+            None
+        };
+
         // Write boot config to a file the subprocess will read
         let config = BootConfig {
             rootfs_path: self.rootfs_path.clone(),
@@ -1489,6 +1507,7 @@ impl AgentManager {
             dns_filter_hosts: features.dns_filter_hosts,
             packed_layers_dir: features.packed_layers_dir,
             extra_disks: features.extra_disks,
+            display_socket,
         };
         let config_path = self
             .storage_disk
@@ -1716,6 +1735,18 @@ impl AgentManager {
             if let Err(e) = std::fs::remove_file(path) {
                 if e.kind() != std::io::ErrorKind::NotFound {
                     tracing::debug!(error = %e, path = %path.display(), "failed to remove marker file");
+                }
+            }
+        }
+        if let Some(parent) = self.vsock_socket.parent() {
+            let runtime_dir = parent.join("display-runtime");
+            if let Err(error) = std::fs::remove_dir_all(&runtime_dir) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::debug!(
+                        %error,
+                        path = %runtime_dir.display(),
+                        "failed to remove display runtime"
+                    );
                 }
             }
         }
