@@ -112,14 +112,12 @@ impl LibkrunVm {
             let krun_create_ctx = krun.create_ctx;
             let krun_free_ctx = krun.free_ctx;
             let krun_set_vm_config = krun.set_vm_config;
-            let krun_set_root = krun.set_root;
             let krun_set_workdir = krun.set_workdir;
             let krun_set_exec = krun.set_exec;
             let krun_add_virtiofs = krun.add_virtiofs;
             let krun_set_port_map = krun.set_port_map;
             let krun_add_disk2 = krun.add_disk2;
             let krun_add_vsock_port2 = krun.add_vsock_port2;
-            let krun_set_console_output = krun.set_console_output;
             let krun_start_enter = krun.start_enter;
 
             // Initialize libkrun logging (0 = off, 1 = error, 2 = warn, 3 = info, 4 = debug)
@@ -139,12 +137,13 @@ impl LibkrunVm {
                 return Err(Error::vm_creation("failed to set VM config"));
             }
 
-            // Set root filesystem
+            // Set root filesystem via the root virtiofs tag (upstream removed
+            // krun_set_root in favor of krun_add_virtiofs with KRUN_FS_ROOT_TAG).
             let root = path_to_cstring(rootfs_path)?;
+            let root_tag = CString::new("/dev/root").expect("static tag");
             tracing::debug!("[libkrun] rootfs_path: {:?}", rootfs_path);
-            tracing::debug!("[libkrun] root CString: {:?}", root);
-            let ret = krun_set_root(ctx, root.as_ptr());
-            tracing::debug!("[libkrun] krun_set_root returned: {}", ret);
+            let ret = krun_add_virtiofs(ctx, root_tag.as_ptr(), root.as_ptr());
+            tracing::debug!("[libkrun] krun_add_virtiofs(root) returned: {}", ret);
             if ret < 0 {
                 krun_free_ctx(ctx);
                 return Err(Error::vm_creation("failed to set root filesystem"));
@@ -307,10 +306,10 @@ impl LibkrunVm {
                 }
             }
 
-            // Set console output if specified
+            // Redirect console output to a file if specified, via the upstream
+            // virtio-console API (krun_set_console_output was removed).
             if let Some(ref log_path) = config.console_log {
-                let console_path = path_to_cstring(log_path)?;
-                if krun_set_console_output(ctx, console_path.as_ptr()) < 0 {
+                if krun.console_output_to_file(ctx, log_path) < 0 {
                     tracing::warn!("failed to set console output: {}", log_path.display());
                 } else {
                     tracing::debug!(path = %log_path.display(), "console output enabled");

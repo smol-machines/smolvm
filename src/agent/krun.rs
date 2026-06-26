@@ -21,7 +21,6 @@ pub struct KrunFunctions {
     pub create_ctx: unsafe extern "C" fn() -> i32,
     pub free_ctx: unsafe extern "C" fn(u32),
     pub set_vm_config: unsafe extern "C" fn(u32, u8, u32) -> i32,
-    pub set_root: unsafe extern "C" fn(u32, *const libc::c_char) -> i32,
     pub set_workdir: unsafe extern "C" fn(u32, *const libc::c_char) -> i32,
     pub set_exec: unsafe extern "C" fn(
         u32,
@@ -38,9 +37,11 @@ pub struct KrunFunctions {
         unsafe extern "C" fn(u32, *const libc::c_char, *const libc::c_char, u64, bool) -> i32,
     >,
     pub start_enter: unsafe extern "C" fn(u32) -> i32,
-    pub disable_implicit_vsock: unsafe extern "C" fn(u32) -> i32,
     pub add_vsock: unsafe extern "C" fn(u32, u32) -> i32,
-    pub set_console_output: unsafe extern "C" fn(u32, *const libc::c_char) -> i32,
+    /// Add a virtio-console device (the upstream replacement for the removed
+    /// `krun_set_console_output`). Unix: input/output/err file descriptors.
+    pub add_virtio_console_default:
+        unsafe extern "C" fn(u32, libc::c_int, libc::c_int, libc::c_int) -> i32,
     pub set_egress_policy: Option<
         unsafe extern "C" fn(
             u32,
@@ -143,7 +144,6 @@ impl KrunFunctions {
             create_ctx: load_sym!(krun_create_ctx),
             free_ctx: load_sym!(krun_free_ctx),
             set_vm_config: load_sym!(krun_set_vm_config),
-            set_root: load_sym!(krun_set_root),
             set_workdir: load_sym!(krun_set_workdir),
             set_exec: load_sym!(krun_set_exec),
             set_port_map: load_sym!(krun_set_port_map),
@@ -152,9 +152,8 @@ impl KrunFunctions {
             add_virtiofs: load_sym!(krun_add_virtiofs),
             add_virtiofs3: load_optional_sym!("krun_add_virtiofs3"),
             start_enter: load_sym!(krun_start_enter),
-            disable_implicit_vsock: load_sym!(krun_disable_implicit_vsock),
             add_vsock: load_sym!(krun_add_vsock),
-            set_console_output: load_sym!(krun_set_console_output),
+            add_virtio_console_default: load_sym!(krun_add_virtio_console_default),
             set_egress_policy: load_optional_sym!("krun_set_egress_policy"),
             add_net_unixstream: load_optional_sym!("krun_add_net_unixstream"),
             get_egress_handle: load_optional_sym!("krun_get_egress_handle"),
@@ -163,6 +162,35 @@ impl KrunFunctions {
             set_snapshot: load_optional_sym!("krun_set_snapshot"),
             create_disk_overlay: load_optional_sym!("krun_create_disk_overlay"),
         })
+    }
+}
+
+impl KrunFunctions {
+    /// Redirect the guest console output to `path`, using the upstream
+    /// virtio-console API (the replacement for the removed
+    /// `krun_set_console_output`). Returns libkrun's rc, or a negative value if
+    /// the file can't be opened.
+    ///
+    /// The opened fds are intentionally leaked: a console device's fds must stay
+    /// valid for the VM's lifetime, and `krun_start_enter` runs the VM in this
+    /// process, so the process owns them until it exits.
+    ///
+    /// # Safety
+    /// `ctx` must be a valid libkrun context that has not yet been started.
+    pub unsafe fn console_output_to_file(&self, ctx: u32, path: &Path) -> i32 {
+        use std::os::fd::IntoRawFd;
+        let Ok(out) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        else {
+            return -1;
+        };
+        let out_fd = out.into_raw_fd();
+        // Console input comes from /dev/null (the agent talks over vsock, not the
+        // console); output and stderr both go to the log file.
+        let null_fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+        unsafe { (self.add_virtio_console_default)(ctx, null_fd, out_fd, out_fd) }
     }
 }
 

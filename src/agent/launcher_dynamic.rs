@@ -168,14 +168,16 @@ pub fn launch_agent_vm_dynamic(
         }
     }
 
-    // Set root filesystem
+    // Set root filesystem via the root virtiofs tag (upstream removed
+    // krun_set_root in favor of krun_add_virtiofs with KRUN_FS_ROOT_TAG).
     let root = try_or_free_ctx!(
         path_to_cstring(config.rootfs_path),
         "rootfs path contains null byte"
     );
-    // SAFETY: ctx is valid, root.as_ptr() is a valid null-terminated C string
-    if unsafe { (krun.set_root)(ctx, root.as_ptr()) } < 0 {
-        free_ctx_on_err!("krun_set_root failed");
+    let root_tag = cstr("/dev/root");
+    // SAFETY: ctx is valid; root_tag/root are valid null-terminated C strings.
+    if unsafe { (krun.add_virtiofs)(ctx, root_tag.as_ptr(), root.as_ptr()) } < 0 {
+        free_ctx_on_err!("krun_add_virtiofs failed for root filesystem");
     }
 
     let network_plan = plan_launch_network(&config.resources, None, config.port_mappings.len());
@@ -183,9 +185,7 @@ pub fn launch_agent_vm_dynamic(
     let mut virtio_network_runtime: Option<VirtioNetworkRuntime> = None;
     let guest_network = match network_plan.backend {
         EffectiveNetworkBackend::None => {
-            if unsafe { (krun.disable_implicit_vsock)(ctx) } < 0 {
-                free_ctx_on_err!("krun_disable_implicit_vsock failed");
-            }
+            // Upstream libkrun no longer creates an implicit vsock; add explicitly.
             if unsafe { (krun.add_vsock)(ctx, 0) } < 0 {
                 free_ctx_on_err!("krun_add_vsock failed");
             }
@@ -193,9 +193,6 @@ pub fn launch_agent_vm_dynamic(
             None
         }
         EffectiveNetworkBackend::Tsi => {
-            if unsafe { (krun.disable_implicit_vsock)(ctx) } < 0 {
-                free_ctx_on_err!("krun_disable_implicit_vsock failed");
-            }
             if unsafe { (krun.add_vsock)(ctx, TSI_FEATURE_HIJACK_INET) } < 0 {
                 free_ctx_on_err!("krun_add_vsock with TSI failed");
             }
@@ -338,13 +335,10 @@ pub fn launch_agent_vm_dynamic(
 
     // Redirect console output to a log file so libkrun doesn't put the
     // inherited terminal into raw mode (which would break terminal echo
-    // if the child is killed before exit observers can restore it).
-    let console_path = try_or_free_ctx!(
-        path_to_cstring(&config.console_log),
-        "console log path contains null byte"
-    );
-    // SAFETY: ctx is valid, console_path is a valid null-terminated C string
-    if unsafe { (krun.set_console_output)(ctx, console_path.as_ptr()) } < 0 {
+    // if the child is killed before exit observers can restore it). Uses the
+    // upstream virtio-console API (krun_set_console_output was removed).
+    // SAFETY: ctx is a valid, not-yet-started libkrun context.
+    if unsafe { krun.console_output_to_file(ctx, &config.console_log) } < 0 {
         tracing::warn!("failed to set console output");
     }
 

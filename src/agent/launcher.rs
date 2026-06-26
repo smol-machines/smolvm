@@ -362,17 +362,14 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         let krun_create_ctx = krun.create_ctx;
         let krun_free_ctx = krun.free_ctx;
         let krun_set_vm_config = krun.set_vm_config;
-        let krun_set_root = krun.set_root;
         let krun_set_workdir = krun.set_workdir;
         let krun_set_exec = krun.set_exec;
         let krun_add_disk2 = krun.add_disk2;
         let krun_add_vsock_port2 = krun.add_vsock_port2;
-        let krun_set_console_output = krun.set_console_output;
         let krun_set_port_map = krun.set_port_map;
         let krun_add_virtiofs = krun.add_virtiofs;
         let krun_add_virtiofs3 = krun.add_virtiofs3;
         let krun_start_enter = krun.start_enter;
-        let krun_disable_implicit_vsock = krun.disable_implicit_vsock;
         let krun_add_vsock = krun.add_vsock;
 
         // Set log level (0 = off, 1 = error, 2 = warn, 3 = info, 4 = debug)
@@ -447,17 +444,19 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             };
         }
 
-        // Set root filesystem.
+        // Set root filesystem via the root virtiofs tag ("/dev/root").
         //
-        // Default path: krun_set_root, preserving libkrun's established rootfs
-        // behavior and DAX defaults. Benchmark path: SMOLVM_ROOTFS_DAX=0 uses
-        // krun_add_virtiofs3 with shm_size=0, disabling the root DAX region
+        // Upstream libkrun removed krun_set_root in favor of krun_add_virtiofs*
+        // with KRUN_FS_ROOT_TAG. Default path: krun_add_virtiofs, preserving the
+        // established rootfs DAX defaults. Benchmark path: SMOLVM_ROOTFS_DAX=0
+        // uses krun_add_virtiofs3 with shm_size=0, disabling the root DAX region
         // while keeping the root read-write.
         let root = try_or_free_ctx!(
             path_to_cstring(rootfs_path),
             "set rootfs",
             "path contains null byte"
         );
+        let root_tag = cstr("/dev/root");
         if rootfs_dax_disabled() {
             let Some(add_virtiofs3) = krun_add_virtiofs3 else {
                 krun_free_ctx(ctx);
@@ -467,7 +466,6 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 ));
             };
 
-            let root_tag = cstr("/dev/root");
             if add_virtiofs3(ctx, root_tag.as_ptr(), root.as_ptr(), 0, false) < 0 {
                 krun_free_ctx(ctx);
                 return Err(Error::agent(
@@ -476,9 +474,12 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 ));
             }
             tracing::info!("rootfs configured via virtiofs without DAX");
-        } else if krun_set_root(ctx, root.as_ptr()) < 0 {
+        } else if krun_add_virtiofs(ctx, root_tag.as_ptr(), root.as_ptr()) < 0 {
             krun_free_ctx(ctx);
-            return Err(Error::agent("set rootfs", "krun_set_root failed"));
+            return Err(Error::agent(
+                "set rootfs",
+                "krun_add_virtiofs failed for root filesystem",
+            ));
         }
 
         let network_plan = select_network_plan(resources, *dns_filter_enabled, port_mappings.len());
@@ -486,13 +487,8 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         let mut virtio_network_runtime: Option<VirtioNetworkRuntime> = None;
         let guest_network = match network_plan.backend {
             EffectiveNetworkBackend::None => {
-                if krun_disable_implicit_vsock(ctx) < 0 {
-                    krun_free_ctx(ctx);
-                    return Err(Error::agent(
-                        "configure vsock",
-                        "krun_disable_implicit_vsock failed",
-                    ));
-                }
+                // Upstream libkrun no longer creates an implicit vsock (the old
+                // krun_disable_implicit_vsock is gone), so just add it explicitly.
                 if krun_add_vsock(ctx, 0) < 0 {
                     krun_free_ctx(ctx);
                     return Err(Error::agent("configure vsock", "krun_add_vsock failed"));
@@ -502,13 +498,6 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 None
             }
             EffectiveNetworkBackend::Tsi => {
-                if krun_disable_implicit_vsock(ctx) < 0 {
-                    krun_free_ctx(ctx);
-                    return Err(Error::agent(
-                        "configure vsock",
-                        "krun_disable_implicit_vsock failed",
-                    ));
-                }
                 if krun_add_vsock(ctx, TSI_FEATURE_HIJACK_INET) < 0 {
                     krun_free_ctx(ctx);
                     return Err(Error::agent(
@@ -799,14 +788,10 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             }
         }
 
-        // Set console output if specified
+        // Redirect console output to a file if specified, via the upstream
+        // virtio-console API (krun_set_console_output was removed).
         if let Some(log_path) = console_log {
-            let console_path = try_or_free_ctx!(
-                path_to_cstring(log_path),
-                "set console output",
-                "path contains null byte"
-            );
-            if krun_set_console_output(ctx, console_path.as_ptr()) < 0 {
+            if krun.console_output_to_file(ctx, log_path) < 0 {
                 tracing::warn!("failed to set console output");
             }
         }
