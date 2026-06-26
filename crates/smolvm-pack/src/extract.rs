@@ -13,6 +13,41 @@ use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 
+/// Mark an open file as sparse (Windows/NTFS) so a later `set_len` to a large
+/// size — or writing chunks at high offsets after such a `set_len` — doesn't
+/// allocate every intermediate block, ballooning a sparse disk image (overlay,
+/// storage) to its full logical size on disk. Unix filesystems are sparse by
+/// default and never call this.
+///
+/// `smolvm-pack` cannot depend on the main crate, so this mirrors the FSCTL
+/// approach in the main crate's `src/disk_utils.rs::mark_file_sparse`.
+#[cfg(windows)]
+fn mark_file_sparse(file: &fs::File) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    // FSCTL_SET_SPARSE control code (winioctl.h).
+    const FSCTL_SET_SPARSE: u32 = 0x000900C4;
+    let mut returned: u32 = 0;
+    // SAFETY: `file` is a valid open handle; FSCTL_SET_SPARSE uses no in/out buffers.
+    let ok = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle(),
+            FSCTL_SET_SPARSE,
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 /// Acquire a blocking, exclusive advisory lock on an open lock file.
 ///
 /// Unix uses `flock(LOCK_EX)`; Windows uses `LockFileEx(LOCKFILE_EXCLUSIVE_LOCK)`
@@ -138,6 +173,13 @@ fn unpack_sparse<R: Read>(
         .create_new(true)
         .open(path)?;
 
+    // On Windows/NTFS the file is dense by default: set_len to the (large)
+    // logical size and pwriting non-zero chunks at high offsets would allocate
+    // every hole, materialising a 10 GiB overlay even though only ~50 MB is
+    // real data. Mark it sparse first.
+    #[cfg(windows)]
+    mark_file_sparse(&file)?;
+
     // ftruncate: on APFS and ext4 this allocates zero disk blocks for the
     // hole regions — only written bytes consume real space.
     file.set_len(entry_size)?;
@@ -179,7 +221,13 @@ fn unpack_sparse<R: Read>(
 /// load the attacker's library. This function rejects any entry that is
 /// not a regular file or directory.
 fn safe_unpack<R: Read>(archive: &mut tar::Archive<R>, dest: &Path) -> std::io::Result<()> {
-    let canonical_dest = dest.canonicalize().unwrap_or_else(|_| dest.to_path_buf());
+    // Use `normalize_path` (not `canonicalize`) for the containment base so it
+    // matches the per-entry `normalized` paths, which are built from this same
+    // plain `dest`. On Windows `canonicalize` returns a `\\?\`-verbatim path
+    // while the entry paths stay plain, so `starts_with` would reject every
+    // entry; `normalize_path` (which still resolves `..`, preserving the
+    // traversal defense) keeps both sides in the same form on all platforms.
+    let canonical_dest = normalize_path(dest);
 
     // Track directories with restrictive permissions. We extract all entries
     // with directories temporarily set to 0o755, then apply final permissions
@@ -212,10 +260,15 @@ fn safe_unpack<R: Read>(archive: &mut tar::Archive<R>, dest: &Path) -> std::io::
                 // Allow symlinks but validate the target stays within dest.
                 if let Some(link_target) = entry.link_name()? {
                     let link_target = link_target.to_path_buf();
+                    // tar targets use Unix semantics: an absolute target starts
+                    // with '/'. `Path::is_absolute` is false for those on Windows
+                    // (no drive), and `Path::join` would then treat the leading
+                    // slash as a root that wipes `dest`, so detect it by string.
+                    let target_str = link_target.to_string_lossy();
                     // Resolve relative symlinks against the entry's parent dir
-                    let resolved = if link_target.is_absolute() {
+                    let resolved = if target_str.starts_with('/') {
                         // Absolute symlinks: jail to dest (e.g., /lib/foo → dest/lib/foo)
-                        dest.join(link_target.strip_prefix("/").unwrap_or(&link_target))
+                        dest.join(target_str.trim_start_matches('/'))
                     } else {
                         let parent = entry_path.parent().unwrap_or(Path::new(""));
                         dest.join(parent).join(&link_target)
@@ -237,7 +290,13 @@ fn safe_unpack<R: Read>(archive: &mut tar::Archive<R>, dest: &Path) -> std::io::
             tar::EntryType::Link => {
                 // Allow hardlinks but validate the target stays within dest.
                 if let Some(link_target) = entry.link_name()? {
-                    let full_target = dest.join(link_target.as_ref());
+                    // Same Unix-absolute handling as symlinks above.
+                    let target_str = link_target.to_string_lossy();
+                    let full_target = if target_str.starts_with('/') {
+                        dest.join(target_str.trim_start_matches('/'))
+                    } else {
+                        dest.join(link_target.as_ref())
+                    };
                     let normalized = normalize_path(&full_target);
                     if !normalized.starts_with(&canonical_dest) {
                         return Err(std::io::Error::new(
@@ -1482,6 +1541,10 @@ pub fn extract_libs_from_binary(exe_path: &Path, debug: bool) -> std::io::Result
 /// Create a storage disk file (empty sparse file).
 pub fn create_storage_disk(path: &Path, size: u64) -> std::io::Result<()> {
     let file = File::create(path)?;
+    // On Windows/NTFS, File::create makes a dense file; set_len to a multi-GiB
+    // size would allocate every block. Mark it sparse first.
+    #[cfg(windows)]
+    mark_file_sparse(&file)?;
     file.set_len(size)?;
     Ok(())
 }
@@ -1537,6 +1600,10 @@ pub fn copy_overlay_template(
 
     if target > copied_size {
         let file = fs::OpenOptions::new().write(true).open(dest)?;
+        // fs::copy created a dense file on Windows/NTFS; extending it with
+        // set_len would allocate every byte of the gap. Mark it sparse first.
+        #[cfg(windows)]
+        mark_file_sparse(&file)?;
         file.set_len(target)?;
     }
 
@@ -1567,6 +1634,10 @@ pub fn create_or_copy_storage_disk(
                 let current = fs::metadata(storage_path)?.len();
                 if desired > current {
                     let file = fs::OpenOptions::new().write(true).open(storage_path)?;
+                    // fs::copy created a dense file on Windows/NTFS; extending it
+                    // with set_len would allocate the whole gap. Mark sparse first.
+                    #[cfg(windows)]
+                    mark_file_sparse(&file)?;
                     file.set_len(desired)?;
                 }
             }

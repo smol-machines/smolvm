@@ -330,6 +330,10 @@ impl AssetCollector {
 
         // Create sparse file
         let mut file = File::create(&template_path)?;
+        // On Windows/NTFS, File::create makes a dense file; seeking past the end
+        // and writing a tail byte would allocate every intermediate block.
+        #[cfg(windows)]
+        mark_file_sparse(&file)?;
         file.seek(SeekFrom::Start(TEMPLATE_SIZE - 1))?;
         file.write_all(&[0])?;
         file.sync_all()?;
@@ -499,6 +503,39 @@ impl AssetCollector {
 // Sparse-aware overlay copy
 // =============================================================================
 
+/// Mark an open file as sparse (Windows/NTFS) so a later `set_len` to a large
+/// size followed by writes at high offsets doesn't allocate every intermediate
+/// block. Unix filesystems are sparse by default and never call this.
+///
+/// `smolvm-pack` cannot depend on the main crate, so this mirrors the FSCTL
+/// approach in the main crate's `src/disk_utils.rs::mark_file_sparse`.
+#[cfg(windows)]
+fn mark_file_sparse(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    // FSCTL_SET_SPARSE control code (winioctl.h).
+    const FSCTL_SET_SPARSE: u32 = 0x000900C4;
+    let mut returned: u32 = 0;
+    // SAFETY: `file` is a valid open handle; FSCTL_SET_SPARSE uses no in/out buffers.
+    let ok = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle(),
+            FSCTL_SET_SPARSE,
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 /// Copy a sparse overlay disk to `dst`, stripping trailing zeros.
 ///
 /// Scans backwards from the end of the source to find the last non-zero byte,
@@ -524,6 +561,13 @@ fn sparse_copy_overlay(src: &Path, dst: &Path) -> std::io::Result<(u64, u64)> {
 
     // Create destination as a sparse skeleton; keep the handle for writing.
     let mut dst_file = File::create(dst)?;
+    // On Windows/NTFS, File::create makes a non-sparse file: set_len-ing to the
+    // (large) truncated size and then writing a chunk at a high offset would
+    // zero-fill/allocate the entire gap, ballooning a ~50 MB overlay to ~10 GiB
+    // of real disk. Mark it sparse first so only written extents consume space —
+    // matching the implicit sparse behavior of Unix filesystems.
+    #[cfg(windows)]
+    mark_file_sparse(&dst_file)?;
     dst_file.set_len(truncated_size)?;
 
     if truncated_size == 0 {
