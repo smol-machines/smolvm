@@ -535,25 +535,40 @@ impl OciSpec {
                     },
                 ],
                 devices: default_devices(),
-                masked_paths: vec![
-                    "/proc/asound".to_string(),
-                    "/proc/acpi".to_string(),
-                    "/proc/kcore".to_string(),
-                    "/proc/keys".to_string(),
-                    "/proc/latency_stats".to_string(),
-                    "/proc/timer_list".to_string(),
-                    "/proc/timer_stats".to_string(),
-                    "/proc/sched_debug".to_string(),
-                    "/proc/scsi".to_string(),
-                    "/sys/firmware".to_string(),
-                ],
-                readonly_paths: vec![
-                    "/proc/bus".to_string(),
-                    "/proc/fs".to_string(),
-                    "/proc/irq".to_string(),
-                    "/proc/sys".to_string(),
-                    "/proc/sysrq-trigger".to_string(),
-                ],
+                // Mask/freeze the standard runc set of /proc and /sys paths only in
+                // unprivileged mode. In the default VM-grade mode the microVM is the
+                // security boundary (same rationale as the full capability set and the
+                // writable cgroup/tmpfs mounts above), so the workload gets a bare-VM
+                // /proc: an independent VM has all of /proc rw and unmasked, and
+                // freezing /proc/sys read-only here breaks in-VM init systems and
+                // docker-in-VM, which must write net.ipv4.ip_forward and friends.
+                masked_paths: if unprivileged {
+                    vec![
+                        "/proc/asound".to_string(),
+                        "/proc/acpi".to_string(),
+                        "/proc/kcore".to_string(),
+                        "/proc/keys".to_string(),
+                        "/proc/latency_stats".to_string(),
+                        "/proc/timer_list".to_string(),
+                        "/proc/timer_stats".to_string(),
+                        "/proc/sched_debug".to_string(),
+                        "/proc/scsi".to_string(),
+                        "/sys/firmware".to_string(),
+                    ]
+                } else {
+                    vec![]
+                },
+                readonly_paths: if unprivileged {
+                    vec![
+                        "/proc/bus".to_string(),
+                        "/proc/fs".to_string(),
+                        "/proc/irq".to_string(),
+                        "/proc/sys".to_string(),
+                        "/proc/sysrq-trigger".to_string(),
+                    ]
+                } else {
+                    vec![]
+                },
             },
             mounts: default_mounts(unprivileged),
             hostname: Some("container".to_string()),
@@ -1350,6 +1365,42 @@ mod tests {
         // Values just under limit should pass
         let ok_value = "x".repeat(32 * 1024);
         assert!(validate_env_vars(&[("KEY".to_string(), ok_value)]).is_ok());
+    }
+
+    #[test]
+    fn privileged_spec_leaves_proc_unrestricted_unprivileged_keeps_runc_hardening() {
+        let identity = ProcessIdentity::root();
+
+        // VM-grade (default, unprivileged=false): the microVM is the boundary, so
+        // /proc is a bare-VM /proc — nothing masked, nothing frozen read-only. This
+        // is what lets docker-in-VM write /proc/sys/net/ipv4/ip_forward.
+        let privileged = OciSpec::new(&["sh".to_string()], &[], "/", false, &identity, false);
+        assert!(
+            privileged.linux.masked_paths.is_empty(),
+            "privileged spec must not mask any /proc paths"
+        );
+        assert!(
+            privileged.linux.readonly_paths.is_empty(),
+            "privileged spec must not freeze /proc/sys read-only"
+        );
+
+        // Unprivileged opt-in (untrusted code): the standard runc masked/readonly
+        // set is preserved for defense-in-depth.
+        let unprivileged = OciSpec::new(&["sh".to_string()], &[], "/", false, &identity, true);
+        assert!(
+            unprivileged
+                .linux
+                .readonly_paths
+                .contains(&"/proc/sys".to_string()),
+            "unprivileged spec must keep /proc/sys read-only"
+        );
+        assert!(
+            unprivileged
+                .linux
+                .masked_paths
+                .contains(&"/proc/kcore".to_string()),
+            "unprivileged spec must keep /proc/kcore masked"
+        );
     }
 
     #[test]

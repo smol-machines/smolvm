@@ -2972,6 +2972,7 @@ fn write_oci_bundle(
     }
 
     storage::add_workspace_fallback(&mut spec, mounts);
+    storage::add_storage_fallback(&mut spec, mounts, unprivileged);
 
     ssh_agent::inject_into_container(&mut spec);
     spec.write_to(bundle_path)
@@ -3641,6 +3642,7 @@ fn spawn_interactive_command(
     }
 
     storage::add_workspace_fallback(&mut spec, mounts);
+    storage::add_storage_fallback(&mut spec, mounts, unprivileged);
 
     // Forward SSH agent into the container if enabled at boot.
     ssh_agent::inject_into_container(&mut spec);
