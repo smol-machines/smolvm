@@ -31,10 +31,19 @@ const EGRESS_CIDR_CAP: usize = 512;
 
 /// Hidden benchmark knob for root virtiofs DAX.
 ///
-/// Default behavior uses `krun_set_root`, which configures the root virtiofs
-/// device with libkrun's default DAX window. Set `SMOLVM_ROOTFS_DAX=0` to use
-/// `krun_add_virtiofs3("/dev/root", ..., shm_size=0, read_only=false)` instead.
+/// Default configures the root virtiofs device with a 512 MB DAX window (the
+/// same default the removed `krun_set_root` used). Set `SMOLVM_ROOTFS_DAX=0` to
+/// use `krun_add_virtiofs3("/dev/root", ..., shm_size=0, read_only=false)`,
+/// disabling the root DAX region for benchmarking.
 const ENV_SMOLVM_ROOTFS_DAX: &str = "SMOLVM_ROOTFS_DAX";
+
+/// Root virtiofs DAX window (512 MB), matching the default the removed
+/// `krun_set_root` configured. DAX gives the host a coherent shared mapping of
+/// the root fs so the guest agent's ready-marker write is visible to the host
+/// immediately. Plain `krun_add_virtiofs` passes shm_size=0 (no DAX), dropping
+/// virtiofs to writeback caching — the marker isn't seen until the multi-second
+/// socket-probe grace, regressing boot time from ~hundreds of ms to ~5 s.
+const ROOTFS_DAX_WINDOW: u64 = 1 << 29;
 
 /// The Arc type shared between the egress-refresh thread and libkrun's vsock muxer.
 type EgressArc = std::sync::Arc<std::sync::RwLock<Vec<(std::net::IpAddr, u8)>>>;
@@ -474,12 +483,25 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 ));
             }
             tracing::info!("rootfs configured via virtiofs without DAX");
-        } else if krun_add_virtiofs(ctx, root_tag.as_ptr(), root.as_ptr()) < 0 {
-            krun_free_ctx(ctx);
-            return Err(Error::agent(
-                "set rootfs",
-                "krun_add_virtiofs failed for root filesystem",
-            ));
+        } else {
+            // Default: restore the 512 MB root DAX window the removed krun_set_root
+            // configured. Plain krun_add_virtiofs passes shm_size=0 (no DAX), which
+            // drops virtiofs to writeback caching and hides the guest's ready-marker
+            // write from the host until the socket-probe grace — a boot-time regression.
+            let Some(add_virtiofs3) = krun_add_virtiofs3 else {
+                krun_free_ctx(ctx);
+                return Err(Error::agent(
+                    "set rootfs",
+                    "root DAX requires libkrun with krun_add_virtiofs3",
+                ));
+            };
+            if add_virtiofs3(ctx, root_tag.as_ptr(), root.as_ptr(), ROOTFS_DAX_WINDOW, false) < 0 {
+                krun_free_ctx(ctx);
+                return Err(Error::agent(
+                    "set rootfs",
+                    "krun_add_virtiofs3 failed for root filesystem",
+                ));
+            }
         }
 
         let network_plan = select_network_plan(resources, *dns_filter_enabled, port_mappings.len());

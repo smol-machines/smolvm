@@ -175,9 +175,16 @@ pub fn launch_agent_vm_dynamic(
         "rootfs path contains null byte"
     );
     let root_tag = cstr("/dev/root");
+    // Default root with a 512 MB DAX window (matches the removed krun_set_root).
+    // Plain krun_add_virtiofs passes shm_size=0 (no DAX), dropping virtiofs to
+    // writeback caching so the guest's ready-marker write isn't visible to the
+    // host until the socket-probe grace — a multi-second boot-time regression.
+    let Some(add_virtiofs3) = krun.add_virtiofs3 else {
+        free_ctx_on_err!("root DAX requires libkrun with krun_add_virtiofs3");
+    };
     // SAFETY: ctx is valid; root_tag/root are valid null-terminated C strings.
-    if unsafe { (krun.add_virtiofs)(ctx, root_tag.as_ptr(), root.as_ptr()) } < 0 {
-        free_ctx_on_err!("krun_add_virtiofs failed for root filesystem");
+    if unsafe { add_virtiofs3(ctx, root_tag.as_ptr(), root.as_ptr(), 1 << 29, false) } < 0 {
+        free_ctx_on_err!("krun_add_virtiofs3 failed for root filesystem");
     }
 
     let network_plan = plan_launch_network(&config.resources, None, config.port_mappings.len());

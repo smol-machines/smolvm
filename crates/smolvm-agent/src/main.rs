@@ -398,9 +398,18 @@ fn signal_ready_to_host() {
 
     for path in &paths {
         if Path::new(path).parent().map_or(false, |p| p.exists()) {
-            if std::fs::write(path, content.as_bytes()).is_ok() {
-                boot_log("INFO", &format!("ready marker written: {path}"));
-                return;
+            // Write + fsync so the host sees the marker immediately. A plain
+            // write() can sit in the guest's virtiofs writeback cache for
+            // seconds before the host fs backend observes it, leaving the host's
+            // marker poll empty until the socket-probe grace expires — a
+            // multi-second boot-time regression. fsync forces the FUSE write
+            // through to the host now.
+            use std::io::Write as _;
+            if let Ok(mut f) = std::fs::File::create(path) {
+                if f.write_all(content.as_bytes()).is_ok() && f.sync_all().is_ok() {
+                    boot_log("INFO", &format!("ready marker written: {path}"));
+                    return;
+                }
             }
         }
     }

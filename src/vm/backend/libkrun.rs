@@ -115,6 +115,7 @@ impl LibkrunVm {
             let krun_set_workdir = krun.set_workdir;
             let krun_set_exec = krun.set_exec;
             let krun_add_virtiofs = krun.add_virtiofs;
+            let krun_add_virtiofs3 = krun.add_virtiofs3;
             let krun_set_port_map = krun.set_port_map;
             let krun_add_disk2 = krun.add_disk2;
             let krun_add_vsock = krun.add_vsock;
@@ -143,8 +144,17 @@ impl LibkrunVm {
             let root = path_to_cstring(rootfs_path)?;
             let root_tag = CString::new("/dev/root").expect("static tag");
             tracing::debug!("[libkrun] rootfs_path: {:?}", rootfs_path);
-            let ret = krun_add_virtiofs(ctx, root_tag.as_ptr(), root.as_ptr());
-            tracing::debug!("[libkrun] krun_add_virtiofs(root) returned: {}", ret);
+            // 512 MB root DAX window (matches the removed krun_set_root); plain
+            // krun_add_virtiofs uses shm_size=0 (no DAX) → writeback caching that
+            // delays host visibility of guest writes (e.g. the agent ready marker).
+            let Some(krun_add_virtiofs3) = krun_add_virtiofs3 else {
+                krun_free_ctx(ctx);
+                return Err(Error::vm_creation(
+                    "root DAX requires libkrun with krun_add_virtiofs3",
+                ));
+            };
+            let ret = krun_add_virtiofs3(ctx, root_tag.as_ptr(), root.as_ptr(), 1 << 29, false);
+            tracing::debug!("[libkrun] krun_add_virtiofs3(root) returned: {}", ret);
             if ret < 0 {
                 krun_free_ctx(ctx);
                 return Err(Error::vm_creation("failed to set root filesystem"));
