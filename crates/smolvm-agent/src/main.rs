@@ -2893,34 +2893,36 @@ fn handle_interactive_run(
     Ok(())
 }
 
-/// Resolve the command for a container run.
+/// Resolve the command AND working directory for a container run.
 ///
 /// If the caller supplied a command, use it verbatim. Otherwise fall back to
 /// the image's OCI `ENTRYPOINT` + `CMD` (read from the stored image config),
 /// so an image can run its own init without the caller having to know it.
 /// Errors if no command was given and the image defines neither.
+///
+/// Also returns the image's `WorkingDir` so the caller can honor it: an image's
+/// `CMD ["node","server.js"]` is relative to its `WORKDIR /app`, and running it
+/// from `/` (the default) fails with "cannot find module". The caller applies
+/// this only when the request did not specify its own workdir.
 #[cfg(target_os = "linux")]
 fn resolve_image_command(
     image: &str,
     command: Vec<String>,
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+) -> Result<(Vec<String>, Option<String>), Box<dyn std::error::Error>> {
+    let info = storage::query_image(image)?
+        .ok_or_else(|| -> Box<dyn std::error::Error> { format!("image not found: {image}").into() })?;
+    let workdir = info.workdir.clone();
     if !command.is_empty() {
-        return Ok(command);
+        return Ok((command, workdir));
     }
-    match storage::query_image(image)? {
-        Some(info) => {
-            let mut resolved = info.entrypoint;
-            resolved.extend(info.cmd);
-            if resolved.is_empty() {
-                return Err(format!(
-                    "no command given and image '{image}' defines no entrypoint or cmd"
-                )
-                .into());
-            }
-            Ok(resolved)
-        }
-        None => Err(format!("image not found: {image}").into()),
+    let mut resolved = info.entrypoint;
+    resolved.extend(info.cmd);
+    if resolved.is_empty() {
+        return Err(
+            format!("no command given and image '{image}' defines no entrypoint or cmd").into(),
+        );
     }
+    Ok((resolved, workdir))
 }
 
 /// Write an OCI bundle (`config.json`) and return a freshly generated container ID.
@@ -2999,7 +3001,7 @@ fn handle_run_detached(
 
     ensure_storage_mounted();
 
-    let (image, mut command, env, workdir, user, mounts, persistent_overlay_id, unprivileged) =
+    let (image, mut command, env, mut workdir, user, mounts, persistent_overlay_id, unprivileged) =
         match request {
             AgentRequest::Run {
                 image,
@@ -3064,11 +3066,13 @@ fn handle_run_detached(
     };
 
     // Resolve the command from the image's OCI ENTRYPOINT+CMD when the caller
-    // gave none — this is what lets service-style images (whose ENTRYPOINT
-    // orchestrates a supervised stack) run as their authors intended.
-    if command.is_empty() {
-        command = match resolve_image_command(&image, command) {
-            Ok(c) => c,
+    // gave none (so service-style images run as their authors intended), and
+    // honor the image's WorkingDir when the request didn't set one — an image
+    // CMD is relative to its WORKDIR (e.g. `node server.js` in `/app`), so
+    // running it from `/` (the default) would fail with "cannot find module".
+    {
+        let (resolved_command, image_workdir) = match resolve_image_command(&image, command) {
+            Ok(r) => r,
             Err(e) => {
                 send_response(
                     stream,
@@ -3077,7 +3081,11 @@ fn handle_run_detached(
                 return Ok(());
             }
         };
-        info!(image = %image, command = ?command, "resolved command from image config");
+        command = resolved_command;
+        if workdir.is_none() {
+            workdir = image_workdir;
+        }
+        info!(image = %image, command = ?command, workdir = ?workdir, "resolved command + workdir from image config");
     }
 
     if let Err(e) = storage::setup_mounts(&prepared.rootfs_path, &mounts) {
