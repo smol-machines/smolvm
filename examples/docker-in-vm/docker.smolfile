@@ -1,8 +1,13 @@
 # Docker inside a smolvm microVM
 #
-# Runs Docker Engine in a bare Alpine VM. No OCI image or crun involved —
-# init commands run directly in the VM as root via VmExec, so Docker gets
-# full kernel privileges without any capability restrictions.
+# Runs Docker Engine in a bare Alpine VM. Init commands run directly in the VM
+# as root via VmExec, so Docker gets full kernel privileges without any
+# capability restrictions.
+#
+# This also works with `--image`: a privileged (default) image-based machine
+# runs in an OCI container, but /storage is bind-mounted into it, so the same
+# `mount --bind /storage/docker /var/lib/docker` resolves to the ext4 disk just
+# as in a bare VM.
 #
 # ── Kernel requirements ───────────────────────────────────────────────────────
 #

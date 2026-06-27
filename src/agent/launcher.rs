@@ -1003,59 +1003,13 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // guest path.
         let _ = &dns_filter_socket;
 
-        if let Some(network) = guest_network {
-            env_strings.push(cstr(&format!(
-                "{}={}",
-                guest_env::BACKEND,
-                guest_env::BACKEND_VIRTIO_NET
-            )));
-            env_strings.push(cstr(&format!(
-                "{}={}",
-                guest_env::GUEST_IP,
-                network.guest_ip
-            )));
-            env_strings.push(cstr(&format!(
-                "{}={}",
-                guest_env::GATEWAY,
-                network.gateway_ip
-            )));
-            env_strings.push(cstr(&format!(
-                "{}={}",
-                guest_env::PREFIX_LEN,
-                network.prefix_len
-            )));
-            env_strings.push(cstr(&format!(
-                "{}={}",
-                guest_env::GUEST_MAC,
-                format_mac(network.guest_mac)
-            )));
-            env_strings.push(cstr(&format!(
-                "{}={}",
-                guest_env::GUEST_IP6,
-                network.guest_ip6
-            )));
-            env_strings.push(cstr(&format!(
-                "{}={}",
-                guest_env::GATEWAY6,
-                network.gateway_ip6
-            )));
-            env_strings.push(cstr(&format!(
-                "{}={}",
-                guest_env::PREFIX_LEN6,
-                network.prefix_len6
-            )));
-            env_strings.push(cstr(&format!("{}={}", guest_env::DNS, network.dns_server)));
-        }
-
-        // TSI has no host-side gateway: the guest's datagrams are proxied to
-        // their real destination, so a custom resolver (--dns) must become the
-        // guest's resolv.conf nameserver directly. (virtio-net already pushed
-        // its gateway address above and routes the override as the upstream.)
-        if guest_network.is_none() {
-            if let Some(dns) = resources.dns {
-                env_strings.push(cstr(&format!("{}={}", guest_env::DNS, dns)));
-            }
-        }
+        // Guest-network env vars — virtio-net interface config plus the TSI
+        // `--dns` override — are built in one shared place so the static and
+        // dynamic launchers can't diverge (see `agent::guest_network_env`).
+        env_strings.extend(crate::agent::guest_network_env(
+            guest_network,
+            resources.dns,
+        ));
 
         // Tell the agent about pre-extracted packed layers
         if packed_layers_dir.is_some_and(|d| d.exists()) {
@@ -1205,13 +1159,6 @@ fn select_network_plan(
     let dns_filter_placeholder = [String::from("configured")];
     let dns_filter_hosts = dns_filter_enabled.then_some(dns_filter_placeholder.as_slice());
     plan_launch_network(resources, dns_filter_hosts, port_count)
-}
-
-fn format_mac(mac: [u8; 6]) -> String {
-    format!(
-        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
-    )
 }
 
 /// Resolve a hostname to /32 CIDR strings for the egress-refresh thread.

@@ -392,49 +392,15 @@ pub fn launch_agent_vm_dynamic(
         }
     }
 
-    if let Some(network) = guest_network {
-        env_strings.push(cstr(&format!(
-            "{}={}",
-            guest_env::BACKEND,
-            guest_env::BACKEND_VIRTIO_NET
-        )));
-        env_strings.push(cstr(&format!(
-            "{}={}",
-            guest_env::GUEST_IP,
-            network.guest_ip
-        )));
-        env_strings.push(cstr(&format!(
-            "{}={}",
-            guest_env::GATEWAY,
-            network.gateway_ip
-        )));
-        env_strings.push(cstr(&format!(
-            "{}={}",
-            guest_env::PREFIX_LEN,
-            network.prefix_len
-        )));
-        env_strings.push(cstr(&format!(
-            "{}={}",
-            guest_env::GUEST_MAC,
-            format_mac(network.guest_mac)
-        )));
-        env_strings.push(cstr(&format!(
-            "{}={}",
-            guest_env::GUEST_IP6,
-            network.guest_ip6
-        )));
-        env_strings.push(cstr(&format!(
-            "{}={}",
-            guest_env::GATEWAY6,
-            network.gateway_ip6
-        )));
-        env_strings.push(cstr(&format!(
-            "{}={}",
-            guest_env::PREFIX_LEN6,
-            network.prefix_len6
-        )));
-        env_strings.push(cstr(&format!("{}={}", guest_env::DNS, network.dns_server)));
-    }
+    // Guest-network env vars — virtio-net interface config plus the TSI `--dns`
+    // override — are built in one shared place so the static and dynamic
+    // launchers can't diverge (see `agent::guest_network_env`). The dynamic
+    // launcher having open-coded this is exactly how it once dropped `--dns` on
+    // TSI (PR #466).
+    env_strings.extend(crate::agent::guest_network_env(
+        guest_network,
+        config.resources.dns,
+    ));
 
     let mut envp: Vec<*const libc::c_char> = env_strings.iter().map(|s| s.as_ptr()).collect();
     envp.push(std::ptr::null());
@@ -513,13 +479,6 @@ fn create_unix_stream_pair() -> std::io::Result<(RawFd, RawFd)> {
         return Err(std::io::Error::last_os_error());
     }
     Ok((fds[0], fds[1]))
-}
-
-fn format_mac(mac: [u8; 6]) -> String {
-    format!(
-        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
-    )
 }
 
 /// Raise file descriptor limits (required by libkrun).

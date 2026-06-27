@@ -415,6 +415,46 @@ pub fn add_workspace_fallback(spec: &mut OciSpec, mounts: &[(String, String, boo
     }
 }
 
+/// Expose the per-VM `/storage` disk inside privileged containers, so an
+/// `--image` machine has the same filesystem topology as a bare VM: `/storage`
+/// (and therefore `/storage/docker`, `/storage/workspace`, …) resolves to the
+/// ext4 disk identically with or without `--image`, and bind-mounts the workload
+/// makes against it — e.g. docker-in-VM binding `/storage/docker` →
+/// `/var/lib/docker` so overlay2 lands on ext4, not the rootfs overlay — work
+/// the same in a container as in a bare VM.
+///
+/// Privileged-only: when `unprivileged` the container is a defense-in-depth
+/// boundary for untrusted code, so it must NOT see the VM's storage disk (its
+/// image archives and overlay plumbing). `/storage` is per-machine, so for a
+/// privileged workload — where the microVM is the security boundary — exposing
+/// it crosses no isolation boundary; it only mirrors what a bare VM already has.
+///
+/// Skipped when the user already mounted something at `/storage`, and a no-op
+/// when the disk isn't mounted (bare agent rootfs / no storage disk).
+pub fn add_storage_fallback(
+    spec: &mut OciSpec,
+    mounts: &[(String, String, bool)],
+    unprivileged: bool,
+) {
+    // Decide policy first (testable without a mounted disk), then gate on the
+    // disk actually being present (a no-op on a bare agent rootfs).
+    if should_expose_storage(mounts, unprivileged) && Path::new(STORAGE_ROOT).exists() {
+        spec.add_bind_mount(STORAGE_ROOT, STORAGE_ROOT, false);
+    }
+}
+
+/// Policy for [`add_storage_fallback`]: a privileged workload that hasn't already
+/// claimed `/storage` should see the VM's storage disk. Unprivileged containers
+/// never do (defense-in-depth boundary for untrusted code).
+fn should_expose_storage(mounts: &[(String, String, bool)], unprivileged: bool) -> bool {
+    if unprivileged {
+        return false;
+    }
+    !mounts
+        .iter()
+        .any(|(_, path, _)| path.trim_end_matches('/') == STORAGE_ROOT)
+}
+
 /// Name of the optional index file (written into the packed-layers dir at
 /// extraction time) recording the layers in OCI order, bottom-most first, one
 /// short layer id per line.
@@ -2639,6 +2679,7 @@ pub fn run_command(
         }
 
         add_workspace_fallback(&mut spec, mounts);
+        add_storage_fallback(&mut spec, mounts, unprivileged);
 
         // Forward SSH agent into the container if enabled at boot.
         crate::ssh_agent::inject_into_container(&mut spec);
@@ -2729,6 +2770,7 @@ pub fn spawn_in_overlay(
     }
 
     add_workspace_fallback(&mut spec, mounts);
+    add_storage_fallback(&mut spec, mounts, unprivileged);
 
     crate::ssh_agent::inject_into_container(&mut spec);
     spec.add_gpu_devices_if_available();
@@ -3620,6 +3662,25 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn storage_exposed_only_to_privileged_workloads_without_a_user_storage_mount() {
+        // Privileged (default) and no user mount at /storage → expose it, so an
+        // --image VM sees /storage like a bare VM (docker-in-VM bind targets work).
+        assert!(should_expose_storage(&[], false));
+
+        // Unprivileged (untrusted code) never sees the VM's storage disk.
+        assert!(!should_expose_storage(&[], true));
+
+        // The user already claimed /storage (e.g. -v host:/storage) → don't clobber
+        // it, even when privileged. Trailing slash is normalized.
+        let user_mount = vec![("tag".to_string(), "/storage/".to_string(), false)];
+        assert!(!should_expose_storage(&user_mount, false));
+
+        // A user mount elsewhere doesn't suppress the /storage fallback.
+        let other_mount = vec![("tag".to_string(), "/data".to_string(), false)];
+        assert!(should_expose_storage(&other_mount, false));
     }
 
     #[test]

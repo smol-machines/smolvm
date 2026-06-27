@@ -139,6 +139,28 @@ fn boottime_ms() -> u64 {
     (ts.tv_sec as u64) * 1000 + (ts.tv_nsec as u64) / 1_000_000
 }
 
+/// Decide what to write to `/etc/resolv.conf` on the TSI (no-virtio) path, or
+/// `None` to leave the existing file untouched.
+///
+/// The host delivers a `--dns` override through one of two mechanisms depending
+/// on the boot path: it either forwards it as `guest_env::DNS`, or it writes the
+/// nameserver straight into the rootfs's resolv.conf before boot (the libkrun
+/// backend's `setup_dns`). This one function honors both: an explicit override
+/// wins, and otherwise we only repair a stale loopback/empty resolv.conf (left
+/// by a prior `--allow-host` run that pointed at the local DNS proxy) — we never
+/// clobber a valid nameserver the host already wrote. The old code wrote the
+/// hardcoded public resolvers unconditionally, which both dropped `--dns` and
+/// overwrote `setup_dns`'s value, so `--dns` never took effect on TSI.
+fn tsi_resolv_conf(dns_override: Option<&str>, current: &str) -> Option<String> {
+    match dns_override.map(str::trim) {
+        Some(dns) if !dns.is_empty() => Some(format!("nameserver {dns}\n")),
+        _ if current.contains("127.0.0.1") || current.trim().is_empty() => {
+            Some("nameserver 1.1.1.1\nnameserver 8.8.8.8\n".to_string())
+        }
+        _ => None,
+    }
+}
+
 fn main() {
     // Quick --version check (used by init script to detect rootfs updates)
     if std::env::args().any(|a| a == "--version") {
@@ -253,14 +275,20 @@ fn main() {
         Ok(false) => {
             // TSI mode or no network. The overlay may contain a stale
             // "nameserver 127.0.0.1" written by a previous --allow-host run.
-            // TSI forwards UDP to 1.1.1.1 directly, so reset resolv.conf to a
-            // known-good value unless the DNS filter proxy is about to
-            // overwrite it with 127.0.0.1 anyway.
+            // TSI forwards UDP to the resolver directly, so reset resolv.conf to
+            // a known-good value unless the DNS filter proxy is about to
+            // overwrite it with 127.0.0.1 anyway. Honor an explicit `--dns`
+            // override (forwarded by the host as guest_env::DNS) — the virtio
+            // path already derives the guest resolver from the same env var, so
+            // both backends now agree on which nameserver the guest uses. This
+            // is what makes `--dns` work on a network where the public resolvers
+            // (1.1.1.1/8.8.8.8) are blocked.
             if !dns_proxy::is_enabled() {
-                let _ = std::fs::write(
-                    "/etc/resolv.conf",
-                    "nameserver 1.1.1.1\nnameserver 8.8.8.8\n",
-                );
+                let dns_override = std::env::var(guest_env::DNS).ok();
+                let current = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
+                if let Some(new) = tsi_resolv_conf(dns_override.as_deref(), &current) {
+                    let _ = std::fs::write("/etc/resolv.conf", new);
+                }
             }
         }
         Err(err) => {
@@ -2944,6 +2972,7 @@ fn write_oci_bundle(
     }
 
     storage::add_workspace_fallback(&mut spec, mounts);
+    storage::add_storage_fallback(&mut spec, mounts, unprivileged);
 
     ssh_agent::inject_into_container(&mut spec);
     spec.write_to(bundle_path)
@@ -3613,6 +3642,7 @@ fn spawn_interactive_command(
     }
 
     storage::add_workspace_fallback(&mut spec, mounts);
+    storage::add_storage_fallback(&mut spec, mounts, unprivileged);
 
     // Forward SSH agent into the container if enabled at boot.
     ssh_agent::inject_into_container(&mut spec);
@@ -5238,6 +5268,46 @@ mod bg_reap_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Regression for `--dns` being silently dropped on the TSI backend: an
+    // explicit override must win over whatever is currently in resolv.conf,
+    // otherwise a guest on a network where 1.1.1.1/8.8.8.8 are unreachable can
+    // never pull an image.
+    #[test]
+    fn tsi_resolv_conf_override_wins_over_current() {
+        assert_eq!(
+            tsi_resolv_conf(Some("9.9.9.9"), "nameserver 8.8.8.8\n").as_deref(),
+            Some("nameserver 9.9.9.9\n")
+        );
+        // Surrounding whitespace is trimmed rather than written into resolv.conf.
+        assert_eq!(
+            tsi_resolv_conf(Some(" 10.0.0.2 "), "").as_deref(),
+            Some("nameserver 10.0.0.2\n")
+        );
+    }
+
+    // Without an override, a valid host-written resolv.conf (e.g. the libkrun
+    // backend's setup_dns) must be PRESERVED, not clobbered — this is the other
+    // half of the same bug.
+    #[test]
+    fn tsi_resolv_conf_preserves_valid_host_written_file() {
+        assert_eq!(tsi_resolv_conf(None, "nameserver 9.9.9.9\n"), None);
+        // A blank override is treated as "no override", so preservation applies.
+        assert_eq!(tsi_resolv_conf(Some("  "), "nameserver 10.0.0.2\n"), None);
+    }
+
+    // A stale loopback (left by a prior --allow-host run) or an empty file is
+    // repaired to the public resolvers.
+    #[test]
+    fn tsi_resolv_conf_repairs_stale_loopback_or_empty() {
+        let public = "nameserver 1.1.1.1\nnameserver 8.8.8.8\n";
+        assert_eq!(
+            tsi_resolv_conf(None, "nameserver 127.0.0.1\n").as_deref(),
+            Some(public)
+        );
+        assert_eq!(tsi_resolv_conf(None, "").as_deref(), Some(public));
+        assert_eq!(tsi_resolv_conf(None, "   \n").as_deref(), Some(public));
+    }
 
     #[test]
     #[cfg(unix)]

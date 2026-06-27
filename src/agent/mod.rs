@@ -60,3 +60,51 @@ fn gpu_virgl_flags() -> u32 {
         (1 << 6) | (1 << 7)
     }
 }
+
+/// Build the guest-network environment variables handed to the agent at boot.
+///
+/// Shared by both the static (`launcher.rs`) and dynamic (`launcher_dynamic.rs`)
+/// launchers — like [`gpu_virgl_flags`] — so the two can never silently diverge.
+/// They previously each open-coded this block, and the dynamic one drifted: it
+/// omitted the TSI `--dns` override, silently dropping `--dns` on the default
+/// backend (PR #466). With one source of truth, the guest's resolver is decided
+/// in exactly one place and the agent remains the sole writer of resolv.conf.
+///
+/// `guest_network` is `Some` for virtio-net (the agent derives its resolver from
+/// `dns_server`, the gateway address). For TSI it is `None`: there is no host
+/// gateway to route a resolver through, so a `--dns` override must be passed
+/// straight through for the agent to write into resolv.conf.
+pub(crate) fn guest_network_env(
+    guest_network: Option<smolvm_network::GuestNetworkConfig>,
+    dns_override: Option<std::net::Ipv4Addr>,
+) -> Vec<std::ffi::CString> {
+    use smolvm_protocol::guest_env;
+    let mut env: Vec<std::ffi::CString> = Vec::new();
+    let mut push = |key: &str, val: String| {
+        env.push(std::ffi::CString::new(format!("{key}={val}")).expect("env var contains NUL"));
+    };
+    if let Some(n) = guest_network {
+        push(
+            guest_env::BACKEND,
+            guest_env::BACKEND_VIRTIO_NET.to_string(),
+        );
+        push(guest_env::GUEST_IP, n.guest_ip.to_string());
+        push(guest_env::GATEWAY, n.gateway_ip.to_string());
+        push(guest_env::PREFIX_LEN, n.prefix_len.to_string());
+        push(guest_env::GUEST_MAC, format_mac(n.guest_mac));
+        push(guest_env::GUEST_IP6, n.guest_ip6.to_string());
+        push(guest_env::GATEWAY6, n.gateway_ip6.to_string());
+        push(guest_env::PREFIX_LEN6, n.prefix_len6.to_string());
+        push(guest_env::DNS, n.dns_server.to_string());
+    } else if let Some(dns) = dns_override {
+        push(guest_env::DNS, dns.to_string());
+    }
+    env
+}
+
+fn format_mac(mac: [u8; 6]) -> String {
+    format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+    )
+}
