@@ -609,11 +609,10 @@ pub async fn create_machine(
         return Err(e);
     }
 
-    // Fetch the persisted record for the response
-    let db = state.db();
-    let record = db
-        .get_vm(&name)
-        .map_err(ApiError::database)?
+    // Fetch the persisted record for the response (off the reactor).
+    let record = state
+        .lookup_vm(&name)
+        .await?
         .ok_or_else(|| ApiError::internal("machine disappeared after creation".to_string()))?;
 
     Ok(Json(record_to_info(&name, &record)))
@@ -632,9 +631,10 @@ pub async fn create_machine(
 pub async fn list_machines(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ListMachinesResponse>, ApiError> {
-    let db = state.db();
-    let vms = db.list_vms().map_err(ApiError::database)?;
-
+    // Read off the reactor: an inline synchronous `list_vms()` here let a stalled
+    // write park the worker pool and wedge the liveness probes (this is the path
+    // the control plane polls every reconcile). See tests/reactor_wedge.rs.
+    let vms = state.list_vm_records().await?;
     let machines: Vec<MachineInfo> = vms
         .iter()
         .map(|(name, record)| record_to_info(name, record))
@@ -660,10 +660,9 @@ pub async fn get_machine(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
 ) -> Result<Json<MachineInfo>, ApiError> {
-    let db = state.db();
-    let record = db
-        .get_vm(&name)
-        .map_err(ApiError::database)?
+    let record = state
+        .lookup_vm(&name)
+        .await?
         .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
 
     Ok(Json(record_to_info(&name, &record)))
@@ -715,11 +714,10 @@ pub async fn start_machine(
     let lifecycle = state.lifecycle_lock(&name);
     let _guard = lifecycle.lock().await;
 
-    // Get VM record from database
-    let db = state.db();
-    let record = db
-        .get_vm(&name)
-        .map_err(ApiError::database)?
+    // Get VM record from database (off the reactor)
+    let record = state
+        .lookup_vm(&name)
+        .await?
         .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
 
     // Resolve via the shared probe (PID + vsock ping) so we don't
@@ -875,14 +873,14 @@ pub async fn start_machine(
     // Capture start time for PID verification
     let pid_start_time = pid.and_then(process_start_time);
 
-    // Persist state to database
-    let record = db
-        .update_vm(&name, |r| {
+    // Persist state to database (off the reactor)
+    let record = state
+        .update_vm(&name, move |r| {
             r.state = RecordState::Running;
             r.pid = pid;
             r.pid_start_time = pid_start_time;
         })
-        .map_err(ApiError::database)?
+        .await?
         .ok_or_else(|| {
             ApiError::NotFound(format!(
                 "machine '{}' disappeared from database during start",
@@ -1022,13 +1020,12 @@ pub async fn fork_machine(
     // Persist the running state.
     let pid_start_time = pid.and_then(process_start_time);
     let record = state
-        .db()
-        .update_vm(&clone, |r| {
+        .update_vm(&clone, move |r| {
             r.state = RecordState::Running;
             r.pid = pid;
             r.pid_start_time = pid_start_time;
         })
-        .map_err(ApiError::database)?
+        .await?
         .ok_or_else(|| {
             ApiError::NotFound(format!(
                 "clone '{}' disappeared from database during fork",
@@ -1070,11 +1067,10 @@ pub async fn stop_machine(
     let lifecycle = state.lifecycle_lock(&name);
     let _guard = lifecycle.lock().await;
 
-    // Get VM record from database
-    let db = state.db();
-    let record = db
-        .get_vm(&name)
-        .map_err(ApiError::database)?
+    // Get VM record from database (off the reactor)
+    let record = state
+        .lookup_vm(&name)
+        .await?
         .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
 
     // Check state
@@ -1152,13 +1148,13 @@ pub async fn stop_machine(
     }
 
     // Persist state to database and get updated record — only after confirmed stop
-    let record = db
+    let record = state
         .update_vm(&name, |r| {
             r.state = RecordState::Stopped;
             r.pid = None;
             r.pid_start_time = None;
         })
-        .map_err(ApiError::database)?
+        .await?
         .ok_or_else(|| {
             ApiError::NotFound(format!(
                 "machine '{}' disappeared from database during stop",
@@ -1189,14 +1185,14 @@ pub async fn drain_node(State(state): State<Arc<ApiState>>) -> axum::http::Statu
 /// the control plane can reschedule. Best-effort, concurrent, and bounded so it
 /// fits inside the host's termination grace period.
 pub async fn drain_machines(state: &Arc<ApiState>) {
-    let running: Vec<(String, Option<i32>, Option<u64>)> = match state.db().list_vms() {
+    let running: Vec<(String, Option<i32>, Option<u64>)> = match state.list_vm_records().await {
         Ok(vms) => vms
             .into_iter()
             .filter(|(_, r)| r.actual_state() == RecordState::Running && r.is_process_alive())
             .map(|(name, r)| (name, r.pid, r.pid_start_time))
             .collect(),
         Err(e) => {
-            tracing::error!(error = %e, "drain: failed to list machines");
+            tracing::error!(error = ?e, "drain: failed to list machines");
             return;
         }
     };
@@ -1228,11 +1224,13 @@ pub async fn drain_machines(state: &Arc<ApiState>) {
             if let Ok(entry) = state.get_machine(&name) {
                 entry.lock().manager.mark_stopped();
             }
-            let _ = state.db().update_vm(&name, |r| {
-                r.state = RecordState::Stopped;
-                r.pid = None;
-                r.pid_start_time = None;
-            });
+            let _ = state
+                .update_vm(&name, |r| {
+                    r.state = RecordState::Stopped;
+                    r.pid = None;
+                    r.pid_start_time = None;
+                })
+                .await;
             tracing::info!(machine = %name, stopped, "drain: machine stopped");
         }));
     }
@@ -1277,12 +1275,10 @@ pub async fn delete_machine(
     let lifecycle = state.lifecycle_lock(&name);
     let _guard = lifecycle.lock().await;
 
-    let db = state.db();
-
-    // Check if VM exists and get its state
-    let record = db
-        .get_vm(&name)
-        .map_err(ApiError::database)?
+    // Check if VM exists and get its state (off the reactor)
+    let record = state
+        .lookup_vm(&name)
+        .await?
         .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
 
     // Get PID and start time from database record
@@ -1464,13 +1460,10 @@ pub async fn resize_machine(
     Path(name): Path<String>,
     Json(req): Json<ResizeMachineRequest>,
 ) -> Result<Json<MachineInfo>, ApiError> {
-    let db = state.db();
-
-    let record = db
-        .get_vm(&name)
-        .map_err(ApiError::database)?
-        .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?
-        .clone();
+    let record = state
+        .lookup_vm(&name)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
 
     let actual_state = record.actual_state();
     match actual_state {
@@ -1524,16 +1517,17 @@ pub async fn resize_machine(
         }
     }
 
-    let record = db
-        .update_vm(&name, |r| {
-            if let Some(s) = req.storage_gb {
+    let (storage_gb, overlay_gb) = (req.storage_gb, req.overlay_gb);
+    let record = state
+        .update_vm(&name, move |r| {
+            if let Some(s) = storage_gb {
                 r.storage_gb = Some(s);
             }
-            if let Some(o) = req.overlay_gb {
+            if let Some(o) = overlay_gb {
                 r.overlay_gb = Some(o);
             }
         })
-        .map_err(ApiError::database)?
+        .await?
         .ok_or_else(|| {
             ApiError::NotFound(format!("machine '{}' disappeared during resize", name))
         })?;

@@ -53,11 +53,7 @@ pub async fn upload_file(
         .await
         .map_err(classify_ensure_running_error)?;
 
-    let machine_image = state
-        .db()
-        .get_vm(&id)
-        .map_err(ApiError::database)?
-        .and_then(|r| r.image);
+    let machine_image = state.lookup_vm(&id).await?.and_then(|r| r.image);
 
     let file_path = file_path.trim_start_matches('/');
     let guest_path = format!("/{}", file_path);
@@ -119,11 +115,7 @@ pub async fn download_file(
         .await
         .map_err(classify_ensure_running_error)?;
 
-    let machine_image = state
-        .db()
-        .get_vm(&id)
-        .map_err(ApiError::database)?
-        .and_then(|r| r.image);
+    let machine_image = state.lookup_vm(&id).await?.and_then(|r| r.image);
 
     let file_path = file_path.trim_start_matches('/');
     let guest_path = format!("/{}", file_path);
