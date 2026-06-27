@@ -383,14 +383,28 @@ pub fn clone_or_copy_file(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Copy a sparse file on Windows/NTFS without materialising its holes: mark the
-/// destination sparse, then write only the non-zero 256 KiB chunks (zero runs
-/// are left as unallocated holes, and the trailing hole is covered by `set_len`).
-/// Mirrors the Linux `SEEK_HOLE`/`SEEK_DATA` path so a large-virtual template
-/// stays small on disk instead of growing to its full logical size on copy.
+/// Copy a sparse file on Windows/NTFS by replicating only its allocated regions,
+/// leaving holes as holes — the Win32 analogue of the Linux `SEEK_HOLE`/`SEEK_DATA`
+/// path. A scan-and-skip-zeros copy would have to read the whole logical size
+/// (20+ GiB for a disk image) and, worse, allocate any non-zero region it finds;
+/// `FSCTL_QUERY_ALLOCATED_RANGES` reports exactly the regions NTFS has backed, so
+/// a 20 GiB image holding a few MB copies a few MB.
 #[cfg(windows)]
 fn sparse_copy_windows(src: &Path, dst: &Path) -> std::io::Result<u64> {
     use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    // FSCTL_QUERY_ALLOCATED_RANGES (winioctl.h) + its in/out record. LARGE_INTEGER
+    // fields are signed 64-bit byte counts.
+    const FSCTL_QUERY_ALLOCATED_RANGES: u32 = 0x0009_40CF;
+    const ERROR_MORE_DATA: i32 = 234;
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct AllocatedRange {
+        file_offset: i64,
+        length: i64,
+    }
 
     let mut src_file = std::fs::File::open(src)?;
     let src_len = src_file.metadata()?.len();
@@ -404,26 +418,65 @@ fn sparse_copy_windows(src: &Path, dst: &Path) -> std::io::Result<u64> {
     if src_len == 0 {
         return Ok(0);
     }
-    // Mark sparse BEFORE extending so the hole regions are never allocated.
+    // Mark sparse BEFORE extending so the holes are never allocated.
     mark_file_sparse(&dst_file)?;
     dst_file.set_len(src_len)?;
 
-    let mut offset: u64 = 0;
     let mut total: u64 = 0;
-    let mut buf = vec![0u8; 256 * 1024];
+    let mut buf = vec![0u8; 1024 * 1024];
+    let mut out: Vec<AllocatedRange> = vec![AllocatedRange { file_offset: 0, length: 0 }; 1024];
+    // Query allocated ranges starting at 0; the FSCTL fills as many as fit, and
+    // signals ERROR_MORE_DATA when there are more (resume past the last range).
+    let mut query = AllocatedRange { file_offset: 0, length: src_len as i64 };
     loop {
-        let n = src_file.read(&mut buf)?;
-        if n == 0 {
+        let mut returned: u32 = 0;
+        // SAFETY: src handle is live; `query` is a valid input record; `out` is a
+        // valid, correctly-sized output array; `returned` is a writable out-param.
+        let ok = unsafe {
+            DeviceIoControl(
+                src_file.as_raw_handle(),
+                FSCTL_QUERY_ALLOCATED_RANGES,
+                &query as *const _ as *const core::ffi::c_void,
+                std::mem::size_of::<AllocatedRange>() as u32,
+                out.as_mut_ptr() as *mut core::ffi::c_void,
+                (out.len() * std::mem::size_of::<AllocatedRange>()) as u32,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        let more = ok == 0 && std::io::Error::last_os_error().raw_os_error() == Some(ERROR_MORE_DATA);
+        if ok == 0 && !more {
+            return Err(std::io::Error::last_os_error());
+        }
+        let count = returned as usize / std::mem::size_of::<AllocatedRange>();
+        if count == 0 {
             break;
         }
-        let chunk = &buf[..n];
-        if chunk.iter().any(|&b| b != 0) {
-            dst_file.seek(SeekFrom::Start(offset))?;
-            dst_file.write_all(chunk)?;
-            total += n as u64;
+        let mut resume = query.file_offset;
+        for r in &out[..count] {
+            let mut pos = r.file_offset as u64;
+            let end = (r.file_offset + r.length) as u64;
+            while pos < end {
+                let want = std::cmp::min((end - pos) as usize, buf.len());
+                src_file.seek(SeekFrom::Start(pos))?;
+                src_file.read_exact(&mut buf[..want])?;
+                dst_file.seek(SeekFrom::Start(pos))?;
+                dst_file.write_all(&buf[..want])?;
+                pos += want as u64;
+                total += want as u64;
+            }
+            resume = r.file_offset + r.length;
         }
-        offset += n as u64;
+        if !more {
+            break;
+        }
+        query.file_offset = resume;
+        query.length = src_len as i64 - resume;
+        if query.length <= 0 {
+            break;
+        }
     }
+    tracing::debug!(total, "sparse_copy_windows: allocated-range copy done");
     Ok(total)
 }
 
