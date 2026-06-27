@@ -734,8 +734,52 @@ impl ApiState {
     }
 
     /// Get the underlying database handle.
+    ///
+    /// Prefer the async helpers below (`lookup_vm`/`list_vm_records`/`update_vm`)
+    /// from async request handlers: `SmolvmDb`'s methods are synchronous SQLite
+    /// I/O, and calling them directly on the tokio reactor lets a stalled write
+    /// (under create/delete churn) park the worker pool and wedge the liveness
+    /// probes. The helpers run the I/O on the blocking pool. `db()` itself is for
+    /// synchronous contexts (CLI, embedded runtime, inside an existing
+    /// `spawn_blocking`). See `tests/reactor_wedge.rs`.
     pub fn db(&self) -> &SmolvmDb {
         &self.db
+    }
+
+    /// Off-reactor VM lookup. Runs the blocking SQLite read on the blocking pool.
+    pub async fn lookup_vm(&self, name: &str) -> Result<Option<VmRecord>, ApiError> {
+        let db = self.db.clone();
+        let name = name.to_string();
+        tokio::task::spawn_blocking(move || db.get_vm(&name))
+            .await
+            .map_err(|e| ApiError::internal(format!("db lookup_vm task join: {e}")))?
+            .map_err(ApiError::database)
+    }
+
+    /// Off-reactor full VM listing. Runs the blocking SQLite scan on the blocking
+    /// pool (reads use the connection-pool, so this never serializes behind a write).
+    pub async fn list_vm_records(&self) -> Result<Vec<(String, VmRecord)>, ApiError> {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || db.list_vms())
+            .await
+            .map_err(|e| ApiError::internal(format!("db list_vm_records task join: {e}")))?
+            .map_err(ApiError::database)
+    }
+
+    /// Off-reactor read-modify-write of a VM record. Runs the synchronous
+    /// transaction on the blocking pool so the write — which holds the single
+    /// writer connection and may wait out `busy_timeout` under contention — never
+    /// parks a reactor worker thread.
+    pub async fn update_vm<F>(&self, name: &str, f: F) -> Result<Option<VmRecord>, ApiError>
+    where
+        F: FnOnce(&mut VmRecord) + Send + 'static,
+    {
+        let db = self.db.clone();
+        let name = name.to_string();
+        tokio::task::spawn_blocking(move || db.update_vm(&name, f))
+            .await
+            .map_err(|e| ApiError::internal(format!("db update_vm task join: {e}")))?
+            .map_err(ApiError::database)
     }
 
     /// Insert a machine entry directly into the in-memory registry.
