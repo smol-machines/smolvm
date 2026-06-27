@@ -2915,7 +2915,9 @@ fn handle_interactive_run(
 /// paths both go through it, and a *future* launch path won't compile without
 /// resolving. That's what keeps Env/WorkingDir/User from being silently dropped
 /// on some path — the failure mode this type exists to make impossible.
-#[cfg(target_os = "linux")]
+///
+/// Defined on all platforms: the shared `handle_interactive_run` constructs one,
+/// and the macOS build compiles the agent (as stubs) for `cargo test`.
 struct ResolvedLaunch {
     command: Vec<String>,
     env: Vec<(String, String)>,
@@ -2923,7 +2925,6 @@ struct ResolvedLaunch {
     user: Option<String>,
 }
 
-#[cfg(target_os = "linux")]
 impl ResolvedLaunch {
     /// Merge the request's launch params with the image's OCI config:
     /// - **command**: the request's, else the image's `ENTRYPOINT` + `CMD`
@@ -2967,7 +2968,6 @@ impl ResolvedLaunch {
 /// Layer the request's env over an image's OCI `Env` (each `"KEY=VAL"`): the
 /// request wins on key conflicts, image entries fill in the rest — matching how
 /// a container runtime composes image + run-time environment.
-#[cfg(target_os = "linux")]
 fn merge_image_env(
     image_env: Vec<String>,
     request_env: Vec<(String, String)>,
@@ -3652,19 +3652,20 @@ fn spawn_interactive_command(
 
 /// Non-Linux stub for spawn_interactive_command.
 #[cfg(not(target_os = "linux"))]
-#[allow(clippy::too_many_arguments)]
 fn spawn_interactive_command(
     rootfs: &str,
-    command: &[String],
-    env: &[(String, String)],
-    workdir: Option<&str>,
-    user: Option<&str>,
+    launch: &ResolvedLaunch,
     mounts: &[(String, String, bool)],
     _tty: bool,
     _persistent_overlay_id: Option<&str>,
     unprivileged: bool,
 ) -> Result<(Child, Option<()>), Box<dyn std::error::Error>> {
     use std::path::Path;
+
+    let command: &[String] = &launch.command;
+    let env: &[(String, String)] = &launch.env;
+    let workdir: Option<&str> = launch.workdir.as_deref();
+    let user: Option<&str> = launch.user.as_deref();
 
     if command.is_empty() {
         return Err("empty command".into());
