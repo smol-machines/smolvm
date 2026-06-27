@@ -19,6 +19,7 @@
 #   run             test_machine_run.sh
 #   image           test_machine_image.sh
 #   local-image     test_machine_local_image.sh
+#   fork-base       test_fork_base_guards.sh
 #   packed          test_machine_packed.sh
 #
 # Extended suites (opt-in only, not run by default):
@@ -60,6 +61,7 @@ get_suite() {
         run)         echo "$SCRIPT_DIR/test_machine_run.sh" ;;
         image)       echo "$SCRIPT_DIR/test_machine_image.sh" ;;
         local-image) echo "$SCRIPT_DIR/test_machine_local_image.sh" ;;
+        fork-base)   echo "$SCRIPT_DIR/test_fork_base_guards.sh" ;;
         packed)      echo "$SCRIPT_DIR/test_machine_packed.sh" ;;
         cli)         echo "$SCRIPT_DIR/test_cli.sh" ;;
         api)         echo "$SCRIPT_DIR/test_api.sh" ;;
@@ -124,7 +126,7 @@ if [[ $# -eq 0 ]]; then
     done
 
     # Sequential suites -- run one at a time.
-    for _name in bare db reliability storage run image local-image network volumes ports packed; do
+    for _name in bare db reliability storage run image local-image fork-base network volumes ports packed; do
         run_suite "$_name"
     done
 
@@ -152,7 +154,7 @@ else
         fi
         get_suite "$group" > /dev/null || {
             echo "Unknown group: $group"
-            echo "Feature suites: bare db network volumes ports storage resources reliability run image local-image packed"
+            echo "Feature suites: bare db network volumes ports storage resources reliability run image local-image fork-base packed"
             echo "Extended suites: cli api virtio-net smolfile pack pack-quick gpu scale"
             echo "Other: bench"
             exit 1

@@ -36,6 +36,15 @@ pub enum RecordState {
     /// of a misleading "running"; `machine start` recovers by
     /// killing the zombie VMM and starting fresh.
     Unreachable,
+    /// libkrun VMM process is alive but deliberately frozen as a fork
+    /// base: `machine fork` snapshotted it and its clones' disk overlays
+    /// are copy-on-write backed by its disks. Its guest agent is paused
+    /// and never answers a vsock ping — so it is reported *without* a
+    /// liveness probe (it would otherwise look identical to an
+    /// `Unreachable` zombie) and is never reaped or auto-restarted: it
+    /// must outlive its clones. Resolved on the fly when a record has
+    /// dependent clones; not persisted.
+    Frozen,
 }
 
 impl std::fmt::Display for RecordState {
@@ -46,6 +55,7 @@ impl std::fmt::Display for RecordState {
             RecordState::Stopped => write!(f, "stopped"),
             RecordState::Failed => write!(f, "failed"),
             RecordState::Unreachable => write!(f, "unreachable"),
+            RecordState::Frozen => write!(f, "frozen"),
         }
     }
 }

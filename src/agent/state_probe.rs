@@ -46,6 +46,15 @@ pub fn resolve_state(name: &str, record: &VmRecord) -> RecordState {
     let pid_alive = record.is_process_alive();
 
     if pid_alive {
+        // A fork base with live clones was snapshot-frozen by `machine
+        // fork`: its guest is paused and never answers a vsock ping.
+        // Report it as Frozen *without* probing — this distinguishes it
+        // from a genuine zombie (so the reaper and supervisor leave it
+        // alone) and avoids a multi-second ping timeout on a VM we know
+        // won't respond (the `machine status`/`ls` hang).
+        if has_live_clones(name) {
+            return RecordState::Frozen;
+        }
         // PID alive: confirm the agent responds. If it doesn't, the
         // VMM is zombied — agent crashed but libkrun stayed up. This
         // is the "machine list says running, exec says not running"
@@ -65,6 +74,29 @@ pub fn resolve_state(name: &str, record: &VmRecord) -> RecordState {
             RecordState::Stopped
         }
     }
+}
+
+/// Cheap (no vsock probe) check for a snapshot-frozen fork base: its
+/// record says `Running`, its VMM PID is alive, and it has dependent
+/// clones. Such a VM's guest agent is paused and must not be connected to
+/// or probed — doing so blocks for the full vsock timeout. Callers report
+/// it as [`RecordState::Frozen`] directly. Shares the same condition
+/// `resolve_state` uses, so the two never disagree.
+pub fn is_frozen_fork_base(name: &str, record: &VmRecord) -> bool {
+    record.state == RecordState::Running && record.is_process_alive() && has_live_clones(name)
+}
+
+/// True if `name` is a fork base — at least one VM record's disk overlays
+/// are copy-on-write backed by this machine's disks (`golden == Some(name)`).
+/// Such a machine is snapshot-frozen and must not be probed, reaped, or
+/// auto-restarted; it has to outlive its clones. Best-effort: a DB error
+/// resolves to `false` (treat as not-a-fork-base) so a transient failure
+/// can't wedge state resolution.
+fn has_live_clones(name: &str) -> bool {
+    SmolvmDb::open()
+        .and_then(|db| db.dependent_clones(name))
+        .map(|clones| !clones.is_empty())
+        .unwrap_or(false)
 }
 
 /// Tear down a zombie libkrun VMM (live PID, dead agent) and clear
@@ -132,6 +164,11 @@ pub fn recover_if_unreachable(name: &str) -> bool {
     let Ok(Some(record)) = db.get_vm(name) else {
         return false;
     };
+    // Only a genuine zombie resolves to `Unreachable`. A frozen fork base
+    // resolves to `Frozen` (see `resolve_state`) and is left alone here —
+    // reaping it would kill the CoW backing out from under live clones.
+    // A force-delete that genuinely wants to break the chain calls
+    // `recover_unreachable_machine` directly, bypassing this path.
     if resolve_state(name, &record) != RecordState::Unreachable {
         return false;
     }
@@ -232,5 +269,31 @@ mod tests {
         // Operator must see "unreachable" verbatim, not the debug
         // form or a fallback.
         assert_eq!(format!("{}", RecordState::Unreachable), "unreachable");
+    }
+
+    #[test]
+    fn frozen_displays_as_frozen() {
+        // A snapshot-frozen fork base must show as "frozen" in `ls`/`status`,
+        // not the misleading "unreachable" (which reads as a fault).
+        assert_eq!(format!("{}", RecordState::Frozen), "frozen");
+    }
+
+    #[test]
+    fn frozen_variant_round_trips_through_serde() {
+        let r = record(RecordState::Frozen, Some(12345));
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("\"state\":\"frozen\""));
+        let back: VmRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.state, RecordState::Frozen);
+    }
+
+    #[test]
+    fn non_running_fork_base_is_not_frozen() {
+        // `is_frozen_fork_base` requires record.state == Running. A golden
+        // that was force-reaped to Stopped (clones dangling) must NOT report
+        // Frozen — Frozen implies a live, paused VMM. (No clones exist for
+        // "does-not-exist" so this also covers has_live_clones == false.)
+        let r = record(RecordState::Stopped, Some(99999));
+        assert!(!is_frozen_fork_base("does-not-exist", &r));
     }
 }

@@ -784,6 +784,22 @@ pub fn start_vm_named(
             // a clean fresh start.
             cli_recover_if_unreachable(name);
         }
+        RecordState::Frozen => {
+            // Snapshot-frozen fork base: relaunching it writable would
+            // corrupt the clones whose disks CoW-back onto it. Refuse —
+            // delete the clones first to reuse the name.
+            let clones = db.dependent_clones(name).unwrap_or_default();
+            return Err(Error::agent(
+                "start",
+                format!(
+                    "'{name}' is the fork base for {} live clone(s) ({}); their disks are \
+                     copy-on-write overlays backed by its disks, so it cannot be re-launched \
+                     while they exist — delete the clones first",
+                    clones.len(),
+                    clones.join(", ")
+                ),
+            ));
+        }
         RecordState::Stopped | RecordState::Created | RecordState::Failed => {
             // Normal start path.
         }
@@ -1326,6 +1342,21 @@ pub fn stop_vm_named(name: &str) -> smolvm::Result<()> {
         RecordState::Running => {
             // fall through to the normal stop path
         }
+        RecordState::Frozen => {
+            // Snapshot-frozen fork base: it must outlive its clones (their
+            // disks CoW-back onto its disks). Refuse instead of tearing it
+            // down — mirrors `delete`'s guard.
+            let clones = SmolvmDb::open()?.dependent_clones(name).unwrap_or_default();
+            return Err(smolvm::Error::agent(
+                "stop",
+                format!(
+                    "machine '{name}' is the fork base for {} live clone(s) ({}); \
+                     stop or delete the clones first",
+                    clones.len(),
+                    clones.join(", ")
+                ),
+            ));
+        }
         other => {
             // Not running. If a prior start mounted the layers volume but the
             // VM failed to boot, it could still be mounted — detach it. Safe:
@@ -1461,7 +1492,20 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
                 }
             }
             RecordState::Unreachable => {
-                cli_recover_if_unreachable(name);
+                // Reap unconditionally: we're past the dependent-clones
+                // guard above, so either this isn't a fork base or --force
+                // was given. The guarded `cli_recover_if_unreachable` would
+                // skip a frozen fork base, orphaning its VMM after we remove
+                // the record below.
+                smolvm::agent::state_probe::recover_unreachable_machine(&record);
+            }
+            RecordState::Frozen => {
+                // A frozen fork base only reaches here under --force (the
+                // dependent-clones guard above blocks the non-force path).
+                // Reap its paused VMM so it isn't orphaned once the record
+                // is removed; the clones' overlays are left dangling, as
+                // the force-delete warning already states.
+                smolvm::agent::state_probe::recover_unreachable_machine(&record);
             }
             _ => {}
         }
@@ -1526,8 +1570,25 @@ pub fn status_vm<F>(name: &Option<String>, extra: F) -> smolvm::Result<()>
 where
     F: FnOnce(&AgentManager),
 {
-    let manager = get_vm_manager(name)?;
     let label = vm_label(name);
+
+    // A frozen fork base's paused agent never answers; connecting to it
+    // would block for the full vsock timeout (the `machine status` hang).
+    // Detect it cheaply from the record (no probe) and report Frozen
+    // without attempting a connection.
+    if let Some(n) = name {
+        if let Some(record) = SmolvmDb::open()
+            .ok()
+            .and_then(|db| db.get_vm(n).ok().flatten())
+        {
+            if smolvm::agent::state_probe::is_frozen_fork_base(n, &record) {
+                println!("Machine '{}': {}", label, RecordState::Frozen);
+                return Ok(());
+            }
+        }
+    }
+
+    let manager = get_vm_manager(name)?;
 
     if manager.try_connect_existing().is_some() {
         let pid_suffix = crate::cli::format_pid_suffix(manager.child_pid());
