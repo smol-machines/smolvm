@@ -105,6 +105,7 @@ windows-sys = { version = "0.60", features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Console",
     "Win32_System_IO",
+    "Win32_Storage_FileSystem",
     "Win32_Networking_WinSock",
 ] }
 
