@@ -11,7 +11,7 @@
 
 use crate::config::VmRecord;
 use crate::error::{Error, Result};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -27,6 +27,106 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 /// crashed creator does not reserve a name forever.
 const CREATE_RESERVATION_TTL_SECS: u64 = 60 * 60;
 
+/// Max SQLite connections held open by the pool. WAL allows these to read
+/// concurrently (writes still serialize at the SQLite layer, gated by
+/// `busy_timeout`), so a slow write can no longer block reads — the prior
+/// single-`Mutex<Connection>` design serialized EVERY db call, which let a
+/// stalled write park the async reactor and wedge the liveness probes
+/// (see `tests/reactor_wedge.rs`). Sized to comfortably cover the API server's
+/// concurrent handlers without holding a large fan of file descriptors.
+const POOL_MAX_CONNS: usize = 8;
+
+/// A small fixed-capacity pool of SQLite connections to the same database file.
+///
+/// Each connection is opened with the WAL pragmas + `busy_timeout`, so multiple
+/// readers proceed in parallel and a writer only blocks other *writers*. A
+/// connection is checked out for the duration of one `with_conn` closure and
+/// returned on drop (discarded if the closure panicked, so a half-applied
+/// statement can't be handed to the next caller). Checkout blocks only when all
+/// `POOL_MAX_CONNS` are in use — never behind an unrelated read.
+struct ConnPool {
+    path: PathBuf,
+    inner: Mutex<PoolInner>,
+    available: Condvar,
+}
+
+struct PoolInner {
+    /// Connections opened and not currently checked out.
+    idle: Vec<Connection>,
+    /// Total connections in existence (idle + checked out).
+    open: usize,
+}
+
+impl ConnPool {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            inner: Mutex::new(PoolInner {
+                idle: Vec::new(),
+                open: 0,
+            }),
+            available: Condvar::new(),
+        }
+    }
+
+    /// Take a connection, opening a new one (up to `POOL_MAX_CONNS`) or waiting
+    /// for one to be returned. Opening happens outside the lock so a slow open
+    /// never blocks other checkouts/checkins.
+    fn checkout(&self) -> Result<Connection> {
+        let mut inner = self.inner.lock();
+        loop {
+            if let Some(conn) = inner.idle.pop() {
+                return Ok(conn);
+            }
+            if inner.open < POOL_MAX_CONNS {
+                inner.open += 1;
+                drop(inner);
+                match SmolvmDb::open_connection(&self.path) {
+                    Ok(conn) => return Ok(conn),
+                    Err(e) => {
+                        // Roll back the reservation and let a waiter retry.
+                        self.inner.lock().open -= 1;
+                        self.available.notify_one();
+                        return Err(e);
+                    }
+                }
+            }
+            // Pool saturated: wait for a checkin.
+            self.available.wait(&mut inner);
+        }
+    }
+
+    fn checkin(&self, conn: Connection) {
+        self.inner.lock().idle.push(conn);
+        self.available.notify_one();
+    }
+
+    /// Drop a connection without returning it (used when its closure panicked,
+    /// so its possibly-dirty state is not reused). Frees a slot for a new open.
+    fn discard(&self) {
+        self.inner.lock().open -= 1;
+        self.available.notify_one();
+    }
+}
+
+/// RAII guard returning a checked-out connection to the pool on drop.
+struct PooledConn<'a> {
+    pool: &'a ConnPool,
+    conn: Option<Connection>,
+}
+
+impl Drop for PooledConn<'_> {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            if std::thread::panicking() {
+                self.pool.discard();
+            } else {
+                self.pool.checkin(conn);
+            }
+        }
+    }
+}
+
 /// Extension trait to convert errors into `Error::database`.
 trait DbResultExt<T> {
     fn db_err(self, operation: impl Into<String>) -> Result<T>;
@@ -40,36 +140,64 @@ impl<T, E: std::fmt::Display> DbResultExt<T> for std::result::Result<T, E> {
 
 /// Thread-safe database handle for smolvm state persistence.
 ///
-/// The SQLite `Connection` is opened lazily on first use and cached for the
-/// lifetime of the `SmolvmDb` instance. The Mutex serialises access within
-/// the process; cross-process concurrency is handled by SQLite's WAL mode
-/// and busy_timeout.
+/// Uses the standard WAL split: a single dedicated WRITER connection (behind a
+/// mutex) serializes all mutations in-process — so they never contend at the
+/// SQLite write-lock layer (no `SQLITE_BUSY` spinning) — while READS go through a
+/// small pool of separate connections that run concurrently under WAL. A reader
+/// therefore never waits on the writer, so a stalled write can no longer park the
+/// async reactor that serves the liveness probes (the single-`Mutex<Connection>`
+/// failure mode; see `tests/reactor_wedge.rs`). Connections open lazily.
+/// Cross-process concurrency is still handled by WAL + busy_timeout.
 #[derive(Clone)]
 pub struct SmolvmDb {
     path: PathBuf,
-    handle: Arc<Mutex<Option<Connection>>>,
+    /// Single connection serializing writes (and the rare read that must observe
+    /// its own just-committed write on the same connection). Opened on first use.
+    writer: Arc<Mutex<Option<Connection>>>,
+    /// Pool of connections for concurrent reads. Never used for writes.
+    readers: Arc<ConnPool>,
 }
 
 impl std::fmt::Debug for SmolvmDb {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SmolvmDb")
             .field("path", &self.path)
-            .field("open", &self.handle.lock().is_some())
+            .field("writer_open", &self.writer.lock().is_some())
+            .field("reader_conns", &self.readers.inner.lock().open)
             .finish()
     }
 }
 
 impl SmolvmDb {
-    /// Run a closure with the cached connection, opening it on first use.
+    /// Run a closure with the single writer connection, opening it on first use.
+    /// Serializes all writers in-process so they never collide at the SQLite
+    /// write lock. Use for every mutation (and any read that must see a write it
+    /// just made on this connection).
     fn with_conn<T, F>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&mut Connection) -> Result<T>,
     {
-        let mut guard = self.handle.lock();
+        let mut guard = self.writer.lock();
         if guard.is_none() {
             *guard = Some(Self::open_connection(&self.path)?);
         }
-        f(guard.as_mut().unwrap())
+        f(guard.as_mut().expect("writer connection present"))
+    }
+
+    /// Run a closure with a pooled READ connection. Concurrent reads use
+    /// different connections (up to `POOL_MAX_CONNS`) and, under WAL, never block
+    /// on the writer — so a stalled write can't serialize or wedge reads. MUST
+    /// NOT be used for writes (that would reintroduce SQLite write contention).
+    fn with_read_conn<T, F>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&mut Connection) -> Result<T>,
+    {
+        let conn = self.readers.checkout()?;
+        let mut guard = PooledConn {
+            pool: &self.readers,
+            conn: Some(conn),
+        };
+        f(guard.conn.as_mut().expect("reader connection present"))
     }
 
     /// Open the SQLite connection, configure pragmas, and ensure tables exist.
@@ -124,7 +252,8 @@ impl SmolvmDb {
 
         Ok(Self {
             path: path.to_path_buf(),
-            handle: Arc::new(Mutex::new(None)),
+            writer: Arc::new(Mutex::new(None)),
+            readers: Arc::new(ConnPool::new(path.to_path_buf())),
         })
     }
 
@@ -324,7 +453,7 @@ impl SmolvmDb {
 
     /// Get a VM record by name.
     pub fn get_vm(&self, name: &str) -> Result<Option<VmRecord>> {
-        self.with_conn(|conn| {
+        self.with_read_conn(|conn| {
             let data: Option<Vec<u8>> = conn
                 .query_row(
                     "SELECT data FROM vms WHERE name = ?1",
@@ -379,7 +508,7 @@ impl SmolvmDb {
 
     /// List all VM records.
     pub fn list_vms(&self) -> Result<Vec<(String, VmRecord)>> {
-        self.with_conn(|conn| {
+        self.with_read_conn(|conn| {
             let mut stmt = conn
                 .prepare_cached("SELECT name, data FROM vms")
                 .db_err("prepare list_vms")?;
@@ -612,6 +741,64 @@ mod tests {
         assert_eq!(removed.name, "test-vm");
 
         assert!(db.get_vm("test-vm").unwrap().is_none());
+    }
+
+    /// A read must not block behind a stalled write. Before the connection pool,
+    /// every db call shared one `Mutex<Connection>`, so a write stalled on
+    /// SQLite's `busy_timeout` held that mutex and serialized ALL reads behind
+    /// it — the serialization that let a stalled write park the async reactor and
+    /// wedge the liveness probes in production (see `tests/reactor_wedge.rs`).
+    /// With the pool the read uses a different WAL connection and returns at once.
+    /// Pre-pool this asserts in ~15s (busy_timeout) and fails; post-pool ~ms.
+    #[test]
+    fn read_does_not_block_behind_a_stalled_write() {
+        let (dir, db) = temp_db();
+        let path = dir.path().join("test.db");
+        db.insert_vm(
+            "m0",
+            &VmRecord::new("m0".to_string(), 1, 256, vec![], vec![], false),
+        )
+        .unwrap();
+
+        // Warm the pool to 2 idle connections so the read below reuses one rather
+        // than opening a fresh connection while the external write lock is held.
+        std::thread::scope(|s| {
+            for _ in 0..2 {
+                s.spawn(|| {
+                    let _ = db.get_vm("m0");
+                    std::thread::sleep(Duration::from_millis(60));
+                });
+            }
+        });
+
+        // A second connection to the same file holds the SQLite write lock —
+        // exactly what concurrent cross-process create-reservations do under churn.
+        let blocker = Connection::open(&path).unwrap();
+        blocker.busy_timeout(Duration::from_secs(30)).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        // A SmolvmDb write now stalls on busy_timeout, holding one pooled connection.
+        let db_w = db.clone();
+        let writer = std::thread::spawn(move || {
+            let _ = db_w.insert_vm(
+                "m1",
+                &VmRecord::new("m1".to_string(), 1, 256, vec![], vec![], false),
+            );
+        });
+        std::thread::sleep(Duration::from_millis(300)); // let the write grab a conn + stall
+
+        // Concurrent read on a DIFFERENT pooled connection (WAL): must be immediate.
+        let start = std::time::Instant::now();
+        let got = db.get_vm("m0").unwrap();
+        let elapsed = start.elapsed();
+        assert!(got.is_some(), "read returned no record");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "read blocked {elapsed:?} behind a stalled write — the pool is not isolating reads from writes"
+        );
+
+        blocker.execute_batch("COMMIT").ok();
+        let _ = writer.join();
     }
 
     #[test]
