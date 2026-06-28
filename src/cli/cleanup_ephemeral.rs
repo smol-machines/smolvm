@@ -1,6 +1,6 @@
 //! Detached cleanup helper for ephemeral `machine run` VMs.
 //!
-//! Invoked as `smolvm _cleanup-ephemeral <vm-name> <pid> <start-time> <ephemeral-name>`
+//! Invoked as `smolvm _cleanup-ephemeral <vm-name> <pid> <start-time>`
 //! after the parent CLI has flushed output and is about to exit. Running out of
 //! process lets the parent return the guest's exit code immediately while disk
 //! removal and process teardown happen asynchronously.
@@ -16,10 +16,12 @@ use smolvm::agent::{vm_cache_root, vm_data_dir};
 use std::path::Path;
 
 /// Entry point for the `_cleanup-ephemeral` subcommand.
-pub fn run(vm_name: &str, pid: i32, start_time: u64, ephemeral_name: &str) {
+pub fn run(vm_name: &str, pid: i32, start_time: u64) {
     let data_dir = vm_data_dir(vm_name);
     let cache_root = vm_cache_root();
-    let ephemeral_name = ephemeral_name.to_owned();
+    // The ephemeral DB record is keyed by the VM's own name (see `RunCmd::run`),
+    // so deregistration and dir removal target the same name.
+    let record_name = vm_name.to_owned();
     run_inner(
         pid,
         start_time,
@@ -43,7 +45,7 @@ pub fn run(vm_name: &str, pid: i32, start_time: u64, ephemeral_name: &str) {
                 !data_dir.exists()
             }
         },
-        move || deregister_ephemeral_vm(&ephemeral_name),
+        move || deregister_ephemeral_vm(&record_name),
     );
 }
 

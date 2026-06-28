@@ -142,12 +142,7 @@ fn parse_cli_secret_refs(
 ///
 /// Returns `false` if spawn fails (binary not found, exec error, etc.).
 /// The caller falls back to synchronous cleanup in that case.
-fn try_spawn_detached_cleanup(
-    vm_name: &str,
-    pid: i32,
-    start_time: Option<u64>,
-    ephemeral_name: &str,
-) -> bool {
+fn try_spawn_detached_cleanup(vm_name: &str, pid: i32, start_time: Option<u64>) -> bool {
     // Require a verified start time so the helper can use is_our_process_strict
     // before sending SIGKILL. Without it, fall back to synchronous cleanup.
     let start_time_val = match start_time {
@@ -163,7 +158,6 @@ fn try_spawn_detached_cleanup(
         .arg(vm_name)
         .arg(pid.to_string())
         .arg(start_time_val.to_string())
-        .arg(ephemeral_name)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -1086,21 +1080,19 @@ impl RunCmd {
             .ensure_running_with_full_config(mounts.clone(), ports, resources, features)
             .map_err(|e| Error::agent("start machine", e.to_string()))?;
 
-        // Register ephemeral VM for tracking (machine list, orphan cleanup).
+        // Register the ephemeral VM for tracking (machine list, orphan cleanup),
+        // keyed by the VM's OWN name. The orphan sweep only has the DB record and
+        // locates the disks via `vm_data_dir(record.name)`, so the record name
+        // MUST be the VM name — a separate generated name would hash to a
+        // different, nonexistent dir and the sweep would delete the record but
+        // leak the real (multi-GB) data dir.
+        //
         // Detached runs are tracked via persist_named_running instead — skip
         // ephemeral registration so the detach path does not leave an
         // unreachable orphan record after persist_named_running succeeds.
-        // Key the ephemeral record by the VM's OWN name, not a fresh random one.
-        // The orphan sweep only has the DB record and locates the disks via
-        // `vm_data_dir(record.name)`; a separate generated name hashes to a
-        // different, nonexistent dir, so the sweep would delete the record but
-        // leak the real (multi-GB) data dir. The detached cleanup helper is
-        // passed `vm_name` explicitly so it was already correct — this aligns the
-        // non-graceful (sweep) path with it.
-        let ephemeral_name = vm_name.clone();
         if !self.detach {
             vm_common::register_ephemeral_vm(
-                &ephemeral_name,
+                &vm_name,
                 manager.child_pid(),
                 params.cpus,
                 params.mem,
@@ -1201,7 +1193,7 @@ impl RunCmd {
                 // (manager.kill() at line ~563/655) and avoids the
                 // graceful-shutdown latency `stop()` adds when no one
                 // is going to use this VM again.
-                vm_common::deregister_ephemeral_vm(&ephemeral_name);
+                vm_common::deregister_ephemeral_vm(&vm_name);
                 manager.kill();
                 return Err(e);
             }
@@ -1391,12 +1383,11 @@ impl RunCmd {
                 // Spawn a detached helper so the parent exits immediately after
                 // flushing output. Falls back to synchronous cleanup if spawn fails.
                 let (pid, start_time) = manager.pid_and_start_time().unwrap_or((0, None));
-                if pid > 0 && try_spawn_detached_cleanup(&vm_name, pid, start_time, &ephemeral_name)
-                {
+                if pid > 0 && try_spawn_detached_cleanup(&vm_name, pid, start_time) {
                     std::process::exit(exit_code);
                 }
                 // Fallback: synchronous cleanup (helper spawn failed).
-                vm_common::deregister_ephemeral_vm(&ephemeral_name);
+                vm_common::deregister_ephemeral_vm(&vm_name);
                 manager.kill();
                 manager.cleanup_data_dir();
                 std::process::exit(exit_code);
@@ -1543,12 +1534,11 @@ impl RunCmd {
                 // Spawn a detached helper so the parent exits immediately after
                 // flushing output. Falls back to synchronous cleanup if spawn fails.
                 let (pid, start_time) = manager.pid_and_start_time().unwrap_or((0, None));
-                if pid > 0 && try_spawn_detached_cleanup(&vm_name, pid, start_time, &ephemeral_name)
-                {
+                if pid > 0 && try_spawn_detached_cleanup(&vm_name, pid, start_time) {
                     std::process::exit(exit_code);
                 }
                 // Fallback: synchronous cleanup (helper spawn failed).
-                vm_common::deregister_ephemeral_vm(&ephemeral_name);
+                vm_common::deregister_ephemeral_vm(&vm_name);
                 manager.kill();
                 manager.cleanup_data_dir();
                 std::process::exit(exit_code);
