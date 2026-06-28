@@ -148,6 +148,38 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
         );
     }
 
+    // Shared pack store: present the node's root-owned shared pack copy at this
+    // VM's `packed_layers_dir` via a per-VM idmapped bind mount (on-disk uid 0 ->
+    // this VM's uid), in a private mount namespace that's torn down on exit. Done
+    // here while still privileged (needs CAP_SYS_ADMIN) and BEFORE the uid drop
+    // and Landlock/seccomp. The manager only sets `pack_idmap_source` when the uid
+    // drop is active, so SMOLVM_VM_UID is guaranteed present; fail closed if not.
+    #[cfg(target_os = "linux")]
+    if let Some(ref shared) = config.pack_idmap_source {
+        let target = match config.packed_layers_dir {
+            Some(ref t) => t,
+            None => {
+                eprintln!("[pack-idmap] idmap source set without a mountpoint; refusing to boot");
+                smolvm::process::exit_child(1);
+            }
+        };
+        let uid: u32 = std::env::var("SMOLVM_VM_UID")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| {
+                eprintln!("[pack-idmap] idmap source set without SMOLVM_VM_UID; refusing to boot");
+                smolvm::process::exit_child(1);
+            });
+        let gid: u32 = std::env::var("SMOLVM_VM_GID")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(uid);
+        if let Err(e) = smolvm::process::setup_pack_idmap_mount(shared, target, uid, gid) {
+            eprintln!("[pack-idmap] failed to mount shared pack, refusing to boot: {e}");
+            smolvm::process::exit_child(1);
+        }
+    }
+
     // Drop to an unprivileged uid before touching the guest, so a guest→VMM
     // escape can't signal/ptrace the supervisor or neighbor VMs nor reach
     // root-owned host files. Gated by SMOLVM_VM_UID (+ optional SMOLVM_VM_GID,

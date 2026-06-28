@@ -187,6 +187,16 @@ pub fn vm_data_dir(name: &str) -> PathBuf {
     vm_cache_root().join(vm_dir_hash(name))
 }
 
+/// Node-shared, content-addressed pack store: `<vm_cache_root>/_shared`. Each
+/// build-constant pack is extracted here once per node under `<checksum>/`
+/// (root-owned, read-only) and presented to every machine via a per-VM idmapped
+/// bind mount — instead of a private per-machine extraction + chown. The `_`
+/// prefix cannot collide with a 16-hex [`vm_dir_hash`], so it sits safely beside
+/// the per-machine data dirs on the same filesystem.
+pub fn shared_pack_cache_root() -> PathBuf {
+    vm_cache_root().join("_shared")
+}
+
 /// Actual host disk consumed by a machine's data dir, in MiB. Sums *real blocks*
 /// (`st_blocks × 512`), not apparent file lengths — the disk images are sparse, so
 /// a 20 GiB image that the guest has barely written to consumes only a few MiB.
@@ -250,6 +260,32 @@ pub fn resolve_disk_image(dir: &Path, raw_filename: &str) -> (PathBuf, DiskForma
 /// the `layers/` subtree that `extract_sidecar` creates *inside* this directory.
 pub fn machine_layers_cache_dir(name: &str) -> PathBuf {
     vm_data_dir(name).join("pack")
+}
+
+/// Filename of the shared-pack pointer dropped beside a machine's
+/// [`machine_layers_cache_dir`] when create extracted the pack into the node's
+/// shared content-addressed store (`_shared/<checksum>`) instead of a private
+/// per-machine copy. Its contents are the absolute path of that shared copy.
+pub const SHARED_PACK_POINTER: &str = ".pack-shared";
+
+/// Path of the shared-pack pointer for a machine, given its layers cache dir
+/// (`<vm_data_dir>/pack`). The pointer sits in the parent (`<vm_data_dir>`) so it
+/// is not shadowed when the `pack` mountpoint is idmap-bound at boot.
+pub fn shared_pack_pointer_path(layers_cache_dir: &std::path::Path) -> PathBuf {
+    layers_cache_dir
+        .parent()
+        .unwrap_or(layers_cache_dir)
+        .join(SHARED_PACK_POINTER)
+}
+
+/// Read the shared-pack pointer for a machine, returning the shared copy's path
+/// iff the pointer exists and names an existing directory. A stale pointer (the
+/// shared copy was evicted) reads as `None`, so callers fall back to the
+/// per-machine extraction path.
+pub fn read_shared_pack_pointer(layers_cache_dir: &std::path::Path) -> Option<PathBuf> {
+    let raw = std::fs::read_to_string(shared_pack_pointer_path(layers_cache_dir)).ok()?;
+    let shared = PathBuf::from(raw.trim());
+    shared.is_dir().then_some(shared)
 }
 
 /// Per-VM egress telemetry file: `<vm_data_dir>/egress`. The launcher (running
@@ -1524,7 +1560,7 @@ impl AgentManager {
         mounts: Vec<HostMount>,
         ports: Vec<PortMapping>,
         resources: VmResources,
-        features: launcher::LaunchFeatures,
+        mut features: launcher::LaunchFeatures,
     ) -> Result<()> {
         use super::boot_config::BootConfig;
 
@@ -1585,6 +1621,21 @@ impl AgentManager {
         let data_dir = self.storage_disk.path().parent().map(|p| p.to_path_buf());
         let registry = vm_uid_registry_dir();
         let mut uid_env: Vec<(&str, String)> = Vec::new();
+        // Shared pack store: `with_packed_layers` sets `pack_idmap_source` when
+        // create wrote a `_shared/<checksum>` pointer, leaving `packed_layers_dir`
+        // an empty per-VM mountpoint. Ensure that mountpoint exists BEFORE the
+        // uid-drop chown_tree below, so it's owned by the VM's uid (harmless — the
+        // idmap bind covers it at boot) rather than left for chown to miss.
+        if features.pack_idmap_source.is_some() {
+            if let Some(ref mountpoint) = features.packed_layers_dir {
+                let _ = std::fs::create_dir_all(mountpoint);
+            }
+        }
+        // Whether the per-VM uid drop is active for this boot. The idmapped pack
+        // bind mount needs CAP_SYS_ADMIN (root) — the same precondition as the
+        // drop — so we only keep `pack_idmap_source` when the drop is active;
+        // otherwise the VMM stays root and reads the shared copy directly.
+        let mut uid_drop_active = false;
         if let Some(d) = data_dir.as_deref() {
             if let Some(result) =
                 crate::process::vm_drop_ids(&registry, d, features.snapshot_dir.as_deref())
@@ -1649,8 +1700,25 @@ impl AgentManager {
                     ("SMOLVM_VM_UID", uid.to_string()),
                     ("SMOLVM_VM_GID", gid.to_string()),
                 ];
+                uid_drop_active = true;
             }
         }
+
+        // Resolve how the shared pack is presented to the guest. With the uid
+        // drop active, keep the idmap source so `internal_boot` (still root, in a
+        // private mount namespace) idmap-binds the root-owned shared copy onto the
+        // empty `packed_layers_dir` mountpoint, mapping on-disk uid 0 -> vm_uid.
+        // Without the drop (non-root `serve`, or SMOLVM_VM_UID_DROP=off), there is
+        // no second uid to isolate from, so collapse the indirection: point
+        // `packed_layers_dir` straight at the shared copy and read it as root.
+        let pack_idmap_source = if uid_drop_active {
+            features.pack_idmap_source.take()
+        } else {
+            if let Some(shared) = features.pack_idmap_source.take() {
+                features.packed_layers_dir = Some(shared);
+            }
+            None
+        };
 
         // Write boot config to a file the subprocess will read
         let config = BootConfig {
@@ -1668,6 +1736,7 @@ impl AgentManager {
             ssh_agent_socket: features.ssh_agent_socket,
             dns_filter_hosts: features.dns_filter_hosts,
             packed_layers_dir: features.packed_layers_dir,
+            pack_idmap_source,
             extra_disks: features.extra_disks,
         };
         let config_path = self

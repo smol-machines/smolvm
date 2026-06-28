@@ -715,6 +715,76 @@ pub fn extract_sidecar(
     // Lock released on drop of lock_file
 }
 
+/// Whether the shared content-addressed pack store is usable on this host.
+///
+/// The shared store extracts each build-constant pack exactly once per node into
+/// `_shared/<checksum>` (root-owned, read-only) and presents it to each VM via a
+/// per-VM idmapped bind mount, instead of re-extracting + re-chowning a private
+/// copy per machine. That mechanism is Linux-only (idmapped mounts, kernel ≥5.12)
+/// and the per-VM uid isolation it preserves only exists on the Linux fleet.
+/// `SMOLVM_DISABLE_SHARED_EXTRACT` is a kill-switch to fall back to the per-machine
+/// path without a redeploy.
+pub fn shared_extract_enabled() -> bool {
+    cfg!(target_os = "linux") && std::env::var_os("SMOLVM_DISABLE_SHARED_EXTRACT").is_none()
+}
+
+/// Directory holding the shared copy for one pack checksum, under `shared_root`.
+pub fn shared_pack_dir(shared_root: &Path, checksum: u32) -> PathBuf {
+    shared_root.join(format!("{:08x}", checksum))
+}
+
+/// Extract a sidecar pack ONCE into the shared content-addressed store and return
+/// the path to the shared copy (`shared_root/<checksum>`).
+///
+/// Unlike [`extract_sidecar`] (which writes a private per-machine copy), this is
+/// keyed purely by `footer.checksum` (a CRC32 content fingerprint), so every
+/// machine on a node whose pack hashes identically reuses the same extracted tree.
+/// The build-constant agent-rootfs (~28.6 MB / 362 files) therefore decodes once
+/// per node instead of once per machine — the cold-start tax this removes.
+///
+/// The shared copy is left **root-owned** (the extractor runs as root and the tar
+/// crate does not preserve ownership by default, so all files land `root:root`)
+/// and the store directories are locked to `0700 root`. No other uid can read the
+/// copy directly; a VM reaches it only through its own idmapped bind mount, which
+/// re-presents on-disk uid 0 as that VM's uid — preserving the per-VM isolation
+/// (#456) without a per-machine chown.
+///
+/// Idempotent + concurrency-safe: delegates to [`extract_sidecar`], whose flock +
+/// `.smolvm-extracted` marker serialize concurrent first extractions of the same
+/// checksum and make a warm hit a no-op.
+pub fn extract_sidecar_shared(
+    sidecar_path: &Path,
+    shared_root: &Path,
+    footer: &PackFooter,
+    debug: bool,
+) -> std::io::Result<PathBuf> {
+    let shared_dir = shared_pack_dir(shared_root, footer.checksum);
+    extract_sidecar(sidecar_path, &shared_dir, footer, false, debug)?;
+    // Lock down the store so a dropped per-VM uid can't read the shared copy
+    // directly (it must go through its idmapped mount). Best-effort: traversal
+    // by root (the VMM before it drops privileges) is unaffected by 0700.
+    restrict_to_owner(shared_root);
+    restrict_to_owner(&shared_dir);
+    Ok(shared_dir)
+}
+
+/// Set a directory to `0700` (owner-only) if possible. Best-effort; errors are
+/// swallowed because the store is already root-owned and root traversal ignores
+/// the mode — this only hardens against a *dropped* sibling uid reading the copy.
+fn restrict_to_owner(dir: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = fs::metadata(dir) {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o700);
+            let _ = fs::set_permissions(dir, perms);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+}
+
 /// Inner extraction logic (called under the lock).
 fn extract_sidecar_inner(
     sidecar_path: &Path,

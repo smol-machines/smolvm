@@ -461,21 +461,54 @@ pub async fn create_machine(
             let path = std::path::Path::new(&sidecar_path);
             let cache_dir = crate::agent::machine_layers_cache_dir(&name);
             let result = (|| {
-                smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
-                match std::fs::remove_dir_all(&cache_dir) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => {
-                        return Err(ApiError::internal(format!(
-                            "clear packed layers cache: {}",
-                            e
-                        )));
-                    }
-                }
                 let footer = smolvm_pack::packer::read_footer_from_sidecar(path)
                     .map_err(|e| ApiError::internal(format!("read sidecar footer: {}", e)))?;
-                smolvm_pack::extract::extract_sidecar(path, &cache_dir, &footer, false, false)
-                    .map_err(|e| ApiError::internal(format!("extract sidecar: {}", e)))
+                if smolvm_pack::extract::shared_extract_enabled() {
+                    // Shared content-addressed store: extract the build-constant
+                    // pack ONCE per node into `_shared/<checksum>` (root-owned,
+                    // read-only) instead of a private per-machine copy, and drop a
+                    // pointer beside this machine. The per-machine `pack` dir is
+                    // left an empty mountpoint that the boot path idmap-binds the
+                    // shared copy onto (mapping on-disk uid 0 -> the VM's dropped
+                    // uid), so a 28.6 MB / 362-file agent-rootfs decodes once per
+                    // node rather than once per machine — the cold-start tax this
+                    // removes — with the per-VM uid isolation (#456) preserved.
+                    let shared_root = crate::agent::shared_pack_cache_root();
+                    let shared_dir = smolvm_pack::extract::extract_sidecar_shared(
+                        path,
+                        &shared_root,
+                        &footer,
+                        false,
+                    )
+                    .map_err(|e| {
+                        ApiError::internal(format!("extract sidecar (shared): {}", e))
+                    })?;
+                    std::fs::create_dir_all(&cache_dir).map_err(|e| {
+                        ApiError::internal(format!("create pack mountpoint: {}", e))
+                    })?;
+                    let pointer = crate::agent::shared_pack_pointer_path(&cache_dir);
+                    std::fs::write(&pointer, shared_dir.to_string_lossy().as_bytes()).map_err(
+                        |e| ApiError::internal(format!("write shared pack pointer: {}", e)),
+                    )?;
+                    Ok(())
+                } else {
+                    // Per-machine extraction: macOS case-sensitive layers volume
+                    // (owned 1:1 by the machine), or the `SMOLVM_DISABLE_SHARED_EXTRACT`
+                    // kill-switch. Wipe any prior cache first for a clean slate.
+                    smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
+                    match std::fs::remove_dir_all(&cache_dir) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => {
+                            return Err(ApiError::internal(format!(
+                                "clear packed layers cache: {}",
+                                e
+                            )));
+                        }
+                    }
+                    smolvm_pack::extract::extract_sidecar(path, &cache_dir, &footer, false, false)
+                        .map_err(|e| ApiError::internal(format!("extract sidecar: {}", e)))
+                }
             })();
             // Detach the case-sensitive volume mounted during extraction so a
             // created-but-unstarted machine leaves nothing mounted, and so the
@@ -514,9 +547,15 @@ pub async fn create_machine(
             .unwrap_or_else(|| vm_data_dir(&name));
         let seed_result = tokio::task::spawn_blocking(move || -> Result<(), ApiError> {
             let cache_dir = crate::agent::machine_layers_cache_dir(&name2);
+            // With the shared store, the pack contents live in `_shared/<checksum>`
+            // (the per-machine `pack` dir is an empty mountpoint), so seed the
+            // VM-mode disk templates from the shared copy. Falls back to the
+            // per-machine dir when no pointer was written (macOS / kill-switch).
+            let pack_content_dir =
+                crate::agent::read_shared_pack_pointer(&cache_dir).unwrap_or(cache_dir);
             crate::storage::seed_vm_mode_disks(
                 &disk_dir,
-                &cache_dir,
+                &pack_content_dir,
                 seed.overlay_template.as_deref(),
                 seed.storage_template.as_deref(),
                 seed.overlay_logical_size,

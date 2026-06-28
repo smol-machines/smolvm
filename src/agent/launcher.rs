@@ -181,6 +181,12 @@ pub struct LaunchFeatures {
     /// When set, the launcher mounts this directory via virtiofs so the agent
     /// can use pre-extracted layers instead of pulling from a registry.
     pub packed_layers_dir: Option<std::path::PathBuf>,
+    /// Root-owned shared pack copy (`_shared/<checksum>`) to present at
+    /// `packed_layers_dir` via a per-VM idmapped bind mount. Set by
+    /// [`with_packed_layers`](LaunchFeatures::with_packed_layers) when create
+    /// wrote a shared pointer; the manager keeps it only when the per-VM uid drop
+    /// is active (else it collapses `packed_layers_dir` onto the shared copy).
+    pub pack_idmap_source: Option<std::path::PathBuf>,
     /// Additional disk images to attach to the VM (path, read_only, format).
     /// Appear as /dev/vdc, /dev/vdd, ... after the storage and overlay disks.
     pub extra_disks: Vec<(std::path::PathBuf, bool, DiskFormat)>,
@@ -232,6 +238,19 @@ impl LaunchFeatures {
         let Some(sidecar_path) = source_smolmachine else {
             return Ok(self);
         };
+
+        // Shared pack store: if create extracted the pack into the node's shared
+        // content-addressed store and dropped a pointer beside this machine, the
+        // per-machine `pack` dir is an empty mountpoint. Point `packed_layers_dir`
+        // at it and carry the shared copy as the idmap source; the manager keeps
+        // the idmap only when the per-VM uid drop is active (else it collapses
+        // `packed_layers_dir` onto the shared copy directly). No lease — the
+        // shared copy is never the macOS case-sensitive volume (Linux-only path).
+        if let Some(shared) = super::read_shared_pack_pointer(layers_cache_dir) {
+            self.packed_layers_dir = Some(layers_cache_dir.to_path_buf());
+            self.pack_idmap_source = Some(shared);
+            return Ok(self);
+        }
 
         if !smolvm_pack::extract::is_extracted(layers_cache_dir) {
             // Fallback: layers not yet extracted into this machine's own dir

@@ -51,8 +51,19 @@ pub struct BootConfig {
     #[serde(default)]
     pub dns_filter_hosts: Option<Vec<String>>,
     /// Pre-extracted OCI layers directory for .smolmachine-sourced machines.
+    /// When `pack_idmap_source` is set, this is an empty per-VM mountpoint the
+    /// boot subprocess idmap-binds the shared pack onto; otherwise it is the
+    /// directory holding the extracted pack directly.
     #[serde(default)]
     pub packed_layers_dir: Option<PathBuf>,
+    /// Root-owned shared pack directory (`_shared/<checksum>`) to present at
+    /// `packed_layers_dir` via a per-VM idmapped bind mount that maps on-disk
+    /// uid 0 -> the VM's dropped uid. Set only when per-VM uid isolation is
+    /// active (Linux fleet); the mount lives in the boot subprocess's private
+    /// mount namespace and is torn down automatically on exit. When `None`,
+    /// `packed_layers_dir` is consumed as-is (no idmap mount).
+    #[serde(default)]
+    pub pack_idmap_source: Option<PathBuf>,
     /// Additional disk images to attach (path, read_only, format). The format
     /// lets the `pack --from-vm` exporter attach a source qcow2 disk read-only.
     #[serde(default)]
