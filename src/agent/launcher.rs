@@ -14,6 +14,7 @@ use crate::network::{plan_launch_network, EffectiveNetworkBackend};
 use crate::storage::{OverlayDisk, StorageDisk};
 use crate::util::{libkrun_filename, libkrunfw_filename};
 
+use crate::agent::vsock_service;
 use smolvm_network::PortMapping as VirtioPortMapping;
 use smolvm_network::{start_virtio_network, GuestNetworkConfig, VirtioNetworkRuntime};
 use smolvm_protocol::{guest_env, ports};
@@ -892,36 +893,41 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             ));
         }
 
-        // Add vsock port for SSH agent forwarding (optional)
-        if let Some(ssh_socket) = ssh_agent_socket {
-            let ssh_path = try_or_free_ctx!(
-                path_to_cstring(ssh_socket),
-                "add ssh agent vsock port",
+        // Guest↔host vsock services (SSH agent, DNS filter, CUDA, …). The set
+        // and its wiring live in `vsock_service`; here we just register the
+        // port for each one enabled for this launch. Adding a capability needs
+        // no new control flow in this function. The `active_vsock` set is reused
+        // below to inject each service's guest-side activation env vars, so the
+        // host and guest sides cannot drift.
+        let vsock_inputs = vsock_service::VsockServiceInputs {
+            ssh_agent_socket: ssh_agent_socket.as_deref(),
+            dns_filter_socket: dns_filter_socket.as_deref(),
+        };
+        let active_vsock: Vec<_> = vsock_service::registry()
+            .iter()
+            .filter_map(|svc| svc.resolve(&vsock_inputs))
+            .collect();
+        for svc in &active_vsock {
+            // An egress port must never shadow the required control channel.
+            debug_assert_ne!(
+                svc.port,
+                ports::AGENT_CONTROL,
+                "{} would shadow the agent control channel",
+                svc.name
+            );
+            let sock_path = try_or_free_ctx!(
+                path_to_cstring(svc.socket),
+                "add vsock port",
                 "path contains null byte"
             );
-            // listen=false: guest connects out to this port, host receives via Unix socket
-            if krun_add_vsock_port2(ctx, ports::SSH_AGENT, ssh_path.as_ptr(), false) < 0 {
-                tracing::warn!("failed to add SSH agent vsock port — SSH forwarding disabled");
-            } else {
-                tracing::info!(
-                    "SSH agent forwarding enabled on vsock port {}",
-                    ports::SSH_AGENT
+            if krun_add_vsock_port2(ctx, svc.port, sock_path.as_ptr(), svc.listen) < 0 {
+                tracing::warn!(
+                    "failed to add {} vsock port {} — disabled",
+                    svc.name,
+                    svc.port
                 );
-            }
-        }
-
-        // Add vsock port for DNS filter proxy (optional)
-        if let Some(dns_socket) = dns_filter_socket {
-            let dns_path = try_or_free_ctx!(
-                path_to_cstring(dns_socket),
-                "add dns filter vsock port",
-                "path contains null byte"
-            );
-            // listen=false: guest connects out to this port, host listens via Unix socket
-            if krun_add_vsock_port2(ctx, ports::DNS_FILTER, dns_path.as_ptr(), false) < 0 {
-                tracing::warn!("failed to add DNS filter vsock port — DNS filtering disabled");
             } else {
-                tracing::info!("DNS filtering enabled on vsock port {}", ports::DNS_FILTER);
+                tracing::info!("{} enabled on vsock port {}", svc.name, svc.port);
             }
         }
 
@@ -1103,9 +1109,13 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             }
         }
 
-        // Tell the agent to start SSH agent forwarding bridge
-        if ssh_agent_socket.is_some() {
-            env_strings.push(cstr("SMOLVM_SSH_AGENT=1"));
+        // Activate the guest side of each enabled vsock service (e.g. tell the
+        // agent to start the SSH agent bridge). The env pairs come from the same
+        // registry that wired the ports above, so the two sides cannot diverge.
+        for svc in &active_vsock {
+            for (key, value) in svc.guest_env {
+                env_strings.push(cstr(&format!("{key}={value}")));
+            }
         }
 
         // Tell the agent GPU was requested so it can sanity-check the
@@ -1132,9 +1142,8 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // egress policy above). The guest-side DNS proxy is intentionally NOT
         // started: the guest keeps its default resolv.conf (1.1.1.1/8.8.8.8) so
         // its UDP DNS queries leave as real datagrams and are intercepted at the
-        // TSI layer. `dns_filter_socket` is retained for now but unused on the
-        // guest path.
-        let _ = &dns_filter_socket;
+        // TSI layer. The DNS-filter vsock port is still registered (above, via
+        // the service registry) for the host-side proxy.
 
         // Guest-network env vars — virtio-net interface config plus the TSI
         // `--dns` override — are built in one shared place so the static and

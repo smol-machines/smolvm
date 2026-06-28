@@ -12,6 +12,7 @@ pub mod launcher_dynamic;
 mod manager;
 pub mod state_probe;
 pub mod terminal;
+mod vsock_service;
 
 pub use crate::data::network::PortMapping;
 pub use crate::data::resources::VmResources;
