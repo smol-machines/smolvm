@@ -140,7 +140,7 @@ script = [
 '''
 set -e
 ARCH=$(uname -m)
-make -C libkrun BLK=1 GPU=1
+make -C libkrun BLK=1 NET=1 GPU=1
 if [ "$(uname -s)" = "Darwin" ]; then
   # macOS: the dylib lives in lib/ (alongside libkrunfw.5.dylib).
   cp libkrun/target/release/libkrun.dylib lib/libkrun.dylib
