@@ -120,6 +120,9 @@ pub mod ports {
     pub const SSH_AGENT: u32 = 6001;
     /// DNS filtering proxy (guest forwards DNS queries to host for filtering).
     pub const DNS_FILTER: u32 = 6002;
+    /// CUDA-over-vsock (experimental): guest CUDA client forwards Driver-API
+    /// calls to a host CUDA server that runs them on the host NVIDIA GPU.
+    pub const CUDA: u32 = 7000;
 }
 
 /// vsock CID constants.

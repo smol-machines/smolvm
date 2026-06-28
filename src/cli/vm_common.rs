@@ -431,6 +431,8 @@ pub struct CreateVmParams {
     pub health_retries: Option<u32>,
     pub health_startup_grace_secs: Option<u64>,
     pub ssh_agent: bool,
+    /// Enable CUDA-over-vsock (remote guest CUDA Driver-API to the host GPU).
+    pub cuda: bool,
     /// Enable GPU acceleration (virtio-gpu with Venus/Vulkan).
     pub gpu: bool,
     /// GPU VRAM size in MiB (None = default). Ignored when gpu is false.
@@ -619,6 +621,7 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
     record.health_retries = params.health_retries;
     record.health_startup_grace_secs = params.health_startup_grace_secs;
     record.ssh_agent = params.ssh_agent;
+    record.cuda = params.cuda;
     record.dns_filter_hosts = params.dns_filter_hosts.clone();
     record.source_smolmachine = params.source_smolmachine.clone();
 
@@ -880,6 +883,7 @@ pub fn start_vm_named(
     // original bundle file. Shared with the API and embedded start paths.
     let mut features = smolvm::agent::LaunchFeatures {
         ssh_agent_socket,
+        cuda: record.cuda,
         dns_filter_hosts: record.dns_filter_hosts.clone(),
         ..Default::default()
     }
@@ -1130,6 +1134,7 @@ pub fn persist_named_running(
                 r.entrypoint = o.entrypoint.clone();
                 r.cmd = o.cmd.clone();
                 r.ssh_agent = o.ssh_agent;
+                r.cuda = o.cuda;
                 r.dns_filter_hosts = o.dns_filter_hosts.clone();
                 r.gpu = if o.gpu { Some(true) } else { None };
                 r.gpu_vram_mib = o.gpu_vram_mib;
@@ -1166,6 +1171,7 @@ pub struct DefaultVmOverrides {
     pub entrypoint: Vec<String>,
     pub cmd: Vec<String>,
     pub ssh_agent: bool,
+    pub cuda: bool,
     pub dns_filter_hosts: Option<Vec<String>>,
     pub gpu: bool,
     pub gpu_vram_mib: Option<u32>,

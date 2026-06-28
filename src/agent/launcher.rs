@@ -179,6 +179,9 @@ pub fn create_disk_overlays(specs: &[DiskOverlaySpec]) -> Result<()> {
 pub struct LaunchFeatures {
     /// Host SSH agent socket path for forwarding into the guest.
     pub ssh_agent_socket: Option<std::path::PathBuf>,
+    /// Enable CUDA-over-vsock: smolvm starts a host CUDA server and the guest
+    /// remotes its CUDA Driver-API calls to the host GPU.
+    pub cuda: bool,
     /// Hostnames for DNS filtering. When set, the host starts a DNS filter
     /// listener and the guest agent proxies DNS queries through it.
     pub dns_filter_hosts: Option<Vec<String>>,
@@ -315,6 +318,11 @@ pub struct LaunchConfig<'a> {
     /// Host DNS filter socket path. When set, the guest DNS proxy forwards
     /// queries over vsock to this socket for filtering.
     pub dns_filter_socket: Option<&'a Path>,
+    /// Host CUDA-over-vsock server socket (experimental). When set, the guest
+    /// CUDA client connects out to this AF_UNIX path and the host server runs
+    /// the calls on the NVIDIA GPU. Resolved at the boot-config boundary (the
+    /// subprocess reads `SMOLVM_CUDA_SOCK`) so the launcher stays policy-free.
+    pub cuda_socket: Option<&'a Path>,
     /// Pre-extracted OCI layers directory for .smolmachine-sourced machines.
     /// Mounted via virtiofs as "smolvm_layers" so the agent uses packed layers.
     pub packed_layers_dir: Option<&'a Path>,
@@ -366,6 +374,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         resources,
         ssh_agent_socket,
         dns_filter_socket,
+        cuda_socket,
         packed_layers_dir,
         extra_disks,
         dns_filter_enabled,
@@ -926,6 +935,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         let vsock_inputs = vsock_service::VsockServiceInputs {
             ssh_agent_socket: ssh_agent_socket.as_deref(),
             dns_filter_socket: dns_filter_socket.as_deref(),
+            cuda_socket: cuda_socket.as_deref(),
         };
         let active_vsock: Vec<_> = vsock_service::registry()
             .iter()

@@ -478,6 +478,11 @@ pub struct VmRecord {
     #[serde(default)]
     pub ssh_agent: bool,
 
+    /// Enable CUDA-over-vsock: smolvm starts a host CUDA server and remotes the
+    /// guest's CUDA Driver-API calls to the host NVIDIA GPU.
+    #[serde(default)]
+    pub cuda: bool,
+
     /// Hostnames for DNS filtering. When set, the guest DNS proxy filters
     /// queries against this allowlist.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -574,6 +579,7 @@ impl VmRecord {
             health_retries: None,
             health_startup_grace_secs: None,
             ssh_agent: false,
+            cuda: false,
             dns_filter_hosts: None,
             ephemeral: false,
             source_smolmachine: None,
@@ -626,6 +632,7 @@ impl VmRecord {
             health_retries: None,
             health_startup_grace_secs: None,
             ssh_agent: false,
+            cuda: false,
             dns_filter_hosts: None,
             ephemeral: false,
             source_smolmachine: None,

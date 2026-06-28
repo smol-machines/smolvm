@@ -1,0 +1,18 @@
+[package]
+name = "smolvm-cuda-guest"
+version = "1.3.1"
+edition = "2021"
+description = "Guest-side CUDA-over-vsock runner for smolvm microVMs (Linux)"
+license = "Apache-2.0"
+
+[[bin]]
+name = "smolvm-cuda-run"
+path = "src/main.rs"
+
+[dependencies]
+smolvm-cuda = { path = "../smolvm-cuda", default-features = false }
+
+# vsock is Linux-only; the guest binary is meaningful only inside a Linux
+# microVM. Off Linux the binary compiles as a stub so the workspace still builds.
+[target.'cfg(target_os = "linux")'.dependencies]
+vsock = "0.5"

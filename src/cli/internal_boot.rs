@@ -438,6 +438,39 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
         None
     };
 
+    // CUDA-over-vsock opt-in, resolved once here at the boot-config boundary so
+    // the launcher receives a typed socket path (it never reads the environment).
+    // Two ways in, both inherited by this boot subprocess from the manager:
+    //   * SMOLVM_CUDA_SOCK=<path> — attach to an externally-managed host server
+    //     at that AF_UNIX path (smolvm does not spawn one).
+    //   * the machine's `cuda` flag (--cuda at create) — smolvm owns the
+    //     lifecycle: derive a per-VM socket in this machine's dir and start the
+    //     in-tree host server on it.
+    let cuda_socket: Option<std::path::PathBuf> = if let Some(p) = std::env::var("SMOLVM_CUDA_SOCK")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        Some(std::path::PathBuf::from(p))
+    } else if config.cuda {
+        let path = config
+            .vsock_socket
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("/tmp"))
+            .join("cuda.sock");
+        match smolvm::cuda_host::start(&path) {
+            Ok(()) => {
+                tracing::info!(path = %path.display(), "CUDA host server started");
+                Some(path)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to start CUDA host server — CUDA disabled");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     proc_timing!("ready to launch");
 
     // Egress telemetry lands in the per-VM dir (the vsock socket's parent), the
@@ -456,6 +489,7 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
         resources: config.resources,
         ssh_agent_socket: config.ssh_agent_socket.as_deref(),
         dns_filter_socket: dns_filter_socket_path.as_deref(),
+        cuda_socket: cuda_socket.as_deref(),
         packed_layers_dir: config.packed_layers_dir.as_deref(),
         extra_disks: &config.extra_disks,
         dns_filter_enabled: config

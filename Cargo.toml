@@ -2,6 +2,8 @@
 members = [
     ".",
     "crates/smolvm-agent",
+    "crates/smolvm-cuda",
+    "crates/smolvm-cuda-guest",
     "crates/smolvm-network",
     "crates/smolvm-pack",
     "crates/smolvm-protocol",
@@ -31,6 +33,7 @@ path = "src/main.rs"
 [dependencies]
 smolvm-network = { path = "crates/smolvm-network", version = "1.3.0" }
 smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.3.0" }
+smolvm-cuda = { path = "crates/smolvm-cuda", version = "1.3.1" }
 smolvm-pack = { path = "crates/smolvm-pack", version = "1.3.0" }
 smolvm-registry = { path = "crates/smolvm-registry", version = "1.3.0" }
 smolfile = { path = "crates/smolvm-smolfile", version = "1.3.0" }

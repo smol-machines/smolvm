@@ -64,6 +64,7 @@
 pub mod agent;
 pub mod api;
 pub mod config;
+pub mod cuda_host;
 /// Canonical shared data models and constants used across adapters.
 pub mod data;
 pub mod db;

@@ -449,6 +449,10 @@ pub struct RunCmd {
     #[arg(long, help_heading = "Security")]
     pub ssh_agent: bool,
 
+    /// Remote guest CUDA Driver-API calls to the host NVIDIA GPU over vsock
+    #[arg(long, help_heading = "Hardware")]
+    pub cuda: bool,
+
     /// Mount ~/.docker/ config into VM for registry authentication
     #[arg(long, help_heading = "Registry")]
     pub docker_config: bool,
@@ -1304,6 +1308,7 @@ impl RunCmd {
                                 entrypoint: Vec::new(),
                                 cmd: command.clone(),
                                 ssh_agent: self.ssh_agent || params.ssh_agent,
+                                cuda: self.cuda || params.cuda,
                                 dns_filter_hosts: params.dns_filter_hosts.clone(),
                                 gpu: self.gpu || params.gpu,
                                 gpu_vram_mib: self.gpu_vram_mib.or(params.gpu_vram_mib),
@@ -1454,6 +1459,7 @@ impl RunCmd {
                             entrypoint: params.entrypoint.clone(),
                             cmd: params.cmd.clone(),
                             ssh_agent: self.ssh_agent || params.ssh_agent,
+                            cuda: self.cuda || params.cuda,
                             dns_filter_hosts: params.dns_filter_hosts.clone(),
                             gpu: self.gpu || params.gpu,
                             gpu_vram_mib: self.gpu_vram_mib.or(params.gpu_vram_mib),
@@ -2110,6 +2116,10 @@ pub struct CreateCmd {
     #[arg(long)]
     pub ssh_agent: bool,
 
+    /// Remote guest CUDA Driver-API calls to the host NVIDIA GPU over vsock
+    #[arg(long)]
+    pub cuda: bool,
+
     /// Inject a secret from a host env var (GUEST_VAR=HOST_VAR), resolved at
     /// each launch. Only the reference is persisted, never the value.
     #[arg(long = "secret-env", value_name = "GUEST_VAR=HOST_VAR")]
@@ -2236,6 +2246,9 @@ impl CreateCmd {
         )?;
         if self.ssh_agent {
             params.ssh_agent = true;
+        }
+        if self.cuda {
+            params.cuda = true;
         }
         if self.gpu {
             params.gpu = true;
@@ -2382,6 +2395,7 @@ impl CreateCmd {
             health_retries: None,
             health_startup_grace_secs: None,
             ssh_agent: self.ssh_agent,
+            cuda: self.cuda,
             dns_filter_hosts: None,
             gpu: manifest.gpu,
             gpu_vram_mib: None,

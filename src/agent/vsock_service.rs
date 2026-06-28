@@ -23,6 +23,8 @@ pub struct VsockServiceInputs<'a> {
     pub ssh_agent_socket: Option<&'a Path>,
     /// Host DNS-filter proxy socket.
     pub dns_filter_socket: Option<&'a Path>,
+    /// Host CUDA-over-vsock server socket (experimental).
+    pub cuda_socket: Option<&'a Path>,
 }
 
 /// A service resolved to "on" for a launch: the concrete wiring the launcher
@@ -81,7 +83,23 @@ impl VsockService for DnsFilterService {
     }
 }
 
+/// CUDA-over-vsock (experimental): the guest CUDA client connects out to a host
+/// server that loads `nvcuda.dll` / `libcuda.so.1` and runs the calls on the
+/// host NVIDIA GPU.
+struct CudaService;
+impl VsockService for CudaService {
+    fn resolve<'a>(&self, inputs: &VsockServiceInputs<'a>) -> Option<ActiveVsockService<'a>> {
+        inputs.cuda_socket.map(|socket| ActiveVsockService {
+            name: "CUDA-over-vsock",
+            port: ports::CUDA,
+            listen: false,
+            socket,
+            guest_env: &[],
+        })
+    }
+}
+
 /// All known vsock services. Add a capability by appending one entry.
 pub fn registry() -> &'static [&'static dyn VsockService] {
-    &[&SshAgentService, &DnsFilterService]
+    &[&SshAgentService, &DnsFilterService, &CudaService]
 }

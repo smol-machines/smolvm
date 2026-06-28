@@ -46,6 +46,10 @@ pub struct BootConfig {
     /// When set, a vsock port is registered so the guest can reach the host's SSH agent.
     #[serde(default)]
     pub ssh_agent_socket: Option<PathBuf>,
+    /// Enable CUDA-over-vsock: smolvm starts a host CUDA server and remotes the
+    /// guest's CUDA Driver-API calls to the host GPU.
+    #[serde(default)]
+    pub cuda: bool,
     /// Hostnames for DNS filtering. When set, the host starts a DNS filter
     /// listener and the guest agent proxies DNS queries through it.
     #[serde(default)]

@@ -1410,6 +1410,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "nix"
+version = "0.31.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
+dependencies = [
+ "bitflags 2.13.0",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+ "memoffset",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2207,6 +2220,7 @@ dependencies = [
  "serde_yaml",
  "sha2",
  "smolfile",
+ "smolvm-cuda",
  "smolvm-network",
  "smolvm-pack",
  "smolvm-protocol",
@@ -2233,7 +2247,7 @@ version = "1.3.0"
 dependencies = [
  "lazy_static",
  "libc",
- "nix",
+ "nix 0.27.1",
  "parking_lot",
  "serde",
  "serde_json",
@@ -2242,6 +2256,21 @@ dependencies = [
  "tempfile",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "smolvm-cuda"
+version = "1.3.1"
+dependencies = [
+ "libloading",
+]
+
+[[package]]
+name = "smolvm-cuda-guest"
+version = "1.3.1"
+dependencies = [
+ "smolvm-cuda",
+ "vsock",
 ]
 
 [[package]]
@@ -2894,6 +2923,16 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "vsock"
+version = "0.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ba782755fc073877e567c2253c0be48e4aa9a254c232d36d3985dfae0bd5205"
+dependencies = [
+ "libc",
+ "nix 0.31.3",
+]
 
 [[package]]
 name = "walkdir"

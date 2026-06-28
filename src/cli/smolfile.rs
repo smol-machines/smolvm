@@ -85,6 +85,7 @@ pub fn build_create_params(
                 health_retries: None,
                 health_startup_grace_secs: None,
                 ssh_agent: false,
+                cuda: false,
                 gpu: false,
                 gpu_vram_mib: None,
                 dns_filter_hosts: None,
@@ -276,6 +277,9 @@ pub fn build_create_params(
         health_retries,
         health_startup_grace_secs,
         ssh_agent: sf.auth.as_ref().and_then(|a| a.ssh_agent).unwrap_or(false),
+        // No Smolfile field yet; CLI `--cuda` is applied by the caller via
+        // `self.cuda || params.cuda` (mirrors how ssh_agent's CLI override works).
+        cuda: false,
         gpu,
         gpu_vram_mib: sf.gpu_vram,
         dns_filter_hosts: if sf_allow_hosts.is_empty() {
