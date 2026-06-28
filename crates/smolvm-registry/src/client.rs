@@ -935,12 +935,19 @@ impl RegistryClient {
         };
 
         if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            // A 401 here usually means there's no usable registry credential
+            // (none configured, or it's invalid/expired) — the body is often
+            // empty, so without a hint the failure is opaque. Stay CLI-agnostic
+            // (smolvm and smol both use this client).
+            let hint = if status.as_u16() == 401 {
+                " — the registry credential is missing, invalid, or expired; re-authenticate to this registry"
+            } else {
+                ""
+            };
             return Err(RegistryError::Authentication {
-                message: format!(
-                    "token service returned {}: {}",
-                    resp.status(),
-                    resp.text().await.unwrap_or_default()
-                ),
+                message: format!("token service returned {status}: {body}{hint}"),
             });
         }
 
