@@ -59,6 +59,12 @@ pub struct VmResources {
 /// Minimum memory required for the VM to boot (kernel + agent).
 const MIN_MEMORY_MIB: u32 = 64;
 
+/// Maximum memory we accept. Beyond this libkrun fails the boot with an opaque
+/// `krun_start_enter: -22` instead of a clear error; 1 TiB is far above any
+/// realistic microVM, so reject the rest up front. Over-host-RAM-but-plausible
+/// values still boot fine via lazy/overcommit allocation.
+const MAX_MEMORY_MIB: u32 = 1024 * 1024;
+
 /// Maximum vCPUs supported by the hypervisor (Hypervisor.framework on macOS).
 /// Requests above this are silently capped by libkrun.
 const MAX_EFFECTIVE_CPUS: u8 = 16;
@@ -86,6 +92,15 @@ impl VmResources {
                 format!(
                     "memory must be at least {} MiB (got {} MiB)",
                     MIN_MEMORY_MIB, self.memory_mib
+                ),
+            ));
+        }
+        if self.memory_mib > MAX_MEMORY_MIB {
+            return Err(crate::Error::config(
+                "validate resources",
+                format!(
+                    "memory must be at most {} MiB (got {} MiB)",
+                    MAX_MEMORY_MIB, self.memory_mib
                 ),
             ));
         }
@@ -165,6 +180,25 @@ mod tests {
     fn effective_gpu_vram_defaults_when_unset() {
         let r = VmResources::default();
         assert_eq!(r.effective_gpu_vram_mib(), DEFAULT_GPU_VRAM_MIB);
+    }
+
+    #[test]
+    fn validate_rejects_absurd_memory_with_a_clear_message() {
+        let r = VmResources {
+            memory_mib: 999_999_999, // ~976 TiB → opaque krun -22 without this guard
+            ..Default::default()
+        };
+        let err = r.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("at most"),
+            "expected an upper-bound error, got: {err}"
+        );
+        // A realistic (even over-host) value still validates.
+        let ok = VmResources {
+            memory_mib: 131_072, // 128 GiB
+            ..Default::default()
+        };
+        assert!(ok.validate().is_ok());
     }
 
     #[test]
