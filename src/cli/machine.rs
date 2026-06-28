@@ -1090,7 +1090,14 @@ impl RunCmd {
         // Detached runs are tracked via persist_named_running instead — skip
         // ephemeral registration so the detach path does not leave an
         // unreachable orphan record after persist_named_running succeeds.
-        let ephemeral_name = smolvm::util::generate_machine_name();
+        // Key the ephemeral record by the VM's OWN name, not a fresh random one.
+        // The orphan sweep only has the DB record and locates the disks via
+        // `vm_data_dir(record.name)`; a separate generated name hashes to a
+        // different, nonexistent dir, so the sweep would delete the record but
+        // leak the real (multi-GB) data dir. The detached cleanup helper is
+        // passed `vm_name` explicitly so it was already correct — this aligns the
+        // non-graceful (sweep) path with it.
+        let ephemeral_name = vm_name.clone();
         if !self.detach {
             vm_common::register_ephemeral_vm(
                 &ephemeral_name,
