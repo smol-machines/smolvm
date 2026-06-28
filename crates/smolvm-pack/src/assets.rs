@@ -213,10 +213,39 @@ impl AssetCollector {
         // Don't follow symlinks - preserve them as-is
         tar_builder.follow_symlinks(false);
 
-        // Add all files from rootfs directory
-        tar_builder
-            .append_dir_all(".", rootfs_dir)
-            .map_err(|e| PackError::Tar(e.to_string()))?;
+        // The agent-rootfs directory doubles as the virtiofs mount the host
+        // writes its per-boot readiness markers into (`.smolvm-ready.<hash>`,
+        // see `AGENT_READY_MARKER`). Those are host-side runtime artifacts, not
+        // part of the guest init system, and they accumulate across boots — and
+        // a VM that ran under per-VM-uid isolation leaves them owned by a
+        // foreign uid with mode 0600, unreadable to the packer. `append_dir_all`
+        // over the whole directory then hard-failed the entire pack with an
+        // opaque "tar error: Permission denied". Walk the top level instead,
+        // skip the markers, and name the offending path on any real I/O error.
+        let mut entries: Vec<fs::DirEntry> =
+            fs::read_dir(rootfs_dir)?.collect::<std::io::Result<_>>()?;
+        // Deterministic ordering so the tar (and its hash) is reproducible.
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let name = entry.file_name();
+            if name
+                .to_string_lossy()
+                .starts_with(smolvm_protocol::AGENT_READY_MARKER)
+            {
+                continue;
+            }
+            let path = entry.path();
+            let tar_err = |e: std::io::Error| PackError::Tar(format!("{}: {e}", path.display()));
+            if entry.file_type()?.is_dir() {
+                tar_builder.append_dir_all(&name, &path).map_err(tar_err)?;
+            } else {
+                // Regular file or symlink (follow_symlinks(false) archives the
+                // link itself rather than its target).
+                tar_builder
+                    .append_path_with_name(&path, &name)
+                    .map_err(tar_err)?;
+            }
+        }
 
         tar_builder
             .finish()
@@ -784,6 +813,61 @@ mod tests {
         // lib/ is only created when collect_libraries() is called
         assert!(!staging.join("lib").exists());
         assert!(staging.join("layers").exists());
+    }
+
+    #[test]
+    fn collect_agent_rootfs_excludes_ready_markers() {
+        // The agent-rootfs dir doubles as the host's per-boot readiness-marker
+        // mount (`.smolvm-ready.<hash>`). Those markers must never be packed
+        // into the guest image — and on a host that ran uid-isolated VMs they
+        // can be foreign-owned/unreadable, which used to hard-fail the whole
+        // pack ("tar error: Permission denied"). Verify they're skipped while
+        // real rootfs content is preserved.
+        let temp = tempfile::tempdir().unwrap();
+        let rootfs = temp.path().join("rootfs");
+        fs::create_dir_all(rootfs.join("bin")).unwrap();
+        fs::create_dir_all(rootfs.join("etc")).unwrap();
+        fs::write(rootfs.join("bin/sh"), b"#!/bin/sh\n").unwrap();
+        fs::write(rootfs.join("etc/hostname"), b"vm\n").unwrap();
+        fs::write(rootfs.join("init"), b"agent").unwrap();
+        fs::write(
+            rootfs.join(format!("{}.deadbeef", smolvm_protocol::AGENT_READY_MARKER)),
+            b"1",
+        )
+        .unwrap();
+        fs::write(
+            rootfs.join(format!("{}.cafef00d", smolvm_protocol::AGENT_READY_MARKER)),
+            b"1",
+        )
+        .unwrap();
+
+        let staging = temp.path().join("staging");
+        let mut collector = AssetCollector::new(staging.clone()).unwrap();
+        collector.collect_agent_rootfs(&rootfs).unwrap();
+
+        let tar_path = staging.join("agent-rootfs.tar");
+        let names: Vec<String> = tar::Archive::new(File::open(&tar_path).unwrap())
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+            .collect();
+
+        assert!(
+            names.iter().any(|n| n.ends_with("bin/sh")),
+            "real rootfs file missing from pack: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n.ends_with("etc/hostname")),
+            "real rootfs file missing from pack: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n.ends_with("init")),
+            "top-level agent binary missing from pack: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains(".smolvm-ready")),
+            "readiness marker leaked into the pack: {names:?}"
+        );
     }
 
     #[test]
