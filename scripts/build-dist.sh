@@ -423,15 +423,20 @@ else
     fi
 fi
 
-# Copy init.krun for Linux (required by libkrunfw kernel)
+# Copy init.krun for Linux only if a real (non-empty) init binary is present.
+# libkrun 2.0.0 embeds the guest init (krun-init) in libkrun.so (INIT_BLOB on by
+# default), so no external init.krun is needed — a VM boots from the embedded
+# init (verified). The committed `libkrun/init/init` is now an empty placeholder,
+# so the `-s` (non-empty) checks skip it; a real prebuilt init still gets bundled
+# for older libkrun builds that expect an external init.krun.
 if [[ "$(uname -s)" == "Linux" ]]; then
-    # Look for init.krun in libkrun submodule or system locations
+    # Look for a non-empty init.krun in the submodule or system locations.
     INIT_KRUN=""
-    if [[ -n "$LOCAL_INIT_KRUN" ]] && [[ -f "$LOCAL_INIT_KRUN" ]]; then
+    if [[ -n "$LOCAL_INIT_KRUN" ]] && [[ -s "$LOCAL_INIT_KRUN" ]]; then
         INIT_KRUN="$LOCAL_INIT_KRUN"
-    elif [[ -f "$PROJECT_ROOT/libkrun/init/init" ]]; then
+    elif [[ -s "$PROJECT_ROOT/libkrun/init/init" ]]; then
         INIT_KRUN="$PROJECT_ROOT/libkrun/init/init"
-    elif [[ -f "/usr/local/share/smolvm/init.krun" ]]; then
+    elif [[ -s "/usr/local/share/smolvm/init.krun" ]]; then
         INIT_KRUN="/usr/local/share/smolvm/init.krun"
     fi
 
@@ -460,7 +465,7 @@ if [[ "$(uname -s)" == "Linux" ]]; then
         fi
         echo "init.krun arch OK ($init_desc)"
     else
-        echo "Warning: init.krun not found - users may need to build libkrun init"
+        echo "No external init.krun bundled (libkrun 2.0.0 embeds the guest init)."
     fi
 fi
 

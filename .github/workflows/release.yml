@@ -253,18 +253,11 @@ jobs:
         env:
           SMOL_REPO_TOKEN: ${{ secrets.SMOL_REPO_TOKEN }}
 
-      # Rebuild the guest init (PID 1) for the target arch. libkrun/init/init is
-      # a committed binary that does not track arch, and this job uses prebuilt
-      # libkrun libs rather than building libkrun — so without this the dist would
-      # ship whatever arch was committed (the x86_64 release once shipped the
-      # aarch64 init, issue #365). Each runner is native to its target, so a plain
-      # static compile produces the correct arch; build-dist.sh asserts it.
-      - name: Build guest init for target arch (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          cc -O2 -static -Wall -o libkrun/init/init \
-            libkrun/init/init.c libkrun/init/dhcp.c
-          file libkrun/init/init
+      # No separate guest-init build: libkrun 2.0.0 embeds the guest init
+      # (krun-init) directly in libkrun.so (INIT_BLOB is on by default), so the
+      # old per-arch `cc init/init.c` step is gone — init.c no longer exists in
+      # the 2.0.0 submodule, and a VM boots from the embedded init with no
+      # external init.krun (verified). build-dist.sh no longer bundles init.krun.
 
       - name: Build distribution tarball
         run: ./scripts/build-dist.sh --skip-agent-build
