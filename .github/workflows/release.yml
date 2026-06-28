@@ -325,11 +325,80 @@ jobs:
           path: dist/smolvm-*.tar.gz
 
   # ==========================================================================
+  # Build Windows distribution (cross-compiled; zipped)
+  # ==========================================================================
+  build-dist-windows:
+    name: Build dist (windows-x86_64)
+    needs: [build-agent, build-rootfs]
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          lfs: true
+
+      - name: Pull LFS files
+        run: git lfs pull
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          # mingw: cross-link smolvm.exe; clang/libclang: bindgen in build deps
+          # (matches the CI windows job); e2fsprogs: pre-format disk templates
+          # (Windows has no host mkfs.ext4); zip: package the dist.
+          sudo apt-get install -y gcc-mingw-w64-x86-64 clang libclang-dev e2fsprogs zip
+
+      - name: Verify Windows libraries
+        run: |
+          ls -la lib/windows-x86_64/
+          file lib/windows-x86_64/*.dll
+
+      - name: Download rootfs (x86_64)
+        uses: actions/download-artifact@v8
+        with:
+          name: rootfs-x86_64
+          path: /tmp/rootfs-dl/
+
+      - name: Extract rootfs
+        run: |
+          mkdir -p target/agent-rootfs
+          sudo tar -xf /tmp/rootfs-dl/agent-rootfs.tar -C target/agent-rootfs
+
+      - name: Download agent binary (x86_64)
+        uses: actions/download-artifact@v8
+        with:
+          name: agent-x86_64
+          path: /tmp/agent/
+
+      # The rootfs artifact ships agent-less; inject the freshly built agent and
+      # repoint /sbin/init at it (same as the Unix build-dist.sh path).
+      - name: Inject agent into rootfs
+        run: |
+          sudo cp /tmp/agent/smolvm-agent target/agent-rootfs/usr/local/bin/smolvm-agent
+          sudo chmod +x target/agent-rootfs/usr/local/bin/smolvm-agent
+          sudo ln -sf /usr/local/bin/smolvm-agent target/agent-rootfs/sbin/init
+
+      - name: Build Windows distribution
+        run: ./scripts/build-dist-windows.sh
+        env:
+          LIB_DIR: lib/windows-x86_64
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-windows-x86_64
+          path: dist/smolvm-*-windows-x86_64.zip
+
+  # ==========================================================================
   # Create GitHub Release
   # ==========================================================================
   release:
     name: Create Release
-    needs: build-dist
+    needs: [build-dist, build-dist-windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -349,7 +418,7 @@ jobs:
       - name: Generate checksums
         run: |
           cd dist
-          sha256sum *.tar.gz > checksums.sha256
+          sha256sum *.tar.gz *.zip > checksums.sha256
           cat checksums.sha256
 
       - name: Create GitHub Release
@@ -360,4 +429,5 @@ jobs:
             --title "smolvm ${{ github.ref_name }}" \
             --generate-notes \
             dist/*.tar.gz \
+            dist/*.zip \
             dist/checksums.sha256
