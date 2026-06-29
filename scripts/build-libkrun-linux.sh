@@ -98,11 +98,29 @@ else
     [[ -n "$KRUNFW_SO" ]] || { echo "ERROR: libkrunfw build produced no .so" >&2; exit 1; }
 fi
 
-# --- 3. init (static guest-arch ELF, built natively) -------------------------
-echo "--- building guest init (native ${ARCH} ELF) ---"
-cc -O2 -static -Wall -o libkrun/init/init libkrun/init/init.c libkrun/init/dhcp.c
-file libkrun/init/init | grep -q 'statically linked' \
-    || { echo "ERROR: init/init is not a static ELF" >&2; exit 1; }
+# --- 3. init (guest PID-1) ---------------------------------------------------
+# Two libkrun layouts, auto-detected by the presence of init/init.c:
+#  - old (<= libkrun 1.x): PID-1 is a static C init compiled here and handed to
+#    the build via KRUN_INIT_BINARY_PATH.
+#  - libkrun 2.0+: PID-1 is a Rust crate (init/) that src/init_blob/build.rs
+#    cross-compiles to musl ITSELF. `init/init` is only an empty placeholder, and
+#    KRUN_INIT_BINARY_PATH must be LEFT UNSET — init_blob/build.rs uses that var
+#    verbatim when set, so pointing it at the empty placeholder embeds a 0-byte
+#    init and bricks the guest (PID-1 dies, VM never reaches agent-ready). The
+#    musl std target must be present or the init links dynamically and can't run
+#    as the guest's PID 1.
+INIT_ENV=()
+if [[ -f libkrun/init/init.c ]]; then
+    echo "--- building guest init (legacy C; native ${ARCH} ELF) ---"
+    cc -O2 -static -Wall -o libkrun/init/init libkrun/init/init.c libkrun/init/dhcp.c
+    file libkrun/init/init | grep -q 'statically linked' \
+        || { echo "ERROR: init/init is not a static ELF" >&2; exit 1; }
+    INIT_ENV=("KRUN_INIT_BINARY_PATH=$(realpath libkrun/init/init)")
+else
+    echo "--- guest init: Rust crate (init_blob cross-compiles to musl) ---"
+    rustup target add "${ARCH}-unknown-linux-musl" >/dev/null 2>&1 \
+        || echo "WARN: could not add ${ARCH}-unknown-linux-musl; init may link dynamically"
+fi
 
 # --- 4. libkrun (VMM) --------------------------------------------------------
 echo "--- building libkrun (BLK=1 NET=1 ${GPU_FLAG}) ---"
@@ -113,8 +131,9 @@ echo "--- building libkrun (BLK=1 NET=1 ${GPU_FLAG}) ---"
 # resolve the now-unprovided virgl symbols and fail the load. Must match the
 # relro-level=partial that build-dist.sh applies on its own libkrun compiles.
 ( cd libkrun && make clean >/dev/null 2>&1 || true; \
+  env "${INIT_ENV[@]}" \
   RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C relro-level=partial" \
-  KRUN_INIT_BINARY_PATH="$(realpath init/init)" make --no-print-directory BLK=1 NET=1 "${GPU_FLAG}" )
+  make --no-print-directory BLK=1 NET=1 "${GPU_FLAG}" )
 KRUN_SO="$(ls -1 libkrun/target/release/libkrun.so.*.*.* 2>/dev/null | head -1)"
 [[ -n "$KRUN_SO" ]] || { echo "ERROR: libkrun build produced no .so" >&2; exit 1; }
 
