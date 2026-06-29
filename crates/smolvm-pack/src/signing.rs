@@ -19,6 +19,11 @@ use crate::Result;
 /// - `hypervisor`: access to Hypervisor.framework for the microVM
 /// - `cs.disable-library-validation`: allow dlopen of libkrun from
 ///   the extracted cache directory (ad-hoc signed libraries)
+/// - `cs.allow-jit`: a forkable golden (`machine start --forkable`) maps guest
+///   RAM from a file-backed region that HVF executes guest code from; under the
+///   hardened runtime that needs a JIT entitlement or `krun_start_enter` returns
+///   -22. (`allow-unsigned-executable-memory` also works; `allow-jit` is the
+///   narrower capability. Harmless for non-forkable VMs, which use anon RAM.)
 #[cfg(target_os = "macos")]
 const HYPERVISOR_ENTITLEMENTS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -27,6 +32,8 @@ const HYPERVISOR_ENTITLEMENTS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
     <key>com.apple.security.hypervisor</key>
     <true/>
     <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+    <key>com.apple.security.cs.allow-jit</key>
     <true/>
 </dict>
 </plist>
