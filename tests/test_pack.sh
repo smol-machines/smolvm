@@ -827,6 +827,218 @@ test_from_vm_image_overlay() {
     rm -f "$pack_output" "$pack_output.smolmachine"
 }
 
+# Regression: default --from-vm repack preserves imported artifact layers.
+#
+# A machine created from a .smolmachine has two kinds of container state:
+# imported layers from the source artifact, and the current writable overlay.
+# Repacking it without --rebase-from-image must keep both.
+test_from_vm_imported_layers_preserved_on_repack() {
+    local vm_a="from-vm-nested-a-$$"
+    local vm_b="from-vm-nested-b-$$"
+    local vm_c="from-vm-nested-c-$$"
+    local pack_a="$TEST_DIR/from-vm-nested-a"
+    local pack_b="$TEST_DIR/from-vm-nested-b"
+
+    cleanup_from_vm_imported_layers_preserved() {
+        $SMOLVM machine stop --name "$vm_c" 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_c" -f 2>/dev/null || true
+        $SMOLVM machine stop --name "$vm_b" 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_b" -f 2>/dev/null || true
+        $SMOLVM machine stop --name "$vm_a" 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_a" -f 2>/dev/null || true
+        rm -f "$pack_a" "$pack_a.smolmachine" "$pack_b" "$pack_b.smolmachine"
+    }
+
+    # Cleanup any leftovers
+    cleanup_from_vm_imported_layers_preserved
+
+    echo "  Step 1: Create source image VM with artifact marker..."
+    $SMOLVM machine create --name "$vm_a" --image alpine:latest --net 2>&1 || {
+        cleanup_from_vm_imported_layers_preserved; return 1
+    }
+    $SMOLVM machine start --name "$vm_a" 2>&1 || {
+        cleanup_from_vm_imported_layers_preserved; return 1
+    }
+    $SMOLVM machine exec --name "$vm_a" -- sh -c "echo inherited > /artifact-origin.txt" 2>&1 || {
+        echo "FAIL: could not write source artifact marker"
+        cleanup_from_vm_imported_layers_preserved; return 1
+    }
+    $SMOLVM machine stop --name "$vm_a" 2>&1 || {
+        cleanup_from_vm_imported_layers_preserved; return 1
+    }
+
+    echo "  Step 2: Pack source VM..."
+    $SMOLVM pack create --from-vm "$vm_a" -o "$pack_a" 2>&1 || {
+        echo "FAIL: pack source VM failed"
+        cleanup_from_vm_imported_layers_preserved; return 1
+    }
+    [[ -f "$pack_a.smolmachine" ]] || {
+        echo "FAIL: no source .smolmachine sidecar produced"
+        cleanup_from_vm_imported_layers_preserved; return 1
+    }
+
+    echo "  Step 3: Create nested VM and verify inherited marker..."
+    $SMOLVM machine create --name "$vm_b" --from "$pack_a.smolmachine" --net 2>&1 || {
+        echo "FAIL: nested machine create --from failed"
+        cleanup_from_vm_imported_layers_preserved; return 1
+    }
+    $SMOLVM machine start --name "$vm_b" 2>&1 || {
+        echo "FAIL: nested machine start failed"
+        cleanup_from_vm_imported_layers_preserved; return 1
+    }
+    local inherited_result
+    inherited_result=$($SMOLVM machine exec --name "$vm_b" -- cat /artifact-origin.txt 2>&1)
+    [[ "$inherited_result" == *"inherited"* ]] || {
+        echo "FAIL: inherited marker missing in nested VM (got: $inherited_result)"
+        cleanup_from_vm_imported_layers_preserved; return 1
+    }
+    $SMOLVM machine exec --name "$vm_b" -- sh -c "echo nested > /nested-mutation.txt" 2>&1 || {
+        echo "FAIL: could not write nested mutation marker"
+        cleanup_from_vm_imported_layers_preserved; return 1
+    }
+    $SMOLVM machine stop --name "$vm_b" 2>&1 || {
+        cleanup_from_vm_imported_layers_preserved; return 1
+    }
+
+    echo "  Step 4: Repack nested VM without rebase..."
+    $SMOLVM pack create --from-vm "$vm_b" -o "$pack_b" 2>&1 || {
+        echo "FAIL: repack nested VM failed"
+        cleanup_from_vm_imported_layers_preserved; return 1
+    }
+    [[ -f "$pack_b.smolmachine" ]] || {
+        echo "FAIL: no nested .smolmachine sidecar produced"
+        cleanup_from_vm_imported_layers_preserved; return 1
+    }
+
+    echo "  Step 5: Create final VM and verify both markers..."
+    $SMOLVM machine create --name "$vm_c" --from "$pack_b.smolmachine" --net 2>&1 || {
+        echo "FAIL: final machine create --from failed"
+        cleanup_from_vm_imported_layers_preserved; return 1
+    }
+    $SMOLVM machine start --name "$vm_c" 2>&1 || {
+        echo "FAIL: final machine start failed"
+        cleanup_from_vm_imported_layers_preserved; return 1
+    }
+    inherited_result=$($SMOLVM machine exec --name "$vm_c" -- cat /artifact-origin.txt 2>&1)
+    [[ "$inherited_result" == *"inherited"* ]] || {
+        echo "FAIL: inherited marker missing after repack (got: $inherited_result)"
+        cleanup_from_vm_imported_layers_preserved; return 1
+    }
+    local nested_result
+    nested_result=$($SMOLVM machine exec --name "$vm_c" -- cat /nested-mutation.txt 2>&1)
+    [[ "$nested_result" == *"nested"* ]] || {
+        echo "FAIL: nested marker missing after repack (got: $nested_result)"
+        cleanup_from_vm_imported_layers_preserved; return 1
+    }
+
+    cleanup_from_vm_imported_layers_preserved
+}
+
+# Regression: --rebase-from-image intentionally rebuilds lower image layers and
+# drops imported artifact layers, while keeping the current writable overlay.
+test_from_vm_rebase_from_image_drops_imported_layers() {
+    local vm_a="from-vm-rebase-a-$$"
+    local vm_b="from-vm-rebase-b-$$"
+    local vm_c="from-vm-rebase-c-$$"
+    local pack_a="$TEST_DIR/from-vm-rebase-a"
+    local pack_b="$TEST_DIR/from-vm-rebase-b"
+
+    cleanup_from_vm_rebase_layers() {
+        $SMOLVM machine stop --name "$vm_c" 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_c" -f 2>/dev/null || true
+        $SMOLVM machine stop --name "$vm_b" 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_b" -f 2>/dev/null || true
+        $SMOLVM machine stop --name "$vm_a" 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_a" -f 2>/dev/null || true
+        rm -f "$pack_a" "$pack_a.smolmachine" "$pack_b" "$pack_b.smolmachine"
+    }
+
+    # Cleanup any leftovers
+    cleanup_from_vm_rebase_layers
+
+    echo "  Step 1: Create source image VM with artifact marker..."
+    $SMOLVM machine create --name "$vm_a" --image alpine:latest --net 2>&1 || {
+        cleanup_from_vm_rebase_layers; return 1
+    }
+    $SMOLVM machine start --name "$vm_a" 2>&1 || {
+        cleanup_from_vm_rebase_layers; return 1
+    }
+    $SMOLVM machine exec --name "$vm_a" -- sh -c "echo inherited > /artifact-origin.txt" 2>&1 || {
+        echo "FAIL: could not write source artifact marker"
+        cleanup_from_vm_rebase_layers; return 1
+    }
+    $SMOLVM machine stop --name "$vm_a" 2>&1 || {
+        cleanup_from_vm_rebase_layers; return 1
+    }
+
+    echo "  Step 2: Pack source VM..."
+    $SMOLVM pack create --from-vm "$vm_a" -o "$pack_a" 2>&1 || {
+        echo "FAIL: pack source VM failed"
+        cleanup_from_vm_rebase_layers; return 1
+    }
+    [[ -f "$pack_a.smolmachine" ]] || {
+        echo "FAIL: no source .smolmachine sidecar produced"
+        cleanup_from_vm_rebase_layers; return 1
+    }
+
+    echo "  Step 3: Create nested VM and write mutation marker..."
+    $SMOLVM machine create --name "$vm_b" --from "$pack_a.smolmachine" --net 2>&1 || {
+        echo "FAIL: nested machine create --from failed"
+        cleanup_from_vm_rebase_layers; return 1
+    }
+    $SMOLVM machine start --name "$vm_b" 2>&1 || {
+        echo "FAIL: nested machine start failed"
+        cleanup_from_vm_rebase_layers; return 1
+    }
+    local inherited_result
+    inherited_result=$($SMOLVM machine exec --name "$vm_b" -- cat /artifact-origin.txt 2>&1)
+    [[ "$inherited_result" == *"inherited"* ]] || {
+        echo "FAIL: inherited marker missing in nested VM (got: $inherited_result)"
+        cleanup_from_vm_rebase_layers; return 1
+    }
+    $SMOLVM machine exec --name "$vm_b" -- sh -c "echo nested > /nested-mutation.txt" 2>&1 || {
+        echo "FAIL: could not write nested mutation marker"
+        cleanup_from_vm_rebase_layers; return 1
+    }
+    $SMOLVM machine stop --name "$vm_b" 2>&1 || {
+        cleanup_from_vm_rebase_layers; return 1
+    }
+
+    echo "  Step 4: Repack nested VM with --rebase-from-image..."
+    $SMOLVM pack create --from-vm "$vm_b" --rebase-from-image -o "$pack_b" 2>&1 || {
+        echo "FAIL: rebase repack nested VM failed"
+        cleanup_from_vm_rebase_layers; return 1
+    }
+    [[ -f "$pack_b.smolmachine" ]] || {
+        echo "FAIL: no rebased .smolmachine sidecar produced"
+        cleanup_from_vm_rebase_layers; return 1
+    }
+
+    echo "  Step 5: Create final VM and verify rebase semantics..."
+    $SMOLVM machine create --name "$vm_c" --from "$pack_b.smolmachine" --net 2>&1 || {
+        echo "FAIL: final machine create --from failed"
+        cleanup_from_vm_rebase_layers; return 1
+    }
+    $SMOLVM machine start --name "$vm_c" 2>&1 || {
+        echo "FAIL: final machine start failed"
+        cleanup_from_vm_rebase_layers; return 1
+    }
+    local presence_result
+    presence_result=$($SMOLVM machine exec --name "$vm_c" -- sh -c 'if [ -e /artifact-origin.txt ]; then echo PRESENT; else echo ABSENT; fi' 2>&1)
+    [[ "$presence_result" == *"ABSENT"* ]] || {
+        echo "FAIL: inherited marker present after --rebase-from-image (got: $presence_result)"
+        cleanup_from_vm_rebase_layers; return 1
+    }
+    local nested_result
+    nested_result=$($SMOLVM machine exec --name "$vm_c" -- cat /nested-mutation.txt 2>&1)
+    [[ "$nested_result" == *"nested"* ]] || {
+        echo "FAIL: nested marker missing after --rebase-from-image (got: $nested_result)"
+        cleanup_from_vm_rebase_layers; return 1
+    }
+
+    cleanup_from_vm_rebase_layers
+}
+
 # =============================================================================
 # Debian Pack Roundtrip (Char device entry regression)
 #
@@ -1367,6 +1579,8 @@ if [[ "$QUICK_MODE" != "true" ]]; then
     echo ""
 
     run_test "from-vm-image: container overlay captured" test_from_vm_image_overlay || true
+    run_test "from-vm-image: imported layers preserved on repack" test_from_vm_imported_layers_preserved_on_repack || true
+    run_test "from-vm-image: rebase flag drops imported layers" test_from_vm_rebase_from_image_drops_imported_layers || true
 
     echo ""
     echo "Running Debian Pack Roundtrip Tests..."

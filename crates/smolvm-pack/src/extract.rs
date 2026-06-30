@@ -429,7 +429,9 @@ fn normalize_path(path: &Path) -> PathBuf {
     components.iter().collect()
 }
 
-fn resolve_cache_asset_path(
+/// Resolve a manifest asset path against an extraction cache without allowing
+/// absolute paths, parent components, or symlink traversal outside the cache.
+pub fn resolve_cache_asset_path(
     cache_dir: &Path,
     asset_rel_path: &str,
     context: &str,
@@ -823,7 +825,7 @@ fn extract_sidecar_inner(
             m.assets
                 .layers
                 .iter()
-                .filter_map(|l| short_layer_id(&l.digest))
+                .filter_map(|l| layer_id_from_asset_path(&l.path))
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -925,12 +927,16 @@ pub unsafe fn extract_from_section(
 /// can be mis-stacked. Must match the agent's `LAYER_ORDER_FILE`.
 const LAYER_ORDER_FILE: &str = "layer-order";
 
-/// Short layer id (first 12 hex of the digest) used as the on-disk layer dir
-/// name — mirrors `assets::digest_to_filename` minus the `.tar`. Returns `None`
-/// for a digest too short to form a valid id.
-fn short_layer_id(digest: &str) -> Option<String> {
-    let hex = digest.strip_prefix("sha256:").unwrap_or(digest);
-    (hex.len() >= 12).then(|| hex[..12].to_string())
+/// Layer id used as the on-disk layer dir name, derived from the manifest asset
+/// path stem so old short paths and new full-digest paths both preserve order.
+fn layer_id_from_asset_path(path: &str) -> Option<String> {
+    let rel = Path::new(path);
+    (!rel.is_absolute())
+        .then_some(rel)?
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 /// Post-process extracted assets: unpack agent rootfs, OCI layers, fix

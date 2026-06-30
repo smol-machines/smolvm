@@ -52,7 +52,7 @@ These are not included in the default run. Pass the group name explicitly:
 | `api` | `test_api.sh` | 25 |
 | `virtio-net` | `test_virtio_net.sh` | 6 |
 | `smolfile` | `test_smolfile.sh` | 49 |
-| `pack` / `pack-quick` | `test_pack.sh` | 37 |
+| `pack` / `pack-quick` | `test_pack.sh` | 39 |
 | `gpu` | `test_gpu.sh` | 14 |
 
 ### Environment variables
