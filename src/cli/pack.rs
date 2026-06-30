@@ -93,6 +93,10 @@ pub struct PackCreateCmd {
     #[arg(long = "from-vm", value_name = "VM_NAME")]
     pub from_vm: Option<String>,
 
+    /// For image-backed VMs created from a .smolmachine, rebuild lower layers from vm.image instead of preserving imported artifact layers.
+    #[arg(long = "rebase-from-image", requires = "from_vm")]
+    pub rebase_from_image: bool,
+
     /// Output file path for the packed binary
     #[arg(short = 'o', long, value_name = "PATH")]
     pub output: PathBuf,
@@ -520,6 +524,7 @@ impl PackCreateCmd {
         let vm_dir = smolvm::agent::vm_data_dir(&vm_name);
         let (overlay_disk, overlay_fmt) = resolve_disk_image(&vm_dir, OVERLAY_DISK_FILENAME);
         let is_image_based = vm.image.is_some();
+        let is_artifact_sourced_container = is_image_based && vm.source_smolmachine.is_some();
         if !is_image_based && !overlay_disk.exists() {
             return Err(Error::agent(
                 "pack from VM",
@@ -542,10 +547,34 @@ impl PackCreateCmd {
         let mut collector = AssetCollector::new(staging_dir.clone())
             .map_err(|e| Error::agent("collect assets", e.to_string()))?;
 
-        // 4. For image-based VMs, export OCI layers + container overlay via temp VM.
-        // The container overlay (installed packages) lives inside the VM's ext4
-        // storage disk which can't be read on macOS — a temp VM mounts it for us.
-        if is_image_based {
+        // 4. For image-based VMs, preserve imported artifact layers by default
+        // and append the current container overlay. The explicit rebase path keeps
+        // the historical behavior of rebuilding lower layers from vm.image.
+        if is_artifact_sourced_container && !self.rebase_from_image {
+            let source_smolmachine = vm.source_smolmachine.clone().unwrap();
+            let source_path = Path::new(&source_smolmachine);
+            let source_manifest = if source_path.exists() {
+                Some(
+                    smolvm_pack::packer::read_manifest_from_sidecar(source_path)
+                        .map_err(|e| Error::agent("read .smolmachine", e.to_string()))?,
+                )
+            } else {
+                None
+            };
+
+            self.collect_base_assets(&mut collector)?;
+            let imported_layers =
+                match self.imported_layers_from_cache(&vm_name, source_manifest.as_ref())? {
+                    Some(layers) => layers,
+                    None => self.imported_layers_from_source_sidecar(
+                        &vm_name,
+                        &source_smolmachine,
+                        temp_dir.path(),
+                    )?,
+                };
+            self.add_imported_layers(&mut collector, imported_layers)?;
+            self.export_container_overlay_from_vm(&mut collector, &vm_name, &vm_dir)?;
+        } else if is_image_based {
             let image = vm.image.clone().unwrap();
             // A locally-sourced image (`--image -` / `--image file.tar` / a rootfs
             // dir) is flattened on boot and has no registry manifest, so the
@@ -564,170 +593,9 @@ impl PackCreateCmd {
                     ),
                 ));
             }
-            // Attach the source storage disk with its real on-disk format so a
-            // qcow2 (default-size) disk is presented correctly and mounts in the
-            // temp VM — hardcoding raw would hand libkrun qcow2 bytes as raw.
-            let (storage_disk, storage_fmt) = resolve_disk_image(&vm_dir, STORAGE_DISK_FILENAME);
 
             self.collect_base_assets(&mut collector)?;
-
-            // Start temp VM with source VM's storage disk attached as an extra
-            // virtio-blk device. virtiofs can only share directories, not files,
-            // so we pass the ext4 disk image as a third block device (/dev/vdc).
-            // Same alphanumeric-first-char constraint as the image-pack
-            // path above; see the comment there for rationale.
-            let pack_vm_name = format!(
-                "pack-fromvm-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
-            );
-            let vm_data = smolvm::agent::vm_data_dir(&pack_vm_name);
-
-            println!("Starting agent VM to export layers...");
-            let manager = AgentManager::for_vm(&pack_vm_name)?;
-            let features = smolvm::agent::LaunchFeatures {
-                extra_disks: vec![(storage_disk.clone(), false, storage_fmt)],
-                ..Default::default()
-            };
-            manager.start_with_full_config(
-                Vec::new(),
-                Vec::new(),
-                VmResources {
-                    cpus: 4,
-                    memory_mib: 8192,
-                    network: true,
-                    network_backend: None,
-                    dns: None,
-                    gpu: false,
-                    gpu_vram_mib: None,
-                    storage_gib: None,
-                    overlay_gib: None,
-                    allowed_cidrs: None,
-                },
-                features,
-            )?;
-
-            // Closure ensures the temp VM is always stopped, even on early errors
-            // (pull failure, export failure, etc.). Export errors propagate; stop
-            // failures are logged but don't mask the original error.
-            let export_result: smolvm::Result<()> = (|| {
-                let mut client = manager.connect()?;
-
-                // Mount the source VM's storage disk inside the guest.
-                // It appears as /dev/vdc (3rd block device after storage + overlay).
-                let (exit_code, _, stderr) = client.vm_exec(
-                    vec![
-                        "sh".to_string(),
-                        "-c".to_string(),
-                        "mkdir -p /mnt/source-storage && mount /dev/vdc /mnt/source-storage"
-                            .to_string(),
-                    ],
-                    vec![],
-                    None,
-                    None,
-                    None,
-                )?;
-                if exit_code != 0 {
-                    return Err(Error::agent(
-                        "mount source storage in temp VM",
-                        format!(
-                            "mount failed (exit {}): {}",
-                            exit_code,
-                            String::from_utf8_lossy(&stderr)
-                        ),
-                    ));
-                }
-
-                // Pull the same image (layers are cached on the source storage,
-                // but the agent needs the manifest to know the layer list).
-                let image_info = crate::cli::pull_with_progress(
-                    &mut client,
-                    &image,
-                    None,
-                    self.proxy_opts.proxy(),
-                    self.proxy_opts.no_proxy(),
-                )?;
-
-                // Export base image layers
-                println!("Exporting {} layers...", image_info.layer_count);
-                for (i, layer_digest) in image_info.layers.iter().enumerate() {
-                    let prefix = format!(
-                        "  Layer {}/{}: {}",
-                        i + 1,
-                        image_info.layer_count,
-                        &layer_digest[..std::cmp::min(19, layer_digest.len())]
-                    );
-                    print!("{}...", prefix);
-                    let _ = std::io::Write::flush(&mut std::io::stdout());
-                    let layer_file = collector.layer_staging_path(layer_digest);
-                    self.export_layer_to_file(
-                        &mut client,
-                        &image_info.digest,
-                        i,
-                        &layer_file,
-                        &prefix,
-                    )?;
-                    collector
-                        .register_layer(layer_digest)
-                        .map_err(|e| Error::agent("collect layers", e.to_string()))?;
-                }
-
-                // Export the container overlay upper dir as an additional layer.
-                // The source VM's storage disk is mounted at /mnt/source-storage.
-                let overlay_dir =
-                    format!("/mnt/source-storage/overlays/persistent-{}/upper", vm_name);
-                println!("Exporting container overlay...");
-                let overlay_hash =
-                    hex::encode(Sha256::digest(format!("overlay-{}", vm_name).as_bytes()));
-                let overlay_digest = format!("sha256:{}", overlay_hash);
-                let overlay_layer_file = collector.layer_staging_path(&overlay_digest);
-
-                // Use the agent to tar the overlay dir
-                let (exit_code, _, stderr) = client.vm_exec(
-                    vec![
-                        "sh".to_string(),
-                        "-c".to_string(),
-                        format!(
-                            "if [ -d '{}' ] && [ \"$(ls -A '{}')\" ]; then \
-                             tar cf /tmp/overlay-export.tar -C '{}' . 2>/dev/null; \
-                             echo OVERLAY_OK; \
-                             else echo OVERLAY_EMPTY; fi",
-                            overlay_dir, overlay_dir, overlay_dir
-                        ),
-                    ],
-                    vec![],
-                    None,
-                    None,
-                    None,
-                )?;
-
-                if exit_code == 0 {
-                    // Download the tar from the temp VM
-                    let tar_data = client.read_file("/tmp/overlay-export.tar")?;
-                    if !tar_data.is_empty() {
-                        std::fs::write(&overlay_layer_file, &tar_data)
-                            .map_err(|e| Error::agent("write overlay layer", e.to_string()))?;
-                        collector
-                            .register_layer(&overlay_digest)
-                            .map_err(|e| Error::agent("register overlay layer", e.to_string()))?;
-                        println!("  Overlay layer: {} bytes", tar_data.len());
-                    }
-                } else {
-                    tracing::debug!(stderr = %String::from_utf8_lossy(&stderr), "overlay export: no container changes found");
-                }
-
-                Ok(())
-            })();
-
-            // Always stop the temp VM and clean up
-            if let Err(e) = manager.stop() {
-                warn!(error = %e, "failed to stop pack temp VM");
-            }
-            let _ = std::fs::remove_dir_all(&vm_data);
-            export_result?;
+            self.export_registry_image_layers_from_vm(&mut collector, &vm_name, &vm_dir, &image)?;
         } else {
             // Bare VM: just collect base assets, no layers needed.
             self.collect_base_assets(&mut collector)?;
@@ -833,6 +701,366 @@ impl PackCreateCmd {
         }
 
         self.finalize_pack(manifest, collector, staging_dir)
+    }
+
+    fn export_registry_image_layers_from_vm(
+        &self,
+        collector: &mut AssetCollector,
+        vm_name: &str,
+        vm_dir: &Path,
+        image: &str,
+    ) -> smolvm::Result<()> {
+        let (storage_disk, storage_fmt) = resolve_disk_image(vm_dir, STORAGE_DISK_FILENAME);
+        let pack_vm_name = format!(
+            "pack-fromvm-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let vm_data = smolvm::agent::vm_data_dir(&pack_vm_name);
+
+        println!("Starting agent VM to export layers...");
+        let manager = AgentManager::for_vm(&pack_vm_name)?;
+        let features = smolvm::agent::LaunchFeatures {
+            extra_disks: vec![(storage_disk.clone(), false, storage_fmt)],
+            ..Default::default()
+        };
+        manager.start_with_full_config(
+            Vec::new(),
+            Vec::new(),
+            VmResources {
+                cpus: 4,
+                memory_mib: 8192,
+                network: true,
+                network_backend: None,
+                dns: None,
+                gpu: false,
+                gpu_vram_mib: None,
+                storage_gib: None,
+                overlay_gib: None,
+                allowed_cidrs: None,
+            },
+            features,
+        )?;
+
+        let export_result: smolvm::Result<()> = (|| {
+            let mut client = manager.connect()?;
+            let (exit_code, _, stderr) = client.vm_exec(
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "mkdir -p /mnt/source-storage && mount /dev/vdc /mnt/source-storage"
+                        .to_string(),
+                ],
+                vec![],
+                None,
+                None,
+                None,
+            )?;
+            if exit_code != 0 {
+                return Err(Error::agent(
+                    "mount source storage in temp VM",
+                    format!(
+                        "mount failed (exit {}): {}",
+                        exit_code,
+                        String::from_utf8_lossy(&stderr)
+                    ),
+                ));
+            }
+
+            let image_info = crate::cli::pull_with_progress(
+                &mut client,
+                image,
+                None,
+                self.proxy_opts.proxy(),
+                self.proxy_opts.no_proxy(),
+            )?;
+
+            println!("Exporting {} layers...", image_info.layer_count);
+            for (i, layer_digest) in image_info.layers.iter().enumerate() {
+                let prefix = format!(
+                    "  Layer {}/{}: {}",
+                    i + 1,
+                    image_info.layer_count,
+                    &layer_digest[..std::cmp::min(19, layer_digest.len())]
+                );
+                print!("{}...", prefix);
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+                let layer_file = collector.layer_staging_path(layer_digest);
+                self.export_layer_to_file(
+                    &mut client,
+                    &image_info.digest,
+                    i,
+                    &layer_file,
+                    &prefix,
+                )?;
+                collector
+                    .register_layer(layer_digest)
+                    .map_err(|e| Error::agent("collect layers", e.to_string()))?;
+            }
+
+            self.export_container_overlay_from_mounted_storage(collector, &mut client, vm_name)?;
+
+            Ok(())
+        })();
+
+        if let Err(e) = manager.stop() {
+            warn!(error = %e, "failed to stop pack temp VM");
+        }
+        let _ = std::fs::remove_dir_all(&vm_data);
+        export_result
+    }
+
+    fn export_container_overlay_from_mounted_storage(
+        &self,
+        collector: &mut AssetCollector,
+        client: &mut AgentClient,
+        vm_name: &str,
+    ) -> smolvm::Result<()> {
+        let overlay_dir = format!("/mnt/source-storage/overlays/persistent-{}/upper", vm_name);
+        println!("Exporting container overlay...");
+        let (exit_code, _, stderr) = client.vm_exec(
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!(
+                    "if [ -d '{}' ] && [ \"$(ls -A '{}')\" ]; then \
+                     tar cf /tmp/overlay-export.tar -C '{}' . 2>/dev/null; \
+                     echo OVERLAY_OK; \
+                     else echo OVERLAY_EMPTY; fi",
+                    overlay_dir, overlay_dir, overlay_dir
+                ),
+            ],
+            vec![],
+            None,
+            None,
+            None,
+        )?;
+
+        if exit_code == 0 {
+            let tar_data = client.read_file("/tmp/overlay-export.tar")?;
+            if !tar_data.is_empty() {
+                let overlay_hash = hex::encode(Sha256::digest(&tar_data));
+                let overlay_digest = format!("sha256:{}", overlay_hash);
+                let overlay_layer_file = collector.layer_staging_path(&overlay_digest);
+                std::fs::write(&overlay_layer_file, &tar_data)
+                    .map_err(|e| Error::agent("write overlay layer", e.to_string()))?;
+                collector
+                    .register_layer(&overlay_digest)
+                    .map_err(|e| Error::agent("register overlay layer", e.to_string()))?;
+                println!("  Overlay layer: {} bytes", tar_data.len());
+            }
+        } else {
+            tracing::debug!(stderr = %String::from_utf8_lossy(&stderr), "overlay export: no container changes found");
+        }
+
+        Ok(())
+    }
+
+    fn export_container_overlay_from_vm(
+        &self,
+        collector: &mut AssetCollector,
+        vm_name: &str,
+        vm_dir: &Path,
+    ) -> smolvm::Result<()> {
+        let (storage_disk, storage_fmt) = resolve_disk_image(vm_dir, STORAGE_DISK_FILENAME);
+        let pack_vm_name = format!(
+            "pack-fromvm-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let vm_data = smolvm::agent::vm_data_dir(&pack_vm_name);
+
+        println!("Starting agent VM to export container overlay...");
+        let manager = AgentManager::for_vm(&pack_vm_name)?;
+        let features = smolvm::agent::LaunchFeatures {
+            extra_disks: vec![(storage_disk.clone(), false, storage_fmt)],
+            ..Default::default()
+        };
+        manager.start_with_full_config(
+            Vec::new(),
+            Vec::new(),
+            VmResources {
+                cpus: 4,
+                memory_mib: 8192,
+                network: true,
+                network_backend: None,
+                dns: None,
+                gpu: false,
+                gpu_vram_mib: None,
+                storage_gib: None,
+                overlay_gib: None,
+                allowed_cidrs: None,
+            },
+            features,
+        )?;
+
+        let export_result: smolvm::Result<()> = (|| {
+            let mut client = manager.connect()?;
+            let (exit_code, _, stderr) = client.vm_exec(
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "mkdir -p /mnt/source-storage && mount /dev/vdc /mnt/source-storage"
+                        .to_string(),
+                ],
+                vec![],
+                None,
+                None,
+                None,
+            )?;
+            if exit_code != 0 {
+                return Err(Error::agent(
+                    "mount source storage in temp VM",
+                    format!(
+                        "mount failed (exit {}): {}",
+                        exit_code,
+                        String::from_utf8_lossy(&stderr)
+                    ),
+                ));
+            }
+
+            self.export_container_overlay_from_mounted_storage(collector, &mut client, vm_name)?;
+
+            Ok(())
+        })();
+
+        if let Err(e) = manager.stop() {
+            warn!(error = %e, "failed to stop pack temp VM");
+        }
+        let _ = std::fs::remove_dir_all(&vm_data);
+        export_result
+    }
+
+    fn imported_layers_from_cache(
+        &self,
+        vm_name: &str,
+        source_manifest: Option<&PackManifest>,
+    ) -> smolvm::Result<Option<Vec<(String, PathBuf)>>> {
+        let cache_dir = smolvm::agent::machine_layers_cache_dir(vm_name);
+        let pack_content_dir =
+            smolvm::agent::read_shared_pack_pointer(&cache_dir).unwrap_or(cache_dir);
+        let layers_dir = pack_content_dir.join("layers");
+
+        if let Some(manifest) = source_manifest {
+            let mut layers = Vec::new();
+            for layer in &manifest.assets.layers {
+                let path = smolvm_pack::extract::resolve_cache_asset_path(
+                    &pack_content_dir,
+                    &layer.path,
+                    "source layer",
+                )
+                .map_err(|e| Error::agent("resolve source layer", e.to_string()))?;
+                if !path.exists() {
+                    return Ok(None);
+                }
+                layers.push((layer.digest.clone(), path));
+            }
+            return Ok(Some(layers));
+        }
+
+        let order_path = layers_dir.join("layer-order");
+        if let Ok(contents) = std::fs::read_to_string(&order_path) {
+            let mut layers = Vec::new();
+            for id in contents.lines().map(str::trim).filter(|id| !id.is_empty()) {
+                let path = layers_dir.join(format!("{id}.tar"));
+                if !path.exists() {
+                    return Ok(None);
+                }
+                layers.push((format!("sha256:{id}"), path));
+            }
+            return Ok(Some(layers));
+        }
+
+        let mut tar_layers = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&layers_dir) {
+            for entry in entries {
+                let entry = entry.map_err(|e| Error::agent("read source layers", e.to_string()))?;
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("tar") {
+                    tar_layers.push(path);
+                }
+            }
+        }
+        if tar_layers.len() == 1 {
+            let path = tar_layers.pop().unwrap();
+            if let Some(id) = path.file_stem().and_then(|s| s.to_str()) {
+                return Ok(Some(vec![(format!("sha256:{id}"), path)]));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn imported_layers_from_source_sidecar(
+        &self,
+        vm_name: &str,
+        source_smolmachine: &str,
+        temp_dir: &Path,
+    ) -> smolvm::Result<Vec<(String, PathBuf)>> {
+        let source_path = Path::new(source_smolmachine);
+        let fail = || {
+            Error::agent(
+                "pack from VM",
+                format!(
+                    "VM '{vm_name}' was created from a .smolmachine artifact, but its imported layer closure could not be read from cache or source artifact: {source_smolmachine}"
+                ),
+            )
+        };
+        if !source_path.exists() {
+            return Err(fail());
+        }
+
+        let source_manifest =
+            smolvm_pack::packer::read_manifest_from_sidecar(source_path).map_err(|_| fail())?;
+        let footer =
+            smolvm_pack::packer::read_footer_from_sidecar(source_path).map_err(|_| fail())?;
+        let source_cache_dir = temp_dir.join("source-pack");
+        std::fs::create_dir_all(&source_cache_dir).map_err(|_| fail())?;
+        smolvm_pack::extract::extract_sidecar(source_path, &source_cache_dir, &footer, true, false)
+            .map_err(|_| fail())?;
+
+        let mut layers = Vec::new();
+        for layer in &source_manifest.assets.layers {
+            let path = smolvm_pack::extract::resolve_cache_asset_path(
+                &source_cache_dir,
+                &layer.path,
+                "source layer",
+            )
+            .map_err(|_| fail())?;
+            if !path.exists() {
+                return Err(fail());
+            }
+            layers.push((layer.digest.clone(), path));
+        }
+        Ok(layers)
+    }
+
+    fn add_imported_layers(
+        &self,
+        collector: &mut AssetCollector,
+        layers: Vec<(String, PathBuf)>,
+    ) -> smolvm::Result<()> {
+        for (_, path) in &layers {
+            if !path.exists() {
+                return Err(Error::agent(
+                    "collect source layers",
+                    format!("source layer not found: {}", path.display()),
+                ));
+            }
+        }
+
+        for (digest, path) in layers {
+            collector
+                .add_layer_from_file(&digest, &path)
+                .map_err(|e| Error::agent("collect source layers", e.to_string()))?;
+        }
+        Ok(())
     }
 
     /// Flatten a qcow2 CoW overlay into a standalone raw disk image.

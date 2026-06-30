@@ -12,23 +12,23 @@ use std::path::{Path, PathBuf};
 use crate::format::{AssetEntry, AssetInventory, LayerEntry};
 use crate::{PackError, Result};
 
-/// Convert a digest string to a short filename for layer tars.
+/// Convert a digest string to a filename for layer tars.
 ///
-/// Expects `sha256:<64-hex-chars>` format. Returns error if the digest
-/// portion (after prefix strip) is shorter than 12 characters.
+/// Strips an optional `sha256:` prefix and uses the full remaining digest hex.
+/// Returns an error if the digest portion is shorter than 12 characters.
 fn digest_to_filename(digest: &str) -> Result<String> {
-    let short = digest.strip_prefix("sha256:").unwrap_or(digest);
-    if short.len() < 12 {
+    let hex = digest.strip_prefix("sha256:").unwrap_or(digest);
+    if hex.len() < 12 {
         return Err(PackError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
                 "digest too short for filename: '{}' ({} chars, need 12)",
                 digest,
-                short.len()
+                hex.len()
             ),
         )));
     }
-    Ok(format!("{}.tar", &short[..12]))
+    Ok(format!("{}.tar", hex))
 }
 
 /// Compression level for zstd (3 = zstd default, fast with good ratio).
