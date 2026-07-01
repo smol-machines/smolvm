@@ -1101,7 +1101,31 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 "adding virtiofs mount"
             );
 
-            if krun_add_virtiofs(ctx, tag.as_ptr(), host_path.as_ptr()) < 0 {
+            // Read-only mounts must be enforced host-side by the virtiofs
+            // device (krun_add_virtiofs3's read_only flag), not only by the
+            // guest's bind-remount: a root process in the guest can undo a
+            // guest-side remount, but it cannot make the host server accept
+            // writes. Fail closed if the symbol is missing rather than
+            // silently attaching the mount writable.
+            if mount.read_only {
+                let Some(add_virtiofs3) = krun_add_virtiofs3 else {
+                    krun_free_ctx(ctx);
+                    return Err(Error::agent(
+                        "add virtiofs mount",
+                        "read-only mounts require libkrun with krun_add_virtiofs3",
+                    ));
+                };
+                if add_virtiofs3(ctx, tag.as_ptr(), host_path.as_ptr(), 0, true) < 0 {
+                    krun_free_ctx(ctx);
+                    return Err(Error::agent(
+                        "add virtiofs mount",
+                        format!(
+                            "krun_add_virtiofs3 failed for '{}' - requested mount cannot be attached",
+                            mount.source.display()
+                        ),
+                    ));
+                }
+            } else if krun_add_virtiofs(ctx, tag.as_ptr(), host_path.as_ptr()) < 0 {
                 krun_free_ctx(ctx);
                 return Err(Error::agent(
                     "add virtiofs mount",
