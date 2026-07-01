@@ -1471,7 +1471,7 @@ impl PackCreateCmd {
         dest: &std::path::Path,
         progress_prefix: &str,
     ) -> smolvm::Result<()> {
-        use smolvm_protocol::AgentRequest;
+        use smolvm_protocol::{AgentRequest, FILE_TRANSFER_MAX_TOTAL};
         use std::io::Write;
         use std::time::{Duration, Instant};
 
@@ -1511,10 +1511,24 @@ impl PackCreateCmd {
             match response {
                 AgentResponse::DataChunk { data, done } => {
                     if !data.is_empty() {
+                        // Cap the cumulative export size the same way the file-read
+                        // paths do (client.rs): a compromised or buggy guest must not
+                        // be able to exhaust the host disk with an endless chunk stream.
+                        let next_total = total_bytes.saturating_add(data.len() as u64);
+                        if next_total > FILE_TRANSFER_MAX_TOTAL {
+                            let _ = std::fs::remove_file(dest);
+                            return Err(Error::agent(
+                                "export layer",
+                                format!(
+                                    "guest streamed {} bytes, exceeding the {} byte cap",
+                                    next_total, FILE_TRANSFER_MAX_TOTAL
+                                ),
+                            ));
+                        }
                         file.write_all(&data).map_err(|e| {
                             Error::agent("export layer", format!("write failed: {}", e))
                         })?;
-                        total_bytes += data.len() as u64;
+                        total_bytes = next_total;
 
                         // Update progress every 500ms
                         if last_progress.elapsed() >= Duration::from_millis(500) {

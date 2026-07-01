@@ -982,6 +982,14 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // virtio-console API (krun_set_console_output was removed).
         if let Some(log_path) = console_log {
             if krun.console_output_to_file(ctx, log_path) < 0 {
+                // Expected on Windows (fd-based console redirection is a no-op
+                // there); don't let a benign WARN mask the real boot failure the
+                // readiness monitor reports. See `boot_failure_reason`.
+                #[cfg(windows)]
+                tracing::debug!(
+                    "guest console not captured on Windows (fd redirection unsupported)"
+                );
+                #[cfg(not(windows))]
                 tracing::warn!("failed to set console output");
             }
         }

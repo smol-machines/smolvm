@@ -5154,11 +5154,25 @@ fn handle_interactive_vm_exec(
     // Send Started response
     send_response(stream, &AgentResponse::Started)?;
 
-    // Run the appropriate interactive I/O loop
-    let exit_code = match pty_master {
+    // Run the appropriate interactive I/O loop. Every Ok path inside the loops
+    // already reaps the child (try_wait auto-reaps on exit; timeout and host
+    // disconnect both kill+wait). The Err paths — a malformed/oversized inbound
+    // frame, a Stdin parse failure, a try_wait/drain error — do NOT, so reap
+    // here before propagating. The agent is PID 1 with no global waitpid(-1)
+    // reaper, so an unreaped interactive child would linger as a zombie holding
+    // its stdio/PTY fds. Mirrors the loop's own kill_child_on_disconnect.
+    let loop_result = match pty_master {
         #[cfg(target_os = "linux")]
-        Some(pty) => run_interactive_loop_pty(stream, &mut child, pty, timeout_ms)?,
-        _ => run_interactive_loop(stream, &mut child, timeout_ms)?,
+        Some(pty) => run_interactive_loop_pty(stream, &mut child, pty, timeout_ms),
+        _ => run_interactive_loop(stream, &mut child, timeout_ms),
+    };
+    let exit_code = match loop_result {
+        Ok(code) => code,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
     };
 
     // Send Exited response

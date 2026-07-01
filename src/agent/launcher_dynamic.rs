@@ -430,6 +430,15 @@ pub fn launch_agent_vm_dynamic(
     // upstream virtio-console API (krun_set_console_output was removed).
     // SAFETY: ctx is a valid, not-yet-started libkrun context.
     if unsafe { krun.console_output_to_file(ctx, &config.console_log) } < 0 {
+        // On Windows the fd-based virtio-console redirection isn't wired (the
+        // wrapper is a known no-op that always returns < 0), so this is expected
+        // — NOT a boot failure. Keep it out of the startup error log at WARN so a
+        // benign line can't become what the readiness monitor surfaces as "the
+        // error" when the boot later fails for a real reason (see
+        // `boot_failure_reason`).
+        #[cfg(windows)]
+        tracing::debug!("guest console not captured on Windows (fd redirection unsupported)");
+        #[cfg(not(windows))]
         tracing::warn!("failed to set console output");
     }
 
