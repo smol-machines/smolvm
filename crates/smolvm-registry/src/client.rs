@@ -9,7 +9,7 @@
 
 use crate::{OciIndex, OciPlatform, RegistryError, Result, INDEX_MEDIA_TYPE, MANIFEST_MEDIA_TYPE};
 use reqwest::header::{
-    ACCEPT, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, LOCATION, WWW_AUTHENTICATE,
+    ACCEPT, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, LINK, LOCATION, WWW_AUTHENTICATE,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -653,6 +653,109 @@ impl RegistryClient {
         Ok(self.get_manifest_raw(repo, &entry.digest).await?.0)
     }
 
+    /// List the repositories in this registry via the OCI catalog endpoint
+    /// (`GET /v2/_catalog`), following `Link: rel="next"` pagination.
+    ///
+    /// Note: `_catalog` is OPTIONAL in the distribution spec and is commonly
+    /// disabled or access-restricted (Docker Hub does not expose a registry-wide
+    /// catalog at all). Such registries answer `404`/`401`, surfaced here as an
+    /// [`RegistryError::ApiError`] the caller can translate into a hint that this
+    /// registry doesn't support catalog listing.
+    pub async fn list_repositories(&self) -> Result<Vec<String>> {
+        #[derive(serde::Deserialize)]
+        struct Catalog {
+            #[serde(default)]
+            repositories: Vec<String>,
+        }
+
+        // First page is the plain endpoint; subsequent pages come from the
+        // registry-supplied `Link` header (already query-encoded), so we resolve
+        // each against the base and stop when no `rel="next"` is offered.
+        let mut next = Some(format!("{}/v2/_catalog", self.base_url));
+        let mut repos = Vec::new();
+        // Bound the walk so a misbehaving registry can't loop us forever.
+        for _ in 0..1000 {
+            let Some(url) = next.take() else { break };
+            let resp = self
+                .send_replayable(self.request(reqwest::Method::GET, &url))
+                .await?;
+            if !resp.status().is_success() {
+                return Err(RegistryError::ApiError {
+                    status: resp.status().as_u16(),
+                    body: resp.text().await.unwrap_or_default(),
+                });
+            }
+            next = resp
+                .headers()
+                .get(LINK)
+                .and_then(|v| v.to_str().ok())
+                .and_then(Self::parse_next_link)
+                .map(|rel| self.resolve_location(&rel))
+                .transpose()?;
+            let page: Catalog = serde_json::from_slice(&resp.bytes().await?)?;
+            repos.extend(page.repositories);
+        }
+        Ok(repos)
+    }
+
+    /// List the tags for a repository (`GET /v2/<repo>/tags/list`).
+    ///
+    /// Unlike the catalog endpoint this is near-universally supported, since it
+    /// only requires `repository:<repo>:pull` scope.
+    pub async fn list_tags(&self, repo: &str) -> Result<Vec<String>> {
+        #[derive(serde::Deserialize)]
+        struct TagList {
+            #[serde(default)]
+            tags: Vec<String>,
+        }
+
+        let url = format!("{}/v2/{}/tags/list", self.base_url, repo);
+        let resp = self
+            .send_replayable(self.request(reqwest::Method::GET, &url))
+            .await?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(RegistryError::BlobNotFound(repo.to_string()));
+        }
+        if !resp.status().is_success() {
+            return Err(RegistryError::ApiError {
+                status: resp.status().as_u16(),
+                body: resp.text().await.unwrap_or_default(),
+            });
+        }
+
+        let list: TagList = serde_json::from_slice(&resp.bytes().await?)?;
+        Ok(list.tags)
+    }
+
+    /// Extract the `rel="next"` URL reference from an RFC 5988 `Link` header.
+    ///
+    /// The distribution spec formats pagination as `<url>; rel="next"`; we return
+    /// the bracketed URL (which may be relative and query-encoded) for the caller
+    /// to resolve against the registry base.
+    fn parse_next_link(header: &str) -> Option<String> {
+        // A Link header may hold several comma-separated entries; pick the one
+        // whose params mark it rel="next".
+        for entry in header.split(',') {
+            let mut parts = entry.split(';');
+            let Some(url_part) = parts.next() else {
+                continue;
+            };
+            let is_next = parts.any(|p| {
+                let p = p.trim().to_ascii_lowercase();
+                p == "rel=\"next\"" || p == "rel=next"
+            });
+            if !is_next {
+                continue;
+            }
+            let url = url_part.trim().trim_start_matches('<').trim_end_matches('>');
+            if !url.is_empty() {
+                return Some(url.to_string());
+            }
+        }
+        None
+    }
+
     /// Resolve a Location header value against the registry base URL.
     ///
     /// Relative paths (with or without a leading `/`) are resolved via
@@ -1193,6 +1296,24 @@ struct TokenResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_next_link_extracts_rel_next() {
+        let h = r#"</v2/_catalog?n=100&last=repo99>; rel="next""#;
+        assert_eq!(
+            RegistryClient::parse_next_link(h).as_deref(),
+            Some("/v2/_catalog?n=100&last=repo99")
+        );
+    }
+
+    #[test]
+    fn parse_next_link_ignores_non_next_and_missing() {
+        assert_eq!(RegistryClient::parse_next_link(r#"</v2/_catalog>; rel="prev""#), None);
+        assert_eq!(RegistryClient::parse_next_link(""), None);
+        // Multiple entries: only the rel="next" one is picked.
+        let h = r#"</a>; rel="prev", </b?n=2>; rel="next""#;
+        assert_eq!(RegistryClient::parse_next_link(h).as_deref(), Some("/b?n=2"));
+    }
 
     #[test]
     fn validate_digest_accepts_valid_sha256() {
