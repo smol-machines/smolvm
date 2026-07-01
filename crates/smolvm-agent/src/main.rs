@@ -89,6 +89,8 @@ mod pty;
 mod retry;
 mod ssh_agent;
 mod storage;
+#[cfg(target_os = "linux")]
+mod timesync;
 mod vsock;
 
 // ============================================================================
@@ -210,6 +212,15 @@ fn main() {
     // No-op when the clock already looks sane (kvmclock on KVM, HVF on macOS).
     #[cfg(target_os = "linux")]
     maybe_set_clock_from_host();
+
+    // Keep the guest clock synced with the host for the machine's whole life:
+    // libkrun's host-side TimesyncThread pushes the host time over a vsock DGRAM
+    // at boot, every 60s, and — critically — right after the host resumes from
+    // sleep (when the frozen VM's clock has fallen behind). Boot-only seeding
+    // above doesn't cover that; without this the guest drifts behind after macOS
+    // sleep until TLS breaks (issue #521).
+    #[cfg(target_os = "linux")]
+    timesync::spawn();
 
     // CRITICAL: Mount essential filesystems FIRST, before anything else.
     // When running as init (PID 1), we need these for the system to function.
