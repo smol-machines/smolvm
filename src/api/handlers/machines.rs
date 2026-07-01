@@ -224,21 +224,47 @@ fn shutdown_machine_process(
             tracing::debug!(pid, name, "PID already dead");
         }
 
-        // Post-check: verify the process is actually gone.
+        // Post-check: verify the process is actually gone. If it outlived the
+        // pid-targeted SIGKILL (or the recorded pid is wrong), fall back to
+        // killing the systemd transient scope — its cgroup owns every process the
+        // VM spawned — then wait briefly for the SIGKILL to land. Only give up if
+        // STILL alive.
         if is_alive(pid) {
-            tracing::warn!(pid, name, "process still alive after shutdown attempts");
-            return false;
-        }
-    } else {
-        // No PID available — check if VM is still reachable via vsock.
-        if let Some(ref manager) = manager {
-            if let Ok(mut client) = AgentClient::connect(manager.vsock_socket()) {
-                if client.ping().is_ok() {
-                    tracing::warn!(name, "VM still reachable via vsock but no PID to signal");
-                    return false;
+            let _ = crate::systemd_scope::kill_scope(name);
+            for _ in 0..10 {
+                if !is_alive(pid) {
+                    break;
                 }
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+            if is_alive(pid) {
+                tracing::warn!(pid, name, "process still alive after shutdown + scope kill");
+                return false;
             }
         }
+    } else {
+        // No recorded pid — the pid-based kill can't run at all, which is exactly
+        // how a stuck/crash-looping VM becomes an un-deletable orphan (delete 500s
+        // "still alive; not removing" while the node keeps running the VM). Kill
+        // the transient scope's cgroup directly and confirm via vsock that the VM
+        // is actually gone.
+        let _ = crate::systemd_scope::kill_scope(name);
+        for _ in 0..10 {
+            let reachable = manager
+                .as_ref()
+                .and_then(|m| AgentClient::connect(m.vsock_socket()).ok())
+                .map(|mut c| c.ping().is_ok())
+                .unwrap_or(false);
+            if !reachable {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+        tracing::warn!(
+            name,
+            "VM still reachable via vsock after scope kill; no PID to signal"
+        );
+        return false;
     }
 
     true

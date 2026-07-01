@@ -171,6 +171,65 @@ pub fn adopt_into_scope(machine_id: &str, pid: i32, caps: &ScopeCaps) -> Result<
     Ok(())
 }
 
+/// Force-kill a VM's transient scope: SIGKILL every process in its cgroup.
+///
+/// This is the AUTHORITATIVE teardown when the pid-based delete can't confirm
+/// death — no recorded pid, or a process that outlived SIGKILL-by-pid. The scope
+/// owns every process the VM spawned regardless of the pid we happened to record,
+/// so killing the cgroup is what stops a stuck/crash-looping VM that would
+/// otherwise become an un-deletable orphan (control marks it deleted, the node
+/// keeps running it). Returns `Ok(true)` on a successful kill OR a missing scope
+/// (already gone == teardown done). Non-Linux / no-busctl hosts return `Ok(false)`
+/// — nothing scope-based to stop; the caller falls back to its pid path.
+pub fn kill_scope(machine_id: &str) -> Result<bool> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = machine_id;
+        Ok(false)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let Some(busctl) = busctl_path() else {
+            return Ok(false);
+        };
+        let name = scope_name(machine_id);
+        // KillUnit(name: s, who: s, signal: i): SIGKILL (9) every process in the
+        // scope ("all"). SIGKILL is uncatchable, so a wedged VM dies immediately;
+        // the emptied scope then self-GCs. `ssi` is the busctl arg signature.
+        let out = Command::new(&busctl)
+            .args([
+                "call",
+                "org.freedesktop.systemd1",
+                "/org/freedesktop/systemd1",
+                "org.freedesktop.systemd1.Manager",
+                "KillUnit",
+                "ssi",
+                &name,
+                "all",
+                "9",
+            ])
+            .output()
+            .map_err(|e| Error::agent("vm scope", format!("busctl spawn failed: {e}")))?;
+        if out.status.success() {
+            tracing::info!(scope = %name, "SIGKILLed VM transient scope (forced teardown)");
+            return Ok(true);
+        }
+        // A scope that already exited is not loaded — teardown is effectively done.
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stderr.contains("not loaded")
+            || stderr.contains("NoSuchUnit")
+            || stderr.contains("not found")
+        {
+            tracing::debug!(scope = %name, "scope already gone on kill");
+            return Ok(true);
+        }
+        Err(Error::agent(
+            "vm scope",
+            format!("KillUnit {name} failed: {}", stderr.trim()),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
