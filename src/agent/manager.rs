@@ -2307,15 +2307,14 @@ impl AgentManager {
                 let mut inner = self.inner.lock();
                 if let Some(ref mut child) = inner.child {
                     if !child.is_running() {
-                        let reason = std::fs::read_to_string(&self.startup_error_log)
+                        let exit_code = child.exit_code();
+                        let log = std::fs::read_to_string(&self.startup_error_log)
                             .ok()
                             .map(|content| content.trim().to_string())
                             .filter(|content| !content.is_empty());
                         return Err(Error::agent(
                             "monitor agent",
-                            reason.unwrap_or_else(|| {
-                                "agent process exited during startup".to_string()
-                            }),
+                            boot_failure_reason(exit_code, log.as_deref()),
                         ));
                     }
                 }
@@ -2455,6 +2454,54 @@ impl Drop for AgentManager {
     }
 }
 
+/// Build a diagnostic reason when the boot subprocess exits before the agent
+/// signals ready. Prefers a real error the launcher logged (a clean
+/// `krun_start_enter` failure, a panic, an `Error:`); otherwise reports the exit
+/// code. A native-crash exit code (NTSTATUS `0xCxxxxxxx` — e.g. `0xC0000005`
+/// access violation or `0xC0000135` DLL-not-found on Windows) points at a
+/// mismatched/corrupt `krun.dll`/`libkrunfw.dll` or unavailable WHP, which is
+/// far more useful than whatever benign WARN happened to be logged last (on
+/// Windows the guest console isn't captured, so the log is often just that).
+fn boot_failure_reason(exit_code: Option<i32>, startup_log: Option<&str>) -> String {
+    let real_error = startup_log.and_then(|log| {
+        log.lines().rev().find_map(|line| {
+            let lower = line.to_ascii_lowercase();
+            if lower.contains("error")
+                || lower.contains("panic")
+                || lower.contains("krun_start_enter returned")
+            {
+                Some(line.trim().to_string())
+            } else {
+                None
+            }
+        })
+    });
+
+    let code_note = match exit_code {
+        Some(code) => {
+            let unsigned = code as u32;
+            // NTSTATUS-style crash codes are 0xCxxxxxxx — a native crash, not a
+            // clean exit (Unix exit codes never fall in this range).
+            if unsigned & 0xF000_0000 == 0xC000_0000 {
+                format!(
+                    "boot process crashed (exit 0x{unsigned:08X}) before the agent was ready \
+                     — usually a mismatched or corrupt krun.dll / libkrunfw.dll, or Windows \
+                     Hypervisor Platform (WHP) is unavailable; verify the DLLs match smolvm \
+                     (checksums.txt) and that WHP is enabled"
+                )
+            } else {
+                format!("boot process exited (code {code}) before the agent was ready")
+            }
+        }
+        None => "agent process exited during startup".to_string(),
+    };
+
+    match real_error {
+        Some(err) => format!("{err} ({code_note})"),
+        None => code_note,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2465,6 +2512,33 @@ mod tests {
         // Callers rely on this to locate existing VM data across processes.
         assert_eq!(vm_dir_hash("sandbox-1"), vm_dir_hash("sandbox-1"));
         assert_eq!(vm_dir_hash("default"), vm_dir_hash("default"));
+    }
+
+    #[test]
+    fn boot_failure_native_crash_gets_dll_hint() {
+        // 0xC0000005 (access violation) — a mismatched/corrupt DLL, not whatever
+        // benign WARN was logged last. The hint must name the DLLs + WHP.
+        let r = boot_failure_reason(Some(0xC000_0005u32 as i32), None);
+        assert!(r.contains("0xC0000005"), "{r}");
+        assert!(r.contains("krun.dll") && r.contains("WHP"), "{r}");
+    }
+
+    #[test]
+    fn boot_failure_prefers_real_error_over_warn() {
+        // A benign WARN must never be surfaced when the log also has a real error.
+        let log = "WARN failed to set console output\nError: kernel not found";
+        let r = boot_failure_reason(Some(1), Some(log));
+        assert!(r.contains("kernel not found"), "{r}");
+        assert!(!r.starts_with("WARN"), "{r}");
+    }
+
+    #[test]
+    fn boot_failure_clean_exit_and_unknown() {
+        assert!(boot_failure_reason(Some(1), None).contains("code 1"));
+        assert_eq!(
+            boot_failure_reason(None, None),
+            "agent process exited during startup"
+        );
     }
 
     #[test]
