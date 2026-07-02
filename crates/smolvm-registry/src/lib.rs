@@ -145,6 +145,9 @@ pub enum RegistryError {
     #[error("invalid manifest: {0}")]
     InvalidManifest(String),
 
+    #[error("registry response too large: {what} exceeds {limit} byte cap")]
+    ResponseTooLarge { what: String, limit: usize },
+
     #[error("blob not found: {0}")]
     BlobNotFound(String),
 

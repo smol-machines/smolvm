@@ -121,7 +121,18 @@ fn unpack_sparse<R: Read>(
     path: &Path,
     entry_size: u64,
     mode: u32,
+    real_dest: &Path,
 ) -> std::io::Result<()> {
+    // Before creating any directory or opening the file, verify that the real
+    // (symlink-resolved) parent of `path` stays within `real_dest`. A prior
+    // tar entry may have placed a symlink parent component (e.g. `foo -> /`)
+    // that `create_dir_all`/`open` would traverse OUT of the extraction root,
+    // writing an attacker-controlled host file as root. `O_NOFOLLOW` below only
+    // guards the FINAL path component, not an escaping parent — this closes
+    // that gap. (The dense write path gets the same guarantee from the tar
+    // crate's `validate_inside_dst`, which the sparse path bypasses.)
+    verify_parent_within_dest(path, real_dest)?;
+
     // Ensure the parent directory exists (mirrors what entry.unpack_in does).
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -204,11 +215,54 @@ fn unpack_sparse<R: Read>(
     // unpack_sparse applies to large cache assets (overlay disks, storage
     // images) extracted to a host-local cache directory; the extra metadata
     // does not affect functionality for those assets.
+    //
+    // Mask to the low permission bits (`& 0o777`) so a hostile header can't
+    // preserve setuid/setgid/sticky bits on a host-extracted file — mirroring
+    // the dense path, which never carries those bits through.
     #[cfg(unix)]
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o777))?;
     #[cfg(not(unix))]
     let _ = mode;
 
+    Ok(())
+}
+
+/// Verify that the real (symlink-resolved) parent directory of `path` stays
+/// within `real_dest`.
+///
+/// `canonicalize` resolves every symlink component, so if a prior tar entry
+/// planted a symlink parent (e.g. `foo -> /`) that would let a later write
+/// escape the extraction root, the deepest existing ancestor resolves to a
+/// path outside `real_dest` and we reject before any directory is created or
+/// file opened. `real_dest` must itself be a canonicalized path (so the
+/// `starts_with` comparison is apples-to-apples, e.g. macOS `/tmp` →
+/// `/private/tmp`).
+fn verify_parent_within_dest(path: &Path, real_dest: &Path) -> std::io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    // Walk up until we hit a component that already exists on disk; canonicalize
+    // it (following all symlinks) and require it to be inside real_dest.
+    for ancestor in parent.ancestors() {
+        match ancestor.canonicalize() {
+            Ok(real) => {
+                if real.starts_with(real_dest) {
+                    return Ok(());
+                }
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "resolved parent '{}' of '{}' escapes destination '{}'",
+                        real.display(),
+                        path.display(),
+                        real_dest.display()
+                    ),
+                ));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        }
+    }
     Ok(())
 }
 
@@ -221,6 +275,39 @@ fn unpack_sparse<R: Read>(
 /// load the attacker's library. This function rejects any entry that is
 /// not a regular file or directory.
 fn safe_unpack<R: Read>(archive: &mut tar::Archive<R>, dest: &Path) -> std::io::Result<()> {
+    safe_unpack_with_limits(archive, dest, &SafeUnpackLimits::from_env())
+}
+
+/// Tunable resource ceilings and sparse-write threshold for [`safe_unpack`].
+/// Extracted into a struct so tests can inject small values (exercising the
+/// sparse-write path and the cap-rejection paths) without mutating process-wide
+/// env vars, which would race with other concurrently-running tests.
+#[derive(Clone, Copy)]
+struct SafeUnpackLimits {
+    /// Max number of tar entries before erroring (inode-flood guard).
+    max_entries: u64,
+    /// Max total apparent (header-declared) bytes before erroring
+    /// (disk-exhaustion / decompression-bomb guard).
+    max_total_bytes: u64,
+    /// Regular files with a header size >= this use the sparse-write path.
+    sparse_threshold: u64,
+}
+
+impl SafeUnpackLimits {
+    fn from_env() -> Self {
+        Self {
+            max_entries: max_extract_entries(),
+            max_total_bytes: max_extract_total_bytes(),
+            sparse_threshold: SPARSE_WRITE_THRESHOLD,
+        }
+    }
+}
+
+fn safe_unpack_with_limits<R: Read>(
+    archive: &mut tar::Archive<R>,
+    dest: &Path,
+    limits: &SafeUnpackLimits,
+) -> std::io::Result<()> {
     // Use `normalize_path` (not `canonicalize`) for the containment base so it
     // matches the per-entry `normalized` paths, which are built from this same
     // plain `dest`. On Windows `canonicalize` returns a `\\?\`-verbatim path
@@ -228,6 +315,24 @@ fn safe_unpack<R: Read>(archive: &mut tar::Archive<R>, dest: &Path) -> std::io::
     // entry; `normalize_path` (which still resolves `..`, preserving the
     // traversal defense) keeps both sides in the same form on all platforms.
     let canonical_dest = normalize_path(dest);
+
+    // Real (symlink-resolved) destination, used only for the sparse-write
+    // parent-escape check. `dest` exists by the time we get here (callers
+    // `create_dir_all` it first), so canonicalize succeeds; fall back to the
+    // normalized form if not. Kept separate from `canonical_dest` because the
+    // per-entry containment check compares against plain-joined paths.
+    let real_dest = dest
+        .canonicalize()
+        .unwrap_or_else(|_| canonical_dest.clone());
+
+    // Bound total work so a hostile layer can't exhaust host disk/inodes across
+    // co-tenants (decompression bomb / entry flood). Counts apparent (header)
+    // sizes and entries; both have generous finite ceilings, overridable via
+    // env for constrained hosts / tests.
+    let max_entries = limits.max_entries;
+    let max_total_bytes = limits.max_total_bytes;
+    let mut entry_count: u64 = 0;
+    let mut total_bytes: u64 = 0;
 
     // Track directories with restrictive permissions. We extract all entries
     // with directories temporarily set to 0o755, then apply final permissions
@@ -241,6 +346,23 @@ fn safe_unpack<R: Read>(archive: &mut tar::Archive<R>, dest: &Path) -> std::io::
         let mut entry = entry_result?;
         let entry_type = entry.header().entry_type();
         let entry_path = entry.path()?.to_path_buf();
+
+        // Enforce the entry-count and total-bytes ceilings (Fix 3): reject an
+        // archive that would flood inodes or exhaust disk before we write it.
+        entry_count += 1;
+        if entry_count > max_entries {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("tar archive exceeds max entry count ({max_entries})"),
+            ));
+        }
+        total_bytes = total_bytes.saturating_add(entry.header().size().unwrap_or(0));
+        if total_bytes > max_total_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("tar archive exceeds max total size ({max_total_bytes} bytes)"),
+            ));
+        }
 
         match entry_type {
             tar::EntryType::Regular
@@ -280,6 +402,26 @@ fn safe_unpack<R: Read>(archive: &mut tar::Archive<R>, dest: &Path) -> std::io::
                             std::io::ErrorKind::InvalidData,
                             format!(
                                 "tar symlink '{}' -> '{}' escapes destination directory",
+                                entry_path.display(),
+                                link_target.display()
+                            ),
+                        ));
+                    }
+                    // Root-cause guard (Fix 1b): reject an ABSOLUTE symlink that
+                    // resolves to the destination ROOT itself (e.g. `foo -> /`,
+                    // `x -> /..`). The jailed check above passes these (they
+                    // "stay within dest" only because the jail rewrite collapses
+                    // them onto dest), but on disk the symlink is created with
+                    // its LITERAL target, turning `foo` into an alias for the
+                    // real filesystem root — the exact primitive a later
+                    // `foo/etc/...` entry uses to escape. A legitimate absolute
+                    // symlink points to a sub-path (`/usr/lib/y`), never at the
+                    // root, so this preserves in-image absolute links.
+                    if target_str.starts_with('/') && normalized == canonical_dest {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "tar symlink '{}' -> '{}' aliases the destination root",
                                 entry_path.display(),
                                 link_target.display()
                             ),
@@ -370,10 +512,10 @@ fn safe_unpack<R: Read>(archive: &mut tar::Archive<R>, dest: &Path) -> std::io::
         // hole skeleton, then we only pwrite non-zero 64 KiB chunks.  This
         // prevents 10 GiB overlay disks from materialising as dense files on
         // disk and causing ENOSPC or slow extraction.
-        if is_regular && entry.header().size().unwrap_or(0) >= SPARSE_WRITE_THRESHOLD {
+        if is_regular && entry.header().size().unwrap_or(0) >= limits.sparse_threshold {
             let entry_size = entry.header().size()?;
             let mode = entry.header().mode().unwrap_or(0o644);
-            if let Err(e) = unpack_sparse(&mut entry, &full_path, entry_size, mode) {
+            if let Err(e) = unpack_sparse(&mut entry, &full_path, entry_size, mode, &real_dest) {
                 return Err(std::io::Error::new(
                     e.kind(),
                     format!("failed to unpack '{}': {}", entry_path.display(), e),
@@ -502,6 +644,12 @@ const EXTRACTION_MARKER: &str = ".smolvm-extracted";
 /// Get the cache directory for a given checksum.
 ///
 /// Returns `~/.cache/smolvm-pack/<checksum>/` (hex-formatted).
+///
+/// FOLLOW-UP (Finding D): `checksum` is a 32-bit CRC content fingerprint, which
+/// is not collision-resistant — two distinct packs can share a cache dir. This
+/// is a content-addressing weakness (not a write-escape) and warrants migrating
+/// the cache key to a SHA-256 digest; tracked separately as it changes the
+/// on-disk cache layout and footer format.
 pub fn get_cache_dir(checksum: u32) -> std::io::Result<PathBuf> {
     let base = dirs::cache_dir()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no cache directory"))?;
@@ -519,6 +667,31 @@ pub fn is_extracted(cache_dir: &Path) -> bool {
 pub fn pack_cache_max_bytes() -> u64 {
     const DEFAULT: u64 = 5 * 1024 * 1024 * 1024;
     std::env::var("SMOLVM_PACK_CACHE_MAX_BYTES")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT)
+}
+
+/// Maximum number of entries `safe_unpack` will extract from a single archive
+/// before erroring (inode-flood / entry-bomb guard). Override with
+/// `SMOLVM_PACK_MAX_ENTRIES`; default 2,000,000 — far above any real image tar.
+fn max_extract_entries() -> u64 {
+    const DEFAULT: u64 = 2_000_000;
+    std::env::var("SMOLVM_PACK_MAX_ENTRIES")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT)
+}
+
+/// Maximum total apparent (header-declared) size `safe_unpack` will extract from
+/// a single archive before erroring (disk-exhaustion / decompression-bomb
+/// guard). Override with `SMOLVM_PACK_MAX_EXTRACT_BYTES`; default 128 GiB —
+/// generous enough for several large (sparse) overlay disks yet finite.
+fn max_extract_total_bytes() -> u64 {
+    const DEFAULT: u64 = 128 * 1024 * 1024 * 1024;
+    std::env::var("SMOLVM_PACK_MAX_EXTRACT_BYTES")
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|&n| n > 0)
@@ -1760,7 +1933,8 @@ mod tests {
         let mut archive = tar::Archive::new(tar_bytes.as_slice());
         let mut entry = archive.entries().unwrap().next().unwrap().unwrap();
 
-        let result = unpack_sparse(&mut entry, &dest, data.len() as u64, 0o644);
+        let real_dest = temp_dir.path().canonicalize().unwrap();
+        let result = unpack_sparse(&mut entry, &dest, data.len() as u64, 0o644, &real_dest);
 
         assert!(result.is_err(), "should reject symlink at destination");
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
@@ -1848,6 +2022,170 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------------------
+    // Fix 1 (PRIMARY): the sparse-write path must NOT follow a symlink parent
+    // component out of `dest`. Reproduces the host-escape: a prior entry plants
+    // `foo -> <abs path OUTSIDE dest>`, then a sparse regular file under
+    // `foo/...` tries to redirect the write through it. `safe_unpack` must
+    // error AND write nothing at the escape target.
+    // ---------------------------------------------------------------------
+    #[cfg(unix)]
+    #[test]
+    fn test_safe_unpack_sparse_symlink_parent_escape_blocked() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Sentinel directory OUTSIDE dest (sibling under the temp dir). If the
+        // escape worked, the payload would land here.
+        let sentinel = temp_dir.path().join("ESCAPE");
+        fs::create_dir(&sentinel).unwrap();
+
+        let dest = temp_dir.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+
+        // Plant the escaping symlink exactly as a prior tar entry would have:
+        // `dest/foo` -> the sentinel dir outside dest. (Pre-planting instead of
+        // relying on the tar crate's symlink-creation semantics keeps the test
+        // deterministic; it reproduces the same on-disk state.)
+        symlink(&sentinel, dest.join("foo")).unwrap();
+
+        // A sparse regular file under `foo/...`: create_dir_all + open would
+        // traverse the symlink parent and write into the sentinel. Small payload
+        // + low sparse threshold forces the `unpack_sparse` path.
+        let payload = vec![0xABu8; 4096];
+        let tar_bytes = make_tar("foo/pwned.bin", &payload);
+
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        let limits = SafeUnpackLimits {
+            max_entries: 1_000,
+            max_total_bytes: 1 << 30,
+            sparse_threshold: 512, // 4096-byte payload takes the sparse path
+        };
+        let result = safe_unpack_with_limits(&mut archive, &dest, &limits);
+
+        assert!(
+            result.is_err(),
+            "symlink-parent escape via the sparse path must be rejected"
+        );
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+        // Nothing may have been written through the escaping symlink.
+        assert!(
+            !sentinel.join("pwned.bin").exists(),
+            "host file was written OUTSIDE dest — escape not blocked"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Fix 1b (root cause): an absolute symlink that aliases the dest ROOT
+    // itself (`foo -> /`) is the parent-escape primitive and must be rejected
+    // at creation — it must never appear on disk.
+    // ---------------------------------------------------------------------
+    #[cfg(unix)]
+    #[test]
+    fn test_safe_unpack_rejects_absolute_symlink_aliasing_root() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dest = temp_dir.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+
+        let tar_bytes = make_symlink_tar("foo", "/");
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        let result = safe_unpack(&mut archive, &dest);
+
+        assert!(
+            result.is_err(),
+            "absolute symlink aliasing dest root must be rejected"
+        );
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            !dest.join("foo").exists() && fs::symlink_metadata(dest.join("foo")).is_err(),
+            "root-aliasing symlink must never be created on disk"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Fix 1 (G): the sparse path must strip setuid/setgid/sticky bits, matching
+    // the dense path — a hostile header must not yield a setuid host file.
+    // ---------------------------------------------------------------------
+    #[cfg(unix)]
+    #[test]
+    fn test_unpack_sparse_strips_setuid() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dest = temp_dir.path().join("suid.bin");
+        let real_dest = temp_dir.path().canonicalize().unwrap();
+
+        let data = vec![0x11u8; 4096];
+        let tar_bytes = make_tar("suid.bin", &data);
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        let mut entry = archive.entries().unwrap().next().unwrap().unwrap();
+
+        // Header mode carries setuid (0o4000) + setgid (0o2000) + rwxr-xr-x.
+        unpack_sparse(&mut entry, &dest, data.len() as u64, 0o6755, &real_dest).unwrap();
+
+        let mode = fs::metadata(&dest).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            mode, 0o0755,
+            "setuid/setgid/sticky bits must be stripped on the sparse path"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Fix 3: an archive exceeding the entry-count ceiling is rejected.
+    // ---------------------------------------------------------------------
+    #[test]
+    fn test_safe_unpack_rejects_too_many_entries() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dest = temp_dir.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+
+        let mut builder = tar::Builder::new(Vec::new());
+        for i in 0..10 {
+            let data = b"x";
+            let mut h = tar::Header::new_gnu();
+            h.set_size(data.len() as u64);
+            h.set_mode(0o644);
+            builder
+                .append_data(&mut h, format!("file{i}.txt"), &data[..])
+                .unwrap();
+        }
+        let tar_bytes = builder.into_inner().unwrap();
+
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        let limits = SafeUnpackLimits {
+            max_entries: 3,
+            max_total_bytes: 1 << 30,
+            sparse_threshold: SPARSE_WRITE_THRESHOLD,
+        };
+        let err = safe_unpack_with_limits(&mut archive, &dest, &limits).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("max entry count"));
+    }
+
+    // ---------------------------------------------------------------------
+    // Fix 3: an archive exceeding the total-bytes ceiling is rejected.
+    // ---------------------------------------------------------------------
+    #[test]
+    fn test_safe_unpack_rejects_total_bytes_over_cap() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dest = temp_dir.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+
+        let data = vec![0u8; 4096];
+        let tar_bytes = make_tar("big.bin", &data);
+
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        let limits = SafeUnpackLimits {
+            max_entries: 1_000,
+            max_total_bytes: 1024, // 4096-byte entry exceeds this
+            sparse_threshold: SPARSE_WRITE_THRESHOLD,
+        };
+        let err = safe_unpack_with_limits(&mut archive, &dest, &limits).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("max total size"));
+    }
+
     #[test]
     fn test_unpack_sparse_preserves_data_integrity() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -1866,7 +2204,8 @@ mod tests {
         let mut archive = tar::Archive::new(tar_bytes.as_slice());
         let mut entry = archive.entries().unwrap().next().unwrap().unwrap();
 
-        unpack_sparse(&mut entry, &dest, data.len() as u64, 0o644).unwrap();
+        let real_dest = temp_dir.path().canonicalize().unwrap();
+        unpack_sparse(&mut entry, &dest, data.len() as u64, 0o644, &real_dest).unwrap();
 
         assert_eq!(fs::read(&dest).unwrap(), data);
     }
@@ -2553,7 +2892,7 @@ mod tests {
         // Good file 3
         let mut header = tar::Header::new_gnu();
         header.set_entry_type(tar::EntryType::Regular);
-        header.set_size(11);
+        header.set_size(19); // == len("#!/usr/bin/env bash")
         header.set_mode(0o755);
         header.set_path("usr/good3.sh").unwrap();
         header.set_cksum();
