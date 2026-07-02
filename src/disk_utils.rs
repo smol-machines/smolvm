@@ -124,7 +124,18 @@ pub(crate) fn copy_disk_from_template<D: DiskType>(
 pub(crate) fn expand_sparse_disk<D: DiskType>(path: &Path, new_size_gb: u64) -> Result<()> {
     use std::fs::OpenOptions;
 
-    let new_size_bytes = new_size_gb * BYTES_PER_GIB;
+    // Use checked_mul so an absurd request (e.g. 2^34 GiB) returns a clean
+    // error instead of overflowing u64 — which would debug-panic or, in release,
+    // wrap to a tiny/zero byte count and silently truncate the sparse file.
+    let new_size_bytes = new_size_gb.checked_mul(BYTES_PER_GIB).ok_or_else(|| {
+        Error::storage(
+            "expand disk",
+            format!(
+                "requested size {} GiB is too large (overflows the maximum addressable byte count)",
+                new_size_gb
+            ),
+        )
+    })?;
     let current_size = std::fs::metadata(path)
         .map_err(|e| Error::storage("get disk metadata", e.to_string()))?
         .len();
@@ -616,5 +627,47 @@ mod tests {
                 "sparse clone must not allocate the full {logical_len} bytes (got {allocated} allocated)"
             );
         }
+    }
+
+    /// Regression: `expand_sparse_disk` must reject a size whose byte count
+    /// overflows u64 with a clean `Err`, never a panic (debug) or a wrapped /
+    /// zero-length sparse file (release). `2^34 GiB * 2^30 bytes/GiB = 2^64`,
+    /// which is exactly the u64 overflow boundary.
+    #[test]
+    fn expand_rejects_overflowing_size_gb() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overflow.img");
+        // The path need not exist: the overflow check runs before any file I/O,
+        // so this must fail on the multiply, not on a missing-file error.
+        let overflow_gb: u64 = 1u64 << 34; // * BYTES_PER_GIB (2^30) == 2^64
+        let err = expand_sparse_disk::<crate::data::disk::Storage>(&path, overflow_gb)
+            .expect_err("overflowing size_gb must return Err, not panic or truncate");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("too large") && msg.contains("overflow"),
+            "expected an overflow error, got: {msg}"
+        );
+        assert!(
+            !path.exists(),
+            "no disk file should be created when the size overflows"
+        );
+    }
+
+    /// A merely-large-but-valid size must not be rejected by the overflow guard
+    /// (it will fail later on the missing file, proving the multiply succeeded).
+    #[test]
+    fn expand_allows_large_but_valid_size_gb() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.img");
+        // 1 GiB below the overflow boundary — the multiply is fine; the call
+        // then fails reading metadata of the nonexistent path.
+        let big_gb: u64 = (1u64 << 34) - 1;
+        let err = expand_sparse_disk::<crate::data::disk::Storage>(&path, big_gb)
+            .expect_err("nonexistent path should fail after a successful multiply");
+        let msg = format!("{}", err);
+        assert!(
+            !msg.contains("too large"),
+            "a valid (non-overflowing) size must not trip the overflow guard: {msg}"
+        );
     }
 }
