@@ -251,7 +251,7 @@ mod tests {
     fn test_read_footer_direct_rejects_invalid_magic() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("no_magic.bin");
-        std::fs::write(&path, &[0u8; 128]).unwrap();
+        std::fs::write(&path, [0u8; 128]).unwrap();
         assert!(read_footer_direct(&path).is_err());
     }
 }

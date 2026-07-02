@@ -16,6 +16,47 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+/// Maximum bytes buffered in memory for a manifest / image-index document.
+/// A hostile or MITM'd registry could otherwise stream a multi-GB (or endless)
+/// body that the client buffers entirely BEFORE the digest is checked, OOMing
+/// the host. 32 MiB is far above any real OCI manifest (a few KB).
+const MAX_MANIFEST_BYTES: usize = 32 * 1024 * 1024;
+
+/// Maximum bytes buffered in memory for a `pull_blob` response. `pull_blob` is
+/// used only for small blobs (the OCI image config, a few KB); large layers use
+/// [`RegistryClient::pull_blob_stream`], which streams to disk. 64 MiB is a
+/// generous ceiling that still bounds the in-memory buffer.
+const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
+
+/// Buffer a response body into memory, refusing to read more than `cap` bytes.
+///
+/// Guards against an unbounded body: it rejects on a too-large `Content-Length`
+/// up front (cheap), then streams chunk-by-chunk and errors the moment the
+/// accumulated size would exceed `cap` — so a lying or absent `Content-Length`
+/// can't get past the cap either. This runs BEFORE any digest computation, so
+/// the host never buffers an unbounded body first.
+async fn read_body_capped(mut resp: reqwest::Response, cap: usize, what: &str) -> Result<Vec<u8>> {
+    if let Some(len) = resp.content_length() {
+        if len > cap as u64 {
+            return Err(RegistryError::ResponseTooLarge {
+                what: what.to_string(),
+                limit: cap,
+            });
+        }
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        if buf.len().saturating_add(chunk.len()) > cap {
+            return Err(RegistryError::ResponseTooLarge {
+                what: what.to_string(),
+                limit: cap,
+            });
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
 /// Validate that a digest string matches the expected `sha256:<64 hex chars>` format.
 pub(crate) fn validate_digest(digest: &str) -> Result<()> {
     if let Some(hex_part) = digest.strip_prefix("sha256:") {
@@ -225,7 +266,9 @@ impl RegistryClient {
             });
         }
 
-        let data = resp.bytes().await?.to_vec();
+        // Cap the in-memory buffer BEFORE hashing so a hostile registry can't
+        // OOM the host by streaming an unbounded body ahead of the digest check.
+        let data = read_body_capped(resp, MAX_BLOB_BYTES, "blob").await?;
 
         // Verify digest.
         let actual = format!("sha256:{}", hex::encode(Sha256::digest(&data)));
@@ -541,7 +584,7 @@ impl RegistryClient {
             ));
         }
 
-        Ok(resp.bytes().await?.to_vec())
+        read_body_capped(resp, MAX_MANIFEST_BYTES, "manifest").await
     }
 
     /// Fetch a manifest OR image index by reference, returning the raw bytes and
@@ -578,7 +621,8 @@ impl RegistryClient {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        let data = resp.bytes().await?.to_vec();
+        // Cap the buffered manifest/index BEFORE the digest check below.
+        let data = read_body_capped(resp, MAX_MANIFEST_BYTES, "manifest").await?;
 
         // When the reference is a content digest (e.g. an image-index entry being
         // resolved to its platform manifest), the bytes MUST hash to it — else a
@@ -2009,5 +2053,65 @@ mod http_tests {
         let client = RegistryClient::new(server.uri().to_string());
         let (bytes, _ct) = client.get_manifest_raw("myrepo", &digest).await.unwrap();
         assert_eq!(bytes, body);
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix 2 (end-to-end): `get_manifest` must reject a body exceeding
+    // MAX_MANIFEST_BYTES via the up-front Content-Length check, rather than
+    // buffering the whole (here, > 32 MiB) body into host RAM before hashing.
+    // The body is honest (matches Content-Length) so the transport accepts it;
+    // our guard rejects it before reading past the header.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_manifest_oversized_rejected() {
+        let server = MockServer::start().await;
+
+        let oversized = vec![0u8; MAX_MANIFEST_BYTES + 1];
+        Mock::given(method("GET"))
+            .and(path("/v2/myrepo/manifests/latest"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", MANIFEST_MEDIA_TYPE)
+                    .set_body_bytes(oversized),
+            )
+            .mount(&server)
+            .await;
+
+        let client = RegistryClient::new(server.uri().to_string());
+        let err = client.get_manifest("myrepo", "latest").await.unwrap_err();
+        assert!(
+            matches!(err, RegistryError::ResponseTooLarge { .. }),
+            "oversized manifest must be rejected, got {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix 2: even with NO / understated Content-Length, the streamed body is
+    // capped — the accumulating read errors once it crosses the limit rather
+    // than buffering an unbounded body. Verified against `read_body_capped`
+    // directly with a tiny cap.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_read_body_capped_streams_and_rejects_over_limit() {
+        let server = MockServer::start().await;
+
+        // 4 KiB body, no explicit Content-Length reliance — cap at 1 KiB.
+        Mock::given(method("GET"))
+            .and(path("/big"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; 4096]))
+            .mount(&server)
+            .await;
+
+        let resp = reqwest::get(format!("{}/big", server.uri())).await.unwrap();
+        let err = read_body_capped(resp, 1024, "test").await.unwrap_err();
+        assert!(
+            matches!(err, RegistryError::ResponseTooLarge { .. }),
+            "over-cap streamed body must be rejected, got {err:?}"
+        );
+
+        // A body within the cap is returned intact.
+        let resp2 = reqwest::get(format!("{}/big", server.uri())).await.unwrap();
+        let ok = read_body_capped(resp2, 8192, "test").await.unwrap();
+        assert_eq!(ok.len(), 4096);
     }
 }
