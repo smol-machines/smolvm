@@ -59,6 +59,7 @@
 
 pub mod device;
 pub mod dns;
+pub mod dns_relay;
 pub mod egress;
 // The libkrun frame bridge speaks over an AF_UNIX stream socket, available on
 // both Unix and Windows (10 1809+), so the whole stack is cross-platform.

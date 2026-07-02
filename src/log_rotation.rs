@@ -41,6 +41,25 @@ pub fn rotate_if_needed(log_path: &Path) -> io::Result<bool> {
 /// Force rotate a log file regardless of size.
 ///
 /// Rotates the log file following the same pattern as `rotate_if_needed`.
+///
+/// The active (live) log is rotated with **copy-truncate** semantics rather
+/// than a rename. The live console log is written by libkrun through an
+/// intentionally-leaked append fd bound to the file's inode for the VM's whole
+/// lifetime (see `KrunFunctions::console_output_to_file`). A `rename` would
+/// leave that leaked fd pointing at the renamed inode (`.1`), so libkrun would
+/// keep appending to `.1` — which then rotates onward and gets deleted, losing
+/// all live output, while `tail agent-console.log` sees a frozen file.
+///
+/// Instead we copy the live file's contents to `.1` and then truncate the
+/// original in place. Because the leaked fd is `O_APPEND`, its next write lands
+/// at offset 0 of the now-empty inode, so the writer stays valid and continues
+/// into the same file. Already-rotated `.1`/`.2`/`.3` files are nobody's live
+/// fd, so they are still shifted with plain renames.
+///
+/// Tradeoff: like `logrotate`'s own `copytruncate`, any bytes written between
+/// the copy and the truncate are lost. We minimise that window by truncating
+/// immediately after the copy; under active writing a tiny loss is the accepted
+/// copy-truncate semantics.
 pub fn rotate(log_path: &Path) -> io::Result<()> {
     let log_str = log_path.display().to_string();
 
@@ -50,7 +69,8 @@ pub fn rotate(log_path: &Path) -> io::Result<()> {
         fs::remove_file(&oldest)?;
     }
 
-    // Rotate existing files: .2 -> .3, .1 -> .2
+    // Rotate existing files: .2 -> .3, .1 -> .2 (plain renames — nothing holds
+    // an open fd to these already-rotated files).
     for i in (1..MAX_LOG_FILES).rev() {
         let from = format!("{}.{}", log_str, i);
         let to = format!("{}.{}", log_str, i + 1);
@@ -59,10 +79,22 @@ pub fn rotate(log_path: &Path) -> io::Result<()> {
         }
     }
 
-    // Move current log to .1
+    // Copy-truncate the live log to .1, preserving the leaked writer fd's inode.
     let first_rotated = format!("{}.1", log_str);
-    fs::rename(log_path, &first_rotated)?;
+    fs::copy(log_path, &first_rotated)?;
+    truncate_in_place(log_path)?;
 
+    Ok(())
+}
+
+/// Truncate a file to zero length in place, keeping its inode (and therefore any
+/// already-open fds) valid. Uses `OpenOptions::write(true).truncate(true)` which
+/// maps to `open(..., O_TRUNC)` — it does not create a new inode.
+fn truncate_in_place(log_path: &Path) -> io::Result<()> {
+    fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(log_path)?;
     Ok(())
 }
 
@@ -145,8 +177,9 @@ mod tests {
         // Force rotate to test the rotation logic
         rotate(&log_path).unwrap();
 
-        // Original file should be gone, .1 should exist
-        assert!(!log_path.exists());
+        // Copy-truncate keeps the live file (now empty) and copies data to .1.
+        assert!(log_path.exists());
+        assert_eq!(fs::metadata(&log_path).unwrap().len(), 0);
         let rotated = dir.path().join("test.log.1");
         assert!(rotated.exists());
     }
@@ -163,8 +196,10 @@ mod tests {
 
         rotate(&log_path).unwrap();
 
-        // Check rotation happened correctly
-        assert!(!log_path.exists());
+        // Check rotation happened correctly. Copy-truncate leaves the live file
+        // present but empty; its data is copied into .1.
+        assert!(log_path.exists());
+        assert_eq!(fs::metadata(&log_path).unwrap().len(), 0);
         assert_eq!(
             fs::read_to_string(dir.path().join("test.log.1")).unwrap(),
             "current"
@@ -225,6 +260,53 @@ mod tests {
         assert!(!log_path.exists());
         assert!(!dir.path().join("test.log.1").exists());
         assert!(!dir.path().join("test.log.2").exists());
+    }
+
+    // Regression test for C2: rotation must not rename the live file out from
+    // under a writer that holds a leaked append fd (as libkrun does for the VM
+    // console). Copy-truncate must keep that fd valid and pointing at the same
+    // inode, so pre-rotation data lands in .1 and post-rotation writes via the
+    // held fd land in the (now truncated) live file — no data lost.
+    #[test]
+    fn test_copytruncate_preserves_open_append_fd() {
+        use std::fs::OpenOptions;
+
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join("agent-console.log");
+
+        // Open an append fd and keep it open across the rotation, mirroring the
+        // leaked libkrun console fd.
+        let mut writer = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .unwrap();
+
+        writer.write_all(b"before-rotation\n").unwrap();
+        writer.flush().unwrap();
+
+        rotate(&log_path).unwrap();
+
+        // The pre-rotation data was copied into .1.
+        assert_eq!(
+            fs::read_to_string(dir.path().join("agent-console.log.1")).unwrap(),
+            "before-rotation\n"
+        );
+        // The live file still exists (same inode) and was truncated to empty.
+        assert!(log_path.exists());
+        assert_eq!(fs::metadata(&log_path).unwrap().len(), 0);
+
+        // The still-open append fd keeps writing to the same inode; O_APPEND
+        // means the next write lands at offset 0 of the truncated file.
+        writer.write_all(b"after-rotation\n").unwrap();
+        writer.flush().unwrap();
+
+        // Post-rotation data is in the live file, not leaked into .1.
+        assert_eq!(fs::read_to_string(&log_path).unwrap(), "after-rotation\n");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("agent-console.log.1")).unwrap(),
+            "before-rotation\n"
+        );
     }
 
     #[test]
