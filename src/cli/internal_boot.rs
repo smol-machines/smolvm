@@ -347,7 +347,20 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
     // while single-threaded so libkrun's vCPU/worker threads inherit the filter.
     // Enforce mode fails closed (a filter that won't install must not silently run
     // unconfined). See docs/runtime-isolation-hardening.md.
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    //
+    // The call site is gated for BOTH x86_64 and aarch64 (AWS Graviton). Without
+    // the aarch64 arm this whole block was compiled out on ARM, so SMOLVM_SECCOMP
+    // was a silent no-op there even though `install_seccomp_filter` has an aarch64
+    // implementation (src/process.rs). CAVEAT: `enforce` remains behind the env
+    // var and the fleet still runs `audit` — enforce currently SIGSYS-kills the
+    // VMM because the allowlist is incomplete for what libkrun needs. Flipping the
+    // fleet default to `enforce` requires first completing the allowlist by
+    // collecting live-VMM SIGSYS violations against a running libkrun run; that is
+    // deliberately out of scope here (follow-up work), not fixed by this change.
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     match std::env::var("SMOLVM_SECCOMP").as_deref() {
         Ok("enforce") => {
             if let Err(e) = smolvm::process::install_seccomp_filter(true) {

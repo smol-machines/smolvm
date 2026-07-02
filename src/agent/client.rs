@@ -2038,11 +2038,50 @@ impl AgentClient {
     }
 }
 
-fn collect_exec_events<F>(client: &mut AgentClient, op: &str, mut on_event: F) -> Result<()>
+/// Cumulative byte ceiling for the streaming/collect exec path.
+///
+/// The buffered (`Completed`) exec path caps guest output inside the guest at
+/// `smolvm_agent::process::MAX_EXEC_OUTPUT` (11 MiB). The streaming path,
+/// however, relays frames one at a time and the SSE handler
+/// (`api::handlers::exec::exec_stream`) buffers the *entire* event vector in
+/// host RAM before responding. Without a cap, a chatty or infinite guest
+/// command (`yes`, `cat /dev/zero`) that emits `Stdout` frames forever and
+/// never sends `Exited` grows the host `serve` process without bound → host
+/// OOM → every co-tenant VM on the node is killed (cross-tenant DoS).
+///
+/// We mirror the buffered path's 11 MiB ceiling: once cumulative stdout+stderr
+/// crosses it, we emit a truncation error event and stop relaying (terminating
+/// the collect loop) instead of growing unbounded.
+///
+/// Semantics: this is a per-exec-session cap on the BUFFERED/relayed output of
+/// the streaming exec path. Interactive PTY sessions are long-lived by design
+/// and do NOT flow through here — they use
+/// [`AgentClient::interactive_session_io`], which streams frame-by-frame to the
+/// WebSocket without accumulating — so a legitimate long interactive session is
+/// unaffected by this cap.
+const MAX_STREAMING_EXEC_OUTPUT: usize = 11 * 1024 * 1024;
+
+fn collect_exec_events<F>(client: &mut AgentClient, op: &str, on_event: F) -> Result<()>
 where
     F: FnMut(ExecEvent),
 {
-    match client.receive()? {
+    collect_exec_events_inner(|| client.receive(), op, MAX_STREAMING_EXEC_OUTPUT, on_event)
+}
+
+/// Cap-parameterized core of [`collect_exec_events`], pulling responses from a
+/// `next_response` closure so it can be unit-tested against synthetic frame
+/// sequences with a small cap (instead of booting a VM and streaming 11 MiB).
+fn collect_exec_events_inner<N, F>(
+    mut next_response: N,
+    op: &str,
+    cap: usize,
+    mut on_event: F,
+) -> Result<()>
+where
+    N: FnMut() -> Result<AgentResponse>,
+    F: FnMut(ExecEvent),
+{
+    match next_response()? {
         AgentResponse::Started => {}
         AgentResponse::Error { message, .. } => {
             return Err(Error::agent(op, message));
@@ -2050,12 +2089,17 @@ where
         _ => return Err(Error::agent(op, "expected Started")),
     }
 
+    // Cumulative stdout+stderr bytes relayed on this session. Bounds the host
+    // buffer so a guest that never sends `Exited` can't OOM the host.
+    let mut total: usize = 0;
     loop {
-        match client.receive() {
+        match next_response() {
             Ok(AgentResponse::Stdout { data }) => {
+                total = total.saturating_add(data.len());
                 on_event(ExecEvent::Stdout(data));
             }
             Ok(AgentResponse::Stderr { data }) => {
+                total = total.saturating_add(data.len());
                 on_event(ExecEvent::Stderr(data));
             }
             Ok(AgentResponse::Exited { exit_code }) => {
@@ -2071,6 +2115,16 @@ where
                 on_event(ExecEvent::Error(err.to_string()));
                 break;
             }
+        }
+
+        // Cap check runs after relaying each frame (matching the buffered
+        // path's "send chunk, then break at the cap" order): we relay at most
+        // `cap` + one frame before terminating with a truncation signal.
+        if total >= cap {
+            on_event(ExecEvent::Error(format!(
+                "streaming output exceeded {cap} byte cap; exec terminated (output truncated)"
+            )));
+            break;
         }
     }
     Ok(())
@@ -2251,6 +2305,115 @@ mod read_cap_tests {
     fn read_cap_rejects_unexpected_response_type() {
         let err = drive(vec![AgentResponse::Pong { version: 1 }]).unwrap_err();
         assert!(format!("{}", err).contains("unexpected response"));
+    }
+}
+
+#[cfg(test)]
+mod collect_exec_cap_tests {
+    //! Regression coverage for the streaming-exec host-OOM guard.
+    //!
+    //! Proves the streaming/collect path (`collect_exec_events_inner`) stops
+    //! and emits a truncation signal once cumulative relayed output crosses the
+    //! cap, instead of buffering unbounded output from a guest that never sends
+    //! `Exited` (the `yes` / `cat /dev/zero` cross-tenant DoS).
+    use super::*;
+
+    fn stdout(n: usize) -> AgentResponse {
+        AgentResponse::Stdout { data: vec![0u8; n] }
+    }
+
+    /// Drive `collect_exec_events_inner` over a fixed response list with a
+    /// small cap, capturing the relayed events and the terminal result.
+    fn drive(cap: usize, responses: Vec<AgentResponse>) -> (Vec<ExecEvent>, Result<()>) {
+        let mut iter = responses.into_iter();
+        let mut events = Vec::new();
+        let res = collect_exec_events_inner(
+            || {
+                iter.next()
+                    .ok_or_else(|| Error::agent("test", "no more responses"))
+            },
+            "test exec",
+            cap,
+            |e| events.push(e),
+        );
+        (events, res)
+    }
+
+    const TEST_CAP: usize = 1024;
+
+    #[test]
+    fn stops_at_cumulative_cap_with_truncation_signal() {
+        // An infinite chatty stream: `Started`, then far more stdout than the
+        // cap, and crucially NEVER `Exited`. If the cap did not fire the loop
+        // would drain all 1000 frames (and in production loop forever). Because
+        // it caps, only a handful of frames are consumed before termination.
+        let half = TEST_CAP / 2;
+        let mut responses = vec![AgentResponse::Started];
+        for _ in 0..1000 {
+            responses.push(stdout(half)); // would total 500_000 bytes unbounded
+        }
+        let (events, res) = drive(TEST_CAP, responses);
+        res.expect("collect returns Ok after capping (not the iterator-drained error)");
+
+        // Terminated near the cap, nowhere near draining 1000 frames.
+        assert!(
+            events.len() < 10,
+            "expected termination near the cap, got {} events",
+            events.len()
+        );
+
+        // Final event is the truncation error.
+        match events.last().expect("at least one event") {
+            ExecEvent::Error(msg) => assert!(
+                msg.contains("byte cap") && msg.contains("truncated"),
+                "expected truncation error, got: {msg}"
+            ),
+            other => panic!("expected trailing truncation Error event, got {other:?}"),
+        }
+
+        // Relayed bytes are bounded: at most cap + one frame.
+        let relayed: usize = events
+            .iter()
+            .map(|e| match e {
+                ExecEvent::Stdout(d) | ExecEvent::Stderr(d) => d.len(),
+                _ => 0,
+            })
+            .sum();
+        assert!(
+            relayed <= TEST_CAP + half,
+            "relayed {relayed} bytes exceeds the cap+one-frame bound"
+        );
+    }
+
+    #[test]
+    fn single_oversized_frame_trips_the_cap() {
+        // One frame that alone crosses the cap: relayed once, then truncated.
+        let (events, res) = drive(TEST_CAP, vec![AgentResponse::Started, stdout(TEST_CAP + 1)]);
+        res.unwrap();
+        assert!(matches!(events.last().unwrap(), ExecEvent::Error(m) if m.contains("byte cap")));
+    }
+
+    #[test]
+    fn passes_through_under_cap_and_exits_cleanly() {
+        // Normal, well-behaved exec under the cap relays everything and ends on
+        // `Exit` with no truncation error injected.
+        let (events, res) = drive(
+            TEST_CAP,
+            vec![
+                AgentResponse::Started,
+                stdout(100),
+                AgentResponse::Stderr {
+                    data: b"warn".to_vec(),
+                },
+                AgentResponse::Exited { exit_code: 0 },
+            ],
+        );
+        res.unwrap();
+        assert_eq!(events.last().unwrap(), &ExecEvent::Exit(0));
+        assert!(
+            !events.iter().any(|e| matches!(e, ExecEvent::Error(_))),
+            "clean exec must not inject a truncation error"
+        );
     }
 }
 
