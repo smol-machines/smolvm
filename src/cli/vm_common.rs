@@ -720,7 +720,20 @@ pub fn fork_vm(
         },
     );
     if result.is_ok() {
-        smolvm::agent::fork::rejuvenate_clone(clone);
+        // Fresh on-disk identity (hostname, machine-id, SSH host keys, RNG).
+        // FAIL-CLOSED: if the reset can't be confirmed, stop the booted clone and
+        // roll it back rather than leave it live with the golden's secrets.
+        smolvm::agent::fork::fail_closed_on_rejuvenation(
+            smolvm::agent::fork::rejuvenate_clone(clone),
+            || {
+                if let Ok(manager) = AgentManager::for_vm(clone) {
+                    manager.kill();
+                    manager.cleanup_data_dir();
+                }
+                let _ = db.remove_vm(clone);
+                let _ = std::fs::remove_dir_all(vm_data_dir(clone));
+            },
+        )?;
         eprintln!(
             "Forked '{golden}' -> '{clone}'. Golden stays frozen as the fork base \
              (do not start it again while clones exist)."
