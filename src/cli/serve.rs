@@ -183,6 +183,18 @@ impl ServeStartCmd {
             }
         }
 
+        // Default-on, fail-closed: a `serve` node hosts untrusted tenant guests,
+        // so force the STRICT egress floor (blocks cloud metadata, host LAN, the
+        // control plane, loopback, and co-resident tenants) rather than inferring
+        // it from `SMOLVM_PUBLISH_ADDR`. A dropped publish-addr must NOT silently
+        // downgrade the floor to metadata-only and expose the host loopback door
+        // to a guest. Single-tenant/self-host operators can opt down with
+        // `SMOLVM_EGRESS_FLOOR=metadata|off`. Inherited by the spawned `_boot-vm`.
+        if std::env::var_os("SMOLVM_EGRESS_FLOOR").is_none() {
+            std::env::set_var("SMOLVM_EGRESS_FLOOR", "strict");
+            tracing::info!("egress floor set to strict (multi-tenant serve default)");
+        }
+
         // Per-VM uid isolation preflight. When serve is privileged each VMM drops
         // to its own unprivileged uid (process::vm_drop_ids), containing a
         // guest→VMM escape to one VM. That only works if the data root is

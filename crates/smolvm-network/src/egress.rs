@@ -118,7 +118,30 @@ enum FloorMode {
 /// Resolve the floor from the deployment context. Read once at policy creation
 /// (never per-packet): explicit local override wins, else fleet ⇒ strict, else
 /// the metadata-only local default.
+/// Parse an explicit `SMOLVM_EGRESS_FLOOR` value into a mode. Returns `None`
+/// for an absent/unrecognized value so the caller falls back to the inferred
+/// default. Pure (no env) so it is unit-testable.
+fn parse_floor_override(v: &str) -> Option<FloorMode> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "strict" => Some(FloorMode::Strict),
+        "metadata" | "metadata-only" | "metadataonly" => Some(FloorMode::MetadataOnly),
+        "off" | "none" => Some(FloorMode::Off),
+        _ => None,
+    }
+}
+
 fn floor_mode() -> FloorMode {
+    // Explicit override wins (highest precedence). A multi-tenant node sets
+    // `SMOLVM_EGRESS_FLOOR=strict` so the floor is fail-closed and never
+    // silently degrades to metadata-only if `SMOLVM_PUBLISH_ADDR` is missing
+    // from the environment (a dropped unit override, a new provisioner, or a
+    // manual launch must NOT quietly expose the host LAN / control plane /
+    // co-tenants to a guest). `metadata`/`off` allow a deliberate downgrade.
+    if let Ok(v) = std::env::var("SMOLVM_EGRESS_FLOOR") {
+        if let Some(mode) = parse_floor_override(&v) {
+            return mode;
+        }
+    }
     let allow_private = std::env::var("SMOLVM_EGRESS_ALLOW_PRIVATE")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
@@ -318,6 +341,25 @@ impl EgressPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn floor_override_parsing() {
+        assert_eq!(parse_floor_override("strict"), Some(FloorMode::Strict));
+        assert_eq!(parse_floor_override("  STRICT "), Some(FloorMode::Strict));
+        assert_eq!(
+            parse_floor_override("metadata"),
+            Some(FloorMode::MetadataOnly)
+        );
+        assert_eq!(
+            parse_floor_override("metadata-only"),
+            Some(FloorMode::MetadataOnly)
+        );
+        assert_eq!(parse_floor_override("off"), Some(FloorMode::Off));
+        assert_eq!(parse_floor_override("none"), Some(FloorMode::Off));
+        // Unrecognized falls through to the inferred default (None).
+        assert_eq!(parse_floor_override(""), None);
+        assert_eq!(parse_floor_override("yes"), None);
+    }
 
     #[test]
     fn unrestricted_allows_everything() {
