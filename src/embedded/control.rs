@@ -137,8 +137,19 @@ pub fn fork_vm(
         ..LaunchFeatures::default()
     };
     match launch_from_record(&prep.clone_record, features) {
-        Ok(handle) => {
-            crate::agent::fork::rejuvenate_clone(clone);
+        Ok(mut handle) => {
+            // Fresh on-disk identity (hostname, machine-id, SSH host keys, RNG).
+            // FAIL-CLOSED: if the reset can't be confirmed, stop the booted clone
+            // and roll it back rather than leave it live with the golden's
+            // per-machine secrets.
+            crate::agent::fork::fail_closed_on_rejuvenation(
+                crate::agent::fork::rejuvenate_clone(clone),
+                || {
+                    let _ = handle.stop();
+                    let _ = db.remove_vm(clone);
+                    let _ = std::fs::remove_dir_all(crate::agent::vm_data_dir(clone));
+                },
+            )?;
             mark_running(db, clone, handle.child_pid())?;
             Ok(handle)
         }

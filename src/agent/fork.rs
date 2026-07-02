@@ -311,49 +311,139 @@ fn clone_fork_disks(gdir: &Path, clone_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Best-effort per-clone identity rejuvenation after a fork. A clone inherits
-/// the golden's hostname, machine-id, and (critically) RNG state, so without
-/// this every clone would share the golden's random stream — a security problem
-/// and a source of duplicate-identity bugs across a pool. Run over the
-/// freshly-booted clone's agent: set a unique hostname, mint a fresh machine-id,
-/// and stir the kernel RNG with fresh host entropy so the streams diverge.
-/// Failures are warnings, not fatal (the clone still works).
+/// Number of times we try to confirm a clone's identity rejuvenation before
+/// giving up and failing the fork. `connect_with_retry` already rides out the
+/// agent's boot; these extra attempts cover a momentarily-busy agent whose
+/// `vm_exec` errors or exits non-zero transiently.
+const REJUVENATE_ATTEMPTS: usize = 3;
+
+/// Build the shell script that re-mints a clone's on-disk identity. Kept as a
+/// pure function of `(clone, seed)` so the security-critical contents (fresh
+/// machine-id, regenerated SSH host keys) are unit-tested without a live VM.
 ///
-/// Note: this stirs but does not *credit* entropy (no `RNDADDENTROPY`/VMGENID
-/// yet), and does not re-address the network (MAC/IP) — both are follow-ups.
-pub fn rejuvenate_clone(clone: &str) {
-    let sock = vm_data_dir(clone).join("agent.sock");
-    let seed = host_random_hex(64);
-    // Names are validated (alphanumeric + dashes), so single-quoting is safe.
-    let script = format!(
-        "hostname '{c}' 2>/dev/null; printf '%s\\n' '{c}' > /etc/hostname 2>/dev/null; \
-         (cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-' > /etc/machine-id) 2>/dev/null; \
-         printf '%s' '{s}' > /dev/urandom 2>/dev/null; true",
+/// `clone` is a validated machine name (alphanumeric + dashes) and `seed` is
+/// hex, so single-quoting both is injection-safe.
+///
+/// The script is fail-hard on the *unambiguously per-machine* identity material
+/// (`set -e`): if a clone cannot get its own machine-id or SSH host keys, the
+/// fork must fail rather than vend a clone that impersonates the golden. Steps
+/// that are legitimately absent on minimal/library images (no sshd, no dbus,
+/// no cloud-init) are guarded so they no-op instead of failing.
+fn build_rejuvenation_script(clone: &str, seed: &str) -> String {
+    format!(
+        "set -e; \
+         hostname '{c}' 2>/dev/null || true; \
+         printf '%s\\n' '{c}' > /etc/hostname; \
+         tr -d '-' < /proc/sys/kernel/random/uuid > /etc/machine-id; \
+         if [ -f /var/lib/dbus/machine-id ] && [ ! -L /var/lib/dbus/machine-id ]; then \
+             tr -d '-' < /proc/sys/kernel/random/uuid > /var/lib/dbus/machine-id; \
+         fi; \
+         if [ -d /etc/ssh ] && command -v ssh-keygen >/dev/null 2>&1; then \
+             rm -f /etc/ssh/ssh_host_*_key /etc/ssh/ssh_host_*_key.pub; \
+             ssh-keygen -A >/dev/null 2>&1; \
+         fi; \
+         rm -rf /var/lib/cloud/instance /var/lib/cloud/instances/* /var/lib/cloud/data/instance-id 2>/dev/null || true; \
+         printf '%s' '{s}' > /dev/urandom 2>/dev/null || true; \
+         true",
         c = clone,
         s = seed,
-    );
-    let mut client = match AgentClient::connect_with_retry(&sock) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(clone, error = %e, "clone rejuvenation skipped (agent connect)");
-            return;
+    )
+}
+
+/// Per-clone identity rejuvenation after a fork. A fork CoW-clones the golden's
+/// disks wholesale, so every per-machine on-disk secret (machine-id, SSH host
+/// keys, dbus id, cloud-init instance state) is byte-identical in the clone —
+/// and clones can belong to *different tenants*. Left unchanged, that is a
+/// cross-tenant impersonation / MITM hole (identical SSH host keys) and a
+/// duplicate-identity bug. This runs over the freshly-booted clone's agent to
+/// give it a fresh hostname, machine-id, SSH host keys, and to stir the kernel
+/// RNG with fresh host entropy so the random streams diverge.
+///
+/// FAIL-CLOSED: this returns `Err` if the reset could not be *confirmed* (agent
+/// unreachable, or the re-mint script exited non-zero) after
+/// [`REJUVENATE_ATTEMPTS`] tries. Callers MUST treat that as a fork failure and
+/// tear the clone down — a clone that still carries the golden's identity must
+/// never be vended (see [`fail_closed_on_rejuvenation`]).
+///
+/// RESIDUAL LIMITATION (out of scope, intentional): this rejuvenates only
+/// *on-disk* identity. It cannot scrub the golden's *in-RAM* secrets — a
+/// session token, JWT, or TLS private key held in a golden-resident process's
+/// memory is CoW-inherited identically by every clone. That is intrinsic to
+/// fork-from-warm and is not fixable here; the mitigation is a product
+/// constraint (goldens must be prepacked library base images that mint no
+/// per-instance boot secrets in RAM, and/or restart key daemons post-fork), not
+/// disk rejuvenation. Likewise this stirs but does not *credit* entropy
+/// (no `RNDADDENTROPY`/VMGENID yet) and does not re-address the network
+/// (MAC/IP; safe under the default TSI backend) — both are follow-ups.
+pub fn rejuvenate_clone(clone: &str) -> Result<()> {
+    let sock = vm_data_dir(clone).join("agent.sock");
+    let seed = host_random_hex(64);
+    let script = build_rejuvenation_script(clone, &seed);
+
+    let mut last_err = String::from("unknown error");
+    for attempt in 1..=REJUVENATE_ATTEMPTS {
+        match rejuvenate_once(&sock, &script) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                tracing::warn!(
+                    clone,
+                    attempt,
+                    error = %e,
+                    "clone rejuvenation attempt failed"
+                );
+                last_err = e;
+                if attempt < REJUVENATE_ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+            }
         }
-    };
+    }
+    Err(Error::agent(
+        "rejuvenate clone",
+        format!(
+            "identity reset could not be confirmed after {REJUVENATE_ATTEMPTS} attempts: {last_err}"
+        ),
+    ))
+}
+
+/// One attempt: connect to the clone's agent and run the re-mint script. Any
+/// connect error, exec error, or non-zero exit is a failure (fail-closed).
+fn rejuvenate_once(sock: &Path, script: &str) -> std::result::Result<(), String> {
+    let mut client =
+        AgentClient::connect_with_retry(sock).map_err(|e| format!("agent connect: {e}"))?;
     match client.vm_exec(
-        vec!["/bin/sh".into(), "-c".into(), script],
+        vec!["/bin/sh".into(), "-c".into(), script.to_string()],
         vec![],
         None,
         Some(std::time::Duration::from_secs(10)),
         None,
     ) {
-        Ok((0, _, _)) => {}
-        Ok((code, _, stderr)) => tracing::warn!(
-            clone,
-            code,
-            stderr = %String::from_utf8_lossy(&stderr).trim(),
-            "clone rejuvenation exited non-zero"
-        ),
-        Err(e) => tracing::warn!(clone, error = %e, "clone rejuvenation failed"),
+        Ok((0, _, _)) => Ok(()),
+        Ok((code, _, stderr)) => Err(format!(
+            "re-mint script exited {code}: {}",
+            String::from_utf8_lossy(&stderr).trim()
+        )),
+        Err(e) => Err(format!("exec: {e}")),
+    }
+}
+
+/// Fail-closed fork finalizer. A clone whose identity could not be rejuvenated
+/// MUST NOT be vended (it would share the golden's machine-id/hostname/SSH host
+/// keys across tenants), so on any rejuvenation `Err` this runs `teardown`
+/// (stop + remove the clone) and propagates the error, turning a rejuvenation
+/// failure into a fork failure. On `Ok` it does nothing and the caller proceeds
+/// to mark the clone ready. Extracted as a pure decision so the fail-closed
+/// behavior is unit-tested independently of the VM/agent machinery.
+pub fn fail_closed_on_rejuvenation<F: FnOnce()>(
+    rejuvenation: Result<()>,
+    teardown: F,
+) -> Result<()> {
+    match rejuvenation {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            teardown();
+            Err(e)
+        }
     }
 }
 
@@ -375,4 +465,67 @@ fn host_random_hex(hex_len: usize) -> String {
         let _ = f.read_exact(&mut buf);
     }
     buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    // Fix 1: the re-mint script must regenerate the per-machine on-disk secrets
+    // that a wholesale CoW disk clone would otherwise share across tenants —
+    // above all the SSH host keys.
+    #[test]
+    fn rejuvenation_script_regenerates_per_machine_secrets() {
+        let script = build_rejuvenation_script("clone-a", "deadbeef");
+
+        // SSH host keys: delete the golden's, then regenerate fresh ones.
+        assert!(
+            script.contains("ssh_host_"),
+            "script must remove the golden's SSH host keys: {script}"
+        );
+        assert!(
+            script.contains("ssh-keygen -A"),
+            "script must regenerate SSH host keys: {script}"
+        );
+        // Fresh machine-id, hostname, and dbus id.
+        assert!(script.contains("> /etc/machine-id"));
+        assert!(script.contains("> /etc/hostname"));
+        assert!(script.contains("/var/lib/dbus/machine-id"));
+        // The clone name and RNG seed are threaded through.
+        assert!(script.contains("clone-a"));
+        assert!(script.contains("deadbeef"));
+        // Guarded so it fails hard on core identity but no-ops when sshd/dbus
+        // are absent (minimal library images).
+        assert!(script.contains("set -e"));
+        assert!(script.contains("command -v ssh-keygen"));
+    }
+
+    // Fix 2 (fail-closed): an Err rejuvenation must tear the clone down and
+    // propagate the error — never leave it live/ready.
+    #[test]
+    fn rejuvenation_failure_tears_down_and_errors() {
+        let torn_down = Cell::new(false);
+        let result = fail_closed_on_rejuvenation(
+            Err(Error::agent("rejuvenate clone", "agent unreachable")),
+            || torn_down.set(true),
+        );
+        assert!(result.is_err(), "a rejuvenation failure must fail the fork");
+        assert!(
+            torn_down.get(),
+            "a rejuvenation failure must tear the clone down"
+        );
+    }
+
+    // Success path: the clone is kept (no teardown) and the fork proceeds.
+    #[test]
+    fn rejuvenation_success_keeps_clone_live() {
+        let torn_down = Cell::new(false);
+        let result = fail_closed_on_rejuvenation(Ok(()), || torn_down.set(true));
+        assert!(result.is_ok());
+        assert!(
+            !torn_down.get(),
+            "a successful rejuvenation must not tear the clone down"
+        );
+    }
 }
