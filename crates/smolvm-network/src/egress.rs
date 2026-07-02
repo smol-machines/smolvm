@@ -115,9 +115,6 @@ enum FloorMode {
     Strict,
 }
 
-/// Resolve the floor from the deployment context. Read once at policy creation
-/// (never per-packet): explicit local override wins, else fleet ⇒ strict, else
-/// the metadata-only local default.
 /// Parse an explicit `SMOLVM_EGRESS_FLOOR` value into a mode. Returns `None`
 /// for an absent/unrecognized value so the caller falls back to the inferred
 /// default. Pure (no env) so it is unit-testable.
@@ -130,6 +127,9 @@ fn parse_floor_override(v: &str) -> Option<FloorMode> {
     }
 }
 
+/// Resolve the floor from the deployment context. Read once at policy creation
+/// (never per-packet): explicit `SMOLVM_EGRESS_FLOOR` override wins, else the
+/// `ALLOW_PRIVATE` opt-out, else fleet ⇒ strict, else the metadata-only default.
 fn floor_mode() -> FloorMode {
     // Explicit override wins (highest precedence). A multi-tenant node sets
     // `SMOLVM_EGRESS_FLOOR=strict` so the floor is fail-closed and never
