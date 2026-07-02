@@ -28,6 +28,16 @@ fn digest_to_filename(digest: &str) -> Result<String> {
             ),
         )));
     }
+    // The filename becomes `layers/{hex}.tar` joined onto the staging dir, so
+    // the digest MUST be pure hex — otherwise a malicious `.smolmachine` with a
+    // digest like `sha256:../../evil` would write the layer bytes outside the
+    // staging root (path traversal). A real content digest is always hex.
+    if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(PackError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("digest is not valid hex: '{}'", digest),
+        )));
+    }
     Ok(format!("{}.tar", hex))
 }
 
@@ -722,6 +732,27 @@ pub fn crc32_file_range(path: &Path, offset: u64, size: u64) -> Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn digest_to_filename_rejects_path_traversal() {
+        // A valid hex digest is accepted.
+        assert_eq!(
+            digest_to_filename("sha256:abcdef012345").unwrap(),
+            "abcdef012345.tar"
+        );
+        // Non-hex / traversal digests are rejected before becoming a path.
+        for bad in [
+            "sha256:../../../../etc/evil",
+            "sha256:..%2f..%2fevil",
+            "sha256:abc/def/ghij",
+            "sha256:abcdefabcdeZ",
+        ] {
+            assert!(
+                digest_to_filename(bad).is_err(),
+                "should reject non-hex digest: {bad}"
+            );
+        }
+    }
 
     #[test]
     fn test_find_last_data_byte_all_zero() {

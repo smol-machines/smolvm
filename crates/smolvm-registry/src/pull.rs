@@ -62,6 +62,12 @@ pub async fn pull(
     let digest = &layer.digest;
     let size = layer.size;
 
+    // Validate the digest format BEFORE it is used to build any cache filesystem
+    // path. `BlobCache::blob_path` only does `digest.replace(':', "_")`, leaving
+    // `/` and `..` intact, so an attacker-controlled manifest digest could
+    // otherwise create a `.partial` file or touch atime outside the cache dir.
+    crate::client::validate_digest(digest)?;
+
     // 3. Check cache.
     if let Some(cached_path) = cache.get(digest) {
         tracing::info!(digest = %digest, "blob found in cache");
