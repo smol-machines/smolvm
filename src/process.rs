@@ -1866,6 +1866,61 @@ pub fn kill_verified(pid: Pid, start_time: Option<u64>) -> bool {
     }
 }
 
+/// Identity fallback for our own VM subprocess when start-time can't be verified.
+///
+/// A live VM is `smolvm-bin _boot-vm <this-vm>/boot-config.json`; that config
+/// path is unique per VM, so an alive PID whose argv contains it is unambiguously
+/// our VM — a recycled PID belonging to an unrelated process could not carry that
+/// exact argument. Lets a teardown confidently kill a VM whose agent vsock is
+/// wedged (so no shutdown ack) and whose start-time record is missing, instead of
+/// leaking it as an untracked orphan. Returns false if the PID is dead or its
+/// argv can't be read / doesn't match.
+pub fn cmdline_contains(pid: Pid, needle: &str) -> bool {
+    if needle.is_empty() || !is_alive(pid) {
+        return false;
+    }
+    match read_cmdline(pid) {
+        Some(cmd) => cmd.contains(needle),
+        None => false,
+    }
+}
+
+/// Read a process's argv as a single space-joined string (best-effort).
+#[cfg(target_os = "linux")]
+fn read_cmdline(pid: Pid) -> Option<String> {
+    // /proc/<pid>/cmdline is NUL-separated argv; join with spaces so a
+    // `contains` on a path substring works regardless of arg boundaries.
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    if raw.is_empty() {
+        return None;
+    }
+    Some(
+        raw.split(|b| *b == 0)
+            .map(|s| String::from_utf8_lossy(s))
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+/// Read a process's argv (macOS: via `ps -o command=`). Best-effort; the orphan
+/// leak this guards is Linux-prod, so macOS just needs to not misfire.
+#[cfg(not(target_os = "linux"))]
+fn read_cmdline(pid: Pid) -> Option<String> {
+    let out = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
 /// Gracefully stop a process.
 ///
 /// 1. Sends SIGTERM
@@ -2784,5 +2839,43 @@ mod tests {
             process_stats(i32::MAX as Pid).is_none(),
             "stats for a non-existent PID must be None"
         );
+    }
+
+    /// A live process's argv is matchable by a unique substring, and a
+    /// non-matching needle / dead PID / empty needle all return false — the
+    /// identity fallback must be specific enough not to misfire.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn cmdline_contains_matches_only_its_own_argv() {
+        let token = format!("smolvm-cmdline-probe-{}", std::process::id());
+        // A long-lived process whose argv carries our unique token. The token is
+        // embedded in the `-c` script itself, and the trailing `; :` makes it a
+        // COMPOUND command so the shell can't exec-optimize into `sleep` (which
+        // would drop the shell's argv, and with it our token, on macOS).
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("sleep 30; : {token}"))
+            .spawn()
+            .expect("spawn sh");
+        let pid = child.id() as Pid;
+        // Give the OS a beat to expose argv.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        assert!(
+            cmdline_contains(pid, &token),
+            "argv containing the unique token must match"
+        );
+        assert!(
+            !cmdline_contains(pid, "a-token-that-is-not-in-argv"),
+            "a non-matching needle must not match"
+        );
+        assert!(
+            !cmdline_contains(pid, ""),
+            "an empty needle must never match"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(!cmdline_contains(pid, &token), "a dead PID must not match");
     }
 }

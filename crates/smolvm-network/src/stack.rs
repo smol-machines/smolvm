@@ -52,6 +52,7 @@
 
 use crate::device::VirtioNetworkDevice;
 use crate::dns;
+use crate::dns_relay::{self, DnsQuery, DnsResponse, DnsTransport};
 use crate::egress::EgressPolicy;
 use crate::icmp_relay;
 use crate::queues::NetworkFrameQueues;
@@ -72,8 +73,8 @@ use smoltcp::wire::{
     EthernetAddress, EthernetFrame, EthernetProtocol, HardwareAddress, IpAddress, IpCidr,
     IpListenEndpoint, IpProtocol, IpVersion, Ipv4Packet, Ipv6Packet, TcpPacket, UdpPacket,
 };
-use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket as HostUdpSocket};
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
@@ -226,6 +227,17 @@ fn run_network_stack(
             Arc::new(move || shutdown_queues.is_shutting_down()),
         )
     };
+    // DNS resolution is offloaded to its own thread so the blocking upstream
+    // exchange never stalls this poll loop (which owns every one of the VM's
+    // sockets). Egress policy stays here; only the raw forward is offloaded.
+    let dns_channels = {
+        let shutdown_queues = queues.clone();
+        dns_relay::start_dns_relay(
+            relay_wake.clone(),
+            Arc::new(move || shutdown_queues.is_shutting_down()),
+        )
+    };
+    let mut dns_gateway = DnsGateway::new();
 
     // The smoltcp loop is driven by poller wakeups rather than busy spinning.
     // guest_wake  -> new guest frame or shutdown
@@ -315,18 +327,38 @@ fn run_network_stack(
         // Move payloads between established smoltcp TCP sockets and host relay
         // threads, and service the DNS gateway socket.
         relays.relay_data(&mut sockets);
-        process_dns_queries(
+        // Enqueue guest DNS queries to the offload thread (or answer blocked
+        // ones locally), then deliver any answers it has produced back to the
+        // guest. Neither step blocks on the upstream resolver.
+        let mut woke_dns = false;
+        woke_dns |= dispatch_dns_udp(
             dns_socket_handle,
             &mut sockets,
             &egress,
             config.upstream_dns,
+            &mut dns_gateway,
+            &dns_channels.to_relay,
         );
-        process_dns_tcp(
+        woke_dns |= process_dns_tcp(
             &dns_tcp_handles,
             &mut dns_tcp_conns,
             &mut sockets,
             &egress,
             config.upstream_dns,
+            &mut dns_gateway,
+            &dns_channels.to_relay,
+        );
+        if woke_dns {
+            dns_channels.relay_thread_wake.wake();
+        }
+        deliver_dns_responses(
+            dns_socket_handle,
+            &dns_tcp_handles,
+            &mut dns_tcp_conns,
+            &mut sockets,
+            &egress,
+            &mut dns_gateway,
+            &dns_channels.from_relay,
         );
 
         // General UDP: forward staged guest datagrams to the relay thread,
@@ -676,154 +708,201 @@ fn relay_accepted_tcp_connection(
     }
 }
 
-fn process_dns_queries(
-    dns_socket_handle: SocketHandle,
-    sockets: &mut SocketSet<'_>,
-    egress: &EgressPolicy,
-    upstream_dns: Ipv4Addr,
-) {
-    // Phase 1 DNS model:
-    // guest UDP/53 -> smoltcp gateway socket -> host UDP socket -> upstream DNS
-    //               <-               response bytes               <-
-    let socket = sockets.get_mut::<UdpSocket>(dns_socket_handle);
-    while socket.can_recv() {
-        let (query, metadata) = match socket.recv() {
-            Ok((q, m)) => (q.to_vec(), m),
-            Err(_) => break,
-        };
-        virtio_net_log!(
-            "virtio-net: forwarding guest DNS query guest={} local_address={:?} query_len={} upstream_dns={}",
-            metadata.endpoint,
-            metadata.local_address,
-            query.len(),
-            upstream_dns
-        );
-        // Apply the same allow-host filter as TCP (see `filtered_dns_response`),
-        // forwarding allowed queries over the host's UDP stack.
-        let response =
-            match filtered_dns_response(&query, egress, |q| forward_dns_query(upstream_dns, q)) {
-                Some(response) => response,
-                None => continue,
-            };
-        virtio_net_log!(
-            "virtio-net: forwarded DNS response back to guest guest={} response_len={}",
-            metadata.endpoint,
-            response.len()
-        );
+/// Bound on outstanding forwarded DNS queries (UDP context) awaiting an answer
+/// from the offload thread. Every enqueued query eventually yields a response
+/// (answer or timeout) that clears its entry, so this is only a safety ceiling
+/// against a wedged relay; DNS volume is far below it in practice.
+const MAX_PENDING_DNS: usize = 512;
 
-        let response_meta = UdpMetadata {
-            endpoint: metadata.endpoint,
-            local_address: metadata.local_address,
-            meta: Default::default(),
-        };
-        let _ = socket.send_slice(&response, response_meta);
+/// Poll-loop-side DNS state: the id generator and the reply context for each
+/// in-flight *UDP* query. TCP context lives on the owning [`DnsTcpConn`]
+/// (`awaiting`), since a DNS/TCP query is pinned to one listener socket.
+struct DnsGateway {
+    next_id: u64,
+    pending_udp: HashMap<u64, PendingDnsUdp>,
+}
+
+/// The guest-reply context we must remember while a UDP query is off-thread.
+struct PendingDnsUdp {
+    endpoint: smoltcp::wire::IpEndpoint,
+    local_address: Option<IpAddress>,
+    /// Whether to learn A/AAAA answer records into the egress allow-list.
+    learn: bool,
+}
+
+impl DnsGateway {
+    fn new() -> Self {
+        Self {
+            next_id: 0,
+            pending_udp: HashMap::new(),
+        }
+    }
+
+    fn next_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        id
     }
 }
 
-fn forward_dns_query(upstream_dns: Ipv4Addr, query: &[u8]) -> std::io::Result<Vec<u8>> {
-    // This is intentionally a plain host UDP exchange rather than a smoltcp
-    // socket-to-socket relay. Once the guest packet reaches the gateway, the
-    // simplest MVP path is to proxy it with the host kernel's UDP stack.
-    //
-    // Rough shell equivalent:
-    //   send raw DNS message to `<upstream_dns>:53`
-    //   wait up to 2 seconds for one reply
-    let socket = HostUdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
-    socket.set_read_timeout(Some(Duration::from_secs(2)))?;
-    let local_addr = socket.local_addr()?;
-    virtio_net_log!(
-        "virtio-net: sending DNS query to upstream resolver local_addr={} upstream_dns={} query_len={}",
-        local_addr,
-        upstream_dns,
-        query.len()
-    );
-    socket.send_to(query, (upstream_dns, DNS_SOCKET_PORT))?;
-
-    let mut buffer = vec![0u8; DNS_BUFFER_BYTES];
-    let (bytes_read, _) = socket.recv_from(&mut buffer)?;
-    buffer.truncate(bytes_read);
-    virtio_net_log!(
-        "virtio-net: received DNS response from upstream resolver upstream_dns={} response_len={}",
-        upstream_dns,
-        buffer.len()
-    );
-    Ok(buffer)
+/// The decision for a single guest DNS query, made on the poll thread using the
+/// egress allow-host policy (no host I/O). Mirrors the previous inline filter.
+enum DnsDecision {
+    /// Answer the guest immediately with these raw DNS message bytes
+    /// (blocked -> NXDOMAIN, unparseable -> SERVFAIL).
+    Immediate(Vec<u8>),
+    /// Forward the query upstream via the offload thread; `learn` records the
+    /// answer's A/AAAA IPs into the egress allow-list when it returns.
+    Forward { learn: bool },
 }
 
-/// Apply the allow-host DNS policy to a single query and produce the response
-/// bytes to return to the guest, or `None` to drop (a forwarding error on an
-/// allowed query — the guest sees a normal DNS timeout).
-///
-/// Shared by the UDP and TCP gateway paths so both enforce identical policy:
-/// only allow-listed names are forwarded (`forward`); others get NXDOMAIN; an
-/// unparseable query gets SERVFAIL. Answer A/AAAA records of allowed queries are
-/// learned as temporary egress IPs so the follow-up connection passes the
-/// filter. Mirrors libkrun's TSI DNS filter.
-fn filtered_dns_response(
-    query: &[u8],
-    egress: &EgressPolicy,
-    forward: impl FnOnce(&[u8]) -> std::io::Result<Vec<u8>>,
-) -> Option<Vec<u8>> {
+/// Classify a query under the allow-host policy. When the DNS filter is
+/// inactive everything is forwarded (no learning); otherwise only allow-listed
+/// names are forwarded and learned, others get NXDOMAIN and unparseable ones
+/// SERVFAIL. Identical policy to the old `filtered_dns_response`.
+fn classify_dns_query(query: &[u8], egress: &EgressPolicy) -> DnsDecision {
     if !egress.dns_filter_active() {
-        return match forward(query) {
-            Ok(response) => Some(response),
-            Err(err) => {
-                virtio_net_log!("virtio-net: host DNS forwarding failed error={}", err);
-                None
-            }
-        };
+        return DnsDecision::Forward { learn: false };
     }
     match dns::question_name(query) {
-        Some(name) if egress.hostname_allowed(&name) => match forward(query) {
-            Ok(response) => {
-                egress.learn_ip_records(&dns::answer_ip_records(&response));
-                Some(response)
-            }
-            Err(err) => {
-                virtio_net_log!("virtio-net: host DNS forwarding failed error={}", err);
-                None
-            }
-        },
+        Some(name) if egress.hostname_allowed(&name) => DnsDecision::Forward { learn: true },
         Some(name) => {
             virtio_net_log!(
                 "virtio-net: blocking DNS query by allow-host policy name={}",
                 name
             );
-            Some(dns::error_response(query, dns::DNS_RCODE_NXDOMAIN))
+            DnsDecision::Immediate(dns::error_response(query, dns::DNS_RCODE_NXDOMAIN))
         }
-        None => Some(dns::error_response(query, dns::DNS_RCODE_SERVFAIL)),
+        None => DnsDecision::Immediate(dns::error_response(query, dns::DNS_RCODE_SERVFAIL)),
     }
 }
 
-/// Forward one DNS query to the upstream resolver over TCP (length-prefixed, per
-/// RFC 1035 §4.2.2) and return the raw response message. Synchronous host TCP
-/// exchange with a short timeout, matching the UDP path's MVP shape.
-fn forward_dns_query_tcp(upstream_dns: Ipv4Addr, query: &[u8]) -> std::io::Result<Vec<u8>> {
-    use std::io::{Error, ErrorKind};
-    let len = u16::try_from(query.len())
-        .map_err(|_| Error::new(ErrorKind::InvalidInput, "DNS query too large for TCP"))?;
-    let mut stream = std::net::TcpStream::connect_timeout(
-        &SocketAddr::new(IpAddr::V4(upstream_dns), DNS_SOCKET_PORT),
-        Duration::from_secs(2),
-    )?;
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-    stream.write_all(&len.to_be_bytes())?;
-    stream.write_all(query)?;
-    stream.flush()?;
-
-    let mut len_buf = [0u8; 2];
-    stream.read_exact(&mut len_buf)?;
-    let resp_len = u16::from_be_bytes(len_buf) as usize;
-    if resp_len == 0 || resp_len > DNS_TCP_MAX_MSG {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            "upstream DNS/TCP response length out of range",
-        ));
+/// Drain guest UDP/53 queries out of the gateway socket. Blocked queries are
+/// answered inline (no host I/O); allowed queries are handed to the DNS offload
+/// thread and their reply context remembered. Returns true if anything was
+/// enqueued (the caller then wakes the relay thread). Never blocks upstream.
+fn dispatch_dns_udp(
+    dns_socket_handle: SocketHandle,
+    sockets: &mut SocketSet<'_>,
+    egress: &EgressPolicy,
+    upstream_dns: Ipv4Addr,
+    gateway: &mut DnsGateway,
+    to_relay: &SyncSender<DnsQuery>,
+) -> bool {
+    let mut queued = false;
+    let socket = sockets.get_mut::<UdpSocket>(dns_socket_handle);
+    while socket.can_recv() {
+        // Copy out the query and the Copy reply-context fields, releasing the
+        // recv borrow before we may re-borrow the socket to answer inline.
+        let (query, endpoint, local_address) = match socket.recv() {
+            Ok((q, m)) => (q.to_vec(), m.endpoint, m.local_address),
+            Err(_) => break,
+        };
+        match classify_dns_query(&query, egress) {
+            DnsDecision::Immediate(response) => {
+                let response_meta = UdpMetadata {
+                    endpoint,
+                    local_address,
+                    meta: Default::default(),
+                };
+                let _ = socket.send_slice(&response, response_meta);
+            }
+            DnsDecision::Forward { learn } => {
+                if gateway.pending_udp.len() >= MAX_PENDING_DNS {
+                    virtio_net_log!("virtio-net: dropping guest DNS query (pending table full)");
+                    continue;
+                }
+                let id = gateway.next_id();
+                gateway.pending_udp.insert(
+                    id,
+                    PendingDnsUdp {
+                        endpoint,
+                        local_address,
+                        learn,
+                    },
+                );
+                match to_relay.try_send(DnsQuery {
+                    id,
+                    transport: DnsTransport::Udp,
+                    upstream: upstream_dns,
+                    query,
+                }) {
+                    Ok(()) => queued = true,
+                    Err(TrySendError::Full(_)) => {
+                        gateway.pending_udp.remove(&id);
+                        virtio_net_log!("virtio-net: dropping guest DNS query (relay queue full)");
+                    }
+                    Err(TrySendError::Disconnected(_)) => {
+                        gateway.pending_udp.remove(&id);
+                        return queued;
+                    }
+                }
+            }
+        }
     }
-    let mut response = vec![0u8; resp_len];
-    stream.read_exact(&mut response)?;
-    Ok(response)
+    queued
+}
+
+/// Deliver answers produced by the DNS offload thread back into the guest-facing
+/// smoltcp sockets. UDP answers are matched by id to their remembered reply
+/// context; TCP answers are matched to the listener whose connection is awaiting
+/// that id. A `None` answer (upstream error/timeout) is dropped for UDP (the
+/// guest sees a normal DNS timeout) and closes the TCP connection empty-handed.
+fn deliver_dns_responses(
+    dns_socket_handle: SocketHandle,
+    dns_tcp_handles: &[SocketHandle],
+    dns_tcp_conns: &mut [DnsTcpConn],
+    sockets: &mut SocketSet<'_>,
+    egress: &EgressPolicy,
+    gateway: &mut DnsGateway,
+    from_relay: &Receiver<DnsResponse>,
+) {
+    while let Ok(response) = from_relay.try_recv() {
+        if let Some(pending) = gateway.pending_udp.remove(&response.id) {
+            if let Some(answer) = response.answer {
+                if pending.learn {
+                    egress.learn_ip_records(&dns::answer_ip_records(&answer));
+                }
+                let socket = sockets.get_mut::<UdpSocket>(dns_socket_handle);
+                let response_meta = UdpMetadata {
+                    endpoint: pending.endpoint,
+                    local_address: pending.local_address,
+                    meta: Default::default(),
+                };
+                let _ = socket.send_slice(&answer, response_meta);
+            }
+            continue;
+        }
+
+        // Otherwise it is a DNS/TCP answer: find the awaiting listener.
+        for (handle, conn) in dns_tcp_handles.iter().zip(dns_tcp_conns.iter_mut()) {
+            match conn.awaiting {
+                Some(pending) if pending.id == response.id => {
+                    conn.awaiting = None;
+                    if let Some(answer) = response.answer {
+                        if pending.learn {
+                            egress.learn_ip_records(&dns::answer_ip_records(&answer));
+                        }
+                        frame_dns_tcp_response(conn, &answer);
+                    }
+                    conn.done = true;
+                    let socket = sockets.get_mut::<tcp::Socket>(*handle);
+                    drain_dns_tcp_tx(socket, conn);
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Append a framed (2-byte length prefix + message) DNS response to a
+/// connection's pending TX buffer.
+fn frame_dns_tcp_response(conn: &mut DnsTcpConn, response: &[u8]) {
+    if let Ok(resp_len) = u16::try_from(response.len()) {
+        conn.tx.extend_from_slice(&resp_len.to_be_bytes());
+        conn.tx.extend_from_slice(response);
+    }
 }
 
 /// Create the pool of smoltcp TCP listening sockets bound to the gateway's
@@ -859,6 +938,17 @@ struct DnsTcpConn {
     tx_sent: usize,
     /// The query has been answered (or rejected); drain `tx` then close.
     done: bool,
+    /// Set once the query has been handed to the DNS offload thread and we are
+    /// waiting for its answer (carries the correlation id + learn flag). While
+    /// set, the connection is parked — `deliver_dns_responses` completes it.
+    awaiting: Option<DnsTcpPending>,
+}
+
+/// Correlation state for a DNS/TCP query parked on the offload thread.
+#[derive(Clone, Copy)]
+struct DnsTcpPending {
+    id: u64,
+    learn: bool,
 }
 
 /// Service the DNS-over-TCP listening sockets: accept a connection, read the
@@ -871,7 +961,10 @@ fn process_dns_tcp(
     sockets: &mut SocketSet<'_>,
     egress: &EgressPolicy,
     upstream_dns: Ipv4Addr,
-) {
+    gateway: &mut DnsGateway,
+    to_relay: &SyncSender<DnsQuery>,
+) -> bool {
+    let mut queued = false;
     for (handle, conn) in handles.iter().zip(conns.iter_mut()) {
         let socket = sockets.get_mut::<tcp::Socket>(*handle);
 
@@ -880,13 +973,19 @@ fn process_dns_tcp(
         // socket is still draining (e.g. TIME-WAIT) the error is ignored and the
         // next poll retries.
         if !socket.is_open() {
-            if !conn.rx.is_empty() || !conn.tx.is_empty() || conn.done {
+            if !conn.rx.is_empty() || !conn.tx.is_empty() || conn.done || conn.awaiting.is_some() {
                 *conn = DnsTcpConn::default();
             }
             let _ = socket.listen(IpListenEndpoint {
                 addr: None,
                 port: DNS_SOCKET_PORT,
             });
+            continue;
+        }
+
+        // Parked awaiting the offload thread's answer: nothing to do here until
+        // `deliver_dns_responses` fills `tx` / sets `done`.
+        if conn.awaiting.is_some() {
             continue;
         }
 
@@ -926,19 +1025,39 @@ fn process_dns_tcp(
                     query.len(),
                     upstream_dns
                 );
-                if let Some(response) = filtered_dns_response(&query, egress, |q| {
-                    forward_dns_query_tcp(upstream_dns, q)
-                }) {
-                    if let Ok(resp_len) = u16::try_from(response.len()) {
-                        conn.tx.extend_from_slice(&resp_len.to_be_bytes());
-                        conn.tx.extend_from_slice(&response);
+                match classify_dns_query(&query, egress) {
+                    DnsDecision::Immediate(response) => {
+                        frame_dns_tcp_response(conn, &response);
+                        conn.done = true;
+                        drain_dns_tcp_tx(socket, conn);
+                    }
+                    DnsDecision::Forward { learn } => {
+                        // Hand the query to the offload thread and park the
+                        // connection; the poll loop stays free.
+                        let id = gateway.next_id();
+                        match to_relay.try_send(DnsQuery {
+                            id,
+                            transport: DnsTransport::Tcp,
+                            upstream: upstream_dns,
+                            query,
+                        }) {
+                            Ok(()) => {
+                                conn.awaiting = Some(DnsTcpPending { id, learn });
+                                queued = true;
+                            }
+                            Err(_) => {
+                                // Relay unavailable/full: close empty-handed
+                                // (guest sees EOF, then retries — DNS semantics).
+                                conn.done = true;
+                                socket.close();
+                            }
+                        }
                     }
                 }
-                conn.done = true;
-                drain_dns_tcp_tx(socket, conn);
             }
         }
     }
+    queued
 }
 
 /// Write as much of the pending framed response as the socket will accept; once

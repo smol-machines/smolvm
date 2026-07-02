@@ -1982,6 +1982,17 @@ impl AgentManager {
     /// 2. **PID start-time** — strict comparison guards against PID reuse
     ///
     /// If either method confirms identity, sends SIGTERM (then SIGKILL on timeout).
+    /// Path to this VM's `boot-config.json` — the unique per-VM argument passed to
+    /// the `_boot-vm` subprocess. Must mirror the construction at launch (next to
+    /// the storage disk) so a teardown can identify the live VM process by argv.
+    fn boot_config_path(&self) -> std::path::PathBuf {
+        self.storage_disk
+            .path()
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("/tmp"))
+            .join("boot-config.json")
+    }
+
     /// Returns `Ok(())` if the process is confirmed dead, `Err` if still alive
     /// or identity could not be verified.
     fn stop_vm_process(&self, pid: crate::process::Pid, start_time: Option<u64>) -> Result<()> {
@@ -1995,11 +2006,18 @@ impl AgentManager {
             false
         };
 
-        // Identity check: vsock acknowledgement OR strict PID start-time match.
-        // We intentionally do NOT use the lenient is_our_process() here because
-        // it treats any alive PID as "ours" when start_time is None — which risks
-        // killing an unrelated process if the OS reused the PID.
-        let identity_ok = shutdown_acked || process::is_our_process_strict(pid, start_time);
+        // Identity check: vsock acknowledgement OR strict PID start-time match OR
+        // an argv match on this VM's unique boot-config path. We intentionally do
+        // NOT use the lenient is_our_process() here because it treats any alive
+        // PID as "ours" when start_time is None — which risks killing an unrelated
+        // process if the OS reused the PID. The cmdline fallback is safe for the
+        // same reason it's specific: only our `_boot-vm <this-vm>/boot-config.json`
+        // process carries that exact path, so it recovers the case where the agent
+        // vsock is wedged (no ack) AND the start-time record is missing — the exact
+        // combination that otherwise leaks a live orphan the control can never see.
+        let identity_ok = shutdown_acked
+            || process::is_our_process_strict(pid, start_time)
+            || process::cmdline_contains(pid, &self.boot_config_path().to_string_lossy());
 
         if identity_ok {
             if !process::is_our_process_strict(pid, start_time) {
@@ -2090,12 +2108,22 @@ impl AgentManager {
                 Some((pid, start_time)) => {
                     if process::kill_verified(pid, start_time) {
                         Some(pid)
+                    } else if process::cmdline_contains(
+                        pid,
+                        &self.boot_config_path().to_string_lossy(),
+                    ) {
+                        // Start-time unverifiable, but the live PID's argv carries
+                        // this VM's unique boot-config path — unambiguously ours,
+                        // so kill it rather than leak a live orphan.
+                        process::kill(pid);
+                        Some(pid)
                     } else {
                         if process::is_alive(pid) {
                             tracing::warn!(
                                 pid,
-                                "skipping kill: pid-file PID is alive but start-time \
-                                 unverified (possible PID reuse)"
+                                "skipping kill: pid-file PID is alive but neither \
+                                 start-time nor argv identify it as ours (possible \
+                                 PID reuse)"
                             );
                         }
                         None

@@ -93,24 +93,24 @@ echo "Agent rootfs tarball: $(du -h "$DIST_DIR/agent-rootfs.tar.gz" | cut -f1)"
 # --- Pre-formatted ext4 disk templates -------------------------------------
 # Windows has no host mkfs.ext4, so the release ships pre-formatted templates
 # next to smolvm.exe (pack/create copies them instead of formatting at runtime).
+#
+# Ship them at their REAL 512 MiB size — do NOT extend to the 20/10 GiB virtual
+# sizes here. Zip has no sparse-file representation, so an extended template
+# materializes as tens of GiB of zeros on extraction (and, no longer holey, gets
+# dense-copied per machine start until the disk fills). The engine extends the
+# per-machine copy to the requested virtual size itself (copy_disk_from_template
+# marks the copy sparse and set_lens it; the guest grows the ext4 with resize2fs
+# at boot), so nothing on Windows needs a pre-extended template. The Linux/macOS
+# tarballs keep full-size templates via GNU tar --sparse (see build-dist.sh).
 if command -v mkfs.ext4 >/dev/null 2>&1; then
     echo "Creating disk templates..."
-    # Set a file's virtual (sparse) size portably — macOS lacks GNU truncate.
-    extend_sparse() { # $1=path $2=bytes
-        if command -v truncate >/dev/null 2>&1; then
-            truncate -s "$2" "$1"
-        else
-            perl -e 'truncate($ARGV[0], $ARGV[1]) or die "truncate: $!"' "$1" "$2"
-        fi
-    }
-    make_template() { # $1=path $2=label $3=virtual_bytes
+    make_template() { # $1=path $2=label
         dd if=/dev/zero of="$1" bs=1 count=0 seek=$((512 * 1024 * 1024)) 2>/dev/null
         mkfs.ext4 -F -q -m 0 -L "$2" "$1"
-        extend_sparse "$1" "$3"
     }
-    make_template "$DIST_DIR/storage-template.ext4" smolvm        $((20 * 1024 * 1024 * 1024))
-    make_template "$DIST_DIR/overlay-template.ext4" smolvm-overlay $((10 * 1024 * 1024 * 1024))
-    echo "Templates: storage (20 GiB virtual), overlay (10 GiB virtual), sparse"
+    make_template "$DIST_DIR/storage-template.ext4" smolvm
+    make_template "$DIST_DIR/overlay-template.ext4" smolvm-overlay
+    echo "Templates: storage + overlay (512 MiB each; engine extends copies to their virtual size)"
 else
     echo "Error: mkfs.ext4 not found — install e2fsprogs to build the Windows dist." >&2
     exit 1

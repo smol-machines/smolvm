@@ -1927,12 +1927,33 @@ impl AgentClient {
     ///
     /// If `propagate_initial_wouldblock` is true and WouldBlock occurs before
     /// any bytes are read, the error is propagated (preserves read timeout
-    /// behavior). Once any bytes are consumed, EAGAIN is always retried.
+    /// behavior). Once any bytes are consumed, EAGAIN is retried.
+    ///
+    /// # Stall protection
+    ///
+    /// When the socket has a read timeout configured, the retry loop is bounded
+    /// by a wall-clock *idle* deadline. Without it, a peer that writes a valid
+    /// length prefix and then stalls mid-frame (fewer body bytes than declared,
+    /// without closing) would spin this loop at 1ms forever, pinning the host
+    /// thread and the per-machine client lock and defeating every client-level
+    /// timeout. The idle deadline is reset on every byte of progress, so a
+    /// slow-but-steady body is never penalized — only a body that delivers *no*
+    /// bytes for a full read-timeout window fails, with a `TimedOut` error.
+    ///
+    /// When no read timeout is configured (interactive sessions), WouldBlock is
+    /// treated as the spurious macOS vsock EAGAIN it is meant to be, and the loop
+    /// retries indefinitely as before — there is no deadline to enforce.
     fn read_exact_retry(
         &mut self,
         buf: &mut [u8],
         propagate_initial_wouldblock: bool,
     ) -> std::io::Result<()> {
+        // Idle window: how long we tolerate zero progress before declaring a
+        // stall. Derived from the socket's configured read timeout so it tracks
+        // the caller's intent; `None` means blocking mode (no deadline).
+        let idle_window = self.stream.read_timeout().ok().flatten();
+        let mut deadline = idle_window.map(|w| std::time::Instant::now() + w);
+
         let mut pos = 0;
         while pos < buf.len() {
             match self.stream.read(&mut buf[pos..]) {
@@ -1942,13 +1963,29 @@ impl AgentClient {
                         "connection closed",
                     ));
                 }
-                Ok(n) => pos += n,
+                Ok(n) => {
+                    pos += n;
+                    // Progress made — extend the idle deadline.
+                    if let Some(w) = idle_window {
+                        deadline = Some(std::time::Instant::now() + w);
+                    }
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     if pos == 0 && propagate_initial_wouldblock {
                         // No data consumed yet and caller wants timeout errors — propagate
                         return Err(e);
                     }
-                    // Either mid-read or caller wants full retry — must retry
+                    // Mid-read (or caller wants full retry). Retry, but bail out
+                    // if the idle deadline has passed so a stalled mid-frame body
+                    // can't busy-spin forever.
+                    if let Some(d) = deadline {
+                        if std::time::Instant::now() >= d {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "timed out reading frame body: peer stalled mid-frame",
+                            ));
+                        }
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(1));
                     continue;
                 }
@@ -2001,11 +2038,50 @@ impl AgentClient {
     }
 }
 
-fn collect_exec_events<F>(client: &mut AgentClient, op: &str, mut on_event: F) -> Result<()>
+/// Cumulative byte ceiling for the streaming/collect exec path.
+///
+/// The buffered (`Completed`) exec path caps guest output inside the guest at
+/// `smolvm_agent::process::MAX_EXEC_OUTPUT` (11 MiB). The streaming path,
+/// however, relays frames one at a time and the SSE handler
+/// (`api::handlers::exec::exec_stream`) buffers the *entire* event vector in
+/// host RAM before responding. Without a cap, a chatty or infinite guest
+/// command (`yes`, `cat /dev/zero`) that emits `Stdout` frames forever and
+/// never sends `Exited` grows the host `serve` process without bound → host
+/// OOM → every co-tenant VM on the node is killed (cross-tenant DoS).
+///
+/// We mirror the buffered path's 11 MiB ceiling: once cumulative stdout+stderr
+/// crosses it, we emit a truncation error event and stop relaying (terminating
+/// the collect loop) instead of growing unbounded.
+///
+/// Semantics: this is a per-exec-session cap on the BUFFERED/relayed output of
+/// the streaming exec path. Interactive PTY sessions are long-lived by design
+/// and do NOT flow through here — they use
+/// [`AgentClient::interactive_session_io`], which streams frame-by-frame to the
+/// WebSocket without accumulating — so a legitimate long interactive session is
+/// unaffected by this cap.
+const MAX_STREAMING_EXEC_OUTPUT: usize = 11 * 1024 * 1024;
+
+fn collect_exec_events<F>(client: &mut AgentClient, op: &str, on_event: F) -> Result<()>
 where
     F: FnMut(ExecEvent),
 {
-    match client.receive()? {
+    collect_exec_events_inner(|| client.receive(), op, MAX_STREAMING_EXEC_OUTPUT, on_event)
+}
+
+/// Cap-parameterized core of [`collect_exec_events`], pulling responses from a
+/// `next_response` closure so it can be unit-tested against synthetic frame
+/// sequences with a small cap (instead of booting a VM and streaming 11 MiB).
+fn collect_exec_events_inner<N, F>(
+    mut next_response: N,
+    op: &str,
+    cap: usize,
+    mut on_event: F,
+) -> Result<()>
+where
+    N: FnMut() -> Result<AgentResponse>,
+    F: FnMut(ExecEvent),
+{
+    match next_response()? {
         AgentResponse::Started => {}
         AgentResponse::Error { message, .. } => {
             return Err(Error::agent(op, message));
@@ -2013,12 +2089,17 @@ where
         _ => return Err(Error::agent(op, "expected Started")),
     }
 
+    // Cumulative stdout+stderr bytes relayed on this session. Bounds the host
+    // buffer so a guest that never sends `Exited` can't OOM the host.
+    let mut total: usize = 0;
     loop {
-        match client.receive() {
+        match next_response() {
             Ok(AgentResponse::Stdout { data }) => {
+                total = total.saturating_add(data.len());
                 on_event(ExecEvent::Stdout(data));
             }
             Ok(AgentResponse::Stderr { data }) => {
+                total = total.saturating_add(data.len());
                 on_event(ExecEvent::Stderr(data));
             }
             Ok(AgentResponse::Exited { exit_code }) => {
@@ -2034,6 +2115,16 @@ where
                 on_event(ExecEvent::Error(err.to_string()));
                 break;
             }
+        }
+
+        // Cap check runs after relaying each frame (matching the buffered
+        // path's "send chunk, then break at the cap" order): we relay at most
+        // `cap` + one frame before terminating with a truncation signal.
+        if total >= cap {
+            on_event(ExecEvent::Error(format!(
+                "streaming output exceeded {cap} byte cap; exec terminated (output truncated)"
+            )));
+            break;
         }
     }
     Ok(())
@@ -2214,6 +2305,115 @@ mod read_cap_tests {
     fn read_cap_rejects_unexpected_response_type() {
         let err = drive(vec![AgentResponse::Pong { version: 1 }]).unwrap_err();
         assert!(format!("{}", err).contains("unexpected response"));
+    }
+}
+
+#[cfg(test)]
+mod collect_exec_cap_tests {
+    //! Regression coverage for the streaming-exec host-OOM guard.
+    //!
+    //! Proves the streaming/collect path (`collect_exec_events_inner`) stops
+    //! and emits a truncation signal once cumulative relayed output crosses the
+    //! cap, instead of buffering unbounded output from a guest that never sends
+    //! `Exited` (the `yes` / `cat /dev/zero` cross-tenant DoS).
+    use super::*;
+
+    fn stdout(n: usize) -> AgentResponse {
+        AgentResponse::Stdout { data: vec![0u8; n] }
+    }
+
+    /// Drive `collect_exec_events_inner` over a fixed response list with a
+    /// small cap, capturing the relayed events and the terminal result.
+    fn drive(cap: usize, responses: Vec<AgentResponse>) -> (Vec<ExecEvent>, Result<()>) {
+        let mut iter = responses.into_iter();
+        let mut events = Vec::new();
+        let res = collect_exec_events_inner(
+            || {
+                iter.next()
+                    .ok_or_else(|| Error::agent("test", "no more responses"))
+            },
+            "test exec",
+            cap,
+            |e| events.push(e),
+        );
+        (events, res)
+    }
+
+    const TEST_CAP: usize = 1024;
+
+    #[test]
+    fn stops_at_cumulative_cap_with_truncation_signal() {
+        // An infinite chatty stream: `Started`, then far more stdout than the
+        // cap, and crucially NEVER `Exited`. If the cap did not fire the loop
+        // would drain all 1000 frames (and in production loop forever). Because
+        // it caps, only a handful of frames are consumed before termination.
+        let half = TEST_CAP / 2;
+        let mut responses = vec![AgentResponse::Started];
+        for _ in 0..1000 {
+            responses.push(stdout(half)); // would total 500_000 bytes unbounded
+        }
+        let (events, res) = drive(TEST_CAP, responses);
+        res.expect("collect returns Ok after capping (not the iterator-drained error)");
+
+        // Terminated near the cap, nowhere near draining 1000 frames.
+        assert!(
+            events.len() < 10,
+            "expected termination near the cap, got {} events",
+            events.len()
+        );
+
+        // Final event is the truncation error.
+        match events.last().expect("at least one event") {
+            ExecEvent::Error(msg) => assert!(
+                msg.contains("byte cap") && msg.contains("truncated"),
+                "expected truncation error, got: {msg}"
+            ),
+            other => panic!("expected trailing truncation Error event, got {other:?}"),
+        }
+
+        // Relayed bytes are bounded: at most cap + one frame.
+        let relayed: usize = events
+            .iter()
+            .map(|e| match e {
+                ExecEvent::Stdout(d) | ExecEvent::Stderr(d) => d.len(),
+                _ => 0,
+            })
+            .sum();
+        assert!(
+            relayed <= TEST_CAP + half,
+            "relayed {relayed} bytes exceeds the cap+one-frame bound"
+        );
+    }
+
+    #[test]
+    fn single_oversized_frame_trips_the_cap() {
+        // One frame that alone crosses the cap: relayed once, then truncated.
+        let (events, res) = drive(TEST_CAP, vec![AgentResponse::Started, stdout(TEST_CAP + 1)]);
+        res.unwrap();
+        assert!(matches!(events.last().unwrap(), ExecEvent::Error(m) if m.contains("byte cap")));
+    }
+
+    #[test]
+    fn passes_through_under_cap_and_exits_cleanly() {
+        // Normal, well-behaved exec under the cap relays everything and ends on
+        // `Exit` with no truncation error injected.
+        let (events, res) = drive(
+            TEST_CAP,
+            vec![
+                AgentResponse::Started,
+                stdout(100),
+                AgentResponse::Stderr {
+                    data: b"warn".to_vec(),
+                },
+                AgentResponse::Exited { exit_code: 0 },
+            ],
+        );
+        res.unwrap();
+        assert_eq!(events.last().unwrap(), &ExecEvent::Exit(0));
+        assert!(
+            !events.iter().any(|e| matches!(e, ExecEvent::Error(_))),
+            "clean exec must not inject a truncation error"
+        );
     }
 }
 
@@ -2439,5 +2639,108 @@ mod run_streaming_tests {
             ]
         );
         server.join().expect("server thread joined cleanly");
+    }
+}
+
+#[cfg(test)]
+mod stalled_body_tests {
+    //! Regression for the busy-spin-forever on a stalled mid-frame body.
+    //!
+    //! A peer that writes a valid 4-byte length prefix and then delivers fewer
+    //! body bytes than declared (without closing the socket) used to pin the
+    //! host thread in a 1ms retry loop with no wall-clock bound, defeating every
+    //! client-level timeout. `read_exact_retry` now honors a wall-clock idle
+    //! deadline derived from the socket read timeout, so `receive()` must return
+    //! a timeout error promptly instead of hanging.
+    use super::*;
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn receive_times_out_on_stalled_mid_frame_body() {
+        let (client_stream, mut server_stream) = UdsStream::pair().unwrap();
+
+        // Short read timeout so the test is fast: the idle deadline tracks this.
+        let read_timeout = Duration::from_millis(150);
+        client_stream
+            .set_read_timeout(Some(read_timeout))
+            .expect("set client read timeout");
+
+        // Server: declare a 64-byte body, then send only 3 bytes and STALL —
+        // hold the socket open (never drop it) so the client never sees EOF.
+        let server = std::thread::spawn(move || {
+            let declared_len: u32 = 64;
+            server_stream
+                .write_all(&declared_len.to_be_bytes())
+                .expect("write length prefix");
+            server_stream
+                .write_all(&[1u8, 2, 3])
+                .expect("write partial body");
+            server_stream.flush().expect("flush");
+            // Stall: keep the connection open well past the client's deadline so
+            // the client cannot rely on EOF to unblock.
+            std::thread::sleep(Duration::from_secs(3));
+            drop(server_stream);
+        });
+
+        let mut client = AgentClient::from_stream(client_stream);
+
+        let start = Instant::now();
+        let result = client.receive();
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.is_err(),
+            "receive() must error on a stalled mid-frame body, not return Ok"
+        );
+        // Must return within a small multiple of the read timeout — nowhere near
+        // the server's 3s hold, proving it did not busy-spin until EOF.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "receive() should time out promptly (got {elapsed:?}); it must not \
+             spin until the peer closes"
+        );
+
+        server.join().expect("server thread joined");
+    }
+
+    #[test]
+    fn read_exact_retry_bounds_stalled_read_without_eof() {
+        // Drive read_exact_retry directly: header-style non-propagating read of a
+        // buffer larger than what the peer sends, with the peer stalling.
+        let (client_stream, mut server_stream) = UdsStream::pair().unwrap();
+        client_stream
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("set read timeout");
+
+        let server = std::thread::spawn(move || {
+            server_stream.write_all(&[0xAAu8]).expect("write one byte");
+            server_stream.flush().expect("flush");
+            std::thread::sleep(Duration::from_secs(3));
+            drop(server_stream);
+        });
+
+        let mut client = AgentClient::from_stream(client_stream);
+
+        let start = Instant::now();
+        // Ask for 8 bytes but only 1 will ever arrive; propagate=false forces the
+        // retry path (the same path receive() uses for the body).
+        let mut buf = [0u8; 8];
+        let err = client
+            .read_exact_retry(&mut buf, false)
+            .expect_err("stalled read must return a bounded error");
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::TimedOut,
+            "stalled mid-buffer read must surface a TimedOut error"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "read_exact_retry must not busy-spin until EOF (got {elapsed:?})"
+        );
+
+        server.join().expect("server thread joined");
     }
 }

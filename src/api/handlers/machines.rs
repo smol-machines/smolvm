@@ -1089,9 +1089,20 @@ pub async fn fork_machine(
             return Err(format!("failed to boot clone: {}", e));
         }
 
-        // Give the clone a fresh identity (hostname, machine-id, RNG) so it does
-        // not share the golden's random stream.
-        crate::agent::fork::rejuvenate_clone(&clone_b);
+        // Give the clone a fresh on-disk identity (hostname, machine-id, SSH
+        // host keys, RNG) so it does not carry the golden's per-machine secrets
+        // into a (possibly different) tenant. FAIL-CLOSED: if the reset can't be
+        // confirmed, tear the booted clone down and fail the fork rather than
+        // vend a clone that impersonates the golden.
+        crate::agent::fork::fail_closed_on_rejuvenation(
+            crate::agent::fork::rejuvenate_clone(&clone_b),
+            || {
+                manager.kill();
+                manager.cleanup_data_dir();
+                let _ = db.remove_vm(&clone_b);
+            },
+        )
+        .map_err(|e| format!("clone identity rejuvenation failed: {}", e))?;
 
         let pid = manager.child_pid();
         Ok::<_, String>((manager, pid, record))
