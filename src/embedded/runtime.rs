@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 use std::time::Duration;
 
-use crate::agent::ExecEvent;
+use crate::agent::{ExecEvent, RunConfig};
 use crate::config::RecordState;
 use crate::db::SmolvmDb;
 use crate::embedded::control::{self, MachineSpec};
@@ -204,6 +204,13 @@ impl EmbeddedRuntime {
         handle.read_file(path)
     }
 
+    /// The machine's image, if it is an image (container-workload) machine.
+    /// Streamed execs on such a machine must run inside its persistent container
+    /// overlay so their writes survive — matching non-streaming exec.
+    fn image_of(&self, name: &str) -> Option<String> {
+        self.db.get_vm(name).ok().flatten().and_then(|r| r.image)
+    }
+
     /// Execute a command and collect streaming output events.
     pub fn exec_streaming(
         &self,
@@ -213,9 +220,9 @@ impl EmbeddedRuntime {
         workdir: Option<String>,
         timeout: Option<Duration>,
     ) -> Result<Vec<ExecEvent>> {
-        let handle = self.started_handle(name)?;
-        let mut handle = lock_handle(&handle)?;
-        handle.exec_streaming(command, env, workdir, timeout)
+        let mut events = Vec::new();
+        self.exec_streaming_with(name, command, env, workdir, timeout, |e| events.push(e))?;
+        Ok(events)
     }
 
     /// Execute a command, delivering streaming output events LIVE via the
@@ -230,9 +237,24 @@ impl EmbeddedRuntime {
         timeout: Option<Duration>,
         on_event: F,
     ) -> Result<()> {
+        let image = self.image_of(name);
         let handle = self.started_handle(name)?;
         let mut handle = lock_handle(&handle)?;
-        handle.exec_streaming_with(command, env, workdir, timeout, on_event)
+        match image {
+            // Image machine: stream inside the machine's persistent container
+            // overlay so streamed installs/writes persist across execs and
+            // restarts, like non-streaming exec. Keyed by machine name.
+            Some(image) => {
+                let config = RunConfig::new(image, command)
+                    .with_env(env)
+                    .with_workdir(workdir)
+                    .with_timeout(timeout)
+                    .with_persistent_overlay(Some(name.to_string()));
+                handle.run_streaming_with(config, on_event)
+            }
+            // Bare VM: stream directly against the guest.
+            None => handle.exec_streaming_with(command, env, workdir, timeout, on_event),
+        }
     }
 
     /// Get the child PID if the machine is running.

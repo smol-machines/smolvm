@@ -99,18 +99,6 @@ impl VmHandle {
         self.client_mut()?.read_file(path)
     }
 
-    /// Execute a command with streaming stdout/stderr events.
-    pub fn exec_streaming(
-        &mut self,
-        command: Vec<String>,
-        env: Vec<(String, String)>,
-        workdir: Option<String>,
-        timeout: Option<Duration>,
-    ) -> Result<Vec<ExecEvent>> {
-        self.client_mut()?
-            .vm_exec_streaming(command, env, workdir, timeout)
-    }
-
     /// Execute a command, delivering stdout/stderr/exit events LIVE via the
     /// callback as each frame arrives (no buffering). SDKs bridge this to a
     /// language-native iterator (Python generator / JS async iterator).
@@ -124,6 +112,19 @@ impl VmHandle {
     ) -> Result<()> {
         self.client_mut()?
             .vm_exec_streaming_with(command, env, workdir, timeout, on_event)
+    }
+
+    /// Stream a command's output LIVE while running it inside the image's
+    /// container overlay (the `RunConfig` carries the persistent-overlay id).
+    /// The streaming counterpart of `run` — used for image machines so streamed
+    /// execs share the same container filesystem + persistence as non-streaming
+    /// execs, instead of running in the bare agent rootfs.
+    pub fn run_streaming_with<F: FnMut(ExecEvent)>(
+        &mut self,
+        config: RunConfig,
+        on_event: F,
+    ) -> Result<()> {
+        self.client_mut()?.run_streaming_with(config, on_event)
     }
 
     /// Stop the VM and drop the cached agent client.
