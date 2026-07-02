@@ -7,7 +7,7 @@
 
 use std::fs::{self, File};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::format::{AssetEntry, AssetInventory, LayerEntry};
 use crate::{PackError, Result};
@@ -642,6 +642,56 @@ fn find_last_data_byte(file: &mut File, logical_size: u64) -> std::io::Result<u6
     Ok(0) // Entire file is zeros
 }
 
+fn validate_archive_path(path: &Path) -> Result<()> {
+    if path.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return Err(PackError::Tar(format!(
+            "archive entry escapes output directory: {}",
+            path.display()
+        )));
+    }
+
+    Ok(())
+}
+
+fn safe_unpack_archive<R: Read>(archive: &mut tar::Archive<R>, output_dir: &Path) -> Result<()> {
+    for entry in archive
+        .entries()
+        .map_err(|e| PackError::Tar(e.to_string()))?
+    {
+        let mut entry = entry.map_err(|e| PackError::Tar(e.to_string()))?;
+        let path = entry
+            .path()
+            .map_err(|e| PackError::Tar(e.to_string()))?
+            .into_owned();
+        validate_archive_path(&path)?;
+
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_symlink() || entry_type.is_hard_link() {
+            return Err(PackError::Tar(format!(
+                "archive links are not allowed in assets: {}",
+                path.display()
+            )));
+        }
+
+        if !entry
+            .unpack_in(output_dir)
+            .map_err(|e| PackError::Tar(e.to_string()))?
+        {
+            return Err(PackError::Tar(format!(
+                "archive entry escapes output directory: {}",
+                path.display()
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 /// Decompress a zstd-compressed assets blob.
 pub fn decompress_assets(compressed: &[u8], output_dir: &Path) -> Result<()> {
     fs::create_dir_all(output_dir)?;
@@ -650,9 +700,7 @@ pub fn decompress_assets(compressed: &[u8], output_dir: &Path) -> Result<()> {
         .map_err(|e| PackError::Compression(e.to_string()))?;
     let mut archive = tar::Archive::new(decoder);
 
-    archive
-        .unpack(output_dir)
-        .map_err(|e| PackError::Tar(e.to_string()))?;
+    safe_unpack_archive(&mut archive, output_dir)?;
 
     Ok(())
 }
@@ -666,9 +714,7 @@ pub fn decompress_assets_from_file(compressed_path: &Path, output_dir: &Path) ->
         zstd::stream::Decoder::new(file).map_err(|e| PackError::Compression(e.to_string()))?;
     let mut archive = tar::Archive::new(decoder);
 
-    archive
-        .unpack(output_dir)
-        .map_err(|e| PackError::Tar(e.to_string()))?;
+    safe_unpack_archive(&mut archive, output_dir)?;
 
     Ok(())
 }
@@ -787,6 +833,89 @@ mod tests {
         assert_eq!(dst_data[0], 0x01);
         assert_eq!(dst_data[511], 0xFF);
         assert_eq!(dst_data[256], 0x00); // interior zero is preserved
+    }
+
+    #[test]
+    fn test_decompress_assets_extracts_regular_files() {
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            let mut header = tar::Header::new_gnu();
+            let content = b"hello assets";
+            header.set_path("nested/asset.txt").unwrap();
+            header.set_size(content.len() as u64);
+            header.set_cksum();
+            builder.append(&header, &content[..]).unwrap();
+            builder.finish().unwrap();
+        }
+
+        let compressed = zstd::stream::encode_all(tar_data.as_slice(), ZSTD_LEVEL).unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        decompress_assets(&compressed, temp_dir.path()).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(temp_dir.path().join("nested/asset.txt")).unwrap(),
+            "hello assets"
+        );
+    }
+
+    #[test]
+    fn test_decompress_assets_rejects_parent_paths() {
+        let mut tar_data = Vec::new();
+        {
+            let content = b"escape";
+            let mut raw_header = [0u8; 512];
+            raw_header[..14].copy_from_slice(b"../escape.txt\0");
+            raw_header[100..108].copy_from_slice(b"0000644\0");
+            raw_header[108..116].copy_from_slice(b"0000000\0");
+            raw_header[116..124].copy_from_slice(b"0000000\0");
+            raw_header[124..136].copy_from_slice(format!("{:011o}\0", content.len()).as_bytes());
+            raw_header[136..148].copy_from_slice(b"00000000000\0");
+            raw_header[148..156].fill(b' ');
+            raw_header[156] = b'0';
+            raw_header[257..263].copy_from_slice(b"ustar\0");
+            raw_header[263..265].copy_from_slice(b"00");
+            let checksum: u32 = raw_header.iter().map(|byte| u32::from(*byte)).sum();
+            raw_header[148..156].copy_from_slice(format!("{:06o}\0 ", checksum).as_bytes());
+            tar_data.extend_from_slice(&raw_header);
+            tar_data.extend_from_slice(content);
+            tar_data.resize(tar_data.len().next_multiple_of(512), 0);
+            tar_data.extend_from_slice(&[0u8; 1024]);
+        }
+
+        let compressed = zstd::stream::encode_all(tar_data.as_slice(), ZSTD_LEVEL).unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let result = decompress_assets(&compressed, temp_dir.path());
+
+        assert!(
+            matches!(result, Err(PackError::Tar(message)) if message.contains("escapes output directory"))
+        );
+        assert!(!temp_dir.path().join("../escape.txt").exists());
+    }
+
+    #[test]
+    fn test_decompress_assets_rejects_links() {
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_path("link").unwrap();
+            header.set_link_name("/etc/passwd").unwrap();
+            header.set_size(0);
+            header.set_cksum();
+            builder.append(&header, std::io::empty()).unwrap();
+            builder.finish().unwrap();
+        }
+
+        let compressed = zstd::stream::encode_all(tar_data.as_slice(), ZSTD_LEVEL).unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let result = decompress_assets(&compressed, temp_dir.path());
+
+        assert!(
+            matches!(result, Err(PackError::Tar(message)) if message.contains("links are not allowed"))
+        );
+        assert!(!temp_dir.path().join("link").exists());
     }
 
     #[test]
