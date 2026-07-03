@@ -1230,7 +1230,10 @@ mod tests {
             .iter()
             .find(|d| d.path == "/dev/kmsg")
             .expect("/dev/kmsg device present");
-        assert_eq!((kmsg.device_type.as_str(), kmsg.major, kmsg.minor), ("c", 1, 11));
+        assert_eq!(
+            (kmsg.device_type.as_str(), kmsg.major, kmsg.minor),
+            ("c", 1, 11)
+        );
     }
 
     #[test]
