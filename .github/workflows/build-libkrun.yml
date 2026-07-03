@@ -15,6 +15,11 @@ name: Build libkrun (linux, glibc 2.35)
 
 on:
   workflow_dispatch:
+    inputs:
+      rebuild_libkrunfw:
+        description: "Rebuild libkrunfw from source (full guest-kernel rebuild) instead of reusing the committed .so. Needed when a libkrunfw patch changed the guest kernel."
+        type: boolean
+        default: false
 
 jobs:
   build:
@@ -40,8 +45,18 @@ jobs:
             /opt/hostedtoolcache/CodeQL 2>/dev/null || true
           df -h / | tail -1
 
-      - name: Build libkrun (SKIP_LIBKRUNFW, GPU=1)
-        run: SKIP_LIBKRUNFW=1 GPU=1 ./scripts/build-libkrun-linux.sh
+      # By default reuse the committed libkrunfw.so (skips the multi-minute guest
+      # kernel rebuild). When a libkrunfw patch changed the guest kernel, dispatch
+      # with rebuild_libkrunfw=true so libkrunfw.so is rebuilt from the submodule
+      # source and picked up here.
+      - name: Build libkrun (GPU=1)
+        run: |
+          if [ "${{ inputs.rebuild_libkrunfw }}" = "true" ]; then
+            echo "Rebuilding libkrunfw from source"
+            GPU=1 ./scripts/build-libkrun-linux.sh
+          else
+            SKIP_LIBKRUNFW=1 GPU=1 ./scripts/build-libkrun-linux.sh
+          fi
 
       - name: Assert glibc floor <= 2.35
         run: |
