@@ -970,6 +970,22 @@ fn default_devices() -> Vec<OciDevice> {
             uid: Some(0),
             gid: Some(0),
         },
+        // /dev/kmsg - kernel log device. The kubelet (k3s/k3d, kind, most
+        // Kubernetes-in-Docker) hard-requires it and refuses to start without
+        // it ("failed to create kubelet: open /dev/kmsg: no such file or
+        // directory"). Bare VMs get it from devtmpfs, but the container /dev is
+        // built from this list, so add it here so nested Kubernetes works out
+        // of the box. Each machine is its own microVM, so exposing its kernel
+        // log to the container is not a cross-tenant concern.
+        OciDevice {
+            device_type: "c".to_string(),
+            path: "/dev/kmsg".to_string(),
+            major: 1,
+            minor: 11,
+            file_mode: Some(0o644),
+            uid: Some(0),
+            gid: Some(0),
+        },
     ]
 }
 
@@ -1204,6 +1220,17 @@ mod tests {
         assert!(spec.process.env.contains(&"HOME=/root".to_string()));
         assert!(!spec.process.terminal);
         assert!(spec.process.console_size.is_none());
+
+        // /dev/kmsg (1:11) must be in the container's device set — the kubelet
+        // (k3s/k3d, kind) refuses to start without it, so nested Kubernetes
+        // works out of the box.
+        let kmsg = spec
+            .linux
+            .devices
+            .iter()
+            .find(|d| d.path == "/dev/kmsg")
+            .expect("/dev/kmsg device present");
+        assert_eq!((kmsg.device_type.as_str(), kmsg.major, kmsg.minor), ("c", 1, 11));
     }
 
     #[test]

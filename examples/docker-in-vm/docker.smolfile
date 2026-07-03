@@ -77,6 +77,26 @@
 #
 #   smolvm machine exec -i --name docker -- docker run --rm -i alpine sh
 #
+# ── Kubernetes (K3d / kind) ───────────────────────────────────────────────────
+#
+#   The guest kernel + this setup run k3s. The engine now creates /dev/kmsg in
+#   the container /dev (the kubelet hard-requires it), so K3d works with no extra
+#   prep beyond a running dockerd:
+#
+#     smolvm machine exec --name docker -- sh -c '
+#       curl -sL https://github.com/k3d-io/k3d/releases/latest/download/k3d-linux-$(uname -m | sed s/aarch64/arm64/;s/x86_64/amd64/) -o /usr/local/bin/k3d
+#       chmod +x /usr/local/bin/k3d
+#       k3d cluster create dev --no-lb
+#       kubectl get nodes'          # -> node Ready
+#
+# ── Cloud (smolmachines) note ─────────────────────────────────────────────────
+#
+#   On the cloud platform each `exec` runs in its own mount namespace, so the
+#   `mount --bind` above is invisible to dockerd. Point docker's data-root
+#   straight at the ext4 disk instead:
+#
+#     dockerd --data-root=/storage/docker --storage-driver=overlay2
+#
 # ── Stop ─────────────────────────────────────────────────────────────────────
 #
 #   smolvm machine stop --name docker
