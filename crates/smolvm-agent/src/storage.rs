@@ -1726,8 +1726,18 @@ where
             crane_cmd.arg("--platform").arg(p);
         }
         crane_cmd.stdout(Stdio::piped());
-        // Use null for stderr to avoid deadlock (pipe buffer can fill if not consumed)
-        crane_cmd.stderr(Stdio::null());
+        // Capture crane stderr to a file (not a pipe — a file can't deadlock on a
+        // full buffer) so the real fetch failure (DNS, TLS, 4xx, redirect) is
+        // surfaced instead of a bare "crane blob failed".
+        let crane_stderr_path = layer_dir.join(".crane-stderr");
+        match std::fs::File::create(&crane_stderr_path) {
+            Ok(f) => {
+                crane_cmd.stderr(Stdio::from(f));
+            }
+            Err(_) => {
+                crane_cmd.stderr(Stdio::null());
+            }
+        }
 
         if let Some(ref td) = temp_dir {
             crane_cmd.env("DOCKER_CONFIG", td.path());
@@ -1773,8 +1783,19 @@ where
 
         // crane failure (network/auth) is the most useful error to surface, and
         // it manifests downstream as a truncated stream, so check it first.
+        let crane_stderr = std::fs::read_to_string(&crane_stderr_path).unwrap_or_default();
+        let _ = std::fs::remove_file(&crane_stderr_path);
+        let crane_stderr = crane_stderr.trim();
+
         let layer_failure = if !crane_status.success() {
-            Some(format!("crane blob failed for layer {}", layer_digest))
+            if crane_stderr.is_empty() {
+                Some(format!("crane blob failed for layer {}", layer_digest))
+            } else {
+                Some(format!(
+                    "crane blob failed for layer {}: {}",
+                    layer_digest, crane_stderr
+                ))
+            }
         } else if let Err(e) = extract_result {
             Some(format!(
                 "layer extraction failed for layer {}: {}",
