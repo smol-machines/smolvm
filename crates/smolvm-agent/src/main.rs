@@ -3593,7 +3593,11 @@ fn ensure_main_container(
     use std::path::Path;
 
     let keepalive = ResolvedLaunch {
-        command: vec!["tail".to_string(), "-f".to_string(), "/dev/null".to_string()],
+        command: vec![
+            "tail".to_string(),
+            "-f".to_string(),
+            "/dev/null".to_string(),
+        ],
         env: base_launch.env.clone(),
         workdir: base_launch.workdir.clone(),
         user: base_launch.user.clone(),
@@ -3608,8 +3612,14 @@ fn ensure_main_container(
         return Err(format!("bundle directory not found: {}", bundle_path.display()).into());
     }
 
-    let container_id =
-        write_oci_bundle(rootfs_path, &bundle_path, &keepalive, mounts, false, unprivileged)?;
+    let container_id = write_oci_bundle(
+        rootfs_path,
+        &bundle_path,
+        &keepalive,
+        mounts,
+        false,
+        unprivileged,
+    )?;
 
     let create = crun::CrunCommand::create(&bundle_path, &container_id).output()?;
     if !create.status.success() {
