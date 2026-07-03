@@ -1,6 +1,6 @@
 [package]
 name = "smolvm-network"
-version = "1.3.8"
+version = "1.3.9"
 edition = "2021"
 description = "Host-side virtio-net runtime for smolvm"
 license = "Apache-2.0"
