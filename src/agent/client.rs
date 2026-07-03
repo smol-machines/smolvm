@@ -9,9 +9,9 @@ use crate::registry::{extract_registry, rewrite_image_registry, RegistryAuth};
 use crate::settings::SmolSettings;
 use smolvm_protocol::normalize_image_ref;
 use smolvm_protocol::{
-    encode_message, AgentRequest, AgentResponse, Envelope, ImageInfo, OverlayInfo, StorageStatus,
-    FILE_TRANSFER_MAX_TOTAL, FILE_WRITE_CHUNK_SIZE, FILE_WRITE_SINGLE_SHOT_MAX, MAX_FRAME_SIZE,
-    PROTOCOL_VERSION,
+    encode_message, AgentRequest, AgentResponse, Envelope, FsNotifyEvent, ImageInfo, OverlayInfo,
+    StorageStatus, FILE_TRANSFER_MAX_TOTAL, FILE_WRITE_CHUNK_SIZE, FILE_WRITE_SINGLE_SHOT_MAX,
+    MAX_FRAME_SIZE, PROTOCOL_VERSION,
 };
 use std::io::{Read, Write};
 use std::path::Path;
@@ -599,6 +599,21 @@ impl AgentClient {
             }
             AgentResponse::Error { message, .. } => Err(Error::agent("ping", message)),
             _ => Err(Error::agent("ping", "unexpected response type")),
+        }
+    }
+
+    /// Replay host-originated filesystem changes into the guest as fsnotify
+    /// events so inotify-based watchers on `-v` mounts fire. Used by the host
+    /// [`FsNotifyWatcher`](super::FsNotifyWatcher); a stale connection surfaces as
+    /// an error the watcher treats as "VM gone, stop".
+    pub fn fsnotify(&mut self, events: Vec<FsNotifyEvent>) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        match self.request(&AgentRequest::FsNotify { events })? {
+            AgentResponse::Ok { .. } => Ok(()),
+            AgentResponse::Error { message, .. } => Err(Error::agent("fsnotify", message)),
+            _ => Err(Error::agent("fsnotify", "unexpected response type")),
         }
     }
 

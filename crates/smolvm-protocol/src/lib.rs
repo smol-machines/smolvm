@@ -135,6 +135,39 @@ pub mod cid {
     pub const ANY: u32 = u32::MAX;
 }
 
+/// fsnotify event masks, mirroring the kernel's `FS_*` bits in
+/// `include/linux/fsnotify_backend.h`. Shared by the host watcher (which maps a
+/// host filesystem event to one of these) and the guest agent (which forwards
+/// the raw bits to `/proc/smolvm-fsnotify`). Only the subset relevant to
+/// file-watching tools is defined.
+pub mod fsnotify_mask {
+    /// File was modified.
+    pub const FS_MODIFY: u32 = 0x0000_0002;
+    /// Metadata changed (chmod/chown/utimes).
+    pub const FS_ATTRIB: u32 = 0x0000_0004;
+    /// Writable file was closed.
+    pub const FS_CLOSE_WRITE: u32 = 0x0000_0008;
+    /// File was moved away from the watched dir.
+    pub const FS_MOVED_FROM: u32 = 0x0000_0040;
+    /// File was moved into the watched dir.
+    pub const FS_MOVED_TO: u32 = 0x0000_0080;
+    /// Subfile was created.
+    pub const FS_CREATE: u32 = 0x0000_0100;
+    /// Subfile was deleted.
+    pub const FS_DELETE: u32 = 0x0000_0200;
+    /// Event occurred against a directory.
+    pub const FS_ISDIR: u32 = 0x4000_0000;
+}
+
+/// A single host-originated filesystem change to replay into the guest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsNotifyEvent {
+    /// Guest-side absolute path the event occurred on (virtiofs staging path).
+    pub path: String,
+    /// `fsnotify_mask::FS_*` bitmask for the event.
+    pub mask: u32,
+}
+
 // ============================================================================
 // Agent Protocol (OCI Operations)
 // ============================================================================
@@ -145,6 +178,22 @@ pub mod cid {
 pub enum AgentRequest {
     /// Ping to check if agent is alive.
     Ping,
+
+    /// Inject host-originated fsnotify events into the guest.
+    ///
+    /// virtiofs does not deliver host-side file changes to the guest as
+    /// fsnotify/inotify events, so inotify-based hot-reload (Vite, webpack,
+    /// nodemon) never fires when a mounted file is edited on the host. The host
+    /// watches the mount source and sends the resulting events here; the agent
+    /// writes them to `/proc/smolvm-fsnotify`, which fires the matching event on
+    /// the guest inode so watchers on the (bind-mounted) container path wake up.
+    /// Each `path` is a guest-side absolute path (the virtiofs staging path),
+    /// `mask` an `fsnotify_mask::FS_*` bitmask.
+    FsNotify {
+        /// Host-originated filesystem changes to replay as guest fsnotify events.
+        #[serde(default)]
+        events: Vec<FsNotifyEvent>,
+    },
 
     /// Pull an OCI image and extract layers.
     Pull {
@@ -407,6 +456,7 @@ impl AgentRequest {
     pub fn log_summary(&self) -> String {
         match self {
             AgentRequest::Ping => "Ping".into(),
+            AgentRequest::FsNotify { events } => format!("FsNotify {{ count: {} }}", events.len()),
             AgentRequest::Pull { image, .. } => format!("Pull {{ image: {image} }}"),
             AgentRequest::Query { image, .. } => format!("Query {{ image: {image} }}"),
             AgentRequest::ListImages => "ListImages".into(),

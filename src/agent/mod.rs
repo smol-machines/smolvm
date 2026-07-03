@@ -6,6 +6,7 @@
 pub mod boot_config;
 mod client;
 pub mod fork;
+mod fsnotify_watch;
 mod krun;
 mod launcher;
 pub mod launcher_dynamic;
@@ -20,6 +21,7 @@ pub use crate::data::storage::HostMount;
 pub use client::{
     AgentClient, ExecEvent, InteractiveInput, InteractiveOutput, PullOptions, RunConfig,
 };
+pub use fsnotify_watch::FsNotifyWatcher;
 pub use krun::KrunFunctions;
 pub use launcher::{
     create_disk_overlays, find_lib_dir, launch_agent_vm, DiskOverlaySpec, LaunchConfig,

@@ -9,8 +9,8 @@
 //! Communication is via vsock on port 6000.
 
 use smolvm_protocol::{
-    error_codes, guest_env, ports, AgentRequest, AgentResponse, Envelope, RegistryAuth,
-    AGENT_READY_MARKER, LAYER_CHUNK_SIZE, PROTOCOL_VERSION,
+    error_codes, guest_env, ports, AgentRequest, AgentResponse, Envelope, FsNotifyEvent,
+    RegistryAuth, AGENT_READY_MARKER, LAYER_CHUNK_SIZE, PROTOCOL_VERSION,
 };
 use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
@@ -1711,6 +1711,48 @@ fn patch_timeout_ms(request: &mut AgentRequest, raw: &[u8]) {
 }
 
 /// Handle a single connection.
+/// Replay host-originated filesystem changes as guest fsnotify events.
+///
+/// Writes one `"<mask_hex> <path>\n"` line per event to `/proc/smolvm-fsnotify`
+/// (provided by the libkrunfw kernel patch), which resolves the path and fires
+/// the matching fsnotify event on the guest inode. Because the container's view
+/// of a `-v` mount is a bind of the same virtiofs inode, a watcher inside the
+/// container wakes up exactly as if the change had happened in the guest.
+///
+/// Best-effort: a path that no longer resolves (e.g. a delete arriving after the
+/// host watcher already saw the unlink) is skipped, not fatal. Returns the count
+/// of events that fired.
+fn handle_fsnotify(events: &[FsNotifyEvent]) -> AgentResponse {
+    const PROC_PATH: &str = "/proc/smolvm-fsnotify";
+
+    let mut file = match std::fs::OpenOptions::new().write(true).open(PROC_PATH) {
+        Ok(f) => f,
+        Err(e) => {
+            // Kernel without the patch (older libkrunfw): degrade gracefully so
+            // hosts on new + old kernels both work — the mount still serves
+            // reads, only event delivery is unavailable.
+            debug!(error = %e, "fsnotify inject unavailable ({PROC_PATH} missing)");
+            return AgentResponse::ok_with_data(
+                serde_json::json!({ "fired": 0, "supported": false }),
+            );
+        }
+    };
+
+    let mut fired = 0u32;
+    for ev in events {
+        // Each write() is one event; the kernel handler parses exactly one line.
+        let line = format!("{:x} {}\n", ev.mask, ev.path);
+        match file.write_all(line.as_bytes()) {
+            Ok(()) => fired += 1,
+            Err(e) => {
+                debug!(path = %ev.path, mask = ev.mask, error = %e, "fsnotify inject skipped")
+            }
+        }
+    }
+
+    AgentResponse::ok_with_data(serde_json::json!({ "fired": fired, "supported": true }))
+}
+
 fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::error::Error>> {
     let mut buf = vec![0u8; REQUEST_BUFFER_SIZE];
 
@@ -1955,6 +1997,8 @@ fn handle_request(
         AgentRequest::Ping => AgentResponse::Pong {
             version: PROTOCOL_VERSION,
         },
+
+        AgentRequest::FsNotify { events } => handle_fsnotify(&events),
 
         // Pull is handled separately in handle_streaming_pull for progress streaming
         AgentRequest::Pull { .. } => unreachable!("Pull handled before match"),

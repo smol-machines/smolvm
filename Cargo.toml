@@ -55,6 +55,9 @@ socket2 = "0.6"
 dirs = "5"
 sha2 = "0.10"
 hex = "0.4"
+# Host filesystem watcher (FSEvents on macOS, inotify on Linux) that drives
+# host→guest fsnotify propagation for -v mounts. See src/agent/fsnotify_watch.rs.
+notify = "6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 
