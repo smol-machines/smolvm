@@ -81,10 +81,14 @@ impl SmolSettings {
         Ok(home.join(".config").join("smolvm").join("config.toml"))
     }
 
-    /// Load settings from the config file, migrating from old format if needed.
+    /// Load settings from the config file, retiring any legacy config on the way.
     ///
-    /// Returns empty settings if no config file exists. Migrates legacy
-    /// `registries.toml` into the `[images]` section on first load.
+    /// Returns empty settings if no config file exists. Regardless of whether
+    /// `config.toml` already existed, a stray legacy `registries.toml` is always
+    /// swept: its entries are merged into the `[images]` section (without
+    /// clobbering anything already in `config.toml`), the merged config is
+    /// persisted, and the old file is deleted — so `config.toml` is left as the
+    /// single source of truth.
     pub fn load() -> Result<Self> {
         let config_path = match Self::config_path() {
             Ok(p) => p,
@@ -94,7 +98,7 @@ impl SmolSettings {
             }
         };
 
-        if config_path.exists() {
+        let mut settings = if config_path.exists() {
             let contents = std::fs::read_to_string(&config_path).map_err(|e| {
                 Error::config(
                     format!("read config at {}", config_path.display()),
@@ -116,39 +120,94 @@ impl SmolSettings {
                 "loaded settings"
             );
 
-            return Ok(settings);
-        }
+            settings
+        } else {
+            tracing::debug!(
+                path = %config_path.display(),
+                "config file not found, using defaults"
+            );
+            Self::default()
+        };
 
-        // Migrate from legacy registries.toml if it exists
+        // Always retire a stray legacy registries.toml, even when config.toml
+        // already exists — otherwise a pre-existing config.toml (e.g. created by
+        // a cloud login) would leave the old file orphaned on disk with its
+        // credentials intact. Best-effort: on any failure the old file is left
+        // untouched so nothing is lost.
         if let Some(dir) = config_path.parent() {
             let old_path = dir.join("registries.toml");
             if old_path.exists() {
-                tracing::info!(
-                    old = %old_path.display(),
-                    new = %config_path.display(),
-                    "migrating legacy registries.toml to config.toml"
-                );
-                if let Ok(contents) = std::fs::read_to_string(&old_path) {
-                    if let Ok(old_config) = toml::from_str::<RegistryConfig>(&contents) {
-                        let settings = SmolSettings {
-                            images: old_config,
-                            ..Default::default()
-                        };
-                        // Best-effort save; don't fail the load on write errors
-                        if let Err(e) = settings.save() {
-                            tracing::warn!(error = %e, "failed to save migrated config");
-                        }
-                        return Ok(settings);
-                    }
+                if let Err(e) = settings.absorb_legacy_registries(&old_path) {
+                    tracing::warn!(
+                        error = %e,
+                        old = %old_path.display(),
+                        "failed to retire legacy registries.toml; leaving it in place"
+                    );
                 }
             }
         }
 
-        tracing::debug!(
-            path = %config_path.display(),
-            "config file not found, using defaults"
+        Ok(settings)
+    }
+
+    /// Merge a legacy `registries.toml` into `[images]`, then remove the file.
+    ///
+    /// Host conflicts resolve in favour of the entry already present in
+    /// `config.toml` — a stale legacy credential never clobbers a newer one. The
+    /// old file is deleted only after the merged config is durably saved.
+    fn absorb_legacy_registries(&mut self, old_path: &std::path::Path) -> Result<()> {
+        let contents = std::fs::read_to_string(old_path).map_err(|e| {
+            Error::config(
+                format!("read legacy registries at {}", old_path.display()),
+                e.to_string(),
+            )
+        })?;
+        let legacy: RegistryConfig = toml::from_str(&contents).map_err(|e| {
+            Error::config(
+                format!("parse legacy registries at {}", old_path.display()),
+                e.to_string(),
+            )
+        })?;
+
+        let merged = self.merge_legacy_images(legacy);
+
+        // Persist the merged config BEFORE deleting the source, so a crash
+        // between the two never loses credentials.
+        self.save()?;
+        std::fs::remove_file(old_path).map_err(|e| {
+            Error::config(
+                format!("remove legacy registries at {}", old_path.display()),
+                e.to_string(),
+            )
+        })?;
+
+        tracing::info!(
+            merged,
+            old = %old_path.display(),
+            "retired legacy registries.toml into config.toml"
         );
-        Ok(Self::default())
+        Ok(())
+    }
+
+    /// Merge a legacy [`RegistryConfig`] into `[images]` in memory, returning the
+    /// number of newly-added entries.
+    ///
+    /// Pure (no I/O): host conflicts keep the entry already in `self.images`
+    /// (config.toml wins), and the legacy default registry is adopted only when
+    /// none is set. Split out from [`Self::absorb_legacy_registries`] so the
+    /// merge policy can be tested without touching the real config path.
+    fn merge_legacy_images(&mut self, legacy: RegistryConfig) -> usize {
+        let mut merged = 0usize;
+        for (host, entry) in legacy.registries {
+            if !self.images.registries.contains_key(&host) {
+                self.images.registries.insert(host, entry);
+                merged += 1;
+            }
+        }
+        if self.images.defaults.registry.is_none() {
+            self.images.defaults.registry = legacy.defaults.registry;
+        }
+        merged
     }
 
     /// Persist the settings back to the config file.
@@ -246,6 +305,7 @@ impl CloudSection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::RegistryEntry;
 
     #[test]
     fn default_settings_are_empty() {
@@ -420,6 +480,70 @@ api_key = "env-override-key"
         assert_eq!(reloaded.cloud.api_key.as_deref(), Some("access123"));
         assert_eq!(reloaded.cloud.refresh_token.as_deref(), Some("refresh456"));
         assert_eq!(reloaded.cloud.token_expires_at, Some(1700000000));
+    }
+
+    #[test]
+    fn merge_legacy_images_is_non_clobbering_and_adopts_default() {
+        // config.toml already has ghcr.io (a *newer* credential) and no default.
+        let mut settings = SmolSettings::default();
+        settings.images.registries.insert(
+            "ghcr.io".to_string(),
+            RegistryEntry {
+                password: Some("new-token".to_string()),
+                ..Default::default()
+            },
+        );
+
+        // Legacy registries.toml carries a stale ghcr.io plus a fresh docker.io,
+        // and sets a default registry.
+        let mut legacy = RegistryConfig::default();
+        legacy.registries.insert(
+            "ghcr.io".to_string(),
+            RegistryEntry {
+                password: Some("stale-token".to_string()),
+                ..Default::default()
+            },
+        );
+        legacy.registries.insert(
+            "docker.io".to_string(),
+            RegistryEntry {
+                password: Some("dh-token".to_string()),
+                ..Default::default()
+            },
+        );
+        legacy.defaults.registry = Some("docker.io".to_string());
+
+        let merged = settings.merge_legacy_images(legacy);
+
+        // Only docker.io was new; the stale ghcr.io must NOT overwrite the newer one.
+        assert_eq!(merged, 1);
+        assert_eq!(
+            settings.images.registries.get("ghcr.io").unwrap().password.as_deref(),
+            Some("new-token"),
+            "config.toml credential must win on conflict"
+        );
+        assert_eq!(
+            settings.images.registries.get("docker.io").unwrap().password.as_deref(),
+            Some("dh-token")
+        );
+        // Default adopted because none was set.
+        assert_eq!(settings.images.defaults.registry.as_deref(), Some("docker.io"));
+    }
+
+    #[test]
+    fn merge_legacy_images_keeps_existing_default() {
+        let mut settings = SmolSettings::default();
+        settings.images.defaults.registry = Some("keep.example.com".to_string());
+
+        let mut legacy = RegistryConfig::default();
+        legacy.defaults.registry = Some("legacy.example.com".to_string());
+
+        settings.merge_legacy_images(legacy);
+        assert_eq!(
+            settings.images.defaults.registry.as_deref(),
+            Some("keep.example.com"),
+            "an existing default must not be overwritten"
+        );
     }
 
     #[test]
