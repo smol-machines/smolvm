@@ -3575,6 +3575,73 @@ static CONSOLE_SOCKET_WORKS: std::sync::atomic::AtomicBool =
 /// allocates its own PTY that the agent has no handle on, and every
 /// resize message is silently applied to the wrong terminal. See GH
 /// #156.
+/// Establish the long-lived "main" container for a persistent overlay and return
+/// its id. PID 1 is a keep-alive (`tail -f /dev/null`, present on both busybox and
+/// coreutils) that never exits, so processes a later `crun exec` backgrounds
+/// inside it survive across exec calls for the machine's lifetime. Env / workdir /
+/// user are inherited from the image so exec'd commands see the right environment.
+/// Uses the same two-step `crun create` + `crun start` as [`handle_run_detached`]
+/// (`crun run --detach` hangs in the smolvm VM environment).
+#[cfg(target_os = "linux")]
+fn ensure_main_container(
+    rootfs: &str,
+    overlay_id: &str,
+    mounts: &[(String, String, bool)],
+    unprivileged: bool,
+    base_launch: &ResolvedLaunch,
+) -> Result<String, Box<dyn std::error::Error>> {
+    use std::path::Path;
+
+    let keepalive = ResolvedLaunch {
+        command: vec!["tail".to_string(), "-f".to_string(), "/dev/null".to_string()],
+        env: base_launch.env.clone(),
+        workdir: base_launch.workdir.clone(),
+        user: base_launch.user.clone(),
+    };
+
+    let rootfs_path = Path::new(rootfs);
+    let bundle_path = rootfs_path
+        .parent()
+        .ok_or("invalid rootfs path: no parent")?
+        .join("bundle");
+    if !bundle_path.exists() {
+        return Err(format!("bundle directory not found: {}", bundle_path.display()).into());
+    }
+
+    let container_id =
+        write_oci_bundle(rootfs_path, &bundle_path, &keepalive, mounts, false, unprivileged)?;
+
+    let create = crun::CrunCommand::create(&bundle_path, &container_id).output()?;
+    if !create.status.success() {
+        return Err(format!(
+            "keep-alive crun create failed: {}",
+            String::from_utf8_lossy(&create.stderr).trim()
+        )
+        .into());
+    }
+    let start = crun::CrunCommand::start(&container_id).output()?;
+    if !start.status.success() {
+        let _ = crun::CrunCommand::delete(&container_id, true).output();
+        return Err(format!(
+            "keep-alive crun start failed: {}",
+            String::from_utf8_lossy(&start.stderr).trim()
+        )
+        .into());
+    }
+
+    let workload_id = format!("persistent-{}", overlay_id);
+    if let Err(e) = std::fs::write(
+        paths::main_container_id_path(&workload_id),
+        container_id.as_bytes(),
+    ) {
+        let _ = crun::CrunCommand::kill(&container_id, "SIGKILL").status();
+        let _ = crun::CrunCommand::delete(&container_id, true).output();
+        return Err(format!("failed to persist main container id: {}", e).into());
+    }
+    info!(container_id = %container_id, overlay_id = %overlay_id, "established keep-alive main container for persistent machine");
+    Ok(container_id)
+}
+
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 fn spawn_interactive_command(
@@ -3597,6 +3664,24 @@ fn spawn_interactive_command(
     // If a main workload container is running for this overlay, join it.
     if let Some(cid) = resolve_main_container(persistent_overlay_id) {
         return spawn_exec_in_container(&cid, launch, tty);
+    }
+
+    // On a persistent machine with no main container yet, establish a long-lived
+    // keep-alive container (PID 1 = `tail -f /dev/null`) and exec the command INTO
+    // it, rather than running the command AS the container. Without this, PID 1 is
+    // the command itself, so the container — and anything the command backgrounds
+    // (a `dockerd`, a dev server, a k3d cluster) — is torn down the moment the
+    // command returns, and the next exec sees a fresh container. Joining a
+    // keep-alive container makes backgrounded processes survive across execs for
+    // the machine's lifetime. On failure, fall through to the fresh-container path
+    // so exec never breaks outright.
+    if let Some(overlay_id) = persistent_overlay_id {
+        match ensure_main_container(rootfs, overlay_id, mounts, unprivileged, launch) {
+            Ok(cid) => return spawn_exec_in_container(&cid, launch, tty),
+            Err(e) => {
+                warn!(error = %e, "keep-alive main container setup failed; running in a fresh container")
+            }
+        }
     }
 
     let rootfs_path = Path::new(rootfs);
