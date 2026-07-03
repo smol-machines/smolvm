@@ -4704,7 +4704,13 @@ fn run_in_keepalive_container(
         None => {
             let prepared = storage::prepare_for_run_persistent(image, overlay_id)?;
             storage::setup_mounts(&prepared.rootfs_path, mounts)?;
-            ensure_main_container(&prepared.rootfs_path, overlay_id, mounts, unprivileged, &launch)?
+            ensure_main_container(
+                &prepared.rootfs_path,
+                overlay_id,
+                mounts,
+                unprivileged,
+                &launch,
+            )?
         }
     };
 
@@ -4765,7 +4771,15 @@ fn handle_run(
     {
         if let Some(overlay_id) = persistent_overlay_id {
             match run_in_keepalive_container(
-                overlay_id, image, command, env, workdir, user, mounts, unprivileged, stdin_data,
+                overlay_id,
+                image,
+                command,
+                env,
+                workdir,
+                user,
+                mounts,
+                unprivileged,
+                stdin_data,
             ) {
                 Ok(resp) => return resp,
                 Err(e) => {
