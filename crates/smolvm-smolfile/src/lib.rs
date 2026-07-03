@@ -22,6 +22,7 @@
 //! | `cpus` | int | No | Number of vCPUs (default: 1). |
 //! | `memory` | int | No | Memory in MiB (default: 256). |
 //! | `net` | bool | No | Enable outbound networking via NAT. |
+//! | `cuda` | bool | No | Enable CUDA-over-vsock (host NVIDIA GPU). |
 //! | `storage` | int | No | Storage disk size in GiB. |
 //! | `overlay` | int | No | Overlay disk size in GiB. |
 //! | `ports` | string[] | No | Port mappings (`"host:guest"`). Prefer `[dev] ports`. |
@@ -237,6 +238,9 @@ pub struct Smolfile {
     /// GPU VRAM (shared memory region) size in MiB. Ignored unless
     /// `gpu = true`. Default comes from `DEFAULT_GPU_VRAM_MIB` (4 GiB).
     pub gpu_vram: Option<u32>,
+    /// Enable CUDA-over-vsock: remote guest CUDA Driver-API calls to the
+    /// host NVIDIA GPU. Linux-only; requires a host NVIDIA driver.
+    pub cuda: Option<bool>,
     /// Storage disk size in GiB.
     pub storage: Option<u64>,
     /// Overlay disk size in GiB.
@@ -539,6 +543,18 @@ protocol = "http"
 
         assert_eq!(sf.auth.unwrap().ssh_agent, Some(true));
         assert_eq!(sf.service.unwrap().port, Some(8080));
+    }
+
+    #[test]
+    fn parse_cuda_field() {
+        let sf = parse("cuda = true").unwrap();
+        assert_eq!(sf.cuda, Some(true));
+
+        let sf = parse("cuda = false").unwrap();
+        assert_eq!(sf.cuda, Some(false));
+
+        let sf = parse("").unwrap();
+        assert_eq!(sf.cuda, None);
     }
 
     #[test]
