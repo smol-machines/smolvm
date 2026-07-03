@@ -30,8 +30,12 @@ pub struct GpuBackend {
     device_get_count: unsafe extern "C" fn(*mut c_int) -> CuResultCode,
     device_get_name: unsafe extern "C" fn(*mut c_char, c_int, c_int) -> CuResultCode,
     device_total_mem: unsafe extern "C" fn(*mut usize, c_int) -> CuResultCode,
+    device_get: unsafe extern "C" fn(*mut c_int, c_int) -> CuResultCode,
+    device_get_attribute: unsafe extern "C" fn(*mut c_int, c_int, c_int) -> CuResultCode,
     ctx_create: unsafe extern "C" fn(*mut *mut c_void, c_uint, c_int) -> CuResultCode,
     ctx_destroy: unsafe extern "C" fn(*mut c_void) -> CuResultCode,
+    primary_ctx_retain: unsafe extern "C" fn(*mut *mut c_void, c_int) -> CuResultCode,
+    primary_ctx_release: unsafe extern "C" fn(c_int) -> CuResultCode,
     module_load_data: unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> CuResultCode,
     module_get_function:
         unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const c_char) -> CuResultCode,
@@ -76,8 +80,12 @@ impl GpuBackend {
                 device_get_count: sym(&lib, b"cuDeviceGetCount\0")?,
                 device_get_name: sym(&lib, b"cuDeviceGetName\0")?,
                 device_total_mem: sym(&lib, b"cuDeviceTotalMem_v2\0")?,
+                device_get: sym(&lib, b"cuDeviceGet\0")?,
+                device_get_attribute: sym(&lib, b"cuDeviceGetAttribute\0")?,
                 ctx_create: sym(&lib, b"cuCtxCreate_v2\0")?,
                 ctx_destroy: sym(&lib, b"cuCtxDestroy_v2\0")?,
+                primary_ctx_retain: sym(&lib, b"cuDevicePrimaryCtxRetain\0")?,
+                primary_ctx_release: sym(&lib, b"cuDevicePrimaryCtxRelease_v2\0")?,
                 module_load_data: sym(&lib, b"cuModuleLoadData\0")?,
                 module_get_function: sym(&lib, b"cuModuleGetFunction\0")?,
                 mem_alloc: sym(&lib, b"cuMemAlloc_v2\0")?,
@@ -130,6 +138,16 @@ impl Backend for GpuBackend {
         unsafe { chk((self.device_total_mem)(&mut bytes, device))? };
         Ok(bytes as u64)
     }
+    fn device_get(&mut self, ordinal: i32) -> CuResult<i32> {
+        let mut dev: c_int = 0;
+        unsafe { chk((self.device_get)(&mut dev, ordinal))? };
+        Ok(dev)
+    }
+    fn device_get_attribute(&mut self, attrib: i32, device: i32) -> CuResult<i32> {
+        let mut val: c_int = 0;
+        unsafe { chk((self.device_get_attribute)(&mut val, attrib, device))? };
+        Ok(val)
+    }
     fn ctx_create(&mut self, device: i32) -> CuResult<u64> {
         let mut ctx: *mut c_void = std::ptr::null_mut();
         unsafe { chk((self.ctx_create)(&mut ctx, 0, device))? };
@@ -137,6 +155,14 @@ impl Backend for GpuBackend {
     }
     fn ctx_destroy(&mut self, ctx: u64) -> CuResult<()> {
         unsafe { chk((self.ctx_destroy)(ctx as *mut c_void)) }
+    }
+    fn device_primary_ctx_retain(&mut self, device: i32) -> CuResult<u64> {
+        let mut ctx: *mut c_void = std::ptr::null_mut();
+        unsafe { chk((self.primary_ctx_retain)(&mut ctx, device))? };
+        Ok(ctx as u64)
+    }
+    fn device_primary_ctx_release(&mut self, device: i32) -> CuResult<()> {
+        unsafe { chk((self.primary_ctx_release)(device)) }
     }
     fn module_load_data(&mut self, image: &[u8]) -> CuResult<u64> {
         // cuModuleLoadData reads a NUL-terminated PTX string or a cubin blob.

@@ -31,8 +31,12 @@ pub trait Backend: Send {
     fn device_get_count(&mut self) -> CuResult<i32>;
     fn device_get_name(&mut self, device: i32) -> CuResult<String>;
     fn device_total_mem(&mut self, device: i32) -> CuResult<u64>;
+    fn device_get(&mut self, ordinal: i32) -> CuResult<i32>;
+    fn device_get_attribute(&mut self, attrib: i32, device: i32) -> CuResult<i32>;
     fn ctx_create(&mut self, device: i32) -> CuResult<u64>;
     fn ctx_destroy(&mut self, ctx: u64) -> CuResult<()>;
+    fn device_primary_ctx_retain(&mut self, device: i32) -> CuResult<u64>;
+    fn device_primary_ctx_release(&mut self, device: i32) -> CuResult<()>;
     fn module_load_data(&mut self, image: &[u8]) -> CuResult<u64>;
     fn module_get_function(&mut self, module: u64, name: &str) -> CuResult<u64>;
     fn mem_alloc(&mut self, bytes: u64) -> CuResult<u64>;
@@ -59,6 +63,7 @@ struct Session {
     modules: HashMap<u64, u64>,
     functions: HashMap<u64, u64>,
     contexts: HashMap<u64, u64>,
+    primary_contexts: HashMap<i32, u64>,
 }
 
 impl Session {
@@ -91,6 +96,10 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         Request::DeviceGetCount => b.device_get_count().map(Response::Count),
         Request::DeviceGetName { device } => b.device_get_name(device).map(Response::Name),
         Request::DeviceTotalMem { device } => b.device_total_mem(device).map(Response::Bytes),
+        Request::DeviceGet { ordinal } => b.device_get(ordinal).map(Response::Count),
+        Request::DeviceGetAttribute { attrib, device } => {
+            b.device_get_attribute(attrib, device).map(Response::Count)
+        }
         Request::CtxCreate { device } => {
             let raw = b.ctx_create(device)?;
             let id = sess.mint();
@@ -102,6 +111,19 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             b.ctx_destroy(raw)?;
             sess.contexts.remove(&ctx);
             Ok(Response::Ok)
+        }
+        Request::DevicePrimaryCtxRetain { device } => {
+            let raw = b.device_primary_ctx_retain(device)?;
+            let id = sess.mint();
+            sess.primary_contexts.insert(device, id);
+            sess.contexts.insert(id, raw);
+            Ok(Response::Handle(id))
+        }
+        Request::DevicePrimaryCtxRelease { device } => {
+            if let Some(id) = sess.primary_contexts.remove(&device) {
+                sess.contexts.remove(&id);
+            }
+            b.device_primary_ctx_release(device).map(|_| Response::Ok)
         }
         Request::ModuleLoadData { image } => {
             let raw = b.module_load_data(&image)?;
@@ -194,10 +216,22 @@ impl Backend for CpuBackend {
     fn device_total_mem(&mut self, _device: i32) -> CuResult<u64> {
         Ok(1 << 30)
     }
+    fn device_get(&mut self, ordinal: i32) -> CuResult<i32> {
+        if ordinal == 0 { Ok(0) } else { Err(CUDA_ERROR_INVALID_HANDLE) }
+    }
+    fn device_get_attribute(&mut self, _attrib: i32, _device: i32) -> CuResult<i32> {
+        Ok(0)
+    }
     fn ctx_create(&mut self, _device: i32) -> CuResult<u64> {
         Ok(self.handle())
     }
     fn ctx_destroy(&mut self, _ctx: u64) -> CuResult<()> {
+        Ok(())
+    }
+    fn device_primary_ctx_retain(&mut self, _device: i32) -> CuResult<u64> {
+        Ok(self.handle())
+    }
+    fn device_primary_ctx_release(&mut self, _device: i32) -> CuResult<()> {
         Ok(())
     }
     fn module_load_data(&mut self, _image: &[u8]) -> CuResult<u64> {

@@ -82,6 +82,23 @@ impl<S: Read + Write> Client<S> {
         }
     }
 
+    pub fn device_get(&mut self, ordinal: i32) -> Result<i32> {
+        match self.call(&Request::DeviceGet { ordinal }, Op::DeviceGet)? {
+            Response::Count(d) => Ok(d),
+            _ => Err(CudaRpcError::Protocol("expected Count")),
+        }
+    }
+
+    pub fn device_get_attribute(&mut self, attrib: i32, device: i32) -> Result<i32> {
+        match self.call(
+            &Request::DeviceGetAttribute { attrib, device },
+            Op::DeviceGetAttribute,
+        )? {
+            Response::Count(v) => Ok(v),
+            _ => Err(CudaRpcError::Protocol("expected Count")),
+        }
+    }
+
     pub fn ctx_create(&mut self, device: i32) -> Result<u64> {
         match self.call(&Request::CtxCreate { device }, Op::CtxCreate)? {
             Response::Handle(h) => Ok(h),
@@ -92,6 +109,24 @@ impl<S: Read + Write> Client<S> {
     pub fn ctx_destroy(&mut self, ctx: u64) -> Result<()> {
         self.call(&Request::CtxDestroy { ctx }, Op::CtxDestroy)
             .map(|_| ())
+    }
+
+    pub fn device_primary_ctx_retain(&mut self, device: i32) -> Result<u64> {
+        match self.call(
+            &Request::DevicePrimaryCtxRetain { device },
+            Op::DevicePrimaryCtxRetain,
+        )? {
+            Response::Handle(h) => Ok(h),
+            _ => Err(CudaRpcError::Protocol("expected Handle")),
+        }
+    }
+
+    pub fn device_primary_ctx_release(&mut self, device: i32) -> Result<()> {
+        self.call(
+            &Request::DevicePrimaryCtxRelease { device },
+            Op::DevicePrimaryCtxRelease,
+        )
+        .map(|_| ())
     }
 
     pub fn module_load_data(&mut self, image: &[u8]) -> Result<u64> {

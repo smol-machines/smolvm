@@ -26,8 +26,12 @@ pub enum Op {
     DeviceGetCount = 0x02,
     DeviceGetName = 0x03,
     DeviceTotalMem = 0x04,
+    DeviceGet = 0x05,
+    DeviceGetAttribute = 0x06,
     CtxCreate = 0x10,
     CtxDestroy = 0x11,
+    DevicePrimaryCtxRetain = 0x12,
+    DevicePrimaryCtxRelease = 0x13,
     ModuleLoadData = 0x20,
     ModuleGetFunction = 0x21,
     MemAlloc = 0x30,
@@ -45,8 +49,12 @@ impl Op {
             0x02 => Op::DeviceGetCount,
             0x03 => Op::DeviceGetName,
             0x04 => Op::DeviceTotalMem,
+            0x05 => Op::DeviceGet,
+            0x06 => Op::DeviceGetAttribute,
             0x10 => Op::CtxCreate,
             0x11 => Op::CtxDestroy,
+            0x12 => Op::DevicePrimaryCtxRetain,
+            0x13 => Op::DevicePrimaryCtxRelease,
             0x20 => Op::ModuleLoadData,
             0x21 => Op::ModuleGetFunction,
             0x30 => Op::MemAlloc,
@@ -71,11 +79,25 @@ pub enum Request {
     DeviceTotalMem {
         device: i32,
     },
+    DeviceGet {
+        ordinal: i32,
+    },
+    /// Query a device attribute by its integer id (CUdevice_attribute enum).
+    DeviceGetAttribute {
+        attrib: i32,
+        device: i32,
+    },
     CtxCreate {
         device: i32,
     },
     CtxDestroy {
         ctx: u64,
+    },
+    DevicePrimaryCtxRetain {
+        device: i32,
+    },
+    DevicePrimaryCtxRelease {
+        device: i32,
     },
     ModuleLoadData {
         image: Vec<u8>,
@@ -244,6 +266,15 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
             w_u8(&mut b, Op::DeviceTotalMem as u8);
             w_i32(&mut b, *device);
         }
+        Request::DeviceGet { ordinal } => {
+            w_u8(&mut b, Op::DeviceGet as u8);
+            w_i32(&mut b, *ordinal);
+        }
+        Request::DeviceGetAttribute { attrib, device } => {
+            w_u8(&mut b, Op::DeviceGetAttribute as u8);
+            w_i32(&mut b, *attrib);
+            w_i32(&mut b, *device);
+        }
         Request::CtxCreate { device } => {
             w_u8(&mut b, Op::CtxCreate as u8);
             w_i32(&mut b, *device);
@@ -251,6 +282,14 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
         Request::CtxDestroy { ctx } => {
             w_u8(&mut b, Op::CtxDestroy as u8);
             w_u64(&mut b, *ctx);
+        }
+        Request::DevicePrimaryCtxRetain { device } => {
+            w_u8(&mut b, Op::DevicePrimaryCtxRetain as u8);
+            w_i32(&mut b, *device);
+        }
+        Request::DevicePrimaryCtxRelease { device } => {
+            w_u8(&mut b, Op::DevicePrimaryCtxRelease as u8);
+            w_i32(&mut b, *device);
         }
         Request::ModuleLoadData { image } => {
             w_u8(&mut b, Op::ModuleLoadData as u8);
@@ -315,8 +354,15 @@ pub fn decode_request(payload: &[u8]) -> io::Result<Request> {
         Op::DeviceGetCount => Request::DeviceGetCount,
         Op::DeviceGetName => Request::DeviceGetName { device: c.i32()? },
         Op::DeviceTotalMem => Request::DeviceTotalMem { device: c.i32()? },
+        Op::DeviceGet => Request::DeviceGet { ordinal: c.i32()? },
+        Op::DeviceGetAttribute => Request::DeviceGetAttribute {
+            attrib: c.i32()?,
+            device: c.i32()?,
+        },
         Op::CtxCreate => Request::CtxCreate { device: c.i32()? },
         Op::CtxDestroy => Request::CtxDestroy { ctx: c.u64()? },
+        Op::DevicePrimaryCtxRetain => Request::DevicePrimaryCtxRetain { device: c.i32()? },
+        Op::DevicePrimaryCtxRelease => Request::DevicePrimaryCtxRelease { device: c.i32()? },
         Op::ModuleLoadData => Request::ModuleLoadData { image: c.bytes()? },
         Op::ModuleGetFunction => Request::ModuleGetFunction {
             module: c.u64()?,
@@ -383,10 +429,10 @@ pub fn decode_response(op: Op, payload: &[u8]) -> io::Result<(i32, Response)> {
         return Ok((status, Response::Ok));
     }
     let body = match op {
-        Op::DeviceGetCount => Response::Count(c.i32()?),
+        Op::DeviceGetCount | Op::DeviceGet | Op::DeviceGetAttribute => Response::Count(c.i32()?),
         Op::DeviceGetName => Response::Name(c.string()?),
         Op::DeviceTotalMem => Response::Bytes(c.u64()?),
-        Op::CtxCreate => Response::Handle(c.u64()?),
+        Op::CtxCreate | Op::DevicePrimaryCtxRetain => Response::Handle(c.u64()?),
         Op::ModuleLoadData | Op::ModuleGetFunction => Response::Handle(c.u64()?),
         Op::MemAlloc => Response::Dptr(c.u64()?),
         Op::MemcpyDtoH => Response::Data(c.bytes()?),
@@ -395,7 +441,8 @@ pub fn decode_response(op: Op, payload: &[u8]) -> io::Result<(i32, Response)> {
         | Op::MemFree
         | Op::MemcpyHtoD
         | Op::LaunchKernel
-        | Op::CtxSynchronize => Response::Ok,
+        | Op::CtxSynchronize
+        | Op::DevicePrimaryCtxRelease => Response::Ok,
     };
     Ok((status, body))
 }
@@ -416,8 +463,15 @@ mod tests {
         roundtrip(Request::DeviceGetCount);
         roundtrip(Request::DeviceGetName { device: 3 });
         roundtrip(Request::DeviceTotalMem { device: 0 });
+        roundtrip(Request::DeviceGet { ordinal: 0 });
+        roundtrip(Request::DeviceGetAttribute {
+            attrib: 75,
+            device: 0,
+        });
         roundtrip(Request::CtxCreate { device: 1 });
         roundtrip(Request::CtxDestroy { ctx: 0xdead_beef });
+        roundtrip(Request::DevicePrimaryCtxRetain { device: 0 });
+        roundtrip(Request::DevicePrimaryCtxRelease { device: 0 });
         roundtrip(Request::ModuleLoadData {
             image: b".version 7.0\n".to_vec(),
         });
@@ -459,7 +513,11 @@ mod tests {
                 Response::Name("NVIDIA GeForce RTX 3070".into()),
             ),
             (Op::DeviceTotalMem, Response::Bytes(8 << 30)),
+            (Op::DeviceGet, Response::Count(0)),
+            (Op::DeviceGetAttribute, Response::Count(128)),
             (Op::CtxCreate, Response::Handle(99)),
+            (Op::DevicePrimaryCtxRetain, Response::Handle(55)),
+            (Op::DevicePrimaryCtxRelease, Response::Ok),
             (Op::ModuleLoadData, Response::Handle(1)),
             (Op::MemAlloc, Response::Dptr(0x7f00_0000)),
             (Op::MemcpyDtoH, Response::Data(vec![9, 8, 7])),
