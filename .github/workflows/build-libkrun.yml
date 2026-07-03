@@ -75,3 +75,37 @@ jobs:
           name: libkrun-linux-${{ matrix.arch }}
           path: lib/linux-${{ matrix.arch }}/
           if-no-files-found: error
+
+  # Cross-build the Windows libkrunfw.dll (guest kernel wrapped for a Windows
+  # host) with mingw-w64 on Linux. The kernel builds with native gcc; only the
+  # final bundle link uses the mingw toolchain (Makefile OS=Windows path). Only
+  # runs when refreshing libkrunfw, since the .dll wraps the guest kernel.
+  windows-libkrunfw:
+    name: libkrunfw.dll (windows cross)
+    if: ${{ inputs.rebuild_libkrunfw }}
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          lfs: false
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+
+      - name: Install build + mingw toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y make gcc bc bison flex libelf-dev libssl-dev \
+            python3-pyelftools curl xz-utils cpio kmod gcc-mingw-w64-x86-64
+
+      - name: Build libkrunfw.dll (mingw cross)
+        run: cd libkrunfw && make OS=Windows -j"$(nproc)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libkrunfw-windows-x86_64
+          path: libkrunfw/libkrunfw.dll
+          if-no-files-found: error
