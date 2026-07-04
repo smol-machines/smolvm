@@ -217,7 +217,11 @@ impl Backend for CpuBackend {
         Ok(1 << 30)
     }
     fn device_get(&mut self, ordinal: i32) -> CuResult<i32> {
-        if ordinal == 0 { Ok(0) } else { Err(CUDA_ERROR_INVALID_HANDLE) }
+        if ordinal == 0 {
+            Ok(0)
+        } else {
+            Err(CUDA_ERROR_INVALID_HANDLE)
+        }
     }
     fn device_get_attribute(&mut self, _attrib: i32, _device: i32) -> CuResult<i32> {
         Ok(0)
