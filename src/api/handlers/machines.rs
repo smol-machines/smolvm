@@ -1671,11 +1671,10 @@ pub async fn export_machine(
     // still being written) can't be snapshotted into an inconsistent image.
     let name_probe = name.clone();
     let record_probe = record.clone();
-    let resolved = tokio::task::spawn_blocking(move || {
-        resolve_machine_state(&name_probe, &record_probe)
-    })
-    .await
-    .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
+    let resolved =
+        tokio::task::spawn_blocking(move || resolve_machine_state(&name_probe, &record_probe))
+            .await
+            .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
     if resolved != RecordState::Stopped {
         return Err(ApiError::Conflict(
             "machine must be stopped to export".to_string(),
@@ -1707,7 +1706,10 @@ pub async fn export_machine(
         .map_err(|e| ApiError::internal(format!("spawn pack export: {}", e)))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(ApiError::internal(format!("pack export failed: {}", stderr)));
+        return Err(ApiError::internal(format!(
+            "pack export failed: {}",
+            stderr
+        )));
     }
 
     // Read back the PackManifest from the sidecar footer for the response.
@@ -1724,8 +1726,7 @@ pub async fn export_machine(
     } else {
         format!("https://{}", req.reference_host)
     };
-    let client =
-        smolvm_registry::RegistryClient::new(base_url).with_token(req.push_token.clone());
+    let client = smolvm_registry::RegistryClient::new(base_url).with_token(req.push_token.clone());
 
     let result = smolvm_registry::push(&client, &req.repo, &req.tag, &tmp_path)
         .await
