@@ -195,6 +195,42 @@ pub struct ExecResponse {
     pub stderr: String,
 }
 
+/// Request to export a stopped machine to a `.smolmachine` and push it to a
+/// registry. The control plane mints a pre-scoped OCI bearer (`push_token`)
+/// that authorizes the write against `reference_host`.
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportRequest {
+    /// Repository to push into (e.g. `tenant/my-machine`).
+    #[schema(example = "tenant/my-machine")]
+    pub repo: String,
+    /// Tag to push under (e.g. `latest`).
+    #[schema(example = "latest")]
+    pub tag: String,
+    /// Pre-scoped OCI bearer token minted by the control plane.
+    pub push_token: String,
+    /// Registry host to push to (e.g. `registry.smolmachines.com`).
+    #[schema(example = "registry.smolmachines.com")]
+    pub reference_host: String,
+}
+
+/// Result of exporting a machine to a registry.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportResponse {
+    /// Digest of the pushed OCI manifest (reference as `repo@<digest>`).
+    #[schema(example = "sha256:abc123")]
+    pub digest: String,
+    /// Size of the `.smolmachine` sidecar blob in bytes.
+    #[schema(example = 104857600)]
+    pub size_bytes: u64,
+    /// Host platform the artifact targets (e.g. `linux/amd64`).
+    #[schema(example = "linux/amd64")]
+    pub platform: String,
+    /// The `PackManifest` JSON carried in the sidecar footer.
+    pub manifest: String,
+}
+
 /// Request to run a command in an image.
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
