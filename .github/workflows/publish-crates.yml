@@ -1,0 +1,91 @@
+name: Publish crates to crates.io
+
+# Publishes the smolvm *library* crates to crates.io so external consumers can
+# `cargo add smolvm-protocol` (etc.) at the same version as the released engine.
+#
+# The crate versions track the workspace — they're bumped in lockstep with the
+# engine — so this publishes whatever version is on the checked-out ref. Runs on
+# a version tag (the engine release) so publishing can never lapse behind a
+# release again, and on manual dispatch for a one-off catch-up.
+#
+# REQUIRES the `CARGO_REGISTRY_TOKEN` repo secret: a crates.io API token that
+# owns/can-publish the smolvm-* + smolfile crates. Without it the job skips with
+# a warning rather than failing a release.
+#
+# Publishes in dependency order (a dependency must be on crates.io before a
+# dependent's `version = "x"` requirement can resolve):
+#   smolvm-protocol, smolvm-network  (leaves)
+#   → smolvm-pack, smolvm-smolfile   (need protocol)
+#   → smolvm-registry                (needs pack)
+# smolvm-cuda / smolvm-cuda-guest are intentionally NOT published.
+
+on:
+  push:
+    tags: ["v1.*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Package + verify only (cargo publish --dry-run); don't upload."
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Never let two publish runs race on the same crate versions.
+concurrency:
+  group: publish-crates
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: publish library crates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish library crates in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+
+          if [ "${DRY_RUN:-false}" != "true" ] && [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "::warning::CARGO_REGISTRY_TOKEN is not set — skipping crates.io publish. \
+          Add the secret to enable it."
+            exit 0
+          fi
+
+          # Dependency order: a dep must be published (and indexed) before a
+          # dependent, so its `version = "x"` requirement resolves on crates.io.
+          crates=(smolvm-protocol smolvm-network smolvm-pack smolvm-smolfile smolvm-registry)
+
+          for c in "${crates[@]}"; do
+            name="$(grep -m1 '^name' "crates/$c/Cargo.toml" | sed -E 's/.*"([^"]+)".*/\1/')"
+            ver="$(grep -m1 '^version' "crates/$c/Cargo.toml" | sed -E 's/.*"([^"]+)".*/\1/')"
+            echo "::group::$name $ver"
+
+            if [ "${DRY_RUN:-false}" = "true" ]; then
+              cargo publish -p "$name" --dry-run
+              echo "::endgroup::"
+              continue
+            fi
+
+            # Idempotent: skip a version that's already on crates.io, so a re-run
+            # after a partial failure resumes instead of erroring on duplicates.
+            if curl -sf -H "User-Agent: smolvm-publish (ops@smolmachines.com)" \
+                 "https://crates.io/api/v1/crates/$name/$ver" >/dev/null 2>&1; then
+              echo "$name $ver already on crates.io — skipping"
+              echo "::endgroup::"
+              continue
+            fi
+
+            # `cargo publish` blocks until the new version is in the registry
+            # index, so the next (dependent) crate can resolve it.
+            cargo publish -p "$name"
+            echo "published $name $ver"
+            echo "::endgroup::"
+          done
