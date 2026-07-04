@@ -90,6 +90,7 @@ use state::ApiState;
         handlers::machines::delete_machine,
         handlers::machines::exec_machine,
         handlers::machines::resize_machine,
+        handlers::machines::export_machine,
     ),
     components(schemas(
         // Request types
@@ -107,6 +108,7 @@ use state::ApiState;
         types::MachineExecRequest,
         types::ResizeMachineRequest,
         types::ForkRequest,
+        types::ExportRequest,
         types::StartMachineQuery,
         // Response types
         types::HealthResponse,
@@ -115,6 +117,7 @@ use state::ApiState;
         types::MountInfo,
         types::ListMachinesResponse,
         types::ExecResponse,
+        types::ExportResponse,
         types::ImageInfo,
         types::ListImagesResponse,
         types::PullImageResponse,
@@ -173,6 +176,7 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .route("/{id}/start", post(handlers::machines::start_machine))
         .route("/{id}/fork", post(handlers::machines::fork_machine))
         .route("/{id}/stop", post(handlers::machines::stop_machine))
+        .route("/{id}/export", post(handlers::machines::export_machine))
         .route("/{id}", delete(handlers::machines::delete_machine))
         // Exec routes
         .route("/{id}/exec", post(handlers::exec::exec_command))

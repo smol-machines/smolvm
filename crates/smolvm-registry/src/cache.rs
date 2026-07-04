@@ -2,13 +2,40 @@
 //!
 //! Content-addressed storage at `~/.cache/smolvm-registry/blobs/sha256/`.
 //! Blobs are stored by their digest. LRU eviction keeps total size under a
-//! configurable limit (default 2 GB).
+//! configurable limit — default 5 GB, override with `SMOLVM_BLOB_CACHE_MAX_BYTES`.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-/// Default maximum cache size: 2 GB.
-const DEFAULT_MAX_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+/// Default maximum blob-cache size when `SMOLVM_BLOB_CACHE_MAX_BYTES` is unset: 5 GB.
+const DEFAULT_MAX_SIZE: u64 = 5 * 1024 * 1024 * 1024;
+
+/// Resolve the blob-cache byte cap from `SMOLVM_BLOB_CACHE_MAX_BYTES`, falling
+/// back to [`DEFAULT_MAX_SIZE`]. A fleet pulling multi-GB `.smolmachine`
+/// artifacts should set this well above the largest artifact (bounded by disk)
+/// so hot worlds are not re-pulled from the registry on every launch.
+fn configured_max_size() -> u64 {
+    parse_cache_limit(std::env::var("SMOLVM_BLOB_CACHE_MAX_BYTES").ok().as_deref())
+}
+
+/// Parse a byte-count cache limit, ignoring absent / unparseable / zero values.
+/// Split out from `configured_max_size` so it is unit-testable without touching
+/// the process-global environment.
+fn parse_cache_limit(val: Option<&str>) -> u64 {
+    val.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_MAX_SIZE)
+}
+
+/// True if a cache-dir entry is an in-flight `.partial` download rather than a
+/// finalized blob. A partial is being streamed by an active pull, so it must
+/// never be counted toward the cache size or evicted — deleting one makes the
+/// owning pull's `adopt` rename fail with ENOENT ("No such file or directory"),
+/// which surfaces as `registry pull failed` on large artifacts (only large ones
+/// push the cache over its cap and trigger eviction in the first place).
+fn is_partial(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()) == Some("partial")
+}
 
 /// Content-addressed blob cache.
 pub struct BlobCache {
@@ -23,7 +50,7 @@ impl BlobCache {
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no cache dir"))?
             .join("smolvm-registry")
             .join("blobs");
-        Self::open(cache_dir, DEFAULT_MAX_SIZE)
+        Self::open(cache_dir, configured_max_size())
     }
 
     /// Open or create a cache at a specific path with a size limit.
@@ -73,7 +100,7 @@ impl BlobCache {
         if self.root.exists() {
             for entry in fs::read_dir(&self.root)? {
                 let entry = entry?;
-                if entry.file_type()?.is_file() {
+                if entry.file_type()?.is_file() && !is_partial(&entry.path()) {
                     total += entry.metadata()?.len();
                 }
             }
@@ -102,7 +129,9 @@ impl BlobCache {
 
         for entry in fs::read_dir(&self.root)? {
             let entry = entry?;
-            if !entry.file_type()?.is_file() {
+            // Never evict in-flight `.partial` downloads — a concurrent pull is
+            // actively writing them; deleting one breaks its adopt with ENOENT.
+            if !entry.file_type()?.is_file() || is_partial(&entry.path()) {
                 continue;
             }
             let meta = entry.metadata()?;
@@ -221,6 +250,53 @@ mod tests {
         assert!(cache.get(d2).is_some());
         // d1 should have been evicted.
         assert!(cache.get(d1).is_none());
+    }
+
+    #[test]
+    fn evict_does_not_delete_in_flight_partial() {
+        // Regression (large-artifact "registry pull failed: No such file or
+        // directory"): under cache pressure, a pull's eviction must not delete
+        // ANOTHER concurrent pull's in-flight `.partial` download, nor its own.
+        // Before the fix, `total_size`/`evict_until` counted and removed
+        // `.partial` files, so the victim's `adopt` rename hit ENOENT. Only
+        // large artifacts trip it because only they push the cache over its cap.
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = BlobCache::open(tmp.path().to_path_buf(), 100).unwrap();
+
+        let victim = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        let pulling = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+
+        // A concurrent pull is mid-download: its large `.partial` is on disk.
+        let victim_partial = cache.blob_path_for(victim).with_extension("partial");
+        fs::write(&victim_partial, [0u8; 80]).unwrap();
+
+        // This pull finishes streaming its own large blob and adopts it — which
+        // triggers eviction because the cache dir now looks over-cap.
+        let pulling_partial = cache.blob_path_for(pulling).with_extension("partial");
+        fs::write(&pulling_partial, [0u8; 80]).unwrap();
+        let adopted = cache
+            .adopt(pulling, 80)
+            .expect("adopt must not fail — its own .partial must survive eviction");
+
+        assert!(adopted.exists(), "adopted blob missing after rename");
+        assert!(
+            victim_partial.exists(),
+            "eviction deleted another concurrent pull's in-flight .partial (the ENOENT bug)"
+        );
+    }
+
+    #[test]
+    fn cache_limit_parses_env_or_defaults() {
+        // Valid byte counts are honored.
+        assert_eq!(
+            parse_cache_limit(Some("10737418240")),
+            10 * 1024 * 1024 * 1024
+        );
+        assert_eq!(parse_cache_limit(Some("  5000000000 ")), 5_000_000_000);
+        // Absent / unparseable / zero fall back to the default.
+        assert_eq!(parse_cache_limit(None), DEFAULT_MAX_SIZE);
+        assert_eq!(parse_cache_limit(Some("garbage")), DEFAULT_MAX_SIZE);
+        assert_eq!(parse_cache_limit(Some("0")), DEFAULT_MAX_SIZE);
     }
 
     #[test]

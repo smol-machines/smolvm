@@ -85,7 +85,41 @@ impl SmolSettings {
     ///
     /// Returns empty settings if no config file exists. Migrates legacy
     /// `registries.toml` into the `[images]` section on first load.
+    /// Load settings from the config file, then overlay environment overrides
+    /// (`SMOL_CLOUD_TOKEN`). Missing/invalid config falls back to defaults.
     pub fn load() -> Result<Self> {
+        let mut settings = Self::load_from_disk()?;
+        settings.apply_env_overrides();
+        Ok(settings)
+    }
+
+    /// Overlay environment-provided credentials onto the loaded settings.
+    /// `SMOL_CLOUD_TOKEN` → `cloud.api_key` (only when not already configured),
+    /// so a CI job can authenticate the CLI — push, cloud ops — with a secret
+    /// env var alone, matching how the SDKs already read `SMOL_CLOUD_TOKEN`. A
+    /// config-file `api_key` (e.g. written by `smol login`) always wins.
+    fn apply_env_overrides(&mut self) {
+        self.apply_cloud_token(std::env::var("SMOL_CLOUD_TOKEN").ok().as_deref());
+    }
+
+    /// Pure core of the `SMOL_CLOUD_TOKEN` fallback (env read split out so it is
+    /// testable without touching process env): set `cloud.api_key` from the token
+    /// only when it is absent and the token is non-empty.
+    fn apply_cloud_token(&mut self, env_token: Option<&str>) {
+        if self.cloud.api_key.is_some() {
+            return;
+        }
+        if let Some(token) = env_token {
+            let token = token.trim();
+            if !token.is_empty() {
+                self.cloud.api_key = Some(token.to_string());
+            }
+        }
+    }
+
+    /// Load settings purely from the config file (or a legacy-format migration),
+    /// without environment overrides.
+    fn load_from_disk() -> Result<Self> {
         let config_path = match Self::config_path() {
             Ok(p) => p,
             Err(e) => {
@@ -246,6 +280,30 @@ impl CloudSection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cloud_token_env_fills_unset_api_key() {
+        let mut s = SmolSettings::default();
+        s.apply_cloud_token(Some("smk_ci_token"));
+        assert_eq!(s.cloud.api_key.as_deref(), Some("smk_ci_token"));
+    }
+
+    #[test]
+    fn config_api_key_takes_precedence_over_env() {
+        let mut s = SmolSettings::default();
+        s.cloud.api_key = Some("smk_from_config".to_string());
+        s.apply_cloud_token(Some("smk_from_env"));
+        assert_eq!(s.cloud.api_key.as_deref(), Some("smk_from_config"));
+    }
+
+    #[test]
+    fn blank_or_absent_env_token_is_ignored() {
+        let mut s = SmolSettings::default();
+        s.apply_cloud_token(Some("   "));
+        assert!(s.cloud.api_key.is_none());
+        s.apply_cloud_token(None);
+        assert!(s.cloud.api_key.is_none());
+    }
 
     #[test]
     fn default_settings_are_empty() {

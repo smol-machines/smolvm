@@ -36,9 +36,9 @@ use crate::api::state::{
     ReservationGuard,
 };
 use crate::api::types::{
-    ApiErrorResponse, CreateMachineRequest, DeleteResponse, EnvVar, ExecResponse, ForkRequest,
-    ListMachinesResponse, MachineExecRequest, MachineInfo, MountInfo, MountSpec, PortSpec,
-    ResizeMachineRequest, ResourceSpec, StartMachineQuery,
+    ApiErrorResponse, CreateMachineRequest, DeleteResponse, EnvVar, ExecResponse, ExportRequest,
+    ExportResponse, ForkRequest, ListMachinesResponse, MachineExecRequest, MachineInfo, MountInfo,
+    MountSpec, PortSpec, ResizeMachineRequest, ResourceSpec, StartMachineQuery,
 };
 use crate::api::validate_command;
 use crate::api::TraceId;
@@ -1630,6 +1630,115 @@ pub async fn resize_machine(
         })?;
 
     Ok(Json(record_to_info(&name, &record)))
+}
+
+/// Export a stopped machine to a `.smolmachine` and push it directly to a
+/// registry.
+///
+/// The machine must be stopped: exporting a running VM would snapshot an
+/// inconsistent overlay. The `.smolmachine` is produced by subprocessing this
+/// same binary's `pack create --from-vm <name>` (the tested path that boots a
+/// helper VM to export the container overlay), then streamed to the registry
+/// with the control-plane-minted, pre-scoped OCI bearer.
+#[utoipa::path(
+    post,
+    path = "/api/v1/machines/{name}/export",
+    tag = "Machines",
+    params(
+        ("name" = String, Path, description = "Machine name")
+    ),
+    request_body = ExportRequest,
+    responses(
+        (status = 200, description = "Machine exported and pushed", body = ExportResponse),
+        (status = 404, description = "Machine not found", body = ApiErrorResponse),
+        (status = 409, description = "Machine is not stopped", body = ApiErrorResponse),
+        (status = 500, description = "Export or push failed", body = ApiErrorResponse)
+    )
+)]
+pub async fn export_machine(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    Json(req): Json<ExportRequest>,
+) -> Result<Json<ExportResponse>, ApiError> {
+    // Resolve the machine record; the path id is the machine name in this API.
+    let record = state
+        .lookup_vm(&id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", id)))?;
+    let name = id;
+
+    // Require STOPPED via the shared probe so a running VM (whose overlay is
+    // still being written) can't be snapshotted into an inconsistent image.
+    let name_probe = name.clone();
+    let record_probe = record.clone();
+    let resolved =
+        tokio::task::spawn_blocking(move || resolve_machine_state(&name_probe, &record_probe))
+            .await
+            .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
+    if resolved != RecordState::Stopped {
+        return Err(ApiError::Conflict(
+            "machine must be stopped to export".to_string(),
+        ));
+    }
+
+    // Build the .smolmachine by subprocessing this binary's tested export path.
+    // The serve handlers and the pack CLI share the same on-disk SmolvmDb, so
+    // `pack create --from-vm <name>` sees the serve-managed machine.
+    let tmp = tempfile::Builder::new()
+        .suffix(".smolmachine")
+        .tempfile()
+        .map_err(|e| ApiError::internal(format!("create temp file: {}", e)))?;
+    let tmp_path = tmp.path().to_path_buf();
+    let exe =
+        std::env::current_exe().map_err(|e| ApiError::internal(format!("current_exe: {}", e)))?;
+
+    let output = tokio::process::Command::new(&exe)
+        .args([
+            "pack",
+            "create",
+            "--from-vm",
+            &name,
+            "-o",
+            &tmp_path.to_string_lossy(),
+        ])
+        .output()
+        .await
+        .map_err(|e| ApiError::internal(format!("spawn pack export: {}", e)))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(ApiError::internal(format!(
+            "pack export failed: {}",
+            stderr
+        )));
+    }
+
+    // Read back the PackManifest from the sidecar footer for the response.
+    let manifest = smolvm_pack::read_manifest_from_sidecar(&tmp_path)
+        .map_err(|e| ApiError::internal(format!("read exported manifest: {}", e)))?;
+    let manifest_json = serde_json::to_string(&manifest)
+        .map_err(|e| ApiError::internal(format!("serialize manifest: {}", e)))?;
+
+    // Push directly to the registry using the pre-scoped bearer token. The
+    // control mints a tenant-scoped OCI bearer, so use the raw token path
+    // (.with_token), not /v2/auth.
+    let base_url = if smolvm_registry::is_local_registry(&req.reference_host) {
+        format!("http://{}", req.reference_host)
+    } else {
+        format!("https://{}", req.reference_host)
+    };
+    let client = smolvm_registry::RegistryClient::new(base_url).with_token(req.push_token.clone());
+
+    let result = smolvm_registry::push(&client, &req.repo, &req.tag, &tmp_path)
+        .await
+        .map_err(|e| ApiError::internal(format!("registry push failed: {}", e)))?;
+
+    // tmp drops here, deleting the sidecar.
+    Ok(Json(ExportResponse {
+        digest: result.manifest_digest,
+        size_bytes: result.layer_size,
+        platform: result.platform,
+        manifest: manifest_json,
+    }))
 }
 
 async fn pull_from_registry(

@@ -15,6 +15,11 @@ name: Build libkrun (linux, glibc 2.35)
 
 on:
   workflow_dispatch:
+    inputs:
+      rebuild_libkrunfw:
+        description: "Rebuild libkrunfw from source (full guest-kernel rebuild) instead of reusing the committed .so. Needed when a libkrunfw patch changed the guest kernel."
+        type: boolean
+        default: false
 
 jobs:
   build:
@@ -40,8 +45,18 @@ jobs:
             /opt/hostedtoolcache/CodeQL 2>/dev/null || true
           df -h / | tail -1
 
-      - name: Build libkrun (SKIP_LIBKRUNFW, GPU=1)
-        run: SKIP_LIBKRUNFW=1 GPU=1 ./scripts/build-libkrun-linux.sh
+      # By default reuse the committed libkrunfw.so (skips the multi-minute guest
+      # kernel rebuild). When a libkrunfw patch changed the guest kernel, dispatch
+      # with rebuild_libkrunfw=true so libkrunfw.so is rebuilt from the submodule
+      # source and picked up here.
+      - name: Build libkrun (GPU=1)
+        run: |
+          if [ "${{ inputs.rebuild_libkrunfw }}" = "true" ]; then
+            echo "Rebuilding libkrunfw from source"
+            GPU=1 ./scripts/build-libkrun-linux.sh
+          else
+            SKIP_LIBKRUNFW=1 GPU=1 ./scripts/build-libkrun-linux.sh
+          fi
 
       - name: Assert glibc floor <= 2.35
         run: |
@@ -59,4 +74,38 @@ jobs:
         with:
           name: libkrun-linux-${{ matrix.arch }}
           path: lib/linux-${{ matrix.arch }}/
+          if-no-files-found: error
+
+  # Cross-build the Windows libkrunfw.dll (guest kernel wrapped for a Windows
+  # host) with mingw-w64 on Linux. The kernel builds with native gcc; only the
+  # final bundle link uses the mingw toolchain (Makefile OS=Windows path). Only
+  # runs when refreshing libkrunfw, since the .dll wraps the guest kernel.
+  windows-libkrunfw:
+    name: libkrunfw.dll (windows cross)
+    if: ${{ inputs.rebuild_libkrunfw }}
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          lfs: false
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+
+      - name: Install build + mingw toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y make gcc bc bison flex libelf-dev libssl-dev \
+            python3-pyelftools curl xz-utils cpio kmod gcc-mingw-w64-x86-64
+
+      - name: Build libkrunfw.dll (mingw cross)
+        run: cd libkrunfw && make OS=Windows -j"$(nproc)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libkrunfw-windows-x86_64
+          path: libkrunfw/libkrunfw.dll
           if-no-files-found: error
