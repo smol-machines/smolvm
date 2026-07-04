@@ -67,6 +67,25 @@ pub struct PackedLaunchConfig<'a> {
     pub console_log: PathBuf,
 }
 
+/// The `krun_add_disk2` image-format code for a disk file: `1` (qcow2) when it
+/// begins with the qcow2 magic (`QFI\xfb`), else `0` (raw). Matches
+/// `DiskFormat::to_krun_u32`. Reading the bytes keeps the format in sync with
+/// what libkrun will parse, regardless of the file's extension.
+fn krun_disk_format(path: &Path) -> u32 {
+    use std::io::Read;
+    const QCOW2_MAGIC: [u8; 4] = [0x51, 0x46, 0x49, 0xfb];
+    let mut magic = [0u8; 4];
+    let is_qcow2 = std::fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut magic))
+        .is_ok()
+        && magic == QCOW2_MAGIC;
+    if is_qcow2 {
+        1
+    } else {
+        0
+    }
+}
+
 /// Launch VM using dynamically loaded libkrun (for packed/sidecar mode).
 ///
 /// This mirrors the setup logic in `launcher.rs:launch_agent_vm()` but calls
@@ -389,14 +408,30 @@ pub fn launch_agent_vm_dynamic(
         }
     };
 
-    // Add storage disk
+    // Add storage disk. The format MUST match the on-disk image: a machine's
+    // storage/overlay can be an instant qcow2 CoW overlay, and telling libkrun a
+    // qcow2 file is raw makes it expose the tiny overlay file (~256 KiB) as the
+    // whole device, so the guest formats a tiny ext4 and image writes fail with
+    // "no space left on device". Detect the format from the file's magic so it
+    // can't drift from what libkrun parses (mirrors `launcher.rs`, which passes
+    // the disk object's `format()`).
     let block_id = cstr("storage");
     let disk_path = try_or_free_ctx!(
         path_to_cstring(config.storage_path),
         "storage path contains null byte"
     );
+    let storage_format = krun_disk_format(config.storage_path);
     // SAFETY: ctx is valid, block_id and disk_path are valid C strings
-    if unsafe { (krun.add_disk2)(ctx, block_id.as_ptr(), disk_path.as_ptr(), 0, false) } < 0 {
+    if unsafe {
+        (krun.add_disk2)(
+            ctx,
+            block_id.as_ptr(),
+            disk_path.as_ptr(),
+            storage_format,
+            false,
+        )
+    } < 0
+    {
         free_ctx_on_err!("krun_add_disk2 failed");
     }
 
@@ -405,9 +440,17 @@ pub fn launch_agent_vm_dynamic(
         let overlay_id = cstr("overlay");
         let overlay_disk =
             try_or_free_ctx!(path_to_cstring(overlay), "overlay path contains null byte");
+        let overlay_format = krun_disk_format(overlay);
         // SAFETY: ctx is valid, overlay_id and overlay_disk are valid C strings
-        if unsafe { (krun.add_disk2)(ctx, overlay_id.as_ptr(), overlay_disk.as_ptr(), 0, false) }
-            < 0
+        if unsafe {
+            (krun.add_disk2)(
+                ctx,
+                overlay_id.as_ptr(),
+                overlay_disk.as_ptr(),
+                overlay_format,
+                false,
+            )
+        } < 0
         {
             free_ctx_on_err!("krun_add_disk2 failed for overlay disk");
         }
