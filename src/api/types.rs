@@ -174,25 +174,31 @@ impl EnvVar {
 
 /// Command execution result.
 ///
-/// **Encoding note**: `stdout` and `stderr` are UTF-8 text. Non-UTF-8 bytes
-/// in the underlying command output are replaced with the Unicode
-/// replacement character (U+FFFD). This is a limitation of JSON-over-HTTP,
-/// not of smolvm itself — the agent preserves bytes end-to-end. If you need
-/// binary output (image bytes, tarballs, etc.), use the CLI `smolvm machine
-/// exec` which writes raw bytes to stdout/stderr, or pipe through `base64`
-/// inside the command.
+/// **Encoding note**: `stdout`/`stderr` are a lossy UTF-8 view (non-UTF-8 bytes
+/// become U+FFFD) kept for older clients. `stdoutB64`/`stderrB64` carry the raw,
+/// byte-exact output (base64) and should be preferred by callers that need
+/// binary-safe results (image bytes, tarballs, etc.) — the agent preserves
+/// bytes end-to-end and these fields do too.
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecResponse {
     /// Exit code.
     #[schema(example = 0)]
     pub exit_code: i32,
-    /// Standard output as UTF-8 text. Non-UTF-8 bytes → U+FFFD.
+    /// Standard output, lossy UTF-8 (non-UTF-8 bytes → U+FFFD). Prefer `stdoutB64`.
     #[schema(example = "hello\n")]
     pub stdout: String,
-    /// Standard error as UTF-8 text. Non-UTF-8 bytes → U+FFFD.
+    /// Standard error, lossy UTF-8 (non-UTF-8 bytes → U+FFFD). Prefer `stderrB64`.
     #[schema(example = "")]
     pub stderr: String,
+    /// Raw stdout bytes, base64-encoded — byte-exact, binary-safe.
+    #[serde(with = "smolvm_protocol::base64_bytes")]
+    #[schema(value_type = String)]
+    pub stdout_b64: Vec<u8>,
+    /// Raw stderr bytes, base64-encoded — byte-exact, binary-safe.
+    #[serde(with = "smolvm_protocol::base64_bytes")]
+    #[schema(value_type = String)]
+    pub stderr_b64: Vec<u8>,
 }
 
 /// Request to export a stopped machine to a `.smolmachine` and push it to a

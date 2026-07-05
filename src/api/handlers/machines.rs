@@ -1527,6 +1527,8 @@ pub async fn exec_machine(
             exit_code,
             stdout: String::from_utf8_lossy(&stdout).into_owned(),
             stderr: String::from_utf8_lossy(&stderr).into_owned(),
+            stdout_b64: stdout,
+            stderr_b64: stderr,
         })
     })
     .await
@@ -1792,7 +1794,17 @@ async fn pull_from_registry(
 
     let result = smolvm_registry::pull(&client, &repo, tag_or_digest, None, &cache)
         .await
-        .map_err(|e| ApiError::internal(format!("registry pull failed: {}", e)))?;
+        .map_err(|e| match &e {
+            // A missing image/manifest is the caller's mistake (typo'd ref, or a
+            // bare name that resolved to an empty repo) — surface it as 404, not a
+            // 500. A 500 here misreports a client error as a server fault and
+            // pollutes the fleet error-rate SLO on every bad reference.
+            smolvm_registry::RegistryError::BlobNotFound(_)
+            | smolvm_registry::RegistryError::ApiError { status: 404, .. } => {
+                ApiError::NotFound(format!("image not found in registry: {}", e))
+            }
+            _ => ApiError::internal(format!("registry pull failed: {}", e)),
+        })?;
 
     tracing::info!(path = %result.path.display(), cached = result.cached, "pull complete");
 

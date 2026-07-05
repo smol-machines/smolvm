@@ -110,9 +110,12 @@ pub async fn exec_command(
             })
             .await?
         };
+        let stdout = format!("pid={pid}\n");
         return Ok(Json(ExecResponse {
             exit_code: 0,
-            stdout: format!("pid={pid}\n"),
+            stdout_b64: stdout.clone().into_bytes(),
+            stdout,
+            stderr_b64: Vec::new(),
             stderr: String::new(),
         }));
     }
@@ -172,6 +175,8 @@ pub async fn exec_command(
         exit_code,
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        stdout_b64: stdout,
+        stderr_b64: stderr,
     }))
 }
 
@@ -357,6 +362,8 @@ pub async fn run_command(
         exit_code,
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        stdout_b64: stdout,
+        stderr_b64: stderr,
     }))
 }
 
