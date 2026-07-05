@@ -148,8 +148,13 @@ pub fn validate_command(cmd: &[String]) -> Result<(), ApiError> {
 /// `cors_origins` specifies allowed CORS origins. If empty, defaults to
 /// localhost:8080 and localhost:3000 (both http and 127.0.0.1 variants).
 pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router {
-    // Health check route
-    let health_route = Router::new().route("/health", get(handlers::health::health));
+    // Health check route. `/health` is liveness (pure-async, always answers);
+    // `/readyz` is a dispatch-path readiness probe that exercises the blocking pool
+    // so the control can detect — and cordon — a node whose start/exec are wedged
+    // even while `/health` still returns 200.
+    let health_route = Router::new()
+        .route("/health", get(handlers::health::health))
+        .route("/readyz", get(handlers::health::readyz));
 
     // Node capacity introspection (polled by a fleet node-agent over HTTP).
     let capacity_route = Router::new().route("/capacity", get(handlers::node::capacity));
