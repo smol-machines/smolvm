@@ -398,6 +398,11 @@ pub struct CapacityResponse {
     pub used_memory_mb: u64,
     /// Real disk (GB) consumed by VM storage + overlay files.
     pub used_disk_gb: u64,
+    /// Opaque id minted once per serve process. It changes iff the serve restarts
+    /// — the signal the control uses to detect that this node's warm pool (and any
+    /// in-memory VM state) was wiped, so it can prune the now-stale pool records.
+    #[serde(default)]
+    pub boot_id: String,
 }
 
 // ============================================================================

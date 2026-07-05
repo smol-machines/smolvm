@@ -8,6 +8,20 @@ use std::sync::Arc;
 use crate::api::state::ApiState;
 use crate::api::types::CapacityResponse;
 
+/// Id minted once per serve process (pid + startup nanos — unique across a restart,
+/// dependency-free). Constant for the process lifetime; a change tells the control
+/// the serve restarted and wiped its warm pool. Lazily initialized on first read.
+fn boot_id() -> &'static str {
+    static BOOT_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    BOOT_ID.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("{}-{}", std::process::id(), nanos)
+    })
+}
+
 /// Report live node capacity — current allocations + real utilization across
 /// all running machines on this host.
 ///
@@ -47,6 +61,7 @@ pub async fn capacity(State(state): State<Arc<ApiState>>) -> Response {
         used_cpus,
         used_memory_mb,
         used_disk_gb,
+        boot_id: boot_id().to_string(),
     })
     .into_response()
 }
