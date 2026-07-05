@@ -1521,7 +1521,7 @@ fn extract_oci_layer<R: std::io::Read>(reader: R, dest: &Path) -> std::io::Resul
                 | tar::EntryType::Directory => {
                     return Err(std::io::Error::new(
                         e.kind(),
-                        format!("failed to unpack '{}': {}", path.display(), e),
+                        format!("failed to unpack '{}' ({:?}): {}", path.display(), e.kind(), e),
                     ));
                 }
                 _ => {
@@ -1787,22 +1787,35 @@ where
         let _ = std::fs::remove_file(&crane_stderr_path);
         let crane_stderr = crane_stderr.trim();
 
-        let layer_failure = if !crane_status.success() {
-            if crane_stderr.is_empty() {
-                Some(format!("crane blob failed for layer {}", layer_digest))
-            } else {
-                Some(format!(
-                    "crane blob failed for layer {}: {}",
-                    layer_digest, crane_stderr
-                ))
+        // A failed extraction closes the pipe and SIGPIPEs gunzip and crane, so a
+        // non-zero crane status is often a *downstream symptom*, not the cause.
+        // Report the extraction error first (it carries the real reason — a full
+        // disk, a truncated stream, a permission fault) and keep crane's stderr as
+        // network context, so callers see the root cause instead of "crane blob
+        // failed" masking it.
+        let layer_failure = if extract_result.is_err()
+            || !crane_status.success()
+            || !gunzip_status.success()
+        {
+            let mut parts = Vec::new();
+            if let Err(e) = &extract_result {
+                parts.push(format!("extract: {}", e));
             }
-        } else if let Err(e) = extract_result {
+            if !gunzip_status.success() {
+                parts.push("gunzip exited non-zero".to_string());
+            }
+            if !crane_status.success() {
+                if crane_stderr.is_empty() {
+                    parts.push("crane exited non-zero".to_string());
+                } else {
+                    parts.push(format!("crane: {}", crane_stderr));
+                }
+            }
             Some(format!(
-                "layer extraction failed for layer {}: {}",
-                layer_digest, e
+                "failed to fetch or extract layer {}: {}",
+                layer_digest,
+                parts.join("; ")
             ))
-        } else if !gunzip_status.success() {
-            Some(format!("gunzip failed for layer {}", layer_digest))
         } else {
             None
         };
