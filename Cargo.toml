@@ -81,6 +81,8 @@ rustls-pemfile = "2"
 rustls-pki-types = "1"
 tower-http = { version = "0.6", features = ["cors", "trace", "timeout"] }
 tokio-stream = "0.1"
+# ReaderStream for streaming a cached blob from disk to a peer (GET /p2p/blob).
+tokio-util = { version = "0.7", features = ["io"] }
 parking_lot = "0.12"
 async-stream = "0.3"
 futures-util = "0.3"

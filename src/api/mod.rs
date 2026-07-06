@@ -164,6 +164,13 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
     // loopback door is localhost). See docs/lossless-serve-restart.md.
     let drain_route = Router::new().route("/drain", post(handlers::machines::drain_node));
 
+    // Brokered P2P blob serving: hand a cached layer blob to a sibling node so a
+    // create on another node can pull it from a peer instead of the registry.
+    // Read-only, content-addressed, and mTLS-gated by the listener by
+    // construction (like /drain, see the comment above). No request timeout:
+    // blobs can be large.
+    let p2p_route = Router::new().route("/p2p/blob/{digest}", get(handlers::p2p::serve_blob));
+
     // Long-lived streaming routes (no request timeout): SSE logs and the
     // interactive PTY WebSocket both outlive the 5-minute API timeout.
     let logs_route = Router::new()
@@ -270,6 +277,7 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .merge(health_route)
         .merge(capacity_route)
         .merge(drain_route)
+        .merge(p2p_route)
         .merge(metrics_route)
         .nest("/api/v1", api_v1)
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))

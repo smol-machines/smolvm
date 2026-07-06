@@ -5,11 +5,12 @@
 
 pub mod cache;
 pub mod client;
+pub mod peer;
 pub mod pull;
 pub mod push;
 
 pub use cache::BlobCache;
-pub use client::RegistryClient;
+pub use client::{validate_digest, RegistryClient};
 pub use pull::{pull, PullResult};
 pub use push::{push, PushResult};
 

@@ -1814,6 +1814,20 @@ impl PackPullCmd {
         let cache = smolvm_registry::BlobCache::open_default()
             .map_err(|e| Error::agent("open blob cache", e.to_string()))?;
 
+        // Optional brokered P2P peers for this one-shot CLI pull. Process-global
+        // env is fine here (single-shot command). Comma-separated node base URLs;
+        // empty/unset ⇒ registry-only.
+        let blob_peers: Vec<String> = std::env::var("SMOLVM_BLOB_PEERS")
+            .ok()
+            .map(|v| {
+                v.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let result = rt
             .block_on(smolvm_registry::pull(
                 &client,
@@ -1821,6 +1835,7 @@ impl PackPullCmd {
                 tag_or_digest,
                 self.output.as_deref(),
                 &cache,
+                &blob_peers,
             ))
             .map_err(|e| Error::agent("registry pull", e.to_string()))?;
 

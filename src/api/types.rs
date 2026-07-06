@@ -497,6 +497,12 @@ pub struct CreateMachineRequest {
     /// `.smolmachine`. Takes precedence over any persisted registry credential.
     #[serde(default)]
     pub registry_identity_token: Option<String>,
+    /// Brokered P2P blob peers: node base URLs (`https://<addr>:<port>`) supplied
+    /// by the control plane. On a cache miss the layer blob is fetched from a
+    /// peer's `GET /p2p/blob/<digest>` (over node→node mTLS) before the registry.
+    /// Empty (the default) ⇒ registry-only, byte-for-byte as before.
+    #[serde(default)]
+    pub blob_peers: Vec<String>,
     /// Secret refs attached to the machine. Resolved at every
     /// subsequent exec against the host's env/files. Rejected unless empty;
     /// accepted — `from_env`/`from_file` on the API surface would let

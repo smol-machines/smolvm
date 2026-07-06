@@ -58,7 +58,11 @@ async fn read_body_capped(mut resp: reqwest::Response, cap: usize, what: &str) -
 }
 
 /// Validate that a digest string matches the expected `sha256:<64 hex chars>` format.
-pub(crate) fn validate_digest(digest: &str) -> Result<()> {
+///
+/// Public so callers that build a filesystem path (e.g. the serve-side P2P blob
+/// handler) can reject a malformed, path-traversing digest at their boundary,
+/// exactly as `pull` does before touching the cache.
+pub fn validate_digest(digest: &str) -> Result<()> {
     if let Some(hex_part) = digest.strip_prefix("sha256:") {
         if hex_part.len() == 64 && hex_part.chars().all(|c| c.is_ascii_hexdigit()) {
             return Ok(());

@@ -336,8 +336,12 @@ pub async fn create_machine(
     // If registry_ref is set, pull the artifact from the registry and treat as `from`
     let mut req = req;
     if let Some(ref registry_ref) = req.registry_ref.clone() {
-        let pulled_path =
-            pull_from_registry(registry_ref, req.registry_identity_token.as_deref()).await?;
+        let pulled_path = pull_from_registry(
+            registry_ref,
+            req.registry_identity_token.as_deref(),
+            &req.blob_peers,
+        )
+        .await?;
         req.from = Some(pulled_path);
         req.registry_ref = None;
     }
@@ -1746,6 +1750,7 @@ pub async fn export_machine(
 async fn pull_from_registry(
     registry_ref: &str,
     identity_token: Option<&str>,
+    blob_peers: &[String],
 ) -> Result<String, ApiError> {
     let parsed = crate::registry::Reference::parse(registry_ref)
         .map_err(|e| ApiError::BadRequest(format!("invalid registry reference: {}", e)))?;
@@ -1792,7 +1797,7 @@ async fn pull_from_registry(
         "pulling .smolmachine from registry"
     );
 
-    let result = smolvm_registry::pull(&client, &repo, tag_or_digest, None, &cache)
+    let result = smolvm_registry::pull(&client, &repo, tag_or_digest, None, &cache, blob_peers)
         .await
         .map_err(|e| match &e {
             // A missing image/manifest is the caller's mistake (typo'd ref, or a
@@ -1996,6 +2001,7 @@ mod tests {
             from: None,
             registry_ref: None,
             registry_identity_token: None,
+            blob_peers: vec![],
             secrets: Default::default(),
         }
     }
