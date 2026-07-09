@@ -227,6 +227,16 @@ for mnt_dir in overlay storage newroot virtiofs rosetta; do
     mkdir -p "$OUTPUT_DIR/mnt/$mnt_dir"
 done
 
+# Install the pre-built Rosetta ptrace wrapper. This static binary intercepts
+# Rosetta's Virtualization.framework ioctl validation, allowing x86_64
+# translation to work under libkrun's Hypervisor.framework backend.
+# Source: scripts/rosetta/rosetta-wrapper.c
+ROSETTA_WRAPPER="$(dirname "$0")/rosetta/rosetta-wrapper"
+if [ -f "$ROSETTA_WRAPPER" ]; then
+    cp "$ROSETTA_WRAPPER" "$OUTPUT_DIR/usr/bin/rosetta-wrapper"
+    chmod 755 "$OUTPUT_DIR/usr/bin/rosetta-wrapper"
+fi
+
 # Remove existing init (it's a symlink to busybox) and replace with
 # symlink to the agent binary. The agent handles overlayfs setup +
 # pivot_root internally before starting the vsock listener.

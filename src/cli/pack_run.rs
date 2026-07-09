@@ -331,6 +331,7 @@ impl PackRunCmd {
             storage_gib,
             overlay_gib: self.overlay,
             gpu_vram_mib: None,
+            rosetta: false,
             allowed_cidrs: None,
         };
         validate_requested_network_backend(&resources, None, self.port.len())?;
@@ -1333,6 +1334,7 @@ fn run_from_cache(
         storage_gib,
         overlay_gib: args.overlay,
         gpu_vram_mib: None,
+        rosetta: false,
         allowed_cidrs: None,
     };
     validate_requested_network_backend(&resources, None, args.port.len())?;
@@ -1728,6 +1730,7 @@ fn daemon_start(
         storage_gib,
         overlay_gib: args.overlay,
         gpu_vram_mib: None,
+        rosetta: false,
         allowed_cidrs: None,
     };
     validate_requested_network_backend(&resources, None, args.port.len())?;

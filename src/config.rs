@@ -385,6 +385,10 @@ pub struct VmRecord {
     #[serde(default)]
     pub gpu_vram_mib: Option<u32>,
 
+    /// Enable Rosetta 2 for x86_64 binary translation on Apple Silicon.
+    #[serde(default)]
+    pub rosetta: Option<bool>,
+
     /// Restart configuration.
     #[serde(default)]
     pub restart: RestartConfig,
@@ -557,6 +561,7 @@ impl VmRecord {
             network,
             gpu: None,
             gpu_vram_mib: None,
+            rosetta: None,
             restart: RestartConfig::default(),
             last_exit_code: None,
             init: Vec::new(),
@@ -610,6 +615,7 @@ impl VmRecord {
             network,
             gpu: None,
             gpu_vram_mib: None,
+            rosetta: None,
             restart,
             last_exit_code: None,
             init: Vec::new(),
@@ -694,6 +700,7 @@ impl VmRecord {
             network_backend: self.network_backend,
             gpu: self.gpu.unwrap_or(false),
             gpu_vram_mib: self.gpu_vram_mib,
+            rosetta: self.rosetta.unwrap_or(false),
             storage_gib: self.storage_gb,
             overlay_gib: self.overlay_gb,
             allowed_cidrs: self.allowed_cidrs.clone(),

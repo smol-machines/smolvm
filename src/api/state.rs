@@ -1266,6 +1266,7 @@ pub fn resource_spec_to_vm_resources(spec: &ResourceSpec, network: bool) -> VmRe
         // inherit the default. Add to ResourceSpec if the API ever
         // needs to expose it.
         gpu_vram_mib: None,
+        rosetta: false,
         storage_gib: spec.storage_gb,
         overlay_gib: spec.overlay_gb,
         allowed_cidrs: spec.allowed_cidrs.clone(),
