@@ -252,7 +252,7 @@ pub(crate) fn run_init_commands(
     }
     println!("Running {} init command(s)...", init.len());
     for (i, cmd) in init.iter().enumerate() {
-        let (exit_code, stdout, stderr) = if let Some(image) = context.image {
+        if let Some(image) = context.image {
             let defaults =
                 resolve_image_runtime_defaults(context.image_info, context.env, context.workdir);
             let config = build_init_run_config(
@@ -261,30 +261,31 @@ pub(crate) fn run_init_commands(
                 &defaults,
                 context.record_mounts,
                 context.overlay_id,
-            );
-            client.run_non_interactive(config)?
+            )
+            .with_tty(true);
+            client.run_interactive(config)?;
         } else {
-            client.vm_exec(
+            let (exit_code, stdout, stderr) = client.vm_exec(
                 init_argv(cmd),
                 context.env.to_vec(),
                 context.workdir.map(|s| s.to_string()),
                 None,
                 None,
-            )?
+            )?;
+            if exit_code != 0 {
+                // Init output is generally text — lossy conversion is fine for
+                // error messages. Binary init output isn't a real use case.
+                return Err(smolvm::Error::agent(
+                    "init",
+                    format_init_failure(
+                        i,
+                        exit_code,
+                        &String::from_utf8_lossy(&stdout),
+                        &String::from_utf8_lossy(&stderr),
+                    ),
+                ));
+            }
         };
-        if exit_code != 0 {
-            // Init output is generally text — lossy conversion is fine for
-            // error messages. Binary init output isn't a real use case.
-            return Err(smolvm::Error::agent(
-                "init",
-                format_init_failure(
-                    i,
-                    exit_code,
-                    &String::from_utf8_lossy(&stdout),
-                    &String::from_utf8_lossy(&stderr),
-                ),
-            ));
-        }
     }
     Ok(())
 }
