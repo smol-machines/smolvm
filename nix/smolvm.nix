@@ -7,23 +7,24 @@
   gcc-unwrapped,
   bzip2,
 }: let
-  version = "0.8.2";
+  version = "1.4.7";
 
   releases = {
     x86_64-linux = {
       asset = "smolvm-${version}-linux-x86_64.tar.gz";
       root = "smolvm-${version}-linux-x86_64";
-      hash = "sha256-FEzCyn9yauzy/ydXZxeD2DK1cXVg2XYlOil6UeUKJeA=";
+      hash = "sha256-KmdN7GDx+u4PB3RqWGDnSXgtC+4JoGnTn2HFUADLTfc=";
     };
     aarch64-linux = {
       asset = "smolvm-${version}-linux-arm64.tar.gz";
       root = "smolvm-${version}-linux-arm64";
-      hash = "sha256-214tjfCntQbk40FiX3TleC9c2xQA0GuTAzJ1QDisn18=";
+      hash = "sha256-SFwSbfO9K7stwcq60IwMQ7ceKvDpBYkHcFJnnUtxL80=";
     };
     aarch64-darwin = {
       asset = "smolvm-${version}-darwin-arm64.tar.gz";
       root = "smolvm-${version}-darwin-arm64";
-      hash = "sha256-jDHrgsq/Ca0UKahufRHMuA2B/i4Y2JKKUpDqWmVWKgI=";
+      hash = "sha256-pJkgLg9uCnNZUz/MEtnbpof3YkcLLfWGLt5UL02PQjo=";
+
     };
   };
 
