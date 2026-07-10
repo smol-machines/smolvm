@@ -36,9 +36,9 @@ smolvm machine exec --name myvm -- apt-get update
 smolvm machine exec --name myvm -- apt-get install -y python3
 smolvm machine exec --name myvm -- which python3      # still there after exit+re-exec
 
-# SSH agent forwarding (git/ssh without exposing keys)
-smolvm machine run --ssh-agent --net --image alpine -- ssh-add -l
-smolvm machine create --name myvm --ssh-agent --net
+# SSH agent forwarding (git/ssh without exposing keys) — see "SSH Agent Forwarding" below
+smolvm machine run --ssh-agent --net --image alpine -- sh -c "apk add -q openssh-client && ssh-add -l"
+smolvm machine create --name myvm --image alpine --ssh-agent --net   # persistent: then start + exec git/ssh
 
 # Inject secrets into workload env (referenced from host env var / file)
 smolvm machine run --secret-env OPENAI_API_KEY=OPENAI_API_KEY -- ./app
@@ -291,9 +291,13 @@ Proxy vars are NOT forwarded automatically — each VM gets exactly the env you 
 Forward the host's SSH agent into the VM so git, ssh, and scp work with your keys — without the private keys ever entering the VM.
 
 ```bash
-# CLI flag
-smolvm machine run --ssh-agent --net --image alpine -- ssh-add -l
-smolvm machine create --name myvm --ssh-agent --net
+# Quick check the agent is forwarded (alpine needs openssh-client for ssh-add):
+smolvm machine run --ssh-agent --net --image alpine -- sh -c "apk add -q openssh-client && ssh-add -l"
+
+# Persistent VM — create, start, install tooling, then use the agent:
+smolvm machine create --name myvm --image alpine --ssh-agent --net
+smolvm machine start  --name myvm
+smolvm machine exec   --name myvm -- apk add -q git openssh-client
 
 # Smolfile
 # [auth]
