@@ -1,0 +1,18 @@
+[package]
+name = "smolvm-cuda-shim"
+version = "1.3.1"
+edition = "2021"
+description = "Guest-side libcuda.so.1 drop-in: CUDA Driver API over smolvm's vsock RPC"
+license = "Apache-2.0"
+
+[lib]
+name = "cuda"
+crate-type = ["cdylib"]
+
+[dependencies]
+smolvm-cuda = { path = "../smolvm-cuda", default-features = false }
+
+# vsock is the production transport (guest → host CID 2). Off Linux the crate
+# still compiles (tcp/unix transports only) so the workspace builds everywhere.
+[target.'cfg(target_os = "linux")'.dependencies]
+vsock = "0.5"
