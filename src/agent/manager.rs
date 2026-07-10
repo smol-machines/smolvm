@@ -1544,7 +1544,27 @@ impl AgentManager {
                 Ok(())
             }
             Err(e) => {
-                process::terminate(child_pid);
+                // The _boot-vm child may be stuck inside krun_start_enter()
+                // where SIGTERM alone may not kill it (the VM run loop can
+                // mask signals). Use the full SIGTERM -> wait -> SIGKILL
+                // sequence so the child is reliably dead before we return,
+                // preventing an orphaned process from holding ports/sockets
+                // and making every subsequent start attempt fail permanently.
+                if let Err(kill_err) = process::stop_vm_process(
+                    child_pid,
+                    AGENT_STOP_TIMEOUT,
+                    process::VM_SIGKILL_TIMEOUT,
+                ) {
+                    tracing::warn!(
+                        pid = child_pid,
+                        error = %kill_err,
+                        "failed to kill _boot-vm child after start failure; \
+                         process may be orphaned"
+                    );
+                }
+                // Remove the PID file written earlier in this function so a
+                // stale PID doesn't confuse future reconnect attempts.
+                let _ = std::fs::remove_file(&self.pid_file);
                 let mut inner = self.inner.lock();
                 inner.state = AgentState::Stopped;
                 inner.child = None;

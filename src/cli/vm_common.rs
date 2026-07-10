@@ -817,7 +817,10 @@ pub fn start_vm_named(
             ));
         }
         RecordState::Stopped | RecordState::Created | RecordState::Failed => {
-            // Normal start path.
+            // Normal start path. Kill any orphaned _boot-vm process left by
+            // a previous failed start — if one is holding ports/sockets, this
+            // fresh start would hit the same error without this cleanup.
+            kill_orphaned_boot_process(name);
         }
     }
 
@@ -1397,6 +1400,12 @@ pub fn stop_vm_named(name: &str) -> smolvm::Result<()> {
                     &smolvm::agent::machine_layers_cache_dir(name),
                 );
             }
+            // Defense-in-depth: a failed `machine start` may have left an
+            // orphaned _boot-vm process that the DB doesn't know about (PID
+            // never persisted). Check the on-disk PID file and, if the
+            // process is alive and its argv matches this VM's boot config
+            // path, kill it so the user doesn't have to hunt it manually.
+            kill_orphaned_boot_process(name);
             println!("Machine '{}' is not running (state: {})", name, other);
             return Ok(());
         }
@@ -1425,6 +1434,58 @@ pub fn stop_vm_named(name: &str) -> smolvm::Result<()> {
 
     println!("Stopped machine: {}", name);
     Ok(())
+}
+
+/// Kill an orphaned `_boot-vm` process for a machine that the DB thinks is
+/// not running.
+///
+/// When `machine start` fails after spawning the `_boot-vm` child (e.g.,
+/// EADDRINUSE in the virtio-net runtime), `finalize_launch` kills the child
+/// with SIGTERM + SIGKILL. But if that cleanup itself fails (or a pre-fix
+/// binary left an orphan), this fallback catches it: read the on-disk PID
+/// file, verify the process argv matches this VM's boot-config path, and
+/// kill it. Best-effort — never fails the caller.
+fn kill_orphaned_boot_process(name: &str) {
+    let data_dir = smolvm::agent::vm_data_dir(name);
+    let pid_file = data_dir.join("agent.pid");
+    let boot_config = data_dir.join("boot-config.json");
+
+    let content = match std::fs::read_to_string(&pid_file) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let pid: i32 = match content.lines().next().and_then(|l| l.trim().parse().ok()) {
+        Some(p) => p,
+        None => return,
+    };
+
+    if !smolvm::process::is_alive(pid) {
+        // Stale PID file — clean it up.
+        let _ = std::fs::remove_file(&pid_file);
+        return;
+    }
+
+    // Verify the process is actually our _boot-vm for this VM (not a
+    // recycled PID belonging to something else).
+    if !smolvm::process::cmdline_contains(pid, &boot_config.to_string_lossy()) {
+        return;
+    }
+
+    eprintln!(
+        "Killing orphaned _boot-vm process (PID {}) for machine '{}'",
+        pid, name
+    );
+    if let Err(e) = smolvm::process::stop_vm_process(
+        pid,
+        std::time::Duration::from_secs(2),
+        smolvm::process::VM_SIGKILL_TIMEOUT,
+    ) {
+        tracing::warn!(
+            pid, error = %e,
+            "failed to kill orphaned _boot-vm process"
+        );
+    }
+    let _ = std::fs::remove_file(&pid_file);
 }
 
 /// Stop the default machine.
