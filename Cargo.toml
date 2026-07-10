@@ -5,6 +5,8 @@ members = [
     "crates/smolvm-cuda",
     "crates/smolvm-cuda-guest",
     "crates/smolvm-cuda-shim",
+    "crates/smolvm-cuda-codegen",
+    "crates/smolvm-cudart-shim",
     "crates/smolvm-network",
     "crates/smolvm-pack",
     "crates/smolvm-protocol",

@@ -13,5 +13,9 @@
 pub mod client;
 pub mod proto;
 
+/// Shared-memory bulk-data channel (zero-copy memcpy). Linux-only.
+#[cfg(target_os = "linux")]
+pub mod shm;
+
 #[cfg(feature = "host")]
 pub mod host;

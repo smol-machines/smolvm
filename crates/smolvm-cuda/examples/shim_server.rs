@@ -26,6 +26,7 @@ fn main() {
     println!("SHIM-SERVER-READY {addr} {backend_kind}");
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
+        let _ = stream.set_nodelay(true); // low-latency request/response
         std::thread::spawn(move || {
             let mut backend: Box<dyn Backend> = match GpuBackend::load() {
                 Ok(b) => Box::new(b),

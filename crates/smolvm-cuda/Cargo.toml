@@ -14,3 +14,4 @@ gpu = ["host", "dep:libloading"]
 
 [dependencies]
 libloading = { version = "0.8", optional = true }
+libc = "0.2"

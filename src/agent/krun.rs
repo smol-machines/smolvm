@@ -59,6 +59,9 @@ pub struct KrunFunctions {
     >,
     pub get_egress_handle: Option<unsafe extern "C" fn(u32) -> *mut libc::c_void>,
     pub set_gpu_options2: Option<unsafe extern "C" fn(u32, u32, u64) -> i32>,
+    /// Retrieve guest RAM regions (`gpa_start, host_va, len` triples) for
+    /// zero-copy CUDA transfers. `None` on libkrun builds that predate the API.
+    pub get_guest_ram: Option<unsafe extern "C" fn(u32, *mut u64, u32, *mut u64) -> i32>,
     /// Register a Unix control socket for the VM (pause/resume/checkpoint/restore).
     pub set_control_socket: Option<unsafe extern "C" fn(u32, *const libc::c_char) -> i32>,
     /// Boot the VM as a fork clone from a snapshot directory (CoW-map a golden
@@ -148,6 +151,7 @@ impl KrunFunctions {
         let add_net_unixstream = load_optional_sym!("krun_add_net_unixstream");
         let get_egress_handle = load_optional_sym!("krun_get_egress_handle");
         let set_gpu_options2 = load_optional_sym!("krun_set_gpu_options2");
+        let get_guest_ram = load_optional_sym!("krun_get_guest_ram");
         let set_control_socket = load_optional_sym!("krun_set_control_socket");
         let set_snapshot = load_optional_sym!("krun_set_snapshot");
         let create_disk_overlay = load_optional_sym!("krun_create_disk_overlay");
@@ -173,6 +177,7 @@ impl KrunFunctions {
             add_net_unixstream,
             get_egress_handle,
             set_gpu_options2,
+            get_guest_ram,
             set_control_socket,
             set_snapshot,
             create_disk_overlay,
