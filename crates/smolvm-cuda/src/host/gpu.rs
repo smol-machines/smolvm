@@ -82,6 +82,20 @@ pub struct GpuBackend {
     ) -> CuResultCode,
     ctx_synchronize: unsafe extern "C" fn() -> CuResultCode,
     stream_create: unsafe extern "C" fn(*mut *mut c_void, c_uint) -> CuResultCode,
+    // CUDA graphs (capture on the real driver; replay = one launch).
+    stream_begin_capture: unsafe extern "C" fn(*mut c_void, c_int) -> CuResultCode,
+    stream_end_capture: unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> CuResultCode,
+    stream_get_capture_info:
+        unsafe extern "C" fn(*mut c_void, *mut c_int, *mut u64) -> CuResultCode,
+    graph_instantiate_with_flags:
+        unsafe extern "C" fn(*mut *mut c_void, *mut c_void, u64) -> CuResultCode,
+    graph_launch: unsafe extern "C" fn(*mut c_void, *mut c_void) -> CuResultCode,
+    graph_exec_destroy: unsafe extern "C" fn(*mut c_void) -> CuResultCode,
+    graph_destroy: unsafe extern "C" fn(*mut c_void) -> CuResultCode,
+    graph_get_nodes:
+        unsafe extern "C" fn(*mut c_void, *mut *mut c_void, *mut usize) -> CuResultCode,
+    memset_d8_async: unsafe extern "C" fn(u64, u8, usize, *mut c_void) -> CuResultCode,
+    memcpy_dtod_async: unsafe extern "C" fn(u64, u64, usize, *mut c_void) -> CuResultCode,
     stream_destroy: unsafe extern "C" fn(*mut c_void) -> CuResultCode,
     stream_synchronize: unsafe extern "C" fn(*mut c_void) -> CuResultCode,
     event_create: unsafe extern "C" fn(*mut *mut c_void, c_uint) -> CuResultCode,
@@ -325,6 +339,24 @@ impl GpuBackend {
                 launch_kernel: sym(&lib, b"cuLaunchKernel\0")?,
                 ctx_synchronize: sym(&lib, b"cuCtxSynchronize\0")?,
                 stream_create: sym(&lib, b"cuStreamCreate\0")?,
+                stream_begin_capture: sym2(
+                    &lib,
+                    b"cuStreamBeginCapture_v2\0",
+                    b"cuStreamBeginCapture\0",
+                )?,
+                stream_end_capture: sym(&lib, b"cuStreamEndCapture\0")?,
+                stream_get_capture_info: sym2(
+                    &lib,
+                    b"cuStreamGetCaptureInfo\0",
+                    b"cuStreamGetCaptureInfo_v2\0",
+                )?,
+                graph_instantiate_with_flags: sym(&lib, b"cuGraphInstantiateWithFlags\0")?,
+                graph_launch: sym(&lib, b"cuGraphLaunch\0")?,
+                graph_exec_destroy: sym(&lib, b"cuGraphExecDestroy\0")?,
+                graph_destroy: sym(&lib, b"cuGraphDestroy\0")?,
+                graph_get_nodes: sym(&lib, b"cuGraphGetNodes\0")?,
+                memset_d8_async: sym(&lib, b"cuMemsetD8Async\0")?,
+                memcpy_dtod_async: sym2(&lib, b"cuMemcpyDtoDAsync_v2\0", b"cuMemcpyDtoDAsync\0")?,
                 stream_destroy: sym2(&lib, b"cuStreamDestroy_v2\0", b"cuStreamDestroy\0")?,
                 stream_synchronize: sym(&lib, b"cuStreamSynchronize\0")?,
                 event_create: sym(&lib, b"cuEventCreate\0")?,
@@ -690,6 +722,82 @@ impl Backend for GpuBackend {
         let mut s: *mut c_void = std::ptr::null_mut();
         unsafe { chk((self.stream_create)(&mut s, flags))? };
         Ok(s as u64)
+    }
+    fn stream_begin_capture(&mut self, stream: u64, mode: i32) -> CuResult<()> {
+        unsafe { chk((self.stream_begin_capture)(stream as *mut c_void, mode)) }
+    }
+    fn stream_end_capture(&mut self, stream: u64) -> CuResult<u64> {
+        let mut g: *mut c_void = std::ptr::null_mut();
+        unsafe { chk((self.stream_end_capture)(stream as *mut c_void, &mut g))? };
+        Ok(g as u64)
+    }
+    fn stream_capture_info(&mut self, stream: u64) -> CuResult<(u64, u64)> {
+        let mut status: c_int = 0;
+        let mut id: u64 = 0;
+        unsafe {
+            chk((self.stream_get_capture_info)(
+                stream as *mut c_void,
+                &mut status,
+                &mut id,
+            ))?
+        };
+        Ok((status as u64, id))
+    }
+    fn graph_instantiate(&mut self, graph: u64) -> CuResult<u64> {
+        let mut e: *mut c_void = std::ptr::null_mut();
+        unsafe {
+            chk((self.graph_instantiate_with_flags)(
+                &mut e,
+                graph as *mut c_void,
+                0,
+            ))?
+        };
+        Ok(e as u64)
+    }
+    fn graph_launch(&mut self, graph_exec: u64, stream: u64) -> CuResult<()> {
+        unsafe {
+            chk((self.graph_launch)(
+                graph_exec as *mut c_void,
+                stream as *mut c_void,
+            ))
+        }
+    }
+    fn graph_exec_destroy(&mut self, graph_exec: u64) -> CuResult<()> {
+        unsafe { chk((self.graph_exec_destroy)(graph_exec as *mut c_void)) }
+    }
+    fn graph_destroy(&mut self, graph: u64) -> CuResult<()> {
+        unsafe { chk((self.graph_destroy)(graph as *mut c_void)) }
+    }
+    fn graph_get_node_count(&mut self, graph: u64) -> CuResult<u64> {
+        let mut n: usize = 0;
+        unsafe {
+            chk((self.graph_get_nodes)(
+                graph as *mut c_void,
+                std::ptr::null_mut(),
+                &mut n,
+            ))?
+        };
+        Ok(n as u64)
+    }
+    fn memset_d8_async(&mut self, dptr: u64, value: u8, bytes: u64, stream: u64) -> CuResult<()> {
+        unsafe {
+            chk((self.memset_d8_async)(
+                dptr,
+                value,
+                bytes as usize,
+                stream as *mut c_void,
+            ))
+        }
+    }
+    fn memcpy_dtod_async(&mut self, dst: u64, src: u64, bytes: u64, stream: u64) -> CuResult<()> {
+        unsafe {
+            chk((self.memcpy_dtod_async)(
+                dst,
+                src,
+                bytes as usize,
+                stream as *mut c_void,
+            ))
+        }
     }
     fn stream_destroy(&mut self, stream: u64) -> CuResult<()> {
         unsafe { chk((self.stream_destroy)(stream as *mut c_void)) }

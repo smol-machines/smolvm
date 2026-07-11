@@ -154,6 +154,11 @@ struct ShimState {
     host_allocs: HashMap<usize, std::alloc::Layout>,
     /// Live device allocations, to classify pointers for cudaMemcpyDefault.
     dev_allocs: HashSet<u64>,
+    /// Active CUDA graph capture, `(stream_handle, capture_id)`. Kept
+    /// guest-side so the per-launch hot queries (`cudaStreamIsCapturing`,
+    /// `cudaStreamGetCaptureInfo` — PyTorch's allocator calls them constantly)
+    /// answer locally instead of round-tripping.
+    capture: Option<(u64, u64)>,
 }
 
 static STATE: Mutex<Option<ShimState>> = Mutex::new(None);
@@ -167,6 +172,16 @@ thread_local! {
 
 fn set_last(code: c_int) -> c_int {
     if code != CUDA_SUCCESS {
+        if std::env::var_os("SMOLVM_CUDA_SHIM_TRACE").is_some() {
+            eprintln!(
+                "[shim-err] code={code} from {:?}",
+                std::backtrace::Backtrace::force_capture()
+                    .to_string()
+                    .lines()
+                    .nth(6)
+                    .unwrap_or("?")
+            );
+        }
         LAST_ERROR.with(|e| e.set(code));
     }
     code
@@ -209,6 +224,7 @@ fn with_client<T>(
             funcs: HashMap::new(),
             host_allocs: HashMap::new(),
             dev_allocs: HashSet::new(),
+            capture: None,
         });
     }
     let st = guard.as_mut().ok_or(CUDA_ERROR_INITIALIZATION)?;
@@ -705,10 +721,24 @@ pub extern "C" fn cudaMemcpyAsync(
     src: *const c_void,
     n: usize,
     kind: c_int,
-    _stream: *mut c_void,
+    stream: *mut c_void,
 ) -> c_int {
-    // Executed synchronously; ordering within a stream is preserved because all
-    // work runs on the host's single serving thread in call order.
+    // Device-to-device goes through the stream-ordered driver call: it
+    // pipelines like a launch and — critically — records into an active graph
+    // capture instead of invalidating it (the sync form is capture-unsafe).
+    let resolved = with_state(|s| Ok(resolve_kind(s, dst, src, kind))).unwrap_or(kind);
+    if resolved == MEMCPY_DTOD {
+        return set_last(
+            match with_client(|c| {
+                c.memcpy_dtod_async(dst as u64, src as u64, n as u64, stream as u64)
+            }) {
+                Ok(()) => CUDA_SUCCESS,
+                Err(e) => e,
+            },
+        );
+    }
+    // Other kinds execute synchronously; ordering within a stream is preserved
+    // because all work runs on the host's single serving thread in call order.
     set_last(do_memcpy(dst, src, n, kind))
 }
 
@@ -727,9 +757,18 @@ pub extern "C" fn cudaMemsetAsync(
     dev_ptr: *mut c_void,
     value: c_int,
     count: usize,
-    _stream: *mut c_void,
+    stream: *mut c_void,
 ) -> c_int {
-    cudaMemset(dev_ptr, value, count)
+    // Stream-ordered driver call: pipelines, and records into an active graph
+    // capture instead of invalidating it.
+    set_last(
+        match with_client(|c| {
+            c.memset_d8_async(dev_ptr as u64, value as u8, count as u64, stream as u64)
+        }) {
+            Ok(()) => CUDA_SUCCESS,
+            Err(e) => e,
+        },
+    )
 }
 
 // ---- streams ----------------------------------------------------------------
@@ -1047,26 +1086,179 @@ pub extern "C" fn cudaStreamWaitEvent(
 pub extern "C" fn cudaStreamQuery(_stream: *mut c_void) -> c_int {
     set_last(CUDA_SUCCESS) // always idle: prior work already ran
 }
+// ---- CUDA graphs -------------------------------------------------------------
+// Capture happens on the HOST driver: Begin/End forward, and every launch /
+// stream-ordered op issued in between lands on the capturing host stream and is
+// recorded (not executed) by the real driver. Replay is a single GraphLaunch
+// message for the whole graph — the antidote to per-launch round-trips in
+// launch-bound inference. The hot capture-status queries answer from the
+// guest-side `capture` field, costing nothing outside capture.
+
+/// cudaStreamCaptureStatusActive.
+const CAPTURE_ACTIVE: c_int = 1;
+
 #[no_mangle]
-pub extern "C" fn cudaStreamIsCapturing(_stream: *mut c_void, status: *mut c_int) -> c_int {
-    set_last(unsafe { out(status, 0) }) // cudaStreamCaptureStatusNone
+pub extern "C" fn cudaStreamBeginCapture(stream: *mut c_void, mode: c_int) -> c_int {
+    set_last(
+        match with_state(|s| {
+            s.client
+                .stream_begin_capture(stream as u64, mode)
+                .map_err(map_err)?;
+            // Fetch the driver's capture id once; the allocator re-reads it
+            // through the local queries below.
+            let (_, id) = s
+                .client
+                .stream_capture_info(stream as u64)
+                .map_err(map_err)?;
+            s.capture = Some((stream as u64, id));
+            Ok(())
+        }) {
+            Ok(()) => CUDA_SUCCESS,
+            Err(e) => e,
+        },
+    )
 }
+
+#[no_mangle]
+pub extern "C" fn cudaStreamEndCapture(stream: *mut c_void, graph: *mut *mut c_void) -> c_int {
+    if graph.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    set_last(
+        match with_state(|s| {
+            let g = s
+                .client
+                .stream_end_capture(stream as u64)
+                .map_err(map_err)?;
+            s.capture = None;
+            Ok(g)
+        }) {
+            Ok(g) => unsafe { out(graph, g as *mut c_void) },
+            Err(e) => {
+                let _ = with_state(|s| {
+                    s.capture = None;
+                    Ok(())
+                });
+                e
+            }
+        },
+    )
+}
+
+#[no_mangle]
+pub extern "C" fn cudaStreamIsCapturing(stream: *mut c_void, status: *mut c_int) -> c_int {
+    let active = with_state(|s| Ok(matches!(s.capture, Some((cs, _)) if cs == stream as u64)))
+        .unwrap_or(false);
+    set_last(unsafe { out(status, if active { CAPTURE_ACTIVE } else { 0 }) })
+}
+
 #[no_mangle]
 pub extern "C" fn cudaStreamGetCaptureInfo_v2(
-    _stream: *mut c_void,
+    stream: *mut c_void,
     status: *mut c_int,
     id: *mut u64,
-    _graph: *mut *mut c_void,
-    _deps: *mut *mut *const c_void,
-    _num_deps: *mut usize,
+    graph: *mut *mut c_void,
+    deps: *mut *mut *const c_void,
+    num_deps: *mut usize,
 ) -> c_int {
+    let cap = with_state(|s| Ok(s.capture)).unwrap_or(None);
+    let (st, cid) = match cap {
+        Some((cs, cid)) if cs == stream as u64 => (CAPTURE_ACTIVE, cid),
+        _ => (0, 0),
+    };
     unsafe {
-        let _ = out(status, 0);
+        let _ = out(status, st);
         if !id.is_null() {
-            let _ = out(id, 0u64);
+            let _ = out(id, cid);
+        }
+        if !graph.is_null() {
+            let _ = out(graph, std::ptr::null_mut());
+        }
+        if !deps.is_null() {
+            let _ = out(deps, std::ptr::null_mut());
+        }
+        if !num_deps.is_null() {
+            let _ = out(num_deps, 0usize);
         }
     }
     set_last(CUDA_SUCCESS)
+}
+
+#[no_mangle]
+pub extern "C" fn cudaGraphInstantiate(
+    graph_exec: *mut *mut c_void,
+    graph: *mut c_void,
+    _error_node: *mut *mut c_void,
+    _log_buffer: *mut c_char,
+    _buffer_size: usize,
+) -> c_int {
+    cudaGraphInstantiateWithFlags(graph_exec, graph, 0)
+}
+
+#[no_mangle]
+pub extern "C" fn cudaGraphInstantiateWithFlags(
+    graph_exec: *mut *mut c_void,
+    graph: *mut c_void,
+    _flags: u64,
+) -> c_int {
+    if graph_exec.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    set_last(match with_client(|c| c.graph_instantiate(graph as u64)) {
+        Ok(e) => unsafe { out(graph_exec, e as *mut c_void) },
+        Err(e) => e,
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn cudaGraphLaunch(graph_exec: *mut c_void, stream: *mut c_void) -> c_int {
+    // The whole point: one pipelined message replays every captured kernel.
+    set_last(
+        match with_client(|c| c.graph_launch(graph_exec as u64, stream as u64)) {
+            Ok(()) => CUDA_SUCCESS,
+            Err(e) => e,
+        },
+    )
+}
+
+/// Count-only node query (`nodes == NULL`): PyTorch uses it to warn about
+/// empty captures. Filling a caller-provided node array is not supported.
+#[no_mangle]
+pub extern "C" fn cudaGraphGetNodes(
+    graph: *mut c_void,
+    nodes: *mut *mut c_void,
+    num_nodes: *mut usize,
+) -> c_int {
+    if num_nodes.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    match with_client(|c| c.graph_get_node_count(graph as u64)) {
+        Ok(n) => {
+            if !nodes.is_null() {
+                return set_last(CUDA_ERROR_INVALID_VALUE);
+            }
+            set_last(unsafe { out(num_nodes, n as usize) })
+        }
+        Err(e) => set_last(e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cudaGraphExecDestroy(graph_exec: *mut c_void) -> c_int {
+    set_last(
+        match with_client(|c| c.graph_exec_destroy(graph_exec as u64)) {
+            Ok(()) => CUDA_SUCCESS,
+            Err(e) => e,
+        },
+    )
+}
+
+#[no_mangle]
+pub extern "C" fn cudaGraphDestroy(graph: *mut c_void) -> c_int {
+    set_last(match with_client(|c| c.graph_destroy(graph as u64)) {
+        Ok(()) => CUDA_SUCCESS,
+        Err(e) => e,
+    })
 }
 #[no_mangle]
 pub extern "C" fn cudaThreadExchangeStreamCaptureMode(_mode: *mut c_int) -> c_int {

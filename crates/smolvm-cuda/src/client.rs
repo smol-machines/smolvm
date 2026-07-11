@@ -317,6 +317,95 @@ impl<S: Read + Write> Client<S> {
         )
     }
 
+    pub fn stream_begin_capture(&mut self, stream: u64, mode: i32) -> Result<()> {
+        self.call(
+            &Request::StreamBeginCapture { stream, mode },
+            Op::StreamBeginCapture,
+        )
+        .map(|_| ())
+    }
+
+    /// Returns the raw `cudaGraph_t` (an opaque host pointer to the guest).
+    pub fn stream_end_capture(&mut self, stream: u64) -> Result<u64> {
+        match self.call(&Request::StreamEndCapture { stream }, Op::StreamEndCapture)? {
+            Response::Handle(h) => Ok(h),
+            _ => Err(CudaRpcError::Protocol("expected Handle")),
+        }
+    }
+
+    /// `(capture_status, capture_id)` straight from the host driver.
+    pub fn stream_capture_info(&mut self, stream: u64) -> Result<(u64, u64)> {
+        match self.call(
+            &Request::StreamCaptureInfo { stream },
+            Op::StreamCaptureInfo,
+        )? {
+            Response::Pair(a, b) => Ok((a, b)),
+            _ => Err(CudaRpcError::Protocol("expected Pair")),
+        }
+    }
+
+    pub fn graph_instantiate(&mut self, graph: u64) -> Result<u64> {
+        match self.call(&Request::GraphInstantiate { graph }, Op::GraphInstantiate)? {
+            Response::Handle(h) => Ok(h),
+            _ => Err(CudaRpcError::Protocol("expected Handle")),
+        }
+    }
+
+    /// Replay an instantiated graph — the hot path (one message replays every
+    /// captured kernel), so it pipelines like a kernel launch.
+    pub fn graph_launch(&mut self, graph_exec: u64, stream: u64) -> Result<()> {
+        self.call_deferred(
+            &Request::GraphLaunch { graph_exec, stream },
+            Op::GraphLaunch,
+        )
+    }
+
+    /// Node count of a captured graph (count-only query; PyTorch uses it to
+    /// warn about empty captures).
+    pub fn graph_get_node_count(&mut self, graph: u64) -> Result<u64> {
+        match self.call(&Request::GraphGetNodes { graph }, Op::GraphGetNodes)? {
+            Response::Bytes(n) => Ok(n),
+            _ => Err(CudaRpcError::Protocol("expected Bytes")),
+        }
+    }
+
+    pub fn graph_exec_destroy(&mut self, graph_exec: u64) -> Result<()> {
+        self.call_deferred(
+            &Request::GraphExecDestroy { graph_exec },
+            Op::GraphExecDestroy,
+        )
+    }
+
+    pub fn graph_destroy(&mut self, graph: u64) -> Result<()> {
+        self.call_deferred(&Request::GraphDestroy { graph }, Op::GraphDestroy)
+    }
+
+    /// Stream-ordered memset: capture-safe (recorded into an active graph).
+    pub fn memset_d8_async(&mut self, dptr: u64, value: u8, bytes: u64, stream: u64) -> Result<()> {
+        self.call_deferred(
+            &Request::MemsetD8Async {
+                dptr,
+                value,
+                bytes,
+                stream,
+            },
+            Op::MemsetD8Async,
+        )
+    }
+
+    /// Stream-ordered device copy: capture-safe.
+    pub fn memcpy_dtod_async(&mut self, dst: u64, src: u64, bytes: u64, stream: u64) -> Result<()> {
+        self.call_deferred(
+            &Request::MemcpyDtoDAsync {
+                dst,
+                src,
+                bytes,
+                stream,
+            },
+            Op::MemcpyDtoDAsync,
+        )
+    }
+
     pub fn ctx_synchronize(&mut self) -> Result<()> {
         self.call(&Request::CtxSynchronize, Op::CtxSynchronize)?;
         // Surface any asynchronous failure collected while draining, the way

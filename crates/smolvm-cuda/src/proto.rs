@@ -63,6 +63,20 @@ pub enum Op {
     EventRecord = 0x72,
     EventSynchronize = 0x73,
     EventElapsedTime = 0x74,
+    // CUDA graphs: capture forwarded to the host driver (which records the
+    // stream's work into a graph), replayed with a single GraphLaunch.
+    StreamBeginCapture = 0xC0,
+    StreamEndCapture = 0xC1,
+    GraphInstantiate = 0xC2,
+    GraphLaunch = 0xC3,
+    GraphExecDestroy = 0xC4,
+    GraphDestroy = 0xC5,
+    StreamCaptureInfo = 0xC6,
+    // Stream-ordered variants (capture-safe: the sync forms would invalidate
+    // an active capture and cannot be recorded into a graph).
+    MemsetD8Async = 0xC7,
+    MemcpyDtoDAsync = 0xC8,
+    GraphGetNodes = 0xC9,
     // nvcomp (forward-to-host-lib): batched Deflate decompression. Device-pointer
     // args are real host device addresses, forwarded by value.
     NvcompDeflateTempSize = 0x80,
@@ -116,6 +130,16 @@ impl Op {
             0x36 => Op::MemGetInfo,
             0x40 => Op::LaunchKernel,
             0x50 => Op::CtxSynchronize,
+            0xC0 => Op::StreamBeginCapture,
+            0xC1 => Op::StreamEndCapture,
+            0xC2 => Op::GraphInstantiate,
+            0xC3 => Op::GraphLaunch,
+            0xC4 => Op::GraphExecDestroy,
+            0xC5 => Op::GraphDestroy,
+            0xC6 => Op::StreamCaptureInfo,
+            0xC7 => Op::MemsetD8Async,
+            0xC8 => Op::MemcpyDtoDAsync,
+            0xC9 => Op::GraphGetNodes,
             0x60 => Op::StreamCreate,
             0x61 => Op::StreamDestroy,
             0x62 => Op::StreamSynchronize,
@@ -224,6 +248,44 @@ pub enum Request {
         params: Vec<Vec<u8>>,
     },
     CtxSynchronize,
+    StreamBeginCapture {
+        stream: u64,
+        mode: i32,
+    },
+    StreamEndCapture {
+        stream: u64,
+    },
+    GraphInstantiate {
+        graph: u64,
+    },
+    GraphLaunch {
+        graph_exec: u64,
+        stream: u64,
+    },
+    GraphExecDestroy {
+        graph_exec: u64,
+    },
+    GraphDestroy {
+        graph: u64,
+    },
+    StreamCaptureInfo {
+        stream: u64,
+    },
+    GraphGetNodes {
+        graph: u64,
+    },
+    MemsetD8Async {
+        dptr: u64,
+        value: u8,
+        bytes: u64,
+        stream: u64,
+    },
+    MemcpyDtoDAsync {
+        dst: u64,
+        src: u64,
+        bytes: u64,
+        stream: u64,
+    },
     StreamCreate {
         flags: u32,
     },
@@ -583,6 +645,64 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
             }
         }
         Request::CtxSynchronize => w_u8(&mut b, Op::CtxSynchronize as u8),
+        Request::StreamBeginCapture { stream, mode } => {
+            w_u8(&mut b, Op::StreamBeginCapture as u8);
+            w_u64(&mut b, *stream);
+            w_i32(&mut b, *mode);
+        }
+        Request::StreamEndCapture { stream } => {
+            w_u8(&mut b, Op::StreamEndCapture as u8);
+            w_u64(&mut b, *stream);
+        }
+        Request::GraphInstantiate { graph } => {
+            w_u8(&mut b, Op::GraphInstantiate as u8);
+            w_u64(&mut b, *graph);
+        }
+        Request::GraphLaunch { graph_exec, stream } => {
+            w_u8(&mut b, Op::GraphLaunch as u8);
+            w_u64(&mut b, *graph_exec);
+            w_u64(&mut b, *stream);
+        }
+        Request::GraphExecDestroy { graph_exec } => {
+            w_u8(&mut b, Op::GraphExecDestroy as u8);
+            w_u64(&mut b, *graph_exec);
+        }
+        Request::GraphDestroy { graph } => {
+            w_u8(&mut b, Op::GraphDestroy as u8);
+            w_u64(&mut b, *graph);
+        }
+        Request::StreamCaptureInfo { stream } => {
+            w_u8(&mut b, Op::StreamCaptureInfo as u8);
+            w_u64(&mut b, *stream);
+        }
+        Request::GraphGetNodes { graph } => {
+            w_u8(&mut b, Op::GraphGetNodes as u8);
+            w_u64(&mut b, *graph);
+        }
+        Request::MemsetD8Async {
+            dptr,
+            value,
+            bytes,
+            stream,
+        } => {
+            w_u8(&mut b, Op::MemsetD8Async as u8);
+            w_u64(&mut b, *dptr);
+            w_u8(&mut b, *value);
+            w_u64(&mut b, *bytes);
+            w_u64(&mut b, *stream);
+        }
+        Request::MemcpyDtoDAsync {
+            dst,
+            src,
+            bytes,
+            stream,
+        } => {
+            w_u8(&mut b, Op::MemcpyDtoDAsync as u8);
+            w_u64(&mut b, *dst);
+            w_u64(&mut b, *src);
+            w_u64(&mut b, *bytes);
+            w_u64(&mut b, *stream);
+        }
         Request::StreamCreate { flags } => {
             w_u8(&mut b, Op::StreamCreate as u8);
             w_u32(&mut b, *flags);
@@ -804,6 +924,34 @@ pub fn decode_request(payload: &[u8]) -> io::Result<Request> {
             }
         }
         Op::CtxSynchronize => Request::CtxSynchronize,
+        Op::StreamBeginCapture => Request::StreamBeginCapture {
+            stream: c.u64()?,
+            mode: c.i32()?,
+        },
+        Op::StreamEndCapture => Request::StreamEndCapture { stream: c.u64()? },
+        Op::GraphInstantiate => Request::GraphInstantiate { graph: c.u64()? },
+        Op::GraphLaunch => Request::GraphLaunch {
+            graph_exec: c.u64()?,
+            stream: c.u64()?,
+        },
+        Op::GraphExecDestroy => Request::GraphExecDestroy {
+            graph_exec: c.u64()?,
+        },
+        Op::GraphDestroy => Request::GraphDestroy { graph: c.u64()? },
+        Op::StreamCaptureInfo => Request::StreamCaptureInfo { stream: c.u64()? },
+        Op::GraphGetNodes => Request::GraphGetNodes { graph: c.u64()? },
+        Op::MemsetD8Async => Request::MemsetD8Async {
+            dptr: c.u64()?,
+            value: c.u8()?,
+            bytes: c.u64()?,
+            stream: c.u64()?,
+        },
+        Op::MemcpyDtoDAsync => Request::MemcpyDtoDAsync {
+            dst: c.u64()?,
+            src: c.u64()?,
+            bytes: c.u64()?,
+            stream: c.u64()?,
+        },
         Op::StreamCreate => Request::StreamCreate { flags: c.u32()? },
         Op::StreamDestroy => Request::StreamDestroy { stream: c.u64()? },
         Op::StreamSynchronize => Request::StreamSynchronize { stream: c.u64()? },
@@ -936,6 +1084,9 @@ pub fn decode_response(op: Op, payload: &[u8]) -> io::Result<(i32, Response)> {
         Op::CtxCreate | Op::PrimaryCtxRetain => Response::Handle(c.u64()?),
         Op::ModuleLoadData | Op::ModuleGetFunction => Response::Handle(c.u64()?),
         Op::StreamCreate | Op::EventCreate => Response::Handle(c.u64()?),
+        Op::StreamEndCapture | Op::GraphInstantiate => Response::Handle(c.u64()?),
+        Op::GraphGetNodes => Response::Bytes(c.u64()?),
+        Op::StreamCaptureInfo => Response::Pair(c.u64()?, c.u64()?),
         Op::MemAlloc => Response::Dptr(c.u64()?),
         Op::MemcpyDtoH | Op::DeviceGetUuid | Op::FuncGetParamInfo => Response::Data(c.bytes()?),
         Op::MemGetInfo => Response::Pair(c.u64()?, c.u64()?),
@@ -947,6 +1098,12 @@ pub fn decode_response(op: Op, payload: &[u8]) -> io::Result<(i32, Response)> {
         Op::LibCall => Response::LibResult(c.i32()?, c.bytes()?),
         Op::EventElapsedTime => Response::Millis(f32::from_bits(c.u32()?)),
         Op::Init
+        | Op::StreamBeginCapture
+        | Op::GraphLaunch
+        | Op::GraphExecDestroy
+        | Op::GraphDestroy
+        | Op::MemsetD8Async
+        | Op::MemcpyDtoDAsync
         | Op::CtxDestroy
         | Op::PrimaryCtxRelease
         | Op::ModuleUnload

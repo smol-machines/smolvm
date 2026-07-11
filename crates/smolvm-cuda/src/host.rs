@@ -22,6 +22,7 @@ pub type CuResult<T> = Result<T, i32>;
 pub const CUDA_ERROR_INVALID_HANDLE: i32 = 400;
 /// `CUDA_ERROR_NOT_FOUND`.
 pub const CUDA_ERROR_NOT_FOUND: i32 = 500;
+pub const CUDA_ERROR_NOT_SUPPORTED: i32 = 801;
 
 /// A CUDA Driver-API implementation. Handles returned here are the backend's
 /// own raw values (e.g. real `CUmodule` pointers); [`serve`] hides them behind
@@ -61,6 +62,26 @@ pub trait Backend: Send {
     ) -> CuResult<()>;
     fn ctx_synchronize(&mut self) -> CuResult<()>;
     fn stream_create(&mut self, flags: u32) -> CuResult<u64>;
+    /// Begin capturing `stream`'s work into a CUDA graph (mode per
+    /// `cudaStreamCaptureMode`).
+    fn stream_begin_capture(&mut self, stream: u64, mode: i32) -> CuResult<()>;
+    /// End capture; returns the raw `cudaGraph_t`.
+    fn stream_end_capture(&mut self, stream: u64) -> CuResult<u64>;
+    /// `(capture_status, capture_id)` for `stream`.
+    fn stream_capture_info(&mut self, stream: u64) -> CuResult<(u64, u64)>;
+    /// Instantiate a captured graph; returns the raw `cudaGraphExec_t`.
+    fn graph_instantiate(&mut self, graph: u64) -> CuResult<u64>;
+    /// Replay an instantiated graph on `stream`.
+    fn graph_launch(&mut self, graph_exec: u64, stream: u64) -> CuResult<()>;
+    fn graph_exec_destroy(&mut self, graph_exec: u64) -> CuResult<()>;
+    fn graph_destroy(&mut self, graph: u64) -> CuResult<()>;
+    /// Number of nodes in a captured graph (PyTorch warns on empty graphs).
+    fn graph_get_node_count(&mut self, graph: u64) -> CuResult<u64>;
+    /// Stream-ordered memset (capture-safe; the sync form would invalidate an
+    /// active capture).
+    fn memset_d8_async(&mut self, dptr: u64, value: u8, bytes: u64, stream: u64) -> CuResult<()>;
+    /// Stream-ordered device-to-device copy (capture-safe).
+    fn memcpy_dtod_async(&mut self, dst: u64, src: u64, bytes: u64, stream: u64) -> CuResult<()>;
     fn stream_destroy(&mut self, stream: u64) -> CuResult<()>;
     fn stream_synchronize(&mut self, stream: u64) -> CuResult<()>;
     fn event_create(&mut self, flags: u32) -> CuResult<u64>;
@@ -182,7 +203,13 @@ pub fn serve<S: Read + Write>(mut stream: S, backend: &mut dyn Backend) -> std::
             // Quiet wrapper: execute the inner request, reply with nothing.
             Some(&crate::proto::QUIET_PREFIX) => {
                 let req = decode_request(&payload[1..])?;
+                if std::env::var_os("SMOLVM_CUDA_HOST_OPLOG").is_some() {
+                    eprintln!("[op~] 0x{:02x} len={}", payload[1], payload.len());
+                }
                 let (status, _) = dispatch(&mut sess, backend, req);
+                if status != 0 && std::env::var_os("SMOLVM_CUDA_HOST_OPLOG").is_some() {
+                    eprintln!("[op~!] status={status}");
+                }
                 if status != 0 && quiet_sticky == 0 {
                     quiet_sticky = status;
                 }
@@ -194,7 +221,13 @@ pub fn serve<S: Read + Write>(mut stream: S, backend: &mut dyn Backend) -> std::
             }
             _ => {
                 let req = decode_request(&payload)?;
+                if std::env::var_os("SMOLVM_CUDA_HOST_OPLOG").is_some() {
+                    eprintln!("[op] 0x{:02x} len={}", payload[0], payload.len());
+                }
                 let (status, resp) = dispatch(&mut sess, backend, req);
+                if status != 0 && std::env::var_os("SMOLVM_CUDA_HOST_OPLOG").is_some() {
+                    eprintln!("[op!] status={status}");
+                }
                 let out = encode_response(status, &resp);
                 write_msg(&mut stream, &out)?;
             }
@@ -311,6 +344,49 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             let id = sess.mint();
             sess.streams.insert(id, raw);
             Ok(Response::Handle(id))
+        }
+        Request::StreamBeginCapture { stream, mode } => {
+            let raw = raw_stream(sess, stream)?;
+            b.stream_begin_capture(raw, mode).map(|_| Response::Ok)
+        }
+        Request::StreamEndCapture { stream } => {
+            let raw = raw_stream(sess, stream)?;
+            b.stream_end_capture(raw).map(Response::Handle)
+        }
+        Request::StreamCaptureInfo { stream } => {
+            let raw = raw_stream(sess, stream)?;
+            b.stream_capture_info(raw)
+                .map(|(st, id)| Response::Pair(st, id))
+        }
+        Request::GraphInstantiate { graph } => b.graph_instantiate(graph).map(Response::Handle),
+        Request::GraphLaunch { graph_exec, stream } => {
+            let raw = raw_stream(sess, stream)?;
+            b.graph_launch(graph_exec, raw).map(|_| Response::Ok)
+        }
+        Request::GraphExecDestroy { graph_exec } => {
+            b.graph_exec_destroy(graph_exec).map(|_| Response::Ok)
+        }
+        Request::GraphDestroy { graph } => b.graph_destroy(graph).map(|_| Response::Ok),
+        Request::GraphGetNodes { graph } => b.graph_get_node_count(graph).map(Response::Bytes),
+        Request::MemsetD8Async {
+            dptr,
+            value,
+            bytes,
+            stream,
+        } => {
+            let raw = raw_stream(sess, stream)?;
+            b.memset_d8_async(dptr, value, bytes, raw)
+                .map(|_| Response::Ok)
+        }
+        Request::MemcpyDtoDAsync {
+            dst,
+            src,
+            bytes,
+            stream,
+        } => {
+            let raw = raw_stream(sess, stream)?;
+            b.memcpy_dtod_async(dst, src, bytes, raw)
+                .map(|_| Response::Ok)
         }
         Request::StreamDestroy { stream } => {
             let raw = raw(&sess.streams, stream)?;
@@ -671,6 +747,36 @@ impl Backend for CpuBackend {
     // synchronously, so create/destroy mint handles and the rest are no-ops.
     fn stream_create(&mut self, _flags: u32) -> CuResult<u64> {
         Ok(self.handle())
+    }
+    fn stream_begin_capture(&mut self, _stream: u64, _mode: i32) -> CuResult<()> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
+    fn stream_end_capture(&mut self, _stream: u64) -> CuResult<u64> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
+    fn stream_capture_info(&mut self, _stream: u64) -> CuResult<(u64, u64)> {
+        Ok((0, 0)) // cudaStreamCaptureStatusNone
+    }
+    fn graph_instantiate(&mut self, _graph: u64) -> CuResult<u64> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
+    fn graph_launch(&mut self, _graph_exec: u64, _stream: u64) -> CuResult<()> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
+    fn graph_exec_destroy(&mut self, _graph_exec: u64) -> CuResult<()> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
+    fn graph_destroy(&mut self, _graph: u64) -> CuResult<()> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
+    fn graph_get_node_count(&mut self, _graph: u64) -> CuResult<u64> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
+    fn memset_d8_async(&mut self, dptr: u64, value: u8, bytes: u64, _stream: u64) -> CuResult<()> {
+        self.memset_d8(dptr, value, bytes)
+    }
+    fn memcpy_dtod_async(&mut self, dst: u64, src: u64, bytes: u64, _stream: u64) -> CuResult<()> {
+        self.memcpy_dtod(dst, src, bytes)
     }
     fn stream_destroy(&mut self, _stream: u64) -> CuResult<()> {
         Ok(())
