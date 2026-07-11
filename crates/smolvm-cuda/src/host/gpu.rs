@@ -105,6 +105,11 @@ pub struct GpuBackend {
     cublaslt: Option<CublasLt>,
     /// Legacy cuDNN batch-norm (Ex) forwarder — PyTorch's `BatchNorm2d` path.
     cudnn_bn: Option<CudnnBn>,
+    /// Guest-assigned virtual handle (bit 63 set) → real host descriptor
+    /// pointer. Lets the guest fire-and-forget descriptor creation: it invents
+    /// the id, the host materializes and maps it, and every later reference is
+    /// translated here. Real pointers (bit 63 clear) pass through untouched.
+    vhandles: std::collections::HashMap<u64, u64>,
     /// Host mappings of guest RAM, each `(gpa_start, host_va, len)`, for
     /// zero-copy `memcpy_gpa_*` (via `krun_get_guest_ram`). Empty outside a
     /// microVM / on older libkrun. Guest RAM is usually split into a low and a
@@ -332,6 +337,7 @@ impl GpuBackend {
                 cublas_gen: None,
                 cudnn_gen: None,
                 cudnn_backend: None,
+                vhandles: std::collections::HashMap::new(),
                 cublaslt: None,
                 cudnn_bn: None,
                 guest_ram: Vec::new(),
@@ -903,29 +909,63 @@ impl CudnnBackend {
 
     /// `func` selects the entry point; `args` is the hand-packed little-endian
     /// argument blob (see the guest shim). Returns `(cudnnStatus, out_bytes)`.
-    fn dispatch(&self, func: u16, args: &[u8]) -> (i32, Vec<u8>) {
+    /// Descriptor handles may be guest-assigned virtual ids (`vh`); attribute
+    /// arrays of type `CUDNN_TYPE_BACKEND_DESCRIPTOR` embed handles and are
+    /// translated element-wise.
+    fn dispatch(
+        &self,
+        func: u16,
+        args: &[u8],
+        vh: &mut std::collections::HashMap<u64, u64>,
+    ) -> (i32, Vec<u8>) {
+        /// `cudnnBackendAttributeType_t` values whose 8-byte elements are
+        /// handles the guest may know only by virtual id: HANDLE(0) — the
+        /// cudnnHandle_t itself — and BACKEND_DESCRIPTOR(15). VOID_PTR(6)
+        /// elements are device pointers (untagged), translated harmlessly.
+        fn handle_bearing(ty: i32) -> bool {
+            matches!(ty, 0 | 6 | 15)
+        }
+        const TYPE_BACKEND_DESCRIPTOR: i32 = 15;
         let rd_u64 = |a: &[u8], o: usize| u64::from_le_bytes(a[o..o + 8].try_into().unwrap());
         let rd_i32 = |a: &[u8], o: usize| i32::from_le_bytes(a[o..o + 4].try_into().unwrap());
         let rd_i64 = |a: &[u8], o: usize| i64::from_le_bytes(a[o..o + 8].try_into().unwrap());
         match func {
             0 => {
-                // create(type) -> handle
+                // create(type[, virtual-id]) -> handle. With a virtual id the
+                // guest fired-and-forgot: map it and reply with the real
+                // pointer (ignored by a pipelining guest, used by an old one).
                 let ty = rd_i32(args, 0);
                 let mut desc: *mut c_void = std::ptr::null_mut();
                 let st = unsafe { (self.create)(ty, &mut desc) };
+                if st == 0 && args.len() >= 12 {
+                    let id = rd_u64(args, 4);
+                    if id & VHANDLE_TAG != 0 {
+                        vh.insert(id, desc as u64);
+                    }
+                }
                 (st, (desc as u64).to_le_bytes().to_vec())
             }
             1 => {
-                let desc = rd_u64(args, 0) as *mut c_void;
+                let id = rd_u64(args, 0);
+                let desc = vh_resolve(vh, id) as *mut c_void;
+                if id & VHANDLE_TAG != 0 {
+                    vh.remove(&id);
+                }
                 (unsafe { (self.destroy)(desc) }, Vec::new())
             }
             2 => {
                 // set_attr(desc, name, type, count, elements...)
-                let desc = rd_u64(args, 0) as *mut c_void;
+                let desc = vh_resolve(vh, rd_u64(args, 0)) as *mut c_void;
                 let name = rd_i32(args, 8);
                 let ty = rd_i32(args, 12);
                 let count = rd_i64(args, 16);
-                let elems = &args[24..];
+                let mut elems = args[24..].to_vec();
+                if handle_bearing(ty) {
+                    for chunk in elems.chunks_exact_mut(8) {
+                        let h = u64::from_le_bytes(chunk.try_into().unwrap());
+                        chunk.copy_from_slice(&vh_resolve(vh, h).to_le_bytes());
+                    }
+                }
                 let st = unsafe { (self.set_attr)(desc, name, ty, count, elems.as_ptr().cast()) };
                 (st, Vec::new())
             }
@@ -933,8 +973,9 @@ impl CudnnBackend {
                 // get_attr(desc, name, type, requestedCount, input_bytes) -> count + bytes.
                 // For descriptor-array attributes the caller pre-creates the
                 // descriptors and passes their handles in; cuDNN populates them
-                // in place. So seed the buffer with the forwarded input.
-                let desc = rd_u64(args, 0) as *mut c_void;
+                // in place. So seed the buffer with the forwarded input
+                // (translated — the guest may pass virtual ids).
+                let desc = vh_resolve(vh, rd_u64(args, 0)) as *mut c_void;
                 let name = rd_i32(args, 8);
                 let ty = rd_i32(args, 12);
                 let req = rd_i64(args, 16);
@@ -943,6 +984,12 @@ impl CudnnBackend {
                 let mut buf = vec![0u8; cap];
                 let seed = input.len().min(cap);
                 buf[..seed].copy_from_slice(&input[..seed]);
+                if handle_bearing(ty) {
+                    for chunk in buf[..seed].chunks_exact_mut(8) {
+                        let h = u64::from_le_bytes(chunk.try_into().unwrap());
+                        chunk.copy_from_slice(&vh_resolve(vh, h).to_le_bytes());
+                    }
+                }
                 let mut count: i64 = 0;
                 let ptr = if cap == 0 {
                     std::ptr::null_mut()
@@ -956,14 +1003,14 @@ impl CudnnBackend {
                 (st, out)
             }
             4 => {
-                let desc = rd_u64(args, 0) as *mut c_void;
+                let desc = vh_resolve(vh, rd_u64(args, 0)) as *mut c_void;
                 (unsafe { (self.finalize)(desc) }, Vec::new())
             }
             5 => {
                 // execute(handle, plan, variantPack)
-                let handle = rd_u64(args, 0) as *mut c_void;
-                let plan = rd_u64(args, 8) as *mut c_void;
-                let vpack = rd_u64(args, 16) as *mut c_void;
+                let handle = vh_resolve(vh, rd_u64(args, 0)) as *mut c_void;
+                let plan = vh_resolve(vh, rd_u64(args, 8)) as *mut c_void;
+                let vpack = vh_resolve(vh, rd_u64(args, 16)) as *mut c_void;
                 (unsafe { (self.execute)(handle, plan, vpack) }, Vec::new())
             }
             _ => (super::CUDA_ERROR_NOT_FOUND, Vec::new()),
@@ -1054,7 +1101,12 @@ impl CublasLt {
 
     /// `func` selects the entry point; `args` is the hand-packed little-endian
     /// argument blob (see the guest shim). Returns `(cublasStatus, out_bytes)`.
-    fn dispatch(&self, func: u16, args: &[u8]) -> (i32, Vec<u8>) {
+    fn dispatch(
+        &self,
+        func: u16,
+        args: &[u8],
+        vh: &std::collections::HashMap<u64, u64>,
+    ) -> (i32, Vec<u8>) {
         // sizeof(cublasLtMatmulHeuristicResult_t): algo[64] + workspaceSize(8)
         // + state(4) + wavesCount(4) + reserved[4](16) = 96 bytes.
         const HEUR_RESULT_SZ: usize = 96;
@@ -1126,7 +1178,7 @@ impl CublasLt {
             9 => {
                 // algo_get_heuristic(light, opDesc, A, B, C, D, pref, requested)
                 //   -> returnCount + returnCount * heuristicResult structs.
-                let light = rd_u64(0) as *mut c_void;
+                let light = vh_resolve(vh, rd_u64(0)) as *mut c_void;
                 let op = rd_u64(8) as *mut c_void;
                 let a = rd_u64(16) as *mut c_void;
                 let b = rd_u64(24) as *mut c_void;
@@ -1158,7 +1210,7 @@ impl CublasLt {
             10 => {
                 // matmul(light, desc, alpha[16], A, Adesc, B, Bdesc, beta[16],
                 //   C, Cdesc, D, Ddesc, algo[64], workspace, wsSize, stream)
-                let light = rd_u64(0) as *mut c_void;
+                let light = vh_resolve(vh, rd_u64(0)) as *mut c_void;
                 let desc = rd_u64(8) as *mut c_void;
                 let alpha = &args[16..32];
                 let a = rd_u64(32) as *mut c_void;
@@ -1216,11 +1268,31 @@ impl CublasLt {
     }
 }
 
+/// The tag bit marking a guest-assigned virtual handle. Host userspace
+/// pointers and CUDA device VAs never have bit 63 set, so tagged values are
+/// unambiguous on the wire.
+const VHANDLE_TAG: u64 = 1 << 63;
+
+/// Resolve a possibly-virtual handle against the map: tagged values must be
+/// mapped (0 → guaranteed invalid-handle error from the library), real
+/// pointers pass through.
+fn vh_resolve(map: &std::collections::HashMap<u64, u64>, h: u64) -> u64 {
+    if h & VHANDLE_TAG != 0 {
+        map.get(&h).copied().unwrap_or(0)
+    } else {
+        h
+    }
+}
+
 /// Little-endian cursor over a hand-packed argument blob (host side of the
 /// batchnorm forwarder). Mirrors the guest shim's packing exactly.
 struct Cur<'a> {
     b: &'a [u8],
     p: usize,
+    /// Virtual-handle map for resolving guest-assigned descriptor ids in
+    /// [`Cur::ptr`]. Device pointers and real host pointers pass through
+    /// (bit 63 clear).
+    vh: &'a std::collections::HashMap<u64, u64>,
 }
 impl Cur<'_> {
     fn take(&mut self, n: usize) -> &[u8] {
@@ -1241,7 +1313,7 @@ impl Cur<'_> {
         f64::from_le_bytes(self.take(8).try_into().unwrap())
     }
     fn ptr(&mut self) -> *mut c_void {
-        self.u64() as *mut c_void
+        vh_resolve(self.vh, self.u64()) as *mut c_void
     }
 }
 
@@ -1391,8 +1463,13 @@ impl CudnnBn {
         }
     }
 
-    fn dispatch(&self, func: u16, args: &[u8]) -> (i32, Vec<u8>) {
-        let mut c = Cur { b: args, p: 0 };
+    fn dispatch(
+        &self,
+        func: u16,
+        args: &[u8],
+        vh: &std::collections::HashMap<u64, u64>,
+    ) -> (i32, Vec<u8>) {
+        let mut c = Cur { b: args, p: 0, vh };
         match func {
             0 => {
                 // set_nd(desc, dataType, nbDims, dimA[], strideA[])
@@ -1764,7 +1841,11 @@ impl GpuBackend {
                         }
                     }
                 }
-                Ok(self.cublas_gen.as_ref().unwrap().dispatch(func, args))
+                Ok(self
+                    .cublas_gen
+                    .as_ref()
+                    .unwrap()
+                    .dispatch(func, args, &mut self.vhandles))
             }
             LIB_CUDNN => {
                 if self.cudnn_gen.is_none() {
@@ -1776,7 +1857,11 @@ impl GpuBackend {
                         }
                     }
                 }
-                Ok(self.cudnn_gen.as_ref().unwrap().dispatch(func, args))
+                Ok(self
+                    .cudnn_gen
+                    .as_ref()
+                    .unwrap()
+                    .dispatch(func, args, &mut self.vhandles))
             }
             LIB_CUDNN_BACKEND => {
                 if self.cudnn_backend.is_none() {
@@ -1788,7 +1873,11 @@ impl GpuBackend {
                         }
                     }
                 }
-                Ok(self.cudnn_backend.as_ref().unwrap().dispatch(func, args))
+                Ok(self
+                    .cudnn_backend
+                    .as_ref()
+                    .unwrap()
+                    .dispatch(func, args, &mut self.vhandles))
             }
             LIB_CUBLASLT => {
                 if self.cublaslt.is_none() {
@@ -1800,7 +1889,11 @@ impl GpuBackend {
                         }
                     }
                 }
-                Ok(self.cublaslt.as_ref().unwrap().dispatch(func, args))
+                Ok(self
+                    .cublaslt
+                    .as_ref()
+                    .unwrap()
+                    .dispatch(func, args, &self.vhandles))
             }
             LIB_CUDNN_BN => {
                 if self.cudnn_bn.is_none() {
@@ -1812,7 +1905,11 @@ impl GpuBackend {
                         }
                     }
                 }
-                Ok(self.cudnn_bn.as_ref().unwrap().dispatch(func, args))
+                Ok(self
+                    .cudnn_bn
+                    .as_ref()
+                    .unwrap()
+                    .dispatch(func, args, &self.vhandles))
             }
             _ => Err(super::CUDA_ERROR_NOT_FOUND),
         }

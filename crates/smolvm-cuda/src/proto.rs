@@ -18,6 +18,15 @@ use std::io::{self, Read, Write};
 /// Maximum accepted message payload (256 MiB) — bounds a hostile/length field.
 pub const MAX_MSG: usize = 256 * 1024 * 1024;
 
+/// First byte of a *quiet* request frame: the server executes the wrapped
+/// request (encoded normally after this byte) and sends **no response**; the
+/// first failing status is held until the next [`FENCE_OP`]. Chosen outside
+/// the [`Op`] value space.
+pub const QUIET_PREFIX: u8 = 0x7F;
+/// Single-byte fence request: replies with (and clears) the first failing
+/// status among quiet requests since the previous fence.
+pub const FENCE_OP: u8 = 0x7E;
+
 /// Request opcodes. Stable wire values — append only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]

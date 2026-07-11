@@ -36,17 +36,158 @@ impl From<io::Error> for CudaRpcError {
 
 pub type Result<T> = std::result::Result<T, CudaRpcError>;
 
+/// Debug profiling (`SMOLVM_CUDA_COUNT_SYNC=1`): tally synchronous round-trips
+/// per op, dumped to stderr every 4096 calls, to show what still serializes an
+/// asynchronously-pipelined workload. For `LibCall` the tally key includes the
+/// library id and function index.
+fn count_sync(req: &Request, op: Op) {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static COUNTS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
+    let key = match req {
+        Request::LibCall { lib, func, .. } => format!("LibCall(lib={lib},func={func})"),
+        Request::ModuleGetFunction { name, .. } => format!("ModuleGetFunction({name})"),
+        Request::FuncGetParamInfo { function } => format!("FuncGetParamInfo(fid={function})"),
+        Request::ModuleLoadData { image } => format!("ModuleLoadData(len={})", image.len()),
+        _ => format!("{op:?}"),
+    };
+    let mut g = COUNTS.lock().unwrap();
+    let m = g.get_or_insert_with(HashMap::new);
+    *m.entry(key).or_insert(0) += 1;
+    let total: u64 = m.values().sum();
+    if total % 4096 == 0 {
+        let mut v: Vec<_> = m.iter().collect();
+        v.sort_by(|a, b| b.1.cmp(a.1));
+        eprintln!("[sync-counts after {total}]");
+        for (k, n) in v.iter().take(12) {
+            eprintln!("  {n:>8}  {k}");
+        }
+    }
+}
+
 /// A CUDA Driver-API client over one connection to the host server.
 pub struct Client<S> {
     stream: S,
+    /// Count of quiet (fire-and-forget) requests since the last fence. Quiet
+    /// requests produce no responses; a fence settles them all at once.
+    deferred: usize,
+    /// First non-zero status collected from a deferred response — surfaced at
+    /// the next launch/synchronize, mirroring CUDA's asynchronous ("sticky")
+    /// error reporting.
+    sticky: i32,
+    /// Kill-switch: `SMOLVM_CUDA_ASYNC=0` restores strict per-call round-trips.
+    defer_enabled: bool,
+    /// Framed-but-unsent deferred requests. Batching them into one write turns
+    /// a launch storm's thousand syscalls into a handful; flushed before any
+    /// read (a response can only exist for a request the host has seen).
+    wbuf: Vec<u8>,
 }
+
+/// Outstanding-response cap. Responses are ~8 bytes, so even the smallest
+/// socket buffer holds far more than this; the cap just bounds how much work
+/// can race ahead of an error being noticed.
+const MAX_DEFERRED: usize = 512;
+/// Flush the deferred-write buffer beyond this size even without a sync point,
+/// so bulk H2D byte-shipping doesn't accumulate unbounded copies in memory.
+const WBUF_FLUSH: usize = 256 * 1024;
 
 impl<S: Read + Write> Client<S> {
     pub fn new(stream: S) -> Self {
-        Client { stream }
+        Client {
+            stream,
+            deferred: 0,
+            sticky: 0,
+            defer_enabled: std::env::var("SMOLVM_CUDA_ASYNC").as_deref() != Ok("0"),
+            wbuf: Vec::new(),
+        }
+    }
+
+    /// Send everything buffered by deferred calls.
+    fn flush_wbuf(&mut self) -> Result<()> {
+        if !self.wbuf.is_empty() {
+            self.stream.write_all(&self.wbuf)?;
+            self.stream.flush()?;
+            self.wbuf.clear();
+        }
+        Ok(())
+    }
+
+    /// Settle all fire-and-forget work with a single fence round-trip: quiet
+    /// requests produce no per-op responses (each response read costs a guest
+    /// wake-up on vsock), so one fence reply carries the first failure among
+    /// them.
+    fn drain(&mut self) -> Result<()> {
+        if self.deferred == 0 {
+            return self.flush_wbuf();
+        }
+        self.deferred = 0;
+        self.wbuf.extend_from_slice(&1u32.to_le_bytes());
+        self.wbuf.push(crate::proto::FENCE_OP);
+        self.flush_wbuf()?;
+        let payload =
+            read_msg(&mut self.stream)?.ok_or(CudaRpcError::Protocol("host closed mid-fence"))?;
+        if payload.len() >= 4 {
+            let status = i32::from_le_bytes(payload[..4].try_into().unwrap());
+            if status != 0 && self.sticky == 0 {
+                self.sticky = status;
+            }
+        }
+        Ok(())
+    }
+
+    /// Take (and clear) the sticky asynchronous error, if any. Non-blocking:
+    /// reports failures already collected by a past drain, the way
+    /// `cudaGetLastError` reports asynchronous errors observed so far.
+    pub fn take_sticky(&mut self) -> i32 {
+        std::mem::take(&mut self.sticky)
+    }
+
+    /// Send `req` without waiting for its (status-only) response. Ordering is
+    /// preserved — the host serves one request at a time in arrival order — so
+    /// the deferred work is complete by the time any later round-trip returns.
+    /// Fails fast if an earlier deferred op already failed (sticky).
+    fn call_deferred(&mut self, req: &Request, op: Op) -> Result<()> {
+        self.call_deferred_kind(req, op, false)
+    }
+
+    fn call_deferred_kind(&mut self, req: &Request, op: Op, _is_libcall: bool) -> Result<()> {
+        if !self.defer_enabled {
+            return self.call(req, op).map(|_| ());
+        }
+        if self.deferred >= MAX_DEFERRED {
+            self.drain()?;
+        }
+        if self.sticky != 0 {
+            return Err(CudaRpcError::Cuda(std::mem::take(&mut self.sticky)));
+        }
+        // Frame into the batch buffer as a QUIET request (no response) — one
+        // write syscall per sync point (or per WBUF_FLUSH bytes), and one
+        // fence reply per drain instead of one reply per request.
+        let payload = encode_request(req);
+        self.wbuf
+            .extend_from_slice(&((payload.len() + 1) as u32).to_le_bytes());
+        self.wbuf.push(crate::proto::QUIET_PREFIX);
+        self.wbuf.extend_from_slice(&payload);
+        self.deferred += 1;
+        if self.wbuf.len() >= WBUF_FLUSH {
+            self.flush_wbuf()?;
+        }
+        Ok(())
+    }
+
+    /// Fire-and-forget `LibCall` for library functions with no output
+    /// parameters (GEMMs, conv/batch-norm executes, stream setters): the call
+    /// reports optimistic success and a real failure surfaces as a sticky
+    /// asynchronous error, like a failed kernel launch.
+    pub fn lib_call_deferred(&mut self, lib: u8, func: u16, args: Vec<u8>) -> Result<()> {
+        self.call_deferred_kind(&Request::LibCall { lib, func, args }, Op::LibCall, true)
     }
 
     fn call(&mut self, req: &Request, op: Op) -> Result<Response> {
+        if std::env::var_os("SMOLVM_CUDA_COUNT_SYNC").is_some() {
+            count_sync(req, op);
+        }
+        self.drain()?;
         write_msg(&mut self.stream, &encode_request(req))?;
         let payload =
             read_msg(&mut self.stream)?.ok_or(CudaRpcError::Protocol("host closed mid-call"))?;
@@ -127,19 +268,20 @@ impl<S: Read + Write> Client<S> {
     }
 
     pub fn mem_free(&mut self, dptr: u64) -> Result<()> {
-        self.call(&Request::MemFree { dptr }, Op::MemFree)
-            .map(|_| ())
+        // Deferred: status-only, and callers ignore free failures anyway.
+        self.call_deferred(&Request::MemFree { dptr }, Op::MemFree)
     }
 
     pub fn memcpy_htod(&mut self, dptr: u64, data: &[u8]) -> Result<()> {
-        self.call(
+        // Deferred: the bytes are copied into the request, so the caller may
+        // reuse its buffer immediately — synchronous-memcpy semantics hold.
+        self.call_deferred(
             &Request::MemcpyHtoD {
                 dptr,
                 data: data.to_vec(),
             },
             Op::MemcpyHtoD,
         )
-        .map(|_| ())
     }
 
     pub fn memcpy_dtoh(&mut self, dptr: u64, bytes: u64) -> Result<Vec<u8>> {
@@ -159,7 +301,10 @@ impl<S: Read + Write> Client<S> {
         stream: u64,
         params: &[Vec<u8>],
     ) -> Result<()> {
-        self.call(
+        // Deferred: kernel launches are asynchronous by CUDA contract; launch
+        // failures surface at the next synchronize (or as a sticky error),
+        // exactly like a real asynchronous launch error.
+        self.call_deferred(
             &Request::LaunchKernel {
                 function,
                 grid,
@@ -170,12 +315,16 @@ impl<S: Read + Write> Client<S> {
             },
             Op::LaunchKernel,
         )
-        .map(|_| ())
     }
 
     pub fn ctx_synchronize(&mut self) -> Result<()> {
-        self.call(&Request::CtxSynchronize, Op::CtxSynchronize)
-            .map(|_| ())
+        self.call(&Request::CtxSynchronize, Op::CtxSynchronize)?;
+        // Surface any asynchronous failure collected while draining, the way
+        // cudaDeviceSynchronize reports errors from earlier async work.
+        match self.take_sticky() {
+            0 => Ok(()),
+            code => Err(CudaRpcError::Cuda(code)),
+        }
     }
 
     pub fn driver_get_version(&mut self) -> Result<i32> {
@@ -246,8 +395,8 @@ impl<S: Read + Write> Client<S> {
     }
 
     pub fn memset_d8(&mut self, dptr: u64, value: u8, bytes: u64) -> Result<()> {
-        self.call(&Request::MemsetD8 { dptr, value, bytes }, Op::MemsetD8)
-            .map(|_| ())
+        // Deferred: status-only device-side work, same contract as a launch.
+        self.call_deferred(&Request::MemsetD8 { dptr, value, bytes }, Op::MemsetD8)
     }
 
     /// Returns `(free, total)` device memory in bytes.

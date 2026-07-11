@@ -38,26 +38,28 @@ impl GenLib {
             })
         }
     }
-    pub fn dispatch(&self, func: u16, args: &[u8]) -> (i32, Vec<u8>) {
+    pub fn dispatch(&self, func: u16, args: &[u8], __vh: &mut std::collections::HashMap<u64, u64>) -> (i32, Vec<u8>) {
         let mut __c = GenCur { b: args, p: 0 };
         match func {
-            0 => { let mut h: *mut c_void = std::ptr::null_mut(); let st = unsafe { (self.f_cudnnCreate)(&mut h) }; (st, (h as u64).to_le_bytes().to_vec()) }
+            0 => { let mut h: *mut c_void = std::ptr::null_mut(); let st = unsafe { (self.f_cudnnCreate)(&mut h) }; if st == 0 && args.len() >= 8 { let id = u64::from_le_bytes(args[..8].try_into().unwrap()); if id & super::VHANDLE_TAG != 0 { __vh.insert(id, h as u64); } } (st, (h as u64).to_le_bytes().to_vec()) }
             1 => {
-                let handle = __c.u64() as *mut c_void;
+                let __raw = __c.u64();
+                let handle = super::vh_resolve(__vh, __raw) as *mut c_void;
+                if __raw & super::VHANDLE_TAG != 0 { __vh.remove(&__raw); }
                 let mut out = Vec::new();
                 let st = unsafe { (self.f_cudnnDestroy)(handle) };
                 (st, out)
             }
             2 => {
-                let handle = __c.u64() as *mut c_void;
-                let stream = __c.u64() as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let stream = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
                 let mut out = Vec::new();
                 let st = unsafe { (self.f_cudnnSetStream)(handle, stream) };
                 (st, out)
             }
-            3 => { let mut h: *mut c_void = std::ptr::null_mut(); let st = unsafe { (self.f_cudnnCreateTensorDescriptor)(&mut h) }; (st, (h as u64).to_le_bytes().to_vec()) }
+            3 => { let mut h: *mut c_void = std::ptr::null_mut(); let st = unsafe { (self.f_cudnnCreateTensorDescriptor)(&mut h) }; if st == 0 && args.len() >= 8 { let id = u64::from_le_bytes(args[..8].try_into().unwrap()); if id & super::VHANDLE_TAG != 0 { __vh.insert(id, h as u64); } } (st, (h as u64).to_le_bytes().to_vec()) }
             4 => {
-                let t = __c.u64() as *mut c_void;
+                let t = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
                 let fmt = __c.i32();
                 let dtype = __c.i32();
                 let n = __c.i32();
@@ -69,14 +71,16 @@ impl GenLib {
                 (st, out)
             }
             5 => {
-                let t = __c.u64() as *mut c_void;
+                let __raw = __c.u64();
+                let t = super::vh_resolve(__vh, __raw) as *mut c_void;
+                if __raw & super::VHANDLE_TAG != 0 { __vh.remove(&__raw); }
                 let mut out = Vec::new();
                 let st = unsafe { (self.f_cudnnDestroyTensorDescriptor)(t) };
                 (st, out)
             }
-            6 => { let mut h: *mut c_void = std::ptr::null_mut(); let st = unsafe { (self.f_cudnnCreateFilterDescriptor)(&mut h) }; (st, (h as u64).to_le_bytes().to_vec()) }
+            6 => { let mut h: *mut c_void = std::ptr::null_mut(); let st = unsafe { (self.f_cudnnCreateFilterDescriptor)(&mut h) }; if st == 0 && args.len() >= 8 { let id = u64::from_le_bytes(args[..8].try_into().unwrap()); if id & super::VHANDLE_TAG != 0 { __vh.insert(id, h as u64); } } (st, (h as u64).to_le_bytes().to_vec()) }
             7 => {
-                let f = __c.u64() as *mut c_void;
+                let f = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
                 let dtype = __c.i32();
                 let fmt = __c.i32();
                 let k = __c.i32();
@@ -88,14 +92,16 @@ impl GenLib {
                 (st, out)
             }
             8 => {
-                let f = __c.u64() as *mut c_void;
+                let __raw = __c.u64();
+                let f = super::vh_resolve(__vh, __raw) as *mut c_void;
+                if __raw & super::VHANDLE_TAG != 0 { __vh.remove(&__raw); }
                 let mut out = Vec::new();
                 let st = unsafe { (self.f_cudnnDestroyFilterDescriptor)(f) };
                 (st, out)
             }
-            9 => { let mut h: *mut c_void = std::ptr::null_mut(); let st = unsafe { (self.f_cudnnCreateConvolutionDescriptor)(&mut h) }; (st, (h as u64).to_le_bytes().to_vec()) }
+            9 => { let mut h: *mut c_void = std::ptr::null_mut(); let st = unsafe { (self.f_cudnnCreateConvolutionDescriptor)(&mut h) }; if st == 0 && args.len() >= 8 { let id = u64::from_le_bytes(args[..8].try_into().unwrap()); if id & super::VHANDLE_TAG != 0 { __vh.insert(id, h as u64); } } (st, (h as u64).to_le_bytes().to_vec()) }
             10 => {
-                let cv = __c.u64() as *mut c_void;
+                let cv = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
                 let pad_h = __c.i32();
                 let pad_w = __c.i32();
                 let u = __c.i32();
@@ -109,17 +115,19 @@ impl GenLib {
                 (st, out)
             }
             11 => {
-                let cv = __c.u64() as *mut c_void;
+                let __raw = __c.u64();
+                let cv = super::vh_resolve(__vh, __raw) as *mut c_void;
+                if __raw & super::VHANDLE_TAG != 0 { __vh.remove(&__raw); }
                 let mut out = Vec::new();
                 let st = unsafe { (self.f_cudnnDestroyConvolutionDescriptor)(cv) };
                 (st, out)
             }
             12 => {
-                let handle = __c.u64() as *mut c_void;
-                let x = __c.u64() as *mut c_void;
-                let w = __c.u64() as *mut c_void;
-                let cv = __c.u64() as *mut c_void;
-                let y = __c.u64() as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let x = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let w = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let cv = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let y = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
                 let algo = __c.i32();
                 let mut size_v: usize = 0 as usize;
                 let mut out = Vec::new();
@@ -128,18 +136,18 @@ impl GenLib {
                 (st, out)
             }
             13 => {
-                let handle = __c.u64() as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
                 let alpha_v = __c.f32();
-                let xDesc = __c.u64() as *mut c_void;
+                let xDesc = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
                 let x = __c.u64() as *mut c_void;
-                let wDesc = __c.u64() as *mut c_void;
+                let wDesc = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
                 let w = __c.u64() as *mut c_void;
-                let convDesc = __c.u64() as *mut c_void;
+                let convDesc = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
                 let algo = __c.i32();
                 let workspace = __c.u64() as *mut c_void;
                 let wsSize = __c.u64();
                 let beta_v = __c.f32();
-                let yDesc = __c.u64() as *mut c_void;
+                let yDesc = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
                 let y = __c.u64() as *mut c_void;
                 let mut out = Vec::new();
                 let st = unsafe { (self.f_cudnnConvolutionForward)(handle, &alpha_v, xDesc, x, wDesc, w, convDesc, algo as c_int, workspace, wsSize as usize, &beta_v, yDesc, y) };

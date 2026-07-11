@@ -1461,6 +1461,10 @@ fn do_launch(
     stream: u64,
     args: *mut *mut c_void,
 ) -> c_int {
+    // Debug bisection: drop launches entirely to isolate marshaling cost.
+    if std::env::var_os("SMOLVM_CUDA_NOOP_LAUNCH").is_some() {
+        return CUDA_SUCCESS;
+    }
     with_state(|s| {
         let rec = s
             .funcs
@@ -1568,6 +1572,7 @@ pub extern "C" fn __cudaLaunchKernel_ptsz(
 
 #[no_mangle]
 pub extern "C" fn cudaGetLastError() -> c_int {
+    merge_sticky_async_error();
     LAST_ERROR.with(|e| {
         let v = e.get();
         e.set(CUDA_SUCCESS);
@@ -1577,7 +1582,22 @@ pub extern "C" fn cudaGetLastError() -> c_int {
 
 #[no_mangle]
 pub extern "C" fn cudaPeekAtLastError() -> c_int {
+    merge_sticky_async_error();
     LAST_ERROR.with(|e| e.get())
+}
+
+/// Fold any sticky asynchronous-pipeline error (a deferred launch/memcpy that
+/// failed on the host) into the thread's last-error slot. Non-blocking: it
+/// only reports failures already observed, matching how `cudaGetLastError`
+/// reports asynchronous errors "seen so far" without synchronizing.
+fn merge_sticky_async_error() {
+    let _ = with_state(|s| {
+        let code = s.client.take_sticky();
+        if code != 0 {
+            set_last(map_err(CudaRpcError::Cuda(code)));
+        }
+        Ok(())
+    });
 }
 
 #[no_mangle]
@@ -1693,6 +1713,15 @@ mod gen_cudnn {
 // pointers, so attribute arrays ship as raw bytes sized by the attribute type.
 const LIB_CUDNN_BACKEND: u8 = 3;
 
+/// Guest-assigned virtual descriptor ids (bit 63 tags them; host userspace
+/// pointers and device VAs never set it). Lets create calls fire-and-forget:
+/// we invent the id, the host maps it to the real descriptor it creates.
+pub(crate) fn alloc_vhandle() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new((1 << 63) | 1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Byte size of one `cudnnBackendAttributeType_t` element (must match host).
 fn cudnn_be_elem_size(t: c_int) -> usize {
     match t {
@@ -1711,14 +1740,17 @@ pub extern "C" fn cudnnBackendCreateDescriptor(
     if descriptor.is_null() {
         return 2000; // CUDNN_STATUS_BAD_PARAM
     }
-    let a = descriptor_type.to_le_bytes().to_vec();
-    match with_client(|c| c.lib_call(LIB_CUDNN_BACKEND, 0, a)) {
-        Ok((0, out)) if out.len() >= 8 => {
-            let h = u64::from_le_bytes(out[..8].try_into().unwrap());
-            unsafe { *descriptor = h as *mut c_void };
+    // Fire-and-forget: hand back a virtual id now; the host materializes the
+    // descriptor and maps the id. A creation failure surfaces on the next
+    // synchronous call touching it (Finalize/GetAttribute).
+    let vh = alloc_vhandle();
+    let mut a = descriptor_type.to_le_bytes().to_vec();
+    a.extend_from_slice(&vh.to_le_bytes());
+    match with_client(|c| c.lib_call_deferred(LIB_CUDNN_BACKEND, 0, a)) {
+        Ok(()) => {
+            unsafe { *descriptor = vh as *mut c_void };
             0
         }
-        Ok((st, _)) => st,
         Err(_) => 1,
     }
 }
@@ -1726,8 +1758,8 @@ pub extern "C" fn cudnnBackendCreateDescriptor(
 #[no_mangle]
 pub extern "C" fn cudnnBackendDestroyDescriptor(descriptor: *mut c_void) -> c_int {
     let a = (descriptor as u64).to_le_bytes().to_vec();
-    match with_client(|c| c.lib_call(LIB_CUDNN_BACKEND, 1, a)) {
-        Ok((st, _)) => st,
+    match with_client(|c| c.lib_call_deferred(LIB_CUDNN_BACKEND, 1, a)) {
+        Ok(()) => 0,
         Err(_) => 1,
     }
 }
@@ -1751,8 +1783,8 @@ pub extern "C" fn cudnnBackendSetAttribute(
             std::slice::from_raw_parts(array_of_elements as *const u8, n)
         });
     }
-    match with_client(|c| c.lib_call(LIB_CUDNN_BACKEND, 2, a)) {
-        Ok((st, _)) => st,
+    match with_client(|c| c.lib_call_deferred(LIB_CUDNN_BACKEND, 2, a)) {
+        Ok(()) => 0,
         Err(_) => 1,
     }
 }
@@ -1789,9 +1821,20 @@ pub extern "C" fn cudnnBackendGetAttribute(
                 let cap =
                     (requested_element_count.max(0) as usize) * cudnn_be_elem_size(attribute_type);
                 let n = bytes.len().min(cap);
-                unsafe {
-                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), array_of_elements as *mut u8, n)
-                };
+                // Descriptor arrays are populated *in place*: the returned
+                // pointers are the caller's own descriptors, so keep the ids
+                // the caller passed (they may be virtual) instead of the real
+                // host pointers the server sees.
+                const TYPE_BACKEND_DESCRIPTOR: c_int = 15;
+                if attribute_type != TYPE_BACKEND_DESCRIPTOR {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            bytes.as_ptr(),
+                            array_of_elements as *mut u8,
+                            n,
+                        )
+                    };
+                }
             }
             0
         }
@@ -1819,8 +1862,8 @@ pub extern "C" fn cudnnBackendExecute(
     a.extend_from_slice(&(handle as u64).to_le_bytes());
     a.extend_from_slice(&(execution_plan as u64).to_le_bytes());
     a.extend_from_slice(&(variant_pack as u64).to_le_bytes());
-    match with_client(|c| c.lib_call(LIB_CUDNN_BACKEND, 5, a)) {
-        Ok((st, _)) => st,
+    match with_client(|c| c.lib_call_deferred(LIB_CUDNN_BACKEND, 5, a)) {
+        Ok(()) => 0,
         Err(_) => 1,
     }
 }
@@ -2109,8 +2152,8 @@ pub extern "C" fn cublasLtMatmul(
     buf.extend_from_slice(&(workspace as u64).to_le_bytes());
     buf.extend_from_slice(&(workspace_size_in_bytes as u64).to_le_bytes());
     buf.extend_from_slice(&(stream as u64).to_le_bytes());
-    match with_client(|c| c.lib_call(LIB_CUBLASLT, 10, buf)) {
-        Ok((st, _)) => st,
+    match with_client(|c| c.lib_call_deferred(LIB_CUBLASLT, 10, buf)) {
+        Ok(()) => CUBLAS_STATUS_SUCCESS,
         Err(_) => CUBLAS_STATUS_NOT_INITIALIZED,
     }
 }
@@ -2152,6 +2195,10 @@ pub extern "C" fn cudnnSetTensorNdDescriptor(
     a.extend_from_slice(&(tensor_desc as u64).to_le_bytes());
     a.extend_from_slice(&data_type.to_le_bytes());
     a.extend_from_slice(&nb_dims.to_le_bytes());
+    // Record this descriptor\'s content fingerprint (everything after the
+    // handle) so pure size queries over it can be memoized soundly — the
+    // handle value alone is reusable across different shapes.
+    record_desc_fingerprint(tensor_desc as u64, &a[8..]);
     for arr in [dim_a, stride_a] {
         for i in 0..n {
             let v = if arr.is_null() {
@@ -2162,8 +2209,8 @@ pub extern "C" fn cudnnSetTensorNdDescriptor(
             a.extend_from_slice(&v.to_le_bytes());
         }
     }
-    match with_client(|c| c.lib_call(LIB_CUDNN_BN, 0, a)) {
-        Ok((st, _)) => st,
+    match with_client(|c| c.lib_call_deferred(LIB_CUDNN_BN, 0, a)) {
+        Ok(()) => 0,
         Err(_) => 1,
     }
 }
@@ -2205,8 +2252,8 @@ pub extern "C" fn cudnnBatchNormalizationForwardInference(
         a.extend_from_slice(&p.to_le_bytes());
     }
     a.extend_from_slice(&epsilon.to_le_bytes());
-    match with_client(|c| c.lib_call(LIB_CUDNN_BN, 2, a)) {
-        Ok((st, _)) => st,
+    match with_client(|c| c.lib_call_deferred(LIB_CUDNN_BN, 2, a)) {
+        Ok(()) => 0,
         Err(_) => 1,
     }
 }
@@ -2274,8 +2321,8 @@ pub extern "C" fn cudnnBatchNormalizationForwardTrainingEx(
     a.extend_from_slice(&(ws_size as u64).to_le_bytes());
     a.extend_from_slice(&(reserve as u64).to_le_bytes());
     a.extend_from_slice(&(reserve_size as u64).to_le_bytes());
-    match with_client(|c| c.lib_call(LIB_CUDNN_BN, 3, a)) {
-        Ok((st, _)) => st,
+    match with_client(|c| c.lib_call_deferred(LIB_CUDNN_BN, 3, a)) {
+        Ok(()) => 0,
         Err(_) => 1,
     }
 }
@@ -2353,19 +2400,81 @@ pub extern "C" fn cudnnBatchNormalizationBackwardEx(
     a.extend_from_slice(&(ws_size as u64).to_le_bytes());
     a.extend_from_slice(&(reserve as u64).to_le_bytes());
     a.extend_from_slice(&(reserve_size as u64).to_le_bytes());
-    match with_client(|c| c.lib_call(LIB_CUDNN_BN, 4, a)) {
-        Ok((st, _)) => st,
+    match with_client(|c| c.lib_call_deferred(LIB_CUDNN_BN, 4, a)) {
+        Ok(()) => 0,
         Err(_) => 1,
     }
 }
 
+/// Tensor-descriptor content fingerprints (dtype + dims + strides from the
+/// last `cudnnSetTensorNdDescriptor`), keyed by handle value. A handle alone
+/// is not a stable identity — destroy/create can reuse the address — so size
+/// memoization keys on these contents instead.
+static DESC_FP: Mutex<Option<HashMap<u64, Vec<u8>>>> = Mutex::new(None);
+
+fn record_desc_fingerprint(desc: u64, contents: &[u8]) {
+    if let Ok(mut g) = DESC_FP.lock() {
+        g.get_or_insert_with(HashMap::new)
+            .insert(desc, contents.to_vec());
+    }
+}
+
+/// Rewrite a BN size-query arg blob into a content-addressed memo key: every
+/// descriptor handle is replaced by its recorded fingerprint. `None` (do not
+/// cache) if any non-null descriptor has no fingerprint on record.
+fn bn_memo_key(func: u16, args: &[u8]) -> Option<Vec<u8>> {
+    // Layouts (see the three Get*Size wrappers): handle u64, mode i32, ops i32,
+    // then only u64 descriptor handles (5/7 for the workspace queries, act+x
+    // for the reserve query). The leading cudnn handle is identity-stable.
+    if args.len() < 16 || (args.len() - 16) % 8 != 0 {
+        return None;
+    }
+    let fps = DESC_FP.lock().ok()?;
+    let fps = fps.as_ref()?;
+    let mut key = Vec::with_capacity(args.len() * 4);
+    key.extend_from_slice(&func.to_le_bytes());
+    key.extend_from_slice(&args[..16]);
+    for chunk in args[16..].chunks_exact(8) {
+        let h = u64::from_le_bytes(chunk.try_into().unwrap());
+        if h == 0 {
+            key.push(0);
+            continue;
+        }
+        let fp = fps.get(&h)?; // unknown descriptor → uncacheable
+        key.extend_from_slice(&(fp.len() as u32).to_le_bytes());
+        key.extend_from_slice(fp);
+    }
+    Some(key)
+}
+
 /// Shared tail for the three `Get...Size` queries: forward the packed args and
-/// write the returned `size_t` through `size_out`.
+/// write the returned `size_t` through `size_out`. Memoized on the descriptor
+/// *contents* (not handles): the sizes are pure functions of those contents,
+/// and PyTorch re-queries them on every batch-norm invocation (~150 sync
+/// round-trips per ResNet training step without the cache).
 fn bn_size_call(func: u16, args: Vec<u8>, size_out: *mut usize) -> c_int {
+    static MEMO: Mutex<Option<HashMap<Vec<u8>, usize>>> = Mutex::new(None);
+    let key = bn_memo_key(func, &args);
+    if let Some(k) = &key {
+        if let Ok(mut g) = MEMO.lock() {
+            if let Some(sz) = g.get_or_insert_with(HashMap::new).get(k) {
+                if !size_out.is_null() {
+                    unsafe { *size_out = *sz };
+                }
+                return 0;
+            }
+        }
+    }
     match with_client(|c| c.lib_call(LIB_CUDNN_BN, func, args)) {
         Ok((0, out)) if out.len() >= 8 => {
+            let sz = u64::from_le_bytes(out[..8].try_into().unwrap()) as usize;
             if !size_out.is_null() {
-                unsafe { *size_out = u64::from_le_bytes(out[..8].try_into().unwrap()) as usize };
+                unsafe { *size_out = sz };
+            }
+            if let Some(k) = key {
+                if let Ok(mut g) = MEMO.lock() {
+                    g.get_or_insert_with(HashMap::new).insert(k, sz);
+                }
             }
             0
         }

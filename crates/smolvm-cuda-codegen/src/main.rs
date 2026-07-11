@@ -393,11 +393,13 @@ fn gen_guest(lib: &Lib) -> String {
                 s,
                 "#[no_mangle]\npub extern \"C\" fn {}(handle_out: *mut *mut c_void) -> c_int {{\n    \
                  if handle_out.is_null() {{ return 1; }}\n    \
-                 match with_client(|c| c.lib_call(LIB_ID, {idx}, Vec::new())) {{\n        \
-                 Ok((0, out)) if out.len() >= 8 => {{\n            \
-                 let h = u64::from_le_bytes(out[..8].try_into().unwrap());\n            \
-                 unsafe {{ *handle_out = h as *mut c_void }};\n            0\n        }}\n        \
-                 Ok((st, _)) => st,\n        Err(_) => 1,\n    }}\n}}",
+                 // Fire-and-forget create: return a guest-assigned virtual id\n    \
+                 // immediately; the host materializes the real descriptor and\n    \
+                 // maps the id (see vh_resolve on the host side).\n    \
+                 let vh = super::alloc_vhandle();\n    \
+                 match with_client(|c| c.lib_call_deferred(LIB_ID, {idx}, vh.to_le_bytes().to_vec())) {{\n        \
+                 Ok(()) => {{ unsafe {{ *handle_out = vh as *mut c_void }}; 0 }}\n        \
+                 Err(_) => 1,\n    }}\n}}",
                 f.sym
             );
             continue;
@@ -453,7 +455,7 @@ fn gen_guest(lib: &Lib) -> String {
         if outs.is_empty() {
             let _ = writeln!(
                 s,
-                "    match with_client(|c| c.lib_call(LIB_ID, {idx}, a)) {{ Ok((st, _)) => st, Err(_) => 1 }}\n}}"
+                "    // No output params: fire-and-forget (failures surface as sticky async errors).\n    match with_client(|c| c.lib_call_deferred(LIB_ID, {idx}, a)) {{ Ok(()) => 0, Err(_) => 1 }}\n}}"
             );
         } else {
             let _ = writeln!(
@@ -524,13 +526,13 @@ fn gen_host(lib: &Lib) -> String {
     // Dispatch.
     let _ = writeln!(
         s,
-        "    pub fn dispatch(&self, func: u16, args: &[u8]) -> (i32, Vec<u8>) {{\n        let mut __c = GenCur {{ b: args, p: 0 }};\n        match func {{"
+        "    pub fn dispatch(&self, func: u16, args: &[u8], __vh: &mut std::collections::HashMap<u64, u64>) -> (i32, Vec<u8>) {{\n        let mut __c = GenCur {{ b: args, p: 0 }};\n        match func {{"
     );
     for (idx, f) in lib.funcs.iter().enumerate() {
         if is_create(f) {
             let _ = writeln!(
                 s,
-                "            {idx} => {{ let mut h: *mut c_void = std::ptr::null_mut(); let st = unsafe {{ (self.f_{})(&mut h) }}; (st, (h as u64).to_le_bytes().to_vec()) }}",
+                "            {idx} => {{ let mut h: *mut c_void = std::ptr::null_mut(); let st = unsafe {{ (self.f_{})(&mut h) }}; if st == 0 && args.len() >= 8 {{ let id = u64::from_le_bytes(args[..8].try_into().unwrap()); if id & super::VHANDLE_TAG != 0 {{ __vh.insert(id, h as u64); }} }} (st, (h as u64).to_le_bytes().to_vec()) }}",
                 f.real
             );
             continue;
@@ -544,7 +546,26 @@ fn gen_host(lib: &Lib) -> String {
                     let _ = writeln!(binds, "                let {} = __c.{t}();", p.name);
                     call.push(format!("{} as {}", p.name, p.cty));
                 }
-                Kind::Handle | Kind::DevPtr => {
+                Kind::Handle => {
+                    // May be a guest-assigned virtual id — resolve to the real
+                    // pointer (untagged values pass through). Destroy calls
+                    // also retire the mapping so the table doesn't grow.
+                    if f.sym.contains("Destroy") {
+                        let _ = writeln!(
+                            binds,
+                            "                let __raw = __c.u64();\n                let {} = super::vh_resolve(__vh, __raw) as {};\n                if __raw & super::VHANDLE_TAG != 0 {{ __vh.remove(&__raw); }}",
+                            p.name, p.cty
+                        );
+                    } else {
+                        let _ = writeln!(
+                            binds,
+                            "                let {} = super::vh_resolve(__vh, __c.u64()) as {};",
+                            p.name, p.cty
+                        );
+                    }
+                    call.push(p.name.to_string());
+                }
+                Kind::DevPtr => {
                     let _ = writeln!(
                         binds,
                         "                let {} = __c.u64() as {};",

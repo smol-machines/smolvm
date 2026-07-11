@@ -3,13 +3,12 @@ const LIB_ID: u8 = 2;
 #[no_mangle]
 pub extern "C" fn cudnnCreate(handle_out: *mut *mut c_void) -> c_int {
     if handle_out.is_null() { return 1; }
-    match with_client(|c| c.lib_call(LIB_ID, 0, Vec::new())) {
-        Ok((0, out)) if out.len() >= 8 => {
-            let h = u64::from_le_bytes(out[..8].try_into().unwrap());
-            unsafe { *handle_out = h as *mut c_void };
-            0
-        }
-        Ok((st, _)) => st,
+    // Fire-and-forget create: return a guest-assigned virtual id
+    // immediately; the host materializes the real descriptor and
+    // maps the id (see vh_resolve on the host side).
+    let vh = super::alloc_vhandle();
+    match with_client(|c| c.lib_call_deferred(LIB_ID, 0, vh.to_le_bytes().to_vec())) {
+        Ok(()) => { unsafe { *handle_out = vh as *mut c_void }; 0 }
         Err(_) => 1,
     }
 }
@@ -17,25 +16,26 @@ pub extern "C" fn cudnnCreate(handle_out: *mut *mut c_void) -> c_int {
 pub extern "C" fn cudnnDestroy(handle: *mut c_void) -> c_int {
     let mut a: Vec<u8> = Vec::new();
     a.extend_from_slice(&(handle as u64).to_le_bytes());
-    match with_client(|c| c.lib_call(LIB_ID, 1, a)) { Ok((st, _)) => st, Err(_) => 1 }
+    // No output params: fire-and-forget (failures surface as sticky async errors).
+    match with_client(|c| c.lib_call_deferred(LIB_ID, 1, a)) { Ok(()) => 0, Err(_) => 1 }
 }
 #[no_mangle]
 pub extern "C" fn cudnnSetStream(handle: *mut c_void, stream: *mut c_void) -> c_int {
     let mut a: Vec<u8> = Vec::new();
     a.extend_from_slice(&(handle as u64).to_le_bytes());
     a.extend_from_slice(&(stream as u64).to_le_bytes());
-    match with_client(|c| c.lib_call(LIB_ID, 2, a)) { Ok((st, _)) => st, Err(_) => 1 }
+    // No output params: fire-and-forget (failures surface as sticky async errors).
+    match with_client(|c| c.lib_call_deferred(LIB_ID, 2, a)) { Ok(()) => 0, Err(_) => 1 }
 }
 #[no_mangle]
 pub extern "C" fn cudnnCreateTensorDescriptor(handle_out: *mut *mut c_void) -> c_int {
     if handle_out.is_null() { return 1; }
-    match with_client(|c| c.lib_call(LIB_ID, 3, Vec::new())) {
-        Ok((0, out)) if out.len() >= 8 => {
-            let h = u64::from_le_bytes(out[..8].try_into().unwrap());
-            unsafe { *handle_out = h as *mut c_void };
-            0
-        }
-        Ok((st, _)) => st,
+    // Fire-and-forget create: return a guest-assigned virtual id
+    // immediately; the host materializes the real descriptor and
+    // maps the id (see vh_resolve on the host side).
+    let vh = super::alloc_vhandle();
+    match with_client(|c| c.lib_call_deferred(LIB_ID, 3, vh.to_le_bytes().to_vec())) {
+        Ok(()) => { unsafe { *handle_out = vh as *mut c_void }; 0 }
         Err(_) => 1,
     }
 }
@@ -49,24 +49,25 @@ pub extern "C" fn cudnnSetTensor4dDescriptor(t: *mut c_void, fmt: c_int, dtype: 
     a.extend_from_slice(&(c as i32).to_le_bytes());
     a.extend_from_slice(&(h as i32).to_le_bytes());
     a.extend_from_slice(&(w as i32).to_le_bytes());
-    match with_client(|c| c.lib_call(LIB_ID, 4, a)) { Ok((st, _)) => st, Err(_) => 1 }
+    // No output params: fire-and-forget (failures surface as sticky async errors).
+    match with_client(|c| c.lib_call_deferred(LIB_ID, 4, a)) { Ok(()) => 0, Err(_) => 1 }
 }
 #[no_mangle]
 pub extern "C" fn cudnnDestroyTensorDescriptor(t: *mut c_void) -> c_int {
     let mut a: Vec<u8> = Vec::new();
     a.extend_from_slice(&(t as u64).to_le_bytes());
-    match with_client(|c| c.lib_call(LIB_ID, 5, a)) { Ok((st, _)) => st, Err(_) => 1 }
+    // No output params: fire-and-forget (failures surface as sticky async errors).
+    match with_client(|c| c.lib_call_deferred(LIB_ID, 5, a)) { Ok(()) => 0, Err(_) => 1 }
 }
 #[no_mangle]
 pub extern "C" fn cudnnCreateFilterDescriptor(handle_out: *mut *mut c_void) -> c_int {
     if handle_out.is_null() { return 1; }
-    match with_client(|c| c.lib_call(LIB_ID, 6, Vec::new())) {
-        Ok((0, out)) if out.len() >= 8 => {
-            let h = u64::from_le_bytes(out[..8].try_into().unwrap());
-            unsafe { *handle_out = h as *mut c_void };
-            0
-        }
-        Ok((st, _)) => st,
+    // Fire-and-forget create: return a guest-assigned virtual id
+    // immediately; the host materializes the real descriptor and
+    // maps the id (see vh_resolve on the host side).
+    let vh = super::alloc_vhandle();
+    match with_client(|c| c.lib_call_deferred(LIB_ID, 6, vh.to_le_bytes().to_vec())) {
+        Ok(()) => { unsafe { *handle_out = vh as *mut c_void }; 0 }
         Err(_) => 1,
     }
 }
@@ -80,24 +81,25 @@ pub extern "C" fn cudnnSetFilter4dDescriptor(f: *mut c_void, dtype: c_int, fmt: 
     a.extend_from_slice(&(c as i32).to_le_bytes());
     a.extend_from_slice(&(h as i32).to_le_bytes());
     a.extend_from_slice(&(w as i32).to_le_bytes());
-    match with_client(|c| c.lib_call(LIB_ID, 7, a)) { Ok((st, _)) => st, Err(_) => 1 }
+    // No output params: fire-and-forget (failures surface as sticky async errors).
+    match with_client(|c| c.lib_call_deferred(LIB_ID, 7, a)) { Ok(()) => 0, Err(_) => 1 }
 }
 #[no_mangle]
 pub extern "C" fn cudnnDestroyFilterDescriptor(f: *mut c_void) -> c_int {
     let mut a: Vec<u8> = Vec::new();
     a.extend_from_slice(&(f as u64).to_le_bytes());
-    match with_client(|c| c.lib_call(LIB_ID, 8, a)) { Ok((st, _)) => st, Err(_) => 1 }
+    // No output params: fire-and-forget (failures surface as sticky async errors).
+    match with_client(|c| c.lib_call_deferred(LIB_ID, 8, a)) { Ok(()) => 0, Err(_) => 1 }
 }
 #[no_mangle]
 pub extern "C" fn cudnnCreateConvolutionDescriptor(handle_out: *mut *mut c_void) -> c_int {
     if handle_out.is_null() { return 1; }
-    match with_client(|c| c.lib_call(LIB_ID, 9, Vec::new())) {
-        Ok((0, out)) if out.len() >= 8 => {
-            let h = u64::from_le_bytes(out[..8].try_into().unwrap());
-            unsafe { *handle_out = h as *mut c_void };
-            0
-        }
-        Ok((st, _)) => st,
+    // Fire-and-forget create: return a guest-assigned virtual id
+    // immediately; the host materializes the real descriptor and
+    // maps the id (see vh_resolve on the host side).
+    let vh = super::alloc_vhandle();
+    match with_client(|c| c.lib_call_deferred(LIB_ID, 9, vh.to_le_bytes().to_vec())) {
+        Ok(()) => { unsafe { *handle_out = vh as *mut c_void }; 0 }
         Err(_) => 1,
     }
 }
@@ -113,13 +115,15 @@ pub extern "C" fn cudnnSetConvolution2dDescriptor(cv: *mut c_void, pad_h: c_int,
     a.extend_from_slice(&(dil_w as i32).to_le_bytes());
     a.extend_from_slice(&(mode as i32).to_le_bytes());
     a.extend_from_slice(&(ctype as i32).to_le_bytes());
-    match with_client(|c| c.lib_call(LIB_ID, 10, a)) { Ok((st, _)) => st, Err(_) => 1 }
+    // No output params: fire-and-forget (failures surface as sticky async errors).
+    match with_client(|c| c.lib_call_deferred(LIB_ID, 10, a)) { Ok(()) => 0, Err(_) => 1 }
 }
 #[no_mangle]
 pub extern "C" fn cudnnDestroyConvolutionDescriptor(cv: *mut c_void) -> c_int {
     let mut a: Vec<u8> = Vec::new();
     a.extend_from_slice(&(cv as u64).to_le_bytes());
-    match with_client(|c| c.lib_call(LIB_ID, 11, a)) { Ok((st, _)) => st, Err(_) => 1 }
+    // No output params: fire-and-forget (failures surface as sticky async errors).
+    match with_client(|c| c.lib_call_deferred(LIB_ID, 11, a)) { Ok(()) => 0, Err(_) => 1 }
 }
 #[no_mangle]
 pub extern "C" fn cudnnGetConvolutionForwardWorkspaceSize(handle: *mut c_void, x: *mut c_void, w: *mut c_void, cv: *mut c_void, y: *mut c_void, algo: c_int, size: *mut usize) -> c_int {
@@ -155,5 +159,6 @@ pub extern "C" fn cudnnConvolutionForward(handle: *mut c_void, alpha: *const f32
     a.extend_from_slice(&(unsafe { *beta } as f32).to_le_bytes());
     a.extend_from_slice(&(yDesc as u64).to_le_bytes());
     a.extend_from_slice(&(y as u64).to_le_bytes());
-    match with_client(|c| c.lib_call(LIB_ID, 13, a)) { Ok((st, _)) => st, Err(_) => 1 }
+    // No output params: fire-and-forget (failures surface as sticky async errors).
+    match with_client(|c| c.lib_call_deferred(LIB_ID, 13, a)) { Ok(()) => 0, Err(_) => 1 }
 }

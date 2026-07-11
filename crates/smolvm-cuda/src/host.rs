@@ -172,11 +172,33 @@ impl Session {
 /// request is dispatched to `backend`; returns on clean EOF.
 pub fn serve<S: Read + Write>(mut stream: S, backend: &mut dyn Backend) -> std::io::Result<()> {
     let mut sess = Session::default();
+    // First failure among quiet (fire-and-forget) requests since the last
+    // fence. Quiet requests get no response at all — the client collects
+    // failures with one Fence round-trip instead of reading N per-op replies,
+    // which on vsock cost a guest wake-up each.
+    let mut quiet_sticky: i32 = 0;
     while let Some(payload) = read_msg(&mut stream)? {
-        let req = decode_request(&payload)?;
-        let (status, resp) = dispatch(&mut sess, backend, req);
-        let out = encode_response(status, &resp);
-        write_msg(&mut stream, &out)?;
+        match payload.first() {
+            // Quiet wrapper: execute the inner request, reply with nothing.
+            Some(&crate::proto::QUIET_PREFIX) => {
+                let req = decode_request(&payload[1..])?;
+                let (status, _) = dispatch(&mut sess, backend, req);
+                if status != 0 && quiet_sticky == 0 {
+                    quiet_sticky = status;
+                }
+            }
+            // Fence: report (and clear) the sticky quiet failure.
+            Some(&crate::proto::FENCE_OP) if payload.len() == 1 => {
+                let st = std::mem::take(&mut quiet_sticky);
+                write_msg(&mut stream, &encode_response(st, &Response::Ok))?;
+            }
+            _ => {
+                let req = decode_request(&payload)?;
+                let (status, resp) = dispatch(&mut sess, backend, req);
+                let out = encode_response(status, &resp);
+                write_msg(&mut stream, &out)?;
+            }
+        }
     }
     Ok(())
 }
