@@ -1174,6 +1174,63 @@ impl<S: Read + Write> Client<S> {
         }
     }
 
+    // ---- VMM (torch expandable-segments) — sync control-plane ops ----
+    pub fn mem_address_reserve(&mut self, size: u64, align: u64) -> Result<u64> {
+        match self.call(
+            &Request::MemAddressReserve { size, align },
+            Op::MemAddressReserve,
+        )? {
+            Response::Dptr(va) => Ok(va),
+            _ => Err(CudaRpcError::Protocol("expected Dptr")),
+        }
+    }
+    pub fn mem_create(&mut self, size: u64, device: i32) -> Result<u64> {
+        match self.call(&Request::MemCreate { size, device }, Op::MemCreate)? {
+            Response::Handle(h) => Ok(h),
+            _ => Err(CudaRpcError::Protocol("expected Handle")),
+        }
+    }
+    pub fn mem_map(&mut self, va: u64, size: u64, offset: u64, handle: u64) -> Result<()> {
+        self.call(
+            &Request::MemMap {
+                va,
+                size,
+                offset,
+                handle,
+            },
+            Op::MemMap,
+        )
+        .map(|_| ())
+    }
+    pub fn mem_set_access(&mut self, va: u64, size: u64, device: i32) -> Result<()> {
+        self.call(
+            &Request::MemSetAccess { va, size, device },
+            Op::MemSetAccess,
+        )
+        .map(|_| ())
+    }
+    pub fn mem_unmap(&mut self, va: u64, size: u64) -> Result<()> {
+        self.call(&Request::MemUnmap { va, size }, Op::MemUnmap)
+            .map(|_| ())
+    }
+    pub fn mem_release(&mut self, handle: u64) -> Result<()> {
+        self.call(&Request::MemRelease { handle }, Op::MemRelease)
+            .map(|_| ())
+    }
+    pub fn mem_address_free(&mut self, va: u64, size: u64) -> Result<()> {
+        self.call(&Request::MemAddressFree { va, size }, Op::MemAddressFree)
+            .map(|_| ())
+    }
+    pub fn mem_get_allocation_granularity(&mut self, device: i32, flags: u32) -> Result<u64> {
+        match self.call(
+            &Request::MemGetAllocationGranularity { device, flags },
+            Op::MemGetAllocationGranularity,
+        )? {
+            Response::Bytes(g) => Ok(g),
+            _ => Err(CudaRpcError::Protocol("expected Bytes")),
+        }
+    }
+
     /// Zero-copy H2D via the shared region (data already written at `offset`).
     pub fn memcpy_shm_htod(
         &mut self,

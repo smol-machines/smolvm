@@ -111,6 +111,16 @@ pub enum Op {
     /// completion ring, and a bounce buffer for oversized responses. After
     /// the host acks, the socket carries only doorbell bytes.
     RingSetup = 0xD0,
+    // CUDA VMM (virtual memory management) — torch's expandable-segments
+    // allocator. Control-plane ops, all synchronous.
+    MemAddressReserve = 0xE0,
+    MemCreate = 0xE1,
+    MemMap = 0xE2,
+    MemSetAccess = 0xE3,
+    MemUnmap = 0xE4,
+    MemRelease = 0xE5,
+    MemAddressFree = 0xE6,
+    MemGetAllocationGranularity = 0xE7,
 }
 
 impl Op {
@@ -175,6 +185,14 @@ impl Op {
             0xB2 => Op::MemcpyGpaHtoD,
             0xB3 => Op::MemcpyGpaDtoH,
             0xD0 => Op::RingSetup,
+            0xE0 => Op::MemAddressReserve,
+            0xE1 => Op::MemCreate,
+            0xE2 => Op::MemMap,
+            0xE3 => Op::MemSetAccess,
+            0xE4 => Op::MemUnmap,
+            0xE5 => Op::MemRelease,
+            0xE6 => Op::MemAddressFree,
+            0xE7 => Op::MemGetAllocationGranularity,
             _ => return None,
         })
     }
@@ -461,6 +479,44 @@ pub enum Request {
         req_pages: Vec<u64>,
         resp_pages: Vec<u64>,
         bounce_pages: Vec<u64>,
+    },
+    /// VMM: reserve a virtual address range (no backing).
+    MemAddressReserve {
+        size: u64,
+        align: u64,
+    },
+    /// VMM: create a physical allocation on `device`.
+    MemCreate {
+        size: u64,
+        device: i32,
+    },
+    /// VMM: back `va` with `handle` at `offset`.
+    MemMap {
+        va: u64,
+        size: u64,
+        offset: u64,
+        handle: u64,
+    },
+    /// VMM: grant `device` read/write access to the mapped range.
+    MemSetAccess {
+        va: u64,
+        size: u64,
+        device: i32,
+    },
+    MemUnmap {
+        va: u64,
+        size: u64,
+    },
+    MemRelease {
+        handle: u64,
+    },
+    MemAddressFree {
+        va: u64,
+        size: u64,
+    },
+    MemGetAllocationGranularity {
+        device: i32,
+        flags: u32,
     },
 }
 
@@ -995,6 +1051,53 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
                 }
             }
         }
+        Request::MemAddressReserve { size, align } => {
+            w_u8(&mut b, Op::MemAddressReserve as u8);
+            w_u64(&mut b, *size);
+            w_u64(&mut b, *align);
+        }
+        Request::MemCreate { size, device } => {
+            w_u8(&mut b, Op::MemCreate as u8);
+            w_u64(&mut b, *size);
+            w_i32(&mut b, *device);
+        }
+        Request::MemMap {
+            va,
+            size,
+            offset,
+            handle,
+        } => {
+            w_u8(&mut b, Op::MemMap as u8);
+            w_u64(&mut b, *va);
+            w_u64(&mut b, *size);
+            w_u64(&mut b, *offset);
+            w_u64(&mut b, *handle);
+        }
+        Request::MemSetAccess { va, size, device } => {
+            w_u8(&mut b, Op::MemSetAccess as u8);
+            w_u64(&mut b, *va);
+            w_u64(&mut b, *size);
+            w_i32(&mut b, *device);
+        }
+        Request::MemUnmap { va, size } => {
+            w_u8(&mut b, Op::MemUnmap as u8);
+            w_u64(&mut b, *va);
+            w_u64(&mut b, *size);
+        }
+        Request::MemRelease { handle } => {
+            w_u8(&mut b, Op::MemRelease as u8);
+            w_u64(&mut b, *handle);
+        }
+        Request::MemAddressFree { va, size } => {
+            w_u8(&mut b, Op::MemAddressFree as u8);
+            w_u64(&mut b, *va);
+            w_u64(&mut b, *size);
+        }
+        Request::MemGetAllocationGranularity { device, flags } => {
+            w_u8(&mut b, Op::MemGetAllocationGranularity as u8);
+            w_i32(&mut b, *device);
+            w_u32(&mut b, *flags);
+        }
     }
     b
 }
@@ -1215,6 +1318,38 @@ pub fn decode_request(payload: &[u8]) -> io::Result<Request> {
                 bounce_pages,
             }
         }
+        Op::MemAddressReserve => Request::MemAddressReserve {
+            size: c.u64()?,
+            align: c.u64()?,
+        },
+        Op::MemCreate => Request::MemCreate {
+            size: c.u64()?,
+            device: c.i32()?,
+        },
+        Op::MemMap => Request::MemMap {
+            va: c.u64()?,
+            size: c.u64()?,
+            offset: c.u64()?,
+            handle: c.u64()?,
+        },
+        Op::MemSetAccess => Request::MemSetAccess {
+            va: c.u64()?,
+            size: c.u64()?,
+            device: c.i32()?,
+        },
+        Op::MemUnmap => Request::MemUnmap {
+            va: c.u64()?,
+            size: c.u64()?,
+        },
+        Op::MemRelease => Request::MemRelease { handle: c.u64()? },
+        Op::MemAddressFree => Request::MemAddressFree {
+            va: c.u64()?,
+            size: c.u64()?,
+        },
+        Op::MemGetAllocationGranularity => Request::MemGetAllocationGranularity {
+            device: c.i32()?,
+            flags: c.u32()?,
+        },
     })
 }
 
@@ -1317,7 +1452,15 @@ pub fn decode_response(op: Op, payload: &[u8]) -> io::Result<(i32, Response)> {
         | Op::MemcpyShmDtoH
         | Op::MemcpyGpaHtoD
         | Op::MemcpyGpaDtoH
-        | Op::RingSetup => Response::Ok,
+        | Op::RingSetup
+        | Op::MemMap
+        | Op::MemSetAccess
+        | Op::MemUnmap
+        | Op::MemRelease
+        | Op::MemAddressFree => Response::Ok,
+        Op::MemAddressReserve => Response::Dptr(c.u64()?),
+        Op::MemCreate => Response::Handle(c.u64()?),
+        Op::MemGetAllocationGranularity => Response::Bytes(c.u64()?),
     };
     Ok((status, body))
 }

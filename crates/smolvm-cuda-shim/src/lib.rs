@@ -635,6 +635,104 @@ unsafe fn module_image_len(image: *const c_void) -> Result<usize, c_int> {
         + 1)
 }
 
+// ---- VMM (torch expandable-segments allocator) --------------------------------
+// Prop/desc structs are read at fixed offsets: CUmemAllocationProp.location.id
+// sits at byte 12, CUmemAccessDesc.location.id at byte 4.
+
+#[no_mangle]
+pub extern "C" fn cuMemAddressReserve(
+    ptr: *mut u64,
+    size: usize,
+    align: usize,
+    _addr_hint: u64,
+    _flags: u64,
+) -> c_int {
+    match with_state(|s| s.client.mem_address_reserve(size as u64, align as u64)) {
+        Ok(va) => ret(unsafe { out(ptr, va) }),
+        Err(code) => code,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cuMemCreate(
+    handle: *mut u64,
+    size: usize,
+    prop: *const c_void,
+    _flags: u64,
+) -> c_int {
+    let device = if prop.is_null() {
+        0
+    } else {
+        unsafe { ((prop as *const u8).add(12) as *const c_int).read_unaligned() }
+    };
+    match with_state(|s| s.client.mem_create(size as u64, device)) {
+        Ok(h) => ret(unsafe { out(handle, h) }),
+        Err(code) => code,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cuMemMap(
+    ptr: u64,
+    size: usize,
+    offset: usize,
+    handle: u64,
+    _flags: u64,
+) -> c_int {
+    ret(with_state(|s| {
+        s.client.mem_map(ptr, size as u64, offset as u64, handle)
+    }))
+}
+
+#[no_mangle]
+pub extern "C" fn cuMemSetAccess(
+    ptr: u64,
+    size: usize,
+    desc: *const c_void,
+    _count: usize,
+) -> c_int {
+    let device = if desc.is_null() {
+        0
+    } else {
+        unsafe { ((desc as *const u8).add(4) as *const c_int).read_unaligned() }
+    };
+    ret(with_state(|s| {
+        s.client.mem_set_access(ptr, size as u64, device)
+    }))
+}
+
+#[no_mangle]
+pub extern "C" fn cuMemUnmap(ptr: u64, size: usize) -> c_int {
+    ret(with_state(|s| s.client.mem_unmap(ptr, size as u64)))
+}
+
+#[no_mangle]
+pub extern "C" fn cuMemRelease(handle: u64) -> c_int {
+    ret(with_state(|s| s.client.mem_release(handle)))
+}
+
+#[no_mangle]
+pub extern "C" fn cuMemAddressFree(ptr: u64, size: usize) -> c_int {
+    ret(with_state(|s| s.client.mem_address_free(ptr, size as u64)))
+}
+
+#[no_mangle]
+pub extern "C" fn cuMemGetAllocationGranularity(
+    granularity: *mut usize,
+    prop: *const c_void,
+    flags: c_uint,
+) -> c_int {
+    let device = if prop.is_null() {
+        0
+    } else {
+        unsafe { ((prop as *const u8).add(12) as *const c_int).read_unaligned() }
+    };
+    match with_state(|s| s.client.mem_get_allocation_granularity(device, flags)) {
+        Ok(g) => ret(unsafe { out(granularity, g as usize) }),
+        Err(code) => code,
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn cuModuleLoadData(module: *mut *mut c_void, image: *const c_void) -> c_int {
     let len = match unsafe { module_image_len(image) } {

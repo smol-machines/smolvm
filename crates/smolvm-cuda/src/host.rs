@@ -221,6 +221,31 @@ pub trait Backend: Send {
     fn gpa_to_hva(&mut self, _gpa: u64, _len: u64) -> Option<u64> {
         None
     }
+    // VMM (torch expandable-segments allocator). Defaults: unsupported.
+    fn mem_address_reserve(&mut self, _size: u64, _align: u64) -> CuResult<u64> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
+    fn mem_create(&mut self, _size: u64, _device: i32) -> CuResult<u64> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
+    fn mem_map(&mut self, _va: u64, _size: u64, _offset: u64, _handle: u64) -> CuResult<()> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
+    fn mem_set_access(&mut self, _va: u64, _size: u64, _device: i32) -> CuResult<()> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
+    fn mem_unmap(&mut self, _va: u64, _size: u64) -> CuResult<()> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
+    fn mem_release(&mut self, _handle: u64) -> CuResult<()> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
+    fn mem_address_free(&mut self, _va: u64, _size: u64) -> CuResult<()> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
+    fn mem_get_allocation_granularity(&mut self, _device: i32, _flags: u32) -> CuResult<u64> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
 }
 
 /// Per-connection opaque→raw handle translation. Ids are dense and monotonic so
@@ -239,6 +264,11 @@ struct Session {
     /// allocations are the multi-GB hazard; modules/streams/events are
     /// hygiene). Raw backend handles.
     owned_dptrs: HashMap<u64, u64>, // dptr → size (also the quota ledger)
+    /// VMM state for reclaim: physical handles → size (quota ledger too),
+    /// live mappings (va → size), and address reservations (va → size).
+    owned_vmm_handles: HashMap<u64, u64>,
+    owned_vmm_maps: HashMap<u64, u64>,
+    owned_vmm_reservations: HashMap<u64, u64>,
     owned_modules: std::collections::HashSet<u64>,
     owned_streams: std::collections::HashSet<u64>,
     owned_events: std::collections::HashSet<u64>,
@@ -250,6 +280,16 @@ struct Session {
 fn reclaim_session(sess: &mut Session, b: &mut dyn Backend) {
     for (d, _size) in std::mem::take(&mut sess.owned_dptrs) {
         let _ = b.mem_free(d);
+    }
+    // VMM teardown order: unmap, release physical, free reservations.
+    for (va, size) in std::mem::take(&mut sess.owned_vmm_maps) {
+        let _ = b.mem_unmap(va, size);
+    }
+    for (h, _size) in std::mem::take(&mut sess.owned_vmm_handles) {
+        let _ = b.mem_release(h);
+    }
+    for (va, size) in std::mem::take(&mut sess.owned_vmm_reservations) {
+        let _ = b.mem_address_free(va, size);
     }
     for m in std::mem::take(&mut sess.owned_modules) {
         let _ = b.module_unload(m);
@@ -605,6 +645,17 @@ fn serve_rings<S: Read + Write>(
     }
 }
 
+/// Per-connection VRAM budget (`SMOLVM_CUDA_VRAM_LIMIT_MB`), read per
+/// allocation: rare calls, and staying uncached keeps it adjustable and
+/// test-deterministic.
+fn vram_limit() -> u64 {
+    std::env::var("SMOLVM_CUDA_VRAM_LIMIT_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|mb| mb * 1024 * 1024)
+        .unwrap_or(u64::MAX)
+}
+
 fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Response) {
     // Translate an opaque id to the backend's raw handle, or error.
     fn raw(map: &HashMap<u64, u64>, id: u64) -> CuResult<u64> {
@@ -703,14 +754,9 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             // Per-connection VRAM quota (SMOLVM_CUDA_VRAM_LIMIT_MB on the
             // host): a guest may not allocate past its budget — the CUDA-
             // native failure (out of memory) surfaces to the app.
-            // Read per call (allocations are rare): also keeps the limit
-            // adjustable and test-deterministic, unlike a process cache.
-            let limit = std::env::var("SMOLVM_CUDA_VRAM_LIMIT_MB")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .map(|mb| mb * 1024 * 1024)
-                .unwrap_or(u64::MAX);
-            let used: u64 = sess.owned_dptrs.values().sum();
+            let limit = vram_limit();
+            let used: u64 = sess.owned_dptrs.values().sum::<u64>()
+                + sess.owned_vmm_handles.values().sum::<u64>();
             if used.saturating_add(bytes) > limit {
                 return Err(2); // CUDA_ERROR_OUT_OF_MEMORY
             }
@@ -996,6 +1042,51 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         // Handled by the serve loop (transport concern, not a backend op);
         // reaching dispatch means the transport doesn't support rings.
         Request::RingSetup { .. } => Err(CUDA_ERROR_NOT_SUPPORTED),
+        Request::MemAddressReserve { size, align } => {
+            b.mem_address_reserve(size, align).map(|va| {
+                sess.owned_vmm_reservations.insert(va, size);
+                Response::Dptr(va)
+            })
+        }
+        Request::MemCreate { size, device } => {
+            let limit = vram_limit();
+            let used: u64 = sess.owned_dptrs.values().sum::<u64>()
+                + sess.owned_vmm_handles.values().sum::<u64>();
+            if used.saturating_add(size) > limit {
+                return Err(2); // CUDA_ERROR_OUT_OF_MEMORY
+            }
+            b.mem_create(size, device).map(|h| {
+                sess.owned_vmm_handles.insert(h, size);
+                Response::Handle(h)
+            })
+        }
+        Request::MemMap {
+            va,
+            size,
+            offset,
+            handle,
+        } => b.mem_map(va, size, offset, handle).map(|_| {
+            sess.owned_vmm_maps.insert(va, size);
+            Response::Ok
+        }),
+        Request::MemSetAccess { va, size, device } => {
+            b.mem_set_access(va, size, device).map(|_| Response::Ok)
+        }
+        Request::MemUnmap { va, size } => {
+            sess.owned_vmm_maps.remove(&va);
+            b.mem_unmap(va, size).map(|_| Response::Ok)
+        }
+        Request::MemRelease { handle } => {
+            sess.owned_vmm_handles.remove(&handle);
+            b.mem_release(handle).map(|_| Response::Ok)
+        }
+        Request::MemAddressFree { va, size } => {
+            sess.owned_vmm_reservations.remove(&va);
+            b.mem_address_free(va, size).map(|_| Response::Ok)
+        }
+        Request::MemGetAllocationGranularity { device, flags } => b
+            .mem_get_allocation_granularity(device, flags)
+            .map(Response::Bytes),
     })();
     match r {
         Ok(resp) => (0, resp),

@@ -102,6 +102,18 @@ pub struct GpuBackend {
     stream_synchronize: unsafe extern "C" fn(*mut c_void) -> CuResultCode,
     stream_query: unsafe extern "C" fn(*mut c_void) -> CuResultCode,
     stream_wait_event: unsafe extern "C" fn(*mut c_void, *mut c_void, c_uint) -> CuResultCode,
+    // VMM (all optional: pre-Pascal drivers lack them; ops report NOT_SUPPORTED)
+    vmm_address_reserve:
+        Option<unsafe extern "C" fn(*mut u64, usize, usize, u64, u64) -> CuResultCode>,
+    vmm_create: Option<unsafe extern "C" fn(*mut u64, usize, *const VmmProp, u64) -> CuResultCode>,
+    vmm_map: Option<unsafe extern "C" fn(u64, usize, usize, u64, u64) -> CuResultCode>,
+    vmm_set_access:
+        Option<unsafe extern "C" fn(u64, usize, *const VmmAccessDesc, usize) -> CuResultCode>,
+    vmm_unmap: Option<unsafe extern "C" fn(u64, usize) -> CuResultCode>,
+    vmm_release: Option<unsafe extern "C" fn(u64) -> CuResultCode>,
+    vmm_address_free: Option<unsafe extern "C" fn(u64, usize) -> CuResultCode>,
+    vmm_granularity:
+        Option<unsafe extern "C" fn(*mut usize, *const VmmProp, c_uint) -> CuResultCode>,
     event_query: unsafe extern "C" fn(*mut c_void) -> CuResultCode,
     event_create: unsafe extern "C" fn(*mut *mut c_void, c_uint) -> CuResultCode,
     event_destroy: unsafe extern "C" fn(*mut c_void) -> CuResultCode,
@@ -368,6 +380,14 @@ impl GpuBackend {
                 stream_synchronize: sym(&lib, b"cuStreamSynchronize\0")?,
                 stream_query: sym(&lib, b"cuStreamQuery\0")?,
                 stream_wait_event: sym(&lib, b"cuStreamWaitEvent\0")?,
+                vmm_address_reserve: sym(&lib, b"cuMemAddressReserve\0").ok(),
+                vmm_create: sym(&lib, b"cuMemCreate\0").ok(),
+                vmm_map: sym(&lib, b"cuMemMap\0").ok(),
+                vmm_set_access: sym(&lib, b"cuMemSetAccess\0").ok(),
+                vmm_unmap: sym(&lib, b"cuMemUnmap\0").ok(),
+                vmm_release: sym(&lib, b"cuMemRelease\0").ok(),
+                vmm_address_free: sym(&lib, b"cuMemAddressFree\0").ok(),
+                vmm_granularity: sym(&lib, b"cuMemGetAllocationGranularity\0").ok(),
                 event_query: sym(&lib, b"cuEventQuery\0")?,
                 event_create: sym(&lib, b"cuEventCreate\0")?,
                 event_destroy: sym2(&lib, b"cuEventDestroy_v2\0", b"cuEventDestroy\0")?,
@@ -473,12 +493,16 @@ impl Backend for GpuBackend {
             buf.push(0);
         }
         let mut module: *mut c_void = std::ptr::null_mut();
-        unsafe {
-            chk((self.module_load_data)(
-                &mut module,
-                buf.as_ptr() as *const c_void,
-            ))?
-        };
+        let code = unsafe { (self.module_load_data)(&mut module, buf.as_ptr() as *const c_void) };
+        if code != 0 {
+            // Debug: keep failing images for cuobjdump post-mortem.
+            if let Some(dir) = std::env::var_os("SMOLVM_CUDA_DUMP_BAD_MODULES") {
+                let n = buf.len();
+                let path = std::path::Path::new(&dir).join(format!("badmod-{code}-{n}.bin"));
+                let _ = std::fs::write(path, &buf);
+            }
+            return Err(code);
+        }
         Ok(module as u64)
     }
     fn module_get_function(&mut self, module: u64, name: &str) -> CuResult<u64> {
@@ -601,6 +625,58 @@ impl Backend for GpuBackend {
         self.guest_ram.iter().find_map(|&(gs, hva, rlen)| {
             (gpa >= gs && gpa.checked_add(len)? <= gs + rlen).then(|| hva + (gpa - gs))
         })
+    }
+
+    fn mem_address_reserve(&mut self, size: u64, align: u64) -> CuResult<u64> {
+        let f = self
+            .vmm_address_reserve
+            .ok_or(super::CUDA_ERROR_NOT_SUPPORTED)?;
+        let mut va = 0u64;
+        unsafe { chk(f(&mut va, size as usize, align as usize, 0, 0))? };
+        Ok(va)
+    }
+    fn mem_create(&mut self, size: u64, device: i32) -> CuResult<u64> {
+        let f = self.vmm_create.ok_or(super::CUDA_ERROR_NOT_SUPPORTED)?;
+        let prop = vmm_prop(device);
+        let mut h = 0u64;
+        unsafe { chk(f(&mut h, size as usize, &prop, 0))? };
+        Ok(h)
+    }
+    fn mem_map(&mut self, va: u64, size: u64, offset: u64, handle: u64) -> CuResult<()> {
+        let f = self.vmm_map.ok_or(super::CUDA_ERROR_NOT_SUPPORTED)?;
+        unsafe { chk(f(va, size as usize, offset as usize, handle, 0)) }
+    }
+    fn mem_set_access(&mut self, va: u64, size: u64, device: i32) -> CuResult<()> {
+        let f = self.vmm_set_access.ok_or(super::CUDA_ERROR_NOT_SUPPORTED)?;
+        let desc = VmmAccessDesc {
+            location_type: 1,
+            location_id: device,
+            flags: 3,
+        };
+        unsafe { chk(f(va, size as usize, &desc, 1)) }
+    }
+    fn mem_unmap(&mut self, va: u64, size: u64) -> CuResult<()> {
+        let f = self.vmm_unmap.ok_or(super::CUDA_ERROR_NOT_SUPPORTED)?;
+        unsafe { chk(f(va, size as usize)) }
+    }
+    fn mem_release(&mut self, handle: u64) -> CuResult<()> {
+        let f = self.vmm_release.ok_or(super::CUDA_ERROR_NOT_SUPPORTED)?;
+        unsafe { chk(f(handle)) }
+    }
+    fn mem_address_free(&mut self, va: u64, size: u64) -> CuResult<()> {
+        let f = self
+            .vmm_address_free
+            .ok_or(super::CUDA_ERROR_NOT_SUPPORTED)?;
+        unsafe { chk(f(va, size as usize)) }
+    }
+    fn mem_get_allocation_granularity(&mut self, device: i32, flags: u32) -> CuResult<u64> {
+        let f = self
+            .vmm_granularity
+            .ok_or(super::CUDA_ERROR_NOT_SUPPORTED)?;
+        let prop = vmm_prop(device);
+        let mut g = 0usize;
+        unsafe { chk(f(&mut g, &prop, flags))? };
+        Ok(g as u64)
     }
 
     fn memcpy_gpa_htod(&mut self, dptr: u64, segments: &[(u64, u64)], stream: u64) -> CuResult<()> {
@@ -1904,6 +1980,37 @@ impl Drop for GpuBackend {
                 unsafe { free(addr as *mut c_void) };
             }
         }
+    }
+}
+
+/// `CUmemAllocationProp` prefix we populate: pinned device memory on one
+/// device, no export handles. Zeroed tail keeps future fields defined.
+#[repr(C)]
+pub struct VmmProp {
+    type_: c_int, // CU_MEM_ALLOCATION_TYPE_PINNED = 1
+    requested_handle_types: c_int,
+    location_type: c_int, // CU_MEM_LOCATION_TYPE_DEVICE = 1
+    location_id: c_int,
+    win32_handle_meta: *mut c_void,
+    alloc_flags: [u8; 8],
+}
+
+/// `CUmemAccessDesc`: device location + RW flags.
+#[repr(C)]
+pub struct VmmAccessDesc {
+    location_type: c_int,
+    location_id: c_int,
+    flags: c_int, // CU_MEM_ACCESS_FLAGS_PROT_READWRITE = 3
+}
+
+fn vmm_prop(device: i32) -> VmmProp {
+    VmmProp {
+        type_: 1,
+        requested_handle_types: 0,
+        location_type: 1,
+        location_id: device,
+        win32_handle_meta: std::ptr::null_mut(),
+        alloc_flags: [0; 8],
     }
 }
 
