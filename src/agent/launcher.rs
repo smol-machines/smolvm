@@ -474,6 +474,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         let krun_add_virtiofs3 = krun.add_virtiofs3;
         let krun_start_enter = krun.start_enter;
         let krun_add_vsock = krun.add_vsock;
+        let krun_get_guest_ram = krun.get_guest_ram;
 
         // Set log level (0 = off, 1 = error, 2 = warn, 3 = info, 4 = debug)
         // Enable debug logging to trace vsock timing issues
@@ -1358,6 +1359,32 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                         tracing::warn!(error = %e, "egress-refresh spawn failed");
                     }
                 }
+            }
+        }
+
+        // Enable guest-RAM zero-copy for the CUDA server: publish a provider it
+        // can query (lazily, once the VM is up) for the guest-RAM host mapping.
+        // The guest side is armed via SMOLVM_CUDA_ZEROCOPY (see vsock_service).
+        if cuda_socket.is_some() {
+            if let Some(get_ram) = krun_get_guest_ram {
+                crate::cuda_host::set_guest_ram_provider(Box::new(move || {
+                    let mut count = 0u64;
+                    // SAFETY: FFI into libkrun; valid after the VM is built.
+                    if get_ram(ctx, std::ptr::null_mut(), 0, &mut count) != 0 || count == 0 {
+                        return None;
+                    }
+                    let mut buf = vec![0u64; count as usize * 3];
+                    if get_ram(ctx, buf.as_mut_ptr(), count as u32, &mut count) != 0 {
+                        return None;
+                    }
+                    Some(
+                        buf.chunks_exact(3)
+                            .map(|c| (c[0], c[1], c[2]))
+                            .collect::<Vec<_>>(),
+                    )
+                }));
+            } else {
+                tracing::info!("cuda-host: libkrun has no krun_get_guest_ram — zero-copy disabled");
             }
         }
 

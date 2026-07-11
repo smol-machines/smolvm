@@ -94,7 +94,11 @@ impl VsockService for CudaService {
             port: ports::CUDA,
             listen: false,
             socket,
-            guest_env: &[],
+            // Arm guest-RAM zero-copy for `cudaMallocHost` buffers. The shim
+            // only uses it when it can read `/proc/self/pagemap` (guest is root)
+            // and the host published the mapping; otherwise it falls back to the
+            // byte-shipping path transparently.
+            guest_env: &[("SMOLVM_CUDA_ZEROCOPY", "1")],
         })
     }
 }

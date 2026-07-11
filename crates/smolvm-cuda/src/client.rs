@@ -177,4 +177,297 @@ impl<S: Read + Write> Client<S> {
         self.call(&Request::CtxSynchronize, Op::CtxSynchronize)
             .map(|_| ())
     }
+
+    pub fn driver_get_version(&mut self) -> Result<i32> {
+        match self.call(&Request::DriverGetVersion, Op::DriverGetVersion)? {
+            Response::Count(v) => Ok(v),
+            _ => Err(CudaRpcError::Protocol("expected Count")),
+        }
+    }
+
+    pub fn device_get_attribute(&mut self, attrib: i32, device: i32) -> Result<i32> {
+        match self.call(
+            &Request::DeviceGetAttribute { attrib, device },
+            Op::DeviceGetAttribute,
+        )? {
+            Response::Count(v) => Ok(v),
+            _ => Err(CudaRpcError::Protocol("expected Count")),
+        }
+    }
+
+    pub fn device_get_uuid(&mut self, device: i32) -> Result<[u8; 16]> {
+        match self.call(&Request::DeviceGetUuid { device }, Op::DeviceGetUuid)? {
+            Response::Data(d) if d.len() == 16 => {
+                let mut uuid = [0u8; 16];
+                uuid.copy_from_slice(&d);
+                Ok(uuid)
+            }
+            _ => Err(CudaRpcError::Protocol("expected 16-byte Data")),
+        }
+    }
+
+    pub fn primary_ctx_retain(&mut self, device: i32) -> Result<u64> {
+        match self.call(&Request::PrimaryCtxRetain { device }, Op::PrimaryCtxRetain)? {
+            Response::Handle(h) => Ok(h),
+            _ => Err(CudaRpcError::Protocol("expected Handle")),
+        }
+    }
+
+    pub fn primary_ctx_release(&mut self, device: i32) -> Result<()> {
+        self.call(
+            &Request::PrimaryCtxRelease { device },
+            Op::PrimaryCtxRelease,
+        )
+        .map(|_| ())
+    }
+
+    pub fn module_unload(&mut self, module: u64) -> Result<()> {
+        self.call(&Request::ModuleUnload { module }, Op::ModuleUnload)
+            .map(|_| ())
+    }
+
+    /// Per-parameter byte sizes of the kernel's arguments, in declaration order.
+    pub fn func_get_param_info(&mut self, function: u64) -> Result<Vec<u32>> {
+        match self.call(
+            &Request::FuncGetParamInfo { function },
+            Op::FuncGetParamInfo,
+        )? {
+            Response::Data(d) if d.len() % 4 == 0 => Ok(d
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .collect()),
+            _ => Err(CudaRpcError::Protocol("expected u32-array Data")),
+        }
+    }
+
+    pub fn memcpy_dtod(&mut self, dst: u64, src: u64, bytes: u64) -> Result<()> {
+        self.call(&Request::MemcpyDtoD { dst, src, bytes }, Op::MemcpyDtoD)
+            .map(|_| ())
+    }
+
+    pub fn memset_d8(&mut self, dptr: u64, value: u8, bytes: u64) -> Result<()> {
+        self.call(&Request::MemsetD8 { dptr, value, bytes }, Op::MemsetD8)
+            .map(|_| ())
+    }
+
+    /// Returns `(free, total)` device memory in bytes.
+    pub fn mem_get_info(&mut self) -> Result<(u64, u64)> {
+        match self.call(&Request::MemGetInfo, Op::MemGetInfo)? {
+            Response::Pair(free, total) => Ok((free, total)),
+            _ => Err(CudaRpcError::Protocol("expected Pair")),
+        }
+    }
+
+    pub fn stream_create(&mut self, flags: u32) -> Result<u64> {
+        match self.call(&Request::StreamCreate { flags }, Op::StreamCreate)? {
+            Response::Handle(h) => Ok(h),
+            _ => Err(CudaRpcError::Protocol("expected Handle")),
+        }
+    }
+
+    pub fn stream_destroy(&mut self, stream: u64) -> Result<()> {
+        self.call(&Request::StreamDestroy { stream }, Op::StreamDestroy)
+            .map(|_| ())
+    }
+
+    pub fn stream_synchronize(&mut self, stream: u64) -> Result<()> {
+        self.call(
+            &Request::StreamSynchronize { stream },
+            Op::StreamSynchronize,
+        )
+        .map(|_| ())
+    }
+
+    pub fn event_create(&mut self, flags: u32) -> Result<u64> {
+        match self.call(&Request::EventCreate { flags }, Op::EventCreate)? {
+            Response::Handle(h) => Ok(h),
+            _ => Err(CudaRpcError::Protocol("expected Handle")),
+        }
+    }
+
+    pub fn event_destroy(&mut self, event: u64) -> Result<()> {
+        self.call(&Request::EventDestroy { event }, Op::EventDestroy)
+            .map(|_| ())
+    }
+
+    pub fn event_record(&mut self, event: u64, stream: u64) -> Result<()> {
+        self.call(&Request::EventRecord { event, stream }, Op::EventRecord)
+            .map(|_| ())
+    }
+
+    pub fn event_synchronize(&mut self, event: u64) -> Result<()> {
+        self.call(&Request::EventSynchronize { event }, Op::EventSynchronize)
+            .map(|_| ())
+    }
+
+    pub fn event_elapsed_time(&mut self, start: u64, end: u64) -> Result<f32> {
+        match self.call(
+            &Request::EventElapsedTime { start, end },
+            Op::EventElapsedTime,
+        )? {
+            Response::Millis(ms) => Ok(ms),
+            _ => Err(CudaRpcError::Protocol("expected Millis")),
+        }
+    }
+
+    /// `(nvcomp_status, temp_bytes)` — nvcomp status is the library's own code.
+    pub fn nvcomp_deflate_temp_size(
+        &mut self,
+        num_chunks: u64,
+        max_uncompressed_chunk_bytes: u64,
+        max_total_uncompressed_bytes: u64,
+    ) -> Result<(i32, u64)> {
+        match self.call(
+            &Request::NvcompDeflateTempSize {
+                num_chunks,
+                max_uncompressed_chunk_bytes,
+                max_total_uncompressed_bytes,
+            },
+            Op::NvcompDeflateTempSize,
+        )? {
+            Response::Pair(st, tb) => Ok((st as i32, tb)),
+            _ => Err(CudaRpcError::Protocol("expected Pair")),
+        }
+    }
+
+    /// Returns the nvcomp status code.
+    #[allow(clippy::too_many_arguments)]
+    pub fn nvcomp_deflate_decompress(
+        &mut self,
+        device_compressed_ptrs: u64,
+        device_compressed_bytes: u64,
+        device_uncompressed_bytes: u64,
+        device_actual_uncompressed_bytes: u64,
+        batch_size: u64,
+        device_temp: u64,
+        temp_bytes: u64,
+        device_uncompressed_ptrs: u64,
+        device_statuses: u64,
+        stream: u64,
+    ) -> Result<i32> {
+        match self.call(
+            &Request::NvcompDeflateDecompress {
+                device_compressed_ptrs,
+                device_compressed_bytes,
+                device_uncompressed_bytes,
+                device_actual_uncompressed_bytes,
+                batch_size,
+                device_temp,
+                temp_bytes,
+                device_uncompressed_ptrs,
+                device_statuses,
+                stream,
+            },
+            Op::NvcompDeflateDecompress,
+        )? {
+            Response::Count(st) => Ok(st),
+            _ => Err(CudaRpcError::Protocol("expected Count")),
+        }
+    }
+
+    pub fn cublas_create(&mut self) -> Result<u64> {
+        match self.call(&Request::CublasCreate, Op::CublasCreate)? {
+            Response::Handle(h) => Ok(h),
+            _ => Err(CudaRpcError::Protocol("expected Handle")),
+        }
+    }
+
+    pub fn cublas_destroy(&mut self, handle: u64) -> Result<()> {
+        self.call(&Request::CublasDestroy { handle }, Op::CublasDestroy)
+            .map(|_| ())
+    }
+
+    pub fn cublas_set_stream(&mut self, handle: u64, stream: u64) -> Result<()> {
+        self.call(
+            &Request::CublasSetStream { handle, stream },
+            Op::CublasSetStream,
+        )
+        .map(|_| ())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn cublas_sgemm(
+        &mut self,
+        handle: u64,
+        transa: u32,
+        transb: u32,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        a: u64,
+        lda: i32,
+        b: u64,
+        ldb: i32,
+        beta: f32,
+        c: u64,
+        ldc: i32,
+    ) -> Result<()> {
+        self.call(
+            &Request::CublasSgemm {
+                handle,
+                transa,
+                transb,
+                m,
+                n,
+                k,
+                alpha_bits: alpha.to_bits(),
+                a,
+                lda,
+                b,
+                ldb,
+                beta_bits: beta.to_bits(),
+                c,
+                ldc,
+            },
+            Op::CublasSgemm,
+        )
+        .map(|_| ())
+    }
+
+    /// Generic forward-to-host-lib call. Returns `(library_status, outputs)`.
+    pub fn lib_call(&mut self, lib: u8, func: u16, args: Vec<u8>) -> Result<(i32, Vec<u8>)> {
+        match self.call(&Request::LibCall { lib, func, args }, Op::LibCall)? {
+            Response::LibResult(status, out) => Ok((status, out)),
+            _ => Err(CudaRpcError::Protocol("expected LibResult")),
+        }
+    }
+
+    /// Zero-copy H2D via the shared region (data already written at `offset`).
+    pub fn memcpy_shm_htod(&mut self, dptr: u64, offset: u64, size: u64) -> Result<()> {
+        self.call(
+            &Request::MemcpyShmHtoD { dptr, offset, size },
+            Op::MemcpyShmHtoD,
+        )
+        .map(|_| ())
+    }
+
+    /// Zero-copy D2H via the shared region (host writes into `offset`).
+    pub fn memcpy_shm_dtoh(&mut self, offset: u64, dptr: u64, size: u64) -> Result<()> {
+        self.call(
+            &Request::MemcpyShmDtoH { offset, dptr, size },
+            Op::MemcpyShmDtoH,
+        )
+        .map(|_| ())
+    }
+
+    /// Zero-copy H2D from guest RAM: the host gathers `segments` (guest-physical)
+    /// and DMAs to `dptr`.
+    pub fn memcpy_gpa_htod(&mut self, dptr: u64, segments: Vec<(u64, u64)>) -> Result<()> {
+        self.call(
+            &Request::MemcpyGpaHtoD { dptr, segments },
+            Op::MemcpyGpaHtoD,
+        )
+        .map(|_| ())
+    }
+
+    /// Zero-copy D2H to guest RAM: the host DMAs from `dptr` and scatters into
+    /// `segments` (guest-physical).
+    pub fn memcpy_gpa_dtoh(&mut self, dptr: u64, segments: Vec<(u64, u64)>) -> Result<()> {
+        self.call(
+            &Request::MemcpyGpaDtoH { dptr, segments },
+            Op::MemcpyGpaDtoH,
+        )
+        .map(|_| ())
+    }
 }

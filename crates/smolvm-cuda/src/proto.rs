@@ -26,16 +26,58 @@ pub enum Op {
     DeviceGetCount = 0x02,
     DeviceGetName = 0x03,
     DeviceTotalMem = 0x04,
+    DriverGetVersion = 0x05,
+    DeviceGetAttribute = 0x06,
+    DeviceGetUuid = 0x07,
     CtxCreate = 0x10,
     CtxDestroy = 0x11,
+    PrimaryCtxRetain = 0x12,
+    PrimaryCtxRelease = 0x13,
     ModuleLoadData = 0x20,
     ModuleGetFunction = 0x21,
+    ModuleUnload = 0x22,
+    FuncGetParamInfo = 0x23,
     MemAlloc = 0x30,
     MemFree = 0x31,
     MemcpyHtoD = 0x32,
     MemcpyDtoH = 0x33,
+    MemcpyDtoD = 0x34,
+    MemsetD8 = 0x35,
+    MemGetInfo = 0x36,
     LaunchKernel = 0x40,
     CtxSynchronize = 0x50,
+    StreamCreate = 0x60,
+    StreamDestroy = 0x61,
+    StreamSynchronize = 0x62,
+    EventCreate = 0x70,
+    EventDestroy = 0x71,
+    EventRecord = 0x72,
+    EventSynchronize = 0x73,
+    EventElapsedTime = 0x74,
+    // nvcomp (forward-to-host-lib): batched Deflate decompression. Device-pointer
+    // args are real host device addresses, forwarded by value.
+    NvcompDeflateTempSize = 0x80,
+    NvcompDeflateDecompress = 0x81,
+    // cuBLAS (forward-to-host-lib). Handles are host-minted opaque ids; device
+    // pointers pass by value.
+    CublasCreate = 0x90,
+    CublasDestroy = 0x91,
+    CublasSetStream = 0x92,
+    CublasSgemm = 0x93,
+    /// Generic forward-to-host-lib call: `(lib, func, args)` → `(status, out)`.
+    /// The wire is library-agnostic; per-function (de)serialization is
+    /// code-generated (see `smolvm-cuda-codegen`). This is how the cuBLAS/cuDNN
+    /// surface scales without a new opcode per function.
+    LibCall = 0xA0,
+    /// Zero-copy memcpy via the shared-memory channel: the payload is an
+    /// `(offset, size)` descriptor into the shared region, not the bytes.
+    MemcpyShmHtoD = 0xB0,
+    MemcpyShmDtoH = 0xB1,
+    /// Zero-copy memcpy via guest RAM the host maps: the payload is a list of
+    /// `(guest_physical_addr, len)` segments, not the bytes. The host reads
+    /// guest memory directly (one DMA if contiguous, gather otherwise).
+    MemcpyGpaHtoD = 0xB2,
+    MemcpyGpaDtoH = 0xB3,
 }
 
 impl Op {
@@ -45,16 +87,45 @@ impl Op {
             0x02 => Op::DeviceGetCount,
             0x03 => Op::DeviceGetName,
             0x04 => Op::DeviceTotalMem,
+            0x05 => Op::DriverGetVersion,
+            0x06 => Op::DeviceGetAttribute,
+            0x07 => Op::DeviceGetUuid,
             0x10 => Op::CtxCreate,
             0x11 => Op::CtxDestroy,
+            0x12 => Op::PrimaryCtxRetain,
+            0x13 => Op::PrimaryCtxRelease,
             0x20 => Op::ModuleLoadData,
             0x21 => Op::ModuleGetFunction,
+            0x22 => Op::ModuleUnload,
+            0x23 => Op::FuncGetParamInfo,
             0x30 => Op::MemAlloc,
             0x31 => Op::MemFree,
             0x32 => Op::MemcpyHtoD,
             0x33 => Op::MemcpyDtoH,
+            0x34 => Op::MemcpyDtoD,
+            0x35 => Op::MemsetD8,
+            0x36 => Op::MemGetInfo,
             0x40 => Op::LaunchKernel,
             0x50 => Op::CtxSynchronize,
+            0x60 => Op::StreamCreate,
+            0x61 => Op::StreamDestroy,
+            0x62 => Op::StreamSynchronize,
+            0x70 => Op::EventCreate,
+            0x71 => Op::EventDestroy,
+            0x72 => Op::EventRecord,
+            0x73 => Op::EventSynchronize,
+            0x74 => Op::EventElapsedTime,
+            0x80 => Op::NvcompDeflateTempSize,
+            0x81 => Op::NvcompDeflateDecompress,
+            0x90 => Op::CublasCreate,
+            0x91 => Op::CublasDestroy,
+            0x92 => Op::CublasSetStream,
+            0x93 => Op::CublasSgemm,
+            0xA0 => Op::LibCall,
+            0xB0 => Op::MemcpyShmHtoD,
+            0xB1 => Op::MemcpyShmDtoH,
+            0xB2 => Op::MemcpyGpaHtoD,
+            0xB3 => Op::MemcpyGpaDtoH,
             _ => return None,
         })
     }
@@ -71,11 +142,25 @@ pub enum Request {
     DeviceTotalMem {
         device: i32,
     },
+    DriverGetVersion,
+    DeviceGetAttribute {
+        attrib: i32,
+        device: i32,
+    },
+    DeviceGetUuid {
+        device: i32,
+    },
     CtxCreate {
         device: i32,
     },
     CtxDestroy {
         ctx: u64,
+    },
+    PrimaryCtxRetain {
+        device: i32,
+    },
+    PrimaryCtxRelease {
+        device: i32,
     },
     ModuleLoadData {
         image: Vec<u8>,
@@ -83,6 +168,14 @@ pub enum Request {
     ModuleGetFunction {
         module: u64,
         name: String,
+    },
+    ModuleUnload {
+        module: u64,
+    },
+    /// Per-parameter byte sizes of `function`'s kernel arguments, in declaration
+    /// order — what a generic client needs to serialize `kernelParams` blobs.
+    FuncGetParamInfo {
+        function: u64,
     },
     MemAlloc {
         bytes: u64,
@@ -98,9 +191,21 @@ pub enum Request {
         dptr: u64,
         bytes: u64,
     },
+    MemcpyDtoD {
+        dst: u64,
+        src: u64,
+        bytes: u64,
+    },
+    MemsetD8 {
+        dptr: u64,
+        value: u8,
+        bytes: u64,
+    },
+    MemGetInfo,
     /// Launch `function` with the given geometry. `params` is one byte-blob per
     /// kernel argument, in order — the host rebuilds the `void*[]` the Driver
-    /// API expects by pointing at local copies of each blob.
+    /// API expects by pointing at local copies of each blob. `stream` is an
+    /// opaque stream id (0 = the default stream).
     LaunchKernel {
         function: u64,
         grid: [u32; 3],
@@ -110,10 +215,111 @@ pub enum Request {
         params: Vec<Vec<u8>>,
     },
     CtxSynchronize,
+    StreamCreate {
+        flags: u32,
+    },
+    StreamDestroy {
+        stream: u64,
+    },
+    StreamSynchronize {
+        stream: u64,
+    },
+    EventCreate {
+        flags: u32,
+    },
+    EventDestroy {
+        event: u64,
+    },
+    /// Record `event` on `stream` (0 = the default stream).
+    EventRecord {
+        event: u64,
+        stream: u64,
+    },
+    EventSynchronize {
+        event: u64,
+    },
+    EventElapsedTime {
+        start: u64,
+        end: u64,
+    },
+    /// `nvcompBatchedDeflateDecompressGetTempSizeEx` — all host scalars.
+    NvcompDeflateTempSize {
+        num_chunks: u64,
+        max_uncompressed_chunk_bytes: u64,
+        max_total_uncompressed_bytes: u64,
+    },
+    /// `nvcompBatchedDeflateDecompressAsync` — every pointer is a host device
+    /// address (or 0 for the optional out-params), forwarded by value.
+    NvcompDeflateDecompress {
+        device_compressed_ptrs: u64,
+        device_compressed_bytes: u64,
+        device_uncompressed_bytes: u64,
+        device_actual_uncompressed_bytes: u64,
+        batch_size: u64,
+        device_temp: u64,
+        temp_bytes: u64,
+        device_uncompressed_ptrs: u64,
+        device_statuses: u64,
+        stream: u64,
+    },
+    CublasCreate,
+    CublasDestroy {
+        handle: u64,
+    },
+    CublasSetStream {
+        handle: u64,
+        stream: u64,
+    },
+    /// `cublasSgemm` (column-major). `alpha`/`beta` carried as f32 bits.
+    CublasSgemm {
+        handle: u64,
+        transa: u32,
+        transb: u32,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha_bits: u32,
+        a: u64,
+        lda: i32,
+        b: u64,
+        ldb: i32,
+        beta_bits: u32,
+        c: u64,
+        ldc: i32,
+    },
+    /// Generic library call; `args` is the code-generated arg blob.
+    LibCall {
+        lib: u8,
+        func: u16,
+        args: Vec<u8>,
+    },
+    /// Zero-copy H2D: copy `size` bytes from shared-region `offset` to `dptr`.
+    MemcpyShmHtoD {
+        dptr: u64,
+        offset: u64,
+        size: u64,
+    },
+    /// Zero-copy D2H: copy `size` bytes from `dptr` to shared-region `offset`.
+    MemcpyShmDtoH {
+        offset: u64,
+        dptr: u64,
+        size: u64,
+    },
+    /// Zero-copy H2D from guest RAM: gather `segments` (each `(gpa, len)`, in
+    /// buffer order) and copy to `dptr`.
+    MemcpyGpaHtoD {
+        dptr: u64,
+        segments: Vec<(u64, u64)>,
+    },
+    /// Zero-copy D2H to guest RAM: copy from `dptr` and scatter into `segments`.
+    MemcpyGpaDtoH {
+        dptr: u64,
+        segments: Vec<(u64, u64)>,
+    },
 }
 
 /// A decoded successful response body (the `status == 0` payload).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Response {
     /// No return value beyond status (Init, CtxDestroy, MemFree, Memcpy*, Launch, Sync).
     Ok,
@@ -123,6 +329,12 @@ pub enum Response {
     Handle(u64),
     Dptr(u64),
     Data(Vec<u8>),
+    /// Two u64s (MemGetInfo: free, total).
+    Pair(u64, u64),
+    /// Milliseconds (EventElapsedTime). f32 bits on the wire.
+    Millis(f32),
+    /// Generic library-call result: library status + serialized output params.
+    LibResult(i32, Vec<u8>),
 }
 
 // ---- low-level primitives -------------------------------------------------
@@ -195,7 +407,13 @@ fn bad() -> io::Error {
 
 // ---- framing --------------------------------------------------------------
 
-/// Write a length-prefixed payload.
+/// Write a length-prefixed payload as a **single** write.
+///
+/// Framing the length and payload into one buffer (rather than two `write_all`
+/// calls) matters for latency: on a request/response protocol, a length-then-
+/// payload pair triggers the classic write-write-read Nagle + delayed-ACK stall
+/// (~40 ms/round-trip on TCP), and even on vsock it halves the syscall count.
+/// One write per message is the single biggest per-call latency win.
 pub fn write_msg<W: Write>(w: &mut W, payload: &[u8]) -> io::Result<()> {
     if payload.len() > MAX_MSG {
         return Err(io::Error::new(
@@ -203,8 +421,22 @@ pub fn write_msg<W: Write>(w: &mut W, payload: &[u8]) -> io::Result<()> {
             "message too large",
         ));
     }
-    w.write_all(&(payload.len() as u32).to_le_bytes())?;
-    w.write_all(payload)?;
+    let len = (payload.len() as u32).to_le_bytes();
+    // Small messages (control calls, launches): coalesce header+payload into one
+    // write so the write-write-read Nagle/delayed-ACK stall can't happen; the
+    // copy is negligible. Large messages (bulk memcpy): write the 4-byte header
+    // then the payload directly — a large payload already fills segments (no
+    // stall), and skipping the copy is a real bandwidth win for H2D/D2H.
+    const COALESCE_MAX: usize = 64 * 1024;
+    if payload.len() <= COALESCE_MAX {
+        let mut framed = Vec::with_capacity(4 + payload.len());
+        framed.extend_from_slice(&len);
+        framed.extend_from_slice(payload);
+        w.write_all(&framed)?;
+    } else {
+        w.write_all(&len)?;
+        w.write_all(payload)?;
+    }
     w.flush()
 }
 
@@ -244,6 +476,16 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
             w_u8(&mut b, Op::DeviceTotalMem as u8);
             w_i32(&mut b, *device);
         }
+        Request::DriverGetVersion => w_u8(&mut b, Op::DriverGetVersion as u8),
+        Request::DeviceGetAttribute { attrib, device } => {
+            w_u8(&mut b, Op::DeviceGetAttribute as u8);
+            w_i32(&mut b, *attrib);
+            w_i32(&mut b, *device);
+        }
+        Request::DeviceGetUuid { device } => {
+            w_u8(&mut b, Op::DeviceGetUuid as u8);
+            w_i32(&mut b, *device);
+        }
         Request::CtxCreate { device } => {
             w_u8(&mut b, Op::CtxCreate as u8);
             w_i32(&mut b, *device);
@@ -251,6 +493,14 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
         Request::CtxDestroy { ctx } => {
             w_u8(&mut b, Op::CtxDestroy as u8);
             w_u64(&mut b, *ctx);
+        }
+        Request::PrimaryCtxRetain { device } => {
+            w_u8(&mut b, Op::PrimaryCtxRetain as u8);
+            w_i32(&mut b, *device);
+        }
+        Request::PrimaryCtxRelease { device } => {
+            w_u8(&mut b, Op::PrimaryCtxRelease as u8);
+            w_i32(&mut b, *device);
         }
         Request::ModuleLoadData { image } => {
             w_u8(&mut b, Op::ModuleLoadData as u8);
@@ -260,6 +510,14 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
             w_u8(&mut b, Op::ModuleGetFunction as u8);
             w_u64(&mut b, *module);
             w_str(&mut b, name);
+        }
+        Request::ModuleUnload { module } => {
+            w_u8(&mut b, Op::ModuleUnload as u8);
+            w_u64(&mut b, *module);
+        }
+        Request::FuncGetParamInfo { function } => {
+            w_u8(&mut b, Op::FuncGetParamInfo as u8);
+            w_u64(&mut b, *function);
         }
         Request::MemAlloc { bytes } => {
             w_u8(&mut b, Op::MemAlloc as u8);
@@ -279,6 +537,19 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
             w_u64(&mut b, *dptr);
             w_u64(&mut b, *bytes);
         }
+        Request::MemcpyDtoD { dst, src, bytes } => {
+            w_u8(&mut b, Op::MemcpyDtoD as u8);
+            w_u64(&mut b, *dst);
+            w_u64(&mut b, *src);
+            w_u64(&mut b, *bytes);
+        }
+        Request::MemsetD8 { dptr, value, bytes } => {
+            w_u8(&mut b, Op::MemsetD8 as u8);
+            w_u64(&mut b, *dptr);
+            w_u8(&mut b, *value);
+            w_u64(&mut b, *bytes);
+        }
+        Request::MemGetInfo => w_u8(&mut b, Op::MemGetInfo as u8),
         Request::LaunchKernel {
             function,
             grid,
@@ -303,8 +574,158 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
             }
         }
         Request::CtxSynchronize => w_u8(&mut b, Op::CtxSynchronize as u8),
+        Request::StreamCreate { flags } => {
+            w_u8(&mut b, Op::StreamCreate as u8);
+            w_u32(&mut b, *flags);
+        }
+        Request::StreamDestroy { stream } => {
+            w_u8(&mut b, Op::StreamDestroy as u8);
+            w_u64(&mut b, *stream);
+        }
+        Request::StreamSynchronize { stream } => {
+            w_u8(&mut b, Op::StreamSynchronize as u8);
+            w_u64(&mut b, *stream);
+        }
+        Request::EventCreate { flags } => {
+            w_u8(&mut b, Op::EventCreate as u8);
+            w_u32(&mut b, *flags);
+        }
+        Request::EventDestroy { event } => {
+            w_u8(&mut b, Op::EventDestroy as u8);
+            w_u64(&mut b, *event);
+        }
+        Request::EventRecord { event, stream } => {
+            w_u8(&mut b, Op::EventRecord as u8);
+            w_u64(&mut b, *event);
+            w_u64(&mut b, *stream);
+        }
+        Request::EventSynchronize { event } => {
+            w_u8(&mut b, Op::EventSynchronize as u8);
+            w_u64(&mut b, *event);
+        }
+        Request::EventElapsedTime { start, end } => {
+            w_u8(&mut b, Op::EventElapsedTime as u8);
+            w_u64(&mut b, *start);
+            w_u64(&mut b, *end);
+        }
+        Request::NvcompDeflateTempSize {
+            num_chunks,
+            max_uncompressed_chunk_bytes,
+            max_total_uncompressed_bytes,
+        } => {
+            w_u8(&mut b, Op::NvcompDeflateTempSize as u8);
+            w_u64(&mut b, *num_chunks);
+            w_u64(&mut b, *max_uncompressed_chunk_bytes);
+            w_u64(&mut b, *max_total_uncompressed_bytes);
+        }
+        Request::NvcompDeflateDecompress {
+            device_compressed_ptrs,
+            device_compressed_bytes,
+            device_uncompressed_bytes,
+            device_actual_uncompressed_bytes,
+            batch_size,
+            device_temp,
+            temp_bytes,
+            device_uncompressed_ptrs,
+            device_statuses,
+            stream,
+        } => {
+            w_u8(&mut b, Op::NvcompDeflateDecompress as u8);
+            for v in [
+                device_compressed_ptrs,
+                device_compressed_bytes,
+                device_uncompressed_bytes,
+                device_actual_uncompressed_bytes,
+                batch_size,
+                device_temp,
+                temp_bytes,
+                device_uncompressed_ptrs,
+                device_statuses,
+                stream,
+            ] {
+                w_u64(&mut b, *v);
+            }
+        }
+        Request::CublasCreate => w_u8(&mut b, Op::CublasCreate as u8),
+        Request::CublasDestroy { handle } => {
+            w_u8(&mut b, Op::CublasDestroy as u8);
+            w_u64(&mut b, *handle);
+        }
+        Request::CublasSetStream { handle, stream } => {
+            w_u8(&mut b, Op::CublasSetStream as u8);
+            w_u64(&mut b, *handle);
+            w_u64(&mut b, *stream);
+        }
+        Request::CublasSgemm {
+            handle,
+            transa,
+            transb,
+            m,
+            n,
+            k,
+            alpha_bits,
+            a,
+            lda,
+            b: bmat,
+            ldb,
+            beta_bits,
+            c,
+            ldc,
+        } => {
+            w_u8(&mut b, Op::CublasSgemm as u8);
+            w_u64(&mut b, *handle);
+            w_u32(&mut b, *transa);
+            w_u32(&mut b, *transb);
+            w_i32(&mut b, *m);
+            w_i32(&mut b, *n);
+            w_i32(&mut b, *k);
+            w_u32(&mut b, *alpha_bits);
+            w_u64(&mut b, *a);
+            w_i32(&mut b, *lda);
+            w_u64(&mut b, *bmat);
+            w_i32(&mut b, *ldb);
+            w_u32(&mut b, *beta_bits);
+            w_u64(&mut b, *c);
+            w_i32(&mut b, *ldc);
+        }
+        Request::LibCall { lib, func, args } => {
+            w_u8(&mut b, Op::LibCall as u8);
+            w_u8(&mut b, *lib);
+            w_u32(&mut b, *func as u32);
+            w_bytes(&mut b, args);
+        }
+        Request::MemcpyShmHtoD { dptr, offset, size } => {
+            w_u8(&mut b, Op::MemcpyShmHtoD as u8);
+            w_u64(&mut b, *dptr);
+            w_u64(&mut b, *offset);
+            w_u64(&mut b, *size);
+        }
+        Request::MemcpyShmDtoH { offset, dptr, size } => {
+            w_u8(&mut b, Op::MemcpyShmDtoH as u8);
+            w_u64(&mut b, *offset);
+            w_u64(&mut b, *dptr);
+            w_u64(&mut b, *size);
+        }
+        Request::MemcpyGpaHtoD { dptr, segments } => {
+            w_u8(&mut b, Op::MemcpyGpaHtoD as u8);
+            w_u64(&mut b, *dptr);
+            w_gpa_segments(&mut b, segments);
+        }
+        Request::MemcpyGpaDtoH { dptr, segments } => {
+            w_u8(&mut b, Op::MemcpyGpaDtoH as u8);
+            w_u64(&mut b, *dptr);
+            w_gpa_segments(&mut b, segments);
+        }
     }
     b
+}
+
+fn w_gpa_segments(b: &mut Vec<u8>, segs: &[(u64, u64)]) {
+    w_u32(b, segs.len() as u32);
+    for (gpa, len) in segs {
+        w_u64(b, *gpa);
+        w_u64(b, *len);
+    }
 }
 
 pub fn decode_request(payload: &[u8]) -> io::Result<Request> {
@@ -315,13 +736,23 @@ pub fn decode_request(payload: &[u8]) -> io::Result<Request> {
         Op::DeviceGetCount => Request::DeviceGetCount,
         Op::DeviceGetName => Request::DeviceGetName { device: c.i32()? },
         Op::DeviceTotalMem => Request::DeviceTotalMem { device: c.i32()? },
+        Op::DriverGetVersion => Request::DriverGetVersion,
+        Op::DeviceGetAttribute => Request::DeviceGetAttribute {
+            attrib: c.i32()?,
+            device: c.i32()?,
+        },
+        Op::DeviceGetUuid => Request::DeviceGetUuid { device: c.i32()? },
         Op::CtxCreate => Request::CtxCreate { device: c.i32()? },
         Op::CtxDestroy => Request::CtxDestroy { ctx: c.u64()? },
+        Op::PrimaryCtxRetain => Request::PrimaryCtxRetain { device: c.i32()? },
+        Op::PrimaryCtxRelease => Request::PrimaryCtxRelease { device: c.i32()? },
         Op::ModuleLoadData => Request::ModuleLoadData { image: c.bytes()? },
         Op::ModuleGetFunction => Request::ModuleGetFunction {
             module: c.u64()?,
             name: c.string()?,
         },
+        Op::ModuleUnload => Request::ModuleUnload { module: c.u64()? },
+        Op::FuncGetParamInfo => Request::FuncGetParamInfo { function: c.u64()? },
         Op::MemAlloc => Request::MemAlloc { bytes: c.u64()? },
         Op::MemFree => Request::MemFree { dptr: c.u64()? },
         Op::MemcpyHtoD => Request::MemcpyHtoD {
@@ -332,6 +763,17 @@ pub fn decode_request(payload: &[u8]) -> io::Result<Request> {
             dptr: c.u64()?,
             bytes: c.u64()?,
         },
+        Op::MemcpyDtoD => Request::MemcpyDtoD {
+            dst: c.u64()?,
+            src: c.u64()?,
+            bytes: c.u64()?,
+        },
+        Op::MemsetD8 => Request::MemsetD8 {
+            dptr: c.u64()?,
+            value: c.u8()?,
+            bytes: c.u64()?,
+        },
+        Op::MemGetInfo => Request::MemGetInfo,
         Op::LaunchKernel => {
             let function = c.u64()?;
             let grid = [c.u32()?, c.u32()?, c.u32()?];
@@ -353,7 +795,92 @@ pub fn decode_request(payload: &[u8]) -> io::Result<Request> {
             }
         }
         Op::CtxSynchronize => Request::CtxSynchronize,
+        Op::StreamCreate => Request::StreamCreate { flags: c.u32()? },
+        Op::StreamDestroy => Request::StreamDestroy { stream: c.u64()? },
+        Op::StreamSynchronize => Request::StreamSynchronize { stream: c.u64()? },
+        Op::EventCreate => Request::EventCreate { flags: c.u32()? },
+        Op::EventDestroy => Request::EventDestroy { event: c.u64()? },
+        Op::EventRecord => Request::EventRecord {
+            event: c.u64()?,
+            stream: c.u64()?,
+        },
+        Op::EventSynchronize => Request::EventSynchronize { event: c.u64()? },
+        Op::EventElapsedTime => Request::EventElapsedTime {
+            start: c.u64()?,
+            end: c.u64()?,
+        },
+        Op::NvcompDeflateTempSize => Request::NvcompDeflateTempSize {
+            num_chunks: c.u64()?,
+            max_uncompressed_chunk_bytes: c.u64()?,
+            max_total_uncompressed_bytes: c.u64()?,
+        },
+        Op::NvcompDeflateDecompress => Request::NvcompDeflateDecompress {
+            device_compressed_ptrs: c.u64()?,
+            device_compressed_bytes: c.u64()?,
+            device_uncompressed_bytes: c.u64()?,
+            device_actual_uncompressed_bytes: c.u64()?,
+            batch_size: c.u64()?,
+            device_temp: c.u64()?,
+            temp_bytes: c.u64()?,
+            device_uncompressed_ptrs: c.u64()?,
+            device_statuses: c.u64()?,
+            stream: c.u64()?,
+        },
+        Op::CublasCreate => Request::CublasCreate,
+        Op::CublasDestroy => Request::CublasDestroy { handle: c.u64()? },
+        Op::CublasSetStream => Request::CublasSetStream {
+            handle: c.u64()?,
+            stream: c.u64()?,
+        },
+        Op::CublasSgemm => Request::CublasSgemm {
+            handle: c.u64()?,
+            transa: c.u32()?,
+            transb: c.u32()?,
+            m: c.i32()?,
+            n: c.i32()?,
+            k: c.i32()?,
+            alpha_bits: c.u32()?,
+            a: c.u64()?,
+            lda: c.i32()?,
+            b: c.u64()?,
+            ldb: c.i32()?,
+            beta_bits: c.u32()?,
+            c: c.u64()?,
+            ldc: c.i32()?,
+        },
+        Op::LibCall => Request::LibCall {
+            lib: c.u8()?,
+            func: c.u32()? as u16,
+            args: c.bytes()?,
+        },
+        Op::MemcpyShmHtoD => Request::MemcpyShmHtoD {
+            dptr: c.u64()?,
+            offset: c.u64()?,
+            size: c.u64()?,
+        },
+        Op::MemcpyShmDtoH => Request::MemcpyShmDtoH {
+            offset: c.u64()?,
+            dptr: c.u64()?,
+            size: c.u64()?,
+        },
+        Op::MemcpyGpaHtoD => Request::MemcpyGpaHtoD {
+            dptr: c.u64()?,
+            segments: r_gpa_segments(&mut c)?,
+        },
+        Op::MemcpyGpaDtoH => Request::MemcpyGpaDtoH {
+            dptr: c.u64()?,
+            segments: r_gpa_segments(&mut c)?,
+        },
     })
+}
+
+fn r_gpa_segments(c: &mut Cur) -> io::Result<Vec<(u64, u64)>> {
+    let n = c.u32()? as usize;
+    let mut segs = Vec::with_capacity(n.min(1 << 20));
+    for _ in 0..n {
+        segs.push((c.u64()?, c.u64()?));
+    }
+    Ok(segs)
 }
 
 // ---- response encode/decode -----------------------------------------------
@@ -369,6 +896,15 @@ pub fn encode_response(status: i32, resp: &Response) -> Vec<u8> {
             Response::Name(s) => w_str(&mut b, s),
             Response::Bytes(v) | Response::Handle(v) | Response::Dptr(v) => w_u64(&mut b, *v),
             Response::Data(d) => w_bytes(&mut b, d),
+            Response::Pair(a, z) => {
+                w_u64(&mut b, *a);
+                w_u64(&mut b, *z);
+            }
+            Response::Millis(ms) => w_u32(&mut b, ms.to_bits()),
+            Response::LibResult(status, out) => {
+                w_i32(&mut b, *status);
+                w_bytes(&mut b, out);
+            }
         }
     }
     b
@@ -383,19 +919,46 @@ pub fn decode_response(op: Op, payload: &[u8]) -> io::Result<(i32, Response)> {
         return Ok((status, Response::Ok));
     }
     let body = match op {
-        Op::DeviceGetCount => Response::Count(c.i32()?),
+        Op::DeviceGetCount | Op::DriverGetVersion | Op::DeviceGetAttribute => {
+            Response::Count(c.i32()?)
+        }
         Op::DeviceGetName => Response::Name(c.string()?),
         Op::DeviceTotalMem => Response::Bytes(c.u64()?),
-        Op::CtxCreate => Response::Handle(c.u64()?),
+        Op::CtxCreate | Op::PrimaryCtxRetain => Response::Handle(c.u64()?),
         Op::ModuleLoadData | Op::ModuleGetFunction => Response::Handle(c.u64()?),
+        Op::StreamCreate | Op::EventCreate => Response::Handle(c.u64()?),
         Op::MemAlloc => Response::Dptr(c.u64()?),
-        Op::MemcpyDtoH => Response::Data(c.bytes()?),
+        Op::MemcpyDtoH | Op::DeviceGetUuid | Op::FuncGetParamInfo => Response::Data(c.bytes()?),
+        Op::MemGetInfo => Response::Pair(c.u64()?, c.u64()?),
+        // nvcomp calls carry their own nvcompStatus in the body (transport
+        // status stays 0): TempSize -> (status, temp_bytes); Decompress -> status.
+        Op::NvcompDeflateTempSize => Response::Pair(c.u64()?, c.u64()?),
+        Op::NvcompDeflateDecompress => Response::Count(c.i32()?),
+        Op::CublasCreate => Response::Handle(c.u64()?),
+        Op::LibCall => Response::LibResult(c.i32()?, c.bytes()?),
+        Op::EventElapsedTime => Response::Millis(f32::from_bits(c.u32()?)),
         Op::Init
         | Op::CtxDestroy
+        | Op::PrimaryCtxRelease
+        | Op::ModuleUnload
         | Op::MemFree
         | Op::MemcpyHtoD
+        | Op::MemcpyDtoD
+        | Op::MemsetD8
         | Op::LaunchKernel
-        | Op::CtxSynchronize => Response::Ok,
+        | Op::CtxSynchronize
+        | Op::StreamDestroy
+        | Op::StreamSynchronize
+        | Op::EventDestroy
+        | Op::EventRecord
+        | Op::EventSynchronize
+        | Op::CublasDestroy
+        | Op::CublasSetStream
+        | Op::CublasSgemm
+        | Op::MemcpyShmHtoD
+        | Op::MemcpyShmDtoH
+        | Op::MemcpyGpaHtoD
+        | Op::MemcpyGpaDtoH => Response::Ok,
     };
     Ok((status, body))
 }
@@ -448,6 +1011,67 @@ mod tests {
             ],
         });
         roundtrip(Request::CtxSynchronize);
+    }
+
+    #[test]
+    fn extended_request_roundtrips() {
+        roundtrip(Request::DriverGetVersion);
+        roundtrip(Request::DeviceGetAttribute {
+            attrib: 75,
+            device: 0,
+        });
+        roundtrip(Request::DeviceGetUuid { device: 0 });
+        roundtrip(Request::PrimaryCtxRetain { device: 0 });
+        roundtrip(Request::PrimaryCtxRelease { device: 0 });
+        roundtrip(Request::ModuleUnload { module: 7 });
+        roundtrip(Request::FuncGetParamInfo { function: 9 });
+        roundtrip(Request::MemcpyDtoD {
+            dst: 0x2000,
+            src: 0x1000,
+            bytes: 64,
+        });
+        roundtrip(Request::MemsetD8 {
+            dptr: 0x1000,
+            value: 0xAB,
+            bytes: 128,
+        });
+        roundtrip(Request::MemGetInfo);
+        roundtrip(Request::StreamCreate { flags: 1 });
+        roundtrip(Request::StreamDestroy { stream: 3 });
+        roundtrip(Request::StreamSynchronize { stream: 3 });
+        roundtrip(Request::EventCreate { flags: 0 });
+        roundtrip(Request::EventDestroy { event: 4 });
+        roundtrip(Request::EventRecord {
+            event: 4,
+            stream: 0,
+        });
+        roundtrip(Request::EventSynchronize { event: 4 });
+        roundtrip(Request::EventElapsedTime { start: 4, end: 5 });
+    }
+
+    #[test]
+    fn extended_response_roundtrips() {
+        for (op, resp) in [
+            (Op::DriverGetVersion, Response::Count(13000)),
+            (Op::DeviceGetAttribute, Response::Count(1024)),
+            (Op::DeviceGetUuid, Response::Data(vec![0u8; 16])),
+            (Op::PrimaryCtxRetain, Response::Handle(11)),
+            (
+                Op::FuncGetParamInfo,
+                Response::Data(vec![8, 0, 0, 0, 4, 0, 0, 0]),
+            ),
+            (Op::MemGetInfo, Response::Pair(6 << 30, 8 << 30)),
+            (Op::StreamCreate, Response::Handle(21)),
+            (Op::EventCreate, Response::Handle(22)),
+            (Op::EventElapsedTime, Response::Millis(1.25)),
+            (Op::ModuleUnload, Response::Ok),
+            (Op::MemsetD8, Response::Ok),
+        ] {
+            let enc = encode_response(0, &resp);
+            let (status, dec) = decode_response(op, &enc).expect("decode");
+            assert_eq!(status, 0);
+            assert_eq!(dec, resp);
+        }
     }
 
     #[test]

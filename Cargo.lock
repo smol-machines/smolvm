@@ -2367,13 +2367,35 @@ dependencies = [
 name = "smolvm-cuda"
 version = "1.3.1"
 dependencies = [
+ "libc",
  "libloading",
 ]
+
+[[package]]
+name = "smolvm-cuda-codegen"
+version = "1.3.1"
 
 [[package]]
 name = "smolvm-cuda-guest"
 version = "1.3.1"
 dependencies = [
+ "smolvm-cuda",
+ "vsock",
+]
+
+[[package]]
+name = "smolvm-cuda-shim"
+version = "1.3.1"
+dependencies = [
+ "smolvm-cuda",
+ "vsock",
+]
+
+[[package]]
+name = "smolvm-cudart-shim"
+version = "1.3.1"
+dependencies = [
+ "libc",
  "smolvm-cuda",
  "vsock",
 ]

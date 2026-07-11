@@ -14,7 +14,23 @@
 use crate::platform::uds::UdsListener;
 use smolvm_cuda::host::{serve, Backend, CpuBackend, GpuBackend};
 use std::path::Path;
+use std::sync::OnceLock;
 use std::thread;
+
+/// Provider for the guest-RAM regions, each `(gpa_start, host_va, len)`,
+/// installed by the launcher (via `krun_get_guest_ram`) before the VM starts.
+/// Each connection's backend queries it to enable guest-RAM zero-copy
+/// `memcpy_gpa_*`. `None` outside a microVM or on a libkrun without the API.
+/// Guest RAM is usually split into a low and a high region around the 4 GiB
+/// PCI hole.
+type GuestRamProvider = Box<dyn Fn() -> Option<Vec<(u64, u64, u64)>> + Send + Sync>;
+static GUEST_RAM: OnceLock<GuestRamProvider> = OnceLock::new();
+
+/// Install the guest-RAM provider. Called once by the launcher before
+/// `krun_start_enter`; the closure resolves lazily once the VM is up.
+pub fn set_guest_ram_provider(f: GuestRamProvider) {
+    let _ = GUEST_RAM.set(f);
+}
 
 /// Start the CUDA host server on `socket_path` in a background thread.
 ///
@@ -58,8 +74,16 @@ pub fn start(socket_path: &Path) -> std::io::Result<()> {
 /// loads, else CPU emulation. Logged once per connection so the mode is visible.
 fn make_backend() -> Box<dyn Backend> {
     match GpuBackend::load() {
-        Ok(gpu) => {
+        Ok(mut gpu) => {
             tracing::info!("cuda-host: GPU driver backend ready");
+            // Enable guest-RAM zero-copy if the launcher published the regions.
+            if let Some(regions) = GUEST_RAM.get().and_then(|f| f()) {
+                tracing::info!(
+                    count = regions.len(),
+                    "cuda-host: guest-RAM zero-copy enabled"
+                );
+                gpu.set_guest_ram(regions);
+            }
             Box::new(gpu)
         }
         Err(e) => {
