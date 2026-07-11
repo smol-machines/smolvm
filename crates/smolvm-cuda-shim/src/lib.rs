@@ -104,7 +104,10 @@ fn connect() -> Result<Stream, c_int> {
     let spec = std::env::var("SMOLVM_CUDA_RPC").unwrap_or_default();
     if let Some(addr) = spec.strip_prefix("tcp:") {
         return std::net::TcpStream::connect(addr)
-            .map(Stream::Tcp)
+            .map(|s| {
+                let _ = s.set_nodelay(true); // low-latency request/response
+                Stream::Tcp(s)
+            })
             .map_err(|_| CUDA_ERROR_NO_DEVICE);
     }
     #[cfg(unix)]

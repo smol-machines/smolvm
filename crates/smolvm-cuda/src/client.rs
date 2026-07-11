@@ -304,7 +304,13 @@ impl<S: Read + Write> Client<S> {
         let payload = if let Some(b) = self.bridge {
             bridge_call_vec(&b, &encode_request(req))?
         } else {
-            self.drain()?;
+            // Flush, don't fence: the host serves in arrival order, so this
+            // request's response already proves every deferred request before
+            // it was consumed. A fence here would double the RTT of every
+            // sync op under deferred load just to surface quiet failures a
+            // little earlier — they still surface at explicit sync points
+            // (drain) and the MAX_DEFERRED backstop.
+            self.flush_wbuf()?;
             write_msg(&mut self.stream, &encode_request(req))?;
             read_msg(&mut self.stream)?.ok_or(CudaRpcError::Protocol("host closed mid-call"))?
         };
@@ -351,7 +357,8 @@ impl<S: Read + Write> Client<S> {
     /// the raw response payload — the status stays in-band for the peer to
     /// decode, so nothing is lost to error mapping.
     pub fn raw_call(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
-        self.drain()?;
+        // Flush, don't fence — see `call`.
+        self.flush_wbuf()?;
         write_msg(&mut self.stream, payload)?;
         read_msg(&mut self.stream)?.ok_or(CudaRpcError::Protocol("host closed mid-call"))
     }
