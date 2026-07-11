@@ -530,7 +530,8 @@ impl Backend for GpuBackend {
     fn mem_free(&mut self, dptr: u64) -> CuResult<()> {
         unsafe { chk((self.mem_free)(dptr)) }
     }
-    fn memcpy_htod(&mut self, dptr: u64, data: &[u8]) -> CuResult<()> {
+    fn memcpy_htod(&mut self, dptr: u64, data: &[u8], stream: u64) -> CuResult<()> {
+        self.wait_stream(stream)?;
         unsafe {
             chk((self.memcpy_htod)(
                 dptr,
@@ -539,7 +540,8 @@ impl Backend for GpuBackend {
             ))
         }
     }
-    fn memcpy_dtoh(&mut self, dptr: u64, bytes: u64) -> CuResult<Vec<u8>> {
+    fn memcpy_dtoh(&mut self, dptr: u64, bytes: u64, stream: u64) -> CuResult<Vec<u8>> {
+        self.wait_stream(stream)?;
         let mut out = vec![0u8; bytes as usize];
         unsafe {
             chk((self.memcpy_dtoh)(
@@ -565,9 +567,10 @@ impl Backend for GpuBackend {
     // The shared-memory data channel is Linux-only (`crate::shm`); on other
     // platforms these fall back to the trait's not-supported default.
     #[cfg(target_os = "linux")]
-    fn memcpy_shm_htod(&mut self, dptr: u64, offset: u64, size: u64) -> CuResult<()> {
+    fn memcpy_shm_htod(&mut self, dptr: u64, offset: u64, size: u64, stream: u64) -> CuResult<()> {
         // Read straight from the shared region (no bytes over the socket) and
         // DMA to the GPU — one copy instead of three.
+        self.wait_stream(stream)?;
         let region = crate::shm::get_or_create().ok_or(super::CUDA_ERROR_NOT_FOUND)?;
         let src = region
             .checked(offset, size)
@@ -581,7 +584,8 @@ impl Backend for GpuBackend {
         }
     }
     #[cfg(target_os = "linux")]
-    fn memcpy_shm_dtoh(&mut self, offset: u64, dptr: u64, size: u64) -> CuResult<()> {
+    fn memcpy_shm_dtoh(&mut self, offset: u64, dptr: u64, size: u64, stream: u64) -> CuResult<()> {
+        self.wait_stream(stream)?;
         let region = crate::shm::get_or_create().ok_or(super::CUDA_ERROR_NOT_FOUND)?;
         let dst = region
             .checked(offset, size)
@@ -593,10 +597,11 @@ impl Backend for GpuBackend {
         self.guest_ram = regions;
     }
 
-    fn memcpy_gpa_htod(&mut self, dptr: u64, segments: &[(u64, u64)]) -> CuResult<()> {
+    fn memcpy_gpa_htod(&mut self, dptr: u64, segments: &[(u64, u64)], stream: u64) -> CuResult<()> {
         if self.guest_ram.is_empty() {
             return Err(super::CUDA_ERROR_NOT_FOUND);
         }
+        self.wait_stream(stream)?;
         self.ensure_guest_ram_pinned();
         zc_trace_segments("H2D", segments);
         // Few segments: DMA each straight from its guest-RAM host mapping to the
@@ -651,10 +656,11 @@ impl Backend for GpuBackend {
         Ok(())
     }
 
-    fn memcpy_gpa_dtoh(&mut self, dptr: u64, segments: &[(u64, u64)]) -> CuResult<()> {
+    fn memcpy_gpa_dtoh(&mut self, dptr: u64, segments: &[(u64, u64)], stream: u64) -> CuResult<()> {
         if self.guest_ram.is_empty() {
             return Err(super::CUDA_ERROR_NOT_FOUND);
         }
+        self.wait_stream(stream)?;
         self.ensure_guest_ram_pinned();
         zc_trace_segments("D2H", segments);
         if segments.len() <= ZC_DIRECT_MAX_SEGMENTS {
@@ -1896,6 +1902,18 @@ impl Drop for GpuBackend {
 }
 
 impl GpuBackend {
+    /// Order a blocking copy after prior work on `stream`. Torch creates its
+    /// pool streams non-blocking, so the NULL-stream blocking `cuMemcpy*` our
+    /// copies use does NOT wait for them — without this wait, a stream-ordered
+    /// `cudaMemcpyAsync` from the guest could overwrite (or read) memory that
+    /// kernels still running on `stream` are using.
+    fn wait_stream(&mut self, stream: u64) -> CuResult<()> {
+        if stream == 0 {
+            return Ok(()); // legacy default stream: blocking copies already order
+        }
+        unsafe { chk((self.stream_synchronize)(stream as *mut c_void)) }
+    }
+
     /// Pin the guest-RAM host mappings into the current CUDA context on the first
     /// zero-copy transfer, so subsequent DMAs from guest RAM run at full pinned
     /// bandwidth (~9 GB/s) instead of the ~3 GB/s pageable path. Best-effort and

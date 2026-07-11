@@ -75,8 +75,8 @@ fn main() {
     let da = cu.mem_alloc(bytes).expect("alloc a");
     let db = cu.mem_alloc(bytes).expect("alloc b");
     let dc = cu.mem_alloc(bytes).expect("alloc c");
-    cu.memcpy_htod(da, bytemuck(&a)).expect("h2d a");
-    cu.memcpy_htod(db, bytemuck(&b)).expect("h2d b");
+    cu.memcpy_htod(da, bytemuck(&a), 0).expect("h2d a");
+    cu.memcpy_htod(db, bytemuck(&b), 0).expect("h2d b");
 
     let block = 256u32;
     let grid = (n as u32).div_ceil(block);
@@ -96,7 +96,7 @@ fn main() {
     .expect("launch");
     cu.ctx_synchronize().expect("sync");
 
-    let out = cu.memcpy_dtoh(dc, bytes).expect("d2h");
+    let out = cu.memcpy_dtoh(dc, bytes, 0).expect("d2h");
     let c: Vec<f32> = out
         .chunks_exact(4)
         .map(|p| f32::from_le_bytes(p.try_into().unwrap()))

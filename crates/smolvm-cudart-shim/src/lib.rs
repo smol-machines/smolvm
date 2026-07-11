@@ -223,6 +223,79 @@ pub extern "C" fn smolvm_cudart_fence() {
     }
 }
 
+// ---- driver-shim bridge -------------------------------------------------------
+// The driver shim (`libcuda.so.1`) dlsym-resolves these three and routes ALL
+// its traffic through this connection, giving the host one program-ordered
+// pipeline for both shims (see smolvm-cuda's `client::Bridge`). Op statuses
+// stay in-band in the response payload — nothing is lost to error mapping.
+
+/// A response too large for the caller's buffer, parked until the caller
+/// retries with a big-enough one (null request = fetch).
+static BRIDGE_PENDING: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+
+/// Fire-and-forget: append one encoded request to the shared pipeline.
+/// Nonzero = transport failure.
+#[no_mangle]
+pub extern "C" fn smolvm_cudart_bridge_quiet(req: *const u8, len: usize) -> i32 {
+    if req.is_null() {
+        return 1;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(req, len) };
+    match with_client(|c| c.raw_quiet(bytes)) {
+        Ok(()) => 0,
+        Err(_) => 999,
+    }
+}
+
+/// Synchronous round-trip: send one encoded request, write the response
+/// payload into `resp`. Returns the response length; -1 = transport failure;
+/// other negatives = `cap` too small, retry with `-ret` capacity and a null
+/// request to collect the stashed response.
+#[no_mangle]
+pub extern "C" fn smolvm_cudart_bridge_call(
+    req: *const u8,
+    req_len: usize,
+    resp: *mut u8,
+    cap: usize,
+) -> isize {
+    let payload = if req.is_null() {
+        match BRIDGE_PENDING.lock().map(|mut g| g.take()) {
+            Ok(Some(p)) => p,
+            _ => return -1,
+        }
+    } else {
+        let bytes = unsafe { std::slice::from_raw_parts(req, req_len) };
+        match with_client(|c| c.raw_call(bytes)) {
+            Ok(p) => p,
+            Err(_) => return -1,
+        }
+    };
+    if payload.len() > cap {
+        let n = payload.len() as isize;
+        match BRIDGE_PENDING.lock() {
+            Ok(mut g) => {
+                *g = Some(payload);
+                -n
+            }
+            Err(_) => -1,
+        }
+    } else {
+        unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr(), resp, payload.len()) };
+        payload.len() as isize
+    }
+}
+
+/// Fence the shared pipeline; returns (and consumes) the first collected
+/// quiet-failure status, so the bridged caller can surface it.
+#[no_mangle]
+pub extern "C" fn smolvm_cudart_bridge_drain() -> i32 {
+    with_client(|c| {
+        c.drain()?;
+        Ok(c.take_sticky())
+    })
+    .unwrap_or(999)
+}
+
 fn with_client<T>(
     f: impl FnOnce(&mut Client<Stream>) -> Result<T, CudaRpcError>,
 ) -> Result<T, c_int> {
@@ -671,7 +744,7 @@ fn resolve_kind(s: &ShimState, dst: *const c_void, src: *const c_void, kind: c_i
     }
 }
 
-fn do_memcpy(dst: *mut c_void, src: *const c_void, n: usize, kind: c_int) -> c_int {
+fn do_memcpy(dst: *mut c_void, src: *const c_void, n: usize, kind: c_int, stream: u64) -> c_int {
     with_state(|s| {
         let kind = resolve_kind(s, dst, src, kind);
         match kind {
@@ -687,7 +760,7 @@ fn do_memcpy(dst: *mut c_void, src: *const c_void, n: usize, kind: c_int) -> c_i
                 // segments; the host reads guest RAM directly. Fall back to
                 // byte-shipping if the host can't serve it (no mapping).
                 if let Some(segs) = guestmem::segments(src as usize, n) {
-                    if s.client.memcpy_gpa_htod(dst as u64, segs).is_ok() {
+                    if s.client.memcpy_gpa_htod(dst as u64, segs, stream).is_ok() {
                         return Ok(());
                     }
                 }
@@ -695,15 +768,17 @@ fn do_memcpy(dst: *mut c_void, src: *const c_void, n: usize, kind: c_int) -> c_i
                 if let Some(off) = shm_offset(src) {
                     return s
                         .client
-                        .memcpy_shm_htod(dst as u64, off, n as u64)
+                        .memcpy_shm_htod(dst as u64, off, n as u64, stream)
                         .map_err(map_err);
                 }
                 let data = unsafe { std::slice::from_raw_parts(src as *const u8, n) };
-                s.client.memcpy_htod(dst as u64, data).map_err(map_err)
+                s.client
+                    .memcpy_htod(dst as u64, data, stream)
+                    .map_err(map_err)
             }
             MEMCPY_DTOH => {
                 if let Some(segs) = guestmem::segments(dst as usize, n) {
-                    if s.client.memcpy_gpa_dtoh(src as u64, segs).is_ok() {
+                    if s.client.memcpy_gpa_dtoh(src as u64, segs, stream).is_ok() {
                         return Ok(());
                     }
                 }
@@ -711,12 +786,12 @@ fn do_memcpy(dst: *mut c_void, src: *const c_void, n: usize, kind: c_int) -> c_i
                     // Host writes straight into the shared region at `off`.
                     return s
                         .client
-                        .memcpy_shm_dtoh(off, src as u64, n as u64)
+                        .memcpy_shm_dtoh(off, src as u64, n as u64, stream)
                         .map_err(map_err);
                 }
                 let data = s
                     .client
-                    .memcpy_dtoh(src as u64, n as u64)
+                    .memcpy_dtoh(src as u64, n as u64, stream)
                     .map_err(map_err)?;
                 if data.len() != n {
                     return Err(CUDA_ERROR_UNKNOWN);
@@ -737,7 +812,7 @@ fn do_memcpy(dst: *mut c_void, src: *const c_void, n: usize, kind: c_int) -> c_i
 
 #[no_mangle]
 pub extern "C" fn cudaMemcpy(dst: *mut c_void, src: *const c_void, n: usize, kind: c_int) -> c_int {
-    set_last(do_memcpy(dst, src, n, kind))
+    set_last(do_memcpy(dst, src, n, kind, 0))
 }
 
 #[no_mangle]
@@ -762,9 +837,12 @@ pub extern "C" fn cudaMemcpyAsync(
             },
         );
     }
-    // Other kinds execute synchronously; ordering within a stream is preserved
-    // because all work runs on the host's single serving thread in call order.
-    set_last(do_memcpy(dst, src, n, kind))
+    // Other kinds complete before returning (the CUDA API permits a more
+    // synchronous implementation), but the host orders the copy after prior
+    // work on `stream` first — torch's non-blocking pool streams don't order
+    // against the NULL-stream copy the host uses, so dropping the stream let
+    // a copy overwrite buffers that still-running kernels were reading.
+    set_last(do_memcpy(dst, src, n, kind, stream as u64))
 }
 
 #[no_mangle]
@@ -851,12 +929,37 @@ const A_MAX_SHMEM_PER_BLOCK: i32 = 8;
 const A_TOTAL_CONST_MEM: i32 = 9;
 const A_WARP_SIZE: i32 = 10;
 const A_MAX_REGS_PER_BLOCK: i32 = 12;
+const A_CLOCK_RATE: i32 = 13;
 const A_MP_COUNT: i32 = 16;
+const A_KERNEL_EXEC_TIMEOUT: i32 = 17;
+const A_CONCURRENT_KERNELS: i32 = 31;
+const A_PCI_BUS_ID: i32 = 33;
+const A_PCI_DEVICE_ID: i32 = 34;
+const A_MEMORY_CLOCK_RATE: i32 = 36;
+const A_MEMORY_BUS_WIDTH: i32 = 37;
+const A_L2_CACHE_SIZE: i32 = 38;
 const A_MAX_THREADS_PER_MP: i32 = 39;
+const A_ASYNC_ENGINE_COUNT: i32 = 40;
+const A_PCI_DOMAIN_ID: i32 = 50;
 const A_COMPUTE_MAJOR: i32 = 75;
 const A_COMPUTE_MINOR: i32 = 76;
 const A_MAX_SHMEM_PER_MP: i32 = 81;
 const A_MAX_REGS_PER_MP: i32 = 82;
+const A_MANAGED_MEMORY: i32 = 83;
+const A_CONCURRENT_MANAGED_ACCESS: i32 = 89;
+const A_COMPUTE_PREEMPTION: i32 = 90;
+const A_COOPERATIVE_LAUNCH: i32 = 95;
+const A_COOPERATIVE_MULTI_DEVICE: i32 = 96;
+const A_SINGLE_TO_DOUBLE_PERF: i32 = 87;
+const A_MAX_SHMEM_PER_BLOCK_OPTIN: i32 = 97;
+const A_HOST_REGISTER_SUPPORTED: i32 = 99;
+const A_SPARSE_CUDA_ARRAY: i32 = 112;
+const A_READ_ONLY_HOST_REGISTER: i32 = 113;
+const A_MAX_BLOCKS_PER_MP: i32 = 106;
+const A_MAX_PERSISTING_L2: i32 = 108;
+const A_MAX_ACCESS_POLICY_WINDOW: i32 = 109;
+const A_RESERVED_SHMEM_PER_BLOCK: i32 = 111;
+const A_TIMELINE_SEMAPHORE: i32 = 114;
 
 #[no_mangle]
 pub extern "C" fn cudaDeviceGetAttribute(value: *mut c_int, attr: c_int, device: c_int) -> c_int {
@@ -879,12 +982,15 @@ pub extern "C" fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> c_int {
     })
 }
 
-/// `cudaDeviceProp` (CUDA 12.x prefix). Only the fields PyTorch reads are set;
-/// the caller's ~1 KiB struct is zeroed first so the rest is well-defined.
+/// `cudaDeviceProp`, the exact CUDA 12.x layout (1032 bytes). Offsets verified
+/// against the real bundled `libcudart.so.12` filling the struct on this
+/// machine, and pinned by the compile-time assertions below — a missing field
+/// silently shifts everything after it (that bug has bitten twice: uuid, and a
+/// mis-sized texture block that landed the tail up to 76 bytes off).
 #[repr(C)]
 struct CudaDeviceProp {
     name: [u8; 256],
-    uuid: [u8; 16], // cudaUUID_t — MUST be here or every field below is 16B off
+    uuid: [u8; 16],
     luid: [u8; 8],
     luid_device_node_mask: c_uint,
     total_global_mem: usize,
@@ -895,15 +1001,19 @@ struct CudaDeviceProp {
     max_threads_per_block: c_int,
     max_threads_dim: [c_int; 3],
     max_grid_size: [c_int; 3],
+    clock_rate: c_int,
     total_const_mem: usize,
     major: c_int,
     minor: c_int,
     texture_alignment: usize,
     texture_pitch_alignment: usize,
+    device_overlap: c_int,
     multi_processor_count: c_int,
+    kernel_exec_timeout_enabled: c_int,
     integrated: c_int,
     can_map_host_memory: c_int,
-    _tex_surf: [c_int; 63], // maxTexture*/maxSurface* block (offsets kept, unused)
+    compute_mode: c_int,
+    _tex_surf: [c_int; 40], // maxTexture*/maxSurface* block (unused, left zero)
     surface_alignment: usize,
     concurrent_kernels: c_int,
     ecc_enabled: c_int,
@@ -913,6 +1023,7 @@ struct CudaDeviceProp {
     tcc_driver: c_int,
     async_engine_count: c_int,
     unified_addressing: c_int,
+    memory_clock_rate: c_int,
     memory_bus_width: c_int,
     l2_cache_size: c_int,
     persisting_l2_cache_max_size: c_int,
@@ -926,16 +1037,48 @@ struct CudaDeviceProp {
     is_multi_gpu_board: c_int,
     multi_gpu_board_group_id: c_int,
     host_native_atomic_supported: c_int,
+    single_to_double_precision_perf_ratio: c_int,
     pageable_memory_access: c_int,
     concurrent_managed_access: c_int,
     compute_preemption_supported: c_int,
     can_use_host_pointer_for_registered_mem: c_int,
     cooperative_launch: c_int,
+    cooperative_multi_device_launch: c_int,
     shared_mem_per_block_optin: usize,
     pageable_memory_access_uses_host_page_tables: c_int,
     direct_managed_mem_access_from_host: c_int,
     max_blocks_per_multiprocessor: c_int,
+    access_policy_max_window_size: c_int,
+    reserved_shared_mem_per_block: usize,
+    host_register_supported: c_int,
+    sparse_cuda_array_supported: c_int,
+    host_register_read_only_supported: c_int,
+    timeline_semaphore_interop_supported: c_int,
+    memory_pools_supported: c_int,
+    gpu_direct_rdma_supported: c_int,
+    gpu_direct_rdma_flush_writes_options: c_uint,
+    gpu_direct_rdma_writes_ordering: c_int,
+    memory_pool_supported_handle_types: c_uint,
+    deferred_mapping_cuda_array_supported: c_int,
+    ipc_event_supported: c_int,
+    cluster_launch: c_int,
+    unified_function_pointers: c_int,
+    _reserved: [c_int; 63],
 }
+
+// Anchor offsets measured from the real 12.4 cudart on this machine; a layout
+// drift fails the build instead of shipping a silently shifted struct.
+const _: () = {
+    assert!(std::mem::offset_of!(CudaDeviceProp, clock_rate) == 348);
+    assert!(std::mem::offset_of!(CudaDeviceProp, multi_processor_count) == 388);
+    assert!(std::mem::offset_of!(CudaDeviceProp, _tex_surf) == 408);
+    assert!(std::mem::offset_of!(CudaDeviceProp, memory_clock_rate) == 608);
+    assert!(std::mem::offset_of!(CudaDeviceProp, max_threads_per_multiprocessor) == 624);
+    assert!(std::mem::offset_of!(CudaDeviceProp, regs_per_multiprocessor) == 648);
+    assert!(std::mem::offset_of!(CudaDeviceProp, shared_mem_per_block_optin) == 696);
+    assert!(std::mem::offset_of!(CudaDeviceProp, reserved_shared_mem_per_block) == 720);
+    assert!(std::mem::size_of::<CudaDeviceProp>() == 1032);
+};
 
 #[no_mangle]
 pub extern "C" fn cudaGetDeviceProperties_v2(prop: *mut c_void, device: c_int) -> c_int {
@@ -951,6 +1094,7 @@ pub extern "C" fn cudaGetDeviceProperties_v2(prop: *mut c_void, device: c_int) -
                 s.client.device_get_attribute(attr, device).unwrap_or(dflt)
             };
             let name = s.client.device_get_name(device).unwrap_or_default();
+            let uuid = s.client.device_get_uuid(device).unwrap_or([0; 16]);
             let total = s.client.device_total_mem(device).unwrap_or(0);
             let major = a(s, A_COMPUTE_MAJOR, 8);
             let minor = a(s, A_COMPUTE_MINOR, 6);
@@ -973,46 +1117,84 @@ pub extern "C" fn cudaGetDeviceProperties_v2(prop: *mut c_void, device: c_int) -
                 a(s, A_MAX_GRID_DIM_Y, 65535),
                 a(s, A_MAX_GRID_DIM_Z, 65535),
             );
+            let clock = a(s, A_CLOCK_RATE, 0);
+            let mem_clock = a(s, A_MEMORY_CLOCK_RATE, 0);
+            let bus_width = a(s, A_MEMORY_BUS_WIDTH, 0);
+            let l2 = a(s, A_L2_CACHE_SIZE, 0);
+            let persist_l2 = a(s, A_MAX_PERSISTING_L2, 0);
+            let engines = a(s, A_ASYNC_ENGINE_COUNT, 2);
+            let timeout = a(s, A_KERNEL_EXEC_TIMEOUT, 0);
+            let shmem_optin = a(s, A_MAX_SHMEM_PER_BLOCK_OPTIN, shmem_mp);
+            let reserved_shmem = a(s, A_RESERVED_SHMEM_PER_BLOCK, 0);
+            let max_blocks_mp = a(s, A_MAX_BLOCKS_PER_MP, 16);
+            let access_window = a(s, A_MAX_ACCESS_POLICY_WINDOW, 0);
+            let (pci_bus, pci_dev, pci_dom) = (
+                a(s, A_PCI_BUS_ID, 0),
+                a(s, A_PCI_DEVICE_ID, 0),
+                a(s, A_PCI_DOMAIN_ID, 0),
+            );
             // SAFETY: `prop` points at a caller-provided cudaDeviceProp we zeroed.
             let p = unsafe { &mut *(prop as *mut CudaDeviceProp) };
             let nb = name.as_bytes();
             let n = nb.len().min(255);
             p.name[..n].copy_from_slice(&nb[..n]);
+            p.uuid = uuid;
             p.total_global_mem = total as usize;
             p.shared_mem_per_block = shmem_blk as usize;
             p.regs_per_block = regs_blk;
             p.warp_size = warp;
+            p.mem_pitch = 2147483647;
             p.max_threads_per_block = max_tpb;
             p.max_threads_dim = [bx, by, bz];
             p.max_grid_size = [gx, gy, gz];
+            p.clock_rate = clock;
             p.total_const_mem = const_mem as usize;
             p.major = major;
             p.minor = minor;
+            p.texture_alignment = 512;
+            p.texture_pitch_alignment = 32;
+            p.device_overlap = (engines > 0) as c_int;
             p.multi_processor_count = mp;
+            p.kernel_exec_timeout_enabled = timeout;
             p.can_map_host_memory = 1;
-            p.concurrent_kernels = 1;
+            p.surface_alignment = 512;
+            p.concurrent_kernels = a(s, A_CONCURRENT_KERNELS, 1);
+            p.pci_bus_id = pci_bus;
+            p.pci_device_id = pci_dev;
+            p.pci_domain_id = pci_dom;
+            p.async_engine_count = engines;
             p.unified_addressing = 1;
+            p.memory_clock_rate = mem_clock;
+            p.memory_bus_width = bus_width;
+            p.l2_cache_size = l2;
+            p.persisting_l2_cache_max_size = persist_l2;
             p.max_threads_per_multiprocessor = max_tpm;
             p.stream_priorities_supported = 1;
             p.global_l1_cache_supported = 1;
             p.local_l1_cache_supported = 1;
             p.shared_mem_per_multiprocessor = shmem_mp as usize;
             p.regs_per_multiprocessor = regs_mp;
-            p.managed_memory = 1;
-            p.concurrent_managed_access = 1;
-            p.cooperative_launch = 1;
-            p.compute_preemption_supported = 1;
-            p.shared_mem_per_block_optin = shmem_mp as usize;
-            p.max_blocks_per_multiprocessor = 16;
-            // The hand-built struct tail diverges from CUDA 12.4's cudaDeviceProp
-            // by a few bytes, so PyTorch reads multiProcessorCount /
-            // maxThreadsPerMultiProcessor as 0 and divides by zero in its RNG
-            // launch config. Write those two at their verified real offsets.
-            unsafe {
-                let base = prop as *mut u8;
-                base.add(388).cast::<c_int>().write_unaligned(mp);
-                base.add(624).cast::<c_int>().write_unaligned(max_tpm);
-            }
+            p.managed_memory = a(s, A_MANAGED_MEMORY, 1);
+            p.single_to_double_precision_perf_ratio = a(s, A_SINGLE_TO_DOUBLE_PERF, 32);
+            p.concurrent_managed_access = a(s, A_CONCURRENT_MANAGED_ACCESS, 1);
+            p.compute_preemption_supported = a(s, A_COMPUTE_PREEMPTION, 1);
+            p.cooperative_launch = a(s, A_COOPERATIVE_LAUNCH, 1);
+            p.cooperative_multi_device_launch = a(s, A_COOPERATIVE_MULTI_DEVICE, 1);
+            p.shared_mem_per_block_optin = shmem_optin as usize;
+            p.max_blocks_per_multiprocessor = max_blocks_mp;
+            p.access_policy_max_window_size = access_window;
+            p.reserved_shared_mem_per_block = reserved_shmem as usize;
+            p.host_register_supported = a(s, A_HOST_REGISTER_SUPPORTED, 1);
+            p.timeline_semaphore_interop_supported = a(s, A_TIMELINE_SEMAPHORE, 1);
+            p.sparse_cuda_array_supported = a(s, A_SPARSE_CUDA_ARRAY, 0);
+            p.host_register_read_only_supported = a(s, A_READ_ONLY_HOST_REGISTER, 0);
+            // Deliberately NOT mirrored from the host GPU: capabilities that
+            // would steer callers onto paths forwarding can't honor. Pageable /
+            // registered host memory is guest RAM the host GPU can't reach by
+            // that pointer, mempools + IPC events are stubbed.
+            // (pageable_memory_access, can_use_host_pointer_for_registered_mem,
+            //  memory_pools_supported, memory_pool_supported_handle_types,
+            //  ipc_event_supported stay 0.)
             Ok(())
         })
         .err()

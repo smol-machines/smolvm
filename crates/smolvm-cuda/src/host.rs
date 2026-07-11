@@ -48,8 +48,13 @@ pub trait Backend: Send {
     fn func_set_attribute(&mut self, function: u64, attrib: i32, value: i32) -> CuResult<()>;
     fn mem_alloc(&mut self, bytes: u64) -> CuResult<u64>;
     fn mem_free(&mut self, dptr: u64) -> CuResult<()>;
-    fn memcpy_htod(&mut self, dptr: u64, data: &[u8]) -> CuResult<()>;
-    fn memcpy_dtoh(&mut self, dptr: u64, bytes: u64) -> CuResult<Vec<u8>>;
+    /// Copy with stream ordering: prior work on `stream` (0 = legacy default)
+    /// must complete first. Torch's pool streams are created non-blocking, so
+    /// a NULL-stream copy does NOT order against them — dropping `stream`
+    /// makes a `cudaMemcpyAsync` overwrite buffers still-running kernels read.
+    fn memcpy_htod(&mut self, dptr: u64, data: &[u8], stream: u64) -> CuResult<()>;
+    /// See `memcpy_htod` for the `stream` contract.
+    fn memcpy_dtoh(&mut self, dptr: u64, bytes: u64, stream: u64) -> CuResult<Vec<u8>>;
     fn memcpy_dtod(&mut self, dst: u64, src: u64, bytes: u64) -> CuResult<()>;
     fn memset_d8(&mut self, dptr: u64, value: u8, bytes: u64) -> CuResult<()>;
     fn mem_get_info(&mut self) -> CuResult<(u64, u64)>;
@@ -168,11 +173,23 @@ pub trait Backend: Send {
 
     /// Zero-copy H2D: DMA `size` bytes from shared-region `offset` to `dptr`.
     /// Default: no shared region → caller must fall back to byte-shipping.
-    fn memcpy_shm_htod(&mut self, _dptr: u64, _offset: u64, _size: u64) -> CuResult<()> {
+    fn memcpy_shm_htod(
+        &mut self,
+        _dptr: u64,
+        _offset: u64,
+        _size: u64,
+        _stream: u64,
+    ) -> CuResult<()> {
         Err(CUDA_ERROR_NOT_FOUND)
     }
     /// Zero-copy D2H: DMA `size` bytes from `dptr` to shared-region `offset`.
-    fn memcpy_shm_dtoh(&mut self, _offset: u64, _dptr: u64, _size: u64) -> CuResult<()> {
+    fn memcpy_shm_dtoh(
+        &mut self,
+        _offset: u64,
+        _dptr: u64,
+        _size: u64,
+        _stream: u64,
+    ) -> CuResult<()> {
         Err(CUDA_ERROR_NOT_FOUND)
     }
 
@@ -181,11 +198,21 @@ pub trait Backend: Send {
     /// by the embedder. Guest RAM is usually split around the 4 GiB PCI hole.
     fn set_guest_ram(&mut self, _regions: Vec<(u64, u64, u64)>) {}
     /// Zero-copy H2D from guest RAM: gather `segments` and DMA to `dptr`.
-    fn memcpy_gpa_htod(&mut self, _dptr: u64, _segments: &[(u64, u64)]) -> CuResult<()> {
+    fn memcpy_gpa_htod(
+        &mut self,
+        _dptr: u64,
+        _segments: &[(u64, u64)],
+        _stream: u64,
+    ) -> CuResult<()> {
         Err(CUDA_ERROR_NOT_FOUND)
     }
     /// Zero-copy D2H to guest RAM: DMA from `dptr` and scatter into `segments`.
-    fn memcpy_gpa_dtoh(&mut self, _dptr: u64, _segments: &[(u64, u64)]) -> CuResult<()> {
+    fn memcpy_gpa_dtoh(
+        &mut self,
+        _dptr: u64,
+        _segments: &[(u64, u64)],
+        _stream: u64,
+    ) -> CuResult<()> {
         Err(CUDA_ERROR_NOT_FOUND)
     }
 }
@@ -349,8 +376,16 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         }
         Request::MemAlloc { bytes } => b.mem_alloc(bytes).map(Response::Dptr),
         Request::MemFree { dptr } => b.mem_free(dptr).map(|_| Response::Ok),
-        Request::MemcpyHtoD { dptr, data } => b.memcpy_htod(dptr, &data).map(|_| Response::Ok),
-        Request::MemcpyDtoH { dptr, bytes } => b.memcpy_dtoh(dptr, bytes).map(Response::Data),
+        Request::MemcpyHtoD { dptr, stream, data } => b
+            .memcpy_htod(dptr, &data, raw_stream(sess, stream)?)
+            .map(|_| Response::Ok),
+        Request::MemcpyDtoH {
+            dptr,
+            bytes,
+            stream,
+        } => b
+            .memcpy_dtoh(dptr, bytes, raw_stream(sess, stream)?)
+            .map(Response::Data),
         Request::MemcpyDtoD { dst, src, bytes } => {
             b.memcpy_dtod(dst, src, bytes).map(|_| Response::Ok)
         }
@@ -572,18 +607,36 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         Request::LibCall { lib, func, args } => b
             .lib_call(lib, func, &args, &sess.streams)
             .map(|(status, out)| Response::LibResult(status, out)),
-        Request::MemcpyShmHtoD { dptr, offset, size } => {
-            b.memcpy_shm_htod(dptr, offset, size).map(|_| Response::Ok)
-        }
-        Request::MemcpyShmDtoH { offset, dptr, size } => {
-            b.memcpy_shm_dtoh(offset, dptr, size).map(|_| Response::Ok)
-        }
-        Request::MemcpyGpaHtoD { dptr, segments } => {
-            b.memcpy_gpa_htod(dptr, &segments).map(|_| Response::Ok)
-        }
-        Request::MemcpyGpaDtoH { dptr, segments } => {
-            b.memcpy_gpa_dtoh(dptr, &segments).map(|_| Response::Ok)
-        }
+        Request::MemcpyShmHtoD {
+            dptr,
+            offset,
+            size,
+            stream,
+        } => b
+            .memcpy_shm_htod(dptr, offset, size, raw_stream(sess, stream)?)
+            .map(|_| Response::Ok),
+        Request::MemcpyShmDtoH {
+            offset,
+            dptr,
+            size,
+            stream,
+        } => b
+            .memcpy_shm_dtoh(offset, dptr, size, raw_stream(sess, stream)?)
+            .map(|_| Response::Ok),
+        Request::MemcpyGpaHtoD {
+            dptr,
+            stream,
+            segments,
+        } => b
+            .memcpy_gpa_htod(dptr, &segments, raw_stream(sess, stream)?)
+            .map(|_| Response::Ok),
+        Request::MemcpyGpaDtoH {
+            dptr,
+            stream,
+            segments,
+        } => b
+            .memcpy_gpa_dtoh(dptr, &segments, raw_stream(sess, stream)?)
+            .map(|_| Response::Ok),
     })();
     match r {
         Ok(resp) => (0, resp),
@@ -717,7 +770,7 @@ impl Backend for CpuBackend {
             .map(|_| ())
             .ok_or(CUDA_ERROR_INVALID_HANDLE)
     }
-    fn memcpy_htod(&mut self, dptr: u64, data: &[u8]) -> CuResult<()> {
+    fn memcpy_htod(&mut self, dptr: u64, data: &[u8], _stream: u64) -> CuResult<()> {
         let buf = self.mem.get_mut(&dptr).ok_or(CUDA_ERROR_INVALID_HANDLE)?;
         if data.len() > buf.len() {
             return Err(CUDA_ERROR_INVALID_HANDLE);
@@ -725,7 +778,7 @@ impl Backend for CpuBackend {
         buf[..data.len()].copy_from_slice(data);
         Ok(())
     }
-    fn memcpy_dtoh(&mut self, dptr: u64, bytes: u64) -> CuResult<Vec<u8>> {
+    fn memcpy_dtoh(&mut self, dptr: u64, bytes: u64, _stream: u64) -> CuResult<Vec<u8>> {
         let buf = self.mem.get(&dptr).ok_or(CUDA_ERROR_INVALID_HANDLE)?;
         let n = bytes as usize;
         if n > buf.len() {
@@ -970,11 +1023,23 @@ mod tests {
             .iter()
             .flat_map(|v| v.to_le_bytes())
             .collect();
-        dispatch(&mut sess, &mut b, Request::MemcpyHtoD { dptr: da, data: a });
         dispatch(
             &mut sess,
             &mut b,
-            Request::MemcpyHtoD { dptr: db, data: bb },
+            Request::MemcpyHtoD {
+                dptr: da,
+                stream: 0,
+                data: a,
+            },
+        );
+        dispatch(
+            &mut sess,
+            &mut b,
+            Request::MemcpyHtoD {
+                dptr: db,
+                stream: 0,
+                data: bb,
+            },
         );
         let params = vec![
             da.to_le_bytes().to_vec(),
@@ -1001,6 +1066,7 @@ mod tests {
             Request::MemcpyDtoH {
                 dptr: dc,
                 bytes: 16,
+                stream: 0,
             },
         )
         .1
@@ -1111,8 +1177,8 @@ mod tests {
         let bb: Vec<u8> = (0..n)
             .flat_map(|i| ((2 * i) as f32).to_le_bytes())
             .collect();
-        cli.memcpy_htod(da, &a).unwrap();
-        cli.memcpy_htod(db, &bb).unwrap();
+        cli.memcpy_htod(da, &a, 0).unwrap();
+        cli.memcpy_htod(db, &bb, 0).unwrap();
         cli.launch_kernel(
             func,
             [1, 1, 1],
@@ -1128,7 +1194,7 @@ mod tests {
         )
         .unwrap();
         cli.ctx_synchronize().unwrap();
-        let out = cli.memcpy_dtoh(dc, (n * 4) as u64).unwrap();
+        let out = cli.memcpy_dtoh(dc, (n * 4) as u64, 0).unwrap();
         let c: Vec<f32> = out
             .chunks(4)
             .map(|p| f32::from_le_bytes(p.try_into().unwrap()))

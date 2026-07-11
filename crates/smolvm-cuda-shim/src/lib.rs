@@ -53,13 +53,16 @@ const SHIM_CUDA_VERSION: c_int = 12040;
 
 // ---- transport ---------------------------------------------------------------
 
-/// One concrete byte stream to the host CUDA server.
+/// One concrete byte stream to the host CUDA server. `Bridged` owns no
+/// socket: the client routes through the runtime shim's connection instead
+/// and never touches its stream.
 enum Stream {
     #[cfg(target_os = "linux")]
     Vsock(vsock::VsockStream),
     Tcp(std::net::TcpStream),
     #[cfg(unix)]
     Unix(std::os::unix::net::UnixStream),
+    Bridged,
 }
 
 impl Read for Stream {
@@ -70,6 +73,7 @@ impl Read for Stream {
             Stream::Tcp(s) => s.read(buf),
             #[cfg(unix)]
             Stream::Unix(s) => s.read(buf),
+            Stream::Bridged => Err(std::io::Error::other("bridged client has no stream")),
         }
     }
 }
@@ -81,6 +85,7 @@ impl Write for Stream {
             Stream::Tcp(s) => s.write(buf),
             #[cfg(unix)]
             Stream::Unix(s) => s.write(buf),
+            Stream::Bridged => Err(std::io::Error::other("bridged client has no stream")),
         }
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -90,6 +95,7 @@ impl Write for Stream {
             Stream::Tcp(s) => s.flush(),
             #[cfg(unix)]
             Stream::Unix(s) => s.flush(),
+            Stream::Bridged => Ok(()),
         }
     }
 }
@@ -145,21 +151,28 @@ fn ensure_connected(guard: &mut Option<ShimState>) -> Result<(), c_int> {
     if guard.is_some() {
         return Ok(());
     }
-    let stream = connect()?;
-    let mut client = Client::new(stream);
-    // This connection shares one guest program-order stream with the runtime
-    // shim's connection. Two independently flushed deferred queues let the
-    // host execute their work out of order — recorded misorder in a CUDA
-    // graph replays wrong (paged-attention reads garbage indices → 700).
-    // Driver-side traffic (Triton launches) is low-volume: run it sync, and
-    // fence the runtime connection before each op (see fence_runtime).
-    client.set_defer_enabled(false);
+    // Preferred: ride the runtime shim's connection (both shims loaded, one
+    // program-ordered pipeline, full deferral). Fallback: own connection —
+    // then this traffic shares one guest program-order stream with the
+    // runtime shim's connection, and two independently flushed deferred
+    // queues would let the host execute work out of order (recorded misorder
+    // in a CUDA graph replays wrong), so run every op sync and fence the
+    // runtime connection before each one (see fence_runtime).
+    let mut client = match resolve_bridge() {
+        Some(bridge) => Client::new_bridged(Stream::Bridged, bridge),
+        None => {
+            let mut c = Client::new(connect()?);
+            c.set_defer_enabled(false);
+            c
+        }
+    };
     if let Err(e) = client.init() {
         return Err(match e {
             CudaRpcError::Cuda(code) => code as c_int,
             _ => CUDA_ERROR_NO_DEVICE,
         });
     }
+    BRIDGED.store(client.is_bridged(), std::sync::atomic::Ordering::Relaxed);
     *guard = Some(ShimState {
         client,
         param_sizes: HashMap::new(),
@@ -167,6 +180,41 @@ fn ensure_connected(guard: &mut Option<ShimState>) -> Result<(), c_int> {
         ctx_stack: Vec::new(),
     });
     Ok(())
+}
+
+/// Set once at connect: this shim's client rides the runtime shim's
+/// connection, so the per-op runtime fence is unnecessary.
+static BRIDGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The runtime shim's bridge exports, if it's loaded in this process.
+/// All three must resolve or none are used. `SMOLVM_CUDA_BRIDGE=0` forces the
+/// standalone fallback (kill-switch, mirrors `SMOLVM_CUDA_ASYNC=0`).
+fn resolve_bridge() -> Option<smolvm_cuda::client::Bridge> {
+    if std::env::var("SMOLVM_CUDA_BRIDGE").as_deref() == Ok("0") {
+        return None;
+    }
+    extern "C" {
+        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    }
+    // glibc: RTLD_DEFAULT == NULL (this shim is glibc-only).
+    unsafe {
+        let quiet = dlsym(std::ptr::null_mut(), c"smolvm_cudart_bridge_quiet".as_ptr());
+        let call = dlsym(std::ptr::null_mut(), c"smolvm_cudart_bridge_call".as_ptr());
+        let drain = dlsym(std::ptr::null_mut(), c"smolvm_cudart_bridge_drain".as_ptr());
+        if quiet.is_null() || call.is_null() || drain.is_null() {
+            return None;
+        }
+        Some(smolvm_cuda::client::Bridge {
+            quiet: std::mem::transmute::<*mut c_void, unsafe extern "C" fn(*const u8, usize) -> i32>(
+                quiet,
+            ),
+            call: std::mem::transmute::<
+                *mut c_void,
+                unsafe extern "C" fn(*const u8, usize, *mut u8, usize) -> isize,
+            >(call),
+            drain: std::mem::transmute::<*mut c_void, unsafe extern "C" fn() -> i32>(drain),
+        })
+    }
 }
 
 /// Run `f` against the connected client, translating errors to `CUresult`.
@@ -198,7 +246,10 @@ fn fence_runtime() {
 }
 
 fn with_state<T>(f: impl FnOnce(&mut ShimState) -> Result<T, CudaRpcError>) -> Result<T, c_int> {
-    fence_runtime();
+    // Bridged: program order is inherent (one pipeline), no fence needed.
+    if !BRIDGED.load(std::sync::atomic::Ordering::Relaxed) {
+        fence_runtime();
+    }
     let mut guard = match STATE.lock() {
         Ok(g) => g,
         Err(_) => return Err(CUDA_ERROR_UNKNOWN),
@@ -675,7 +726,7 @@ pub extern "C" fn cuMemcpyHtoD_v2(dptr: u64, src: *const c_void, bytes: usize) -
         return CUDA_ERROR_INVALID_VALUE;
     }
     let data = unsafe { std::slice::from_raw_parts(src as *const u8, bytes) };
-    ret(with_state(|s| s.client.memcpy_htod(dptr, data)))
+    ret(with_state(|s| s.client.memcpy_htod(dptr, data, 0)))
 }
 
 #[no_mangle]
@@ -683,7 +734,7 @@ pub extern "C" fn cuMemcpyDtoH_v2(dst: *mut c_void, dptr: u64, bytes: usize) -> 
     if dst.is_null() && bytes > 0 {
         return CUDA_ERROR_INVALID_VALUE;
     }
-    match with_state(|s| s.client.memcpy_dtoh(dptr, bytes as u64)) {
+    match with_state(|s| s.client.memcpy_dtoh(dptr, bytes as u64, 0)) {
         Ok(data) => {
             if data.len() != bytes {
                 return CUDA_ERROR_UNKNOWN;

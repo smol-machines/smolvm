@@ -237,11 +237,18 @@ pub enum Request {
     },
     MemcpyHtoD {
         dptr: u64,
+        /// Stream whose prior work must complete before the copy (0 = legacy
+        /// default). Guest `cudaMemcpyAsync` semantics: the copy is ordered
+        /// within this stream, and torch's pool streams are non-blocking, so
+        /// a NULL-stream copy would NOT wait for them.
+        stream: u64,
         data: Vec<u8>,
     },
     MemcpyDtoH {
         dptr: u64,
         bytes: u64,
+        /// See `MemcpyHtoD::stream`.
+        stream: u64,
     },
     MemcpyDtoD {
         dst: u64,
@@ -414,22 +421,30 @@ pub enum Request {
         dptr: u64,
         offset: u64,
         size: u64,
+        /// See `MemcpyHtoD::stream`.
+        stream: u64,
     },
     /// Zero-copy D2H: copy `size` bytes from `dptr` to shared-region `offset`.
     MemcpyShmDtoH {
         offset: u64,
         dptr: u64,
         size: u64,
+        /// See `MemcpyHtoD::stream`.
+        stream: u64,
     },
     /// Zero-copy H2D from guest RAM: gather `segments` (each `(gpa, len)`, in
     /// buffer order) and copy to `dptr`.
     MemcpyGpaHtoD {
         dptr: u64,
+        /// See `MemcpyHtoD::stream`.
+        stream: u64,
         segments: Vec<(u64, u64)>,
     },
     /// Zero-copy D2H to guest RAM: copy from `dptr` and scatter into `segments`.
     MemcpyGpaDtoH {
         dptr: u64,
+        /// See `MemcpyHtoD::stream`.
+        stream: u64,
         segments: Vec<(u64, u64)>,
     },
 }
@@ -653,15 +668,21 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
             w_u8(&mut b, Op::MemFree as u8);
             w_u64(&mut b, *dptr);
         }
-        Request::MemcpyHtoD { dptr, data } => {
+        Request::MemcpyHtoD { dptr, stream, data } => {
             w_u8(&mut b, Op::MemcpyHtoD as u8);
             w_u64(&mut b, *dptr);
+            w_u64(&mut b, *stream);
             w_bytes(&mut b, data);
         }
-        Request::MemcpyDtoH { dptr, bytes } => {
+        Request::MemcpyDtoH {
+            dptr,
+            bytes,
+            stream,
+        } => {
             w_u8(&mut b, Op::MemcpyDtoH as u8);
             w_u64(&mut b, *dptr);
             w_u64(&mut b, *bytes);
+            w_u64(&mut b, *stream);
         }
         Request::MemcpyDtoD { dst, src, bytes } => {
             w_u8(&mut b, Op::MemcpyDtoD as u8);
@@ -900,26 +921,48 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
             w_u32(&mut b, *func as u32);
             w_bytes(&mut b, args);
         }
-        Request::MemcpyShmHtoD { dptr, offset, size } => {
+        Request::MemcpyShmHtoD {
+            dptr,
+            offset,
+            size,
+            stream,
+        } => {
             w_u8(&mut b, Op::MemcpyShmHtoD as u8);
             w_u64(&mut b, *dptr);
             w_u64(&mut b, *offset);
             w_u64(&mut b, *size);
+            w_u64(&mut b, *stream);
         }
-        Request::MemcpyShmDtoH { offset, dptr, size } => {
+        Request::MemcpyShmDtoH {
+            offset,
+            dptr,
+            size,
+            stream,
+        } => {
             w_u8(&mut b, Op::MemcpyShmDtoH as u8);
             w_u64(&mut b, *offset);
             w_u64(&mut b, *dptr);
             w_u64(&mut b, *size);
+            w_u64(&mut b, *stream);
         }
-        Request::MemcpyGpaHtoD { dptr, segments } => {
+        Request::MemcpyGpaHtoD {
+            dptr,
+            stream,
+            segments,
+        } => {
             w_u8(&mut b, Op::MemcpyGpaHtoD as u8);
             w_u64(&mut b, *dptr);
+            w_u64(&mut b, *stream);
             w_gpa_segments(&mut b, segments);
         }
-        Request::MemcpyGpaDtoH { dptr, segments } => {
+        Request::MemcpyGpaDtoH {
+            dptr,
+            stream,
+            segments,
+        } => {
             w_u8(&mut b, Op::MemcpyGpaDtoH as u8);
             w_u64(&mut b, *dptr);
+            w_u64(&mut b, *stream);
             w_gpa_segments(&mut b, segments);
         }
     }
@@ -968,11 +1011,13 @@ pub fn decode_request(payload: &[u8]) -> io::Result<Request> {
         Op::MemFree => Request::MemFree { dptr: c.u64()? },
         Op::MemcpyHtoD => Request::MemcpyHtoD {
             dptr: c.u64()?,
+            stream: c.u64()?,
             data: c.bytes()?,
         },
         Op::MemcpyDtoH => Request::MemcpyDtoH {
             dptr: c.u64()?,
             bytes: c.u64()?,
+            stream: c.u64()?,
         },
         Op::MemcpyDtoD => Request::MemcpyDtoD {
             dst: c.u64()?,
@@ -1104,18 +1149,22 @@ pub fn decode_request(payload: &[u8]) -> io::Result<Request> {
             dptr: c.u64()?,
             offset: c.u64()?,
             size: c.u64()?,
+            stream: c.u64()?,
         },
         Op::MemcpyShmDtoH => Request::MemcpyShmDtoH {
             offset: c.u64()?,
             dptr: c.u64()?,
             size: c.u64()?,
+            stream: c.u64()?,
         },
         Op::MemcpyGpaHtoD => Request::MemcpyGpaHtoD {
             dptr: c.u64()?,
+            stream: c.u64()?,
             segments: r_gpa_segments(&mut c)?,
         },
         Op::MemcpyGpaDtoH => Request::MemcpyGpaDtoH {
             dptr: c.u64()?,
+            stream: c.u64()?,
             segments: r_gpa_segments(&mut c)?,
         },
     })
@@ -1253,11 +1302,13 @@ mod tests {
         roundtrip(Request::MemFree { dptr: 0x7f00_0000 });
         roundtrip(Request::MemcpyHtoD {
             dptr: 0x7f00_0000,
+            stream: 0x7001,
             data: vec![1, 2, 3, 4],
         });
         roundtrip(Request::MemcpyDtoH {
             dptr: 0x7f00_0000,
             bytes: 16,
+            stream: 0x7001,
         });
         roundtrip(Request::LaunchKernel {
             function: 7,

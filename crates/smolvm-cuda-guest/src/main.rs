@@ -64,8 +64,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let da = cu.mem_alloc(bytes)?;
     let db = cu.mem_alloc(bytes)?;
     let dc = cu.mem_alloc(bytes)?;
-    cu.memcpy_htod(da, as_bytes(&a))?;
-    cu.memcpy_htod(db, as_bytes(&b))?;
+    cu.memcpy_htod(da, as_bytes(&a), 0)?;
+    cu.memcpy_htod(db, as_bytes(&b), 0)?;
 
     // kernelParams: one little-endian blob per arg, in declaration order.
     let params = vec![
@@ -75,11 +75,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         (n as u32).to_le_bytes().to_vec(),
     ];
     let block = 256u32;
-    let grid = ((n as u32) + block - 1) / block;
+    let grid = (n as u32).div_ceil(block);
     cu.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, 0, &params)?;
     cu.ctx_synchronize()?;
 
-    let out = cu.memcpy_dtoh(dc, bytes)?;
+    let out = cu.memcpy_dtoh(dc, bytes, 0)?;
     let c: Vec<f32> = out
         .chunks_exact(4)
         .map(|p| f32::from_le_bytes(p.try_into().unwrap()))
