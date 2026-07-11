@@ -85,6 +85,7 @@ pub struct GpuBackend {
     stream_create: unsafe extern "C" fn(*mut *mut c_void, c_uint) -> CuResultCode,
     // CUDA graphs (capture on the real driver; replay = one launch).
     stream_begin_capture: unsafe extern "C" fn(*mut c_void, c_int) -> CuResultCode,
+    thread_exchange_capture_mode: unsafe extern "C" fn(*mut c_int) -> CuResultCode,
     stream_end_capture: unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> CuResultCode,
     stream_get_capture_info:
         unsafe extern "C" fn(*mut c_void, *mut c_int, *mut u64) -> CuResultCode,
@@ -99,6 +100,9 @@ pub struct GpuBackend {
     memcpy_dtod_async: unsafe extern "C" fn(u64, u64, usize, *mut c_void) -> CuResultCode,
     stream_destroy: unsafe extern "C" fn(*mut c_void) -> CuResultCode,
     stream_synchronize: unsafe extern "C" fn(*mut c_void) -> CuResultCode,
+    stream_query: unsafe extern "C" fn(*mut c_void) -> CuResultCode,
+    stream_wait_event: unsafe extern "C" fn(*mut c_void, *mut c_void, c_uint) -> CuResultCode,
+    event_query: unsafe extern "C" fn(*mut c_void) -> CuResultCode,
     event_create: unsafe extern "C" fn(*mut *mut c_void, c_uint) -> CuResultCode,
     event_destroy: unsafe extern "C" fn(*mut c_void) -> CuResultCode,
     event_record: unsafe extern "C" fn(*mut c_void, *mut c_void) -> CuResultCode,
@@ -346,6 +350,7 @@ impl GpuBackend {
                     b"cuStreamBeginCapture_v2\0",
                     b"cuStreamBeginCapture\0",
                 )?,
+                thread_exchange_capture_mode: sym(&lib, b"cuThreadExchangeStreamCaptureMode\0")?,
                 stream_end_capture: sym(&lib, b"cuStreamEndCapture\0")?,
                 stream_get_capture_info: sym2(
                     &lib,
@@ -361,6 +366,9 @@ impl GpuBackend {
                 memcpy_dtod_async: sym2(&lib, b"cuMemcpyDtoDAsync_v2\0", b"cuMemcpyDtoDAsync\0")?,
                 stream_destroy: sym2(&lib, b"cuStreamDestroy_v2\0", b"cuStreamDestroy\0")?,
                 stream_synchronize: sym(&lib, b"cuStreamSynchronize\0")?,
+                stream_query: sym(&lib, b"cuStreamQuery\0")?,
+                stream_wait_event: sym(&lib, b"cuStreamWaitEvent\0")?,
+                event_query: sym(&lib, b"cuEventQuery\0")?,
                 event_create: sym(&lib, b"cuEventCreate\0")?,
                 event_destroy: sym2(&lib, b"cuEventDestroy_v2\0", b"cuEventDestroy\0")?,
                 event_record: sym(&lib, b"cuEventRecord\0")?,
@@ -506,7 +514,13 @@ impl Backend for GpuBackend {
         Ok(sizes)
     }
     fn func_set_attribute(&mut self, function: u64, attrib: i32, value: i32) -> CuResult<()> {
-        unsafe { chk((self.func_set_attribute)(function as *mut c_void, attrib, value)) }
+        unsafe {
+            chk((self.func_set_attribute)(
+                function as *mut c_void,
+                attrib,
+                value,
+            ))
+        }
     }
     fn mem_alloc(&mut self, bytes: u64) -> CuResult<u64> {
         let mut dptr: u64 = 0;
@@ -726,7 +740,15 @@ impl Backend for GpuBackend {
     fn stream_create(&mut self, flags: u32) -> CuResult<u64> {
         let mut s: *mut c_void = std::ptr::null_mut();
         unsafe { chk((self.stream_create)(&mut s, flags))? };
+        if std::env::var_os("SMOLVM_CUDA_HOST_OPLOG").is_some() {
+            eprintln!("[strm] host created {:#x}", s as u64);
+        }
         Ok(s as u64)
+    }
+    fn thread_exchange_capture_mode(&mut self, mode: i32) -> CuResult<i32> {
+        let mut m: c_int = mode;
+        unsafe { chk((self.thread_exchange_capture_mode)(&mut m))? };
+        Ok(m)
     }
     fn stream_begin_capture(&mut self, stream: u64, mode: i32) -> CuResult<()> {
         unsafe { chk((self.stream_begin_capture)(stream as *mut c_void, mode)) }
@@ -806,6 +828,22 @@ impl Backend for GpuBackend {
     }
     fn stream_destroy(&mut self, stream: u64) -> CuResult<()> {
         unsafe { chk((self.stream_destroy)(stream as *mut c_void)) }
+    }
+    fn stream_query(&mut self, stream: u64) -> CuResult<i32> {
+        // 600 (NOT_READY) is a status, not an error — return the raw code.
+        Ok(unsafe { (self.stream_query)(stream as *mut c_void) })
+    }
+    fn stream_wait_event(&mut self, stream: u64, event: u64, flags: u32) -> CuResult<()> {
+        unsafe {
+            chk((self.stream_wait_event)(
+                stream as *mut c_void,
+                event as *mut c_void,
+                flags,
+            ))
+        }
+    }
+    fn event_query(&mut self, event: u64) -> CuResult<i32> {
+        Ok(unsafe { (self.event_query)(event as *mut c_void) })
     }
     fn stream_synchronize(&mut self, stream: u64) -> CuResult<()> {
         unsafe { chk((self.stream_synchronize)(stream as *mut c_void)) }
@@ -961,8 +999,14 @@ impl Backend for GpuBackend {
         })
     }
 
-    fn lib_call(&mut self, lib: u8, func: u16, args: &[u8]) -> CuResult<(i32, Vec<u8>)> {
-        self.gen_lib_call(lib, func, args)
+    fn lib_call(
+        &mut self,
+        lib: u8,
+        func: u16,
+        args: &[u8],
+        streams: &std::collections::HashMap<u64, u64>,
+    ) -> CuResult<(i32, Vec<u8>)> {
+        self.gen_lib_call(lib, func, args, streams)
     }
 }
 
@@ -1219,6 +1263,7 @@ impl CublasLt {
         func: u16,
         args: &[u8],
         vh: &std::collections::HashMap<u64, u64>,
+        streams: &std::collections::HashMap<u64, u64>,
     ) -> (i32, Vec<u8>) {
         // sizeof(cublasLtMatmulHeuristicResult_t): algo[64] + workspaceSize(8)
         // + state(4) + wavesCount(4) + reserved[4](16) = 96 bytes.
@@ -1339,7 +1384,8 @@ impl CublasLt {
                 let algo_present = rd_u64(176) != 0;
                 let workspace = rd_u64(184) as *mut c_void;
                 let ws_size = rd_u64(192) as usize;
-                let stream = rd_u64(200) as *mut c_void;
+                // Session-minted stream id → real host stream (see stream_resolve).
+                let stream = stream_resolve(streams, rd_u64(200)) as *mut c_void;
                 let algo_ptr = if algo_present {
                     algo.as_ptr().cast()
                 } else {
@@ -1394,6 +1440,19 @@ fn vh_resolve(map: &std::collections::HashMap<u64, u64>, h: u64) -> u64 {
         map.get(&h).copied().unwrap_or(0)
     } else {
         h
+    }
+}
+
+/// Resolve a wire `cudaStream_t` against the session stream table. Streams are
+/// session-minted small ids (see `StreamCreate` in host.rs), so passing one
+/// straight to a real library would be read as a pointer and crash it. 0 (the
+/// default stream) and unmapped values (the legacy 0x1/0x2 stream constants)
+/// pass through.
+fn stream_resolve(map: &std::collections::HashMap<u64, u64>, s: u64) -> u64 {
+    if s == 0 {
+        0
+    } else {
+        map.get(&s).copied().unwrap_or(s)
     }
 }
 
@@ -1942,7 +2001,13 @@ impl GpuBackend {
     }
 
     /// Dispatch a generic `LibCall` to the code-generated handler for `lib`.
-    fn gen_lib_call(&mut self, lib: u8, func: u16, args: &[u8]) -> CuResult<(i32, Vec<u8>)> {
+    fn gen_lib_call(
+        &mut self,
+        lib: u8,
+        func: u16,
+        args: &[u8],
+        streams: &std::collections::HashMap<u64, u64>,
+    ) -> CuResult<(i32, Vec<u8>)> {
         match lib {
             LIB_CUBLAS => {
                 if self.cublas_gen.is_none() {
@@ -1954,11 +2019,12 @@ impl GpuBackend {
                         }
                     }
                 }
-                Ok(self
-                    .cublas_gen
-                    .as_ref()
-                    .unwrap()
-                    .dispatch(func, args, &mut self.vhandles))
+                Ok(self.cublas_gen.as_ref().unwrap().dispatch(
+                    func,
+                    args,
+                    &mut self.vhandles,
+                    streams,
+                ))
             }
             LIB_CUDNN => {
                 if self.cudnn_gen.is_none() {
@@ -1970,11 +2036,12 @@ impl GpuBackend {
                         }
                     }
                 }
-                Ok(self
-                    .cudnn_gen
-                    .as_ref()
-                    .unwrap()
-                    .dispatch(func, args, &mut self.vhandles))
+                Ok(self.cudnn_gen.as_ref().unwrap().dispatch(
+                    func,
+                    args,
+                    &mut self.vhandles,
+                    streams,
+                ))
             }
             LIB_CUDNN_BACKEND => {
                 if self.cudnn_backend.is_none() {
@@ -2006,7 +2073,7 @@ impl GpuBackend {
                     .cublaslt
                     .as_ref()
                     .unwrap()
-                    .dispatch(func, args, &self.vhandles))
+                    .dispatch(func, args, &self.vhandles, streams))
             }
             LIB_CUDNN_BN => {
                 if self.cudnn_bn.is_none() {

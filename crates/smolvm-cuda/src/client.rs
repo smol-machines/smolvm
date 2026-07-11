@@ -112,11 +112,20 @@ impl<S: Read + Write> Client<S> {
         Ok(())
     }
 
+    /// Force every op to a synchronous round-trip (disable the deferred
+    /// pipeline). Used by the driver shim: it shares one guest program-order
+    /// stream with the runtime shim's connection, and two independently
+    /// flushed deferred queues would let the host execute their work out of
+    /// program order (fatal once CUDA-graph capture records the misorder).
+    pub fn set_defer_enabled(&mut self, on: bool) {
+        self.defer_enabled = on;
+    }
+
     /// Settle all fire-and-forget work with a single fence round-trip: quiet
     /// requests produce no per-op responses (each response read costs a guest
     /// wake-up on vsock), so one fence reply carries the first failure among
     /// them.
-    fn drain(&mut self) -> Result<()> {
+    pub fn drain(&mut self) -> Result<()> {
         if self.deferred == 0 {
             return self.flush_wbuf();
         }
@@ -315,6 +324,18 @@ impl<S: Read + Write> Client<S> {
             },
             Op::LaunchKernel,
         )
+    }
+
+    /// Exchange the serving thread's stream-capture interaction mode; returns
+    /// the previous mode. Sync: the caller's next op must see the new mode.
+    pub fn thread_exchange_capture_mode(&mut self, mode: i32) -> Result<i32> {
+        match self.call(
+            &Request::ThreadExchangeCaptureMode { mode },
+            Op::ThreadExchangeCaptureMode,
+        )? {
+            Response::Count(old) => Ok(old),
+            _ => Err(CudaRpcError::Protocol("expected Count")),
+        }
     }
 
     pub fn stream_begin_capture(&mut self, stream: u64, mode: i32) -> Result<()> {
@@ -528,6 +549,35 @@ impl<S: Read + Write> Client<S> {
             Op::StreamSynchronize,
         )
         .map(|_| ())
+    }
+
+    /// Raw `cuStreamQuery` code: 0 complete, 600 not ready.
+    pub fn stream_query(&mut self, stream: u64) -> Result<i32> {
+        match self.call(&Request::StreamQuery { stream }, Op::StreamQuery)? {
+            Response::Count(code) => Ok(code),
+            _ => Err(CudaRpcError::Protocol("expected Count")),
+        }
+    }
+
+    /// Deferred like a launch: a stream-ordered dependency edge whose failure
+    /// surfaces at the next fence, exactly like an async launch error.
+    pub fn stream_wait_event(&mut self, stream: u64, event: u64, flags: u32) -> Result<()> {
+        self.call_deferred(
+            &Request::StreamWaitEvent {
+                stream,
+                event,
+                flags,
+            },
+            Op::StreamWaitEvent,
+        )
+    }
+
+    /// Raw `cuEventQuery` code: 0 complete, 600 not ready.
+    pub fn event_query(&mut self, event: u64) -> Result<i32> {
+        match self.call(&Request::EventQuery { event }, Op::EventQuery)? {
+            Response::Count(code) => Ok(code),
+            _ => Err(CudaRpcError::Protocol("expected Count")),
+        }
     }
 
     pub fn event_create(&mut self, flags: u32) -> Result<u64> {

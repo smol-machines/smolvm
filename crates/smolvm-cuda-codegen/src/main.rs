@@ -26,9 +26,15 @@ use std::fmt::Write as _;
 enum Kind {
     /// A machine scalar passed by value. `.0` is the Rust scalar type.
     Scalar(&'static str),
-    /// An opaque host handle (cuBLAS/cuDNN handle, stream, …) — pass the pointer
+    /// An opaque host handle (cuBLAS/cuDNN handle, …) — pass the pointer
     /// value by reference; the guest never dereferences it.
     Handle,
+    /// A `cudaStream_t`. Streams are session-mapped small ids on the wire (the
+    /// host mints them at StreamCreate), so the host must translate through the
+    /// session stream table — NOT vh_resolve — or the raw id reaches the real
+    /// library as a pointer and crashes it. 0 and the legacy constants
+    /// (0x1/0x2) pass through.
+    Stream,
     /// A real device address — pass by value.
     DevPtr,
     /// A host input scalar behind a pointer (cuBLAS alpha/beta) — read `*p` on
@@ -171,7 +177,7 @@ fn cublas_spec() -> Lib {
             Fun {
                 sym: "cublasSetStream_v2",
                 real: "cublasSetStream_v2",
-                params: vec![handle(), p("stream", "*mut c_void", Handle)],
+                params: vec![handle(), p("stream", "*mut c_void", Stream)],
             },
             Fun {
                 sym: "cublasSetWorkspace_v2",
@@ -294,7 +300,7 @@ fn cudnn_spec() -> Lib {
             f("cudnnDestroy", vec![h()]),
             f(
                 "cudnnSetStream",
-                vec![h(), p("stream", "*mut c_void", Handle)],
+                vec![h(), p("stream", "*mut c_void", Stream)],
             ),
             create("cudnnCreateTensorDescriptor"),
             f(
@@ -430,7 +436,7 @@ fn gen_guest(lib: &Lib) -> String {
                         p.name
                     );
                 }
-                Kind::Handle | Kind::DevPtr => {
+                Kind::Handle | Kind::Stream | Kind::DevPtr => {
                     let _ = writeln!(
                         s,
                         "    a.extend_from_slice(&({} as u64).to_le_bytes());",
@@ -530,7 +536,7 @@ fn gen_host(lib: &Lib) -> String {
     // Dispatch.
     let _ = writeln!(
         s,
-        "    pub fn dispatch(&self, func: u16, args: &[u8], __vh: &mut std::collections::HashMap<u64, u64>) -> (i32, Vec<u8>) {{\n        let mut __c = GenCur {{ b: args, p: 0 }};\n        match func {{"
+        "    pub fn dispatch(&self, func: u16, args: &[u8], __vh: &mut std::collections::HashMap<u64, u64>, __streams: &std::collections::HashMap<u64, u64>) -> (i32, Vec<u8>) {{\n        let mut __c = GenCur {{ b: args, p: 0 }};\n        let _ = __streams;\n        match func {{"
     );
     for (idx, f) in lib.funcs.iter().enumerate() {
         if is_create(f) {
@@ -567,6 +573,14 @@ fn gen_host(lib: &Lib) -> String {
                             p.name, p.cty
                         );
                     }
+                    call.push(p.name.to_string());
+                }
+                Kind::Stream => {
+                    let _ = writeln!(
+                        binds,
+                        "                let {} = super::stream_resolve(__streams, __c.u64()) as {};",
+                        p.name, p.cty
+                    );
                     call.push(p.name.to_string());
                 }
                 Kind::DevPtr => {

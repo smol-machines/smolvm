@@ -147,6 +147,13 @@ fn ensure_connected(guard: &mut Option<ShimState>) -> Result<(), c_int> {
     }
     let stream = connect()?;
     let mut client = Client::new(stream);
+    // This connection shares one guest program-order stream with the runtime
+    // shim's connection. Two independently flushed deferred queues let the
+    // host execute their work out of order — recorded misorder in a CUDA
+    // graph replays wrong (paged-attention reads garbage indices → 700).
+    // Driver-side traffic (Triton launches) is low-volume: run it sync, and
+    // fence the runtime connection before each op (see fence_runtime).
+    client.set_defer_enabled(false);
     if let Err(e) = client.init() {
         return Err(match e {
             CudaRpcError::Cuda(code) => code as c_int,
@@ -164,7 +171,34 @@ fn ensure_connected(guard: &mut Option<ShimState>) -> Result<(), c_int> {
 
 /// Run `f` against the connected client, translating errors to `CUresult`.
 /// Auto-connects on first use (see [`ensure_connected`]).
+/// Settle the runtime shim's deferred pipeline before running one of our ops,
+/// so guest program order holds across the two connections. The hook is
+/// exported by the runtime shim (`smolvm_cudart_fence` in libcudart); resolved
+/// lazily because either shim can load first. dlsym cost is paid only until
+/// the symbol appears (a process without the runtime shim keeps probing, but
+/// such a process has no cross-connection ordering to preserve anyway).
+fn fence_runtime() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    extern "C" {
+        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    }
+    // glibc: RTLD_DEFAULT == NULL (this shim is glibc-only).
+    static HOOK: AtomicUsize = AtomicUsize::new(0);
+    let mut p = HOOK.load(Ordering::Relaxed);
+    if p == 0 {
+        p = unsafe { dlsym(std::ptr::null_mut(), c"smolvm_cudart_fence".as_ptr()) } as usize;
+        if p != 0 {
+            HOOK.store(p, Ordering::Relaxed);
+        }
+    }
+    if p != 0 {
+        let f: extern "C" fn() = unsafe { std::mem::transmute::<usize, extern "C" fn()>(p) };
+        f();
+    }
+}
+
 fn with_state<T>(f: impl FnOnce(&mut ShimState) -> Result<T, CudaRpcError>) -> Result<T, c_int> {
+    fence_runtime();
     let mut guard = match STATE.lock() {
         Ok(g) => g,
         Err(_) => return Err(CUDA_ERROR_UNKNOWN),
@@ -784,11 +818,7 @@ pub extern "C" fn cuLaunchKernelEx_ptsz(
 /// managed. Range/host-pointer queries return the pointer / null respectively.
 /// vLLM's allocator and Triton link these; a stub error broke import.
 #[no_mangle]
-pub extern "C" fn cuPointerGetAttribute(
-    data: *mut c_void,
-    attribute: c_int,
-    ptr: u64,
-) -> c_int {
+pub extern "C" fn cuPointerGetAttribute(data: *mut c_void, attribute: c_int, ptr: u64) -> c_int {
     if data.is_null() {
         return CUDA_ERROR_INVALID_VALUE;
     }
@@ -968,17 +998,26 @@ pub extern "C" fn cuStreamSynchronize(stream: *mut c_void) -> c_int {
 }
 
 #[no_mangle]
-pub extern "C" fn cuStreamQuery(_stream: *mut c_void) -> c_int {
-    CUDA_SUCCESS // all work completes synchronously
+pub extern "C" fn cuStreamQuery(stream: *mut c_void) -> c_int {
+    // Honest completion status (0 or 600-NotReady) now that work runs on real
+    // side streams.
+    match with_state(|s| s.client.stream_query(stream as u64)) {
+        Ok(code) => code,
+        Err(e) => e,
+    }
 }
 
 #[no_mangle]
 pub extern "C" fn cuStreamWaitEvent(
-    _stream: *mut c_void,
-    _event: *mut c_void,
-    _flags: c_uint,
+    stream: *mut c_void,
+    event: *mut c_void,
+    flags: c_uint,
 ) -> c_int {
-    CUDA_SUCCESS // recorded events are already complete
+    // Real cross-stream ordering edge (a graph dependency during capture).
+    ret(with_state(|s| {
+        s.client
+            .stream_wait_event(stream as u64, event as u64, flags)
+    }))
 }
 
 #[no_mangle]

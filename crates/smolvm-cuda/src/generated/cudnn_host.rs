@@ -38,8 +38,9 @@ impl GenLib {
             })
         }
     }
-    pub fn dispatch(&self, func: u16, args: &[u8], __vh: &mut std::collections::HashMap<u64, u64>) -> (i32, Vec<u8>) {
+    pub fn dispatch(&self, func: u16, args: &[u8], __vh: &mut std::collections::HashMap<u64, u64>, __streams: &std::collections::HashMap<u64, u64>) -> (i32, Vec<u8>) {
         let mut __c = GenCur { b: args, p: 0 };
+        let _ = __streams;
         match func {
             0 => { let mut h: *mut c_void = std::ptr::null_mut(); let st = unsafe { (self.f_cudnnCreate)(&mut h) }; if st == 0 && args.len() >= 8 { let id = u64::from_le_bytes(args[..8].try_into().unwrap()); if id & super::VHANDLE_TAG != 0 { __vh.insert(id, h as u64); } } (st, (h as u64).to_le_bytes().to_vec()) }
             1 => {
@@ -52,7 +53,7 @@ impl GenLib {
             }
             2 => {
                 let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
-                let stream = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let stream = super::stream_resolve(__streams, __c.u64()) as *mut c_void;
                 let mut out = Vec::new();
                 let st = unsafe { (self.f_cudnnSetStream)(handle, stream) };
                 (st, out)

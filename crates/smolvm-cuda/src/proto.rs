@@ -59,11 +59,14 @@ pub enum Op {
     StreamCreate = 0x60,
     StreamDestroy = 0x61,
     StreamSynchronize = 0x62,
+    StreamQuery = 0x63,
     EventCreate = 0x70,
     EventDestroy = 0x71,
     EventRecord = 0x72,
     EventSynchronize = 0x73,
     EventElapsedTime = 0x74,
+    StreamWaitEvent = 0x75,
+    EventQuery = 0x76,
     // CUDA graphs: capture forwarded to the host driver (which records the
     // stream's work into a graph), replayed with a single GraphLaunch.
     StreamBeginCapture = 0xC0,
@@ -78,6 +81,7 @@ pub enum Op {
     MemsetD8Async = 0xC7,
     MemcpyDtoDAsync = 0xC8,
     GraphGetNodes = 0xC9,
+    ThreadExchangeCaptureMode = 0xCA,
     // nvcomp (forward-to-host-lib): batched Deflate decompression. Device-pointer
     // args are real host device addresses, forwarded by value.
     NvcompDeflateTempSize = 0x80,
@@ -142,14 +146,18 @@ impl Op {
             0xC7 => Op::MemsetD8Async,
             0xC8 => Op::MemcpyDtoDAsync,
             0xC9 => Op::GraphGetNodes,
+            0xCA => Op::ThreadExchangeCaptureMode,
             0x60 => Op::StreamCreate,
             0x61 => Op::StreamDestroy,
             0x62 => Op::StreamSynchronize,
+            0x63 => Op::StreamQuery,
             0x70 => Op::EventCreate,
             0x71 => Op::EventDestroy,
             0x72 => Op::EventRecord,
             0x73 => Op::EventSynchronize,
             0x74 => Op::EventElapsedTime,
+            0x75 => Op::StreamWaitEvent,
+            0x76 => Op::EventQuery,
             0x80 => Op::NvcompDeflateTempSize,
             0x81 => Op::NvcompDeflateDecompress,
             0x90 => Op::CublasCreate,
@@ -285,6 +293,14 @@ pub enum Request {
     GraphGetNodes {
         graph: u64,
     },
+    /// `cuThreadExchangeStreamCaptureMode` on the serving thread. PyTorch's
+    /// allocator wraps its capture-time `cudaMalloc` in a thread-local
+    /// relaxed-mode guard; each connection is served by one host thread, so
+    /// forwarding the exchange preserves the per-thread semantics. Returns the
+    /// previous mode.
+    ThreadExchangeCaptureMode {
+        mode: i32,
+    },
     MemsetD8Async {
         dptr: u64,
         value: u8,
@@ -305,6 +321,24 @@ pub enum Request {
     },
     StreamSynchronize {
         stream: u64,
+    },
+    /// `cuStreamQuery`: 0 = all work complete, 600 = not ready (raw code in
+    /// the Count response; the guest surfaces it as its own return).
+    StreamQuery {
+        stream: u64,
+    },
+    /// Make `stream` wait for `event` — the cross-stream ordering edge. Once
+    /// work really runs on side streams (and graph capture records these as
+    /// graph dependencies), dropping it means racy replays.
+    StreamWaitEvent {
+        stream: u64,
+        event: u64,
+        flags: u32,
+    },
+    /// `cuEventQuery`: 0 = complete, 600 = not ready. PyTorch's allocator
+    /// polls this to decide when freed blocks are safe to reuse.
+    EventQuery {
+        event: u64,
     },
     EventCreate {
         flags: u32,
@@ -700,6 +734,10 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
             w_u8(&mut b, Op::GraphGetNodes as u8);
             w_u64(&mut b, *graph);
         }
+        Request::ThreadExchangeCaptureMode { mode } => {
+            w_u8(&mut b, Op::ThreadExchangeCaptureMode as u8);
+            w_i32(&mut b, *mode);
+        }
         Request::MemsetD8Async {
             dptr,
             value,
@@ -735,6 +773,24 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
         Request::StreamSynchronize { stream } => {
             w_u8(&mut b, Op::StreamSynchronize as u8);
             w_u64(&mut b, *stream);
+        }
+        Request::StreamQuery { stream } => {
+            w_u8(&mut b, Op::StreamQuery as u8);
+            w_u64(&mut b, *stream);
+        }
+        Request::StreamWaitEvent {
+            stream,
+            event,
+            flags,
+        } => {
+            w_u8(&mut b, Op::StreamWaitEvent as u8);
+            w_u64(&mut b, *stream);
+            w_u64(&mut b, *event);
+            w_u32(&mut b, *flags);
+        }
+        Request::EventQuery { event } => {
+            w_u8(&mut b, Op::EventQuery as u8);
+            w_u64(&mut b, *event);
         }
         Request::EventCreate { flags } => {
             w_u8(&mut b, Op::EventCreate as u8);
@@ -966,6 +1022,7 @@ pub fn decode_request(payload: &[u8]) -> io::Result<Request> {
         Op::GraphDestroy => Request::GraphDestroy { graph: c.u64()? },
         Op::StreamCaptureInfo => Request::StreamCaptureInfo { stream: c.u64()? },
         Op::GraphGetNodes => Request::GraphGetNodes { graph: c.u64()? },
+        Op::ThreadExchangeCaptureMode => Request::ThreadExchangeCaptureMode { mode: c.i32()? },
         Op::MemsetD8Async => Request::MemsetD8Async {
             dptr: c.u64()?,
             value: c.u8()?,
@@ -981,6 +1038,13 @@ pub fn decode_request(payload: &[u8]) -> io::Result<Request> {
         Op::StreamCreate => Request::StreamCreate { flags: c.u32()? },
         Op::StreamDestroy => Request::StreamDestroy { stream: c.u64()? },
         Op::StreamSynchronize => Request::StreamSynchronize { stream: c.u64()? },
+        Op::StreamQuery => Request::StreamQuery { stream: c.u64()? },
+        Op::StreamWaitEvent => Request::StreamWaitEvent {
+            stream: c.u64()?,
+            event: c.u64()?,
+            flags: c.u32()?,
+        },
+        Op::EventQuery => Request::EventQuery { event: c.u64()? },
         Op::EventCreate => Request::EventCreate { flags: c.u32()? },
         Op::EventDestroy => Request::EventDestroy { event: c.u64()? },
         Op::EventRecord => Request::EventRecord {
@@ -1102,9 +1166,12 @@ pub fn decode_response(op: Op, payload: &[u8]) -> io::Result<(i32, Response)> {
         return Ok((status, Response::Ok));
     }
     let body = match op {
-        Op::DeviceGetCount | Op::DriverGetVersion | Op::DeviceGetAttribute => {
-            Response::Count(c.i32()?)
-        }
+        Op::DeviceGetCount
+        | Op::DriverGetVersion
+        | Op::DeviceGetAttribute
+        | Op::ThreadExchangeCaptureMode
+        | Op::StreamQuery
+        | Op::EventQuery => Response::Count(c.i32()?),
         Op::DeviceGetName => Response::Name(c.string()?),
         Op::DeviceTotalMem => Response::Bytes(c.u64()?),
         Op::CtxCreate | Op::PrimaryCtxRetain => Response::Handle(c.u64()?),
@@ -1142,6 +1209,7 @@ pub fn decode_response(op: Op, payload: &[u8]) -> io::Result<(i32, Response)> {
         | Op::CtxSynchronize
         | Op::StreamDestroy
         | Op::StreamSynchronize
+        | Op::StreamWaitEvent
         | Op::EventDestroy
         | Op::EventRecord
         | Op::EventSynchronize
@@ -1245,6 +1313,14 @@ mod tests {
         });
         roundtrip(Request::EventSynchronize { event: 4 });
         roundtrip(Request::EventElapsedTime { start: 4, end: 5 });
+        roundtrip(Request::StreamQuery { stream: 3 });
+        roundtrip(Request::StreamWaitEvent {
+            stream: 3,
+            event: 4,
+            flags: 0,
+        });
+        roundtrip(Request::EventQuery { event: 4 });
+        roundtrip(Request::ThreadExchangeCaptureMode { mode: 2 });
     }
 
     #[test]
