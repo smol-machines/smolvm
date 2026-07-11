@@ -1082,7 +1082,6 @@ impl CudnnBackend {
         fn handle_bearing(ty: i32) -> bool {
             matches!(ty, 0 | 6 | 15)
         }
-        const TYPE_BACKEND_DESCRIPTOR: i32 = 15;
         let rd_u64 = |a: &[u8], o: usize| u64::from_le_bytes(a[o..o + 8].try_into().unwrap());
         let rd_i32 = |a: &[u8], o: usize| i32::from_le_bytes(a[o..o + 4].try_into().unwrap());
         let rd_i64 = |a: &[u8], o: usize| i64::from_le_bytes(a[o..o + 8].try_into().unwrap());

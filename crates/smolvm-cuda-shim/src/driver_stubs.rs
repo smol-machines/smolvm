@@ -174,7 +174,6 @@ pub extern "C" fn cuCtxGetId() -> c_int {
     801
 }
 #[no_mangle]
-#[no_mangle]
 pub extern "C" fn cuCtxGetSharedMemConfig() -> c_int {
     801
 }
@@ -206,7 +205,6 @@ pub extern "C" fn cuCtxSetCacheConfig() -> c_int {
 pub extern "C" fn cuCtxSetFlags() -> c_int {
     801
 }
-#[no_mangle]
 #[no_mangle]
 pub extern "C" fn cuCtxSetSharedMemConfig() -> c_int {
     801
@@ -439,7 +437,6 @@ pub extern "C" fn cuFuncLoad() -> c_int {
 pub extern "C" fn cuFuncSetBlockShape() -> c_int {
     801
 }
-#[no_mangle]
 #[no_mangle]
 pub extern "C" fn cuFuncSetSharedMemConfig() -> c_int {
     801
@@ -1100,8 +1097,6 @@ pub extern "C" fn cuLaunchHostFunc_v2() -> c_int {
 pub extern "C" fn cuLaunchHostFunc_v2_ptsz() -> c_int {
     801
 }
-#[no_mangle]
-#[no_mangle]
 #[no_mangle]
 pub extern "C" fn cuLaunchKernel_ptsz() -> c_int {
     801
@@ -2011,7 +2006,6 @@ pub extern "C" fn cuOccupancyAvailableDynamicSMemPerBlock() -> c_int {
     801
 }
 #[no_mangle]
-#[no_mangle]
 pub extern "C" fn cuOccupancyMaxPotentialBlockSize() -> c_int {
     801
 }
@@ -2043,8 +2037,6 @@ pub extern "C" fn cuParamSetTexRef() -> c_int {
 pub extern "C" fn cuParamSetv() -> c_int {
     801
 }
-#[no_mangle]
-#[no_mangle]
 #[no_mangle]
 pub extern "C" fn cuPointerSetAttribute() -> c_int {
     801

@@ -55,7 +55,7 @@ fn count_sync(req: &Request, op: Op) {
     let m = g.get_or_insert_with(HashMap::new);
     *m.entry(key).or_insert(0) += 1;
     let total: u64 = m.values().sum();
-    if total % 4096 == 0 {
+    if total.is_multiple_of(4096) {
         let mut v: Vec<_> = m.iter().collect();
         v.sort_by(|a, b| b.1.cmp(a.1));
         eprintln!("[sync-counts after {total}]");

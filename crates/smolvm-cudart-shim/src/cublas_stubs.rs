@@ -471,12 +471,6 @@ pub extern "C" fn cudaGraphDebugDotPrint() -> c_int {
     rt_stub("cudaGraphDebugDotPrint")
 }
 #[no_mangle]
-#[no_mangle]
-#[no_mangle]
-#[no_mangle]
-#[no_mangle]
-#[no_mangle]
-#[no_mangle]
 pub extern "C" fn cudaIpcCloseMemHandle() -> c_int {
     rt_stub("cudaIpcCloseMemHandle")
 }
@@ -504,9 +498,6 @@ pub extern "C" fn cudaMemcpyPeerAsync() -> c_int {
 pub extern "C" fn cudaRegisterVar() -> c_int {
     rt_stub("cudaRegisterVar")
 }
-#[no_mangle]
-#[no_mangle]
-
 /// `__cudaRegisterVar` — registers a __device__/__constant__ global. No-op:
 /// forwarded workloads that don't use cudaMemcpyToSymbol never need the mapping.
 #[no_mangle]

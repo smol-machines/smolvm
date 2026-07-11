@@ -2438,7 +2438,7 @@ const LIB_CUDNN_BN: u8 = 5;
 /// stub that returned an int caused a segfault. The exact text is cosmetic.
 #[no_mangle]
 pub extern "C" fn cudnnGetErrorString(_status: c_int) -> *const c_char {
-    b"cudnn status (forwarded by smolvm)\0".as_ptr() as *const c_char
+    c"cudnn status (forwarded by smolvm)".as_ptr()
 }
 
 /// Read a host float behind a `*const c_void` (cuDNN alpha/beta), 0.0 if null.
@@ -2694,7 +2694,7 @@ fn bn_memo_key(func: u16, args: &[u8]) -> Option<Vec<u8>> {
     // Layouts (see the three Get*Size wrappers): handle u64, mode i32, ops i32,
     // then only u64 descriptor handles (5/7 for the workspace queries, act+x
     // for the reserve query). The leading cudnn handle is identity-stable.
-    if args.len() < 16 || (args.len() - 16) % 8 != 0 {
+    if args.len() < 16 || !(args.len() - 16).is_multiple_of(8) {
         return None;
     }
     let fps = DESC_FP.lock().ok()?;
