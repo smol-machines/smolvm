@@ -1181,7 +1181,7 @@ fn make_idmap_userns(uid: u32, gid: u32) -> std::io::Result<libc::c_int> {
         if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
             unsafe { libc::_exit(1) };
         }
-        let sig: [u8; 1] = [b'r'];
+        let sig: [u8; 1] = *b"r";
         unsafe {
             libc::write(ready[1], sig.as_ptr() as *const libc::c_void, 1);
         }
@@ -1203,7 +1203,7 @@ fn make_idmap_userns(uid: u32, gid: u32) -> std::io::Result<libc::c_int> {
     // Write the maps from the privileged parent. A single entry mapping host id
     // `uid`/`gid` is permitted via the ns-creator's CAP_SETUID/CAP_SETGID path.
     let finish = |result: std::io::Result<libc::c_int>| -> std::io::Result<libc::c_int> {
-        let go_w: [u8; 1] = [b'x'];
+        let go_w: [u8; 1] = *b"x";
         unsafe {
             libc::write(go[1], go_w.as_ptr() as *const libc::c_void, 1);
             libc::close(go[1]);

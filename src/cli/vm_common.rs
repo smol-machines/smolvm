@@ -263,7 +263,18 @@ pub(crate) fn run_init_commands(
                 context.overlay_id,
             )
             .with_tty(true);
-            client.run_interactive(config)?;
+            // Interactive run streams the command's output live so the user sees
+            // progress (a slow compile, apt-get, etc.). The output isn't buffered
+            // here, so on a non-zero exit we report just the code — the detail was
+            // already printed above. Not checking the exit code would silently
+            // ignore a failed init command (e.g. a broken `apt install`).
+            let exit_code = client.run_interactive(config)?;
+            if exit_code != 0 {
+                return Err(smolvm::Error::agent(
+                    "init",
+                    format_init_failure(i, exit_code, "", ""),
+                ));
+            }
         } else {
             let (exit_code, stdout, stderr) = client.vm_exec(
                 init_argv(cmd),
