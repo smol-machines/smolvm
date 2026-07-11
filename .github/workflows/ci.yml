@@ -36,10 +36,20 @@ jobs:
     name: libkrun freshness
     runs-on: ubuntu-latest
     steps:
-      # No submodule checkout needed — the check reads the pinned gitlinks.
+      # LFS on: check-krun-exports.sh reads the actual bundled lib binaries.
+      # (check-libkrun-provenance.sh itself only needs the pinned gitlinks.)
       - uses: actions/checkout@v4
+        with:
+          lfs: true
       - name: Bundled libkrun matches the pinned submodule
         run: ./scripts/check-libkrun-provenance.sh
+      # nm (ELF), llvm-nm (Mach-O dylib), mingw objdump (PE dll exports).
+      - name: Install symbol-reading tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils binutils-mingw-w64-x86-64 llvm
+      - name: Bundled libkrun exports every symbol smolvm requires
+        run: ./scripts/check-krun-exports.sh
 
   audit:
     name: Cargo Audit
