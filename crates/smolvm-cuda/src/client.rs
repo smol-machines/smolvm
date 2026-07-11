@@ -445,6 +445,9 @@ impl<S: Read + Write> Client<S> {
         if payload.len() >= 4 {
             let status = i32::from_le_bytes(payload[..4].try_into().unwrap());
             if status != 0 && self.sticky == 0 {
+                if std::env::var_os("SMOLVM_CUDA_TRACE_STICKY").is_some() {
+                    eprintln!("[sticky] fence collected {status}");
+                }
                 self.sticky = status;
             }
         }

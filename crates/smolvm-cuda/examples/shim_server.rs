@@ -26,13 +26,15 @@ fn main() {
     println!("SHIM-SERVER-READY {addr} {backend_kind}");
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
-        let _ = stream.set_nodelay(true); // low-latency request/response
+        let __r = stream.set_nodelay(true); // low-latency request/response
         std::thread::spawn(move || {
             let mut backend: Box<dyn Backend> = match GpuBackend::load() {
                 Ok(b) => Box::new(b),
                 Err(_) => Box::<CpuBackend>::default(),
             };
-            let _ = serve(stream, backend.as_mut());
+            if let Err(e) = serve(stream, backend.as_mut()) {
+                eprintln!("[conn-err] {e}");
+            }
         });
     }
 }

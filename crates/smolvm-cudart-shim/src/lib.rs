@@ -176,14 +176,9 @@ thread_local! {
 fn set_last(code: c_int) -> c_int {
     if code != CUDA_SUCCESS {
         if std::env::var_os("SMOLVM_CUDA_SHIM_TRACE").is_some() {
-            eprintln!(
-                "[shim-err] code={code} from {:?}",
-                std::backtrace::Backtrace::force_capture()
-                    .to_string()
-                    .lines()
-                    .nth(6)
-                    .unwrap_or("?")
-            );
+            let bt = std::backtrace::Backtrace::force_capture().to_string();
+            let frames: Vec<&str> = bt.lines().take(16).collect();
+            eprintln!("[shim-err] code={code} frames:\n{}", frames.join("\n"));
         }
         LAST_ERROR.with(|e| e.set(code));
     }
@@ -199,9 +194,19 @@ fn map_err(e: CudaRpcError) -> c_int {
             2 => CUDA_ERROR_MEMORY_ALLOCATION,
             200 | 218 => CUDA_ERROR_INVALID_VALUE, // invalid image / PTX
             400 => CUDA_ERROR_INVALID_RESOURCE_HANDLE,
-            _ => CUDA_ERROR_UNKNOWN,
+            other => {
+                if std::env::var_os("SMOLVM_CUDA_SHIM_TRACE").is_some() {
+                    eprintln!("[map-err] unmapped driver code {other}");
+                }
+                CUDA_ERROR_UNKNOWN
+            }
         },
-        CudaRpcError::Io(_) | CudaRpcError::Protocol(_) => CUDA_ERROR_UNKNOWN,
+        CudaRpcError::Io(_) | CudaRpcError::Protocol(_) => {
+            if std::env::var_os("SMOLVM_CUDA_SHIM_TRACE").is_some() {
+                eprintln!("[map-err] transport: {e}");
+            }
+            CUDA_ERROR_UNKNOWN
+        }
     }
 }
 
@@ -830,6 +835,21 @@ fn resolve_kind(s: &ShimState, dst: *const c_void, src: *const c_void, kind: c_i
 }
 
 fn do_memcpy(dst: *mut c_void, src: *const c_void, n: usize, kind: c_int, stream: u64) -> c_int {
+    let dbg = std::env::var_os("SMOLVM_CUDA_TRACE_MEMCPY").is_some();
+    let r = do_memcpy_inner(dst, src, n, kind, stream);
+    if dbg && r != CUDA_SUCCESS {
+        eprintln!("[memcpy-err] kind={kind} n={n} -> {r}");
+    }
+    r
+}
+
+fn do_memcpy_inner(
+    dst: *mut c_void,
+    src: *const c_void,
+    n: usize,
+    kind: c_int,
+    stream: u64,
+) -> c_int {
     with_state(|s| {
         let kind = resolve_kind(s, dst, src, kind);
         match kind {
@@ -856,10 +876,17 @@ fn do_memcpy(dst: *mut c_void, src: *const c_void, n: usize, kind: c_int, stream
                         .memcpy_shm_htod(dst as u64, off, n as u64, stream)
                         .map_err(map_err);
                 }
+                // Chunk: one frame must stay far below the transport's
+                // 256 MiB message cap (a 272 MiB embedding tensor here killed
+                // the connection). Host-synchronous copies chunk safely.
                 let data = unsafe { std::slice::from_raw_parts(src as *const u8, n) };
-                s.client
-                    .memcpy_htod(dst as u64, data, stream)
-                    .map_err(map_err)
+                const CHUNK: usize = 64 * 1024 * 1024;
+                for (i, piece) in data.chunks(CHUNK).enumerate() {
+                    s.client
+                        .memcpy_htod(dst as u64 + (i * CHUNK) as u64, piece, stream)
+                        .map_err(map_err)?;
+                }
+                Ok(())
             }
             MEMCPY_DTOH => {
                 if let Some(segs) = guestmem::segments(dst as usize, n) {
@@ -874,14 +901,22 @@ fn do_memcpy(dst: *mut c_void, src: *const c_void, n: usize, kind: c_int, stream
                         .memcpy_shm_dtoh(off, src as u64, n as u64, stream)
                         .map_err(map_err);
                 }
-                let data = s
-                    .client
-                    .memcpy_dtoh(src as u64, n as u64, stream)
-                    .map_err(map_err)?;
-                if data.len() != n {
-                    return Err(CUDA_ERROR_UNKNOWN);
+                const CHUNK: usize = 64 * 1024 * 1024; // see H2D: stay under the frame cap
+                let mut off = 0;
+                while off < n {
+                    let c = (n - off).min(CHUNK);
+                    let data = s
+                        .client
+                        .memcpy_dtoh(src as u64 + off as u64, c as u64, stream)
+                        .map_err(map_err)?;
+                    if data.len() != c {
+                        return Err(CUDA_ERROR_UNKNOWN);
+                    }
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(data.as_ptr(), (dst as *mut u8).add(off), c)
+                    };
+                    off += c;
                 }
-                unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), dst as *mut u8, n) };
                 Ok(())
             }
             MEMCPY_DTOD => s
