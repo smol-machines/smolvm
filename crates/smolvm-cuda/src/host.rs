@@ -703,14 +703,13 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             // Per-connection VRAM quota (SMOLVM_CUDA_VRAM_LIMIT_MB on the
             // host): a guest may not allocate past its budget — the CUDA-
             // native failure (out of memory) surfaces to the app.
-            static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-            let limit = *LIMIT.get_or_init(|| {
-                std::env::var("SMOLVM_CUDA_VRAM_LIMIT_MB")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .map(|mb| mb * 1024 * 1024)
-                    .unwrap_or(u64::MAX)
-            });
+            // Read per call (allocations are rare): also keeps the limit
+            // adjustable and test-deterministic, unlike a process cache.
+            let limit = std::env::var("SMOLVM_CUDA_VRAM_LIMIT_MB")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(|mb| mb * 1024 * 1024)
+                .unwrap_or(u64::MAX);
             let used: u64 = sess.owned_dptrs.values().sum();
             if used.saturating_add(bytes) > limit {
                 return Err(2); // CUDA_ERROR_OUT_OF_MEMORY
@@ -1683,8 +1682,8 @@ mod tests {
         server.join().unwrap();
     }
     // A connection may not allocate past SMOLVM_CUDA_VRAM_LIMIT_MB; freeing
-    // returns budget. (Env is process-global — this test sets it before the
-    // OnceLock is first read; fine while it's the only quota test.)
+    // returns budget. (Env is process-global; restored at the end so
+    // parallel tests never see the 1 MB cap on their own allocations.)
     #[test]
     fn vram_quota_enforced() {
         std::env::set_var("SMOLVM_CUDA_VRAM_LIMIT_MB", "1");
@@ -1707,5 +1706,6 @@ mod tests {
         assert_eq!(st, 0);
         let (st, _) = dispatch(&mut sess, &mut b, Request::MemAlloc { bytes: mb / 4 });
         assert_eq!(st, 0);
+        std::env::remove_var("SMOLVM_CUDA_VRAM_LIMIT_MB");
     }
 }
