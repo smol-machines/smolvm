@@ -134,9 +134,28 @@ fn bridge_call_vec(b: &Bridge, req: &[u8]) -> Result<Vec<u8>> {
     }
 }
 
+/// Shared-memory ring transport state (in-VM fast path; see `crate::ring`).
+pub struct ClientRing {
+    /// Guest→host requests (this side produces).
+    req: crate::ring::Ring,
+    /// Host→guest completions (this side consumes).
+    resp: crate::ring::Ring,
+    /// Guest VAs of the bounce pages: staging for oversized traffic in both
+    /// directions (requests chunk guest→host, responses spill host→guest —
+    /// never simultaneously, the queue is strictly request-then-response).
+    bounce: Vec<*mut u8>,
+    page_size: usize,
+}
+
+// SAFETY: raw pointers reference process-owned pinned pages; the shim holds
+// the client behind a mutex.
+unsafe impl Send for ClientRing {}
+
 /// A CUDA Driver-API client over one connection to the host server.
 pub struct Client<S> {
     stream: S,
+    /// Shared-memory ring transport, when negotiated (in-VM fast path).
+    ring: Option<ClientRing>,
     /// When set, this client owns no connection: every request rides another
     /// shim's connection through these hooks (see [`Bridge`]).
     bridge: Option<Bridge>,
@@ -167,6 +186,7 @@ impl<S: Read + Write> Client<S> {
     pub fn new(stream: S) -> Self {
         Client {
             stream,
+            ring: None,
             bridge: None,
             deferred: 0,
             sticky: 0,
@@ -185,6 +205,187 @@ impl<S: Read + Write> Client<S> {
 
     pub fn is_bridged(&self) -> bool {
         self.bridge.is_some()
+    }
+
+    /// Negotiate the shared-memory ring transport (in-VM fast path). `req`,
+    /// `resp` and `bounce` are (page VAs, page GPAs) of zeroed, mlocked,
+    /// page-aligned guest allocations. On Ok the connection switches: the
+    /// socket carries only doorbell bytes from here on.
+    #[allow(clippy::type_complexity)]
+    pub fn ring_setup(
+        &mut self,
+        page_size: usize,
+        req: (Vec<*mut u8>, Vec<u64>),
+        resp: (Vec<*mut u8>, Vec<u64>),
+        bounce: (Vec<*mut u8>, Vec<u64>),
+    ) -> Result<()> {
+        self.call(
+            &Request::RingSetup {
+                page_size: page_size as u32,
+                req_pages: req.1,
+                resp_pages: resp.1,
+                bounce_pages: bounce.1,
+            },
+            Op::RingSetup,
+        )?;
+        // SAFETY: pages are owned by the shim and stay mapped + resident for
+        // the process lifetime (mlocked, never freed).
+        self.ring = Some(ClientRing {
+            req: unsafe { crate::ring::Ring::from_pages(req.0, page_size) },
+            resp: unsafe { crate::ring::Ring::from_pages(resp.0, page_size) },
+            bounce: bounce.0,
+            page_size,
+        });
+        Ok(())
+    }
+
+    pub fn is_ring(&self) -> bool {
+        self.ring.is_some()
+    }
+
+    /// Push one frame (socket-payload bytes: QUIET/FENCE prefix included) to
+    /// the request ring. Oversized frames chunk through the bounce pages:
+    /// each chunk record is acked by the host before the pages are reused,
+    /// except the last — the caller's own response wait covers it, so every
+    /// oversized frame MUST be a sync op (quiet callers upgrade to sync).
+    fn ring_push(&mut self, frame: &[u8]) -> Result<()> {
+        use crate::ring::{INLINE_MAX, LEN_INDIRECT};
+        if frame.len() <= INLINE_MAX {
+            let ring = self.ring.as_ref().expect("ring transport");
+            while !ring.req.try_push(frame, 0) {
+                std::hint::spin_loop(); // host drains continuously
+            }
+            if ring.req.take_parked() {
+                self.stream.write_all(&[1u8])?;
+                self.stream.flush()?;
+            }
+            return Ok(());
+        }
+        let (bounce_cap, page_size) = {
+            let ring = self.ring.as_ref().expect("ring transport");
+            (ring.bounce.len() * ring.page_size, ring.page_size)
+        };
+        let total = frame.len();
+        let mut off = 0;
+        while off < total {
+            let chunk = (total - off).min(bounce_cap);
+            {
+                let ring = self.ring.as_ref().expect("ring transport");
+                for (i, piece) in frame[off..off + chunk].chunks(page_size).enumerate() {
+                    // SAFETY: bounce pages are live shim allocations of
+                    // page_size bytes each; piece fits by construction.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(piece.as_ptr(), ring.bounce[i], piece.len());
+                    }
+                }
+                let mut rec = [0u8; 16];
+                rec[..8].copy_from_slice(&(total as u64).to_le_bytes());
+                rec[8..].copy_from_slice(&(chunk as u64).to_le_bytes());
+                while !ring.req.try_push(&rec, LEN_INDIRECT) {
+                    std::hint::spin_loop();
+                }
+                if ring.req.take_parked() {
+                    self.stream.write_all(&[1u8])?;
+                    self.stream.flush()?;
+                }
+            }
+            off += chunk;
+            if off < total {
+                // Host acks each non-final chunk once copied out; the final
+                // chunk is covered by the operation's own response.
+                let _ack = self.ring_pop_response()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Await exactly one completion record: spin briefly, then park and block
+    /// on a doorbell byte.
+    fn ring_pop_response(&mut self) -> Result<Vec<u8>> {
+        use crate::ring::LEN_INDIRECT;
+        loop {
+            {
+                let ring = self.ring.as_ref().expect("ring transport");
+                let mut popped = ring.resp.try_pop();
+                if popped.is_none() {
+                    for _ in 0..20_000 {
+                        popped = ring.resp.try_pop();
+                        if popped.is_some() {
+                            break;
+                        }
+                        std::hint::spin_loop();
+                    }
+                }
+                if let Some((payload, flags)) = popped {
+                    if flags & LEN_INDIRECT == 0 {
+                        return Ok(payload);
+                    }
+                    // Oversized response: [total][chunk] records, each chunk
+                    // staged in the bounce pages; we post a continue record
+                    // after copying each non-final chunk out.
+                    let mut hdr = payload;
+                    let mut buf: Vec<u8> = Vec::new();
+                    loop {
+                        if hdr.len() < 16 {
+                            return Err(CudaRpcError::Protocol("ring: short indirect"));
+                        }
+                        let total = u64::from_le_bytes(hdr[..8].try_into().unwrap()) as usize;
+                        let chunk = u64::from_le_bytes(hdr[8..16].try_into().unwrap()) as usize;
+                        if chunk > ring.bounce.len() * ring.page_size {
+                            return Err(CudaRpcError::Protocol("ring: bounce overrun"));
+                        }
+                        let mut left = chunk;
+                        for &page in &ring.bounce {
+                            if left == 0 {
+                                break;
+                            }
+                            let take = left.min(ring.page_size);
+                            // SAFETY: bounce pages are live shim allocations.
+                            unsafe {
+                                buf.extend_from_slice(std::slice::from_raw_parts(
+                                    page as *const u8,
+                                    take,
+                                ));
+                            }
+                            left -= take;
+                        }
+                        if buf.len() >= total {
+                            return Ok(buf);
+                        }
+                        // More chunks: tell the host the pages are free.
+                        while !ring.req.try_push(&[0xFF; 16], LEN_INDIRECT) {
+                            std::hint::spin_loop();
+                        }
+                        hdr = loop {
+                            if let Some((p, f)) = ring.resp.try_pop() {
+                                if f & LEN_INDIRECT == 0 {
+                                    return Err(CudaRpcError::Protocol("ring: expected chunk"));
+                                }
+                                break p;
+                            }
+                            std::hint::spin_loop();
+                        };
+                    }
+                }
+                if ring.resp.park() {
+                    continue; // record landed while parking
+                }
+            }
+            // Blocked: wait for the host's doorbell byte on the socket.
+            let mut byte = [0u8; 1];
+            match self.stream.read(&mut byte) {
+                Ok(0) => return Err(CudaRpcError::Protocol("host closed ring connection")),
+                Ok(_) => {}
+                Err(e) => return Err(e.into()),
+            }
+            self.ring.as_ref().expect("ring transport").resp.unpark();
+        }
+    }
+
+    /// One sync round-trip over the rings.
+    fn ring_roundtrip(&mut self, frame: &[u8]) -> Result<Vec<u8>> {
+        self.ring_push(frame)?;
+        self.ring_pop_response()
     }
 
     /// Send everything buffered by deferred calls.
@@ -211,6 +412,20 @@ impl<S: Read + Write> Client<S> {
     /// wake-up on vsock), so one fence reply carries the first failure among
     /// them.
     pub fn drain(&mut self) -> Result<()> {
+        if self.ring.is_some() {
+            if self.deferred == 0 {
+                return Ok(());
+            }
+            self.deferred = 0;
+            let resp = self.ring_roundtrip(&[crate::proto::FENCE_OP])?;
+            if resp.len() >= 4 {
+                let status = i32::from_le_bytes(resp[..4].try_into().unwrap());
+                if status != 0 && self.sticky == 0 {
+                    self.sticky = status;
+                }
+            }
+            return Ok(());
+        }
         if let Some(b) = self.bridge {
             let st = unsafe { (b.drain)() };
             if st != 0 && self.sticky == 0 {
@@ -268,6 +483,34 @@ impl<S: Read + Write> Client<S> {
             }
             return Ok(());
         }
+        if self.ring.is_some() {
+            if self.deferred >= MAX_DEFERRED {
+                self.drain()?;
+            }
+            if self.sticky != 0 {
+                return Err(CudaRpcError::Cuda(std::mem::take(&mut self.sticky)));
+            }
+            let payload = encode_request(req);
+            if payload.len() < crate::ring::INLINE_MAX {
+                let mut frame = Vec::with_capacity(payload.len() + 1);
+                frame.push(crate::proto::QUIET_PREFIX);
+                frame.extend_from_slice(&payload);
+                self.ring_push(&frame)?;
+                self.deferred += 1;
+            } else {
+                // Oversized quiet frames go indirect, which needs the staging
+                // buffer alive until consumption — round-trip instead and
+                // fold a failure into the sticky slot.
+                let resp = self.ring_roundtrip(&payload)?;
+                if resp.len() >= 4 {
+                    let st = i32::from_le_bytes(resp[..4].try_into().unwrap());
+                    if st != 0 && self.sticky == 0 {
+                        self.sticky = st;
+                    }
+                }
+            }
+            return Ok(());
+        }
         if self.deferred >= MAX_DEFERRED {
             self.drain()?;
         }
@@ -301,7 +544,9 @@ impl<S: Read + Write> Client<S> {
         if std::env::var_os("SMOLVM_CUDA_COUNT_SYNC").is_some() {
             count_sync(req, op);
         }
-        let payload = if let Some(b) = self.bridge {
+        let payload = if self.ring.is_some() {
+            self.ring_roundtrip(&encode_request(req))?
+        } else if let Some(b) = self.bridge {
             bridge_call_vec(&b, &encode_request(req))?
         } else {
             // Flush, don't fence: the host serves in arrival order, so this
@@ -326,6 +571,30 @@ impl<S: Read + Write> Client<S> {
     /// mode (`SMOLVM_CUDA_ASYNC=0`) the request round-trips instead and a
     /// failure status is collected as this connection's sticky error.
     pub fn raw_quiet(&mut self, payload: &[u8]) -> Result<()> {
+        if self.ring.is_some() && self.defer_enabled {
+            if self.deferred >= MAX_DEFERRED {
+                self.drain()?;
+            }
+            if self.sticky != 0 {
+                return Err(CudaRpcError::Cuda(std::mem::take(&mut self.sticky)));
+            }
+            if payload.len() < crate::ring::INLINE_MAX {
+                let mut frame = Vec::with_capacity(payload.len() + 1);
+                frame.push(crate::proto::QUIET_PREFIX);
+                frame.extend_from_slice(payload);
+                self.ring_push(&frame)?;
+                self.deferred += 1;
+            } else {
+                let resp = self.ring_roundtrip(payload)?;
+                if resp.len() >= 4 {
+                    let st = i32::from_le_bytes(resp[..4].try_into().unwrap());
+                    if st != 0 && self.sticky == 0 {
+                        self.sticky = st;
+                    }
+                }
+            }
+            return Ok(());
+        }
         if !self.defer_enabled {
             let resp = self.raw_call(payload)?;
             if resp.len() >= 4 {
@@ -357,6 +626,9 @@ impl<S: Read + Write> Client<S> {
     /// the raw response payload — the status stays in-band for the peer to
     /// decode, so nothing is lost to error mapping.
     pub fn raw_call(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
+        if self.ring.is_some() {
+            return self.ring_roundtrip(payload);
+        }
         // Flush, don't fence — see `call`.
         self.flush_wbuf()?;
         write_msg(&mut self.stream, payload)?;

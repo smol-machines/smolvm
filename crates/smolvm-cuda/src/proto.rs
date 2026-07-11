@@ -106,6 +106,11 @@ pub enum Op {
     /// guest memory directly (one DMA if contiguous, gather otherwise).
     MemcpyGpaHtoD = 0xB2,
     MemcpyGpaDtoH = 0xB3,
+    /// Switch this connection to shared-memory rings (see `crate::ring`):
+    /// the payload names the guest-physical pages of the request ring, the
+    /// completion ring, and a bounce buffer for oversized responses. After
+    /// the host acks, the socket carries only doorbell bytes.
+    RingSetup = 0xD0,
 }
 
 impl Op {
@@ -169,6 +174,7 @@ impl Op {
             0xB1 => Op::MemcpyShmDtoH,
             0xB2 => Op::MemcpyGpaHtoD,
             0xB3 => Op::MemcpyGpaDtoH,
+            0xD0 => Op::RingSetup,
             _ => return None,
         })
     }
@@ -447,6 +453,15 @@ pub enum Request {
         stream: u64,
         segments: Vec<(u64, u64)>,
     },
+    /// Switch to shared-memory rings. Page lists are guest-physical addresses
+    /// of `page_size`-sized pages; `bounce` receives responses too large for
+    /// an inline completion record.
+    RingSetup {
+        page_size: u32,
+        req_pages: Vec<u64>,
+        resp_pages: Vec<u64>,
+        bounce_pages: Vec<u64>,
+    },
 }
 
 /// A decoded successful response body (the `status == 0` payload).
@@ -493,12 +508,12 @@ fn w_str(b: &mut Vec<u8>, v: &str) {
 /// Cursor-based reader over an in-memory payload. Every accessor is
 /// bounds-checked so a malformed/hostile message yields `InvalidData`, never a
 /// panic.
-struct Cur<'a> {
+pub(crate) struct Cur<'a> {
     b: &'a [u8],
     p: usize,
 }
 impl<'a> Cur<'a> {
-    fn new(b: &'a [u8]) -> Self {
+    pub(crate) fn new(b: &'a [u8]) -> Self {
         Cur { b, p: 0 }
     }
     fn take(&mut self, n: usize) -> io::Result<&'a [u8]> {
@@ -516,10 +531,10 @@ impl<'a> Cur<'a> {
     fn i32(&mut self) -> io::Result<i32> {
         Ok(i32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
-    fn u32(&mut self) -> io::Result<u32> {
+    pub(crate) fn u32(&mut self) -> io::Result<u32> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
-    fn u64(&mut self) -> io::Result<u64> {
+    pub(crate) fn u64(&mut self) -> io::Result<u64> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
     fn bytes(&mut self) -> io::Result<Vec<u8>> {
@@ -965,6 +980,21 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
             w_u64(&mut b, *stream);
             w_gpa_segments(&mut b, segments);
         }
+        Request::RingSetup {
+            page_size,
+            req_pages,
+            resp_pages,
+            bounce_pages,
+        } => {
+            w_u8(&mut b, Op::RingSetup as u8);
+            w_u32(&mut b, *page_size);
+            for pages in [req_pages, resp_pages, bounce_pages] {
+                w_u32(&mut b, pages.len() as u32);
+                for gpa in pages {
+                    w_u64(&mut b, *gpa);
+                }
+            }
+        }
     }
     b
 }
@@ -1167,6 +1197,24 @@ pub fn decode_request(payload: &[u8]) -> io::Result<Request> {
             stream: c.u64()?,
             segments: r_gpa_segments(&mut c)?,
         },
+        Op::RingSetup => {
+            let page_size = c.u32()?;
+            let mut lists = [const { Vec::new() }; 3];
+            for list in lists.iter_mut() {
+                let n = c.u32()? as usize;
+                list.reserve(n.min(1 << 16));
+                for _ in 0..n {
+                    list.push(c.u64()?);
+                }
+            }
+            let [req_pages, resp_pages, bounce_pages] = lists;
+            Request::RingSetup {
+                page_size,
+                req_pages,
+                resp_pages,
+                bounce_pages,
+            }
+        }
     })
 }
 
@@ -1268,7 +1316,8 @@ pub fn decode_response(op: Op, payload: &[u8]) -> io::Result<(i32, Response)> {
         | Op::MemcpyShmHtoD
         | Op::MemcpyShmDtoH
         | Op::MemcpyGpaHtoD
-        | Op::MemcpyGpaDtoH => Response::Ok,
+        | Op::MemcpyGpaDtoH
+        | Op::RingSetup => Response::Ok,
     };
     Ok((status, body))
 }

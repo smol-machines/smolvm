@@ -597,6 +597,12 @@ impl Backend for GpuBackend {
         self.guest_ram = regions;
     }
 
+    fn gpa_to_hva(&mut self, gpa: u64, len: u64) -> Option<u64> {
+        self.guest_ram.iter().find_map(|&(gs, hva, rlen)| {
+            (gpa >= gs && gpa.checked_add(len)? <= gs + rlen).then(|| hva + (gpa - gs))
+        })
+    }
+
     fn memcpy_gpa_htod(&mut self, dptr: u64, segments: &[(u64, u64)], stream: u64) -> CuResult<()> {
         if self.guest_ram.is_empty() {
             return Err(super::CUDA_ERROR_NOT_FOUND);

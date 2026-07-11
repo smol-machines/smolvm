@@ -12,6 +12,8 @@
 
 pub mod client;
 pub mod proto;
+/// Shared-memory command/completion rings (low-latency in-VM transport).
+pub mod ring;
 
 /// Shared-memory bulk-data channel (zero-copy memcpy). Linux-only.
 #[cfg(target_os = "linux")]

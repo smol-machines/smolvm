@@ -296,17 +296,77 @@ pub extern "C" fn smolvm_cudart_bridge_drain() -> i32 {
     .unwrap_or(999)
 }
 
+/// Allocate one ring region: pinned pages + their per-page GPAs.
+fn ring_alloc_pages(pages: usize) -> Option<(Vec<*mut u8>, Vec<u64>)> {
+    const PAGE: usize = 4096;
+    let base = guestmem::alloc(pages * PAGE)? as usize;
+    // Zero (also faults every page in before pagemap reads).
+    unsafe { std::ptr::write_bytes(base as *mut u8, 0, pages * PAGE) };
+    let segs = guestmem::segments(base, pages * PAGE)?;
+    let mut gpas = Vec::with_capacity(pages);
+    for (gpa, len) in segs {
+        let mut off = 0;
+        while off < len {
+            gpas.push(gpa + off);
+            off += PAGE as u64;
+        }
+    }
+    if gpas.len() != pages {
+        return None;
+    }
+    Some((
+        (0..pages).map(|i| (base + i * PAGE) as *mut u8).collect(),
+        gpas,
+    ))
+}
+
+/// Try to switch `client` to the shared-memory ring transport. Failure is
+/// fine — the connection simply stays on the socket.
+fn ring_try_setup(client: &mut Client<Stream>) {
+    const PAGE: usize = 4096;
+    let trace = std::env::var_os("SMOLVM_CUDA_SHIM_TRACE").is_some();
+    let Some(req) = ring_alloc_pages(32) else {
+        if trace {
+            eprintln!("[ring] no pinned pages (zerocopy off?) — socket mode");
+        }
+        return;
+    };
+    let (Some(resp), Some(bounce)) = (ring_alloc_pages(8), ring_alloc_pages(64)) else {
+        return;
+    };
+    match client.ring_setup(PAGE, req, resp, bounce) {
+        Ok(()) => {
+            if trace {
+                eprintln!("[ring] shared-memory rings active");
+            }
+        }
+        Err(e) => {
+            if trace {
+                eprintln!("[ring] setup rejected ({e}) — socket mode");
+            }
+        }
+    }
+}
+
 fn with_client<T>(
     f: impl FnOnce(&mut Client<Stream>) -> Result<T, CudaRpcError>,
 ) -> Result<T, c_int> {
     let mut guard = STATE.lock().map_err(|_| CUDA_ERROR_UNKNOWN)?;
     if guard.is_none() {
         let stream = connect()?;
+        #[cfg(target_os = "linux")]
+        let try_ring = matches!(stream, Stream::Vsock(_))
+            && std::env::var("SMOLVM_CUDA_RING").as_deref() != Ok("0");
+        #[cfg(not(target_os = "linux"))]
+        let try_ring = false;
         let mut client = Client::new(stream);
         client.init().map_err(|_| CUDA_ERROR_INITIALIZATION)?;
         let _ = client
             .primary_ctx_retain(0)
             .map_err(|_| CUDA_ERROR_INITIALIZATION)?;
+        if try_ring {
+            ring_try_setup(&mut client); // best-effort; socket mode on failure
+        }
         *guard = Some(ShimState {
             client,
             initialized: true,

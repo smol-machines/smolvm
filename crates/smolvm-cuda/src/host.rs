@@ -215,6 +215,12 @@ pub trait Backend: Send {
     ) -> CuResult<()> {
         Err(CUDA_ERROR_NOT_FOUND)
     }
+    /// Host virtual address of `len` bytes at guest-physical `gpa`, when the
+    /// embedder mapped guest RAM (in-VM only). Rings need long-lived page
+    /// mappings, unlike the per-call `memcpy_gpa_*` segment reads.
+    fn gpa_to_hva(&mut self, _gpa: u64, _len: u64) -> Option<u64> {
+        None
+    }
 }
 
 /// Per-connection opaque→raw handle translation. Ids are dense and monotonic so
@@ -272,6 +278,28 @@ pub fn serve<S: Read + Write>(mut stream: S, backend: &mut dyn Backend) -> std::
                 if std::env::var_os("SMOLVM_CUDA_HOST_OPLOG").is_some() {
                     eprintln!("[op] 0x{:02x} len={}", payload[0], payload.len());
                 }
+                // Transport upgrade: switch this connection to shared-memory
+                // rings and never return to socket framing (the socket then
+                // carries only doorbell bytes).
+                if let Request::RingSetup {
+                    page_size,
+                    req_pages,
+                    resp_pages,
+                    bounce_pages,
+                } = req
+                {
+                    match HostRings::map(backend, page_size, &req_pages, &resp_pages, &bounce_pages)
+                    {
+                        Ok(rings) => {
+                            write_msg(&mut stream, &encode_response(0, &Response::Ok))?;
+                            return serve_rings(stream, backend, sess, quiet_sticky, rings);
+                        }
+                        Err(code) => {
+                            write_msg(&mut stream, &encode_response(code, &Response::Ok))?;
+                            continue;
+                        }
+                    }
+                }
                 let (status, resp) = dispatch(&mut sess, backend, req);
                 if status != 0 && std::env::var_os("SMOLVM_CUDA_HOST_OPLOG").is_some() {
                     eprintln!("[op!] status={status}");
@@ -282,6 +310,257 @@ pub fn serve<S: Read + Write>(mut stream: S, backend: &mut dyn Backend) -> std::
         }
     }
     Ok(())
+}
+
+/// Host mappings of the guest's rings + bounce buffer.
+struct HostRings {
+    req: crate::ring::Ring,
+    resp: crate::ring::Ring,
+    /// Bounce pages (host VAs) for responses too large for an inline record.
+    bounce: Vec<*mut u8>,
+    page_size: usize,
+}
+
+impl HostRings {
+    fn map(
+        backend: &mut dyn Backend,
+        page_size: u32,
+        req_pages: &[u64],
+        resp_pages: &[u64],
+        bounce_pages: &[u64],
+    ) -> Result<HostRings, i32> {
+        let ps = page_size as usize;
+        if ps < crate::ring::HEADER_SIZE + crate::ring::RECORD_SIZE
+            || req_pages.is_empty()
+            || resp_pages.is_empty()
+        {
+            return Err(1); // CUDA_ERROR_INVALID_VALUE
+        }
+        let mut map_all = |gpas: &[u64]| -> Result<Vec<*mut u8>, i32> {
+            gpas.iter()
+                .map(|&gpa| {
+                    backend
+                        .gpa_to_hva(gpa, page_size as u64)
+                        .map(|hva| hva as *mut u8)
+                        .ok_or(CUDA_ERROR_NOT_SUPPORTED)
+                })
+                .collect()
+        };
+        let req = map_all(req_pages)?;
+        let resp = map_all(resp_pages)?;
+        let bounce = map_all(bounce_pages)?;
+        // SAFETY: pages are backed by mapped guest RAM for the VM's lifetime.
+        Ok(HostRings {
+            req: unsafe { crate::ring::Ring::from_pages(req, ps) },
+            resp: unsafe { crate::ring::Ring::from_pages(resp, ps) },
+            bounce,
+            page_size: ps,
+        })
+    }
+
+    /// Copy an oversized response into the bounce buffer. Returns false when
+    /// it doesn't fit (protocol error surfaced to the guest as a status).
+    fn write_bounce(&self, bytes: &[u8]) -> bool {
+        if bytes.len() > self.bounce.len() * self.page_size {
+            return false;
+        }
+        for (i, chunk) in bytes.chunks(self.page_size).enumerate() {
+            // SAFETY: chunk fits within bounce page i (checked above).
+            unsafe {
+                std::ptr::copy_nonoverlapping(chunk.as_ptr(), self.bounce[i], chunk.len());
+            }
+        }
+        true
+    }
+}
+
+/// Ring-mode serve loop: requests pop from the guest's request ring,
+/// responses push to the completion ring; the socket carries doorbells only.
+fn serve_rings<S: Read + Write>(
+    mut stream: S,
+    backend: &mut dyn Backend,
+    mut sess: Session,
+    mut quiet_sticky: i32,
+    rings: HostRings,
+) -> std::io::Result<()> {
+    use crate::ring::LEN_INDIRECT;
+    let oplog = std::env::var_os("SMOLVM_CUDA_HOST_OPLOG").is_some();
+    // Reassembly buffer for oversized frames arriving as bounce chunks.
+    let mut pending: Vec<u8> = Vec::new();
+    // Push one response. Oversized ones chunk through the bounce pages: the
+    // guest posts a continue record (16×0xFF, LEN_INDIRECT) on the request
+    // ring after copying each non-final chunk out — unambiguous because a
+    // blocked guest can't send anything else. Doorbell on park either way.
+    fn respond<S: Read + Write>(
+        rings: &HostRings,
+        stream: &mut S,
+        bytes: &[u8],
+    ) -> std::io::Result<()> {
+        let kick = |stream: &mut S| -> std::io::Result<()> {
+            if rings_take_parked(rings) {
+                stream.write_all(&[1u8])?;
+                stream.flush()?;
+            }
+            Ok(())
+        };
+        fn rings_take_parked(rings: &HostRings) -> bool {
+            rings.resp.take_parked()
+        }
+        if bytes.len() <= crate::ring::INLINE_MAX {
+            while !rings.resp.try_push(bytes, 0) {
+                std::hint::spin_loop(); // guest drains sync responses promptly
+            }
+            return kick(stream);
+        }
+        let cap = rings.bounce.len() * rings.page_size;
+        let total = bytes.len();
+        let mut off = 0;
+        while off < total {
+            let chunk = (total - off).min(cap);
+            if !rings.write_bounce(&bytes[off..off + chunk]) {
+                return Err(std::io::Error::other("ring: bounce write failed"));
+            }
+            let mut hdr = [0u8; 16];
+            hdr[..8].copy_from_slice(&(total as u64).to_le_bytes());
+            hdr[8..].copy_from_slice(&(chunk as u64).to_le_bytes());
+            while !rings.resp.try_push(&hdr, LEN_INDIRECT) {
+                std::hint::spin_loop();
+            }
+            kick(stream)?;
+            off += chunk;
+            if off < total {
+                // Await the guest's continue record before refilling.
+                loop {
+                    if let Some((p, f)) = rings.req.try_pop() {
+                        if f & LEN_INDIRECT != 0 && p == [0xFF; 16] {
+                            break;
+                        }
+                        return Err(std::io::Error::other("ring: expected continue"));
+                    }
+                    std::hint::spin_loop();
+                }
+            }
+        }
+        Ok(())
+    }
+    loop {
+        let (payload, flags) = match rings.req.try_pop() {
+            Some(rec) => rec,
+            None => {
+                // Adaptive wait: spin briefly, then park and block on a
+                // doorbell byte from the guest.
+                let mut found = None;
+                for _ in 0..20_000 {
+                    if let Some(rec) = rings.req.try_pop() {
+                        found = Some(rec);
+                        break;
+                    }
+                    std::hint::spin_loop();
+                }
+                match found {
+                    Some(rec) => rec,
+                    None => {
+                        if !rings.req.park() {
+                            let mut byte = [0u8; 1];
+                            match stream.read(&mut byte) {
+                                Ok(0) => return Ok(()), // guest closed
+                                Ok(_) => {}
+                                Err(e) => return Err(e),
+                            }
+                            rings.req.unpark();
+                        }
+                        continue;
+                    }
+                }
+            }
+        };
+        // Oversized frame: chunks arrive through the bounce pages. Every
+        // non-final chunk is acked (so the guest can refill the pages); the
+        // final chunk completes the frame, which dispatches below and whose
+        // own response closes the exchange.
+        let frame: Vec<u8> = if flags & LEN_INDIRECT != 0 {
+            if payload.len() < 16 {
+                return Err(std::io::Error::other("ring: short chunk record"));
+            }
+            let total = u64::from_le_bytes(payload[..8].try_into().unwrap()) as usize;
+            let chunk = u64::from_le_bytes(payload[8..16].try_into().unwrap()) as usize;
+            if total > crate::proto::MAX_MSG || chunk > rings.bounce.len() * rings.page_size {
+                return Err(std::io::Error::other("ring: oversized chunk"));
+            }
+            let mut left = chunk;
+            for &page in &rings.bounce {
+                if left == 0 {
+                    break;
+                }
+                let take = left.min(rings.page_size);
+                // SAFETY: bounce pages are mapped guest RAM.
+                unsafe {
+                    pending.extend_from_slice(std::slice::from_raw_parts(page, take));
+                }
+                left -= take;
+            }
+            if pending.len() < total {
+                // Ack the chunk so the guest may refill the bounce pages.
+                respond(&rings, &mut stream, &encode_response(0, &Response::Ok))?;
+                continue;
+            }
+            std::mem::take(&mut pending)
+        } else {
+            payload
+        };
+        match frame.first() {
+            Some(&crate::proto::QUIET_PREFIX) => {
+                let req = match decode_request(&frame[1..]) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!(
+                            "[ring-dbg] malformed QUIET frame len={} head={:02x?}",
+                            frame.len(),
+                            &frame[..frame.len().min(12)]
+                        );
+                        return Err(e);
+                    }
+                };
+                if oplog {
+                    eprintln!("[op~] 0x{:02x} len={}", frame[1], frame.len());
+                }
+                let (status, _) = dispatch(&mut sess, backend, req);
+                if status != 0 {
+                    if oplog {
+                        eprintln!("[op~!] status={status}");
+                    }
+                    if quiet_sticky == 0 {
+                        quiet_sticky = status;
+                    }
+                }
+            }
+            Some(&crate::proto::FENCE_OP) if frame.len() == 1 => {
+                let st = std::mem::take(&mut quiet_sticky);
+                respond(&rings, &mut stream, &encode_response(st, &Response::Ok))?;
+            }
+            _ => {
+                let req = match decode_request(&frame) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!(
+                            "[ring-dbg] malformed frame len={} head={:02x?}",
+                            frame.len(),
+                            &frame[..frame.len().min(12)]
+                        );
+                        return Err(e);
+                    }
+                };
+                if oplog {
+                    eprintln!("[op] 0x{:02x} len={}", frame[0], frame.len());
+                }
+                let (status, resp) = dispatch(&mut sess, backend, req);
+                if status != 0 && oplog {
+                    eprintln!("[op!] status={status}");
+                }
+                respond(&rings, &mut stream, &encode_response(status, &resp))?;
+            }
+        }
+    }
 }
 
 fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Response) {
@@ -637,6 +916,9 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         } => b
             .memcpy_gpa_dtoh(dptr, &segments, raw_stream(sess, stream)?)
             .map(|_| Response::Ok),
+        // Handled by the serve loop (transport concern, not a backend op);
+        // reaching dispatch means the transport doesn't support rings.
+        Request::RingSetup { .. } => Err(CUDA_ERROR_NOT_SUPPORTED),
     })();
     match r {
         Ok(resp) => (0, resp),
@@ -657,6 +939,9 @@ pub struct CpuBackend {
     mem: HashMap<u64, Vec<u8>>,
     fn_names: HashMap<u64, String>,
     next_handle: u64,
+    /// Guest-RAM mappings, same shape as the GPU backend's — lets the ring
+    /// transport (and its tests) run without a GPU.
+    guest_ram: Vec<(u64, u64, u64)>,
 }
 
 impl Default for CpuBackend {
@@ -666,6 +951,7 @@ impl Default for CpuBackend {
             mem: HashMap::new(),
             fn_names: HashMap::new(),
             next_handle: 1,
+            guest_ram: Vec::new(),
         }
     }
 }
@@ -688,6 +974,14 @@ fn read_u32(p: &[u8]) -> Option<u32> {
 impl Backend for CpuBackend {
     fn init(&mut self) -> CuResult<()> {
         Ok(())
+    }
+    fn set_guest_ram(&mut self, regions: Vec<(u64, u64, u64)>) {
+        self.guest_ram = regions;
+    }
+    fn gpa_to_hva(&mut self, gpa: u64, len: u64) -> Option<u64> {
+        self.guest_ram.iter().find_map(|&(gs, hva, rlen)| {
+            (gpa >= gs && gpa.checked_add(len)? <= gs + rlen).then(|| hva + (gpa - gs))
+        })
     }
     fn device_get_count(&mut self) -> CuResult<i32> {
         Ok(1)
@@ -1202,6 +1496,112 @@ mod tests {
         let expect: Vec<f32> = (0..n).map(|i| (3 * i) as f32).collect();
         assert_eq!(c, expect);
         drop(cli); // closes client_side → server sees EOF
+        server.join().unwrap();
+    }
+    // Ring transport end-to-end: handshake over the socket, then requests
+    // (inline quiet, indirect oversized, fence) through shared memory with
+    // bounce-buffer responses — no GPU, no VM.
+    #[test]
+    fn ring_transport_end_to_end() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::mpsc::{Receiver, Sender};
+        struct Chan {
+            tx: Sender<u8>,
+            rx: Receiver<u8>,
+        }
+        impl Write for Chan {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                for &x in buf {
+                    self.tx
+                        .send(x)
+                        .map_err(|_| std::io::ErrorKind::BrokenPipe)?;
+                }
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl Read for Chan {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if buf.is_empty() {
+                    return Ok(0);
+                }
+                match self.rx.recv() {
+                    Ok(b) => {
+                        buf[0] = b;
+                        Ok(1)
+                    }
+                    Err(_) => Ok(0), // EOF
+                }
+            }
+        }
+
+        // In-process fake guest RAM: identity-mapped (GPA == host VA), so
+        // any heap address — ring pages and indirect staging buffers alike —
+        // resolves. The aligned ring pages are leaked so both threads may
+        // hold pointers.
+        const PAGES: usize = 64;
+        const PAGE: usize = 4096;
+        let _ = AtomicUsize::new(0); // (kept import happy on older toolchains)
+        let layout = std::alloc::Layout::from_size_align(PAGES * PAGE, PAGE).unwrap();
+        // SAFETY: fresh allocation, zeroed, intentionally leaked.
+        let hva = unsafe {
+            let p = std::alloc::alloc_zeroed(layout);
+            assert!(!p.is_null());
+            p as usize
+        };
+
+        let (c2s_tx, c2s_rx) = std::sync::mpsc::channel();
+        let (s2c_tx, s2c_rx) = std::sync::mpsc::channel();
+        let server_side = Chan {
+            tx: s2c_tx,
+            rx: c2s_rx,
+        };
+        let client_side = Chan {
+            tx: c2s_tx,
+            rx: s2c_rx,
+        };
+        let server = std::thread::spawn(move || {
+            let mut b = CpuBackend::default();
+            b.set_guest_ram(vec![(0, 0, u64::MAX / 2)]); // identity: hva == gpa
+            let r = serve(server_side, &mut b);
+            eprintln!("[test] serve exited: {r:?}");
+        });
+
+        let mut cli = Client::new(client_side);
+        cli.init().unwrap();
+        let vas = |r: std::ops::Range<usize>| -> Vec<*mut u8> {
+            r.map(|i| (hva + i * PAGE) as *mut u8).collect()
+        };
+        let gpas = |r: std::ops::Range<usize>| -> Vec<u64> {
+            r.map(|i| (hva + i * PAGE) as u64).collect()
+        };
+        cli.ring_setup(
+            PAGE,
+            (vas(0..8), gpas(0..8)),
+            (vas(8..16), gpas(8..16)),
+            (vas(16..24), gpas(16..24)),
+        )
+        .unwrap();
+        assert!(cli.is_ring());
+
+        // Sync op over the ring (inline both ways).
+        assert_eq!(cli.device_get_count().unwrap(), 1);
+        let d = cli.mem_alloc(8192).unwrap();
+        // Deferred quiet op, inline record.
+        cli.memcpy_htod(d, &[9u8; 64], 0).unwrap();
+        // Fence over the ring settles it.
+        cli.drain().unwrap();
+        assert_eq!(cli.take_sticky(), 0);
+        // Oversized write: multi-chunk through the 32 KiB bounce staging.
+        let big: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+        let d2 = cli.mem_alloc(big.len() as u64).unwrap();
+        cli.memcpy_htod(d2, &big, 0).unwrap();
+        // Oversized read: response spills through the same bounce pages.
+        let back = cli.memcpy_dtoh(d2, big.len() as u64, 0).unwrap();
+        assert_eq!(back, big);
+        drop(cli);
         server.join().unwrap();
     }
 }
