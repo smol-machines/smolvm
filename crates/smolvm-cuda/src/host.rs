@@ -234,6 +234,35 @@ struct Session {
     streams: HashMap<u64, u64>,
     events: HashMap<u64, u64>,
     cublas_handles: HashMap<u64, u64>,
+    /// Live resources this connection created, reclaimed when it ends —
+    /// a guest that dies mid-run must not leak GPU memory (device
+    /// allocations are the multi-GB hazard; modules/streams/events are
+    /// hygiene). Raw backend handles.
+    owned_dptrs: std::collections::HashSet<u64>,
+    owned_modules: std::collections::HashSet<u64>,
+    owned_streams: std::collections::HashSet<u64>,
+    owned_events: std::collections::HashSet<u64>,
+    primary_retains: u32,
+}
+
+/// Free everything a finished connection still owns. Failures are ignored —
+/// the driver may already have reclaimed (context destruction, device reset).
+fn reclaim_session(sess: &mut Session, b: &mut dyn Backend) {
+    for d in std::mem::take(&mut sess.owned_dptrs) {
+        let _ = b.mem_free(d);
+    }
+    for m in std::mem::take(&mut sess.owned_modules) {
+        let _ = b.module_unload(m);
+    }
+    for st in std::mem::take(&mut sess.owned_streams) {
+        let _ = b.stream_destroy(st);
+    }
+    for e in std::mem::take(&mut sess.owned_events) {
+        let _ = b.event_destroy(e);
+    }
+    for _ in 0..std::mem::take(&mut sess.primary_retains) {
+        let _ = b.primary_ctx_release(0);
+    }
 }
 
 impl Session {
@@ -245,8 +274,20 @@ impl Session {
 
 /// Serve one CUDA-RPC connection to completion (until the peer closes). Each
 /// request is dispatched to `backend`; returns on clean EOF.
-pub fn serve<S: Read + Write>(mut stream: S, backend: &mut dyn Backend) -> std::io::Result<()> {
+pub fn serve<S: Read + Write>(stream: S, backend: &mut dyn Backend) -> std::io::Result<()> {
     let mut sess = Session::default();
+    let r = serve_inner(stream, backend, &mut sess);
+    // The connection is over (guest exit, crash, or transport error): free
+    // everything it still owns so a dead client can't hold GPU memory.
+    reclaim_session(&mut sess, backend);
+    r
+}
+
+fn serve_inner<S: Read + Write>(
+    mut stream: S,
+    backend: &mut dyn Backend,
+    sess: &mut Session,
+) -> std::io::Result<()> {
     // First failure among quiet (fire-and-forget) requests since the last
     // fence. Quiet requests get no response at all — the client collects
     // failures with one Fence round-trip instead of reading N per-op replies,
@@ -260,7 +301,7 @@ pub fn serve<S: Read + Write>(mut stream: S, backend: &mut dyn Backend) -> std::
                 if std::env::var_os("SMOLVM_CUDA_HOST_OPLOG").is_some() {
                     eprintln!("[op~] 0x{:02x} len={}", payload[1], payload.len());
                 }
-                let (status, _) = dispatch(&mut sess, backend, req);
+                let (status, _) = dispatch(sess, backend, req);
                 if status != 0 && std::env::var_os("SMOLVM_CUDA_HOST_OPLOG").is_some() {
                     eprintln!("[op~!] status={status}");
                 }
@@ -293,6 +334,7 @@ pub fn serve<S: Read + Write>(mut stream: S, backend: &mut dyn Backend) -> std::
                         Ok(rings) => {
                             write_msg(&mut stream, &encode_response(0, &Response::Ok))?;
                             return serve_rings(stream, backend, sess, quiet_sticky, rings);
+                            // (session reclaimed by `serve` on return)
                         }
                         Err(code) => {
                             write_msg(&mut stream, &encode_response(code, &Response::Ok))?;
@@ -300,7 +342,7 @@ pub fn serve<S: Read + Write>(mut stream: S, backend: &mut dyn Backend) -> std::
                         }
                     }
                 }
-                let (status, resp) = dispatch(&mut sess, backend, req);
+                let (status, resp) = dispatch(sess, backend, req);
                 if status != 0 && std::env::var_os("SMOLVM_CUDA_HOST_OPLOG").is_some() {
                     eprintln!("[op!] status={status}");
                 }
@@ -379,7 +421,7 @@ impl HostRings {
 fn serve_rings<S: Read + Write>(
     mut stream: S,
     backend: &mut dyn Backend,
-    mut sess: Session,
+    sess: &mut Session,
     mut quiet_sticky: i32,
     rings: HostRings,
 ) -> std::io::Result<()> {
@@ -524,7 +566,7 @@ fn serve_rings<S: Read + Write>(
                 if oplog {
                     eprintln!("[op~] 0x{:02x} len={}", frame[1], frame.len());
                 }
-                let (status, _) = dispatch(&mut sess, backend, req);
+                let (status, _) = dispatch(sess, backend, req);
                 if status != 0 {
                     if oplog {
                         eprintln!("[op~!] status={status}");
@@ -553,7 +595,7 @@ fn serve_rings<S: Read + Write>(
                 if oplog {
                     eprintln!("[op] 0x{:02x} len={}", frame[0], frame.len());
                 }
-                let (status, resp) = dispatch(&mut sess, backend, req);
+                let (status, resp) = dispatch(sess, backend, req);
                 if status != 0 && oplog {
                     eprintln!("[op!] status={status}");
                 }
@@ -609,15 +651,18 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         }
         Request::PrimaryCtxRetain { device } => {
             let raw = b.primary_ctx_retain(device)?;
+            sess.primary_retains += 1;
             let id = sess.mint();
             sess.contexts.insert(id, raw);
             Ok(Response::Handle(id))
         }
         Request::PrimaryCtxRelease { device } => {
+            sess.primary_retains = sess.primary_retains.saturating_sub(1);
             b.primary_ctx_release(device).map(|_| Response::Ok)
         }
         Request::ModuleLoadData { image } => {
             let raw = b.module_load_data(&image)?;
+            sess.owned_modules.insert(raw);
             let id = sess.mint();
             sess.modules.insert(id, raw);
             Ok(Response::Handle(id))
@@ -632,6 +677,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         Request::ModuleUnload { module } => {
             let raw_mod = raw(&sess.modules, module)?;
             b.module_unload(raw_mod)?;
+            sess.owned_modules.remove(&raw_mod);
             sess.modules.remove(&module);
             Ok(Response::Ok)
         }
@@ -653,8 +699,14 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             b.func_set_attribute(raw_fn, attrib, value)
                 .map(|_| Response::Ok)
         }
-        Request::MemAlloc { bytes } => b.mem_alloc(bytes).map(Response::Dptr),
-        Request::MemFree { dptr } => b.mem_free(dptr).map(|_| Response::Ok),
+        Request::MemAlloc { bytes } => b.mem_alloc(bytes).map(|d| {
+            sess.owned_dptrs.insert(d);
+            Response::Dptr(d)
+        }),
+        Request::MemFree { dptr } => {
+            sess.owned_dptrs.remove(&dptr);
+            b.mem_free(dptr).map(|_| Response::Ok)
+        }
         Request::MemcpyHtoD { dptr, stream, data } => b
             .memcpy_htod(dptr, &data, raw_stream(sess, stream)?)
             .map(|_| Response::Ok),
@@ -693,7 +745,10 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         // on one is garbage on the other: torch's capture stream (runtime)
         // fed to a Triton kernel launch (driver) came back INVALID_HANDLE.
         // Raw pointers are valid on every connection, like device pointers.
-        Request::StreamCreate { flags } => b.stream_create(flags).map(Response::Handle),
+        Request::StreamCreate { flags } => b.stream_create(flags).map(|st| {
+            sess.owned_streams.insert(st);
+            Response::Handle(st)
+        }),
         Request::StreamBeginCapture { stream, mode } => {
             let raw = raw_stream(sess, stream)?;
             b.stream_begin_capture(raw, mode).map(|_| Response::Ok)
@@ -743,6 +798,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         Request::StreamDestroy { stream } => {
             let raw = raw_stream(sess, stream)?;
             b.stream_destroy(raw)?;
+            sess.owned_streams.remove(&raw);
             sess.streams.remove(&stream);
             Ok(Response::Ok)
         }
@@ -767,10 +823,14 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         // Events are raw host pointers on the wire, same as streams (see
         // StreamCreate): context-scoped, and one guest process talks over
         // several connections that must all understand the same handle.
-        Request::EventCreate { flags } => b.event_create(flags).map(Response::Handle),
+        Request::EventCreate { flags } => b.event_create(flags).map(|e| {
+            sess.owned_events.insert(e);
+            Response::Handle(e)
+        }),
         Request::EventDestroy { event } => {
             let raw = raw_event(sess, event)?;
             b.event_destroy(raw)?;
+            sess.owned_events.remove(&raw);
             sess.events.remove(&event);
             Ok(Response::Ok)
         }
