@@ -2263,7 +2263,7 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
 name = "smolfile"
-version = "1.4.7"
+version = "1.5.0"
 dependencies = [
  "serde",
  "smolvm-protocol",
@@ -2289,7 +2289,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm"
-version = "1.4.7"
+version = "1.5.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -2344,7 +2344,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-agent"
-version = "1.4.7"
+version = "1.5.0"
 dependencies = [
  "flate2",
  "lazy_static",
@@ -2365,7 +2365,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-cuda"
-version = "1.3.1"
+version = "1.5.0"
 dependencies = [
  "libc",
  "libloading",
@@ -2373,11 +2373,11 @@ dependencies = [
 
 [[package]]
 name = "smolvm-cuda-codegen"
-version = "1.3.1"
+version = "1.5.0"
 
 [[package]]
 name = "smolvm-cuda-guest"
-version = "1.3.1"
+version = "1.5.0"
 dependencies = [
  "smolvm-cuda",
  "vsock",
@@ -2385,7 +2385,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-cuda-shim"
-version = "1.3.1"
+version = "1.5.0"
 dependencies = [
  "smolvm-cuda",
  "vsock",
@@ -2393,7 +2393,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-cudart-shim"
-version = "1.3.1"
+version = "1.5.0"
 dependencies = [
  "libc",
  "smolvm-cuda",
@@ -2402,7 +2402,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-network"
-version = "1.4.7"
+version = "1.5.0"
 dependencies = [
  "crossbeam-queue",
  "humantime",
@@ -2414,7 +2414,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-pack"
-version = "1.4.7"
+version = "1.5.0"
 dependencies = [
  "crc32fast",
  "dirs",
@@ -2433,7 +2433,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-protocol"
-version = "1.4.7"
+version = "1.5.0"
 dependencies = [
  "base64",
  "serde",
@@ -2443,7 +2443,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-registry"
-version = "1.4.7"
+version = "1.5.0"
 dependencies = [
  "bytes",
  "dirs",
