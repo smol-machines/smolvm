@@ -1349,9 +1349,24 @@ impl CublasLt {
         &self,
         func: u16,
         args: &[u8],
-        vh: &std::collections::HashMap<u64, u64>,
+        vh: &mut std::collections::HashMap<u64, u64>,
         streams: &std::collections::HashMap<u64, u64>,
     ) -> (i32, Vec<u8>) {
+        // Fire-and-forget creates append a guest-minted virtual id after the
+        // regular args; register it so later (deferred) calls resolve.
+        fn register_vh(
+            vh: &mut std::collections::HashMap<u64, u64>,
+            args: &[u8],
+            fixed: usize,
+            real: u64,
+        ) {
+            if args.len() >= fixed + 8 {
+                let id = u64::from_le_bytes(args[fixed..fixed + 8].try_into().unwrap());
+                if id & VHANDLE_TAG != 0 {
+                    vh.insert(id, real);
+                }
+            }
+        }
         // sizeof(cublasLtMatmulHeuristicResult_t): algo[64] + workspaceSize(8)
         // + state(4) + wavesCount(4) + reserved[4](16) = 96 bytes.
         const HEUR_RESULT_SZ: usize = 96;
@@ -1365,15 +1380,21 @@ impl CublasLt {
                 let scale = rd_i32(4);
                 let mut d: *mut c_void = std::ptr::null_mut();
                 let st = unsafe { (self.desc_create)(&mut d, compute, scale) };
+                register_vh(vh, args, 8, d as u64);
                 (st, (d as u64).to_le_bytes().to_vec())
             }
-            1 => (
-                unsafe { (self.desc_destroy)(rd_u64(0) as *mut c_void) },
-                Vec::new(),
-            ),
+            1 => {
+                let id = rd_u64(0);
+                let real = vh_resolve(vh, id);
+                vh.remove(&id);
+                (
+                    unsafe { (self.desc_destroy)(real as *mut c_void) },
+                    Vec::new(),
+                )
+            }
             2 => {
                 // desc_set_attr(desc, attr, buf, size)
-                let desc = rd_u64(0) as *mut c_void;
+                let desc = vh_resolve(vh, rd_u64(0)) as *mut c_void;
                 let attr = rd_i32(8);
                 let buf = &args[12..];
                 let st =
@@ -1388,14 +1409,20 @@ impl CublasLt {
                 let ld = rd_i64(20);
                 let mut l: *mut c_void = std::ptr::null_mut();
                 let st = unsafe { (self.layout_create)(&mut l, ty, rows, cols, ld) };
+                register_vh(vh, args, 28, l as u64);
                 (st, (l as u64).to_le_bytes().to_vec())
             }
-            4 => (
-                unsafe { (self.layout_destroy)(rd_u64(0) as *mut c_void) },
-                Vec::new(),
-            ),
+            4 => {
+                let id = rd_u64(0);
+                let real = vh_resolve(vh, id);
+                vh.remove(&id);
+                (
+                    unsafe { (self.layout_destroy)(real as *mut c_void) },
+                    Vec::new(),
+                )
+            }
             5 => {
-                let layout = rd_u64(0) as *mut c_void;
+                let layout = vh_resolve(vh, rd_u64(0)) as *mut c_void;
                 let attr = rd_i32(8);
                 let buf = &args[12..];
                 let st =
@@ -1406,14 +1433,20 @@ impl CublasLt {
                 // pref_create() -> handle
                 let mut p: *mut c_void = std::ptr::null_mut();
                 let st = unsafe { (self.pref_create)(&mut p) };
+                register_vh(vh, args, 0, p as u64);
                 (st, (p as u64).to_le_bytes().to_vec())
             }
-            7 => (
-                unsafe { (self.pref_destroy)(rd_u64(0) as *mut c_void) },
-                Vec::new(),
-            ),
+            7 => {
+                let id = rd_u64(0);
+                let real = vh_resolve(vh, id);
+                vh.remove(&id);
+                (
+                    unsafe { (self.pref_destroy)(real as *mut c_void) },
+                    Vec::new(),
+                )
+            }
             8 => {
-                let pref = rd_u64(0) as *mut c_void;
+                let pref = vh_resolve(vh, rd_u64(0)) as *mut c_void;
                 let attr = rd_i32(8);
                 let buf = &args[12..];
                 let st =
@@ -1424,12 +1457,12 @@ impl CublasLt {
                 // algo_get_heuristic(light, opDesc, A, B, C, D, pref, requested)
                 //   -> returnCount + returnCount * heuristicResult structs.
                 let light = vh_resolve(vh, rd_u64(0)) as *mut c_void;
-                let op = rd_u64(8) as *mut c_void;
-                let a = rd_u64(16) as *mut c_void;
-                let b = rd_u64(24) as *mut c_void;
-                let c = rd_u64(32) as *mut c_void;
-                let d = rd_u64(40) as *mut c_void;
-                let pref = rd_u64(48) as *mut c_void;
+                let op = vh_resolve(vh, rd_u64(8)) as *mut c_void;
+                let a = vh_resolve(vh, rd_u64(16)) as *mut c_void;
+                let b = vh_resolve(vh, rd_u64(24)) as *mut c_void;
+                let c = vh_resolve(vh, rd_u64(32)) as *mut c_void;
+                let d = vh_resolve(vh, rd_u64(40)) as *mut c_void;
+                let pref = vh_resolve(vh, rd_u64(48)) as *mut c_void;
                 let requested = rd_i32(56).max(0);
                 let mut results = vec![0u8; requested as usize * HEUR_RESULT_SZ];
                 let mut count: c_int = 0;
@@ -1456,17 +1489,17 @@ impl CublasLt {
                 // matmul(light, desc, alpha[16], A, Adesc, B, Bdesc, beta[16],
                 //   C, Cdesc, D, Ddesc, algo[64], workspace, wsSize, stream)
                 let light = vh_resolve(vh, rd_u64(0)) as *mut c_void;
-                let desc = rd_u64(8) as *mut c_void;
+                let desc = vh_resolve(vh, rd_u64(8)) as *mut c_void;
                 let alpha = &args[16..32];
                 let a = rd_u64(32) as *mut c_void;
-                let adesc = rd_u64(40) as *mut c_void;
+                let adesc = vh_resolve(vh, rd_u64(40)) as *mut c_void;
                 let b = rd_u64(48) as *mut c_void;
-                let bdesc = rd_u64(56) as *mut c_void;
+                let bdesc = vh_resolve(vh, rd_u64(56)) as *mut c_void;
                 let beta = &args[64..80];
                 let c = rd_u64(80) as *mut c_void;
-                let cdesc = rd_u64(88) as *mut c_void;
+                let cdesc = vh_resolve(vh, rd_u64(88)) as *mut c_void;
                 let dd = rd_u64(96) as *mut c_void;
-                let ddesc = rd_u64(104) as *mut c_void;
+                let ddesc = vh_resolve(vh, rd_u64(104)) as *mut c_void;
                 let algo = &args[112..176];
                 let algo_present = rd_u64(176) != 0;
                 let workspace = rd_u64(184) as *mut c_void;
@@ -2199,11 +2232,12 @@ impl GpuBackend {
                         }
                     }
                 }
-                Ok(self
-                    .cublaslt
-                    .as_ref()
-                    .unwrap()
-                    .dispatch(func, args, &self.vhandles, streams))
+                Ok(self.cublaslt.as_ref().unwrap().dispatch(
+                    func,
+                    args,
+                    &mut self.vhandles,
+                    streams,
+                ))
             }
             LIB_CUDNN_BN => {
                 if self.cudnn_bn.is_none() {

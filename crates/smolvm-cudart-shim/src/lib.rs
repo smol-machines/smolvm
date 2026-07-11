@@ -1783,6 +1783,19 @@ pub extern "C" fn cudaFuncGetAttributes(attr: *mut c_void, _func: *const c_void)
 /// The runtime and driver enum values coincide, so `attr` passes through.
 #[no_mangle]
 pub extern "C" fn cudaFuncSetAttribute(func: *const c_void, attr: c_int, value: c_int) -> c_int {
+    // Kernels re-assert the same attribute before every launch (FlashAttention
+    // raises the shared-memory cap each call) — skip repeats, each was a sync
+    // round-trip.
+    static APPLIED: Mutex<Option<HashMap<(usize, c_int), c_int>>> = Mutex::new(None);
+    if APPLIED
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .get(&(func as usize, attr))
+        == Some(&value)
+    {
+        return CUDA_SUCCESS;
+    }
     let r = with_state(|s| {
         let fid = s
             .funcs
@@ -1793,6 +1806,13 @@ pub extern "C" fn cudaFuncSetAttribute(func: *const c_void, attr: c_int, value: 
             .func_set_attribute(fid, attr, value)
             .map_err(map_err)
     });
+    if r.is_ok() {
+        APPLIED
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert((func as usize, attr), value);
+    }
     set_last(r.err().unwrap_or(CUDA_SUCCESS))
 }
 #[no_mangle]
@@ -2446,6 +2466,51 @@ pub extern "C" fn cudnnBackendExecute(
 const LIB_CUBLASLT: u8 = 4;
 const CUBLAS_STATUS_SUCCESS: c_int = 0;
 const CUBLAS_STATUS_NOT_INITIALIZED: c_int = 1;
+
+// ---- cuBLASLt descriptor fast path -------------------------------------------
+// torch builds desc + layouts + preference around EVERY Linear matmul; sync
+// round-trips here dominated eager decode (125k of 184k). Creates are
+// fire-and-forget with guest-minted virtual ids (bit-63-tagged, host maps
+// them), Set/Destroy defer, and AlgoGetHeuristic memoizes on the CONTENT of
+// the descriptors (ids change every step; the shapes repeat).
+/// Live Lt handle → content fingerprint (create args + every attr write).
+static LT_FP: Mutex<Option<HashMap<u64, Vec<u8>>>> = Mutex::new(None);
+/// Heuristic memo entry: (status, out blob).
+type LtHeurEntry = (c_int, Vec<u8>);
+/// Heuristic memo: concatenated fingerprints + request → result.
+static LT_HEUR_MEMO: Mutex<Option<HashMap<Vec<u8>, LtHeurEntry>>> = Mutex::new(None);
+
+fn lt_mint(create_args: &[u8]) -> u64 {
+    // Share the process-wide virtual-handle counter (alloc_vhandle) — a
+    // second counter minted colliding ids and clobbered the host's map.
+    let id = alloc_vhandle();
+    let mut g = LT_FP.lock().unwrap();
+    g.get_or_insert_with(HashMap::new)
+        .insert(id, create_args.to_vec());
+    id
+}
+
+fn lt_fp_append(handle: u64, attr: c_int, buf: &[u8]) {
+    let mut g = LT_FP.lock().unwrap();
+    if let Some(fp) = g.get_or_insert_with(HashMap::new).get_mut(&handle) {
+        fp.extend_from_slice(&attr.to_le_bytes());
+        fp.extend_from_slice(&(buf.len() as u32).to_le_bytes());
+        fp.extend_from_slice(buf);
+    }
+}
+
+fn lt_fp_of(handle: u64) -> Vec<u8> {
+    let mut g = LT_FP.lock().unwrap();
+    g.get_or_insert_with(HashMap::new)
+        .get(&handle)
+        .cloned()
+        .unwrap_or_else(|| handle.to_le_bytes().to_vec())
+}
+
+fn lt_fp_drop(handle: u64) {
+    let mut g = LT_FP.lock().unwrap();
+    g.get_or_insert_with(HashMap::new).remove(&handle);
+}
 /// sizeof(cublasLtMatmulHeuristicResult_t): algo[64]+workspaceSize(8)+state(4)
 /// +wavesCount(4)+reserved[4](16). Must match the host.
 const LT_HEUR_RESULT_SZ: usize = 96;
@@ -2485,26 +2550,26 @@ pub extern "C" fn cublasLtMatmulDescCreate(
     if matmul_desc.is_null() {
         return CUBLAS_STATUS_NOT_INITIALIZED;
     }
-    let mut a = Vec::with_capacity(8);
+    let mut a = Vec::with_capacity(16);
     a.extend_from_slice(&compute_type.to_le_bytes());
     a.extend_from_slice(&scale_type.to_le_bytes());
-    match with_client(|c| c.lib_call(LIB_CUBLASLT, 0, a)) {
-        Ok((0, out)) if out.len() >= 8 => {
-            unsafe {
-                *matmul_desc = u64::from_le_bytes(out[..8].try_into().unwrap()) as *mut c_void
-            };
+    let vh = lt_mint(&a);
+    a.extend_from_slice(&vh.to_le_bytes());
+    match with_client(|c| c.lib_call_deferred(LIB_CUBLASLT, 0, a)) {
+        Ok(()) => {
+            unsafe { *matmul_desc = vh as *mut c_void };
             CUBLAS_STATUS_SUCCESS
         }
-        Ok((st, _)) => st,
         Err(_) => CUBLAS_STATUS_NOT_INITIALIZED,
     }
 }
 
 #[no_mangle]
 pub extern "C" fn cublasLtMatmulDescDestroy(matmul_desc: *mut c_void) -> c_int {
+    lt_fp_drop(matmul_desc as u64);
     let a = (matmul_desc as u64).to_le_bytes().to_vec();
-    match with_client(|c| c.lib_call(LIB_CUBLASLT, 1, a)) {
-        Ok((st, _)) => st,
+    match with_client(|c| c.lib_call_deferred(LIB_CUBLASLT, 1, a)) {
+        Ok(()) => CUBLAS_STATUS_SUCCESS,
         Err(_) => CUBLAS_STATUS_NOT_INITIALIZED,
     }
 }
@@ -2521,11 +2586,15 @@ fn lt_set_attr(
     let mut a = Vec::with_capacity(12 + size);
     a.extend_from_slice(&(handle as u64).to_le_bytes());
     a.extend_from_slice(&attr.to_le_bytes());
-    if size > 0 && !buf.is_null() {
-        a.extend_from_slice(unsafe { std::slice::from_raw_parts(buf as *const u8, size) });
-    }
-    match with_client(|c| c.lib_call(LIB_CUBLASLT, func, a)) {
-        Ok((st, _)) => st,
+    let bytes: &[u8] = if size > 0 && !buf.is_null() {
+        unsafe { std::slice::from_raw_parts(buf as *const u8, size) }
+    } else {
+        &[]
+    };
+    a.extend_from_slice(bytes);
+    lt_fp_append(handle as u64, attr, bytes);
+    match with_client(|c| c.lib_call_deferred(LIB_CUBLASLT, func, a)) {
+        Ok(()) => CUBLAS_STATUS_SUCCESS,
         Err(_) => CUBLAS_STATUS_NOT_INITIALIZED,
     }
 }
@@ -2551,28 +2620,28 @@ pub extern "C" fn cublasLtMatrixLayoutCreate(
     if mat_layout.is_null() {
         return CUBLAS_STATUS_NOT_INITIALIZED;
     }
-    let mut a = Vec::with_capacity(28);
+    let mut a = Vec::with_capacity(36);
     a.extend_from_slice(&data_type.to_le_bytes());
     a.extend_from_slice(&rows.to_le_bytes());
     a.extend_from_slice(&cols.to_le_bytes());
     a.extend_from_slice(&ld.to_le_bytes());
-    match with_client(|c| c.lib_call(LIB_CUBLASLT, 3, a)) {
-        Ok((0, out)) if out.len() >= 8 => {
-            unsafe {
-                *mat_layout = u64::from_le_bytes(out[..8].try_into().unwrap()) as *mut c_void
-            };
+    let vh = lt_mint(&a);
+    a.extend_from_slice(&vh.to_le_bytes());
+    match with_client(|c| c.lib_call_deferred(LIB_CUBLASLT, 3, a)) {
+        Ok(()) => {
+            unsafe { *mat_layout = vh as *mut c_void };
             CUBLAS_STATUS_SUCCESS
         }
-        Ok((st, _)) => st,
         Err(_) => CUBLAS_STATUS_NOT_INITIALIZED,
     }
 }
 
 #[no_mangle]
 pub extern "C" fn cublasLtMatrixLayoutDestroy(mat_layout: *mut c_void) -> c_int {
+    lt_fp_drop(mat_layout as u64);
     let a = (mat_layout as u64).to_le_bytes().to_vec();
-    match with_client(|c| c.lib_call(LIB_CUBLASLT, 4, a)) {
-        Ok((st, _)) => st,
+    match with_client(|c| c.lib_call_deferred(LIB_CUBLASLT, 4, a)) {
+        Ok(()) => CUBLAS_STATUS_SUCCESS,
         Err(_) => CUBLAS_STATUS_NOT_INITIALIZED,
     }
 }
@@ -2592,21 +2661,22 @@ pub extern "C" fn cublasLtMatmulPreferenceCreate(pref: *mut *mut c_void) -> c_in
     if pref.is_null() {
         return CUBLAS_STATUS_NOT_INITIALIZED;
     }
-    match with_client(|c| c.lib_call(LIB_CUBLASLT, 6, Vec::new())) {
-        Ok((0, out)) if out.len() >= 8 => {
-            unsafe { *pref = u64::from_le_bytes(out[..8].try_into().unwrap()) as *mut c_void };
+    let vh = lt_mint(&[]);
+    match with_client(|c| c.lib_call_deferred(LIB_CUBLASLT, 6, vh.to_le_bytes().to_vec())) {
+        Ok(()) => {
+            unsafe { *pref = vh as *mut c_void };
             CUBLAS_STATUS_SUCCESS
         }
-        Ok((st, _)) => st,
         Err(_) => CUBLAS_STATUS_NOT_INITIALIZED,
     }
 }
 
 #[no_mangle]
 pub extern "C" fn cublasLtMatmulPreferenceDestroy(pref: *mut c_void) -> c_int {
+    lt_fp_drop(pref as u64);
     let a = (pref as u64).to_le_bytes().to_vec();
-    match with_client(|c| c.lib_call(LIB_CUBLASLT, 7, a)) {
-        Ok((st, _)) => st,
+    match with_client(|c| c.lib_call_deferred(LIB_CUBLASLT, 7, a)) {
+        Ok(()) => CUBLAS_STATUS_SUCCESS,
         Err(_) => CUBLAS_STATUS_NOT_INITIALIZED,
     }
 }
@@ -2635,6 +2705,42 @@ pub extern "C" fn cublasLtMatmulAlgoGetHeuristic(
     heuristic_results_array: *mut c_void,
     return_algo_count: *mut c_int,
 ) -> c_int {
+    // Memo key: the CONTENT of every descriptor (ids change per step; the
+    // shapes repeat every decode step, so this hits ~always after warmup).
+    let mut key = Vec::new();
+    for h in [operation_desc, a_desc, b_desc, c_desc, d_desc, preference] {
+        let fp = lt_fp_of(h as u64);
+        key.extend_from_slice(&(fp.len() as u32).to_le_bytes());
+        key.extend_from_slice(&fp);
+    }
+    key.extend_from_slice(&requested_algo_count.to_le_bytes());
+    if let Some((st, out)) = LT_HEUR_MEMO
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .get(&key)
+        .cloned()
+    {
+        if st == 0 && out.len() >= 8 {
+            let count = i64::from_le_bytes(out[..8].try_into().unwrap()).max(0) as usize;
+            if !return_algo_count.is_null() {
+                unsafe { *return_algo_count = count as c_int };
+            }
+            let bytes = &out[8..];
+            if !heuristic_results_array.is_null() {
+                let n = bytes.len().min(count * LT_HEUR_RESULT_SZ);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        bytes.as_ptr(),
+                        heuristic_results_array as *mut u8,
+                        n,
+                    )
+                };
+            }
+            return CUBLAS_STATUS_SUCCESS;
+        }
+        return st;
+    }
     let mut a = Vec::with_capacity(60);
     a.extend_from_slice(&(light_handle as u64).to_le_bytes());
     a.extend_from_slice(&(operation_desc as u64).to_le_bytes());
@@ -2646,6 +2752,11 @@ pub extern "C" fn cublasLtMatmulAlgoGetHeuristic(
     a.extend_from_slice(&requested_algo_count.to_le_bytes());
     match with_client(|c| c.lib_call(LIB_CUBLASLT, 9, a)) {
         Ok((0, out)) if out.len() >= 8 => {
+            LT_HEUR_MEMO
+                .lock()
+                .unwrap()
+                .get_or_insert_with(HashMap::new)
+                .insert(key, (0, out.clone()));
             let count = i64::from_le_bytes(out[..8].try_into().unwrap()).max(0) as usize;
             if !return_algo_count.is_null() {
                 unsafe { *return_algo_count = count as c_int };
