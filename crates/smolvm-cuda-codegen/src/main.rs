@@ -48,6 +48,7 @@ fn pointee(cty: &str) -> &str {
 /// Wire size in bytes of a scalar type name.
 fn wire_size(t: &str) -> usize {
     match t {
+        "u16" => 2, // __half forwarded bitwise
         "i32" | "u32" | "f32" => 4,
         _ => 8,
     }
@@ -152,6 +153,9 @@ fn cublas_spec() -> Lib {
                 params: vec![handle()],
             },
             gemm("cublasSgemm_v2", "cublasSgemm_v2", "f32"),
+            // __half forwarded bitwise as u16 (the value is never interpreted
+            // guest-side; the host passes a pointer to the same 2 bytes).
+            gemm("cublasHgemm", "cublasHgemm", "u16"),
             gemm("cublasDgemm_v2", "cublasDgemm_v2", "f64"),
             gemm_strided(
                 "cublasSgemmStridedBatched",
@@ -607,7 +611,7 @@ fn gen_host(lib: &Lib) -> String {
     // A tiny cursor with the scalar readers the generated code uses.
     let _ = writeln!(
         s,
-        "struct GenCur<'a> {{ b: &'a [u8], p: usize }}\nimpl GenCur<'_> {{\n    fn take(&mut self, n: usize) -> [u8; 8] {{ let mut o = [0u8; 8]; let end = (self.p + n).min(self.b.len()); o[..end - self.p].copy_from_slice(&self.b[self.p..end]); self.p = end; o }}\n    fn i32(&mut self) -> i32 {{ i32::from_le_bytes(self.take(4)[..4].try_into().unwrap()) }}\n    fn i64(&mut self) -> i64 {{ i64::from_le_bytes(self.take(8)) }}\n    fn u64(&mut self) -> u64 {{ u64::from_le_bytes(self.take(8)) }}\n    fn f32(&mut self) -> f32 {{ f32::from_le_bytes(self.take(4)[..4].try_into().unwrap()) }}\n    fn f64(&mut self) -> f64 {{ f64::from_le_bytes(self.take(8)) }}\n}}"
+        "struct GenCur<'a> {{ b: &'a [u8], p: usize }}\nimpl GenCur<'_> {{\n    fn take(&mut self, n: usize) -> [u8; 8] {{ let mut o = [0u8; 8]; let end = (self.p + n).min(self.b.len()); o[..end - self.p].copy_from_slice(&self.b[self.p..end]); self.p = end; o }}\n    fn u16(&mut self) -> u16 {{ u16::from_le_bytes(self.take(2)[..2].try_into().unwrap()) }}\n    fn i32(&mut self) -> i32 {{ i32::from_le_bytes(self.take(4)[..4].try_into().unwrap()) }}\n    fn i64(&mut self) -> i64 {{ i64::from_le_bytes(self.take(8)) }}\n    fn u64(&mut self) -> u64 {{ u64::from_le_bytes(self.take(8)) }}\n    fn f32(&mut self) -> f32 {{ f32::from_le_bytes(self.take(4)[..4].try_into().unwrap()) }}\n    fn f64(&mut self) -> f64 {{ f64::from_le_bytes(self.take(8)) }}\n}}"
     );
     s
 }

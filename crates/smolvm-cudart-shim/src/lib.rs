@@ -1413,9 +1413,22 @@ pub extern "C" fn cudaFuncGetAttributes(attr: *mut c_void, _func: *const c_void)
     }
     set_last(CUDA_SUCCESS)
 }
+/// Forward the shared-memory opt-in (`cudaFuncAttributeMaxDynamicSharedMemorySize`
+/// = 8, matching the driver's `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`)
+/// to the host function. FlashAttention/cutlass kernels needing >48 KiB shared
+/// memory raise it here before launching, or the launch fails with INVALID_VALUE.
+/// The runtime and driver enum values coincide, so `attr` passes through.
 #[no_mangle]
-pub extern "C" fn cudaFuncSetAttribute(_func: *const c_void, _attr: c_int, _value: c_int) -> c_int {
-    set_last(CUDA_SUCCESS)
+pub extern "C" fn cudaFuncSetAttribute(func: *const c_void, attr: c_int, value: c_int) -> c_int {
+    let r = with_state(|s| {
+        let fid = s
+            .funcs
+            .get(&(func as usize))
+            .ok_or(CUDA_ERROR_INVALID_DEVICE_POINTER)?
+            .fid;
+        s.client.func_set_attribute(fid, attr, value).map_err(map_err)
+    });
+    set_last(r.err().unwrap_or(CUDA_SUCCESS))
 }
 #[no_mangle]
 pub extern "C" fn cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(

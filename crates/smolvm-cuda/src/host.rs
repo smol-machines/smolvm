@@ -44,6 +44,8 @@ pub trait Backend: Send {
     fn module_unload(&mut self, module: u64) -> CuResult<()>;
     /// Per-parameter byte sizes of the kernel's arguments, in declaration order.
     fn func_get_param_info(&mut self, function: u64) -> CuResult<Vec<u32>>;
+    /// Set a `CUfunction_attribute` (e.g. raise max dynamic shared memory).
+    fn func_set_attribute(&mut self, function: u64, attrib: i32, value: i32) -> CuResult<()>;
     fn mem_alloc(&mut self, bytes: u64) -> CuResult<u64>;
     fn mem_free(&mut self, dptr: u64) -> CuResult<()>;
     fn memcpy_htod(&mut self, dptr: u64, data: &[u8]) -> CuResult<()>;
@@ -313,6 +315,15 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 out.extend_from_slice(&s.to_le_bytes());
             }
             Ok(Response::Data(out))
+        }
+        Request::FuncSetAttribute {
+            function,
+            attrib,
+            value,
+        } => {
+            let raw_fn = raw(&sess.functions, function)?;
+            b.func_set_attribute(raw_fn, attrib, value)
+                .map(|_| Response::Ok)
         }
         Request::MemAlloc { bytes } => b.mem_alloc(bytes).map(Response::Dptr),
         Request::MemFree { dptr } => b.mem_free(dptr).map(|_| Response::Ok),
@@ -646,6 +657,10 @@ impl Backend for CpuBackend {
             "vecadd" => Ok(vec![8, 8, 8, 4]),
             _ => Err(CUDA_ERROR_NOT_FOUND),
         }
+    }
+    fn func_set_attribute(&mut self, _function: u64, _attrib: i32, _value: i32) -> CuResult<()> {
+        // CPU emulation has no shared-memory limits to raise.
+        Ok(())
     }
     fn mem_alloc(&mut self, bytes: u64) -> CuResult<u64> {
         let dptr = self.next_dptr;

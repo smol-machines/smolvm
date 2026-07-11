@@ -46,6 +46,7 @@ pub enum Op {
     ModuleGetFunction = 0x21,
     ModuleUnload = 0x22,
     FuncGetParamInfo = 0x23,
+    FuncSetAttribute = 0x24,
     MemAlloc = 0x30,
     MemFree = 0x31,
     MemcpyHtoD = 0x32,
@@ -121,6 +122,7 @@ impl Op {
             0x21 => Op::ModuleGetFunction,
             0x22 => Op::ModuleUnload,
             0x23 => Op::FuncGetParamInfo,
+            0x24 => Op::FuncSetAttribute,
             0x30 => Op::MemAlloc,
             0x31 => Op::MemFree,
             0x32 => Op::MemcpyHtoD,
@@ -209,6 +211,15 @@ pub enum Request {
     /// order — what a generic client needs to serialize `kernelParams` blobs.
     FuncGetParamInfo {
         function: u64,
+    },
+    /// Raise/set a `CUfunction_attribute` on the host function — chiefly
+    /// `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`, which Triton/vLLM
+    /// kernels needing >48 KiB shared memory must opt into before launching, or
+    /// the launch fails with `INVALID_VALUE`.
+    FuncSetAttribute {
+        function: u64,
+        attrib: i32,
+        value: i32,
     },
     MemAlloc {
         bytes: u64,
@@ -590,6 +601,16 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
             w_u8(&mut b, Op::FuncGetParamInfo as u8);
             w_u64(&mut b, *function);
         }
+        Request::FuncSetAttribute {
+            function,
+            attrib,
+            value,
+        } => {
+            w_u8(&mut b, Op::FuncSetAttribute as u8);
+            w_u64(&mut b, *function);
+            w_i32(&mut b, *attrib);
+            w_i32(&mut b, *value);
+        }
         Request::MemAlloc { bytes } => {
             w_u8(&mut b, Op::MemAlloc as u8);
             w_u64(&mut b, *bytes);
@@ -882,6 +903,11 @@ pub fn decode_request(payload: &[u8]) -> io::Result<Request> {
         },
         Op::ModuleUnload => Request::ModuleUnload { module: c.u64()? },
         Op::FuncGetParamInfo => Request::FuncGetParamInfo { function: c.u64()? },
+        Op::FuncSetAttribute => Request::FuncSetAttribute {
+            function: c.u64()?,
+            attrib: c.i32()?,
+            value: c.i32()?,
+        },
         Op::MemAlloc => Request::MemAlloc { bytes: c.u64()? },
         Op::MemFree => Request::MemFree { dptr: c.u64()? },
         Op::MemcpyHtoD => Request::MemcpyHtoD {
@@ -1107,6 +1133,7 @@ pub fn decode_response(op: Op, payload: &[u8]) -> io::Result<(i32, Response)> {
         | Op::CtxDestroy
         | Op::PrimaryCtxRelease
         | Op::ModuleUnload
+        | Op::FuncSetAttribute
         | Op::MemFree
         | Op::MemcpyHtoD
         | Op::MemcpyDtoD
@@ -1191,6 +1218,11 @@ mod tests {
         roundtrip(Request::PrimaryCtxRelease { device: 0 });
         roundtrip(Request::ModuleUnload { module: 7 });
         roundtrip(Request::FuncGetParamInfo { function: 9 });
+        roundtrip(Request::FuncSetAttribute {
+            function: 9,
+            attrib: 8,
+            value: 73728,
+        });
         roundtrip(Request::MemcpyDtoD {
             dst: 0x2000,
             src: 0x1000,

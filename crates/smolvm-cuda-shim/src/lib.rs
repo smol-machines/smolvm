@@ -722,6 +722,154 @@ pub extern "C" fn cuMemcpyDtoDAsync_v2(
 
 // ---- kernel launch ----------------------------------------------------------------
 
+/// `CUlaunchConfig` (CUDA 12): dims + shared bytes + stream + an attribute
+/// array we don't forward (clusters/programmatic completion — not used by the
+/// Triton kernels that launch through this entry point).
+#[repr(C)]
+struct CuLaunchConfig {
+    grid_x: c_uint,
+    grid_y: c_uint,
+    grid_z: c_uint,
+    block_x: c_uint,
+    block_y: c_uint,
+    block_z: c_uint,
+    shared_bytes: c_uint,
+    stream: *mut c_void,
+    attrs: *mut c_void,
+    num_attrs: c_uint,
+}
+
+/// Attribute-carrying launch (Triton/torch.compile's launcher). The attributes
+/// are ignored; everything else lowers onto the plain launch path.
+#[no_mangle]
+pub extern "C" fn cuLaunchKernelEx(
+    config: *const c_void,
+    func: *mut c_void,
+    kernel_params: *mut *mut c_void,
+    extra: *mut *mut c_void,
+) -> c_int {
+    if config.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    // SAFETY: caller passes a valid CUlaunchConfig.
+    let c = unsafe { &*(config as *const CuLaunchConfig) };
+    cuLaunchKernel(
+        func,
+        c.grid_x,
+        c.grid_y,
+        c.grid_z,
+        c.block_x,
+        c.block_y,
+        c.block_z,
+        c.shared_bytes,
+        c.stream,
+        kernel_params,
+        extra,
+    )
+}
+
+#[no_mangle]
+pub extern "C" fn cuLaunchKernelEx_ptsz(
+    config: *const c_void,
+    func: *mut c_void,
+    kernel_params: *mut *mut c_void,
+    extra: *mut *mut c_void,
+) -> c_int {
+    cuLaunchKernelEx(config, func, kernel_params, extra)
+}
+
+/// Pointer attributes. Every device pointer we hand out is the host's real
+/// `CUdeviceptr`, so a pointer the guest holds is a device pointer: report
+/// memory-type Device, device-pointer = the value itself, ordinal 0, not
+/// managed. Range/host-pointer queries return the pointer / null respectively.
+/// vLLM's allocator and Triton link these; a stub error broke import.
+#[no_mangle]
+pub extern "C" fn cuPointerGetAttribute(
+    data: *mut c_void,
+    attribute: c_int,
+    ptr: u64,
+) -> c_int {
+    if data.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    // CUpointer_attribute: 1=CONTEXT, 2=MEMORY_TYPE, 3=DEVICE_POINTER,
+    // 4=HOST_POINTER, 6=BUFFER_ID, 7=IS_MANAGED, 9=DEVICE_ORDINAL,
+    // 11=RANGE_START_ADDR, 12=RANGE_SIZE, 13=MAPPED.
+    unsafe {
+        match attribute {
+            2 => *(data as *mut c_uint) = 2, // CU_MEMORYTYPE_DEVICE
+            3 | 11 => *(data as *mut u64) = ptr,
+            12 => *(data as *mut usize) = 0,
+            4 => *(data as *mut u64) = 0, // no host mapping
+            7 => *(data as *mut c_int) = 0,
+            9 => *(data as *mut c_int) = 0,
+            13 => *(data as *mut c_int) = 1,
+            _ => *(data as *mut u64) = 0,
+        }
+    }
+    CUDA_SUCCESS
+}
+
+/// Batched pointer-attribute query: fill each requested attribute per the
+/// single-attribute logic above.
+#[no_mangle]
+pub extern "C" fn cuPointerGetAttributes(
+    num_attributes: c_uint,
+    attributes: *const c_int,
+    data: *const *mut c_void,
+    ptr: u64,
+) -> c_int {
+    if attributes.is_null() || data.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    for i in 0..num_attributes as isize {
+        let attr = unsafe { *attributes.offset(i) };
+        let out = unsafe { *data.offset(i) };
+        if !out.is_null() {
+            cuPointerGetAttribute(out, attr, ptr);
+        }
+    }
+    CUDA_SUCCESS
+}
+
+/// Cache-config is a scheduling hint the host driver applies at launch; a
+/// no-op here is correct (work runs on the host's real function).
+#[no_mangle]
+pub extern "C" fn cuFuncSetCacheConfig(_func: *mut c_void, _config: c_int) -> c_int {
+    CUDA_SUCCESS
+}
+
+/// Context limits (stack size, printf FIFO, malloc heap): report a generous
+/// value on get, accept any set. Triton reads the stack-size limit during
+/// launcher setup; a stub error there aborted the launch.
+#[no_mangle]
+pub extern "C" fn cuCtxGetLimit(pvalue: *mut usize, _limit: c_int) -> c_int {
+    if pvalue.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    unsafe { *pvalue = 8 * 1024 * 1024 };
+    CUDA_SUCCESS
+}
+#[no_mangle]
+pub extern "C" fn cuCtxSetLimit(_limit: c_int, _value: usize) -> c_int {
+    CUDA_SUCCESS
+}
+
+/// No cluster support (clusters are an sm_90+ feature we don't forward);
+/// reporting 0 max clusters keeps Triton on the standard, non-cluster launch.
+#[no_mangle]
+pub extern "C" fn cuOccupancyMaxActiveClusters(
+    num_clusters: *mut c_int,
+    _func: *mut c_void,
+    _config: *const c_void,
+) -> c_int {
+    if num_clusters.is_null() {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    unsafe { *num_clusters = 0 };
+    CUDA_SUCCESS
+}
+
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn cuLaunchKernel(
@@ -787,6 +935,22 @@ pub extern "C" fn cuLaunchKernel(
 
 #[no_mangle]
 pub extern "C" fn cuStreamCreate(stream: *mut *mut c_void, flags: c_uint) -> c_int {
+    match with_state(|s| s.client.stream_create(flags)) {
+        Ok(h) => ret(unsafe { out(stream, h as *mut c_void) }),
+        Err(code) => code,
+    }
+}
+
+// PyTorch's stream pool (used for CUDA-graph capture) creates streams here.
+// Priority is advisory scheduling only; forward as a plain stream. A stub that
+// left `stream` unwritten fed callers an uninitialized handle → a bad-pointer
+// crash inside cuBLAS during graph capture.
+#[no_mangle]
+pub extern "C" fn cuStreamCreateWithPriority(
+    stream: *mut *mut c_void,
+    flags: c_uint,
+    _priority: c_int,
+) -> c_int {
     match with_state(|s| s.client.stream_create(flags)) {
         Ok(h) => ret(unsafe { out(stream, h as *mut c_void) }),
         Err(code) => code,
@@ -939,6 +1103,7 @@ fn proc_table(name: &str) -> Option<*mut c_void> {
         "cuMemGetInfo" => cuMemGetInfo_v2,
         "cuLaunchKernel" => cuLaunchKernel,
         "cuStreamCreate" => cuStreamCreate,
+        "cuStreamCreateWithPriority" => cuStreamCreateWithPriority,
         "cuStreamDestroy" => cuStreamDestroy_v2,
         "cuStreamSynchronize" => cuStreamSynchronize,
         "cuStreamQuery" => cuStreamQuery,
@@ -1075,9 +1240,15 @@ pub extern "C" fn cuFuncGetAttribute(pi: *mut c_int, attrib: c_int, _func: *mut 
     }
     CUDA_SUCCESS
 }
+// Triton/vLLM kernels needing >48 KiB shared memory must raise
+// CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES here before launching, or the
+// launch fails with INVALID_VALUE. Forward it so the host function's real limit
+// is raised; Triton checks the return to decide whether the kernel can run.
 #[no_mangle]
-pub extern "C" fn cuFuncSetAttribute() -> c_int {
-    CUDA_SUCCESS
+pub extern "C" fn cuFuncSetAttribute(func: *mut c_void, attrib: c_int, value: c_int) -> c_int {
+    ret(with_state(|s| {
+        s.client.func_set_attribute(func as u64, attrib, value)
+    }))
 }
 #[no_mangle]
 pub extern "C" fn cuLaunchCooperativeKernel() -> c_int {

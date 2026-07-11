@@ -465,6 +465,20 @@ impl<S: Read + Write> Client<S> {
     }
 
     /// Per-parameter byte sizes of the kernel's arguments, in declaration order.
+    /// Set a `CUfunction_attribute` on the host function (round-trip: the caller
+    /// — Triton — checks the status to decide whether the kernel can run).
+    pub fn func_set_attribute(&mut self, function: u64, attrib: i32, value: i32) -> Result<()> {
+        self.call(
+            &Request::FuncSetAttribute {
+                function,
+                attrib,
+                value,
+            },
+            Op::FuncSetAttribute,
+        )
+        .map(|_| ())
+    }
+
     pub fn func_get_param_info(&mut self, function: u64) -> Result<Vec<u32>> {
         match self.call(
             &Request::FuncGetParamInfo { function },
