@@ -50,6 +50,16 @@ pub mod base64_bytes {
 /// Protocol version.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// virtiofs tag under which the host exposes the Rosetta 2 Linux runtime to the
+/// guest. Shared host↔guest so the launcher's `krun_add_virtiofs` tag and the
+/// guest agent's `mount -t virtiofs` source can't drift apart.
+pub const ROSETTA_TAG: &str = "rosetta";
+
+/// Guest mount point for the Rosetta 2 Linux runtime. The ptrace wrapper execs
+/// `<ROSETTA_GUEST_PATH>/rosetta` (the translator), so this path is baked into
+/// both the wrapper and the `binfmt_misc` registration.
+pub const ROSETTA_GUEST_PATH: &str = "/mnt/rosetta";
+
 /// Maximum frame size (32 MB - layer exports use chunked streaming).
 pub const MAX_FRAME_SIZE: u32 = 32 * 1024 * 1024;
 

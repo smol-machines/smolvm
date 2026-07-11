@@ -88,6 +88,7 @@ pub fn build_create_params(
                 cuda: false,
                 gpu: false,
                 gpu_vram_mib: None,
+                rosetta: false,
                 dns_filter_hosts: None,
                 source_smolmachine: None,
             });
@@ -172,6 +173,7 @@ pub fn build_create_params(
     };
 
     let gpu = sf.gpu.unwrap_or(false);
+    let rosetta = sf.rosetta.unwrap_or(false);
 
     let workdir = cli_workdir.or(dev_workdir).or(sf.workdir);
 
@@ -280,6 +282,7 @@ pub fn build_create_params(
         cuda: sf.cuda.unwrap_or(false),
         gpu,
         gpu_vram_mib: sf.gpu_vram,
+        rosetta,
         dns_filter_hosts: if sf_allow_hosts.is_empty() {
             None
         } else {

@@ -6,32 +6,39 @@
 //! # How it works
 //!
 //! When Rosetta is available and enabled, smolvm mounts the Rosetta runtime
-//! directory into the guest VM via virtiofs. The guest can then execute
-//! x86_64 binaries by registering Rosetta with binfmt_misc.
+//! directory into the guest VM via virtiofs. A ptrace wrapper
+//! (`/usr/bin/rosetta-wrapper`) intercepts Rosetta's Virtualization.framework
+//! validation ioctl — required because libkrun uses Hypervisor.framework, not
+//! Virtualization.framework — and registers as the binfmt_misc interpreter for
+//! x86_64 ELF binaries.
 //!
 //! # Requirements
 //!
-//! - Apple Silicon Mac (M1/M2/M3)
+//! - Apple Silicon Mac (M1/M2/M3/M4)
 //! - Rosetta 2 installed (`softwareupdate --install-rosetta`)
 //! - macOS 11.0 or later
 
 use crate::platform::{self, RosettaSupport};
 
-/// Virtiofs tag for the Rosetta mount.
-pub const ROSETTA_TAG: &str = "rosetta";
+/// Virtiofs tag for the Rosetta mount. Re-exported from the wire protocol so the
+/// host launcher and guest agent share one definition.
+pub use smolvm_protocol::ROSETTA_TAG;
 
-/// Guest mount path for Rosetta runtime.
-pub const ROSETTA_GUEST_PATH: &str = "/mnt/rosetta";
+/// Guest mount path for the Rosetta runtime. Re-exported from the wire protocol.
+pub use smolvm_protocol::ROSETTA_GUEST_PATH;
 
 /// binfmt_misc registration command for the guest.
 ///
-/// This command should be run inside the guest VM to register Rosetta
-/// as the interpreter for x86_64 ELF binaries.
+/// Registers the ptrace wrapper as the interpreter for x86_64 ELF binaries.
+/// The wrapper intercepts Rosetta's validation ioctl, then detaches for
+/// full-speed execution. The `F` flag keeps the interpreter fd open at
+/// registration time (required since the wrapper lives on the rootfs, not
+/// the virtiofs mount).
 pub const BINFMT_REGISTER_CMD: &str = r#"
-if [ -d /mnt/rosetta ] && [ -f /mnt/rosetta/rosetta ]; then
+if [ -d /mnt/rosetta ] && [ -f /mnt/rosetta/rosetta ] && [ -x /usr/bin/rosetta-wrapper ]; then
     if [ -d /proc/sys/fs/binfmt_misc ]; then
         mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc 2>/dev/null || true
-        echo ':rosetta:M::\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00:\xff\xff\xff\xff\xff\xfe\xfe\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:/mnt/rosetta/rosetta:OCF' > /proc/sys/fs/binfmt_misc/register 2>/dev/null || true
+        echo ':rosetta:M::\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00:\xff\xff\xff\xff\xff\xfe\xfe\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:/usr/bin/rosetta-wrapper:F' > /proc/sys/fs/binfmt_misc/register 2>/dev/null || true
     fi
 fi
 "#;

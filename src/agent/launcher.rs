@@ -1176,6 +1176,26 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             }
         }
 
+        // Attach the Rosetta 2 Linux runtime as a virtiofs mount when requested
+        // AND available on this host, so a stray `--rosetta` on a non-Rosetta host
+        // degrades to a no-op rather than a dangling tag the guest can't mount.
+        // The guest agent (gated on guest_env::ROSETTA, set below) mounts it at
+        // ROSETTA_GUEST_PATH and registers the binfmt_misc wrapper.
+        let rosetta_enabled = resources.rosetta && crate::vm::rosetta::is_available();
+        if rosetta_enabled {
+            if let Some(runtime) = crate::vm::rosetta::runtime_path() {
+                let tag = cstr(smolvm_protocol::ROSETTA_TAG);
+                let host_path = cstr(runtime);
+                if krun_add_virtiofs(ctx, tag.as_ptr(), host_path.as_ptr()) < 0 {
+                    krun_free_ctx(ctx);
+                    return Err(Error::agent(
+                        "add rosetta virtiofs",
+                        "krun_add_virtiofs failed for Rosetta runtime",
+                    ));
+                }
+            }
+        }
+
         boot_timing!("devices configured");
 
         // Set working directory
@@ -1242,6 +1262,15 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         if resources.gpu {
             let gpu_env = format!("{}={}", guest_env::GPU, guest_env::VALUE_ON);
             if let Ok(cs) = CString::new(gpu_env) {
+                env_strings.push(cs);
+            }
+        }
+
+        // Signal the guest agent to set up Rosetta (mount the runtime + register
+        // binfmt_misc). Gated on the same host-availability check as the mount.
+        if rosetta_enabled {
+            let rosetta_env = format!("{}={}", guest_env::ROSETTA, guest_env::VALUE_ON);
+            if let Ok(cs) = CString::new(rosetta_env) {
                 env_strings.push(cs);
             }
         }

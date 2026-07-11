@@ -93,14 +93,20 @@ impl VmExecutor for MacOsExecutor {
 /// This is only available on ARM64 macOS systems with Rosetta installed.
 pub struct MacOsRosetta;
 
-/// Path to the Rosetta runtime on macOS.
-const ROSETTA_RUNTIME_PATH: &str = "/Library/Apple/usr/libexec/oah";
+/// Directory holding the Linux Rosetta runtime on macOS. This is the virtiofs
+/// mount *source*: the guest mounts it at [`ROSETTA_GUEST_PATH`] so that the
+/// translator appears at `<ROSETTA_GUEST_PATH>/rosetta`. It is a subdirectory of
+/// `/Library/Apple/usr/libexec/oah` — NOT that parent directory, whose `rosetta`
+/// entry does not exist (the parent holds `libRosettaRuntime` + `RosettaLinux/`).
+const ROSETTA_RUNTIME_PATH: &str = "/Library/Apple/usr/libexec/oah/RosettaLinux";
 
 impl RosettaSupport for MacOsRosetta {
     #[cfg(target_arch = "aarch64")]
     fn is_available(&self) -> bool {
-        Path::new(ROSETTA_RUNTIME_PATH).exists()
-            && Path::new("/Library/Apple/usr/libexec/oah/libRosettaRuntime").exists()
+        // Require the Linux translator itself, not just the runtime dir: it is
+        // what the guest's ptrace wrapper execs, and its absence is exactly the
+        // failure that makes an attached mount useless.
+        Path::new(ROSETTA_RUNTIME_PATH).join("rosetta").exists()
     }
 
     #[cfg(not(target_arch = "aarch64"))]

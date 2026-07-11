@@ -529,6 +529,18 @@ pub fn launch_agent_vm_dynamic(
         }
     }
 
+    // Enable Rosetta only when requested AND actually available on this host, so
+    // a stray `--rosetta` on a non-Rosetta host degrades to a no-op rather than a
+    // dangling virtiofs tag the guest would fail to mount. The guest agent reads
+    // guest_env::ROSETTA and mounts the runtime + registers binfmt_misc.
+    let rosetta_enabled = config.resources.rosetta && crate::vm::rosetta::is_available();
+    if rosetta_enabled {
+        let rosetta_env = format!("{}={}", guest_env::ROSETTA, guest_env::VALUE_ON);
+        if let Ok(cstr) = CString::new(rosetta_env) {
+            env_strings.push(cstr);
+        }
+    }
+
     // Guest-network env vars — virtio-net interface config plus the TSI `--dns`
     // override — are built in one shared place so the static and dynamic
     // launchers can't diverge (see `agent::guest_network_env`). The dynamic
@@ -610,6 +622,24 @@ pub fn launch_agent_vm_dynamic(
                 "krun_add_virtiofs failed for '{}' - requested mount cannot be attached",
                 mount.tag
             ));
+        }
+    }
+
+    // Attach the Rosetta 2 Linux runtime (read-write is unnecessary but the plain
+    // add_virtiofs is what the guest expects for this tag; the runtime dir is
+    // never written). runtime_path() is Some iff is_available() held above.
+    if rosetta_enabled {
+        if let Some(runtime) = crate::vm::rosetta::runtime_path() {
+            let rosetta_tag = cstr(smolvm_protocol::ROSETTA_TAG);
+            let rosetta_path = try_or_free_ctx!(
+                CString::new(runtime),
+                "rosetta runtime path contains null byte"
+            );
+            // SAFETY: ctx is valid, tag and path are valid C strings
+            if unsafe { (krun.add_virtiofs)(ctx, rosetta_tag.as_ptr(), rosetta_path.as_ptr()) } < 0
+            {
+                free_ctx_on_err!("krun_add_virtiofs failed for Rosetta runtime");
+            }
         }
     }
 

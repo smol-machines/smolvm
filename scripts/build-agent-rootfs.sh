@@ -227,6 +227,16 @@ for mnt_dir in overlay storage newroot virtiofs rosetta; do
     mkdir -p "$OUTPUT_DIR/mnt/$mnt_dir"
 done
 
+# Install the pre-built Rosetta ptrace wrapper. This static binary intercepts
+# Rosetta's Virtualization.framework ioctl validation, allowing x86_64
+# translation to work under libkrun's Hypervisor.framework backend.
+# Source: scripts/rosetta/rosetta-wrapper.c
+ROSETTA_WRAPPER="$(dirname "$0")/rosetta/rosetta-wrapper"
+if [ -f "$ROSETTA_WRAPPER" ]; then
+    cp "$ROSETTA_WRAPPER" "$OUTPUT_DIR/usr/bin/rosetta-wrapper"
+    chmod 755 "$OUTPUT_DIR/usr/bin/rosetta-wrapper"
+fi
+
 # Remove existing init (it's a symlink to busybox) and replace with
 # symlink to the agent binary. The agent handles overlayfs setup +
 # pivot_root internally before starting the vsock listener.
@@ -293,6 +303,29 @@ if [[ -n "${CUDA_GUEST_BINARY:-}" ]] && [[ -f "${CUDA_GUEST_BINARY}" ]]; then
     echo "Installing smolvm-cuda-run binary..."
     cp "$CUDA_GUEST_BINARY" "$OUTPUT_DIR/usr/local/bin/smolvm-cuda-run"
     chmod +x "$OUTPUT_DIR/usr/local/bin/smolvm-cuda-run"
+fi
+
+# CUDA guest shims: glibc cdylibs the agent bind-mounts into workload
+# containers on `--cuda` (see crates/smolvm-agent/src/cuda.rs). They are loaded
+# by the container's glibc — not by the (musl) agent — so they build for the
+# native gnu target. Best-effort: without them `--cuda` still works, the user
+# just stages shims manually; cross-arch rootfs builds skip them.
+if [[ "$NO_BUILD_AGENT" != "1" && "$(uname -s)" == "Linux" && "$(uname -m)" == "$ALPINE_ARCH" ]] \
+    && command -v cargo &> /dev/null; then
+    echo "Building CUDA guest shims (native gnu target)..."
+    if cargo build --release -p smolvm-cudart-shim -p smolvm-cuda-shim \
+        --manifest-path "$PROJECT_ROOT/Cargo.toml"; then
+        mkdir -p "$OUTPUT_DIR/usr/local/lib/smolvm-cuda"
+        cp "$PROJECT_ROOT/target/release/libcudart.so" \
+            "$OUTPUT_DIR/usr/local/lib/smolvm-cuda/libcudart-shim.so"
+        cp "$PROJECT_ROOT/target/release/libcuda.so" \
+            "$OUTPUT_DIR/usr/local/lib/smolvm-cuda/libcuda.so.1"
+        echo "Installed CUDA guest shims"
+    else
+        echo "CUDA guest shim build failed — rootfs ships without auto-staging"
+    fi
+else
+    echo "Skipping CUDA guest shims (cross-arch or no cargo) — auto-staging disabled in this rootfs"
 fi
 
 echo ""

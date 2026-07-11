@@ -420,6 +420,10 @@ pub struct RunCmd {
     )]
     pub gpu_vram_mib: Option<u32>,
 
+    /// Enable Rosetta 2 for x86_64 binary translation on Apple Silicon
+    #[arg(long, help_heading = "Resources")]
+    pub rosetta: bool,
+
     /// Number of virtual CPUs
     #[arg(long, default_value_t = DEFAULT_MICROVM_CPU_COUNT, value_name = "N", help_heading = "Resources")]
     pub cpus: u8,
@@ -1014,6 +1018,7 @@ impl RunCmd {
             // CLI --gpu wins; Smolfile gpu = true also enables it.
             gpu: self.gpu || params.gpu,
             gpu_vram_mib: self.gpu_vram_mib.or(params.gpu_vram_mib),
+            rosetta: self.rosetta || params.rosetta,
             storage_gib: params.storage_gb,
             overlay_gib: params.overlay_gb,
             allowed_cidrs: params.allowed_cidrs.clone(),
@@ -1119,6 +1124,16 @@ impl RunCmd {
         let sigint_guard = manager.child_pid().map(smolvm::process::SigintGuard::new);
 
         // Resolve image: CLI > Smolfile > None (bare VM)
+        // When Rosetta is enabled, default the image pull to linux/amd64 so there
+        // is an x86_64 binary to translate; an explicit --oci-platform still wins.
+        // Without this, a multi-arch image resolves to the guest-native arm64
+        // variant and Rosetta has nothing to do.
+        let rosetta_requested = self.rosetta || params.rosetta;
+        let effective_platform: Option<String> = self
+            .oci_platform
+            .clone()
+            .or_else(|| rosetta_requested.then(|| "linux/amd64".to_string()));
+
         // Pull only registry images; a local source's layers are already
         // mounted via virtiofs and the guest assembles its rootfs from them.
         let image_info = if uses_packed_layers {
@@ -1127,7 +1142,7 @@ impl RunCmd {
             match crate::cli::pull_with_progress(
                 &mut client,
                 img,
-                self.oci_platform.as_deref(),
+                effective_platform.as_deref(),
                 self.proxy_opts.proxy(),
                 self.proxy_opts.no_proxy(),
             ) {
@@ -1318,6 +1333,7 @@ impl RunCmd {
                                 dns_filter_hosts: params.dns_filter_hosts.clone(),
                                 gpu: self.gpu || params.gpu,
                                 gpu_vram_mib: self.gpu_vram_mib.or(params.gpu_vram_mib),
+                                rosetta: self.rosetta || params.rosetta,
                             }),
                         )
                     });
@@ -1469,6 +1485,7 @@ impl RunCmd {
                             dns_filter_hosts: params.dns_filter_hosts.clone(),
                             gpu: self.gpu || params.gpu,
                             gpu_vram_mib: self.gpu_vram_mib.or(params.gpu_vram_mib),
+                            rosetta: false,
                         }),
                     )?;
                 }
@@ -2106,6 +2123,10 @@ pub struct CreateCmd {
     )]
     pub gpu_vram_mib: Option<u32>,
 
+    /// Enable Rosetta 2 for x86_64 binary translation on Apple Silicon
+    #[arg(long)]
+    pub rosetta: bool,
+
     /// Run command on every VM start (can be used multiple times)
     #[arg(long = "init", value_name = "COMMAND")]
     pub init: Vec<String>,
@@ -2237,6 +2258,7 @@ impl CreateCmd {
             dns: params.dns,
             gpu: params.gpu,
             gpu_vram_mib: params.gpu_vram_mib,
+            rosetta: params.rosetta,
             storage_gib: params.storage_gb,
             overlay_gib: params.overlay_gb,
             allowed_cidrs: params.allowed_cidrs.clone(),
@@ -2258,6 +2280,9 @@ impl CreateCmd {
         }
         if self.gpu {
             params.gpu = true;
+        }
+        if self.rosetta {
+            params.rosetta = true;
         }
         // CLI --gpu-vram takes precedence over Smolfile gpu_vram.
         if let Some(vram) = self.gpu_vram_mib {
@@ -2405,6 +2430,7 @@ impl CreateCmd {
             dns_filter_hosts: None,
             gpu: manifest.gpu,
             gpu_vram_mib: None,
+            rosetta: false,
             source_smolmachine: Some(canonical_path),
         };
 
@@ -2830,6 +2856,14 @@ pub struct UpdateCmd {
     #[arg(long, conflicts_with = "gpu")]
     pub no_gpu: bool,
 
+    /// Enable Rosetta 2 for x86_64 binary translation
+    #[arg(long)]
+    pub rosetta: bool,
+
+    /// Disable Rosetta 2
+    #[arg(long, conflicts_with = "rosetta")]
+    pub no_rosetta: bool,
+
     /// Storage disk size in GiB (expand only)
     #[arg(long, value_name = "GiB")]
     pub storage: Option<u64>,
@@ -3044,6 +3078,14 @@ impl UpdateCmd {
             if self.no_gpu {
                 changes.push("  gpu: disabled".to_string());
                 r.gpu = Some(false);
+            }
+            if self.rosetta {
+                changes.push("  rosetta: enabled".to_string());
+                r.rosetta = Some(true);
+            }
+            if self.no_rosetta {
+                changes.push("  rosetta: disabled".to_string());
+                r.rosetta = Some(false);
             }
         })?;
 

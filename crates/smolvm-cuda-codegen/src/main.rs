@@ -79,7 +79,8 @@ struct Lib {
     name: &'static str,
     id: u8,
     /// Default soname to dlopen on the host if the env override is unset.
-    default_so: &'static str,
+    /// Sonames to probe via `open_host_lib`, most-specific last.
+    default_sos: &'static [&'static str],
     funcs: Vec<Fun>,
 }
 
@@ -138,7 +139,7 @@ fn cublas_spec() -> Lib {
     Lib {
         name: "cublas",
         id: 1,
-        default_so: "libcublas.so",
+        default_sos: &["libcublas.so", "libcublas.so.13", "libcublas.so.12"],
         funcs: vec![
             Fun {
                 sym: "cublasCreate_v2",
@@ -283,7 +284,7 @@ fn cudnn_spec() -> Lib {
     Lib {
         name: "cudnn",
         id: 2,
-        default_so: "libcudnn.so",
+        default_sos: &["libcudnn.so", "libcudnn.so.9", "libcudnn.so.8"],
         funcs: vec![
             create("cudnnCreate"),
             f("cudnnDestroy", vec![h()]),
@@ -501,9 +502,13 @@ fn gen_host(lib: &Lib) -> String {
     // Loader.
     let _ = writeln!(
         s,
-        "impl GenLib {{\n    pub fn load() -> Result<GenLib, String> {{\n        let path = std::env::var(\"SMOLVM_{}_LIB\").unwrap_or_else(|_| \"{}\".into());\n        unsafe {{\n            let lib = Library::new(&path).map_err(|e| format!(\"load {{path}}: {{e}}\"))?;\n            Ok(GenLib {{",
+        "impl GenLib {{\n    pub fn load() -> Result<GenLib, String> {{\n        unsafe {{\n            let lib = super::open_host_lib(\"SMOLVM_{}_LIB\", &[{}])?;\n            Ok(GenLib {{",
         lib.name.to_uppercase(),
-        lib.default_so
+        lib.default_sos
+            .iter()
+            .map(|s| format!("\"{s}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     for f in &lib.funcs {
         let _ = writeln!(

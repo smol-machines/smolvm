@@ -238,6 +238,9 @@ pub struct Smolfile {
     /// GPU VRAM (shared memory region) size in MiB. Ignored unless
     /// `gpu = true`. Default comes from `DEFAULT_GPU_VRAM_MIB` (4 GiB).
     pub gpu_vram: Option<u32>,
+    /// Enable Rosetta 2 x86_64 binary translation. macOS Apple Silicon
+    /// only; mounts the host Rosetta runtime into the guest via virtiofs.
+    pub rosetta: Option<bool>,
     /// Enable CUDA-over-vsock: remote guest CUDA Driver-API calls to the
     /// host NVIDIA GPU. Linux-only; requires a host NVIDIA driver.
     pub cuda: Option<bool>,

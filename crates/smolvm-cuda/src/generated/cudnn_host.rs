@@ -17,9 +17,8 @@ pub struct GenLib { _lib: Library,
 }
 impl GenLib {
     pub fn load() -> Result<GenLib, String> {
-        let path = std::env::var("SMOLVM_CUDNN_LIB").unwrap_or_else(|_| "libcudnn.so".into());
         unsafe {
-            let lib = Library::new(&path).map_err(|e| format!("load {path}: {e}"))?;
+            let lib = super::open_host_lib("SMOLVM_CUDNN_LIB", &["libcudnn.so", "libcudnn.so.9", "libcudnn.so.8"])?;
             Ok(GenLib {
                 f_cudnnCreate: sym(&lib, b"cudnnCreate\0")?,
                 f_cudnnDestroy: sym(&lib, b"cudnnDestroy\0")?,

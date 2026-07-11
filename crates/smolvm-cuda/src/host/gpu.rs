@@ -176,11 +176,47 @@ struct Cublas {
     ) -> c_int,
 }
 
+/// Open a host CUDA library with auto-discovery: an env override wins, then
+/// the plain soname (dlopen's ldconfig search), then the usual CUDA install
+/// prefixes. Removes the need to export `SMOLVM_*_LIB` on typical hosts, where
+/// the toolkit lives under `/opt/cuda` or `/usr/local/cuda` without ldconfig
+/// entries.
+pub(super) fn open_host_lib(env_var: &str, sonames: &[&str]) -> Result<Library, String> {
+    if let Ok(path) = std::env::var(env_var) {
+        // SAFETY: loading a user-designated shared library.
+        return unsafe { Library::new(&path).map_err(|e| format!("load {path}: {e}")) };
+    }
+    const PREFIXES: &[&str] = &[
+        "", // plain soname: dlopen's own ldconfig search
+        "/opt/cuda/lib64/",
+        "/usr/local/cuda/lib64/",
+        "/usr/lib/x86_64-linux-gnu/",
+        "/usr/lib64/",
+        "/usr/lib/",
+    ];
+    let mut last_err = String::new();
+    for soname in sonames {
+        for prefix in PREFIXES {
+            let cand = format!("{prefix}{soname}");
+            // SAFETY: probing well-known system library locations.
+            match unsafe { Library::new(&cand) } {
+                Ok(lib) => return Ok(lib),
+                Err(e) => last_err = format!("load {cand}: {e}"),
+            }
+        }
+    }
+    Err(format!(
+        "{last_err} (set {env_var} to the library path if it lives elsewhere)"
+    ))
+}
+
 impl Cublas {
     fn load() -> Result<Cublas, String> {
-        let path = std::env::var("SMOLVM_CUBLAS_LIB").unwrap_or_else(|_| "libcublas.so".into());
         unsafe {
-            let lib = Library::new(&path).map_err(|e| format!("load {path}: {e}"))?;
+            let lib = open_host_lib(
+                "SMOLVM_CUBLAS_LIB",
+                &["libcublas.so", "libcublas.so.13", "libcublas.so.12"],
+            )?;
             let c = Cublas {
                 create: sym(&lib, b"cublasCreate_v2\0")?,
                 destroy: sym(&lib, b"cublasDestroy_v2\0")?,
@@ -847,9 +883,11 @@ struct CudnnBackend {
 
 impl CudnnBackend {
     fn load() -> Result<CudnnBackend, String> {
-        let path = std::env::var("SMOLVM_CUDNN_LIB").unwrap_or_else(|_| "libcudnn.so".into());
         unsafe {
-            let lib = Library::new(&path).map_err(|e| format!("load {path}: {e}"))?;
+            let lib = open_host_lib(
+                "SMOLVM_CUDNN_LIB",
+                &["libcudnn.so", "libcudnn.so.9", "libcudnn.so.8"],
+            )?;
             let b = CudnnBackend {
                 create: sym(&lib, b"cudnnBackendCreateDescriptor\0")?,
                 destroy: sym(&lib, b"cudnnBackendDestroyDescriptor\0")?,
@@ -989,9 +1027,11 @@ struct CublasLt {
 impl CublasLt {
     fn load() -> Result<CublasLt, String> {
         // cuBLASLt ships in its own soname; fall back to the cuBLAS path's dir.
-        let path = std::env::var("SMOLVM_CUBLASLT_LIB").unwrap_or_else(|_| "libcublasLt.so".into());
         unsafe {
-            let lib = Library::new(&path).map_err(|e| format!("load {path}: {e}"))?;
+            let lib = open_host_lib(
+                "SMOLVM_CUBLASLT_LIB",
+                &["libcublasLt.so", "libcublasLt.so.13", "libcublasLt.so.12"],
+            )?;
             let b = CublasLt {
                 matmul: sym(&lib, b"cublasLtMatmul\0")?,
                 algo_get_heuristic: sym(&lib, b"cublasLtMatmulAlgoGetHeuristic\0")?,
@@ -1325,9 +1365,11 @@ struct CudnnBn {
 
 impl CudnnBn {
     fn load() -> Result<CudnnBn, String> {
-        let path = std::env::var("SMOLVM_CUDNN_LIB").unwrap_or_else(|_| "libcudnn.so".into());
         unsafe {
-            let lib = Library::new(&path).map_err(|e| format!("load {path}: {e}"))?;
+            let lib = open_host_lib(
+                "SMOLVM_CUDNN_LIB",
+                &["libcudnn.so", "libcudnn.so.9", "libcudnn.so.8"],
+            )?;
             let b = CudnnBn {
                 set_nd: sym(&lib, b"cudnnSetTensorNdDescriptor\0")?,
                 derive_bn: sym(&lib, b"cudnnDeriveBNTensorDescriptor\0")?,

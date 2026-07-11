@@ -437,6 +437,8 @@ pub struct CreateVmParams {
     pub gpu: bool,
     /// GPU VRAM size in MiB (None = default). Ignored when gpu is false.
     pub gpu_vram_mib: Option<u32>,
+    /// Enable Rosetta 2 for x86_64 binary translation on Apple Silicon.
+    pub rosetta: bool,
     /// Hostnames for DNS filtering (from --allow-host / [network].allow_hosts).
     pub dns_filter_hosts: Option<Vec<String>>,
     /// Absolute path to .smolmachine sidecar (for machines created with --from).
@@ -607,6 +609,7 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
     record.network_backend = params.network_backend;
     record.dns = params.dns;
     record.gpu = if params.gpu { Some(true) } else { None };
+    record.rosetta = if params.rosetta { Some(true) } else { None };
     // Same invariant the CLI enforces, applied again here because
     // Smolfile values arrive through `params.gpu_vram_mib` without
     // passing through the clap value_parser.
@@ -1165,6 +1168,7 @@ pub fn persist_named_running(
                 r.dns_filter_hosts = o.dns_filter_hosts.clone();
                 r.gpu = if o.gpu { Some(true) } else { None };
                 r.gpu_vram_mib = o.gpu_vram_mib;
+                r.rosetta = if o.rosetta { Some(true) } else { None };
             }
         })
         .ok_or_else(|| smolvm::Error::config(
@@ -1202,6 +1206,7 @@ pub struct DefaultVmOverrides {
     pub dns_filter_hosts: Option<Vec<String>>,
     pub gpu: bool,
     pub gpu_vram_mib: Option<u32>,
+    pub rosetta: bool,
 }
 
 /// Check if any running VM already binds to the same host ports.

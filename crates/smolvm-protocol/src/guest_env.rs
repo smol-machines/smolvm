@@ -23,6 +23,18 @@ pub const VALUE_ON: &str = "1";
 /// This is a boolean sentinel — the value is [`VALUE_ON`] when set.
 pub const GPU: &str = "SMOLVM_GPU";
 
+/// Env var the host sets on guest init to signal Rosetta 2 x86_64 translation
+/// was requested (and is available on the host).
+///
+/// Present means the host has attached the RosettaLinux runtime as the virtiofs
+/// tag [`crate::ROSETTA_TAG`]; the guest agent reads this on startup and, if set,
+/// mounts that runtime at [`crate::ROSETTA_GUEST_PATH`] and registers the ptrace
+/// wrapper with `binfmt_misc` as the interpreter for x86_64 ELF binaries. Absent
+/// means no Rosetta was requested.
+///
+/// This is a boolean sentinel — the value is [`VALUE_ON`] when set.
+pub const ROSETTA: &str = "SMOLVM_ROSETTA";
+
 /// Filename of this VM's readiness marker, written by the agent into the virtiofs
 /// rootfs when boot completes. Per VM (so concurrent boots don't race on one
 /// shared file); the host pre-creates and polls the same name. Unset → the agent

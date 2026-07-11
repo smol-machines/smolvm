@@ -16,9 +16,8 @@ pub struct GenLib { _lib: Library,
 }
 impl GenLib {
     pub fn load() -> Result<GenLib, String> {
-        let path = std::env::var("SMOLVM_CUBLAS_LIB").unwrap_or_else(|_| "libcublas.so".into());
         unsafe {
-            let lib = Library::new(&path).map_err(|e| format!("load {path}: {e}"))?;
+            let lib = super::open_host_lib("SMOLVM_CUBLAS_LIB", &["libcublas.so", "libcublas.so.13", "libcublas.so.12"])?;
             Ok(GenLib {
                 f_cublasCreate_v2: sym(&lib, b"cublasCreate_v2\0")?,
                 f_cublasDestroy_v2: sym(&lib, b"cublasDestroy_v2\0")?,

@@ -39,6 +39,9 @@ pub struct VmResources {
     /// `None` → use `DEFAULT_GPU_VRAM_MIB`.
     #[serde(default)]
     pub gpu_vram_mib: Option<u32>,
+    /// Enable Rosetta 2 for x86_64 binary translation on Apple Silicon.
+    #[serde(default)]
+    pub rosetta: bool,
     /// Storage disk size in GiB (None = default 20 GiB).
     pub storage_gib: Option<u64>,
     /// Overlay disk size in GiB (None = default 10 GiB).
@@ -117,6 +120,7 @@ impl Default for VmResources {
             network_backend: None,
             gpu: false,
             gpu_vram_mib: None,
+            rosetta: false,
             storage_gib: None,
             overlay_gib: None,
             allowed_cidrs: None,
