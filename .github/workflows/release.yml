@@ -424,3 +424,23 @@ jobs:
             dist/*.tar.gz \
             dist/*.zip \
             dist/checksums.sha256
+
+      # Ping the Homebrew tap to bump its formula to this release immediately,
+      # instead of waiting for its scheduled poll. Best-effort: if the token
+      # secret isn't configured, this no-ops (the tap's cron picks the release up
+      # within a few hours anyway) and never fails the release. The token is a
+      # fine-grained PAT with Contents:write on smol-machines/homebrew-tap.
+      - name: Notify Homebrew tap of the new release
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_DISPATCH_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "HOMEBREW_TAP_DISPATCH_TOKEN not set — skipping instant bump (the tap polls on a schedule)."
+            exit 0
+          fi
+          version="${TAG#v}"
+          gh api --method POST repos/smol-machines/homebrew-tap/dispatches \
+            -f event_type=smolvm-release \
+            -f "client_payload[version]=$version"
+          echo "Dispatched smolvm-release ($version) to the Homebrew tap."
