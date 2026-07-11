@@ -238,7 +238,7 @@ struct Session {
     /// a guest that dies mid-run must not leak GPU memory (device
     /// allocations are the multi-GB hazard; modules/streams/events are
     /// hygiene). Raw backend handles.
-    owned_dptrs: std::collections::HashSet<u64>,
+    owned_dptrs: HashMap<u64, u64>, // dptr → size (also the quota ledger)
     owned_modules: std::collections::HashSet<u64>,
     owned_streams: std::collections::HashSet<u64>,
     owned_events: std::collections::HashSet<u64>,
@@ -248,7 +248,7 @@ struct Session {
 /// Free everything a finished connection still owns. Failures are ignored —
 /// the driver may already have reclaimed (context destruction, device reset).
 fn reclaim_session(sess: &mut Session, b: &mut dyn Backend) {
-    for d in std::mem::take(&mut sess.owned_dptrs) {
+    for (d, _size) in std::mem::take(&mut sess.owned_dptrs) {
         let _ = b.mem_free(d);
     }
     for m in std::mem::take(&mut sess.owned_modules) {
@@ -699,12 +699,30 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             b.func_set_attribute(raw_fn, attrib, value)
                 .map(|_| Response::Ok)
         }
-        Request::MemAlloc { bytes } => b.mem_alloc(bytes).map(|d| {
-            sess.owned_dptrs.insert(d);
-            Response::Dptr(d)
-        }),
+        Request::MemAlloc { bytes } => {
+            // Per-connection VRAM quota (SMOLVM_CUDA_VRAM_LIMIT_MB on the
+            // host): a guest may not allocate past its budget — the CUDA-
+            // native failure (out of memory) surfaces to the app.
+            static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            let limit = *LIMIT.get_or_init(|| {
+                std::env::var("SMOLVM_CUDA_VRAM_LIMIT_MB")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .map(|mb| mb * 1024 * 1024)
+                    .unwrap_or(u64::MAX)
+            });
+            let used: u64 = sess.owned_dptrs.values().sum();
+            if used.saturating_add(bytes) > limit {
+                return Err(2); // CUDA_ERROR_OUT_OF_MEMORY
+            }
+            b.mem_alloc(bytes).map(|d| {
+                sess.owned_dptrs.insert(d, bytes);
+                Response::Dptr(d)
+            })
+        }
         Request::MemFree { dptr } => {
             sess.owned_dptrs.remove(&dptr);
+            // (removal returns the freed size to the quota ledger)
             b.mem_free(dptr).map(|_| Response::Ok)
         }
         Request::MemcpyHtoD { dptr, stream, data } => b
@@ -1663,5 +1681,31 @@ mod tests {
         assert_eq!(back, big);
         drop(cli);
         server.join().unwrap();
+    }
+    // A connection may not allocate past SMOLVM_CUDA_VRAM_LIMIT_MB; freeing
+    // returns budget. (Env is process-global — this test sets it before the
+    // OnceLock is first read; fine while it's the only quota test.)
+    #[test]
+    fn vram_quota_enforced() {
+        std::env::set_var("SMOLVM_CUDA_VRAM_LIMIT_MB", "1");
+        let mut sess = Session::default();
+        let mut b = CpuBackend::default();
+        let mb = 1024 * 1024;
+        let (st, r) = dispatch(&mut sess, &mut b, Request::MemAlloc { bytes: mb / 2 });
+        assert_eq!(st, 0);
+        let d1 = match r {
+            Response::Dptr(d) => d,
+            _ => unreachable!(),
+        };
+        // Second half-MB fits exactly; a byte more must fail with OOM(2).
+        let (st, _) = dispatch(&mut sess, &mut b, Request::MemAlloc { bytes: mb / 2 });
+        assert_eq!(st, 0);
+        let (st, _) = dispatch(&mut sess, &mut b, Request::MemAlloc { bytes: 1 });
+        assert_eq!(st, 2, "over-quota alloc must report OUT_OF_MEMORY");
+        // Freeing restores budget.
+        let (st, _) = dispatch(&mut sess, &mut b, Request::MemFree { dptr: d1 });
+        assert_eq!(st, 0);
+        let (st, _) = dispatch(&mut sess, &mut b, Request::MemAlloc { bytes: mb / 4 });
+        assert_eq!(st, 0);
     }
 }
