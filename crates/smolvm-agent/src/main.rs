@@ -3141,7 +3141,7 @@ fn write_oci_bundle(
     storage::add_storage_fallback(&mut spec, mounts, unprivileged);
 
     ssh_agent::inject_into_container(&mut spec);
-    cuda::inject_into_container(&mut spec);
+    cuda::inject_into_container(&mut spec, rootfs_path);
     spec.write_to(bundle_path)
         .map_err(|e| format!("failed to write OCI spec: {}", e))?;
 
@@ -3897,7 +3897,7 @@ fn spawn_interactive_command(
 
     // Forward SSH agent into the container if enabled at boot.
     ssh_agent::inject_into_container(&mut spec);
-    cuda::inject_into_container(&mut spec);
+    cuda::inject_into_container(&mut spec, rootfs_path);
 
     spec.write_to(&bundle_path)
         .map_err(|e| format!("failed to write OCI spec: {}", e))?;
