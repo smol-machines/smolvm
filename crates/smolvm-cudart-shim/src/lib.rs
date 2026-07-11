@@ -467,6 +467,31 @@ pub extern "C" fn cudaMalloc(dev_ptr: *mut *mut c_void, size: usize) -> c_int {
     )
 }
 
+/// `cudaMallocManaged` served as plain device memory: bitsandbytes links it
+/// (its paged optimizers host-access managed pointers — those would fault —
+/// but its 4-bit/8-bit compute paths only need the symbol to resolve and the
+/// pointer to be device-valid).
+#[no_mangle]
+pub extern "C" fn cudaMallocManaged(
+    dev_ptr: *mut *mut c_void,
+    size: usize,
+    _flags: c_uint,
+) -> c_int {
+    cudaMalloc(dev_ptr, size)
+}
+
+/// Managed-memory prefetch hint: nothing to do, our "managed" memory is
+/// always device-resident.
+#[no_mangle]
+pub extern "C" fn cudaMemPrefetchAsync(
+    _dev_ptr: *const c_void,
+    _count: usize,
+    _dst_device: c_int,
+    _stream: *mut c_void,
+) -> c_int {
+    CUDA_SUCCESS
+}
+
 /// Is `p` inside any live device allocation (base ≤ p < base+size)?
 fn dev_contains(allocs: &std::collections::BTreeMap<u64, u64>, p: u64) -> bool {
     allocs
