@@ -32,7 +32,7 @@
 use smolvm_cuda::client::{Client, CudaRpcError};
 mod cublas_stubs;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
 use std::io::{Read, Write};
 use std::sync::Mutex;
@@ -152,8 +152,11 @@ struct ShimState {
     funcs: HashMap<usize, FuncRec>,
     /// Host pinned-memory allocations (guest RAM) → layout, for cudaFreeHost.
     host_allocs: HashMap<usize, std::alloc::Layout>,
-    /// Live device allocations, to classify pointers for cudaMemcpyDefault.
-    dev_allocs: HashSet<u64>,
+    /// Live device allocations, base → size. Range-queried (not exact-match):
+    /// PyTorch's caching allocator suballocates, so tensor data pointers are
+    /// interior to a cudaMalloc'd block — `cudaPointerGetAttributes` on one
+    /// must still report Device or torch's `getDeviceFromPtr` throws.
+    dev_allocs: std::collections::BTreeMap<u64, u64>,
     /// Active CUDA graph capture, `(stream_handle, capture_id)`. Kept
     /// guest-side so the per-launch hot queries (`cudaStreamIsCapturing`,
     /// `cudaStreamGetCaptureInfo` — PyTorch's allocator calls them constantly)
@@ -206,6 +209,20 @@ fn map_err(e: CudaRpcError) -> c_int {
 /// client. The first call performs `cuInit` + `cuDevicePrimaryCtxRetain(0)`
 /// (which the host binds current on its serving thread), matching how the CUDA
 /// runtime brings up its device on first use.
+/// Cross-shim ordering hook, dlsym'd by the driver shim (`libcuda.so.1`).
+/// The two shims hold separate connections to the host, i.e. two ordering
+/// domains for one guest program-order stream; the driver shim fences this
+/// connection before each of its own ops so runtime-issued work (deferred in
+/// the pipeline) executes first. No-op before the runtime connection exists.
+#[no_mangle]
+pub extern "C" fn smolvm_cudart_fence() {
+    if let Ok(mut guard) = STATE.lock() {
+        if let Some(st) = guard.as_mut() {
+            let _ = st.client.drain();
+        }
+    }
+}
+
 fn with_client<T>(
     f: impl FnOnce(&mut Client<Stream>) -> Result<T, CudaRpcError>,
 ) -> Result<T, c_int> {
@@ -223,7 +240,7 @@ fn with_client<T>(
             modules: HashMap::new(),
             funcs: HashMap::new(),
             host_allocs: HashMap::new(),
-            dev_allocs: HashSet::new(),
+            dev_allocs: std::collections::BTreeMap::new(),
             capture: None,
         });
     }
@@ -308,13 +325,21 @@ pub extern "C" fn cudaMalloc(dev_ptr: *mut *mut c_void, size: usize) -> c_int {
     set_last(
         match with_state(|s| {
             let d = s.client.mem_alloc(size as u64).map_err(map_err)?;
-            s.dev_allocs.insert(d);
+            s.dev_allocs.insert(d, size as u64);
             Ok(d)
         }) {
             Ok(d) => unsafe { out(dev_ptr, d as *mut c_void) },
             Err(e) => e,
         },
     )
+}
+
+/// Is `p` inside any live device allocation (base ≤ p < base+size)?
+fn dev_contains(allocs: &std::collections::BTreeMap<u64, u64>, p: u64) -> bool {
+    allocs
+        .range(..=p)
+        .next_back()
+        .is_some_and(|(base, size)| p < base + size)
 }
 
 #[no_mangle]
@@ -636,8 +661,8 @@ fn resolve_kind(s: &ShimState, dst: *const c_void, src: *const c_void, kind: c_i
     if kind != MEMCPY_DEFAULT {
         return kind;
     }
-    let dst_dev = s.dev_allocs.contains(&(dst as u64));
-    let src_dev = s.dev_allocs.contains(&(src as u64));
+    let dst_dev = dev_contains(&s.dev_allocs, dst as u64);
+    let src_dev = dev_contains(&s.dev_allocs, src as u64);
     match (src_dev, dst_dev) {
         (false, true) => MEMCPY_HTOD,
         (true, false) => MEMCPY_DTOH,
@@ -1043,9 +1068,15 @@ pub extern "C" fn cudaEventSynchronize(event: *mut c_void) -> c_int {
     })
 }
 #[no_mangle]
-pub extern "C" fn cudaEventQuery(_event: *mut c_void) -> c_int {
-    // Serving thread runs work in call order, so a recorded event is complete.
-    set_last(CUDA_SUCCESS)
+pub extern "C" fn cudaEventQuery(event: *mut c_void) -> c_int {
+    // Must be honest: PyTorch's allocator polls this to decide when freed
+    // blocks are safe to reuse. Always answering "complete" caused premature
+    // reuse (ILLEGAL_ADDRESS) once work really ran on side streams. NotReady
+    // (600) latches into last-error exactly like real cudart; torch clears it.
+    set_last(match with_client(|c| c.event_query(event as u64)) {
+        Ok(code) => code,
+        Err(e) => e,
+    })
 }
 #[no_mangle]
 pub extern "C" fn cudaEventElapsedTime(
@@ -1076,15 +1107,27 @@ pub extern "C" fn cudaStreamCreateWithPriority(
 }
 #[no_mangle]
 pub extern "C" fn cudaStreamWaitEvent(
-    _stream: *mut c_void,
-    _event: *mut c_void,
-    _flags: c_uint,
+    stream: *mut c_void,
+    event: *mut c_void,
+    flags: c_uint,
 ) -> c_int {
-    set_last(CUDA_SUCCESS) // in-order execution on the serving thread
+    // A real cross-stream ordering edge now that work runs on side streams
+    // (and a graph dependency during capture) — dropping it made replays racy
+    // (ILLEGAL_ADDRESS). Deferred like a launch.
+    set_last(
+        match with_client(|c| c.stream_wait_event(stream as u64, event as u64, flags)) {
+            Ok(()) => CUDA_SUCCESS,
+            Err(e) => e,
+        },
+    )
 }
 #[no_mangle]
-pub extern "C" fn cudaStreamQuery(_stream: *mut c_void) -> c_int {
-    set_last(CUDA_SUCCESS) // always idle: prior work already ran
+pub extern "C" fn cudaStreamQuery(stream: *mut c_void) -> c_int {
+    // Honest completion status (0 or 600-NotReady), same as cudaEventQuery.
+    set_last(match with_client(|c| c.stream_query(stream as u64)) {
+        Ok(code) => code,
+        Err(e) => e,
+    })
 }
 // ---- CUDA graphs -------------------------------------------------------------
 // Capture happens on the HOST driver: Begin/End forward, and every launch /
@@ -1261,8 +1304,26 @@ pub extern "C" fn cudaGraphDestroy(graph: *mut c_void) -> c_int {
     })
 }
 #[no_mangle]
-pub extern "C" fn cudaThreadExchangeStreamCaptureMode(_mode: *mut c_int) -> c_int {
-    set_last(CUDA_SUCCESS)
+pub extern "C" fn cudaThreadExchangeStreamCaptureMode(mode: *mut c_int) -> c_int {
+    // PyTorch's allocator wraps capture-time cudaMalloc in a relaxed-mode
+    // guard via this call. The per-thread mode must take effect on the HOST
+    // thread that will execute the malloc — each connection is served by one
+    // host thread, so forwarding maps the semantics exactly. A no-op here
+    // leaves the host thread in global mode and the malloc fails with 900
+    // (cudaErrorStreamCaptureUnsupported), invalidating the capture.
+    if mode.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    let new_mode = unsafe { *mode };
+    set_last(
+        match with_client(|c| c.thread_exchange_capture_mode(new_mode)) {
+            Ok(old) => {
+                unsafe { *mode = old };
+                CUDA_SUCCESS
+            }
+            Err(e) => e,
+        },
+    )
 }
 /// `cudaStreamCallback_t` = `void (*)(cudaStream_t, cudaError_t, void*)`.
 type StreamCallback = unsafe extern "C" fn(*mut c_void, c_int, *mut c_void);
@@ -1365,7 +1426,7 @@ pub extern "C" fn cudaPointerGetAttributes(attr: *mut c_void, ptr: *const c_void
     // unregistered, and PyTorch's `is_pinned()` relies on that: reporting Host
     // for arbitrary pointers made `pin_memory()` a silent no-op, so pinned
     // transfers never reached the zero-copy path.
-    let is_dev = with_state(|s| Ok(s.dev_allocs.contains(&(ptr as u64)))).unwrap_or(false);
+    let is_dev = with_state(|s| Ok(dev_contains(&s.dev_allocs, ptr as u64))).unwrap_or(false);
     let is_pinned_host = !is_dev
         && (guestmem::is_pinned(ptr as usize)
             || shm_offset(ptr).is_some()
@@ -1426,7 +1487,9 @@ pub extern "C" fn cudaFuncSetAttribute(func: *const c_void, attr: c_int, value: 
             .get(&(func as usize))
             .ok_or(CUDA_ERROR_INVALID_DEVICE_POINTER)?
             .fid;
-        s.client.func_set_attribute(fid, attr, value).map_err(map_err)
+        s.client
+            .func_set_attribute(fid, attr, value)
+            .map_err(map_err)
     });
     set_last(r.err().unwrap_or(CUDA_SUCCESS))
 }

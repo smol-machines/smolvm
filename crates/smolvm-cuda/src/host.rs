@@ -67,6 +67,17 @@ pub trait Backend: Send {
     /// Begin capturing `stream`'s work into a CUDA graph (mode per
     /// `cudaStreamCaptureMode`).
     fn stream_begin_capture(&mut self, stream: u64, mode: i32) -> CuResult<()>;
+    /// Exchange this (serving) thread's capture interaction mode; returns the
+    /// previous mode. Lets a guest run capture-unsafe calls (allocator growth)
+    /// under `cudaStreamCaptureModeRelaxed` exactly like PyTorch does natively.
+    fn thread_exchange_capture_mode(&mut self, mode: i32) -> CuResult<i32>;
+    /// Raw `cuStreamQuery` code as a value (0 complete, 600 not ready) — not
+    /// an error, so it rides the response body.
+    fn stream_query(&mut self, stream: u64) -> CuResult<i32>;
+    /// `cuStreamWaitEvent`: make `stream` wait for `event`.
+    fn stream_wait_event(&mut self, stream: u64, event: u64, flags: u32) -> CuResult<()>;
+    /// Raw `cuEventQuery` code as a value (0 complete, 600 not ready).
+    fn event_query(&mut self, event: u64) -> CuResult<i32>;
     /// End capture; returns the raw `cudaGraph_t`.
     fn stream_end_capture(&mut self, stream: u64) -> CuResult<u64>;
     /// `(capture_status, capture_id)` for `stream`.
@@ -142,8 +153,16 @@ pub trait Backend: Send {
     ) -> CuResult<()>;
 
     /// Generic forward-to-host-lib dispatch (code-generated per function).
-    /// Returns `(library_status, serialized_outputs)`. Default: unsupported.
-    fn lib_call(&mut self, _lib: u8, _func: u16, _args: &[u8]) -> CuResult<(i32, Vec<u8>)> {
+    /// `streams` is the session's stream table (wire id → raw host stream) for
+    /// resolving `cudaStream_t` parameters. Returns `(library_status,
+    /// serialized_outputs)`. Default: unsupported.
+    fn lib_call(
+        &mut self,
+        _lib: u8,
+        _func: u16,
+        _args: &[u8],
+        _streams: &HashMap<u64, u64>,
+    ) -> CuResult<(i32, Vec<u8>)> {
         Err(CUDA_ERROR_NOT_FOUND)
     }
 
@@ -246,14 +265,17 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
     // Translate an opaque stream id: 0 is the default stream (passes through),
     // anything else must be a live minted id.
     fn raw_stream(sess: &Session, stream: u64) -> CuResult<u64> {
+        // Streams are raw host pointers on the wire (see StreamCreate below);
+        // the table only translates ids minted by pre-raw-stream guests.
         if stream == 0 {
             Ok(0)
         } else {
-            sess.streams
-                .get(&stream)
-                .copied()
-                .ok_or(CUDA_ERROR_INVALID_HANDLE)
+            Ok(sess.streams.get(&stream).copied().unwrap_or(stream))
         }
+    }
+    fn raw_event(sess: &Session, event: u64) -> CuResult<u64> {
+        // Same raw-on-the-wire convention as streams.
+        Ok(sess.events.get(&event).copied().unwrap_or(event))
     }
     let r: CuResult<Response> = (|| match req {
         Request::Init => b.init().map(|_| Response::Ok),
@@ -350,15 +372,20 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 .map(|_| Response::Ok)
         }
         Request::CtxSynchronize => b.ctx_synchronize().map(|_| Response::Ok),
-        Request::StreamCreate { flags } => {
-            let raw = b.stream_create(flags)?;
-            let id = sess.mint();
-            sess.streams.insert(id, raw);
-            Ok(Response::Handle(id))
-        }
+        // Streams hand back the RAW host pointer, not a session-minted id.
+        // Streams are context-scoped and every connection retains the same
+        // device primary context — but one guest process holds SEPARATE
+        // connections (runtime shim + driver shim), so a per-session id minted
+        // on one is garbage on the other: torch's capture stream (runtime)
+        // fed to a Triton kernel launch (driver) came back INVALID_HANDLE.
+        // Raw pointers are valid on every connection, like device pointers.
+        Request::StreamCreate { flags } => b.stream_create(flags).map(Response::Handle),
         Request::StreamBeginCapture { stream, mode } => {
             let raw = raw_stream(sess, stream)?;
             b.stream_begin_capture(raw, mode).map(|_| Response::Ok)
+        }
+        Request::ThreadExchangeCaptureMode { mode } => {
+            b.thread_exchange_capture_mode(mode).map(Response::Count)
         }
         Request::StreamEndCapture { stream } => {
             let raw = raw_stream(sess, stream)?;
@@ -400,7 +427,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 .map(|_| Response::Ok)
         }
         Request::StreamDestroy { stream } => {
-            let raw = raw(&sess.streams, stream)?;
+            let raw = raw_stream(sess, stream)?;
             b.stream_destroy(raw)?;
             sess.streams.remove(&stream);
             Ok(Response::Ok)
@@ -409,30 +436,46 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             let raw = raw_stream(sess, stream)?;
             b.stream_synchronize(raw).map(|_| Response::Ok)
         }
-        Request::EventCreate { flags } => {
-            let raw = b.event_create(flags)?;
-            let id = sess.mint();
-            sess.events.insert(id, raw);
-            Ok(Response::Handle(id))
+        Request::StreamQuery { stream } => {
+            let raw = raw_stream(sess, stream)?;
+            b.stream_query(raw).map(Response::Count)
         }
+        Request::StreamWaitEvent {
+            stream,
+            event,
+            flags,
+        } => {
+            let raw_s = raw_stream(sess, stream)?;
+            let raw_e = raw_event(sess, event)?;
+            b.stream_wait_event(raw_s, raw_e, flags)
+                .map(|_| Response::Ok)
+        }
+        // Events are raw host pointers on the wire, same as streams (see
+        // StreamCreate): context-scoped, and one guest process talks over
+        // several connections that must all understand the same handle.
+        Request::EventCreate { flags } => b.event_create(flags).map(Response::Handle),
         Request::EventDestroy { event } => {
-            let raw = raw(&sess.events, event)?;
+            let raw = raw_event(sess, event)?;
             b.event_destroy(raw)?;
             sess.events.remove(&event);
             Ok(Response::Ok)
         }
         Request::EventRecord { event, stream } => {
-            let raw_ev = raw(&sess.events, event)?;
+            let raw_ev = raw_event(sess, event)?;
             let raw_str = raw_stream(sess, stream)?;
             b.event_record(raw_ev, raw_str).map(|_| Response::Ok)
         }
         Request::EventSynchronize { event } => {
-            let raw_ev = raw(&sess.events, event)?;
+            let raw_ev = raw_event(sess, event)?;
             b.event_synchronize(raw_ev).map(|_| Response::Ok)
         }
+        Request::EventQuery { event } => {
+            let raw_ev = raw_event(sess, event)?;
+            b.event_query(raw_ev).map(Response::Count)
+        }
         Request::EventElapsedTime { start, end } => {
-            let raw_start = raw(&sess.events, start)?;
-            let raw_end = raw(&sess.events, end)?;
+            let raw_start = raw_event(sess, start)?;
+            let raw_end = raw_event(sess, end)?;
             b.event_elapsed_time(raw_start, raw_end)
                 .map(Response::Millis)
         }
@@ -527,7 +570,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             .map(|_| Response::Ok)
         }
         Request::LibCall { lib, func, args } => b
-            .lib_call(lib, func, &args)
+            .lib_call(lib, func, &args, &sess.streams)
             .map(|(status, out)| Response::LibResult(status, out)),
         Request::MemcpyShmHtoD { dptr, offset, size } => {
             b.memcpy_shm_htod(dptr, offset, size).map(|_| Response::Ok)
@@ -765,6 +808,19 @@ impl Backend for CpuBackend {
     }
     fn stream_begin_capture(&mut self, _stream: u64, _mode: i32) -> CuResult<()> {
         Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
+    fn thread_exchange_capture_mode(&mut self, mode: i32) -> CuResult<i32> {
+        // No capture machinery in CPU emulation; echo the mode back.
+        Ok(mode)
+    }
+    fn stream_query(&mut self, _stream: u64) -> CuResult<i32> {
+        Ok(0) // everything executes synchronously
+    }
+    fn stream_wait_event(&mut self, _stream: u64, _event: u64, _flags: u32) -> CuResult<()> {
+        Ok(()) // in-order execution: the dependency already holds
+    }
+    fn event_query(&mut self, _event: u64) -> CuResult<i32> {
+        Ok(0)
     }
     fn stream_end_capture(&mut self, _stream: u64) -> CuResult<u64> {
         Err(CUDA_ERROR_NOT_SUPPORTED)
