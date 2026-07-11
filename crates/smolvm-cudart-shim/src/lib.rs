@@ -1167,21 +1167,41 @@ pub extern "C" fn cudaPointerGetAttributes(attr: *mut c_void, ptr: *const c_void
     if attr.is_null() {
         return set_last(CUDA_ERROR_INVALID_VALUE);
     }
-    // cudaMemoryTypeDevice=2 if we allocated it on the device, else Host=1.
+    // cudaMemoryTypeDevice=2 for our device allocations, Host=1 only for
+    // buffers from cudaMallocHost/cudaHostAlloc (zero-copy, shm or plain), and
+    // Unregistered=0 for everything else — real cudart reports plain memory as
+    // unregistered, and PyTorch's `is_pinned()` relies on that: reporting Host
+    // for arbitrary pointers made `pin_memory()` a silent no-op, so pinned
+    // transfers never reached the zero-copy path.
     let is_dev = with_state(|s| Ok(s.dev_allocs.contains(&(ptr as u64)))).unwrap_or(false);
+    let is_pinned_host = !is_dev
+        && (guestmem::is_pinned(ptr as usize)
+            || shm_offset(ptr).is_some()
+            || with_state(|s| {
+                Ok(s.host_allocs
+                    .iter()
+                    .any(|(b, l)| ptr as usize >= *b && (ptr as usize) < b + l.size()))
+            })
+            .unwrap_or(false));
     // SAFETY: caller-provided cudaPointerAttributes.
     let a = unsafe { &mut *(attr as *mut CudaPointerAttributes) };
-    a.memory_type = if is_dev { 2 } else { 1 };
+    a.memory_type = if is_dev {
+        2
+    } else if is_pinned_host {
+        1
+    } else {
+        0
+    };
     a.device = 0;
     a.device_pointer = if is_dev {
         ptr as *mut c_void
     } else {
         std::ptr::null_mut()
     };
-    a.host_pointer = if is_dev {
-        std::ptr::null_mut()
-    } else {
+    a.host_pointer = if is_pinned_host {
         ptr as *mut c_void
+    } else {
+        std::ptr::null_mut()
     };
     set_last(CUDA_SUCCESS)
 }
