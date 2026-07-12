@@ -46,6 +46,13 @@ enum Commands {
         config: std::path::PathBuf,
     },
 
+    /// Internal: run the shared CUDA daemon (not for direct use)
+    #[command(name = "_cuda-daemon", hide = true)]
+    CudaDaemon {
+        /// Control-socket path to bind
+        socket: std::path::PathBuf,
+    },
+
     /// Internal: clean up an ephemeral VM after its command exits (not for direct use)
     #[command(name = "_cleanup-ephemeral", hide = true)]
     CleanupEphemeral {
@@ -75,9 +82,13 @@ fn main() {
     // still carries the packed footer/sidecar, so without this guard it would
     // re-trigger packed-mode detection and rehydrate again instead of booting
     // the VM from the config it was handed.
-    let is_boot_vm =
-        std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("_boot-vm"));
-    if !is_boot_vm {
+    // Internal re-invocations (`_boot-vm`, `_cuda-daemon`) run the same packed
+    // executable but must do their job, not re-trigger packed rehydration.
+    let internal = matches!(
+        std::env::args_os().nth(1).as_deref().and_then(|s| s.to_str()),
+        Some("_boot-vm") | Some("_cuda-daemon")
+    );
+    if !internal {
         if let Some(mode) = smolvm_pack::detect_packed_mode() {
             cli::pack_run::run_as_packed_binary(mode);
         }
@@ -98,6 +109,9 @@ fn main() {
         Commands::Pack(cmd) => cmd.run(),
         Commands::Config(cmd) => cmd.run(),
         Commands::BootVm { config } => cli::internal_boot::run(config),
+        Commands::CudaDaemon { socket } => {
+            smolvm::cuda_daemon::run(&socket).map_err(smolvm::Error::Io)
+        }
         Commands::CleanupEphemeral {
             vm_name,
             pid,
