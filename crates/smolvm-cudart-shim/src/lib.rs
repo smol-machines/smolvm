@@ -14,7 +14,7 @@
 //!
 //! Interpose it with `LD_PRELOAD=/path/libcudart.so.11.0` (or stage it ahead of
 //! the program's own copy on `LD_LIBRARY_PATH`). Transport is selected by
-//! `SMOLVM_CUDA_RPC` exactly as the libcuda shim: unset/`vsock` (in-guest),
+//! `CUDA_REMOTE_ENDPOINT` (or legacy `SMOLVM_CUDA_RPC`) exactly as the libcuda shim: unset/`vsock` (in-guest),
 //! `tcp:HOST:PORT`, or `unix:/path` (host-side testing).
 //!
 //! Semantics: work executes synchronously on the host, so `*Async` calls and
@@ -107,7 +107,7 @@ impl Write for Stream {
 }
 
 fn connect() -> Result<Stream, c_int> {
-    let spec = std::env::var("SMOLVM_CUDA_RPC").unwrap_or_default();
+    let spec = smolvm_cuda::config::transport_spec();
     if let Some(addr) = spec.strip_prefix("tcp:") {
         return std::net::TcpStream::connect(addr)
             .map(|s| {
@@ -124,9 +124,8 @@ fn connect() -> Result<Stream, c_int> {
     }
     #[cfg(target_os = "linux")]
     {
-        const HOST_CID: u32 = 2;
-        const CUDA_PORT: u32 = 7000;
-        vsock::VsockStream::connect_with_cid_port(HOST_CID, CUDA_PORT)
+        let (cid, port) = smolvm_cuda::config::vsock_default();
+        vsock::VsockStream::connect_with_cid_port(cid, port)
             .map(Stream::Vsock)
             .map_err(|_| CUDA_ERROR_NO_DEVICE)
     }

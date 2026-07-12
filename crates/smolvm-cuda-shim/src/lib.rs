@@ -6,7 +6,7 @@
 //! CUDA runtime's dlopen of the driver — run their GPU work on the host GPU
 //! with no code changes.
 //!
-//! Transport is chosen by `SMOLVM_CUDA_RPC`:
+//! Transport is chosen by `CUDA_REMOTE_ENDPOINT` (or legacy `SMOLVM_CUDA_RPC`):
 //!   * unset / `vsock` — AF_VSOCK to host CID 2, port 7000 (production, in-guest)
 //!   * `tcp:HOST:PORT` — TCP (host-side testing against a loopback server)
 //!   * `unix:/path`    — AF_UNIX (host-side testing against the real cuda.sock)
@@ -101,7 +101,7 @@ impl Write for Stream {
 }
 
 fn connect() -> Result<Stream, c_int> {
-    let spec = std::env::var("SMOLVM_CUDA_RPC").unwrap_or_default();
+    let spec = smolvm_cuda::config::transport_spec();
     if let Some(addr) = spec.strip_prefix("tcp:") {
         return std::net::TcpStream::connect(addr)
             .map(|s| {
@@ -119,9 +119,8 @@ fn connect() -> Result<Stream, c_int> {
     #[cfg(target_os = "linux")]
     {
         // smolvm's reserved CUDA port on the host CID (smolvm_protocol::ports::CUDA).
-        const HOST_CID: u32 = 2;
-        const CUDA_PORT: u32 = 7000;
-        vsock::VsockStream::connect_with_cid_port(HOST_CID, CUDA_PORT)
+        let (cid, port) = smolvm_cuda::config::vsock_default();
+        vsock::VsockStream::connect_with_cid_port(cid, port)
             .map(Stream::Vsock)
             .map_err(|_| CUDA_ERROR_NO_DEVICE)
     }
