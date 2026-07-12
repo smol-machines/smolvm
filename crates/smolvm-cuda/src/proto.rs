@@ -1153,9 +1153,16 @@ pub fn decode_request(payload: &[u8]) -> io::Result<Request> {
     let mut c = Cur::new(payload);
     let op = Op::from_u8(c.u8()?).ok_or_else(bad)?;
     Ok(match op {
+        // Decode Init leniently so a *shorter* Init from an older shim still
+        // yields a Request rather than a decode error. A stale shim would
+        // otherwise have its whole connection dropped as a "malformed message",
+        // hiding the real cause; decoding here lets the proto_hash check reject
+        // it *loudly* ("PROTOCOL MISMATCH … rebuild and restage both"). Missing
+        // fields default to 0 — proto_hash is never 0 in practice, so an Init too
+        // short to even carry a hash still mismatches and is rejected.
         Op::Init => Request::Init {
-            proto_hash: c.u64()?,
-            resume_token: c.u64()?,
+            proto_hash: c.u64().unwrap_or(0),
+            resume_token: c.u64().unwrap_or(0),
         },
         Op::DeviceGetCount => Request::DeviceGetCount,
         Op::DeviceGetName => Request::DeviceGetName { device: c.i32()? },
@@ -1573,6 +1580,49 @@ mod tests {
             ],
         });
         roundtrip(Request::CtxSynchronize);
+    }
+
+    // A stale shim sends a shorter Init (older wire format). It must still
+    // *decode* — with missing fields defaulting to 0 — so the host's proto_hash
+    // check can reject it loudly, rather than the frame failing to decode and
+    // the connection being silently dropped as "malformed" (which hid the real
+    // version-skew cause during the torch bring-up debugging).
+    #[test]
+    fn short_init_decodes_for_loud_rejection() {
+        // Full-length Init (current format).
+        let full = decode_request(&encode_request(&Request::Init {
+            proto_hash: 0xabcd,
+            resume_token: 7,
+        }))
+        .expect("full Init decodes");
+        assert_eq!(
+            full,
+            Request::Init {
+                proto_hash: 0xabcd,
+                resume_token: 7
+            }
+        );
+
+        // Older shim: op + proto_hash only (no resume_token) → resume_token = 0.
+        let mut short = vec![Op::Init as u8];
+        short.extend_from_slice(&0xabcdu64.to_le_bytes());
+        assert_eq!(
+            decode_request(&short).expect("short Init still decodes"),
+            Request::Init {
+                proto_hash: 0xabcd,
+                resume_token: 0
+            }
+        );
+
+        // Pre-handshake shim: just the op byte → proto_hash = 0 (never a real
+        // hash, so it will mismatch and be rejected loudly).
+        assert_eq!(
+            decode_request(&[Op::Init as u8]).expect("bare Init still decodes"),
+            Request::Init {
+                proto_hash: 0,
+                resume_token: 0
+            }
+        );
     }
 
     #[test]

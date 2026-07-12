@@ -428,15 +428,34 @@ fn bring_up_client(resume_token: u64) -> Result<(Client<Stream>, u64, i32), c_in
     let fd = stream.raw_fd();
     #[cfg(not(unix))]
     let fd = -1;
+    let trace = std::env::var_os("SHIM_TRACE").is_some();
+    if trace {
+        eprintln!("[shim] bring_up: connected fd={fd}");
+    }
     let mut client = Client::new(stream);
-    let token = client
-        .init(resume_token)
-        .map_err(|_| CUDA_ERROR_INITIALIZATION)?;
-    let _ = client
-        .primary_ctx_retain(0)
-        .map_err(|_| CUDA_ERROR_INITIALIZATION)?;
+    let token = client.init(resume_token).map_err(|e| {
+        if trace {
+            eprintln!("[shim] bring_up: init FAILED {e:?}");
+        }
+        CUDA_ERROR_INITIALIZATION
+    })?;
+    if trace {
+        eprintln!("[shim] bring_up: init ok token={token}");
+    }
+    client.primary_ctx_retain(0).map_err(|e| {
+        if trace {
+            eprintln!("[shim] bring_up: primary_ctx_retain FAILED {e:?}");
+        }
+        CUDA_ERROR_INITIALIZATION
+    })?;
+    if trace {
+        eprintln!("[shim] bring_up: primary_ctx_retain ok");
+    }
     if try_ring {
         ring_try_setup(&mut client); // best-effort; socket mode on failure
+    }
+    if trace {
+        eprintln!("[shim] bring_up: complete");
     }
     Ok((client, token, fd))
 }
