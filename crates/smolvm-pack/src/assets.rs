@@ -356,7 +356,11 @@ impl AssetCollector {
         // Try to copy from an existing pre-formatted template first.
         // This avoids requiring e2fsprogs on the build machine.
         if let Some(existing) = find_existing_template("storage-template.ext4") {
-            fs::copy(&existing, &template_path)?;
+            // Hole-preserving copy: the shipped storage-template.ext4 is a large
+            // (multi-GiB) sparse file, and a plain fs::copy densifies it into its
+            // full logical size of zeros on some Linux filesystems/mounts —
+            // ballooning the staging dir and failing pack builds with ENOSPC.
+            crate::extract::sparse_copy(&existing, &template_path)?;
             let metadata = fs::metadata(&template_path)?;
             self.inventory.storage_template = Some(AssetEntry {
                 path: TEMPLATE_NAME.to_string(),

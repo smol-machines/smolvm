@@ -1806,7 +1806,11 @@ pub fn extract_libs_from_binary(exe_path: &Path, debug: bool) -> std::io::Result
 /// APFS/ext4/xfs/NTFS alike. Reading over holes costs no disk I/O (the kernel
 /// serves zero pages from cache), so scanning even a mostly-empty 20 GiB
 /// template is fast.
-fn sparse_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
+///
+/// Used on both ends: the extract/run side here, and the pack-create side in
+/// `assets::create_storage_template` when it copies the pre-formatted
+/// `storage-template.ext4` into the staging directory.
+pub(crate) fn sparse_copy(src: &Path, dst: &Path) -> std::io::Result<()> {
     let mut src_file = File::open(src)?;
     let size = src_file.metadata()?.len();
 
