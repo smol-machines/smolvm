@@ -47,6 +47,7 @@ pub enum Op {
     ModuleUnload = 0x22,
     FuncGetParamInfo = 0x23,
     FuncSetAttribute = 0x24,
+    FuncGetAttribute = 0x25,
     MemAlloc = 0x30,
     MemFree = 0x31,
     MemcpyHtoD = 0x32,
@@ -142,6 +143,7 @@ impl Op {
             0x22 => Op::ModuleUnload,
             0x23 => Op::FuncGetParamInfo,
             0x24 => Op::FuncSetAttribute,
+            0x25 => Op::FuncGetAttribute,
             0x30 => Op::MemAlloc,
             0x31 => Op::MemFree,
             0x32 => Op::MemcpyHtoD,
@@ -256,6 +258,14 @@ pub enum Request {
         function: u64,
         attrib: i32,
         value: i32,
+    },
+    /// Read a `CUfunction_attribute` (max-threads, num-regs, shared/local
+    /// bytes, ptx/binary version) — forwarded so `cudaFuncGetAttributes`
+    /// returns real values instead of fakes (num_regs=0 divides by zero in
+    /// occupancy math).
+    FuncGetAttribute {
+        function: u64,
+        attrib: i32,
     },
     MemAlloc {
         bytes: u64,
@@ -728,6 +738,11 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
             w_u8(&mut b, Op::FuncGetParamInfo as u8);
             w_u64(&mut b, *function);
         }
+        Request::FuncGetAttribute { function, attrib } => {
+            w_u8(&mut b, Op::FuncGetAttribute as u8);
+            w_u64(&mut b, *function);
+            w_i32(&mut b, *attrib);
+        }
         Request::FuncSetAttribute {
             function,
             attrib,
@@ -1149,6 +1164,10 @@ pub fn decode_request(payload: &[u8]) -> io::Result<Request> {
             attrib: c.i32()?,
             value: c.i32()?,
         },
+        Op::FuncGetAttribute => Request::FuncGetAttribute {
+            function: c.u64()?,
+            attrib: c.i32()?,
+        },
         Op::MemAlloc => Request::MemAlloc { bytes: c.u64()? },
         Op::MemFree => Request::MemFree { dptr: c.u64()? },
         Op::MemcpyHtoD => Request::MemcpyHtoD {
@@ -1412,7 +1431,8 @@ pub fn decode_response(op: Op, payload: &[u8]) -> io::Result<(i32, Response)> {
         | Op::DeviceGetAttribute
         | Op::ThreadExchangeCaptureMode
         | Op::StreamQuery
-        | Op::EventQuery => Response::Count(c.i32()?),
+        | Op::EventQuery
+        | Op::FuncGetAttribute => Response::Count(c.i32()?),
         Op::DeviceGetName => Response::Name(c.string()?),
         Op::DeviceTotalMem => Response::Bytes(c.u64()?),
         Op::CtxCreate | Op::PrimaryCtxRetain => Response::Handle(c.u64()?),

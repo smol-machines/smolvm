@@ -47,6 +47,7 @@ pub struct GpuBackend {
     func_get_param_info:
         Option<unsafe extern "C" fn(*mut c_void, usize, *mut usize, *mut usize) -> CuResultCode>,
     func_set_attribute: unsafe extern "C" fn(*mut c_void, c_int, c_int) -> CuResultCode,
+    func_get_attribute: unsafe extern "C" fn(*mut c_int, c_int, *mut c_void) -> CuResultCode,
     mem_alloc: unsafe extern "C" fn(*mut u64, usize) -> CuResultCode,
     mem_free: unsafe extern "C" fn(u64) -> CuResultCode,
     memcpy_htod: unsafe extern "C" fn(u64, *const c_void, usize) -> CuResultCode,
@@ -343,6 +344,7 @@ impl GpuBackend {
                 module_unload: sym(&lib, b"cuModuleUnload\0")?,
                 func_get_param_info: sym(&lib, b"cuFuncGetParamInfo\0").ok(),
                 func_set_attribute: sym(&lib, b"cuFuncSetAttribute\0")?,
+                func_get_attribute: sym(&lib, b"cuFuncGetAttribute\0")?,
                 mem_alloc: sym(&lib, b"cuMemAlloc_v2\0")?,
                 mem_free: sym(&lib, b"cuMemFree_v2\0")?,
                 memcpy_htod: sym(&lib, b"cuMemcpyHtoD_v2\0")?,
@@ -545,6 +547,17 @@ impl Backend for GpuBackend {
                 value,
             ))
         }
+    }
+    fn func_get_attribute(&mut self, function: u64, attrib: i32) -> CuResult<i32> {
+        let mut v = 0;
+        unsafe {
+            chk((self.func_get_attribute)(
+                &mut v,
+                attrib,
+                function as *mut c_void,
+            ))?
+        };
+        Ok(v)
     }
     fn mem_alloc(&mut self, bytes: u64) -> CuResult<u64> {
         let mut dptr: u64 = 0;

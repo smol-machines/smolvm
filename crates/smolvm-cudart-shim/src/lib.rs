@@ -1843,8 +1843,14 @@ pub extern "C" fn cudaMemPoolSetAttribute(
 pub extern "C" fn cudaMemPoolGetAttribute(
     _pool: *mut c_void,
     _attr: c_int,
-    _value: *mut c_void,
+    value: *mut c_void,
 ) -> c_int {
+    // Every mempool attribute is an 8-byte value (thresholds are u64, the
+    // bool/used/reserved counters are i64). Write a defined 0 rather than
+    // leaving the caller's buffer as stack garbage.
+    if !value.is_null() {
+        unsafe { (value as *mut u64).write_unaligned(0) };
+    }
     set_last(CUDA_SUCCESS)
 }
 #[no_mangle]
@@ -1915,20 +1921,45 @@ pub extern "C" fn cudaPointerGetAttributes(attr: *mut c_void, ptr: *const c_void
     set_last(CUDA_SUCCESS)
 }
 #[no_mangle]
-pub extern "C" fn cudaFuncGetAttributes(attr: *mut c_void, _func: *const c_void) -> c_int {
+pub extern "C" fn cudaFuncGetAttributes(attr: *mut c_void, func: *const c_void) -> c_int {
     if attr.is_null() {
         return set_last(CUDA_ERROR_INVALID_VALUE);
     }
-    // cudaFuncAttributes prefix: sharedSizeBytes, constSizeBytes, localSizeBytes
-    // (size_t) then maxThreadsPerBlock, numRegs, ptxVersion, binaryVersion (int).
-    unsafe {
-        std::ptr::write_bytes(attr as *mut u8, 0, 72);
-        let ints = (attr as *mut u8).add(24) as *mut c_int;
-        *ints = 1024; // maxThreadsPerBlock
-        *ints.add(2) = 86; // ptxVersion (sm_86)
-        *ints.add(3) = 86; // binaryVersion
-    }
-    set_last(CUDA_SUCCESS)
+    // cudaFuncAttributes: sharedSizeBytes, constSizeBytes, localSizeBytes
+    // (size_t @ 0/8/16) then maxThreadsPerBlock, numRegs, ptxVersion,
+    // binaryVersion (i32 @ 24/28/32/36). Forward the real values — the old
+    // fixed fakes (numRegs=0) divided by zero in occupancy math.
+    unsafe { std::ptr::write_bytes(attr as *mut u8, 0, 72) };
+    // CUfunction_attribute: MAX_THREADS_PER_BLOCK=0, SHARED=1, CONST=2,
+    // LOCAL=3, NUM_REGS=4, PTX_VERSION=5, BINARY_VERSION=6.
+    let r = with_state(|s| {
+        let fid = s
+            .funcs
+            .get(&(func as usize))
+            .ok_or(CUDA_ERROR_INVALID_DEVICE_POINTER)?
+            .fid;
+        let get = |s: &mut ShimState, a: i32| s.client.func_get_attribute(fid, a).unwrap_or(0);
+        let shared = get(s, 1);
+        let cst = get(s, 2);
+        let local = get(s, 3);
+        let max_tpb = get(s, 0);
+        let num_regs = get(s, 4);
+        let ptx = get(s, 5);
+        let bin = get(s, 6);
+        unsafe {
+            let base = attr as *mut u8;
+            (base as *mut usize).write_unaligned(shared.max(0) as usize);
+            (base.add(8) as *mut usize).write_unaligned(cst.max(0) as usize);
+            (base.add(16) as *mut usize).write_unaligned(local.max(0) as usize);
+            let ints = base.add(24) as *mut c_int;
+            *ints = if max_tpb > 0 { max_tpb } else { 1024 };
+            *ints.add(1) = if num_regs > 0 { num_regs } else { 1 }; // never 0 (occupancy div)
+            *ints.add(2) = if ptx > 0 { ptx } else { 86 };
+            *ints.add(3) = if bin > 0 { bin } else { 86 };
+        }
+        Ok(())
+    });
+    set_last(r.err().unwrap_or(CUDA_SUCCESS))
 }
 /// Forward the shared-memory opt-in (`cudaFuncAttributeMaxDynamicSharedMemorySize`
 /// = 8, matching the driver's `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`)
@@ -1995,7 +2026,13 @@ pub extern "C" fn cudaHostGetDevicePointer(
     host: *mut c_void,
     _flags: c_uint,
 ) -> c_int {
-    set_last(unsafe { out(p_device, host) }) // unified addressing
+    // Unified-addressing convention: device VA == host VA. Correct for the
+    // memcpy path (the host recognizes guest-RAM addresses and DMAs them).
+    // KNOWN LIMITATION: a mapped host pointer passed as a KERNEL ARG can't be
+    // dereferenced by the host GPU (a guest VA isn't device-addressable) — that
+    // needs true unified memory we don't have. No validated workload does this;
+    // those that would should use explicit cudaMemcpy instead.
+    set_last(unsafe { out(p_device, host) })
 }
 #[no_mangle]
 pub extern "C" fn cudaDeviceCanAccessPeer(can: *mut c_int, _device: c_int, _peer: c_int) -> c_int {

@@ -46,6 +46,10 @@ pub trait Backend: Send {
     fn func_get_param_info(&mut self, function: u64) -> CuResult<Vec<u32>>;
     /// Set a `CUfunction_attribute` (e.g. raise max dynamic shared memory).
     fn func_set_attribute(&mut self, function: u64, attrib: i32, value: i32) -> CuResult<()>;
+    /// Read a `CUfunction_attribute`; default 0 (CPU backend has no kernels).
+    fn func_get_attribute(&mut self, _function: u64, _attrib: i32) -> CuResult<i32> {
+        Ok(0)
+    }
     fn mem_alloc(&mut self, bytes: u64) -> CuResult<u64>;
     fn mem_free(&mut self, dptr: u64) -> CuResult<()>;
     /// Copy with stream ordering: prior work on `stream` (0 = legacy default)
@@ -763,6 +767,10 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             let raw_fn = raw(&sess.functions, function)?;
             b.func_set_attribute(raw_fn, attrib, value)
                 .map(|_| Response::Ok)
+        }
+        Request::FuncGetAttribute { function, attrib } => {
+            let raw_fn = raw(&sess.functions, function)?;
+            b.func_get_attribute(raw_fn, attrib).map(Response::Count)
         }
         Request::MemAlloc { bytes } => {
             // Per-connection VRAM quota (SMOLVM_CUDA_VRAM_LIMIT_MB on the
