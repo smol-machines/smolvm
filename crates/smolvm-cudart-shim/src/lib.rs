@@ -162,6 +162,13 @@ struct ShimState {
     /// `cudaStreamGetCaptureInfo` — PyTorch's allocator calls them constantly)
     /// answer locally instead of round-tripping.
     capture: Option<(u64, u64)>,
+    /// PID that opened `client`. If the process forks (or a snapshotted VM is
+    /// restored as a clone), the inherited socket fd + ring mapping belong to
+    /// the parent and are dead here; a mismatch triggers a transparent
+    /// reconnect. The registries above survive because every connection retains
+    /// the same device primary context, so their raw module / function / device
+    /// handles stay valid across the new connection.
+    conn_pid: i32,
 }
 
 static STATE: Mutex<Option<ShimState>> = Mutex::new(None);
@@ -353,34 +360,56 @@ fn ring_try_setup(client: &mut Client<Stream>) {
     }
 }
 
+/// Open a fresh transport, run the init handshake, retain device 0's primary
+/// context, and (best-effort) set up the shared-memory rings. Used for the
+/// first connection and to re-establish one after a fork/clone.
+fn bring_up_client() -> Result<Client<Stream>, c_int> {
+    let stream = connect()?;
+    #[cfg(target_os = "linux")]
+    let try_ring = matches!(stream, Stream::Vsock(_))
+        && std::env::var("SMOLVM_CUDA_RING").as_deref() != Ok("0");
+    #[cfg(not(target_os = "linux"))]
+    let try_ring = false;
+    let mut client = Client::new(stream);
+    client.init().map_err(|_| CUDA_ERROR_INITIALIZATION)?;
+    let _ = client
+        .primary_ctx_retain(0)
+        .map_err(|_| CUDA_ERROR_INITIALIZATION)?;
+    if try_ring {
+        ring_try_setup(&mut client); // best-effort; socket mode on failure
+    }
+    Ok(client)
+}
+
 fn with_client<T>(
     f: impl FnOnce(&mut Client<Stream>) -> Result<T, CudaRpcError>,
 ) -> Result<T, c_int> {
     let mut guard = STATE.lock().map_err(|_| CUDA_ERROR_UNKNOWN)?;
-    if guard.is_none() {
-        let stream = connect()?;
-        #[cfg(target_os = "linux")]
-        let try_ring = matches!(stream, Stream::Vsock(_))
-            && std::env::var("SMOLVM_CUDA_RING").as_deref() != Ok("0");
-        #[cfg(not(target_os = "linux"))]
-        let try_ring = false;
-        let mut client = Client::new(stream);
-        client.init().map_err(|_| CUDA_ERROR_INITIALIZATION)?;
-        let _ = client
-            .primary_ctx_retain(0)
-            .map_err(|_| CUDA_ERROR_INITIALIZATION)?;
-        if try_ring {
-            ring_try_setup(&mut client); // best-effort; socket mode on failure
+    let pid = unsafe { libc::getpid() };
+    match guard.as_mut() {
+        None => {
+            let client = bring_up_client()?;
+            *guard = Some(ShimState {
+                client,
+                initialized: true,
+                modules: HashMap::new(),
+                funcs: HashMap::new(),
+                host_allocs: HashMap::new(),
+                dev_allocs: std::collections::BTreeMap::new(),
+                capture: None,
+                conn_pid: pid,
+            });
         }
-        *guard = Some(ShimState {
-            client,
-            initialized: true,
-            modules: HashMap::new(),
-            funcs: HashMap::new(),
-            host_allocs: HashMap::new(),
-            dev_allocs: std::collections::BTreeMap::new(),
-            capture: None,
-        });
+        // We forked (in-guest process fork, or a snapshotted VM restored as a
+        // clone): the inherited connection is dead. Re-establish it in place,
+        // keeping the registries — their handles are still valid because the
+        // reconnected session retains the same device primary context.
+        Some(st) if st.conn_pid != pid => {
+            st.client = bring_up_client()?;
+            st.conn_pid = pid;
+            st.capture = None; // any in-flight capture belonged to the parent
+        }
+        Some(_) => {}
     }
     let st = guard.as_mut().ok_or(CUDA_ERROR_INITIALIZATION)?;
     debug_assert!(st.initialized);
