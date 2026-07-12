@@ -95,11 +95,11 @@ smolvm machine exec --name myvm -it -- /bin/sh
 smolvm machine stop --name myvm
 ```
 
-**Use git and SSH without exposing keys** — forward your host SSH agent into the VM. Private keys never enter the guest — the hypervisor enforces this. Requires an SSH agent running on your host (`ssh-add -l` to check).
+**Use git and SSH without copying private keys into the guest** — forward your host SSH agent into the VM. The guest can ask the agent to sign with any forwarded key while the socket is available, so forward it only to workloads you trust. Requires an SSH agent running on your host (`ssh-add -l` to check).
 
 ```bash
 smolvm machine run --ssh-agent --net --image alpine -- sh -c "apk add -q openssh-client && ssh-add -l"
-# lists your host keys, but they can't be extracted from inside the VM
+# lists your host keys; private key material remains in the host agent
 
 smolvm machine exec --name myvm -- git clone git@github.com:org/private-repo.git
 ```
@@ -131,18 +131,32 @@ More examples: [python](https://github.com/smol-machines/smolvm/tree/main/exampl
 How It Works
 ------------
 
-Each workload gets real hardware isolation — its own kernel on [Hypervisor.framework](https://developer.apple.com/documentation/hypervisor) (macOS), KVM (Linux), or the [Windows Hypervisor Platform](https://learn.microsoft.com/en-us/virtualization/api/) (Windows). [libkrun](https://github.com/containers/libkrun) VMM with custom kernel: [libkrunfw](https://github.com/smol-machines/libkrunfw). Pack it into a `.smolmachine` and it runs anywhere the host architecture matches, with zero dependencies.
+Each workload runs in a hardware-virtualized VM with its own guest kernel on [Hypervisor.framework](https://developer.apple.com/documentation/hypervisor) (macOS), KVM (Linux), or the [Windows Hypervisor Platform](https://learn.microsoft.com/en-us/virtualization/api/) (Windows). [libkrun](https://github.com/containers/libkrun) is the VMM and [libkrunfw](https://github.com/smol-machines/libkrunfw) supplies the guest kernel. Pack it into a `.smolmachine` and it runs anywhere the host architecture matches, with zero dependencies.
 
 Images use the [OCI](https://opencontainers.org/) format — the same open standard Docker uses. Any image on Docker Hub, ghcr.io, or other OCI registries can be pulled and booted as a microVM. No Docker daemon required.
 
 Defaults: 4 vCPUs, 8 GiB RAM. Memory is elastic via virtio balloon — the host only commits what the guest actually uses and reclaims the rest automatically. vCPU threads sleep in the hypervisor when idle, so over-provisioning has near-zero cost. Override with `--cpus` and `--mem`.
+
+Security Model
+--------------
+
+smolvm strengthens the guest/host boundary by giving each workload a separate VM and guest kernel. It is not, by itself, a hardened multi-user control plane:
+
+* The `smolvm` CLI and VMM processes run with the permissions of the invoking host user. That user account, the host OS, the hypervisor backend, libkrun, and smolvm are in the trusted computing base.
+* Host directories passed with `--volume` are intentionally exposed to the guest with the requested access. Do not mount secrets or sensitive paths into an untrusted workload.
+* `--ssh-agent` does not copy private key material into the guest, but it grants the guest access to the forwarded agent socket and therefore the ability to request signatures while the VM is running.
+* Networking is disabled by default. Enabling `--net`, port forwarding, or host services expands the workload's reachable surface.
+* smolvm's local state and control endpoints are scoped to the invoking user's environment. For hostile local co-tenants, add host-level account separation and OS confinement around the VMM process.
+* Release archives publish SHA-256 checksums and the installer rejects a mismatch when the checksum file is available. Releases are not currently signed or accompanied by provenance attestations, and the installer permits installation when the checksum file cannot be downloaded.
+
+Treat root in the guest as untrusted. The VM boundary limits its direct access to the host, while every explicitly forwarded capability—mounts, network access, ports, and SSH agent access—becomes part of the workload's authority.
 
 Comparison
 ----------
 
 |                     | smolvm | Containers | Colima | QEMU | Firecracker | Kata |
 |---------------------|--------|------------|--------|------|-------------|------|
-| Isolation           | VM per workload | Namespace (shared kernel) | Namespace (1 VM) | Separate VM | Separate VM | VM per container |
+| Workload boundary   | VM + guest kernel | Namespace + shared kernel | Namespace inside shared VM | VM + guest kernel | VM + guest kernel | VM per container |
 | Boot time           | <200ms | ~100ms | ~seconds | ~15-30s | <125ms | ~500ms |
 | Architecture        | Library (libkrun) | Daemon | Daemon (in VM) | Process | Process | Runtime stack |
 | Per-workload VMs    | Yes | No | No (shared) | Yes | Yes | Yes |
