@@ -1688,6 +1688,10 @@ impl AgentManager {
             }
             // Shared CUDA daemon: forward so this VM's embedded host proxies to
             // the one daemon (shared GPU context across VMs / fork clones).
+            // SHARED=1 => smolvm spawns/manages the daemon; DAEMON=X => external.
+            if let Ok(shared) = std::env::var("SMOLVM_CUDA_SHARED") {
+                v.push(("SMOLVM_CUDA_SHARED", shared));
+            }
             if let Ok(daemon) = std::env::var("SMOLVM_CUDA_DAEMON") {
                 v.push(("SMOLVM_CUDA_DAEMON", daemon));
             }
