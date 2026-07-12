@@ -95,7 +95,7 @@ smolvm machine exec --name myvm -it -- /bin/sh
 smolvm machine stop --name myvm
 ```
 
-**Use git and SSH without copying private keys into the guest** — forward your host SSH agent into the VM. The guest can ask the agent to sign with any forwarded key while the socket is available, so forward it only to workloads you trust. Requires an SSH agent running on your host (`ssh-add -l` to check).
+**Use git and SSH without copying private keys into the guest.** Forward your host SSH agent into the VM. The guest can ask the agent to sign with any forwarded key while the socket is available, so forward it only to workloads you trust. Requires an SSH agent running on your host (`ssh-add -l` to check).
 
 ```bash
 smolvm machine run --ssh-agent --net --image alpine -- sh -c "apk add -q openssh-client && ssh-add -l"
@@ -149,7 +149,7 @@ smolvm strengthens the guest/host boundary by giving each workload a separate VM
 * In standalone local use, smolvm's state and control endpoints are scoped to the invoking user's environment. For hostile local co-tenants, add host-level account separation and OS confinement around the VMM process. This section does not describe the separate smolmachines cloud control plane or its tenant-isolation guarantees.
 * Release archives publish SHA-256 checksums and the installer rejects a mismatch when the checksum file is available. Releases are not currently signed or accompanied by provenance attestations, and the installer permits installation when the checksum file cannot be downloaded.
 
-Treat root in the guest as untrusted. The VM boundary limits its direct access to the host, while every explicitly forwarded capability—mounts, network access, ports, and SSH agent access—becomes part of the workload's authority.
+Treat root in the guest as untrusted. The VM boundary limits its direct access to the host, while every explicitly forwarded capability, including mounts, network access, ports, and SSH agent access, becomes part of the workload's authority.
 
 Comparison
 ----------
