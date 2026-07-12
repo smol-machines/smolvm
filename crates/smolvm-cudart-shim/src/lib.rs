@@ -445,8 +445,16 @@ pub extern "C" fn cudaDeviceSynchronize() -> c_int {
 
 #[no_mangle]
 pub extern "C" fn cudaDriverGetVersion(version: *mut c_int) -> c_int {
+    static CACHED: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+    let c = CACHED.load(std::sync::atomic::Ordering::Relaxed);
+    if c != 0 {
+        return set_last(unsafe { out(version, c) });
+    }
     set_last(match with_client(|c| c.driver_get_version()) {
-        Ok(v) => unsafe { out(version, v) },
+        Ok(v) => {
+            CACHED.store(v, std::sync::atomic::Ordering::Relaxed);
+            unsafe { out(version, v) }
+        }
         Err(e) => e,
     })
 }
@@ -1115,11 +1123,36 @@ const A_MAX_ACCESS_POLICY_WINDOW: i32 = 109;
 const A_RESERVED_SHMEM_PER_BLOCK: i32 = 111;
 const A_TIMELINE_SEMAPHORE: i32 = 114;
 
+/// Immutable per-(device, attribute) cache (see cudaDeviceGetAttribute).
+static DEV_ATTRS: Mutex<Option<HashMap<(c_int, c_int), c_int>>> = Mutex::new(None);
+fn dev_attr_cached(device: c_int, attr: c_int) -> Option<c_int> {
+    DEV_ATTRS
+        .lock()
+        .ok()?
+        .get_or_insert_with(HashMap::new)
+        .get(&(device, attr))
+        .copied()
+}
+fn dev_attr_store(device: c_int, attr: c_int, v: c_int) {
+    if let Ok(mut g) = DEV_ATTRS.lock() {
+        g.get_or_insert_with(HashMap::new).insert((device, attr), v);
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn cudaDeviceGetAttribute(value: *mut c_int, attr: c_int, device: c_int) -> c_int {
+    // Device attributes are immutable — memoize to spare a host round-trip on
+    // every repeat (torch queries them thousands of times; a remote server's
+    // network RTT makes each one expensive).
+    if let Some(v) = dev_attr_cached(device, attr) {
+        return set_last(unsafe { out(value, v) });
+    }
     set_last(
         match with_client(|c| c.device_get_attribute(attr, device)) {
-            Ok(v) => unsafe { out(value, v) },
+            Ok(v) => {
+                dev_attr_store(device, attr, v);
+                unsafe { out(value, v) }
+            }
             Err(e) => e,
         },
     )

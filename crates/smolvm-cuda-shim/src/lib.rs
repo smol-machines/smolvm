@@ -362,9 +362,21 @@ pub extern "C" fn cuDeviceTotalMem_v2(bytes: *mut usize, device: c_int) -> c_int
 
 #[no_mangle]
 pub extern "C" fn cuDeviceGetAttribute(pi: *mut c_int, attrib: c_int, device: c_int) -> c_int {
+    // Immutable — memoize to spare a host round-trip per repeat.
+    static DEV_ATTRS: Mutex<Option<HashMap<(c_int, c_int), c_int>>> = Mutex::new(None);
+    if let Ok(mut g) = DEV_ATTRS.lock() {
+        if let Some(&v) = g.get_or_insert_with(HashMap::new).get(&(device, attrib)) {
+            return ret(unsafe { out(pi, v) });
+        }
+    }
     ret(
-        with_state(|s| s.client.device_get_attribute(attrib, device))
-            .and_then(|v| unsafe { out(pi, v) }),
+        with_state(|s| s.client.device_get_attribute(attrib, device)).and_then(|v| {
+            if let Ok(mut g) = DEV_ATTRS.lock() {
+                g.get_or_insert_with(HashMap::new)
+                    .insert((device, attrib), v);
+            }
+            unsafe { out(pi, v) }
+        }),
     )
 }
 
