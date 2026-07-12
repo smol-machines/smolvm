@@ -383,18 +383,62 @@ CUDA 12.4+ drivers), streams, events, `cuGetProcAddress`. All work executes
 synchronously host-side; `*Async` calls complete before returning (permitted
 by the CUDA contract).
 
-**This covers programs written against the Driver API (the `cu*` C API), not
-the Runtime API.** A program built with `nvcc` (or PyTorch, RAPIDS, etc.) links
-NVIDIA's `libcudart`, which bootstraps by requesting a *private* internal
-driver interface via `cuGetExportTable` (a versioned UUID whose function ABIs
-are undocumented). A pure `libcuda` shim cannot provide it, so `libcudart`
-aborts during context init. Hosting Runtime-API workloads therefore requires
-remoting at the `libcudart` level instead — a separate, larger effort (see
-`docs/cuda-support-plan.md`, Phase 4). Set `SMOLVM_CUDA_SHIM_TRACE=1` to log
-which driver entry points a program resolves through the shim.
+**Runtime-API workloads (PyTorch, vLLM, Triton) are also supported** through a
+second drop-in library, [`crates/smolvm-cudart-shim`](crates/smolvm-cudart-shim)
+(soname `libcudart.so`), which lowers each `cuda*` / `__cuda*` Runtime call to
+the public Driver API and forwards cuBLAS / cuBLASLt / cuDNN through generated
+marshaling. This replaces NVIDIA's `libcudart` (whose private `cuGetExportTable`
+bootstrap a pure `libcuda` shim cannot provide) rather than sitting behind it.
+Set `SMOLVM_CUDA_SHIM_TRACE=1` to log which entry points a program resolves.
 
 Without an NVIDIA driver the host serves a CPU-emulation backend (test-only:
 it knows the `vecadd` test kernel), so the transport stays testable anywhere.
+
+### PyTorch worker images: required layout for auto-staging
+
+On `--cuda`, the agent bind-mounts the guest shims over the NVIDIA libraries it
+finds in the **image rootfs at pull time**
+(see [`crates/smolvm-agent/src/cuda.rs`](crates/smolvm-agent/src/cuda.rs),
+`find_rpath_pinned_libs`). It scans the pip-wheel layout only —
+`.../site-packages/nvidia/*/lib/{libcudart,libcublas,libcublasLt,libcudnn}.so.*`
+— and overlays the shim there because PyTorch RPATH-pins those sonames ahead of
+`LD_LIBRARY_PATH`. For this to work the image must **already contain the pip
+`torch` + `nvidia-*` wheels when smolvm pulls it**:
+
+```dockerfile
+# worker image — torch present at pull time so staging can overlay the wheels
+FROM python:3.11-slim-bookworm
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu124
+```
+
+```bash
+docker build -t torch-cuda . && docker save torch-cuda -o torch-cuda.tar
+smolvm machine run --net --cuda --mem 16384 --image ./torch-cuda.tar -- \
+  python3 -c "import torch; x=torch.randn(4,4,device='cuda',requires_grad=True); (x@x).sum().backward(); print('ok')"
+```
+
+Inside the VM the pinned sonames should be small shim bind-mounts (~600 KB), not
+the full NVIDIA libs (tens–hundreds of MB):
+
+```bash
+find /usr/local/lib/python*/site-packages/nvidia -name 'libcublas.so.12' -exec ls -la {} \;
+```
+
+Layouts that are **not** auto-staged (fall back to `LD_PRELOAD` or a different
+image):
+
+| Layout | Why it fails |
+|--------|--------------|
+| conda `pytorch/pytorch` (`/opt/conda/lib/libcublas.so.*`) | outside the `site-packages/nvidia/` scan → real lib loads |
+| `pip install torch` at **runtime** inside `machine run` | wheels don't exist at pull time → nothing to stage |
+
+For conda images, preload the runtime shim as a stopgap:
+`-e LD_PRELOAD=/opt/smolvm-cuda/libcudart-shim.so`.
+
+Recommended container env for training:
+`-e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False`. See
+[`examples/cuda-pytorch/`](examples/cuda-pytorch/) for a complete worker image
+and run recipe.
 ## Secrets
 
 smolvm stores no secret material. A secret is a *reference* to a value that

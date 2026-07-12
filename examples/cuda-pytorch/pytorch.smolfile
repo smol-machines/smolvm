@@ -1,0 +1,19 @@
+# PyTorch worker on smolvm with CUDA forwarding.
+#
+# Build the image first (torch must be present at pull time — see README.md):
+#   docker build -t torch-cuda examples/cuda-pytorch
+#   docker save torch-cuda -o torch-cuda.tar
+# Then point `image` at the tar (or a registry ref) and:
+#   smolvm machine run --cuda -s examples/cuda-pytorch/pytorch.smolfile -- python3 train.py
+
+image = "./torch-cuda.tar"
+cuda = true
+net = true
+memory = 16384
+
+# expandable-segments off is safer on the current CUDA remoting VMM surface.
+env = ["PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False"]
+
+[dev]
+volumes = ["./work:/work"]
+workdir = "/work"
