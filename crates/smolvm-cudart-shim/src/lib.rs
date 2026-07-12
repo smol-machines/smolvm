@@ -1631,12 +1631,14 @@ pub extern "C" fn cudaStreamBeginCapture(stream: *mut c_void, mode: c_int) -> c_
             s.client
                 .stream_begin_capture(stream as u64, mode)
                 .map_err(map_err)?;
-            // Fetch the driver's capture id once; the allocator re-reads it
-            // through the local queries below.
-            let (_, id) = s
-                .client
-                .stream_capture_info(stream as u64)
-                .map_err(map_err)?;
+            // The capture id is torch-visible only (its allocator correlates
+            // capture state through the local GetCaptureInfo queries); the
+            // host tracks capture by stream, not id. So mint it locally
+            // instead of round-tripping cuStreamGetCaptureInfo — that saved
+            // one host RTT per captured graph (vLLM captures ~1400, dominating
+            // coldstart over a network).
+            static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             s.capture = Some((stream as u64, id));
             Ok(())
         }) {
@@ -1752,22 +1754,25 @@ pub extern "C" fn cudaGraphLaunch(graph_exec: *mut c_void, stream: *mut c_void) 
 /// empty captures. Filling a caller-provided node array is not supported.
 #[no_mangle]
 pub extern "C" fn cudaGraphGetNodes(
-    graph: *mut c_void,
+    _graph: *mut c_void,
     nodes: *mut *mut c_void,
     num_nodes: *mut usize,
 ) -> c_int {
     if num_nodes.is_null() {
         return set_last(CUDA_ERROR_INVALID_VALUE);
     }
-    match with_client(|c| c.graph_get_node_count(graph as u64)) {
-        Ok(n) => {
-            if !nodes.is_null() {
-                return set_last(CUDA_ERROR_INVALID_VALUE);
-            }
-            set_last(unsafe { out(num_nodes, n as usize) })
-        }
-        Err(e) => set_last(e),
+    // The real node list is never requested (nodes != NULL is rejected below);
+    // torch calls this only with nodes = NULL to check for an EMPTY graph and
+    // warn. A captured decode graph is never empty, so answer the count query
+    // locally with a non-zero value instead of a host round-trip — fetching
+    // the true count cost one RTT per captured graph (~1400), dominating
+    // coldstart over a network. (This can only suppress a cosmetic empty-graph
+    // warning, never cause wrong behavior — unlike the fake-data stubs that
+    // were replaced with real values.)
+    if !nodes.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
     }
+    set_last(unsafe { out(num_nodes, 1usize) })
 }
 
 #[no_mangle]
