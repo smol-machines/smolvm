@@ -663,14 +663,21 @@ impl<S: Read + Write> Client<S> {
         read_msg(&mut self.stream)?.ok_or(CudaRpcError::Protocol("host closed mid-call"))
     }
 
-    pub fn init(&mut self) -> Result<()> {
-        self.call(
+    /// Run the connect handshake, adopting `resume_token`'s (frozen) session
+    /// handle map if non-zero. Returns this session's own lineage token, to be
+    /// replayed as `resume_token` when a fork clone reconnects.
+    pub fn init(&mut self, resume_token: u64) -> Result<u64> {
+        match self.call(
             &Request::Init {
                 proto_hash: crate::PROTO_HASH,
+                resume_token,
             },
             Op::Init,
-        )
-        .map(|_| ())
+        )? {
+            Response::Handle(token) => Ok(token),
+            // Older host that replies Ok carries no token; treat as no handoff.
+            _ => Ok(0),
+        }
     }
 
     pub fn device_get_count(&mut self) -> Result<i32> {

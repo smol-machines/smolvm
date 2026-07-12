@@ -31,6 +31,14 @@ pub const CUDA_ERROR_NOT_SUPPORTED: i32 = 801;
 /// opaque ids before they reach the guest.
 pub trait Backend: Send {
     fn init(&mut self) -> CuResult<()>;
+    /// Begin a session on this connection and return its lineage token (0 if
+    /// the backend has no handoff support). `resume_token` is 0 for a fresh
+    /// session, or a token from a prior `begin_session` whose (frozen) library
+    /// handle map this connection should adopt — the mechanism a forked VM
+    /// clone uses to keep its parent's cuBLAS/cuDNN descriptors valid.
+    fn begin_session(&mut self, _resume_token: u64) -> u64 {
+        0
+    }
     fn device_get_count(&mut self) -> CuResult<i32>;
     fn device_get_name(&mut self, device: i32) -> CuResult<String>;
     fn device_total_mem(&mut self, device: i32) -> CuResult<u64>;
@@ -717,7 +725,10 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         Ok(sess.events.get(&event).copied().unwrap_or(event))
     }
     let r: CuResult<Response> = (|| match req {
-        Request::Init { proto_hash } => {
+        Request::Init {
+            proto_hash,
+            resume_token,
+        } => {
             if proto_hash != crate::PROTO_HASH {
                 eprintln!(
                     "[smolvm-cuda] PROTOCOL MISMATCH: client wire hash {:016x} != server {:016x} \
@@ -729,7 +740,10 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 // CUDA_ERROR_NOT_SUPPORTED — surfaced at cuInit, loud and early.
                 Err(CUDA_ERROR_NOT_SUPPORTED)
             } else {
-                b.init().map(|_| Response::Ok)
+                // Adopt the parent's handle map if resuming, and hand back this
+                // session's token so a later fork-clone can resume from us.
+                let token = b.begin_session(resume_token);
+                b.init().map(|_| Response::Handle(token))
             }
         }
         Request::DeviceGetCount => b.device_get_count().map(Response::Count),
@@ -1703,7 +1717,7 @@ mod tests {
         });
 
         let mut cli = Client::new(client_side);
-        cli.init().unwrap();
+        cli.init(0).unwrap();
         assert_eq!(cli.device_get_count().unwrap(), 1);
         let module = cli.module_load_data(b"<ptx>").unwrap();
         let func = cli.module_get_function(module, "vecadd").unwrap();
@@ -1814,7 +1828,7 @@ mod tests {
         });
 
         let mut cli = Client::new(client_side);
-        cli.init().unwrap();
+        cli.init(0).unwrap();
         let vas = |r: std::ops::Range<usize>| -> Vec<*mut u8> {
             r.map(|i| (hva + i * PAGE) as *mut u8).collect()
         };
@@ -1942,6 +1956,7 @@ mod tests {
             &mut b,
             Request::Init {
                 proto_hash: crate::PROTO_HASH,
+                resume_token: 0,
             },
         );
         assert_eq!(st, 0, "matching proto hash must connect");
@@ -1950,6 +1965,7 @@ mod tests {
             &mut b,
             Request::Init {
                 proto_hash: crate::PROTO_HASH ^ 0x1,
+                resume_token: 0,
             },
         );
         assert_eq!(

@@ -169,7 +169,7 @@ fn ensure_connected(guard: &mut Option<ShimState>) -> Result<(), c_int> {
             c
         }
     };
-    if let Err(e) = client.init() {
+    if let Err(e) = client.init(0) {
         return Err(match e {
             CudaRpcError::Cuda(code) => code as c_int,
             _ => CUDA_ERROR_NO_DEVICE,

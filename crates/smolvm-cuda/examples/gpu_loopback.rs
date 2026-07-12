@@ -50,7 +50,7 @@ fn main() {
     });
 
     let mut cu = Client::new(TcpStream::connect(addr).expect("connect"));
-    cu.init().expect("cuInit");
+    cu.init(0).expect("cuInit");
     let count = cu.device_get_count().expect("device count");
     let name = cu.device_get_name(0).expect("device name");
     let vram = cu.device_total_mem(0).expect("total mem");

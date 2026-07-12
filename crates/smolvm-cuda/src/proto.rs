@@ -205,8 +205,13 @@ impl Op {
 pub enum Request {
     /// Connect handshake. `proto_hash` is the client's wire fingerprint
     /// (`crate::PROTO_HASH`); the host rejects a mismatch (stale binary).
+    /// `resume_token` is 0 for a fresh session, or a token returned by a prior
+    /// `Init` to adopt that (frozen) session's library handle map — this is how
+    /// a forked VM clone reconnects and keeps using its parent's cuBLAS/cuDNN
+    /// descriptors. The response's `Handle` carries this session's own token.
     Init {
         proto_hash: u64,
+        resume_token: u64,
     },
     DeviceGetCount,
     DeviceGetName {
@@ -688,9 +693,13 @@ pub fn read_msg<R: Read>(r: &mut R) -> io::Result<Option<Vec<u8>>> {
 pub fn encode_request(req: &Request) -> Vec<u8> {
     let mut b = Vec::new();
     match req {
-        Request::Init { proto_hash } => {
+        Request::Init {
+            proto_hash,
+            resume_token,
+        } => {
             w_u8(&mut b, Op::Init as u8);
             w_u64(&mut b, *proto_hash);
+            w_u64(&mut b, *resume_token);
         }
         Request::DeviceGetCount => w_u8(&mut b, Op::DeviceGetCount as u8),
         Request::DeviceGetName { device } => {
@@ -1146,6 +1155,7 @@ pub fn decode_request(payload: &[u8]) -> io::Result<Request> {
     Ok(match op {
         Op::Init => Request::Init {
             proto_hash: c.u64()?,
+            resume_token: c.u64()?,
         },
         Op::DeviceGetCount => Request::DeviceGetCount,
         Op::DeviceGetName => Request::DeviceGetName { device: c.i32()? },
@@ -1449,6 +1459,8 @@ pub fn decode_response(op: Op, payload: &[u8]) -> io::Result<(i32, Response)> {
         | Op::FuncGetAttribute => Response::Count(c.i32()?),
         Op::DeviceGetName => Response::Name(c.string()?),
         Op::DeviceTotalMem => Response::Bytes(c.u64()?),
+        // Init hands back this session's lineage token (for fork-clone handoff).
+        Op::Init => Response::Handle(c.u64()?),
         Op::CtxCreate | Op::PrimaryCtxRetain => Response::Handle(c.u64()?),
         Op::ModuleLoadData | Op::ModuleGetFunction => Response::Handle(c.u64()?),
         Op::StreamCreate | Op::EventCreate => Response::Handle(c.u64()?),
@@ -1522,6 +1534,7 @@ mod tests {
     fn request_roundtrips() {
         roundtrip(Request::Init {
             proto_hash: 0xdeadbeef,
+            resume_token: 0x1234,
         });
         roundtrip(Request::DeviceGetCount);
         roundtrip(Request::DeviceGetName { device: 3 });

@@ -169,6 +169,11 @@ struct ShimState {
     /// the same device primary context, so their raw module / function / device
     /// handles stay valid across the new connection.
     conn_pid: i32,
+    /// Lineage token the host assigned this session. Inherited by a fork clone
+    /// (it lives in this CoW guest memory), so on reconnect the clone replays it
+    /// as the resume token and the host seeds the clone's fresh connection with
+    /// the parent's cuBLAS/cuDNN handle map. 0 = host has no handoff support.
+    conn_token: u64,
 }
 
 static STATE: Mutex<Option<ShimState>> = Mutex::new(None);
@@ -360,10 +365,12 @@ fn ring_try_setup(client: &mut Client<Stream>) {
     }
 }
 
-/// Open a fresh transport, run the init handshake, retain device 0's primary
-/// context, and (best-effort) set up the shared-memory rings. Used for the
-/// first connection and to re-establish one after a fork/clone.
-fn bring_up_client() -> Result<Client<Stream>, c_int> {
+/// Open a fresh transport, run the init handshake (adopting `resume_token`'s
+/// session handle map if non-zero), retain device 0's primary context, and
+/// (best-effort) set up the shared-memory rings. Used for the first connection
+/// and to re-establish one after a fork/clone. Returns the client and the
+/// lineage token the host assigned this session.
+fn bring_up_client(resume_token: u64) -> Result<(Client<Stream>, u64), c_int> {
     let stream = connect()?;
     #[cfg(target_os = "linux")]
     let try_ring = matches!(stream, Stream::Vsock(_))
@@ -371,14 +378,16 @@ fn bring_up_client() -> Result<Client<Stream>, c_int> {
     #[cfg(not(target_os = "linux"))]
     let try_ring = false;
     let mut client = Client::new(stream);
-    client.init().map_err(|_| CUDA_ERROR_INITIALIZATION)?;
+    let token = client
+        .init(resume_token)
+        .map_err(|_| CUDA_ERROR_INITIALIZATION)?;
     let _ = client
         .primary_ctx_retain(0)
         .map_err(|_| CUDA_ERROR_INITIALIZATION)?;
     if try_ring {
         ring_try_setup(&mut client); // best-effort; socket mode on failure
     }
-    Ok(client)
+    Ok((client, token))
 }
 
 fn with_client<T>(
@@ -388,7 +397,7 @@ fn with_client<T>(
     let pid = unsafe { libc::getpid() };
     match guard.as_mut() {
         None => {
-            let client = bring_up_client()?;
+            let (client, token) = bring_up_client(0)?;
             *guard = Some(ShimState {
                 client,
                 initialized: true,
@@ -398,14 +407,25 @@ fn with_client<T>(
                 dev_allocs: std::collections::BTreeMap::new(),
                 capture: None,
                 conn_pid: pid,
+                conn_token: token,
             });
         }
         // We forked (in-guest process fork, or a snapshotted VM restored as a
         // clone): the inherited connection is dead. Re-establish it in place,
-        // keeping the registries — their handles are still valid because the
-        // reconnected session retains the same device primary context.
+        // resuming from the parent's lineage token so the host seeds this
+        // connection with the parent's library handle map. The registries here
+        // stay valid because the reconnected session retains the same device
+        // primary context.
         Some(st) if st.conn_pid != pid => {
-            st.client = bring_up_client()?;
+            if std::env::var_os("SHIM_TRACE").is_some() {
+                eprintln!(
+                    "[shim] fork detected pid {}->{}, reconnect resume_token={}",
+                    st.conn_pid, pid, st.conn_token
+                );
+            }
+            let (client, token) = bring_up_client(st.conn_token)?;
+            st.client = client;
+            st.conn_token = token;
             st.conn_pid = pid;
             st.capture = None; // any in-flight capture belonged to the parent
         }

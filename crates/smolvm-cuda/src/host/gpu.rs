@@ -141,7 +141,13 @@ pub struct GpuBackend {
     /// pointer. Lets the guest fire-and-forget descriptor creation: it invents
     /// the id, the host materializes and maps it, and every later reference is
     /// translated here. Real pointers (bit 63 clear) pass through untouched.
-    vhandles: std::collections::HashMap<u64, u64>,
+    ///
+    /// Behind `Arc<Mutex>` so a fork clone's reconnecting session can adopt a
+    /// snapshot of its (frozen) parent's map — the descriptors are real host
+    /// pointers valid in the shared primary context, so copying the id→pointer
+    /// pairs is enough. Lock cost is negligible: every access already sits
+    /// behind a guest round-trip.
+    vhandles: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, u64>>>,
     /// Host mappings of guest RAM, each `(gpa_start, host_va, len)`, for
     /// zero-copy `memcpy_gpa_*` (via `krun_get_guest_ram`). Empty outside a
     /// microVM / on older libkrun. Guest RAM is usually split into a low and a
@@ -401,7 +407,9 @@ impl GpuBackend {
                 cublas_gen: None,
                 cudnn_gen: None,
                 cudnn_backend: None,
-                vhandles: std::collections::HashMap::new(),
+                vhandles: std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::HashMap::new(),
+                )),
                 cublaslt: None,
                 cudnn_bn: None,
                 guest_ram: Vec::new(),
@@ -424,9 +432,47 @@ fn chk(code: CuResultCode) -> CuResult<()> {
     }
 }
 
+/// Registry of live sessions' `vhandles` maps, keyed by lineage token. Holds
+/// `Weak` refs so a session's entry evaporates when its connection closes; a
+/// fork clone resuming a dead token just starts with an empty map. Lets a
+/// clone's fresh connection adopt a snapshot of its (frozen) parent's handle
+/// map — see [`GpuBackend::begin_session`].
+type VhMap = std::sync::Mutex<std::collections::HashMap<u64, u64>>;
+static HANDOFF: std::sync::Mutex<
+    Option<std::collections::HashMap<u64, std::sync::Weak<VhMap>>>,
+> = std::sync::Mutex::new(None);
+
+fn next_lineage_token() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Adopt `resume_token`'s (frozen) descriptor map into `dst`, then register
+/// `dst` under a fresh token and return it. The parent's entries are real host
+/// pointers valid in the shared primary context, so copying id→pointer pairs is
+/// enough for a fork clone to keep using them. Closed sessions' entries (dead
+/// `Weak`s) are pruned on the way through.
+fn handoff_register(dst: &std::sync::Arc<VhMap>, resume_token: u64) -> u64 {
+    let mut reg = HANDOFF.lock().unwrap();
+    let reg = reg.get_or_insert_with(std::collections::HashMap::new);
+    if resume_token != 0 {
+        if let Some(parent) = reg.get(&resume_token).and_then(|w| w.upgrade()) {
+            *dst.lock().unwrap() = parent.lock().unwrap().clone();
+        }
+    }
+    let token = next_lineage_token();
+    reg.retain(|_, w| w.strong_count() > 0);
+    reg.insert(token, std::sync::Arc::downgrade(dst));
+    token
+}
+
 impl Backend for GpuBackend {
     fn init(&mut self) -> CuResult<()> {
         unsafe { chk((self.init)(0)) }
+    }
+    fn begin_session(&mut self, resume_token: u64) -> u64 {
+        handoff_register(&self.vhandles, resume_token)
     }
     fn device_get_count(&mut self) -> CuResult<i32> {
         let mut n = 0;
@@ -2195,12 +2241,12 @@ impl GpuBackend {
                         }
                     }
                 }
-                Ok(self.cublas_gen.as_ref().unwrap().dispatch(
-                    func,
-                    args,
-                    &mut self.vhandles,
-                    streams,
-                ))
+                let mut vh = self.vhandles.lock().unwrap();
+                Ok(self
+                    .cublas_gen
+                    .as_ref()
+                    .unwrap()
+                    .dispatch(func, args, &mut vh, streams))
             }
             LIB_CUDNN => {
                 if self.cudnn_gen.is_none() {
@@ -2212,12 +2258,12 @@ impl GpuBackend {
                         }
                     }
                 }
-                Ok(self.cudnn_gen.as_ref().unwrap().dispatch(
-                    func,
-                    args,
-                    &mut self.vhandles,
-                    streams,
-                ))
+                let mut vh = self.vhandles.lock().unwrap();
+                Ok(self
+                    .cudnn_gen
+                    .as_ref()
+                    .unwrap()
+                    .dispatch(func, args, &mut vh, streams))
             }
             LIB_CUDNN_BACKEND => {
                 if self.cudnn_backend.is_none() {
@@ -2229,11 +2275,12 @@ impl GpuBackend {
                         }
                     }
                 }
+                let mut vh = self.vhandles.lock().unwrap();
                 Ok(self
                     .cudnn_backend
                     .as_ref()
                     .unwrap()
-                    .dispatch(func, args, &mut self.vhandles))
+                    .dispatch(func, args, &mut vh))
             }
             LIB_CUBLASLT => {
                 if self.cublaslt.is_none() {
@@ -2245,12 +2292,12 @@ impl GpuBackend {
                         }
                     }
                 }
-                Ok(self.cublaslt.as_ref().unwrap().dispatch(
-                    func,
-                    args,
-                    &mut self.vhandles,
-                    streams,
-                ))
+                let mut vh = self.vhandles.lock().unwrap();
+                Ok(self
+                    .cublaslt
+                    .as_ref()
+                    .unwrap()
+                    .dispatch(func, args, &mut vh, streams))
             }
             LIB_CUDNN_BN => {
                 if self.cudnn_bn.is_none() {
@@ -2262,11 +2309,12 @@ impl GpuBackend {
                         }
                     }
                 }
+                let vh = self.vhandles.lock().unwrap();
                 Ok(self
                     .cudnn_bn
                     .as_ref()
                     .unwrap()
-                    .dispatch(func, args, &self.vhandles))
+                    .dispatch(func, args, &vh))
             }
             _ => Err(super::CUDA_ERROR_NOT_FOUND),
         }
@@ -2310,5 +2358,63 @@ fn zc_trace_segments(dir: &str, segments: &[(u64, u64)]) {
             "[zc-host] {dir} gpa memcpy: {total} bytes in {} segment(s)",
             segments.len()
         ));
+    }
+}
+
+#[cfg(test)]
+mod handoff_tests {
+    use super::handoff_register;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    fn map(pairs: &[(u64, u64)]) -> Arc<Mutex<HashMap<u64, u64>>> {
+        Arc::new(Mutex::new(pairs.iter().copied().collect()))
+    }
+
+    // A fork clone (fresh, empty handle map) resuming its parent's token adopts
+    // the parent's live descriptor map — the mechanism that keeps a clone's
+    // cuBLAS/cuDNN handles valid after it reconnects.
+    #[test]
+    fn clone_adopts_parent_handle_map() {
+        // Parent registers (fresh), then creates a descriptor after the fact —
+        // the clone must see it because the registry holds the live map.
+        let parent = map(&[]);
+        let ptoken = handoff_register(&parent, 0);
+        assert_ne!(ptoken, 0, "a session gets a non-zero lineage token");
+        parent.lock().unwrap().insert(1 << 63, 0xdead_beef);
+
+        let clone = map(&[]);
+        let ctoken = handoff_register(&clone, ptoken);
+        assert_ne!(ctoken, ptoken, "the clone gets its own token");
+        assert_eq!(
+            clone.lock().unwrap().get(&(1 << 63)).copied(),
+            Some(0xdead_beef),
+            "clone adopted the parent's descriptor"
+        );
+
+        // The clone's own later descriptors do not leak back into the parent.
+        clone.lock().unwrap().insert((1 << 63) | 2, 0x1234);
+        assert!(
+            !parent.lock().unwrap().contains_key(&((1 << 63) | 2)),
+            "clone and parent maps are independent copies"
+        );
+    }
+
+    // Resuming a token whose session has closed (its map dropped) is not an
+    // error — the clone simply starts empty instead of faulting.
+    #[test]
+    fn resuming_a_dead_token_is_harmless() {
+        let dead_token = {
+            let gone = map(&[(1 << 63, 7)]);
+            handoff_register(&gone, 0)
+            // `gone` drops here; the registry's Weak can no longer upgrade.
+        };
+        let clone = map(&[]);
+        let t = handoff_register(&clone, dead_token);
+        assert_ne!(t, 0);
+        assert!(
+            clone.lock().unwrap().is_empty(),
+            "no parent to adopt → empty map, no panic"
+        );
     }
 }
