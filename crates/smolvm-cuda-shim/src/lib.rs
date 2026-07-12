@@ -939,6 +939,26 @@ pub extern "C" fn cuLaunchKernelEx(
     }
     // SAFETY: caller passes a valid CUlaunchConfig.
     let c = unsafe { &*(config as *const CuLaunchConfig) };
+    // The attribute array is dropped when lowering to the plain launch. If a
+    // kernel *requires* an attribute (e.g. a cluster dimension or cooperative
+    // launch), that silent drop produces a launch the driver may reject with
+    // INVALID_VALUE — a prime suspect for fused-SDPA-backward failures (#597).
+    // Surface it under the trace env so the gap is diagnosable on a GPU host.
+    if c.num_attrs != 0 && shim_trace_on() {
+        eprintln!(
+            "[shim] cuLaunchKernelEx func={:#x} grid=[{},{},{}] block=[{},{},{}] \
+             shared={} DROPPING {} launch attribute(s) (see #597)",
+            func as u64,
+            c.grid_x,
+            c.grid_y,
+            c.grid_z,
+            c.block_x,
+            c.block_y,
+            c.block_z,
+            c.shared_bytes,
+            c.num_attrs,
+        );
+    }
     cuLaunchKernel(
         func,
         c.grid_x,
@@ -1085,7 +1105,16 @@ pub extern "C" fn cuLaunchKernel(
         Vec::new()
     } else {
         if kernel_params.is_null() {
-            // The `extra` buffer-pointer convention is not implemented.
+            // The `extra` buffer-pointer convention (CU_LAUNCH_PARAM_BUFFER_*)
+            // is not implemented — some kernels pass args this way instead of a
+            // kernelParams array. Trace it: another #597 suspect.
+            if shim_trace_on() {
+                eprintln!(
+                    "[shim] cuLaunchKernel func={fh:#x} params via `extra` buffer \
+                     convention (extra={}) — UNSUPPORTED (see #597)",
+                    if extra.is_null() { "null" } else { "set" },
+                );
+            }
             return if extra.is_null() {
                 CUDA_ERROR_INVALID_VALUE
             } else {
@@ -1101,7 +1130,7 @@ pub extern "C" fn cuLaunchKernel(
             })
             .collect()
     };
-    ret(with_state(|s| {
+    let code = ret(with_state(|s| {
         s.client.launch_kernel(
             fh,
             [grid_x, grid_y, grid_z],
@@ -1110,7 +1139,17 @@ pub extern "C" fn cuLaunchKernel(
             stream as u64,
             &params,
         )
-    }))
+    }));
+    // Log launches that the host/driver rejected — pinpoints which kernel and
+    // param shape yields INVALID_VALUE (fused-attention backward, #597).
+    if code != CUDA_SUCCESS && shim_trace_on() {
+        eprintln!(
+            "[shim] cuLaunchKernel func={fh:#x} grid=[{grid_x},{grid_y},{grid_z}] \
+             block=[{block_x},{block_y},{block_z}] shared={shared_bytes} nparams={} -> err {code}",
+            params.len(),
+        );
+    }
+    code
 }
 
 // ---- streams / events ----------------------------------------------------------------
@@ -1371,13 +1410,11 @@ pub extern "C" fn cuGetProcAddress_v2(
     }
 }
 
-/// When `SMOLVM_CUDA_SHIM_TRACE` is set, log each cuGetProcAddress lookup and
-/// whether the shim served it — the fastest way to enumerate the surface a
-/// given CUDA runtime needs. No-op otherwise.
-fn trace_proc(name: &str, hit: bool) {
+/// Whether `SMOLVM_CUDA_SHIM_TRACE` is set (cached after first read).
+fn shim_trace_on() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
     static ENABLED: AtomicU8 = AtomicU8::new(0); // 0=unknown, 1=on, 2=off
-    let on = match ENABLED.load(Ordering::Relaxed) {
+    match ENABLED.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
         _ => {
@@ -1385,8 +1422,14 @@ fn trace_proc(name: &str, hit: bool) {
             ENABLED.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
-    };
-    if on {
+    }
+}
+
+/// When `SMOLVM_CUDA_SHIM_TRACE` is set, log each cuGetProcAddress lookup and
+/// whether the shim served it — the fastest way to enumerate the surface a
+/// given CUDA runtime needs. No-op otherwise.
+fn trace_proc(name: &str, hit: bool) {
+    if shim_trace_on() {
         eprintln!(
             "[shim] cuGetProcAddress {name} -> {}",
             if hit { "hit" } else { "MISS" }
