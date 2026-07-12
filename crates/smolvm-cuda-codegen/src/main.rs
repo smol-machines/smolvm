@@ -143,6 +143,163 @@ fn cublas_spec() -> Lib {
             i("batchCount"),
         ],
     };
+    // ---- BLAS Level 1/2/3 (device-pointer ops with host scalars) ----
+    // Reduction ops (dot/nrm2/asum/amax) are omitted deliberately: their
+    // result pointer is host- or device-resident depending on the handle's
+    // pointer mode, which this uniform marshaling can't disambiguate — they
+    // stay honest NOT_SUPPORTED stubs rather than risk a silently-wrong result.
+    let ic = i; // alias for closures below
+    let dp = |n, ety: &'static str, m: bool| {
+        p(
+            n,
+            leak(format!("*{} {ety}", if m { "mut" } else { "const" })),
+            DevPtr,
+        )
+    };
+    let hin = |n, ety: &'static str| p(n, leak(format!("*const {ety}")), HostInScalar(ety));
+    let axpy = |sym, real, ety: &'static str| Fun {
+        sym,
+        real,
+        params: vec![
+            handle(),
+            ic("n"),
+            hin("alpha", ety),
+            dp("x", ety, false),
+            ic("incx"),
+            dp("y", ety, true),
+            ic("incy"),
+        ],
+    };
+    let scal = |sym, real, ety: &'static str| Fun {
+        sym,
+        real,
+        params: vec![
+            handle(),
+            ic("n"),
+            hin("alpha", ety),
+            dp("x", ety, true),
+            ic("incx"),
+        ],
+    };
+    let copyswap = |sym, real, ety: &'static str| Fun {
+        sym,
+        real,
+        params: vec![
+            handle(),
+            ic("n"),
+            dp("x", ety, true),
+            ic("incx"),
+            dp("y", ety, true),
+            ic("incy"),
+        ],
+    };
+    let gemv = |sym, real, ety: &'static str| Fun {
+        sym,
+        real,
+        params: vec![
+            handle(),
+            ic("trans"),
+            ic("m"),
+            ic("n"),
+            hin("alpha", ety),
+            dp("A", ety, false),
+            ic("lda"),
+            dp("x", ety, false),
+            ic("incx"),
+            hin("beta", ety),
+            dp("y", ety, true),
+            ic("incy"),
+        ],
+    };
+    let ger = |sym, real, ety: &'static str| Fun {
+        sym,
+        real,
+        params: vec![
+            handle(),
+            ic("m"),
+            ic("n"),
+            hin("alpha", ety),
+            dp("x", ety, false),
+            ic("incx"),
+            dp("y", ety, false),
+            ic("incy"),
+            dp("A", ety, true),
+            ic("lda"),
+        ],
+    };
+    let geam = |sym, real, ety: &'static str| Fun {
+        sym,
+        real,
+        params: vec![
+            handle(),
+            ic("transa"),
+            ic("transb"),
+            ic("m"),
+            ic("n"),
+            hin("alpha", ety),
+            dp("A", ety, false),
+            ic("lda"),
+            hin("beta", ety),
+            dp("B", ety, false),
+            ic("ldb"),
+            dp("C", ety, true),
+            ic("ldc"),
+        ],
+    };
+    let syrk = |sym, real, ety: &'static str| Fun {
+        sym,
+        real,
+        params: vec![
+            handle(),
+            ic("uplo"),
+            ic("trans"),
+            ic("n"),
+            ic("k"),
+            hin("alpha", ety),
+            dp("A", ety, false),
+            ic("lda"),
+            hin("beta", ety),
+            dp("C", ety, true),
+            ic("ldc"),
+        ],
+    };
+    let symm = |sym, real, ety: &'static str| Fun {
+        sym,
+        real,
+        params: vec![
+            handle(),
+            ic("side"),
+            ic("uplo"),
+            ic("m"),
+            ic("n"),
+            hin("alpha", ety),
+            dp("A", ety, false),
+            ic("lda"),
+            dp("B", ety, false),
+            ic("ldb"),
+            hin("beta", ety),
+            dp("C", ety, true),
+            ic("ldc"),
+        ],
+    };
+    let trsm = |sym, real, ety: &'static str| Fun {
+        sym,
+        real,
+        params: vec![
+            handle(),
+            ic("side"),
+            ic("uplo"),
+            ic("trans"),
+            ic("diag"),
+            ic("m"),
+            ic("n"),
+            hin("alpha", ety),
+            dp("A", ety, false),
+            ic("lda"),
+            dp("B", ety, true),
+            ic("ldb"),
+        ],
+    };
     Lib {
         name: "cublas",
         id: 1,
@@ -294,6 +451,27 @@ fn cublas_spec() -> Lib {
                     i("algo"),
                 ],
             },
+            // BLAS Level 1/2/3 — appended (indices grow; existing ones stable).
+            axpy("cublasSaxpy_v2", "cublasSaxpy_v2", "f32"),
+            axpy("cublasDaxpy_v2", "cublasDaxpy_v2", "f64"),
+            scal("cublasSscal_v2", "cublasSscal_v2", "f32"),
+            scal("cublasDscal_v2", "cublasDscal_v2", "f64"),
+            copyswap("cublasScopy_v2", "cublasScopy_v2", "f32"),
+            copyswap("cublasDcopy_v2", "cublasDcopy_v2", "f64"),
+            copyswap("cublasSswap_v2", "cublasSswap_v2", "f32"),
+            copyswap("cublasDswap_v2", "cublasDswap_v2", "f64"),
+            gemv("cublasSgemv_v2", "cublasSgemv_v2", "f32"),
+            gemv("cublasDgemv_v2", "cublasDgemv_v2", "f64"),
+            ger("cublasSger_v2", "cublasSger_v2", "f32"),
+            ger("cublasDger_v2", "cublasDger_v2", "f64"),
+            geam("cublasSgeam", "cublasSgeam", "f32"),
+            geam("cublasDgeam", "cublasDgeam", "f64"),
+            syrk("cublasSsyrk_v2", "cublasSsyrk_v2", "f32"),
+            syrk("cublasDsyrk_v2", "cublasDsyrk_v2", "f64"),
+            symm("cublasSsymm_v2", "cublasSsymm_v2", "f32"),
+            symm("cublasDsymm_v2", "cublasDsymm_v2", "f64"),
+            trsm("cublasStrsm_v2", "cublasStrsm_v2", "f32"),
+            trsm("cublasDtrsm_v2", "cublasDtrsm_v2", "f64"),
         ],
     }
 }

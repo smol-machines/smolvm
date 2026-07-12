@@ -270,3 +270,337 @@ pub extern "C" fn cublasGemmBatchedEx(handle: *mut c_void, transa: c_int, transb
     // No output params: fire-and-forget (failures surface as sticky async errors).
     match with_client(|c| c.lib_call_deferred(LIB_ID, 14, a)) { Ok(()) => 0, Err(_) => 1 }
 }
+#[no_mangle]
+pub extern "C" fn cublasSaxpy_v2(handle: *mut c_void, n: c_int, alpha: *const f32, x: *const f32, incx: c_int, y: *mut f32, incy: c_int) -> c_int {
+    let mut a: Vec<u8> = Vec::new();
+    a.extend_from_slice(&(handle as u64).to_le_bytes());
+    a.extend_from_slice(&(n as i32).to_le_bytes());
+    if alpha.is_null() { return 1; }
+    a.extend_from_slice(&(unsafe { *alpha } as f32).to_le_bytes());
+    a.extend_from_slice(&(x as u64).to_le_bytes());
+    a.extend_from_slice(&(incx as i32).to_le_bytes());
+    a.extend_from_slice(&(y as u64).to_le_bytes());
+    a.extend_from_slice(&(incy as i32).to_le_bytes());
+    // No output params: fire-and-forget (failures surface as sticky async errors).
+    match with_client(|c| c.lib_call_deferred(LIB_ID, 15, a)) { Ok(()) => 0, Err(_) => 1 }
+}
+#[no_mangle]
+pub extern "C" fn cublasDaxpy_v2(handle: *mut c_void, n: c_int, alpha: *const f64, x: *const f64, incx: c_int, y: *mut f64, incy: c_int) -> c_int {
+    let mut a: Vec<u8> = Vec::new();
+    a.extend_from_slice(&(handle as u64).to_le_bytes());
+    a.extend_from_slice(&(n as i32).to_le_bytes());
+    if alpha.is_null() { return 1; }
+    a.extend_from_slice(&(unsafe { *alpha } as f64).to_le_bytes());
+    a.extend_from_slice(&(x as u64).to_le_bytes());
+    a.extend_from_slice(&(incx as i32).to_le_bytes());
+    a.extend_from_slice(&(y as u64).to_le_bytes());
+    a.extend_from_slice(&(incy as i32).to_le_bytes());
+    // No output params: fire-and-forget (failures surface as sticky async errors).
+    match with_client(|c| c.lib_call_deferred(LIB_ID, 16, a)) { Ok(()) => 0, Err(_) => 1 }
+}
+#[no_mangle]
+pub extern "C" fn cublasSscal_v2(handle: *mut c_void, n: c_int, alpha: *const f32, x: *mut f32, incx: c_int) -> c_int {
+    let mut a: Vec<u8> = Vec::new();
+    a.extend_from_slice(&(handle as u64).to_le_bytes());
+    a.extend_from_slice(&(n as i32).to_le_bytes());
+    if alpha.is_null() { return 1; }
+    a.extend_from_slice(&(unsafe { *alpha } as f32).to_le_bytes());
+    a.extend_from_slice(&(x as u64).to_le_bytes());
+    a.extend_from_slice(&(incx as i32).to_le_bytes());
+    // No output params: fire-and-forget (failures surface as sticky async errors).
+    match with_client(|c| c.lib_call_deferred(LIB_ID, 17, a)) { Ok(()) => 0, Err(_) => 1 }
+}
+#[no_mangle]
+pub extern "C" fn cublasDscal_v2(handle: *mut c_void, n: c_int, alpha: *const f64, x: *mut f64, incx: c_int) -> c_int {
+    let mut a: Vec<u8> = Vec::new();
+    a.extend_from_slice(&(handle as u64).to_le_bytes());
+    a.extend_from_slice(&(n as i32).to_le_bytes());
+    if alpha.is_null() { return 1; }
+    a.extend_from_slice(&(unsafe { *alpha } as f64).to_le_bytes());
+    a.extend_from_slice(&(x as u64).to_le_bytes());
+    a.extend_from_slice(&(incx as i32).to_le_bytes());
+    // No output params: fire-and-forget (failures surface as sticky async errors).
+    match with_client(|c| c.lib_call_deferred(LIB_ID, 18, a)) { Ok(()) => 0, Err(_) => 1 }
+}
+#[no_mangle]
+pub extern "C" fn cublasScopy_v2(handle: *mut c_void, n: c_int, x: *mut f32, incx: c_int, y: *mut f32, incy: c_int) -> c_int {
+    let mut a: Vec<u8> = Vec::new();
+    a.extend_from_slice(&(handle as u64).to_le_bytes());
+    a.extend_from_slice(&(n as i32).to_le_bytes());
+    a.extend_from_slice(&(x as u64).to_le_bytes());
+    a.extend_from_slice(&(incx as i32).to_le_bytes());
+    a.extend_from_slice(&(y as u64).to_le_bytes());
+    a.extend_from_slice(&(incy as i32).to_le_bytes());
+    // No output params: fire-and-forget (failures surface as sticky async errors).
+    match with_client(|c| c.lib_call_deferred(LIB_ID, 19, a)) { Ok(()) => 0, Err(_) => 1 }
+}
+#[no_mangle]
+pub extern "C" fn cublasDcopy_v2(handle: *mut c_void, n: c_int, x: *mut f64, incx: c_int, y: *mut f64, incy: c_int) -> c_int {
+    let mut a: Vec<u8> = Vec::new();
+    a.extend_from_slice(&(handle as u64).to_le_bytes());
+    a.extend_from_slice(&(n as i32).to_le_bytes());
+    a.extend_from_slice(&(x as u64).to_le_bytes());
+    a.extend_from_slice(&(incx as i32).to_le_bytes());
+    a.extend_from_slice(&(y as u64).to_le_bytes());
+    a.extend_from_slice(&(incy as i32).to_le_bytes());
+    // No output params: fire-and-forget (failures surface as sticky async errors).
+    match with_client(|c| c.lib_call_deferred(LIB_ID, 20, a)) { Ok(()) => 0, Err(_) => 1 }
+}
+#[no_mangle]
+pub extern "C" fn cublasSswap_v2(handle: *mut c_void, n: c_int, x: *mut f32, incx: c_int, y: *mut f32, incy: c_int) -> c_int {
+    let mut a: Vec<u8> = Vec::new();
+    a.extend_from_slice(&(handle as u64).to_le_bytes());
+    a.extend_from_slice(&(n as i32).to_le_bytes());
+    a.extend_from_slice(&(x as u64).to_le_bytes());
+    a.extend_from_slice(&(incx as i32).to_le_bytes());
+    a.extend_from_slice(&(y as u64).to_le_bytes());
+    a.extend_from_slice(&(incy as i32).to_le_bytes());
+    // No output params: fire-and-forget (failures surface as sticky async errors).
+    match with_client(|c| c.lib_call_deferred(LIB_ID, 21, a)) { Ok(()) => 0, Err(_) => 1 }
+}
+#[no_mangle]
+pub extern "C" fn cublasDswap_v2(handle: *mut c_void, n: c_int, x: *mut f64, incx: c_int, y: *mut f64, incy: c_int) -> c_int {
+    let mut a: Vec<u8> = Vec::new();
+    a.extend_from_slice(&(handle as u64).to_le_bytes());
+    a.extend_from_slice(&(n as i32).to_le_bytes());
+    a.extend_from_slice(&(x as u64).to_le_bytes());
+    a.extend_from_slice(&(incx as i32).to_le_bytes());
+    a.extend_from_slice(&(y as u64).to_le_bytes());
+    a.extend_from_slice(&(incy as i32).to_le_bytes());
+    // No output params: fire-and-forget (failures surface as sticky async errors).
+    match with_client(|c| c.lib_call_deferred(LIB_ID, 22, a)) { Ok(()) => 0, Err(_) => 1 }
+}
+#[no_mangle]
+pub extern "C" fn cublasSgemv_v2(handle: *mut c_void, trans: c_int, m: c_int, n: c_int, alpha: *const f32, A: *const f32, lda: c_int, x: *const f32, incx: c_int, beta: *const f32, y: *mut f32, incy: c_int) -> c_int {
+    let mut a: Vec<u8> = Vec::new();
+    a.extend_from_slice(&(handle as u64).to_le_bytes());
+    a.extend_from_slice(&(trans as i32).to_le_bytes());
+    a.extend_from_slice(&(m as i32).to_le_bytes());
+    a.extend_from_slice(&(n as i32).to_le_bytes());
+    if alpha.is_null() { return 1; }
+    a.extend_from_slice(&(unsafe { *alpha } as f32).to_le_bytes());
+    a.extend_from_slice(&(A as u64).to_le_bytes());
+    a.extend_from_slice(&(lda as i32).to_le_bytes());
+    a.extend_from_slice(&(x as u64).to_le_bytes());
+    a.extend_from_slice(&(incx as i32).to_le_bytes());
+    if beta.is_null() { return 1; }
+    a.extend_from_slice(&(unsafe { *beta } as f32).to_le_bytes());
+    a.extend_from_slice(&(y as u64).to_le_bytes());
+    a.extend_from_slice(&(incy as i32).to_le_bytes());
+    // No output params: fire-and-forget (failures surface as sticky async errors).
+    match with_client(|c| c.lib_call_deferred(LIB_ID, 23, a)) { Ok(()) => 0, Err(_) => 1 }
+}
+#[no_mangle]
+pub extern "C" fn cublasDgemv_v2(handle: *mut c_void, trans: c_int, m: c_int, n: c_int, alpha: *const f64, A: *const f64, lda: c_int, x: *const f64, incx: c_int, beta: *const f64, y: *mut f64, incy: c_int) -> c_int {
+    let mut a: Vec<u8> = Vec::new();
+    a.extend_from_slice(&(handle as u64).to_le_bytes());
+    a.extend_from_slice(&(trans as i32).to_le_bytes());
+    a.extend_from_slice(&(m as i32).to_le_bytes());
+    a.extend_from_slice(&(n as i32).to_le_bytes());
+    if alpha.is_null() { return 1; }
+    a.extend_from_slice(&(unsafe { *alpha } as f64).to_le_bytes());
+    a.extend_from_slice(&(A as u64).to_le_bytes());
+    a.extend_from_slice(&(lda as i32).to_le_bytes());
+    a.extend_from_slice(&(x as u64).to_le_bytes());
+    a.extend_from_slice(&(incx as i32).to_le_bytes());
+    if beta.is_null() { return 1; }
+    a.extend_from_slice(&(unsafe { *beta } as f64).to_le_bytes());
+    a.extend_from_slice(&(y as u64).to_le_bytes());
+    a.extend_from_slice(&(incy as i32).to_le_bytes());
+    // No output params: fire-and-forget (failures surface as sticky async errors).
+    match with_client(|c| c.lib_call_deferred(LIB_ID, 24, a)) { Ok(()) => 0, Err(_) => 1 }
+}
+#[no_mangle]
+pub extern "C" fn cublasSger_v2(handle: *mut c_void, m: c_int, n: c_int, alpha: *const f32, x: *const f32, incx: c_int, y: *const f32, incy: c_int, A: *mut f32, lda: c_int) -> c_int {
+    let mut a: Vec<u8> = Vec::new();
+    a.extend_from_slice(&(handle as u64).to_le_bytes());
+    a.extend_from_slice(&(m as i32).to_le_bytes());
+    a.extend_from_slice(&(n as i32).to_le_bytes());
+    if alpha.is_null() { return 1; }
+    a.extend_from_slice(&(unsafe { *alpha } as f32).to_le_bytes());
+    a.extend_from_slice(&(x as u64).to_le_bytes());
+    a.extend_from_slice(&(incx as i32).to_le_bytes());
+    a.extend_from_slice(&(y as u64).to_le_bytes());
+    a.extend_from_slice(&(incy as i32).to_le_bytes());
+    a.extend_from_slice(&(A as u64).to_le_bytes());
+    a.extend_from_slice(&(lda as i32).to_le_bytes());
+    // No output params: fire-and-forget (failures surface as sticky async errors).
+    match with_client(|c| c.lib_call_deferred(LIB_ID, 25, a)) { Ok(()) => 0, Err(_) => 1 }
+}
+#[no_mangle]
+pub extern "C" fn cublasDger_v2(handle: *mut c_void, m: c_int, n: c_int, alpha: *const f64, x: *const f64, incx: c_int, y: *const f64, incy: c_int, A: *mut f64, lda: c_int) -> c_int {
+    let mut a: Vec<u8> = Vec::new();
+    a.extend_from_slice(&(handle as u64).to_le_bytes());
+    a.extend_from_slice(&(m as i32).to_le_bytes());
+    a.extend_from_slice(&(n as i32).to_le_bytes());
+    if alpha.is_null() { return 1; }
+    a.extend_from_slice(&(unsafe { *alpha } as f64).to_le_bytes());
+    a.extend_from_slice(&(x as u64).to_le_bytes());
+    a.extend_from_slice(&(incx as i32).to_le_bytes());
+    a.extend_from_slice(&(y as u64).to_le_bytes());
+    a.extend_from_slice(&(incy as i32).to_le_bytes());
+    a.extend_from_slice(&(A as u64).to_le_bytes());
+    a.extend_from_slice(&(lda as i32).to_le_bytes());
+    // No output params: fire-and-forget (failures surface as sticky async errors).
+    match with_client(|c| c.lib_call_deferred(LIB_ID, 26, a)) { Ok(()) => 0, Err(_) => 1 }
+}
+#[no_mangle]
+pub extern "C" fn cublasSgeam(handle: *mut c_void, transa: c_int, transb: c_int, m: c_int, n: c_int, alpha: *const f32, A: *const f32, lda: c_int, beta: *const f32, B: *const f32, ldb: c_int, C: *mut f32, ldc: c_int) -> c_int {
+    let mut a: Vec<u8> = Vec::new();
+    a.extend_from_slice(&(handle as u64).to_le_bytes());
+    a.extend_from_slice(&(transa as i32).to_le_bytes());
+    a.extend_from_slice(&(transb as i32).to_le_bytes());
+    a.extend_from_slice(&(m as i32).to_le_bytes());
+    a.extend_from_slice(&(n as i32).to_le_bytes());
+    if alpha.is_null() { return 1; }
+    a.extend_from_slice(&(unsafe { *alpha } as f32).to_le_bytes());
+    a.extend_from_slice(&(A as u64).to_le_bytes());
+    a.extend_from_slice(&(lda as i32).to_le_bytes());
+    if beta.is_null() { return 1; }
+    a.extend_from_slice(&(unsafe { *beta } as f32).to_le_bytes());
+    a.extend_from_slice(&(B as u64).to_le_bytes());
+    a.extend_from_slice(&(ldb as i32).to_le_bytes());
+    a.extend_from_slice(&(C as u64).to_le_bytes());
+    a.extend_from_slice(&(ldc as i32).to_le_bytes());
+    // No output params: fire-and-forget (failures surface as sticky async errors).
+    match with_client(|c| c.lib_call_deferred(LIB_ID, 27, a)) { Ok(()) => 0, Err(_) => 1 }
+}
+#[no_mangle]
+pub extern "C" fn cublasDgeam(handle: *mut c_void, transa: c_int, transb: c_int, m: c_int, n: c_int, alpha: *const f64, A: *const f64, lda: c_int, beta: *const f64, B: *const f64, ldb: c_int, C: *mut f64, ldc: c_int) -> c_int {
+    let mut a: Vec<u8> = Vec::new();
+    a.extend_from_slice(&(handle as u64).to_le_bytes());
+    a.extend_from_slice(&(transa as i32).to_le_bytes());
+    a.extend_from_slice(&(transb as i32).to_le_bytes());
+    a.extend_from_slice(&(m as i32).to_le_bytes());
+    a.extend_from_slice(&(n as i32).to_le_bytes());
+    if alpha.is_null() { return 1; }
+    a.extend_from_slice(&(unsafe { *alpha } as f64).to_le_bytes());
+    a.extend_from_slice(&(A as u64).to_le_bytes());
+    a.extend_from_slice(&(lda as i32).to_le_bytes());
+    if beta.is_null() { return 1; }
+    a.extend_from_slice(&(unsafe { *beta } as f64).to_le_bytes());
+    a.extend_from_slice(&(B as u64).to_le_bytes());
+    a.extend_from_slice(&(ldb as i32).to_le_bytes());
+    a.extend_from_slice(&(C as u64).to_le_bytes());
+    a.extend_from_slice(&(ldc as i32).to_le_bytes());
+    // No output params: fire-and-forget (failures surface as sticky async errors).
+    match with_client(|c| c.lib_call_deferred(LIB_ID, 28, a)) { Ok(()) => 0, Err(_) => 1 }
+}
+#[no_mangle]
+pub extern "C" fn cublasSsyrk_v2(handle: *mut c_void, uplo: c_int, trans: c_int, n: c_int, k: c_int, alpha: *const f32, A: *const f32, lda: c_int, beta: *const f32, C: *mut f32, ldc: c_int) -> c_int {
+    let mut a: Vec<u8> = Vec::new();
+    a.extend_from_slice(&(handle as u64).to_le_bytes());
+    a.extend_from_slice(&(uplo as i32).to_le_bytes());
+    a.extend_from_slice(&(trans as i32).to_le_bytes());
+    a.extend_from_slice(&(n as i32).to_le_bytes());
+    a.extend_from_slice(&(k as i32).to_le_bytes());
+    if alpha.is_null() { return 1; }
+    a.extend_from_slice(&(unsafe { *alpha } as f32).to_le_bytes());
+    a.extend_from_slice(&(A as u64).to_le_bytes());
+    a.extend_from_slice(&(lda as i32).to_le_bytes());
+    if beta.is_null() { return 1; }
+    a.extend_from_slice(&(unsafe { *beta } as f32).to_le_bytes());
+    a.extend_from_slice(&(C as u64).to_le_bytes());
+    a.extend_from_slice(&(ldc as i32).to_le_bytes());
+    // No output params: fire-and-forget (failures surface as sticky async errors).
+    match with_client(|c| c.lib_call_deferred(LIB_ID, 29, a)) { Ok(()) => 0, Err(_) => 1 }
+}
+#[no_mangle]
+pub extern "C" fn cublasDsyrk_v2(handle: *mut c_void, uplo: c_int, trans: c_int, n: c_int, k: c_int, alpha: *const f64, A: *const f64, lda: c_int, beta: *const f64, C: *mut f64, ldc: c_int) -> c_int {
+    let mut a: Vec<u8> = Vec::new();
+    a.extend_from_slice(&(handle as u64).to_le_bytes());
+    a.extend_from_slice(&(uplo as i32).to_le_bytes());
+    a.extend_from_slice(&(trans as i32).to_le_bytes());
+    a.extend_from_slice(&(n as i32).to_le_bytes());
+    a.extend_from_slice(&(k as i32).to_le_bytes());
+    if alpha.is_null() { return 1; }
+    a.extend_from_slice(&(unsafe { *alpha } as f64).to_le_bytes());
+    a.extend_from_slice(&(A as u64).to_le_bytes());
+    a.extend_from_slice(&(lda as i32).to_le_bytes());
+    if beta.is_null() { return 1; }
+    a.extend_from_slice(&(unsafe { *beta } as f64).to_le_bytes());
+    a.extend_from_slice(&(C as u64).to_le_bytes());
+    a.extend_from_slice(&(ldc as i32).to_le_bytes());
+    // No output params: fire-and-forget (failures surface as sticky async errors).
+    match with_client(|c| c.lib_call_deferred(LIB_ID, 30, a)) { Ok(()) => 0, Err(_) => 1 }
+}
+#[no_mangle]
+pub extern "C" fn cublasSsymm_v2(handle: *mut c_void, side: c_int, uplo: c_int, m: c_int, n: c_int, alpha: *const f32, A: *const f32, lda: c_int, B: *const f32, ldb: c_int, beta: *const f32, C: *mut f32, ldc: c_int) -> c_int {
+    let mut a: Vec<u8> = Vec::new();
+    a.extend_from_slice(&(handle as u64).to_le_bytes());
+    a.extend_from_slice(&(side as i32).to_le_bytes());
+    a.extend_from_slice(&(uplo as i32).to_le_bytes());
+    a.extend_from_slice(&(m as i32).to_le_bytes());
+    a.extend_from_slice(&(n as i32).to_le_bytes());
+    if alpha.is_null() { return 1; }
+    a.extend_from_slice(&(unsafe { *alpha } as f32).to_le_bytes());
+    a.extend_from_slice(&(A as u64).to_le_bytes());
+    a.extend_from_slice(&(lda as i32).to_le_bytes());
+    a.extend_from_slice(&(B as u64).to_le_bytes());
+    a.extend_from_slice(&(ldb as i32).to_le_bytes());
+    if beta.is_null() { return 1; }
+    a.extend_from_slice(&(unsafe { *beta } as f32).to_le_bytes());
+    a.extend_from_slice(&(C as u64).to_le_bytes());
+    a.extend_from_slice(&(ldc as i32).to_le_bytes());
+    // No output params: fire-and-forget (failures surface as sticky async errors).
+    match with_client(|c| c.lib_call_deferred(LIB_ID, 31, a)) { Ok(()) => 0, Err(_) => 1 }
+}
+#[no_mangle]
+pub extern "C" fn cublasDsymm_v2(handle: *mut c_void, side: c_int, uplo: c_int, m: c_int, n: c_int, alpha: *const f64, A: *const f64, lda: c_int, B: *const f64, ldb: c_int, beta: *const f64, C: *mut f64, ldc: c_int) -> c_int {
+    let mut a: Vec<u8> = Vec::new();
+    a.extend_from_slice(&(handle as u64).to_le_bytes());
+    a.extend_from_slice(&(side as i32).to_le_bytes());
+    a.extend_from_slice(&(uplo as i32).to_le_bytes());
+    a.extend_from_slice(&(m as i32).to_le_bytes());
+    a.extend_from_slice(&(n as i32).to_le_bytes());
+    if alpha.is_null() { return 1; }
+    a.extend_from_slice(&(unsafe { *alpha } as f64).to_le_bytes());
+    a.extend_from_slice(&(A as u64).to_le_bytes());
+    a.extend_from_slice(&(lda as i32).to_le_bytes());
+    a.extend_from_slice(&(B as u64).to_le_bytes());
+    a.extend_from_slice(&(ldb as i32).to_le_bytes());
+    if beta.is_null() { return 1; }
+    a.extend_from_slice(&(unsafe { *beta } as f64).to_le_bytes());
+    a.extend_from_slice(&(C as u64).to_le_bytes());
+    a.extend_from_slice(&(ldc as i32).to_le_bytes());
+    // No output params: fire-and-forget (failures surface as sticky async errors).
+    match with_client(|c| c.lib_call_deferred(LIB_ID, 32, a)) { Ok(()) => 0, Err(_) => 1 }
+}
+#[no_mangle]
+pub extern "C" fn cublasStrsm_v2(handle: *mut c_void, side: c_int, uplo: c_int, trans: c_int, diag: c_int, m: c_int, n: c_int, alpha: *const f32, A: *const f32, lda: c_int, B: *mut f32, ldb: c_int) -> c_int {
+    let mut a: Vec<u8> = Vec::new();
+    a.extend_from_slice(&(handle as u64).to_le_bytes());
+    a.extend_from_slice(&(side as i32).to_le_bytes());
+    a.extend_from_slice(&(uplo as i32).to_le_bytes());
+    a.extend_from_slice(&(trans as i32).to_le_bytes());
+    a.extend_from_slice(&(diag as i32).to_le_bytes());
+    a.extend_from_slice(&(m as i32).to_le_bytes());
+    a.extend_from_slice(&(n as i32).to_le_bytes());
+    if alpha.is_null() { return 1; }
+    a.extend_from_slice(&(unsafe { *alpha } as f32).to_le_bytes());
+    a.extend_from_slice(&(A as u64).to_le_bytes());
+    a.extend_from_slice(&(lda as i32).to_le_bytes());
+    a.extend_from_slice(&(B as u64).to_le_bytes());
+    a.extend_from_slice(&(ldb as i32).to_le_bytes());
+    // No output params: fire-and-forget (failures surface as sticky async errors).
+    match with_client(|c| c.lib_call_deferred(LIB_ID, 33, a)) { Ok(()) => 0, Err(_) => 1 }
+}
+#[no_mangle]
+pub extern "C" fn cublasDtrsm_v2(handle: *mut c_void, side: c_int, uplo: c_int, trans: c_int, diag: c_int, m: c_int, n: c_int, alpha: *const f64, A: *const f64, lda: c_int, B: *mut f64, ldb: c_int) -> c_int {
+    let mut a: Vec<u8> = Vec::new();
+    a.extend_from_slice(&(handle as u64).to_le_bytes());
+    a.extend_from_slice(&(side as i32).to_le_bytes());
+    a.extend_from_slice(&(uplo as i32).to_le_bytes());
+    a.extend_from_slice(&(trans as i32).to_le_bytes());
+    a.extend_from_slice(&(diag as i32).to_le_bytes());
+    a.extend_from_slice(&(m as i32).to_le_bytes());
+    a.extend_from_slice(&(n as i32).to_le_bytes());
+    if alpha.is_null() { return 1; }
+    a.extend_from_slice(&(unsafe { *alpha } as f64).to_le_bytes());
+    a.extend_from_slice(&(A as u64).to_le_bytes());
+    a.extend_from_slice(&(lda as i32).to_le_bytes());
+    a.extend_from_slice(&(B as u64).to_le_bytes());
+    a.extend_from_slice(&(ldb as i32).to_le_bytes());
+    // No output params: fire-and-forget (failures surface as sticky async errors).
+    match with_client(|c| c.lib_call_deferred(LIB_ID, 34, a)) { Ok(()) => 0, Err(_) => 1 }
+}

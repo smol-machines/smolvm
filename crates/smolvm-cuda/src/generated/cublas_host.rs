@@ -15,6 +15,26 @@ pub struct GenLib { _lib: Library,
     f_cublasGemmEx: unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, c_int, c_int, *const f32, *const c_void, c_int, c_int, *const c_void, c_int, c_int, *const f32, *mut c_void, c_int, c_int, c_int, c_int) -> c_int,
     f_cublasGemmStridedBatchedEx: unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, c_int, c_int, *const f32, *const c_void, c_int, c_int, i64, *const c_void, c_int, c_int, i64, *const f32, *mut c_void, c_int, c_int, i64, c_int, c_int, c_int) -> c_int,
     f_cublasGemmBatchedEx: unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, c_int, c_int, *const f32, *const c_void, c_int, c_int, *const c_void, c_int, c_int, *const f32, *mut c_void, c_int, c_int, c_int, c_int, c_int) -> c_int,
+    f_cublasSaxpy_v2: unsafe extern "C" fn(*mut c_void, c_int, *const f32, *const f32, c_int, *mut f32, c_int) -> c_int,
+    f_cublasDaxpy_v2: unsafe extern "C" fn(*mut c_void, c_int, *const f64, *const f64, c_int, *mut f64, c_int) -> c_int,
+    f_cublasSscal_v2: unsafe extern "C" fn(*mut c_void, c_int, *const f32, *mut f32, c_int) -> c_int,
+    f_cublasDscal_v2: unsafe extern "C" fn(*mut c_void, c_int, *const f64, *mut f64, c_int) -> c_int,
+    f_cublasScopy_v2: unsafe extern "C" fn(*mut c_void, c_int, *mut f32, c_int, *mut f32, c_int) -> c_int,
+    f_cublasDcopy_v2: unsafe extern "C" fn(*mut c_void, c_int, *mut f64, c_int, *mut f64, c_int) -> c_int,
+    f_cublasSswap_v2: unsafe extern "C" fn(*mut c_void, c_int, *mut f32, c_int, *mut f32, c_int) -> c_int,
+    f_cublasDswap_v2: unsafe extern "C" fn(*mut c_void, c_int, *mut f64, c_int, *mut f64, c_int) -> c_int,
+    f_cublasSgemv_v2: unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, *const f32, *const f32, c_int, *const f32, c_int, *const f32, *mut f32, c_int) -> c_int,
+    f_cublasDgemv_v2: unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, *const f64, *const f64, c_int, *const f64, c_int, *const f64, *mut f64, c_int) -> c_int,
+    f_cublasSger_v2: unsafe extern "C" fn(*mut c_void, c_int, c_int, *const f32, *const f32, c_int, *const f32, c_int, *mut f32, c_int) -> c_int,
+    f_cublasDger_v2: unsafe extern "C" fn(*mut c_void, c_int, c_int, *const f64, *const f64, c_int, *const f64, c_int, *mut f64, c_int) -> c_int,
+    f_cublasSgeam: unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, c_int, *const f32, *const f32, c_int, *const f32, *const f32, c_int, *mut f32, c_int) -> c_int,
+    f_cublasDgeam: unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, c_int, *const f64, *const f64, c_int, *const f64, *const f64, c_int, *mut f64, c_int) -> c_int,
+    f_cublasSsyrk_v2: unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, c_int, *const f32, *const f32, c_int, *const f32, *mut f32, c_int) -> c_int,
+    f_cublasDsyrk_v2: unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, c_int, *const f64, *const f64, c_int, *const f64, *mut f64, c_int) -> c_int,
+    f_cublasSsymm_v2: unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, c_int, *const f32, *const f32, c_int, *const f32, c_int, *const f32, *mut f32, c_int) -> c_int,
+    f_cublasDsymm_v2: unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, c_int, *const f64, *const f64, c_int, *const f64, c_int, *const f64, *mut f64, c_int) -> c_int,
+    f_cublasStrsm_v2: unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, c_int, c_int, c_int, *const f32, *const f32, c_int, *mut f32, c_int) -> c_int,
+    f_cublasDtrsm_v2: unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, c_int, c_int, c_int, *const f64, *const f64, c_int, *mut f64, c_int) -> c_int,
 }
 impl GenLib {
     pub fn load() -> Result<GenLib, String> {
@@ -36,6 +56,26 @@ impl GenLib {
                 f_cublasGemmEx: sym(&lib, b"cublasGemmEx\0")?,
                 f_cublasGemmStridedBatchedEx: sym(&lib, b"cublasGemmStridedBatchedEx\0")?,
                 f_cublasGemmBatchedEx: sym(&lib, b"cublasGemmBatchedEx\0")?,
+                f_cublasSaxpy_v2: sym(&lib, b"cublasSaxpy_v2\0")?,
+                f_cublasDaxpy_v2: sym(&lib, b"cublasDaxpy_v2\0")?,
+                f_cublasSscal_v2: sym(&lib, b"cublasSscal_v2\0")?,
+                f_cublasDscal_v2: sym(&lib, b"cublasDscal_v2\0")?,
+                f_cublasScopy_v2: sym(&lib, b"cublasScopy_v2\0")?,
+                f_cublasDcopy_v2: sym(&lib, b"cublasDcopy_v2\0")?,
+                f_cublasSswap_v2: sym(&lib, b"cublasSswap_v2\0")?,
+                f_cublasDswap_v2: sym(&lib, b"cublasDswap_v2\0")?,
+                f_cublasSgemv_v2: sym(&lib, b"cublasSgemv_v2\0")?,
+                f_cublasDgemv_v2: sym(&lib, b"cublasDgemv_v2\0")?,
+                f_cublasSger_v2: sym(&lib, b"cublasSger_v2\0")?,
+                f_cublasDger_v2: sym(&lib, b"cublasDger_v2\0")?,
+                f_cublasSgeam: sym(&lib, b"cublasSgeam\0")?,
+                f_cublasDgeam: sym(&lib, b"cublasDgeam\0")?,
+                f_cublasSsyrk_v2: sym(&lib, b"cublasSsyrk_v2\0")?,
+                f_cublasDsyrk_v2: sym(&lib, b"cublasDsyrk_v2\0")?,
+                f_cublasSsymm_v2: sym(&lib, b"cublasSsymm_v2\0")?,
+                f_cublasDsymm_v2: sym(&lib, b"cublasDsymm_v2\0")?,
+                f_cublasStrsm_v2: sym(&lib, b"cublasStrsm_v2\0")?,
+                f_cublasDtrsm_v2: sym(&lib, b"cublasDtrsm_v2\0")?,
                 _lib: lib,
             })
         }
@@ -269,6 +309,296 @@ impl GenLib {
                 let algo = __c.i32();
                 let mut out = Vec::new();
                 let st = unsafe { (self.f_cublasGemmBatchedEx)(handle, transa as c_int, transb as c_int, m as c_int, n as c_int, k as c_int, &alpha_v, Aarray, Atype as c_int, lda as c_int, Barray, Btype as c_int, ldb as c_int, &beta_v, Carray, Ctype as c_int, ldc as c_int, batchCount as c_int, computeType as c_int, algo as c_int) };
+                (st, out)
+            }
+            15 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let n = __c.i32();
+                let alpha_v = __c.f32();
+                let x = __c.u64() as *const f32;
+                let incx = __c.i32();
+                let y = __c.u64() as *mut f32;
+                let incy = __c.i32();
+                let mut out = Vec::new();
+                let st = unsafe { (self.f_cublasSaxpy_v2)(handle, n as c_int, &alpha_v, x, incx as c_int, y, incy as c_int) };
+                (st, out)
+            }
+            16 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let n = __c.i32();
+                let alpha_v = __c.f64();
+                let x = __c.u64() as *const f64;
+                let incx = __c.i32();
+                let y = __c.u64() as *mut f64;
+                let incy = __c.i32();
+                let mut out = Vec::new();
+                let st = unsafe { (self.f_cublasDaxpy_v2)(handle, n as c_int, &alpha_v, x, incx as c_int, y, incy as c_int) };
+                (st, out)
+            }
+            17 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let n = __c.i32();
+                let alpha_v = __c.f32();
+                let x = __c.u64() as *mut f32;
+                let incx = __c.i32();
+                let mut out = Vec::new();
+                let st = unsafe { (self.f_cublasSscal_v2)(handle, n as c_int, &alpha_v, x, incx as c_int) };
+                (st, out)
+            }
+            18 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let n = __c.i32();
+                let alpha_v = __c.f64();
+                let x = __c.u64() as *mut f64;
+                let incx = __c.i32();
+                let mut out = Vec::new();
+                let st = unsafe { (self.f_cublasDscal_v2)(handle, n as c_int, &alpha_v, x, incx as c_int) };
+                (st, out)
+            }
+            19 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let n = __c.i32();
+                let x = __c.u64() as *mut f32;
+                let incx = __c.i32();
+                let y = __c.u64() as *mut f32;
+                let incy = __c.i32();
+                let mut out = Vec::new();
+                let st = unsafe { (self.f_cublasScopy_v2)(handle, n as c_int, x, incx as c_int, y, incy as c_int) };
+                (st, out)
+            }
+            20 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let n = __c.i32();
+                let x = __c.u64() as *mut f64;
+                let incx = __c.i32();
+                let y = __c.u64() as *mut f64;
+                let incy = __c.i32();
+                let mut out = Vec::new();
+                let st = unsafe { (self.f_cublasDcopy_v2)(handle, n as c_int, x, incx as c_int, y, incy as c_int) };
+                (st, out)
+            }
+            21 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let n = __c.i32();
+                let x = __c.u64() as *mut f32;
+                let incx = __c.i32();
+                let y = __c.u64() as *mut f32;
+                let incy = __c.i32();
+                let mut out = Vec::new();
+                let st = unsafe { (self.f_cublasSswap_v2)(handle, n as c_int, x, incx as c_int, y, incy as c_int) };
+                (st, out)
+            }
+            22 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let n = __c.i32();
+                let x = __c.u64() as *mut f64;
+                let incx = __c.i32();
+                let y = __c.u64() as *mut f64;
+                let incy = __c.i32();
+                let mut out = Vec::new();
+                let st = unsafe { (self.f_cublasDswap_v2)(handle, n as c_int, x, incx as c_int, y, incy as c_int) };
+                (st, out)
+            }
+            23 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let trans = __c.i32();
+                let m = __c.i32();
+                let n = __c.i32();
+                let alpha_v = __c.f32();
+                let A = __c.u64() as *const f32;
+                let lda = __c.i32();
+                let x = __c.u64() as *const f32;
+                let incx = __c.i32();
+                let beta_v = __c.f32();
+                let y = __c.u64() as *mut f32;
+                let incy = __c.i32();
+                let mut out = Vec::new();
+                let st = unsafe { (self.f_cublasSgemv_v2)(handle, trans as c_int, m as c_int, n as c_int, &alpha_v, A, lda as c_int, x, incx as c_int, &beta_v, y, incy as c_int) };
+                (st, out)
+            }
+            24 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let trans = __c.i32();
+                let m = __c.i32();
+                let n = __c.i32();
+                let alpha_v = __c.f64();
+                let A = __c.u64() as *const f64;
+                let lda = __c.i32();
+                let x = __c.u64() as *const f64;
+                let incx = __c.i32();
+                let beta_v = __c.f64();
+                let y = __c.u64() as *mut f64;
+                let incy = __c.i32();
+                let mut out = Vec::new();
+                let st = unsafe { (self.f_cublasDgemv_v2)(handle, trans as c_int, m as c_int, n as c_int, &alpha_v, A, lda as c_int, x, incx as c_int, &beta_v, y, incy as c_int) };
+                (st, out)
+            }
+            25 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let m = __c.i32();
+                let n = __c.i32();
+                let alpha_v = __c.f32();
+                let x = __c.u64() as *const f32;
+                let incx = __c.i32();
+                let y = __c.u64() as *const f32;
+                let incy = __c.i32();
+                let A = __c.u64() as *mut f32;
+                let lda = __c.i32();
+                let mut out = Vec::new();
+                let st = unsafe { (self.f_cublasSger_v2)(handle, m as c_int, n as c_int, &alpha_v, x, incx as c_int, y, incy as c_int, A, lda as c_int) };
+                (st, out)
+            }
+            26 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let m = __c.i32();
+                let n = __c.i32();
+                let alpha_v = __c.f64();
+                let x = __c.u64() as *const f64;
+                let incx = __c.i32();
+                let y = __c.u64() as *const f64;
+                let incy = __c.i32();
+                let A = __c.u64() as *mut f64;
+                let lda = __c.i32();
+                let mut out = Vec::new();
+                let st = unsafe { (self.f_cublasDger_v2)(handle, m as c_int, n as c_int, &alpha_v, x, incx as c_int, y, incy as c_int, A, lda as c_int) };
+                (st, out)
+            }
+            27 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let transa = __c.i32();
+                let transb = __c.i32();
+                let m = __c.i32();
+                let n = __c.i32();
+                let alpha_v = __c.f32();
+                let A = __c.u64() as *const f32;
+                let lda = __c.i32();
+                let beta_v = __c.f32();
+                let B = __c.u64() as *const f32;
+                let ldb = __c.i32();
+                let C = __c.u64() as *mut f32;
+                let ldc = __c.i32();
+                let mut out = Vec::new();
+                let st = unsafe { (self.f_cublasSgeam)(handle, transa as c_int, transb as c_int, m as c_int, n as c_int, &alpha_v, A, lda as c_int, &beta_v, B, ldb as c_int, C, ldc as c_int) };
+                (st, out)
+            }
+            28 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let transa = __c.i32();
+                let transb = __c.i32();
+                let m = __c.i32();
+                let n = __c.i32();
+                let alpha_v = __c.f64();
+                let A = __c.u64() as *const f64;
+                let lda = __c.i32();
+                let beta_v = __c.f64();
+                let B = __c.u64() as *const f64;
+                let ldb = __c.i32();
+                let C = __c.u64() as *mut f64;
+                let ldc = __c.i32();
+                let mut out = Vec::new();
+                let st = unsafe { (self.f_cublasDgeam)(handle, transa as c_int, transb as c_int, m as c_int, n as c_int, &alpha_v, A, lda as c_int, &beta_v, B, ldb as c_int, C, ldc as c_int) };
+                (st, out)
+            }
+            29 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let uplo = __c.i32();
+                let trans = __c.i32();
+                let n = __c.i32();
+                let k = __c.i32();
+                let alpha_v = __c.f32();
+                let A = __c.u64() as *const f32;
+                let lda = __c.i32();
+                let beta_v = __c.f32();
+                let C = __c.u64() as *mut f32;
+                let ldc = __c.i32();
+                let mut out = Vec::new();
+                let st = unsafe { (self.f_cublasSsyrk_v2)(handle, uplo as c_int, trans as c_int, n as c_int, k as c_int, &alpha_v, A, lda as c_int, &beta_v, C, ldc as c_int) };
+                (st, out)
+            }
+            30 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let uplo = __c.i32();
+                let trans = __c.i32();
+                let n = __c.i32();
+                let k = __c.i32();
+                let alpha_v = __c.f64();
+                let A = __c.u64() as *const f64;
+                let lda = __c.i32();
+                let beta_v = __c.f64();
+                let C = __c.u64() as *mut f64;
+                let ldc = __c.i32();
+                let mut out = Vec::new();
+                let st = unsafe { (self.f_cublasDsyrk_v2)(handle, uplo as c_int, trans as c_int, n as c_int, k as c_int, &alpha_v, A, lda as c_int, &beta_v, C, ldc as c_int) };
+                (st, out)
+            }
+            31 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let side = __c.i32();
+                let uplo = __c.i32();
+                let m = __c.i32();
+                let n = __c.i32();
+                let alpha_v = __c.f32();
+                let A = __c.u64() as *const f32;
+                let lda = __c.i32();
+                let B = __c.u64() as *const f32;
+                let ldb = __c.i32();
+                let beta_v = __c.f32();
+                let C = __c.u64() as *mut f32;
+                let ldc = __c.i32();
+                let mut out = Vec::new();
+                let st = unsafe { (self.f_cublasSsymm_v2)(handle, side as c_int, uplo as c_int, m as c_int, n as c_int, &alpha_v, A, lda as c_int, B, ldb as c_int, &beta_v, C, ldc as c_int) };
+                (st, out)
+            }
+            32 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let side = __c.i32();
+                let uplo = __c.i32();
+                let m = __c.i32();
+                let n = __c.i32();
+                let alpha_v = __c.f64();
+                let A = __c.u64() as *const f64;
+                let lda = __c.i32();
+                let B = __c.u64() as *const f64;
+                let ldb = __c.i32();
+                let beta_v = __c.f64();
+                let C = __c.u64() as *mut f64;
+                let ldc = __c.i32();
+                let mut out = Vec::new();
+                let st = unsafe { (self.f_cublasDsymm_v2)(handle, side as c_int, uplo as c_int, m as c_int, n as c_int, &alpha_v, A, lda as c_int, B, ldb as c_int, &beta_v, C, ldc as c_int) };
+                (st, out)
+            }
+            33 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let side = __c.i32();
+                let uplo = __c.i32();
+                let trans = __c.i32();
+                let diag = __c.i32();
+                let m = __c.i32();
+                let n = __c.i32();
+                let alpha_v = __c.f32();
+                let A = __c.u64() as *const f32;
+                let lda = __c.i32();
+                let B = __c.u64() as *mut f32;
+                let ldb = __c.i32();
+                let mut out = Vec::new();
+                let st = unsafe { (self.f_cublasStrsm_v2)(handle, side as c_int, uplo as c_int, trans as c_int, diag as c_int, m as c_int, n as c_int, &alpha_v, A, lda as c_int, B, ldb as c_int) };
+                (st, out)
+            }
+            34 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let side = __c.i32();
+                let uplo = __c.i32();
+                let trans = __c.i32();
+                let diag = __c.i32();
+                let m = __c.i32();
+                let n = __c.i32();
+                let alpha_v = __c.f64();
+                let A = __c.u64() as *const f64;
+                let lda = __c.i32();
+                let B = __c.u64() as *mut f64;
+                let ldb = __c.i32();
+                let mut out = Vec::new();
+                let st = unsafe { (self.f_cublasDtrsm_v2)(handle, side as c_int, uplo as c_int, trans as c_int, diag as c_int, m as c_int, n as c_int, &alpha_v, A, lda as c_int, B, ldb as c_int) };
                 (st, out)
             }
             _ => (super::super::CUDA_ERROR_NOT_FOUND, Vec::new()),
