@@ -11,6 +11,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 smolvm-cuda = { path = "../smolvm-cuda", default-features = false }
+libc = "0.2"
 
 # vsock is the production transport (guest → host CID 2). Off Linux the crate
 # still compiles (tcp/unix transports only) so the workspace builds everywhere.

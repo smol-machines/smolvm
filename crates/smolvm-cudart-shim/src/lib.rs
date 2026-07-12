@@ -106,6 +106,47 @@ impl Write for Stream {
     }
 }
 
+#[cfg(unix)]
+impl Stream {
+    fn raw_fd(&self) -> std::os::unix::io::RawFd {
+        use std::os::unix::io::AsRawFd;
+        match self {
+            #[cfg(target_os = "linux")]
+            Stream::Vsock(s) => s.as_raw_fd(),
+            Stream::Tcp(s) => s.as_raw_fd(),
+            Stream::Unix(s) => s.as_raw_fd(),
+        }
+    }
+}
+
+/// Best-effort liveness of the host connection via a non-blocking, non-consuming
+/// `MSG_PEEK`. A VM-fork clone inherits a socket whose host peer is gone; the
+/// guest kernel resets it, so the peek sees EOF/ECONNRESET and we know to
+/// reconnect. Returns `true` when the connection is usable (data pending, or
+/// simply no data yet), `false` on a clean close or fatal socket error. Peeking
+/// is safe in shared-memory-ring mode too: pending doorbell bytes read as
+/// "alive" and stay queued for the real read.
+#[cfg(unix)]
+fn conn_alive(fd: std::os::unix::io::RawFd) -> bool {
+    let mut b = [0u8; 1];
+    let n = unsafe {
+        libc::recv(
+            fd,
+            b.as_mut_ptr() as *mut libc::c_void,
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    if n > 0 {
+        true
+    } else if n == 0 {
+        false // orderly shutdown by the peer
+    } else {
+        let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        e == libc::EAGAIN || e == libc::EWOULDBLOCK
+    }
+}
+
 fn connect() -> Result<Stream, c_int> {
     let spec = std::env::var("SMOLVM_CUDA_RPC").unwrap_or_default();
     if let Some(addr) = spec.strip_prefix("tcp:") {
@@ -174,6 +215,10 @@ struct ShimState {
     /// as the resume token and the host seeds the clone's fresh connection with
     /// the parent's cuBLAS/cuDNN handle map. 0 = host has no handoff support.
     conn_token: u64,
+    /// Raw fd of `client`'s socket, for the pre-call liveness peek. A VM-fork
+    /// clone (same pid, so the pid check can't fire) inherits a dead socket;
+    /// the peek catches it and triggers a reconnect. -1 = no fd / skip.
+    conn_fd: i32,
 }
 
 static STATE: Mutex<Option<ShimState>> = Mutex::new(None);
@@ -370,13 +415,19 @@ fn ring_try_setup(client: &mut Client<Stream>) {
 /// (best-effort) set up the shared-memory rings. Used for the first connection
 /// and to re-establish one after a fork/clone. Returns the client and the
 /// lineage token the host assigned this session.
-fn bring_up_client(resume_token: u64) -> Result<(Client<Stream>, u64), c_int> {
+fn bring_up_client(resume_token: u64) -> Result<(Client<Stream>, u64, i32), c_int> {
     let stream = connect()?;
     #[cfg(target_os = "linux")]
     let try_ring = matches!(stream, Stream::Vsock(_))
         && std::env::var("SMOLVM_CUDA_RING").as_deref() != Ok("0");
     #[cfg(not(target_os = "linux"))]
     let try_ring = false;
+    // Capture the socket fd for the liveness check before `Client` takes the
+    // stream. Rings keep this same socket (for doorbells), so it stays valid.
+    #[cfg(unix)]
+    let fd = stream.raw_fd();
+    #[cfg(not(unix))]
+    let fd = -1;
     let mut client = Client::new(stream);
     let token = client
         .init(resume_token)
@@ -387,7 +438,7 @@ fn bring_up_client(resume_token: u64) -> Result<(Client<Stream>, u64), c_int> {
     if try_ring {
         ring_try_setup(&mut client); // best-effort; socket mode on failure
     }
-    Ok((client, token))
+    Ok((client, token, fd))
 }
 
 fn with_client<T>(
@@ -397,7 +448,7 @@ fn with_client<T>(
     let pid = unsafe { libc::getpid() };
     match guard.as_mut() {
         None => {
-            let (client, token) = bring_up_client(0)?;
+            let (client, token, fd) = bring_up_client(0)?;
             *guard = Some(ShimState {
                 client,
                 initialized: true,
@@ -408,28 +459,37 @@ fn with_client<T>(
                 capture: None,
                 conn_pid: pid,
                 conn_token: token,
+                conn_fd: fd,
             });
         }
-        // We forked (in-guest process fork, or a snapshotted VM restored as a
-        // clone): the inherited connection is dead. Re-establish it in place,
-        // resuming from the parent's lineage token so the host seeds this
-        // connection with the parent's library handle map. The registries here
-        // stay valid because the reconnected session retains the same device
+        // We forked and the inherited connection is dead — either an in-guest
+        // process fork (pid changes) or a snapshotted VM restored as a clone
+        // (pid is preserved, so the socket peek is what catches it). Either way
+        // re-establish in place, resuming the parent's lineage token so the host
+        // seeds this connection with the parent's library handle map. The
+        // registries stay valid: the reconnected session retains the same device
         // primary context.
-        Some(st) if st.conn_pid != pid => {
-            if std::env::var_os("SHIM_TRACE").is_some() {
-                eprintln!(
-                    "[shim] fork detected pid {}->{}, reconnect resume_token={}",
-                    st.conn_pid, pid, st.conn_token
-                );
+        Some(st) => {
+            let forked = st.conn_pid != pid;
+            #[cfg(unix)]
+            let severed = st.conn_fd >= 0 && !conn_alive(st.conn_fd);
+            #[cfg(not(unix))]
+            let severed = false;
+            if forked || severed {
+                if std::env::var_os("SHIM_TRACE").is_some() {
+                    eprintln!(
+                        "[shim] reconnect (forked={forked} severed={severed}) resume_token={}",
+                        st.conn_token
+                    );
+                }
+                let (client, token, fd) = bring_up_client(st.conn_token)?;
+                st.client = client;
+                st.conn_token = token;
+                st.conn_pid = pid;
+                st.conn_fd = fd;
+                st.capture = None; // any in-flight capture belonged to the parent
             }
-            let (client, token) = bring_up_client(st.conn_token)?;
-            st.client = client;
-            st.conn_token = token;
-            st.conn_pid = pid;
-            st.capture = None; // any in-flight capture belonged to the parent
         }
-        Some(_) => {}
     }
     let st = guard.as_mut().ok_or(CUDA_ERROR_INITIALIZATION)?;
     debug_assert!(st.initialized);

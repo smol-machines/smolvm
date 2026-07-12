@@ -100,6 +100,49 @@ impl Write for Stream {
     }
 }
 
+#[cfg(unix)]
+impl Stream {
+    /// Raw socket fd for the liveness peek; -1 when bridged (no own socket).
+    fn raw_fd(&self) -> std::os::unix::io::RawFd {
+        use std::os::unix::io::AsRawFd;
+        match self {
+            #[cfg(target_os = "linux")]
+            Stream::Vsock(s) => s.as_raw_fd(),
+            Stream::Tcp(s) => s.as_raw_fd(),
+            Stream::Unix(s) => s.as_raw_fd(),
+            Stream::Bridged => -1,
+        }
+    }
+}
+
+/// Non-blocking, non-consuming liveness peek on the host connection. A VM-fork
+/// clone (same pid, so a pid check can't fire) inherits a socket whose host peer
+/// is gone; the guest kernel resets it and the peek sees EOF, telling us to
+/// reconnect. `true` = usable (data pending or none yet), `false` = closed/error.
+#[cfg(unix)]
+fn conn_alive(fd: std::os::unix::io::RawFd) -> bool {
+    if fd < 0 {
+        return true; // bridged: liveness is the runtime shim's concern
+    }
+    let mut b = [0u8; 1];
+    let n = unsafe {
+        libc::recv(
+            fd,
+            b.as_mut_ptr() as *mut libc::c_void,
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    if n > 0 {
+        true
+    } else if n == 0 {
+        false
+    } else {
+        let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        e == libc::EAGAIN || e == libc::EWOULDBLOCK
+    }
+}
+
 fn connect() -> Result<Stream, c_int> {
     let spec = std::env::var("SMOLVM_CUDA_RPC").unwrap_or_default();
     if let Some(addr) = spec.strip_prefix("tcp:") {
@@ -140,6 +183,12 @@ struct ShimState {
     primary_ctx: HashMap<i32, u64>,
     /// Process-global "current context" stack (bottom = cuCtxSetCurrent slot).
     ctx_stack: Vec<u64>,
+    /// Fork-reconnect bookkeeping for a standalone (non-bridged) connection:
+    /// pid that opened it, its socket fd (liveness peek), and the host-assigned
+    /// lineage token to resume. Bridged connections leave these inert (fd -1).
+    conn_pid: i32,
+    conn_fd: i32,
+    conn_token: u64,
 }
 
 static STATE: Mutex<Option<ShimState>> = Mutex::new(None);
@@ -151,7 +200,34 @@ static STATE: Mutex<Option<ShimState>> = Mutex::new(None);
 /// initialized CUDA through the runtime API never called *our* `cuInit`. Lazily
 /// connecting on first use makes any driver entry point self-initializing.
 fn ensure_connected(guard: &mut Option<ShimState>) -> Result<(), c_int> {
-    if guard.is_some() {
+    if let Some(st) = guard.as_mut() {
+        // A standalone connection can be severed under us by a VM-fork clone
+        // (pid is preserved across the snapshot, so the peek is what catches
+        // it). Bridged connections ride the runtime shim, which reconnects
+        // itself. Rebuild in place, resuming the lineage token; the registries
+        // (param sizes, primary-context + stack — all raw handles valid in the
+        // shared primary context) survive.
+        let bridged = BRIDGED.load(std::sync::atomic::Ordering::Relaxed);
+        let pid = std::process::id() as i32;
+        #[cfg(unix)]
+        let severed = !bridged && !conn_alive(st.conn_fd);
+        #[cfg(not(unix))]
+        let severed = false;
+        if !bridged && (st.conn_pid != pid || severed) {
+            let (mut client, token, fd) = connect_standalone(st.conn_token)?;
+            // Restore a current context on the fresh host session. The host binds
+            // the primary context on retain (its `cuCtxSetCurrent` is local), so
+            // without this a driver-API alloc/launch on the reconnected session
+            // faults with INVALID_CONTEXT. The app's own handle stays valid in
+            // the shared daemon context; we only need the host thread bound.
+            if !st.primary_ctx.is_empty() {
+                let _ = client.primary_ctx_retain(0);
+            }
+            st.client = client;
+            st.conn_token = token;
+            st.conn_fd = fd;
+            st.conn_pid = pid;
+        }
         return Ok(());
     }
     // Preferred: ride the runtime shim's connection (both shims loaded, one
@@ -161,28 +237,48 @@ fn ensure_connected(guard: &mut Option<ShimState>) -> Result<(), c_int> {
     // queues would let the host execute work out of order (recorded misorder
     // in a CUDA graph replays wrong), so run every op sync and fence the
     // runtime connection before each one (see fence_runtime).
-    let mut client = match resolve_bridge() {
-        Some(bridge) => Client::new_bridged(Stream::Bridged, bridge),
-        None => {
-            let mut c = Client::new(connect()?);
-            c.set_defer_enabled(false);
-            c
+    let (client, token, fd) = match resolve_bridge() {
+        Some(bridge) => {
+            let mut client = Client::new_bridged(Stream::Bridged, bridge);
+            let token = client.init(0).map_err(init_err)?;
+            (client, token, -1)
         }
+        None => connect_standalone(0)?,
     };
-    if let Err(e) = client.init(0) {
-        return Err(match e {
-            CudaRpcError::Cuda(code) => code as c_int,
-            _ => CUDA_ERROR_NO_DEVICE,
-        });
-    }
     BRIDGED.store(client.is_bridged(), std::sync::atomic::Ordering::Relaxed);
     *guard = Some(ShimState {
         client,
         param_sizes: HashMap::new(),
         primary_ctx: HashMap::new(),
         ctx_stack: Vec::new(),
+        conn_pid: std::process::id() as i32,
+        conn_fd: fd,
+        conn_token: token,
     });
     Ok(())
+}
+
+/// Open a standalone (non-bridged) connection to the host, run the handshake
+/// resuming `resume_token`, and return the client, its assigned token, and its
+/// socket fd. Deferral is off — a standalone driver connection must stay
+/// program-ordered against the runtime shim's separate connection.
+fn connect_standalone(resume_token: u64) -> Result<(Client<Stream>, u64, i32), c_int> {
+    let stream = connect()?;
+    #[cfg(unix)]
+    let fd = stream.raw_fd();
+    #[cfg(not(unix))]
+    let fd = -1;
+    let mut client = Client::new(stream);
+    client.set_defer_enabled(false);
+    let token = client.init(resume_token).map_err(init_err)?;
+    Ok((client, token, fd))
+}
+
+fn init_err(e: CudaRpcError) -> c_int {
+    match e {
+        CudaRpcError::Cuda(code) => code as c_int,
+        _ => CUDA_ERROR_NO_DEVICE,
+    }
 }
 
 /// Set once at connect: this shim's client rides the runtime shim's
