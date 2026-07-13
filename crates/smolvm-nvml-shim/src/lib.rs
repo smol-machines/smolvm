@@ -13,6 +13,11 @@
 //!
 //! Drop it in where the loader looks for `libnvidia-ml.so.1`.
 
+// These are C ABI entry points: the caller owns the pointers and the contract is
+// the NVML one, so marking each `unsafe` would only obscure the ABI. Matches the
+// other `smolvm-*-shim` crates.
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+
 use std::os::raw::{c_char, c_int, c_uint, c_ulonglong};
 
 // ---- nvmlReturn_t ------------------------------------------------------------
@@ -27,8 +32,13 @@ const CU_ATTR_CC_MINOR: c_int = 76;
 
 /// Resolve a NUL-terminated CUDA Driver symbol from any library loaded in the
 /// process (our LD_PRELOADed `libcuda.so.1`). `None` if CUDA isn't present.
-unsafe fn cu_sym(name: &[u8]) -> Option<*mut std::ffi::c_void> {
-    let p = libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr() as *const c_char);
+///
+/// The shim is only ever loaded by a Linux guest, but the workspace is
+/// cross-compiled, so the non-Unix build resolves nothing and every NVML query
+/// then falls back to its static answer.
+#[cfg(unix)]
+unsafe fn cu_sym(name: &std::ffi::CStr) -> Option<*mut std::ffi::c_void> {
+    let p = libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr());
     if p.is_null() {
         None
     } else {
@@ -36,9 +46,14 @@ unsafe fn cu_sym(name: &[u8]) -> Option<*mut std::ffi::c_void> {
     }
 }
 
+#[cfg(not(unix))]
+unsafe fn cu_sym(_name: &std::ffi::CStr) -> Option<*mut std::ffi::c_void> {
+    None
+}
+
 fn cu_init() {
     unsafe {
-        if let Some(f) = cu_sym(b"cuInit\0") {
+        if let Some(f) = cu_sym(c"cuInit") {
             let f: extern "C" fn(c_uint) -> c_int = std::mem::transmute(f);
             let _ = f(0);
         }
@@ -47,7 +62,7 @@ fn cu_init() {
 
 /// The driver's CUdevice for ordinal `ord` (an int handle, usually == ord).
 unsafe fn cu_device(ord: c_int) -> Option<c_int> {
-    let f = cu_sym(b"cuDeviceGet\0")?;
+    let f = cu_sym(c"cuDeviceGet")?;
     let f: extern "C" fn(*mut c_int, c_int) -> c_int = std::mem::transmute(f);
     let mut dev: c_int = 0;
     (f(&mut dev, ord) == 0).then_some(dev)
@@ -57,7 +72,7 @@ unsafe fn cu_device(ord: c_int) -> Option<c_int> {
 /// ever expose the single remoted GPU anyway).
 fn cu_device_count() -> u32 {
     unsafe {
-        if let Some(f) = cu_sym(b"cuDeviceGetCount\0") {
+        if let Some(f) = cu_sym(c"cuDeviceGetCount") {
             let f: extern "C" fn(*mut c_int) -> c_int = std::mem::transmute(f);
             let mut n: c_int = 0;
             if f(&mut n) == 0 && n > 0 {
@@ -71,7 +86,7 @@ fn cu_device_count() -> u32 {
 fn cu_device_name(ord: c_int) -> Option<String> {
     unsafe {
         let dev = cu_device(ord)?;
-        let f = cu_sym(b"cuDeviceGetName\0")?;
+        let f = cu_sym(c"cuDeviceGetName")?;
         let f: extern "C" fn(*mut c_char, c_int, c_int) -> c_int = std::mem::transmute(f);
         let mut buf = [0i8; 256];
         (f(buf.as_mut_ptr(), buf.len() as c_int, dev) == 0).then(|| {
@@ -85,7 +100,7 @@ fn cu_total_mem(ord: c_int) -> Option<u64> {
     unsafe {
         let dev = cu_device(ord)?;
         // cuDeviceTotalMem_v2 takes no context (device query only).
-        let f = cu_sym(b"cuDeviceTotalMem_v2\0").or_else(|| cu_sym(b"cuDeviceTotalMem\0"))?;
+        let f = cu_sym(c"cuDeviceTotalMem_v2").or_else(|| cu_sym(c"cuDeviceTotalMem"))?;
         let f: extern "C" fn(*mut usize, c_int) -> c_int = std::mem::transmute(f);
         let mut bytes: usize = 0;
         (f(&mut bytes, dev) == 0 && bytes > 0).then_some(bytes as u64)
@@ -95,7 +110,7 @@ fn cu_total_mem(ord: c_int) -> Option<u64> {
 /// (free, total) from the current context if one exists; `None` otherwise.
 fn cu_mem_get_info() -> Option<(u64, u64)> {
     unsafe {
-        let f = cu_sym(b"cuMemGetInfo_v2\0").or_else(|| cu_sym(b"cuMemGetInfo\0"))?;
+        let f = cu_sym(c"cuMemGetInfo_v2").or_else(|| cu_sym(c"cuMemGetInfo"))?;
         let f: extern "C" fn(*mut usize, *mut usize) -> c_int = std::mem::transmute(f);
         let (mut free, mut total): (usize, usize) = (0, 0);
         (f(&mut free, &mut total) == 0 && total > 0).then_some((free as u64, total as u64))
@@ -105,7 +120,7 @@ fn cu_mem_get_info() -> Option<(u64, u64)> {
 fn cu_compute_capability(ord: c_int) -> Option<(c_int, c_int)> {
     unsafe {
         let dev = cu_device(ord)?;
-        let f = cu_sym(b"cuDeviceGetAttribute\0")?;
+        let f = cu_sym(c"cuDeviceGetAttribute")?;
         let f: extern "C" fn(*mut c_int, c_int, c_int) -> c_int = std::mem::transmute(f);
         let (mut maj, mut min): (c_int, c_int) = (0, 0);
         let ok = f(&mut maj, CU_ATTR_CC_MAJOR, dev) == 0
@@ -291,5 +306,5 @@ pub extern "C" fn nvmlDeviceGetP2PStatus(
 
 #[no_mangle]
 pub extern "C" fn nvmlErrorString(_result: c_int) -> *const c_char {
-    b"Success\0".as_ptr() as *const c_char
+    c"Success".as_ptr()
 }

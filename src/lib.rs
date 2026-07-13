@@ -64,6 +64,10 @@
 pub mod agent;
 pub mod api;
 pub mod config;
+// The shared CUDA daemon manages unix-domain sockets, flock, and detached
+// process groups — all POSIX. GPU acceleration is unavailable on Windows anyway,
+// so the module (and its callers in cuda_host) are unix-only.
+#[cfg(unix)]
 pub mod cuda_daemon;
 pub mod cuda_host;
 /// Canonical shared data models and constants used across adapters.
