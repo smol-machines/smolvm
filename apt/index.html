@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>smolvm — apt repository</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font: 14px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    max-width: 42rem; margin: 5rem auto 4rem; padding: 0 1.25rem;
+    color: #1a1a1a; background: #fff;
+  }
+  @media (prefers-color-scheme: dark) { body { color: #d8d8d8; background: #111; } }
+  h1 { font-size: 1.15rem; font-weight: 600; margin: 0 0 .25rem; }
+  .sub { opacity: .6; margin: 0 0 2rem; }
+  pre { background: rgba(127,127,127,.12); padding: .85rem 1rem; border-radius: 4px; overflow-x: auto; margin: .75rem 0; }
+  a { color: inherit; text-underline-offset: 2px; }
+  table { border-collapse: collapse; margin: 1.25rem 0; }
+  td { padding: .15rem 1.5rem .15rem 0; }
+  hr { border: 0; border-top: 1px solid rgba(127,127,127,.25); margin: 2.5rem 0 1.25rem; }
+  footer { opacity: .5; font-size: .85rem; }
+</style>
+</head>
+<body>
+  <h1>smolvm — apt repository</h1>
+  <p class="sub">Official Debian / Ubuntu packages for <a href="https://github.com/smol-machines/smolvm">smolvm</a> (<code>amd64</code> &amp; <code>arm64</code>).</p>
+
+  <p>A flat, unsigned repo installed with <code>[trusted=yes]</code>:</p>
+  <pre>echo 'deb [trusted=yes] https://smol-machines.github.io/smolvm/apt ./' | sudo tee /etc/apt/sources.list.d/smolvm.list
+sudo apt-get update &amp;&amp; sudo apt-get install smolvm</pre>
+
+  <table>
+    <tr><td>index</td><td><a href="Packages">Packages</a> · <a href="Packages.gz">Packages.gz</a></td></tr>
+  </table>
+
+  <hr>
+  <footer>
+    <a href="../">downloads</a> ·
+    <a href="https://github.com/smol-machines/smolvm/blob/main/docs/install-debian.md">install&nbsp;docs</a> ·
+    <a href="https://github.com/smol-machines/smolvm">source</a>
+  </footer>
+</body>
+</html>

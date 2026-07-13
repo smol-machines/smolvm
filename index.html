@@ -39,6 +39,18 @@
   <pre>[smol-machines]
 SigLevel = Optional TrustAll
 Server  = https://smol-machines.github.io/smolvm/pacman/$arch</pre>
+  <p>Debian / Ubuntu (apt) — <code>amd64</code> &amp; <code>arm64</code>:</p>
+  <pre>echo 'deb [trusted=yes] https://smol-machines.github.io/smolvm/apt ./' | sudo tee /etc/apt/sources.list.d/smolvm.list
+sudo apt-get update &amp;&amp; sudo apt-get install smolvm</pre>
+  <p>Fedora / RHEL (dnf) — <code>x86_64</code> &amp; <code>aarch64</code>:</p>
+  <pre>sudo tee /etc/yum.repos.d/smolvm.repo &lt;&lt;'EOF'
+[smolvm]
+name=smolvm
+baseurl=https://smol-machines.github.io/smolvm/yum
+enabled=1
+gpgcheck=0
+EOF
+sudo dnf install smolvm</pre>
   <p>Windows: download the <span class="win-link">windows-x86_64</span> build below and run <code>smolvm.exe</code> (needs the Windows Hypervisor Platform enabled).</p>
 
   <h2>releases</h2>
@@ -57,7 +69,9 @@ Server  = https://smol-machines.github.io/smolvm/pacman/$arch</pre>
     <a href="https://github.com/smol-machines/smolvm">source</a> ·
     <a href="https://github.com/smol-machines/smolvm/blob/main/README.md">docs</a> ·
     <a href="https://github.com/smol-machines/smolvm/releases">all&nbsp;releases</a> ·
-    <a href="pacman/">pacman&nbsp;repo</a>
+    <a href="pacman/">pacman</a> ·
+    <a href="apt/">apt</a> ·
+    <a href="yum/">yum</a>
   </footer>
 
 <script>
