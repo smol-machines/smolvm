@@ -744,6 +744,26 @@ fn dir_disk_usage(path: &Path) -> u64 {
 /// automatically after a new (cache-miss) extraction, and keeps the newest
 /// entries (including the one just written) by evicting oldest-first.
 pub fn evict_cache_to_size(cache_root: &Path, max_bytes: u64) -> u64 {
+    evict_cache_to_size_protecting(cache_root, max_bytes, None)
+}
+
+/// Like [`evict_cache_to_size`], but never evicts `protect` (canonicalized),
+/// even if that leaves the cache over the cap.
+///
+/// The eviction after a fresh extraction runs *before* the caller acquires a
+/// layers lease, so the just-written directory has no lease yet. When a single
+/// extraction is larger than the cap (a torch/CUDA pack is ~13 GiB vs the 5 GiB
+/// default), oldest-first eviction would otherwise delete the very directory
+/// about to be booted — the VM then mounts nonexistent virtio-fs shares and the
+/// vcpu panics with `BadActivate`. Passing the current `cache_dir` as `protect`
+/// prevents that; the cache is simply allowed over-cap until the run releases it
+/// (same policy already applied to leased dirs).
+pub fn evict_cache_to_size_protecting(
+    cache_root: &Path,
+    max_bytes: u64,
+    protect: Option<&Path>,
+) -> u64 {
+    let protect_canon = protect.and_then(|p| fs::canonicalize(p).ok());
     let mut entries: Vec<(PathBuf, std::time::SystemTime, u64)> = Vec::new();
     let read_dir = match fs::read_dir(cache_root) {
         Ok(rd) => rd,
@@ -778,6 +798,12 @@ pub fn evict_cache_to_size(cache_root: &Path, max_bytes: u64) -> u64 {
         }
         if has_active_leases(&path) {
             continue; // never evict a running pack/VM
+        }
+        if protect_canon
+            .as_deref()
+            .is_some_and(|pc| fs::canonicalize(&path).ok().as_deref() == Some(pc))
+        {
+            continue; // never evict the extraction we just wrote / are about to boot
         }
         force_detach_layers_volume(&path);
         if fs::remove_dir_all(&path).is_ok() {
@@ -879,7 +905,13 @@ pub fn extract_sidecar(
     // wrote) and never evicts a running pack.
     if result.is_ok() {
         if let Some(root) = cache_dir.parent() {
-            let freed = evict_cache_to_size(root, pack_cache_max_bytes());
+            // Protect the directory we just extracted: the caller has not yet
+            // acquired its layers lease, so without this the eviction can delete
+            // the assets this very run is about to boot (→ virtio-fs ENOENT →
+            // vcpu BadActivate). A torch pack (~13 GiB) alone exceeds the 5 GiB
+            // default cap, which is exactly when oldest-first eviction reaches it.
+            let freed =
+                evict_cache_to_size_protecting(root, pack_cache_max_bytes(), Some(cache_dir));
             if freed > 0 && debug {
                 eprintln!("debug: pack cache evicted {freed} bytes to stay under cap");
             }
@@ -3152,6 +3184,43 @@ mod tests {
         assert!(freed > 0, "expected some bytes freed");
         assert!(!old.exists(), "oldest extraction should be evicted");
         assert!(mid.exists() && new.exists(), "newer extractions kept");
+    }
+
+    #[test]
+    fn test_evict_cache_protects_current_extraction() {
+        use std::ffi::CString;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mk = |name: &str, mtime_secs: i64| {
+            let d = root.join(name);
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("data"), vec![0u8; 4 * 1024 * 1024]).unwrap(); // ~4 MiB real
+            let c = CString::new(d.to_string_lossy().as_bytes()).unwrap();
+            let tv = libc::timeval {
+                tv_sec: mtime_secs,
+                tv_usec: 0,
+            };
+            let times = [tv, tv];
+            unsafe {
+                libc::utimes(c.as_ptr(), times.as_ptr());
+            }
+            d
+        };
+        // The dir we just wrote is the NEWEST but still larger than the cap on
+        // its own — the exact torch-pack shape (one ~13 GiB extraction vs a 5 GiB
+        // cap). Without protection, oldest-first eviction would reach it and
+        // delete the very assets about to boot.
+        let old = mk("aaaa", 1_000_000);
+        let current = mk("cccc", 3_000_000);
+
+        // Cap smaller than `current` alone: everything is "over cap".
+        let freed = evict_cache_to_size_protecting(root, 1024 * 1024, Some(&current));
+        assert!(freed > 0, "the old entry should still be evicted");
+        assert!(!old.exists(), "oldest unprotected extraction evicted");
+        assert!(
+            current.exists() && current.join("data").exists(),
+            "the protected (just-extracted) dir must survive even over cap"
+        );
     }
 
     // Lease tracking is a macOS case-sensitive-volume concept; on Linux
