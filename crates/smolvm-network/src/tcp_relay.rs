@@ -104,6 +104,9 @@ struct TrackedConnection {
     buffered_proxy_data: Option<(Vec<u8>, usize)>,
     // bounded retry count for closing with unsent buffered data
     close_attempts: u16,
+    // set once we've sent FIN to the guest after the host half-closed, so the
+    // HalfClosed handling closes the guest send-half exactly once
+    guest_send_closed: bool,
     // relay thread termination mode observed by the poll loop
     exit_state: RelayExitState,
     // reserved local source port for published inbound connections
@@ -131,8 +134,10 @@ pub enum RelayTarget {
 /// The relay thread cannot mutate smoltcp sockets directly because those sockets
 /// are owned by the poll loop thread. Instead it reports how it finished, and
 /// the poll loop interprets that into guest-side socket actions:
-/// - `Graceful` -> close guest socket cleanly
-/// - `Abort`    -> abort/reset guest socket
+/// - `Graceful`   -> close guest socket cleanly
+/// - `HalfClosed` -> host closed its send half; send FIN to the guest but keep
+///   the guest socket open so guest->host output still drains
+/// - `Abort`      -> abort/reset guest socket
 #[derive(Clone, Debug)]
 pub struct RelayExitState {
     inner: Arc<AtomicU8>,
@@ -148,6 +153,12 @@ pub enum RelayExitMode {
     Graceful = 1,
     /// Remote connect or I/O failed; abort the guest TCP socket.
     Abort = 2,
+    /// Host closed its send half (host-read EOF) but the guest may still be
+    /// sending. Mirror the FIN toward the guest and keep pumping guest->host
+    /// until the guest closes too. Without this a hijacked-attach response is
+    /// dropped: the docker CLI half-closes (`shutdown(SHUT_WR)`) after
+    /// `101 UPGRADED` when it has no stdin, while the daemon is still streaming.
+    HalfClosed = 3,
 }
 
 impl RelayExitState {
@@ -161,6 +172,7 @@ impl RelayExitState {
         match self.inner.load(Ordering::Relaxed) {
             1 => RelayExitMode::Graceful,
             2 => RelayExitMode::Abort,
+            3 => RelayExitMode::HalfClosed,
             _ => RelayExitMode::Running,
         }
     }
@@ -261,6 +273,7 @@ impl TcpRelayTable {
                 buffered_guest_data: None,
                 buffered_proxy_data: None,
                 close_attempts: 0,
+                guest_send_closed: false,
                 exit_state,
                 reserved_published_port: None,
             },
@@ -354,6 +367,7 @@ impl TcpRelayTable {
                 buffered_guest_data: None,
                 buffered_proxy_data: None,
                 close_attempts: 0,
+                guest_send_closed: false,
                 exit_state,
                 reserved_published_port: Some(local_port),
             },
@@ -396,6 +410,19 @@ impl TcpRelayTable {
                         }
                     }
                     continue;
+                }
+                RelayExitMode::HalfClosed => {
+                    // Host closed its send half: flush any remaining host->guest
+                    // bytes, then send FIN to the guest exactly once. Crucially
+                    // we do NOT `continue` — fall through to the guest->host
+                    // drain below so the guest's in-flight response still
+                    // reaches the host. The thread flips to Graceful once the
+                    // guest closes too, and the connection is torn down then.
+                    flush_proxy_data(socket, connection);
+                    if connection.buffered_proxy_data.is_none() && !connection.guest_send_closed {
+                        socket.close();
+                        connection.guest_send_closed = true;
+                    }
                 }
                 RelayExitMode::Running => {}
             }
@@ -546,6 +573,7 @@ fn run_tcp_relay(
         from_smoltcp,
         to_smoltcp,
         relay_wake,
+        &exit_state,
     ) {
         Ok(mode) => {
             virtio_net_log!(
@@ -572,6 +600,7 @@ fn tcp_relay_loop(
     from_smoltcp: Receiver<Vec<u8>>,
     to_smoltcp: SyncSender<Vec<u8>>,
     relay_wake: Arc<WakePipe>,
+    exit_state: &RelayExitState,
 ) -> io::Result<RelayExitMode> {
     // Host-side flow:
     //
@@ -606,6 +635,7 @@ fn tcp_relay_loop(
 
     let mut guest_write_closed = false;
     let mut guest_channel_closed = false;
+    let mut host_read_closed = false;
     let mut pending_guest_data: Option<(Vec<u8>, usize)> = None;
     let mut read_buffer = [0u8; RELAY_BUFFER_BYTES];
 
@@ -661,17 +691,36 @@ fn tcp_relay_loop(
             guest_write_closed = true;
         }
 
-        match stream.read(&mut read_buffer) {
-            Ok(0) => return Ok(RelayExitMode::Graceful),
-            Ok(bytes_read) => {
-                if to_smoltcp.send(read_buffer[..bytes_read].to_vec()).is_err() {
-                    return Ok(RelayExitMode::Graceful);
+        // Both directions are done — the host stopped sending (host_read_closed)
+        // and the guest stopped sending and was fully flushed. Finish with a
+        // clean close; the poll loop tears the guest socket down.
+        if host_read_closed && guest_channel_closed && pending_guest_data.is_none() {
+            return Ok(RelayExitMode::Graceful);
+        }
+
+        // host -> guest, only while the host's send half is still open. On host
+        // read-EOF we do NOT tear the relay down: signal HalfClosed so the poll
+        // loop mirrors the FIN to the guest, then keep draining guest->host. A
+        // hijacked docker attach half-closes here (`shutdown(SHUT_WR)` with no
+        // stdin) while the daemon is still streaming its response back.
+        if !host_read_closed {
+            match stream.read(&mut read_buffer) {
+                Ok(0) => {
+                    host_read_closed = true;
+                    exit_state.store(RelayExitMode::HalfClosed);
+                    relay_wake.wake();
+                    did_work = true;
                 }
-                relay_wake.wake();
-                did_work = true;
+                Ok(bytes_read) => {
+                    if to_smoltcp.send(read_buffer[..bytes_read].to_vec()).is_err() {
+                        return Ok(RelayExitMode::Graceful);
+                    }
+                    relay_wake.wake();
+                    did_work = true;
+                }
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
+                Err(err) => return Err(err),
             }
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
-            Err(err) => return Err(err),
         }
 
         if !did_work {
@@ -756,6 +805,7 @@ mod tests {
             buffered_guest_data: None,
             buffered_proxy_data: None,
             close_attempts: 0,
+            guest_send_closed: false,
             exit_state: RelayExitState::new(),
             reserved_published_port: None,
         }
