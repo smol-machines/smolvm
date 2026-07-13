@@ -69,8 +69,7 @@ fn agent_ready_timeout() -> Duration {
 fn detach_vm_child_stdio() {
     match std::env::var("SMOLVM_PACKED_KRUN_STDERR_LOG").ok() {
         Some(p) if !p.trim().is_empty() => {
-            if smolvm::process::detach_stdio_to_stderr_file(std::path::Path::new(p.trim()))
-                .is_err()
+            if smolvm::process::detach_stdio_to_stderr_file(std::path::Path::new(p.trim())).is_err()
             {
                 smolvm::process::detach_stdio();
             }
@@ -492,7 +491,8 @@ impl PackRunCmd {
             // These bindings are consumed by the Unix fork closure above; on
             // Windows the BootConfig carries the same data, so silence the
             // unused-variable warnings rather than reshape the surrounding code.
-            let _ = (&packed_mounts, &port_mappings);
+            // `cuda_enabled`/`cuda_sock` drive the unix-only shared-daemon path.
+            let _ = (&packed_mounts, &port_mappings, cuda_enabled, &cuda_sock);
 
             // The overlay file is always created on disk before this point
             // (`setup_vm_overlay`); fall back to the well-known runtime path when

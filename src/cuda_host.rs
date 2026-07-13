@@ -57,6 +57,9 @@ pub fn start(socket_path: &Path) -> std::io::Result<()> {
             //                           overrides the managed one.
             let daemon = match std::env::var("SMOLVM_CUDA_DAEMON").ok() {
                 Some(addr) => Some(addr),
+                // The smolvm-managed daemon is unix-only (see `cuda_daemon`); on
+                // other platforms SMOLVM_CUDA_SHARED just serves in-process.
+                #[cfg(unix)]
                 None if std::env::var("SMOLVM_CUDA_SHARED").as_deref() == Ok("1") => {
                     match crate::cuda_daemon::ensure_running() {
                         Ok(sock) => Some(sock.to_string_lossy().into_owned()),
@@ -109,13 +112,23 @@ pub fn start(socket_path: &Path) -> std::io::Result<()> {
 fn proxy_to_daemon(guest: crate::platform::uds::UdsStream, addr: &str) -> std::io::Result<()> {
     // A path (managed daemon) → unix socket; otherwise host:port → TCP.
     if addr.starts_with('/') {
-        let daemon = std::os::unix::net::UnixStream::connect(addr)?;
-        pump(guest, daemon.try_clone()?, daemon)
-    } else {
-        let daemon = std::net::TcpStream::connect(addr)?;
-        let _ = daemon.set_nodelay(true);
-        pump(guest, daemon.try_clone()?, daemon)
+        #[cfg(unix)]
+        {
+            let daemon = std::os::unix::net::UnixStream::connect(addr)?;
+            return pump(guest, daemon.try_clone()?, daemon);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = guest;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "unix-socket CUDA daemon unsupported on this platform; use SMOLVM_CUDA_DAEMON=host:port",
+            ));
+        }
     }
+    let daemon = std::net::TcpStream::connect(addr)?;
+    let _ = daemon.set_nodelay(true);
+    pump(guest, daemon.try_clone()?, daemon)
 }
 
 /// Byte-pump the guest connection and a daemon connection in both directions.

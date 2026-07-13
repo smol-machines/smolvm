@@ -1227,10 +1227,12 @@ pub extern "C" fn cudaStreamDestroy(stream: *mut c_void) -> c_int {
 
 #[no_mangle]
 pub extern "C" fn cudaStreamSynchronize(stream: *mut c_void) -> c_int {
-    set_last(match with_client_retrying(|c| c.stream_synchronize(stream as u64)) {
-        Ok(()) => CUDA_SUCCESS,
-        Err(e) => e,
-    })
+    set_last(
+        match with_client_retrying(|c| c.stream_synchronize(stream as u64)) {
+            Ok(()) => CUDA_SUCCESS,
+            Err(e) => e,
+        },
+    )
 }
 
 /// `cudaLaunchHostFunc` — a host callback that must run AFTER all prior work on
@@ -1737,10 +1739,12 @@ pub extern "C" fn cudaEventQuery(event: *mut c_void) -> c_int {
     // blocks are safe to reuse. Always answering "complete" caused premature
     // reuse (ILLEGAL_ADDRESS) once work really ran on side streams. NotReady
     // (600) latches into last-error exactly like real cudart; torch clears it.
-    set_last(match with_client_retrying(|c| c.event_query(event as u64)) {
-        Ok(code) => code,
-        Err(e) => e,
-    })
+    set_last(
+        match with_client_retrying(|c| c.event_query(event as u64)) {
+            Ok(code) => code,
+            Err(e) => e,
+        },
+    )
 }
 #[no_mangle]
 pub extern "C" fn cudaEventElapsedTime(
@@ -1788,10 +1792,12 @@ pub extern "C" fn cudaStreamWaitEvent(
 #[no_mangle]
 pub extern "C" fn cudaStreamQuery(stream: *mut c_void) -> c_int {
     // Honest completion status (0 or 600-NotReady), same as cudaEventQuery.
-    set_last(match with_client_retrying(|c| c.stream_query(stream as u64)) {
-        Ok(code) => code,
-        Err(e) => e,
-    })
+    set_last(
+        match with_client_retrying(|c| c.stream_query(stream as u64)) {
+            Ok(code) => code,
+            Err(e) => e,
+        },
+    )
 }
 // ---- CUDA graphs -------------------------------------------------------------
 // Capture happens on the HOST driver: Begin/End forward, and every launch /

@@ -438,9 +438,8 @@ fn chk(code: CuResultCode) -> CuResult<()> {
 /// clone's fresh connection adopt a snapshot of its (frozen) parent's handle
 /// map — see [`GpuBackend::begin_session`].
 type VhMap = std::sync::Mutex<std::collections::HashMap<u64, u64>>;
-static HANDOFF: std::sync::Mutex<
-    Option<std::collections::HashMap<u64, std::sync::Weak<VhMap>>>,
-> = std::sync::Mutex::new(None);
+static HANDOFF: std::sync::Mutex<Option<std::collections::HashMap<u64, std::sync::Weak<VhMap>>>> =
+    std::sync::Mutex::new(None);
 
 fn next_lineage_token() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2310,11 +2309,7 @@ impl GpuBackend {
                     }
                 }
                 let vh = self.vhandles.lock().unwrap();
-                Ok(self
-                    .cudnn_bn
-                    .as_ref()
-                    .unwrap()
-                    .dispatch(func, args, &vh))
+                Ok(self.cudnn_bn.as_ref().unwrap().dispatch(func, args, &vh))
             }
             _ => Err(super::CUDA_ERROR_NOT_FOUND),
         }

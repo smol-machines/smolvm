@@ -359,11 +359,7 @@ static GRAPH_HANDOFF: std::sync::Mutex<Option<HashMap<u64, std::sync::Weak<Graph
 /// under `my_token` (the same token the backend minted for cuBLAS handoff, so
 /// both handle families share one lineage). The reals are context-scoped host
 /// handles valid in the shared primary context, so copying vh→real is enough.
-fn graph_handoff_register(
-    dst: &std::sync::Arc<GraphVhMap>,
-    resume_token: u64,
-    my_token: u64,
-) {
+fn graph_handoff_register(dst: &std::sync::Arc<GraphVhMap>, resume_token: u64, my_token: u64) {
     let mut reg = GRAPH_HANDOFF.lock().unwrap();
     let reg = reg.get_or_insert_with(HashMap::new);
     if resume_token != 0 {
@@ -1956,7 +1952,9 @@ mod tests {
         let (st, r) = dispatch(
             &mut sess_a,
             &mut backend,
-            Request::ModuleLoadData { image: vec![0u8; 8] },
+            Request::ModuleLoadData {
+                image: vec![0u8; 8],
+            },
         );
         assert_eq!(st, 0);
         let module = match r {
@@ -1966,7 +1964,10 @@ mod tests {
         let (st, r) = dispatch(
             &mut sess_a,
             &mut backend,
-            Request::ModuleGetFunction { module, name: "vecadd".into() },
+            Request::ModuleGetFunction {
+                module,
+                name: "vecadd".into(),
+            },
         );
         assert_eq!(st, 0);
         let function = match r {
@@ -1986,7 +1987,10 @@ mod tests {
             &mut backend,
             Request::FuncGetParamInfo { function },
         );
-        assert_eq!(st, 0, "function from another session must resolve, not fault");
+        assert_eq!(
+            st, 0,
+            "function from another session must resolve, not fault"
+        );
         match r {
             Response::Data(d) => assert_eq!(
                 d,

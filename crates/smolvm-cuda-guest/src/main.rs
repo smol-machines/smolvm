@@ -161,7 +161,11 @@ fn run_loop() -> Result<(), Box<dyn std::error::Error>> {
         .take(8)
         .collect::<String>();
     let mut append = |line: String| {
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&out) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&out)
+        {
             let _ = writeln!(f, "{line}");
         }
     };

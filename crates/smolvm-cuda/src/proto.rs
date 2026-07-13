@@ -1484,8 +1484,7 @@ pub fn decode_response(op: Op, payload: &[u8]) -> io::Result<(i32, Response)> {
         Op::CublasCreate => Response::Handle(c.u64()?),
         Op::LibCall => Response::LibResult(c.i32()?, c.bytes()?),
         Op::EventElapsedTime => Response::Millis(f32::from_bits(c.u32()?)),
-        Op::Init
-        | Op::StreamBeginCapture
+        Op::StreamBeginCapture
         | Op::GraphLaunch
         | Op::GraphExecDestroy
         | Op::GraphDestroy

@@ -85,7 +85,10 @@ fn main() {
     // Internal re-invocations (`_boot-vm`, `_cuda-daemon`) run the same packed
     // executable but must do their job, not re-trigger packed rehydration.
     let internal = matches!(
-        std::env::args_os().nth(1).as_deref().and_then(|s| s.to_str()),
+        std::env::args_os()
+            .nth(1)
+            .as_deref()
+            .and_then(|s| s.to_str()),
         Some("_boot-vm") | Some("_cuda-daemon")
     );
     if !internal {
@@ -109,9 +112,15 @@ fn main() {
         Commands::Pack(cmd) => cmd.run(),
         Commands::Config(cmd) => cmd.run(),
         Commands::BootVm { config } => cli::internal_boot::run(config),
+        #[cfg(unix)]
         Commands::CudaDaemon { socket } => {
             smolvm::cuda_daemon::run(&socket).map_err(smolvm::Error::Io)
         }
+        #[cfg(not(unix))]
+        Commands::CudaDaemon { .. } => Err(smolvm::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "the shared CUDA daemon is unix-only",
+        ))),
         Commands::CleanupEphemeral {
             vm_name,
             pid,
