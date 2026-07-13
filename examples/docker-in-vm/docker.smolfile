@@ -70,6 +70,35 @@
 #   running inside the VM (start it as above); until it is, host connections
 #   just fail with the usual "is the docker daemon running?".
 #
+#   This is the RECOMMENDED endpoint: the Unix socket is itself the trust
+#   boundary, so there is no open TCP port and no unauthenticated network
+#   surface — nothing to TLS-protect or firewall. Prefer it over the TCP
+#   endpoint below for anything beyond a single-user throwaway box.
+#
+# ── Alternative: TCP endpoint (dockerd -H tcp) ────────────────────────────────
+#
+#   If a client insists on TCP, run dockerd on a TCP port and publish it. dockerd
+#   deliberately sleeps ~15s when binding TCP without TLS unless you state intent,
+#   so pass --tls=false to remove that delay:
+#
+#     dockerd --host=tcp://0.0.0.0:2375 --tls=false \
+#             --data-root=/storage/docker --storage-driver=overlay2 \
+#             >/tmp/dockerd.log 2>&1 &
+#
+#   Publish the port at create time (published ports use the virtio-net backend):
+#     smolvm machine create --name docker -p 12375:2375 ...   # + the init below
+#   then from the host:
+#     DOCKER_HOST=tcp://127.0.0.1:12375 docker ps
+#
+#   Caveats:
+#   - The TCP docker API is UNAUTHENTICATED. Publish to a host LOOPBACK port only
+#     (127.0.0.1), never 0.0.0.0 on a shared host, or terminate TLS in front of
+#     it. The Unix-socket endpoint above avoids this entirely.
+#   - A container's OWN published ports must be declared up front with -p at
+#     machine-create time. Dynamically-assigned host ports (e.g. `docker
+#     compose` picking a random host port) outside the pre-mapped set are not
+#     reachable — pin the ports you publish.
+#
 # ── Run containers ────────────────────────────────────────────────────────────
 #
 #   # Pull an image
