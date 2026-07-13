@@ -1308,9 +1308,26 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             Ok(Response::Handle(e))
         }
         Request::GraphLaunch { graph_exec, stream } => {
-            let raw = raw_stream(sess, stream)?;
-            b.graph_launch(raw_graph(sess, graph_exec), raw)
-                .map(|_| Response::Ok)
+            let real = raw_graph(sess, graph_exec);
+            // Fork isolation + an INHERITED cudagraph is silent corruption: the
+            // graph baked in the golden's device addresses at capture time and
+            // `cuGraphLaunch` replays them un-translated, so the clone would write
+            // the golden's / a sibling's memory. Fail loud until per-clone graph
+            // node patching lands (docs/cuda-fork-production-plan.md, Path 2). A
+            // graph the clone captured ITSELF (in owned_graph_reals) is fine —
+            // its nodes were translated at capture time. Eager mode has no graphs,
+            // so this never fires there.
+            if !sess.dptr_trans.is_empty() && !sess.owned_graph_reals.contains(&real) {
+                eprintln!(
+                    "[cuda-fork-isolate] refusing to launch an inherited CUDA graph in an \
+                     isolated clone (baked-in pointers would corrupt across clones). Run the \
+                     workload with enforce_eager, or land Path 2 graph-node patching."
+                );
+                Err(CUDA_ERROR_NOT_SUPPORTED)
+            } else {
+                let raw = raw_stream(sess, stream)?;
+                b.graph_launch(real, raw).map(|_| Response::Ok)
+            }
         }
         Request::GraphExecDestroy { graph_exec } => {
             let real = raw_graph(sess, graph_exec);
