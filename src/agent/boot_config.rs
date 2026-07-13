@@ -50,6 +50,11 @@ pub struct BootConfig {
     /// guest's CUDA Driver-API calls to the host GPU.
     #[serde(default)]
     pub cuda: bool,
+    /// Expose the guest's Docker daemon socket to the host. When set, the boot
+    /// subprocess registers a vsock port whose host end is a Unix socket in the
+    /// VM data dir; the guest agent proxies it to `/var/run/docker.sock`.
+    #[serde(default)]
+    pub expose_docker: bool,
     /// Hostnames for DNS filtering. When set, the host starts a DNS filter
     /// listener and the guest agent proxies DNS queries through it.
     #[serde(default)]

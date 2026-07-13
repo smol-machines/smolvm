@@ -57,6 +57,19 @@
 #     for i in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 1; done
 #     docker info | grep "Storage Driver"'
 #
+# ── Reach the daemon from the host (DOCKER_HOST) ──────────────────────────────
+#
+#   Set `docker_socket = true` below (or pass `--docker-socket` to
+#   `machine create`/`run`) to expose the guest's /var/run/docker.sock to the
+#   host as a Unix socket. smolvm bridges it over vsock and prints the host path
+#   on start; a host docker client then drives the in-VM daemon directly:
+#
+#     DOCKER_HOST=unix://<vm-data-dir>/docker.sock docker ps
+#
+#   The bridge starts at boot and needs no port publishing. dockerd must be
+#   running inside the VM (start it as above); until it is, host connections
+#   just fail with the usual "is the docker daemon running?".
+#
 # ── Run containers ────────────────────────────────────────────────────────────
 #
 #   # Pull an image
@@ -107,6 +120,10 @@ cpus = 2
 memory = 2048
 net = true
 storage = 20
+
+# Expose the guest dockerd socket to the host as a Unix socket
+# (DOCKER_HOST=unix://<vm-data-dir>/docker.sock). See the section above.
+docker_socket = true
 
 init = [
     "apk update -q",

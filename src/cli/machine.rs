@@ -457,6 +457,11 @@ pub struct RunCmd {
     #[arg(long, help_heading = "Hardware")]
     pub cuda: bool,
 
+    /// Expose the guest's Docker daemon socket to the host as a Unix socket
+    /// (DOCKER_HOST=unix://…). Requires dockerd running in the VM.
+    #[arg(long, help_heading = "Network")]
+    pub docker_socket: bool,
+
     /// Mount ~/.docker/ config into VM for registry authentication
     #[arg(long, help_heading = "Registry")]
     pub docker_config: bool,
@@ -1082,6 +1087,7 @@ impl RunCmd {
         let mut features = smolvm::agent::LaunchFeatures {
             ssh_agent_socket,
             cuda: self.cuda || params.cuda,
+            expose_docker: self.docker_socket || params.docker_socket,
             dns_filter_hosts: params.dns_filter_hosts.clone(),
             packed_layers_dir,
             extra_disks: Vec::new(),
@@ -1096,6 +1102,19 @@ impl RunCmd {
         let freshly_started = manager
             .ensure_running_with_full_config(mounts.clone(), ports, resources, features)
             .map_err(|e| Error::agent("start machine", e.to_string()))?;
+
+        // Tell the user how to reach the guest's Docker daemon from the host.
+        // libkrun exposes the bridge as a Unix socket in the VM data dir; a
+        // host docker client uses it via DOCKER_HOST. dockerd must be running
+        // inside the VM (start it once the machine is up).
+        if self.docker_socket || params.docker_socket {
+            let sock = smolvm::agent::vm_data_dir(&vm_name).join("docker.sock");
+            eprintln!(
+                "Docker socket exposed — once dockerd is running in the VM, reach it with:\n  \
+                 DOCKER_HOST=unix://{} docker ps",
+                sock.display()
+            );
+        }
 
         // Register the ephemeral VM for tracking (machine list, orphan cleanup),
         // keyed by the VM's OWN name. The orphan sweep only has the DB record and
@@ -1332,6 +1351,7 @@ impl RunCmd {
                                 cmd: command.clone(),
                                 ssh_agent: self.ssh_agent || params.ssh_agent,
                                 cuda: self.cuda || params.cuda,
+                                docker_socket: self.docker_socket || params.docker_socket,
                                 dns_filter_hosts: params.dns_filter_hosts.clone(),
                                 gpu: self.gpu || params.gpu,
                                 gpu_vram_mib: self.gpu_vram_mib.or(params.gpu_vram_mib),
@@ -1484,6 +1504,7 @@ impl RunCmd {
                             cmd: params.cmd.clone(),
                             ssh_agent: self.ssh_agent || params.ssh_agent,
                             cuda: self.cuda || params.cuda,
+                            docker_socket: self.docker_socket || params.docker_socket,
                             dns_filter_hosts: params.dns_filter_hosts.clone(),
                             gpu: self.gpu || params.gpu,
                             gpu_vram_mib: self.gpu_vram_mib.or(params.gpu_vram_mib),
@@ -2149,6 +2170,11 @@ pub struct CreateCmd {
     #[arg(long)]
     pub cuda: bool,
 
+    /// Expose the guest's Docker daemon socket to the host as a Unix socket
+    /// (DOCKER_HOST=unix://…). Requires dockerd running in the VM.
+    #[arg(long)]
+    pub docker_socket: bool,
+
     /// Inject a secret from a host env var (GUEST_VAR=HOST_VAR), resolved at
     /// each launch. Only the reference is persisted, never the value.
     #[arg(long = "secret-env", value_name = "GUEST_VAR=HOST_VAR")]
@@ -2279,6 +2305,9 @@ impl CreateCmd {
         }
         if self.cuda {
             params.cuda = true;
+        }
+        if self.docker_socket {
+            params.docker_socket = true;
         }
         if self.gpu {
             params.gpu = true;
@@ -2429,6 +2458,7 @@ impl CreateCmd {
             health_startup_grace_secs: None,
             ssh_agent: self.ssh_agent,
             cuda: self.cuda,
+            docker_socket: self.docker_socket,
             dns_filter_hosts: None,
             gpu: manifest.gpu,
             gpu_vram_mib: None,

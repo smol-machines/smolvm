@@ -25,6 +25,10 @@ pub struct VsockServiceInputs<'a> {
     pub dns_filter_socket: Option<&'a Path>,
     /// Host CUDA-over-vsock server socket (experimental).
     pub cuda_socket: Option<&'a Path>,
+    /// Host-side Docker socket to expose. libkrun *listens* on this path and
+    /// forwards each host connection to the guest, which proxies it to the
+    /// in-guest dockerd socket. When set, the Docker bridge is enabled.
+    pub docker_socket: Option<&'a Path>,
 }
 
 /// A service resolved to "on" for a launch: the concrete wiring the launcher
@@ -103,7 +107,29 @@ impl VsockService for CudaService {
     }
 }
 
+/// Docker socket bridge: the guest serves on the vsock port (proxying to its
+/// own dockerd socket) and the host connects in via the exposed Unix socket, so
+/// a host client can drive the guest's Docker daemon with `DOCKER_HOST=unix://…`.
+/// `listen: true` — the only inbound service besides the agent control channel.
+struct DockerSocketService;
+impl VsockService for DockerSocketService {
+    fn resolve<'a>(&self, inputs: &VsockServiceInputs<'a>) -> Option<ActiveVsockService<'a>> {
+        inputs.docker_socket.map(|socket| ActiveVsockService {
+            name: "Docker socket bridge",
+            port: ports::DOCKER,
+            listen: true,
+            socket,
+            guest_env: &[(smolvm_protocol::guest_env::DOCKER_SOCKET, "1")],
+        })
+    }
+}
+
 /// All known vsock services. Add a capability by appending one entry.
 pub fn registry() -> &'static [&'static dyn VsockService] {
-    &[&SshAgentService, &DnsFilterService, &CudaService]
+    &[
+        &SshAgentService,
+        &DnsFilterService,
+        &CudaService,
+        &DockerSocketService,
+    ]
 }

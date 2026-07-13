@@ -491,6 +491,19 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
         None
     };
 
+    // Docker socket bridge: expose the guest's dockerd socket to the host as a
+    // Unix socket in the per-VM dir. libkrun listens on this path (listen=true),
+    // so we only need to hand it the path and clear any stale socket first.
+    let docker_socket: Option<std::path::PathBuf> = if config.expose_docker {
+        config.vsock_socket.parent().map(|dir| {
+            let path = dir.join("docker.sock");
+            let _ = std::fs::remove_file(&path);
+            path
+        })
+    } else {
+        None
+    };
+
     proc_timing!("ready to launch");
 
     // Egress telemetry lands in the per-VM dir (the vsock socket's parent), the
@@ -510,6 +523,7 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
         ssh_agent_socket: config.ssh_agent_socket.as_deref(),
         dns_filter_socket: dns_filter_socket_path.as_deref(),
         cuda_socket: cuda_socket.as_deref(),
+        docker_socket: docker_socket.as_deref(),
         packed_layers_dir: config.packed_layers_dir.as_deref(),
         extra_disks: &config.extra_disks,
         dns_filter_enabled: config

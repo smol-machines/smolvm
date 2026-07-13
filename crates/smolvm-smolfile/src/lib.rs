@@ -244,6 +244,9 @@ pub struct Smolfile {
     /// Enable CUDA-over-vsock: remote guest CUDA Driver-API calls to the
     /// host NVIDIA GPU. Linux-only; requires a host NVIDIA driver.
     pub cuda: Option<bool>,
+    /// Expose the guest's Docker daemon socket to the host as a Unix socket
+    /// (`DOCKER_HOST=unix://…`). Requires dockerd running inside the VM.
+    pub docker_socket: Option<bool>,
     /// Storage disk size in GiB.
     pub storage: Option<u64>,
     /// Overlay disk size in GiB.
@@ -558,6 +561,18 @@ protocol = "http"
 
         let sf = parse("").unwrap();
         assert_eq!(sf.cuda, None);
+    }
+
+    #[test]
+    fn parse_docker_socket_field() {
+        let sf = parse("docker_socket = true").unwrap();
+        assert_eq!(sf.docker_socket, Some(true));
+
+        let sf = parse("docker_socket = false").unwrap();
+        assert_eq!(sf.docker_socket, Some(false));
+
+        let sf = parse("").unwrap();
+        assert_eq!(sf.docker_socket, None);
     }
 
     #[test]

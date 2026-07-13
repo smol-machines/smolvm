@@ -71,3 +71,7 @@ pub const PREFIX_LEN6: &str = "SMOLVM_NETWORK_PREFIX_LEN6";
 pub const DNS: &str = "SMOLVM_NETWORK_DNS";
 /// Enables the guest-side DNS filtering proxy.
 pub const DNS_FILTER: &str = "SMOLVM_DNS_FILTER";
+/// Enables the guest-side Docker socket bridge: the agent listens on the
+/// `ports::DOCKER` vsock port and proxies each connection to the in-guest
+/// Docker daemon socket, so the host can reach it over a Unix socket.
+pub const DOCKER_SOCKET: &str = "SMOLVM_DOCKER_SOCKET";

@@ -81,6 +81,7 @@ fn boot_log(level: &str, msg: &str) {
 }
 mod cuda;
 mod dns_proxy;
+mod docker_bridge;
 mod network;
 mod oci;
 mod paths;
@@ -403,6 +404,14 @@ fn main() {
         ssh_agent::start();
         // Set env so all child processes (git, ssh, etc.) find the agent socket
         std::env::set_var("SSH_AUTH_SOCK", ssh_agent::GUEST_SSH_AUTH_SOCK);
+    }
+
+    // Start the Docker socket bridge if enabled by host: the guest listens on a
+    // vsock port and proxies to the in-guest dockerd socket, so the host reaches
+    // it over a Unix socket (DOCKER_HOST=unix://…).
+    if docker_bridge::is_enabled() {
+        info!("Docker socket bridge enabled, starting guest bridge");
+        docker_bridge::start();
     }
 
     // Mount the Rosetta 2 runtime and register the binfmt_misc handler if the

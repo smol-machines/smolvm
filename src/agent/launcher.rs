@@ -182,6 +182,10 @@ pub struct LaunchFeatures {
     /// Enable CUDA-over-vsock: smolvm starts a host CUDA server and the guest
     /// remotes its CUDA Driver-API calls to the host GPU.
     pub cuda: bool,
+    /// Expose the guest's Docker daemon socket to the host as a Unix socket in
+    /// the VM data dir (`DOCKER_HOST=unix://…`). The guest agent proxies each
+    /// host connection to its in-guest `/var/run/docker.sock`.
+    pub expose_docker: bool,
     /// Hostnames for DNS filtering. When set, the host starts a DNS filter
     /// listener and the guest agent proxies DNS queries through it.
     pub dns_filter_hosts: Option<Vec<String>>,
@@ -371,6 +375,10 @@ pub struct LaunchConfig<'a> {
     /// the calls on the NVIDIA GPU. Resolved at the boot-config boundary (the
     /// subprocess reads `SMOLVM_CUDA_SOCK`) so the launcher stays policy-free.
     pub cuda_socket: Option<&'a Path>,
+    /// Host-side Docker socket to expose. When set, libkrun listens on this
+    /// path and the guest proxies connections to its in-guest dockerd socket,
+    /// so a host client reaches the daemon at `DOCKER_HOST=unix://<this path>`.
+    pub docker_socket: Option<&'a Path>,
     /// Pre-extracted OCI layers directory for .smolmachine-sourced machines.
     /// Mounted via virtiofs as "smolvm_layers" so the agent uses packed layers.
     pub packed_layers_dir: Option<&'a Path>,
@@ -423,6 +431,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         ssh_agent_socket,
         dns_filter_socket,
         cuda_socket,
+        docker_socket,
         packed_layers_dir,
         extra_disks,
         dns_filter_enabled,
@@ -985,6 +994,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             ssh_agent_socket: ssh_agent_socket.as_deref(),
             dns_filter_socket: dns_filter_socket.as_deref(),
             cuda_socket: cuda_socket.as_deref(),
+            docker_socket: docker_socket.as_deref(),
         };
         let active_vsock: Vec<_> = vsock_service::registry()
             .iter()

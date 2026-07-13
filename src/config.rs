@@ -487,6 +487,11 @@ pub struct VmRecord {
     #[serde(default)]
     pub cuda: bool,
 
+    /// Expose the guest's Docker daemon socket to the host as a Unix socket in
+    /// the VM data dir, so a host client can drive it with `DOCKER_HOST=unix://…`.
+    #[serde(default)]
+    pub docker_socket: bool,
+
     /// Hostnames for DNS filtering. When set, the guest DNS proxy filters
     /// queries against this allowlist.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -585,6 +590,7 @@ impl VmRecord {
             health_startup_grace_secs: None,
             ssh_agent: false,
             cuda: false,
+            docker_socket: false,
             dns_filter_hosts: None,
             ephemeral: false,
             source_smolmachine: None,
@@ -639,6 +645,7 @@ impl VmRecord {
             health_startup_grace_secs: None,
             ssh_agent: false,
             cuda: false,
+            docker_socket: false,
             dns_filter_hosts: None,
             ephemeral: false,
             source_smolmachine: None,

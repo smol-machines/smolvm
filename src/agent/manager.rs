@@ -1836,6 +1836,7 @@ impl AgentManager {
             resources: resources_for_config.clone(),
             ssh_agent_socket: features.ssh_agent_socket,
             cuda: features.cuda,
+            expose_docker: features.expose_docker,
             dns_filter_hosts: features.dns_filter_hosts,
             packed_layers_dir: features.packed_layers_dir,
             pack_idmap_source,
