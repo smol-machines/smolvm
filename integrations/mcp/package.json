@@ -1,0 +1,43 @@
+{
+  "name": "@smol-machines/smolvm-mcp",
+  "version": "0.1.0",
+  "description": "MCP server that gives AI agents an isolated microVM (smolvm) to run code, edit files, and browse — sub-200ms boot, on macOS/Linux/Windows.",
+  "type": "module",
+  "bin": {
+    "smolvm-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "smolvm",
+    "microvm",
+    "sandbox",
+    "agent",
+    "code-execution"
+  ],
+  "homepage": "https://github.com/smol-machines/smolvm/tree/main/integrations/mcp",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/smol-machines/smolvm.git",
+    "directory": "integrations/mcp"
+  },
+  "license": "Apache-2.0",
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "typescript": "^5.5.0"
+  }
+}
