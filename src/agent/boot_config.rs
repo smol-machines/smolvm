@@ -72,4 +72,11 @@ pub struct BootConfig {
     /// lets the `pack --from-vm` exporter attach a source qcow2 disk read-only.
     #[serde(default)]
     pub extra_disks: Vec<(PathBuf, bool, DiskFormat)>,
+    /// Kubernetes pod network namespace to attach the guest virtio-net NIC to.
+    /// When set, the boot subprocess (while still privileged) opens a tap inside
+    /// this netns and tc-redirects it against the CNI interface, then bridges the
+    /// guest NIC L2 to it — so the pod carries its CNI-assigned IP. Requires the
+    /// virtio-net backend. See `agent::pod_net`.
+    #[serde(default)]
+    pub pod_netns: Option<PathBuf>,
 }

@@ -84,6 +84,7 @@ mod dns_proxy;
 mod network;
 mod oci;
 mod paths;
+mod pod;
 mod process;
 #[cfg(target_os = "linux")]
 mod pty;
@@ -1873,6 +1874,14 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
             continue;
         }
 
+        // PodStart streams the pod container's (or exec process's) I/O on
+        // this connection — Started → Stdout/Stderr → Exited, with Stdin and
+        // Resize handled by the interactive pumps — like interactive Run.
+        if let AgentRequest::PodStart { .. } = &request {
+            pod::handle_pod_start(stream, request)?;
+            continue;
+        }
+
         // Handle Pull with progress streaming
         if let AgentRequest::Pull {
             ref image,
@@ -2214,6 +2223,40 @@ fn handle_request(
             "streaming file read must be handled at connection level",
             error_codes::INTERNAL_ERROR,
         ),
+
+        // Pod-container lifecycle (containerd shim v2 datapath, see pod.rs).
+        AgentRequest::PodCreate {
+            id,
+            rootfs_rel,
+            spec_json,
+            tty,
+        } => pod::handle_pod_create(&id, &rootfs_rel, &spec_json, tty),
+
+        // PodStart streams on the connection; routed in handle_connection.
+        AgentRequest::PodStart { .. } => AgentResponse::error(
+            "pod start must be handled at connection level",
+            error_codes::INTERNAL_ERROR,
+        ),
+
+        AgentRequest::PodExec {
+            id,
+            exec_id,
+            process_json,
+            tty,
+        } => pod::handle_pod_exec(&id, &exec_id, &process_json, tty),
+
+        AgentRequest::PodSignal {
+            id,
+            exec_id,
+            signal,
+            all,
+        } => pod::handle_pod_signal(&id, exec_id.as_deref(), signal, all),
+
+        AgentRequest::PodPids { id } => pod::handle_pod_pids(&id),
+
+        AgentRequest::PodStats { id } => pod::handle_pod_stats(&id),
+
+        AgentRequest::PodDelete { id, exec_id } => pod::handle_pod_delete(&id, exec_id.as_deref()),
     }
 }
 
@@ -3009,7 +3052,13 @@ fn handle_interactive_run(
     };
 
     // Send Exited response
-    send_response(stream, &AgentResponse::Exited { exit_code })?;
+    send_response(
+        stream,
+        &AgentResponse::Exited {
+            exit_code,
+            oom: false,
+        },
+    )?;
     maybe_cleanup(&prepared.workload_id);
 
     Ok(())
@@ -3515,6 +3564,7 @@ fn spawn_exec_in_container(
                 workdir,
                 console.path(),
             )
+            .user(launch.user.as_deref())
             .spawn()?;
             match console.recv_master(std::time::Duration::from_secs(3)) {
                 Ok(pty_master) => {
@@ -3558,6 +3608,7 @@ fn spawn_exec_in_container(
         // SAFETY: slave_fd is a valid open fd from openpty.
         let child = unsafe {
             crun::CrunCommand::exec(container_id, env, command, workdir, true)
+                .user(launch.user.as_deref())
                 .stdin_from_fd(libc::dup(slave_raw))
                 .stdout_from_fd(libc::dup(slave_raw))
                 .stderr_from_fd(libc::dup(slave_raw))
@@ -3567,6 +3618,7 @@ fn spawn_exec_in_container(
         Ok((child, Some(pty_master)))
     } else {
         let child = crun::CrunCommand::exec(container_id, env, command, workdir, false)
+            .user(launch.user.as_deref())
             .stdin_piped()
             .capture_output()
             .spawn()?;
@@ -3718,10 +3770,7 @@ fn spawn_interactive_command(
     persistent_overlay_id: Option<&str>,
     unprivileged: bool,
 ) -> Result<(Child, Option<pty::PtyMaster>), Box<dyn std::error::Error>> {
-    use std::io::Read as _;
-    use std::os::unix::io::AsRawFd as _;
     use std::path::Path;
-    use std::sync::atomic::Ordering;
 
     if launch.command.is_empty() {
         return Err("empty command".into());
@@ -3786,14 +3835,43 @@ fn spawn_interactive_command(
         "spawning interactive container with crun"
     );
 
+    // The single-container `Run` path keeps cgroups disabled (its VM is the
+    // limit); per-container cgroups are a pod-only concern.
+    spawn_crun_run(&bundle_path, &container_id, tty, false)
+}
+
+/// Launch a container with `crun run` and hand back the child plus the PTY
+/// master when `tty` is set (console-socket handshake, with the stdio-PTY
+/// fallback). This is the spawn tail shared by interactive `Run`
+/// ([`spawn_interactive_command`]) and pod containers
+/// ([`pod::handle_pod_start`] → `start_init_process`); the bundle must
+/// already be written.
+#[cfg(target_os = "linux")]
+fn spawn_crun_run(
+    bundle_path: &std::path::Path,
+    container_id: &str,
+    tty: bool,
+    cgroups: bool,
+) -> Result<(Child, Option<pty::PtyMaster>), Box<dyn std::error::Error>> {
+    use std::io::Read as _;
+    use std::os::unix::io::AsRawFd as _;
+    use std::sync::atomic::Ordering;
+
     if tty {
         // Preferred path: take the container's console over a socket so the
         // master we hold is the process's real tty (resize works).
         if CONSOLE_SOCKET_WORKS.load(Ordering::Relaxed) {
-            let console = pty::ConsoleSocket::bind(&container_id)?;
-            let mut child =
-                crun::CrunCommand::run_with_console(&bundle_path, &container_id, console.path())
-                    .spawn()?;
+            let console = pty::ConsoleSocket::bind(container_id)?;
+            let cmd = if cgroups {
+                crun::CrunCommand::run_with_console_cgroupfs(
+                    bundle_path,
+                    container_id,
+                    console.path(),
+                )
+            } else {
+                crun::CrunCommand::run_with_console(bundle_path, container_id, console.path())
+            };
+            let mut child = cmd.spawn()?;
             match console.recv_master(std::time::Duration::from_secs(3)) {
                 Ok(pty_master) => {
                     let _ = pty_master.set_window_size(80, 24);
@@ -3830,7 +3908,7 @@ fn spawn_interactive_command(
                     // The failed `crun run --console-socket` may have registered
                     // container state under this id; clear it so the fallback
                     // `crun run` with the same id doesn't hit "already exists".
-                    let _ = crun::CrunCommand::delete(&container_id, true).output();
+                    let _ = crun::CrunCommand::delete(container_id, true).output();
                 }
             }
         }
@@ -3839,9 +3917,13 @@ fn spawn_interactive_command(
         let (pty_master, slave_fd) = pty::open_pty(80, 24)?;
         let slave_raw = slave_fd.as_raw_fd();
         // SAFETY: slave_fd is a valid open fd from openpty.
+        let base = if cgroups {
+            crun::CrunCommand::run_cgroupfs(bundle_path, container_id)
+        } else {
+            crun::CrunCommand::run(bundle_path, container_id)
+        };
         let child = unsafe {
-            crun::CrunCommand::run(&bundle_path, &container_id)
-                .stdin_from_fd(libc::dup(slave_raw))
+            base.stdin_from_fd(libc::dup(slave_raw))
                 .stdout_from_fd(libc::dup(slave_raw))
                 .stderr_from_fd(libc::dup(slave_raw))
                 .spawn()?
@@ -3849,10 +3931,12 @@ fn spawn_interactive_command(
         drop(slave_fd);
         Ok((child, Some(pty_master)))
     } else {
-        let child = crun::CrunCommand::run(&bundle_path, &container_id)
-            .stdin_piped()
-            .capture_output()
-            .spawn()?;
+        let base = if cgroups {
+            crun::CrunCommand::run_cgroupfs(bundle_path, container_id)
+        } else {
+            crun::CrunCommand::run(bundle_path, container_id)
+        };
+        let child = base.stdin_piped().capture_output().spawn()?;
         Ok((child, None))
     }
 }
@@ -5453,7 +5537,13 @@ fn handle_interactive_vm_exec(
     };
 
     // Send Exited response
-    send_response(stream, &AgentResponse::Exited { exit_code })?;
+    send_response(
+        stream,
+        &AgentResponse::Exited {
+            exit_code,
+            oom: false,
+        },
+    )?;
 
     Ok(())
 }

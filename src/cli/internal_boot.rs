@@ -180,6 +180,34 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
         }
     }
 
+    // Kubernetes pod networking: while still privileged (needs CAP_NET_ADMIN +
+    // CAP_SYS_ADMIN, and BEFORE the uid drop and Landlock/seccomp), attach this
+    // sandbox to its CNI netns — open a tap there, tc-redirect it against the CNI
+    // interface, and discover the pod's L3 config. The tap fd + config flow to the
+    // launcher, which bridges the guest NIC to the tap. The attachment is held for
+    // the VM's lifetime (owns the tap fd); dropping it tears the datapath down.
+    #[cfg(target_os = "linux")]
+    let pod_net_attachment = match config.pod_netns.as_deref() {
+        Some(netns) => {
+            let ns = netns.to_string_lossy();
+            match smolvm::agent::pod_net::attach_pod_netns(&ns) {
+                Ok(a) => Some(a),
+                Err(e) => {
+                    eprintln!(
+                        "[pod-net] failed to attach pod netns {}: {e}",
+                        netns.display()
+                    );
+                    smolvm::process::exit_child(1);
+                }
+            }
+        }
+        None => None,
+    };
+    #[cfg(target_os = "linux")]
+    let pod_net_launch = pod_net_attachment.as_ref().map(|a| a.launch());
+    #[cfg(not(target_os = "linux"))]
+    let pod_net_launch: Option<smolvm::agent::pod_net::PodNetLaunch> = None;
+
     // Drop to an unprivileged uid before touching the guest, so a guest→VMM
     // escape can't signal/ptrace the supervisor or neighbor VMs nor reach
     // root-owned host files. Gated by SMOLVM_VM_UID (+ optional SMOLVM_VM_GID,
@@ -332,17 +360,7 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
         let marker_name = std::env::var(smolvm_protocol::guest_env::READY_MARKER)
             .unwrap_or_else(|_| smolvm_protocol::AGENT_READY_MARKER.to_string());
         let ready_marker = config.rootfs_path.join(marker_name);
-        if let Err(e) = std::fs::File::create(&ready_marker) {
-            // Read-only rootfs (e.g. root-owned system install): the marker
-            // can never be written, by us or by the guest. Not fatal — the
-            // manager detects this and uses socket readiness instead (#590) —
-            // but don't hide it.
-            eprintln!(
-                "[boot] ready marker pre-create failed ({e}); readiness will use \
-                 the vsock socket probe: {}",
-                ready_marker.display()
-            );
-        }
+        let _ = std::fs::File::create(&ready_marker);
         read_write.push(ready_marker);
 
         if let Err(e) = smolvm::process::restrict_filesystem(&read_exec, &read_write) {
@@ -517,6 +535,7 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
             .as_ref()
             .is_some_and(|hosts| !hosts.is_empty()),
         egress_refresh_hosts: config.dns_filter_hosts.clone(),
+        pod_net: pod_net_launch,
     });
 
     // If we get here, launch_agent_vm returned (should only happen on error)

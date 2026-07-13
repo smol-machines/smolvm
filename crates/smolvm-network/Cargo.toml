@@ -9,6 +9,7 @@ repository = "https://github.com/smol-machines/smolvm"
 [dependencies]
 crossbeam-queue = "0.3"
 humantime = "2"
+libc = "0.2"
 polling = "3"
 smoltcp = { version = "0.13", default-features = false, features = [
     "std",

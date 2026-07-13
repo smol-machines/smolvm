@@ -50,9 +50,17 @@ impl CrunCommand {
     /// instead of the default `/run/crun`, which may not be writable when the
     /// rootfs is an overlayfs with an initramfs lower layer.
     fn new() -> Self {
+        Self::new_with_cgroup(paths::CRUN_CGROUP_MANAGER)
+    }
+
+    /// Like [`new`](Self::new) but with an explicit cgroup manager. Pods pass
+    /// `"cgroupfs"` (after delegating a writable cgroup2) so crun creates a
+    /// per-container cgroup and enforces resource limits; everything else uses
+    /// the `disabled` default (libkrun mounts cgroup2 read-only by default).
+    fn new_with_cgroup(manager: &str) -> Self {
         let mut cmd = Command::new(paths::CRUN_PATH);
         cmd.args(["--root", paths::CRUN_ROOT_DIR]);
-        cmd.args(["--cgroup-manager", paths::CRUN_CGROUP_MANAGER]);
+        cmd.args(["--cgroup-manager", manager]);
         Self {
             cmd,
             pending_positionals: Vec::new(),
@@ -84,7 +92,18 @@ impl CrunCommand {
     /// The container id is deferred so later builder calls (e.g.
     /// `console_socket`) can still insert options before the positional.
     pub fn run(bundle_dir: &Path, container_id: &str) -> Self {
-        let mut c = Self::new();
+        Self::run_managed(bundle_dir, container_id, paths::CRUN_CGROUP_MANAGER)
+    }
+
+    /// [`run`](Self::run) with the cgroupfs manager, so crun creates a
+    /// per-container cgroup and enforces the spec's resource limits (memory/
+    /// pids → OOM). Only safe once cgroup2 is writable and delegated.
+    pub fn run_cgroupfs(bundle_dir: &Path, container_id: &str) -> Self {
+        Self::run_managed(bundle_dir, container_id, "cgroupfs")
+    }
+
+    fn run_managed(bundle_dir: &Path, container_id: &str, manager: &str) -> Self {
+        let mut c = Self::new_with_cgroup(manager);
         c.cmd
             .args(["run", "--bundle", &bundle_dir.to_string_lossy()]);
         c.pending_positionals = vec![container_id.to_string()];
@@ -100,7 +119,31 @@ impl CrunCommand {
     /// size / resize, which crun does not propagate in stdio-relay mode. crun's own
     /// stdio is unused, so it's nulled.
     pub fn run_with_console(bundle_dir: &Path, container_id: &str, console_socket: &Path) -> Self {
-        let mut c = Self::new();
+        Self::run_with_console_managed(
+            bundle_dir,
+            container_id,
+            console_socket,
+            paths::CRUN_CGROUP_MANAGER,
+        )
+    }
+
+    /// [`run_with_console`](Self::run_with_console) with the cgroupfs manager
+    /// (pod containers; see [`run_cgroupfs`](Self::run_cgroupfs)).
+    pub fn run_with_console_cgroupfs(
+        bundle_dir: &Path,
+        container_id: &str,
+        console_socket: &Path,
+    ) -> Self {
+        Self::run_with_console_managed(bundle_dir, container_id, console_socket, "cgroupfs")
+    }
+
+    fn run_with_console_managed(
+        bundle_dir: &Path,
+        container_id: &str,
+        console_socket: &Path,
+        manager: &str,
+    ) -> Self {
+        let mut c = Self::new_with_cgroup(manager);
         c.cmd.args([
             "run",
             "--bundle",
@@ -137,11 +180,27 @@ impl CrunCommand {
         if let Some(wd) = workdir {
             c.cmd.args(["--cwd", wd]);
         }
-        c.cmd.arg(container_id).args(command);
+        // Defer the container id + command so `.user()` (and any later option)
+        // can still insert flags before the positionals in `spawn`.
+        c.pending_positionals = std::iter::once(container_id.to_string())
+            .chain(command.iter().cloned())
+            .collect();
         c.cmd.stdin(Stdio::null());
         c.cmd.stdout(Stdio::null());
         c.cmd.stderr(Stdio::piped());
         c
+    }
+
+    /// Run the exec/run as `--user UID[:GID]` (or a username crun resolves against
+    /// the container's /etc/passwd). No-op when `user` is None. Used so `crun exec`
+    /// honours the container's configured user (CRI RunAsUser/RunAsUserName) —
+    /// without it, exec defaults to uid 0. Inserted before the deferred positional
+    /// arguments.
+    pub fn user(mut self, user: Option<&str>) -> Self {
+        if let Some(u) = user.filter(|s| !s.is_empty()) {
+            self.cmd.arg("--user").arg(u);
+        }
+        self
     }
 
     /// Start a container: `crun start <id>`
@@ -186,10 +245,33 @@ impl CrunCommand {
         c
     }
 
+    /// Execute a command in a running container from a full OCI Process spec:
+    /// `crun exec --process <file> <id>`. Unlike the flag-based [`Self::exec`],
+    /// this honors every field of the process — notably `user.additionalGids`
+    /// (CRI SupplementalGroups), which crun exec has no flag for. Non-TTY
+    /// (piped) stdio; the process file must set `terminal: false`.
+    pub fn exec_with_process(container_id: &str, process_file: &Path) -> Self {
+        let mut c = Self::new();
+        c.cmd.arg("exec").arg("--process").arg(process_file);
+        c.pending_positionals = vec![container_id.to_string()];
+        c
+    }
+
     /// Kill a container: `crun kill <id> <signal>`
     pub fn kill(container_id: &str, signal: &str) -> Self {
         let mut c = Self::new();
         c.cmd.args(["kill", container_id, signal]);
+        c
+    }
+
+    /// Kill every process in a container: `crun kill --all <id> <signal>`
+    ///
+    /// Used by the pod-container path (`PodSignal { all: true }`). May fail
+    /// when no per-container cgroup exists (cgroup manager is disabled);
+    /// callers fall back to signalling the process tree directly.
+    pub fn kill_all(container_id: &str, signal: &str) -> Self {
+        let mut c = Self::new();
+        c.cmd.args(["kill", "--all", container_id, signal]);
         c
     }
 

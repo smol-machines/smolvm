@@ -435,6 +435,7 @@ impl PackRunCmd {
                 packed_layers_dir: Some(layers_dir.to_path_buf()),
                 pack_idmap_source: None,
                 extra_disks: vec![],
+                pod_netns: None,
             };
 
             let config_path = runtime_dir.path().join("boot-config.json");
@@ -1409,6 +1410,7 @@ fn run_from_cache(
             packed_layers_dir: Some(layers_dir.to_path_buf()),
             pack_idmap_source: None,
             extra_disks: vec![],
+            pod_netns: None,
         };
         let config_path = runtime_dir.path().join("boot-config.json");
         let config_json = serde_json::to_vec(&boot_config)

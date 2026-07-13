@@ -18,6 +18,7 @@ fn main() {
             ..Default::default()
         },
         persistent: false,
+        runtime_managed: false,
     });
     rt.start_machine(name).expect("start");
     // small output: works

@@ -449,6 +449,95 @@ pub enum AgentRequest {
         /// Absolute path in the VM filesystem.
         path: String,
     },
+
+    /// Create (without starting) a Kubernetes pod container whose rootfs is a
+    /// virtiofs-shared host directory (containerd snapshotter output) and whose
+    /// process definition comes from the host's OCI config. The agent builds
+    /// its crun bundle around the shared rootfs; nothing runs until
+    /// `PodStart`. Part of the containerd shim v2 datapath
+    /// (docs/kubernetes-runtime.md).
+    PodCreate {
+        /// Container ID (containerd task id).
+        id: String,
+        /// Rootfs path relative to the sandbox's shared virtiofs mount. The
+        /// shim boots the sandbox VM with ONE shared dir and bind-mounts each
+        /// container's rootfs under it (virtiofs shares are fixed at boot, but
+        /// pod containers are created afterwards), so the guest resolves this
+        /// as `<sandbox-share-mount>/<rootfs_rel>`.
+        rootfs_rel: String,
+        /// The host OCI runtime spec (config.json bytes). The agent extracts
+        /// process/env/cwd/user/mounts/resources and grafts them onto its own
+        /// guest bundle template; host-specific namespaces/paths are ignored.
+        spec_json: String,
+        /// Allocate a PTY for the init process.
+        #[serde(default)]
+        tty: bool,
+    },
+
+    /// Start a pod container created by `PodCreate` (or an exec process
+    /// registered by `PodExec`), streaming its I/O on THIS connection:
+    /// `Started` → `Stdout`/`Stderr`... → `Exited`. Stdin arrives via `Stdin`
+    /// requests; PTY resize via `Resize`.
+    PodStart {
+        /// Container ID.
+        id: String,
+        /// Exec process to start instead of the init process.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exec_id: Option<String>,
+    },
+
+    /// Register an exec process for a running pod container. Started later by
+    /// `PodStart { exec_id }`.
+    PodExec {
+        /// Container ID.
+        id: String,
+        /// Exec process ID (unique within the container).
+        exec_id: String,
+        /// OCI Process JSON (containerd's ExecProcessRequest spec).
+        process_json: String,
+        /// Allocate a PTY for the exec process.
+        #[serde(default)]
+        tty: bool,
+    },
+
+    /// Signal a pod container's init process (or one exec process).
+    PodSignal {
+        /// Container ID.
+        id: String,
+        /// Exec process to signal instead of init.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exec_id: Option<String>,
+        /// Signal number (SIGKILL = 9, SIGTERM = 15, ...).
+        signal: u32,
+        /// Signal the whole container process group.
+        #[serde(default)]
+        all: bool,
+    },
+
+    /// List PIDs inside a pod container (guest view).
+    PodPids {
+        /// Container ID.
+        id: String,
+    },
+
+    /// Sample a pod container's resource usage (guest view). The agent reads the
+    /// container's process tree from /proc (there is no per-container cgroup); the
+    /// shim maps the reply into containerd's cgroups metrics for CRI stats.
+    PodStats {
+        /// Container ID.
+        id: String,
+    },
+
+    /// Remove a pod container's (or exec process's) guest resources after
+    /// exit: bundle, cgroup, PTY. Exit status was already streamed by
+    /// `PodStart`'s `Exited`.
+    PodDelete {
+        /// Container ID.
+        id: String,
+        /// Exec process to remove instead of the whole container.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exec_id: Option<String>,
+    },
 }
 
 impl AgentRequest {
@@ -486,6 +575,24 @@ impl AgentRequest {
             AgentRequest::FileWriteBegin { .. } => "FileWriteBegin".into(),
             AgentRequest::FileWriteChunk { .. } => "FileWriteChunk".into(),
             AgentRequest::FileRead { .. } => "FileRead".into(),
+            // Pod requests: spec/process JSON may carry env secrets — emit ids only.
+            AgentRequest::PodCreate { id, .. } => format!("PodCreate {{ id: {id} }}"),
+            AgentRequest::PodStart { id, exec_id } => match exec_id {
+                Some(e) => format!("PodStart {{ id: {id}, exec: {e} }}"),
+                None => format!("PodStart {{ id: {id} }}"),
+            },
+            AgentRequest::PodExec { id, exec_id, .. } => {
+                format!("PodExec {{ id: {id}, exec: {exec_id} }}")
+            }
+            AgentRequest::PodSignal {
+                id, signal, all, ..
+            } => format!("PodSignal {{ id: {id}, signal: {signal}, all: {all} }}"),
+            AgentRequest::PodPids { id } => format!("PodPids {{ id: {id} }}"),
+            AgentRequest::PodStats { id } => format!("PodStats {{ id: {id} }}"),
+            AgentRequest::PodDelete { id, exec_id } => match exec_id {
+                Some(e) => format!("PodDelete {{ id: {id}, exec: {e} }}"),
+                None => format!("PodDelete {{ id: {id} }}"),
+            },
         }
     }
 }
@@ -565,6 +672,26 @@ pub enum AgentResponse {
     Exited {
         /// Exit code from the command.
         exit_code: i32,
+        /// The container was terminated by the cgroup OOM killer. The shim
+        /// turns this into a TaskOOM event so the CRI reports
+        /// `reason=OOMKilled`. Only ever set on a pod container's init exit.
+        #[serde(default)]
+        oom: bool,
+    },
+
+    /// PIDs inside a pod container (`PodPids` reply).
+    Pids {
+        /// Guest PIDs, container-init first when known.
+        pids: Vec<u32>,
+    },
+
+    /// Resource usage sample for a pod container (`PodStats` reply). Summed over
+    /// the container's process tree read from /proc (no per-container cgroup).
+    Stats {
+        /// Cumulative CPU time of the process tree, in nanoseconds.
+        cpu_usage_ns: u64,
+        /// Resident memory of the process tree, in bytes.
+        memory_bytes: u64,
     },
 
     /// Streaming binary-data chunk.

@@ -227,8 +227,16 @@ jobs:
         env:
           LIBRARY_PATH: /usr/local/lib
           LD_LIBRARY_PATH: /usr/local/lib
-      # Note: Full VM integration tests require KVM + real libkrun.
-      # Run integration tests locally on a machine with KVM access.
+
+      # The Kubernetes containerd-shim runtime: its Task-state-machine and
+      # pod-lifecycle tests run on the MockBackend, so they need no KVM.
+      - name: Run K8s shim unit tests
+        run: cargo test -p smolvm-shim --target ${{ matrix.target }}
+        env:
+          LIBRARY_PATH: /usr/local/lib
+          LD_LIBRARY_PATH: /usr/local/lib
+      # Note: Full VM integration tests (and critest CRI conformance) require
+      # KVM + real libkrun. Run those locally on a machine with KVM access.
 
   # ==========================================================================
   # Windows Build & Lint (cross-compiled from Linux, mingw-w64 / GNU target)

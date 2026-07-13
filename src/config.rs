@@ -509,6 +509,14 @@ pub struct VmRecord {
     /// the single source of truth (see `agent::resolve_disk_image`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub golden: Option<String>,
+
+    /// Set for machines created by the Kubernetes containerd shim (pod
+    /// sandboxes). Scopes node-reboot reconciliation (see
+    /// `control::reconcile_runtime_machines`) so it reclaims only shim-managed
+    /// VMs whose process died with a crash or reboot, never a user's persistent
+    /// CLI/SDK machine.
+    #[serde(default)]
+    pub runtime_managed: bool,
 }
 
 /// Deserialize `created_at` from either a legacy JSON string `"1705312345"` or
@@ -589,6 +597,7 @@ impl VmRecord {
             ephemeral: false,
             source_smolmachine: None,
             golden: None,
+            runtime_managed: false,
         }
     }
 
@@ -643,6 +652,7 @@ impl VmRecord {
             ephemeral: false,
             source_smolmachine: None,
             golden: None,
+            runtime_managed: false,
         }
     }
 

@@ -11,6 +11,7 @@ mod krun;
 mod launcher;
 pub mod launcher_dynamic;
 mod manager;
+pub mod pod_net;
 pub mod state_probe;
 pub mod terminal;
 mod vsock_service;

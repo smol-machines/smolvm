@@ -78,7 +78,11 @@ pub struct OciConsoleSize {
 pub struct OciUser {
     pub uid: u32,
     pub gid: u32,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        rename = "additionalGids",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub additional_gids: Vec<u32>,
 }
 

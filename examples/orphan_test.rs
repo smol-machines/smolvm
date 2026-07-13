@@ -22,6 +22,7 @@ fn main() {
             ..Default::default()
         },
         persistent: false,
+        runtime_managed: false,
     };
     let _ = rt.create_machine(spec); // ignore "already exists" on reruns
     rt.start_machine(&name).expect("start machine");

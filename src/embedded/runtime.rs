@@ -41,6 +41,13 @@ impl EmbeddedRuntime {
         self.with_name_lock(&spec.name, || control::create_vm(&self.db, &spec))
     }
 
+    /// Reclaim shim-managed sandbox VMs whose process is gone (node reboot or a
+    /// shim crash left the record + disks behind). See
+    /// [`control::reconcile_runtime_machines`]. Returns the count reclaimed.
+    pub fn reconcile_runtime_machines(&self) -> Result<usize> {
+        control::reconcile_runtime_machines(&self.db)
+    }
+
     /// Start or reconnect to a persisted machine and cache its handle.
     pub fn start_machine(&self, name: &str) -> Result<()> {
         self.with_name_lock(name, || {
@@ -53,6 +60,25 @@ impl EmbeddedRuntime {
             }
 
             let handle = control::start_vm(&self.db, name)?;
+            self.insert_handle(name, handle)?;
+            Ok(())
+        })
+    }
+
+    /// Start a persisted machine attached to a Kubernetes pod network namespace.
+    /// The launcher bridges the guest virtio-net NIC to a tap inside `netns` so
+    /// the pod carries its CNI-assigned IP (see [`control::start_vm_with_netns`]).
+    /// Used by the containerd shim for pod sandboxes; requires the machine to use
+    /// the virtio-net backend.
+    pub fn start_machine_with_netns(&self, name: &str, netns: std::path::PathBuf) -> Result<()> {
+        self.with_name_lock(name, || {
+            if let Some(handle) = self.cached_handle(name)? {
+                if lock_handle(&handle)?.is_process_alive() {
+                    return Ok(());
+                }
+                self.remove_cached_handle(name)?;
+            }
+            let handle = control::start_vm_with_netns(&self.db, name, netns)?;
             self.insert_handle(name, handle)?;
             Ok(())
         })
@@ -430,6 +456,7 @@ mod tests {
             ports: Vec::new(),
             resources: crate::agent::VmResources::default(),
             persistent,
+            runtime_managed: false,
         }
     }
 

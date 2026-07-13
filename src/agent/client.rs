@@ -1097,7 +1097,7 @@ impl AgentClient {
                         write_all_retry(&mut stderr(), &data)?;
                         flush_retry(&mut stderr())?;
                     }
-                    Ok(AgentResponse::Exited { exit_code }) => {
+                    Ok(AgentResponse::Exited { exit_code, .. }) => {
                         break exit_code;
                     }
                     Ok(AgentResponse::Error { message, .. }) => {
@@ -1425,7 +1425,7 @@ impl AgentClient {
                     Ok(AgentResponse::Stderr { data }) => {
                         on_output(InteractiveOutput::Stderr(data))
                     }
-                    Ok(AgentResponse::Exited { exit_code }) => break exit_code,
+                    Ok(AgentResponse::Exited { exit_code, .. }) => break exit_code,
                     Ok(AgentResponse::Error { message, .. }) => {
                         return Err(Error::agent(op, message))
                     }
@@ -2117,7 +2117,7 @@ where
                 total = total.saturating_add(data.len());
                 on_event(ExecEvent::Stderr(data));
             }
-            Ok(AgentResponse::Exited { exit_code }) => {
+            Ok(AgentResponse::Exited { exit_code, .. }) => {
                 on_event(ExecEvent::Exit(exit_code));
                 break;
             }
@@ -2420,7 +2420,10 @@ mod collect_exec_cap_tests {
                 AgentResponse::Stderr {
                     data: b"warn".to_vec(),
                 },
-                AgentResponse::Exited { exit_code: 0 },
+                AgentResponse::Exited {
+                    exit_code: 0,
+                    oom: false,
+                },
             ],
         );
         res.unwrap();
@@ -2621,7 +2624,10 @@ mod run_streaming_tests {
                 AgentResponse::Stderr {
                     data: b"warn\n".to_vec(),
                 },
-                AgentResponse::Exited { exit_code: 7 },
+                AgentResponse::Exited {
+                    exit_code: 7,
+                    oom: false,
+                },
             ] {
                 let encoded = encode_message(&response).expect("encode response");
                 server_stream.write_all(&encoded).expect("write response");

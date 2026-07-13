@@ -17,6 +17,7 @@ fn main() {
             ..Default::default()
         },
         persistent: false,
+        runtime_managed: false,
     })
     .expect("create");
     rt.delete_machine(name).expect("first delete");

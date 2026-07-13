@@ -1,0 +1,29 @@
+[package]
+name = "smolvm-shim"
+version = "0.1.0"
+edition = "2021"
+description = "containerd shim v2 (io.containerd.smolvm.v2) — runs Kubernetes pods as smolvm microVMs"
+license = "Apache-2.0"
+
+[[bin]]
+name = "containerd-shim-smolvm-v2"
+path = "src/main.rs"
+
+# The shim is Linux-only (Kubernetes nodes). On other hosts the binary compiles
+# to a stub so `cargo check --workspace` stays green everywhere.
+[target.'cfg(target_os = "linux")'.dependencies]
+containerd-shim = { version = "0.11", features = ["async"] }
+containerd-shim-protos = { version = "0.11", features = ["async"] }
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "net", "fs", "signal"] }
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+nix = { version = "0.27", features = ["sched", "net", "socket", "fs", "signal", "mount"] }
+# The engine library: boots/tears down the per-pod sandbox microVM and carries
+# the agent vsock client the shim streams container I/O through.
+smolvm = { path = "../.." }
+smolvm-protocol = { path = "../smolvm-protocol" }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+tempfile = "3"

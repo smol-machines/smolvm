@@ -65,6 +65,10 @@ pub mod egress;
 // both Unix and Windows (10 1809+), so the whole stack is cross-platform.
 pub mod frame_stream;
 pub mod icmp_relay;
+// CNI netns ↔ virtio-net L2 bridge for the Kubernetes runtime (Linux only:
+// needs /dev/net/tun + setns).
+#[cfg(target_os = "linux")]
+pub mod netns_tap;
 pub mod queues;
 pub mod stack;
 pub mod tcp_listeners;

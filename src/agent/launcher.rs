@@ -214,6 +214,13 @@ pub struct LaunchFeatures {
     /// `SMOLVM_BOOT_BINARY` (so `current_exe` need not handle `_boot-vm`) yet
     /// DETACHES the VM to persist after the CLI exits (e.g. `smol start`/`fork`).
     pub watch_parent: Option<bool>,
+    /// Kubernetes pod network namespace to attach the VM's virtio-net device to
+    /// (the CNI-provisioned netns for a shim-booted pod sandbox). When set, the
+    /// launcher bridges the guest NIC L2 to a tap inside this netns (tc-redirect
+    /// against the CNI interface) instead of running the NAT gateway, so the pod
+    /// carries its CNI-assigned IP and is reachable at L2. Runtime-only (never
+    /// persisted in `VmRecord`); requires the virtio-net backend.
+    pub pod_netns: Option<std::path::PathBuf>,
 }
 
 impl LaunchFeatures {
@@ -390,6 +397,12 @@ pub struct LaunchConfig<'a> {
     /// surface `egressBytes` in the machine info, the same per-VM-dir bridge the
     /// vsock/console paths use. `None` disables egress telemetry (e.g. TSI).
     pub egress_telemetry: Option<&'a Path>,
+    /// Kubernetes pod-network attachment (Linux only): the tap fd bridged to the
+    /// guest virtio-net NIC and the CNI L3 config (pod IP/prefix/gateway/MAC/MTU)
+    /// to apply to it. Set by the boot subprocess after it attached the pod netns
+    /// while privileged. When present, the virtio-net arm bridges the guest NIC to
+    /// the tap instead of running the NAT gateway. `None` for non-pod VMs.
+    pub pod_net: Option<crate::agent::pod_net::PodNetLaunch>,
 }
 
 /// Launch the agent VM using libkrun.
@@ -428,7 +441,12 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         dns_filter_enabled,
         egress_refresh_hosts,
         egress_telemetry,
+        pod_net,
     } = config;
+    // `pod_net` drives the Linux-only pod netns-tap datapath; on other targets the
+    // field exists (cross-platform LaunchConfig) but is never read.
+    #[cfg(not(target_os = "linux"))]
+    let _ = &pod_net;
 
     crate::network::validate_requested_network_backend(resources, None, port_mappings.len())?;
 
@@ -613,6 +631,11 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // binding stays `None`.
         #[cfg_attr(not(unix), allow(unused_mut))]
         let mut virtio_network_runtime: Option<VirtioNetworkRuntime> = None;
+        // Holds the pod netns-tap frame bridge (Kubernetes pod networking) for the
+        // VM's lifetime; dropped alongside `virtio_network_runtime` after the VM
+        // exits. Only ever set on the pod datapath.
+        #[cfg(target_os = "linux")]
+        let mut netns_bridge: Option<smolvm_network::netns_tap::NetnsTapBridge> = None;
         let guest_network: Option<GuestNetworkConfig> = match network_plan.backend {
             EffectiveNetworkBackend::None => {
                 // Upstream libkrun no longer creates an implicit vsock (the old
@@ -738,6 +761,24 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 }
                 let mut guest_mac = guest_network.guest_mac;
 
+                // Kubernetes pod networking: adopt the CNI interface's IP/prefix/
+                // MAC (discovered from the pod netns) so the guest NIC *is* the pod
+                // IP and ARP for it resolves to the VM. `guest_network_env` pushes
+                // these to the guest, which configures eth0 statically at boot.
+                #[cfg(target_os = "linux")]
+                if let Some(pod) = pod_net.as_ref() {
+                    guest_network.guest_ip = pod.ip;
+                    guest_network.prefix_len = pod.prefix;
+                    if let Some(gw) = pod.gateway {
+                        guest_network.gateway_ip = gw;
+                        // Best-effort: point the guest resolver at the gateway.
+                        // Cluster DNS injection (pod dnsConfig) is a follow-up.
+                        guest_network.dns_server = gw;
+                    }
+                    guest_network.guest_mac = pod.mac;
+                    guest_mac = pod.mac;
+                }
+
                 let virtio_port_mappings: Vec<VirtioPortMapping> = port_mappings
                     .iter()
                     .map(|mapping| VirtioPortMapping::new(mapping.host, mapping.guest))
@@ -759,25 +800,85 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     let (host_fd, guest_fd) = create_unix_stream_pair().map_err(|e| {
                         Error::agent("configure virtio-net", format!("socketpair failed: {e}"))
                     })?;
-                    // SAFETY: ownership of the host-side socketpair fd transfers
-                    // here (already inside the function's outer `unsafe` block).
-                    let host_stream = Socket::from_raw_fd(host_fd);
-                    let runtime = match start_virtio_network(
-                        host_stream,
-                        guest_network,
-                        &virtio_port_mappings,
-                        egress,
-                    ) {
-                        Ok(runtime) => runtime,
-                        Err(err) => {
-                            libc::close(guest_fd);
-                            krun_free_ctx(ctx);
-                            return Err(Error::agent(
-                                "configure virtio-net",
-                                format!("failed to start virtio network runtime: {err}"),
-                            ));
+
+                    // Datapath selection on the host end of the virtio-net channel:
+                    //   * Kubernetes pod: bridge the guest NIC L2 to the tap in the
+                    //     pod netns (opened + tc-redirected while privileged in
+                    //     internal_boot), so the pod is reachable at its CNI IP.
+                    //   * Otherwise: run the smoltcp NAT gateway (outbound + ports).
+                    #[cfg(target_os = "linux")]
+                    let pod_tap_fd: Option<i32> = pod_net.as_ref().map(|p| p.tap_fd);
+                    #[cfg(not(target_os = "linux"))]
+                    let pod_tap_fd: Option<i32> = None;
+
+                    match pod_tap_fd {
+                        #[cfg(target_os = "linux")]
+                        Some(tap_fd) => {
+                            use std::os::fd::{FromRawFd, OwnedFd};
+                            use std::os::unix::net::UnixStream;
+                            // Dup so the bridge owns an independent fd; internal_boot's
+                            // PodNetAttachment keeps the original tap open for the VM's
+                            // lifetime.
+                            let dup_fd = libc::dup(tap_fd);
+                            if dup_fd < 0 {
+                                libc::close(host_fd);
+                                libc::close(guest_fd);
+                                krun_free_ctx(ctx);
+                                return Err(Error::agent(
+                                    "configure pod netns",
+                                    "dup(tap fd) failed",
+                                ));
+                            }
+                            // SAFETY: host_fd and dup_fd are fresh owned fds.
+                            let tap_owned = OwnedFd::from_raw_fd(dup_fd);
+                            let host_unixstream = UnixStream::from_raw_fd(host_fd);
+                            match smolvm_network::netns_tap::start_netns_tap_bridge(
+                                host_unixstream,
+                                tap_owned,
+                            ) {
+                                Ok(bridge) => netns_bridge = Some(bridge),
+                                Err(err) => {
+                                    libc::close(guest_fd);
+                                    krun_free_ctx(ctx);
+                                    return Err(Error::agent(
+                                        "configure pod netns",
+                                        format!("start netns-tap bridge: {err}"),
+                                    ));
+                                }
+                            }
+                            tracing::info!("network backend: virtio-net (pod netns-tap bridge)");
                         }
-                    };
+                        _ => {
+                            // SAFETY: ownership of the host-side socketpair fd transfers
+                            // here (already inside the function's outer `unsafe` block).
+                            let host_stream = Socket::from_raw_fd(host_fd);
+                            let runtime = match start_virtio_network(
+                                host_stream,
+                                guest_network,
+                                &virtio_port_mappings,
+                                egress,
+                            ) {
+                                Ok(runtime) => runtime,
+                                Err(err) => {
+                                    libc::close(guest_fd);
+                                    krun_free_ctx(ctx);
+                                    return Err(Error::agent(
+                                        "configure virtio-net",
+                                        format!("failed to start virtio network runtime: {err}"),
+                                    ));
+                                }
+                            };
+                            // Flush this NIC's egress counter to the per-VM dir so serve
+                            // can bill it (parity with how disk size reaches the node API).
+                            if let Some(path) = egress_path {
+                                crate::agent::manager::spawn_egress_flush(
+                                    path,
+                                    runtime.egress_counter(),
+                                );
+                            }
+                            virtio_network_runtime = Some(runtime);
+                        }
+                    }
 
                     if add_net_unixstream(
                         ctx,
@@ -795,13 +896,6 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                             "krun_add_net_unixstream failed",
                         ));
                     }
-
-                    // Flush this NIC's egress counter to the per-VM dir so serve can
-                    // bill it (parity with how disk size reaches the node API).
-                    if let Some(path) = egress_path {
-                        crate::agent::manager::spawn_egress_flush(path, runtime.egress_counter());
-                    }
-                    virtio_network_runtime = Some(runtime);
                 }
                 #[cfg(windows)]
                 {
@@ -1424,6 +1518,8 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // If we get here, something went wrong — free the context before returning
         krun_free_ctx(ctx);
         drop(virtio_network_runtime);
+        #[cfg(target_os = "linux")]
+        drop(netns_bridge);
         Err(Error::agent(
             "start vm",
             format!("krun_start_enter returned: {}", ret),

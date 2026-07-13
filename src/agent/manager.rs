@@ -393,22 +393,6 @@ pub fn prune_orphaned_ready_markers() {
     }
 }
 
-/// Whether a readiness-marker file at `path` can be created (pre-created
-/// empty as a side effect on success, which the Landlock carve-out relies
-/// on). False on read-only rootfs installs — see
-/// `AgentManager::ready_marker_writable`.
-fn marker_creatable(path: &Path) -> bool {
-    // truncate(false): a fast guest may already have written the marker by the
-    // time this probe runs — truncating would erase the readiness signal and
-    // force the boot onto the socket path it was trying to avoid.
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)
-        .is_ok()
-}
-
 /// Path-injectable core of [`prune_orphaned_ready_markers`] (unit-testable).
 fn prune_orphaned_ready_markers_in(rootfs: &Path, vm_cache_root: &Path) {
     let prefix = format!("{}.", AGENT_READY_MARKER);
@@ -1371,21 +1355,6 @@ impl AgentManager {
         self.rootfs_path.join(self.ready_marker_name())
     }
 
-    /// Whether this VM's ready marker can actually be created.
-    ///
-    /// The marker lives inside the agent rootfs (the virtiofs share), so on
-    /// system installs where that directory is root-owned (/opt, /usr/lib)
-    /// and smolvm runs unprivileged, neither the host pre-create nor the
-    /// guest's virtiofs write can ever succeed — the marker "never appears"
-    /// and every boot silently pays the full socket-probe grace (#590).
-    /// Probing this up front lets `wait_for_ready` fall back to socket
-    /// polling immediately instead. The probe leaves the marker pre-created
-    /// empty on success, which is also what the Landlock carve-out expects
-    /// (readiness requires non-empty content, so this cannot false-positive).
-    fn ready_marker_writable(&self) -> bool {
-        marker_creatable(&self.ready_marker_path())
-    }
-
     /// Common pre-launch setup: validate state, pre-format disks, clean markers.
     ///
     /// Called by both `start_with_full_config` (fork) and `start_via_subprocess`.
@@ -1820,6 +1789,7 @@ impl AgentManager {
             packed_layers_dir: features.packed_layers_dir,
             pack_idmap_source,
             extra_disks: features.extra_disks,
+            pod_netns: features.pod_netns,
         };
         let config_path = self
             .storage_disk
@@ -2336,23 +2306,7 @@ impl AgentManager {
     fn wait_for_ready(&self) -> Result<()> {
         let timeout = AGENT_READY_TIMEOUT;
         let start = Instant::now();
-        // Marker-first readiness only works when the marker file (inside the
-        // agent-rootfs virtiofs share) is writable at all. On read-only system
-        // installs it never appears; skip the grace and poll the socket from
-        // the start instead of stalling every boot for the full grace (#590).
-        let marker_expected = self.ready_marker_writable();
-        let socket_probe_grace = if marker_expected {
-            Duration::from_secs(5)
-        } else {
-            tracing::info!(
-                rootfs = %self.rootfs_path.display(),
-                "agent-rootfs is not writable by this process; ready-marker fast \
-                 path unavailable, using socket readiness probe. For the fastest \
-                 boots make the rootfs dir writable by the running user or point \
-                 SMOLVM_AGENT_ROOTFS at a writable copy"
-            );
-            Duration::ZERO
-        };
+        let socket_probe_grace = Duration::from_secs(5);
 
         tracing::debug!("waiting for agent to be ready");
 
@@ -2440,24 +2394,15 @@ impl AgentManager {
                 {
                     if client.ping().is_ok() {
                         let elapsed = start.elapsed();
-                        if marker_expected {
-                            let landlock = std::env::var("SMOLVM_LANDLOCK").unwrap_or_default();
-                            tracing::warn!(
-                                elapsed_ms = elapsed.as_millis(),
-                                landlock = %landlock,
-                                "agent ready via SOCKET FALLBACK — ready marker never appeared; \
-                                 boot was delayed by the probe grace. If a current agent, this is a \
-                                 fault (under SMOLVM_LANDLOCK=enforce the ready-marker carve-out in \
-                                 internal_boot.rs is likely broken)"
-                            );
-                        } else {
-                            // Read-only rootfs: socket IS the readiness path; no
-                            // grace was paid (socket_probe_grace == 0).
-                            tracing::info!(
-                                elapsed_ms = elapsed.as_millis(),
-                                "agent ready (socket; marker unavailable on read-only rootfs)"
-                            );
-                        }
+                        let landlock = std::env::var("SMOLVM_LANDLOCK").unwrap_or_default();
+                        tracing::warn!(
+                            elapsed_ms = elapsed.as_millis(),
+                            landlock = %landlock,
+                            "agent ready via SOCKET FALLBACK — ready marker never appeared; \
+                             boot was delayed by the probe grace. If a current agent, this is a \
+                             fault (under SMOLVM_LANDLOCK=enforce the ready-marker carve-out in \
+                             internal_boot.rs is likely broken)"
+                        );
                         return Ok(());
                     }
                 }
@@ -2616,36 +2561,6 @@ mod tests {
         // Callers rely on this to locate existing VM data across processes.
         assert_eq!(vm_dir_hash("sandbox-1"), vm_dir_hash("sandbox-1"));
         assert_eq!(vm_dir_hash("default"), vm_dir_hash("default"));
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn marker_creatable_detects_readonly_rootfs() {
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = tempfile::tempdir().unwrap();
-
-        // Writable rootfs: probe succeeds and pre-creates the marker empty.
-        let marker = tmp.path().join(format!("{}.abc123", AGENT_READY_MARKER));
-        assert!(marker_creatable(&marker));
-        assert_eq!(std::fs::metadata(&marker).unwrap().len(), 0);
-
-        // Read-only rootfs (root-owned system install, #590): probe fails so
-        // wait_for_ready can skip the socket-probe grace instead of stalling.
-        let ro = tmp.path().join("ro-rootfs");
-        std::fs::create_dir(&ro).unwrap();
-        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let denied = ro.join(format!("{}.abc123", AGENT_READY_MARKER));
-        if !nix_is_root() {
-            assert!(!marker_creatable(&denied));
-        }
-        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-
-    /// chmod-based denial doesn't apply to root (e.g. docker CI); skip there.
-    #[cfg(unix)]
-    fn nix_is_root() -> bool {
-        // SAFETY: geteuid has no preconditions and cannot fail.
-        unsafe { libc::geteuid() == 0 }
     }
 
     #[test]

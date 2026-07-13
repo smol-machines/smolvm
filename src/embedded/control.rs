@@ -21,6 +21,10 @@ pub struct MachineSpec {
     pub resources: VmResources,
     /// Whether the machine should persist across stop/start.
     pub persistent: bool,
+    /// Set by the Kubernetes containerd shim for pod-sandbox VMs. Marks the
+    /// record so node-reboot reconciliation can reclaim it (and only it) when
+    /// its process is gone. Defaults to false for CLI/SDK machines.
+    pub runtime_managed: bool,
 }
 
 impl MachineSpec {
@@ -40,9 +44,11 @@ impl MachineSpec {
         record.storage_gb = self.resources.storage_gib;
         record.overlay_gb = self.resources.overlay_gib;
         record.allowed_cidrs = self.resources.allowed_cidrs.clone();
+        record.network_backend = self.resources.network_backend;
         record.gpu = Some(self.resources.gpu);
         record.gpu_vram_mib = self.resources.gpu_vram_mib;
         record.ephemeral = !self.persistent;
+        record.runtime_managed = self.runtime_managed;
         record
     }
 }
@@ -107,6 +113,26 @@ pub fn start_forkable_vm(db: &SmolvmDb, name: &str) -> Result<VmHandle> {
     let features = LaunchFeatures {
         forkable: true,
         control_socket: Some(crate::agent::fork::control_socket_path(name)),
+        ..LaunchFeatures::default()
+    };
+    let handle = launch_from_record(&record, features)?;
+    mark_running(db, name, handle.child_pid())?;
+    Ok(handle)
+}
+
+/// Start a persisted VM attached to a Kubernetes pod network namespace: the
+/// launcher bridges the guest virtio-net NIC L2 to a tap inside `netns` (against
+/// the CNI-provisioned interface) so the pod carries its CNI-assigned IP and is
+/// reachable at L2. Used by the containerd shim for pod sandboxes. `netns` is a
+/// bind-mounted netns path (e.g. `/var/run/netns/cni-…` or `/proc/<pid>/ns/net`).
+pub fn start_vm_with_netns(
+    db: &SmolvmDb,
+    name: &str,
+    netns: std::path::PathBuf,
+) -> Result<VmHandle> {
+    let record = get_record(db, name)?;
+    let features = LaunchFeatures {
+        pod_netns: Some(netns),
         ..LaunchFeatures::default()
     };
     let handle = launch_from_record(&record, features)?;
@@ -223,6 +249,35 @@ pub fn delete_vm(db: &SmolvmDb, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Reclaim shim-managed sandbox VMs whose process is gone. After a node reboot
+/// every VM dies but its persistent record and disk images survive, and a shim
+/// that crashed before containerd reaped it leaves the same residue. Removes only
+/// `runtime_managed` records that were Running but whose process is no longer
+/// alive, and only via [`delete_vm`] (DB record + disk images, never a signal) —
+/// so a reused pid is never harmed and a user's CLI/SDK machine is never touched.
+/// The liveness check is start-time verified, so a pid reused by an unrelated
+/// process reads as not-alive. Best-effort; returns the count reclaimed.
+pub fn reconcile_runtime_machines(db: &SmolvmDb) -> Result<usize> {
+    let mut reclaimed = 0;
+    for (name, record) in db.list_vms()? {
+        if record.runtime_managed
+            && record.state == RecordState::Running
+            && !record.is_process_alive()
+        {
+            match delete_vm(db, &name) {
+                Ok(()) => {
+                    reclaimed += 1;
+                    tracing::info!(machine = %name, "reconcile: reclaimed stale sandbox VM (record + disks)");
+                }
+                Err(e) => {
+                    tracing::warn!(machine = %name, error = %e, "reconcile: failed to reclaim stale sandbox VM")
+                }
+            }
+        }
+    }
+    Ok(reclaimed)
+}
+
 /// Mark a machine record as running.
 pub fn mark_running(db: &SmolvmDb, name: &str, pid: Option<i32>) -> Result<()> {
     let pid_start_time = pid.and_then(crate::process::process_start_time);
@@ -270,7 +325,52 @@ mod tests {
             ports: Vec::new(),
             resources: VmResources::default(),
             persistent,
+            runtime_managed: false,
         }
+    }
+
+    fn insert(
+        db: &SmolvmDb,
+        name: &str,
+        runtime_managed: bool,
+        state: RecordState,
+        pid: Option<i32>,
+    ) {
+        let mut r = VmRecord::new(name.to_string(), 1, 512, vec![], vec![], false);
+        r.runtime_managed = runtime_managed;
+        r.state = state;
+        r.pid = pid;
+        db.insert_vm_if_not_exists(name, &r).unwrap();
+    }
+
+    #[test]
+    fn reconcile_reclaims_only_dead_runtime_managed() {
+        let db = test_db();
+        // No such process: Linux pids never reach 2^31, so this reads as not-alive.
+        let dead = Some(0x7fff_fff0);
+
+        // Shim sandbox that was running but whose process is gone (reboot/crash).
+        insert(&db, "sandbox-stale", true, RecordState::Running, dead);
+        // A user's CLI/SDK machine, also running-but-dead — must be left alone.
+        insert(&db, "cli-machine", false, RecordState::Running, dead);
+        // A shim sandbox that never started (no process expected) — keep it.
+        insert(&db, "sandbox-created", true, RecordState::Created, None);
+
+        let reclaimed = reconcile_runtime_machines(&db).unwrap();
+
+        assert_eq!(reclaimed, 1);
+        assert!(
+            db.get_vm("sandbox-stale").unwrap().is_none(),
+            "dead sandbox reclaimed"
+        );
+        assert!(
+            db.get_vm("cli-machine").unwrap().is_some(),
+            "CLI machine untouched"
+        );
+        assert!(
+            db.get_vm("sandbox-created").unwrap().is_some(),
+            "created sandbox kept"
+        );
     }
 
     #[test]
