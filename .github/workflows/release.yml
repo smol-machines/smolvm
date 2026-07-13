@@ -444,3 +444,17 @@ jobs:
             -f event_type=smolvm-release \
             -f "client_payload[version]=$version"
           echo "Dispatched smolvm-release ($version) to the Homebrew tap."
+
+  # Build + publish the Arch/pacman packages for this release. Invoked directly
+  # (not via the `release: published` event) because that event never fires for a
+  # release created with the default GITHUB_TOKEN — the same GitHub restriction
+  # the Homebrew step above works around. Runs after the release exists so the
+  # PKGBUILD can download its release binaries.
+  publish-pacman:
+    name: Publish pacman repo
+    needs: release
+    permissions:
+      contents: write
+    uses: ./.github/workflows/pacman-repo.yml
+    with:
+      tag: ${{ github.ref_name }}

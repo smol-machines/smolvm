@@ -3,6 +3,15 @@ name: Publish pacman repo
 # Builds Arch packages from the release binaries and publishes them to
 # rolling releases (pacman-repo-x86_64 / pacman-repo-aarch64) that serve
 # as pacman repository endpoints. See docs/install/arch.md.
+#
+# Triggers:
+#  - workflow_call: invoked by release.yml right after it creates the GitHub
+#    Release. This is the real automation path — the `release: published` event
+#    does NOT fire here on its own, because that release is created with the
+#    default GITHUB_TOKEN and GitHub does not start workflows from token-created
+#    releases (same reason release.yml pings the Homebrew tap explicitly).
+#  - workflow_dispatch: manual re-run / backfill for a given tag.
+#  - release: kept as a safety net for releases published by a human/PAT.
 on:
   release:
     types: [published]
@@ -11,6 +20,12 @@ on:
       tag:
         description: 'Release tag to package (e.g. v1.5.0)'
         required: true
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Release tag to package (e.g. v1.5.0)'
+        required: true
+        type: string
 
 permissions:
   contents: write
