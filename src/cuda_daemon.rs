@@ -16,8 +16,10 @@ use std::io;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Control-socket path for the shared daemon, under the smolvm data dir (so the
 /// daemon and every boot subprocess agree on one location).
@@ -33,9 +35,48 @@ fn is_alive(sock: &Path) -> bool {
     UnixStream::connect(sock).is_ok()
 }
 
+/// How long the daemon may sit with ZERO open connections before it exits and
+/// releases the GPU context. `None` (env set to `0`) disables the timeout.
+///
+/// Counting *open connections* (not activity) is what makes this fork-safe: a
+/// frozen golden keeps its proxied connection open, so it counts as active and
+/// never trips the timeout even while paused. The daemon only exits once every
+/// VM — golden and clones — has disconnected.
+fn idle_timeout() -> Option<Duration> {
+    let secs = std::env::var("SMOLVM_CUDA_DAEMON_IDLE_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(300);
+    (secs > 0).then(|| Duration::from_secs(secs))
+}
+
+/// Exit the process once `active` has been 0 for `timeout`. Polls slowly (the
+/// timeout is coarse) and resets the idle clock whenever a connection is live.
+fn spawn_idle_watchdog(active: Arc<AtomicUsize>, timeout: Duration) {
+    thread::Builder::new()
+        .name("cuda-daemon-idle".into())
+        .spawn(move || {
+            let mut idle_since = Instant::now();
+            loop {
+                thread::sleep(Duration::from_secs(5));
+                if active.load(Ordering::SeqCst) > 0 {
+                    idle_since = Instant::now();
+                } else if idle_since.elapsed() >= timeout {
+                    tracing::info!(
+                        timeout_secs = timeout.as_secs(),
+                        "shared CUDA daemon idle with no connections — exiting"
+                    );
+                    std::process::exit(0);
+                }
+            }
+        })
+        .ok();
+}
+
 /// Run the daemon body: bind `sock` and serve every connection in its own
 /// thread against a fresh backend — all in this process, so they share one GPU
-/// context. Never returns under normal operation.
+/// context. Returns only on listener failure; otherwise exits via the idle
+/// watchdog (or runs until the host shuts down when the timeout is disabled).
 pub fn run(sock: &Path) -> io::Result<()> {
     if let Some(parent) = sock.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -43,12 +84,21 @@ pub fn run(sock: &Path) -> io::Result<()> {
     let _ = std::fs::remove_file(sock); // caller serialized us; clear any stale node
     let listener = UdsListener::bind(sock)?;
     tracing::info!(socket = %sock.display(), "shared CUDA daemon listening");
+    let active = Arc::new(AtomicUsize::new(0));
+    if let Some(timeout) = idle_timeout() {
+        spawn_idle_watchdog(active.clone(), timeout);
+    }
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
+                // Count the connection open for the whole serve loop so a frozen
+                // golden (idle but connected) keeps the daemon alive for its
+                // clones. The RAII guard balances the count even if spawn fails.
+                let guard = ConnGuard::new(&active);
                 thread::Builder::new()
                     .name("cuda-daemon-conn".into())
                     .spawn(move || {
+                        let _guard = guard;
                         let mut backend = make_backend();
                         if let Err(e) = serve(stream, backend.as_mut()) {
                             tracing::debug!(error = %e, "CUDA daemon connection ended");
@@ -60,6 +110,23 @@ pub fn run(sock: &Path) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Keeps the daemon's open-connection count accurate: +1 on construction, -1 on
+/// drop (whether the serve thread finished or never started).
+struct ConnGuard(Arc<AtomicUsize>);
+
+impl ConnGuard {
+    fn new(active: &Arc<AtomicUsize>) -> Self {
+        active.fetch_add(1, Ordering::SeqCst);
+        ConnGuard(active.clone())
+    }
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 fn make_backend() -> Box<dyn Backend> {
