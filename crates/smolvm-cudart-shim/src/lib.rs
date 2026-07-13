@@ -219,6 +219,11 @@ struct ShimState {
     /// clone (same pid, so the pid check can't fire) inherits a dead socket;
     /// the peek catches it and triggers a reconnect. -1 = no fd / skip.
     conn_fd: i32,
+    /// Set when an op just hit a transport error: the peek can miss a freshly
+    /// severed connection (the kernel hasn't processed the reset yet on the
+    /// first post-fork call), so `with_client_retrying` forces an unconditional
+    /// reconnect on its retry instead of trusting the peek.
+    force_reconnect: bool,
 }
 
 static STATE: Mutex<Option<ShimState>> = Mutex::new(None);
@@ -479,6 +484,7 @@ fn with_client<T>(
                 conn_pid: pid,
                 conn_token: token,
                 conn_fd: fd,
+                force_reconnect: false,
             });
         }
         // We forked and the inherited connection is dead — either an in-guest
@@ -494,10 +500,11 @@ fn with_client<T>(
             let severed = st.conn_fd >= 0 && !conn_alive(st.conn_fd);
             #[cfg(not(unix))]
             let severed = false;
-            if forked || severed {
+            let forced = st.force_reconnect;
+            if forked || severed || forced {
                 if std::env::var_os("SHIM_TRACE").is_some() {
                     eprintln!(
-                        "[shim] reconnect (forked={forked} severed={severed}) resume_token={}",
+                        "[shim] reconnect (forked={forked} severed={severed} forced={forced}) resume_token={}",
                         st.conn_token
                     );
                 }
@@ -506,6 +513,7 @@ fn with_client<T>(
                 st.conn_token = token;
                 st.conn_pid = pid;
                 st.conn_fd = fd;
+                st.force_reconnect = false;
                 st.capture = None; // any in-flight capture belonged to the parent
             }
         }
@@ -515,6 +523,27 @@ fn with_client<T>(
     // SAFETY-free: split the borrow so `f` gets the client while we keep the lock.
     let client = &mut st.client;
     f(client).map_err(map_err)
+}
+
+/// Like [`with_client`], but transparently retries once on a transport error.
+/// After a VM-fork the clone's inherited connection is dead, but the pre-call
+/// liveness peek can miss it on the very first call (the kernel hasn't surfaced
+/// the reset yet) — so that call fails with a transport error (`999`). This
+/// forces a reconnect and reruns `f`, which then reads from the reconnected
+/// (shared-context) session. Only for idempotent ops (reads, syncs, queries):
+/// `f` runs twice, so it must have no side effects on the first, failed attempt
+/// — which holds here because a transport failure means the op never reached the
+/// host. Takes `Fn` (not `FnOnce`) precisely so it can run twice.
+fn with_client_retrying<T>(
+    f: impl Fn(&mut Client<Stream>) -> Result<T, CudaRpcError>,
+) -> Result<T, c_int> {
+    match with_client(&f) {
+        Err(CUDA_ERROR_UNKNOWN) => {
+            mark_force_reconnect();
+            with_client(&f)
+        }
+        other => other,
+    }
 }
 
 /// Run `f` with the full state (client + registries) under the lock.
@@ -538,7 +567,7 @@ unsafe fn out<T>(p: *mut T, v: T) -> c_int {
 
 #[no_mangle]
 pub extern "C" fn cudaGetDeviceCount(count: *mut c_int) -> c_int {
-    set_last(match with_client(|c| c.device_get_count()) {
+    set_last(match with_client_retrying(|c| c.device_get_count()) {
         Ok(n) => unsafe { out(count, n) },
         Err(e) => {
             // A CUDA program treats "0 devices" as recoverable; surface the count.
@@ -565,7 +594,7 @@ pub extern "C" fn cudaGetDevice(device: *mut c_int) -> c_int {
 
 #[no_mangle]
 pub extern "C" fn cudaDeviceSynchronize() -> c_int {
-    set_last(match with_client(|c| c.ctx_synchronize()) {
+    set_last(match with_client_retrying(|c| c.ctx_synchronize()) {
         Ok(()) => CUDA_SUCCESS,
         Err(e) => e,
     })
@@ -986,11 +1015,29 @@ fn resolve_kind(s: &ShimState, dst: *const c_void, src: *const c_void, kind: c_i
 
 fn do_memcpy(dst: *mut c_void, src: *const c_void, n: usize, kind: c_int, stream: u64) -> c_int {
     let dbg = std::env::var_os("SMOLVM_CUDA_TRACE_MEMCPY").is_some();
-    let r = do_memcpy_inner(dst, src, n, kind, stream);
+    let mut r = do_memcpy_inner(dst, src, n, kind, stream);
+    // A transport error means the copy never reached the host (e.g. a VM-fork
+    // clone's inherited connection is dead and the pre-call peek missed it on
+    // this first call). Force a reconnect and retry once — the copy is safe to
+    // repeat because it didn't run.
+    if r == CUDA_ERROR_UNKNOWN {
+        mark_force_reconnect();
+        r = do_memcpy_inner(dst, src, n, kind, stream);
+    }
     if dbg && r != CUDA_SUCCESS {
         eprintln!("[memcpy-err] kind={kind} n={n} -> {r}");
     }
     r
+}
+
+/// Force the next `with_client` to rebuild the connection (used after a
+/// transport error whose op is safe to retry).
+fn mark_force_reconnect() {
+    if let Ok(mut guard) = STATE.lock() {
+        if let Some(st) = guard.as_mut() {
+            st.force_reconnect = true;
+        }
+    }
 }
 
 fn do_memcpy_inner(
@@ -1175,7 +1222,7 @@ pub extern "C" fn cudaStreamDestroy(stream: *mut c_void) -> c_int {
 
 #[no_mangle]
 pub extern "C" fn cudaStreamSynchronize(stream: *mut c_void) -> c_int {
-    set_last(match with_client(|c| c.stream_synchronize(stream as u64)) {
+    set_last(match with_client_retrying(|c| c.stream_synchronize(stream as u64)) {
         Ok(()) => CUDA_SUCCESS,
         Err(e) => e,
     })
@@ -1191,7 +1238,7 @@ pub extern "C" fn cudaLaunchHostFunc(
     func: Option<unsafe extern "C" fn(*mut c_void)>,
     user_data: *mut c_void,
 ) -> c_int {
-    let rc = with_client(|c| c.stream_synchronize(stream as u64));
+    let rc = with_client_retrying(|c| c.stream_synchronize(stream as u64));
     if let Err(e) = rc {
         return set_last(e);
     }
@@ -1288,7 +1335,7 @@ pub extern "C" fn cudaDeviceGetAttribute(value: *mut c_int, attr: c_int, device:
 
 #[no_mangle]
 pub extern "C" fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> c_int {
-    set_last(match with_client(|c| c.mem_get_info()) {
+    set_last(match with_client_retrying(|c| c.mem_get_info()) {
         Ok((f, t)) => unsafe {
             let _ = out(free, f as usize);
             out(total, t as usize)
@@ -1685,7 +1732,7 @@ pub extern "C" fn cudaEventQuery(event: *mut c_void) -> c_int {
     // blocks are safe to reuse. Always answering "complete" caused premature
     // reuse (ILLEGAL_ADDRESS) once work really ran on side streams. NotReady
     // (600) latches into last-error exactly like real cudart; torch clears it.
-    set_last(match with_client(|c| c.event_query(event as u64)) {
+    set_last(match with_client_retrying(|c| c.event_query(event as u64)) {
         Ok(code) => code,
         Err(e) => e,
     })
@@ -1736,7 +1783,7 @@ pub extern "C" fn cudaStreamWaitEvent(
 #[no_mangle]
 pub extern "C" fn cudaStreamQuery(stream: *mut c_void) -> c_int {
     // Honest completion status (0 or 600-NotReady), same as cudaEventQuery.
-    set_last(match with_client(|c| c.stream_query(stream as u64)) {
+    set_last(match with_client_retrying(|c| c.stream_query(stream as u64)) {
         Ok(code) => code,
         Err(e) => e,
     })
@@ -1964,7 +2011,7 @@ pub extern "C" fn cudaStreamAddCallback(
     // The callback must run after all prior work on `stream`. Under the
     // deferred pipeline that work may not have executed host-side yet, so
     // synchronize first — invoking it immediately let it observe stale results.
-    if let Err(e) = with_client(|c| c.stream_synchronize(stream as u64)) {
+    if let Err(e) = with_client_retrying(|c| c.stream_synchronize(stream as u64)) {
         return set_last(e);
     }
     if let Some(cb) = callback {
