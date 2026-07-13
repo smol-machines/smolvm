@@ -2,33 +2,37 @@ Package: smolvm
 Version: 1.5.2-1
 Architecture: arm64
 Maintainer: smol-machines <hebinsquared@gmail.com>
-Installed-Size: 80971
-Depends: crun, jq, e2fsprogs
+Installed-Size: 80961
+Depends: crun, jq, e2fsprogs, libc6
 Filename: ./smolvm_1.5.2-1_arm64.deb
-Size: 30732514
-MD5sum: f556629187e47c6c2e8a8e353d7982f9
-SHA1: 5930af96d34ca5394edcd8b755e951c37b50481c
-SHA256: 9080efaf3ba148d40de9c6bed7efd107f23ce6def2709011d7d80d8804291d78
+Size: 30729122
+MD5sum: f4c12437086bcb661451aca3fcc4a263
+SHA1: 3bc82eede186c45f07c71e75ed9b8e4df242125a
+SHA256: 8ce70a157794aa7db7aa7b839087cee8ffd188fe18230ff912fa85f8acdc8ed5
 Section: utils
 Priority: optional
 Homepage: https://github.com/smol-machines/smolvm
-Description: Build & run portable, lightweight, self-contained virtual machines.
- Official smol-machines build — bundles the smol-machines libkrun fork.
+Description: Build and run portable, lightweight, self-contained virtual machines
+ smolvm runs each workload in its own microVM on libkrun, with sub-second boot
+ and OCI-native images. This is the official smol-machines build and bundles
+ the smol-machines libkrun fork.
 
 Package: smolvm
 Version: 1.5.2-1
 Architecture: amd64
 Maintainer: smol-machines <hebinsquared@gmail.com>
-Installed-Size: 77414
-Depends: crun, jq, e2fsprogs
+Installed-Size: 77403
+Depends: crun, jq, e2fsprogs, libc6
 Filename: ./smolvm_1.5.2-1_amd64.deb
-Size: 31130712
-MD5sum: 5f1b033dca8296a4af6d7835f0fdff01
-SHA1: d796f770b243c8b09362b877d4b763c79fb47c3c
-SHA256: 07ab91228b24df0d7059e7cc6ba5ac13ed5c7b6cc581f33c2b217bb2a2887a7f
+Size: 31127394
+MD5sum: fcf12716365ed541c01bde1b185662e3
+SHA1: 8e98408f6922e367e3d9828565cd655cfc6eece0
+SHA256: 0126e53a92967e0da9f85f83e11bd5819ae115d2b69a2ea9df9e753da4aeaf94
 Section: utils
 Priority: optional
 Homepage: https://github.com/smol-machines/smolvm
-Description: Build & run portable, lightweight, self-contained virtual machines.
- Official smol-machines build — bundles the smol-machines libkrun fork.
+Description: Build and run portable, lightweight, self-contained virtual machines
+ smolvm runs each workload in its own microVM on libkrun, with sub-second boot
+ and OCI-native images. This is the official smol-machines build and bundles
+ the smol-machines libkrun fork.
 
