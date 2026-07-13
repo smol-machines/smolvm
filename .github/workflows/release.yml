@@ -471,3 +471,16 @@ jobs:
     uses: ./.github/workflows/deb-rpm-repo.yml
     with:
       tag: ${{ github.ref_name }}
+
+  # Bump the Nix flake (nix/smolvm.nix) to this release and open a PR. Same
+  # reasoning as the steps above (the `release: published` event never fires for
+  # a GITHUB_TOKEN release), so it is invoked directly after the release exists.
+  update-nix-flake:
+    name: Update Nix flake
+    needs: release
+    permissions:
+      contents: write
+      pull-requests: write
+    uses: ./.github/workflows/update-nix-flake.yml
+    with:
+      tag: ${{ github.ref_name }}

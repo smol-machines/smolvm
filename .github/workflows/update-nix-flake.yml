@@ -1,0 +1,62 @@
+name: Update Nix flake
+
+# Bumps nix/smolvm.nix (version + per-arch SRI hashes) to a release and opens a
+# PR. Invoked by release.yml (workflow_call) after the release exists, because
+# the `release: published` event never fires for a GITHUB_TOKEN release — the
+# same restriction the pacman / deb-rpm / Homebrew steps work around. Opens a PR
+# rather than pushing to main so the flake bump gets a normal review.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to pin (e.g. v1.5.2)'
+        required: true
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Release tag to pin (e.g. v1.5.2)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bump nix/smolvm.nix
+        id: bump
+        run: |
+          set -euo pipefail
+          TAG='${{ github.event.release.tag_name || inputs.tag }}'
+          VER="${TAG#v}"
+          python3 packaging/nix/bump.py "$VER" nix/smolvm.nix
+          echo "ver=$VER" >> "$GITHUB_OUTPUT"
+          if git diff --quiet nix/smolvm.nix; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open bump PR
+        if: steps.bump.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          ver='${{ steps.bump.outputs.ver }}'
+          branch="nix-bump-${ver}"
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git checkout -b "$branch"
+          git add nix/smolvm.nix
+          git commit -m "chore(nix): bump flake to ${ver}"
+          git push -f origin "$branch"
+          gh pr create --base main --head "$branch" \
+            --title "chore(nix): bump flake to ${ver}" \
+            --body "Automated bump of nix/smolvm.nix to ${ver} (version + per-arch SRI hashes)." \
+            || gh pr edit "$branch" --title "chore(nix): bump flake to ${ver}"

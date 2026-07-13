@@ -6,25 +6,34 @@
   patchelf,
   gcc-unwrapped,
   bzip2,
+  # Runtime tools smolvm shells out to on the host. The binary looks for these
+  # on PATH (and hardcodes FHS paths like /sbin/mkfs.ext4 that do not exist on
+  # NixOS), so the wrapper must put them there.
+  crun,
+  jq,
+  e2fsprogs,
+  util-linux,
+  gzip,
+  gnutar,
+  coreutils,
 }: let
-  version = "1.4.7";
+  version = "1.5.2";
 
   releases = {
     x86_64-linux = {
       asset = "smolvm-${version}-linux-x86_64.tar.gz";
       root = "smolvm-${version}-linux-x86_64";
-      hash = "sha256-KmdN7GDx+u4PB3RqWGDnSXgtC+4JoGnTn2HFUADLTfc=";
+      hash = "sha256-eZ2/o6zXdAR6SItNpN8uP5ovG1LpCqq9mT9Y4uJ73jQ=";
     };
     aarch64-linux = {
       asset = "smolvm-${version}-linux-arm64.tar.gz";
       root = "smolvm-${version}-linux-arm64";
-      hash = "sha256-SFwSbfO9K7stwcq60IwMQ7ceKvDpBYkHcFJnnUtxL80=";
+      hash = "sha256-HyLzUReV8K7N7PHk5vjztmi8duIIyjcg8PJZskn32ic=";
     };
     aarch64-darwin = {
       asset = "smolvm-${version}-darwin-arm64.tar.gz";
       root = "smolvm-${version}-darwin-arm64";
-      hash = "sha256-pJkgLg9uCnNZUz/MEtnbpof3YkcLLfWGLt5UL02PQjo=";
-
+      hash = "sha256-0sL56qrNNXuoKOcWYhaJs7Fnm4CCRjuGe8iRook1i6c=";
     };
   };
 
@@ -34,6 +43,21 @@
     gcc-unwrapped.lib
     bzip2
   ];
+
+  # crun/e2fsprogs/util-linux are Linux-only; the container runtime and mkfs.ext4
+  # only matter there. On darwin smolvm uses the host's own facilities.
+  runtimeDeps =
+    [
+      jq
+      gzip
+      gnutar
+      coreutils
+    ]
+    ++ lib.optionals stdenv.hostPlatform.isLinux [
+      crun
+      e2fsprogs
+      util-linux
+    ];
 in
   stdenv.mkDerivation {
     pname = "smolvm";
@@ -80,7 +104,8 @@ in
       ''
       + ''
         makeWrapper $out/libexec/smolvm/smolvm $out/bin/smolvm \
-          --set-default SMOLVM_AGENT_ROOTFS $out/libexec/smolvm/agent-rootfs
+          --set-default SMOLVM_AGENT_ROOTFS $out/libexec/smolvm/agent-rootfs \
+          --prefix PATH : ${lib.makeBinPath runtimeDeps}
 
         runHook postInstall
       '';
