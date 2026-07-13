@@ -133,8 +133,13 @@ pub fn launch_agent_vm_dynamic(
     // SAFETY: Each FFI call below is individually wrapped in unsafe.
     // All CString/pointer construction is safe Rust outside the unsafe blocks.
 
-    // Set log level
-    let log_level = if config.debug { 3 } else { 0 };
+    // Set log level (0 = off, 1 = error, 2 = warn, 3 = info, 4 = debug).
+    // Honor SMOLVM_KRUN_LOG_LEVEL like the non-packed launcher so a packed VM's
+    // boot can be traced; otherwise fall back to info under --debug.
+    let log_level = std::env::var(crate::data::consts::ENV_SMOLVM_KRUN_LOG_LEVEL)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(if config.debug { 3 } else { 0 });
     // SAFETY: set_log_level is a valid function pointer loaded from libkrun
     unsafe { (krun.set_log_level)(log_level) };
 

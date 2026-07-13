@@ -30,8 +30,48 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// Timeout waiting for the agent to become ready.
-const AGENT_READY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default timeout waiting for the agent to become ready.
+///
+/// A packed VM assembles its container rootfs *inside the guest* on first boot
+/// (extract OCI layers to /storage, then overlayfs copy-up), so a machine that
+/// carries a large dependency tree — e.g. a ~6 GiB torch + CUDA-wheels overlay —
+/// can legitimately take longer than this to reach its vsock accept loop. Raise
+/// it for such machines with `SMOLVM_AGENT_READY_TIMEOUT_SECS`.
+const AGENT_READY_TIMEOUT_DEFAULT_SECS: u64 = 30;
+
+/// Resolve the agent-ready timeout, honoring `SMOLVM_AGENT_READY_TIMEOUT_SECS`.
+fn agent_ready_timeout() -> Duration {
+    let secs = std::env::var("SMOLVM_AGENT_READY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(AGENT_READY_TIMEOUT_DEFAULT_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Detach the forked VM child from the terminal. When
+/// `SMOLVM_PACKED_KRUN_STDERR_LOG` names a path, the child's stderr (libkrun's
+/// own log, level from `SMOLVM_KRUN_LOG_LEVEL`) is captured there instead of
+/// discarded — the only way to see a libkrun-level boot failure in a packed run,
+/// since the guest's virtio-console goes to a separate file.
+#[cfg(unix)]
+fn detach_vm_child_stdio() {
+    match std::env::var("SMOLVM_PACKED_KRUN_STDERR_LOG").ok() {
+        Some(p) if !p.trim().is_empty() => {
+            if smolvm::process::detach_stdio_to_stderr_file(std::path::Path::new(p.trim()))
+                .is_err()
+            {
+                smolvm::process::detach_stdio();
+            }
+        }
+        _ => smolvm::process::detach_stdio(),
+    }
+}
+
+#[cfg(not(unix))]
+fn detach_vm_child_stdio() {
+    smolvm::process::detach_stdio();
+}
 
 /// Resolve the lib directory containing libkrun/libkrunfw.
 ///
@@ -39,6 +79,22 @@ const AGENT_READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Single-file mode: libs extracted from Mach-O section to cache_dir/lib/.
 /// `smolvm pack run`: uses the host-installed libs.
 fn resolve_lib_dir(cache_dir: &Path, debug: bool) -> smolvm::Result<PathBuf> {
+    // Explicit override (matches the non-packed launcher). Lets a dev run a
+    // packed sidecar with a freshly-built smolvm binary pointed at a known-good
+    // libkrun, instead of the libs embedded in the original stub.
+    if let Ok(dir) = std::env::var(smolvm::data::consts::ENV_SMOLVM_LIB_DIR) {
+        let dir = dir.trim();
+        if !dir.is_empty() {
+            let p = PathBuf::from(dir);
+            if p.exists() {
+                if debug {
+                    eprintln!("debug: using libs from SMOLVM_LIB_DIR: {}", p.display());
+                }
+                return Ok(p);
+            }
+        }
+    }
+
     // Two-file mode: libs embedded in stub binary (SMOLLIBS footer)
     if let Ok(exe_path) = std::env::current_exe() {
         if let Ok(Some(lib_dir)) = extract::extract_libs_from_binary(&exe_path, debug) {
@@ -389,7 +445,7 @@ impl PackRunCmd {
 
                 // Detach from parent's terminal so libkrun doesn't
                 // steal keystrokes or corrupt terminal state.
-                smolvm::process::detach_stdio();
+                detach_vm_child_stdio();
 
                 if let Err(e) = launch_agent_vm_dynamic(&krun, &config) {
                     let msg = format!("launch_agent_vm_dynamic failed: {}\n", e);
@@ -682,14 +738,15 @@ fn wait_for_agent(vsock_path: &Path, debug: bool) -> smolvm::Result<AgentClient>
 
     let start = Instant::now();
     let poll_interval = Duration::from_millis(100);
+    let timeout = agent_ready_timeout();
 
     loop {
-        if start.elapsed() > AGENT_READY_TIMEOUT {
+        if start.elapsed() > timeout {
             return Err(Error::agent(
                 "wait for agent",
                 format!(
                     "agent did not become ready within {} seconds",
-                    AGENT_READY_TIMEOUT.as_secs()
+                    timeout.as_secs()
                 ),
             ));
         }
@@ -1370,7 +1427,7 @@ fn run_from_cache(
 
         // Detach from parent's terminal so libkrun doesn't
         // steal keystrokes or corrupt terminal state.
-        smolvm::process::detach_stdio();
+        detach_vm_child_stdio();
 
         if let Err(e) = launch_agent_vm_dynamic(&krun, &config) {
             let msg = format!("launch_agent_vm_dynamic failed: {}\n", e);
@@ -1790,7 +1847,7 @@ fn daemon_start(
         // Detach from parent's terminal before launching the VM.
         // Without this, libkrun's threads inherit stdin and steal
         // keystrokes from the user's shell.
-        smolvm::process::detach_stdio();
+        detach_vm_child_stdio();
 
         if let Err(e) = launch_agent_vm_dynamic(&krun, &config) {
             let msg = format!("launch_agent_vm_dynamic failed: {}\n", e);
