@@ -4864,6 +4864,7 @@ fn run_in_keepalive_container(
             launch.workdir.as_deref(),
             false,
         )
+        .user(launch.user.as_deref())
         .capture_output()
         .stdin_piped()
         .spawn()?;
@@ -4879,6 +4880,7 @@ fn run_in_keepalive_container(
             launch.workdir.as_deref(),
             false,
         )
+        .user(launch.user.as_deref())
         .capture_output()
         .stdin_null()
         .output()?
@@ -4913,6 +4915,19 @@ fn handle_run(
     let mut env = env.to_vec();
     ssh_agent::inject_into_env(&mut env);
     let env = &env[..];
+
+    // Honor the image's default USER when the request doesn't pin one, so every
+    // container-run path (the keep-alive `crun exec` below and the fresh-container
+    // fallback) runs as the uid the image expects — matching the workload
+    // container itself. An explicit request user still wins; an image with no
+    // USER stays root. Bare-VM exec (`handle_vm_exec`) never reaches here, so it
+    // is unaffected.
+    let image_user = if user.is_none() {
+        storage::query_image(image).ok().flatten().and_then(|i| i.user)
+    } else {
+        None
+    };
+    let user = user.or(image_user.as_deref());
 
     // On a persistent machine, run inside the long-lived keep-alive container so
     // backgrounded processes survive across execs. Fall back to a fresh container
