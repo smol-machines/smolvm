@@ -105,6 +105,17 @@ pub trait Backend: Send {
     fn graph_instantiate(&mut self, graph: u64) -> CuResult<u64>;
     /// Replay an instantiated graph on `stream`.
     fn graph_launch(&mut self, graph_exec: u64, stream: u64) -> CuResult<()>;
+    /// Rewrite `exec`'s node params so device pointers baked in at capture are
+    /// translated through `trans` to a fork clone's private copies (Path 2).
+    /// Default: no-op (a backend without graph support has nothing to patch).
+    fn graph_exec_patch(
+        &mut self,
+        _exec: u64,
+        _graph: u64,
+        _trans: &[(u64, u64, u64)],
+    ) -> CuResult<()> {
+        Ok(())
+    }
     fn graph_exec_destroy(&mut self, graph_exec: u64) -> CuResult<()>;
     fn graph_destroy(&mut self, graph: u64) -> CuResult<()>;
     /// Number of nodes in a captured graph (PyTorch warns on empty graphs).
@@ -297,6 +308,27 @@ struct Session {
     owned_streams: std::collections::HashSet<u64>,
     owned_events: std::collections::HashSet<u64>,
     primary_retains: u32,
+    /// This session's live device allocations (dptr → size), shared via
+    /// [`DPTR_HANDOFF`] so a fork clone in isolation mode can enumerate the
+    /// parent's buffers and give itself private copies. Mirrors `owned_dptrs`.
+    alloc_table: std::sync::Arc<std::sync::Mutex<HashMap<u64, (u64, bool)>>>,
+    /// Fork-isolation pointer map: `(parent_base, size, private_copy_base)`.
+    /// Empty unless this session is an isolating clone. Every inherited dptr the
+    /// guest sends is rewritten through these ranges to the clone's own copy, so
+    /// two clones of one golden write disjoint VRAM instead of colliding.
+    dptr_trans: Vec<(u64, u64, u64)>,
+    /// Parent lineage token whose allocations must be copied privately on the
+    /// first `PrimaryCtxRetain` (when a context is finally current). 0 = none.
+    pending_isolate: u64,
+    /// Inherited read-only (weight) buffers this isolating clone SHARES with its
+    /// parent: `(base, size)`. Shared until the clone writes one, at which point
+    /// it's copied-on-write into `dptr_trans` and dropped from here. Lets clones
+    /// share gigabytes of weights while still isolating anything they mutate.
+    shared_ranges: Vec<(u64, u64)>,
+    /// Per-clone patched graph execs: inherited exec (real) → this clone's own
+    /// exec (real) with node pointers translated to its private copies. Freed via
+    /// `owned_graph_reals` on teardown. Empty for non-isolating sessions.
+    clone_graph_execs: HashMap<u64, u64>,
 }
 
 /// Free everything a finished connection still owns. Failures are ignored —
@@ -355,6 +387,47 @@ type GraphVhMap = std::sync::Mutex<HashMap<u64, u64>>;
 static GRAPH_HANDOFF: std::sync::Mutex<Option<HashMap<u64, std::sync::Weak<GraphVhMap>>>> =
     std::sync::Mutex::new(None);
 
+/// Maps an instantiated graph exec (real handle) → its source graph template
+/// (real handle). Populated at GraphInstantiate; lets an isolating fork clone
+/// re-instantiate + patch an inherited exec (Path 2 graph-mode isolation).
+/// Real handles are context-global, so one process-wide map serves all sessions.
+static EXEC_TEMPLATES: std::sync::Mutex<Option<HashMap<u64, u64>>> = std::sync::Mutex::new(None);
+
+fn exec_template_register(exec: u64, graph: u64) {
+    EXEC_TEMPLATES
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .insert(exec, graph);
+}
+
+fn exec_template_lookup(exec: u64) -> Option<u64> {
+    EXEC_TEMPLATES.lock().unwrap().as_ref()?.get(&exec).copied()
+}
+
+/// Graph templates an isolating clone may need to re-instantiate. PyTorch/vLLM
+/// destroy the cuGraph right after instantiating its exec, so we keep templates
+/// alive (leaking them — acceptable on the opt-in isolation path) so a clone can
+/// re-instantiate + patch them later.
+static TEMPLATE_GRAPHS: std::sync::Mutex<Option<std::collections::HashSet<u64>>> =
+    std::sync::Mutex::new(None);
+
+fn template_graph_mark(graph: u64) {
+    TEMPLATE_GRAPHS
+        .lock()
+        .unwrap()
+        .get_or_insert_with(std::collections::HashSet::new)
+        .insert(graph);
+}
+
+fn template_graph_is(graph: u64) -> bool {
+    TEMPLATE_GRAPHS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|s| s.contains(&graph))
+}
+
 /// Copy `resume_token`'s captured-graph map into `dst`, then register `dst`
 /// under `my_token` (the same token the backend minted for cuBLAS handoff, so
 /// both handle families share one lineage). The reals are context-scoped host
@@ -369,6 +442,353 @@ fn graph_handoff_register(dst: &std::sync::Arc<GraphVhMap>, resume_token: u64, m
     }
     reg.retain(|_, w| w.strong_count() > 0);
     reg.insert(my_token, std::sync::Arc::downgrade(dst));
+}
+
+/// Opt-in (`SMOLVM_CUDA_FORK_ISOLATE=1`): fork clones get PRIVATE copies of the
+/// golden's device memory instead of sharing it. Independent serving (two clones
+/// running different requests) needs this; the default shared-memory fork is for
+/// "resume the golden's exact work" (checkpoint/continue), which this would break.
+fn fork_isolate_enabled() -> bool {
+    std::env::var_os("SMOLVM_CUDA_FORK_ISOLATE").is_some()
+}
+
+/// P0 transport-viability instrumentation. Counts every dispatched CUDA RPC so we
+/// can derive calls-per-token (the number that decides whether CUDA-over-network
+/// survives WAN round-trips). `SMOLVM_CUDA_RPC_STATS=1` logs the running count with
+/// a wall-clock stamp every 2000 calls; `SMOLVM_CUDA_RPC_DELAY_US=<n>` injects `n`
+/// microseconds of latency per call to model network RTT. Both cached so a normal
+/// run pays only one relaxed atomic add.
+static RPC_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Subset of RPCs that actually block the client on a reply (non-quiet responses +
+/// fences). This — not the raw RPC count — is what a network RTT multiplies, since
+/// quiet/fire-and-forget requests pipeline.
+static ROUNDTRIP_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+fn rpc_stats_enabled() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| std::env::var_os("SMOLVM_CUDA_RPC_STATS").is_some())
+}
+fn rpc_delay_us() -> u64 {
+    static D: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *D.get_or_init(|| {
+        std::env::var("SMOLVM_CUDA_RPC_DELAY_US")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    })
+}
+/// Models network round-trip time: `SMOLVM_CUDA_RTT_US` microseconds of latency
+/// added at each BLOCKING round-trip (fence / non-quiet response) only — quiet
+/// fire-and-forget requests are untouched, exactly as a real network would leave
+/// pipelined sends overlapped. Lets us confirm the P0 latency model on a live
+/// workload over the existing transport, without netem.
+fn rtt_us() -> u64 {
+    static R: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *R.get_or_init(|| {
+        std::env::var("SMOLVM_CUDA_RTT_US")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// Let an isolating clone launch an INHERITED cudagraph by re-instantiating it and
+/// translating its node pointers to the clone's private copies (Path 2). ON by
+/// default: `graph_exec_patch` now translates device pointers embedded in by-value
+/// kernel-arg structs (vLLM's attention/sampling kernels), not just standalone
+/// 8-byte args, so graph-mode isolation is correct (verified: opt-350m, shared
+/// weights, two concurrent clones on different prompts, all token-exact). Opt out
+/// with `SMOLVM_CUDA_FORK_GRAPH_PATCH=0` to fall back to fail-loud (e.g. to bisect a
+/// suspected regression).
+fn graph_patch_enabled() -> bool {
+    !matches!(
+        std::env::var("SMOLVM_CUDA_FORK_GRAPH_PATCH").as_deref(),
+        Ok("0")
+    )
+}
+
+/// Diagnostic: patch the golden's exec IN PLACE instead of re-instantiating, to
+/// tell whether the re-instantiation or the patching is what breaks graph mode.
+/// Single-clone only (mutates the shared exec).
+fn graph_inplace_enabled() -> bool {
+    std::env::var_os("SMOLVM_CUDA_GRAPH_INPLACE").is_some()
+}
+
+/// Registry of live sessions' allocation tables, keyed by lineage token, so an
+/// isolating clone can enumerate its parent's device buffers to copy them.
+/// `Weak` so a session's entry evaporates when its connection closes. Parallels
+/// [`GRAPH_HANDOFF`].
+/// dptr → (size, loaded). `loaded` = written via a host-to-device copy, i.e. a
+/// weight/constant streamed in at load time. Such buffers are read-only during
+/// inference, so clones SHARE them (M4) instead of each copying gigabytes of
+/// weights; only the un-loaded buffers (KV cache, activations) get private copies.
+type AllocTable = std::sync::Mutex<HashMap<u64, (u64, bool)>>;
+static DPTR_HANDOFF: std::sync::Mutex<Option<HashMap<u64, std::sync::Weak<AllocTable>>>> =
+    std::sync::Mutex::new(None);
+
+fn dptr_handoff_register(table: &std::sync::Arc<AllocTable>, my_token: u64) {
+    let mut reg = DPTR_HANDOFF.lock().unwrap();
+    let reg = reg.get_or_insert_with(HashMap::new);
+    reg.retain(|_, w| w.strong_count() > 0);
+    reg.insert(my_token, std::sync::Arc::downgrade(table));
+}
+
+/// Snapshot of `token`'s current `(dptr, size, loaded)` allocations, or `None`
+/// if that lineage is gone.
+fn dptr_handoff_snapshot(token: u64) -> Option<Vec<(u64, u64, bool)>> {
+    let reg = DPTR_HANDOFF.lock().unwrap();
+    let table = reg.as_ref()?.get(&token)?.upgrade()?;
+    let snap = table
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(&d, &(s, l))| (d, s, l))
+        .collect();
+    Some(snap)
+}
+
+/// Mark the allocation containing `dptr` as loaded (H2D-written → read-only
+/// weight). Called on every host-to-device copy on the golden.
+fn mark_loaded(table: &AllocTable, dptr: u64) {
+    let mut t = table.lock().unwrap();
+    if let Some(v) = t.get_mut(&dptr) {
+        v.1 = true;
+        return;
+    }
+    for (&base, v) in t.iter_mut() {
+        if dptr >= base && dptr < base + v.0 {
+            v.1 = true;
+            return;
+        }
+    }
+}
+
+/// Copy-on-write a shared (inherited read-only) buffer that this clone is about
+/// to WRITE, so the write hits a private copy instead of the parent's buffer.
+/// Moves it from `shared_ranges` into `dptr_trans`. No-op if `dptr` isn't shared.
+fn cow_one(sess: &mut Session, b: &mut dyn Backend, dptr: u64) {
+    let Some(i) = sess
+        .shared_ranges
+        .iter()
+        .position(|&(base, size)| dptr >= base && dptr < base + size)
+    else {
+        return;
+    };
+    let (base, size) = sess.shared_ranges.swap_remove(i);
+    if let Ok(cdptr) = b.mem_alloc(size) {
+        let _ = b.memcpy_dtod(cdptr, base, size);
+        sess.dptr_trans.push((base, size, cdptr));
+        sess.owned_dptrs.insert(cdptr, size);
+        sess.alloc_table
+            .lock()
+            .unwrap()
+            .insert(cdptr, (size, false));
+        gpu::set_lib_trans(&sess.dptr_trans); // keep the cuBLAS/cuDNN map current
+    }
+}
+
+/// COW any shared buffer this request WRITES (host-to-device copies, memset,
+/// device-to-device destination). Kernel outputs are undetectable, but the only
+/// shared buffers are H2D-loaded weights, which kernels only read.
+fn cow_written(sess: &mut Session, b: &mut dyn Backend, req: &Request) {
+    if sess.shared_ranges.is_empty() {
+        return;
+    }
+    match req {
+        Request::MemcpyHtoD { dptr, .. }
+        | Request::MemsetD8 { dptr, .. }
+        | Request::MemsetD8Async { dptr, .. }
+        | Request::MemcpyShmHtoD { dptr, .. }
+        | Request::MemcpyGpaHtoD { dptr, .. } => cow_one(sess, b, *dptr),
+        Request::MemcpyDtoD { dst, .. } | Request::MemcpyDtoDAsync { dst, .. } => {
+            cow_one(sess, b, *dst)
+        }
+        _ => {}
+    }
+}
+
+/// Rewrite a guest device pointer through the clone's private-copy ranges. A
+/// pointer inside an inherited allocation `[base, base+size)` maps to the same
+/// offset in the clone's copy; everything else (fresh post-fork allocations,
+/// non-isolating sessions) passes through untouched.
+fn xlat(trans: &[(u64, u64, u64)], p: u64) -> u64 {
+    if p == 0 {
+        return 0;
+    }
+    for &(base, size, copy) in trans {
+        if p >= base && p < base + size {
+            return copy + (p - base);
+        }
+    }
+    p
+}
+
+/// Rewrite every inherited device pointer in a memory-op request to the clone's
+/// private copy. No-op when `trans` is empty (the common, non-isolating path).
+fn translate_dptrs(trans: &[(u64, u64, u64)], req: Request) -> Request {
+    if trans.is_empty() {
+        return req;
+    }
+    match req {
+        Request::MemcpyHtoD { dptr, stream, data } => Request::MemcpyHtoD {
+            dptr: xlat(trans, dptr),
+            stream,
+            data,
+        },
+        Request::MemcpyDtoH {
+            dptr,
+            bytes,
+            stream,
+        } => Request::MemcpyDtoH {
+            dptr: xlat(trans, dptr),
+            bytes,
+            stream,
+        },
+        Request::MemcpyDtoD { dst, src, bytes } => Request::MemcpyDtoD {
+            dst: xlat(trans, dst),
+            src: xlat(trans, src),
+            bytes,
+        },
+        Request::MemcpyDtoDAsync {
+            dst,
+            src,
+            bytes,
+            stream,
+        } => Request::MemcpyDtoDAsync {
+            dst: xlat(trans, dst),
+            src: xlat(trans, src),
+            bytes,
+            stream,
+        },
+        Request::MemsetD8 { dptr, value, bytes } => Request::MemsetD8 {
+            dptr: xlat(trans, dptr),
+            value,
+            bytes,
+        },
+        Request::MemsetD8Async {
+            dptr,
+            value,
+            bytes,
+            stream,
+        } => Request::MemsetD8Async {
+            dptr: xlat(trans, dptr),
+            value,
+            bytes,
+            stream,
+        },
+        Request::MemcpyShmHtoD {
+            dptr,
+            offset,
+            size,
+            stream,
+        } => Request::MemcpyShmHtoD {
+            dptr: xlat(trans, dptr),
+            offset,
+            size,
+            stream,
+        },
+        Request::MemcpyShmDtoH {
+            offset,
+            dptr,
+            size,
+            stream,
+        } => Request::MemcpyShmDtoH {
+            offset,
+            dptr: xlat(trans, dptr),
+            size,
+            stream,
+        },
+        Request::MemcpyGpaHtoD {
+            dptr,
+            segments,
+            stream,
+        } => Request::MemcpyGpaHtoD {
+            dptr: xlat(trans, dptr),
+            segments,
+            stream,
+        },
+        Request::MemcpyGpaDtoH {
+            dptr,
+            segments,
+            stream,
+        } => Request::MemcpyGpaDtoH {
+            dptr: xlat(trans, dptr),
+            segments,
+            stream,
+        },
+        Request::MemFree { dptr } => Request::MemFree {
+            dptr: xlat(trans, dptr),
+        },
+        Request::LaunchKernel {
+            function,
+            grid,
+            block,
+            shared_bytes,
+            stream,
+            mut params,
+        } => {
+            // A kernel's pointer arguments are device addresses embedded in the
+            // per-arg byte buffers. CUDA doesn't tell us which args are pointers,
+            // so scan each arg's 8-byte-aligned windows and remap any value that
+            // lands inside an inherited allocation. Each arg is its own buffer, so
+            // a standalone pointer arg is a clean 8-byte read; non-pointer scalars
+            // essentially never fall inside a live device-address range.
+            for p in params.iter_mut() {
+                let mut off = 0;
+                while off + 8 <= p.len() {
+                    let v = u64::from_le_bytes(p[off..off + 8].try_into().unwrap());
+                    let t = xlat(trans, v);
+                    if t != v {
+                        p[off..off + 8].copy_from_slice(&t.to_le_bytes());
+                    }
+                    off += 8;
+                }
+            }
+            Request::LaunchKernel {
+                function,
+                grid,
+                block,
+                shared_bytes,
+                stream,
+                params,
+            }
+        }
+        Request::CublasSgemm {
+            handle,
+            transa,
+            transb,
+            m,
+            n,
+            k,
+            alpha_bits,
+            a,
+            lda,
+            b,
+            ldb,
+            beta_bits,
+            c,
+            ldc,
+        } => Request::CublasSgemm {
+            handle,
+            transa,
+            transb,
+            m,
+            n,
+            k,
+            alpha_bits,
+            a: xlat(trans, a),
+            lda,
+            b: xlat(trans, b),
+            ldb,
+            beta_bits,
+            c: xlat(trans, c),
+            ldc,
+        },
+        // LibCall (cuBLAS/cuDNN) device-pointer args are translated TYPED in the
+        // generated dispatch via `gpu::dptr_resolve` (a byte-scan of the packed,
+        // mixed-width arg buffer would mis-align and corrupt scalars), driven by
+        // the thread-local map that `dispatch` keeps in sync — see `set_lib_trans`.
+        other => other,
+    }
 }
 
 /// Serve one CUDA-RPC connection to completion (until the peer closes). Each
@@ -410,6 +830,11 @@ fn serve_inner<S: Read + Write>(
             }
             // Fence: report (and clear) the sticky quiet failure.
             Some(&crate::proto::FENCE_OP) if payload.len() == 1 => {
+                ROUNDTRIP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let rtt = rtt_us();
+                if rtt > 0 {
+                    std::thread::sleep(std::time::Duration::from_micros(rtt));
+                }
                 let st = std::mem::take(&mut quiet_sticky);
                 write_msg(&mut stream, &encode_response(st, &Response::Ok))?;
             }
@@ -440,6 +865,11 @@ fn serve_inner<S: Read + Write>(
                             continue;
                         }
                     }
+                }
+                ROUNDTRIP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let rtt = rtt_us();
+                if rtt > 0 {
+                    std::thread::sleep(std::time::Duration::from_micros(rtt));
                 }
                 let (status, resp) = dispatch(sess, backend, req);
                 if status != 0 && std::env::var_os("SMOLVM_CUDA_HOST_OPLOG").is_some() {
@@ -716,6 +1146,22 @@ fn vram_limit() -> u64 {
 }
 
 fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Response) {
+    // P0 transport-viability: count every RPC; optionally inject per-call latency
+    // to model network RTT, and periodically log the count vs wall-clock so
+    // calls/sec (and thus calls-per-token) can be derived.
+    let rpc_n = RPC_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let delay = rpc_delay_us();
+    if delay > 0 {
+        std::thread::sleep(std::time::Duration::from_micros(delay));
+    }
+    if rpc_stats_enabled() && rpc_n.is_multiple_of(2000) {
+        let wall = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let rt = ROUNDTRIP_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        eprintln!("[rpc-stats] count={rpc_n} roundtrips={rt} wall={wall:.6}");
+    }
     // Translate an opaque id to the backend's raw handle, or error.
     fn raw(map: &HashMap<u64, u64>, id: u64) -> CuResult<u64> {
         map.get(&id).copied().ok_or(CUDA_ERROR_INVALID_HANDLE)
@@ -760,6 +1206,11 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         // Same raw-on-the-wire convention as streams.
         Ok(sess.events.get(&event).copied().unwrap_or(event))
     }
+    // Copy-on-write any shared weight buffer this request writes, then rewrite
+    // inherited device pointers to this clone's private copies (both no-ops
+    // unless this is an isolating clone).
+    cow_written(sess, b, &req);
+    let req = translate_dptrs(&sess.dptr_trans, req);
     let r: CuResult<Response> = (|| match req {
         Request::Init {
             proto_hash,
@@ -782,6 +1233,12 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 // the session-level captured-graph map under the same token.
                 let token = b.begin_session(resume_token);
                 graph_handoff_register(&sess.graph_vhandles, resume_token, token);
+                dptr_handoff_register(&sess.alloc_table, token);
+                // Isolation-mode clone: defer copying the parent's buffers until
+                // the first PrimaryCtxRetain, when a context is actually current.
+                if resume_token != 0 && fork_isolate_enabled() {
+                    sess.pending_isolate = resume_token;
+                }
                 b.init().map(|_| Response::Handle(token))
             }
         }
@@ -812,6 +1269,78 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             sess.primary_retains += 1;
             let id = sess.mint();
             sess.contexts.insert(id, raw);
+            // Copy-on-fork (isolation mode): now that the primary context is
+            // current on this thread, give this clone private copies of the
+            // parent's device buffers and record the pointer translation, so its
+            // inherited dptrs resolve to disjoint VRAM from sibling clones.
+            if sess.pending_isolate != 0 {
+                let parent = std::mem::take(&mut sess.pending_isolate);
+                // SMOLVM_CUDA_FORK_COPY_ALL forces every buffer private (weights
+                // too) — maximal isolation at N× the VRAM. Default shares the
+                // read-only weights (copy-on-write) so clones fit alongside the golden.
+                let copy_all = std::env::var_os("SMOLVM_CUDA_FORK_COPY_ALL").is_some();
+                let (mut copied, mut shared, mut cbytes, mut sbytes) = (0u64, 0u64, 0u64, 0u64);
+                if let Some(allocs) = dptr_handoff_snapshot(parent) {
+                    for (gdptr, size, loaded) in allocs {
+                        if loaded && !copy_all {
+                            // Weight/constant: share the parent's copy (read in
+                            // place, no translation). Copied-on-write only if the
+                            // clone actually writes it (see `cow_written`).
+                            sess.shared_ranges.push((gdptr, size));
+                            shared += 1;
+                            sbytes += size;
+                            continue;
+                        }
+                        if let Ok(cdptr) = b.mem_alloc(size) {
+                            let _ = b.memcpy_dtod(cdptr, gdptr, size);
+                            sess.dptr_trans.push((gdptr, size, cdptr));
+                            sess.owned_dptrs.insert(cdptr, size);
+                            sess.alloc_table
+                                .lock()
+                                .unwrap()
+                                .insert(cdptr, (size, false));
+                            copied += 1;
+                            cbytes += size;
+                        }
+                    }
+                }
+                gpu::set_lib_trans(&sess.dptr_trans); // forwarded-lib pointer map
+                eprintln!(
+                    "[cuda-fork-isolate] clone resumed token {parent}: {copied} private copies \
+                     ({cbytes} B), {shared} shared read-only ({sbytes} B)"
+                );
+                if std::env::var_os("SMOLVM_CUDA_GRAPH_DEBUG").is_some() {
+                    // Scan the copied buffers for 8-byte values that fall inside a
+                    // golden allocation range: those are DEVICE-STORED POINTERS that
+                    // node-arg translation can't reach. fp16/fp32 data almost never
+                    // forms a 0x7f..-class address, so any hits are real.
+                    let mut ranges: Vec<(u64, u64)> = sess
+                        .dptr_trans
+                        .iter()
+                        .map(|&(b, s, _)| (b, b + s))
+                        .collect();
+                    ranges.extend(sess.shared_ranges.iter().map(|&(b, s)| (b, b + s)));
+                    let copies: Vec<(u64, u64)> =
+                        sess.dptr_trans.iter().map(|&(_, s, c)| (c, s)).collect();
+                    let (mut found, mut sample) = (0u64, Vec::new());
+                    for (cptr, size) in copies {
+                        if let Ok(bytes) = b.memcpy_dtoh(cptr, size, 0) {
+                            for ch in bytes.chunks_exact(8) {
+                                let v = u64::from_ne_bytes(ch.try_into().unwrap());
+                                if ranges.iter().any(|&(lo, hi)| v >= lo && v < hi) {
+                                    found += 1;
+                                    if sample.len() < 6 {
+                                        sample.push(v);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    eprintln!(
+                        "[cuda-fork-isolate] DEVICE-STORED golden pointers in copies: {found} (e.g. {sample:#x?})"
+                    );
+                }
+            }
             Ok(Response::Handle(id))
         }
         Request::PrimaryCtxRelease { device } => {
@@ -873,17 +1402,22 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             }
             b.mem_alloc(bytes).map(|d| {
                 sess.owned_dptrs.insert(d, bytes);
+                sess.alloc_table.lock().unwrap().insert(d, (bytes, false));
                 Response::Dptr(d)
             })
         }
         Request::MemFree { dptr } => {
+            // `dptr` is already translated to the clone's copy (if inherited).
             sess.owned_dptrs.remove(&dptr);
+            sess.alloc_table.lock().unwrap().remove(&dptr);
             // (removal returns the freed size to the quota ledger)
             b.mem_free(dptr).map(|_| Response::Ok)
         }
-        Request::MemcpyHtoD { dptr, stream, data } => b
-            .memcpy_htod(dptr, &data, raw_stream(sess, stream)?)
-            .map(|_| Response::Ok),
+        Request::MemcpyHtoD { dptr, stream, data } => {
+            mark_loaded(&sess.alloc_table, dptr); // H2D write → weight/read-only
+            b.memcpy_htod(dptr, &data, raw_stream(sess, stream)?)
+                .map(|_| Response::Ok)
+        }
         Request::MemcpyDtoH {
             dptr,
             bytes,
@@ -947,6 +1481,10 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         Request::GraphInstantiate { graph, exec_vh } => {
             let real_graph = raw_graph(sess, graph);
             let e = b.graph_instantiate(real_graph)?;
+            exec_template_register(e, real_graph); // for Path 2 clone re-instantiation
+            if fork_isolate_enabled() {
+                template_graph_mark(real_graph); // keep it alive for clones
+            }
             if exec_vh & VHANDLE_TAG != 0 {
                 sess.graph_vhandles.lock().unwrap().insert(exec_vh, e);
                 sess.owned_graph_reals.insert(e);
@@ -954,9 +1492,73 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             Ok(Response::Handle(e))
         }
         Request::GraphLaunch { graph_exec, stream } => {
+            let real = raw_graph(sess, graph_exec);
+            // Fork isolation + an INHERITED cudagraph: the graph baked in the
+            // golden's device addresses at capture time, so replaying it verbatim
+            // would write the golden's / a sibling's memory. A graph the clone
+            // captured itself (owned_graph_reals) is already correct; eager mode
+            // has no graphs, so this branch never fires there.
+            let inherited_isolated =
+                !sess.dptr_trans.is_empty() && !sess.owned_graph_reals.contains(&real);
+            if inherited_isolated && !graph_patch_enabled() {
+                // Only when explicitly disabled (SMOLVM_CUDA_FORK_GRAPH_PATCH=0):
+                // fail loud rather than launch an inherited graph verbatim.
+                eprintln!(
+                    "[cuda-fork-isolate] graph patch disabled (SMOLVM_CUDA_FORK_GRAPH_PATCH=0); \
+                     refusing to launch an inherited CUDA graph in an isolated clone. \
+                     Unset the var to use the graph-patch path, or run with enforce_eager."
+                );
+                return Err(CUDA_ERROR_NOT_SUPPORTED);
+            }
+            // Diagnostic: patch the golden's exec IN PLACE (no re-instantiate).
+            if inherited_isolated && graph_inplace_enabled() {
+                if let Some(template) = exec_template_lookup(real) {
+                    if !sess.clone_graph_execs.contains_key(&real) {
+                        b.graph_exec_patch(real, template, &sess.dptr_trans)?;
+                        sess.clone_graph_execs.insert(real, real); // patch once
+                    }
+                }
+                let raw = raw_stream(sess, stream)?;
+                return b.graph_launch(real, raw).map(|_| Response::Ok);
+            }
+            // Path 2: re-instantiate the template and translate its node pointers
+            // (including those embedded in by-value kernel-arg structs) to this
+            // clone's private copies.
+            let launch = if inherited_isolated {
+                match sess.clone_graph_execs.get(&real).copied() {
+                    Some(patched) => patched,
+                    None => {
+                        let template = exec_template_lookup(real).ok_or_else(|| {
+                            eprintln!(
+                                "[cuda-fork-isolate] inherited graph exec {real:#x} has no known \
+                                 template; refusing to launch (would corrupt across clones)"
+                            );
+                            CUDA_ERROR_NOT_SUPPORTED
+                        })?;
+                        let dbg = std::env::var_os("SMOLVM_CUDA_GRAPH_DEBUG").is_some();
+                        let patched = b.graph_instantiate(template).inspect_err(|e| {
+                            if dbg {
+                                eprintln!(
+                                    "[gpatch] reinstantiate template {template:#x} FAILED: {e}"
+                                )
+                            }
+                        })?;
+                        b.graph_exec_patch(patched, template, &sess.dptr_trans)
+                            .inspect_err(|e| {
+                                if dbg {
+                                    eprintln!("[gpatch] patch exec {patched:#x} FAILED: {e}")
+                                }
+                            })?;
+                        sess.clone_graph_execs.insert(real, patched);
+                        sess.owned_graph_reals.insert(patched);
+                        patched
+                    }
+                }
+            } else {
+                real
+            };
             let raw = raw_stream(sess, stream)?;
-            b.graph_launch(raw_graph(sess, graph_exec), raw)
-                .map(|_| Response::Ok)
+            b.graph_launch(launch, raw).map(|_| Response::Ok)
         }
         Request::GraphExecDestroy { graph_exec } => {
             let real = raw_graph(sess, graph_exec);
@@ -972,7 +1574,12 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         Request::GraphDestroy { graph } => {
             let real = raw_graph(sess, graph);
             sess.graph_vhandles.lock().unwrap().remove(&graph);
-            if sess.owned_graph_reals.remove(&real) {
+            let owned = sess.owned_graph_reals.remove(&real);
+            if template_graph_is(real) {
+                // Keep the template alive so isolating clones can still
+                // re-instantiate + patch it (Path 2). Leaks the cuGraph.
+                Ok(Response::Ok)
+            } else if owned {
                 b.graph_destroy(real).map(|_| Response::Ok)
             } else {
                 Ok(Response::Ok)
@@ -1155,9 +1762,11 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             offset,
             size,
             stream,
-        } => b
-            .memcpy_shm_htod(dptr, offset, size, raw_stream(sess, stream)?)
-            .map(|_| Response::Ok),
+        } => {
+            mark_loaded(&sess.alloc_table, dptr);
+            b.memcpy_shm_htod(dptr, offset, size, raw_stream(sess, stream)?)
+                .map(|_| Response::Ok)
+        }
         Request::MemcpyShmDtoH {
             offset,
             dptr,
@@ -1170,9 +1779,11 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             dptr,
             stream,
             segments,
-        } => b
-            .memcpy_gpa_htod(dptr, &segments, raw_stream(sess, stream)?)
-            .map(|_| Response::Ok),
+        } => {
+            mark_loaded(&sess.alloc_table, dptr);
+            b.memcpy_gpa_htod(dptr, &segments, raw_stream(sess, stream)?)
+                .map(|_| Response::Ok)
+        }
         Request::MemcpyGpaDtoH {
             dptr,
             stream,

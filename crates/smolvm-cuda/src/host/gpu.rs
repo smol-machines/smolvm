@@ -36,6 +36,7 @@ pub struct GpuBackend {
     ctx_create: unsafe extern "C" fn(*mut *mut c_void, c_uint, c_int) -> CuResultCode,
     ctx_destroy: unsafe extern "C" fn(*mut c_void) -> CuResultCode,
     ctx_set_current: unsafe extern "C" fn(*mut c_void) -> CuResultCode,
+    ctx_get_current: unsafe extern "C" fn(*mut *mut c_void) -> CuResultCode,
     primary_ctx_retain: unsafe extern "C" fn(*mut *mut c_void, c_int) -> CuResultCode,
     primary_ctx_release: unsafe extern "C" fn(c_int) -> CuResultCode,
     module_load_data: unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> CuResultCode,
@@ -97,6 +98,29 @@ pub struct GpuBackend {
     graph_destroy: unsafe extern "C" fn(*mut c_void) -> CuResultCode,
     graph_get_nodes:
         unsafe extern "C" fn(*mut c_void, *mut *mut c_void, *mut usize) -> CuResultCode,
+    // Graph-node introspection + exec node-param setters — used to patch a fork
+    // clone's inherited cudagraph so its baked-in device pointers hit the clone's
+    // private copies (Path 2 of the fork-isolation design).
+    graph_node_get_type: unsafe extern "C" fn(*mut c_void, *mut c_int) -> CuResultCode,
+    graph_kernel_node_get_params:
+        unsafe extern "C" fn(*mut c_void, *mut KernelNodeParams) -> CuResultCode,
+    graph_exec_kernel_node_set_params:
+        unsafe extern "C" fn(*mut c_void, *mut c_void, *const KernelNodeParams) -> CuResultCode,
+    graph_memset_node_get_params:
+        unsafe extern "C" fn(*mut c_void, *mut MemsetNodeParams) -> CuResultCode,
+    graph_exec_memset_node_set_params: unsafe extern "C" fn(
+        *mut c_void,
+        *mut c_void,
+        *const MemsetNodeParams,
+        *mut c_void,
+    ) -> CuResultCode,
+    graph_memcpy_node_get_params: unsafe extern "C" fn(*mut c_void, *mut Memcpy3D) -> CuResultCode,
+    graph_exec_memcpy_node_set_params: unsafe extern "C" fn(
+        *mut c_void,
+        *mut c_void,
+        *const Memcpy3D,
+        *mut c_void,
+    ) -> CuResultCode,
     memset_d8_async: unsafe extern "C" fn(u64, u8, usize, *mut c_void) -> CuResultCode,
     memcpy_dtod_async: unsafe extern "C" fn(u64, u64, usize, *mut c_void) -> CuResultCode,
     stream_destroy: unsafe extern "C" fn(*mut c_void) -> CuResultCode,
@@ -339,6 +363,7 @@ impl GpuBackend {
                 ctx_create: sym(&lib, b"cuCtxCreate_v2\0")?,
                 ctx_destroy: sym(&lib, b"cuCtxDestroy_v2\0")?,
                 ctx_set_current: sym(&lib, b"cuCtxSetCurrent\0")?,
+                ctx_get_current: sym(&lib, b"cuCtxGetCurrent\0")?,
                 primary_ctx_retain: sym(&lib, b"cuDevicePrimaryCtxRetain\0")?,
                 primary_ctx_release: sym2(
                     &lib,
@@ -382,6 +407,16 @@ impl GpuBackend {
                 graph_exec_destroy: sym(&lib, b"cuGraphExecDestroy\0")?,
                 graph_destroy: sym(&lib, b"cuGraphDestroy\0")?,
                 graph_get_nodes: sym(&lib, b"cuGraphGetNodes\0")?,
+                graph_node_get_type: sym(&lib, b"cuGraphNodeGetType\0")?,
+                graph_kernel_node_get_params: sym(&lib, b"cuGraphKernelNodeGetParams_v2\0")?,
+                graph_exec_kernel_node_set_params: sym(
+                    &lib,
+                    b"cuGraphExecKernelNodeSetParams_v2\0",
+                )?,
+                graph_memset_node_get_params: sym(&lib, b"cuGraphMemsetNodeGetParams\0")?,
+                graph_exec_memset_node_set_params: sym(&lib, b"cuGraphExecMemsetNodeSetParams\0")?,
+                graph_memcpy_node_get_params: sym(&lib, b"cuGraphMemcpyNodeGetParams\0")?,
+                graph_exec_memcpy_node_set_params: sym(&lib, b"cuGraphExecMemcpyNodeSetParams\0")?,
                 memset_d8_async: sym(&lib, b"cuMemsetD8Async\0")?,
                 memcpy_dtod_async: sym2(&lib, b"cuMemcpyDtoDAsync_v2\0", b"cuMemcpyDtoDAsync\0")?,
                 stream_destroy: sym2(&lib, b"cuStreamDestroy_v2\0", b"cuStreamDestroy\0")?,
@@ -935,6 +970,238 @@ impl Backend for GpuBackend {
             ))
         }
     }
+    fn graph_exec_patch(
+        &mut self,
+        exec: u64,
+        graph: u64,
+        trans: &[(u64, u64, u64)],
+    ) -> CuResult<()> {
+        // Enumerate the graph's nodes and rewrite each node's device-pointer
+        // params through `trans`, so a fork clone's inherited cudagraph writes its
+        // OWN private copies instead of the golden's memory (Path 2).
+        let mut count: usize = 0;
+        unsafe {
+            chk((self.graph_get_nodes)(
+                graph as *mut c_void,
+                std::ptr::null_mut(),
+                &mut count,
+            ))?
+        };
+        if count == 0 {
+            return Ok(());
+        }
+        let mut nodes: Vec<*mut c_void> = vec![std::ptr::null_mut(); count];
+        unsafe {
+            chk((self.graph_get_nodes)(
+                graph as *mut c_void,
+                nodes.as_mut_ptr(),
+                &mut count,
+            ))?
+        };
+        let dbg = std::env::var_os("SMOLVM_CUDA_GRAPH_DEBUG").is_some();
+        // Diagnostic: rewrite translated pointers to a definitely-unmapped address
+        // instead of the real copy. If the patched exec is what actually runs, the
+        // clone must crash with an illegal access; if it keeps producing the same
+        // garbage without crashing, the patched exec is NOT the one being launched.
+        let poison = std::env::var_os("SMOLVM_CUDA_GRAPH_POISON").is_some();
+        const POISON: u64 = 0x0000_dead_dead_0000;
+        if dbg {
+            eprintln!("[gpatch] graph {graph:#x} exec {exec:#x}: {count} nodes");
+        }
+        let mut type_hist: std::collections::HashMap<c_int, u32> = std::collections::HashMap::new();
+        // Diagnostic: find the MISSED pointer class. Scan every kernel param's raw
+        // bytes (8-aligned) for values that look like device VAs but are NOT in any
+        // trans range. Under full-copy (COPY_ALL=1) every mutable buffer is in trans,
+        // so any hit here is a pointer we fail to translate — keyed by param size to
+        // reveal struct-embedded pointers (size != 8) vs plain missed 8-byte args.
+        const VA_LO: u64 = 0x10_0000_0000; // 64 GiB
+        const VA_HI: u64 = 0x1_0000_0000_0000; // 256 TiB
+        let mut missed_by_size: std::collections::HashMap<usize, u32> =
+            std::collections::HashMap::new();
+        let mut missed_examples: Vec<(usize, u64)> = Vec::new();
+        for &node in nodes.iter().take(count) {
+            let mut ty: c_int = -1;
+            unsafe { chk((self.graph_node_get_type)(node, &mut ty))? };
+            *type_hist.entry(ty).or_insert(0) += 1;
+            match ty {
+                0 => {
+                    // KERNEL node: translate 8-byte pointer args (sized via the
+                    // function's param info; args are stored as pointers-to-values).
+                    let mut kp: KernelNodeParams = unsafe { std::mem::zeroed() };
+                    unsafe { chk((self.graph_kernel_node_get_params)(node, &mut kp))? };
+                    if kp.kernel_params.is_null() {
+                        // Args packed via `extra` (CU_LAUNCH_PARAM_BUFFER_*): an opaque
+                        // blob we don't parse, so we can't translate any device
+                        // pointers inside it. Fail loud rather than launch with the
+                        // golden's addresses (silent cross-clone corruption). opt-350m
+                        // never hits this; a model that does must use enforce_eager.
+                        eprintln!(
+                            "[gpatch] kernel node {:#x} packs args via `extra` (untranslatable); \
+                             refusing to launch this inherited graph in an isolated clone. \
+                             Use enforce_eager for this model.",
+                            kp.func as u64
+                        );
+                        return Err(super::CUDA_ERROR_NOT_SUPPORTED);
+                    }
+                    let sizes = self.func_get_param_info(kp.func as u64)?;
+                    // Copy EVERY arg value (full size, 8-byte-aligned) into our own
+                    // buffer, translating 8-byte pointers, and point the new
+                    // kernelParams entirely into it — never reuse the driver's
+                    // returned arg pointers.
+                    let mut offsets = Vec::with_capacity(sizes.len());
+                    let mut total = 0usize;
+                    for &sz in &sizes {
+                        total = total.next_multiple_of(8);
+                        offsets.push(total);
+                        total += sz as usize;
+                    }
+                    let mut buf = vec![0u8; total.max(8)];
+                    let mut changed = false;
+                    for (i, &sz) in sizes.iter().enumerate() {
+                        let sz = sz as usize;
+                        let argptr = unsafe { *kp.kernel_params.add(i) } as *const u8;
+                        if argptr.is_null() || sz == 0 {
+                            continue;
+                        }
+                        let o = offsets[i];
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(argptr, buf.as_mut_ptr().add(o), sz);
+                        }
+                        // Translate EVERY 8-byte-aligned device pointer embedded in
+                        // this param, not just standalone 8-byte pointer args. vLLM's
+                        // attention/sampling kernels pass large by-value structs (e.g.
+                        // 360 B) that embed many device pointers; those must be
+                        // redirected to the clone's private copies too. A window is
+                        // rewritten only when its value lands inside a known golden
+                        // allocation range (`xlat_range` returns a different address),
+                        // so shared read-only weights and scalar fields are untouched.
+                        let mut w = 0usize;
+                        while w + 8 <= sz {
+                            let v = u64::from_ne_bytes(buf[o + w..o + w + 8].try_into().unwrap());
+                            let t = xlat_range(trans, v);
+                            if t != v {
+                                let nw = if poison { POISON } else { t };
+                                buf[o + w..o + w + 8].copy_from_slice(&nw.to_ne_bytes());
+                                changed = true;
+                            } else if dbg && (VA_LO..VA_HI).contains(&v) {
+                                *missed_by_size.entry(sz).or_insert(0) += 1;
+                                if missed_examples.len() < 12 {
+                                    missed_examples.push((sz, v));
+                                }
+                            }
+                            w += 8;
+                        }
+                    }
+                    if !changed {
+                        continue;
+                    }
+                    let new_ptrs: Vec<*mut c_void> = offsets
+                        .iter()
+                        .map(|&o| unsafe { buf.as_mut_ptr().add(o) } as *mut c_void)
+                        .collect();
+                    let mut kp2 = kp;
+                    kp2.kernel_params = new_ptrs.as_ptr() as *mut *mut c_void;
+                    let rc = unsafe {
+                        (self.graph_exec_kernel_node_set_params)(exec as *mut c_void, node, &kp2)
+                    };
+                    if dbg || rc != 0 {
+                        eprintln!(
+                            "[gpatch] KERNEL func={:#x} nargs={} extra_null={} rc={rc}",
+                            kp.func as u64,
+                            sizes.len(),
+                            kp.extra.is_null()
+                        );
+                    }
+                    chk(rc)?;
+                }
+                2 => {
+                    // MEMSET node: translate the destination.
+                    let mut mp: MemsetNodeParams = unsafe { std::mem::zeroed() };
+                    unsafe { chk((self.graph_memset_node_get_params)(node, &mut mp))? };
+                    let t = xlat_range(trans, mp.dst);
+                    if t != mp.dst {
+                        mp.dst = if poison { POISON } else { t };
+                        let mut ctx: *mut c_void = std::ptr::null_mut();
+                        unsafe { chk((self.ctx_get_current)(&mut ctx))? };
+                        unsafe {
+                            chk((self.graph_exec_memset_node_set_params)(
+                                exec as *mut c_void,
+                                node,
+                                &mp,
+                                ctx,
+                            ))?
+                        };
+                    }
+                }
+                1 => {
+                    // MEMCPY node: translate src/dst device pointers.
+                    let mut cp: Memcpy3D = unsafe { std::mem::zeroed() };
+                    unsafe { chk((self.graph_memcpy_node_get_params)(node, &mut cp))? };
+                    let (ns, nd) = (
+                        xlat_range(trans, cp.src_device),
+                        xlat_range(trans, cp.dst_device),
+                    );
+                    if ns != cp.src_device || nd != cp.dst_device {
+                        cp.src_device = if poison && ns != cp.src_device {
+                            POISON
+                        } else {
+                            ns
+                        };
+                        cp.dst_device = if poison && nd != cp.dst_device {
+                            POISON
+                        } else {
+                            nd
+                        };
+                        let mut ctx: *mut c_void = std::ptr::null_mut();
+                        unsafe { chk((self.ctx_get_current)(&mut ctx))? };
+                        let rc = unsafe {
+                            (self.graph_exec_memcpy_node_set_params)(
+                                exec as *mut c_void,
+                                node,
+                                &cp,
+                                ctx,
+                            )
+                        };
+                        if dbg || rc != 0 {
+                            eprintln!("[gpatch] MEMCPY src->{ns:#x} dst->{nd:#x} rc={rc}");
+                        }
+                        chk(rc)?;
+                    }
+                }
+                // Host(3), empty(5), wait-event(6), event-record(7), ext-sema
+                // signal(8)/wait(9): carry no device pointers we must translate.
+                3 | 5 | 6 | 7 | 8 | 9 => {}
+                // Child-graph(4), mem-alloc(10)/free(11), batch-mem-op(12) and any
+                // future type CAN reference device memory we don't yet translate.
+                // Fail loud rather than replay the golden's addresses (silent
+                // corruption); the clone should fall back to enforce_eager.
+                other => {
+                    eprintln!(
+                        "[gpatch] unsupported graph node type {other} in an isolated clone's \
+                         inherited graph; refusing to launch (would corrupt across clones). \
+                         Use enforce_eager for this model."
+                    );
+                    return Err(super::CUDA_ERROR_NOT_SUPPORTED);
+                }
+            }
+        }
+        if dbg {
+            eprintln!("[gpatch] node types (type:count): {type_hist:?}");
+            if missed_by_size.is_empty() {
+                eprintln!(
+                    "[gpatch] MISSED-CLASS scan: 0 untranslated device-VA values in kernel params"
+                );
+            } else {
+                let mut sizes: Vec<(usize, u32)> = missed_by_size.into_iter().collect();
+                sizes.sort_unstable();
+                eprintln!(
+                    "[gpatch] MISSED-CLASS scan: untranslated device-VA values by param size {sizes:?}; examples (size,val) {:#x?}",
+                    &missed_examples[..missed_examples.len().min(12)]
+                );
+            }
+        }
+        Ok(())
+    }
     fn graph_exec_destroy(&mut self, graph_exec: u64) -> CuResult<()> {
         unsafe { chk((self.graph_exec_destroy)(graph_exec as *mut c_void)) }
     }
@@ -1265,7 +1532,14 @@ impl CudnnBackend {
                 if handle_bearing(ty) {
                     for chunk in elems.chunks_exact_mut(8) {
                         let h = u64::from_le_bytes(chunk.try_into().unwrap());
-                        chunk.copy_from_slice(&vh_resolve(vh, h).to_le_bytes());
+                        // VOID_PTR(6) = device pointer (fork-translate); HANDLE(0)
+                        // / BACKEND_DESCRIPTOR(15) = opaque handle (vh_resolve).
+                        let r = if ty == 6 {
+                            dptr_resolve(h)
+                        } else {
+                            vh_resolve(vh, h)
+                        };
+                        chunk.copy_from_slice(&r.to_le_bytes());
                     }
                 }
                 let st = unsafe { (self.set_attr)(desc, name, ty, count, elems.as_ptr().cast()) };
@@ -1289,7 +1563,12 @@ impl CudnnBackend {
                 if handle_bearing(ty) {
                     for chunk in buf[..seed].chunks_exact_mut(8) {
                         let h = u64::from_le_bytes(chunk.try_into().unwrap());
-                        chunk.copy_from_slice(&vh_resolve(vh, h).to_le_bytes());
+                        let r = if ty == 6 {
+                            dptr_resolve(h)
+                        } else {
+                            vh_resolve(vh, h)
+                        };
+                        chunk.copy_from_slice(&r.to_le_bytes());
                     }
                 }
                 let mut count: i64 = 0;
@@ -1549,18 +1828,21 @@ impl CublasLt {
                 let light = vh_resolve(vh, rd_u64(0)) as *mut c_void;
                 let desc = vh_resolve(vh, rd_u64(8)) as *mut c_void;
                 let alpha = &args[16..32];
-                let a = rd_u64(32) as *mut c_void;
+                // A/B/C/D and the workspace are device pointers — translate them
+                // through the fork-isolation map so a clone's matmul hits its
+                // private copies (untranslated for normal sessions).
+                let a = dptr_resolve(rd_u64(32)) as *mut c_void;
                 let adesc = vh_resolve(vh, rd_u64(40)) as *mut c_void;
-                let b = rd_u64(48) as *mut c_void;
+                let b = dptr_resolve(rd_u64(48)) as *mut c_void;
                 let bdesc = vh_resolve(vh, rd_u64(56)) as *mut c_void;
                 let beta = &args[64..80];
-                let c = rd_u64(80) as *mut c_void;
+                let c = dptr_resolve(rd_u64(80)) as *mut c_void;
                 let cdesc = vh_resolve(vh, rd_u64(88)) as *mut c_void;
-                let dd = rd_u64(96) as *mut c_void;
+                let dd = dptr_resolve(rd_u64(96)) as *mut c_void;
                 let ddesc = vh_resolve(vh, rd_u64(104)) as *mut c_void;
                 let algo = &args[112..176];
                 let algo_present = rd_u64(176) != 0;
-                let workspace = rd_u64(184) as *mut c_void;
+                let workspace = dptr_resolve(rd_u64(184)) as *mut c_void;
                 let ws_size = rd_u64(192) as usize;
                 // Session-minted stream id → real host stream (see stream_resolve).
                 let stream = stream_resolve(streams, rd_u64(200)) as *mut c_void;
@@ -1632,6 +1914,43 @@ fn stream_resolve(map: &std::collections::HashMap<u64, u64>, s: u64) -> u64 {
     } else {
         map.get(&s).copied().unwrap_or(s)
     }
+}
+
+// Fork-isolation pointer translation for forwarded library calls (cuBLAS/cuDNN).
+// The generated `dispatch` reads each DevPtr arg through `dptr_resolve`, so a
+// clone's inherited device pointers hit its private copies — TYPED at the exact
+// arg offset, unlike the byte-scan used for opaque kernel args. Kept in a
+// thread-local (one serve thread per connection) so the generated code needs no
+// extra parameter; `host::dispatch` refreshes it whenever the map changes.
+thread_local! {
+    static LIB_TRANS: std::cell::RefCell<Vec<(u64, u64, u64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Install this connection's `(base, size, copy)` translation ranges for the
+/// generated library dispatch. No-op cost when empty (the common case).
+pub(super) fn set_lib_trans(trans: &[(u64, u64, u64)]) {
+    LIB_TRANS.with(|c| {
+        let mut v = c.borrow_mut();
+        v.clear();
+        v.extend_from_slice(trans);
+    });
+}
+
+/// Translate a device pointer arg of a forwarded library call to the clone's
+/// private copy; untranslated pointers (weights, fresh allocations) pass through.
+pub(super) fn dptr_resolve(p: u64) -> u64 {
+    if p == 0 {
+        return 0;
+    }
+    LIB_TRANS.with(|c| {
+        for &(base, size, copy) in c.borrow().iter() {
+            if p >= base && p < base + size {
+                return copy + (p - base);
+            }
+        }
+        p
+    })
 }
 
 /// Little-endian cursor over a hand-packed argument blob (host side of the
@@ -2072,6 +2391,88 @@ impl Drop for GpuBackend {
             }
         }
     }
+}
+
+/// `CUDA_KERNEL_NODE_PARAMS_v2` — a graph kernel node's launch config (CUDA 12+;
+/// torch captures kernels through the v2 API, so we use v2 get/set with the extra
+/// `kern`/`ctx` tail). We read it to translate a fork clone's inherited pointer
+/// args, then set it on the exec. Fields are read by the driver via FFI.
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+pub struct KernelNodeParams {
+    func: *mut c_void,
+    grid_x: c_uint,
+    grid_y: c_uint,
+    grid_z: c_uint,
+    block_x: c_uint,
+    block_y: c_uint,
+    block_z: c_uint,
+    shared_mem_bytes: c_uint,
+    kernel_params: *mut *mut c_void,
+    extra: *mut *mut c_void,
+    kern: *mut c_void, // v2: CUkernel
+    ctx: *mut c_void,  // v2: CUcontext
+}
+
+/// `CUDA_MEMSET_NODE_PARAMS` — a graph memset node's target + fill.
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+pub struct MemsetNodeParams {
+    dst: u64,
+    pitch: usize,
+    value: c_uint,
+    element_size: c_uint,
+    width: usize,
+    height: usize,
+}
+
+/// `CUDA_MEMCPY3D` — a graph memcpy node's descriptor. We translate the src/dst
+/// device pointers; host-memory copies leave those 0 (pass through).
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+pub struct Memcpy3D {
+    src_x: usize,
+    src_y: usize,
+    src_z: usize,
+    src_lod: usize,
+    src_mem_type: c_uint,
+    src_host: *const c_void,
+    src_device: u64,
+    src_array: *mut c_void,
+    reserved0: *mut c_void,
+    src_pitch: usize,
+    src_height: usize,
+    dst_x: usize,
+    dst_y: usize,
+    dst_z: usize,
+    dst_lod: usize,
+    dst_mem_type: c_uint,
+    dst_host: *mut c_void,
+    dst_device: u64,
+    dst_array: *mut c_void,
+    reserved1: *mut c_void,
+    dst_pitch: usize,
+    dst_height: usize,
+    width: usize,
+    height: usize,
+    depth: usize,
+}
+
+/// Translate a device pointer through a clone's `(base, size, copy)` ranges
+/// (mirrors `host::xlat`); untranslated pointers pass through.
+fn xlat_range(trans: &[(u64, u64, u64)], p: u64) -> u64 {
+    if p == 0 {
+        return p;
+    }
+    for &(base, size, copy) in trans {
+        if p >= base && p < base + size {
+            return copy + (p - base);
+        }
+    }
+    p
 }
 
 /// `CUmemAllocationProp` prefix we populate: pinned device memory on one

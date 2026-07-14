@@ -85,31 +85,72 @@ pub fn run(sock: &Path) -> io::Result<()> {
     let listener = UdsListener::bind(sock)?;
     tracing::info!(socket = %sock.display(), "shared CUDA daemon listening");
     let active = Arc::new(AtomicUsize::new(0));
-    if let Some(timeout) = idle_timeout() {
-        spawn_idle_watchdog(active.clone(), timeout);
-    }
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                // Count the connection open for the whole serve loop so a frozen
-                // golden (idle but connected) keeps the daemon alive for its
-                // clones. The RAII guard balances the count even if spawn fails.
-                let guard = ConnGuard::new(&active);
+    // Optional network transport (P1): also accept CUDA-RPC over TCP so a remote,
+    // GPU-less client (e.g. a Mac running the shim with SMOLVM_CUDA_RPC=tcp:HOST:PORT)
+    // can drive this GPU. Trusted single-tenant only — NO TLS/auth yet; that is the
+    // hosted-service layer, intentionally deferred. Bind e.g. `0.0.0.0:7001`.
+    let tcp_addr = std::env::var("SMOLVM_CUDA_DAEMON_TCP").ok();
+    if let Some(ref addr) = tcp_addr {
+        match std::net::TcpListener::bind(addr) {
+            Ok(tcp) => {
+                tracing::info!(%addr, "CUDA daemon ALSO listening on TCP (network transport)");
+                let active_tcp = active.clone();
                 thread::Builder::new()
-                    .name("cuda-daemon-conn".into())
+                    .name("cuda-daemon-tcp".into())
                     .spawn(move || {
-                        let _guard = guard;
-                        let mut backend = make_backend();
-                        if let Err(e) = serve(stream, backend.as_mut()) {
-                            tracing::debug!(error = %e, "CUDA daemon connection ended");
+                        for stream in tcp.incoming() {
+                            match stream {
+                                Ok(s) => {
+                                    let _ = s.set_nodelay(true); // low-latency RPC
+                                    spawn_serve(s, &active_tcp);
+                                }
+                                Err(e) => {
+                                    tracing::debug!(error = %e, "CUDA daemon TCP accept error")
+                                }
+                            }
                         }
                     })
                     .ok();
             }
+            Err(e) => tracing::warn!(%addr, error = %e, "CUDA daemon TCP bind failed"),
+        }
+    }
+    // A network daemon should persist even with no client yet, so only run the
+    // idle watchdog when there is no TCP listener holding the door open.
+    if tcp_addr.is_none() {
+        if let Some(timeout) = idle_timeout() {
+            spawn_idle_watchdog(active.clone(), timeout);
+        }
+    }
+    for stream in listener.incoming() {
+        match stream {
+            // Count the connection open for the whole serve loop so a frozen golden
+            // (idle but connected) keeps the daemon alive for its clones.
+            Ok(stream) => spawn_serve(stream, &active),
             Err(e) => tracing::debug!(error = %e, "CUDA daemon accept error"),
         }
     }
     Ok(())
+}
+
+/// Serve one accepted connection on its own thread with a fresh backend, counting
+/// it against `active` for the idle watchdog. Generic over the stream type so the
+/// local UDS listener and the optional TCP listener share one path.
+fn spawn_serve<S>(stream: S, active: &Arc<AtomicUsize>)
+where
+    S: std::io::Read + std::io::Write + Send + 'static,
+{
+    let guard = ConnGuard::new(active);
+    thread::Builder::new()
+        .name("cuda-daemon-conn".into())
+        .spawn(move || {
+            let _guard = guard;
+            let mut backend = make_backend();
+            if let Err(e) = serve(stream, backend.as_mut()) {
+                tracing::debug!(error = %e, "CUDA daemon connection ended");
+            }
+        })
+        .ok();
 }
 
 /// Keeps the daemon's open-connection count accurate: +1 on construction, -1 on
@@ -158,11 +199,22 @@ pub fn ensure_running() -> io::Result<PathBuf> {
     let _ = std::fs::remove_file(&sock); // stale node from a dead daemon
     use std::os::unix::process::CommandExt;
     let exe = std::env::current_exe()?;
+    // Dev diagnostic: SMOLVM_CUDA_DAEMON_STDERR=<path> captures the daemon's
+    // stderr (fork-isolation traces, backend selection) instead of dropping it.
+    let stderr = match std::env::var_os("SMOLVM_CUDA_DAEMON_STDERR") {
+        Some(p) => std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&p)
+            .map(Stdio::from)
+            .unwrap_or_else(|_| Stdio::null()),
+        None => Stdio::null(),
+    };
     Command::new(exe)
         .args(["_cuda-daemon", &sock.to_string_lossy()])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(stderr)
         // Own process group so the daemon outlives the VM that first spawned it.
         .process_group(0)
         .spawn()?;
