@@ -41,6 +41,23 @@ sha256sums_aarch64=(
     'f3e339635359b29cb60407e5d7deac3d4199870d8af2034c37c74f0f1c5530e8'
 )
 
+# makepkg extracts with bsdtar (libarchive), which desyncs on the fully-sparse
+# storage-template.ext4 in the arm64 tarball and silently drops every later
+# member — including the smolvm wrapper — so package()'s `sed ... smolvm` fails.
+# GNU tar handles the sparse member correctly, so skip makepkg's auto-extract
+# and unpack the arch tarball ourselves in prepare().
+noextract=(
+    "$pkgname-$pkgver-linux-x86_64.tar.gz"
+    "$pkgname-$pkgver-linux-arm64.tar.gz"
+)
+
+prepare() {
+    case "$CARCH" in
+        x86_64)  tar -xf "$pkgname-$pkgver-linux-x86_64.tar.gz" ;;
+        aarch64) tar -xf "$pkgname-$pkgver-linux-arm64.tar.gz" ;;
+    esac
+}
+
 package() {
     case "$CARCH" in
         x86_64)  _dir="$pkgname-$pkgver-linux-x86_64" ;;
