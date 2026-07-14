@@ -312,6 +312,14 @@ struct Session {
     /// [`DPTR_HANDOFF`] so a fork clone in isolation mode can enumerate the
     /// parent's buffers and give itself private copies. Mirrors `owned_dptrs`.
     alloc_table: std::sync::Arc<std::sync::Mutex<HashMap<u64, (u64, bool)>>>,
+    /// This session's live VMM-mapped ranges (mapped-va → size), shared via
+    /// [`VMM_HANDOFF`] so a fork clone copies them privately. Torch's default
+    /// `expandable_segments` allocator serves the whole pool from VMM
+    /// (`cuMemCreate`/`cuMemMap`), whose memory never lands in `alloc_table` —
+    /// without this the fork misses the entire model (0 copies). Always copied,
+    /// never shared: an expandable segment mixes weights and activations, so it
+    /// can't be shared read-only like a discrete weight buffer.
+    vmm_ranges: std::sync::Arc<VmmRanges>,
     /// Fork-isolation pointer map: `(parent_base, size, private_copy_base)`.
     /// Empty unless this session is an isolating clone. Every inherited dptr the
     /// guest sends is rewritten through these ranges to the clone's own copy, so
@@ -522,6 +530,9 @@ fn graph_inplace_enabled() -> bool {
 /// inference, so clones SHARE them (M4) instead of each copying gigabytes of
 /// weights; only the un-loaded buffers (KV cache, activations) get private copies.
 type AllocTable = std::sync::Mutex<HashMap<u64, (u64, bool)>>;
+/// VMM-mapped ranges (mapped-va → size), handed off to fork clones. Parallels
+/// [`AllocTable`] but for the CUDA VMM path (see [`Session::vmm_ranges`]).
+type VmmRanges = std::sync::Mutex<HashMap<u64, u64>>;
 static DPTR_HANDOFF: std::sync::Mutex<Option<HashMap<u64, std::sync::Weak<AllocTable>>>> =
     std::sync::Mutex::new(None);
 
@@ -536,12 +547,52 @@ fn dptr_handoff_register(table: &std::sync::Arc<AllocTable>, my_token: u64) {
 /// if that lineage is gone.
 fn dptr_handoff_snapshot(token: u64) -> Option<Vec<(u64, u64, bool)>> {
     let reg = DPTR_HANDOFF.lock().unwrap();
+    if std::env::var_os("SMOLVM_CUDA_FORK_DEBUG").is_some() {
+        // Show which tokens hold how many live allocations — reveals whether the
+        // weight-bearing session's token differs from the one the clone resumes.
+        let dump: Vec<(u64, usize)> = reg
+            .as_ref()
+            .map(|m| {
+                m.iter()
+                    .map(|(&t, w)| (t, w.upgrade().map(|a| a.lock().unwrap().len()).unwrap_or(0)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        eprintln!("[fork-debug] snapshot(token={token}) registry tokens->allocs = {dump:?}");
+    }
     let table = reg.as_ref()?.get(&token)?.upgrade()?;
     let snap = table
         .lock()
         .unwrap()
         .iter()
         .map(|(&d, &(s, l))| (d, s, l))
+        .collect();
+    Some(snap)
+}
+
+/// Registry of live sessions' VMM-mapped ranges, keyed by lineage token — the
+/// VMM counterpart of [`DPTR_HANDOFF`]. Torch/Unsloth `expandable_segments`
+/// memory lives here (never in `alloc_table`), so a fork clone must copy these
+/// too or it inherits the golden's raw VMM addresses untranslated.
+static VMM_HANDOFF: std::sync::Mutex<Option<HashMap<u64, std::sync::Weak<VmmRanges>>>> =
+    std::sync::Mutex::new(None);
+
+fn vmm_handoff_register(ranges: &std::sync::Arc<VmmRanges>, my_token: u64) {
+    let mut reg = VMM_HANDOFF.lock().unwrap();
+    let reg = reg.get_or_insert_with(HashMap::new);
+    reg.retain(|_, w| w.strong_count() > 0);
+    reg.insert(my_token, std::sync::Arc::downgrade(ranges));
+}
+
+/// Snapshot of `token`'s VMM-mapped `(va, size)` ranges, or `None` if gone.
+fn vmm_handoff_snapshot(token: u64) -> Option<Vec<(u64, u64)>> {
+    let reg = VMM_HANDOFF.lock().unwrap();
+    let ranges = reg.as_ref()?.get(&token)?.upgrade()?;
+    let snap = ranges
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(&v, &s)| (v, s))
         .collect();
     Some(snap)
 }
@@ -1234,6 +1285,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 let token = b.begin_session(resume_token);
                 graph_handoff_register(&sess.graph_vhandles, resume_token, token);
                 dptr_handoff_register(&sess.alloc_table, token);
+                vmm_handoff_register(&sess.vmm_ranges, token);
                 // Isolation-mode clone: defer copying the parent's buffers until
                 // the first PrimaryCtxRetain, when a context is actually current.
                 if resume_token != 0 && fork_isolate_enabled() {
@@ -1294,6 +1346,26 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                         if let Ok(cdptr) = b.mem_alloc(size) {
                             let _ = b.memcpy_dtod(cdptr, gdptr, size);
                             sess.dptr_trans.push((gdptr, size, cdptr));
+                            sess.owned_dptrs.insert(cdptr, size);
+                            sess.alloc_table
+                                .lock()
+                                .unwrap()
+                                .insert(cdptr, (size, false));
+                            copied += 1;
+                            cbytes += size;
+                        }
+                    }
+                }
+                // VMM-mapped ranges (torch's expandable_segments pool) never
+                // enter alloc_table, so copy each privately here — ALWAYS, since
+                // an expandable segment mixes weights + activations and can't be
+                // shared read-only. Without this a clone inherits the golden's
+                // raw VMM addresses untranslated (the 0-copies bug).
+                if let Some(vmm) = vmm_handoff_snapshot(parent) {
+                    for (gva, size) in vmm {
+                        if let Ok(cdptr) = b.mem_alloc(size) {
+                            let _ = b.memcpy_dtod(cdptr, gva, size);
+                            sess.dptr_trans.push((gva, size, cdptr));
                             sess.owned_dptrs.insert(cdptr, size);
                             sess.alloc_table
                                 .lock()
@@ -1819,6 +1891,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             handle,
         } => b.mem_map(va, size, offset, handle).map(|_| {
             sess.owned_vmm_maps.insert(va, size);
+            sess.vmm_ranges.lock().unwrap().insert(va, size);
             Response::Ok
         }),
         Request::MemSetAccess { va, size, device } => {
@@ -1826,6 +1899,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         }
         Request::MemUnmap { va, size } => {
             sess.owned_vmm_maps.remove(&va);
+            sess.vmm_ranges.lock().unwrap().remove(&va);
             b.mem_unmap(va, size).map(|_| Response::Ok)
         }
         Request::MemRelease { handle } => {
