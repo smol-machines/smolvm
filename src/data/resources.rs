@@ -39,6 +39,12 @@ pub struct VmResources {
     /// `None` → use `DEFAULT_GPU_VRAM_MIB`.
     #[serde(default)]
     pub gpu_vram_mib: Option<u32>,
+    /// Remote the guest's CUDA Driver-API calls to the host NVIDIA GPU over vsock
+    /// (distinct from `gpu`, which is Vulkan/virtio-gpu). When set, the launcher
+    /// starts a per-VM CUDA host server and bridges it to the guest's CUDA shims,
+    /// so unmodified CUDA/PyTorch code in the guest runs on the host GPU.
+    #[serde(default)]
+    pub cuda: bool,
     /// Enable Rosetta 2 for x86_64 binary translation on Apple Silicon.
     #[serde(default)]
     pub rosetta: bool,
@@ -120,6 +126,7 @@ impl Default for VmResources {
             network_backend: None,
             gpu: false,
             gpu_vram_mib: None,
+            cuda: false,
             rosetta: false,
             storage_gib: None,
             overlay_gib: None,

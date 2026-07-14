@@ -1266,6 +1266,9 @@ pub fn resource_spec_to_vm_resources(spec: &ResourceSpec, network: bool) -> VmRe
         // inherit the default. Add to ResourceSpec if the API ever
         // needs to expose it.
         gpu_vram_mib: None,
+        // CUDA-over-vsock is exposed via the local CLI/SDK first; add to
+        // ResourceSpec when the cloud transport wires it (mirrors gpu_vram_mib).
+        cuda: false,
         rosetta: false,
         storage_gib: spec.storage_gb,
         overlay_gib: spec.overlay_gb,

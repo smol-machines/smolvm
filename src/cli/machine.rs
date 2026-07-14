@@ -1025,6 +1025,7 @@ impl RunCmd {
             // CLI --gpu wins; Smolfile gpu = true also enables it.
             gpu: self.gpu || params.gpu,
             gpu_vram_mib: self.gpu_vram_mib.or(params.gpu_vram_mib),
+            cuda: self.cuda || params.cuda,
             rosetta: self.rosetta || params.rosetta,
             storage_gib: params.storage_gb,
             overlay_gib: params.overlay_gb,
@@ -2286,6 +2287,7 @@ impl CreateCmd {
             dns: params.dns,
             gpu: params.gpu,
             gpu_vram_mib: params.gpu_vram_mib,
+            cuda: params.cuda,
             rosetta: params.rosetta,
             storage_gib: params.storage_gb,
             overlay_gib: params.overlay_gb,

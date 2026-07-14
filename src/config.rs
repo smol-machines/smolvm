@@ -717,6 +717,7 @@ impl VmRecord {
             network_backend: self.network_backend,
             gpu: self.gpu.unwrap_or(false),
             gpu_vram_mib: self.gpu_vram_mib,
+            cuda: self.cuda,
             rosetta: self.rosetta.unwrap_or(false),
             storage_gib: self.storage_gb,
             overlay_gib: self.overlay_gb,
