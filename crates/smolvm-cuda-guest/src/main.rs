@@ -276,8 +276,20 @@ fn as_bytes(v: &[f32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
 
+/// `--proto-hash`: print the wire fingerprint and exit, before any VM-only work.
+/// Lets `scripts/build-agent-rootfs.sh` stamp the shim's hash into the rootfs
+/// without re-deriving the FNV algorithm, so the host can spot a stale rootfs at
+/// boot (see `internal_boot`) instead of a cryptic `cuInit` failure mid-workload.
+fn print_proto_hash_and_exit() {
+    if std::env::args().any(|a| a == "--proto-hash") {
+        println!("{:016x}", smolvm_cuda::PROTO_HASH);
+        std::process::exit(0);
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn main() {
+    print_proto_hash_and_exit();
     if let Err(e) = run() {
         eprintln!("smolvm-cuda: ERROR: {e}");
         std::process::exit(1);
@@ -286,6 +298,7 @@ fn main() {
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
+    print_proto_hash_and_exit();
     eprintln!("smolvm-cuda-run runs only inside a Linux guest microVM");
     std::process::exit(1);
 }

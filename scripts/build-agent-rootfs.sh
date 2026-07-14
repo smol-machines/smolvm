@@ -321,6 +321,25 @@ if [[ "$NO_BUILD_AGENT" != "1" && "$(uname -s)" == "Linux" && "$(uname -m)" == "
         cp "$PROJECT_ROOT/target/release/libcuda.so" \
             "$OUTPUT_DIR/usr/local/lib/smolvm-cuda/libcuda.so.1"
         echo "Installed CUDA guest shims"
+        # Stamp the shims' wire fingerprint into the rootfs so the host can flag a
+        # stale rootfs at boot (internal_boot's warn_if_stale_cuda_shim) instead of
+        # leaving the user with an opaque cuInit failure. Read it from the guest
+        # runner (built from the same smolvm-cuda source as the shims, so the same
+        # PROTO_HASH); fall back to a quick native build of that same binary.
+        PROTO_HASH=""
+        if [[ -n "${CUDA_GUEST_BINARY:-}" && -x "${CUDA_GUEST_BINARY:-}" ]]; then
+            PROTO_HASH="$("$CUDA_GUEST_BINARY" --proto-hash 2>/dev/null || true)"
+        fi
+        if [[ -z "$PROTO_HASH" ]]; then
+            PROTO_HASH="$(cargo run --release -q -p smolvm-cuda-guest \
+                --manifest-path "$PROJECT_ROOT/Cargo.toml" -- --proto-hash 2>/dev/null || true)"
+        fi
+        if [[ -n "$PROTO_HASH" ]]; then
+            printf '%s\n' "$PROTO_HASH" > "$OUTPUT_DIR/usr/local/lib/smolvm-cuda/proto-hash"
+            echo "Stamped CUDA shim proto-hash: $PROTO_HASH"
+        else
+            echo "Could not determine CUDA proto-hash — rootfs left unstamped (boot check skips)"
+        fi
     else
         echo "CUDA guest shim build failed — rootfs ships without auto-staging"
     fi

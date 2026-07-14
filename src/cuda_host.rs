@@ -17,6 +17,12 @@ use std::path::Path;
 use std::sync::OnceLock;
 use std::thread;
 
+/// The host's CUDA wire fingerprint (see [`smolvm_cuda::PROTO_HASH`]). Re-exported
+/// so smolvm-side callers (e.g. the boot-time stale-rootfs check in
+/// `internal_boot`) can compare it against the shim hash stamped into the agent
+/// rootfs, without taking a direct dependency on the `smolvm-cuda` crate.
+pub use smolvm_cuda::PROTO_HASH;
+
 /// Provider for the guest-RAM regions, each `(gpa_start, host_va, len)`,
 /// installed by the launcher (via `krun_get_guest_ram`) before the VM starts.
 /// Each connection's backend queries it to enable guest-RAM zero-copy

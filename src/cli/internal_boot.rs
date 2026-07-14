@@ -490,6 +490,33 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
     {
         Some(std::path::PathBuf::from(p))
     } else if config.cuda {
+        // Before booting: if the CUDA guest shims baked into this rootfs were
+        // built from different wire source than this host binary, say so now with
+        // the exact fix — otherwise the skew only surfaces as an opaque cuInit
+        // failure deep inside the guest's first real CUDA call. The connect
+        // handshake still hard-rejects a mismatch; this is the early, legible heads-up.
+        fn warn_if_stale_cuda_shim(rootfs: &std::path::Path) {
+            let stamp = rootfs.join("usr/local/lib/smolvm-cuda/proto-hash");
+            let Ok(text) = std::fs::read_to_string(&stamp) else {
+                return; // pre-stamp rootfs (no marker) — handshake still guards it
+            };
+            let Ok(shim) = u64::from_str_radix(text.trim(), 16) else {
+                return; // unrecognized marker — don't second-guess it
+            };
+            if shim != smolvm::cuda_host::PROTO_HASH {
+                let msg = format!(
+                    "CUDA guest shim in the agent rootfs is STALE: rootfs wire hash {:016x} != \
+                     this host {:016x}. The guest's CUDA calls will fail at cuInit. Rebuild the \
+                     rootfs from the same source: scripts/build-agent-rootfs.sh --install",
+                    shim,
+                    smolvm::cuda_host::PROTO_HASH
+                );
+                tracing::warn!("{msg}");
+                eprintln!("[smolvm] WARNING: {msg}");
+            }
+        }
+        warn_if_stale_cuda_shim(&config.rootfs_path);
+
         let path = config
             .vsock_socket
             .parent()
