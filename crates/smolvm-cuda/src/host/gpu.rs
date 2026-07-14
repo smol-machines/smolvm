@@ -993,11 +993,26 @@ impl Backend for GpuBackend {
             ))?
         };
         let dbg = std::env::var_os("SMOLVM_CUDA_GRAPH_DEBUG").is_some();
+        // Diagnostic: rewrite translated pointers to a definitely-unmapped address
+        // instead of the real copy. If the patched exec is what actually runs, the
+        // clone must crash with an illegal access; if it keeps producing the same
+        // garbage without crashing, the patched exec is NOT the one being launched.
+        let poison = std::env::var_os("SMOLVM_CUDA_GRAPH_POISON").is_some();
+        const POISON: u64 = 0x0000_dead_dead_0000;
         if dbg {
             eprintln!("[gpatch] graph {graph:#x} exec {exec:#x}: {count} nodes");
         }
         let mut type_hist: std::collections::HashMap<c_int, u32> = std::collections::HashMap::new();
-        let mut untranslated: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        // Diagnostic: find the MISSED pointer class. Scan every kernel param's raw
+        // bytes (8-aligned) for values that look like device VAs but are NOT in any
+        // trans range. Under full-copy (COPY_ALL=1) every mutable buffer is in trans,
+        // so any hit here is a pointer we fail to translate — keyed by param size to
+        // reveal struct-embedded pointers (size != 8) vs plain missed 8-byte args.
+        const VA_LO: u64 = 0x10_0000_0000; // 64 GiB
+        const VA_HI: u64 = 0x1_0000_0000_0000; // 256 TiB
+        let mut missed_by_size: std::collections::HashMap<usize, u32> =
+            std::collections::HashMap::new();
+        let mut missed_examples: Vec<(usize, u64)> = Vec::new();
         for &node in nodes.iter().take(count) {
             let mut ty: c_int = -1;
             unsafe { chk((self.graph_node_get_type)(node, &mut ty))? };
@@ -1009,7 +1024,18 @@ impl Backend for GpuBackend {
                     let mut kp: KernelNodeParams = unsafe { std::mem::zeroed() };
                     unsafe { chk((self.graph_kernel_node_get_params)(node, &mut kp))? };
                     if kp.kernel_params.is_null() {
-                        continue; // args packed via `extra` — not translated
+                        // Args packed via `extra` (CU_LAUNCH_PARAM_BUFFER_*): an opaque
+                        // blob we don't parse, so we can't translate any device
+                        // pointers inside it. Fail loud rather than launch with the
+                        // golden's addresses (silent cross-clone corruption). opt-350m
+                        // never hits this; a model that does must use enforce_eager.
+                        eprintln!(
+                            "[gpatch] kernel node {:#x} packs args via `extra` (untranslatable); \
+                             refusing to launch this inherited graph in an isolated clone. \
+                             Use enforce_eager for this model.",
+                            kp.func as u64
+                        );
+                        return Err(super::CUDA_ERROR_NOT_SUPPORTED);
                     }
                     let sizes = self.func_get_param_info(kp.func as u64)?;
                     // Copy EVERY arg value (full size, 8-byte-aligned) into our own
@@ -1035,15 +1061,29 @@ impl Backend for GpuBackend {
                         unsafe {
                             std::ptr::copy_nonoverlapping(argptr, buf.as_mut_ptr().add(o), sz);
                         }
-                        if sz == 8 {
-                            let v = u64::from_ne_bytes(buf[o..o + 8].try_into().unwrap());
+                        // Translate EVERY 8-byte-aligned device pointer embedded in
+                        // this param, not just standalone 8-byte pointer args. vLLM's
+                        // attention/sampling kernels pass large by-value structs (e.g.
+                        // 360 B) that embed many device pointers; those must be
+                        // redirected to the clone's private copies too. A window is
+                        // rewritten only when its value lands inside a known golden
+                        // allocation range (`xlat_range` returns a different address),
+                        // so shared read-only weights and scalar fields are untouched.
+                        let mut w = 0usize;
+                        while w + 8 <= sz {
+                            let v = u64::from_ne_bytes(buf[o + w..o + w + 8].try_into().unwrap());
                             let t = xlat_range(trans, v);
                             if t != v {
-                                buf[o..o + 8].copy_from_slice(&t.to_ne_bytes());
+                                let nw = if poison { POISON } else { t };
+                                buf[o + w..o + w + 8].copy_from_slice(&nw.to_ne_bytes());
                                 changed = true;
-                            } else if dbg && v > 0x1000_0000_0000 {
-                                untranslated.insert(v);
+                            } else if dbg && (VA_LO..VA_HI).contains(&v) {
+                                *missed_by_size.entry(sz).or_insert(0) += 1;
+                                if missed_examples.len() < 12 {
+                                    missed_examples.push((sz, v));
+                                }
                             }
+                            w += 8;
                         }
                     }
                     if !changed {
@@ -1074,7 +1114,7 @@ impl Backend for GpuBackend {
                     unsafe { chk((self.graph_memset_node_get_params)(node, &mut mp))? };
                     let t = xlat_range(trans, mp.dst);
                     if t != mp.dst {
-                        mp.dst = t;
+                        mp.dst = if poison { POISON } else { t };
                         let mut ctx: *mut c_void = std::ptr::null_mut();
                         unsafe { chk((self.ctx_get_current)(&mut ctx))? };
                         unsafe {
@@ -1093,8 +1133,8 @@ impl Backend for GpuBackend {
                     unsafe { chk((self.graph_memcpy_node_get_params)(node, &mut cp))? };
                     let (ns, nd) = (xlat_range(trans, cp.src_device), xlat_range(trans, cp.dst_device));
                     if ns != cp.src_device || nd != cp.dst_device {
-                        cp.src_device = ns;
-                        cp.dst_device = nd;
+                        cp.src_device = if poison && ns != cp.src_device { POISON } else { ns };
+                        cp.dst_device = if poison && nd != cp.dst_device { POISON } else { nd };
                         let mut ctx: *mut c_void = std::ptr::null_mut();
                         unsafe { chk((self.ctx_get_current)(&mut ctx))? };
                         let rc = unsafe {
@@ -1106,20 +1146,33 @@ impl Backend for GpuBackend {
                         chk(rc)?;
                     }
                 }
-                _ => {} // host / child-graph / other nodes: no device pointers
+                // Host(3), empty(5), wait-event(6), event-record(7), ext-sema
+                // signal(8)/wait(9): carry no device pointers we must translate.
+                3 | 5 | 6 | 7 | 8 | 9 => {}
+                // Child-graph(4), mem-alloc(10)/free(11), batch-mem-op(12) and any
+                // future type CAN reference device memory we don't yet translate.
+                // Fail loud rather than replay the golden's addresses (silent
+                // corruption); the clone should fall back to enforce_eager.
+                other => {
+                    eprintln!(
+                        "[gpatch] unsupported graph node type {other} in an isolated clone's \
+                         inherited graph; refusing to launch (would corrupt across clones). \
+                         Use enforce_eager for this model."
+                    );
+                    return Err(super::CUDA_ERROR_NOT_SUPPORTED);
+                }
             }
         }
         if dbg {
             eprintln!("[gpatch] node types (type:count): {type_hist:?}");
-            if !untranslated.is_empty() {
-                let mut v: Vec<u64> = untranslated.into_iter().collect();
-                v.sort_unstable();
-                let trans_lo = trans.iter().map(|&(b, _, _)| b).min().unwrap_or(0);
-                let trans_hi = trans.iter().map(|&(b, s, _)| b + s).max().unwrap_or(0);
+            if missed_by_size.is_empty() {
+                eprintln!("[gpatch] MISSED-CLASS scan: 0 untranslated device-VA values in kernel params");
+            } else {
+                let mut sizes: Vec<(usize, u32)> = missed_by_size.into_iter().collect();
+                sizes.sort_unstable();
                 eprintln!(
-                    "[gpatch] {} UNTRANSLATED ptr(s), e.g. {:#x?}; trans span [{trans_lo:#x},{trans_hi:#x})",
-                    v.len(),
-                    &v[..v.len().min(8)]
+                    "[gpatch] MISSED-CLASS scan: untranslated device-VA values by param size {sizes:?}; examples (size,val) {:#x?}",
+                    &missed_examples[..missed_examples.len().min(12)]
                 );
             }
         }

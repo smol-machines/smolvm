@@ -452,14 +452,19 @@ fn fork_isolate_enabled() -> bool {
     std::env::var_os("SMOLVM_CUDA_FORK_ISOLATE").is_some()
 }
 
-/// Experimental (`SMOLVM_CUDA_FORK_GRAPH_PATCH=1`): let an isolating clone launch
-/// an INHERITED cudagraph by re-instantiating it and translating its node
-/// pointers (Path 2). Incomplete — it patches kernel/memset/memcpy node pointers
-/// but does NOT yet copy allocations made through the graph capture mempool / VMM
-/// path, so graph output can still be wrong. Off by default: graph mode fails
-/// loud rather than risk silent corruption.
+/// Let an isolating clone launch an INHERITED cudagraph by re-instantiating it and
+/// translating its node pointers to the clone's private copies (Path 2). ON by
+/// default: `graph_exec_patch` now translates device pointers embedded in by-value
+/// kernel-arg structs (vLLM's attention/sampling kernels), not just standalone
+/// 8-byte args, so graph-mode isolation is correct (verified: opt-350m, shared
+/// weights, two concurrent clones on different prompts, all token-exact). Opt out
+/// with `SMOLVM_CUDA_FORK_GRAPH_PATCH=0` to fall back to fail-loud (e.g. to bisect a
+/// suspected regression).
 fn graph_patch_enabled() -> bool {
-    std::env::var_os("SMOLVM_CUDA_FORK_GRAPH_PATCH").is_some()
+    !matches!(
+        std::env::var("SMOLVM_CUDA_FORK_GRAPH_PATCH").as_deref(),
+        Ok("0")
+    )
 }
 
 /// Diagnostic: patch the golden's exec IN PLACE instead of re-instantiating, to
@@ -1234,14 +1239,31 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                      ({cbytes} B), {shared} shared read-only ({sbytes} B)"
                 );
                 if std::env::var_os("SMOLVM_CUDA_GRAPH_DEBUG").is_some() {
-                    let mut cs: Vec<u64> = sess.dptr_trans.iter().map(|&(_, s, _)| s).collect();
-                    let mut ss: Vec<u64> = sess.shared_ranges.iter().map(|&(_, s)| s).collect();
-                    cs.sort_unstable_by(|a, b| b.cmp(a));
-                    ss.sort_unstable_by(|a, b| b.cmp(a));
+                    // Scan the copied buffers for 8-byte values that fall inside a
+                    // golden allocation range: those are DEVICE-STORED POINTERS that
+                    // node-arg translation can't reach. fp16/fp32 data almost never
+                    // forms a 0x7f..-class address, so any hits are real.
+                    let mut ranges: Vec<(u64, u64)> =
+                        sess.dptr_trans.iter().map(|&(b, s, _)| (b, b + s)).collect();
+                    ranges.extend(sess.shared_ranges.iter().map(|&(b, s)| (b, b + s)));
+                    let copies: Vec<(u64, u64)> =
+                        sess.dptr_trans.iter().map(|&(_, s, c)| (c, s)).collect();
+                    let (mut found, mut sample) = (0u64, Vec::new());
+                    for (cptr, size) in copies {
+                        if let Ok(bytes) = b.memcpy_dtoh(cptr, size, 0) {
+                            for ch in bytes.chunks_exact(8) {
+                                let v = u64::from_ne_bytes(ch.try_into().unwrap());
+                                if ranges.iter().any(|&(lo, hi)| v >= lo && v < hi) {
+                                    found += 1;
+                                    if sample.len() < 6 {
+                                        sample.push(v);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     eprintln!(
-                        "[cuda-fork-isolate] top COPIED sizes: {:?}; top SHARED sizes: {:?}",
-                        &cs[..cs.len().min(6)],
-                        &ss[..ss.len().min(6)]
+                        "[cuda-fork-isolate] DEVICE-STORED golden pointers in copies: {found} (e.g. {sample:#x?})"
                     );
                 }
             }
@@ -1405,12 +1427,12 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             let inherited_isolated =
                 !sess.dptr_trans.is_empty() && !sess.owned_graph_reals.contains(&real);
             if inherited_isolated && !graph_patch_enabled() {
-                // Default: fail loud rather than silently corrupt. The Path 2
-                // graph-node-patch path (below) is experimental + incomplete.
+                // Only when explicitly disabled (SMOLVM_CUDA_FORK_GRAPH_PATCH=0):
+                // fail loud rather than launch an inherited graph verbatim.
                 eprintln!(
-                    "[cuda-fork-isolate] refusing to launch an inherited CUDA graph in an \
-                     isolated clone. Run with enforce_eager, or set \
-                     SMOLVM_CUDA_FORK_GRAPH_PATCH=1 for the experimental graph-patch path."
+                    "[cuda-fork-isolate] graph patch disabled (SMOLVM_CUDA_FORK_GRAPH_PATCH=0); \
+                     refusing to launch an inherited CUDA graph in an isolated clone. \
+                     Unset the var to use the graph-patch path, or run with enforce_eager."
                 );
                 return Err(CUDA_ERROR_NOT_SUPPORTED);
             }
@@ -1425,8 +1447,9 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 let raw = raw_stream(sess, stream)?;
                 return b.graph_launch(real, raw).map(|_| Response::Ok);
             }
-            // Path 2 (experimental): re-instantiate the template and translate its
-            // node pointers to this clone's private copies.
+            // Path 2: re-instantiate the template and translate its node pointers
+            // (including those embedded in by-value kernel-arg structs) to this
+            // clone's private copies.
             let launch = if inherited_isolated {
                 match sess.clone_graph_execs.get(&real).copied() {
                     Some(patched) => patched,
