@@ -1992,6 +1992,7 @@ mod tests {
             ports: vec![],
             network: false,
             gpu: false,
+            docker_socket: false,
             storage_gb: None,
             overlay_gb: None,
             allowed_cidrs: None,
