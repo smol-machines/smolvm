@@ -667,6 +667,7 @@ pub async fn create_machine(
             None => RestartConfig::default(),
         },
         network,
+        docker_socket: req.docker_socket,
         image,
         source_smolmachine,
         entrypoint,

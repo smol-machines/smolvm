@@ -459,6 +459,11 @@ pub struct CreateMachineRequest {
     /// Enable GPU acceleration (Vulkan via virtio-gpu).
     #[serde(default)]
     pub gpu: bool,
+    /// Expose the guest's Docker daemon socket to the host as a Unix socket in
+    /// the VM data dir, so a host client can drive it with `DOCKER_HOST=unix://…`.
+    /// Off by default.
+    #[serde(default)]
+    pub docker_socket: bool,
     /// Storage disk size in GiB (default: 20).
     #[serde(default)]
     pub storage_gb: Option<u64>,
