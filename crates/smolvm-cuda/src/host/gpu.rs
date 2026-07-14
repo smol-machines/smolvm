@@ -137,6 +137,12 @@ pub struct GpuBackend {
     vmm_unmap: Option<unsafe extern "C" fn(u64, usize) -> CuResultCode>,
     vmm_release: Option<unsafe extern "C" fn(u64) -> CuResultCode>,
     vmm_address_free: Option<unsafe extern "C" fn(u64, usize) -> CuResultCode>,
+    // IPC (Path 3 address-preserving isolation): export a physical handle to a
+    // POSIX fd (golden) and import it back (clone), so a clone process shares the
+    // golden's weight physical at the golden's VA. `cuMemExportToShareableHandle`
+    // / `cuMemImportFromShareableHandle`.
+    vmm_export: Option<unsafe extern "C" fn(*mut c_int, u64, c_int, u64) -> CuResultCode>,
+    vmm_import: Option<unsafe extern "C" fn(*mut u64, *mut c_void, c_int) -> CuResultCode>,
     vmm_granularity:
         Option<unsafe extern "C" fn(*mut usize, *const VmmProp, c_uint) -> CuResultCode>,
     event_query: unsafe extern "C" fn(*mut c_void) -> CuResultCode,
@@ -430,6 +436,8 @@ impl GpuBackend {
                 vmm_unmap: sym(&lib, b"cuMemUnmap\0").ok(),
                 vmm_release: sym(&lib, b"cuMemRelease\0").ok(),
                 vmm_address_free: sym(&lib, b"cuMemAddressFree\0").ok(),
+                vmm_export: sym(&lib, b"cuMemExportToShareableHandle\0").ok(),
+                vmm_import: sym(&lib, b"cuMemImportFromShareableHandle\0").ok(),
                 vmm_granularity: sym(&lib, b"cuMemGetAllocationGranularity\0").ok(),
                 event_query: sym(&lib, b"cuEventQuery\0")?,
                 event_create: sym(&lib, b"cuEventCreate\0")?,
@@ -761,6 +769,42 @@ impl Backend for GpuBackend {
             .vmm_address_free
             .ok_or(super::CUDA_ERROR_NOT_SUPPORTED)?;
         unsafe { chk(f(va, size as usize)) }
+    }
+    // ---- Path 3 address-preserving isolation primitives ----
+    /// Reserve a VA at a FIXED address (`cuMemAddressReserve` addr hint), so a
+    /// clone process can place memory at the golden's exact virtual address.
+    fn mem_address_reserve_fixed(&mut self, size: u64, align: u64, fixed: u64) -> CuResult<u64> {
+        let f = self
+            .vmm_address_reserve
+            .ok_or(super::CUDA_ERROR_NOT_SUPPORTED)?;
+        let mut va = 0u64;
+        unsafe { chk(f(&mut va, size as usize, align as usize, fixed, 0))? };
+        Ok(va)
+    }
+    /// `cuMemCreate` with POSIX-fd handle type requested, so the physical can be
+    /// IPC-exported to a clone process.
+    fn mem_create_exportable(&mut self, size: u64, device: i32) -> CuResult<u64> {
+        let f = self.vmm_create.ok_or(super::CUDA_ERROR_NOT_SUPPORTED)?;
+        let mut prop = vmm_prop(device);
+        prop.requested_handle_types = 1; // CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+        let mut h = 0u64;
+        unsafe { chk(f(&mut h, size as usize, &prop, 0))? };
+        Ok(h)
+    }
+    /// Export a physical handle to a POSIX fd (`cuMemExportToShareableHandle`).
+    fn mem_export_handle(&mut self, handle: u64) -> CuResult<i32> {
+        let f = self.vmm_export.ok_or(super::CUDA_ERROR_NOT_SUPPORTED)?;
+        let mut fd: c_int = -1;
+        unsafe { chk(f(&mut fd, handle, 1, 0))? }; // 1 = POSIX_FILE_DESCRIPTOR
+        Ok(fd as i32)
+    }
+    /// Import a physical handle from a POSIX fd (`cuMemImportFromShareableHandle`).
+    /// The fd's int value is passed as the `osHandle` pointer, per the CUDA ABI.
+    fn mem_import_handle(&mut self, fd: i32) -> CuResult<u64> {
+        let f = self.vmm_import.ok_or(super::CUDA_ERROR_NOT_SUPPORTED)?;
+        let mut h = 0u64;
+        unsafe { chk(f(&mut h, fd as usize as *mut c_void, 1))? };
+        Ok(h)
     }
     fn mem_get_allocation_granularity(&mut self, device: i32, flags: u32) -> CuResult<u64> {
         let f = self

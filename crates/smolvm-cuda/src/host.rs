@@ -271,6 +271,19 @@ pub trait Backend: Send {
     fn mem_get_allocation_granularity(&mut self, _device: i32, _flags: u32) -> CuResult<u64> {
         Err(CUDA_ERROR_NOT_SUPPORTED)
     }
+    // Path 3 address-preserving isolation primitives. Defaults: unsupported.
+    fn mem_address_reserve_fixed(&mut self, _size: u64, _align: u64, _fixed: u64) -> CuResult<u64> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
+    fn mem_create_exportable(&mut self, _size: u64, _device: i32) -> CuResult<u64> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
+    fn mem_export_handle(&mut self, _handle: u64) -> CuResult<i32> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
+    fn mem_import_handle(&mut self, _fd: i32) -> CuResult<u64> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
 }
 
 /// Per-connection opaque→raw handle translation. Ids are dense and monotonic so
