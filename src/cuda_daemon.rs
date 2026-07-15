@@ -234,19 +234,22 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
             tracing::warn!(e, "clone-worker: sync after memory reconstruction failed");
         }
     }
-    // M3a: reload the golden's modules + re-resolve its functions in OUR context,
-    // and install the golden→worker handle translation so the clone's inherited
-    // kernel launches (raw CUfunction from the golden's context) resolve correctly.
+    // M3a: STAGE the golden's modules/functions for LAZY reload in OUR context
+    // (reloading all up front stalls serving ~2s and breaks the clone connection)
+    // + recreate streams/events, then install the translation so the clone's
+    // inherited kernel launches resolve (each module reloads on first use).
     if let Ok(modpath) = std::env::var("SMOLVM_CUDA_CLONE_MODULES") {
-        let (funcs, mods, streams, events) = reconstruct_golden_modules(backend.as_mut(), &modpath);
-        let (nf, ns, ne) = (funcs.len(), streams.len(), events.len());
-        smolvm_cuda::host::set_handle_trans(funcs, mods, streams, events);
+        let (mod_images, func_meta, streams, events) =
+            reconstruct_golden_modules(backend.as_mut(), &modpath);
+        let (nm, nf, ns, ne) = (mod_images.len(), func_meta.len(), streams.len(), events.len());
+        smolvm_cuda::host::set_handle_trans(mod_images, func_meta, streams, events);
         let _ = std::fs::remove_file(&modpath);
         tracing::info!(
+            modules = nm,
             functions = nf,
             streams = ns,
             events = ne,
-            "cuda clone-worker: reloaded golden modules + remapped handles"
+            "cuda clone-worker: staged modules for lazy reload + remapped handles"
         );
     }
     // SAFETY: the daemon handed us sole ownership of the accepted connection fd.
@@ -341,33 +344,36 @@ fn reconstruct_golden_memory(b: &mut dyn Backend, layout: &str) -> usize {
     count
 }
 
-/// M3a: reload the golden's modules + re-resolve its functions in THIS worker's
-/// context, returning golden→worker handle maps `(functions, modules)`. Reads the
-/// binary blob the daemon wrote (path in `SMOLVM_CUDA_CLONE_MODULES`):
-/// `[u32 nmods]( [u64 handle][u32 len][image] )* [u32 nfuncs]( [u64 fn][u64 mod][u32 len][name] )*`.
+/// M3a: parse the golden's module IMAGES + function METADATA (for LAZY reload in
+/// THIS worker at first use — reloading ~400 modules up front stalls the clone
+/// ~2s and breaks its connection) and RECREATE its streams/events now (few,
+/// cheap). Returns `(mod_images, func_meta, streams, events)`. Reads the blob the
+/// daemon wrote (path in `SMOLVM_CUDA_CLONE_MODULES`):
+/// `[u32 nmods]([u64 h][u32 len][image])* [u32 nfuncs]([u64 fn][u64 mod][u32 len][name])*
+///  [u32 nstreams]([u64 h][u32 flags])* [u32 nevents]([u64 h][u32 flags])*`.
 #[cfg(unix)]
 #[allow(clippy::type_complexity)]
 fn reconstruct_golden_modules(
     b: &mut dyn Backend,
     path: &str,
 ) -> (
-    Vec<(u64, u64)>,
-    Vec<(u64, u64)>,
+    Vec<(u64, Vec<u8>)>,
+    Vec<(u64, u64, String)>,
     Vec<(u64, u64)>,
     Vec<(u64, u64)>,
 ) {
-    let mut func_trans = Vec::new();
-    let mut mod_trans = Vec::new();
+    let mut mod_images = Vec::new();
+    let mut func_meta = Vec::new();
     let mut stream_trans = Vec::new();
     let mut event_trans = Vec::new();
     let Ok(buf) = std::fs::read(path) else {
-        return (func_trans, mod_trans, stream_trans, event_trans);
+        return (mod_images, func_meta, stream_trans, event_trans);
     };
     let mut p = 0usize;
     macro_rules! need {
         ($n:expr) => {
             if p + $n > buf.len() {
-                return (func_trans, mod_trans, stream_trans, event_trans);
+                return (mod_images, func_meta, stream_trans, event_trans);
             }
         };
     }
@@ -387,28 +393,16 @@ fn reconstruct_golden_modules(
             v
         }};
     }
-    let mut g2w: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    // Modules: just STAGE the images (reloaded lazily on first use in the worker).
     let nmods = ru32!();
     for _ in 0..nmods {
         let gh = ru64!();
         let ilen = ru32!() as usize;
         need!(ilen);
-        let img = buf[p..p + ilen].to_vec();
+        mod_images.push((gh, buf[p..p + ilen].to_vec()));
         p += ilen;
-        // Null-terminate: cuModuleLoadData treats a PTX image as a C string, so the
-        // stored bytes need a trailing NUL the raw blob may lack.
-        let mut img = img;
-        if img.last() != Some(&0) {
-            img.push(0);
-        }
-        match b.module_load_data(&img) {
-            Ok(wh) => {
-                g2w.insert(gh, wh);
-                mod_trans.push((gh, wh));
-            }
-            Err(e) => tracing::warn!(e, ilen, "M3a: module reload failed"),
-        }
     }
+    // Functions: stage golden fn → (golden module, name); resolved lazily.
     let nfuncs = ru32!();
     for _ in 0..nfuncs {
         let gf = ru64!();
@@ -417,13 +411,7 @@ fn reconstruct_golden_modules(
         need!(nlen);
         let name = String::from_utf8_lossy(&buf[p..p + nlen]).into_owned();
         p += nlen;
-        match g2w.get(&gm) {
-            Some(&wm) => match b.module_get_function(wm, &name) {
-                Ok(wf) => func_trans.push((gf, wf)),
-                Err(e) => tracing::warn!(name, e, "M3a: re-resolve function failed"),
-            },
-            None => tracing::warn!(gm, "M3a: function's module not reloaded"),
-        }
+        func_meta.push((gf, gm, name));
     }
     // Streams + events: recreate each with its golden create flags in OUR context,
     // mapping the golden's inherited raw handle → our own (same M3a pattern).
@@ -450,13 +438,11 @@ fn reconstruct_golden_modules(
         nfuncs,
         nstreams,
         nevents,
-        mods = mod_trans.len(),
-        funcs = func_trans.len(),
         streams = stream_trans.len(),
         events = event_trans.len(),
-        "M3a: reconstruct_golden_modules"
+        "M3a: staged golden modules/functions for lazy reload + recreated streams/events"
     );
-    (func_trans, mod_trans, stream_trans, event_trans)
+    (mod_images, func_meta, stream_trans, event_trans)
 }
 
 /// Path 3 (M1): peek a just-accepted connection's first message; true iff it's an

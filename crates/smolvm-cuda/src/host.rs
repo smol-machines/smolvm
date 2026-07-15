@@ -691,42 +691,107 @@ pub fn module_handoff_snapshot(
 }
 
 // M3a: per-worker (thread-local) translation of the golden's inherited raw
-// module/function handles → this worker's reloaded ones. Empty (identity) unless
-// a Path-3 clone worker installed it via `set_handle_trans`.
+// module/function handles → this worker's reloaded ones. LAZY: a real model has
+// ~400 modules; reloading them ALL synchronously before serving stalls the clone
+// worker ~2s, and the clone's connection breaks during that silent window. So we
+// hold the source images/metadata here and reload each module (and re-resolve
+// each function) on FIRST USE at the raw_module/raw_fn_h choke points. Empty
+// (identity) unless a Path-3 clone worker installed it via `set_handle_trans`.
 type HandleMap = std::cell::RefCell<HashMap<u64, u64>>;
+type ImageMap = std::cell::RefCell<HashMap<u64, Vec<u8>>>;
+type MetaMap = std::cell::RefCell<HashMap<u64, (u64, String)>>;
 thread_local! {
     static FUNC_TRANS: HandleMap = std::cell::RefCell::new(HashMap::new());
     static MOD_TRANS: HandleMap = std::cell::RefCell::new(HashMap::new());
     static STREAM_TRANS: HandleMap = std::cell::RefCell::new(HashMap::new());
     static EVENT_TRANS: HandleMap = std::cell::RefCell::new(HashMap::new());
+    // Lazy sources: golden module handle → image; golden fn handle → (module, name).
+    static MOD_IMAGES: ImageMap = std::cell::RefCell::new(HashMap::new());
+    static FUNC_META: MetaMap = std::cell::RefCell::new(HashMap::new());
 }
 
-/// Install a clone worker's golden→worker handle maps (functions, modules,
-/// streams, events); each applied at the matching dispatch choke point.
+/// Install a clone worker's golden→worker handle reconstruction. Modules are
+/// reloaded / functions re-resolved LAZILY from `mod_images` / `func_meta` at
+/// first use; streams/events are already-recreated golden→worker maps (eager,
+/// few). Clears any prior worker's caches.
 pub fn set_handle_trans(
-    funcs: Vec<(u64, u64)>,
-    mods: Vec<(u64, u64)>,
+    mod_images: Vec<(u64, Vec<u8>)>,
+    func_meta: Vec<(u64, u64, String)>,
     streams: Vec<(u64, u64)>,
     events: Vec<(u64, u64)>,
 ) {
-    fn put(cell: &'static std::thread::LocalKey<HandleMap>, v: Vec<(u64, u64)>) {
+    fn put_h(cell: &'static std::thread::LocalKey<HandleMap>, v: Vec<(u64, u64)>) {
         cell.with(|m| {
             let mut m = m.borrow_mut();
             m.clear();
             m.extend(v);
         });
     }
-    put(&FUNC_TRANS, funcs);
-    put(&MOD_TRANS, mods);
-    put(&STREAM_TRANS, streams);
-    put(&EVENT_TRANS, events);
+    MOD_TRANS.with(|m| m.borrow_mut().clear());
+    FUNC_TRANS.with(|m| m.borrow_mut().clear());
+    MOD_IMAGES.with(|m| {
+        let mut m = m.borrow_mut();
+        m.clear();
+        m.extend(mod_images);
+    });
+    FUNC_META.with(|m| {
+        let mut m = m.borrow_mut();
+        m.clear();
+        m.extend(func_meta.into_iter().map(|(f, gm, n)| (f, (gm, n))));
+    });
+    put_h(&STREAM_TRANS, streams);
+    put_h(&EVENT_TRANS, events);
 }
 
-fn xlat_func(h: u64) -> u64 {
-    FUNC_TRANS.with(|m| m.borrow().get(&h).copied().unwrap_or(h))
+/// Lazily reload the golden module `golden` in THIS worker's context (once),
+/// caching golden→worker. Identity for a non-clone / unknown handle.
+fn xlat_mod(b: &mut dyn Backend, golden: u64) -> u64 {
+    if let Some(w) = MOD_TRANS.with(|m| m.borrow().get(&golden).copied()) {
+        return w;
+    }
+    let Some(mut image) = MOD_IMAGES.with(|m| m.borrow().get(&golden).cloned()) else {
+        return golden;
+    };
+    // cuModuleLoadData treats a PTX image as a C string; ensure a trailing NUL.
+    if image.last() != Some(&0) {
+        image.push(0);
+    }
+    match b.module_load_data(&image) {
+        Ok(w) => {
+            MOD_TRANS.with(|m| {
+                m.borrow_mut().insert(golden, w);
+            });
+            w
+        }
+        Err(e) => {
+            eprintln!("[M3a-lazy] module reload failed: e={e}");
+            golden
+        }
+    }
 }
-fn xlat_mod(h: u64) -> u64 {
-    MOD_TRANS.with(|m| m.borrow().get(&h).copied().unwrap_or(h))
+
+/// Lazily re-resolve the golden function `golden` (loading its module first if
+/// needed), caching golden→worker. Identity for a non-clone / unknown handle.
+fn xlat_func(b: &mut dyn Backend, golden: u64) -> u64 {
+    if let Some(w) = FUNC_TRANS.with(|m| m.borrow().get(&golden).copied()) {
+        return w;
+    }
+    let Some((gm, name)) = FUNC_META.with(|m| m.borrow().get(&golden).cloned()) else {
+        return golden;
+    };
+    let wm = xlat_mod(b, gm);
+    match b.module_get_function(wm, &name) {
+        Ok(w) => {
+            FUNC_TRANS.with(|m| {
+                m.borrow_mut().insert(golden, w);
+            });
+            w
+        }
+        Err(e) => {
+            eprintln!("[M3a-lazy] function re-resolve failed: name={name} e={e}");
+            golden
+        }
+    }
 }
 fn xlat_stream(h: u64) -> u64 {
     STREAM_TRANS.with(|m| m.borrow().get(&h).copied().unwrap_or(h))
@@ -1376,13 +1441,13 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
     // connection stays valid on another (this is what lets a forked VM clone
     // reconnect and keep using its parent's loaded modules). The tables only
     // translate ids minted by pre-raw guests; a raw value passes through.
-    fn raw_module(sess: &Session, m: u64) -> u64 {
-        // Path 3 (M3a): a clone worker translates the golden's inherited raw module
-        // handle to its own reloaded module; identity otherwise.
-        xlat_mod(sess.modules.get(&m).copied().unwrap_or(m))
+    fn raw_module(sess: &Session, b: &mut dyn Backend, m: u64) -> u64 {
+        // Path 3 (M3a): a clone worker lazily reloads + translates the golden's
+        // inherited raw module handle to its own; identity otherwise.
+        xlat_mod(b, sess.modules.get(&m).copied().unwrap_or(m))
     }
-    fn raw_fn_h(sess: &Session, f: u64) -> u64 {
-        xlat_func(sess.functions.get(&f).copied().unwrap_or(f))
+    fn raw_fn_h(sess: &Session, b: &mut dyn Backend, f: u64) -> u64 {
+        xlat_func(b, sess.functions.get(&f).copied().unwrap_or(f))
     }
     fn raw_graph(sess: &Session, h: u64) -> u64 {
         // Virtual graph/exec handle → real; untagged values pass through.
@@ -1583,7 +1648,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             Ok(Response::Handle(raw))
         }
         Request::ModuleGetFunction { module, name } => {
-            let raw_mod = raw_module(sess, module);
+            let raw_mod = raw_module(sess, b, module);
             // Raw CUfunction on the wire: valid across connections in the shared
             // primary context, so a forked clone keeps its parent's functions.
             let raw_fn = b.module_get_function(raw_mod, &name)?;
@@ -1597,14 +1662,14 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             Ok(Response::Handle(raw_fn))
         }
         Request::ModuleUnload { module } => {
-            let raw_mod = raw_module(sess, module);
+            let raw_mod = raw_module(sess, b, module);
             b.module_unload(raw_mod)?;
             sess.owned_modules.remove(&raw_mod);
             sess.modules.remove(&module);
             Ok(Response::Ok)
         }
         Request::FuncGetParamInfo { function } => {
-            let raw_fn = raw_fn_h(sess, function);
+            let raw_fn = raw_fn_h(sess, b, function);
             let sizes = b.func_get_param_info(raw_fn)?;
             let mut out = Vec::with_capacity(sizes.len() * 4);
             for s in sizes {
@@ -1617,12 +1682,12 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             attrib,
             value,
         } => {
-            let raw_fn = raw_fn_h(sess, function);
+            let raw_fn = raw_fn_h(sess, b, function);
             b.func_set_attribute(raw_fn, attrib, value)
                 .map(|_| Response::Ok)
         }
         Request::FuncGetAttribute { function, attrib } => {
-            let raw_fn = raw_fn_h(sess, function);
+            let raw_fn = raw_fn_h(sess, b, function);
             b.func_get_attribute(raw_fn, attrib).map(Response::Count)
         }
         Request::MemAlloc { bytes } => {
@@ -1675,7 +1740,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             stream,
             params,
         } => {
-            let raw_fn = raw_fn_h(sess, function);
+            let raw_fn = raw_fn_h(sess, b, function);
             let raw_str = raw_stream(sess, stream)?;
             b.launch_kernel(raw_fn, grid, block, shared_bytes, raw_str, &params)
                 .map(|_| Response::Ok)
