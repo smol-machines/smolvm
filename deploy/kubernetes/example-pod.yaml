@@ -1,0 +1,36 @@
+# Minimal end-to-end smoke pod: runs inside a smolvm microVM via the RuntimeClass.
+#
+#   kubectl apply -f example-pod.yaml
+#   kubectl wait --for=condition=Ready pod/smolvm-hello --timeout=120s
+#   kubectl logs smolvm-hello        # -> SMOLVM_K8S_E2E_OK + `uname -a` from the guest
+#   kubectl exec smolvm-hello -- id  # exec into the microVM
+#
+# The `uname` line proves it's a real VM kernel (not the host); the pod is a
+# throwaway per-workload microVM torn down on delete.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: smolvm-hello
+  labels:
+    app: smolvm-hello
+spec:
+  runtimeClassName: smolvm
+  restartPolicy: Never
+  containers:
+    - name: hello
+      image: busybox:1.36
+      command: ["sh", "-c"]
+      args:
+        - |
+          echo "SMOLVM_K8S_E2E_OK"
+          echo "kernel: $(uname -sr)"
+          echo "whoami: $(id)"
+          # keep the pod alive so `kubectl exec` works during the e2e
+          sleep 3600
+      resources:
+        requests:
+          cpu: "250m"
+          memory: "128Mi"
+        limits:
+          cpu: "1"
+          memory: "512Mi"
