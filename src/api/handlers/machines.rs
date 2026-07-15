@@ -23,13 +23,14 @@
 //! Recommended: keep names short and descriptive (e.g., "dev-vm", "test-1").
 
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
     Json,
 };
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::agent::{vm_data_dir, AgentClient, AgentManager, HostMount};
+use crate::agent::{resolve_disk_image, vm_data_dir, AgentClient, AgentManager, HostMount};
 use crate::api::error::ApiError;
 use crate::api::state::{
     vm_resources_to_spec, with_machine_client_traced, ApiState, MachineEntry, MachineRegistration,
@@ -49,6 +50,7 @@ use crate::process::{
     is_alive, is_our_process_strict, process_start_time, stop_vm_process, VM_SIGKILL_TIMEOUT,
     VM_SIGTERM_TIMEOUT,
 };
+use crate::storage::STORAGE_DISK_FILENAME;
 use crate::storage::{expand_disk, DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
 use crate::util::generate_machine_name;
 use crate::Error as SmolvmError;
@@ -1748,6 +1750,167 @@ pub async fn export_machine(
     }))
 }
 
+/// Guard for [`snapshot_machine`]: a machine is snapshottable iff it is
+/// image-based (the container overlay only exists for image machines; bare VMs
+/// persist via their overlay disk) and not currently running (the capture
+/// mounts its ext4 disk, which would corrupt a disk a live VMM holds open).
+/// Pure over the resolved state so the branches are unit-testable.
+fn check_snapshottable(name: &str, record: &VmRecord, state: RecordState) -> Result<(), ApiError> {
+    if record.image.is_none() {
+        return Err(ApiError::BadRequest(
+            "snapshot is only supported for image-based machines".into(),
+        ));
+    }
+    if state == RecordState::Running {
+        return Err(ApiError::Conflict(format!(
+            "machine '{}' must be stopped before snapshot (capture mounts its disk)",
+            name
+        )));
+    }
+    Ok(())
+}
+
+/// Capture a stopped image-machine's container overlay (the filesystem delta
+/// over its base image) and stream it back as a tar archive.
+///
+/// This is the node-side half of cloud machine snapshots (durability + fork):
+/// the control plane calls it through the driver, then uploads the bytes to
+/// object storage. We return ONLY the overlay delta — the base image is
+/// reproducible from the registry, so a snapshot is just the delta plus the
+/// recorded base-image pointer (kept in the control plane's
+/// `machine_snapshots` row).
+///
+/// Mechanism: the overlay's upper dir lives inside the machine's ext4 storage
+/// disk, which `serve` (running unprivileged) cannot host-mount. So we boot a
+/// short-lived helper VM with that disk attached as `/dev/vdc`, mount it inside
+/// the guest, and `tar` the overlay upper dir — the same idiom
+/// `pack create --from-vm` uses, minus the OCI-layer export.
+///
+/// The machine MUST be stopped (409 otherwise): the helper VM mounts the
+/// machine's ext4 disk, and doing that while the machine's own VMM still holds
+/// it open risks filesystem corruption.
+#[utoipa::path(
+    post,
+    path = "/api/v1/machines/{id}/snapshot",
+    tag = "Machines",
+    params(("id" = String, Path, description = "Machine name")),
+    responses(
+        (status = 200, description = "Overlay tar archive", content_type = "application/octet-stream"),
+        (status = 400, description = "Not an image-based machine"),
+        (status = 404, description = "Machine not found"),
+        (status = 409, description = "Machine is running (must be stopped)"),
+        (status = 500, description = "Capture failed")
+    )
+)]
+pub async fn snapshot_machine(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Result<Bytes, ApiError> {
+    let record = state
+        .db()
+        .get_vm(&id)
+        .map_err(ApiError::database)?
+        .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", id)))?;
+
+    // `actual_state()` probes liveness, so a machine the DB thinks is stopped
+    // but whose process is still alive is correctly rejected below.
+    check_snapshottable(&id, &record, record.actual_state())?;
+
+    let name = id.clone();
+    let tar = tokio::task::spawn_blocking(move || capture_overlay_blocking(&name))
+        .await
+        .map_err(|e| ApiError::internal(format!("snapshot task failed: {}", e)))??;
+
+    Ok(Bytes::from(tar))
+}
+
+/// Capture a stopped image-machine's container overlay as a tar. Thin wrapper
+/// over the shared [`crate::agent::capture_overlay_tar`] primitive (the same one
+/// `pack create --from-vm` uses), mapping its error to [`ApiError`]. A
+/// never-modified machine yields a valid empty archive rather than an error.
+fn capture_overlay_blocking(vm_name: &str) -> Result<Vec<u8>, ApiError> {
+    let vm_dir = vm_data_dir(vm_name);
+    let (storage_path, storage_fmt) = resolve_disk_image(&vm_dir, STORAGE_DISK_FILENAME);
+    if !storage_path.exists() {
+        return Err(ApiError::NotFound(format!(
+            "machine '{}' has no storage disk to snapshot",
+            vm_name
+        )));
+    }
+    crate::agent::capture_overlay_tar(vm_name, &storage_path, storage_fmt)
+        .map(|o| o.tar)
+        .map_err(|e| ApiError::internal(format!("capture overlay: {}", e)))
+}
+
+/// Seed a stopped image-machine's container overlay from a snapshot tar (the
+/// inverse of [`snapshot_machine`]).
+///
+/// This is the restore/fork half of cloud machine snapshots: the control plane
+/// downloads a snapshot's overlay bytes from object storage and POSTs them here
+/// to seed the machine's persistent overlay BEFORE its first boot. On the next
+/// start, the agent's overlay setup finds the existing upper layer and remounts
+/// it (preserving the restored state) instead of creating a blank overlay. For
+/// **rehydrate**, the target is a freshly-rescheduled machine; for **fork**, a
+/// brand-new machine with its own identity — both reduce to seeding
+/// `overlays/persistent-{id}/upper`.
+///
+/// Same constraints as snapshot: image-based (400 for bare) and stopped (409),
+/// since the helper VM mounts the machine's ext4 disk read-write.
+#[utoipa::path(
+    post,
+    path = "/api/v1/machines/{id}/restore",
+    tag = "Machines",
+    request_body(content = Vec<u8>, description = "Overlay tar archive", content_type = "application/octet-stream"),
+    params(("id" = String, Path, description = "Machine name")),
+    responses(
+        (status = 200, description = "Overlay restored"),
+        (status = 400, description = "Not an image-based machine"),
+        (status = 404, description = "Machine not found"),
+        (status = 409, description = "Machine is running (must be stopped)"),
+        (status = 500, description = "Restore failed")
+    )
+)]
+pub async fn restore_machine(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let record = state
+        .db()
+        .get_vm(&id)
+        .map_err(ApiError::database)?
+        .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", id)))?;
+
+    check_snapshottable(&id, &record, record.actual_state())?;
+
+    let name = id.clone();
+    let tar = body.to_vec();
+    let bytes = tar.len() as u64;
+    tokio::task::spawn_blocking(move || apply_overlay_blocking(&name, tar))
+        .await
+        .map_err(|e| ApiError::internal(format!("restore task failed: {}", e)))??;
+
+    Ok(Json(
+        serde_json::json!({ "restored": true, "id": id, "bytes": bytes }),
+    ))
+}
+
+/// Seed the machine's container overlay from a snapshot tar. Thin wrapper over
+/// the shared [`crate::agent::seed_overlay_tar`] primitive (the inverse of
+/// capture), mapping its error to [`ApiError`].
+fn apply_overlay_blocking(vm_name: &str, tar: Vec<u8>) -> Result<(), ApiError> {
+    let vm_dir = vm_data_dir(vm_name);
+    let (storage_path, storage_fmt) = resolve_disk_image(&vm_dir, STORAGE_DISK_FILENAME);
+    if !storage_path.exists() {
+        return Err(ApiError::NotFound(format!(
+            "machine '{}' has no storage disk to restore into",
+            vm_name
+        )));
+    }
+    crate::agent::seed_overlay_tar(vm_name, &storage_path, storage_fmt, &tar)
+        .map_err(|e| ApiError::internal(format!("seed overlay: {}", e)))
+}
+
 async fn pull_from_registry(
     registry_ref: &str,
     identity_token: Option<&str>,
@@ -1867,6 +2030,36 @@ mod tests {
             classify_launch_error("failed to start machine: kernel panic".to_string()),
             ApiError::Internal(_)
         ));
+    }
+
+    #[test]
+    fn check_snapshottable_rejects_bare_vm() {
+        // A bare VM has no container overlay to capture → BadRequest, even when
+        // stopped.
+        let record = VmRecord::new("bare".into(), 2, 1024, vec![], vec![], false);
+        let err = check_snapshottable("bare", &record, RecordState::Stopped).unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    #[test]
+    fn check_snapshottable_rejects_running_image_machine() {
+        // Capturing mounts the machine's ext4 disk, so a running machine must be
+        // refused with a 409 (not silently corrupt the live disk).
+        let mut record = VmRecord::new("img".into(), 2, 1024, vec![], vec![], false);
+        record.image = Some("alpine:3.20".into());
+        let err = check_snapshottable("img", &record, RecordState::Running).unwrap_err();
+        match err {
+            ApiError::Conflict(msg) => assert!(msg.contains("stopped"), "msg: {}", msg),
+            other => panic!("expected Conflict, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn check_snapshottable_accepts_stopped_image_machine() {
+        let mut record = VmRecord::new("img".into(), 2, 1024, vec![], vec![], false);
+        record.image = Some("alpine:3.20".into());
+        assert!(check_snapshottable("img", &record, RecordState::Stopped).is_ok());
+        assert!(check_snapshottable("img", &record, RecordState::Created).is_ok());
     }
 
     #[test]
