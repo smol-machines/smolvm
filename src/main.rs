@@ -53,6 +53,14 @@ enum Commands {
         socket: std::path::PathBuf,
     },
 
+    /// Internal: serve one isolating fork-clone connection in its own process
+    /// (Path 3 per-clone worker; not for direct use)
+    #[command(name = "_cuda-clone-worker", hide = true)]
+    CudaCloneWorker {
+        /// Accepted connection fd handed over by the daemon
+        fd: i32,
+    },
+
     /// Internal: clean up an ephemeral VM after its command exits (not for direct use)
     #[command(name = "_cleanup-ephemeral", hide = true)]
     CleanupEphemeral {
@@ -89,7 +97,7 @@ fn main() {
             .nth(1)
             .as_deref()
             .and_then(|s| s.to_str()),
-        Some("_boot-vm") | Some("_cuda-daemon")
+        Some("_boot-vm") | Some("_cuda-daemon") | Some("_cuda-clone-worker")
     );
     if !internal {
         if let Some(mode) = smolvm_pack::detect_packed_mode() {
@@ -120,6 +128,15 @@ fn main() {
         Commands::CudaDaemon { .. } => Err(smolvm::Error::Io(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "the shared CUDA daemon is unix-only",
+        ))),
+        #[cfg(unix)]
+        Commands::CudaCloneWorker { fd } => {
+            smolvm::cuda_daemon::run_clone_worker(fd).map_err(smolvm::Error::Io)
+        }
+        #[cfg(not(unix))]
+        Commands::CudaCloneWorker { .. } => Err(smolvm::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "the CUDA clone worker is unix-only",
         ))),
         Commands::CleanupEphemeral {
             vm_name,

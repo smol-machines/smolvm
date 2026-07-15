@@ -126,7 +126,29 @@ pub fn run(sock: &Path) -> io::Result<()> {
         match stream {
             // Count the connection open for the whole serve loop so a frozen golden
             // (idle but connected) keeps the daemon alive for its clones.
-            Ok(stream) => spawn_serve(stream, &active),
+            Ok(stream) => {
+                // Path 3 (M1): an isolating fork clone is served in its own worker
+                // PROCESS (own context/UVA) so it can hold memory at the golden's
+                // exact VAs. Only fires under SMOLVM_CUDA_PATH3; otherwise legacy.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::io::AsRawFd;
+                    let fd = stream.as_raw_fd();
+                    if let Some(token) = peek_clone_token(fd) {
+                        match spawn_clone_worker(fd, token) {
+                            Ok(()) => {
+                                tracing::info!(token, "routed isolating clone to a worker process");
+                                drop(stream); // the worker owns the connection now
+                                continue;
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "clone-worker spawn failed; serving in-process");
+                            }
+                        }
+                    }
+                }
+                spawn_serve(stream, &active);
+            }
             Err(e) => tracing::debug!(error = %e, "CUDA daemon accept error"),
         }
     }
@@ -181,6 +203,183 @@ fn make_backend() -> Box<dyn Backend> {
             Box::<CpuBackend>::default()
         }
     }
+}
+
+/// Path 3 (M1): serve one isolating fork-clone connection in THIS separate worker
+/// process. A per-clone process has its own CUDA primary context and thus its own
+/// UVA space, so it can place memory at the golden's exact virtual addresses
+/// (address-preserving isolation — no per-op pointer translation). The daemon
+/// spawns us with the accepted connection's fd (see the clone routing in
+/// `spawn_serve`). M2 (golden-state reconstruction) and M3 (module/graph rebuild)
+/// hook in before the serve loop; establishing the process boundary comes first.
+pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
+    use std::os::unix::io::FromRawFd;
+    let mut backend = make_backend();
+    // Our own primary context (separate process ⇒ own UVA), so we can place memory
+    // at the golden's exact VAs.
+    let _ = backend.init();
+    let _ = backend.primary_ctx_retain(0);
+    // M2: reconstruct the golden's memory at its exact VAs from the layout the
+    // daemon passed (SMOLVM_CUDA_CLONE_LAYOUT) + the golden's physical exported to
+    // fds 4.. — BEFORE serving, so the clone's inherited pointers are valid verbatim.
+    if let Ok(layout) = std::env::var("SMOLVM_CUDA_CLONE_LAYOUT") {
+        let n = reconstruct_golden_memory(backend.as_mut(), &layout);
+        tracing::info!(
+            maps = n,
+            "cuda clone-worker: reconstructed golden memory at its VAs"
+        );
+    }
+    // SAFETY: the daemon handed us sole ownership of the accepted connection fd.
+    let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+    tracing::info!(
+        fd,
+        "cuda clone-worker: serving in its own context / UVA space"
+    );
+    serve(stream, backend.as_mut())
+}
+
+/// M2: rebuild the golden's VMM layout in THIS worker's context at the golden's
+/// EXACT VAs. `layout` = `"resv=va:size,…|maps=va:size:fdidx,…"` (hex); each map's
+/// physical was exported by the daemon to fd `4 + fdidx`. We import + map at the
+/// same VA — address-preserving, so inherited pointers and rebuilt graphs are
+/// valid verbatim. (Weights are shared here; private-mutable copy for full
+/// isolation is the next refinement.)
+#[cfg(unix)]
+fn reconstruct_golden_memory(b: &mut dyn Backend, layout: &str) -> usize {
+    let (mut resv_s, mut maps_s) = ("", "");
+    for part in layout.split('|') {
+        if let Some(r) = part.strip_prefix("resv=") {
+            resv_s = r;
+        }
+        if let Some(m) = part.strip_prefix("maps=") {
+            maps_s = m;
+        }
+    }
+    let hx = |s: &str| u64::from_str_radix(s, 16).ok();
+    for e in resv_s.split(',').filter(|s| !s.is_empty()) {
+        if let Some((va, size)) = e.split_once(':') {
+            if let (Some(va), Some(size)) = (hx(va), hx(size)) {
+                let _ = b.mem_address_reserve_fixed(size, 0, va);
+            }
+        }
+    }
+    let mut count = 0;
+    for e in maps_s.split(',').filter(|s| !s.is_empty()) {
+        let f: Vec<&str> = e.split(':').collect();
+        if f.len() != 3 {
+            continue;
+        }
+        let (Some(va), Some(size), Ok(idx)) = (hx(f[0]), hx(f[1]), f[2].parse::<i32>()) else {
+            continue;
+        };
+        // Private-mutable, address-preserving: map a PRIVATE physical at the golden
+        // VA, then copy the golden's bytes in via a temp mapping of the imported
+        // physical. Reads see the golden's data; writes hit the clone's own copy,
+        // so a clone can't corrupt the frozen golden.
+        let Ok(priv_h) = b.mem_create(size, 0) else {
+            continue;
+        };
+        if b.mem_map(va, size, 0, priv_h).is_err() {
+            continue;
+        }
+        let _ = b.mem_set_access(va, size, 0);
+        if let Ok(gh) = b.mem_import_handle(4 + idx) {
+            if let Ok(tmp) = b.mem_address_reserve(size, 0) {
+                if b.mem_map(tmp, size, 0, gh).is_ok() {
+                    let _ = b.mem_set_access(tmp, size, 0);
+                    let _ = b.memcpy_dtod(va, tmp, size); // golden data → private copy
+                    let _ = b.mem_unmap(tmp, size);
+                }
+                let _ = b.mem_address_free(tmp, size);
+            }
+            let _ = b.mem_release(gh);
+        }
+        count += 1;
+    }
+    count
+}
+
+/// Path 3 (M1): peek a just-accepted connection's first message; true iff it's an
+/// isolating fork-clone Init (`op == Init`, `resume_token != 0`) that should be
+/// served in a dedicated worker process. `MSG_PEEK` leaves the bytes on the
+/// socket so the worker reads them fresh. Gated behind `SMOLVM_CUDA_PATH3` (unset
+/// = legacy shared-context path) so partial Path-3 wiring can't disturb serving.
+#[cfg(unix)]
+fn peek_clone_token(fd: std::os::unix::io::RawFd) -> Option<u64> {
+    if std::env::var_os("SMOLVM_CUDA_PATH3").is_none()
+        || std::env::var_os("SMOLVM_CUDA_FORK_ISOLATE").is_none()
+    {
+        return None;
+    }
+    // framing: [u32 le len][op][proto_hash u64][resume_token u64]
+    let mut buf = [0u8; 21];
+    let n = unsafe {
+        libc::recv(
+            fd,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len(),
+            libc::MSG_PEEK,
+        )
+    };
+    if n < 21 || buf[4] != 0x01 {
+        return None; // short read or not an Init
+    }
+    let token = u64::from_le_bytes(buf[13..21].try_into().unwrap());
+    (token != 0).then_some(token)
+}
+
+/// Path 3 (M1): hand the accepted connection to a fresh worker PROCESS (its own
+/// CUDA context, hence its own UVA — so it can place memory at the golden's exact
+/// VAs). `dup2` the socket fd onto fd 3 in the child (clears CLOEXEC) and exec
+/// `smolvm _cuda-clone-worker 3`; the daemon then drops its own copy.
+#[cfg(unix)]
+fn spawn_clone_worker(conn_fd: std::os::unix::io::RawFd, token: u64) -> io::Result<()> {
+    use std::os::unix::process::CommandExt;
+    // Gather the golden's VMM layout (reservations + maps→physical handle).
+    let (resvs, maps) = smolvm_cuda::host::layout_handoff_snapshot(token)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no golden layout for token"))?;
+    // Export each map's physical to a POSIX fd (in the golden's shared context) and
+    // build the layout string the worker parses ("resv=va:size,…|maps=va:size:fdidx,…").
+    let mut backend = make_backend();
+    backend
+        .init()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("worker-export init: {e}")))?;
+    backend
+        .primary_ctx_retain(0)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("ctx retain: {e}")))?;
+    let mut layout = String::from("resv=");
+    for (va, size) in &resvs {
+        layout.push_str(&format!("{va:x}:{size:x},"));
+    }
+    layout.push_str("|maps=");
+    let mut export_fds: Vec<i32> = Vec::new();
+    for (va, size, handle) in &maps {
+        if let Ok(efd) = backend.mem_export_handle(*handle) {
+            let idx = export_fds.len();
+            export_fds.push(efd);
+            layout.push_str(&format!("{va:x}:{size:x}:{idx},"));
+        }
+    }
+    let exe = std::env::current_exe()?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("_cuda-clone-worker").arg("3");
+    cmd.env("SMOLVM_CUDA_CLONE_LAYOUT", layout);
+    // SAFETY: dup2 in the forked child (async-signal-safe); fds were inherited at
+    // fork. Connection → fd 3; each exported physical → fd 4+idx.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::dup2(conn_fd, 3) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            for (i, efd) in export_fds.iter().enumerate() {
+                if libc::dup2(*efd, 4 + i as i32) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    cmd.spawn().map(|_| ())
 }
 
 /// Ensure the shared daemon is running and return its socket path. Serialized by
