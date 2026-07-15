@@ -1682,7 +1682,7 @@ impl AgentManager {
             // settings win. The daemon reads these at ITS spawn (inherited from
             // this VM's boot process via ensure_running), so a daemon already
             // running in another mode keeps that mode until restarted.
-            for flag in ["SMOLVM_CUDA_PATH3", "SMOLVM_CUDA_FORK_ISOLATE"] {
+            for flag in ["SMOLVM_CUDA_FORK_WORKERS", "SMOLVM_CUDA_FORK_ISOLATE"] {
                 if std::env::var_os(flag).is_none()
                     && (features.forkable || features.snapshot_dir.is_some())
                 {

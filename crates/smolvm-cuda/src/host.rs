@@ -480,7 +480,7 @@ fn fork_isolate_enabled() -> bool {
 /// golden's VMM physical is created IPC-exportable so a clone worker process can
 /// share/copy it at the golden's exact VA. Off = legacy shared-context path.
 fn path3_enabled() -> bool {
-    std::env::var_os("SMOLVM_CUDA_PATH3").is_some()
+    std::env::var_os("SMOLVM_CUDA_FORK_WORKERS").is_some()
 }
 
 /// Path 3 density opt-in: a clone worker SHARES the golden's loaded (weight)
@@ -488,7 +488,7 @@ fn path3_enabled() -> bool {
 /// them. Off by default (the proven path privately copies every range —
 /// correct + isolated but N copies of the weights).
 pub fn path3_share_weights_enabled() -> bool {
-    std::env::var_os("SMOLVM_CUDA_PATH3_SHARE_WEIGHTS").is_some()
+    std::env::var_os("SMOLVM_CUDA_FORK_SHARE_WEIGHTS").is_some()
 }
 
 /// P0 transport-viability instrumentation. Counts every dispatched CUDA RPC so we

@@ -1,5 +1,5 @@
 //! Path 3 M1 routing probe: connect to a running cuda-daemon as an ISOLATING fork
-//! clone (`init` with resume_token=1). With SMOLVM_CUDA_PATH3=1 +
+//! clone (`init` with resume_token=1). With SMOLVM_CUDA_FORK_WORKERS=1 +
 //! SMOLVM_CUDA_FORK_ISOLATE=1 the daemon serves us in a dedicated worker PROCESS
 //! (its own CUDA context/UVA). We then run a real vecadd kernel and verify —
 //! proving the routed worker process serves the clone correctly (M1).

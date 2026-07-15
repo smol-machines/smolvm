@@ -154,7 +154,7 @@ pub fn run(sock: &Path) -> io::Result<()> {
             Ok(stream) => {
                 // Path 3 (M1): an isolating fork clone is served in its own worker
                 // PROCESS (own context/UVA) so it can hold memory at the golden's
-                // exact VAs. Only fires under SMOLVM_CUDA_PATH3; otherwise legacy.
+                // exact VAs. Only fires under SMOLVM_CUDA_FORK_WORKERS; otherwise legacy.
                 #[cfg(unix)]
                 {
                     use std::os::unix::io::AsRawFd;
@@ -388,7 +388,7 @@ fn reconstruct_golden_memory(
         let loaded = f.get(3).map(|s| *s == "1").unwrap_or(false);
         let golden_h = f.get(4).and_then(|s| hx(s));
 
-        // DENSITY (opt-in, SMOLVM_CUDA_PATH3_SHARE_WEIGHTS): a loaded weight range is
+        // DENSITY (opt-in, SMOLVM_CUDA_FORK_SHARE_WEIGHTS): a loaded weight range is
         // read-only during frozen-base fine-tuning (LoRA freezes the base; only the
         // clone's PRIVATE adapters train), so SHARE the golden's physical at its VA —
         // every clone imports the same physical, so one weight set lives in VRAM.
@@ -587,11 +587,11 @@ fn reconstruct_golden_modules(
 /// Path 3 (M1): peek a just-accepted connection's first message; true iff it's an
 /// isolating fork-clone Init (`op == Init`, `resume_token != 0`) that should be
 /// served in a dedicated worker process. `MSG_PEEK` leaves the bytes on the
-/// socket so the worker reads them fresh. Gated behind `SMOLVM_CUDA_PATH3` (unset
+/// socket so the worker reads them fresh. Gated behind `SMOLVM_CUDA_FORK_WORKERS` (unset
 /// = legacy shared-context path) so partial Path-3 wiring can't disturb serving.
 #[cfg(unix)]
 fn peek_clone_token(fd: std::os::unix::io::RawFd) -> Option<u64> {
-    if std::env::var_os("SMOLVM_CUDA_PATH3").is_none()
+    if std::env::var_os("SMOLVM_CUDA_FORK_WORKERS").is_none()
         || std::env::var_os("SMOLVM_CUDA_FORK_ISOLATE").is_none()
     {
         return None;
