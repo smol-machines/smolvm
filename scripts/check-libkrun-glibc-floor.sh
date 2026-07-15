@@ -13,7 +13,7 @@ set -euo pipefail
 FLOOR="2.35"
 status=0
 
-for so in lib/linux-x86_64/libkrun.so lib/linux-arm64/libkrun.so; do
+for so in lib/linux-x86_64/libkrun.so lib/linux-aarch64/libkrun.so; do
   if [ ! -f "$so" ]; then
     echo "::error::$so is missing (LFS not pulled?)"
     status=1
