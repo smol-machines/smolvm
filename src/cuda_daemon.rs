@@ -631,6 +631,24 @@ fn peek_clone_token(fd: std::os::unix::io::RawFd) -> Option<u64> {
     (token != 0).then_some(token)
 }
 
+/// Fork-time share-safety check: D2H the chunk and confirm every recorded
+/// upload segment still hashes to its H2D-time CRC. Any mismatch (or D2H
+/// failure) → not shareable.
+#[cfg(unix)]
+fn verify_chunk_content(b: &mut dyn Backend, ch: &smolvm_cuda::host::HandoffChunk) -> bool {
+    match b.memcpy_dtoh(ch.va, ch.size, 0) {
+        Ok(bytes) => ch.segs.iter().all(|&(s, e, crc)| {
+            crc != 0
+                && e as usize <= bytes.len()
+                && smolvm_cuda::host::fnv64(&bytes[s as usize..e as usize]) == crc
+        }),
+        Err(e) => {
+            tracing::warn!(e, va = ch.va, "M2-share: verify D2H failed → private");
+            false
+        }
+    }
+}
+
 /// Path 3 (M1): hand the accepted connection to a fresh worker PROCESS (its own
 /// CUDA context, hence its own UVA — so it can place memory at the golden's exact
 /// VAs). `dup2` the socket fd onto fd 3 in the child (clears CLOEXEC) and exec
@@ -664,12 +682,29 @@ fn spawn_clone_worker(conn_fd: std::os::unix::io::RawFd, token: u64) -> io::Resu
     }
     layout.push_str("|maps=");
     let mut export_fds: Vec<i32> = Vec::new();
-    for (va, size, handle, loaded) in &maps {
-        if let Ok(efd) = backend.mem_export_handle(*handle) {
+    for ch in &maps {
+        if let Ok(efd) = backend.mem_export_handle(ch.handle) {
             let idx = export_fds.len();
             export_fds.push(efd);
-            let ld = u8::from(*loaded);
-            layout.push_str(&format!("{va:x}:{size:x}:{idx}:{ld}:{handle:x},"));
+            // Share-safety: a candidate chunk is shared only if its device
+            // content still equals what the H2Ds uploaded (any kernel write —
+            // e.g. LoRA adapters placed in freed weight space — must keep the
+            // chunk private or clone writes leak through the shared physical).
+            // Verified once per frozen golden; verdict cached.
+            let safe = match (ch.candidate, ch.verified) {
+                (false, _) => false,
+                (true, Some(v)) => v,
+                (true, None) => {
+                    let v = verify_chunk_content(backend.as_mut(), ch);
+                    smolvm_cuda::host::layout_set_share_verdict(token, ch.va, v);
+                    v
+                }
+            };
+            let ld = u8::from(safe);
+            layout.push_str(&format!(
+                "{:x}:{:x}:{}:{}:{:x},",
+                ch.va, ch.size, idx, ld, ch.handle
+            ));
         }
     }
     // M3a: serialize the golden's modules (images) + functions to a temp file for
