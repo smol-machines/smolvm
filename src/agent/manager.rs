@@ -1675,6 +1675,20 @@ impl AgentManager {
             if !shared_set && (features.forkable || features.snapshot_dir.is_some()) {
                 v.push(("SMOLVM_CUDA_SHARED", "1".to_string()));
             }
+            // Auto-enable Path 3 isolating forks for a fork base / clone, same
+            // pattern as SHARED above: a CUDA golden's clones need the daemon in
+            // address-preserving per-clone-worker mode or default-config torch
+            // (expandable_segments) forks into a broken clone. Explicit operator
+            // settings win. The daemon reads these at ITS spawn (inherited from
+            // this VM's boot process via ensure_running), so a daemon already
+            // running in another mode keeps that mode until restarted.
+            for flag in ["SMOLVM_CUDA_PATH3", "SMOLVM_CUDA_FORK_ISOLATE"] {
+                if std::env::var_os(flag).is_none()
+                    && (features.forkable || features.snapshot_dir.is_some())
+                {
+                    v.push((flag, "1".to_string()));
+                }
+            }
             v
         };
         self.inner.lock().is_clone = features.snapshot_dir.is_some();
