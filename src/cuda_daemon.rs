@@ -765,6 +765,12 @@ fn spawn_clone_worker(conn_fd: std::os::unix::io::RawFd, token: u64) -> io::Resu
     if let Some(mp) = &modpath {
         cmd.env("SMOLVM_CUDA_CLONE_MODULES", mp);
     }
+    // Parent copies of the exported-physical fds, to close once the child has
+    // forked (it inherits its own set). Every open export fd holds a DRIVER
+    // REFERENCE on the golden's physical allocation — leaking them in the
+    // daemon pins the golden's VRAM long after the golden is torn down and its
+    // session reclaimed (found: two dead goldens left ~3.2 GB resident).
+    let parent_fds = export_fds.clone();
     // SAFETY: dup2 in the forked child (async-signal-safe); fds were inherited at
     // fork. Connection → fd 3; each exported physical → fd 4+idx.
     unsafe {
@@ -794,7 +800,14 @@ fn spawn_clone_worker(conn_fd: std::os::unix::io::RawFd, token: u64) -> io::Resu
             Ok(())
         });
     }
-    cmd.spawn().map(|_| ())
+    let spawned = cmd.spawn().map(|_| ());
+    // The child (if any) forked with its own copies; drop ours either way so
+    // the golden's physicals can actually be released at teardown.
+    for efd in parent_fds {
+        // SAFETY: fds we created via mem_export_handle and no longer use.
+        unsafe { libc::close(efd) };
+    }
+    spawned
 }
 
 /// Ensure the shared daemon is running and return its socket path. Serialized by
