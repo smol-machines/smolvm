@@ -41,7 +41,13 @@ impl Shim for Service {
     }
 
     async fn start_shim(&mut self, opts: StartOpts) -> Result<String, Error> {
-        let grouping = opts.id.clone();
+        // Group a container task under its sandbox's shim (via the CRI
+        // `io.kubernetes.cri.sandbox-id` annotation) so the container reaches the
+        // shim process that owns the pod VM. Without this, containerd 2.2+ starts
+        // a fresh shim per container — which has no sandbox in its state, so the
+        // container task fails with "no sandbox created for this pod". The shim's
+        // `start` action runs with the bundle directory as its CWD.
+        let grouping = crate::bundle::sandbox_grouping(".").unwrap_or_else(|| opts.id.clone());
         let address = spawn(opts, &grouping, Vec::new()).await?;
         Ok(address)
     }
