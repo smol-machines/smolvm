@@ -708,6 +708,18 @@ thread_local! {
     // Lazy sources: golden module handle → image; golden fn handle → (module, name).
     static MOD_IMAGES: ImageMap = std::cell::RefCell::new(HashMap::new());
     static FUNC_META: MetaMap = std::cell::RefCell::new(HashMap::new());
+    // M2: golden VMM physical handle → THIS worker's handle backing the same VA.
+    // `None` = not a clone worker (raw passthrough). The clone frees inherited
+    // chunks by their GOLDEN handle values; passing one raw into cuMemRelease in
+    // the worker's context SEGFAULTS the driver (SEGV_MAPERR inside cuMemRelease).
+    static VMM_TRANS: std::cell::RefCell<Option<HashMap<u64, u64>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Install a clone worker's golden→worker VMM physical-handle map (M2). Until
+/// installed, MemMap/MemRelease pass handles through raw (daemon/golden path).
+pub fn set_vmm_trans(map: HashMap<u64, u64>) {
+    VMM_TRANS.with(|m| *m.borrow_mut() = Some(map));
 }
 
 /// Install a clone worker's golden→worker handle reconstruction. Modules are
@@ -2135,18 +2147,25 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             size,
             offset,
             handle,
-        } => b.mem_map(va, size, offset, handle).map(|_| {
-            sess.owned_vmm_maps.insert(va, size);
-            sess.vmm_ranges.lock().unwrap().insert(va, size);
-            // Path 3 (M2): record va→(size, physical handle) so the daemon can
-            // export this physical to an fd for a clone worker to import at `va`.
-            sess.golden_layout
-                .lock()
-                .unwrap()
-                .maps
-                .insert(va, (size, handle));
-            Response::Ok
-        }),
+        } => {
+            // Path 3 worker: an inherited golden handle must map via the worker's
+            // own physical (raw golden values are invalid in this context).
+            let handle = VMM_TRANS
+                .with(|m| m.borrow().as_ref().and_then(|t| t.get(&handle).copied()))
+                .unwrap_or(handle);
+            b.mem_map(va, size, offset, handle).map(|_| {
+                sess.owned_vmm_maps.insert(va, size);
+                sess.vmm_ranges.lock().unwrap().insert(va, size);
+                // Path 3 (M2): record va→(size, physical handle) so the daemon can
+                // export this physical to an fd for a clone worker to import at `va`.
+                sess.golden_layout
+                    .lock()
+                    .unwrap()
+                    .maps
+                    .insert(va, (size, handle));
+                Response::Ok
+            })
+        }
         Request::MemSetAccess { va, size, device } => {
             b.mem_set_access(va, size, device).map(|_| Response::Ok)
         }
@@ -2157,8 +2176,28 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             b.mem_unmap(va, size).map(|_| Response::Ok)
         }
         Request::MemRelease { handle } => {
-            sess.owned_vmm_handles.remove(&handle);
-            b.mem_release(handle).map(|_| Response::Ok)
+            let created_here = sess.owned_vmm_handles.remove(&handle).is_some();
+            // Path 3 worker: translate an inherited golden handle to the worker
+            // handle backing that chunk (consumed: releasing twice is a no-op).
+            // A handle neither translated nor created in this process is a stale
+            // golden value we can't resolve — dropped, NOT passed to the driver
+            // (cuMemRelease on a foreign-context handle segfaults, not errors).
+            let resolved = VMM_TRANS.with(|m| match m.borrow_mut().as_mut() {
+                Some(t) => match t.remove(&handle) {
+                    Some(w) => Some(Some(w)),
+                    None if created_here => Some(Some(handle)),
+                    None => Some(None),
+                },
+                None => None,
+            });
+            match resolved {
+                Some(Some(h)) => b.mem_release(h).map(|_| Response::Ok),
+                Some(None) => {
+                    eprintln!("[M2] MemRelease: unknown inherited handle {handle:#x} → no-op");
+                    Ok(Response::Ok)
+                }
+                None => b.mem_release(handle).map(|_| Response::Ok),
+            }
         }
         Request::MemAddressFree { va, size } => {
             sess.owned_vmm_reservations.remove(&va);

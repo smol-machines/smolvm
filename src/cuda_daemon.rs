@@ -223,11 +223,16 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
     // daemon passed (SMOLVM_CUDA_CLONE_LAYOUT) + the golden's physical exported to
     // fds 4.. — BEFORE serving, so the clone's inherited pointers are valid verbatim.
     if let Ok(layout) = std::env::var("SMOLVM_CUDA_CLONE_LAYOUT") {
-        let n = reconstruct_golden_memory(backend.as_mut(), &layout);
+        let (n, vmm_trans) = reconstruct_golden_memory(backend.as_mut(), &layout);
         tracing::info!(
             maps = n,
+            vmm_handles = vmm_trans.len(),
             "cuda clone-worker: reconstructed golden memory at its VAs"
         );
+        // The clone unmaps/releases inherited chunks by their GOLDEN handle
+        // values (torch expandable_segments trims segments under pressure);
+        // untranslated, cuMemRelease segfaults on the foreign-context handle.
+        smolvm_cuda::host::set_vmm_trans(vmm_trans);
         // Barrier: VMM reconstruction must fully settle before the clone runs, or a
         // later cuModuleLoadData surfaces a sticky async fault from the copies.
         if let Err(e) = backend.ctx_synchronize() {
@@ -262,13 +267,21 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
 }
 
 /// M2: rebuild the golden's VMM layout in THIS worker's context at the golden's
-/// EXACT VAs. `layout` = `"resv=va:size,…|maps=va:size:fdidx,…"` (hex); each map's
-/// physical was exported by the daemon to fd `4 + fdidx`. We import + map at the
-/// same VA — address-preserving, so inherited pointers and rebuilt graphs are
-/// valid verbatim. (Weights are shared here; private-mutable copy for full
-/// isolation is the next refinement.)
+/// EXACT VAs. `layout` = `"resv=va:size,…|maps=va:size:fdidx:ghandle,…"` (hex);
+/// each map's physical was exported by the daemon to fd `4 + fdidx`. We import +
+/// map at the same VA — address-preserving, so inherited pointers and rebuilt
+/// graphs are valid verbatim. (Weights are shared here; private-mutable copy for
+/// full isolation is the next refinement.)
+///
+/// Also returns the golden-handle → worker-handle map (from `ghandle`): the
+/// clone's torch later unmaps/releases inherited chunks by their GOLDEN handle
+/// values, and cuMemRelease on a foreign-context handle SEGFAULTS the worker.
 #[cfg(unix)]
-fn reconstruct_golden_memory(b: &mut dyn Backend, layout: &str) -> usize {
+fn reconstruct_golden_memory(
+    b: &mut dyn Backend,
+    layout: &str,
+) -> (usize, std::collections::HashMap<u64, u64>) {
+    let mut vmm_trans = std::collections::HashMap::new();
     let (mut resv_s, mut maps_s) = ("", "");
     for part in layout.split('|') {
         if let Some(r) = part.strip_prefix("resv=") {
@@ -291,12 +304,14 @@ fn reconstruct_golden_memory(b: &mut dyn Backend, layout: &str) -> usize {
     let mut count = 0;
     for e in maps_s.split(',').filter(|s| !s.is_empty()) {
         let f: Vec<&str> = e.split(':').collect();
-        if f.len() != 3 {
+        if f.len() < 3 {
             continue;
         }
         let (Some(va), Some(size), Ok(idx)) = (hx(f[0]), hx(f[1]), f[2].parse::<i32>()) else {
             continue;
         };
+        // 4th field: the golden's handle value for this chunk (hex).
+        let golden_h = f.get(3).and_then(|s| hx(s));
         // Private-mutable, address-preserving: map a PRIVATE physical at the golden
         // VA, then copy the golden's bytes in via a temp mapping of the imported
         // physical. Reads see the golden's data; writes hit the clone's own copy,
@@ -311,6 +326,11 @@ fn reconstruct_golden_memory(b: &mut dyn Backend, layout: &str) -> usize {
         if let Err(e) = b.mem_map(va, size, 0, priv_h) {
             tracing::warn!(e, va, "M2: private map failed");
             continue;
+        }
+        // priv_h stays held (never released here): the clone releases this chunk
+        // post-fork by the GOLDEN's handle value, translated to priv_h.
+        if let Some(g) = golden_h {
+            vmm_trans.insert(g, priv_h);
         }
         if let Err(e) = b.mem_set_access(va, size, 0) {
             tracing::warn!(e, va, "M2: private set_access failed");
@@ -341,7 +361,7 @@ fn reconstruct_golden_memory(b: &mut dyn Backend, layout: &str) -> usize {
         }
         count += 1;
     }
-    count
+    (count, vmm_trans)
 }
 
 /// M3a: parse the golden's module IMAGES + function METADATA (for LAZY reload in
@@ -503,7 +523,10 @@ fn spawn_clone_worker(conn_fd: std::os::unix::io::RawFd, token: u64) -> io::Resu
     let (resvs, maps) = smolvm_cuda::host::layout_handoff_snapshot(token)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no golden layout for token"))?;
     // Export each map's physical to a POSIX fd (in the golden's shared context) and
-    // build the layout string the worker parses ("resv=va:size,…|maps=va:size:fdidx,…").
+    // build the layout string the worker parses
+    // ("resv=va:size,…|maps=va:size:fdidx:ghandle,…"; ghandle = the golden's
+    // handle value, so the worker can translate the clone's inherited
+    // MemRelease/MemMap handles to its own).
     let mut backend = make_backend();
     backend
         .init()
@@ -525,7 +548,7 @@ fn spawn_clone_worker(conn_fd: std::os::unix::io::RawFd, token: u64) -> io::Resu
         if let Ok(efd) = backend.mem_export_handle(*handle) {
             let idx = export_fds.len();
             export_fds.push(efd);
-            layout.push_str(&format!("{va:x}:{size:x}:{idx},"));
+            layout.push_str(&format!("{va:x}:{size:x}:{idx}:{handle:x},"));
         }
     }
     // M3a: serialize the golden's modules (images) + functions to a temp file for
