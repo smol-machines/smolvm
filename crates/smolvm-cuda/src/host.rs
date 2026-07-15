@@ -564,6 +564,11 @@ type VmmRanges = std::sync::Mutex<HashMap<u64, u64>>;
 struct GoldenLayout {
     reservations: HashMap<u64, u64>,
     maps: HashMap<u64, (u64, u64)>,
+    /// M3a: golden module handle → module image bytes (to reload in the worker).
+    modules: HashMap<u64, Vec<u8>>,
+    /// M3a: golden function handle → (module handle, name) — the worker re-resolves
+    /// it in its reloaded module and remaps the inherited raw CUfunction handle.
+    functions: HashMap<u64, (u64, String)>,
 }
 type LayoutCell = std::sync::Mutex<GoldenLayout>;
 static DPTR_HANDOFF: std::sync::Mutex<Option<HashMap<u64, std::sync::Weak<AllocTable>>>> =
@@ -650,6 +655,54 @@ pub fn layout_handoff_snapshot(token: u64) -> Option<(Vec<(u64, u64)>, Vec<(u64,
     let resvs = g.reservations.iter().map(|(&v, &s)| (v, s)).collect();
     let maps = g.maps.iter().map(|(&v, &(s, h))| (v, s, h)).collect();
     Some((resvs, maps))
+}
+
+/// M3a: `(modules: [(handle, image)], functions: [(handle, module, name)])` for
+/// `token`'s golden — the module images the worker reloads + the functions it
+/// re-resolves, to remap the clone's inherited raw handles.
+#[allow(clippy::type_complexity)]
+pub fn module_handoff_snapshot(
+    token: u64,
+) -> Option<(Vec<(u64, Vec<u8>)>, Vec<(u64, u64, String)>)> {
+    let reg = LAYOUT_HANDOFF.lock().unwrap();
+    let l = reg.as_ref()?.get(&token)?.upgrade()?;
+    let g = l.lock().unwrap();
+    let modules = g.modules.iter().map(|(&h, i)| (h, i.clone())).collect();
+    let funcs = g
+        .functions
+        .iter()
+        .map(|(&h, (m, n))| (h, *m, n.clone()))
+        .collect();
+    Some((modules, funcs))
+}
+
+// M3a: per-worker (thread-local) translation of the golden's inherited raw
+// module/function handles → this worker's reloaded ones. Empty (identity) unless
+// a Path-3 clone worker installed it via `set_handle_trans`.
+thread_local! {
+    static FUNC_TRANS: std::cell::RefCell<HashMap<u64, u64>> = std::cell::RefCell::new(HashMap::new());
+    static MOD_TRANS: std::cell::RefCell<HashMap<u64, u64>> = std::cell::RefCell::new(HashMap::new());
+}
+
+/// Install a clone worker's golden→worker handle maps (functions, modules).
+pub fn set_handle_trans(funcs: Vec<(u64, u64)>, mods: Vec<(u64, u64)>) {
+    FUNC_TRANS.with(|m| {
+        let mut m = m.borrow_mut();
+        m.clear();
+        m.extend(funcs);
+    });
+    MOD_TRANS.with(|m| {
+        let mut m = m.borrow_mut();
+        m.clear();
+        m.extend(mods);
+    });
+}
+
+fn xlat_func(h: u64) -> u64 {
+    FUNC_TRANS.with(|m| m.borrow().get(&h).copied().unwrap_or(h))
+}
+fn xlat_mod(h: u64) -> u64 {
+    MOD_TRANS.with(|m| m.borrow().get(&h).copied().unwrap_or(h))
 }
 
 /// Mark the allocation containing `dptr` as loaded (H2D-written → read-only
@@ -1290,10 +1343,12 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
     // reconnect and keep using its parent's loaded modules). The tables only
     // translate ids minted by pre-raw guests; a raw value passes through.
     fn raw_module(sess: &Session, m: u64) -> u64 {
-        sess.modules.get(&m).copied().unwrap_or(m)
+        // Path 3 (M3a): a clone worker translates the golden's inherited raw module
+        // handle to its own reloaded module; identity otherwise.
+        xlat_mod(sess.modules.get(&m).copied().unwrap_or(m))
     }
     fn raw_fn_h(sess: &Session, f: u64) -> u64 {
-        sess.functions.get(&f).copied().unwrap_or(f)
+        xlat_func(sess.functions.get(&f).copied().unwrap_or(f))
     }
     fn raw_graph(sess: &Session, h: u64) -> u64 {
         // Virtual graph/exec handle → real; untagged values pass through.
@@ -1480,6 +1535,15 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             // survives a fork-clone reconnect). Still tracked for reclaim.
             let raw = b.module_load_data(&image)?;
             sess.owned_modules.insert(raw);
+            // M3a: keep the image so a Path-3 clone worker can reload the module in
+            // its own context and remap this inherited handle.
+            if path3_enabled() {
+                sess.golden_layout
+                    .lock()
+                    .unwrap()
+                    .modules
+                    .insert(raw, image.clone());
+            }
             Ok(Response::Handle(raw))
         }
         Request::ModuleGetFunction { module, name } => {
@@ -1487,6 +1551,13 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             // Raw CUfunction on the wire: valid across connections in the shared
             // primary context, so a forked clone keeps its parent's functions.
             let raw_fn = b.module_get_function(raw_mod, &name)?;
+            if path3_enabled() {
+                sess.golden_layout
+                    .lock()
+                    .unwrap()
+                    .functions
+                    .insert(raw_fn, (raw_mod, name.clone()));
+            }
             Ok(Response::Handle(raw_fn))
         }
         Request::ModuleUnload { module } => {

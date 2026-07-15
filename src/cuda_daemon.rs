@@ -228,6 +228,24 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
             maps = n,
             "cuda clone-worker: reconstructed golden memory at its VAs"
         );
+        // Barrier: VMM reconstruction must fully settle before the clone runs, or a
+        // later cuModuleLoadData surfaces a sticky async fault from the copies.
+        if let Err(e) = backend.ctx_synchronize() {
+            tracing::warn!(e, "clone-worker: sync after memory reconstruction failed");
+        }
+    }
+    // M3a: reload the golden's modules + re-resolve its functions in OUR context,
+    // and install the golden→worker handle translation so the clone's inherited
+    // kernel launches (raw CUfunction from the golden's context) resolve correctly.
+    if let Ok(modpath) = std::env::var("SMOLVM_CUDA_CLONE_MODULES") {
+        let (funcs, mods) = reconstruct_golden_modules(backend.as_mut(), &modpath);
+        let nf = funcs.len();
+        smolvm_cuda::host::set_handle_trans(funcs, mods);
+        let _ = std::fs::remove_file(&modpath);
+        tracing::info!(
+            functions = nf,
+            "cuda clone-worker: reloaded golden modules + remapped handles"
+        );
     }
     // SAFETY: the daemon handed us sole ownership of the accepted connection fd.
     let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
@@ -259,7 +277,9 @@ fn reconstruct_golden_memory(b: &mut dyn Backend, layout: &str) -> usize {
     for e in resv_s.split(',').filter(|s| !s.is_empty()) {
         if let Some((va, size)) = e.split_once(':') {
             if let (Some(va), Some(size)) = (hx(va), hx(size)) {
-                let _ = b.mem_address_reserve_fixed(size, 0, va);
+                if let Err(e) = b.mem_address_reserve_fixed(size, 0, va) {
+                    tracing::warn!(e, va, "M2: reserve-fixed failed");
+                }
             }
         }
     }
@@ -276,27 +296,132 @@ fn reconstruct_golden_memory(b: &mut dyn Backend, layout: &str) -> usize {
         // VA, then copy the golden's bytes in via a temp mapping of the imported
         // physical. Reads see the golden's data; writes hit the clone's own copy,
         // so a clone can't corrupt the frozen golden.
-        let Ok(priv_h) = b.mem_create(size, 0) else {
-            continue;
+        let priv_h = match b.mem_create(size, 0) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(e, "M2: private create failed");
+                continue;
+            }
         };
-        if b.mem_map(va, size, 0, priv_h).is_err() {
+        if let Err(e) = b.mem_map(va, size, 0, priv_h) {
+            tracing::warn!(e, va, "M2: private map failed");
             continue;
         }
-        let _ = b.mem_set_access(va, size, 0);
-        if let Ok(gh) = b.mem_import_handle(4 + idx) {
-            if let Ok(tmp) = b.mem_address_reserve(size, 0) {
-                if b.mem_map(tmp, size, 0, gh).is_ok() {
-                    let _ = b.mem_set_access(tmp, size, 0);
-                    let _ = b.memcpy_dtod(va, tmp, size); // golden data → private copy
-                    let _ = b.mem_unmap(tmp, size);
+        if let Err(e) = b.mem_set_access(va, size, 0) {
+            tracing::warn!(e, va, "M2: private set_access failed");
+        }
+        match b.mem_import_handle(4 + idx) {
+            Ok(gh) => {
+                if let Ok(tmp) = b.mem_address_reserve(size, 0) {
+                    match b.mem_map(tmp, size, 0, gh) {
+                        Ok(()) => {
+                            if let Err(e) = b.mem_set_access(tmp, size, 0) {
+                                tracing::warn!(e, "M2: temp set_access failed");
+                            }
+                            if let Err(e) = b.memcpy_dtod(va, tmp, size) {
+                                tracing::warn!(e, va, tmp, "M2: dtod copy failed");
+                            }
+                            // The copy must finish before we unmap the temp source,
+                            // or the in-flight copy faults on unmapped memory.
+                            let _ = b.ctx_synchronize();
+                            let _ = b.mem_unmap(tmp, size);
+                        }
+                        Err(e) => tracing::warn!(e, tmp, "M2: temp map failed"),
+                    }
+                    let _ = b.mem_address_free(tmp, size);
                 }
-                let _ = b.mem_address_free(tmp, size);
+                let _ = b.mem_release(gh);
             }
-            let _ = b.mem_release(gh);
+            Err(e) => tracing::warn!(e, idx, "M2: import failed"),
         }
         count += 1;
     }
     count
+}
+
+/// M3a: reload the golden's modules + re-resolve its functions in THIS worker's
+/// context, returning golden→worker handle maps `(functions, modules)`. Reads the
+/// binary blob the daemon wrote (path in `SMOLVM_CUDA_CLONE_MODULES`):
+/// `[u32 nmods]( [u64 handle][u32 len][image] )* [u32 nfuncs]( [u64 fn][u64 mod][u32 len][name] )*`.
+#[cfg(unix)]
+fn reconstruct_golden_modules(
+    b: &mut dyn Backend,
+    path: &str,
+) -> (Vec<(u64, u64)>, Vec<(u64, u64)>) {
+    let (mut func_trans, mut mod_trans) = (Vec::new(), Vec::new());
+    let Ok(buf) = std::fs::read(path) else {
+        return (func_trans, mod_trans);
+    };
+    let mut p = 0usize;
+    macro_rules! need {
+        ($n:expr) => {
+            if p + $n > buf.len() {
+                return (func_trans, mod_trans);
+            }
+        };
+    }
+    macro_rules! ru32 {
+        () => {{
+            need!(4);
+            let v = u32::from_le_bytes(buf[p..p + 4].try_into().unwrap());
+            p += 4;
+            v
+        }};
+    }
+    macro_rules! ru64 {
+        () => {{
+            need!(8);
+            let v = u64::from_le_bytes(buf[p..p + 8].try_into().unwrap());
+            p += 8;
+            v
+        }};
+    }
+    let mut g2w: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    let nmods = ru32!();
+    for _ in 0..nmods {
+        let gh = ru64!();
+        let ilen = ru32!() as usize;
+        need!(ilen);
+        let img = buf[p..p + ilen].to_vec();
+        p += ilen;
+        // Null-terminate: cuModuleLoadData treats a PTX image as a C string, so the
+        // stored bytes need a trailing NUL the raw blob may lack.
+        let mut img = img;
+        if img.last() != Some(&0) {
+            img.push(0);
+        }
+        match b.module_load_data(&img) {
+            Ok(wh) => {
+                g2w.insert(gh, wh);
+                mod_trans.push((gh, wh));
+            }
+            Err(e) => tracing::warn!(e, ilen, "M3a: module reload failed"),
+        }
+    }
+    let nfuncs = ru32!();
+    for _ in 0..nfuncs {
+        let gf = ru64!();
+        let gm = ru64!();
+        let nlen = ru32!() as usize;
+        need!(nlen);
+        let name = String::from_utf8_lossy(&buf[p..p + nlen]).into_owned();
+        p += nlen;
+        match g2w.get(&gm) {
+            Some(&wm) => match b.module_get_function(wm, &name) {
+                Ok(wf) => func_trans.push((gf, wf)),
+                Err(e) => tracing::warn!(name, e, "M3a: re-resolve function failed"),
+            },
+            None => tracing::warn!(gm, "M3a: function's module not reloaded"),
+        }
+    }
+    tracing::info!(
+        nmods,
+        nfuncs,
+        mods = mod_trans.len(),
+        funcs = func_trans.len(),
+        "M3a: reconstruct_golden_modules"
+    );
+    (func_trans, mod_trans)
 }
 
 /// Path 3 (M1): peek a just-accepted connection's first message; true iff it's an
@@ -347,6 +472,10 @@ fn spawn_clone_worker(conn_fd: std::os::unix::io::RawFd, token: u64) -> io::Resu
     backend
         .primary_ctx_retain(0)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("ctx retain: {e}")))?;
+    // Commit the golden's pending device work so its writes are visible in the
+    // physical the clone will IPC-import (the golden runs on another thread of the
+    // shared primary context).
+    let _ = backend.ctx_synchronize();
     let mut layout = String::from("resv=");
     for (va, size) in &resvs {
         layout.push_str(&format!("{va:x}:{size:x},"));
@@ -360,10 +489,42 @@ fn spawn_clone_worker(conn_fd: std::os::unix::io::RawFd, token: u64) -> io::Resu
             layout.push_str(&format!("{va:x}:{size:x}:{idx},"));
         }
     }
+    // M3a: serialize the golden's modules (images) + functions to a temp file for
+    // the worker to reload + remap. Images are MB-scale, so a file, not env.
+    let mut modpath: Option<String> = None;
+    if let Some((modules, funcs)) = smolvm_cuda::host::module_handoff_snapshot(token) {
+        tracing::info!(
+            modules = modules.len(),
+            funcs = funcs.len(),
+            "M3a: gathered golden modules/functions"
+        );
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&(modules.len() as u32).to_le_bytes());
+        for (h, img) in &modules {
+            blob.extend_from_slice(&h.to_le_bytes());
+            blob.extend_from_slice(&(img.len() as u32).to_le_bytes());
+            blob.extend_from_slice(img);
+        }
+        blob.extend_from_slice(&(funcs.len() as u32).to_le_bytes());
+        for (h, m, n) in &funcs {
+            blob.extend_from_slice(&h.to_le_bytes());
+            blob.extend_from_slice(&m.to_le_bytes());
+            blob.extend_from_slice(&(n.len() as u32).to_le_bytes());
+            blob.extend_from_slice(n.as_bytes());
+        }
+        let _ = std::fs::create_dir_all("/tmp/smolvm");
+        let mp = format!("/tmp/smolvm/clone-mods-{token}-{conn_fd}.bin");
+        if std::fs::write(&mp, &blob).is_ok() {
+            modpath = Some(mp);
+        }
+    }
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("_cuda-clone-worker").arg("3");
     cmd.env("SMOLVM_CUDA_CLONE_LAYOUT", layout);
+    if let Some(mp) = &modpath {
+        cmd.env("SMOLVM_CUDA_CLONE_MODULES", mp);
+    }
     // SAFETY: dup2 in the forked child (async-signal-safe); fds were inherited at
     // fork. Connection → fd 3; each exported physical → fd 4+idx.
     unsafe {
