@@ -31,8 +31,17 @@ pub const MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+jso
 pub struct OciManifest {
     pub schema_version: u32,
     pub media_type: String,
+    /// OCI 1.1 artifact type. Stamped with the pack layer media type on push so
+    /// artifact-aware clients (oras, crane, referrers APIs) classify the
+    /// manifest as a smolmachine artifact rather than an opaque custom image.
+    /// Optional so manifests written before OCI 1.1 stamping still deserialize.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub artifact_type: Option<String>,
     pub config: OciDescriptor,
     pub layers: Vec<OciDescriptor>,
+    /// Standard OCI annotations (`org.opencontainers.image.*`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub annotations: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// OCI content descriptor.
@@ -304,5 +313,34 @@ mod is_local_tests {
         // hostname that starts with "127." but is not an IPv4 address
         assert!(!is_local_registry("127.example.com"));
         assert!(!is_local_registry("127.example.com:5000"));
+    }
+
+    #[test]
+    fn manifest_serializes_oci_11_artifact_fields() {
+        let m = OciManifest {
+            schema_version: 2,
+            media_type: MANIFEST_MEDIA_TYPE.to_string(),
+            artifact_type: Some(LAYER_MEDIA_TYPE.to_string()),
+            config: OciDescriptor {
+                media_type: CONFIG_MEDIA_TYPE.to_string(),
+                digest: "sha256:abc".to_string(),
+                size: 1,
+            },
+            layers: vec![],
+            annotations: Some(std::collections::BTreeMap::from([(
+                "org.opencontainers.image.title".to_string(),
+                "t".to_string(),
+            )])),
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(json.contains("\"artifactType\":\"application/vnd.smolmachines.smolmachine.v1\""));
+        assert!(json.contains("org.opencontainers.image.title"));
+
+        // Manifests written before OCI 1.1 stamping (no artifactType or
+        // annotations) must still deserialize.
+        let legacy = r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"c","digest":"sha256:x","size":1},"layers":[]}"#;
+        let parsed: OciManifest = serde_json::from_str(legacy).unwrap();
+        assert!(parsed.artifact_type.is_none());
+        assert!(parsed.annotations.is_none());
     }
 }
