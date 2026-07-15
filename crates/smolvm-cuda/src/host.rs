@@ -483,6 +483,14 @@ fn path3_enabled() -> bool {
     std::env::var_os("SMOLVM_CUDA_PATH3").is_some()
 }
 
+/// Path 3 density opt-in: a clone worker SHARES the golden's loaded (weight)
+/// VMM ranges read-only (IPC-import without copy) instead of privately copying
+/// them. Off by default (the proven path privately copies every range —
+/// correct + isolated but N copies of the weights).
+pub fn path3_share_weights_enabled() -> bool {
+    std::env::var_os("SMOLVM_CUDA_PATH3_SHARE_WEIGHTS").is_some()
+}
+
 /// P0 transport-viability instrumentation. Counts every dispatched CUDA RPC so we
 /// can derive calls-per-token (the number that decides whether CUDA-over-network
 /// survives WAN round-trips). `SMOLVM_CUDA_RPC_STATS=1` logs the running count with
@@ -563,7 +571,15 @@ type VmmRanges = std::sync::Mutex<HashMap<u64, u64>>;
 #[derive(Default)]
 struct GoldenLayout {
     reservations: HashMap<u64, u64>,
-    maps: HashMap<u64, (u64, u64)>,
+    /// va → (size, physical handle, h2d_covered_bytes). `h2d_covered_bytes` = how
+    /// many bytes of this VMM chunk received a host→device copy (weights streamed
+    /// in at load). A chunk is shareable ONLY if FULLY covered (covered == size):
+    /// under `expandable_segments` torch packs post-fork activations into the FREE
+    /// space of partially-filled weight chunks, so sharing a partial chunk lets an
+    /// activation write corrupt the shared physical (proven: RMS-LayerNorm writes
+    /// Y/r into a loaded chunk). A fully-covered chunk has no free space → the
+    /// allocator can't place activations there → safe to share.
+    maps: HashMap<u64, (u64, u64, u64)>,
     /// M3a: golden module handle → module image bytes (to reload in the worker).
     modules: HashMap<u64, Vec<u8>>,
     /// M3a: golden function handle → (module handle, name) — the worker re-resolves
@@ -651,14 +667,23 @@ fn layout_handoff_register(l: &std::sync::Arc<LayoutCell>, my_token: u64) {
     reg.insert(my_token, std::sync::Arc::downgrade(l));
 }
 
-/// `(reservations: [(va,size)], maps: [(va,size,handle)])` for `token`'s golden.
+/// `(reservations: [(va,size)], maps: [(va,size,handle,loaded)])` for `token`'s
+/// golden. `loaded` marks a weight range a clone worker can share read-only.
 #[allow(clippy::type_complexity)]
-pub fn layout_handoff_snapshot(token: u64) -> Option<(Vec<(u64, u64)>, Vec<(u64, u64, u64)>)> {
+pub fn layout_handoff_snapshot(
+    token: u64,
+) -> Option<(Vec<(u64, u64)>, Vec<(u64, u64, u64, bool)>)> {
     let reg = LAYOUT_HANDOFF.lock().unwrap();
     let l = reg.as_ref()?.get(&token)?.upgrade()?;
     let g = l.lock().unwrap();
     let resvs = g.reservations.iter().map(|(&v, &s)| (v, s)).collect();
-    let maps = g.maps.iter().map(|(&v, &(s, h))| (v, s, h)).collect();
+    // A chunk is shareable only if FULLY covered by H2D weight bytes (no free
+    // space for the clone's post-fork activation writes).
+    let maps = g
+        .maps
+        .iter()
+        .map(|(&v, &(s, h, covered))| (v, s, h, covered >= s))
+        .collect();
     Some((resvs, maps))
 }
 
@@ -818,6 +843,22 @@ fn xlat_stream(h: u64) -> u64 {
 }
 fn xlat_event(h: u64) -> u64 {
     EVENT_TRANS.with(|m| m.borrow().get(&h).copied().unwrap_or(h))
+}
+
+/// Path 3: accumulate this H2D's byte coverage into every golden VMM chunk it
+/// overlaps. A chunk is shareable only once fully covered (see `GoldenLayout.maps`).
+/// No-op unless Path 3 is tracking a golden layout.
+fn mark_loaded_vmm(layout: &LayoutCell, dptr: u64, nbytes: u64) {
+    let end = dptr.saturating_add(nbytes);
+    let mut g = layout.lock().unwrap();
+    for (&base, v) in g.maps.iter_mut() {
+        let (size, covered) = (v.0, &mut v.2);
+        let (s, e) = (dptr.max(base), end.min(base + size));
+        if s < e {
+            // Cap at the chunk size so overlapping/re-issued H2Ds can't over-count.
+            *covered = (*covered + (e - s)).min(size);
+        }
+    }
 }
 
 /// Mark the allocation containing `dptr` as loaded (H2D-written → read-only
@@ -1735,6 +1776,9 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         }
         Request::MemcpyHtoD { dptr, stream, data } => {
             mark_loaded(&sess.alloc_table, dptr); // H2D write → weight/read-only
+            if path3_enabled() {
+                mark_loaded_vmm(&sess.golden_layout, dptr, data.len() as u64);
+            }
             b.memcpy_htod(dptr, &data, raw_stream(sess, stream)?)
                 .map(|_| Response::Ok)
         }
@@ -2090,6 +2134,9 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             stream,
         } => {
             mark_loaded(&sess.alloc_table, dptr);
+            if path3_enabled() {
+                mark_loaded_vmm(&sess.golden_layout, dptr, size);
+            }
             b.memcpy_shm_htod(dptr, offset, size, raw_stream(sess, stream)?)
                 .map(|_| Response::Ok)
         }
@@ -2107,6 +2154,10 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             segments,
         } => {
             mark_loaded(&sess.alloc_table, dptr);
+            if path3_enabled() {
+                let n: u64 = segments.iter().map(|&(_, len)| len).sum();
+                mark_loaded_vmm(&sess.golden_layout, dptr, n);
+            }
             b.memcpy_gpa_htod(dptr, &segments, raw_stream(sess, stream)?)
                 .map(|_| Response::Ok)
         }
@@ -2166,11 +2217,12 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 sess.vmm_ranges.lock().unwrap().insert(va, size);
                 // Path 3 (M2): record va→(size, physical handle) so the daemon can
                 // export this physical to an fd for a clone worker to import at `va`.
+                // coverage starts at 0 bytes; H2Ds accumulate it (see mark_loaded_vmm).
                 sess.golden_layout
                     .lock()
                     .unwrap()
                     .maps
-                    .insert(va, (size, handle));
+                    .insert(va, (size, handle, 0));
                 Response::Ok
             })
         }
