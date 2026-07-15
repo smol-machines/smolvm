@@ -34,6 +34,6 @@ offline.
   blocks on a GO file. `machine fork` snapshots it in that state.
 - Each clone claims a distinct task via `O_CREAT|O_EXCL` files on the shared
   mount, builds its trainer, trains, and writes its result.
-- Weight sharing is opt-in (`SMOLVM_CUDA_PATH3_SHARE_WEIGHTS=1`): a chunk is
+- Weight sharing is opt-in (`SMOLVM_CUDA_FORK_SHARE_WEIGHTS=1`): a chunk is
   shared only if fork-time verification shows its device content still matches
   the uploaded weights; everything else is copied per clone.

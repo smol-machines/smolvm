@@ -13,7 +13,7 @@ VENV=${SMOLVM_DEMO_VENV:-$HOME/ptwork}                 # host venv with unsloth
 DRV=${SMOLVM_DEMO_DRV:-$(dirname "$0")/drvlib}         # CUDA shim libs
 COORD=${SMOLVM_DEMO_COORD:-$(mktemp -d)}               # shared clone<->host mount
 WORKLOAD="$(cd "$(dirname "$0")" && pwd)/workload.py"
-export SMOLVM_CUDA_PATH3_SHARE_WEIGHTS=1
+export SMOLVM_CUDA_FORK_SHARE_WEIGHTS=1
 gpumem() { nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits; }
 line()   { printf '%s\n' "──────────────────────────────────────────────────────────────"; }
 
