@@ -1,7 +1,5 @@
-# One warm Unsloth model -> N isolated fine-tunes, via smolvm machine fork.
-# Runs UNMODIFIED Unsloth with DEFAULT torch settings inside a smolvm microVM.
-# The golden loads the model once and freezes; every fork resumes warm, claims
-# a distinct task over the shared mount, and fine-tunes it in isolation.
+# Demo workload: the golden loads the model and blocks on a GO file; each fork
+# claims one task over the shared mount and fine-tunes it. See README.md.
 import os, time
 
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
@@ -18,8 +16,8 @@ model = FastLanguageModel.get_peft_model(
     target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
     use_gradient_checkpointing="unsloth", random_state=42)
 
-# Golden pre-fix: run fix_untrained_tokens ONCE here so no clone writes the
-# (shared) embedding at trainer setup. Recommended for 3+ concurrent clones.
+# Run fix_untrained_tokens in the golden so clones don't write the embedding
+# at trainer setup (recommended for 3+ clones with weight sharing).
 from unsloth_zoo.tokenizer_utils import fix_untrained_tokens
 from datasets import Dataset
 _ds = Dataset.from_list([{"text": f"### Q: {a}+{b}?\n### A: {a+b}"}
@@ -34,7 +32,7 @@ while not os.path.exists(GO):
     time.sleep(0.2)  # golden freezes here; forks are taken during this wait
 t_go = time.time()
 
-# Each fork atomically claims a distinct skill to teach the shared base.
+# Claim one task per fork (O_EXCL on the shared mount).
 TASKS = [("add", "+", lambda a, b: a + b),
          ("mul", "*", lambda a, b: a * b),
          ("sub", "-", lambda a, b: a - b)]
