@@ -14,6 +14,9 @@ use serde::Deserialize;
 const ANN_CONTAINER_TYPE: &str = "io.kubernetes.cri.container-type";
 /// CRI annotation on sandboxes: host path of the pod's network namespace.
 const ANN_SANDBOX_NETNS: &str = "io.kubernetes.cri.sandbox-network-ns";
+/// CRI annotation on workload containers: the id of the pod sandbox they belong
+/// to. Used to group a container's shim under its sandbox's shim.
+const ANN_SANDBOX_ID: &str = "io.kubernetes.cri.sandbox-id";
 
 #[derive(Debug, Default)]
 pub struct BundleInfo {
@@ -74,6 +77,25 @@ pub fn load(bundle: &str) -> Result<BundleInfo, String> {
         });
 
     Ok(BundleInfo { is_sandbox, netns })
+}
+
+/// If this bundle is a workload container (not the pod sandbox), return its
+/// sandbox id from the CRI `io.kubernetes.cri.sandbox-id` annotation. The shim's
+/// `start` action uses it as the grouping so the container's shim is the one
+/// that already owns the pod VM. Returns `None` for the sandbox itself, a bare
+/// `ctr run`, or an unreadable bundle (caller falls back to the task id).
+pub fn sandbox_grouping(bundle: &str) -> Option<String> {
+    let cfg = Path::new(bundle).join("config.json");
+    let spec: MinimalSpec = serde_json::from_str(&std::fs::read_to_string(cfg).ok()?).ok()?;
+    let is_sandbox = spec
+        .annotations
+        .get(ANN_CONTAINER_TYPE)
+        .map(|v| v == "sandbox")
+        .unwrap_or(true);
+    if is_sandbox {
+        return None;
+    }
+    spec.annotations.get(ANN_SANDBOX_ID).cloned()
 }
 
 /// Mount containerd's rootfs mounts at `<bundle>/rootfs`, returning that path.
