@@ -11,6 +11,8 @@ pub mod error;
 pub mod image_source;
 /// Canonical network-related data models.
 pub mod network;
+/// Detecting and host-pulling registry refs that name smolmachine packs.
+pub mod pack_ref;
 /// Canonical resource configuration data models.
 pub mod resources;
 /// Canonical storage and mount data models.

@@ -882,6 +882,59 @@ impl RunCmd {
             params.secret_refs.insert(key, r);
         }
 
+        // A registry --image can name a smolmachine PACK artifact (e.g.
+        // registry.smolmachines.com/library/alpine), whose single "layer" is a
+        // full .smolmachine sidecar — not an OCI filesystem layer. The in-guest
+        // OCI puller would tar-unpack its multi-GiB storage.ext4 into the guest
+        // disk, so probe the manifest on the host and reroute through the
+        // proven pack-run path (same as `--from`); a failed probe falls back to
+        // the normal in-guest pull.
+        if let Some(img) = params.image.clone() {
+            if let Some(sidecar) = smolvm::data::pack_ref::resolve_pack_ref_blocking(&img)? {
+                if self.detach {
+                    // pack-run is ephemeral-only; a persistent machine from a
+                    // pack ref goes through create (which reroutes the same way).
+                    return Err(Error::config(
+                        "machine run",
+                        format!(
+                            "'{img}' is a smolmachine pack artifact and cannot run detached \
+                             via --image. Create a persistent machine instead:\n  \
+                             smolvm machine create --image {img} && smolvm machine start"
+                        ),
+                    ));
+                }
+                let command = if !self.command.is_empty() {
+                    self.command.clone()
+                } else {
+                    let mut c = params.entrypoint.clone();
+                    c.extend(params.cmd.clone());
+                    c
+                };
+                return crate::cli::pack_run::PackRunCmd {
+                    sidecar: Some(sidecar),
+                    command,
+                    interactive: self.interactive,
+                    tty: self.tty,
+                    timeout: self.timeout,
+                    workdir: params.workdir.clone(),
+                    env: params.env.clone(),
+                    volume: params.volume.clone(),
+                    port: params.port.clone(),
+                    net: params.net,
+                    net_backend: params.network_backend,
+                    cpus: (params.cpus != DEFAULT_MICROVM_CPU_COUNT).then_some(params.cpus),
+                    mem: (params.mem != DEFAULT_MICROVM_MEMORY_MIB).then_some(params.mem),
+                    storage: params.storage_gb,
+                    overlay: params.overlay_gb,
+                    force_extract: false,
+                    info: false,
+                    debug: false,
+                    cuda: false,
+                }
+                .run();
+            }
+        }
+
         // Init-layer cache (prototype): for an ephemeral run of an IMAGE with `init`
         // commands, bake `image + init` once into a cached `.smolmachine` and run from
         // that artifact, so init's cost (e.g. `apt install`) is paid once and reused
@@ -2217,6 +2270,19 @@ impl CreateCmd {
         // Branch for --from: create machine from .smolmachine artifact.
         if let Some(ref sidecar_path) = self.from {
             return self.run_from_smolmachine(sidecar_path);
+        }
+
+        // A registry --image can name a smolmachine PACK artifact (e.g.
+        // registry.smolmachines.com/library/alpine), whose single "layer" is a
+        // full .smolmachine sidecar — not an OCI filesystem layer the in-guest
+        // puller could unpack (its multi-GiB storage.ext4 would fill the guest
+        // disk). Probe the manifest on the host and, if so, pull the sidecar
+        // and continue exactly as `--from`; a failed probe falls back to the
+        // normal in-guest pull.
+        if let Some(img) = self.image.as_deref() {
+            if let Some(sidecar) = smolvm::data::pack_ref::resolve_pack_ref_blocking(img)? {
+                return self.run_from_smolmachine(&sidecar);
+            }
         }
 
         let (cli_allow_cidrs, net, cli_dns_filter_hosts) = resolve_egress_flags(

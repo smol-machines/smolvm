@@ -346,6 +346,26 @@ pub async fn create_machine(
         req.registry_ref = None;
     }
 
+    // An `image` can also name a smolmachine pack artifact (e.g.
+    // registry.smolmachines.com/library/alpine), whose single "layer" is a
+    // full .smolmachine sidecar, not an OCI filesystem layer — the in-guest
+    // OCI puller would unpack its multi-GiB storage.ext4 into the guest disk.
+    // Probe the manifest on the host and reroute through the same from-sidecar
+    // flow as `registryRef`; a failed probe falls back to the in-guest pull.
+    if let Some(image) = req.image.clone() {
+        let sidecar = crate::data::pack_ref::resolve_pack_ref(
+            &image,
+            req.registry_identity_token.as_deref(),
+            &req.blob_peers,
+        )
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+        if let Some(sidecar) = sidecar {
+            req.from = Some(sidecar.to_string_lossy().into_owned());
+            req.image = None;
+        }
+    }
+
     // Generate name if not provided, then validate. The on-disk layout uses
     // a hash-derived directory (see `vm_data_dir`) so name length doesn't
     // affect the socket path — only character sanity + a generous length
