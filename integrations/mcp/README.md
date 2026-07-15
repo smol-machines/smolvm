@@ -49,7 +49,7 @@ Once published, clients run it with `npx` — no manual install:
   "mcpServers": {
     "smolvm": {
       "command": "npx",
-      "args": ["-y", "@smol-machines/smolvm-mcp"]
+      "args": ["-y", "smolvm-mcp"]
     }
   }
 }
