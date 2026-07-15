@@ -238,12 +238,14 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
     // and install the golden→worker handle translation so the clone's inherited
     // kernel launches (raw CUfunction from the golden's context) resolve correctly.
     if let Ok(modpath) = std::env::var("SMOLVM_CUDA_CLONE_MODULES") {
-        let (funcs, mods) = reconstruct_golden_modules(backend.as_mut(), &modpath);
-        let nf = funcs.len();
-        smolvm_cuda::host::set_handle_trans(funcs, mods);
+        let (funcs, mods, streams, events) = reconstruct_golden_modules(backend.as_mut(), &modpath);
+        let (nf, ns, ne) = (funcs.len(), streams.len(), events.len());
+        smolvm_cuda::host::set_handle_trans(funcs, mods, streams, events);
         let _ = std::fs::remove_file(&modpath);
         tracing::info!(
             functions = nf,
+            streams = ns,
+            events = ne,
             "cuda clone-worker: reloaded golden modules + remapped handles"
         );
     }
@@ -344,19 +346,28 @@ fn reconstruct_golden_memory(b: &mut dyn Backend, layout: &str) -> usize {
 /// binary blob the daemon wrote (path in `SMOLVM_CUDA_CLONE_MODULES`):
 /// `[u32 nmods]( [u64 handle][u32 len][image] )* [u32 nfuncs]( [u64 fn][u64 mod][u32 len][name] )*`.
 #[cfg(unix)]
+#[allow(clippy::type_complexity)]
 fn reconstruct_golden_modules(
     b: &mut dyn Backend,
     path: &str,
-) -> (Vec<(u64, u64)>, Vec<(u64, u64)>) {
-    let (mut func_trans, mut mod_trans) = (Vec::new(), Vec::new());
+) -> (
+    Vec<(u64, u64)>,
+    Vec<(u64, u64)>,
+    Vec<(u64, u64)>,
+    Vec<(u64, u64)>,
+) {
+    let mut func_trans = Vec::new();
+    let mut mod_trans = Vec::new();
+    let mut stream_trans = Vec::new();
+    let mut event_trans = Vec::new();
     let Ok(buf) = std::fs::read(path) else {
-        return (func_trans, mod_trans);
+        return (func_trans, mod_trans, stream_trans, event_trans);
     };
     let mut p = 0usize;
     macro_rules! need {
         ($n:expr) => {
             if p + $n > buf.len() {
-                return (func_trans, mod_trans);
+                return (func_trans, mod_trans, stream_trans, event_trans);
             }
         };
     }
@@ -414,14 +425,38 @@ fn reconstruct_golden_modules(
             None => tracing::warn!(gm, "M3a: function's module not reloaded"),
         }
     }
+    // Streams + events: recreate each with its golden create flags in OUR context,
+    // mapping the golden's inherited raw handle → our own (same M3a pattern).
+    let nstreams = ru32!();
+    for _ in 0..nstreams {
+        let gs = ru64!();
+        let flags = ru32!();
+        match b.stream_create(flags) {
+            Ok(ws) => stream_trans.push((gs, ws)),
+            Err(e) => tracing::warn!(e, "M3a: stream recreate failed"),
+        }
+    }
+    let nevents = ru32!();
+    for _ in 0..nevents {
+        let ge = ru64!();
+        let flags = ru32!();
+        match b.event_create(flags) {
+            Ok(we) => event_trans.push((ge, we)),
+            Err(e) => tracing::warn!(e, "M3a: event recreate failed"),
+        }
+    }
     tracing::info!(
         nmods,
         nfuncs,
+        nstreams,
+        nevents,
         mods = mod_trans.len(),
         funcs = func_trans.len(),
+        streams = stream_trans.len(),
+        events = event_trans.len(),
         "M3a: reconstruct_golden_modules"
     );
-    (func_trans, mod_trans)
+    (func_trans, mod_trans, stream_trans, event_trans)
 }
 
 /// Path 3 (M1): peek a just-accepted connection's first message; true iff it's an
@@ -492,11 +527,15 @@ fn spawn_clone_worker(conn_fd: std::os::unix::io::RawFd, token: u64) -> io::Resu
     // M3a: serialize the golden's modules (images) + functions to a temp file for
     // the worker to reload + remap. Images are MB-scale, so a file, not env.
     let mut modpath: Option<String> = None;
-    if let Some((modules, funcs)) = smolvm_cuda::host::module_handoff_snapshot(token) {
+    if let Some((modules, funcs, streams, events)) =
+        smolvm_cuda::host::module_handoff_snapshot(token)
+    {
         tracing::info!(
             modules = modules.len(),
             funcs = funcs.len(),
-            "M3a: gathered golden modules/functions"
+            streams = streams.len(),
+            events = events.len(),
+            "M3a: gathered golden modules/functions/streams/events"
         );
         let mut blob = Vec::new();
         blob.extend_from_slice(&(modules.len() as u32).to_le_bytes());
@@ -511,6 +550,17 @@ fn spawn_clone_worker(conn_fd: std::os::unix::io::RawFd, token: u64) -> io::Resu
             blob.extend_from_slice(&m.to_le_bytes());
             blob.extend_from_slice(&(n.len() as u32).to_le_bytes());
             blob.extend_from_slice(n.as_bytes());
+        }
+        // Streams + events: [u64 golden handle][u32 create flags] each.
+        blob.extend_from_slice(&(streams.len() as u32).to_le_bytes());
+        for (h, flags) in &streams {
+            blob.extend_from_slice(&h.to_le_bytes());
+            blob.extend_from_slice(&flags.to_le_bytes());
+        }
+        blob.extend_from_slice(&(events.len() as u32).to_le_bytes());
+        for (h, flags) in &events {
+            blob.extend_from_slice(&h.to_le_bytes());
+            blob.extend_from_slice(&flags.to_le_bytes());
         }
         let _ = std::fs::create_dir_all("/tmp/smolvm");
         let mp = format!("/tmp/smolvm/clone-mods-{token}-{conn_fd}.bin");

@@ -569,6 +569,10 @@ struct GoldenLayout {
     /// M3a: golden function handle → (module handle, name) — the worker re-resolves
     /// it in its reloaded module and remaps the inherited raw CUfunction handle.
     functions: HashMap<u64, (u64, String)>,
+    /// M3a: golden stream handle → create flags (the worker recreates + remaps).
+    streams: HashMap<u64, u32>,
+    /// M3a: golden event handle → create flags (the worker recreates + remaps).
+    events: HashMap<u64, u32>,
 }
 type LayoutCell = std::sync::Mutex<GoldenLayout>;
 static DPTR_HANDOFF: std::sync::Mutex<Option<HashMap<u64, std::sync::Weak<AllocTable>>>> =
@@ -648,6 +652,7 @@ fn layout_handoff_register(l: &std::sync::Arc<LayoutCell>, my_token: u64) {
 }
 
 /// `(reservations: [(va,size)], maps: [(va,size,handle)])` for `token`'s golden.
+#[allow(clippy::type_complexity)]
 pub fn layout_handoff_snapshot(token: u64) -> Option<(Vec<(u64, u64)>, Vec<(u64, u64, u64)>)> {
     let reg = LAYOUT_HANDOFF.lock().unwrap();
     let l = reg.as_ref()?.get(&token)?.upgrade()?;
@@ -657,13 +662,20 @@ pub fn layout_handoff_snapshot(token: u64) -> Option<(Vec<(u64, u64)>, Vec<(u64,
     Some((resvs, maps))
 }
 
-/// M3a: `(modules: [(handle, image)], functions: [(handle, module, name)])` for
-/// `token`'s golden — the module images the worker reloads + the functions it
-/// re-resolves, to remap the clone's inherited raw handles.
+/// M3a: golden handle-reconstruction snapshot for `token`'s golden —
+/// `(modules: [(handle, image)], functions: [(handle, module, name)],
+///   streams: [(handle, flags)], events: [(handle, flags)])`. The worker
+/// reloads modules / re-resolves functions / recreates streams+events, then
+/// remaps the clone's inherited raw handles to its own.
 #[allow(clippy::type_complexity)]
 pub fn module_handoff_snapshot(
     token: u64,
-) -> Option<(Vec<(u64, Vec<u8>)>, Vec<(u64, u64, String)>)> {
+) -> Option<(
+    Vec<(u64, Vec<u8>)>,
+    Vec<(u64, u64, String)>,
+    Vec<(u64, u32)>,
+    Vec<(u64, u32)>,
+)> {
     let reg = LAYOUT_HANDOFF.lock().unwrap();
     let l = reg.as_ref()?.get(&token)?.upgrade()?;
     let g = l.lock().unwrap();
@@ -673,29 +685,41 @@ pub fn module_handoff_snapshot(
         .iter()
         .map(|(&h, (m, n))| (h, *m, n.clone()))
         .collect();
-    Some((modules, funcs))
+    let streams = g.streams.iter().map(|(&h, &f)| (h, f)).collect();
+    let events = g.events.iter().map(|(&h, &f)| (h, f)).collect();
+    Some((modules, funcs, streams, events))
 }
 
 // M3a: per-worker (thread-local) translation of the golden's inherited raw
 // module/function handles → this worker's reloaded ones. Empty (identity) unless
 // a Path-3 clone worker installed it via `set_handle_trans`.
+type HandleMap = std::cell::RefCell<HashMap<u64, u64>>;
 thread_local! {
-    static FUNC_TRANS: std::cell::RefCell<HashMap<u64, u64>> = std::cell::RefCell::new(HashMap::new());
-    static MOD_TRANS: std::cell::RefCell<HashMap<u64, u64>> = std::cell::RefCell::new(HashMap::new());
+    static FUNC_TRANS: HandleMap = std::cell::RefCell::new(HashMap::new());
+    static MOD_TRANS: HandleMap = std::cell::RefCell::new(HashMap::new());
+    static STREAM_TRANS: HandleMap = std::cell::RefCell::new(HashMap::new());
+    static EVENT_TRANS: HandleMap = std::cell::RefCell::new(HashMap::new());
 }
 
-/// Install a clone worker's golden→worker handle maps (functions, modules).
-pub fn set_handle_trans(funcs: Vec<(u64, u64)>, mods: Vec<(u64, u64)>) {
-    FUNC_TRANS.with(|m| {
-        let mut m = m.borrow_mut();
-        m.clear();
-        m.extend(funcs);
-    });
-    MOD_TRANS.with(|m| {
-        let mut m = m.borrow_mut();
-        m.clear();
-        m.extend(mods);
-    });
+/// Install a clone worker's golden→worker handle maps (functions, modules,
+/// streams, events); each applied at the matching dispatch choke point.
+pub fn set_handle_trans(
+    funcs: Vec<(u64, u64)>,
+    mods: Vec<(u64, u64)>,
+    streams: Vec<(u64, u64)>,
+    events: Vec<(u64, u64)>,
+) {
+    fn put(cell: &'static std::thread::LocalKey<HandleMap>, v: Vec<(u64, u64)>) {
+        cell.with(|m| {
+            let mut m = m.borrow_mut();
+            m.clear();
+            m.extend(v);
+        });
+    }
+    put(&FUNC_TRANS, funcs);
+    put(&MOD_TRANS, mods);
+    put(&STREAM_TRANS, streams);
+    put(&EVENT_TRANS, events);
 }
 
 fn xlat_func(h: u64) -> u64 {
@@ -703,6 +727,12 @@ fn xlat_func(h: u64) -> u64 {
 }
 fn xlat_mod(h: u64) -> u64 {
     MOD_TRANS.with(|m| m.borrow().get(&h).copied().unwrap_or(h))
+}
+fn xlat_stream(h: u64) -> u64 {
+    STREAM_TRANS.with(|m| m.borrow().get(&h).copied().unwrap_or(h))
+}
+fn xlat_event(h: u64) -> u64 {
+    EVENT_TRANS.with(|m| m.borrow().get(&h).copied().unwrap_or(h))
 }
 
 /// Mark the allocation containing `dptr` as loaded (H2D-written → read-only
@@ -1333,7 +1363,11 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         if stream == 0 {
             Ok(0)
         } else {
-            Ok(sess.streams.get(&stream).copied().unwrap_or(stream))
+            // Path 3 (M3a pattern): translate a clone's inherited golden stream
+            // to its own recreated stream; identity otherwise.
+            Ok(xlat_stream(
+                sess.streams.get(&stream).copied().unwrap_or(stream),
+            ))
         }
     }
     // Modules and functions are raw host handles on the wire (like streams):
@@ -1365,7 +1399,9 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
     }
     fn raw_event(sess: &Session, event: u64) -> CuResult<u64> {
         // Same raw-on-the-wire convention as streams.
-        Ok(sess.events.get(&event).copied().unwrap_or(event))
+        Ok(xlat_event(
+            sess.events.get(&event).copied().unwrap_or(event),
+        ))
     }
     // Copy-on-write any shared weight buffer this request writes, then rewrite
     // inherited device pointers to this clone's private copies (both no-ops
@@ -1654,6 +1690,9 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         // Raw pointers are valid on every connection, like device pointers.
         Request::StreamCreate { flags } => b.stream_create(flags).map(|st| {
             sess.owned_streams.insert(st);
+            if path3_enabled() {
+                sess.golden_layout.lock().unwrap().streams.insert(st, flags);
+            }
             Response::Handle(st)
         }),
         Request::StreamBeginCapture { stream, mode } => {
@@ -1835,6 +1874,9 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         // several connections that must all understand the same handle.
         Request::EventCreate { flags } => b.event_create(flags).map(|e| {
             sess.owned_events.insert(e);
+            if path3_enabled() {
+                sess.golden_layout.lock().unwrap().events.insert(e, flags);
+            }
             Response::Handle(e)
         }),
         Request::EventDestroy { event } => {
@@ -2031,6 +2073,8 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         } => b.mem_map(va, size, offset, handle).map(|_| {
             sess.owned_vmm_maps.insert(va, size);
             sess.vmm_ranges.lock().unwrap().insert(va, size);
+            // Path 3 (M2): record va→(size, physical handle) so the daemon can
+            // export this physical to an fd for a clone worker to import at `va`.
             sess.golden_layout
                 .lock()
                 .unwrap()
