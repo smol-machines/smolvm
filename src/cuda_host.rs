@@ -142,7 +142,10 @@ fn proxy_to_daemon(guest: crate::platform::uds::UdsStream, addr: &str) -> std::i
         #[cfg(unix)]
         {
             let daemon = std::os::unix::net::UnixStream::connect(addr)?;
-            return pump(guest, daemon.try_clone()?, daemon);
+            let sd = daemon.try_clone()?;
+            return pump(guest, daemon.try_clone()?, daemon, move || {
+                let _ = sd.shutdown(std::net::Shutdown::Both);
+            });
         }
         #[cfg(not(unix))]
         {
@@ -155,7 +158,10 @@ fn proxy_to_daemon(guest: crate::platform::uds::UdsStream, addr: &str) -> std::i
     }
     let daemon = std::net::TcpStream::connect(addr)?;
     let _ = daemon.set_nodelay(true);
-    pump(guest, daemon.try_clone()?, daemon)
+    let sd = daemon.try_clone()?;
+    pump(guest, daemon.try_clone()?, daemon, move || {
+        let _ = sd.shutdown(std::net::Shutdown::Both);
+    })
 }
 
 /// Byte-pump the guest connection and a daemon connection in both directions.
@@ -163,16 +169,25 @@ fn pump<D>(
     guest: crate::platform::uds::UdsStream,
     mut daemon_wr: D,
     mut daemon_rd: D,
+    daemon_shutdown: impl FnOnce() + Send + 'static,
 ) -> std::io::Result<()>
 where
     D: std::io::Read + std::io::Write + Send + 'static,
 {
     let mut guest_rd = guest.try_clone()?;
+    let guest_sd = guest_rd.try_clone()?;
     let mut guest_wr = guest;
     let up = thread::spawn(move || {
         let _ = std::io::copy(&mut guest_rd, &mut daemon_wr);
+        // Guest side ended: unblock the daemon→guest copy below so the proxy
+        // thread exits instead of leaking, blocked on a silent daemon.
+        daemon_shutdown();
     });
     let _ = std::io::copy(&mut daemon_rd, &mut guest_wr);
+    // Daemon side ended — e.g. this connection's clone worker died. Shut the
+    // guest socket down so the guest's blocked read fails LOUDLY (the clone
+    // would otherwise hang forever mid-training) and the up-thread unblocks.
+    let _ = guest_sd.shutdown(std::net::Shutdown::Both);
     let _ = up.join();
     Ok(())
 }

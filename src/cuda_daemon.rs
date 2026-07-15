@@ -122,7 +122,10 @@ pub fn run(sock: &Path) -> io::Result<()> {
                                                     continue;
                                                 }
                                                 Err(e) => {
-                                                    tracing::warn!(error = %e, "remote clone-worker spawn failed; serving in-process");
+                                                    // See the UDS arm: reject, fail fast.
+                                                    tracing::warn!(error = %e, token, "remote clone-worker spawn failed; rejecting the clone connection");
+                                                    drop(s);
+                                                    continue;
                                                 }
                                             }
                                         }
@@ -154,7 +157,7 @@ pub fn run(sock: &Path) -> io::Result<()> {
             Ok(stream) => {
                 // Path 3 (M1): an isolating fork clone is served in its own worker
                 // PROCESS (own context/UVA) so it can hold memory at the golden's
-                // exact VAs. Only fires under SMOLVM_CUDA_PATH3; otherwise legacy.
+                // exact VAs. Only fires under SMOLVM_CUDA_FORK_WORKERS; otherwise legacy.
                 #[cfg(unix)]
                 {
                     use std::os::unix::io::AsRawFd;
@@ -167,7 +170,16 @@ pub fn run(sock: &Path) -> io::Result<()> {
                                 continue;
                             }
                             Err(e) => {
-                                tracing::warn!(error = %e, "clone-worker spawn failed; serving in-process");
+                                // REJECT rather than serve in-process: this IS an
+                                // isolating clone (peek matched), and the legacy
+                                // shared path can't serve it — its inherited
+                                // pointers are garbage in a fresh context, so the
+                                // guest would wedge mid-training (seen after a
+                                // daemon restart orphaned a lineage). Closing
+                                // makes the guest fail fast instead.
+                                tracing::warn!(error = %e, token, "clone-worker spawn failed; rejecting the clone connection");
+                                drop(stream);
+                                continue;
                             }
                         }
                     }
@@ -388,7 +400,7 @@ fn reconstruct_golden_memory(
         let loaded = f.get(3).map(|s| *s == "1").unwrap_or(false);
         let golden_h = f.get(4).and_then(|s| hx(s));
 
-        // DENSITY (opt-in, SMOLVM_CUDA_PATH3_SHARE_WEIGHTS): a loaded weight range is
+        // DENSITY (opt-in, SMOLVM_CUDA_FORK_SHARE_WEIGHTS): a loaded weight range is
         // read-only during frozen-base fine-tuning (LoRA freezes the base; only the
         // clone's PRIVATE adapters train), so SHARE the golden's physical at its VA —
         // every clone imports the same physical, so one weight set lives in VRAM.
@@ -587,11 +599,11 @@ fn reconstruct_golden_modules(
 /// Path 3 (M1): peek a just-accepted connection's first message; true iff it's an
 /// isolating fork-clone Init (`op == Init`, `resume_token != 0`) that should be
 /// served in a dedicated worker process. `MSG_PEEK` leaves the bytes on the
-/// socket so the worker reads them fresh. Gated behind `SMOLVM_CUDA_PATH3` (unset
+/// socket so the worker reads them fresh. Gated behind `SMOLVM_CUDA_FORK_WORKERS` (unset
 /// = legacy shared-context path) so partial Path-3 wiring can't disturb serving.
 #[cfg(unix)]
 fn peek_clone_token(fd: std::os::unix::io::RawFd) -> Option<u64> {
-    if std::env::var_os("SMOLVM_CUDA_PATH3").is_none()
+    if std::env::var_os("SMOLVM_CUDA_FORK_WORKERS").is_none()
         || std::env::var_os("SMOLVM_CUDA_FORK_ISOLATE").is_none()
     {
         return None;
@@ -765,6 +777,12 @@ fn spawn_clone_worker(conn_fd: std::os::unix::io::RawFd, token: u64) -> io::Resu
     if let Some(mp) = &modpath {
         cmd.env("SMOLVM_CUDA_CLONE_MODULES", mp);
     }
+    // Parent copies of the exported-physical fds, to close once the child has
+    // forked (it inherits its own set). Every open export fd holds a DRIVER
+    // REFERENCE on the golden's physical allocation — leaking them in the
+    // daemon pins the golden's VRAM long after the golden is torn down and its
+    // session reclaimed (found: two dead goldens left ~3.2 GB resident).
+    let parent_fds = export_fds.clone();
     // SAFETY: dup2 in the forked child (async-signal-safe); fds were inherited at
     // fork. Connection → fd 3; each exported physical → fd 4+idx.
     unsafe {
@@ -794,7 +812,14 @@ fn spawn_clone_worker(conn_fd: std::os::unix::io::RawFd, token: u64) -> io::Resu
             Ok(())
         });
     }
-    cmd.spawn().map(|_| ())
+    let spawned = cmd.spawn().map(|_| ());
+    // The child (if any) forked with its own copies; drop ours either way so
+    // the golden's physicals can actually be released at teardown.
+    for efd in parent_fds {
+        // SAFETY: fds we created via mem_export_handle and no longer use.
+        unsafe { libc::close(efd) };
+    }
+    spawned
 }
 
 /// Ensure the shared daemon is running and return its socket path. Serialized by
