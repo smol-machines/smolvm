@@ -1494,6 +1494,25 @@ fn decompress_layer_reader<'a>(
     }
 }
 
+/// The `.smolmachine` sidecar members that identify a smolmachine pack blob
+/// masquerading as an OCI layer: `agent-rootfs.tar` is the archive's first
+/// entry (so the guard fires before anything large is written) and
+/// `storage.ext4` is the multi-GiB disk template that would fill the guest
+/// disk. Only TOP-LEVEL entries match — a real container image nesting a
+/// same-named file (e.g. `/var/lib/foo/storage.ext4`) must not trip the guard.
+fn pack_sidecar_sentinel(path: &Path) -> Option<&'static str> {
+    const SENTINELS: [&str; 2] = ["agent-rootfs.tar", "storage.ext4"];
+    let mut components = path
+        .components()
+        .filter(|c| !matches!(c, std::path::Component::CurDir));
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(name)), None) => {
+            SENTINELS.into_iter().find(|s| name.to_str() == Some(s))
+        }
+        _ => None,
+    }
+}
+
 fn extract_oci_layer<R: std::io::Read>(reader: R, dest: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -1514,6 +1533,22 @@ fn extract_oci_layer<R: std::io::Read>(reader: R, dest: &Path) -> std::io::Resul
     for entry in archive.entries()? {
         let mut entry = entry?;
         let path = entry.path()?.into_owned();
+
+        // A smolmachine PACK blob (mediaType application/vnd.smolmachines.*) is
+        // not an OCI filesystem layer: it is a .smolmachine sidecar carrying
+        // agent-rootfs.tar and a multi-GiB non-sparse storage.ext4 disk
+        // template. Unpacking it here fills the guest disk before failing, so
+        // detect its top-level sentinels and abort immediately with a routing
+        // hint instead.
+        if let Some(sentinel) = pack_sidecar_sentinel(&path) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "layer is a smolmachine pack (contains '{sentinel}') — pull it on the \
+                     host via the smolmachine flow, not as a container image"
+                ),
+            ));
+        }
 
         // Jail the on-disk path under the layer dir (defends against `..` and
         // absolute paths embedded in the archive).
@@ -3893,6 +3928,54 @@ mod tests {
         let zst = zstd::stream::encode_all(&tar_buf[..], 0).unwrap();
         assert_eq!(&zst[..4], &[0x28, 0xb5, 0x2f, 0xfd], "zstd magic");
         assert_eq!(extract(&zst), b"hello from a layer");
+    }
+
+    /// A smolmachine pack blob pulled as if it were a container image must
+    /// fail fast on its sentinel entries — before the pack's multi-GiB
+    /// storage.ext4 fills the guest disk — with a host-flow routing hint.
+    #[test]
+    fn extract_oci_layer_rejects_smolmachine_pack_blobs() {
+        // Owned by the current uid/gid so the nested-file case (which really
+        // extracts, preserving ownership) succeeds without root.
+        let uid = unsafe { libc::getuid() } as u64;
+        let gid = unsafe { libc::getgid() } as u64;
+        let build_tar = |name: &str| -> Vec<u8> {
+            let mut buf = Vec::new();
+            let mut builder = tar::Builder::new(&mut buf);
+            let body = b"not really a disk image";
+            let mut header = tar::Header::new_gnu();
+            header.set_path(name).unwrap();
+            header.set_size(body.len() as u64);
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_mode(0o644);
+            header.set_uid(uid);
+            header.set_gid(gid);
+            header.set_cksum();
+            builder.append(&header, &body[..]).unwrap();
+            builder.finish().unwrap();
+            drop(builder);
+            buf
+        };
+
+        for sentinel in ["storage.ext4", "agent-rootfs.tar", "./storage.ext4"] {
+            let dir = tempfile::tempdir().unwrap();
+            let err = extract_oci_layer(&build_tar(sentinel)[..], dir.path())
+                .expect_err("pack sentinel must abort extraction");
+            assert!(
+                err.to_string().contains("smolmachine pack"),
+                "clear error for {sentinel}, got: {err}"
+            );
+            assert!(
+                err.to_string().contains("host"),
+                "routing hint for {sentinel}, got: {err}"
+            );
+        }
+
+        // A NESTED file of the same name is legitimate image content.
+        let dir = tempfile::tempdir().unwrap();
+        extract_oci_layer(&build_tar("var/lib/foo/storage.ext4")[..], dir.path())
+            .expect("nested same-named file extracts normally");
+        assert!(dir.path().join("var/lib/foo/storage.ext4").exists());
     }
 
     #[cfg(target_os = "linux")]
