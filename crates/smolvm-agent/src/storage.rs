@@ -99,6 +99,17 @@ fn overlay_root_for_workload(workload_id: &str) -> Result<PathBuf> {
     Ok(Path::new(STORAGE_ROOT).join(OVERLAYS_DIR).join(workload_id))
 }
 
+/// Merged rootfs directory of a persistent overlay, derived without preparing
+/// it. Lets the keep-alive `crun exec` path read the running container's
+/// `/etc/passwd` (to resolve a username to a numeric uid, #632) when joining an
+/// already-running container, where no fresh `prepare_for_run_persistent` ran.
+pub fn persistent_overlay_rootfs(overlay_id: &str) -> PathBuf {
+    Path::new(STORAGE_ROOT)
+        .join(OVERLAYS_DIR)
+        .join(format!("persistent-{}", overlay_id))
+        .join("merged")
+}
+
 fn validate_container_destination_path(container_path: &str) -> Result<PathBuf> {
     if !container_path.starts_with('/') {
         return Err(StorageError::ValidationFailed {

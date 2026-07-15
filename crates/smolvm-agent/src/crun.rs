@@ -191,11 +191,15 @@ impl CrunCommand {
         c
     }
 
-    /// Run the exec/run as `--user UID[:GID]` (or a username crun resolves against
-    /// the container's /etc/passwd). No-op when `user` is None. Used so `crun exec`
-    /// honours the container's configured user (CRI RunAsUser/RunAsUserName) —
-    /// without it, exec defaults to uid 0. Inserted before the deferred positional
-    /// arguments.
+    /// Run the exec/run as `--user UID[:GID]`. No-op when `user` is None. Used so
+    /// `crun exec` honours the container's configured user (image `config.User` /
+    /// CRI RunAsUser) — without it, exec defaults to uid 0.
+    ///
+    /// NOTE: crun's `--user` CLI flag accepts only a NUMERIC uid[:gid]; a username
+    /// is rejected with "invalid USERSPEC specified" (unlike the OCI runtime
+    /// spec's `process.user`, which `crun run` resolves). Callers must pass an
+    /// already-resolved numeric spec — see `oci::resolve_exec_user_spec` (#632).
+    /// Inserted before the deferred positional arguments.
     pub fn user(mut self, user: Option<&str>) -> Self {
         if let Some(u) = user.filter(|s| !s.is_empty()) {
             self.cmd.arg("--user").arg(u);

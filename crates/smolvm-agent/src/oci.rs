@@ -176,6 +176,29 @@ pub fn resolve_process_identity(
     })
 }
 
+/// Resolve an OCI/CRI user spec — which may be a **username** (an image's
+/// `config.User`, e.g. `node`/`nobody`/`root`, or a CRI `RunAsUserName`) — to the
+/// numeric `"uid:gid"` form that `crun exec --user` requires. Unlike the OCI
+/// runtime spec's `process.user` (which `crun run` reads and resolves), crun's
+/// `--user` CLI flag only accepts numeric ids and rejects a name with
+/// `invalid USERSPEC specified` (issue #632).
+///
+/// Returns `Ok(None)` for an empty/absent spec so the exec keeps the container
+/// default. Names are resolved against the rootfs `/etc/passwd` via
+/// [`resolve_process_identity`], so this stays consistent with the `crun run`
+/// path's resolution (same uid/gid, home, groups).
+pub fn resolve_exec_user_spec(
+    rootfs: &Path,
+    user_spec: Option<&str>,
+) -> Result<Option<String>, String> {
+    let normalized = user_spec.map(str::trim).filter(|s| !s.is_empty());
+    if normalized.is_none() {
+        return Ok(None);
+    }
+    let identity = resolve_process_identity(rootfs, user_spec)?;
+    Ok(Some(format!("{}:{}", identity.user.uid, identity.user.gid)))
+}
+
 fn parse_user_spec(spec: &str) -> Result<(&str, Option<&str>), String> {
     match spec.split_once(':') {
         Some((user, group)) => {
@@ -1363,6 +1386,43 @@ mod tests {
         assert_eq!(identity.user.gid, 2345);
         assert!(identity.user.additional_gids.is_empty());
         assert!(identity.home.is_none());
+    }
+
+    #[test]
+    fn test_resolve_exec_user_spec_resolves_name_to_numeric() {
+        // crun exec --user needs numeric ids; a name (image config.User) must be
+        // resolved against the rootfs passwd — the crux of issue #632.
+        let rootfs = tempdir().unwrap();
+        let etc = rootfs.path().join("etc");
+        std::fs::create_dir_all(&etc).unwrap();
+        std::fs::write(
+            etc.join("passwd"),
+            "root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534::/:/sbin/nologin\n",
+        )
+        .unwrap();
+        std::fs::write(etc.join("group"), "root:x:0:\nnobody:x:65534:\n").unwrap();
+
+        // A username resolves to its uid:gid.
+        assert_eq!(
+            resolve_exec_user_spec(rootfs.path(), Some("nobody")).unwrap(),
+            Some("65534:65534".to_string())
+        );
+        // `root` is also a name — it must resolve to 0:0, not be rejected.
+        assert_eq!(
+            resolve_exec_user_spec(rootfs.path(), Some("root")).unwrap(),
+            Some("0:0".to_string())
+        );
+        // Numeric specs pass through unchanged.
+        assert_eq!(
+            resolve_exec_user_spec(rootfs.path(), Some("65534")).unwrap(),
+            Some("65534:65534".to_string())
+        );
+        // No user / blank → None (exec keeps the container default).
+        assert_eq!(resolve_exec_user_spec(rootfs.path(), None).unwrap(), None);
+        assert_eq!(
+            resolve_exec_user_spec(rootfs.path(), Some("  ")).unwrap(),
+            None
+        );
     }
 
     #[test]

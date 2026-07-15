@@ -3785,6 +3785,19 @@ fn spawn_interactive_command(
         return Err("empty command".into());
     }
 
+    // The keep-alive join below runs the command via `crun exec --user`, which
+    // requires a NUMERIC uid[:gid] — a username (image `config.User` / request
+    // user) is rejected with "invalid USERSPEC specified". Resolve it against the
+    // container rootfs /etc/passwd, consistent with the `crun run` path (#632).
+    // (Harmless for the fresh-container path, which re-resolves via config.json.)
+    let launch_owned = ResolvedLaunch {
+        command: launch.command.clone(),
+        env: launch.env.clone(),
+        workdir: launch.workdir.clone(),
+        user: oci::resolve_exec_user_spec(Path::new(rootfs), launch.user.as_deref())?,
+    };
+    let launch = &launch_owned;
+
     // If a main workload container is running for this overlay, join it.
     if let Some(cid) = resolve_main_container(persistent_overlay_id) {
         return spawn_exec_in_container(&cid, launch, tty);
@@ -4840,7 +4853,7 @@ fn run_in_keepalive_container(
 ) -> Result<AgentResponse, Box<dyn std::error::Error>> {
     use std::io::Write as _;
 
-    let launch = ResolvedLaunch::resolve(
+    let mut launch = ResolvedLaunch::resolve(
         image,
         command.to_vec(),
         env.to_vec(),
@@ -4850,20 +4863,30 @@ fn run_in_keepalive_container(
 
     // Reuse the running keep-alive container, or establish one now so this and
     // every later exec join the same container (PID 1 = `tail -f /dev/null`).
-    let cid = match resolve_main_container(Some(overlay_id)) {
-        Some(c) => c,
+    // Also carry the container's rootfs so the user can be resolved against its
+    // /etc/passwd below.
+    let (cid, rootfs) = match resolve_main_container(Some(overlay_id)) {
+        Some(c) => (c, storage::persistent_overlay_rootfs(overlay_id)),
         None => {
             let prepared = storage::prepare_for_run_persistent(image, overlay_id)?;
             storage::setup_mounts(&prepared.rootfs_path, mounts)?;
-            ensure_main_container(
+            let cid = ensure_main_container(
                 &prepared.rootfs_path,
                 overlay_id,
                 mounts,
                 unprivileged,
                 &launch,
-            )?
+            )?;
+            (cid, std::path::PathBuf::from(&prepared.rootfs_path))
         }
     };
+
+    // The workload runs via `crun exec --user`, which requires a NUMERIC uid[:gid]
+    // — a username (the image's `config.User`, e.g. `nobody`/`node`, or the
+    // request user) is rejected with "invalid USERSPEC specified". Resolve it
+    // against the container's /etc/passwd, matching the `crun run` path (#632).
+    launch.user = oci::resolve_exec_user_spec(&rootfs, launch.user.as_deref())
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
     let output = if let Some(data) = stdin_data {
         let mut child = crun::CrunCommand::exec(
