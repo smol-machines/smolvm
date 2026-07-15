@@ -1506,9 +1506,9 @@ fn pack_sidecar_sentinel(path: &Path) -> Option<&'static str> {
         .components()
         .filter(|c| !matches!(c, std::path::Component::CurDir));
     match (components.next(), components.next()) {
-        (Some(std::path::Component::Normal(name)), None) => SENTINELS
-            .into_iter()
-            .find(|s| name.to_str() == Some(s)),
+        (Some(std::path::Component::Normal(name)), None) => {
+            SENTINELS.into_iter().find(|s| name.to_str() == Some(s))
+        }
         _ => None,
     }
 }

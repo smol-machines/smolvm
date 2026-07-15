@@ -73,7 +73,10 @@ fn explicit_registry_host(image: &str) -> Option<&str> {
 /// Docker Hub aliases — never serve packs, so skip the probe entirely rather
 /// than pay a cold manifest round-trip on every Hub pull.
 fn is_docker_hub(host: &str) -> bool {
-    matches!(host, "docker.io" | "index.docker.io" | "registry-1.docker.io")
+    matches!(
+        host,
+        "docker.io" | "index.docker.io" | "registry-1.docker.io"
+    )
 }
 
 /// Probe `image`'s manifest and, if it is a smolmachine pack artifact, pull
