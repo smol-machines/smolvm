@@ -314,8 +314,32 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
     }
 }
 
+/// IPC-import a golden physical from `fd`, retrying on transient failure with a
+/// ctx_synchronize between attempts. Defense-in-depth: the deterministic e=999
+/// import failure was the CLOEXEC fd handoff (fixed in spawn_clone_worker); this
+/// guards the remaining first-import-in-fresh-context warm-up window.
+#[cfg(unix)]
+fn import_with_retry(b: &mut dyn Backend, fd: i32) -> Result<u64, i32> {
+    let mut last = 0;
+    for attempt in 0..5 {
+        match b.mem_import_handle(fd) {
+            Ok(h) => {
+                if attempt > 0 {
+                    tracing::info!(fd, attempt, "M2: import succeeded on retry");
+                }
+                return Ok(h);
+            }
+            Err(e) => {
+                last = e;
+                let _ = b.ctx_synchronize();
+            }
+        }
+    }
+    Err(last)
+}
+
 /// M2: rebuild the golden's VMM layout in THIS worker's context at the golden's
-/// EXACT VAs. `layout` = `"resv=va:size,…|maps=va:size:fdidx:ghandle,…"` (hex);
+/// EXACT VAs. `layout` = `"resv=va:size,…|maps=va:size:fdidx:loaded:ghandle,…"` (hex);
 /// each map's physical was exported by the daemon to fd `4 + fdidx`. We import +
 /// map at the same VA — address-preserving, so inherited pointers and rebuilt
 /// graphs are valid verbatim. (Weights are shared here; private-mutable copy for
@@ -349,7 +373,8 @@ fn reconstruct_golden_memory(
             }
         }
     }
-    let mut count = 0;
+    let share_weights = smolvm_cuda::host::path3_share_weights_enabled();
+    let (mut count, mut shared) = (0, 0);
     for e in maps_s.split(',').filter(|s| !s.is_empty()) {
         let f: Vec<&str> = e.split(':').collect();
         if f.len() < 3 {
@@ -358,8 +383,51 @@ fn reconstruct_golden_memory(
         let (Some(va), Some(size), Ok(idx)) = (hx(f[0]), hx(f[1]), f[2].parse::<i32>()) else {
             continue;
         };
-        // 4th field: the golden's handle value for this chunk (hex).
-        let golden_h = f.get(3).and_then(|s| hx(s));
+        // 4th field (loaded) marks a fully-H2D-covered weight range; 5th is the
+        // golden's handle value for this chunk (hex).
+        let loaded = f.get(3).map(|s| *s == "1").unwrap_or(false);
+        let golden_h = f.get(4).and_then(|s| hx(s));
+
+        // DENSITY (opt-in, SMOLVM_CUDA_PATH3_SHARE_WEIGHTS): a loaded weight range is
+        // read-only during frozen-base fine-tuning (LoRA freezes the base; only the
+        // clone's PRIVATE adapters train), so SHARE the golden's physical at its VA —
+        // every clone imports the same physical, so one weight set lives in VRAM.
+        // Mapped READ-WRITE: unsloth's fix_untrained_tokens writes the embedding at
+        // trainer setup, and that write is identical across clones (same base → same
+        // fix), so sharing stays correct for this use case (verified by each clone
+        // still learning its distinct task). On ANY share failure, fall through to a
+        // private copy — never leave the VA unmapped (a hole faults the clone).
+        if share_weights && loaded {
+            let mut ok = false;
+            if let Ok(gh) = import_with_retry(b, 4 + idx) {
+                if b.mem_map(va, size, 0, gh).is_ok() {
+                    if b.mem_set_access(va, size, 0).is_ok() {
+                        ok = true;
+                    } else {
+                        let _ = b.mem_unmap(va, size); // roll back for the fallback
+                    }
+                }
+                match (ok, golden_h) {
+                    // Keep gh held and record golden→worker: the clone later
+                    // releases this chunk by the GOLDEN's handle value.
+                    (true, Some(g)) => {
+                        vmm_trans.insert(g, gh);
+                    }
+                    // Legacy layout (no handle field) or failure: the va mapping
+                    // holds its own ref, so drop ours.
+                    _ => {
+                        let _ = b.mem_release(gh);
+                    }
+                }
+            }
+            if ok {
+                shared += 1;
+                count += 1;
+                continue;
+            }
+            tracing::warn!(idx, "M2-share: share failed → private-copy fallback");
+            // fall through to the private path (va stays reserved + unmapped)
+        }
         // Private-mutable, address-preserving: map a PRIVATE physical at the golden
         // VA, then copy the golden's bytes in via a temp mapping of the imported
         // physical. Reads see the golden's data; writes hit the clone's own copy,
@@ -383,7 +451,7 @@ fn reconstruct_golden_memory(
         if let Err(e) = b.mem_set_access(va, size, 0) {
             tracing::warn!(e, va, "M2: private set_access failed");
         }
-        match b.mem_import_handle(4 + idx) {
+        match import_with_retry(b, 4 + idx) {
             Ok(gh) => {
                 if let Ok(tmp) = b.mem_address_reserve(size, 0) {
                     match b.mem_map(tmp, size, 0, gh) {
@@ -408,6 +476,9 @@ fn reconstruct_golden_memory(
             Err(e) => tracing::warn!(e, idx, "M2: import failed"),
         }
         count += 1;
+    }
+    if share_weights {
+        tracing::info!(shared, private = count - shared, "M2: shared weight ranges");
     }
     (count, vmm_trans)
 }
@@ -572,7 +643,8 @@ fn spawn_clone_worker(conn_fd: std::os::unix::io::RawFd, token: u64) -> io::Resu
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no golden layout for token"))?;
     // Export each map's physical to a POSIX fd (in the golden's shared context) and
     // build the layout string the worker parses
-    // ("resv=va:size,…|maps=va:size:fdidx:ghandle,…"; ghandle = the golden's
+    // ("resv=va:size,…|maps=va:size:fdidx:loaded:ghandle,…"; loaded=1 → shareable
+    // weight; ghandle = the golden's
     // handle value, so the worker can translate the clone's inherited
     // MemRelease/MemMap handles to its own).
     let mut backend = make_backend();
@@ -592,11 +664,12 @@ fn spawn_clone_worker(conn_fd: std::os::unix::io::RawFd, token: u64) -> io::Resu
     }
     layout.push_str("|maps=");
     let mut export_fds: Vec<i32> = Vec::new();
-    for (va, size, handle) in &maps {
+    for (va, size, handle, loaded) in &maps {
         if let Ok(efd) = backend.mem_export_handle(*handle) {
             let idx = export_fds.len();
             export_fds.push(efd);
-            layout.push_str(&format!("{va:x}:{size:x}:{idx}:{handle:x},"));
+            let ld = u8::from(*loaded);
+            layout.push_str(&format!("{va:x}:{size:x}:{idx}:{ld}:{handle:x},"));
         }
     }
     // M3a: serialize the golden's modules (images) + functions to a temp file for
