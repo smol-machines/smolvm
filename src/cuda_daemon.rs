@@ -605,6 +605,20 @@ fn spawn_clone_worker(conn_fd: std::os::unix::io::RawFd, token: u64) -> io::Resu
                     return Err(std::io::Error::last_os_error());
                 }
             }
+            // The export fds from cuMemExportToShareableHandle are O_CLOEXEC. dup2 to
+            // a DIFFERENT fd clears CLOEXEC, but dup2(fd, fd) — when an export fd
+            // already sits at its destination (commonly the first, fd 4) — is a
+            // no-op that does NOT clear it, so that fd would be closed on exec and
+            // the worker's import fails e=999 (a region left uninitialized → a later
+            // read of a weight there faults). Clear CLOEXEC on every handed-off fd.
+            if libc::fcntl(3, libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            for i in 0..export_fds.len() as i32 {
+                if libc::fcntl(4 + i, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
             Ok(())
         });
     }
