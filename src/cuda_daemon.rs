@@ -503,10 +503,10 @@ fn spawn_clone_worker(conn_fd: std::os::unix::io::RawFd, token: u64) -> io::Resu
     let mut backend = make_backend();
     backend
         .init()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("worker-export init: {e}")))?;
+        .map_err(|e| io::Error::other(format!("worker-export init: {e}")))?;
     backend
         .primary_ctx_retain(0)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("ctx retain: {e}")))?;
+        .map_err(|e| io::Error::other(format!("ctx retain: {e}")))?;
     // Commit the golden's pending device work so its writes are visible in the
     // physical the clone will IPC-import (the golden runs on another thread of the
     // shared primary context).

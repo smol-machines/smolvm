@@ -1,10 +1,12 @@
 //! Path 3 primitive spike — validates the address-preserving IPC primitives the
 //! per-clone-process isolation needs:
-//!   * `mem_create_exportable` + `mem_export_handle` → a POSIX fd for a physical,
-//!   * `mem_import_handle` → the physical back, mapped at a SECOND VA that must
-//!     alias the first (reads back bytes written through VA_a), and
-//!   * `mem_address_reserve_fixed` → reserve at an exact VA (place a clone's
-//!     memory at the golden's address).
+//!
+//! - `mem_create_exportable` + `mem_export_handle` give a POSIX fd for a physical.
+//! - `mem_import_handle` maps that physical back at a SECOND VA that aliases the
+//!   first (reads back bytes written through VA_a).
+//! - `mem_address_reserve_fixed` reserves at an exact VA (place a clone's memory
+//!   at the golden's address).
+//!
 //! Cross-process separate-UVA behavior is proven in scratchpad/spike_vmm_ipc.py;
 //! this validates the in-tree `GpuBackend` primitives added for Path 3.
 //!
