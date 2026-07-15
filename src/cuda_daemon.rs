@@ -102,6 +102,31 @@ pub fn run(sock: &Path) -> io::Result<()> {
                             match stream {
                                 Ok(s) => {
                                     let _ = s.set_nodelay(true); // low-latency RPC
+                                    // Path 3: a REMOTE isolating fork clone (its VM
+                                    // proxies here over TCP) gets a worker process
+                                    // exactly like a local one — the golden's memory
+                                    // and the clone worker both live on THIS GPU
+                                    // host; only the RPC crosses the network.
+                                    #[cfg(unix)]
+                                    {
+                                        use std::os::unix::io::AsRawFd;
+                                        let fd = s.as_raw_fd();
+                                        if let Some(token) = peek_clone_token(fd) {
+                                            match spawn_clone_worker(fd, token) {
+                                                Ok(()) => {
+                                                    tracing::info!(
+                                                        token,
+                                                        "routed REMOTE isolating clone to a worker process"
+                                                    );
+                                                    drop(s); // the worker owns it now
+                                                    continue;
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!(error = %e, "remote clone-worker spawn failed; serving in-process");
+                                                }
+                                            }
+                                        }
+                                    }
                                     spawn_serve(s, &active_tcp);
                                 }
                                 Err(e) => {
@@ -262,13 +287,35 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
             "cuda clone-worker: staged modules for lazy reload + remapped handles"
         );
     }
-    // SAFETY: the daemon handed us sole ownership of the accepted connection fd.
-    let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+    // The handed-off connection may be a local UDS (VM on this host) or a TCP
+    // socket (remote client driving this GPU host) — wrap by actual domain.
+    let mut domain: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: plain getsockopt on a valid fd with a correctly-sized out buffer.
+    unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_DOMAIN,
+            &mut domain as *mut _ as *mut libc::c_void,
+            &mut len,
+        );
+    }
     tracing::info!(
         fd,
+        tcp = domain != libc::AF_UNIX,
         "cuda clone-worker: serving in its own context / UVA space"
     );
-    serve(stream, backend.as_mut())
+    if domain == libc::AF_UNIX {
+        // SAFETY: the daemon handed us sole ownership of the accepted fd.
+        let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+        serve(stream, backend.as_mut())
+    } else {
+        // SAFETY: as above; a TCP connection from the daemon's network listener.
+        let stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+        let _ = stream.set_nodelay(true);
+        serve(stream, backend.as_mut())
+    }
 }
 
 /// M2: rebuild the golden's VMM layout in THIS worker's context at the golden's
