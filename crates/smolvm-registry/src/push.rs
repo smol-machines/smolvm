@@ -104,10 +104,24 @@ pub async fn push(
     let config_digest = client.push_blob(repo, &config_json).await?;
     let config_size = config_json.len() as u64;
 
-    // 5. Build OCI Image Manifest.
+    // 5. Build OCI Image Manifest. `artifactType` + annotations make the
+    // manifest a well-behaved OCI 1.1 artifact: any generic client (oras,
+    // crane) can pull and classify it, while container runtimes still refuse
+    // to run it because the layer media type is not an image layer.
+    let annotations = std::collections::BTreeMap::from([
+        (
+            "org.opencontainers.image.title".to_string(),
+            format!("{repo}:{reference}"),
+        ),
+        (
+            "com.smolmachines.pack.mode".to_string(),
+            format!("{:?}", manifest.mode).to_lowercase(),
+        ),
+    ]);
     let oci_manifest = OciManifest {
         schema_version: 2,
         media_type: MANIFEST_MEDIA_TYPE.to_string(),
+        artifact_type: Some(LAYER_MEDIA_TYPE.to_string()),
         config: OciDescriptor {
             media_type: CONFIG_MEDIA_TYPE.to_string(),
             digest: config_digest,
@@ -118,6 +132,7 @@ pub async fn push(
             digest: layer_digest.clone(),
             size: layer_size,
         }],
+        annotations: Some(annotations),
     };
 
     let manifest_json = serde_json::to_vec_pretty(&oci_manifest)?;
