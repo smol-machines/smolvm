@@ -122,7 +122,10 @@ pub fn run(sock: &Path) -> io::Result<()> {
                                                     continue;
                                                 }
                                                 Err(e) => {
-                                                    tracing::warn!(error = %e, "remote clone-worker spawn failed; serving in-process");
+                                                    // See the UDS arm: reject, fail fast.
+                                                    tracing::warn!(error = %e, token, "remote clone-worker spawn failed; rejecting the clone connection");
+                                                    drop(s);
+                                                    continue;
                                                 }
                                             }
                                         }
@@ -167,7 +170,16 @@ pub fn run(sock: &Path) -> io::Result<()> {
                                 continue;
                             }
                             Err(e) => {
-                                tracing::warn!(error = %e, "clone-worker spawn failed; serving in-process");
+                                // REJECT rather than serve in-process: this IS an
+                                // isolating clone (peek matched), and the legacy
+                                // shared path can't serve it — its inherited
+                                // pointers are garbage in a fresh context, so the
+                                // guest would wedge mid-training (seen after a
+                                // daemon restart orphaned a lineage). Closing
+                                // makes the guest fail fast instead.
+                                tracing::warn!(error = %e, token, "clone-worker spawn failed; rejecting the clone connection");
+                                drop(stream);
+                                continue;
                             }
                         }
                     }
