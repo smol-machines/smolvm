@@ -289,18 +289,14 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
     }
     // The handed-off connection may be a local UDS (VM on this host) or a TCP
     // socket (remote client driving this GPU host) — wrap by actual domain.
-    let mut domain: libc::c_int = 0;
-    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-    // SAFETY: plain getsockopt on a valid fd with a correctly-sized out buffer.
+    // (getsockname is portable unix; SO_DOMAIN would be Linux-only.)
+    let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    // SAFETY: plain getsockname on a valid fd with a correctly-sized out buffer.
     unsafe {
-        libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_DOMAIN,
-            &mut domain as *mut _ as *mut libc::c_void,
-            &mut len,
-        );
+        libc::getsockname(fd, &mut addr as *mut _ as *mut libc::sockaddr, &mut len);
     }
+    let domain = libc::c_int::from(addr.ss_family);
     tracing::info!(
         fd,
         tcp = domain != libc::AF_UNIX,
