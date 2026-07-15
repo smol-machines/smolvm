@@ -49,6 +49,27 @@ pub fn start(socket_path: &Path) -> std::io::Result<()> {
     let listener = UdsListener::bind(socket_path)?;
     let path_display = socket_path.display().to_string();
 
+    // One-time, launch-time preflight: if this host can't load the CUDA driver,
+    // every guest connection falls back to a CPU-emulation backend that only
+    // services a built-in test kernel, so a real workload (PyTorch, a custom
+    // kernel, cuBLAS) dies deep inside the guest with a cryptic
+    // CUDA_ERROR_NOT_FOUND. Warn the user plainly here instead. Warn-and-continue
+    // rather than fail: the emulation backend is intentionally useful for the
+    // built-in test path and for development on GPU-less hosts (e.g. macOS).
+    // Skipped when relaying to an external daemon, which may own the GPU on a
+    // different host than this process.
+    if std::env::var_os("SMOLVM_CUDA_DAEMON").is_none() {
+        if let Err(e) = GpuBackend::load() {
+            eprintln!(
+                "warning: CUDA remoting is enabled but this host has no usable CUDA GPU \
+                 ({e}); guest CUDA calls will run on a CPU-emulation backend that only \
+                 supports a built-in test kernel — real CUDA/PyTorch workloads will fail. \
+                 Run on a Linux host with an NVIDIA GPU and driver for real acceleration."
+            );
+            tracing::warn!(error = %e, "cuda-host: no usable host GPU at launch; CPU-emulation fallback active");
+        }
+    }
+
     thread::Builder::new()
         .name("cuda-host".into())
         .spawn(move || {
