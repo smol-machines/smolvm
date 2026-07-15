@@ -1,316 +1,182 @@
-//! Live validation of the snapshot-capture helper-VM mechanism.
+//! Live validation of the shared container-overlay primitive (capture + seed).
 //!
-//! This exercises the exact path `snapshot_machine`'s `capture_overlay_blocking`
-//! uses — boot a helper VM with a source machine's storage disk attached as
-//! `/dev/vdc`, mount it read-only, and `tar` the container overlay upper dir —
-//! against a REAL ext4 `storage.raw`, using only public `smolvm` API.
+//! Exercises the REAL `agent::capture_overlay_tar` / `agent::seed_overlay_tar` —
+//! the exact functions `pack create --from-vm`, the snapshot endpoint, and
+//! restore all route through — by booting helper VMs against a synthetic ext4
+//! `storage.raw` built in-test with `mkfs.ext4 -d` (no root required).
 //!
-//! Ignored by default (needs a libkrun dylib + a real storage disk). Run with:
+//! `#[ignore]` by default: needs a libkrun dylib to boot a VM, plus `mkfs.ext4`
+//! (Linux, e2fsprogs) to build the disk. The boot-helper binary is located
+//! automatically via `CARGO_BIN_EXE_smolvm`, so `SMOLVM_BOOT_BINARY` does NOT
+//! need to be set by hand. Run with:
 //!   SMOLVM_LIB_DIR=/path/to/lib \
-//!   SNAP_TEST_STORAGE=/path/to/vms/<id>/storage.raw \
 //!   cargo test --test snapshot_capture_live -- --ignored --nocapture
+//!
+//! Without the `SMOLVM_BOOT_BINARY` shim below, these tests would silently
+//! "fail to boot" (`boot process exited code 0 before agent ready`): under
+//! `cargo test`, `current_exe()` is the test harness, which has no `_boot-vm`
+//! subcommand, so `start_via_subprocess` spawns a process that exits instantly.
 
-use smolvm::agent::{AgentManager, LaunchFeatures, VmResources};
+use smolvm::agent::{capture_overlay_tar, seed_overlay_tar};
 use smolvm::storage::DiskFormat;
+use std::path::PathBuf;
 
-#[test]
-#[ignore]
-fn helper_vm_captures_overlay_tar() {
-    let storage = std::env::var("SNAP_TEST_STORAGE")
-        .expect("set SNAP_TEST_STORAGE to a machine storage.raw path");
-    let storage_path = std::path::PathBuf::from(&storage);
-    assert!(storage_path.exists(), "storage disk not found: {}", storage);
+const VM: &str = "snaplive";
 
-    let helper = format!("snaptest-helper-{}", std::process::id());
-    let manager = AgentManager::for_vm(&helper).expect("helper manager");
-
-    let features = LaunchFeatures {
-        extra_disks: vec![(storage_path, false, DiskFormat::Raw)],
-        ..Default::default()
-    };
-    manager
-        .start_with_full_config(
-            Vec::new(),
-            Vec::new(),
-            VmResources {
-                cpus: 2,
-                memory_mib: 2048,
-                network: false,
-                network_backend: None,
-                gpu: false,
-                gpu_vram_mib: None,
-                cuda: false,
-                rosetta: false,
-                storage_gib: None,
-                overlay_gib: None,
-                allowed_cidrs: None,
-                dns: None,
-            },
-            features,
-        )
-        .expect("start helper VM");
-
-    let outcome = {
-        let mut client = manager.connect().expect("connect helper VM");
-
-        // Mount the source storage disk (/dev/vdc) read-only.
-        let (code, _, stderr) = client
-            .vm_exec(
-                vec![
-                    "sh".into(),
-                    "-c".into(),
-                    "mkdir -p /mnt/src && mount -o ro /dev/vdc /mnt/src".into(),
-                ],
-                vec![],
-                None,
-                None,
-                None,
-            )
-            .expect("mount exec");
-        assert_eq!(
-            code,
-            0,
-            "mount /dev/vdc failed: {}",
-            String::from_utf8_lossy(&stderr)
-        );
-
-        // Show what overlays exist — this is what a real capture would tar.
-        let (_, out, _) = client
-            .vm_exec(
-                vec![
-                    "sh".into(),
-                    "-c".into(),
-                    "ls -1 /mnt/src/overlays 2>/dev/null; \
-                     echo '---upper sizes---'; \
-                     du -sh /mnt/src/overlays/*/upper 2>/dev/null | head"
-                        .into(),
-                ],
-                vec![],
-                None,
-                None,
-                None,
-            )
-            .expect("list overlays exec");
-        println!("[overlays on disk]\n{}", String::from_utf8_lossy(&out));
-
-        // Tar the FIRST persistent overlay's upper dir if one exists, else tar an
-        // empty dir — same empty-safe behavior as capture_overlay_blocking.
-        let script = "set -e; \
-             U=$(ls -d /mnt/src/overlays/persistent-*/upper 2>/dev/null | head -1); \
-             mkdir -p /tmp/empty; \
-             if [ -n \"$U\" ]; then echo \"capturing $U\"; tar cf /tmp/snap.tar -C \"$U\" . ; \
-             else echo 'no persistent overlay; empty tar'; tar cf /tmp/snap.tar -C /tmp/empty . ; fi; \
-             echo \"tar bytes: $(wc -c < /tmp/snap.tar)\"";
-        let (code, out, stderr) = client
-            .vm_exec(
-                vec!["sh".into(), "-c".into(), script.into()],
-                vec![],
-                None,
-                None,
-                None,
-            )
-            .expect("tar exec");
-        println!("[tar step]\n{}", String::from_utf8_lossy(&out));
-        assert_eq!(code, 0, "tar failed: {}", String::from_utf8_lossy(&stderr));
-
-        // Read the tar back out — this is the byte stream the endpoint returns.
-        let tar = client.read_file("/tmp/snap.tar").expect("read snap.tar");
-        assert!(!tar.is_empty(), "snapshot tar is unexpectedly empty");
-        // A valid (even empty) tar is >= 512 bytes (one zeroed record block).
-        assert!(
-            tar.len() >= 512,
-            "snapshot tar too small to be a valid archive: {} bytes",
-            tar.len()
-        );
-        println!(
-            "[captured] {} tar bytes read back from helper VM",
-            tar.len()
-        );
-        tar.len()
-    };
-
-    let _ = manager.stop();
-    println!("helper VM stopped; captured {} bytes", outcome);
+/// Point the boot subprocess at the freshly-built `smolvm` binary. Cargo builds
+/// the `smolvm` bin before integration tests and exposes its path via
+/// `CARGO_BIN_EXE_smolvm`; the harness binary that `current_exe()` returns can't
+/// serve `_boot-vm`. Idempotent, and only sets the var if the caller hasn't.
+fn ensure_boot_binary() {
+    if std::env::var_os("SMOLVM_BOOT_BINARY").is_none() {
+        std::env::set_var("SMOLVM_BOOT_BINARY", env!("CARGO_BIN_EXE_smolvm"));
+    }
 }
 
-/// Round-trip the RESTORE write path: seed an overlay into a real ext4 disk via
-/// one helper VM, then prove it survived (sync + umount + VM teardown reached
-/// the host disk image) by reading it back in a SECOND helper VM. This is the
-/// property capture's read-only test can't cover.
-///
-/// Writes to a COW copy of SNAP_TEST_STORAGE so the source disk is untouched.
-/// Run with the same env as `helper_vm_captures_overlay_tar` (see module docs).
-#[test]
-#[ignore]
-fn restore_seeds_overlay_persistently() {
-    let src = std::env::var("SNAP_TEST_STORAGE")
-        .expect("set SNAP_TEST_STORAGE to a machine storage.raw path");
-    // COW copy (clonefile on APFS) so the original disk is never modified.
-    let scratch = format!("/tmp/snaptest-restore-{}.raw", std::process::id());
-    let status = std::process::Command::new("cp")
-        .args(["-c", src.as_str(), scratch.as_str()])
-        .status()
-        .expect("cp -c");
-    assert!(status.success(), "failed to COW-copy disk");
-    let scratch_path = std::path::PathBuf::from(&scratch);
-    let _cleanup = DropFile(scratch.clone());
-
-    // Build a tiny overlay tar host-side containing a known marker file.
-    let stage = format!("/tmp/snaptest-stage-{}", std::process::id());
-    std::fs::create_dir_all(format!("{}/etc", stage)).unwrap();
-    std::fs::write(format!("{}/RESTORE_MARKER", stage), b"durable-restore\n").unwrap();
-    std::fs::write(format!("{}/etc/myconf", stage), b"hello\n").unwrap();
-    let tar_path = format!("/tmp/snaptest-overlay-{}.tar", std::process::id());
-    let status = std::process::Command::new("tar")
-        .args(["cf", tar_path.as_str(), "-C", stage.as_str(), "."])
-        .status()
-        .expect("tar");
-    assert!(status.success(), "failed to build overlay tar");
-    let tar = std::fs::read(&tar_path).unwrap();
-    let _t = DropFile(tar_path);
-    let _s = DropDir(stage);
-    println!("[restore] staged overlay tar: {} bytes", tar.len());
-
-    let overlay_id = "roundtrip";
-
-    // --- Phase 1: write the overlay into the scratch disk via a helper VM. ---
-    {
-        let wname = format!("snaptest-w-{}", std::process::id());
-        let m = AgentManager::for_vm(&wname).expect("writer manager");
-        m.start_with_full_config(
-            Vec::new(),
-            Vec::new(),
-            helper_resources(),
-            LaunchFeatures {
-                extra_disks: vec![(scratch_path.clone(), false, DiskFormat::Raw)], // read-write
-                ..Default::default()
-            },
-        )
-        .expect("start writer VM");
-
-        {
-            let mut c = m.connect().expect("connect writer");
-            let (code, _, e) = c
-                .vm_exec(
-                    sh("mkdir -p /mnt/src && mount /dev/vdc /mnt/src"),
-                    vec![],
-                    None,
-                    None,
-                    None,
-                )
-                .expect("mount rw");
-            assert_eq!(code, 0, "mount rw failed: {}", String::from_utf8_lossy(&e));
-
-            c.write_file("/tmp/restore.tar", &tar, None)
-                .expect("push tar");
-
-            let root = format!("/mnt/src/overlays/persistent-{}", overlay_id);
-            let script = format!(
-                "set -e; rm -rf '{r}'; mkdir -p '{r}/upper'; \
-                 tar xf /tmp/restore.tar -C '{r}/upper'; sync; umount /mnt/src",
-                r = root
-            );
-            let (code, _, e) = c
-                .vm_exec(sh(&script), vec![], None, None, None)
-                .expect("untar");
-            assert_eq!(code, 0, "untar failed: {}", String::from_utf8_lossy(&e));
+/// Build a synthetic ext4 `storage.raw` holding `overlays/persistent-<VM>/upper`
+/// populated with `files` (relative path → contents). Uses `mkfs.ext4 -d` so no
+/// root/loop-mount is needed. Panics with a clear message if `mkfs.ext4` is
+/// absent — the test is explicitly opt-in (`--ignored`), so a silent skip would
+/// just re-create the gap this file exists to close.
+fn build_storage_disk(files: &[(&str, &[u8])]) -> Disk {
+    let base = std::env::temp_dir().join(format!("snaplive-{}", std::process::id()));
+    let stage = base.join("stage");
+    let upper = stage.join(format!("overlays/persistent-{}/upper", VM));
+    std::fs::create_dir_all(&upper).unwrap();
+    for (rel, contents) in files {
+        let p = upper.join(rel);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).unwrap();
         }
-        let _ = m.stop();
-        println!("[restore] phase 1 done — overlay written + VM torn down");
+        std::fs::write(&p, contents).unwrap();
     }
 
-    // --- Phase 2: a fresh helper VM must see the persisted marker. ---
-    {
-        let rname = format!("snaptest-r-{}", std::process::id());
-        let m = AgentManager::for_vm(&rname).expect("reader manager");
-        m.start_with_full_config(
-            Vec::new(),
-            Vec::new(),
-            helper_resources(),
-            LaunchFeatures {
-                extra_disks: vec![(scratch_path.clone(), true, DiskFormat::Raw)], // read-only verify
-                ..Default::default()
-            },
-        )
-        .expect("start reader VM");
-
-        let found = {
-            let mut c = m.connect().expect("connect reader");
-            let (code, _, e) = c
-                .vm_exec(
-                    sh("mkdir -p /mnt/src && mount -o ro /dev/vdc /mnt/src"),
-                    vec![],
-                    None,
-                    None,
-                    None,
-                )
-                .expect("mount ro");
-            assert_eq!(code, 0, "mount ro failed: {}", String::from_utf8_lossy(&e));
-
-            let upper = format!("/mnt/src/overlays/persistent-{}/upper", overlay_id);
-            let (code, out, _) = c
-                .vm_exec(
-                    sh(&format!(
-                        "cat '{u}/RESTORE_MARKER' 2>/dev/null; echo '|'; cat '{u}/etc/myconf' 2>/dev/null",
-                        u = upper
-                    )),
-                    vec![],
-                    None,
-                    None,
-                    None,
-                )
-                .expect("read marker");
-            assert_eq!(code, 0, "read marker exec failed");
-            String::from_utf8_lossy(&out).to_string()
-        };
-        let _ = m.stop();
-
-        println!("[restore] phase 2 read back: {:?}", found);
-        assert!(
-            found.contains("durable-restore"),
-            "RESTORE_MARKER did not persist across VM teardown: {:?}",
-            found
-        );
-        assert!(
-            found.contains("hello"),
-            "nested etc/myconf missing: {:?}",
-            found
-        );
-        println!("[restore] PASS — overlay persisted across helper-VM teardown");
-    }
+    let disk = base.join("storage.raw");
+    let status = std::process::Command::new("mkfs.ext4")
+        .args([
+            "-F",
+            "-q",
+            "-d",
+            &stage.to_string_lossy(),
+            &disk.to_string_lossy(),
+            "128M",
+        ])
+        .status()
+        .expect("run mkfs.ext4 (install e2fsprogs; this test needs Linux)");
+    assert!(status.success(), "mkfs.ext4 failed to build the test disk");
+    Disk { disk, base }
 }
 
-fn helper_resources() -> VmResources {
-    VmResources {
-        cpus: 2,
-        memory_mib: 2048,
-        network: false,
-        network_backend: None,
-        gpu: false,
-        gpu_vram_mib: None,
-        cuda: false,
-        rosetta: false,
-        storage_gib: None,
-        overlay_gib: None,
-        allowed_cidrs: None,
-        dns: None,
-    }
+struct Disk {
+    disk: PathBuf,
+    base: PathBuf,
 }
-
-fn sh(script: &str) -> Vec<String> {
-    vec!["sh".into(), "-c".into(), script.into()]
-}
-
-struct DropFile(String);
-impl Drop for DropFile {
+impl Drop for Disk {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        let _ = std::fs::remove_dir_all(&self.base);
     }
 }
 
-struct DropDir(String);
-impl Drop for DropDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
+fn tar_has(tar: &[u8], name: &str) -> bool {
+    // tar stores each member's path as ASCII in its 512-byte header.
+    String::from_utf8_lossy(tar).contains(name)
+}
+
+/// Capture must boot a read-only helper VM, mount the disk, and return the
+/// overlay `upper` dir as a tar with the expected files.
+#[test]
+#[ignore]
+fn capture_overlay_reads_persisted_overlay() {
+    ensure_boot_binary();
+    let d = build_storage_disk(&[("MARKER", b"capture-me\n"), ("etc/conf", b"nested\n")]);
+
+    let cap = capture_overlay_tar(VM, &d.disk, DiskFormat::Raw).expect("capture_overlay_tar");
+    println!(
+        "[capture] {} tar bytes, had_content={}",
+        cap.tar.len(),
+        cap.had_content
+    );
+    assert!(cap.had_content, "expected a non-empty overlay");
+    assert!(
+        cap.tar.len() >= 512,
+        "tar too small to be valid: {}",
+        cap.tar.len()
+    );
+    assert!(tar_has(&cap.tar, "MARKER"), "captured tar missing MARKER");
+    assert!(tar_has(&cap.tar, "conf"), "captured tar missing etc/conf");
+    println!("[capture] PASS — overlay contents captured via shared primitive");
+}
+
+/// Empty-safe: a never-modified overlay still yields a valid (empty) archive.
+#[test]
+#[ignore]
+fn capture_empty_overlay_is_valid_archive() {
+    ensure_boot_binary();
+    let d = build_storage_disk(&[]); // upper dir exists but is empty
+
+    let cap = capture_overlay_tar(VM, &d.disk, DiskFormat::Raw).expect("capture_overlay_tar");
+    println!(
+        "[empty] {} tar bytes, had_content={}",
+        cap.tar.len(),
+        cap.had_content
+    );
+    assert!(
+        !cap.had_content,
+        "empty overlay should report had_content=false"
+    );
+    assert!(
+        cap.tar.len() >= 512,
+        "empty tar must still be a valid archive"
+    );
+    println!("[empty] PASS — empty overlay yields a valid empty archive");
+}
+
+/// Round-trip the RESTORE write path: seed an overlay into a real ext4 disk
+/// (read-write helper VM, sync + umount + teardown), then prove it reached the
+/// host disk image by re-capturing it in a fresh (read-only) helper VM. Also
+/// proves the replace semantics: prior overlay content is gone.
+#[test]
+#[ignore]
+fn seed_then_capture_roundtrips() {
+    ensure_boot_binary();
+    // Start with an OLD overlay so we can prove seed replaces it.
+    let d = build_storage_disk(&[("OLD_MARKER", b"stale\n")]);
+
+    // Build the new overlay tar host-side.
+    let stage = std::env::temp_dir().join(format!("snaplive-seed-{}", std::process::id()));
+    std::fs::create_dir_all(stage.join("etc")).unwrap();
+    std::fs::write(stage.join("SEEDED_MARKER"), b"durable-restore\n").unwrap();
+    std::fs::write(stage.join("etc/myconf"), b"hello\n").unwrap();
+    let tar_path = std::env::temp_dir().join(format!("snaplive-seed-{}.tar", std::process::id()));
+    let ok = std::process::Command::new("tar")
+        .args([
+            "cf",
+            &tar_path.to_string_lossy(),
+            "-C",
+            &stage.to_string_lossy(),
+            ".",
+        ])
+        .status()
+        .expect("tar")
+        .success();
+    assert!(ok, "failed to build overlay tar");
+    let tar = std::fs::read(&tar_path).unwrap();
+
+    seed_overlay_tar(VM, &d.disk, DiskFormat::Raw, &tar).expect("seed_overlay_tar");
+    let cap = capture_overlay_tar(VM, &d.disk, DiskFormat::Raw).expect("recapture");
+    println!("[roundtrip] recaptured {} tar bytes", cap.tar.len());
+
+    assert!(
+        tar_has(&cap.tar, "SEEDED_MARKER"),
+        "seeded marker did not persist"
+    );
+    assert!(tar_has(&cap.tar, "myconf"), "nested seeded file missing");
+    assert!(
+        !tar_has(&cap.tar, "OLD_MARKER"),
+        "prior overlay survived a replace-seed"
+    );
+    println!("[roundtrip] PASS — seed persisted across teardown and replaced prior overlay");
+
+    let _ = std::fs::remove_file(&tar_path);
+    let _ = std::fs::remove_dir_all(&stage);
 }
