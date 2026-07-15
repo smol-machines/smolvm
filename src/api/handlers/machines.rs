@@ -30,9 +30,7 @@ use axum::{
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::agent::{
-    vm_data_dir, AgentClient, AgentManager, HostMount, LaunchFeatures, VmResources,
-};
+use crate::agent::{resolve_disk_image, vm_data_dir, AgentClient, AgentManager, HostMount};
 use crate::api::error::ApiError;
 use crate::api::state::{
     vm_resources_to_spec, with_machine_client_traced, ApiState, MachineEntry, MachineRegistration,
@@ -52,6 +50,7 @@ use crate::process::{
     is_alive, is_our_process_strict, process_start_time, stop_vm_process, VM_SIGKILL_TIMEOUT,
     VM_SIGTERM_TIMEOUT,
 };
+use crate::storage::STORAGE_DISK_FILENAME;
 use crate::storage::{expand_disk, DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
 use crate::util::generate_machine_name;
 use crate::Error as SmolvmError;
@@ -1825,146 +1824,22 @@ pub async fn snapshot_machine(
     Ok(Bytes::from(tar))
 }
 
-/// Boot a short-lived, network-less helper VM with `storage_path` attached as
-/// the 3rd block device (`/dev/vdc`, after the helper's own storage + overlay
-/// disks). Used by both snapshot capture and restore to reach a stopped
-/// machine's ext4 storage disk that unprivileged `serve` can't host-mount.
-/// `read_only` sets the virtio-blk attachment mode. Returns the manager plus
-/// the helper's name + data dir so the caller can stop and clean it up.
-fn start_overlay_helper_vm(
-    storage_path: &std::path::Path,
-    read_only: bool,
-) -> Result<(AgentManager, String, std::path::PathBuf), ApiError> {
-    // Unique helper-VM name (pid + nanos); first char alphanumeric — same
-    // constraint the pack-from-vm path documents.
-    let helper_name = format!(
-        "snap-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    );
-    let helper_data = vm_data_dir(&helper_name);
-
-    let manager = AgentManager::for_vm(&helper_name)
-        .map_err(|e| ApiError::internal(format!("helper VM manager: {}", e)))?;
-
-    let features = LaunchFeatures {
-        extra_disks: vec![(
-            storage_path.to_path_buf(),
-            read_only,
-            crate::data::disk::DiskFormat::Raw,
-        )],
-        ..Default::default()
-    };
-    manager
-        .start_with_full_config(
-            Vec::new(),
-            Vec::new(),
-            VmResources {
-                cpus: 2,
-                memory_mib: 2048,
-                network: false,
-                network_backend: None,
-                gpu: false,
-                gpu_vram_mib: None,
-                cuda: false,
-                rosetta: false,
-                storage_gib: None,
-                overlay_gib: None,
-                allowed_cidrs: None,
-                dns: None,
-            },
-            features,
-        )
-        .map_err(|e| ApiError::internal(format!("start helper VM: {}", e)))?;
-
-    Ok((manager, helper_name, helper_data))
-}
-
-/// Boot a short-lived helper VM, mount the source machine's storage disk, tar
-/// its container overlay upper dir, and return the tar bytes. A missing/empty
-/// overlay yields a valid empty (single `./` entry) archive rather than an
-/// error, so a never-modified machine still snapshots cleanly. The helper VM is
-/// always stopped and its data dir removed, even on error.
+/// Capture a stopped image-machine's container overlay as a tar. Thin wrapper
+/// over the shared [`crate::agent::capture_overlay_tar`] primitive (the same one
+/// `pack create --from-vm` uses), mapping its error to [`ApiError`]. A
+/// never-modified machine yields a valid empty archive rather than an error.
 fn capture_overlay_blocking(vm_name: &str) -> Result<Vec<u8>, ApiError> {
-    let storage_path = vm_data_dir(vm_name).join("storage.raw");
+    let vm_dir = vm_data_dir(vm_name);
+    let (storage_path, storage_fmt) = resolve_disk_image(&vm_dir, STORAGE_DISK_FILENAME);
     if !storage_path.exists() {
         return Err(ApiError::NotFound(format!(
             "machine '{}' has no storage disk to snapshot",
             vm_name
         )));
     }
-
-    // Capture never writes the source disk → attach it read-only.
-    let (manager, helper_name, helper_data) = start_overlay_helper_vm(&storage_path, true)?;
-
-    // Closure so the helper VM is always stopped/cleaned, even on early error.
-    let result: Result<Vec<u8>, ApiError> = (|| {
-        let mut client = manager
-            .connect()
-            .map_err(|e| ApiError::internal(format!("connect helper VM: {}", e)))?;
-
-        // Mount the source storage disk (/dev/vdc) read-only.
-        let (code, _, stderr) = client
-            .vm_exec(
-                vec![
-                    "sh".into(),
-                    "-c".into(),
-                    "mkdir -p /mnt/src && mount -o ro /dev/vdc /mnt/src".into(),
-                ],
-                vec![],
-                None,
-                None,
-                None,
-            )
-            .map_err(|e| ApiError::internal(format!("mount exec: {}", e)))?;
-        if code != 0 {
-            return Err(ApiError::internal(format!(
-                "mount source disk failed (exit {}): {}",
-                code,
-                String::from_utf8_lossy(&stderr)
-            )));
-        }
-
-        // Tar the container overlay upper dir. Missing/empty → tar an empty dir
-        // so the result is always a valid archive.
-        let upper = format!("/mnt/src/overlays/persistent-{}/upper", vm_name);
-        let script = format!(
-            "mkdir -p /tmp/empty && \
-             if [ -d '{u}' ]; then tar cf /tmp/snap.tar -C '{u}' . ; \
-             else tar cf /tmp/snap.tar -C /tmp/empty . ; fi",
-            u = upper
-        );
-        let (code, _, stderr) = client
-            .vm_exec(
-                vec!["sh".into(), "-c".into(), script],
-                vec![],
-                None,
-                None,
-                None,
-            )
-            .map_err(|e| ApiError::internal(format!("tar exec: {}", e)))?;
-        if code != 0 {
-            return Err(ApiError::internal(format!(
-                "tar overlay failed (exit {}): {}",
-                code,
-                String::from_utf8_lossy(&stderr)
-            )));
-        }
-
-        client
-            .read_file("/tmp/snap.tar")
-            .map_err(|e| ApiError::internal(format!("read snapshot tar: {}", e)))
-    })();
-
-    if let Err(e) = manager.stop() {
-        tracing::warn!(helper = %helper_name, error = %e, "failed to stop snapshot helper VM");
-    }
-    let _ = std::fs::remove_dir_all(&helper_data);
-
-    result
+    crate::agent::capture_overlay_tar(vm_name, &storage_path, storage_fmt)
+        .map(|o| o.tar)
+        .map_err(|e| ApiError::internal(format!("capture overlay: {}", e)))
 }
 
 /// Seed a stopped image-machine's container overlay from a snapshot tar (the
@@ -2020,95 +1895,20 @@ pub async fn restore_machine(
     ))
 }
 
-/// Boot a helper VM, mount the source machine's storage disk read-write, and
-/// untar `tar` into a fresh `overlays/persistent-{vm_name}/upper`, replacing any
-/// prior overlay state. Syncs + unmounts inside the guest before stopping so the
-/// write reaches the host disk image. The helper VM is always stopped and its
-/// data dir removed, even on error.
+/// Seed the machine's container overlay from a snapshot tar. Thin wrapper over
+/// the shared [`crate::agent::seed_overlay_tar`] primitive (the inverse of
+/// capture), mapping its error to [`ApiError`].
 fn apply_overlay_blocking(vm_name: &str, tar: Vec<u8>) -> Result<(), ApiError> {
-    let storage_path = vm_data_dir(vm_name).join("storage.raw");
+    let vm_dir = vm_data_dir(vm_name);
+    let (storage_path, storage_fmt) = resolve_disk_image(&vm_dir, STORAGE_DISK_FILENAME);
     if !storage_path.exists() {
         return Err(ApiError::NotFound(format!(
             "machine '{}' has no storage disk to restore into",
             vm_name
         )));
     }
-
-    // Restore writes the source disk → attach it read-write.
-    let (manager, helper_name, helper_data) = start_overlay_helper_vm(&storage_path, false)?;
-
-    let result: Result<(), ApiError> = (|| {
-        let mut client = manager
-            .connect()
-            .map_err(|e| ApiError::internal(format!("connect helper VM: {}", e)))?;
-
-        // Mount the source storage disk (/dev/vdc) read-write.
-        let (code, _, stderr) = client
-            .vm_exec(
-                vec![
-                    "sh".into(),
-                    "-c".into(),
-                    "mkdir -p /mnt/src && mount /dev/vdc /mnt/src".into(),
-                ],
-                vec![],
-                None,
-                None,
-                None,
-            )
-            .map_err(|e| ApiError::internal(format!("mount exec: {}", e)))?;
-        if code != 0 {
-            return Err(ApiError::internal(format!(
-                "mount source disk failed (exit {}): {}",
-                code,
-                String::from_utf8_lossy(&stderr)
-            )));
-        }
-
-        // Push the snapshot tar into the helper VM (auto-chunked over vsock).
-        client
-            .write_file("/tmp/restore.tar", &tar, None)
-            .map_err(|e| ApiError::internal(format!("write restore tar: {}", e)))?;
-
-        // Replace the persistent overlay's upper dir with the snapshot contents.
-        // Removing the whole overlay root first guarantees the agent's overlay
-        // setup takes the "existing upper → remount preserving it" path (not a
-        // stale-merged-mount reuse) on the next start. `work`/`merged` are
-        // recreated by the agent at mount time. sync + umount so the write lands
-        // on the host disk image before the helper VM is torn down.
-        let overlay_root = format!("/mnt/src/overlays/persistent-{}", vm_name);
-        let script = format!(
-            "set -e; \
-             rm -rf '{root}'; \
-             mkdir -p '{root}/upper'; \
-             tar xf /tmp/restore.tar -C '{root}/upper'; \
-             sync; umount /mnt/src",
-            root = overlay_root
-        );
-        let (code, _, stderr) = client
-            .vm_exec(
-                vec!["sh".into(), "-c".into(), script],
-                vec![],
-                None,
-                None,
-                None,
-            )
-            .map_err(|e| ApiError::internal(format!("untar exec: {}", e)))?;
-        if code != 0 {
-            return Err(ApiError::internal(format!(
-                "apply overlay failed (exit {}): {}",
-                code,
-                String::from_utf8_lossy(&stderr)
-            )));
-        }
-        Ok(())
-    })();
-
-    if let Err(e) = manager.stop() {
-        tracing::warn!(helper = %helper_name, error = %e, "failed to stop restore helper VM");
-    }
-    let _ = std::fs::remove_dir_all(&helper_data);
-
-    result
+    crate::agent::seed_overlay_tar(vm_name, &storage_path, storage_fmt, &tar)
+        .map_err(|e| ApiError::internal(format!("seed overlay: {}", e)))
 }
 
 async fn pull_from_registry(

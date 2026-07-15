@@ -11,6 +11,7 @@ mod krun;
 mod launcher;
 pub mod launcher_dynamic;
 mod manager;
+pub mod overlay_export;
 pub mod pod_net;
 pub mod state_probe;
 pub mod terminal;
@@ -35,6 +36,7 @@ pub use manager::{
     resolve_disk_image, shared_pack_cache_root, shared_pack_pointer_path, vm_cache_root,
     vm_data_dir, vm_dir_hash, vm_uid_registry_dir, AgentManager, AgentState, SHARED_PACK_POINTER,
 };
+pub use overlay_export::{capture_overlay_tar, seed_overlay_tar, tar_overlay_upper, OverlayTar};
 
 /// Agent VM name.
 pub const AGENT_VM_NAME: &str = "smolvm-agent";

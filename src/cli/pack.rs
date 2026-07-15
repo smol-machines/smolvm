@@ -820,52 +820,45 @@ impl PackCreateCmd {
         export_result
     }
 
+    /// Register a captured container overlay as an image layer, skipping empty
+    /// overlays (a never-modified machine adds no layer). The layer digest is
+    /// `sha256` over the tar bytes, so it's stable across the capture callers.
+    fn register_overlay_layer(
+        collector: &mut AssetCollector,
+        overlay: &smolvm::agent::OverlayTar,
+    ) -> smolvm::Result<()> {
+        if !overlay.had_content {
+            tracing::debug!("overlay export: no container changes found");
+            return Ok(());
+        }
+        let overlay_digest = format!("sha256:{}", hex::encode(Sha256::digest(&overlay.tar)));
+        let overlay_layer_file = collector.layer_staging_path(&overlay_digest);
+        std::fs::write(&overlay_layer_file, &overlay.tar)
+            .map_err(|e| Error::agent("write overlay layer", e.to_string()))?;
+        collector
+            .register_layer(&overlay_digest)
+            .map_err(|e| Error::agent("register overlay layer", e.to_string()))?;
+        println!("  Overlay layer: {} bytes", overlay.tar.len());
+        Ok(())
+    }
+
+    /// Export the container overlay from a helper VM that already has the source
+    /// storage mounted at `/mnt/source-storage` (used by the image-layers path,
+    /// which needs the same VM online to pull base layers).
     fn export_container_overlay_from_mounted_storage(
         &self,
         collector: &mut AssetCollector,
         client: &mut AgentClient,
         vm_name: &str,
     ) -> smolvm::Result<()> {
-        let overlay_dir = format!("/mnt/source-storage/overlays/persistent-{}/upper", vm_name);
         println!("Exporting container overlay...");
-        let (exit_code, _, stderr) = client.vm_exec(
-            vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                format!(
-                    "if [ -d '{}' ] && [ \"$(ls -A '{}')\" ]; then \
-                     tar cf /tmp/overlay-export.tar -C '{}' . 2>/dev/null; \
-                     echo OVERLAY_OK; \
-                     else echo OVERLAY_EMPTY; fi",
-                    overlay_dir, overlay_dir, overlay_dir
-                ),
-            ],
-            vec![],
-            None,
-            None,
-            None,
-        )?;
-
-        if exit_code == 0 {
-            let tar_data = client.read_file("/tmp/overlay-export.tar")?;
-            if !tar_data.is_empty() {
-                let overlay_hash = hex::encode(Sha256::digest(&tar_data));
-                let overlay_digest = format!("sha256:{}", overlay_hash);
-                let overlay_layer_file = collector.layer_staging_path(&overlay_digest);
-                std::fs::write(&overlay_layer_file, &tar_data)
-                    .map_err(|e| Error::agent("write overlay layer", e.to_string()))?;
-                collector
-                    .register_layer(&overlay_digest)
-                    .map_err(|e| Error::agent("register overlay layer", e.to_string()))?;
-                println!("  Overlay layer: {} bytes", tar_data.len());
-            }
-        } else {
-            tracing::debug!(stderr = %String::from_utf8_lossy(&stderr), "overlay export: no container changes found");
-        }
-
-        Ok(())
+        let overlay = smolvm::agent::tar_overlay_upper(client, "/mnt/source-storage", vm_name)?;
+        Self::register_overlay_layer(collector, &overlay)
     }
 
+    /// Export just the container overlay of a stopped machine — the same shared
+    /// capture the cloud snapshot endpoint uses, wrapped to register the result
+    /// as an image layer.
     fn export_container_overlay_from_vm(
         &self,
         collector: &mut AssetCollector,
@@ -873,77 +866,9 @@ impl PackCreateCmd {
         vm_dir: &Path,
     ) -> smolvm::Result<()> {
         let (storage_disk, storage_fmt) = resolve_disk_image(vm_dir, STORAGE_DISK_FILENAME);
-        let pack_vm_name = format!(
-            "pack-fromvm-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        );
-        let vm_data = smolvm::agent::vm_data_dir(&pack_vm_name);
-
         println!("Starting agent VM to export container overlay...");
-        let manager = AgentManager::for_vm(&pack_vm_name)?;
-        let features = smolvm::agent::LaunchFeatures {
-            extra_disks: vec![(storage_disk.clone(), false, storage_fmt)],
-            ..Default::default()
-        };
-        manager.start_with_full_config(
-            Vec::new(),
-            Vec::new(),
-            VmResources {
-                cpus: 4,
-                memory_mib: 8192,
-                network: true,
-                network_backend: None,
-                dns: None,
-                gpu: false,
-                cuda: false,
-                gpu_vram_mib: None,
-                rosetta: false,
-                storage_gib: None,
-                overlay_gib: None,
-                allowed_cidrs: None,
-            },
-            features,
-        )?;
-
-        let export_result: smolvm::Result<()> = (|| {
-            let mut client = manager.connect()?;
-            let (exit_code, _, stderr) = client.vm_exec(
-                vec![
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    "mkdir -p /mnt/source-storage && mount /dev/vdc /mnt/source-storage"
-                        .to_string(),
-                ],
-                vec![],
-                None,
-                None,
-                None,
-            )?;
-            if exit_code != 0 {
-                return Err(Error::agent(
-                    "mount source storage in temp VM",
-                    format!(
-                        "mount failed (exit {}): {}",
-                        exit_code,
-                        String::from_utf8_lossy(&stderr)
-                    ),
-                ));
-            }
-
-            self.export_container_overlay_from_mounted_storage(collector, &mut client, vm_name)?;
-
-            Ok(())
-        })();
-
-        if let Err(e) = manager.stop() {
-            warn!(error = %e, "failed to stop pack temp VM");
-        }
-        let _ = std::fs::remove_dir_all(&vm_data);
-        export_result
+        let overlay = smolvm::agent::capture_overlay_tar(vm_name, &storage_disk, storage_fmt)?;
+        Self::register_overlay_layer(collector, &overlay)
     }
 
     fn imported_layers_from_cache(
