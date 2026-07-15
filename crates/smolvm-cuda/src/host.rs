@@ -333,6 +333,9 @@ struct Session {
     /// never shared: an expandable segment mixes weights and activations, so it
     /// can't be shared read-only like a discrete weight buffer.
     vmm_ranges: std::sync::Arc<VmmRanges>,
+    /// Path 3: this session's VMM layout (reservations + maps→physical handle),
+    /// handed off so a clone worker reconstructs memory at the golden's VAs (M2).
+    golden_layout: std::sync::Arc<LayoutCell>,
     /// Fork-isolation pointer map: `(parent_base, size, private_copy_base)`.
     /// Empty unless this session is an isolating clone. Every inherited dptr the
     /// guest sends is rewritten through these ranges to the clone's own copy, so
@@ -473,6 +476,13 @@ fn fork_isolate_enabled() -> bool {
     std::env::var_os("SMOLVM_CUDA_FORK_ISOLATE").is_some()
 }
 
+/// Path 3 (address-preserving per-clone-process isolation) mode. When set, the
+/// golden's VMM physical is created IPC-exportable so a clone worker process can
+/// share/copy it at the golden's exact VA. Off = legacy shared-context path.
+fn path3_enabled() -> bool {
+    std::env::var_os("SMOLVM_CUDA_PATH3").is_some()
+}
+
 /// P0 transport-viability instrumentation. Counts every dispatched CUDA RPC so we
 /// can derive calls-per-token (the number that decides whether CUDA-over-network
 /// survives WAN round-trips). `SMOLVM_CUDA_RPC_STATS=1` logs the running count with
@@ -546,6 +556,16 @@ type AllocTable = std::sync::Mutex<HashMap<u64, (u64, bool)>>;
 /// VMM-mapped ranges (mapped-va → size), handed off to fork clones. Parallels
 /// [`AllocTable`] but for the CUDA VMM path (see [`Session::vmm_ranges`]).
 type VmmRanges = std::sync::Mutex<HashMap<u64, u64>>;
+/// Path 3: the golden's VMM layout, handed off (via [`LAYOUT_HANDOFF`]) so a clone
+/// worker process reconstructs memory at the golden's EXACT VAs (M2). Reservations
+/// (va→size) it re-reserves; maps (va→(size, physical handle)) whose handle the
+/// daemon exports to an fd for the clone to IPC-import/copy at that VA.
+#[derive(Default)]
+struct GoldenLayout {
+    reservations: HashMap<u64, u64>,
+    maps: HashMap<u64, (u64, u64)>,
+}
+type LayoutCell = std::sync::Mutex<GoldenLayout>;
 static DPTR_HANDOFF: std::sync::Mutex<Option<HashMap<u64, std::sync::Weak<AllocTable>>>> =
     std::sync::Mutex::new(None);
 
@@ -608,6 +628,28 @@ fn vmm_handoff_snapshot(token: u64) -> Option<Vec<(u64, u64)>> {
         .map(|(&v, &s)| (v, s))
         .collect();
     Some(snap)
+}
+
+/// Path 3 (M2): the golden's VMM layout, keyed by lineage token, so the daemon
+/// can gather it (reservations + maps→handle) when spawning a clone worker.
+static LAYOUT_HANDOFF: std::sync::Mutex<Option<HashMap<u64, std::sync::Weak<LayoutCell>>>> =
+    std::sync::Mutex::new(None);
+
+fn layout_handoff_register(l: &std::sync::Arc<LayoutCell>, my_token: u64) {
+    let mut reg = LAYOUT_HANDOFF.lock().unwrap();
+    let reg = reg.get_or_insert_with(HashMap::new);
+    reg.retain(|_, w| w.strong_count() > 0);
+    reg.insert(my_token, std::sync::Arc::downgrade(l));
+}
+
+/// `(reservations: [(va,size)], maps: [(va,size,handle)])` for `token`'s golden.
+pub fn layout_handoff_snapshot(token: u64) -> Option<(Vec<(u64, u64)>, Vec<(u64, u64, u64)>)> {
+    let reg = LAYOUT_HANDOFF.lock().unwrap();
+    let l = reg.as_ref()?.get(&token)?.upgrade()?;
+    let g = l.lock().unwrap();
+    let resvs = g.reservations.iter().map(|(&v, &s)| (v, s)).collect();
+    let maps = g.maps.iter().map(|(&v, &(s, h))| (v, s, h)).collect();
+    Some((resvs, maps))
 }
 
 /// Mark the allocation containing `dptr` as loaded (H2D-written → read-only
@@ -1299,6 +1341,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 graph_handoff_register(&sess.graph_vhandles, resume_token, token);
                 dptr_handoff_register(&sess.alloc_table, token);
                 vmm_handoff_register(&sess.vmm_ranges, token);
+                layout_handoff_register(&sess.golden_layout, token);
                 // Isolation-mode clone: defer copying the parent's buffers until
                 // the first PrimaryCtxRetain, when a context is actually current.
                 if resume_token != 0 && fork_isolate_enabled() {
@@ -1882,6 +1925,11 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         Request::MemAddressReserve { size, align } => {
             b.mem_address_reserve(size, align).map(|va| {
                 sess.owned_vmm_reservations.insert(va, size);
+                sess.golden_layout
+                    .lock()
+                    .unwrap()
+                    .reservations
+                    .insert(va, size);
                 Response::Dptr(va)
             })
         }
@@ -1892,7 +1940,14 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             if used.saturating_add(size) > limit {
                 return Err(2); // CUDA_ERROR_OUT_OF_MEMORY
             }
-            b.mem_create(size, device).map(|h| {
+            // Path 3: create the physical IPC-exportable so a clone worker process
+            // can import it and place it at the golden's exact VA (M2).
+            let created = if path3_enabled() {
+                b.mem_create_exportable(size, device)
+            } else {
+                b.mem_create(size, device)
+            };
+            created.map(|h| {
                 sess.owned_vmm_handles.insert(h, size);
                 Response::Handle(h)
             })
@@ -1905,6 +1960,11 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         } => b.mem_map(va, size, offset, handle).map(|_| {
             sess.owned_vmm_maps.insert(va, size);
             sess.vmm_ranges.lock().unwrap().insert(va, size);
+            sess.golden_layout
+                .lock()
+                .unwrap()
+                .maps
+                .insert(va, (size, handle));
             Response::Ok
         }),
         Request::MemSetAccess { va, size, device } => {
@@ -1913,6 +1973,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         Request::MemUnmap { va, size } => {
             sess.owned_vmm_maps.remove(&va);
             sess.vmm_ranges.lock().unwrap().remove(&va);
+            sess.golden_layout.lock().unwrap().maps.remove(&va);
             b.mem_unmap(va, size).map(|_| Response::Ok)
         }
         Request::MemRelease { handle } => {
@@ -1921,6 +1982,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         }
         Request::MemAddressFree { va, size } => {
             sess.owned_vmm_reservations.remove(&va);
+            sess.golden_layout.lock().unwrap().reservations.remove(&va);
             b.mem_address_free(va, size).map(|_| Response::Ok)
         }
         Request::MemGetAllocationGranularity { device, flags } => b
