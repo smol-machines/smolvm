@@ -81,7 +81,8 @@ node dist/index.js        # speaks MCP over stdio
 
 Point your client's `command`/`args` at `node` + the absolute `dist/index.js`
 path. A manual smoke test that drives the server against real microVMs lives in
-`test-e2e.mjs` (`node test-e2e.mjs`).
+`test-e2e.mjs` (`node test-e2e.mjs`); `demo.mjs` is a short narrated demo
+(spin up a computer, install a package, fetch live data, tear down).
 
 ## Example
 
