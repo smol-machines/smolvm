@@ -246,7 +246,12 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
     if let Ok(modpath) = std::env::var("SMOLVM_CUDA_CLONE_MODULES") {
         let (mod_images, func_meta, streams, events) =
             reconstruct_golden_modules(backend.as_mut(), &modpath);
-        let (nm, nf, ns, ne) = (mod_images.len(), func_meta.len(), streams.len(), events.len());
+        let (nm, nf, ns, ne) = (
+            mod_images.len(),
+            func_meta.len(),
+            streams.len(),
+            events.len(),
+        );
         smolvm_cuda::host::set_handle_trans(mod_images, func_meta, streams, events);
         let _ = std::fs::remove_file(&modpath);
         tracing::info!(
@@ -590,7 +595,14 @@ fn spawn_clone_worker(conn_fd: std::os::unix::io::RawFd, token: u64) -> io::Resu
             blob.extend_from_slice(&flags.to_le_bytes());
         }
         let _ = std::fs::create_dir_all("/tmp/smolvm");
-        let mp = format!("/tmp/smolvm/clone-mods-{token}-{conn_fd}.bin");
+        // Unique per SPAWN, not per (token, conn_fd): fd numbers are reused as
+        // soon as the daemon closes a spawned worker's copy, so two clones forked
+        // near-simultaneously collide on the same path — and each worker deletes
+        // its blob after staging, leaving the second worker 0 modules (its kernel
+        // launches then use raw golden handles → SIGSEGV in cuLaunchKernel).
+        static SPAWN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SPAWN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mp = format!("/tmp/smolvm/clone-mods-{token}-{seq}.bin");
         if std::fs::write(&mp, &blob).is_ok() {
             modpath = Some(mp);
         }
