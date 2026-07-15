@@ -1,6 +1,6 @@
 [package]
 name = "smolvm-cudart-shim"
-version = "1.6.0"
+version = "1.6.1"
 edition = "2021"
 description = "Guest-side libcudart.so drop-in: CUDA Runtime API lowered to smolvm's Driver-API vsock RPC"
 license = "Apache-2.0"

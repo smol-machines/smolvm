@@ -1,6 +1,6 @@
 [package]
 name = "smolvm-cuda-codegen"
-version = "1.6.0"
+version = "1.6.1"
 edition = "2021"
 description = "Generates forward-to-host-lib marshaling (guest stubs + host dispatch) from a function spec"
 license = "Apache-2.0"
