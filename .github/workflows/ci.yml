@@ -50,6 +50,11 @@ jobs:
           sudo apt-get install -y binutils binutils-mingw-w64-x86-64 llvm
       - name: Bundled libkrun exports every symbol smolvm requires
         run: ./scripts/check-krun-exports.sh
+      # A libkrun built on a newer distro (glibc > 2.35) loads there but fails on
+      # ubuntu-22.04 / Debian 12 with "GLIBC_x.y not found" before the VM boots
+      # (issue #636). Gate every push so a wrong-host lib can't ship again.
+      - name: Bundled libkrun keeps a glibc floor <= 2.35
+        run: ./scripts/check-libkrun-glibc-floor.sh
 
   audit:
     name: Cargo Audit
