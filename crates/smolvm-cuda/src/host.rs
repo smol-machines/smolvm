@@ -777,7 +777,10 @@ fn xlat_mod(b: &mut dyn Backend, golden: u64) -> u64 {
         }
         Err(e) => {
             eprintln!("[M3a-lazy] module reload failed: e={e}");
-            golden
+            // NULL, not the golden handle: the driver rejects a NULL module with
+            // a clean error, but DEREFERENCES a foreign-context handle (SIGSEGV
+            // in cuModuleGetFunction — seen when a sticky fault poisoned reloads).
+            0
         }
     }
 }
@@ -792,6 +795,9 @@ fn xlat_func(b: &mut dyn Backend, golden: u64) -> u64 {
         return golden;
     };
     let wm = xlat_mod(b, gm);
+    if wm == 0 {
+        return 0; // module reload failed; a NULL function errors cleanly
+    }
     match b.module_get_function(wm, &name) {
         Ok(w) => {
             FUNC_TRANS.with(|m| {
@@ -801,7 +807,9 @@ fn xlat_func(b: &mut dyn Backend, golden: u64) -> u64 {
         }
         Err(e) => {
             eprintln!("[M3a-lazy] function re-resolve failed: name={name} e={e}");
-            golden
+            // NULL, not the golden handle (see xlat_mod): fail with a clean
+            // driver error rather than a foreign-handle dereference.
+            0
         }
     }
 }
