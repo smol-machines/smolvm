@@ -662,6 +662,27 @@ pub extern "C" fn cudaDeviceSynchronize() -> c_int {
     })
 }
 
+/// Context / device limits (stack size, printf FIFO, malloc heap, …).
+/// Mirror `cuCtxGetLimit` / `cuCtxSetLimit` in the driver shim: report a generous
+/// stack-size default on get, accept any set. Conda PyTorch (`libtorch_cuda.so`)
+/// version-requires `cudaDeviceSetLimit@libcudart.so.12` at import time; without
+/// this export, bind-mount staging of the shim over a real cudart fails the
+/// dynamic linker before any CUDA call runs.
+#[no_mangle]
+pub extern "C" fn cudaDeviceGetLimit(pvalue: *mut usize, _limit: c_int) -> c_int {
+    if pvalue.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    // Match driver-shim stack-size default (Triton / launcher setup reads this).
+    unsafe { *pvalue = 8 * 1024 * 1024 };
+    set_last(CUDA_SUCCESS)
+}
+
+#[no_mangle]
+pub extern "C" fn cudaDeviceSetLimit(_limit: c_int, _value: usize) -> c_int {
+    set_last(CUDA_SUCCESS)
+}
+
 /// The CUDA surface this shim advertises (mirrors the cuda-shim's
 /// `shim_cuda_version`): `SMOLVM_CUDA_ADVERTISE` overrides, default 12.4.
 /// Never report the HOST's real driver/runtime version — guest libraries
