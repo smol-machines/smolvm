@@ -473,16 +473,34 @@ fn peek_clone_token(fd: std::os::unix::io::RawFd) -> Option<u64> {
     }
     // framing: [u32 le len][op][proto_hash u64][resume_token u64]
     let mut buf = [0u8; 21];
-    let n = unsafe {
-        libc::recv(
-            fd,
-            buf.as_mut_ptr() as *mut libc::c_void,
-            buf.len(),
-            libc::MSG_PEEK,
-        )
-    };
+    // The connection is often proxied (guest vsock → per-VM cuda_host proxy →
+    // daemon unix socket), so the 21-byte Init can arrive in pieces AFTER accept.
+    // A one-shot peek that saw a short read here would MISROUTE the isolating
+    // clone to the legacy shared-context path (which fails for expandable_segments
+    // → CUDA_ERROR_UNKNOWN, esp. at larger models). Retry the non-consuming peek
+    // until the full header is buffered (or the peer closes / we time out ~1s).
+    let mut n: isize = 0;
+    for _ in 0..200 {
+        n = unsafe {
+            libc::recv(
+                fd,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+                libc::MSG_PEEK,
+            )
+        };
+        if n >= 21 || n == 0 {
+            break; // full header buffered, or peer closed
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     if n < 21 || buf[4] != 0x01 {
-        return None; // short read or not an Init
+        tracing::warn!(
+            n,
+            op = buf[4],
+            "peek_clone_token: not routed (short read / non-Init)"
+        );
+        return None;
     }
     let token = u64::from_le_bytes(buf[13..21].try_into().unwrap());
     (token != 0).then_some(token)
