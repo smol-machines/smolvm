@@ -4124,6 +4124,7 @@ impl AgentManager {
             auto_ports: features.auto_ports,
             published_sockets: features.published_sockets,
             waypipe: features.waypipe,
+            x11: features.x11,
             dns_filter_hosts: features.dns_filter_hosts,
             credentials: features.credentials,
             external_interceptor: features.external_interceptor,

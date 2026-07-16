@@ -318,6 +318,9 @@ pub struct Smolfile {
     /// Enable waypipe Wayland forwarding over vsock: render guest GUI apps on
     /// the host compositor. Requires waypipe inside the VM.
     pub waypipe: Option<bool>,
+    /// Bridge the guest X11 socket straight to the host X server over vsock, so
+    /// guest X11 apps render on the host X server with no waypipe involved.
+    pub x11: Option<bool>,
     /// Publish every TCP port the guest listens on at the same port on the
     /// host's loopback while it listens, like `--auto-ports`.
     pub auto_ports: Option<bool>,

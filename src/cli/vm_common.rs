@@ -620,6 +620,8 @@ pub struct CreateVmParams {
     /// Enable waypipe Wayland forwarding over vsock (guest GUI apps on the host
     /// compositor).
     pub waypipe: bool,
+    /// Bridge the guest X11 socket straight to the host X server over vsock.
+    pub x11: bool,
     /// Publish the TCP ports the guest listens on (`--auto-ports`).
     pub auto_ports: Option<smolvm::data::network::AutoPorts>,
     /// Enable GPU acceleration (virtio-gpu with Venus/Vulkan).
@@ -828,6 +830,7 @@ impl CreateVmParams {
             cuda_vram_limit_mib,
             docker_socket,
             waypipe,
+            x11,
             auto_ports,
             nested_virt,
             gpu,
@@ -900,6 +903,7 @@ impl CreateVmParams {
             cuda,
             docker_socket,
             waypipe,
+            x11,
             ssh_agent,
             forkable,
             cuda_fork_pool_size,
@@ -2042,6 +2046,7 @@ fn start_vm_named_locked(
         auto_ports: record.auto_ports.clone(),
         published_sockets: record.published_sockets.clone(),
         waypipe: record.waypipe,
+        x11: record.x11,
         dns_filter_hosts: record.dns_filter_hosts.clone(),
         credentials: smolvm::credentials::CredentialLaunch::for_record(name, &record),
         external_interceptor,
