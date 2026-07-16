@@ -100,6 +100,7 @@ ipnet = "2.12.0"
 metrics = "0.24"
 
 metrics-exporter-prometheus = { version = "0.16", default-features = false }
+shellexpand = "3.1.2"
 
 # Seccomp + Landlock for the VM boot subprocess (runtime isolation). Linux-only
 # — macOS/HVF has neither; the code is cfg-gated to linux (seccomp also to x86_64).

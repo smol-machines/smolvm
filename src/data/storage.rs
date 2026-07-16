@@ -83,7 +83,7 @@ impl HostMount {
         read_only: bool,
     ) -> Result<Self> {
         let mut mount = Self {
-            source: source.into(),
+            source: Self::expand_path(source),
             target: target.into(),
             read_only,
         };
@@ -112,6 +112,11 @@ impl HostMount {
         })?;
         Self::validate(&mount)?;
         Ok(mount)
+    }
+
+    /// Expand path containing a tilde into a full path
+    fn expand_path(source: impl Into<PathBuf>) -> PathBuf {
+        PathBuf::from(shellexpand::tilde(&source.into().to_string_lossy()).into_owned())
     }
 
     /// Parse a mount specification (`host_path:guest_path[:ro|:rw]`).
