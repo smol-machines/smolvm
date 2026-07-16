@@ -4364,6 +4364,7 @@ impl AgentManager {
             expose_docker: features.expose_docker,
             auto_ports: features.auto_ports,
             published_sockets: features.published_sockets,
+            waypipe: features.waypipe,
             dns_filter_hosts: features.dns_filter_hosts,
             credentials: features.credentials,
             external_interceptor: features.external_interceptor,
