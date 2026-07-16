@@ -2497,8 +2497,19 @@ impl CreateCmd {
             } else {
                 Some(manifest.image)
             },
-            entrypoint: manifest.entrypoint,
-            cmd: manifest.cmd,
+            // CLI trailing args override the artifact's baked (entrypoint, cmd),
+            // matching the --image create path's precedence — without this a
+            // `machine create --from art -- <workload>` silently never runs it.
+            entrypoint: if self.command.is_empty() {
+                manifest.entrypoint
+            } else {
+                Vec::new()
+            },
+            cmd: if self.command.is_empty() {
+                manifest.cmd
+            } else {
+                self.command.clone()
+            },
             cpus,
             mem,
             volume: self.volume.clone(),
