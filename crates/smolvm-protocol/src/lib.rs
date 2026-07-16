@@ -157,6 +157,12 @@ pub mod ports {
     /// Maximum number of user-published sockets per VM. Bounds the vsock-port
     /// window (`6100..6100+MAX`) below CUDA's 7000.
     pub const PUBLISH_SOCKET_MAX: usize = 64;
+
+    /// Waypipe Wayland forwarding: the guest runs `waypipe server --vsock` and
+    /// connects out to this port; libkrun bridges it to a host Unix socket where
+    /// `waypipe client` listens next to the host compositor. Outbound (guest
+    /// connects out), like the SSH/DNS/CUDA bridges.
+    pub const WAYPIPE: u32 = 7001;
 }
 
 /// vsock CID constants.

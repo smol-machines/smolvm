@@ -247,6 +247,9 @@ pub struct Smolfile {
     /// Expose the guest's Docker daemon socket to the host as a Unix socket
     /// (`DOCKER_HOST=unix://…`). Requires dockerd running inside the VM.
     pub docker_socket: Option<bool>,
+    /// Enable waypipe Wayland forwarding over vsock: render guest GUI apps on
+    /// the host compositor. Requires waypipe inside the VM.
+    pub waypipe: Option<bool>,
     /// Storage disk size in GiB.
     pub storage: Option<u64>,
     /// Overlay disk size in GiB.

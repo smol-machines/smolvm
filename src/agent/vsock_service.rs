@@ -25,6 +25,10 @@ pub struct VsockServiceInputs<'a> {
     pub dns_filter_socket: Option<&'a Path>,
     /// Host CUDA-over-vsock server socket (experimental).
     pub cuda_socket: Option<&'a Path>,
+    /// Host waypipe socket. libkrun bridges the guest's outbound waypipe vsock
+    /// port to this host `AF_UNIX` path, where a `waypipe client` listens next
+    /// to the host compositor. When set, waypipe forwarding is enabled.
+    pub waypipe_socket: Option<&'a Path>,
     /// Host-side Docker socket to expose. libkrun *listens* on this path and
     /// forwards each host connection to the guest, which proxies it to the
     /// in-guest dockerd socket. When set, the Docker bridge is enabled.
@@ -107,6 +111,24 @@ impl VsockService for CudaService {
     }
 }
 
+/// Waypipe Wayland forwarding: the guest runs `waypipe server --vsock` and
+/// connects out to the host, where a `waypipe client` (plain unix mode) listens
+/// on the bridged socket next to the host compositor. Outbound like CUDA/DNS, so
+/// `listen: false`. The guest side needs no env signal — the user starts
+/// `waypipe server` explicitly per app — so `guest_env` is empty.
+struct WaypipeService;
+impl VsockService for WaypipeService {
+    fn resolve<'a>(&self, inputs: &VsockServiceInputs<'a>) -> Option<ActiveVsockService<'a>> {
+        inputs.waypipe_socket.map(|socket| ActiveVsockService {
+            name: "Waypipe Wayland forwarding",
+            port: ports::WAYPIPE,
+            listen: false,
+            socket,
+            guest_env: &[],
+        })
+    }
+}
+
 /// Docker socket bridge: the guest serves on the vsock port (proxying to its
 /// own dockerd socket) and the host connects in via the exposed Unix socket, so
 /// a host client can drive the guest's Docker daemon with `DOCKER_HOST=unix://…`.
@@ -130,6 +152,7 @@ pub fn registry() -> &'static [&'static dyn VsockService] {
         &SshAgentService,
         &DnsFilterService,
         &CudaService,
+        &WaypipeService,
         &DockerSocketService,
     ]
 }
