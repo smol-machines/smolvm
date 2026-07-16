@@ -735,6 +735,13 @@ pub struct VmRecord {
     #[serde(default)]
     pub docker_socket: bool,
 
+    /// Enable waypipe Wayland forwarding over vsock: smolvm bridges a guest
+    /// waypipe vsock port to a host Unix socket, so guest GUI apps render on the
+    /// host compositor via `waypipe client` (host) and `waypipe server --vsock`
+    /// (guest).
+    #[serde(default)]
+    pub waypipe: bool,
+
     /// Hostnames for DNS filtering. When set, the guest DNS proxy filters
     /// queries against this allowlist.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1026,6 +1033,7 @@ impl VmRecord {
             cuda_vram_limit_mib: None,
             cuda_preload_modules: false,
             docker_socket: false,
+            waypipe: false,
             dns_filter_hosts: None,
             credential_policy: None,
             external_interceptor_required: false,
@@ -1130,6 +1138,7 @@ impl VmRecord {
             cuda_vram_limit_mib: None,
             cuda_preload_modules: false,
             docker_socket: false,
+            waypipe: false,
             dns_filter_hosts: None,
             credential_policy: None,
             external_interceptor_required: false,

@@ -525,6 +525,9 @@ pub struct CreateVmParams {
     pub cuda_vram_limit_mib: Option<u64>,
     /// Expose the guest's Docker daemon socket to the host as a Unix socket.
     pub docker_socket: bool,
+    /// Enable waypipe Wayland forwarding over vsock (guest GUI apps on the host
+    /// compositor).
+    pub waypipe: bool,
     /// Enable GPU acceleration (virtio-gpu with Venus/Vulkan).
     /// Expose host virtualization extensions so the guest can run KVM.
     pub nested_virt: bool,
@@ -759,6 +762,7 @@ impl CreateVmParams {
             cuda_fork_pool_size,
             cuda_vram_limit_mib,
             docker_socket,
+            waypipe,
             nested_virt,
             gpu,
             gpu_vram_mib,
@@ -824,6 +828,7 @@ impl CreateVmParams {
             nested_virt,
             cuda,
             docker_socket,
+            waypipe,
             ssh_agent,
             forkable,
             cuda_fork_pool_size,
@@ -1853,6 +1858,7 @@ fn start_vm_named_with_db(
         cuda: record.cuda,
         expose_docker: record.docker_socket,
         published_sockets: record.published_sockets.clone(),
+        waypipe: record.waypipe,
         dns_filter_hosts: record.dns_filter_hosts.clone(),
         credentials: smolvm::credentials::CredentialLaunch::for_record(name, &record),
         external_interceptor,

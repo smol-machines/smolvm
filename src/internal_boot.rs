@@ -748,6 +748,19 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
                 }
             }
         });
+    // Waypipe Wayland forwarding: bridge the guest's outbound waypipe vsock port
+    // to a Unix socket in the per-VM dir. Outbound (listen=false), so libkrun
+    // connects to this path when the guest opens the port; the user runs a
+    // `waypipe client` listening on it. Clear any stale socket first.
+    let waypipe_socket: Option<std::path::PathBuf> = if config.waypipe {
+        config.vsock_socket.parent().map(|dir| {
+            let path = dir.join("waypipe.sock");
+            let _ = std::fs::remove_file(&path);
+            path
+        })
+    } else {
+        None
+    };
 
     proc_timing!("ready to launch");
 
@@ -775,6 +788,7 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
         docker_socket: docker_socket.as_deref(),
         workload_log_socket: workload_log_socket.as_deref(),
         published_sockets: &config.published_sockets,
+        waypipe_socket: waypipe_socket.as_deref(),
         packed_layers_dir: config.packed_layers_dir.as_deref(),
         packed_layers_dax_window: config.packed_layers_dax_window,
         extra_disks: &config.extra_disks,
