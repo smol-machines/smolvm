@@ -84,7 +84,7 @@ impl HostMount {
         read_only: bool,
     ) -> Result<Self> {
         let mut mount = Self {
-            source: source.into(),
+            source: Self::expand_path(source),
             target: target.into(),
             read_only,
         };
@@ -113,6 +113,32 @@ impl HostMount {
         })?;
         Self::validate(&mount)?;
         Ok(mount)
+    }
+
+    /// Expand a path containing a tilde into a full path
+    ///
+    /// '~', '~/foo' are valid paths but not '~foo'
+    fn expand_path(source: impl Into<PathBuf>) -> PathBuf {
+        let source_path = source.into();
+        let Some(after_tilde) = source_path.to_str().and_then(|s| s.strip_prefix('~')) else {
+            return source_path;
+        };
+
+        if !after_tilde.is_empty() && !after_tilde.starts_with('/') {
+            // '~somepath should not be expanded
+            return source_path;
+        }
+
+        dirs::home_dir()
+            .map(|home| {
+                if after_tilde.is_empty() {
+                    home
+                } else {
+                    // drop leading /
+                    home.join(&after_tilde[1..])
+                }
+            })
+            .unwrap_or(source_path)
     }
 
     /// Parse a mount specification (`host_path:guest_path[:ro|:rw]`).
