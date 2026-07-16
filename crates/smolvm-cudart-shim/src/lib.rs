@@ -420,6 +420,28 @@ fn ring_try_setup(client: &mut Client<Stream>) {
 /// (best-effort) set up the shared-memory rings. Used for the first connection
 /// and to re-establish one after a fork/clone. Returns the client and the
 /// lineage token the host assigned this session.
+/// Bound a socket's blocking reads (0 = restore fully blocking). Used only
+/// around bring-up: a connection that is ACCEPTED but never answered (e.g. the
+/// CUDA host service isn't actually up behind the port) must fail cuInit in
+/// seconds, not hang the first torch import forever.
+#[cfg(unix)]
+fn set_recv_timeout(fd: i32, secs: i64) {
+    let tv = libc::timeval {
+        tv_sec: secs,
+        tv_usec: 0,
+    };
+    // SAFETY: plain setsockopt on our own connected socket fd.
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            &tv as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        );
+    }
+}
+
 fn bring_up_client(resume_token: u64) -> Result<(Client<Stream>, u64, i32), c_int> {
     let stream = connect()?;
     #[cfg(target_os = "linux")]
@@ -437,6 +459,8 @@ fn bring_up_client(resume_token: u64) -> Result<(Client<Stream>, u64, i32), c_in
     if trace {
         eprintln!("[shim] bring_up: connected fd={fd}");
     }
+    #[cfg(unix)]
+    set_recv_timeout(fd, 10);
     let mut client = Client::new(stream);
     let token = client.init(resume_token).map_err(|e| {
         if trace {
@@ -459,6 +483,10 @@ fn bring_up_client(resume_token: u64) -> Result<(Client<Stream>, u64, i32), c_in
     if try_ring {
         ring_try_setup(&mut client); // best-effort; socket mode on failure
     }
+    // Bring-up answered: restore fully blocking reads (steady-state ops may
+    // legitimately wait longer than the handshake bound).
+    #[cfg(unix)]
+    set_recv_timeout(fd, 0);
     if trace {
         eprintln!("[shim] bring_up: complete");
     }
