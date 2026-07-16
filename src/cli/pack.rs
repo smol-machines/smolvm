@@ -847,17 +847,45 @@ impl PackCreateCmd {
         )?;
 
         if exit_code == 0 {
-            let tar_data = client.read_file("/tmp/overlay-export.tar")?;
-            if !tar_data.is_empty() {
-                let overlay_hash = hex::encode(Sha256::digest(&tar_data));
-                let overlay_digest = format!("sha256:{}", overlay_hash);
+            // Stream the overlay tar to disk instead of buffering it: a real
+            // image's overlay (e.g. a baked-in ML venv) easily exceeds the
+            // in-memory transfer cap. Raise SMOLVM_FILE_TRANSFER_MAX_BYTES for
+            // overlays past the default streaming cap.
+            // Stage the temp download in the layers dir (same filesystem as the
+            // final digest-named file, so the rename below stays atomic).
+            let tmp_file = collector
+                .layer_staging_path(&format!("sha256:{}", "0".repeat(64)))
+                .with_file_name("overlay-export.tmp");
+            let total = client
+                .read_file_to_path("/tmp/overlay-export.tar", &tmp_file, |_| {})
+                .map_err(|e| Error::agent("export overlay layer", e.to_string()))?;
+            if total > 0 {
+                let mut hasher = Sha256::new();
+                {
+                    use std::io::Read;
+                    let mut f = std::fs::File::open(&tmp_file)
+                        .map_err(|e| Error::agent("read overlay layer", e.to_string()))?;
+                    let mut buf = vec![0u8; 4 * 1024 * 1024];
+                    loop {
+                        let n = f
+                            .read(&mut buf)
+                            .map_err(|e| Error::agent("hash overlay layer", e.to_string()))?;
+                        if n == 0 {
+                            break;
+                        }
+                        hasher.update(&buf[..n]);
+                    }
+                }
+                let overlay_digest = format!("sha256:{}", hex::encode(hasher.finalize()));
                 let overlay_layer_file = collector.layer_staging_path(&overlay_digest);
-                std::fs::write(&overlay_layer_file, &tar_data)
+                std::fs::rename(&tmp_file, &overlay_layer_file)
                     .map_err(|e| Error::agent("write overlay layer", e.to_string()))?;
                 collector
                     .register_layer(&overlay_digest)
                     .map_err(|e| Error::agent("register overlay layer", e.to_string()))?;
-                println!("  Overlay layer: {} bytes", tar_data.len());
+                println!("  Overlay layer: {} bytes", total);
+            } else {
+                let _ = std::fs::remove_file(&tmp_file);
             }
         } else {
             tracing::debug!(stderr = %String::from_utf8_lossy(&stderr), "overlay export: no container changes found");
