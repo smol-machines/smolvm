@@ -459,6 +459,9 @@ pub struct CreateVmParams {
     pub cuda_vram_limit_mib: Option<u64>,
     /// Expose the guest's Docker daemon socket to the host as a Unix socket.
     pub docker_socket: bool,
+    /// Enable waypipe Wayland forwarding over vsock (guest GUI apps on the host
+    /// compositor).
+    pub waypipe: bool,
     /// Enable GPU acceleration (virtio-gpu with Venus/Vulkan).
     pub gpu: bool,
     /// GPU VRAM size in MiB (None = default). Ignored when gpu is false.
@@ -699,6 +702,7 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
     record.cuda_fork_pool_size = params.cuda_fork_pool_size;
     record.cuda_vram_limit_mib = params.cuda_vram_limit_mib;
     record.docker_socket = params.docker_socket;
+    record.waypipe = params.waypipe;
     record.dns_filter_hosts = params.dns_filter_hosts.clone();
     record.published_sockets = params.published_sockets.clone();
     record.source_smolmachine = params.source_smolmachine.clone();
@@ -1427,6 +1431,7 @@ fn start_vm_named_with_db(
         cuda: record.cuda,
         expose_docker: record.docker_socket,
         published_sockets: record.published_sockets.clone(),
+        waypipe: record.waypipe,
         dns_filter_hosts: record.dns_filter_hosts.clone(),
         // A fork clone shares its golden's uid; resolve it explicitly so a
         // cold (re)start can open the golden's CoW disk backing behind its
@@ -1697,6 +1702,7 @@ pub fn persist_named_running(
                 r.ssh_agent = o.ssh_agent;
                 r.cuda = o.cuda;
                 r.docker_socket = o.docker_socket;
+                r.waypipe = o.waypipe;
                 r.dns_filter_hosts = o.dns_filter_hosts.clone();
                 r.gpu = if o.gpu { Some(true) } else { None };
                 r.gpu_vram_mib = o.gpu_vram_mib;
@@ -1737,6 +1743,8 @@ pub struct DefaultVmOverrides {
     pub ssh_agent: bool,
     pub cuda: bool,
     pub docker_socket: bool,
+    /// Enable waypipe Wayland forwarding over vsock.
+    pub waypipe: bool,
     pub dns_filter_hosts: Option<Vec<String>>,
     pub gpu: bool,
     pub gpu_vram_mib: Option<u32>,

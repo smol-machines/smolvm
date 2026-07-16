@@ -628,6 +628,12 @@ pub struct RunCmd {
     #[arg(long, help_heading = "Network")]
     pub docker_socket: bool,
 
+    /// Forward guest Wayland apps to the host compositor over vsock. Bridges a
+    /// guest waypipe vsock port to a host Unix socket; run `waypipe client` on
+    /// it and `waypipe server --vsock` in the VM. Requires waypipe in the VM.
+    #[arg(long, help_heading = "Hardware")]
+    pub waypipe: bool,
+
     /// Mount ~/.docker/ config into VM for registry authentication
     #[arg(long, help_heading = "Registry")]
     pub docker_config: bool,
@@ -1504,6 +1510,7 @@ impl RunCmd {
             ssh_agent_socket,
             cuda: self.cuda || params.cuda,
             expose_docker: self.docker_socket || params.docker_socket,
+            waypipe: self.waypipe || params.waypipe,
             dns_filter_hosts: params.dns_filter_hosts.clone(),
             // A foreground ephemeral VM exists only to serve this command, so bind
             // its lifetime to this process. Without the watchdog the VM survives a
@@ -1560,6 +1567,22 @@ impl RunCmd {
                 "Docker socket exposed — once dockerd is running in the VM, reach it with:\n  \
                  DOCKER_HOST=unix://{} docker ps",
                 sock.display()
+            );
+        }
+
+        // Tell the user how to bring up the Wayland bridge. smolvm bridges the
+        // guest's outbound waypipe vsock port to this host Unix socket; the user
+        // runs a `waypipe client` listening on it, next to the host compositor,
+        // and `waypipe server --vsock` in the VM for each app.
+        if self.waypipe || params.waypipe {
+            let sock = smolvm::agent::vm_data_dir(&vm_name).join("waypipe.sock");
+            eprintln!(
+                "Waypipe forwarding enabled. On the host, run a listening client:\n  \
+                 waypipe -s {} client\n\
+                 then in the VM run an app through the vsock server:\n  \
+                 waypipe --vsock -s {} server -- weston-terminal",
+                sock.display(),
+                smolvm_protocol::ports::WAYPIPE
             );
         }
 
@@ -1805,6 +1828,7 @@ impl RunCmd {
                                 ssh_agent: self.ssh_agent || params.ssh_agent,
                                 cuda: self.cuda || params.cuda,
                                 docker_socket: self.docker_socket || params.docker_socket,
+                                waypipe: self.waypipe || params.waypipe,
                                 dns_filter_hosts: params.dns_filter_hosts.clone(),
                                 gpu: self.gpu || params.gpu,
                                 gpu_vram_mib: self.gpu_vram_mib.or(params.gpu_vram_mib),
@@ -1961,6 +1985,7 @@ impl RunCmd {
                             ssh_agent: self.ssh_agent || params.ssh_agent,
                             cuda: self.cuda || params.cuda,
                             docker_socket: self.docker_socket || params.docker_socket,
+                            waypipe: self.waypipe || params.waypipe,
                             dns_filter_hosts: params.dns_filter_hosts.clone(),
                             gpu: self.gpu || params.gpu,
                             gpu_vram_mib: self.gpu_vram_mib.or(params.gpu_vram_mib),
@@ -3099,6 +3124,12 @@ pub struct CreateCmd {
     #[arg(long)]
     pub docker_socket: bool,
 
+    /// Forward guest Wayland apps to the host compositor over vsock. Bridges a
+    /// guest waypipe vsock port to a host Unix socket; run `waypipe client` on
+    /// it and `waypipe server --vsock` in the VM. Requires waypipe in the VM.
+    #[arg(long)]
+    pub waypipe: bool,
+
     /// Inject a secret from a host env var (GUEST_VAR=HOST_VAR), resolved at
     /// each launch. Only the reference is persisted, never the value.
     #[arg(long = "secret-env", value_name = "GUEST_VAR=HOST_VAR")]
@@ -3277,6 +3308,9 @@ impl CreateCmd {
         }
         if self.docker_socket {
             params.docker_socket = true;
+        }
+        if self.waypipe {
+            params.waypipe = true;
         }
         if self.gpu {
             params.gpu = true;
@@ -3466,6 +3500,7 @@ impl CreateCmd {
             cuda_fork_pool_size: None,
             cuda_vram_limit_mib: None,
             docker_socket: self.docker_socket,
+            waypipe: self.waypipe,
             dns_filter_hosts,
             published_sockets: parse_published_sockets(&self.expose_socket, &self.mount_socket)?,
             gpu: manifest.gpu,
