@@ -157,7 +157,10 @@ fn parse_published_sockets(
         if s.guest_path.contains(';') || s.guest_path.contains('|') {
             return Err(smolvm::Error::config(
                 "publish-socket",
-                format!("guest path '{}' contains an unsupported character (';' or '|')", s.guest_path),
+                format!(
+                    "guest path '{}' contains an unsupported character (';' or '|')",
+                    s.guest_path
+                ),
             ));
         }
     }
