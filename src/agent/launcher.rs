@@ -189,6 +189,10 @@ pub struct LaunchFeatures {
     /// Hostnames for DNS filtering. When set, the host starts a DNS filter
     /// listener and the guest agent proxies DNS queries through it.
     pub dns_filter_hosts: Option<Vec<String>>,
+    /// User-published Unix-socket bridges (`--expose-socket` / `--mount-socket`).
+    /// The launcher assigns each a vsock port, wires libkrun, and tells the guest
+    /// agent to start the matching relay.
+    pub published_sockets: Vec<crate::config::PublishedSocketConfig>,
     /// Pre-extracted OCI layer directory for machines created from .smolmachine.
     /// When set, the launcher mounts this directory via virtiofs so the agent
     /// can use pre-extracted layers instead of pulling from a registry.
@@ -386,6 +390,11 @@ pub struct LaunchConfig<'a> {
     /// path and the guest proxies connections to its in-guest dockerd socket,
     /// so a host client reaches the daemon at `DOCKER_HOST=unix://<this path>`.
     pub docker_socket: Option<&'a Path>,
+    /// User-published Unix-socket bridges. The launcher resolves each `expose`
+    /// socket's host path against the per-VM dir (the vsock socket's parent),
+    /// assigns a vsock port (`ports::PUBLISH_SOCKET_BASE + i`), wires libkrun,
+    /// and encodes the guest side into `SMOLVM_PUBLISH_SOCKETS`.
+    pub published_sockets: &'a [crate::config::PublishedSocketConfig],
     /// Pre-extracted OCI layers directory for .smolmachine-sourced machines.
     /// Mounted via virtiofs as "smolvm_layers" so the agent uses packed layers.
     pub packed_layers_dir: Option<&'a Path>,
@@ -445,6 +454,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         dns_filter_socket,
         cuda_socket,
         docker_socket,
+        published_sockets,
         packed_layers_dir,
         extra_disks,
         dns_filter_enabled,
@@ -1118,6 +1128,74 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             }
         }
 
+        // User-published Unix-socket bridges (`--expose-socket`/`--mount-socket`).
+        // Each is assigned a dynamic vsock port; libkrun bridges it to a host-side
+        // Unix socket (listening for `expose`, dialing for `mount`), and the guest
+        // agent starts the matching relay from the `SMOLVM_PUBLISH_SOCKETS` env.
+        // The per-VM dir (the vsock socket's parent) is where an `expose` socket's
+        // host end is created when the user didn't pin a host path.
+        let per_vm_dir = vsock_socket.parent();
+        let published_guest: Vec<smolvm_protocol::publish_socket::PublishedSocket> = published_sockets
+            .iter()
+            .take(ports::PUBLISH_SOCKET_MAX)
+            .enumerate()
+            .filter_map(|(i, spec)| {
+                let vsock_port = ports::PUBLISH_SOCKET_BASE + i as u32;
+                // Resolve the host-side path: explicit, or (expose only) the
+                // per-VM dir + the guest socket's basename.
+                let host_path: std::path::PathBuf = match &spec.host_path {
+                    Some(p) => std::path::PathBuf::from(p),
+                    None => {
+                        let base = std::path::Path::new(&spec.guest_path)
+                            .file_name()
+                            .unwrap_or_else(|| std::ffi::OsStr::new("published.sock"));
+                        match per_vm_dir {
+                            Some(dir) => dir.join(base),
+                            None => {
+                                tracing::warn!(
+                                    guest_path = %spec.guest_path,
+                                    "published socket has no host path and no per-VM dir; skipping"
+                                );
+                                return None;
+                            }
+                        }
+                    }
+                };
+                // For an expose socket libkrun *creates* the host listener, so
+                // clear any stale file first (mirrors the Docker bridge).
+                if spec.direction.host_listens() {
+                    let _ = std::fs::remove_file(&host_path);
+                }
+                let host_c = match path_to_cstring(&host_path) {
+                    Ok(c) => c,
+                    Err(_) => {
+                        tracing::warn!(host_path = %host_path.display(), "published socket host path has a null byte; skipping");
+                        return None;
+                    }
+                };
+                if krun_add_vsock_port2(ctx, vsock_port, host_c.as_ptr(), spec.direction.host_listens()) < 0 {
+                    tracing::warn!(
+                        vsock_port,
+                        host_path = %host_path.display(),
+                        "failed to add published socket vsock port — disabled"
+                    );
+                    return None;
+                }
+                tracing::info!(
+                    vsock_port,
+                    direction = spec.direction.as_str(),
+                    host_path = %host_path.display(),
+                    guest_path = %spec.guest_path,
+                    "published socket bridge enabled"
+                );
+                Some(smolvm_protocol::publish_socket::PublishedSocket {
+                    vsock_port,
+                    guest_path: spec.guest_path.clone(),
+                    direction: spec.direction,
+                })
+            })
+            .collect();
+
         // Redirect console output to a file if specified, via the upstream
         // virtio-console API (krun_set_console_output was removed).
         if let Some(log_path) = console_log {
@@ -1359,6 +1437,12 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             for (key, value) in svc.guest_env {
                 env_strings.push(cstr(&format!("{key}={value}")));
             }
+        }
+
+        // Tell the guest agent which published-socket bridges to start.
+        if !published_guest.is_empty() {
+            let encoded = smolvm_protocol::publish_socket::encode(&published_guest);
+            env_strings.push(cstr(&format!("{}={}", guest_env::PUBLISH_SOCKETS, encoded)));
         }
 
         // Tell the agent GPU was requested so it can sanity-check the

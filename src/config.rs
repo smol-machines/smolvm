@@ -13,7 +13,25 @@ use crate::db::SmolvmDb;
 use crate::error::Result;
 use crate::network::NetworkBackend;
 use serde::{Deserialize, Serialize};
+pub use smolvm_protocol::publish_socket::SocketDirection;
 use std::collections::HashMap;
+
+/// A user-published host↔guest Unix-socket bridge (`--expose-socket` /
+/// `--mount-socket`), persisted on the VM record. The vsock port is assigned at
+/// launch (not stored); only the paths and direction are durable.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PublishedSocketConfig {
+    /// Bridge direction (`expose` = guest→host, `mount` = host→guest).
+    pub direction: SocketDirection,
+    /// Guest-side socket path: the existing app socket to expose, or the path a
+    /// mounted host socket is created at inside the guest.
+    pub guest_path: String,
+    /// Host-side socket path. For `expose`, where the host-side socket is
+    /// created (`None` → default to `<per-VM dir>/<basename of guest_path>`).
+    /// For `mount`, the existing host socket to bridge in (required).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_path: Option<String>,
+}
 
 /// VM lifecycle state.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -372,6 +390,10 @@ pub struct VmRecord {
     #[serde(default)]
     pub ports: Vec<(u16, u16)>,
 
+    /// User-published Unix-socket bridges (`--expose-socket` / `--mount-socket`).
+    #[serde(default)]
+    pub published_sockets: Vec<PublishedSocketConfig>,
+
     /// Enable outbound network access (TSI).
     #[serde(default)]
     pub network: bool,
@@ -571,6 +593,7 @@ impl VmRecord {
             mem,
             mounts,
             ports,
+            published_sockets: Vec::new(),
             network,
             gpu: None,
             gpu_vram_mib: None,
@@ -627,6 +650,7 @@ impl VmRecord {
             mem,
             mounts,
             ports,
+            published_sockets: Vec::new(),
             network,
             gpu: None,
             gpu_vram_mib: None,

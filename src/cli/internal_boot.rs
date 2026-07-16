@@ -569,6 +569,7 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
         dns_filter_socket: dns_filter_socket_path.as_deref(),
         cuda_socket: cuda_socket.as_deref(),
         docker_socket: docker_socket.as_deref(),
+        published_sockets: &config.published_sockets,
         packed_layers_dir: config.packed_layers_dir.as_deref(),
         extra_disks: &config.extra_disks,
         dns_filter_enabled: config

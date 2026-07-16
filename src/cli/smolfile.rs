@@ -91,6 +91,7 @@ pub fn build_create_params(
                 gpu_vram_mib: None,
                 rosetta: false,
                 dns_filter_hosts: None,
+                published_sockets: Vec::new(),
                 source_smolmachine: None,
             });
         }
@@ -290,6 +291,7 @@ pub fn build_create_params(
         } else {
             Some(sf_allow_hosts)
         },
+        published_sockets: Vec::new(),
         source_smolmachine: None,
     })
 }
