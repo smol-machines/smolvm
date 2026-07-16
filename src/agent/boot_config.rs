@@ -64,6 +64,11 @@ pub struct BootConfig {
     /// (guest connects out); the user runs a `waypipe client` on the host socket.
     #[serde(default)]
     pub waypipe: bool,
+    /// Enable the raw X11 socket bridge. When set, the boot subprocess resolves
+    /// the host X server socket from `$DISPLAY` and registers an outbound vsock
+    /// port bridged straight to it (guest connects out).
+    #[serde(default)]
+    pub x11: bool,
     /// Hostnames for DNS filtering. When set, the host starts a DNS filter
     /// listener and the guest agent proxies DNS queries through it.
     #[serde(default)]

@@ -634,6 +634,12 @@ pub struct RunCmd {
     #[arg(long, help_heading = "Hardware")]
     pub waypipe: bool,
 
+    /// Bridge the guest X11 socket straight to the host X server (no waypipe).
+    /// Resolves the host $DISPLAY at launch and bridges a guest vsock port to
+    /// that X server socket. Requires a running host X server.
+    #[arg(long, help_heading = "Hardware")]
+    pub x11: bool,
+
     /// Mount ~/.docker/ config into VM for registry authentication
     #[arg(long, help_heading = "Registry")]
     pub docker_config: bool,
@@ -1511,6 +1517,7 @@ impl RunCmd {
             cuda: self.cuda || params.cuda,
             expose_docker: self.docker_socket || params.docker_socket,
             waypipe: self.waypipe || params.waypipe,
+            x11: self.x11 || params.x11,
             dns_filter_hosts: params.dns_filter_hosts.clone(),
             // A foreground ephemeral VM exists only to serve this command, so bind
             // its lifetime to this process. Without the watchdog the VM survives a
@@ -1583,6 +1590,20 @@ impl RunCmd {
                  waypipe --vsock -s {} server -- weston-terminal",
                 sock.display(),
                 smolvm_protocol::ports::WAYPIPE
+            );
+        }
+
+        // Tell the user how to use the raw X11 bridge. smolvm bridges the guest's
+        // outbound X11 vsock port straight to the host X server socket (resolved
+        // from $DISPLAY), and the guest agent exposes it as a local display and
+        // exports DISPLAY automatically - no socat needed. X11 auth still applies:
+        // allow the guest with `xhost +local:` on the host (or copy the MIT cookie).
+        if self.x11 || params.x11 {
+            eprintln!(
+                "X11 bridge enabled (host $DISPLAY -> guest display :10). \
+                 DISPLAY is set in the VM automatically, so just run an X app:\n  \
+                 smolvm machine exec -- xterm\n  \
+                 If clients are refused, run `xhost +local:` on the host first."
             );
         }
 
@@ -1829,6 +1850,7 @@ impl RunCmd {
                                 cuda: self.cuda || params.cuda,
                                 docker_socket: self.docker_socket || params.docker_socket,
                                 waypipe: self.waypipe || params.waypipe,
+                                x11: self.x11 || params.x11,
                                 dns_filter_hosts: params.dns_filter_hosts.clone(),
                                 gpu: self.gpu || params.gpu,
                                 gpu_vram_mib: self.gpu_vram_mib.or(params.gpu_vram_mib),
@@ -1986,6 +2008,7 @@ impl RunCmd {
                             cuda: self.cuda || params.cuda,
                             docker_socket: self.docker_socket || params.docker_socket,
                             waypipe: self.waypipe || params.waypipe,
+                            x11: self.x11 || params.x11,
                             dns_filter_hosts: params.dns_filter_hosts.clone(),
                             gpu: self.gpu || params.gpu,
                             gpu_vram_mib: self.gpu_vram_mib.or(params.gpu_vram_mib),
@@ -3130,6 +3153,12 @@ pub struct CreateCmd {
     #[arg(long)]
     pub waypipe: bool,
 
+    /// Bridge the guest X11 socket straight to the host X server (no waypipe).
+    /// Resolves the host $DISPLAY at launch and bridges a guest vsock port to
+    /// that X server socket. Requires a running host X server.
+    #[arg(long)]
+    pub x11: bool,
+
     /// Inject a secret from a host env var (GUEST_VAR=HOST_VAR), resolved at
     /// each launch. Only the reference is persisted, never the value.
     #[arg(long = "secret-env", value_name = "GUEST_VAR=HOST_VAR")]
@@ -3311,6 +3340,9 @@ impl CreateCmd {
         }
         if self.waypipe {
             params.waypipe = true;
+        }
+        if self.x11 {
+            params.x11 = true;
         }
         if self.gpu {
             params.gpu = true;
@@ -3501,6 +3533,7 @@ impl CreateCmd {
             cuda_vram_limit_mib: None,
             docker_socket: self.docker_socket,
             waypipe: self.waypipe,
+            x11: self.x11,
             dns_filter_hosts,
             published_sockets: parse_published_sockets(&self.expose_socket, &self.mount_socket)?,
             gpu: manifest.gpu,
