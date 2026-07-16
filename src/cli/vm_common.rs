@@ -450,6 +450,8 @@ pub struct CreateVmParams {
     /// Enable waypipe Wayland forwarding over vsock (guest GUI apps on the host
     /// compositor).
     pub waypipe: bool,
+    /// Bridge the guest X11 socket straight to the host X server over vsock.
+    pub x11: bool,
     /// Enable GPU acceleration (virtio-gpu with Venus/Vulkan).
     pub gpu: bool,
     /// GPU VRAM size in MiB (None = default). Ignored when gpu is false.
@@ -646,6 +648,7 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
     record.cuda = params.cuda;
     record.docker_socket = params.docker_socket;
     record.waypipe = params.waypipe;
+    record.x11 = params.x11;
     record.dns_filter_hosts = params.dns_filter_hosts.clone();
     record.published_sockets = params.published_sockets.clone();
     record.source_smolmachine = params.source_smolmachine.clone();
@@ -932,6 +935,7 @@ pub fn start_vm_named(
         expose_docker: record.docker_socket,
         published_sockets: record.published_sockets.clone(),
         waypipe: record.waypipe,
+        x11: record.x11,
         dns_filter_hosts: record.dns_filter_hosts.clone(),
         // A fork clone shares its golden's uid; resolve it explicitly so a
         // cold (re)start can open the golden's CoW disk backing behind its
@@ -1196,6 +1200,7 @@ pub fn persist_named_running(
                 r.cuda = o.cuda;
                 r.docker_socket = o.docker_socket;
                 r.waypipe = o.waypipe;
+                r.x11 = o.x11;
                 r.dns_filter_hosts = o.dns_filter_hosts.clone();
                 r.gpu = if o.gpu { Some(true) } else { None };
                 r.gpu_vram_mib = o.gpu_vram_mib;
@@ -1237,6 +1242,8 @@ pub struct DefaultVmOverrides {
     pub docker_socket: bool,
     /// Enable waypipe Wayland forwarding over vsock.
     pub waypipe: bool,
+    /// Bridge the guest X11 socket straight to the host X server over vsock.
+    pub x11: bool,
     pub dns_filter_hosts: Option<Vec<String>>,
     pub gpu: bool,
     pub gpu_vram_mib: Option<u32>,

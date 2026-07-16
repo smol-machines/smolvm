@@ -121,6 +121,20 @@ smolvm machine exec --name gui -- waypipe --vsock -s 7001 server -- weston-termi
 
 Each `waypipe server` invocation forwards one application; run it again for another window. The bridge uses the same vsock mechanism as `--cuda`, so no networking is required for forwarding itself (`--net` is only needed to install waypipe in the guest).
 
+**Or bridge the raw X11 socket, no waypipe.** `--x11` resolves the host `$DISPLAY` at launch and bridges a guest vsock port straight to that X server's Unix socket. X was designed for network transparency, so guest X clients talk to your host X server directly. The guest agent sets up the display socket and exports `DISPLAY=:10` for you — no `socat`, just run an X client. Needs a running host X server (a native X session, or an Xwayland/`Xephyr` on a Wayland host).
+
+```bash
+smolvm machine create --name xgui --net --x11 --image ubuntu:24.04
+smolvm machine start --name xgui               # start with $DISPLAY set
+
+xhost +local:                                  # allow the bridged connections
+
+# DISPLAY=:10 is already set in the VM — just run an X client.
+smolvm machine exec --name xgui -- sh -c 'apt-get install -y x11-apps && xeyes'
+```
+
+The X11 bridge is a plain byte pipe (guest connects out to host CID 2, port 7002), so it cannot pass `SCM_RIGHTS` ancillary fds — MIT-SHM and DRI3 fall back to wire-image transport (correct, just slower). For per-window Wayland integration and correct fd/GPU handling, prefer `--waypipe`.
+
 **Declare environments with a Smolfile** — reproducible VM config in a simple TOML file.
 
 ```toml
@@ -163,6 +177,7 @@ smolvm strengthens the guest/host boundary by giving each workload a separate VM
 * Host directories passed with `--volume` are intentionally exposed to the guest with the requested access. Do not mount secrets or sensitive paths into an untrusted workload.
 * `--ssh-agent` does not copy private key material into the guest, but it grants the guest access to the forwarded agent socket and therefore the ability to request signatures while the VM is running.
 * `--waypipe` opens a vsock channel from the guest to a host Unix socket that a `waypipe client` reads next to your Wayland compositor. A guest with this enabled can drive that client; only enable it for workloads whose GUI you intend to display.
+* `--x11` bridges a guest vsock port straight to your host X server socket, giving the guest a direct connection to that X server. X11 has weak client isolation, so treat a guest with `--x11` as having access to the whole X server (input, other windows, clipboard); only enable it for trusted GUI workloads, and rely on X access control (`xhost`) deliberately.
 * Networking is disabled by default. Enabling `--net`, port forwarding, or host services expands the workload's reachable surface.
 * In standalone local use, smolvm's state and control endpoints are scoped to the invoking user's environment. For hostile local co-tenants, add host-level account separation and OS confinement around the VMM process. This section does not describe the separate smolmachines cloud control plane or its tenant-isolation guarantees.
 * Release archives publish SHA-256 checksums and the installer rejects a mismatch when the checksum file is available. Releases are not currently signed or accompanied by provenance attestations, and the installer permits installation when the checksum file cannot be downloaded.

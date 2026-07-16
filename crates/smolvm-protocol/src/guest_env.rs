@@ -80,3 +80,11 @@ pub const DOCKER_SOCKET: &str = "SMOLVM_DOCKER_SOCKET";
 /// by [`crate::publish_socket::encode`] (`port|dir|guest_path;…`). The agent
 /// decodes it on startup and spawns one relay per entry. Absent means none.
 pub const PUBLISH_SOCKETS: &str = "SMOLVM_PUBLISH_SOCKETS";
+
+/// Enables the guest-side raw X11 socket bridge: the agent creates a local X11
+/// display socket in the guest and relays each connection out to the host X
+/// server over the `ports::X11` vsock port, so guest X clients render on the
+/// host X server. The agent also exports `DISPLAY` for the workload.
+///
+/// This is a boolean sentinel — the value is [`VALUE_ON`] when set.
+pub const X11: &str = "SMOLVM_X11";

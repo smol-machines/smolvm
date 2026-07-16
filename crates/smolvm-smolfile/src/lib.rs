@@ -250,6 +250,9 @@ pub struct Smolfile {
     /// Enable waypipe Wayland forwarding over vsock: render guest GUI apps on
     /// the host compositor. Requires waypipe inside the VM.
     pub waypipe: Option<bool>,
+    /// Bridge the guest X11 socket straight to the host X server over vsock, so
+    /// guest X11 apps render on the host X server with no waypipe involved.
+    pub x11: Option<bool>,
     /// Storage disk size in GiB.
     pub storage: Option<u64>,
     /// Overlay disk size in GiB.

@@ -29,6 +29,12 @@ pub struct VsockServiceInputs<'a> {
     /// port to this host `AF_UNIX` path, where a `waypipe client` listens next
     /// to the host compositor. When set, waypipe forwarding is enabled.
     pub waypipe_socket: Option<&'a Path>,
+    /// Host X11 server socket (`/tmp/.X11-unix/X<n>`). libkrun bridges the
+    /// guest's outbound X11 vsock port straight to this existing host socket, so
+    /// guest X clients render on the host X server. When set, the raw X11 bridge
+    /// is enabled. Unlike the other endpoints this path is NOT smolvm-owned (it
+    /// is the live host X server socket), so it must never be unlinked.
+    pub x11_socket: Option<&'a Path>,
     /// Host-side Docker socket to expose. libkrun *listens* on this path and
     /// forwards each host connection to the guest, which proxies it to the
     /// in-guest dockerd socket. When set, the Docker bridge is enabled.
@@ -129,6 +135,33 @@ impl VsockService for WaypipeService {
     }
 }
 
+/// Raw X11 socket bridge: a guest X client connects out and libkrun bridges the
+/// vsock port straight to the host X server's Unix socket. No waypipe, no
+/// server/client pair - X was designed for network transparency, so the bytes
+/// pass through unmodified. Outbound like waypipe, so `listen: false`. Note that
+/// a plain byte bridge cannot carry SCM_RIGHTS ancillary fds, so MIT-SHM and
+/// DRI3 fall back to wire-image transport (correctness preserved, perf reduced).
+///
+/// The guest agent is told to start its bridge via `SMOLVM_X11=1`: on boot it
+/// binds a local X11 display socket (`:10`) and relays each connection out to
+/// this vsock port, and exports `DISPLAY=:10` for the workload - so guest X
+/// clients work with no manual `socat`.
+struct X11Service;
+impl VsockService for X11Service {
+    fn resolve<'a>(&self, inputs: &VsockServiceInputs<'a>) -> Option<ActiveVsockService<'a>> {
+        inputs.x11_socket.map(|socket| ActiveVsockService {
+            name: "X11 socket bridge",
+            port: ports::X11,
+            listen: false,
+            socket,
+            guest_env: &[(
+                smolvm_protocol::guest_env::X11,
+                smolvm_protocol::guest_env::VALUE_ON,
+            )],
+        })
+    }
+}
+
 /// Docker socket bridge: the guest serves on the vsock port (proxying to its
 /// own dockerd socket) and the host connects in via the exposed Unix socket, so
 /// a host client can drive the guest's Docker daemon with `DOCKER_HOST=unix://…`.
@@ -153,6 +186,7 @@ pub fn registry() -> &'static [&'static dyn VsockService] {
         &DnsFilterService,
         &CudaService,
         &WaypipeService,
+        &X11Service,
         &DockerSocketService,
     ]
 }

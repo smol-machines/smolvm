@@ -521,6 +521,11 @@ pub struct VmRecord {
     #[serde(default)]
     pub waypipe: bool,
 
+    /// Bridge the guest X11 socket straight to the host X server over vsock, so
+    /// guest X11 apps render on the host X server with no waypipe involved.
+    #[serde(default)]
+    pub x11: bool,
+
     /// Hostnames for DNS filtering. When set, the guest DNS proxy filters
     /// queries against this allowlist.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -630,6 +635,7 @@ impl VmRecord {
             cuda: false,
             docker_socket: false,
             waypipe: false,
+            x11: false,
             dns_filter_hosts: None,
             ephemeral: false,
             source_smolmachine: None,
@@ -688,6 +694,7 @@ impl VmRecord {
             cuda: false,
             docker_socket: false,
             waypipe: false,
+            x11: false,
             dns_filter_hosts: None,
             ephemeral: false,
             source_smolmachine: None,

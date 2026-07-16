@@ -1850,6 +1850,7 @@ impl AgentManager {
             expose_docker: features.expose_docker,
             published_sockets: features.published_sockets,
             waypipe: features.waypipe,
+            x11: features.x11,
             dns_filter_hosts: features.dns_filter_hosts,
             packed_layers_dir: features.packed_layers_dir,
             pack_idmap_source,

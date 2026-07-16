@@ -97,6 +97,7 @@ mod storage;
 #[cfg(target_os = "linux")]
 mod timesync;
 mod vsock;
+mod x11;
 
 // ============================================================================
 // Configuration Constants
@@ -419,6 +420,16 @@ fn main() {
     // Start any user-published Unix-socket bridges (`--expose-socket` /
     // `--mount-socket`). No-op when none are configured.
     publish_socket::start_all();
+
+    // Start the raw X11 socket bridge if enabled by host: the guest binds a
+    // local display socket (:10) and relays each connection out to the host X
+    // server over vsock, so guest X clients render on the host X server. Set
+    // DISPLAY so all child processes (and the agent's own workloads) find it.
+    if x11::is_enabled() {
+        info!("X11 socket bridge enabled, starting guest bridge");
+        x11::start();
+        std::env::set_var("DISPLAY", x11::GUEST_DISPLAY);
+    }
 
     // Mount the Rosetta 2 runtime and register the binfmt_misc handler if the
     // host attached it. Must run after pivot_root (the wrapper lives in the
@@ -3213,6 +3224,7 @@ fn write_oci_bundle(
     storage::add_storage_fallback(&mut spec, mounts, unprivileged);
 
     ssh_agent::inject_into_container(&mut spec);
+    x11::inject_into_container(&mut spec);
     rosetta::inject_into_container(&mut spec);
     cuda::inject_into_container(&mut spec, rootfs_path);
     spec.write_to(bundle_path)
@@ -3556,8 +3568,18 @@ fn spawn_exec_in_container(
 
     // An exec joining a running container inherits the same image-resolved env /
     // workdir as the container's main process.
+    //
+    // The container's config.json got SSH_AUTH_SOCK / DISPLAY via the spec
+    // injection in `write_oci_bundle`, but `crun exec` builds a fresh process env
+    // from what we pass here, NOT the container's - so those vars have to be
+    // re-injected onto the exec env or an interactive `-it` join (this path)
+    // silently loses them. Mirrors the injection `handle_run` does for the
+    // non-interactive keep-alive exec path (#542).
+    let mut env: Vec<(String, String)> = launch.env.clone();
+    ssh_agent::inject_into_env(&mut env);
+    x11::inject_into_env(&mut env);
     let command: &[String] = &launch.command;
-    let env: &[(String, String)] = &launch.env;
+    let env: &[(String, String)] = &env;
     let workdir: Option<&str> = launch.workdir.as_deref();
 
     info!(
@@ -4031,6 +4053,7 @@ fn spawn_interactive_command(
 
     // Forward SSH agent into the container if enabled at boot.
     ssh_agent::inject_into_container(&mut spec);
+    x11::inject_into_container(&mut spec);
     rosetta::inject_into_container(&mut spec);
     cuda::inject_into_container(&mut spec, rootfs_path);
 
@@ -5137,6 +5160,7 @@ fn handle_run(
     // is off; harmless on the fresh-container path.
     let mut env = env.to_vec();
     ssh_agent::inject_into_env(&mut env);
+    x11::inject_into_env(&mut env);
     let env = &env[..];
 
     // Honor the image's default USER when the request doesn't pin one, so every

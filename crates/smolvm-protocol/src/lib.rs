@@ -163,6 +163,11 @@ pub mod ports {
     /// `waypipe client` listens next to the host compositor. Outbound (guest
     /// connects out), like the SSH/DNS/CUDA bridges.
     pub const WAYPIPE: u32 = 7001;
+    /// Raw X11 socket bridge: a guest X client connects out to this port and
+    /// libkrun bridges it straight to the host X server's Unix socket
+    /// (`/tmp/.X11-unix/X<n>`), so guest X11 apps render on the host X server
+    /// with no waypipe in between. Outbound (guest connects out).
+    pub const X11: u32 = 7002;
 }
 
 /// vsock CID constants.
