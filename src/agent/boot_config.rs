@@ -55,6 +55,10 @@ pub struct BootConfig {
     /// VM data dir; the guest agent proxies it to `/var/run/docker.sock`.
     #[serde(default)]
     pub expose_docker: bool,
+    /// User-published Unix-socket bridges (`--expose-socket` / `--mount-socket`),
+    /// carried into the boot subprocess and applied by the launcher.
+    #[serde(default)]
+    pub published_sockets: Vec<crate::config::PublishedSocketConfig>,
     /// Hostnames for DNS filtering. When set, the host starts a DNS filter
     /// listener and the guest agent proxies DNS queries through it.
     #[serde(default)]

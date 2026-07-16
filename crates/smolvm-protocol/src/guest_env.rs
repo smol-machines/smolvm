@@ -75,3 +75,8 @@ pub const DNS_FILTER: &str = "SMOLVM_DNS_FILTER";
 /// `ports::DOCKER` vsock port and proxies each connection to the in-guest
 /// Docker daemon socket, so the host can reach it over a Unix socket.
 pub const DOCKER_SOCKET: &str = "SMOLVM_DOCKER_SOCKET";
+
+/// Carries the user's published Unix-socket bridges to the guest agent, encoded
+/// by [`crate::publish_socket::encode`] (`port|dir|guest_path;…`). The agent
+/// decodes it on startup and spawns one relay per entry. Absent means none.
+pub const PUBLISH_SOCKETS: &str = "SMOLVM_PUBLISH_SOCKETS";

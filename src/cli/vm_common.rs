@@ -455,6 +455,8 @@ pub struct CreateVmParams {
     pub rosetta: bool,
     /// Hostnames for DNS filtering (from --allow-host / [network].allow_hosts).
     pub dns_filter_hosts: Option<Vec<String>>,
+    /// User-published Unix-socket bridges (`--expose-socket` / `--mount-socket`).
+    pub published_sockets: Vec<smolvm::config::PublishedSocketConfig>,
     /// Absolute path to .smolmachine sidecar (for machines created with --from).
     pub source_smolmachine: Option<String>,
     /// Secret refs from Smolfile `[secrets]`. The refs themselves are
@@ -641,6 +643,7 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
     record.cuda = params.cuda;
     record.docker_socket = params.docker_socket;
     record.dns_filter_hosts = params.dns_filter_hosts.clone();
+    record.published_sockets = params.published_sockets.clone();
     record.source_smolmachine = params.source_smolmachine.clone();
 
     Ok(record)
@@ -919,6 +922,7 @@ pub fn start_vm_named(
         ssh_agent_socket,
         cuda: record.cuda,
         expose_docker: record.docker_socket,
+        published_sockets: record.published_sockets.clone(),
         dns_filter_hosts: record.dns_filter_hosts.clone(),
         ..Default::default()
     }

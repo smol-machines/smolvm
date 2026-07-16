@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod guest_env;
 pub mod image_ref;
+pub mod publish_socket;
 pub mod retry;
 pub mod secrets;
 
@@ -146,6 +147,16 @@ pub mod ports {
     /// CUDA-over-vsock (experimental): guest CUDA client forwards Driver-API
     /// calls to a host CUDA server that runs them on the host NVIDIA GPU.
     pub const CUDA: u32 = 7000;
+
+    /// Base vsock port for user-published Unix-socket bridges
+    /// (`--expose-socket` / `--mount-socket`). Each published socket is assigned
+    /// `PUBLISH_SOCKET_BASE + index`. Kept clear of the fixed ports above (and of
+    /// CUDA at 7000) so a reasonable number of sockets never collides.
+    pub const PUBLISH_SOCKET_BASE: u32 = 6100;
+
+    /// Maximum number of user-published sockets per VM. Bounds the vsock-port
+    /// window (`6100..6100+MAX`) below CUDA's 7000.
+    pub const PUBLISH_SOCKET_MAX: usize = 64;
 }
 
 /// vsock CID constants.

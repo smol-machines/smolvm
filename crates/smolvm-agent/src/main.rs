@@ -89,6 +89,7 @@ mod pod;
 mod process;
 #[cfg(target_os = "linux")]
 mod pty;
+mod publish_socket;
 mod retry;
 mod rosetta;
 mod ssh_agent;
@@ -414,6 +415,10 @@ fn main() {
         info!("Docker socket bridge enabled, starting guest bridge");
         docker_bridge::start();
     }
+
+    // Start any user-published Unix-socket bridges (`--expose-socket` /
+    // `--mount-socket`). No-op when none are configured.
+    publish_socket::start_all();
 
     // Mount the Rosetta 2 runtime and register the binfmt_misc handler if the
     // host attached it. Must run after pivot_root (the wrapper lives in the

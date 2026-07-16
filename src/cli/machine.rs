@@ -93,6 +93,80 @@ fn resolve_egress_flags(
 /// absolute `from_file` paths. A key that appears more than once — across or
 /// within the two flags — is a hard error, since silently keeping the last
 /// occurrence would mask a typo.
+/// Parse `--expose-socket`/`--mount-socket` specs into published-socket configs.
+///
+/// - `--expose-socket GUEST_PATH[:HOST_PATH]`: expose a guest-listening socket to
+///   the host. `HOST_PATH` optional (defaults to `<vm-dir>/<basename>`).
+/// - `--mount-socket HOST_PATH:GUEST_PATH`: mount a host socket into the guest.
+fn parse_published_sockets(
+    expose: &[String],
+    mount: &[String],
+) -> smolvm::Result<Vec<smolvm::config::PublishedSocketConfig>> {
+    use smolvm::config::{PublishedSocketConfig, SocketDirection};
+
+    let mut out = Vec::new();
+    for spec in expose {
+        let (guest_path, host_path) = match spec.split_once(':') {
+            Some((g, h)) => (g.to_string(), Some(h.to_string())),
+            None => (spec.clone(), None),
+        };
+        if guest_path.is_empty() {
+            return Err(smolvm::Error::config(
+                "expose-socket",
+                format!("empty guest path in '{spec}'"),
+            ));
+        }
+        out.push(PublishedSocketConfig {
+            direction: SocketDirection::Expose,
+            guest_path,
+            host_path: host_path.filter(|h| !h.is_empty()),
+        });
+    }
+    for spec in mount {
+        let (host_path, guest_path) = spec.split_once(':').ok_or_else(|| {
+            smolvm::Error::config(
+                "mount-socket",
+                format!("expected HOST_PATH:GUEST_PATH, got '{spec}'"),
+            )
+        })?;
+        if host_path.is_empty() || guest_path.is_empty() {
+            return Err(smolvm::Error::config(
+                "mount-socket",
+                format!("both HOST_PATH and GUEST_PATH are required in '{spec}'"),
+            ));
+        }
+        out.push(PublishedSocketConfig {
+            direction: SocketDirection::Mount,
+            guest_path: guest_path.to_string(),
+            host_path: Some(host_path.to_string()),
+        });
+    }
+    if out.len() > smolvm_protocol::ports::PUBLISH_SOCKET_MAX {
+        return Err(smolvm::Error::config(
+            "publish-socket",
+            format!(
+                "too many published sockets ({}); max is {}",
+                out.len(),
+                smolvm_protocol::ports::PUBLISH_SOCKET_MAX
+            ),
+        ));
+    }
+    // The guest env encoding uses ';' and '|' as separators; reject paths that
+    // would corrupt it.
+    for s in &out {
+        if s.guest_path.contains(';') || s.guest_path.contains('|') {
+            return Err(smolvm::Error::config(
+                "publish-socket",
+                format!(
+                    "guest path '{}' contains an unsupported character (';' or '|')",
+                    s.guest_path
+                ),
+            ));
+        }
+    }
+    Ok(out)
+}
+
 fn parse_cli_secret_refs(
     secret_env: &[String],
     secret_file: &[String],
@@ -1686,6 +1760,34 @@ mod tests {
     }
 
     #[test]
+    fn parse_published_sockets_both_directions() {
+        use smolvm::config::SocketDirection;
+        let out = parse_published_sockets(
+            &[
+                "/var/run/app.sock".to_string(),
+                "/run/svc.sock:/tmp/pinned.sock".to_string(),
+            ],
+            &["/run/host.sock:/run/guest.sock".to_string()],
+        )
+        .unwrap();
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].direction, SocketDirection::Expose);
+        assert_eq!(out[0].guest_path, "/var/run/app.sock");
+        assert_eq!(out[0].host_path, None);
+        assert_eq!(out[1].host_path.as_deref(), Some("/tmp/pinned.sock"));
+        assert_eq!(out[2].direction, SocketDirection::Mount);
+        assert_eq!(out[2].guest_path, "/run/guest.sock");
+        assert_eq!(out[2].host_path.as_deref(), Some("/run/host.sock"));
+    }
+
+    #[test]
+    fn parse_published_sockets_rejects_bad_specs() {
+        assert!(parse_published_sockets(&[], &["/only-host".to_string()]).is_err());
+        assert!(parse_published_sockets(&[":/tmp/h.sock".to_string()], &[]).is_err());
+        assert!(parse_published_sockets(&["/run/a;b.sock".to_string()], &[]).is_err());
+    }
+
+    #[test]
     fn parse_cli_secret_refs_builds_env_and_file_refs() {
         let refs = parse_cli_secret_refs(
             &["GUEST_TOKEN=HOST_TOKEN".to_string()],
@@ -2204,6 +2306,17 @@ pub struct CreateCmd {
     #[arg(long)]
     pub rosetta: bool,
 
+    /// Expose a Unix socket the guest listens on to the host (repeatable). The
+    /// host reaches it at the given host path, or `<vm-dir>/<basename>` by
+    /// default. Format: GUEST_PATH[:HOST_PATH].
+    #[arg(long = "expose-socket", value_name = "GUEST_PATH[:HOST_PATH]")]
+    pub expose_socket: Vec<String>,
+
+    /// Mount a host Unix socket into the guest (repeatable), so a guest process
+    /// reaches the host service at GUEST_PATH. Format: HOST_PATH:GUEST_PATH.
+    #[arg(long = "mount-socket", value_name = "HOST_PATH:GUEST_PATH")]
+    pub mount_socket: Vec<String>,
+
     /// Run command on every VM start (can be used multiple times)
     #[arg(long = "init", value_name = "COMMAND")]
     pub init: Vec<String>,
@@ -2340,6 +2453,8 @@ impl CreateCmd {
             (Some(from_smolfile), None) => Some(from_smolfile),
             (None, some) => some,
         };
+        params.published_sockets =
+            parse_published_sockets(&self.expose_socket, &self.mount_socket)?;
         // CLI `--secret-env`/`--secret-file` refs merge over any Smolfile
         // `[secrets]` of the same name (CLI wins). Only refs are persisted.
         for (key, r) in parse_cli_secret_refs(&self.secret_env, &self.secret_file)? {
@@ -2539,6 +2654,7 @@ impl CreateCmd {
             cuda: self.cuda,
             docker_socket: self.docker_socket,
             dns_filter_hosts: None,
+            published_sockets: Vec::new(),
             gpu: manifest.gpu,
             gpu_vram_mib: None,
             rosetta: false,
