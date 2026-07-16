@@ -167,6 +167,14 @@ pub const DISK_VOLUMES: &str = "SMOLVM_DISK_VOLUMES";
 /// machine's `workload.log`. Absent means the output is discarded.
 pub const WORKLOAD_LOGS: &str = "SMOLVM_WORKLOAD_LOGS";
 
+/// Enables the guest-side raw X11 socket bridge: the agent creates a local X11
+/// display socket in the guest and relays each connection out to the host X
+/// server over the `ports::X11` vsock port, so guest X clients render on the
+/// host X server. The agent also exports `DISPLAY` for the workload.
+///
+/// This is a boolean sentinel — the value is [`VALUE_ON`] when set.
+pub const X11: &str = "SMOLVM_X11";
+
 #[cfg(test)]
 mod shm_size_tests {
     use super::shm_size_option;
