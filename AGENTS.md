@@ -261,6 +261,33 @@ cpus/mem:   CLI flag > Smolfile > defaults (4 CPU, 8192 MiB)
 - `-p HOST:GUEST` forwards a host port to the VM (TCP)
 - Smolfile: use `[network] allow_hosts` and `[network] allow_cidrs`
 
+### Socket Bridges (`machine create`)
+
+Bridge Unix sockets and TCP ports between host and guest over vsock, without
+opening any host TCP listener (all three are repeatable):
+
+- `--expose-socket GUEST_PATH[:HOST_PATH]` — a Unix socket the guest listens on
+  becomes reachable at HOST_PATH (default `<vm-dir>/<basename>`), e.g. an
+  in-guest Docker daemon via `DOCKER_HOST=unix://...`
+- `--mount-socket HOST_PATH:GUEST_PATH` — a Unix socket a host service listens
+  on becomes reachable inside the guest at GUEST_PATH
+- `--publish-socket HOST_PATH:GUEST_PORT` — a TCP port the guest listens on
+  becomes reachable as a host Unix socket at HOST_PATH: `-p` without the host
+  TCP listener. The bridge dials IPv4 loopback, so the workload must listen on
+  `127.0.0.1` or `0.0.0.0`; a listener bound only to `::1` is unreachable.
+
+The host socket file is created with the invoking user's umask and is not
+chmod'd (same as `--expose-socket`), so who can connect is governed by the
+file and its directory permissions — put HOST_PATH in a directory you own.
+
+```bash
+mkdir -p ~/.myapp
+smolvm machine create --name api --publish-socket ~/.myapp/api.sock:8080
+smolvm machine start --name api
+smolvm machine exec --name api -- ./serve --port 8080 &
+curl --unix-socket ~/.myapp/api.sock http://localhost/health
+```
+
 ### Proxy Support
 
 Pass proxy settings into VMs with `-e` when behind a corporate proxy or VPN:

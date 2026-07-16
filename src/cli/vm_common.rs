@@ -455,7 +455,7 @@ pub struct CreateVmParams {
     pub rosetta: bool,
     /// Hostnames for DNS filtering (from --allow-host / [network].allow_hosts).
     pub dns_filter_hosts: Option<Vec<String>>,
-    /// User-published Unix-socket bridges (`--expose-socket` / `--mount-socket`).
+    /// User-published Unix-socket bridges (`--expose-socket` / `--mount-socket` / `--publish-socket`).
     pub published_sockets: Vec<smolvm::config::PublishedSocketConfig>,
     /// Absolute path to .smolmachine sidecar (for machines created with --from).
     pub source_smolmachine: Option<String>,

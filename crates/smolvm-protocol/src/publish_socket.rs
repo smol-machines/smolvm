@@ -4,7 +4,8 @@
 //! into a dynamic, user-specified set. The host allocates a vsock port per
 //! published socket and encodes the guest-relevant fields into the
 //! [`crate::guest_env::PUBLISH_SOCKETS`] env var; the guest agent decodes it and
-//! starts one relay per entry.
+//! starts one relay per entry. The guest-side target is a Unix socket path
+//! (`expose`/`mount`) or a TCP port on the guest loopback (`publish`).
 
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -20,6 +21,10 @@ pub enum SocketDirection {
     /// the guest at the guest path. Guest clients connect in — the SSH-agent
     /// pattern.
     Mount,
+    /// A guest process listens on a TCP port; smolvm exposes it on the host as a
+    /// Unix socket. Host clients connect in — `Expose`, but with a guest TCP
+    /// target instead of a guest socket path (the socket-flavored `-p`).
+    Publish,
 }
 
 impl SocketDirection {
@@ -28,17 +33,18 @@ impl SocketDirection {
         match self {
             SocketDirection::Expose => "expose",
             SocketDirection::Mount => "mount",
+            SocketDirection::Publish => "publish",
         }
     }
 
     /// The libkrun `krun_add_vsock_port2` `listen` flag for this direction.
     ///
-    /// `Expose`: the guest serves on the vsock port and the host connects in, so
-    /// libkrun *listens* on the host-side socket (`true`). `Mount`: the guest
-    /// connects out to the vsock port and libkrun dials the host socket, so
-    /// libkrun does not listen (`false`).
+    /// `Expose`/`Publish`: the guest serves on the vsock port and the host
+    /// connects in, so libkrun *listens* on the host-side socket (`true`).
+    /// `Mount`: the guest connects out to the vsock port and libkrun dials the
+    /// host socket, so libkrun does not listen (`false`).
     pub fn host_listens(&self) -> bool {
-        matches!(self, SocketDirection::Expose)
+        matches!(self, SocketDirection::Expose | SocketDirection::Publish)
     }
 }
 
@@ -48,15 +54,16 @@ impl FromStr for SocketDirection {
         match s.to_ascii_lowercase().as_str() {
             "expose" => Ok(SocketDirection::Expose),
             "mount" => Ok(SocketDirection::Mount),
+            "publish" => Ok(SocketDirection::Publish),
             other => Err(format!(
-                "invalid socket direction '{other}' (expected 'expose' or 'mount')"
+                "invalid socket direction '{other}' (expected 'expose', 'mount' or 'publish')"
             )),
         }
     }
 }
 
 /// One published socket, as the guest agent needs to know it: which vsock port
-/// carries it, which guest-side path to serve or create, and the direction.
+/// carries it, which guest-side target to serve or create, and the direction.
 ///
 /// The host-side path is intentionally absent — libkrun owns the host end, so
 /// the guest never needs it.
@@ -64,11 +71,24 @@ impl FromStr for SocketDirection {
 pub struct PublishedSocket {
     /// vsock port assigned to this bridge by the host launcher.
     pub vsock_port: u32,
-    /// Guest-side socket path: the existing app socket to proxy to (`Expose`),
-    /// or the path to create a listener at (`Mount`).
+    /// Guest-side target: the existing app socket to proxy to (`Expose`), the
+    /// path to create a listener at (`Mount`), or the guest TCP port in digits
+    /// (`Publish`) — see [`Self::guest_port`].
     pub guest_path: String,
     /// Bridge direction.
     pub direction: SocketDirection,
+}
+
+impl PublishedSocket {
+    /// The guest TCP port of a `Publish` bridge, parsed from [`Self::guest_path`].
+    /// `None` for path-target bridges or an unparseable port (the host-side
+    /// validator and [`decode`] reject those before a bridge ever starts).
+    pub fn guest_port(&self) -> Option<u16> {
+        match self.direction {
+            SocketDirection::Publish => self.guest_path.parse::<u16>().ok().filter(|p| *p != 0),
+            SocketDirection::Expose | SocketDirection::Mount => None,
+        }
+    }
 }
 
 /// Encode a list of published sockets for the guest env var, as
@@ -98,11 +118,17 @@ pub fn decode(encoded: &str) -> Vec<PublishedSocket> {
             if guest_path.is_empty() {
                 return None;
             }
-            Some(PublishedSocket {
+            let sock = PublishedSocket {
                 vsock_port,
                 guest_path,
                 direction,
-            })
+            };
+            // A publish target must be a valid TCP port; skip it like any other
+            // malformed entry instead of starting a bridge that can never dial.
+            if direction == SocketDirection::Publish && sock.guest_port().is_none() {
+                return None;
+            }
+            Some(sock)
         })
         .collect()
 }
@@ -121,9 +147,14 @@ mod tests {
             "MOUNT".parse::<SocketDirection>().unwrap(),
             SocketDirection::Mount
         );
+        assert_eq!(
+            "publish".parse::<SocketDirection>().unwrap(),
+            SocketDirection::Publish
+        );
         assert!("bogus".parse::<SocketDirection>().is_err());
         assert!(SocketDirection::Expose.host_listens());
         assert!(!SocketDirection::Mount.host_listens());
+        assert!(SocketDirection::Publish.host_listens());
     }
 
     #[test]
@@ -139,11 +170,16 @@ mod tests {
                 guest_path: "/tmp/host.sock".into(),
                 direction: SocketDirection::Mount,
             },
+            PublishedSocket {
+                vsock_port: 6102,
+                guest_path: "8080".into(),
+                direction: SocketDirection::Publish,
+            },
         ];
         let encoded = encode(&socks);
         assert_eq!(
             encoded,
-            "6100|expose|/var/run/app.sock;6101|mount|/tmp/host.sock"
+            "6100|expose|/var/run/app.sock;6101|mount|/tmp/host.sock;6102|publish|8080"
         );
         assert_eq!(decode(&encoded), socks);
     }
@@ -156,5 +192,36 @@ mod tests {
         let out = decode(mixed);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].guest_path, "/ok.sock");
+    }
+
+    #[test]
+    fn guest_port_parses_publish_targets_only() {
+        let publish = |target: &str| PublishedSocket {
+            vsock_port: 6100,
+            guest_path: target.into(),
+            direction: SocketDirection::Publish,
+        };
+        assert_eq!(publish("8080").guest_port(), Some(8080));
+        assert_eq!(publish("0").guest_port(), None);
+        assert_eq!(publish("65536").guest_port(), None);
+        assert_eq!(publish("/var/run/app.sock").guest_port(), None);
+        let expose = PublishedSocket {
+            vsock_port: 6100,
+            guest_path: "8080".into(),
+            direction: SocketDirection::Expose,
+        };
+        assert_eq!(expose.guest_port(), None);
+    }
+
+    #[test]
+    fn decode_skips_publish_entries_without_a_valid_port() {
+        // A path, an out-of-range port, and port 0 are all skipped; the valid
+        // publish entry survives.
+        let mixed =
+            "6100|publish|/not-a-port.sock;6101|publish|65536;6102|publish|0;6103|publish|8080";
+        let out = decode(mixed);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].vsock_port, 6103);
+        assert_eq!(out[0].guest_port(), Some(8080));
     }
 }

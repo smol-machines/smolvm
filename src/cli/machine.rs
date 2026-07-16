@@ -93,14 +93,18 @@ fn resolve_egress_flags(
 /// absolute `from_file` paths. A key that appears more than once — across or
 /// within the two flags — is a hard error, since silently keeping the last
 /// occurrence would mask a typo.
-/// Parse `--expose-socket`/`--mount-socket` specs into published-socket configs.
+/// Parse `--expose-socket`/`--mount-socket`/`--publish-socket` specs into
+/// published-socket configs.
 ///
 /// - `--expose-socket GUEST_PATH[:HOST_PATH]`: expose a guest-listening socket to
 ///   the host. `HOST_PATH` optional (defaults to `<vm-dir>/<basename>`).
 /// - `--mount-socket HOST_PATH:GUEST_PATH`: mount a host socket into the guest.
+/// - `--publish-socket HOST_PATH:GUEST_PORT`: expose a guest-listening TCP port
+///   to the host as a Unix socket.
 fn parse_published_sockets(
     expose: &[String],
     mount: &[String],
+    publish: &[String],
 ) -> smolvm::Result<Vec<smolvm::config::PublishedSocketConfig>> {
     use smolvm::config::{PublishedSocketConfig, SocketDirection};
 
@@ -141,11 +145,41 @@ fn parse_published_sockets(
             host_path: Some(host_path.to_string()),
         });
     }
+    for spec in publish {
+        // Split on the LAST colon: host paths may contain ':', the port cannot.
+        let (host_path, guest_port) = spec.rsplit_once(':').ok_or_else(|| {
+            smolvm::Error::config(
+                "publish-socket",
+                format!("expected HOST_PATH:GUEST_PORT, got '{spec}'"),
+            )
+        })?;
+        if host_path.is_empty() {
+            return Err(smolvm::Error::config(
+                "publish-socket",
+                format!("HOST_PATH is required in '{spec}'"),
+            ));
+        }
+        let port = guest_port
+            .parse::<u16>()
+            .ok()
+            .filter(|p| *p != 0)
+            .ok_or_else(|| {
+                smolvm::Error::config(
+                    "publish-socket",
+                    format!("invalid guest TCP port '{guest_port}' in '{spec}' (expected 1-65535)"),
+                )
+            })?;
+        out.push(PublishedSocketConfig {
+            direction: SocketDirection::Publish,
+            guest_path: port.to_string(),
+            host_path: Some(host_path.to_string()),
+        });
+    }
     if out.len() > smolvm_protocol::ports::PUBLISH_SOCKET_MAX {
         return Err(smolvm::Error::config(
             "publish-socket",
             format!(
-                "too many published sockets ({}); max is {}",
+                "too many socket bridges across --expose-socket/--mount-socket/--publish-socket ({}); max is {}",
                 out.len(),
                 smolvm_protocol::ports::PUBLISH_SOCKET_MAX
             ),
@@ -1768,6 +1802,7 @@ mod tests {
                 "/run/svc.sock:/tmp/pinned.sock".to_string(),
             ],
             &["/run/host.sock:/run/guest.sock".to_string()],
+            &[],
         )
         .unwrap();
         assert_eq!(out.len(), 3);
@@ -1782,9 +1817,40 @@ mod tests {
 
     #[test]
     fn parse_published_sockets_rejects_bad_specs() {
-        assert!(parse_published_sockets(&[], &["/only-host".to_string()]).is_err());
-        assert!(parse_published_sockets(&[":/tmp/h.sock".to_string()], &[]).is_err());
-        assert!(parse_published_sockets(&["/run/a;b.sock".to_string()], &[]).is_err());
+        assert!(parse_published_sockets(&[], &["/only-host".to_string()], &[]).is_err());
+        assert!(parse_published_sockets(&[":/tmp/h.sock".to_string()], &[], &[]).is_err());
+        assert!(parse_published_sockets(&["/run/a;b.sock".to_string()], &[], &[]).is_err());
+    }
+
+    #[test]
+    fn parse_published_sockets_publish_specs() {
+        use smolvm::config::SocketDirection;
+        let out = parse_published_sockets(
+            &[],
+            &[],
+            &[
+                "/tmp/app.sock:8080".to_string(),
+                // Host paths may contain ':'; only the last colon separates the port.
+                "/tmp/odd:name.sock:9090".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].direction, SocketDirection::Publish);
+        assert_eq!(out[0].guest_path, "8080");
+        assert_eq!(out[0].host_path.as_deref(), Some("/tmp/app.sock"));
+        assert_eq!(out[1].guest_path, "9090");
+        assert_eq!(out[1].host_path.as_deref(), Some("/tmp/odd:name.sock"));
+    }
+
+    #[test]
+    fn parse_published_sockets_rejects_bad_publish_specs() {
+        // no colon, empty host path, non-numeric port, port 0, port > 65535
+        assert!(parse_published_sockets(&[], &[], &["8080".to_string()]).is_err());
+        assert!(parse_published_sockets(&[], &[], &[":8080".to_string()]).is_err());
+        assert!(parse_published_sockets(&[], &[], &["/tmp/a.sock:http".to_string()]).is_err());
+        assert!(parse_published_sockets(&[], &[], &["/tmp/a.sock:0".to_string()]).is_err());
+        assert!(parse_published_sockets(&[], &[], &["/tmp/a.sock:65536".to_string()]).is_err());
     }
 
     #[test]
@@ -2317,6 +2383,12 @@ pub struct CreateCmd {
     #[arg(long = "mount-socket", value_name = "HOST_PATH:GUEST_PATH")]
     pub mount_socket: Vec<String>,
 
+    /// Expose a TCP port the guest listens on to the host as a Unix socket
+    /// (repeatable) — `-p` without a host TCP listener. The workload must listen
+    /// on the guest loopback or all interfaces. Format: HOST_PATH:GUEST_PORT.
+    #[arg(long = "publish-socket", value_name = "HOST_PATH:GUEST_PORT")]
+    pub publish_socket: Vec<String>,
+
     /// Run command on every VM start (can be used multiple times)
     #[arg(long = "init", value_name = "COMMAND")]
     pub init: Vec<String>,
@@ -2453,8 +2525,11 @@ impl CreateCmd {
             (Some(from_smolfile), None) => Some(from_smolfile),
             (None, some) => some,
         };
-        params.published_sockets =
-            parse_published_sockets(&self.expose_socket, &self.mount_socket)?;
+        params.published_sockets = parse_published_sockets(
+            &self.expose_socket,
+            &self.mount_socket,
+            &self.publish_socket,
+        )?;
         // CLI `--secret-env`/`--secret-file` refs merge over any Smolfile
         // `[secrets]` of the same name (CLI wins). Only refs are persisted.
         for (key, r) in parse_cli_secret_refs(&self.secret_env, &self.secret_file)? {

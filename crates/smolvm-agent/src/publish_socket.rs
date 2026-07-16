@@ -1,5 +1,5 @@
 //! Guest-side generalized Unix-socket bridges (`--expose-socket` /
-//! `--mount-socket`).
+//! `--mount-socket` / `--publish-socket`).
 //!
 //! Generalizes the fixed Docker (expose) and SSH-agent (mount) bridges into a
 //! user-specified set. On startup the agent reads
@@ -12,6 +12,9 @@
 //! - **Mount** (host→guest): the agent creates a Unix listener at the guest path;
 //!   for each guest-app connection it dials the vsock port (libkrun bridges it to
 //!   the host socket) and relays. Same shape as the SSH-agent bridge.
+//! - **Publish** (guest→host): like `Expose`, but for each host connection the
+//!   agent dials a TCP port on the guest loopback instead of a Unix socket path,
+//!   so a guest TCP service is reachable through a host socket file.
 //!
 //! The relay honors independent TCP-style half-close so hijacked/streaming
 //! protocols don't lose output — the same property the Docker bridge fixed.
@@ -39,6 +42,7 @@ fn start_one(sock: PublishedSocket) {
             let result = match sock.direction {
                 SocketDirection::Expose => serve_expose(&sock),
                 SocketDirection::Mount => serve_mount(&sock),
+                SocketDirection::Publish => serve_publish(&sock),
             };
             if let Err(e) = result {
                 tracing::warn!(
@@ -94,6 +98,69 @@ fn serve_expose(sock: &PublishedSocket) -> io::Result<()> {
                     "expose-socket: in-guest app socket not reachable"
                 ),
             })
+            .ok();
+    }
+}
+
+/// How long a publish bridge waits for the guest TCP dial. A loopback connect
+/// either succeeds or is refused immediately; the timeout only bounds the case
+/// where the port is firewalled to silently drop, which would otherwise pin the
+/// forwarder thread until the kernel gives up.
+#[cfg(target_os = "linux")]
+const PUBLISH_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Publish: listen on the vsock port; per host connection, dial the guest TCP
+/// port on loopback and relay. `serve_expose` with a TCP target — the workload
+/// must listen on the guest loopback or on all interfaces.
+#[cfg(target_os = "linux")]
+fn serve_publish(sock: &PublishedSocket) -> io::Result<()> {
+    use std::net::{SocketAddr, TcpStream};
+
+    // Validated by the host and by `decode`; a missing port here is a bug, and
+    // a terminal one for this bridge.
+    let guest_port = sock.guest_port().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid publish target '{}'", sock.guest_path),
+        )
+    })?;
+    let guest_addr = SocketAddr::from(([127, 0, 0, 1], guest_port));
+    let listener = crate::vsock::VsockListener::bind(sock.vsock_port)?;
+    tracing::info!(
+        vsock_port = sock.vsock_port,
+        guest_port,
+        "publish-socket bridge listening"
+    );
+    loop {
+        let host_conn = match listener.accept() {
+            Ok(conn) => conn,
+            Err(e) => {
+                // A bad listener fd is terminal; per-connection errors are not.
+                if e.kind() == io::ErrorKind::InvalidInput {
+                    return Err(e);
+                }
+                continue;
+            }
+        };
+        thread::Builder::new()
+            .name("publish-sock-fwd".into())
+            .spawn(
+                move || match TcpStream::connect_timeout(&guest_addr, PUBLISH_DIAL_TIMEOUT) {
+                    Ok(app) => {
+                        if let Err(e) = relay(host_conn, app) {
+                            tracing::debug!(error = %e, "publish-socket relay ended");
+                        }
+                    }
+                    // No listener on the guest port yet (or ever): drop the
+                    // connection. The host client sees a connection reset, same as
+                    // the expose bridge — no start-order coupling.
+                    Err(e) => tracing::debug!(
+                        guest_port,
+                        error = %e,
+                        "publish-socket: guest TCP port not reachable"
+                    ),
+                },
+            )
             .ok();
     }
 }
@@ -240,6 +307,14 @@ fn serve_mount(_sock: &PublishedSocket) -> io::Result<()> {
     ))
 }
 
+#[cfg(not(target_os = "linux"))]
+fn serve_publish(_sock: &PublishedSocket) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "published socket bridges are only supported on Linux guests",
+    ))
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::relay;
@@ -332,6 +407,51 @@ mod tests {
             server_saw, expected,
             "client input after a server half-close must not be dropped"
         );
+    }
+
+    /// The publish-socket shape: one relay leg is a real TCP stream. The client
+    /// (host side, Unix) half-closes after its request; the FIN must cross the
+    /// TCP leg so the guest server sees EOF, and the server's streamed response
+    /// must still be delivered — then the reverse close drains cleanly.
+    #[test]
+    fn relay_bridges_unix_to_tcp_with_half_close() {
+        use std::net::{TcpListener, TcpStream};
+
+        // client <-> a  ==relay==  tcp_client <-> tcp_server
+        let (mut client, a) = UnixStream::pair().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let tcp_client = TcpStream::connect(addr).unwrap();
+        let (mut tcp_server, _) = listener.accept().unwrap();
+
+        let relay_thread = thread::spawn(move || {
+            let _ = relay(a, tcp_client);
+        });
+
+        let payload = vec![b'T'; 256 * 1024];
+        let expected = payload.clone();
+        let server_thread = thread::spawn(move || {
+            let mut request = Vec::new();
+            tcp_server.read_to_end(&mut request).unwrap(); // sees the mirrored FIN
+            tcp_server.write_all(&payload).unwrap();
+            request
+        });
+
+        client.write_all(b"GET / HTTP/1.1\r\n\r\n").unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+
+        let mut got = Vec::new();
+        client.read_to_end(&mut got).unwrap();
+
+        let request = server_thread.join().unwrap();
+        relay_thread.join().unwrap();
+        assert_eq!(request, b"GET / HTTP/1.1\r\n\r\n");
+        assert_eq!(
+            got.len(),
+            expected.len(),
+            "streamed TCP output after a client half-close must not be dropped"
+        );
+        assert_eq!(got, expected);
     }
 
     /// Ordinary bidirectional echo — a plain request/response with no early

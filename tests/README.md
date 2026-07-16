@@ -23,7 +23,7 @@ SMOLVM_SKIP_SLOW=1 ./tests/run_tests.sh   # skip tests with long sleeps (~5 min)
 | `db` | `test_db.sh` | 6 | DB state persistence, VM state transitions |
 | `network` | `test_network.sh` | 17 | Network disable, DNS, egress, DNS filter, Smolfile allow_hosts |
 | `volumes` | `test_volumes.sh` | 6 | virtiofs mounts, /workspace priority |
-| `ports` | `test_ports.sh` | 2 | Port mapping, cross-VM conflict detection |
+| `ports` | `test_ports.sh` | 4 | Port mapping, cross-VM conflict detection, publish-socket bridges |
 | `storage` | `test_storage.sh` | 12 | Overlay, image list, prune, storage resize |
 | `resources` | `test_resources.sh` | 8 | CLI validation — no VMs required |
 | `reliability` | `test_reliability.sh` | 5 | Concurrency, state probe, ls-does-not-kill-vm |

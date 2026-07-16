@@ -417,7 +417,7 @@ fn main() {
     }
 
     // Start any user-published Unix-socket bridges (`--expose-socket` /
-    // `--mount-socket`). No-op when none are configured.
+    // `--mount-socket` / `--publish-socket`). No-op when none are configured.
     publish_socket::start_all();
 
     // Mount the Rosetta 2 runtime and register the binfmt_misc handler if the

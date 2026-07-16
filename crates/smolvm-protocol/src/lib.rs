@@ -149,7 +149,7 @@ pub mod ports {
     pub const CUDA: u32 = 7000;
 
     /// Base vsock port for user-published Unix-socket bridges
-    /// (`--expose-socket` / `--mount-socket`). Each published socket is assigned
+    /// (`--expose-socket` / `--mount-socket` / `--publish-socket`). Each published socket is assigned
     /// `PUBLISH_SOCKET_BASE + index`. Kept clear of the fixed ports above (and of
     /// CUDA at 7000) so a reasonable number of sockets never collides.
     pub const PUBLISH_SOCKET_BASE: u32 = 6100;

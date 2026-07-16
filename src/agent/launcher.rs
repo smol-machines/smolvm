@@ -189,7 +189,7 @@ pub struct LaunchFeatures {
     /// Hostnames for DNS filtering. When set, the host starts a DNS filter
     /// listener and the guest agent proxies DNS queries through it.
     pub dns_filter_hosts: Option<Vec<String>>,
-    /// User-published Unix-socket bridges (`--expose-socket` / `--mount-socket`).
+    /// User-published Unix-socket bridges (`--expose-socket` / `--mount-socket` / `--publish-socket`).
     /// The launcher assigns each a vsock port, wires libkrun, and tells the guest
     /// agent to start the matching relay.
     pub published_sockets: Vec<crate::config::PublishedSocketConfig>,
@@ -1128,9 +1128,9 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             }
         }
 
-        // User-published Unix-socket bridges (`--expose-socket`/`--mount-socket`).
+        // User-published Unix-socket bridges (`--expose-socket`/`--mount-socket`/`--publish-socket`).
         // Each is assigned a dynamic vsock port; libkrun bridges it to a host-side
-        // Unix socket (listening for `expose`, dialing for `mount`), and the guest
+        // Unix socket (listening for `expose`/`publish`, dialing for `mount`), and the guest
         // agent starts the matching relay from the `SMOLVM_PUBLISH_SOCKETS` env.
         // The per-VM dir (the vsock socket's parent) is where an `expose` socket's
         // host end is created when the user didn't pin a host path.
@@ -1161,8 +1161,9 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                         }
                     }
                 };
-                // For an expose socket libkrun *creates* the host listener, so
-                // clear any stale file first (mirrors the Docker bridge).
+                // For an expose or publish socket libkrun *creates* the host
+                // listener, so clear any stale file first (mirrors the Docker
+                // bridge).
                 if spec.direction.host_listens() {
                     let _ = std::fs::remove_file(&host_path);
                 }

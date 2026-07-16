@@ -17,18 +17,21 @@ pub use smolvm_protocol::publish_socket::SocketDirection;
 use std::collections::HashMap;
 
 /// A user-published host↔guest Unix-socket bridge (`--expose-socket` /
-/// `--mount-socket`), persisted on the VM record. The vsock port is assigned at
-/// launch (not stored); only the paths and direction are durable.
+/// `--mount-socket` / `--publish-socket`), persisted on the VM record. The
+/// vsock port is assigned at launch (not stored); only the guest target, host
+/// path and direction are durable.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PublishedSocketConfig {
-    /// Bridge direction (`expose` = guest→host, `mount` = host→guest).
+    /// Bridge direction (`expose`/`publish` = guest→host, `mount` = host→guest).
     pub direction: SocketDirection,
-    /// Guest-side socket path: the existing app socket to expose, or the path a
-    /// mounted host socket is created at inside the guest.
+    /// Guest-side target: the existing app socket to expose, the path a mounted
+    /// host socket is created at inside the guest, or — for `publish` — the
+    /// guest TCP port in digits (validated by the CLI before it gets here).
     pub guest_path: String,
     /// Host-side socket path. For `expose`, where the host-side socket is
     /// created (`None` → default to `<per-VM dir>/<basename of guest_path>`).
-    /// For `mount`, the existing host socket to bridge in (required).
+    /// For `mount` (the existing host socket to bridge in) and `publish` (where
+    /// the published socket is created), required.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_path: Option<String>,
 }
@@ -390,7 +393,7 @@ pub struct VmRecord {
     #[serde(default)]
     pub ports: Vec<(u16, u16)>,
 
-    /// User-published Unix-socket bridges (`--expose-socket` / `--mount-socket`).
+    /// User-published Unix-socket bridges (`--expose-socket` / `--mount-socket` / `--publish-socket`).
     #[serde(default)]
     pub published_sockets: Vec<PublishedSocketConfig>,
 
