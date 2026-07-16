@@ -3101,6 +3101,7 @@ impl AgentManager {
             cuda: features.cuda || resources_for_config.cuda,
             expose_docker: features.expose_docker,
             published_sockets: features.published_sockets,
+            waypipe: features.waypipe,
             dns_filter_hosts: features.dns_filter_hosts,
             credentials: features.credentials,
             external_interceptor: features.external_interceptor,

@@ -826,6 +826,7 @@ impl PackRunCmd {
                 resources: resources.clone(),
                 ssh_agent_socket,
                 cuda: false,
+                waypipe: false,
                 expose_docker: false,
                 published_sockets: Vec::new(),
                 dns_filter_hosts: self
@@ -2021,6 +2022,7 @@ fn run_from_cache(
             resources: resources.clone(),
             ssh_agent_socket,
             cuda: false,
+            waypipe: false,
             expose_docker: false,
             published_sockets: Vec::new(),
             dns_filter_hosts: None,
@@ -2419,6 +2421,7 @@ fn daemon_start(
             resources: resources.clone(),
             ssh_agent_socket: ssh_agent_socket.clone(),
             cuda: false,
+            waypipe: false,
             expose_docker: false,
             published_sockets: Vec::new(),
             dns_filter_hosts: None,
