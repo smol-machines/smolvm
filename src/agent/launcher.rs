@@ -265,6 +265,10 @@ pub struct LaunchFeatures {
     /// the VM data dir (`DOCKER_HOST=unix://…`). The guest agent proxies each
     /// host connection to its in-guest `/var/run/docker.sock`.
     pub expose_docker: bool,
+    /// Enable waypipe Wayland forwarding: smolvm bridges a guest waypipe vsock
+    /// port to a host Unix socket in the VM data dir, where the user runs a
+    /// `waypipe client` next to the host compositor.
+    pub waypipe: bool,
     /// Publish the TCP ports the guest listens on at the same host port on
     /// loopback while they listen. Set only by the local CLI's launches.
     pub auto_ports: Option<crate::data::network::AutoPorts>,
@@ -594,6 +598,11 @@ pub struct LaunchConfig<'a> {
     /// assigns a vsock port (`ports::PUBLISH_SOCKET_BASE + i`), wires libkrun,
     /// and encodes the guest side into `SMOLVM_PUBLISH_SOCKETS`.
     pub published_sockets: &'a [crate::config::PublishedSocketConfig],
+    /// Host-side waypipe socket. When set, libkrun bridges the guest's outbound
+    /// waypipe vsock port to this `AF_UNIX` path, where a `waypipe client`
+    /// listens next to the host compositor. Derived in the per-VM dir at the
+    /// boot-config boundary, so the launcher stays policy-free.
+    pub waypipe_socket: Option<&'a Path>,
     /// Pre-extracted OCI layers directory for .smolmachine-sourced machines.
     /// Mounted via virtiofs as "smolvm_layers" so the agent uses packed layers.
     pub packed_layers_dir: Option<&'a Path>,
@@ -675,6 +684,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         workload_log_socket,
         auto_ports,
         published_sockets,
+        waypipe_socket,
         packed_layers_dir,
         packed_layers_dax_window,
         extra_disks,
@@ -1922,6 +1932,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             port_forward_socket: port_forward_socket.as_deref(),
             auto_ports_socket: auto_ports_socket.as_deref(),
             workload_log_socket: workload_log_socket.as_deref(),
+            waypipe_socket: waypipe_socket.as_deref(),
         };
         let active_vsock: Vec<_> = vsock_service::registry()
             .iter()
