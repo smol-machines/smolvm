@@ -798,6 +798,11 @@ pub struct VmRecord {
     #[serde(default)]
     pub waypipe: bool,
 
+    /// Bridge the guest X11 socket straight to the host X server over vsock, so
+    /// guest X11 apps render on the host X server with no waypipe involved.
+    #[serde(default)]
+    pub x11: bool,
+
     /// Publish every TCP port the guest listens on at the same host port on
     /// loopback while it listens (`--auto-ports`). Applied only when the local
     /// CLI starts the machine, never by `smolvm serve`.
@@ -1138,6 +1143,7 @@ impl VmRecord {
             cuda_preload_modules: false,
             docker_socket: false,
             waypipe: false,
+            x11: false,
             auto_ports: None,
             dns_filter_hosts: None,
             credential_policy: None,
@@ -1255,6 +1261,7 @@ impl VmRecord {
             cuda_preload_modules: false,
             docker_socket: false,
             waypipe: false,
+            x11: false,
             auto_ports: None,
             dns_filter_hosts: None,
             credential_policy: None,
