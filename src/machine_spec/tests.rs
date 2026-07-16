@@ -649,6 +649,7 @@ fn cases() -> Vec<Case> {
         cuda,
         docker_socket,
         waypipe,
+        x11,
         ssh_agent,
         forkable,
         cuda_fork_pool_size,
@@ -1045,6 +1046,9 @@ fn cases() -> Vec<Case> {
         case!(waypipe, |s, _| s.waypipe = true, |r| r.waypipe)
             .cli(&["--waypipe"])
             .checkpoint(Refused("waypipe")),
+        case!(x11, |s, _| s.x11 = true, |r| r.x11)
+            .cli(&["--x11"])
+            .checkpoint(Refused("x11")),
         case!(ssh_agent, |s, _| s.ssh_agent = true, |r| r.ssh_agent)
             .cli(&["--ssh-agent"])
             .checkpoint(Refused("ssh agent")),
