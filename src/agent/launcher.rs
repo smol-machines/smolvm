@@ -190,6 +190,10 @@ pub struct LaunchFeatures {
     /// port to a host Unix socket in the VM data dir, where the user runs a
     /// `waypipe client` next to the host compositor.
     pub waypipe: bool,
+    /// Which `waypipe` binary the guest daemon runs: `None`/`"host"` shares the
+    /// host binary into the guest, `"container"` uses the image's own, or an
+    /// absolute host path shares that specific binary. Ignored unless `waypipe`.
+    pub waypipe_bin: Option<String>,
     /// Enable the raw X11 socket bridge: smolvm bridges a guest X11 vsock port
     /// straight to the host X server's Unix socket, so guest X clients render on
     /// the host X server with no waypipe involved.
@@ -466,6 +470,11 @@ pub struct LaunchConfig<'a> {
     /// listens next to the host compositor. Derived in the per-VM dir at the
     /// boot-config boundary, so the launcher stays policy-free.
     pub waypipe_socket: Option<&'a Path>,
+    /// Which `waypipe` binary the guest daemon runs: `None`/`"host"` shares the
+    /// host binary into the guest, `"container"` uses the image's own, or an
+    /// absolute host path shares that specific binary. Ignored unless
+    /// `waypipe_socket` is set.
+    pub waypipe_bin: Option<&'a str>,
     /// Host X server socket (`/tmp/.X11-unix/X<n>`). When set, libkrun bridges
     /// the guest's outbound X11 vsock port straight to this existing host
     /// socket. Resolved from the host `$DISPLAY` at the boot-config boundary;
@@ -532,6 +541,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         docker_socket,
         published_sockets,
         waypipe_socket,
+        waypipe_bin,
         x11_socket,
         packed_layers_dir,
         extra_disks,
@@ -1485,6 +1495,58 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             }
         }
 
+        // Waypipe binary source selection. The guest daemon always runs inside
+        // the workload container (the only place with glibc; the agent rootfs is
+        // musl and cannot exec a glibc binary). The source picks WHICH binary
+        // the container runs:
+        //   - "container"    -> the image's own `waypipe` on PATH; nothing to
+        //                       share, and no SMOLVM_WAYPIPE_BIN env (guest falls
+        //                       back to PATH lookup).
+        //   - "host"/None    -> share the host `waypipe` into the guest via
+        //                       virtiofs; the guest bind-mounts it into the
+        //                       container and runs it.
+        //   - "/abs/path"    -> same as host, but that specific binary.
+        // Best-effort: if staging fails (no host waypipe, path missing), we skip
+        // the share and leave the daemon to fall back to the container's PATH
+        // rather than aborting the launch.
+        //
+        // `waypipe_guest_bin` carries the in-guest binary path to inject as
+        // SMOLVM_WAYPIPE_BIN below; `None` means "use the container's PATH".
+        let mut waypipe_guest_bin: Option<String> = None;
+        if let Some(vmdir) = waypipe_socket.and_then(|s| s.parent()) {
+            let source = waypipe_bin.unwrap_or("host");
+            if source != "container" {
+                // "host" resolves via PATH; an absolute path is used verbatim.
+                let src_path = if source == "host" {
+                    crate::vm::waypipe::host_binary()
+                } else {
+                    Some(std::path::PathBuf::from(source))
+                };
+                match src_path.and_then(|p| crate::vm::waypipe::stage_host_binary(vmdir, &p).ok()) {
+                    Some(_dir) => {
+                        let tag = cstr(smolvm_protocol::WAYPIPE_TAG);
+                        // virtiofs shares the staging DIR; the guest mounts it at
+                        // WAYPIPE_GUEST_PATH and runs <that>/waypipe.
+                        let host_path = cstr(&vmdir.join("waypipe-bin").to_string_lossy());
+                        if krun_add_virtiofs(ctx, tag.as_ptr(), host_path.as_ptr()) < 0 {
+                            tracing::warn!("krun_add_virtiofs failed for waypipe binary; falling back to container PATH");
+                        } else {
+                            waypipe_guest_bin = Some(format!(
+                                "{}/waypipe",
+                                smolvm_protocol::WAYPIPE_GUEST_PATH
+                            ));
+                        }
+                    }
+                    None => {
+                        tracing::warn!(
+                            source = source,
+                            "could not stage waypipe binary; falling back to container PATH"
+                        );
+                    }
+                }
+            }
+        }
+
         boot_timing!("devices configured");
 
         // Set working directory
@@ -1546,6 +1608,13 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         if !published_guest.is_empty() {
             let encoded = smolvm_protocol::publish_socket::encode(&published_guest);
             env_strings.push(cstr(&format!("{}={}", guest_env::PUBLISH_SOCKETS, encoded)));
+        }
+
+        // Waypipe binary path is dynamic (depends on the shared-vs-container
+        // source decision above), so it rides as a normal env rather than a
+        // static vsock guest_env pair. Absent => guest uses the container PATH.
+        if let Some(bin) = &waypipe_guest_bin {
+            env_strings.push(cstr(&format!("{}={}", guest_env::WAYPIPE_BIN, bin)));
         }
 
         // Tell the agent GPU was requested so it can sanity-check the

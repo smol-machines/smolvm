@@ -521,6 +521,13 @@ pub struct VmRecord {
     #[serde(default)]
     pub waypipe: bool,
 
+    /// Which `waypipe` binary the guest daemon runs. `None` or `"host"` shares
+    /// the host binary into the guest; `"container"` uses the image's own
+    /// `waypipe`; an absolute path shares that specific host binary. Ignored
+    /// unless `waypipe` is set.
+    #[serde(default)]
+    pub waypipe_bin: Option<String>,
+
     /// Bridge the guest X11 socket straight to the host X server over vsock, so
     /// guest X11 apps render on the host X server with no waypipe involved.
     #[serde(default)]
@@ -635,6 +642,7 @@ impl VmRecord {
             cuda: false,
             docker_socket: false,
             waypipe: false,
+            waypipe_bin: None,
             x11: false,
             dns_filter_hosts: None,
             ephemeral: false,
@@ -694,6 +702,7 @@ impl VmRecord {
             cuda: false,
             docker_socket: false,
             waypipe: false,
+            waypipe_bin: None,
             x11: false,
             dns_filter_hosts: None,
             ephemeral: false,

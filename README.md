@@ -104,22 +104,34 @@ smolvm machine run --ssh-agent --net --image alpine -- sh -c "apk add -q openssh
 smolvm machine exec --name myvm -- git clone git@github.com:org/private-repo.git
 ```
 
-**Run guest GUI apps on your host desktop over vsock.** `--waypipe` bridges a guest [waypipe](https://gitlab.freedesktop.org/mstoeckl/waypipe) vsock port to a host Unix socket in the VM data dir — no X11, no SSH server, no TCP port forward. The guest runs `waypipe server` and connects out; you run a `waypipe client` next to your host Wayland compositor. Requires a `--vsock`-capable waypipe (>= 0.9) on both sides.
+**Run guest GUI apps on your host desktop over vsock.** `--waypipe` bridges a guest [waypipe](https://gitlab.freedesktop.org/mstoeckl/waypipe) vsock port to a host Unix socket in the VM data dir — no X11, no SSH server, no TCP port forward. The guest agent runs `waypipe server` as a daemon inside the workload container and exports `WAYLAND_DISPLAY` automatically, and on the host smolvm starts the matching `waypipe client` next to your Wayland compositor for you (Linux hosts). So you just run your GUI app — both ends are wired up. One daemon serves every app (like a normal Wayland display), and it starts on first launch — no per-app `waypipe server` wrapper.
 
 ```bash
 smolvm machine create --name gui --net --waypipe --image ubuntu:24.04
 smolvm machine start --name gui
 
-# Host: start a client listening on the bridged socket (leave it running).
-# The socket is created lazily when the guest first connects, so start the
-# client first.
-waypipe -s "$(smolvm machine data-dir --name gui)/waypipe.sock" client &
-
-# Guest: run an app; waypipe server connects out over vsock (port 7001, host CID 2).
-smolvm machine exec --name gui -- waypipe --vsock -s 7001 server -- weston-terminal
+# Guest: run any GUI app. WAYLAND_DISPLAY is set, the guest daemon is started,
+# and the host waypipe client is running against your compositor.
+smolvm machine exec --name gui -- weston-terminal
 ```
 
-Each `waypipe server` invocation forwards one application; run it again for another window. The bridge uses the same vsock mechanism as `--cuda`, so no networking is required for forwarding itself (`--net` is only needed to install waypipe in the guest).
+The host client is started automatically on Linux when `$WAYLAND_DISPLAY` is set and `waypipe` is on the host `PATH`; it lives as long as the VM and is killed with it. If either is missing, smolvm skips it and you can run one by hand:
+
+```bash
+waypipe -s "$(smolvm machine data-dir --name gui)/waypipe.sock" client &
+```
+
+`--waypipe` takes an optional value selecting which `waypipe` binary the guest daemon runs:
+
+- `--waypipe` or `--waypipe=host` (default) — share the **host** waypipe binary into the guest, so the guest server and your host client are the exact same binary (no wire-version drift) and the image needs no waypipe installed. Requires the host glibc to be compatible with the guest image's (usually true for a recent image).
+- `--waypipe=container` — use the image's **own** `waypipe` (install it yourself, e.g. `apt-get install -y waypipe`). The daemon starts on the first launch after waypipe is present, with no restart.
+- `--waypipe=/path/to/waypipe` — share that specific host binary.
+
+Requires a `--vsock`-capable waypipe (>= 0.9) on the host, and (for `container`) in the guest. `--waypipe` needs an `--image`: the guest daemon runs inside the workload container (the agent's own rootfs is musl and cannot exec a glibc waypipe), which a bare VM does not have — so `--waypipe` without an image is rejected up front.
+
+One waypipe daemon in the guest serves every app (like the X11 display socket), and it starts lazily — the first launch after you install waypipe brings it up with no VM restart. The bridge uses the same vsock mechanism as `--cuda`, so no networking is required for forwarding itself (`--net` is only needed to install waypipe in the guest).
+
+If the daemon can't start, smolvm says so rather than failing silently: `machine exec -- cmd` prints the reason on stderr (without disturbing the command's own output), and an interactive `machine exec -it` shell prints it at the top of the session. Either way the message says whether waypipe isn't installed yet (with how to install it — the daemon then comes up on the next command) or is present but failed to start (e.g. a host/guest glibc mismatch in `host` mode — try `--waypipe=container`).
 
 **Or bridge the raw X11 socket, no waypipe.** `--x11` resolves the host `$DISPLAY` at launch and bridges a guest vsock port straight to that X server's Unix socket. X was designed for network transparency, so guest X clients talk to your host X server directly. The guest agent sets up the display socket and exports `DISPLAY=:10` for you — no `socat`, just run an X client. Needs a running host X server (a native X session, or an Xwayland/`Xephyr` on a Wayland host).
 

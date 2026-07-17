@@ -61,6 +61,17 @@ pub const ROSETTA_TAG: &str = "rosetta";
 /// both the wrapper and the `binfmt_misc` registration.
 pub const ROSETTA_GUEST_PATH: &str = "/mnt/rosetta";
 
+/// virtiofs tag for the host `waypipe` binary, shared into the guest so the
+/// agent can run `waypipe server` in its own namespace with the exact same
+/// binary the host `waypipe client` uses (avoiding wire-version drift between a
+/// bundled guest waypipe and the user's host one). Shared host↔guest so the
+/// launcher's `krun_add_virtiofs` tag and the guest mount source can't diverge.
+pub const WAYPIPE_TAG: &str = "waypipe";
+
+/// Guest mount point for the shared host `waypipe` binary. The agent runs
+/// `<WAYPIPE_GUEST_PATH>/waypipe server` as the forwarding daemon.
+pub const WAYPIPE_GUEST_PATH: &str = "/mnt/waypipe";
+
 /// Maximum frame size (32 MB - layer exports use chunked streaming).
 pub const MAX_FRAME_SIZE: u32 = 32 * 1024 * 1024;
 

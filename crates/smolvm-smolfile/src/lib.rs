@@ -250,6 +250,10 @@ pub struct Smolfile {
     /// Enable waypipe Wayland forwarding over vsock: render guest GUI apps on
     /// the host compositor. Requires waypipe inside the VM.
     pub waypipe: Option<bool>,
+    /// Which `waypipe` binary the guest daemon runs: `"host"` (default, share
+    /// the host binary), `"container"` (use the image's own `waypipe`), or an
+    /// absolute path to a host binary. Ignored unless `waypipe` is set.
+    pub waypipe_bin: Option<String>,
     /// Bridge the guest X11 socket straight to the host X server over vsock, so
     /// guest X11 apps render on the host X server with no waypipe involved.
     pub x11: Option<bool>,
