@@ -175,6 +175,26 @@ pub const WORKLOAD_LOGS: &str = "SMOLVM_WORKLOAD_LOGS";
 /// This is a boolean sentinel — the value is [`VALUE_ON`] when set.
 pub const X11: &str = "SMOLVM_X11";
 
+/// Enables the guest-side waypipe Wayland forwarding daemon: the agent runs
+/// `waypipe server` in daemon mode, which creates a Wayland display socket in
+/// the guest and forwards every client that connects to it out over the
+/// `ports::WAYPIPE` vsock port to the host `waypipe client`. The agent also
+/// exports `WAYLAND_DISPLAY` (and `XDG_RUNTIME_DIR`) for the workload.
+///
+/// Unlike X11, waypipe is a guest binary dependency usually installed after
+/// boot, so the daemon starts lazily on the first launch once `waypipe` is on
+/// PATH.
+///
+/// This is a boolean sentinel — the value is [`VALUE_ON`] when set.
+pub const WAYPIPE: &str = "SMOLVM_WAYPIPE";
+
+/// Selects which `waypipe` binary the guest daemon runs. When set to a
+/// non-empty absolute path, the daemon execs that binary (the host binary the
+/// launcher shared into the guest via `WAYPIPE_TAG`, bind-mounted into the
+/// container). When unset or empty, the daemon uses `waypipe` from the
+/// container's `PATH` (the image's own install).
+pub const WAYPIPE_BIN: &str = "SMOLVM_WAYPIPE_BIN";
+
 #[cfg(test)]
 mod shm_size_tests {
     use super::shm_size_option;
