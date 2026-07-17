@@ -131,17 +131,56 @@ pub fn start(socket_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// This VM's clone identity for the daemon-connection preamble, computed once.
+/// `Some` iff this VMM process was launched from a fork snapshot (the boot
+/// subprocess carries `SMOLVM_SNAPSHOT_DIR` per-process; the golden's process
+/// never has it). The id is stable for this VM's lifetime and distinct across
+/// sibling clones (per-process randomness ⊕ pid), so the daemon can key one
+/// worker per clone and tell a clone's reconnect apart from a fresh clone.
+fn fork_clone_id() -> Option<u64> {
+    static ID: OnceLock<Option<u64>> = OnceLock::new();
+    *ID.get_or_init(|| {
+        std::env::var_os("SMOLVM_SNAPSHOT_DIR")?;
+        let mut b = [0u8; 8];
+        if std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut b))
+            .is_err()
+        {
+            b = (std::process::id() as u64)
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .to_le_bytes();
+        }
+        Some(u64::from_le_bytes(b) ^ u64::from(std::process::id()))
+    })
+}
+
 /// Relay one guest connection to the shared CUDA daemon at `addr` (a byte pump
 /// in both directions — the RPC is end-to-end between the guest shim and the
 /// daemon, so smolvm only forwards frames). This is the minimal form of the
 /// shared-host-daemon architecture: every VM's traffic lands in one process, so
 /// they share a single GPU context and device memory.
+///
+/// A FORK-CLONE VM's proxy prepends the clone preamble (magic + clone id) so
+/// the daemon routes this connection to the clone's isolating worker — and, by
+/// its absence, serves the GOLDEN's own reconnect in-daemon instead of handing
+/// it a worker's reconstructed COPY of its memory.
 fn proxy_to_daemon(guest: crate::platform::uds::UdsStream, addr: &str) -> std::io::Result<()> {
+    fn preamble() -> Option<[u8; 16]> {
+        let id = fork_clone_id()?;
+        let mut p = [0u8; 16];
+        p[..8].copy_from_slice(&smolvm_cuda::proto::CLONE_PREAMBLE_MAGIC);
+        p[8..].copy_from_slice(&id.to_le_bytes());
+        Some(p)
+    }
     // A path (managed daemon) → unix socket; otherwise host:port → TCP.
     if addr.starts_with('/') {
         #[cfg(unix)]
         {
-            let daemon = std::os::unix::net::UnixStream::connect(addr)?;
+            use std::io::Write as _;
+            let mut daemon = std::os::unix::net::UnixStream::connect(addr)?;
+            if let Some(p) = preamble() {
+                daemon.write_all(&p)?;
+            }
             let sd = daemon.try_clone()?;
             return pump(guest, daemon.try_clone()?, daemon, move || {
                 let _ = sd.shutdown(std::net::Shutdown::Both);
@@ -156,8 +195,12 @@ fn proxy_to_daemon(guest: crate::platform::uds::UdsStream, addr: &str) -> std::i
             ));
         }
     }
-    let daemon = std::net::TcpStream::connect(addr)?;
+    let mut daemon = std::net::TcpStream::connect(addr)?;
     let _ = daemon.set_nodelay(true);
+    if let Some(p) = preamble() {
+        use std::io::Write as _;
+        daemon.write_all(&p)?;
+    }
     let sd = daemon.try_clone()?;
     pump(guest, daemon.try_clone()?, daemon, move || {
         let _ = sd.shutdown(std::net::Shutdown::Both);

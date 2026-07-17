@@ -31,7 +31,14 @@ fn main() {
     let sock = std::env::args()
         .nth(1)
         .expect("usage: m1_route_probe <daemon.sock>");
-    let stream = UnixStream::connect(&sock).expect("connect daemon");
+    let mut stream = UnixStream::connect(&sock).expect("connect daemon");
+    // Identify as a fork clone (proxy preamble): magic + clone id.
+    {
+        use std::io::Write as _;
+        let mut p = smolvm_cuda::proto::CLONE_PREAMBLE_MAGIC.to_vec();
+        p.extend_from_slice(&u64::from(std::process::id()).to_le_bytes());
+        stream.write_all(&p).expect("clone preamble");
+    }
     let mut cu = Client::new(stream);
     let token = cu.init(1).expect("init (isolating clone, resume_token=1)");
     eprintln!("m1_route_probe: connected as isolating clone; server token={token}");

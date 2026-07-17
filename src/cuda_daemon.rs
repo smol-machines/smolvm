@@ -17,7 +17,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -102,32 +102,21 @@ pub fn run(sock: &Path) -> io::Result<()> {
                             match stream {
                                 Ok(s) => {
                                     let _ = s.set_nodelay(true); // low-latency RPC
-                                    // Path 3: a REMOTE isolating fork clone (its VM
-                                    // proxies here over TCP) gets a worker process
-                                    // exactly like a local one — the golden's memory
-                                    // and the clone worker both live on THIS GPU
-                                    // host; only the RPC crosses the network.
+                                                                 // Path 3: a REMOTE isolating fork clone (its VM
+                                                                 // proxies here over TCP) gets a worker process
+                                                                 // exactly like a local one — the golden's memory
+                                                                 // and the clone worker both live on THIS GPU
+                                                                 // host; only the RPC crosses the network.
                                     #[cfg(unix)]
                                     {
                                         use std::os::unix::io::AsRawFd;
-                                        let fd = s.as_raw_fd();
-                                        if let Some(token) = peek_clone_token(fd) {
-                                            match spawn_clone_worker(fd, token) {
-                                                Ok(()) => {
-                                                    tracing::info!(
-                                                        token,
-                                                        "routed REMOTE isolating clone to a worker process"
-                                                    );
-                                                    drop(s); // the worker owns it now
-                                                    continue;
-                                                }
-                                                Err(e) => {
-                                                    // See the UDS arm: reject, fail fast.
-                                                    tracing::warn!(error = %e, token, "remote clone-worker spawn failed; rejecting the clone connection");
-                                                    drop(s);
-                                                    continue;
-                                                }
-                                            }
+                                        // Clone-marked connections (preamble from the
+                                        // remote clone VM's proxy) route to a worker or
+                                        // are rejected; a golden's reconnect (token, no
+                                        // preamble) falls through to in-daemon serving.
+                                        if route_clone_connection(s.as_raw_fd()) {
+                                            drop(s); // worker owns it / rejected
+                                            continue;
                                         }
                                     }
                                     spawn_serve(s, &active_tcp);
@@ -155,33 +144,19 @@ pub fn run(sock: &Path) -> io::Result<()> {
             // Count the connection open for the whole serve loop so a frozen golden
             // (idle but connected) keeps the daemon alive for its clones.
             Ok(stream) => {
-                // Path 3 (M1): an isolating fork clone is served in its own worker
-                // PROCESS (own context/UVA) so it can hold memory at the golden's
-                // exact VAs. Only fires under SMOLVM_CUDA_FORK_WORKERS; otherwise legacy.
+                // Path 3 (M1): an isolating fork clone (its VM's proxy sends a
+                // clone preamble) is served in its own worker PROCESS (own
+                // context/UVA) so it can hold memory at the golden's exact VAs.
+                // A GOLDEN's reconnect — same lineage token, NO preamble —
+                // falls through and resumes in-daemon: routing it to a worker
+                // would silently serve it a reconstructed COPY of its memory.
+                // Only fires under SMOLVM_CUDA_FORK_WORKERS; otherwise legacy.
                 #[cfg(unix)]
                 {
                     use std::os::unix::io::AsRawFd;
-                    let fd = stream.as_raw_fd();
-                    if let Some(token) = peek_clone_token(fd) {
-                        match spawn_clone_worker(fd, token) {
-                            Ok(()) => {
-                                tracing::info!(token, "routed isolating clone to a worker process");
-                                drop(stream); // the worker owns the connection now
-                                continue;
-                            }
-                            Err(e) => {
-                                // REJECT rather than serve in-process: this IS an
-                                // isolating clone (peek matched), and the legacy
-                                // shared path can't serve it — its inherited
-                                // pointers are garbage in a fresh context, so the
-                                // guest would wedge mid-training (seen after a
-                                // daemon restart orphaned a lineage). Closing
-                                // makes the guest fail fast instead.
-                                tracing::warn!(error = %e, token, "clone-worker spawn failed; rejecting the clone connection");
-                                drop(stream);
-                                continue;
-                            }
-                        }
+                    if route_clone_connection(stream.as_raw_fd()) {
+                        drop(stream); // worker owns it / rejected
+                        continue;
                     }
                 }
                 spawn_serve(stream, &active);
@@ -652,6 +627,121 @@ fn reconstruct_golden_modules(
     (mod_images, func_meta, stream_trans, event_trans, graphs)
 }
 
+/// Strip a fork-clone connection preamble (magic + clone id) if present,
+/// returning the clone id. The preamble is sent by a CLONE VM's proxy before
+/// any RPC frames (see `cuda_host::proxy_to_daemon`); the GOLDEN's connections
+/// never carry it. Must run on every accepted connection REGARDLESS of routing
+/// mode — an unconsumed preamble would corrupt the frame stream. Non-preamble
+/// connections are left untouched (peek only).
+#[cfg(unix)]
+fn consume_clone_preamble(fd: std::os::unix::io::RawFd) -> Option<u64> {
+    let mut buf = [0u8; 16];
+    // Same buffered-in-pieces caveat as peek_clone_token: retry the peek
+    // briefly so a slow proxy write can't make us misread the magic.
+    let mut n: isize = 0;
+    for _ in 0..200 {
+        n = unsafe {
+            libc::recv(
+                fd,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+                libc::MSG_PEEK,
+            )
+        };
+        // Enough to decide: 8 bytes tells us magic-or-not; 16 is the full
+        // preamble. A legit first frame is ≥ 5 bytes, so a short non-magic
+        // prefix resolves as soon as the magic mismatches.
+        if n >= 8 && buf[..(n as usize).min(8)] != smolvm_cuda::proto::CLONE_PREAMBLE_MAGIC {
+            return None;
+        }
+        if n >= 16 || n == 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    if n < 16 || buf[..8] != smolvm_cuda::proto::CLONE_PREAMBLE_MAGIC {
+        return None;
+    }
+    // Consume exactly the 16 preamble bytes, leaving the RPC stream intact.
+    // SAFETY: plain recv on a valid fd; MSG_WAITALL for the already-peeked bytes.
+    let c = unsafe {
+        libc::recv(
+            fd,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            16,
+            libc::MSG_WAITALL,
+        )
+    };
+    if c != 16 {
+        return None;
+    }
+    Some(u64::from_le_bytes(buf[8..16].try_into().unwrap()))
+}
+
+/// Live clone workers keyed by (lineage token, clone id) → worker pid. A
+/// reconnect from a clone whose worker is STILL ALIVE is rejected loudly: a
+/// fresh worker would re-reconstruct from the golden and silently DISCARD the
+/// clone's accumulated GPU state (its training progress). Dead entries are
+/// replaced (worker crash → a fresh worker is the best recovery available).
+#[cfg(unix)]
+fn clone_worker_registry() -> &'static Mutex<std::collections::HashMap<(u64, u64), u32>> {
+    static REG: OnceLock<Mutex<std::collections::HashMap<(u64, u64), u32>>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Route one just-accepted connection: strip the clone preamble (always), and
+/// when it marks an isolating fork clone, spawn/refuse its worker. Returns
+/// `true` when the connection was consumed (routed or rejected); `false` means
+/// the caller serves it normally — including a GOLDEN's own reconnect, whose
+/// token-bearing Init WITHOUT the preamble must resume in-daemon (a worker
+/// would silently serve it a reconstructed COPY of its memory).
+#[cfg(unix)]
+fn route_clone_connection(fd: std::os::unix::io::RawFd) -> bool {
+    let Some(clone_id) = consume_clone_preamble(fd) else {
+        return false;
+    };
+    let Some(token) = peek_clone_token(fd) else {
+        // A clone VM's connection whose Init carries no lineage token: fresh
+        // post-fork work (new guest process), served in-daemon like any new
+        // session.
+        return false;
+    };
+    let mut reg = clone_worker_registry().lock().unwrap();
+    if let Some(&pid) = reg.get(&(token, clone_id)) {
+        // SAFETY: kill(pid, 0) — pure liveness probe, no signal delivered.
+        if unsafe { libc::kill(pid as i32, 0) } == 0 {
+            tracing::warn!(
+                token,
+                clone_id,
+                worker_pid = pid,
+                "clone reconnected while its worker is still alive; rejecting — \
+                 a fresh worker would silently reset the clone's GPU state"
+            );
+            return true; // consumed: caller drops the stream (fail fast)
+        }
+        reg.remove(&(token, clone_id));
+    }
+    match spawn_clone_worker(fd, token) {
+        Ok(pid) => {
+            reg.insert((token, clone_id), pid);
+            tracing::info!(
+                token,
+                clone_id,
+                worker_pid = pid,
+                "routed isolating clone to a worker process"
+            );
+        }
+        Err(e) => {
+            // REJECT rather than serve in-process: this IS an isolating clone
+            // (preamble matched), and the legacy shared path can't serve it —
+            // its inherited pointers are garbage in a fresh context, so the
+            // guest would wedge mid-training. Closing makes it fail fast.
+            tracing::warn!(error = %e, token, "clone-worker spawn failed; rejecting the clone connection");
+        }
+    }
+    true
+}
+
 /// Path 3 (M1): peek a just-accepted connection's first message; true iff it's an
 /// isolating fork-clone Init (`op == Init`, `resume_token != 0`) that should be
 /// served in a dedicated worker process. `MSG_PEEK` leaves the bytes on the
@@ -722,7 +812,7 @@ fn verify_chunk_content(b: &mut dyn Backend, ch: &smolvm_cuda::host::HandoffChun
 /// VAs). `dup2` the socket fd onto fd 3 in the child (clears CLOEXEC) and exec
 /// `smolvm _cuda-clone-worker 3`; the daemon then drops its own copy.
 #[cfg(unix)]
-fn spawn_clone_worker(conn_fd: std::os::unix::io::RawFd, token: u64) -> io::Result<()> {
+fn spawn_clone_worker(conn_fd: std::os::unix::io::RawFd, token: u64) -> io::Result<u32> {
     use std::os::unix::process::CommandExt;
     // Gather the golden's VMM layout (reservations + maps→physical handle).
     let (resvs, maps) = smolvm_cuda::host::layout_handoff_snapshot(token)
@@ -896,7 +986,7 @@ fn spawn_clone_worker(conn_fd: std::os::unix::io::RawFd, token: u64) -> io::Resu
             Ok(())
         });
     }
-    let spawned = cmd.spawn().map(|_| ());
+    let spawned = cmd.spawn().map(|child| child.id());
     // The child (if any) forked with its own copies; drop ours either way so
     // the golden's physicals can actually be released at teardown.
     for efd in parent_fds {

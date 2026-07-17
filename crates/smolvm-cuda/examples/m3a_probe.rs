@@ -81,7 +81,15 @@ fn main() {
             let s = std::fs::read_to_string(state).unwrap();
             let p: Vec<u64> = s.split_whitespace().map(|x| x.parse().unwrap()).collect();
             let (token, va_a, va_b, va_c, func) = (p[0], p[1], p[2], p[3], p[4]);
-            let mut cu = Client::new(UnixStream::connect(sock).expect("connect"));
+            let mut conn = UnixStream::connect(sock).expect("connect");
+            // Identify as a fork clone (proxy preamble): magic + clone id.
+            {
+                use std::io::Write as _;
+                let mut p = smolvm_cuda::proto::CLONE_PREAMBLE_MAGIC.to_vec();
+                p.extend_from_slice(&u64::from(std::process::id()).to_le_bytes());
+                conn.write_all(&p).expect("clone preamble");
+            }
+            let mut cu = Client::new(conn);
             cu.init(token).expect("init clone");
             cu.primary_ctx_retain(0).expect("ctx");
             // diagnostic: does the clone see the golden's a/b at their VAs?

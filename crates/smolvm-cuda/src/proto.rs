@@ -27,6 +27,15 @@ pub const QUIET_PREFIX: u8 = 0x7F;
 /// status among quiet requests since the previous fence.
 pub const FENCE_OP: u8 = 0x7E;
 
+/// Connection preamble a FORK-CLONE VM's proxy sends before any RPC frames:
+/// these 8 magic bytes followed by an 8-byte per-clone id (le). Lets the
+/// daemon distinguish a clone's connection (route to its isolating worker
+/// process) from the GOLDEN's own reconnect carrying the same lineage token
+/// (must resume in-daemon — a worker would silently serve it a reconstructed
+/// COPY of its memory). The first 4 bytes decode as a length far beyond
+/// [`MAX_MSG`], so the preamble can never be confused with a legit frame.
+pub const CLONE_PREAMBLE_MAGIC: [u8; 8] = *b"SMVCLN\x01\x00";
+
 /// Request opcodes. Stable wire values — append only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
