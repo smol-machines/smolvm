@@ -617,7 +617,7 @@ fn gen_guest(lib: &Lib) -> String {
                  let vh = super::alloc_vhandle();\n    \
                  match with_client(|c| c.lib_call_deferred(LIB_ID, {idx}, vh.to_le_bytes().to_vec())) {{\n        \
                  Ok(()) => {{ unsafe {{ *handle_out = vh as *mut c_void }}; 0 }}\n        \
-                 Err(_) => 1,\n    }}\n}}",
+                 Err(e) => {{ super::lib_err_trace(LIB_ID, {idx}, e); 1 }}\n    }}\n}}",
                 f.sym
             );
             continue;
@@ -673,12 +673,12 @@ fn gen_guest(lib: &Lib) -> String {
         if outs.is_empty() {
             let _ = writeln!(
                 s,
-                "    // No output params: fire-and-forget (failures surface as sticky async errors).\n    match with_client(|c| c.lib_call_deferred(LIB_ID, {idx}, a)) {{ Ok(()) => 0, Err(_) => 1 }}\n}}"
+                "    // No output params: fire-and-forget (failures surface as sticky async errors).\n    match with_client(|c| c.lib_call_deferred(LIB_ID, {idx}, a)) {{ Ok(()) => 0, Err(e) => {{ super::lib_err_trace(LIB_ID, {idx}, e); 1 }} }}\n}}"
             );
         } else {
             let _ = writeln!(
                 s,
-                "    match with_client(|c| c.lib_call(LIB_ID, {idx}, a)) {{\n        Ok((st, out)) => {{ let mut o = 0usize;"
+                "    // Sync call: retried once on a transport error (a fork clone's first\n    // post-fork call can hit the dead inherited connection before the\n    // liveness peek sees it) — the request never reached the host, so the\n    // retry runs it exactly once on the reconnected session.\n    match with_client_retrying(|c| c.lib_call(LIB_ID, {idx}, a.clone())) {{\n        Ok((st, out)) => {{ let mut o = 0usize;"
             );
             for (name, t) in &outs {
                 let sz = wire_size(t);
@@ -689,7 +689,7 @@ fn gen_guest(lib: &Lib) -> String {
             }
             let _ = writeln!(
                 s,
-                "            let _ = o; st }}\n        Err(_) => 1,\n    }}\n}}"
+                "            let _ = o; st }}\n        Err(e) => {{ super::lib_err_trace(LIB_ID, {idx}, e); 1 }}\n    }}\n}}"
             );
         }
     }
