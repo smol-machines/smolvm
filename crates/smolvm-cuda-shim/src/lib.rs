@@ -271,6 +271,13 @@ fn connect_standalone(resume_token: u64) -> Result<(Client<Stream>, u64, i32), c
     let mut client = Client::new(stream);
     client.set_defer_enabled(false);
     let token = client.init(resume_token).map_err(init_err)?;
+    // Per-machine GPU pin (see the runtime shim's bring_up_client).
+    if let Some(d) = std::env::var("SMOLVM_CUDA_DEVICE")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+    {
+        let _ = client.set_device_base(d);
+    }
     Ok((client, token, fd))
 }
 

@@ -1325,6 +1325,12 @@ impl<S: Read + Write> Client<S> {
     pub fn mem_release_quiet(&mut self, handle: u64) -> Result<()> {
         self.call_deferred(&Request::MemRelease { handle }, Op::MemRelease)
     }
+    /// Pin this session to host GPU `device` (guest device 0 maps to it; the
+    /// guest sees exactly one device). Sent right after `init` when the VM is
+    /// launched with `SMOLVM_CUDA_DEVICE=<n>`.
+    pub fn set_device_base(&mut self, device: i32) -> Result<()> {
+        self.call_deferred(&Request::SetDeviceBase { device }, Op::SetDeviceBase)
+    }
     pub fn mem_map(&mut self, va: u64, size: u64, offset: u64, handle: u64) -> Result<()> {
         self.call(
             &Request::MemMap {

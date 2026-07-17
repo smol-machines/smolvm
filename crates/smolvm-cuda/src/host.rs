@@ -364,6 +364,10 @@ struct Session {
     /// Guest-minted VMM virtual handle → real handle (burst-path creates:
     /// `MemCreateVh` is fire-and-forget, so the guest never sees the real).
     vmm_vhandles: HashMap<u64, u64>,
+    /// Host GPU this session is pinned to (guest device 0 maps here; the
+    /// guest sees exactly one device). (0, false) = unpinned legacy behavior.
+    device_base: i32,
+    device_pinned: bool,
     owned_vmm_maps: HashMap<u64, u64>,
     owned_vmm_reservations: HashMap<u64, u64>,
     owned_modules: std::collections::HashSet<u64>,
@@ -687,6 +691,8 @@ struct GoldenLayout {
     /// pointer). Only context-level creates are recorded; descriptors are
     /// transient and recreated by the workload itself.
     lib_handles: Vec<(u8, u16, u64, Vec<u8>)>,
+    /// Host GPU the golden is pinned to — clones must reconstruct on it.
+    device_base: i32,
 }
 type LayoutCell = std::sync::Mutex<GoldenLayout>;
 static DPTR_HANDOFF: std::sync::Mutex<Option<HashMap<u64, std::sync::Weak<AllocTable>>>> =
@@ -785,7 +791,7 @@ pub struct HandoffChunk {
 
 /// `(reservations: [(va,size)], chunks)` for `token`'s golden.
 #[allow(clippy::type_complexity)]
-pub fn layout_handoff_snapshot(token: u64) -> Option<(Vec<(u64, u64)>, Vec<HandoffChunk>)> {
+pub fn layout_handoff_snapshot(token: u64) -> Option<(Vec<(u64, u64)>, Vec<HandoffChunk>, i32)> {
     let reg = LAYOUT_HANDOFF.lock().unwrap();
     let l = reg.as_ref()?.get(&token)?.upgrade()?;
     let g = l.lock().unwrap();
@@ -803,7 +809,7 @@ pub fn layout_handoff_snapshot(token: u64) -> Option<(Vec<(u64, u64)>, Vec<Hando
             verified: c.verified,
         })
         .collect();
-    Some((resvs, maps))
+    Some((resvs, maps, g.device_base))
 }
 
 /// Cache the fork-time content-verification verdict for `va` in `token`'s
@@ -1806,6 +1812,14 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         let rt = ROUNDTRIP_COUNT.load(std::sync::atomic::Ordering::Relaxed);
         eprintln!("[rpc-stats] count={rpc_n} roundtrips={rt} wall={wall:.6}");
     }
+    // Map a guest device index through the session's pin (guest 0 → host N).
+    fn dev(sess: &Session, device: i32) -> i32 {
+        if sess.device_pinned {
+            sess.device_base + device
+        } else {
+            device
+        }
+    }
     // Translate an opaque id to the backend's raw handle, or error.
     fn raw(map: &HashMap<u64, u64>, id: u64) -> CuResult<u64> {
         map.get(&id).copied().ok_or(CUDA_ERROR_INVALID_HANDLE)
@@ -1904,18 +1918,28 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 b.init().map(|_| Response::Handle(token))
             }
         }
-        Request::DeviceGetCount => b.device_get_count().map(Response::Count),
-        Request::DeviceGetName { device } => b.device_get_name(device).map(Response::Name),
-        Request::DeviceTotalMem { device } => b.device_total_mem(device).map(Response::Bytes),
-        Request::DriverGetVersion => b.driver_get_version().map(Response::Count),
-        Request::DeviceGetAttribute { attrib, device } => {
-            b.device_get_attribute(attrib, device).map(Response::Count)
+        Request::DeviceGetCount => {
+            if sess.device_pinned {
+                // Pinned sessions see exactly one device (their pin).
+                return Ok(Response::Count(1));
+            }
+            b.device_get_count().map(Response::Count)
         }
+        Request::DeviceGetName { device } => {
+            b.device_get_name(dev(sess, device)).map(Response::Name)
+        }
+        Request::DeviceTotalMem { device } => {
+            b.device_total_mem(dev(sess, device)).map(Response::Bytes)
+        }
+        Request::DriverGetVersion => b.driver_get_version().map(Response::Count),
+        Request::DeviceGetAttribute { attrib, device } => b
+            .device_get_attribute(attrib, dev(sess, device))
+            .map(Response::Count),
         Request::DeviceGetUuid { device } => b
-            .device_get_uuid(device)
+            .device_get_uuid(dev(sess, device))
             .map(|u| Response::Data(u.to_vec())),
         Request::CtxCreate { device } => {
-            let raw = b.ctx_create(device)?;
+            let raw = b.ctx_create(dev(sess, device))?;
             let id = sess.mint();
             sess.contexts.insert(id, raw);
             Ok(Response::Handle(id))
@@ -1927,6 +1951,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             Ok(Response::Ok)
         }
         Request::PrimaryCtxRetain { device } => {
+            let device = dev(sess, device);
             let raw = b.primary_ctx_retain(device)?;
             sess.primary_retains += 1;
             let id = sess.mint();
@@ -2026,6 +2051,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             Ok(Response::Handle(id))
         }
         Request::PrimaryCtxRelease { device } => {
+            let device = dev(sess, device);
             sess.primary_retains = sess.primary_retains.saturating_sub(1);
             b.primary_ctx_release(device).map(|_| Response::Ok)
         }
@@ -2576,6 +2602,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             }
             // Path 3: create the physical IPC-exportable so a clone worker process
             // can import it and place it at the golden's exact VA (M2).
+            let device = dev(sess, device);
             let created = if path3_enabled() {
                 b.mem_create_exportable(size, device)
             } else {
@@ -2597,6 +2624,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             if used.saturating_add(size) > limit {
                 return Err(2); // CUDA_ERROR_OUT_OF_MEMORY (surfaces via sticky)
             }
+            let device = dev(sess, device);
             let created = if path3_enabled() {
                 b.mem_create_exportable(size, device)
             } else {
@@ -2643,9 +2671,9 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 Response::Ok
             })
         }
-        Request::MemSetAccess { va, size, device } => {
-            b.mem_set_access(va, size, device).map(|_| Response::Ok)
-        }
+        Request::MemSetAccess { va, size, device } => b
+            .mem_set_access(va, size, dev(sess, device))
+            .map(|_| Response::Ok),
         Request::MemUnmap { va, size } => {
             sess.owned_vmm_maps.remove(&va);
             sess.vmm_ranges.lock().unwrap().remove(&va);
@@ -2678,13 +2706,19 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 None => b.mem_release(handle).map(|_| Response::Ok),
             }
         }
+        Request::SetDeviceBase { device } => {
+            sess.device_base = device;
+            sess.device_pinned = true;
+            sess.golden_layout.lock().unwrap().device_base = device;
+            Ok(Response::Ok)
+        }
         Request::MemAddressFree { va, size } => {
             sess.owned_vmm_reservations.remove(&va);
             sess.golden_layout.lock().unwrap().reservations.remove(&va);
             b.mem_address_free(va, size).map(|_| Response::Ok)
         }
         Request::MemGetAllocationGranularity { device, flags } => b
-            .mem_get_allocation_granularity(device, flags)
+            .mem_get_allocation_granularity(dev(sess, device), flags)
             .map(Response::Bytes),
     })();
     let (status, resp) = match r {
