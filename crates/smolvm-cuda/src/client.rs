@@ -1291,6 +1291,40 @@ impl<S: Read + Write> Client<S> {
             _ => Err(CudaRpcError::Protocol("expected Handle")),
         }
     }
+    /// Fire-and-forget create under a guest-minted virtual handle: the burst
+    /// path for allocation-heavy phases (model load) — create/map/setAccess
+    /// pipeline with no per-chunk round trip. A failure (e.g. OOM) surfaces as
+    /// a sticky asynchronous error at the next blocking call.
+    pub fn mem_create_vh(&mut self, size: u64, device: i32, handle_vh: u64) -> Result<()> {
+        self.call_deferred(
+            &Request::MemCreateVh {
+                size,
+                device,
+                handle_vh,
+            },
+            Op::MemCreateVh,
+        )
+    }
+    pub fn mem_map_quiet(&mut self, va: u64, size: u64, offset: u64, handle: u64) -> Result<()> {
+        self.call_deferred(
+            &Request::MemMap {
+                va,
+                size,
+                offset,
+                handle,
+            },
+            Op::MemMap,
+        )
+    }
+    pub fn mem_set_access_quiet(&mut self, va: u64, size: u64, device: i32) -> Result<()> {
+        self.call_deferred(
+            &Request::MemSetAccess { va, size, device },
+            Op::MemSetAccess,
+        )
+    }
+    pub fn mem_release_quiet(&mut self, handle: u64) -> Result<()> {
+        self.call_deferred(&Request::MemRelease { handle }, Op::MemRelease)
+    }
     pub fn mem_map(&mut self, va: u64, size: u64, offset: u64, handle: u64) -> Result<()> {
         self.call(
             &Request::MemMap {

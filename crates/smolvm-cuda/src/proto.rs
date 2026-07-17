@@ -131,6 +131,10 @@ pub enum Op {
     MemRelease = 0xE5,
     MemAddressFree = 0xE6,
     MemGetAllocationGranularity = 0xE7,
+    /// VMM create under a GUEST-MINTED virtual handle — quiet-eligible, so an
+    /// allocation burst (model load) pipelines create/map/setAccess with no
+    /// per-chunk round trip.
+    MemCreateVh = 0xE8,
 }
 
 impl Op {
@@ -198,6 +202,7 @@ impl Op {
             0xD0 => Op::RingSetup,
             0xE0 => Op::MemAddressReserve,
             0xE1 => Op::MemCreate,
+            0xE8 => Op::MemCreateVh,
             0xE2 => Op::MemMap,
             0xE3 => Op::MemSetAccess,
             0xE4 => Op::MemUnmap,
@@ -523,6 +528,14 @@ pub enum Request {
     MemCreate {
         size: u64,
         device: i32,
+    },
+    /// VMM: create a physical allocation on `device` under `handle_vh`, a
+    /// guest-minted bit-63-tagged virtual handle later ops resolve (fire-and-
+    /// forget: the guest never needs the real handle value).
+    MemCreateVh {
+        size: u64,
+        device: i32,
+        handle_vh: u64,
     },
     /// VMM: back `va` with `handle` at `offset`.
     MemMap {
@@ -1109,6 +1122,16 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
             w_u64(&mut b, *size);
             w_i32(&mut b, *device);
         }
+        Request::MemCreateVh {
+            size,
+            device,
+            handle_vh,
+        } => {
+            w_u8(&mut b, Op::MemCreateVh as u8);
+            w_u64(&mut b, *size);
+            w_i32(&mut b, *device);
+            w_u64(&mut b, *handle_vh);
+        }
         Request::MemMap {
             va,
             size,
@@ -1394,6 +1417,11 @@ pub fn decode_request(payload: &[u8]) -> io::Result<Request> {
             size: c.u64()?,
             device: c.i32()?,
         },
+        Op::MemCreateVh => Request::MemCreateVh {
+            size: c.u64()?,
+            device: c.i32()?,
+            handle_vh: c.u64()?,
+        },
         Op::MemMap => Request::MemMap {
             va: c.u64()?,
             size: c.u64()?,
@@ -1527,7 +1555,8 @@ pub fn decode_response(op: Op, payload: &[u8]) -> io::Result<(i32, Response)> {
         | Op::MemSetAccess
         | Op::MemUnmap
         | Op::MemRelease
-        | Op::MemAddressFree => Response::Ok,
+        | Op::MemAddressFree
+        | Op::MemCreateVh => Response::Ok,
         Op::MemAddressReserve => Response::Dptr(c.u64()?),
         Op::MemCreate => Response::Handle(c.u64()?),
         Op::MemGetAllocationGranularity => Response::Bytes(c.u64()?),

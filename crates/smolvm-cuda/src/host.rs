@@ -361,6 +361,9 @@ struct Session {
     /// VMM state for reclaim: physical handles → size (quota ledger too),
     /// live mappings (va → size), and address reservations (va → size).
     owned_vmm_handles: HashMap<u64, u64>,
+    /// Guest-minted VMM virtual handle → real handle (burst-path creates:
+    /// `MemCreateVh` is fire-and-forget, so the guest never sees the real).
+    vmm_vhandles: HashMap<u64, u64>,
     owned_vmm_maps: HashMap<u64, u64>,
     owned_vmm_reservations: HashMap<u64, u64>,
     owned_modules: std::collections::HashSet<u64>,
@@ -623,6 +626,11 @@ type VmmRanges = std::sync::Mutex<HashMap<u64, u64>>;
 struct ChunkCover {
     size: u64,
     handle: u64,
+    /// The GUEST-visible handle value for this chunk (differs from `handle`
+    /// when the guest created it under a burst virtual handle): what the
+    /// clone's inherited MemMap/MemRelease carry, so the worker's translation
+    /// table must be keyed by it.
+    ghandle: u64,
     segs: Vec<(u64, u64, u64)>,
     verified: Option<bool>,
 }
@@ -762,6 +770,10 @@ pub struct HandoffChunk {
     pub va: u64,
     pub size: u64,
     pub handle: u64,
+    /// Guest-visible handle value (a burst virtual handle, or `handle` when
+    /// the guest created it synchronously) — the clone's inherited ops carry
+    /// this, so the worker's translation table is keyed by it.
+    pub ghandle: u64,
     /// Upload segments tile the chunk exactly (share CANDIDATE — safe to share
     /// only after fork-time content verification against `segs`).
     pub candidate: bool,
@@ -785,6 +797,7 @@ pub fn layout_handoff_snapshot(token: u64) -> Option<(Vec<(u64, u64)>, Vec<Hando
             va,
             size: c.size,
             handle: c.handle,
+            ghandle: c.ghandle,
             candidate: c.covered_exactly(),
             segs: c.segs.clone(),
             verified: c.verified,
@@ -1741,6 +1754,11 @@ fn optrace_summary(req: &Request) -> Option<String> {
         }
         Request::MemAddressReserve { size, .. } => format!("VmmReserve size={size:#x}"),
         Request::MemCreate { size, .. } => format!("VmmCreate size={size:#x}"),
+        Request::MemCreateVh {
+            size, handle_vh, ..
+        } => {
+            format!("VmmCreateVh size={size:#x} vh={handle_vh:#x}")
+        }
         Request::MemMap {
             va, size, handle, ..
         } => {
@@ -2568,12 +2586,40 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 Response::Handle(h)
             })
         }
+        Request::MemCreateVh {
+            size,
+            device,
+            handle_vh,
+        } => {
+            let limit = vram_limit();
+            let used: u64 = sess.owned_dptrs.values().sum::<u64>()
+                + sess.owned_vmm_handles.values().sum::<u64>();
+            if used.saturating_add(size) > limit {
+                return Err(2); // CUDA_ERROR_OUT_OF_MEMORY (surfaces via sticky)
+            }
+            let created = if path3_enabled() {
+                b.mem_create_exportable(size, device)
+            } else {
+                b.mem_create(size, device)
+            };
+            created.map(|h| {
+                sess.owned_vmm_handles.insert(h, size);
+                sess.vmm_vhandles.insert(handle_vh, h);
+                Response::Ok
+            })
+        }
         Request::MemMap {
             va,
             size,
             offset,
             handle,
         } => {
+            // The guest-visible value: a burst virtual handle, or (legacy) the
+            // raw real. Recorded as the chunk's ghandle so a clone's inherited
+            // ops (which carry this value) translate in the worker.
+            let ghandle = handle;
+            // Burst create: resolve the session's minted virtual handle.
+            let handle = sess.vmm_vhandles.get(&handle).copied().unwrap_or(handle);
             // Path 3 worker: an inherited golden handle must map via the worker's
             // own physical (raw golden values are invalid in this context).
             let handle = VMM_TRANS
@@ -2590,6 +2636,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                     ChunkCover {
                         size,
                         handle,
+                        ghandle,
                         ..ChunkCover::default()
                     },
                 );
@@ -2606,6 +2653,8 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             b.mem_unmap(va, size).map(|_| Response::Ok)
         }
         Request::MemRelease { handle } => {
+            // Burst create: resolve (and retire) the session's virtual handle.
+            let handle = sess.vmm_vhandles.remove(&handle).unwrap_or(handle);
             let created_here = sess.owned_vmm_handles.remove(&handle).is_some();
             // Path 3 worker: translate an inherited golden handle to the worker
             // handle backing that chunk (consumed: releasing twice is a no-op).
