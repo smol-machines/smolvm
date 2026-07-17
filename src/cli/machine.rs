@@ -874,11 +874,13 @@ pub struct RunCmd {
     )]
     pub mount_socket: Vec<String>,
 
-    /// Forward guest Wayland apps to the host compositor over vsock. Bridges a
-    /// guest waypipe vsock port to a host Unix socket; run `waypipe client` on
-    /// it and `waypipe server --vsock` in the VM. Requires waypipe in the VM.
-    #[arg(long, help_heading = "Hardware")]
-    pub waypipe: bool,
+    /// Forward guest Wayland apps to the host compositor over vsock. Run a
+    /// `waypipe client` on the host socket next to your compositor; the guest
+    /// daemon and WAYLAND_DISPLAY are set up automatically. Optional value picks
+    /// the binary: `host` (default, share the host waypipe), `container` (use
+    /// the image's own), or a path to a host waypipe binary.
+    #[arg(long, help_heading = "Hardware", num_args = 0..=1, default_missing_value = "host", value_name = "host|container|PATH")]
+    pub waypipe: Option<String>,
 
     /// Bridge the guest X11 socket straight to the host X server (no waypipe).
     /// Resolves the host $DISPLAY at launch and bridges a guest vsock port to
@@ -2026,11 +2028,26 @@ impl RunCmd {
 
         let uses_packed_layers = packed_layers_dir.is_some();
 
+        // Waypipe needs a workload container to host its daemon: the guest agent
+        // rootfs is musl Alpine and cannot exec a glibc `waypipe`, so the daemon
+        // runs inside the (glibc) container. A bare VM (no image) has no such
+        // container, so forwarding could never start. Reject up front rather than
+        // booting with SMOLVM_WAYPIPE set and silently doing nothing.
+        if (self.waypipe.is_some() || params.waypipe) && image.is_none() {
+            return Err(smolvm::Error::agent(
+                "waypipe",
+                "--waypipe requires an --image: the forwarding daemon runs inside the \
+                 workload container, which a bare VM does not have. Re-run with \
+                 --image <img> (the image must provide, or let you install, waypipe).",
+            ));
+        }
+
         let mut features = smolvm::agent::LaunchFeatures {
             ssh_agent_socket,
             cuda: self.cuda || params.cuda,
             expose_docker: self.docker_socket || params.docker_socket,
-            waypipe: self.waypipe || params.waypipe,
+            waypipe: self.waypipe.is_some() || params.waypipe,
+            waypipe_bin: self.waypipe.clone().or_else(|| params.waypipe_bin.clone()),
             x11: self.x11 || params.x11,
             dns_filter_hosts: params.dns_filter_hosts.clone(),
             credentials: params.credential_policy.as_ref().and_then(|policy| {
@@ -2104,19 +2121,22 @@ impl RunCmd {
             );
         }
 
-        // Tell the user how to bring up the Wayland bridge. smolvm bridges the
-        // guest's outbound waypipe vsock port to this host Unix socket; the user
-        // runs a `waypipe client` listening on it, next to the host compositor,
-        // and `waypipe server --vsock` in the VM for each app.
-        if self.waypipe || params.waypipe {
+        // Tell the user how to use the Wayland bridge. Both ends are wired up
+        // automatically: the guest agent runs `waypipe server` as a daemon and
+        // exports WAYLAND_DISPLAY, and on Linux smolvm starts the matching host
+        // `waypipe client` next to the compositor. The host client is skipped
+        // when $WAYLAND_DISPLAY is unset or no `waypipe` is on the host PATH; a
+        // manual fallback for that case is shown below.
+        if self.waypipe.is_some() || params.waypipe {
             let sock = smolvm::agent::vm_data_dir(&vm_name).join("waypipe.sock");
             eprintln!(
-                "Waypipe forwarding enabled. On the host, run a listening client:\n  \
-                 waypipe -s {} client\n\
-                 then in the VM run an app through the vsock server:\n  \
-                 waypipe --vsock -s {} server -- weston-terminal",
-                sock.display(),
-                smolvm_protocol::ports::WAYPIPE
+                "Waypipe forwarding enabled (guest Wayland apps -> host compositor). \
+                 Both ends are set up automatically - just run a GUI app in the VM:\n  \
+                 smolvm machine exec -- weston-terminal\n\
+                 If the host client wasn't started (no $WAYLAND_DISPLAY, or no waypipe \
+                 on the host PATH), run one yourself:\n  \
+                 waypipe -s {} client",
+                sock.display()
             );
         }
 
@@ -2352,7 +2372,8 @@ impl RunCmd {
                                 r.ssh_agent |= self.ssh_agent;
                                 r.cuda |= self.cuda;
                                 r.docker_socket |= self.docker_socket;
-                                r.waypipe |= self.waypipe;
+                                r.waypipe |= self.waypipe.is_some();
+                                r.waypipe_bin = self.waypipe.clone().or(r.waypipe_bin.take());
                                 r.x11 |= self.x11;
                                 if self.gpu {
                                     r.gpu = Some(true);
@@ -2510,7 +2531,8 @@ impl RunCmd {
                             r.ssh_agent |= self.ssh_agent;
                             r.cuda |= self.cuda;
                             r.docker_socket |= self.docker_socket;
-                            r.waypipe |= self.waypipe;
+                            r.waypipe |= self.waypipe.is_some();
+                            r.waypipe_bin = self.waypipe.clone().or(r.waypipe_bin.take());
                             r.x11 |= self.x11;
                             if self.gpu {
                                 r.gpu = Some(true);
@@ -4823,11 +4845,13 @@ pub struct CreateCmd {
     #[arg(long)]
     pub docker_socket: bool,
 
-    /// Forward guest Wayland apps to the host compositor over vsock. Bridges a
-    /// guest waypipe vsock port to a host Unix socket; run `waypipe client` on
-    /// it and `waypipe server --vsock` in the VM. Requires waypipe in the VM.
-    #[arg(long)]
-    pub waypipe: bool,
+    /// Forward guest Wayland apps to the host compositor over vsock. Run a
+    /// `waypipe client` on the host socket next to your compositor; the guest
+    /// daemon and WAYLAND_DISPLAY are set up automatically. Optional value picks
+    /// the binary: `host` (default, share the host waypipe), `container` (use
+    /// the image's own), or a path to a host waypipe binary.
+    #[arg(long, num_args = 0..=1, default_missing_value = "host", value_name = "host|container|PATH")]
+    pub waypipe: Option<String>,
 
     /// Bridge the guest X11 socket straight to the host X server (no waypipe).
     /// Resolves the host $DISPLAY at launch and bridges a guest vsock port to
@@ -5258,7 +5282,10 @@ impl CreateCmd {
         }
         cli.cuda |= *cuda;
         cli.docker_socket |= *docker_socket;
-        cli.waypipe |= *waypipe;
+        if let Some(bin) = waypipe {
+            cli.waypipe = true;
+            cli.waypipe_bin = Some(bin.clone());
+        }
         cli.x11 |= *x11;
         cli.gpu |= *gpu;
         cli.rosetta |= *rosetta;
