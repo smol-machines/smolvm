@@ -23,17 +23,17 @@
     x86_64-linux = {
       asset = "smolvm-${version}-linux-x86_64.tar.gz";
       root = "smolvm-${version}-linux-x86_64";
-      hash = "sha256-JaLEPFlI0wnvFWlaubQKtzc7p6b0vmAVn5RPXni7jWY=";
+      hash = "sha256-FCnYE4y8L97RxjdjBVxrIdrk3J7Fz5NW44QieiBUqxk=";
     };
     aarch64-linux = {
       asset = "smolvm-${version}-linux-arm64.tar.gz";
       root = "smolvm-${version}-linux-arm64";
-      hash = "sha256-zx3i1SGL/2u49hfLswFe5cYyyoRh4K6jUX0TqXEYY/Y=";
+      hash = "sha256-ydJSqhX8R9E4AnJdH4Ecma/7UtsejeRtkTkhe+N3ApY=";
     };
     aarch64-darwin = {
       asset = "smolvm-${version}-darwin-arm64.tar.gz";
       root = "smolvm-${version}-darwin-arm64";
-      hash = "sha256-T6/oznmhfsv446JxaEOx5T2kXuOyYoa6ClOG96wB58Y=";
+      hash = "sha256-j3clBHsYZpum6bxMA47GERistj9/gmNpDiygPxRUSDE=";
     };
   };
 
