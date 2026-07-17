@@ -193,6 +193,15 @@ pub struct Client<S> {
     /// a launch storm's thousand syscalls into a handful; flushed before any
     /// read (a response can only exist for a request the host has seen).
     wbuf: Vec<u8>,
+    /// Replay journal: every quiet request "sent" since the last response we
+    /// received (encoded payloads, send order). A VM-fork clone inherits a
+    /// transport that swallows writes without erroring — ring records land in
+    /// cloned pages no host reads, vsock writes buffer into a dead socket — so
+    /// quiet ops issued before the first blocking call are silently lost. The
+    /// host serves strictly in order, so ANY received response proves every
+    /// prior request was consumed (journal clears); on reconnect the journal
+    /// replays the unproven suffix. Bounded by MAX_DEFERRED (drain fences).
+    journal: Vec<Vec<u8>>,
 }
 
 /// Outstanding-response cap. Responses are ~8 bytes, so even the smallest
@@ -213,6 +222,7 @@ impl<S: Read + Write> Client<S> {
             sticky: 0,
             defer_enabled: std::env::var("SMOLVM_CUDA_ASYNC").as_deref() != Ok("0"),
             wbuf: Vec::new(),
+            journal: Vec::new(),
         }
     }
 
@@ -407,7 +417,11 @@ impl<S: Read + Write> Client<S> {
     fn ring_roundtrip(&mut self, frame: &[u8]) -> Result<Vec<u8>> {
         self.ring_push(frame)?;
         rtt_tax();
-        self.ring_pop_response()
+        let resp = self.ring_pop_response()?;
+        // In-order serving: this response proves every earlier request was
+        // consumed by the host — the replay journal can forget them.
+        self.journal.clear();
+        Ok(resp)
     }
 
     /// Send everything buffered by deferred calls.
@@ -429,30 +443,37 @@ impl<S: Read + Write> Client<S> {
         self.defer_enabled = on;
     }
 
-    /// Take this client's pending deferred pipeline (framed-but-unsent quiet
-    /// requests + their count + sticky status), clearing it. On a VM-fork clone
-    /// whose connection died mid-flush, these requests never reached the host —
-    /// so they must move to the reconnected client and re-flush there, or the
-    /// buffered work (e.g. torch's queued cuBLAS matmuls before a `.item()`)
-    /// would be silently dropped and the next read returns stale data.
-    pub fn take_pending(&mut self) -> (Vec<u8>, usize, i32) {
-        let sticky = self.sticky;
-        self.sticky = 0;
-        let deferred = self.deferred;
+    /// Take this client's replay journal — every quiet request not yet proven
+    /// consumed by a host response — plus the sticky status, clearing both. On
+    /// a VM-fork clone the inherited transport swallows writes without erroring
+    /// (ring records land in cloned pages no host reads; vsock writes buffer
+    /// into a dead socket), so these requests may never have reached the host:
+    /// they must replay on the reconnected client or the work (e.g. torch's
+    /// queued launches before a `.item()`) is silently dropped and later reads
+    /// return stale data. Fork points are quiescent (the golden synchronizes
+    /// before gating), so an empty journal is the common case and replay of a
+    /// host-side-executed op cannot arise there.
+    pub fn take_journal(&mut self) -> (Vec<Vec<u8>>, i32) {
+        let sticky = std::mem::take(&mut self.sticky);
         self.deferred = 0;
-        (std::mem::take(&mut self.wbuf), deferred, sticky)
+        self.wbuf.clear(); // superseded: the journal holds sent AND unsent
+        (std::mem::take(&mut self.journal), sticky)
     }
 
-    /// Adopt a pending deferred pipeline taken from a prior (dead) client. The
-    /// requests reference handles that stay valid in the shared primary context
-    /// (and are restored by the Init handoff), so re-flushing them on this fresh
-    /// connection replays exactly the not-yet-executed work.
-    pub fn restore_pending(&mut self, wbuf: Vec<u8>, deferred: usize, sticky: i32) {
-        self.wbuf = wbuf;
-        self.deferred = deferred;
+    /// Replay a journal taken from a prior (dead) client, in order, on this
+    /// fresh connection (after `init` — and ring setup, if any — so the ops
+    /// re-enter the new pipeline exactly like first-time sends and are
+    /// re-journaled for a possible second reconnect). The requests reference
+    /// handles that stay valid across the reconnect (shared primary context /
+    /// Init handoff / clone-worker translation tables).
+    pub fn replay_journal(&mut self, ops: Vec<Vec<u8>>, sticky: i32) -> Result<()> {
         if self.sticky == 0 {
             self.sticky = sticky;
         }
+        for payload in ops {
+            self.enqueue_quiet(payload)?;
+        }
+        Ok(())
     }
 
     /// Settle all fire-and-forget work with a single fence round-trip: quiet
@@ -491,6 +512,7 @@ impl<S: Read + Write> Client<S> {
         rtt_tax();
         let payload =
             read_msg(&mut self.stream)?.ok_or(CudaRpcError::Protocol("host closed mid-fence"))?;
+        self.journal.clear(); // fence response → all prior consumed
         if payload.len() >= 4 {
             let status = i32::from_le_bytes(payload[..4].try_into().unwrap());
             if status != 0 && self.sticky == 0 {
@@ -535,24 +557,33 @@ impl<S: Read + Write> Client<S> {
             }
             return Ok(());
         }
+        self.enqueue_quiet(encode_request(req))
+    }
+
+    /// Enqueue one quiet (fire-and-forget) request payload on the active
+    /// transport, journaling it for replay-on-reconnect. The journal append
+    /// comes FIRST so a payload whose transport write fails is still replayed
+    /// after the reconnect that failure triggers.
+    fn enqueue_quiet(&mut self, payload: Vec<u8>) -> Result<()> {
+        if self.deferred >= MAX_DEFERRED {
+            self.drain()?;
+        }
+        if self.sticky != 0 {
+            return Err(CudaRpcError::Cuda(std::mem::take(&mut self.sticky)));
+        }
         if self.ring.is_some() {
-            if self.deferred >= MAX_DEFERRED {
-                self.drain()?;
-            }
-            if self.sticky != 0 {
-                return Err(CudaRpcError::Cuda(std::mem::take(&mut self.sticky)));
-            }
-            let payload = encode_request(req);
             if payload.len() < crate::ring::INLINE_MAX {
                 let mut frame = Vec::with_capacity(payload.len() + 1);
                 frame.push(crate::proto::QUIET_PREFIX);
                 frame.extend_from_slice(&payload);
-                self.ring_push(&frame)?;
+                self.journal.push(payload);
                 self.deferred += 1;
+                self.ring_push(&frame)?;
             } else {
                 // Oversized quiet frames go indirect, which needs the staging
                 // buffer alive until consumption — round-trip instead and
-                // fold a failure into the sticky slot.
+                // fold a failure into the sticky slot. (Synchronous: no
+                // journal entry needed, the response itself proves delivery.)
                 let resp = self.ring_roundtrip(&payload)?;
                 if resp.len() >= 4 {
                     let st = i32::from_le_bytes(resp[..4].try_into().unwrap());
@@ -563,20 +594,14 @@ impl<S: Read + Write> Client<S> {
             }
             return Ok(());
         }
-        if self.deferred >= MAX_DEFERRED {
-            self.drain()?;
-        }
-        if self.sticky != 0 {
-            return Err(CudaRpcError::Cuda(std::mem::take(&mut self.sticky)));
-        }
         // Frame into the batch buffer as a QUIET request (no response) — one
         // write syscall per sync point (or per WBUF_FLUSH bytes), and one
         // fence reply per drain instead of one reply per request.
-        let payload = encode_request(req);
         self.wbuf
             .extend_from_slice(&((payload.len() + 1) as u32).to_le_bytes());
         self.wbuf.push(crate::proto::QUIET_PREFIX);
         self.wbuf.extend_from_slice(&payload);
+        self.journal.push(payload);
         self.deferred += 1;
         if self.wbuf.len() >= WBUF_FLUSH {
             self.flush_wbuf()?;
@@ -610,7 +635,10 @@ impl<S: Read + Write> Client<S> {
             self.flush_wbuf()?;
             write_msg(&mut self.stream, &encode_request(req))?;
             rtt_tax();
-            read_msg(&mut self.stream)?.ok_or(CudaRpcError::Protocol("host closed mid-call"))?
+            let p = read_msg(&mut self.stream)?
+                .ok_or(CudaRpcError::Protocol("host closed mid-call"))?;
+            self.journal.clear(); // response received → all prior consumed
+            p
         };
         let (status, resp) = decode_response(op, &payload)?;
         if status != 0 {
@@ -624,30 +652,6 @@ impl<S: Read + Write> Client<S> {
     /// mode (`SMOLVM_CUDA_ASYNC=0`) the request round-trips instead and a
     /// failure status is collected as this connection's sticky error.
     pub fn raw_quiet(&mut self, payload: &[u8]) -> Result<()> {
-        if self.ring.is_some() && self.defer_enabled {
-            if self.deferred >= MAX_DEFERRED {
-                self.drain()?;
-            }
-            if self.sticky != 0 {
-                return Err(CudaRpcError::Cuda(std::mem::take(&mut self.sticky)));
-            }
-            if payload.len() < crate::ring::INLINE_MAX {
-                let mut frame = Vec::with_capacity(payload.len() + 1);
-                frame.push(crate::proto::QUIET_PREFIX);
-                frame.extend_from_slice(payload);
-                self.ring_push(&frame)?;
-                self.deferred += 1;
-            } else {
-                let resp = self.ring_roundtrip(payload)?;
-                if resp.len() >= 4 {
-                    let st = i32::from_le_bytes(resp[..4].try_into().unwrap());
-                    if st != 0 && self.sticky == 0 {
-                        self.sticky = st;
-                    }
-                }
-            }
-            return Ok(());
-        }
         if !self.defer_enabled {
             let resp = self.raw_call(payload)?;
             if resp.len() >= 4 {
@@ -658,21 +662,7 @@ impl<S: Read + Write> Client<S> {
             }
             return Ok(());
         }
-        if self.deferred >= MAX_DEFERRED {
-            self.drain()?;
-        }
-        if self.sticky != 0 {
-            return Err(CudaRpcError::Cuda(std::mem::take(&mut self.sticky)));
-        }
-        self.wbuf
-            .extend_from_slice(&((payload.len() + 1) as u32).to_le_bytes());
-        self.wbuf.push(crate::proto::QUIET_PREFIX);
-        self.wbuf.extend_from_slice(payload);
-        self.deferred += 1;
-        if self.wbuf.len() >= WBUF_FLUSH {
-            self.flush_wbuf()?;
-        }
-        Ok(())
+        self.enqueue_quiet(payload.to_vec())
     }
 
     /// Serve a bridged peer: one pre-encoded synchronous round-trip. Returns
@@ -686,7 +676,9 @@ impl<S: Read + Write> Client<S> {
         self.flush_wbuf()?;
         write_msg(&mut self.stream, payload)?;
         rtt_tax();
-        read_msg(&mut self.stream)?.ok_or(CudaRpcError::Protocol("host closed mid-call"))
+        let p = read_msg(&mut self.stream)?.ok_or(CudaRpcError::Protocol("host closed mid-call"))?;
+        self.journal.clear(); // response received → all prior consumed
+        Ok(p)
     }
 
     /// Run the connect handshake, adopting `resume_token`'s (frozen) session
@@ -944,8 +936,14 @@ impl<S: Read + Write> Client<S> {
     }
 
     pub fn ctx_synchronize(&mut self) -> Result<()> {
+        // Settle fire-and-forget work first: a quiet op's failure lives in the
+        // HOST's sticky slot and only a fence reports it — and synchronize is
+        // exactly CUDA's contract point for surfacing asynchronous errors.
+        // Without this, a failed quiet launch (e.g. an inherited CUDA graph a
+        // fork clone couldn't rebuild) returns success + stale data.
+        self.drain()?;
         self.call(&Request::CtxSynchronize, Op::CtxSynchronize)?;
-        // Surface any asynchronous failure collected while draining, the way
+        // Surface any asynchronous failure collected by the drain, the way
         // cudaDeviceSynchronize reports errors from earlier async work.
         match self.take_sticky() {
             0 => Ok(()),
@@ -1070,11 +1068,15 @@ impl<S: Read + Write> Client<S> {
     }
 
     pub fn stream_synchronize(&mut self, stream: u64) -> Result<()> {
+        self.drain()?; // see ctx_synchronize: fences surface quiet failures
         self.call(
             &Request::StreamSynchronize { stream },
             Op::StreamSynchronize,
-        )
-        .map(|_| ())
+        )?;
+        match self.take_sticky() {
+            0 => Ok(()),
+            code => Err(CudaRpcError::Cuda(code)),
+        }
     }
 
     /// Raw `cuStreamQuery` code: 0 complete, 600 not ready.

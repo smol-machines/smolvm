@@ -536,12 +536,21 @@ fn with_client<T>(
                         st.conn_token
                     );
                 }
-                // Carry the not-yet-sent deferred pipeline across the reconnect
-                // so buffered quiet ops (e.g. torch's queued matmuls) replay on
-                // the fresh connection instead of being dropped.
-                let (wbuf, deferred, sticky) = st.client.take_pending();
+                // Carry every quiet op not yet PROVEN consumed (no host response
+                // received since it was sent) across the reconnect. A fork
+                // clone's inherited transport swallows writes without erroring —
+                // ring records go into cloned pages no host reads — so ops
+                // "sent" pre-reconnect (e.g. torch's queued launches before the
+                // first sync) would otherwise be silently lost, leaving reads
+                // stale and compute wrong.
+                let (journal, sticky) = st.client.take_journal();
                 let (mut client, token, fd) = bring_up_client(st.conn_token)?;
-                client.restore_pending(wbuf, deferred, sticky);
+                if let Err(e) = client.replay_journal(journal, sticky) {
+                    if std::env::var_os("SHIM_TRACE").is_some() {
+                        eprintln!("[shim] journal replay failed: {e:?}");
+                    }
+                    return Err(map_err(e));
+                }
                 st.client = client;
                 st.conn_token = token;
                 st.conn_pid = pid;
