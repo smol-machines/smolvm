@@ -256,16 +256,22 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
     // + recreate streams/events, then install the translation so the clone's
     // inherited kernel launches resolve (each module reloads on first use).
     if let Ok(modpath) = std::env::var("SMOLVM_CUDA_CLONE_MODULES") {
-        let (mod_images, func_meta, streams, events, graphs) =
+        let (mod_images, func_meta, streams, events, graphs, lib_handles) =
             reconstruct_golden_modules(backend.as_mut(), &modpath);
-        let (nm, nf, ns, ne, ng) = (
+        let (nm, nf, ns, ne, ng, nlh) = (
             mod_images.len(),
             func_meta.len(),
             streams.len(),
             events.len(),
             graphs.len(),
+            lib_handles.len(),
         );
         smolvm_cuda::host::set_handle_trans(mod_images, func_meta, streams, events);
+        // Re-create the golden's top-level cuBLAS/cuBLASLt/cuDNN handles in
+        // THIS process and map the clone's inherited values to them — library
+        // handles are process-local, so a pre-fork handle would otherwise fail
+        // the clone's first post-fork library call.
+        let nseeded = smolvm_cuda::host::replay_lib_handles(backend.as_mut(), &lib_handles);
         // M3b: rebuild the golden's captured CUDA graphs in THIS context, now
         // that modules can lazily reload and memory is reconstructed (kernel-arg
         // pointers reference the golden VAs, valid here). Maps the clone's
@@ -279,6 +285,8 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
             events = ne,
             graphs = ng,
             graphs_rebuilt = nrebuilt,
+            lib_handles = nlh,
+            lib_handles_seeded = nseeded,
             "cuda clone-worker: staged modules for lazy reload + remapped handles"
         );
     }
@@ -496,20 +504,36 @@ fn reconstruct_golden_modules(
     Vec<(u64, u64)>,
     Vec<(u64, u64)>,
     Vec<(u64, u64, smolvm_cuda::host::GraphSer)>,
+    Vec<(u8, u16, u64, Vec<u8>)>,
 ) {
     let mut mod_images = Vec::new();
     let mut func_meta = Vec::new();
     let mut stream_trans = Vec::new();
     let mut event_trans = Vec::new();
     let mut graphs: Vec<(u64, u64, smolvm_cuda::host::GraphSer)> = Vec::new();
+    let mut lib_handles: Vec<(u8, u16, u64, Vec<u8>)> = Vec::new();
     let Ok(buf) = std::fs::read(path) else {
-        return (mod_images, func_meta, stream_trans, event_trans, graphs);
+        return (
+            mod_images,
+            func_meta,
+            stream_trans,
+            event_trans,
+            graphs,
+            lib_handles,
+        );
     };
     let mut p = 0usize;
     macro_rules! need {
         ($n:expr) => {
             if p + $n > buf.len() {
-                return (mod_images, func_meta, stream_trans, event_trans, graphs);
+                return (
+                    mod_images,
+                    func_meta,
+                    stream_trans,
+                    event_trans,
+                    graphs,
+                    lib_handles,
+                );
             }
         };
     }
@@ -614,6 +638,24 @@ fn reconstruct_golden_modules(
             ));
         }
     }
+    // Library-handle creates to replay in this worker (absent in older blobs).
+    if p < buf.len() {
+        let nlh = ru32!();
+        for _ in 0..nlh {
+            need!(1);
+            let lib = buf[p];
+            p += 1;
+            need!(2);
+            let func = u16::from_le_bytes(buf[p..p + 2].try_into().unwrap());
+            p += 2;
+            let h = ru64!();
+            let alen = ru32!() as usize;
+            need!(alen);
+            let args = buf[p..p + alen].to_vec();
+            p += alen;
+            lib_handles.push((lib, func, h, args));
+        }
+    }
     tracing::info!(
         nmods,
         nfuncs,
@@ -622,9 +664,17 @@ fn reconstruct_golden_modules(
         ngraphs = graphs.len(),
         streams = stream_trans.len(),
         events = event_trans.len(),
+        lib_handles = lib_handles.len(),
         "M3a: staged golden modules/functions for lazy reload + recreated streams/events"
     );
-    (mod_images, func_meta, stream_trans, event_trans, graphs)
+    (
+        mod_images,
+        func_meta,
+        stream_trans,
+        event_trans,
+        graphs,
+        lib_handles,
+    )
 }
 
 /// Strip a fork-clone connection preamble (magic + clone id) if present,
@@ -868,7 +918,7 @@ fn spawn_clone_worker(conn_fd: std::os::unix::io::RawFd, token: u64) -> io::Resu
     // M3a: serialize the golden's modules (images) + functions to a temp file for
     // the worker to reload + remap. Images are MB-scale, so a file, not env.
     let mut modpath: Option<String> = None;
-    if let Some((modules, funcs, streams, events, graphs)) =
+    if let Some((modules, funcs, streams, events, graphs, lib_handles)) =
         smolvm_cuda::host::module_handoff_snapshot(token)
     {
         tracing::info!(
@@ -877,6 +927,7 @@ fn spawn_clone_worker(conn_fd: std::os::unix::io::RawFd, token: u64) -> io::Resu
             streams = streams.len(),
             events = events.len(),
             graphs = graphs.len(),
+            lib_handles = lib_handles.len(),
             "M3a: gathered golden modules/functions/streams/events"
         );
         let mut blob = Vec::new();
@@ -930,6 +981,16 @@ fn spawn_clone_worker(conn_fd: std::os::unix::io::RawFd, token: u64) -> io::Resu
                 blob.extend_from_slice(&f.to_le_bytes());
                 blob.extend_from_slice(&t.to_le_bytes());
             }
+        }
+        // Library-handle creates for the worker to replay:
+        //   [u32 n]([u8 lib][u16 func][u64 handle][u32 len][args])*
+        blob.extend_from_slice(&(lib_handles.len() as u32).to_le_bytes());
+        for (lib, func, h, args) in &lib_handles {
+            blob.push(*lib);
+            blob.extend_from_slice(&func.to_le_bytes());
+            blob.extend_from_slice(&h.to_le_bytes());
+            blob.extend_from_slice(&(args.len() as u32).to_le_bytes());
+            blob.extend_from_slice(args);
         }
         let _ = std::fs::create_dir_all("/tmp/smolvm");
         // Unique per SPAWN, not per (token, conn_fd): fd numbers are reused as

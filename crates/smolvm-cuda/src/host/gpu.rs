@@ -1663,6 +1663,9 @@ impl Backend for GpuBackend {
     ) -> CuResult<(i32, Vec<u8>)> {
         self.gen_lib_call(lib, func, args, streams)
     }
+    fn lib_handle_alias(&mut self, golden: u64, real: u64) {
+        self.vhandles.lock().unwrap().insert(golden, real);
+    }
 }
 
 /// cuBLAS status: 0 = `CUBLAS_STATUS_SUCCESS`, else the code as `Err`.
@@ -2141,7 +2144,12 @@ fn vh_resolve(map: &std::collections::HashMap<u64, u64>, h: u64) -> u64 {
     if h & VHANDLE_TAG != 0 {
         map.get(&h).copied().unwrap_or(0)
     } else {
-        h
+        // Untagged values are usually real host pointers and pass through —
+        // EXCEPT an inherited raw library handle in a fork-clone worker
+        // (cuBLASLt returns raw pointers to the guest), which the worker
+        // aliased to its own re-created handle at staging. Identity when
+        // absent, so the common case costs one map miss.
+        map.get(&h).copied().unwrap_or(h)
     }
 }
 

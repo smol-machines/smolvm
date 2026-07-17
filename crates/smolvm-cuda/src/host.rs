@@ -11,7 +11,9 @@
 //! `libcuda.so.1`) and [`CpuBackend`] (emulates a known test kernel so the full
 //! protocol + transport can be exercised on a host with no NVIDIA GPU).
 
-use crate::proto::{decode_request, encode_response, read_msg, write_msg, Request, Response};
+use crate::proto::{
+    decode_request, encode_request, encode_response, read_msg, write_msg, Request, Response,
+};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 
@@ -233,6 +235,12 @@ pub trait Backend: Send {
     ) -> CuResult<(i32, Vec<u8>)> {
         Err(CUDA_ERROR_NOT_FOUND)
     }
+
+    /// Alias an inherited raw library-handle value (the GOLDEN process's
+    /// pointer, e.g. what cublasLtCreate returned there) to `real`, a handle
+    /// created in THIS process — so a clone's calls on the inherited value
+    /// resolve to a live handle instead of a foreign pointer. Default: no-op.
+    fn lib_handle_alias(&mut self, _golden: u64, _real: u64) {}
 
     /// Zero-copy H2D: DMA `size` bytes from shared-region `offset` to `dptr`.
     /// Default: no shared region → caller must fall back to byte-shipping.
@@ -662,6 +670,15 @@ struct GoldenLayout {
     /// rebuilds the graph in its own context and maps both virtual handles to
     /// its rebuilt reals, so the clone's inherited `GraphLaunch` resolves.
     graphs: Vec<(u64, u64, GraphSer)>,
+    /// Top-level library handles (cuBLAS/cuBLASLt/cuDNN contexts) the golden
+    /// created, as `(lib, func, guest handle value, create args)`. Library
+    /// handles are process-local; a clone worker replays each create in ITS
+    /// process and maps the inherited value to its own handle — otherwise the
+    /// clone's first post-fork cuBLASLt call on a pre-fork handle fails
+    /// CUBLAS_STATUS_NOT_INITIALIZED (or worse, dereferences a foreign
+    /// pointer). Only context-level creates are recorded; descriptors are
+    /// transient and recreated by the workload itself.
+    lib_handles: Vec<(u8, u16, u64, Vec<u8>)>,
 }
 type LayoutCell = std::sync::Mutex<GoldenLayout>;
 static DPTR_HANDOFF: std::sync::Mutex<Option<HashMap<u64, std::sync::Weak<AllocTable>>>> =
@@ -807,6 +824,7 @@ pub fn module_handoff_snapshot(
     Vec<(u64, u32)>,
     Vec<(u64, u32)>,
     Vec<(u64, u64, GraphSer)>,
+    Vec<(u8, u16, u64, Vec<u8>)>,
 )> {
     let reg = LAYOUT_HANDOFF.lock().unwrap();
     let l = reg.as_ref()?.get(&token)?.upgrade()?;
@@ -820,7 +838,34 @@ pub fn module_handoff_snapshot(
     let streams = g.streams.iter().map(|(&h, &f)| (h, f)).collect();
     let events = g.events.iter().map(|(&h, &f)| (h, f)).collect();
     let graphs = g.graphs.clone();
-    Some((modules, funcs, streams, events, graphs))
+    let lib_handles = g.lib_handles.clone();
+    Some((modules, funcs, streams, events, graphs, lib_handles))
+}
+
+/// Replay the golden's top-level library-handle creates in THIS worker's
+/// process. cuBLAS/cuDNN creates carry the guest-minted id in their args, so
+/// the generated dispatch installs id→worker-handle itself; cuBLASLt returns a
+/// raw pointer, so the golden's value is aliased to the worker's new handle
+/// via [`Backend::lib_handle_alias`]. Returns how many creates succeeded.
+pub fn replay_lib_handles(b: &mut dyn Backend, handles: &[(u8, u16, u64, Vec<u8>)]) -> usize {
+    let empty = HashMap::new();
+    let mut n = 0;
+    for (lib, func, golden, args) in handles {
+        match b.lib_call(*lib, *func, args, &empty) {
+            Ok((0, out)) => {
+                if *lib == 4 && out.len() >= 8 {
+                    let real = u64::from_le_bytes(out[..8].try_into().unwrap());
+                    b.lib_handle_alias(*golden, real);
+                }
+                n += 1;
+            }
+            Ok((st, _)) => {
+                eprintln!("[lib-seed] create lib={lib} func={func} failed: status={st}")
+            }
+            Err(e) => eprintln!("[lib-seed] create lib={lib} func={func} failed: e={e}"),
+        }
+    }
+    n
 }
 
 // M3a: per-worker (thread-local) translation of the golden's inherited raw
@@ -1691,6 +1736,9 @@ fn optrace_summary(req: &Request) -> Option<String> {
             function, params, ..
         } => format!("Launch fn={function:#x} nparams={}", params.len()),
         Request::GraphLaunch { graph_exec, .. } => format!("GraphLaunch exec={graph_exec:#x}"),
+        Request::LibCall { lib, func, args } => {
+            format!("LibCall lib={lib} func={func} alen={}", args.len())
+        }
         Request::MemAddressReserve { size, .. } => format!("VmmReserve size={size:#x}"),
         Request::MemCreate { size, .. } => format!("VmmCreate size={size:#x}"),
         Request::MemMap {
@@ -1701,7 +1749,12 @@ fn optrace_summary(req: &Request) -> Option<String> {
         Request::MemSetAccess { va, size, .. } => format!("VmmAccess va={va:#x} size={size:#x}"),
         Request::MemUnmap { va, size } => format!("VmmUnmap va={va:#x} size={size:#x}"),
         Request::MemRelease { handle } => format!("VmmRelease h={handle:#x}"),
-        _ => return None,
+        // Catch-all: op byte only (re-encoding is debug-run-only cost), so a
+        // failing op outside the detailed set above still shows up.
+        other => format!(
+            "Op0x{:02x}",
+            encode_request(other).first().copied().unwrap_or(0)
+        ),
     })
 }
 
@@ -2404,9 +2457,41 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             )
             .map(|_| Response::Ok)
         }
-        Request::LibCall { lib, func, args } => b
-            .lib_call(lib, func, &args, &sess.streams)
-            .map(|(status, out)| Response::LibResult(status, out)),
+        Request::LibCall { lib, func, args } => {
+            let r = b.lib_call(lib, func, &args, &sess.streams);
+            // Path 3: record top-level library-context creates so a clone
+            // worker can replay them in ITS process (library handles are
+            // process-local; see GoldenLayout::lib_handles). The guest value
+            // is the minted vhandle id (cuBLAS/cuDNN pass it in args) or the
+            // returned raw pointer (cuBLASLt returns it in the output).
+            if path3_enabled() {
+                if let Ok((0, ref out)) = r {
+                    let recorded = match (lib, func) {
+                        // cublasCreate_v2 / cudnnCreate: guest-minted id leads args.
+                        (1, 0) | (2, 0) if args.len() >= 8 => {
+                            Some(u64::from_le_bytes(args[..8].try_into().unwrap()))
+                        }
+                        // cublasLtCreate: raw host pointer returned to the guest.
+                        (4, 11) if out.len() >= 8 => {
+                            Some(u64::from_le_bytes(out[..8].try_into().unwrap()))
+                        }
+                        _ => None,
+                    };
+                    if let Some(h) = recorded {
+                        if std::env::var_os("SMOLVM_CUDA_LIB_SEED_DEBUG").is_some() {
+                            eprintln!("[lib-rec] lib={lib} func={func} h={h:#x}");
+                        }
+                        sess.golden_layout.lock().unwrap().lib_handles.push((
+                            lib,
+                            func,
+                            h,
+                            args.clone(),
+                        ));
+                    }
+                }
+            }
+            r.map(|(status, out)| Response::LibResult(status, out))
+        }
         Request::MemcpyShmHtoD {
             dptr,
             offset,
@@ -2557,7 +2642,10 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         Ok(resp) => (0, resp),
         Err(code) => (code, Response::Ok),
     };
-    if let Some(line) = trace {
+    if let Some(mut line) = trace {
+        if let Response::LibResult(lst, _) = &resp {
+            line.push_str(&format!(" lib_st={lst}"));
+        }
         optrace_write(&line, status);
     }
     (status, resp)

@@ -578,7 +578,15 @@ impl<S: Read + Write> Client<S> {
                 frame.extend_from_slice(&payload);
                 self.journal.push(payload);
                 self.deferred += 1;
-                self.ring_push(&frame)?;
+                // A transport error here (e.g. a fork clone's first op hitting
+                // the dead inherited ring/doorbell) is NOT a failure of the op:
+                // it is already journaled, so the reconnect the next blocking
+                // call triggers will replay it in order. Erroring here instead
+                // made the guest wrapper fail the op spuriously (seen as a
+                // bogus CUBLAS_STATUS_NOT_INITIALIZED on the clone's first
+                // post-fork matmul). A persistent transport failure still
+                // surfaces loudly at the next blocking round-trip.
+                let _ = self.ring_push(&frame);
             } else {
                 // Oversized quiet frames go indirect, which needs the staging
                 // buffer alive until consumption — round-trip instead and
@@ -604,7 +612,10 @@ impl<S: Read + Write> Client<S> {
         self.journal.push(payload);
         self.deferred += 1;
         if self.wbuf.len() >= WBUF_FLUSH {
-            self.flush_wbuf()?;
+            // Swallow a transport error: the ops are journaled (see the ring
+            // branch above) and replay after the reconnect the next blocking
+            // call triggers.
+            let _ = self.flush_wbuf();
         }
         Ok(())
     }
