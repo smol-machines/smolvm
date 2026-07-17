@@ -184,7 +184,10 @@ fn build_real_sidecar_marked(dir: &Path, marker: &[u8]) -> std::path::PathBuf {
 
     let mut collector = AssetCollector::new(dir.join("staging")).unwrap();
     collector
-        .add_layer("sha256:aaa111aaa111bbb222", &layer_tar("etc/base.conf", marker))
+        .add_layer(
+            "sha256:aaa111aaa111bbb222",
+            &layer_tar("etc/base.conf", marker),
+        )
         .unwrap();
 
     let manifest = PackManifest::new(
