@@ -26,6 +26,28 @@ const VHANDLE_TAG: u64 = 1 << 63;
 pub const CUDA_ERROR_NOT_FOUND: i32 = 500;
 pub const CUDA_ERROR_NOT_SUPPORTED: i32 = 801;
 
+/// M3b: one KERNEL node of a captured CUDA graph, in a portable form. `func` is
+/// the golden's `CUfunction` (re-resolved in the worker); `params` are the raw
+/// bytes of each kernel argument in declaration order (address-preserving fork
+/// keeps device pointers valid verbatim, so they are copied, not translated).
+#[derive(Clone)]
+pub struct GraphKernelNode {
+    pub func: u64,
+    pub grid: [u32; 3],
+    pub block: [u32; 3],
+    pub shared_mem: u32,
+    pub params: Vec<Vec<u8>>,
+}
+
+/// M3b: a captured CUDA graph reduced to kernel nodes + dependency edges, so a
+/// clone worker can rebuild it in its own context. `edges` are `(from, to)`
+/// indices into `nodes` (from runs before to).
+#[derive(Clone, Default)]
+pub struct GraphSer {
+    pub nodes: Vec<GraphKernelNode>,
+    pub edges: Vec<(u32, u32)>,
+}
+
 /// A CUDA Driver-API implementation. Handles returned here are the backend's
 /// own raw values (e.g. real `CUmodule` pointers); [`serve`] hides them behind
 /// opaque ids before they reach the guest.
@@ -120,6 +142,26 @@ pub trait Backend: Send {
     fn graph_destroy(&mut self, graph: u64) -> CuResult<()>;
     /// Number of nodes in a captured graph (PyTorch warns on empty graphs).
     fn graph_get_node_count(&mut self, graph: u64) -> CuResult<u64>;
+    /// M3b: introspect a captured graph into a portable, rebuildable form so a
+    /// Path-3 clone worker can reconstruct it in its OWN context (the golden's
+    /// CUgraph/CUgraphExec are context-scoped and invalid there). Returns `None`
+    /// if the graph contains any non-KERNEL node (unsupported — the caller then
+    /// keeps the golden's exec, which fails loud rather than mis-executing).
+    /// Address-preserving fork means kernel-arg bytes are captured verbatim;
+    /// only each node's `func` is golden-scoped and re-resolved in the worker.
+    fn graph_introspect(&mut self, _graph: u64) -> CuResult<Option<GraphSer>> {
+        Ok(None)
+    }
+    /// M3b: rebuild `ser` as a NEW CUDA graph in THIS context, mapping every
+    /// node's golden `func` handle through `funcs` (golden CUfunction → this
+    /// context's reloaded function). Returns the new `cudaGraph_t`.
+    fn graph_rebuild(
+        &mut self,
+        _ser: &GraphSer,
+        _funcs: &HashMap<u64, u64>,
+    ) -> CuResult<u64> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
     /// Stream-ordered memset (capture-safe; the sync form would invalidate an
     /// active capture).
     fn memset_d8_async(&mut self, dptr: u64, value: u8, bytes: u64, stream: u64) -> CuResult<()>;
@@ -618,6 +660,12 @@ struct GoldenLayout {
     streams: HashMap<u64, u32>,
     /// M3a: golden event handle → create flags (the worker recreates + remaps).
     events: HashMap<u64, u32>,
+    /// M3b: captured CUDA graphs to rebuild in a clone worker. Each entry is
+    /// `(guest virtual graph handle, guest virtual exec handle, portable graph)`,
+    /// recorded at the golden's `GraphInstantiate` under Path 3. The worker
+    /// rebuilds the graph in its own context and maps both virtual handles to
+    /// its rebuilt reals, so the clone's inherited `GraphLaunch` resolves.
+    graphs: Vec<(u64, u64, GraphSer)>,
 }
 type LayoutCell = std::sync::Mutex<GoldenLayout>;
 static DPTR_HANDOFF: std::sync::Mutex<Option<HashMap<u64, std::sync::Weak<AllocTable>>>> =
@@ -762,6 +810,7 @@ pub fn module_handoff_snapshot(
     Vec<(u64, u64, String)>,
     Vec<(u64, u32)>,
     Vec<(u64, u32)>,
+    Vec<(u64, u64, GraphSer)>,
 )> {
     let reg = LAYOUT_HANDOFF.lock().unwrap();
     let l = reg.as_ref()?.get(&token)?.upgrade()?;
@@ -774,7 +823,8 @@ pub fn module_handoff_snapshot(
         .collect();
     let streams = g.streams.iter().map(|(&h, &f)| (h, f)).collect();
     let events = g.events.iter().map(|(&h, &f)| (h, f)).collect();
-    Some((modules, funcs, streams, events))
+    let graphs = g.graphs.clone();
+    Some((modules, funcs, streams, events, graphs))
 }
 
 // M3a: per-worker (thread-local) translation of the golden's inherited raw
@@ -801,12 +851,67 @@ thread_local! {
     // the worker's context SEGFAULTS the driver (SEGV_MAPERR inside cuMemRelease).
     static VMM_TRANS: std::cell::RefCell<Option<HashMap<u64, u64>>> =
         const { std::cell::RefCell::new(None) };
+    // M3b: guest virtual graph/exec handle → THIS worker's rebuilt graph/exec.
+    // A clone forked at a graph-capture point inherits the guest's virtual
+    // handles; the golden's reals are context-scoped, so `raw_graph` remaps them
+    // to the worker's rebuilt reals here.
+    static GRAPH_TRANS: HandleMap = std::cell::RefCell::new(HashMap::new());
 }
 
 /// Install a clone worker's golden→worker VMM physical-handle map (M2). Until
 /// installed, MemMap/MemRelease pass handles through raw (daemon/golden path).
 pub fn set_vmm_trans(map: HashMap<u64, u64>) {
     VMM_TRANS.with(|m| *m.borrow_mut() = Some(map));
+}
+
+/// M3b: rebuild the golden's captured graphs in THIS worker's context and map
+/// each `(graph_vh, exec_vh)` to the rebuilt reals, so the clone's inherited
+/// `GraphLaunch` resolves. Kernel-node graphs only; a rebuild/instantiate
+/// failure is logged and skipped (that graph's launch then fails loud). Returns
+/// the number rebuilt. Call AFTER `set_handle_trans` (needs module reload) and
+/// AFTER memory reconstruction (kernel-arg pointers reference golden VAs).
+pub fn rebuild_clone_graphs(b: &mut dyn Backend, graphs: Vec<(u64, u64, GraphSer)>) -> usize {
+    let mut n = 0;
+    for (graph_vh, exec_vh, ser) in graphs {
+        // Resolve each golden CUfunction to this worker's reloaded function.
+        let mut funcs: HashMap<u64, u64> = HashMap::new();
+        for node in &ser.nodes {
+            if let std::collections::hash_map::Entry::Vacant(e) = funcs.entry(node.func) {
+                let w = xlat_func(b, node.func);
+                e.insert(w);
+            }
+        }
+        // A func that resolved to 0 (reload failed) or back to its golden handle
+        // (not in FUNC_META — e.g. cuBLAS kernels bound via the CUDA-12 library
+        // API, which we don't track) is a FOREIGN-context handle. Passing it to
+        // cuGraphAddKernelNode makes the driver dereference it -> SIGSEGV, which
+        // crash-loops the worker. Skip the whole graph instead: the clone's
+        // GraphLaunch then fails loud rather than taking down the process.
+        let unresolved = funcs.iter().filter(|(g, w)| **w == 0 || *g == *w).count();
+        if unresolved > 0 {
+            eprintln!(
+                "[graph-rebuild] skipping graph vh={graph_vh:#x}: {unresolved}/{} kernel funcs \
+                 unresolved (not in FUNC_META); leaving inherited exec in place",
+                funcs.len()
+            );
+            continue;
+        }
+        match b.graph_rebuild(&ser, &funcs) {
+            Ok(wgraph) => match b.graph_instantiate(wgraph) {
+                Ok(wexec) => {
+                    GRAPH_TRANS.with(|m| {
+                        let mut m = m.borrow_mut();
+                        m.insert(graph_vh, wgraph);
+                        m.insert(exec_vh, wexec);
+                    });
+                    n += 1;
+                }
+                Err(e) => eprintln!("[graph-rebuild] instantiate failed: e={e}"),
+            },
+            Err(e) => eprintln!("[graph-rebuild] rebuild failed: e={e}"),
+        }
+    }
+    n
 }
 
 /// Install a clone worker's golden→worker handle reconstruction. Modules are
@@ -1545,6 +1650,72 @@ fn vram_limit() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+/// Debug op trace (`SMOLVM_CUDA_OPTRACE=<path>`): appends one line per traced
+/// memory/launch op with pid + post-translation params + status, so a fork
+/// investigation can see exactly which PROCESS executed which op on which
+/// address. Off (None) unless the env var is set.
+fn optrace_summary(req: &Request) -> Option<String> {
+    static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| std::env::var_os("SMOLVM_CUDA_OPTRACE").map(Into::into))
+        .as_ref()?;
+    Some(match req {
+        Request::MemAlloc { bytes } => format!("MemAlloc bytes={bytes:#x}"),
+        Request::MemFree { dptr } => format!("MemFree dptr={dptr:#x}"),
+        Request::MemcpyHtoD { dptr, data, .. } => {
+            format!("HtoD dptr={dptr:#x} len={:#x}", data.len())
+        }
+        Request::MemcpyDtoH { dptr, bytes, .. } => format!("DtoH dptr={dptr:#x} len={bytes:#x}"),
+        Request::MemcpyShmHtoD { dptr, size, .. } => {
+            format!("ShmHtoD dptr={dptr:#x} len={size:#x}")
+        }
+        Request::MemcpyShmDtoH { dptr, size, .. } => {
+            format!("ShmDtoH dptr={dptr:#x} len={size:#x}")
+        }
+        Request::MemcpyGpaHtoD { dptr, segments, .. } => {
+            let len: u64 = segments.iter().map(|(_, l)| l).sum();
+            format!("GpaHtoD dptr={dptr:#x} len={len:#x}")
+        }
+        Request::MemcpyGpaDtoH { dptr, segments, .. } => {
+            let len: u64 = segments.iter().map(|(_, l)| l).sum();
+            format!("GpaDtoH dptr={dptr:#x} len={len:#x}")
+        }
+        Request::MemcpyDtoD { dst, src, bytes } => {
+            format!("DtoD dst={dst:#x} src={src:#x} len={bytes:#x}")
+        }
+        Request::MemcpyDtoDAsync {
+            dst, src, bytes, ..
+        } => format!("DtoDAsync dst={dst:#x} src={src:#x} len={bytes:#x}"),
+        Request::MemsetD8 { dptr, value, bytes } => {
+            format!("MemsetD8 dptr={dptr:#x} v={value} len={bytes:#x}")
+        }
+        Request::MemsetD8Async {
+            dptr, value, bytes, ..
+        } => format!("MemsetD8Async dptr={dptr:#x} v={value} len={bytes:#x}"),
+        Request::LaunchKernel {
+            function, params, ..
+        } => format!("Launch fn={function:#x} nparams={}", params.len()),
+        Request::GraphLaunch { graph_exec, .. } => format!("GraphLaunch exec={graph_exec:#x}"),
+        Request::MemAddressReserve { size, .. } => format!("VmmReserve size={size:#x}"),
+        Request::MemCreate { size, .. } => format!("VmmCreate size={size:#x}"),
+        Request::MemMap { va, size, handle, .. } => {
+            format!("VmmMap va={va:#x} size={size:#x} h={handle:#x}")
+        }
+        Request::MemSetAccess { va, size, .. } => format!("VmmAccess va={va:#x} size={size:#x}"),
+        Request::MemUnmap { va, size } => format!("VmmUnmap va={va:#x} size={size:#x}"),
+        Request::MemRelease { handle } => format!("VmmRelease h={handle:#x}"),
+        _ => return None,
+    })
+}
+
+fn optrace_write(line: &str, status: i32) {
+    if let Some(p) = std::env::var_os("SMOLVM_CUDA_OPTRACE") {
+        use std::io::Write as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+            let _ = writeln!(f, "pid={} {line} st={status}", std::process::id());
+        }
+    }
+}
+
 fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Response) {
     // P0 transport-viability: count every RPC; optionally inject per-call latency
     // to model network RTT, and periodically log the count vs wall-clock so
@@ -1597,16 +1768,23 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
     }
     fn raw_graph(sess: &Session, h: u64) -> u64 {
         // Virtual graph/exec handle → real; untagged values pass through.
-        if h & VHANDLE_TAG != 0 {
-            sess.graph_vhandles
-                .lock()
-                .unwrap()
-                .get(&h)
-                .copied()
-                .unwrap_or(0)
-        } else {
-            h
+        if h & VHANDLE_TAG == 0 {
+            return h;
         }
+        // M3b (Path 3): a clone worker rebuilds inherited graphs in ITS OWN
+        // context; GRAPH_TRANS holds those worker-local reals. It must win over
+        // the session map, which — via the handoff registry — still carries the
+        // GOLDEN's real handles for the same virtual handle (a foreign-context
+        // exec that silently no-ops or faults if launched here).
+        if let Some(r) = GRAPH_TRANS.with(|m| m.borrow().get(&h).copied()) {
+            return r;
+        }
+        sess.graph_vhandles
+            .lock()
+            .unwrap()
+            .get(&h)
+            .copied()
+            .unwrap_or(0)
     }
     fn raw_event(sess: &Session, event: u64) -> CuResult<u64> {
         // Same raw-on-the-wire convention as streams.
@@ -1619,6 +1797,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
     // unless this is an isolating clone).
     cow_written(sess, b, &req);
     let req = translate_dptrs(&sess.dptr_trans, req);
+    let trace = optrace_summary(&req);
     let r: CuResult<Response> = (|| match req {
         Request::Init {
             proto_hash,
@@ -1936,6 +2115,20 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             exec_template_register(e, real_graph); // for Path 2 clone re-instantiation
             if fork_isolate_enabled() {
                 template_graph_mark(real_graph); // keep it alive for clones
+            }
+            // M3b (Path 3): record the graph in portable form so a clone worker
+            // can rebuild it in its own context (the golden's CUgraph/exec are
+            // context-scoped). Only kernel-node graphs serialize; anything else
+            // returns None and simply isn't recorded (the clone then fails loud
+            // on launch rather than mis-executing an unsupported graph).
+            if path3_enabled() {
+                if let Ok(Some(ser)) = b.graph_introspect(real_graph) {
+                    sess.golden_layout
+                        .lock()
+                        .unwrap()
+                        .graphs
+                        .push((graph, exec_vh, ser));
+                }
             }
             if exec_vh & VHANDLE_TAG != 0 {
                 sess.graph_vhandles.lock().unwrap().insert(exec_vh, e);
@@ -2358,10 +2551,14 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             .mem_get_allocation_granularity(device, flags)
             .map(Response::Bytes),
     })();
-    match r {
+    let (status, resp) = match r {
         Ok(resp) => (0, resp),
         Err(code) => (code, Response::Ok),
+    };
+    if let Some(line) = trace {
+        optrace_write(&line, status);
     }
+    (status, resp)
 }
 
 // ===========================================================================

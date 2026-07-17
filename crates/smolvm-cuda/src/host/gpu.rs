@@ -98,6 +98,24 @@ pub struct GpuBackend {
     graph_destroy: unsafe extern "C" fn(*mut c_void) -> CuResultCode,
     graph_get_nodes:
         unsafe extern "C" fn(*mut c_void, *mut *mut c_void, *mut usize) -> CuResultCode,
+    // M3b: graph rebuild in a fresh context (Path 3) — create + add kernel nodes
+    // + wire dependencies, then instantiate.
+    graph_create: unsafe extern "C" fn(*mut *mut c_void, c_uint) -> CuResultCode,
+    graph_add_kernel_node: unsafe extern "C" fn(
+        *mut *mut c_void,       // out node
+        *mut c_void,            // graph
+        *const *mut c_void,     // deps
+        usize,                  // numDeps
+        *const KernelNodeParams,
+    ) -> CuResultCode,
+    graph_node_get_dependencies:
+        unsafe extern "C" fn(*mut c_void, *mut *mut c_void, *mut usize) -> CuResultCode,
+    graph_add_dependencies: unsafe extern "C" fn(
+        *mut c_void,        // graph
+        *const *mut c_void, // from[]
+        *const *mut c_void, // to[]
+        usize,              // count
+    ) -> CuResultCode,
     // Graph-node introspection + exec node-param setters — used to patch a fork
     // clone's inherited cudagraph so its baked-in device pointers hit the clone's
     // private copies (Path 2 of the fork-isolation design).
@@ -413,6 +431,10 @@ impl GpuBackend {
                 graph_exec_destroy: sym(&lib, b"cuGraphExecDestroy\0")?,
                 graph_destroy: sym(&lib, b"cuGraphDestroy\0")?,
                 graph_get_nodes: sym(&lib, b"cuGraphGetNodes\0")?,
+                graph_create: sym(&lib, b"cuGraphCreate\0")?,
+                graph_add_kernel_node: sym(&lib, b"cuGraphAddKernelNode_v2\0")?,
+                graph_node_get_dependencies: sym(&lib, b"cuGraphNodeGetDependencies\0")?,
+                graph_add_dependencies: sym(&lib, b"cuGraphAddDependencies\0")?,
                 graph_node_get_type: sym(&lib, b"cuGraphNodeGetType\0")?,
                 graph_kernel_node_get_params: sym(&lib, b"cuGraphKernelNodeGetParams_v2\0")?,
                 graph_exec_kernel_node_set_params: sym(
@@ -1262,6 +1284,176 @@ impl Backend for GpuBackend {
             ))?
         };
         Ok(n as u64)
+    }
+    fn graph_introspect(&mut self, graph: u64) -> CuResult<Option<super::GraphSer>> {
+        // Enumerate the golden graph's nodes.
+        let mut count: usize = 0;
+        unsafe {
+            chk((self.graph_get_nodes)(
+                graph as *mut c_void,
+                std::ptr::null_mut(),
+                &mut count,
+            ))?
+        };
+        if count == 0 {
+            // A working captured graph that reports zero nodes is OPAQUE, not
+            // empty — torch.compile(reduce-overhead)'s cudagraph trees hide
+            // their kernels from cuGraphGetNodes. Rebuilding it would produce a
+            // genuinely empty graph whose replay silently returns wrong data
+            // (stale/zero outputs); skipping keeps the inherited exec, which
+            // fails loud in the clone instead.
+            return Ok(None);
+        }
+        let mut nodes: Vec<*mut c_void> = vec![std::ptr::null_mut(); count];
+        unsafe {
+            chk((self.graph_get_nodes)(
+                graph as *mut c_void,
+                nodes.as_mut_ptr(),
+                &mut count,
+            ))?
+        };
+        // Node pointer -> index, for turning dependency edges into indices.
+        let idx: std::collections::HashMap<usize, u32> = nodes
+            .iter()
+            .take(count)
+            .enumerate()
+            .map(|(i, &n)| (n as usize, i as u32))
+            .collect();
+        let mut out = super::GraphSer::default();
+        for &node in nodes.iter().take(count) {
+            let mut ty: c_int = -1;
+            unsafe { chk((self.graph_node_get_type)(node, &mut ty))? };
+            if ty != 0 {
+                // Non-KERNEL node (memcpy/memset/child-graph/event/...). Rebuild
+                // isn't implemented for these yet; bail so the caller keeps the
+                // golden's exec (which fails loud) rather than a wrong graph.
+                return Ok(None);
+            }
+            let mut kp: KernelNodeParams = unsafe { std::mem::zeroed() };
+            unsafe { chk((self.graph_kernel_node_get_params)(node, &mut kp))? };
+            if kp.kernel_params.is_null() {
+                // Args packed via `extra` — opaque, can't serialize. Bail.
+                return Ok(None);
+            }
+            let sizes = self.func_get_param_info(kp.func as u64)?;
+            let mut params: Vec<Vec<u8>> = Vec::with_capacity(sizes.len());
+            for (i, &sz) in sizes.iter().enumerate() {
+                let sz = sz as usize;
+                let argptr = unsafe { *kp.kernel_params.add(i) } as *const u8;
+                if argptr.is_null() || sz == 0 {
+                    params.push(Vec::new());
+                    continue;
+                }
+                let mut v = vec![0u8; sz];
+                unsafe { std::ptr::copy_nonoverlapping(argptr, v.as_mut_ptr(), sz) };
+                params.push(v);
+            }
+            out.nodes.push(super::GraphKernelNode {
+                func: kp.func as u64,
+                grid: [kp.grid_x, kp.grid_y, kp.grid_z],
+                block: [kp.block_x, kp.block_y, kp.block_z],
+                shared_mem: kp.shared_mem_bytes,
+                params,
+            });
+        }
+        // Dependency edges: for each node, its predecessors -> (pred, node).
+        for (&node, to) in nodes.iter().take(count).zip(0u32..) {
+            let mut dn: usize = 0;
+            unsafe {
+                chk((self.graph_node_get_dependencies)(
+                    node,
+                    std::ptr::null_mut(),
+                    &mut dn,
+                ))?
+            };
+            if dn == 0 {
+                continue;
+            }
+            let mut deps: Vec<*mut c_void> = vec![std::ptr::null_mut(); dn];
+            unsafe {
+                chk((self.graph_node_get_dependencies)(
+                    node,
+                    deps.as_mut_ptr(),
+                    &mut dn,
+                ))?
+            };
+            for &d in deps.iter().take(dn) {
+                if let Some(&from) = idx.get(&(d as usize)) {
+                    out.edges.push((from, to));
+                }
+            }
+        }
+        Ok(Some(out))
+    }
+    fn graph_rebuild(
+        &mut self,
+        ser: &super::GraphSer,
+        funcs: &std::collections::HashMap<u64, u64>,
+    ) -> CuResult<u64> {
+        let mut graph: *mut c_void = std::ptr::null_mut();
+        unsafe { chk((self.graph_create)(&mut graph, 0))? };
+        let mut new_nodes: Vec<*mut c_void> = Vec::with_capacity(ser.nodes.len());
+        for n in &ser.nodes {
+            // Keep each arg's bytes alive for the add call; kernel_params points
+            // at them. Addresses are preserved across the fork, so the bytes
+            // (which may embed device pointers) are used verbatim.
+            let bufs = n.params.clone();
+            let mut argp: Vec<*mut c_void> = bufs
+                .iter()
+                .map(|b| {
+                    if b.is_empty() {
+                        std::ptr::null_mut()
+                    } else {
+                        b.as_ptr() as *mut c_void
+                    }
+                })
+                .collect();
+            let func = funcs.get(&n.func).copied().unwrap_or(n.func);
+            let kp = KernelNodeParams {
+                func: func as *mut c_void,
+                grid_x: n.grid[0],
+                grid_y: n.grid[1],
+                grid_z: n.grid[2],
+                block_x: n.block[0],
+                block_y: n.block[1],
+                block_z: n.block[2],
+                shared_mem_bytes: n.shared_mem,
+                kernel_params: if argp.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    argp.as_mut_ptr()
+                },
+                extra: std::ptr::null_mut(),
+                kern: std::ptr::null_mut(),
+                ctx: std::ptr::null_mut(),
+            };
+            let mut node: *mut c_void = std::ptr::null_mut();
+            unsafe {
+                chk((self.graph_add_kernel_node)(
+                    &mut node,
+                    graph,
+                    std::ptr::null(),
+                    0,
+                    &kp,
+                ))?
+            };
+            new_nodes.push(node);
+        }
+        if !ser.edges.is_empty() {
+            let from: Vec<*mut c_void> =
+                ser.edges.iter().map(|&(f, _)| new_nodes[f as usize]).collect();
+            let to: Vec<*mut c_void> =
+                ser.edges.iter().map(|&(_, t)| new_nodes[t as usize]).collect();
+            unsafe {
+                chk((self.graph_add_dependencies)(
+                    graph,
+                    from.as_ptr(),
+                    to.as_ptr(),
+                    from.len(),
+                ))?
+            };
+        }
+        Ok(graph as u64)
     }
     fn memset_d8_async(&mut self, dptr: u64, value: u8, bytes: u64, stream: u64) -> CuResult<()> {
         unsafe {

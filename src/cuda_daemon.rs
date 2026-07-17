@@ -281,21 +281,29 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
     // + recreate streams/events, then install the translation so the clone's
     // inherited kernel launches resolve (each module reloads on first use).
     if let Ok(modpath) = std::env::var("SMOLVM_CUDA_CLONE_MODULES") {
-        let (mod_images, func_meta, streams, events) =
+        let (mod_images, func_meta, streams, events, graphs) =
             reconstruct_golden_modules(backend.as_mut(), &modpath);
-        let (nm, nf, ns, ne) = (
+        let (nm, nf, ns, ne, ng) = (
             mod_images.len(),
             func_meta.len(),
             streams.len(),
             events.len(),
+            graphs.len(),
         );
         smolvm_cuda::host::set_handle_trans(mod_images, func_meta, streams, events);
+        // M3b: rebuild the golden's captured CUDA graphs in THIS context, now
+        // that modules can lazily reload and memory is reconstructed (kernel-arg
+        // pointers reference the golden VAs, valid here). Maps the clone's
+        // inherited graph/exec handles to the worker's rebuilt reals.
+        let nrebuilt = smolvm_cuda::host::rebuild_clone_graphs(backend.as_mut(), graphs);
         let _ = std::fs::remove_file(&modpath);
         tracing::info!(
             modules = nm,
             functions = nf,
             streams = ns,
             events = ne,
+            graphs = ng,
+            graphs_rebuilt = nrebuilt,
             "cuda clone-worker: staged modules for lazy reload + remapped handles"
         );
     }
@@ -512,19 +520,21 @@ fn reconstruct_golden_modules(
     Vec<(u64, u64, String)>,
     Vec<(u64, u64)>,
     Vec<(u64, u64)>,
+    Vec<(u64, u64, smolvm_cuda::host::GraphSer)>,
 ) {
     let mut mod_images = Vec::new();
     let mut func_meta = Vec::new();
     let mut stream_trans = Vec::new();
     let mut event_trans = Vec::new();
+    let mut graphs: Vec<(u64, u64, smolvm_cuda::host::GraphSer)> = Vec::new();
     let Ok(buf) = std::fs::read(path) else {
-        return (mod_images, func_meta, stream_trans, event_trans);
+        return (mod_images, func_meta, stream_trans, event_trans, graphs);
     };
     let mut p = 0usize;
     macro_rules! need {
         ($n:expr) => {
             if p + $n > buf.len() {
-                return (mod_images, func_meta, stream_trans, event_trans);
+                return (mod_images, func_meta, stream_trans, event_trans, graphs);
             }
         };
     }
@@ -584,16 +594,58 @@ fn reconstruct_golden_modules(
             Err(e) => tracing::warn!(e, "M3a: event recreate failed"),
         }
     }
+    // M3b: parse captured graphs (rebuilt later, after set_handle_trans). Absent
+    // in older blobs → the `p < buf.len()` guard leaves `graphs` empty.
+    if p < buf.len() {
+        let ngraphs = ru32!();
+        for _ in 0..ngraphs {
+            let graph_vh = ru64!();
+            let exec_vh = ru64!();
+            let nnodes = ru32!();
+            let mut nodes = Vec::with_capacity(nnodes as usize);
+            for _ in 0..nnodes {
+                let func = ru64!();
+                let mut d = [0u32; 7];
+                for v in d.iter_mut() {
+                    *v = ru32!();
+                }
+                let nparams = ru32!();
+                let mut params = Vec::with_capacity(nparams as usize);
+                for _ in 0..nparams {
+                    let plen = ru32!() as usize;
+                    need!(plen);
+                    params.push(buf[p..p + plen].to_vec());
+                    p += plen;
+                }
+                nodes.push(smolvm_cuda::host::GraphKernelNode {
+                    func,
+                    grid: [d[0], d[1], d[2]],
+                    block: [d[3], d[4], d[5]],
+                    shared_mem: d[6],
+                    params,
+                });
+            }
+            let nedges = ru32!();
+            let mut edges = Vec::with_capacity(nedges as usize);
+            for _ in 0..nedges {
+                let f = ru32!();
+                let t = ru32!();
+                edges.push((f, t));
+            }
+            graphs.push((graph_vh, exec_vh, smolvm_cuda::host::GraphSer { nodes, edges }));
+        }
+    }
     tracing::info!(
         nmods,
         nfuncs,
         nstreams,
         nevents,
+        ngraphs = graphs.len(),
         streams = stream_trans.len(),
         events = event_trans.len(),
         "M3a: staged golden modules/functions for lazy reload + recreated streams/events"
     );
-    (mod_images, func_meta, stream_trans, event_trans)
+    (mod_images, func_meta, stream_trans, event_trans, graphs)
 }
 
 /// Path 3 (M1): peek a just-accepted connection's first message; true iff it's an
@@ -722,7 +774,7 @@ fn spawn_clone_worker(conn_fd: std::os::unix::io::RawFd, token: u64) -> io::Resu
     // M3a: serialize the golden's modules (images) + functions to a temp file for
     // the worker to reload + remap. Images are MB-scale, so a file, not env.
     let mut modpath: Option<String> = None;
-    if let Some((modules, funcs, streams, events)) =
+    if let Some((modules, funcs, streams, events, graphs)) =
         smolvm_cuda::host::module_handoff_snapshot(token)
     {
         tracing::info!(
@@ -730,6 +782,7 @@ fn spawn_clone_worker(conn_fd: std::os::unix::io::RawFd, token: u64) -> io::Resu
             funcs = funcs.len(),
             streams = streams.len(),
             events = events.len(),
+            graphs = graphs.len(),
             "M3a: gathered golden modules/functions/streams/events"
         );
         let mut blob = Vec::new();
@@ -756,6 +809,33 @@ fn spawn_clone_worker(conn_fd: std::os::unix::io::RawFd, token: u64) -> io::Resu
         for (h, flags) in &events {
             blob.extend_from_slice(&h.to_le_bytes());
             blob.extend_from_slice(&flags.to_le_bytes());
+        }
+        // M3b: captured graphs. Per graph: [u64 graph_vh][u64 exec_vh]
+        //   [u32 nnodes]([u64 func][u32*3 grid][u32*3 block][u32 shmem]
+        //                [u32 nparams]([u32 len][bytes])* )*
+        //   [u32 nedges]([u32 from][u32 to])*
+        blob.extend_from_slice(&(graphs.len() as u32).to_le_bytes());
+        for (graph_vh, exec_vh, g) in &graphs {
+            blob.extend_from_slice(&graph_vh.to_le_bytes());
+            blob.extend_from_slice(&exec_vh.to_le_bytes());
+            blob.extend_from_slice(&(g.nodes.len() as u32).to_le_bytes());
+            for nd in &g.nodes {
+                blob.extend_from_slice(&nd.func.to_le_bytes());
+                for x in nd.grid.iter().chain(nd.block.iter()) {
+                    blob.extend_from_slice(&x.to_le_bytes());
+                }
+                blob.extend_from_slice(&nd.shared_mem.to_le_bytes());
+                blob.extend_from_slice(&(nd.params.len() as u32).to_le_bytes());
+                for p in &nd.params {
+                    blob.extend_from_slice(&(p.len() as u32).to_le_bytes());
+                    blob.extend_from_slice(p);
+                }
+            }
+            blob.extend_from_slice(&(g.edges.len() as u32).to_le_bytes());
+            for &(f, t) in &g.edges {
+                blob.extend_from_slice(&f.to_le_bytes());
+                blob.extend_from_slice(&t.to_le_bytes());
+            }
         }
         let _ = std::fs::create_dir_all("/tmp/smolvm");
         // Unique per SPAWN, not per (token, conn_fd): fd numbers are reused as
