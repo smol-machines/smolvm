@@ -230,12 +230,17 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
     // Our own primary context (separate process ⇒ own UVA), so we can place memory
     // at the golden's exact VAs.
     let _ = backend.init();
-    let _ = backend.primary_ctx_retain(0);
+    // Reconstruct on the GOLDEN's GPU: the exported physical lives there.
+    let clone_dev: i32 = std::env::var("SMOLVM_CUDA_CLONE_DEVICE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let _ = backend.primary_ctx_retain(clone_dev);
     // M2: reconstruct the golden's memory at its exact VAs from the layout the
     // daemon passed (SMOLVM_CUDA_CLONE_LAYOUT) + the golden's physical exported to
     // fds 4.. — BEFORE serving, so the clone's inherited pointers are valid verbatim.
     if let Ok(layout) = std::env::var("SMOLVM_CUDA_CLONE_LAYOUT") {
-        let (n, vmm_trans) = reconstruct_golden_memory(backend.as_mut(), &layout);
+        let (n, vmm_trans) = reconstruct_golden_memory(backend.as_mut(), &layout, clone_dev);
         tracing::info!(
             maps = n,
             vmm_handles = vmm_trans.len(),
@@ -355,6 +360,7 @@ fn import_with_retry(b: &mut dyn Backend, fd: i32) -> Result<u64, i32> {
 fn reconstruct_golden_memory(
     b: &mut dyn Backend,
     layout: &str,
+    device: i32,
 ) -> (usize, std::collections::HashMap<u64, u64>) {
     let mut vmm_trans = std::collections::HashMap::new();
     let (mut resv_s, mut maps_s) = ("", "");
@@ -404,7 +410,7 @@ fn reconstruct_golden_memory(
             let mut ok = false;
             if let Ok(gh) = import_with_retry(b, 4 + idx) {
                 if b.mem_map(va, size, 0, gh).is_ok() {
-                    if b.mem_set_access(va, size, 0).is_ok() {
+                    if b.mem_set_access(va, size, device).is_ok() {
                         ok = true;
                     } else {
                         let _ = b.mem_unmap(va, size); // roll back for the fallback
@@ -435,7 +441,7 @@ fn reconstruct_golden_memory(
         // VA, then copy the golden's bytes in via a temp mapping of the imported
         // physical. Reads see the golden's data; writes hit the clone's own copy,
         // so a clone can't corrupt the frozen golden.
-        let priv_h = match b.mem_create(size, 0) {
+        let priv_h = match b.mem_create(size, device) {
             Ok(h) => h,
             Err(e) => {
                 tracing::warn!(e, "M2: private create failed");
@@ -451,7 +457,7 @@ fn reconstruct_golden_memory(
         if let Some(g) = golden_h {
             vmm_trans.insert(g, priv_h);
         }
-        if let Err(e) = b.mem_set_access(va, size, 0) {
+        if let Err(e) = b.mem_set_access(va, size, device) {
             tracing::warn!(e, va, "M2: private set_access failed");
         }
         match import_with_retry(b, 4 + idx) {
@@ -459,7 +465,7 @@ fn reconstruct_golden_memory(
                 if let Ok(tmp) = b.mem_address_reserve(size, 0) {
                     match b.mem_map(tmp, size, 0, gh) {
                         Ok(()) => {
-                            if let Err(e) = b.mem_set_access(tmp, size, 0) {
+                            if let Err(e) = b.mem_set_access(tmp, size, device) {
                                 tracing::warn!(e, "M2: temp set_access failed");
                             }
                             if let Err(e) = b.memcpy_dtod(va, tmp, size) {
@@ -865,7 +871,7 @@ fn verify_chunk_content(b: &mut dyn Backend, ch: &smolvm_cuda::host::HandoffChun
 fn spawn_clone_worker(conn_fd: std::os::unix::io::RawFd, token: u64) -> io::Result<u32> {
     use std::os::unix::process::CommandExt;
     // Gather the golden's VMM layout (reservations + maps→physical handle).
-    let (resvs, maps) = smolvm_cuda::host::layout_handoff_snapshot(token)
+    let (resvs, maps, golden_dev) = smolvm_cuda::host::layout_handoff_snapshot(token)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no golden layout for token"))?;
     // Export each map's physical to a POSIX fd (in the golden's shared context) and
     // build the layout string the worker parses
@@ -878,7 +884,7 @@ fn spawn_clone_worker(conn_fd: std::os::unix::io::RawFd, token: u64) -> io::Resu
         .init()
         .map_err(|e| io::Error::other(format!("worker-export init: {e}")))?;
     backend
-        .primary_ctx_retain(0)
+        .primary_ctx_retain(golden_dev)
         .map_err(|e| io::Error::other(format!("ctx retain: {e}")))?;
     // Commit the golden's pending device work so its writes are visible in the
     // physical the clone will IPC-import (the golden runs on another thread of the
@@ -1009,6 +1015,7 @@ fn spawn_clone_worker(conn_fd: std::os::unix::io::RawFd, token: u64) -> io::Resu
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("_cuda-clone-worker").arg("3");
     cmd.env("SMOLVM_CUDA_CLONE_LAYOUT", layout);
+    cmd.env("SMOLVM_CUDA_CLONE_DEVICE", golden_dev.to_string());
     if let Some(mp) = &modpath {
         cmd.env("SMOLVM_CUDA_CLONE_MODULES", mp);
     }

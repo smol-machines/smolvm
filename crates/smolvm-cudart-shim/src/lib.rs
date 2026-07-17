@@ -468,6 +468,14 @@ fn bring_up_client(resume_token: u64) -> Result<(Client<Stream>, u64, i32), c_in
         }
         CUDA_ERROR_INITIALIZATION
     })?;
+    // Per-machine GPU pin: guest device 0 maps to host device N and the guest
+    // sees exactly one device. Sent before any device query or ctx retain.
+    if let Some(d) = std::env::var("SMOLVM_CUDA_DEVICE")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+    {
+        let _ = client.set_device_base(d);
+    }
     if trace {
         eprintln!("[shim] bring_up: init ok token={token}");
     }

@@ -135,6 +135,9 @@ pub enum Op {
     /// allocation burst (model load) pipelines create/map/setAccess with no
     /// per-chunk round trip.
     MemCreateVh = 0xE8,
+    /// Pin this session to a host GPU: guest device 0 maps to host device N
+    /// and the guest sees exactly one device (CUDA_VISIBLE_DEVICES-style).
+    SetDeviceBase = 0xE9,
 }
 
 impl Op {
@@ -203,6 +206,7 @@ impl Op {
             0xE0 => Op::MemAddressReserve,
             0xE1 => Op::MemCreate,
             0xE8 => Op::MemCreateVh,
+            0xE9 => Op::SetDeviceBase,
             0xE2 => Op::MemMap,
             0xE3 => Op::MemSetAccess,
             0xE4 => Op::MemUnmap,
@@ -536,6 +540,10 @@ pub enum Request {
         size: u64,
         device: i32,
         handle_vh: u64,
+    },
+    /// Pin the session's device mapping (see [`Op::SetDeviceBase`]).
+    SetDeviceBase {
+        device: i32,
     },
     /// VMM: back `va` with `handle` at `offset`.
     MemMap {
@@ -1132,6 +1140,10 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
             w_i32(&mut b, *device);
             w_u64(&mut b, *handle_vh);
         }
+        Request::SetDeviceBase { device } => {
+            w_u8(&mut b, Op::SetDeviceBase as u8);
+            w_i32(&mut b, *device);
+        }
         Request::MemMap {
             va,
             size,
@@ -1422,6 +1434,7 @@ pub fn decode_request(payload: &[u8]) -> io::Result<Request> {
             device: c.i32()?,
             handle_vh: c.u64()?,
         },
+        Op::SetDeviceBase => Request::SetDeviceBase { device: c.i32()? },
         Op::MemMap => Request::MemMap {
             va: c.u64()?,
             size: c.u64()?,
@@ -1556,7 +1569,8 @@ pub fn decode_response(op: Op, payload: &[u8]) -> io::Result<(i32, Response)> {
         | Op::MemUnmap
         | Op::MemRelease
         | Op::MemAddressFree
-        | Op::MemCreateVh => Response::Ok,
+        | Op::MemCreateVh
+        | Op::SetDeviceBase => Response::Ok,
         Op::MemAddressReserve => Response::Dptr(c.u64()?),
         Op::MemCreate => Response::Handle(c.u64()?),
         Op::MemGetAllocationGranularity => Response::Bytes(c.u64()?),
