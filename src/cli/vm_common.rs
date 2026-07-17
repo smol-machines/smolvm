@@ -462,6 +462,9 @@ pub struct CreateVmParams {
     /// Enable waypipe Wayland forwarding over vsock (guest GUI apps on the host
     /// compositor).
     pub waypipe: bool,
+    /// Which `waypipe` binary the guest daemon runs: `None`/`"host"` shares the
+    /// host binary, `"container"` uses the image's own, or an absolute path.
+    pub waypipe_bin: Option<String>,
     /// Bridge the guest X11 socket straight to the host X server over vsock.
     pub x11: bool,
     /// Enable GPU acceleration (virtio-gpu with Venus/Vulkan).
@@ -705,6 +708,7 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
     record.cuda_vram_limit_mib = params.cuda_vram_limit_mib;
     record.docker_socket = params.docker_socket;
     record.waypipe = params.waypipe;
+    record.waypipe_bin = params.waypipe_bin.clone();
     record.x11 = params.x11;
     record.dns_filter_hosts = params.dns_filter_hosts.clone();
     record.published_sockets = params.published_sockets.clone();
@@ -1435,6 +1439,7 @@ fn start_vm_named_with_db(
         expose_docker: record.docker_socket,
         published_sockets: record.published_sockets.clone(),
         waypipe: record.waypipe,
+        waypipe_bin: record.waypipe_bin.clone(),
         x11: record.x11,
         dns_filter_hosts: record.dns_filter_hosts.clone(),
         // A fork clone shares its golden's uid; resolve it explicitly so a
@@ -1707,6 +1712,7 @@ pub fn persist_named_running(
                 r.cuda = o.cuda;
                 r.docker_socket = o.docker_socket;
                 r.waypipe = o.waypipe;
+                r.waypipe_bin = o.waypipe_bin.clone();
                 r.x11 = o.x11;
                 r.dns_filter_hosts = o.dns_filter_hosts.clone();
                 r.gpu = if o.gpu { Some(true) } else { None };
@@ -1750,6 +1756,8 @@ pub struct DefaultVmOverrides {
     pub docker_socket: bool,
     /// Enable waypipe Wayland forwarding over vsock.
     pub waypipe: bool,
+    /// Which `waypipe` binary the guest daemon runs (see [`CreateVmParams`]).
+    pub waypipe_bin: Option<String>,
     /// Bridge the guest X11 socket straight to the host X server over vsock.
     pub x11: bool,
     pub dns_filter_hosts: Option<Vec<String>>,

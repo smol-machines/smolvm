@@ -117,11 +117,17 @@ impl VsockService for CudaService {
     }
 }
 
-/// Waypipe Wayland forwarding: the guest runs `waypipe server --vsock` and
-/// connects out to the host, where a `waypipe client` (plain unix mode) listens
-/// on the bridged socket next to the host compositor. Outbound like CUDA/DNS, so
-/// `listen: false`. The guest side needs no env signal — the user starts
-/// `waypipe server` explicitly per app — so `guest_env` is empty.
+/// Waypipe Wayland forwarding: the guest runs `waypipe server` in daemon mode
+/// and connects out to the host, where a `waypipe client` (plain unix mode)
+/// listens on the bridged socket next to the host compositor. Outbound like
+/// CUDA/DNS, so `listen: false`.
+///
+/// The guest agent is told to start its daemon via `SMOLVM_WAYPIPE=1`: it runs
+/// `waypipe server` with `--display`, which creates a Wayland display socket in
+/// the guest and forwards every client that connects (one daemon for all apps),
+/// and exports `WAYLAND_DISPLAY` for the workload — so guest GUI apps work with
+/// no manual per-app `waypipe server`. The daemon starts lazily because waypipe
+/// is usually installed in the guest after boot.
 struct WaypipeService;
 impl VsockService for WaypipeService {
     fn resolve<'a>(&self, inputs: &VsockServiceInputs<'a>) -> Option<ActiveVsockService<'a>> {
@@ -130,7 +136,10 @@ impl VsockService for WaypipeService {
             port: ports::WAYPIPE,
             listen: false,
             socket,
-            guest_env: &[],
+            guest_env: &[(
+                smolvm_protocol::guest_env::WAYPIPE,
+                smolvm_protocol::guest_env::VALUE_ON,
+            )],
         })
     }
 }
