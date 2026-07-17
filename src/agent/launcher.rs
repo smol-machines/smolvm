@@ -238,6 +238,17 @@ pub struct LaunchFeatures {
     pub uid_share_dir: Option<std::path::PathBuf>,
 }
 
+/// Whether a shared-pack-store `layers/` dir actually holds image layers — i.e.
+/// contains at least one subdirectory (a digest layer dir). A shared entry whose
+/// dir survives but whose `layers/` is missing or holds no layer dirs would boot
+/// an empty `/packed_layers` and make the guest fail "no layer directories
+/// found"; this drives the self-heal re-extract in `with_packed_layers`.
+fn shared_layers_populated(layers: &Path) -> bool {
+    std::fs::read_dir(layers)
+        .map(|rd| rd.flatten().any(|e| e.path().is_dir()))
+        .unwrap_or(false)
+}
+
 impl LaunchFeatures {
     /// Fold an image's own registry into the enforced DNS egress filter so a
     /// scoped machine's in-guest base-image pull isn't blocked by its own
@@ -325,6 +336,40 @@ impl LaunchFeatures {
         // container `/` and running the agent rootfs instead of the real image.
         if let Some(shared) = super::read_shared_pack_pointer(layers_cache_dir) {
             let layers = shared.join("layers");
+            // Self-heal: the shared entry's dir survived but its `layers/` holds
+            // no layer subdirs (a partial extraction, or an older binary that
+            // size-evicted the shared store's contents out from under this VM).
+            // Booting over that mounts an empty `/packed_layers` and the guest
+            // fails "no layer directories found in /packed_layers" (exit 255 on
+            // connect/exec). Re-extract the pack into the shared store from the
+            // sidecar first — idempotent + flock-serialized (a healthy entry is a
+            // cheap no-op via the `.smolvm-extracted` marker). Best-effort: if the
+            // sidecar is gone we proceed and surface the original error rather than
+            // masking it.
+            if !shared_layers_populated(&layers) {
+                let sidecar = Path::new(sidecar_path);
+                if sidecar.exists() {
+                    if let Ok(footer) = smolvm_pack::packer::read_footer_from_sidecar(sidecar) {
+                        if let Err(e) = smolvm_pack::extract::extract_sidecar_shared(
+                            sidecar,
+                            &super::shared_pack_cache_root(),
+                            &footer,
+                            false,
+                        ) {
+                            tracing::warn!(
+                                error = %e,
+                                shared = %shared.display(),
+                                "shared pack re-extract (self-heal) failed"
+                            );
+                        } else {
+                            tracing::info!(
+                                shared = %shared.display(),
+                                "re-extracted evicted shared pack before launch"
+                            );
+                        }
+                    }
+                }
+            }
             self.packed_layers_dir = Some(layers_cache_dir.to_path_buf());
             self.pack_idmap_source = Some(if layers.is_dir() { layers } else { shared });
             return Ok(self);

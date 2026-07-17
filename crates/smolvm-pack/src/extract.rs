@@ -847,6 +847,30 @@ pub fn extract_sidecar(
     force: bool,
     debug: bool,
 ) -> std::io::Result<()> {
+    // Private per-machine caches are LRU-capped after extraction; the shared
+    // store opts out (see `extract_sidecar_capped`).
+    extract_sidecar_capped(sidecar_path, cache_dir, footer, force, debug, true)
+}
+
+/// Core of [`extract_sidecar`]. `cap_cache` runs the LRU size-cap on
+/// `cache_dir.parent()` after a successful extraction.
+///
+/// It MUST be `false` for the node-shared store (`_shared`): those entries are
+/// reference-shared across many VMs via `.pack-shared` pointers and hold NO
+/// per-VM lease, so capping the shared root would LRU-evict a pack still mounted
+/// by live pool VMs — their `/packed_layers` then reads empty and the guest
+/// fails with "no layer directories found in /packed_layers" (exit 255 on
+/// connect/exec). Only the private per-machine cache (`smolvm-pack/<checksum>`),
+/// whose running entries DO hold leases, is safe to cap. See
+/// `extract_sidecar_shared`, which passes `false`.
+fn extract_sidecar_capped(
+    sidecar_path: &Path,
+    cache_dir: &Path,
+    footer: &PackFooter,
+    force: bool,
+    debug: bool,
+    cap_cache: bool,
+) -> std::io::Result<()> {
     if !sidecar_path.exists() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -903,7 +927,7 @@ pub fn extract_sidecar(
     // handles cache hits), cap the cache so old, unused extractions don't grow
     // without bound. LRU + lease-aware: keeps the newest (incl. what we just
     // wrote) and never evicts a running pack.
-    if result.is_ok() {
+    if result.is_ok() && cap_cache {
         if let Some(root) = cache_dir.parent() {
             // Protect the directory we just extracted: the caller has not yet
             // acquired its layers lease, so without this the eviction can delete
@@ -966,7 +990,11 @@ pub fn extract_sidecar_shared(
     debug: bool,
 ) -> std::io::Result<PathBuf> {
     let shared_dir = shared_pack_dir(shared_root, footer.checksum);
-    extract_sidecar(sidecar_path, &shared_dir, footer, false, debug)?;
+    // cap_cache=false: NEVER LRU-evict the shared store. Its entries are
+    // reference-shared across every VM via `.pack-shared` pointers and take no
+    // per-VM lease, so an oldest-first size-cap here would delete a pack still
+    // mounted by live pool VMs. See `extract_sidecar_capped`.
+    extract_sidecar_capped(sidecar_path, &shared_dir, footer, false, debug, false)?;
     // Lock down the store so a dropped per-VM uid can't read the shared copy
     // directly (it must go through its idmapped mount). Best-effort: traversal
     // by root (the VMM before it drops privileges) is unaffected by 0700.
