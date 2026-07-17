@@ -911,7 +911,7 @@ fn spawn_clone_worker(conn_fd: std::os::unix::io::RawFd, token: u64) -> io::Resu
             let ld = u8::from(safe);
             layout.push_str(&format!(
                 "{:x}:{:x}:{}:{}:{:x},",
-                ch.va, ch.size, idx, ld, ch.handle
+                ch.va, ch.size, idx, ld, ch.ghandle
             ));
         }
     }
