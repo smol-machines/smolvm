@@ -466,6 +466,14 @@ pub struct CreateMachineRequest {
     /// Enable CUDA remoting (host NVIDIA GPU via the bundled shims).
     #[serde(default)]
     pub cuda: bool,
+    /// Workload entrypoint. With `cmd`, overrides the image's (or the
+    /// `.smolmachine` artifact's) own entrypoint+cmd, matching the CLI's
+    /// `machine create -- <command>` precedence. Empty = use the image's.
+    #[serde(default)]
+    pub entrypoint: Vec<String>,
+    /// Workload command run when the machine starts (see `entrypoint`).
+    #[serde(default)]
+    pub cmd: Vec<String>,
     /// Expose the guest's Docker daemon socket to the host as a Unix socket in
     /// the VM data dir, so a host client can drive it with `DOCKER_HOST=unix://…`.
     /// Off by default.

@@ -468,11 +468,18 @@ pub async fn create_machine(
         } else {
             Some(manifest.image)
         };
+        // CLI-parity precedence: a request-supplied workload overrides the
+        // artifact's baked (entrypoint, cmd).
+        let (ep, cmd) = if req.entrypoint.is_empty() && req.cmd.is_empty() {
+            (manifest.entrypoint, manifest.cmd)
+        } else {
+            (req.entrypoint.clone(), req.cmd.clone())
+        };
         (
             image,
             Some(canonical),
-            manifest.entrypoint,
-            manifest.cmd,
+            ep,
+            cmd,
             env_parsed,
             manifest.workdir,
             manifest.cpus,
@@ -485,8 +492,8 @@ pub async fn create_machine(
         (
             req.image.clone(),
             None,
-            vec![],
-            vec![],
+            req.entrypoint.clone(),
+            req.cmd.clone(),
             vec![],
             None,
             crate::data::resources::DEFAULT_MICROVM_CPU_COUNT,
