@@ -388,6 +388,35 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
     ))]
     match std::env::var("SMOLVM_SECCOMP").as_deref() {
         Ok("enforce") => {
+            // CUDA + enforce: the shared CUDA daemon is spawned (fork+exec) on
+            // first use, but exec is — rightly — not in the sandbox allowlist,
+            // so a CUDA boot was SIGSYS-killed the moment cuda_host started.
+            // Ensure the daemon BEFORE the filter goes on; the confined VMM
+            // then only ever connect()s to its socket. Fail loud if it can't
+            // start: an enforced CUDA boot without it would die anyway, later
+            // and less legibly.
+            #[cfg(unix)]
+            if config.cuda
+                && std::env::var_os("SMOLVM_CUDA_DAEMON").is_none()
+                && std::env::var_os("SMOLVM_CUDA_SOCK").is_none()
+            {
+                match smolvm::cuda_daemon::ensure_running() {
+                    Ok(sock) => {
+                        // Single-threaded here (the filter install below relies
+                        // on the same invariant), so set_var is race-free.
+                        std::env::set_var("SMOLVM_CUDA_DAEMON", &sock);
+                        tracing::info!(socket = %sock.display(),
+                            "CUDA daemon pre-started for the sandboxed boot");
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[seccomp] CUDA daemon pre-start failed ({e}); refusing to boot a \
+                             CUDA machine that would be SIGSYS-killed under enforce"
+                        );
+                        smolvm::process::exit_child(1);
+                    }
+                }
+            }
             if let Err(e) = smolvm::process::install_seccomp_filter(true) {
                 eprintln!("[seccomp] enforce install failed, refusing to boot unconfined: {e}");
                 smolvm::process::exit_child(1);

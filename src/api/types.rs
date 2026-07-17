@@ -92,6 +92,10 @@ pub struct ResourceSpec {
     /// Enable GPU acceleration (Vulkan via virtio-gpu).
     #[serde(default)]
     pub gpu: Option<bool>,
+    /// Enable CUDA remoting (the guest sees the host NVIDIA GPU through the
+    /// bundled shims). Required on a golden that fork clones will train on.
+    #[serde(default)]
+    pub cuda: Option<bool>,
     /// Storage disk size in GiB (default: 20).
     #[serde(default)]
     #[schema(example = 20)]
@@ -459,6 +463,9 @@ pub struct CreateMachineRequest {
     /// Enable GPU acceleration (Vulkan via virtio-gpu).
     #[serde(default)]
     pub gpu: bool,
+    /// Enable CUDA remoting (host NVIDIA GPU via the bundled shims).
+    #[serde(default)]
+    pub cuda: bool,
     /// Expose the guest's Docker daemon socket to the host as a Unix socket in
     /// the VM data dir, so a host client can drive it with `DOCKER_HOST=unix://…`.
     /// Off by default.
