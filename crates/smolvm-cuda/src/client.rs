@@ -676,7 +676,8 @@ impl<S: Read + Write> Client<S> {
         self.flush_wbuf()?;
         write_msg(&mut self.stream, payload)?;
         rtt_tax();
-        let p = read_msg(&mut self.stream)?.ok_or(CudaRpcError::Protocol("host closed mid-call"))?;
+        let p =
+            read_msg(&mut self.stream)?.ok_or(CudaRpcError::Protocol("host closed mid-call"))?;
         self.journal.clear(); // response received → all prior consumed
         Ok(p)
     }

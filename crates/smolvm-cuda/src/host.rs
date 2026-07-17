@@ -155,11 +155,7 @@ pub trait Backend: Send {
     /// M3b: rebuild `ser` as a NEW CUDA graph in THIS context, mapping every
     /// node's golden `func` handle through `funcs` (golden CUfunction → this
     /// context's reloaded function). Returns the new `cudaGraph_t`.
-    fn graph_rebuild(
-        &mut self,
-        _ser: &GraphSer,
-        _funcs: &HashMap<u64, u64>,
-    ) -> CuResult<u64> {
+    fn graph_rebuild(&mut self, _ser: &GraphSer, _funcs: &HashMap<u64, u64>) -> CuResult<u64> {
         Err(CUDA_ERROR_NOT_SUPPORTED)
     }
     /// Stream-ordered memset (capture-safe; the sync form would invalidate an
@@ -1697,7 +1693,9 @@ fn optrace_summary(req: &Request) -> Option<String> {
         Request::GraphLaunch { graph_exec, .. } => format!("GraphLaunch exec={graph_exec:#x}"),
         Request::MemAddressReserve { size, .. } => format!("VmmReserve size={size:#x}"),
         Request::MemCreate { size, .. } => format!("VmmCreate size={size:#x}"),
-        Request::MemMap { va, size, handle, .. } => {
+        Request::MemMap {
+            va, size, handle, ..
+        } => {
             format!("VmmMap va={va:#x} size={size:#x} h={handle:#x}")
         }
         Request::MemSetAccess { va, size, .. } => format!("VmmAccess va={va:#x} size={size:#x}"),
@@ -1710,7 +1708,11 @@ fn optrace_summary(req: &Request) -> Option<String> {
 fn optrace_write(line: &str, status: i32) {
     if let Some(p) = std::env::var_os("SMOLVM_CUDA_OPTRACE") {
         use std::io::Write as _;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(p)
+        {
             let _ = writeln!(f, "pid={} {line} st={status}", std::process::id());
         }
     }

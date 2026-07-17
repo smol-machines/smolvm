@@ -102,10 +102,10 @@ pub struct GpuBackend {
     // + wire dependencies, then instantiate.
     graph_create: unsafe extern "C" fn(*mut *mut c_void, c_uint) -> CuResultCode,
     graph_add_kernel_node: unsafe extern "C" fn(
-        *mut *mut c_void,       // out node
-        *mut c_void,            // graph
-        *const *mut c_void,     // deps
-        usize,                  // numDeps
+        *mut *mut c_void,   // out node
+        *mut c_void,        // graph
+        *const *mut c_void, // deps
+        usize,              // numDeps
         *const KernelNodeParams,
     ) -> CuResultCode,
     graph_node_get_dependencies:
@@ -1440,10 +1440,16 @@ impl Backend for GpuBackend {
             new_nodes.push(node);
         }
         if !ser.edges.is_empty() {
-            let from: Vec<*mut c_void> =
-                ser.edges.iter().map(|&(f, _)| new_nodes[f as usize]).collect();
-            let to: Vec<*mut c_void> =
-                ser.edges.iter().map(|&(_, t)| new_nodes[t as usize]).collect();
+            let from: Vec<*mut c_void> = ser
+                .edges
+                .iter()
+                .map(|&(f, _)| new_nodes[f as usize])
+                .collect();
+            let to: Vec<*mut c_void> = ser
+                .edges
+                .iter()
+                .map(|&(_, t)| new_nodes[t as usize])
+                .collect();
             unsafe {
                 chk((self.graph_add_dependencies)(
                     graph,

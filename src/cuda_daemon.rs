@@ -632,7 +632,11 @@ fn reconstruct_golden_modules(
                 let t = ru32!();
                 edges.push((f, t));
             }
-            graphs.push((graph_vh, exec_vh, smolvm_cuda::host::GraphSer { nodes, edges }));
+            graphs.push((
+                graph_vh,
+                exec_vh,
+                smolvm_cuda::host::GraphSer { nodes, edges },
+            ));
         }
     }
     tracing::info!(
