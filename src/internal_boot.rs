@@ -850,6 +850,16 @@ fn run_inner(config_path: PathBuf, token: Option<String>) -> crate::Result<()> {
         None
     };
 
+    // Waypipe host client: when forwarding is enabled, start a `waypipe client`
+    // on the host that listens on `waypipe.sock` and forwards to the host
+    // compositor, so the user does not run it by hand. Held for the VM's
+    // lifetime (dropped when this process exits); `spawn_client` also arms
+    // PR_SET_PDEATHSIG so it dies with the boot process. No-op off Linux / with
+    // no compositor.
+    let _waypipe_client = waypipe_socket
+        .as_deref()
+        .and_then(smolvm::vm::waypipe::spawn_client);
+
     proc_timing!("ready to launch");
 
     // Egress telemetry lands in the per-VM dir (the vsock socket's parent), the
@@ -878,6 +888,7 @@ fn run_inner(config_path: PathBuf, token: Option<String>) -> crate::Result<()> {
         auto_ports: config.auto_ports.as_ref(),
         published_sockets: &config.published_sockets,
         waypipe_socket: waypipe_socket.as_deref(),
+        waypipe_bin: config.waypipe_bin.as_deref(),
         x11_socket: x11_socket.as_deref(),
         packed_layers_dir: config.packed_layers_dir.as_deref(),
         packed_layers_dax_window: config.packed_layers_dax_window,

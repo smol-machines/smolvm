@@ -185,6 +185,9 @@ pub struct CreateSpec {
     pub docker_socket: bool,
     /// Forward guest Wayland apps to the host compositor (waypipe).
     pub waypipe: bool,
+    /// Which `waypipe` the guest daemon runs: `host` (the default), `container`
+    /// or a host path.
+    pub waypipe_bin: Option<String>,
     /// Bridge guest X11 apps to the host X server.
     pub x11: bool,
     /// Forward the host's SSH agent.
@@ -300,6 +303,7 @@ impl CreateSpec {
             cuda,
             docker_socket,
             waypipe,
+            waypipe_bin,
             x11,
             ssh_agent,
             forkable,
@@ -381,6 +385,7 @@ impl CreateSpec {
             cuda: cuda || self.cuda,
             docker_socket: docker_socket || self.docker_socket,
             waypipe: waypipe || self.waypipe,
+            waypipe_bin: waypipe_bin.or(self.waypipe_bin),
             x11: x11 || self.x11,
             ssh_agent: ssh_agent || self.ssh_agent,
             forkable: forkable || self.forkable,
@@ -585,6 +590,8 @@ pub struct ResolvedSpec {
     pub docker_socket: bool,
     /// Waypipe forwarding.
     pub waypipe: bool,
+    /// Waypipe binary.
+    pub waypipe_bin: Option<String>,
     /// X11 bridge.
     pub x11: bool,
     /// SSH agent.
@@ -901,6 +908,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
         cuda,
         docker_socket,
         waypipe,
+        waypipe_bin,
         x11,
         ssh_agent,
         forkable,
@@ -1111,6 +1119,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 cuda,
                 docker_socket,
                 waypipe,
+                waypipe_bin,
                 x11,
                 ssh_agent,
                 forkable: forkable || cuda_fork_pool_size.is_some(),
@@ -1242,6 +1251,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 cuda: cuda || pack.cuda,
                 docker_socket,
                 waypipe,
+                waypipe_bin,
                 x11,
                 ssh_agent,
                 forkable: forkable || cuda_fork_pool_size.is_some(),
@@ -1325,7 +1335,11 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 return Err(fixed("a CUDA branch pool", TOPOLOGY));
             }
             let docker_socket = same_flag("the Docker socket", docker_socket, false)?;
-            let waypipe = same_flag("waypipe forwarding", waypipe, false)?;
+            let waypipe = same_flag(
+                "waypipe forwarding",
+                waypipe || waypipe_bin.is_some(),
+                false,
+            )?;
             let x11 = same_flag("the X11 bridge", x11, false)?;
             if auto_ports.is_some() {
                 return Err(fixed(
@@ -1586,6 +1600,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 cuda,
                 docker_socket,
                 waypipe,
+                waypipe_bin,
                 x11,
                 ssh_agent,
                 // A restored checkpoint stays eligible to be branched or
@@ -1658,6 +1673,15 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
         return Err(Error::config(
             "create machine",
             "CUDA VRAM limit requires a fork pool size",
+        ));
+    }
+    if resolved.waypipe && resolved.image.is_none() {
+        // The waypipe daemon runs in the workload container: the agent rootfs
+        // is musl and cannot exec a glibc waypipe.
+        return Err(Error::config(
+            "create machine",
+            "waypipe forwarding needs an image: its daemon runs inside the workload \
+             container, which a machine without an image does not have",
         ));
     }
     if let Some(policy) = resolved.credentials.as_ref() {
@@ -1827,6 +1851,7 @@ impl ResolvedSpec {
             cuda,
             docker_socket,
             waypipe,
+            waypipe_bin,
             x11,
             ssh_agent,
             forkable,
@@ -1933,6 +1958,7 @@ impl ResolvedSpec {
             cuda_preload_modules: false,
             docker_socket,
             waypipe,
+            waypipe_bin,
             x11,
             auto_ports,
             dns_filter_hosts: allowed_hosts,

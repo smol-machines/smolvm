@@ -561,6 +561,26 @@ fn checkpoint_mount_relocation_refuses_topology_and_permission_changes() {
 }
 
 #[test]
+fn waypipe_needs_an_image() {
+    let spec = CreateSpec {
+        waypipe: true,
+        ..Default::default()
+    };
+    let mut vm_pack = pack_manifest();
+    vm_pack.mode = PackMode::Vm;
+    for source in [SpecSource::Bare, SpecSource::Pack(&vm_pack)] {
+        let error = resolve(source, spec.clone(), Caller::Cli)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("waypipe forwarding needs an image"),
+            "{error}"
+        );
+    }
+    assert!(fresh(spec, Src::Image).waypipe);
+}
+
+#[test]
 fn a_checkpoint_restores_what_it_captured() {
     let record = fresh(CreateSpec::default(), Src::Checkpoint);
     assert_eq!((record.cpus, record.mem), (1, 512));
@@ -1123,6 +1143,7 @@ fn cases() -> Vec<Case> {
         cuda,
         docker_socket,
         waypipe,
+        waypipe_bin,
         x11,
         ssh_agent,
         forkable,
@@ -1544,6 +1565,16 @@ fn cases() -> Vec<Case> {
         case!(waypipe, |s, _| s.waypipe = true, |r| r.waypipe)
             .cli(&["--waypipe"])
             .checkpoint(Refused("waypipe")),
+        case!(
+            waypipe_bin,
+            |s, _| {
+                s.waypipe = true;
+                s.waypipe_bin = Some("container".into());
+            },
+            |r| r.waypipe_bin.as_deref() == Some("container")
+        )
+        .cli(&["--waypipe=container"])
+        .checkpoint(Refused("waypipe")),
         case!(x11, |s, _| s.x11 = true, |r| r.x11)
             .cli(&["--x11"])
             .checkpoint(Refused("x11")),
