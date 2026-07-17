@@ -329,11 +329,86 @@ jobs:
           file target/aarch64-unknown-linux-musl/release/smolvm-agent
 
   # ==========================================================================
+  # Downstream compatibility: the smol CLI builds this workspace via path deps
+  # (`smolvm = { path = ".." }`) and releases in version lockstep, so an engine
+  # API change that breaks smol otherwise surfaces only at release time (as
+  # with the LaunchConfig `published_sockets` field). Compile smol's main
+  # against this PR so the break fails HERE, before merge.
+  # ==========================================================================
+  smol-compat:
+    name: smol CLI compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          lfs: false
+
+      - name: Checkout smol (main) into the monorepo
+        uses: actions/checkout@v6
+        with:
+          repository: smol-machines/smol
+          path: smol
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: smol-compat-${{ hashFiles('smol/Cargo.lock') }}
+          restore-keys: smol-compat-
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libssl-dev pkg-config
+
+      # Same linking stub the Linux job uses — smol only needs to COMPILE
+      # against this engine tree, not boot VMs.
+      - name: Create libkrun stub for linking
+        run: |
+          cat > /tmp/libkrun_stub.c << 'EOF'
+          int krun_create_ctx() { return -1; }
+          int krun_free_ctx(int ctx) { return 0; }
+          int krun_set_vm_config(int ctx, int cpus, int mem) { return -1; }
+          int krun_set_root(int ctx, const char* path) { return -1; }
+          int krun_set_workdir(int ctx, const char* path) { return -1; }
+          int krun_set_exec(int ctx, const char* path, char** argv, char** env) { return -1; }
+          int krun_start_enter(int ctx) { return -1; }
+          int krun_set_log_level(int level) { return 0; }
+          int krun_add_disk2(int ctx, const char* id, const char* path, int flags, int ro) { return -1; }
+          int krun_set_port_map(int ctx, char** map) { return -1; }
+          int krun_add_vsock_port(int ctx, int port, const char* path) { return -1; }
+          int krun_add_vsock_port2(int ctx, int port, const char* path, int flags) { return -1; }
+          int krun_disable_implicit_vsock(int ctx) { return -1; }
+          int krun_add_vsock(int ctx, int tsi_features) { return -1; }
+          int krun_set_passt_fd(int ctx, int fd) { return -1; }
+          int krun_add_virtiofs(int ctx, const char* tag, const char* path) { return -1; }
+          int krun_add_virtiofs2(int ctx, const char* tag, const char* path, int flags) { return -1; }
+          int krun_set_console_output(int ctx, const char* path) { return -1; }
+          int krun_add_virtio_console_default(int ctx) { return -1; }
+          EOF
+          gcc -shared -fPIC -o /tmp/libkrun.so /tmp/libkrun_stub.c
+          sudo cp /tmp/libkrun.so /usr/local/lib/
+          sudo ldconfig
+
+      - name: Compile smol against this engine tree
+        working-directory: smol
+        run: cargo check --bin smol
+        env:
+          LIBRARY_PATH: /usr/local/lib
+          LIBKRUN_BUNDLE: /usr/local/lib
+
+  # ==========================================================================
   # Summary job for branch protection
   # ==========================================================================
   ci-success:
     name: CI Success
-    needs: [fmt, macos, linux, windows, agent]
+    needs: [fmt, macos, linux, windows, agent, smol-compat]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -343,7 +418,8 @@ jobs:
              [[ "${{ needs.macos.result }}" != "success" ]] || \
              [[ "${{ needs.linux.result }}" != "success" ]] || \
              [[ "${{ needs.windows.result }}" != "success" ]] || \
-             [[ "${{ needs.agent.result }}" != "success" ]]; then
+             [[ "${{ needs.agent.result }}" != "success" ]] || \
+             [[ "${{ needs.smol-compat.result }}" != "success" ]]; then
             echo "One or more jobs failed"
             exit 1
           fi
