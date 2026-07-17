@@ -5269,6 +5269,7 @@ pub fn run_command(
             crate::ssh_agent::inject_into_container(&mut spec);
             crate::publish_socket::inject_into_container(&mut spec);
             crate::x11::inject_into_container(&mut spec);
+            crate::waypipe::inject_into_container(&mut spec);
             crate::forkpoint::inject_into_container(&mut spec);
             crate::cuda::inject_into_container(&mut spec, Path::new(&prepared.rootfs_path));
             crate::vulkan::inject_into_container(&mut spec, Path::new(&prepared.rootfs_path));
@@ -5401,6 +5402,7 @@ pub fn spawn_in_overlay(
     crate::ssh_agent::inject_into_container(&mut spec);
     crate::publish_socket::inject_into_container(&mut spec);
     crate::x11::inject_into_container(&mut spec);
+    crate::waypipe::inject_into_container(&mut spec);
     crate::forkpoint::inject_into_container(&mut spec);
     crate::cuda::inject_into_container(&mut spec, Path::new(&prepared.rootfs_path));
     crate::vulkan::inject_into_container(&mut spec, Path::new(&prepared.rootfs_path));

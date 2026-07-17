@@ -139,6 +139,7 @@ mod terminal_modes;
 mod timesync;
 mod vsock;
 mod vulkan;
+mod waypipe;
 #[cfg(target_os = "linux")]
 mod workload;
 mod x11;
@@ -693,6 +694,16 @@ fn main() {
         info!("X11 socket bridge enabled, starting guest bridge");
         x11::start();
         std::env::set_var("DISPLAY", x11::GUEST_DISPLAY);
+    }
+
+    // Waypipe Wayland forwarding runs its daemon INSIDE the workload container
+    // (the agent rootfs is musl and cannot exec a glibc waypipe). The only
+    // boot-time work is mounting the host-shared waypipe binary (host/path mode)
+    // so it can be bind-mounted into the container; the daemon itself is started
+    // once the keep-alive container is up (see `handle_run_detached`).
+    if waypipe::is_enabled() {
+        info!("waypipe Wayland forwarding enabled");
+        waypipe::mount_shared_binary_at_boot();
     }
 
     // Mount the Rosetta 2 runtime and register the binfmt_misc handler if the
@@ -4658,7 +4669,7 @@ fn handle_interactive_run(
     }
 
     // Spawn the command with crun
-    let (mut child, pty_master) = match spawn_interactive_command(
+    let (mut child, pty_master, waypipe_warning) = match spawn_interactive_command(
         &prepared.rootfs_path,
         &launch,
         &mounts,
@@ -4680,6 +4691,23 @@ fn handle_interactive_run(
 
     // Send Started response
     send_response(stream, &AgentResponse::Started)?;
+
+    // If the waypipe daemon could not start, print the reason to the user's
+    // terminal before the session begins so forwarding never fails silently.
+    // Sent as a Stdout frame (the interactive protocol has no separate stderr
+    // channel); the message already carries the `smolvm:` prefix. CRLF, not LF:
+    // a raw TTY does no newline translation, so a bare LF would stair-step.
+    // No-op unless forwarding is enabled and did not come up. (Non-interactive
+    // exec surfaces the same text on the command stderr.)
+    if let Some(warning) = waypipe_warning {
+        let line = format!("\r\n{warning}\r\n");
+        let _ = send_response(
+            stream,
+            &AgentResponse::Stdout {
+                data: line.into_bytes(),
+            },
+        );
+    }
 
     // Run the appropriate interactive I/O loop
     let exit_code = match pty_master {
@@ -4946,6 +4974,7 @@ fn build_oci_spec(
     ssh_agent::inject_into_container(&mut spec);
     publish_socket::inject_into_container(&mut spec);
     x11::inject_into_container(&mut spec);
+    waypipe::inject_into_container(&mut spec);
     rosetta::inject_into_container(&mut spec);
     forkpoint::inject_into_container(&mut spec);
     cuda::inject_into_container(&mut spec, rootfs_path);
@@ -5861,6 +5890,7 @@ fn spawn_exec_in_container(
     let mut env: Vec<(String, String)> = launch.env.clone();
     ssh_agent::inject_into_env(&mut env);
     x11::inject_into_env(&mut env);
+    waypipe::inject_into_env(&mut env);
     let command: &[String] = &launch.command;
     let env: &[(String, String)] = &env;
     let workdir: Option<&str> = launch.workdir.as_deref();
@@ -6345,6 +6375,13 @@ fn ensure_main_container(
 }
 
 #[cfg(target_os = "linux")]
+type InteractiveSpawn = (Child, Option<pty::PtyMaster>, Option<String>);
+
+/// Spawn the interactive command, returning the child, its PTY master (when a
+/// TTY was requested), and an optional one-line warning to print to the user's
+/// terminal before the session starts (currently the waypipe daemon-start
+/// outcome, `None` unless forwarding is enabled and did not come up).
+#[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 fn spawn_interactive_command(
     rootfs: &str,
@@ -6354,7 +6391,7 @@ fn spawn_interactive_command(
     persistent_overlay_id: Option<&str>,
     unprivileged: bool,
     s3_volumes: &[smolvm_protocol::S3Volume],
-) -> Result<(Child, Option<pty::PtyMaster>), Box<dyn std::error::Error>> {
+) -> Result<InteractiveSpawn, Box<dyn std::error::Error>> {
     use std::path::Path;
 
     if launch.command.is_empty() {
@@ -6381,7 +6418,14 @@ fn spawn_interactive_command(
 
     // If a main workload container is running for this overlay, join it.
     if let Some(cid) = resolve_main_container(persistent_overlay_id) {
-        return spawn_exec_in_container(&cid, launch, tty, unprivileged);
+        // Ensure the waypipe daemon is up in this container (idempotent; no-op
+        // unless forwarding is enabled). Covers the case where the container
+        // persisted from an earlier exec but the daemon has not been started.
+        // The outcome's warning (if any) is returned so the caller can print it
+        // to the user's terminal before the session starts.
+        let warning = waypipe::start_daemon_in_container(&cid).user_warning();
+        let (child, pty) = spawn_exec_in_container(&cid, launch, tty, unprivileged)?;
+        return Ok((child, pty, warning));
     }
 
     // On a persistent machine with no main container yet, establish a long-lived
@@ -6402,7 +6446,14 @@ fn spawn_interactive_command(
             launch,
             s3_volumes,
         ) {
-            Ok(cid) => return spawn_exec_in_container(&cid, launch, tty, unprivileged),
+            Ok(cid) => {
+                // Start the waypipe daemon in the freshly-established keep-alive
+                // container (idempotent; no-op unless forwarding is enabled).
+                // The warning (if any) is returned to the caller to print.
+                let warning = waypipe::start_daemon_in_container(&cid).user_warning();
+                let (child, pty) = spawn_exec_in_container(&cid, launch, tty, unprivileged)?;
+                return Ok((child, pty, warning));
+            }
             Err(e) => {
                 // Falling back to a fresh container would silently drop the
                 // remote volumes, leaving the workload reading an empty
@@ -6422,7 +6473,9 @@ fn spawn_interactive_command(
     // container in two steps and exec the command into it instead.
     if !s3_volumes.is_empty() {
         let cid = ensure_main_container(rootfs, None, mounts, unprivileged, launch, s3_volumes)?;
-        return spawn_exec_in_container(&cid, launch, tty, unprivileged);
+        let warning = waypipe::start_daemon_in_container(&cid).user_warning();
+        let (child, pty) = spawn_exec_in_container(&cid, launch, tty, unprivileged)?;
+        return Ok((child, pty, warning));
     }
 
     let rootfs_path = Path::new(rootfs);
@@ -6469,8 +6522,11 @@ fn spawn_interactive_command(
     );
 
     // The single-container `Run` path keeps cgroups disabled (its VM is the
-    // limit); per-container cgroups are a pod-only concern.
-    spawn_crun_run(&bundle_path, &container_id, tty, false)
+    // limit); per-container cgroups are a pod-only concern. The fresh-container
+    // path does not start the waypipe daemon (only the persistent keep-alive
+    // paths do), so there is no warning to carry here.
+    let (child, pty) = spawn_crun_run(&bundle_path, &container_id, tty, false)?;
+    Ok((child, pty, None))
 }
 
 /// Launch a container with `crun run` and hand back the child plus the PTY
@@ -6584,7 +6640,7 @@ fn spawn_interactive_command(
     _persistent_overlay_id: Option<&str>,
     unprivileged: bool,
     _s3_volumes: &[smolvm_protocol::S3Volume],
-) -> Result<(Child, Option<()>), Box<dyn std::error::Error>> {
+) -> Result<(Child, Option<()>, Option<String>), Box<dyn std::error::Error>> {
     use std::path::Path;
 
     let command: &[String] = &launch.command;
@@ -6620,6 +6676,7 @@ fn spawn_interactive_command(
     ssh_agent::inject_into_container(&mut spec);
     publish_socket::inject_into_container(&mut spec);
     x11::inject_into_container(&mut spec);
+    waypipe::inject_into_container(&mut spec);
     rosetta::inject_into_container(&mut spec);
     forkpoint::inject_into_container(&mut spec);
     cuda::inject_into_container(&mut spec, rootfs_path);
@@ -6636,7 +6693,7 @@ fn spawn_interactive_command(
         .capture_output()
         .spawn()?;
 
-    Ok((child, None))
+    Ok((child, None, None))
 }
 
 /// Run the interactive I/O loop using poll() for efficient I/O multiplexing.
@@ -7989,6 +8046,13 @@ fn run_in_keepalive_container(
     // long-lived VM accumulates one per `run`. Dropped on every exit path.
     let _reaper = EphemeralContainer(ephemeral.then(|| cid.clone()));
 
+    // Ensure the waypipe daemon is up in the keep-alive container before the
+    // workload runs (idempotent; no-op unless forwarding is enabled). If it
+    // could not come up - waypipe not installed yet, or present but broken - the
+    // reason is surfaced on this exec's stderr below so forwarding never fails
+    // silently. Only a running daemon is silent.
+    let waypipe_warning = waypipe::start_daemon_in_container(&cid).user_warning();
+
     // The workload runs via `crun exec --user`, which requires a NUMERIC uid[:gid]
     // — a username (the image's `config.User`, e.g. `nobody`/`node`, or the
     // request user) is rejected with "invalid USERSPEC specified". Resolve it
@@ -8046,11 +8110,23 @@ fn run_in_keepalive_container(
         },
     )?;
 
+    // Prepend the waypipe warning (if any) to the command's stderr so the user
+    // sees why forwarding did not come up, without corrupting stdout.
+    let prepend_waypipe_warning = |stderr: Vec<u8>| -> Vec<u8> {
+        if let Some(warning) = &waypipe_warning {
+            let mut prefixed = format!("{warning}\n").into_bytes();
+            prefixed.extend_from_slice(&stderr);
+            prefixed
+        } else {
+            stderr
+        }
+    };
+
     Ok(match result {
         crate::process::WaitResult::Completed { exit_code, output } => AgentResponse::Completed {
             exit_code,
             stdout: output.stdout,
-            stderr: output.stderr,
+            stderr: prepend_waypipe_warning(output.stderr),
         },
         crate::process::WaitResult::TimedOut { output, timeout_ms } => {
             let mut stderr = output.stderr;
@@ -8060,7 +8136,7 @@ fn run_in_keepalive_container(
             AgentResponse::Completed {
                 exit_code: crate::process::TIMEOUT_EXIT_CODE,
                 stdout: output.stdout,
-                stderr,
+                stderr: prepend_waypipe_warning(stderr),
             }
         }
         crate::process::WaitResult::ClientDisconnected { output } => {
@@ -8069,7 +8145,7 @@ fn run_in_keepalive_container(
             AgentResponse::Completed {
                 exit_code: 137,
                 stdout: output.stdout,
-                stderr,
+                stderr: prepend_waypipe_warning(stderr),
             }
         }
     })
@@ -8139,6 +8215,7 @@ fn handle_run(
     let mut env = env.to_vec();
     ssh_agent::inject_into_env(&mut env);
     x11::inject_into_env(&mut env);
+    waypipe::inject_into_env(&mut env);
     let env = &env[..];
 
     // Honor the image's default USER when the request doesn't pin one, so every
