@@ -1739,8 +1739,20 @@ pub async fn export_machine(
         )));
     }
 
+    // `pack create -o X` emits an executable stub at X and the actual pack data
+    // at X.smolmachine (the sidecar carrying the SMOLPACK footer). The manifest
+    // and the pushed blob must come from the SIDECAR — reading the stub fails
+    // with "invalid magic". Resolve it exactly like `smol pack push` does, with
+    // the pre-sidecar single-file layout as the fallback.
+    let sidecar = smolvm_pack::sidecar_path_for(&tmp_path);
+    let artifact = if sidecar.exists() {
+        sidecar.clone()
+    } else {
+        tmp_path.clone()
+    };
+
     // Read back the PackManifest from the sidecar footer for the response.
-    let manifest = smolvm_pack::read_manifest_from_sidecar(&tmp_path)
+    let manifest = smolvm_pack::read_manifest_from_sidecar(&artifact)
         .map_err(|e| ApiError::internal(format!("read exported manifest: {}", e)))?;
     let manifest_json = serde_json::to_string(&manifest)
         .map_err(|e| ApiError::internal(format!("serialize manifest: {}", e)))?;
@@ -1755,11 +1767,15 @@ pub async fn export_machine(
     };
     let client = smolvm_registry::RegistryClient::new(base_url).with_token(req.push_token.clone());
 
-    let result = smolvm_registry::push(&client, &req.repo, &req.tag, &tmp_path)
+    let result = smolvm_registry::push(&client, &req.repo, &req.tag, &artifact)
         .await
         .map_err(|e| ApiError::internal(format!("registry push failed: {}", e)))?;
 
-    // tmp drops here, deleting the sidecar.
+    // The tempfile guard only removes the stub path; clean the sidecar too so
+    // exports don't accumulate multi-GB files in /tmp.
+    let _ = std::fs::remove_file(&sidecar);
+
+    // tmp drops here, deleting the stub.
     Ok(Json(ExportResponse {
         digest: result.manifest_digest,
         size_bytes: result.layer_size,
