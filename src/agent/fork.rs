@@ -159,7 +159,7 @@ pub fn prepare_fork(
     // command below, so hand this dir to that uid. No-op unless privileged; if the
     // drop is active the golden's uid lookup must succeed (fail closed).
     if let Some(result) =
-        crate::process::vm_drop_ids(&crate::agent::vm_uid_registry_dir(), &gdir, None)
+        crate::process::vm_drop_ids(&crate::agent::vm_uid_registry_dir(), &gdir, None, None)
     {
         let (uid, gid) =
             result.map_err(|e| Error::agent("fork: resolve golden uid", e.to_string()))?;

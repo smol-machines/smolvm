@@ -229,6 +229,13 @@ pub struct LaunchFeatures {
     /// carries its CNI-assigned IP and is reachable at L2. Runtime-only (never
     /// persisted in `VmRecord`); requires the virtio-net backend.
     pub pod_netns: Option<std::path::PathBuf>,
+    /// Under per-VM uid isolation, run this VM as the uid already owned by the
+    /// VM at this data dir instead of allocating a fresh one. Set by the
+    /// pack-from-vm helper, whose whole job is reading the source VM's 0700
+    /// disks (attached via `extra_disks`) — a fresh sibling uid cannot open
+    /// them, so the helper boot would fail configuring virtio-blk. Same trust
+    /// domain, same uid, mirroring how a fork clone shares its golden's uid.
+    pub uid_share_dir: Option<std::path::PathBuf>,
 }
 
 impl LaunchFeatures {

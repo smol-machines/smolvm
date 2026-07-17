@@ -1721,9 +1721,12 @@ impl AgentManager {
         // otherwise the VMM stays root and reads the shared copy directly.
         let mut uid_drop_active = false;
         if let Some(d) = data_dir.as_deref() {
-            if let Some(result) =
-                crate::process::vm_drop_ids(&registry, d, features.snapshot_dir.as_deref())
-            {
+            if let Some(result) = crate::process::vm_drop_ids(
+                &registry,
+                d,
+                features.snapshot_dir.as_deref(),
+                features.uid_share_dir.as_deref(),
+            ) {
                 // The drop is active — allocation MUST succeed or we refuse to boot
                 // (fail closed; never silently run the VMM over-privileged).
                 let (uid, gid) = result.map_err(|e| {

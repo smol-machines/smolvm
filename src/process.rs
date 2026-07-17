@@ -1046,18 +1046,27 @@ pub fn free_vm_uid(_registry_dir: &std::path::Path, _key_dir: &std::path::Path) 
 /// A fork clone (`snapshot_dir` set, laid out as
 /// `<golden_dir>/fork-snapshots/<clone>`) resolves to the GOLDEN's uid so it can
 /// map the golden's memfd. gid mirrors uid (a per-VM group).
+///
+/// `share_uid_with` (when set) overrides the key resolution entirely: the VM
+/// resolves to THAT data dir's uid instead of claiming its own. Used by the
+/// pack-from-vm helper, which must read the source VM's 0700 disks — same trust
+/// domain, same uid (mirroring how a fork clone shares its golden's uid). The
+/// borrower never writes its own `.vm-uid`, so deleting it can't free the
+/// owner's uid.
 #[cfg(target_os = "linux")]
 pub fn vm_drop_ids(
     registry_dir: &std::path::Path,
     data_dir: &std::path::Path,
     snapshot_dir: Option<&std::path::Path>,
+    share_uid_with: Option<&std::path::Path>,
 ) -> Option<std::io::Result<(u32, u32)>> {
     if !vm_uid_drop_active() {
         return None;
     }
-    let key_dir = match snapshot_dir {
-        Some(snap) => snap.parent().and_then(|p| p.parent()).unwrap_or(data_dir),
-        None => data_dir,
+    let key_dir = match (share_uid_with, snapshot_dir) {
+        (Some(owner), _) => owner,
+        (None, Some(snap)) => snap.parent().and_then(|p| p.parent()).unwrap_or(data_dir),
+        (None, None) => data_dir,
     };
     let Some(vm_key) = key_dir.file_name().and_then(|n| n.to_str()) else {
         return Some(Err(std::io::Error::new(
@@ -1074,6 +1083,7 @@ pub fn vm_drop_ids(
     _registry_dir: &std::path::Path,
     _data_dir: &std::path::Path,
     _snapshot_dir: Option<&std::path::Path>,
+    _share_uid_with: Option<&std::path::Path>,
 ) -> Option<std::io::Result<(u32, u32)>> {
     None
 }

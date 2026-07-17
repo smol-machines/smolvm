@@ -915,6 +915,11 @@ impl PackCreateCmd {
         let manager = AgentManager::for_vm(&pack_vm_name)?;
         let features = smolvm::agent::LaunchFeatures {
             extra_disks: vec![(storage_disk.clone(), false, storage_fmt)],
+            // Under per-VM uid isolation the source VM's dir is 0700/its-own-uid;
+            // this helper's whole job is reading that VM's storage disk, so run
+            // it as the source's uid (a fresh sibling uid can't open the disk and
+            // the boot dies configuring virtio-blk).
+            uid_share_dir: Some(vm_dir.to_path_buf()),
             ..Default::default()
         };
         manager.start_with_full_config(
