@@ -318,7 +318,10 @@ fn export_flattened_from_artifact_sourced(
     // Stage each virtiofs layer dir onto the helper's local disk. A tar pipe
     // preserves overlayfs whiteout devices and opaque-dir xattrs, which a
     // later overlay mount needs intact.
-    println!("Staging {} imported layer(s) for flatten...", layer_ids.len());
+    println!(
+        "Staging {} imported layer(s) for flatten...",
+        layer_ids.len()
+    );
     let mut lowers = Vec::new();
     for (i, id) in layer_ids.iter().enumerate() {
         let src = format!("/packed_layers/{}", id);
@@ -403,7 +406,10 @@ fn flatten_and_export(
     let base_chain: Vec<&str> = lowers.iter().rev().map(String::as_str).collect();
     let base_chain = base_chain.join(":");
 
-    println!("Flattening {} layer(s) + container overlay...", lowers.len());
+    println!(
+        "Flattening {} layer(s) + container overlay...",
+        lowers.len()
+    );
     let script = format!(
         "set -e\n\
          low='{base_chain}'\n\
@@ -582,8 +588,7 @@ fn flatten_qcow2_to_raw(qcow2_path: &Path, dest_raw: &Path) -> crate::Result<()>
 /// Read a qcow2 header's virtual size (big-endian u64 at offset 24).
 fn read_qcow2_virtual_size(path: &Path) -> crate::Result<u64> {
     use std::io::Read;
-    let mut f =
-        std::fs::File::open(path).map_err(|e| Error::agent("open qcow2", e.to_string()))?;
+    let mut f = std::fs::File::open(path).map_err(|e| Error::agent("open qcow2", e.to_string()))?;
     let mut header = [0u8; 32];
     f.read_exact(&mut header)
         .map_err(|e| Error::agent("read qcow2 header", e.to_string()))?;

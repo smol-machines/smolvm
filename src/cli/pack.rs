@@ -23,7 +23,7 @@ use smolvm_pack::format::PackManifest;
 use smolvm_pack::packer::Packer;
 use smolvm_pack::signing::sign_with_hypervisor_entitlements;
 use smolvm_protocol::AgentResponse;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tracing::{debug, info, warn};
 
 /// Package and run self-contained VM executables.
@@ -1510,7 +1510,6 @@ fn fmt_bytes(bytes: u64) -> String {
         format!("{} MB", bytes / (1024 * 1024))
     }
 }
-
 
 /// A simple terminal spinner that prints a rotating character every 200ms.
 /// Stops automatically on drop (error paths) or via explicit `stop()`.

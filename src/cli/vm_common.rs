@@ -1074,9 +1074,12 @@ pub fn start_vm_named(
         // inherited as-is.
         let _ = img;
         if !from_snapshot {
-            if let Err(e) =
-                smolvm::workload::launch_image_workload(&mut client, name, &record, exec_env.clone())
-            {
+            if let Err(e) = smolvm::workload::launch_image_workload(
+                &mut client,
+                name,
+                &record,
+                exec_env.clone(),
+            ) {
                 if let Err(stop_err) = manager.stop() {
                     tracing::warn!(error = %stop_err, "failed to stop machine after CMD launch failure");
                 }
