@@ -4829,7 +4829,8 @@ fn oversized_output_error(stdout: &[u8], stderr: &[u8]) -> Option<AgentResponse>
         return Some(AgentResponse::error(
             format!(
                 "command output too large ({total} bytes; limit {BUDGET}). \
-                 Use streaming exec (exec_stream / execStream) for large output."
+                 Redirect large output to a file and download it via the files \
+                 API — streaming exec is capped at the same output budget."
             ),
             error_codes::EXEC_FAILED,
         ));
