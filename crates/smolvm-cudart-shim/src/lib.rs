@@ -468,6 +468,14 @@ fn bring_up_client(resume_token: u64) -> Result<(Client<Stream>, u64, i32), c_in
         }
         CUDA_ERROR_INITIALIZATION
     })?;
+    // Per-machine GPU pin: guest device 0 maps to host device N and the guest
+    // sees exactly one device. Sent before any device query or ctx retain.
+    if let Some(d) = std::env::var("SMOLVM_CUDA_DEVICE")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+    {
+        let _ = client.set_device_base(d);
+    }
     if trace {
         eprintln!("[shim] bring_up: init ok token={token}");
     }
@@ -572,10 +580,19 @@ fn with_client<T>(
 /// liveness peek can miss it on the very first call (the kernel hasn't surfaced
 /// the reset yet) — so that call fails with a transport error (`999`). This
 /// forces a reconnect and reruns `f`, which then reads from the reconnected
-/// (shared-context) session. Only for idempotent ops (reads, syncs, queries):
-/// `f` runs twice, so it must have no side effects on the first, failed attempt
-/// — which holds here because a transport failure means the op never reached the
-/// host. Takes `Fn` (not `FnOnce`) precisely so it can run twice.
+/// (shared-context) session. For ops safe to rerun after a TRANSPORT failure
+/// (reads, syncs, queries, and sync library calls): the failure means the op
+/// never reached the host, so the retry runs it exactly once. Takes `Fn` (not
+/// `FnOnce`) precisely so it can run twice — closures clone their args per
+/// attempt.
+/// Debug (`SMOLVM_CUDA_SHIM_TRACE=1`): print which generated library wrapper
+/// swallowed an error into its c_int return, with the mapped code.
+fn lib_err_trace(lib: u8, func: u16, code: c_int) {
+    if std::env::var_os("SMOLVM_CUDA_SHIM_TRACE").is_some() {
+        eprintln!("[lib-err] lib={lib} func={func} code={code}");
+    }
+}
+
 fn with_client_retrying<T>(
     f: impl Fn(&mut Client<Stream>) -> Result<T, CudaRpcError>,
 ) -> Result<T, c_int> {
@@ -2765,14 +2782,14 @@ pub extern "C" fn cudaGetErrorName(error: c_int) -> *const c_char {
 /// Regenerate with `smolvm-cuda-codegen`; do not edit by hand.
 mod gen_cublas {
     #![allow(non_snake_case, clippy::unnecessary_cast, unused_mut, dead_code)]
-    use super::{c_int, c_void, with_client};
+    use super::{c_int, c_void, with_client, with_client_retrying};
     include!("generated/cublas_guest.rs");
 }
 
 /// Code-generated cuDNN forwarding stubs. Regenerate with `smolvm-cuda-codegen`.
 mod gen_cudnn {
     #![allow(non_snake_case, clippy::unnecessary_cast, unused_mut, dead_code)]
-    use super::{c_int, c_void, with_client};
+    use super::{c_int, c_void, with_client, with_client_retrying};
     include!("generated/cudnn_guest.rs");
 }
 
@@ -2879,7 +2896,7 @@ pub extern "C" fn cudnnBackendGetAttribute(
             std::slice::from_raw_parts(array_of_elements as *const u8, cap)
         });
     }
-    match with_client(|c| c.lib_call(LIB_CUDNN_BACKEND, 3, a)) {
+    match with_client_retrying(|c| c.lib_call(LIB_CUDNN_BACKEND, 3, a.clone())) {
         Ok((0, out)) if out.len() >= 8 => {
             let cnt = i64::from_le_bytes(out[..8].try_into().unwrap());
             if !element_count.is_null() {
@@ -2915,7 +2932,7 @@ pub extern "C" fn cudnnBackendGetAttribute(
 #[no_mangle]
 pub extern "C" fn cudnnBackendFinalize(descriptor: *mut c_void) -> c_int {
     let a = (descriptor as u64).to_le_bytes().to_vec();
-    match with_client(|c| c.lib_call(LIB_CUDNN_BACKEND, 4, a)) {
+    match with_client_retrying(|c| c.lib_call(LIB_CUDNN_BACKEND, 4, a.clone())) {
         Ok((st, _)) => st,
         Err(_) => 1,
     }
@@ -2999,7 +3016,7 @@ pub extern "C" fn cublasLtCreate(light_handle: *mut *mut c_void) -> c_int {
     if light_handle.is_null() {
         return CUBLAS_STATUS_NOT_INITIALIZED;
     }
-    match with_client(|c| c.lib_call(LIB_CUBLASLT, 11, Vec::new())) {
+    match with_client_retrying(|c| c.lib_call(LIB_CUBLASLT, 11, Vec::new())) {
         Ok((0, out)) if out.len() >= 8 => {
             unsafe {
                 *light_handle = u64::from_le_bytes(out[..8].try_into().unwrap()) as *mut c_void
@@ -3014,7 +3031,7 @@ pub extern "C" fn cublasLtCreate(light_handle: *mut *mut c_void) -> c_int {
 #[no_mangle]
 pub extern "C" fn cublasLtDestroy(light_handle: *mut c_void) -> c_int {
     let a = (light_handle as u64).to_le_bytes().to_vec();
-    match with_client(|c| c.lib_call(LIB_CUBLASLT, 12, a)) {
+    match with_client_retrying(|c| c.lib_call(LIB_CUBLASLT, 12, a.clone())) {
         Ok((st, _)) => st,
         Err(_) => CUBLAS_STATUS_NOT_INITIALIZED,
     }
@@ -3229,7 +3246,7 @@ pub extern "C" fn cublasLtMatmulAlgoGetHeuristic(
     a.extend_from_slice(&(d_desc as u64).to_le_bytes());
     a.extend_from_slice(&(preference as u64).to_le_bytes());
     a.extend_from_slice(&requested_algo_count.to_le_bytes());
-    match with_client(|c| c.lib_call(LIB_CUBLASLT, 9, a)) {
+    match with_client_retrying(|c| c.lib_call(LIB_CUBLASLT, 9, a.clone())) {
         Ok((0, out)) if out.len() >= 8 => {
             LT_HEUR_MEMO
                 .lock()
@@ -3625,7 +3642,7 @@ fn bn_size_call(func: u16, args: Vec<u8>, size_out: *mut usize) -> c_int {
             }
         }
     }
-    match with_client(|c| c.lib_call(LIB_CUDNN_BN, func, args)) {
+    match with_client_retrying(|c| c.lib_call(LIB_CUDNN_BN, func, args.clone())) {
         Ok((0, out)) if out.len() >= 8 => {
             let sz = u64::from_le_bytes(out[..8].try_into().unwrap()) as usize;
             if !size_out.is_null() {

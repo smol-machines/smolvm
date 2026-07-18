@@ -165,11 +165,16 @@ fn fork_clone_id() -> Option<u64> {
 /// its absence, serves the GOLDEN's own reconnect in-daemon instead of handing
 /// it a worker's reconstructed COPY of its memory.
 fn proxy_to_daemon(guest: crate::platform::uds::UdsStream, addr: &str) -> std::io::Result<()> {
-    fn preamble() -> Option<[u8; 16]> {
+    fn preamble() -> Option<[u8; 17]> {
         let id = fork_clone_id()?;
-        let mut p = [0u8; 16];
+        let mut p = [0u8; 17];
         p[..8].copy_from_slice(&smolvm_cuda::proto::CLONE_PREAMBLE_MAGIC);
-        p[8..].copy_from_slice(&id.to_le_bytes());
+        p[8..16].copy_from_slice(&id.to_le_bytes());
+        // bit 0: this fork was requested with --share-weights (the launcher put
+        // SMOLVM_CUDA_CLONE_SHARE in this clone VMM's env).
+        if std::env::var_os("SMOLVM_CUDA_CLONE_SHARE").is_some() {
+            p[16] |= 1;
+        }
         Some(p)
     }
     // A path (managed daemon) → unix socket; otherwise host:port → TCP.

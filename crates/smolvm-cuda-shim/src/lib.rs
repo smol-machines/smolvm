@@ -271,6 +271,13 @@ fn connect_standalone(resume_token: u64) -> Result<(Client<Stream>, u64, i32), c
     let mut client = Client::new(stream);
     client.set_defer_enabled(false);
     let token = client.init(resume_token).map_err(init_err)?;
+    // Per-machine GPU pin (see the runtime shim's bring_up_client).
+    if let Some(d) = std::env::var("SMOLVM_CUDA_DEVICE")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+    {
+        let _ = client.set_device_base(d);
+    }
     Ok((client, token, fd))
 }
 
@@ -769,6 +776,59 @@ pub extern "C" fn cuMemAddressReserve(
     }
 }
 
+/// Allocation-burst bookkeeping: fire-and-forget `cuMemCreate` under a
+/// guest-minted virtual handle, so allocation-heavy phases (model load: torch's
+/// expandable segments create/map/setAccess per 2 MiB granule) pipeline instead
+/// of paying a round trip per call. Bounded by a VRAM headroom check so a
+/// plausible OOM still surfaces synchronously (torch's allocator frees its
+/// cache and retries on cuMemCreate OOM — that contract needs a sync answer
+/// when memory is actually tight). `SMOLVM_CUDA_ALLOC_BURST=0` disables.
+mod vmm_burst {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+
+    /// vh → size of burst-created allocations (for the headroom counter).
+    static SIZES: Mutex<Option<std::collections::HashMap<u64, u64>>> = Mutex::new(None);
+    static CREATED: AtomicU64 = AtomicU64::new(0);
+    static TOTAL: AtomicU64 = AtomicU64::new(0);
+    static NEXT_VH: AtomicU64 = AtomicU64::new(1 << 62); // distinct from lib vhandles
+
+    pub fn enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("SMOLVM_CUDA_ALLOC_BURST").as_deref() != Ok("0"))
+    }
+    pub fn set_total(bytes: u64) {
+        TOTAL.store(bytes, Ordering::Relaxed);
+    }
+    /// Quiet-create is allowed while there is comfortable headroom; near the
+    /// device limit the caller must fall back to a synchronous create so OOM
+    /// surfaces at the right call.
+    pub fn headroom_ok(size: u64) -> bool {
+        let total = TOTAL.load(Ordering::Relaxed);
+        total > 0 && (CREATED.load(Ordering::Relaxed) + size) < total / 100 * 85
+    }
+    pub fn mint(size: u64) -> u64 {
+        let vh = (1 << 63) | NEXT_VH.fetch_add(1, Ordering::Relaxed);
+        CREATED.fetch_add(size, Ordering::Relaxed);
+        SIZES
+            .lock()
+            .unwrap()
+            .get_or_insert_with(Default::default)
+            .insert(vh, size);
+        vh
+    }
+    pub fn released(handle: u64) {
+        if let Some(sz) = SIZES
+            .lock()
+            .unwrap()
+            .get_or_insert_with(Default::default)
+            .remove(&handle)
+        {
+            CREATED.fetch_sub(sz, Ordering::Relaxed);
+        }
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn cuMemCreate(
     handle: *mut u64,
@@ -781,6 +841,24 @@ pub extern "C" fn cuMemCreate(
     } else {
         unsafe { ((prop as *const u8).add(12) as *const c_int).read_unaligned() }
     };
+    if vmm_burst::enabled() {
+        // Lazily learn the device capacity for the headroom check.
+        if !vmm_burst::headroom_ok(size as u64) {
+            if let Ok(total) = with_state(|s| s.client.device_total_mem(device)) {
+                vmm_burst::set_total(total);
+            }
+        }
+        if vmm_burst::headroom_ok(size as u64) {
+            let vh = vmm_burst::mint(size as u64);
+            match with_state(|s| s.client.mem_create_vh(size as u64, device, vh)) {
+                Ok(()) => return ret(unsafe { out(handle, vh) }),
+                Err(code) => {
+                    vmm_burst::released(vh);
+                    return code;
+                }
+            }
+        }
+    }
     match with_state(|s| s.client.mem_create(size as u64, device)) {
         Ok(h) => ret(unsafe { out(handle, h) }),
         Err(code) => code,
@@ -795,6 +873,12 @@ pub extern "C" fn cuMemMap(
     handle: u64,
     _flags: u64,
 ) -> c_int {
+    if vmm_burst::enabled() {
+        return ret(with_state(|s| {
+            s.client
+                .mem_map_quiet(ptr, size as u64, offset as u64, handle)
+        }));
+    }
     ret(with_state(|s| {
         s.client.mem_map(ptr, size as u64, offset as u64, handle)
     }))
@@ -812,6 +896,11 @@ pub extern "C" fn cuMemSetAccess(
     } else {
         unsafe { ((desc as *const u8).add(4) as *const c_int).read_unaligned() }
     };
+    if vmm_burst::enabled() {
+        return ret(with_state(|s| {
+            s.client.mem_set_access_quiet(ptr, size as u64, device)
+        }));
+    }
     ret(with_state(|s| {
         s.client.mem_set_access(ptr, size as u64, device)
     }))
@@ -824,6 +913,10 @@ pub extern "C" fn cuMemUnmap(ptr: u64, size: usize) -> c_int {
 
 #[no_mangle]
 pub extern "C" fn cuMemRelease(handle: u64) -> c_int {
+    vmm_burst::released(handle);
+    if vmm_burst::enabled() {
+        return ret(with_state(|s| s.client.mem_release_quiet(handle)));
+    }
     ret(with_state(|s| s.client.mem_release(handle)))
 }
 

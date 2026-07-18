@@ -1655,6 +1655,12 @@ impl AgentManager {
             if let Some(ref snap) = features.snapshot_dir {
                 v.push(("SMOLVM_SNAPSHOT_DIR", snap.to_string_lossy().into_owned()));
             }
+            if features.cuda_share_weights {
+                // Read by the clone VMM's CUDA proxy: sets the share-weights bit
+                // in its clone preamble so the daemon's worker shares the
+                // golden's loaded weights instead of copying them.
+                v.push(("SMOLVM_CUDA_CLONE_SHARE", "1".to_string()));
+            }
             // Shared CUDA daemon: forward an explicit operator setting as-is.
             // SHARED=1 => smolvm spawns/manages the daemon; DAEMON=X => external.
             let mut shared_set = false;

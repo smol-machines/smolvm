@@ -468,11 +468,18 @@ pub async fn create_machine(
         } else {
             Some(manifest.image)
         };
+        // CLI-parity precedence: a request-supplied workload overrides the
+        // artifact's baked (entrypoint, cmd).
+        let (ep, cmd) = if req.entrypoint.is_empty() && req.cmd.is_empty() {
+            (manifest.entrypoint, manifest.cmd)
+        } else {
+            (req.entrypoint.clone(), req.cmd.clone())
+        };
         (
             image,
             Some(canonical),
-            manifest.entrypoint,
-            manifest.cmd,
+            ep,
+            cmd,
             env_parsed,
             manifest.workdir,
             manifest.cpus,
@@ -485,8 +492,8 @@ pub async fn create_machine(
         (
             req.image.clone(),
             None,
-            vec![],
-            vec![],
+            req.entrypoint.clone(),
+            req.cmd.clone(),
             vec![],
             None,
             crate::data::resources::DEFAULT_MICROVM_CPU_COUNT,
@@ -651,6 +658,7 @@ pub async fn create_machine(
         memory_mb: Some(mem),
         network: Some(network),
         gpu: Some(req.gpu),
+        cuda: Some(req.cuda),
         storage_gb: req.storage_gb,
         overlay_gb: req.overlay_gb,
         allowed_cidrs: req.allowed_cidrs.clone(),
@@ -1075,6 +1083,7 @@ pub async fn fork_machine(
 ) -> Result<Json<MachineInfo>, ApiError> {
     let clone = req.name.clone();
     let pinned_ports: Vec<(u16, u16)> = req.ports.iter().map(|p| (p.host, p.guest)).collect();
+    let req_share_weights = req.share_weights;
 
     // Serialize lifecycle on the CLONE name so a concurrent start/stop/delete of
     // the same clone can't race the fork's register + boot. The golden is only
@@ -1124,6 +1133,7 @@ pub async fn fork_machine(
         .map_err(|e| format!("failed to prepare packed layers: {}", e))?;
         // Boot from the golden's snapshot instead of cold-booting.
         features.snapshot_dir = Some(prep.snapshot_dir);
+        features.cuda_share_weights = req_share_weights;
 
         if let Err(e) = manager.ensure_running_via_subprocess(mounts, ports, resources, features) {
             // Boot failed: roll back the clone registration so a failed fork
@@ -2061,6 +2071,9 @@ mod tests {
             ports: vec![],
             network: false,
             gpu: false,
+            cuda: false,
+            entrypoint: vec![],
+            cmd: vec![],
             docker_socket: false,
             storage_gb: None,
             overlay_gb: None,

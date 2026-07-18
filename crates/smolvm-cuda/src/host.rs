@@ -361,6 +361,13 @@ struct Session {
     /// VMM state for reclaim: physical handles → size (quota ledger too),
     /// live mappings (va → size), and address reservations (va → size).
     owned_vmm_handles: HashMap<u64, u64>,
+    /// Guest-minted VMM virtual handle → real handle (burst-path creates:
+    /// `MemCreateVh` is fire-and-forget, so the guest never sees the real).
+    vmm_vhandles: HashMap<u64, u64>,
+    /// Host GPU this session is pinned to (guest device 0 maps here; the
+    /// guest sees exactly one device). (0, false) = unpinned legacy behavior.
+    device_base: i32,
+    device_pinned: bool,
     owned_vmm_maps: HashMap<u64, u64>,
     owned_vmm_reservations: HashMap<u64, u64>,
     owned_modules: std::collections::HashSet<u64>,
@@ -623,6 +630,11 @@ type VmmRanges = std::sync::Mutex<HashMap<u64, u64>>;
 struct ChunkCover {
     size: u64,
     handle: u64,
+    /// The GUEST-visible handle value for this chunk (differs from `handle`
+    /// when the guest created it under a burst virtual handle): what the
+    /// clone's inherited MemMap/MemRelease carry, so the worker's translation
+    /// table must be keyed by it.
+    ghandle: u64,
     segs: Vec<(u64, u64, u64)>,
     verified: Option<bool>,
 }
@@ -679,6 +691,8 @@ struct GoldenLayout {
     /// pointer). Only context-level creates are recorded; descriptors are
     /// transient and recreated by the workload itself.
     lib_handles: Vec<(u8, u16, u64, Vec<u8>)>,
+    /// Host GPU the golden is pinned to — clones must reconstruct on it.
+    device_base: i32,
 }
 type LayoutCell = std::sync::Mutex<GoldenLayout>;
 static DPTR_HANDOFF: std::sync::Mutex<Option<HashMap<u64, std::sync::Weak<AllocTable>>>> =
@@ -693,6 +707,15 @@ fn dptr_handoff_register(table: &std::sync::Arc<AllocTable>, my_token: u64) {
 
 /// Snapshot of `token`'s current `(dptr, size, loaded)` allocations, or `None`
 /// if that lineage is gone.
+/// Worker-mode handoff: the golden's live non-VMM (`cudaMalloc`) allocations,
+/// read from the daemon-process registry. The daemon stages private copies of
+/// these for a clone worker — a plain-torch golden (no expandable_segments)
+/// keeps ALL its tensors here, and without the staging a worker-mode clone
+/// faults on its first touch of any pre-fork buffer.
+pub fn alloc_handoff_snapshot(token: u64) -> Option<Vec<(u64, u64, bool)>> {
+    dptr_handoff_snapshot(token)
+}
+
 fn dptr_handoff_snapshot(token: u64) -> Option<Vec<(u64, u64, bool)>> {
     let reg = DPTR_HANDOFF.lock().unwrap();
     if std::env::var_os("SMOLVM_CUDA_FORK_DEBUG").is_some() {
@@ -762,6 +785,10 @@ pub struct HandoffChunk {
     pub va: u64,
     pub size: u64,
     pub handle: u64,
+    /// Guest-visible handle value (a burst virtual handle, or `handle` when
+    /// the guest created it synchronously) — the clone's inherited ops carry
+    /// this, so the worker's translation table is keyed by it.
+    pub ghandle: u64,
     /// Upload segments tile the chunk exactly (share CANDIDATE — safe to share
     /// only after fork-time content verification against `segs`).
     pub candidate: bool,
@@ -773,7 +800,7 @@ pub struct HandoffChunk {
 
 /// `(reservations: [(va,size)], chunks)` for `token`'s golden.
 #[allow(clippy::type_complexity)]
-pub fn layout_handoff_snapshot(token: u64) -> Option<(Vec<(u64, u64)>, Vec<HandoffChunk>)> {
+pub fn layout_handoff_snapshot(token: u64) -> Option<(Vec<(u64, u64)>, Vec<HandoffChunk>, i32)> {
     let reg = LAYOUT_HANDOFF.lock().unwrap();
     let l = reg.as_ref()?.get(&token)?.upgrade()?;
     let g = l.lock().unwrap();
@@ -785,12 +812,13 @@ pub fn layout_handoff_snapshot(token: u64) -> Option<(Vec<(u64, u64)>, Vec<Hando
             va,
             size: c.size,
             handle: c.handle,
+            ghandle: c.ghandle,
             candidate: c.covered_exactly(),
             segs: c.segs.clone(),
             verified: c.verified,
         })
         .collect();
-    Some((resvs, maps))
+    Some((resvs, maps, g.device_base))
 }
 
 /// Cache the fork-time content-verification verdict for `va` in `token`'s
@@ -905,6 +933,24 @@ pub fn set_vmm_trans(map: HashMap<u64, u64>) {
     VMM_TRANS.with(|m| *m.borrow_mut() = Some(map));
 }
 
+thread_local! {
+    /// Worker-mode: private copies of the golden's non-VMM (`cudaMalloc`)
+    /// allocations, made during reconstruction — `(golden_dptr, size, copy)`.
+    /// Drained into the serving session's `dptr_trans` at clone resume, so the
+    /// clone's inherited pointers translate exactly like the in-daemon isolate
+    /// path (see `alloc_handoff_snapshot`).
+    static WORKER_ALLOC_TRANS: std::cell::RefCell<Vec<(u64, u64, u64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+pub fn set_worker_alloc_trans(v: Vec<(u64, u64, u64)>) {
+    WORKER_ALLOC_TRANS.with(|r| *r.borrow_mut() = v);
+}
+
+fn take_worker_alloc_trans() -> Vec<(u64, u64, u64)> {
+    WORKER_ALLOC_TRANS.with(|r| std::mem::take(&mut *r.borrow_mut()))
+}
+
 /// M3b: rebuild the golden's captured graphs in THIS worker's context and map
 /// each `(graph_vh, exec_vh)` to the rebuilt reals, so the clone's inherited
 /// `GraphLaunch` resolves. Kernel-node graphs only; a rebuild/instantiate
@@ -1009,7 +1055,14 @@ fn xlat_mod(b: &mut dyn Backend, golden: u64) -> u64 {
             w
         }
         Err(e) => {
-            eprintln!("[M3a-lazy] module reload failed: e={e}");
+            static RELOAD_FAILS: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let n = RELOAD_FAILS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 8 {
+                eprintln!("[M3a-lazy] module reload failed: e={e}");
+            } else if n == 8 {
+                eprintln!("[M3a-lazy] module reload failing repeatedly (e={e}); further reports suppressed");
+            }
             // NULL, not the golden handle: the driver rejects a NULL module with
             // a clean error, but DEREFERENCES a foreign-context handle (SIGSEGV
             // in cuModuleGetFunction — seen when a sticky fault poisoned reloads).
@@ -1741,6 +1794,11 @@ fn optrace_summary(req: &Request) -> Option<String> {
         }
         Request::MemAddressReserve { size, .. } => format!("VmmReserve size={size:#x}"),
         Request::MemCreate { size, .. } => format!("VmmCreate size={size:#x}"),
+        Request::MemCreateVh {
+            size, handle_vh, ..
+        } => {
+            format!("VmmCreateVh size={size:#x} vh={handle_vh:#x}")
+        }
         Request::MemMap {
             va, size, handle, ..
         } => {
@@ -1787,6 +1845,14 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             .unwrap_or(0.0);
         let rt = ROUNDTRIP_COUNT.load(std::sync::atomic::Ordering::Relaxed);
         eprintln!("[rpc-stats] count={rpc_n} roundtrips={rt} wall={wall:.6}");
+    }
+    // Map a guest device index through the session's pin (guest 0 → host N).
+    fn dev(sess: &Session, device: i32) -> i32 {
+        if sess.device_pinned {
+            sess.device_base + device
+        } else {
+            device
+        }
     }
     // Translate an opaque id to the backend's raw handle, or error.
     fn raw(map: &HashMap<u64, u64>, id: u64) -> CuResult<u64> {
@@ -1886,18 +1952,28 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 b.init().map(|_| Response::Handle(token))
             }
         }
-        Request::DeviceGetCount => b.device_get_count().map(Response::Count),
-        Request::DeviceGetName { device } => b.device_get_name(device).map(Response::Name),
-        Request::DeviceTotalMem { device } => b.device_total_mem(device).map(Response::Bytes),
-        Request::DriverGetVersion => b.driver_get_version().map(Response::Count),
-        Request::DeviceGetAttribute { attrib, device } => {
-            b.device_get_attribute(attrib, device).map(Response::Count)
+        Request::DeviceGetCount => {
+            if sess.device_pinned {
+                // Pinned sessions see exactly one device (their pin).
+                return Ok(Response::Count(1));
+            }
+            b.device_get_count().map(Response::Count)
         }
+        Request::DeviceGetName { device } => {
+            b.device_get_name(dev(sess, device)).map(Response::Name)
+        }
+        Request::DeviceTotalMem { device } => {
+            b.device_total_mem(dev(sess, device)).map(Response::Bytes)
+        }
+        Request::DriverGetVersion => b.driver_get_version().map(Response::Count),
+        Request::DeviceGetAttribute { attrib, device } => b
+            .device_get_attribute(attrib, dev(sess, device))
+            .map(Response::Count),
         Request::DeviceGetUuid { device } => b
-            .device_get_uuid(device)
+            .device_get_uuid(dev(sess, device))
             .map(|u| Response::Data(u.to_vec())),
         Request::CtxCreate { device } => {
-            let raw = b.ctx_create(device)?;
+            let raw = b.ctx_create(dev(sess, device))?;
             let id = sess.mint();
             sess.contexts.insert(id, raw);
             Ok(Response::Handle(id))
@@ -1909,6 +1985,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             Ok(Response::Ok)
         }
         Request::PrimaryCtxRetain { device } => {
+            let device = dev(sess, device);
             let raw = b.primary_ctx_retain(device)?;
             sess.primary_retains += 1;
             let id = sess.mint();
@@ -1968,6 +2045,20 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                         }
                     }
                 }
+                // Worker-mode: reconstruction already made private copies of the
+                // golden's non-VMM allocations (the daemon-process registries
+                // above are empty in a worker) — adopt them into this session's
+                // translation exactly like the copies made in-daemon.
+                for (gdptr, size, cdptr) in take_worker_alloc_trans() {
+                    sess.dptr_trans.push((gdptr, size, cdptr));
+                    sess.owned_dptrs.insert(cdptr, size);
+                    sess.alloc_table
+                        .lock()
+                        .unwrap()
+                        .insert(cdptr, (size, false));
+                    copied += 1;
+                    cbytes += size;
+                }
                 gpu::set_lib_trans(&sess.dptr_trans); // forwarded-lib pointer map
                 eprintln!(
                     "[cuda-fork-isolate] clone resumed token {parent}: {copied} private copies \
@@ -2008,6 +2099,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             Ok(Response::Handle(id))
         }
         Request::PrimaryCtxRelease { device } => {
+            let device = dev(sess, device);
             sess.primary_retains = sess.primary_retains.saturating_sub(1);
             b.primary_ctx_release(device).map(|_| Response::Ok)
         }
@@ -2558,6 +2650,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             }
             // Path 3: create the physical IPC-exportable so a clone worker process
             // can import it and place it at the golden's exact VA (M2).
+            let device = dev(sess, device);
             let created = if path3_enabled() {
                 b.mem_create_exportable(size, device)
             } else {
@@ -2568,12 +2661,41 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 Response::Handle(h)
             })
         }
+        Request::MemCreateVh {
+            size,
+            device,
+            handle_vh,
+        } => {
+            let limit = vram_limit();
+            let used: u64 = sess.owned_dptrs.values().sum::<u64>()
+                + sess.owned_vmm_handles.values().sum::<u64>();
+            if used.saturating_add(size) > limit {
+                return Err(2); // CUDA_ERROR_OUT_OF_MEMORY (surfaces via sticky)
+            }
+            let device = dev(sess, device);
+            let created = if path3_enabled() {
+                b.mem_create_exportable(size, device)
+            } else {
+                b.mem_create(size, device)
+            };
+            created.map(|h| {
+                sess.owned_vmm_handles.insert(h, size);
+                sess.vmm_vhandles.insert(handle_vh, h);
+                Response::Ok
+            })
+        }
         Request::MemMap {
             va,
             size,
             offset,
             handle,
         } => {
+            // The guest-visible value: a burst virtual handle, or (legacy) the
+            // raw real. Recorded as the chunk's ghandle so a clone's inherited
+            // ops (which carry this value) translate in the worker.
+            let ghandle = handle;
+            // Burst create: resolve the session's minted virtual handle.
+            let handle = sess.vmm_vhandles.get(&handle).copied().unwrap_or(handle);
             // Path 3 worker: an inherited golden handle must map via the worker's
             // own physical (raw golden values are invalid in this context).
             let handle = VMM_TRANS
@@ -2590,15 +2712,16 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                     ChunkCover {
                         size,
                         handle,
+                        ghandle,
                         ..ChunkCover::default()
                     },
                 );
                 Response::Ok
             })
         }
-        Request::MemSetAccess { va, size, device } => {
-            b.mem_set_access(va, size, device).map(|_| Response::Ok)
-        }
+        Request::MemSetAccess { va, size, device } => b
+            .mem_set_access(va, size, dev(sess, device))
+            .map(|_| Response::Ok),
         Request::MemUnmap { va, size } => {
             sess.owned_vmm_maps.remove(&va);
             sess.vmm_ranges.lock().unwrap().remove(&va);
@@ -2606,6 +2729,8 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             b.mem_unmap(va, size).map(|_| Response::Ok)
         }
         Request::MemRelease { handle } => {
+            // Burst create: resolve (and retire) the session's virtual handle.
+            let handle = sess.vmm_vhandles.remove(&handle).unwrap_or(handle);
             let created_here = sess.owned_vmm_handles.remove(&handle).is_some();
             // Path 3 worker: translate an inherited golden handle to the worker
             // handle backing that chunk (consumed: releasing twice is a no-op).
@@ -2629,13 +2754,19 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 None => b.mem_release(handle).map(|_| Response::Ok),
             }
         }
+        Request::SetDeviceBase { device } => {
+            sess.device_base = device;
+            sess.device_pinned = true;
+            sess.golden_layout.lock().unwrap().device_base = device;
+            Ok(Response::Ok)
+        }
         Request::MemAddressFree { va, size } => {
             sess.owned_vmm_reservations.remove(&va);
             sess.golden_layout.lock().unwrap().reservations.remove(&va);
             b.mem_address_free(va, size).map(|_| Response::Ok)
         }
         Request::MemGetAllocationGranularity { device, flags } => b
-            .mem_get_allocation_granularity(device, flags)
+            .mem_get_allocation_granularity(dev(sess, device), flags)
             .map(Response::Bytes),
     })();
     let (status, resp) = match r {

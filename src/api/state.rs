@@ -344,6 +344,7 @@ impl ApiState {
                 memory_mb: Some(record.mem),
                 network: Some(record.network),
                 gpu: record.gpu,
+                cuda: Some(record.cuda),
                 storage_gb: record.storage_gb,
                 overlay_gb: record.overlay_gb,
                 allowed_cidrs: record.allowed_cidrs.clone(),
@@ -820,6 +821,10 @@ impl ApiState {
         record.allowed_cidrs = reg.resources.allowed_cidrs.clone();
         record.dns_filter_hosts = reg.resources.allowed_hosts.clone();
         record.network_backend = reg.resources.network_backend;
+        // GPU flags (previously dropped here, so API-created machines
+        // silently lost CUDA/GPU on restart).
+        record.gpu = reg.resources.gpu;
+        record.cuda = reg.resources.cuda.unwrap_or(false);
         record.docker_socket = reg.docker_socket;
         record.image = reg.image;
         record.source_smolmachine = reg.source_smolmachine.clone();
@@ -1269,9 +1274,7 @@ pub fn resource_spec_to_vm_resources(spec: &ResourceSpec, network: bool) -> VmRe
         // inherit the default. Add to ResourceSpec if the API ever
         // needs to expose it.
         gpu_vram_mib: None,
-        // CUDA-over-vsock is exposed via the local CLI/SDK first; add to
-        // ResourceSpec when the cloud transport wires it (mirrors gpu_vram_mib).
-        cuda: false,
+        cuda: spec.cuda.unwrap_or(false),
         rosetta: false,
         storage_gib: spec.storage_gb,
         overlay_gib: spec.overlay_gb,
@@ -1289,6 +1292,7 @@ pub fn vm_resources_to_spec(res: VmResources) -> ResourceSpec {
         memory_mb: Some(res.memory_mib),
         network: Some(res.network),
         gpu: Some(res.gpu),
+        cuda: Some(res.cuda),
         storage_gb: res.storage_gib,
         overlay_gb: res.overlay_gib,
         allowed_cidrs: res.allowed_cidrs,
@@ -1409,6 +1413,7 @@ mod tests {
             memory_mb: None,
             network: None,
             gpu: None,
+            cuda: None,
             storage_gb: None,
             overlay_gb: None,
             allowed_cidrs: None,
@@ -1473,6 +1478,7 @@ mod tests {
                     memory_mb: None,
                     network: None,
                     gpu: None,
+                    cuda: None,
                     storage_gb: None,
                     overlay_gb: None,
                     allowed_cidrs: None,
@@ -1535,6 +1541,7 @@ mod tests {
                     memory_mb: None,
                     network: None,
                     gpu: None,
+                    cuda: None,
                     storage_gb: None,
                     overlay_gb: None,
                     allowed_cidrs: None,

@@ -2835,12 +2835,25 @@ pub struct ForkCmd {
     /// golden's forwards are remapped to freshly-allocated host ports.
     #[arg(short = 'p', long = "port", value_parser = PortMapping::parse, value_name = "HOST:GUEST", help_heading = "Network")]
     pub port: Vec<PortMapping>,
+
+    /// Share the golden's loaded CUDA weights with this clone instead of
+    /// copying them — sibling clones then keep ONE copy of the base model in
+    /// VRAM. Correct when the base stays frozen (LoRA/QLoRA fine-tuning,
+    /// inference); use a plain fork when the clone trains the base weights.
+    #[arg(long)]
+    pub share_weights: bool,
 }
 
 impl ForkCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let ports: Vec<(u16, u16)> = self.port.iter().map(|p| (p.host, p.guest)).collect();
-        vm_common::fork_vm(&self.golden, &self.clone, self.forkable, &ports)
+        vm_common::fork_vm(
+            &self.golden,
+            &self.clone,
+            self.forkable,
+            &ports,
+            self.share_weights,
+        )
     }
 }
 

@@ -230,12 +230,17 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
     // Our own primary context (separate process ⇒ own UVA), so we can place memory
     // at the golden's exact VAs.
     let _ = backend.init();
-    let _ = backend.primary_ctx_retain(0);
+    // Reconstruct on the GOLDEN's GPU: the exported physical lives there.
+    let clone_dev: i32 = std::env::var("SMOLVM_CUDA_CLONE_DEVICE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let _ = backend.primary_ctx_retain(clone_dev);
     // M2: reconstruct the golden's memory at its exact VAs from the layout the
     // daemon passed (SMOLVM_CUDA_CLONE_LAYOUT) + the golden's physical exported to
     // fds 4.. — BEFORE serving, so the clone's inherited pointers are valid verbatim.
     if let Ok(layout) = std::env::var("SMOLVM_CUDA_CLONE_LAYOUT") {
-        let (n, vmm_trans) = reconstruct_golden_memory(backend.as_mut(), &layout);
+        let (n, vmm_trans) = reconstruct_golden_memory(backend.as_mut(), &layout, clone_dev);
         tracing::info!(
             maps = n,
             vmm_handles = vmm_trans.len(),
@@ -355,15 +360,26 @@ fn import_with_retry(b: &mut dyn Backend, fd: i32) -> Result<u64, i32> {
 fn reconstruct_golden_memory(
     b: &mut dyn Backend,
     layout: &str,
+    device: i32,
 ) -> (usize, std::collections::HashMap<u64, u64>) {
     let mut vmm_trans = std::collections::HashMap::new();
-    let (mut resv_s, mut maps_s) = ("", "");
+    let (mut resv_s, mut maps_s, mut aregions_s, mut allocs_s) = ("", "", "", "");
+    let mut astage: Option<i32> = None;
     for part in layout.split('|') {
         if let Some(r) = part.strip_prefix("resv=") {
             resv_s = r;
         }
         if let Some(m) = part.strip_prefix("maps=") {
             maps_s = m;
+        }
+        if let Some(a) = part.strip_prefix("astage=") {
+            astage = a.parse().ok();
+        }
+        if let Some(a) = part.strip_prefix("aregions=") {
+            aregions_s = a;
+        }
+        if let Some(a) = part.strip_prefix("allocs=") {
+            allocs_s = a;
         }
     }
     let hx = |s: &str| u64::from_str_radix(s, 16).ok();
@@ -404,7 +420,7 @@ fn reconstruct_golden_memory(
             let mut ok = false;
             if let Ok(gh) = import_with_retry(b, 4 + idx) {
                 if b.mem_map(va, size, 0, gh).is_ok() {
-                    if b.mem_set_access(va, size, 0).is_ok() {
+                    if b.mem_set_access(va, size, device).is_ok() {
                         ok = true;
                     } else {
                         let _ = b.mem_unmap(va, size); // roll back for the fallback
@@ -435,7 +451,7 @@ fn reconstruct_golden_memory(
         // VA, then copy the golden's bytes in via a temp mapping of the imported
         // physical. Reads see the golden's data; writes hit the clone's own copy,
         // so a clone can't corrupt the frozen golden.
-        let priv_h = match b.mem_create(size, 0) {
+        let priv_h = match b.mem_create(size, device) {
             Ok(h) => h,
             Err(e) => {
                 tracing::warn!(e, "M2: private create failed");
@@ -451,7 +467,7 @@ fn reconstruct_golden_memory(
         if let Some(g) = golden_h {
             vmm_trans.insert(g, priv_h);
         }
-        if let Err(e) = b.mem_set_access(va, size, 0) {
+        if let Err(e) = b.mem_set_access(va, size, device) {
             tracing::warn!(e, va, "M2: private set_access failed");
         }
         match import_with_retry(b, 4 + idx) {
@@ -459,7 +475,7 @@ fn reconstruct_golden_memory(
                 if let Ok(tmp) = b.mem_address_reserve(size, 0) {
                     match b.mem_map(tmp, size, 0, gh) {
                         Ok(()) => {
-                            if let Err(e) = b.mem_set_access(tmp, size, 0) {
+                            if let Err(e) = b.mem_set_access(tmp, size, device) {
                                 tracing::warn!(e, "M2: temp set_access failed");
                             }
                             if let Err(e) = b.memcpy_dtod(va, tmp, size) {
@@ -482,6 +498,83 @@ fn reconstruct_golden_memory(
     }
     if share_weights {
         tracing::info!(shared, private = count - shared, "M2: shared weight ranges");
+    }
+    // Non-VMM golden allocations (`cudaMalloc` — a plain-torch golden keeps ALL
+    // its tensors here): copy each from the daemon's staged export into a fresh
+    // private buffer and record a POINTER TRANSLATION, exactly like the
+    // in-daemon isolate path. cudaMalloc VAs can't be address-preserved — they
+    // collide with the worker's own host mappings (cuMemAddressReserve treats
+    // the address as a hint) — but every op already translates through
+    // `dptr_trans`, so translated copies are equivalent.
+    if let (Some(sidx), false) = (astage, aregions_s.is_empty()) {
+        let regions: Vec<(u64, u64, u64)> = aregions_s
+            .split(',')
+            .filter(|e| !e.is_empty())
+            .filter_map(|e| {
+                let f: Vec<&str> = e.split(':').collect();
+                match (
+                    hx(f[0]),
+                    f.get(1).and_then(|v| hx(v)),
+                    f.get(2).and_then(|v| hx(v)),
+                ) {
+                    (Some(b0), Some(sz), Some(off)) => Some((b0, sz, off)),
+                    _ => None,
+                }
+            })
+            .collect();
+        let allocs: Vec<(u64, u64)> = allocs_s
+            .split(',')
+            .filter(|e| !e.is_empty())
+            .filter_map(|e| {
+                let (d, sz) = e.split_once(':')?;
+                Some((hx(d)?, hx(sz)?))
+            })
+            .collect();
+        let total: u64 = regions.iter().map(|r| r.1).sum();
+        let mut trans: Vec<(u64, u64, u64)> = Vec::new();
+        match import_with_retry(b, 4 + sidx) {
+            Ok(sh) => {
+                if let Ok(tmp) = b.mem_address_reserve(total, 0) {
+                    if b.mem_map(tmp, total, 0, sh).is_ok() {
+                        let _ = b.mem_set_access(tmp, total, device);
+                        for &(d, sz) in &allocs {
+                            // Staging offset: region offset + intra-region delta.
+                            let Some(&(base, _, off)) =
+                                regions.iter().find(|&&(b0, rs, _)| d >= b0 && d < b0 + rs)
+                            else {
+                                continue;
+                            };
+                            let cdptr = match b.mem_alloc(sz) {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    tracing::warn!(e, d, "M2-alloc: copy alloc failed");
+                                    continue;
+                                }
+                            };
+                            if let Err(e) = b.memcpy_dtod(cdptr, tmp + off + (d - base), sz) {
+                                tracing::warn!(e, d, "M2-alloc: dtod failed");
+                            }
+                            trans.push((d, sz, cdptr));
+                        }
+                        let _ = b.ctx_synchronize();
+                        let _ = b.mem_unmap(tmp, total);
+                    } else {
+                        tracing::warn!("M2-alloc: staging map failed");
+                    }
+                    let _ = b.mem_address_free(tmp, total);
+                }
+                let _ = b.mem_release(sh);
+            }
+            Err(e) => tracing::warn!(e, "M2-alloc: staging import failed"),
+        }
+        tracing::info!(
+            copies = trans.len(),
+            of = allocs.len(),
+            bytes = total,
+            "M2-alloc: private translated copies of the golden's non-VMM allocations"
+        );
+        count += trans.len();
+        smolvm_cuda::host::set_worker_alloc_trans(trans);
     }
     (count, vmm_trans)
 }
@@ -684,8 +777,8 @@ fn reconstruct_golden_modules(
 /// mode — an unconsumed preamble would corrupt the frame stream. Non-preamble
 /// connections are left untouched (peek only).
 #[cfg(unix)]
-fn consume_clone_preamble(fd: std::os::unix::io::RawFd) -> Option<u64> {
-    let mut buf = [0u8; 16];
+fn consume_clone_preamble(fd: std::os::unix::io::RawFd) -> Option<(u64, u8)> {
+    let mut buf = [0u8; 17];
     // Same buffered-in-pieces caveat as peek_clone_token: retry the peek
     // briefly so a slow proxy write can't make us misread the magic.
     let mut n: isize = 0;
@@ -704,28 +797,28 @@ fn consume_clone_preamble(fd: std::os::unix::io::RawFd) -> Option<u64> {
         if n >= 8 && buf[..(n as usize).min(8)] != smolvm_cuda::proto::CLONE_PREAMBLE_MAGIC {
             return None;
         }
-        if n >= 16 || n == 0 {
+        if n >= 17 || n == 0 {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    if n < 16 || buf[..8] != smolvm_cuda::proto::CLONE_PREAMBLE_MAGIC {
+    if n < 17 || buf[..8] != smolvm_cuda::proto::CLONE_PREAMBLE_MAGIC {
         return None;
     }
-    // Consume exactly the 16 preamble bytes, leaving the RPC stream intact.
+    // Consume exactly the 17 preamble bytes, leaving the RPC stream intact.
     // SAFETY: plain recv on a valid fd; MSG_WAITALL for the already-peeked bytes.
     let c = unsafe {
         libc::recv(
             fd,
             buf.as_mut_ptr() as *mut libc::c_void,
-            16,
+            17,
             libc::MSG_WAITALL,
         )
     };
-    if c != 16 {
+    if c != 17 {
         return None;
     }
-    Some(u64::from_le_bytes(buf[8..16].try_into().unwrap()))
+    Some((u64::from_le_bytes(buf[8..16].try_into().unwrap()), buf[16]))
 }
 
 /// Live clone workers keyed by (lineage token, clone id) → worker pid. A
@@ -747,9 +840,10 @@ fn clone_worker_registry() -> &'static Mutex<std::collections::HashMap<(u64, u64
 /// would silently serve it a reconstructed COPY of its memory).
 #[cfg(unix)]
 fn route_clone_connection(fd: std::os::unix::io::RawFd) -> bool {
-    let Some(clone_id) = consume_clone_preamble(fd) else {
+    let Some((clone_id, flags)) = consume_clone_preamble(fd) else {
         return false;
     };
+    let share_weights = flags & 1 != 0;
     let Some(token) = peek_clone_token(fd) else {
         // A clone VM's connection whose Init carries no lineage token: fresh
         // post-fork work (new guest process), served in-daemon like any new
@@ -771,13 +865,14 @@ fn route_clone_connection(fd: std::os::unix::io::RawFd) -> bool {
         }
         reg.remove(&(token, clone_id));
     }
-    match spawn_clone_worker(fd, token) {
+    match spawn_clone_worker(fd, token, share_weights) {
         Ok(pid) => {
             reg.insert((token, clone_id), pid);
             tracing::info!(
                 token,
                 clone_id,
                 worker_pid = pid,
+                share_weights,
                 "routed isolating clone to a worker process"
             );
         }
@@ -857,15 +952,81 @@ fn verify_chunk_content(b: &mut dyn Backend, ch: &smolvm_cuda::host::HandoffChun
     }
 }
 
+/// Stage private copies of the golden's non-VMM (`cudaMalloc`) allocations into
+/// one exportable physical the worker can import. Regions are
+/// granularity-aligned merged spans of the allocations' VAs; each allocation's
+/// bytes are copied at `region_off + (dptr - region_base)` so the worker can
+/// blit whole regions back to the golden's exact VAs. Returns the export fd.
+#[cfg(unix)]
+fn stage_alloc_copies(
+    b: &mut dyn smolvm_cuda::host::Backend,
+    device: i32,
+    allocs: &[(u64, u64, bool)],
+    regions: &[(u64, u64)], // (base, end)
+    total: u64,
+) -> Result<i32, String> {
+    let h = b
+        .mem_create_exportable(total, device)
+        .map_err(|e| format!("stage create: {e}"))?;
+    let tmp = match b.mem_address_reserve(total, 0) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = b.mem_release(h);
+            return Err(format!("stage reserve: {e}"));
+        }
+    };
+    let mut copy = || -> Result<(), String> {
+        b.mem_map(tmp, total, 0, h)
+            .map_err(|e| format!("stage map: {e}"))?;
+        b.mem_set_access(tmp, total, device)
+            .map_err(|e| format!("stage access: {e}"))?;
+        for &(d, sz, _) in allocs {
+            // Locate the containing region and its offset into the staging chunk.
+            let mut off = 0u64;
+            for &(base, end) in regions {
+                if d >= base && d < end {
+                    b.memcpy_dtod(tmp + off + (d - base), d, sz)
+                        .map_err(|e| format!("stage dtod {d:#x}: {e}"))?;
+                    break;
+                }
+                off += end - base;
+            }
+        }
+        let _ = b.ctx_synchronize();
+        Ok(())
+    };
+    let res = copy();
+    let _ = b.mem_unmap(tmp, total);
+    let _ = b.mem_address_free(tmp, total);
+    match res.and_then(|()| {
+        b.mem_export_handle(h)
+            .map_err(|e| format!("stage export: {e}"))
+    }) {
+        Ok(fd) => {
+            // The fd holds its own driver reference; drop ours.
+            let _ = b.mem_release(h);
+            Ok(fd)
+        }
+        Err(e) => {
+            let _ = b.mem_release(h);
+            Err(e)
+        }
+    }
+}
+
 /// Path 3 (M1): hand the accepted connection to a fresh worker PROCESS (its own
 /// CUDA context, hence its own UVA — so it can place memory at the golden's exact
 /// VAs). `dup2` the socket fd onto fd 3 in the child (clears CLOEXEC) and exec
 /// `smolvm _cuda-clone-worker 3`; the daemon then drops its own copy.
 #[cfg(unix)]
-fn spawn_clone_worker(conn_fd: std::os::unix::io::RawFd, token: u64) -> io::Result<u32> {
+fn spawn_clone_worker(
+    conn_fd: std::os::unix::io::RawFd,
+    token: u64,
+    share_weights: bool,
+) -> io::Result<u32> {
     use std::os::unix::process::CommandExt;
     // Gather the golden's VMM layout (reservations + maps→physical handle).
-    let (resvs, maps) = smolvm_cuda::host::layout_handoff_snapshot(token)
+    let (resvs, maps, golden_dev) = smolvm_cuda::host::layout_handoff_snapshot(token)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no golden layout for token"))?;
     // Export each map's physical to a POSIX fd (in the golden's shared context) and
     // build the layout string the worker parses
@@ -878,7 +1039,7 @@ fn spawn_clone_worker(conn_fd: std::os::unix::io::RawFd, token: u64) -> io::Resu
         .init()
         .map_err(|e| io::Error::other(format!("worker-export init: {e}")))?;
     backend
-        .primary_ctx_retain(0)
+        .primary_ctx_retain(golden_dev)
         .map_err(|e| io::Error::other(format!("ctx retain: {e}")))?;
     // Commit the golden's pending device work so its writes are visible in the
     // physical the clone will IPC-import (the golden runs on another thread of the
@@ -911,8 +1072,59 @@ fn spawn_clone_worker(conn_fd: std::os::unix::io::RawFd, token: u64) -> io::Resu
             let ld = u8::from(safe);
             layout.push_str(&format!(
                 "{:x}:{:x}:{}:{}:{:x},",
-                ch.va, ch.size, idx, ld, ch.handle
+                ch.va, ch.size, idx, ld, ch.ghandle
             ));
+        }
+    }
+    // Non-VMM golden memory: a plain-torch golden (no expandable_segments) keeps
+    // every tensor in cudaMalloc'd blocks that never enter the VMM layout, so a
+    // worker-mode clone would lose them all (illegal address on first touch —
+    // the maps above only cover VMM). Stage private copies for the worker.
+    if let Some(allocs) = smolvm_cuda::host::alloc_handoff_snapshot(token) {
+        if !allocs.is_empty() {
+            let gran = backend
+                .mem_get_allocation_granularity(golden_dev, 0)
+                .unwrap_or(1 << 21)
+                .max(1 << 16);
+            let mut spans: Vec<(u64, u64)> = allocs
+                .iter()
+                .map(|&(d, sz, _)| (d & !(gran - 1), (d + sz + gran - 1) & !(gran - 1)))
+                .collect();
+            spans.sort_unstable();
+            let mut regions: Vec<(u64, u64)> = Vec::new();
+            for (b0, e0) in spans {
+                match regions.last_mut() {
+                    Some((_, e)) if b0 <= *e => *e = (*e).max(e0),
+                    _ => regions.push((b0, e0)),
+                }
+            }
+            let total: u64 = regions.iter().map(|&(b0, e0)| e0 - b0).sum();
+            match stage_alloc_copies(backend.as_mut(), golden_dev, &allocs, &regions, total) {
+                Ok(efd) => {
+                    let idx = export_fds.len();
+                    export_fds.push(efd);
+                    layout.push_str(&format!("|astage={idx}|aregions="));
+                    let mut off = 0u64;
+                    for &(b0, e0) in &regions {
+                        layout.push_str(&format!("{:x}:{:x}:{:x},", b0, e0 - b0, off));
+                        off += e0 - b0;
+                    }
+                    layout.push_str("|allocs=");
+                    for &(d, sz, _) in &allocs {
+                        layout.push_str(&format!("{d:x}:{sz:x},"));
+                    }
+                    tracing::info!(
+                        allocs = allocs.len(),
+                        regions = regions.len(),
+                        bytes = total,
+                        "staged the golden's non-VMM allocations for the worker"
+                    );
+                }
+                Err(e) => tracing::warn!(
+                    e,
+                    "failed to stage non-VMM golden allocations; the clone will fault on pre-fork tensors"
+                ),
+            }
         }
     }
     // M3a: serialize the golden's modules (images) + functions to a temp file for
@@ -1009,6 +1221,14 @@ fn spawn_clone_worker(conn_fd: std::os::unix::io::RawFd, token: u64) -> io::Resu
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("_cuda-clone-worker").arg("3");
     cmd.env("SMOLVM_CUDA_CLONE_LAYOUT", layout);
+    cmd.env("SMOLVM_CUDA_CLONE_DEVICE", golden_dev.to_string());
+    // Per-fork density: this fork asked for --share-weights (preamble flag), so
+    // the worker's reconstruction shares the golden's loaded weight physicals
+    // instead of copying them. The daemon-wide env remains the global default;
+    // the worker inherits it, so the flag only ever ADDS sharing.
+    if share_weights {
+        cmd.env("SMOLVM_CUDA_FORK_SHARE_WEIGHTS", "1");
+    }
     if let Some(mp) = &modpath {
         cmd.env("SMOLVM_CUDA_CLONE_MODULES", mp);
     }
