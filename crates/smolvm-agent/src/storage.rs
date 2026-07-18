@@ -530,15 +530,12 @@ fn create_packed_image_info(image: &str, packed_dir: &Path) -> Result<ImageInfo>
         .map(|name| format!("sha256:{}", name))
         .collect();
 
-    // Calculate approximate size
-    let mut total_size = 0u64;
-    for layer_digest in &layer_dirs {
-        let short_id = layer_digest.strip_prefix("sha256:").unwrap_or(layer_digest);
-        let layer_path = packed_dir.join(short_id);
-        if let Ok(size) = dir_size(&layer_path) {
-            total_size += size;
-        }
-    }
+    // Size is informational only — never walk the layer trees for it. The
+    // packed dir is virtiofs-backed, and stat-ing a multi-GB extracted layer
+    // (hundreds of thousands of files) costs a FUSE round-trip per entry:
+    // minutes on the first Run, which blows the client's 120s read timeout and
+    // surfaces as EAGAIN before the container ever assembles.
+    let total_size = 0u64;
 
     // Determine architecture from environment or default
     #[cfg(target_arch = "aarch64")]
