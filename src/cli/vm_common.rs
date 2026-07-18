@@ -1072,22 +1072,15 @@ pub fn start_vm_named(
         // container and hang every later `machine exec`, so skip the (re)launch
         // entirely when restoring from a snapshot — the forked container is
         // inherited as-is.
-        let mut cmd = record.entrypoint.clone();
-        cmd.extend(record.cmd.clone());
+        let _ = img;
         if !from_snapshot {
-            let mount_bindings =
-                crate::cli::parsers::record_mounts_to_runconfig_bindings(&record.mounts);
-            let bg_config = smolvm::agent::RunConfig::new(img, cmd)
-                .with_env(exec_env.clone())
-                .with_workdir(record.workdir.clone())
-                .with_user(record.user.clone())
-                .with_mounts(mount_bindings)
-                .with_persistent_overlay(Some(name.to_string()));
-            if let Err(e) = client.run_container_detached(bg_config) {
+            if let Err(e) =
+                smolvm::workload::launch_image_workload(&mut client, name, &record, exec_env.clone())
+            {
                 if let Err(stop_err) = manager.stop() {
                     tracing::warn!(error = %stop_err, "failed to stop machine after CMD launch failure");
                 }
-                return Err(smolvm::Error::agent("start background CMD", format!("{e}")));
+                return Err(e);
             }
         } else {
             tracing::info!(

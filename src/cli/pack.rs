@@ -8,10 +8,8 @@
 //! - Configuration manifest
 
 use clap::{Args, Subcommand};
-use smolvm::agent::{resolve_disk_image, AgentClient, AgentManager, VmResources};
-use smolvm::data::disk::DiskFormat;
+use smolvm::agent::{AgentClient, AgentManager, VmResources};
 use smolvm::data::resources::DEFAULT_MICROVM_CPU_COUNT;
-use smolvm::storage::{OVERLAY_DISK_FILENAME, STORAGE_DISK_FILENAME};
 
 /// Default memory for packed VMs. Same as machine create — memory is elastic
 /// via virtio balloon, so the host only commits what the guest actually uses.
@@ -21,7 +19,7 @@ use smolvm::config::{RecordState, SmolvmConfig};
 use smolvm::platform::{Arch, Os, Platform, VmExecutor};
 use smolvm::Error;
 use smolvm_pack::assets::AssetCollector;
-use smolvm_pack::format::{PackManifest, PackMode};
+use smolvm_pack::format::PackManifest;
 use smolvm_pack::packer::Packer;
 use smolvm_pack::signing::sign_with_hypervisor_entitlements;
 use smolvm_protocol::AgentResponse;
@@ -518,28 +516,9 @@ impl PackCreateCmd {
             ));
         }
 
-        // 2. Locate the VM's disks. Default-size machines on Linux get qcow2 CoW
-        // overlays (overlay.qcow2 / storage.qcow2), not `.raw`, so resolve whichever
-        // format exists rather than hardcoding `.raw`. The overlay template is only
-        // consumed by VM-mode (bare) restores — container restores ignore it — so it
-        // is required only for non-image VMs.
-        let vm_dir = smolvm::agent::vm_data_dir(&vm_name);
-        let (overlay_disk, overlay_fmt) = resolve_disk_image(&vm_dir, OVERLAY_DISK_FILENAME);
-        let is_image_based = vm.image.is_some();
-        let is_artifact_sourced_container = is_image_based && vm.source_smolmachine.is_some();
-        if !is_image_based && !overlay_disk.exists() {
-            return Err(Error::agent(
-                "pack from VM",
-                format!(
-                    "overlay disk not found at {}. The VM may not have been started yet.",
-                    overlay_disk.display()
-                ),
-            ));
-        }
-
         println!("Packing VM '{}' snapshot...", vm_name);
 
-        // 3. Create temporary staging directory
+        // 2. Create temporary staging directory
         let temp_dir = tempfile::Builder::new()
             .prefix("pack-staging-")
             .tempdir_in(self.staging_root()?)
@@ -549,81 +528,24 @@ impl PackCreateCmd {
         let mut collector = AssetCollector::new(staging_dir.clone())
             .map_err(|e| Error::agent("collect assets", e.to_string()))?;
 
-        // 4. For image-based VMs, preserve imported artifact layers by default
-        // and append the current container overlay. The explicit rebase path keeps
-        // the historical behavior of rebuilding lower layers from vm.image.
-        if is_artifact_sourced_container && !self.rebase_from_image {
-            let source_smolmachine = vm.source_smolmachine.clone().unwrap();
-            let source_path = Path::new(&source_smolmachine);
-            let source_manifest = if source_path.exists() {
-                Some(
-                    smolvm_pack::packer::read_manifest_from_sidecar(source_path)
-                        .map_err(|e| Error::agent("read .smolmachine", e.to_string()))?,
-                )
-            } else {
-                None
-            };
+        // 3. Collect the machine's state via the shared export (single source
+        // of truth for bare / image / artifact-sourced dispatch and the
+        // single-layer flatten).
+        self.collect_base_assets(&mut collector)?;
+        let export_opts = smolvm::pack_export::FromVmExportOptions {
+            proxy: self.proxy_opts.proxy().map(str::to_string),
+            no_proxy: self.proxy_opts.no_proxy().map(str::to_string),
+            rebase_from_image: self.rebase_from_image,
+        };
+        let assets = smolvm::pack_export::collect_from_vm_assets(
+            &mut collector,
+            &vm_name,
+            vm,
+            temp_dir.path(),
+            &export_opts,
+        )?;
 
-            self.collect_base_assets(&mut collector)?;
-            let imported_layers =
-                match self.imported_layers_from_cache(&vm_name, source_manifest.as_ref())? {
-                    Some(layers) => layers,
-                    None => self.imported_layers_from_source_sidecar(
-                        &vm_name,
-                        &source_smolmachine,
-                        temp_dir.path(),
-                    )?,
-                };
-            self.add_imported_layers(&mut collector, imported_layers)?;
-            self.export_container_overlay_from_vm(&mut collector, &vm_name, &vm_dir)?;
-        } else if is_image_based {
-            let image = vm.image.clone().unwrap();
-            // A locally-sourced image (`--image -` / `--image file.tar` / a rootfs
-            // dir) is flattened on boot and has no registry manifest, so the
-            // layer-export path below — which pulls that manifest to enumerate base
-            // layers — cannot source it. Fail with a clear, actionable message
-            // instead of a confusing registry "UNAUTHORIZED" on `local:<hash>`.
-            if smolvm::data::image_source::is_local_ref(&image) {
-                return Err(Error::agent(
-                    "pack from VM",
-                    format!(
-                        "VM '{vm_name}' was created from a local image ({image}). \
-                         `pack create --from-vm` can only snapshot VMs created from a \
-                         REGISTRY image — local archives and rootfs directories are \
-                         flattened on boot and have no registry manifest to re-pull. \
-                         Recreate the machine from a registry reference to pack it."
-                    ),
-                ));
-            }
-
-            self.collect_base_assets(&mut collector)?;
-            self.export_registry_image_layers_from_vm(&mut collector, &vm_name, &vm_dir, &image)?;
-        } else {
-            // Bare VM: just collect base assets, no layers needed.
-            self.collect_base_assets(&mut collector)?;
-        }
-
-        // Add the overlay template (the VM's rootfs state). VM-mode restores boot
-        // from it; container restores ignore it entirely (every import path gates
-        // `overlay_template` on `PackMode::Vm`), so skip it for image-based VMs
-        // rather than flatten a qcow2 for nothing. A default-size overlay is a qcow2
-        // CoW image, which must be flattened to a raw before it can be a template.
-        if !is_image_based {
-            let overlay_for_pack = match overlay_fmt {
-                DiskFormat::Raw => overlay_disk.clone(),
-                DiskFormat::Qcow2 => {
-                    let flat = temp_dir.path().join("overlay-flat.raw");
-                    self.flatten_qcow2_to_raw(&overlay_disk, &flat)?;
-                    flat
-                }
-            };
-            println!("Copying overlay disk ({})...", overlay_for_pack.display());
-            collector
-                .add_overlay_template(&overlay_for_pack)
-                .map_err(|e| Error::agent("collect overlay", e.to_string()))?;
-        }
-
-        // 5. Resolve Smolfile overrides if provided
+        // 4. Resolve Smolfile overrides if provided
         //    Precedence: CLI > [artifact] > Smolfile top-level > VmRecord > default
         let pack_config = crate::cli::smolfile::resolve_pack_config(
             None, // no image for --from-vm
@@ -635,7 +557,7 @@ impl PackCreateCmd {
             self.smolfile.clone(),
         )?;
 
-        // 6. Build manifest
+        // 5. Build manifest: shared VM-derived baseline, then local overrides.
         let platform = format!("linux/{}", Arch::current().oci_arch());
         let host_platform = Platform::current().host_oci_platform().to_string();
         let mut manifest = PackManifest::new(
@@ -644,33 +566,15 @@ impl PackCreateCmd {
             platform,
             host_platform,
         );
-        if is_image_based {
-            manifest.mode = PackMode::Container;
-            manifest.image = vm.image.clone().unwrap_or_default();
-        } else {
-            manifest.mode = PackMode::Vm;
-        }
+        smolvm::pack_export::seed_manifest_from_vm(&mut manifest, vm, &assets);
         manifest.cpus = pack_config.cpus;
         manifest.mem = pack_config.mem;
         // Smolfile > source VM record > default
-        manifest.network = pack_config.net.unwrap_or(vm.network);
+        if let Some(net) = pack_config.net {
+            manifest.network = net;
+        }
         // CLI --gpu > Smolfile gpu > source VM record gpu > false
-        manifest.gpu = pack_config.gpu || vm.gpu.unwrap_or(false);
-        // Preserve the source VM's CUDA-over-vsock flag so the packed run starts
-        // a host CUDA server and bridges the guest's CUDA client to it.
-        manifest.cuda = vm.cuda;
-
-        // Entrypoint baseline: VmRecord > /bin/sh default
-        manifest.entrypoint = if !vm.entrypoint.is_empty() {
-            vm.entrypoint.clone()
-        } else {
-            vec!["/bin/sh".to_string()]
-        };
-        manifest.cmd = vm.cmd.clone();
-
-        // Start with VmRecord env/workdir as baseline
-        manifest.env = vm.env.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
-        manifest.workdir = vm.workdir.clone();
+        manifest.gpu = pack_config.gpu || manifest.gpu;
 
         // Layer Smolfile env on top of VmRecord env
         if !pack_config.env.is_empty() {
@@ -684,10 +588,9 @@ impl PackCreateCmd {
             }
         }
 
-        // Baseline secret refs from the source VM record, then layer the
+        // Seeded baseline secret refs come from the source VM record; layer the
         // Smolfile [secrets] on top (Smolfile wins on key collisions). Refs
         // only — plaintext is resolved on the run host, never packed.
-        manifest.secret_refs = vm.secret_refs.clone();
         manifest.secret_refs.extend(pack_config.secret_refs.clone());
 
         // Smolfile workdir overrides VmRecord workdir
@@ -708,500 +611,6 @@ impl PackCreateCmd {
         self.finalize_pack(manifest, collector, staging_dir)
     }
 
-    fn export_registry_image_layers_from_vm(
-        &self,
-        collector: &mut AssetCollector,
-        vm_name: &str,
-        vm_dir: &Path,
-        image: &str,
-    ) -> smolvm::Result<()> {
-        let (storage_disk, storage_fmt) = resolve_disk_image(vm_dir, STORAGE_DISK_FILENAME);
-        let pack_vm_name = format!(
-            "pack-fromvm-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        );
-        let vm_data = smolvm::agent::vm_data_dir(&pack_vm_name);
-
-        println!("Starting agent VM to export layers...");
-        let manager = AgentManager::for_vm(&pack_vm_name)?;
-        let features = smolvm::agent::LaunchFeatures {
-            extra_disks: vec![(storage_disk.clone(), false, storage_fmt)],
-            ..Default::default()
-        };
-        manager.start_with_full_config(
-            Vec::new(),
-            Vec::new(),
-            VmResources {
-                cpus: 4,
-                memory_mib: 8192,
-                network: true,
-                network_backend: None,
-                dns: None,
-                gpu: false,
-                cuda: false,
-                gpu_vram_mib: None,
-                rosetta: false,
-                storage_gib: None,
-                overlay_gib: None,
-                allowed_cidrs: None,
-            },
-            features,
-        )?;
-
-        let export_result: smolvm::Result<()> = (|| {
-            let mut client = manager.connect()?;
-            let (exit_code, _, stderr) = client.vm_exec(
-                vec![
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    "mkdir -p /mnt/source-storage && mount /dev/vdc /mnt/source-storage"
-                        .to_string(),
-                ],
-                vec![],
-                None,
-                None,
-                None,
-            )?;
-            if exit_code != 0 {
-                return Err(Error::agent(
-                    "mount source storage in temp VM",
-                    format!(
-                        "mount failed (exit {}): {}",
-                        exit_code,
-                        String::from_utf8_lossy(&stderr)
-                    ),
-                ));
-            }
-
-            let image_info = crate::cli::pull_with_progress(
-                &mut client,
-                image,
-                None,
-                self.proxy_opts.proxy(),
-                self.proxy_opts.no_proxy(),
-            )?;
-
-            println!("Exporting {} layers...", image_info.layer_count);
-            for (i, layer_digest) in image_info.layers.iter().enumerate() {
-                let prefix = format!(
-                    "  Layer {}/{}: {}",
-                    i + 1,
-                    image_info.layer_count,
-                    &layer_digest[..std::cmp::min(19, layer_digest.len())]
-                );
-                print!("{}...", prefix);
-                let _ = std::io::Write::flush(&mut std::io::stdout());
-                let layer_file = collector.layer_staging_path(layer_digest);
-                self.export_layer_to_file(
-                    &mut client,
-                    &image_info.digest,
-                    i,
-                    &layer_file,
-                    &prefix,
-                )?;
-                collector
-                    .register_layer(layer_digest)
-                    .map_err(|e| Error::agent("collect layers", e.to_string()))?;
-            }
-
-            self.export_container_overlay_from_mounted_storage(collector, &mut client, vm_name)?;
-
-            Ok(())
-        })();
-
-        if let Err(e) = manager.stop() {
-            warn!(error = %e, "failed to stop pack temp VM");
-        }
-        let _ = std::fs::remove_dir_all(&vm_data);
-        export_result
-    }
-
-    fn export_container_overlay_from_mounted_storage(
-        &self,
-        collector: &mut AssetCollector,
-        client: &mut AgentClient,
-        vm_name: &str,
-    ) -> smolvm::Result<()> {
-        let overlay_dir = format!("/mnt/source-storage/overlays/persistent-{}/upper", vm_name);
-        println!("Exporting container overlay...");
-        let (exit_code, _, stderr) = client.vm_exec(
-            vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                format!(
-                    "if [ -d '{}' ] && [ \"$(ls -A '{}')\" ]; then \
-                     tar cf /tmp/overlay-export.tar -C '{}' . 2>/dev/null; \
-                     echo OVERLAY_OK; \
-                     else echo OVERLAY_EMPTY; fi",
-                    overlay_dir, overlay_dir, overlay_dir
-                ),
-            ],
-            vec![],
-            None,
-            None,
-            None,
-        )?;
-
-        if exit_code == 0 {
-            // Stream the overlay tar to disk instead of buffering it: a real
-            // image's overlay (e.g. a baked-in ML venv) easily exceeds the
-            // in-memory transfer cap. Raise SMOLVM_FILE_TRANSFER_MAX_BYTES for
-            // overlays past the default streaming cap.
-            // Stage the temp download in the layers dir (same filesystem as the
-            // final digest-named file, so the rename below stays atomic).
-            let tmp_file = collector
-                .layer_staging_path(&format!("sha256:{}", "0".repeat(64)))
-                .with_file_name("overlay-export.tmp");
-            let total = client
-                .read_file_to_path("/tmp/overlay-export.tar", &tmp_file, |_| {})
-                .map_err(|e| Error::agent("export overlay layer", e.to_string()))?;
-            if total > 0 {
-                let mut hasher = Sha256::new();
-                {
-                    use std::io::Read;
-                    let mut f = std::fs::File::open(&tmp_file)
-                        .map_err(|e| Error::agent("read overlay layer", e.to_string()))?;
-                    let mut buf = vec![0u8; 4 * 1024 * 1024];
-                    loop {
-                        let n = f
-                            .read(&mut buf)
-                            .map_err(|e| Error::agent("hash overlay layer", e.to_string()))?;
-                        if n == 0 {
-                            break;
-                        }
-                        hasher.update(&buf[..n]);
-                    }
-                }
-                let overlay_digest = format!("sha256:{}", hex::encode(hasher.finalize()));
-                let overlay_layer_file = collector.layer_staging_path(&overlay_digest);
-                std::fs::rename(&tmp_file, &overlay_layer_file)
-                    .map_err(|e| Error::agent("write overlay layer", e.to_string()))?;
-                collector
-                    .register_layer(&overlay_digest)
-                    .map_err(|e| Error::agent("register overlay layer", e.to_string()))?;
-                println!("  Overlay layer: {} bytes", total);
-            } else {
-                let _ = std::fs::remove_file(&tmp_file);
-            }
-        } else {
-            tracing::debug!(stderr = %String::from_utf8_lossy(&stderr), "overlay export: no container changes found");
-        }
-
-        Ok(())
-    }
-
-    fn export_container_overlay_from_vm(
-        &self,
-        collector: &mut AssetCollector,
-        vm_name: &str,
-        vm_dir: &Path,
-    ) -> smolvm::Result<()> {
-        let (storage_disk, storage_fmt) = resolve_disk_image(vm_dir, STORAGE_DISK_FILENAME);
-        let pack_vm_name = format!(
-            "pack-fromvm-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        );
-        let vm_data = smolvm::agent::vm_data_dir(&pack_vm_name);
-
-        println!("Starting agent VM to export container overlay...");
-        let manager = AgentManager::for_vm(&pack_vm_name)?;
-        let features = smolvm::agent::LaunchFeatures {
-            extra_disks: vec![(storage_disk.clone(), false, storage_fmt)],
-            // Under per-VM uid isolation the source VM's dir is 0700/its-own-uid;
-            // this helper's whole job is reading that VM's storage disk, so run
-            // it as the source's uid (a fresh sibling uid can't open the disk and
-            // the boot dies configuring virtio-blk).
-            uid_share_dir: Some(vm_dir.to_path_buf()),
-            ..Default::default()
-        };
-        manager.start_with_full_config(
-            Vec::new(),
-            Vec::new(),
-            VmResources {
-                cpus: 4,
-                memory_mib: 8192,
-                network: true,
-                network_backend: None,
-                dns: None,
-                gpu: false,
-                cuda: false,
-                gpu_vram_mib: None,
-                rosetta: false,
-                storage_gib: None,
-                overlay_gib: None,
-                allowed_cidrs: None,
-            },
-            features,
-        )?;
-
-        let export_result: smolvm::Result<()> = (|| {
-            let mut client = manager.connect()?;
-            let (exit_code, _, stderr) = client.vm_exec(
-                vec![
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    "mkdir -p /mnt/source-storage && mount /dev/vdc /mnt/source-storage"
-                        .to_string(),
-                ],
-                vec![],
-                None,
-                None,
-                None,
-            )?;
-            if exit_code != 0 {
-                return Err(Error::agent(
-                    "mount source storage in temp VM",
-                    format!(
-                        "mount failed (exit {}): {}",
-                        exit_code,
-                        String::from_utf8_lossy(&stderr)
-                    ),
-                ));
-            }
-
-            self.export_container_overlay_from_mounted_storage(collector, &mut client, vm_name)?;
-
-            Ok(())
-        })();
-
-        if let Err(e) = manager.stop() {
-            warn!(error = %e, "failed to stop pack temp VM");
-        }
-        let _ = std::fs::remove_dir_all(&vm_data);
-        export_result
-    }
-
-    fn imported_layers_from_cache(
-        &self,
-        vm_name: &str,
-        source_manifest: Option<&PackManifest>,
-    ) -> smolvm::Result<Option<Vec<(String, PathBuf)>>> {
-        let cache_dir = smolvm::agent::machine_layers_cache_dir(vm_name);
-        let pack_content_dir =
-            smolvm::agent::read_shared_pack_pointer(&cache_dir).unwrap_or(cache_dir);
-        let layers_dir = pack_content_dir.join("layers");
-
-        if let Some(manifest) = source_manifest {
-            let mut layers = Vec::new();
-            for layer in &manifest.assets.layers {
-                let path = smolvm_pack::extract::resolve_cache_asset_path(
-                    &pack_content_dir,
-                    &layer.path,
-                    "source layer",
-                )
-                .map_err(|e| Error::agent("resolve source layer", e.to_string()))?;
-                if !path.exists() {
-                    return Ok(None);
-                }
-                layers.push((layer.digest.clone(), path));
-            }
-            return Ok(Some(layers));
-        }
-
-        let order_path = layers_dir.join("layer-order");
-        if let Ok(contents) = std::fs::read_to_string(&order_path) {
-            let mut layers = Vec::new();
-            for id in contents.lines().map(str::trim).filter(|id| !id.is_empty()) {
-                let path = layers_dir.join(format!("{id}.tar"));
-                if !path.exists() {
-                    return Ok(None);
-                }
-                layers.push((format!("sha256:{id}"), path));
-            }
-            return Ok(Some(layers));
-        }
-
-        let mut tar_layers = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&layers_dir) {
-            for entry in entries {
-                let entry = entry.map_err(|e| Error::agent("read source layers", e.to_string()))?;
-                let path = entry.path();
-                if path.extension().and_then(|s| s.to_str()) == Some("tar") {
-                    tar_layers.push(path);
-                }
-            }
-        }
-        if tar_layers.len() == 1 {
-            let path = tar_layers.pop().unwrap();
-            if let Some(id) = path.file_stem().and_then(|s| s.to_str()) {
-                return Ok(Some(vec![(format!("sha256:{id}"), path)]));
-            }
-        }
-
-        Ok(None)
-    }
-
-    fn imported_layers_from_source_sidecar(
-        &self,
-        vm_name: &str,
-        source_smolmachine: &str,
-        temp_dir: &Path,
-    ) -> smolvm::Result<Vec<(String, PathBuf)>> {
-        let source_path = Path::new(source_smolmachine);
-        let fail = || {
-            Error::agent(
-                "pack from VM",
-                format!(
-                    "VM '{vm_name}' was created from a .smolmachine artifact, but its imported layer closure could not be read from cache or source artifact: {source_smolmachine}"
-                ),
-            )
-        };
-        if !source_path.exists() {
-            return Err(fail());
-        }
-
-        let source_manifest =
-            smolvm_pack::packer::read_manifest_from_sidecar(source_path).map_err(|_| fail())?;
-        let footer =
-            smolvm_pack::packer::read_footer_from_sidecar(source_path).map_err(|_| fail())?;
-        let source_cache_dir = temp_dir.join("source-pack");
-        std::fs::create_dir_all(&source_cache_dir).map_err(|_| fail())?;
-        smolvm_pack::extract::extract_sidecar(source_path, &source_cache_dir, &footer, true, false)
-            .map_err(|_| fail())?;
-
-        let mut layers = Vec::new();
-        for layer in &source_manifest.assets.layers {
-            let path = smolvm_pack::extract::resolve_cache_asset_path(
-                &source_cache_dir,
-                &layer.path,
-                "source layer",
-            )
-            .map_err(|_| fail())?;
-            if !path.exists() {
-                return Err(fail());
-            }
-            layers.push((layer.digest.clone(), path));
-        }
-        Ok(layers)
-    }
-
-    fn add_imported_layers(
-        &self,
-        collector: &mut AssetCollector,
-        layers: Vec<(String, PathBuf)>,
-    ) -> smolvm::Result<()> {
-        for (_, path) in &layers {
-            if !path.exists() {
-                return Err(Error::agent(
-                    "collect source layers",
-                    format!("source layer not found: {}", path.display()),
-                ));
-            }
-        }
-
-        for (digest, path) in layers {
-            collector
-                .add_layer_from_file(&digest, &path)
-                .map_err(|e| Error::agent("collect source layers", e.to_string()))?;
-        }
-        Ok(())
-    }
-
-    /// Flatten a qcow2 CoW overlay into a standalone raw disk image.
-    ///
-    /// Default-size machines use a qcow2 overlay backed by the install's default
-    /// template, but a pack's overlay template must be a flat raw. There is no
-    /// host-side qcow2 reader (smolvm deliberately takes no qemu-img dependency),
-    /// so the conversion runs inside a throwaway agent VM: the source qcow2 is
-    /// attached read-only (libkrun resolves its backing chain) as `/dev/vdc`
-    /// alongside a fresh raw output as `/dev/vdd`, and the guest `dd`s one into the
-    /// other. `add_overlay_template` then strips trailing zeros so a mostly-empty
-    /// overlay still packs small, and extraction re-sparsifies it on import.
-    fn flatten_qcow2_to_raw(&self, qcow2_path: &Path, dest_raw: &Path) -> smolvm::Result<()> {
-        let virtual_size = read_qcow2_virtual_size(qcow2_path)?;
-        {
-            let f = std::fs::File::create(dest_raw)
-                .map_err(|e| Error::agent("create flatten target", e.to_string()))?;
-            f.set_len(virtual_size)
-                .map_err(|e| Error::agent("size flatten target", e.to_string()))?;
-        }
-
-        let flatten_vm_name = format!(
-            "pack-flatten-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        );
-        let vm_data = smolvm::agent::vm_data_dir(&flatten_vm_name);
-        println!("Flattening qcow2 overlay to raw...");
-        let manager = AgentManager::for_vm(&flatten_vm_name)?;
-        let features = smolvm::agent::LaunchFeatures {
-            // vdc = source qcow2 (read-only), vdd = fresh raw output.
-            extra_disks: vec![
-                (qcow2_path.to_path_buf(), true, DiskFormat::Qcow2),
-                (dest_raw.to_path_buf(), false, DiskFormat::Raw),
-            ],
-            ..Default::default()
-        };
-        manager.start_with_full_config(
-            Vec::new(),
-            Vec::new(),
-            VmResources {
-                cpus: 2,
-                memory_mib: 2048,
-                network: false,
-                network_backend: None,
-                dns: None,
-                gpu: false,
-                cuda: false,
-                gpu_vram_mib: None,
-                rosetta: false,
-                storage_gib: None,
-                overlay_gib: None,
-                allowed_cidrs: None,
-            },
-            features,
-        )?;
-
-        let result: smolvm::Result<()> = (|| {
-            let mut client = manager.connect()?;
-            let (exit_code, _, stderr) = client.vm_exec(
-                vec![
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    // busybox dd lacks GNU `conv=sparse`, so do a plain full copy
-                    // and `sync`. The output is dense on the temp disk, but
-                    // `add_overlay_template` strips trailing zeros so the pack stays
-                    // small; the imported overlay is re-sparsified on extraction.
-                    "dd if=/dev/vdc of=/dev/vdd bs=1M && sync".to_string(),
-                ],
-                vec![],
-                None,
-                None,
-                None,
-            )?;
-            if exit_code != 0 {
-                return Err(Error::agent(
-                    "flatten qcow2 overlay",
-                    format!(
-                        "dd failed (exit {}): {}",
-                        exit_code,
-                        String::from_utf8_lossy(&stderr)
-                    ),
-                ));
-            }
-            Ok(())
-        })();
-
-        if let Err(e) = manager.stop() {
-            warn!(error = %e, "failed to stop pack flatten VM");
-        }
-        let _ = std::fs::remove_dir_all(&vm_data);
-        result
-    }
-
-    /// Collect base assets shared by both image and VM packing modes:
-    /// runtime libraries, agent rootfs, and a pre-formatted storage template.
     fn collect_base_assets(&self, collector: &mut AssetCollector) -> smolvm::Result<()> {
         println!("Collecting runtime libraries...");
         let lib_dir = self.find_lib_dir()?;
@@ -2102,28 +1511,6 @@ fn fmt_bytes(bytes: u64) -> String {
     }
 }
 
-/// Read a qcow2 image's virtual (guest-visible) size from its header — the
-/// big-endian `u64` at byte offset 24, per the qcow2 spec. Lets the flatten path
-/// size its raw output correctly without a qcow2 library.
-fn read_qcow2_virtual_size(path: &Path) -> smolvm::Result<u64> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut f = std::fs::File::open(path).map_err(|e| Error::agent("open qcow2", e.to_string()))?;
-    let mut magic = [0u8; 4];
-    f.read_exact(&mut magic)
-        .map_err(|e| Error::agent("read qcow2 magic", e.to_string()))?;
-    if &magic != b"QFI\xfb" {
-        return Err(Error::agent(
-            "read qcow2",
-            format!("{} is not a qcow2 image (bad magic)", path.display()),
-        ));
-    }
-    f.seek(SeekFrom::Start(24))
-        .map_err(|e| Error::agent("seek qcow2 size", e.to_string()))?;
-    let mut buf = [0u8; 8];
-    f.read_exact(&mut buf)
-        .map_err(|e| Error::agent("read qcow2 size", e.to_string()))?;
-    Ok(u64::from_be_bytes(buf))
-}
 
 /// A simple terminal spinner that prints a rotating character every 200ms.
 /// Stops automatically on drop (error paths) or via explicit `stop()`.

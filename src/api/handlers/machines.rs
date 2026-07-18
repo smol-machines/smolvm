@@ -692,8 +692,8 @@ pub async fn create_machine(
         source_smolmachine,
         entrypoint,
         cmd,
-        env,
-        workdir,
+        env: merge_request_env(env, &req.env),
+        workdir: req.workdir.clone().or(workdir),
         // Record secrets = packed refs from --from (validated Untrusted above)
         // merged with request refs (validated Untrusted at ~line 333); request
         // refs win on key collision. Both sources are store-only, so RecordReplay
@@ -1872,6 +1872,20 @@ fn resolve_create_resources(
     )
 }
 
+/// Manifest env is the baseline; request env layers on top and wins on name
+/// collision, so a control plane can override a packed default.
+fn merge_request_env(
+    manifest_env: Vec<(String, String)>,
+    request_env: &[crate::api::types::EnvVar],
+) -> Vec<(String, String)> {
+    let mut merged = manifest_env;
+    for (name, value) in crate::api::types::EnvVar::to_tuples(request_env) {
+        merged.retain(|(existing, _)| existing != &name);
+        merged.push((name, value));
+    }
+    merged
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2041,7 +2055,53 @@ mod tests {
             registry_identity_token: None,
             blob_peers: vec![],
             secrets: Default::default(),
+            env: vec![],
+            workdir: None,
         }
+    }
+
+    #[test]
+    fn request_env_layers_over_manifest_env_and_wins_collisions() {
+        let manifest_env = vec![
+            ("KEEP".to_string(), "manifest".to_string()),
+            ("OVERRIDE".to_string(), "manifest".to_string()),
+        ];
+        let request_env = vec![
+            crate::api::types::EnvVar {
+                name: "OVERRIDE".to_string(),
+                value: "request".to_string(),
+            },
+            crate::api::types::EnvVar {
+                name: "NEW".to_string(),
+                value: "request".to_string(),
+            },
+        ];
+
+        let merged = merge_request_env(manifest_env, &request_env);
+
+        assert_eq!(
+            merged,
+            vec![
+                ("KEEP".to_string(), "manifest".to_string()),
+                ("OVERRIDE".to_string(), "request".to_string()),
+                ("NEW".to_string(), "request".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn create_request_accepts_env_and_workdir() {
+        let req: CreateMachineRequest = serde_json::from_value(serde_json::json!({
+            "name": "api-vm",
+            "env": [{"name": "FOO", "value": "bar"}],
+            "workdir": "/app"
+        }))
+        .unwrap();
+
+        assert_eq!(req.env.len(), 1);
+        assert_eq!(req.env[0].name, "FOO");
+        assert_eq!(req.env[0].value, "bar");
+        assert_eq!(req.workdir.as_deref(), Some("/app"));
     }
 
     #[test]

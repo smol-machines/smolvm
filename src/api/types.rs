@@ -517,6 +517,15 @@ pub struct CreateMachineRequest {
     #[serde(default)]
     #[schema(value_type = Object)]
     pub secrets: RequestSecretRefs,
+    /// Environment variables for the machine's workload (init commands and the
+    /// entrypoint). For `from`/`registry_ref` machines these layer on top of
+    /// the artifact manifest's env; a request variable wins on name collision.
+    #[serde(default)]
+    pub env: Vec<EnvVar>,
+    /// Working directory for the machine's workload. Overrides the artifact
+    /// manifest's workdir when set.
+    #[serde(default)]
+    pub workdir: Option<String>,
 }
 
 /// Request to execute a command in a machine.

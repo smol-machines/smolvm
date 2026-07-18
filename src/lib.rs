@@ -80,6 +80,8 @@ pub mod dns_filter_listener;
 pub mod embedded;
 pub mod log_rotation;
 pub mod network;
+/// Shared from-VM pack export used by every `pack create --from-vm` front-end.
+pub mod pack_export;
 pub mod platform;
 pub mod process;
 pub mod registry;
@@ -90,6 +92,8 @@ pub mod storage;
 pub mod systemd_scope;
 pub mod util;
 pub mod vm;
+/// Shared machine-workload launch used by every machine-start front-end.
+pub mod workload;
 
 /// Compatibility re-exports for smolvm error types.
 ///
