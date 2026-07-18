@@ -208,8 +208,7 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         // true maximum.
         .route(
             "/{id}/files/{*path}",
-            put(handlers::files::upload_file)
-                .layer(DefaultBodyLimit::max(MAX_FILE_UPLOAD_BYTES)),
+            put(handlers::files::upload_file).layer(DefaultBodyLimit::max(MAX_FILE_UPLOAD_BYTES)),
         )
         .route("/{id}/files/{*path}", get(handlers::files::download_file))
         // Image routes
