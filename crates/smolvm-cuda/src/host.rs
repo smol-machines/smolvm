@@ -1043,8 +1043,14 @@ fn xlat_mod(b: &mut dyn Backend, golden: u64) -> u64 {
     let Some(mut image) = MOD_IMAGES.with(|m| m.borrow().get(&golden).cloned()) else {
         return golden;
     };
-    // cuModuleLoadData treats a PTX image as a C string; ensure a trailing NUL.
-    if image.last() != Some(&0) {
+    // Binary images (ELF cubin / fatbin) must reload BYTE-IDENTICAL to what the
+    // golden loaded — appending anything diverges from the proven-loadable bytes
+    // (sm90 fatbins failed 209 with a spurious trailing byte). Only PTX, which
+    // cuModuleLoadData reads as a C string, needs a trailing NUL.
+    let is_elf = image.starts_with(&[0x7f, b'E', b'L', b'F']);
+    let is_fatbin = image.len() >= 4
+        && u32::from_le_bytes([image[0], image[1], image[2], image[3]]) == 0xba55ed50;
+    if !is_elf && !is_fatbin && image.last() != Some(&0) {
         image.push(0);
     }
     match b.module_load_data(&image) {
@@ -1059,7 +1065,12 @@ fn xlat_mod(b: &mut dyn Backend, golden: u64) -> u64 {
                 std::sync::atomic::AtomicU64::new(0);
             let n = RELOAD_FAILS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if n < 8 {
-                eprintln!("[M3a-lazy] module reload failed: e={e}");
+                let head: Vec<String> = image.iter().take(12).map(|b| format!("{b:02x}")).collect();
+                eprintln!(
+                    "[M3a-lazy] module reload failed: e={e} len={} elf={is_elf} fatbin={is_fatbin} head={}",
+                    image.len(),
+                    head.join("")
+                );
             } else if n == 8 {
                 eprintln!("[M3a-lazy] module reload failing repeatedly (e={e}); further reports suppressed");
             }
