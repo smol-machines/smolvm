@@ -958,10 +958,29 @@ pub async fn start_machine(
                 .collect::<Vec<_>>()
         };
         let overlay_id = name.clone();
-        let launch = with_machine_client_traced(&entry, None, move |c| {
-            if c.query(&image)?.is_none() {
-                c.pull_with_registry_config(&image)?;
+        // Pull the image FIRST, as a FATAL step. A pull failure — the image /
+        // tag doesn't exist, is private without access, or the machine has no
+        // network to reach the registry — is a permanent, user-fixable
+        // condition. Failing the start here surfaces it to the control as a
+        // clear 4xx and marks the machine `error`, instead of proceeding to
+        // `Running` below and leaving a `started` ZOMBIE whose every exec then
+        // fails (and, once billing is on, meters a machine that never worked).
+        // A cached image (`query` returns Some) skips the pull, so this is a
+        // no-op on the stop→restart path. Mirrors how the smolmachine source
+        // fails a bad artifact at create.
+        let image_pull = image.clone();
+        with_machine_client_traced(&entry, None, move |c| {
+            if c.query(&image_pull)?.is_none() {
+                c.pull_with_registry_config(&image_pull)?;
             }
+            Ok(())
+        })
+        .await?;
+        // Launch the workload container. Best-effort past the pull: a transient
+        // crun/overlay hiccup leaves a reachable (exec-able) VM rather than
+        // failing an otherwise-pullable start — the image is already local, so a
+        // retry or the health loop can bring the workload up.
+        let launch = with_machine_client_traced(&entry, None, move |c| {
             let config = crate::agent::RunConfig::new(image, command)
                 .with_env(env)
                 .with_workdir(workdir)
