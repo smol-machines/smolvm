@@ -707,6 +707,15 @@ fn dptr_handoff_register(table: &std::sync::Arc<AllocTable>, my_token: u64) {
 
 /// Snapshot of `token`'s current `(dptr, size, loaded)` allocations, or `None`
 /// if that lineage is gone.
+/// Worker-mode handoff: the golden's live non-VMM (`cudaMalloc`) allocations,
+/// read from the daemon-process registry. The daemon stages private copies of
+/// these for a clone worker — a plain-torch golden (no expandable_segments)
+/// keeps ALL its tensors here, and without the staging a worker-mode clone
+/// faults on its first touch of any pre-fork buffer.
+pub fn alloc_handoff_snapshot(token: u64) -> Option<Vec<(u64, u64, bool)>> {
+    dptr_handoff_snapshot(token)
+}
+
 fn dptr_handoff_snapshot(token: u64) -> Option<Vec<(u64, u64, bool)>> {
     let reg = DPTR_HANDOFF.lock().unwrap();
     if std::env::var_os("SMOLVM_CUDA_FORK_DEBUG").is_some() {
@@ -924,6 +933,24 @@ pub fn set_vmm_trans(map: HashMap<u64, u64>) {
     VMM_TRANS.with(|m| *m.borrow_mut() = Some(map));
 }
 
+thread_local! {
+    /// Worker-mode: private copies of the golden's non-VMM (`cudaMalloc`)
+    /// allocations, made during reconstruction — `(golden_dptr, size, copy)`.
+    /// Drained into the serving session's `dptr_trans` at clone resume, so the
+    /// clone's inherited pointers translate exactly like the in-daemon isolate
+    /// path (see `alloc_handoff_snapshot`).
+    static WORKER_ALLOC_TRANS: std::cell::RefCell<Vec<(u64, u64, u64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+pub fn set_worker_alloc_trans(v: Vec<(u64, u64, u64)>) {
+    WORKER_ALLOC_TRANS.with(|r| *r.borrow_mut() = v);
+}
+
+fn take_worker_alloc_trans() -> Vec<(u64, u64, u64)> {
+    WORKER_ALLOC_TRANS.with(|r| std::mem::take(&mut *r.borrow_mut()))
+}
+
 /// M3b: rebuild the golden's captured graphs in THIS worker's context and map
 /// each `(graph_vh, exec_vh)` to the rebuilt reals, so the clone's inherited
 /// `GraphLaunch` resolves. Kernel-node graphs only; a rebuild/instantiate
@@ -1028,7 +1055,14 @@ fn xlat_mod(b: &mut dyn Backend, golden: u64) -> u64 {
             w
         }
         Err(e) => {
-            eprintln!("[M3a-lazy] module reload failed: e={e}");
+            static RELOAD_FAILS: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let n = RELOAD_FAILS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 8 {
+                eprintln!("[M3a-lazy] module reload failed: e={e}");
+            } else if n == 8 {
+                eprintln!("[M3a-lazy] module reload failing repeatedly (e={e}); further reports suppressed");
+            }
             // NULL, not the golden handle: the driver rejects a NULL module with
             // a clean error, but DEREFERENCES a foreign-context handle (SIGSEGV
             // in cuModuleGetFunction — seen when a sticky fault poisoned reloads).
@@ -2010,6 +2044,20 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                             cbytes += size;
                         }
                     }
+                }
+                // Worker-mode: reconstruction already made private copies of the
+                // golden's non-VMM allocations (the daemon-process registries
+                // above are empty in a worker) — adopt them into this session's
+                // translation exactly like the copies made in-daemon.
+                for (gdptr, size, cdptr) in take_worker_alloc_trans() {
+                    sess.dptr_trans.push((gdptr, size, cdptr));
+                    sess.owned_dptrs.insert(cdptr, size);
+                    sess.alloc_table
+                        .lock()
+                        .unwrap()
+                        .insert(cdptr, (size, false));
+                    copied += 1;
+                    cbytes += size;
                 }
                 gpu::set_lib_trans(&sess.dptr_trans); // forwarded-lib pointer map
                 eprintln!(

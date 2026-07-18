@@ -363,13 +363,23 @@ fn reconstruct_golden_memory(
     device: i32,
 ) -> (usize, std::collections::HashMap<u64, u64>) {
     let mut vmm_trans = std::collections::HashMap::new();
-    let (mut resv_s, mut maps_s) = ("", "");
+    let (mut resv_s, mut maps_s, mut aregions_s, mut allocs_s) = ("", "", "", "");
+    let mut astage: Option<i32> = None;
     for part in layout.split('|') {
         if let Some(r) = part.strip_prefix("resv=") {
             resv_s = r;
         }
         if let Some(m) = part.strip_prefix("maps=") {
             maps_s = m;
+        }
+        if let Some(a) = part.strip_prefix("astage=") {
+            astage = a.parse().ok();
+        }
+        if let Some(a) = part.strip_prefix("aregions=") {
+            aregions_s = a;
+        }
+        if let Some(a) = part.strip_prefix("allocs=") {
+            allocs_s = a;
         }
     }
     let hx = |s: &str| u64::from_str_radix(s, 16).ok();
@@ -488,6 +498,83 @@ fn reconstruct_golden_memory(
     }
     if share_weights {
         tracing::info!(shared, private = count - shared, "M2: shared weight ranges");
+    }
+    // Non-VMM golden allocations (`cudaMalloc` — a plain-torch golden keeps ALL
+    // its tensors here): copy each from the daemon's staged export into a fresh
+    // private buffer and record a POINTER TRANSLATION, exactly like the
+    // in-daemon isolate path. cudaMalloc VAs can't be address-preserved — they
+    // collide with the worker's own host mappings (cuMemAddressReserve treats
+    // the address as a hint) — but every op already translates through
+    // `dptr_trans`, so translated copies are equivalent.
+    if let (Some(sidx), false) = (astage, aregions_s.is_empty()) {
+        let regions: Vec<(u64, u64, u64)> = aregions_s
+            .split(',')
+            .filter(|e| !e.is_empty())
+            .filter_map(|e| {
+                let f: Vec<&str> = e.split(':').collect();
+                match (
+                    hx(f[0]),
+                    f.get(1).and_then(|v| hx(v)),
+                    f.get(2).and_then(|v| hx(v)),
+                ) {
+                    (Some(b0), Some(sz), Some(off)) => Some((b0, sz, off)),
+                    _ => None,
+                }
+            })
+            .collect();
+        let allocs: Vec<(u64, u64)> = allocs_s
+            .split(',')
+            .filter(|e| !e.is_empty())
+            .filter_map(|e| {
+                let (d, sz) = e.split_once(':')?;
+                Some((hx(d)?, hx(sz)?))
+            })
+            .collect();
+        let total: u64 = regions.iter().map(|r| r.1).sum();
+        let mut trans: Vec<(u64, u64, u64)> = Vec::new();
+        match import_with_retry(b, 4 + sidx) {
+            Ok(sh) => {
+                if let Ok(tmp) = b.mem_address_reserve(total, 0) {
+                    if b.mem_map(tmp, total, 0, sh).is_ok() {
+                        let _ = b.mem_set_access(tmp, total, device);
+                        for &(d, sz) in &allocs {
+                            // Staging offset: region offset + intra-region delta.
+                            let Some(&(base, _, off)) =
+                                regions.iter().find(|&&(b0, rs, _)| d >= b0 && d < b0 + rs)
+                            else {
+                                continue;
+                            };
+                            let cdptr = match b.mem_alloc(sz) {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    tracing::warn!(e, d, "M2-alloc: copy alloc failed");
+                                    continue;
+                                }
+                            };
+                            if let Err(e) = b.memcpy_dtod(cdptr, tmp + off + (d - base), sz) {
+                                tracing::warn!(e, d, "M2-alloc: dtod failed");
+                            }
+                            trans.push((d, sz, cdptr));
+                        }
+                        let _ = b.ctx_synchronize();
+                        let _ = b.mem_unmap(tmp, total);
+                    } else {
+                        tracing::warn!("M2-alloc: staging map failed");
+                    }
+                    let _ = b.mem_address_free(tmp, total);
+                }
+                let _ = b.mem_release(sh);
+            }
+            Err(e) => tracing::warn!(e, "M2-alloc: staging import failed"),
+        }
+        tracing::info!(
+            copies = trans.len(),
+            of = allocs.len(),
+            bytes = total,
+            "M2-alloc: private translated copies of the golden's non-VMM allocations"
+        );
+        count += trans.len();
+        smolvm_cuda::host::set_worker_alloc_trans(trans);
     }
     (count, vmm_trans)
 }
@@ -863,6 +950,68 @@ fn verify_chunk_content(b: &mut dyn Backend, ch: &smolvm_cuda::host::HandoffChun
     }
 }
 
+/// Stage private copies of the golden's non-VMM (`cudaMalloc`) allocations into
+/// one exportable physical the worker can import. Regions are
+/// granularity-aligned merged spans of the allocations' VAs; each allocation's
+/// bytes are copied at `region_off + (dptr - region_base)` so the worker can
+/// blit whole regions back to the golden's exact VAs. Returns the export fd.
+#[cfg(unix)]
+fn stage_alloc_copies(
+    b: &mut dyn smolvm_cuda::host::Backend,
+    device: i32,
+    allocs: &[(u64, u64, bool)],
+    regions: &[(u64, u64)], // (base, end)
+    total: u64,
+) -> Result<i32, String> {
+    let h = b
+        .mem_create_exportable(total, device)
+        .map_err(|e| format!("stage create: {e}"))?;
+    let tmp = match b.mem_address_reserve(total, 0) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = b.mem_release(h);
+            return Err(format!("stage reserve: {e}"));
+        }
+    };
+    let mut copy = || -> Result<(), String> {
+        b.mem_map(tmp, total, 0, h)
+            .map_err(|e| format!("stage map: {e}"))?;
+        b.mem_set_access(tmp, total, device)
+            .map_err(|e| format!("stage access: {e}"))?;
+        for &(d, sz, _) in allocs {
+            // Locate the containing region and its offset into the staging chunk.
+            let mut off = 0u64;
+            for &(base, end) in regions {
+                if d >= base && d < end {
+                    b.memcpy_dtod(tmp + off + (d - base), d, sz)
+                        .map_err(|e| format!("stage dtod {d:#x}: {e}"))?;
+                    break;
+                }
+                off += end - base;
+            }
+        }
+        let _ = b.ctx_synchronize();
+        Ok(())
+    };
+    let res = copy();
+    let _ = b.mem_unmap(tmp, total);
+    let _ = b.mem_address_free(tmp, total);
+    match res.and_then(|()| {
+        b.mem_export_handle(h)
+            .map_err(|e| format!("stage export: {e}"))
+    }) {
+        Ok(fd) => {
+            // The fd holds its own driver reference; drop ours.
+            let _ = b.mem_release(h);
+            Ok(fd)
+        }
+        Err(e) => {
+            let _ = b.mem_release(h);
+            Err(e)
+        }
+    }
+}
+
 /// Path 3 (M1): hand the accepted connection to a fresh worker PROCESS (its own
 /// CUDA context, hence its own UVA — so it can place memory at the golden's exact
 /// VAs). `dup2` the socket fd onto fd 3 in the child (clears CLOEXEC) and exec
@@ -919,6 +1068,57 @@ fn spawn_clone_worker(conn_fd: std::os::unix::io::RawFd, token: u64) -> io::Resu
                 "{:x}:{:x}:{}:{}:{:x},",
                 ch.va, ch.size, idx, ld, ch.ghandle
             ));
+        }
+    }
+    // Non-VMM golden memory: a plain-torch golden (no expandable_segments) keeps
+    // every tensor in cudaMalloc'd blocks that never enter the VMM layout, so a
+    // worker-mode clone would lose them all (illegal address on first touch —
+    // the maps above only cover VMM). Stage private copies for the worker.
+    if let Some(allocs) = smolvm_cuda::host::alloc_handoff_snapshot(token) {
+        if !allocs.is_empty() {
+            let gran = backend
+                .mem_get_allocation_granularity(golden_dev, 0)
+                .unwrap_or(1 << 21)
+                .max(1 << 16);
+            let mut spans: Vec<(u64, u64)> = allocs
+                .iter()
+                .map(|&(d, sz, _)| (d & !(gran - 1), (d + sz + gran - 1) & !(gran - 1)))
+                .collect();
+            spans.sort_unstable();
+            let mut regions: Vec<(u64, u64)> = Vec::new();
+            for (b0, e0) in spans {
+                match regions.last_mut() {
+                    Some((_, e)) if b0 <= *e => *e = (*e).max(e0),
+                    _ => regions.push((b0, e0)),
+                }
+            }
+            let total: u64 = regions.iter().map(|&(b0, e0)| e0 - b0).sum();
+            match stage_alloc_copies(backend.as_mut(), golden_dev, &allocs, &regions, total) {
+                Ok(efd) => {
+                    let idx = export_fds.len();
+                    export_fds.push(efd);
+                    layout.push_str(&format!("|astage={idx}|aregions="));
+                    let mut off = 0u64;
+                    for &(b0, e0) in &regions {
+                        layout.push_str(&format!("{:x}:{:x}:{:x},", b0, e0 - b0, off));
+                        off += e0 - b0;
+                    }
+                    layout.push_str("|allocs=");
+                    for &(d, sz, _) in &allocs {
+                        layout.push_str(&format!("{d:x}:{sz:x},"));
+                    }
+                    tracing::info!(
+                        allocs = allocs.len(),
+                        regions = regions.len(),
+                        bytes = total,
+                        "staged the golden's non-VMM allocations for the worker"
+                    );
+                }
+                Err(e) => tracing::warn!(
+                    e,
+                    "failed to stage non-VMM golden allocations; the clone will fault on pre-fork tensors"
+                ),
+            }
         }
     }
     // M3a: serialize the golden's modules (images) + functions to a temp file for
