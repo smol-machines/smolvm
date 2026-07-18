@@ -723,4 +723,9 @@ pub struct ForkRequest {
     /// not collide with the still-running golden or sibling clones.
     #[serde(default)]
     pub ports: Vec<PortSpec>,
+    /// Share the golden's loaded CUDA weights with this clone instead of
+    /// copying them (one base copy in VRAM across sibling clones). Correct when
+    /// the base stays frozen (LoRA/QLoRA fine-tuning, inference).
+    #[serde(default)]
+    pub share_weights: bool,
 }

@@ -777,8 +777,8 @@ fn reconstruct_golden_modules(
 /// mode — an unconsumed preamble would corrupt the frame stream. Non-preamble
 /// connections are left untouched (peek only).
 #[cfg(unix)]
-fn consume_clone_preamble(fd: std::os::unix::io::RawFd) -> Option<u64> {
-    let mut buf = [0u8; 16];
+fn consume_clone_preamble(fd: std::os::unix::io::RawFd) -> Option<(u64, u8)> {
+    let mut buf = [0u8; 17];
     // Same buffered-in-pieces caveat as peek_clone_token: retry the peek
     // briefly so a slow proxy write can't make us misread the magic.
     let mut n: isize = 0;
@@ -797,28 +797,28 @@ fn consume_clone_preamble(fd: std::os::unix::io::RawFd) -> Option<u64> {
         if n >= 8 && buf[..(n as usize).min(8)] != smolvm_cuda::proto::CLONE_PREAMBLE_MAGIC {
             return None;
         }
-        if n >= 16 || n == 0 {
+        if n >= 17 || n == 0 {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    if n < 16 || buf[..8] != smolvm_cuda::proto::CLONE_PREAMBLE_MAGIC {
+    if n < 17 || buf[..8] != smolvm_cuda::proto::CLONE_PREAMBLE_MAGIC {
         return None;
     }
-    // Consume exactly the 16 preamble bytes, leaving the RPC stream intact.
+    // Consume exactly the 17 preamble bytes, leaving the RPC stream intact.
     // SAFETY: plain recv on a valid fd; MSG_WAITALL for the already-peeked bytes.
     let c = unsafe {
         libc::recv(
             fd,
             buf.as_mut_ptr() as *mut libc::c_void,
-            16,
+            17,
             libc::MSG_WAITALL,
         )
     };
-    if c != 16 {
+    if c != 17 {
         return None;
     }
-    Some(u64::from_le_bytes(buf[8..16].try_into().unwrap()))
+    Some((u64::from_le_bytes(buf[8..16].try_into().unwrap()), buf[16]))
 }
 
 /// Live clone workers keyed by (lineage token, clone id) → worker pid. A
@@ -840,9 +840,10 @@ fn clone_worker_registry() -> &'static Mutex<std::collections::HashMap<(u64, u64
 /// would silently serve it a reconstructed COPY of its memory).
 #[cfg(unix)]
 fn route_clone_connection(fd: std::os::unix::io::RawFd) -> bool {
-    let Some(clone_id) = consume_clone_preamble(fd) else {
+    let Some((clone_id, flags)) = consume_clone_preamble(fd) else {
         return false;
     };
+    let share_weights = flags & 1 != 0;
     let Some(token) = peek_clone_token(fd) else {
         // A clone VM's connection whose Init carries no lineage token: fresh
         // post-fork work (new guest process), served in-daemon like any new
@@ -864,13 +865,14 @@ fn route_clone_connection(fd: std::os::unix::io::RawFd) -> bool {
         }
         reg.remove(&(token, clone_id));
     }
-    match spawn_clone_worker(fd, token) {
+    match spawn_clone_worker(fd, token, share_weights) {
         Ok(pid) => {
             reg.insert((token, clone_id), pid);
             tracing::info!(
                 token,
                 clone_id,
                 worker_pid = pid,
+                share_weights,
                 "routed isolating clone to a worker process"
             );
         }
@@ -1017,7 +1019,11 @@ fn stage_alloc_copies(
 /// VAs). `dup2` the socket fd onto fd 3 in the child (clears CLOEXEC) and exec
 /// `smolvm _cuda-clone-worker 3`; the daemon then drops its own copy.
 #[cfg(unix)]
-fn spawn_clone_worker(conn_fd: std::os::unix::io::RawFd, token: u64) -> io::Result<u32> {
+fn spawn_clone_worker(
+    conn_fd: std::os::unix::io::RawFd,
+    token: u64,
+    share_weights: bool,
+) -> io::Result<u32> {
     use std::os::unix::process::CommandExt;
     // Gather the golden's VMM layout (reservations + maps→physical handle).
     let (resvs, maps, golden_dev) = smolvm_cuda::host::layout_handoff_snapshot(token)
@@ -1216,6 +1222,13 @@ fn spawn_clone_worker(conn_fd: std::os::unix::io::RawFd, token: u64) -> io::Resu
     cmd.arg("_cuda-clone-worker").arg("3");
     cmd.env("SMOLVM_CUDA_CLONE_LAYOUT", layout);
     cmd.env("SMOLVM_CUDA_CLONE_DEVICE", golden_dev.to_string());
+    // Per-fork density: this fork asked for --share-weights (preamble flag), so
+    // the worker's reconstruction shares the golden's loaded weight physicals
+    // instead of copying them. The daemon-wide env remains the global default;
+    // the worker inherits it, so the flag only ever ADDS sharing.
+    if share_weights {
+        cmd.env("SMOLVM_CUDA_FORK_SHARE_WEIGHTS", "1");
+    }
     if let Some(mp) = &modpath {
         cmd.env("SMOLVM_CUDA_CLONE_MODULES", mp);
     }

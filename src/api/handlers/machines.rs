@@ -1083,6 +1083,7 @@ pub async fn fork_machine(
 ) -> Result<Json<MachineInfo>, ApiError> {
     let clone = req.name.clone();
     let pinned_ports: Vec<(u16, u16)> = req.ports.iter().map(|p| (p.host, p.guest)).collect();
+    let req_share_weights = req.share_weights;
 
     // Serialize lifecycle on the CLONE name so a concurrent start/stop/delete of
     // the same clone can't race the fork's register + boot. The golden is only
@@ -1132,6 +1133,7 @@ pub async fn fork_machine(
         .map_err(|e| format!("failed to prepare packed layers: {}", e))?;
         // Boot from the golden's snapshot instead of cold-booting.
         features.snapshot_dir = Some(prep.snapshot_dir);
+        features.cuda_share_weights = req_share_weights;
 
         if let Err(e) = manager.ensure_running_via_subprocess(mounts, ports, resources, features) {
             // Boot failed: roll back the clone registration so a failed fork

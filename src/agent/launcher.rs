@@ -208,6 +208,10 @@ pub struct LaunchFeatures {
     /// Additional disk images to attach to the VM (path, read_only, format).
     /// Appear as /dev/vdc, /dev/vdd, ... after the storage and overlay disks.
     pub extra_disks: Vec<(std::path::PathBuf, bool, DiskFormat)>,
+    /// Fork clone requested weight sharing: the clone's CUDA worker maps the
+    /// golden's loaded weight physicals instead of copying them (one base copy
+    /// in VRAM across sibling clones; correct for frozen-base fine-tuning).
+    pub cuda_share_weights: bool,
     /// Start as a fork base: back guest RAM with a memfd (copy-on-write
     /// cloneable) and expose `control_socket` so the machine can be forked.
     pub forkable: bool,
