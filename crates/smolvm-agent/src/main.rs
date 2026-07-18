@@ -4837,6 +4837,26 @@ fn oversized_output_error(stdout: &[u8], stderr: &[u8]) -> Option<AgentResponse>
     None
 }
 
+/// Swap a `Completed` response whose captured output would overflow the wire
+/// frame for the clean oversized-output error. EVERY exec return path must pass
+/// through this — otherwise the frame-size validator rejects the send and the
+/// caller sees an opaque "frame too large" 500 with zero output (e.g. the
+/// keep-alive container path, whose output previously skipped the guard the
+/// fresh-container path applied).
+fn cap_exec_response(resp: AgentResponse) -> AgentResponse {
+    if let AgentResponse::Completed {
+        ref stdout,
+        ref stderr,
+        ..
+    } = resp
+    {
+        if let Some(err) = oversized_output_error(stdout, stderr) {
+            return err;
+        }
+    }
+    resp
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Run a non-interactive command inside the machine's long-lived keep-alive
 /// container (establishing it on first use), capturing its output. Joining the
@@ -4986,7 +5006,7 @@ fn handle_run(
                 unprivileged,
                 stdin_data,
             ) {
-                Ok(resp) => return resp,
+                Ok(resp) => return cap_exec_response(resp),
                 Err(e) => {
                     warn!(error = %e, "keep-alive exec failed; running in a fresh container")
                 }
@@ -5007,13 +5027,11 @@ fn handle_run(
         client_fd,
         unprivileged,
     ) {
-        Ok(result) => oversized_output_error(&result.stdout, &result.stderr).unwrap_or(
-            AgentResponse::Completed {
-                exit_code: result.exit_code,
-                stdout: result.stdout,
-                stderr: result.stderr,
-            },
-        ),
+        Ok(result) => cap_exec_response(AgentResponse::Completed {
+            exit_code: result.exit_code,
+            stdout: result.stdout,
+            stderr: result.stderr,
+        }),
         Err(e) => AgentResponse::from_err(e, error_codes::RUN_FAILED),
     }
 }
@@ -6031,6 +6049,32 @@ mod tests {
             "expected error, got {:?}",
             resp
         );
+    }
+
+    #[test]
+    fn cap_exec_response_guards_oversized_keepalive_output() {
+        // A Completed response whose output would overflow the wire frame must be
+        // swapped for a clean error — the exact keep-alive-container path that
+        // used to return oversized output straight into a "frame too large" 500.
+        let huge = AgentResponse::Completed {
+            exit_code: 0,
+            stdout: vec![b'A'; 25 * 1024 * 1024],
+            stderr: Vec::new(),
+        };
+        assert!(
+            matches!(cap_exec_response(huge), AgentResponse::Error { .. }),
+            "oversized output must become a clean error, not a frame-too-large 500"
+        );
+        // Normal-sized output passes through untouched.
+        let ok = AgentResponse::Completed {
+            exit_code: 7,
+            stdout: b"hello".to_vec(),
+            stderr: b"world".to_vec(),
+        };
+        assert!(matches!(
+            cap_exec_response(ok),
+            AgentResponse::Completed { exit_code: 7, .. }
+        ));
     }
 
     #[test]
