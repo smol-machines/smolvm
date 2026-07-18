@@ -26,7 +26,7 @@ pub mod supervisor;
 pub mod types;
 
 use axum::{
-    extract::Request,
+    extract::{DefaultBodyLimit, Request},
     http::{HeaderValue, StatusCode},
     middleware::{self, Next},
     response::Response,
@@ -135,6 +135,11 @@ pub struct ApiDoc;
 /// provides a reasonable upper bound for most requests.
 const API_REQUEST_TIMEOUT_SECS: u64 = 300;
 
+/// Body cap for the file-upload route. axum's 2 MiB default silently 413s larger
+/// uploads before the handler runs; the control plane permits 100 MiB, so match
+/// it here. The agent streams the write and enforces the true ceiling.
+const MAX_FILE_UPLOAD_BYTES: usize = 100 * 1024 * 1024;
+
 /// Validate that an API command payload is not empty.
 pub fn validate_command(cmd: &[String]) -> Result<(), ApiError> {
     if cmd.is_empty() {
@@ -194,8 +199,18 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .route("/{id}/exec", post(handlers::exec::exec_command))
         .route("/{id}/exec/stream", post(handlers::exec::exec_stream))
         .route("/{id}/run", post(handlers::exec::run_command))
-        // File I/O routes
-        .route("/{id}/files/{*path}", put(handlers::files::upload_file))
+        // File I/O routes. The upload handler buffers the whole body (`body:
+        // Bytes`), so without a raised limit axum's 2 MiB default rejects any
+        // larger upload with a bare 413 "Failed to buffer the request body" —
+        // the control plane already permits 100 MiB here, so match it (the agent
+        // streams the write, so the real ceiling is FILE_TRANSFER_MAX_TOTAL).
+        // Per-route so only uploads get the large cap; the agent enforces the
+        // true maximum.
+        .route(
+            "/{id}/files/{*path}",
+            put(handlers::files::upload_file)
+                .layer(DefaultBodyLimit::max(MAX_FILE_UPLOAD_BYTES)),
+        )
         .route("/{id}/files/{*path}", get(handlers::files::download_file))
         // Image routes
         .route("/{id}/images", get(handlers::images::list_images))
