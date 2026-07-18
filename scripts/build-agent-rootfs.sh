@@ -324,10 +324,11 @@ if { [[ -z "$CUDART_SHIM_SRC" ]] || [[ -z "$CUDA_DRIVER_SHIM_SRC" ]]; } \
     && [[ "$NO_BUILD_AGENT" != "1" && "$(uname -s)" == "Linux" && "$(uname -m)" == "$ALPINE_ARCH" ]] \
     && command -v cargo &> /dev/null; then
     echo "Building CUDA guest shims (native gnu target)..."
-    if cargo build --release -p smolvm-cudart-shim -p smolvm-cuda-shim \
+    if cargo build --release -p smolvm-cudart-shim -p smolvm-cuda-shim -p smolvm-nvml-shim \
         --manifest-path "$PROJECT_ROOT/Cargo.toml"; then
         CUDART_SHIM_SRC="${CUDART_SHIM_SRC:-$PROJECT_ROOT/target/release/libcudart.so}"
         CUDA_DRIVER_SHIM_SRC="${CUDA_DRIVER_SHIM_SRC:-$PROJECT_ROOT/target/release/libcuda.so}"
+        NVML_SHIM_SRC="${NVML_SHIM_SRC:-$PROJECT_ROOT/target/release/libnvidia_ml.so}"
     else
         echo "CUDA guest shim build failed — rootfs ships without auto-staging"
     fi
@@ -339,6 +340,12 @@ if [[ -n "$CUDART_SHIM_SRC" && -f "$CUDART_SHIM_SRC" \
     mkdir -p "$OUTPUT_DIR/usr/local/lib/smolvm-cuda"
     cp "$CUDART_SHIM_SRC" "$OUTPUT_DIR/usr/local/lib/smolvm-cuda/libcudart-shim.so"
     cp "$CUDA_DRIVER_SHIM_SRC" "$OUTPUT_DIR/usr/local/lib/smolvm-cuda/libcuda.so.1"
+    # NVML drop-in: frameworks (vLLM) detect the GPU through NVML, not the CUDA
+    # driver — the shim dir rides LD_LIBRARY_PATH, so the plain-soname dlopen of
+    # libnvidia-ml.so.1 resolves here. Best-effort: absent on non-Linux builds.
+    if [[ -n "${NVML_SHIM_SRC:-}" && -f "$NVML_SHIM_SRC" ]]; then
+        cp "$NVML_SHIM_SRC" "$OUTPUT_DIR/usr/local/lib/smolvm-cuda/libnvidia-ml.so.1"
+    fi
     echo "Installed CUDA guest shims"
     # Stamp the shims' wire fingerprint into the rootfs so the host can flag a
     # stale rootfs at boot (internal_boot's warn_if_stale_cuda_shim) instead of

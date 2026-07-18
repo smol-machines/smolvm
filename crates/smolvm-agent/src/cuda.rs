@@ -39,6 +39,9 @@ const DRIVER_SHIM: &str = "libcuda.so.1";
 /// interpose is to place the shim at these exact paths (a read-only bind mount
 /// over each file). CUDA 12 and 11 wheel layouts.
 const RPATH_PINNED_SONAMES: &[&str] = &[
+    "libcudart.so.13",
+    "libcublas.so.13",
+    "libcublasLt.so.13",
     "libcudart.so.12",
     "libcublas.so.12",
     "libcublasLt.so.12",

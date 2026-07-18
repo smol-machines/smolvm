@@ -49,7 +49,7 @@ const CUDA_ERROR_NOT_SUPPORTED: c_int = 801;
 const CUDA_ERROR_UNKNOWN: c_int = 999;
 
 /// The CUDA version this shim reports for its own API surface.
-const SHIM_CUDA_VERSION: c_int = 12040;
+const SHIM_CUDA_VERSION: c_int = 13020;
 
 // ---- transport ---------------------------------------------------------------
 

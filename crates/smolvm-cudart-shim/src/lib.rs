@@ -677,7 +677,7 @@ pub extern "C" fn cudaDriverGetVersion(version: *mut c_int) -> c_int {
 
 #[no_mangle]
 pub extern "C" fn cudaRuntimeGetVersion(version: *mut c_int) -> c_int {
-    set_last(unsafe { out(version, 12040) })
+    set_last(unsafe { out(version, 13000) })
 }
 
 // ---- memory -----------------------------------------------------------------
@@ -2316,6 +2316,125 @@ pub extern "C" fn cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(
     // Coarse estimate: 2048 threads/SM cap divided by the block size, ≥1.
     let bs = block_size.max(1);
     set_last(unsafe { out(num_blocks, (2048 / bs).clamp(1, 32)) })
+}
+
+// ---- CUDA 13 surface --------------------------------------------------------
+// CUDA 13 renamed several `_v2` entry points back to their base names and cu13
+// wheels (torch 2.11+cu130) bind these from libcudart.so.13 / libcublas*.so.13.
+
+#[no_mangle]
+pub extern "C" fn cudaStreamGetCaptureInfo(
+    stream: *mut c_void,
+    status: *mut c_int,
+    id: *mut u64,
+    graph: *mut *mut c_void,
+    deps: *mut *mut *const c_void,
+    num_deps: *mut usize,
+) -> c_int {
+    cudaStreamGetCaptureInfo_v2(stream, status, id, graph, deps, num_deps)
+}
+
+#[no_mangle]
+pub extern "C" fn cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+    num_blocks: *mut c_int,
+    func: *const c_void,
+    block_size: c_int,
+    dynamic_smem: usize,
+) -> c_int {
+    cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(
+        num_blocks,
+        func,
+        block_size,
+        dynamic_smem,
+        0,
+    )
+}
+
+#[no_mangle]
+pub extern "C" fn cublasLtGetVersion() -> usize {
+    130000
+}
+
+/// Driver entry-point lookup (cudart 13): resolve `symbol` from the staged
+/// driver shim (`libcuda.so.1`) so callers get the same interposed surface as
+/// direct linking. Missing symbols report `SymbolNotFound` via `driver_status`
+/// with a success return, per the cudart contract.
+#[no_mangle]
+pub extern "C" fn cudaGetDriverEntryPointByVersion(
+    symbol: *const c_char,
+    func_ptr: *mut *mut c_void,
+    _cuda_version: c_uint,
+    _flags: u64,
+    driver_status: *mut c_int,
+) -> c_int {
+    extern "C" {
+        fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
+        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    }
+    const RTLD_NOW: c_int = 2;
+    const RTLD_GLOBAL: c_int = 0x100;
+    const ENTRY_POINT_SUCCESS: c_int = 0;
+    const ENTRY_POINT_SYMBOL_NOT_FOUND: c_int = 1;
+    if symbol.is_null() || func_ptr.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    let found = unsafe {
+        let lib = dlopen(c"libcuda.so.1".as_ptr(), RTLD_NOW | RTLD_GLOBAL);
+        if lib.is_null() {
+            std::ptr::null_mut()
+        } else {
+            dlsym(lib, symbol)
+        }
+    };
+    unsafe {
+        *func_ptr = found;
+        if !driver_status.is_null() {
+            *driver_status = if found.is_null() {
+                ENTRY_POINT_SYMBOL_NOT_FOUND
+            } else {
+                ENTRY_POINT_SUCCESS
+            };
+        }
+    }
+    set_last(CUDA_SUCCESS)
+}
+
+#[no_mangle]
+pub extern "C" fn cudaGetSymbolAddress(
+    _dev_ptr: *mut *mut c_void,
+    _symbol: *const c_void,
+) -> c_int {
+    // Device-global symbol lookup is not remoted; callers treat this as
+    // "symbol unavailable" (cudaErrorInvalidSymbol).
+    set_last(13)
+}
+
+#[no_mangle]
+pub extern "C" fn cudaMemcpyToSymbol(
+    _symbol: *const c_void,
+    _src: *const c_void,
+    _count: usize,
+    _offset: usize,
+    _kind: c_int,
+) -> c_int {
+    set_last(13)
+}
+
+#[no_mangle]
+pub extern "C" fn cudaGraphNodeGetDependencies(
+    _node: *mut c_void,
+    deps: *mut *mut c_void,
+    num_deps: *mut usize,
+) -> c_int {
+    unsafe {
+        if !num_deps.is_null() {
+            if !deps.is_null() && *num_deps > 0 {
+                // No dependency introspection over the wire; report none.
+            }
+            *num_deps = 0;
+        }
+    }
+    set_last(CUDA_SUCCESS)
 }
 #[no_mangle]
 pub extern "C" fn cudaHostRegister(_ptr: *mut c_void, _size: usize, _flags: c_uint) -> c_int {

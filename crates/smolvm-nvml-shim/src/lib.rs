@@ -304,6 +304,103 @@ pub extern "C" fn nvmlDeviceGetP2PStatus(
     NVML_SUCCESS
 }
 
+// ---- torch c10 DriverAPI surface --------------------------------------------
+// torch's expandable-segments support (c10/cuda/driver_api.cpp) dlopens NVML
+// and eagerly asserts its whole symbol table; a single missing name aborts
+// engine startup (vLLM: "Can't find nvmlDeviceGetHandleByPciBusId_v2").
+// NvLink/fabric queries honestly report NOT_SUPPORTED — the remoted view is a
+// single GPU with no NvLink topology.
+
+const NVML_ERROR_NOT_SUPPORTED: c_int = 3;
+
+#[no_mangle]
+pub extern "C" fn nvmlDeviceGetHandleByPciBusId_v2(
+    _pci_bus_id: *const c_char,
+    device: *mut *mut std::ffi::c_void,
+) -> c_int {
+    // The guest sees exactly one device; every bus id resolves to it.
+    if device.is_null() {
+        return NVML_ERROR_INVALID_ARGUMENT;
+    }
+    unsafe { *device = handle_of(0) }
+    NVML_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn nvmlDeviceGetHandleByPciBusId(
+    pci_bus_id: *const c_char,
+    device: *mut *mut std::ffi::c_void,
+) -> c_int {
+    nvmlDeviceGetHandleByPciBusId_v2(pci_bus_id, device)
+}
+
+#[no_mangle]
+pub extern "C" fn nvmlDeviceGetNvLinkRemoteDeviceType(
+    _device: *mut std::ffi::c_void,
+    _link: c_uint,
+    _dev_type: *mut c_int,
+) -> c_int {
+    NVML_ERROR_NOT_SUPPORTED
+}
+
+#[no_mangle]
+pub extern "C" fn nvmlDeviceGetNvLinkRemotePciInfo_v2(
+    _device: *mut std::ffi::c_void,
+    _link: c_uint,
+    _pci: *mut std::ffi::c_void,
+) -> c_int {
+    NVML_ERROR_NOT_SUPPORTED
+}
+
+#[no_mangle]
+pub extern "C" fn nvmlDeviceGetComputeRunningProcesses(
+    _device: *mut std::ffi::c_void,
+    info_count: *mut c_uint,
+    _infos: *mut std::ffi::c_void,
+) -> c_int {
+    // No process visibility across the remoting boundary; report none.
+    if info_count.is_null() {
+        return NVML_ERROR_INVALID_ARGUMENT;
+    }
+    unsafe { *info_count = 0 }
+    NVML_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn nvmlSystemGetCudaDriverVersion_v2(version: *mut c_int) -> c_int {
+    if version.is_null() {
+        return NVML_ERROR_INVALID_ARGUMENT;
+    }
+    let mut v: c_int = 0;
+    let ok = unsafe {
+        match cu_sym(c"cuDriverGetVersion") {
+            Some(f) => {
+                let f: extern "C" fn(*mut c_int) -> c_int = std::mem::transmute(f);
+                f(&mut v) == 0 && v > 0
+            }
+            None => false,
+        }
+    };
+    if !ok {
+        v = 13020;
+    }
+    unsafe { *version = v }
+    NVML_SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn nvmlSystemGetCudaDriverVersion(version: *mut c_int) -> c_int {
+    nvmlSystemGetCudaDriverVersion_v2(version)
+}
+
+#[no_mangle]
+pub extern "C" fn nvmlDeviceGetGpuFabricInfoV(
+    _device: *mut std::ffi::c_void,
+    _info: *mut std::ffi::c_void,
+) -> c_int {
+    NVML_ERROR_NOT_SUPPORTED
+}
+
 #[no_mangle]
 pub extern "C" fn nvmlErrorString(_result: c_int) -> *const c_char {
     c"Success".as_ptr()
