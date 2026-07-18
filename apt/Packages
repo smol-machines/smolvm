@@ -1,14 +1,14 @@
 Package: smolvm
-Version: 1.6.10-1
-Architecture: amd64
+Version: 1.6.11-1
+Architecture: arm64
 Maintainer: smol-machines <hebinsquared@gmail.com>
-Installed-Size: 79876
+Installed-Size: 83189
 Depends: crun, jq, e2fsprogs, libc6
-Filename: ./smolvm_1.6.10-1_amd64.deb
-Size: 32282958
-MD5sum: 7a72f090018b41309ad5ddcc3bd51b51
-SHA1: a8d0be6e459fb937f60135534cdb28bd4a57408e
-SHA256: aed585b4b7d731d1024d7c6857c628ec4895a154c41ac272c7924fdbf7856dfa
+Filename: ./smolvm_1.6.11-1_arm64.deb
+Size: 31812820
+MD5sum: 9021e68309bf6ff25dc0a68fb5d0e876
+SHA1: 2a6c98709789d2b7af52cbc047da381b92ff98b5
+SHA256: 2136dc52f113ca6d9b1cfc1e79972460a536d9345803f718a6e6e07012074be3
 Section: utils
 Priority: optional
 Homepage: https://github.com/smol-machines/smolvm
@@ -18,16 +18,16 @@ Description: Build and run portable, lightweight, self-contained virtual machine
  the smol-machines libkrun fork.
 
 Package: smolvm
-Version: 1.6.10-1
-Architecture: arm64
+Version: 1.6.11-1
+Architecture: amd64
 Maintainer: smol-machines <hebinsquared@gmail.com>
-Installed-Size: 83185
+Installed-Size: 79881
 Depends: crun, jq, e2fsprogs, libc6
-Filename: ./smolvm_1.6.10-1_arm64.deb
-Size: 31811004
-MD5sum: 8850248e14ab8159aca5c26629c68ab0
-SHA1: 7ef5374ac2728caa3a1b982e7a17fa04994574f7
-SHA256: 6cc166ccbcbfd5af733753cf0df3faaefc8fe07376496ac6c1154923f1c2e1ca
+Filename: ./smolvm_1.6.11-1_amd64.deb
+Size: 32289166
+MD5sum: 3f1a5f1c18ab3021d88a7ee641c6001b
+SHA1: 88bccfa6de423a45311d6469ba174df661ca7731
+SHA256: 1390acdfbff14888b3434a6ef4619aa1db1d71ae60dbc1f88c11634b89009300
 Section: utils
 Priority: optional
 Homepage: https://github.com/smol-machines/smolvm
