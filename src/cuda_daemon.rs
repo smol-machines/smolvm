@@ -593,7 +593,7 @@ fn reconstruct_golden_modules(
     path: &str,
 ) -> (
     Vec<(u64, Vec<u8>)>,
-    Vec<(u64, u64, String)>,
+    Vec<(u64, u64, String, Vec<(i32, i32)>)>,
     Vec<(u64, u64)>,
     Vec<(u64, u64)>,
     Vec<(u64, u64, smolvm_cuda::host::GraphSer)>,
@@ -664,7 +664,14 @@ fn reconstruct_golden_modules(
         need!(nlen);
         let name = String::from_utf8_lossy(&buf[p..p + nlen]).into_owned();
         p += nlen;
-        func_meta.push((gf, gm, name));
+        let nattrs = ru32!();
+        let mut attrs = Vec::with_capacity(nattrs as usize);
+        for _ in 0..nattrs {
+            let a = ru32!() as i32;
+            let v = ru32!() as i32;
+            attrs.push((a, v));
+        }
+        func_meta.push((gf, gm, name, attrs));
     }
     // Streams + events: recreate each with its golden create flags in OUR context,
     // mapping the golden's inherited raw handle → our own (same M3a pattern).
@@ -1177,11 +1184,18 @@ fn spawn_clone_worker(
             blob.extend_from_slice(img);
         }
         blob.extend_from_slice(&(funcs.len() as u32).to_le_bytes());
-        for (h, m, n) in &funcs {
+        for (h, m, n, attrs) in &funcs {
             blob.extend_from_slice(&h.to_le_bytes());
             blob.extend_from_slice(&m.to_le_bytes());
             blob.extend_from_slice(&(n.len() as u32).to_le_bytes());
             blob.extend_from_slice(n.as_bytes());
+            // Per-function attribute replays ([i32 attr][i32 value] each) —
+            // e.g. FlashAttention's MaxDynamicSharedMemorySize opt-in.
+            blob.extend_from_slice(&(attrs.len() as u32).to_le_bytes());
+            for &(a, v) in attrs {
+                blob.extend_from_slice(&a.to_le_bytes());
+                blob.extend_from_slice(&v.to_le_bytes());
+            }
         }
         // Streams + events: [u64 golden handle][u32 create flags] each.
         blob.extend_from_slice(&(streams.len() as u32).to_le_bytes());
