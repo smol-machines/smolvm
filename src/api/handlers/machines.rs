@@ -904,6 +904,7 @@ pub async fn start_machine(
     let overlay_gb = record.overlay_gb;
     let source_smolmachine = record.source_smolmachine.clone();
     let dns_filter_hosts = record.dns_filter_hosts.clone();
+    let record_golden = record.golden.clone();
     let forkable = query.forkable;
     let (manager, pid) = tokio::task::spawn_blocking(move || {
         let manager = AgentManager::for_vm_with_sizes(&name_clone, storage_gb, overlay_gb)
@@ -916,6 +917,14 @@ pub async fn start_machine(
             dns_filter_hosts,
         )
         .map_err(|e| format!("failed to prepare packed layers: {}", e))?;
+        // A fork clone shares its golden's uid. On a cold (re)start there is no
+        // snapshot path to resolve it from, so pass the golden's data dir
+        // explicitly — without it the clone claims a fresh uid that cannot
+        // traverse the golden's 0700 dir to open its copy-on-write disk
+        // backing, and the boot dies configuring virtio-blk.
+        if let Some(ref g) = record_golden {
+            features.uid_share_dir = Some(crate::agent::vm_data_dir(g));
+        }
         // Forkable start: memfd-back guest RAM and expose a control socket at the
         // machine's known path so it can later be forked via the fork endpoint.
         if forkable {
@@ -1431,6 +1440,28 @@ pub async fn delete_machine(
         .lookup_vm(&name)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
+
+    // A forked clone's block disks are copy-on-write overlays backed by this
+    // machine's disks, so deleting a golden with live clones would destroy
+    // their backing files (silent data loss the moment a clone re-opens its
+    // disks). Refuse — mirroring the CLI `machine rm` guard.
+    {
+        let db = state.db().clone();
+        let golden = name.clone();
+        let clones = tokio::task::spawn_blocking(move || db.dependent_clones(&golden))
+            .await
+            .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+            .map_err(ApiError::database)?;
+        if !clones.is_empty() {
+            return Err(ApiError::Conflict(format!(
+                "machine '{}' is the fork base of {} live clone(s) ({}); their disks are \
+                 backed by its disks — delete the clones first",
+                name,
+                clones.len(),
+                clones.join(", ")
+            )));
+        }
+    }
 
     // Get PID and start time from database record
     let pid = record.pid;

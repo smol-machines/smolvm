@@ -337,6 +337,19 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
                 read_write.push(path.clone());
             }
         }
+        // A fork clone's disks are qcow2 copy-on-write overlays whose backing
+        // files live in the GOLDEN's data dir (and may chain further, e.g.
+        // golden qcow2 -> shared disk template). libkrun resolves the whole
+        // chain inside this confined process, so every backing file must be
+        // readable or the cold (re)start of a clone dies with "Error
+        // configuring virtio-blk". Walk each disk's backing chain and grant
+        // the files read-only. (The fork-restore boot path skips Landlock
+        // entirely; this covers the plain stop -> start path.)
+        for disk in [&config.storage_disk_path, &config.overlay_disk_path] {
+            for backing in qcow2_backing_chain(disk) {
+                read_exec.push(backing);
+            }
+        }
         for m in &config.mounts {
             if m.read_only {
                 read_exec.push(m.source.clone());
@@ -622,4 +635,99 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
     }
 
     smolvm::process::exit_child(1);
+}
+
+/// Resolve the qcow2 backing-file chain of `path`: if the file is a qcow2 with
+/// a backing file, return that path and recurse into it (bounded). Non-qcow2
+/// files, unreadable files, and files without a backing entry yield nothing.
+/// Used to pre-grant Landlock read access on every image the confined VMM's
+/// block layer will open — a fork clone's disks are backed by files in the
+/// golden's data dir, outside the clone's own granted paths.
+#[cfg(target_os = "linux")]
+fn qcow2_backing_chain(path: &std::path::Path) -> Vec<std::path::PathBuf> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut chain = Vec::new();
+    let mut current = path.to_path_buf();
+    // A backing chain deeper than a handful of links is not something this
+    // engine produces; the bound only guards against cycles.
+    for _ in 0..8 {
+        let Ok(mut f) = std::fs::File::open(&current) else {
+            break;
+        };
+        let mut header = [0u8; 20];
+        if f.read_exact(&mut header).is_err() {
+            break;
+        }
+        // qcow2: magic "QFI\xfb", then version; backing offset at 8, size at 16.
+        if header[0..4] != [0x51, 0x46, 0x49, 0xfb] {
+            break;
+        }
+        let offset = u64::from_be_bytes(header[8..16].try_into().unwrap());
+        let size = u32::from_be_bytes(header[16..20].try_into().unwrap());
+        if offset == 0 || size == 0 || size > 4096 {
+            break;
+        }
+        let mut name = vec![0u8; size as usize];
+        if f.seek(SeekFrom::Start(offset)).is_err() || f.read_exact(&mut name).is_err() {
+            break;
+        }
+        let Ok(backing) = String::from_utf8(name) else {
+            break;
+        };
+        let backing = std::path::PathBuf::from(backing);
+        if chain.contains(&backing) {
+            break;
+        }
+        chain.push(backing.clone());
+        current = backing;
+    }
+    chain
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod backing_chain_tests {
+    use super::qcow2_backing_chain;
+    use std::io::Write;
+
+    fn fake_qcow2(
+        dir: &std::path::Path,
+        name: &str,
+        backing: Option<&std::path::Path>,
+    ) -> std::path::PathBuf {
+        let p = dir.join(name);
+        let mut h = vec![0u8; 128];
+        h[0..4].copy_from_slice(&[0x51, 0x46, 0x49, 0xfb]);
+        h[4..8].copy_from_slice(&3u32.to_be_bytes());
+        if let Some(b) = backing {
+            let bs = b.as_os_str().to_str().unwrap().as_bytes();
+            h[8..16].copy_from_slice(&128u64.to_be_bytes());
+            h[16..20].copy_from_slice(&(bs.len() as u32).to_be_bytes());
+            h.extend_from_slice(bs);
+        }
+        let mut f = std::fs::File::create(&p).unwrap();
+        f.write_all(&h).unwrap();
+        p
+    }
+
+    // A clone's disk chains through its golden's qcow2 to the shared raw
+    // template; the Landlock grant must surface every link so the confined
+    // VMM can open the whole chain on a cold restart.
+    #[test]
+    fn resolves_two_level_chain_and_stops_at_raw() {
+        let dir = std::env::temp_dir().join(format!("smolvm-bc-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.join("template.raw");
+        std::fs::write(&raw, b"not a qcow2").unwrap();
+        let golden = fake_qcow2(&dir, "golden.qcow2", Some(&raw));
+        let clone = fake_qcow2(&dir, "clone.qcow2", Some(&golden));
+        assert_eq!(
+            qcow2_backing_chain(&clone),
+            vec![golden.clone(), raw.clone()]
+        );
+        // Non-qcow2 and backing-less files yield nothing.
+        assert!(qcow2_backing_chain(&raw).is_empty());
+        let solo = fake_qcow2(&dir, "solo.qcow2", None);
+        assert!(qcow2_backing_chain(&solo).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

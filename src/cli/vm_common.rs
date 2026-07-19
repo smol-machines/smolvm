@@ -930,6 +930,10 @@ pub fn start_vm_named(
         expose_docker: record.docker_socket,
         published_sockets: record.published_sockets.clone(),
         dns_filter_hosts: record.dns_filter_hosts.clone(),
+        // A fork clone shares its golden's uid; resolve it explicitly so a
+        // cold (re)start can open the golden's CoW disk backing behind its
+        // 0700 data dir.
+        uid_share_dir: record.golden.as_deref().map(smolvm::agent::vm_data_dir),
         ..Default::default()
     }
     .with_packed_layers(

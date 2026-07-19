@@ -88,6 +88,15 @@ fn start_vm_from_record(record: &VmRecord) -> Result<VmHandle> {
 /// Boot `record` with the given launch features and return a handle. Shared by
 /// the plain, forkable-golden, and fork-clone start paths so they can't drift.
 fn launch_from_record(record: &VmRecord, features: LaunchFeatures) -> Result<VmHandle> {
+    let mut features = features;
+    // A fork clone shares its golden's uid; resolve it explicitly so a cold
+    // (re)start — where no snapshot path exists to infer it — can still open
+    // the golden's copy-on-write disk backing behind its 0700 data dir.
+    if features.uid_share_dir.is_none() {
+        if let Some(ref g) = record.golden {
+            features.uid_share_dir = Some(crate::agent::vm_data_dir(g));
+        }
+    }
     let manager =
         AgentManager::for_vm_with_sizes(&record.name, record.storage_gb, record.overlay_gb)
             .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
