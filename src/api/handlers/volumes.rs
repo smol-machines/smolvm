@@ -70,6 +70,22 @@ pub async fn provision_volume(
         "local" => {
             let path = volumes_base().join(&req.id);
             std::fs::create_dir_all(&path).map_err(ApiError::internal)?;
+            // The node service runs as root, so the dir is created root:root 0755.
+            // But a machine mounts it via virtiofs under per-VM uid isolation
+            // (#456): the guest's uid 0 is a dropped host uid (e.g. 2000025), and
+            // the virtiofs daemon writing on the guest's behalf runs as THAT uid —
+            // which has no write access to a root-owned 0755 dir, so every write
+            // into the mounted volume fails with EACCES (the volume is read-only in
+            // practice). Make the volume root world-writable so whichever per-VM
+            // uid mounts it can write; the dir is only ever virtiofs-exposed to the
+            // single VM that has it attached (volumes are single-attach), and the
+            // per-VM uid boundary — not these bits — is the isolation guarantee.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777))
+                    .map_err(ApiError::internal)?;
+            }
             let node_path = path.to_string_lossy().to_string();
             tracing::info!(volume_id = %req.id, node_path = %node_path, size_gb = req.size_gb, "provisioned local volume");
             Ok(Json(ProvisionVolumeResponse { node_path }))
