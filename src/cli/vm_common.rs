@@ -751,7 +751,7 @@ pub fn fork_vm(
         // FAIL-CLOSED: if the reset can't be confirmed, stop the booted clone and
         // roll it back rather than leave it live with the golden's secrets.
         smolvm::agent::fork::fail_closed_on_rejuvenation(
-            smolvm::agent::fork::rejuvenate_clone(clone, golden),
+            smolvm::agent::fork::rejuvenate_clone(clone),
             || {
                 if let Ok(manager) = AgentManager::for_vm(clone) {
                     manager.kill();

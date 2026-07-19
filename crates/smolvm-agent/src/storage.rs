@@ -2410,16 +2410,41 @@ impl OverlaySetup {
 
     /// Reuse an existing persistent overlay or create a new one.
     ///
-    /// If the overlay is already mounted, returns it immediately.
+    /// If the overlay is already mounted AND healthy, returns it immediately.
+    /// A mounted-but-stale overlay (a fork clone's RAM image carries the
+    /// golden's overlay mount, whose virtiofs lowerdirs died with the pre-fork
+    /// virtiofsd session — every fresh lookup through it is ESTALE) is torn
+    /// down and remounted from its intact upper layer, so the clone keeps the
+    /// golden's exec-written state instead of erroring on every exec.
     /// If the overlay directory exists but is not mounted (e.g. after VM restart),
     /// remounts it preserving the upper layer (which contains previous changes).
     /// If the overlay does not exist at all, creates it fresh.
     fn execute_or_remount(self, lowerdirs: Vec<String>) -> Result<OverlayInfo> {
-        // Already mounted — just reuse it
+        // Already mounted — reuse it only if it actually answers lookups.
         if self.merged_path.exists() && is_mountpoint(&self.merged_path) {
-            info!(workload_id = %self.workload_id, "reusing existing persistent overlay");
-            self.create_bundle()?;
-            return Ok(self.into_overlay_info());
+            if mounted_overlay_is_healthy(&self.merged_path) {
+                info!(workload_id = %self.workload_id, "reusing existing persistent overlay");
+                self.create_bundle()?;
+                return Ok(self.into_overlay_info());
+            }
+            // Stale restored mount (fork clone). The restored keep-alive
+            // container (if any) still runs from it — kill it so the next
+            // exec establishes a fresh one on the healed overlay, then detach
+            // the dead mount and fall through to the remount path below,
+            // which reuses the (CoW-inherited) upper layer.
+            warn!(
+                workload_id = %self.workload_id,
+                "persistent overlay mount is stale (restored fork state); remounting from its upper layer"
+            );
+            let id_path = paths::main_container_id_path(&self.workload_id);
+            if let Ok(cid) = std::fs::read_to_string(&id_path) {
+                let cid = cid.trim();
+                if !cid.is_empty() {
+                    let _ = CrunCommand::delete(cid, true).output();
+                }
+            }
+            let _ = std::fs::remove_file(&id_path);
+            detach_mount(&self.merged_path);
         }
 
         // Upper layer exists from a previous session — remount preserving it
@@ -3057,6 +3082,67 @@ fn setup_volume_mounts(_rootfs: &str, _mounts: &[(String, String, bool)]) -> Res
 /// Check if a path is a mountpoint (delegates to paths::is_mount_point).
 fn is_mountpoint(path: &Path) -> bool {
     paths::is_mount_point(path)
+}
+
+/// Whether a persistent overlay's mounted state (if any) answers lookups.
+/// True when the overlay isn't mounted at all — "nothing stale to heal".
+/// Used by `resolve_main_container` to refuse handing out a restored
+/// keep-alive container whose rootfs mount is dead.
+pub fn persistent_overlay_mount_is_healthy(workload_id: &str) -> bool {
+    let Ok(root) = overlay_root_for_workload(workload_id) else {
+        return true;
+    };
+    let merged = root.join("merged");
+    !(merged.exists() && is_mountpoint(&merged)) || mounted_overlay_is_healthy(&merged)
+}
+
+/// Whether an already-mounted persistent overlay actually answers lookups.
+///
+/// A fork clone's restored RAM image carries the golden's overlay mount, but
+/// the mount's virtiofs lowerdirs reference the pre-fork virtiofsd session —
+/// in the clone every *fresh* lookup through it fails with ESTALE, while
+/// page-cached entries may still read fine. So the probe is a lookup that
+/// cannot be served from cache: a name never looked up before. A healthy
+/// mount answers NotFound; a stale one surfaces the lowerdir error.
+fn mounted_overlay_is_healthy(merged: &Path) -> bool {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let probe = merged.join(format!(".smolvm-stale-probe-{nonce}"));
+    match std::fs::metadata(&probe) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(e) => {
+            warn!(path = %merged.display(), error = %e, "mounted overlay failed the lookup probe");
+            false
+        }
+        Ok(_) => true,
+    }
+}
+
+/// Lazily detach a dead mount (`umount2(MNT_DETACH)`): the tree is unhooked
+/// immediately while any restored process still holding it keeps its
+/// references until it exits. Best-effort — a failure here just means the
+/// subsequent fresh mount shadows the stale one.
+fn detach_mount(path: &Path) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        if let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) {
+            let rc = unsafe { libc::umount2(c.as_ptr(), libc::MNT_DETACH) };
+            if rc != 0 {
+                warn!(
+                    path = %path.display(),
+                    errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+                    "could not detach stale overlay mount"
+                );
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+    }
 }
 
 /// Run a command using crun OCI runtime (one-shot execution).
