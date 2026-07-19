@@ -70,6 +70,7 @@ pub async fn provision_volume(
         "local" => {
             let path = volumes_base().join(&req.id);
             std::fs::create_dir_all(&path).map_err(ApiError::internal)?;
+<<<<<<< Updated upstream
             // The node service runs as root, so the dir is created root:root 0755.
             // But a machine mounts it via virtiofs under per-VM uid isolation
             // (#456): the guest's uid 0 is a dropped host uid (e.g. 2000025), and
@@ -80,6 +81,17 @@ pub async fn provision_volume(
             // uid mounts it can write; the dir is only ever virtiofs-exposed to the
             // single VM that has it attached (volumes are single-attach), and the
             // per-VM uid boundary — not these bits — is the isolation guarantee.
+=======
+            // Each VM boot setuid-drops to a per-VM uid, and virtiofs serves this
+            // dir from that dropped process — so a dir left at the serve user's
+            // umask default (0755, serve-user-owned) is READ-ONLY to every guest,
+            // forever: even guest root gets EACCES, and it can't self-repair
+            // because guest root is not the host-side owner. World-writable is
+            // the only mode that works across attaches (a volume outlives any
+            // one machine, and successive machines get different uids); the
+            // node's data-dir ancestors gate which host users can reach it, and
+            // the microVM remains the tenant-isolation boundary.
+>>>>>>> Stashed changes
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -128,5 +140,20 @@ mod tests {
     fn volumes_base_is_under_smolvm() {
         let b = volumes_base();
         assert!(b.ends_with("smolvm/volumes"), "got {b:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provisioned_volume_dir_is_guest_writable() {
+        use std::os::unix::fs::PermissionsExt;
+        // Mirror the provision path's perms logic on a temp dir: created under a
+        // restrictive umask, the dir must still end up world-writable so the
+        // per-VM-uid virtiofs process (guest root) can write it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vol-test");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o777, "got {mode:o}");
     }
 }
