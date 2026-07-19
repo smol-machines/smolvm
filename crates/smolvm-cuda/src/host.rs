@@ -960,6 +960,13 @@ pub fn set_worker_alloc_trans(v: Vec<(u64, u64, u64)>) {
     WORKER_ALLOC_TRANS.with(|r| *r.borrow_mut() = v);
 }
 
+/// Non-draining copy of this thread's staged alloc translations, taken by the
+/// clone worker's main thread BEFORE serving so late-attached guest channels
+/// (served on other threads) can be seeded with the same map.
+pub fn worker_alloc_trans_snapshot() -> Vec<(u64, u64, u64)> {
+    WORKER_ALLOC_TRANS.with(|r| r.borrow().clone())
+}
+
 fn take_worker_alloc_trans() -> Vec<(u64, u64, u64)> {
     WORKER_ALLOC_TRANS.with(|r| std::mem::take(&mut *r.borrow_mut()))
 }
@@ -1088,6 +1095,24 @@ fn xlat_mod(b: &mut dyn Backend, golden: u64) -> u64 {
                     image.len(),
                     head.join("")
                 );
+                if std::env::var_os("SMOLVM_CUDA_DUMP_FAILMOD").is_some() {
+                    let p = format!("/tmp/smolvm/failmod-{golden:x}.bin");
+                    let _ = std::fs::write(&p, &image);
+                    // Context health right after the failed load: a poisoned
+                    // (sticky-fault) context errors on sync/alloc too; a healthy
+                    // one pins the failure on cuModuleLoadData itself.
+                    let sync = b.ctx_synchronize().err();
+                    let alloc = match b.mem_alloc(1 << 20) {
+                        Ok(d) => {
+                            let _ = b.mem_free(d);
+                            None
+                        }
+                        Err(e) => Some(e),
+                    };
+                    eprintln!(
+                        "[M3a-lazy] dumped {p}; post-fail probes: sync_err={sync:?} alloc_err={alloc:?}"
+                    );
+                }
             } else if n == 8 {
                 eprintln!("[M3a-lazy] module reload failing repeatedly (e={e}); further reports suppressed");
             }
