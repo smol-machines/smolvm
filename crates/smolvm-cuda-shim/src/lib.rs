@@ -759,6 +759,7 @@ unsafe fn module_image_len(image: *const c_void) -> Result<usize, c_int> {
     // shipped image loads fine on sm80/sm86 but fails 209 NO_BINARY_FOR_GPU
     // on H100). Walk every consecutive container.
     if magic == [0x50, 0xED, 0x55, 0xBA] {
+        let chain = std::env::var_os("SMOLVM_CUDA_FATBIN_CHAIN").is_some();
         let mut total = 0usize;
         loop {
             let q = unsafe { p.add(total) };
@@ -773,6 +774,9 @@ unsafe fn module_image_len(image: *const c_void) -> Result<usize, c_int> {
                 break;
             }
             total += header_size + fat_size;
+            if !chain {
+                break;
+            }
             // Chains abutting in .rodata can run away (the walk cannot see
             // module boundaries); cap well above any real per-module chain.
             if total >= 128 * 1024 * 1024 {
