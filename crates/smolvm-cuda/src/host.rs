@@ -2773,6 +2773,32 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 }
                 return Ok(Response::LibResult(0, Vec::new()));
             }
+            // lib 6 / func 2: classify a pointer — reply [2] iff the session
+            // knows it as device memory (cudaMalloc table, VMM ranges, clone
+            // translations/shared ranges). The guest cudart shim can't see
+            // driver-VMM allocations (torch expandable_segments), so its
+            // cudaPointerGetAttributes mis-reported them as unregistered and
+            // vLLM's CUDA-graph capture (`weak_ref_tensor`) refused them.
+            if lib == 6 && func == 2 && args.len() >= 8 {
+                let p = u64::from_le_bytes(args[0..8].try_into().unwrap());
+                let in_alloc = sess
+                    .alloc_table
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(&b0, &(sz, _))| p >= b0 && p < b0 + sz);
+                let dev = in_alloc
+                    || sess.owned_dptrs.iter().any(|(&b0, &sz)| p >= b0 && p < b0 + sz)
+                    || sess
+                        .vmm_ranges
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|(&b0, &sz)| p >= b0 && p < b0 + sz)
+                    || sess.dptr_trans.iter().any(|&(b0, sz, _)| p >= b0 && p < b0 + sz)
+                    || sess.shared_ranges.iter().any(|&(b0, sz)| p >= b0 && p < b0 + sz);
+                return Ok(Response::LibResult(0, vec![if dev { 2 } else { 0 }]));
+            }
             let r = b.lib_call(lib, func, &args, &sess.streams);
             // Path 3: record top-level library-context creates so a clone
             // worker can replay them in ITS process (library handles are
