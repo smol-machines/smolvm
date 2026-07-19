@@ -1451,6 +1451,17 @@ fn translate_dptrs(trans: &[(u64, u64, u64)], req: Request) -> Request {
     }
 }
 
+/// Oplog helper: for LibCall payloads, decode "(lib,func)" for attribution.
+fn libcall_tag(p: &[u8]) -> String {
+    if p.first() == Some(&0xA0) && p.len() >= 4 {
+        let lib = p[1];
+        let func = u16::from_le_bytes([p[2], p[3]]);
+        format!(" lib={lib} func={func}")
+    } else {
+        String::new()
+    }
+}
+
 /// Serve one CUDA-RPC connection to completion (until the peer closes). Each
 /// request is dispatched to `backend`; returns on clean EOF.
 pub fn serve<S: Read + Write>(stream: S, backend: &mut dyn Backend) -> std::io::Result<()> {
@@ -1478,7 +1489,12 @@ fn serve_inner<S: Read + Write>(
             Some(&crate::proto::QUIET_PREFIX) => {
                 let req = decode_request(&payload[1..])?;
                 if std::env::var_os("SMOLVM_CUDA_HOST_OPLOG").is_some() {
-                    eprintln!("[op~] 0x{:02x} len={}", payload[1], payload.len());
+                    eprintln!(
+                        "[op~] 0x{:02x} len={}{}",
+                        payload[1],
+                        payload.len(),
+                        libcall_tag(&payload[1..])
+                    );
                 }
                 let (status, _) = dispatch(sess, backend, req);
                 if status != 0 && std::env::var_os("SMOLVM_CUDA_HOST_OPLOG").is_some() {
@@ -1501,7 +1517,12 @@ fn serve_inner<S: Read + Write>(
             _ => {
                 let req = decode_request(&payload)?;
                 if std::env::var_os("SMOLVM_CUDA_HOST_OPLOG").is_some() {
-                    eprintln!("[op] 0x{:02x} len={}", payload[0], payload.len());
+                    eprintln!(
+                        "[op] 0x{:02x} len={}{}",
+                        payload[0],
+                        payload.len(),
+                        libcall_tag(&payload)
+                    );
                 }
                 // Transport upgrade: switch this connection to shared-memory
                 // rings and never return to socket framing (the socket then
@@ -1753,7 +1774,7 @@ fn serve_rings<S: Read + Write>(
                     }
                 };
                 if oplog {
-                    eprintln!("[op~] 0x{:02x} len={}", frame[1], frame.len());
+                    eprintln!("[op~] 0x{:02x} len={}{}", frame[1], frame.len(), libcall_tag(&frame[1..]));
                 }
                 let (status, _) = dispatch(sess, backend, req);
                 if status != 0 {
@@ -1782,7 +1803,7 @@ fn serve_rings<S: Read + Write>(
                     }
                 };
                 if oplog {
-                    eprintln!("[op] 0x{:02x} len={}", frame[0], frame.len());
+                    eprintln!("[op] 0x{:02x} len={}{}", frame[0], frame.len(), libcall_tag(&frame));
                 }
                 let (status, resp) = dispatch(sess, backend, req);
                 if status != 0 && oplog {

@@ -140,16 +140,16 @@ impl GenLib {
                 let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
                 let alpha_v = __c.f32();
                 let xDesc = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
-                let x = __c.u64() as *mut c_void;
+                let x = super::dptr_resolve(__c.u64()) as *mut c_void;
                 let wDesc = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
-                let w = __c.u64() as *mut c_void;
+                let w = super::dptr_resolve(__c.u64()) as *mut c_void;
                 let convDesc = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
                 let algo = __c.i32();
-                let workspace = __c.u64() as *mut c_void;
+                let workspace = super::dptr_resolve(__c.u64()) as *mut c_void;
                 let wsSize = __c.u64();
                 let beta_v = __c.f32();
                 let yDesc = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
-                let y = __c.u64() as *mut c_void;
+                let y = super::dptr_resolve(__c.u64()) as *mut c_void;
                 let mut out = Vec::new();
                 let st = unsafe { (self.f_cudnnConvolutionForward)(handle, &alpha_v, xDesc, x, wDesc, w, convDesc, algo as c_int, workspace, wsSize as usize, &beta_v, yDesc, y) };
                 (st, out)

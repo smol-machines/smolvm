@@ -792,9 +792,13 @@ fn gen_host(lib: &Lib) -> String {
                     call.push(p.name.to_string());
                 }
                 Kind::DevPtr => {
+                    // Clone sessions translate inherited golden pointers to
+                    // their private copies (identity for everything else) —
+                    // an untranslated golden VA here is unmapped in a worker
+                    // and faults the whole context (sticky 700; QA-1l).
                     let _ = writeln!(
                         binds,
-                        "                let {} = __c.u64() as {};",
+                        "                let {} = super::dptr_resolve(__c.u64()) as {};",
                         p.name, p.cty
                     );
                     call.push(p.name.to_string());
