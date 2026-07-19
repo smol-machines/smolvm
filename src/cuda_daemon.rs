@@ -101,10 +101,7 @@ pub(crate) fn install_crash_handler(role: &'static str) {
         // SAFETY: installing a handler that only formats + re-raises.
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
-            #[allow(clippy::fn_to_numeric_cast_any)] // sigaction's ABI wants the raw address
-            {
-                sa.sa_sigaction = on_fatal as usize;
-            }
+            sa.sa_sigaction = on_fatal as *const () as usize;
             sa.sa_flags = libc::SA_ONSTACK;
             libc::sigaction(sig, &sa, std::ptr::null_mut());
         }
