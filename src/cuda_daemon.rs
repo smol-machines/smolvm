@@ -1007,9 +1007,39 @@ fn route_clone_connection(fd: std::os::unix::io::RawFd) -> bool {
     };
     let share_weights = flags & 1 != 0;
     let Some(token) = peek_clone_token(fd) else {
-        // A clone VM's connection whose Init carries no lineage token: fresh
-        // post-fork work (new guest process), served in-daemon like any new
-        // session.
+        // A clone VM's connection whose Init carries no lineage token. The
+        // guest treats CUDA state as process-global, so if this clone already
+        // has a live worker, the channel MUST serve there: a cuBLAS handle
+        // created through an in-daemon session is invisible to the worker's
+        // sessions (vh-miss → NOT_INITIALIZED on the compute channel). Only
+        // when no worker exists is in-daemon serving correct (genuinely
+        // fresh post-fork work before any isolating resume).
+        let reg = clone_worker_registry().lock().unwrap();
+        let live = reg.iter().find_map(|(&(_, cid), &(pid, ctrl))| {
+            // SAFETY: kill(pid, 0) — pure liveness probe, no signal delivered.
+            (cid == clone_id && unsafe { libc::kill(pid as i32, 0) } == 0)
+                .then_some((pid, ctrl))
+        });
+        if let Some((pid, ctrl)) = live {
+            match send_fd(ctrl, fd) {
+                Ok(()) => {
+                    tracing::info!(
+                        clone_id,
+                        worker_pid = pid,
+                        "attached token-less clone channel to its live worker"
+                    );
+                    return true; // worker owns an in-flight dup; caller drops its copy
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        clone_id,
+                        worker_pid = pid,
+                        "token-less channel attach failed; serving in-daemon"
+                    );
+                }
+            }
+        }
         return false;
     };
     let mut reg = clone_worker_registry().lock().unwrap();
