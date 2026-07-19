@@ -429,12 +429,12 @@ pub extern "C" fn cuGetExportTable(_table: *mut *const c_void, uuid: *const c_vo
 
 #[no_mangle]
 pub extern "C" fn cuDriverGetVersion(version: *mut c_int) -> c_int {
-    // Queryable before cuInit, per the driver's contract.
-    if STATE.lock().map(|g| g.is_some()).unwrap_or(false) {
-        ret(with_state(|s| s.client.driver_get_version()).and_then(|v| unsafe { out(version, v) }))
-    } else {
-        ret(unsafe { out(version, shim_cuda_version()) })
-    }
+    // ALWAYS the advertised surface, never the daemon's real driver version.
+    // Forwarding post-connect leaked the host's version (e.g. 13000 on a
+    // CUDA-13 box) to guest libraries that then negotiate cu13 entry points
+    // this shim only partially provides — cuBLASLt degraded into loading
+    // kernels the driver rejects (209 NO_BINARY_FOR_GPU on sm90).
+    ret(unsafe { out(version, shim_cuda_version()) })
 }
 
 #[no_mangle]
@@ -753,10 +753,36 @@ unsafe fn module_image_len(image: *const c_void) -> Result<usize, c_int> {
     let p = image as *const u8;
     let magic = unsafe { std::slice::from_raw_parts(p, 4) };
     // Fatbin container: u32 magic, u16 version, u16 headerSize, u64 fatSize.
+    // nvcc/cuBLAS emit BACK-TO-BACK containers (per-arch/per-component) and
+    // the driver walks them all — summing only the first truncates any SASS
+    // living in a later container (observed: cuBLASLt sm90 kernels → the
+    // shipped image loads fine on sm80/sm86 but fails 209 NO_BINARY_FOR_GPU
+    // on H100). Walk every consecutive container.
     if magic == [0x50, 0xED, 0x55, 0xBA] {
-        let header_size = u16::from_le_bytes(unsafe { *(p.add(6) as *const [u8; 2]) }) as usize;
-        let fat_size = u64::from_le_bytes(unsafe { *(p.add(8) as *const [u8; 8]) }) as usize;
-        return Ok(header_size + fat_size);
+        let mut total = 0usize;
+        loop {
+            let q = unsafe { p.add(total) };
+            let m = unsafe { std::slice::from_raw_parts(q, 4) };
+            if m != [0x50, 0xED, 0x55, 0xBA] {
+                break;
+            }
+            let header_size =
+                u16::from_le_bytes(unsafe { *(q.add(6) as *const [u8; 2]) }) as usize;
+            let fat_size = u64::from_le_bytes(unsafe { *(q.add(8) as *const [u8; 8]) }) as usize;
+            if header_size == 0 || fat_size == 0 {
+                break;
+            }
+            total += header_size + fat_size;
+            // Chains abutting in .rodata can run away (the walk cannot see
+            // module boundaries); cap well above any real per-module chain.
+            if total >= 128 * 1024 * 1024 {
+                break;
+            }
+        }
+        if total > 0 {
+            return Ok(total);
+        }
+        return Err(CUDA_ERROR_INVALID_VALUE);
     }
     // ELF (cubin): total = e_shoff + e_shnum * e_shentsize (sections are last).
     if magic == [0x7F, b'E', b'L', b'F'] {
@@ -1516,6 +1542,7 @@ fn proc_table(name: &str) -> Option<*mut c_void> {
         "cuMemsetD8" => cuMemsetD8_v2,
         "cuMemGetInfo" => cuMemGetInfo_v2,
         "cuLaunchKernel" => cuLaunchKernel,
+        "cuTensorMapEncodeTiled" => cuTensorMapEncodeTiled,
         "cuStreamCreate" => cuStreamCreate,
         "cuStreamCreateWithPriority" => cuStreamCreateWithPriority,
         "cuStreamDestroy" => cuStreamDestroy_v2,
@@ -1681,9 +1708,80 @@ pub extern "C" fn cuOccupancyMaxActiveBlocksPerMultiprocessor(
     }
     CUDA_SUCCESS
 }
+/// Hopper TMA descriptor encode, forwarded to the daemon (generic LibCall,
+/// lib 6 / func 0). sm90 cuBLASLt and FlashAttention kernels cannot
+/// initialize without it — the old NOT_SUPPORTED stub surfaced as
+/// "Failed to initialize the TMA descriptor 801" → CUBLAS_STATUS_NOT_INITIALIZED
+/// in vLLM on H100. Blob: [u32 dtype][u32 rank][u64 gaddr][5xu64 gdim]
+/// [5xu64 gstride][5xu32 boxdim][5xu32 estride][u32 il][u32 sw][u32 l2][u32 oob]
+/// = 152 bytes; reply payload is the 128-byte CUtensorMap.
 #[no_mangle]
-pub extern "C" fn cuTensorMapEncodeTiled() -> c_int {
-    CU_ERROR_NOT_SUPPORTED
+pub extern "C" fn cuTensorMapEncodeTiled(
+    tensor_map: *mut u8,
+    data_type: c_int,
+    rank: u32,
+    global_address: u64,
+    global_dim: *const u64,
+    global_strides: *const u64,
+    box_dim: *const u32,
+    element_strides: *const u32,
+    interleave: c_int,
+    swizzle: c_int,
+    l2_promotion: c_int,
+    oob_fill: c_int,
+) -> c_int {
+    if tensor_map.is_null() || rank == 0 || rank > 5 || global_dim.is_null() || box_dim.is_null()
+    {
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+    let r = rank as usize;
+    let mut blob = Vec::with_capacity(152);
+    blob.extend_from_slice(&(data_type as u32).to_le_bytes());
+    blob.extend_from_slice(&rank.to_le_bytes());
+    blob.extend_from_slice(&global_address.to_le_bytes());
+    for i in 0..5 {
+        let v = if i < r { unsafe { *global_dim.add(i) } } else { 0 };
+        blob.extend_from_slice(&v.to_le_bytes());
+    }
+    for i in 0..5 {
+        // The API takes rank-1 stride entries (innermost is implicit).
+        let v = if i + 1 < r && !global_strides.is_null() {
+            unsafe { *global_strides.add(i) }
+        } else {
+            0
+        };
+        blob.extend_from_slice(&v.to_le_bytes());
+    }
+    for i in 0..5 {
+        let v = if i < r { unsafe { *box_dim.add(i) } } else { 0 };
+        blob.extend_from_slice(&v.to_le_bytes());
+    }
+    for i in 0..5 {
+        // NULL elementStrides means all-ones, per the driver contract.
+        let v = if i < r && !element_strides.is_null() {
+            unsafe { *element_strides.add(i) }
+        } else {
+            1
+        };
+        blob.extend_from_slice(&v.to_le_bytes());
+    }
+    for v in [interleave, swizzle, l2_promotion, oob_fill] {
+        blob.extend_from_slice(&(v as u32).to_le_bytes());
+    }
+    match with_state(|s| s.client.lib_call(6, 0, blob)) {
+        Ok((0, out)) if out.len() == 128 => {
+            unsafe { std::ptr::copy_nonoverlapping(out.as_ptr(), tensor_map, 128) };
+            CUDA_SUCCESS
+        }
+        Ok((st, _)) => {
+            if st == 0 {
+                CU_ERROR_NOT_SUPPORTED // 128-byte payload missing: daemon too old
+            } else {
+                st
+            }
+        }
+        Err(e) => e,
+    }
 }
 
 #[no_mangle]

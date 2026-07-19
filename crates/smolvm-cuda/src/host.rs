@@ -786,6 +786,12 @@ fn layout_handoff_register(l: &std::sync::Arc<LayoutCell>, my_token: u64) {
     reg.insert(my_token, std::sync::Arc::downgrade(l));
 }
 
+/// The live layout registered under `token`, for a resuming sibling channel to
+/// SHARE (same guest process → one layout; see the Init handler).
+fn layout_handoff_adopt(token: u64) -> Option<std::sync::Arc<LayoutCell>> {
+    LAYOUT_HANDOFF.lock().unwrap().as_ref()?.get(&token)?.upgrade()
+}
+
 /// One VMM chunk in the fork handoff (see [`layout_handoff_snapshot`]).
 pub struct HandoffChunk {
     pub va: u64,
@@ -1490,7 +1496,8 @@ fn serve_inner<S: Read + Write>(
                 let req = decode_request(&payload[1..])?;
                 if std::env::var_os("SMOLVM_CUDA_HOST_OPLOG").is_some() {
                     eprintln!(
-                        "[op~] 0x{:02x} len={}{}",
+                        "[op~] p{} 0x{:02x} len={}{}",
+                        std::process::id(),
                         payload[1],
                         payload.len(),
                         libcall_tag(&payload[1..])
@@ -1518,7 +1525,8 @@ fn serve_inner<S: Read + Write>(
                 let req = decode_request(&payload)?;
                 if std::env::var_os("SMOLVM_CUDA_HOST_OPLOG").is_some() {
                     eprintln!(
-                        "[op] 0x{:02x} len={}{}",
+                        "[op] p{} 0x{:02x} len={}{}",
+                        std::process::id(),
                         payload[0],
                         payload.len(),
                         libcall_tag(&payload)
@@ -1774,7 +1782,7 @@ fn serve_rings<S: Read + Write>(
                     }
                 };
                 if oplog {
-                    eprintln!("[op~] 0x{:02x} len={}{}", frame[1], frame.len(), libcall_tag(&frame[1..]));
+                    eprintln!("[op~] p{} 0x{:02x} len={}{}", std::process::id(), frame[1], frame.len(), libcall_tag(&frame[1..]));
                 }
                 let (status, _) = dispatch(sess, backend, req);
                 if status != 0 {
@@ -1803,7 +1811,7 @@ fn serve_rings<S: Read + Write>(
                     }
                 };
                 if oplog {
-                    eprintln!("[op] 0x{:02x} len={}{}", frame[0], frame.len(), libcall_tag(&frame));
+                    eprintln!("[op] p{} 0x{:02x} len={}{}", std::process::id(), frame[0], frame.len(), libcall_tag(&frame));
                 }
                 let (status, resp) = dispatch(sess, backend, req);
                 if status != 0 && oplog {
@@ -2025,6 +2033,19 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 graph_handoff_register(&sess.graph_vhandles, resume_token, token);
                 dptr_handoff_register(&sess.alloc_table, token);
                 vmm_handoff_register(&sess.vmm_ranges, token);
+                // A resuming channel belongs to the SAME guest process as its
+                // parent, and GoldenLayout is process-scoped fork-handoff
+                // metadata (modules, upload coverage, library-handle creates).
+                // SHARE the parent's layout instead of registering a fresh one,
+                // or records split across channels: a cuBLAS handle created on
+                // one channel is then missing from the layout the fork stages,
+                // and every clone's replay lacks it (vh-miss →
+                // NOT_INITIALIZED on the clone's first GEMM).
+                if resume_token != 0 {
+                    if let Some(parent) = layout_handoff_adopt(resume_token) {
+                        sess.golden_layout = parent;
+                    }
+                }
                 layout_handoff_register(&sess.golden_layout, token);
                 // Isolation-mode clone: defer copying the parent's buffers until
                 // the first PrimaryCtxRetain, when a context is actually current.

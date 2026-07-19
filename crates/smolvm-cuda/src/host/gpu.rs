@@ -241,6 +241,9 @@ const LIB_CUDNN: u8 = 2;
 const LIB_CUDNN_BACKEND: u8 = 3;
 const LIB_CUBLASLT: u8 = 4;
 const LIB_CUDNN_BN: u8 = 5;
+/// Driver-API extras forwarded over the generic LibCall transport (no proto
+/// change needed): func 0 = cuTensorMapEncodeTiled (Hopper TMA descriptors).
+const LIB_DRIVER_TMA: u8 = 6;
 
 /// Hand-declared cuBLAS entry points (subset). `cublasStatus_t` is an enum (i32).
 struct Cublas {
@@ -2169,7 +2172,8 @@ fn vh_resolve(map: &std::collections::HashMap<u64, u64>, h: u64) -> u64 {
             // call fails (cuBLAS: NOT_INITIALIZED). Always-log: this is a
             // bug signature, not a hot path.
             eprintln!(
-                "[vh-miss] tagged handle {h:#x} unmapped (map has {} entries)",
+                "[vh-miss] pid={} tagged handle {h:#x} unmapped (map has {} entries)",
+                std::process::id(),
                 map.len()
             );
         }
@@ -2912,6 +2916,69 @@ impl GpuBackend {
         streams: &std::collections::HashMap<u64, u64>,
     ) -> CuResult<(i32, Vec<u8>)> {
         match lib {
+            LIB_DRIVER_TMA => {
+                // cuTensorMapEncodeTiled: 152-byte blob (see the guest shim),
+                // reply = the 128-byte CUtensorMap. The global address goes
+                // through the clone translation like every other device
+                // pointer; the descriptor embeds the RESOLVED address, so
+                // clone kernels using it touch their own memory.
+                if func != 0 || args.len() < 152 {
+                    return Err(1); // CUDA_ERROR_INVALID_VALUE
+                }
+                type EncodeTiled = unsafe extern "C" fn(
+                    *mut u8,
+                    c_int,
+                    u32,
+                    *mut c_void,
+                    *const u64,
+                    *const u64,
+                    *const u32,
+                    *const u32,
+                    c_int,
+                    c_int,
+                    c_int,
+                    c_int,
+                ) -> c_int;
+                let f: EncodeTiled = unsafe {
+                    sym(&self._lib, b"cuTensorMapEncodeTiled\0")
+                        .map_err(|_| super::CUDA_ERROR_NOT_SUPPORTED)?
+                };
+                let rd_u32 = |o: usize| u32::from_le_bytes(args[o..o + 4].try_into().unwrap());
+                let rd_u64 = |o: usize| u64::from_le_bytes(args[o..o + 8].try_into().unwrap());
+                let dtype = rd_u32(0) as c_int;
+                let rank = rd_u32(4).min(5);
+                let gaddr = dptr_resolve(rd_u64(8));
+                let mut gdim = [0u64; 5];
+                let mut gstr = [0u64; 5];
+                let mut bdim = [0u32; 5];
+                let mut estr = [0u32; 5];
+                for i in 0..5 {
+                    gdim[i] = rd_u64(16 + i * 8);
+                    gstr[i] = rd_u64(56 + i * 8);
+                    bdim[i] = rd_u32(96 + i * 4);
+                    estr[i] = rd_u32(116 + i * 4);
+                }
+                let mut map = [0u8; 128];
+                // SAFETY: real driver entry point with in-range arrays; the
+                // descriptor out-buffer is exactly CUtensorMap-sized.
+                let st = unsafe {
+                    f(
+                        map.as_mut_ptr(),
+                        dtype,
+                        rank,
+                        gaddr as *mut c_void,
+                        gdim.as_ptr(),
+                        gstr.as_ptr(),
+                        bdim.as_ptr(),
+                        estr.as_ptr(),
+                        rd_u32(136) as c_int,
+                        rd_u32(140) as c_int,
+                        rd_u32(144) as c_int,
+                        rd_u32(148) as c_int,
+                    )
+                };
+                Ok((st, if st == 0 { map.to_vec() } else { Vec::new() }))
+            }
             LIB_CUBLAS => {
                 if self.cublas_gen.is_none() {
                     match gen_cublas::GenLib::load() {
