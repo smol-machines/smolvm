@@ -49,7 +49,21 @@ const CUDA_ERROR_NOT_SUPPORTED: c_int = 801;
 const CUDA_ERROR_UNKNOWN: c_int = 999;
 
 /// The CUDA version this shim reports for its own API surface.
-const SHIM_CUDA_VERSION: c_int = 13020;
+/// CUDA version the driver shim ADVERTISES. Must not overpromise: a real cu12
+/// cuBLASLt that hears "13020" requests 13.x entry points through
+/// cuGetProcAddress that this shim only partially provides, and fails
+/// CUBLAS_STATUS_NOT_INITIALIZED at its first matmul (broke every cu124-wheel
+/// guest). Default to the fully-implemented 12.4 surface; a cu130-wheel guest
+/// opts into the newer advertisement with SMOLVM_CUDA_ADVERTISE=13020.
+fn shim_cuda_version() -> c_int {
+    static V: std::sync::OnceLock<c_int> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("SMOLVM_CUDA_ADVERTISE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(12040)
+    })
+}
 
 // ---- transport ---------------------------------------------------------------
 
@@ -419,7 +433,7 @@ pub extern "C" fn cuDriverGetVersion(version: *mut c_int) -> c_int {
     if STATE.lock().map(|g| g.is_some()).unwrap_or(false) {
         ret(with_state(|s| s.client.driver_get_version()).and_then(|v| unsafe { out(version, v) }))
     } else {
-        ret(unsafe { out(version, SHIM_CUDA_VERSION) })
+        ret(unsafe { out(version, shim_cuda_version()) })
     }
 }
 
