@@ -2788,15 +2788,24 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                     .iter()
                     .any(|(&b0, &(sz, _))| p >= b0 && p < b0 + sz);
                 let dev = in_alloc
-                    || sess.owned_dptrs.iter().any(|(&b0, &sz)| p >= b0 && p < b0 + sz)
+                    || sess
+                        .owned_dptrs
+                        .iter()
+                        .any(|(&b0, &sz)| p >= b0 && p < b0 + sz)
                     || sess
                         .vmm_ranges
                         .lock()
                         .unwrap()
                         .iter()
                         .any(|(&b0, &sz)| p >= b0 && p < b0 + sz)
-                    || sess.dptr_trans.iter().any(|&(b0, sz, _)| p >= b0 && p < b0 + sz)
-                    || sess.shared_ranges.iter().any(|&(b0, sz)| p >= b0 && p < b0 + sz);
+                    || sess
+                        .dptr_trans
+                        .iter()
+                        .any(|&(b0, sz, _)| p >= b0 && p < b0 + sz)
+                    || sess
+                        .shared_ranges
+                        .iter()
+                        .any(|&(b0, sz)| p >= b0 && p < b0 + sz);
                 return Ok(Response::LibResult(0, vec![if dev { 2 } else { 0 }]));
             }
             let r = b.lib_call(lib, func, &args, &sess.streams);

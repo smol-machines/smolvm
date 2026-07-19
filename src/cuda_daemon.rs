@@ -222,7 +222,10 @@ where
             let _guard = guard;
             let mut backend = make_backend();
             if let Some(regions) = guest_ram {
-                tracing::info!(count = regions.len(), "guest-RAM mapped: zero-copy + rings enabled");
+                tracing::info!(
+                    count = regions.len(),
+                    "guest-RAM mapped: zero-copy + rings enabled"
+                );
                 backend.set_guest_ram(regions);
             }
             if let Err(e) = serve(stream, backend.as_mut()) {
