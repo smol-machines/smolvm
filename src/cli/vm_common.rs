@@ -685,19 +685,17 @@ pub struct ForkLaunch {
     pub forkable: bool,
     /// Boot as a fork clone, restoring from the golden's snapshot at this dir.
     pub snapshot_dir: Option<std::path::PathBuf>,
-    /// Control socket path (set together with `forkable`).
-    pub control_socket: Option<std::path::PathBuf>,
     /// Clone boot only: share the golden's loaded CUDA weights instead of
     /// copying them (`machine fork --share-weights`).
     pub share_weights: bool,
 }
 
-/// Fork parameters for starting `name` as a forkable base (memfd RAM + a control
-/// socket at the machine's known path), so `machine fork` can later freeze it.
-pub fn forkable_launch(name: &str) -> ForkLaunch {
+/// Fork parameters for starting a machine as a forkable base (memfd RAM), so
+/// `machine fork` can later freeze it. The control socket it relies on is
+/// created for every machine by the launcher at the well-known per-VM path.
+pub fn forkable_launch() -> ForkLaunch {
     ForkLaunch {
         forkable: true,
-        control_socket: Some(smolvm::agent::fork::control_socket_path(name)),
         snapshot_dir: None,
         share_weights: false,
     }
@@ -944,7 +942,6 @@ pub fn start_vm_named(
     // the boot subprocess's env by the manager, not via process-global env vars.
     features.forkable = fork.forkable;
     features.snapshot_dir = fork.snapshot_dir;
-    features.control_socket = fork.control_socket;
     features.cuda_share_weights = fork.share_weights;
     // A machine created from a local image archive/dir persists a `local:…`
     // reference; re-derive its virtiofs mount dir so the guest assembles the

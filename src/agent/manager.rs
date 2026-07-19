@@ -1649,8 +1649,18 @@ impl AgentManager {
             if features.forkable {
                 v.push(("SMOLVM_FORKABLE", "1".to_string()));
             }
+            // Embedder override for the control socket path; without it the
+            // launcher defaults to control.sock in the per-VM dir.
             if let Some(ref ctl) = features.control_socket {
                 v.push(("SMOLVM_CONTROL_SOCKET", ctl.to_string_lossy().into_owned()));
+            }
+            // Idle reclaim is on by default (SMOLVM_IDLE_RECLAIM=0/off
+            // disables); a pulse without host-side release is pure waste, so
+            // the libkrun reclaim gate follows the same switch. libkrun
+            // additionally hard-disables reclaim for forkable (CoW-shared)
+            // guest RAM regardless of this env.
+            if crate::agent::launcher::idle_reclaim_minutes().is_some() {
+                v.push(("SMOLVM_BALLOON_RECLAIM", "1".to_string()));
             }
             if let Some(ref snap) = features.snapshot_dir {
                 v.push(("SMOLVM_SNAPSHOT_DIR", snap.to_string_lossy().into_owned()));

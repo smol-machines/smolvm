@@ -215,11 +215,13 @@ pub struct LaunchFeatures {
     /// Start as a fork base: back guest RAM with a memfd (copy-on-write
     /// cloneable) and expose `control_socket` so the machine can be forked.
     pub forkable: bool,
+    /// Embedder override for the control socket path. `None` (the default)
+    /// places it at `control.sock` in the per-VM dir; the SMOLVM_CONTROL_SOCKET
+    /// env var takes precedence over both.
+    pub control_socket: Option<std::path::PathBuf>,
     /// Boot this VM as a fork clone, restoring from the golden's snapshot at
     /// this directory (set on the clone; `None` for a normal cold boot).
     pub snapshot_dir: Option<std::path::PathBuf>,
-    /// Control socket path for a forkable machine (pause/resume/checkpoint/FORK).
-    pub control_socket: Option<std::path::PathBuf>,
     /// Override the parent-death watchdog. `None` = default (arm it iff a
     /// separate boot binary is used, i.e. an in-process SDK embedder whose VM
     /// must die with it). `Some(false)` forces it off — for a CLI that sets
@@ -1272,29 +1274,52 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             }
         }
 
-        // Register a control socket (pause/resume/checkpoint/restore) when
-        // requested via SMOLVM_CONTROL_SOCKET. Best-effort: a missing symbol
-        // (older libkrun) or a failure just leaves the VM without a control
-        // channel rather than aborting the boot.
-        if let Ok(ctl_path) = std::env::var("SMOLVM_CONTROL_SOCKET") {
-            if !ctl_path.is_empty() {
-                match krun.set_control_socket {
-                    Some(set_control_socket) => match CString::new(ctl_path.clone()) {
-                        Ok(ctl_c) => {
-                            let ret = set_control_socket(ctx, ctl_c.as_ptr());
-                            if ret < 0 {
-                                tracing::warn!("krun_set_control_socket failed: {ret}");
-                            } else {
-                                tracing::info!(socket = %ctl_path, "control socket enabled");
-                            }
+        // Register a control socket (pause/resume/checkpoint/restore/balloon).
+        // An explicit SMOLVM_CONTROL_SOCKET path wins; otherwise it defaults to
+        // control.sock in the per-VM dir so runtime control (e.g. idle reclaim)
+        // always has a channel. Best-effort: a missing symbol (older libkrun)
+        // or a failure just leaves the VM without a control channel rather than
+        // aborting the boot.
+        let ctl_path: Option<PathBuf> = match std::env::var("SMOLVM_CONTROL_SOCKET") {
+            Ok(p) if !p.is_empty() => Some(PathBuf::from(p)),
+            _ => vsock_socket.parent().map(|d| d.join("control.sock")),
+        };
+        if let Some(ref ctl) = ctl_path {
+            let ctl_str = ctl.to_string_lossy().into_owned();
+            match krun.set_control_socket {
+                Some(set_control_socket) => match CString::new(ctl_str.clone()) {
+                    Ok(ctl_c) => {
+                        let ret = set_control_socket(ctx, ctl_c.as_ptr());
+                        if ret < 0 {
+                            tracing::warn!("krun_set_control_socket failed: {ret}");
+                        } else {
+                            tracing::info!(socket = %ctl_str, "control socket enabled");
                         }
-                        Err(_) => tracing::warn!("control socket path contains null byte"),
-                    },
-                    None => tracing::warn!(
-                        "SMOLVM_CONTROL_SOCKET set but libkrun lacks krun_set_control_socket"
-                    ),
-                }
+                    }
+                    Err(_) => tracing::warn!("control socket path contains null byte"),
+                },
+                None => tracing::warn!(
+                    "control socket unavailable: libkrun lacks krun_set_control_socket"
+                ),
             }
+        }
+
+        // Idle reclaim is on by default: after IDLE_RECLAIM_DEFAULT_MINUTES of
+        // process-level CPU idleness the balloon is pulsed so an idle guest's
+        // page cache is evicted and handed back to the host.
+        // SMOLVM_IDLE_RECLAIM=<minutes> tunes the window; `0` or `off`
+        // disables. Fork roles are excluded for now: a golden's RAM file is
+        // the shared CoW image (releasing its pages needs hole-punch
+        // semantics, and a frozen golden cannot answer balloon requests), and
+        // a clone's private mapping reverts to golden bytes on discard —
+        // spec-legal for reported-free pages but unvalidated, so clones wait
+        // until that path is exercised.
+        let fork_role = std::env::var_os("SMOLVM_FORKABLE").is_some_and(|v| v == "1")
+            || std::env::var_os("SMOLVM_SNAPSHOT_DIR").is_some();
+        if let (Some(ctl), Some(idle_min), false) =
+            (ctl_path.clone(), idle_reclaim_minutes(), fork_role)
+        {
+            spawn_idle_reclaim(ctl, resources.memory_mib, idle_min);
         }
 
         // Fork clone: boot from a snapshot dir (CoW-map a golden VM's RAM +
@@ -1810,6 +1835,111 @@ fn raise_fd_limits() {
             libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
         }
     }
+}
+
+/// Idle-reclaim policy: once the whole VM process (vCPUs + I/O threads) has
+/// averaged under ~1% of a core for `idle_minutes`, pulse the balloon —
+/// inflate to ~80% of guest RAM so the guest evicts page cache, then deflate
+/// so the freed pages return to the host via free-page reporting. Re-arms
+/// only after a subsequent burst of activity, so a machine that stays idle is
+/// pulsed once, not continuously. Host-side release additionally needs
+/// SMOLVM_BALLOON_RECLAIM=1 (macOS stage-2 unmap reclaim).
+pub(crate) const IDLE_RECLAIM_DEFAULT_MINUTES: u64 = 10;
+
+/// The effective idle-reclaim window: `None` = disabled (`SMOLVM_IDLE_RECLAIM`
+/// set to `0`/`off`), otherwise the configured or default minutes.
+pub(crate) fn idle_reclaim_minutes() -> Option<u64> {
+    match std::env::var("SMOLVM_IDLE_RECLAIM") {
+        Ok(v) => {
+            let v = v.trim();
+            if v.eq_ignore_ascii_case("off") || v == "0" {
+                None
+            } else {
+                Some(
+                    v.parse::<u64>()
+                        .unwrap_or(IDLE_RECLAIM_DEFAULT_MINUTES)
+                        .max(1),
+                )
+            }
+        }
+        Err(_) => Some(IDLE_RECLAIM_DEFAULT_MINUTES),
+    }
+}
+
+fn spawn_idle_reclaim(ctl: PathBuf, memory_mib: u32, idle_minutes: u64) {
+    use std::time::Duration;
+    const TICK: Duration = Duration::from_secs(30);
+    const IDLE_FRACTION: f64 = 0.01;
+    const ACTIVE_FRACTION: f64 = 0.05;
+
+    fn process_cpu() -> Option<Duration> {
+        #[cfg(unix)]
+        unsafe {
+            let mut ru: libc::rusage = std::mem::zeroed();
+            if libc::getrusage(libc::RUSAGE_SELF, &mut ru) != 0 {
+                return None;
+            }
+            let tv = |t: libc::timeval| Duration::new(t.tv_sec as u64, (t.tv_usec as u32) * 1000);
+            Some(tv(ru.ru_utime) + tv(ru.ru_stime))
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
+    let Some(mut last) = process_cpu() else {
+        return;
+    };
+    let target_mib = (memory_mib / 10) * 8;
+    if target_mib == 0 {
+        return;
+    }
+    let ticks_needed = ((idle_minutes * 60).div_ceil(TICK.as_secs())).max(1) as u32;
+
+    let _ = std::thread::Builder::new()
+        .name("idle-reclaim".into())
+        .spawn(move || {
+            let cmd = |c: &str| crate::agent::fork::control_socket_cmd(&ctl, c);
+            let mut idle_ticks = 0u32;
+            let mut armed = true;
+            loop {
+                std::thread::sleep(TICK);
+                let Some(now) = process_cpu() else {
+                    return;
+                };
+                let busy = now.saturating_sub(last).as_secs_f64() / TICK.as_secs_f64();
+                last = now;
+                if busy > ACTIVE_FRACTION {
+                    armed = true;
+                }
+                if busy > IDLE_FRACTION {
+                    idle_ticks = 0;
+                    continue;
+                }
+                idle_ticks += 1;
+                if !armed || idle_ticks < ticks_needed {
+                    continue;
+                }
+                armed = false;
+                idle_ticks = 0;
+                tracing::info!(target_mib, "idle reclaim: balloon pulse");
+                if cmd(&format!("BALLOON {target_mib}")).is_err() {
+                    continue;
+                }
+                // Wait for the guest to reach the target (or give up), then
+                // deflate; the durable effect is the cache eviction.
+                for _ in 0..30 {
+                    std::thread::sleep(Duration::from_secs(2));
+                    match cmd("BALLOON") {
+                        Ok(r) if r.contains(&format!("actual={target_mib}")) => break,
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+                let _ = cmd("BALLOON 0");
+            }
+        });
 }
 
 #[cfg(test)]

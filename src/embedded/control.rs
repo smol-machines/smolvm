@@ -121,7 +121,6 @@ pub fn start_forkable_vm(db: &SmolvmDb, name: &str) -> Result<VmHandle> {
     let record = get_record(db, name)?;
     let features = LaunchFeatures {
         forkable: true,
-        control_socket: Some(crate::agent::fork::control_socket_path(name)),
         ..LaunchFeatures::default()
     };
     let handle = launch_from_record(&record, features)?;

@@ -2786,7 +2786,7 @@ impl StartCmd {
         // Forkable start: memfd-back guest RAM and register a control socket at a
         // known path so `machine fork` can later freeze this machine as a CoW base.
         let fork = if self.forkable {
-            vm_common::forkable_launch(&name)
+            vm_common::forkable_launch()
         } else {
             vm_common::ForkLaunch::default()
         };

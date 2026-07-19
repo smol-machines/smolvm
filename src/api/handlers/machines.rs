@@ -929,7 +929,6 @@ pub async fn start_machine(
         // machine's known path so it can later be forked via the fork endpoint.
         if forkable {
             features.forkable = true;
-            features.control_socket = Some(crate::agent::fork::control_socket_path(&name_clone));
         }
         let _ = manager
             .ensure_running_via_subprocess(mounts, ports, resources, features)
