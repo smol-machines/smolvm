@@ -956,8 +956,15 @@ impl AgentManager {
             }
         };
 
-        // Try to ping the agent
-        if let Ok(mut client) = super::AgentClient::connect(&self.vsock_socket) {
+        // Try to ping the agent. Probe-timeout connect (3 s), not the default
+        // client (30 s read timeout): this client only carries the liveness
+        // ping and is dropped after. Against a frozen fork-base golden the
+        // unix socket accepts (libkrun holds the listener) but the paused
+        // guest never replies, so the default timeout stalled every caller —
+        // most visibly `serve start`, which pings each persisted machine
+        // during its reconnect scan and sat silent for 30 s per frozen golden
+        // before binding its port.
+        if let Ok(mut client) = super::AgentClient::connect_for_state_probe(&self.vsock_socket) {
             if client.ping().is_ok() {
                 // Update internal state to reflect running
                 let mut inner = self.inner.lock();
@@ -2560,17 +2567,31 @@ impl Drop for AgentManager {
 /// Windows the guest console isn't captured, so the log is often just that).
 fn boot_failure_reason(exit_code: Option<i32>, startup_log: Option<&str>) -> String {
     let real_error = startup_log.and_then(|log| {
-        log.lines().rev().find_map(|line| {
-            let lower = line.to_ascii_lowercase();
-            if lower.contains("error")
-                || lower.contains("panic")
-                || lower.contains("krun_start_enter returned")
-            {
-                Some(line.trim().to_string())
-            } else {
-                None
-            }
-        })
+        log.lines()
+            .rev()
+            .find_map(|line| {
+                let lower = line.to_ascii_lowercase();
+                if lower.contains("error")
+                    || lower.contains("panic")
+                    || lower.contains("krun_start_enter returned")
+                {
+                    Some(line.trim().to_string())
+                } else {
+                    None
+                }
+            })
+            // Everything in the startup-error log is error content — e.g.
+            // "agent operation failed: load libkrun: symbol not found: …"
+            // carries neither "error" nor "panic", and dropping it leaves the
+            // user with only the generic exit-code note. Fall back to the last
+            // non-empty line so the actionable message always surfaces.
+            .or_else(|| {
+                log.lines()
+                    .rev()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty())
+                    .map(str::to_string)
+            })
     });
 
     let code_note = match exit_code {
@@ -2626,6 +2647,18 @@ mod tests {
         let r = boot_failure_reason(Some(1), Some(log));
         assert!(r.contains("kernel not found"), "{r}");
         assert!(!r.starts_with("WARN"), "{r}");
+    }
+
+    #[test]
+    fn boot_failure_surfaces_log_without_error_keyword() {
+        // Real field failures ("agent operation failed: load libkrun: symbol
+        // not found: krun_add_disk2", "find libraries: libkrun/libkrunfw not
+        // found… set SMOLVM_LIB_DIR") contain neither "error" nor "panic";
+        // the last non-empty log line must surface anyway.
+        let log = "agent operation failed: load libkrun: symbol not found: krun_add_disk2\n";
+        let r = boot_failure_reason(Some(1), Some(log));
+        assert!(r.contains("krun_add_disk2"), "{r}");
+        assert!(r.contains("code 1"), "{r}");
     }
 
     #[test]

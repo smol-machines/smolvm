@@ -103,6 +103,24 @@ fn main() {
         if let Some(mode) = smolvm_pack::detect_packed_mode() {
             cli::pack_run::run_as_packed_binary(mode);
         }
+        // A packed stub separated from its `.smolmachine` sidecar is
+        // byte-identical to the plain CLI, so detection can't hard-fail —
+        // but silently becoming a different program strands users (QA
+        // BUG-167). A non-`smolvm` executable name is the tell: say what
+        // happened before falling through to the normal CLI.
+        let exe_name = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()));
+        if let Some(name) = exe_name {
+            if name != "smolvm" {
+                eprintln!(
+                    "note: no packed assets found for '{name}' (looked for a \
+                     '{name}.smolmachine' sidecar next to the executable); \
+                     running as the plain smolvm CLI. If this is a packed \
+                     binary, keep its .smolmachine file alongside it."
+                );
+            }
+        }
     }
 
     let cli = Cli::parse();

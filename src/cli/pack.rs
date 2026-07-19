@@ -186,6 +186,26 @@ impl PackCreateCmd {
     }
 
     pub fn run(self) -> smolvm::Result<()> {
+        // `--output foo.smolmachine` names the EXECUTABLE stub, so the sidecar
+        // lands at `foo.smolmachine.smolmachine` — a footgun every time (QA
+        // BUG-139). The extension belongs to the sidecar, which is derived
+        // from the stub name automatically.
+        if self
+            .output
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("smolmachine"))
+        {
+            let stem = self.output.with_extension("");
+            return Err(smolvm::Error::config(
+                "pack create",
+                format!(
+                    "--output names the executable stub, not the .smolmachine sidecar \
+                     (which is created automatically as '<output>.smolmachine'). Use \
+                     --output {} instead.",
+                    stem.display()
+                ),
+            ));
+        }
         if let Some(vm_name) = self.from_vm.clone() {
             if self.oci_platform.is_some() {
                 warn!("--oci-platform is ignored with --from-vm (VM snapshot is arch-fixed)");

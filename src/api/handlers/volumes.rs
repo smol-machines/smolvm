@@ -98,9 +98,31 @@ pub async fn provision_volume(
 
 /// `DELETE /api/v1/volumes/{id}` — tear down the backing storage. Idempotent:
 /// deleting an already-absent volume succeeds.
-pub async fn deprovision_volume(Path(id): Path<String>) -> Result<StatusCode, ApiError> {
+pub async fn deprovision_volume(
+    axum::extract::State(state): axum::extract::State<std::sync::Arc<crate::api::state::ApiState>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
     safe_volume_id(&id)?;
     let path = volumes_base().join(&id);
+    // Volumes are single-attach with the control plane driving detach-then-
+    // deprovision ordering — but the node must not yank a virtiofs backing dir
+    // out from under a live VM if that ordering breaks (the machine's mounts
+    // go dark and its execs start failing). Refuse while any running machine
+    // still lists this volume's path as a mount source.
+    let path_str = path.to_string_lossy();
+    if let Ok(vms) = state.db().list_vms() {
+        for (name, record) in vms {
+            let attached = record
+                .mounts
+                .iter()
+                .any(|(source, _, _)| source == path_str.as_ref());
+            if attached && record.is_process_alive() {
+                return Err(ApiError::Conflict(format!(
+                    "volume '{id}' is mounted by running machine '{name}'; stop or detach it first"
+                )));
+            }
+        }
+    }
     match std::fs::remove_dir_all(&path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {} // already gone
