@@ -2082,8 +2082,18 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 // too) — maximal isolation at N× the VRAM. Default shares the
                 // read-only weights (copy-on-write) so clones fit alongside the golden.
                 let copy_all = std::env::var_os("SMOLVM_CUDA_FORK_COPY_ALL").is_some();
+                // In a clone WORKER (layout env set), reconstruction already
+                // placed/copied everything; the in-daemon copy branches below
+                // must not run. They originally no-op'd because the worker's
+                // handoff registries were empty — but a LATE-ATTACHED channel
+                // Inits after the primary session re-registered the clone's
+                // own ranges under the same token, and copying those would
+                // snapshot live clone state into stale "private copies"
+                // (VMM ranges are address-preserved in workers: translating
+                // them is wrong even when the copy succeeds).
+                let in_worker = std::env::var_os("SMOLVM_CUDA_CLONE_LAYOUT").is_some();
                 let (mut copied, mut shared, mut cbytes, mut sbytes) = (0u64, 0u64, 0u64, 0u64);
-                if let Some(allocs) = dptr_handoff_snapshot(parent) {
+                if let Some(allocs) = dptr_handoff_snapshot(parent).filter(|_| !in_worker) {
                     for (gdptr, size, loaded) in allocs {
                         if loaded && !copy_all {
                             // Weight/constant: share the parent's copy (read in
@@ -2112,7 +2122,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 // an expandable segment mixes weights + activations and can't be
                 // shared read-only. Without this a clone inherits the golden's
                 // raw VMM addresses untranslated (the 0-copies bug).
-                if let Some(vmm) = vmm_handoff_snapshot(parent) {
+                if let Some(vmm) = vmm_handoff_snapshot(parent).filter(|_| !in_worker) {
                     for (gva, size) in vmm {
                         if let Ok(cdptr) = b.mem_alloc(size) {
                             let _ = b.memcpy_dtod(cdptr, gva, size);
