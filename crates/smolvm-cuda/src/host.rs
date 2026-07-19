@@ -789,7 +789,12 @@ fn layout_handoff_register(l: &std::sync::Arc<LayoutCell>, my_token: u64) {
 /// The live layout registered under `token`, for a resuming sibling channel to
 /// SHARE (same guest process → one layout; see the Init handler).
 fn layout_handoff_adopt(token: u64) -> Option<std::sync::Arc<LayoutCell>> {
-    LAYOUT_HANDOFF.lock().unwrap().as_ref()?.get(&token)?.upgrade()
+    LAYOUT_HANDOFF
+        .lock()
+        .unwrap()
+        .as_ref()?
+        .get(&token)?
+        .upgrade()
 }
 
 /// One VMM chunk in the fork handoff (see [`layout_handoff_snapshot`]).
@@ -1215,8 +1220,9 @@ struct ModuleCacheKey {
 }
 
 fn module_cache() -> &'static std::sync::Mutex<HashMap<ModuleCacheKey, std::sync::Arc<Vec<u8>>>> {
-    static C: std::sync::OnceLock<std::sync::Mutex<HashMap<ModuleCacheKey, std::sync::Arc<Vec<u8>>>>> =
-        std::sync::OnceLock::new();
+    static C: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<ModuleCacheKey, std::sync::Arc<Vec<u8>>>>,
+    > = std::sync::OnceLock::new();
     C.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
@@ -1247,7 +1253,8 @@ fn module_cache_put(image: &[u8]) {
         head: image[..8].try_into().unwrap(),
         tail: image[image.len() - 8..].try_into().unwrap(),
     };
-    c.entry(key).or_insert_with(|| std::sync::Arc::new(image.to_vec()));
+    c.entry(key)
+        .or_insert_with(|| std::sync::Arc::new(image.to_vec()));
 }
 
 fn module_cache_get(key: &ModuleCacheKey) -> Option<std::sync::Arc<Vec<u8>>> {
@@ -1833,7 +1840,13 @@ fn serve_rings<S: Read + Write>(
                     }
                 };
                 if oplog {
-                    eprintln!("[op~] p{} 0x{:02x} len={}{}", std::process::id(), frame[1], frame.len(), libcall_tag(&frame[1..]));
+                    eprintln!(
+                        "[op~] p{} 0x{:02x} len={}{}",
+                        std::process::id(),
+                        frame[1],
+                        frame.len(),
+                        libcall_tag(&frame[1..])
+                    );
                 }
                 let (status, _) = dispatch(sess, backend, req);
                 if status != 0 {
@@ -1862,7 +1875,13 @@ fn serve_rings<S: Read + Write>(
                     }
                 };
                 if oplog {
-                    eprintln!("[op] p{} 0x{:02x} len={}{}", std::process::id(), frame[0], frame.len(), libcall_tag(&frame));
+                    eprintln!(
+                        "[op] p{} 0x{:02x} len={}{}",
+                        std::process::id(),
+                        frame[0],
+                        frame.len(),
+                        libcall_tag(&frame)
+                    );
                 }
                 let (status, resp) = dispatch(sess, backend, req);
                 if status != 0 && oplog {

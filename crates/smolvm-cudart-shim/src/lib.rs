@@ -2508,7 +2508,7 @@ unsafe fn fatbin_len(data: *const c_void) -> Option<usize> {
     // them made loads fail 209 NO_BINARY_FOR_GPU on H100).
     let p = data as *const u8;
     let chain = std::env::var_os("SMOLVM_CUDA_FATBIN_CHAIN").is_some();
-        let mut total = 0usize;
+    let mut total = 0usize;
     loop {
         let q = unsafe { p.add(total) };
         let magic = u32::from_le_bytes(unsafe { *(q as *const [u8; 4]) });
@@ -2521,16 +2521,20 @@ unsafe fn fatbin_len(data: *const c_void) -> Option<usize> {
             break;
         }
         total += header_size + fat_size;
-            if !chain {
-                break;
-            }
+        if !chain {
+            break;
+        }
         // Chains abutting in .rodata can run away (the walk cannot see
         // module boundaries); cap well above any real per-module chain.
         if total >= 128 * 1024 * 1024 {
             break;
         }
     }
-    if total > 0 { Some(total) } else { None }
+    if total > 0 {
+        Some(total)
+    } else {
+        None
+    }
 }
 
 #[no_mangle]

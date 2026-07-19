@@ -251,6 +251,15 @@ fn make_backend() -> Box<dyn Backend> {
     }
 }
 
+/// Staged golden handle state retained for late-attached channels:
+/// (module images, function metadata, streams, events).
+type SeedHandles = (
+    Vec<(u64, Vec<u8>)>,
+    Vec<smolvm_cuda::host::FuncMeta>,
+    Vec<(u64, u64)>,
+    Vec<(u64, u64)>,
+);
+
 /// Path 3 (M1): serve one isolating fork-clone connection in THIS separate worker
 /// process. A per-clone process has its own CUDA primary context and thus its own
 /// UVA space, so it can place memory at the golden's exact virtual addresses
@@ -276,12 +285,7 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
     // translation table is thread-local — new threads must be seeded with
     // clones of what the main serving thread installed.
     let mut seed_vmm: Option<std::collections::HashMap<u64, u64>> = None;
-    let mut seed_handles: Option<(
-        Vec<(u64, Vec<u8>)>,
-        Vec<smolvm_cuda::host::FuncMeta>,
-        Vec<(u64, u64)>,
-        Vec<(u64, u64)>,
-    )> = None;
+    let mut seed_handles: Option<SeedHandles> = None;
     // M2: reconstruct the golden's memory at its exact VAs from the layout the
     // daemon passed (SMOLVM_CUDA_CLONE_LAYOUT) + the golden's physical exported to
     // fds 4.. — BEFORE serving, so the clone's inherited pointers are valid verbatim.
@@ -360,17 +364,15 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
     {
         let seed_alloc = smolvm_cuda::host::worker_alloc_trans_snapshot();
         let seed = std::sync::Arc::new((seed_vmm, seed_handles, seed_alloc));
-        std::thread::spawn(move || {
-            loop {
-                match recv_fd(ctrl) {
-                    Ok(nfd) => {
-                        let seed = seed.clone();
-                        std::thread::spawn(move || serve_attached_channel(nfd, clone_dev, &seed));
-                    }
-                    Err(e) => {
-                        tracing::info!(error = %e, "clone-worker: control channel closed");
-                        break;
-                    }
+        std::thread::spawn(move || loop {
+            match recv_fd(ctrl) {
+                Ok(nfd) => {
+                    let seed = seed.clone();
+                    std::thread::spawn(move || serve_attached_channel(nfd, clone_dev, &seed));
+                }
+                Err(e) => {
+                    tracing::info!(error = %e, "clone-worker: control channel closed");
+                    break;
                 }
             }
         });
@@ -413,12 +415,7 @@ fn serve_attached_channel(
     dev: i32,
     seed: &(
         Option<std::collections::HashMap<u64, u64>>,
-        Option<(
-            Vec<(u64, Vec<u8>)>,
-            Vec<smolvm_cuda::host::FuncMeta>,
-            Vec<(u64, u64)>,
-            Vec<(u64, u64)>,
-        )>,
+        Option<SeedHandles>,
         Vec<(u64, u64, u64)>,
     ),
 ) {
@@ -443,7 +440,11 @@ fn serve_attached_channel(
         libc::getsockname(fd, &mut addr as *mut _ as *mut libc::sockaddr, &mut len);
     }
     let domain = libc::c_int::from(addr.ss_family);
-    tracing::info!(fd, tcp = domain != libc::AF_UNIX, "cuda clone-worker: serving attached channel");
+    tracing::info!(
+        fd,
+        tcp = domain != libc::AF_UNIX,
+        "cuda clone-worker: serving attached channel"
+    );
     let r = if domain == libc::AF_UNIX {
         // SAFETY: recv_fd handed us sole ownership of the received fd.
         let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
@@ -1017,8 +1018,7 @@ fn route_clone_connection(fd: std::os::unix::io::RawFd) -> bool {
         let reg = clone_worker_registry().lock().unwrap();
         let live = reg.iter().find_map(|(&(_, cid), &(pid, ctrl))| {
             // SAFETY: kill(pid, 0) — pure liveness probe, no signal delivered.
-            (cid == clone_id && unsafe { libc::kill(pid as i32, 0) } == 0)
-                .then_some((pid, ctrl))
+            (cid == clone_id && unsafe { libc::kill(pid as i32, 0) } == 0).then_some((pid, ctrl))
         });
         if let Some((pid, ctrl)) = live {
             match send_fd(ctrl, fd) {
@@ -1146,11 +1146,7 @@ fn send_fd(chan: std::os::unix::io::RawFd, fd: std::os::unix::io::RawFd) -> io::
         (*c).cmsg_level = libc::SOL_SOCKET;
         (*c).cmsg_type = libc::SCM_RIGHTS;
         (*c).cmsg_len = libc::CMSG_LEN(4) as _;
-        std::ptr::copy_nonoverlapping(
-            &fd as *const i32 as *const u8,
-            libc::CMSG_DATA(c),
-            4,
-        );
+        std::ptr::copy_nonoverlapping(&fd as *const i32 as *const u8, libc::CMSG_DATA(c), 4);
         if libc::sendmsg(chan, &msg, 0) < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -1194,11 +1190,7 @@ fn recv_fd(chan: std::os::unix::io::RawFd) -> io::Result<std::os::unix::io::RawF
             ));
         }
         let mut fd: i32 = -1;
-        std::ptr::copy_nonoverlapping(
-            libc::CMSG_DATA(c),
-            &mut fd as *mut i32 as *mut u8,
-            4,
-        );
+        std::ptr::copy_nonoverlapping(libc::CMSG_DATA(c), &mut fd as *mut i32 as *mut u8, 4);
         Ok(fd)
     }
 }

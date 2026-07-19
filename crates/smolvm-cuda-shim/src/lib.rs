@@ -767,8 +767,7 @@ unsafe fn module_image_len(image: *const c_void) -> Result<usize, c_int> {
             if m != [0x50, 0xED, 0x55, 0xBA] {
                 break;
             }
-            let header_size =
-                u16::from_le_bytes(unsafe { *(q.add(6) as *const [u8; 2]) }) as usize;
+            let header_size = u16::from_le_bytes(unsafe { *(q.add(6) as *const [u8; 2]) }) as usize;
             let fat_size = u64::from_le_bytes(unsafe { *(q.add(8) as *const [u8; 8]) }) as usize;
             if header_size == 0 || fat_size == 0 {
                 break;
@@ -1734,8 +1733,7 @@ pub extern "C" fn cuTensorMapEncodeTiled(
     l2_promotion: c_int,
     oob_fill: c_int,
 ) -> c_int {
-    if tensor_map.is_null() || rank == 0 || rank > 5 || global_dim.is_null() || box_dim.is_null()
-    {
+    if tensor_map.is_null() || rank == 0 || rank > 5 || global_dim.is_null() || box_dim.is_null() {
         return CUDA_ERROR_INVALID_VALUE;
     }
     let r = rank as usize;
@@ -1744,7 +1742,11 @@ pub extern "C" fn cuTensorMapEncodeTiled(
     blob.extend_from_slice(&rank.to_le_bytes());
     blob.extend_from_slice(&global_address.to_le_bytes());
     for i in 0..5 {
-        let v = if i < r { unsafe { *global_dim.add(i) } } else { 0 };
+        let v = if i < r {
+            unsafe { *global_dim.add(i) }
+        } else {
+            0
+        };
         blob.extend_from_slice(&v.to_le_bytes());
     }
     for i in 0..5 {
