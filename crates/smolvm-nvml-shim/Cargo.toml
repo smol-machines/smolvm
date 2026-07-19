@@ -1,6 +1,6 @@
 [package]
 name = "smolvm-nvml-shim"
-version = "1.6.1"
+version = "1.6.13"
 edition = "2021"
 description = "Guest-side libnvidia-ml.so.1 drop-in: answers the NVML queries CUDA frameworks (vLLM) use for device detection, backed by the remoted CUDA driver"
 license = "Apache-2.0"

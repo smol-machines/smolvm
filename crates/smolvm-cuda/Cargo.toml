@@ -1,6 +1,6 @@
 [package]
 name = "smolvm-cuda"
-version = "1.6.1"
+version = "1.6.13"
 edition = "2021"
 description = "CUDA Driver-API remoting over vsock for smolvm guests"
 license = "Apache-2.0"

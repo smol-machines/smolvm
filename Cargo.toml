@@ -19,7 +19,7 @@ resolver = "2"
 
 [package]
 name = "smolvm"
-version = "1.6.1"
+version = "1.6.13"
 edition = "2021"
 description = "OCI-native microVM runtime"
 license = "Apache-2.0"
@@ -36,12 +36,12 @@ name = "smolvm"
 path = "src/main.rs"
 
 [dependencies]
-smolvm-network = { path = "crates/smolvm-network", version = "1.6.1" }
-smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.6.1" }
-smolvm-cuda = { path = "crates/smolvm-cuda", version = "1.6.1" }
-smolvm-pack = { path = "crates/smolvm-pack", version = "1.6.1" }
-smolvm-registry = { path = "crates/smolvm-registry", version = "1.6.1" }
-smolfile = { path = "crates/smolvm-smolfile", version = "1.6.1" }
+smolvm-network = { path = "crates/smolvm-network", version = "1.6.13" }
+smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.6.13" }
+smolvm-cuda = { path = "crates/smolvm-cuda", version = "1.6.13" }
+smolvm-pack = { path = "crates/smolvm-pack", version = "1.6.13" }
+smolvm-registry = { path = "crates/smolvm-registry", version = "1.6.13" }
+smolfile = { path = "crates/smolvm-smolfile", version = "1.6.13" }
 thiserror = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
@@ -124,7 +124,7 @@ windows-sys = { version = "0.60", features = [
 
 [dev-dependencies]
 tempfile = "3"
-smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.6.1" }
+smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.6.13" }
 regex = "1"
 
 [build-dependencies]
