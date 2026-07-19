@@ -472,9 +472,25 @@ impl GpuBackend {
                 cublas_gen: None,
                 cudnn_gen: None,
                 cudnn_backend: None,
-                vhandles: std::sync::Arc::new(std::sync::Mutex::new(
-                    std::collections::HashMap::new(),
-                )),
+                vhandles: if std::env::var_os("SMOLVM_CUDA_CLONE_LAYOUT").is_some() {
+                    // Clone worker: every channel serves the SAME guest, so
+                    // all backend instances share ONE handle map. Per-channel
+                    // snapshot adoption loses handles created after the
+                    // snapshot (guest creates a cuBLAS handle on one channel,
+                    // GEMMs flow on another → vh-miss → NOT_INITIALIZED).
+                    static WORKER_VHANDLES: std::sync::OnceLock<
+                        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, u64>>>,
+                    > = std::sync::OnceLock::new();
+                    WORKER_VHANDLES
+                        .get_or_init(|| {
+                            std::sync::Arc::new(std::sync::Mutex::new(
+                                std::collections::HashMap::new(),
+                            ))
+                        })
+                        .clone()
+                } else {
+                    std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()))
+                },
                 cublaslt: None,
                 cudnn_bn: None,
                 guest_ram: Vec::new(),
@@ -522,7 +538,12 @@ fn handoff_register(dst: &std::sync::Arc<VhMap>, resume_token: u64) -> u64 {
     let reg = reg.get_or_insert_with(std::collections::HashMap::new);
     if resume_token != 0 {
         if let Some(parent) = reg.get(&resume_token).and_then(|w| w.upgrade()) {
-            *dst.lock().unwrap() = parent.lock().unwrap().clone();
+            // ptr_eq guard: in a clone worker every backend shares ONE map
+            // (see the WORKER_VHANDLES init) — self-adoption would deadlock
+            // on the same mutex and is a no-op anyway.
+            if !std::sync::Arc::ptr_eq(&parent, dst) {
+                *dst.lock().unwrap() = parent.lock().unwrap().clone();
+            }
         }
     }
     let token = next_lineage_token();
@@ -2142,7 +2163,17 @@ const VHANDLE_TAG: u64 = 1 << 63;
 /// pointers pass through.
 fn vh_resolve(map: &std::collections::HashMap<u64, u64>, h: u64) -> u64 {
     if h & VHANDLE_TAG != 0 {
-        map.get(&h).copied().unwrap_or(0)
+        let r = map.get(&h).copied().unwrap_or(0);
+        if r == 0 {
+            // A tagged id with no mapping resolves to NULL and the library
+            // call fails (cuBLAS: NOT_INITIALIZED). Always-log: this is a
+            // bug signature, not a hot path.
+            eprintln!(
+                "[vh-miss] tagged handle {h:#x} unmapped (map has {} entries)",
+                map.len()
+            );
+        }
+        r
     } else {
         // Untagged values are usually real host pointers and pass through —
         // EXCEPT an inherited raw library handle in a fork-clone worker
