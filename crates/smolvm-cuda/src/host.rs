@@ -1203,6 +1203,57 @@ fn mark_loaded_vmm(layout: &LayoutCell, dptr: u64, nbytes: u64, data: Option<&[u
 
 /// FNV-1a 64-bit content hash (0 remapped to 1 — segment CRC 0 means
 /// "unverifiable", reserved for uploads whose bytes dispatch can't see).
+/// Process-wide module-image cache key: content hash + length + first/last
+/// bytes (the extra fields guard fnv collisions — a wrong module would be a
+/// silent catastrophe).
+#[derive(PartialEq, Eq, Hash, Clone)]
+struct ModuleCacheKey {
+    fnv: u64,
+    len: u64,
+    head: [u8; 8],
+    tail: [u8; 8],
+}
+
+fn module_cache() -> &'static std::sync::Mutex<HashMap<ModuleCacheKey, std::sync::Arc<Vec<u8>>>> {
+    static C: std::sync::OnceLock<std::sync::Mutex<HashMap<ModuleCacheKey, std::sync::Arc<Vec<u8>>>>> =
+        std::sync::OnceLock::new();
+    C.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn module_cache_budget() -> u64 {
+    static B: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *B.get_or_init(|| {
+        std::env::var("SMOLVM_CUDA_MODCACHE_MB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2048u64)
+            * 1024
+            * 1024
+    })
+}
+
+fn module_cache_put(image: &[u8]) {
+    if image.len() < 64 {
+        return;
+    }
+    let mut c = module_cache().lock().unwrap();
+    let used: u64 = c.values().map(|v| v.len() as u64).sum();
+    if used + image.len() as u64 > module_cache_budget() {
+        return; // over budget: first-come wins; the big early fatbins matter most
+    }
+    let key = ModuleCacheKey {
+        fnv: fnv64(image),
+        len: image.len() as u64,
+        head: image[..8].try_into().unwrap(),
+        tail: image[image.len() - 8..].try_into().unwrap(),
+    };
+    c.entry(key).or_insert_with(|| std::sync::Arc::new(image.to_vec()));
+}
+
+fn module_cache_get(key: &ModuleCacheKey) -> Option<std::sync::Arc<Vec<u8>>> {
+    module_cache().lock().unwrap().get(key).cloned()
+}
+
 pub fn fnv64(data: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in data {
@@ -2221,6 +2272,9 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             // survives a fork-clone reconnect). Still tracked for reclaim.
             let raw = b.module_load_data(&image)?;
             sess.owned_modules.insert(raw);
+            // Feed the process-wide image cache so later replicas can load by
+            // hash without re-shipping the bytes (LibCall 6/1).
+            module_cache_put(&image);
             // M3a: keep the image so a Path-3 clone worker can reload the module in
             // its own context and remap this inherited handle.
             if path3_enabled() {
@@ -2672,6 +2726,34 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             .map(|_| Response::Ok)
         }
         Request::LibCall { lib, func, args } => {
+            // lib 6 / func 1: module load BY CONTENT HASH — served here (needs
+            // session state), not in the backend. Blob:
+            // [u64 fnv][u64 len][first 8 bytes][last 8 bytes]. HIT → load the
+            // cached image (same bookkeeping as ModuleLoadData) and return the
+            // 8-byte handle; MISS → (0, empty) and the client falls back to a
+            // full ModuleLoadData. Engine loads re-ship hundreds of MB of
+            // identical fatbins per replica without this.
+            if lib == 6 && func == 1 && args.len() >= 32 {
+                let key = ModuleCacheKey {
+                    fnv: u64::from_le_bytes(args[0..8].try_into().unwrap()),
+                    len: u64::from_le_bytes(args[8..16].try_into().unwrap()),
+                    head: args[16..24].try_into().unwrap(),
+                    tail: args[24..32].try_into().unwrap(),
+                };
+                if let Some(image) = module_cache_get(&key) {
+                    let raw = b.module_load_data(&image)?;
+                    sess.owned_modules.insert(raw);
+                    if path3_enabled() {
+                        sess.golden_layout
+                            .lock()
+                            .unwrap()
+                            .modules
+                            .insert(raw, image.to_vec());
+                    }
+                    return Ok(Response::LibResult(0, raw.to_le_bytes().to_vec()));
+                }
+                return Ok(Response::LibResult(0, Vec::new()));
+            }
             let r = b.lib_call(lib, func, &args, &sess.streams);
             // Path 3: record top-level library-context creates so a clone
             // worker can replay them in ITS process (library handles are
