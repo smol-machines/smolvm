@@ -1114,6 +1114,7 @@ pub async fn fork_machine(
     // processes are already running in the restored RAM, so unlike a cold start
     // there is no image workload to launch), then rejuvenate its identity.
     let clone_b = clone.clone();
+    let golden_c = golden.clone();
     let db = state.db().clone();
     let (manager, pid, clone_record) = tokio::task::spawn_blocking(move || {
         let record = prep.clone_record;
@@ -1149,7 +1150,7 @@ pub async fn fork_machine(
         // confirmed, tear the booted clone down and fail the fork rather than
         // vend a clone that impersonates the golden.
         crate::agent::fork::fail_closed_on_rejuvenation(
-            crate::agent::fork::rejuvenate_clone(&clone_b),
+            crate::agent::fork::rejuvenate_clone(&clone_b, &golden_c),
             || {
                 manager.kill();
                 manager.cleanup_data_dir();
