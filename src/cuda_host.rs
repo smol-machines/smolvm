@@ -266,7 +266,7 @@ fn proxy_to_daemon(guest: crate::platform::uds::UdsStream, addr: &str) -> std::i
         Some(p)
     }
     #[cfg(not(target_os = "linux"))]
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(target_os = "linux")))]
     fn guest_ram_advert() -> Option<Vec<u8>> {
         None
     }
