@@ -4879,6 +4879,7 @@ fn cap_exec_response(resp: AgentResponse) -> AgentResponse {
 /// cluster) survive into later execs for the machine's lifetime. Returns the
 /// captured result; the caller falls back to a fresh container on error.
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 fn run_in_keepalive_container(
     overlay_id: &str,
     image: &str,
@@ -4888,7 +4889,9 @@ fn run_in_keepalive_container(
     user: Option<&str>,
     mounts: &[(String, String, bool)],
     unprivileged: bool,
+    timeout_ms: Option<u64>,
     stdin_data: Option<&str>,
+    client_fd: Option<std::os::unix::io::RawFd>,
 ) -> Result<AgentResponse, Box<dyn std::error::Error>> {
     use std::io::Write as _;
 
@@ -4927,40 +4930,70 @@ fn run_in_keepalive_container(
     launch.user = oci::resolve_exec_user_spec(&rootfs, launch.user.as_deref())
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
-    let output = if let Some(data) = stdin_data {
-        let mut child = crun::CrunCommand::exec(
-            &cid,
-            &launch.env,
-            &launch.command,
-            launch.workdir.as_deref(),
-            false,
-        )
-        .user(launch.user.as_deref())
-        .capture_output()
-        .stdin_piped()
-        .spawn()?;
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(data.as_bytes());
-        }
-        child.wait_with_output()?
+    // Spawn the exec, wire stdin, then wait with the SAME timeout + client
+    // liveness contract every other exec path uses. The keep-alive path
+    // previously used blocking `.output()` / `wait_with_output()`, which
+    // silently ignored `timeout_ms` — an `exec --timeout N` against an image
+    // machine ran to completion regardless (found by QA 2026-07-19).
+    let mut builder = crun::CrunCommand::exec(
+        &cid,
+        &launch.env,
+        &launch.command,
+        launch.workdir.as_deref(),
+        false,
+    )
+    .user(launch.user.as_deref())
+    .capture_output();
+    builder = if stdin_data.is_some() {
+        builder.stdin_piped()
     } else {
-        crun::CrunCommand::exec(
-            &cid,
-            &launch.env,
-            &launch.command,
-            launch.workdir.as_deref(),
-            false,
-        )
-        .user(launch.user.as_deref())
-        .capture_output()
-        .stdin_null()
-        .output()?
+        builder.stdin_null()
     };
+    let mut child = builder.spawn()?;
+    if let (Some(data), Some(mut stdin)) = (stdin_data, child.stdin.take()) {
+        let _ = stdin.write_all(data.as_bytes());
+        // Drop closes the pipe → the command sees EOF.
+    }
 
-    Ok(AgentResponse::Completed {
-        exit_code: output.status.code().unwrap_or(-1),
-        stdout: output.stdout,
-        stderr: output.stderr,
+    // Kill only the exec'd process on timeout/disconnect — NOT the keep-alive
+    // container, which hosts the shared namespace for every exec (a timed-out
+    // `exec -- sleep 10` must not destroy the machine's workload).
+    let exec_pid = child.id();
+    let result = crate::process::wait_with_timeout_cleanup_and_liveness(
+        &mut child,
+        timeout_ms,
+        client_fd,
+        || unsafe {
+            libc::kill(exec_pid as libc::pid_t, libc::SIGKILL);
+        },
+    )?;
+
+    Ok(match result {
+        crate::process::WaitResult::Completed { exit_code, output } => AgentResponse::Completed {
+            exit_code,
+            stdout: output.stdout,
+            stderr: output.stderr,
+        },
+        crate::process::WaitResult::TimedOut { output, timeout_ms } => {
+            let mut stderr = output.stderr;
+            stderr.extend_from_slice(
+                format!("\ncommand timed out after {}ms", timeout_ms).as_bytes(),
+            );
+            AgentResponse::Completed {
+                exit_code: crate::process::TIMEOUT_EXIT_CODE,
+                stdout: output.stdout,
+                stderr,
+            }
+        }
+        crate::process::WaitResult::ClientDisconnected { output } => {
+            let mut stderr = output.stderr;
+            stderr.extend_from_slice(b"\nclient disconnected");
+            AgentResponse::Completed {
+                exit_code: 137,
+                stdout: output.stdout,
+                stderr,
+            }
+        }
     })
 }
 
@@ -5018,7 +5051,9 @@ fn handle_run(
                 user,
                 mounts,
                 unprivileged,
+                timeout_ms,
                 stdin_data,
+                client_fd,
             ) {
                 Ok(resp) => return cap_exec_response(resp),
                 Err(e) => {
