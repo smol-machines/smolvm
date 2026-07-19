@@ -4810,6 +4810,35 @@ fn handle_run_background(
         );
     };
 
+    // Run the background command DETACHED inside the machine's long-lived
+    // keep-alive container (via `crun exec --detach`), NOT as a separate
+    // `crun run` container. The old separate-container path
+    // (`spawn_in_overlay`) shared the overlay's merged mount and per-overlay
+    // OCI bundle with the keep-alive container; the two conflicted and the
+    // background container died within seconds — so a documented "long-lived
+    // daemon" (dev server, agent) never survived (QA 2026-07-19, F-12).
+    // Running inside the keep-alive container makes the background process a
+    // child of the container's PID 1, sharing the exact namespace/filesystem
+    // every foreground exec sees, and it lives for the machine's lifetime.
+    #[cfg(target_os = "linux")]
+    {
+        match run_background_in_keepalive(
+            overlay_id,
+            image,
+            command,
+            env,
+            workdir,
+            user,
+            mounts,
+            unprivileged,
+        ) {
+            Ok(resp) => return resp,
+            Err(e) => {
+                warn!(error = %e, "keep-alive background exec failed; falling back to a fresh container");
+            }
+        }
+    }
+
     match storage::spawn_in_overlay(
         image,
         command,
@@ -4827,6 +4856,96 @@ fn handle_run_background(
         },
         Err(e) => AgentResponse::from_err(e, error_codes::RUN_FAILED),
     }
+}
+
+/// Launch a background command detached inside the machine's keep-alive
+/// container, establishing the keep-alive container first if needed. Mirrors
+/// [`run_in_keepalive_container`]'s container resolution, then `crun exec
+/// --detach` instead of a foreground exec.
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn run_background_in_keepalive(
+    overlay_id: &str,
+    image: &str,
+    command: &[String],
+    env: &[(String, String)],
+    workdir: Option<&str>,
+    user: Option<&str>,
+    mounts: &[(String, String, bool)],
+    unprivileged: bool,
+) -> Result<AgentResponse, Box<dyn std::error::Error>> {
+    let mut launch = ResolvedLaunch::resolve(
+        image,
+        command.to_vec(),
+        env.to_vec(),
+        workdir.map(str::to_string),
+        user.map(str::to_string),
+    )?;
+
+    let (cid, rootfs) = match resolve_main_container(Some(overlay_id)) {
+        Some(c) => (c, storage::persistent_overlay_rootfs(overlay_id)),
+        None => {
+            let prepared = storage::prepare_for_run_persistent(image, overlay_id)?;
+            storage::setup_mounts(&prepared.rootfs_path, mounts)?;
+            let cid = ensure_main_container(
+                &prepared.rootfs_path,
+                overlay_id,
+                mounts,
+                unprivileged,
+                &launch,
+            )?;
+            (cid, std::path::PathBuf::from(&prepared.rootfs_path))
+        }
+    };
+
+    // `crun exec --user` needs a numeric uid[:gid]; resolve any username
+    // against the container's /etc/passwd, same as the foreground path.
+    launch.user = oci::resolve_exec_user_spec(&rootfs, launch.user.as_deref())
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+
+    // Capture the detached process's PID via a pid-file so the response
+    // honors the run-background contract (the host client parses a PID from
+    // stdout). Unique per launch to avoid collisions between concurrent
+    // background execs on the same machine.
+    let pid_file = std::path::PathBuf::from(format!(
+        "/tmp/smolvm-bg-{}-{}.pid",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let status = crun::CrunCommand::exec_detached(
+        &cid,
+        &launch.env,
+        &launch.command,
+        launch.workdir.as_deref(),
+        Some(&pid_file),
+    )
+    .user(launch.user.as_deref())
+    .stdin_null()
+    .discard_output()
+    .status()?;
+    if !status.success() {
+        let _ = std::fs::remove_file(&pid_file);
+        return Err(format!(
+            "crun exec --detach failed (exit {})",
+            status.code().unwrap_or(-1)
+        )
+        .into());
+    }
+
+    let pid: u32 = std::fs::read_to_string(&pid_file)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    let _ = std::fs::remove_file(&pid_file);
+
+    Ok(AgentResponse::Completed {
+        exit_code: 0,
+        stdout: format!("{pid}").into_bytes(),
+        stderr: Vec::new(),
+    })
 }
 
 /// Non-streaming exec/run returns the whole output in a single wire frame. If it

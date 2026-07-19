@@ -249,6 +249,41 @@ impl CrunCommand {
         c
     }
 
+    /// Execute a command DETACHED inside a running container:
+    /// `crun exec --detach <id> <cmd…>`. crun starts the process in the
+    /// container's namespaces and returns immediately; the process keeps
+    /// running as a child of the container's PID 1 (the keep-alive `tail -f`)
+    /// for the machine's lifetime — this is how a background exec (a dev
+    /// server, an agent) survives across foreground execs, sharing the
+    /// container view every other exec sees. Stdio is detached (no pipes to
+    /// wait on), so the caller does not block.
+    pub fn exec_detached(
+        container_id: &str,
+        env: &[(String, String)],
+        command: &[String],
+        workdir: Option<&str>,
+        pid_file: Option<&Path>,
+    ) -> Self {
+        let mut c = Self::new();
+        c.cmd.arg("exec").arg("--detach");
+        if let Some(pf) = pid_file {
+            // crun writes the detached process's PID here so the caller can
+            // report it back (the run-background contract returns a PID).
+            c.cmd.arg("--pid-file").arg(pf);
+        }
+        let env_with_path = crate::cuda::augment_exec_env(ensure_path_in_env(env));
+        for (key, value) in &env_with_path {
+            c.cmd.arg("--env").arg(format!("{}={}", key, value));
+        }
+        if let Some(wd) = workdir {
+            c.cmd.args(["--cwd", wd]);
+        }
+        c.pending_positionals = std::iter::once(container_id.to_string())
+            .chain(command.iter().cloned())
+            .collect();
+        c
+    }
+
     /// Execute a command in a running container from a full OCI Process spec:
     /// `crun exec --process <file> <id>`. Unlike the flag-based [`Self::exec`],
     /// this honors every field of the process — notably `user.additionalGids`
