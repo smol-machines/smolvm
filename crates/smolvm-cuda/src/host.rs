@@ -672,6 +672,12 @@ struct GoldenLayout {
     /// M3a: golden function handle → (module handle, name) — the worker re-resolves
     /// it in its reloaded module and remaps the inherited raw CUfunction handle.
     functions: HashMap<u64, (u64, String)>,
+    /// Function attributes the golden set (`cuFuncSetAttribute`) — chiefly
+    /// FlashAttention's MaxDynamicSharedMemorySize opt-in, applied once at
+    /// library import. Per-context state: a worker's re-resolved function
+    /// reverts to the 48KB default and every large-smem launch fails with
+    /// "invalid argument" until these are replayed.
+    func_attrs: HashMap<u64, Vec<(i32, i32)>>,
     /// M3a: golden stream handle → create flags (the worker recreates + remaps).
     streams: HashMap<u64, u32>,
     /// M3a: golden event handle → create flags (the worker recreates + remaps).
@@ -848,7 +854,7 @@ pub fn module_handoff_snapshot(
     token: u64,
 ) -> Option<(
     Vec<(u64, Vec<u8>)>,
-    Vec<(u64, u64, String)>,
+    Vec<(u64, u64, String, Vec<(i32, i32)>)>,
     Vec<(u64, u32)>,
     Vec<(u64, u32)>,
     Vec<(u64, u64, GraphSer)>,
@@ -861,7 +867,14 @@ pub fn module_handoff_snapshot(
     let funcs = g
         .functions
         .iter()
-        .map(|(&h, (m, n))| (h, *m, n.clone()))
+        .map(|(&h, (m, n))| {
+            (
+                h,
+                *m,
+                n.clone(),
+                g.func_attrs.get(&h).cloned().unwrap_or_default(),
+            )
+        })
         .collect();
     let streams = g.streams.iter().map(|(&h, &f)| (h, f)).collect();
     let events = g.events.iter().map(|(&h, &f)| (h, f)).collect();
@@ -905,7 +918,7 @@ pub fn replay_lib_handles(b: &mut dyn Backend, handles: &[(u8, u16, u64, Vec<u8>
 // (identity) unless a Path-3 clone worker installed it via `set_handle_trans`.
 type HandleMap = std::cell::RefCell<HashMap<u64, u64>>;
 type ImageMap = std::cell::RefCell<HashMap<u64, Vec<u8>>>;
-type MetaMap = std::cell::RefCell<HashMap<u64, (u64, String)>>;
+type MetaMap = std::cell::RefCell<HashMap<u64, (u64, String, Vec<(i32, i32)>)>>;
 thread_local! {
     static FUNC_TRANS: HandleMap = std::cell::RefCell::new(HashMap::new());
     static MOD_TRANS: HandleMap = std::cell::RefCell::new(HashMap::new());
@@ -1007,7 +1020,7 @@ pub fn rebuild_clone_graphs(b: &mut dyn Backend, graphs: Vec<(u64, u64, GraphSer
 /// few). Clears any prior worker's caches.
 pub fn set_handle_trans(
     mod_images: Vec<(u64, Vec<u8>)>,
-    func_meta: Vec<(u64, u64, String)>,
+    func_meta: Vec<(u64, u64, String, Vec<(i32, i32)>)>,
     streams: Vec<(u64, u64)>,
     events: Vec<(u64, u64)>,
 ) {
@@ -1028,7 +1041,7 @@ pub fn set_handle_trans(
     FUNC_META.with(|m| {
         let mut m = m.borrow_mut();
         m.clear();
-        m.extend(func_meta.into_iter().map(|(f, gm, n)| (f, (gm, n))));
+        m.extend(func_meta.into_iter().map(|(f, gm, n, a)| (f, (gm, n, a))));
     });
     put_h(&STREAM_TRANS, streams);
     put_h(&EVENT_TRANS, events);
@@ -1088,7 +1101,7 @@ fn xlat_func(b: &mut dyn Backend, golden: u64) -> u64 {
     if let Some(w) = FUNC_TRANS.with(|m| m.borrow().get(&golden).copied()) {
         return w;
     }
-    let Some((gm, name)) = FUNC_META.with(|m| m.borrow().get(&golden).cloned()) else {
+    let Some((gm, name, attrs)) = FUNC_META.with(|m| m.borrow().get(&golden).cloned()) else {
         return golden;
     };
     let wm = xlat_mod(b, gm);
@@ -1097,6 +1110,14 @@ fn xlat_func(b: &mut dyn Backend, golden: u64) -> u64 {
     }
     match b.module_get_function(wm, &name) {
         Ok(w) => {
+            // Re-apply the golden's per-function attributes in THIS context —
+            // without FlashAttention's MaxDynamicSharedMemorySize opt-in, its
+            // decode kernels launch with >48KB smem and fail "invalid argument".
+            for &(a, v) in &attrs {
+                if let Err(e) = b.func_set_attribute(w, a, v) {
+                    eprintln!("[M3a-lazy] func attr replay failed: name={name} attr={a} e={e}");
+                }
+            }
             FUNC_TRANS.with(|m| {
                 m.borrow_mut().insert(golden, w);
             });
@@ -2166,6 +2187,15 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             value,
         } => {
             let raw_fn = raw_fn_h(sess, b, function);
+            if path3_enabled() {
+                sess.golden_layout
+                    .lock()
+                    .unwrap()
+                    .func_attrs
+                    .entry(raw_fn)
+                    .or_default()
+                    .push((attrib, value));
+            }
             b.func_set_attribute(raw_fn, attrib, value)
                 .map(|_| Response::Ok)
         }
