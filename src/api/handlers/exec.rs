@@ -239,60 +239,84 @@ pub async fn exec_stream(
     let machine_golden = machine_rec.as_ref().and_then(|r| r.golden.clone());
     let machine_image = machine_rec.and_then(|r| r.image);
 
-    // Run streaming exec via the machine client (vsock is synchronous)
+    // Bridge the blocking, synchronous vsock streaming exec to an async SSE
+    // stream: a spawned blocking task runs the exec and pushes each ExecEvent
+    // into an unbounded channel AS IT ARRIVES; the SSE stream below yields
+    // them live. Previously this collected every event into a Vec and only
+    // built the SSE stream AFTER the command completed, so the "stream"
+    // delivered nothing until exit — defeating streaming exec (F-16). The
+    // per-session output cap is still enforced inside the agent client's
+    // streaming collector (MAX_STREAMING_EXEC_OUTPUT), which emits a
+    // truncation Error event and stops relaying.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::agent::ExecEvent>();
+    let err_tx = tx.clone();
+    let entry_exec = entry.clone();
     let start = std::time::Instant::now();
-    let events = if let Some(image) = machine_image {
-        let mounts_config = {
-            let e = entry.lock();
-            e.mounts
-                .iter()
-                .enumerate()
-                .map(|(i, m)| (HostMount::mount_tag(i), m.target.clone(), m.readonly))
-                .collect::<Vec<_>>()
+    tokio::spawn(async move {
+        let result = if let Some(image) = machine_image {
+            let mounts_config = {
+                let e = entry_exec.lock();
+                e.mounts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, m)| (HostMount::mount_tag(i), m.target.clone(), m.readonly))
+                    .collect::<Vec<_>>()
+            };
+            // A fork clone's inherited overlay lives under the golden's id.
+            let overlay_id =
+                crate::workload::persistent_overlay_owner(&id, machine_golden.as_deref());
+            with_machine_client_traced(&entry_exec, tid, move |c| {
+                if c.query(&image)?.is_none() {
+                    c.pull_with_registry_config(&image)?;
+                }
+                let config = crate::agent::RunConfig::new(image, command)
+                    .with_env(env)
+                    .with_workdir(workdir)
+                    .with_mounts(mounts_config)
+                    .with_timeout(timeout)
+                    .with_persistent_overlay(Some(overlay_id));
+                c.run_streaming_with(config, |e| {
+                    let _ = tx.send(e);
+                })
+            })
+            .await
+        } else {
+            with_machine_client_traced(&entry_exec, tid, move |c| {
+                c.vm_exec_streaming_with(command, env, workdir, timeout, |e| {
+                    let _ = tx.send(e);
+                })
+            })
+            .await
         };
-        // A fork clone's inherited overlay lives under the golden's id.
-        let overlay_id = crate::workload::persistent_overlay_owner(&id, machine_golden.as_deref());
-        with_machine_client_traced(&entry, tid, move |c| {
-            if c.query(&image)?.is_none() {
-                c.pull_with_registry_config(&image)?;
-            }
-            let config = crate::agent::RunConfig::new(image, command)
-                .with_env(env)
-                .with_workdir(workdir)
-                .with_mounts(mounts_config)
-                .with_timeout(timeout)
-                .with_persistent_overlay(Some(overlay_id));
-            let mut evs = Vec::new();
-            c.run_streaming_with(config, |e| evs.push(e))?;
-            Ok(evs)
-        })
-        .await?
-    } else {
-        with_machine_client_traced(&entry, tid, move |c| {
-            c.vm_exec_streaming(command, env, workdir, timeout)
-        })
-        .await?
-    };
-    metrics::histogram!("smolvm_exec_seconds").record(start.elapsed().as_secs_f64());
+        metrics::histogram!("smolvm_exec_seconds").record(start.elapsed().as_secs_f64());
+        // Setup/transport failures (image pull, vsock) can't become an HTTP
+        // status once the SSE has begun, so surface them as a terminal error
+        // event instead of silently ending the stream.
+        if let Err(e) = result {
+            let _ = err_tx.send(crate::agent::ExecEvent::Error(format!("{e:?}")));
+        }
+    });
 
-    // Convert events to SSE stream
-    let stream = futures_util::stream::iter(events.into_iter().map(|event| {
-        let sse_event = match event {
-            crate::agent::ExecEvent::Stdout(data) => Event::default()
-                .event("stdout")
-                .data(String::from_utf8_lossy(&data)),
-            crate::agent::ExecEvent::Stderr(data) => Event::default()
-                .event("stderr")
-                .data(String::from_utf8_lossy(&data)),
-            crate::agent::ExecEvent::Exit(code) => Event::default()
-                .event("exit")
-                .data(format!("{{\"exitCode\":{}}}", code)),
-            crate::agent::ExecEvent::Error(msg) => Event::default()
-                .event("error")
-                .data(format!("{{\"message\":\"{}\"}}", msg)),
-        };
-        Ok(sse_event)
-    }));
+    // Yield each event as an SSE frame the instant it lands in the channel.
+    let stream = async_stream::stream! {
+        while let Some(event) = rx.recv().await {
+            let sse_event = match event {
+                crate::agent::ExecEvent::Stdout(data) => Event::default()
+                    .event("stdout")
+                    .data(String::from_utf8_lossy(&data)),
+                crate::agent::ExecEvent::Stderr(data) => Event::default()
+                    .event("stderr")
+                    .data(String::from_utf8_lossy(&data)),
+                crate::agent::ExecEvent::Exit(code) => Event::default()
+                    .event("exit")
+                    .data(format!("{{\"exitCode\":{}}}", code)),
+                crate::agent::ExecEvent::Error(msg) => Event::default()
+                    .event("error")
+                    .data(format!("{{\"message\":\"{}\"}}", msg)),
+            };
+            yield Ok::<_, Infallible>(sse_event);
+        }
+    };
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
