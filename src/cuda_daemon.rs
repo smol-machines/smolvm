@@ -77,7 +77,40 @@ fn spawn_idle_watchdog(active: Arc<AtomicUsize>, timeout: Duration) {
 /// thread against a fresh backend — all in this process, so they share one GPU
 /// context. Returns only on listener failure; otherwise exits via the idle
 /// watchdog (or runs until the host shuts down when the timeout is disabled).
+/// Fatal-signal backtrace: the daemon and its clone workers host large unsafe
+/// surfaces (the CUDA driver itself, raw-pointer translation, IPC mappings). A
+/// SIGSEGV/SIGABRT/SIGBUS here previously died SILENTLY — a daemon segfault
+/// under concurrent 7B vLLM engines left a 933-byte log and no evidence. The
+/// handler writes the signal and a native backtrace to stderr (async-signal-
+/// unsafe in principle, but we are crashing anyway — best-effort output beats
+/// none) and then re-raises with the default action so wait() sees the truth.
+#[cfg(unix)]
+pub(crate) fn install_crash_handler(role: &'static str) {
+    static ROLE: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    let _ = ROLE.set(role);
+    unsafe extern "C" fn on_fatal(sig: libc::c_int) {
+        let role = ROLE.get().copied().unwrap_or("cuda-proc");
+        eprintln!("[{role}] FATAL signal {sig}; backtrace:");
+        eprintln!("{}", std::backtrace::Backtrace::force_capture());
+        unsafe {
+            libc::signal(sig, libc::SIG_DFL);
+            libc::raise(sig);
+        }
+    }
+    for sig in [libc::SIGSEGV, libc::SIGABRT, libc::SIGBUS, libc::SIGILL] {
+        // SAFETY: installing a handler that only formats + re-raises.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = on_fatal as usize;
+            sa.sa_flags = libc::SA_ONSTACK;
+            libc::sigaction(sig, &sa, std::ptr::null_mut());
+        }
+    }
+}
+
 pub fn run(sock: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    install_crash_handler("cuda-daemon");
     if let Some(parent) = sock.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -226,6 +259,7 @@ fn make_backend() -> Box<dyn Backend> {
 /// hook in before the serve loop; establishing the process boundary comes first.
 pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
     use std::os::unix::io::FromRawFd;
+    install_crash_handler("cuda-clone-worker");
     let mut backend = make_backend();
     // Our own primary context (separate process ⇒ own UVA), so we can place memory
     // at the golden's exact VAs.
