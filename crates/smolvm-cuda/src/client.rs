@@ -744,6 +744,23 @@ impl<S: Read + Write> Client<S> {
     }
 
     pub fn module_load_data(&mut self, image: &[u8]) -> Result<u64> {
+        // Dedup: offer the image BY CONTENT HASH first (LibCall 6/1). A HIT
+        // loads the server's cached copy — the bytes never cross the wire
+        // again (engine loads re-ship hundreds of MB of identical fatbins per
+        // replica otherwise). MISS or an old server → full send below, which
+        // also populates the server cache.
+        if image.len() >= 64 {
+            let mut blob = Vec::with_capacity(32);
+            blob.extend_from_slice(&crate::host::fnv64(image).to_le_bytes());
+            blob.extend_from_slice(&(image.len() as u64).to_le_bytes());
+            blob.extend_from_slice(&image[..8]);
+            blob.extend_from_slice(&image[image.len() - 8..]);
+            if let Ok((0, out)) = self.lib_call(6, 1, blob) {
+                if out.len() == 8 {
+                    return Ok(u64::from_le_bytes(out.try_into().unwrap()));
+                }
+            }
+        }
         match self.call(
             &Request::ModuleLoadData {
                 image: image.to_vec(),

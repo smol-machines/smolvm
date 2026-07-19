@@ -463,7 +463,7 @@ fn bring_up_client(resume_token: u64) -> Result<(Client<Stream>, u64, i32), c_in
     // reconstruction (chunk imports + copies + module staging) — give it real
     // headroom; a fresh session's handshake stays tight.
     #[cfg(unix)]
-    set_recv_timeout(fd, if resume_token != 0 { 45 } else { 10 });
+    set_recv_timeout(fd, if resume_token != 0 { 90 } else { 60 });
     let mut client = Client::new(stream);
     let token = client.init(resume_token).map_err(|e| {
         if trace {
@@ -662,25 +662,30 @@ pub extern "C" fn cudaDeviceSynchronize() -> c_int {
     })
 }
 
-#[no_mangle]
-pub extern "C" fn cudaDriverGetVersion(version: *mut c_int) -> c_int {
-    static CACHED: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-    let c = CACHED.load(std::sync::atomic::Ordering::Relaxed);
-    if c != 0 {
-        return set_last(unsafe { out(version, c) });
-    }
-    set_last(match with_client(|c| c.driver_get_version()) {
-        Ok(v) => {
-            CACHED.store(v, std::sync::atomic::Ordering::Relaxed);
-            unsafe { out(version, v) }
-        }
-        Err(e) => e,
+/// The CUDA surface this shim advertises (mirrors the cuda-shim's
+/// `shim_cuda_version`): `SMOLVM_CUDA_ADVERTISE` overrides, default 12.4.
+/// Never report the HOST's real driver/runtime version — guest libraries
+/// negotiate entry points for whatever they see, and the shim only fully
+/// provides the cu12 surface (a leaked 13000 sent cuBLASLt down cu13 paths
+/// that ended in 209 NO_BINARY_FOR_GPU on sm90).
+fn advertised_cuda_version() -> c_int {
+    static V: std::sync::OnceLock<c_int> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("SMOLVM_CUDA_ADVERTISE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(12040)
     })
 }
 
 #[no_mangle]
+pub extern "C" fn cudaDriverGetVersion(version: *mut c_int) -> c_int {
+    set_last(unsafe { out(version, advertised_cuda_version()) })
+}
+
+#[no_mangle]
 pub extern "C" fn cudaRuntimeGetVersion(version: *mut c_int) -> c_int {
-    set_last(unsafe { out(version, 13000) })
+    set_last(unsafe { out(version, advertised_cuda_version()) })
 }
 
 // ---- memory -----------------------------------------------------------------
@@ -2498,14 +2503,38 @@ unsafe fn fatbin_len(data: *const c_void) -> Option<usize> {
     if data.is_null() {
         return None;
     }
+    // Walk every back-to-back container, not just the first — later
+    // containers can carry the only SASS for newer arches (sm90: truncating
+    // them made loads fail 209 NO_BINARY_FOR_GPU on H100).
     let p = data as *const u8;
-    let magic = u32::from_le_bytes(unsafe { *(p as *const [u8; 4]) });
-    if magic != 0xBA55_ED50 {
-        return None;
+    let chain = std::env::var_os("SMOLVM_CUDA_FATBIN_CHAIN").is_some();
+    let mut total = 0usize;
+    loop {
+        let q = unsafe { p.add(total) };
+        let magic = u32::from_le_bytes(unsafe { *(q as *const [u8; 4]) });
+        if magic != 0xBA55_ED50 {
+            break;
+        }
+        let header_size = u16::from_le_bytes(unsafe { *(q.add(6) as *const [u8; 2]) }) as usize;
+        let fat_size = u64::from_le_bytes(unsafe { *(q.add(8) as *const [u8; 8]) }) as usize;
+        if header_size == 0 || fat_size == 0 {
+            break;
+        }
+        total += header_size + fat_size;
+        if !chain {
+            break;
+        }
+        // Chains abutting in .rodata can run away (the walk cannot see
+        // module boundaries); cap well above any real per-module chain.
+        if total >= 128 * 1024 * 1024 {
+            break;
+        }
     }
-    let header_size = u16::from_le_bytes(unsafe { *(p.add(6) as *const [u8; 2]) }) as usize;
-    let fat_size = u64::from_le_bytes(unsafe { *(p.add(8) as *const [u8; 8]) }) as usize;
-    Some(header_size + fat_size)
+    if total > 0 {
+        Some(total)
+    } else {
+        None
+    }
 }
 
 #[no_mangle]

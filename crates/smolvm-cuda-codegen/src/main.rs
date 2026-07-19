@@ -750,7 +750,7 @@ fn gen_host(lib: &Lib) -> String {
         if is_create(f) {
             let _ = writeln!(
                 s,
-                "            {idx} => {{ let mut h: *mut c_void = std::ptr::null_mut(); let st = unsafe {{ (self.f_{})(&mut h) }}; if st == 0 && args.len() >= 8 {{ let id = u64::from_le_bytes(args[..8].try_into().unwrap()); if id & super::VHANDLE_TAG != 0 {{ __vh.insert(id, h as u64); }} }} (st, (h as u64).to_le_bytes().to_vec()) }}",
+                "            {idx} => {{ let mut h: *mut c_void = std::ptr::null_mut(); let st = unsafe {{ (self.f_{})(&mut h) }}; if st == 0 && args.len() >= 8 {{ let id = u64::from_le_bytes(args[..8].try_into().unwrap()); if id & super::VHANDLE_TAG != 0 {{ __vh.insert(id, h as u64); if std::env::var_os(\"SMOLVM_CUDA_HOST_OPLOG\").is_some() {{ eprintln!(\"[vh-insert] pid={{}} id={{id:#x}}\", std::process::id()); }} }} }} (st, (h as u64).to_le_bytes().to_vec()) }}",
                 f.real
             );
             continue;
@@ -792,9 +792,13 @@ fn gen_host(lib: &Lib) -> String {
                     call.push(p.name.to_string());
                 }
                 Kind::DevPtr => {
+                    // Clone sessions translate inherited golden pointers to
+                    // their private copies (identity for everything else) —
+                    // an untranslated golden VA here is unmapped in a worker
+                    // and faults the whole context (sticky 700; QA-1l).
                     let _ = writeln!(
                         binds,
-                        "                let {} = __c.u64() as {};",
+                        "                let {} = super::dptr_resolve(__c.u64()) as {};",
                         p.name, p.cty
                     );
                     call.push(p.name.to_string());
