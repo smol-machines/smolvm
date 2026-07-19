@@ -459,8 +459,11 @@ fn bring_up_client(resume_token: u64) -> Result<(Client<Stream>, u64, i32), c_in
     if trace {
         eprintln!("[shim] bring_up: connected fd={fd}");
     }
+    // A fork clone's reconnect handshake waits for its worker's full golden
+    // reconstruction (chunk imports + copies + module staging) — give it real
+    // headroom; a fresh session's handshake stays tight.
     #[cfg(unix)]
-    set_recv_timeout(fd, 10);
+    set_recv_timeout(fd, if resume_token != 0 { 45 } else { 10 });
     let mut client = Client::new(stream);
     let token = client.init(resume_token).map_err(|e| {
         if trace {

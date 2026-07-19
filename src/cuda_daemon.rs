@@ -852,8 +852,35 @@ fn route_clone_connection(fd: std::os::unix::io::RawFd) -> bool {
     };
     let mut reg = clone_worker_registry().lock().unwrap();
     if let Some(&pid) = reg.get(&(token, clone_id)) {
+        // Reap first: an exited worker stays a ZOMBIE (the daemon is its parent
+        // and nothing waits on it), and kill(pid, 0) reports zombies as alive —
+        // without this, one worker death makes every reconnect of that clone
+        // rejected forever (observed as a 54/s reconnect storm on H100).
+        // Reaping also surfaces HOW it died, which nothing logged before.
+        let mut status: libc::c_int = 0;
+        // SAFETY: WNOHANG waitpid on our own child; no blocking, no signals.
+        let r = unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) };
+        if r == pid as i32 {
+            let (code, sig) = (
+                libc::WEXITSTATUS(status),
+                if libc::WIFSIGNALED(status) {
+                    libc::WTERMSIG(status)
+                } else {
+                    0
+                },
+            );
+            tracing::warn!(
+                token,
+                clone_id,
+                worker_pid = pid,
+                exit_code = code,
+                signal = sig,
+                "clone worker had exited; reaped — spawning a fresh worker for the reconnect"
+            );
+            reg.remove(&(token, clone_id));
+        }
         // SAFETY: kill(pid, 0) — pure liveness probe, no signal delivered.
-        if unsafe { libc::kill(pid as i32, 0) } == 0 {
+        else if unsafe { libc::kill(pid as i32, 0) } == 0 {
             tracing::warn!(
                 token,
                 clone_id,
