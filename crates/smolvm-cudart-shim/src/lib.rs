@@ -463,7 +463,7 @@ fn bring_up_client(resume_token: u64) -> Result<(Client<Stream>, u64, i32), c_in
     // reconstruction (chunk imports + copies + module staging) — give it real
     // headroom; a fresh session's handshake stays tight.
     #[cfg(unix)]
-    set_recv_timeout(fd, if resume_token != 0 { 45 } else { 10 });
+    set_recv_timeout(fd, if resume_token != 0 { 90 } else { 60 });
     let mut client = Client::new(stream);
     let token = client.init(resume_token).map_err(|e| {
         if trace {
