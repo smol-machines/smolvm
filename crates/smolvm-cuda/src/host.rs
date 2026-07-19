@@ -854,7 +854,7 @@ pub fn module_handoff_snapshot(
     token: u64,
 ) -> Option<(
     Vec<(u64, Vec<u8>)>,
-    Vec<(u64, u64, String, Vec<(i32, i32)>)>,
+    Vec<FuncMeta>,
     Vec<(u64, u32)>,
     Vec<(u64, u32)>,
     Vec<(u64, u64, GraphSer)>,
@@ -1018,9 +1018,13 @@ pub fn rebuild_clone_graphs(b: &mut dyn Backend, graphs: Vec<(u64, u64, GraphSer
 /// reloaded / functions re-resolved LAZILY from `mod_images` / `func_meta` at
 /// first use; streams/events are already-recreated golden→worker maps (eager,
 /// few). Clears any prior worker's caches.
+/// One staged golden function: `(golden handle, golden module, name, attribute
+/// replays)` — see [`module_handoff_snapshot`].
+pub type FuncMeta = (u64, u64, String, Vec<(i32, i32)>);
+
 pub fn set_handle_trans(
     mod_images: Vec<(u64, Vec<u8>)>,
-    func_meta: Vec<(u64, u64, String, Vec<(i32, i32)>)>,
+    func_meta: Vec<FuncMeta>,
     streams: Vec<(u64, u64)>,
     events: Vec<(u64, u64)>,
 ) {

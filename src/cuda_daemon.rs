@@ -101,13 +101,17 @@ pub(crate) fn install_crash_handler(role: &'static str) {
         // SAFETY: installing a handler that only formats + re-raises.
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
-            sa.sa_sigaction = on_fatal as usize;
+            #[allow(clippy::fn_to_numeric_cast_any)] // sigaction's ABI wants the raw address
+            {
+                sa.sa_sigaction = on_fatal as usize;
+            }
             sa.sa_flags = libc::SA_ONSTACK;
             libc::sigaction(sig, &sa, std::ptr::null_mut());
         }
     }
 }
 
+/// Serve the shared CUDA daemon on `sock` (spawned as `smolvm _cuda-daemon`).
 pub fn run(sock: &Path) -> io::Result<()> {
     #[cfg(unix)]
     install_crash_handler("cuda-daemon");
@@ -627,7 +631,7 @@ fn reconstruct_golden_modules(
     path: &str,
 ) -> (
     Vec<(u64, Vec<u8>)>,
-    Vec<(u64, u64, String, Vec<(i32, i32)>)>,
+    Vec<smolvm_cuda::host::FuncMeta>,
     Vec<(u64, u64)>,
     Vec<(u64, u64)>,
     Vec<(u64, u64, smolvm_cuda::host::GraphSer)>,
