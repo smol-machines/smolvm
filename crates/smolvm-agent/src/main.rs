@@ -3660,7 +3660,20 @@ pub fn resolve_main_container(persistent_overlay_id: Option<&str>) -> Option<Str
     }
 
     if is_container_running(&cid) {
-        return Some(cid);
+        // A restored fork clone's keep-alive container is alive (its process
+        // came back with the golden's RAM) but runs from the golden's
+        // pre-fork overlay mount, whose virtiofs lowerdirs are stale in the
+        // clone — joining it fails every exec with ESTALE. Only hand the
+        // container out if its overlay still answers lookups; otherwise
+        // recycle it so the caller re-establishes container + overlay fresh
+        // (the remount keeps the CoW-inherited upper layer).
+        if storage::persistent_overlay_mount_is_healthy(&workload_id) {
+            return Some(cid);
+        }
+        info!(container_id = %cid, "main container's overlay mount is stale (restored fork state); recycling");
+        let _ = std::fs::remove_file(&id_path);
+        let _ = crun::CrunCommand::delete(&cid, true).output();
+        return None;
     }
 
     // Stale: container died. Clean up the ID file and crun state.

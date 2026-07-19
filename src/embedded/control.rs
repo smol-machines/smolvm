@@ -169,7 +169,7 @@ pub fn fork_vm(
             // and roll it back rather than leave it live with the golden's
             // per-machine secrets.
             crate::agent::fork::fail_closed_on_rejuvenation(
-                crate::agent::fork::rejuvenate_clone(clone, golden),
+                crate::agent::fork::rejuvenate_clone(clone),
                 || {
                     let _ = handle.stop();
                     let _ = db.remove_vm(clone);

@@ -81,7 +81,9 @@ pub async fn exec_command(
     if req.background {
         let command = req.command.clone();
         let workdir = req.workdir.clone();
-        let machine_image = state.lookup_vm(&id).await?.and_then(|r| r.image);
+        let machine_rec = state.lookup_vm(&id).await?;
+        let machine_golden = machine_rec.as_ref().and_then(|r| r.golden.clone());
+        let machine_image = machine_rec.and_then(|r| r.image);
         let pid = if let Some(image) = machine_image {
             let mounts_config = {
                 let e = entry.lock();
@@ -91,7 +93,10 @@ pub async fn exec_command(
                     .map(|(i, m)| (HostMount::mount_tag(i), m.target.clone(), m.readonly))
                     .collect::<Vec<_>>()
             };
-            let overlay_id = id.clone();
+            // A fork clone's inherited overlay lives under the golden's id
+            // (see `persistent_overlay_owner`).
+            let overlay_id =
+                crate::workload::persistent_overlay_owner(&id, machine_golden.as_deref());
             with_machine_client_traced(&entry, tid, move |c| {
                 if c.query(&image)?.is_none() {
                     c.pull_with_registry_config(&image)?;
@@ -132,7 +137,9 @@ pub async fn exec_command(
     // sessions. Without this, exec runs in the bare agent VM (no `python3`,
     // etc.) — the image is never entered. Plain machines exec in the VM
     // directly via `vm_exec`.
-    let machine_image = state.lookup_vm(&id).await?.and_then(|r| r.image);
+    let machine_rec = state.lookup_vm(&id).await?;
+    let machine_golden = machine_rec.as_ref().and_then(|r| r.golden.clone());
+    let machine_image = machine_rec.and_then(|r| r.image);
 
     let start = std::time::Instant::now();
     let (exit_code, stdout, stderr) = if let Some(image) = machine_image {
@@ -144,7 +151,8 @@ pub async fn exec_command(
                 .map(|(i, m)| (HostMount::mount_tag(i), m.target.clone(), m.readonly))
                 .collect::<Vec<_>>()
         };
-        let overlay_id = id.clone();
+        // A fork clone's inherited overlay lives under the golden's id.
+        let overlay_id = crate::workload::persistent_overlay_owner(&id, machine_golden.as_deref());
         let stdin_data = stdin_data.clone();
         with_machine_client_traced(&entry, tid, move |c| {
             // Pull only if the image isn't already present — avoids a registry
@@ -227,7 +235,9 @@ pub async fn exec_stream(
     // overlay keyed by machine name); plain machines stream from the VM
     // directly. Without this, streaming exec on an image machine produces no
     // output (the agent-base streaming path doesn't enter the container).
-    let machine_image = state.lookup_vm(&id).await?.and_then(|r| r.image);
+    let machine_rec = state.lookup_vm(&id).await?;
+    let machine_golden = machine_rec.as_ref().and_then(|r| r.golden.clone());
+    let machine_image = machine_rec.and_then(|r| r.image);
 
     // Run streaming exec via the machine client (vsock is synchronous)
     let start = std::time::Instant::now();
@@ -240,7 +250,8 @@ pub async fn exec_stream(
                 .map(|(i, m)| (HostMount::mount_tag(i), m.target.clone(), m.readonly))
                 .collect::<Vec<_>>()
         };
-        let overlay_id = id.clone();
+        // A fork clone's inherited overlay lives under the golden's id.
+        let overlay_id = crate::workload::persistent_overlay_owner(&id, machine_golden.as_deref());
         with_machine_client_traced(&entry, tid, move |c| {
             if c.query(&image)?.is_none() {
                 c.pull_with_registry_config(&image)?;

@@ -317,30 +317,26 @@ fn clone_fork_disks(gdir: &Path, clone_dir: &Path) -> Result<()> {
 /// `vm_exec` errors or exits non-zero transiently.
 const REJUVENATE_ATTEMPTS: usize = 3;
 
-/// Build the shell script that re-mints a clone's on-disk identity and adopts
-/// the golden's persistent exec overlay. Kept as a pure function of
-/// `(clone, golden, seed)` so the security-critical contents (fresh
+/// Build the shell script that re-mints a clone's on-disk identity. Kept as a
+/// pure function of `(clone, seed)` so the security-critical contents (fresh
 /// machine-id, regenerated SSH host keys) are unit-tested without a live VM.
 ///
-/// `clone` and `golden` are validated machine names (alphanumeric + dashes)
-/// and `seed` is hex, so single-quoting them is injection-safe.
+/// `clone` is a validated machine name (alphanumeric + dashes) and `seed` is
+/// hex, so single-quoting both is injection-safe.
 ///
-/// OVERLAY ADOPTION: the CoW disk clone carries the golden's persistent exec
-/// overlay byte-for-byte, but it sits at `/storage/overlays/persistent-<golden>`
-/// while the clone's execs resolve `/storage/overlays/persistent-<clone>` — so
-/// without a re-key the clone would mount a fresh empty upper next to the
-/// inherited one and appear to start blank. Renaming it (same ext4, atomic)
-/// makes the clone's first exec find and remount the golden's upper, i.e. the
-/// clone inherits everything the golden wrote via exec. Guarded: no-op when the
-/// golden never ran an exec (no source dir) or the clone already has its own
-/// overlay (never clobber real state).
+/// NOTE: this deliberately does NOT touch `/storage/overlays`. The clone's
+/// inherited exec overlay stays under the GOLDEN's id and the restored guest
+/// may still hold it mounted (or have a restored workload container running
+/// from it) — renaming it on disk poisons that live overlayfs mount (ESTALE
+/// in every subsequent container exec). Hosts alias the overlay lookup
+/// instead (`crate::workload::persistent_overlay_owner`).
 ///
 /// The script is fail-hard on the *unambiguously per-machine* identity material
 /// (`set -e`): if a clone cannot get its own machine-id or SSH host keys, the
 /// fork must fail rather than vend a clone that impersonates the golden. Steps
 /// that are legitimately absent on minimal/library images (no sshd, no dbus,
 /// no cloud-init) are guarded so they no-op instead of failing.
-fn build_rejuvenation_script(clone: &str, golden: &str, seed: &str) -> String {
+fn build_rejuvenation_script(clone: &str, seed: &str) -> String {
     format!(
         "set -e; \
          hostname '{c}' 2>/dev/null || true; \
@@ -354,13 +350,9 @@ fn build_rejuvenation_script(clone: &str, golden: &str, seed: &str) -> String {
              ssh-keygen -A >/dev/null 2>&1; \
          fi; \
          rm -rf /var/lib/cloud/instance /var/lib/cloud/instances/* /var/lib/cloud/data/instance-id 2>/dev/null || true; \
-         if [ -d '/storage/overlays/persistent-{g}' ] && [ ! -e '/storage/overlays/persistent-{c}' ]; then \
-             mv '/storage/overlays/persistent-{g}' '/storage/overlays/persistent-{c}'; \
-         fi; \
          printf '%s' '{s}' > /dev/urandom 2>/dev/null || true; \
          true",
         c = clone,
-        g = golden,
         s = seed,
     )
 }
@@ -372,11 +364,7 @@ fn build_rejuvenation_script(clone: &str, golden: &str, seed: &str) -> String {
 /// cross-tenant impersonation / MITM hole (identical SSH host keys) and a
 /// duplicate-identity bug. This runs over the freshly-booted clone's agent to
 /// give it a fresh hostname, machine-id, SSH host keys, and to stir the kernel
-/// RNG with fresh host entropy so the random streams diverge. It also re-keys
-/// the golden's persistent exec overlay to the clone's name so the clone's
-/// execs see the filesystem state the golden built up (see
-/// [`build_rejuvenation_script`]) — the disks are already CoW-inherited; this
-/// makes the inherited overlay *findable* under the clone's own id.
+/// RNG with fresh host entropy so the random streams diverge.
 ///
 /// FAIL-CLOSED: this returns `Err` if the reset could not be *confirmed* (agent
 /// unreachable, or the re-mint script exited non-zero) after
@@ -394,10 +382,10 @@ fn build_rejuvenation_script(clone: &str, golden: &str, seed: &str) -> String {
 /// disk rejuvenation. Likewise this stirs but does not *credit* entropy
 /// (no `RNDADDENTROPY`/VMGENID yet) and does not re-address the network
 /// (MAC/IP; safe under the default TSI backend) — both are follow-ups.
-pub fn rejuvenate_clone(clone: &str, golden: &str) -> Result<()> {
+pub fn rejuvenate_clone(clone: &str) -> Result<()> {
     let sock = vm_data_dir(clone).join("agent.sock");
     let seed = host_random_hex(64);
-    let script = build_rejuvenation_script(clone, golden, &seed);
+    let script = build_rejuvenation_script(clone, &seed);
 
     let mut last_err = String::from("unknown error");
     for attempt in 1..=REJUVENATE_ATTEMPTS {
@@ -496,7 +484,7 @@ mod tests {
     // above all the SSH host keys.
     #[test]
     fn rejuvenation_script_regenerates_per_machine_secrets() {
-        let script = build_rejuvenation_script("clone-a", "golden-a", "deadbeef");
+        let script = build_rejuvenation_script("clone-a", "deadbeef");
 
         // SSH host keys: delete the golden's, then regenerate fresh ones.
         assert!(
@@ -520,25 +508,17 @@ mod tests {
         assert!(script.contains("command -v ssh-keygen"));
     }
 
-    // The CoW disk clone carries the golden's persistent exec overlay, but the
-    // clone's execs look it up under the clone's own name — the script must
-    // re-key it so the clone actually inherits the golden's filesystem state,
-    // and must never clobber an overlay the clone already owns.
+    // The rejuvenation script must NOT touch the inherited exec overlay: the
+    // restored guest may still hold it mounted, and renaming a live
+    // overlayfs's backing directories breaks every subsequent container exec
+    // (ESTALE). Overlay adoption is a host-side lookup alias instead.
     #[test]
-    fn rejuvenation_script_adopts_goldens_persistent_overlay() {
-        let script = build_rejuvenation_script("clone-a", "golden-a", "deadbeef");
-
-        // Renames the golden's overlay dir to the clone's id.
+    fn rejuvenation_script_leaves_the_inherited_overlay_alone() {
+        let script = build_rejuvenation_script("clone-a", "deadbeef");
         assert!(
-            script.contains(
-                "mv '/storage/overlays/persistent-golden-a' '/storage/overlays/persistent-clone-a'"
-            ),
-            "script must re-key the inherited overlay to the clone: {script}"
+            !script.contains("/storage/overlays"),
+            "script must not rename/touch overlay dirs: {script}"
         );
-        // Guarded on both sides: source must exist (golden may never have
-        // exec'd) and destination must not (never overwrite the clone's own).
-        assert!(script.contains("[ -d '/storage/overlays/persistent-golden-a' ]"));
-        assert!(script.contains("[ ! -e '/storage/overlays/persistent-clone-a' ]"));
     }
 
     // Fix 2 (fail-closed): an Err rejuvenation must tear the clone down and
