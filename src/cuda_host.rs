@@ -107,7 +107,8 @@ pub fn start(socket_path: &Path) -> std::io::Result<()> {
             // concurrent with guest resume, instead of on the guest's first
             // CUDA call. The connection is held open as the worker's idle
             // primary channel; real guest channels attach to the live worker.
-            if let (Some(addr), Some(p)) = (daemon.clone(), clone_preamble(true)) {
+            if std::env::var("SMOLVM_CUDA_WARM_DIAL").as_deref() != Ok("0") {
+              if let (Some(addr), Some(p)) = (daemon.clone(), clone_preamble(true)) {
                 thread::Builder::new()
                     .name("cuda-clone-warm".into())
                     .spawn(move || {
@@ -130,6 +131,7 @@ pub fn start(socket_path: &Path) -> std::io::Result<()> {
                         }
                     })
                     .ok();
+              }
             }
             for stream in listener.incoming() {
                 match stream {

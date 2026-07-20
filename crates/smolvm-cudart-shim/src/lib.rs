@@ -2378,6 +2378,19 @@ pub extern "C" fn cublasLtGetVersion() -> usize {
 /// driver shim (`libcuda.so.1`) so callers get the same interposed surface as
 /// direct linking. Missing symbols report `SymbolNotFound` via `driver_status`
 /// with a success return, per the cudart contract.
+/// Pre-12.5 entry point (no cudaVersion arg). torch 2.7's `libtorch_cuda.so`
+/// links this symbol directly at load time, so it must be exported even though
+/// the versioned variant carries the real logic.
+#[no_mangle]
+pub extern "C" fn cudaGetDriverEntryPoint(
+    symbol: *const c_char,
+    func_ptr: *mut *mut c_void,
+    flags: u64,
+    driver_status: *mut c_int,
+) -> c_int {
+    cudaGetDriverEntryPointByVersion(symbol, func_ptr, 12040, flags, driver_status)
+}
+
 #[no_mangle]
 pub extern "C" fn cudaGetDriverEntryPointByVersion(
     symbol: *const c_char,
