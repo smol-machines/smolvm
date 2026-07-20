@@ -620,7 +620,23 @@ pub async fn stream_logs(
     Path(id): Path<String>,
     Query(query): Query<LogsQuery>,
 ) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError> {
-    let entry = state.get_machine(&id)?;
+    // get_machine only knows machines in the running map. Distinguish a real
+    // typo (absent from the DB too) from a machine that exists but was never
+    // started (present in the DB, no console log yet) so clients don't read a
+    // created machine as "not found".
+    let entry = match state.get_machine(&id) {
+        Ok(e) => e,
+        Err(_) => {
+            let known = matches!(state.db().get_vm(&id), Ok(Some(_)));
+            return Err(if known {
+                ApiError::NotFound(format!(
+                    "machine '{id}' has not been started yet — no logs available"
+                ))
+            } else {
+                ApiError::NotFound(format!("machine '{id}' not found"))
+            });
+        }
+    };
 
     // Get console log path
     let log_path: PathBuf = {

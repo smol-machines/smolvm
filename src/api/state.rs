@@ -1121,9 +1121,12 @@ pub fn build_launch_features(
 /// callers MUST hold the per-machine lifecycle lock (see `ensure_running_and_persist`,
 /// the only caller) for the duration, or the mount can race a concurrent
 /// stop/delete detach (review finding #3).
+/// Returns `true` when this call actually booted the VM — it was not already
+/// reachable — so callers know a freshly-booted image machine still needs its
+/// workload launched.
 pub async fn ensure_machine_running(
     entry: &Arc<parking_lot::Mutex<MachineEntry>>,
-) -> crate::Result<()> {
+) -> crate::Result<bool> {
     let entry_clone = entry.clone();
     tokio::task::spawn_blocking(move || {
         let entry = entry_clone.lock();
@@ -1150,7 +1153,8 @@ pub async fn ensure_machine_running(
         // `ensure_running_via_subprocess` re-attaches this machine's pre-extracted
         // packed layers itself (see `rewire_packed_layers_if_extracted`), so the
         // restart keeps using them instead of falling back to a registry pull.
-        let features = if entry.manager.try_connect_existing().is_some() {
+        let already_up = entry.manager.try_connect_existing().is_some();
+        let features = if already_up {
             crate::agent::LaunchFeatures::default()
         } else {
             build_launch_features(
@@ -1162,7 +1166,7 @@ pub async fn ensure_machine_running(
         entry
             .manager
             .ensure_running_via_subprocess(mounts, ports, resources, features)?;
-        Ok(())
+        Ok(!already_up)
     })
     .await
     .map_err(|e| crate::Error::agent("ensure running", e.to_string()))?
@@ -1189,7 +1193,38 @@ pub async fn ensure_running_and_persist(
     let lifecycle = state.lifecycle_lock(name);
     let _guard = lifecycle.lock().await;
 
-    ensure_machine_running(entry).await?;
+    // Refresh the entry's launch config from the persisted record before an
+    // implicit start. The record is the source of truth and can change while
+    // the machine is stopped (`machine update` from the CLI edits the DB but
+    // not this server's in-memory entry), so booting from the cached entry
+    // launches with pre-update mounts/ports/resources. `update` refuses
+    // running machines, so a running machine's entry can't be stale — and for
+    // one, ensure_machine_running early-returns before the config matters.
+    if let Ok(Some(record)) = state.lookup_vm(name).await {
+        let mut e = entry.lock();
+        e.mounts = record
+            .mounts
+            .iter()
+            .map(|(source, target, readonly)| MountSpec {
+                source: source.clone(),
+                target: target.clone(),
+                readonly: *readonly,
+            })
+            .collect();
+        e.ports = record
+            .ports
+            .iter()
+            .map(|(host, guest)| PortSpec {
+                host: *host,
+                guest: *guest,
+            })
+            .collect();
+        e.resources.cpus = Some(record.cpus);
+        e.resources.memory_mb = Some(record.mem);
+        e.network = record.network;
+    }
+
+    let freshly_booted = ensure_machine_running(entry).await?;
 
     let pid = {
         let entry = entry.lock();
@@ -1199,7 +1234,89 @@ pub async fn ensure_running_and_persist(
         tracing::warn!(machine = %name, error = %e, "failed to persist Running state after implicit start");
     }
 
+    // An implicit start of an image machine (exec/files/images waking a stopped
+    // machine) must relaunch the image workload just like the explicit start
+    // handler does — otherwise the wake boots a bare agent VM and a published
+    // port forwards to a guest socket nothing listens on (the exact drift
+    // `workload.rs`'s module doc warns front-ends about). Gated on
+    // `freshly_booted` so an already-running machine's workload is never
+    // double-launched. Best-effort like the handler's launch step: the caller's
+    // exec must not fail because the workload didn't come up.
+    if freshly_booted {
+        if let Err(e) = relaunch_image_workload(state, name, entry).await {
+            tracing::warn!(
+                machine = %name,
+                error = ?e,
+                "failed to relaunch image workload after implicit start; VM is up but its server is not running"
+            );
+        }
+    }
+
     Ok(())
+}
+
+/// Launch an image machine's workload container after an implicit start,
+/// mirroring the explicit start handler (`handlers/machines.rs`): same
+/// env/secret resolution, mount bindings, and golden-aliased persistent
+/// overlay. No-op for machines without an image. The image is pulled only on a
+/// cache miss — on the wake path the machine has run before, so this is
+/// normally a no-op.
+async fn relaunch_image_workload(
+    state: &ApiState,
+    name: &str,
+    entry: &Arc<parking_lot::Mutex<MachineEntry>>,
+) -> crate::Result<()> {
+    let Some(record) = state
+        .lookup_vm(name)
+        .await
+        .map_err(|e| crate::Error::agent("load record for workload", format!("{e:?}")))?
+    else {
+        return Ok(());
+    };
+    let Some(image) = record.image.clone() else {
+        return Ok(());
+    };
+
+    let mut command = record.entrypoint.clone();
+    command.extend(record.cmd.clone());
+    let mut env = record.env.clone();
+    env.extend(crate::secrets::expose_into_env(
+        crate::api::handlers::record_secret_refs_env(entry)
+            .map_err(|e| crate::Error::agent("resolve workload secrets", format!("{e:?}")))?,
+    ));
+    let workdir = record.workdir.clone();
+    let user = record.user.clone();
+    let mounts_config = {
+        let e = entry.lock();
+        e.mounts
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (HostMount::mount_tag(i), m.target.clone(), m.readonly))
+            .collect::<Vec<_>>()
+    };
+    let overlay_id = crate::workload::persistent_overlay_owner(name, record.golden.as_deref());
+
+    let image_pull = image.clone();
+    with_machine_client_traced(entry, None, move |c| {
+        if c.query(&image_pull)?.is_none() {
+            c.pull_with_registry_config(&image_pull)?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| crate::Error::agent("pull image for workload", format!("{e:?}")))?;
+
+    with_machine_client_traced(entry, None, move |c| {
+        let config = crate::agent::RunConfig::new(image, command)
+            .with_env(env)
+            .with_workdir(workdir)
+            .with_user(user)
+            .with_mounts(mounts_config)
+            .with_persistent_overlay(Some(overlay_id));
+        c.run_container_detached(config).map(|_| ())
+    })
+    .await
+    .map_err(|e| crate::Error::agent("launch workload", format!("{e:?}")))
 }
 
 // ============================================================================
