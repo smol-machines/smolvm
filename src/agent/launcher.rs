@@ -532,7 +532,16 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
     // Opt out with SMOLVM_CUDA_FILE_RING=0.
     let mut mounts_vec: Vec<crate::data::storage::HostMount> = mounts.to_vec();
     if let Some(cs) = cuda_socket {
-        if std::env::var("SMOLVM_CUDA_FILE_RING").as_deref() != Ok("0") {
+        // Device-slot budget: libkrun EINVALs the VM config once the virtio
+        // device count crosses its table size (measured: 4 user mounts + the
+        // ring device fails; either alone boots). Skip the ring mount rather
+        // than brick the boot — such machines simply stay on socket transport.
+        if mounts_vec.len() > 3 {
+            tracing::warn!(
+                mounts = mounts_vec.len(),
+                "skipping CUDA ring mount: virtio device budget exhausted (clone rings unavailable; socket transport)"
+            );
+        } else if std::env::var("SMOLVM_CUDA_FILE_RING").as_deref() != Ok("0") {
             if let Some(dir) = cs.parent().map(|d| d.join("cuda-ring")) {
                 if std::fs::create_dir_all(&dir).is_ok() {
                     // SAFETY-free env set: single-threaded launch path, before
