@@ -2995,17 +2995,37 @@ fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Resul
                     }
                 })?;
             let fstype = std::ffi::CString::new("virtiofs").unwrap();
-            let opts = std::ffi::CString::new("sync").unwrap();
+            // DAX first: when the device has a DAX window (host passed a
+            // nonzero shm_size — SMOLVM_MOUNT_DAX=1), a dax mount maps host
+            // page-cache pages directly into the guest, making guest/host
+            // MAP_SHARED mmaps of the same file coherent shared memory (the
+            // clone-ring transport). The kernel silently downgrades dax on a
+            // window-less device; the explicit fallback covers kernels that
+            // reject the option outright.
+            let opts_dax = std::ffi::CString::new("dax,sync").unwrap();
+            let opts_plain = std::ffi::CString::new("sync").unwrap();
             // SAFETY: mount virtiofs with valid CString arguments
-            let rc = unsafe {
+            let mut rc = unsafe {
                 libc::mount(
                     src.as_ptr(),
                     dst.as_ptr(),
                     fstype.as_ptr(),
                     0,
-                    opts.as_ptr() as *const libc::c_void,
+                    opts_dax.as_ptr() as *const libc::c_void,
                 )
             };
+            if rc != 0 {
+                // SAFETY: as above, plain options.
+                rc = unsafe {
+                    libc::mount(
+                        src.as_ptr(),
+                        dst.as_ptr(),
+                        fstype.as_ptr(),
+                        0,
+                        opts_plain.as_ptr() as *const libc::c_void,
+                    )
+                };
+            }
             if rc != 0 {
                 let err = std::io::Error::last_os_error();
                 warn!(error = %err, tag = %tag, "failed to mount virtiofs device");

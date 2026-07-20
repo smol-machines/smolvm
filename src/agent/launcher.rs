@@ -1344,21 +1344,56 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 "adding virtiofs mount"
             );
 
+            // DAX window for user mounts (SMOLVM_MOUNT_DAX=1, validation
+            // gate): a dax-mounted virtiofs file mmap'd MAP_SHARED by guest
+            // and host is genuinely coherent shared memory (the window maps
+            // host page-cache pages into the guest), which is the transport
+            // for CLONE rings — clone guest RAM is COW-private, but the DAX
+            // window is device memory, re-established per-VM, so it dodges
+            // the COW wall entirely. libkrun supports per-device windows
+            // (ShmManager::create_fs_region per fs index); the old code just
+            // never asked (shm_size=0 here while launcher_dynamic asked for
+            // 2 GiB — the source of the "only root has DAX" misdiagnosis).
+            let dax_window: u64 = match std::env::var("SMOLVM_MOUNT_DAX").as_deref() {
+                Ok("1") => 1 << 29,
+                _ => 0,
+            };
             // Read-only mounts must be enforced host-side by the virtiofs
             // device (krun_add_virtiofs3's read_only flag), not only by the
             // guest's bind-remount: a root process in the guest can undo a
             // guest-side remount, but it cannot make the host server accept
             // writes. Fail closed if the symbol is missing rather than
             // silently attaching the mount writable.
-            if mount.read_only {
+            if mount.read_only || dax_window > 0 {
                 let Some(add_virtiofs3) = krun_add_virtiofs3 else {
-                    krun_free_ctx(ctx);
-                    return Err(Error::agent(
-                        "add virtiofs mount",
-                        "read-only mounts require libkrun with krun_add_virtiofs3",
-                    ));
+                    if mount.read_only {
+                        krun_free_ctx(ctx);
+                        return Err(Error::agent(
+                            "add virtiofs mount",
+                            "read-only mounts require libkrun with krun_add_virtiofs3",
+                        ));
+                    }
+                    // DAX requested but symbol missing: fall back to plain.
+                    if krun_add_virtiofs(ctx, tag.as_ptr(), host_path.as_ptr()) < 0 {
+                        krun_free_ctx(ctx);
+                        return Err(Error::agent(
+                            "add virtiofs mount",
+                            format!(
+                                "krun_add_virtiofs failed for '{}' - requested mount cannot be attached",
+                                mount.source.display()
+                            ),
+                        ));
+                    }
+                    continue;
                 };
-                if add_virtiofs3(ctx, tag.as_ptr(), host_path.as_ptr(), 0, true) < 0 {
+                if add_virtiofs3(
+                    ctx,
+                    tag.as_ptr(),
+                    host_path.as_ptr(),
+                    dax_window,
+                    mount.read_only,
+                ) < 0
+                {
                     krun_free_ctx(ctx);
                     return Err(Error::agent(
                         "add virtiofs mount",
