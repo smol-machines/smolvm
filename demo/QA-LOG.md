@@ -830,3 +830,34 @@ pages died on resume. `SMOLVM_MOUNT_DAX` stays OPT-IN/default-off; the load-hang
 fix is non-DAX (page-cache warm now; block-disk model staging is the durable
 fix). LESSON: verify VMM/fork behavior on the local 3070 before spending remote
 H100 time — this took 5 min locally vs multiple H100 runs.
+
+## 2026-07-20 — DAX fork issue ROOT-CAUSED and FIXED (libkrun PR #43)
+
+Root cause (code-level, libkrun): smolvm's fork is manifest-based — the clone
+is a fresh process that CoW-maps the golden's memfd RAM regions, but the DAX
+window is an ANONYMOUS guest-memory region, and `open_cow_memory_from_pid`
+gives anonymous regions a fresh ZEROED mapping. The virtiofs `setupmapping`
+`mmap(MAP_SHARED|MAP_FIXED)` calls that populated the golden's window were
+fire-and-forget — nothing recorded them — so the clone's restored guest kernel
+still holds DAX page-table entries into a window that is now all zeros. The
+guest reads zeros where file pages were (torch .so text, safetensors) and its
+processes SIGSEGV. Not a CUDA bug at all.
+
+Fix (libkrun `dax-fork-replay`, PR smol-machines/libkrun#43): track live
+SETUPMAPPING/REMOVEMAPPING state in the passthrough server (`dax_maps`,
+keyed by window offset), serialize it in `FuseServerState` (which already
+crosses the fork and rebuilds inodes by host path), and replay each mmap
+into the clone's window in `FsWorker::new` — after the inode map is rebuilt,
+before the guest resumes.
+
+Validated on the 3070 (val_dax_inherit.sh, patched libkrun BLK=1 NET=1 from
+bundle-rev+1): clone's inherited-DAX writer ADVANCES post-fork (508→707),
+zero guest errors, and the inherited read-only torch libc10.so DAX pages read
+correctly (chk!=0) — the exact training failure mode. Non-DAX fork regression
+run: clean.
+
+Why this matters: DAX mounts now survive fork, so the venv/model mounts can go
+DAX — removing the FUSE READ path that causes the golden-load slow mode (159s
+load seen again on the H100 this run vs ~15s normal), and letting N clones
+share ONE host page-cache copy of the model weights. Next: rebuild libkrun on
+the H100 box and rerun the DAX training sweep.
