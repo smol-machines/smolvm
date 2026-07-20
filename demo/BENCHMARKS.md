@@ -32,12 +32,30 @@ Density scaling (measured, all correct — 0 nan):
 
 Each added container costs ~7.7 GB; each added smolvm clone only ~2.4 GB (the
 ~5 GB base is shared once). Container OOMs near N=10 on 80 GB; smolvm fits
-**~3× the learners** (~N=30). The density advantage GROWS with N. Aggregate
-throughput at N=8: container 7,088 vs smolvm 2,053 tok/s — container wins
-per-learner throughput (the remoting tax), smolvm wins learners-per-GB and
-startup. So smolvm is the better choice when VRAM/learner-count-bound or
-startup-bound (many concurrent experiments, elastic spawning); container when
-raw per-learner throughput-bound.
+**~3× the learners** (~N=30), and the density advantage GROWS with N.
+
+**FINAL (2026-07-20, clone file-rings live): smolvm EXCEEDS the container
+aggregate at N=8 while using 55% less VRAM.**
+
+| N=8, one H100 | Container | smolvm (rings + graphs + warm chain) |
+|---|---|---|
+| Aggregate training tok/s | 7,088 | **7,341 (+3.6%)** |
+| Peak GPU memory | 61.8 GB | **28.0 GB (−55%)** |
+| Per-learner tok/s | ~886 | 804–1,106 |
+| Startup per replica | 7–17 s | **0.45 s fork** |
+| Learner slots remaining | ~2 | **~20** |
+| Correctness | ✓ | ✓ (distinct loss curves, all 8) |
+
+Journey of the per-learner remoting tax: 257 tok/s (socket, op-trace on) →
+357 (op-trace off) → 429 (math-mode cache) → 450 (event deferral) →
+**1,434 solo / ~920 avg at N=8 (DAX file rings — 3.2× from transport
+alone)**. The container arm's ~7,100 tok/s is the GPU's compute ceiling for
+this workload; smolvm now reaches it at N≈6–8 with ~20 learner slots to
+spare — i.e. **token-throughput parity-or-better per GPU, ~3× the isolated
+experiments per dollar, and 20–35× faster elastic scaling**. For
+throughput-only single-job use, native/containers remain equal-best (the
+ceiling is the ceiling); smolvm's win is carrying density, isolation, and
+instant elasticity AT the ceiling.
 
 **Correctness fix (this run):** concurrent share-weights training corrupted
 (loss=nan) at N≥3 because the golden froze without exercising the training
