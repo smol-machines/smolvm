@@ -249,3 +249,18 @@ file offsets instead of GPAs for this mode. Expected effect: clone
 per-call transport drops from socket RTT to shared-memory latency — the
 same 318→87 ms class of win the golden got from rings, applied to clones,
 compounding with graph replay (P3b) and the sync-elimination work.
+
+### P2b SHIPPED (2026-07-20): clone file-rings live — [ring-file] active
+
+End-to-end on the local 3070 vLLM graphs gate: both clones negotiate the
+DAX file-ring transport (`[ring-file] file rings active`) and serve at
+**127–134 ms steady-state vs 169–235 ms on sockets (~40% faster), within
+~1.4× of the golden's 91 ms** (was 2.5×). Implementation (commits 37cb826,
+9b44267, 47dc1d7): `RingSetupFile` protocol op; shim falls back to file
+rings when GPA rings are rejected (fresh file + fresh MAP_SHARED mmap on
+the dax mount — the fork-safe pattern); implicit per-CUDA-machine ring
+mount (/opt/smolvm-ring, 512 MB DAX window) injected by the launcher and
+merged into every container's mounts by the agent; per-VM ring-dir advert
+(SMVRDIR1) carried by both real channels and the warm dial so workers
+spawn knowing the dir. H100 training re-measure queued (training was
+measured 86% transport-idle — rings collapse those socket round-trips).
