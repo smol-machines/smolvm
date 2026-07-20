@@ -153,7 +153,7 @@ pub fn run(sock: &Path) -> io::Result<()> {
                                             continue;
                                         }
                                     }
-                                    spawn_serve(s, &active_tcp);
+                                    spawn_serve(s, &active_tcp, None);
                                 }
                                 Err(e) => {
                                     tracing::debug!(error = %e, "CUDA daemon TCP accept error")
@@ -186,14 +186,18 @@ pub fn run(sock: &Path) -> io::Result<()> {
                 // would silently serve it a reconstructed COPY of its memory.
                 // Only fires under SMOLVM_CUDA_FORK_WORKERS; otherwise legacy.
                 #[cfg(unix)]
-                {
+                let guest_ram = {
                     use std::os::unix::io::AsRawFd;
+                    let ram = consume_ram_preamble(stream.as_raw_fd());
                     if route_clone_connection(stream.as_raw_fd()) {
                         drop(stream); // worker owns it / rejected
                         continue;
                     }
-                }
-                spawn_serve(stream, &active);
+                    ram
+                };
+                #[cfg(not(unix))]
+                let guest_ram = None;
+                spawn_serve(stream, &active, guest_ram);
             }
             Err(e) => tracing::debug!(error = %e, "CUDA daemon accept error"),
         }
@@ -204,7 +208,10 @@ pub fn run(sock: &Path) -> io::Result<()> {
 /// Serve one accepted connection on its own thread with a fresh backend, counting
 /// it against `active` for the idle watchdog. Generic over the stream type so the
 /// local UDS listener and the optional TCP listener share one path.
-fn spawn_serve<S>(stream: S, active: &Arc<AtomicUsize>)
+/// `guest_ram`: daemon-local mappings of the VM's guest RAM (from the RAM
+/// preamble) — installing them enables the ring transport + zero-copy GPA
+/// memcpys for this connection.
+fn spawn_serve<S>(stream: S, active: &Arc<AtomicUsize>, guest_ram: Option<Vec<(u64, u64, u64)>>)
 where
     S: std::io::Read + std::io::Write + Send + 'static,
 {
@@ -214,11 +221,120 @@ where
         .spawn(move || {
             let _guard = guard;
             let mut backend = make_backend();
+            if let Some(regions) = guest_ram {
+                tracing::info!(
+                    count = regions.len(),
+                    "guest-RAM mapped: zero-copy + rings enabled"
+                );
+                backend.set_guest_ram(regions);
+            }
             if let Err(e) = serve(stream, backend.as_mut()) {
                 tracing::debug!(error = %e, "CUDA daemon connection ended");
             }
         })
         .ok();
+}
+
+/// Consume a guest-RAM advertisement preamble if present (peek-based; absent on
+/// old proxies and non-memfd VMs). Maps the advertised regions of
+/// `/proc/<pid>/fd/<memfd>` MAP_SHARED into THIS process and returns them as
+/// `(gpa, daemon_va, len)` for `Backend::set_guest_ram`. Mappings are leaked
+/// (VM-lifetime; bounded by connections-with-adverts). Same-uid access only —
+/// exactly the trust boundary the daemon already has with its VMs.
+#[cfg(unix)]
+fn consume_ram_preamble(fd: std::os::unix::io::RawFd) -> Option<Vec<(u64, u64, u64)>> {
+    let mut hdr = [0u8; 20];
+    // SAFETY: MSG_PEEK of the fixed header on a valid fd; loops like
+    // peek_clone_token because proxied bytes can arrive in pieces.
+    let mut n: isize = 0;
+    for _ in 0..200 {
+        n = unsafe {
+            libc::recv(
+                fd,
+                hdr.as_mut_ptr() as *mut libc::c_void,
+                hdr.len(),
+                libc::MSG_PEEK,
+            )
+        };
+        if n >= 8 && &hdr[..8] != b"SMVGRAM2" {
+            return None; // not ours; leave the bytes untouched
+        }
+        if n >= 20 || n == 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    if n < 20 || &hdr[..8] != b"SMVGRAM2" {
+        return None;
+    }
+    let pid = u32::from_le_bytes(hdr[8..12].try_into().unwrap());
+    let count = u32::from_le_bytes(hdr[12..16].try_into().unwrap()) as usize;
+    if count == 0 || count > 64 {
+        return None;
+    }
+    let total = 20 + count * 28;
+    let mut buf = vec![0u8; total];
+    let mut got = 0usize;
+    while got < total {
+        // SAFETY: plain recv consuming the preamble we just validated.
+        let r = unsafe {
+            libc::recv(
+                fd,
+                buf[got..].as_mut_ptr() as *mut libc::c_void,
+                total - got,
+                0,
+            )
+        };
+        if r <= 0 {
+            return None;
+        }
+        got += r as usize;
+    }
+    // One memfd PER REGION (libkrun's layout): open each via /proc and map
+    // MAP_SHARED at the advertised offset.
+    let mut files: std::collections::HashMap<u32, std::fs::File> = std::collections::HashMap::new();
+    let mut regions = Vec::with_capacity(count);
+    for i in 0..count {
+        let o = 20 + i * 28;
+        let gpa = u64::from_le_bytes(buf[o..o + 8].try_into().unwrap());
+        let fd_no = u32::from_le_bytes(buf[o + 8..o + 12].try_into().unwrap());
+        let off = u64::from_le_bytes(buf[o + 12..o + 20].try_into().unwrap());
+        let len = u64::from_le_bytes(buf[o + 20..o + 28].try_into().unwrap());
+        if len == 0 || off % 4096 != 0 {
+            return None;
+        }
+        use std::os::unix::io::AsRawFd as _;
+        let file = match files.entry(fd_no) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(v) => {
+                let f = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(format!("/proc/{pid}/fd/{fd_no}"))
+                    .ok()?;
+                v.insert(f)
+            }
+        };
+        // SAFETY: MAP_SHARED of the VM's guest-RAM memfd at the advertised
+        // offset; failure aborts the whole advert. Mappings are leaked
+        // (VM-lifetime; bounded by connections that advertise).
+        let va = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                off as i64,
+            )
+        };
+        if va == libc::MAP_FAILED {
+            tracing::warn!(pid, fd_no, off, len, "guest-RAM mmap failed; sockets only");
+            return None;
+        }
+        regions.push((gpa, va as u64, len));
+    }
+    Some(regions)
 }
 
 /// Keeps the daemon's open-connection count accurate: +1 on construction, -1 on

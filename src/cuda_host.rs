@@ -177,12 +177,108 @@ fn proxy_to_daemon(guest: crate::platform::uds::UdsStream, addr: &str) -> std::i
         }
         Some(p)
     }
+    /// Guest-RAM advertisement for a SHARED daemon: when this VM's RAM is
+    /// memfd-backed (forkable machines), tell the daemon how to map the same
+    /// pages via `/proc/<pid>/fd/<memfd>` — magic + pid + fd + count +
+    /// (gpa, memfd offset, len)×count. With guest RAM visible, the daemon can
+    /// establish the shared-memory ring transport and zero-copy GPA memcpys
+    /// instead of per-call socket framing. `None` (silently) when RAM isn't
+    /// memfd-backed or the layout can't be resolved — sockets still work.
+    #[cfg(target_os = "linux")]
+    fn guest_ram_advert() -> Option<Vec<u8>> {
+        if std::env::var_os("SMOLVM_CUDA_NO_RAM_ADVERT").is_some() {
+            return None;
+        }
+        let regions = GUEST_RAM.get().and_then(|f| f())?; // (gpa, host_va, len)
+        if regions.is_empty() {
+            return None;
+        }
+        // memfd-backed mappings of this process: match each guest region's
+        // host VA into a maps entry, then express it as a file offset.
+        let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
+        let mut memfd_maps: Vec<(u64, u64, u64, u64)> = Vec::new(); // start,end,file_off,inode
+        for l in maps.lines() {
+            if !l.contains("memfd:") {
+                continue;
+            }
+            let mut f = l.split_whitespace();
+            let range = f.next()?;
+            let perms = f.next()?;
+            // MAP_SHARED only: a fork CLONE maps the golden's memfd
+            // MAP_PRIVATE (COW) — its live pages have diverged from the file,
+            // so advertising the memfd would hand the daemon STALE golden
+            // bytes. Private mappings are excluded; clones stay socket-mode.
+            if perms.as_bytes().get(3) != Some(&b's') {
+                continue;
+            }
+            let off = u64::from_str_radix(f.next()?, 16).ok()?;
+            let _dev = f.next()?;
+            let inode: u64 = f.next()?.parse().ok()?;
+            let (s, e) = range.split_once('-')?;
+            memfd_maps.push((
+                u64::from_str_radix(s, 16).ok()?,
+                u64::from_str_radix(e, 16).ok()?,
+                off,
+                inode,
+            ));
+        }
+        if memfd_maps.is_empty() {
+            return None;
+        }
+        // libkrun backs guest RAM with ONE MEMFD PER REGION — build an
+        // inode→fd table and express each region as (gpa, fd, offset, len).
+        let mut inode_to_fd: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+        for e in std::fs::read_dir("/proc/self/fd").ok()? {
+            let e = e.ok()?;
+            let is_memfd = std::fs::read_link(e.path())
+                .ok()
+                .and_then(|l| l.to_str().map(|s| s.contains("memfd:")))
+                .unwrap_or(false);
+            if !is_memfd {
+                continue;
+            }
+            if let Ok(md) = std::fs::metadata(e.path()) {
+                use std::os::unix::fs::MetadataExt as _;
+                if let Some(n) = e.file_name().to_str().and_then(|s| s.parse().ok()) {
+                    inode_to_fd.entry(md.ino()).or_insert(n);
+                }
+            }
+        }
+        let mut quads: Vec<(u64, u32, u64, u64)> = Vec::new();
+        for &(gpa, hva, len) in &regions {
+            let m = memfd_maps
+                .iter()
+                .find(|&&(s, e, _, _)| hva >= s && hva + len <= e)?;
+            let fd_no = *inode_to_fd.get(&m.3)?;
+            quads.push((gpa, fd_no, m.2 + (hva - m.0), len));
+        }
+        let mut p = Vec::with_capacity(20 + quads.len() * 28);
+        p.extend_from_slice(b"SMVGRAM2");
+        p.extend_from_slice(&(std::process::id()).to_le_bytes());
+        p.extend_from_slice(&(quads.len() as u32).to_le_bytes());
+        p.extend_from_slice(&[0u8; 4]); // reserved
+        for (gpa, fd_no, off, len) in quads {
+            p.extend_from_slice(&gpa.to_le_bytes());
+            p.extend_from_slice(&fd_no.to_le_bytes());
+            p.extend_from_slice(&off.to_le_bytes());
+            p.extend_from_slice(&len.to_le_bytes());
+        }
+        Some(p)
+    }
+    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn guest_ram_advert() -> Option<Vec<u8>> {
+        None
+    }
     // A path (managed daemon) → unix socket; otherwise host:port → TCP.
     if addr.starts_with('/') {
         #[cfg(unix)]
         {
             use std::io::Write as _;
             let mut daemon = std::os::unix::net::UnixStream::connect(addr)?;
+            if let Some(a) = guest_ram_advert() {
+                daemon.write_all(&a)?;
+            }
             if let Some(p) = preamble() {
                 daemon.write_all(&p)?;
             }

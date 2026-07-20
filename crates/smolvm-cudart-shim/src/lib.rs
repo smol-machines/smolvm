@@ -2184,7 +2184,18 @@ pub extern "C" fn cudaPointerGetAttributes(attr: *mut c_void, ptr: *const c_void
     // unregistered, and PyTorch's `is_pinned()` relies on that: reporting Host
     // for arbitrary pointers made `pin_memory()` a silent no-op, so pinned
     // transfers never reached the zero-copy path.
-    let is_dev = with_state(|s| Ok(dev_contains(&s.dev_allocs, ptr as u64))).unwrap_or(false);
+    let is_dev = with_state(|s| Ok(dev_contains(&s.dev_allocs, ptr as u64))).unwrap_or(false)
+        // Driver-VMM allocations (torch expandable_segments) never enter this
+        // shim's tables — ask the server, which knows every session range
+        // (LibCall 6/2 → [2] iff device). Without this, CUDA-graph capture
+        // (vLLM `weak_ref_tensor`) saw device tensors as "unregistered host".
+        || with_state(|s| {
+            Ok(s.client
+                .lib_call(6, 2, (ptr as u64).to_le_bytes().to_vec())
+                .map(|(st, out)| st == 0 && out.first() == Some(&2))
+                .unwrap_or(false))
+        })
+        .unwrap_or(false);
     let is_pinned_host = !is_dev
         && (guestmem::is_pinned(ptr as usize)
             || shm_offset(ptr).is_some()
