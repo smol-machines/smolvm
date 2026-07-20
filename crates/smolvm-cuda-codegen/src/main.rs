@@ -604,7 +604,40 @@ fn gen_guest(lib: &Lib) -> String {
         lib.name, lib.id
     );
     let _ = writeln!(s, "const LIB_ID: u8 = {};", lib.id);
+    // Guest-cached cuBLAS math mode: torch queries cublasGetMathMode before
+    // essentially every GEMM (~1,550×/training step). Each was a VM-boundary
+    // sync round-trip (~39% of ALL sync ops) for a value that only changes on
+    // cublasSetMathMode. Cache it guest-side: set fires-and-forgets AND stores;
+    // get answers from the store with zero round-trip.
+    if lib.name == "cublas" {
+        let _ = writeln!(
+            s,
+            "static MATH_MODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);"
+        );
+    }
     for (idx, f) in lib.funcs.iter().enumerate() {
+        if f.sym == "cublasGetMathMode" {
+            let _ = writeln!(
+                s,
+                "#[no_mangle]\npub extern \"C\" fn cublasGetMathMode(_handle: *mut c_void, mode: *mut c_int) -> c_int {{\n    \
+                 if mode.is_null() {{ return 1; }}\n    \
+                 // guest-cached — no round-trip (see MATH_MODE).\n    \
+                 unsafe {{ *mode = MATH_MODE.load(std::sync::atomic::Ordering::Relaxed); }}\n    0\n}}"
+            );
+            continue;
+        }
+        if f.sym == "cublasSetMathMode" {
+            let _ = writeln!(
+                s,
+                "#[no_mangle]\npub extern \"C\" fn cublasSetMathMode(handle: *mut c_void, mode: c_int) -> c_int {{\n    \
+                 MATH_MODE.store(mode as i32, std::sync::atomic::Ordering::Relaxed);\n    \
+                 let mut a: Vec<u8> = Vec::new();\n    \
+                 a.extend_from_slice(&(handle as u64).to_le_bytes());\n    \
+                 a.extend_from_slice(&(mode as i32).to_le_bytes());\n    \
+                 match with_client(|c| c.lib_call_deferred(LIB_ID, {idx}, a)) {{ Ok(()) => 0, Err(e) => {{ super::lib_err_trace(LIB_ID, {idx}, e); 1 }} }}\n}}"
+            );
+            continue;
+        }
         if is_create(f) {
             // out-handle create: no args in; returns a handle (u64) in `out`.
             let _ = writeln!(
