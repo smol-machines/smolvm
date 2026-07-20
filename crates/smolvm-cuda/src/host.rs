@@ -305,6 +305,13 @@ pub trait Backend: Send {
     fn mem_set_access(&mut self, _va: u64, _size: u64, _device: i32) -> CuResult<()> {
         Err(CUDA_ERROR_NOT_SUPPORTED)
     }
+    /// Like `mem_set_access` but READ-ONLY (CU_MEM_ACCESS_FLAGS_PROT_READ). Used
+    /// for `--share-weights` clones so a kernel that writes the shared frozen
+    /// base faults loudly instead of silently corrupting every sibling clone
+    /// that maps the same physical (the N>=3 concurrent-training nan).
+    fn mem_set_access_ro(&mut self, _va: u64, _size: u64, _device: i32) -> CuResult<()> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
     fn mem_unmap(&mut self, _va: u64, _size: u64) -> CuResult<()> {
         Err(CUDA_ERROR_NOT_SUPPORTED)
     }

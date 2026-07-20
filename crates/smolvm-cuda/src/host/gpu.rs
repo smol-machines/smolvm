@@ -802,6 +802,15 @@ impl Backend for GpuBackend {
         };
         unsafe { chk(f(va, size as usize, &desc, 1)) }
     }
+    fn mem_set_access_ro(&mut self, va: u64, size: u64, device: i32) -> CuResult<()> {
+        let f = self.vmm_set_access.ok_or(super::CUDA_ERROR_NOT_SUPPORTED)?;
+        let desc = VmmAccessDesc {
+            location_type: 1,
+            location_id: device,
+            flags: 1, // CU_MEM_ACCESS_FLAGS_PROT_READ
+        };
+        unsafe { chk(f(va, size as usize, &desc, 1)) }
+    }
     fn mem_unmap(&mut self, va: u64, size: u64) -> CuResult<()> {
         let f = self.vmm_unmap.ok_or(super::CUDA_ERROR_NOT_SUPPORTED)?;
         unsafe { chk(f(va, size as usize)) }

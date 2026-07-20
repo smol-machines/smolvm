@@ -679,7 +679,23 @@ fn reconstruct_golden_memory(
             let mut ok = false;
             if let Ok(gh) = import_with_retry(b, 4 + idx) {
                 if b.mem_map(va, size, 0, gh).is_ok() {
-                    if b.mem_set_access(va, size, device).is_ok() {
+                    // Sharing the golden's frozen base READ-WRITE across clones
+                    // is only correct when the base is never written post-fork.
+                    // Unsloth writes the embedding via a KERNEL (undetectable by
+                    // the COW path, which only catches explicit mem ops), so at
+                    // N>=3 concurrent clones those writes race on the shared
+                    // physical and corrupt every sibling (loss=nan). Copy-mode
+                    // (the DEFAULT, no --share-weights) is correct at all N.
+                    // SMOLVM_CUDA_SHARE_RO=1 maps read-only so a base write
+                    // faults loudly instead of corrupting silently (diagnostic;
+                    // currently SIGSEGVs on base-writing workloads — the proper
+                    // fix is to private-copy only the written ranges).
+                    let set = if std::env::var("SMOLVM_CUDA_SHARE_RO").as_deref() == Ok("1") {
+                        b.mem_set_access_ro(va, size, device)
+                    } else {
+                        b.mem_set_access(va, size, device)
+                    };
+                    if set.is_ok() {
                         ok = true;
                     } else {
                         let _ = b.mem_unmap(va, size); // roll back for the fallback
