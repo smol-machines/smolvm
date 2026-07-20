@@ -812,3 +812,21 @@ can't be batched. Sync-op breakdown via SMOLVM_CUDA_COUNT_SYNC in progress
 to find the dominant sync to cut. The big structural lever (clone rings,
 shared-memory transport) stays libkrun-blocked (P2b); near-term levers are
 reducing sync count + dropping the per-VM proxy hop.
+
+## 2026-07-20 — DAX mappings DO NOT survive fork (verified locally, 3070)
+
+Reproduced on the 3070 (val_dax_inherit.sh): a golden mmaps a file on a DAX
+virtiofs mount, writes to it in a loop; the loop continues in the clone after
+fork. Golden heartbeat advances (99→199, mapping live); post-fork the clone's
+writes via the SAME inherited mapping STOP (199→199) and the clone SIGSEGVs.
+Touching an inherited-then-DAX page in the clone faults.
+
+**Implication:** DAX is FRESH-MMAP-ONLY across fork. Safe for the clone ring
+files (freshly mmap'd on fork-detect — that's why file-rings work). UNSAFE for
+any mount the clone reads via mappings inherited from the golden — including a
+DAX venv mount (torch .so pages) or a DAX model mount (safetensors mmap). This
+was the H100 `SMOLVM_MOUNT_DAX=1` training `done=0`: clone .so/safetensors
+pages died on resume. `SMOLVM_MOUNT_DAX` stays OPT-IN/default-off; the load-hang
+fix is non-DAX (page-cache warm now; block-disk model staging is the durable
+fix). LESSON: verify VMM/fork behavior on the local 3070 before spending remote
+H100 time — this took 5 min locally vs multiple H100 runs.
