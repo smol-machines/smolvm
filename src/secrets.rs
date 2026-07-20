@@ -59,6 +59,10 @@ enum FileSourceError {
     Symlink,
     /// File size exceeded the per-call cap.
     TooLarge,
+    /// The path is not a regular file (FIFO, device, socket, directory).
+    /// Reading such a source can block indefinitely or return unbounded /
+    /// meaningless data, so a secret must come from a real file.
+    NotRegular,
     /// Any other I/O failure (missing, permission denied, non-UTF-8
     /// content, etc.). The inner error is available for callers that
     /// want to log it; classifiers treat this as `FileReadFailed`.
@@ -74,6 +78,7 @@ impl std::fmt::Display for FileSourceError {
                  (store the canonicalized target instead)"
             ),
             Self::TooLarge => write!(f, "file size exceeds maximum"),
+            Self::NotRegular => write!(f, "from_file path is not a regular file"),
             Self::Io(e) => write!(f, "{}", e),
         }
     }
@@ -122,7 +127,11 @@ fn read_from_file_source(path: &std::path::Path) -> std::result::Result<String, 
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW);
+        // O_NOFOLLOW refuses a symlink leaf atomically. O_NONBLOCK ensures the
+        // open of a FIFO (or a slow device) returns immediately instead of
+        // blocking forever waiting for a writer — the regular-file check below
+        // then rejects it. Regular files ignore O_NONBLOCK on read.
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     let f = opts.open(path).map_err(|e| {
         // O_NOFOLLOW on a symlink leaf fails with ELOOP — surface it as the
@@ -133,6 +142,11 @@ fn read_from_file_source(path: &std::path::Path) -> std::result::Result<String, 
         }
         FileSourceError::Io(e)
     })?;
+    // Reject anything that isn't a regular file (FIFO, device, socket, dir).
+    // fstat is on the fd we already hold, so there is no re-resolution window.
+    if !f.metadata()?.file_type().is_file() {
+        return Err(FileSourceError::NotRegular);
+    }
     read_file_bounded(f, MAX_FROM_FILE_BYTES)
 }
 
@@ -142,7 +156,9 @@ fn read_from_file_source(path: &std::path::Path) -> std::result::Result<String, 
 fn classify_file_source_error(e: FileSourceError) -> ResolutionFailure {
     match e {
         FileSourceError::TooLarge => ResolutionFailure::FileTooLarge,
-        FileSourceError::Symlink | FileSourceError::Io(_) => ResolutionFailure::FileReadFailed,
+        FileSourceError::Symlink | FileSourceError::NotRegular | FileSourceError::Io(_) => {
+            ResolutionFailure::FileReadFailed
+        }
     }
 }
 
@@ -608,6 +624,21 @@ mod tests {
             &*resolve_secret_ref("FILE_SECRET", &r, ResolutionScope::TrustedLocal).unwrap(),
             "hunter2"
         );
+    }
+
+    // A from_file pointing at a FIFO must return a clean error, not block
+    // forever opening a writer-less FIFO. This test completing is itself the
+    // no-hang proof (a broken resolver would never return here).
+    #[cfg(unix)]
+    #[test]
+    fn file_ref_at_fifo_errors_without_hanging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("fifo");
+        let c = std::ffi::CString::new(p.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo failed");
+        let r = file_ref_for(&p);
+        let res = resolve_secret_ref_classified("FIFO", &r, ResolutionScope::TrustedLocal);
+        assert_eq!(res.err(), Some(ResolutionFailure::FileReadFailed));
     }
 
     #[test]
