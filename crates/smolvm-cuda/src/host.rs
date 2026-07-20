@@ -1144,6 +1144,22 @@ fn xlat_mod(b: &mut dyn Backend, golden: u64) -> u64 {
     if let Some(w) = MOD_TRANS.with(|m| m.borrow().get(&golden).copied()) {
         return w;
     }
+    // Process-global registry: a module some OTHER thread already reloaded
+    // (pre-warm on the resume thread, or a sibling channel's lazy load) is
+    // reused, not loaded again — CUmodule handles are context-wide; only the
+    // mapping was thread-local, which silently duplicated every module per
+    // serve thread that touched it.
+    if let Some(w) = MOD_TRANS_GLOBAL
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(&golden).copied())
+    {
+        MOD_TRANS.with(|m| {
+            m.borrow_mut().insert(golden, w);
+        });
+        return w;
+    }
     let Some(mut image) = MOD_IMAGES.with(|m| m.borrow().get(&golden).cloned()) else {
         return golden;
     };
@@ -1162,6 +1178,11 @@ fn xlat_mod(b: &mut dyn Backend, golden: u64) -> u64 {
             MOD_TRANS.with(|m| {
                 m.borrow_mut().insert(golden, w);
             });
+            MOD_TRANS_GLOBAL
+                .lock()
+                .unwrap()
+                .get_or_insert_with(HashMap::new)
+                .insert(golden, w);
             w
         }
         Err(e) => {
@@ -2092,6 +2113,41 @@ fn is_capturable(req: &Request) -> bool {
     )
 }
 
+/// P3b: execs this worker process has already re-captured, keyed by the
+/// inherited exec vhandle. Clone workers serve several sessions (one per
+/// guest channel) that each adopt the same oplogs at resume — the registry
+/// makes the re-capture happen once per process, with later sessions just
+/// adopting the finished exec.
+static REPLAYED_EXECS: std::sync::Mutex<Option<HashMap<u64, u64>>> = std::sync::Mutex::new(None);
+
+/// Process-global golden-module → reloaded-module map (see `xlat_mod`). Safe
+/// as a process global: golden handles are raw host pointers (unique), and a
+/// clone worker owns exactly one CUDA context.
+static MOD_TRANS_GLOBAL: std::sync::Mutex<Option<HashMap<u64, u64>>> = std::sync::Mutex::new(None);
+
+fn replayed_exec_get(exec_vh: u64) -> Option<u64> {
+    REPLAYED_EXECS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(&exec_vh).copied())
+}
+
+fn replayed_exec_put(exec_vh: u64, exec: u64) {
+    REPLAYED_EXECS
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .insert(exec_vh, exec);
+}
+
+/// P3b: adopt a finished re-capture into this session so `raw_graph` resolves
+/// the inherited vhandle to the clone-owned exec from now on.
+fn adopt_replayed_exec(sess: &mut Session, exec_vh: u64, exec: u64) {
+    sess.graph_vhandles.lock().unwrap().insert(exec_vh, exec);
+    sess.owned_graph_reals.insert(exec);
+}
+
 /// P3b: rebuild an inherited graph by RE-CAPTURING its recorded op sequence in
 /// this clone's context. Begins capture on the clone's remapped copy of the
 /// golden's capture stream, re-dispatches each recorded op (so `dispatch`'s
@@ -2521,6 +2577,63 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                     "[cuda-fork-isolate] clone resumed token {parent}: {copied} private copies \
                      ({cbytes} B), {shared} shared read-only ({sbytes} B)"
                 );
+                // P3b PRE-WARM (opt out: SMOLVM_CUDA_PREREPLAY=0). Two stages,
+                // both moving one-time clone costs off the first-request path:
+                // (1) eagerly reload every staged golden module — first-touch
+                // kernel launches (prefill, eager ops) stop paying per-module
+                // reload stalls; (2) re-capture every inherited graph now
+                // rather than lazily at first launch. Failures are left for
+                // the lazy paths to retry; later sessions adopt from the
+                // registry.
+                if std::env::var("SMOLVM_CUDA_PREREPLAY").as_deref() != Ok("0") {
+                    let mods: Vec<u64> = MOD_IMAGES.with(|m| m.borrow().keys().copied().collect());
+                    if !mods.is_empty() {
+                        let t0 = std::time::Instant::now();
+                        let mut loaded = 0u32;
+                        for g in mods {
+                            if xlat_mod(b, g) != g {
+                                loaded += 1;
+                            }
+                        }
+                        eprintln!(
+                            "[p3b] pre-warm: {loaded} module(s) ready in {} ms",
+                            t0.elapsed().as_millis()
+                        );
+                    }
+                }
+                if !sess.clone_graph_oplogs.is_empty()
+                    && std::env::var("SMOLVM_CUDA_PREREPLAY").as_deref() != Ok("0")
+                {
+                    let t0 = std::time::Instant::now();
+                    let execs: Vec<u64> = sess.clone_graph_oplogs.keys().copied().collect();
+                    let (mut fresh, mut adopted, mut deferred) = (0u32, 0u32, 0u32);
+                    for exec_vh in execs {
+                        if let Some(exec) = replayed_exec_get(exec_vh) {
+                            adopt_replayed_exec(sess, exec_vh, exec);
+                            adopted += 1;
+                            continue;
+                        }
+                        match replay_capture_graph(sess, b, exec_vh) {
+                            Ok(exec) => {
+                                replayed_exec_put(exec_vh, exec);
+                                adopt_replayed_exec(sess, exec_vh, exec);
+                                fresh += 1;
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[p3b] pre-replay exec {exec_vh:#x} failed st={e}; \
+                                     left for lazy retry"
+                                );
+                                deferred += 1;
+                            }
+                        }
+                    }
+                    eprintln!(
+                        "[p3b] pre-replay: {fresh} re-captured, {adopted} adopted, \
+                         {deferred} deferred in {} ms",
+                        t0.elapsed().as_millis()
+                    );
+                }
                 if std::env::var_os("SMOLVM_CUDA_GRAPH_DEBUG").is_some() {
                     // Scan the copied buffers for 8-byte values that fall inside a
                     // golden allocation range: those are DEVICE-STORED POINTERS that
@@ -2787,20 +2900,25 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             // handle through the normal dispatch path) instead of rebuilding
             // nodes — the only path that reproduces cuBLAS-kernel and non-kernel
             // graph nodes. Built once, then launched like a clone-owned graph.
-            // ONLY for COPY-mode isolation (dptr_trans non-empty): a VMM /
-            // share-weights clone reconstructs memory at the golden's exact VAs,
-            // so the inherited graph is valid verbatim and re-capture would only
-            // add risk (and re-issuing cuBLAS mid-replay can poison the handle).
+            // Normally satisfied by pre-replay at resume; this is the lazy
+            // fallback (and retry path for deferred pre-replays).
             if clone_graph_replay_enabled()
                 && !sess
                     .owned_graph_reals
                     .contains(&raw_graph(sess, graph_exec))
                 && sess.clone_graph_oplogs.contains_key(&graph_exec)
             {
+                // Another session in this worker may have re-captured already
+                // (pre-replay at resume, or its own lazy launch) — adopt.
+                if let Some(exec) = replayed_exec_get(graph_exec) {
+                    adopt_replayed_exec(sess, graph_exec, exec);
+                    let raw = raw_stream(sess, stream)?;
+                    return b.graph_launch(exec, raw).map(|_| Response::Ok);
+                }
                 match replay_capture_graph(sess, b, graph_exec) {
                     Ok(exec) => {
-                        sess.graph_vhandles.lock().unwrap().insert(graph_exec, exec);
-                        sess.owned_graph_reals.insert(exec);
+                        replayed_exec_put(graph_exec, exec);
+                        adopt_replayed_exec(sess, graph_exec, exec);
                         let raw = raw_stream(sess, stream)?;
                         return b.graph_launch(exec, raw).map(|_| Response::Ok);
                     }
