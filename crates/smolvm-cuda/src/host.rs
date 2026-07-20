@@ -406,6 +406,18 @@ struct Session {
     /// exec (real) with node pointers translated to its private copies. Freed via
     /// `owned_graph_reals` on teardown. Empty for non-isolating sessions.
     clone_graph_execs: HashMap<u64, u64>,
+    /// P3b capture-replay recording. `Some((capture stream vh, recorded op
+    /// payloads))` while a stream capture is active on this session. Every
+    /// capturable op (kernel launch, library call, async memset/memcpy, event
+    /// op) issued during the window is recorded verbatim (wire bytes) so a
+    /// clone can RE-CAPTURE the same sequence in its own context — the robust
+    /// alternative to node-by-node graph rebuild, which can't reconstruct
+    /// library-API (cuBLAS) kernels or non-kernel nodes.
+    capture_rec: Option<(u64, Vec<Vec<u8>>)>,
+    /// Worker-side (clone) inherited capture-replay logs, keyed by the golden's
+    /// exec vhandle: the ordered op payloads to re-capture on first launch.
+    /// Drained from the layout at clone resume.
+    clone_graph_oplogs: HashMap<u64, Vec<Vec<u8>>>,
 }
 
 /// Free everything a finished connection still owns. Failures are ignored —
@@ -598,6 +610,17 @@ fn graph_patch_enabled() -> bool {
     )
 }
 
+/// P3b capture-replay (WIP): record the golden's capture-window ops and
+/// re-capture them in a clone. OFF by default — the shipped clone path is
+/// eager (enforce_eager), which works; graph clones are experimental. A
+/// worker-process clone can't launch the golden's exec verbatim (the
+/// CUgraphExec is process-local), so this is the eventual mechanism, but
+/// re-issuing cuBLAS under capture in the clone still needs work (handle
+/// initialization state under `cuStreamBeginCapture`).
+fn clone_graph_replay_enabled() -> bool {
+    std::env::var_os("SMOLVM_CUDA_CLONE_GRAPH_REPLAY").is_some()
+}
+
 /// Diagnostic: patch the golden's exec IN PLACE instead of re-instantiating, to
 /// tell whether the re-instantiation or the patching is what breaks graph mode.
 /// Single-clone only (mutates the shared exec).
@@ -688,6 +711,15 @@ struct GoldenLayout {
     /// rebuilds the graph in its own context and maps both virtual handles to
     /// its rebuilt reals, so the clone's inherited `GraphLaunch` resolves.
     graphs: Vec<(u64, u64, GraphSer)>,
+    /// P3b: capture-replay op-logs, `(graph_vh, exec_vh, ordered op payloads)`.
+    /// The worker re-captures the recorded ops in its own context instead of
+    /// rebuilding nodes — the only path that reproduces cuBLAS-kernel and
+    /// non-kernel graph nodes. Preferred over `graphs` when present for an exec.
+    graph_oplogs: Vec<(u64, u64, Vec<Vec<u8>>)>,
+    /// P3b: capture recordings finished (EndCapture) but not yet instantiated,
+    /// keyed by graph_vh; moved into `graph_oplogs` with the exec_vh at
+    /// GraphInstantiate.
+    pending_oplogs: HashMap<u64, Vec<Vec<u8>>>,
     /// Top-level library handles (cuBLAS/cuBLASLt/cuDNN contexts) the golden
     /// created, as `(lib, func, guest handle value, create args)`. Library
     /// handles are process-local; a clone worker replays each create in ITS
@@ -892,6 +924,39 @@ pub fn module_handoff_snapshot(
     let graphs = g.graphs.clone();
     let lib_handles = g.lib_handles.clone();
     Some((modules, funcs, streams, events, graphs, lib_handles))
+}
+
+/// P3b: capture-replay op-logs, `(graph_vh, exec_vh, ordered op payloads)`.
+type GraphOplogs = Vec<(u64, u64, Vec<Vec<u8>>)>;
+
+/// P3b: snapshot the golden's capture-replay op-logs for a clone worker,
+/// `(graph_vh, exec_vh, ordered op payloads)`. Separate from
+/// [`module_handoff_snapshot`] so its 6-tuple stays stable.
+pub fn graph_oplogs_snapshot(token: u64) -> GraphOplogs {
+    let reg = LAYOUT_HANDOFF.lock().unwrap();
+    match reg
+        .as_ref()
+        .and_then(|r| r.get(&token))
+        .and_then(|w| w.upgrade())
+    {
+        Some(l) => l.lock().unwrap().graph_oplogs.clone(),
+        None => Vec::new(),
+    }
+}
+
+/// P3b worker: install inherited capture-replay logs for this clone. Drained
+/// into the serving session at clone resume; replayed lazily at first launch.
+pub fn set_worker_graph_oplogs(v: GraphOplogs) {
+    WORKER_GRAPH_OPLOGS.with(|r| *r.borrow_mut() = v);
+}
+
+thread_local! {
+    static WORKER_GRAPH_OPLOGS: std::cell::RefCell<GraphOplogs> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn take_worker_graph_oplogs() -> GraphOplogs {
+    WORKER_GRAPH_OPLOGS.with(|r| std::mem::take(&mut *r.borrow_mut()))
 }
 
 /// Replay the golden's top-level library-handle creates in THIS worker's
@@ -1989,7 +2054,74 @@ fn optrace_write(line: &str, status: i32) {
     }
 }
 
+/// P3b: which requests belong INSIDE a capture window and must be recorded for
+/// clone re-capture. Work-issuing ops only — handle bookkeeping (create/destroy)
+/// and queries stay out of the graph. `CublasSetStream` is included so a
+/// replayed GEMM lands on the re-capture stream.
+fn is_capturable(req: &Request) -> bool {
+    matches!(
+        req,
+        Request::LaunchKernel { .. }
+            | Request::LibCall { .. }
+            | Request::MemsetD8Async { .. }
+            | Request::MemcpyDtoDAsync { .. }
+            | Request::EventRecord { .. }
+            | Request::StreamWaitEvent { .. }
+    )
+}
+
+/// P3b: rebuild an inherited graph by RE-CAPTURING its recorded op sequence in
+/// this clone's context. Begins capture on the clone's remapped copy of the
+/// golden's capture stream, re-dispatches each recorded op (so `dispatch`'s
+/// pointer/handle translation applies verbatim), ends capture, and instantiates.
+/// Returns the clone-owned exec. Errors bubble so the caller can fall back.
+fn replay_capture_graph(sess: &mut Session, b: &mut dyn Backend, exec_vh: u64) -> CuResult<u64> {
+    let ops = sess
+        .clone_graph_oplogs
+        .get(&exec_vh)
+        .cloned()
+        .ok_or(CUDA_ERROR_INVALID_HANDLE)?;
+    // The capture stream is whatever the recorded kernel launches target; scan
+    // for the first LaunchKernel and translate its (golden) stream vhandle.
+    let mut cap_stream_vh = 0u64;
+    for op in &ops {
+        if let Ok(Request::LaunchKernel { stream, .. }) = crate::proto::decode_request(op) {
+            cap_stream_vh = stream;
+            break;
+        }
+    }
+    let raw_cap = match cap_stream_vh {
+        0 => 0,
+        s => xlat_stream(sess.streams.get(&s).copied().unwrap_or(s)),
+    };
+    // RELAXED (2): the re-issued library calls may touch capture-unsafe APIs.
+    b.stream_begin_capture(raw_cap, 2)?;
+    for op in &ops {
+        let req = crate::proto::decode_request(op).map_err(|_| CUDA_ERROR_INVALID_HANDLE)?;
+        let (st, _) = dispatch(sess, b, req);
+        if st != 0 {
+            // Abort the capture cleanly before bubbling — a dangling capture
+            // poisons the stream for every later op.
+            let _ = b.stream_end_capture(raw_cap);
+            return Err(st);
+        }
+    }
+    let graph = b.stream_end_capture(raw_cap)?;
+    let exec = b.graph_instantiate(graph)?;
+    let _ = b.graph_destroy(graph); // the exec is what we launch; graph is scratch
+    Ok(exec)
+}
+
 fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Response) {
+    // P3b capture-replay recording: while a capture is active on this session,
+    // append each capturable op's wire bytes so a clone can re-capture the same
+    // sequence in its own context (see StreamBeginCapture / GraphInstantiate).
+    if sess.capture_rec.is_some() && is_capturable(&req) {
+        let bytes = crate::proto::encode_request(&req);
+        if let Some((_, log)) = sess.capture_rec.as_mut() {
+            log.push(bytes);
+        }
+    }
     // P0 transport-viability: count every RPC; optionally inject per-call latency
     // to model network RTT, and periodically log the count vs wall-clock so
     // calls/sec (and thus calls-per-token) can be derived.
@@ -2243,6 +2375,11 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                     cbytes += size;
                 }
                 gpu::set_lib_trans(&sess.dptr_trans); // forwarded-lib pointer map
+                                                      // P3b: adopt inherited capture-replay logs, keyed by exec_vh —
+                                                      // replayed lazily at the clone's first GraphLaunch.
+                for (_graph_vh, exec_vh, ops) in take_worker_graph_oplogs() {
+                    sess.clone_graph_oplogs.insert(exec_vh, ops);
+                }
                 eprintln!(
                     "[cuda-fork-isolate] clone resumed token {parent}: {copied} private copies \
                      ({cbytes} B), {shared} shared read-only ({sbytes} B)"
@@ -2432,6 +2569,12 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         }),
         Request::StreamBeginCapture { stream, mode } => {
             let raw = raw_stream(sess, stream)?;
+            // P3b: start recording capturable ops for clone re-capture. Only the
+            // golden records (path3 enabled, not itself a clone); a clone that
+            // captures its own graph needs no replay log.
+            if clone_graph_replay_enabled() && path3_enabled() && sess.dptr_trans.is_empty() {
+                sess.capture_rec = Some((stream, Vec::new()));
+            }
             b.stream_begin_capture(raw, mode).map(|_| Response::Ok)
         }
         Request::ThreadExchangeCaptureMode { mode } => {
@@ -2443,6 +2586,17 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             if graph_vh & VHANDLE_TAG != 0 {
                 sess.graph_vhandles.lock().unwrap().insert(graph_vh, g);
                 sess.owned_graph_reals.insert(g);
+            }
+            // P3b: park the recorded op-log under graph_vh until GraphInstantiate
+            // associates it with an exec_vh (what the clone launches).
+            if let Some((_, log)) = sess.capture_rec.take() {
+                if !log.is_empty() {
+                    sess.golden_layout
+                        .lock()
+                        .unwrap()
+                        .pending_oplogs
+                        .insert(graph_vh, log);
+                }
             }
             Ok(Response::Handle(g))
         }
@@ -2464,12 +2618,16 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             // returns None and simply isn't recorded (the clone then fails loud
             // on launch rather than mis-executing an unsupported graph).
             if path3_enabled() {
+                let mut layout = sess.golden_layout.lock().unwrap();
+                // P3b preferred: promote the parked capture-replay log (keyed by
+                // graph_vh) to a `(graph_vh, exec_vh, log)` entry.
+                if let Some(log) = layout.pending_oplogs.remove(&graph) {
+                    layout.graph_oplogs.push((graph, exec_vh, log));
+                }
+                // Node-rebuild fallback (kernel-only graphs): kept for clones
+                // whose exec has no oplog.
                 if let Ok(Some(ser)) = b.graph_introspect(real_graph) {
-                    sess.golden_layout
-                        .lock()
-                        .unwrap()
-                        .graphs
-                        .push((graph, exec_vh, ser));
+                    layout.graphs.push((graph, exec_vh, ser));
                 }
             }
             if exec_vh & VHANDLE_TAG != 0 {
@@ -2479,6 +2637,37 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             Ok(Response::Handle(e))
         }
         Request::GraphLaunch { graph_exec, stream } => {
+            // P3b: an inherited exec with a capture-replay log re-captures the
+            // recorded ops in THIS clone's context (translating every pointer /
+            // handle through the normal dispatch path) instead of rebuilding
+            // nodes — the only path that reproduces cuBLAS-kernel and non-kernel
+            // graph nodes. Built once, then launched like a clone-owned graph.
+            // ONLY for COPY-mode isolation (dptr_trans non-empty): a VMM /
+            // share-weights clone reconstructs memory at the golden's exact VAs,
+            // so the inherited graph is valid verbatim and re-capture would only
+            // add risk (and re-issuing cuBLAS mid-replay can poison the handle).
+            if clone_graph_replay_enabled()
+                && !sess
+                    .owned_graph_reals
+                    .contains(&raw_graph(sess, graph_exec))
+                && sess.clone_graph_oplogs.contains_key(&graph_exec)
+            {
+                match replay_capture_graph(sess, b, graph_exec) {
+                    Ok(exec) => {
+                        sess.graph_vhandles.lock().unwrap().insert(graph_exec, exec);
+                        sess.owned_graph_reals.insert(exec);
+                        let raw = raw_stream(sess, stream)?;
+                        return b.graph_launch(exec, raw).map(|_| Response::Ok);
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[p3b] capture-replay failed for exec {graph_exec:#x}: e={e}; \
+                                   falling back to node rebuild"
+                        );
+                        // fall through to the node-rebuild / patch paths below
+                    }
+                }
+            }
             let real = raw_graph(sess, graph_exec);
             // Fork isolation + an INHERITED cudagraph: the graph baked in the
             // golden's device addresses at capture time, so replaying it verbatim

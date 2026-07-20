@@ -1022,12 +1022,35 @@ fn reconstruct_golden_modules(
             lib_handles.push((lib, func, h, args));
         }
     }
+    // P3b: capture-replay op-logs (absent in older blobs). Installed into a
+    // thread-local for the serving session to drain and replay lazily.
+    let mut noplogs = 0usize;
+    if p < buf.len() {
+        let ng = ru32!();
+        let mut oplogs: Vec<(u64, u64, Vec<Vec<u8>>)> = Vec::with_capacity(ng as usize);
+        for _ in 0..ng {
+            let graph_vh = ru64!();
+            let exec_vh = ru64!();
+            let nops = ru32!();
+            let mut ops = Vec::with_capacity(nops as usize);
+            for _ in 0..nops {
+                let olen = ru32!() as usize;
+                need!(olen);
+                ops.push(buf[p..p + olen].to_vec());
+                p += olen;
+            }
+            oplogs.push((graph_vh, exec_vh, ops));
+        }
+        noplogs = oplogs.len();
+        smolvm_cuda::host::set_worker_graph_oplogs(oplogs);
+    }
     tracing::info!(
         nmods,
         nfuncs,
         nstreams,
         nevents,
         ngraphs = graphs.len(),
+        noplogs,
         streams = stream_trans.len(),
         events = event_trans.len(),
         lib_handles = lib_handles.len(),
@@ -1634,6 +1657,19 @@ fn spawn_clone_worker(
             blob.extend_from_slice(&h.to_le_bytes());
             blob.extend_from_slice(&(args.len() as u32).to_le_bytes());
             blob.extend_from_slice(args);
+        }
+        // P3b: capture-replay op-logs. Per graph:
+        //   [u64 graph_vh][u64 exec_vh][u32 nops]([u32 len][op bytes])*
+        let oplogs = smolvm_cuda::host::graph_oplogs_snapshot(token);
+        blob.extend_from_slice(&(oplogs.len() as u32).to_le_bytes());
+        for (graph_vh, exec_vh, ops) in &oplogs {
+            blob.extend_from_slice(&graph_vh.to_le_bytes());
+            blob.extend_from_slice(&exec_vh.to_le_bytes());
+            blob.extend_from_slice(&(ops.len() as u32).to_le_bytes());
+            for op in ops {
+                blob.extend_from_slice(&(op.len() as u32).to_le_bytes());
+                blob.extend_from_slice(op);
+            }
         }
         let _ = std::fs::create_dir_all("/tmp/smolvm");
         // Unique per SPAWN, not per (token, conn_fd): fd numbers are reused as
