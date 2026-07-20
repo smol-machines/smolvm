@@ -794,3 +794,21 @@ kernel + eager-remoted backward — one-time, amortized over N clones).
 have exercised the workload's write path before fork. Documented as a
 requirement; a future guard could refuse/​warn if share-weights is requested
 before the golden has run representative compute.
+
+## 2026-07-20 — throughput analysis: op-trace tax + transport-bound training
+
+**Op-trace logging is a 39% tax.** N=1 7B QLoRA: 257 tok/s with
+SMOLVM_CUDA_HOST_OPLOG=1 (+RUST_LOG=info) vs **357 tok/s with logging off**
+(RUST_LOG=error, no oplog). Production must never enable HOST_OPLOG — it's
+a debug-only per-op eprintln. Free win; all benchmark harnesses had it on.
+
+**Training is transport-bound, not compute-bound.** Native single-learner
+2,507 tok/s (0.4 s/step) vs remoted 357 tok/s (2.87 s/step) → the H100 is
+IDLE ~86% of each step waiting on the VM-boundary transport. Op-coalescing
+already exists (client `wbuf` batches quiet launches "a thousand syscalls
+into a handful"), so the residual tax is the SYNC round-trips (allocations,
+loss readback, stream syncs) that each cross the guest↔host boundary and
+can't be batched. Sync-op breakdown via SMOLVM_CUDA_COUNT_SYNC in progress
+to find the dominant sync to cut. The big structural lever (clone rings,
+shared-memory transport) stays libkrun-blocked (P2b); near-term levers are
+reducing sync count + dropping the per-VM proxy hop.
