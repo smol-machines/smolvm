@@ -1243,6 +1243,24 @@ fn xlat_func(b: &mut dyn Backend, golden: u64) -> u64 {
 fn xlat_stream(h: u64) -> u64 {
     STREAM_TRANS.with(|m| m.borrow().get(&h).copied().unwrap_or(h))
 }
+/// P3b: temporarily redirect a golden stream to a private replay stream.
+/// Returns the previous mapping so the caller can restore it.
+fn stream_trans_override(golden: u64, private: u64) -> Option<u64> {
+    STREAM_TRANS.with(|m| m.borrow_mut().insert(golden, private))
+}
+fn stream_trans_restore(golden: u64, prev: Option<u64>) {
+    STREAM_TRANS.with(|m| {
+        let mut b = m.borrow_mut();
+        match prev {
+            Some(p) => {
+                b.insert(golden, p);
+            }
+            None => {
+                b.remove(&golden);
+            }
+        }
+    });
+}
 fn xlat_event(h: u64) -> u64 {
     EVENT_TRANS.with(|m| m.borrow().get(&h).copied().unwrap_or(h))
 }
@@ -2091,78 +2109,129 @@ fn replay_capture_graph(sess: &mut Session, b: &mut dyn Backend, exec_vh: u64) -
             _ => "other",
         }
     }
+    fn op_stream(req: &Request) -> Option<u64> {
+        match req {
+            Request::LaunchKernel { stream, .. }
+            | Request::MemsetD8Async { stream, .. }
+            | Request::MemcpyDtoDAsync { stream, .. }
+            | Request::EventRecord { stream, .. }
+            | Request::StreamWaitEvent { stream, .. } => Some(*stream),
+            _ => None,
+        }
+    }
     let ops = sess
         .clone_graph_oplogs
         .get(&exec_vh)
         .cloned()
         .ok_or(CUDA_ERROR_INVALID_HANDLE)?;
-    // The capture stream is whatever the recorded kernel launches target; scan
-    // for the first LaunchKernel and translate its (golden) stream vhandle.
-    let mut cap_stream_vh = 0u64;
+    // Collect every stream the recorded ops touch (as GOLDEN raw values — the
+    // same key both raw_stream and the lib-arg stream_resolve translate by).
     let mut kinds: HashMap<&'static str, u32> = HashMap::new();
+    let mut golden_streams: Vec<u64> = Vec::new();
     for op in &ops {
         if let Ok(req) = crate::proto::decode_request(op) {
             *kinds.entry(op_tag(&req)).or_insert(0) += 1;
-            if cap_stream_vh == 0 {
-                if let Request::LaunchKernel { stream, .. } = req {
-                    cap_stream_vh = stream;
+            if let Some(s) = op_stream(&req) {
+                if s != 0 {
+                    let g = sess.streams.get(&s).copied().unwrap_or(s);
+                    if !golden_streams.contains(&g) {
+                        golden_streams.push(g);
+                    }
                 }
             }
         }
     }
-    let raw_cap = match cap_stream_vh {
-        0 => 0,
-        s => xlat_stream(sess.streams.get(&s).copied().unwrap_or(s)),
-    };
+    // PRIVATE replay stream: capturing on the clone's live remapped stream
+    // races the guest's own traffic arriving on other channels — concurrent
+    // guest ops get absorbed into (or collide with) the capture, corrupting
+    // both. All recorded streams are redirected onto one private stream for
+    // the replay (linearizing a multi-stream DAG is dependency-safe, it only
+    // serializes intra-graph parallelism), then the overrides are restored.
+    let private = b.stream_create(0)?;
+    let saved: Vec<(u64, Option<u64>)> = golden_streams
+        .iter()
+        .map(|&g| (g, stream_trans_override(g, private)))
+        .collect();
     eprintln!(
-        "[p3b] replay exec {exec_vh:#x}: {} ops {kinds:?}, cap_stream_vh={cap_stream_vh:#x} raw_cap={raw_cap:#x}",
-        ops.len()
+        "[p3b] replay exec {exec_vh:#x}: {} ops {kinds:?}, {} stream(s) -> private {private:#x}",
+        ops.len(),
+        golden_streams.len()
     );
-    // WARMUP eager pass: run the whole sequence once WITHOUT capture so every
-    // library handle binds its stream and allocates its workspace outside the
-    // capture window (cuBLAS workspace cudaMalloc during capture is the classic
-    // NOT_INITIALIZED source). Results land in the clone's own buffers, which
-    // the guest overwrites before any real launch.
+    let restore = |saved: &[(u64, Option<u64>)]| {
+        for &(g, prev) in saved {
+            stream_trans_restore(g, prev);
+        }
+    };
+    // WARMUP eager pass (on the private stream): binds every library handle's
+    // stream/workspace outside the capture window (cuBLAS workspace cudaMalloc
+    // during capture is the classic NOT_INITIALIZED source). Results land in
+    // the clone's own buffers, which the guest overwrites before real use.
     if std::env::var("SMOLVM_CUDA_P3B_WARMUP").as_deref() != Ok("0") {
         for (i, op) in ops.iter().enumerate() {
-            let req = crate::proto::decode_request(op).map_err(|_| CUDA_ERROR_INVALID_HANDLE)?;
+            let req = match crate::proto::decode_request(op) {
+                Ok(r) => r,
+                Err(_) => {
+                    restore(&saved);
+                    let _ = b.stream_destroy(private);
+                    return Err(CUDA_ERROR_INVALID_HANDLE);
+                }
+            };
             let tag = op_tag(&req);
             let (st, _) = dispatch(sess, b, req);
             if st != 0 {
                 eprintln!("[p3b] WARMUP op {i}/{} {tag} failed st={st}", ops.len());
+                restore(&saved);
+                let _ = b.stream_destroy(private);
                 return Err(st);
             }
         }
         if let Err(e) = b.ctx_synchronize() {
             eprintln!("[p3b] WARMUP ctx_synchronize failed st={e}");
+            restore(&saved);
+            let _ = b.stream_destroy(private);
             return Err(e);
         }
-        eprintln!("[p3b] warmup pass ok ({} ops)", ops.len());
     }
     // RELAXED (2): the re-issued library calls may touch capture-unsafe APIs.
-    if let Err(e) = b.stream_begin_capture(raw_cap, 2) {
-        eprintln!("[p3b] begin_capture(raw={raw_cap:#x}) failed st={e}");
+    if let Err(e) = b.stream_begin_capture(private, 2) {
+        eprintln!("[p3b] begin_capture(private={private:#x}) failed st={e}");
+        restore(&saved);
+        let _ = b.stream_destroy(private);
         return Err(e);
     }
     for (i, op) in ops.iter().enumerate() {
-        let req = crate::proto::decode_request(op).map_err(|_| CUDA_ERROR_INVALID_HANDLE)?;
+        let req = match crate::proto::decode_request(op) {
+            Ok(r) => r,
+            Err(_) => {
+                let _ = b.stream_end_capture(private);
+                restore(&saved);
+                let _ = b.stream_destroy(private);
+                return Err(CUDA_ERROR_INVALID_HANDLE);
+            }
+        };
         let tag = op_tag(&req);
         let (st, _) = dispatch(sess, b, req);
         if st != 0 {
             eprintln!("[p3b] CAPTURE op {i}/{} {tag} failed st={st}", ops.len());
             // Abort the capture cleanly before bubbling — a dangling capture
             // poisons the stream for every later op.
-            let _ = b.stream_end_capture(raw_cap);
+            let _ = b.stream_end_capture(private);
+            restore(&saved);
+            let _ = b.stream_destroy(private);
             return Err(st);
         }
     }
-    let graph = match b.stream_end_capture(raw_cap) {
+    let ended = b.stream_end_capture(private);
+    restore(&saved);
+    let graph = match ended {
         Ok(g) => g,
         Err(e) => {
             eprintln!("[p3b] end_capture failed st={e}");
+            let _ = b.stream_destroy(private);
             return Err(e);
         }
     };
+    let _ = b.stream_destroy(private);
     let exec = match b.graph_instantiate(graph) {
         Ok(e) => e,
         Err(e) => {
