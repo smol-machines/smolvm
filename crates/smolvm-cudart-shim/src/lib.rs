@@ -2173,6 +2173,31 @@ struct CudaPointerAttributes {
     device_pointer: *mut c_void,
     host_pointer: *mut c_void,
 }
+
+/// Server-side pointer classification with a page-granular verdict cache —
+/// `cudaPointerGetAttributes` is hot (torch queries per tensor in some
+/// paths), and an uncached server round-trip per miss adds a full RTT each
+/// (measured: +300 ms/request on socket transports). Device pools and host
+/// heaps don't swap roles within a process, so verdicts are cached forever.
+fn classify_via_server(ptr: u64) -> bool {
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<u64, bool>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let page = ptr >> 21; // 2 MiB granularity matches allocator pools
+    if let Some(&v) = cache.lock().unwrap().get(&page) {
+        return v;
+    }
+    let v = with_state(|s| {
+        Ok(s.client
+            .lib_call(6, 2, ptr.to_le_bytes().to_vec())
+            .map(|(st, out)| st == 0 && out.first() == Some(&2))
+            .unwrap_or(false))
+    })
+    .unwrap_or(false);
+    cache.lock().unwrap().insert(page, v);
+    v
+}
+
 #[no_mangle]
 pub extern "C" fn cudaPointerGetAttributes(attr: *mut c_void, ptr: *const c_void) -> c_int {
     if attr.is_null() {
@@ -2189,13 +2214,7 @@ pub extern "C" fn cudaPointerGetAttributes(attr: *mut c_void, ptr: *const c_void
         // shim's tables — ask the server, which knows every session range
         // (LibCall 6/2 → [2] iff device). Without this, CUDA-graph capture
         // (vLLM `weak_ref_tensor`) saw device tensors as "unregistered host".
-        || with_state(|s| {
-            Ok(s.client
-                .lib_call(6, 2, (ptr as u64).to_le_bytes().to_vec())
-                .map(|(st, out)| st == 0 && out.first() == Some(&2))
-                .unwrap_or(false))
-        })
-        .unwrap_or(false);
+        || classify_via_server(ptr as u64);
     let is_pinned_host = !is_dev
         && (guestmem::is_pinned(ptr as usize)
             || shm_offset(ptr).is_some()
