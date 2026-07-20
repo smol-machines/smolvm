@@ -250,6 +250,18 @@ impl Supervisor {
             }
         }
 
+        // Never hibernate a forkable golden base, even before its first clone: a
+        // forkable base is quiescent by design while it waits to be forked (no
+        // inbound, no leases), which would otherwise make it a prime auto-standby
+        // target — but stopping its VMM destroys the memfd RAM image and control
+        // socket that `machine fork` snapshots from, so the next fork would fail
+        // with "golden is not running forkable". The live control socket is the
+        // host-side signal that a machine was started `--forkable`.
+        if crate::agent::fork::control_socket_path(name).exists() {
+            self.idle.clear(name);
+            return;
+        }
+
         let now = crate::util::current_timestamp();
         let snapshot = self.state.activity().snapshot(name);
         match self.idle.evaluate(name, timeout, snapshot, now) {

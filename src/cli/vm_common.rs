@@ -911,7 +911,10 @@ pub fn start_vm_named(
     // allow-listed the registry), so warn with the fix. First boot only.
     let has_restrictive_egress = record.network
         && (record.allowed_cidrs.as_ref().is_some_and(|c| !c.is_empty())
-            || record.dns_filter_hosts.as_ref().is_some_and(|h| !h.is_empty()));
+            || record
+                .dns_filter_hosts
+                .as_ref()
+                .is_some_and(|h| !h.is_empty()));
     if record.image.is_some() && has_restrictive_egress {
         let storage_disk = smolvm::agent::vm_data_dir(name).join("storage.raw");
         if !storage_disk.exists() {

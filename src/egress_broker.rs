@@ -1182,8 +1182,10 @@ mod tests {
 
         // Request 1 — establishes the tunnel and is the head the broker rewrites.
         ctls.write_all(
-            format!("GET /a HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {placeholder}\r\n\r\n")
-                .as_bytes(),
+            format!(
+                "GET /a HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {placeholder}\r\n\r\n"
+            )
+            .as_bytes(),
         )
         .await
         .unwrap();
@@ -1193,8 +1195,10 @@ mod tests {
 
         // Request 2 — same TLS session, reused connection.
         ctls.write_all(
-            format!("GET /b HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {placeholder}\r\n\r\n")
-                .as_bytes(),
+            format!(
+                "GET /b HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {placeholder}\r\n\r\n"
+            )
+            .as_bytes(),
         )
         .await
         .unwrap();
@@ -1310,17 +1314,20 @@ mod tests {
 
         // Request 2 on the same tunnel.
         ctls.write_all(
-            format!("GET /b HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {placeholder}\r\n\r\n")
-                .as_bytes(),
+            format!(
+                "GET /b HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {placeholder}\r\n\r\n"
+            )
+            .as_bytes(),
         )
         .await
         .unwrap();
         ctls.flush().await.unwrap();
 
-        let (head1, body1, head2) = tokio::time::timeout(std::time::Duration::from_secs(5), seen_rx)
-            .await
-            .expect("upstream did not receive both requests in time")
-            .unwrap();
+        let (head1, body1, head2) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), seen_rx)
+                .await
+                .expect("upstream did not receive both requests in time")
+                .unwrap();
 
         assert!(head1.contains("sk-REAL-SECRET-123"), "req1 head:\n{head1}");
         assert_eq!(body1, "hello", "req1 body must be forwarded intact");

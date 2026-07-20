@@ -1835,8 +1835,7 @@ pub async fn export_machine(
     // exports don't accumulate multi-GB files in /tmp — on the failure path as
     // well, which previously leaked it.
     let _ = std::fs::remove_file(&sidecar);
-    let result =
-        result.map_err(|e| ApiError::internal(format!("registry push failed: {}", e)))?;
+    let result = result.map_err(|e| ApiError::internal(format!("registry push failed: {}", e)))?;
 
     // tmp drops here, deleting the stub.
     Ok(Json(ExportResponse {
