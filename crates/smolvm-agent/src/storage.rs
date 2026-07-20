@@ -2960,6 +2960,20 @@ pub fn prepare_for_run_persistent(image: &str, overlay_id: &str) -> Result<Prepa
 }
 
 /// Setup volume mounts for a rootfs (public wrapper).
+/// Request mounts merged with the BOOT env mounts (SMOLVM_MOUNT_*): boot-time
+/// binds land in a rootfs the workload's overlay later mounts OVER, so
+/// launcher-injected mounts (e.g. the CUDA ring mount) must ride every
+/// container's own mount list. Request entries win on target collision.
+pub fn merged_with_boot_mounts(mounts: &[(String, String, bool)]) -> Vec<(String, String, bool)> {
+    let mut v: Vec<(String, String, bool)> = mounts.to_vec();
+    for bm in init_volume_mounts() {
+        if !v.iter().any(|(_, t, _)| t == &bm.1) {
+            v.push(bm.clone());
+        }
+    }
+    v
+}
+
 pub fn setup_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Result<()> {
     let _mounted_paths = setup_volume_mounts(rootfs, mounts)?;
     Ok(())

@@ -528,7 +528,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
     // CUDA machines get an implicit dax RING mount: a per-machine host dir the
     // guest shim and the CUDA daemon both mmap for the file-backed clone-ring
     // transport (see cuda_host::ring_dir_advert / RingSetupFile). The dir sits
-    // next to the per-VM cuda socket; the guest sees it at /run/smolvm-ring.
+    // next to the per-VM cuda socket; the guest sees it at /opt/smolvm-ring.
     // Opt out with SMOLVM_CUDA_FILE_RING=0.
     let mut mounts_vec: Vec<crate::data::storage::HostMount> = mounts.to_vec();
     if let Some(cs) = cuda_socket {
@@ -542,7 +542,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     }
                     mounts_vec.push(crate::data::storage::HostMount {
                         source: dir,
-                        target: std::path::PathBuf::from("/run/smolvm-ring"),
+                        target: std::path::PathBuf::from("/opt/smolvm-ring"),
                         read_only: false,
                     });
                 }
@@ -1380,12 +1380,12 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             // (ShmManager::create_fs_region per fs index); the old code just
             // never asked (shm_size=0 here while launcher_dynamic asked for
             // 2 GiB — the source of the "only root has DAX" misdiagnosis).
-            let is_ring_mount = mount.target == std::path::Path::new("/run/smolvm-ring");
+            let is_ring_mount = mount.target == std::path::Path::new("/opt/smolvm-ring");
             let dax_window: u64 = match std::env::var("SMOLVM_MOUNT_DAX").as_deref() {
                 Ok("1") => 1 << 29,
                 // The implicit CUDA ring mount ALWAYS gets a window — it exists
-                // solely to be dax-mmap'd (64 MB is ample for ring pages).
-                _ if is_ring_mount => 1 << 26,
+                // solely to be dax-mmap'd (512 MB, the proven window size).
+                _ if is_ring_mount => 1 << 29,
                 _ => 0,
             };
             // Read-only mounts must be enforced host-side by the virtiofs

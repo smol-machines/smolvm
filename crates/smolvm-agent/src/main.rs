@@ -2976,6 +2976,7 @@ fn handle_interactive_run(
     };
 
     let is_persistent = persistent_overlay_id.is_some();
+    let mounts = storage::merged_with_boot_mounts(&mounts);
     info!(image = %image, command = ?command, tty = tty, persistent = is_persistent, "starting interactive run");
 
     // Prepare the overlay and get the rootfs path
@@ -3273,6 +3274,7 @@ fn handle_run_detached(
     // An empty command is allowed here: it means "run the image's own
     // ENTRYPOINT/CMD". We resolve it from the image config below, after the
     // image has been prepared (so its config is guaranteed present).
+    let mounts = storage::merged_with_boot_mounts(&mounts);
 
     let overlay_id = match persistent_overlay_id {
         Some(id) => id,
