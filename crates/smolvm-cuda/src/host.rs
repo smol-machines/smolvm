@@ -1353,10 +1353,10 @@ fn xlat_func(b: &mut dyn Backend, golden: u64) -> u64 {
         }
     }
 }
-/// Per-connection host ring directory for file-backed rings, advertised by
-/// the per-VM proxy at connect (SMVRDIR1 preamble) and installed by the
-/// serving thread before entering `serve`. Thread-local: one serve thread per
-/// connection.
+// Per-connection host ring directory for file-backed rings, advertised by
+// the per-VM proxy at connect (SMVRDIR1 preamble) and installed by the
+// serving thread before entering `serve`. Thread-local: one serve thread per
+// connection.
 thread_local! {
     static RING_DIR: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
@@ -1842,7 +1842,14 @@ fn serve_inner<S: Read + Write>(
                     fname,
                 } = req
                 {
-                    match HostRings::map_file(page_size, req_n, resp_n, bounce_n, &fname) {
+                    #[cfg(unix)]
+                    let mapped = HostRings::map_file(page_size, req_n, resp_n, bounce_n, &fname);
+                    #[cfg(not(unix))]
+                    let mapped: Result<HostRings, i32> = {
+                        let _ = (page_size, req_n, resp_n, bounce_n, &fname);
+                        Err(801)
+                    };
+                    match mapped {
                         Ok(rings) => {
                             write_msg(&mut stream, &encode_response(0, &Response::Ok))?;
                             eprintln!(
@@ -1924,6 +1931,7 @@ impl HostRings {
     /// the per-connection advertised ring dir) MAP_SHARED and slice it into
     /// req/resp/bounce page lists. The guest mmaps the SAME file through its
     /// dax mount, so both sides touch the same host page-cache pages.
+    #[cfg(unix)]
     fn map_file(
         page_size: u32,
         req_n: u32,

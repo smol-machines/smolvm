@@ -121,7 +121,7 @@ pub fn start(socket_path: &Path) -> std::io::Result<()> {
                         if addr.starts_with('/') {
                             #[cfg(unix)]
                             if let Ok(mut s) = std::os::unix::net::UnixStream::connect(&addr) {
-                                if rd.as_ref().map_or(true, |r| s.write_all(r).is_ok())
+                                if rd.as_ref().is_none_or(|r| s.write_all(r).is_ok())
                                     && s.write_all(&p).is_ok()
                                 {
                                     tracing::info!("cuda-host: clone warm dial sent");
@@ -130,7 +130,7 @@ pub fn start(socket_path: &Path) -> std::io::Result<()> {
                                 }
                             }
                         } else if let Ok(mut s) = std::net::TcpStream::connect(&addr) {
-                            if rd.as_ref().map_or(true, |r| s.write_all(r).is_ok())
+                            if rd.as_ref().is_none_or(|r| s.write_all(r).is_ok())
                                 && s.write_all(&p).is_ok()
                             {
                                 tracing::info!("cuda-host: clone warm dial sent");

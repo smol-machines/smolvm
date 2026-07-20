@@ -421,13 +421,14 @@ fn ring_try_setup(client: &mut Client<Stream>) {
 /// mapping — inherited dax mappings die across fork, fresh ones are
 /// host-coherent), and negotiate `RingSetupFile`. Failure is fine — socket
 /// mode continues.
+#[cfg(target_os = "linux")]
 fn ring_try_setup_file(client: &mut Client<Stream>) {
     const PAGE: usize = 4096;
     const REQ_N: usize = 32;
     const RESP_N: usize = 8;
     const BOUNCE_N: usize = 64;
     let trace = std::env::var_os("SMOLVM_CUDA_SHIM_TRACE").is_some();
-    let dir = std::env::var("SMOLVM_CUDA_RING_DIR").unwrap_or_else(|_| "/run/smolvm-ring".into());
+    let dir = std::env::var("SMOLVM_CUDA_RING_DIR").unwrap_or_else(|_| "/opt/smolvm-ring".into());
     if !std::path::Path::new(&dir).is_dir() {
         if trace {
             eprintln!("[ring-file] no ring dir {dir} — socket mode");
@@ -591,6 +592,7 @@ fn bring_up_client(resume_token: u64) -> Result<(Client<Stream>, u64, i32), c_in
     }
     if try_ring {
         ring_try_setup(&mut client); // best-effort; socket mode on failure
+        #[cfg(target_os = "linux")]
         if !client.is_ring() {
             // GPA rings rejected (clone COW RAM is daemon-invisible): try the
             // DAX file-ring transport instead.
