@@ -185,7 +185,7 @@ fn machine_entry_from_record(record: &VmRecord, manager: AgentManager) -> Machin
 /// disks are discarded immediately after, so there is nothing to flush — SIGKILL
 /// at once instead of waiting out the guest's graceful shutdown (the bulk of the
 /// ~1.9s DELETE latency on metal).
-fn shutdown_machine_process(
+pub(crate) fn shutdown_machine_process(
     name: &str,
     pid: Option<i32>,
     pid_start_time: Option<u64>,

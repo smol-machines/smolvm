@@ -457,6 +457,8 @@ pub struct CreateVmParams {
     pub dns_filter_hosts: Option<Vec<String>>,
     /// User-published Unix-socket bridges (`--expose-socket` / `--mount-socket`).
     pub published_sockets: Vec<smolvm::config::PublishedSocketConfig>,
+    /// Auto-standby idle timeout in seconds (`--idle-timeout`). `None`/0 disables.
+    pub idle_timeout_secs: Option<u64>,
     /// Absolute path to .smolmachine sidecar (for machines created with --from).
     pub source_smolmachine: Option<String>,
     /// Secret refs from Smolfile `[secrets]`. The refs themselves are
@@ -644,6 +646,7 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
     record.docker_socket = params.docker_socket;
     record.dns_filter_hosts = params.dns_filter_hosts.clone();
     record.published_sockets = params.published_sockets.clone();
+    record.idle_timeout_secs = params.idle_timeout_secs;
     record.source_smolmachine = params.source_smolmachine.clone();
 
     Ok(record)
@@ -846,6 +849,57 @@ pub fn start_vm_named(
             // a previous failed start — if one is holding ports/sockets, this
             // fresh start would hit the same error without this cleanup.
             kill_orphaned_boot_process(name);
+        }
+        RecordState::Standby => {
+            // Auto-standby hibernated this machine: no VMM is alive, its guest +
+            // device state is in the machine's snapshot dir. Waking it goes
+            // through the same launch path below; a full wake boots from that
+            // snapshot (via `LaunchFeatures::snapshot_dir`) rather than cold —
+            // the restore-from-disk half of `autostandby::HibernateSeam`. Until
+            // that seam lands the machine cold-boots here, which is correct but
+            // loses in-guest state; clean up any orphan first, same as a stop.
+            kill_orphaned_boot_process(name);
+        }
+    }
+
+    // First boot of an image machine pulls the image INSIDE the guest, so a
+    // machine created without any network flag is dead on arrival — the pull
+    // can never succeed, and the user gets raw crane DNS retries after a
+    // misleading progress bar. Detect the combination up front (storage disk
+    // absent ⇒ never started ⇒ the pull WILL run; restarts have the image
+    // cached in-guest and never hit this).
+    if record.image.is_some() && !record.network {
+        let storage_disk = smolvm::agent::vm_data_dir(name).join("storage.raw");
+        if !storage_disk.exists() {
+            return Err(Error::agent(
+                "start",
+                format!(
+                    "machine '{name}' has an image but no network: the first start pulls \
+                     the image inside the guest, which requires egress. Recreate it with \
+                     --net (or --dns/--allow-host for a restricted policy)."
+                ),
+            ));
+        }
+    }
+
+    // A restrictive egress policy (allow-cidr / allow-host / localhost-only) with
+    // network ENABLED can still strand a first boot: the in-guest image pull
+    // needs the container registry reachable, and if the allowlist doesn't
+    // include it the pull fails with a raw crane "connection refused" that blames
+    // the network stack, not the policy. We can't hard-fail (the user may have
+    // allow-listed the registry), so warn with the fix. First boot only.
+    let has_restrictive_egress = record.network
+        && (record.allowed_cidrs.as_ref().is_some_and(|c| !c.is_empty())
+            || record.dns_filter_hosts.as_ref().is_some_and(|h| !h.is_empty()));
+    if record.image.is_some() && has_restrictive_egress {
+        let storage_disk = smolvm::agent::vm_data_dir(name).join("storage.raw");
+        if !storage_disk.exists() {
+            eprintln!(
+                "Warning: '{name}' has a restrictive egress policy; the first start pulls \
+                 its image from the registry inside the guest. If the registry host isn't \
+                 in your allow-list the pull will fail — add it with --allow-host <registry>, \
+                 or pre-pull the image."
+            );
         }
     }
 
@@ -1437,6 +1491,20 @@ pub fn stop_vm_named(name: &str) -> smolvm::Result<()> {
             // process is alive and its argv matches this VM's boot config
             // path, kill it so the user doesn't have to hunt it manually.
             kill_orphaned_boot_process(name);
+            // Stopping a hibernated machine means "cancel the auto-wake":
+            // demote Standby to plain Stopped so the state machine has an exit
+            // (update/resize accept it, the supervisor won't treat it as
+            // wake-eligible, and `stop` isn't a confusing no-op).
+            if matches!(other, RecordState::Standby) {
+                if let Ok(db) = SmolvmDb::open() {
+                    let _ = db.update_vm(name, |r| {
+                        r.state = RecordState::Stopped;
+                        r.pid = None;
+                    });
+                }
+                println!("Machine '{}' left standby (now stopped)", name);
+                return Ok(());
+            }
             println!("Machine '{}' is not running (state: {})", name, other);
             return Ok(());
         }

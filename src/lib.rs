@@ -63,6 +63,7 @@
 
 pub mod agent;
 pub mod api;
+pub mod autostandby;
 pub mod config;
 // The shared CUDA daemon manages unix-domain sockets, flock, and detached
 // process groups — all POSIX. GPU acceleration is unavailable on Windows anyway,
