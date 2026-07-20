@@ -1929,11 +1929,17 @@ mod tests {
 #[derive(Args, Debug)]
 pub struct ExecCmd {
     /// Command and arguments to execute
-    #[arg(trailing_var_arg = true, required = true, value_name = "COMMAND")]
+    ///
+    /// `last = true` requires the `--` separator, matching `machine create`:
+    /// with the machine name now a flag, an old-style positional
+    /// (`machine exec myvm -- cmd`) must fail loudly instead of `myvm` being
+    /// silently captured as the guest command and run against machine
+    /// "default".
+    #[arg(last = true, required = true, value_name = "COMMAND")]
     pub command: Vec<String>,
 
     /// Target machine (default: "default")
-    #[arg(long, value_name = "NAME")]
+    #[arg(short = 'n', long, value_name = "NAME")]
     pub name: Option<String>,
 
     /// Set working directory in the VM

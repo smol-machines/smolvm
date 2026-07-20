@@ -110,6 +110,27 @@ pub fn ensure_running_and_connect(
             ));
         }
 
+        // A frozen fork base must NOT be pointed at `machine start` — starting
+        // it reaps the frozen memfd image its clones fork from (QA BUG-142/183).
+        // Checked via dependent_clones (not resolve_state): the zombie-marking
+        // above may already have rewritten the record's state, but "has live
+        // clones and isn't serving" identifies the fork base regardless.
+        let has_live_clones = SmolvmDb::open()
+            .ok()
+            .and_then(|db| db.dependent_clones(&label).ok())
+            .is_some_and(|clones| !clones.is_empty());
+        if has_live_clones {
+            return Err(smolvm::Error::agent(
+                "connect",
+                format!(
+                    "machine '{}' is a frozen fork base — it cannot serve execs while \
+                     frozen. Fork it ('smolvm machine fork --golden {} -n <clone>') and \
+                     exec the clone, or delete its clones first to release it.",
+                    label, label
+                ),
+            ));
+        }
+
         return Err(smolvm::Error::agent(
             "connect",
             format!(

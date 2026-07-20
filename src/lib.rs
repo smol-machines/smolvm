@@ -77,6 +77,7 @@ pub mod db;
 pub mod disk_utils;
 pub mod dns_filter;
 pub mod dns_filter_listener;
+pub mod egress_broker;
 /// Language-neutral embedded runtime support shared by SDK adapters.
 pub mod embedded;
 pub mod log_rotation;
