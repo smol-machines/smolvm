@@ -1145,13 +1145,17 @@ impl<S: Read + Write> Client<S> {
     }
 
     pub fn event_destroy(&mut self, event: u64) -> Result<()> {
-        self.call(&Request::EventDestroy { event }, Op::EventDestroy)
-            .map(|_| ())
+        // No return value: fire-and-forget. torch's allocator churns events
+        // (~2,500 destroys/short run); a sync round-trip each was pure tax.
+        // Ordered in the pipeline, so it runs after every prior use of `event`.
+        self.call_deferred_kind(&Request::EventDestroy { event }, Op::EventDestroy, false)
     }
 
     pub fn event_record(&mut self, event: u64, stream: u64) -> Result<()> {
-        self.call(&Request::EventRecord { event, stream }, Op::EventRecord)
-            .map(|_| ())
+        // No return value (also graph-capturable): fire-and-forget. It flushes
+        // before any sync that reads the event (EventQuery/Synchronize/
+        // ElapsedTime), so the record is always ordered before its reader.
+        self.call_deferred_kind(&Request::EventRecord { event, stream }, Op::EventRecord, false)
     }
 
     pub fn event_synchronize(&mut self, event: u64) -> Result<()> {
