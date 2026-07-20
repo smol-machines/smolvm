@@ -809,7 +809,7 @@ pub struct HandoffChunk {
     /// Upload segments tile the chunk exactly (share CANDIDATE — safe to share
     /// only after fork-time content verification against `segs`).
     pub candidate: bool,
-    /// Chunk-relative `(start, end, crc)` upload segments (crc from [`fnv64`]).
+    /// Chunk-relative `(start, end, crc)` upload segments (crc from [`crate::fnv64`]).
     pub segs: Vec<(u64, u64, u64)>,
     /// Cached fork-time content-verification verdict (golden frozen → stable).
     pub verified: Option<bool>,
@@ -1193,7 +1193,7 @@ fn mark_loaded_vmm(layout: &LayoutCell, dptr: u64, nbytes: u64, data: Option<&[u
         // and each chunk must record the hash of its own bytes (crc 0 =
         // unverifiable → never shared; used when bytes aren't dispatch-visible).
         let crc = data.map_or(0, |d| {
-            fnv64(&d[(abs_s - dptr) as usize..(abs_e - dptr) as usize])
+            crate::fnv64(&d[(abs_s - dptr) as usize..(abs_e - dptr) as usize])
         });
         let (s, e) = (abs_s - base, abs_e - base);
         // An overlapping re-upload invalidates the prior segment's CRC for its
@@ -1248,7 +1248,7 @@ fn module_cache_put(image: &[u8]) {
         return; // over budget: first-come wins; the big early fatbins matter most
     }
     let key = ModuleCacheKey {
-        fnv: fnv64(image),
+        fnv: crate::fnv64(image),
         len: image.len() as u64,
         head: image[..8].try_into().unwrap(),
         tail: image[image.len() - 8..].try_into().unwrap(),
@@ -1259,15 +1259,6 @@ fn module_cache_put(image: &[u8]) {
 
 fn module_cache_get(key: &ModuleCacheKey) -> Option<std::sync::Arc<Vec<u8>>> {
     module_cache().lock().unwrap().get(key).cloned()
-}
-
-pub fn fnv64(data: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in data {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h.max(1)
 }
 
 /// Mark the allocation containing `dptr` as loaded (H2D-written → read-only
