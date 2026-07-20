@@ -507,42 +507,35 @@ impl EgressBroker {
 
         // 3. Become the TLS server for `host` using a freshly-minted leaf.
         let acceptor = TlsAcceptor::from(self.server_config_for(&target.host)?);
-        let mut client = acceptor.accept(tcp).await?;
+        let client = acceptor.accept(tcp).await?;
 
-        // 4. Read the guest's real request head and swap placeholders for real
-        //    secrets. Only the head is rewritten (credentials live there); the
-        //    body streams through untouched.
-        let mut inner = Vec::new();
-        read_http_head(&mut client, &mut inner).await?;
-        let (head_bytes, leftover) = split_head(&inner)
-            .ok_or_else(|| BrokerError::MalformedRequest("no request head from guest".into()))?;
-        let (rewritten, subs) = self.table.rewrite_head(head_bytes);
-        for s in &subs {
-            // Audit: name + count only — never the value.
-            tracing::info!(
-                secret = %s.secret_name,
-                count = s.count,
-                host = %target.host,
-                "substituted brokered secret into an outbound request"
-            );
-        }
-        let leftover = leftover.to_vec();
-
-        // 5. Dial the real upstream and verify its certificate for real.
+        // 4. Dial the real upstream and verify its certificate for real.
         let upstream_tcp = TcpStream::connect((target.host.as_str(), target.port)).await?;
         let connector = TlsConnector::from(Arc::clone(&self.upstream));
         let sni = ServerName::try_from(target.host.clone())
             .map_err(|e| BrokerError::MalformedRequest(format!("invalid SNI host: {e}")))?;
-        let mut upstream = connector.connect(sni, upstream_tcp).await?;
+        let upstream = connector.connect(sni, upstream_tcp).await?;
 
-        // 6. Forward the rewritten head + any buffered body, then splice the
-        //    rest of the conversation in both directions.
-        upstream.write_all(&rewritten).await?;
-        if !leftover.is_empty() {
-            upstream.write_all(&leftover).await?;
-        }
-        upstream.flush().await?;
-        tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+        // 5. Proxy the tunnel. Responses stream back verbatim (they never carry
+        //    placeholders); every request head the client sends is rewritten, not
+        //    just the first — a single CONNECT tunnel carries multiple requests
+        //    under HTTP/1.1 keep-alive, and each must have its placeholders
+        //    swapped for real secrets.
+        let (mut client_r, mut client_w) = tokio::io::split(client);
+        let (mut upstream_r, mut upstream_w) = tokio::io::split(upstream);
+        let response_pump = tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut upstream_r, &mut client_w).await;
+            // Propagate the upstream's EOF to the client. The read half is still
+            // held by the request loop, so dropping this write half alone would
+            // not close the tunnel — shut it down explicitly.
+            let _ = client_w.shutdown().await;
+        });
+        let result =
+            relay_requests(&self.table, &target.host, &mut client_r, &mut upstream_w).await;
+        // Signal EOF upstream so it can finish the last response, then drain it.
+        let _ = upstream_w.shutdown().await;
+        let _ = response_pump.await;
+        result?;
         Ok(())
     }
 }
@@ -625,6 +618,132 @@ async fn read_http_head<S: AsyncReadExt + Unpin>(
             ));
         }
     }
+}
+
+/// Proxy the request direction of a tunnel: read each HTTP request head the
+/// client sends, rewrite its placeholders into real secrets, forward it plus its
+/// body, and loop for the next request. A single CONNECT tunnel carries multiple
+/// requests under keep-alive, so rewriting only the first head (and splicing the
+/// rest) would leak placeholders unsubstituted on every subsequent request.
+///
+/// Body bytes are forwarded verbatim (credentials live in the head). The body is
+/// framed by `Content-Length`; a chunked or otherwise unframed body means the
+/// next head boundary can't be located, so the remainder is spliced through and
+/// the loop ends (matching the original splice behavior for that uncommon case).
+async fn relay_requests<R, W>(
+    table: &SubstitutionTable,
+    host: &str,
+    client_r: &mut R,
+    upstream_w: &mut W,
+) -> std::io::Result<()>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
+    let mut buf: Vec<u8> = Vec::new();
+    let mut tmp = [0u8; 4096];
+    loop {
+        // Accumulate bytes until a full request head is buffered (or the client
+        // cleanly ends the stream between requests).
+        let head_end = loop {
+            if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
+                break pos + 4;
+            }
+            if buf.len() > MAX_HEAD_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "request head exceeded the maximum size",
+                ));
+            }
+            let n = client_r.read(&mut tmp).await?;
+            if n == 0 {
+                if buf.is_empty() {
+                    return Ok(());
+                }
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed before the end of a request head",
+                ));
+            }
+            buf.extend_from_slice(&tmp[..n]);
+        };
+
+        let head = &buf[..head_end];
+        let (rewritten, subs) = table.rewrite_head(head);
+        for s in &subs {
+            // Audit: name + count only — never the value.
+            tracing::info!(
+                secret = %s.secret_name,
+                count = s.count,
+                host = %host,
+                "substituted brokered secret into an outbound request"
+            );
+        }
+        let body_len = request_body_len(head);
+        upstream_w.write_all(&rewritten).await?;
+        buf.drain(..head_end);
+
+        match body_len {
+            Some(mut remaining) => {
+                // Forward already-buffered body bytes first, then read the rest.
+                let take = remaining.min(buf.len());
+                if take > 0 {
+                    upstream_w.write_all(&buf[..take]).await?;
+                    buf.drain(..take);
+                    remaining -= take;
+                }
+                while remaining > 0 {
+                    let n = client_r.read(&mut tmp).await?;
+                    if n == 0 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "connection closed before the end of a request body",
+                        ));
+                    }
+                    let take = remaining.min(n);
+                    upstream_w.write_all(&tmp[..take]).await?;
+                    if n > take {
+                        // Bytes past this body belong to the next request head.
+                        buf.extend_from_slice(&tmp[take..n]);
+                    }
+                    remaining -= take;
+                }
+                upstream_w.flush().await?;
+            }
+            None => {
+                // Unframed/chunked body: we can't find the next head boundary, so
+                // splice the remainder through untouched and stop rewriting.
+                upstream_w.write_all(&buf).await?;
+                upstream_w.flush().await?;
+                tokio::io::copy(client_r, upstream_w).await?;
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// How many body bytes follow a request head: `Some(n)` for a `Content-Length`
+/// body (or `Some(0)` when there is none), `None` when the framing is chunked or
+/// otherwise not a plain length and the caller must splice the remainder.
+fn request_body_len(head: &[u8]) -> Option<usize> {
+    let text = std::str::from_utf8(head).ok()?;
+    let mut content_length: Option<usize> = None;
+    // Skip the request line; stop at the blank line ending the head.
+    for line in text.split("\r\n").skip(1) {
+        if line.is_empty() {
+            break;
+        }
+        let (name, value) = line.split_once(':')?;
+        let name = name.trim();
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            // chunked (or any transfer-coding) — not a simple length.
+            return None;
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            content_length = Some(value.trim().parse::<usize>().ok()?);
+        }
+    }
+    Some(content_length.unwrap_or(0))
 }
 
 // ============================================================================
@@ -987,5 +1106,227 @@ mod tests {
             "placeholder must never reach the upstream"
         );
         assert!(String::from_utf8_lossy(&client_resp).contains("200 OK"));
+    }
+
+    /// A single CONNECT tunnel carries more than one request under HTTP/1.1
+    /// keep-alive (curl reusing a connection, requests.Session, Go/Node default
+    /// clients). The broker rewrites only the first head and then splices the
+    /// rest via copy_bidirectional, so a placeholder in the second request
+    /// reaches the upstream unsubstituted.
+    #[tokio::test]
+    async fn keepalive_second_request_placeholder_is_not_substituted() {
+        let upstream_ca = CaAuthority::generate().unwrap();
+        let upstream_leaf = upstream_ca.mint_leaf("localhost").unwrap();
+        let upstream_cfg = Arc::new(server_config_from_leaf(&upstream_leaf));
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_port = upstream_listener.local_addr().unwrap().port();
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<(String, String)>();
+        tokio::spawn(async move {
+            let (tcp, _) = upstream_listener.accept().await.unwrap();
+            let mut tls = TlsAcceptor::from(upstream_cfg).accept(tcp).await.unwrap();
+            let mut h1 = Vec::new();
+            read_http_head(&mut tls, &mut h1).await.unwrap();
+            tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            tls.flush().await.unwrap();
+            let mut h2 = Vec::new();
+            read_http_head(&mut tls, &mut h2).await.unwrap();
+            tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            tls.flush().await.unwrap();
+            let _ = seen_tx.send((
+                String::from_utf8_lossy(&h1).into_owned(),
+                String::from_utf8_lossy(&h2).into_owned(),
+            ));
+        });
+
+        let broker_ca = CaAuthority::generate().unwrap();
+        let table = Arc::new(SubstitutionTable::new());
+        let placeholder = table.register("OPENAI_API_KEY", make_secret("sk-REAL-SECRET-123"));
+        let broker = Arc::new(EgressBroker::with_upstream_roots(
+            broker_ca,
+            Arc::clone(&table),
+            root_store_from_pem(upstream_ca.ca_cert_pem()),
+        ));
+        let broker_ca_pem = broker.ca_cert_pem().to_string();
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        tokio::spawn(Arc::clone(&broker).serve(proxy_listener));
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        client
+            .write_all(
+                format!("CONNECT localhost:{upstream_port} HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut connect_resp = Vec::new();
+        read_http_head(&mut client, &mut connect_resp)
+            .await
+            .unwrap();
+
+        let client_cfg =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(root_store_from_pem(&broker_ca_pem))
+                .with_no_client_auth();
+        let sni = ServerName::try_from("localhost").unwrap();
+        let mut ctls = TlsConnector::from(Arc::new(client_cfg))
+            .connect(sni, client)
+            .await
+            .unwrap();
+
+        // Request 1 — establishes the tunnel and is the head the broker rewrites.
+        ctls.write_all(
+            format!("GET /a HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {placeholder}\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+        ctls.flush().await.unwrap();
+        let mut r1 = Vec::new();
+        read_http_head(&mut ctls, &mut r1).await.unwrap();
+
+        // Request 2 — same TLS session, reused connection.
+        ctls.write_all(
+            format!("GET /b HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {placeholder}\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+        ctls.flush().await.unwrap();
+
+        let (h1, h2) = tokio::time::timeout(std::time::Duration::from_secs(5), seen_rx)
+            .await
+            .expect("upstream did not receive both requests in time")
+            .unwrap();
+
+        assert!(
+            h1.contains("sk-REAL-SECRET-123") && !h1.contains(&placeholder),
+            "req1 should carry the real secret; upstream saw:\n{h1}"
+        );
+        assert!(
+            h2.contains("sk-REAL-SECRET-123") && !h2.contains(&placeholder),
+            "req2 on the keep-alive tunnel leaked the placeholder unsubstituted; upstream saw:\n{h2}"
+        );
+    }
+
+    /// A framed request body (Content-Length) must be forwarded intact and the
+    /// next request head on the same tunnel located after it — exercises the
+    /// body-forwarding path of the request loop, not just bodyless GETs.
+    #[tokio::test]
+    async fn keepalive_request_body_is_forwarded_and_next_head_rewritten() {
+        let upstream_ca = CaAuthority::generate().unwrap();
+        let upstream_leaf = upstream_ca.mint_leaf("localhost").unwrap();
+        let upstream_cfg = Arc::new(server_config_from_leaf(&upstream_leaf));
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_port = upstream_listener.local_addr().unwrap().port();
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<(String, String, String)>();
+        tokio::spawn(async move {
+            let (tcp, _) = upstream_listener.accept().await.unwrap();
+            let mut tls = TlsAcceptor::from(upstream_cfg).accept(tcp).await.unwrap();
+            // Request 1: head + a 5-byte "hello" body. read_http_head may pull
+            // some body bytes past the head, so split and read the remainder.
+            let mut b1 = Vec::new();
+            read_http_head(&mut tls, &mut b1).await.unwrap();
+            let (head1, leftover) = split_head(&b1).unwrap();
+            let head1 = String::from_utf8_lossy(head1).into_owned();
+            let mut body1 = leftover.to_vec();
+            while body1.len() < 5 {
+                let mut t = [0u8; 64];
+                let n = tls.read(&mut t).await.unwrap();
+                body1.extend_from_slice(&t[..n]);
+            }
+            tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            tls.flush().await.unwrap();
+            // Request 2: bodyless.
+            let mut b2 = Vec::new();
+            read_http_head(&mut tls, &mut b2).await.unwrap();
+            tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            tls.flush().await.unwrap();
+            let _ = seen_tx.send((
+                head1,
+                String::from_utf8_lossy(&body1).into_owned(),
+                String::from_utf8_lossy(&b2).into_owned(),
+            ));
+        });
+
+        let broker_ca = CaAuthority::generate().unwrap();
+        let table = Arc::new(SubstitutionTable::new());
+        let placeholder = table.register("OPENAI_API_KEY", make_secret("sk-REAL-SECRET-123"));
+        let broker = Arc::new(EgressBroker::with_upstream_roots(
+            broker_ca,
+            Arc::clone(&table),
+            root_store_from_pem(upstream_ca.ca_cert_pem()),
+        ));
+        let broker_ca_pem = broker.ca_cert_pem().to_string();
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        tokio::spawn(Arc::clone(&broker).serve(proxy_listener));
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        client
+            .write_all(
+                format!("CONNECT localhost:{upstream_port} HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut connect_resp = Vec::new();
+        read_http_head(&mut client, &mut connect_resp)
+            .await
+            .unwrap();
+
+        let client_cfg =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(root_store_from_pem(&broker_ca_pem))
+                .with_no_client_auth();
+        let sni = ServerName::try_from("localhost").unwrap();
+        let mut ctls = TlsConnector::from(Arc::new(client_cfg))
+            .connect(sni, client)
+            .await
+            .unwrap();
+
+        // Request 1 with a body.
+        ctls.write_all(
+            format!("POST /a HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {placeholder}\r\nContent-Length: 5\r\n\r\nhello")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+        ctls.flush().await.unwrap();
+        let mut r1 = Vec::new();
+        read_http_head(&mut ctls, &mut r1).await.unwrap();
+
+        // Request 2 on the same tunnel.
+        ctls.write_all(
+            format!("GET /b HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {placeholder}\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+        ctls.flush().await.unwrap();
+
+        let (head1, body1, head2) = tokio::time::timeout(std::time::Duration::from_secs(5), seen_rx)
+            .await
+            .expect("upstream did not receive both requests in time")
+            .unwrap();
+
+        assert!(head1.contains("sk-REAL-SECRET-123"), "req1 head:\n{head1}");
+        assert_eq!(body1, "hello", "req1 body must be forwarded intact");
+        assert!(
+            head2.contains("sk-REAL-SECRET-123") && !head2.contains(&placeholder),
+            "req2 head after a framed body must be rewritten; saw:\n{head2}"
+        );
     }
 }
