@@ -89,6 +89,23 @@ pub(crate) fn install_crash_handler(role: &'static str) {
     static ROLE: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
     let _ = ROLE.set(role);
     unsafe extern "C" fn on_fatal(sig: libc::c_int) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        // A fault raised while already handling one (the capture itself
+        // faulted — e.g. the original crash was inside malloc and the
+        // allocating Backtrace deadlocked or re-crashed) must not recurse:
+        // go straight to the default action so the process dies and dumps.
+        static IN_HANDLER: AtomicBool = AtomicBool::new(false);
+        if IN_HANDLER.swap(true, Ordering::SeqCst) {
+            unsafe {
+                libc::signal(sig, libc::SIG_DFL);
+                libc::raise(sig);
+            }
+            return;
+        }
+        // If the capture deadlocks (malloc lock held by the faulting thread),
+        // SIGALRM's default action ends the process instead of wedging the
+        // worker forever ("FATAL signal 11; backtrace:" with no frames).
+        unsafe { libc::alarm(5) };
         let role = ROLE.get().copied().unwrap_or("cuda-proc");
         eprintln!("[{role}] FATAL signal {sig}; backtrace:");
         eprintln!("{}", std::backtrace::Backtrace::force_capture());
@@ -96,6 +113,18 @@ pub(crate) fn install_crash_handler(role: &'static str) {
             libc::signal(sig, libc::SIG_DFL);
             libc::raise(sig);
         }
+    }
+    // A stack-overflow SIGSEGV cannot run its handler on the overflowed
+    // stack; SA_ONSTACK only helps if an alternate stack is registered on
+    // the thread. Best-effort: register one for this (installing) thread.
+    unsafe {
+        static mut ALT_STACK: [u8; 256 * 1024] = [0; 256 * 1024];
+        let ss = libc::stack_t {
+            ss_sp: std::ptr::addr_of_mut!(ALT_STACK) as *mut libc::c_void,
+            ss_flags: 0,
+            ss_size: 256 * 1024,
+        };
+        libc::sigaltstack(&ss, std::ptr::null_mut());
     }
     for sig in [libc::SIGSEGV, libc::SIGABRT, libc::SIGBUS, libc::SIGILL] {
         // SAFETY: installing a handler that only formats + re-raises.
