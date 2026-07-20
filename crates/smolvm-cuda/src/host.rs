@@ -1366,6 +1366,7 @@ pub fn ring_dir_set(dir: Option<String>) {
     RING_DIR.with(|r| *r.borrow_mut() = dir);
 }
 
+#[cfg(unix)]
 fn ring_dir_get() -> Option<String> {
     RING_DIR.with(|r| r.borrow().clone())
 }
