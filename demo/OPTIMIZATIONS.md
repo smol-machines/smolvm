@@ -222,3 +222,30 @@ smol-machines fork, one commit ahead of the bundle):
    SMVGRAM2 machinery the daemon already consumes.
 
 Either is a contained libkrun change now, not a fork-the-VMM project.
+
+### P2b FEASIBILITY SOLVED (2026-07-20, H100): clone shared-memory transport works, zero libkrun changes
+
+Full fork-DAX probe on the H100 with the SHIPPED libkrun bundle:
+- Golden: coherent bidirectional shared memory, echo RTT p50 2.12 ms
+- **CLONE, fresh mmap post-fork: RTT p50 2.11 ms — identical to golden.**
+  A forked clone that re-mmaps the DAX file (the shim's remap-on-fork
+  pattern) gets fully coherent host↔guest shared memory.
+
+The entire enabler was smolvm-side (commit d623d14): the static launcher
+now requests a 512 MB DAX window per user mount (SMOLVM_MOUNT_DAX=1) and
+the agent mounts virtiofs `dax,sync` (guest shows `dax=always`; dmesg shows
+`Cache len` per device). The earlier "needs a libkrun fork" conclusion was
+wrong twice over: libkrun's per-device ShmManager was always there, and the
+clone path works because DAX mappings are DEVICE state re-established by
+fresh FUSE setupmapping in the clone — sidestepping the guest-RAM COW wall
+entirely. (A diagnostic libkrun build was used to localize one probe
+failure; it broke boots and is retired — the bundle needs no changes.)
+
+**Remaining work to ship clone rings (all smolvm, scoped):** file-backed
+ring setup — guest shim places its rings + doorbell in a file on the DAX
+mount and re-mmaps on fork-detect; daemon mmaps the same file MAP_SHARED
+(replacing the memfd/GPA advert path for clones); wire RingSetup to carry
+file offsets instead of GPAs for this mode. Expected effect: clone
+per-call transport drops from socket RTT to shared-memory latency — the
+same 318→87 ms class of win the golden got from rings, applied to clones,
+compounding with graph replay (P3b) and the sync-elimination work.
