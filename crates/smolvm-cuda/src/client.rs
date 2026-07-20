@@ -751,7 +751,7 @@ impl<S: Read + Write> Client<S> {
         // also populates the server cache.
         if image.len() >= 64 {
             let mut blob = Vec::with_capacity(32);
-            blob.extend_from_slice(&crate::host::fnv64(image).to_le_bytes());
+            blob.extend_from_slice(&fnv64_local(image).to_le_bytes());
             blob.extend_from_slice(&(image.len() as u64).to_le_bytes());
             blob.extend_from_slice(&image[..8]);
             blob.extend_from_slice(&image[image.len() - 8..]);
@@ -1565,4 +1565,14 @@ mod tests {
         expect.extend_from_slice(&payload);
         assert_eq!(direct.wbuf, expect);
     }
+}
+
+/// FNV-1a (local copy: `host::fnv64` is feature-gated out of shim builds).
+fn fnv64_local(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
 }
