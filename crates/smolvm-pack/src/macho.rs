@@ -443,16 +443,41 @@ impl MachoFile {
             ));
         }
 
-        // Read load commands
-        let mut load_commands = Vec::with_capacity(header.ncmds as usize);
+        // Read load commands. Cap the pre-allocation by the byte budget (each
+        // command is at least LoadCommand::SIZE), so a bogus `ncmds` can't demand
+        // a huge allocation before a single byte is validated.
+        let mut load_commands =
+            Vec::with_capacity((header.ncmds as usize).min(data.len() / LoadCommand::SIZE + 1));
         for _ in 0..header.ncmds {
             let cmd_start = cursor.position() as usize;
             let lc = LoadCommand::read(&mut cursor)?;
 
+            // Validate the declared command size before trusting it: at least its
+            // own 8-byte header (a smaller value underflows `cmdsize - SIZE` below
+            // into an enormous allocation) and within the file (so the fallback
+            // `vec![0u8; remaining]` and `set_position` stay bounded by the input).
+            let cmd_end = cmd_start.checked_add(lc.cmdsize as usize);
+            if (lc.cmdsize as usize) < LoadCommand::SIZE
+                || cmd_end.is_none_or(|end| end > data.len())
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "malformed Mach-O load command 0x{:x}: cmdsize {}",
+                        lc.cmd, lc.cmdsize
+                    ),
+                ));
+            }
+
             let parsed = match lc.cmd {
                 LC_SEGMENT_64 => {
                     let segment = SegmentCommand64::read(&mut cursor, lc.cmd, lc.cmdsize)?;
-                    let mut sections = Vec::with_capacity(segment.nsects as usize);
+                    // Cap by the byte budget: `nsects` is attacker-controlled and
+                    // each section is Section64::SIZE bytes, so an inflated count
+                    // must not drive the pre-allocation.
+                    let mut sections = Vec::with_capacity(
+                        (segment.nsects as usize).min(data.len() / Section64::SIZE + 1),
+                    );
                     for _ in 0..segment.nsects {
                         sections.push(Section64::read(&mut cursor)?);
                     }
@@ -1160,6 +1185,43 @@ mod tests {
         assert_eq!(header.magic, parsed.magic);
         assert_eq!(header.cputype, parsed.cputype);
         assert_eq!(header.ncmds, parsed.ncmds);
+    }
+
+    fn header_with_one_cmd() -> Vec<u8> {
+        let header = MachHeader64 {
+            magic: MH_MAGIC_64,
+            cputype: 0x0100000c, // ARM64
+            cpusubtype: 0,
+            filetype: 2, // MH_EXECUTE
+            ncmds: 1,
+            sizeofcmds: 0,
+            flags: 0,
+            reserved: 0,
+        };
+        let mut buf = Vec::new();
+        header.write(&mut buf).unwrap();
+        buf
+    }
+
+    // A load command claiming cmdsize < its own 8-byte header would underflow
+    // `cmdsize - SIZE` into an enormous allocation; parse must reject it cleanly
+    // so the packer's "not a Mach-O, fall back" path works instead of aborting.
+    #[test]
+    fn parse_rejects_undersized_load_command() {
+        let mut buf = header_with_one_cmd();
+        buf.extend_from_slice(&0x99u32.to_le_bytes()); // unknown cmd
+        buf.extend_from_slice(&4u32.to_le_bytes()); // cmdsize = 4 (< 8)
+        assert!(MachoFile::parse(&buf).is_err());
+    }
+
+    // A cmdsize that runs past the end of the file must error rather than drive a
+    // multi-gigabyte `vec![0u8; cmdsize - SIZE]` allocation.
+    #[test]
+    fn parse_rejects_out_of_bounds_cmdsize() {
+        let mut buf = header_with_one_cmd();
+        buf.extend_from_slice(&0x99u32.to_le_bytes()); // unknown cmd
+        buf.extend_from_slice(&u32::MAX.to_le_bytes()); // cmdsize ~4 GiB, no data
+        assert!(MachoFile::parse(&buf).is_err());
     }
 
     #[test]
