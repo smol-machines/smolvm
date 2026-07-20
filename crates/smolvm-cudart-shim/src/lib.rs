@@ -415,6 +415,104 @@ fn ring_try_setup(client: &mut Client<Stream>) {
     }
 }
 
+/// File-backed ring fallback (DAX clone transport). When the GPA ring is
+/// rejected (clones: their COW RAM is invisible to the daemon), create a
+/// uniquely-named file on the dax ring mount, mmap it MAP_SHARED (a FRESH
+/// mapping — inherited dax mappings die across fork, fresh ones are
+/// host-coherent), and negotiate `RingSetupFile`. Failure is fine — socket
+/// mode continues.
+fn ring_try_setup_file(client: &mut Client<Stream>) {
+    const PAGE: usize = 4096;
+    const REQ_N: usize = 32;
+    const RESP_N: usize = 8;
+    const BOUNCE_N: usize = 64;
+    let trace = std::env::var_os("SMOLVM_CUDA_SHIM_TRACE").is_some();
+    let dir = std::env::var("SMOLVM_CUDA_RING_DIR").unwrap_or_else(|_| "/run/smolvm-ring".into());
+    if !std::path::Path::new(&dir).is_dir() {
+        if trace {
+            eprintln!("[ring-file] no ring dir {dir} — socket mode");
+        }
+        return;
+    }
+    // Unique per (process, attempt): a clone shares the golden's ring dir, so
+    // names must never collide with the golden's (or a sibling's) live file.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut t = 0i64;
+    // SAFETY: plain clock read into a local.
+    unsafe {
+        let mut ts: libc::timespec = std::mem::zeroed();
+        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+        t = ts.tv_nsec as i64 ^ (ts.tv_sec as i64) << 20;
+    }
+    let fname = format!("ring-{}-{}-{}.bin", std::process::id(), seq, t as u64);
+    let path = format!("{dir}/{fname}");
+    let total = (REQ_N + RESP_N + BOUNCE_N) * PAGE;
+    let Ok(f) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    else {
+        if trace {
+            eprintln!("[ring-file] create {path} failed — socket mode");
+        }
+        return;
+    };
+    if f.set_len(total as u64).is_err() {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    // SAFETY: fresh mmap of a regular file on the dax mount; pages stay
+    // mapped for the process lifetime.
+    let base = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            total,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            std::os::unix::io::AsRawFd::as_raw_fd(&f),
+            0,
+        )
+    };
+    if base == libc::MAP_FAILED {
+        let _ = std::fs::remove_file(&path);
+        if trace {
+            eprintln!("[ring-file] mmap failed — socket mode");
+        }
+        return;
+    }
+    // Zero the ring headers so producer/consumer indices start clean.
+    // SAFETY: base..base+total is our fresh mapping.
+    unsafe { std::ptr::write_bytes(base as *mut u8, 0, total) };
+    let pages = |start: usize, n: usize| -> Vec<*mut u8> {
+        (0..n)
+            .map(|i| (base as usize + (start + i) * PAGE) as *mut u8)
+            .collect()
+    };
+    match client.ring_setup_file(
+        PAGE,
+        &fname,
+        pages(0, REQ_N),
+        pages(REQ_N, RESP_N),
+        pages(REQ_N + RESP_N, BOUNCE_N),
+    ) {
+        Ok(()) => {
+            if trace {
+                eprintln!("[ring-file] file-backed rings active ({fname})");
+            }
+        }
+        Err(e) => {
+            // SAFETY: unmapping the mapping we created above.
+            unsafe { libc::munmap(base, total) };
+            let _ = std::fs::remove_file(&path);
+            if trace {
+                eprintln!("[ring-file] setup rejected ({e}) — socket mode");
+            }
+        }
+    }
+}
+
 /// Open a fresh transport, run the init handshake (adopting `resume_token`'s
 /// session handle map if non-zero), retain device 0's primary context, and
 /// (best-effort) set up the shared-memory rings. Used for the first connection
@@ -493,6 +591,11 @@ fn bring_up_client(resume_token: u64) -> Result<(Client<Stream>, u64, i32), c_in
     }
     if try_ring {
         ring_try_setup(&mut client); // best-effort; socket mode on failure
+        if !client.is_ring() {
+            // GPA rings rejected (clone COW RAM is daemon-invisible): try the
+            // DAX file-ring transport instead.
+            ring_try_setup_file(&mut client);
+        }
     }
     // Bring-up answered: restore fully blocking reads (steady-state ops may
     // legitimately wait longer than the handshake bound).

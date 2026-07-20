@@ -211,6 +211,22 @@ fn clone_preamble(warm: bool) -> Option<[u8; 17]> {
     Some(p)
 }
 
+/// Ring-dir advert (`SMVRDIR1` + u16 len + host path): tells the daemon which
+/// HOST directory backs this VM's dax ring mount, so a guest `RingSetupFile`
+/// can be honored. Sent on every daemon connection when the launcher exported
+/// `SMOLVM_CUDA_RING_HOST_DIR` (CUDA machines with the ring mount).
+fn ring_dir_advert() -> Option<Vec<u8>> {
+    let dir = std::env::var("SMOLVM_CUDA_RING_HOST_DIR").ok()?;
+    if dir.is_empty() || dir.len() > 512 {
+        return None;
+    }
+    let mut v = Vec::with_capacity(10 + dir.len());
+    v.extend_from_slice(b"SMVRDIR1");
+    v.extend_from_slice(&(dir.len() as u16).to_le_bytes());
+    v.extend_from_slice(dir.as_bytes());
+    Some(v)
+}
+
 /// A FORK-CLONE VM's proxy prepends the clone preamble (magic + clone id) so
 /// the daemon routes this connection to the clone's isolating worker — and, by
 /// its absence, serves the GOLDEN's own reconnect in-daemon instead of handing
@@ -318,6 +334,9 @@ fn proxy_to_daemon(guest: crate::platform::uds::UdsStream, addr: &str) -> std::i
             let mut daemon = std::os::unix::net::UnixStream::connect(addr)?;
             if let Some(a) = guest_ram_advert() {
                 daemon.write_all(&a)?;
+            }
+            if let Some(r) = ring_dir_advert() {
+                daemon.write_all(&r)?;
             }
             if let Some(p) = preamble() {
                 daemon.write_all(&p)?;

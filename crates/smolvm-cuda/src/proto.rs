@@ -123,6 +123,7 @@ pub enum Op {
     /// completion ring, and a bounce buffer for oversized responses. After
     /// the host acks, the socket carries only doorbell bytes.
     RingSetup = 0xD0,
+    RingSetupFile = 0xD1,
     // CUDA VMM (virtual memory management) — torch's expandable-segments
     // allocator. Control-plane ops, all synchronous.
     MemAddressReserve = 0xE0,
@@ -205,6 +206,7 @@ impl Op {
             0xB2 => Op::MemcpyGpaHtoD,
             0xB3 => Op::MemcpyGpaDtoH,
             0xD0 => Op::RingSetup,
+            0xD1 => Op::RingSetupFile,
             0xE0 => Op::MemAddressReserve,
             0xE1 => Op::MemCreate,
             0xE8 => Op::MemCreateVh,
@@ -524,6 +526,19 @@ pub enum Request {
         req_pages: Vec<u64>,
         resp_pages: Vec<u64>,
         bounce_pages: Vec<u64>,
+    },
+    /// Like [`Request::RingSetup`] but the rings live in a FILE inside a host
+    /// directory the per-VM proxy advertised at connect (DAX-backed clone
+    /// rings — clone guest RAM is COW-private, but a fresh MAP_SHARED mmap of
+    /// a dax-mount file is host-coherent). `fname` is a bare file name (no
+    /// separators); the file holds `req_n` + `resp_n` + `bounce_n` contiguous
+    /// pages of `page_size`.
+    RingSetupFile {
+        page_size: u32,
+        req_n: u32,
+        resp_n: u32,
+        bounce_n: u32,
+        fname: Vec<u8>,
     },
     /// VMM: reserve a virtual address range (no backing).
     MemAddressReserve {
@@ -1122,6 +1137,20 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
                 }
             }
         }
+        Request::RingSetupFile {
+            page_size,
+            req_n,
+            resp_n,
+            bounce_n,
+            fname,
+        } => {
+            w_u8(&mut b, Op::RingSetupFile as u8);
+            w_u32(&mut b, *page_size);
+            w_u32(&mut b, *req_n);
+            w_u32(&mut b, *resp_n);
+            w_u32(&mut b, *bounce_n);
+            w_bytes(&mut b, fname);
+        }
         Request::MemAddressReserve { size, align } => {
             w_u8(&mut b, Op::MemAddressReserve as u8);
             w_u64(&mut b, *size);
@@ -1423,6 +1452,13 @@ pub fn decode_request(payload: &[u8]) -> io::Result<Request> {
                 bounce_pages,
             }
         }
+        Op::RingSetupFile => Request::RingSetupFile {
+            page_size: c.u32()?,
+            req_n: c.u32()?,
+            resp_n: c.u32()?,
+            bounce_n: c.u32()?,
+            fname: c.bytes()?,
+        },
         Op::MemAddressReserve => Request::MemAddressReserve {
             size: c.u64()?,
             align: c.u64()?,
@@ -1566,6 +1602,7 @@ pub fn decode_response(op: Op, payload: &[u8]) -> io::Result<(i32, Response)> {
         | Op::MemcpyGpaHtoD
         | Op::MemcpyGpaDtoH
         | Op::RingSetup
+        | Op::RingSetupFile
         | Op::MemMap
         | Op::MemSetAccess
         | Op::MemUnmap

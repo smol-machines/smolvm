@@ -1353,6 +1353,23 @@ fn xlat_func(b: &mut dyn Backend, golden: u64) -> u64 {
         }
     }
 }
+/// Per-connection host ring directory for file-backed rings, advertised by
+/// the per-VM proxy at connect (SMVRDIR1 preamble) and installed by the
+/// serving thread before entering `serve`. Thread-local: one serve thread per
+/// connection.
+thread_local! {
+    static RING_DIR: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Install (or clear) the file-ring host directory for THIS serve thread.
+pub fn ring_dir_set(dir: Option<String>) {
+    RING_DIR.with(|r| *r.borrow_mut() = dir);
+}
+
+fn ring_dir_get() -> Option<String> {
+    RING_DIR.with(|r| r.borrow().clone())
+}
+
 fn xlat_stream(h: u64) -> u64 {
     STREAM_TRANS.with(|m| m.borrow().get(&h).copied().unwrap_or(h))
 }
@@ -1813,6 +1830,33 @@ fn serve_inner<S: Read + Write>(
                         }
                     }
                 }
+                // File-backed rings (DAX clone transport): the rings live in a
+                // file inside the host dir the per-VM proxy advertised; guest
+                // and host mmap the same page-cache pages (coherent), which is
+                // how a COW clone gets ring speed without guest-RAM visibility.
+                if let Request::RingSetupFile {
+                    page_size,
+                    req_n,
+                    resp_n,
+                    bounce_n,
+                    fname,
+                } = req
+                {
+                    match HostRings::map_file(page_size, req_n, resp_n, bounce_n, &fname) {
+                        Ok(rings) => {
+                            write_msg(&mut stream, &encode_response(0, &Response::Ok))?;
+                            eprintln!(
+                                "[ring-file] file rings active ({req_n}/{resp_n}/{bounce_n} pages)"
+                            );
+                            return serve_rings(stream, backend, sess, quiet_sticky, rings);
+                        }
+                        Err(code) => {
+                            eprintln!("[ring-file] setup rejected code={code}");
+                            write_msg(&mut stream, &encode_response(code, &Response::Ok))?;
+                            continue;
+                        }
+                    }
+                }
                 ROUNDTRIP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let rtt = rtt_us();
                 if rtt > 0 {
@@ -1868,6 +1912,83 @@ impl HostRings {
         let resp = map_all(resp_pages)?;
         let bounce = map_all(bounce_pages)?;
         // SAFETY: pages are backed by mapped guest RAM for the VM's lifetime.
+        Ok(HostRings {
+            req: unsafe { crate::ring::Ring::from_pages(req, ps) },
+            resp: unsafe { crate::ring::Ring::from_pages(resp, ps) },
+            bounce,
+            page_size: ps,
+        })
+    }
+
+    /// File-backed variant (DAX clone rings): mmap `fname` (a bare name inside
+    /// the per-connection advertised ring dir) MAP_SHARED and slice it into
+    /// req/resp/bounce page lists. The guest mmaps the SAME file through its
+    /// dax mount, so both sides touch the same host page-cache pages.
+    fn map_file(
+        page_size: u32,
+        req_n: u32,
+        resp_n: u32,
+        bounce_n: u32,
+        fname: &[u8],
+    ) -> Result<HostRings, i32> {
+        let ps = page_size as usize;
+        if ps < crate::ring::HEADER_SIZE + crate::ring::RECORD_SIZE
+            || req_n == 0
+            || resp_n == 0
+            || req_n > 1024
+            || resp_n > 1024
+            || bounce_n > 4096
+        {
+            return Err(1);
+        }
+        let Some(dir) = ring_dir_get() else {
+            return Err(801); // no advert on this connection -> not supported
+        };
+        let name = std::str::from_utf8(fname).map_err(|_| 1)?;
+        // Bare names only: the guest must not traverse out of the ring dir.
+        if name.is_empty() || name.contains('/') || name.contains("..") {
+            return Err(1);
+        }
+        let total = (req_n + resp_n + bounce_n) as usize * ps;
+        let path = std::path::Path::new(&dir).join(name);
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|_| 1)?;
+        if f.metadata()
+            .map(|m| (m.len() as usize) < total)
+            .unwrap_or(true)
+        {
+            return Err(1);
+        }
+        // SAFETY: mapping a regular file we just validated, MAP_SHARED so the
+        // guest's dax view and ours are the same physical pages.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                total,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                std::os::unix::io::AsRawFd::as_raw_fd(&f),
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            return Err(1);
+        }
+        let pages = |start: usize, n: usize| -> Vec<*mut u8> {
+            (0..n)
+                .map(|i| (base as usize + (start + i) * ps) as *mut u8)
+                .collect()
+        };
+        let req = pages(0, req_n as usize);
+        let resp = pages(req_n as usize, resp_n as usize);
+        let bounce = pages((req_n + resp_n) as usize, bounce_n as usize);
+        // The mapping (and an O_RDWR fd via the mmap ref) lives for the
+        // connection; the file itself can be unlinked by either side later.
+        // SAFETY: pages are backed by the shared file mapping for the
+        // connection's lifetime (never munmap'd until process exit).
         Ok(HostRings {
             req: unsafe { crate::ring::Ring::from_pages(req, ps) },
             resp: unsafe { crate::ring::Ring::from_pages(resp, ps) },
@@ -3441,7 +3562,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             .map(|_| Response::Ok),
         // Handled by the serve loop (transport concern, not a backend op);
         // reaching dispatch means the transport doesn't support rings.
-        Request::RingSetup { .. } => Err(CUDA_ERROR_NOT_SUPPORTED),
+        Request::RingSetup { .. } | Request::RingSetupFile { .. } => Err(CUDA_ERROR_NOT_SUPPORTED),
         Request::MemAddressReserve { size, align } => {
             b.mem_address_reserve(size, align).map(|va| {
                 sess.owned_vmm_reservations.insert(va, size);

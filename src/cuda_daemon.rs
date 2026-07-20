@@ -148,12 +148,13 @@ pub fn run(sock: &Path) -> io::Result<()> {
                                         // remote clone VM's proxy) route to a worker or
                                         // are rejected; a golden's reconnect (token, no
                                         // preamble) falls through to in-daemon serving.
-                                        if route_clone_connection(s.as_raw_fd()) {
+                                        let rdir = consume_ring_dir_preamble(s.as_raw_fd());
+                                        if route_clone_connection(s.as_raw_fd(), rdir.as_deref()) {
                                             drop(s); // worker owns it / rejected
                                             continue;
                                         }
                                     }
-                                    spawn_serve(s, &active_tcp, None);
+                                    spawn_serve(s, &active_tcp, None, None);
                                 }
                                 Err(e) => {
                                     tracing::debug!(error = %e, "CUDA daemon TCP accept error")
@@ -186,18 +187,19 @@ pub fn run(sock: &Path) -> io::Result<()> {
                 // would silently serve it a reconstructed COPY of its memory.
                 // Only fires under SMOLVM_CUDA_FORK_WORKERS; otherwise legacy.
                 #[cfg(unix)]
-                let guest_ram = {
+                let (guest_ram, ring_dir) = {
                     use std::os::unix::io::AsRawFd;
                     let ram = consume_ram_preamble(stream.as_raw_fd());
-                    if route_clone_connection(stream.as_raw_fd()) {
+                    let rdir = consume_ring_dir_preamble(stream.as_raw_fd());
+                    if route_clone_connection(stream.as_raw_fd(), rdir.as_deref()) {
                         drop(stream); // worker owns it / rejected
                         continue;
                     }
-                    ram
+                    (ram, rdir)
                 };
                 #[cfg(not(unix))]
-                let guest_ram = None;
-                spawn_serve(stream, &active, guest_ram);
+                let (guest_ram, ring_dir) = (None, None::<String>);
+                spawn_serve(stream, &active, guest_ram, ring_dir);
             }
             Err(e) => tracing::debug!(error = %e, "CUDA daemon accept error"),
         }
@@ -211,8 +213,12 @@ pub fn run(sock: &Path) -> io::Result<()> {
 /// `guest_ram`: daemon-local mappings of the VM's guest RAM (from the RAM
 /// preamble) — installing them enables the ring transport + zero-copy GPA
 /// memcpys for this connection.
-fn spawn_serve<S>(stream: S, active: &Arc<AtomicUsize>, guest_ram: Option<Vec<(u64, u64, u64)>>)
-where
+fn spawn_serve<S>(
+    stream: S,
+    active: &Arc<AtomicUsize>,
+    guest_ram: Option<Vec<(u64, u64, u64)>>,
+    ring_dir: Option<String>,
+) where
     S: std::io::Read + std::io::Write + Send + 'static,
 {
     let guard = ConnGuard::new(active);
@@ -228,6 +234,7 @@ where
                 );
                 backend.set_guest_ram(regions);
             }
+            smolvm_cuda::host::ring_dir_set(ring_dir);
             if let Err(e) = serve(stream, backend.as_mut()) {
                 tracing::debug!(error = %e, "CUDA daemon connection ended");
             }
@@ -241,6 +248,60 @@ where
 /// `(gpa, daemon_va, len)` for `Backend::set_guest_ram`. Mappings are leaked
 /// (VM-lifetime; bounded by connections-with-adverts). Same-uid access only —
 /// exactly the trust boundary the daemon already has with its VMs.
+/// Consume a ring-dir advertisement (`SMVRDIR1` + u16 len + host path) if
+/// present. Returns the HOST directory backing the VM's dax ring mount, which
+/// `RingSetupFile` on this connection resolves file names against.
+#[cfg(unix)]
+fn consume_ring_dir_preamble(fd: std::os::unix::io::RawFd) -> Option<String> {
+    let mut hdr = [0u8; 10];
+    let mut n: isize = 0;
+    // SAFETY: MSG_PEEK of the fixed header on a valid fd; loop because proxied
+    // bytes can arrive in pieces.
+    for _ in 0..200 {
+        n = unsafe {
+            libc::recv(
+                fd,
+                hdr.as_mut_ptr() as *mut libc::c_void,
+                hdr.len(),
+                libc::MSG_PEEK,
+            )
+        };
+        if n >= 8 && &hdr[..8] != b"SMVRDIR1" {
+            return None; // not ours; leave the bytes untouched
+        }
+        if n >= 10 || n == 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    if n < 10 || &hdr[..8] != b"SMVRDIR1" {
+        return None;
+    }
+    let len = u16::from_le_bytes(hdr[8..10].try_into().unwrap()) as usize;
+    if len == 0 || len > 512 {
+        return None;
+    }
+    let total = 10 + len;
+    let mut buf = vec![0u8; total];
+    let mut got = 0usize;
+    while got < total {
+        // SAFETY: plain recv into our buffer.
+        let r = unsafe {
+            libc::recv(
+                fd,
+                buf[got..].as_mut_ptr() as *mut libc::c_void,
+                total - got,
+                0,
+            )
+        };
+        if r <= 0 {
+            return None;
+        }
+        got += r as usize;
+    }
+    String::from_utf8(buf[10..].to_vec()).ok()
+}
+
 #[cfg(unix)]
 fn consume_ram_preamble(fd: std::os::unix::io::RawFd) -> Option<Vec<(u64, u64, u64)>> {
     let mut hdr = [0u8; 20];
@@ -386,6 +447,8 @@ type SeedHandles = (
 pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
     use std::os::unix::io::FromRawFd;
     install_crash_handler("cuda-clone-worker");
+    // File-ring transport (per-worker: one worker == one clone VM == one dir).
+    smolvm_cuda::host::ring_dir_set(std::env::var("SMOLVM_CUDA_CLONE_RING_DIR").ok());
     let mut backend = make_backend();
     // Our own primary context (separate process ⇒ own UVA), so we can place memory
     // at the golden's exact VAs.
@@ -544,6 +607,9 @@ fn serve_attached_channel(
     let mut backend = make_backend();
     let _ = backend.init();
     let _ = backend.primary_ctx_retain(dev);
+    // File-ring transport: attached channels serve on their own threads, and
+    // the ring dir is per-worker (thread-local install per serve thread).
+    smolvm_cuda::host::ring_dir_set(std::env::var("SMOLVM_CUDA_CLONE_RING_DIR").ok());
     let (vmm, handles, alloc) = seed;
     if let Some(v) = vmm {
         smolvm_cuda::host::set_vmm_trans(v.clone());
@@ -1162,7 +1228,7 @@ fn clone_worker_registry() -> &'static Mutex<std::collections::HashMap<(u64, u64
 /// token-bearing Init WITHOUT the preamble must resume in-daemon (a worker
 /// would silently serve it a reconstructed COPY of its memory).
 #[cfg(unix)]
-fn route_clone_connection(fd: std::os::unix::io::RawFd) -> bool {
+fn route_clone_connection(fd: std::os::unix::io::RawFd, ring_dir: Option<&str>) -> bool {
     let Some((clone_id, flags)) = consume_clone_preamble(fd) else {
         return false;
     };
@@ -1194,7 +1260,7 @@ fn route_clone_connection(fd: std::os::unix::io::RawFd) -> bool {
             );
             return false;
         };
-        match spawn_clone_worker(fd, token, share_weights) {
+        match spawn_clone_worker(fd, token, share_weights, ring_dir) {
             Ok((pid, ctrl)) => {
                 reg.insert((token, clone_id), (pid, ctrl));
                 tracing::info!(
@@ -1338,7 +1404,7 @@ fn route_clone_connection(fd: std::os::unix::io::RawFd) -> bool {
             }
         }
     }
-    match spawn_clone_worker(fd, token, share_weights) {
+    match spawn_clone_worker(fd, token, share_weights, ring_dir) {
         Ok((pid, ctrl)) => {
             reg.insert((token, clone_id), (pid, ctrl));
             tracing::info!(
@@ -1566,6 +1632,7 @@ fn spawn_clone_worker(
     conn_fd: std::os::unix::io::RawFd,
     token: u64,
     share_weights: bool,
+    ring_dir: Option<&str>,
 ) -> io::Result<(u32, std::os::unix::io::RawFd)> {
     use std::os::unix::process::CommandExt;
     // Gather the golden's VMM layout (reservations + maps→physical handle).
@@ -1806,6 +1873,11 @@ fn spawn_clone_worker(
     cmd.env("SMOLVM_CUDA_CLONE_LAYOUT", layout);
     cmd.env("SMOLVM_CUDA_CLONE_DEVICE", golden_dev.to_string());
     cmd.env("SMOLVM_CUDA_CLONE_CTRL", ctrl_slot.to_string());
+    if let Some(rd) = ring_dir {
+        // File-ring transport: the worker resolves RingSetupFile names
+        // against the clone VM's advertised host ring dir.
+        cmd.env("SMOLVM_CUDA_CLONE_RING_DIR", rd);
+    }
     // Per-fork density: this fork asked for --share-weights (preamble flag), so
     // the worker's reconstruction shares the golden's loaded weight physicals
     // instead of copying them. The daemon-wide env remains the global default;

@@ -270,6 +270,39 @@ impl<S: Read + Write> Client<S> {
         Ok(())
     }
 
+    /// File-backed ring setup (DAX clone transport): the caller mmap'd
+    /// `fname` (inside the guest's dax ring mount) MAP_SHARED and hands the
+    /// page pointers here; the host mmaps the same file through the dir its
+    /// proxy advertised. Layout: req pages, then resp, then bounce.
+    pub fn ring_setup_file(
+        &mut self,
+        page_size: usize,
+        fname: &str,
+        req: Vec<*mut u8>,
+        resp: Vec<*mut u8>,
+        bounce: Vec<*mut u8>,
+    ) -> Result<()> {
+        self.call(
+            &Request::RingSetupFile {
+                page_size: page_size as u32,
+                req_n: req.len() as u32,
+                resp_n: resp.len() as u32,
+                bounce_n: bounce.len() as u32,
+                fname: fname.as_bytes().to_vec(),
+            },
+            Op::RingSetupFile,
+        )?;
+        // SAFETY: the file mapping is owned by the shim and stays mapped for
+        // the process lifetime (never munmap'd).
+        self.ring = Some(ClientRing {
+            req: unsafe { crate::ring::Ring::from_pages(req, page_size) },
+            resp: unsafe { crate::ring::Ring::from_pages(resp, page_size) },
+            bounce,
+            page_size,
+        });
+        Ok(())
+    }
+
     pub fn is_ring(&self) -> bool {
         self.ring.is_some()
     }
@@ -1155,7 +1188,11 @@ impl<S: Read + Write> Client<S> {
         // No return value (also graph-capturable): fire-and-forget. It flushes
         // before any sync that reads the event (EventQuery/Synchronize/
         // ElapsedTime), so the record is always ordered before its reader.
-        self.call_deferred_kind(&Request::EventRecord { event, stream }, Op::EventRecord, false)
+        self.call_deferred_kind(
+            &Request::EventRecord { event, stream },
+            Op::EventRecord,
+            false,
+        )
     }
 
     pub fn event_synchronize(&mut self, event: u64) -> Result<()> {
