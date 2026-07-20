@@ -933,6 +933,37 @@ pub fn module_handoff_snapshot(
 /// P3b: capture-replay op-logs, `(graph_vh, exec_vh, ordered op payloads)`.
 type GraphOplogs = Vec<(u64, u64, Vec<Vec<u8>>)>;
 
+/// Live golden-layout tokens WITH fork content (staged modules / VMM maps /
+/// library handles). Every guest channel's session registers a layout, but
+/// only the golden's real one carries content — filtering to those makes the
+/// eager warm-dial token inference unambiguous in the single-golden case.
+pub fn layout_tokens() -> Vec<u64> {
+    let reg = LAYOUT_HANDOFF.lock().unwrap();
+    let Some(r) = reg.as_ref() else {
+        return Vec::new();
+    };
+    // One golden's layout Arc is registered under EVERY channel token that
+    // shares it — dedupe by Arc identity, keeping the smallest token per
+    // distinct layout so the result is deterministic.
+    let mut seen: Vec<(*const std::sync::Mutex<GoldenLayout>, u64)> = Vec::new();
+    for (&t, w) in r.iter() {
+        let Some(l) = w.upgrade() else { continue };
+        let has_content = {
+            let g = l.lock().unwrap();
+            !g.modules.is_empty() || !g.maps.is_empty() || !g.lib_handles.is_empty()
+        };
+        if !has_content {
+            continue;
+        }
+        let p = std::sync::Arc::as_ptr(&l);
+        match seen.iter_mut().find(|(sp, _)| *sp == p) {
+            Some((_, st)) => *st = (*st).min(t),
+            None => seen.push((p, t)),
+        }
+    }
+    seen.into_iter().map(|(_, t)| t).collect()
+}
+
 /// P3b: snapshot the golden's capture-replay op-logs for a clone worker,
 /// `(graph_vh, exec_vh, ordered op payloads)`. Separate from
 /// [`module_handoff_snapshot`] so its 6-tuple stays stable.
@@ -961,6 +992,60 @@ thread_local! {
 
 fn take_worker_graph_oplogs() -> GraphOplogs {
     WORKER_GRAPH_OPLOGS.with(|r| std::mem::take(&mut *r.borrow_mut()))
+}
+
+fn worker_graph_oplogs_peek() -> GraphOplogs {
+    WORKER_GRAPH_OPLOGS.with(|r| r.borrow().clone())
+}
+
+/// P3b: pre-warm a clone worker at SPAWN, before any guest channel attaches —
+/// eagerly reload every staged golden module and re-capture every inherited
+/// graph into the process-wide registries. Serving sessions then ADOPT the
+/// results at resume instead of paying reload/re-capture on the guest's first
+/// CUDA call. Must run on the worker main thread AFTER module staging and
+/// lib-handle replay (their thread-locals seed the scratch session).
+/// Opt out: SMOLVM_CUDA_PREREPLAY=0.
+pub fn prewarm_clone_worker(b: &mut dyn Backend) {
+    if std::env::var("SMOLVM_CUDA_PREREPLAY").as_deref() == Ok("0") {
+        return;
+    }
+    let t0 = std::time::Instant::now();
+    let mods: Vec<u64> = MOD_IMAGES.with(|m| m.borrow().keys().copied().collect());
+    let nmods = mods.len();
+    for g in mods {
+        let _ = xlat_mod(b, g);
+    }
+    let t_mods = t0.elapsed().as_millis();
+    // Scratch session: replay dispatch needs pointer translation for
+    // alloc-table clones (VMM clones are address-preserved / identity).
+    let mut sess = Session {
+        dptr_trans: worker_alloc_trans_snapshot(),
+        ..Session::default()
+    };
+    gpu::set_lib_trans(&sess.dptr_trans);
+    let oplogs = worker_graph_oplogs_peek();
+    let (mut ok, mut failed) = (0u32, 0u32);
+    for (_graph_vh, exec_vh, ops) in oplogs {
+        if replayed_exec_get(exec_vh).is_some() {
+            continue;
+        }
+        sess.clone_graph_oplogs.insert(exec_vh, ops);
+        match replay_capture_graph(&mut sess, b, exec_vh) {
+            Ok(exec) => {
+                replayed_exec_put(exec_vh, exec);
+                ok += 1;
+            }
+            Err(e) => {
+                eprintln!("[p3b] spawn pre-replay exec {exec_vh:#x} failed st={e}");
+                failed += 1;
+            }
+        }
+    }
+    eprintln!(
+        "[p3b] spawn pre-warm: {nmods} module(s) in {t_mods} ms, {ok} graph(s) re-captured \
+         ({failed} deferred) in {} ms total",
+        t0.elapsed().as_millis()
+    );
 }
 
 /// Replay the golden's top-level library-handle creates in THIS worker's
@@ -2906,15 +2991,25 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 && !sess
                     .owned_graph_reals
                     .contains(&raw_graph(sess, graph_exec))
-                && sess.clone_graph_oplogs.contains_key(&graph_exec)
             {
-                // Another session in this worker may have re-captured already
-                // (pre-replay at resume, or its own lazy launch) — adopt.
+                // Registry FIRST, independent of this session's oplog stash:
+                // spawn pre-warm re-captures on the worker main thread, while
+                // the resumed session may serve on an attached channel whose
+                // thread-local oplogs were never seeded — the registry is the
+                // process-wide truth. Empty outside clone workers, so this is
+                // a no-op for golden/daemon sessions.
                 if let Some(exec) = replayed_exec_get(graph_exec) {
                     adopt_replayed_exec(sess, graph_exec, exec);
                     let raw = raw_stream(sess, stream)?;
                     return b.graph_launch(exec, raw).map(|_| Response::Ok);
                 }
+            }
+            if clone_graph_replay_enabled()
+                && !sess
+                    .owned_graph_reals
+                    .contains(&raw_graph(sess, graph_exec))
+                && sess.clone_graph_oplogs.contains_key(&graph_exec)
+            {
                 match replay_capture_graph(sess, b, graph_exec) {
                     Ok(exec) => {
                         replayed_exec_put(graph_exec, exec);

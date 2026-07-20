@@ -458,6 +458,11 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
         // inherited graph/exec handles to the worker's rebuilt reals.
         let nrebuilt = smolvm_cuda::host::rebuild_clone_graphs(backend.as_mut(), graphs);
         let _ = std::fs::remove_file(&modpath);
+        // P3b: pre-warm NOW (module reloads + graph re-capture into the
+        // process-wide registries), while the guest VM is still resuming —
+        // serving sessions adopt the results instead of doing this work on
+        // the guest's first CUDA call.
+        smolvm_cuda::host::prewarm_clone_worker(backend.as_mut());
         tracing::info!(
             modules = nm,
             functions = nf,
@@ -1146,6 +1151,50 @@ fn route_clone_connection(fd: std::os::unix::io::RawFd) -> bool {
         return false;
     };
     let share_weights = flags & 1 != 0;
+    // Warm dial (flag bit 1): the clone VM's proxy dials at STARTUP so worker
+    // spawn (CUDA init + memory reconstruction + module/graph pre-warm) runs
+    // concurrent with guest resume instead of on the guest's first CUDA call.
+    // No Init ever arrives on this connection — it parks as the worker's idle
+    // primary channel. The golden token is inferred from the registered
+    // layouts (unambiguous with one golden; otherwise skip and let the real
+    // channel spawn with its true token).
+    if flags & 2 != 0 {
+        let mut reg = clone_worker_registry().lock().unwrap();
+        let live = reg.iter().find_map(|(&(_, cid), &(pid, ctrl))| {
+            // SAFETY: kill(pid, 0) — pure liveness probe, no signal delivered.
+            (cid == clone_id && unsafe { libc::kill(pid as i32, 0) } == 0).then_some((pid, ctrl))
+        });
+        if let Some((_pid, ctrl)) = live {
+            // Worker already up (a real channel won the race): park there.
+            let _ = send_fd(ctrl, fd);
+            return true;
+        }
+        let tokens = smolvm_cuda::host::layout_tokens();
+        let [token] = tokens[..] else {
+            tracing::info!(
+                clone_id,
+                goldens = tokens.len(),
+                "warm dial: cannot infer golden token; deferring spawn to first real channel"
+            );
+            return false;
+        };
+        match spawn_clone_worker(fd, token, share_weights) {
+            Ok((pid, ctrl)) => {
+                reg.insert((token, clone_id), (pid, ctrl));
+                tracing::info!(
+                    token,
+                    clone_id,
+                    worker_pid = pid,
+                    "warm dial: spawned clone worker ahead of first CUDA call"
+                );
+                return true;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, token, clone_id, "warm dial: worker spawn failed");
+                return false;
+            }
+        }
+    }
     let Some(token) = peek_clone_token(fd) else {
         // A clone VM's connection whose Init carries no lineage token. The
         // guest treats CUDA state as process-global, so if this clone already
@@ -1241,6 +1290,37 @@ fn route_clone_connection(fd: std::os::unix::io::RawFd) -> bool {
         reg.remove(&(token, clone_id));
         // SAFETY: control fd of a dead/reaped worker.
         unsafe { libc::close(ctrl) };
+    }
+    // A warm-dial worker may be registered under an INFERRED token. A clone
+    // has exactly one golden lineage, so any live worker for this clone_id is
+    // the right one — attach rather than spawning a duplicate (which would
+    // split the clone's CUDA state across two processes).
+    let live = reg.iter().find_map(|(&(t, cid), &(pid, ctrl))| {
+        // SAFETY: kill(pid, 0) — pure liveness probe, no signal delivered.
+        (cid == clone_id && t != token && unsafe { libc::kill(pid as i32, 0) } == 0)
+            .then_some((pid, ctrl))
+    });
+    if let Some((pid, ctrl)) = live {
+        match send_fd(ctrl, fd) {
+            Ok(()) => {
+                tracing::info!(
+                    token,
+                    clone_id,
+                    worker_pid = pid,
+                    "attached tokened clone channel to its (warm-spawned) live worker"
+                );
+                return true;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    token,
+                    clone_id,
+                    worker_pid = pid,
+                    "attach to warm worker failed; spawning fresh"
+                );
+            }
+        }
     }
     match spawn_clone_worker(fd, token, share_weights) {
         Ok((pid, ctrl)) => {

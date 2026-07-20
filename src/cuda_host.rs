@@ -101,6 +101,36 @@ pub fn start(socket_path: &Path) -> std::io::Result<()> {
             if let Some(ref addr) = daemon {
                 tracing::info!(daemon = %addr, "cuda-host: shared-daemon proxy mode");
             }
+            // P3b: a FORK-CLONE VM warms its daemon-side worker EAGERLY. The
+            // warm-flagged preamble makes the daemon spawn the worker (CUDA
+            // init + memory reconstruction + module/graph pre-warm) NOW,
+            // concurrent with guest resume, instead of on the guest's first
+            // CUDA call. The connection is held open as the worker's idle
+            // primary channel; real guest channels attach to the live worker.
+            if let (Some(addr), Some(p)) = (daemon.clone(), clone_preamble(true)) {
+                thread::Builder::new()
+                    .name("cuda-clone-warm".into())
+                    .spawn(move || {
+                        use std::io::{Read as _, Write as _};
+                        if addr.starts_with('/') {
+                            #[cfg(unix)]
+                            if let Ok(mut s) = std::os::unix::net::UnixStream::connect(&addr) {
+                                if s.write_all(&p).is_ok() {
+                                    tracing::info!("cuda-host: clone warm dial sent");
+                                    let mut b = [0u8; 1];
+                                    let _ = s.read(&mut b); // parked for the worker's lifetime
+                                }
+                            }
+                        } else if let Ok(mut s) = std::net::TcpStream::connect(&addr) {
+                            if s.write_all(&p).is_ok() {
+                                tracing::info!("cuda-host: clone warm dial sent");
+                                let mut b = [0u8; 1];
+                                let _ = s.read(&mut b);
+                            }
+                        }
+                    })
+                    .ok();
+            }
             for stream in listener.incoming() {
                 match stream {
                     Ok(stream) => {
@@ -160,23 +190,31 @@ fn fork_clone_id() -> Option<u64> {
 /// shared-host-daemon architecture: every VM's traffic lands in one process, so
 /// they share a single GPU context and device memory.
 ///
+/// The 17-byte clone-connection preamble (magic + clone id + flags), `None`
+/// on non-clone VMs. Flag bit 0: forked with `--share-weights`; bit 1: warm
+/// dial (spawn the worker eagerly, no Init follows on this connection).
+fn clone_preamble(warm: bool) -> Option<[u8; 17]> {
+    let id = fork_clone_id()?;
+    let mut p = [0u8; 17];
+    p[..8].copy_from_slice(&smolvm_cuda::proto::CLONE_PREAMBLE_MAGIC);
+    p[8..16].copy_from_slice(&id.to_le_bytes());
+    // bit 0: this fork was requested with --share-weights (the launcher put
+    // SMOLVM_CUDA_CLONE_SHARE in this clone VMM's env).
+    if std::env::var_os("SMOLVM_CUDA_CLONE_SHARE").is_some() {
+        p[16] |= 1;
+    }
+    if warm {
+        p[16] |= 2;
+    }
+    Some(p)
+}
+
 /// A FORK-CLONE VM's proxy prepends the clone preamble (magic + clone id) so
 /// the daemon routes this connection to the clone's isolating worker — and, by
 /// its absence, serves the GOLDEN's own reconnect in-daemon instead of handing
 /// it a worker's reconstructed COPY of its memory.
 fn proxy_to_daemon(guest: crate::platform::uds::UdsStream, addr: &str) -> std::io::Result<()> {
-    fn preamble() -> Option<[u8; 17]> {
-        let id = fork_clone_id()?;
-        let mut p = [0u8; 17];
-        p[..8].copy_from_slice(&smolvm_cuda::proto::CLONE_PREAMBLE_MAGIC);
-        p[8..16].copy_from_slice(&id.to_le_bytes());
-        // bit 0: this fork was requested with --share-weights (the launcher put
-        // SMOLVM_CUDA_CLONE_SHARE in this clone VMM's env).
-        if std::env::var_os("SMOLVM_CUDA_CLONE_SHARE").is_some() {
-            p[16] |= 1;
-        }
-        Some(p)
-    }
+    let preamble = || clone_preamble(false);
     /// Guest-RAM advertisement for a SHARED daemon: when this VM's RAM is
     /// memfd-backed (forkable machines), tell the daemon how to map the same
     /// pages via `/proc/<pid>/fd/<memfd>` — magic + pid + fd + count +
