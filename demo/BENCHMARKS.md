@@ -23,12 +23,21 @@ in the smolvm arm.
 | Per-learner throughput | ~1,340 tok/s | ~340 tok/s |
 | Correctness | ✓ distinct loss curves | ✓ distinct loss curves (all N, post-fix) |
 
-Density scaling: each added container costs ~7.7 GB; each added smolvm clone
-~3.7 GB (the ~5 GB base is shared once). Container OOMs near N=10 on 80 GB;
-smolvm fits roughly 2× the learners. **At max GPU utilization smolvm matches
-container aggregate throughput while using one model load + instant forks and
-fitting ~2× the concurrent learners** — the density/startup win offsets the
-per-learner remoting tax.
+Density scaling (measured, all correct — 0 nan):
+
+| Peak GPU | Container | smolvm | smolvm density |
+|---|---|---|---|
+| N=3 | 23.2 GB | 16.1 GB | −30% |
+| N=8 | 61.8 GB | 28.2 GB | **−54%** |
+
+Each added container costs ~7.7 GB; each added smolvm clone only ~2.4 GB (the
+~5 GB base is shared once). Container OOMs near N=10 on 80 GB; smolvm fits
+**~3× the learners** (~N=30). The density advantage GROWS with N. Aggregate
+throughput at N=8: container 7,088 vs smolvm 2,053 tok/s — container wins
+per-learner throughput (the remoting tax), smolvm wins learners-per-GB and
+startup. So smolvm is the better choice when VRAM/learner-count-bound or
+startup-bound (many concurrent experiments, elastic spawning); container when
+raw per-learner throughput-bound.
 
 **Correctness fix (this run):** concurrent share-weights training corrupted
 (loss=nan) at N≥3 because the golden froze without exercising the training
