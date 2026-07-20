@@ -116,13 +116,14 @@ pub(crate) async fn fetch_blob_from_peers(
     client: &reqwest::Client,
     peers: &[String],
     digest: &str,
+    max_bytes: u64,
     output: Option<&Path>,
     cache: &BlobCache,
 ) -> Option<PullResult> {
     let partial_path = cache.blob_path_for(digest).with_extension("partial");
 
     for peer in peers {
-        match fetch_one(client, peer, digest, output, cache).await {
+        match fetch_one(client, peer, digest, max_bytes, output, cache).await {
             Ok(result) => {
                 tracing::info!(peer = %peer, digest = %digest, "fetched layer blob from peer (P2P)");
                 return Some(result);
@@ -149,6 +150,7 @@ async fn fetch_one(
     client: &reqwest::Client,
     peer: &str,
     digest: &str,
+    max_bytes: u64,
     output: Option<&Path>,
     cache: &BlobCache,
 ) -> Result<PullResult> {
@@ -167,7 +169,7 @@ async fn fetch_one(
 
     // Identical verification + cache accounting to the registry path: the digest
     // is re-checked while streaming, so a lying peer can never poison the cache.
-    stream_verify_adopt(resp.bytes_stream(), digest, output, cache).await
+    stream_verify_adopt(resp.bytes_stream(), digest, max_bytes, output, cache).await
 }
 
 #[cfg(test)]
@@ -210,7 +212,7 @@ mod tests {
         mount_blob(&peer, &digest, 200, data.clone()).await;
 
         let client = reqwest::Client::new();
-        let result = fetch_blob_from_peers(&client, &[peer.uri()], &digest, None, &cache)
+        let result = fetch_blob_from_peers(&client, &[peer.uri()], &digest, u64::MAX, None, &cache)
             .await
             .expect("peer hit must yield a result");
 
@@ -237,7 +239,7 @@ mod tests {
 
         let client = reqwest::Client::new();
         let result =
-            fetch_blob_from_peers(&client, &[miss.uri(), hit.uri()], &digest, None, &cache)
+            fetch_blob_from_peers(&client, &[miss.uri(), hit.uri()], &digest, u64::MAX, None, &cache)
                 .await
                 .expect("second peer must satisfy the fetch");
         assert_eq!(result.size, data.len() as u64);
@@ -257,7 +259,7 @@ mod tests {
 
         let client = reqwest::Client::new();
         let result =
-            fetch_blob_from_peers(&client, &[liar.uri(), honest.uri()], &digest, None, &cache)
+            fetch_blob_from_peers(&client, &[liar.uri(), honest.uri()], &digest, u64::MAX, None, &cache)
                 .await
                 .expect("honest peer must satisfy the fetch");
         assert_eq!(result.size, data.len() as u64);
@@ -293,7 +295,7 @@ mod tests {
             .build()
             .unwrap();
         let result =
-            fetch_blob_from_peers(&client, &[slow.uri(), fast.uri()], &digest, None, &cache)
+            fetch_blob_from_peers(&client, &[slow.uri(), fast.uri()], &digest, u64::MAX, None, &cache)
                 .await
                 .expect("fast peer must satisfy the fetch after the slow one times out");
         assert_eq!(result.size, data.len() as u64);
@@ -313,7 +315,7 @@ mod tests {
 
         let client = reqwest::Client::new();
         let result =
-            fetch_blob_from_peers(&client, &[a.uri(), b.uri()], &digest, None, &cache).await;
+            fetch_blob_from_peers(&client, &[a.uri(), b.uri()], &digest, u64::MAX, None, &cache).await;
         assert!(result.is_none(), "all-peers-fail must return None");
         assert!(cache.get(&digest).is_none(), "cache must stay empty");
         let partial = cache.blob_path_for(&digest).with_extension("partial");
@@ -334,7 +336,7 @@ mod tests {
         let client = reqwest::Client::new();
         // Port 1 has nothing listening → connection refused.
         let dead = "http://127.0.0.1:1".to_string();
-        let result = fetch_blob_from_peers(&client, &[dead, hit.uri()], &digest, None, &cache)
+        let result = fetch_blob_from_peers(&client, &[dead, hit.uri()], &digest, u64::MAX, None, &cache)
             .await
             .expect("live peer must satisfy the fetch");
         assert_eq!(result.size, data.len() as u64);

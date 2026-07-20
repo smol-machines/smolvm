@@ -97,11 +97,22 @@ pub async fn pull(
     //    byte-for-byte as before. Peers arrive only from the control plane, and
     //    a node with no serve-TLS identity has no peer client, so this is also a
     //    no-op there.
+    // Bound the streamed download. A correct blob is exactly its declared size,
+    // so cap there; if the manifest declares no usable size, fall back to the
+    // cache's absolute byte cap so a hostile registry still can't fill the disk.
+    let max_bytes = if size > 0 { size } else { cache.max_size() };
+
     if !blob_peers.is_empty() {
         if let Some(peer_client) = crate::peer::peer_client() {
-            if let Some(result) =
-                crate::peer::fetch_blob_from_peers(peer_client, blob_peers, digest, output, cache)
-                    .await
+            if let Some(result) = crate::peer::fetch_blob_from_peers(
+                peer_client,
+                blob_peers,
+                digest,
+                max_bytes,
+                output,
+                cache,
+            )
+            .await
             {
                 return Ok(result);
             }
@@ -114,7 +125,7 @@ pub async fn pull(
     tracing::info!(digest = %digest, size, "downloading blob...");
 
     let stream = client.pull_blob_stream(repo, digest).await?;
-    let result = stream_verify_adopt(stream, digest, output, cache).await?;
+    let result = stream_verify_adopt(stream, digest, max_bytes, output, cache).await?;
 
     tracing::info!(digest = %digest, size = result.size, "pull complete");
 
@@ -134,6 +145,7 @@ pub async fn pull(
 pub(crate) async fn stream_verify_adopt<S>(
     stream: S,
     digest: &str,
+    max_bytes: u64,
     output: Option<&Path>,
     cache: &BlobCache,
 ) -> Result<PullResult>
@@ -148,9 +160,27 @@ where
     let mut stream = std::pin::pin!(stream);
     while let Some(chunk_result) = stream.next().await {
         let chunk: bytes::Bytes = chunk_result.map_err(RegistryError::Http)?;
+        total_bytes += chunk.len() as u64;
+        // Bound the download: a correct blob is exactly its declared size, so a
+        // registry or peer that streams more is hostile or broken. Abort before
+        // writing the offending chunk (the digest check only runs after the whole
+        // stream, so without this an unbounded body fills the host disk first).
+        if total_bytes > max_bytes {
+            drop(file);
+            if let Err(e) = tokio::fs::remove_file(&partial_path).await {
+                tracing::warn!(
+                    error = %e,
+                    path = %partial_path.display(),
+                    "failed to clean up partial blob after exceeding size cap"
+                );
+            }
+            return Err(RegistryError::ResponseTooLarge {
+                what: "blob".to_string(),
+                limit: max_bytes.min(usize::MAX as u64) as usize,
+            });
+        }
         hasher.update(&chunk);
         file.write_all(&chunk).await?;
-        total_bytes += chunk.len() as u64;
     }
     file.flush().await?;
     drop(file);
@@ -195,6 +225,28 @@ mod tests {
     use super::*;
     use crate::{CONFIG_MEDIA_TYPE, MANIFEST_MEDIA_TYPE};
     use wiremock::matchers::{method, path};
+
+    // A stream that delivers more bytes than the cap must be rejected before the
+    // (post-stream) digest check, and its partial file cleaned up — so a hostile
+    // registry/peer can't fill the host disk with garbage under any digest.
+    #[tokio::test]
+    async fn stream_exceeding_max_bytes_is_rejected_and_partial_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = BlobCache::open(tmp.path().to_path_buf(), 1024 * 1024).unwrap();
+        let digest = format!("sha256:{}", "a".repeat(64));
+        // 300 bytes streamed against a 100-byte cap.
+        let chunks: Vec<reqwest::Result<bytes::Bytes>> =
+            (0..3).map(|_| Ok(bytes::Bytes::from(vec![0u8; 100]))).collect();
+        let res =
+            stream_verify_adopt(futures_util::stream::iter(chunks), &digest, 100, None, &cache)
+                .await;
+        assert!(
+            matches!(res, Err(RegistryError::ResponseTooLarge { .. })),
+            "oversized stream must be rejected, got {res:?}"
+        );
+        let partial = cache.blob_path_for(&digest).with_extension("partial");
+        assert!(!partial.exists(), "partial must be removed after the cap trips");
+    }
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// With empty `blob_peers`, `pull` takes the registry path exactly as before:

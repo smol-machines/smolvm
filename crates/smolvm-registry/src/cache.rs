@@ -59,6 +59,12 @@ impl BlobCache {
         Ok(Self { root, max_size })
     }
 
+    /// The cache's byte cap — an absolute upper bound for a single blob, used to
+    /// bound a streamed download when the manifest declares no usable size.
+    pub fn max_size(&self) -> u64 {
+        self.max_size
+    }
+
     /// Look up a blob by digest. Returns the path if it exists.
     pub fn get(&self, digest: &str) -> Option<PathBuf> {
         let path = self.blob_path(digest);
