@@ -113,17 +113,26 @@ pub fn start(socket_path: &Path) -> std::io::Result<()> {
                     .name("cuda-clone-warm".into())
                     .spawn(move || {
                         use std::io::{Read as _, Write as _};
+                        // The warm dial is the connection that SPAWNS the
+                        // worker, so it must carry the ring-dir advert — the
+                        // worker inherits the dir at spawn and every later
+                        // attached channel resolves RingSetupFile against it.
+                        let rd = ring_dir_advert();
                         if addr.starts_with('/') {
                             #[cfg(unix)]
                             if let Ok(mut s) = std::os::unix::net::UnixStream::connect(&addr) {
-                                if s.write_all(&p).is_ok() {
+                                if rd.as_ref().map_or(true, |r| s.write_all(r).is_ok())
+                                    && s.write_all(&p).is_ok()
+                                {
                                     tracing::info!("cuda-host: clone warm dial sent");
                                     let mut b = [0u8; 1];
                                     let _ = s.read(&mut b); // parked for the worker's lifetime
                                 }
                             }
                         } else if let Ok(mut s) = std::net::TcpStream::connect(&addr) {
-                            if s.write_all(&p).is_ok() {
+                            if rd.as_ref().map_or(true, |r| s.write_all(r).is_ok())
+                                && s.write_all(&p).is_ok()
+                            {
                                 tracing::info!("cuda-host: clone warm dial sent");
                                 let mut b = [0u8; 1];
                                 let _ = s.read(&mut b);
