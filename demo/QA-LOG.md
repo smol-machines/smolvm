@@ -767,3 +767,30 @@ sharers corrupt.
 **Implication for the training-infra story:** the 17GB-vs-31GB density win
 requires --share-weights, which is currently N≤2-safe for Unsloth-style
 training. Copy-mode gives correctness at all N but ~container-equivalent VRAM.
+
+## 2026-07-20 — N≥3 concurrent clone training nan: SOLVED (golden warmup)
+
+Confirmed the root cause and shipped a fix. Base-weight checksums across 3
+clones at fork are IDENTICAL (ck_embed/ck_q0/ck_qN all equal) → the IPC
+sharing is correct; corruption is a POST-fork training write to a chunk the
+daemon's content-verification (share only if content == initial H2D upload)
+mis-marked as frozen. Cause: in a fork-sweep the golden loads the model then
+FREEZES at the barrier WITHOUT running the training path, so any chunk the
+forward/backward writes in-place was never dirtied in the golden → passes
+verification as shared → clones' concurrent writes race on it at N≥3.
+
+**Fix: warm the golden with ONE training step before fork** (GOLDEN_WARMUP in
+the workload). This dirties every training-written chunk in the golden, so the
+daemon marks those private per-clone; the genuinely-frozen base stays shared.
+
+**Result (H100, 7B QLoRA, N=3 share-weights):** all 3 learners train CORRECTLY
+(16.99→7.27, 16.48→7.33, 17.11→7.32), no nan, distinct curves. shared=260
+private=227 (was 261/69 when broken). Fork 0.43s/clone. Density (clean):
+container N=3 = 23.2GB; smolvm N=3 = <pending clean re-measure>. Cost: the
+golden's first training step is slow (Triton JIT-compiles every training
+kernel + eager-remoted backward — one-time, amortized over N clones).
+
+**Smolvm-side implication:** share-weights correctness REQUIRES the golden to
+have exercised the workload's write path before fork. Documented as a
+requirement; a future guard could refuse/​warn if share-weights is requested
+before the golden has run representative compute.
