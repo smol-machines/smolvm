@@ -610,15 +610,19 @@ fn graph_patch_enabled() -> bool {
     )
 }
 
-/// P3b capture-replay (WIP): record the golden's capture-window ops and
-/// re-capture them in a clone. OFF by default — the shipped clone path is
-/// eager (enforce_eager), which works; graph clones are experimental. A
-/// worker-process clone can't launch the golden's exec verbatim (the
-/// CUgraphExec is process-local), so this is the eventual mechanism, but
-/// re-issuing cuBLAS under capture in the clone still needs work (handle
-/// initialization state under `cuStreamBeginCapture`).
+/// P3b capture-replay: record the golden's capture-window ops and re-capture
+/// them in a clone at first launch (with an eager warmup pass so library
+/// handles bind their streams/workspaces outside the capture window). ON by
+/// default: a worker-process clone can never launch the golden's exec
+/// verbatim (the CUgraphExec is process-local), and node rebuild can't
+/// reproduce library-emitted kernels — replay is the only correct path.
+/// `SMOLVM_CUDA_CLONE_GRAPH_REPLAY=0` disables (falls back to node
+/// rebuild/patch, known-broken for library graphs).
 fn clone_graph_replay_enabled() -> bool {
-    std::env::var_os("SMOLVM_CUDA_CLONE_GRAPH_REPLAY").is_some()
+    !matches!(
+        std::env::var("SMOLVM_CUDA_CLONE_GRAPH_REPLAY").as_deref(),
+        Ok("0")
+    )
 }
 
 /// Diagnostic: patch the golden's exec IN PLACE instead of re-instantiating, to
@@ -2076,6 +2080,17 @@ fn is_capturable(req: &Request) -> bool {
 /// pointer/handle translation applies verbatim), ends capture, and instantiates.
 /// Returns the clone-owned exec. Errors bubble so the caller can fall back.
 fn replay_capture_graph(sess: &mut Session, b: &mut dyn Backend, exec_vh: u64) -> CuResult<u64> {
+    fn op_tag(req: &Request) -> &'static str {
+        match req {
+            Request::LaunchKernel { .. } => "LaunchKernel",
+            Request::LibCall { .. } => "LibCall",
+            Request::MemsetD8Async { .. } => "MemsetD8Async",
+            Request::MemcpyDtoDAsync { .. } => "MemcpyDtoDAsync",
+            Request::EventRecord { .. } => "EventRecord",
+            Request::StreamWaitEvent { .. } => "StreamWaitEvent",
+            _ => "other",
+        }
+    }
     let ops = sess
         .clone_graph_oplogs
         .get(&exec_vh)
@@ -2084,31 +2099,80 @@ fn replay_capture_graph(sess: &mut Session, b: &mut dyn Backend, exec_vh: u64) -
     // The capture stream is whatever the recorded kernel launches target; scan
     // for the first LaunchKernel and translate its (golden) stream vhandle.
     let mut cap_stream_vh = 0u64;
+    let mut kinds: HashMap<&'static str, u32> = HashMap::new();
     for op in &ops {
-        if let Ok(Request::LaunchKernel { stream, .. }) = crate::proto::decode_request(op) {
-            cap_stream_vh = stream;
-            break;
+        if let Ok(req) = crate::proto::decode_request(op) {
+            *kinds.entry(op_tag(&req)).or_insert(0) += 1;
+            if cap_stream_vh == 0 {
+                if let Request::LaunchKernel { stream, .. } = req {
+                    cap_stream_vh = stream;
+                }
+            }
         }
     }
     let raw_cap = match cap_stream_vh {
         0 => 0,
         s => xlat_stream(sess.streams.get(&s).copied().unwrap_or(s)),
     };
+    eprintln!(
+        "[p3b] replay exec {exec_vh:#x}: {} ops {kinds:?}, cap_stream_vh={cap_stream_vh:#x} raw_cap={raw_cap:#x}",
+        ops.len()
+    );
+    // WARMUP eager pass: run the whole sequence once WITHOUT capture so every
+    // library handle binds its stream and allocates its workspace outside the
+    // capture window (cuBLAS workspace cudaMalloc during capture is the classic
+    // NOT_INITIALIZED source). Results land in the clone's own buffers, which
+    // the guest overwrites before any real launch.
+    if std::env::var("SMOLVM_CUDA_P3B_WARMUP").as_deref() != Ok("0") {
+        for (i, op) in ops.iter().enumerate() {
+            let req = crate::proto::decode_request(op).map_err(|_| CUDA_ERROR_INVALID_HANDLE)?;
+            let tag = op_tag(&req);
+            let (st, _) = dispatch(sess, b, req);
+            if st != 0 {
+                eprintln!("[p3b] WARMUP op {i}/{} {tag} failed st={st}", ops.len());
+                return Err(st);
+            }
+        }
+        if let Err(e) = b.ctx_synchronize() {
+            eprintln!("[p3b] WARMUP ctx_synchronize failed st={e}");
+            return Err(e);
+        }
+        eprintln!("[p3b] warmup pass ok ({} ops)", ops.len());
+    }
     // RELAXED (2): the re-issued library calls may touch capture-unsafe APIs.
-    b.stream_begin_capture(raw_cap, 2)?;
-    for op in &ops {
+    if let Err(e) = b.stream_begin_capture(raw_cap, 2) {
+        eprintln!("[p3b] begin_capture(raw={raw_cap:#x}) failed st={e}");
+        return Err(e);
+    }
+    for (i, op) in ops.iter().enumerate() {
         let req = crate::proto::decode_request(op).map_err(|_| CUDA_ERROR_INVALID_HANDLE)?;
+        let tag = op_tag(&req);
         let (st, _) = dispatch(sess, b, req);
         if st != 0 {
+            eprintln!("[p3b] CAPTURE op {i}/{} {tag} failed st={st}", ops.len());
             // Abort the capture cleanly before bubbling — a dangling capture
             // poisons the stream for every later op.
             let _ = b.stream_end_capture(raw_cap);
             return Err(st);
         }
     }
-    let graph = b.stream_end_capture(raw_cap)?;
-    let exec = b.graph_instantiate(graph)?;
+    let graph = match b.stream_end_capture(raw_cap) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("[p3b] end_capture failed st={e}");
+            return Err(e);
+        }
+    };
+    let exec = match b.graph_instantiate(graph) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("[p3b] instantiate failed st={e}");
+            let _ = b.graph_destroy(graph);
+            return Err(e);
+        }
+    };
     let _ = b.graph_destroy(graph); // the exec is what we launch; graph is scratch
+    eprintln!("[p3b] replay exec {exec_vh:#x}: re-captured OK -> new exec {exec:#x}");
     Ok(exec)
 }
 
@@ -2377,7 +2441,11 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 gpu::set_lib_trans(&sess.dptr_trans); // forwarded-lib pointer map
                                                       // P3b: adopt inherited capture-replay logs, keyed by exec_vh —
                                                       // replayed lazily at the clone's first GraphLaunch.
-                for (_graph_vh, exec_vh, ops) in take_worker_graph_oplogs() {
+                for (graph_vh, exec_vh, ops) in take_worker_graph_oplogs() {
+                    eprintln!(
+                        "[p3b] clone adopted oplog: graph {graph_vh:#x} exec {exec_vh:#x} ({} ops)",
+                        ops.len()
+                    );
                     sess.clone_graph_oplogs.insert(exec_vh, ops);
                 }
                 eprintln!(
@@ -2591,6 +2659,10 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             // associates it with an exec_vh (what the clone launches).
             if let Some((_, log)) = sess.capture_rec.take() {
                 if !log.is_empty() {
+                    eprintln!(
+                        "[p3b] golden recorded {} ops for graph {graph_vh:#x}",
+                        log.len()
+                    );
                     sess.golden_layout
                         .lock()
                         .unwrap()
@@ -2622,6 +2694,10 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 // P3b preferred: promote the parked capture-replay log (keyed by
                 // graph_vh) to a `(graph_vh, exec_vh, log)` entry.
                 if let Some(log) = layout.pending_oplogs.remove(&graph) {
+                    eprintln!(
+                        "[p3b] promoted oplog: graph {graph:#x} -> exec {exec_vh:#x} ({} ops)",
+                        log.len()
+                    );
                     layout.graph_oplogs.push((graph, exec_vh, log));
                 }
                 // Node-rebuild fallback (kernel-only graphs): kept for clones

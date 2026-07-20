@@ -2197,7 +2197,12 @@ fn stream_resolve(map: &std::collections::HashMap<u64, u64>, s: u64) -> u64 {
     if s == 0 {
         0
     } else {
-        map.get(&s).copied().unwrap_or(s)
+        // Clone workers additionally remap the GOLDEN's raw stream to their own
+        // re-created stream (M3a stream_trans) — without this, a raw-stream
+        // guest's cublasSetStream(golden ptr) dereferences a foreign heap
+        // pointer inside libcuda (SIGSEGV in cuStreamGetGreenCtx). Identity on
+        // non-clone sessions, so the common case is one thread-local miss.
+        super::xlat_stream(map.get(&s).copied().unwrap_or(s))
     }
 }
 
