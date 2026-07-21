@@ -102,3 +102,14 @@ throughput STORY is the aggregate/density win (already proven: N=16 9,628 =
 ROADMAP PIVOT: remaining high-value levers are (1) golden ring transport
 (load time 156s->~90s, HIGH conf, user-facing) and (2) production hardening.
 Per-learner micro-optimization retired as diminishing-returns.
+
+## 2026-07-21 11:03 — OPEN reliability watch: teardown clone-worker SIGSEGV
+soak7 (profiler-commit binary) showed FATAL clone-worker SIGSEGV ~2.8/cycle
+(31 by cycle 11) — but soak5/6 (xlat-commit binary) held 0 FATAL over 22
+cycles. All are TEARDOWN-time (each precedes "Broken pipe": guest closed,
+worker faults during shutdown ring-read); ZERO correctness impact (learners
+4/4 pass every cycle). Backtrace unsymbolized (<unknown>, async-signal
+handler in worker). Hypothesis: serve_rings profiler refactor reintroduced a
+shutdown-path fault, OR soak5's 0 was luck. Controlled check: redeployed the
+LATEST (env-cache) binary + clean soak8 to see if FATALs return on the
+shipping binary. Correctness-safe either way; tracking as hardening.
