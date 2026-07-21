@@ -720,7 +720,8 @@ impl<S: Read + Write> Client<S> {
             | Op::StreamCaptureInfo => {}
             _ => self.clean = false,
         }
-        let tally = std::env::var_os("SMOLVM_CUDA_COUNT_SYNC").is_some();
+        static TALLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let tally = *TALLY.get_or_init(|| std::env::var_os("SMOLVM_CUDA_COUNT_SYNC").is_some());
         let t0 = tally.then(std::time::Instant::now);
         let payload = if self.ring.is_some() {
             self.ring_roundtrip(&encode_request(req))?
@@ -775,7 +776,8 @@ impl<S: Read + Write> Client<S> {
     /// decode, so nothing is lost to error mapping.
     pub fn raw_call(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
         self.clean = false; // bridged driver-shim work dirties the pipeline
-        if std::env::var_os("SMOLVM_CUDA_COUNT_SYNC").is_some() {
+        static TALLY_RAW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *TALLY_RAW.get_or_init(|| std::env::var_os("SMOLVM_CUDA_COUNT_SYNC").is_some()) {
             let t0 = std::time::Instant::now();
             let r = self.raw_call_inner(payload);
             let key = format!("Bridged(0x{:02x})", payload.first().copied().unwrap_or(0));

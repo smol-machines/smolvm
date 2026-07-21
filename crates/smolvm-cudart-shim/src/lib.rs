@@ -2884,6 +2884,24 @@ pub extern "C" fn cudaLaunchKernel(
 /// look up the registered function, gather its argument blobs, forward.
 /// Call through `retry_transport_c` — a fork clone's first launch can race
 /// the reconnect and die with a transport error the host never saw.
+/// Guest-side hot-path profiler (SMOLVM_CUDA_SHIM_PROF=1): accumulated ns
+/// spent inside do_launch (marshal + enqueue, excluding torch/python), dumped
+/// every 8192 launches — separates OUR per-op cost from the framework's.
+fn shim_prof_launch(dur: std::time::Duration) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NS: AtomicU64 = AtomicU64::new(0);
+    static N: AtomicU64 = AtomicU64::new(0);
+    let ns = NS.fetch_add(dur.as_nanos() as u64, Ordering::Relaxed) + dur.as_nanos() as u64;
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n % 8192 == 0 {
+        eprintln!(
+            "[shim-prof] launches={n} total={}ms avg={}ns",
+            ns / 1_000_000,
+            ns / n
+        );
+    }
+}
+
 fn do_launch(
     func: *const c_void,
     grid: [u32; 3],
@@ -2892,8 +2910,28 @@ fn do_launch(
     stream: u64,
     args: *mut *mut c_void,
 ) -> c_int {
+    static PROF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *PROF.get_or_init(|| std::env::var_os("SMOLVM_CUDA_SHIM_PROF").is_some()) {
+        let t0 = std::time::Instant::now();
+        let rc = do_launch_inner(func, grid, block, shared_mem, stream, args);
+        shim_prof_launch(t0.elapsed());
+        return rc;
+    }
+    do_launch_inner(func, grid, block, shared_mem, stream, args)
+}
+
+fn do_launch_inner(
+    func: *const c_void,
+    grid: [u32; 3],
+    block: [u32; 3],
+    shared_mem: usize,
+    stream: u64,
+    args: *mut *mut c_void,
+) -> c_int {
     // Debug bisection: drop launches entirely to isolate marshaling cost.
-    if std::env::var_os("SMOLVM_CUDA_NOOP_LAUNCH").is_some() {
+    // Cached: an env walk per launch cost measurable ns on the hot path.
+    static NOOP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *NOOP.get_or_init(|| std::env::var_os("SMOLVM_CUDA_NOOP_LAUNCH").is_some()) {
         return CUDA_SUCCESS;
     }
     with_state(|s| {
