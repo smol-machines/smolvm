@@ -135,3 +135,18 @@ shipping stack (soak5's 0-fatals/22-cycles was luck). Correctness-safe
 (learners complete). Approach: build release WITH debug symbols
 (CARGO_PROFILE_RELEASE_DEBUG=2) so the crash handler's own Backtrace resolves
 to real frames in the daemon log — no core dumps (avoids the 6.6GB flood).
+
+## 2026-07-21 12:22 — teardown SIGSEGV re-classified COSMETIC; rat-hole exited
+Debuginfo build: crash handler backtrace STILL frames 0-11 = <unknown>
+(async-signal unwinder can't walk from its altstack; driver frames unsymboled).
+Confirmed: crash is on the worker MAIN thread at teardown (frame 12 =
+__libc_start_main), after "Broken pipe" (guest closed). SEVERITY ASSESSMENT:
+COSMETIC. The clone worker is a one-shot process exiting anyway; the CUDA
+driver reclaims the ENTIRE context on process death whether exit is clean or
+SIGSEGV — so: learners unaffected (fail=0 on known-good across all soaks), no
+GPU leak, identical cleanup. It is log noise, not a functional defect. Cost/
+benefit says stop chasing the exact driver call (needs live-gdb + driver
+symbols) — DECISION: document as known cosmetic, restore shipping binary,
+pivot to the high-value lever (golden ring transport, load-time). Fixing it
+cleanly would need catching the guest-close and skipping the driver teardown
+without the hard-exit race that regressed — deferred, low priority.
