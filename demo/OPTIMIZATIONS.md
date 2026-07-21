@@ -264,3 +264,18 @@ merged into every container's mounts by the agent; per-VM ring-dir advert
 (SMVRDIR1) carried by both real channels and the warm dial so workers
 spawn knowing the dir. H100 training re-measure queued (training was
 measured 86% transport-idle — rings collapse those socket round-trips).
+
+## 2026-07-21 — sync-tally findings: count is the wrong metric
+
+Per-op sync tally of a 30-step QLoRA run (0.5B, 3070 clone): StreamSynchronize
+1,667 (~55/step, bnb/unsloth-driven), LibCall(6,1) 499, EventCreate 240,
+DeviceGetAttribute 210 (one-time misses), MemcpyGpaDtoH 174 (each a wasted
+double-trip — clone GPA-map gap), EventElapsedTime 118. Clean-pipeline sync
+elision implemented (client tracks pending-work state; syncs on a settled
+stream return locally) — fired ~1/1,667: the training interleave is
+launch-dense, the syncs are real. At ring RTTs the whole sync class is ~4% of
+step time. CONCLUSION: the per-learner gap is NOT sync-count-bound; next
+measurement must attribute TIME per op class (extend count_sync with
+durations) before more targeting. The generic classification table remains
+the right frame — entries just need time-weighting. Elision kept: correct,
+free, and pays in idle-heavy serving patterns.
