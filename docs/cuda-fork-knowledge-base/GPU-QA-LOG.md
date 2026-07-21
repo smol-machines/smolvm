@@ -18,6 +18,20 @@ QA branches (pushed, no PRs). Venue: Lambda A100-40GB (sm80) unless noted.
 ## Results
 (newest first)
 
+### QA-GPU-5 (harness) — EXP-5 START-FAILED root cause: missing mount source
+gives a "vm not found" at start, not a clear create error (2026-07-21). EXP-5's
+create referenced `~/hfshare` (a path from the *first* A100 box, absent on
+repro2); the create aborts with `mount source not found`, the machine is never
+registered, and the subsequent `start` fails opaquely with `vm not found`.
+Fixed the harness to mount the real cache (`~/coord/hf`). Product note worth a
+look: a `--volume` whose host source is missing should fail the CREATE loudly
+and consistently, rather than surfacing later as a confusing start-time
+`vm not found`. (This is what the earlier "START FAILED twice" retry was
+actually hitting — not daemon contention as QA-GPU-4 first guessed; QA-GPU-4's
+stale-daemon reap is still a valid harden, but the real blocker here was the
+mount path.)
+
+
 ### QA-GPU-4 (LOW) — fork/CUDA harness: golden start fails if a prior daemon
 ### is mid-teardown (2026-07-21). EXP-5's first run hit an immediate "START
 FAILED" because the previous experiment's `_cuda-daemon` + machine were still
