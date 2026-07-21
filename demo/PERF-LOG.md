@@ -366,3 +366,14 @@ reap (whichever wins; the other sees the child gone -> spawns fresh). fmt +
 clippy -D warnings clean (ran CI's checks pre-commit this time). Deploying via
 BOX rebuild (not scp). LESSON: never declare "hardened" from a spot check —
 watch the trend; an accelerating fail rate is a real signal.
+
+## 2026-07-21 22:12 — reaper fix VERIFIED (zombies 288->0); wire matched
+All-3 rebuild deployed (daemon-only had broken the wire hash — 3rd time this
+session; rule saved to memory box-deploy-rule). Verified on the fixed stack:
+zombies=0 (was 288), PROTOCOL MISMATCH=0, soak cycle 1 = 4/4 pass 0 nan. The
+zombie clone-worker leak is FIXED. REMAINING FOLLOW-UP: daemon RSS was 16GB —
+the reaper doesn't touch that (zombies cost ~0 memory), so it's a SEPARATE
+accumulation: per-clone state (module images / graph oplogs / staged blobs)
+not freed when a worker dies WITHOUT a reconnect. Monitoring whether zombies
+stay ~0 across cycles and whether daemon RSS still climbs (isolates the RSS
+leak as the next real hardening item).
