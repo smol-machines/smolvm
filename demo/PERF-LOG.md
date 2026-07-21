@@ -62,3 +62,12 @@ Host-serve overlap hypothesis DEAD. New lever ranking:
 2. Guest-side op production cost (marshal/encode) — measure if vCPUs move it.
 3. Op-count reduction (17k/step is enormous) — torch-level, harder.
 Local tok/s stable at ~2,450-2,500 across the current stack.
+
+## 2026-07-21 10:40 — vCPU A/B: NO EFFECT (guest bottleneck is single-thread)
+8 vCPUs vs 4 on local clone: 2,443/2,443 vs 2,443-2,508 — identical. The
+guest's op production is a serial python/shim thread; cores don't help.
+Refined thesis: per-op GUEST cost (torch dispatch + shim encode + ring write,
+~12us/op budget at 17k ops/step) is the gap. Corollary: the tax should
+SHRINK with model size (fewer, larger ops per token) — verifying via H100 7B
+serve-prof run. If confirmed: guest encode-path optimization is the lever,
+and large-model workloads are already near-native.
