@@ -83,3 +83,22 @@ fewer ops/token). Host CPU immaterial. NEXT ENGINEERING: guest marshal path
 — do_launch allocates 3-5 heap buffers per op (param_sizes.clone, per-arg
 Vecs, encode_request) x 17k ops/step; rework to a reused scratch buffer
 encoding directly into the ring/wbuf.
+
+## 2026-07-21 10:55 — guest shim marshal is NOT the lever; perf investigation converged
+Shim launch profiler (SMOLVM_CUDA_SHIM_PROF): do_launch marshal = 3.0us/launch,
+270ms over 90k launches (~4% of runtime). Reducing it is low-value. Env-cache
+hardening (OnceLock the per-op getenv on launch/call/tally paths) committed —
+neutral throughput (2,441-2,495), removes real syscalls from the hot path.
+
+CONVERGENCE (5 measured experiments): the per-learner gap (7B solo 1,720 =
+69% native) is NOT host-serve (51-69% idle), NOT translation (xlat neutral),
+NOT vCPUs (neutral), NOT our marshal (3us/op). Residual = torch/python
+framework dispatch (native pays it too, in-process) + per-sync ring RTT (our
+only structural add, ~1,667 syncs/run). This is near the practical floor for
+API-remoting; per-learner is well-characterized and near-optimal. The
+throughput STORY is the aggregate/density win (already proven: N=16 9,628 =
++36% over container ceiling), not per-learner parity.
+
+ROADMAP PIVOT: remaining high-value levers are (1) golden ring transport
+(load time 156s->~90s, HIGH conf, user-facing) and (2) production hardening.
+Per-learner micro-optimization retired as diminishing-returns.
