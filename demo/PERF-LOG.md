@@ -71,3 +71,15 @@ Refined thesis: per-op GUEST cost (torch dispatch + shim encode + ring write,
 SHRINK with model size (fewer, larger ops per token) — verifying via H100 7B
 serve-prof run. If confirmed: guest encode-path optimization is the lever,
 and large-model workloads are already near-native.
+
+## 2026-07-21 10:39 — H100 7B serve-prof + NEW SOLO RECORD 1,720 tok/s
+Solo 7B with profiler: agg 1,720 tok/s (69% of native 2,507; historical
+record 1,434). Buckets over 647k ops: idle 5,887ms (51%) | exec 3,171ms
+(27%, real CUDA) | respond 2,043ms (18%, host SPINS waiting for the guest to
+drain the response ring) | decode 361ms (3%). Waiting-on-guest = ~69% at 7B
+(was 87% at 0.5B) — guest-side serial op cost confirmed as THE lever at all
+scales, and the tax shrinks with model size as predicted (bigger kernels,
+fewer ops/token). Host CPU immaterial. NEXT ENGINEERING: guest marshal path
+— do_launch allocates 3-5 heap buffers per op (param_sizes.clone, per-arg
+Vecs, encode_request) x 17k ops/step; rework to a reused scratch buffer
+encoding directly into the ring/wbuf.
