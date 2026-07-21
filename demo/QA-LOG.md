@@ -887,3 +887,28 @@ DAX smoke (golden + 2 clones, all 3 user mounts dax=always, patched libkrun):
   fine; all-DAX venv/drvlib/coord is the new variable).
 - Next: reproduce on the local 3070 (fork-sweep demo + SMOLVM_MOUNT_DAX=1)
   per the local-first rule.
+
+## 2026-07-21 — clone first-op reliability: three fixes landed, one tail remains
+
+Root-caused the "one stranded learner per fork leg" (7/8, 15/16 on H100; ~50%
+single-clone failure locally). Layered causes, all in the clone worker path:
+1. TRANSPORT RACE (fixed): a clone's inherited connection dies at fork but the
+   pre-call liveness peek can miss it — the first CUDA op surfaced transport
+   death as CUDA 999. Fix: classify transport failures in the shim and retry
+   exactly once after the forced reconnect (launch/malloc/free/memcpy + the
+   existing retrying wrapper, flag-based). Minimal probe: 0-of-~half → 7/7.
+2. WORKER SEEDING GAPS (fixed): thread_local alloc-translation was drained by
+   whichever session hit PrimaryCtxRetain first (and its owner could FREE the
+   clone's copies on close); module images + function metadata were per-thread
+   too, so unseeded threads passed RAW GOLDEN HANDLES to the driver — launch
+   "invalid argument" at best, SIGSEGV in cuModuleGetFunction at worst (the
+   H100 crash-loop signature). Fix: process-global registries + ownerless
+   adoption (copies live for the worker's lifetime).
+3. REMAINING TAIL (open): trainer-init in clones still fails "invalid
+   argument" AFTER a clean reconnect (traced: reconnect ok, then set_last(1)
+   with empty frames). Not the attrs-memoization (zero-guards produce sane
+   fallbacks). Next: per-wrapper error naming on the reduce-path candidates to
+   pin the op. Reproducible in ~5 min via scratchpad val_trainer.sh.
+
+Also: fork_err files are written by the workload itself; shim trace goes to the
+detached container's stderr (invisible) — probes must capture stderr to coord.
