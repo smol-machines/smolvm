@@ -113,3 +113,16 @@ handler in worker). Hypothesis: serve_rings profiler refactor reintroduced a
 shutdown-path fault, OR soak5's 0 was luck. Controlled check: redeployed the
 LATEST (env-cache) binary + clean soak8 to see if FATALs return on the
 shipping binary. Correctness-safe either way; tracking as hardening.
+
+## 2026-07-21 11:57 — no-reclaim fix REVERTED (failed + regressed)
+The serve_no_reclaim + hard-exit change did NOT eliminate teardown fatals
+(soak9 held ~2/cycle: 24→26→28 over cycles 3-5) AND correlated with a NEW
+learner failure (cycle 2: done=3/4) the pre-fix stack never had. Conclusion:
+reclaim_session is NOT the (sole) SIGSEGV source, and hard-exit(0) races a
+still-finishing guest connection → lost learner. Reverted (bb908c7) to
+known-good. The libcuda-frame core told us WHERE (driver, teardown) but not
+WHICH call; release-binary cores are unsymbolizable past the driver frame.
+NEXT: build a DEBUG (symbols) clone-worker, capture ONE core with a full
+Rust backtrace to name the exact call, before touching the teardown path
+again. Lesson: a plausible root-cause from a partial core is a hypothesis,
+not a fix — validate the SIGSEGV location precisely first.
