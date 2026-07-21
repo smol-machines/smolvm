@@ -255,3 +255,16 @@ venv/drvlib/coord, HF cache via coord) which forks fast AND loads correctly.
 The baked machine stays a turnkey EASE option (QUICKSTART) but with a noted
 fork-time tradeoff. Also worth a real smolvm investigation: why does fork copy
 disk data instead of pure-CoW overlay? (separate item)
+
+## 2026-07-21 18:07 — coord-symlink HF path CONFIRMED broken; load-saga re-explained
+Fast (non-baked, ubuntu:22.04 + coord/hf symlink) path FAILED with the same
+"Can't load the model" OSError as my v1. So virtiofs does NOT follow a
+/opt/coord/hf -> $HF symlink into the guest, AND run_smolvm_fast.sh's `rm -rf
+$CO` deletes the symlink anyway — meaning the "fast fork" ubuntu-machine
+benchmark runs were loading the 7B via HF HUB DOWNLOAD (HF_HUB_OFFLINE=0), not
+from local cache. That re-explains a chunk of the 156s "slow load" saga (it was
+partly a 5.5GB download). ONLY the baked machine reliably loads offline. So the
+real tension: baked = reliable offline load but 25s disk-bound fork; mounts =
+fast fork but broken/downloading load. NEXT: make baked fork fast — test if
+the 25s is overlay-SIZE (fixable: small/sparse overlay) vs a full backing-disk
+copy (deeper smolvm fork-CoW fix).
