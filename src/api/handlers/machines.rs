@@ -1067,10 +1067,13 @@ fn classify_fork_error(e: SmolvmError) -> ApiError {
         ApiError::BadRequest(msg)
     } else if lc.contains("already exists")
         || lc.contains("not running forkable")
+        || lc.contains("no memfd-backed ram")
         || lc.contains("control socket not responding")
         || lc.contains("not ready to fork")
     {
-        // Clone name taken, or the golden isn't a ready fork base — both 409.
+        // Clone name taken, or the golden isn't a ready fork base (never started
+        // forkable, so it has no memfd-backed RAM to CoW-fork) — both 409, a
+        // caller-fixable precondition, not a server fault a client should retry.
         ApiError::Conflict(msg)
     } else if lc.contains("not found") {
         ApiError::NotFound(msg)
@@ -1983,6 +1986,23 @@ mod tests {
     use super::*;
     use crate::db::SmolvmDb;
     use tempfile::TempDir;
+
+    #[test]
+    fn classify_fork_error_maps_precondition_failures_to_conflict() {
+        // A golden started without SMOLVM_FORKABLE has no memfd RAM to CoW-fork —
+        // a caller-fixable precondition (409), not a 500 a client would retry.
+        let e = SmolvmError::agent(
+            "fork",
+            "golden FORK failed: ERR EINVAL no memfd-backed RAM (start the golden VM with SMOLVM_FORKABLE=1)",
+        );
+        assert!(matches!(classify_fork_error(e), ApiError::Conflict(_)));
+        // A stopped golden's dead control socket is likewise a 409.
+        let e = SmolvmError::agent("fork", "golden 'g' control socket not responding");
+        assert!(matches!(classify_fork_error(e), ApiError::Conflict(_)));
+        // An unrelated fork failure stays a 500.
+        let e = SmolvmError::agent("fork", "disk write failed");
+        assert!(matches!(classify_fork_error(e), ApiError::Internal(_)));
+    }
 
     #[test]
     fn classify_launch_error_flags_virtio_port_conflict() {
