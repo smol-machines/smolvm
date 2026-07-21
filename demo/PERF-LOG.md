@@ -268,3 +268,19 @@ real tension: baked = reliable offline load but 25s disk-bound fork; mounts =
 fast fork but broken/downloading load. NEXT: make baked fork fast — test if
 the 25s is overlay-SIZE (fixable: small/sparse overlay) vs a full backing-disk
 copy (deeper smolvm fork-CoW fix).
+
+## 2026-07-21 18:21 — fork-disk cost DEFINITIVELY isolated + record corrected
+Baked disk (30GB storage / 14GB data), NO cuda, no workload: fork 26.0 / 30.3s
+— identical to the with-cuda case. So the ~29s fork is PURELY disk-size cost;
+the CUDA 7B clone is sub-second (ubuntu-minimal 7B fork = 0.4s). Disk clone
+uses qcow2 CoW overlays (should be instant), so the cost is likely the clone's
+GUEST BOOT scanning/mounting the large 14GB filesystem, not a copy. Corrected
+BENCHMARKS.md header with both fixes: (1) sub-second fork is the RAM/GPU clone
+on a MINIMAL-disk golden; large forkable disk adds ~1s/GB; (2) some ubuntu
+golden "loads" were HF hub downloads (symlink doesn't cross virtiofs).
+SMOLVM OPTIMIZATION FILED: machine fork of a large-disk golden is O(disk) via
+guest-boot filesystem scan — investigate keeping fork O(1) (skip fsck/scan on
+the CoW clone, or lazy-mount). Benchmark stance: keep the forkable golden's
+disk small; the baked machine is a turnkey EASE option with a fork-time
+caveat, not the way to showcase fork latency. Investigation CLOSED — the
+record is now honest.

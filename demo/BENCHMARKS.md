@@ -7,6 +7,24 @@ REPRODUCIBILITY.md + TESTBED.md + smolvm-gpu-testbed.smolmachine (this
 directory / Lambda FS `smolvm-testbed`). Defects found while validating:
 QA-LOG.md.
 
+> **2026-07-21 corrections (see PERF-LOG.md for the measurements).** Two
+> claims below need qualifying:
+> 1. **Fork time.** The sub-second fork figures (0.43/0.45 s) are the RAM+GPU
+>    clone (CoW memfd + CUDA state) on a golden with a **minimal disk**. Fork
+>    time also includes provisioning the clone's disk, which scales with the
+>    golden's on-disk size: a minimal golden forks in **0.2 s**, but a golden
+>    with a 14 GB baked venv+model on a 30 GB disk takes **~26–30 s** (disk-
+>    bound, not GPU — the CUDA 7B clone alone is still sub-second, confirmed by
+>    a no-CUDA control at the same 26–30 s). The RAM/GPU innovation is fast;
+>    packing large data onto the *forkable* disk is what's slow (a smolvm
+>    fork-disk optimization opportunity — clone boot appears to scan the large
+>    filesystem). Keep the forkable golden's disk small.
+> 2. **Golden load time.** Some ubuntu-image golden runs loaded the model by
+>    **downloading it from the HF hub** (the coord/hf symlink does not resolve
+>    across virtiofs, and HF_HUB_OFFLINE=0 fell back to download), so part of
+>    the 135–156 s "load" was a 5.5 GB download, not pure compute. Reliable
+>    offline load requires the model on the guest's own disk (baked machine).
+
 ## Training head-to-head: N cold containers vs 1 golden + N forks (7B QLoRA, H100, 2026-07-20)
 
 The incumbent training-infra pattern is N containers, each cold-loading the
