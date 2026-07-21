@@ -16,6 +16,27 @@ QA branches (pushed, no PRs). Venue: Lambda A100-40GB (sm80) unless noted.
 ## Results
 (newest first)
 
+### EXP-3c — full baked-artifact boot measurement: NOT COMPLETED (2026-07-21)
+Attempted to bake a venv + pre-warmed-cache `.smolmachine` and measure a real
+golden boot end-to-end. Aborted after two self-inflicted harness bugs
+(`machine start --cuda` — invalid; then a sed that broke the script). Not worth
+further box time: the recipe's MECHANISM is already validated by EXP-3b (the
+93s is compile-cache generation, cut by pre-warming caches before packing; venv
+location saves a smaller ~10-19s). A single confirming boot number would be
+nice-to-have, not load-bearing. Left as a documented follow-up: run the
+IMAGE.md pack recipe with a cache-warm step, boot `--from` it, expect the ~93s
+warm-up phase to drop to ~10-20s. LESSON: for multi-step bake experiments,
+write the script as a file and syntax-check it before nohup, don't sed-patch a
+running harness.
+
+## Loop closed 2026-07-21
+GPU QA loop ran its full productive queue. Findings above; no engine
+regressions; `fork --env` shipped (#705) and boot-optimization recipe
+documented + corrected. Remaining GPU work is externally gated (sm90 #695,
+balloon #697) or is the optional EXP-3c bake confirmation. Box torn
+down/idle after ~13h. Branch: gpu-qa-experiments (pushed, no PR).
+
+
 ### EXP-3b — CORRECTS EXP-3's boot attribution (2026-07-21)
 Timed the isolated unsloth import from virtiofs vs a guest-local ext4 copy:
 | | cold | warm (2nd run) |
