@@ -16,6 +16,31 @@ QA branches (pushed, no PRs). Venue: Lambda A100-40GB (sm80) unless noted.
 ## Results
 (newest first)
 
+### EXP-3b — CORRECTS EXP-3's boot attribution (2026-07-21)
+Timed the isolated unsloth import from virtiofs vs a guest-local ext4 copy:
+| | cold | warm (2nd run) |
+|---|---|---|
+| virtiofs mount | 28s | **28s** (no page-cache benefit — FUSE per-access overhead) |
+| local ext4 overlay | 19s | **9s** (page cache works) |
+
+So the isolated import is ~28s, but EXP-3's golden *first* import was **93s** —
+therefore **~65s of that phase is first-time compile-cache generation**
+(Triton JIT + `/unsloth_compiled_cache`), NOT venv file I/O over virtiofs.
+EXP-3's "venv-over-virtiofs = 42%, fixed by baking the venv" is **corrected**:
+- Baking the venv onto local overlay saves only ~10–19s on the import (and
+  restores warm-cache benefit that virtiofs never gives).
+- The **bigger, cleaner win is pre-warming the Triton + unsloth compile caches
+  BEFORE packing** — run one import (and ideally one training step) in the prep
+  VM so `/unsloth_compiled_cache` + `~/.triton` are baked into the artifact.
+  That removes the ~65s first-import cost entirely.
+- Real-world note: virtiofs import does NOT improve on a warm second access
+  (28s→28s) — independent support for DAX (libkrun #43) and for baking
+  hot read paths into the artifact rather than mounting them.
+Corrected recipe: bake venv **+ pre-warmed compile caches** → the 93s golden
+warm-up phase should drop to ~10–19s. (End-to-end validation from a real
+baked+pre-warmed `.smolmachine` is the remaining follow-up.)
+
+
 ### EXP-3 — golden boot phase breakdown: 223s, and 42% is bakeable (2026-07-21)
 Instrumented a 7B QLoRA golden cold boot (bundle binary, A100), timestamps per
 phase:
