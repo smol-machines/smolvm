@@ -150,3 +150,14 @@ symbols) — DECISION: document as known cosmetic, restore shipping binary,
 pivot to the high-value lever (golden ring transport, load-time). Fixing it
 cleanly would need catching the guest-close and skipping the driver teardown
 without the hard-exit race that regressed — deferred, low priority.
+
+## 2026-07-21 12:24 — CHECK before building golden-ring: golden ALREADY has rings
+bring_up_client calls ring_try_setup for EVERY connection incl. the golden
+(SMOLVM_CUDA_SHARED=1 → zerocopy → GPA rings; golden RAM is daemon-visible).
+So the golden's from_pretrained H2D is likely ALREADY zero-copy — the planned
+"golden ring transport" lever may be a no-op. The ~62s load is then dominated
+by bnb-4bit quantize (GPU compute) + torch/python init + virtiofs disk read
+(~13s warm), NOT transport. MUST VERIFY before building: (1) confirm golden
+"shared-memory rings active" in daemon log; (2) decompose load_ms into
+disk-read vs from_pretrained-compute. Applying the measure-first lesson from
+the teardown rat-hole: don't build a fix for an unverified bottleneck.
