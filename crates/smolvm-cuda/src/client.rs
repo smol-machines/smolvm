@@ -40,10 +40,6 @@ pub type Result<T> = std::result::Result<T, CudaRpcError>;
 /// per op, dumped to stderr every 4096 calls, to show what still serializes an
 /// asynchronously-pipelined workload. For `LibCall` the tally key includes the
 /// library id and function index.
-fn count_sync(req: &Request, op: Op) {
-    count_sync_key(&sync_key(req, op), std::time::Duration::ZERO);
-}
-
 fn sync_key(req: &Request, op: Op) -> String {
     match req {
         Request::LibCall { lib, func, .. } => format!("LibCall(lib={lib},func={func})"),
@@ -70,7 +66,7 @@ fn count_sync_key(key: &str, dur: std::time::Duration) {
     let total: u64 = m.values().map(|(n, _)| n).sum();
     if total.is_multiple_of(4096) {
         let mut v: Vec<_> = m.iter().collect();
-        v.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+        v.sort_by_key(|b| std::cmp::Reverse(b.1 .1));
         eprintln!("[sync-times after {total}]");
         for (k, (n, us)) in v.iter().take(12) {
             eprintln!("  {:>9.1}ms {n:>7}x  {k}", *us as f64 / 1000.0);

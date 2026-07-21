@@ -482,13 +482,12 @@ fn ring_try_setup_file(client: &mut Client<Stream>) {
     // names must never collide with the golden's (or a sibling's) live file.
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let mut t = 0i64;
     // SAFETY: plain clock read into a local.
-    unsafe {
+    let t: i64 = unsafe {
         let mut ts: libc::timespec = std::mem::zeroed();
         libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
-        t = ts.tv_nsec as i64 ^ (ts.tv_sec as i64) << 20;
-    }
+        ts.tv_nsec as i64 ^ (ts.tv_sec as i64) << 20
+    };
     let fname = format!("ring-{}-{}-{}.bin", std::process::id(), seq, t as u64);
     let path = format!("{dir}/{fname}");
     let total = (REQ_N + RESP_N + BOUNCE_N) * PAGE;
@@ -1392,7 +1391,9 @@ pub extern "C" fn cudaMemcpyAsync(
     // work on `stream` first — torch's non-blocking pool streams don't order
     // against the NULL-stream copy the host uses, so dropping the stream let
     // a copy overwrite buffers that still-running kernels were reading.
-    set_last(retry_transport_c(|| do_memcpy(dst, src, n, kind, stream as u64)))
+    set_last(retry_transport_c(|| {
+        do_memcpy(dst, src, n, kind, stream as u64)
+    }))
 }
 
 #[no_mangle]
@@ -2893,7 +2894,7 @@ fn shim_prof_launch(dur: std::time::Duration) {
     static N: AtomicU64 = AtomicU64::new(0);
     let ns = NS.fetch_add(dur.as_nanos() as u64, Ordering::Relaxed) + dur.as_nanos() as u64;
     let n = N.fetch_add(1, Ordering::Relaxed) + 1;
-    if n % 8192 == 0 {
+    if n.is_multiple_of(8192) {
         eprintln!(
             "[shim-prof] launches={n} total={}ms avg={}ns",
             ns / 1_000_000,
