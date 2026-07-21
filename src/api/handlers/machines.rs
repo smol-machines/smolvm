@@ -372,8 +372,13 @@ pub async fn create_machine(
     // an imageless machine up front — it boots the bare-agent rootfs with nothing
     // to launch them in, so silently accepting them would strand a caller whose
     // command never runs (drive an imageless machine via `exec` instead).
-    validate_workload_image_source(req.image.is_some(), req.from.is_some(), &req.cmd, &req.entrypoint)
-        .map_err(ApiError::BadRequest)?;
+    validate_workload_image_source(
+        req.image.is_some(),
+        req.from.is_some(),
+        &req.cmd,
+        &req.entrypoint,
+    )
+    .map_err(ApiError::BadRequest)?;
 
     // Generate name if not provided, then validate. The on-disk layout uses
     // a hash-derived directory (see `vm_data_dir`) so name length doesn't
@@ -841,9 +846,11 @@ fn validate_workload_image_source(
     entrypoint: &[String],
 ) -> Result<(), String> {
     if !has_image && !has_from && (!cmd.is_empty() || !entrypoint.is_empty()) {
-        return Err("cmd/entrypoint require an image, from, or registryRef; an imageless \
+        return Err(
+            "cmd/entrypoint require an image, from, or registryRef; an imageless \
              machine has no workload to launch them in (use exec instead)"
-            .to_string());
+                .to_string(),
+        );
     }
     Ok(())
 }
