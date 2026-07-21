@@ -7,9 +7,12 @@ set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/config.sh"
 
+[ -f "$BAKED" ] || { echo "MISSING baked machine at $BAKED — build it once with ./make-baked.sh"; exit 1; }
 CO="$HOME/coord_smol"; rm -rf "$CO"; mkdir -p "$CO"; cp "$WORKLOAD" "$CO/qlora_train.py"
 SOCK=/tmp/smolvm/cuda-daemon.sock
-MOUNTS=(-v "$VENV:$GUEST_VENV:ro" -v "$DRVLIB:/opt/drvlib:ro" -v "$CO:/opt/coord:rw")
+# Only 2 mounts (drvlib + coord): venv + model are baked into the machine's
+# block storage, so nothing crosses virtiofs and we stay under the device budget.
+MOUNTS=(-v "$DRVLIB:/opt/drvlib:ro" -v "$CO:/opt/coord:rw")
 
 mk() { for m in "$@"; do "$SMOLVM" machine stop --name "$m" >/dev/null 2>&1; "$SMOLVM" machine rm --name "$m" --force >/dev/null 2>&1; done; }
 mk ql-g $(seq -f "ql-c%g" 0 $((N-1)))
@@ -25,19 +28,16 @@ env SMOLVM_CUDA_FORK_WORKERS=1 SMOLVM_CUDA_FORK_ISOLATE=1 SMOLVM_CUDA_DAEMON_IDL
 for i in $(seq 1 100); do [ -S "$SOCK" ] && break; sleep 0.1; done
 
 echo "== SMOLVM: golden + $N share-weights forks, $STEPS steps each =="
-GUEST="export DEBIAN_FRONTEND=noninteractive; apt-get update -qq >/dev/null 2>&1; \
-apt-get install -y -qq python3 python3-dev gcc ca-certificates >/dev/null 2>&1; \
-export LD_PRELOAD='/opt/drvlib/libcudart.so.12 /opt/drvlib/libcuda.so.1' \
-HF_HOME=/opt/coord/hf HF_HUB_OFFLINE=0 COORD=/opt/coord ARM=fork FORK=1 GOLDEN_WARMUP=1 \
+# Baked machine: venv at /home/ubuntu/ptwork, HF cache at /opt/hfcache (offline).
+GUEST="export LD_PRELOAD='/opt/drvlib/libcudart.so.12 /opt/drvlib/libcuda.so.1' \
+HF_HOME=/opt/hfcache HF_HUB_OFFLINE=1 COORD=/opt/coord ARM=fork FORK=1 GOLDEN_WARMUP=1 \
 STEPS=$STEPS NSLOTS=$N MODEL=$MODEL PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True; \
 ln -sf /opt/drvlib/libcuda.so.1 /usr/lib/x86_64-linux-gnu/libcuda.so; \
 $GUEST_PYBIN /opt/coord/qlora_train.py 2>>/opt/coord/g.err"
-# make the HF cache visible in-guest under /opt/coord/hf
-ln -sfn "$HF" "$CO/hf"
 
 t0=$(date +%s.%N)
-"$SMOLVM" machine create --name ql-g --cuda --net "${MOUNTS[@]}" \
-  --image ubuntu:22.04 --storage 30 --overlay 20 -- sh -c "$GUEST" >/dev/null 2>&1
+"$SMOLVM" machine create --name ql-g --cuda --net --from "$BAKED" "${MOUNTS[@]}" \
+  --storage 30 --overlay 20 -- sh -c "$GUEST" >/dev/null 2>&1
 env SMOLVM_CUDA_SHARED=1 "$SMOLVM" machine start --forkable --name ql-g >/dev/null 2>&1
 for i in $(seq 1 300); do [ -f "$CO/golden_ready" ] && break; sleep 2; done
 [ -f "$CO/golden_ready" ] || { echo "GOLDEN-LOAD-FAILED"; tail -5 "$CO/g.err" 2>/dev/null; mk ql-g; exit 1; }
