@@ -1665,6 +1665,15 @@ pub async fn resize_machine(
     Path(name): Path<String>,
     Json(req): Json<ResizeMachineRequest>,
 ) -> Result<Json<MachineInfo>, ApiError> {
+    // Serialize against start/stop/delete/clone on the same machine: resize
+    // reads the state, then grows the disk files and rewrites the record. Without
+    // the per-machine lifecycle lock a concurrent start could boot the VM between
+    // our "must be stopped" check and the on-disk expansion (and race the record
+    // update), so hold the lock across the whole operation as the other lifecycle
+    // handlers do — the state check below is only meaningful under it.
+    let lifecycle = state.lifecycle_lock(&name);
+    let _guard = lifecycle.lock().await;
+
     let record = state
         .lookup_vm(&name)
         .await?
