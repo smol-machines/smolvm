@@ -1575,6 +1575,7 @@ fn cow_one(sess: &mut Session, b: &mut dyn Backend, dptr: u64) {
     if let Ok(cdptr) = b.mem_alloc(size) {
         let _ = b.memcpy_dtod(cdptr, base, size);
         sess.dptr_trans.push((base, size, cdptr));
+        sort_trans(&mut sess.dptr_trans); // xlat binary-searches by base
         sess.owned_dptrs.insert(cdptr, size);
         sess.alloc_table
             .lock()
@@ -1608,16 +1609,27 @@ fn cow_written(sess: &mut Session, b: &mut dyn Backend, req: &Request) {
 /// pointer inside an inherited allocation `[base, base+size)` maps to the same
 /// offset in the clone's copy; everything else (fresh post-fork allocations,
 /// non-isolating sessions) passes through untouched.
+/// Translate one inherited device pointer through the (base-sorted) table.
+/// Binary search: this runs per 8-byte window of every kernel-param blob on
+/// the serve thread — a linear scan here was O(windows x table) per launch,
+/// a tax only clones paid (goldens have an empty table).
 fn xlat(trans: &[(u64, u64, u64)], p: u64) -> u64 {
-    if p == 0 {
-        return 0;
+    if p == 0 || trans.is_empty() {
+        return p;
     }
-    for &(base, size, copy) in trans {
-        if p >= base && p < base + size {
+    let i = trans.partition_point(|&(base, _, _)| base <= p);
+    if i > 0 {
+        let (base, size, copy) = trans[i - 1];
+        if p < base + size {
             return copy + (p - base);
         }
     }
     p
+}
+
+/// Keep `dptr_trans` base-sorted (see [`xlat`]). Call after any append.
+fn sort_trans(trans: &mut [(u64, u64, u64)]) {
+    trans.sort_unstable_by_key(|t| t.0);
 }
 
 /// Rewrite every inherited device pointer in a memory-op request to the clone's
@@ -2863,6 +2875,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                     copied += 1;
                     cbytes += size;
                 }
+                sort_trans(&mut sess.dptr_trans); // xlat binary-searches by base
                 gpu::set_lib_trans(&sess.dptr_trans); // forwarded-lib pointer map
                                                       // P3b: adopt inherited capture-replay logs, keyed by exec_vh —
                                                       // replayed lazily at the clone's first GraphLaunch.
