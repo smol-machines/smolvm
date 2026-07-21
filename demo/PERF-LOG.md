@@ -240,3 +240,18 @@ definitively fixed and the runnable harness is empirically verified, not just
 trace/soak-equivalent. Minor note: fork_2_clones_s=51s (first-fork warm-chain
 spawn cost; amortizes at higher N, ~0.4-1s/clone in the soak). Not a
 correctness issue.
+
+## 2026-07-21 17:57 — fork time scales with GOLDEN DISK DATA (baked=25s, minimal=0.2s)
+Isolated the verification run's 51s fork: 3 sequential baked-machine forks
+(14GB venv+model on disk) = 25.4 / 27.2 / 27.1s each; a minimal machine
+(little disk data, no cuda) = 0.20s. So `machine fork`'s disk-overlay/copy
+cost scales with the golden's on-disk footprint — NOT a GPU-fork regression
+(the RAM+CUDA fork is still sub-second; published fork_8=3.6s / fork_16=6.7s
+were minimal-disk ubuntu machines). IMPLICATION: my benchmark's smolvm arm
+switched to the baked machine (to fix model loading) and thereby regressed
+fork time 0.4s->25s — breaking the headline. FIX: the benchmark's fork arm
+must use the PROVEN run_smolvm_fast.sh approach (minimal ubuntu image + mount
+venv/drvlib/coord, HF cache via coord) which forks fast AND loads correctly.
+The baked machine stays a turnkey EASE option (QUICKSTART) but with a noted
+fork-time tradeoff. Also worth a real smolvm investigation: why does fork copy
+disk data instead of pure-CoW overlay? (separate item)
