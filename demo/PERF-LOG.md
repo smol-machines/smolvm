@@ -31,3 +31,11 @@ Newest first. Numbers are H100 SXM5 80GB (sm90) unless noted; local = RTX 3070
 
 Aggregate leverage: per-learner +32% at N=16 → agg ~12,700 (~1.8x container
 ceiling), a regime containers cannot reach.
+
+## 2026-07-21 09:56 — measurement-blocking gotcha found and fixed
+run_smolvm_fast/baked harnesses re-copy drvlib/libcudart.so -> .so.12 (and
+libcuda.so -> .so.1) at every start — staging only the suffixed names gets
+clobbered by stale unsuffixed files, producing PROTOCOL MISMATCH refusals
+(seen as "GOLDEN-LOAD-FAILED"). Cost five failed measurement attempts.
+Deploys must stage BOTH suffixed and unsuffixed shim names + the smolvm
+binary from one build. xlat solo A/B relaunched with corrected staging.
