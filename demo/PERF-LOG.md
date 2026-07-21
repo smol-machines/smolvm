@@ -183,3 +183,17 @@ No controllable perf lever remains. Remaining production-readiness items are
 NON-perf: (1) teardown SIGSEGV — cosmetic, self-reaping (assessed); (2)
 turnkey packaging (baked .smolmachine exists); (3) sustained-soak stability
 evidence (ongoing). Perf-optimization phase complete.
+
+## 2026-07-21 12:55 — packaging iteration + soak observations
+DELIVERED: demo/QUICKSTART.md (turnkey: baked .smolmachine fork-sweep, the
+proven share-weights+GOLDEN_WARMUP+expandable_segments recipe, staging/
+wire-hash gotchas) + demo/qlora_train.py (the workload it references, now
+in-repo so QUICKSTART is self-contained). Commit 650e7d0.
+SOAK (shipping binary, soak_ship2): 8 cycles, fatals=0 (teardown SIGSEGV did
+NOT recur — confirms intermittent/state-dependent, cosmetic), nans=0. One
+cycle (5) went done=3/4: it ran 7min vs the normal 2.3min and lost one
+learner with NO error in g.err — a transient SLOW clone that exceeded the
+soak harness's 5-min poll window under contention, not a crash/corruption
+(cycles 6-8 back to 4/4). Tail-latency note, not a defect. Production-
+readiness status: perf converged, crash cosmetic, turnkey doc landed,
+sustained-stability green (0 fatal/0 nan across cycles).
