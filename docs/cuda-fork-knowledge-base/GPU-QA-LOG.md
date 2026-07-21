@@ -16,6 +16,38 @@ QA branches (pushed, no PRs). Venue: Lambda A100-40GB (sm80) unless noted.
 ## Results
 (newest first)
 
+### ★ BEACHHEAD PROOF — a real GRPO/RL loop CLOSES on smolvm (2026-07-21)
+The one workload the whole "RL rollout fan-out substrate" pitch rests on had
+NEVER been run end-to-end (the verl A/B arm died at flash-attn). Now it has.
+A minimal but real GRPO loop ran to completion INSIDE a smolvm `--cuda` machine:
+Qwen2.5-0.5B policy + LoRA, trl.GRPOTrainer, **8 generations/prompt (the group)**,
+**verifiable gsm8k numeric-answer reward**, 12 policy-update steps:
+```
+step=1 reward=1.575  step=7 reward=1.000  step=12 reward=0.650  (kl 0->0.003)
+GRPO DONE: 12 steps, wall=291s (~24s/step). LOOP-CLOSED, ran clean, 0 crash/nan.
+```
+Every step did the full RL cycle on-GPU: generate 8 completions/prompt -> score
+vs the gold answer -> group-relative advantage -> policy-gradient update, with KL
+to the frozen reference tracking correctly. The reward is noisy over just 12
+steps on 0.5B (no monotonic gain expected at this scale) — the point is the
+**loop mechanics close**: rollout, verifiable reward, and policy update all run
+together inside the microVM. **This converts "components validated" into
+"beachhead workload validated."**
+
+Getting here required NO smolvm changes — only working around baked-venv version
+skew: (1) PEFT LoRA dispatch RAISES on torchao 0.9<0.16 (bf16 needs none) — override
+`is_torchao_available` on `peft.tuners.lora.torchao`; (2) importing unsloth AT ALL
+monkeypatches trl.GRPOTrainer into a broken compiled wrapper
+(`truncate_with_protected_tokens` undefined, missing `image_token_id`) — so use
+plain transformers+peft+trl, no unsloth. Both are venv-hygiene notes for the
+Unsloth-facing launch, not engine issues. Log+workload archived to FS
+runs-a100-2026-07-20/grpo-loop-closed.txt.
+
+NEXT (not yet done): the fork-native version — one golden serving rollouts, fork N
+rollout workers (share weights), re-fork on policy update (P2 weight-sync). That
+shows the *density* value on top of "the loop closes".
+
+
 ### EXP-3c — full baked-artifact boot measurement: NOT COMPLETED (2026-07-21)
 Attempted to bake a venv + pre-warmed-cache `.smolmachine` and measure a real
 golden boot end-to-end. Aborted after two self-inflicted harness bugs
