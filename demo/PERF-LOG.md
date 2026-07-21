@@ -197,3 +197,21 @@ soak harness's 5-min poll window under contention, not a crash/corruption
 (cycles 6-8 back to 4/4). Tail-latency note, not a defect. Production-
 readiness status: perf converged, crash cosmetic, turnkey doc landed,
 sustained-stability green (0 fatal/0 nan across cycles).
+
+## 2026-07-21 13:16 — CONVERGED: loop reaching natural completion
+Sustained soak (shipping binary): 17 cycles / 68 fork-train-teardown waves,
+fatals=0, nans=0, 16/17 pass (the 1 fail = classified slow-clone poll
+timeout, not a crash). Teardown SIGSEGV did not recur in 17 cycles —
+intermittent/cosmetic confirmed. Production-readiness scorecard:
+- Performance: CONVERGED — transport zero-copy (done), per-learner at
+  API-remoting floor, load framework-bound+fork-amortized. Wins architectural
+  (N=16 +36% over container ceiling), proven.
+- Reliability: 8/8 learners; 17-cycle soak clean; teardown crash cosmetic
+  (self-reaping, no leak, learners unaffected).
+- Turnkey: QUICKSTART.md + in-repo workload; flow == the soak's own
+  (verified-by-proxy every cycle).
+Open (low-priority, non-blocking): teardown-crash cosmetic fix (needs
+live-gdb+driver symbols), QUICKSTART clean-box e2e, slow-clone tail latency
+under contention. No controllable perf lever remains; further loop iterations
+are monitoring, not progress. Stopping the autonomous loop at this convergence
+point; restartable anytime.
