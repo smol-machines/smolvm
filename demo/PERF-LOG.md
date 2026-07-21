@@ -284,3 +284,12 @@ the CoW clone, or lazy-mount). Benchmark stance: keep the forkable golden's
 disk small; the baked machine is a turnkey EASE option with a fork-time
 caveat, not the way to showcase fork latency. Investigation CLOSED — the
 record is now honest.
+
+## 2026-07-21 19:09 — SELF-INFLICTED: scp'd a local (glibc-2.39) binary to the box (2.35)
+Deployed my locally-built smolvm to the H100 (Ubuntu 22.04, glibc 2.35) — it
+requires GLIBC_2.39 (Arch), so it wouldn't run, and I'd overwritten the box's
+working binary, breaking the soak. Violated my own standing rule (memory:
+"build smolvm ON the box"). RECOVERY: rsync source + rebuild on the box (which
+also carries the fork-timing change a29f673), redeploy, restart soak. LESSON
+re-learned: never scp a local Rust build to the glibc-older box; always build
+there. The fork phase-timing measurement is pending the box rebuild.
