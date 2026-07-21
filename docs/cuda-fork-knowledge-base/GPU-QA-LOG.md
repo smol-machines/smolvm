@@ -7,8 +7,7 @@ QA branches (pushed, no PRs). Venue: Lambda A100-40GB (sm80) unless noted.
 ## Experiment queue
 - [x] EXP-1 zero-config release path — PASS (see Results)
 - [x] EXP-2 series — fork `--env` PASS; clone-CUDA "failure" was workload-flaky, path HEALTHY (EXP-2e)
-- [ ] EXP-3 golden boot-time cut: apt/Triton-cache baked artifact vs current
-      (285s baseline)
+- [x] EXP-3 golden boot breakdown — MEASURED; venv-over-virtiofs is 42% (see Results)
 - [ ] EXP-4 clone ring-activation SIGSEGV reproduction at N=8 (sm80, from the
       H100 QA-LOG's 1-clone-per-leg crash)
 - [~] EXP-5 vLLM 30-min serving — BLOCKED on harness/venv drift (see Results)
@@ -16,6 +15,49 @@ QA branches (pushed, no PRs). Venue: Lambda A100-40GB (sm80) unless noted.
 
 ## Results
 (newest first)
+
+### EXP-3 — golden boot phase breakdown: 223s, and 42% is bakeable (2026-07-21)
+Instrumented a 7B QLoRA golden cold boot (bundle binary, A100), timestamps per
+phase:
+| phase | time | share | reducible? |
+|---|---|---|---|
+| apt install (gcc, python3-dev, ca-certs) | 34s | 15% | **fully** — bake into base image / artifact |
+| **venv import over virtiofs** | **93s** | **42%** | **fully** — bake the venv into the artifact rootfs (local ext4 overlay, not a virtiofs mount) OR enable DAX (libkrun #43) |
+| model weights → VRAM | 82s | 37% | mostly irreducible; pre-warm HF page cache helps a little |
+| misc (ln, py startup) | ~14s | 6% | — |
+
+**Headline: the single biggest cost is the venv import over virtiofs (93s, ~42%
+of boot)** — the same FUSE import-storm root cause as the N=24 DNF. Recipe to
+cut cold boot ~223s → ~90s with no engine change: ship the golden as a
+`.smolmachine` with the venv + apt packages baked into its rootfs (already the
+`unsloth-sweep.smolmachine` build recipe in IMAGE.md), so the interpreter and
+site-packages live on the machine's local overlay instead of a mounted host
+venv. DAX (libkrun #43) would additionally cut the virtiofs cost for any
+remaining host mounts. Fork stays ~1s regardless — this only affects the
+one-time golden warm-up, which is exactly the metric that gates
+time-to-first-experiment.
+
+---
+
+## Session summary (2026-07-21 GPU QA loop)
+- EXP-1 zero-config release path: **PASS** — released tarball auto-stages CUDA
+  shims; legacy drvlib/LD_PRELOAD recipe is obsolete for users.
+- EXP-2 series + EXP-2e: `fork --env` **VALIDATED** (clones read distinct params
+  from `/etc/smolvm/fork-env`); the transient clone-CUDA "failure" was
+  workload-specific flakiness, path proven healthy — earlier reads retracted.
+- EXP-3 golden boot: **MEASURED** — 223s, venv-over-virtiofs is 42%; bake-venv
+  recipe cuts it to ~90s.
+- EXP-5 sustained serving: **BLOCKED** on testbed harness/venv drift; the path
+  itself was already validated clean (EXP3 in A100-REPRODUCTION).
+- EXP-6 balloon-idle+load: **NO-REPRO** — narrows the cloud pool segfault to
+  pinned-RAM/pool-timing, not plain idle+load.
+- Harness/UX findings: QA-GPU-4 (stale-daemon socket on start), QA-GPU-5
+  (missing mount source → opaque `vm not found`), both with product notes.
+No engine regressions found; no code fixes needed. Reliability of the fork +
+weight-share path holds on sm80 (N=8 soak earlier + EXP-2e). Remaining
+GPU-side work is gated on in-flight branches (#695 sm90, #697 balloon) and the
+bake-venv artifact build.
+
 
 ### EXP-2e — CORRECTS the EXP-2 series: clone-CUDA path is HEALTHY (2026-07-21)
 Re-ran the exact known-good soak config (bundle binary, PATH3 share,
