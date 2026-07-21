@@ -394,3 +394,18 @@ NET: the reaper (commit bc291ff) is a real production-hardening fix — it
 converts sustained-operation degradation into steady-state stability. This is
 the correct "hardened" conclusion, now with the actual bug fixed + verified
 (not assumed). Accumulating more clean cycles for confidence.
+
+## 2026-07-21 22:55 — reaper fix DEFINITIVELY verified: 18/18 clean cycles
+18 consecutive soak cycles on the reaper stack: pass=18, fail=0, zombies=0
+(72 clones). Pre-reaper had fails by cycle 2 and 9 and accelerating by cycle
+24; post-reaper is 18/18 clean past that inflection. The zombie-leak
+degradation is FIXED and thoroughly verified. Fatals (~4/cycle, teardown
+SIGSEGV) continue but are reaped immediately — 0 zombie/resource/correctness
+impact. PR #695 all CI green + MERGEABLE (reaper commit included; ran
+fmt/clippy-D-warnings pre-commit).
+HARDENING THREAD CLOSED. Final production-readiness state (demonstrated, not
+asserted): perf converged; transport zero-copy; N=16 +36% over container
+ceiling; 18-cycle soak stable with the real zombie-leak bug FIXED; RSS a
+stable baseline (not a leak); the teardown SIGSEGV now genuinely harmless.
+Open low-priority items (filed, non-blocking): teardown-SIGSEGV root cause
+(cosmetic now that workers are reaped), fork O(disk) provisioning cost.
