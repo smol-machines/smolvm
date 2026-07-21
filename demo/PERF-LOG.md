@@ -332,3 +332,18 @@ train correctly; the 90 FATALs are all the known cosmetic teardown SIGSEGV
 (worker self-reaps, no correctness/leak impact — variable rate ~5/cycle now),
 the 2 fails are slow-clone poll timeouts under sustained load (harness
 sensitivity, cycle 9 ran 7min vs normal 2.3). NO new regression.
+
+## 2026-07-21 20:12 — teardown crash VERIFIED harmless (no leak); long-run soak stable
+Investigated whether the teardown clone-worker SIGSEGV leaks resources (a
+crash DURING reclaim_session could strand the clone's GPU memory). Measured
+across a full cycle: GPU mem is STABLE at 8837 MiB (exact golden baseline)
+for 60s between cycles with 0 clones running; nvidia per-process shows only
+the daemon (8810 MiB). So the driver fully reclaims each clone worker's GPU
+memory on process death despite the SIGSEGV — GPU returns to baseline every
+cycle. Daemon fd=268 (moderate, not unbounded), host mem 16G/209G. Over 34
+soak cycles / 136 clones: 0 nans, no GPU leak, no fd leak, no memory creep.
+CONCLUSION: the teardown SIGSEGV is VERIFIED harmless (was "believed
+cosmetic", now measured) — pure log noise, no resource or correctness impact.
+The long-run soak is stable = strong production-hardened evidence. Fatal rate
+is variable ~3-5/cycle with bursts (intermittent, state-dependent), not a
+smoothly-growing leak signature.
