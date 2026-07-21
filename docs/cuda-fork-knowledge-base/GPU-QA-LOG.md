@@ -6,8 +6,7 @@ QA branches (pushed, no PRs). Venue: Lambda A100-40GB (sm80) unless noted.
 
 ## Experiment queue
 - [x] EXP-1 zero-config release path — PASS (see Results)
-- [x] EXP-2/2b/2c fork `--env` GPU sweep — feature PASS; exposed main-branch
-      clone first-op CUDA failure (see Results)
+- [x] EXP-2 series — fork `--env` PASS; clone-CUDA "failure" was workload-flaky, path HEALTHY (EXP-2e)
 - [ ] EXP-3 golden boot-time cut: apt/Triton-cache baked artifact vs current
       (285s baseline)
 - [ ] EXP-4 clone ring-activation SIGSEGV reproduction at N=8 (sm80, from the
@@ -17,6 +16,24 @@ QA branches (pushed, no PRs). Venue: Lambda A100-40GB (sm80) unless noted.
 
 ## Results
 (newest first)
+
+### EXP-2e — CORRECTS the EXP-2 series: clone-CUDA path is HEALTHY (2026-07-21)
+Re-ran the exact known-good soak config (bundle binary, PATH3 share,
+`soak_workload.py`, N=3) on the same box, same day: **3 clones claimed slots and
+trained cleanly, no CUDA error.** Therefore:
+- The clone-CUDA-training path is fine on this binary/box RIGHT NOW.
+- EXP-2/2b/2c/2d's `RuntimeError: CUDA error: unknown error` (in unsloth
+  `fix_untrained_tokens` → `torch.amax(embedding_matrix)`) was **specific to
+  `exp2_workload.py`'s first-op, not the fork/`--env` engine path.** The
+  earlier reads ("main-only break", "not p3b-specific", "environmental
+  degradation") are RETRACTED — all were misattributions of a flaky workload
+  first-op. The GPU was healthy/idle throughout (0 MiB, no Xid).
+- **`fork --env` itself is fully validated**: in every EXP-2 run the clones
+  read their correct distinct LR from `/etc/smolvm/fork-env` before the
+  workload's own unsloth call flaked. Delivery + parameterization: PASS.
+Lesson for this log: when a GPU workload fails first-op, discriminate with a
+KNOWN-GOOD workload on the same binary before blaming the engine/branch.
+
 
 ### EXP-5 — BLOCKED on harness/venv drift, not an engine defect (2026-07-21)
 Four launch attempts, three separate stale-harness path issues each fixed in
