@@ -352,3 +352,11 @@ Validated end-to-end (training forks + vLLM inference forks) on sm86
    instance is experiment-ready ~2 min after boot (`testbed_boot.sh`).
 3. Harnesses: `vllm_compare.sh`, `l8_vllm_scale.sh`, `real-sweep.sh`,
    `unique-demo.sh`.
+
+### Clone-reliability fix validation (2026-07-21, H100, N=8)
+
+With the transport-retry + worker-state-globals fixes (commits 59314ee,
+4039fdd, 46172e7): **learners_done=8/8** (pre-fix baseline: 7/8 with one
+learner stranded by a crash-looping clone worker), agg 6,750 tok/s, all 8
+loss curves distinct and converging, 8 forks in 3.6 s. The per-leg stranded
+learner is eliminated; sweep rows no longer need the N−1 asterisk.
