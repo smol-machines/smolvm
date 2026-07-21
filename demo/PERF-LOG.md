@@ -347,3 +347,22 @@ cosmetic", now measured) — pure log noise, no resource or correctness impact.
 The long-run soak is stable = strong production-hardened evidence. Fatal rate
 is variable ~3-5/cycle with bursts (intermittent, state-dependent), not a
 smoothly-growing leak signature.
+
+## 2026-07-21 21:42 — REAL BUG FOUND: zombie clone-worker leak (not cosmetic!)
+Almost stopped the loop declaring "hardened", but checked the soak fail rate
+first: 7 fails/42 cycles, ACCELERATING (0.2/cycle early -> 0.33/cycle late).
+Root cause: 288 ZOMBIE (<defunct>) smolvm processes, all daemon children.
+The daemon forks a worker per clone but only reaps on the RECONNECT path
+(route_clone_connection); a worker that dies at teardown (incl. the teardown
+SIGSEGV) with no reconnect was never waited on -> zombie. Over a long run they
+fill the process table (risking PID exhaustion + fork failures that slow clone
+startup -> the accelerating timeouts). This OVERTURNS the earlier "teardown
+crash is harmless" — GPU didn't leak but the PROCESS TABLE did. My leak check
+had only looked at GPU, not host RSS/zombies (daemon RSS also 16GB, likely
+per-clone state not freed on no-reconnect death — separate follow-up).
+FIX (commit): spawn_child_reaper() — background thread waitpid(-1, WNOHANG)
+draining all exited children every 2s; coexists with the targeted reconnect
+reap (whichever wins; the other sees the child gone -> spawns fresh). fmt +
+clippy -D warnings clean (ran CI's checks pre-commit this time). Deploying via
+BOX rebuild (not scp). LESSON: never declare "hardened" from a spot check —
+watch the trend; an accelerating fail rate is a real signal.
