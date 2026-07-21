@@ -366,6 +366,15 @@ pub async fn create_machine(
         }
     }
 
+    // `cmd`/`entrypoint` are the machine's persistent workload, launched only as
+    // a container from an image or `.smolmachine` artifact (registryRef and any
+    // image-pack-ref have already been folded into `from` above). Reject them on
+    // an imageless machine up front — it boots the bare-agent rootfs with nothing
+    // to launch them in, so silently accepting them would strand a caller whose
+    // command never runs (drive an imageless machine via `exec` instead).
+    validate_workload_image_source(req.image.is_some(), req.from.is_some(), &req.cmd, &req.entrypoint)
+        .map_err(ApiError::BadRequest)?;
+
     // Generate name if not provided, then validate. The on-disk layout uses
     // a hash-derived directory (see `vm_data_dir`) so name length doesn't
     // affect the socket path — only character sanity + a generous length
@@ -814,6 +823,29 @@ fn classify_launch_error(e: String) -> ApiError {
     } else {
         ApiError::Internal(e)
     }
+}
+
+/// Reject `cmd`/`entrypoint` on a create request that names no image source.
+///
+/// A machine's `cmd`/`entrypoint` are launched only as a container workload from
+/// an image or `.smolmachine` artifact (see the image-launch path in
+/// [`start_machine`]). An imageless machine boots the bare-agent rootfs with
+/// nothing to run them in, so accepting them silently would strand a caller whose
+/// command never executes. Callers should fold `registryRef` and any pack-ref
+/// into `from`/`image` before this check so only a genuinely imageless request is
+/// rejected.
+fn validate_workload_image_source(
+    has_image: bool,
+    has_from: bool,
+    cmd: &[String],
+    entrypoint: &[String],
+) -> Result<(), String> {
+    if !has_image && !has_from && (!cmd.is_empty() || !entrypoint.is_empty()) {
+        return Err("cmd/entrypoint require an image, from, or registryRef; an imageless \
+             machine has no workload to launch them in (use exec instead)"
+            .to_string());
+    }
+    Ok(())
 }
 
 /// Start a machine.
@@ -1983,6 +2015,20 @@ mod tests {
             classify_launch_error(e),
             ApiError::PortConflict(_)
         ));
+    }
+
+    #[test]
+    fn validate_workload_image_source_rejects_imageless_workload() {
+        let cmd = vec!["python".to_string(), "app.py".to_string()];
+        let ep = vec!["/bin/sh".to_string()];
+        // Imageless (no image, no from) + a command/entrypoint → rejected.
+        assert!(validate_workload_image_source(false, false, &cmd, &[]).is_err());
+        assert!(validate_workload_image_source(false, false, &[], &ep).is_err());
+        // With an image or a from source, the workload has somewhere to run.
+        assert!(validate_workload_image_source(true, false, &cmd, &[]).is_ok());
+        assert!(validate_workload_image_source(false, true, &cmd, &ep).is_ok());
+        // Imageless with no workload is the ordinary exec-driven machine.
+        assert!(validate_workload_image_source(false, false, &[], &[]).is_ok());
     }
 
     #[test]
