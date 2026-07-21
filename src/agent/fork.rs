@@ -209,6 +209,10 @@ pub fn prepare_fork(
         let _ = std::fs::remove_dir_all(&clone_dir);
         let _ = std::fs::remove_dir_all(&snapshot_dir);
     };
+    // Phase timing: fork latency is dominated by one of these two steps; log
+    // each so a slow fork is diagnosable (the golden's RAM checkpoint vs the
+    // clone's disk-overlay creation) instead of a single opaque wall-time.
+    let t_snap = std::time::Instant::now();
     let reply = match control_socket_cmd(&ctl, &format!("FORK {}", snapshot_dir.display())) {
         Ok(r) => r,
         Err(e) => {
@@ -220,11 +224,20 @@ pub fn prepare_fork(
         cleanup();
         return Err(Error::agent("fork", format!("golden FORK failed: {reply}")));
     }
+    tracing::info!(
+        elapsed_ms = t_snap.elapsed().as_millis() as u64,
+        "fork: golden RAM checkpoint written"
+    );
 
+    let t_disk = std::time::Instant::now();
     if let Err(e) = clone_fork_disks(&gdir, &clone_dir) {
         cleanup();
         return Err(e);
     }
+    tracing::info!(
+        elapsed_ms = t_disk.elapsed().as_millis() as u64,
+        "fork: clone disk overlays created"
+    );
 
     Ok(PreparedFork {
         snapshot_dir,
