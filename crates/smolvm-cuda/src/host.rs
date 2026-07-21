@@ -2101,6 +2101,40 @@ fn serve_rings<S: Read + Write>(
 ) -> std::io::Result<()> {
     use crate::ring::LEN_INDIRECT;
     let oplog = std::env::var_os("SMOLVM_CUDA_HOST_OPLOG").is_some();
+    // Phase profiler (SMOLVM_CUDA_HOST_PROF=1): where the serve thread's wall
+    // time goes — idle (waiting on the guest), frame decode, dispatch (the
+    // CUDA call), respond. Dumped every 8192 ops so the per-learner gap can
+    // be attributed to guest-bound vs host-bound vs GPU-bound time.
+    struct Prof {
+        on: bool,
+        idle: u128,
+        decode: u128,
+        exec: u128,
+        resp: u128,
+        ops: u64,
+    }
+    impl Prof {
+        fn dump_maybe(&mut self) {
+            if self.on && self.ops.is_multiple_of(8192) && self.ops > 0 {
+                eprintln!(
+                    "[serve-prof] ops={} idle={}ms decode={}ms exec={}ms respond={}ms",
+                    self.ops,
+                    self.idle / 1000,
+                    self.decode / 1000,
+                    self.exec / 1000,
+                    self.resp / 1000
+                );
+            }
+        }
+    }
+    let mut prof = Prof {
+        on: std::env::var_os("SMOLVM_CUDA_HOST_PROF").is_some(),
+        idle: 0,
+        decode: 0,
+        exec: 0,
+        resp: 0,
+        ops: 0,
+    };
     // Reassembly buffer for oversized frames arriving as bounce chunks.
     let mut pending: Vec<u8> = Vec::new();
     // Push one response. Oversized ones chunk through the bounce pages: the
@@ -2160,6 +2194,7 @@ fn serve_rings<S: Read + Write>(
         Ok(())
     }
     loop {
+        let t_idle = std::time::Instant::now();
         let (payload, flags) = match rings.req.try_pop() {
             Some(rec) => rec,
             None => {
@@ -2190,6 +2225,10 @@ fn serve_rings<S: Read + Write>(
                 }
             }
         };
+        if prof.on {
+            prof.idle += t_idle.elapsed().as_micros();
+        }
+        let t_dec = std::time::Instant::now();
         // Oversized frame: chunks arrive through the bounce pages. Every
         // non-final chunk is acked (so the guest can refill the pages); the
         // final chunk completes the frame, which dispatches below and whose
@@ -2246,7 +2285,16 @@ fn serve_rings<S: Read + Write>(
                         libcall_tag(&frame[1..])
                     );
                 }
+                if prof.on {
+                    prof.decode += t_dec.elapsed().as_micros();
+                }
+                let t_exec = std::time::Instant::now();
                 let (status, _) = dispatch(sess, backend, req);
+                if prof.on {
+                    prof.exec += t_exec.elapsed().as_micros();
+                    prof.ops += 1;
+                    prof.dump_maybe();
+                }
                 if status != 0 {
                     if oplog {
                         eprintln!("[op~!] status={status}");
@@ -2281,11 +2329,24 @@ fn serve_rings<S: Read + Write>(
                         libcall_tag(&frame)
                     );
                 }
+                if prof.on {
+                    prof.decode += t_dec.elapsed().as_micros();
+                }
+                let t_exec = std::time::Instant::now();
                 let (status, resp) = dispatch(sess, backend, req);
+                if prof.on {
+                    prof.exec += t_exec.elapsed().as_micros();
+                }
                 if status != 0 && oplog {
                     eprintln!("[op!] status={status}");
                 }
+                let t_resp = std::time::Instant::now();
                 respond(&rings, &mut stream, &encode_response(status, &resp))?;
+                if prof.on {
+                    prof.resp += t_resp.elapsed().as_micros();
+                    prof.ops += 1;
+                    prof.dump_maybe();
+                }
             }
         }
     }

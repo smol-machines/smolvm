@@ -50,3 +50,15 @@ the 1,434 historical record (cross-day, soft comparison); (b) 4/4 golden
 loads at 151-155s with zero failures — staging fix confirmed as the cure
 for the "flaky load" era. NEXT: host-serve phase profiler (ring-wait vs
 decode/translate vs execute) to locate the remaining 35%.
+
+## 2026-07-21 10:35 — serve-phase profiler: HOST IS 87% IDLE; gap is GUEST-side
+New SMOLVM_CUDA_HOST_PROF instrumentation (serve loop: idle/decode/exec/
+respond buckets). Local 30-step clone run, ~500k ops: idle 4,812ms, exec
+726ms (~1.4us/op), decode+respond ~0. The host serve thread and ring
+transport are effectively free — the guest cannot PRODUCE ops fast enough
+(~17k ops/step: python dispatch + shim marshal + ring writes on 4 vCPUs).
+Host-serve overlap hypothesis DEAD. New lever ranking:
+1. Guest vCPUs (native uses all host cores; guests get 4) — A/B running.
+2. Guest-side op production cost (marshal/encode) — measure if vCPUs move it.
+3. Op-count reduction (17k/step is enormous) — torch-level, harder.
+Local tok/s stable at ~2,450-2,500 across the current stack.
