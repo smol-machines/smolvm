@@ -39,3 +39,14 @@ clobbered by stale unsuffixed files, producing PROTOCOL MISMATCH refusals
 (seen as "GOLDEN-LOAD-FAILED"). Cost five failed measurement attempts.
 Deploys must stage BOTH suffixed and unsuffixed shim names + the smolvm
 binary from one build. xlat solo A/B relaunched with corrected staging.
+
+## 2026-07-21 10:18 — xlat A/B verdict: NEUTRAL; solo baseline re-established
+Controlled solo 7B A/B (2 runs each, same box/day/harness):
+binary-search xlat 1,681/1,578 vs linear 1,631/1,639 tok/s — no difference;
+the share-weights translation table is small, the scan was never hot. Change
+kept (correct + future-proofs large tables), no perf claim. Byproducts:
+(a) current-stack solo clone = ~1,630 tok/s (65% of native 2,507), up from
+the 1,434 historical record (cross-day, soft comparison); (b) 4/4 golden
+loads at 151-155s with zero failures — staging fix confirmed as the cure
+for the "flaky load" era. NEXT: host-serve phase profiler (ring-wait vs
+decode/translate vs execute) to locate the remaining 35%.
