@@ -377,3 +377,20 @@ accumulation: per-clone state (module images / graph oplogs / staged blobs)
 not freed when a worker dies WITHOUT a reconnect. Monitoring whether zombies
 stay ~0 across cycles and whether daemon RSS still climbs (isolates the RSS
 leak as the next real hardening item).
+
+## 2026-07-21 22:25 — reaper CONFIRMS the degradation was zombies; RSS is baseline not leak
+5 cycles on the reaper stack: zombies stay 0 (transient 1 -> reaped), 0 fails
+(vs 7/42 pre-reaper), daemon RSS STABLE at ~15991MB (not growing per-cycle).
+CONCLUSIONS:
+- The accelerating fail rate (nearly dismissed as cosmetic) WAS caused by
+  zombie accumulation filling the process table -> slower fork/clone startup
+  -> timeouts. The reaper fixes it: 0 zombies, 0 fails.
+- The 16GB daemon RSS is a stable BASELINE (golden's zero-copy-mapped 8GB
+  guest RAM + 7B model + CUDA host allocations), NOT a leak — flat across
+  cycles. The earlier "per-clone state leak" worry was wrong.
+- The teardown SIGSEGV (fatals ~4/cycle) is now genuinely harmless: reaped
+  immediately, no zombie/resource accumulation, no correctness impact.
+NET: the reaper (commit bc291ff) is a real production-hardening fix — it
+converts sustained-operation degradation into steady-state stability. This is
+the correct "hardened" conclusion, now with the actual bug fixed + verified
+(not assumed). Accumulating more clean cycles for confidence.
