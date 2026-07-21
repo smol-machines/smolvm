@@ -68,6 +68,7 @@ pub async fn exec_command(
     // before resolution so structural/scope violations surface as 400 without
     // the resolution audit firing.
     crate::api::handlers::validate_request_secrets(&req.secrets)?;
+    crate::api::handlers::validate_request_env(&req.env)?;
     let record_env = crate::api::handlers::record_secret_refs_env(&entry)?;
     let req_env = crate::api::handlers::resolve_request_secrets(&req.secrets)?;
     let mut env = EnvVar::to_tuples(&req.env);
@@ -221,6 +222,7 @@ pub async fn exec_stream(
         .map_err(classify_ensure_running_error)?;
 
     crate::api::handlers::validate_request_secrets(&req.secrets)?;
+    crate::api::handlers::validate_request_env(&req.env)?;
     let record_env = crate::api::handlers::record_secret_refs_env(&entry)?;
     let req_env = crate::api::handlers::resolve_request_secrets(&req.secrets)?;
 
@@ -356,6 +358,7 @@ pub async fn run_command(
         .map_err(classify_ensure_running_error)?;
 
     crate::api::handlers::validate_request_secrets(&req.secrets)?;
+    crate::api::handlers::validate_request_env(&req.env)?;
     let record_env = crate::api::handlers::record_secret_refs_env(&entry)?;
     let req_env = crate::api::handlers::resolve_request_secrets(&req.secrets)?;
 
