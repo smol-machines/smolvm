@@ -509,6 +509,18 @@ pub async fn create_machine(
     // machines. Memory is ballooned, so a generous default does not imply
     // immediate host commitment.
     let (cpus, mem) = resolve_create_resources(&req, manifest_cpus, manifest_mem);
+    // Reject invalid resources up front (as the CLI does at create time), so the
+    // API returns a clear 400 here instead of persisting an unbootable machine
+    // that only fails with a deferred 500 when it is later started.
+    crate::data::resources::VmResources {
+        cpus,
+        memory_mib: mem,
+        storage_gib: req.storage_gb,
+        overlay_gib: req.overlay_gb,
+        ..Default::default()
+    }
+    .validate()
+    .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let network = req.network || manifest_net;
 
     // Reserve the name atomically (prevents concurrent creation)
