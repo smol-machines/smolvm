@@ -65,7 +65,38 @@ before fork (QA-LOG.md 2026-07-20). Copy-mode is correct at all N regardless.
 
 **Open gap:** per-learner throughput (~4× slower via eager socket remoting;
 CUDA-graphing the step is blocked by bitsandbytes 4-bit — op-coalescing is
-the lever). Cross-N density sweep + throughput work ongoing.
+the lever).
+
+### Saturation sweep (2026-07-20, file rings, non-DAX, one H100)
+
+Where does aggregate throughput stop scaling? The container arm cannot answer
+past N≈10 (OOM on 80 GB); smolvm keeps going:
+
+| N forked learners | Aggregate tok/s | Peak GPU | Learners finished |
+|---|---|---|---|
+| 8 | 6,105 | 25.6 GB | 7/8¹ |
+| 16 | **9,628** | 43.9 GB | 15/16¹ |
+| 24 | DNF² | 8.8 GB | 0/24 |
+
+**N=16 exceeds the container arm's compute ceiling (7,088 at N=8, its OOM
+wall) by +36% — a regime the container pattern cannot reach at all** — in
+43.9 GB. Per-learner: 872 (N=8) → 642 (N=16): sub-linear but still strongly
+additive at 2× the container's max density.
+
+¹ Exactly one clone worker per leg crash-looped (SIGSEGV every ~1.6 s at
+spawn, immediately after ring activation), stranding one learner; the other
+N−1 trained to completion, 0 nan. Open defect — crash-handler hardening
+landed (5972dc1) and a gdb catcher is staged to capture the fault site.
+² The 24 learners never reached the training phase (GPU stayed at the
+golden's 8.8 GB through all 3 attempts). Leading hypothesis: 24 guests ×
+4 vCPUs ≈ 96 vCPUs on this box's cores — the concurrent venv/python import
+storm over virtiofs FUSE starves learner startup, not a GPU/memory limit.
+Retest planned with DAX mounts (imports bypass FUSE) after the DAX
+fork-replay fix (libkrun PR #43).
+
+Every golden load this session also hit the virtiofs FUSE slow mode
+(~156 s vs ~15 s healthy), burning two retry attempts per leg — the same
+FUSE path the DAX fix removes.
 
 ## The claim
 
