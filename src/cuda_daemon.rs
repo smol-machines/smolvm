@@ -73,6 +73,39 @@ fn spawn_idle_watchdog(active: Arc<AtomicUsize>, timeout: Duration) {
         .ok();
 }
 
+/// Reap dead clone-worker children so they don't accumulate as zombies. The
+/// daemon forks a worker per clone; the reconnect path reaps a worker only if
+/// that clone reconnects (see route_clone_connection), but a worker that dies
+/// at teardown — including the teardown SIGSEGV — with no reconnect was never
+/// waited on and became a zombie. Over a long run these fill the process table
+/// (observed: 288 `<defunct>` after ~42 fork cycles), risking PID exhaustion
+/// and fork failures that slow clone startup. A background reaper drains all
+/// exited children; it coexists with the targeted reconnect reap (whichever
+/// waits first wins; the other simply sees the child already gone).
+#[cfg(unix)]
+fn spawn_child_reaper() {
+    thread::Builder::new()
+        .name("cuda-daemon-reaper".into())
+        .spawn(|| loop {
+            // Drain every exited child without blocking.
+            loop {
+                let mut status: libc::c_int = 0;
+                // SAFETY: WNOHANG waitpid(-1) on our own children; never blocks.
+                let r = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+                // 0 = children exist but none exited yet; <=0 (incl. -1/ECHILD
+                // when there are no children) = nothing to reap right now.
+                if r <= 0 {
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_secs(2));
+        })
+        .ok();
+}
+
+#[cfg(not(unix))]
+fn spawn_child_reaper() {}
+
 /// Run the daemon body: bind `sock` and serve every connection in its own
 /// thread against a fresh backend — all in this process, so they share one GPU
 /// context. Returns only on listener failure; otherwise exits via the idle
@@ -203,6 +236,7 @@ pub fn run(sock: &Path) -> io::Result<()> {
             spawn_idle_watchdog(active.clone(), timeout);
         }
     }
+    spawn_child_reaper();
     for stream in listener.incoming() {
         match stream {
             // Count the connection open for the whole serve loop so a frozen golden
