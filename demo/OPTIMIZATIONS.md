@@ -279,3 +279,20 @@ measurement must attribute TIME per op class (extend count_sync with
 durations) before more targeting. The generic classification table remains
 the right frame — entries just need time-weighting. Elision kept: correct,
 free, and pays in idle-heavy serving patterns.
+
+## 2026-07-21 (cont.) — time-weighted tally results and the corrected picture
+
+Time-ranked sync profile (30-step 0.5B clone run): MemcpyGpaDtoH 1,483ms/174
+calls dominates — but the A/B with a fast-fail latch showed most of those
+SUCCEED (golden phase) and the 8.5ms/call is largely SYNC-POINT WAIT (the GPU
+draining queued kernels before a D2H), not transport. Three metric
+corrections in one evening: (1) sync COUNT pointed at required waits
+(elision fired 1/1,667); (2) sync TIME pointed at an op that is mostly
+GPU-busy time; (3) the honest residual per-learner gap remains the H100
+solo number (clone 1,434 vs native 2,507 = 57%), and its next lever is
+host-side pipeline OVERLAP (serve-loop batching between deferred ops), not
+guest-side round-trip elimination. Shipped from this arc: time-weighted
+tally tooling (COUNT_SYNC now reports ms + counts, incl. bridged ops),
+clean-pipeline sync elision, clone GPA fast-fail latch. Local native 0.5B
+baseline blocked by an Arch torch-cu124 quirk (cuInit fine, torch refuses)
+— not worth chasing; H100 numbers carry the comparison.
