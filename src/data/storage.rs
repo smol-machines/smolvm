@@ -56,6 +56,7 @@ impl HostMount {
         ("/var/run", true),
         ("/var/log", true),
         ("/etc", true),
+        ("/boot", true),
         ("/usr", true),
         ("/bin", true),
         ("/sbin", true),
@@ -273,6 +274,29 @@ mod tests {
                 "Error should explain that {} cannot be mounted, got: {}",
                 path,
                 err_msg
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_validate_rejects_boot_subtree() {
+        // `/boot` holds the kernel and bootloader config; mounting it read-write
+        // into a guest that scribbles on it can leave the host unbootable, so it
+        // belongs alongside the other protected system paths. Exercise `validate`
+        // directly so the assertion holds where `/boot` is absent (e.g. CI
+        // containers), which `HostMount::new` would otherwise reject earlier as
+        // not-found.
+        for path in ["/boot", "/boot/grub"] {
+            let mount = HostMount {
+                source: PathBuf::from(path),
+                target: PathBuf::from("/guest/path"),
+                read_only: true,
+            };
+            let err = HostMount::validate(&mount).unwrap_err().to_string();
+            assert!(
+                err.contains("protected system path"),
+                "{path} should be blocked as a protected path, got: {err}"
             );
         }
     }
