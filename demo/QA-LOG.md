@@ -912,3 +912,23 @@ single-clone failure locally). Layered causes, all in the clone worker path:
 
 Also: fork_err files are written by the workload itself; shim trace goes to the
 detached container's stderr (invisible) — probes must capture stderr to coord.
+
+## 2026-07-21 — clone trainer-init tail: classification via pre-fix baseline
+
+The local 0.5B trainer/demo failures are NOT a regression from the clone
+fixes: the identical control (proven H100 sweep workload qlora_train.py,
+0.5B, single fork, full recipe) fails the same way at pre-fix commit 62ad582
+(clone claims + emits ready, then dies "unknown error" in the first bnb 4-bit
+forward). The local 0.5B combo has no known-good baseline and is not a valid
+instrument for the trainer path. Three experimental shim changes (post-fork
+strict window, burst-start liveness fence, bridged fence) did not validate and
+were reverted; the burst-fence variant HUNG the proven workload (a probe read
+on a dead inherited ring never returns — inherited ring pages never show the
+host's close marker). Committed and kept: transport-retry (7/7 on its probe),
+worker-state globals (alloc/mod/func/stream/event), bridged-op retry.
+
+VALIDATION VENUE: the H100 sweep (proven 15/16 baseline; the fixes target the
+stranded 1/16). Also fully identified en route: the deferred-mode killer op is
+cuMemMap (torch expandable_segments VMM) — the documented clone recipe
+(PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False + GOLDEN_WARMUP) is
+REQUIRED for training clones; without it the VMM map fails INVALID_VALUE.
