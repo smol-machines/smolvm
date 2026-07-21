@@ -947,3 +947,20 @@ kernel-param structs that the 8-byte-aligned scan misses, and/or VMM MemMap
 in copy mode). Share-weights — the production and density mode — works on
 sm86 and sm90. Repro harness: scratchpad val_sweepwl.sh (~2 min/cycle);
 flip the --share-weights flag to toggle the failure.
+
+## 2026-07-21 — copy-mode RESOLVED; overnight soak started
+
+Copy-mode fork (no --share-weights) now passes 3/3 on the 3070 (1,930-1,980
+tok/s, losses identical to share-weights) — the same transport-retry +
+worker-globals fixes that closed the stranded-learner bug healed it; the
+"copy-mode translation defect" was the same root causes. Both fork modes are
+now correct on sm86 and sm90.
+
+Remaining (perf, not correctness): clone workers lack the CLONE's guest-RAM
+map — every zero-copy GPA op (MemcpyGpaDtoH 0xb3) fails NOT_FOUND and falls
+back to the bounce path (visible as [op!] status=500 noise; costs a wasted
+round-trip per readback and likely part of the per-learner gap). Fix: route
+the clone's RAM advert to its worker.
+
+Overnight fork-churn soak running on the H100 (soak.sh: baked golden, 200
+cycles of fork-4/train/verify/teardown; cycle 1: 4/4, 0 nan).
