@@ -1118,29 +1118,28 @@ pub fn set_vmm_trans(map: HashMap<u64, u64>) {
     VMM_TRANS.with(|m| *m.borrow_mut() = Some(map));
 }
 
-thread_local! {
-    /// Worker-mode: private copies of the golden's non-VMM (`cudaMalloc`)
-    /// allocations, made during reconstruction — `(golden_dptr, size, copy)`.
-    /// Drained into the serving session's `dptr_trans` at clone resume, so the
-    /// clone's inherited pointers translate exactly like the in-daemon isolate
-    /// path (see `alloc_handoff_snapshot`).
-    static WORKER_ALLOC_TRANS: std::cell::RefCell<Vec<(u64, u64, u64)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
+/// Worker-mode: private copies of the golden's non-VMM (`cudaMalloc`)
+/// allocations, made during reconstruction — `(golden_dptr, size, copy)`.
+/// Process-global and NON-draining: every serving thread's isolate session
+/// adopts the same translations at clone resume. This was a drained
+/// thread_local, which made clone survival a scheduling lottery — a channel
+/// served on any thread other than the one that staged the copies (or after
+/// the spawn pre-warm's scratch session drained them) resumed with ZERO
+/// translations, and its first kernel launch dereferenced untranslated golden
+/// addresses (the intermittent one-dead-clone-per-fork bug: "unknown error"
+/// or a worker SIGSEGV). No session takes ownership of the copies — they must
+/// outlive every channel and are reclaimed when the worker process exits.
+static WORKER_ALLOC_TRANS: std::sync::Mutex<Vec<(u64, u64, u64)>> =
+    std::sync::Mutex::new(Vec::new());
 
 pub fn set_worker_alloc_trans(v: Vec<(u64, u64, u64)>) {
-    WORKER_ALLOC_TRANS.with(|r| *r.borrow_mut() = v);
+    *WORKER_ALLOC_TRANS.lock().unwrap() = v;
 }
 
-/// Non-draining copy of this thread's staged alloc translations, taken by the
-/// clone worker's main thread BEFORE serving so late-attached guest channels
-/// (served on other threads) can be seeded with the same map.
+/// Non-draining copy of the worker's staged alloc translations; used both to
+/// seed late-attached channels and by every isolate session at clone resume.
 pub fn worker_alloc_trans_snapshot() -> Vec<(u64, u64, u64)> {
-    WORKER_ALLOC_TRANS.with(|r| r.borrow().clone())
-}
-
-fn take_worker_alloc_trans() -> Vec<(u64, u64, u64)> {
-    WORKER_ALLOC_TRANS.with(|r| std::mem::take(&mut *r.borrow_mut()))
+    WORKER_ALLOC_TRANS.lock().unwrap().clone()
 }
 
 /// M3b: rebuild the golden's captured graphs in THIS worker's context and map
@@ -2774,10 +2773,13 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 // Worker-mode: reconstruction already made private copies of the
                 // golden's non-VMM allocations (the daemon-process registries
                 // above are empty in a worker) — adopt them into this session's
-                // translation exactly like the copies made in-daemon.
-                for (gdptr, size, cdptr) in take_worker_alloc_trans() {
+                // translation exactly like the copies made in-daemon. Adoption
+                // is non-draining and ownerless: every channel's session needs
+                // the same translations (the guest launches kernels on more
+                // than one channel), and no session may free the copies on
+                // close — they live until the worker process exits.
+                for (gdptr, size, cdptr) in worker_alloc_trans_snapshot() {
                     sess.dptr_trans.push((gdptr, size, cdptr));
-                    sess.owned_dptrs.insert(cdptr, size);
                     sess.alloc_table
                         .lock()
                         .unwrap()

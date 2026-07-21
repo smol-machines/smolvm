@@ -2817,6 +2817,11 @@ pub extern "C" fn cudaLaunchKernel(
     ))
 }
 
+/// Sentinel (not a real `cudaError_t`) marking a launch that failed at the
+/// TRANSPORT layer — the op never reached the host, so one retry after a
+/// forced reconnect runs it exactly once.
+const LAUNCH_TRANSPORT_ERR: c_int = -9990;
+
 /// Shared launch path for both `cudaLaunchKernel` and `cudaLaunchKernelExC`:
 /// look up the registered function, gather its argument blobs, forward.
 fn do_launch(
@@ -2831,34 +2836,56 @@ fn do_launch(
     if std::env::var_os("SMOLVM_CUDA_NOOP_LAUNCH").is_some() {
         return CUDA_SUCCESS;
     }
-    with_state(|s| {
-        let rec = s
-            .funcs
-            .get(&(func as usize))
-            .ok_or(CUDA_ERROR_INVALID_DEVICE_POINTER)?;
-        let fid = rec.fid;
-        let sizes = rec.param_sizes.clone();
-        // Reconstruct one byte-blob per kernel argument from `args[i]`.
-        let params: Vec<Vec<u8>> = if sizes.is_empty() {
-            Vec::new()
-        } else if args.is_null() {
-            return Err(CUDA_ERROR_INVALID_VALUE);
-        } else {
-            let ptrs = unsafe { std::slice::from_raw_parts(args, sizes.len()) };
-            sizes
-                .iter()
-                .zip(ptrs)
-                .map(|(&sz, &p)| {
-                    unsafe { std::slice::from_raw_parts(p as *const u8, sz as usize) }.to_vec()
+    let attempt = || {
+        with_state(|s| {
+            let rec = s
+                .funcs
+                .get(&(func as usize))
+                .ok_or(CUDA_ERROR_INVALID_DEVICE_POINTER)?;
+            let fid = rec.fid;
+            let sizes = rec.param_sizes.clone();
+            // Reconstruct one byte-blob per kernel argument from `args[i]`.
+            let params: Vec<Vec<u8>> = if sizes.is_empty() {
+                Vec::new()
+            } else if args.is_null() {
+                return Err(CUDA_ERROR_INVALID_VALUE);
+            } else {
+                let ptrs = unsafe { std::slice::from_raw_parts(args, sizes.len()) };
+                sizes
+                    .iter()
+                    .zip(ptrs)
+                    .map(|(&sz, &p)| {
+                        unsafe { std::slice::from_raw_parts(p as *const u8, sz as usize) }.to_vec()
+                    })
+                    .collect()
+            };
+            s.client
+                .launch_kernel(fid, grid, block, shared_mem as u32, stream, &params)
+                .map_err(|e| match e {
+                    CudaRpcError::Io(_) | CudaRpcError::Protocol(_) => LAUNCH_TRANSPORT_ERR,
+                    other => map_err(other),
                 })
-                .collect()
-        };
-        s.client
-            .launch_kernel(fid, grid, block, shared_mem as u32, stream, &params)
-            .map_err(map_err)
-    })
-    .err()
-    .unwrap_or(CUDA_SUCCESS)
+        })
+    };
+    let rc = match attempt() {
+        // A VM-fork clone's first launch can race the reconnect: the pre-call
+        // liveness peek misses the dead inherited transport (the guest pid is
+        // unchanged and the socket reset may not have surfaced yet, while ring
+        // writes vanish into cloned pages no host reads), so the launch dies
+        // with a transport error the host never saw. Force the reconnect
+        // (which replays the quiet-op journal) and run the launch once more
+        // on the fresh channel.
+        Err(LAUNCH_TRANSPORT_ERR) => {
+            mark_force_reconnect();
+            attempt()
+        }
+        other => other,
+    };
+    match rc {
+        Err(LAUNCH_TRANSPORT_ERR) => CUDA_ERROR_UNKNOWN,
+        Err(e) => e,
+        Ok(()) => CUDA_SUCCESS,
+    }
 }
 
 /// `cudaLaunchConfig_t` (CUDA 12): grid/block dims, dynamic shared bytes, stream,
