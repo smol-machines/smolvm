@@ -7,12 +7,33 @@ set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/config.sh"
 
-[ -f "$BAKED" ] || { echo "MISSING baked machine at $BAKED — build it once with ./make-baked.sh"; exit 1; }
+# Two golden layouts:
+#  - DEFAULT (fast fork ~0.4s/clone): minimal ubuntu image + mount the venv;
+#    the HF cache is reached via a symlink inside the coord mount. This is the
+#    layout that produced the published fork numbers. `machine fork` cost scales
+#    with the golden's ON-DISK data, so a minimal image forks in a fraction of
+#    a second.
+#  - USE_BAKED=1 (DEFAULT — reliable offline load, but SLOW fork ~25s/clone):
+#    boot from the baked machine ($BAKED) with venv+model on guest block
+#    storage. This loads the model reliably offline. Its large disk makes each
+#    fork ~25s (disk-bound provisioning, NOT the GPU clone — see BENCHMARKS.md).
+#    Throughput + memory numbers are correct; the fork TIME is understated vs a
+#    minimal-disk golden. Default because the non-baked path's model loading is
+#    currently unreliable (the coord/hf symlink doesn't cross virtiofs).
+: "${USE_BAKED:=1}"
 CO="$HOME/coord_smol"; rm -rf "$CO"; mkdir -p "$CO"; cp "$WORKLOAD" "$CO/qlora_train.py"
 SOCK=/tmp/smolvm/cuda-daemon.sock
-# Only 2 mounts (drvlib + coord): venv + model are baked into the machine's
-# block storage, so nothing crosses virtiofs and we stay under the device budget.
-MOUNTS=(-v "$DRVLIB:/opt/drvlib:ro" -v "$CO:/opt/coord:rw")
+if [ "$USE_BAKED" = 1 ]; then
+  [ -f "$BAKED" ] || { echo "MISSING baked machine at $BAKED — build it with ./make-baked.sh"; exit 1; }
+  BASE=(--from "$BAKED"); MOUNTS=(-v "$DRVLIB:/opt/drvlib:ro" -v "$CO:/opt/coord:rw")
+  HF_ENV="HF_HOME=/opt/hfcache HF_HUB_OFFLINE=1"
+else
+  [ -d "$VENV" ] || { echo "MISSING venv at $VENV (set VENV=..., or USE_BAKED=1)"; exit 1; }
+  [ -d "$HF/hub" ] || { echo "MISSING HF cache at $HF/hub (pre-download the model; set HF=...)"; exit 1; }
+  ln -sfn "$HF" "$CO/hf"   # HF cache reached through the coord mount
+  BASE=(--image ubuntu:22.04); MOUNTS=(-v "$VENV:$(dirname "$GUEST_PYBIN" | xargs dirname):ro" -v "$DRVLIB:/opt/drvlib:ro" -v "$CO:/opt/coord:rw")
+  HF_ENV="HF_HOME=/opt/coord/hf HF_HUB_OFFLINE=0"
+fi
 
 mk() { for m in "$@"; do "$SMOLVM" machine stop --name "$m" >/dev/null 2>&1; "$SMOLVM" machine rm --name "$m" --force >/dev/null 2>&1; done; }
 mk ql-g $(seq -f "ql-c%g" 0 $((N-1)))
@@ -27,16 +48,17 @@ env SMOLVM_CUDA_FORK_WORKERS=1 SMOLVM_CUDA_FORK_ISOLATE=1 SMOLVM_CUDA_DAEMON_IDL
   "$SMOLVM" _cuda-daemon "$SOCK" > "$HOME/smol_daemon.log" 2>&1 &
 for i in $(seq 1 100); do [ -S "$SOCK" ] && break; sleep 0.1; done
 
-echo "== SMOLVM: golden + $N share-weights forks, $STEPS steps each =="
-# Baked machine: venv at /home/ubuntu/ptwork, HF cache at /opt/hfcache (offline).
-GUEST="export LD_PRELOAD='/opt/drvlib/libcudart.so.12 /opt/drvlib/libcuda.so.1' \
-HF_HOME=/opt/hfcache HF_HUB_OFFLINE=1 COORD=/opt/coord ARM=fork FORK=1 GOLDEN_WARMUP=1 \
+echo "== SMOLVM: golden + $N share-weights forks, $STEPS steps each (USE_BAKED=$USE_BAKED) =="
+# The default (non-baked) path apt-installs python in the minimal image.
+APT=""; [ "$USE_BAKED" = 1 ] || APT="export DEBIAN_FRONTEND=noninteractive; apt-get update -qq >/dev/null 2>&1; apt-get install -y -qq python3 python3-dev gcc ca-certificates >/dev/null 2>&1;"
+GUEST="$APT export LD_PRELOAD='/opt/drvlib/libcudart.so.12 /opt/drvlib/libcuda.so.1' \
+$HF_ENV COORD=/opt/coord ARM=fork FORK=1 GOLDEN_WARMUP=1 \
 STEPS=$STEPS NSLOTS=$N MODEL=$MODEL PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True; \
 ln -sf /opt/drvlib/libcuda.so.1 /usr/lib/x86_64-linux-gnu/libcuda.so; \
 $GUEST_PYBIN /opt/coord/qlora_train.py 2>>/opt/coord/g.err"
 
 t0=$(date +%s.%N)
-"$SMOLVM" machine create --name ql-g --cuda --net --from "$BAKED" "${MOUNTS[@]}" \
+"$SMOLVM" machine create --name ql-g --cuda --net "${BASE[@]}" "${MOUNTS[@]}" \
   --storage 30 --overlay 20 -- sh -c "$GUEST" >/dev/null 2>&1
 env SMOLVM_CUDA_SHARED=1 "$SMOLVM" machine start --forkable --name ql-g >/dev/null 2>&1
 for i in $(seq 1 300); do [ -f "$CO/golden_ready" ] && break; sleep 2; done

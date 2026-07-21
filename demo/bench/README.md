@@ -50,5 +50,16 @@ layout in QUICKSTART.md.
 high-water mark. Expect smolvm to reach or beat the container aggregate at far
 lower VRAM, and to keep scaling past the N where containers OOM. Each run is a
 single sample — average a few (and warm the page cache) for a stable number.
-Known gotchas (slow first load = HF re-download, staging/wire-hash) are in
-QUICKSTART.md and QA-LOG.md.
+
+**Two honest caveats (measured; see BENCHMARKS.md):**
+- **Fork time is understated by the default baked machine.** The baked golden
+  has a ~14 GB disk, and `machine fork` provisioning scales with golden disk
+  size (~1 s/GB, disk-bound — NOT the GPU clone, which is sub-second). So the
+  `fork_N_clones_s` you see is ~25 s, vs the ~0.4 s the RAM/GPU clone actually
+  costs on a minimal-disk golden. Throughput and memory numbers are unaffected.
+- **The default uses the baked machine for reliable OFFLINE model loading.**
+  The non-baked path (`USE_BAKED=0`) forks fast but its model loading is
+  currently unreliable (the coord/hf symlink doesn't resolve across virtiofs),
+  so it's not the default.
+
+Known gotchas (staging/wire-hash) are in QUICKSTART.md and QA-LOG.md.
