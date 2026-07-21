@@ -161,3 +161,25 @@ by bnb-4bit quantize (GPU compute) + torch/python init + virtiofs disk read
 "shared-memory rings active" in daemon log; (2) decompose load_ms into
 disk-read vs from_pretrained-compute. Applying the measure-first lesson from
 the teardown rat-hole: don't build a fix for an unverified bottleneck.
+
+## 2026-07-21 12:36 — PERF INVESTIGATION CONVERGED (data-backed)
+Golden load decomposition CONFIRMS: golden shows "shared-memory rings active"
+— H2D weight upload is ALREADY zero-copy. Load-phase sync-times are dominated
+by ModuleLoadData (314+176+... ms of cubin/JIT loads) + Init 273ms +
+PrimaryCtxRetain 119ms — NO large H2D in the sync costs. The 158s load is
+bnb-4bit quantize (GPU compute) + torch/python framework + module JIT — all
+outside our control, and PAID ONCE (fork amortizes it into 0.4s clones).
+
+FULL CONVERGENCE across the session's measured experiments:
+- Transport (H2D golden + clone rings): DONE (zero-copy, confirmed).
+- Per-learner throughput: at API-remoting floor (framework dispatch native
+  also pays + ~1,667 sync RTT/run); host 51-69% idle, marshal 3us/op, cores
+  neutral, xlat neutral. Solo 7B 1,720 = 69% native.
+- Load time: framework/compute-bound, paid once, fork-amortized; baking = 4%.
+The wins are ARCHITECTURAL (fork density + amortized load), already proven:
+N=16 agg 9,628 = +36% over container ceiling, 8/8 reliable.
+
+No controllable perf lever remains. Remaining production-readiness items are
+NON-perf: (1) teardown SIGSEGV — cosmetic, self-reaping (assessed); (2)
+turnkey packaging (baked .smolmachine exists); (3) sustained-soak stability
+evidence (ongoing). Perf-optimization phase complete.
