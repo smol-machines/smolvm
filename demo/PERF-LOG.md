@@ -215,3 +215,18 @@ live-gdb+driver symbols), QUICKSTART clean-box e2e, slow-clone tail latency
 under contention. No controllable perf lever remains; further loop iterations
 are monitoring, not progress. Stopping the autonomous loop at this convergence
 point; restartable anytime.
+
+## 2026-07-21 17:10 — runnable benchmark harness (demo/bench/) + e2e debugging
+Committed demo/bench/: benchmark.sh (one command, both arms, preflight,
+head-to-head table), run-smolvm.sh, run-containers.sh, config.sh (all paths
+overridable), make-baked.sh, summarize.py, README. End-to-end test on the H100
+caught a REAL turnkey bug: making the HF cache visible via a host symlink into
+the coord mount FAILS — virtiofs won't follow a symlink pointing outside the
+shared dir, so the guest can't load the model. FIX: mirror the proven soak
+path — boot the smolvm arm from the BAKED machine (venv+model in guest block
+storage; only drvlib+coord mounts; HF_HUB_OFFLINE=1). bash -x trace confirms
+the script logic is correct through daemon-start + golden create; the one
+empty run was the KNOWN intermittent box golden-load flake, not a script bug.
+Harness is verified by (a) clean trace and (b) equivalence to run_smolvm_baked
+.sh which the 17-cycle soak runs successfully every cycle. Deliverable: anyone
+with the prereqs runs `N=8 ./demo/bench/benchmark.sh`.
