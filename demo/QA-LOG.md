@@ -964,3 +964,19 @@ the clone's RAM advert to its worker.
 
 Overnight fork-churn soak running on the H100 (soak.sh: baked golden, 200
 cycles of fork-4/train/verify/teardown; cycle 1: 4/4, 0 nan).
+
+## 2026-07-21 (cont.) — clean-stack soak: zero worker crashes
+
+Fork-churn soak on the fully-fixed stack (transport-retry + worker-globals +
+GPA latch + binary-search xlat, all shims restaged to matching wire hash):
+11/11 cycles pass, 44 fork waves, 0 fail, 0 FATAL, 0 nan. The PRE-fix soak
+grew daemon FATALs ~2.7/cycle (teardown-time worker SIGSEGVs); the fixed stack
+holds at 0 — the clone fixes eliminated teardown crashes, not just the
+stranded learner. Ongoing overnight for sustained-stability evidence.
+
+DEPLOY NOTE (cost 3 false "golden failed" runs): smolvm binary AND all of
+drvlib/ (libcudart.so.12, libcuda.so.1) must be restaged from ONE build
+atomically — the wire-hash guard refuses a daemon/shim mismatch (correctly).
+A `cp: Text file busy` on ~/smolvm/smolvm means a daemon is still running it;
+kill the daemon first. The guard did its job: mismatch = refused connection,
+not corruption.
