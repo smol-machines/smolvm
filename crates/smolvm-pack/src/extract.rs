@@ -1464,6 +1464,16 @@ pub fn has_active_leases(cache_dir: &Path) -> bool {
 /// `pack prune` — prune should check `has_active_leases` first and skip
 /// active caches.
 pub fn force_detach_layers_volume(cache_dir: &Path) {
+    // A fork clone's cache dir is a symlink to its golden's — the clone doesn't
+    // own the volume or the leases behind it, so detaching through the link
+    // would rip the layers out from under the frozen golden and its siblings.
+    if cache_dir
+        .symlink_metadata()
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return;
+    }
     #[cfg(target_os = "macos")]
     {
         let mount_point = cache_dir.join(CS_MOUNT_DIR);

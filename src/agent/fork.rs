@@ -144,6 +144,43 @@ pub fn prepare_fork(
     std::fs::create_dir_all(&clone_dir)
         .map_err(|e| Error::agent("create clone dir", e.to_string()))?;
 
+    // A pack-backed golden (created `--from <.smolmachine>`) resolves its layers
+    // either through the shared content-addressed store (privileged installs: a
+    // pointer file beside its data dir) or from its own pre-extracted `pack`
+    // dir (rootless installs). The clone record inherits `source_smolmachine`
+    // but a fork never runs the create-time extraction, so without one of those
+    // the clone's start falls into the sidecar re-extraction fallback — seconds
+    // of host-side work per fork for read-only state the golden already has.
+    // Give the clone the golden's resolution in O(1):
+    //  - shared store: replicate the pointer file (the entry is no-evict while
+    //    referenced and start self-heals a missing one, so the copied pointer
+    //    can never point at anything the golden's own couldn't);
+    //  - per-machine layout: symlink the clone's `pack` dir to the golden's
+    //    extracted layers. The layers are read-only lowerdir content, the
+    //    golden is frozen, and its deletion is refused while clones exist, so
+    //    the target outlives every reader. `force_detach_layers_volume` no-ops
+    //    on symlinks, so a clone's stop/delete can't detach the golden's macOS
+    //    layers volume through the link.
+    let golden_layers = crate::agent::machine_layers_cache_dir(golden);
+    let golden_ptr = crate::agent::shared_pack_pointer_path(&golden_layers);
+    if golden_ptr.exists() {
+        let clone_layers = crate::agent::machine_layers_cache_dir(clone);
+        std::fs::create_dir_all(&clone_layers)
+            .map_err(|e| Error::agent("create clone pack dir", e.to_string()))?;
+        std::fs::copy(
+            &golden_ptr,
+            crate::agent::shared_pack_pointer_path(&clone_layers),
+        )
+        .map_err(|e| Error::agent("copy shared pack pointer", e.to_string()))?;
+    } else if smolvm_pack::extract::is_extracted(&golden_layers) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            &golden_layers,
+            crate::agent::machine_layers_cache_dir(clone),
+        )
+        .map_err(|e| Error::agent("link clone pack dir", e.to_string()))?;
+    }
+
     // The golden writes its frozen snapshot (checkpoint + memfd manifest) here.
     // It lives under the GOLDEN's data dir, not the clone's: under Landlock the
     // frozen golden VMM is confined to its own data dir, so it can write here but
