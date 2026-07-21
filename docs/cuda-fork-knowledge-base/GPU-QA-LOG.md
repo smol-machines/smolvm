@@ -12,11 +12,30 @@ QA branches (pushed, no PRs). Venue: Lambda A100-40GB (sm80) unless noted.
       (285s baseline)
 - [ ] EXP-4 clone ring-activation SIGSEGV reproduction at N=8 (sm80, from the
       H100 QA-LOG's 1-clone-per-leg crash)
-- [ ] EXP-5 vLLM clone serving: 30-min sustained load stability (sm80)
+- [~] EXP-5 vLLM 30-min serving — BLOCKED on harness/venv drift (see Results)
 - [x] EXP-6 balloon-idle + model-load — NO-REPRO, narrows the cloud bug (see Results)
 
 ## Results
 (newest first)
+
+### EXP-5 — BLOCKED on harness/venv drift, not an engine defect (2026-07-21)
+Four launch attempts, three separate stale-harness path issues each fixed in
+turn (missing `~/hfshare` mount [QA-GPU-5], `vllm_compare.py` not in `~/coord`,
+then vLLM engine-config failure from a transformers/vLLM version mismatch
+against this box's venv — the testbed `vllm_compare.py` predates the venv).
+De-prioritized: sustained sm80 clone serving is ALREADY validated clean in the
+original reproduction (A100-REPRODUCTION EXP3, batch-40, zero SIGSEGV/nan). A
+longer re-soak isn't worth chasing a drifted harness. If revisited, pin the
+vLLM/transformers versions the `vllm_compare.py` was written against, or
+rewrite the probe against the current venv.
+
+### EXP-2d — confirm the clone-CUDA break is main-only: RUNNING
+Re-runs the exact EXP-2c workload (N=1 clone QLoRA training) with the BUNDLE
+(graph-demo) binary that passed the N=8 soak, instead of merged-main. If the
+clone trains here, it confirms EXP-2's finding — the clone first-op CUDA
+failure is specific to merged-main (missing the p3b-graph-replay clone first-op
+registry + transport-retry work), not a hardware/workload issue.
+
 
 ### QA-GPU-5 (harness) — EXP-5 START-FAILED root cause: missing mount source
 gives a "vm not found" at start, not a clear create error (2026-07-21). EXP-5's
