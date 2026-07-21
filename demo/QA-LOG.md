@@ -932,3 +932,18 @@ stranded 1/16). Also fully identified en route: the deferred-mode killer op is
 cuMemMap (torch expandable_segments VMM) — the documented clone recipe
 (PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False + GOLDEN_WARMUP) is
 REQUIRED for training clones; without it the VMM map fails INVALID_VALUE.
+
+## 2026-07-21 — bug tail CLOSED: copy-mode fork translation is the defect
+
+The local control in the EXACT H100 configuration (--share-weights +
+expandable_segments:True) PASSES 2/2 on the 3070 with today's full fix stack:
+clone trains loss 8.381→6.994 at ~1,960 tok/s, bit-identical across runs. The
+same control WITHOUT --share-weights (copy mode) fails at all commits incl.
+pre-fix baseline. Classification: every local trainer/demo failure this
+session reduces to ONE pre-existing defect — copy-mode fork translation
+breaks bnb/trainer workloads (first 4-bit forward dereferences an
+untranslated pointer; suspect: pointers embedded at unaligned offsets in
+kernel-param structs that the 8-byte-aligned scan misses, and/or VMM MemMap
+in copy mode). Share-weights — the production and density mode — works on
+sm86 and sm90. Repro harness: scratchpad val_sweepwl.sh (~2 min/cycle);
+flip the --share-weights flag to toggle the failure.
