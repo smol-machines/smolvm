@@ -317,3 +317,18 @@ FORK-TIMING FINDING (complete + actionable):
   writing 8GB to a snapshot file vs the overlay path).
 RETURNING TO MONITORING. Core deliverables intact: perf converged, reliability
 soak clean, honest runnable benchmark, honest BENCHMARKS record.
+
+## 2026-07-21 20:07 — PR #695 CI RED->GREEN + soak reassessed
+PR #695 was FAILING CI (Format + all platform Clippy builds). Cause: my
+session commits accrued rustfmt + clippy(-D warnings) violations that the
+box's plain `cargo build` never caught — dead count_sync (orphaned by the
+time-weighted tally), sort_by->sort_by_key, %==0 -> is_multiple_of, an unused
+init. Fixed by reproducing CI's exact checks locally (fmt --check + clippy
+-D warnings on cuda crates + shims + smolvm binary), commit b92a8f5. ALL CI
+GREEN now; PR MERGEABLE (mergeStateStatus BLOCKED = awaiting human review, not
+CI). PROCESS LESSON: gate "CI green" claims on actually running clippy
+-D warnings, not just a successful build. Soak (cycle 14): 0 nans, learners
+train correctly; the 90 FATALs are all the known cosmetic teardown SIGSEGV
+(worker self-reaps, no correctness/leak impact — variable rate ~5/cycle now),
+the 2 fails are slow-clone poll timeouts under sustained load (harness
+sensitivity, cycle 9 ran 7min vs normal 2.3). NO new regression.
