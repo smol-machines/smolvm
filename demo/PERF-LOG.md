@@ -230,3 +230,13 @@ empty run was the KNOWN intermittent box golden-load flake, not a script bug.
 Harness is verified by (a) clean trace and (b) equivalence to run_smolvm_baked
 .sh which the 17-cycle soak runs successfully every cycle. Deliverable: anyone
 with the prereqs runs `N=8 ./demo/bench/benchmark.sh`.
+
+## 2026-07-21 17:23 — HF fix CONFIRMED end-to-end (my exact script, complete run)
+run-smolvm.sh (baked machine, HF_HUB_OFFLINE=1) ran to completion N=2/STEPS=3:
+golden_load_s=153.6, learners_done=2/2, agg_tok_s=1167, peak_gpu_mem=13688 MiB,
+both learners trained (loss 17.0->13.55 / 16.5->13.53). Model loaded from the
+BAKED /opt/hfcache (no download, no symlink) — the HF-symlink turnkey bug is
+definitively fixed and the runnable harness is empirically verified, not just
+trace/soak-equivalent. Minor note: fork_2_clones_s=51s (first-fork warm-chain
+spawn cost; amortizes at higher N, ~0.4-1s/clone in the soak). Not a
+correctness issue.
