@@ -189,6 +189,15 @@ pub struct Client<S> {
     sticky: i32,
     /// Kill-switch: `SMOLVM_CUDA_ASYNC=0` restores strict per-call round-trips.
     defer_enabled: bool,
+    /// Sync-elision: true when NO op that could enqueue device work has been
+    /// issued since the last successful synchronize. `clean_all` means a
+    /// context-wide sync established it (covers every stream); otherwise only
+    /// `clean_stream` is known settled. bnb-style workloads synchronize the
+    /// same stream dozens of times per training step with no work in between
+    /// — each elided sync saves a full host round-trip.
+    clean: bool,
+    clean_all: bool,
+    clean_stream: u64,
     /// Framed-but-unsent deferred requests. Batching them into one write turns
     /// a launch storm's thousand syscalls into a handful; flushed before any
     /// read (a response can only exist for a request the host has seen).
@@ -221,6 +230,9 @@ impl<S: Read + Write> Client<S> {
             deferred: 0,
             sticky: 0,
             defer_enabled: std::env::var("SMOLVM_CUDA_ASYNC").as_deref() != Ok("0"),
+            clean: false,
+            clean_all: false,
+            clean_stream: 0,
             wbuf: Vec::new(),
             journal: Vec::new(),
         }
@@ -574,6 +586,7 @@ impl<S: Read + Write> Client<S> {
     }
 
     fn call_deferred_kind(&mut self, req: &Request, op: Op, _is_libcall: bool) -> Result<()> {
+        self.clean = false; // deferred work dirties the pipeline
         if !self.defer_enabled || sync_forced(req, op) {
             return self.call(req, op).map(|_| ());
         }
@@ -662,6 +675,38 @@ impl<S: Read + Write> Client<S> {
     }
 
     fn call(&mut self, req: &Request, op: Op) -> Result<Response> {
+        // Sync-elision bookkeeping: only ops that can leave PENDING device
+        // work dirty the pipeline. Pure queries return existing state, and
+        // the blocking transfer forms complete before the host responds —
+        // after either, a stream with nothing else outstanding is still
+        // settled. Everything not whitelisted dirties (conservative).
+        match op {
+            Op::StreamSynchronize
+            | Op::CtxSynchronize
+            | Op::EventSynchronize
+            | Op::DeviceGetCount
+            | Op::DeviceGetName
+            | Op::DeviceTotalMem
+            | Op::DriverGetVersion
+            | Op::DeviceGetAttribute
+            | Op::DeviceGetUuid
+            | Op::ModuleGetFunction
+            | Op::FuncGetParamInfo
+            | Op::FuncGetAttribute
+            | Op::MemAlloc
+            | Op::MemFree
+            | Op::MemGetInfo
+            | Op::MemcpyDtoH
+            | Op::MemcpyShmDtoH
+            | Op::MemcpyGpaDtoH
+            | Op::StreamQuery
+            | Op::EventQuery
+            | Op::EventCreate
+            | Op::EventDestroy
+            | Op::EventElapsedTime
+            | Op::StreamCaptureInfo => {}
+            _ => self.clean = false,
+        }
         if std::env::var_os("SMOLVM_CUDA_COUNT_SYNC").is_some() {
             count_sync(req, op);
         }
@@ -696,6 +741,7 @@ impl<S: Read + Write> Client<S> {
     /// mode (`SMOLVM_CUDA_ASYNC=0`) the request round-trips instead and a
     /// failure status is collected as this connection's sticky error.
     pub fn raw_quiet(&mut self, payload: &[u8]) -> Result<()> {
+        self.clean = false; // bridged driver-shim work dirties the pipeline
         if !self.defer_enabled {
             let resp = self.raw_call(payload)?;
             if resp.len() >= 4 {
@@ -713,6 +759,7 @@ impl<S: Read + Write> Client<S> {
     /// the raw response payload — the status stays in-band for the peer to
     /// decode, so nothing is lost to error mapping.
     pub fn raw_call(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
+        self.clean = false; // bridged driver-shim work dirties the pipeline
         if self.ring.is_some() {
             return self.ring_roundtrip(payload);
         }
@@ -998,6 +1045,11 @@ impl<S: Read + Write> Client<S> {
     }
 
     pub fn ctx_synchronize(&mut self) -> Result<()> {
+        // Clean-pipeline elision: nothing was issued since a context-wide
+        // sync completed, so there is nothing to wait for — skip the trip.
+        if self.clean && self.clean_all && self.sticky == 0 {
+            return Ok(());
+        }
         // Settle fire-and-forget work first: a quiet op's failure lives in the
         // HOST's sticky slot and only a fence reports it — and synchronize is
         // exactly CUDA's contract point for surfacing asynchronous errors.
@@ -1005,6 +1057,8 @@ impl<S: Read + Write> Client<S> {
         // fork clone couldn't rebuild) returns success + stale data.
         self.drain()?;
         self.call(&Request::CtxSynchronize, Op::CtxSynchronize)?;
+        self.clean = true;
+        self.clean_all = true;
         // Surface any asynchronous failure collected by the drain, the way
         // cudaDeviceSynchronize reports errors from earlier async work.
         match self.take_sticky() {
@@ -1130,11 +1184,20 @@ impl<S: Read + Write> Client<S> {
     }
 
     pub fn stream_synchronize(&mut self, stream: u64) -> Result<()> {
+        // Clean-pipeline elision: no device work was issued since the last
+        // successful sync whose scope covers this stream (same stream, or a
+        // context-wide sync). bnb-heavy steps repeat this dozens of times.
+        if self.clean && self.sticky == 0 && (self.clean_all || self.clean_stream == stream) {
+            return Ok(());
+        }
         self.drain()?; // see ctx_synchronize: fences surface quiet failures
         self.call(
             &Request::StreamSynchronize { stream },
             Op::StreamSynchronize,
         )?;
+        self.clean = true;
+        self.clean_all = false;
+        self.clean_stream = stream;
         match self.take_sticky() {
             0 => Ok(()),
             code => Err(CudaRpcError::Cuda(code)),
