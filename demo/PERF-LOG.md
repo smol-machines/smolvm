@@ -113,3 +113,20 @@ handler in worker). Hypothesis: serve_rings profiler refactor reintroduced a
 shutdown-path fault, OR soak5's 0 was luck. Controlled check: redeployed the
 LATEST (env-cache) binary + clean soak8 to see if FATALs return on the
 shipping binary. Correctness-safe either way; tracking as hardening.
+
+## 2026-07-21 11:26 — teardown clone-worker SIGSEGV ROOT-CAUSED + FIXED
+Core dump (6.6GB) of a teardown crash: rip inside libcuda.so, worker
+_cuda-clone-worker. Cause: serve() calls reclaim_session() on exit, issuing
+cuMemFree/cuMemUnmap/cuMemRelease/cuCtxRelease against the clone's context
+whose backing (golden exported physical + guest RAM) VANISHES when the clone
+VM is torn down — the driver segfaults on the dead context. The per-resource
+frees are ALSO redundant: a clone worker is a one-shot process; the driver
+reclaims the whole context on process death.
+FIX: serve_no_reclaim() for clone-worker main + attached channels; hard
+std::process::exit(0) after (skips backend Drop, which would repeat the
+driver calls; also cleanly kills late-attached threads instead of racing
+them). In-daemon serve() keeps reclaim (long-lived process). Correctness-safe
+(GPU mem reclaimed by driver on exit either way). Deployed; soak9 verifying
+0-fatals across many cycles.
+NOTE: core dumps are 6.6GB each on an 80GB-GPU box; a debug prlimit=unlimited
+flooded ~90GB fast — reset core_pattern + prlimit=0 after capture.

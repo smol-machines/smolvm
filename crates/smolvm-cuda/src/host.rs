@@ -1823,6 +1823,24 @@ pub fn serve<S: Read + Write>(stream: S, backend: &mut dyn Backend) -> std::io::
     r
 }
 
+/// Serve one connection WITHOUT reclaiming session GPU resources on exit.
+/// For a clone worker, whose process exits immediately after this returns:
+/// the CUDA driver reclaims the whole process's context on death, so the
+/// per-resource frees `serve` does are redundant — and worse, dangerous.
+/// A clone's context maps memory reconstructed from the golden's exported
+/// physical and the guest's RAM; when the guest VM is torn down that backing
+/// vanishes, and calling `cuMemFree`/`cuMemRelease`/`cuCtxRelease` against it
+/// SIGSEGVs inside libcuda (observed as the teardown clone-worker crash). The
+/// caller must hard-exit (`process::exit`) after this so no destructor runs
+/// the same driver calls.
+pub fn serve_no_reclaim<S: Read + Write>(
+    stream: S,
+    backend: &mut dyn Backend,
+) -> std::io::Result<()> {
+    let mut sess = Session::default();
+    serve_inner(stream, backend, &mut sess)
+}
+
 fn serve_inner<S: Read + Write>(
     mut stream: S,
     backend: &mut dyn Backend,

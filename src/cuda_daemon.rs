@@ -11,7 +11,7 @@
 //! tied to any single VM's boot subprocess) until the host shuts down.
 
 use crate::platform::uds::UdsListener;
-use smolvm_cuda::host::{serve, Backend, CpuBackend, GpuBackend};
+use smolvm_cuda::host::{serve, serve_no_reclaim, Backend, CpuBackend, GpuBackend};
 use std::io;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -605,16 +605,29 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
         tcp = domain != libc::AF_UNIX,
         "cuda clone-worker: serving in its own context / UVA space"
     );
-    if domain == libc::AF_UNIX {
+    // A clone worker serves exactly one clone VM (plus its late-attached
+    // channels as threads) and then this process exits. Use the no-reclaim
+    // serve + a hard exit: the CUDA driver reclaims the whole context on
+    // process death, so per-resource frees are redundant, and issuing them
+    // against a context whose guest RAM just vanished SIGSEGVs inside libcuda
+    // (the teardown clone-worker crash). Hard exit also skips backend Drop,
+    // which would run the same driver calls, and terminates any late-attached
+    // channel thread cleanly instead of racing it against reclaim.
+    let r = if domain == libc::AF_UNIX {
         // SAFETY: the daemon handed us sole ownership of the accepted fd.
         let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
-        serve(stream, backend.as_mut())
+        serve_no_reclaim(stream, backend.as_mut())
     } else {
         // SAFETY: as above; a TCP connection from the daemon's network listener.
         let stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
         let _ = stream.set_nodelay(true);
-        serve(stream, backend.as_mut())
+        serve_no_reclaim(stream, backend.as_mut())
+    };
+    if let Err(e) = &r {
+        tracing::debug!(error = %e, "clone worker: serve ended with error (guest gone)");
     }
+    // Flush tracing, then reap without running destructors.
+    std::process::exit(0);
 }
 
 /// Serve one late-attached guest channel inside the clone worker. Own backend
@@ -661,15 +674,19 @@ fn serve_attached_channel(
         tcp = domain != libc::AF_UNIX,
         "cuda clone-worker: serving attached channel"
     );
+    // No-reclaim like the main channel: this runs on a thread inside the clone
+    // worker, sharing that context. Reclaiming on channel close risks the same
+    // libcuda teardown SIGSEGV (guest RAM may be gone) and could free memory a
+    // sibling channel still uses; the worker's process exit reaps everything.
     let r = if domain == libc::AF_UNIX {
         // SAFETY: recv_fd handed us sole ownership of the received fd.
         let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
-        smolvm_cuda::host::serve(stream, backend.as_mut())
+        serve_no_reclaim(stream, backend.as_mut())
     } else {
         // SAFETY: as above; a TCP connection forwarded by the daemon.
         let stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
         let _ = stream.set_nodelay(true);
-        smolvm_cuda::host::serve(stream, backend.as_mut())
+        serve_no_reclaim(stream, backend.as_mut())
     };
     if let Err(e) = r {
         tracing::info!(error = %e, fd, "clone-worker: attached channel ended");
