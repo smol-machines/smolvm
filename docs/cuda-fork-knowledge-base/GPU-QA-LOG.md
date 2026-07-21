@@ -18,6 +18,16 @@ QA branches (pushed, no PRs). Venue: Lambda A100-40GB (sm80) unless noted.
 ## Results
 (newest first)
 
+### QA-GPU-4 (LOW) — fork/CUDA harness: golden start fails if a prior daemon
+### is mid-teardown (2026-07-21). EXP-5's first run hit an immediate "START
+FAILED" because the previous experiment's `_cuda-daemon` + machine were still
+winding down when it started a new daemon on the same socket. A bare golden
+start on the same binary/box succeeds once the socket is free. Not an engine
+defect — a harness sequencing gap; hardened the run scripts to reap the daemon
++ socket and retry the golden start once. Product-side follow-up worth noting:
+`machine start --forkable --cuda` gives no distinct error when the CUDA daemon
+socket is stale/busy — a clearer message would help users.
+
 ### EXP-6 — balloon-idle then 7B model load: NO-REPRO (2026-07-21, A100, main)
 `SMOLVM_IDLE_RECLAIM=1` (1-min window), guest idled 240s, then loaded
 Qwen2.5-7B-bnb-4bit: **LOADED-OK**. Interpretation, with caveats:
