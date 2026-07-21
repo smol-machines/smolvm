@@ -1218,13 +1218,27 @@ pub fn set_handle_trans(
     MOD_IMAGES.with(|m| {
         let mut m = m.borrow_mut();
         m.clear();
-        m.extend(mod_images);
+        m.extend(mod_images.iter().cloned());
     });
     FUNC_META.with(|m| {
         let mut m = m.borrow_mut();
         m.clear();
-        m.extend(func_meta.into_iter().map(|(f, gm, n, a)| (f, (gm, n, a))));
+        m.extend(
+            func_meta
+                .iter()
+                .cloned()
+                .map(|(f, gm, n, a)| (f, (gm, n, a))),
+        );
     });
+    // Process-global copies too, so a channel served on a thread that was
+    // never seeded still lazy-resolves instead of leaking golden handles.
+    *MOD_IMAGES_GLOBAL.lock().unwrap() = Some(mod_images.into_iter().collect());
+    *FUNC_META_GLOBAL.lock().unwrap() = Some(
+        func_meta
+            .into_iter()
+            .map(|(f, gm, n, a)| (f, (gm, n, a)))
+            .collect(),
+    );
     put_h(&STREAM_TRANS, streams);
     put_h(&EVENT_TRANS, events);
 }
@@ -1251,7 +1265,18 @@ fn xlat_mod(b: &mut dyn Backend, golden: u64) -> u64 {
         });
         return w;
     }
-    let Some(mut image) = MOD_IMAGES.with(|m| m.borrow().get(&golden).cloned()) else {
+    let image = MOD_IMAGES
+        .with(|m| m.borrow().get(&golden).cloned())
+        .or_else(|| {
+            // Unseeded thread: fall back to the process-global copy rather
+            // than returning the golden handle (foreign-handle deref hazard).
+            MOD_IMAGES_GLOBAL
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|m| m.get(&golden).cloned())
+        });
+    let Some(mut image) = image else {
         return golden;
     };
     // Binary images (ELF cubin / fatbin) must reload BYTE-IDENTICAL to what the
@@ -1322,7 +1347,19 @@ fn xlat_func(b: &mut dyn Backend, golden: u64) -> u64 {
     if let Some(w) = FUNC_TRANS.with(|m| m.borrow().get(&golden).copied()) {
         return w;
     }
-    let Some((gm, name, attrs)) = FUNC_META.with(|m| m.borrow().get(&golden).cloned()) else {
+    let meta = FUNC_META
+        .with(|m| m.borrow().get(&golden).cloned())
+        .or_else(|| {
+            // Unseeded thread: process-global fallback (see MOD_IMAGES_GLOBAL) —
+            // returning the golden handle here launched foreign functions
+            // ("invalid argument") on channels served by unseeded threads.
+            FUNC_META_GLOBAL
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|m| m.get(&golden).cloned())
+        });
+    let Some((gm, name, attrs)) = meta else {
         return golden;
     };
     let wm = xlat_mod(b, gm);
@@ -2345,6 +2382,18 @@ static REPLAYED_EXECS: std::sync::Mutex<Option<HashMap<u64, u64>>> = std::sync::
 /// as a process global: golden handles are raw host pointers (unique), and a
 /// clone worker owns exactly one CUDA context.
 static MOD_TRANS_GLOBAL: std::sync::Mutex<Option<HashMap<u64, u64>>> = std::sync::Mutex::new(None);
+
+/// Process-global copies of the lazy-resolve INPUTS (module images + function
+/// metadata). The thread-local copies are seeded per serving thread; a channel
+/// served on an unseeded thread previously fell through the lazy paths and
+/// passed RAW GOLDEN HANDLES to the driver — launch-time "invalid argument"
+/// at best, a SIGSEGV inside `cuModuleGetFunction` (foreign-handle deref) at
+/// worst: the intermittent per-clone worker crash loop.
+static MOD_IMAGES_GLOBAL: std::sync::Mutex<Option<HashMap<u64, Vec<u8>>>> =
+    std::sync::Mutex::new(None);
+#[allow(clippy::type_complexity)]
+static FUNC_META_GLOBAL: std::sync::Mutex<Option<HashMap<u64, (u64, String, Vec<(i32, i32)>)>>> =
+    std::sync::Mutex::new(None);
 
 fn replayed_exec_get(exec_vh: u64) -> Option<u64> {
     REPLAYED_EXECS

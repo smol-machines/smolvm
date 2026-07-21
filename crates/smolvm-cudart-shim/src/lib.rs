@@ -233,6 +233,10 @@ thread_local! {
     static CALL_CONFIG: RefCell<Vec<(Dim3, Dim3, usize, u64)>> = const { RefCell::new(Vec::new()) };
     /// Last error, for cudaGetLastError / cudaPeekAtLastError.
     static LAST_ERROR: std::cell::Cell<c_int> = const { std::cell::Cell::new(CUDA_SUCCESS) };
+    /// Set by `map_err` when the failure was TRANSPORT (Io/Protocol), i.e. the
+    /// op never reached the host. `retry_transport_c` consults this to decide
+    /// that one forced-reconnect retry runs the op exactly once.
+    static TRANSPORT_ERR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn set_last(code: c_int) -> c_int {
@@ -267,9 +271,28 @@ fn map_err(e: CudaRpcError) -> c_int {
             if std::env::var_os("SMOLVM_CUDA_SHIM_TRACE").is_some() {
                 eprintln!("[map-err] transport: {e}");
             }
+            TRANSPORT_ERR.with(|t| t.set(true));
             CUDA_ERROR_UNKNOWN
         }
     }
+}
+
+/// Run `f`, and if it failed because the TRANSPORT died (not a device error),
+/// force a reconnect (which replays the quiet-op journal) and run it once
+/// more. A VM-fork clone's first ops race the reconnect: the pre-call
+/// liveness peek can miss the dead inherited channel (the guest pid is
+/// unchanged, the socket reset may not have surfaced, and ring writes vanish
+/// into cloned pages no host reads), so the op dies with a transport error
+/// the host never saw — safe to rerun exactly once.
+fn retry_transport_c(f: impl Fn() -> c_int) -> c_int {
+    TRANSPORT_ERR.with(|t| t.set(false));
+    let rc = f();
+    if rc != CUDA_SUCCESS && TRANSPORT_ERR.with(|t| t.get()) {
+        mark_force_reconnect();
+        TRANSPORT_ERR.with(|t| t.set(false));
+        return f();
+    }
+    rc
 }
 
 /// Lazily connect and bring up a primary context, then run `f` against the
@@ -704,9 +727,15 @@ fn lib_err_trace(lib: u8, func: u16, code: c_int) {
 fn with_client_retrying<T>(
     f: impl Fn(&mut Client<Stream>) -> Result<T, CudaRpcError>,
 ) -> Result<T, c_int> {
+    TRANSPORT_ERR.with(|t| t.set(false));
     match with_client(&f) {
-        Err(CUDA_ERROR_UNKNOWN) => {
+        // Retry only when the failure was TRANSPORT (op never reached the
+        // host) — retrying on any CUDA_ERROR_UNKNOWN would re-run ops the
+        // device may have executed (unmapped driver codes also map to 999).
+        Err(e) if TRANSPORT_ERR.with(|t| t.get()) => {
+            let _ = e;
             mark_force_reconnect();
+            TRANSPORT_ERR.with(|t| t.set(false));
             with_client(&f)
         }
         other => other,
@@ -797,7 +826,7 @@ pub extern "C" fn cudaRuntimeGetVersion(version: *mut c_int) -> c_int {
 
 #[no_mangle]
 pub extern "C" fn cudaMalloc(dev_ptr: *mut *mut c_void, size: usize) -> c_int {
-    set_last(
+    set_last(retry_transport_c(|| {
         match with_state(|s| {
             let d = s.client.mem_alloc(size as u64).map_err(map_err)?;
             s.dev_allocs.insert(d, size as u64);
@@ -805,8 +834,8 @@ pub extern "C" fn cudaMalloc(dev_ptr: *mut *mut c_void, size: usize) -> c_int {
         }) {
             Ok(d) => unsafe { out(dev_ptr, d as *mut c_void) },
             Err(e) => e,
-        },
-    )
+        }
+    }))
 }
 
 /// `cudaMallocManaged` — unified memory the CPU and GPU both access by the same
@@ -860,7 +889,7 @@ pub extern "C" fn cudaFree(dev_ptr: *mut c_void) -> c_int {
     if dev_ptr.is_null() {
         return set_last(CUDA_SUCCESS); // cudaFree(NULL) is a no-op
     }
-    set_last(
+    set_last(retry_transport_c(|| {
         match with_state(|s| {
             s.client.mem_free(dev_ptr as u64).map_err(map_err)?;
             s.dev_allocs.remove(&(dev_ptr as u64));
@@ -868,8 +897,8 @@ pub extern "C" fn cudaFree(dev_ptr: *mut c_void) -> c_int {
         }) {
             Ok(()) => CUDA_SUCCESS,
             Err(e) => e,
-        },
-    )
+        }
+    }))
 }
 
 #[no_mangle]
@@ -1301,7 +1330,7 @@ fn do_memcpy_inner(
 
 #[no_mangle]
 pub extern "C" fn cudaMemcpy(dst: *mut c_void, src: *const c_void, n: usize, kind: c_int) -> c_int {
-    set_last(do_memcpy(dst, src, n, kind, 0))
+    set_last(retry_transport_c(|| do_memcpy(dst, src, n, kind, 0)))
 }
 
 #[no_mangle]
@@ -1331,7 +1360,7 @@ pub extern "C" fn cudaMemcpyAsync(
     // work on `stream` first — torch's non-blocking pool streams don't order
     // against the NULL-stream copy the host uses, so dropping the stream let
     // a copy overwrite buffers that still-running kernels were reading.
-    set_last(do_memcpy(dst, src, n, kind, stream as u64))
+    set_last(retry_transport_c(|| do_memcpy(dst, src, n, kind, stream as u64)))
 }
 
 #[no_mangle]
@@ -2807,23 +2836,22 @@ pub extern "C" fn cudaLaunchKernel(
     shared_mem: usize,
     stream: *mut c_void,
 ) -> c_int {
-    set_last(do_launch(
-        func,
-        [grid.x, grid.y, grid.z],
-        [block.x, block.y, block.z],
-        shared_mem,
-        stream as u64,
-        args,
-    ))
+    set_last(retry_transport_c(|| {
+        do_launch(
+            func,
+            [grid.x, grid.y, grid.z],
+            [block.x, block.y, block.z],
+            shared_mem,
+            stream as u64,
+            args,
+        )
+    }))
 }
-
-/// Sentinel (not a real `cudaError_t`) marking a launch that failed at the
-/// TRANSPORT layer — the op never reached the host, so one retry after a
-/// forced reconnect runs it exactly once.
-const LAUNCH_TRANSPORT_ERR: c_int = -9990;
 
 /// Shared launch path for both `cudaLaunchKernel` and `cudaLaunchKernelExC`:
 /// look up the registered function, gather its argument blobs, forward.
+/// Call through `retry_transport_c` — a fork clone's first launch can race
+/// the reconnect and die with a transport error the host never saw.
 fn do_launch(
     func: *const c_void,
     grid: [u32; 3],
@@ -2836,56 +2864,34 @@ fn do_launch(
     if std::env::var_os("SMOLVM_CUDA_NOOP_LAUNCH").is_some() {
         return CUDA_SUCCESS;
     }
-    let attempt = || {
-        with_state(|s| {
-            let rec = s
-                .funcs
-                .get(&(func as usize))
-                .ok_or(CUDA_ERROR_INVALID_DEVICE_POINTER)?;
-            let fid = rec.fid;
-            let sizes = rec.param_sizes.clone();
-            // Reconstruct one byte-blob per kernel argument from `args[i]`.
-            let params: Vec<Vec<u8>> = if sizes.is_empty() {
-                Vec::new()
-            } else if args.is_null() {
-                return Err(CUDA_ERROR_INVALID_VALUE);
-            } else {
-                let ptrs = unsafe { std::slice::from_raw_parts(args, sizes.len()) };
-                sizes
-                    .iter()
-                    .zip(ptrs)
-                    .map(|(&sz, &p)| {
-                        unsafe { std::slice::from_raw_parts(p as *const u8, sz as usize) }.to_vec()
-                    })
-                    .collect()
-            };
-            s.client
-                .launch_kernel(fid, grid, block, shared_mem as u32, stream, &params)
-                .map_err(|e| match e {
-                    CudaRpcError::Io(_) | CudaRpcError::Protocol(_) => LAUNCH_TRANSPORT_ERR,
-                    other => map_err(other),
+    with_state(|s| {
+        let rec = s
+            .funcs
+            .get(&(func as usize))
+            .ok_or(CUDA_ERROR_INVALID_DEVICE_POINTER)?;
+        let fid = rec.fid;
+        let sizes = rec.param_sizes.clone();
+        // Reconstruct one byte-blob per kernel argument from `args[i]`.
+        let params: Vec<Vec<u8>> = if sizes.is_empty() {
+            Vec::new()
+        } else if args.is_null() {
+            return Err(CUDA_ERROR_INVALID_VALUE);
+        } else {
+            let ptrs = unsafe { std::slice::from_raw_parts(args, sizes.len()) };
+            sizes
+                .iter()
+                .zip(ptrs)
+                .map(|(&sz, &p)| {
+                    unsafe { std::slice::from_raw_parts(p as *const u8, sz as usize) }.to_vec()
                 })
-        })
-    };
-    let rc = match attempt() {
-        // A VM-fork clone's first launch can race the reconnect: the pre-call
-        // liveness peek misses the dead inherited transport (the guest pid is
-        // unchanged and the socket reset may not have surfaced yet, while ring
-        // writes vanish into cloned pages no host reads), so the launch dies
-        // with a transport error the host never saw. Force the reconnect
-        // (which replays the quiet-op journal) and run the launch once more
-        // on the fresh channel.
-        Err(LAUNCH_TRANSPORT_ERR) => {
-            mark_force_reconnect();
-            attempt()
-        }
-        other => other,
-    };
-    match rc {
-        Err(LAUNCH_TRANSPORT_ERR) => CUDA_ERROR_UNKNOWN,
-        Err(e) => e,
-        Ok(()) => CUDA_SUCCESS,
-    }
+                .collect()
+        };
+        s.client
+            .launch_kernel(fid, grid, block, shared_mem as u32, stream, &params)
+            .map_err(map_err)
+    })
+    .err()
+    .unwrap_or(CUDA_SUCCESS)
 }
 
 /// `cudaLaunchConfig_t` (CUDA 12): grid/block dims, dynamic shared bytes, stream,
@@ -2911,14 +2917,16 @@ pub extern "C" fn cudaLaunchKernelExC(
     }
     // SAFETY: caller passes a valid cudaLaunchConfig_t.
     let c = unsafe { &*(config as *const CudaLaunchConfig) };
-    set_last(do_launch(
-        func,
-        [c.grid_dim.x, c.grid_dim.y, c.grid_dim.z],
-        [c.block_dim.x, c.block_dim.y, c.block_dim.z],
-        c.dynamic_smem_bytes,
-        c.stream as u64,
-        args,
-    ))
+    set_last(retry_transport_c(|| {
+        do_launch(
+            func,
+            [c.grid_dim.x, c.grid_dim.y, c.grid_dim.z],
+            [c.block_dim.x, c.block_dim.y, c.block_dim.z],
+            c.dynamic_smem_bytes,
+            c.stream as u64,
+            args,
+        )
+    }))
 }
 
 // CUDA 12.0+ launch path. nvcc-generated stubs resolve a "kernel handle" via
