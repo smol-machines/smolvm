@@ -683,6 +683,7 @@ pub async fn create_machine(
     // the API surface is refused regardless of server binding — secrets
     // must be configured locally via the CLI.
     crate::api::handlers::validate_request_secrets(&req.secrets)?;
+    crate::api::handlers::validate_request_env(&req.env)?;
 
     // Complete registration: persists to DB + registers in ApiState
     let complete_result = guard.complete(MachineRegistration {
@@ -1591,6 +1592,7 @@ pub async fn exec_machine(
     // This avoids a second DB read per request.
     let entry = state.get_machine(&name)?;
     crate::api::handlers::validate_request_secrets(&req.secrets)?;
+    crate::api::handlers::validate_request_env(&req.env)?;
     let record_env = crate::api::handlers::record_secret_refs_env(&entry)?;
     let req_env = crate::api::handlers::resolve_request_secrets(&req.secrets)?;
 

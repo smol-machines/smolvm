@@ -132,6 +132,26 @@ pub(crate) fn validate_request_secrets(
     Ok(())
 }
 
+/// Validate caller-supplied env var *names* with the same shape rule as secret
+/// keys ([`check_env_key_shape`]). Env *values* stay unrestricted, but a name is
+/// materialized into the guest environment verbatim, so one carrying `=`, a
+/// control character, or a newline could inject or corrupt a second variable in
+/// anything that parses the environment line-by-line. As with secret keys, a
+/// malformed name is not echoed back (only its byte length) since it may hold
+/// control characters. Used by the exec/run/create handlers on `req.env`.
+pub(crate) fn validate_request_env(env: &[crate::api::types::EnvVar]) -> Result<(), ApiError> {
+    for var in env {
+        check_env_key_shape(&var.name).map_err(|rule| {
+            ApiError::BadRequest(format!(
+                "env entry with {}-byte name rejected: {}",
+                var.name.len(),
+                rule
+            ))
+        })?;
+    }
+    Ok(())
+}
+
 /// Resolve request-body `req.secrets` under `Untrusted` scope. Caller
 /// must have already called [`validate_request_secrets`].
 pub(crate) fn resolve_request_secrets(
@@ -166,6 +186,25 @@ mod tests {
         SecretRef {
             from_env: Some(name.to_string()),
             from_file: None,
+        }
+    }
+
+    #[test]
+    fn validate_request_env_rejects_malformed_names() {
+        use crate::api::types::EnvVar;
+        let ev = |name: &str| EnvVar {
+            name: name.to_string(),
+            value: "v".to_string(),
+        };
+        // Well-formed names pass; values are never inspected.
+        assert!(validate_request_env(&[ev("FOO"), ev("_BAR2")]).is_ok());
+        assert!(validate_request_env(&[]).is_ok());
+        // Injection/corruption-prone names are rejected.
+        for bad in ["", "HAS=EQ", "HAS SPACE", "HAS\nNL", "1LEADINGDIGIT"] {
+            assert!(
+                validate_request_env(&[ev(bad)]).is_err(),
+                "expected {bad:?} to be rejected"
+            );
         }
     }
 
