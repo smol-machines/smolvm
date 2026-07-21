@@ -126,3 +126,12 @@ NEXT: build a DEBUG (symbols) clone-worker, capture ONE core with a full
 Rust backtrace to name the exact call, before touching the teardown path
 again. Lesson: a plausible root-cause from a partial core is a hypothesis,
 not a fix — validate the SIGSEGV location precisely first.
+
+## 2026-07-21 12:10 — revert confirms known-good; teardown SIGSEGV is pre-existing
+soak10 (reverted known-good): fail=0 both cycles — the learner failures were
+MY no-reclaim/hard-exit regression, now gone. But fatals persist ~1-4/cycle,
+so the teardown clone-worker SIGSEGV is PRE-EXISTING and long-standing on the
+shipping stack (soak5's 0-fatals/22-cycles was luck). Correctness-safe
+(learners complete). Approach: build release WITH debug symbols
+(CARGO_PROFILE_RELEASE_DEBUG=2) so the crash handler's own Backtrace resolves
+to real frames in the daemon log — no core dumps (avoids the 6.6GB flood).
