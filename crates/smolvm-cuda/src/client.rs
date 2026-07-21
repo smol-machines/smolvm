@@ -41,26 +41,39 @@ pub type Result<T> = std::result::Result<T, CudaRpcError>;
 /// asynchronously-pipelined workload. For `LibCall` the tally key includes the
 /// library id and function index.
 fn count_sync(req: &Request, op: Op) {
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-    static COUNTS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
-    let key = match req {
+    count_sync_key(&sync_key(req, op), std::time::Duration::ZERO);
+}
+
+fn sync_key(req: &Request, op: Op) -> String {
+    match req {
         Request::LibCall { lib, func, .. } => format!("LibCall(lib={lib},func={func})"),
         Request::ModuleGetFunction { name, .. } => format!("ModuleGetFunction({name})"),
         Request::FuncGetParamInfo { function } => format!("FuncGetParamInfo(fid={function})"),
         Request::ModuleLoadData { image } => format!("ModuleLoadData(len={})", image.len()),
         _ => format!("{op:?}"),
-    };
+    }
+}
+
+/// Tally one sync round-trip: count AND total wall time per op class, dumped
+/// every 4096 calls ranked by TIME (counts alone pointed at high-frequency
+/// cheap ops; the gap hides in where the microseconds actually go).
+fn count_sync_key(key: &str, dur: std::time::Duration) {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    #[allow(clippy::type_complexity)]
+    static COUNTS: Mutex<Option<HashMap<String, (u64, u128)>>> = Mutex::new(None);
     let mut g = COUNTS.lock().unwrap();
     let m = g.get_or_insert_with(HashMap::new);
-    *m.entry(key).or_insert(0) += 1;
-    let total: u64 = m.values().sum();
+    let e = m.entry(key.to_string()).or_insert((0, 0));
+    e.0 += 1;
+    e.1 += dur.as_micros();
+    let total: u64 = m.values().map(|(n, _)| n).sum();
     if total.is_multiple_of(4096) {
         let mut v: Vec<_> = m.iter().collect();
-        v.sort_by(|a, b| b.1.cmp(a.1));
-        eprintln!("[sync-counts after {total}]");
-        for (k, n) in v.iter().take(12) {
-            eprintln!("  {n:>8}  {k}");
+        v.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+        eprintln!("[sync-times after {total}]");
+        for (k, (n, us)) in v.iter().take(12) {
+            eprintln!("  {:>9.1}ms {n:>7}x  {k}", *us as f64 / 1000.0);
         }
     }
 }
@@ -707,9 +720,8 @@ impl<S: Read + Write> Client<S> {
             | Op::StreamCaptureInfo => {}
             _ => self.clean = false,
         }
-        if std::env::var_os("SMOLVM_CUDA_COUNT_SYNC").is_some() {
-            count_sync(req, op);
-        }
+        let tally = std::env::var_os("SMOLVM_CUDA_COUNT_SYNC").is_some();
+        let t0 = tally.then(std::time::Instant::now);
         let payload = if self.ring.is_some() {
             self.ring_roundtrip(&encode_request(req))?
         } else if let Some(b) = self.bridge {
@@ -730,6 +742,9 @@ impl<S: Read + Write> Client<S> {
             p
         };
         let (status, resp) = decode_response(op, &payload)?;
+        if let Some(t0) = t0 {
+            count_sync_key(&sync_key(req, op), t0.elapsed());
+        }
         if status != 0 {
             return Err(CudaRpcError::Cuda(status));
         }
@@ -760,6 +775,17 @@ impl<S: Read + Write> Client<S> {
     /// decode, so nothing is lost to error mapping.
     pub fn raw_call(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
         self.clean = false; // bridged driver-shim work dirties the pipeline
+        if std::env::var_os("SMOLVM_CUDA_COUNT_SYNC").is_some() {
+            let t0 = std::time::Instant::now();
+            let r = self.raw_call_inner(payload);
+            let key = format!("Bridged(0x{:02x})", payload.first().copied().unwrap_or(0));
+            count_sync_key(&key, t0.elapsed());
+            return r;
+        }
+        self.raw_call_inner(payload)
+    }
+
+    fn raw_call_inner(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
         if self.ring.is_some() {
             return self.ring_roundtrip(payload);
         }

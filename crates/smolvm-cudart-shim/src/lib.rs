@@ -1307,9 +1307,21 @@ fn do_memcpy_inner(
                 Ok(())
             }
             MEMCPY_DTOH => {
-                if let Some(segs) = guestmem::segments(dst as usize, n) {
-                    if s.client.memcpy_gpa_dtoh(src as u64, segs, stream).is_ok() {
-                        return Ok(());
+                // Fast-fail latch: in a fork clone the worker has no map of
+                // THIS VM's guest RAM, so every GPA copy fails NOT_FOUND —
+                // at ~8.5 ms per doomed attempt that was 23% of a training
+                // step. One failure disables the GPA path for this process;
+                // the bounce fallback below serves everything after.
+                static GPA_D2H_DEAD: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !GPA_D2H_DEAD.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Some(segs) = guestmem::segments(dst as usize, n) {
+                        match s.client.memcpy_gpa_dtoh(src as u64, segs, stream) {
+                            Ok(()) => return Ok(()),
+                            Err(_) => {
+                                GPA_D2H_DEAD.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
                     }
                 }
                 if let Some(off) = shm_offset(dst) {
