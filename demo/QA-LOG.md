@@ -861,3 +861,29 @@ DAX — removing the FUSE READ path that causes the golden-load slow mode (159s
 load seen again on the H100 this run vs ~15s normal), and letting N clones
 share ONE host page-cache copy of the model weights. Next: rebuild libkrun on
 the H100 box and rerun the DAX training sweep.
+
+## 2026-07-21 — DAX fix live on H100; new finding: all-DAX training clones hang at first CUDA op
+
+Deployment lessons (H100): (1) libkrun built on the box booted guests that
+panicked at ~1.5s ("boot process exited code 0") — root cause: no musl rust
+target on the box, so the embedded guest init was DYNAMICALLY linked and died
+as PID1. `rustup target add x86_64-unknown-linux-musl` + forcing the
+init_blob build script to re-run fixed it. This retroactively explains the
+earlier "instrumented build broke boots" mystery (same box, same missing
+target) — it was never commit drift. (2) The init_blob musl probe is cached
+by cargo; `touch src/init_blob/build.rs` after adding the target.
+
+DAX smoke (golden + 2 clones, all 3 user mounts dax=always, patched libkrun):
+- Fork-replay fix VERIFIED on H100: clones resumed, wrote claim files through
+  the DAX rw coord mount post-fork (pre-fix this segfaulted instantly).
+- golden_load_s=166s — DAX did NOT fix the slow load. The load bottleneck is
+  not FUSE READs; leading suspect is the 14 GB weight upload through the
+  remoting transport (~90 MB/s ≈ 155 s) — measure next.
+- NEW DEFECT: both clone learners hang at their first CUDA op post-fork.
+  Daemon: only ONE of two clone workers spawned; that one went silent after
+  "[ring-file] file rings active" (0 FATALs, 0 ops). Guest: no segfault, no
+  traceback; python alive-but-blocked. Suspect: DAX user mounts interacting
+  with the CUDA warm-dial/ring attach at fork (ring mount was always-DAX and
+  fine; all-DAX venv/drvlib/coord is the new variable).
+- Next: reproduce on the local 3070 (fork-sweep demo + SMOLVM_MOUNT_DAX=1)
+  per the local-first rule.
