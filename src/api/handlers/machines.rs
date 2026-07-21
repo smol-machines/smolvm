@@ -1092,6 +1092,7 @@ pub async fn fork_machine(
     let clone = req.name.clone();
     let pinned_ports: Vec<(u16, u16)> = req.ports.iter().map(|p| (p.host, p.guest)).collect();
     let req_share_weights = req.share_weights;
+    let fork_env = crate::util::parse_env_list(&req.env);
 
     // Serialize lifecycle on the CLONE name so a concurrent start/stop/delete of
     // the same clone can't race the fork's register + boot. The golden is only
@@ -1108,9 +1109,10 @@ pub async fn fork_machine(
         let golden_b = golden.clone();
         let clone_b = clone.clone();
         let ports = pinned_ports.clone();
+        let env = fork_env.clone();
         tokio::task::spawn_blocking(move || {
             crate::agent::fork::prepare_fork(
-                &db, &golden_b, &clone_b, &ports, /* clone_forkable */ false,
+                &db, &golden_b, &clone_b, &ports, /* clone_forkable */ false, &env,
             )
         })
         .await
@@ -1156,15 +1158,23 @@ pub async fn fork_machine(
         // into a (possibly different) tenant. FAIL-CLOSED: if the reset can't be
         // confirmed, tear the booted clone down and fail the fork rather than
         // vend a clone that impersonates the golden.
+        let teardown = || {
+            manager.kill();
+            manager.cleanup_data_dir();
+            let _ = db.remove_vm(&clone_b);
+        };
         crate::agent::fork::fail_closed_on_rejuvenation(
             crate::agent::fork::rejuvenate_clone(&clone_b),
-            || {
-                manager.kill();
-                manager.cleanup_data_dir();
-                let _ = db.remove_vm(&clone_b);
-            },
+            teardown,
         )
         .map_err(|e| format!("clone identity rejuvenation failed: {}", e))?;
+        // Per-fork parameters: same fail-closed contract — a clone that asked
+        // for parameters but can't receive them must not be vended.
+        crate::agent::fork::fail_closed_on_rejuvenation(
+            crate::agent::fork::write_fork_env(&clone_b, &record, &fork_env),
+            teardown,
+        )
+        .map_err(|e| format!("fork env delivery failed: {}", e))?;
 
         let pid = manager.child_pid();
         Ok::<_, String>((manager, pid, record))

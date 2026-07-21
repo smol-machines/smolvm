@@ -81,8 +81,10 @@ pub fn prepare_fork(
     clone: &str,
     pinned_ports: &[(u16, u16)],
     clone_forkable: bool,
+    fork_env: &[(String, String)],
 ) -> Result<PreparedFork> {
     validate_vm_name(clone, "clone name").map_err(|e| Error::config("clone name", e))?;
+    validate_fork_env(fork_env)?;
 
     // Nested fork is unsupported: a clone boots from a copy-on-write MAP_PRIVATE
     // mapping of the golden's RAM, not a fresh memfd, so it cannot itself be
@@ -214,6 +216,17 @@ pub fn prepare_fork(
     clone_rec.name = clone.to_string();
     clone_rec.pid = None;
     clone_rec.pid_start_time = None;
+    // Per-fork parameters: merged into the clone's record env (so `machine
+    // exec` sessions and any workload relaunch see them), overriding
+    // same-named keys inherited from the golden. The already-running workload
+    // can't have its env changed — it reads the same pairs from the file
+    // `write_fork_env` drops after boot.
+    if !fork_env.is_empty() {
+        clone_rec
+            .env
+            .retain(|(k, _)| !fork_env.iter().any(|(fk, _)| fk == k));
+        clone_rec.env.extend(fork_env.iter().cloned());
+    }
     let mut port_remaps = Vec::new();
     if !pinned_ports.is_empty() {
         // User pinned the clone's forwards explicitly — use them as-is.
@@ -471,6 +484,111 @@ fn rejuvenate_once(sock: &Path, script: &str) -> std::result::Result<(), String>
     }
 }
 
+/// Guest path of the per-fork parameter file, dotenv format (`KEY=VALUE`
+/// lines). A forked clone's workload resumed mid-flight from the golden's
+/// snapshot, so its process env cannot carry per-clone values — sweep and
+/// rollout workloads read this file instead (typically after their GO gate).
+///
+/// Lives under `/etc` (the workload container's overlay filesystem), NOT
+/// `/run`: `/run` is a per-container-instance tmpfs, so a file there vanishes
+/// if the restored container is recycled — the overlay is the only surface
+/// shared by every instance and the running workload alike.
+pub const FORK_ENV_GUEST_PATH: &str = "/etc/smolvm/fork-env";
+
+/// Validate per-fork parameters: keys must be non-empty `[A-Za-z_][A-Za-z0-9_]*`
+/// (they double as env var names for exec sessions) and values must be free of
+/// newlines (one `KEY=VALUE` per line in the delivered file).
+pub fn validate_fork_env(env: &[(String, String)]) -> Result<()> {
+    for (k, v) in env {
+        let mut chars = k.chars();
+        let head_ok = chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+        if !head_ok || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(Error::config(
+                "fork env",
+                format!("invalid key '{k}': must match [A-Za-z_][A-Za-z0-9_]*"),
+            ));
+        }
+        if v.contains('\n') || v.contains('\r') {
+            return Err(Error::config(
+                "fork env",
+                format!("value for '{k}' must not contain newlines"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Render per-fork parameters as the dotenv file content.
+pub fn render_fork_env(env: &[(String, String)]) -> String {
+    let mut out = String::new();
+    for (k, v) in env {
+        out.push_str(k);
+        out.push('=');
+        out.push_str(v);
+        out.push('\n');
+    }
+    out
+}
+
+/// Deliver per-fork parameters into a freshly-booted clone at
+/// [`FORK_ENV_GUEST_PATH`], via a VM-namespace write THROUGH the workload
+/// container's overlayfs `merged` mount. Deliberately not a container exec:
+/// the restored workload container can look stale to the exec path right
+/// after a fork, and exec'ing would recycle it — killing the very workload
+/// that is waiting for these parameters. Writing through the merged mount
+/// reaches the running container's rootfs without touching the container
+/// runtime at all. Bare VMs (no image) get the file in the VM rootfs.
+///
+/// FAIL-CLOSED by the caller: if the user asked for parameters and they can't
+/// be delivered, the fork must fail rather than vend a clone that silently
+/// runs with the golden's (or a sibling's) parameters.
+pub fn write_fork_env(clone: &str, record: &VmRecord, env: &[(String, String)]) -> Result<()> {
+    if env.is_empty() {
+        return Ok(());
+    }
+    let content = render_fork_env(env);
+    // Overlay owner is a validated machine name (alphanumeric + dashes), so
+    // splicing it into the script is injection-safe — same contract as the
+    // rejuvenation script's clone name.
+    let owner = crate::workload::persistent_overlay_owner(clone, record.golden.as_deref());
+    let merged = format!("/storage/overlays/persistent-{owner}/merged");
+    // Image machines MUST land the file in the workload container's rootfs
+    // (the overlay merged dir): falling through silently would strand it in
+    // the agent rootfs where no workload will ever look. Fail with the actual
+    // overlay listing so a layout change is diagnosable, not silent.
+    let script = if record.image.is_some() {
+        format!(
+            "if [ ! -d {merged} ]; then echo \"missing {merged}; overlays:\" >&2; \
+             ls /storage/overlays >&2; exit 41; fi; \
+             mkdir -p {merged}/etc/smolvm && umask 077 && cat > {merged}{FORK_ENV_GUEST_PATH}"
+        )
+    } else {
+        format!("mkdir -p /etc/smolvm && umask 077 && cat > {FORK_ENV_GUEST_PATH}")
+    };
+    let sock = vm_data_dir(clone).join("agent.sock");
+    let mut client = AgentClient::connect_with_retry(&sock)
+        .map_err(|e| Error::agent("fork env: agent connect", e.to_string()))?;
+    match client.vm_exec(
+        vec!["/bin/sh".into(), "-c".into(), script],
+        vec![],
+        None,
+        Some(std::time::Duration::from_secs(10)),
+        Some(content),
+    ) {
+        Ok((0, _, _)) => Ok(()),
+        Ok((code, _, stderr)) => Err(Error::agent(
+            "fork env",
+            format!(
+                "write exited {code}: {}",
+                String::from_utf8_lossy(&stderr).trim()
+            ),
+        )),
+        Err(e) => Err(Error::agent("fork env", format!("vm exec: {e}"))),
+    }
+}
+
 /// Fail-closed fork finalizer. A clone whose identity could not be rejuvenated
 /// MUST NOT be vended (it would share the golden's machine-id/hostname/SSH host
 /// keys across tenants), so on any rejuvenation `Err` this runs `teardown`
@@ -515,6 +633,45 @@ fn host_random_hex(hex_len: usize) -> String {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    // Per-fork parameters double as env var names and dotenv file lines, so
+    // keys must be valid identifiers and values single-line — anything else
+    // must be rejected up front, before the golden is frozen.
+    #[test]
+    fn fork_env_validation_accepts_identifiers_and_rejects_junk() {
+        let ok = vec![
+            ("LR".to_string(), "3e-4".to_string()),
+            ("_SEED".to_string(), "42".to_string()),
+            (
+                "TASK_2".to_string(),
+                "spaces and = are fine in values".to_string(),
+            ),
+        ];
+        assert!(validate_fork_env(&ok).is_ok());
+
+        for (k, v) in [
+            ("2LR", "x"),
+            ("", "x"),
+            ("A-B", "x"),
+            ("K", "line1\nline2"),
+            ("K", "cr\rvalue"),
+        ] {
+            assert!(
+                validate_fork_env(&[(k.to_string(), v.to_string())]).is_err(),
+                "expected rejection for key={k:?} value={v:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fork_env_renders_one_pair_per_line() {
+        let env = vec![
+            ("LR".to_string(), "3e-4".to_string()),
+            ("NOTE".to_string(), "a=b c".to_string()),
+        ];
+        assert_eq!(render_fork_env(&env), "LR=3e-4\nNOTE=a=b c\n");
+        assert_eq!(render_fork_env(&[]), "");
+    }
 
     // Fix 1: the re-mint script must regenerate the per-machine on-disk secrets
     // that a wholesale CoW disk clone would otherwise share across tenants —

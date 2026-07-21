@@ -713,6 +713,7 @@ pub fn fork_vm(
     clone_forkable: bool,
     pinned_ports: &[(u16, u16)],
     share_weights: bool,
+    fork_env: &[(String, String)],
 ) -> smolvm::Result<()> {
     let db = SmolvmDb::open()?;
 
@@ -720,7 +721,14 @@ pub fn fork_vm(
     // The launch-agnostic mechanics live in the lib (`agent::fork`) so the CLI
     // and the serve API share one implementation.
     eprintln!("Freezing golden '{golden}' as fork base...");
-    let prep = smolvm::agent::fork::prepare_fork(&db, golden, clone, pinned_ports, clone_forkable)?;
+    let prep = smolvm::agent::fork::prepare_fork(
+        &db,
+        golden,
+        clone,
+        pinned_ports,
+        clone_forkable,
+        fork_env,
+    )?;
     for (golden_host, guest, clone_host) in &prep.port_remaps {
         if pinned_ports.is_empty() {
             eprintln!(
@@ -748,16 +756,24 @@ pub fn fork_vm(
         // Fresh on-disk identity (hostname, machine-id, SSH host keys, RNG).
         // FAIL-CLOSED: if the reset can't be confirmed, stop the booted clone and
         // roll it back rather than leave it live with the golden's secrets.
+        let teardown = || {
+            if let Ok(manager) = AgentManager::for_vm(clone) {
+                manager.kill();
+                manager.cleanup_data_dir();
+            }
+            let _ = db.remove_vm(clone);
+            let _ = std::fs::remove_dir_all(vm_data_dir(clone));
+        };
         smolvm::agent::fork::fail_closed_on_rejuvenation(
             smolvm::agent::fork::rejuvenate_clone(clone),
-            || {
-                if let Ok(manager) = AgentManager::for_vm(clone) {
-                    manager.kill();
-                    manager.cleanup_data_dir();
-                }
-                let _ = db.remove_vm(clone);
-                let _ = std::fs::remove_dir_all(vm_data_dir(clone));
-            },
+            teardown,
+        )?;
+        // Per-fork parameters: same fail-closed contract — a clone that asked
+        // for parameters but can't receive them must not be vended (it would
+        // silently run with the golden's or a sibling's values).
+        smolvm::agent::fork::fail_closed_on_rejuvenation(
+            smolvm::agent::fork::write_fork_env(clone, &prep.clone_record, fork_env),
+            teardown,
         )?;
         eprintln!(
             "Forked '{golden}' -> '{clone}'. Golden stays frozen as the fork base \

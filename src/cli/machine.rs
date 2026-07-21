@@ -2842,17 +2842,27 @@ pub struct ForkCmd {
     /// inference); use a plain fork when the clone trains the base weights.
     #[arg(long)]
     pub share_weights: bool,
+
+    /// Per-fork parameter (repeatable, KEY=VALUE). Delivered to the clone as
+    /// `/run/smolvm/fork-env` (dotenv format) for the already-running workload
+    /// to read, and merged into the clone's env for later `machine exec`
+    /// sessions. This is how sweep/rollout clones learn which variant they
+    /// are — no shared-mount claim files needed.
+    #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
+    pub env: Vec<String>,
 }
 
 impl ForkCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let ports: Vec<(u16, u16)> = self.port.iter().map(|p| (p.host, p.guest)).collect();
+        let fork_env = smolvm::util::parse_env_list(&self.env);
         vm_common::fork_vm(
             &self.golden,
             &self.clone,
             self.forkable,
             &ports,
             self.share_weights,
+            &fork_env,
         )
     }
 }

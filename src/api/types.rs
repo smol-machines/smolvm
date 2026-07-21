@@ -728,4 +728,9 @@ pub struct ForkRequest {
     /// the base stays frozen (LoRA/QLoRA fine-tuning, inference).
     #[serde(default)]
     pub share_weights: bool,
+    /// Per-fork parameters as KEY=VALUE strings. Delivered to the clone at
+    /// `/run/smolvm/fork-env` (dotenv format) for the already-running workload
+    /// to read, and merged into the clone's env for later exec sessions.
+    #[serde(default)]
+    pub env: Vec<String>,
 }
