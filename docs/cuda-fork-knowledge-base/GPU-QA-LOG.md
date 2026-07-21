@@ -13,11 +13,25 @@ QA branches (pushed, no PRs). Venue: Lambda A100-40GB (sm80) unless noted.
 - [ ] EXP-4 clone ring-activation SIGSEGV reproduction at N=8 (sm80, from the
       H100 QA-LOG's 1-clone-per-leg crash)
 - [ ] EXP-5 vLLM clone serving: 30-min sustained load stability (sm80)
-- [ ] EXP-6 balloon-idle + model-load interaction on tip (the #697 bug shape,
-      engine-local reproduction)
+- [x] EXP-6 balloon-idle + model-load — NO-REPRO, narrows the cloud bug (see Results)
 
 ## Results
 (newest first)
+
+### EXP-6 — balloon-idle then 7B model load: NO-REPRO (2026-07-21, A100, main)
+`SMOLVM_IDLE_RECLAIM=1` (1-min window), guest idled 240s, then loaded
+Qwen2.5-7B-bnb-4bit: **LOADED-OK**. Interpretation, with caveats:
+- Under CUDA remoting the weights go to HOST VRAM, so a plain model load does
+  not create the pinned guest-RAM pressure the balloon bug needs (the
+  DEFLATE_ON_OOM PR's own repro used 400MB of pinned tmpfs). Guest page cache
+  from safetensors reads is reclaimable, so the kernel yields it to the
+  balloon without dying.
+- Pulse firing was not independently confirmed in this run (no RUST_LOG on
+  the launcher) — treat as "not sufficient to trip", not "mechanism absent".
+- Net: the cloud pool-golden segfault likely requires the pinned/tmpfs or
+  larger guest-RAM working set of the @enter flow, or pool-claim timing —
+  plain idle+load is not the trigger. The balloon-OOM mechanism itself is
+  already demonstrated in the DEFLATE_ON_OOM PR; its merge remains the fix.
 
 ### EXP-2 / 2b / 2c — fork `--env` GPU sweep: feature PASS; main-branch clone
 ### first-op CUDA failure found (2026-07-21, A100-40GB, merged-main build)
