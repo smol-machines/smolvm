@@ -293,3 +293,27 @@ working binary, breaking the soak. Violated my own standing rule (memory:
 also carries the fork-timing change a29f673), redeploy, restart soak. LESSON
 re-learned: never scp a local Rust build to the glibc-older box; always build
 there. The fork phase-timing measurement is pending the box rebuild.
+
+## 2026-07-21 19:25 — box RECOVERED; fork-timing thread CLOSED
+Box fully recovered after the two self-inflicted breaks: all 3 crates rebuilt
+on the box (glibc-2.35), shims restaged, wire-hash matched (0 mismatches),
+soak cycle 1 = 4/4 pass 0 nan. Fork phase-timing instrumentation (a29f673)
+is deployed; its logs route to CLI stdout (soak discards them), so the exact
+RAM-checkpoint-vs-disk-overlay split would need a soak pause to capture —
+NOT pursued (diminishing returns; the two operational breaks this thread came
+from rushing a refinement the conclusion didn't need).
+FORK-TIMING FINDING (complete + actionable):
+- machine fork of a large-disk golden = ~27s, ALL in host-side prepare_fork
+  ("freeze golden"); clone boot is 73ms. Scales with golden disk size
+  (baked 30GB/14GB-data = 27s; minimal = 0.2s). RAM/GPU clone is sub-second.
+- The freeze = golden RAM checkpoint (FORK control cmd) + qcow2 CoW disk
+  overlays (code is pure-CoW). Exact split uncaptured; instrumentation in
+  place for whoever picks it up (read CLI stdout of a `machine fork`).
+- MITIGATION (documented in BENCHMARKS/bench): keep the forkable golden's
+  disk small → fork returns to sub-second. Baked machine = turnkey ease with
+  a fork-time caveat.
+- OPTIMIZATION FILED: make large-disk fork O(1) (the freeze shouldn't scale
+  with golden disk if overlays are truly CoW — investigate the RAM checkpoint
+  writing 8GB to a snapshot file vs the overlay path).
+RETURNING TO MONITORING. Core deliverables intact: perf converged, reliability
+soak clean, honest runnable benchmark, honest BENCHMARKS record.
