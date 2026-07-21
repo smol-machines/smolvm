@@ -331,8 +331,19 @@ pub extern "C" fn smolvm_cudart_bridge_quiet(req: *const u8, len: usize) -> i32 
         return 1;
     }
     let bytes = unsafe { std::slice::from_raw_parts(req, len) };
+    // Transport-classified retry (see retry_transport_c): a fork clone's
+    // bridged op racing the reconnect never reached the host — rerun once.
+    TRANSPORT_ERR.with(|t| t.set(false));
     match with_client(|c| c.raw_quiet(bytes)) {
         Ok(()) => 0,
+        Err(_) if TRANSPORT_ERR.with(|t| t.get()) => {
+            mark_force_reconnect();
+            TRANSPORT_ERR.with(|t| t.set(false));
+            match with_client(|c| c.raw_quiet(bytes)) {
+                Ok(()) => 0,
+                Err(_) => 999,
+            }
+        }
         Err(_) => 999,
     }
 }
@@ -355,8 +366,17 @@ pub extern "C" fn smolvm_cudart_bridge_call(
         }
     } else {
         let bytes = unsafe { std::slice::from_raw_parts(req, req_len) };
+        TRANSPORT_ERR.with(|t| t.set(false));
         match with_client(|c| c.raw_call(bytes)) {
             Ok(p) => p,
+            Err(_) if TRANSPORT_ERR.with(|t| t.get()) => {
+                mark_force_reconnect();
+                TRANSPORT_ERR.with(|t| t.set(false));
+                match with_client(|c| c.raw_call(bytes)) {
+                    Ok(p) => p,
+                    Err(_) => return -1,
+                }
+            }
             Err(_) => return -1,
         }
     };

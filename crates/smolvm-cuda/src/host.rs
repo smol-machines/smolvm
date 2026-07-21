@@ -1239,6 +1239,8 @@ pub fn set_handle_trans(
             .map(|(f, gm, n, a)| (f, (gm, n, a)))
             .collect(),
     );
+    *STREAM_TRANS_GLOBAL.lock().unwrap() = Some(streams.iter().copied().collect());
+    *EVENT_TRANS_GLOBAL.lock().unwrap() = Some(events.iter().copied().collect());
     put_h(&STREAM_TRANS, streams);
     put_h(&EVENT_TRANS, events);
 }
@@ -1408,7 +1410,17 @@ fn ring_dir_get() -> Option<String> {
 }
 
 fn xlat_stream(h: u64) -> u64 {
-    STREAM_TRANS.with(|m| m.borrow().get(&h).copied().unwrap_or(h))
+    // Thread-local first (P3b replay overrides are deliberately per-thread),
+    // then the process-global map for channels served on unseeded threads.
+    if let Some(w) = STREAM_TRANS.with(|m| m.borrow().get(&h).copied()) {
+        return w;
+    }
+    STREAM_TRANS_GLOBAL
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(&h).copied())
+        .unwrap_or(h)
 }
 /// P3b: temporarily redirect a golden stream to a private replay stream.
 /// Returns the previous mapping so the caller can restore it.
@@ -1429,7 +1441,15 @@ fn stream_trans_restore(golden: u64, prev: Option<u64>) {
     });
 }
 fn xlat_event(h: u64) -> u64 {
-    EVENT_TRANS.with(|m| m.borrow().get(&h).copied().unwrap_or(h))
+    if let Some(w) = EVENT_TRANS.with(|m| m.borrow().get(&h).copied()) {
+        return w;
+    }
+    EVENT_TRANS_GLOBAL
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(&h).copied())
+        .unwrap_or(h)
 }
 
 /// Path 3: record this H2D's coverage (+ content CRC) into every golden VMM
@@ -2393,6 +2413,13 @@ static MOD_IMAGES_GLOBAL: std::sync::Mutex<Option<HashMap<u64, Vec<u8>>>> =
     std::sync::Mutex::new(None);
 #[allow(clippy::type_complexity)]
 static FUNC_META_GLOBAL: std::sync::Mutex<Option<HashMap<u64, (u64, String, Vec<(i32, i32)>)>>> =
+    std::sync::Mutex::new(None);
+/// Golden→worker stream/event maps, process-global fallbacks for unseeded
+/// serving threads (thread-locals stay authoritative — P3b replay overrides
+/// stream mappings per-thread on purpose).
+static STREAM_TRANS_GLOBAL: std::sync::Mutex<Option<HashMap<u64, u64>>> =
+    std::sync::Mutex::new(None);
+static EVENT_TRANS_GLOBAL: std::sync::Mutex<Option<HashMap<u64, u64>>> =
     std::sync::Mutex::new(None);
 
 fn replayed_exec_get(exec_vh: u64) -> Option<u64> {
