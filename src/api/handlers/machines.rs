@@ -989,6 +989,11 @@ pub async fn start_machine(
             r.state = RecordState::Running;
             r.pid = pid;
             r.pid_start_time = pid_start_time;
+            // An explicit start re-enables supervision: clear the user-stopped
+            // flag and reset the retry budget so a machine that previously
+            // exhausted max_retries can be restarted and supervised again.
+            r.restart.user_stopped = false;
+            r.restart.restart_count = 0;
         })
         .await?
         .ok_or_else(|| {
@@ -1275,6 +1280,9 @@ pub async fn stop_machine(
             r.state = RecordState::Stopped;
             r.pid = None;
             r.pid_start_time = None;
+            // Record the explicit stop so the restart supervisor does not
+            // resurrect this machine (any policy) until an explicit start.
+            r.restart.user_stopped = true;
         })
         .await?
         .ok_or_else(|| {
