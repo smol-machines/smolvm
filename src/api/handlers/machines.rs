@@ -378,6 +378,23 @@ pub async fn create_machine(
         HostMount::try_from(mount_spec).map_err(|e| ApiError::BadRequest(e.to_string()))?;
     }
 
+    // Validate and normalize egress CIDRs, matching the CLI's --allow-cidr
+    // parser. Without this a malformed entry is silently dropped at launch
+    // (EgressPolicy::new filter_maps unparseable CIDRs, logging only a warn to
+    // the discarded boot log), leaving egress MORE restrictive than requested
+    // with no error. Normalizing (bare IP -> /32) keeps the stored policy
+    // identical to what the CLI persists.
+    let normalized_cidrs = match &req.allowed_cidrs {
+        Some(cidrs) => Some(
+            cidrs
+                .iter()
+                .map(|c| crate::smolfile::parse_cidr(c))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(ApiError::BadRequest)?,
+        ),
+        None => None,
+    };
+
     // If --from is set, read manifest and extract sidecar
     let (
         image,
@@ -653,7 +670,7 @@ pub async fn create_machine(
         gpu: Some(req.gpu),
         storage_gb: req.storage_gb,
         overlay_gb: req.overlay_gb,
-        allowed_cidrs: req.allowed_cidrs.clone(),
+        allowed_cidrs: normalized_cidrs,
         allowed_hosts: req.allowed_hosts.clone(),
         network_backend: req.network_backend,
     };
