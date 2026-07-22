@@ -543,31 +543,6 @@ pub struct CreateMachineRequest {
     pub workdir: Option<String>,
 }
 
-/// Request to execute a command in a machine.
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct MachineExecRequest {
-    /// Command and arguments.
-    #[schema(example = json!(["echo", "hello"]))]
-    pub command: Vec<String>,
-    /// Environment variables.
-    #[serde(default)]
-    pub env: Vec<EnvVar>,
-    /// Ad-hoc secret refs. Rejected unless empty (untrusted scope).
-    #[serde(default)]
-    #[schema(value_type = Object)]
-    pub secrets: RequestSecretRefs,
-    /// Working directory.
-    #[serde(default)]
-    pub workdir: Option<String>,
-    /// Timeout in seconds.
-    #[serde(default)]
-    pub timeout_secs: Option<u64>,
-    /// Data to pipe to the command's stdin.
-    #[serde(default)]
-    pub stdin: Option<String>,
-}
-
 /// Machine status information.
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]

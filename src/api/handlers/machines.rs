@@ -36,12 +36,10 @@ use crate::api::state::{
     ReservationGuard,
 };
 use crate::api::types::{
-    ApiErrorResponse, CreateMachineRequest, DeleteResponse, EnvVar, ExecResponse, ExportRequest,
-    ExportResponse, ForkRequest, ListMachinesResponse, MachineExecRequest, MachineInfo, MountInfo,
-    MountSpec, PortSpec, ResizeMachineRequest, ResourceSpec, StartMachineQuery,
+    ApiErrorResponse, CreateMachineRequest, DeleteResponse, ExportRequest, ExportResponse,
+    ForkRequest, ListMachinesResponse, MachineInfo, MountInfo, MountSpec, PortSpec,
+    ResizeMachineRequest, ResourceSpec, StartMachineQuery,
 };
-use crate::api::validate_command;
-use crate::api::TraceId;
 use crate::config::{RecordState, RestartConfig, VmRecord};
 use crate::data::disk::{Overlay, Storage};
 use crate::data::validate_vm_name;
@@ -1598,90 +1596,6 @@ pub async fn delete_machine(
     }
 
     Ok(Json(DeleteResponse { deleted: name }))
-}
-
-/// Execute a command in a machine.
-#[utoipa::path(
-    post,
-    path = "/api/v1/machines/{name}/exec",
-    tag = "Machines",
-    params(
-        ("name" = String, Path, description = "Machine name")
-    ),
-    request_body = MachineExecRequest,
-    responses(
-        (status = 200, description = "Command executed", body = ExecResponse),
-        (status = 400, description = "Invalid request", body = ApiErrorResponse),
-        (status = 404, description = "Machine not found", body = ApiErrorResponse),
-        (status = 409, description = "Machine not running", body = ApiErrorResponse),
-        (status = 500, description = "Execution failed", body = ApiErrorResponse)
-    )
-)]
-pub async fn exec_machine(
-    State(state): State<Arc<ApiState>>,
-    Path(name): Path<String>,
-    trace_id: Option<axum::Extension<TraceId>>,
-    Json(req): Json<MachineExecRequest>,
-) -> Result<Json<ExecResponse>, ApiError> {
-    let tid = trace_id.map(|t| t.0 .0.clone());
-    validate_command(&req.command)?;
-
-    // Load the in-memory machine entry; its `secret_refs` were
-    // populated at create time and updated via start/stop handlers.
-    // This avoids a second DB read per request.
-    let entry = state.get_machine(&name)?;
-    crate::api::handlers::validate_request_secrets(&req.secrets)?;
-    crate::api::handlers::validate_request_env(&req.env)?;
-    let record_env = crate::api::handlers::record_secret_refs_env(&entry)?;
-    let req_env = crate::api::handlers::resolve_request_secrets(&req.secrets)?;
-
-    let name_clone = name.clone();
-    let command = req.command.clone();
-    let mut env = EnvVar::to_tuples(&req.env);
-    env.extend(crate::secrets::expose_into_env(record_env));
-    env.extend(crate::secrets::expose_into_env(req_env));
-    let workdir = req.workdir.clone();
-    let timeout = req.timeout_secs.map(Duration::from_secs);
-    let stdin_data = req.stdin.clone();
-
-    let result = tokio::task::spawn_blocking(move || {
-        // Get manager and check if running
-        let manager = AgentManager::for_vm(&name_clone)
-            .map_err(|e| SmolvmError::agent("create agent manager", e.to_string()))?;
-
-        if manager.try_connect_existing().is_none() {
-            return Err(SmolvmError::InvalidState {
-                expected: "running".into(),
-                actual: "stopped".into(),
-            });
-        }
-
-        // Execute command
-        let mut client = manager
-            .connect()
-            .map_err(|e| SmolvmError::agent("connect", e.to_string()))?;
-        if let Some(tid) = tid {
-            client.set_trace_id(tid);
-        }
-        let (exit_code, stdout, stderr) = client
-            .vm_exec(command, env, workdir, timeout, stdin_data)
-            .map_err(|e| SmolvmError::agent("exec", e.to_string()))?;
-
-        // Keep VM running (persistent)
-        manager.detach();
-
-        Ok(ExecResponse {
-            exit_code,
-            stdout: String::from_utf8_lossy(&stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&stderr).into_owned(),
-            stdout_b64: stdout,
-            stderr_b64: stderr,
-        })
-    })
-    .await
-    .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
-
-    result.map(Json).map_err(ApiError::from)
 }
 
 /// Resize a machine's disk resources.
