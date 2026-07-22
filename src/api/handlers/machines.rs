@@ -29,7 +29,7 @@ use axum::{
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::agent::{vm_data_dir, AgentClient, AgentManager, HostMount};
+use crate::agent::{vm_data_dir, AgentClient, AgentManager, HostMount, PortMapping};
 use crate::api::error::ApiError;
 use crate::api::state::{
     vm_resources_to_spec, with_machine_client_traced, ApiState, MachineEntry, MachineRegistration,
@@ -377,6 +377,24 @@ pub async fn create_machine(
     for mount_spec in &req.mounts {
         HostMount::try_from(mount_spec).map_err(|e| ApiError::BadRequest(e.to_string()))?;
     }
+
+    // Validate published ports, matching the CLI (which rejects these before
+    // launch): port 0 is invalid for forwarding, and each host port may be
+    // mapped only once — two guest ports on one host port can't both bind, so
+    // reject it as a clean 400 rather than an ambiguous mid-boot bind failure.
+    for p in &req.ports {
+        if p.host == 0 || p.guest == 0 {
+            return Err(ApiError::BadRequest(
+                "port 0 is not valid for VM port forwarding".to_string(),
+            ));
+        }
+    }
+    let port_mappings: Vec<PortMapping> = req
+        .ports
+        .iter()
+        .map(|p| PortMapping::new(p.host, p.guest))
+        .collect();
+    PortMapping::check_duplicates(&port_mappings).map_err(ApiError::BadRequest)?;
 
     // If --from is set, read manifest and extract sidecar
     let (
