@@ -658,9 +658,13 @@ pub async fn stream_logs(
         .map_err(ApiError::internal)?;
 
     if !exists {
+        // The machine is registered (get_machine succeeded above) but has no
+        // console log yet — it was created and never started, or hasn't produced
+        // output. Report that plainly instead of leaking the internal host log
+        // path, and give the same not-started-shaped hint as the DB-miss branch
+        // (which a created machine skips, since it's in the running map).
         return Err(ApiError::NotFound(format!(
-            "log file not found: {}",
-            log_path.display()
+            "machine '{id}' has no logs yet — it may not have been started"
         )));
     }
 
