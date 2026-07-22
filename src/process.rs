@@ -585,6 +585,16 @@ fn build_seccomp_program(enforce: bool) -> std::result::Result<seccompiler::BpfP
         libc::SYS_wait4, libc::SYS_exit, libc::SYS_exit_group, libc::SYS_restart_syscall,
         libc::SYS_prctl, libc::SYS_prlimit64, libc::SYS_getrusage,
         libc::SYS_sysinfo, libc::SYS_uname, libc::SYS_getrandom,
+        // getcwd: NOT on any hot path — allowed purely for crash observability.
+        // Rust's panic/backtrace printing resolves relative frames via
+        // `env::current_dir()` → getcwd. With `enforce` (KillProcess) and getcwd
+        // denied, a VMM (or vendored-libkrun) panic is SIGSYS-killed BEFORE its
+        // message reaches stderr — so a genuine boot failure (e.g. libkrun
+        // aborting on a KVM-open error when /dev/kvm has an unexpected group)
+        // surfaces as a bare "Bad system call" with no diagnostic. Allowing this
+        // read-only, no-argument syscall lets the panic actually print. Safe: it
+        // returns only the process's own cwd and reaches nothing outside it.
+        libc::SYS_getcwd,
         libc::SYS_getuid, libc::SYS_geteuid, libc::SYS_getgid, libc::SYS_getegid,
         // capget/capset: virtiofs drops CAP_FSETID around a passthrough write/
         // create (`drop_effective_cap`, via the `caps` crate) so the kernel
@@ -2643,6 +2653,38 @@ mod tests {
             assert!(
                 libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSYS,
                 "forbidden syscall (kexec_load) should trigger SIGSYS, status={status:#x}"
+            );
+        }
+    }
+
+    /// getcwd must be ALLOWED under `enforce`: Rust's panic/backtrace printing
+    /// resolves frames via `env::current_dir()` → getcwd, so denying it SIGSYS-
+    /// kills a panicking VMM before its diagnostic reaches stderr. Regression
+    /// guard for the "hardened boot failure prints nothing useful" case.
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn seccomp_allows_getcwd() {
+        let program = build_seccomp_program(true).expect("build seccomp program");
+        unsafe {
+            let pid = libc::fork();
+            assert!(pid >= 0, "fork failed");
+            if pid == 0 {
+                if seccompiler::apply_filter(&program).is_err() {
+                    libc::_exit(2);
+                }
+                let mut buf = [0u8; 4096];
+                // If getcwd were denied, SIGSYS kills us before the _exit below.
+                let _ = libc::syscall(libc::SYS_getcwd, buf.as_mut_ptr(), buf.len());
+                libc::_exit(0);
+            }
+            let mut status: libc::c_int = 0;
+            libc::waitpid(pid, &mut status, 0);
+            assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "getcwd must be allowed under enforce (no SIGSYS), status={status:#x}"
             );
         }
     }
