@@ -1687,6 +1687,14 @@ pub async fn export_machine(
     Path(id): Path<String>,
     Json(req): Json<ExportRequest>,
 ) -> Result<Json<ExportResponse>, ApiError> {
+    // Hold the per-machine lifecycle lock across BOTH the stopped-check and the
+    // pack export below so a concurrent start cannot boot the VM in between and
+    // leave `pack create --from-vm` reading disks that are being written — the
+    // inconsistent-snapshot race the stopped-check alone can't close (start
+    // acquires this same lock). Mirrors start/stop/delete/resize.
+    let lifecycle = state.lifecycle_lock(&id);
+    let _guard = lifecycle.lock().await;
+
     // Resolve the machine record; the path id is the machine name in this API.
     let record = state
         .lookup_vm(&id)
