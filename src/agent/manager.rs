@@ -2592,9 +2592,42 @@ fn boot_failure_reason(exit_code: Option<i32>, startup_log: Option<&str>) -> Str
         None => "agent process exited during startup".to_string(),
     };
 
+    // No line matched the error/panic heuristic. Rather than drop the whole log
+    // and report a bare exit code (an undiagnosable dead-end — a failed image
+    // pull, a guest OOM, a missing device all look identical), surface the TAIL
+    // of whatever the boot process printed. Its last lines almost always name the
+    // real cause ("network is unreachable", "manifest unknown", "no space left").
     match real_error {
         Some(err) => format!("{err} ({code_note})"),
-        None => code_note,
+        None => match startup_log.map(boot_log_tail).filter(|t| !t.is_empty()) {
+            Some(tail) => format!("{code_note}; last boot output: {tail}"),
+            None => code_note,
+        },
+    }
+}
+
+/// The last few non-empty lines of a boot log, joined with ` / `, for surfacing
+/// in an otherwise-generic boot failure. Bounded so a runaway log can't bloat the
+/// error string.
+fn boot_log_tail(log: &str) -> String {
+    const MAX_LINES: usize = 3;
+    const MAX_CHARS: usize = 400;
+    let mut lines: Vec<&str> = log
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let start = lines.len().saturating_sub(MAX_LINES);
+    lines.drain(..start);
+    let tail = lines.join(" / ");
+    if tail.chars().count() > MAX_CHARS {
+        // Keep the END (the final error is usually last), not the start. Count in
+        // chars so a multibyte boundary can't panic the slice.
+        let skip = tail.chars().count() - MAX_CHARS;
+        let kept: String = tail.chars().skip(skip).collect();
+        format!("…{kept}")
+    } else {
+        tail
     }
 }
 
@@ -2635,6 +2668,27 @@ mod tests {
             boot_failure_reason(None, None),
             "agent process exited during startup"
         );
+    }
+
+    #[test]
+    fn boot_failure_surfaces_log_tail_when_no_keyword_matches() {
+        // A real failure whose lines don't contain "error"/"panic" (e.g. a failed
+        // image pull) must NOT collapse to a bare exit code — the tail names it.
+        let log = "pulling library/alpine:latest\n\
+                   dial tcp: lookup index.docker.io: network is unreachable\n\
+                   crane: fetching manifest failed";
+        let r = boot_failure_reason(Some(1), Some(log));
+        assert!(r.contains("code 1"), "{r}");
+        assert!(r.contains("network is unreachable"), "{r}");
+        assert!(r.contains("fetching manifest failed"), "{r}");
+    }
+
+    #[test]
+    fn boot_failure_tail_is_bounded_and_utf8_safe() {
+        let long = format!("préambule {}\nfin: échec réseau", "x".repeat(1000));
+        let r = boot_failure_reason(Some(1), Some(&long));
+        assert!(r.contains("échec réseau"), "{r}"); // last line kept
+        assert!(r.chars().count() < 600, "bounded: {}", r.chars().count());
     }
 
     #[test]
