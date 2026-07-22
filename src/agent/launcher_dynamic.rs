@@ -704,7 +704,38 @@ fn cstr(s: &str) -> CString {
 /// monitor as "boot process exited before the agent was ready", tells the user
 /// nothing about what to fix. Decode the common codes and name the usual cause.
 pub(crate) fn describe_krun_start_error(ret: i32) -> String {
+    // For hypervisor-access errnos, re-probe /dev/kvm from THIS context. The
+    // server's preflight (`check_kvm_available`) runs before the per-VM uid
+    // drop, so it can pass while the dropped VMM process — landing on a uid
+    // outside the kvm group — can't open /dev/kvm, and libkrun then fails here.
+    // The probe runs post-drop, so its group/permission hint is the real cause,
+    // not the generic "usually a disk/overlay" guess.
+    #[cfg(target_os = "linux")]
+    let kvm_error = if matches!(-ret, 1 | 13 | 19 | 22) {
+        crate::platform::linux::check_kvm_available()
+            .err()
+            .map(|e| e.to_string())
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "linux"))]
+    let kvm_error: Option<String> = None;
+
+    describe_start_error_with_probe(ret, kvm_error.as_deref())
+}
+
+/// Pure core of [`describe_krun_start_error`], with the KVM probe result
+/// injected so the decoding is testable without a live `/dev/kvm`.
+fn describe_start_error_with_probe(ret: i32, kvm_error: Option<&str>) -> String {
     let errno = -ret;
+    if matches!(errno, 1 | 13 | 19 | 22) {
+        if let Some(kvm) = kvm_error {
+            return format!(
+                "krun_start_enter returned: {ret} (KVM inaccessible to the VM process \
+                 after privilege drop — {kvm})"
+            );
+        }
+    }
     let hint = match errno {
         22 => {
             "EINVAL — libkrun rejected the VM configuration; usually a disk/overlay \
@@ -785,15 +816,36 @@ mod tests {
     #[test]
     fn describe_krun_start_error_decodes_common_codes() {
         // The exact string the readiness monitor greps for must survive so
-        // boot_failure_reason still surfaces it as "the error".
-        let einval = describe_krun_start_error(-22);
+        // boot_failure_reason still surfaces it as "the error". Use the pure
+        // form with no KVM probe failure so decoding is deterministic on hosts
+        // both with and without /dev/kvm.
+        let einval = describe_start_error_with_probe(-22, None);
         assert!(einval.contains("krun_start_enter returned: -22"));
         assert!(einval.contains("EINVAL"));
-        assert!(describe_krun_start_error(-13).contains("EACCES"));
+        assert!(describe_start_error_with_probe(-13, None).contains("EACCES"));
         // Unknown codes still render the raw number with a generic explanation.
-        let unknown = describe_krun_start_error(-999);
+        let unknown = describe_start_error_with_probe(-999, None);
         assert!(unknown.contains("-999"));
         assert!(unknown.contains("hypervisor"));
+        // The live wrapper still emits the grep contract regardless of host KVM.
+        assert!(describe_krun_start_error(-22).contains("krun_start_enter returned: -22"));
+    }
+
+    #[test]
+    fn describe_krun_start_error_surfaces_post_drop_kvm_cause() {
+        // When a hypervisor-access errno coincides with a failed post-drop KVM
+        // probe, the concrete group/permission cause replaces the generic guess.
+        let msg = describe_start_error_with_probe(
+            -22,
+            Some("Cannot access /dev/kvm (permission denied). Add your user to the 'kvm' group"),
+        );
+        assert!(msg.contains("krun_start_enter returned: -22"));
+        assert!(msg.contains("KVM inaccessible to the VM process after privilege drop"));
+        assert!(msg.contains("kvm' group"));
+        // A non-hypervisor errno ignores the probe result entirely.
+        let eio = describe_start_error_with_probe(-5, Some("should be ignored"));
+        assert!(eio.contains("EIO"));
+        assert!(!eio.contains("privilege drop"));
     }
 
     #[test]
