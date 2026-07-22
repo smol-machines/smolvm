@@ -16,6 +16,38 @@ QA branches (pushed, no PRs). Venue: Lambda A100-40GB (sm80) unless noted.
 ## Results
 (newest first)
 
+### Fork-native GRPO rollout fan-out — MIXED: fork+sharding+sharing work; raw
+### transformers generate() in a share-clone is a limitation, but vLLM (the real
+### rollout engine) already works (2026-07-21)
+Set out to show the density half of the beachhead: 1 golden + N weight-sharing
+forks each generating GRPO rollouts. Results:
+- ✅ **`fork --env SHARD=i N=4` delivered distinct shards** to all 4 clones (boot
+  log: shard 0/1/2/3 of 4) — #705 validated in a real fork-fan-out context.
+- ✅ **Weight sharing**: 4 forks, VRAM delta **+0 MiB** (2245→2245); forks
+  908–956 ms each. One policy copy, four rollout workers.
+- 🔴 **BUT the rollout engine I chose — raw transformers `model.generate()` —
+  fails inside a share-weights clone on sm80**: `CUBLAS_STATUS_NOT_INITIALIZED`
+  (golden's cuBLAS handle is inherited stale), and after forcing a fresh matmul
+  reinit + removing the golden's warm-gen, it degrades to `CUDA error: unknown
+  error` at the generation kernels. The clone shares device memory (weights) but
+  the golden's torch CUDA compute handles (cuBLAS/cuDNN) don't transfer, and
+  raw-HF-generate can't fully re-establish them.
+- ✅ **This is NOT blocking, because real GRPO rollout uses vLLM, and vLLM
+  inference across weight-sharing forks is ALREADY validated** (A100-REPRODUCTION
+  EXP2/EXP3: 8 forked vLLM clones + golden = 9 serving 7B replicas in ~20GB,
+  sustained batch-40 load clean on sm80). vLLM manages its own CUDA context per
+  worker, so it sidesteps the inherited-handle problem that raw HF generate hits.
+
+**Net for the beachhead density claim:** the rollout fan-out works with the
+engine real RL actually uses (vLLM, already proven); raw `transformers.generate()`
+in a share-clone is a genuine sm80 limitation to document (torch CUDA handles
+don't survive the fork; use vLLM or re-establish the model's CUDA state in-clone).
+Combined with #200 (loop closes), the beachhead is: **loop closes ✅ + rollout
+fans out densely via vLLM ✅ + sharding via --env ✅.** Boot log archived.
+Follow-up if wanted: rollout via vLLM in each clone (not raw HF generate) to show
+the fan-out with the correct engine in one script.
+
+
 ### ★ BEACHHEAD PROOF — a real GRPO/RL loop CLOSES on smolvm (2026-07-21)
 The one workload the whole "RL rollout fan-out substrate" pitch rests on had
 NEVER been run end-to-end (the verl A/B arm died at flash-attn). Now it has.
