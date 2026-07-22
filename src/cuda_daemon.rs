@@ -106,6 +106,92 @@ fn spawn_child_reaper() {
 #[cfg(not(unix))]
 fn spawn_child_reaper() {}
 
+/// Sweep clone-worker processes left behind by a PRIOR daemon that died without
+/// reaping them (crash or SIGKILL — neither runs the clean-shutdown handler).
+/// Called at startup ONLY when no live daemon answers the socket, so any process
+/// still running `_cuda-clone-worker` is orphaned and is pinning a GPU context;
+/// killing it lets the next golden's CUDA init proceed cleanly. Identifies
+/// workers by argv (NUL-separated `/proc/<pid>/cmdline`) rather than a registry,
+/// so it catches workers from a daemon instance that is already gone.
+#[cfg(unix)]
+fn reap_orphan_workers() {
+    let me = std::process::id();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return;
+    };
+    let mut killed = 0u32;
+    for ent in entries.flatten() {
+        let name = ent.file_name();
+        let Some(pid) = name.to_str().and_then(|s| s.parse::<i32>().ok()) else {
+            continue;
+        };
+        if pid as u32 == me {
+            continue;
+        }
+        let Ok(cmdline) = std::fs::read(ent.path().join("cmdline")) else {
+            continue;
+        };
+        if cmdline
+            .split(|&b| b == 0)
+            .any(|arg| arg == b"_cuda-clone-worker")
+        {
+            // SAFETY: kill(pid, SIGKILL) on a process we identified by argv as an
+            // orphaned clone worker; the daemon that parented it is already gone.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+            killed += 1;
+        }
+    }
+    if killed > 0 {
+        tracing::warn!(
+            count = killed,
+            "swept orphaned clone-worker(s) from a dead prior daemon"
+        );
+        // Let the driver release the killed workers' GPU contexts before we serve.
+        thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// Install a clean-shutdown handler for SIGTERM/SIGINT: unlink the control
+/// socket and SIGKILL our own process group (this daemon + its clone workers),
+/// so a `pkill`/`kill` of the daemon never leaves GPU-pinning workers or a stale
+/// socket node behind. Without this a killed daemon orphaned its workers and the
+/// next golden's CUDA init stalled on their lingering context.
+#[cfg(unix)]
+fn install_shutdown_handler(sock: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    static SOCK_C: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
+    let _ = SOCK_C.set(std::ffi::CString::new(sock.as_os_str().as_bytes()).unwrap_or_default());
+    unsafe extern "C" fn on_term(_sig: libc::c_int) {
+        // async-signal-safe only: OnceLock::get (atomic load) + unlink + getpgrp
+        // + getpid + kill + _exit.
+        if let Some(c) = SOCK_C.get() {
+            unsafe {
+                libc::unlink(c.as_ptr());
+            }
+        }
+        // Only group-kill when we actually lead our own group — never nuke the
+        // shell/ssh that launched us if setpgid(0, 0) did not take.
+        if unsafe { libc::getpgrp() } == unsafe { libc::getpid() } {
+            unsafe {
+                libc::kill(0, libc::SIGKILL);
+            }
+        }
+        unsafe {
+            libc::_exit(0);
+        }
+    }
+    for sig in [libc::SIGTERM, libc::SIGINT] {
+        // SAFETY: installing a handler that only unlinks + group-kills + _exits.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = on_term as *const () as usize;
+            libc::sigaction(sig, &sa, std::ptr::null_mut());
+        }
+    }
+}
+
 /// Run the daemon body: bind `sock` and serve every connection in its own
 /// thread against a fresh backend — all in this process, so they share one GPU
 /// context. Returns only on listener failure; otherwise exits via the idle
@@ -174,10 +260,39 @@ pub(crate) fn install_crash_handler(role: &'static str) {
 pub fn run(sock: &Path) -> io::Result<()> {
     #[cfg(unix)]
     install_crash_handler("cuda-daemon");
+    // Become our own process-group leader so a clean-shutdown signal can take the
+    // whole group (this daemon + its clone workers) down together without ever
+    // touching the shell/ssh session that launched us. The `ensure_running` spawn
+    // path already sets this at fork; this also covers a direct `_cuda-daemon &`.
+    // SAFETY: setpgid(0, 0) on self; harmless best-effort (ignore EPERM if we are
+    // already a session leader).
+    #[cfg(unix)]
+    unsafe {
+        libc::setpgid(0, 0);
+    }
     if let Some(parent) = sock.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::remove_file(sock); // caller serialized us; clear any stale node
+    // Refuse to double-bind: a live daemon on this socket already owns the GPU.
+    // Clobbering its socket node would orphan it (still holding the GPU context)
+    // and split state across two daemons — the "new golden hangs forever" bug.
+    if is_alive(sock) {
+        tracing::warn!(socket = %sock.display(),
+            "a CUDA daemon already owns this socket; not starting a second one");
+        return Ok(());
+    }
+    // No live daemon answered, but a prior one may have died (crash / SIGKILL)
+    // without reaping its clone-worker children. Those workers still pin the GPU
+    // context, so the next golden's CUDA init stalls on it. Sweep them before we
+    // bind — this is the self-heal for stale post-fork daemon/IPC state.
+    #[cfg(unix)]
+    reap_orphan_workers();
+    // Drop any stale socket node, then arm the clean-shutdown handler (unlink the
+    // socket + take the process group down on SIGTERM/SIGINT) so a `pkill` of the
+    // daemon never leaks workers or a stale socket node.
+    let _ = std::fs::remove_file(sock);
+    #[cfg(unix)]
+    install_shutdown_handler(sock);
     let listener = UdsListener::bind(sock)?;
     tracing::info!(socket = %sock.display(), "shared CUDA daemon listening");
     let active = Arc::new(AtomicUsize::new(0));
