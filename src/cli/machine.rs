@@ -3174,6 +3174,48 @@ impl UpdateCmd {
                 .map_err(|e| smolvm::Error::config("update", e))?;
         }
 
+        // Validate no duplicate guest mount targets after proposed changes. The
+        // merge below only skips an exact (source,target) re-add, so a new mount
+        // whose guest target collides with a DIFFERENT existing source would
+        // otherwise leave two virtiofs mounts at one guest path — the ambiguous
+        // config create-time validation rejects. Mirror the port check above by
+        // computing the final mount set exactly as the DB closure does, then
+        // rejecting duplicate targets.
+        {
+            let mut final_mounts: Vec<(String, String, bool)> = record.mounts.clone();
+            for rm in &self.remove_volume {
+                let canonical_rm = if let Some((rm_src, rm_tgt)) = rm.split_once(':') {
+                    let resolved = std::fs::canonicalize(rm_src)
+                        .unwrap_or_else(|_| std::path::PathBuf::from(rm_src));
+                    format!("{}:{}", resolved.display(), rm_tgt)
+                } else {
+                    rm.clone()
+                };
+                final_mounts.retain(|(src, tgt, _)| {
+                    let spec = format!("{}:{}", src, tgt);
+                    spec != canonical_rm && spec != *rm
+                });
+            }
+            for m in &new_mounts {
+                let tuple = m.to_storage_tuple();
+                if !final_mounts
+                    .iter()
+                    .any(|(s, t, _)| *s == tuple.0 && *t == tuple.1)
+                {
+                    final_mounts.push(tuple);
+                }
+            }
+            let mut seen = std::collections::HashSet::new();
+            for (_, tgt, _) in &final_mounts {
+                if !seen.insert(tgt.clone()) {
+                    return Err(smolvm::Error::config(
+                        "update",
+                        format!("duplicate mount target: {tgt} is specified more than once"),
+                    ));
+                }
+            }
+        }
+
         // Expand physical disk files before the DB write. If expansion fails,
         // no DB changes are made — the record stays consistent.
         let mut changes: Vec<String> = Vec::new();
