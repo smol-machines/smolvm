@@ -378,3 +378,32 @@ With the transport-retry + worker-state-globals fixes (commits 59314ee,
 learner stranded by a crash-looping clone worker), agg 6,750 tok/s, all 8
 loss curves distinct and converging, 8 forks in 3.6 s. The per-leg stranded
 learner is eliminated; sweep rows no longer need the N−1 asterisk.
+
+## Post-training: DPO fork sweep (2026-07-22, H100, 0.5B)
+
+Direct Preference Optimization via smolvm forks — the post-training case where
+sharing pays double. DPO trains a policy against a FROZEN REFERENCE model
+(normally a second full copy in memory). With a LoRA policy the reference is
+the adapter-off base, so `--share-weights` shares that one frozen reference
+across all forks; each fork trains only its own LoRA policy on its own
+preference shard.
+
+golden loads once (176s), forks N=4 `--share-weights` DPO learners:
+
+| learner | DPO loss (start→end) | tok/s | peak |
+|---|---|---|---|
+| 0 | 0.6931 → 0.6564 | 49 | 6.4 GB |
+| 1 | 0.6931 → 0.6643 | 52 | 6.4 GB |
+| 2 | 0.6931 → 0.6530 | 52 | 6.4 GB |
+| 3 | 0.6931 → 0.6592 | 47 | 6.4 GB |
+
+All 4 done; **peak 15.3 GB for 4 learners sharing ONE reference** (~40% under
+4 independent at 0.5B; the share wins bigger at 7B where the reference
+dominates memory). Every learner starts at ln(2)=0.6931 (the DPO identity —
+policy==reference) and converges to a DISTINCT value, proving each optimized
+its own preference shard while sharing the frozen reference. Correctness of
+post-training + the reference-sharing density win, both demonstrated.
+Workload: demo/dpo_train.py (FORK barrier + golden warmup + synthetic
+preference pairs + trl DPOTrainer, ref_model=None). GRPO (RL) pending an
+rlwork venv trl/vLLM realignment (trl 0.24 GRPOTrainer needs a vLLM API
+0.19.1 lacks).
