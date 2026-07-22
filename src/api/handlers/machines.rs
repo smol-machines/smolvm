@@ -1359,6 +1359,11 @@ pub async fn drain_machines(state: &Arc<ApiState>) {
                     r.state = RecordState::Stopped;
                     r.pid = None;
                     r.pid_start_time = None;
+                    // A drain is a deliberate decommission: mark the machine
+                    // user-stopped so the restart supervisor does not resurrect it
+                    // in the window before the host is terminated (or if drain is
+                    // used standalone). An explicit start elsewhere clears this.
+                    r.restart.user_stopped = true;
                 })
                 .await;
             tracing::info!(machine = %name, stopped, "drain: machine stopped");
