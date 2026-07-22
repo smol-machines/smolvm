@@ -1434,6 +1434,32 @@ pub async fn delete_machine(
         )));
     }
 
+    // Re-check for dependent clones now that the golden's process (and its fork
+    // control socket) is down. `fork_machine` locks only the CLONE name, not the
+    // golden, so a fork could have snapshotted + registered a clone between the
+    // initial check above and here. With the golden killed no NEW fork can
+    // snapshot, so this catches that race window. Abort BEFORE removing the DB
+    // record or the data dir — the clones' copy-on-write disks are backed by this
+    // golden's disks, so removing them would be silent data loss. The golden is
+    // left stopped with its disks intact; delete the clones and retry.
+    {
+        let db = state.db().clone();
+        let golden = name.clone();
+        let clones = tokio::task::spawn_blocking(move || db.dependent_clones(&golden))
+            .await
+            .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+            .map_err(ApiError::database)?;
+        if !clones.is_empty() {
+            return Err(ApiError::Conflict(format!(
+                "machine '{}' gained {} clone(s) during deletion ({}); their disks are backed by \
+                 its disks — delete the clones first",
+                name,
+                clones.len(),
+                clones.join(", ")
+            )));
+        }
+    }
+
     // Remove from registry (in-memory + database) in a blocking task: the DB
     // delete is synchronous disk I/O and must not run on an async worker thread,
     // where it would starve the small per-node reactor under delete churn.
