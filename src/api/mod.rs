@@ -193,6 +193,7 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .route("/{id}/start", post(handlers::machines::start_machine))
         .route("/{id}/fork", post(handlers::machines::fork_machine))
         .route("/{id}/stop", post(handlers::machines::stop_machine))
+        .route("/{id}/resize", post(handlers::machines::resize_machine))
         .route("/{id}/export", post(handlers::machines::export_machine))
         .route("/{id}", delete(handlers::machines::delete_machine))
         // Exec routes
