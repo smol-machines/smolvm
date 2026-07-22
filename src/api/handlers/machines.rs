@@ -374,9 +374,15 @@ pub async fn create_machine(
     validate_vm_name(&name, "machine name").map_err(ApiError::BadRequest)?;
 
     // Validate mount paths
-    for mount_spec in &req.mounts {
-        HostMount::try_from(mount_spec).map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    }
+    let host_mounts: Vec<HostMount> = req
+        .mounts
+        .iter()
+        .map(|m| HostMount::try_from(m).map_err(|e| ApiError::BadRequest(e.to_string())))
+        .collect::<Result<_, _>>()?;
+    // Reject duplicate guest targets, matching the CLI (HostMount::parse) so an
+    // ambiguous same-target mount is a clean 400 rather than a silent shadow.
+    HostMount::ensure_unique_targets(&host_mounts)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     // If --from is set, read manifest and extract sidecar
     let (
