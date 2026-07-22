@@ -1195,6 +1195,30 @@ pub async fn stop_machine(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
 
+    // A frozen fork base must outlive its clones: they CoW-map its guest RAM
+    // (memfd) and CoW-back their disks onto its disks, so stopping it — which
+    // kills the VMM and frees the memfd — corrupts every live clone. `actual_state`
+    // does not resolve the on-the-fly `Frozen` state, so a golden with clones
+    // looks `Running` here and would be torn down. Refuse, mirroring `delete` and
+    // the CLI stop guard.
+    {
+        let db = state.db().clone();
+        let golden = name.clone();
+        let clones = tokio::task::spawn_blocking(move || db.dependent_clones(&golden))
+            .await
+            .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+            .map_err(ApiError::database)?;
+        if !clones.is_empty() {
+            return Err(ApiError::Conflict(format!(
+                "machine '{}' is the fork base of {} live clone(s) ({}); they CoW-map its \
+                 memory and disks — stop or delete the clones first",
+                name,
+                clones.len(),
+                clones.join(", ")
+            )));
+        }
+    }
+
     // Check state
     let actual_state = record.actual_state();
     if actual_state != RecordState::Running {
