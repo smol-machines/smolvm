@@ -1037,13 +1037,32 @@ pub async fn start_machine(
         // no-op on the stop→restart path. Mirrors how the smolmachine source
         // fails a bad artifact at create.
         let image_pull = image.clone();
-        with_machine_client_traced(&entry, None, move |c| {
+        let pull = with_machine_client_traced(&entry, None, move |c| {
             if c.query(&image_pull)?.is_none() {
                 c.pull_with_registry_config(&image_pull)?;
             }
             Ok(())
         })
-        .await?;
+        .await;
+        if let Err(e) = pull {
+            // The agent VM booted above, but the image can't be pulled (bad or
+            // private ref, or no route to the registry). The Running state + pid
+            // are only persisted AFTER this block, so returning now would strand
+            // the booted VM as an untracked orphan — its pid never reaches the
+            // record, and a later delete then reports "process still alive after
+            // shutdown; not removing" while the VM leaks. Tear the VM down so the
+            // machine is left exactly like a never-started one (`created`, no live
+            // process) — cleanly retryable (e.g. once a transient registry outage
+            // clears) and deletable — then surface the pull failure.
+            let st = pid.and_then(process_start_time);
+            let name_rb = name.clone();
+            tokio::task::spawn_blocking(move || {
+                shutdown_machine_process(&name_rb, pid, st, false);
+            })
+            .await
+            .ok();
+            return Err(e);
+        }
         // Launch the workload container. Best-effort past the pull: a transient
         // crun/overlay hiccup leaves a reachable (exec-able) VM rather than
         // failing an otherwise-pullable start — the image is already local, so a
