@@ -591,6 +591,60 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
         None
     };
 
+    // Waypipe Wayland forwarding: bridge the guest's outbound waypipe vsock port
+    // to a Unix socket in the per-VM dir. Outbound (listen=false), so libkrun
+    // connects to this path when the guest opens the port; the user runs a
+    // `waypipe client` listening on it. Clear any stale socket first.
+    let waypipe_socket: Option<std::path::PathBuf> = if config.waypipe {
+        config.vsock_socket.parent().map(|dir| {
+            let path = dir.join("waypipe.sock");
+            let _ = std::fs::remove_file(&path);
+            path
+        })
+    } else {
+        None
+    };
+
+    // Raw X11 socket bridge: resolve the host X server socket from the host
+    // `$DISPLAY` and bridge the guest's outbound X11 vsock port straight to it.
+    // The path is the LIVE host X server socket, not smolvm-owned, so it is
+    // never removed. Skips (with a warning) if $DISPLAY is unset/unparseable or
+    // the socket is missing, so a misconfigured host disables X11 rather than
+    // aborting the boot.
+    let x11_socket: Option<std::path::PathBuf> = if config.x11 {
+        match host_x11_socket() {
+            Some(path) if path.exists() => {
+                tracing::info!(path = %path.display(), "X11 bridge: using host X server socket");
+                Some(path)
+            }
+            Some(path) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "X11 bridge requested but the host X server socket does not exist - X11 disabled"
+                );
+                None
+            }
+            None => {
+                tracing::warn!(
+                    "X11 bridge requested but $DISPLAY is unset or not a local display - X11 disabled"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Waypipe host client: when forwarding is enabled, start a `waypipe client`
+    // on the host that listens on `waypipe.sock` and forwards to the host
+    // compositor, so the user does not run it by hand. Held for the VM's
+    // lifetime (dropped when this process exits); `spawn_client` also arms
+    // PR_SET_PDEATHSIG so it dies with the boot process. No-op off Linux / with
+    // no compositor.
+    let _waypipe_client = waypipe_socket
+        .as_deref()
+        .and_then(smolvm::vm::waypipe::spawn_client);
+
     proc_timing!("ready to launch");
 
     // Egress telemetry lands in the per-VM dir (the vsock socket's parent), the
@@ -612,6 +666,9 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
         cuda_socket: cuda_socket.as_deref(),
         docker_socket: docker_socket.as_deref(),
         published_sockets: &config.published_sockets,
+        waypipe_socket: waypipe_socket.as_deref(),
+        waypipe_bin: config.waypipe_bin.as_deref(),
+        x11_socket: x11_socket.as_deref(),
         packed_layers_dir: config.packed_layers_dir.as_deref(),
         extra_disks: &config.extra_disks,
         dns_filter_enabled: config
@@ -730,4 +787,26 @@ mod backing_chain_tests {
         assert!(qcow2_backing_chain(&solo).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// Resolve the host X server's Unix socket path from the host `$DISPLAY`.
+///
+/// Handles the common local forms `:N` and `:N.S` (screen suffix ignored),
+/// mapping display N to `/tmp/.X11-unix/XN`. Returns `None` for a network
+/// display (`host:N`, which has no local socket) or an unparseable value. The
+/// boot subprocess inherits `$DISPLAY` from the launching user's environment.
+fn host_x11_socket() -> Option<std::path::PathBuf> {
+    let display = std::env::var("DISPLAY").ok()?;
+    // Strip an optional host part before ':'. A non-empty host means a TCP
+    // display, which has no local Unix socket to bridge.
+    let (host, rest) = display.rsplit_once(':')?;
+    if !host.is_empty() {
+        return None;
+    }
+    // rest is "N" or "N.S"; take the display number before any screen suffix.
+    let num = rest.split('.').next()?;
+    if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(std::path::PathBuf::from(format!("/tmp/.X11-unix/X{num}")))
 }

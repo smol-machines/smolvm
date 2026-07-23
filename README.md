@@ -104,6 +104,49 @@ smolvm machine run --ssh-agent --net --image alpine -- sh -c "apk add -q openssh
 smolvm machine exec --name myvm -- git clone git@github.com:org/private-repo.git
 ```
 
+**Run guest GUI apps on your host desktop over vsock.** `--waypipe` bridges a guest [waypipe](https://gitlab.freedesktop.org/mstoeckl/waypipe) vsock port to a host Unix socket in the VM data dir — no X11, no SSH server, no TCP port forward. The guest agent runs `waypipe server` as a daemon inside the workload container and exports `WAYLAND_DISPLAY` automatically, and on the host smolvm starts the matching `waypipe client` next to your Wayland compositor for you (Linux hosts). So you just run your GUI app — both ends are wired up. One daemon serves every app (like a normal Wayland display), and it starts on first launch — no per-app `waypipe server` wrapper.
+
+```bash
+smolvm machine create --name gui --net --waypipe --image ubuntu:24.04
+smolvm machine start --name gui
+
+# Guest: run any GUI app. WAYLAND_DISPLAY is set, the guest daemon is started,
+# and the host waypipe client is running against your compositor.
+smolvm machine exec --name gui -- weston-terminal
+```
+
+The host client is started automatically on Linux when `$WAYLAND_DISPLAY` is set and `waypipe` is on the host `PATH`; it lives as long as the VM and is killed with it. If either is missing, smolvm skips it and you can run one by hand:
+
+```bash
+waypipe -s "$(smolvm machine data-dir --name gui)/waypipe.sock" client &
+```
+
+`--waypipe` takes an optional value selecting which `waypipe` binary the guest daemon runs:
+
+- `--waypipe` or `--waypipe=host` (default) — share the **host** waypipe binary into the guest, so the guest server and your host client are the exact same binary (no wire-version drift) and the image needs no waypipe installed. Requires the host glibc to be compatible with the guest image's (usually true for a recent image).
+- `--waypipe=container` — use the image's **own** `waypipe` (install it yourself, e.g. `apt-get install -y waypipe`). The daemon starts on the first launch after waypipe is present, with no restart.
+- `--waypipe=/path/to/waypipe` — share that specific host binary.
+
+Requires a `--vsock`-capable waypipe (>= 0.9) on the host, and (for `container`) in the guest. `--waypipe` needs an `--image`: the guest daemon runs inside the workload container (the agent's own rootfs is musl and cannot exec a glibc waypipe), which a bare VM does not have — so `--waypipe` without an image is rejected up front.
+
+One waypipe daemon in the guest serves every app (like the X11 display socket), and it starts lazily — the first launch after you install waypipe brings it up with no VM restart. The bridge uses the same vsock mechanism as `--cuda`, so no networking is required for forwarding itself (`--net` is only needed to install waypipe in the guest).
+
+If the daemon can't start, smolvm says so rather than failing silently: `machine exec -- cmd` prints the reason on stderr (without disturbing the command's own output), and an interactive `machine exec -it` shell prints it at the top of the session. Either way the message says whether waypipe isn't installed yet (with how to install it — the daemon then comes up on the next command) or is present but failed to start (e.g. a host/guest glibc mismatch in `host` mode — try `--waypipe=container`).
+
+**Or bridge the raw X11 socket, no waypipe.** `--x11` resolves the host `$DISPLAY` at launch and bridges a guest vsock port straight to that X server's Unix socket. X was designed for network transparency, so guest X clients talk to your host X server directly. The guest agent sets up the display socket and exports `DISPLAY=:10` for you — no `socat`, just run an X client. Needs a running host X server (a native X session, or an Xwayland/`Xephyr` on a Wayland host).
+
+```bash
+smolvm machine create --name xgui --net --x11 --image ubuntu:24.04
+smolvm machine start --name xgui               # start with $DISPLAY set
+
+xhost +local:                                  # allow the bridged connections
+
+# DISPLAY=:10 is already set in the VM — just run an X client.
+smolvm machine exec --name xgui -- sh -c 'apt-get install -y x11-apps && xeyes'
+```
+
+The X11 bridge is a plain byte pipe (guest connects out to host CID 2, port 7002), so it cannot pass `SCM_RIGHTS` ancillary fds — MIT-SHM and DRI3 fall back to wire-image transport (correct, just slower). For per-window Wayland integration and correct fd/GPU handling, prefer `--waypipe`.
+
 **Declare environments with a Smolfile** — reproducible VM config in a simple TOML file.
 
 ```toml
@@ -145,6 +188,8 @@ smolvm strengthens the guest/host boundary by giving each workload a separate VM
 * The `smolvm` CLI and VMM processes run with the permissions of the invoking host user. That user account, the host OS, the hypervisor backend, libkrun, and smolvm are in the trusted computing base.
 * Host directories passed with `--volume` are intentionally exposed to the guest with the requested access. Do not mount secrets or sensitive paths into an untrusted workload.
 * `--ssh-agent` does not copy private key material into the guest, but it grants the guest access to the forwarded agent socket and therefore the ability to request signatures while the VM is running.
+* `--waypipe` opens a vsock channel from the guest to a host Unix socket that a `waypipe client` reads next to your Wayland compositor. A guest with this enabled can drive that client; only enable it for workloads whose GUI you intend to display.
+* `--x11` bridges a guest vsock port straight to your host X server socket, giving the guest a direct connection to that X server. X11 has weak client isolation, so treat a guest with `--x11` as having access to the whole X server (input, other windows, clipboard); only enable it for trusted GUI workloads, and rely on X access control (`xhost`) deliberately.
 * Networking is disabled by default. Enabling `--net`, port forwarding, or host services expands the workload's reachable surface.
 * In standalone local use, smolvm's state and control endpoints are scoped to the invoking user's environment. For hostile local co-tenants, add host-level account separation and OS confinement around the VMM process. This section does not describe the separate smolmachines cloud control plane or its tenant-isolation guarantees.
 * Release archives publish SHA-256 checksums and the installer rejects a mismatch when the checksum file is available. Releases are not currently signed or accompanied by provenance attestations, and the installer permits installation when the checksum file cannot be downloaded.

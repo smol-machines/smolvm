@@ -15,6 +15,20 @@ pub mod proto;
 /// Shared-memory command/completion rings (low-latency in-VM transport).
 pub mod ring;
 
+/// FNV-1a 64-bit hash of `data`, never zero (0 is reserved as a sentinel).
+///
+/// Lives at the crate root so both the always-compiled `client` (content-hash
+/// module dedup) and the feature-gated `host` (module cache keys, chunk CRCs)
+/// share one implementation without `client` reaching into `host`.
+pub fn fnv64(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h.max(1)
+}
+
 /// Fingerprint of the wire-defining source (see `build.rs`). The client sends
 /// it in the `Init` handshake; the host rejects a mismatch, turning a stale
 /// shim/server pairing into a loud error instead of silent data corruption.

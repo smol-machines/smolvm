@@ -61,6 +61,17 @@ pub const ROSETTA_TAG: &str = "rosetta";
 /// both the wrapper and the `binfmt_misc` registration.
 pub const ROSETTA_GUEST_PATH: &str = "/mnt/rosetta";
 
+/// virtiofs tag for the host `waypipe` binary, shared into the guest so the
+/// agent can run `waypipe server` in its own namespace with the exact same
+/// binary the host `waypipe client` uses (avoiding wire-version drift between a
+/// bundled guest waypipe and the user's host one). Shared host↔guest so the
+/// launcher's `krun_add_virtiofs` tag and the guest mount source can't diverge.
+pub const WAYPIPE_TAG: &str = "waypipe";
+
+/// Guest mount point for the shared host `waypipe` binary. The agent runs
+/// `<WAYPIPE_GUEST_PATH>/waypipe server` as the forwarding daemon.
+pub const WAYPIPE_GUEST_PATH: &str = "/mnt/waypipe";
+
 /// Maximum frame size (32 MB - layer exports use chunked streaming).
 pub const MAX_FRAME_SIZE: u32 = 32 * 1024 * 1024;
 
@@ -157,6 +168,17 @@ pub mod ports {
     /// Maximum number of user-published sockets per VM. Bounds the vsock-port
     /// window (`6100..6100+MAX`) below CUDA's 7000.
     pub const PUBLISH_SOCKET_MAX: usize = 64;
+
+    /// Waypipe Wayland forwarding: the guest runs `waypipe server --vsock` and
+    /// connects out to this port; libkrun bridges it to a host Unix socket where
+    /// `waypipe client` listens next to the host compositor. Outbound (guest
+    /// connects out), like the SSH/DNS/CUDA bridges.
+    pub const WAYPIPE: u32 = 7001;
+    /// Raw X11 socket bridge: a guest X client connects out to this port and
+    /// libkrun bridges it straight to the host X server's Unix socket
+    /// (`/tmp/.X11-unix/X<n>`), so guest X11 apps render on the host X server
+    /// with no waypipe in between. Outbound (guest connects out).
+    pub const X11: u32 = 7002;
 }
 
 /// vsock CID constants.
