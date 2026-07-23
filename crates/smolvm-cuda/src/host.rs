@@ -449,13 +449,19 @@ fn reclaim_session(sess: &mut Session, b: &mut dyn Backend) {
         let _ = b.mem_address_free(va, size);
     }
     for m in std::mem::take(&mut sess.owned_modules) {
-        let _ = b.module_unload(m);
+        if worker_module_take(m) {
+            let _ = b.module_unload(m);
+        }
     }
     for st in std::mem::take(&mut sess.owned_streams) {
-        let _ = b.stream_destroy(st);
+        if worker_handle_take(&WORKER_STREAMS, st) {
+            let _ = b.stream_destroy(st);
+        }
     }
     for e in std::mem::take(&mut sess.owned_events) {
-        let _ = b.event_destroy(e);
+        if worker_handle_take(&WORKER_EVENTS, e) {
+            let _ = b.event_destroy(e);
+        }
     }
     for real in std::mem::take(&mut sess.owned_graph_reals) {
         // Only reals this session created — never a graph inherited from a
@@ -2538,26 +2544,43 @@ static MOD_TRANS_GLOBAL: std::sync::Mutex<Option<HashMap<u64, u64>>> = std::sync
 /// correctly from another (no leak) while foreign handles are never touched.
 static WORKER_MODULES: std::sync::Mutex<Option<std::collections::HashSet<u64>>> =
     std::sync::Mutex::new(None);
+/// Streams and events this worker created in its OWN context — same rationale as
+/// WORKER_MODULES: `cuStreamDestroy`/`cuEventDestroy` on a golden-/foreign-context
+/// handle the clone inherited via COW would deref a pointer valid only in another
+/// context. Process-global so a create on one channel destroys correctly from
+/// another (no leak) while foreign handles are skipped.
+static WORKER_STREAMS: std::sync::Mutex<Option<std::collections::HashSet<u64>>> =
+    std::sync::Mutex::new(None);
+static WORKER_EVENTS: std::sync::Mutex<Option<std::collections::HashSet<u64>>> =
+    std::sync::Mutex::new(None);
 
-/// Record a module this worker just loaded in its own context.
-fn worker_module_register(raw: u64) {
-    WORKER_MODULES
-        .lock()
+/// Record a handle this worker just created in its own context.
+fn worker_handle_register(reg: &std::sync::Mutex<Option<std::collections::HashSet<u64>>>, h: u64) {
+    reg.lock()
         .unwrap()
         .get_or_insert_with(std::collections::HashSet::new)
-        .insert(raw);
+        .insert(h);
 }
 
-/// Claim ownership of `raw` for unload: returns true (and forgets it, so a later
-/// double-unload is a safe no-op) iff this worker created it; false for foreign
-/// handles, which must NOT be passed to `cuModuleUnload`.
-fn worker_module_take(raw: u64) -> bool {
-    WORKER_MODULES
-        .lock()
+/// Claim `h` for destroy: true (and forgets it, so a double-destroy is a safe
+/// no-op) iff this worker created it; false for a foreign/inherited/already-freed
+/// handle, which must NOT be passed to the driver's destroy call.
+fn worker_handle_take(
+    reg: &std::sync::Mutex<Option<std::collections::HashSet<u64>>>,
+    h: u64,
+) -> bool {
+    reg.lock()
         .unwrap()
         .as_mut()
-        .map(|s| s.remove(&raw))
+        .map(|s| s.remove(&h))
         .unwrap_or(false)
+}
+
+fn worker_module_register(raw: u64) {
+    worker_handle_register(&WORKER_MODULES, raw);
+}
+fn worker_module_take(raw: u64) -> bool {
+    worker_handle_take(&WORKER_MODULES, raw)
 }
 
 /// Process-global copies of the lazy-resolve INPUTS (module images + function
@@ -3284,6 +3307,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         // Raw pointers are valid on every connection, like device pointers.
         Request::StreamCreate { flags } => b.stream_create(flags).map(|st| {
             sess.owned_streams.insert(st);
+            worker_handle_register(&WORKER_STREAMS, st);
             if path3_enabled() {
                 sess.golden_layout.lock().unwrap().streams.insert(st, flags);
             }
@@ -3529,7 +3553,11 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         }
         Request::StreamDestroy { stream } => {
             let raw = raw_stream(sess, stream)?;
-            b.stream_destroy(raw)?;
+            // Only destroy a stream THIS worker created; a foreign/inherited handle
+            // would SIGSEGV cuStreamDestroy in the wrong context (see WORKER_MODULES).
+            if worker_handle_take(&WORKER_STREAMS, raw) {
+                b.stream_destroy(raw)?;
+            }
             sess.owned_streams.remove(&raw);
             sess.streams.remove(&stream);
             Ok(Response::Ok)
@@ -3557,6 +3585,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         // several connections that must all understand the same handle.
         Request::EventCreate { flags } => b.event_create(flags).map(|e| {
             sess.owned_events.insert(e);
+            worker_handle_register(&WORKER_EVENTS, e);
             if path3_enabled() {
                 sess.golden_layout.lock().unwrap().events.insert(e, flags);
             }
@@ -3564,7 +3593,9 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         }),
         Request::EventDestroy { event } => {
             let raw = raw_event(sess, event)?;
-            b.event_destroy(raw)?;
+            if worker_handle_take(&WORKER_EVENTS, raw) {
+                b.event_destroy(raw)?;
+            }
             sess.owned_events.remove(&raw);
             sess.events.remove(&event);
             Ok(Response::Ok)
