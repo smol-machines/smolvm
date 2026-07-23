@@ -1929,11 +1929,17 @@ mod tests {
 #[derive(Args, Debug)]
 pub struct ExecCmd {
     /// Command and arguments to execute
-    #[arg(trailing_var_arg = true, required = true, value_name = "COMMAND")]
+    ///
+    /// `last = true` requires the `--` separator, matching `machine create`:
+    /// with the machine name now a flag, an old-style positional
+    /// (`machine exec myvm -- cmd`) must fail loudly instead of `myvm` being
+    /// silently captured as the guest command and run against machine
+    /// "default".
+    #[arg(last = true, required = true, value_name = "COMMAND")]
     pub command: Vec<String>,
 
     /// Target machine (default: "default")
-    #[arg(long, value_name = "NAME")]
+    #[arg(short = 'n', long, value_name = "NAME")]
     pub name: Option<String>,
 
     /// Set working directory in the VM
@@ -2306,6 +2312,12 @@ pub struct CreateCmd {
     #[arg(long)]
     pub rosetta: bool,
 
+    /// Auto-standby: stop the machine to free host RAM after it has been idle
+    /// (no exec/run/interactive activity) for this many seconds. Omit or 0 to
+    /// disable. A later start/exec boots it again.
+    #[arg(long = "idle-timeout", value_name = "SECONDS")]
+    pub idle_timeout: Option<u64>,
+
     /// Expose a Unix socket the guest listens on to the host (repeatable). The
     /// host reaches it at the given host path, or `<vm-dir>/<basename>` by
     /// default. Format: GUEST_PATH[:HOST_PATH].
@@ -2453,6 +2465,7 @@ impl CreateCmd {
             (Some(from_smolfile), None) => Some(from_smolfile),
             (None, some) => some,
         };
+        params.idle_timeout_secs = self.idle_timeout;
         params.published_sockets =
             parse_published_sockets(&self.expose_socket, &self.mount_socket)?;
         // CLI `--secret-env`/`--secret-file` refs merge over any Smolfile
@@ -2655,6 +2668,7 @@ impl CreateCmd {
             docker_socket: self.docker_socket,
             dns_filter_hosts: None,
             published_sockets: Vec::new(),
+            idle_timeout_secs: self.idle_timeout,
             gpu: manifest.gpu,
             gpu_vram_mib: None,
             rosetta: false,
@@ -3133,10 +3147,13 @@ impl UpdateCmd {
             smolvm::Error::config("update", format!("machine '{}' not found", self.name))
         })?;
 
-        // Must be stopped (same check as resize)
+        // Must be stopped (same check as resize). Standby counts: its VMM is
+        // deliberately not running, so it is as safe to reconfigure as Stopped
+        // — and refusing it wedged users, since `machine stop` used to no-op
+        // on standby machines.
         let state = record.actual_state();
         match state {
-            RecordState::Stopped | RecordState::Created => {}
+            RecordState::Stopped | RecordState::Created | RecordState::Standby => {}
             _ => {
                 return Err(smolvm::Error::InvalidState {
                     expected: "stopped".into(),

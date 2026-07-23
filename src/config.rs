@@ -63,6 +63,13 @@ pub enum RecordState {
     /// must outlive its clones. Resolved on the fly when a record has
     /// dependent clones; not persisted.
     Frozen,
+    /// The machine was automatically snapshotted to disk and its VMM process
+    /// stopped after sitting idle past its `idle_timeout_secs`. No process is
+    /// alive; guest+device state lives in the machine's snapshot dir. A
+    /// subsequent `start`/`exec`/inbound connection restores it from that
+    /// snapshot rather than cold-booting. Persisted, so a control-plane restart
+    /// still knows the machine is hibernated (not stopped) and can wake it.
+    Standby,
 }
 
 impl std::fmt::Display for RecordState {
@@ -74,6 +81,7 @@ impl std::fmt::Display for RecordState {
             RecordState::Failed => write!(f, "failed"),
             RecordState::Unreachable => write!(f, "unreachable"),
             RecordState::Frozen => write!(f, "frozen"),
+            RecordState::Standby => write!(f, "standby"),
         }
     }
 }
@@ -394,6 +402,14 @@ pub struct VmRecord {
     #[serde(default)]
     pub published_sockets: Vec<PublishedSocketConfig>,
 
+    /// Auto-standby idle timeout in seconds. When set and the machine has been
+    /// inactive (no inbound connections, no exec/run traffic) for at least this
+    /// long, the supervisor snapshots it to disk and stops the VMM, moving it to
+    /// [`RecordState::Standby`]. `None` (the default) disables auto-standby, so
+    /// existing records deserialize unchanged. `0` is treated as disabled.
+    #[serde(default)]
+    pub idle_timeout_secs: Option<u64>,
+
     /// Enable outbound network access (TSI).
     #[serde(default)]
     pub network: bool,
@@ -594,6 +610,7 @@ impl VmRecord {
             mounts,
             ports,
             published_sockets: Vec::new(),
+            idle_timeout_secs: None,
             network,
             gpu: None,
             gpu_vram_mib: None,
@@ -651,6 +668,7 @@ impl VmRecord {
             mounts,
             ports,
             published_sockets: Vec::new(),
+            idle_timeout_secs: None,
             network,
             gpu: None,
             gpu_vram_mib: None,

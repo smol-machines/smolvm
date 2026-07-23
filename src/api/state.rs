@@ -67,6 +67,10 @@ pub struct ApiState {
     /// node as unschedulable (HTTP 503) the moment the main runtime stops
     /// making progress, turning a silent wedge into a fast, honest drain signal.
     runtime_heartbeat_ms: std::sync::atomic::AtomicU64,
+    /// Per-machine activity accounting for auto-standby. Control-plane handlers
+    /// (exec/run/file-copy) stamp activity here; the supervisor reads it to
+    /// decide when an idle machine should be stopped to free its RAM.
+    activity: crate::autostandby::ActivityTracker,
 }
 
 /// Internal machine entry with manager and configuration.
@@ -223,6 +227,7 @@ impl ApiState {
             cpu_samples: parking_lot::Mutex::new(HashMap::new()),
             started_at: std::time::Instant::now(),
             runtime_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
+            activity: crate::autostandby::ActivityTracker::new(),
         })
     }
 
@@ -238,6 +243,7 @@ impl ApiState {
             cpu_samples: parking_lot::Mutex::new(HashMap::new()),
             started_at: std::time::Instant::now(),
             runtime_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
+            activity: crate::autostandby::ActivityTracker::new(),
         }
     }
 
@@ -889,6 +895,20 @@ impl ApiState {
         &self.db
     }
 
+    /// The auto-standby activity tracker. Handlers stamp control-plane activity
+    /// (exec/run/file-copy) via [`ApiState::mark_activity`]; the supervisor
+    /// reads snapshots from here to drive idle detection.
+    pub fn activity(&self) -> &crate::autostandby::ActivityTracker {
+        &self.activity
+    }
+
+    /// Stamp control-plane activity for `name` at the current wall-clock second.
+    /// Called at the entry of exec/run/file-copy handlers so any interaction
+    /// with a machine resets its auto-standby idle clock.
+    pub fn mark_activity(&self, name: &str) {
+        self.activity.mark(name, crate::util::current_timestamp());
+    }
+
     /// Off-reactor VM lookup. Runs the blocking SQLite read on the blocking pool.
     pub async fn lookup_vm(&self, name: &str) -> Result<Option<VmRecord>, ApiError> {
         let db = self.db.clone();
@@ -1235,10 +1255,10 @@ pub async fn ensure_running_and_persist(
     }
 
     // An implicit start of an image machine (exec/files/images waking a stopped
-    // machine) must relaunch the image workload just like the explicit start
-    // handler does — otherwise the wake boots a bare agent VM and a published
-    // port forwards to a guest socket nothing listens on (the exact drift
-    // `workload.rs`'s module doc warns front-ends about). Gated on
+    // or hibernated machine) must relaunch the image workload just like the
+    // explicit start handler does — otherwise the wake boots a bare agent VM
+    // and a published port forwards to a guest socket nothing listens on (the
+    // exact drift `workload.rs`'s module doc warns front-ends about). Gated on
     // `freshly_booted` so an already-running machine's workload is never
     // double-launched. Best-effort like the handler's launch step: the caller's
     // exec must not fail because the workload didn't come up.

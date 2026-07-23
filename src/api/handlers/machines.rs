@@ -183,7 +183,7 @@ fn machine_entry_from_record(record: &VmRecord, manager: AgentManager) -> Machin
 /// disks are discarded immediately after, so there is nothing to flush — SIGKILL
 /// at once instead of waiting out the guest's graceful shutdown (the bulk of the
 /// ~1.9s DELETE latency on metal).
-fn shutdown_machine_process(
+pub(crate) fn shutdown_machine_process(
     name: &str,
     pid: Option<i32>,
     pid_start_time: Option<u64>,
@@ -1869,8 +1869,11 @@ pub async fn export_machine(
     // Build the .smolmachine by subprocessing this binary's tested export path.
     // The serve handlers and the pack CLI share the same on-disk SmolvmDb, so
     // `pack create --from-vm <name>` sees the serve-managed machine.
+    // No `.smolmachine` suffix: `-o` names the executable STUB (the CLI now
+    // rejects a .smolmachine-suffixed output for exactly the confusion the
+    // comment below describes); the sidecar we push lands at
+    // `<tmp>.smolmachine` via sidecar_path_for.
     let tmp = tempfile::Builder::new()
-        .suffix(".smolmachine")
         .tempfile()
         .map_err(|e| ApiError::internal(format!("create temp file: {}", e)))?;
     let tmp_path = tmp.path().to_path_buf();
@@ -1925,13 +1928,13 @@ pub async fn export_machine(
     };
     let client = smolvm_registry::RegistryClient::new(base_url).with_token(req.push_token.clone());
 
-    let result = smolvm_registry::push(&client, &req.repo, &req.tag, &artifact)
-        .await
-        .map_err(|e| ApiError::internal(format!("registry push failed: {}", e)))?;
+    let result = smolvm_registry::push(&client, &req.repo, &req.tag, &artifact).await;
 
     // The tempfile guard only removes the stub path; clean the sidecar too so
-    // exports don't accumulate multi-GB files in /tmp.
+    // exports don't accumulate multi-GB files in /tmp — on the failure path as
+    // well, which previously leaked it.
     let _ = std::fs::remove_file(&sidecar);
+    let result = result.map_err(|e| ApiError::internal(format!("registry push failed: {}", e)))?;
 
     // tmp drops here, deleting the stub.
     Ok(Json(ExportResponse {
