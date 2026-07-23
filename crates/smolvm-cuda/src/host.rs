@@ -268,6 +268,11 @@ pub trait Backend: Send {
     /// so `memcpy_gpa_*` can read guest memory directly. Set once per connection
     /// by the embedder. Guest RAM is usually split around the 4 GiB PCI hole.
     fn set_guest_ram(&mut self, _regions: Vec<(u64, u64, u64)>) {}
+    /// Fork-CLONE variant: `regions` are the clone's own (gpa, host_va, len);
+    /// the backend reaches its LIVE pages through /proc/<pid>/mem. Default no-op.
+    fn set_guest_ram_procmem(&mut self, _pid: u32, _regions: Vec<(u64, u64, u64)>) -> bool {
+        false
+    }
     /// Zero-copy H2D from guest RAM: gather `segments` and DMA to `dptr`.
     fn memcpy_gpa_htod(
         &mut self,

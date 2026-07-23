@@ -201,6 +201,16 @@ pub struct GpuBackend {
     /// microVM / on older libkrun. Guest RAM is usually split into a low and a
     /// high region around the 4 GiB PCI hole.
     guest_ram: Vec<(u64, u64, u64)>,
+    /// Fork-CLONE transport: private COW guest RAM cannot be memfd-mapped, so
+    /// `guest_ram` holds the CLONE's own (gpa, host_va, len) and we read/write its
+    /// LIVE pages through this open /proc/<pid>/mem. Correct on COW-diverged pages
+    /// and race-free vs the socket bounce path. `None` for the golden (memfd map).
+    proc_mem: Option<std::fs::File>,
+    /// Clone proc-mem regions (gpa, CLONE host_va, len), resolved for pread/pwrite
+    /// of /proc/<pid>/mem. Kept SEPARATE from `guest_ram` because these host VAs
+    /// live in the CLONE's address space and must NEVER be dereferenced by the
+    /// daemon's ring / zero-copy paths (which assume guest_ram is mapped HERE).
+    proc_mem_regions: Vec<(u64, u64, u64)>,
     /// Guest-RAM host ranges `(host_va, len)` this backend pinned via
     /// `cuMemHostRegister` (to unregister on drop). Excludes ranges another
     /// connection already owns. Empty until the first zero-copy transfer.
@@ -497,6 +507,8 @@ impl GpuBackend {
                 cublaslt: None,
                 cudnn_bn: None,
                 guest_ram: Vec::new(),
+                proc_mem: None,
+                proc_mem_regions: Vec::new(),
                 registered: Vec::new(),
                 guest_ram_pin_tried: false,
                 staging: (0, 0),
@@ -768,6 +780,31 @@ impl Backend for GpuBackend {
         self.guest_ram = regions;
     }
 
+    fn set_guest_ram_procmem(&mut self, pid: u32, regions: Vec<(u64, u64, u64)>) -> bool {
+        // Only install the clone regions if we can actually open its /proc/mem.
+        // Their host VAs live in the CLONE's address space, so without proc_mem
+        // the normal GPA path would deref foreign pointers — leave guest_ram
+        // empty on failure so memcpy_gpa returns NOT_FOUND and the shim falls
+        // back to the (safe) ring-copy path instead.
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(format!("/proc/{pid}/mem"))
+        {
+            Ok(f) => {
+                self.proc_mem = Some(f);
+                self.proc_mem_regions = regions;
+                true
+            }
+            Err(e) => {
+                eprintln!(
+                    "clone-worker: /proc/{pid}/mem open failed ({e}); proc-mem off, ring copy"
+                );
+                false
+            }
+        }
+    }
+
     fn gpa_to_hva(&mut self, gpa: u64, len: u64) -> Option<u64> {
         self.guest_ram.iter().find_map(|&(gs, hva, rlen)| {
             (gpa >= gs && gpa.checked_add(len)? <= gs + rlen).then(|| hva + (gpa - gs))
@@ -872,6 +909,10 @@ impl Backend for GpuBackend {
     }
 
     fn memcpy_gpa_htod(&mut self, dptr: u64, segments: &[(u64, u64)], stream: u64) -> CuResult<()> {
+        if self.proc_mem.is_some() {
+            self.wait_stream(stream)?;
+            return self.gpa_procmem(dptr, segments, false);
+        }
         if self.guest_ram.is_empty() {
             return Err(super::CUDA_ERROR_NOT_FOUND);
         }
@@ -931,6 +972,10 @@ impl Backend for GpuBackend {
     }
 
     fn memcpy_gpa_dtoh(&mut self, dptr: u64, segments: &[(u64, u64)], stream: u64) -> CuResult<()> {
+        if self.proc_mem.is_some() {
+            self.wait_stream(stream)?;
+            return self.gpa_procmem(dptr, segments, true);
+        }
         if self.guest_ram.is_empty() {
             return Err(super::CUDA_ERROR_NOT_FOUND);
         }
@@ -2806,6 +2851,76 @@ fn vmm_prop(device: i32) -> VmmProp {
 }
 
 impl GpuBackend {
+    /// CLONE transport: move `total` bytes between the GPU (`dptr`) and the
+    /// clone's LIVE guest RAM via /proc/<pid>/mem + pinned staging. `to_guest`:
+    /// D2H (GPU -> pwrite guest); else H2D (pread guest -> GPU).
+    fn gpa_procmem(&mut self, dptr: u64, segments: &[(u64, u64)], to_guest: bool) -> CuResult<()> {
+        let total: u64 = segments.iter().map(|(_, l)| *l).sum();
+        if total == 0 {
+            return Ok(());
+        }
+        let stg = self
+            .ensure_staging(total as usize)
+            .ok_or(super::CUDA_ERROR_NOT_FOUND)?;
+        let memfd = {
+            use std::os::unix::io::AsRawFd as _;
+            self.proc_mem
+                .as_ref()
+                .ok_or(super::CUDA_ERROR_NOT_FOUND)?
+                .as_raw_fd()
+        };
+        let dtoh = self.memcpy_dtoh;
+        let htod = self.memcpy_htod;
+        // Resolve each segment's clone host VA (immutable read of guest_ram).
+        let mut resolved: Vec<(u64, u64, u64)> = Vec::with_capacity(segments.len());
+        let mut off = 0u64;
+        for &(gpa, len) in segments {
+            let hva = self
+                .proc_mem_regions
+                .iter()
+                .find_map(|&(gs, h, rl)| {
+                    (gpa >= gs && gpa.checked_add(len)? <= gs + rl).then(|| h + (gpa - gs))
+                })
+                .ok_or(super::CUDA_ERROR_INVALID_HANDLE)?;
+            resolved.push((hva, off, len));
+            off += len;
+        }
+        if to_guest {
+            // D2H: one DMA GPU -> staging, then pwrite each segment into the clone.
+            unsafe { chk(dtoh(stg as *mut c_void, dptr, total as usize))? };
+            for (hva, o, len) in resolved {
+                let r = unsafe {
+                    libc::pwrite(
+                        memfd,
+                        stg.add(o as usize) as *const c_void,
+                        len as usize,
+                        hva as i64,
+                    )
+                };
+                if r < 0 || r as u64 != len {
+                    return Err(super::CUDA_ERROR_INVALID_HANDLE);
+                }
+            }
+        } else {
+            // H2D: pread each segment from the clone into staging, then one DMA.
+            for (hva, o, len) in resolved {
+                let r = unsafe {
+                    libc::pread(
+                        memfd,
+                        stg.add(o as usize) as *mut c_void,
+                        len as usize,
+                        hva as i64,
+                    )
+                };
+                if r < 0 || r as u64 != len {
+                    return Err(super::CUDA_ERROR_INVALID_HANDLE);
+                }
+            }
+            unsafe { chk(htod(dptr, stg as *const c_void, total as usize))? };
+        }
+        Ok(())
+    }
+
     /// Order a blocking copy after prior work on `stream`. Torch creates its
     /// pool streams non-blocking, so the NULL-stream blocking `cuMemcpy*` our
     /// copies use does NOT wait for them — without this wait, a stream-ordered

@@ -327,7 +327,11 @@ pub fn run(sock: &Path) -> io::Result<()> {
                                         // are rejected; a golden's reconnect (token, no
                                         // preamble) falls through to in-daemon serving.
                                         let rdir = consume_ring_dir_preamble(s.as_raw_fd());
-                                        if route_clone_connection(s.as_raw_fd(), rdir.as_deref()) {
+                                        if route_clone_connection(
+                                            s.as_raw_fd(),
+                                            rdir.as_deref(),
+                                            None,
+                                        ) {
                                             drop(s); // worker owns it / rejected
                                             continue;
                                         }
@@ -370,7 +374,8 @@ pub fn run(sock: &Path) -> io::Result<()> {
                     use std::os::unix::io::AsRawFd;
                     let ram = consume_ram_preamble(stream.as_raw_fd());
                     let rdir = consume_ring_dir_preamble(stream.as_raw_fd());
-                    if route_clone_connection(stream.as_raw_fd(), rdir.as_deref()) {
+                    let procmem = consume_procmem_preamble(stream.as_raw_fd());
+                    if route_clone_connection(stream.as_raw_fd(), rdir.as_deref(), procmem) {
                         drop(stream); // worker owns it / rejected
                         continue;
                     }
@@ -419,6 +424,98 @@ fn spawn_serve<S>(
             }
         })
         .ok();
+}
+
+/// Consume a fork-CLONE proc-mem advertisement (`SMVGPVM1`) if present: the
+/// clone proxy sends `(pid, gpa, host_va, len)` for its LIVE private (COW) guest
+/// RAM after its clone preamble, so the worker can pread/pwrite /proc/<pid>/mem
+/// (a memfd map would be STALE golden bytes). Peek-based; `None` on any old proxy
+/// or golden connection (leaves the bytes untouched for the RPC serve loop).
+/// A fork clone's live-RAM advert: its pid + (gpa, host_va, len) regions.
+type ProcMemAdvert = (u32, Vec<(u64, u64, u64)>);
+
+/// Serialize a proc-mem advert into the worker env value (see `procmem_from_env`).
+fn procmem_to_env(pid: u32, regions: &[(u64, u64, u64)]) -> String {
+    let mut out = pid.to_string();
+    for (g, h, l) in regions {
+        out.push_str(&format!(";{g},{h},{l}"));
+    }
+    out
+}
+
+/// Parse the `SMOLVM_CUDA_CLONE_PROCMEM` worker env back into a proc-mem advert.
+fn procmem_from_env() -> Option<ProcMemAdvert> {
+    let v = std::env::var("SMOLVM_CUDA_CLONE_PROCMEM").ok()?;
+    let mut it = v.split(';');
+    let pid: u32 = it.next()?.parse().ok()?;
+    let mut regions = Vec::new();
+    for part in it {
+        let mut c = part.split(',');
+        let g: u64 = c.next()?.parse().ok()?;
+        let h: u64 = c.next()?.parse().ok()?;
+        let l: u64 = c.next()?.parse().ok()?;
+        regions.push((g, h, l));
+    }
+    (!regions.is_empty()).then_some((pid, regions))
+}
+
+fn consume_procmem_preamble(fd: std::os::unix::io::RawFd) -> Option<ProcMemAdvert> {
+    let mut hdr = [0u8; 20];
+    let mut n = 0isize;
+    for _ in 0..200 {
+        n = unsafe {
+            libc::recv(
+                fd,
+                hdr.as_mut_ptr() as *mut libc::c_void,
+                hdr.len(),
+                libc::MSG_PEEK,
+            )
+        };
+        if n >= 8 && &hdr[..8] != b"SMVGPVM1" {
+            return None; // not ours; leave the bytes untouched
+        }
+        if n >= 20 || n == 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    if n < 20 || &hdr[..8] != b"SMVGPVM1" {
+        return None;
+    }
+    let pid = u32::from_le_bytes(hdr[8..12].try_into().unwrap());
+    let count = u32::from_le_bytes(hdr[12..16].try_into().unwrap()) as usize;
+    if count == 0 || count > 64 {
+        return None;
+    }
+    let total = 20 + count * 24;
+    let mut buf = vec![0u8; total];
+    let mut got = 0usize;
+    while got < total {
+        let r = unsafe {
+            libc::recv(
+                fd,
+                buf[got..].as_mut_ptr() as *mut libc::c_void,
+                total - got,
+                0,
+            )
+        };
+        if r <= 0 {
+            return None;
+        }
+        got += r as usize;
+    }
+    let mut regions = Vec::with_capacity(count);
+    for i in 0..count {
+        let o = 20 + i * 24;
+        let gpa = u64::from_le_bytes(buf[o..o + 8].try_into().unwrap());
+        let hva = u64::from_le_bytes(buf[o + 8..o + 16].try_into().unwrap());
+        let len = u64::from_le_bytes(buf[o + 16..o + 24].try_into().unwrap());
+        if len == 0 {
+            return None;
+        }
+        regions.push((gpa, hva, len));
+    }
+    Some((pid, regions))
 }
 
 /// Consume a guest-RAM advertisement preamble if present (peek-based; absent on
@@ -638,6 +735,24 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     let _ = backend.primary_ctx_retain(clone_dev);
+    // Clone transport: consume the proc-mem advert (SMVGPVM1) the clone proxy
+    // sent right after its clone preamble, so D2H/H2D reach the clone's LIVE
+    // guest RAM via /proc/<pid>/mem instead of the ring-copy fallback.
+    if let Some((pid, regions)) = procmem_from_env() {
+        let n = regions.len();
+        if backend.set_guest_ram_procmem(pid, regions) {
+            tracing::info!(
+                pid,
+                count = n,
+                "cuda clone-worker: proc-mem live-RAM transport enabled"
+            );
+        } else {
+            tracing::warn!(
+                pid,
+                "cuda clone-worker: proc-mem unavailable; ring-copy fallback"
+            );
+        }
+    }
     // Seed state for late-attached guest channels (see the attach listener
     // below): each attached channel serves on its own thread, and every
     // translation table is thread-local — new threads must be seeded with
@@ -786,6 +901,9 @@ fn serve_attached_channel(
     let mut backend = make_backend();
     let _ = backend.init();
     let _ = backend.primary_ctx_retain(dev);
+    if let Some((pid, regions)) = procmem_from_env() {
+        backend.set_guest_ram_procmem(pid, regions);
+    }
     // File-ring transport: attached channels serve on their own threads, and
     // the ring dir is per-worker (thread-local install per serve thread).
     smolvm_cuda::host::ring_dir_set(std::env::var("SMOLVM_CUDA_CLONE_RING_DIR").ok());
@@ -1407,7 +1525,11 @@ fn clone_worker_registry() -> &'static Mutex<std::collections::HashMap<(u64, u64
 /// token-bearing Init WITHOUT the preamble must resume in-daemon (a worker
 /// would silently serve it a reconstructed COPY of its memory).
 #[cfg(unix)]
-fn route_clone_connection(fd: std::os::unix::io::RawFd, ring_dir: Option<&str>) -> bool {
+fn route_clone_connection(
+    fd: std::os::unix::io::RawFd,
+    ring_dir: Option<&str>,
+    procmem: Option<ProcMemAdvert>,
+) -> bool {
     let Some((clone_id, flags)) = consume_clone_preamble(fd) else {
         return false;
     };
@@ -1439,7 +1561,7 @@ fn route_clone_connection(fd: std::os::unix::io::RawFd, ring_dir: Option<&str>) 
             );
             return false;
         };
-        match spawn_clone_worker(fd, token, share_weights, ring_dir) {
+        match spawn_clone_worker(fd, token, share_weights, ring_dir, procmem.clone()) {
             Ok((pid, ctrl)) => {
                 reg.insert((token, clone_id), (pid, ctrl));
                 tracing::info!(
@@ -1583,7 +1705,7 @@ fn route_clone_connection(fd: std::os::unix::io::RawFd, ring_dir: Option<&str>) 
             }
         }
     }
-    match spawn_clone_worker(fd, token, share_weights, ring_dir) {
+    match spawn_clone_worker(fd, token, share_weights, ring_dir, procmem.clone()) {
         Ok((pid, ctrl)) => {
             reg.insert((token, clone_id), (pid, ctrl));
             tracing::info!(
@@ -1812,6 +1934,7 @@ fn spawn_clone_worker(
     token: u64,
     share_weights: bool,
     ring_dir: Option<&str>,
+    procmem: Option<ProcMemAdvert>,
 ) -> io::Result<(u32, std::os::unix::io::RawFd)> {
     use std::os::unix::process::CommandExt;
     // Gather the golden's VMM layout (reservations + maps→physical handle).
@@ -2052,6 +2175,11 @@ fn spawn_clone_worker(
     cmd.env("SMOLVM_CUDA_CLONE_LAYOUT", layout);
     cmd.env("SMOLVM_CUDA_CLONE_DEVICE", golden_dev.to_string());
     cmd.env("SMOLVM_CUDA_CLONE_CTRL", ctrl_slot.to_string());
+    // Clone live-RAM transport: hand the worker our (pid, gpa, host_va, len) so
+    // it can pread/pwrite /proc/<pid>/mem for D2H/H2D instead of ring-copying.
+    if let Some((pid, regions)) = &procmem {
+        cmd.env("SMOLVM_CUDA_CLONE_PROCMEM", procmem_to_env(*pid, regions));
+    }
     if let Some(rd) = ring_dir {
         // File-ring transport: the worker resolves RingSetupFile names
         // against the clone VM's advertised host ring dir.

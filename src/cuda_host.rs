@@ -335,6 +335,36 @@ fn proxy_to_daemon(guest: crate::platform::uds::UdsStream, addr: &str) -> std::i
     fn guest_ram_advert() -> Option<Vec<u8>> {
         None
     }
+    /// Fork-CLONE proc-mem advertisement: the clone maps the golden's guest-RAM
+    /// memfd MAP_PRIVATE (COW), so it can't be memfd-advertised (its live pages
+    /// have diverged). Instead advertise our (pid, gpa, host_va, len) so the clone
+    /// worker reads our LIVE pages via /proc/<pid>/mem. Emitted only for clones
+    /// (right after the clone preamble); the golden uses the memfd advert above.
+    #[cfg(target_os = "linux")]
+    fn guest_ram_procmem_advert() -> Option<Vec<u8>> {
+        if std::env::var_os("SMOLVM_CUDA_NO_RAM_ADVERT").is_some() {
+            return None;
+        }
+        let regions = GUEST_RAM.get().and_then(|f| f())?; // (gpa, host_va, len)
+        if regions.is_empty() {
+            return None;
+        }
+        let mut p = Vec::with_capacity(20 + regions.len() * 24);
+        p.extend_from_slice(b"SMVGPVM1");
+        p.extend_from_slice(&std::process::id().to_le_bytes());
+        p.extend_from_slice(&(regions.len() as u32).to_le_bytes());
+        p.extend_from_slice(&[0u8; 4]); // reserved
+        for (gpa, hva, len) in regions {
+            p.extend_from_slice(&gpa.to_le_bytes());
+            p.extend_from_slice(&hva.to_le_bytes());
+            p.extend_from_slice(&len.to_le_bytes());
+        }
+        Some(p)
+    }
+    #[cfg(not(target_os = "linux"))]
+    fn guest_ram_procmem_advert() -> Option<Vec<u8>> {
+        None
+    }
     // A path (managed daemon) → unix socket; otherwise host:port → TCP.
     if addr.starts_with('/') {
         #[cfg(unix)]
@@ -346,6 +376,17 @@ fn proxy_to_daemon(guest: crate::platform::uds::UdsStream, addr: &str) -> std::i
             }
             if let Some(r) = ring_dir_advert() {
                 daemon.write_all(&r)?;
+            }
+            // Clone: advertise our LIVE private RAM BEFORE the clone preamble
+            // so the daemon consumes it as an accept-loop preamble (like the
+            // SMVGRAM2 memfd advert) and passes it to the worker via env. It must
+            // NOT sit between the clone preamble and the RPC Init, where
+            // peek_clone_token would read it as the routing frame and misroute
+            // the clone. Gated on preamble() so a golden never emits it.
+            if preamble().is_some() {
+                if let Some(pm) = guest_ram_procmem_advert() {
+                    daemon.write_all(&pm)?;
+                }
             }
             if let Some(p) = preamble() {
                 daemon.write_all(&p)?;

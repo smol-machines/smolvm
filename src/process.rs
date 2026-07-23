@@ -309,8 +309,20 @@ pub fn harden_self() {
         // RLIMIT_CORE=0 below still prevents a core dump from leaking the
         // golden's RAM, so only same-uid /proc access + ptrace are relaxed —
         // acceptable for a fork pool whose clones legitimately share its memory.
-        if std::env::var_os("SMOLVM_FORKABLE").is_none() {
+        // A forkable golden OR a CUDA fork clone must stay dumpable so the
+        // same-uid daemon/worker can reach its guest RAM (the golden's memfd via
+        // /proc/<pid>/fd; a clone's LIVE pages via /proc/<pid>/mem). Everything
+        // else hardens to dumpable=0 (root-owned /proc, no cross-VM RAM read).
+        if std::env::var_os("SMOLVM_FORKABLE").is_none()
+            && std::env::var_os("SMOLVM_CUDA_CLONE_PTRACEABLE").is_none()
+        {
             libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+        } else {
+            // Also allow the same-uid clone worker (a child of the daemon, NOT of
+            // this VM) to pread /proc/<pid>/mem under yama ptrace_scope=1, so the
+            // proc-mem live-RAM transport works. Single-tenant: same-uid exposure
+            // is within the trust model.
+            libc::prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
         }
     }
     // RLIMIT_CORE=0: never write a core dump (which would contain guest RAM).
@@ -325,6 +337,15 @@ pub fn harden_self() {
     }
 }
 
+/// `PR_SET_PTRACER` / `PR_SET_PTRACER_ANY` (yama LSM; absent from the `libc`
+/// crate). Opting in lets any same-uid process pread `/proc/<pid>/mem` under
+/// `ptrace_scope=1` — used so a forkable VM's CUDA clone workers (children of
+/// the daemon, not of the VM) can reach its live guest RAM.
+#[cfg(target_os = "linux")]
+const PR_SET_PTRACER: libc::c_int = 0x5961_6d61;
+#[cfg(target_os = "linux")]
+const PR_SET_PTRACER_ANY: libc::c_ulong = !0;
+
 /// (Re)assert the process's `PR_SET_DUMPABLE` flag.
 ///
 /// `setuid()` clears dumpable, after which `ptrace_may_access` denies even a
@@ -335,7 +356,15 @@ pub fn harden_self() {
 /// exactly its clones) can reach it. Linux-only; no-op elsewhere.
 #[cfg(target_os = "linux")]
 pub fn set_dumpable(dumpable: bool) {
-    unsafe { libc::prctl(libc::PR_SET_DUMPABLE, i32::from(dumpable), 0, 0, 0) };
+    unsafe {
+        libc::prctl(libc::PR_SET_DUMPABLE, i32::from(dumpable), 0, 0, 0);
+        // Re-assert the yama ptracer opt-in whenever we go dumpable (setuid can
+        // reset process attributes): a forkable clone re-asserts this after its
+        // per-VM uid drop so its CUDA clone worker keeps /proc/<pid>/mem access.
+        if dumpable {
+            libc::prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
+        }
+    }
 }
 
 /// No-op where `prctl` isn't applicable (macOS dev).
