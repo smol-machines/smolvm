@@ -1306,6 +1306,7 @@ fn xlat_mod(b: &mut dyn Backend, golden: u64) -> u64 {
                 .unwrap()
                 .get_or_insert_with(HashMap::new)
                 .insert(golden, w);
+            worker_module_register(w);
             w
         }
         Err(e) => {
@@ -2528,6 +2529,37 @@ static REPLAYED_EXECS: std::sync::Mutex<Option<HashMap<u64, u64>>> = std::sync::
 /// clone worker owns exactly one CUDA context.
 static MOD_TRANS_GLOBAL: std::sync::Mutex<Option<HashMap<u64, u64>>> = std::sync::Mutex::new(None);
 
+/// Handles of modules THIS worker process loaded into ITS OWN context, across
+/// every channel. A `ModuleUnload` whose resolved handle is NOT in here is a
+/// module the worker never created — a golden-/foreign-context module the clone
+/// inherited via COW guest RAM (or one already freed) — and `cuModuleUnload`
+/// would deref a pointer valid only in another context, SIGSEGV-ing the driver.
+/// Process-global (not per-session) so a module loaded on one channel unloads
+/// correctly from another (no leak) while foreign handles are never touched.
+static WORKER_MODULES: std::sync::Mutex<Option<std::collections::HashSet<u64>>> =
+    std::sync::Mutex::new(None);
+
+/// Record a module this worker just loaded in its own context.
+fn worker_module_register(raw: u64) {
+    WORKER_MODULES
+        .lock()
+        .unwrap()
+        .get_or_insert_with(std::collections::HashSet::new)
+        .insert(raw);
+}
+
+/// Claim ownership of `raw` for unload: returns true (and forgets it, so a later
+/// double-unload is a safe no-op) iff this worker created it; false for foreign
+/// handles, which must NOT be passed to `cuModuleUnload`.
+fn worker_module_take(raw: u64) -> bool {
+    WORKER_MODULES
+        .lock()
+        .unwrap()
+        .as_mut()
+        .map(|s| s.remove(&raw))
+        .unwrap_or(false)
+}
+
 /// Process-global copies of the lazy-resolve INPUTS (module images + function
 /// metadata). The thread-local copies are seeded per serving thread; a channel
 /// served on an unseeded thread previously fell through the lazy paths and
@@ -3109,6 +3141,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 let _ = std::fs::write(&p, &image);
             }
             let raw = b.module_load_data(&image)?;
+            worker_module_register(raw);
             sess.owned_modules.insert(raw);
             // Feed the process-wide image cache so later replicas can load by
             // hash without re-shipping the bytes (LibCall 6/1).
@@ -3140,7 +3173,14 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         }
         Request::ModuleUnload { module } => {
             let raw_mod = raw_module(sess, b, module);
-            b.module_unload(raw_mod)?;
+            // Only unload a module THIS worker created (WORKER_MODULES). A handle
+            // it doesn't own is a foreign/golden-context module inherited via COW
+            // (or already freed); cuModuleUnload would deref it in the wrong
+            // context and SIGSEGV the driver. Skipping is correct — the worker
+            // never allocated it, and its own modules are freed on ctx teardown.
+            if worker_module_take(raw_mod) {
+                b.module_unload(raw_mod)?;
+            }
             sess.owned_modules.remove(&raw_mod);
             sess.modules.remove(&module);
             Ok(Response::Ok)
@@ -3655,6 +3695,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 };
                 if let Some(image) = module_cache_get(&key) {
                     let raw = b.module_load_data(&image)?;
+                    worker_module_register(raw);
                     sess.owned_modules.insert(raw);
                     if path3_enabled() {
                         sess.golden_layout
