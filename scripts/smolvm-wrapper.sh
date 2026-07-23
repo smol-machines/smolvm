@@ -39,6 +39,29 @@ if [[ ! -x "$SMOLVM_BIN" ]]; then
     exit 1
 fi
 
+# Check GLIBC compatibility on Linux
+if [[ "$(uname -s)" == "Linux" ]]; then
+    # Extract the maximum required GLIBC version from the binary
+    REQUIRED_GLIBC=$(objdump -T "$SMOLVM_BIN" 2>/dev/null | grep -oP 'GLIBC_\d+\.\d+' | sort -V | tail -1 | sed 's/GLIBC_//')
+    if [[ -n "$REQUIRED_GLIBC" ]]; then
+        # Get the system GLIBC version
+        SYSTEM_GLIBC=$(ldd --version 2>&1 | head -1 | grep -oP '\d+\.\d+' | head -1)
+        if [[ -n "$SYSTEM_GLIBC" ]]; then
+            # Compare versions
+            if [[ "$(printf '%s\n' "$REQUIRED_GLIBC" "$SYSTEM_GLIBC" | sort -V | tail -1)" != "$SYSTEM_GLIBC" ]]; then
+                echo "Error: smolvm requires GLIBC >= $REQUIRED_GLIBC but your system has GLIBC $SYSTEM_GLIBC" >&2
+                echo "" >&2
+                echo "This typically happens on older Linux distributions (e.g., Ubuntu 22.04)." >&2
+                echo "To resolve:" >&2
+                echo "  1. Upgrade to Ubuntu 24.04 or newer, or" >&2
+                echo "  2. Build smolvm from source: https://github.com/smol-machines/smolvm#building-from-source" >&2
+                echo "  3. Use the smolvm Docker image: docker run --rm -it --privileged smolmachines/smolvm" >&2
+                exit 1
+            fi
+        fi
+    fi
+fi
+
 # Check if libraries exist
 if [[ ! -d "$SMOLVM_LIB" ]]; then
     echo "Error: library directory not found at $SMOLVM_LIB" >&2
