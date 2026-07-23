@@ -274,7 +274,10 @@ fn verify_parent_within_dest(path: &Path, real_dest: &Path) -> std::io::Result<(
 /// `lib/libkrun.dylib → /tmp/evil.so`, and subsequent `dlopen()` would
 /// load the attacker's library. This function rejects any entry that is
 /// not a regular file or directory.
-fn safe_unpack<R: Read>(archive: &mut tar::Archive<R>, dest: &Path) -> std::io::Result<()> {
+pub(crate) fn safe_unpack<R: Read>(
+    archive: &mut tar::Archive<R>,
+    dest: &Path,
+) -> std::io::Result<()> {
     safe_unpack_with_limits(archive, dest, &SafeUnpackLimits::from_env())
 }
 

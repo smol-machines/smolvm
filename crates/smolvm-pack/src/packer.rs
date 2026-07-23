@@ -858,7 +858,7 @@ mod tests {
 
         // Add a fake layer (digest must be at least 12 chars after sha256:)
         collector
-            .add_layer("sha256:embedded123456", b"embedded layer content")
+            .add_layer("sha256:beefcafe1234", b"embedded layer content")
             .unwrap();
 
         // Create manifest
@@ -879,7 +879,7 @@ mod tests {
         // Verify we can read the manifest with layer info
         let manifest = read_manifest(&output_path).unwrap();
         assert_eq!(manifest.assets.layers.len(), 1);
-        assert_eq!(manifest.assets.layers[0].digest, "sha256:embedded123456");
+        assert_eq!(manifest.assets.layers[0].digest, "sha256:beefcafe1234");
 
         // Verify footer indicates embedded mode
         let footer = read_footer(&output_path).unwrap();
@@ -890,7 +890,7 @@ mod tests {
         let extract_dir = temp_dir.path().join("extracted");
         extract_assets(&output_path, &extract_dir).unwrap();
 
-        let layer_file = extract_dir.join("layers/embedded1234.tar"); // First 12 chars
+        let layer_file = extract_dir.join("layers/beefcafe1234.tar"); // First 12 chars
         assert!(layer_file.exists());
         assert_eq!(
             fs::read_to_string(&layer_file).unwrap(),

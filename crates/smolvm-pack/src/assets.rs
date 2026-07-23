@@ -664,8 +664,12 @@ pub fn decompress_assets(compressed: &[u8], output_dir: &Path) -> Result<()> {
         .map_err(|e| PackError::Compression(e.to_string()))?;
     let mut archive = tar::Archive::new(decoder);
 
-    archive
-        .unpack(output_dir)
+    // Route through safe_unpack (not the raw tar `unpack`): a pulled pack's
+    // asset blob is untrusted, and its libs are later dlopen'd — the raw path
+    // would create escaping symlinks (e.g. `lib/libkrun → /tmp/evil.so`) and
+    // has no entry/size caps. safe_unpack rejects symlinks/hardlinks/traversal
+    // and bounds the extraction.
+    crate::extract::safe_unpack(&mut archive, output_dir)
         .map_err(|e| PackError::Tar(e.to_string()))?;
 
     Ok(())
@@ -680,8 +684,9 @@ pub fn decompress_assets_from_file(compressed_path: &Path, output_dir: &Path) ->
         zstd::stream::Decoder::new(file).map_err(|e| PackError::Compression(e.to_string()))?;
     let mut archive = tar::Archive::new(decoder);
 
-    archive
-        .unpack(output_dir)
+    // See decompress_assets: use safe_unpack so an untrusted pack can't plant
+    // escaping symlinks or blow past the resource caps.
+    crate::extract::safe_unpack(&mut archive, output_dir)
         .map_err(|e| PackError::Tar(e.to_string()))?;
 
     Ok(())
@@ -736,6 +741,34 @@ pub fn crc32_file_range(path: &Path, offset: u64, size: u64) -> Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A pulled pack's asset blob is untrusted; decompress must go through
+    // safe_unpack, which rejects a symlink that escapes the output dir (the raw
+    // tar `unpack` would create it, enabling a `lib/... -> /evil` dlopen swap).
+    #[test]
+    fn decompress_assets_rejects_escaping_symlink() {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header.set_mode(0o777);
+        builder
+            .append_link(&mut header, "evil", "../../../../../../etc/passwd")
+            .unwrap();
+        let tar_bytes = builder.into_inner().unwrap();
+        let compressed = zstd::encode_all(&tar_bytes[..], ZSTD_LEVEL).unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out");
+        assert!(
+            decompress_assets(&compressed, &out).is_err(),
+            "escaping symlink must be rejected"
+        );
+        assert!(
+            std::fs::symlink_metadata(out.join("evil")).is_err(),
+            "no escaping symlink should be created"
+        );
+    }
 
     #[test]
     fn digest_to_filename_rejects_path_traversal() {

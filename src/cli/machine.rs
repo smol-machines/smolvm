@@ -164,6 +164,43 @@ fn parse_published_sockets(
             ));
         }
     }
+    // Endpoints a bridge *creates* must be unique, or one silently clobbers
+    // another at launch (the listener file is removed and re-bound). An `expose`
+    // socket has the host create the listener — at the explicit host path, or the
+    // guest basename in the per-VM dir when defaulted — so two exposes that
+    // resolve to the same host file collide. A `mount` socket has the guest
+    // create the listener at its guest path, so two mounts on one guest path
+    // collide.
+    let mut host_listeners = std::collections::HashSet::new();
+    let mut guest_listeners = std::collections::HashSet::new();
+    for s in &out {
+        if s.direction.host_listens() {
+            let key = match &s.host_path {
+                Some(h) => h.clone(),
+                None => std::path::Path::new(&s.guest_path)
+                    .file_name()
+                    .map(|b| b.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "published.sock".to_string()),
+            };
+            if !host_listeners.insert(key.clone()) {
+                return Err(smolvm::Error::config(
+                    "expose-socket",
+                    format!(
+                        "two exposed sockets resolve to the same host endpoint '{key}'; \
+                         give distinct host paths as GUEST_PATH:HOST_PATH"
+                    ),
+                ));
+            }
+        } else if !guest_listeners.insert(s.guest_path.clone()) {
+            return Err(smolvm::Error::config(
+                "mount-socket",
+                format!(
+                    "two mounted sockets resolve to the same guest path '{}'",
+                    s.guest_path
+                ),
+            ));
+        }
+    }
     Ok(out)
 }
 
@@ -1785,6 +1822,44 @@ mod tests {
         assert!(parse_published_sockets(&[], &["/only-host".to_string()]).is_err());
         assert!(parse_published_sockets(&[":/tmp/h.sock".to_string()], &[]).is_err());
         assert!(parse_published_sockets(&["/run/a;b.sock".to_string()], &[]).is_err());
+    }
+
+    #[test]
+    fn parse_published_sockets_rejects_colliding_endpoints() {
+        // Two exposes whose default host paths share a basename collide on the
+        // host (both land at <per-vm-dir>/api.sock).
+        assert!(parse_published_sockets(
+            &["/run/a/api.sock".to_string(), "/run/b/api.sock".to_string()],
+            &[],
+        )
+        .is_err());
+        // Two exposes pinned to the same explicit host path collide.
+        assert!(parse_published_sockets(
+            &[
+                "/run/a.sock:/tmp/h.sock".to_string(),
+                "/run/b.sock:/tmp/h.sock".to_string(),
+            ],
+            &[],
+        )
+        .is_err());
+        // Two mounts targeting the same guest path collide in the guest.
+        assert!(parse_published_sockets(
+            &[],
+            &[
+                "/run/h1.sock:/run/g.sock".to_string(),
+                "/run/h2.sock:/run/g.sock".to_string(),
+            ],
+        )
+        .is_err());
+        // Same basename but distinct pinned host paths is fine (no collision).
+        assert!(parse_published_sockets(
+            &[
+                "/run/a/api.sock:/tmp/a-api.sock".to_string(),
+                "/run/b/api.sock:/tmp/b-api.sock".to_string(),
+            ],
+            &[],
+        )
+        .is_ok());
     }
 
     #[test]
