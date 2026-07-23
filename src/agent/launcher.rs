@@ -771,19 +771,39 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     // null-terminated array.
                     let mut all_cidrs = resources.allowed_cidrs.clone().unwrap_or_default();
                     crate::data::network::ensure_dns_in_cidrs(&mut all_cidrs);
-                    let cidr_cstrings: Vec<CString> = all_cidrs
+                    let cidr_cstrings: Vec<CString> = match all_cidrs
                         .iter()
-                        .map(|c| CString::new(c.as_str()).expect("CIDR cannot contain null bytes"))
-                        .collect();
+                        .map(|c| CString::new(c.as_str()))
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                    {
+                        Ok(v) => v,
+                        Err(_) => {
+                            krun_free_ctx(ctx);
+                            return Err(Error::agent(
+                                "set egress policy",
+                                "allow-CIDR contains an interior NUL byte",
+                            ));
+                        }
+                    };
                     let mut cidr_ptrs: Vec<*const libc::c_char> =
                         cidr_cstrings.iter().map(|s| s.as_ptr()).collect();
                     cidr_ptrs.push(std::ptr::null());
 
                     // Allow-host list + trusted resolver, only when hosts are set.
-                    let host_cstrings: Vec<CString> = egress_hosts
+                    let host_cstrings: Vec<CString> = match egress_hosts
                         .iter()
-                        .map(|h| CString::new(h.as_str()).expect("host cannot contain null bytes"))
-                        .collect();
+                        .map(|h| CString::new(h.as_str()))
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                    {
+                        Ok(v) => v,
+                        Err(_) => {
+                            krun_free_ctx(ctx);
+                            return Err(Error::agent(
+                                "set egress policy",
+                                "allow-host contains an interior NUL byte",
+                            ));
+                        }
+                    };
                     let mut host_ptrs: Vec<*const libc::c_char> =
                         host_cstrings.iter().map(|s| s.as_ptr()).collect();
                     host_ptrs.push(std::ptr::null());
