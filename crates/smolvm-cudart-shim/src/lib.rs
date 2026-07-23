@@ -412,7 +412,7 @@ fn ring_alloc_pages(pages: usize) -> Option<(Vec<*mut u8>, Vec<u64>)> {
     let base = guestmem::alloc(pages * PAGE)? as usize;
     // Zero (also faults every page in before pagemap reads).
     unsafe { std::ptr::write_bytes(base as *mut u8, 0, pages * PAGE) };
-    let segs = guestmem::segments(base, pages * PAGE)?;
+    let segs = guestmem::segments(base, pages * PAGE, false)?;
     let mut gpas = Vec::with_capacity(pages);
     for (gpa, len) in segs {
         let mut off = 0;
@@ -1067,7 +1067,7 @@ mod guestmem {
     /// SMOLVM_CUDA_ZEROCOPY): on-demand /proc/self/pagemap translation of an
     /// arbitrary (pageable) source range, so a pageable H2D also gets the
     /// zero-copy GPA path instead of slow byte-shipping through the ring.
-    pub fn segments(ptr: usize, len: usize) -> Option<Vec<(u64, u64)>> {
+    pub fn segments(ptr: usize, len: usize, writable: bool) -> Option<Vec<(u64, u64)>> {
         if len == 0 {
             return None;
         }
@@ -1099,19 +1099,28 @@ mod guestmem {
         if !enabled() {
             return None;
         }
-        segments_pagemap(ptr, len)
+        segments_pagemap(ptr, len, writable)
     }
 
     /// On-demand GPA segments for an arbitrary source range via pagemap.
-    fn segments_pagemap(ptr: usize, len: usize) -> Option<Vec<(u64, u64)>> {
+    fn segments_pagemap(ptr: usize, len: usize, writable: bool) -> Option<Vec<(u64, u64)>> {
         let first_page = ptr & !(PAGE - 1);
         let last_page = (ptr + len - 1) & !(PAGE - 1);
         let npages = (last_page - first_page) / PAGE + 1;
         // Fault every page in so pagemap reports a present frame (the H2D reads
         // these bytes anyway); a no-op for already-present real data.
         for i in 0..npages {
+            let pp = (first_page + i * PAGE) as *mut u8;
             unsafe {
-                std::ptr::read_volatile((first_page + i * PAGE) as *const u8);
+                let b = std::ptr::read_volatile(pp);
+                // A D2H destination may be an unwritten (shared read-only ZERO)
+                // page; the host writing its GPA would corrupt the shared zero
+                // page guest-wide. Force a PRIVATE, writable frame first (COW)
+                // without changing content. H2D sources stay read-only (they can
+                // be read-only mmap file pages) so we never write-fault those.
+                if writable {
+                    std::ptr::write_volatile(pp, b);
+                }
             }
         }
         let gpas = read_gpas_bulk(first_page, npages)?;
@@ -1344,7 +1353,7 @@ fn do_memcpy_inner(
                 // Zero-copy from a pinned guest buffer: ship guest-physical
                 // segments; the host reads guest RAM directly. Fall back to
                 // byte-shipping if the host can't serve it (no mapping).
-                if let Some(segs) = guestmem::segments(src as usize, n) {
+                if let Some(segs) = guestmem::segments(src as usize, n, false) {
                     if s.client.memcpy_gpa_htod(dst as u64, segs, stream).is_ok() {
                         return Ok(());
                     }
@@ -1377,7 +1386,7 @@ fn do_memcpy_inner(
                 static GPA_D2H_DEAD: std::sync::atomic::AtomicBool =
                     std::sync::atomic::AtomicBool::new(false);
                 if !GPA_D2H_DEAD.load(std::sync::atomic::Ordering::Relaxed) {
-                    if let Some(segs) = guestmem::segments(dst as usize, n) {
+                    if let Some(segs) = guestmem::segments(dst as usize, n, true) {
                         match s.client.memcpy_gpa_dtoh(src as u64, segs, stream) {
                             Ok(()) => return Ok(()),
                             Err(_) => {
