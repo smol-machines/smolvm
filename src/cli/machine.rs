@@ -1218,7 +1218,26 @@ impl RunCmd {
             expose_docker: self.docker_socket || params.docker_socket,
             dns_filter_hosts: params.dns_filter_hosts.clone(),
             packed_layers_dir,
-            extra_disks: Vec::new(),
+            extra_disks: std::env::var("SMOLVM_EXTRA_DISK")
+                .ok()
+                .into_iter()
+                .flat_map(|spec| {
+                    spec.split(',')
+                        .filter(|s| !s.is_empty())
+                        .map(|entry| {
+                            let (path, ro) = match entry.strip_suffix(":ro") {
+                                Some(p) => (p, true),
+                                None => (entry, false),
+                            };
+                            (
+                                std::path::PathBuf::from(path),
+                                ro,
+                                smolvm::data::disk::DiskFormat::Raw,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect(),
             ..Default::default()
         };
 

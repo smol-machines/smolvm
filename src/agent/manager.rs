@@ -1842,7 +1842,23 @@ impl AgentManager {
             dns_filter_hosts: features.dns_filter_hosts,
             packed_layers_dir: features.packed_layers_dir,
             pack_idmap_source,
-            extra_disks: features.extra_disks,
+            extra_disks: {
+                let mut __d = features.extra_disks;
+                if let Ok(spec) = std::env::var("SMOLVM_EXTRA_DISK") {
+                    for entry in spec.split(',').filter(|s| !s.is_empty()) {
+                        let (path, ro) = match entry.strip_suffix(":ro") {
+                            Some(p) => (p, true),
+                            None => (entry, false),
+                        };
+                        __d.push((
+                            std::path::PathBuf::from(path),
+                            ro,
+                            crate::data::disk::DiskFormat::Raw,
+                        ));
+                    }
+                }
+                __d
+            },
             pod_netns: features.pod_netns,
         };
         let config_path = self
