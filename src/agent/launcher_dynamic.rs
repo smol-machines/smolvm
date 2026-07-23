@@ -277,10 +277,14 @@ pub fn launch_agent_vm_dynamic(
                     let mut all_cidrs = cidrs.clone();
                     crate::data::network::ensure_dns_in_cidrs(&mut all_cidrs);
 
-                    let cidr_cstrings: Vec<CString> = all_cidrs
+                    let cidr_cstrings: Vec<CString> = match all_cidrs
                         .iter()
-                        .map(|c| CString::new(c.as_str()).expect("CIDR cannot contain null bytes"))
-                        .collect();
+                        .map(|c| CString::new(c.as_str()))
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                    {
+                        Ok(v) => v,
+                        Err(_) => free_ctx_on_err!("allow-CIDR contains an interior NUL byte"),
+                    };
                     let mut cidr_ptrs: Vec<*const libc::c_char> =
                         cidr_cstrings.iter().map(|s| s.as_ptr()).collect();
                     cidr_ptrs.push(std::ptr::null());
