@@ -1183,7 +1183,7 @@ mod guestmem {
     pub fn alloc(_: usize) -> Option<*mut u8> {
         None
     }
-    pub fn segments(_: usize, _: usize) -> Option<Vec<(u64, u64)>> {
+    pub fn segments(_: usize, _: usize, _: bool) -> Option<Vec<(u64, u64)>> {
         None
     }
     pub fn is_pinned(_: usize) -> bool {
