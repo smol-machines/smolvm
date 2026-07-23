@@ -2405,8 +2405,30 @@ fn optrace_summary(req: &Request) -> Option<String> {
             dptr, value, bytes, ..
         } => format!("MemsetD8Async dptr={dptr:#x} v={value} len={bytes:#x}"),
         Request::LaunchKernel {
-            function, params, ..
-        } => format!("Launch fn={function:#x} nparams={}", params.len()),
+            function,
+            grid,
+            block,
+            shared_bytes,
+            params,
+            ..
+        } => {
+            let args: Vec<String> = params
+                .iter()
+                .take(10)
+                .map(|a| {
+                    if a.len() >= 8 {
+                        format!("{:#x}", u64::from_le_bytes(a[..8].try_into().unwrap()))
+                    } else {
+                        format!("<{}b>", a.len())
+                    }
+                })
+                .collect();
+            format!(
+                "Launch fn={function:#x} grid={grid:?} block={block:?} smem={shared_bytes:#x} np={} args=[{}]",
+                params.len(),
+                args.join(" ")
+            )
+        }
         Request::GraphLaunch { graph_exec, .. } => format!("GraphLaunch exec={graph_exec:#x}"),
         Request::LibCall { lib, func, args } => {
             format!("LibCall lib={lib} func={func} alen={}", args.len())
@@ -2426,6 +2448,11 @@ fn optrace_summary(req: &Request) -> Option<String> {
         Request::MemSetAccess { va, size, .. } => format!("VmmAccess va={va:#x} size={size:#x}"),
         Request::MemUnmap { va, size } => format!("VmmUnmap va={va:#x} size={size:#x}"),
         Request::MemRelease { handle } => format!("VmmRelease h={handle:#x}"),
+        Request::ModuleLoadData { image } => {
+            let n = image.len();
+            let head: Vec<String> = image.iter().take(4).map(|b| format!("{b:02x}")).collect();
+            format!("ModuleLoadData len={n:#x} head={}", head.join(""))
+        }
         // Catch-all: op byte only (re-encoding is debug-run-only cost), so a
         // failing op outside the detailed set above still shows up.
         other => format!(
@@ -2435,16 +2462,36 @@ fn optrace_summary(req: &Request) -> Option<String> {
     })
 }
 
-fn optrace_write(line: &str, status: i32) {
-    if let Some(p) = std::env::var_os("SMOLVM_CUDA_OPTRACE") {
-        use std::io::Write as _;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(p)
-        {
-            let _ = writeln!(f, "pid={} {line} st={status}", std::process::id());
+fn op_ring() -> &'static std::sync::Mutex<std::collections::VecDeque<String>> {
+    static R: std::sync::OnceLock<std::sync::Mutex<std::collections::VecDeque<String>>> =
+        std::sync::OnceLock::new();
+    R.get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::with_capacity(80)))
+}
+
+fn op_ring_push(line: String) {
+    if let Ok(mut r) = op_ring().try_lock() {
+        if r.len() >= 64 {
+            r.pop_front();
         }
+        r.push_back(line);
+    }
+}
+
+pub fn op_ring_dump() {
+    if let Ok(r) = op_ring().try_lock() {
+        eprintln!(
+            "[op-ring] last {} ops before crash (oldest first):",
+            r.len()
+        );
+        for (i, l) in r.iter().enumerate() {
+            eprintln!("  [{i:02}] {l}");
+        }
+    }
+}
+
+fn optrace_write(line: &str, status: i32) {
+    if std::env::var_os("SMOLVM_CUDA_OPTRACE").is_some() {
+        op_ring_push(format!("{line} st={status}"));
     }
 }
 
@@ -2770,6 +2817,9 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
     cow_written(sess, b, &req);
     let req = translate_dptrs(&sess.dptr_trans, req);
     let trace = optrace_summary(&req);
+    if let Some(_l) = &trace {
+        optrace_write(&format!("BEGIN {_l}"), -999);
+    }
     let r: CuResult<Response> = (|| match req {
         Request::Init {
             proto_hash,
@@ -3050,6 +3100,9 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         Request::ModuleLoadData { image } => {
             // Return the raw CUmodule as the wire handle (context-scoped, so it
             // survives a fork-clone reconnect). Still tracked for reclaim.
+            if let Some(p) = std::env::var_os("SMOLVM_CUDA_DUMP_LOADING") {
+                let _ = std::fs::write(&p, &image);
+            }
             let raw = b.module_load_data(&image)?;
             sess.owned_modules.insert(raw);
             // Feed the process-wide image cache so later replicas can load by

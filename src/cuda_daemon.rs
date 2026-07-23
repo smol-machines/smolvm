@@ -227,6 +227,7 @@ pub(crate) fn install_crash_handler(role: &'static str) {
         unsafe { libc::alarm(5) };
         let role = ROLE.get().copied().unwrap_or("cuda-proc");
         eprintln!("[{role}] FATAL signal {sig}; backtrace:");
+        smolvm_cuda::host::op_ring_dump();
         eprintln!("{}", std::backtrace::Backtrace::force_capture());
         unsafe {
             libc::signal(sig, libc::SIG_DFL);
