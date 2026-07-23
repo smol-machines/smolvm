@@ -1062,31 +1062,94 @@ mod guestmem {
         Some(gpas)
     }
 
-    /// Coalesced `(gpa, len)` segments for `[ptr, ptr+len)` if it lies wholly in
-    /// a pinned buffer.
+    /// Coalesced `(gpa, len)` segments for `[ptr, ptr+len)`. Fast path: a
+    /// registered pinned buffer (precomputed frames). Fallback (opt-in via
+    /// SMOLVM_CUDA_ZEROCOPY): on-demand /proc/self/pagemap translation of an
+    /// arbitrary (pageable) source range, so a pageable H2D also gets the
+    /// zero-copy GPA path instead of slow byte-shipping through the ring.
     pub fn segments(ptr: usize, len: usize) -> Option<Vec<(u64, u64)>> {
         if len == 0 {
             return None;
         }
-        let reg = PINNED.lock().unwrap();
-        let buf = reg
-            .iter()
-            .find(|b| ptr >= b.base && ptr + len <= b.base + b.size)?;
-        let mut segs: Vec<(u64, u64)> = Vec::new();
-        let mut cur = ptr - buf.base;
-        let end = cur + len;
-        while cur < end {
-            let page_gpa = buf.page_gpas[cur / PAGE];
-            let in_page = cur % PAGE;
-            let chunk = (PAGE - in_page).min(end - cur);
-            let gpa = page_gpa + in_page as u64;
-            match segs.last_mut() {
-                Some(last) if last.0 + last.1 == gpa => last.1 += chunk as u64,
-                _ => segs.push((gpa, chunk as u64)),
+        let hit = {
+            let reg = PINNED.lock().unwrap();
+            reg.iter()
+                .find(|b| ptr >= b.base && ptr + len <= b.base + b.size)
+                .map(|buf| {
+                    let mut segs: Vec<(u64, u64)> = Vec::new();
+                    let mut cur = ptr - buf.base;
+                    let end = cur + len;
+                    while cur < end {
+                        let page_gpa = buf.page_gpas[cur / PAGE];
+                        let in_page = cur % PAGE;
+                        let chunk = (PAGE - in_page).min(end - cur);
+                        let gpa = page_gpa + in_page as u64;
+                        match segs.last_mut() {
+                            Some(last) if last.0 + last.1 == gpa => last.1 += chunk as u64,
+                            _ => segs.push((gpa, chunk as u64)),
+                        }
+                        cur += chunk;
+                    }
+                    segs
+                })
+        };
+        if let Some(segs) = hit {
+            return Some(segs);
+        }
+        if !enabled() {
+            return None;
+        }
+        segments_pagemap(ptr, len)
+    }
+
+    /// On-demand GPA segments for an arbitrary source range via pagemap.
+    fn segments_pagemap(ptr: usize, len: usize) -> Option<Vec<(u64, u64)>> {
+        let first_page = ptr & !(PAGE - 1);
+        let last_page = (ptr + len - 1) & !(PAGE - 1);
+        let npages = (last_page - first_page) / PAGE + 1;
+        // Fault every page in so pagemap reports a present frame (the H2D reads
+        // these bytes anyway); a no-op for already-present real data.
+        for i in 0..npages {
+            unsafe {
+                std::ptr::read_volatile((first_page + i * PAGE) as *const u8);
             }
-            cur += chunk;
+        }
+        let gpas = read_gpas_bulk(first_page, npages)?;
+        let mut segs: Vec<(u64, u64)> = Vec::new();
+        let mut cur = ptr;
+        let end = ptr + len;
+        while cur < end {
+            let pidx = (cur - first_page) / PAGE;
+            let in_page = (cur & (PAGE - 1)) as u64;
+            let chunk = ((PAGE - (cur & (PAGE - 1))).min(end - cur)) as u64;
+            let gpa = gpas[pidx] + in_page;
+            match segs.last_mut() {
+                Some(last) if last.0 + last.1 == gpa => last.1 += chunk,
+                _ => segs.push((gpa, chunk)),
+            }
+            cur += chunk as usize;
         }
         Some(segs)
+    }
+
+    /// Bulk pagemap read: one pread of the whole VA range's entries.
+    fn read_gpas_bulk(base: usize, npages: usize) -> Option<Vec<u64>> {
+        let f = std::fs::File::open("/proc/self/pagemap").ok()?;
+        let mut raw = vec![0u8; npages * 8];
+        f.read_exact_at(&mut raw, (base / PAGE) as u64 * 8).ok()?;
+        let mut gpas = Vec::with_capacity(npages);
+        for i in 0..npages {
+            let entry = u64::from_le_bytes(raw[i * 8..i * 8 + 8].try_into().unwrap());
+            if entry & (1 << 63) == 0 {
+                return None;
+            }
+            let pfn = entry & ((1u64 << 55) - 1);
+            if pfn == 0 {
+                return None;
+            }
+            gpas.push(pfn * PAGE as u64);
+        }
+        Some(gpas)
     }
 
     pub fn is_pinned(ptr: usize) -> bool {
