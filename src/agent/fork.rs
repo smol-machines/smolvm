@@ -82,6 +82,7 @@ pub fn prepare_fork(
     pinned_ports: &[(u16, u16)],
     clone_forkable: bool,
     fork_env: &[(String, String)],
+    fork_secrets: &std::collections::BTreeMap<String, crate::secrets::SecretRef>,
 ) -> Result<PreparedFork> {
     validate_vm_name(clone, "clone name").map_err(|e| Error::config("clone name", e))?;
     validate_fork_env(fork_env)?;
@@ -226,6 +227,15 @@ pub fn prepare_fork(
             .env
             .retain(|(k, _)| !fork_env.iter().any(|(fk, _)| fk == k));
         clone_rec.env.extend(fork_env.iter().cloned());
+    }
+    // Per-fork secrets: merge the refs into the clone's persisted `secret_refs`
+    // (overriding same-named refs inherited from the golden), so every `exec`
+    // in the clone resolves them fresh — the fork-safe path where plaintext
+    // never lands in the overlay/artifact or a guest file, and each clone's
+    // secrets are its own, invisible to the golden and sibling clones. Unlike
+    // `fork_env`, these are NOT written to the `fork-env` guest file.
+    for (k, r) in fork_secrets {
+        clone_rec.secret_refs.insert(k.clone(), r.clone());
     }
     let mut port_remaps = Vec::new();
     if !pinned_ports.is_empty() {

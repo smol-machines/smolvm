@@ -163,7 +163,15 @@ pub fn fork_vm(
 ) -> Result<VmHandle> {
     // Freeze + snapshot the golden, register the clone (CoW disks + DB record).
     // `clone_forkable = false`: a clone can't itself be re-forked (nested fork).
-    let prep = crate::agent::fork::prepare_fork(db, golden, clone, pinned_ports, false, &[])?;
+    let prep = crate::agent::fork::prepare_fork(
+        db,
+        golden,
+        clone,
+        pinned_ports,
+        false,
+        &[],
+        &std::collections::BTreeMap::new(),
+    )?;
 
     // Boot the clone from the golden's in-memory snapshot instead of cold-booting.
     let features = LaunchFeatures {

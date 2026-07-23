@@ -708,4 +708,13 @@ pub struct ForkRequest {
     /// to read, and merged into the clone's env for later exec sessions.
     #[serde(default)]
     pub env: Vec<String>,
+    /// Per-fork secrets as `SecretRef`s (host env var / absolute file). Merged
+    /// into the clone's persisted `secret_refs`, overriding same-named refs
+    /// inherited from the golden — so each clone gets its OWN secrets, resolved
+    /// fresh on every `exec`, never written to the overlay/artifact or a guest
+    /// file, and isolated from the golden and sibling clones. This is the
+    /// fork-safe path: unlike `env`, the plaintext never lands at rest.
+    #[serde(default)]
+    #[schema(value_type = Object)]
+    pub secrets: RequestSecretRefs,
 }

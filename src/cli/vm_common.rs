@@ -714,6 +714,7 @@ pub fn fork_vm(
     pinned_ports: &[(u16, u16)],
     share_weights: bool,
     fork_env: &[(String, String)],
+    fork_secrets: &BTreeMap<String, SecretRef>,
 ) -> smolvm::Result<()> {
     let db = SmolvmDb::open()?;
 
@@ -728,6 +729,7 @@ pub fn fork_vm(
         pinned_ports,
         clone_forkable,
         fork_env,
+        fork_secrets,
     )?;
     for (golden_host, guest, clone_host) in &prep.port_remaps {
         if pinned_ports.is_empty() {

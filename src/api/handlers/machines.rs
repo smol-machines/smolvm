@@ -1203,6 +1203,11 @@ pub async fn fork_machine(
     let pinned_ports: Vec<(u16, u16)> = req.ports.iter().map(|p| (p.host, p.guest)).collect();
     let req_share_weights = req.share_weights;
     let fork_env = crate::util::parse_env_list(&req.env);
+    // Per-fork secrets become the clone's persisted secret_refs (resolved fresh
+    // on each exec, never at rest) — validate them at TrustedLocal like the
+    // Smolfile-declared refs they join.
+    crate::api::handlers::validate_fork_secrets(&req.secrets)?;
+    let fork_secrets = req.secrets.clone();
 
     // Validate pinned ports as the create path does: fork uses these host ports
     // as-is (no remapping), so port 0 or a duplicated host port would otherwise
@@ -1241,9 +1246,10 @@ pub async fn fork_machine(
         let clone_b = clone.clone();
         let ports = pinned_ports.clone();
         let env = fork_env.clone();
+        let secrets = fork_secrets.clone();
         tokio::task::spawn_blocking(move || {
             crate::agent::fork::prepare_fork(
-                &db, &golden_b, &clone_b, &ports, /* clone_forkable */ false, &env,
+                &db, &golden_b, &clone_b, &ports, /* clone_forkable */ false, &env, &secrets,
             )
         })
         .await
