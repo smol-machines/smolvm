@@ -1,0 +1,23 @@
+# RuntimeClass that routes pods to the smolvm containerd shim v2, so each pod
+# sandbox boots as a real per-workload microVM (the Kata/Firecracker model).
+#
+#   kubectl apply -f runtimeclass.yaml
+#   # then set `runtimeClassName: smolvm` on any Pod (see example-pod.yaml)
+#
+# `handler` must match the containerd runtime name (config `...runtimes.smolvm`,
+# runtime_type = io.containerd.smolvm.v2). The overhead reflects the per-pod VM
+# footprint so the scheduler accounts for it.
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: smolvm
+handler: smolvm
+overhead:
+  podFixed:
+    cpu: "250m"
+    memory: "160Mi"
+# Restrict to nodes that actually have the smolvm runtime installed (label them
+# `smolvm-runtime=true`). Drop this block on a single-node/all-nodes install.
+scheduling:
+  nodeSelector:
+    smolvm-runtime: "true"
