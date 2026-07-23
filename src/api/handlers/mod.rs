@@ -257,9 +257,15 @@ mod tests {
         refs.insert("GUEST_TOKEN".to_string(), env_ref("HOST_TOKEN"));
         refs.insert(
             "GUEST_KEY".to_string(),
-            SecretRef { from_env: None, from_file: Some("/abs/key".into()) },
+            SecretRef {
+                from_env: None,
+                from_file: Some("/abs/key".into()),
+            },
         );
-        assert!(validate_fork_secrets(&refs).is_ok(), "host refs must be allowed for fork");
+        assert!(
+            validate_fork_secrets(&refs).is_ok(),
+            "host refs must be allowed for fork"
+        );
 
         // Empty is fine (the common case).
         assert!(validate_fork_secrets(&BTreeMap::new()).is_ok());
@@ -267,15 +273,24 @@ mod tests {
         // A malformed key is still rejected at ingress.
         let mut bad = BTreeMap::new();
         bad.insert("HAS=EQ".to_string(), env_ref("HOST"));
-        assert!(matches!(validate_fork_secrets(&bad), Err(ApiError::BadRequest(_))));
+        assert!(matches!(
+            validate_fork_secrets(&bad),
+            Err(ApiError::BadRequest(_))
+        ));
 
         // A relative file path is rejected (validate_ref TrustedLocal).
         let mut rel = BTreeMap::new();
         rel.insert(
             "K".to_string(),
-            SecretRef { from_env: None, from_file: Some("relative/path".into()) },
+            SecretRef {
+                from_env: None,
+                from_file: Some("relative/path".into()),
+            },
         );
-        assert!(matches!(validate_fork_secrets(&rel), Err(ApiError::BadRequest(_))));
+        assert!(matches!(
+            validate_fork_secrets(&rel),
+            Err(ApiError::BadRequest(_))
+        ));
     }
 
     #[test]

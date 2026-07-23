@@ -2856,13 +2856,21 @@ pub struct ForkCmd {
     /// never written to the clone's record, the overlay/pack, or the fork-env
     /// guest file — and each clone's secrets are its own, invisible to the
     /// golden and sibling clones.
-    #[arg(long = "secret-env", value_name = "GUEST_VAR=HOST_VAR", help_heading = "Security")]
+    #[arg(
+        long = "secret-env",
+        value_name = "GUEST_VAR=HOST_VAR",
+        help_heading = "Security"
+    )]
     pub secret_env: Vec<String>,
 
     /// Inject a per-fork secret from a host file (GUEST_VAR=/abs/path), resolved
     /// fresh on every `exec` in the clone. Never persisted to the record,
     /// overlay/pack, or fork-env guest file. See `--secret-env`.
-    #[arg(long = "secret-file", value_name = "GUEST_VAR=PATH", help_heading = "Security")]
+    #[arg(
+        long = "secret-file",
+        value_name = "GUEST_VAR=PATH",
+        help_heading = "Security"
+    )]
     pub secret_file: Vec<String>,
 }
 
