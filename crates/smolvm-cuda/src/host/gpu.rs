@@ -205,11 +205,13 @@ pub struct GpuBackend {
     /// `guest_ram` holds the CLONE's own (gpa, host_va, len) and we read/write its
     /// LIVE pages through this open /proc/<pid>/mem. Correct on COW-diverged pages
     /// and race-free vs the socket bounce path. `None` for the golden (memfd map).
+    #[cfg(unix)]
     proc_mem: Option<std::fs::File>,
     /// Clone proc-mem regions (gpa, CLONE host_va, len), resolved for pread/pwrite
     /// of /proc/<pid>/mem. Kept SEPARATE from `guest_ram` because these host VAs
     /// live in the CLONE's address space and must NEVER be dereferenced by the
     /// daemon's ring / zero-copy paths (which assume guest_ram is mapped HERE).
+    #[cfg(unix)]
     proc_mem_regions: Vec<(u64, u64, u64)>,
     /// Guest-RAM host ranges `(host_va, len)` this backend pinned via
     /// `cuMemHostRegister` (to unregister on drop). Excludes ranges another
@@ -507,7 +509,9 @@ impl GpuBackend {
                 cublaslt: None,
                 cudnn_bn: None,
                 guest_ram: Vec::new(),
+                #[cfg(unix)]
                 proc_mem: None,
+                #[cfg(unix)]
                 proc_mem_regions: Vec::new(),
                 registered: Vec::new(),
                 guest_ram_pin_tried: false,
@@ -780,6 +784,7 @@ impl Backend for GpuBackend {
         self.guest_ram = regions;
     }
 
+    #[cfg(unix)]
     fn set_guest_ram_procmem(&mut self, pid: u32, regions: Vec<(u64, u64, u64)>) -> bool {
         // Only install the clone regions if we can actually open its /proc/mem.
         // Their host VAs live in the CLONE's address space, so without proc_mem
@@ -909,6 +914,7 @@ impl Backend for GpuBackend {
     }
 
     fn memcpy_gpa_htod(&mut self, dptr: u64, segments: &[(u64, u64)], stream: u64) -> CuResult<()> {
+        #[cfg(unix)]
         if self.proc_mem.is_some() {
             self.wait_stream(stream)?;
             return self.gpa_procmem(dptr, segments, false);
@@ -972,6 +978,7 @@ impl Backend for GpuBackend {
     }
 
     fn memcpy_gpa_dtoh(&mut self, dptr: u64, segments: &[(u64, u64)], stream: u64) -> CuResult<()> {
+        #[cfg(unix)]
         if self.proc_mem.is_some() {
             self.wait_stream(stream)?;
             return self.gpa_procmem(dptr, segments, true);
@@ -2854,6 +2861,7 @@ impl GpuBackend {
     /// CLONE transport: move `total` bytes between the GPU (`dptr`) and the
     /// clone's LIVE guest RAM via /proc/<pid>/mem + pinned staging. `to_guest`:
     /// D2H (GPU -> pwrite guest); else H2D (pread guest -> GPU).
+    #[cfg(unix)]
     fn gpa_procmem(&mut self, dptr: u64, segments: &[(u64, u64)], to_guest: bool) -> CuResult<()> {
         let total: u64 = segments.iter().map(|(_, l)| *l).sum();
         if total == 0 {
