@@ -25,6 +25,11 @@ smolvm machine exec --name browser -- \
     --screenshot=/tmp/out.png --window-size=1280,800 \
     https://example.com
 smolvm machine exec --name browser -- base64 /tmp/out.png | base64 -d > out.png
+
+# PyTorch on a host NVIDIA GPU via CUDA forwarding (build torch-cuda.tar first,
+# see examples/cuda-pytorch/README.md)
+smolvm machine run --net --cuda --mem 16384 --image ./torch-cuda.tar -- \
+  python3 -c "import torch; print(torch.cuda.is_available())"
 ```
 
 ### Persistent microVMs
