@@ -1951,6 +1951,24 @@ pub fn expand_disks(
     use smolvm::data::disk::{Overlay, Storage};
     use smolvm::storage::{expand_disk, DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
 
+    // A fork base's disks are the copy-on-write backing for its clones' disks, so
+    // growing them corrupts the clones' overlays. Refuse if any clone still
+    // depends on this machine. Guarded independently of run state: a golden whose
+    // VMM has died (e.g. after a host reboot) resolves to Stopped, not Frozen, so
+    // a state check alone would let the resize through.
+    let clones = SmolvmDb::open()?.dependent_clones(name).unwrap_or_default();
+    if !clones.is_empty() {
+        return Err(smolvm::Error::config(
+            "resize",
+            format!(
+                "machine '{name}' is the fork base for {} live clone(s) ({}); their disks are \
+                 copy-on-write overlays backed by its disks — delete the clones first",
+                clones.len(),
+                clones.join(", ")
+            ),
+        ));
+    }
+
     let current_storage_gb = record.storage_gb.unwrap_or(DEFAULT_STORAGE_SIZE_GIB);
     let current_overlay_gb = record.overlay_gb.unwrap_or(DEFAULT_OVERLAY_SIZE_GIB);
 

@@ -1789,6 +1789,29 @@ pub async fn resize_machine(
         }
     }
 
+    // A fork base's disks are the copy-on-write backing for its clones' disks, so
+    // growing them corrupts the clones. The state check above is not enough: a
+    // golden whose VMM has died (e.g. after a host reboot) resolves to Stopped
+    // while its clones still depend on it, so `actual_state` would pass. Refuse
+    // explicitly, mirroring delete/stop and the CLI resize guard.
+    {
+        let db = state.db().clone();
+        let golden = name.clone();
+        let clones = tokio::task::spawn_blocking(move || db.dependent_clones(&golden))
+            .await
+            .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+            .map_err(ApiError::database)?;
+        if !clones.is_empty() {
+            return Err(ApiError::Conflict(format!(
+                "machine '{}' is the fork base of {} live clone(s) ({}); their disks are backed \
+                 by its disks — delete the clones first",
+                name,
+                clones.len(),
+                clones.join(", ")
+            )));
+        }
+    }
+
     let current_storage_gb = record.storage_gb.unwrap_or(DEFAULT_STORAGE_SIZE_GIB);
     let current_overlay_gb = record.overlay_gb.unwrap_or(DEFAULT_OVERLAY_SIZE_GIB);
 
