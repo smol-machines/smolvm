@@ -95,7 +95,8 @@ fn stage_shims(
     spec.add_bind_mount(&shim_dir.to_string_lossy(), CONTAINER_SHIM_DIR, true);
     append_ld_library_path(&mut spec.process.env, CONTAINER_SHIM_DIR);
 
-    // Runtime shim over each RPATH-pinned pip-bundled NVIDIA library.
+    // Runtime shim over each RPATH-pinned NVIDIA library found in the image
+    // (pip-wheel and conda layouts, plus SMOLVM_CUDA_STAGE_EXTRA_DIRS).
     let runtime_src = runtime.to_string_lossy();
     for hit in find_rpath_pinned_libs(rootfs) {
         let dest = format!(
@@ -121,10 +122,57 @@ fn append_ld_library_path(env: &mut Vec<String>, dir: &str) {
     env.push(format!("LD_LIBRARY_PATH={dir}"));
 }
 
-/// Find pip-bundled NVIDIA libraries in the image rootfs: files named like the
-/// RPATH-pinned sonames under a `site-packages`/`dist-packages` → `nvidia`
-/// wheel layout. Bounded walk: skips pseudo-filesystems and never follows
-/// symlinks (wheel layouts don't use them and cycles would hang the boot).
+/// Colon-separated list of extra guest directories to scan for pinned sonames,
+/// from the `SMOLVM_CUDA_STAGE_EXTRA_DIRS` env var. Escape hatch for images
+/// whose CUDA libraries live outside the layouts [`find_rpath_pinned_libs`]
+/// recognizes (e.g. a vendored `/usr/local/cuda/lib64`).
+const STAGE_EXTRA_DIRS_ENV: &str = "SMOLVM_CUDA_STAGE_EXTRA_DIRS";
+
+/// Whether a path holding a pinned soname is a layout we interpose. Two known
+/// layouts: pip wheels (`.../site-packages/nvidia/<lib>/lib/<soname>`) and conda
+/// (`/opt/conda/lib/<soname>`, `/opt/conda/pkgs/*/lib/<soname>`). RPATH pins the
+/// soname ahead of `LD_LIBRARY_PATH` in both, so a bind mount is the only way in.
+fn is_staged_layout(path: &str) -> bool {
+    let pip = path.contains("/nvidia/")
+        && (path.contains("/site-packages/") || path.contains("/dist-packages/"));
+    let conda = path.contains("/conda/");
+    pip || conda
+}
+
+/// Resolve a matched entry to the real file to overlay. Regular files map to
+/// themselves; symlinks (conda ships `libcublas.so.12 -> libcublas.so.12.x.y`)
+/// resolve to their target so the bind mount lands on a regular file the loader
+/// reaches through the link.
+///
+/// The link is resolved *lexically* (relative to its own dir, or remapped under
+/// `rootfs` if absolute) rather than with `canonicalize`, which would also
+/// resolve symlinks in `rootfs`'s own ancestors and break the `strip_prefix`
+/// stage_shims uses to derive the guest path. Targets that don't exist or escape
+/// `rootfs` are dropped (never mount a host path into the guest).
+fn resolve_pinned_hit(
+    path: &std::path::Path,
+    is_symlink: bool,
+    rootfs: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    if !is_symlink {
+        return Some(path.to_path_buf());
+    }
+    let link = std::fs::read_link(path).ok()?;
+    let target = if link.is_absolute() {
+        rootfs.join(link.strip_prefix("/").ok()?)
+    } else {
+        // Drop a leading `./` so the derived guest path stays clean.
+        let rel = link.strip_prefix(".").unwrap_or(link.as_path());
+        path.parent()?.join(rel)
+    };
+    (target.exists() && target.starts_with(rootfs)).then_some(target)
+}
+
+/// Find NVIDIA libraries in the image rootfs to interpose: entries named like
+/// the RPATH-pinned sonames under a recognized layout (pip wheel or conda), plus
+/// anything under [`STAGE_EXTRA_DIRS_ENV`]. Bounded walk: skips pseudo-
+/// filesystems and never recurses through symlinked dirs (cycles would hang the
+/// boot), but matches symlinked *files* so conda's versioned soname links work.
 fn find_rpath_pinned_libs(rootfs: &std::path::Path) -> Vec<std::path::PathBuf> {
     const SKIP_TOP: &[&str] = &["proc", "sys", "dev", "run", "tmp", "boot"];
     const MAX_DEPTH: usize = 16;
@@ -150,18 +198,49 @@ fn find_rpath_pinned_libs(rootfs: &std::path::Path) -> Vec<std::path::PathBuf> {
                     continue;
                 }
                 stack.push((entry.path(), depth + 1));
-            } else if ft.is_file() && RPATH_PINNED_SONAMES.contains(&name.as_ref()) {
+            } else if (ft.is_file() || ft.is_symlink())
+                && RPATH_PINNED_SONAMES.contains(&name.as_ref())
+            {
                 let p = entry.path();
-                let s = p.to_string_lossy();
-                if s.contains("/nvidia/")
-                    && (s.contains("/site-packages/") || s.contains("/dist-packages/"))
-                {
-                    hits.push(p);
+                if is_staged_layout(&p.to_string_lossy()) {
+                    if let Some(hit) = resolve_pinned_hit(&p, ft.is_symlink(), rootfs) {
+                        hits.push(hit);
+                    }
                 }
             }
         }
     }
+
+    // Escape hatch: scan operator-provided guest dirs (shallow) for pinned
+    // sonames, no layout heuristic required.
+    if let Some(extra) = std::env::var_os(STAGE_EXTRA_DIRS_ENV) {
+        for guest_dir in std::env::split_paths(&extra) {
+            let rel = guest_dir.strip_prefix("/").unwrap_or(guest_dir.as_path());
+            let host_dir = rootfs.join(rel);
+            let entries = match std::fs::read_dir(&host_dir) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            for entry in entries.flatten() {
+                let ft = match entry.file_type() {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if (ft.is_file() || ft.is_symlink())
+                    && RPATH_PINNED_SONAMES.contains(&name.as_ref())
+                {
+                    if let Some(hit) = resolve_pinned_hit(&entry.path(), ft.is_symlink(), rootfs) {
+                        hits.push(hit);
+                    }
+                }
+            }
+        }
+    }
+
     hits.sort();
+    hits.dedup();
     hits
 }
 
@@ -288,6 +367,45 @@ mod tests {
             .env
             .iter()
             .any(|e| e.starts_with("LD_LIBRARY_PATH=") && e.contains(CONTAINER_SHIM_DIR)));
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn finds_conda_symlinked_libs() {
+        let tmp = std::env::temp_dir().join(format!("cuda-conda-test-{}", std::process::id()));
+        let lib = tmp.join("rootfs/opt/conda/lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        // conda ships a versioned real file + an soname symlink (relative).
+        std::fs::write(lib.join("libcublas.so.12.4.2.65"), b"real-cublas").unwrap();
+        std::os::unix::fs::symlink("libcublas.so.12.4.2.65", lib.join("libcublas.so.12")).unwrap();
+
+        let hits = find_rpath_pinned_libs(&tmp.join("rootfs"));
+        // The symlink resolves to its real target, which is what we overlay.
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].ends_with("opt/conda/lib/libcublas.so.12.4.2.65"));
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn finds_extra_dir_libs() {
+        let tmp = std::env::temp_dir().join(format!("cuda-extra-test-{}", std::process::id()));
+        let rootfs = tmp.join("rootfs");
+        // A layout outside pip/conda that only the escape hatch can reach.
+        let vendored = rootfs.join("usr/local/cuda/lib64");
+        std::fs::create_dir_all(&vendored).unwrap();
+        std::fs::write(vendored.join("libcudart.so.12"), b"real").unwrap();
+
+        // Not found without the env var (unknown layout).
+        assert!(find_rpath_pinned_libs(&rootfs).is_empty());
+
+        // Found once the operator points the escape hatch at the guest dir.
+        std::env::set_var(STAGE_EXTRA_DIRS_ENV, "/usr/local/cuda/lib64");
+        let hits = find_rpath_pinned_libs(&rootfs);
+        std::env::remove_var(STAGE_EXTRA_DIRS_ENV);
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].ends_with("usr/local/cuda/lib64/libcudart.so.12"));
 
         std::fs::remove_dir_all(&tmp).ok();
     }
