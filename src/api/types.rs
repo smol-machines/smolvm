@@ -360,6 +360,11 @@ pub struct DeleteQuery {
     /// This may orphan the VM process. Default: false.
     #[serde(default)]
     pub force: bool,
+    /// If true, also delete any clones forked from this machine before removing
+    /// it. A fork base cannot be removed while its clones' overlays depend on
+    /// its disks; cascade removes those clones first. Default: false.
+    #[serde(default)]
+    pub cascade: bool,
 }
 
 // ============================================================================

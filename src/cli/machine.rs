@@ -2952,6 +2952,12 @@ pub struct DeleteCmd {
     /// Skip confirmation prompt
     #[arg(short, long)]
     pub force: bool,
+
+    /// Also delete any clones forked from this machine. A fork base cannot be
+    /// removed while its clones' disks depend on it; --cascade removes the
+    /// clones first (children before the base). Implies no confirmation.
+    #[arg(long)]
+    pub cascade: bool,
 }
 
 impl DeleteCmd {
@@ -2966,6 +2972,9 @@ impl DeleteCmd {
                 // dir out from under the live VM. The API delete handler and
                 // `delete_vm`'s own teardown already do this.
                 stop_if_running: true,
+                // Delete dependent clones too when requested, instead of
+                // refusing on a fork base.
+                cascade: self.cascade,
             },
         )
     }

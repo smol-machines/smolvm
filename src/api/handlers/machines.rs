@@ -36,8 +36,8 @@ use crate::api::state::{
     ReservationGuard,
 };
 use crate::api::types::{
-    ApiErrorResponse, CreateMachineRequest, DeleteResponse, ExportRequest, ExportResponse,
-    ForkRequest, ListMachinesResponse, MachineInfo, MountInfo, MountSpec, PortSpec,
+    ApiErrorResponse, CreateMachineRequest, DeleteQuery, DeleteResponse, ExportRequest,
+    ExportResponse, ForkRequest, ListMachinesResponse, MachineInfo, MountInfo, MountSpec, PortSpec,
     ResizeMachineRequest, ResourceSpec, StartMachineQuery,
 };
 use crate::config::{RecordState, RestartConfig, VmRecord};
@@ -1597,18 +1597,45 @@ pub async fn drain_machines(state: &Arc<ApiState>) {
     path = "/api/v1/machines/{name}",
     tag = "Machines",
     params(
-        ("name" = String, Path, description = "Machine name")
+        ("name" = String, Path, description = "Machine name"),
+        ("cascade" = Option<bool>, Query, description = "Also delete clones forked from this machine (fork base cannot be removed while its clones depend on it)")
     ),
     responses(
         (status = 200, description = "Machine deleted", body = DeleteResponse),
         (status = 404, description = "Machine not found", body = ApiErrorResponse),
+        (status = 409, description = "Machine is a fork base with live clones (use cascade)", body = ApiErrorResponse),
         (status = 500, description = "Failed to delete", body = ApiErrorResponse)
     )
 )]
 pub async fn delete_machine(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
+    Query(query): Query<DeleteQuery>,
 ) -> Result<Json<DeleteResponse>, ApiError> {
+    // Cascade: remove each dependent clone before the golden so its own delete
+    // (below) sees no dependents. Clones are leaves (launched non-forkable), so
+    // one level is exhaustive; the read is unlocked but delete_one re-checks
+    // under the golden's lifecycle lock, so a clone forked in the race still
+    // refuses rather than dangling.
+    if query.cascade {
+        let db = state.db().clone();
+        let golden = name.clone();
+        let clones = tokio::task::spawn_blocking(move || db.dependent_clones(&golden))
+            .await
+            .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+            .map_err(ApiError::database)?;
+        for clone in clones {
+            delete_one(state.clone(), clone).await?;
+        }
+    }
+    delete_one(state, name).await.map(Json)
+}
+
+/// Delete a single machine (no cascade): stop it, remove it from the registry
+/// and database, and delete its data directory. Refuses if it is a fork base
+/// with live clones. Shared by [`delete_machine`] (once per golden, and once per
+/// clone during a cascade).
+async fn delete_one(state: Arc<ApiState>, name: String) -> Result<DeleteResponse, ApiError> {
     // Hold the per-machine lifecycle lock across the whole delete so the layers
     // volume detach (before the data-dir removal) cannot race a concurrent
     // start's acquire+mount+launch (review finding #3). Acquired before the DB
@@ -1745,7 +1772,7 @@ pub async fn delete_machine(
         }
     }
 
-    Ok(Json(DeleteResponse { deleted: name }))
+    Ok(DeleteResponse { deleted: name })
 }
 
 /// Resize a machine's disk resources.

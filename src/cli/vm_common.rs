@@ -1582,6 +1582,10 @@ pub fn stop_vm_default() -> smolvm::Result<()> {
 pub struct DeleteVmOptions {
     /// If true, stop the VM before deleting when it is running.
     pub stop_if_running: bool,
+    /// If true, delete any clones forked from this machine before removing it
+    /// (children before the fork base) instead of refusing. Implies no
+    /// interactive confirmation.
+    pub cascade: bool,
 }
 
 /// Delete a named machine configuration.
@@ -1599,22 +1603,43 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
     // it (unless forced, in which case the clones' overlays are left dangling).
     let dependent_clones = SmolvmDb::open()?.dependent_clones(name)?;
     if !dependent_clones.is_empty() {
-        if !force {
+        if options.cascade {
+            // Children before the fork base: delete each dependent clone first,
+            // then fall through to remove the golden. A clone is never itself a
+            // fork base (clones launch non-forkable), so one level of recursion
+            // is exhaustive — no name-guessing, no stale overlays left dangling.
+            for clone in &dependent_clones {
+                println!("Deleting dependent clone '{clone}' (cascade)...");
+                delete_vm(
+                    clone,
+                    true, // no per-clone confirmation during a cascade
+                    DeleteVmOptions {
+                        stop_if_running: true,
+                        cascade: false,
+                    },
+                )?;
+            }
+            // The clone deletes above rewrote the config on disk; reload so the
+            // golden's own removal below persists against current state.
+            config = SmolvmConfig::load()?;
+        } else if !force {
             return Err(smolvm::Error::agent(
                 "delete",
                 format!(
                     "machine '{name}' is the fork base for {} clone(s) ({}); \
-                     delete the clones first, or use --force to break them",
+                     delete the clones first, use --cascade to remove them too, \
+                     or --force to break them",
                     dependent_clones.len(),
                     dependent_clones.join(", ")
                 ),
             ));
+        } else {
+            tracing::warn!(
+                golden = name,
+                clones = %dependent_clones.join(", "),
+                "force-deleting a golden; dependent clones' disk overlays will dangle"
+            );
         }
-        tracing::warn!(
-            golden = name,
-            clones = %dependent_clones.join(", "),
-            "force-deleting a golden; dependent clones' disk overlays will dangle"
-        );
     }
 
     // Stop if running (machine run does this). Use the shared
@@ -1651,8 +1676,9 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
         }
     }
 
-    // Confirm deletion unless --force
-    if !force {
+    // Confirm deletion unless --force (or --cascade, which is already an
+    // explicit "remove this and its clones" and runs unattended).
+    if !force && !options.cascade {
         eprint!("Delete machine '{}'? [y/N] ", name);
         let mut input = String::new();
         if std::io::stdin().read_line(&mut input).is_ok() {
