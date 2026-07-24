@@ -12,6 +12,25 @@ A tool to build and run portable, self-contained virtual machines locally. <200m
 
 Windows caveats (run, persistent machines, volumes, port-forwarding, pack create/run, and interactive TTY all work): networking is TSI-only (TCP/UDP + inbound `-p`, no virtio-net); no GPU acceleration; no fork/snapshot. `pack create` needs `storage-template.ext4` / `overlay-template.ext4` beside `smolvm.exe` (Windows has no host `mkfs.ext4`). Set `SMOLVM_LIB_DIR` (folder holding `krun.dll` + `libkrunfw.dll`) and `SMOLVM_AGENT_ROOTFS` when running from a non-standard layout.
 
+## Rust quality (agents)
+
+Use Microsoft's [Pragmatic Rust Guidelines](https://microsoft.github.io/rust-guidelines/) as a quality reference. The [condensed agent pack](https://microsoft.github.io/rust-guidelines/agents/all.txt) is available for deep Rust API, FFI, or unsafe refactors; attaching it is optional, not required for every task.
+
+Prioritize, in order:
+
+1. Library UX: smolvm is library-first; keep the CLI a thin surface.
+2. FFI quality in `napi` and `pyo3` bindings.
+3. Unsafe code and correctness.
+4. Hot-path performance.
+5. Avoid AI anti-patterns: one implementation path, no meta-design docs in user-facing docs, and no tautological tests.
+
+Smol overrides:
+
+- Subtract: do not add crates or APIs solely for ceremony.
+- Keep one way to do a thing; prefer small shared validators over fat dependencies.
+- Humans own design; agents implement it.
+- Treat guideline must/should rules as spirit over letter—do not block work by citing rule IDs for theater.
+
 ## Quick Reference
 
 ```bash
