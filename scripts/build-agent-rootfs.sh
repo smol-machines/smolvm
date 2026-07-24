@@ -340,6 +340,14 @@ if [[ -n "$CUDART_SHIM_SRC" && -f "$CUDART_SHIM_SRC" \
     mkdir -p "$OUTPUT_DIR/usr/local/lib/smolvm-cuda"
     cp "$CUDART_SHIM_SRC" "$OUTPUT_DIR/usr/local/lib/smolvm-cuda/libcudart-shim.so"
     cp "$CUDA_DRIVER_SHIM_SRC" "$OUTPUT_DIR/usr/local/lib/smolvm-cuda/libcuda.so.1"
+    # Unversioned linker ("dev") names next to the sonames. Code that *links*
+    # against CUDA at runtime — Triton's JIT compiles cuda_utils with
+    # `gcc … -lcuda`, taking its -L from LD_LIBRARY_PATH, which the shim dir
+    # rides — needs `libcuda.so`; ld does not accept `libcuda.so.1`. Without
+    # these, torch.compile/Triton dies inside the guest with an opaque gcc
+    # failure and users hand-symlink the shim to fix it.
+    ln -sf libcuda.so.1 "$OUTPUT_DIR/usr/local/lib/smolvm-cuda/libcuda.so"
+    ln -sf libcudart-shim.so "$OUTPUT_DIR/usr/local/lib/smolvm-cuda/libcudart.so"
     # NVML drop-in: frameworks (vLLM) detect the GPU through NVML, not the CUDA
     # driver — the shim dir rides LD_LIBRARY_PATH, so the plain-soname dlopen of
     # libnvidia-ml.so.1 resolves here. Best-effort: absent on non-Linux builds.
