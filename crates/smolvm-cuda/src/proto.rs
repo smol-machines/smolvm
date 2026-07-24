@@ -1617,6 +1617,19 @@ pub fn decode_response(op: Op, payload: &[u8]) -> io::Result<(i32, Response)> {
     Ok((status, body))
 }
 
+/// FNV-1a 64-bit hash of `data`, floored to a minimum of 1 so `0` stays free as
+/// a "no hash" sentinel. Used for the module/upload wire cache on both sides of
+/// the RPC (host verifies, guest primes), so it lives here in the shared,
+/// always-compiled protocol module rather than the host-only backend.
+pub fn fnv64(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h.max(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

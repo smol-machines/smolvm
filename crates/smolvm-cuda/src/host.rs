@@ -12,7 +12,7 @@
 //! protocol + transport can be exercised on a host with no NVIDIA GPU).
 
 use crate::proto::{
-    decode_request, encode_request, encode_response, read_msg, write_msg, Request, Response,
+    decode_request, encode_request, encode_response, fnv64, read_msg, write_msg, Request, Response,
 };
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -1545,15 +1545,6 @@ fn module_cache_put(image: &[u8]) {
 
 fn module_cache_get(key: &ModuleCacheKey) -> Option<std::sync::Arc<Vec<u8>>> {
     module_cache().lock().unwrap().get(key).cloned()
-}
-
-pub fn fnv64(data: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in data {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h.max(1)
 }
 
 /// Mark the allocation containing `dptr` as loaded (H2D-written → read-only

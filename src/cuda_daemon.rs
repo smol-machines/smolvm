@@ -1853,7 +1853,7 @@ fn verify_chunk_content(b: &mut dyn Backend, ch: &smolvm_cuda::host::HandoffChun
         Ok(bytes) => ch.segs.iter().all(|&(s, e, crc)| {
             crc != 0
                 && e as usize <= bytes.len()
-                && smolvm_cuda::host::fnv64(&bytes[s as usize..e as usize]) == crc
+                && smolvm_cuda::proto::fnv64(&bytes[s as usize..e as usize]) == crc
         }),
         Err(e) => {
             tracing::warn!(e, va = ch.va, "M2-share: verify D2H failed → private");

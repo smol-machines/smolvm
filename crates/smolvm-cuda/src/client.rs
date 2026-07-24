@@ -855,7 +855,7 @@ impl<S: Read + Write> Client<S> {
         // also populates the server cache.
         if image.len() >= 64 {
             let mut blob = Vec::with_capacity(32);
-            blob.extend_from_slice(&crate::host::fnv64(image).to_le_bytes());
+            blob.extend_from_slice(&crate::proto::fnv64(image).to_le_bytes());
             blob.extend_from_slice(&(image.len() as u64).to_le_bytes());
             blob.extend_from_slice(&image[..8]);
             blob.extend_from_slice(&image[image.len() - 8..]);
