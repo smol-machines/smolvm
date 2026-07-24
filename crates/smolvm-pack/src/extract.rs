@@ -266,14 +266,18 @@ fn verify_parent_within_dest(path: &Path, real_dest: &Path) -> std::io::Result<(
     Ok(())
 }
 
-/// Safely unpack a tar archive, rejecting symlinks, hardlinks, and entries
-/// that resolve outside `dest`.
+/// Safely unpack a tar archive: symlinks and hardlinks are allowed only when
+/// their targets stay within `dest`, and any entry that resolves outside `dest`
+/// is rejected.
 ///
 /// The standard `tar::Archive::unpack()` strips `..` components but does
-/// **not** reject symlinks. A crafted archive could create
+/// **not** validate symlink targets. A crafted archive could create
 /// `lib/libkrun.dylib → /tmp/evil.so`, and subsequent `dlopen()` would
-/// load the attacker's library. This function rejects any entry that is
-/// not a regular file or directory.
+/// load the attacker's library. This function validates every symlink and
+/// hardlink target against `dest` (rejecting escaping links and absolute
+/// links that alias the destination root) and opens regular files with
+/// `O_NOFOLLOW` plus a canonicalized-parent check, so a write can never
+/// follow a planted symlink out of `dest`.
 fn safe_unpack<R: Read>(archive: &mut tar::Archive<R>, dest: &Path) -> std::io::Result<()> {
     safe_unpack_with_limits(archive, dest, &SafeUnpackLimits::from_env())
 }
