@@ -79,6 +79,15 @@ const DEFAULT_WRITE_TIMEOUT_SECS: u64 = 10;
 /// Image pulls can take a long time for large images over slow connections.
 const IMAGE_PULL_TIMEOUT_SECS: u64 = 600;
 
+/// Read timeout for starting a detached container (10 minutes).
+/// The first start of a persistent overlay from a large *local* image archive
+/// flattens the archive into guest storage before crun init, which scales with
+/// image size and can far exceed the default 30s (or the old 120s) budget on a
+/// multi-GiB image — the client would abort mid-flatten with a spurious
+/// "Resource temporarily unavailable" error. Match the image-pull budget, since
+/// this is comparable one-time first-touch work.
+const DETACHED_START_TIMEOUT_SECS: u64 = 600;
+
 // (Removed INTERACTIVE_TIMEOUT_SECS — no-user-timeout execs now disable
 // the socket read timeout entirely, matching interactive_session behavior.)
 
@@ -1326,9 +1335,11 @@ impl AgentClient {
     /// Requires `config.persistent_overlay_id` to be set — detached containers
     /// only make sense when there is a persistent overlay to associate with.
     pub fn run_container_detached(&mut self, config: RunConfig) -> Result<String> {
-        // Container startup involves overlay setup + crun init which can exceed
+        // Container startup involves overlay setup, a one-time flatten of a local
+        // image archive into guest storage, and crun init, which can far exceed
         // the default 30s read timeout on first run (cold overlay, cold image).
-        let _timeout_guard = self.set_extended_read_timeout(Duration::from_secs(120))?;
+        let _timeout_guard =
+            self.set_extended_read_timeout(Duration::from_secs(DETACHED_START_TIMEOUT_SECS))?;
 
         let resp = self.request(&AgentRequest::Run {
             image: config.image,
