@@ -228,6 +228,17 @@ export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/virtio_icd.x86_64.json
 
 See [`examples/headless-browser/`](examples/headless-browser/) for a working Chromium setup using ANGLE + Venus for hardware-accelerated WebGL inside a headless VM.
 
+CUDA API Remoting
+-----------------
+
+`--gpu` and `--cuda` provide different interfaces. `--gpu` exposes Vulkan through virtio-gpu / Venus; it does not provide CUDA. `--cuda` enables CUDA API remoting: driverless guest shims forward CUDA calls over vsock to a host process, which executes them through the host's NVIDIA driver.
+
+CUDA remoting requires an NVIDIA GPU and a working NVIDIA driver on the host. It is not GPU passthrough: the guest receives neither the physical device nor an NVIDIA driver.
+
+The VM boundary still isolates the workload's CPU, memory, and filesystem. GPU access is mediated by host processes and the shared host GPU, so GPU isolation remains process-level rather than a hardware or VM boundary. Do not treat CUDA remoting as a hardened multi-tenant GPU isolation boundary.
+
+See [GPU access by API remoting: how a driverless microVM runs CUDA](https://smolmachines.com/engineering/gpu-over-vsock) for the design, trade-offs, and comparison with passthrough.
+
 Development
 -----------
 
