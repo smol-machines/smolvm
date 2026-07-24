@@ -328,6 +328,23 @@ jobs:
           echo "aarch64 agent:"
           file target/aarch64-unknown-linux-musl/release/smolvm-agent
 
+      # The guest CUDA shims pull smolvm-cuda with `default-features = false`
+      # (no `host`), and scripts/build-agent-rootfs.sh builds them standalone.
+      # A whole-workspace build unifies features, so a host-only reference from
+      # the client side compiles there and breaks only the standalone shim
+      # build — which the rootfs script swallows as "auto-staging disabled",
+      # leaving an unstamped rootfs with stale shims (this regressed once, see
+      # #737). Check the guest feature set explicitly so that skew fails here.
+      #
+      # `--lib` only: the shims link the library, while the crate's examples
+      # (gpu_loopback, shim_server) are host-side tools that legitimately need
+      # the feature.
+      - name: smolvm-cuda builds without the host feature (guest shim path)
+        run: cargo clippy -p smolvm-cuda --no-default-features --lib -- -D warnings
+
+      - name: Guest CUDA shims build standalone
+        run: cargo build --release -p smolvm-cudart-shim -p smolvm-cuda-shim -p smolvm-nvml-shim -p smolvm-cuda-guest
+
   # ==========================================================================
   # Downstream compatibility: the smol CLI builds this workspace via path deps
   # (`smolvm = { path = ".." }`) and releases in version lockstep, so an engine
