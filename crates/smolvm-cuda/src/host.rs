@@ -1547,14 +1547,10 @@ fn module_cache_get(key: &ModuleCacheKey) -> Option<std::sync::Arc<Vec<u8>>> {
     module_cache().lock().unwrap().get(key).cloned()
 }
 
-pub fn fnv64(data: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in data {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h.max(1)
-}
+/// Re-export of [`crate::fnv64`], which lives in the crate root so the guest
+/// client can use it without the `host` feature. Kept here so existing
+/// `host::fnv64` callers (and this module's own uses) resolve unchanged.
+pub use crate::fnv64;
 
 /// Mark the allocation containing `dptr` as loaded (H2D-written → read-only
 /// weight). Called on every host-to-device copy on the golden.

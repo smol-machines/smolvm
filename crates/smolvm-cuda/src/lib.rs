@@ -35,6 +35,23 @@ pub const PROTO_HASH: u64 = {
     v
 };
 
+/// FNV-1a over `data`, never returning 0 (0 is reserved as "no hash").
+///
+/// Lives in the crate root, NOT in `host`: BOTH sides of the wire need it — the
+/// client fingerprints the module images it ships, the host verifies
+/// upload-segment CRCs — and `host` is gated off in the guest shim's
+/// `default-features = false` build. Keeping one definition here is what lets
+/// `smolvm-cuda` compile without the `host` feature. Re-exported as
+/// `host::fnv64` for existing callers.
+pub fn fnv64(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h.max(1)
+}
+
 /// Shared-memory bulk-data channel (zero-copy memcpy). Linux-only.
 #[cfg(target_os = "linux")]
 pub mod shm;
