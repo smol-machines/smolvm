@@ -1233,6 +1233,11 @@ pub async fn ensure_running_and_persist(
     if let Err(e) = state.update_machine_state(name, RecordState::Running, pid) {
         tracing::warn!(machine = %name, error = %e, "failed to persist Running state after implicit start");
     }
+    // An implicit start (exec/file/image waking a stopped machine) re-enables
+    // supervision like the explicit start handler: clear the user-stopped flag so
+    // the restart supervisor will keep this machine up again. (Retry-budget reset
+    // stays on the explicit `start` path.) Idempotent for an already-running machine.
+    state.mark_user_stopped(name, false);
 
     // An implicit start of an image machine (exec/files/images waking a stopped
     // machine) must relaunch the image workload just like the explicit start

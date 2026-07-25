@@ -1,0 +1,175 @@
+{
+  "arm": "fork",
+  "n": 16,
+  "steps": 10,
+  "cpus_per_learner": 4,
+  "cold_cache": false,
+  "alloc_conf": "expandable_segments:True",
+  "batch": 2,
+  "maxseq": 256,
+  "share_weights_env": "unset",
+  "wall_s": 364.52,
+  "golden_load_s": 164.39,
+  "fork_s": 9.0,
+  "peak_gpu_mib": 35340,
+  "learners_done": 16,
+  "learners_expected": 16,
+  "agg_tok_s": 487,
+  "learners": [
+    {
+      "lid": "0",
+      "tok_s": 32,
+      "train_s": 161.0,
+      "step_ms": 16100,
+      "loss0": 0.6931,
+      "lossN": 0.6813,
+      "peak_gb": 6.41
+    },
+    {
+      "lid": "1",
+      "tok_s": 30,
+      "train_s": 169.02,
+      "step_ms": 16902,
+      "loss0": 0.6931,
+      "lossN": 0.6656,
+      "peak_gb": 6.41
+    },
+    {
+      "lid": "10",
+      "tok_s": 30,
+      "train_s": 171.43,
+      "step_ms": 17143,
+      "loss0": 0.6931,
+      "lossN": 0.648,
+      "peak_gb": 6.41
+    },
+    {
+      "lid": "11",
+      "tok_s": 30,
+      "train_s": 168.68,
+      "step_ms": 16868,
+      "loss0": 0.6931,
+      "lossN": 0.6397,
+      "peak_gb": 6.41
+    },
+    {
+      "lid": "12",
+      "tok_s": 30,
+      "train_s": 171.38,
+      "step_ms": 17138,
+      "loss0": 0.6931,
+      "lossN": 0.6383,
+      "peak_gb": 6.41
+    },
+    {
+      "lid": "13",
+      "tok_s": 30,
+      "train_s": 170.1,
+      "step_ms": 17010,
+      "loss0": 0.6931,
+      "lossN": 0.6849,
+      "peak_gb": 6.41
+    },
+    {
+      "lid": "14",
+      "tok_s": 30,
+      "train_s": 168.37,
+      "step_ms": 16837,
+      "loss0": 0.6931,
+      "lossN": 0.6406,
+      "peak_gb": 6.41
+    },
+    {
+      "lid": "15",
+      "tok_s": 33,
+      "train_s": 156.46,
+      "step_ms": 15646,
+      "loss0": 0.6931,
+      "lossN": 0.6968,
+      "peak_gb": 6.41
+    },
+    {
+      "lid": "2",
+      "tok_s": 31,
+      "train_s": 164.94,
+      "step_ms": 16494,
+      "loss0": 0.6931,
+      "lossN": 0.6401,
+      "peak_gb": 6.41
+    },
+    {
+      "lid": "3",
+      "tok_s": 31,
+      "train_s": 164.77,
+      "step_ms": 16477,
+      "loss0": 0.6931,
+      "lossN": 0.6234,
+      "peak_gb": 6.41
+    },
+    {
+      "lid": "4",
+      "tok_s": 30,
+      "train_s": 170.27,
+      "step_ms": 17027,
+      "loss0": 0.6931,
+      "lossN": 0.6452,
+      "peak_gb": 6.41
+    },
+    {
+      "lid": "5",
+      "tok_s": 30,
+      "train_s": 171.6,
+      "step_ms": 17160,
+      "loss0": 0.6931,
+      "lossN": 0.6243,
+      "peak_gb": 6.41
+    },
+    {
+      "lid": "6",
+      "tok_s": 30,
+      "train_s": 170.28,
+      "step_ms": 17028,
+      "loss0": 0.6931,
+      "lossN": 0.6235,
+      "peak_gb": 6.41
+    },
+    {
+      "lid": "7",
+      "tok_s": 30,
+      "train_s": 168.76,
+      "step_ms": 16876,
+      "loss0": 0.6931,
+      "lossN": 0.6375,
+      "peak_gb": 6.41
+    },
+    {
+      "lid": "8",
+      "tok_s": 30,
+      "train_s": 170.23,
+      "step_ms": 17023,
+      "loss0": 0.6931,
+      "lossN": 0.6384,
+      "peak_gb": 6.4
+    },
+    {
+      "lid": "9",
+      "tok_s": 30,
+      "train_s": 168.61,
+      "step_ms": 16861,
+      "loss0": 0.6931,
+      "lossN": 0.5834,
+      "peak_gb": 6.41
+    }
+  ],
+  "env": {
+    "smolvm_version": "smolvm 1.6.13",
+    "smolvm_binary_md5": "60924e45452fad0b386bed5bfa5c54ba",
+    "proto_hash_rootfs": "c5631758382d21af",
+    "shim_md5": "46a6603f881b42931779b12b50805052",
+    "driver": "570.148.08",
+    "gpu": "NVIDIA H100 80GB HBM3",
+    "torch": "2.7.0+cu126",
+    "host_cores": 26,
+    "host_mem_gb": 237
+  }
+}

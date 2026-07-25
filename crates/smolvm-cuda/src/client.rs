@@ -40,27 +40,36 @@ pub type Result<T> = std::result::Result<T, CudaRpcError>;
 /// per op, dumped to stderr every 4096 calls, to show what still serializes an
 /// asynchronously-pipelined workload. For `LibCall` the tally key includes the
 /// library id and function index.
-fn count_sync(req: &Request, op: Op) {
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-    static COUNTS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
-    let key = match req {
+fn sync_key(req: &Request, op: Op) -> String {
+    match req {
         Request::LibCall { lib, func, .. } => format!("LibCall(lib={lib},func={func})"),
         Request::ModuleGetFunction { name, .. } => format!("ModuleGetFunction({name})"),
         Request::FuncGetParamInfo { function } => format!("FuncGetParamInfo(fid={function})"),
         Request::ModuleLoadData { image } => format!("ModuleLoadData(len={})", image.len()),
         _ => format!("{op:?}"),
-    };
+    }
+}
+
+/// Tally one sync round-trip: count AND total wall time per op class, dumped
+/// every 4096 calls ranked by TIME (counts alone pointed at high-frequency
+/// cheap ops; the gap hides in where the microseconds actually go).
+fn count_sync_key(key: &str, dur: std::time::Duration) {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    #[allow(clippy::type_complexity)]
+    static COUNTS: Mutex<Option<HashMap<String, (u64, u128)>>> = Mutex::new(None);
     let mut g = COUNTS.lock().unwrap();
     let m = g.get_or_insert_with(HashMap::new);
-    *m.entry(key).or_insert(0) += 1;
-    let total: u64 = m.values().sum();
+    let e = m.entry(key.to_string()).or_insert((0, 0));
+    e.0 += 1;
+    e.1 += dur.as_micros();
+    let total: u64 = m.values().map(|(n, _)| n).sum();
     if total.is_multiple_of(4096) {
         let mut v: Vec<_> = m.iter().collect();
-        v.sort_by(|a, b| b.1.cmp(a.1));
-        eprintln!("[sync-counts after {total}]");
-        for (k, n) in v.iter().take(12) {
-            eprintln!("  {n:>8}  {k}");
+        v.sort_by_key(|b| std::cmp::Reverse(b.1 .1));
+        eprintln!("[sync-times after {total}]");
+        for (k, (n, us)) in v.iter().take(12) {
+            eprintln!("  {:>9.1}ms {n:>7}x  {k}", *us as f64 / 1000.0);
         }
     }
 }
@@ -189,6 +198,15 @@ pub struct Client<S> {
     sticky: i32,
     /// Kill-switch: `SMOLVM_CUDA_ASYNC=0` restores strict per-call round-trips.
     defer_enabled: bool,
+    /// Sync-elision: true when NO op that could enqueue device work has been
+    /// issued since the last successful synchronize. `clean_all` means a
+    /// context-wide sync established it (covers every stream); otherwise only
+    /// `clean_stream` is known settled. bnb-style workloads synchronize the
+    /// same stream dozens of times per training step with no work in between
+    /// — each elided sync saves a full host round-trip.
+    clean: bool,
+    clean_all: bool,
+    clean_stream: u64,
     /// Framed-but-unsent deferred requests. Batching them into one write turns
     /// a launch storm's thousand syscalls into a handful; flushed before any
     /// read (a response can only exist for a request the host has seen).
@@ -221,6 +239,9 @@ impl<S: Read + Write> Client<S> {
             deferred: 0,
             sticky: 0,
             defer_enabled: std::env::var("SMOLVM_CUDA_ASYNC").as_deref() != Ok("0"),
+            clean: false,
+            clean_all: false,
+            clean_stream: 0,
             wbuf: Vec::new(),
             journal: Vec::new(),
         }
@@ -265,6 +286,39 @@ impl<S: Read + Write> Client<S> {
             req: unsafe { crate::ring::Ring::from_pages(req.0, page_size) },
             resp: unsafe { crate::ring::Ring::from_pages(resp.0, page_size) },
             bounce: bounce.0,
+            page_size,
+        });
+        Ok(())
+    }
+
+    /// File-backed ring setup (DAX clone transport): the caller mmap'd
+    /// `fname` (inside the guest's dax ring mount) MAP_SHARED and hands the
+    /// page pointers here; the host mmaps the same file through the dir its
+    /// proxy advertised. Layout: req pages, then resp, then bounce.
+    pub fn ring_setup_file(
+        &mut self,
+        page_size: usize,
+        fname: &str,
+        req: Vec<*mut u8>,
+        resp: Vec<*mut u8>,
+        bounce: Vec<*mut u8>,
+    ) -> Result<()> {
+        self.call(
+            &Request::RingSetupFile {
+                page_size: page_size as u32,
+                req_n: req.len() as u32,
+                resp_n: resp.len() as u32,
+                bounce_n: bounce.len() as u32,
+                fname: fname.as_bytes().to_vec(),
+            },
+            Op::RingSetupFile,
+        )?;
+        // SAFETY: the file mapping is owned by the shim and stays mapped for
+        // the process lifetime (never munmap'd).
+        self.ring = Some(ClientRing {
+            req: unsafe { crate::ring::Ring::from_pages(req, page_size) },
+            resp: unsafe { crate::ring::Ring::from_pages(resp, page_size) },
+            bounce,
             page_size,
         });
         Ok(())
@@ -541,6 +595,7 @@ impl<S: Read + Write> Client<S> {
     }
 
     fn call_deferred_kind(&mut self, req: &Request, op: Op, _is_libcall: bool) -> Result<()> {
+        self.clean = false; // deferred work dirties the pipeline
         if !self.defer_enabled || sync_forced(req, op) {
             return self.call(req, op).map(|_| ());
         }
@@ -629,9 +684,41 @@ impl<S: Read + Write> Client<S> {
     }
 
     fn call(&mut self, req: &Request, op: Op) -> Result<Response> {
-        if std::env::var_os("SMOLVM_CUDA_COUNT_SYNC").is_some() {
-            count_sync(req, op);
+        // Sync-elision bookkeeping: only ops that can leave PENDING device
+        // work dirty the pipeline. Pure queries return existing state, and
+        // the blocking transfer forms complete before the host responds —
+        // after either, a stream with nothing else outstanding is still
+        // settled. Everything not whitelisted dirties (conservative).
+        match op {
+            Op::StreamSynchronize
+            | Op::CtxSynchronize
+            | Op::EventSynchronize
+            | Op::DeviceGetCount
+            | Op::DeviceGetName
+            | Op::DeviceTotalMem
+            | Op::DriverGetVersion
+            | Op::DeviceGetAttribute
+            | Op::DeviceGetUuid
+            | Op::ModuleGetFunction
+            | Op::FuncGetParamInfo
+            | Op::FuncGetAttribute
+            | Op::MemAlloc
+            | Op::MemFree
+            | Op::MemGetInfo
+            | Op::MemcpyDtoH
+            | Op::MemcpyShmDtoH
+            | Op::MemcpyGpaDtoH
+            | Op::StreamQuery
+            | Op::EventQuery
+            | Op::EventCreate
+            | Op::EventDestroy
+            | Op::EventElapsedTime
+            | Op::StreamCaptureInfo => {}
+            _ => self.clean = false,
         }
+        static TALLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let tally = *TALLY.get_or_init(|| std::env::var_os("SMOLVM_CUDA_COUNT_SYNC").is_some());
+        let t0 = tally.then(std::time::Instant::now);
         let payload = if self.ring.is_some() {
             self.ring_roundtrip(&encode_request(req))?
         } else if let Some(b) = self.bridge {
@@ -652,6 +739,9 @@ impl<S: Read + Write> Client<S> {
             p
         };
         let (status, resp) = decode_response(op, &payload)?;
+        if let Some(t0) = t0 {
+            count_sync_key(&sync_key(req, op), t0.elapsed());
+        }
         if status != 0 {
             return Err(CudaRpcError::Cuda(status));
         }
@@ -663,6 +753,7 @@ impl<S: Read + Write> Client<S> {
     /// mode (`SMOLVM_CUDA_ASYNC=0`) the request round-trips instead and a
     /// failure status is collected as this connection's sticky error.
     pub fn raw_quiet(&mut self, payload: &[u8]) -> Result<()> {
+        self.clean = false; // bridged driver-shim work dirties the pipeline
         if !self.defer_enabled {
             let resp = self.raw_call(payload)?;
             if resp.len() >= 4 {
@@ -680,6 +771,19 @@ impl<S: Read + Write> Client<S> {
     /// the raw response payload — the status stays in-band for the peer to
     /// decode, so nothing is lost to error mapping.
     pub fn raw_call(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
+        self.clean = false; // bridged driver-shim work dirties the pipeline
+        static TALLY_RAW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *TALLY_RAW.get_or_init(|| std::env::var_os("SMOLVM_CUDA_COUNT_SYNC").is_some()) {
+            let t0 = std::time::Instant::now();
+            let r = self.raw_call_inner(payload);
+            let key = format!("Bridged(0x{:02x})", payload.first().copied().unwrap_or(0));
+            count_sync_key(&key, t0.elapsed());
+            return r;
+        }
+        self.raw_call_inner(payload)
+    }
+
+    fn raw_call_inner(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
         if self.ring.is_some() {
             return self.ring_roundtrip(payload);
         }
@@ -751,7 +855,7 @@ impl<S: Read + Write> Client<S> {
         // also populates the server cache.
         if image.len() >= 64 {
             let mut blob = Vec::with_capacity(32);
-            blob.extend_from_slice(&crate::host::fnv64(image).to_le_bytes());
+            blob.extend_from_slice(&crate::proto::fnv64(image).to_le_bytes());
             blob.extend_from_slice(&(image.len() as u64).to_le_bytes());
             blob.extend_from_slice(&image[..8]);
             blob.extend_from_slice(&image[image.len() - 8..]);
@@ -965,6 +1069,11 @@ impl<S: Read + Write> Client<S> {
     }
 
     pub fn ctx_synchronize(&mut self) -> Result<()> {
+        // Clean-pipeline elision: nothing was issued since a context-wide
+        // sync completed, so there is nothing to wait for — skip the trip.
+        if self.clean && self.clean_all && self.sticky == 0 {
+            return Ok(());
+        }
         // Settle fire-and-forget work first: a quiet op's failure lives in the
         // HOST's sticky slot and only a fence reports it — and synchronize is
         // exactly CUDA's contract point for surfacing asynchronous errors.
@@ -972,6 +1081,8 @@ impl<S: Read + Write> Client<S> {
         // fork clone couldn't rebuild) returns success + stale data.
         self.drain()?;
         self.call(&Request::CtxSynchronize, Op::CtxSynchronize)?;
+        self.clean = true;
+        self.clean_all = true;
         // Surface any asynchronous failure collected by the drain, the way
         // cudaDeviceSynchronize reports errors from earlier async work.
         match self.take_sticky() {
@@ -1097,11 +1208,20 @@ impl<S: Read + Write> Client<S> {
     }
 
     pub fn stream_synchronize(&mut self, stream: u64) -> Result<()> {
+        // Clean-pipeline elision: no device work was issued since the last
+        // successful sync whose scope covers this stream (same stream, or a
+        // context-wide sync). bnb-heavy steps repeat this dozens of times.
+        if self.clean && self.sticky == 0 && (self.clean_all || self.clean_stream == stream) {
+            return Ok(());
+        }
         self.drain()?; // see ctx_synchronize: fences surface quiet failures
         self.call(
             &Request::StreamSynchronize { stream },
             Op::StreamSynchronize,
         )?;
+        self.clean = true;
+        self.clean_all = false;
+        self.clean_stream = stream;
         match self.take_sticky() {
             0 => Ok(()),
             code => Err(CudaRpcError::Cuda(code)),
@@ -1145,13 +1265,21 @@ impl<S: Read + Write> Client<S> {
     }
 
     pub fn event_destroy(&mut self, event: u64) -> Result<()> {
-        self.call(&Request::EventDestroy { event }, Op::EventDestroy)
-            .map(|_| ())
+        // No return value: fire-and-forget. torch's allocator churns events
+        // (~2,500 destroys/short run); a sync round-trip each was pure tax.
+        // Ordered in the pipeline, so it runs after every prior use of `event`.
+        self.call_deferred_kind(&Request::EventDestroy { event }, Op::EventDestroy, false)
     }
 
     pub fn event_record(&mut self, event: u64, stream: u64) -> Result<()> {
-        self.call(&Request::EventRecord { event, stream }, Op::EventRecord)
-            .map(|_| ())
+        // No return value (also graph-capturable): fire-and-forget. It flushes
+        // before any sync that reads the event (EventQuery/Synchronize/
+        // ElapsedTime), so the record is always ordered before its reader.
+        self.call_deferred_kind(
+            &Request::EventRecord { event, stream },
+            Op::EventRecord,
+            false,
+        )
     }
 
     pub fn event_synchronize(&mut self, event: u64) -> Result<()> {

@@ -1218,7 +1218,26 @@ impl RunCmd {
             expose_docker: self.docker_socket || params.docker_socket,
             dns_filter_hosts: params.dns_filter_hosts.clone(),
             packed_layers_dir,
-            extra_disks: Vec::new(),
+            extra_disks: std::env::var("SMOLVM_EXTRA_DISK")
+                .ok()
+                .into_iter()
+                .flat_map(|spec| {
+                    spec.split(',')
+                        .filter(|s| !s.is_empty())
+                        .map(|entry| {
+                            let (path, ro) = match entry.strip_suffix(":ro") {
+                                Some(p) => (p, true),
+                                None => (entry, false),
+                            };
+                            (
+                                std::path::PathBuf::from(path),
+                                ro,
+                                smolvm::data::disk::DiskFormat::Raw,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect(),
             ..Default::default()
         };
 
@@ -2842,17 +2861,53 @@ pub struct ForkCmd {
     /// inference); use a plain fork when the clone trains the base weights.
     #[arg(long)]
     pub share_weights: bool,
+
+    /// Per-fork parameter (repeatable, KEY=VALUE). Delivered to the clone as
+    /// `/run/smolvm/fork-env` (dotenv format) for the already-running workload
+    /// to read, and merged into the clone's env for later `machine exec`
+    /// sessions. This is how sweep/rollout clones learn which variant they
+    /// are — no shared-mount claim files needed.
+    #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
+    pub env: Vec<String>,
+
+    /// Inject a per-fork secret from a host env var (GUEST_VAR=HOST_VAR),
+    /// resolved fresh on every `exec` in the clone. Unlike `--env`, the value is
+    /// never written to the clone's record, the overlay/pack, or the fork-env
+    /// guest file — and each clone's secrets are its own, invisible to the
+    /// golden and sibling clones.
+    #[arg(
+        long = "secret-env",
+        value_name = "GUEST_VAR=HOST_VAR",
+        help_heading = "Security"
+    )]
+    pub secret_env: Vec<String>,
+
+    /// Inject a per-fork secret from a host file (GUEST_VAR=/abs/path), resolved
+    /// fresh on every `exec` in the clone. Never persisted to the record,
+    /// overlay/pack, or fork-env guest file. See `--secret-env`.
+    #[arg(
+        long = "secret-file",
+        value_name = "GUEST_VAR=PATH",
+        help_heading = "Security"
+    )]
+    pub secret_file: Vec<String>,
 }
 
 impl ForkCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let ports: Vec<(u16, u16)> = self.port.iter().map(|p| (p.host, p.guest)).collect();
+        let fork_env = smolvm::util::parse_env_list(&self.env);
+        // Parse per-fork secret refs (TrustedLocal — host env/absolute file);
+        // they merge into the clone's secret_refs and resolve fresh per exec.
+        let fork_secrets = parse_cli_secret_refs(&self.secret_env, &self.secret_file)?;
         vm_common::fork_vm(
             &self.golden,
             &self.clone,
             self.forkable,
             &ports,
             self.share_weights,
+            &fork_env,
+            &fork_secrets,
         )
     }
 }
@@ -2897,6 +2952,12 @@ pub struct DeleteCmd {
     /// Skip confirmation prompt
     #[arg(short, long)]
     pub force: bool,
+
+    /// Also delete any clones forked from this machine. A fork base cannot be
+    /// removed while its clones' disks depend on it; --cascade removes the
+    /// clones first (children before the base). Implies no confirmation.
+    #[arg(long)]
+    pub cascade: bool,
 }
 
 impl DeleteCmd {
@@ -2911,6 +2972,9 @@ impl DeleteCmd {
                 // dir out from under the live VM. The API delete handler and
                 // `delete_vm`'s own teardown already do this.
                 stop_if_running: true,
+                // Delete dependent clones too when requested, instead of
+                // refusing on a fork base.
+                cascade: self.cascade,
             },
         )
     }
@@ -3185,6 +3249,48 @@ impl UpdateCmd {
             }
             PortMapping::check_duplicates(&final_ports)
                 .map_err(|e| smolvm::Error::config("update", e))?;
+        }
+
+        // Validate no duplicate guest mount targets after proposed changes. The
+        // merge below only skips an exact (source,target) re-add, so a new mount
+        // whose guest target collides with a DIFFERENT existing source would
+        // otherwise leave two virtiofs mounts at one guest path — the ambiguous
+        // config create-time validation rejects. Mirror the port check above by
+        // computing the final mount set exactly as the DB closure does, then
+        // rejecting duplicate targets.
+        {
+            let mut final_mounts: Vec<(String, String, bool)> = record.mounts.clone();
+            for rm in &self.remove_volume {
+                let canonical_rm = if let Some((rm_src, rm_tgt)) = rm.split_once(':') {
+                    let resolved = std::fs::canonicalize(rm_src)
+                        .unwrap_or_else(|_| std::path::PathBuf::from(rm_src));
+                    format!("{}:{}", resolved.display(), rm_tgt)
+                } else {
+                    rm.clone()
+                };
+                final_mounts.retain(|(src, tgt, _)| {
+                    let spec = format!("{}:{}", src, tgt);
+                    spec != canonical_rm && spec != *rm
+                });
+            }
+            for m in &new_mounts {
+                let tuple = m.to_storage_tuple();
+                if !final_mounts
+                    .iter()
+                    .any(|(s, t, _)| *s == tuple.0 && *t == tuple.1)
+                {
+                    final_mounts.push(tuple);
+                }
+            }
+            let mut seen = std::collections::HashSet::new();
+            for (_, tgt, _) in &final_mounts {
+                if !seen.insert(tgt.clone()) {
+                    return Err(smolvm::Error::config(
+                        "update",
+                        format!("duplicate mount target: {tgt} is specified more than once"),
+                    ));
+                }
+            }
         }
 
         // Expand physical disk files before the DB write. If expansion fails,

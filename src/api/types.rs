@@ -360,6 +360,11 @@ pub struct DeleteQuery {
     /// This may orphan the VM process. Default: false.
     #[serde(default)]
     pub force: bool,
+    /// If true, also delete any clones forked from this machine before removing
+    /// it. A fork base cannot be removed while its clones' overlays depend on
+    /// its disks; cascade removes those clones first. Default: false.
+    #[serde(default)]
+    pub cascade: bool,
 }
 
 // ============================================================================
@@ -543,31 +548,6 @@ pub struct CreateMachineRequest {
     pub workdir: Option<String>,
 }
 
-/// Request to execute a command in a machine.
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct MachineExecRequest {
-    /// Command and arguments.
-    #[schema(example = json!(["echo", "hello"]))]
-    pub command: Vec<String>,
-    /// Environment variables.
-    #[serde(default)]
-    pub env: Vec<EnvVar>,
-    /// Ad-hoc secret refs. Rejected unless empty (untrusted scope).
-    #[serde(default)]
-    #[schema(value_type = Object)]
-    pub secrets: RequestSecretRefs,
-    /// Working directory.
-    #[serde(default)]
-    pub workdir: Option<String>,
-    /// Timeout in seconds.
-    #[serde(default)]
-    pub timeout_secs: Option<u64>,
-    /// Data to pipe to the command's stdin.
-    #[serde(default)]
-    pub stdin: Option<String>,
-}
-
 /// Machine status information.
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -728,4 +708,18 @@ pub struct ForkRequest {
     /// the base stays frozen (LoRA/QLoRA fine-tuning, inference).
     #[serde(default)]
     pub share_weights: bool,
+    /// Per-fork parameters as KEY=VALUE strings. Delivered to the clone at
+    /// `/run/smolvm/fork-env` (dotenv format) for the already-running workload
+    /// to read, and merged into the clone's env for later exec sessions.
+    #[serde(default)]
+    pub env: Vec<String>,
+    /// Per-fork secrets as `SecretRef`s (host env var / absolute file). Merged
+    /// into the clone's persisted `secret_refs`, overriding same-named refs
+    /// inherited from the golden — so each clone gets its OWN secrets, resolved
+    /// fresh on every `exec`, never written to the overlay/artifact or a guest
+    /// file, and isolated from the golden and sibling clones. This is the
+    /// fork-safe path: unlike `env`, the plaintext never lands at rest.
+    #[serde(default)]
+    #[schema(value_type = Object)]
+    pub secrets: RequestSecretRefs,
 }

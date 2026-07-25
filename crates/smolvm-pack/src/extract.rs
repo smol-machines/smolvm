@@ -266,14 +266,18 @@ fn verify_parent_within_dest(path: &Path, real_dest: &Path) -> std::io::Result<(
     Ok(())
 }
 
-/// Safely unpack a tar archive, rejecting symlinks, hardlinks, and entries
-/// that resolve outside `dest`.
+/// Safely unpack a tar archive: symlinks and hardlinks are allowed only when
+/// their targets stay within `dest`, and any entry that resolves outside `dest`
+/// is rejected.
 ///
 /// The standard `tar::Archive::unpack()` strips `..` components but does
-/// **not** reject symlinks. A crafted archive could create
+/// **not** validate symlink targets. A crafted archive could create
 /// `lib/libkrun.dylib → /tmp/evil.so`, and subsequent `dlopen()` would
-/// load the attacker's library. This function rejects any entry that is
-/// not a regular file or directory.
+/// load the attacker's library. This function validates every symlink and
+/// hardlink target against `dest` (rejecting escaping links and absolute
+/// links that alias the destination root) and opens regular files with
+/// `O_NOFOLLOW` plus a canonicalized-parent check, so a write can never
+/// follow a planted symlink out of `dest`.
 fn safe_unpack<R: Read>(archive: &mut tar::Archive<R>, dest: &Path) -> std::io::Result<()> {
     safe_unpack_with_limits(archive, dest, &SafeUnpackLimits::from_env())
 }
@@ -1464,6 +1468,16 @@ pub fn has_active_leases(cache_dir: &Path) -> bool {
 /// `pack prune` — prune should check `has_active_leases` first and skip
 /// active caches.
 pub fn force_detach_layers_volume(cache_dir: &Path) {
+    // A fork clone's cache dir is a symlink to its golden's — the clone doesn't
+    // own the volume or the leases behind it, so detaching through the link
+    // would rip the layers out from under the frozen golden and its siblings.
+    if cache_dir
+        .symlink_metadata()
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return;
+    }
     #[cfg(target_os = "macos")]
     {
         let mount_point = cache_dir.join(CS_MOUNT_DIR);

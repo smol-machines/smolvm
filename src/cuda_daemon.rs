@@ -73,6 +73,125 @@ fn spawn_idle_watchdog(active: Arc<AtomicUsize>, timeout: Duration) {
         .ok();
 }
 
+/// Reap dead clone-worker children so they don't accumulate as zombies. The
+/// daemon forks a worker per clone; the reconnect path reaps a worker only if
+/// that clone reconnects (see route_clone_connection), but a worker that dies
+/// at teardown — including the teardown SIGSEGV — with no reconnect was never
+/// waited on and became a zombie. Over a long run these fill the process table
+/// (observed: 288 `<defunct>` after ~42 fork cycles), risking PID exhaustion
+/// and fork failures that slow clone startup. A background reaper drains all
+/// exited children; it coexists with the targeted reconnect reap (whichever
+/// waits first wins; the other simply sees the child already gone).
+#[cfg(unix)]
+fn spawn_child_reaper() {
+    thread::Builder::new()
+        .name("cuda-daemon-reaper".into())
+        .spawn(|| loop {
+            // Drain every exited child without blocking.
+            loop {
+                let mut status: libc::c_int = 0;
+                // SAFETY: WNOHANG waitpid(-1) on our own children; never blocks.
+                let r = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+                // 0 = children exist but none exited yet; <=0 (incl. -1/ECHILD
+                // when there are no children) = nothing to reap right now.
+                if r <= 0 {
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_secs(2));
+        })
+        .ok();
+}
+
+#[cfg(not(unix))]
+fn spawn_child_reaper() {}
+
+/// Sweep clone-worker processes left behind by a PRIOR daemon that died without
+/// reaping them (crash or SIGKILL — neither runs the clean-shutdown handler).
+/// Called at startup ONLY when no live daemon answers the socket, so any process
+/// still running `_cuda-clone-worker` is orphaned and is pinning a GPU context;
+/// killing it lets the next golden's CUDA init proceed cleanly. Identifies
+/// workers by argv (NUL-separated `/proc/<pid>/cmdline`) rather than a registry,
+/// so it catches workers from a daemon instance that is already gone.
+#[cfg(unix)]
+fn reap_orphan_workers() {
+    let me = std::process::id();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return;
+    };
+    let mut killed = 0u32;
+    for ent in entries.flatten() {
+        let name = ent.file_name();
+        let Some(pid) = name.to_str().and_then(|s| s.parse::<i32>().ok()) else {
+            continue;
+        };
+        if pid as u32 == me {
+            continue;
+        }
+        let Ok(cmdline) = std::fs::read(ent.path().join("cmdline")) else {
+            continue;
+        };
+        if cmdline
+            .split(|&b| b == 0)
+            .any(|arg| arg == b"_cuda-clone-worker")
+        {
+            // SAFETY: kill(pid, SIGKILL) on a process we identified by argv as an
+            // orphaned clone worker; the daemon that parented it is already gone.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+            killed += 1;
+        }
+    }
+    if killed > 0 {
+        tracing::warn!(
+            count = killed,
+            "swept orphaned clone-worker(s) from a dead prior daemon"
+        );
+        // Let the driver release the killed workers' GPU contexts before we serve.
+        thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// Install a clean-shutdown handler for SIGTERM/SIGINT: unlink the control
+/// socket and SIGKILL our own process group (this daemon + its clone workers),
+/// so a `pkill`/`kill` of the daemon never leaves GPU-pinning workers or a stale
+/// socket node behind. Without this a killed daemon orphaned its workers and the
+/// next golden's CUDA init stalled on their lingering context.
+#[cfg(unix)]
+fn install_shutdown_handler(sock: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    static SOCK_C: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
+    let _ = SOCK_C.set(std::ffi::CString::new(sock.as_os_str().as_bytes()).unwrap_or_default());
+    unsafe extern "C" fn on_term(_sig: libc::c_int) {
+        // async-signal-safe only: OnceLock::get (atomic load) + unlink + getpgrp
+        // + getpid + kill + _exit.
+        if let Some(c) = SOCK_C.get() {
+            unsafe {
+                libc::unlink(c.as_ptr());
+            }
+        }
+        // Only group-kill when we actually lead our own group — never nuke the
+        // shell/ssh that launched us if setpgid(0, 0) did not take.
+        if unsafe { libc::getpgrp() } == unsafe { libc::getpid() } {
+            unsafe {
+                libc::kill(0, libc::SIGKILL);
+            }
+        }
+        unsafe {
+            libc::_exit(0);
+        }
+    }
+    for sig in [libc::SIGTERM, libc::SIGINT] {
+        // SAFETY: installing a handler that only unlinks + group-kills + _exits.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = on_term as *const () as usize;
+            libc::sigaction(sig, &sa, std::ptr::null_mut());
+        }
+    }
+}
+
 /// Run the daemon body: bind `sock` and serve every connection in its own
 /// thread against a fresh backend — all in this process, so they share one GPU
 /// context. Returns only on listener failure; otherwise exits via the idle
@@ -89,13 +208,43 @@ pub(crate) fn install_crash_handler(role: &'static str) {
     static ROLE: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
     let _ = ROLE.set(role);
     unsafe extern "C" fn on_fatal(sig: libc::c_int) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        // A fault raised while already handling one (the capture itself
+        // faulted — e.g. the original crash was inside malloc and the
+        // allocating Backtrace deadlocked or re-crashed) must not recurse:
+        // go straight to the default action so the process dies and dumps.
+        static IN_HANDLER: AtomicBool = AtomicBool::new(false);
+        if IN_HANDLER.swap(true, Ordering::SeqCst) {
+            unsafe {
+                libc::signal(sig, libc::SIG_DFL);
+                libc::raise(sig);
+            }
+            return;
+        }
+        // If the capture deadlocks (malloc lock held by the faulting thread),
+        // SIGALRM's default action ends the process instead of wedging the
+        // worker forever ("FATAL signal 11; backtrace:" with no frames).
+        unsafe { libc::alarm(5) };
         let role = ROLE.get().copied().unwrap_or("cuda-proc");
         eprintln!("[{role}] FATAL signal {sig}; backtrace:");
+        smolvm_cuda::host::op_ring_dump();
         eprintln!("{}", std::backtrace::Backtrace::force_capture());
         unsafe {
             libc::signal(sig, libc::SIG_DFL);
             libc::raise(sig);
         }
+    }
+    // A stack-overflow SIGSEGV cannot run its handler on the overflowed
+    // stack; SA_ONSTACK only helps if an alternate stack is registered on
+    // the thread. Best-effort: register one for this (installing) thread.
+    unsafe {
+        static mut ALT_STACK: [u8; 256 * 1024] = [0; 256 * 1024];
+        let ss = libc::stack_t {
+            ss_sp: std::ptr::addr_of_mut!(ALT_STACK) as *mut libc::c_void,
+            ss_flags: 0,
+            ss_size: 256 * 1024,
+        };
+        libc::sigaltstack(&ss, std::ptr::null_mut());
     }
     for sig in [libc::SIGSEGV, libc::SIGABRT, libc::SIGBUS, libc::SIGILL] {
         // SAFETY: installing a handler that only formats + re-raises.
@@ -112,10 +261,39 @@ pub(crate) fn install_crash_handler(role: &'static str) {
 pub fn run(sock: &Path) -> io::Result<()> {
     #[cfg(unix)]
     install_crash_handler("cuda-daemon");
+    // Become our own process-group leader so a clean-shutdown signal can take the
+    // whole group (this daemon + its clone workers) down together without ever
+    // touching the shell/ssh session that launched us. The `ensure_running` spawn
+    // path already sets this at fork; this also covers a direct `_cuda-daemon &`.
+    // SAFETY: setpgid(0, 0) on self; harmless best-effort (ignore EPERM if we are
+    // already a session leader).
+    #[cfg(unix)]
+    unsafe {
+        libc::setpgid(0, 0);
+    }
     if let Some(parent) = sock.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::remove_file(sock); // caller serialized us; clear any stale node
+    // Refuse to double-bind: a live daemon on this socket already owns the GPU.
+    // Clobbering its socket node would orphan it (still holding the GPU context)
+    // and split state across two daemons — the "new golden hangs forever" bug.
+    if is_alive(sock) {
+        tracing::warn!(socket = %sock.display(),
+            "a CUDA daemon already owns this socket; not starting a second one");
+        return Ok(());
+    }
+    // No live daemon answered, but a prior one may have died (crash / SIGKILL)
+    // without reaping its clone-worker children. Those workers still pin the GPU
+    // context, so the next golden's CUDA init stalls on it. Sweep them before we
+    // bind — this is the self-heal for stale post-fork daemon/IPC state.
+    #[cfg(unix)]
+    reap_orphan_workers();
+    // Drop any stale socket node, then arm the clean-shutdown handler (unlink the
+    // socket + take the process group down on SIGTERM/SIGINT) so a `pkill` of the
+    // daemon never leaks workers or a stale socket node.
+    let _ = std::fs::remove_file(sock);
+    #[cfg(unix)]
+    install_shutdown_handler(sock);
     let listener = UdsListener::bind(sock)?;
     tracing::info!(socket = %sock.display(), "shared CUDA daemon listening");
     let active = Arc::new(AtomicUsize::new(0));
@@ -148,12 +326,17 @@ pub fn run(sock: &Path) -> io::Result<()> {
                                         // remote clone VM's proxy) route to a worker or
                                         // are rejected; a golden's reconnect (token, no
                                         // preamble) falls through to in-daemon serving.
-                                        if route_clone_connection(s.as_raw_fd()) {
+                                        let rdir = consume_ring_dir_preamble(s.as_raw_fd());
+                                        if route_clone_connection(
+                                            s.as_raw_fd(),
+                                            rdir.as_deref(),
+                                            None,
+                                        ) {
                                             drop(s); // worker owns it / rejected
                                             continue;
                                         }
                                     }
-                                    spawn_serve(s, &active_tcp, None);
+                                    spawn_serve(s, &active_tcp, None, None);
                                 }
                                 Err(e) => {
                                     tracing::debug!(error = %e, "CUDA daemon TCP accept error")
@@ -173,6 +356,7 @@ pub fn run(sock: &Path) -> io::Result<()> {
             spawn_idle_watchdog(active.clone(), timeout);
         }
     }
+    spawn_child_reaper();
     for stream in listener.incoming() {
         match stream {
             // Count the connection open for the whole serve loop so a frozen golden
@@ -186,18 +370,20 @@ pub fn run(sock: &Path) -> io::Result<()> {
                 // would silently serve it a reconstructed COPY of its memory.
                 // Only fires under SMOLVM_CUDA_FORK_WORKERS; otherwise legacy.
                 #[cfg(unix)]
-                let guest_ram = {
+                let (guest_ram, ring_dir) = {
                     use std::os::unix::io::AsRawFd;
                     let ram = consume_ram_preamble(stream.as_raw_fd());
-                    if route_clone_connection(stream.as_raw_fd()) {
+                    let rdir = consume_ring_dir_preamble(stream.as_raw_fd());
+                    let procmem = consume_procmem_preamble(stream.as_raw_fd());
+                    if route_clone_connection(stream.as_raw_fd(), rdir.as_deref(), procmem) {
                         drop(stream); // worker owns it / rejected
                         continue;
                     }
-                    ram
+                    (ram, rdir)
                 };
                 #[cfg(not(unix))]
-                let guest_ram = None;
-                spawn_serve(stream, &active, guest_ram);
+                let (guest_ram, ring_dir) = (None, None::<String>);
+                spawn_serve(stream, &active, guest_ram, ring_dir);
             }
             Err(e) => tracing::debug!(error = %e, "CUDA daemon accept error"),
         }
@@ -211,8 +397,12 @@ pub fn run(sock: &Path) -> io::Result<()> {
 /// `guest_ram`: daemon-local mappings of the VM's guest RAM (from the RAM
 /// preamble) — installing them enables the ring transport + zero-copy GPA
 /// memcpys for this connection.
-fn spawn_serve<S>(stream: S, active: &Arc<AtomicUsize>, guest_ram: Option<Vec<(u64, u64, u64)>>)
-where
+fn spawn_serve<S>(
+    stream: S,
+    active: &Arc<AtomicUsize>,
+    guest_ram: Option<Vec<(u64, u64, u64)>>,
+    ring_dir: Option<String>,
+) where
     S: std::io::Read + std::io::Write + Send + 'static,
 {
     let guard = ConnGuard::new(active);
@@ -228,11 +418,104 @@ where
                 );
                 backend.set_guest_ram(regions);
             }
+            smolvm_cuda::host::ring_dir_set(ring_dir);
             if let Err(e) = serve(stream, backend.as_mut()) {
                 tracing::debug!(error = %e, "CUDA daemon connection ended");
             }
         })
         .ok();
+}
+
+/// Consume a fork-CLONE proc-mem advertisement (`SMVGPVM1`) if present: the
+/// clone proxy sends `(pid, gpa, host_va, len)` for its LIVE private (COW) guest
+/// RAM after its clone preamble, so the worker can pread/pwrite /proc/<pid>/mem
+/// (a memfd map would be STALE golden bytes). Peek-based; `None` on any old proxy
+/// or golden connection (leaves the bytes untouched for the RPC serve loop).
+/// A fork clone's live-RAM advert: its pid + (gpa, host_va, len) regions.
+type ProcMemAdvert = (u32, Vec<(u64, u64, u64)>);
+
+/// Serialize a proc-mem advert into the worker env value (see `procmem_from_env`).
+fn procmem_to_env(pid: u32, regions: &[(u64, u64, u64)]) -> String {
+    let mut out = pid.to_string();
+    for (g, h, l) in regions {
+        out.push_str(&format!(";{g},{h},{l}"));
+    }
+    out
+}
+
+/// Parse the `SMOLVM_CUDA_CLONE_PROCMEM` worker env back into a proc-mem advert.
+fn procmem_from_env() -> Option<ProcMemAdvert> {
+    let v = std::env::var("SMOLVM_CUDA_CLONE_PROCMEM").ok()?;
+    let mut it = v.split(';');
+    let pid: u32 = it.next()?.parse().ok()?;
+    let mut regions = Vec::new();
+    for part in it {
+        let mut c = part.split(',');
+        let g: u64 = c.next()?.parse().ok()?;
+        let h: u64 = c.next()?.parse().ok()?;
+        let l: u64 = c.next()?.parse().ok()?;
+        regions.push((g, h, l));
+    }
+    (!regions.is_empty()).then_some((pid, regions))
+}
+
+fn consume_procmem_preamble(fd: std::os::unix::io::RawFd) -> Option<ProcMemAdvert> {
+    let mut hdr = [0u8; 20];
+    let mut n = 0isize;
+    for _ in 0..200 {
+        n = unsafe {
+            libc::recv(
+                fd,
+                hdr.as_mut_ptr() as *mut libc::c_void,
+                hdr.len(),
+                libc::MSG_PEEK,
+            )
+        };
+        if n >= 8 && &hdr[..8] != b"SMVGPVM1" {
+            return None; // not ours; leave the bytes untouched
+        }
+        if n >= 20 || n == 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    if n < 20 || &hdr[..8] != b"SMVGPVM1" {
+        return None;
+    }
+    let pid = u32::from_le_bytes(hdr[8..12].try_into().unwrap());
+    let count = u32::from_le_bytes(hdr[12..16].try_into().unwrap()) as usize;
+    if count == 0 || count > 64 {
+        return None;
+    }
+    let total = 20 + count * 24;
+    let mut buf = vec![0u8; total];
+    let mut got = 0usize;
+    while got < total {
+        let r = unsafe {
+            libc::recv(
+                fd,
+                buf[got..].as_mut_ptr() as *mut libc::c_void,
+                total - got,
+                0,
+            )
+        };
+        if r <= 0 {
+            return None;
+        }
+        got += r as usize;
+    }
+    let mut regions = Vec::with_capacity(count);
+    for i in 0..count {
+        let o = 20 + i * 24;
+        let gpa = u64::from_le_bytes(buf[o..o + 8].try_into().unwrap());
+        let hva = u64::from_le_bytes(buf[o + 8..o + 16].try_into().unwrap());
+        let len = u64::from_le_bytes(buf[o + 16..o + 24].try_into().unwrap());
+        if len == 0 {
+            return None;
+        }
+        regions.push((gpa, hva, len));
+    }
+    Some((pid, regions))
 }
 
 /// Consume a guest-RAM advertisement preamble if present (peek-based; absent on
@@ -241,6 +524,60 @@ where
 /// `(gpa, daemon_va, len)` for `Backend::set_guest_ram`. Mappings are leaked
 /// (VM-lifetime; bounded by connections-with-adverts). Same-uid access only —
 /// exactly the trust boundary the daemon already has with its VMs.
+/// Consume a ring-dir advertisement (`SMVRDIR1` + u16 len + host path) if
+/// present. Returns the HOST directory backing the VM's dax ring mount, which
+/// `RingSetupFile` on this connection resolves file names against.
+#[cfg(unix)]
+fn consume_ring_dir_preamble(fd: std::os::unix::io::RawFd) -> Option<String> {
+    let mut hdr = [0u8; 10];
+    let mut n: isize = 0;
+    // SAFETY: MSG_PEEK of the fixed header on a valid fd; loop because proxied
+    // bytes can arrive in pieces.
+    for _ in 0..200 {
+        n = unsafe {
+            libc::recv(
+                fd,
+                hdr.as_mut_ptr() as *mut libc::c_void,
+                hdr.len(),
+                libc::MSG_PEEK,
+            )
+        };
+        if n >= 8 && &hdr[..8] != b"SMVRDIR1" {
+            return None; // not ours; leave the bytes untouched
+        }
+        if n >= 10 || n == 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    if n < 10 || &hdr[..8] != b"SMVRDIR1" {
+        return None;
+    }
+    let len = u16::from_le_bytes(hdr[8..10].try_into().unwrap()) as usize;
+    if len == 0 || len > 512 {
+        return None;
+    }
+    let total = 10 + len;
+    let mut buf = vec![0u8; total];
+    let mut got = 0usize;
+    while got < total {
+        // SAFETY: plain recv into our buffer.
+        let r = unsafe {
+            libc::recv(
+                fd,
+                buf[got..].as_mut_ptr() as *mut libc::c_void,
+                total - got,
+                0,
+            )
+        };
+        if r <= 0 {
+            return None;
+        }
+        got += r as usize;
+    }
+    String::from_utf8(buf[10..].to_vec()).ok()
+}
+
 #[cfg(unix)]
 fn consume_ram_preamble(fd: std::os::unix::io::RawFd) -> Option<Vec<(u64, u64, u64)>> {
     let mut hdr = [0u8; 20];
@@ -386,6 +723,8 @@ type SeedHandles = (
 pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
     use std::os::unix::io::FromRawFd;
     install_crash_handler("cuda-clone-worker");
+    // File-ring transport (per-worker: one worker == one clone VM == one dir).
+    smolvm_cuda::host::ring_dir_set(std::env::var("SMOLVM_CUDA_CLONE_RING_DIR").ok());
     let mut backend = make_backend();
     // Our own primary context (separate process ⇒ own UVA), so we can place memory
     // at the golden's exact VAs.
@@ -396,6 +735,24 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     let _ = backend.primary_ctx_retain(clone_dev);
+    // Clone transport: consume the proc-mem advert (SMVGPVM1) the clone proxy
+    // sent right after its clone preamble, so D2H/H2D reach the clone's LIVE
+    // guest RAM via /proc/<pid>/mem instead of the ring-copy fallback.
+    if let Some((pid, regions)) = procmem_from_env() {
+        let n = regions.len();
+        if backend.set_guest_ram_procmem(pid, regions) {
+            tracing::info!(
+                pid,
+                count = n,
+                "cuda clone-worker: proc-mem live-RAM transport enabled"
+            );
+        } else {
+            tracing::warn!(
+                pid,
+                "cuda clone-worker: proc-mem unavailable; ring-copy fallback"
+            );
+        }
+    }
     // Seed state for late-attached guest channels (see the attach listener
     // below): each attached channel serves on its own thread, and every
     // translation table is thread-local — new threads must be seeded with
@@ -458,6 +815,11 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
         // inherited graph/exec handles to the worker's rebuilt reals.
         let nrebuilt = smolvm_cuda::host::rebuild_clone_graphs(backend.as_mut(), graphs);
         let _ = std::fs::remove_file(&modpath);
+        // P3b: pre-warm NOW (module reloads + graph re-capture into the
+        // process-wide registries), while the guest VM is still resuming —
+        // serving sessions adopt the results instead of doing this work on
+        // the guest's first CUDA call.
+        smolvm_cuda::host::prewarm_clone_worker(backend.as_mut());
         tracing::info!(
             modules = nm,
             functions = nf,
@@ -539,6 +901,12 @@ fn serve_attached_channel(
     let mut backend = make_backend();
     let _ = backend.init();
     let _ = backend.primary_ctx_retain(dev);
+    if let Some((pid, regions)) = procmem_from_env() {
+        backend.set_guest_ram_procmem(pid, regions);
+    }
+    // File-ring transport: attached channels serve on their own threads, and
+    // the ring dir is per-worker (thread-local install per serve thread).
+    smolvm_cuda::host::ring_dir_set(std::env::var("SMOLVM_CUDA_CLONE_RING_DIR").ok());
     let (vmm, handles, alloc) = seed;
     if let Some(v) = vmm {
         smolvm_cuda::host::set_vmm_trans(v.clone());
@@ -674,7 +1042,27 @@ fn reconstruct_golden_memory(
             let mut ok = false;
             if let Ok(gh) = import_with_retry(b, 4 + idx) {
                 if b.mem_map(va, size, 0, gh).is_ok() {
-                    if b.mem_set_access(va, size, device).is_ok() {
+                    // READ-ONLY by default. A shared chunk is one the golden's
+                    // H2Ds wrote and nothing has touched since (verified at fork
+                    // time), so a clone has no business writing it. Mapping it
+                    // read-write means a post-fork base write — unsloth's
+                    // embedding fixup is a KERNEL write, invisible to the COW
+                    // path, which only sees explicit mem ops — silently races
+                    // across every clone sharing that physical (loss=nan).
+                    // Read-only makes that fail-stop instead: the write faults,
+                    // and since each clone worker owns its context the blast
+                    // radius is that one clone, with the shared bytes intact for
+                    // its siblings. A warmed golden never trips it (its writes
+                    // happen pre-fork, so verification already marked those
+                    // chunks private): measured 8/8 clean, 0 faults, same
+                    // 260-shared/160-private split as read-write.
+                    // SMOLVM_CUDA_SHARE_RO=0 restores read-write sharing.
+                    let set = if std::env::var("SMOLVM_CUDA_SHARE_RO").as_deref() == Ok("0") {
+                        b.mem_set_access(va, size, device)
+                    } else {
+                        b.mem_set_access_ro(va, size, device)
+                    };
+                    if set.is_ok() {
                         ok = true;
                     } else {
                         let _ = b.mem_unmap(va, size); // roll back for the fallback
@@ -1022,12 +1410,35 @@ fn reconstruct_golden_modules(
             lib_handles.push((lib, func, h, args));
         }
     }
+    // P3b: capture-replay op-logs (absent in older blobs). Installed into a
+    // thread-local for the serving session to drain and replay lazily.
+    let mut noplogs = 0usize;
+    if p < buf.len() {
+        let ng = ru32!();
+        let mut oplogs: Vec<(u64, u64, Vec<Vec<u8>>)> = Vec::with_capacity(ng as usize);
+        for _ in 0..ng {
+            let graph_vh = ru64!();
+            let exec_vh = ru64!();
+            let nops = ru32!();
+            let mut ops = Vec::with_capacity(nops as usize);
+            for _ in 0..nops {
+                let olen = ru32!() as usize;
+                need!(olen);
+                ops.push(buf[p..p + olen].to_vec());
+                p += olen;
+            }
+            oplogs.push((graph_vh, exec_vh, ops));
+        }
+        noplogs = oplogs.len();
+        smolvm_cuda::host::set_worker_graph_oplogs(oplogs);
+    }
     tracing::info!(
         nmods,
         nfuncs,
         nstreams,
         nevents,
         ngraphs = graphs.len(),
+        noplogs,
         streams = stream_trans.len(),
         events = event_trans.len(),
         lib_handles = lib_handles.len(),
@@ -1118,11 +1529,59 @@ fn clone_worker_registry() -> &'static Mutex<std::collections::HashMap<(u64, u64
 /// token-bearing Init WITHOUT the preamble must resume in-daemon (a worker
 /// would silently serve it a reconstructed COPY of its memory).
 #[cfg(unix)]
-fn route_clone_connection(fd: std::os::unix::io::RawFd) -> bool {
+fn route_clone_connection(
+    fd: std::os::unix::io::RawFd,
+    ring_dir: Option<&str>,
+    procmem: Option<ProcMemAdvert>,
+) -> bool {
     let Some((clone_id, flags)) = consume_clone_preamble(fd) else {
         return false;
     };
     let share_weights = flags & 1 != 0;
+    // Warm dial (flag bit 1): the clone VM's proxy dials at STARTUP so worker
+    // spawn (CUDA init + memory reconstruction + module/graph pre-warm) runs
+    // concurrent with guest resume instead of on the guest's first CUDA call.
+    // No Init ever arrives on this connection — it parks as the worker's idle
+    // primary channel. The golden token is inferred from the registered
+    // layouts (unambiguous with one golden; otherwise skip and let the real
+    // channel spawn with its true token).
+    if flags & 2 != 0 {
+        let mut reg = clone_worker_registry().lock().unwrap();
+        let live = reg.iter().find_map(|(&(_, cid), &(pid, ctrl))| {
+            // SAFETY: kill(pid, 0) — pure liveness probe, no signal delivered.
+            (cid == clone_id && unsafe { libc::kill(pid as i32, 0) } == 0).then_some((pid, ctrl))
+        });
+        if let Some((_pid, ctrl)) = live {
+            // Worker already up (a real channel won the race): park there.
+            let _ = send_fd(ctrl, fd);
+            return true;
+        }
+        let tokens = smolvm_cuda::host::layout_tokens();
+        let [token] = tokens[..] else {
+            tracing::info!(
+                clone_id,
+                goldens = tokens.len(),
+                "warm dial: cannot infer golden token; deferring spawn to first real channel"
+            );
+            return false;
+        };
+        match spawn_clone_worker(fd, token, share_weights, ring_dir, procmem.clone()) {
+            Ok((pid, ctrl)) => {
+                reg.insert((token, clone_id), (pid, ctrl));
+                tracing::info!(
+                    token,
+                    clone_id,
+                    worker_pid = pid,
+                    "warm dial: spawned clone worker ahead of first CUDA call"
+                );
+                return true;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, token, clone_id, "warm dial: worker spawn failed");
+                return false;
+            }
+        }
+    }
     let Some(token) = peek_clone_token(fd) else {
         // A clone VM's connection whose Init carries no lineage token. The
         // guest treats CUDA state as process-global, so if this clone already
@@ -1219,7 +1678,38 @@ fn route_clone_connection(fd: std::os::unix::io::RawFd) -> bool {
         // SAFETY: control fd of a dead/reaped worker.
         unsafe { libc::close(ctrl) };
     }
-    match spawn_clone_worker(fd, token, share_weights) {
+    // A warm-dial worker may be registered under an INFERRED token. A clone
+    // has exactly one golden lineage, so any live worker for this clone_id is
+    // the right one — attach rather than spawning a duplicate (which would
+    // split the clone's CUDA state across two processes).
+    let live = reg.iter().find_map(|(&(t, cid), &(pid, ctrl))| {
+        // SAFETY: kill(pid, 0) — pure liveness probe, no signal delivered.
+        (cid == clone_id && t != token && unsafe { libc::kill(pid as i32, 0) } == 0)
+            .then_some((pid, ctrl))
+    });
+    if let Some((pid, ctrl)) = live {
+        match send_fd(ctrl, fd) {
+            Ok(()) => {
+                tracing::info!(
+                    token,
+                    clone_id,
+                    worker_pid = pid,
+                    "attached tokened clone channel to its (warm-spawned) live worker"
+                );
+                return true;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    token,
+                    clone_id,
+                    worker_pid = pid,
+                    "attach to warm worker failed; spawning fresh"
+                );
+            }
+        }
+    }
+    match spawn_clone_worker(fd, token, share_weights, ring_dir, procmem.clone()) {
         Ok((pid, ctrl)) => {
             reg.insert((token, clone_id), (pid, ctrl));
             tracing::info!(
@@ -1367,7 +1857,7 @@ fn verify_chunk_content(b: &mut dyn Backend, ch: &smolvm_cuda::host::HandoffChun
         Ok(bytes) => ch.segs.iter().all(|&(s, e, crc)| {
             crc != 0
                 && e as usize <= bytes.len()
-                && smolvm_cuda::host::fnv64(&bytes[s as usize..e as usize]) == crc
+                && smolvm_cuda::proto::fnv64(&bytes[s as usize..e as usize]) == crc
         }),
         Err(e) => {
             tracing::warn!(e, va = ch.va, "M2-share: verify D2H failed → private");
@@ -1447,6 +1937,8 @@ fn spawn_clone_worker(
     conn_fd: std::os::unix::io::RawFd,
     token: u64,
     share_weights: bool,
+    ring_dir: Option<&str>,
+    procmem: Option<ProcMemAdvert>,
 ) -> io::Result<(u32, std::os::unix::io::RawFd)> {
     use std::os::unix::process::CommandExt;
     // Gather the golden's VMM layout (reservations + maps→physical handle).
@@ -1635,6 +2127,19 @@ fn spawn_clone_worker(
             blob.extend_from_slice(&(args.len() as u32).to_le_bytes());
             blob.extend_from_slice(args);
         }
+        // P3b: capture-replay op-logs. Per graph:
+        //   [u64 graph_vh][u64 exec_vh][u32 nops]([u32 len][op bytes])*
+        let oplogs = smolvm_cuda::host::graph_oplogs_snapshot(token);
+        blob.extend_from_slice(&(oplogs.len() as u32).to_le_bytes());
+        for (graph_vh, exec_vh, ops) in &oplogs {
+            blob.extend_from_slice(&graph_vh.to_le_bytes());
+            blob.extend_from_slice(&exec_vh.to_le_bytes());
+            blob.extend_from_slice(&(ops.len() as u32).to_le_bytes());
+            for op in ops {
+                blob.extend_from_slice(&(op.len() as u32).to_le_bytes());
+                blob.extend_from_slice(op);
+            }
+        }
         let _ = std::fs::create_dir_all("/tmp/smolvm");
         // Unique per SPAWN, not per (token, conn_fd): fd numbers are reused as
         // soon as the daemon closes a spawned worker's copy, so two clones forked
@@ -1674,6 +2179,16 @@ fn spawn_clone_worker(
     cmd.env("SMOLVM_CUDA_CLONE_LAYOUT", layout);
     cmd.env("SMOLVM_CUDA_CLONE_DEVICE", golden_dev.to_string());
     cmd.env("SMOLVM_CUDA_CLONE_CTRL", ctrl_slot.to_string());
+    // Clone live-RAM transport: hand the worker our (pid, gpa, host_va, len) so
+    // it can pread/pwrite /proc/<pid>/mem for D2H/H2D instead of ring-copying.
+    if let Some((pid, regions)) = &procmem {
+        cmd.env("SMOLVM_CUDA_CLONE_PROCMEM", procmem_to_env(*pid, regions));
+    }
+    if let Some(rd) = ring_dir {
+        // File-ring transport: the worker resolves RingSetupFile names
+        // against the clone VM's advertised host ring dir.
+        cmd.env("SMOLVM_CUDA_CLONE_RING_DIR", rd);
+    }
     // Per-fork density: this fork asked for --share-weights (preamble flag), so
     // the worker's reconstruction shares the golden's loaded weight physicals
     // instead of copying them. The daemon-wide env remains the global default;

@@ -142,6 +142,14 @@ impl RestartConfig {
     /// Determine whether the machine should be restarted based on the policy,
     /// exit code, and current restart count.
     pub fn should_restart(&self, exit_code: Option<i32>) -> bool {
+        // An explicit user stop suppresses auto-restart for every policy until an
+        // explicit start clears the flag — a machine the operator stopped must
+        // stay stopped (matching `docker stop` on a restart-policy container),
+        // not be resurrected by the supervisor. Only `unless-stopped` consulted
+        // this flag before, so `always`/`on-failure` machines were un-stoppable.
+        if self.user_stopped {
+            return false;
+        }
         // Check max retries limit (0 = unlimited)
         if self.max_retries > 0 && self.restart_count >= self.max_retries {
             return false;
@@ -150,7 +158,7 @@ impl RestartConfig {
             RestartPolicy::Never => false,
             RestartPolicy::Always => true,
             RestartPolicy::OnFailure => exit_code != Some(0),
-            RestartPolicy::UnlessStopped => !self.user_stopped,
+            RestartPolicy::UnlessStopped => true,
         }
     }
 
@@ -963,6 +971,26 @@ mod tests {
                 None,
                 false,
                 "unless-stopped user stopped",
+            ),
+            // An explicit user stop suppresses restart for every policy, not just
+            // unless-stopped — otherwise always/on-failure machines can't be stopped.
+            (
+                RestartPolicy::Always,
+                0,
+                0,
+                true,
+                None,
+                false,
+                "always but user stopped",
+            ),
+            (
+                RestartPolicy::OnFailure,
+                0,
+                0,
+                true,
+                Some(1),
+                false,
+                "on-failure non-zero but user stopped",
             ),
         ];
 

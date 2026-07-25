@@ -415,9 +415,9 @@ pub fn parse_duration_secs(s: &str) -> Option<u64> {
     if let Some(n) = s.strip_suffix('s') {
         n.parse().ok()
     } else if let Some(n) = s.strip_suffix('m') {
-        n.parse::<u64>().ok().map(|n| n * 60)
+        n.parse::<u64>().ok().and_then(|n| n.checked_mul(60))
     } else if let Some(n) = s.strip_suffix('h') {
-        n.parse::<u64>().ok().map(|n| n * 3600)
+        n.parse::<u64>().ok().and_then(|n| n.checked_mul(3600))
     } else {
         s.parse().ok() // bare number = seconds
     }
@@ -617,5 +617,13 @@ init = ["echo hello"]
         assert_eq!(parse_duration_secs("5m"), Some(300));
         assert_eq!(parse_duration_secs("2h"), Some(7200));
         assert_eq!(parse_duration_secs("42"), Some(42));
+    }
+
+    #[test]
+    fn parse_duration_secs_rejects_overflow() {
+        // A value that fits in u64 but overflows when scaled to seconds must
+        // return None, not panic (debug) or wrap to a garbage duration (release).
+        assert_eq!(parse_duration_secs("18446744073709551615h"), None);
+        assert_eq!(parse_duration_secs("18446744073709551615m"), None);
     }
 }

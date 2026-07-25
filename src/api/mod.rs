@@ -88,7 +88,6 @@ use state::ApiState;
         handlers::machines::fork_machine,
         handlers::machines::stop_machine,
         handlers::machines::delete_machine,
-        handlers::machines::exec_machine,
         handlers::machines::resize_machine,
         handlers::machines::export_machine,
     ),
@@ -105,7 +104,6 @@ use state::ApiState;
         types::PullImageRequest,
         types::DeleteQuery,
         types::LogsQuery,
-        types::MachineExecRequest,
         types::ResizeMachineRequest,
         types::ForkRequest,
         types::ExportRequest,
@@ -193,6 +191,7 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .route("/{id}/start", post(handlers::machines::start_machine))
         .route("/{id}/fork", post(handlers::machines::fork_machine))
         .route("/{id}/stop", post(handlers::machines::stop_machine))
+        .route("/{id}/resize", post(handlers::machines::resize_machine))
         .route("/{id}/export", post(handlers::machines::export_machine))
         .route("/{id}", delete(handlers::machines::delete_machine))
         // Exec routes

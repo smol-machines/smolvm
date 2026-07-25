@@ -190,6 +190,14 @@ impl Ring {
     /// Producer: does the consumer need a doorbell kick? (Checked after
     /// publishing; clears the flag when set so exactly one kick is sent.)
     pub fn take_parked(&self) -> bool {
+        // StoreLoad barrier: our record publish (the head advance in try_push)
+        // MUST be globally visible before we read PARKED. Without it, the head
+        // store (Release) reorders after this flag load, so a consumer that
+        // parks concurrently reads a stale head (sleeps) while we read a stale
+        // (clear) PARKED and skip the kick -> LOST WAKEUP: the consumer sleeps
+        // forever and is never doorbelled. This was the fork-clone sync stall
+        // (worker parked, guest never kicked its CtxSynchronize request).
+        std::sync::atomic::fence(Ordering::SeqCst);
         let flags = self.header_atomic(OFF_FLAGS);
         if flags.load(Ordering::SeqCst) & FLAG_PARKED != 0 {
             flags.fetch_and(!FLAG_PARKED, Ordering::SeqCst) & FLAG_PARKED != 0
