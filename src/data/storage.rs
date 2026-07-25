@@ -56,6 +56,7 @@ impl HostMount {
         ("/var/run", true),
         ("/var/log", true),
         ("/etc", true),
+        ("/boot", true),
         ("/usr", true),
         ("/bin", true),
         ("/sbin", true),
@@ -145,12 +146,17 @@ impl HostMount {
             .iter()
             .map(|spec| Self::_parse(spec))
             .collect::<Result<_>>()?;
+        Self::ensure_unique_targets(&mounts)?;
+        Ok(mounts)
+    }
 
-        // Reject duplicate guest targets. Silently letting a later `-v`
-        // shadow an earlier one (second-wins) hides a likely user mistake
-        // and makes the effective mount ambiguous.
+    /// Reject duplicate guest targets. Silently letting a later mount shadow an
+    /// earlier one at the same guest path (second-wins) hides a likely mistake
+    /// and makes the effective mount ambiguous. Enforced on both the CLI (`-v`)
+    /// and the HTTP create paths so they behave identically.
+    pub fn ensure_unique_targets(mounts: &[Self]) -> Result<()> {
         let mut seen = std::collections::HashSet::new();
-        for m in &mounts {
+        for m in mounts {
             if !seen.insert(&m.target) {
                 return Err(Error::mount(
                     "validate mounts",
@@ -161,8 +167,7 @@ impl HostMount {
                 ));
             }
         }
-
-        Ok(mounts)
+        Ok(())
     }
 
     fn validate(mount: &Self) -> Result<()> {
@@ -252,6 +257,31 @@ mod tests {
         assert!(HostMount::parse(&[format!("{a}:/app"), format!("{b}:/data")]).is_ok());
     }
 
+    #[test]
+    fn ensure_unique_targets_guards_the_http_path() {
+        // The HTTP create handler builds HostMounts via TryFrom (which does not
+        // dedup) and relies on this helper for the same duplicate-target guard
+        // the CLI gets through parse(). Exercise it directly on that collection.
+        let base = std::env::temp_dir();
+        let a = base.join("smolvm_dup_http_a");
+        let b = base.join("smolvm_dup_http_b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let dup = vec![
+            HostMount::new(&a, "/data", true).unwrap(),
+            HostMount::new(&b, "/data", true).unwrap(),
+        ];
+        assert!(HostMount::ensure_unique_targets(&dup)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate mount target"));
+        let ok = vec![
+            HostMount::new(&a, "/data", true).unwrap(),
+            HostMount::new(&b, "/logs", true).unwrap(),
+        ];
+        assert!(HostMount::ensure_unique_targets(&ok).is_ok());
+    }
+
     fn parse_one(spec: &str) -> HostMount {
         HostMount::parse(&[spec.to_string()]).unwrap().remove(0)
     }
@@ -273,6 +303,29 @@ mod tests {
                 "Error should explain that {} cannot be mounted, got: {}",
                 path,
                 err_msg
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_validate_rejects_boot_subtree() {
+        // `/boot` holds the kernel and bootloader config; mounting it read-write
+        // into a guest that scribbles on it can leave the host unbootable, so it
+        // belongs alongside the other protected system paths. Exercise `validate`
+        // directly so the assertion holds where `/boot` is absent (e.g. CI
+        // containers), which `HostMount::new` would otherwise reject earlier as
+        // not-found.
+        for path in ["/boot", "/boot/grub"] {
+            let mount = HostMount {
+                source: PathBuf::from(path),
+                target: PathBuf::from("/guest/path"),
+                read_only: true,
+            };
+            let err = HostMount::validate(&mount).unwrap_err().to_string();
+            assert!(
+                err.contains("protected system path"),
+                "{path} should be blocked as a protected path, got: {err}"
             );
         }
     }

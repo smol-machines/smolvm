@@ -29,19 +29,17 @@ use axum::{
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::agent::{vm_data_dir, AgentClient, AgentManager, HostMount};
+use crate::agent::{vm_data_dir, AgentClient, AgentManager, HostMount, PortMapping};
 use crate::api::error::ApiError;
 use crate::api::state::{
     vm_resources_to_spec, with_machine_client_traced, ApiState, MachineEntry, MachineRegistration,
     ReservationGuard,
 };
 use crate::api::types::{
-    ApiErrorResponse, CreateMachineRequest, DeleteResponse, EnvVar, ExecResponse, ExportRequest,
-    ExportResponse, ForkRequest, ListMachinesResponse, MachineExecRequest, MachineInfo, MountInfo,
-    MountSpec, PortSpec, ResizeMachineRequest, ResourceSpec, StartMachineQuery,
+    ApiErrorResponse, CreateMachineRequest, DeleteQuery, DeleteResponse, ExportRequest,
+    ExportResponse, ForkRequest, ListMachinesResponse, MachineInfo, MountInfo, MountSpec, PortSpec,
+    ResizeMachineRequest, ResourceSpec, StartMachineQuery,
 };
-use crate::api::validate_command;
-use crate::api::TraceId;
 use crate::config::{RecordState, RestartConfig, VmRecord};
 use crate::data::disk::{Overlay, Storage};
 use crate::data::validate_vm_name;
@@ -366,6 +364,20 @@ pub async fn create_machine(
         }
     }
 
+    // `cmd`/`entrypoint` are the machine's persistent workload, launched only as
+    // a container from an image or `.smolmachine` artifact (registryRef and any
+    // image-pack-ref have already been folded into `from` above). Reject them on
+    // an imageless machine up front — it boots the bare-agent rootfs with nothing
+    // to launch them in, so silently accepting them would strand a caller whose
+    // command never runs (drive an imageless machine via `exec` instead).
+    validate_workload_image_source(
+        req.image.is_some(),
+        req.from.is_some(),
+        &req.cmd,
+        &req.entrypoint,
+    )
+    .map_err(ApiError::BadRequest)?;
+
     // Generate name if not provided, then validate. The on-disk layout uses
     // a hash-derived directory (see `vm_data_dir`) so name length doesn't
     // affect the socket path — only character sanity + a generous length
@@ -374,9 +386,50 @@ pub async fn create_machine(
     validate_vm_name(&name, "machine name").map_err(ApiError::BadRequest)?;
 
     // Validate mount paths
-    for mount_spec in &req.mounts {
-        HostMount::try_from(mount_spec).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let host_mounts: Vec<HostMount> = req
+        .mounts
+        .iter()
+        .map(|m| HostMount::try_from(m).map_err(|e| ApiError::BadRequest(e.to_string())))
+        .collect::<Result<_, _>>()?;
+    // Reject duplicate guest targets, matching the CLI (HostMount::parse) so an
+    // ambiguous same-target mount is a clean 400 rather than a silent shadow.
+    HostMount::ensure_unique_targets(&host_mounts)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+
+    // Validate published ports, matching the CLI (which rejects these before
+    // launch): port 0 is invalid for forwarding, and each host port may be
+    // mapped only once — two guest ports on one host port can't both bind, so
+    // reject it as a clean 400 rather than an ambiguous mid-boot bind failure.
+    for p in &req.ports {
+        if p.host == 0 || p.guest == 0 {
+            return Err(ApiError::BadRequest(
+                "port 0 is not valid for VM port forwarding".to_string(),
+            ));
+        }
     }
+    let port_mappings: Vec<PortMapping> = req
+        .ports
+        .iter()
+        .map(|p| PortMapping::new(p.host, p.guest))
+        .collect();
+    PortMapping::check_duplicates(&port_mappings).map_err(ApiError::BadRequest)?;
+
+    // Validate and normalize egress CIDRs, matching the CLI's --allow-cidr
+    // parser. Without this a malformed entry is silently dropped at launch
+    // (EgressPolicy::new filter_maps unparseable CIDRs, logging only a warn to
+    // the discarded boot log), leaving egress MORE restrictive than requested
+    // with no error. Normalizing (bare IP -> /32) keeps the stored policy
+    // identical to what the CLI persists.
+    let normalized_cidrs = match &req.allowed_cidrs {
+        Some(cidrs) => Some(
+            cidrs
+                .iter()
+                .map(|c| crate::smolfile::parse_cidr(c))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(ApiError::BadRequest)?,
+        ),
+        None => None,
+    };
 
     // If --from is set, read manifest and extract sidecar
     let (
@@ -509,6 +562,18 @@ pub async fn create_machine(
     // machines. Memory is ballooned, so a generous default does not imply
     // immediate host commitment.
     let (cpus, mem) = resolve_create_resources(&req, manifest_cpus, manifest_mem);
+    // Reject invalid resources up front (as the CLI does at create time), so the
+    // API returns a clear 400 here instead of persisting an unbootable machine
+    // that only fails with a deferred 500 when it is later started.
+    crate::data::resources::VmResources {
+        cpus,
+        memory_mib: mem,
+        storage_gib: req.storage_gb,
+        overlay_gib: req.overlay_gb,
+        ..Default::default()
+    }
+    .validate()
+    .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let network = req.network || manifest_net;
 
     // Reserve the name atomically (prevents concurrent creation)
@@ -661,7 +726,7 @@ pub async fn create_machine(
         cuda: Some(req.cuda),
         storage_gb: req.storage_gb,
         overlay_gb: req.overlay_gb,
-        allowed_cidrs: req.allowed_cidrs.clone(),
+        allowed_cidrs: normalized_cidrs,
         allowed_hosts: req.allowed_hosts.clone(),
         network_backend: req.network_backend,
     };
@@ -671,6 +736,7 @@ pub async fn create_machine(
     // the API surface is refused regardless of server binding — secrets
     // must be configured locally via the CLI.
     crate::api::handlers::validate_request_secrets(&req.secrets)?;
+    crate::api::handlers::validate_request_env(&req.env)?;
 
     // Complete registration: persists to DB + registers in ApiState
     let complete_result = guard.complete(MachineRegistration {
@@ -802,6 +868,31 @@ fn classify_launch_error(e: String) -> ApiError {
     } else {
         ApiError::Internal(e)
     }
+}
+
+/// Reject `cmd`/`entrypoint` on a create request that names no image source.
+///
+/// A machine's `cmd`/`entrypoint` are launched only as a container workload from
+/// an image or `.smolmachine` artifact (see the image-launch path in
+/// [`start_machine`]). An imageless machine boots the bare-agent rootfs with
+/// nothing to run them in, so accepting them silently would strand a caller whose
+/// command never executes. Callers should fold `registryRef` and any pack-ref
+/// into `from`/`image` before this check so only a genuinely imageless request is
+/// rejected.
+fn validate_workload_image_source(
+    has_image: bool,
+    has_from: bool,
+    cmd: &[String],
+    entrypoint: &[String],
+) -> Result<(), String> {
+    if !has_image && !has_from && (!cmd.is_empty() || !entrypoint.is_empty()) {
+        return Err(
+            "cmd/entrypoint require an image, from, or registryRef; an imageless \
+             machine has no workload to launch them in (use exec instead)"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// Start a machine.
@@ -985,13 +1076,32 @@ pub async fn start_machine(
         // no-op on the stop→restart path. Mirrors how the smolmachine source
         // fails a bad artifact at create.
         let image_pull = image.clone();
-        with_machine_client_traced(&entry, None, move |c| {
+        let pull = with_machine_client_traced(&entry, None, move |c| {
             if c.query(&image_pull)?.is_none() {
                 c.pull_with_registry_config(&image_pull)?;
             }
             Ok(())
         })
-        .await?;
+        .await;
+        if let Err(e) = pull {
+            // The agent VM booted above, but the image can't be pulled (bad or
+            // private ref, or no route to the registry). The Running state + pid
+            // are only persisted AFTER this block, so returning now would strand
+            // the booted VM as an untracked orphan — its pid never reaches the
+            // record, and a later delete then reports "process still alive after
+            // shutdown; not removing" while the VM leaks. Tear the VM down so the
+            // machine is left exactly like a never-started one (`created`, no live
+            // process) — cleanly retryable (e.g. once a transient registry outage
+            // clears) and deletable — then surface the pull failure.
+            let st = pid.and_then(process_start_time);
+            let name_rb = name.clone();
+            tokio::task::spawn_blocking(move || {
+                shutdown_machine_process(&name_rb, pid, st, false);
+            })
+            .await
+            .ok();
+            return Err(e);
+        }
         // Launch the workload container. Best-effort past the pull: a transient
         // crun/overlay hiccup leaves a reachable (exec-able) VM rather than
         // failing an otherwise-pullable start — the image is already local, so a
@@ -1024,6 +1134,11 @@ pub async fn start_machine(
             r.state = RecordState::Running;
             r.pid = pid;
             r.pid_start_time = pid_start_time;
+            // An explicit start re-enables supervision: clear the user-stopped
+            // flag and reset the retry budget so a machine that previously
+            // exhausted max_retries can be restarted and supervised again.
+            r.restart.user_stopped = false;
+            r.restart.restart_count = 0;
         })
         .await?
         .ok_or_else(|| {
@@ -1092,6 +1207,33 @@ pub async fn fork_machine(
     let clone = req.name.clone();
     let pinned_ports: Vec<(u16, u16)> = req.ports.iter().map(|p| (p.host, p.guest)).collect();
     let req_share_weights = req.share_weights;
+    let fork_env = crate::util::parse_env_list(&req.env);
+    // Per-fork secrets become the clone's persisted secret_refs (resolved fresh
+    // on each exec, never at rest) — validate them at TrustedLocal like the
+    // Smolfile-declared refs they join.
+    crate::api::handlers::validate_fork_secrets(&req.secrets)?;
+    let fork_secrets = req.secrets.clone();
+
+    // Validate pinned ports as the create path does: fork uses these host ports
+    // as-is (no remapping), so port 0 or a duplicated host port would otherwise
+    // surface only as a confusing clone-boot bind failure instead of a clean 400.
+    for (h, g) in &pinned_ports {
+        if *h == 0 || *g == 0 {
+            return Err(ApiError::BadRequest(
+                "port 0 is not valid for VM port forwarding".to_string(),
+            ));
+        }
+    }
+    {
+        let mut seen = std::collections::HashSet::new();
+        for (h, _) in &pinned_ports {
+            if !seen.insert(*h) {
+                return Err(ApiError::BadRequest(format!(
+                    "duplicate host port {h}: each host port can only be mapped once"
+                )));
+            }
+        }
+    }
 
     // Serialize lifecycle on the CLONE name so a concurrent start/stop/delete of
     // the same clone can't race the fork's register + boot. The golden is only
@@ -1108,9 +1250,11 @@ pub async fn fork_machine(
         let golden_b = golden.clone();
         let clone_b = clone.clone();
         let ports = pinned_ports.clone();
+        let env = fork_env.clone();
+        let secrets = fork_secrets.clone();
         tokio::task::spawn_blocking(move || {
             crate::agent::fork::prepare_fork(
-                &db, &golden_b, &clone_b, &ports, /* clone_forkable */ false,
+                &db, &golden_b, &clone_b, &ports, /* clone_forkable */ false, &env, &secrets,
             )
         })
         .await
@@ -1156,15 +1300,23 @@ pub async fn fork_machine(
         // into a (possibly different) tenant. FAIL-CLOSED: if the reset can't be
         // confirmed, tear the booted clone down and fail the fork rather than
         // vend a clone that impersonates the golden.
+        let teardown = || {
+            manager.kill();
+            manager.cleanup_data_dir();
+            let _ = db.remove_vm(&clone_b);
+        };
         crate::agent::fork::fail_closed_on_rejuvenation(
             crate::agent::fork::rejuvenate_clone(&clone_b),
-            || {
-                manager.kill();
-                manager.cleanup_data_dir();
-                let _ = db.remove_vm(&clone_b);
-            },
+            teardown,
         )
         .map_err(|e| format!("clone identity rejuvenation failed: {}", e))?;
+        // Per-fork parameters: same fail-closed contract — a clone that asked
+        // for parameters but can't receive them must not be vended.
+        crate::agent::fork::fail_closed_on_rejuvenation(
+            crate::agent::fork::write_fork_env(&clone_b, &record, &fork_env),
+            teardown,
+        )
+        .map_err(|e| format!("fork env delivery failed: {}", e))?;
 
         let pid = manager.child_pid();
         Ok::<_, String>((manager, pid, record))
@@ -1231,6 +1383,30 @@ pub async fn stop_machine(
         .lookup_vm(&name)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
+
+    // A frozen fork base must outlive its clones: they CoW-map its guest RAM
+    // (memfd) and CoW-back their disks onto its disks, so stopping it — which
+    // kills the VMM and frees the memfd — corrupts every live clone. `actual_state`
+    // does not resolve the on-the-fly `Frozen` state, so a golden with clones
+    // looks `Running` here and would be torn down. Refuse, mirroring `delete` and
+    // the CLI stop guard.
+    {
+        let db = state.db().clone();
+        let golden = name.clone();
+        let clones = tokio::task::spawn_blocking(move || db.dependent_clones(&golden))
+            .await
+            .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+            .map_err(ApiError::database)?;
+        if !clones.is_empty() {
+            return Err(ApiError::Conflict(format!(
+                "machine '{}' is the fork base of {} live clone(s) ({}); they CoW-map its \
+                 memory and disks — stop or delete the clones first",
+                name,
+                clones.len(),
+                clones.join(", ")
+            )));
+        }
+    }
 
     // Check state
     let actual_state = record.actual_state();
@@ -1312,6 +1488,9 @@ pub async fn stop_machine(
             r.state = RecordState::Stopped;
             r.pid = None;
             r.pid_start_time = None;
+            // Record the explicit stop so the restart supervisor does not
+            // resurrect this machine (any policy) until an explicit start.
+            r.restart.user_stopped = true;
         })
         .await?
         .ok_or_else(|| {
@@ -1388,6 +1567,11 @@ pub async fn drain_machines(state: &Arc<ApiState>) {
                     r.state = RecordState::Stopped;
                     r.pid = None;
                     r.pid_start_time = None;
+                    // A drain is a deliberate decommission: mark the machine
+                    // user-stopped so the restart supervisor does not resurrect it
+                    // in the window before the host is terminated (or if drain is
+                    // used standalone). An explicit start elsewhere clears this.
+                    r.restart.user_stopped = true;
                 })
                 .await;
             tracing::info!(machine = %name, stopped, "drain: machine stopped");
@@ -1413,18 +1597,45 @@ pub async fn drain_machines(state: &Arc<ApiState>) {
     path = "/api/v1/machines/{name}",
     tag = "Machines",
     params(
-        ("name" = String, Path, description = "Machine name")
+        ("name" = String, Path, description = "Machine name"),
+        ("cascade" = Option<bool>, Query, description = "Also delete clones forked from this machine (fork base cannot be removed while its clones depend on it)")
     ),
     responses(
         (status = 200, description = "Machine deleted", body = DeleteResponse),
         (status = 404, description = "Machine not found", body = ApiErrorResponse),
+        (status = 409, description = "Machine is a fork base with live clones (use cascade)", body = ApiErrorResponse),
         (status = 500, description = "Failed to delete", body = ApiErrorResponse)
     )
 )]
 pub async fn delete_machine(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
+    Query(query): Query<DeleteQuery>,
 ) -> Result<Json<DeleteResponse>, ApiError> {
+    // Cascade: remove each dependent clone before the golden so its own delete
+    // (below) sees no dependents. Clones are leaves (launched non-forkable), so
+    // one level is exhaustive; the read is unlocked but delete_one re-checks
+    // under the golden's lifecycle lock, so a clone forked in the race still
+    // refuses rather than dangling.
+    if query.cascade {
+        let db = state.db().clone();
+        let golden = name.clone();
+        let clones = tokio::task::spawn_blocking(move || db.dependent_clones(&golden))
+            .await
+            .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+            .map_err(ApiError::database)?;
+        for clone in clones {
+            delete_one(state.clone(), clone).await?;
+        }
+    }
+    delete_one(state, name).await.map(Json)
+}
+
+/// Delete a single machine (no cascade): stop it, remove it from the registry
+/// and database, and delete its data directory. Refuses if it is a fork base
+/// with live clones. Shared by [`delete_machine`] (once per golden, and once per
+/// clone during a cascade).
+async fn delete_one(state: Arc<ApiState>, name: String) -> Result<DeleteResponse, ApiError> {
     // Hold the per-machine lifecycle lock across the whole delete so the layers
     // volume detach (before the data-dir removal) cannot race a concurrent
     // start's acquire+mount+launch (review finding #3). Acquired before the DB
@@ -1493,6 +1704,32 @@ pub async fn delete_machine(
         )));
     }
 
+    // Re-check for dependent clones now that the golden's process (and its fork
+    // control socket) is down. `fork_machine` locks only the CLONE name, not the
+    // golden, so a fork could have snapshotted + registered a clone between the
+    // initial check above and here. With the golden killed no NEW fork can
+    // snapshot, so this catches that race window. Abort BEFORE removing the DB
+    // record or the data dir — the clones' copy-on-write disks are backed by this
+    // golden's disks, so removing them would be silent data loss. The golden is
+    // left stopped with its disks intact; delete the clones and retry.
+    {
+        let db = state.db().clone();
+        let golden = name.clone();
+        let clones = tokio::task::spawn_blocking(move || db.dependent_clones(&golden))
+            .await
+            .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+            .map_err(ApiError::database)?;
+        if !clones.is_empty() {
+            return Err(ApiError::Conflict(format!(
+                "machine '{}' gained {} clone(s) during deletion ({}); their disks are backed by \
+                 its disks — delete the clones first",
+                name,
+                clones.len(),
+                clones.join(", ")
+            )));
+        }
+    }
+
     // Remove from registry (in-memory + database) in a blocking task: the DB
     // delete is synchronous disk I/O and must not run on an async worker thread,
     // where it would starve the small per-node reactor under delete churn.
@@ -1535,90 +1772,7 @@ pub async fn delete_machine(
         }
     }
 
-    Ok(Json(DeleteResponse { deleted: name }))
-}
-
-/// Execute a command in a machine.
-#[utoipa::path(
-    post,
-    path = "/api/v1/machines/{name}/exec",
-    tag = "Machines",
-    params(
-        ("name" = String, Path, description = "Machine name")
-    ),
-    request_body = MachineExecRequest,
-    responses(
-        (status = 200, description = "Command executed", body = ExecResponse),
-        (status = 400, description = "Invalid request", body = ApiErrorResponse),
-        (status = 404, description = "Machine not found", body = ApiErrorResponse),
-        (status = 409, description = "Machine not running", body = ApiErrorResponse),
-        (status = 500, description = "Execution failed", body = ApiErrorResponse)
-    )
-)]
-pub async fn exec_machine(
-    State(state): State<Arc<ApiState>>,
-    Path(name): Path<String>,
-    trace_id: Option<axum::Extension<TraceId>>,
-    Json(req): Json<MachineExecRequest>,
-) -> Result<Json<ExecResponse>, ApiError> {
-    let tid = trace_id.map(|t| t.0 .0.clone());
-    validate_command(&req.command)?;
-
-    // Load the in-memory machine entry; its `secret_refs` were
-    // populated at create time and updated via start/stop handlers.
-    // This avoids a second DB read per request.
-    let entry = state.get_machine(&name)?;
-    crate::api::handlers::validate_request_secrets(&req.secrets)?;
-    let record_env = crate::api::handlers::record_secret_refs_env(&entry)?;
-    let req_env = crate::api::handlers::resolve_request_secrets(&req.secrets)?;
-
-    let name_clone = name.clone();
-    let command = req.command.clone();
-    let mut env = EnvVar::to_tuples(&req.env);
-    env.extend(crate::secrets::expose_into_env(record_env));
-    env.extend(crate::secrets::expose_into_env(req_env));
-    let workdir = req.workdir.clone();
-    let timeout = req.timeout_secs.map(Duration::from_secs);
-    let stdin_data = req.stdin.clone();
-
-    let result = tokio::task::spawn_blocking(move || {
-        // Get manager and check if running
-        let manager = AgentManager::for_vm(&name_clone)
-            .map_err(|e| SmolvmError::agent("create agent manager", e.to_string()))?;
-
-        if manager.try_connect_existing().is_none() {
-            return Err(SmolvmError::InvalidState {
-                expected: "running".into(),
-                actual: "stopped".into(),
-            });
-        }
-
-        // Execute command
-        let mut client = manager
-            .connect()
-            .map_err(|e| SmolvmError::agent("connect", e.to_string()))?;
-        if let Some(tid) = tid {
-            client.set_trace_id(tid);
-        }
-        let (exit_code, stdout, stderr) = client
-            .vm_exec(command, env, workdir, timeout, stdin_data)
-            .map_err(|e| SmolvmError::agent("exec", e.to_string()))?;
-
-        // Keep VM running (persistent)
-        manager.detach();
-
-        Ok(ExecResponse {
-            exit_code,
-            stdout: String::from_utf8_lossy(&stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&stderr).into_owned(),
-            stdout_b64: stdout,
-            stderr_b64: stderr,
-        })
-    })
-    .await
-    .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
-
-    result.map(Json).map_err(ApiError::from)
+    Ok(DeleteResponse { deleted: name })
 }
 
 /// Resize a machine's disk resources.
@@ -1643,6 +1797,15 @@ pub async fn resize_machine(
     Path(name): Path<String>,
     Json(req): Json<ResizeMachineRequest>,
 ) -> Result<Json<MachineInfo>, ApiError> {
+    // Serialize against start/stop/delete/clone on the same machine: resize
+    // reads the state, then grows the disk files and rewrites the record. Without
+    // the per-machine lifecycle lock a concurrent start could boot the VM between
+    // our "must be stopped" check and the on-disk expansion (and race the record
+    // update), so hold the lock across the whole operation as the other lifecycle
+    // handlers do — the state check below is only meaningful under it.
+    let lifecycle = state.lifecycle_lock(&name);
+    let _guard = lifecycle.lock().await;
+
     let record = state
         .lookup_vm(&name)
         .await?
@@ -1746,6 +1909,14 @@ pub async fn export_machine(
     Path(id): Path<String>,
     Json(req): Json<ExportRequest>,
 ) -> Result<Json<ExportResponse>, ApiError> {
+    // Hold the per-machine lifecycle lock across BOTH the stopped-check and the
+    // pack export below so a concurrent start cannot boot the VM in between and
+    // leave `pack create --from-vm` reading disks that are being written — the
+    // inconsistent-snapshot race the stopped-check alone can't close (start
+    // acquires this same lock). Mirrors start/stop/delete/resize.
+    let lifecycle = state.lifecycle_lock(&id);
+    let _guard = lifecycle.lock().await;
+
     // Resolve the machine record; the path id is the machine name in this API.
     let record = state
         .lookup_vm(&id)
@@ -1961,6 +2132,20 @@ mod tests {
             classify_launch_error(e),
             ApiError::PortConflict(_)
         ));
+    }
+
+    #[test]
+    fn validate_workload_image_source_rejects_imageless_workload() {
+        let cmd = vec!["python".to_string(), "app.py".to_string()];
+        let ep = vec!["/bin/sh".to_string()];
+        // Imageless (no image, no from) + a command/entrypoint → rejected.
+        assert!(validate_workload_image_source(false, false, &cmd, &[]).is_err());
+        assert!(validate_workload_image_source(false, false, &[], &ep).is_err());
+        // With an image or a from source, the workload has somewhere to run.
+        assert!(validate_workload_image_source(true, false, &cmd, &[]).is_ok());
+        assert!(validate_workload_image_source(false, true, &cmd, &ep).is_ok());
+        // Imageless with no workload is the ordinary exec-driven machine.
+        assert!(validate_workload_image_source(false, false, &[], &[]).is_ok());
     }
 
     #[test]

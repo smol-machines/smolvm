@@ -132,6 +132,57 @@ pub(crate) fn validate_request_secrets(
     Ok(())
 }
 
+/// Validate per-fork `secrets` refs. Unlike [`validate_request_secrets`]
+/// (`Untrusted`), fork secrets are operator-declared and become the clone's
+/// *persisted* `secret_refs` — the same trust as a Smolfile's `[secrets]` — so
+/// they resolve under `TrustedLocal` (host env / absolute file allowed). The
+/// key-shape and count caps are identical. NOTE: the cloud control plane must
+/// not forward tenant-controlled refs to a shared node's fork endpoint (that
+/// would resolve against the node's env/files); cloud delivery is a later phase.
+pub(crate) fn validate_fork_secrets(
+    refs: &std::collections::BTreeMap<String, smolvm_protocol::SecretRef>,
+) -> Result<(), ApiError> {
+    if refs.len() > MAX_REQ_SECRETS_PER_REQUEST {
+        return Err(ApiError::BadRequest(format!(
+            "fork `secrets` map has {} entries; maximum is {}",
+            refs.len(),
+            MAX_REQ_SECRETS_PER_REQUEST
+        )));
+    }
+    for (name, r) in refs {
+        check_env_key_shape(name).map_err(|rule| {
+            ApiError::BadRequest(format!(
+                "fork secrets entry with {}-byte key rejected: {}",
+                name.len(),
+                rule
+            ))
+        })?;
+        crate::secrets::validate_ref(r, crate::secrets::ResolutionScope::TrustedLocal)
+            .map_err(|e| ApiError::BadRequest(format!("fork secret '{}': {}", name, e)))?;
+    }
+    Ok(())
+}
+
+/// Validate caller-supplied env var *names* with the same shape rule as secret
+/// keys ([`check_env_key_shape`]). Env *values* stay unrestricted, but a name is
+/// materialized into the guest environment verbatim, so one carrying `=`, a
+/// control character, or a newline could inject or corrupt a second variable in
+/// anything that parses the environment line-by-line. As with secret keys, a
+/// malformed name is not echoed back (only its byte length) since it may hold
+/// control characters. Used by the exec/run/create handlers on `req.env`.
+pub(crate) fn validate_request_env(env: &[crate::api::types::EnvVar]) -> Result<(), ApiError> {
+    for var in env {
+        check_env_key_shape(&var.name).map_err(|rule| {
+            ApiError::BadRequest(format!(
+                "env entry with {}-byte name rejected: {}",
+                var.name.len(),
+                rule
+            ))
+        })?;
+    }
+    Ok(())
+}
+
 /// Resolve request-body `req.secrets` under `Untrusted` scope. Caller
 /// must have already called [`validate_request_secrets`].
 pub(crate) fn resolve_request_secrets(
@@ -170,12 +221,76 @@ mod tests {
     }
 
     #[test]
+    fn validate_request_env_rejects_malformed_names() {
+        use crate::api::types::EnvVar;
+        let ev = |name: &str| EnvVar {
+            name: name.to_string(),
+            value: "v".to_string(),
+        };
+        // Well-formed names pass; values are never inspected.
+        assert!(validate_request_env(&[ev("FOO"), ev("_BAR2")]).is_ok());
+        assert!(validate_request_env(&[]).is_ok());
+        // Injection/corruption-prone names are rejected.
+        for bad in ["", "HAS=EQ", "HAS SPACE", "HAS\nNL", "1LEADINGDIGIT"] {
+            assert!(
+                validate_request_env(&[ev(bad)]).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn validate_request_secrets_accepts_empty_map() {
         // The HTTP API can no longer carry resolvable secret refs (an
         // untrusted caller must not read this host's env/files), so the
         // only request that passes secret validation is one with none.
         let refs = BTreeMap::new();
         assert!(validate_request_secrets(&refs).is_ok());
+    }
+
+    #[test]
+    fn validate_fork_secrets_accepts_host_refs_but_rejects_bad_shape() {
+        // Fork secrets are operator-declared (TrustedLocal), so unlike the
+        // untrusted request path they MAY resolve from host env/absolute files —
+        // they become the clone's persisted secret_refs.
+        let mut refs = BTreeMap::new();
+        refs.insert("GUEST_TOKEN".to_string(), env_ref("HOST_TOKEN"));
+        refs.insert(
+            "GUEST_KEY".to_string(),
+            SecretRef {
+                from_env: None,
+                from_file: Some("/abs/key".into()),
+            },
+        );
+        assert!(
+            validate_fork_secrets(&refs).is_ok(),
+            "host refs must be allowed for fork"
+        );
+
+        // Empty is fine (the common case).
+        assert!(validate_fork_secrets(&BTreeMap::new()).is_ok());
+
+        // A malformed key is still rejected at ingress.
+        let mut bad = BTreeMap::new();
+        bad.insert("HAS=EQ".to_string(), env_ref("HOST"));
+        assert!(matches!(
+            validate_fork_secrets(&bad),
+            Err(ApiError::BadRequest(_))
+        ));
+
+        // A relative file path is rejected (validate_ref TrustedLocal).
+        let mut rel = BTreeMap::new();
+        rel.insert(
+            "K".to_string(),
+            SecretRef {
+                from_env: None,
+                from_file: Some("relative/path".into()),
+            },
+        );
+        assert!(matches!(
+            validate_fork_secrets(&rel),
+            Err(ApiError::BadRequest(_))
+        ));
     }
 
     #[test]

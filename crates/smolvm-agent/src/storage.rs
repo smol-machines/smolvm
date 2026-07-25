@@ -2960,6 +2960,20 @@ pub fn prepare_for_run_persistent(image: &str, overlay_id: &str) -> Result<Prepa
 }
 
 /// Setup volume mounts for a rootfs (public wrapper).
+/// Request mounts merged with the BOOT env mounts (SMOLVM_MOUNT_*): boot-time
+/// binds land in a rootfs the workload's overlay later mounts OVER, so
+/// launcher-injected mounts (e.g. the CUDA ring mount) must ride every
+/// container's own mount list. Request entries win on target collision.
+pub fn merged_with_boot_mounts(mounts: &[(String, String, bool)]) -> Vec<(String, String, bool)> {
+    let mut v: Vec<(String, String, bool)> = mounts.to_vec();
+    for bm in init_volume_mounts() {
+        if !v.iter().any(|(_, t, _)| t == &bm.1) {
+            v.push(bm.clone());
+        }
+    }
+    v
+}
+
 pub fn setup_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Result<()> {
     let _mounted_paths = setup_volume_mounts(rootfs, mounts)?;
     Ok(())
@@ -2995,17 +3009,37 @@ fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Resul
                     }
                 })?;
             let fstype = std::ffi::CString::new("virtiofs").unwrap();
-            let opts = std::ffi::CString::new("sync").unwrap();
+            // DAX first: when the device has a DAX window (host passed a
+            // nonzero shm_size — SMOLVM_MOUNT_DAX=1), a dax mount maps host
+            // page-cache pages directly into the guest, making guest/host
+            // MAP_SHARED mmaps of the same file coherent shared memory (the
+            // clone-ring transport). The kernel silently downgrades dax on a
+            // window-less device; the explicit fallback covers kernels that
+            // reject the option outright.
+            let opts_dax = std::ffi::CString::new("dax,sync").unwrap();
+            let opts_plain = std::ffi::CString::new("sync").unwrap();
             // SAFETY: mount virtiofs with valid CString arguments
-            let rc = unsafe {
+            let mut rc = unsafe {
                 libc::mount(
                     src.as_ptr(),
                     dst.as_ptr(),
                     fstype.as_ptr(),
                     0,
-                    opts.as_ptr() as *const libc::c_void,
+                    opts_dax.as_ptr() as *const libc::c_void,
                 )
             };
+            if rc != 0 {
+                // SAFETY: as above, plain options.
+                rc = unsafe {
+                    libc::mount(
+                        src.as_ptr(),
+                        dst.as_ptr(),
+                        fstype.as_ptr(),
+                        0,
+                        opts_plain.as_ptr() as *const libc::c_void,
+                    )
+                };
+            }
             if rc != 0 {
                 let err = std::io::Error::last_os_error();
                 warn!(error = %err, tag = %tag, "failed to mount virtiofs device");

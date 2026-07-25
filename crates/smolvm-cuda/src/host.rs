@@ -12,7 +12,7 @@
 //! protocol + transport can be exercised on a host with no NVIDIA GPU).
 
 use crate::proto::{
-    decode_request, encode_request, encode_response, read_msg, write_msg, Request, Response,
+    decode_request, encode_request, encode_response, fnv64, read_msg, write_msg, Request, Response,
 };
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -253,6 +253,13 @@ pub trait Backend: Send {
     ) -> CuResult<()> {
         Err(CUDA_ERROR_NOT_FOUND)
     }
+    /// Content hash of the shared-region bytes a [`Self::memcpy_shm_htod`] of
+    /// `(offset, size)` would upload, over payload subrange `[start, end)`.
+    /// Lets Path 3 record a VERIFIABLE crc for a zero-copy upload so the chunk
+    /// stays eligible for fork weight sharing. Default: source unreachable.
+    fn hash_shm_range(&mut self, _offset: u64, _start: u64, _end: u64) -> Option<u64> {
+        None
+    }
     /// Zero-copy D2H: DMA `size` bytes from `dptr` to shared-region `offset`.
     fn memcpy_shm_dtoh(
         &mut self,
@@ -268,6 +275,11 @@ pub trait Backend: Send {
     /// so `memcpy_gpa_*` can read guest memory directly. Set once per connection
     /// by the embedder. Guest RAM is usually split around the 4 GiB PCI hole.
     fn set_guest_ram(&mut self, _regions: Vec<(u64, u64, u64)>) {}
+    /// Fork-CLONE variant: `regions` are the clone's own (gpa, host_va, len);
+    /// the backend reaches its LIVE pages through /proc/<pid>/mem. Default no-op.
+    fn set_guest_ram_procmem(&mut self, _pid: u32, _regions: Vec<(u64, u64, u64)>) -> bool {
+        false
+    }
     /// Zero-copy H2D from guest RAM: gather `segments` and DMA to `dptr`.
     fn memcpy_gpa_htod(
         &mut self,
@@ -276,6 +288,13 @@ pub trait Backend: Send {
         _stream: u64,
     ) -> CuResult<()> {
         Err(CUDA_ERROR_NOT_FOUND)
+    }
+    /// Content hash of the guest-RAM bytes a [`Self::memcpy_gpa_htod`] of
+    /// `segments` would upload, over payload subrange `[start, end)` (offsets
+    /// relative to the first segment's first byte). Path 3 uses it to record a
+    /// verifiable crc for a zero-copy upload; see [`Self::hash_shm_range`].
+    fn hash_gpa_range(&mut self, _segments: &[(u64, u64)], _start: u64, _end: u64) -> Option<u64> {
+        None
     }
     /// Zero-copy D2H to guest RAM: DMA from `dptr` and scatter into `segments`.
     fn memcpy_gpa_dtoh(
@@ -303,6 +322,13 @@ pub trait Backend: Send {
         Err(CUDA_ERROR_NOT_SUPPORTED)
     }
     fn mem_set_access(&mut self, _va: u64, _size: u64, _device: i32) -> CuResult<()> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
+    /// Like `mem_set_access` but READ-ONLY (CU_MEM_ACCESS_FLAGS_PROT_READ). Used
+    /// for `--share-weights` clones so a kernel that writes the shared frozen
+    /// base faults loudly instead of silently corrupting every sibling clone
+    /// that maps the same physical (the N>=3 concurrent-training nan).
+    fn mem_set_access_ro(&mut self, _va: u64, _size: u64, _device: i32) -> CuResult<()> {
         Err(CUDA_ERROR_NOT_SUPPORTED)
     }
     fn mem_unmap(&mut self, _va: u64, _size: u64) -> CuResult<()> {
@@ -406,6 +432,18 @@ struct Session {
     /// exec (real) with node pointers translated to its private copies. Freed via
     /// `owned_graph_reals` on teardown. Empty for non-isolating sessions.
     clone_graph_execs: HashMap<u64, u64>,
+    /// P3b capture-replay recording. `Some((capture stream vh, recorded op
+    /// payloads))` while a stream capture is active on this session. Every
+    /// capturable op (kernel launch, library call, async memset/memcpy, event
+    /// op) issued during the window is recorded verbatim (wire bytes) so a
+    /// clone can RE-CAPTURE the same sequence in its own context — the robust
+    /// alternative to node-by-node graph rebuild, which can't reconstruct
+    /// library-API (cuBLAS) kernels or non-kernel nodes.
+    capture_rec: Option<(u64, Vec<Vec<u8>>)>,
+    /// Worker-side (clone) inherited capture-replay logs, keyed by the golden's
+    /// exec vhandle: the ordered op payloads to re-capture on first launch.
+    /// Drained from the layout at clone resume.
+    clone_graph_oplogs: HashMap<u64, Vec<Vec<u8>>>,
 }
 
 /// Free everything a finished connection still owns. Failures are ignored —
@@ -425,13 +463,19 @@ fn reclaim_session(sess: &mut Session, b: &mut dyn Backend) {
         let _ = b.mem_address_free(va, size);
     }
     for m in std::mem::take(&mut sess.owned_modules) {
-        let _ = b.module_unload(m);
+        if worker_module_take(m) {
+            let _ = b.module_unload(m);
+        }
     }
     for st in std::mem::take(&mut sess.owned_streams) {
-        let _ = b.stream_destroy(st);
+        if worker_handle_take(&WORKER_STREAMS, st) {
+            let _ = b.stream_destroy(st);
+        }
     }
     for e in std::mem::take(&mut sess.owned_events) {
-        let _ = b.event_destroy(e);
+        if worker_handle_take(&WORKER_EVENTS, e) {
+            let _ = b.event_destroy(e);
+        }
     }
     for real in std::mem::take(&mut sess.owned_graph_reals) {
         // Only reals this session created — never a graph inherited from a
@@ -536,12 +580,25 @@ fn path3_enabled() -> bool {
     std::env::var_os("SMOLVM_CUDA_FORK_WORKERS").is_some()
 }
 
-/// Path 3 density opt-in: a clone worker SHARES the golden's loaded (weight)
-/// VMM ranges read-only (IPC-import without copy) instead of privately copying
-/// them. Off by default (the proven path privately copies every range —
-/// correct + isolated but N copies of the weights).
+/// Path 3 density: a clone worker SHARES the golden's loaded (weight) VMM
+/// ranges (IPC-import without copy) instead of privately copying them — one
+/// weight set in VRAM for the whole fork pool instead of one per clone.
+///
+/// ON by default: density is the point of a fork pool, and sharing is
+/// self-limiting because only chunks that pass share verification are shared
+/// (`verify_chunk_content`) — a chunk whose device bytes no longer match what
+/// the H2Ds uploaded (i.e. something wrote it, like unsloth's embedding fixup
+/// during the golden's warmup step) is privately copied instead. Set
+/// `SMOLVM_CUDA_FORK_SHARE_WEIGHTS=0` to force the all-private behaviour.
+///
+/// NOTE: verification only sees writes that happened BEFORE the fork, so the
+/// golden must exercise its write path (warm up) before forking — otherwise a
+/// post-fork write to a shared chunk races across clones.
 pub fn path3_share_weights_enabled() -> bool {
-    std::env::var_os("SMOLVM_CUDA_FORK_SHARE_WEIGHTS").is_some()
+    !matches!(
+        std::env::var("SMOLVM_CUDA_FORK_SHARE_WEIGHTS").as_deref(),
+        Ok("0") | Ok("false") | Ok("off")
+    )
 }
 
 /// P0 transport-viability instrumentation. Counts every dispatched CUDA RPC so we
@@ -594,6 +651,21 @@ fn rtt_us() -> u64 {
 fn graph_patch_enabled() -> bool {
     !matches!(
         std::env::var("SMOLVM_CUDA_FORK_GRAPH_PATCH").as_deref(),
+        Ok("0")
+    )
+}
+
+/// P3b capture-replay: record the golden's capture-window ops and re-capture
+/// them in a clone at first launch (with an eager warmup pass so library
+/// handles bind their streams/workspaces outside the capture window). ON by
+/// default: a worker-process clone can never launch the golden's exec
+/// verbatim (the CUgraphExec is process-local), and node rebuild can't
+/// reproduce library-emitted kernels — replay is the only correct path.
+/// `SMOLVM_CUDA_CLONE_GRAPH_REPLAY=0` disables (falls back to node
+/// rebuild/patch, known-broken for library graphs).
+fn clone_graph_replay_enabled() -> bool {
+    !matches!(
+        std::env::var("SMOLVM_CUDA_CLONE_GRAPH_REPLAY").as_deref(),
         Ok("0")
     )
 }
@@ -688,6 +760,15 @@ struct GoldenLayout {
     /// rebuilds the graph in its own context and maps both virtual handles to
     /// its rebuilt reals, so the clone's inherited `GraphLaunch` resolves.
     graphs: Vec<(u64, u64, GraphSer)>,
+    /// P3b: capture-replay op-logs, `(graph_vh, exec_vh, ordered op payloads)`.
+    /// The worker re-captures the recorded ops in its own context instead of
+    /// rebuilding nodes — the only path that reproduces cuBLAS-kernel and
+    /// non-kernel graph nodes. Preferred over `graphs` when present for an exec.
+    graph_oplogs: Vec<(u64, u64, Vec<Vec<u8>>)>,
+    /// P3b: capture recordings finished (EndCapture) but not yet instantiated,
+    /// keyed by graph_vh; moved into `graph_oplogs` with the exec_vh at
+    /// GraphInstantiate.
+    pending_oplogs: HashMap<u64, Vec<Vec<u8>>>,
     /// Top-level library handles (cuBLAS/cuBLASLt/cuDNN contexts) the golden
     /// created, as `(lib, func, guest handle value, create args)`. Library
     /// handles are process-local; a clone worker replays each create in ITS
@@ -894,6 +975,124 @@ pub fn module_handoff_snapshot(
     Some((modules, funcs, streams, events, graphs, lib_handles))
 }
 
+/// P3b: capture-replay op-logs, `(graph_vh, exec_vh, ordered op payloads)`.
+type GraphOplogs = Vec<(u64, u64, Vec<Vec<u8>>)>;
+
+/// Live golden-layout tokens WITH fork content (staged modules / VMM maps /
+/// library handles). Every guest channel's session registers a layout, but
+/// only the golden's real one carries content — filtering to those makes the
+/// eager warm-dial token inference unambiguous in the single-golden case.
+pub fn layout_tokens() -> Vec<u64> {
+    let reg = LAYOUT_HANDOFF.lock().unwrap();
+    let Some(r) = reg.as_ref() else {
+        return Vec::new();
+    };
+    // One golden's layout Arc is registered under EVERY channel token that
+    // shares it — dedupe by Arc identity, keeping the smallest token per
+    // distinct layout so the result is deterministic.
+    let mut seen: Vec<(*const std::sync::Mutex<GoldenLayout>, u64)> = Vec::new();
+    for (&t, w) in r.iter() {
+        let Some(l) = w.upgrade() else { continue };
+        let has_content = {
+            let g = l.lock().unwrap();
+            !g.modules.is_empty() || !g.maps.is_empty() || !g.lib_handles.is_empty()
+        };
+        if !has_content {
+            continue;
+        }
+        let p = std::sync::Arc::as_ptr(&l);
+        match seen.iter_mut().find(|(sp, _)| *sp == p) {
+            Some((_, st)) => *st = (*st).min(t),
+            None => seen.push((p, t)),
+        }
+    }
+    seen.into_iter().map(|(_, t)| t).collect()
+}
+
+/// P3b: snapshot the golden's capture-replay op-logs for a clone worker,
+/// `(graph_vh, exec_vh, ordered op payloads)`. Separate from
+/// [`module_handoff_snapshot`] so its 6-tuple stays stable.
+pub fn graph_oplogs_snapshot(token: u64) -> GraphOplogs {
+    let reg = LAYOUT_HANDOFF.lock().unwrap();
+    match reg
+        .as_ref()
+        .and_then(|r| r.get(&token))
+        .and_then(|w| w.upgrade())
+    {
+        Some(l) => l.lock().unwrap().graph_oplogs.clone(),
+        None => Vec::new(),
+    }
+}
+
+/// P3b worker: install inherited capture-replay logs for this clone. Drained
+/// into the serving session at clone resume; replayed lazily at first launch.
+pub fn set_worker_graph_oplogs(v: GraphOplogs) {
+    WORKER_GRAPH_OPLOGS.with(|r| *r.borrow_mut() = v);
+}
+
+thread_local! {
+    static WORKER_GRAPH_OPLOGS: std::cell::RefCell<GraphOplogs> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn take_worker_graph_oplogs() -> GraphOplogs {
+    WORKER_GRAPH_OPLOGS.with(|r| std::mem::take(&mut *r.borrow_mut()))
+}
+
+fn worker_graph_oplogs_peek() -> GraphOplogs {
+    WORKER_GRAPH_OPLOGS.with(|r| r.borrow().clone())
+}
+
+/// P3b: pre-warm a clone worker at SPAWN, before any guest channel attaches —
+/// eagerly reload every staged golden module and re-capture every inherited
+/// graph into the process-wide registries. Serving sessions then ADOPT the
+/// results at resume instead of paying reload/re-capture on the guest's first
+/// CUDA call. Must run on the worker main thread AFTER module staging and
+/// lib-handle replay (their thread-locals seed the scratch session).
+/// Opt out: SMOLVM_CUDA_PREREPLAY=0.
+pub fn prewarm_clone_worker(b: &mut dyn Backend) {
+    if std::env::var("SMOLVM_CUDA_PREREPLAY").as_deref() == Ok("0") {
+        return;
+    }
+    let t0 = std::time::Instant::now();
+    let mods: Vec<u64> = MOD_IMAGES.with(|m| m.borrow().keys().copied().collect());
+    let nmods = mods.len();
+    for g in mods {
+        let _ = xlat_mod(b, g);
+    }
+    let t_mods = t0.elapsed().as_millis();
+    // Scratch session: replay dispatch needs pointer translation for
+    // alloc-table clones (VMM clones are address-preserved / identity).
+    let mut sess = Session {
+        dptr_trans: worker_alloc_trans_snapshot(),
+        ..Session::default()
+    };
+    gpu::set_lib_trans(&sess.dptr_trans);
+    let oplogs = worker_graph_oplogs_peek();
+    let (mut ok, mut failed) = (0u32, 0u32);
+    for (_graph_vh, exec_vh, ops) in oplogs {
+        if replayed_exec_get(exec_vh).is_some() {
+            continue;
+        }
+        sess.clone_graph_oplogs.insert(exec_vh, ops);
+        match replay_capture_graph(&mut sess, b, exec_vh) {
+            Ok(exec) => {
+                replayed_exec_put(exec_vh, exec);
+                ok += 1;
+            }
+            Err(e) => {
+                eprintln!("[p3b] spawn pre-replay exec {exec_vh:#x} failed st={e}");
+                failed += 1;
+            }
+        }
+    }
+    eprintln!(
+        "[p3b] spawn pre-warm: {nmods} module(s) in {t_mods} ms, {ok} graph(s) re-captured \
+         ({failed} deferred) in {} ms total",
+        t0.elapsed().as_millis()
+    );
+}
+
 /// Replay the golden's top-level library-handle creates in THIS worker's
 /// process. cuBLAS/cuDNN creates carry the guest-minted id in their args, so
 /// the generated dispatch installs id→worker-handle itself; cuBLASLt returns a
@@ -957,29 +1156,28 @@ pub fn set_vmm_trans(map: HashMap<u64, u64>) {
     VMM_TRANS.with(|m| *m.borrow_mut() = Some(map));
 }
 
-thread_local! {
-    /// Worker-mode: private copies of the golden's non-VMM (`cudaMalloc`)
-    /// allocations, made during reconstruction — `(golden_dptr, size, copy)`.
-    /// Drained into the serving session's `dptr_trans` at clone resume, so the
-    /// clone's inherited pointers translate exactly like the in-daemon isolate
-    /// path (see `alloc_handoff_snapshot`).
-    static WORKER_ALLOC_TRANS: std::cell::RefCell<Vec<(u64, u64, u64)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
+/// Worker-mode: private copies of the golden's non-VMM (`cudaMalloc`)
+/// allocations, made during reconstruction — `(golden_dptr, size, copy)`.
+/// Process-global and NON-draining: every serving thread's isolate session
+/// adopts the same translations at clone resume. This was a drained
+/// thread_local, which made clone survival a scheduling lottery — a channel
+/// served on any thread other than the one that staged the copies (or after
+/// the spawn pre-warm's scratch session drained them) resumed with ZERO
+/// translations, and its first kernel launch dereferenced untranslated golden
+/// addresses (the intermittent one-dead-clone-per-fork bug: "unknown error"
+/// or a worker SIGSEGV). No session takes ownership of the copies — they must
+/// outlive every channel and are reclaimed when the worker process exits.
+static WORKER_ALLOC_TRANS: std::sync::Mutex<Vec<(u64, u64, u64)>> =
+    std::sync::Mutex::new(Vec::new());
 
 pub fn set_worker_alloc_trans(v: Vec<(u64, u64, u64)>) {
-    WORKER_ALLOC_TRANS.with(|r| *r.borrow_mut() = v);
+    *WORKER_ALLOC_TRANS.lock().unwrap() = v;
 }
 
-/// Non-draining copy of this thread's staged alloc translations, taken by the
-/// clone worker's main thread BEFORE serving so late-attached guest channels
-/// (served on other threads) can be seeded with the same map.
+/// Non-draining copy of the worker's staged alloc translations; used both to
+/// seed late-attached channels and by every isolate session at clone resume.
 pub fn worker_alloc_trans_snapshot() -> Vec<(u64, u64, u64)> {
-    WORKER_ALLOC_TRANS.with(|r| r.borrow().clone())
-}
-
-fn take_worker_alloc_trans() -> Vec<(u64, u64, u64)> {
-    WORKER_ALLOC_TRANS.with(|r| std::mem::take(&mut *r.borrow_mut()))
+    WORKER_ALLOC_TRANS.lock().unwrap().clone()
 }
 
 /// M3b: rebuild the golden's captured graphs in THIS worker's context and map
@@ -1058,13 +1256,29 @@ pub fn set_handle_trans(
     MOD_IMAGES.with(|m| {
         let mut m = m.borrow_mut();
         m.clear();
-        m.extend(mod_images);
+        m.extend(mod_images.iter().cloned());
     });
     FUNC_META.with(|m| {
         let mut m = m.borrow_mut();
         m.clear();
-        m.extend(func_meta.into_iter().map(|(f, gm, n, a)| (f, (gm, n, a))));
+        m.extend(
+            func_meta
+                .iter()
+                .cloned()
+                .map(|(f, gm, n, a)| (f, (gm, n, a))),
+        );
     });
+    // Process-global copies too, so a channel served on a thread that was
+    // never seeded still lazy-resolves instead of leaking golden handles.
+    *MOD_IMAGES_GLOBAL.lock().unwrap() = Some(mod_images.into_iter().collect());
+    *FUNC_META_GLOBAL.lock().unwrap() = Some(
+        func_meta
+            .into_iter()
+            .map(|(f, gm, n, a)| (f, (gm, n, a)))
+            .collect(),
+    );
+    *STREAM_TRANS_GLOBAL.lock().unwrap() = Some(streams.iter().copied().collect());
+    *EVENT_TRANS_GLOBAL.lock().unwrap() = Some(events.iter().copied().collect());
     put_h(&STREAM_TRANS, streams);
     put_h(&EVENT_TRANS, events);
 }
@@ -1075,7 +1289,34 @@ fn xlat_mod(b: &mut dyn Backend, golden: u64) -> u64 {
     if let Some(w) = MOD_TRANS.with(|m| m.borrow().get(&golden).copied()) {
         return w;
     }
-    let Some(mut image) = MOD_IMAGES.with(|m| m.borrow().get(&golden).cloned()) else {
+    // Process-global registry: a module some OTHER thread already reloaded
+    // (pre-warm on the resume thread, or a sibling channel's lazy load) is
+    // reused, not loaded again — CUmodule handles are context-wide; only the
+    // mapping was thread-local, which silently duplicated every module per
+    // serve thread that touched it.
+    if let Some(w) = MOD_TRANS_GLOBAL
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(&golden).copied())
+    {
+        MOD_TRANS.with(|m| {
+            m.borrow_mut().insert(golden, w);
+        });
+        return w;
+    }
+    let image = MOD_IMAGES
+        .with(|m| m.borrow().get(&golden).cloned())
+        .or_else(|| {
+            // Unseeded thread: fall back to the process-global copy rather
+            // than returning the golden handle (foreign-handle deref hazard).
+            MOD_IMAGES_GLOBAL
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|m| m.get(&golden).cloned())
+        });
+    let Some(mut image) = image else {
         return golden;
     };
     // Binary images (ELF cubin / fatbin) must reload BYTE-IDENTICAL to what the
@@ -1093,6 +1334,12 @@ fn xlat_mod(b: &mut dyn Backend, golden: u64) -> u64 {
             MOD_TRANS.with(|m| {
                 m.borrow_mut().insert(golden, w);
             });
+            MOD_TRANS_GLOBAL
+                .lock()
+                .unwrap()
+                .get_or_insert_with(HashMap::new)
+                .insert(golden, w);
+            worker_module_register(w);
             w
         }
         Err(e) => {
@@ -1141,7 +1388,19 @@ fn xlat_func(b: &mut dyn Backend, golden: u64) -> u64 {
     if let Some(w) = FUNC_TRANS.with(|m| m.borrow().get(&golden).copied()) {
         return w;
     }
-    let Some((gm, name, attrs)) = FUNC_META.with(|m| m.borrow().get(&golden).cloned()) else {
+    let meta = FUNC_META
+        .with(|m| m.borrow().get(&golden).cloned())
+        .or_else(|| {
+            // Unseeded thread: process-global fallback (see MOD_IMAGES_GLOBAL) —
+            // returning the golden handle here launched foreign functions
+            // ("invalid argument") on channels served by unseeded threads.
+            FUNC_META_GLOBAL
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|m| m.get(&golden).cloned())
+        });
+    let Some((gm, name, attrs)) = meta else {
         return golden;
     };
     let wm = xlat_mod(b, gm);
@@ -1171,17 +1430,92 @@ fn xlat_func(b: &mut dyn Backend, golden: u64) -> u64 {
         }
     }
 }
+// Per-connection host ring directory for file-backed rings, advertised by
+// the per-VM proxy at connect (SMVRDIR1 preamble) and installed by the
+// serving thread before entering `serve`. Thread-local: one serve thread per
+// connection.
+thread_local! {
+    static RING_DIR: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Install (or clear) the file-ring host directory for THIS serve thread.
+pub fn ring_dir_set(dir: Option<String>) {
+    RING_DIR.with(|r| *r.borrow_mut() = dir);
+}
+
+#[cfg(unix)]
+fn ring_dir_get() -> Option<String> {
+    RING_DIR.with(|r| r.borrow().clone())
+}
+
 fn xlat_stream(h: u64) -> u64 {
-    STREAM_TRANS.with(|m| m.borrow().get(&h).copied().unwrap_or(h))
+    // Thread-local first (P3b replay overrides are deliberately per-thread),
+    // then the process-global map for channels served on unseeded threads.
+    if let Some(w) = STREAM_TRANS.with(|m| m.borrow().get(&h).copied()) {
+        return w;
+    }
+    STREAM_TRANS_GLOBAL
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(&h).copied())
+        .unwrap_or(h)
+}
+/// P3b: temporarily redirect a golden stream to a private replay stream.
+/// Returns the previous mapping so the caller can restore it.
+fn stream_trans_override(golden: u64, private: u64) -> Option<u64> {
+    STREAM_TRANS.with(|m| m.borrow_mut().insert(golden, private))
+}
+fn stream_trans_restore(golden: u64, prev: Option<u64>) {
+    STREAM_TRANS.with(|m| {
+        let mut b = m.borrow_mut();
+        match prev {
+            Some(p) => {
+                b.insert(golden, p);
+            }
+            None => {
+                b.remove(&golden);
+            }
+        }
+    });
 }
 fn xlat_event(h: u64) -> u64 {
-    EVENT_TRANS.with(|m| m.borrow().get(&h).copied().unwrap_or(h))
+    if let Some(w) = EVENT_TRANS.with(|m| m.borrow().get(&h).copied()) {
+        return w;
+    }
+    EVENT_TRANS_GLOBAL
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(&h).copied())
+        .unwrap_or(h)
 }
 
 /// Path 3: record this H2D's coverage (+ content CRC) into every golden VMM
 /// chunk it overlaps (see `GoldenLayout.maps`). No-op unless Path 3 is
 /// tracking a golden layout.
 fn mark_loaded_vmm(layout: &LayoutCell, dptr: u64, nbytes: u64, data: Option<&[u8]>) {
+    mark_loaded_vmm_with(layout, dptr, nbytes, |s, e| {
+        data.map_or(0, |d| fnv64(&d[s as usize..e as usize]))
+    })
+}
+
+/// [`mark_loaded_vmm`] for sources the dispatch loop cannot slice directly.
+///
+/// `crc_of(start, end)` hashes the payload subrange `[start, end)` — offsets
+/// relative to the H2D's first byte — and returns 0 when the bytes are
+/// unreachable. The zero-copy paths (shared region / guest RAM) never put the
+/// payload on the socket, but the daemon still READS it to run the DMA, so it
+/// can hash it there. Without this, every zero-copy-uploaded chunk records
+/// crc 0, fails share verification, and gets privately copied into each clone —
+/// silently defeating fork weight sharing (and `SMOLVM_CUDA_ZEROCOPY` is on by
+/// default, so that was every weight chunk of every golden).
+fn mark_loaded_vmm_with(
+    layout: &LayoutCell,
+    dptr: u64,
+    nbytes: u64,
+    mut crc_of: impl FnMut(u64, u64) -> u64,
+) {
     let end = dptr.saturating_add(nbytes);
     let mut g = layout.lock().unwrap();
     for (&base, c) in g.maps.iter_mut() {
@@ -1191,10 +1525,8 @@ fn mark_loaded_vmm(layout: &LayoutCell, dptr: u64, nbytes: u64, data: Option<&[u
         }
         // CRC the PER-CHUNK SLICE of the payload: one H2D spans many chunks,
         // and each chunk must record the hash of its own bytes (crc 0 =
-        // unverifiable → never shared; used when bytes aren't dispatch-visible).
-        let crc = data.map_or(0, |d| {
-            fnv64(&d[(abs_s - dptr) as usize..(abs_e - dptr) as usize])
-        });
+        // unverifiable → never shared).
+        let crc = crc_of(abs_s - dptr, abs_e - dptr);
         let (s, e) = (abs_s - base, abs_e - base);
         // An overlapping re-upload invalidates the prior segment's CRC for its
         // surviving bytes, so overlapped segments are dropped whole
@@ -1261,15 +1593,6 @@ fn module_cache_get(key: &ModuleCacheKey) -> Option<std::sync::Arc<Vec<u8>>> {
     module_cache().lock().unwrap().get(key).cloned()
 }
 
-pub fn fnv64(data: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in data {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h.max(1)
-}
-
 /// Mark the allocation containing `dptr` as loaded (H2D-written → read-only
 /// weight). Called on every host-to-device copy on the golden.
 fn mark_loaded(table: &AllocTable, dptr: u64) {
@@ -1301,6 +1624,7 @@ fn cow_one(sess: &mut Session, b: &mut dyn Backend, dptr: u64) {
     if let Ok(cdptr) = b.mem_alloc(size) {
         let _ = b.memcpy_dtod(cdptr, base, size);
         sess.dptr_trans.push((base, size, cdptr));
+        sort_trans(&mut sess.dptr_trans); // xlat binary-searches by base
         sess.owned_dptrs.insert(cdptr, size);
         sess.alloc_table
             .lock()
@@ -1334,16 +1658,27 @@ fn cow_written(sess: &mut Session, b: &mut dyn Backend, req: &Request) {
 /// pointer inside an inherited allocation `[base, base+size)` maps to the same
 /// offset in the clone's copy; everything else (fresh post-fork allocations,
 /// non-isolating sessions) passes through untouched.
+/// Translate one inherited device pointer through the (base-sorted) table.
+/// Binary search: this runs per 8-byte window of every kernel-param blob on
+/// the serve thread — a linear scan here was O(windows x table) per launch,
+/// a tax only clones paid (goldens have an empty table).
 fn xlat(trans: &[(u64, u64, u64)], p: u64) -> u64 {
-    if p == 0 {
-        return 0;
+    if p == 0 || trans.is_empty() {
+        return p;
     }
-    for &(base, size, copy) in trans {
-        if p >= base && p < base + size {
+    let i = trans.partition_point(|&(base, _, _)| base <= p);
+    if i > 0 {
+        let (base, size, copy) = trans[i - 1];
+        if p < base + size {
             return copy + (p - base);
         }
     }
     p
+}
+
+/// Keep `dptr_trans` base-sorted (see [`xlat`]). Call after any append.
+fn sort_trans(trans: &mut [(u64, u64, u64)]) {
+    trans.sort_unstable_by_key(|t| t.0);
 }
 
 /// Rewrite every inherited device pointer in a memory-op request to the clone's
@@ -1613,6 +1948,40 @@ fn serve_inner<S: Read + Write>(
                         }
                     }
                 }
+                // File-backed rings (DAX clone transport): the rings live in a
+                // file inside the host dir the per-VM proxy advertised; guest
+                // and host mmap the same page-cache pages (coherent), which is
+                // how a COW clone gets ring speed without guest-RAM visibility.
+                if let Request::RingSetupFile {
+                    page_size,
+                    req_n,
+                    resp_n,
+                    bounce_n,
+                    fname,
+                } = req
+                {
+                    #[cfg(unix)]
+                    let mapped = HostRings::map_file(page_size, req_n, resp_n, bounce_n, &fname);
+                    #[cfg(not(unix))]
+                    let mapped: Result<HostRings, i32> = {
+                        let _ = (page_size, req_n, resp_n, bounce_n, &fname);
+                        Err(801)
+                    };
+                    match mapped {
+                        Ok(rings) => {
+                            write_msg(&mut stream, &encode_response(0, &Response::Ok))?;
+                            eprintln!(
+                                "[ring-file] file rings active ({req_n}/{resp_n}/{bounce_n} pages)"
+                            );
+                            return serve_rings(stream, backend, sess, quiet_sticky, rings);
+                        }
+                        Err(code) => {
+                            eprintln!("[ring-file] setup rejected code={code}");
+                            write_msg(&mut stream, &encode_response(code, &Response::Ok))?;
+                            continue;
+                        }
+                    }
+                }
                 ROUNDTRIP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let rtt = rtt_us();
                 if rtt > 0 {
@@ -1676,6 +2045,84 @@ impl HostRings {
         })
     }
 
+    /// File-backed variant (DAX clone rings): mmap `fname` (a bare name inside
+    /// the per-connection advertised ring dir) MAP_SHARED and slice it into
+    /// req/resp/bounce page lists. The guest mmaps the SAME file through its
+    /// dax mount, so both sides touch the same host page-cache pages.
+    #[cfg(unix)]
+    fn map_file(
+        page_size: u32,
+        req_n: u32,
+        resp_n: u32,
+        bounce_n: u32,
+        fname: &[u8],
+    ) -> Result<HostRings, i32> {
+        let ps = page_size as usize;
+        if ps < crate::ring::HEADER_SIZE + crate::ring::RECORD_SIZE
+            || req_n == 0
+            || resp_n == 0
+            || req_n > 1024
+            || resp_n > 1024
+            || bounce_n > 4096
+        {
+            return Err(1);
+        }
+        let Some(dir) = ring_dir_get() else {
+            return Err(801); // no advert on this connection -> not supported
+        };
+        let name = std::str::from_utf8(fname).map_err(|_| 1)?;
+        // Bare names only: the guest must not traverse out of the ring dir.
+        if name.is_empty() || name.contains('/') || name.contains("..") {
+            return Err(1);
+        }
+        let total = (req_n + resp_n + bounce_n) as usize * ps;
+        let path = std::path::Path::new(&dir).join(name);
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|_| 1)?;
+        if f.metadata()
+            .map(|m| (m.len() as usize) < total)
+            .unwrap_or(true)
+        {
+            return Err(1);
+        }
+        // SAFETY: mapping a regular file we just validated, MAP_SHARED so the
+        // guest's dax view and ours are the same physical pages.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                total,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                std::os::unix::io::AsRawFd::as_raw_fd(&f),
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            return Err(1);
+        }
+        let pages = |start: usize, n: usize| -> Vec<*mut u8> {
+            (0..n)
+                .map(|i| (base as usize + (start + i) * ps) as *mut u8)
+                .collect()
+        };
+        let req = pages(0, req_n as usize);
+        let resp = pages(req_n as usize, resp_n as usize);
+        let bounce = pages((req_n + resp_n) as usize, bounce_n as usize);
+        // The mapping (and an O_RDWR fd via the mmap ref) lives for the
+        // connection; the file itself can be unlinked by either side later.
+        // SAFETY: pages are backed by the shared file mapping for the
+        // connection's lifetime (never munmap'd until process exit).
+        Ok(HostRings {
+            req: unsafe { crate::ring::Ring::from_pages(req, ps) },
+            resp: unsafe { crate::ring::Ring::from_pages(resp, ps) },
+            bounce,
+            page_size: ps,
+        })
+    }
+
     /// Copy an oversized response into the bounce buffer. Returns false when
     /// it doesn't fit (protocol error surfaced to the guest as a status).
     fn write_bounce(&self, bytes: &[u8]) -> bool {
@@ -1703,6 +2150,40 @@ fn serve_rings<S: Read + Write>(
 ) -> std::io::Result<()> {
     use crate::ring::LEN_INDIRECT;
     let oplog = std::env::var_os("SMOLVM_CUDA_HOST_OPLOG").is_some();
+    // Phase profiler (SMOLVM_CUDA_HOST_PROF=1): where the serve thread's wall
+    // time goes — idle (waiting on the guest), frame decode, dispatch (the
+    // CUDA call), respond. Dumped every 8192 ops so the per-learner gap can
+    // be attributed to guest-bound vs host-bound vs GPU-bound time.
+    struct Prof {
+        on: bool,
+        idle: u128,
+        decode: u128,
+        exec: u128,
+        resp: u128,
+        ops: u64,
+    }
+    impl Prof {
+        fn dump_maybe(&mut self) {
+            if self.on && self.ops.is_multiple_of(8192) && self.ops > 0 {
+                eprintln!(
+                    "[serve-prof] ops={} idle={}ms decode={}ms exec={}ms respond={}ms",
+                    self.ops,
+                    self.idle / 1000,
+                    self.decode / 1000,
+                    self.exec / 1000,
+                    self.resp / 1000
+                );
+            }
+        }
+    }
+    let mut prof = Prof {
+        on: std::env::var_os("SMOLVM_CUDA_HOST_PROF").is_some(),
+        idle: 0,
+        decode: 0,
+        exec: 0,
+        resp: 0,
+        ops: 0,
+    };
     // Reassembly buffer for oversized frames arriving as bounce chunks.
     let mut pending: Vec<u8> = Vec::new();
     // Push one response. Oversized ones chunk through the bounce pages: the
@@ -1762,6 +2243,7 @@ fn serve_rings<S: Read + Write>(
         Ok(())
     }
     loop {
+        let t_idle = std::time::Instant::now();
         let (payload, flags) = match rings.req.try_pop() {
             Some(rec) => rec,
             None => {
@@ -1792,6 +2274,10 @@ fn serve_rings<S: Read + Write>(
                 }
             }
         };
+        if prof.on {
+            prof.idle += t_idle.elapsed().as_micros();
+        }
+        let t_dec = std::time::Instant::now();
         // Oversized frame: chunks arrive through the bounce pages. Every
         // non-final chunk is acked (so the guest can refill the pages); the
         // final chunk completes the frame, which dispatches below and whose
@@ -1848,7 +2334,16 @@ fn serve_rings<S: Read + Write>(
                         libcall_tag(&frame[1..])
                     );
                 }
+                if prof.on {
+                    prof.decode += t_dec.elapsed().as_micros();
+                }
+                let t_exec = std::time::Instant::now();
                 let (status, _) = dispatch(sess, backend, req);
+                if prof.on {
+                    prof.exec += t_exec.elapsed().as_micros();
+                    prof.ops += 1;
+                    prof.dump_maybe();
+                }
                 if status != 0 {
                     if oplog {
                         eprintln!("[op~!] status={status}");
@@ -1883,11 +2378,24 @@ fn serve_rings<S: Read + Write>(
                         libcall_tag(&frame)
                     );
                 }
+                if prof.on {
+                    prof.decode += t_dec.elapsed().as_micros();
+                }
+                let t_exec = std::time::Instant::now();
                 let (status, resp) = dispatch(sess, backend, req);
+                if prof.on {
+                    prof.exec += t_exec.elapsed().as_micros();
+                }
                 if status != 0 && oplog {
                     eprintln!("[op!] status={status}");
                 }
+                let t_resp = std::time::Instant::now();
                 respond(&rings, &mut stream, &encode_response(status, &resp))?;
+                if prof.on {
+                    prof.resp += t_resp.elapsed().as_micros();
+                    prof.ops += 1;
+                    prof.dump_maybe();
+                }
             }
         }
     }
@@ -1946,8 +2454,30 @@ fn optrace_summary(req: &Request) -> Option<String> {
             dptr, value, bytes, ..
         } => format!("MemsetD8Async dptr={dptr:#x} v={value} len={bytes:#x}"),
         Request::LaunchKernel {
-            function, params, ..
-        } => format!("Launch fn={function:#x} nparams={}", params.len()),
+            function,
+            grid,
+            block,
+            shared_bytes,
+            params,
+            ..
+        } => {
+            let args: Vec<String> = params
+                .iter()
+                .take(10)
+                .map(|a| {
+                    if a.len() >= 8 {
+                        format!("{:#x}", u64::from_le_bytes(a[..8].try_into().unwrap()))
+                    } else {
+                        format!("<{}b>", a.len())
+                    }
+                })
+                .collect();
+            format!(
+                "Launch fn={function:#x} grid={grid:?} block={block:?} smem={shared_bytes:#x} np={} args=[{}]",
+                params.len(),
+                args.join(" ")
+            )
+        }
         Request::GraphLaunch { graph_exec, .. } => format!("GraphLaunch exec={graph_exec:#x}"),
         Request::LibCall { lib, func, args } => {
             format!("LibCall lib={lib} func={func} alen={}", args.len())
@@ -1967,6 +2497,11 @@ fn optrace_summary(req: &Request) -> Option<String> {
         Request::MemSetAccess { va, size, .. } => format!("VmmAccess va={va:#x} size={size:#x}"),
         Request::MemUnmap { va, size } => format!("VmmUnmap va={va:#x} size={size:#x}"),
         Request::MemRelease { handle } => format!("VmmRelease h={handle:#x}"),
+        Request::ModuleLoadData { image } => {
+            let n = image.len();
+            let head: Vec<String> = image.iter().take(4).map(|b| format!("{b:02x}")).collect();
+            format!("ModuleLoadData len={n:#x} head={}", head.join(""))
+        }
         // Catch-all: op byte only (re-encoding is debug-run-only cost), so a
         // failing op outside the detailed set above still shows up.
         other => format!(
@@ -1976,20 +2511,320 @@ fn optrace_summary(req: &Request) -> Option<String> {
     })
 }
 
-fn optrace_write(line: &str, status: i32) {
-    if let Some(p) = std::env::var_os("SMOLVM_CUDA_OPTRACE") {
-        use std::io::Write as _;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(p)
-        {
-            let _ = writeln!(f, "pid={} {line} st={status}", std::process::id());
+fn op_ring() -> &'static std::sync::Mutex<std::collections::VecDeque<String>> {
+    static R: std::sync::OnceLock<std::sync::Mutex<std::collections::VecDeque<String>>> =
+        std::sync::OnceLock::new();
+    R.get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::with_capacity(80)))
+}
+
+fn op_ring_push(line: String) {
+    if let Ok(mut r) = op_ring().try_lock() {
+        if r.len() >= 64 {
+            r.pop_front();
+        }
+        r.push_back(line);
+    }
+}
+
+pub fn op_ring_dump() {
+    if let Ok(r) = op_ring().try_lock() {
+        eprintln!(
+            "[op-ring] last {} ops before crash (oldest first):",
+            r.len()
+        );
+        for (i, l) in r.iter().enumerate() {
+            eprintln!("  [{i:02}] {l}");
         }
     }
 }
 
+fn optrace_write(line: &str, status: i32) {
+    if std::env::var_os("SMOLVM_CUDA_OPTRACE").is_some() {
+        op_ring_push(format!("{line} st={status}"));
+    }
+}
+
+/// P3b: which requests belong INSIDE a capture window and must be recorded for
+/// clone re-capture. Work-issuing ops only — handle bookkeeping (create/destroy)
+/// and queries stay out of the graph. `CublasSetStream` is included so a
+/// replayed GEMM lands on the re-capture stream.
+fn is_capturable(req: &Request) -> bool {
+    matches!(
+        req,
+        Request::LaunchKernel { .. }
+            | Request::LibCall { .. }
+            | Request::MemsetD8Async { .. }
+            | Request::MemcpyDtoDAsync { .. }
+            | Request::EventRecord { .. }
+            | Request::StreamWaitEvent { .. }
+    )
+}
+
+/// P3b: execs this worker process has already re-captured, keyed by the
+/// inherited exec vhandle. Clone workers serve several sessions (one per
+/// guest channel) that each adopt the same oplogs at resume — the registry
+/// makes the re-capture happen once per process, with later sessions just
+/// adopting the finished exec.
+static REPLAYED_EXECS: std::sync::Mutex<Option<HashMap<u64, u64>>> = std::sync::Mutex::new(None);
+
+/// Process-global golden-module → reloaded-module map (see `xlat_mod`). Safe
+/// as a process global: golden handles are raw host pointers (unique), and a
+/// clone worker owns exactly one CUDA context.
+static MOD_TRANS_GLOBAL: std::sync::Mutex<Option<HashMap<u64, u64>>> = std::sync::Mutex::new(None);
+
+/// Handles of modules THIS worker process loaded into ITS OWN context, across
+/// every channel. A `ModuleUnload` whose resolved handle is NOT in here is a
+/// module the worker never created — a golden-/foreign-context module the clone
+/// inherited via COW guest RAM (or one already freed) — and `cuModuleUnload`
+/// would deref a pointer valid only in another context, SIGSEGV-ing the driver.
+/// Process-global (not per-session) so a module loaded on one channel unloads
+/// correctly from another (no leak) while foreign handles are never touched.
+static WORKER_MODULES: std::sync::Mutex<Option<std::collections::HashSet<u64>>> =
+    std::sync::Mutex::new(None);
+/// Streams and events this worker created in its OWN context — same rationale as
+/// WORKER_MODULES: `cuStreamDestroy`/`cuEventDestroy` on a golden-/foreign-context
+/// handle the clone inherited via COW would deref a pointer valid only in another
+/// context. Process-global so a create on one channel destroys correctly from
+/// another (no leak) while foreign handles are skipped.
+static WORKER_STREAMS: std::sync::Mutex<Option<std::collections::HashSet<u64>>> =
+    std::sync::Mutex::new(None);
+static WORKER_EVENTS: std::sync::Mutex<Option<std::collections::HashSet<u64>>> =
+    std::sync::Mutex::new(None);
+
+/// Record a handle this worker just created in its own context.
+fn worker_handle_register(reg: &std::sync::Mutex<Option<std::collections::HashSet<u64>>>, h: u64) {
+    reg.lock()
+        .unwrap()
+        .get_or_insert_with(std::collections::HashSet::new)
+        .insert(h);
+}
+
+/// Claim `h` for destroy: true (and forgets it, so a double-destroy is a safe
+/// no-op) iff this worker created it; false for a foreign/inherited/already-freed
+/// handle, which must NOT be passed to the driver's destroy call.
+fn worker_handle_take(
+    reg: &std::sync::Mutex<Option<std::collections::HashSet<u64>>>,
+    h: u64,
+) -> bool {
+    reg.lock()
+        .unwrap()
+        .as_mut()
+        .map(|s| s.remove(&h))
+        .unwrap_or(false)
+}
+
+fn worker_module_register(raw: u64) {
+    worker_handle_register(&WORKER_MODULES, raw);
+}
+fn worker_module_take(raw: u64) -> bool {
+    worker_handle_take(&WORKER_MODULES, raw)
+}
+
+/// Process-global copies of the lazy-resolve INPUTS (module images + function
+/// metadata). The thread-local copies are seeded per serving thread; a channel
+/// served on an unseeded thread previously fell through the lazy paths and
+/// passed RAW GOLDEN HANDLES to the driver — launch-time "invalid argument"
+/// at best, a SIGSEGV inside `cuModuleGetFunction` (foreign-handle deref) at
+/// worst: the intermittent per-clone worker crash loop.
+static MOD_IMAGES_GLOBAL: std::sync::Mutex<Option<HashMap<u64, Vec<u8>>>> =
+    std::sync::Mutex::new(None);
+#[allow(clippy::type_complexity)]
+static FUNC_META_GLOBAL: std::sync::Mutex<Option<HashMap<u64, (u64, String, Vec<(i32, i32)>)>>> =
+    std::sync::Mutex::new(None);
+/// Golden→worker stream/event maps, process-global fallbacks for unseeded
+/// serving threads (thread-locals stay authoritative — P3b replay overrides
+/// stream mappings per-thread on purpose).
+static STREAM_TRANS_GLOBAL: std::sync::Mutex<Option<HashMap<u64, u64>>> =
+    std::sync::Mutex::new(None);
+static EVENT_TRANS_GLOBAL: std::sync::Mutex<Option<HashMap<u64, u64>>> =
+    std::sync::Mutex::new(None);
+
+fn replayed_exec_get(exec_vh: u64) -> Option<u64> {
+    REPLAYED_EXECS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(&exec_vh).copied())
+}
+
+fn replayed_exec_put(exec_vh: u64, exec: u64) {
+    REPLAYED_EXECS
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .insert(exec_vh, exec);
+}
+
+/// P3b: adopt a finished re-capture into this session so `raw_graph` resolves
+/// the inherited vhandle to the clone-owned exec from now on.
+fn adopt_replayed_exec(sess: &mut Session, exec_vh: u64, exec: u64) {
+    sess.graph_vhandles.lock().unwrap().insert(exec_vh, exec);
+    sess.owned_graph_reals.insert(exec);
+}
+
+/// P3b: rebuild an inherited graph by RE-CAPTURING its recorded op sequence in
+/// this clone's context. Begins capture on the clone's remapped copy of the
+/// golden's capture stream, re-dispatches each recorded op (so `dispatch`'s
+/// pointer/handle translation applies verbatim), ends capture, and instantiates.
+/// Returns the clone-owned exec. Errors bubble so the caller can fall back.
+fn replay_capture_graph(sess: &mut Session, b: &mut dyn Backend, exec_vh: u64) -> CuResult<u64> {
+    fn op_tag(req: &Request) -> &'static str {
+        match req {
+            Request::LaunchKernel { .. } => "LaunchKernel",
+            Request::LibCall { .. } => "LibCall",
+            Request::MemsetD8Async { .. } => "MemsetD8Async",
+            Request::MemcpyDtoDAsync { .. } => "MemcpyDtoDAsync",
+            Request::EventRecord { .. } => "EventRecord",
+            Request::StreamWaitEvent { .. } => "StreamWaitEvent",
+            _ => "other",
+        }
+    }
+    fn op_stream(req: &Request) -> Option<u64> {
+        match req {
+            Request::LaunchKernel { stream, .. }
+            | Request::MemsetD8Async { stream, .. }
+            | Request::MemcpyDtoDAsync { stream, .. }
+            | Request::EventRecord { stream, .. }
+            | Request::StreamWaitEvent { stream, .. } => Some(*stream),
+            _ => None,
+        }
+    }
+    let ops = sess
+        .clone_graph_oplogs
+        .get(&exec_vh)
+        .cloned()
+        .ok_or(CUDA_ERROR_INVALID_HANDLE)?;
+    // Collect every stream the recorded ops touch (as GOLDEN raw values — the
+    // same key both raw_stream and the lib-arg stream_resolve translate by).
+    let mut kinds: HashMap<&'static str, u32> = HashMap::new();
+    let mut golden_streams: Vec<u64> = Vec::new();
+    for op in &ops {
+        if let Ok(req) = crate::proto::decode_request(op) {
+            *kinds.entry(op_tag(&req)).or_insert(0) += 1;
+            if let Some(s) = op_stream(&req) {
+                if s != 0 {
+                    let g = sess.streams.get(&s).copied().unwrap_or(s);
+                    if !golden_streams.contains(&g) {
+                        golden_streams.push(g);
+                    }
+                }
+            }
+        }
+    }
+    // PRIVATE replay stream: capturing on the clone's live remapped stream
+    // races the guest's own traffic arriving on other channels — concurrent
+    // guest ops get absorbed into (or collide with) the capture, corrupting
+    // both. All recorded streams are redirected onto one private stream for
+    // the replay (linearizing a multi-stream DAG is dependency-safe, it only
+    // serializes intra-graph parallelism), then the overrides are restored.
+    let private = b.stream_create(0)?;
+    let saved: Vec<(u64, Option<u64>)> = golden_streams
+        .iter()
+        .map(|&g| (g, stream_trans_override(g, private)))
+        .collect();
+    eprintln!(
+        "[p3b] replay exec {exec_vh:#x}: {} ops {kinds:?}, {} stream(s) -> private {private:#x}",
+        ops.len(),
+        golden_streams.len()
+    );
+    let restore = |saved: &[(u64, Option<u64>)]| {
+        for &(g, prev) in saved {
+            stream_trans_restore(g, prev);
+        }
+    };
+    // WARMUP eager pass (on the private stream): binds every library handle's
+    // stream/workspace outside the capture window (cuBLAS workspace cudaMalloc
+    // during capture is the classic NOT_INITIALIZED source). Results land in
+    // the clone's own buffers, which the guest overwrites before real use.
+    if std::env::var("SMOLVM_CUDA_P3B_WARMUP").as_deref() != Ok("0") {
+        for (i, op) in ops.iter().enumerate() {
+            let req = match crate::proto::decode_request(op) {
+                Ok(r) => r,
+                Err(_) => {
+                    restore(&saved);
+                    let _ = b.stream_destroy(private);
+                    return Err(CUDA_ERROR_INVALID_HANDLE);
+                }
+            };
+            let tag = op_tag(&req);
+            let (st, _) = dispatch(sess, b, req);
+            if st != 0 {
+                eprintln!("[p3b] WARMUP op {i}/{} {tag} failed st={st}", ops.len());
+                restore(&saved);
+                let _ = b.stream_destroy(private);
+                return Err(st);
+            }
+        }
+        if let Err(e) = b.ctx_synchronize() {
+            eprintln!("[p3b] WARMUP ctx_synchronize failed st={e}");
+            restore(&saved);
+            let _ = b.stream_destroy(private);
+            return Err(e);
+        }
+    }
+    // RELAXED (2): the re-issued library calls may touch capture-unsafe APIs.
+    if let Err(e) = b.stream_begin_capture(private, 2) {
+        eprintln!("[p3b] begin_capture(private={private:#x}) failed st={e}");
+        restore(&saved);
+        let _ = b.stream_destroy(private);
+        return Err(e);
+    }
+    for (i, op) in ops.iter().enumerate() {
+        let req = match crate::proto::decode_request(op) {
+            Ok(r) => r,
+            Err(_) => {
+                let _ = b.stream_end_capture(private);
+                restore(&saved);
+                let _ = b.stream_destroy(private);
+                return Err(CUDA_ERROR_INVALID_HANDLE);
+            }
+        };
+        let tag = op_tag(&req);
+        let (st, _) = dispatch(sess, b, req);
+        if st != 0 {
+            eprintln!("[p3b] CAPTURE op {i}/{} {tag} failed st={st}", ops.len());
+            // Abort the capture cleanly before bubbling — a dangling capture
+            // poisons the stream for every later op.
+            let _ = b.stream_end_capture(private);
+            restore(&saved);
+            let _ = b.stream_destroy(private);
+            return Err(st);
+        }
+    }
+    let ended = b.stream_end_capture(private);
+    restore(&saved);
+    let graph = match ended {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("[p3b] end_capture failed st={e}");
+            let _ = b.stream_destroy(private);
+            return Err(e);
+        }
+    };
+    let _ = b.stream_destroy(private);
+    let exec = match b.graph_instantiate(graph) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("[p3b] instantiate failed st={e}");
+            let _ = b.graph_destroy(graph);
+            return Err(e);
+        }
+    };
+    let _ = b.graph_destroy(graph); // the exec is what we launch; graph is scratch
+    eprintln!("[p3b] replay exec {exec_vh:#x}: re-captured OK -> new exec {exec:#x}");
+    Ok(exec)
+}
+
 fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Response) {
+    // P3b capture-replay recording: while a capture is active on this session,
+    // append each capturable op's wire bytes so a clone can re-capture the same
+    // sequence in its own context (see StreamBeginCapture / GraphInstantiate).
+    if sess.capture_rec.is_some() && is_capturable(&req) {
+        let bytes = crate::proto::encode_request(&req);
+        if let Some((_, log)) = sess.capture_rec.as_mut() {
+            log.push(bytes);
+        }
+    }
     // P0 transport-viability: count every RPC; optionally inject per-call latency
     // to model network RTT, and periodically log the count vs wall-clock so
     // calls/sec (and thus calls-per-token) can be derived.
@@ -2079,6 +2914,9 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
     cow_written(sess, b, &req);
     let req = translate_dptrs(&sess.dptr_trans, req);
     let trace = optrace_summary(&req);
+    if let Some(_l) = &trace {
+        optrace_write(&format!("BEGIN {_l}"), -999);
+    }
     let r: CuResult<Response> = (|| match req {
         Request::Init {
             proto_hash,
@@ -2231,10 +3069,13 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 // Worker-mode: reconstruction already made private copies of the
                 // golden's non-VMM allocations (the daemon-process registries
                 // above are empty in a worker) — adopt them into this session's
-                // translation exactly like the copies made in-daemon.
-                for (gdptr, size, cdptr) in take_worker_alloc_trans() {
+                // translation exactly like the copies made in-daemon. Adoption
+                // is non-draining and ownerless: every channel's session needs
+                // the same translations (the guest launches kernels on more
+                // than one channel), and no session may free the copies on
+                // close — they live until the worker process exits.
+                for (gdptr, size, cdptr) in worker_alloc_trans_snapshot() {
                     sess.dptr_trans.push((gdptr, size, cdptr));
-                    sess.owned_dptrs.insert(cdptr, size);
                     sess.alloc_table
                         .lock()
                         .unwrap()
@@ -2242,11 +3083,78 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                     copied += 1;
                     cbytes += size;
                 }
+                sort_trans(&mut sess.dptr_trans); // xlat binary-searches by base
                 gpu::set_lib_trans(&sess.dptr_trans); // forwarded-lib pointer map
+                                                      // P3b: adopt inherited capture-replay logs, keyed by exec_vh —
+                                                      // replayed lazily at the clone's first GraphLaunch.
+                for (graph_vh, exec_vh, ops) in take_worker_graph_oplogs() {
+                    eprintln!(
+                        "[p3b] clone adopted oplog: graph {graph_vh:#x} exec {exec_vh:#x} ({} ops)",
+                        ops.len()
+                    );
+                    sess.clone_graph_oplogs.insert(exec_vh, ops);
+                }
                 eprintln!(
                     "[cuda-fork-isolate] clone resumed token {parent}: {copied} private copies \
                      ({cbytes} B), {shared} shared read-only ({sbytes} B)"
                 );
+                // P3b PRE-WARM (opt out: SMOLVM_CUDA_PREREPLAY=0). Two stages,
+                // both moving one-time clone costs off the first-request path:
+                // (1) eagerly reload every staged golden module — first-touch
+                // kernel launches (prefill, eager ops) stop paying per-module
+                // reload stalls; (2) re-capture every inherited graph now
+                // rather than lazily at first launch. Failures are left for
+                // the lazy paths to retry; later sessions adopt from the
+                // registry.
+                if std::env::var("SMOLVM_CUDA_PREREPLAY").as_deref() != Ok("0") {
+                    let mods: Vec<u64> = MOD_IMAGES.with(|m| m.borrow().keys().copied().collect());
+                    if !mods.is_empty() {
+                        let t0 = std::time::Instant::now();
+                        let mut loaded = 0u32;
+                        for g in mods {
+                            if xlat_mod(b, g) != g {
+                                loaded += 1;
+                            }
+                        }
+                        eprintln!(
+                            "[p3b] pre-warm: {loaded} module(s) ready in {} ms",
+                            t0.elapsed().as_millis()
+                        );
+                    }
+                }
+                if !sess.clone_graph_oplogs.is_empty()
+                    && std::env::var("SMOLVM_CUDA_PREREPLAY").as_deref() != Ok("0")
+                {
+                    let t0 = std::time::Instant::now();
+                    let execs: Vec<u64> = sess.clone_graph_oplogs.keys().copied().collect();
+                    let (mut fresh, mut adopted, mut deferred) = (0u32, 0u32, 0u32);
+                    for exec_vh in execs {
+                        if let Some(exec) = replayed_exec_get(exec_vh) {
+                            adopt_replayed_exec(sess, exec_vh, exec);
+                            adopted += 1;
+                            continue;
+                        }
+                        match replay_capture_graph(sess, b, exec_vh) {
+                            Ok(exec) => {
+                                replayed_exec_put(exec_vh, exec);
+                                adopt_replayed_exec(sess, exec_vh, exec);
+                                fresh += 1;
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[p3b] pre-replay exec {exec_vh:#x} failed st={e}; \
+                                     left for lazy retry"
+                                );
+                                deferred += 1;
+                            }
+                        }
+                    }
+                    eprintln!(
+                        "[p3b] pre-replay: {fresh} re-captured, {adopted} adopted, \
+                         {deferred} deferred in {} ms",
+                        t0.elapsed().as_millis()
+                    );
+                }
                 if std::env::var_os("SMOLVM_CUDA_GRAPH_DEBUG").is_some() {
                     // Scan the copied buffers for 8-byte values that fall inside a
                     // golden allocation range: those are DEVICE-STORED POINTERS that
@@ -2289,7 +3197,11 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         Request::ModuleLoadData { image } => {
             // Return the raw CUmodule as the wire handle (context-scoped, so it
             // survives a fork-clone reconnect). Still tracked for reclaim.
+            if let Some(p) = std::env::var_os("SMOLVM_CUDA_DUMP_LOADING") {
+                let _ = std::fs::write(&p, &image);
+            }
             let raw = b.module_load_data(&image)?;
+            worker_module_register(raw);
             sess.owned_modules.insert(raw);
             // Feed the process-wide image cache so later replicas can load by
             // hash without re-shipping the bytes (LibCall 6/1).
@@ -2321,7 +3233,14 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         }
         Request::ModuleUnload { module } => {
             let raw_mod = raw_module(sess, b, module);
-            b.module_unload(raw_mod)?;
+            // Only unload a module THIS worker created (WORKER_MODULES). A handle
+            // it doesn't own is a foreign/golden-context module inherited via COW
+            // (or already freed); cuModuleUnload would deref it in the wrong
+            // context and SIGSEGV the driver. Skipping is correct — the worker
+            // never allocated it, and its own modules are freed on ctx teardown.
+            if worker_module_take(raw_mod) {
+                b.module_unload(raw_mod)?;
+            }
             sess.owned_modules.remove(&raw_mod);
             sess.modules.remove(&module);
             Ok(Response::Ok)
@@ -2425,6 +3344,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         // Raw pointers are valid on every connection, like device pointers.
         Request::StreamCreate { flags } => b.stream_create(flags).map(|st| {
             sess.owned_streams.insert(st);
+            worker_handle_register(&WORKER_STREAMS, st);
             if path3_enabled() {
                 sess.golden_layout.lock().unwrap().streams.insert(st, flags);
             }
@@ -2432,6 +3352,12 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         }),
         Request::StreamBeginCapture { stream, mode } => {
             let raw = raw_stream(sess, stream)?;
+            // P3b: start recording capturable ops for clone re-capture. Only the
+            // golden records (path3 enabled, not itself a clone); a clone that
+            // captures its own graph needs no replay log.
+            if clone_graph_replay_enabled() && path3_enabled() && sess.dptr_trans.is_empty() {
+                sess.capture_rec = Some((stream, Vec::new()));
+            }
             b.stream_begin_capture(raw, mode).map(|_| Response::Ok)
         }
         Request::ThreadExchangeCaptureMode { mode } => {
@@ -2443,6 +3369,21 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             if graph_vh & VHANDLE_TAG != 0 {
                 sess.graph_vhandles.lock().unwrap().insert(graph_vh, g);
                 sess.owned_graph_reals.insert(g);
+            }
+            // P3b: park the recorded op-log under graph_vh until GraphInstantiate
+            // associates it with an exec_vh (what the clone launches).
+            if let Some((_, log)) = sess.capture_rec.take() {
+                if !log.is_empty() {
+                    eprintln!(
+                        "[p3b] golden recorded {} ops for graph {graph_vh:#x}",
+                        log.len()
+                    );
+                    sess.golden_layout
+                        .lock()
+                        .unwrap()
+                        .pending_oplogs
+                        .insert(graph_vh, log);
+                }
             }
             Ok(Response::Handle(g))
         }
@@ -2464,12 +3405,20 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             // returns None and simply isn't recorded (the clone then fails loud
             // on launch rather than mis-executing an unsupported graph).
             if path3_enabled() {
+                let mut layout = sess.golden_layout.lock().unwrap();
+                // P3b preferred: promote the parked capture-replay log (keyed by
+                // graph_vh) to a `(graph_vh, exec_vh, log)` entry.
+                if let Some(log) = layout.pending_oplogs.remove(&graph) {
+                    eprintln!(
+                        "[p3b] promoted oplog: graph {graph:#x} -> exec {exec_vh:#x} ({} ops)",
+                        log.len()
+                    );
+                    layout.graph_oplogs.push((graph, exec_vh, log));
+                }
+                // Node-rebuild fallback (kernel-only graphs): kept for clones
+                // whose exec has no oplog.
                 if let Ok(Some(ser)) = b.graph_introspect(real_graph) {
-                    sess.golden_layout
-                        .lock()
-                        .unwrap()
-                        .graphs
-                        .push((graph, exec_vh, ser));
+                    layout.graphs.push((graph, exec_vh, ser));
                 }
             }
             if exec_vh & VHANDLE_TAG != 0 {
@@ -2479,6 +3428,52 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             Ok(Response::Handle(e))
         }
         Request::GraphLaunch { graph_exec, stream } => {
+            // P3b: an inherited exec with a capture-replay log re-captures the
+            // recorded ops in THIS clone's context (translating every pointer /
+            // handle through the normal dispatch path) instead of rebuilding
+            // nodes — the only path that reproduces cuBLAS-kernel and non-kernel
+            // graph nodes. Built once, then launched like a clone-owned graph.
+            // Normally satisfied by pre-replay at resume; this is the lazy
+            // fallback (and retry path for deferred pre-replays).
+            if clone_graph_replay_enabled()
+                && !sess
+                    .owned_graph_reals
+                    .contains(&raw_graph(sess, graph_exec))
+            {
+                // Registry FIRST, independent of this session's oplog stash:
+                // spawn pre-warm re-captures on the worker main thread, while
+                // the resumed session may serve on an attached channel whose
+                // thread-local oplogs were never seeded — the registry is the
+                // process-wide truth. Empty outside clone workers, so this is
+                // a no-op for golden/daemon sessions.
+                if let Some(exec) = replayed_exec_get(graph_exec) {
+                    adopt_replayed_exec(sess, graph_exec, exec);
+                    let raw = raw_stream(sess, stream)?;
+                    return b.graph_launch(exec, raw).map(|_| Response::Ok);
+                }
+            }
+            if clone_graph_replay_enabled()
+                && !sess
+                    .owned_graph_reals
+                    .contains(&raw_graph(sess, graph_exec))
+                && sess.clone_graph_oplogs.contains_key(&graph_exec)
+            {
+                match replay_capture_graph(sess, b, graph_exec) {
+                    Ok(exec) => {
+                        replayed_exec_put(graph_exec, exec);
+                        adopt_replayed_exec(sess, graph_exec, exec);
+                        let raw = raw_stream(sess, stream)?;
+                        return b.graph_launch(exec, raw).map(|_| Response::Ok);
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[p3b] capture-replay failed for exec {graph_exec:#x}: e={e}; \
+                                   falling back to node rebuild"
+                        );
+                        // fall through to the node-rebuild / patch paths below
+                    }
+                }
+            }
             let real = raw_graph(sess, graph_exec);
             // Fork isolation + an INHERITED cudagraph: the graph baked in the
             // golden's device addresses at capture time, so replaying it verbatim
@@ -2595,7 +3590,11 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         }
         Request::StreamDestroy { stream } => {
             let raw = raw_stream(sess, stream)?;
-            b.stream_destroy(raw)?;
+            // Only destroy a stream THIS worker created; a foreign/inherited handle
+            // would SIGSEGV cuStreamDestroy in the wrong context (see WORKER_MODULES).
+            if worker_handle_take(&WORKER_STREAMS, raw) {
+                b.stream_destroy(raw)?;
+            }
             sess.owned_streams.remove(&raw);
             sess.streams.remove(&stream);
             Ok(Response::Ok)
@@ -2623,6 +3622,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         // several connections that must all understand the same handle.
         Request::EventCreate { flags } => b.event_create(flags).map(|e| {
             sess.owned_events.insert(e);
+            worker_handle_register(&WORKER_EVENTS, e);
             if path3_enabled() {
                 sess.golden_layout.lock().unwrap().events.insert(e, flags);
             }
@@ -2630,7 +3630,9 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         }),
         Request::EventDestroy { event } => {
             let raw = raw_event(sess, event)?;
-            b.event_destroy(raw)?;
+            if worker_handle_take(&WORKER_EVENTS, raw) {
+                b.event_destroy(raw)?;
+            }
             sess.owned_events.remove(&raw);
             sess.events.remove(&event);
             Ok(Response::Ok)
@@ -2761,6 +3763,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 };
                 if let Some(image) = module_cache_get(&key) {
                     let raw = b.module_load_data(&image)?;
+                    worker_module_register(raw);
                     sess.owned_modules.insert(raw);
                     if path3_enabled() {
                         sess.golden_layout
@@ -2850,9 +3853,12 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         } => {
             mark_loaded(&sess.alloc_table, dptr);
             if path3_enabled() {
-                // Bytes not dispatch-visible on this path: coverage recorded but
-                // never verifiable, so the chunk can't be shared (crc = 0).
-                mark_loaded_vmm(&sess.golden_layout, dptr, size, None);
+                // The payload never crosses the socket, but it IS readable in
+                // the shared region — hash it there so the chunk stays
+                // shareable (crc 0 would pin every clone to a private copy).
+                mark_loaded_vmm_with(&sess.golden_layout, dptr, size, |s, e| {
+                    b.hash_shm_range(offset, s, e).unwrap_or(0)
+                });
             }
             b.memcpy_shm_htod(dptr, offset, size, raw_stream(sess, stream)?)
                 .map(|_| Response::Ok)
@@ -2873,7 +3879,10 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             mark_loaded(&sess.alloc_table, dptr);
             if path3_enabled() {
                 let n: u64 = segments.iter().map(|&(_, len)| len).sum();
-                mark_loaded_vmm(&sess.golden_layout, dptr, n, None); // see ShmHtoD
+                // Readable through the guest-RAM mapping the DMA itself uses.
+                mark_loaded_vmm_with(&sess.golden_layout, dptr, n, |s, e| {
+                    b.hash_gpa_range(&segments, s, e).unwrap_or(0)
+                });
             }
             b.memcpy_gpa_htod(dptr, &segments, raw_stream(sess, stream)?)
                 .map(|_| Response::Ok)
@@ -2887,7 +3896,7 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             .map(|_| Response::Ok),
         // Handled by the serve loop (transport concern, not a backend op);
         // reaching dispatch means the transport doesn't support rings.
-        Request::RingSetup { .. } => Err(CUDA_ERROR_NOT_SUPPORTED),
+        Request::RingSetup { .. } | Request::RingSetupFile { .. } => Err(CUDA_ERROR_NOT_SUPPORTED),
         Request::MemAddressReserve { size, align } => {
             b.mem_address_reserve(size, align).map(|va| {
                 sess.owned_vmm_reservations.insert(va, size);
@@ -3389,6 +4398,93 @@ mod tests {
     use super::*;
     use crate::client::Client;
     use std::io::{Read, Write};
+
+    fn layout_with_chunk(va: u64, size: u64) -> LayoutCell {
+        let mut g = GoldenLayout::default();
+        g.maps.insert(
+            va,
+            ChunkCover {
+                size,
+                ..ChunkCover::default()
+            },
+        );
+        std::sync::Mutex::new(g)
+    }
+
+    /// A weight chunk uploaded with VERIFIABLE bytes tiles exactly and so is a
+    /// share candidate — this is what lets fork clones import one copy of the
+    /// weights instead of each privately copying them.
+    #[test]
+    fn covered_chunk_with_crc_is_share_candidate() {
+        let layout = layout_with_chunk(0x1000, 4096);
+        mark_loaded_vmm_with(&layout, 0x1000, 4096, |s, e| {
+            fnv64(&vec![7u8; (e - s) as usize])
+        });
+        let g = layout.lock().unwrap();
+        assert!(g.maps[&0x1000].covered_exactly());
+    }
+
+    /// REGRESSION (silent fork-density loss): the zero-copy H2D paths
+    /// (shared region / guest RAM) do not put the payload on the socket. They
+    /// used to record coverage with crc 0, and `covered_exactly` rejects ANY
+    /// zero-crc segment — so every weight chunk of every golden failed share
+    /// verification and was privately copied into each clone, making the fork
+    /// pool use MORE VRAM than running N independent processes. The backends
+    /// now hash the source in place, so this only happens when the bytes are
+    /// genuinely unreachable.
+    #[test]
+    fn chunk_without_crc_is_never_shared() {
+        let layout = layout_with_chunk(0x1000, 4096);
+        mark_loaded_vmm_with(&layout, 0x1000, 4096, |_, _| 0);
+        let g = layout.lock().unwrap();
+        assert!(
+            !g.maps[&0x1000].covered_exactly(),
+            "an unverifiable chunk must stay private"
+        );
+    }
+
+    /// Coverage is recorded per overlapped chunk, each hashing only its own
+    /// slice of the payload, so one H2D spanning several chunks leaves every
+    /// chunk independently verifiable.
+    #[test]
+    fn multi_chunk_upload_hashes_each_chunk_slice() {
+        let mut g = GoldenLayout::default();
+        for va in [0x1000u64, 0x2000] {
+            g.maps.insert(
+                va,
+                ChunkCover {
+                    size: 4096,
+                    ..ChunkCover::default()
+                },
+            );
+        }
+        let layout = std::sync::Mutex::new(g);
+        let mut seen = Vec::new();
+        mark_loaded_vmm_with(&layout, 0x1000, 8192, |s, e| {
+            seen.push((s, e));
+            fnv64(&vec![3u8; (e - s) as usize])
+        });
+        seen.sort_unstable();
+        assert_eq!(seen, vec![(0, 4096), (4096, 8192)]);
+        let g = layout.lock().unwrap();
+        assert!(g.maps[&0x1000].covered_exactly() && g.maps[&0x2000].covered_exactly());
+    }
+
+    /// Sharing is the default (density is the point of a fork pool); only an
+    /// explicit off-switch disables it.
+    #[test]
+    fn weight_sharing_defaults_on() {
+        // Not asserting on a set var: the process env is shared across tests.
+        assert!(matches!(
+            std::env::var("SMOLVM_CUDA_FORK_SHARE_WEIGHTS").as_deref(),
+            Err(_) | Ok(_)
+        ));
+        std::env::remove_var("SMOLVM_CUDA_FORK_SHARE_WEIGHTS");
+        assert!(path3_share_weights_enabled());
+        std::env::set_var("SMOLVM_CUDA_FORK_SHARE_WEIGHTS", "0");
+        assert!(!path3_share_weights_enabled());
+        std::env::remove_var("SMOLVM_CUDA_FORK_SHARE_WEIGHTS");
+    }
 
     // Drive the CPU backend through the full encode→dispatch→decode path.
     #[test]

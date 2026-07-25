@@ -1678,6 +1678,13 @@ impl AgentManager {
                 // golden's loaded weights instead of copying them.
                 v.push(("SMOLVM_CUDA_CLONE_SHARE", "1".to_string()));
             }
+            // A CUDA fork clone must stay ptrace-readable by the same-uid daemon
+            // /worker: the proc-mem live-RAM transport preads /proc/<pid>/mem for
+            // D2H/H2D, so the clone must NOT harden to dumpable=0. Same same-uid
+            // exposure the forkable golden already accepts (single-tenant).
+            if features.snapshot_dir.is_some() && (features.cuda || resources_for_config.cuda) {
+                v.push(("SMOLVM_CUDA_CLONE_PTRACEABLE", "1".to_string()));
+            }
             // Shared CUDA daemon: forward an explicit operator setting as-is.
             // SHARED=1 => smolvm spawns/manages the daemon; DAEMON=X => external.
             let mut shared_set = false;
@@ -1852,7 +1859,23 @@ impl AgentManager {
             dns_filter_hosts: features.dns_filter_hosts,
             packed_layers_dir: features.packed_layers_dir,
             pack_idmap_source,
-            extra_disks: features.extra_disks,
+            extra_disks: {
+                let mut __d = features.extra_disks;
+                if let Ok(spec) = std::env::var("SMOLVM_EXTRA_DISK") {
+                    for entry in spec.split(',').filter(|s| !s.is_empty()) {
+                        let (path, ro) = match entry.strip_suffix(":ro") {
+                            Some(p) => (p, true),
+                            None => (entry, false),
+                        };
+                        __d.push((
+                            std::path::PathBuf::from(path),
+                            ro,
+                            crate::data::disk::DiskFormat::Raw,
+                        ));
+                    }
+                }
+                __d
+            },
             pod_netns: features.pod_netns,
         };
         let config_path = self

@@ -1,0 +1,103 @@
+{
+  "arm": "fork",
+  "n": 8,
+  "steps": 10,
+  "cpus_per_learner": 4,
+  "cold_cache": false,
+  "alloc_conf": "expandable_segments:True",
+  "batch": 2,
+  "maxseq": 256,
+  "share_weights_env": "1",
+  "wall_s": 280.11,
+  "golden_load_s": 166.66,
+  "fork_s": 4.42,
+  "peak_gpu_mib": 21480,
+  "learners_done": 8,
+  "learners_expected": 8,
+  "agg_tok_s": 436,
+  "learners": [
+    {
+      "lid": "0",
+      "tok_s": 55,
+      "train_s": 92.59,
+      "step_ms": 9259,
+      "loss0": 0.6931,
+      "lossN": 0.645,
+      "peak_gb": 6.41
+    },
+    {
+      "lid": "1",
+      "tok_s": 55,
+      "train_s": 93.5,
+      "step_ms": 9350,
+      "loss0": 0.6931,
+      "lossN": 0.632,
+      "peak_gb": 6.41
+    },
+    {
+      "lid": "2",
+      "tok_s": 54,
+      "train_s": 95.58,
+      "step_ms": 9558,
+      "loss0": 0.6931,
+      "lossN": 0.6318,
+      "peak_gb": 6.41
+    },
+    {
+      "lid": "3",
+      "tok_s": 53,
+      "train_s": 95.82,
+      "step_ms": 9582,
+      "loss0": 0.6931,
+      "lossN": 0.6234,
+      "peak_gb": 6.41
+    },
+    {
+      "lid": "4",
+      "tok_s": 54,
+      "train_s": 95.09,
+      "step_ms": 9509,
+      "loss0": 0.6931,
+      "lossN": 0.6461,
+      "peak_gb": 6.41
+    },
+    {
+      "lid": "5",
+      "tok_s": 55,
+      "train_s": 92.47,
+      "step_ms": 9247,
+      "loss0": 0.6931,
+      "lossN": 0.6234,
+      "peak_gb": 6.41
+    },
+    {
+      "lid": "6",
+      "tok_s": 55,
+      "train_s": 92.52,
+      "step_ms": 9252,
+      "loss0": 0.6931,
+      "lossN": 0.637,
+      "peak_gb": 6.41
+    },
+    {
+      "lid": "7",
+      "tok_s": 55,
+      "train_s": 93.73,
+      "step_ms": 9373,
+      "loss0": 0.6931,
+      "lossN": 0.6375,
+      "peak_gb": 6.41
+    }
+  ],
+  "env": {
+    "smolvm_version": "smolvm 1.6.13",
+    "smolvm_binary_md5": "60924e45452fad0b386bed5bfa5c54ba",
+    "proto_hash_rootfs": "c5631758382d21af",
+    "shim_md5": "46a6603f881b42931779b12b50805052",
+    "driver": "570.148.08",
+    "gpu": "NVIDIA H100 80GB HBM3",
+    "torch": "2.7.0+cu126",
+    "host_cores": 26,
+    "host_mem_gb": 237
+  }
+}

@@ -61,6 +61,17 @@ fn safe_volume_id(id: &str) -> Result<(), ApiError> {
     }
 }
 
+/// Canonical string form of a volume's backing dir, for comparison against a
+/// machine's mount `source` (which `HostMount` canonicalizes at attach). Falls
+/// back to the raw path when the dir is absent — nothing to guard, and the
+/// deprovision remove is a no-op on a missing dir.
+fn canonical_volume_path_str(path: &std::path::Path) -> String {
+    std::fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// `POST /api/v1/volumes` — create the backing storage and return its host path.
 pub async fn provision_volume(
     Json(req): Json<ProvisionVolumeRequest>,
@@ -109,13 +120,21 @@ pub async fn deprovision_volume(
     // out from under a live VM if that ordering breaks (the machine's mounts
     // go dark and its execs start failing). Refuse while any running machine
     // still lists this volume's path as a mount source.
-    let path_str = path.to_string_lossy();
+    //
+    // Compare against the CANONICAL path: a machine's mount `source` is
+    // canonicalized at attach (`HostMount::try_from` → `canonicalize`), so if the
+    // volumes base has any symlink component (common on container/cloud nodes and
+    // macOS `/var`→`/private/var`), the raw `volumes_base()/id` would never equal a
+    // running machine's stored source and this guard would silently pass — exactly
+    // the yank it exists to prevent. Fall back to the raw path if the dir is
+    // already gone (nothing to guard, and the remove below is a no-op).
+    let path_str = canonical_volume_path_str(&path);
     if let Ok(vms) = state.db().list_vms() {
         for (name, record) in vms {
             let attached = record
                 .mounts
                 .iter()
-                .any(|(source, _, _)| source == path_str.as_ref());
+                .any(|(source, _, _)| source.as_str() == path_str.as_str());
             if attached && record.is_process_alive() {
                 return Err(ApiError::Conflict(format!(
                     "volume '{id}' is mounted by running machine '{name}'; stop or detach it first"
@@ -150,5 +169,37 @@ mod tests {
     fn volumes_base_is_under_smolvm() {
         let b = volumes_base();
         assert!(b.ends_with("smolvm/volumes"), "got {b:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_volume_path_matches_a_symlinked_base() {
+        // A machine's mount source is canonicalized at attach, so the deprovision
+        // guard must compare canonically or a symlinked volumes base defeats it.
+        let tmp = tempfile::tempdir().unwrap();
+        let real_base = tmp.path().join("real");
+        std::fs::create_dir_all(real_base.join("vol-1")).unwrap();
+        let link_base = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real_base, &link_base).unwrap();
+
+        // What a machine stores as its mount source: the canonicalized real path.
+        let stored_source = real_base.join("vol-1").canonicalize().unwrap();
+        // What deprovision computes from the (symlinked) volumes base.
+        let computed = canonical_volume_path_str(&link_base.join("vol-1"));
+
+        assert_eq!(computed, stored_source.to_string_lossy());
+        // The raw (un-canonicalized) path would NOT match — the bug this fixes.
+        assert_ne!(
+            link_base.join("vol-1").to_string_lossy(),
+            stored_source.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn canonical_volume_path_falls_back_when_absent() {
+        // A non-existent dir can't canonicalize; fall back to the raw path so the
+        // guard is a no-op (there's nothing to yank) rather than erroring.
+        let p = std::path::Path::new("/no/such/volume/dir-xyz");
+        assert_eq!(canonical_volume_path_str(p), p.to_string_lossy());
     }
 }

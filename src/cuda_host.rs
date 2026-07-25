@@ -101,6 +101,47 @@ pub fn start(socket_path: &Path) -> std::io::Result<()> {
             if let Some(ref addr) = daemon {
                 tracing::info!(daemon = %addr, "cuda-host: shared-daemon proxy mode");
             }
+            // P3b: a FORK-CLONE VM warms its daemon-side worker EAGERLY. The
+            // warm-flagged preamble makes the daemon spawn the worker (CUDA
+            // init + memory reconstruction + module/graph pre-warm) NOW,
+            // concurrent with guest resume, instead of on the guest's first
+            // CUDA call. The connection is held open as the worker's idle
+            // primary channel; real guest channels attach to the live worker.
+            if std::env::var("SMOLVM_CUDA_WARM_DIAL").as_deref() != Ok("0") {
+              if let (Some(addr), Some(p)) = (daemon.clone(), clone_preamble(true)) {
+                thread::Builder::new()
+                    .name("cuda-clone-warm".into())
+                    .spawn(move || {
+                        use std::io::{Read as _, Write as _};
+                        // The warm dial is the connection that SPAWNS the
+                        // worker, so it must carry the ring-dir advert — the
+                        // worker inherits the dir at spawn and every later
+                        // attached channel resolves RingSetupFile against it.
+                        let rd = ring_dir_advert();
+                        if addr.starts_with('/') {
+                            #[cfg(unix)]
+                            if let Ok(mut s) = std::os::unix::net::UnixStream::connect(&addr) {
+                                if rd.as_ref().is_none_or(|r| s.write_all(r).is_ok())
+                                    && s.write_all(&p).is_ok()
+                                {
+                                    tracing::info!("cuda-host: clone warm dial sent");
+                                    let mut b = [0u8; 1];
+                                    let _ = s.read(&mut b); // parked for the worker's lifetime
+                                }
+                            }
+                        } else if let Ok(mut s) = std::net::TcpStream::connect(&addr) {
+                            if rd.as_ref().is_none_or(|r| s.write_all(r).is_ok())
+                                && s.write_all(&p).is_ok()
+                            {
+                                tracing::info!("cuda-host: clone warm dial sent");
+                                let mut b = [0u8; 1];
+                                let _ = s.read(&mut b);
+                            }
+                        }
+                    })
+                    .ok();
+              }
+            }
             for stream in listener.incoming() {
                 match stream {
                     Ok(stream) => {
@@ -160,23 +201,47 @@ fn fork_clone_id() -> Option<u64> {
 /// shared-host-daemon architecture: every VM's traffic lands in one process, so
 /// they share a single GPU context and device memory.
 ///
+/// The 17-byte clone-connection preamble (magic + clone id + flags), `None`
+/// on non-clone VMs. Flag bit 0: forked with `--share-weights`; bit 1: warm
+/// dial (spawn the worker eagerly, no Init follows on this connection).
+fn clone_preamble(warm: bool) -> Option<[u8; 17]> {
+    let id = fork_clone_id()?;
+    let mut p = [0u8; 17];
+    p[..8].copy_from_slice(&smolvm_cuda::proto::CLONE_PREAMBLE_MAGIC);
+    p[8..16].copy_from_slice(&id.to_le_bytes());
+    // bit 0: this fork was requested with --share-weights (the launcher put
+    // SMOLVM_CUDA_CLONE_SHARE in this clone VMM's env).
+    if std::env::var_os("SMOLVM_CUDA_CLONE_SHARE").is_some() {
+        p[16] |= 1;
+    }
+    if warm {
+        p[16] |= 2;
+    }
+    Some(p)
+}
+
+/// Ring-dir advert (`SMVRDIR1` + u16 len + host path): tells the daemon which
+/// HOST directory backs this VM's dax ring mount, so a guest `RingSetupFile`
+/// can be honored. Sent on every daemon connection when the launcher exported
+/// `SMOLVM_CUDA_RING_HOST_DIR` (CUDA machines with the ring mount).
+fn ring_dir_advert() -> Option<Vec<u8>> {
+    let dir = std::env::var("SMOLVM_CUDA_RING_HOST_DIR").ok()?;
+    if dir.is_empty() || dir.len() > 512 {
+        return None;
+    }
+    let mut v = Vec::with_capacity(10 + dir.len());
+    v.extend_from_slice(b"SMVRDIR1");
+    v.extend_from_slice(&(dir.len() as u16).to_le_bytes());
+    v.extend_from_slice(dir.as_bytes());
+    Some(v)
+}
+
 /// A FORK-CLONE VM's proxy prepends the clone preamble (magic + clone id) so
 /// the daemon routes this connection to the clone's isolating worker — and, by
 /// its absence, serves the GOLDEN's own reconnect in-daemon instead of handing
 /// it a worker's reconstructed COPY of its memory.
 fn proxy_to_daemon(guest: crate::platform::uds::UdsStream, addr: &str) -> std::io::Result<()> {
-    fn preamble() -> Option<[u8; 17]> {
-        let id = fork_clone_id()?;
-        let mut p = [0u8; 17];
-        p[..8].copy_from_slice(&smolvm_cuda::proto::CLONE_PREAMBLE_MAGIC);
-        p[8..16].copy_from_slice(&id.to_le_bytes());
-        // bit 0: this fork was requested with --share-weights (the launcher put
-        // SMOLVM_CUDA_CLONE_SHARE in this clone VMM's env).
-        if std::env::var_os("SMOLVM_CUDA_CLONE_SHARE").is_some() {
-            p[16] |= 1;
-        }
-        Some(p)
-    }
+    let preamble = || clone_preamble(false);
     /// Guest-RAM advertisement for a SHARED daemon: when this VM's RAM is
     /// memfd-backed (forkable machines), tell the daemon how to map the same
     /// pages via `/proc/<pid>/fd/<memfd>` — magic + pid + fd + count +
@@ -270,6 +335,37 @@ fn proxy_to_daemon(guest: crate::platform::uds::UdsStream, addr: &str) -> std::i
     fn guest_ram_advert() -> Option<Vec<u8>> {
         None
     }
+    /// Fork-CLONE proc-mem advertisement: the clone maps the golden's guest-RAM
+    /// memfd MAP_PRIVATE (COW), so it can't be memfd-advertised (its live pages
+    /// have diverged). Instead advertise our (pid, gpa, host_va, len) so the clone
+    /// worker reads our LIVE pages via /proc/<pid>/mem. Emitted only for clones
+    /// (right after the clone preamble); the golden uses the memfd advert above.
+    #[cfg(target_os = "linux")]
+    fn guest_ram_procmem_advert() -> Option<Vec<u8>> {
+        if std::env::var_os("SMOLVM_CUDA_NO_RAM_ADVERT").is_some() {
+            return None;
+        }
+        let regions = GUEST_RAM.get().and_then(|f| f())?; // (gpa, host_va, len)
+        if regions.is_empty() {
+            return None;
+        }
+        let mut p = Vec::with_capacity(20 + regions.len() * 24);
+        p.extend_from_slice(b"SMVGPVM1");
+        p.extend_from_slice(&std::process::id().to_le_bytes());
+        p.extend_from_slice(&(regions.len() as u32).to_le_bytes());
+        p.extend_from_slice(&[0u8; 4]); // reserved
+        for (gpa, hva, len) in regions {
+            p.extend_from_slice(&gpa.to_le_bytes());
+            p.extend_from_slice(&hva.to_le_bytes());
+            p.extend_from_slice(&len.to_le_bytes());
+        }
+        Some(p)
+    }
+    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn guest_ram_procmem_advert() -> Option<Vec<u8>> {
+        None
+    }
     // A path (managed daemon) → unix socket; otherwise host:port → TCP.
     if addr.starts_with('/') {
         #[cfg(unix)]
@@ -278,6 +374,20 @@ fn proxy_to_daemon(guest: crate::platform::uds::UdsStream, addr: &str) -> std::i
             let mut daemon = std::os::unix::net::UnixStream::connect(addr)?;
             if let Some(a) = guest_ram_advert() {
                 daemon.write_all(&a)?;
+            }
+            if let Some(r) = ring_dir_advert() {
+                daemon.write_all(&r)?;
+            }
+            // Clone: advertise our LIVE private RAM BEFORE the clone preamble
+            // so the daemon consumes it as an accept-loop preamble (like the
+            // SMVGRAM2 memfd advert) and passes it to the worker via env. It must
+            // NOT sit between the clone preamble and the RPC Init, where
+            // peek_clone_token would read it as the routing frame and misroute
+            // the clone. Gated on preamble() so a golden never emits it.
+            if preamble().is_some() {
+                if let Some(pm) = guest_ram_procmem_advert() {
+                    daemon.write_all(&pm)?;
+                }
             }
             if let Some(p) = preamble() {
                 daemon.write_all(&p)?;

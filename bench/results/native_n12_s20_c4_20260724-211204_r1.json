@@ -1,0 +1,94 @@
+{
+  "arm": "native",
+  "n": 12,
+  "steps": 20,
+  "cpus_per_learner": 4,
+  "cold_cache": false,
+  "alloc_conf": "expandable_segments:True",
+  "batch": 2,
+  "maxseq": 256,
+  "share_weights_env": "unset",
+  "wall_s": 86.14,
+  "golden_load_s": null,
+  "fork_s": null,
+  "peak_gpu_mib": 81057,
+  "learners_done": 7,
+  "learners_expected": 12,
+  "agg_tok_s": 1145,
+  "learners": [
+    {
+      "lid": "0",
+      "tok_s": 159,
+      "train_s": 64.43,
+      "step_ms": 3222,
+      "loss0": 0.688,
+      "lossN": 0.4483,
+      "peak_gb": 7.07
+    },
+    {
+      "lid": "11",
+      "tok_s": 158,
+      "train_s": 64.95,
+      "step_ms": 3247,
+      "loss0": 0.6867,
+      "lossN": 0.4188,
+      "peak_gb": 7.07
+    },
+    {
+      "lid": "2",
+      "tok_s": 158,
+      "train_s": 64.71,
+      "step_ms": 3235,
+      "loss0": 0.688,
+      "lossN": 0.4809,
+      "peak_gb": 7.07
+    },
+    {
+      "lid": "4",
+      "tok_s": 163,
+      "train_s": 62.72,
+      "step_ms": 3136,
+      "loss0": 0.6891,
+      "lossN": 0.4552,
+      "peak_gb": 7.07
+    },
+    {
+      "lid": "5",
+      "tok_s": 185,
+      "train_s": 55.27,
+      "step_ms": 2763,
+      "loss0": 0.6861,
+      "lossN": 0.3857,
+      "peak_gb": 7.07
+    },
+    {
+      "lid": "6",
+      "tok_s": 164,
+      "train_s": 62.29,
+      "step_ms": 3115,
+      "loss0": 0.6878,
+      "lossN": 0.4008,
+      "peak_gb": 7.07
+    },
+    {
+      "lid": "9",
+      "tok_s": 158,
+      "train_s": 64.88,
+      "step_ms": 3244,
+      "loss0": 0.6877,
+      "lossN": 0.4369,
+      "peak_gb": 6.41
+    }
+  ],
+  "env": {
+    "smolvm_version": "smolvm 1.6.13",
+    "smolvm_binary_md5": "ee08f6bc0870e951afd497373fe87be8",
+    "proto_hash_rootfs": "afe482be004b7c1f",
+    "shim_md5": "392e1f5e9843abfefad5c8252510edc0",
+    "driver": "570.148.08",
+    "gpu": "NVIDIA H100 80GB HBM3",
+    "torch": "2.7.0+cu126",
+    "host_cores": 26,
+    "host_mem_gb": 237
+  }
+}

@@ -81,8 +81,11 @@ pub fn prepare_fork(
     clone: &str,
     pinned_ports: &[(u16, u16)],
     clone_forkable: bool,
+    fork_env: &[(String, String)],
+    fork_secrets: &std::collections::BTreeMap<String, crate::secrets::SecretRef>,
 ) -> Result<PreparedFork> {
     validate_vm_name(clone, "clone name").map_err(|e| Error::config("clone name", e))?;
+    validate_fork_env(fork_env)?;
 
     // Nested fork is unsupported: a clone boots from a copy-on-write MAP_PRIVATE
     // mapping of the golden's RAM, not a fresh memfd, so it cannot itself be
@@ -144,6 +147,43 @@ pub fn prepare_fork(
     std::fs::create_dir_all(&clone_dir)
         .map_err(|e| Error::agent("create clone dir", e.to_string()))?;
 
+    // A pack-backed golden (created `--from <.smolmachine>`) resolves its layers
+    // either through the shared content-addressed store (privileged installs: a
+    // pointer file beside its data dir) or from its own pre-extracted `pack`
+    // dir (rootless installs). The clone record inherits `source_smolmachine`
+    // but a fork never runs the create-time extraction, so without one of those
+    // the clone's start falls into the sidecar re-extraction fallback — seconds
+    // of host-side work per fork for read-only state the golden already has.
+    // Give the clone the golden's resolution in O(1):
+    //  - shared store: replicate the pointer file (the entry is no-evict while
+    //    referenced and start self-heals a missing one, so the copied pointer
+    //    can never point at anything the golden's own couldn't);
+    //  - per-machine layout: symlink the clone's `pack` dir to the golden's
+    //    extracted layers. The layers are read-only lowerdir content, the
+    //    golden is frozen, and its deletion is refused while clones exist, so
+    //    the target outlives every reader. `force_detach_layers_volume` no-ops
+    //    on symlinks, so a clone's stop/delete can't detach the golden's macOS
+    //    layers volume through the link.
+    let golden_layers = crate::agent::machine_layers_cache_dir(golden);
+    let golden_ptr = crate::agent::shared_pack_pointer_path(&golden_layers);
+    if golden_ptr.exists() {
+        let clone_layers = crate::agent::machine_layers_cache_dir(clone);
+        std::fs::create_dir_all(&clone_layers)
+            .map_err(|e| Error::agent("create clone pack dir", e.to_string()))?;
+        std::fs::copy(
+            &golden_ptr,
+            crate::agent::shared_pack_pointer_path(&clone_layers),
+        )
+        .map_err(|e| Error::agent("copy shared pack pointer", e.to_string()))?;
+    } else if smolvm_pack::extract::is_extracted(&golden_layers) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            &golden_layers,
+            crate::agent::machine_layers_cache_dir(clone),
+        )
+        .map_err(|e| Error::agent("link clone pack dir", e.to_string()))?;
+    }
+
     // The golden writes its frozen snapshot (checkpoint + memfd manifest) here.
     // It lives under the GOLDEN's data dir, not the clone's: under Landlock the
     // frozen golden VMM is confined to its own data dir, so it can write here but
@@ -177,6 +217,26 @@ pub fn prepare_fork(
     clone_rec.name = clone.to_string();
     clone_rec.pid = None;
     clone_rec.pid_start_time = None;
+    // Per-fork parameters: merged into the clone's record env (so `machine
+    // exec` sessions and any workload relaunch see them), overriding
+    // same-named keys inherited from the golden. The already-running workload
+    // can't have its env changed — it reads the same pairs from the file
+    // `write_fork_env` drops after boot.
+    if !fork_env.is_empty() {
+        clone_rec
+            .env
+            .retain(|(k, _)| !fork_env.iter().any(|(fk, _)| fk == k));
+        clone_rec.env.extend(fork_env.iter().cloned());
+    }
+    // Per-fork secrets: merge the refs into the clone's persisted `secret_refs`
+    // (overriding same-named refs inherited from the golden), so every `exec`
+    // in the clone resolves them fresh — the fork-safe path where plaintext
+    // never lands in the overlay/artifact or a guest file, and each clone's
+    // secrets are its own, invisible to the golden and sibling clones. Unlike
+    // `fork_env`, these are NOT written to the `fork-env` guest file.
+    for (k, r) in fork_secrets {
+        clone_rec.secret_refs.insert(k.clone(), r.clone());
+    }
     let mut port_remaps = Vec::new();
     if !pinned_ports.is_empty() {
         // User pinned the clone's forwards explicitly — use them as-is.
@@ -209,6 +269,10 @@ pub fn prepare_fork(
         let _ = std::fs::remove_dir_all(&clone_dir);
         let _ = std::fs::remove_dir_all(&snapshot_dir);
     };
+    // Phase timing: fork latency is dominated by one of these two steps; log
+    // each so a slow fork is diagnosable (the golden's RAM checkpoint vs the
+    // clone's disk-overlay creation) instead of a single opaque wall-time.
+    let t_snap = std::time::Instant::now();
     let reply = match control_socket_cmd(&ctl, &format!("FORK {}", snapshot_dir.display())) {
         Ok(r) => r,
         Err(e) => {
@@ -220,11 +284,20 @@ pub fn prepare_fork(
         cleanup();
         return Err(Error::agent("fork", format!("golden FORK failed: {reply}")));
     }
+    tracing::info!(
+        elapsed_ms = t_snap.elapsed().as_millis() as u64,
+        "fork: golden RAM checkpoint written"
+    );
 
+    let t_disk = std::time::Instant::now();
     if let Err(e) = clone_fork_disks(&gdir, &clone_dir) {
         cleanup();
         return Err(e);
     }
+    tracing::info!(
+        elapsed_ms = t_disk.elapsed().as_millis() as u64,
+        "fork: clone disk overlays created"
+    );
 
     Ok(PreparedFork {
         snapshot_dir,
@@ -434,6 +507,111 @@ fn rejuvenate_once(sock: &Path, script: &str) -> std::result::Result<(), String>
     }
 }
 
+/// Guest path of the per-fork parameter file, dotenv format (`KEY=VALUE`
+/// lines). A forked clone's workload resumed mid-flight from the golden's
+/// snapshot, so its process env cannot carry per-clone values — sweep and
+/// rollout workloads read this file instead (typically after their GO gate).
+///
+/// Lives under `/etc` (the workload container's overlay filesystem), NOT
+/// `/run`: `/run` is a per-container-instance tmpfs, so a file there vanishes
+/// if the restored container is recycled — the overlay is the only surface
+/// shared by every instance and the running workload alike.
+pub const FORK_ENV_GUEST_PATH: &str = "/etc/smolvm/fork-env";
+
+/// Validate per-fork parameters: keys must be non-empty `[A-Za-z_][A-Za-z0-9_]*`
+/// (they double as env var names for exec sessions) and values must be free of
+/// newlines (one `KEY=VALUE` per line in the delivered file).
+pub fn validate_fork_env(env: &[(String, String)]) -> Result<()> {
+    for (k, v) in env {
+        let mut chars = k.chars();
+        let head_ok = chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+        if !head_ok || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(Error::config(
+                "fork env",
+                format!("invalid key '{k}': must match [A-Za-z_][A-Za-z0-9_]*"),
+            ));
+        }
+        if v.contains('\n') || v.contains('\r') {
+            return Err(Error::config(
+                "fork env",
+                format!("value for '{k}' must not contain newlines"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Render per-fork parameters as the dotenv file content.
+pub fn render_fork_env(env: &[(String, String)]) -> String {
+    let mut out = String::new();
+    for (k, v) in env {
+        out.push_str(k);
+        out.push('=');
+        out.push_str(v);
+        out.push('\n');
+    }
+    out
+}
+
+/// Deliver per-fork parameters into a freshly-booted clone at
+/// [`FORK_ENV_GUEST_PATH`], via a VM-namespace write THROUGH the workload
+/// container's overlayfs `merged` mount. Deliberately not a container exec:
+/// the restored workload container can look stale to the exec path right
+/// after a fork, and exec'ing would recycle it — killing the very workload
+/// that is waiting for these parameters. Writing through the merged mount
+/// reaches the running container's rootfs without touching the container
+/// runtime at all. Bare VMs (no image) get the file in the VM rootfs.
+///
+/// FAIL-CLOSED by the caller: if the user asked for parameters and they can't
+/// be delivered, the fork must fail rather than vend a clone that silently
+/// runs with the golden's (or a sibling's) parameters.
+pub fn write_fork_env(clone: &str, record: &VmRecord, env: &[(String, String)]) -> Result<()> {
+    if env.is_empty() {
+        return Ok(());
+    }
+    let content = render_fork_env(env);
+    // Overlay owner is a validated machine name (alphanumeric + dashes), so
+    // splicing it into the script is injection-safe — same contract as the
+    // rejuvenation script's clone name.
+    let owner = crate::workload::persistent_overlay_owner(clone, record.golden.as_deref());
+    let merged = format!("/storage/overlays/persistent-{owner}/merged");
+    // Image machines MUST land the file in the workload container's rootfs
+    // (the overlay merged dir): falling through silently would strand it in
+    // the agent rootfs where no workload will ever look. Fail with the actual
+    // overlay listing so a layout change is diagnosable, not silent.
+    let script = if record.image.is_some() {
+        format!(
+            "if [ ! -d {merged} ]; then echo \"missing {merged}; overlays:\" >&2; \
+             ls /storage/overlays >&2; exit 41; fi; \
+             mkdir -p {merged}/etc/smolvm && umask 077 && cat > {merged}{FORK_ENV_GUEST_PATH}"
+        )
+    } else {
+        format!("mkdir -p /etc/smolvm && umask 077 && cat > {FORK_ENV_GUEST_PATH}")
+    };
+    let sock = vm_data_dir(clone).join("agent.sock");
+    let mut client = AgentClient::connect_with_retry(&sock)
+        .map_err(|e| Error::agent("fork env: agent connect", e.to_string()))?;
+    match client.vm_exec(
+        vec!["/bin/sh".into(), "-c".into(), script],
+        vec![],
+        None,
+        Some(std::time::Duration::from_secs(10)),
+        Some(content),
+    ) {
+        Ok((0, _, _)) => Ok(()),
+        Ok((code, _, stderr)) => Err(Error::agent(
+            "fork env",
+            format!(
+                "write exited {code}: {}",
+                String::from_utf8_lossy(&stderr).trim()
+            ),
+        )),
+        Err(e) => Err(Error::agent("fork env", format!("vm exec: {e}"))),
+    }
+}
+
 /// Fail-closed fork finalizer. A clone whose identity could not be rejuvenated
 /// MUST NOT be vended (it would share the golden's machine-id/hostname/SSH host
 /// keys across tenants), so on any rejuvenation `Err` this runs `teardown`
@@ -478,6 +656,45 @@ fn host_random_hex(hex_len: usize) -> String {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    // Per-fork parameters double as env var names and dotenv file lines, so
+    // keys must be valid identifiers and values single-line — anything else
+    // must be rejected up front, before the golden is frozen.
+    #[test]
+    fn fork_env_validation_accepts_identifiers_and_rejects_junk() {
+        let ok = vec![
+            ("LR".to_string(), "3e-4".to_string()),
+            ("_SEED".to_string(), "42".to_string()),
+            (
+                "TASK_2".to_string(),
+                "spaces and = are fine in values".to_string(),
+            ),
+        ];
+        assert!(validate_fork_env(&ok).is_ok());
+
+        for (k, v) in [
+            ("2LR", "x"),
+            ("", "x"),
+            ("A-B", "x"),
+            ("K", "line1\nline2"),
+            ("K", "cr\rvalue"),
+        ] {
+            assert!(
+                validate_fork_env(&[(k.to_string(), v.to_string())]).is_err(),
+                "expected rejection for key={k:?} value={v:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fork_env_renders_one_pair_per_line() {
+        let env = vec![
+            ("LR".to_string(), "3e-4".to_string()),
+            ("NOTE".to_string(), "a=b c".to_string()),
+        ];
+        assert_eq!(render_fork_env(&env), "LR=3e-4\nNOTE=a=b c\n");
+        assert_eq!(render_fork_env(&[]), "");
+    }
 
     // Fix 1: the re-mint script must regenerate the per-machine on-disk secrets
     // that a wholesale CoW disk clone would otherwise share across tenants —

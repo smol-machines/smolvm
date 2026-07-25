@@ -787,12 +787,23 @@ unsafe fn module_image_len(image: *const c_void) -> Result<usize, c_int> {
         }
         return Err(CUDA_ERROR_INVALID_VALUE);
     }
-    // ELF (cubin): total = e_shoff + e_shnum * e_shentsize (sections are last).
+    // ELF (cubin): the image ends at whichever header table comes LAST. The ELF
+    // spec does not fix their order, and some toolchains (observed: Triton's RL
+    // kernels) place the PROGRAM-header table AFTER the section-header table — so
+    // the old "sections are last" assumption under-counted the length, the RPC
+    // marshalled a truncated image, and cuModuleLoadData read past the short
+    // host buffer and SIGSEGV'd. Take the max of both header-table ends.
     if magic == [0x7F, b'E', b'L', b'F'] {
+        let e_phoff = u64::from_le_bytes(unsafe { *(p.add(0x20) as *const [u8; 8]) }) as usize;
+        let e_phentsize = u16::from_le_bytes(unsafe { *(p.add(0x36) as *const [u8; 2]) }) as usize;
+        let e_phnum = u16::from_le_bytes(unsafe { *(p.add(0x38) as *const [u8; 2]) }) as usize;
         let e_shoff = u64::from_le_bytes(unsafe { *(p.add(0x28) as *const [u8; 8]) }) as usize;
         let e_shentsize = u16::from_le_bytes(unsafe { *(p.add(0x3A) as *const [u8; 2]) }) as usize;
         let e_shnum = u16::from_le_bytes(unsafe { *(p.add(0x3C) as *const [u8; 2]) }) as usize;
-        return Ok(e_shoff + e_shentsize * e_shnum);
+        // An absent table has offset 0 and count 0, so its computed end is 0.
+        let sh_end = e_shoff + e_shentsize * e_shnum;
+        let ph_end = e_phoff + e_phentsize * e_phnum;
+        return Ok(sh_end.max(ph_end));
     }
     // PTX text: NUL-terminated.
     Ok(unsafe { CStr::from_ptr(image as *const c_char) }

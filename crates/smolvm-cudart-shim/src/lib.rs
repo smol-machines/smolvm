@@ -233,6 +233,10 @@ thread_local! {
     static CALL_CONFIG: RefCell<Vec<(Dim3, Dim3, usize, u64)>> = const { RefCell::new(Vec::new()) };
     /// Last error, for cudaGetLastError / cudaPeekAtLastError.
     static LAST_ERROR: std::cell::Cell<c_int> = const { std::cell::Cell::new(CUDA_SUCCESS) };
+    /// Set by `map_err` when the failure was TRANSPORT (Io/Protocol), i.e. the
+    /// op never reached the host. `retry_transport_c` consults this to decide
+    /// that one forced-reconnect retry runs the op exactly once.
+    static TRANSPORT_ERR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn set_last(code: c_int) -> c_int {
@@ -267,9 +271,28 @@ fn map_err(e: CudaRpcError) -> c_int {
             if std::env::var_os("SMOLVM_CUDA_SHIM_TRACE").is_some() {
                 eprintln!("[map-err] transport: {e}");
             }
+            TRANSPORT_ERR.with(|t| t.set(true));
             CUDA_ERROR_UNKNOWN
         }
     }
+}
+
+/// Run `f`, and if it failed because the TRANSPORT died (not a device error),
+/// force a reconnect (which replays the quiet-op journal) and run it once
+/// more. A VM-fork clone's first ops race the reconnect: the pre-call
+/// liveness peek can miss the dead inherited channel (the guest pid is
+/// unchanged, the socket reset may not have surfaced, and ring writes vanish
+/// into cloned pages no host reads), so the op dies with a transport error
+/// the host never saw — safe to rerun exactly once.
+fn retry_transport_c(f: impl Fn() -> c_int) -> c_int {
+    TRANSPORT_ERR.with(|t| t.set(false));
+    let rc = f();
+    if rc != CUDA_SUCCESS && TRANSPORT_ERR.with(|t| t.get()) {
+        mark_force_reconnect();
+        TRANSPORT_ERR.with(|t| t.set(false));
+        return f();
+    }
+    rc
 }
 
 /// Lazily connect and bring up a primary context, then run `f` against the
@@ -308,8 +331,19 @@ pub extern "C" fn smolvm_cudart_bridge_quiet(req: *const u8, len: usize) -> i32 
         return 1;
     }
     let bytes = unsafe { std::slice::from_raw_parts(req, len) };
+    // Transport-classified retry (see retry_transport_c): a fork clone's
+    // bridged op racing the reconnect never reached the host — rerun once.
+    TRANSPORT_ERR.with(|t| t.set(false));
     match with_client(|c| c.raw_quiet(bytes)) {
         Ok(()) => 0,
+        Err(_) if TRANSPORT_ERR.with(|t| t.get()) => {
+            mark_force_reconnect();
+            TRANSPORT_ERR.with(|t| t.set(false));
+            match with_client(|c| c.raw_quiet(bytes)) {
+                Ok(()) => 0,
+                Err(_) => 999,
+            }
+        }
         Err(_) => 999,
     }
 }
@@ -332,8 +366,17 @@ pub extern "C" fn smolvm_cudart_bridge_call(
         }
     } else {
         let bytes = unsafe { std::slice::from_raw_parts(req, req_len) };
+        TRANSPORT_ERR.with(|t| t.set(false));
         match with_client(|c| c.raw_call(bytes)) {
             Ok(p) => p,
+            Err(_) if TRANSPORT_ERR.with(|t| t.get()) => {
+                mark_force_reconnect();
+                TRANSPORT_ERR.with(|t| t.set(false));
+                match with_client(|c| c.raw_call(bytes)) {
+                    Ok(p) => p,
+                    Err(_) => return -1,
+                }
+            }
             Err(_) => return -1,
         }
     };
@@ -369,7 +412,7 @@ fn ring_alloc_pages(pages: usize) -> Option<(Vec<*mut u8>, Vec<u64>)> {
     let base = guestmem::alloc(pages * PAGE)? as usize;
     // Zero (also faults every page in before pagemap reads).
     unsafe { std::ptr::write_bytes(base as *mut u8, 0, pages * PAGE) };
-    let segs = guestmem::segments(base, pages * PAGE)?;
+    let segs = guestmem::segments(base, pages * PAGE, false)?;
     let mut gpas = Vec::with_capacity(pages);
     for (gpa, len) in segs {
         let mut off = 0;
@@ -410,6 +453,104 @@ fn ring_try_setup(client: &mut Client<Stream>) {
         Err(e) => {
             if trace {
                 eprintln!("[ring] setup rejected ({e}) — socket mode");
+            }
+        }
+    }
+}
+
+/// File-backed ring fallback (DAX clone transport). When the GPA ring is
+/// rejected (clones: their COW RAM is invisible to the daemon), create a
+/// uniquely-named file on the dax ring mount, mmap it MAP_SHARED (a FRESH
+/// mapping — inherited dax mappings die across fork, fresh ones are
+/// host-coherent), and negotiate `RingSetupFile`. Failure is fine — socket
+/// mode continues.
+#[cfg(target_os = "linux")]
+fn ring_try_setup_file(client: &mut Client<Stream>) {
+    const PAGE: usize = 4096;
+    const REQ_N: usize = 32;
+    const RESP_N: usize = 8;
+    const BOUNCE_N: usize = 64;
+    let trace = std::env::var_os("SMOLVM_CUDA_SHIM_TRACE").is_some();
+    let dir = std::env::var("SMOLVM_CUDA_RING_DIR").unwrap_or_else(|_| "/opt/smolvm-ring".into());
+    if !std::path::Path::new(&dir).is_dir() {
+        if trace {
+            eprintln!("[ring-file] no ring dir {dir} — socket mode");
+        }
+        return;
+    }
+    // Unique per (process, attempt): a clone shares the golden's ring dir, so
+    // names must never collide with the golden's (or a sibling's) live file.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // SAFETY: plain clock read into a local.
+    let t: i64 = unsafe {
+        let mut ts: libc::timespec = std::mem::zeroed();
+        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+        ts.tv_nsec as i64 ^ (ts.tv_sec as i64) << 20
+    };
+    let fname = format!("ring-{}-{}-{}.bin", std::process::id(), seq, t as u64);
+    let path = format!("{dir}/{fname}");
+    let total = (REQ_N + RESP_N + BOUNCE_N) * PAGE;
+    let Ok(f) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    else {
+        if trace {
+            eprintln!("[ring-file] create {path} failed — socket mode");
+        }
+        return;
+    };
+    if f.set_len(total as u64).is_err() {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    // SAFETY: fresh mmap of a regular file on the dax mount; pages stay
+    // mapped for the process lifetime.
+    let base = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            total,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            std::os::unix::io::AsRawFd::as_raw_fd(&f),
+            0,
+        )
+    };
+    if base == libc::MAP_FAILED {
+        let _ = std::fs::remove_file(&path);
+        if trace {
+            eprintln!("[ring-file] mmap failed — socket mode");
+        }
+        return;
+    }
+    // Zero the ring headers so producer/consumer indices start clean.
+    // SAFETY: base..base+total is our fresh mapping.
+    unsafe { std::ptr::write_bytes(base as *mut u8, 0, total) };
+    let pages = |start: usize, n: usize| -> Vec<*mut u8> {
+        (0..n)
+            .map(|i| (base as usize + (start + i) * PAGE) as *mut u8)
+            .collect()
+    };
+    match client.ring_setup_file(
+        PAGE,
+        &fname,
+        pages(0, REQ_N),
+        pages(REQ_N, RESP_N),
+        pages(REQ_N + RESP_N, BOUNCE_N),
+    ) {
+        Ok(()) => {
+            if trace {
+                eprintln!("[ring-file] file-backed rings active ({fname})");
+            }
+        }
+        Err(e) => {
+            // SAFETY: unmapping the mapping we created above.
+            unsafe { libc::munmap(base, total) };
+            let _ = std::fs::remove_file(&path);
+            if trace {
+                eprintln!("[ring-file] setup rejected ({e}) — socket mode");
             }
         }
     }
@@ -493,6 +634,12 @@ fn bring_up_client(resume_token: u64) -> Result<(Client<Stream>, u64, i32), c_in
     }
     if try_ring {
         ring_try_setup(&mut client); // best-effort; socket mode on failure
+        #[cfg(target_os = "linux")]
+        if !client.is_ring() {
+            // GPA rings rejected (clone COW RAM is daemon-invisible): try the
+            // DAX file-ring transport instead.
+            ring_try_setup_file(&mut client);
+        }
     }
     // Bring-up answered: restore fully blocking reads (steady-state ops may
     // legitimately wait longer than the handshake bound).
@@ -599,9 +746,15 @@ fn lib_err_trace(lib: u8, func: u16, code: c_int) {
 fn with_client_retrying<T>(
     f: impl Fn(&mut Client<Stream>) -> Result<T, CudaRpcError>,
 ) -> Result<T, c_int> {
+    TRANSPORT_ERR.with(|t| t.set(false));
     match with_client(&f) {
-        Err(CUDA_ERROR_UNKNOWN) => {
+        // Retry only when the failure was TRANSPORT (op never reached the
+        // host) — retrying on any CUDA_ERROR_UNKNOWN would re-run ops the
+        // device may have executed (unmapped driver codes also map to 999).
+        Err(e) if TRANSPORT_ERR.with(|t| t.get()) => {
+            let _ = e;
             mark_force_reconnect();
+            TRANSPORT_ERR.with(|t| t.set(false));
             with_client(&f)
         }
         other => other,
@@ -692,7 +845,7 @@ pub extern "C" fn cudaRuntimeGetVersion(version: *mut c_int) -> c_int {
 
 #[no_mangle]
 pub extern "C" fn cudaMalloc(dev_ptr: *mut *mut c_void, size: usize) -> c_int {
-    set_last(
+    set_last(retry_transport_c(|| {
         match with_state(|s| {
             let d = s.client.mem_alloc(size as u64).map_err(map_err)?;
             s.dev_allocs.insert(d, size as u64);
@@ -700,8 +853,8 @@ pub extern "C" fn cudaMalloc(dev_ptr: *mut *mut c_void, size: usize) -> c_int {
         }) {
             Ok(d) => unsafe { out(dev_ptr, d as *mut c_void) },
             Err(e) => e,
-        },
-    )
+        }
+    }))
 }
 
 /// `cudaMallocManaged` — unified memory the CPU and GPU both access by the same
@@ -755,7 +908,7 @@ pub extern "C" fn cudaFree(dev_ptr: *mut c_void) -> c_int {
     if dev_ptr.is_null() {
         return set_last(CUDA_SUCCESS); // cudaFree(NULL) is a no-op
     }
-    set_last(
+    set_last(retry_transport_c(|| {
         match with_state(|s| {
             s.client.mem_free(dev_ptr as u64).map_err(map_err)?;
             s.dev_allocs.remove(&(dev_ptr as u64));
@@ -763,8 +916,8 @@ pub extern "C" fn cudaFree(dev_ptr: *mut c_void) -> c_int {
         }) {
             Ok(()) => CUDA_SUCCESS,
             Err(e) => e,
-        },
-    )
+        }
+    }))
 }
 
 #[no_mangle]
@@ -909,31 +1062,103 @@ mod guestmem {
         Some(gpas)
     }
 
-    /// Coalesced `(gpa, len)` segments for `[ptr, ptr+len)` if it lies wholly in
-    /// a pinned buffer.
-    pub fn segments(ptr: usize, len: usize) -> Option<Vec<(u64, u64)>> {
+    /// Coalesced `(gpa, len)` segments for `[ptr, ptr+len)`. Fast path: a
+    /// registered pinned buffer (precomputed frames). Fallback (opt-in via
+    /// SMOLVM_CUDA_ZEROCOPY): on-demand /proc/self/pagemap translation of an
+    /// arbitrary (pageable) source range, so a pageable H2D also gets the
+    /// zero-copy GPA path instead of slow byte-shipping through the ring.
+    pub fn segments(ptr: usize, len: usize, writable: bool) -> Option<Vec<(u64, u64)>> {
         if len == 0 {
             return None;
         }
-        let reg = PINNED.lock().unwrap();
-        let buf = reg
-            .iter()
-            .find(|b| ptr >= b.base && ptr + len <= b.base + b.size)?;
-        let mut segs: Vec<(u64, u64)> = Vec::new();
-        let mut cur = ptr - buf.base;
-        let end = cur + len;
-        while cur < end {
-            let page_gpa = buf.page_gpas[cur / PAGE];
-            let in_page = cur % PAGE;
-            let chunk = (PAGE - in_page).min(end - cur);
-            let gpa = page_gpa + in_page as u64;
-            match segs.last_mut() {
-                Some(last) if last.0 + last.1 == gpa => last.1 += chunk as u64,
-                _ => segs.push((gpa, chunk as u64)),
+        let hit = {
+            let reg = PINNED.lock().unwrap();
+            reg.iter()
+                .find(|b| ptr >= b.base && ptr + len <= b.base + b.size)
+                .map(|buf| {
+                    let mut segs: Vec<(u64, u64)> = Vec::new();
+                    let mut cur = ptr - buf.base;
+                    let end = cur + len;
+                    while cur < end {
+                        let page_gpa = buf.page_gpas[cur / PAGE];
+                        let in_page = cur % PAGE;
+                        let chunk = (PAGE - in_page).min(end - cur);
+                        let gpa = page_gpa + in_page as u64;
+                        match segs.last_mut() {
+                            Some(last) if last.0 + last.1 == gpa => last.1 += chunk as u64,
+                            _ => segs.push((gpa, chunk as u64)),
+                        }
+                        cur += chunk;
+                    }
+                    segs
+                })
+        };
+        if let Some(segs) = hit {
+            return Some(segs);
+        }
+        if !enabled() {
+            return None;
+        }
+        segments_pagemap(ptr, len, writable)
+    }
+
+    /// On-demand GPA segments for an arbitrary source range via pagemap.
+    fn segments_pagemap(ptr: usize, len: usize, writable: bool) -> Option<Vec<(u64, u64)>> {
+        let first_page = ptr & !(PAGE - 1);
+        let last_page = (ptr + len - 1) & !(PAGE - 1);
+        let npages = (last_page - first_page) / PAGE + 1;
+        // Fault every page in so pagemap reports a present frame (the H2D reads
+        // these bytes anyway); a no-op for already-present real data.
+        for i in 0..npages {
+            let pp = (first_page + i * PAGE) as *mut u8;
+            unsafe {
+                let b = std::ptr::read_volatile(pp);
+                // A D2H destination may be an unwritten (shared read-only ZERO)
+                // page; the host writing its GPA would corrupt the shared zero
+                // page guest-wide. Force a PRIVATE, writable frame first (COW)
+                // without changing content. H2D sources stay read-only (they can
+                // be read-only mmap file pages) so we never write-fault those.
+                if writable {
+                    std::ptr::write_volatile(pp, b);
+                }
             }
-            cur += chunk;
+        }
+        let gpas = read_gpas_bulk(first_page, npages)?;
+        let mut segs: Vec<(u64, u64)> = Vec::new();
+        let mut cur = ptr;
+        let end = ptr + len;
+        while cur < end {
+            let pidx = (cur - first_page) / PAGE;
+            let in_page = (cur & (PAGE - 1)) as u64;
+            let chunk = ((PAGE - (cur & (PAGE - 1))).min(end - cur)) as u64;
+            let gpa = gpas[pidx] + in_page;
+            match segs.last_mut() {
+                Some(last) if last.0 + last.1 == gpa => last.1 += chunk,
+                _ => segs.push((gpa, chunk)),
+            }
+            cur += chunk as usize;
         }
         Some(segs)
+    }
+
+    /// Bulk pagemap read: one pread of the whole VA range's entries.
+    fn read_gpas_bulk(base: usize, npages: usize) -> Option<Vec<u64>> {
+        let f = std::fs::File::open("/proc/self/pagemap").ok()?;
+        let mut raw = vec![0u8; npages * 8];
+        f.read_exact_at(&mut raw, (base / PAGE) as u64 * 8).ok()?;
+        let mut gpas = Vec::with_capacity(npages);
+        for i in 0..npages {
+            let entry = u64::from_le_bytes(raw[i * 8..i * 8 + 8].try_into().unwrap());
+            if entry & (1 << 63) == 0 {
+                return None;
+            }
+            let pfn = entry & ((1u64 << 55) - 1);
+            if pfn == 0 {
+                return None;
+            }
+            gpas.push(pfn * PAGE as u64);
+        }
+        Some(gpas)
     }
 
     pub fn is_pinned(ptr: usize) -> bool {
@@ -958,7 +1183,7 @@ mod guestmem {
     pub fn alloc(_: usize) -> Option<*mut u8> {
         None
     }
-    pub fn segments(_: usize, _: usize) -> Option<Vec<(u64, u64)>> {
+    pub fn segments(_: usize, _: usize, _: bool) -> Option<Vec<(u64, u64)>> {
         None
     }
     pub fn is_pinned(_: usize) -> bool {
@@ -1128,7 +1353,7 @@ fn do_memcpy_inner(
                 // Zero-copy from a pinned guest buffer: ship guest-physical
                 // segments; the host reads guest RAM directly. Fall back to
                 // byte-shipping if the host can't serve it (no mapping).
-                if let Some(segs) = guestmem::segments(src as usize, n) {
+                if let Some(segs) = guestmem::segments(src as usize, n, false) {
                     if s.client.memcpy_gpa_htod(dst as u64, segs, stream).is_ok() {
                         return Ok(());
                     }
@@ -1153,9 +1378,21 @@ fn do_memcpy_inner(
                 Ok(())
             }
             MEMCPY_DTOH => {
-                if let Some(segs) = guestmem::segments(dst as usize, n) {
-                    if s.client.memcpy_gpa_dtoh(src as u64, segs, stream).is_ok() {
-                        return Ok(());
+                // Fast-fail latch: in a fork clone the worker has no map of
+                // THIS VM's guest RAM, so every GPA copy fails NOT_FOUND —
+                // at ~8.5 ms per doomed attempt that was 23% of a training
+                // step. One failure disables the GPA path for this process;
+                // the bounce fallback below serves everything after.
+                static GPA_D2H_DEAD: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !GPA_D2H_DEAD.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Some(segs) = guestmem::segments(dst as usize, n, true) {
+                        match s.client.memcpy_gpa_dtoh(src as u64, segs, stream) {
+                            Ok(()) => return Ok(()),
+                            Err(_) => {
+                                GPA_D2H_DEAD.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
                     }
                 }
                 if let Some(off) = shm_offset(dst) {
@@ -1196,7 +1433,7 @@ fn do_memcpy_inner(
 
 #[no_mangle]
 pub extern "C" fn cudaMemcpy(dst: *mut c_void, src: *const c_void, n: usize, kind: c_int) -> c_int {
-    set_last(do_memcpy(dst, src, n, kind, 0))
+    set_last(retry_transport_c(|| do_memcpy(dst, src, n, kind, 0)))
 }
 
 #[no_mangle]
@@ -1226,7 +1463,9 @@ pub extern "C" fn cudaMemcpyAsync(
     // work on `stream` first — torch's non-blocking pool streams don't order
     // against the NULL-stream copy the host uses, so dropping the stream let
     // a copy overwrite buffers that still-running kernels were reading.
-    set_last(do_memcpy(dst, src, n, kind, stream as u64))
+    set_last(retry_transport_c(|| {
+        do_memcpy(dst, src, n, kind, stream as u64)
+    }))
 }
 
 #[no_mangle]
@@ -2378,6 +2617,19 @@ pub extern "C" fn cublasLtGetVersion() -> usize {
 /// driver shim (`libcuda.so.1`) so callers get the same interposed surface as
 /// direct linking. Missing symbols report `SymbolNotFound` via `driver_status`
 /// with a success return, per the cudart contract.
+/// Pre-12.5 entry point (no cudaVersion arg). torch 2.7's `libtorch_cuda.so`
+/// links this symbol directly at load time, so it must be exported even though
+/// the versioned variant carries the real logic.
+#[no_mangle]
+pub extern "C" fn cudaGetDriverEntryPoint(
+    symbol: *const c_char,
+    func_ptr: *mut *mut c_void,
+    flags: u64,
+    driver_status: *mut c_int,
+) -> c_int {
+    cudaGetDriverEntryPointByVersion(symbol, func_ptr, 12040, flags, driver_status)
+}
+
 #[no_mangle]
 pub extern "C" fn cudaGetDriverEntryPointByVersion(
     symbol: *const c_char,
@@ -2689,18 +2941,40 @@ pub extern "C" fn cudaLaunchKernel(
     shared_mem: usize,
     stream: *mut c_void,
 ) -> c_int {
-    set_last(do_launch(
-        func,
-        [grid.x, grid.y, grid.z],
-        [block.x, block.y, block.z],
-        shared_mem,
-        stream as u64,
-        args,
-    ))
+    set_last(retry_transport_c(|| {
+        do_launch(
+            func,
+            [grid.x, grid.y, grid.z],
+            [block.x, block.y, block.z],
+            shared_mem,
+            stream as u64,
+            args,
+        )
+    }))
 }
 
 /// Shared launch path for both `cudaLaunchKernel` and `cudaLaunchKernelExC`:
 /// look up the registered function, gather its argument blobs, forward.
+/// Call through `retry_transport_c` — a fork clone's first launch can race
+/// the reconnect and die with a transport error the host never saw.
+/// Guest-side hot-path profiler (SMOLVM_CUDA_SHIM_PROF=1): accumulated ns
+/// spent inside do_launch (marshal + enqueue, excluding torch/python), dumped
+/// every 8192 launches — separates OUR per-op cost from the framework's.
+fn shim_prof_launch(dur: std::time::Duration) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NS: AtomicU64 = AtomicU64::new(0);
+    static N: AtomicU64 = AtomicU64::new(0);
+    let ns = NS.fetch_add(dur.as_nanos() as u64, Ordering::Relaxed) + dur.as_nanos() as u64;
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_multiple_of(8192) {
+        eprintln!(
+            "[shim-prof] launches={n} total={}ms avg={}ns",
+            ns / 1_000_000,
+            ns / n
+        );
+    }
+}
+
 fn do_launch(
     func: *const c_void,
     grid: [u32; 3],
@@ -2709,8 +2983,28 @@ fn do_launch(
     stream: u64,
     args: *mut *mut c_void,
 ) -> c_int {
+    static PROF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *PROF.get_or_init(|| std::env::var_os("SMOLVM_CUDA_SHIM_PROF").is_some()) {
+        let t0 = std::time::Instant::now();
+        let rc = do_launch_inner(func, grid, block, shared_mem, stream, args);
+        shim_prof_launch(t0.elapsed());
+        return rc;
+    }
+    do_launch_inner(func, grid, block, shared_mem, stream, args)
+}
+
+fn do_launch_inner(
+    func: *const c_void,
+    grid: [u32; 3],
+    block: [u32; 3],
+    shared_mem: usize,
+    stream: u64,
+    args: *mut *mut c_void,
+) -> c_int {
     // Debug bisection: drop launches entirely to isolate marshaling cost.
-    if std::env::var_os("SMOLVM_CUDA_NOOP_LAUNCH").is_some() {
+    // Cached: an env walk per launch cost measurable ns on the hot path.
+    static NOOP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *NOOP.get_or_init(|| std::env::var_os("SMOLVM_CUDA_NOOP_LAUNCH").is_some()) {
         return CUDA_SUCCESS;
     }
     with_state(|s| {
@@ -2766,14 +3060,16 @@ pub extern "C" fn cudaLaunchKernelExC(
     }
     // SAFETY: caller passes a valid cudaLaunchConfig_t.
     let c = unsafe { &*(config as *const CudaLaunchConfig) };
-    set_last(do_launch(
-        func,
-        [c.grid_dim.x, c.grid_dim.y, c.grid_dim.z],
-        [c.block_dim.x, c.block_dim.y, c.block_dim.z],
-        c.dynamic_smem_bytes,
-        c.stream as u64,
-        args,
-    ))
+    set_last(retry_transport_c(|| {
+        do_launch(
+            func,
+            [c.grid_dim.x, c.grid_dim.y, c.grid_dim.z],
+            [c.block_dim.x, c.block_dim.y, c.block_dim.z],
+            c.dynamic_smem_bytes,
+            c.stream as u64,
+            args,
+        )
+    }))
 }
 
 // CUDA 12.0+ launch path. nvcc-generated stubs resolve a "kernel handle" via

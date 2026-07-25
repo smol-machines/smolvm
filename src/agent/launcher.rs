@@ -527,6 +527,41 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
 
     crate::network::validate_requested_network_backend(resources, None, port_mappings.len())?;
 
+    // CUDA machines get an implicit dax RING mount: a per-machine host dir the
+    // guest shim and the CUDA daemon both mmap for the file-backed clone-ring
+    // transport (see cuda_host::ring_dir_advert / RingSetupFile). The dir sits
+    // next to the per-VM cuda socket; the guest sees it at /opt/smolvm-ring.
+    // Opt out with SMOLVM_CUDA_FILE_RING=0.
+    let mut mounts_vec: Vec<crate::data::storage::HostMount> = mounts.to_vec();
+    if let Some(cs) = cuda_socket {
+        // Device-slot budget: libkrun EINVALs the VM config once the virtio
+        // device count crosses its table size (measured: 4 user mounts + the
+        // ring device fails; either alone boots). Skip the ring mount rather
+        // than brick the boot — such machines simply stay on socket transport.
+        if mounts_vec.len() > 3 {
+            tracing::warn!(
+                mounts = mounts_vec.len(),
+                "skipping CUDA ring mount: virtio device budget exhausted (clone rings unavailable; socket transport)"
+            );
+        } else if std::env::var("SMOLVM_CUDA_FILE_RING").as_deref() != Ok("0") {
+            if let Some(dir) = cs.parent().map(|d| d.join("cuda-ring")) {
+                if std::fs::create_dir_all(&dir).is_ok() {
+                    // SAFETY-free env set: single-threaded launch path, before
+                    // the proxy threads spawn (they read these lazily anyway).
+                    unsafe {
+                        std::env::set_var("SMOLVM_CUDA_RING_HOST_DIR", &dir);
+                    }
+                    mounts_vec.push(crate::data::storage::HostMount {
+                        source: dir,
+                        target: std::path::PathBuf::from("/opt/smolvm-ring"),
+                        read_only: false,
+                    });
+                }
+            }
+        }
+    }
+    let mounts: &[crate::data::storage::HostMount] = &mounts_vec;
+
     // Raise file descriptor limits
     raise_fd_limits();
 
@@ -771,19 +806,39 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     // null-terminated array.
                     let mut all_cidrs = resources.allowed_cidrs.clone().unwrap_or_default();
                     crate::data::network::ensure_dns_in_cidrs(&mut all_cidrs);
-                    let cidr_cstrings: Vec<CString> = all_cidrs
+                    let cidr_cstrings: Vec<CString> = match all_cidrs
                         .iter()
-                        .map(|c| CString::new(c.as_str()).expect("CIDR cannot contain null bytes"))
-                        .collect();
+                        .map(|c| CString::new(c.as_str()))
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                    {
+                        Ok(v) => v,
+                        Err(_) => {
+                            krun_free_ctx(ctx);
+                            return Err(Error::agent(
+                                "set egress policy",
+                                "allow-CIDR contains an interior NUL byte",
+                            ));
+                        }
+                    };
                     let mut cidr_ptrs: Vec<*const libc::c_char> =
                         cidr_cstrings.iter().map(|s| s.as_ptr()).collect();
                     cidr_ptrs.push(std::ptr::null());
 
                     // Allow-host list + trusted resolver, only when hosts are set.
-                    let host_cstrings: Vec<CString> = egress_hosts
+                    let host_cstrings: Vec<CString> = match egress_hosts
                         .iter()
-                        .map(|h| CString::new(h.as_str()).expect("host cannot contain null bytes"))
-                        .collect();
+                        .map(|h| CString::new(h.as_str()))
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                    {
+                        Ok(v) => v,
+                        Err(_) => {
+                            krun_free_ctx(ctx);
+                            return Err(Error::agent(
+                                "set egress policy",
+                                "allow-host contains an interior NUL byte",
+                            ));
+                        }
+                    };
                     let mut host_ptrs: Vec<*const libc::c_char> =
                         host_cstrings.iter().map(|s| s.as_ptr()).collect();
                     host_ptrs.push(std::ptr::null());
@@ -1369,21 +1424,60 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 "adding virtiofs mount"
             );
 
+            // DAX window for user mounts (SMOLVM_MOUNT_DAX=1, validation
+            // gate): a dax-mounted virtiofs file mmap'd MAP_SHARED by guest
+            // and host is genuinely coherent shared memory (the window maps
+            // host page-cache pages into the guest), which is the transport
+            // for CLONE rings — clone guest RAM is COW-private, but the DAX
+            // window is device memory, re-established per-VM, so it dodges
+            // the COW wall entirely. libkrun supports per-device windows
+            // (ShmManager::create_fs_region per fs index); the old code just
+            // never asked (shm_size=0 here while launcher_dynamic asked for
+            // 2 GiB — the source of the "only root has DAX" misdiagnosis).
+            let is_ring_mount = mount.target == std::path::Path::new("/opt/smolvm-ring");
+            let dax_window: u64 = match std::env::var("SMOLVM_MOUNT_DAX").as_deref() {
+                Ok("1") => 1 << 29,
+                // The implicit CUDA ring mount ALWAYS gets a window — it exists
+                // solely to be dax-mmap'd (512 MB, the proven window size).
+                _ if is_ring_mount => 1 << 29,
+                _ => 0,
+            };
             // Read-only mounts must be enforced host-side by the virtiofs
             // device (krun_add_virtiofs3's read_only flag), not only by the
             // guest's bind-remount: a root process in the guest can undo a
             // guest-side remount, but it cannot make the host server accept
             // writes. Fail closed if the symbol is missing rather than
             // silently attaching the mount writable.
-            if mount.read_only {
+            if mount.read_only || dax_window > 0 {
                 let Some(add_virtiofs3) = krun_add_virtiofs3 else {
-                    krun_free_ctx(ctx);
-                    return Err(Error::agent(
-                        "add virtiofs mount",
-                        "read-only mounts require libkrun with krun_add_virtiofs3",
-                    ));
+                    if mount.read_only {
+                        krun_free_ctx(ctx);
+                        return Err(Error::agent(
+                            "add virtiofs mount",
+                            "read-only mounts require libkrun with krun_add_virtiofs3",
+                        ));
+                    }
+                    // DAX requested but symbol missing: fall back to plain.
+                    if krun_add_virtiofs(ctx, tag.as_ptr(), host_path.as_ptr()) < 0 {
+                        krun_free_ctx(ctx);
+                        return Err(Error::agent(
+                            "add virtiofs mount",
+                            format!(
+                                "krun_add_virtiofs failed for '{}' - requested mount cannot be attached",
+                                mount.source.display()
+                            ),
+                        ));
+                    }
+                    continue;
                 };
-                if add_virtiofs3(ctx, tag.as_ptr(), host_path.as_ptr(), 0, true) < 0 {
+                if add_virtiofs3(
+                    ctx,
+                    tag.as_ptr(),
+                    host_path.as_ptr(),
+                    dax_window,
+                    mount.read_only,
+                ) < 0
+                {
                     krun_free_ctx(ctx);
                     return Err(Error::agent(
                         "add virtiofs mount",

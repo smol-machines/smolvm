@@ -1,0 +1,49 @@
+{
+  "arm": "native",
+  "n": 16,
+  "steps": 10,
+  "cpus_per_learner": 4,
+  "cold_cache": false,
+  "alloc_conf": "expandable_segments:True",
+  "batch": 2,
+  "maxseq": 256,
+  "share_weights_env": "unset",
+  "wall_s": 43.74,
+  "golden_load_s": null,
+  "fork_s": null,
+  "peak_gpu_mib": 81087,
+  "learners_done": 2,
+  "learners_expected": 16,
+  "agg_tok_s": 467,
+  "learners": [
+    {
+      "lid": "14",
+      "tok_s": 235,
+      "train_s": 21.75,
+      "step_ms": 2175,
+      "loss0": 0.6931,
+      "lossN": 0.6406,
+      "peak_gb": 6.41
+    },
+    {
+      "lid": "6",
+      "tok_s": 232,
+      "train_s": 22.03,
+      "step_ms": 2203,
+      "loss0": 0.6931,
+      "lossN": 0.637,
+      "peak_gb": 6.41
+    }
+  ],
+  "env": {
+    "smolvm_version": "smolvm 1.6.13",
+    "smolvm_binary_md5": "60924e45452fad0b386bed5bfa5c54ba",
+    "proto_hash_rootfs": "c5631758382d21af",
+    "shim_md5": "46a6603f881b42931779b12b50805052",
+    "driver": "570.148.08",
+    "gpu": "NVIDIA H100 80GB HBM3",
+    "torch": "2.7.0+cu126",
+    "host_cores": 26,
+    "host_mem_gb": 237
+  }
+}
