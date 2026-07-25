@@ -2673,7 +2673,7 @@ impl CreateCmd {
             cuda: self.cuda,
             docker_socket: self.docker_socket,
             dns_filter_hosts: None,
-            published_sockets: Vec::new(),
+            published_sockets: parse_published_sockets(&self.expose_socket, &self.mount_socket)?,
             gpu: manifest.gpu,
             gpu_vram_mib: None,
             rosetta: false,
