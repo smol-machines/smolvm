@@ -92,6 +92,7 @@ pub fn build_create_params(
                 rosetta: false,
                 dns_filter_hosts: None,
                 published_sockets: Vec::new(),
+                idle_timeout_secs: None,
                 source_smolmachine: None,
             });
         }
@@ -286,12 +287,13 @@ pub fn build_create_params(
         gpu,
         gpu_vram_mib: sf.gpu_vram,
         rosetta,
+        idle_timeout_secs: None,
+        published_sockets: Vec::new(),
         dns_filter_hosts: if sf_allow_hosts.is_empty() {
             None
         } else {
             Some(sf_allow_hosts)
         },
-        published_sockets: Vec::new(),
         source_smolmachine: None,
     })
 }

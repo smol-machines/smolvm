@@ -63,6 +63,7 @@
 
 pub mod agent;
 pub mod api;
+pub mod autostandby;
 pub mod config;
 // The shared CUDA daemon manages unix-domain sockets, flock, and detached
 // process groups — all POSIX. GPU acceleration is unavailable on Windows anyway,
@@ -76,6 +77,7 @@ pub mod db;
 pub mod disk_utils;
 pub mod dns_filter;
 pub mod dns_filter_listener;
+pub mod egress_broker;
 /// Language-neutral embedded runtime support shared by SDK adapters.
 pub mod embedded;
 pub mod log_rotation;

@@ -39,6 +39,10 @@ pub struct Supervisor {
     /// the loop, so a plain map needs no synchronization. Entries are cleared
     /// when a machine is alive again, its restart fires, or its policy stops it.
     next_restart_at: std::collections::HashMap<String, tokio::time::Instant>,
+    /// Auto-standby idle detector. Owned solely by the supervisor task (the one
+    /// place the loop runs), so its arm-timer map needs no synchronization —
+    /// same ownership model as `next_restart_at`.
+    idle: crate::autostandby::IdleController,
 }
 
 impl Supervisor {
@@ -48,6 +52,7 @@ impl Supervisor {
             state,
             shutdown_rx,
             next_restart_at: std::collections::HashMap::new(),
+            idle: crate::autostandby::IdleController::new(),
         }
     }
 
@@ -94,6 +99,7 @@ impl Supervisor {
         // can't grow without bound across deletes.
         self.next_restart_at
             .retain(|name, _| machine_names.iter().any(|n| n == name));
+        self.idle.retain_only(&machine_names);
 
         for name in machine_names {
             if let Err(e) = self.check_machine(&name).await {
@@ -120,7 +126,24 @@ impl Supervisor {
             // Running again (recovered, or a prior restart took hold) — drop any
             // pending restart schedule so a future death re-arms from scratch.
             self.next_restart_at.remove(name);
+            // A live machine is the auto-standby candidate: check whether it has
+            // been idle past its timeout and, if so, stop it to free its RAM.
+            self.check_idle(name).await;
             return Ok(());
+        }
+        // A machine that isn't alive can't be idling; clear any arm so a future
+        // run re-arms cleanly.
+        self.idle.clear(name);
+
+        // A machine we hibernated is deliberately not running — it is not a
+        // crash. Leave its Standby state intact (so surfaces can distinguish
+        // "will wake on exec" from "someone stopped it") and don't let the
+        // restart policy resurrect it.
+        if let Ok(Some(record)) = self.state.db().get_vm(name) {
+            if record.state == crate::config::RecordState::Standby {
+                self.next_restart_at.remove(name);
+                return Ok(());
+            }
         }
 
         // Machine is dead — try to retrieve its exit code via waitpid
@@ -180,6 +203,138 @@ impl Supervisor {
 
         // Attempt restart
         self.restart_machine(name).await
+    }
+
+    /// For an alive machine, evaluate its auto-standby idle timer and stop it if
+    /// it has been idle past its configured timeout. A no-op for machines with
+    /// no `idle_timeout_secs`.
+    async fn check_idle(&mut self, name: &str) {
+        // Read the machine's configured idle timeout from the DB record.
+        let record = match self.state.db().get_vm(name) {
+            Ok(Some(rec)) => Some(rec),
+            _ => None,
+        };
+        let timeout = record.as_ref().and_then(|rec| rec.idle_timeout_secs);
+        let timeout = match timeout {
+            Some(secs) if secs > 0 => Some(Duration::from_secs(secs)),
+            _ => {
+                // Auto-standby disabled for this machine; keep the map clean.
+                self.idle.clear(name);
+                return;
+            }
+        };
+
+        // Never hibernate a fork clone: its boot is a snapshot resume against
+        // CoW overlays that the implicit-start wake path cannot reconstruct
+        // (it cold-boots, and krun rejects the overlay stack with EINVAL), so
+        // stopping it here would brick it until a manual `machine start`.
+        if record.as_ref().is_some_and(|rec| rec.golden.is_some()) {
+            self.idle.clear(name);
+            return;
+        }
+
+        // Never hibernate a frozen fork base: it is quiescent by definition
+        // (its guest is paused), and stopping its VMM destroys the memfd RAM
+        // image every live clone forks from. Mirrors the dependent_clones
+        // guard `restart_machine` already applies.
+        match self.state.db().dependent_clones(name) {
+            Ok(clones) if !clones.is_empty() => {
+                self.idle.clear(name);
+                return;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(machine = %name, error = %e, "could not check dependent clones for auto-standby; skipping this machine");
+                self.idle.clear(name);
+                return;
+            }
+        }
+
+        // Never hibernate a forkable golden base, even before its first clone: a
+        // forkable base is quiescent by design while it waits to be forked (no
+        // inbound, no leases), which would otherwise make it a prime auto-standby
+        // target — but stopping its VMM destroys the memfd RAM image and control
+        // socket that `machine fork` snapshots from, so the next fork would fail
+        // with "golden is not running forkable". The live control socket is the
+        // host-side signal that a machine was started `--forkable`.
+        if crate::agent::fork::control_socket_path(name).exists() {
+            self.idle.clear(name);
+            return;
+        }
+
+        let now = crate::util::current_timestamp();
+        let snapshot = self.state.activity().snapshot(name);
+        match self.idle.evaluate(name, timeout, snapshot, now) {
+            crate::autostandby::IdleDecision::Hibernate => {
+                tracing::info!(
+                    machine = %name,
+                    idle_timeout_secs = ?timeout.map(|d| d.as_secs()),
+                    "machine idle past its timeout; stopping to free host RAM (auto-standby)"
+                );
+                self.hibernate_machine(name).await;
+            }
+            crate::autostandby::IdleDecision::Armed => {
+                tracing::debug!(machine = %name, "auto-standby idle countdown armed");
+            }
+            crate::autostandby::IdleDecision::Waiting
+            | crate::autostandby::IdleDecision::Active => {}
+        }
+    }
+
+    /// Stop an idle machine's VMM process and mark it [`RecordState::Standby`],
+    /// freeing its guest RAM. A later `start`/`exec` boots it again through the
+    /// normal launch path. Uses the same graceful shutdown as a user `stop` so
+    /// the guest can flush to its persistent overlay first.
+    async fn hibernate_machine(&mut self, name: &str) {
+        // Serialize against user start/stop/delete via the per-machine lifecycle
+        // lock, same as restart_machine, so we can't race a concurrent op.
+        let lifecycle = self.state.lifecycle_lock(name);
+        let _guard = lifecycle.lock().await;
+
+        // Re-check under the lock: activity may have arrived, or the machine may
+        // have been stopped/deleted between the decision and here.
+        if !self.state.is_machine_alive(name) {
+            self.idle.clear(name);
+            return;
+        }
+        if !self.state.activity().is_quiescent(name) {
+            // A request landed while we were arming; abort the hibernate.
+            self.idle.clear(name);
+            return;
+        }
+
+        let record = match self.state.db().get_vm(name) {
+            Ok(Some(r)) => r,
+            _ => return,
+        };
+
+        let name_owned = name.to_string();
+        let pid = record.pid;
+        let pid_start = record.pid_start_time;
+        let stopped = tokio::task::spawn_blocking(move || {
+            crate::api::handlers::machines::shutdown_machine_process(
+                &name_owned,
+                pid,
+                pid_start,
+                true,
+            )
+        })
+        .await
+        .unwrap_or(false);
+
+        if stopped {
+            if let Err(e) = self
+                .state
+                .update_machine_state(name, RecordState::Standby, None)
+            {
+                tracing::warn!(machine = %name, error = %e, "failed to persist standby state");
+            } else {
+                tracing::info!(machine = %name, "machine entered auto-standby");
+            }
+        } else {
+            tracing::warn!(machine = %name, "auto-standby stop did not confirm process exit");
+        }
+        self.idle.clear(name);
     }
 
     /// Decide, for a dead machine that should restart, whether its restart fires

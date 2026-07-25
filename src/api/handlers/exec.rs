@@ -51,6 +51,8 @@ pub async fn exec_command(
     Json(req): Json<ExecRequest>,
 ) -> Result<Json<ExecResponse>, ApiError> {
     let tid = trace_id.map(|t| t.0 .0.clone());
+    // Auto-standby: any control-plane op resets the machine's idle clock.
+    state.mark_activity(&id);
     validate_command(&req.command)?;
 
     let entry = state.get_machine(&id)?;
@@ -214,6 +216,8 @@ pub async fn exec_stream(
     Json(req): Json<ExecRequest>,
 ) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, ApiError> {
     let tid = trace_id.map(|t| t.0 .0.clone());
+    // Auto-standby: any control-plane op resets the machine's idle clock.
+    state.mark_activity(&id);
     validate_command(&req.command)?;
 
     let entry = state.get_machine(&id)?;
@@ -348,6 +352,8 @@ pub async fn run_command(
     Json(req): Json<RunRequest>,
 ) -> Result<Json<ExecResponse>, ApiError> {
     let tid = trace_id.map(|t| t.0 .0.clone());
+    // Auto-standby: any control-plane op resets the machine's idle clock.
+    state.mark_activity(&id);
     validate_command(&req.command)?;
 
     let entry = state.get_machine(&id)?;
@@ -433,6 +439,8 @@ pub async fn exec_interactive(
     _trace_id: Option<axum::Extension<TraceId>>,
     ws: WebSocketUpgrade,
 ) -> Result<axum::response::Response, ApiError> {
+    // Auto-standby: an interactive session resets the machine's idle clock.
+    state.mark_activity(&id);
     let entry = state.get_machine(&id)?;
     ensure_running_and_persist(&state, &id, &entry)
         .await
