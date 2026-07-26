@@ -3297,13 +3297,29 @@ fn handle_run_detached(
         "starting detached container"
     );
 
-    let prepared = match storage::prepare_for_run_persistent(&image, &overlay_id) {
-        Ok(p) => p,
-        Err(e) => {
-            send_response(stream, &AgentResponse::from_err(e, error_codes::RUN_FAILED))?;
-            return Ok(());
-        }
+    let progress = |phase: &str, bytes: u64| {
+        let message = if bytes == 0 {
+            phase.to_string()
+        } else {
+            format!("{phase} ({} MiB)", bytes / (1024 * 1024))
+        };
+        let _ = send_response(
+            stream,
+            &AgentResponse::Progress {
+                message,
+                percent: None,
+                layer: None,
+            },
+        );
     };
+    let prepared =
+        match storage::prepare_for_run_persistent_with_progress(&image, &overlay_id, progress) {
+            Ok(p) => p,
+            Err(e) => {
+                send_response(stream, &AgentResponse::from_err(e, error_codes::RUN_FAILED))?;
+                return Ok(());
+            }
+        };
 
     // Resolve the container's launch settings from the image's OCI config
     // (command, Env, WorkingDir, User) with the request layered on top.
@@ -3381,6 +3397,14 @@ fn handle_run_detached(
         workload_id = %workload_id,
         "running detached container"
     );
+    send_response(
+        stream,
+        &AgentResponse::Progress {
+            message: "starting detached container".to_string(),
+            percent: None,
+            layer: None,
+        },
+    )?;
 
     // Use `crun create` + `crun start` (two-step OCI lifecycle) instead of
     // `crun run --detach` which hangs in the smolvm VM environment. The

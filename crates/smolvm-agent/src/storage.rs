@@ -16,6 +16,7 @@ use smolvm_protocol::guest_env;
 use smolvm_protocol::{
     image_repo, normalize_image_ref, ImageInfo, OverlayInfo, RegistryAuth, StorageStatus,
 };
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
@@ -599,6 +600,16 @@ const ARCHIVE_EXTRACTED_MARKER: &str = ".extracted";
 /// disk re-flattens instead of booting the old rootfs. The marker is written
 /// last, so the image-info and overlay paths share one flatten within a start.
 fn ensure_archive_flattened(packed_dir: &Path) -> Result<Option<PathBuf>> {
+    ensure_archive_flattened_with_progress(packed_dir, |_, _| {})
+}
+
+fn ensure_archive_flattened_with_progress<F>(
+    packed_dir: &Path,
+    mut progress: F,
+) -> Result<Option<PathBuf>>
+where
+    F: FnMut(&str, u64),
+{
     let archive = packed_dir.join(ARCHIVE_FILE_NAME);
     if !archive.exists() {
         return Ok(None);
@@ -619,10 +630,12 @@ fn ensure_archive_flattened(packed_dir: &Path) -> Result<Option<PathBuf>> {
     let rootfs = out_base.join(ARCHIVE_ROOTFS_DIR);
     std::fs::create_dir_all(&rootfs)?;
     info!(archive = %archive.display(), rootfs = %rootfs.display(), "flattening local image archive");
-    flatten_archive(&archive, &rootfs)?;
+    progress("flattening local image archive", 0);
+    flatten_archive_with_progress(&archive, &rootfs, &mut progress)?;
     // Recover the image config before writing the marker, so a later reuse can
     // rely on config.json being present. A docker/podman `save` always carries
     // one.
+    progress("recovering image configuration", 0);
     recover_archive_config(&archive, &out_base.join(ARCHIVE_CONFIG_FILE))?;
     std::fs::write(&marker, signature)?;
     Ok(Some(out_base))
@@ -647,6 +660,17 @@ fn archive_signature(archive: &Path) -> Result<String> {
 /// has consumed it; a plain archive streams straight through. This handles zstd,
 /// which the old `gunzip`-only path silently mangled.
 fn pipe_archive_into(cmd: &mut Command, archive: &Path) -> Result<Option<tempfile::NamedTempFile>> {
+    pipe_archive_into_with_progress(cmd, archive, &mut |_, _| {})
+}
+
+fn pipe_archive_into_with_progress<F>(
+    cmd: &mut Command,
+    archive: &Path,
+    progress: &mut F,
+) -> Result<Option<tempfile::NamedTempFile>>
+where
+    F: FnMut(&str, u64),
+{
     let file = std::fs::File::open(archive)?;
     if !is_compressed(archive)? {
         cmd.stdin(Stdio::from(file));
@@ -659,8 +683,13 @@ fn pipe_archive_into(cmd: &mut Command, archive: &Path) -> Result<Option<tempfil
     let mut reader = decompress_layer_reader(file)?;
     let mut tmp = tempfile::NamedTempFile::new()
         .map_err(|e| StorageError::new(format!("failed to create temp file: {e}")))?;
-    std::io::copy(&mut reader, tmp.as_file_mut())
-        .map_err(|e| StorageError::new(format!("failed to decompress archive: {e}")))?;
+    copy_with_progress(
+        &mut reader,
+        tmp.as_file_mut(),
+        "decompressing image archive",
+        progress,
+    )
+    .map_err(|e| StorageError::new(format!("failed to decompress archive: {e}")))?;
     let reopened = tmp
         .reopen()
         .map_err(|e| StorageError::new(format!("failed to reopen temp file: {e}")))?;
@@ -668,10 +697,55 @@ fn pipe_archive_into(cmd: &mut Command, archive: &Path) -> Result<Option<tempfil
     Ok(Some(tmp))
 }
 
+fn copy_with_progress<R, W, F>(
+    reader: &mut R,
+    writer: &mut W,
+    phase: &str,
+    progress: &mut F,
+) -> std::io::Result<u64>
+where
+    R: Read,
+    W: Write,
+    F: FnMut(&str, u64),
+{
+    const BUFFER_SIZE: usize = 1024 * 1024;
+    const REPORT_BYTES: u64 = 16 * 1024 * 1024;
+    const REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+    let mut buffer = vec![0u8; BUFFER_SIZE];
+    let mut total = 0u64;
+    let mut last_reported = 0u64;
+    let mut last_report = std::time::Instant::now();
+
+    progress(phase, 0);
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        writer.write_all(&buffer[..read])?;
+        total += read as u64;
+
+        if total - last_reported >= REPORT_BYTES || last_report.elapsed() >= REPORT_INTERVAL {
+            progress(phase, total);
+            last_reported = total;
+            last_report = std::time::Instant::now();
+        }
+    }
+    writer.flush()?;
+    if total != last_reported {
+        progress(phase, total);
+    }
+    Ok(total)
+}
+
 /// Flatten a `docker save` archive into `rootfs`, delegating to the bundled
 /// `crane export`. The flattened tar is a single layer with no whiteouts, so
 /// plain `tar -x` is sufficient (no per-layer handling needed).
-fn flatten_archive(archive: &Path, rootfs: &Path) -> Result<()> {
+fn flatten_archive_with_progress<F>(archive: &Path, rootfs: &Path, progress: &mut F) -> Result<()>
+where
+    F: FnMut(&str, u64),
+{
     // crane export - - : read an image tarball from stdin, write a flat rootfs
     // tar to stdout.
     let mut crane = Command::new("crane");
@@ -683,7 +757,7 @@ fn flatten_archive(archive: &Path, rootfs: &Path) -> Result<()> {
         // truncated archive — instead of a misleading guess.
         .stderr(Stdio::piped());
     // Held alive until crane has consumed it (the decompressed input, if any).
-    let _archive_tmp = pipe_archive_into(&mut crane, archive)?;
+    let _archive_tmp = pipe_archive_into_with_progress(&mut crane, archive, progress)?;
 
     let mut crane_child = crane
         .spawn()
@@ -697,26 +771,50 @@ fn flatten_archive(archive: &Path, rootfs: &Path) -> Result<()> {
         .take()
         .ok_or_else(|| StorageError::new("failed to capture crane stderr".to_string()))?;
 
-    let tar_out = Command::new("tar")
+    let mut tar_child = Command::new("tar")
         .arg("-x")
         .arg("-C")
         .arg(rootfs)
-        .stdin(Stdio::from(crane_out))
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .output()
+        .spawn()
         .map_err(|e| StorageError::new(format!("failed to run tar: {e}")))?;
+
+    let mut tar_in = tar_child
+        .stdin
+        .take()
+        .ok_or_else(|| StorageError::new("failed to open tar stdin".to_string()))?;
+
+    // Drain stderr concurrently: crane may emit enough diagnostics to fill its
+    // pipe while stdout is still flowing, which would otherwise deadlock the
+    // crane -> host -> tar pipeline.
+    let crane_err_thread = std::thread::spawn(move || {
+        let mut stderr = String::new();
+        let _ = std::io::Read::read_to_string(&mut crane_err, &mut stderr);
+        stderr
+    });
+
+    let mut crane_out = crane_out;
+    let copy_result = copy_with_progress(
+        &mut crane_out,
+        &mut tar_in,
+        "extracting flattened rootfs",
+        progress,
+    );
+    drop(tar_in);
+
+    let tar_out = tar_child
+        .wait_with_output()
+        .map_err(|e| StorageError::new(format!("failed to wait for tar: {e}")))?;
 
     let crane_status = crane_child
         .wait()
         .map_err(|e| StorageError::new(format!("failed to wait for crane: {e}")))?;
+    let crane_stderr = crane_err_thread.join().unwrap_or_default();
 
     if !crane_status.success() {
-        // crane's stderr is a single short line; reading it after the process
-        // exits (its stdout was drained by `tar`) cannot deadlock.
-        let mut stderr = String::new();
-        let _ = std::io::Read::read_to_string(&mut crane_err, &mut stderr);
-        let stderr = stderr.trim();
+        let stderr = crane_stderr.trim();
         return Err(StorageError::new(format!(
             "crane export failed{} (is the image a valid `docker save` / OCI archive?)",
             if stderr.is_empty() {
@@ -732,6 +830,8 @@ fn flatten_archive(archive: &Path, rootfs: &Path) -> Result<()> {
             String::from_utf8_lossy(&tar_out.stderr)
         )));
     }
+    copy_result
+        .map_err(|e| StorageError::new(format!("streaming flattened rootfs failed: {e}")))?;
     Ok(())
 }
 
@@ -2931,6 +3031,17 @@ pub fn prepare_for_run(image: &str) -> Result<PreparedOverlayRootfs> {
 /// If it exists but is unmounted (e.g. after VM restart), remounts preserving
 /// the upper layer that contains previous changes.
 pub fn prepare_for_run_persistent(image: &str, overlay_id: &str) -> Result<PreparedOverlayRootfs> {
+    prepare_for_run_persistent_with_progress(image, overlay_id, |_, _| {})
+}
+
+pub fn prepare_for_run_persistent_with_progress<F>(
+    image: &str,
+    overlay_id: &str,
+    mut progress: F,
+) -> Result<PreparedOverlayRootfs>
+where
+    F: FnMut(&str, u64),
+{
     validate_storage_id(overlay_id, "persistent overlay id")?;
     let workload_id = format!("persistent-{}", overlay_id);
 
@@ -2938,13 +3049,14 @@ pub fn prepare_for_run_persistent(image: &str, overlay_id: &str) -> Result<Prepa
     // archive is flattened into a rootfs first; a packed-layers dir is used
     // as-is.
     let lowerdirs = if let Some(packed_dir) = get_packed_layers_dir() {
-        let flattened = ensure_archive_flattened(packed_dir)?;
+        let flattened = ensure_archive_flattened_with_progress(packed_dir, &mut progress)?;
         let effective = flattened.as_deref().unwrap_or(packed_dir);
         get_packed_lowerdirs(effective)?
     } else {
         get_image_lowerdirs(image)?
     };
 
+    progress("preparing persistent overlay", 0);
     let setup = OverlaySetup::new(&workload_id)?;
     let overlay = setup.execute_or_remount(lowerdirs)?;
 
@@ -3938,6 +4050,34 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn copy_with_progress_reports_bytes_while_streaming() {
+        let input = vec![0x5a; 17 * 1024 * 1024];
+        let mut reader = std::io::Cursor::new(&input);
+        let mut output = Vec::new();
+        let mut reports = Vec::new();
+
+        let copied = copy_with_progress(
+            &mut reader,
+            &mut output,
+            "flattening",
+            &mut |phase, bytes| reports.push((phase.to_string(), bytes)),
+        )
+        .unwrap();
+
+        assert_eq!(copied, input.len() as u64);
+        assert_eq!(output, input);
+        assert_eq!(reports.first(), Some(&("flattening".to_string(), 0)));
+        assert_eq!(
+            reports.last(),
+            Some(&("flattening".to_string(), input.len() as u64))
+        );
+        assert!(
+            reports.iter().any(|(_, bytes)| *bytes >= 16 * 1024 * 1024),
+            "large copies must report before completion"
+        );
     }
 
     #[test]
