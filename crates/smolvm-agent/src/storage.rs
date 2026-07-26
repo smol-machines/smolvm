@@ -17,6 +17,8 @@ use smolvm_protocol::{
     image_repo, normalize_image_ref, ImageInfo, OverlayInfo, RegistryAuth, StorageStatus,
 };
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
@@ -671,10 +673,21 @@ fn pipe_archive_into_with_progress<F>(
 where
     F: FnMut(&str, u64),
 {
+    let (input, tmp) = prepare_archive_input_with_progress(archive, progress)?;
+    cmd.stdin(Stdio::from(input));
+    Ok(tmp)
+}
+
+fn prepare_archive_input_with_progress<F>(
+    archive: &Path,
+    progress: &mut F,
+) -> Result<(std::fs::File, Option<tempfile::NamedTempFile>)>
+where
+    F: FnMut(&str, u64),
+{
     let file = std::fs::File::open(archive)?;
     if !is_compressed(archive)? {
-        cmd.stdin(Stdio::from(file));
-        return Ok(None);
+        return Ok((file, None));
     }
     // Expand to a temp file, then feed that. `docker save` archives are a local
     // dev-import path, so the extra copy is cheap and avoids threading a
@@ -693,8 +706,7 @@ where
     let reopened = tmp
         .reopen()
         .map_err(|e| StorageError::new(format!("failed to reopen temp file: {e}")))?;
-    cmd.stdin(Stdio::from(reopened));
-    Ok(Some(tmp))
+    Ok((reopened, Some(tmp)))
 }
 
 fn copy_with_progress<R, W, F>(
@@ -739,6 +751,123 @@ where
     Ok(total)
 }
 
+fn spawn_copy_with_progress<R, W>(
+    mut reader: R,
+    mut writer: W,
+    phase: &'static str,
+) -> (
+    std::thread::JoinHandle<std::io::Result<u64>>,
+    std::sync::mpsc::Receiver<(&'static str, u64)>,
+)
+where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+{
+    let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        copy_with_progress(&mut reader, &mut writer, phase, &mut |_, bytes| {
+            let _ = progress_tx.send((phase, bytes));
+        })
+    });
+    (handle, progress_rx)
+}
+
+fn forward_latest_progress<F>(
+    progress_rx: &std::sync::mpsc::Receiver<(&'static str, u64)>,
+    progress: &mut F,
+) where
+    F: FnMut(&str, u64),
+{
+    let mut latest = None;
+    while let Ok(update) = progress_rx.try_recv() {
+        latest = Some(update);
+    }
+    if let Some((phase, bytes)) = latest {
+        progress(phase, bytes);
+    }
+}
+
+#[cfg(unix)]
+fn copy_process_output_with_progress<R, W, F>(
+    reader: &mut R,
+    writer: &mut W,
+    phase: &str,
+    input_progress: &std::sync::mpsc::Receiver<(&'static str, u64)>,
+    progress: &mut F,
+) -> std::io::Result<u64>
+where
+    R: Read + AsRawFd,
+    W: Write,
+    F: FnMut(&str, u64),
+{
+    const BUFFER_SIZE: usize = 1024 * 1024;
+    const REPORT_BYTES: u64 = 16 * 1024 * 1024;
+    const REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+    let mut buffer = vec![0u8; BUFFER_SIZE];
+    let mut total = 0u64;
+    let mut last_reported = 0u64;
+    let mut last_report = std::time::Instant::now();
+
+    progress(phase, 0);
+    loop {
+        forward_latest_progress(input_progress, progress);
+        let mut poll_fd = libc::pollfd {
+            fd: reader.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut poll_fd, 1, 1000) };
+        if ready < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if ready == 0 {
+            continue;
+        }
+
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        writer.write_all(&buffer[..read])?;
+        total += read as u64;
+
+        if total - last_reported >= REPORT_BYTES || last_report.elapsed() >= REPORT_INTERVAL {
+            progress(phase, total);
+            last_reported = total;
+            last_report = std::time::Instant::now();
+        }
+    }
+    writer.flush()?;
+    forward_latest_progress(input_progress, progress);
+    if total != last_reported {
+        progress(phase, total);
+    }
+    Ok(total)
+}
+
+#[cfg(not(unix))]
+fn copy_process_output_with_progress<R, W, F>(
+    reader: &mut R,
+    writer: &mut W,
+    phase: &str,
+    input_progress: &std::sync::mpsc::Receiver<(&'static str, u64)>,
+    progress: &mut F,
+) -> std::io::Result<u64>
+where
+    R: Read,
+    W: Write,
+    F: FnMut(&str, u64),
+{
+    let result = copy_with_progress(reader, writer, phase, progress);
+    forward_latest_progress(input_progress, progress);
+    result
+}
+
 /// Flatten a `docker save` archive into `rootfs`, delegating to the bundled
 /// `crane export`. The flattened tar is a single layer with no whiteouts, so
 /// plain `tar -x` is sufficient (no per-layer handling needed).
@@ -751,17 +880,24 @@ where
     let mut crane = Command::new("crane");
     crane
         .args(["export", "-", "-"])
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         // Capture (don't discard) crane's stderr so a failure reports the REAL
         // reason — e.g. "file manifest.json not found in tar" for an empty or
         // truncated archive — instead of a misleading guess.
         .stderr(Stdio::piped());
     // Held alive until crane has consumed it (the decompressed input, if any).
-    let _archive_tmp = pipe_archive_into_with_progress(&mut crane, archive, progress)?;
+    let (archive_input, _archive_tmp) = prepare_archive_input_with_progress(archive, progress)?;
 
     let mut crane_child = crane
         .spawn()
         .map_err(|e| StorageError::new(format!("failed to spawn crane export: {e}")))?;
+    let crane_in = crane_child
+        .stdin
+        .take()
+        .ok_or_else(|| StorageError::new("failed to open crane stdin".to_string()))?;
+    let (input_copy_thread, input_progress) =
+        spawn_copy_with_progress(archive_input, crane_in, "reading image archive");
     let crane_out = crane_child
         .stdout
         .take()
@@ -796,10 +932,11 @@ where
     });
 
     let mut crane_out = crane_out;
-    let copy_result = copy_with_progress(
+    let copy_result = copy_process_output_with_progress(
         &mut crane_out,
         &mut tar_in,
         "extracting flattened rootfs",
+        &input_progress,
         progress,
     );
     drop(tar_in);
@@ -811,6 +948,12 @@ where
     let crane_status = crane_child
         .wait()
         .map_err(|e| StorageError::new(format!("failed to wait for crane: {e}")))?;
+    let input_copy_result = input_copy_thread.join().unwrap_or_else(|_| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "archive input worker panicked",
+        ))
+    });
     let crane_stderr = crane_err_thread.join().unwrap_or_default();
 
     if !crane_status.success() {
@@ -830,6 +973,8 @@ where
             String::from_utf8_lossy(&tar_out.stderr)
         )));
     }
+    input_copy_result
+        .map_err(|e| StorageError::new(format!("streaming image archive failed: {e}")))?;
     copy_result
         .map_err(|e| StorageError::new(format!("streaming flattened rootfs failed: {e}")))?;
     Ok(())
@@ -4077,6 +4222,23 @@ mod tests {
         assert!(
             reports.iter().any(|(_, bytes)| *bytes >= 16 * 1024 * 1024),
             "large copies must report before completion"
+        );
+    }
+
+    #[test]
+    fn spawned_copy_reports_archive_input_progress() {
+        let input = std::io::Cursor::new(vec![0x5a; 17 * 1024 * 1024]);
+        let (copy_thread, progress_rx) =
+            spawn_copy_with_progress(input, std::io::sink(), "reading archive");
+        let reports: Vec<_> = progress_rx.iter().collect();
+        let copied = copy_thread.join().unwrap().unwrap();
+
+        assert_eq!(copied, 17 * 1024 * 1024);
+        assert_eq!(reports.first(), Some(&("reading archive", 0)));
+        assert_eq!(reports.last(), Some(&("reading archive", 17 * 1024 * 1024)));
+        assert!(
+            reports.iter().any(|(_, bytes)| *bytes >= 16 * 1024 * 1024),
+            "large archive inputs must report before completion"
         );
     }
 
