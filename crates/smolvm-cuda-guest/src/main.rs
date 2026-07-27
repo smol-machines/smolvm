@@ -120,7 +120,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// The shared pattern the writer stores and the reader verifies.
+///
+/// Arbitrary recognizable floats, not mathematical constants — the point is
+/// that a wrong read is obvious in the log, so `approx_constant` is a false
+/// positive on the leading value here.
 #[cfg(target_os = "linux")]
+#[allow(clippy::approx_constant)]
 const PROBE_PATTERN: [f32; 4] = [3.14, 2.71, 1.41, 1.61];
 
 #[cfg(target_os = "linux")]
@@ -160,7 +165,7 @@ fn run_loop() -> Result<(), Box<dyn std::error::Error>> {
         .chars()
         .take(8)
         .collect::<String>();
-    let mut append = |line: String| {
+    let append = |line: String| {
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
