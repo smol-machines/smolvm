@@ -141,13 +141,14 @@ pub struct SignatureInfo {
     pub raw_output: String,
 }
 
-#[cfg(test)]
+// Every test here drives `codesign`, so the whole module is macOS-only —
+// otherwise its imports are unused on other platforms.
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
     use std::io::Write;
 
     #[test]
-    #[cfg(target_os = "macos")]
     fn test_sign_binary() {
         let temp_dir = tempfile::tempdir().unwrap();
         let binary_path = temp_dir.path().join("test_binary");
@@ -189,7 +190,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
     fn test_entitlements_format() {
         // Verify the entitlements XML is valid
         assert!(HYPERVISOR_ENTITLEMENTS.contains("com.apple.security.hypervisor"));

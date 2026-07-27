@@ -856,9 +856,11 @@ mod tests {
         let staging = temp_dir.path().join("staging");
         let mut collector = AssetCollector::new(staging).unwrap();
 
-        // Add a fake layer (digest must be at least 12 chars after sha256:)
+        // Add a fake layer. The digest must be at least 12 characters after
+        // `sha256:` and valid hex — it is used as a filesystem path, so
+        // `add_layer` rejects anything else (see 680ba8d9).
         collector
-            .add_layer("sha256:embedded123456", b"embedded layer content")
+            .add_layer("sha256:abcdef123456", b"embedded layer content")
             .unwrap();
 
         // Create manifest
@@ -879,7 +881,7 @@ mod tests {
         // Verify we can read the manifest with layer info
         let manifest = read_manifest(&output_path).unwrap();
         assert_eq!(manifest.assets.layers.len(), 1);
-        assert_eq!(manifest.assets.layers[0].digest, "sha256:embedded123456");
+        assert_eq!(manifest.assets.layers[0].digest, "sha256:abcdef123456");
 
         // Verify footer indicates embedded mode
         let footer = read_footer(&output_path).unwrap();
@@ -890,7 +892,7 @@ mod tests {
         let extract_dir = temp_dir.path().join("extracted");
         extract_assets(&output_path, &extract_dir).unwrap();
 
-        let layer_file = extract_dir.join("layers/embedded1234.tar"); // First 12 chars
+        let layer_file = extract_dir.join("layers/abcdef123456.tar"); // First 12 chars
         assert!(layer_file.exists());
         assert_eq!(
             fs::read_to_string(&layer_file).unwrap(),
