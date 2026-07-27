@@ -61,29 +61,9 @@ pub const CONTAINERS_EXIT_DIR: &str = "/storage/containers/exit";
 // Path Helper Functions
 // =============================================================================
 
-/// Get the runtime directory for a specific container.
-pub fn container_run_dir(container_id: &str) -> PathBuf {
-    PathBuf::from(CONTAINERS_RUN_DIR).join(container_id)
-}
-
-/// Get the log file path for a container.
-pub fn container_log_path(container_id: &str) -> PathBuf {
-    PathBuf::from(CONTAINERS_LOGS_DIR).join(format!("{}.log", container_id))
-}
-
-/// Get the exit code file path for a container.
-pub fn container_exit_path(container_id: &str) -> PathBuf {
-    PathBuf::from(CONTAINERS_EXIT_DIR).join(container_id)
-}
-
 /// Get the overlay directory for a workload.
 pub fn overlay_dir(workload_id: &str) -> PathBuf {
     PathBuf::from(OVERLAYS_DIR).join(workload_id)
-}
-
-/// Get the bundle directory for a workload.
-pub fn bundle_dir(workload_id: &str) -> PathBuf {
-    overlay_dir(workload_id).join("bundle")
 }
 
 /// Path to the file recording the main container ID for a persistent overlay.
@@ -124,32 +104,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_container_paths() {
-        let id = "abc123";
-        assert_eq!(
-            container_run_dir(id),
-            PathBuf::from("/storage/containers/run/abc123")
-        );
-        assert_eq!(
-            container_log_path(id),
-            PathBuf::from("/storage/containers/logs/abc123.log")
-        );
-        assert_eq!(
-            container_exit_path(id),
-            PathBuf::from("/storage/containers/exit/abc123")
-        );
-    }
-
-    #[test]
     fn test_overlay_paths() {
         let wl = "workload-123";
         assert_eq!(
             overlay_dir(wl),
             PathBuf::from("/storage/overlays/workload-123")
-        );
-        assert_eq!(
-            bundle_dir(wl),
-            PathBuf::from("/storage/overlays/workload-123/bundle")
         );
     }
 

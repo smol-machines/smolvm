@@ -10,7 +10,7 @@
 
 use crate::crun::CrunCommand;
 use crate::oci::{generate_container_id, OciSpec};
-use crate::paths;
+use crate::paths::{self, STORAGE_ROOT};
 use crate::process::{WaitResult, TIMEOUT_EXIT_CODE};
 use smolvm_protocol::guest_env;
 use smolvm_protocol::{
@@ -20,9 +20,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use tracing::{debug, info, warn};
-
-/// Storage root path (where the ext4 disk is mounted).
-const STORAGE_ROOT: &str = "/storage";
 
 /// Directory structure within storage.
 const LAYERS_DIR: &str = "layers";
