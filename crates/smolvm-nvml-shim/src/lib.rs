@@ -100,7 +100,8 @@ fn cu_device_name(ord: c_int) -> Option<String> {
         let dev = cu_device(ord)?;
         let f = cu_sym(c"cuDeviceGetName")?;
         let f: extern "C" fn(*mut c_char, c_int, c_int) -> c_int = std::mem::transmute(f);
-        let mut buf = [0i8; 256];
+        // c_char, not i8: they differ on aarch64 Linux, where c_char is u8.
+        let mut buf: [c_char; 256] = [0; 256];
         (f(buf.as_mut_ptr(), buf.len() as c_int, dev) == 0).then(|| {
             let cstr = std::ffi::CStr::from_ptr(buf.as_ptr());
             cstr.to_string_lossy().into_owned()
