@@ -80,128 +80,6 @@ fn inject_into_env_if(env: &mut Vec<(String, String)>, enabled: bool) {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::oci::{OciSpec, ProcessIdentity};
-
-    // Regression guard for #542: non-interactive exec + run go through the
-    // keep-alive container's `crun exec`, whose process env is built fresh (not
-    // inherited from the container), so SSH_AUTH_SOCK must be injected into that
-    // env explicitly — the container-spec injection alone doesn't reach it.
-    #[test]
-    fn inject_into_env_adds_ssh_auth_sock_only_when_enabled() {
-        // Enabled → injected.
-        let mut env = vec![("PATH".to_string(), "/usr/bin".to_string())];
-        inject_into_env_if(&mut env, true);
-        assert!(
-            env.iter()
-                .any(|(k, v)| k == "SSH_AUTH_SOCK" && v == GUEST_SSH_AUTH_SOCK),
-            "SSH_AUTH_SOCK must be injected into the exec/run env when forwarding is enabled"
-        );
-
-        // Disabled → no-op.
-        let mut env = vec![("PATH".to_string(), "/usr/bin".to_string())];
-        inject_into_env_if(&mut env, false);
-        assert!(!env.iter().any(|(k, _)| k == "SSH_AUTH_SOCK"));
-
-        // Never overrides a user-supplied value.
-        let mut env = vec![("SSH_AUTH_SOCK".to_string(), "/custom.sock".to_string())];
-        inject_into_env_if(&mut env, true);
-        assert_eq!(env.iter().filter(|(k, _)| k == "SSH_AUTH_SOCK").count(), 1);
-        assert_eq!(env[0].1, "/custom.sock");
-    }
-
-    #[test]
-    fn inject_is_noop_when_disabled() {
-        let mut spec = OciSpec::new(
-            &["true".to_string()],
-            &[],
-            "/",
-            false,
-            &ProcessIdentity::root(),
-            false,
-        );
-        let mounts_before = spec.mounts.len();
-        let envs_before = spec.process.env.len();
-
-        inject_into_container_if(&mut spec, false);
-
-        assert_eq!(spec.mounts.len(), mounts_before);
-        assert_eq!(spec.process.env.len(), envs_before);
-        assert!(!spec
-            .process
-            .env
-            .iter()
-            .any(|e| e.starts_with("SSH_AUTH_SOCK=")));
-    }
-
-    #[test]
-    fn inject_adds_env_and_mount_when_enabled() {
-        let mut spec = OciSpec::new(
-            &["true".to_string()],
-            &[],
-            "/",
-            false,
-            &ProcessIdentity::root(),
-            false,
-        );
-
-        inject_into_container_if(&mut spec, true);
-
-        // Env must point at the guest-side bridge socket.
-        assert!(spec
-            .process
-            .env
-            .iter()
-            .any(|e| e == &format!("SSH_AUTH_SOCK={}", GUEST_SSH_AUTH_SOCK)));
-
-        // Mount must bind the socket at the same path inside the container.
-        let mount = spec
-            .mounts
-            .iter()
-            .find(|m| m.destination == GUEST_SSH_AUTH_SOCK)
-            .expect("bind mount for SSH agent socket not found");
-        assert_eq!(mount.source, GUEST_SSH_AUTH_SOCK);
-        assert_eq!(mount.mount_type.as_deref(), Some("bind"));
-        // rw: the SSH agent protocol is bidirectional.
-        assert!(!mount.options.iter().any(|o| o == "ro"));
-        assert!(mount.options.iter().any(|o| o == "bind"));
-    }
-
-    #[test]
-    fn inject_replaces_existing_ssh_auth_sock() {
-        // Simulates an image whose config already exports a stale
-        // SSH_AUTH_SOCK: we must replace it, not duplicate it — two entries
-        // for the same key leaves the effective value shell-dependent.
-        let mut spec = OciSpec::new(
-            &["true".to_string()],
-            &[],
-            "/",
-            false,
-            &ProcessIdentity::root(),
-            false,
-        );
-        spec.process
-            .env
-            .push("SSH_AUTH_SOCK=/stale/path".to_string());
-
-        inject_into_container_if(&mut spec, true);
-
-        let matches: Vec<_> = spec
-            .process
-            .env
-            .iter()
-            .filter(|e| e.starts_with("SSH_AUTH_SOCK="))
-            .collect();
-        assert_eq!(matches.len(), 1, "duplicate SSH_AUTH_SOCK entries");
-        assert_eq!(
-            matches[0],
-            &format!("SSH_AUTH_SOCK={}", GUEST_SSH_AUTH_SOCK)
-        );
-    }
-}
-
 fn run_bridge() -> io::Result<()> {
     let sock_path = std::path::Path::new(GUEST_SSH_AUTH_SOCK);
 
@@ -417,5 +295,127 @@ fn vsock_connect(port: u32) -> io::Result<VsockStream> {
         }
 
         Ok(VsockStream { fd })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::oci::{OciSpec, ProcessIdentity};
+
+    // Regression guard for #542: non-interactive exec + run go through the
+    // keep-alive container's `crun exec`, whose process env is built fresh (not
+    // inherited from the container), so SSH_AUTH_SOCK must be injected into that
+    // env explicitly — the container-spec injection alone doesn't reach it.
+    #[test]
+    fn inject_into_env_adds_ssh_auth_sock_only_when_enabled() {
+        // Enabled → injected.
+        let mut env = vec![("PATH".to_string(), "/usr/bin".to_string())];
+        inject_into_env_if(&mut env, true);
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "SSH_AUTH_SOCK" && v == GUEST_SSH_AUTH_SOCK),
+            "SSH_AUTH_SOCK must be injected into the exec/run env when forwarding is enabled"
+        );
+
+        // Disabled → no-op.
+        let mut env = vec![("PATH".to_string(), "/usr/bin".to_string())];
+        inject_into_env_if(&mut env, false);
+        assert!(!env.iter().any(|(k, _)| k == "SSH_AUTH_SOCK"));
+
+        // Never overrides a user-supplied value.
+        let mut env = vec![("SSH_AUTH_SOCK".to_string(), "/custom.sock".to_string())];
+        inject_into_env_if(&mut env, true);
+        assert_eq!(env.iter().filter(|(k, _)| k == "SSH_AUTH_SOCK").count(), 1);
+        assert_eq!(env[0].1, "/custom.sock");
+    }
+
+    #[test]
+    fn inject_is_noop_when_disabled() {
+        let mut spec = OciSpec::new(
+            &["true".to_string()],
+            &[],
+            "/",
+            false,
+            &ProcessIdentity::root(),
+            false,
+        );
+        let mounts_before = spec.mounts.len();
+        let envs_before = spec.process.env.len();
+
+        inject_into_container_if(&mut spec, false);
+
+        assert_eq!(spec.mounts.len(), mounts_before);
+        assert_eq!(spec.process.env.len(), envs_before);
+        assert!(!spec
+            .process
+            .env
+            .iter()
+            .any(|e| e.starts_with("SSH_AUTH_SOCK=")));
+    }
+
+    #[test]
+    fn inject_adds_env_and_mount_when_enabled() {
+        let mut spec = OciSpec::new(
+            &["true".to_string()],
+            &[],
+            "/",
+            false,
+            &ProcessIdentity::root(),
+            false,
+        );
+
+        inject_into_container_if(&mut spec, true);
+
+        // Env must point at the guest-side bridge socket.
+        assert!(spec
+            .process
+            .env
+            .iter()
+            .any(|e| e == &format!("SSH_AUTH_SOCK={}", GUEST_SSH_AUTH_SOCK)));
+
+        // Mount must bind the socket at the same path inside the container.
+        let mount = spec
+            .mounts
+            .iter()
+            .find(|m| m.destination == GUEST_SSH_AUTH_SOCK)
+            .expect("bind mount for SSH agent socket not found");
+        assert_eq!(mount.source, GUEST_SSH_AUTH_SOCK);
+        assert_eq!(mount.mount_type.as_deref(), Some("bind"));
+        // rw: the SSH agent protocol is bidirectional.
+        assert!(!mount.options.iter().any(|o| o == "ro"));
+        assert!(mount.options.iter().any(|o| o == "bind"));
+    }
+
+    #[test]
+    fn inject_replaces_existing_ssh_auth_sock() {
+        // Simulates an image whose config already exports a stale
+        // SSH_AUTH_SOCK: we must replace it, not duplicate it — two entries
+        // for the same key leaves the effective value shell-dependent.
+        let mut spec = OciSpec::new(
+            &["true".to_string()],
+            &[],
+            "/",
+            false,
+            &ProcessIdentity::root(),
+            false,
+        );
+        spec.process
+            .env
+            .push("SSH_AUTH_SOCK=/stale/path".to_string());
+
+        inject_into_container_if(&mut spec, true);
+
+        let matches: Vec<_> = spec
+            .process
+            .env
+            .iter()
+            .filter(|e| e.starts_with("SSH_AUTH_SOCK="))
+            .collect();
+        assert_eq!(matches.len(), 1, "duplicate SSH_AUTH_SOCK entries");
+        assert_eq!(
+            matches[0],
+            &format!("SSH_AUTH_SOCK={}", GUEST_SSH_AUTH_SOCK)
+        );
     }
 }

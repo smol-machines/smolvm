@@ -936,7 +936,11 @@ pub extern "C" fn cudaMallocHost(ptr: *mut *mut c_void, size: usize) -> c_int {
 // offset (see do_memcpy). Falls back to plain host memory when the region is
 // absent or exhausted.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
+// Every use of the bare `Ordering` name in this file sits on a Linux-only
+// path, so importing it unconditionally warns on a macOS dev host.
+#[cfg(target_os = "linux")]
+use std::sync::atomic::Ordering;
 
 static SHM_NEXT: AtomicU64 = AtomicU64::new(0);
 

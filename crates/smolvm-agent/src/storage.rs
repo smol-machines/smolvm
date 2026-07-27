@@ -2737,6 +2737,9 @@ fn prepare_rootfs_for_ephemeral_run(image: &str) -> Result<PreparedOverlayRootfs
 /// When `persistent_overlay_id` is `Some`, the overlay persists across runs
 /// (filesystem changes accumulate). When `None`, an ephemeral overlay is
 /// created and destroyed after the run.
+// The workload parameter list, mirrored by `main::handle_run`; both want
+// folding into a shared spec struct rather than trimming here.
+#[allow(clippy::too_many_arguments)]
 pub fn run_command(
     image: &str,
     command: &[String],
@@ -2843,6 +2846,8 @@ pub fn run_command(
 /// Requires a persistent overlay ID — ephemeral overlays would leak their
 /// upper/work/merged directories because nothing is waiting to clean them
 /// up after the container exits.
+// Same workload parameter list as `run_command`, minus the wait-related args.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_in_overlay(
     image: &str,
     command: &[String],

@@ -92,6 +92,13 @@ pub const FILE_WRITE_SINGLE_SHOT_MAX: usize = 1024 * 1024;
 /// asymmetric case and needs a smaller chunk.
 pub const FILE_WRITE_CHUNK_SIZE: usize = FILE_WRITE_SINGLE_SHOT_MAX;
 
+// The single-shot threshold must be <= the chunk size. They can be equal (a
+// 1 MiB file is a single shot; a 1 MiB + 1 byte file streams as two chunks),
+// but SINGLE_SHOT > CHUNK would be incoherent — a file slightly over the shot
+// threshold would have to stream as a single oversized chunk. Enforced at
+// compile time so a bad edit fails the build rather than a test.
+const _: () = assert!(FILE_WRITE_SINGLE_SHOT_MAX <= FILE_WRITE_CHUNK_SIZE);
+
 /// Hard ceiling on a single file transfer in either direction.
 ///
 /// On the write path: enforced at `FileWriteBegin` by the agent —
@@ -1373,13 +1380,6 @@ mod tests {
             total,
             MAX_FRAME_SIZE
         );
-
-        // Single-shot threshold must be <= chunk size. They can be
-        // equal (a 1 MiB file is a single shot; a 1 MiB + 1 byte
-        // file streams as two chunks); but SINGLE_SHOT > CHUNK would
-        // be incoherent — a file slightly over the shot threshold
-        // would need to stream as... a single oversized chunk.
-        assert!(FILE_WRITE_SINGLE_SHOT_MAX <= FILE_WRITE_CHUNK_SIZE);
     }
 
     #[test]

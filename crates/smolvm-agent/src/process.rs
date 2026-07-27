@@ -243,8 +243,8 @@ where
                 let join_deadline = Instant::now() + READER_JOIN_TIMEOUT;
                 while Instant::now() < join_deadline {
                     drain_channels(&stdout_rx, &stderr_rx, &mut stdout_buf, &mut stderr_buf);
-                    let stdout_done = stdout_handle.as_ref().map_or(true, |h| h.is_finished());
-                    let stderr_done = stderr_handle.as_ref().map_or(true, |h| h.is_finished());
+                    let stdout_done = stdout_handle.as_ref().is_none_or(|h| h.is_finished());
+                    let stderr_done = stderr_handle.as_ref().is_none_or(|h| h.is_finished());
                     if stdout_done && stderr_done {
                         break;
                     }
