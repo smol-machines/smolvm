@@ -7,7 +7,7 @@ mod cli;
 
 /// smolvm - build and run portable, self-contained virtual machines
 #[derive(Parser, Debug)]
-#[command(name = "smolvm")]
+#[command(name = "smolvm", bin_name = "smolvm")]
 #[command(
     about = "Build and run portable, self-contained virtual machines",
     after_help = "Agents: run `smolvm --help` for full documentation including CLI reference and Smolfile schema"
