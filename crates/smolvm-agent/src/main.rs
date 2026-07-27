@@ -4992,7 +4992,6 @@ fn cap_exec_response(resp: AgentResponse) -> AgentResponse {
     resp
 }
 
-#[allow(clippy::too_many_arguments)]
 /// Run a non-interactive command inside the machine's long-lived keep-alive
 /// container (establishing it on first use), capturing its output. Joining the
 /// keep-alive container — rather than spawning a fresh one per exec — is what

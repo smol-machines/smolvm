@@ -3873,7 +3873,7 @@ fn get_disk_usage(path: &Path) -> Result<(u64, u64)> {
             let free = stat.f_bfree * stat.f_frsize;
             let used = total - free;
 
-            Ok((total as u64, used as u64))
+            Ok((total, used))
         }
     }
 

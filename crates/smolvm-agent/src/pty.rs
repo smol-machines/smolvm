@@ -260,10 +260,8 @@ pub fn slave_pre_exec(slave_fd: RawFd) -> impl FnMut() -> io::Result<()> {
 
         // Dup slave fd onto stdin/stdout/stderr.
         for &target in &[0, 1, 2] {
-            if slave_fd != target {
-                if unsafe { libc::dup2(slave_fd, target) } < 0 {
-                    return Err(io::Error::last_os_error());
-                }
+            if slave_fd != target && unsafe { libc::dup2(slave_fd, target) } < 0 {
+                return Err(io::Error::last_os_error());
             }
         }
 
