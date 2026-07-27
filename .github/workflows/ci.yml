@@ -107,11 +107,29 @@ jobs:
         env:
           LIBRARY_PATH: ${{ github.workspace }}/lib
 
+      # Root-package scope on purpose. smolvm-agent and the CUDA shims only ever
+      # ship for Linux; compiling them for macOS reports their Linux-gated items
+      # as dead code, which is noise rather than signal. The Linux job lints the
+      # whole workspace.
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
         env:
           LIBRARY_PATH: ${{ github.workspace }}/lib
 
+      # Regression guard for #737. The CUDA guest crates depend on smolvm-cuda
+      # with default-features = false, so building them alone resolves it with
+      # the host feature off — the configuration the guest actually ships. The
+      # release job only ever builds these for Linux, so a host-feature or
+      # non-Linux-unix regression here is otherwise invisible until release.
+      - name: Check CUDA guest crates (no host feature)
+        run: cargo check -p smolvm-cuda-shim -p smolvm-cudart-shim -p smolvm-cuda-guest
+        env:
+          LIBRARY_PATH: ${{ github.workspace }}/lib
+
+      # Also root-package scope for now: smolvm-network's ICMP relay test builds
+      # echo requests with a zero ident/checksum for the kernel to fill in, which
+      # is Linux ping-socket behaviour, so it times out on macOS. The Linux job
+      # runs the full workspace suite; widen this once that is sorted.
       - name: Run unit tests
         run: cargo test --lib
         env:
@@ -216,13 +234,16 @@ jobs:
         env:
           LIBRARY_PATH: /usr/local/lib
 
+      # --workspace: Linux is where the guest crates (smolvm-agent, the CUDA
+      # shims) actually build and ship, so their lints are meaningful here.
+      # The macOS job stays at root-package scope — see the comment there.
       - name: Clippy
-        run: cargo clippy --all-targets --target ${{ matrix.target }} -- -D warnings
+        run: cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
         env:
           LIBRARY_PATH: /usr/local/lib
 
       - name: Run unit tests
-        run: cargo test --lib --target ${{ matrix.target }}
+        run: cargo test --workspace --lib --target ${{ matrix.target }}
         env:
           LIBRARY_PATH: /usr/local/lib
           LD_LIBRARY_PATH: /usr/local/lib
