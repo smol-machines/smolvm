@@ -1816,6 +1816,13 @@ fn clone_worker_share_env(requested: bool, configured: Option<&str>) -> Option<&
     }
 }
 
+/// Decide whether a clone-marked connection should bypass worker routing when
+/// worker mode is disabled. Real channels fall through to ordinary serving;
+/// warm dials carry no Init and must be consumed instead of parking forever.
+fn disabled_worker_route(flags: u8, workers: bool, isolate: bool) -> Option<bool> {
+    (!workers || !isolate).then_some(flags & 2 != 0)
+}
+
 /// Route one just-accepted connection: strip the clone preamble (always), and
 /// when it marks an isolating fork clone, spawn/refuse its worker. Returns
 /// `true` when the connection was consumed (routed or rejected); `false` means
@@ -1831,6 +1838,20 @@ fn route_clone_connection(
     let Some((clone_id, flags)) = consume_clone_preamble(fd) else {
         return false;
     };
+    // The preamble must always be stripped, but a warm-dial connection must
+    // not bypass the worker-mode gate below. Previously the warm branch spawned
+    // a Path-3 worker unconditionally, so `SMOLVM_CUDA_FORK_WORKERS` unset still
+    // mixed worker contexts into the legacy single-context path.
+    if let Some(consumed) = disabled_worker_route(
+        flags,
+        std::env::var_os("SMOLVM_CUDA_FORK_WORKERS").is_some(),
+        std::env::var_os("SMOLVM_CUDA_FORK_ISOLATE").is_some(),
+    ) {
+        // Real clone connections still fall through to the shared-context
+        // server. A warm dial has no Init payload, so consume it instead of
+        // parking an otherwise permanent server thread on an idle socket.
+        return consumed;
+    }
     let share_weights = flags & 1 != 0;
     // Warm dial (flag bit 1): the clone VM's proxy dials at STARTUP so worker
     // spawn (CUDA init + memory reconstruction + module/graph pre-warm) runs
@@ -2740,7 +2761,8 @@ impl Drop for FileLock {
 mod mps_tests {
     use super::{
         clone_worker_share_env, create_private_mps_paths, decode_attach_procmem,
-        encode_attach_procmem, mps_enabled, recv_fd, send_fd, unique_live_clone_worker,
+        disabled_worker_route, encode_attach_procmem, mps_enabled, recv_fd, send_fd,
+        unique_live_clone_worker,
     };
     use std::collections::HashMap;
     use std::io;
@@ -2818,6 +2840,14 @@ mod mps_tests {
         assert_eq!(clone_worker_share_env(true, Some("false")), Some("0"));
         assert_eq!(clone_worker_share_env(true, Some("off")), Some("0"));
         assert_eq!(clone_worker_share_env(false, None), None);
+    }
+
+    #[test]
+    fn disabled_worker_mode_consumes_only_warm_dials() {
+        assert_eq!(disabled_worker_route(1, false, true), Some(false));
+        assert_eq!(disabled_worker_route(3, false, true), Some(true));
+        assert_eq!(disabled_worker_route(3, true, false), Some(true));
+        assert_eq!(disabled_worker_route(3, true, true), None);
     }
 
     #[test]
