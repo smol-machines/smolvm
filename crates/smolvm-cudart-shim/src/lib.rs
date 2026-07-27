@@ -2746,7 +2746,9 @@ pub extern "C" fn cudaDeviceGetPCIBusId(buf: *mut c_char, len: c_int, _device: c
     let id = b"0000:01:00.0\0";
     if !buf.is_null() && len > 0 {
         let n = (len as usize - 1).min(id.len() - 1);
-        unsafe { std::ptr::copy_nonoverlapping(id.as_ptr() as *const c_char, buf, n) };
+        // `.cast()`: c_char is u8 on aarch64 Linux (making `as` a no-op cast
+        // clippy rejects) but i8 elsewhere.
+        unsafe { std::ptr::copy_nonoverlapping(id.as_ptr().cast::<c_char>(), buf, n) };
         unsafe { *buf.add(n) = 0 };
     }
     set_last(CUDA_SUCCESS)

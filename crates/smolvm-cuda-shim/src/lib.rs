@@ -462,7 +462,10 @@ pub extern "C" fn cuDeviceGetName(name: *mut c_char, len: c_int, device: c_int) 
             let bytes = n.as_bytes();
             let copy = bytes.len().min(len as usize - 1);
             unsafe {
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), name as *mut u8, copy);
+                // `.cast()` rather than `as *mut u8`: c_char is u8 on aarch64
+                // Linux, where the `as` form is a no-op cast clippy rejects,
+                // but i8 on x86_64 and macOS, where the conversion is real.
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), name.cast::<u8>(), copy);
                 *name.add(copy) = 0;
             }
             CUDA_SUCCESS

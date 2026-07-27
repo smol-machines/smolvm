@@ -160,7 +160,9 @@ unsafe fn write_cstr(dst: *mut c_char, len: c_uint, s: &str) {
     let cap = len as usize - 1;
     let bytes = s.as_bytes();
     let n = bytes.len().min(cap);
-    std::ptr::copy_nonoverlapping(bytes.as_ptr() as *const c_char, dst, n);
+    // `.cast()`: c_char is u8 on aarch64 Linux (making `as` a no-op cast clippy
+    // rejects) but i8 elsewhere.
+    std::ptr::copy_nonoverlapping(bytes.as_ptr().cast::<c_char>(), dst, n);
     *dst.add(n) = 0;
 }
 
