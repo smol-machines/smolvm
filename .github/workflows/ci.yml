@@ -10,13 +10,6 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
-# Supersede a PR's older in-flight run when it is pushed to again. Pushes to a
-# branch (i.e. main) are never cancelled. Without this, a run that wedges holds
-# runners until the 6h job timeout even after the fix has been pushed.
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
 jobs:
   # ==========================================================================
   # Quick checks (no platform-specific deps needed)
@@ -135,8 +128,8 @@ jobs:
 
       # Also root-package scope for now: smolvm-network's ICMP relay test builds
       # echo requests with a zero ident/checksum for the kernel to fill in, which
-      # is Linux ping-socket behaviour, so it times out on macOS. The Linux job
-      # runs the full workspace suite; widen this once that is sorted.
+      # is Linux ping-socket behaviour, so it times out on macOS. Linux runs the
+      # reliable member-crate suites listed below.
       - name: Run unit tests
         run: cargo test --lib
         env:
@@ -249,10 +242,12 @@ jobs:
         env:
           LIBRARY_PATH: /usr/local/lib
 
-      # Crates listed explicitly rather than --workspace: smolvm-network's suite
-      # hangs on the runner (it is the only one doing real socket I/O in tests,
-      # and its ICMP relay test is already known to be platform-sensitive).
-      # Everything else is covered; re-add smolvm-network once that is diagnosed.
+      # Every library crate with host-runnable unit tests is listed explicitly
+      # except smolvm-network: its real-socket suite hangs on the Linux runner,
+      # and its ICMP relay test is already known to be platform-sensitive.
+      # The agent and K8s shim suites run in the dedicated steps below. The CUDA
+      # guest/shim and codegen crates have no unit tests; Clippy and the
+      # standalone guest build checks above still compile them.
       - name: Run unit tests
         run: >
           cargo test --lib --target ${{ matrix.target }}
