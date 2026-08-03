@@ -132,6 +132,18 @@ def json_request(endpoint, path, body=None):
 
 
 class UnslothVllmExecutorTests(unittest.TestCase):
+    def test_default_batch_window_is_five_milliseconds(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = UnslothVllmExecutor(
+                FakeModel(),
+                Path(directory) / "device.sock",
+                port=0,
+                _request_factory=request_factory,
+                _sampling_factory=lambda **values: values,
+                _synchronize=lambda: None,
+            )
+            self.assertEqual(service.batch_window, 0.005)
+
     def test_rejects_non_loopback_listener(self):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(ValueError, "loopback"):

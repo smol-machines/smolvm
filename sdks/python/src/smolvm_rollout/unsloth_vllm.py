@@ -169,7 +169,7 @@ class UnslothVllmExecutor:
         host: str = "127.0.0.1",
         port: int = 8000,
         model_lock: Any | None = None,
-        batch_window_ms: float = 2.0,
+        batch_window_ms: float = 5.0,
         max_batch_requests: int = 64,
         max_batch_prompts: int = 4096,
         max_queue_depth: int = 256,
