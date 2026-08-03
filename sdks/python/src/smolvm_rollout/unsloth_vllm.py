@@ -854,19 +854,26 @@ class UnslothVllmExecutor:
                     begin = len(prompts)
                     prompts.extend(body["prompt"])
                     requests.extend([record.request] * len(body["prompt"]))
-                    parameters = self._sampling_factory(
-                        n=body.get("n", 1),
-                        max_tokens=body["max_tokens"],
-                        temperature=body.get("temperature", 1.0),
-                        top_p=body.get("top_p", 1.0),
-                        top_k=body.get("top_k", -1),
-                        min_p=body.get("min_p", 0.0),
-                        repetition_penalty=body.get("repetition_penalty", 1.0),
-                        seed=body.get("seed"),
-                        logprobs=body.get("logprobs"),
-                        prompt_logprobs=body.get("prompt_logprobs"),
-                    )
-                    sampling.extend([parameters] * len(body["prompt"]))
+                    seed = body.get("seed")
+                    for prompt_index in range(len(body["prompt"])):
+                        sampling.append(
+                            self._sampling_factory(
+                                n=body.get("n", 1),
+                                max_tokens=body["max_tokens"],
+                                temperature=body.get("temperature", 1.0),
+                                top_p=body.get("top_p", 1.0),
+                                top_k=body.get("top_k", -1),
+                                min_p=body.get("min_p", 0.0),
+                                repetition_penalty=body.get(
+                                    "repetition_penalty", 1.0
+                                ),
+                                seed=(
+                                    None if seed is None else seed + prompt_index
+                                ),
+                                logprobs=body.get("logprobs"),
+                                prompt_logprobs=body.get("prompt_logprobs"),
+                            )
+                        )
                     slices.append((call, begin, len(prompts)))
                 outputs = self.model.fast_generate(
                     prompts,

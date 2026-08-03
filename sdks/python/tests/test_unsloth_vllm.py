@@ -355,6 +355,29 @@ class UnslothVllmExecutorTests(unittest.TestCase):
                     self.assertEqual(value["logprob"], -0.25)
                     self.assertEqual(value["rank"], 1)
 
+    def test_repeated_prompts_receive_distinct_deterministic_seeds(self):
+        model = FakeModel()
+        with tempfile.TemporaryDirectory() as directory:
+            service = executor(model, Path(directory) / "device.sock")
+            service._insert("policy-a", FakeRequest("policy-a", 11), "filesystem")
+            with service:
+                status, _response = json_request(
+                    service.endpoint,
+                    "/v1/completions",
+                    {
+                        "model": "policy-a",
+                        "prompt": ["same", "same", "same"],
+                        "n": 1,
+                        "max_tokens": 2,
+                        "seed": 41,
+                    },
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(
+                    [values["seed"] for values in model.generate_calls[0][1]],
+                    [41, 42, 43],
+                )
+
     def test_request_larger_than_batch_limit_fails_without_queuing(self):
         model = FakeModel()
         with tempfile.TemporaryDirectory() as directory:
