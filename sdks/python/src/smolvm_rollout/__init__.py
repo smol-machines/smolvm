@@ -8,6 +8,7 @@ from .device_handoff import (
     publish_device_adapter,
 )
 from .torch_handoff import TorchDeviceAdapter, import_torch_device_adapter
+from .unsloth_vllm import UnslothVllmExecutor
 
 __all__ = [
     "DeviceAdapterBundle",
@@ -16,6 +17,7 @@ __all__ = [
     "RolloutClient",
     "RolloutError",
     "TorchDeviceAdapter",
+    "UnslothVllmExecutor",
     "adapter_sha256",
     "publish_device_adapter",
     "import_torch_device_adapter",
