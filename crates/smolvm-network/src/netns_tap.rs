@@ -23,6 +23,7 @@
 //! statically from boot config; this is a pure L2 wire.
 
 use std::io;
+use std::net::Shutdown;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,6 +39,8 @@ const TAP_READ_BUF: usize = 65_536;
 /// and joins them; the tap fd closes with the bridge.
 pub struct NetnsTapBridge {
     stop: Arc<AtomicBool>,
+    stream: Arc<UnixStream>,
+    wake_sockets: Vec<UnixStream>,
     threads: Vec<JoinHandle<()>>,
 }
 
@@ -45,6 +48,14 @@ impl NetnsTapBridge {
     /// Stop the pumps and join. Idempotent; also called on drop.
     pub fn shutdown(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
+        // Closing a duplicated TAP fd does not reliably interrupt a read that
+        // is already blocked in another thread. The TAP workers therefore poll
+        // dedicated wake sockets, while shutting down the shared Unix stream
+        // interrupts any framed read or write already in progress.
+        let _ = self.stream.shutdown(Shutdown::Both);
+        for wake in &self.wake_sockets {
+            let _ = wake.shutdown(Shutdown::Both);
+        }
         for t in self.threads.drain(..) {
             let _ = t.join();
         }
@@ -68,38 +79,66 @@ impl Drop for NetnsTapBridge {
 /// - **stream → tap**: `read_frame` (strips the prefix), `write()` the raw frame
 ///   to the tap.
 pub fn start_netns_tap_bridge(stream: UnixStream, tap: OwnedFd) -> io::Result<NetnsTapBridge> {
-    // Independent fds for each direction so concurrent read+write never block
-    // each other (the same lesson as frame_stream's split sockets).
-    let stream_rx = stream.try_clone()?;
-    let stream_tx = stream;
+    // TAP writes can otherwise block behind a full device queue after shutdown
+    // begins. Both duplicated fds share this file status flag.
+    set_nonblocking(tap.as_raw_fd())?;
     let tap_rx = tap.try_clone()?;
     let tap_tx = tap;
+    let stream = Arc::new(stream);
+    let (tap_wake_worker, tap_wake_control) = UnixStream::pair()?;
+    let (stream_wake_worker, stream_wake_control) = UnixStream::pair()?;
 
     let stop = Arc::new(AtomicBool::new(false));
 
     let stop_a = stop.clone();
+    let stream_tx = stream.clone();
     let t_up = std::thread::Builder::new()
         .name("netns-tap-tx".into())
-        .spawn(move || pump_tap_to_stream(tap_rx, stream_tx, &stop_a))?;
+        .spawn(move || pump_tap_to_stream(tap_rx, stream_tx, tap_wake_worker, &stop_a))?;
 
     let stop_b = stop.clone();
-    let t_down = std::thread::Builder::new()
+    let stream_rx = stream.clone();
+    let t_down = match std::thread::Builder::new()
         .name("netns-tap-rx".into())
-        .spawn(move || pump_stream_to_tap(stream_rx, tap_tx, &stop_b))?;
+        .spawn(move || pump_stream_to_tap(stream_rx, tap_tx, stream_wake_worker, &stop_b))
+    {
+        Ok(thread) => thread,
+        Err(error) => {
+            stop.store(true, Ordering::SeqCst);
+            let _ = stream.shutdown(Shutdown::Both);
+            let _ = tap_wake_control.shutdown(Shutdown::Both);
+            let _ = stream_wake_control.shutdown(Shutdown::Both);
+            let _ = t_up.join();
+            return Err(error);
+        }
+    };
 
     Ok(NetnsTapBridge {
         stop,
+        stream,
+        wake_sockets: vec![tap_wake_control, stream_wake_control],
         threads: vec![t_up, t_down],
     })
 }
 
-fn pump_tap_to_stream(tap: OwnedFd, mut stream: UnixStream, stop: &AtomicBool) {
+fn pump_tap_to_stream(tap: OwnedFd, stream: Arc<UnixStream>, wake: UnixStream, stop: &AtomicBool) {
     let mut buf = vec![0u8; TAP_READ_BUF];
     let fd = tap.as_raw_fd();
     while !stop.load(Ordering::SeqCst) {
+        match wait_for_fd(fd, libc::POLLIN, wake.as_raw_fd(), stop) {
+            Ok(true) => {}
+            Ok(false) => break,
+            Err(e) => {
+                if !stop.load(Ordering::SeqCst) {
+                    tracing::debug!("netns-tap: tap poll ended: {e}");
+                }
+                break;
+            }
+        }
         match read_fd(fd, &mut buf) {
             Ok(0) => break, // tap closed
             Ok(n) => {
+                let mut stream = stream.as_ref();
                 if let Err(e) = write_frame(&mut stream, &buf[..n]) {
                     if !stop.load(Ordering::SeqCst) {
                         tracing::debug!("netns-tap: stream write ended: {e}");
@@ -107,6 +146,7 @@ fn pump_tap_to_stream(tap: OwnedFd, mut stream: UnixStream, stop: &AtomicBool) {
                     break;
                 }
             }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => {
                 if !stop.load(Ordering::SeqCst) {
@@ -118,20 +158,21 @@ fn pump_tap_to_stream(tap: OwnedFd, mut stream: UnixStream, stop: &AtomicBool) {
     }
 }
 
-fn pump_stream_to_tap(mut stream: UnixStream, tap: OwnedFd, stop: &AtomicBool) {
+fn pump_stream_to_tap(stream: Arc<UnixStream>, tap: OwnedFd, wake: UnixStream, stop: &AtomicBool) {
     let fd = tap.as_raw_fd();
     while !stop.load(Ordering::SeqCst) {
+        let mut stream = stream.as_ref();
         match read_frame(&mut stream) {
-            Ok(frame) => {
-                // A short write to a tap would corrupt the frame; tap writes are
-                // atomic per frame, so a partial write is a hard error.
-                if let Err(e) = write_fd_all(fd, &frame) {
+            Ok(frame) => match write_tap_frame(fd, &frame, wake.as_raw_fd(), stop) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(e) => {
                     if !stop.load(Ordering::SeqCst) {
                         tracing::debug!("netns-tap: tap write ended: {e}");
                     }
                     break;
                 }
-            }
+            },
             Err(e) => {
                 if !stop.load(Ordering::SeqCst) {
                     tracing::debug!("netns-tap: stream read ended: {e}");
@@ -140,6 +181,54 @@ fn pump_stream_to_tap(mut stream: UnixStream, tap: OwnedFd, stop: &AtomicBool) {
             }
         }
     }
+}
+
+fn set_nonblocking(fd: RawFd) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if flags & libc::O_NONBLOCK == 0
+        && unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Wait for TAP readiness or an explicit bridge shutdown wakeup.
+fn wait_for_fd(fd: RawFd, events: i16, wake_fd: RawFd, stop: &AtomicBool) -> io::Result<bool> {
+    while !stop.load(Ordering::SeqCst) {
+        let mut fds = [
+            libc::pollfd {
+                fd,
+                events,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: wake_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, -1) };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if stop.load(Ordering::SeqCst)
+            || fds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+        {
+            return Ok(false);
+        }
+        if fds[0].revents & (events | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 // Raw fd read/write: the tap fd is a character device, not a std type. Using
@@ -155,19 +244,30 @@ fn read_fd(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
     }
 }
 
-fn write_fd_all(fd: RawFd, buf: &[u8]) -> io::Result<()> {
-    // One write() call per Ethernet frame (tap semantics are datagram-like).
-    let n = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
-    if n < 0 {
-        return Err(io::Error::last_os_error());
+fn write_tap_frame(fd: RawFd, buf: &[u8], wake_fd: RawFd, stop: &AtomicBool) -> io::Result<bool> {
+    loop {
+        if !wait_for_fd(fd, libc::POLLOUT, wake_fd, stop)? {
+            return Ok(false);
+        }
+        // One write() call per Ethernet frame (tap semantics are datagram-like).
+        let n = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
+        if n < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::WouldBlock
+                || error.kind() == io::ErrorKind::Interrupted
+            {
+                continue;
+            }
+            return Err(error);
+        }
+        if (n as usize) != buf.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "short tap write truncated an ethernet frame",
+            ));
+        }
+        return Ok(true);
     }
-    if (n as usize) != buf.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::WriteZero,
-            "short tap write truncated an ethernet frame",
-        ));
-    }
-    Ok(())
 }
 
 /// Open a TAP device inside the network namespace at `netns_path` and return
@@ -382,7 +482,7 @@ mod tests {
         let stream_near = UnixStream::from(stream_near_raw);
         let mut stream_far = UnixStream::from(stream_far_raw);
 
-        let _bridge = start_netns_tap_bridge(stream_near, tap_near).unwrap();
+        let bridge = start_netns_tap_bridge(stream_near, tap_near).unwrap();
 
         // tap → stream: write a raw frame into the tap side; expect it framed on
         // the stream side.
@@ -399,5 +499,16 @@ mod tests {
         let mut buf = vec![0u8; frame2.len()];
         tap_far_w.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, frame2);
+
+        // Both peer sockets deliberately remain open. Shutdown must wake the
+        // idle TAP and stream reads instead of waiting for peer teardown.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(bridge);
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("netns TAP bridge shutdown blocked on idle I/O");
     }
 }
