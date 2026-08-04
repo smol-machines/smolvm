@@ -775,9 +775,14 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
 
     let snapshot_dir = prep.snapshot_dir.clone();
     let resume_golden = prep.resume_golden_on_rollback;
-    if let Err(error) =
-        boot_prepared_fork(&db, clone, prep, options.share_weights, options.fork_env)
-    {
+    if let Err(error) = boot_prepared_fork(
+        &db,
+        clone,
+        prep,
+        options.share_weights,
+        options.fork_env,
+        None,
+    ) {
         return rollback_failed_fork(golden, &snapshot_dir, resume_golden, error);
     }
     if options.wait_ready.is_some() && !options.hold {
@@ -848,12 +853,16 @@ pub fn fork_vm_batch(
     let mut first_error = None;
 
     let queue = std::sync::Mutex::new(std::collections::VecDeque::from(jobs));
+    // Initial boots retain the requested width. Only failed boots retry one at
+    // a time so a transient launch-pressure failure cannot amplify the burst.
+    let retry_gate = std::sync::Mutex::new(());
     let stop = std::sync::atomic::AtomicBool::new(false);
     let results = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..width)
             .map(|_| {
                 let db = db.clone();
                 let queue = &queue;
+                let retry_gate = &retry_gate;
                 let stop = &stop;
                 scope.spawn(move || {
                     let mut results = Vec::new();
@@ -866,7 +875,14 @@ pub fn fork_vm_batch(
                             break;
                         };
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            boot_prepared_fork(&db, &name, prep, share_weights, &env)
+                            boot_prepared_fork(
+                                &db,
+                                &name,
+                                prep,
+                                share_weights,
+                                &env,
+                                Some(retry_gate),
+                            )
                         }))
                         .unwrap_or_else(|_| {
                             Err(smolvm::Error::agent(
@@ -1008,20 +1024,37 @@ fn boot_prepared_fork(
     prep: smolvm::agent::fork::PreparedFork,
     share_weights: bool,
     fork_env: &[(String, String)],
+    retry_gate: Option<&std::sync::Mutex<()>>,
 ) -> smolvm::Result<()> {
     eprintln!("Booting clone '{clone}' from snapshot...");
-    if let Err(error) = start_vm_named_with_db(
-        db,
-        clone,
-        None,
-        None,
-        true,
-        ForkLaunch {
-            snapshot_dir: Some(prep.snapshot_dir.clone()),
-            share_weights,
-            ..Default::default()
-        },
-    ) {
+    let mut start = || {
+        start_vm_named_with_db(
+            db,
+            clone,
+            None,
+            None,
+            true,
+            ForkLaunch {
+                snapshot_dir: Some(prep.snapshot_dir.clone()),
+                share_weights,
+                ..Default::default()
+            },
+        )
+    };
+    let started = match retry_gate {
+        Some(gate) => retry_once_serialized(gate, &mut start, |error| {
+            eprintln!("Clone '{clone}' boot failed once; retrying serially: {error}");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        })
+        .map_err(|(first, retry)| {
+            smolvm::Error::agent(
+                "batch fork boot",
+                format!("clone '{clone}' first attempt failed: {first}; retry failed: {retry}"),
+            )
+        }),
+        None => start(),
+    };
+    if let Err(error) = started {
         teardown_fork_clone(db, clone);
         return Err(error);
     }
@@ -1034,6 +1067,22 @@ fn boot_prepared_fork(
         smolvm::agent::fork::write_fork_env(clone, &prep.clone_record, fork_env),
         || teardown_fork_clone(db, clone),
     )
+}
+
+fn retry_once_serialized<T, E>(
+    gate: &std::sync::Mutex<()>,
+    mut operation: impl FnMut() -> Result<T, E>,
+    before_retry: impl FnOnce(&E),
+) -> Result<T, (E, E)> {
+    let first = match operation() {
+        Ok(value) => return Ok(value),
+        Err(error) => error,
+    };
+    let _guard = gate
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    before_retry(&first);
+    operation().map_err(|retry| (first, retry))
 }
 
 fn teardown_fork_clone(db: &SmolvmDb, clone: &str) {
@@ -2572,6 +2621,62 @@ pub fn cleanup_orphaned_ephemeral_vms_bounded(limit: usize) {
 #[cfg(test)]
 mod init_runner_tests {
     use super::*;
+
+    #[test]
+    fn batch_boot_retry_is_skipped_after_success() {
+        let gate = std::sync::Mutex::new(());
+        let mut attempts = 0;
+        let result = retry_once_serialized(
+            &gate,
+            || {
+                attempts += 1;
+                Ok::<_, &'static str>("ready")
+            },
+            |_| panic!("successful boots must not enter the retry path"),
+        );
+        assert_eq!(result, Ok("ready"));
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn batch_boot_retry_recovers_after_one_failure() {
+        let gate = std::sync::Mutex::new(());
+        let mut attempts = 0;
+        let mut observed = None;
+        let result = retry_once_serialized(
+            &gate,
+            || {
+                attempts += 1;
+                if attempts == 1 {
+                    Err("launch pressure")
+                } else {
+                    Ok("ready")
+                }
+            },
+            |first| observed = Some(*first),
+        );
+        assert_eq!(result, Ok("ready"));
+        assert_eq!(observed, Some("launch pressure"));
+        assert_eq!(attempts, 2);
+    }
+
+    #[test]
+    fn batch_boot_retry_preserves_both_failures() {
+        let gate = std::sync::Mutex::new(());
+        let mut attempts = 0;
+        let mut observed = None;
+        let result = retry_once_serialized(
+            &gate,
+            || {
+                attempts += 1;
+                Err::<(), _>(attempts)
+            },
+            |first| observed = Some(*first),
+        );
+        assert_eq!(result, Err((1, 2)));
+        assert_eq!(observed, Some(1));
+        assert_eq!(attempts, 2);
+    }
 
     // The ephemeral-reap policy: only ephemeral + (dead or PID-less) records, in
     // list order, capped at `limit`. Persistent and still-alive VMs are never
