@@ -95,6 +95,31 @@ class CohortTests(unittest.TestCase):
             client.job(**common, cohort_id="training-step-1")
         with self.assertRaisesRegex(ValueError, "between 1 and 256"):
             client.job(**common, cohort_id="training-step-1", cohort_size=0)
+        with self.assertRaisesRegex(ValueError, "requires a cohort"):
+            client.job(**common, cohort_max_wait_ms=250)
+        with self.assertRaisesRegex(ValueError, "between 1 and 60000"):
+            client.job(
+                **common,
+                cohort_id="training-step-1",
+                cohort_size=2,
+                cohort_max_wait_ms=0,
+            )
+
+    def test_generate_encodes_bounded_distributed_cohort(self):
+        client = RecordingClient()
+        client.generate(
+            idempotency_key="request-1",
+            policy="policy-1",
+            prompts=["hello"],
+            max_tokens=8,
+            cohort_id="training-step-1",
+            cohort_size=4,
+            cohort_max_wait_ms=250,
+        )
+        self.assertEqual(
+            client.recorded[2]["cohort"],
+            {"id": "training-step-1", "size": 4, "maxWaitMs": 250},
+        )
 
     def test_explicit_cohort_overrides_fork_metadata(self):
         with patch.dict(
@@ -142,6 +167,7 @@ class CohortTests(unittest.TestCase):
             first_cohort = first.recorded[2]["cohort"]
             self.assertEqual(first_cohort, second.recorded[2]["cohort"])
             self.assertEqual(first_cohort["size"], 2)
+            self.assertEqual(first_cohort["maxWaitMs"], 250)
 
             first.generate(
                 idempotency_key="learner-0-step-1",
@@ -179,6 +205,10 @@ class CohortTests(unittest.TestCase):
             disabled = RecordingClient(auto_fork_cohort=False)
             disabled.generate(**request)
             self.assertNotIn("cohort", disabled.recorded[2])
+
+            exact = RecordingClient(auto_fork_cohort_max_wait_ms=None)
+            exact.generate(**request)
+            self.assertNotIn("maxWaitMs", exact.recorded[2]["cohort"])
 
     def test_automatic_fork_cohort_rejects_incomplete_metadata(self):
         with patch.dict(

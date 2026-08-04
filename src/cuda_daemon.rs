@@ -365,7 +365,8 @@ const TENSOR_RESPONSE_MAGIC: [u8; 4] = *b"TBR1";
 const MAX_TENSOR_BUNDLE_METADATA: usize = (2 << 20) + 64;
 const MAX_PENDING_TENSOR_BUNDLES: usize = 64;
 const MAX_PENDING_TENSOR_BYTES: u64 = 32 << 30;
-const TENSOR_BUNDLE_TTL: Duration = Duration::from_secs(60);
+const DEFAULT_TENSOR_BUNDLE_TTL: Duration = Duration::from_secs(5 * 60);
+const MAX_TENSOR_BUNDLE_TTL_SECS: u64 = 60 * 60;
 static TENSOR_BUNDLE_SERVICE_READY: AtomicBool = AtomicBool::new(false);
 #[cfg(unix)]
 const MAX_MODULE_HANDOFF_BLOB_BYTES: u64 = 32 << 30;
@@ -385,6 +386,26 @@ fn pending_tensor_bundles(
     static BUNDLES: OnceLock<Mutex<std::collections::HashMap<Vec<u8>, PendingTensorBundle>>> =
         OnceLock::new();
     BUNDLES.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn tensor_bundle_ttl_from(value: Option<&str>) -> Duration {
+    value
+        .map(str::trim)
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| (1..=MAX_TENSOR_BUNDLE_TTL_SECS).contains(seconds))
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_TENSOR_BUNDLE_TTL)
+}
+
+fn tensor_bundle_ttl() -> Duration {
+    static TTL: OnceLock<Duration> = OnceLock::new();
+    *TTL.get_or_init(|| {
+        tensor_bundle_ttl_from(
+            std::env::var("SMOLVM_CUDA_TENSOR_BUNDLE_TTL_SECS")
+                .ok()
+                .as_deref(),
+        )
+    })
 }
 
 fn tensor_bundle_socket_path(cuda_socket: &Path) -> PathBuf {
@@ -407,7 +428,7 @@ fn prune_tensor_bundles(
     bundles: &mut std::collections::HashMap<Vec<u8>, PendingTensorBundle>,
     now: Instant,
 ) {
-    bundles.retain(|_, bundle| now.duration_since(bundle.created) < TENSOR_BUNDLE_TTL);
+    bundles.retain(|_, bundle| now.duration_since(bundle.created) < tensor_bundle_ttl());
 }
 
 fn pending_tensor_bytes(bundles: &std::collections::HashMap<Vec<u8>, PendingTensorBundle>) -> u64 {
@@ -6031,8 +6052,9 @@ mod mps_tests {
         reconstruct_golden_modules, recv_fd, redeem_tensor_bundle_from_stream, seal_host_snapshot,
         select_golden_owner, send_fd, send_tensor_bundle_to_parent, serve_tensor_bundle_consumer,
         spawn_clone_attach_listener_with_timeout, spawn_tensor_bundle_receiver,
-        unique_live_clone_worker, validate_tensor_bundle_metadata, write_module_handoff,
-        CloneWorkerSpawnFds, CloneWorkerStatus, TENSOR_CONSUME_MAGIC,
+        tensor_bundle_ttl_from, unique_live_clone_worker, validate_tensor_bundle_metadata,
+        write_module_handoff, CloneWorkerSpawnFds, CloneWorkerStatus, DEFAULT_TENSOR_BUNDLE_TTL,
+        TENSOR_CONSUME_MAGIC,
     };
     use std::collections::HashMap;
     use std::io::{self, Write};
@@ -6448,6 +6470,24 @@ mod mps_tests {
         assert_eq!(
             clone_worker_idle_timeout_from(Some("invalid")).as_secs(),
             300
+        );
+    }
+
+    #[test]
+    fn tensor_bundle_lifetime_covers_delayed_cohort_consumers() {
+        assert_eq!(tensor_bundle_ttl_from(None), Duration::from_secs(300));
+        assert_eq!(
+            tensor_bundle_ttl_from(Some(" 600 ")),
+            Duration::from_secs(600)
+        );
+        assert_eq!(tensor_bundle_ttl_from(Some("0")), DEFAULT_TENSOR_BUNDLE_TTL);
+        assert_eq!(
+            tensor_bundle_ttl_from(Some("3601")),
+            DEFAULT_TENSOR_BUNDLE_TTL
+        );
+        assert_eq!(
+            tensor_bundle_ttl_from(Some("invalid")),
+            DEFAULT_TENSOR_BUNDLE_TTL
         );
     }
 
