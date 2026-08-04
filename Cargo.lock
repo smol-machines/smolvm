@@ -3020,6 +3020,7 @@ dependencies = [
  "clap",
  "dirs",
  "futures-util",
+ "getrandom 0.3.4",
  "hex",
  "humantime",
  "ipnet",

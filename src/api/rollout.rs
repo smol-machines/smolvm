@@ -1461,7 +1461,7 @@ struct BackendCompletionResponse {
     usage: RolloutUsage,
 }
 
-fn validate_name(kind: &str, value: &str) -> Result<(), RolloutError> {
+pub(crate) fn validate_name(kind: &str, value: &str) -> Result<(), RolloutError> {
     let valid = !value.is_empty()
         && value.len() <= MAX_NAME_BYTES
         && value

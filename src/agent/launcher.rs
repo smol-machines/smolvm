@@ -892,6 +892,8 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 }
 
                 let mut guest_network = GuestNetworkConfig::default();
+                guest_network.host_service = crate::network::launch::guest_host_service()
+                    .map_err(|reason| Error::config("configure guest rollout ingress", reason))?;
                 // A custom resolver (--dns) becomes the gateway's upstream: the
                 // guest still points at the gateway (100.96.0.1), which forwards
                 // queries to this address instead of the default.

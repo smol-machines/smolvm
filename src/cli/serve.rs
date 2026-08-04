@@ -195,6 +195,37 @@ impl ServeStartCmd {
             tracing::info!("egress floor set to strict (multi-tenant serve default)");
         }
 
+        // VMM subprocesses may route exactly one gateway port to the
+        // lease-authenticated rollout listener started below. This is internal
+        // node configuration, never a guest-supplied egress exception.
+        let guest_rollout_host_port =
+            std::env::var(smolvm::api::guest_rollout::GUEST_ROLLOUT_HOST_PORT_ENV)
+                .ok()
+                .map(|value| {
+                    value
+                        .parse::<u16>()
+                        .ok()
+                        .filter(|port| *port != 0)
+                        .ok_or_else(|| {
+                            smolvm::error::Error::config(
+                                "configure guest rollout ingress",
+                                format!(
+                                    "{} must be an integer between 1 and 65535",
+                                    smolvm::api::guest_rollout::GUEST_ROLLOUT_HOST_PORT_ENV
+                                ),
+                            )
+                        })
+                })
+                .transpose()?
+                .unwrap_or(smolvm::api::guest_rollout::GUEST_ROLLOUT_PORT);
+        smolvm::network::launch::configure_guest_host_service(
+            smolvm::api::guest_rollout::GUEST_ROLLOUT_PORT,
+            guest_rollout_host_port,
+        )
+        .map_err(|reason| {
+            smolvm::error::Error::config("configure guest rollout ingress", reason)
+        })?;
+
         // Per-VM uid isolation preflight. When serve is privileged each VMM drops
         // to its own unprivileged uid (process::vm_drop_ids), containing a
         // guest→VMM escape to one VM. That only works if the data root is
@@ -278,6 +309,41 @@ impl ServeStartCmd {
         // Create shutdown channel for supervisor
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
+        // A dedicated loopback listener carries only lease-authenticated rollout
+        // operations. The virtio gateway maps its internal host-service port to
+        // this socket while the normal strict egress floor remains unchanged.
+        let guest_rollout_host_port = smolvm::network::launch::guest_host_service()
+            .map_err(|reason| smolvm::error::Error::config("read guest rollout ingress", reason))?
+            .ok_or_else(|| {
+                smolvm::error::Error::config(
+                    "read guest rollout ingress",
+                    "guest host service is not configured",
+                )
+            })?
+            .host_port;
+        let guest_rollout_addr = SocketAddr::from(([127, 0, 0, 1], guest_rollout_host_port));
+        let guest_rollout_listener = tokio::net::TcpListener::bind(guest_rollout_addr)
+            .await
+            .map_err(|error| {
+                smolvm::error::Error::config(
+                    "bind guest rollout ingress",
+                    format!("{guest_rollout_addr}: {error}"),
+                )
+            })?;
+        let guest_rollout_app = smolvm::api::guest_rollout::create_router(state.clone());
+        let guest_rollout_shutdown = shutdown_rx.clone();
+        let guest_rollout_failure = shutdown_tx.clone();
+        let guest_rollout_handle = tokio::spawn(async move {
+            tracing::info!(address = %guest_rollout_addr, "starting lease-authenticated guest rollout ingress");
+            let result = axum::serve(guest_rollout_listener, guest_rollout_app)
+                .with_graceful_shutdown(wait_for_shutdown(guest_rollout_shutdown))
+                .await;
+            if result.is_err() {
+                let _ = guest_rollout_failure.send(true);
+            }
+            result
+        });
+
         // Spawn supervisor task
         let supervisor_state = state.clone();
         let supervisor_shutdown = shutdown_rx.clone();
@@ -315,17 +381,30 @@ impl ServeStartCmd {
         })?;
 
         // Listen server on TCP or Unix socket
-        match listen_target {
-            ListenTarget::Tcp(addr) => self.serve_tcp(addr, app, local_app, tls).await?,
+        let server_result = match listen_target {
+            ListenTarget::Tcp(addr) => {
+                self.serve_tcp(addr, app, local_app, tls, shutdown_rx.clone())
+                    .await
+            }
             #[cfg(unix)]
-            ListenTarget::Unix(path) => self.serve_unix(path, app).await?,
-        }
+            ListenTarget::Unix(path) => self.serve_unix(path, app, shutdown_rx.clone()).await,
+        };
 
         // The HTTP server has stopped accepting (graceful shutdown on SIGTERM).
         // Stop reconcilers before detaching or draining machine managers. In
         // particular, a pool fill must not register a newly booted worker after
         // `detach_all` has already walked the registry.
         let _ = shutdown_tx.send(true);
+        let guest_rollout_result = guest_rollout_handle.await.map_err(|error| {
+            smolvm::error::Error::config("guest rollout ingress task", error.to_string())
+        })?;
+        if let Err(error) = guest_rollout_result {
+            tracing::error!(%error, "guest rollout ingress stopped unexpectedly");
+            if server_result.is_ok() {
+                return Err(smolvm::error::Error::Io(error));
+            }
+        }
+        server_result?;
         let mut pool_controller_handle = pool_controller_handle;
         match tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -376,9 +455,10 @@ impl ServeStartCmd {
         app: Router,
         local_app: Router,
         tls: Option<std::sync::Arc<rustls::ServerConfig>>,
+        internal_shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<()> {
         if let Some(tls_config) = tls {
-            return Self::serve_tcp_tls(addr, app, local_app, tls_config).await;
+            return Self::serve_tcp_tls(addr, app, local_app, tls_config, internal_shutdown).await;
         }
 
         let listener = tokio::net::TcpListener::bind(addr)
@@ -389,7 +469,7 @@ impl ServeStartCmd {
         println!("smolvm API server listening on http://{}", addr);
 
         axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal())
+            .with_graceful_shutdown(shutdown_signal_or_internal(internal_shutdown))
             .await
             .map_err(smolvm::error::Error::Io)
     }
@@ -408,6 +488,7 @@ impl ServeStartCmd {
         app: Router,
         local_app: Router,
         tls_config: std::sync::Arc<rustls::ServerConfig>,
+        internal_shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Result<()> {
         // Loopback plain-HTTP door for the local node-agent.
         if let Some(local_addr) = super::serve_tls::local_plain_addr(addr) {
@@ -438,6 +519,7 @@ impl ServeStartCmd {
                 "smolvm local API (loopback, plain) on http://{}",
                 local_addr
             );
+            let local_shutdown = internal_shutdown.clone();
             std::thread::Builder::new()
                 .name("smolvm-loopback-api".to_string())
                 .spawn(move || {
@@ -461,7 +543,7 @@ impl ServeStartCmd {
                             }
                         };
                         let _ = axum::serve(listener, local_app)
-                            .with_graceful_shutdown(shutdown_signal())
+                            .with_graceful_shutdown(shutdown_signal_or_internal(local_shutdown))
                             .await;
                     });
                 })
@@ -474,7 +556,7 @@ impl ServeStartCmd {
         // Trip graceful shutdown on the same signal the plain path observes.
         let shutdown_handle = handle.clone();
         tokio::spawn(async move {
-            shutdown_signal().await;
+            shutdown_signal_or_internal(internal_shutdown).await;
             shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
         });
 
@@ -489,7 +571,12 @@ impl ServeStartCmd {
     }
 
     #[cfg(unix)]
-    async fn serve_unix(&self, path: PathBuf, app: Router) -> Result<()> {
+    async fn serve_unix(
+        &self,
+        path: PathBuf,
+        app: Router,
+        internal_shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<()> {
         let socket_guard = UnixSocketGuard::bind(&path)?;
         let listener =
             tokio::net::UnixListener::bind(&socket_guard.path).map_err(smolvm::error::Error::Io)?;
@@ -501,7 +588,7 @@ impl ServeStartCmd {
         );
 
         axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal())
+            .with_graceful_shutdown(shutdown_signal_or_internal(internal_shutdown))
             .await
             .map_err(smolvm::error::Error::Io)
     }
@@ -636,6 +723,21 @@ async fn shutdown_signal() {
 
     tracing::info!("shutdown signal received");
     eprintln!("\nShutting down server (VMs continue running)...");
+}
+
+async fn wait_for_shutdown(mut shutdown: tokio::sync::watch::Receiver<bool>) {
+    while !*shutdown.borrow() {
+        if shutdown.changed().await.is_err() {
+            break;
+        }
+    }
+}
+
+async fn shutdown_signal_or_internal(shutdown: tokio::sync::watch::Receiver<bool>) {
+    tokio::select! {
+        () = shutdown_signal() => {},
+        () = wait_for_shutdown(shutdown) => {},
+    }
 }
 
 #[cfg(test)]

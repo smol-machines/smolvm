@@ -152,6 +152,17 @@ pub struct GuestNetworkConfig {
     /// caller passes `--dns <ip>` so a VM on a network that blocks the default
     /// resolver can still resolve names.
     pub upstream_dns: Ipv4Addr,
+    /// Optional dedicated host service reachable only through the gateway IP.
+    pub host_service: Option<GatewayHostService>,
+}
+
+/// Exact guest gateway port mapped to one smolvm-owned host loopback port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GatewayHostService {
+    /// Port the guest addresses on its gateway IP.
+    pub guest_port: u16,
+    /// Loopback port the host listener actually owns.
+    pub host_port: u16,
 }
 
 impl GuestNetworkConfig {
@@ -171,6 +182,7 @@ impl GuestNetworkConfig {
                 IpAddr::V4(ip) => ip,
                 IpAddr::V6(_) => Ipv4Addr::new(1, 1, 1, 1),
             },
+            host_service: None,
         }
     }
 }
@@ -301,6 +313,7 @@ pub fn start_virtio_network(
             guest_ipv6: guest_network.guest_ip6,
             prefix_len6: guest_network.prefix_len6,
             upstream_dns: guest_network.upstream_dns,
+            host_service: guest_network.host_service,
             mtu: 1500,
         },
         tcp_listeners.as_ref().map(|_| tcp_receiver),
