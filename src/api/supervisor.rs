@@ -301,6 +301,9 @@ impl Supervisor {
                 Some(&name_for_features),
                 source_smolmachine.as_deref(),
                 dns_filter_hosts,
+                // A supervisor restart re-presents an already-filled entry; it
+                // holds no credential to gate a fresh fill with.
+                None,
             )?;
             features.cuda_fork_pool_size = cuda_fork_pool_size;
             features.cuda_vram_limit_mib = cuda_vram_limit_mib;

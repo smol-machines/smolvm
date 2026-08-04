@@ -15,7 +15,7 @@ smolvm-protocol = { path = "../smolvm-protocol", version = "1.6.1" }
 # Shared, pure-Rust OCI layer extraction (decompress + untar + whiteout→overlay
 # translation). The single implementation this guest and the host image cache
 # both call. Dependency-light + no C-linked crate so it links under musl.
-smolvm-oci-layer = { path = "../smolvm-oci-layer", version = "1.7.2" }
+smolvm-oci-layer = { path = "../smolvm-oci-layer", version = "1.7.4" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }

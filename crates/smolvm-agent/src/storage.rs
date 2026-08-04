@@ -12,7 +12,7 @@ use crate::crun::CrunCommand;
 use crate::oci::{generate_container_id, OciSpec};
 use crate::paths::{self, STORAGE_ROOT};
 use crate::process::{WaitResult, TIMEOUT_EXIT_CODE};
-use smolvm_oci_layer::{decompress_layer_reader, extract_oci_layer};
+use smolvm_oci_layer::{decompress_layer_reader, extract_oci_layer, ExtractOptions};
 use smolvm_protocol::guest_env;
 use smolvm_protocol::{
     image_repo, normalize_image_ref, ImageInfo, OverlayInfo, RegistryAuth, StorageStatus,
@@ -333,6 +333,35 @@ pub fn init_packed_layers() -> Option<PathBuf> {
         warn!("packed layers mount not supported on non-Linux");
         None
     }
+}
+
+/// Filename a layer producer drops beside `layer-order` to declare which xattr
+/// namespace its opaque-directory markers use.
+///
+/// Absent means `trusted.overlay.*` — the long-standing representation every
+/// existing `.smolmachine` uses — so older artifacts keep working untouched.
+const OPAQUE_XATTR_MARKER: &str = "opaque-xattr";
+
+/// Whether the mounted packed layers use `user.overlay.*` opaque markers, which
+/// the overlay must then be mounted with `userxattr` to honor.
+///
+/// Layers extracted on the HOST are served to us over virtiofs by a VMM that has
+/// dropped privileges, and an unprivileged reader cannot see a `trusted.*` xattr
+/// at all — so those layers use `user.*`. Getting this pairing wrong fails
+/// SILENTLY: the kernel ignores markers from the other namespace and stale lower
+/// content shows through with no error, which is why the producer declares it
+/// rather than the consumer guessing.
+pub fn packed_layers_use_userxattr() -> bool {
+    static USERXATTR: OnceLock<bool> = OnceLock::new();
+    *USERXATTR.get_or_init(|| {
+        get_packed_layers_dir()
+            .map(|d| {
+                std::fs::read_to_string(d.join(OPAQUE_XATTR_MARKER))
+                    .map(|v| v.trim() == "user")
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    })
 }
 
 /// Get the packed layers directory if available.
@@ -1785,7 +1814,7 @@ where
             .take()
             .ok_or_else(|| StorageError::new("failed to capture crane stdout".to_string()))?;
 
-        let extract_result = extract_oci_layer(crane_stdout, &layer_dir);
+        let extract_result = extract_oci_layer(crane_stdout, &layer_dir, ExtractOptions::GUEST);
 
         let crane_status = crane
             .wait()
@@ -3393,6 +3422,13 @@ fn mount_overlay_fsconfig(
     // Preserve prior semantics: index=off disables the inode-index feature.
     fsconfig_set_string(fs.as_fd(), "index", "off")
         .map_err(|e| StorageError::new(format!("fsconfig index=off failed: {e}")))?;
+    // Host-extracted layers mark opaque dirs in the `user.*` namespace, because
+    // the unprivileged virtiofs server that serves them cannot see `trusted.*`.
+    // The kernel only consults that namespace when mounted with `userxattr`.
+    if packed_layers_use_userxattr() {
+        rustix::mount::fsconfig_set_flag(fs.as_fd(), "userxattr")
+            .map_err(|e| StorageError::new(format!("fsconfig userxattr failed: {e}")))?;
+    }
 
     fsconfig_create(fs.as_fd())
         .map_err(|e| StorageError::new(format!("fsconfig create (overlay) failed: {e}")))?;
@@ -4036,7 +4072,8 @@ mod tests {
 
         let extract = |bytes: &[u8]| -> Vec<u8> {
             let dir = tempfile::tempdir().unwrap();
-            extract_oci_layer(bytes, dir.path()).expect("extraction should succeed");
+            extract_oci_layer(bytes, dir.path(), ExtractOptions::GUEST)
+                .expect("extraction should succeed");
             std::fs::read(dir.path().join("greeting.txt")).unwrap()
         };
 
@@ -4087,8 +4124,9 @@ mod tests {
 
         for sentinel in ["storage.ext4", "agent-rootfs.tar", "./storage.ext4"] {
             let dir = tempfile::tempdir().unwrap();
-            let err = extract_oci_layer(&build_tar(sentinel)[..], dir.path())
-                .expect_err("pack sentinel must abort extraction");
+            let err =
+                extract_oci_layer(&build_tar(sentinel)[..], dir.path(), ExtractOptions::GUEST)
+                    .expect_err("pack sentinel must abort extraction");
             assert!(
                 err.to_string().contains("smolmachine pack"),
                 "clear error for {sentinel}, got: {err}"
@@ -4101,8 +4139,12 @@ mod tests {
 
         // A NESTED file of the same name is legitimate image content.
         let dir = tempfile::tempdir().unwrap();
-        extract_oci_layer(&build_tar("var/lib/foo/storage.ext4")[..], dir.path())
-            .expect("nested same-named file extracts normally");
+        extract_oci_layer(
+            &build_tar("var/lib/foo/storage.ext4")[..],
+            dir.path(),
+            ExtractOptions::GUEST,
+        )
+        .expect("nested same-named file extracts normally");
         assert!(dir.path().join("var/lib/foo/storage.ext4").exists());
     }
 
@@ -4155,7 +4197,8 @@ mod tests {
             builder.finish().unwrap();
         }
 
-        extract_oci_layer(&buf[..], dest).expect("extraction should succeed");
+        extract_oci_layer(&buf[..], dest, ExtractOptions::GUEST)
+            .expect("extraction should succeed");
 
         // The real file extracted.
         assert_eq!(

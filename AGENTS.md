@@ -87,6 +87,17 @@ smolvm machine create --name myvm --image ./myapp.tar     # persistent, from a l
 - **`pack start` + `exec`** — daemon mode. `/workspace` persists across exec sessions and stop/start. Container overlay resets per exec (package installs don't persist — use `/workspace` for durable data).
 - **`machine create --from .smolmachine`** — creates a persistent named machine from a packed artifact. Boots from pre-extracted layers (~250ms, no image pull). Full `machine exec` persistence — package installs, file writes all survive across exec and stop/start.
 
+### Image Layer Cache
+
+A machine created from a registry image (`--image alpine`) takes its root filesystem from a host-side cache of extracted layers, so the image is pulled and unpacked once instead of inside every VM. The second machine on the same image starts without contacting the registry at all, and so does every restart of a machine already using it.
+
+The cache is transparent — there is nothing to enable and no flag to pass. Creating the device nodes overlay whiteouts require needs privileges, so it applies when smolvm runs as root on a Unix host (validated on Linux) and never on Windows; anywhere else machines pull in-guest exactly as before. It is only ever a cache: if it cannot serve a machine for any reason, that machine falls back to the in-guest pull rather than failing.
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `SMOLVM_IMAGE_CACHE_MAX_BYTES` | 20 GiB | Size ceiling for the cache. Least-recently-used images are evicted; images a machine still boots from are never evicted. |
+| `SMOLVM_MAX_LAYER_BYTES` | 8 GiB | Rejects any single layer larger than this. |
+
 ## CLI Structure
 
 All commands use named flags (no positional args except `machine create --name NAME` and `machine delete --name NAME`).

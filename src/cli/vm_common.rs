@@ -1351,6 +1351,33 @@ fn start_vm_named_with_db(
             features.packed_layers_dir = Some(dir);
         }
     }
+    // Host-side image store: pull + extract a registry image ONCE into shared
+    // overlay lowerdirs, so this and every other machine on that image skips both
+    // the in-guest pull and the per-VM flatten. `prepare_layers` is the same
+    // implementation the API start path uses; a local caller gates with the
+    // host's own configured credentials.
+    if features.packed_layers_dir.is_none() {
+        if let Some(image) = record.image.as_deref() {
+            // Reconcile claims against the machines that actually exist, so a
+            // discarded database cannot pin entries against the LRU forever.
+            if let Ok(vms) = db.list_vms() {
+                smolvm::image_store::sweep_refs(vms.iter().map(|(n, _)| n.as_str()));
+            }
+            if let Some(layers) = smolvm::image_store::prepare_layers(
+                name,
+                Some(image),
+                Some(&smolvm::registry::PullAuth::FromConfig),
+            ) {
+                features.pack_idmap_source = Some(layers.idmap_source);
+                features.packed_layers_dir = Some(layers.mountpoint);
+            }
+        }
+    }
+
+    // Whether the guest's layers are already mounted via virtiofs. Captured here
+    // because `features` is moved into the launch below, and the in-guest pull
+    // further down must be skipped exactly when this is true.
+    let uses_packed_layers = features.packed_layers_dir.is_some();
 
     // First boot pulls the base image in-guest, subject to the egress filter —
     // fold the image's registry into the enforced policy so a hostname scope
@@ -1392,11 +1419,12 @@ fn start_vm_named_with_db(
     // starts, skip both — image manifests/layers persist on the storage disk
     // and the container overlay is remounted (not recreated).
     if !record.init_completed {
-        let uses_packed_layers = record.source_smolmachine.is_some()
-            || record
-                .image
-                .as_deref()
-                .is_some_and(smolvm::data::image_source::is_local_ref);
+        // `uses_packed_layers` comes from the launch features (captured above), not
+        // re-derived from the record: `packed_layers_dir` is the one place that
+        // knows whether layers are already mounted, and it is set from three
+        // sources (a `.smolmachine`, a local image archive, and the image store).
+        // Re-deriving here would miss any source it does not enumerate, and the
+        // machine would pull in-guest even though the layers are already there.
         let image_info = if uses_packed_layers {
             // Layers already mounted via virtiofs — no pull needed.
             None
@@ -2105,6 +2133,10 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
             name,
         ));
     }
+
+    // Release this machine's claim on its shared store entry, so the LRU may
+    // reclaim it once nothing boots from it. The entry itself is shared and stays.
+    smolvm::image_store::forget_entry(name);
 
     let data_dir = vm_data_dir(name);
     if data_dir.exists() {

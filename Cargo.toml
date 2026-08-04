@@ -42,6 +42,10 @@ smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.7.4" }
 smolvm-cuda = { path = "crates/smolvm-cuda", version = "1.7.4" }
 smolvm-pack = { path = "crates/smolvm-pack", version = "1.7.4" }
 smolvm-registry = { path = "crates/smolvm-registry", version = "1.7.4" }
+# Shared OCI layer extraction. The host image store fills content-addressed
+# overlay lowerdirs through the SAME code the guest agent uses, with the
+# host-shared options (see `ExtractOptions::HOST_SHARED`).
+smolvm-oci-layer = { path = "crates/smolvm-oci-layer", version = "1.7.4" }
 smolfile = { path = "crates/smolvm-smolfile", version = "1.7.4" }
 thiserror = "1"
 clap = { version = "4", features = ["derive"] }

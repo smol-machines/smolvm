@@ -439,6 +439,24 @@ fn flatten_and_export(
     // overlayfs wants topmost-first in `lowerdir=`.
     let base_chain: Vec<&str> = lowers.iter().rev().map(String::as_str).collect();
     let base_chain = base_chain.join(":");
+    // NOTE on the bind-mounts in the script below: `mount(8)` caps its option
+    // string near 255 bytes, and a lowerdir chain of real layer paths blows past
+    // that — `/storage/layers/<64-hex>` alone is 80 bytes, so three layers plus
+    // the container overlay reach ~290 and the mount fails with the famously
+    // unhelpful "wrong fs type, bad option". Binding each lower to a short
+    // `/tmp/lN` first keeps the option string tiny no matter how many layers an
+    // image has. (The guest's own overlay mount sidesteps this differently, via
+    // `fsconfig` + repeated `lowerdir+`, which the shell has no access to.)
+    //
+    // The producer of these layers declares its opaque-marker namespace in a file
+    // beside them; the layer dirs are siblings under one parent, so derive it from
+    // the first lower. Absent → `trusted.*`, i.e. every pre-existing pack.
+    let marker_path = std::path::Path::new(&lowers[0])
+        .parent()
+        .map(|d| d.join("opaque-xattr"))
+        .unwrap_or_else(|| std::path::PathBuf::from("/nonexistent"))
+        .display()
+        .to_string();
 
     println!(
         "Flattening {} layer(s) + container overlay...",
@@ -455,12 +473,28 @@ fn flatten_and_export(
            tar cf /storage/flat-export.tar -C \"${{low%%:*}}\" .\n\
          else\n\
            mkdir -p /tmp/flatview\n\
-           mount -t overlay overlay -o lowerdir=\"$low\" /tmp/flatview\n\
+           xopt=\"\"\n\
+           if [ \"$(cat {marker} 2>/dev/null)\" = user ]; then xopt=\",userxattr\"; fi\n\
+           i=0; short=\"\"\n\
+           for l in $(echo \"$low\" | tr : \" \"); do\n\
+             mkdir -p /tmp/l$i && mount --bind \"$l\" /tmp/l$i || exit 33\n\
+             short=\"${{short:+$short:}}/tmp/l$i\"; i=$((i+1))\n\
+           done\n\
+           mount -t overlay overlay -o lowerdir=\"$short\"\"$xopt\" /tmp/flatview\n\
            tar cf /storage/flat-export.tar -C /tmp/flatview .\n\
            umount /tmp/flatview\n\
+           j=0; while [ $j -lt $i ]; do umount /tmp/l$j 2>/dev/null; j=$((j+1)); done\n\
          fi\n\
          echo FLAT_OK\n",
         n = lowers.len(),
+        // Layers extracted on the HOST mark opaque directories in the `user.*`
+        // namespace (the unprivileged virtiofs server that serves them cannot see
+        // `trusted.*`), and the kernel only consults that namespace under
+        // `userxattr`. Without matching here the merged view would silently show
+        // content a replaced directory had removed — and this tar becomes an
+        // exported artifact, so those files would travel to a registry.
+        // No marker means `trusted.*`, which is every pre-existing pack.
+        marker = marker_path,
     );
     let (exit_code, stdout, stderr) = client.vm_exec(
         vec!["sh".to_string(), "-c".to_string(), script],
