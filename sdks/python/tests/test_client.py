@@ -140,5 +140,35 @@ class DevicePublicationTests(unittest.TestCase):
         self.assertEqual(client.attempts[0], client.attempts[1])
 
 
+class CohortTests(unittest.TestCase):
+    def test_generate_encodes_distributed_cohort(self):
+        client = RecordingClient()
+        client.generate(
+            idempotency_key="request-1",
+            policy="policy-1",
+            prompts=["hello"],
+            max_tokens=8,
+            cohort_id="training-step-1",
+            cohort_size=4,
+        )
+        method, path, body = client.recorded
+        self.assertEqual(method, "POST")
+        self.assertEqual(path, "/rollout-executors/fused/generate")
+        self.assertEqual(body["cohort"], {"id": "training-step-1", "size": 4})
+
+    def test_generate_requires_complete_valid_cohort(self):
+        client = RecordingClient()
+        common = {
+            "idempotency_key": "request-1",
+            "policy": "policy-1",
+            "prompts": ["hello"],
+            "max_tokens": 8,
+        }
+        with self.assertRaisesRegex(ValueError, "must be set together"):
+            client.job(**common, cohort_id="training-step-1")
+        with self.assertRaisesRegex(ValueError, "between 1 and 256"):
+            client.job(**common, cohort_id="training-step-1", cohort_size=0)
+
+
 if __name__ == "__main__":
     unittest.main()

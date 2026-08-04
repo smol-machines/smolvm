@@ -346,6 +346,8 @@ class RolloutClient:
         version: str | None = None,
         n: int = 1,
         deadline_ms: int | None = None,
+        cohort_id: str | None = None,
+        cohort_size: int | None = None,
         **sampling: Any,
     ) -> dict[str, Any]:
         """Build a generation job for `generate` or a cross-policy cohort."""
@@ -377,6 +379,16 @@ class RolloutClient:
             job["version"] = version
         if deadline_ms is not None:
             job["deadlineMs"] = deadline_ms
+        if (cohort_id is None) != (cohort_size is None):
+            raise ValueError("cohort_id and cohort_size must be set together")
+        if cohort_id is not None:
+            if not cohort_id:
+                raise ValueError("cohort_id cannot be empty")
+            if not isinstance(cohort_size, int) or isinstance(cohort_size, bool):
+                raise ValueError("cohort_size must be an integer")
+            if not 1 <= cohort_size <= 256:
+                raise ValueError("cohort_size must be between 1 and 256")
+            job["cohort"] = {"id": cohort_id, "size": cohort_size}
         return job
 
     def generate(self, **job: Any) -> dict[str, Any]:
