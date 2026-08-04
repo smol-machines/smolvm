@@ -25,7 +25,7 @@ use smolvm::network::{validate_requested_network_backend, NetworkBackend};
 use smolvm::{DEFAULT_IDLE_CMD, DEFAULT_SHELL_CMD};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// How many orphaned ephemeral VMs `machine run` reaps per boot. Small so the
 /// hot path never stalls on a large backlog; a heavier backlog drains over
@@ -2130,9 +2130,31 @@ mod tests {
             "TRIAL={index}".to_string(),
             "OUTPUT=/runs/{name}".to_string(),
             "SMOLVM_FORK_INDEX=wrong".to_string(),
+            "SMOLVM_FORK_BATCH_ID=wrong".to_string(),
+            "SMOLVM_FORK_BATCH_SIZE=999".to_string(),
         ];
         assert_eq!(
-            render_indexed_fork_env(&specs, 3, "worker-3", true),
+            render_indexed_fork_env(
+                &specs,
+                3,
+                "worker-3",
+                true,
+                Some(&ForkBatchIdentity {
+                    id: "batch-1".to_string(),
+                    size: 8,
+                }),
+            ),
+            vec![
+                ("TRIAL".to_string(), "3".to_string()),
+                ("OUTPUT".to_string(), "/runs/worker-3".to_string()),
+                ("SMOLVM_FORK_INDEX".to_string(), "3".to_string()),
+                ("SMOLVM_FORK_NAME".to_string(), "worker-3".to_string()),
+                ("SMOLVM_FORK_BATCH_ID".to_string(), "batch-1".to_string()),
+                ("SMOLVM_FORK_BATCH_SIZE".to_string(), "8".to_string()),
+            ]
+        );
+        assert_eq!(
+            render_indexed_fork_env(&specs, 3, "worker-3", true, None),
             vec![
                 ("TRIAL".to_string(), "3".to_string()),
                 ("OUTPUT".to_string(), "/runs/worker-3".to_string()),
@@ -3223,7 +3245,9 @@ pub struct ForkCmd {
     pub clone: Option<String>,
 
     /// Number of clones to create from one snapshot. Batch forks wait for the
-    /// standard `smolvm-fork-ready` boundary automatically.
+    /// standard `smolvm-fork-ready` boundary automatically. Direct batches
+    /// receive one shared `SMOLVM_FORK_BATCH_ID` and `SMOLVM_FORK_BATCH_SIZE`;
+    /// held slots remain independent until assigned by their controller.
     #[arg(long, default_value = "1", value_name = "COUNT")]
     pub count: std::num::NonZeroU32,
 
@@ -3343,7 +3367,7 @@ impl ForkCmd {
                     ));
                 }
             };
-            let fork_env = render_indexed_fork_env(&self.env, 0, &clone, false);
+            let fork_env = render_indexed_fork_env(&self.env, 0, &clone, false, None);
             return vm_common::fork_vm(
                 &self.golden,
                 &clone,
@@ -3384,10 +3408,14 @@ impl ForkCmd {
             ));
         }
 
+        let batch = (!self.hold).then(|| ForkBatchIdentity {
+            id: fork_batch_id(&self.golden, &prefix),
+            size: count,
+        });
         let clones: Vec<_> = (0..count)
             .map(|index| {
                 let name = format!("{prefix}-{index}");
-                let env = render_indexed_fork_env(&self.env, index, &name, true);
+                let env = render_indexed_fork_env(&self.env, index, &name, true, batch.as_ref());
                 (name, env)
             })
             .collect();
@@ -3428,6 +3456,7 @@ fn render_indexed_fork_env(
     index: u32,
     name: &str,
     include_identity: bool,
+    batch: Option<&ForkBatchIdentity>,
 ) -> Vec<(String, String)> {
     let mut env = smolvm::util::parse_env_list(specs);
     for (_, value) in &mut env {
@@ -3436,11 +3465,44 @@ fn render_indexed_fork_env(
             .replace("{name}", name);
     }
     if include_identity {
-        env.retain(|(key, _)| key != "SMOLVM_FORK_INDEX" && key != "SMOLVM_FORK_NAME");
+        env.retain(|(key, _)| {
+            !matches!(
+                key.as_str(),
+                "SMOLVM_FORK_INDEX"
+                    | "SMOLVM_FORK_NAME"
+                    | "SMOLVM_FORK_BATCH_ID"
+                    | "SMOLVM_FORK_BATCH_SIZE"
+            )
+        });
         env.push(("SMOLVM_FORK_INDEX".to_string(), index.to_string()));
         env.push(("SMOLVM_FORK_NAME".to_string(), name.to_string()));
+        if let Some(batch) = batch {
+            env.push(("SMOLVM_FORK_BATCH_ID".to_string(), batch.id.clone()));
+            env.push(("SMOLVM_FORK_BATCH_SIZE".to_string(), batch.size.to_string()));
+        }
     }
     env
+}
+
+#[derive(Debug)]
+struct ForkBatchIdentity {
+    id: String,
+    size: u32,
+}
+
+fn fork_batch_id(golden: &str, prefix: &str) -> String {
+    let created = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mut digest = Sha256::new();
+    digest.update(golden.as_bytes());
+    digest.update([0]);
+    digest.update(prefix.as_bytes());
+    digest.update([0]);
+    digest.update(std::process::id().to_le_bytes());
+    digest.update(created.to_le_bytes());
+    hex::encode(digest.finalize())[..32].to_string()
 }
 
 fn forkpoint_timeout(
