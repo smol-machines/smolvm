@@ -8,6 +8,7 @@ from .device_handoff import (
     publish_device_adapter,
 )
 from .torch_handoff import TorchDeviceAdapter, import_torch_device_adapter
+from .transformers import add_transformers_forkpoint, transformers_forkpoint_callback
 from .unsloth_vllm import UnslothVllmExecutor
 
 __all__ = [
@@ -19,6 +20,8 @@ __all__ = [
     "TorchDeviceAdapter",
     "UnslothVllmExecutor",
     "adapter_sha256",
+    "add_transformers_forkpoint",
     "publish_device_adapter",
     "import_torch_device_adapter",
+    "transformers_forkpoint_callback",
 ]
