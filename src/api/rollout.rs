@@ -42,6 +42,8 @@ const MAX_ADAPTER_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 const IDEMPOTENCY_TTL: Duration = Duration::from_secs(10 * 60);
 const MAX_IDEMPOTENCY_ENTRIES: usize = 8192;
 const MAX_COHORT_SIZE: u32 = 256;
+const MAX_COHORT_WAIT_MS: u64 = 60_000;
+const PARTIAL_COHORT_RETENTION: Duration = Duration::from_secs(10 * 60);
 
 /// Request to register one local fused rollout engine.
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
@@ -242,8 +244,11 @@ pub struct RolloutGenerateRequest {
 pub struct RolloutCohort {
     /// Unique identifier for one logical rollout round.
     pub id: String,
-    /// Exact number of independent jobs required before any member executes.
+    /// Target number of independent jobs in this rollout round.
     pub size: u32,
+    /// Optional bounded wait before the members already present are admitted.
+    #[serde(default)]
+    pub max_wait_ms: Option<u64>,
 }
 
 /// A cohort of independent policy requests submitted together for backend fusion.
@@ -453,6 +458,7 @@ const COHORT_FAILED: usize = 2;
 struct CohortEntry {
     id: String,
     expected: u32,
+    max_wait_ms: Option<u64>,
     members: SyncMutex<HashSet<String>>,
     state: AtomicUsize,
     changed: Notify,
@@ -476,6 +482,7 @@ impl CohortAdmission {
                 Arc::new(CohortEntry {
                     id: cohort.id.clone(),
                     expected: cohort.size,
+                    max_wait_ms: cohort.max_wait_ms,
                     members: SyncMutex::new(HashSet::new()),
                     state: AtomicUsize::new(COHORT_WAITING),
                     changed: Notify::new(),
@@ -488,6 +495,12 @@ impl CohortAdmission {
                 cohort.id, entry.expected, cohort.size
             )));
         }
+        if entry.max_wait_ms != cohort.max_wait_ms {
+            return Err(RolloutError::Conflict(format!(
+                "rollout cohort '{}' has a different maxWaitMs",
+                cohort.id
+            )));
+        }
         let ready = {
             let mut members = entry.members.lock();
             if !members.insert(member.to_string()) {
@@ -498,7 +511,7 @@ impl CohortAdmission {
             }
             members.len() == entry.expected as usize
         };
-        if ready
+        let released_exactly = ready
             && entry
                 .state
                 .compare_exchange(
@@ -507,9 +520,11 @@ impl CohortAdmission {
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 )
-                .is_ok()
-        {
+                .is_ok();
+        if ready {
             entries.remove(&cohort.id);
+        }
+        if released_exactly {
             entry.changed.notify_waiters();
             metrics::counter!("smolvm_rollout_cohorts_total", "status" => "ready").increment(1);
             metrics::histogram!("smolvm_rollout_cohort_size").record(cohort.size as f64);
@@ -553,6 +568,10 @@ struct CohortTicket {
 
 impl CohortTicket {
     async fn wait(mut self) -> Result<(), RolloutError> {
+        let deadline = self
+            .entry
+            .max_wait_ms
+            .map(|wait_ms| tokio::time::Instant::now() + Duration::from_millis(wait_ms));
         loop {
             let changed = self.entry.changed.notified();
             match self.entry.state.load(Ordering::Acquire) {
@@ -567,9 +586,52 @@ impl CohortTicket {
                         self.entry.id
                     )));
                 }
-                _ => changed.await,
+                _ => {
+                    if let Some(deadline) = deadline {
+                        if tokio::time::timeout_at(deadline, changed).await.is_err() {
+                            self.release_partial();
+                        }
+                    } else {
+                        changed.await;
+                    }
+                }
             }
         }
+    }
+
+    fn release_partial(&self) {
+        if self
+            .entry
+            .state
+            .compare_exchange(
+                COHORT_WAITING,
+                COHORT_READY,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return;
+        }
+
+        let admitted = self.entry.members.lock().len();
+        self.entry.changed.notify_waiters();
+        metrics::counter!("smolvm_rollout_cohorts_total", "status" => "partial").increment(1);
+        metrics::histogram!("smolvm_rollout_cohort_size").record(self.entry.expected as f64);
+        metrics::histogram!("smolvm_rollout_cohort_admitted_size").record(admitted as f64);
+
+        let admission = self.admission.clone();
+        let entry = self.entry.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(PARTIAL_COHORT_RETENTION).await;
+            let mut entries = admission.entries.lock();
+            if entries
+                .get(&entry.id)
+                .is_some_and(|current| Arc::ptr_eq(current, &entry))
+            {
+                entries.remove(&entry.id);
+            }
+        });
     }
 }
 
@@ -1899,6 +1961,14 @@ fn validate_generate_request(request: &RolloutGenerateRequest) -> Result<(), Rol
                 "cohort.size must be between 1 and {MAX_COHORT_SIZE}"
             )));
         }
+        if cohort
+            .max_wait_ms
+            .is_some_and(|wait_ms| !(1..=MAX_COHORT_WAIT_MS).contains(&wait_ms))
+        {
+            return Err(RolloutError::BadRequest(format!(
+                "cohort.maxWaitMs must be between 1 and {MAX_COHORT_WAIT_MS}"
+            )));
+        }
     }
     Ok(())
 }
@@ -2133,6 +2203,7 @@ mod tests {
         let cohort = RolloutCohort {
             id: "round-1".into(),
             size: 2,
+            max_wait_ms: None,
         };
         let first = admission.join(&cohort, "request-1").unwrap();
         let first = tokio::spawn(first.wait());
@@ -2154,11 +2225,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn distributed_cohort_releases_arrived_members_after_bounded_wait() {
+        let admission = Arc::new(CohortAdmission::default());
+        let cohort = RolloutCohort {
+            id: "round-partial".into(),
+            size: 2,
+            max_wait_ms: Some(10),
+        };
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            admission.join(&cohort, "request-1").unwrap().wait(),
+        )
+        .await
+        .expect("the bounded cohort must release its arrived member")
+        .unwrap();
+        assert_eq!(admission.entries.lock().len(), 1);
+
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            admission.join(&cohort, "request-2").unwrap().wait(),
+        )
+        .await
+        .expect("a late cohort member must be admitted immediately")
+        .unwrap();
+        assert!(admission.entries.lock().is_empty());
+    }
+
+    #[tokio::test]
     async fn distributed_cohort_fails_all_members_when_one_leaves() {
         let admission = Arc::new(CohortAdmission::default());
         let cohort = RolloutCohort {
             id: "round-2".into(),
             size: 3,
+            max_wait_ms: None,
         };
         let first = admission.join(&cohort, "request-1").unwrap();
         let first = tokio::spawn(first.wait());
@@ -2181,6 +2281,7 @@ mod tests {
         let cohort = RolloutCohort {
             id: "round-shutdown".into(),
             size: 2,
+            max_wait_ms: None,
         };
         let waiting = admission.join(&cohort, "request-1").unwrap();
         let waiting = tokio::spawn(waiting.wait());
@@ -2203,14 +2304,25 @@ mod tests {
         let first = RolloutCohort {
             id: "round-3".into(),
             size: 2,
+            max_wait_ms: None,
         };
         let inconsistent = RolloutCohort {
             id: first.id.clone(),
             size: 3,
+            max_wait_ms: None,
+        };
+        let inconsistent_wait = RolloutCohort {
+            id: first.id.clone(),
+            size: first.size,
+            max_wait_ms: Some(10),
         };
         let _ticket = admission.join(&first, "request-1").unwrap();
         assert!(matches!(
             admission.join(&inconsistent, "request-2"),
+            Err(RolloutError::Conflict(_))
+        ));
+        assert!(matches!(
+            admission.join(&inconsistent_wait, "request-2"),
             Err(RolloutError::Conflict(_))
         ));
     }
@@ -2261,6 +2373,7 @@ mod tests {
         first.cohort = Some(RolloutCohort {
             id: "training-step-1".into(),
             size: 2,
+            max_wait_ms: None,
         });
         let first_executor = executor.clone();
         let first = tokio::spawn(async move { first_executor.generate(first).await });
@@ -2271,6 +2384,7 @@ mod tests {
         second.cohort = Some(RolloutCohort {
             id: "training-step-1".into(),
             size: 2,
+            max_wait_ms: None,
         });
         let (first, second) = tokio::join!(first, executor.generate(second));
         first.unwrap().unwrap();
@@ -2288,6 +2402,7 @@ mod tests {
         abandoned.cohort = Some(RolloutCohort {
             id: "retry-round".into(),
             size: 2,
+            max_wait_ms: None,
         });
         assert!(matches!(
             executor.generate(abandoned.clone()).await,
@@ -2597,6 +2712,20 @@ mod tests {
             deadline_ms: None,
             cohort: None,
         };
+        assert!(validate_generate_request(&request).is_err());
+    }
+
+    #[test]
+    fn cohort_validation_rejects_invalid_bounded_wait() {
+        let mut request = sample_generate("invalid-cohort-wait");
+        request.cohort = Some(RolloutCohort {
+            id: "round-invalid".into(),
+            size: 2,
+            max_wait_ms: Some(0),
+        });
+        assert!(validate_generate_request(&request).is_err());
+
+        request.cohort.as_mut().unwrap().max_wait_ms = Some(MAX_COHORT_WAIT_MS + 1);
         assert!(validate_generate_request(&request).is_err());
     }
 
