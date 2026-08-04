@@ -993,6 +993,12 @@ pub struct AcquireForkLeaseRequest {
     /// Optional lease duration override for this worker.
     #[serde(default)]
     pub ttl_secs: Option<u64>,
+    /// Keep the lease activating until the workload calls `smolvm-worker-ready`.
+    #[serde(default)]
+    pub await_worker_ready: bool,
+    /// Optional readiness timeout in seconds; defaults to 240 when enabled.
+    #[serde(default)]
+    pub worker_ready_timeout_secs: Option<u64>,
 }
 
 /// One file staged into a held worker before lease activation.

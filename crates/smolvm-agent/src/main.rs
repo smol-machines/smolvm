@@ -200,6 +200,9 @@ fn maybe_set_clock_from_host() {
 }
 
 fn main() {
+    if forkpoint::worker_ready_helper_requested() {
+        std::process::exit(forkpoint::run_worker_ready_helper());
+    }
     if forkpoint::helper_requested() {
         std::process::exit(forkpoint::run_helper());
     }
