@@ -176,9 +176,26 @@ impl EmbeddedRuntime {
         workdir: Option<String>,
         timeout: Option<Duration>,
     ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
+        let image = self.image_of(name);
         let handle = self.started_handle(name)?;
         let mut handle = lock_handle(&handle)?;
-        handle.exec(command, env, workdir, timeout)
+        match image {
+            // Image machine: run inside the machine's persistent container overlay,
+            // exactly as the streaming counterpart does — and as the CLI and the
+            // cloud transport already do. Without this an exec lands in the bare
+            // VM's own rootfs, so the caller silently gets a different filesystem
+            // than the image they asked for.
+            Some(image) => {
+                let config = RunConfig::new(image, command)
+                    .with_env(env)
+                    .with_workdir(workdir)
+                    .with_timeout(timeout)
+                    .with_persistent_overlay(Some(name.to_string()));
+                handle.run_config(config)
+            }
+            // Bare VM: exec directly against the guest.
+            None => handle.exec(command, env, workdir, timeout),
+        }
     }
 
     /// Pull an OCI image and run a command inside it.
@@ -455,6 +472,7 @@ mod tests {
             mounts: Vec::new(),
             ports: Vec::new(),
             resources: crate::agent::VmResources::default(),
+            image: None,
             persistent,
             runtime_managed: false,
         }

@@ -18,6 +18,7 @@ fn main() {
             network: false,
             ..Default::default()
         },
+        image: None,
         persistent: false,
         runtime_managed: false,
     });

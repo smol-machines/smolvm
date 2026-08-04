@@ -19,6 +19,10 @@ pub struct MachineSpec {
     pub ports: Vec<PortMapping>,
     /// VM resources for this machine.
     pub resources: VmResources,
+    /// OCI image the machine boots from, when it is an image machine rather than
+    /// a bare VM. Mirrors the CLI's `--image`: without it the guest comes up as a
+    /// bare VM and any image the caller asked for is silently not applied.
+    pub image: Option<String>,
     /// Whether the machine should persist across stop/start.
     pub persistent: bool,
     /// Set by the Kubernetes containerd shim for pod-sandbox VMs. Marks the
@@ -47,6 +51,7 @@ impl MachineSpec {
         record.network_backend = self.resources.network_backend;
         record.gpu = Some(self.resources.gpu);
         record.gpu_vram_mib = self.resources.gpu_vram_mib;
+        record.image = self.image.clone();
         record.ephemeral = !self.persistent;
         record.runtime_managed = self.runtime_managed;
         record
@@ -346,6 +351,7 @@ mod tests {
             mounts: Vec::new(),
             ports: Vec::new(),
             resources: VmResources::default(),
+            image: None,
             persistent,
             runtime_managed: false,
         }

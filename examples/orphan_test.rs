@@ -21,6 +21,7 @@ fn main() {
             network: true,
             ..Default::default()
         },
+        image: None,
         persistent: false,
         runtime_managed: false,
     };
