@@ -7,6 +7,7 @@ from .device_handoff import (
     DeviceTensor,
     publish_device_adapter,
 )
+from .peft import peft_lora_tensors, publish_peft_adapter
 from .torch_handoff import TorchDeviceAdapter, import_torch_device_adapter
 from .transformers import add_transformers_forkpoint, transformers_forkpoint_callback
 from .unsloth_vllm import UnslothVllmExecutor
@@ -21,7 +22,9 @@ __all__ = [
     "UnslothVllmExecutor",
     "adapter_sha256",
     "add_transformers_forkpoint",
+    "peft_lora_tensors",
     "publish_device_adapter",
+    "publish_peft_adapter",
     "import_torch_device_adapter",
     "transformers_forkpoint_callback",
 ]
