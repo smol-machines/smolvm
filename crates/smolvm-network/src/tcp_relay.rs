@@ -265,13 +265,27 @@ impl TcpRelayTable {
         // Egress policy: drop the guest SYN before any socket is created when the
         // destination isn't allowed, so the guest just sees the connection fail.
         // Inbound published-port flows take a separate path and are unaffected.
-        if !self.egress.allows(destination.ip()) {
+        if !self
+            .egress
+            .allows(destination.ip(), Some(destination.port()))
+        {
             tracing::debug!(
                 %destination,
                 "virtio-net: blocking outbound connection by egress policy"
             );
             return false;
         }
+
+        // Sentinel → host loopback; guest-facing smoltcp socket keeps the sentinel.
+        // Two disjoint host remaps compose here: the opt-in egress host sentinel
+        // (192.0.2.1 → 127.0.0.1), and the gateway-IP → loopback mapping for the
+        // gateway's own services. host_forward handles the former; anything it
+        // leaves alone falls through to host_connect_addr for the latter.
+        let connect_to = self
+            .egress
+            .host_forward(destination.ip())
+            .map(|ip| SocketAddr::new(ip, destination.port()))
+            .unwrap_or_else(|| self.host_connect_addr(destination));
 
         let rx_buffer = tcp::SocketBuffer::new(vec![0u8; TCP_RX_BUFFER_BYTES]);
         let tx_buffer = tcp::SocketBuffer::new(vec![0u8; TCP_TX_BUFFER_BYTES]);
@@ -302,7 +316,7 @@ impl TcpRelayTable {
                 pending_proxy_endpoints: Some(PendingProxyEndpoints {
                     from_smoltcp: to_proxy_rx,
                     to_smoltcp: from_proxy_tx,
-                    relay_target: RelayTarget::Connect(self.host_connect_addr(destination)),
+                    relay_target: RelayTarget::Connect(connect_to),
                 }),
                 relay_spawned: false,
                 buffered_guest_data: None,

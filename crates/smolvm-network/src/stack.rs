@@ -210,6 +210,8 @@ fn run_network_stack(
         IpAddr::V6(config.gateway_ipv6),
         IpAddr::V6(link_local_from_mac(config.gateway_mac)),
     ];
+    // Static remaps need every TCP/53 SYN intercepted so the guest's own resolver doesn't win.
+    let intercept_dns_tcp = egress.has_static_dns();
     let relay_wake = Arc::new(queues.relay_wake.clone());
     let mut relays = TcpRelayTable::new(None, egress.clone(), gateway_addrs.to_vec());
     let mut udp_sockets = udp_relay::UdpSocketTable::new();
@@ -218,6 +220,7 @@ fn run_network_stack(
         udp_relay::start_udp_relay(
             relay_wake.clone(),
             Arc::new(move || shutdown_queues.is_shutting_down()),
+            egress.clone(),
         )
     };
     let icmp_channels = {
@@ -262,7 +265,7 @@ fn run_network_stack(
             // - TCP SYN: pre-create a matching smoltcp socket + relay entry
             // - DNS UDP: allow through for gateway-side forwarding
             // - other UDP: pre-create the destination-keyed relay socket
-            match classify_guest_frame(frame, &gateway_addrs) {
+            match classify_guest_frame(frame, &gateway_addrs, intercept_dns_tcp) {
                 FrameAction::TcpSyn {
                     source,
                     destination,
@@ -756,11 +759,22 @@ enum DnsDecision {
     Forward { learn: bool },
 }
 
-/// Classify a query under the allow-host policy. When the DNS filter is
-/// inactive everything is forwarded (no learning); otherwise only allow-listed
-/// names are forwarded and learned, others get NXDOMAIN and unparseable ones
-/// SERVFAIL. Identical policy to the old `filtered_dns_response`.
+/// TTL on synthesized static answers (60s).
+const STATIC_DNS_TTL: u32 = 60;
+
+/// Returns a synthesized answer for a name the policy maps itself, or `None` to
+/// fall through to the normal allow-host path.
+fn static_dns_response(query: &[u8], egress: &EgressPolicy) -> Option<Vec<u8>> {
+    let ips = egress.static_answer(&dns::question_name(query)?)?;
+    Some(dns::build_ip_response(query, &ips, STATIC_DNS_TTL))
+}
+
+/// Classify a query: static names answered from the policy; otherwise standard
+/// allow-host filtering (forward if allowed, NXDOMAIN/SERVFAIL if not).
 fn classify_dns_query(query: &[u8], egress: &EgressPolicy) -> DnsDecision {
+    if let Some(response) = static_dns_response(query, egress) {
+        return DnsDecision::Immediate(response);
+    }
     if !egress.dns_filter_active() {
         return DnsDecision::Forward { learn: false };
     }
@@ -861,7 +875,7 @@ fn deliver_dns_responses(
         if let Some(pending) = gateway.pending_udp.remove(&response.id) {
             if let Some(answer) = response.answer {
                 if pending.learn {
-                    egress.learn_ip_records(&dns::answer_ip_records(&answer));
+                    egress.learn_ip_records(&answer);
                 }
                 let socket = sockets.get_mut::<UdpSocket>(dns_socket_handle);
                 let response_meta = UdpMetadata {
@@ -881,7 +895,7 @@ fn deliver_dns_responses(
                     conn.awaiting = None;
                     if let Some(answer) = response.answer {
                         if pending.learn {
-                            egress.learn_ip_records(&dns::answer_ip_records(&answer));
+                            egress.learn_ip_records(&answer);
                         }
                         frame_dns_tcp_response(conn, &answer);
                     }
@@ -1105,7 +1119,11 @@ fn smoltcp_now(clock: StdInstant) -> Instant {
     Instant::from_millis(elapsed.as_millis() as i64)
 }
 
-fn classify_guest_frame(frame: &[u8], gateway_addrs: &[IpAddr]) -> FrameAction {
+fn classify_guest_frame(
+    frame: &[u8],
+    gateway_addrs: &[IpAddr],
+    intercept_dns_tcp: bool,
+) -> FrameAction {
     let ethernet = match EthernetFrame::new_checked(frame) {
         Ok(frame) => frame,
         Err(_) => return FrameAction::Passthrough,
@@ -1151,11 +1169,11 @@ fn classify_guest_frame(frame: &[u8], gateway_addrs: &[IpAddr]) -> FrameAction {
             };
 
             if tcp.syn() && !tcp.ack() {
-                // DNS-over-TCP to the gateway itself is intercepted by the local
-                // listening sockets (process_dns_tcp), not relayed. TCP/53 to an
-                // external resolver (an allow-listed IP) is left to the egress
-                // relay so the policy still applies.
-                if tcp.dst_port() == DNS_SOCKET_PORT && gateway_addrs.contains(&dst_ip) {
+                // Intercept DNS/TCP to gateway (always) or to external resolvers
+                // when static remaps are configured.
+                if tcp.dst_port() == DNS_SOCKET_PORT
+                    && (intercept_dns_tcp || gateway_addrs.contains(&dst_ip))
+                {
                     FrameAction::Passthrough
                 } else {
                     FrameAction::TcpSyn {
@@ -1192,7 +1210,7 @@ fn classify_guest_frame(frame: &[u8], gateway_addrs: &[IpAddr]) -> FrameAction {
 /// behind the `fuzzing` feature so it never ships in a normal build.
 #[cfg(feature = "fuzzing")]
 pub fn fuzz_classify_guest_frame(frame: &[u8]) {
-    let _ = classify_guest_frame(frame, &[]);
+    let _ = classify_guest_frame(frame, &[], false);
 }
 
 #[cfg(test)]
@@ -1225,7 +1243,7 @@ mod tests {
         let gw = IpAddr::V4(Ipv4Addr::new(100, 96, 0, 1));
         // TCP/53 to the gateway -> handled by the local DNS listeners (Passthrough).
         assert_eq!(
-            classify_guest_frame(&tcp_syn_frame([100, 96, 0, 1], 53), &[gw]),
+            classify_guest_frame(&tcp_syn_frame([100, 96, 0, 1], 53), &[gw], false),
             FrameAction::Passthrough
         );
     }
@@ -1236,9 +1254,20 @@ mod tests {
         // TCP/53 to an external (allow-listed) resolver must go through the egress
         // relay, NOT be swallowed by the gateway DNS listeners.
         assert!(matches!(
-            classify_guest_frame(&tcp_syn_frame([1, 1, 1, 1], 53), &[gw]),
+            classify_guest_frame(&tcp_syn_frame([1, 1, 1, 1], 53), &[gw], false),
             FrameAction::TcpSyn { .. }
         ));
+    }
+
+    #[test]
+    fn dns_tcp_to_external_resolver_intercepted_when_remaps_exist() {
+        let gw = IpAddr::V4(Ipv4Addr::new(100, 96, 0, 1));
+        // With static remaps configured the guest's own resolver must not win, so
+        // every TCP/53 SYN lands on the gateway DNS listeners instead.
+        assert_eq!(
+            classify_guest_frame(&tcp_syn_frame([1, 1, 1, 1], 53), &[gw], true),
+            FrameAction::Passthrough
+        );
     }
 
     #[test]
@@ -1246,7 +1275,12 @@ mod tests {
         let gw = IpAddr::V4(Ipv4Addr::new(100, 96, 0, 1));
         // Only port 53 is intercepted; other gateway ports relay as usual.
         assert!(matches!(
-            classify_guest_frame(&tcp_syn_frame([100, 96, 0, 1], 443), &[gw]),
+            classify_guest_frame(&tcp_syn_frame([100, 96, 0, 1], 443), &[gw], false),
+            FrameAction::TcpSyn { .. }
+        ));
+        // ...even with the DNS/TCP intercept armed.
+        assert!(matches!(
+            classify_guest_frame(&tcp_syn_frame([1, 1, 1, 1], 443), &[gw], true),
             FrameAction::TcpSyn { .. }
         ));
     }

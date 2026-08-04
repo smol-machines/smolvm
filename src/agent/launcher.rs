@@ -923,8 +923,10 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     .map(|mapping| VirtioPortMapping::new(mapping.host, mapping.guest))
                     .collect();
                 let egress = smolvm_network::EgressPolicy::new(
-                    resources.allowed_cidrs.as_deref(),
-                    egress_refresh_hosts.as_deref(),
+                    smolvm_network::EgressConfig::from_allow_lists(
+                        resources.allowed_cidrs.clone(),
+                        egress_refresh_hosts.clone(),
+                    ),
                 );
                 let egress_path = egress_telemetry.map(|p| p.to_path_buf());
 

@@ -326,9 +326,11 @@ pub fn launch_agent_vm_dynamic(
                 .iter()
                 .map(|(host, guest)| VirtioPortMapping::new(*host, *guest))
                 .collect();
-            let egress = smolvm_network::EgressPolicy::from_allowed_cidrs(
-                config.resources.allowed_cidrs.as_deref(),
-            );
+            let egress =
+                smolvm_network::EgressPolicy::new(smolvm_network::EgressConfig::from_allow_lists(
+                    config.resources.allowed_cidrs.clone(),
+                    None,
+                ));
 
             // The host/guest ends of the virtio-net channel are an AF_UNIX
             // stream: a socketpair fd on Unix, a per-VM path listener libkrun

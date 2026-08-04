@@ -348,10 +348,10 @@ fn parse_echo_reply(destination: IpAddr, bytes: &[u8]) -> Option<(u16, Vec<u8>)>
     Some((seq, bytes[8..].to_vec()))
 }
 
-/// Whether the gateway should relay a guest echo to this destination. Echo
-/// obeys the same egress policy as TCP/UDP (static CIDRs + DNS-learned IPs).
+/// Whether the gateway should relay a guest echo (portless, so any-port policy).
 pub fn should_relay_icmp(destination: IpAddr, egress: &EgressPolicy) -> bool {
-    egress.allows(destination)
+    // ICMP echo carries no port, so only any-port allow rules cover it.
+    egress.allows(destination, None)
 }
 
 /// Decode a guest IPv4 ICMP echo *request* captured off the raw socket (a full

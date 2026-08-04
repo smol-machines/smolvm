@@ -75,7 +75,7 @@ pub mod tcp_listeners;
 pub mod tcp_relay;
 pub mod udp_relay;
 
-pub use egress::EgressPolicy;
+pub use egress::{EgressConfig, EgressPolicy, FloorMode, StaticTarget};
 
 use socket2::Socket;
 use std::fmt;
