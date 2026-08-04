@@ -871,7 +871,7 @@ fn rejuvenate_once(sock: &Path, script: &str) -> std::result::Result<(), String>
 /// `/run`: `/run` is a per-container-instance tmpfs, so a file there vanishes
 /// if the restored container is recycled — the overlay is the only surface
 /// shared by every instance and the running workload alike.
-pub const FORK_ENV_GUEST_PATH: &str = "/etc/smolvm/fork-env";
+pub const FORK_ENV_GUEST_PATH: &str = smolvm_protocol::forkpoint::FORK_ENV_PATH;
 
 /// Validate per-fork parameters: keys must be non-empty `[A-Za-z_][A-Za-z0-9_]*`
 /// (they double as env var names for exec sessions) and values must be free of
@@ -1046,6 +1046,7 @@ pub fn activate_held_fork(
     let script = build_activation_script(
         smolvm_protocol::forkpoint::READY_PATH,
         smolvm_protocol::forkpoint::RELEASE_PATH,
+        smolvm_protocol::forkpoint::WORKER_READY_PATH,
         &receipt,
         &ensure_env_parent,
         &env_path,
@@ -1128,9 +1129,81 @@ pub fn activate_held_fork(
     unreachable!("held-fork activation loop always returns")
 }
 
+/// Wait until a released workload proves that clone-local preparation finished.
+pub fn wait_for_worker_ready(clone: &str, token: &str, timeout: Duration) -> Result<()> {
+    if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(Error::config(
+            "worker readiness",
+            "token must contain exactly 64 hexadecimal characters",
+        ));
+    }
+    if timeout.is_zero() {
+        return Err(Error::config(
+            "worker readiness",
+            "timeout must be positive",
+        ));
+    }
+    let polls = timeout
+        .as_secs()
+        .checked_mul(10)
+        .ok_or_else(|| Error::config("worker readiness", "timeout is too large"))?;
+    let script = build_worker_ready_wait_script(smolvm_protocol::forkpoint::WORKER_READY_PATH);
+    let socket = vm_data_dir(clone).join("agent.sock");
+    let mut client = AgentClient::connect_with_retry(&socket)
+        .map_err(|error| Error::agent("wait for worker readiness", error.to_string()))?;
+    let command = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        script,
+        "smolvm-worker-ready-wait".into(),
+        token.to_ascii_lowercase(),
+        polls.to_string(),
+    ];
+    let command_timeout = timeout
+        .checked_add(Duration::from_secs(5))
+        .ok_or_else(|| Error::config("worker readiness", "timeout is too large"))?;
+    match client.vm_exec(command, vec![], None, Some(command_timeout), None) {
+        Ok((0, _, _)) => Ok(()),
+        Ok((44, _, _)) => Err(Error::agent(
+            "wait for worker readiness",
+            format!(
+                "clone '{clone}' did not signal readiness within {} seconds",
+                timeout.as_secs()
+            ),
+        )),
+        Ok((45, _, _)) => Err(Error::agent(
+            "wait for worker readiness",
+            format!("clone '{clone}' published a stale or invalid readiness token"),
+        )),
+        Ok((code, _, stderr)) => Err(Error::agent(
+            "wait for worker readiness",
+            format!(
+                "clone '{clone}' readiness wait exited {code}: {}",
+                String::from_utf8_lossy(&stderr).trim()
+            ),
+        )),
+        Err(error) => Err(Error::agent(
+            "wait for worker readiness",
+            format!("clone '{clone}': {error}"),
+        )),
+    }
+}
+
+fn build_worker_ready_wait_script(worker_ready: &str) -> String {
+    format!(
+        "set -e; i=0; while [ \"$i\" -lt \"$2\" ]; do \
+         if [ -f '{worker_ready}' ]; then \
+           [ \"$(cat '{worker_ready}')\" = \"$1\" ] && exit 0; exit 45; \
+         fi; \
+         i=$((i + 1)); sleep 0.1; \
+         done; exit 44"
+    )
+}
+
 fn build_activation_script(
     ready: &str,
     release: &str,
+    worker_ready: &str,
     receipt: &str,
     ensure_env_parent: &str,
     env_path: &str,
@@ -1143,6 +1216,7 @@ fn build_activation_script(
            exit 42; \
          fi; \
          if [ ! -f '{ready}' ]; then exit 43; fi; \
+         rm -f '{worker_ready}'; \
          receipt_tmp='{receipt}.{activation_token}.'$$; \
          printf '%s\\n' '{activation_token}' > \"$receipt_tmp\"; \
          if ! ln \"$receipt_tmp\" '{receipt}' 2>/dev/null; then \
@@ -1368,13 +1442,16 @@ mod tests {
         std::fs::write(state.join("ready"), b"ready\n").unwrap();
         let ready = state.join("ready");
         let release = state.join("release");
+        let worker_ready = state.join("worker-ready");
         let receipt = state.join("activation");
         let env_path = workspace.join("fork-env");
         let ensure_parent = format!("mkdir -p '{}'", workspace.display());
         let token = "0123456789abcdef";
+        std::fs::write(&worker_ready, b"stale\n").unwrap();
         let script = build_activation_script(
             ready.to_str().unwrap(),
             release.to_str().unwrap(),
+            worker_ready.to_str().unwrap(),
             receipt.to_str().unwrap(),
             &ensure_parent,
             env_path.to_str().unwrap(),
@@ -1393,6 +1470,7 @@ mod tests {
             format!("{token}\n")
         );
         assert!(release.is_file());
+        assert!(!worker_ready.exists());
 
         // A lost reply may cause the host to send the same activation again.
         // The receipt proves ownership and makes that retry a successful no-op.
@@ -1403,6 +1481,7 @@ mod tests {
         let other = build_activation_script(
             ready.to_str().unwrap(),
             release.to_str().unwrap(),
+            worker_ready.to_str().unwrap(),
             receipt.to_str().unwrap(),
             &ensure_parent,
             env_path.to_str().unwrap(),
@@ -1424,6 +1503,7 @@ mod tests {
         std::fs::write(state.join("ready"), b"ready\n").unwrap();
         let ready = state.join("ready");
         let release = state.join("release");
+        let worker_ready = state.join("worker-ready");
         let receipt = state.join("activation");
         let env_path = workspace.join("fork-env");
         let ensure_parent = format!("mkdir -p '{}'", workspace.display());
@@ -1432,6 +1512,7 @@ mod tests {
         let script = build_activation_script(
             ready.to_str().unwrap(),
             release.to_str().unwrap(),
+            worker_ready.to_str().unwrap(),
             receipt.to_str().unwrap(),
             &ensure_parent,
             env_path.to_str().unwrap(),
@@ -1446,6 +1527,37 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&env_path).unwrap(), "LR=3e-4\n");
         assert!(release.is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_ready_wait_requires_the_exact_token_and_has_a_bounded_timeout() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("worker-ready");
+        let script = build_worker_ready_wait_script(marker.to_str().unwrap());
+        let expected = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        std::fs::write(&marker, format!("{expected}\n")).unwrap();
+        let success = std::process::Command::new("/bin/sh")
+            .args(["-c", &script, "wait", expected, "1"])
+            .output()
+            .unwrap();
+        assert!(success.status.success());
+
+        std::fs::write(&marker, format!("{}\n", "f".repeat(64))).unwrap();
+        let stale = std::process::Command::new("/bin/sh")
+            .args(["-c", &script, "wait", expected, "1"])
+            .output()
+            .unwrap();
+        assert_eq!(stale.status.code(), Some(45));
+
+        std::fs::remove_file(marker).unwrap();
+        let timeout = std::process::Command::new("/bin/sh")
+            .args(["-c", &script, "wait", expected, "1"])
+            .output()
+            .unwrap();
+        assert_eq!(timeout.status.code(), Some(44));
+        assert!(!script.contains(expected));
     }
 
     #[test]

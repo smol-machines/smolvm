@@ -11,7 +11,10 @@ use std::path::Path;
 use std::time::Duration;
 
 const AGENT_BINARY: &str = "/usr/local/bin/smolvm-agent";
-use smolvm_protocol::forkpoint::{HELPER_PATH, READY_PATH, RELEASE_PATH, RESTORED_PATH, STATE_DIR};
+use smolvm_protocol::forkpoint::{
+    FORK_ENV_PATH, HELPER_PATH, READY_PATH, RELEASE_PATH, RESTORED_PATH, STATE_DIR,
+    WORKER_READY_HELPER_PATH, WORKER_READY_PATH, WORKER_READY_TOKEN_ENV,
+};
 const READY_CONTENT: &[u8] = b"smolvm-forkpoint-v1\n";
 
 fn enabled() -> bool {
@@ -28,6 +31,16 @@ pub fn helper_requested() -> bool {
         .file_name()
         .is_some_and(|name| name == "smolvm-fork-ready");
     helper_argv0 || args.next().is_some_and(|arg| arg == "fork-ready")
+}
+
+/// Whether this invocation is the post-restore worker-readiness helper.
+pub fn worker_ready_helper_requested() -> bool {
+    let mut args = std::env::args_os();
+    let argv0 = args.next().unwrap_or_default();
+    let helper_argv0 = Path::new(&argv0)
+        .file_name()
+        .is_some_and(|name| name == "smolvm-worker-ready");
+    helper_argv0 || args.next().is_some_and(|arg| arg == "worker-ready")
 }
 
 /// Prepare the VM-private coordination directory and the bare-VM helper name.
@@ -48,10 +61,13 @@ pub fn setup() {
     let _ = std::fs::remove_file(READY_PATH);
     let _ = std::fs::remove_file(RESTORED_PATH);
     let _ = std::fs::remove_file(RELEASE_PATH);
+    let _ = std::fs::remove_file(WORKER_READY_PATH);
 
-    if !Path::new(HELPER_PATH).exists() {
-        if let Err(error) = std::os::unix::fs::symlink(AGENT_BINARY, HELPER_PATH) {
-            tracing::warn!(%error, "failed to install bare-VM forkpoint helper");
+    for helper in [HELPER_PATH, WORKER_READY_HELPER_PATH] {
+        if !Path::new(helper).exists() {
+            if let Err(error) = std::os::unix::fs::symlink(AGENT_BINARY, helper) {
+                tracing::warn!(%error, helper, "failed to install bare-VM forkpoint helper");
+            }
         }
     }
 }
@@ -72,6 +88,7 @@ fn inject_into_container_if(
         return;
     }
     spec.add_bind_mount(agent_binary, HELPER_PATH, true);
+    spec.add_bind_mount(agent_binary, WORKER_READY_HELPER_PATH, true);
     spec.add_bind_mount(state_dir, STATE_DIR, false);
 }
 
@@ -138,6 +155,68 @@ fn run_helper_at(
     }
 }
 
+/// Publish the host-issued activation token after clone-local setup completes.
+pub fn run_worker_ready_helper() -> i32 {
+    if let Err(error) = write_worker_ready_at(
+        Path::new(STATE_DIR),
+        Path::new(FORK_ENV_PATH),
+        Path::new(WORKER_READY_PATH),
+    ) {
+        eprintln!("smolvm-worker-ready: {error}");
+        return 1;
+    }
+    0
+}
+
+fn worker_ready_token(env_path: &Path) -> Result<String, String> {
+    let contents = std::fs::read_to_string(env_path)
+        .map_err(|error| format!("read {}: {error}", env_path.display()))?;
+    let prefix = format!("{WORKER_READY_TOKEN_ENV}=");
+    let mut matches = contents
+        .lines()
+        .filter_map(|line| line.strip_prefix(&prefix));
+    let token = matches
+        .next()
+        .ok_or_else(|| format!("{WORKER_READY_TOKEN_ENV} is not configured for this lease"))?;
+    if matches.next().is_some() {
+        return Err(format!("{WORKER_READY_TOKEN_ENV} is duplicated"));
+    }
+    if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!(
+            "{WORKER_READY_TOKEN_ENV} must be 64 hexadecimal characters"
+        ));
+    }
+    Ok(token.to_ascii_lowercase())
+}
+
+fn write_worker_ready_at(
+    state_dir: &Path,
+    env_path: &Path,
+    worker_ready_path: &Path,
+) -> Result<(), String> {
+    std::fs::create_dir_all(state_dir)
+        .map_err(|error| format!("create {}: {error}", state_dir.display()))?;
+    let token = worker_ready_token(env_path)?;
+    let temporary = state_dir.join(format!(".worker-ready.{}", std::process::id()));
+    let _ = std::fs::remove_file(&temporary);
+    let mut marker = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|error| format!("create {}: {error}", temporary.display()))?;
+    if let Err(error) = marker
+        .write_all(format!("{token}\n").as_bytes())
+        .and_then(|()| marker.sync_all())
+    {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(format!("write {}: {error}", temporary.display()));
+    }
+    std::fs::rename(&temporary, worker_ready_path).map_err(|error| {
+        let _ = std::fs::remove_file(&temporary);
+        format!("publish {}: {error}", worker_ready_path.display())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,7 +240,8 @@ mod tests {
         assert!(spec
             .mounts
             .iter()
-            .all(|mount| mount.destination != HELPER_PATH));
+            .all(|mount| mount.destination != HELPER_PATH
+                && mount.destination != WORKER_READY_HELPER_PATH));
     }
 
     #[test]
@@ -186,6 +266,16 @@ mod tests {
             .unwrap();
         assert_eq!(helper.source, agent.to_str().unwrap());
         assert!(helper.options.iter().any(|option| option == "ro"));
+        let worker_ready_helper = spec
+            .mounts
+            .iter()
+            .find(|mount| mount.destination == WORKER_READY_HELPER_PATH)
+            .unwrap();
+        assert_eq!(worker_ready_helper.source, agent.to_str().unwrap());
+        assert!(worker_ready_helper
+            .options
+            .iter()
+            .any(|option| option == "ro"));
         let state_mount = spec
             .mounts
             .iter()
@@ -263,5 +353,52 @@ mod tests {
         std::fs::write(&release, b"release\n").unwrap();
         helper.join().unwrap().unwrap();
         assert!(!ready.exists());
+    }
+
+    #[test]
+    fn worker_ready_helper_atomically_publishes_the_lease_token() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("forkpoint");
+        let env = temp.path().join("fork-env");
+        let marker = state.join("worker-ready");
+        let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        std::fs::write(
+            &env,
+            format!("LEARNER=3\n{WORKER_READY_TOKEN_ENV}={token}\n"),
+        )
+        .unwrap();
+
+        write_worker_ready_at(&state, &env, &marker).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(marker).unwrap(),
+            format!("{token}\n")
+        );
+        assert!(std::fs::read_dir(state).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with('.')));
+    }
+
+    #[test]
+    fn worker_ready_helper_rejects_missing_duplicate_or_invalid_tokens() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("forkpoint");
+        let env = temp.path().join("fork-env");
+        let marker = state.join("worker-ready");
+        for contents in [
+            "LEARNER=3\n".to_string(),
+            format!(
+                "{WORKER_READY_TOKEN_ENV}={}\n{WORKER_READY_TOKEN_ENV}={}\n",
+                "a".repeat(64),
+                "b".repeat(64)
+            ),
+            format!("{WORKER_READY_TOKEN_ENV}=not-a-token\n"),
+        ] {
+            std::fs::write(&env, contents).unwrap();
+            assert!(write_worker_ready_at(&state, &env, &marker).is_err());
+            assert!(!marker.exists());
+        }
     }
 }

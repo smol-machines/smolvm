@@ -32,12 +32,73 @@ const MAX_LEASE_PAYLOAD_BYTES: usize = 1024 * 1024;
 const MAX_LEASE_PAYLOAD_PATH_BYTES: usize = 512;
 const DEFAULT_LEASE_PAYLOAD_MODE: u32 = 0o644;
 const LEASE_PAYLOAD_STAGE_ATTEMPTS: usize = 2;
+// Leave one minute for payload staging, guest release, and the durable commit
+// before the controller's five-minute activating-lease grace period expires.
+const MAX_WORKER_READY_TIMEOUT_SECS: u64 = crate::pool::FORK_LEASE_ACTIVATION_GRACE_SECS - 60;
+const DEFAULT_WORKER_READY_TIMEOUT_SECS: u64 = MAX_WORKER_READY_TIMEOUT_SECS;
+const WORKER_READY_TIMEOUT_ENV: &str = "SMOLVM_WORKER_READY_TIMEOUT_SECS";
 
 #[derive(Clone)]
 struct StagedLeaseFile {
     path: String,
     data: Vec<u8>,
     mode: u32,
+}
+
+fn validate_worker_ready_request(
+    await_worker_ready: bool,
+    requested_timeout: Option<u64>,
+) -> Result<Option<u64>, ApiError> {
+    if !await_worker_ready {
+        if requested_timeout.is_some() {
+            return Err(ApiError::BadRequest(
+                "workerReadyTimeoutSecs requires awaitWorkerReady=true".into(),
+            ));
+        }
+        return Ok(None);
+    }
+    let timeout = requested_timeout.unwrap_or(DEFAULT_WORKER_READY_TIMEOUT_SECS);
+    if !(1..=MAX_WORKER_READY_TIMEOUT_SECS).contains(&timeout) {
+        return Err(ApiError::BadRequest(format!(
+            "workerReadyTimeoutSecs must be between 1 and {MAX_WORKER_READY_TIMEOUT_SECS}"
+        )));
+    }
+    Ok(Some(timeout))
+}
+
+fn worker_ready_token(pool: &str, idempotency_key: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"smolvm-worker-ready-v1\0");
+    digest.update((pool.len() as u64).to_le_bytes());
+    digest.update(pool.as_bytes());
+    digest.update((idempotency_key.len() as u64).to_le_bytes());
+    digest.update(idempotency_key.as_bytes());
+    hex::encode(digest.finalize())
+}
+
+fn add_worker_ready_assignment(
+    assignment: &mut Vec<(String, String)>,
+    pool: &str,
+    idempotency_key: &str,
+    timeout_secs: u64,
+) -> Result<String, ApiError> {
+    for reserved in [
+        smolvm_protocol::forkpoint::WORKER_READY_TOKEN_ENV,
+        WORKER_READY_TIMEOUT_ENV,
+    ] {
+        if assignment.iter().any(|(key, _)| key == reserved) {
+            return Err(ApiError::BadRequest(format!(
+                "{reserved} is reserved for smolvm worker readiness"
+            )));
+        }
+    }
+    let token = worker_ready_token(pool, idempotency_key);
+    assignment.push((
+        smolvm_protocol::forkpoint::WORKER_READY_TOKEN_ENV.into(),
+        token.clone(),
+    ));
+    assignment.push((WORKER_READY_TIMEOUT_ENV.into(), timeout_secs.to_string()));
+    Ok(token)
 }
 
 fn validate_lease_payload(
@@ -182,6 +243,7 @@ async fn activate_claimed_lease(
     lease: ForkLeaseRecord,
     assignment: Vec<(String, String)>,
     files: Vec<StagedLeaseFile>,
+    worker_ready: Option<(String, Duration)>,
 ) -> Result<ForkLeaseRecord, String> {
     let record = match state.lookup_vm(&lease.machine_name).await {
         Ok(Some(record)) => record,
@@ -204,7 +266,11 @@ async fn activate_claimed_lease(
     let machine = lease.machine_name.clone();
     let activation = tokio::task::spawn_blocking(move || {
         stage_lease_payload(&machine, &files)?;
-        crate::agent::fork::activate_held_fork(&machine, &record, &assignment)
+        crate::agent::fork::activate_held_fork(&machine, &record, &assignment)?;
+        if let Some((token, timeout)) = worker_ready {
+            crate::agent::fork::wait_for_worker_ready(&machine, &token, timeout)?;
+        }
+        Ok::<(), crate::Error>(())
     })
     .await
     .map_err(|e| format!("pool activation task failed: {e}"))?;
@@ -240,6 +306,52 @@ async fn activate_claimed_lease(
         ));
     }
     Ok(active)
+}
+
+async fn wait_for_existing_activation(
+    state: &ApiState,
+    mut lease: ForkLeaseRecord,
+    timeout: Duration,
+) -> Result<ForkLeaseRecord, ApiError> {
+    let deadline = tokio::time::Instant::now() + timeout + Duration::from_secs(5);
+    loop {
+        match lease.state {
+            ForkLeaseState::Active => return Ok(lease),
+            ForkLeaseState::Activating if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let db = state.db().clone();
+                let pool = lease.pool_name.clone();
+                let id = lease.id.clone();
+                lease = tokio::task::spawn_blocking(move || db.get_fork_lease(&pool, &id))
+                    .await
+                    .map_err(|error| {
+                        ApiError::internal(format!(
+                            "existing lease activation query task failed: {error}"
+                        ))
+                    })?
+                    .map_err(ApiError::database)?
+                    .ok_or_else(|| ApiError::internal("existing fork lease disappeared"))?;
+            }
+            ForkLeaseState::Activating => {
+                return Err(ApiError::internal(format!(
+                    "fork lease '{}' remained activating after its worker readiness timeout",
+                    lease.id
+                )));
+            }
+            _ => {
+                return Err(ApiError::internal(format!(
+                    "fork lease '{}' ended in state '{}'{}",
+                    lease.id,
+                    lease.state.as_str(),
+                    lease
+                        .last_error
+                        .as_deref()
+                        .map(|error| format!(": {error}"))
+                        .unwrap_or_default()
+                )));
+            }
+        }
+    }
 }
 
 async fn pool_info(state: &ApiState, pool: ForkPoolRecord) -> Result<ForkPoolInfo, ApiError> {
@@ -586,9 +698,29 @@ pub async fn acquire_lease(
             "idempotencyKey must contain 1-{MAX_IDEMPOTENCY_KEY_BYTES} non-control bytes"
         )));
     }
-    let assignment = crate::util::parse_env_list(&req.env);
+    let worker_ready_timeout =
+        validate_worker_ready_request(req.await_worker_ready, req.worker_ready_timeout_secs)?;
+    let mut assignment = crate::util::parse_env_list(&req.env);
     crate::agent::fork::validate_fork_env(&assignment)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    for reserved in [
+        smolvm_protocol::forkpoint::WORKER_READY_TOKEN_ENV,
+        WORKER_READY_TIMEOUT_ENV,
+    ] {
+        if assignment.iter().any(|(key, _)| key == reserved) {
+            return Err(ApiError::BadRequest(format!(
+                "{reserved} is reserved for smolvm worker readiness"
+            )));
+        }
+    }
+    let worker_ready = worker_ready_timeout.map(|timeout| {
+        add_worker_ready_assignment(&mut assignment, &pool_name, &req.idempotency_key, timeout)
+            .map(|token| (token, Duration::from_secs(timeout)))
+    });
+    let worker_ready = match worker_ready {
+        Some(result) => Some(result?),
+        None => None,
+    };
     let (files, payload_sha256) = validate_lease_payload(&req.files)?;
     let db = state.db().clone();
     let lookup = pool_name.clone();
@@ -648,6 +780,11 @@ pub async fn acquire_lease(
                         .into(),
                 ));
             }
+            let lease = if let Some((_, timeout)) = worker_ready.as_ref() {
+                wait_for_existing_activation(&state, lease, *timeout).await?
+            } else {
+                lease
+            };
             return Ok(Json(lease_info(lease)));
         }
         ClaimForkPoolSlot::NoReadySlot => {
@@ -697,13 +834,14 @@ pub async fn acquire_lease(
         lease,
         assignment,
         files,
+        worker_ready,
     ))
     .await
     .map_err(|e| ApiError::internal(format!("pool activation task failed: {e}")))?
     .map_err(ApiError::Internal)?;
     // The durable claim removed one ready slot. Refill it only after payload
-    // staging and guest release complete: starting replacement VMs earlier can
-    // starve the held workers' control channels during a concurrent lease wave.
+    // staging and any requested worker-readiness wait complete. Starting
+    // replacement VMs earlier can starve the held workers' control channels.
     state.notify_pool_reconcile();
     Ok(Json(lease_info(active)))
 }
@@ -1009,5 +1147,69 @@ mod tests {
         )
         .unwrap();
         assert!(request.files.is_empty());
+        assert!(!request.await_worker_ready);
+        assert_eq!(request.worker_ready_timeout_secs, None);
+    }
+
+    #[test]
+    fn worker_ready_timeout_is_explicit_bounded_and_opt_in() {
+        assert_eq!(validate_worker_ready_request(false, None).unwrap(), None);
+        assert_eq!(
+            validate_worker_ready_request(true, None).unwrap(),
+            Some(DEFAULT_WORKER_READY_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            validate_worker_ready_request(true, Some(37)).unwrap(),
+            Some(37)
+        );
+        assert!(
+            bad_request(validate_worker_ready_request(false, Some(1)).unwrap_err())
+                .contains("requires awaitWorkerReady=true")
+        );
+        assert!(
+            bad_request(validate_worker_ready_request(true, Some(0)).unwrap_err())
+                .contains("between 1")
+        );
+        assert!(bad_request(
+            validate_worker_ready_request(true, Some(MAX_WORKER_READY_TIMEOUT_SECS + 1))
+                .unwrap_err()
+        )
+        .contains("between 1"));
+    }
+
+    #[test]
+    fn worker_ready_assignment_is_retry_stable_and_pool_scoped() {
+        let first = worker_ready_token("pool-a", "request-1");
+        assert_eq!(first, worker_ready_token("pool-a", "request-1"));
+        assert_ne!(first, worker_ready_token("pool-b", "request-1"));
+        assert_ne!(first, worker_ready_token("pool-a", "request-2"));
+        assert_eq!(first.len(), 64);
+
+        let mut assignment = vec![("LEARNER".into(), "3".into())];
+        let token = add_worker_ready_assignment(
+            &mut assignment,
+            "pool-a",
+            "request-1",
+            DEFAULT_WORKER_READY_TIMEOUT_SECS,
+        )
+        .unwrap();
+        assert_eq!(token, first);
+        assert!(assignment.contains(&(
+            smolvm_protocol::forkpoint::WORKER_READY_TOKEN_ENV.into(),
+            first
+        )));
+        assert!(assignment.contains(&(
+            WORKER_READY_TIMEOUT_ENV.into(),
+            DEFAULT_WORKER_READY_TIMEOUT_SECS.to_string()
+        )));
+
+        let mut reserved = vec![(
+            smolvm_protocol::forkpoint::WORKER_READY_TOKEN_ENV.into(),
+            "user-value".into(),
+        )];
+        assert!(bad_request(
+            add_worker_ready_assignment(&mut reserved, "pool", "request", 1).unwrap_err()
+        )
+        .contains("reserved"));
     }
 }
