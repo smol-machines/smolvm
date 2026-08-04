@@ -773,6 +773,17 @@ impl PackCreateCmd {
                     .and_then(|d| d.parent())
                     .map(|d| d.join(&platform_lib))
             }),
+            // Cargo dev build run from any CWD: target/<profile>/smolvm →
+            // repo-root/lib/linux-<arch>/ (three parents up). Without this,
+            // `pack create` only finds the bundled libs when invoked from the
+            // source-tree root, since libkrun is loaded in the _boot-vm
+            // subprocess and not visible to find_loaded_libkrun_dir() here.
+            std::env::current_exe().ok().and_then(|p| {
+                p.parent()
+                    .and_then(|d| d.parent())
+                    .and_then(|d| d.parent())
+                    .map(|d| d.join(&platform_lib))
+            }),
             // Source tree (CWD)
             Some(PathBuf::from("lib")),
             Some(PathBuf::from("./lib")),
