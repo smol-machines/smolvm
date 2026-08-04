@@ -32,8 +32,9 @@ def transformers_forkpoint_callback(
     command: str | Sequence[str] = "smolvm-fork-ready",
     env_path: str | Path = "/etc/smolvm/fork-env",
     reseed: bool = True,
+    preload_cuda_modules: bool = True,
 ):
-    """Create a callback that forks after Transformers prepares the trainer."""
+    """Fork after trainer preparation and preload clone CUDA modules by default."""
     try:
         from transformers import TrainerCallback, set_seed
     except ImportError as error:
@@ -44,6 +45,8 @@ def transformers_forkpoint_callback(
     argv = (command,) if isinstance(command, str) else tuple(command)
     if not argv or any(not isinstance(value, str) or not value for value in argv):
         raise ValueError("forkpoint command must contain non-empty strings")
+    if preload_cuda_modules and "--cuda-preload-modules" not in argv:
+        argv += ("--cuda-preload-modules",)
     fork_env_path = Path(env_path)
 
     class SmolvmTrainerForkpointCallback(TrainerCallback):

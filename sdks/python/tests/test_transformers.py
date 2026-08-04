@@ -54,7 +54,9 @@ class TransformersForkpointTests(unittest.TestCase):
                 self.assertEqual(os.environ["SMOLVM_FORK_NAME"], "worker-3")
                 self.assertEqual(os.environ["VALUE"], "a=b c")
 
-            run.assert_called_once_with(("fork-ready", "--test"), check=True)
+            run.assert_called_once_with(
+                ("fork-ready", "--test", "--cuda-preload-modules"), check=True
+            )
             self.assertTrue(callback.released)
             self.assertEqual(callback.fork_env["SMOLVM_FORK_INDEX"], "3")
             self.assertEqual(callback.seed, 45)
@@ -111,6 +113,27 @@ class TransformersForkpointTests(unittest.TestCase):
         ):
             callback = add_transformers_forkpoint(trainer, command="fork-ready")
         self.assertEqual(trainer.callbacks, [callback])
+
+    def test_cuda_module_preload_can_be_disabled(self):
+        seeds = []
+        with tempfile.TemporaryDirectory() as directory:
+            env_path = Path(directory) / "fork-env"
+            env_path.write_text("")
+            with (
+                mock.patch.dict(
+                    sys.modules,
+                    {"transformers": self.transformers_module(seeds)},
+                ),
+                mock.patch("smolvm_rollout.transformers.subprocess.run") as run,
+            ):
+                callback = transformers_forkpoint_callback(
+                    command="fork-ready",
+                    env_path=env_path,
+                    preload_cuda_modules=False,
+                )
+                callback.on_train_begin(SimpleNamespace(seed=1), None, object())
+
+            run.assert_called_once_with(("fork-ready",), check=True)
 
     def test_factory_reports_missing_transformers(self):
         with mock.patch.dict(sys.modules, {"transformers": None}):
