@@ -599,6 +599,9 @@ impl PodBackend for EnginePodBackend {
                 name: id_owned.clone(),
                 mounts: vec![mount],
                 ports: Vec::new(),
+                // A pod sandbox is a bare VM; the pod's containers bring their
+                // own images through the CRI, not through the machine record.
+                image: None,
                 resources: VmResources {
                     cpus: SANDBOX_CPUS,
                     memory_mib: SANDBOX_MEMORY_MIB,
