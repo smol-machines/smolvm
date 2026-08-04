@@ -34,7 +34,7 @@
 //! drops host sockets idle for [`FLOW_IDLE_TIMEOUT`]. Loss under pressure (full
 //! channels / tables) is acceptable ICMP semantics — logged, never blocking.
 
-use crate::egress::EgressPolicy;
+use crate::policy::Policy;
 use crate::queues::WakePipe;
 use crate::virtio_net_log;
 use polling::{Event, Events};
@@ -348,10 +348,10 @@ fn parse_echo_reply(destination: IpAddr, bytes: &[u8]) -> Option<(u16, Vec<u8>)>
     Some((seq, bytes[8..].to_vec()))
 }
 
-/// Whether the gateway should relay a guest echo to this destination. Echo
-/// obeys the same egress policy as TCP/UDP (static CIDRs + DNS-learned IPs).
-pub fn should_relay_icmp(destination: IpAddr, egress: &EgressPolicy) -> bool {
-    egress.allows(destination)
+/// Whether the gateway should relay a guest echo (portless, so any-port policy).
+pub fn should_relay_icmp(destination: IpAddr, egress: &dyn Policy) -> bool {
+    // ICMP echo carries no port, so only any-port allow rules cover it.
+    egress.allows(destination, None)
 }
 
 /// Decode a guest IPv4 ICMP echo *request* captured off the raw socket (a full
@@ -456,6 +456,7 @@ pub fn build_echo_reply_v6(reply: &IcmpEcho) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::PolicyHandle;
     use std::net::{Ipv4Addr, Ipv6Addr};
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -591,5 +592,32 @@ mod tests {
             }
             other => panic!("expected echo reply, got {other:?}"),
         }
+    }
+
+    /// An echo carries no port, so the policy is asked with `None` — and only a
+    /// rule that covers every port can answer that. A policy scoped to one port
+    /// must not find itself relaying pings to the same address.
+    #[test]
+    fn a_custom_policy_sees_a_portless_flow_for_icmp() {
+        struct OnlyHttps;
+        struct AnyPort;
+
+        impl crate::policy::Policy for OnlyHttps {
+            fn allows(&self, _ip: IpAddr, port: Option<u16>) -> bool {
+                port == Some(443)
+            }
+        }
+
+        impl crate::policy::Policy for AnyPort {
+            fn allows(&self, _ip: IpAddr, _port: Option<u16>) -> bool {
+                true
+            }
+        }
+
+        let ip: IpAddr = "1.1.1.1".parse().unwrap();
+        let scoped: PolicyHandle = Arc::new(OnlyHttps);
+        let open: PolicyHandle = Arc::new(AnyPort);
+        assert!(!should_relay_icmp(ip, scoped.as_ref()));
+        assert!(should_relay_icmp(ip, open.as_ref()));
     }
 }
