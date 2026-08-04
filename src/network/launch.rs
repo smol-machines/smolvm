@@ -1,5 +1,60 @@
 use crate::data::resources::VmResources;
 use crate::network::backend::NetworkBackend;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+static GUEST_HOST_SERVICE: AtomicU32 = AtomicU32::new(0);
+
+/// Enable one smolvm-owned gateway service for VMs launched by this server.
+pub fn configure_guest_host_service(
+    guest_port: u16,
+    host_port: u16,
+) -> std::result::Result<(), String> {
+    if guest_port == 0 || host_port == 0 {
+        return Err("guest host service ports must be between 1 and 65535".into());
+    }
+    let mapping = (u32::from(guest_port) << 16) | u32::from(host_port);
+    match GUEST_HOST_SERVICE.compare_exchange(0, mapping, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => Ok(()),
+        Err(current) if current == mapping => Ok(()),
+        Err(_) => Err("guest host service is already configured differently".into()),
+    }
+}
+
+fn guest_host_service_configured() -> bool {
+    GUEST_HOST_SERVICE.load(Ordering::Acquire) != 0
+        || std::env::var_os(crate::api::guest_rollout::GUEST_HOST_SERVICE_ENV).is_some()
+}
+
+/// Resolve the internal, smolvm-owned gateway service enabled by `serve`.
+pub fn guest_host_service(
+) -> std::result::Result<Option<smolvm_network::GatewayHostService>, String> {
+    let configured = GUEST_HOST_SERVICE.load(Ordering::Acquire);
+    if configured != 0 {
+        return Ok(Some(smolvm_network::GatewayHostService {
+            guest_port: (configured >> 16) as u16,
+            host_port: configured as u16,
+        }));
+    }
+    let Some(value) = std::env::var_os(crate::api::guest_rollout::GUEST_HOST_SERVICE_ENV) else {
+        return Ok(None);
+    };
+    let value = value
+        .to_str()
+        .ok_or_else(|| "guest host service mapping is not valid UTF-8".to_string())?;
+    let (guest_port, host_port) = value
+        .split_once(':')
+        .ok_or_else(|| "guest host service mapping must be GUEST_PORT:HOST_PORT".to_string())?;
+    let parse_port = |port: &str| {
+        port.parse::<u16>()
+            .ok()
+            .filter(|port| *port != 0)
+            .ok_or_else(|| "guest host service ports must be between 1 and 65535".to_string())
+    };
+    Ok(Some(smolvm_network::GatewayHostService {
+        guest_port: parse_port(guest_port)?,
+        host_port: parse_port(host_port)?,
+    }))
+}
 
 /// Effective backend selected for a launch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +97,7 @@ pub fn plan_launch_network(
         .as_ref()
         .is_some_and(|cidrs| !cidrs.is_empty());
     let has_dns_filter = dns_filter_hosts.is_some_and(|hosts| !hosts.is_empty());
+    let has_host_service = guest_host_service_configured();
     let wants_network = resources.network || has_ports || has_cidr_policy || has_dns_filter;
 
     if !wants_network {
@@ -69,7 +125,7 @@ pub fn plan_launch_network(
     // so a policy forces virtio-net unless the caller explicitly picked a backend.
     let fleet_mode = std::env::var_os("SMOLVM_PUBLISH_ADDR").is_some();
     let backend = resources.network_backend.unwrap_or(
-        if has_ports || fleet_mode || has_cidr_policy || has_dns_filter {
+        if has_ports || fleet_mode || has_cidr_policy || has_dns_filter || has_host_service {
             NetworkBackend::VirtioNet
         } else {
             NetworkBackend::Tsi
@@ -105,17 +161,18 @@ pub fn validate_requested_network_backend(
         .as_ref()
         .is_some_and(|c| !c.is_empty())
         || dns_filter_hosts.is_some_and(|h| !h.is_empty());
+    let has_host_service = guest_host_service_configured();
 
     // Mirror plan_launch_network's default: unset backend + (ports OR egress
     // policy) ⇒ virtio-net. So only an EXPLICIT `--net-backend tsi` alongside
     // ports/egress is a misconfig.
-    let backend = resources
-        .network_backend
-        .unwrap_or(if port_count > 0 || has_egress_policy {
+    let backend = resources.network_backend.unwrap_or(
+        if port_count > 0 || has_egress_policy || has_host_service {
             NetworkBackend::VirtioNet
         } else {
             NetworkBackend::Tsi
-        });
+        },
+    );
 
     // Published ports require the inbound path that only virtio-net has. With
     // the default above this only fires when the caller EXPLICITLY forced TSI.

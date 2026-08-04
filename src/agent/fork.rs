@@ -1223,7 +1223,7 @@ fn build_activation_script(
            rm -f \"$receipt_tmp\"; \
            [ \"$(cat '{receipt}' 2>/dev/null)\" = '{activation_token}' ] || exit 42; \
          else rm -f \"$receipt_tmp\"; fi; \
-         {ensure_env_parent}; \
+         {ensure_env_parent}; umask 077; \
          env_tmp='{env_path}.{activation_token}.'$$; \
          release_tmp='{release}.{activation_token}.'$$; \
          trap 'rm -f \"$env_tmp\" \"$release_tmp\"' EXIT; \
@@ -1465,6 +1465,14 @@ mod tests {
             String::from_utf8_lossy(&first.stderr)
         );
         assert_eq!(std::fs::read_to_string(&env_path).unwrap(), "LR=1e-4\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&env_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
         assert_eq!(
             std::fs::read_to_string(&receipt).unwrap(),
             format!("{token}\n")

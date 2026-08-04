@@ -32,6 +32,20 @@ result = client.generate(
 )
 ```
 
+Inside a worker acquired with `rolloutAccess`, no endpoint or credential wiring
+is needed. `RolloutClient()` reads the clone-local assignment installed at
+`/etc/smolvm/fork-env` and authenticates every request with its lease scope:
+
+```python
+client = RolloutClient()
+result = client.generate(
+    idempotency_key="experiment-a-step-40-batch-7",
+    policy=client.lease_policy,
+    prompts=[[1, 2, 3]],
+    max_tokens=64,
+)
+```
+
 For colocated CUDA trainers, `publish_device_adapter` replaces the checkpoint
 write with an immutable device allocation. Register a mode-0600 sidecar socket,
 then publish the returned one-use token:

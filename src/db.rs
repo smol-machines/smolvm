@@ -1374,6 +1374,22 @@ impl SmolvmDb {
         })
     }
 
+    /// Read one lease by its globally unique opaque ID.
+    pub fn get_fork_lease_by_id(&self, lease_id: &str) -> Result<Option<ForkLeaseRecord>> {
+        self.with_read_conn(|conn| {
+            let data: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT data FROM fork_leases WHERE id = ?1",
+                    params![lease_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .db_err(format!("get fork lease '{lease_id}'"))?;
+            data.map(|bytes| serde_json::from_slice(&bytes).db_err("deserialize fork lease"))
+                .transpose()
+        })
+    }
+
     /// Mark a claimed worker active after its guest release succeeds.
     pub fn mark_fork_lease_active(
         &self,

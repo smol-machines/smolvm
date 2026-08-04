@@ -999,6 +999,19 @@ pub struct AcquireForkLeaseRequest {
     /// Optional readiness timeout in seconds; defaults to 240 when enabled.
     #[serde(default)]
     pub worker_ready_timeout_secs: Option<u64>,
+    /// Optional fused-rollout access granted only to this lease's executor and policy.
+    #[serde(default)]
+    pub rollout_access: Option<RolloutLeaseAccess>,
+}
+
+/// Least-privilege fused-rollout scope injected into one pool worker.
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RolloutLeaseAccess {
+    /// Existing rollout executor this worker may call.
+    pub executor: String,
+    /// Logical policy this worker may publish, generate, and retire.
+    pub policy: String,
 }
 
 /// One file staged into a held worker before lease activation.

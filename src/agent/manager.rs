@@ -2061,6 +2061,14 @@ impl AgentManager {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| exe.clone());
         let mut cmd = std::process::Command::new(&boot_exe);
+        if let Some(service) = crate::network::launch::guest_host_service()
+            .map_err(|reason| Error::config("configure guest rollout ingress", reason))?
+        {
+            cmd.env(
+                crate::api::guest_rollout::GUEST_HOST_SERVICE_ENV,
+                format!("{}:{}", service.guest_port, service.host_port),
+            );
+        }
         // libkrun dlopen()s libkrunfw by bare soname at krun_start_enter time and
         // carries no rpath, so the dynamic linker must be told where to look
         // BEFORE the child launches — the loader caches its search path at

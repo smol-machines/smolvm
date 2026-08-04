@@ -23,6 +23,7 @@ pub mod admission;
 pub(crate) mod device_handoff;
 #[path = "errors.rs"]
 pub mod error;
+pub mod guest_rollout;
 pub mod handlers;
 pub mod pool_controller;
 pub mod rollout;
@@ -140,6 +141,7 @@ use state::ApiState;
         types::CreateForkPoolRequest,
         types::DeleteForkPoolQuery,
         types::AcquireForkLeaseRequest,
+        types::RolloutLeaseAccess,
         types::ForkLeasePayloadFile,
         types::ResizeForkPoolRequest,
         rollout::CreateRolloutExecutorRequest,
