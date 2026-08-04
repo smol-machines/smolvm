@@ -271,20 +271,27 @@ class DeviceAdapterServer:
         self._lock = threading.Lock()
         self._listener: socket.socket | None = None
         self._stopping = threading.Event()
+        self._ready = threading.Event()
+        self._startup_error: BaseException | None = None
 
     def serve_forever(self) -> None:
         """Bind the private socket and process requests until ``shutdown``."""
 
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        _remove_stale_socket(self.path)
-        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener: socket.socket | None = None
         cleanup_error: Exception | None = None
+        socket_identity: tuple[int, int] | None = None
         try:
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            _remove_stale_socket(self.path)
             listener.bind(str(self.path))
+            metadata = self.path.lstat()
+            socket_identity = (metadata.st_dev, metadata.st_ino)
             os.chmod(self.path, 0o600)
             listener.listen(16)
             listener.settimeout(0.5)
             self._listener = listener
+            self._ready.set()
             while not self._stopping.is_set():
                 try:
                     connection, _ = listener.accept()
@@ -297,13 +304,16 @@ class DeviceAdapterServer:
                 with connection:
                     connection.settimeout(self._io_timeout_secs)
                     self._serve_one(connection)
+        except BaseException as error:
+            if not self._ready.is_set():
+                self._startup_error = error
+                self._ready.set()
+            raise
         finally:
             self._listener = None
-            listener.close()
-            try:
-                self.path.unlink()
-            except FileNotFoundError:
-                pass
+            if listener is not None:
+                listener.close()
+            _remove_owned_socket(self.path, socket_identity)
             for model in tuple(self._loaded):
                 try:
                     self._unload(model)
@@ -312,6 +322,18 @@ class DeviceAdapterServer:
                         cleanup_error = error
         if cleanup_error is not None:
             raise cleanup_error
+
+    def wait_until_ready(self, timeout: float | None = None) -> None:
+        """Wait until the socket accepts connections or startup fails."""
+
+        if timeout is not None and timeout < 0:
+            raise ValueError("timeout must be non-negative")
+        if not self._ready.wait(timeout):
+            raise TimeoutError(f"device adapter server did not become ready at {self.path}")
+        if self._startup_error is not None:
+            raise RuntimeError(
+                f"device adapter server failed to start at {self.path}"
+            ) from self._startup_error
 
     def shutdown(self) -> None:
         """Stop accepting requests and unload every retained adapter mapping."""
@@ -432,6 +454,17 @@ def _remove_stale_socket(path: Path) -> None:
         raise RuntimeError(f"device adapter socket {path} is already active")
     finally:
         probe.close()
+
+
+def _remove_owned_socket(path: Path, identity: tuple[int, int] | None) -> None:
+    if identity is None:
+        return
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return
+    if (metadata.st_dev, metadata.st_ino) == identity and stat.S_ISSOCK(metadata.st_mode):
+        path.unlink()
 
 
 def _validate_peer(connection: socket.socket) -> None:

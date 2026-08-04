@@ -51,6 +51,13 @@ class Owner:
         self.closed = True
 
 
+def start_server(server):
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    server.wait_until_ready(2)
+    return thread
+
+
 class DeviceHandoffTests(unittest.TestCase):
     def test_active_socket_is_never_unlinked(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -64,6 +71,42 @@ class DeviceHandoffTests(unittest.TestCase):
                     device_handoff._remove_stale_socket(path)
                 self.assertTrue(path.exists())
             finally:
+                listener.close()
+
+    def test_failed_server_start_does_not_unlink_an_active_socket(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "adapter.sock"
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(path))
+            os.chmod(path, 0o600)
+            listener.listen(4)
+            errors = []
+            server = DeviceAdapterServer(
+                path,
+                load_adapter=lambda _model, _bundle: None,
+                unload_adapter=lambda _model, _owner: None,
+            )
+
+            def run_server():
+                try:
+                    server.serve_forever()
+                except BaseException as error:
+                    errors.append(error)
+
+            thread = threading.Thread(target=run_server, daemon=True)
+            thread.start()
+            with self.assertRaisesRegex(RuntimeError, "failed to start"):
+                server.wait_until_ready(2)
+            thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+            self.assertTrue(errors)
+            self.assertTrue(path.exists())
+
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                probe.connect(str(path))
+            finally:
+                probe.close()
                 listener.close()
 
     def test_manifest_range_must_match_shape_and_dtype(self):
@@ -99,13 +142,7 @@ class DeviceHandoffTests(unittest.TestCase):
                 unload_adapter=lambda _model, _owner: None,
                 io_timeout_secs=0.05,
             )
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
-            deadline = time.monotonic() + 2
-            while not path.exists():
-                if time.monotonic() > deadline:
-                    self.fail("device adapter server did not bind")
-                time.sleep(0.01)
+            thread = start_server(server)
             stalled = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             stalled.connect(str(path))
             stalled.sendall(b"S")
@@ -186,13 +223,7 @@ class DeviceHandoffTests(unittest.TestCase):
                 os.fstat(owner.descriptor)
 
             server = DeviceAdapterServer(path, load_adapter=load, unload_adapter=unload)
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
-            deadline = time.monotonic() + 2
-            while not path.exists():
-                if time.monotonic() > deadline:
-                    self.fail("device adapter server did not bind")
-                time.sleep(0.01)
+            thread = start_server(server)
 
             self.assertEqual(request(path, 0), (b"SMVDHR01", 0, b""))
             manifest = json.dumps(
@@ -253,13 +284,7 @@ class DeviceHandoffTests(unittest.TestCase):
                     raise RuntimeError("injected unload failure")
 
             server = DeviceAdapterServer(path, load_adapter=load, unload_adapter=unload)
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
-            deadline = time.monotonic() + 2
-            while not path.exists():
-                if time.monotonic() > deadline:
-                    self.fail("device adapter server did not bind")
-                time.sleep(0.01)
+            thread = start_server(server)
             manifest = json.dumps(
                 {
                     "schema": "smolvm.device-lora.v1",
@@ -312,13 +337,7 @@ class DeviceHandoffTests(unittest.TestCase):
                 unloads += 1
 
             server = DeviceAdapterServer(path, load_adapter=load, unload_adapter=unload)
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
-            deadline = time.monotonic() + 2
-            while not path.exists():
-                if time.monotonic() > deadline:
-                    self.fail("device adapter server did not bind")
-                time.sleep(0.01)
+            thread = start_server(server)
             manifest = json.dumps(
                 {
                     "schema": "smolvm.device-lora.v1",
