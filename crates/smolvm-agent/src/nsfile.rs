@@ -85,6 +85,7 @@ pub fn run_helper() -> i32 {
     let result = match op {
         "read" => helper_read(&path),
         "write" => helper_write(&path, mode),
+        "connect" => helper_connect(&path),
         _ => Err("unknown op".to_string()),
     };
     match result {
@@ -193,6 +194,43 @@ fn helper_write(path: &str, mode: Option<u32>) -> Result<(), String> {
     out.write_all(b"OK\n").map_err(|e| e.to_string())?;
     out.flush().map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Dial a Unix socket inside the container and hand the connected descriptor
+/// back to the parent over stdin, which the parent made a socketpair.
+///
+/// Only the *connect* needs the container's namespace: once the socket is
+/// established the path is spent, so the parent relays over an ordinary
+/// `UnixStream` with no namespace involvement. That is why a descriptor is
+/// passed rather than the helper proxying bytes — no extra hop in the data path,
+/// and no second process alive for the life of the connection.
+#[cfg(target_os = "linux")]
+fn helper_connect(path: &str) -> Result<(), String> {
+    use std::io::IoSlice;
+    use std::os::unix::io::AsRawFd;
+    use std::os::unix::net::UnixStream;
+
+    let app = UnixStream::connect(path).map_err(|e| format!("connect {path}: {e}"))?;
+
+    // One byte of payload: SCM_RIGHTS needs a non-empty iovec to travel, and it
+    // doubles as the parent's "the fd is coming" signal.
+    let fds = [app.as_raw_fd()];
+    let cmsg = [nix::sys::socket::ControlMessage::ScmRights(&fds)];
+    let iov = [IoSlice::new(b"K")];
+    nix::sys::socket::sendmsg::<()>(
+        std::io::stdin().as_raw_fd(),
+        &iov,
+        &cmsg,
+        nix::sys::socket::MsgFlags::empty(),
+        None,
+    )
+    .map_err(|e| format!("send fd for {path}: {e}"))?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn helper_connect(_path: &str) -> Result<(), String> {
+    Err("mount namespaces are Linux-only".to_string())
 }
 
 // ===========================================================================
@@ -332,6 +370,93 @@ fn write_via_helper(pid: u32, path: &str, data: &[u8], mode: Option<u32>) -> Res
         .to_string())
 }
 
+/// Connect to a Unix socket at `path` inside the workload container.
+///
+/// `None` means "no single running workload" — the caller keeps whatever it does
+/// in the agent's own namespace. Used by the `--expose-socket` bridge, whose app
+/// socket lives in the container's mount namespace on an `--image` machine (a
+/// private tmpfs `/run`, or the container rootfs) and therefore does not resolve
+/// for the agent at all.
+#[cfg(target_os = "linux")]
+pub fn connect_in_container(path: &str) -> Option<Result<std::os::unix::net::UnixStream, String>> {
+    let pid = workload_container_pid()?;
+    Some(connect_via_helper(pid, path))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn connect_in_container(_path: &str) -> Option<Result<std::os::unix::net::UnixStream, String>> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn connect_via_helper(pid: u32, path: &str) -> Result<std::os::unix::net::UnixStream, String> {
+    use std::io::IoSliceMut;
+    use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::net::UnixStream;
+
+    // The helper returns the descriptor over SCM_RIGHTS, which needs a socket
+    // rather than a pipe — so its stdin is one end of a socketpair instead of
+    // the pipe `read`/`write` use.
+    let (ours, theirs) =
+        UnixStream::pair().map_err(|e| format!("socketpair for ns-file connect: {e}"))?;
+    let child = Command::new(AGENT_BINARY)
+        .args([HELPER_ARG, "connect", &pid.to_string(), path])
+        .stdin(Stdio::from(OwnedFd::from(theirs)))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("spawn ns-file helper: {e}"))?;
+
+    let mut byte = [0u8; 1];
+    let mut iov = [IoSliceMut::new(&mut byte)];
+    let mut cmsg_buf = nix::cmsg_space!(std::os::unix::io::RawFd);
+    let received = nix::sys::socket::recvmsg::<()>(
+        ours.as_raw_fd(),
+        &mut iov,
+        Some(&mut cmsg_buf),
+        nix::sys::socket::MsgFlags::empty(),
+    );
+
+    let mut app_fd = None;
+    if let Ok(msg) = received {
+        for cmsg in msg.cmsgs() {
+            if let nix::sys::socket::ControlMessageOwned::ScmRights(fds) = cmsg {
+                // SAFETY: SCM_RIGHTS installed these descriptors in this process,
+                // which owns them from here. Exactly one is expected; close any
+                // extra rather than leak it.
+                for (i, fd) in fds.iter().enumerate() {
+                    let owned = unsafe { OwnedFd::from_raw_fd(*fd) };
+                    if i == 0 {
+                        app_fd = Some(owned);
+                    }
+                }
+            }
+        }
+    }
+
+    // The helper is short-lived either way; reap it before reporting.
+    let output = child.wait_with_output();
+    match app_fd {
+        Some(fd) => Ok(UnixStream::from(fd)),
+        None => {
+            let reply = output
+                .as_ref()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim_end().to_string())
+                .unwrap_or_default();
+            Err(reply
+                .strip_prefix("ERR ")
+                .unwrap_or_else(|| {
+                    if reply.is_empty() {
+                        "ns-file helper sent no descriptor"
+                    } else {
+                        &reply
+                    }
+                })
+                .to_string())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,5 +474,38 @@ mod tests {
         for bad in ["", "ERR boom", "OKAY", "ERR "] {
             assert_ne!(bad.trim_end(), "OK", "{bad:?} must not look like success");
         }
+    }
+
+    #[test]
+    fn connect_reports_an_error_when_no_descriptor_arrives() {
+        // The connect op signals success by SENDING A DESCRIPTOR, not by a reply
+        // string, so "nothing came back" is the failure the parent must name
+        // rather than treat as an empty-but-fine result. Mirrors the fallback in
+        // `connect_via_helper` when `app_fd` is None and stdout was empty.
+        let reply = "";
+        let msg = reply
+            .strip_prefix("ERR ")
+            .unwrap_or(if reply.is_empty() {
+                "ns-file helper sent no descriptor"
+            } else {
+                reply
+            })
+            .to_string();
+        assert!(
+            !msg.is_empty(),
+            "a missing descriptor must produce a reason"
+        );
+        assert!(msg.contains("no descriptor"));
+    }
+
+    #[test]
+    fn connect_surfaces_the_helper_error_text() {
+        // A failed in-container dial reports through stdout like the other ops.
+        let reply = "ERR connect /run/control/app.sock: No such file or directory";
+        let msg = reply.strip_prefix("ERR ").unwrap_or(reply);
+        assert_eq!(
+            msg,
+            "connect /run/control/app.sock: No such file or directory"
+        );
     }
 }
