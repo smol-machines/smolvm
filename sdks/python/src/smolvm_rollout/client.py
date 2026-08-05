@@ -59,7 +59,7 @@ def _read_fork_env(path: Path) -> dict[str, str]:
     return values
 
 
-def _lease_configuration(path: Path) -> tuple[str, str, str, str]:
+def _lease_configuration(path: Path) -> tuple[str, str, str, str, dict[str, str]]:
     values = _read_fork_env(path)
     for key in _ROLLOUT_LEASE_KEYS:
         if key in os.environ:
@@ -86,6 +86,7 @@ def _lease_configuration(path: Path) -> tuple[str, str, str, str]:
         executor,
         values[_ROLLOUT_TOKEN_ENV],
         values[_ROLLOUT_POLICY_ENV],
+        values,
     )
 
 
@@ -144,10 +145,15 @@ class RolloutClient:
         auto_fork_cohort_max_wait_ms: int | None = 250,
     ) -> None:
         lease_policy = None
+        fork_assignment: dict[str, str] = {}
         if api_url is None and executor is None:
-            api_url, executor, discovered_token, lease_policy = _lease_configuration(
-                Path(fork_env_path)
-            )
+            (
+                api_url,
+                executor,
+                discovered_token,
+                lease_policy,
+                fork_assignment,
+            ) = _lease_configuration(Path(fork_env_path))
             if bearer_token is not None and bearer_token != discovered_token:
                 raise ValueError("bearer_token conflicts with the smolvm lease credential")
             bearer_token = discovered_token
@@ -171,6 +177,7 @@ class RolloutClient:
         self.ssl_context = ssl_context
         self.auto_fork_cohort = auto_fork_cohort
         self.auto_fork_cohort_max_wait_ms = auto_fork_cohort_max_wait_ms
+        self._fork_assignment = fork_assignment
         self._fork_cohort_lock = threading.Lock()
         self._fork_cohort_round = 0
         self._fork_cohorts: OrderedDict[
@@ -182,8 +189,13 @@ class RolloutClient:
     ) -> tuple[str, int, int | None] | None:
         if not self.auto_fork_cohort:
             return None
-        batch_id = os.environ.get("SMOLVM_FORK_BATCH_ID")
-        batch_size_text = os.environ.get("SMOLVM_FORK_BATCH_SIZE")
+        batch_id = os.environ.get(
+            "SMOLVM_FORK_BATCH_ID", self._fork_assignment.get("SMOLVM_FORK_BATCH_ID")
+        )
+        batch_size_text = os.environ.get(
+            "SMOLVM_FORK_BATCH_SIZE",
+            self._fork_assignment.get("SMOLVM_FORK_BATCH_SIZE"),
+        )
         if batch_id is None and batch_size_text is None:
             return None
         if not batch_id or batch_size_text is None:
@@ -199,7 +211,9 @@ class RolloutClient:
         group_index = 0
         group_size = batch_size
         if batch_size > 256:
-            fork_index_text = os.environ.get("SMOLVM_FORK_INDEX")
+            fork_index_text = os.environ.get(
+                "SMOLVM_FORK_INDEX", self._fork_assignment.get("SMOLVM_FORK_INDEX")
+            )
             try:
                 fork_index = int(fork_index_text or "")
             except ValueError as error:

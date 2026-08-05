@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -42,7 +43,9 @@ class LeaseDiscoveryTests(unittest.TestCase):
                 "SMOLVM_ROLLOUT_URL=http://100.96.0.1:10081/api/v1/rollout-executors/fused\n"
                 "SMOLVM_ROLLOUT_TOKEN=lease-id.secret\n"
                 "SMOLVM_ROLLOUT_EXECUTOR=fused\n"
-                "SMOLVM_ROLLOUT_POLICY=experiment-a\n",
+                "SMOLVM_ROLLOUT_POLICY=experiment-a\n"
+                "SMOLVM_FORK_BATCH_ID=batch-a\n"
+                "SMOLVM_FORK_BATCH_SIZE=2\n",
                 encoding="utf-8",
             )
             with mock.patch.dict("os.environ", {}, clear=True):
@@ -65,6 +68,9 @@ class LeaseDiscoveryTests(unittest.TestCase):
                 self.assertEqual(
                     request.get_header("Authorization"), "Bearer lease-id.secret"
                 )
+                cohort = json.loads(request.data)["cohort"]
+                self.assertRegex(cohort.pop("id"), r"^fork-[0-9a-f]{32}$")
+                self.assertEqual(cohort, {"size": 2, "maxWaitMs": 250})
 
     def test_environment_overrides_assignment_after_clone_release(self):
         with tempfile.TemporaryDirectory() as directory:
