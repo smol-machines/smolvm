@@ -46,6 +46,12 @@ result = client.generate(
 )
 ```
 
+When the fork assignment includes a batch ID and size, the client automatically
+coordinates matching `generate` calls for up to 250 ms so the rollout engine can
+batch policies before admitting stragglers. Use
+`RolloutClient(auto_fork_cohort=False)` for intentionally divergent workers, or
+set `auto_fork_cohort_max_wait_ms` to tune the bounded wait.
+
 For colocated CUDA trainers, `publish_device_adapter` replaces the checkpoint
 write with an immutable device allocation. Register a mode-0600 sidecar socket,
 then publish the returned one-use token:
