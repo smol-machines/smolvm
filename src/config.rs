@@ -793,7 +793,20 @@ impl VmRecord {
     /// directory is resolved from bytes the host already has, and a
     /// `.smolmachine` artifact has its layers extracted at create — all three are
     /// legitimately network-free and must keep working.
+    ///
+    /// A `.smolmachine` is checked by SOURCE, not by `image`: the create path
+    /// sets both fields, so the artifact's provenance ref is present and looks
+    /// exactly like a pull that will never happen.
     pub fn validate_image_fetchable(&self) -> crate::Result<()> {
+        // A `.smolmachine` source carries the ORIGINAL registry reference in
+        // `image` as provenance, while the bytes come from the artifact's layers,
+        // extracted at create. Judging it by `image` alone reads that provenance
+        // as a pull that has to happen and rejects a machine that needs no
+        // network at all — which took the warm pool offline in prod, because
+        // pooled VMs are deliberately created network-less from a pack.
+        if self.source_smolmachine.is_some() {
+            return Ok(());
+        }
         let Some(image) = self.image.as_deref() else {
             return Ok(());
         };
@@ -920,13 +933,37 @@ mod tests {
 
     #[test]
     fn a_machine_with_no_image_is_unaffected() {
-        // Bare VMs (and `.smolmachine` artifacts, whose layers are extracted on
-        // the host at create) carry no pullable image reference.
+        // A bare VM carries no pullable image reference.
         assert!(
             VmRecord::new("m".to_string(), 1, 512, vec![], vec![], false)
                 .validate_image_fetchable()
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn a_smolmachine_source_needs_no_network_even_though_it_names_a_registry_image() {
+        // The create path sets BOTH fields for an artifact-sourced machine: the
+        // layers come from the `.smolmachine`, and `image` is retained only as
+        // provenance. Reading `image` alone made this look like an impossible
+        // pull, which is how warm-pool fill (network-less, artifact-sourced)
+        // started failing every create in production.
+        let mut r = rec_with_image("alpine:3.20", false, vec![]);
+        r.source_smolmachine = Some("library/alpine:latest".to_string());
+        assert!(
+            r.validate_image_fetchable().is_ok(),
+            "an artifact-sourced machine extracts its layers locally and must not \
+             require network"
+        );
+    }
+
+    #[test]
+    fn a_registry_image_with_no_network_is_still_rejected_without_an_artifact() {
+        // The guard #807 added must survive the fix above: no artifact source,
+        // no network, registry ref → still a create-time rejection.
+        let mut r = rec_with_image("alpine:3.20", false, vec![]);
+        r.source_smolmachine = None;
+        assert!(r.validate_image_fetchable().is_err());
     }
 
     #[test]
