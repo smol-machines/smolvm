@@ -251,6 +251,18 @@ rm -f "$OUTPUT_DIR/run/seatd.sock"
 
 PROFILE="release-small"
 
+# Cargo writes build artifacts under CARGO_TARGET_DIR when it is set. Relative
+# values are resolved from the directory where this script was invoked, which
+# matches Cargo's own environment-variable semantics.
+if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+    case "$CARGO_TARGET_DIR" in
+        /*) CARGO_BUILD_TARGET_DIR="$CARGO_TARGET_DIR" ;;
+        *) CARGO_BUILD_TARGET_DIR="$PWD/$CARGO_TARGET_DIR" ;;
+    esac
+else
+    CARGO_BUILD_TARGET_DIR="$PROJECT_ROOT/target"
+fi
+
 if [[ -n "${AGENT_BINARY:-}" ]] && [[ -f "${AGENT_BINARY}" ]]; then
     echo "Using pre-built agent binary: $AGENT_BINARY"
 elif [[ "$NO_BUILD_AGENT" == "1" ]]; then
@@ -265,8 +277,8 @@ else
             # Build the agent and the CUDA-over-vsock guest runner together.
             cargo build --profile "$PROFILE" -p smolvm-agent -p smolvm-cuda-guest \
                 --target "$RUST_TARGET" --manifest-path "$PROJECT_ROOT/Cargo.toml"
-            AGENT_BINARY="$PROJECT_ROOT/target/$RUST_TARGET/$PROFILE/smolvm-agent"
-            CUDA_GUEST_BINARY="$PROJECT_ROOT/target/$RUST_TARGET/$PROFILE/smolvm-cuda-run"
+            AGENT_BINARY="$CARGO_BUILD_TARGET_DIR/$RUST_TARGET/$PROFILE/smolvm-agent"
+            CUDA_GUEST_BINARY="$CARGO_BUILD_TARGET_DIR/$RUST_TARGET/$PROFILE/smolvm-cuda-run"
         fi
     fi
 
@@ -274,10 +286,15 @@ else
     if [[ -z "$AGENT_BINARY" ]] || [[ ! -f "$AGENT_BINARY" ]]; then
         if command -v smolvm &> /dev/null; then
             echo "Building via smolvm (rust:alpine)..."
-            smolvm machine run --net --mem 2048 -v "$PROJECT_ROOT:/work" --image rust:alpine \
+            mkdir -p "$CARGO_BUILD_TARGET_DIR"
+            smolvm machine run --net --mem 2048 \
+                -v "$PROJECT_ROOT:/work" \
+                -v "$CARGO_BUILD_TARGET_DIR:/cargo-target" \
+                -e CARGO_TARGET_DIR=/cargo-target \
+                --image rust:alpine \
                 -- sh -c ". /usr/local/cargo/env && apk add musl-dev && cd /work && cargo build --profile $PROFILE -p smolvm-agent -p smolvm-cuda-guest"
-            AGENT_BINARY="$PROJECT_ROOT/target/$PROFILE/smolvm-agent"
-            CUDA_GUEST_BINARY="$PROJECT_ROOT/target/$PROFILE/smolvm-cuda-run"
+            AGENT_BINARY="$CARGO_BUILD_TARGET_DIR/$PROFILE/smolvm-agent"
+            CUDA_GUEST_BINARY="$CARGO_BUILD_TARGET_DIR/$PROFILE/smolvm-cuda-run"
         else
             echo "Error: Cannot build smolvm-agent"
             echo "  Either install the musl target: rustup target add $RUST_TARGET"
@@ -326,9 +343,9 @@ if { [[ -z "$CUDART_SHIM_SRC" ]] || [[ -z "$CUDA_DRIVER_SHIM_SRC" ]]; } \
     echo "Building CUDA guest shims (native gnu target)..."
     if cargo build --release -p smolvm-cudart-shim -p smolvm-cuda-shim -p smolvm-nvml-shim \
         --manifest-path "$PROJECT_ROOT/Cargo.toml"; then
-        CUDART_SHIM_SRC="${CUDART_SHIM_SRC:-$PROJECT_ROOT/target/release/libcudart.so}"
-        CUDA_DRIVER_SHIM_SRC="${CUDA_DRIVER_SHIM_SRC:-$PROJECT_ROOT/target/release/libcuda.so}"
-        NVML_SHIM_SRC="${NVML_SHIM_SRC:-$PROJECT_ROOT/target/release/libnvidia_ml.so}"
+        CUDART_SHIM_SRC="${CUDART_SHIM_SRC:-$CARGO_BUILD_TARGET_DIR/release/libcudart.so}"
+        CUDA_DRIVER_SHIM_SRC="${CUDA_DRIVER_SHIM_SRC:-$CARGO_BUILD_TARGET_DIR/release/libcuda.so}"
+        NVML_SHIM_SRC="${NVML_SHIM_SRC:-$CARGO_BUILD_TARGET_DIR/release/libnvidia_ml.so}"
     else
         echo "CUDA guest shim build failed — rootfs ships without auto-staging"
     fi
