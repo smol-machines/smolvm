@@ -2631,16 +2631,19 @@ fn install_file_atomic(path: &str, data: &[u8], mode: Option<u32>) -> AgentRespo
 /// reads `upper` at mount time, so seeding it before the container starts is
 /// exactly how the file becomes visible once it does.
 fn handle_file_write(path: &str, data: &[u8], mode: Option<u32>) -> AgentResponse {
-    if let Some(result) = nsfile::write_to_container(path, data, mode) {
-        return match result {
+    match nsfile::GuestNs::for_workload() {
+        nsfile::GuestNs::Container(ns) => match ns.write(path, data, mode) {
             Ok(()) => AgentResponse::Ok { data: None },
             Err(e) => AgentResponse::error(
                 format!("failed to write {} in the workload container: {}", path, e),
                 error_codes::FILE_IO_FAILED,
             ),
-        };
+        },
+        // Seeding the VM's own namespace, which `install_file_atomic` maps into
+        // the machine's overlay. Correct with no workload running, and a
+        // deliberate branch rather than a fallthrough.
+        nsfile::GuestNs::Root(_) => install_file_atomic(path, data, mode),
     }
-    install_file_atomic(path, data, mode)
 }
 
 /// State for an in-progress streaming file upload on one connection.
@@ -2938,8 +2941,8 @@ fn handle_streaming_file_read(
     // layer, so a file the container itself created came back 404 (BUG-240).
     // Both directions must move together: fixing only writes would break the
     // upload-then-download round trip, which is self-consistent today.
-    if let Some(opened) = nsfile::open_in_container(path) {
-        match opened {
+    if let nsfile::GuestNs::Container(ns) = nsfile::GuestNs::for_workload() {
+        match ns.open(path) {
             Ok(mut cf) => {
                 info!(path = %path, size = cf.size, "streaming file read (container)");
                 return send_data_chunks(
