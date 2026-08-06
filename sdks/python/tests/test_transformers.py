@@ -7,7 +7,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from smolvm_rollout import add_transformers_forkpoint, transformers_forkpoint_callback
+from smolvm_rollout.integrations import (
+    add_transformers_forkpoint,
+    transformers_forkpoint_callback,
+)
 
 
 class FakeTrainerCallback:
@@ -43,7 +46,9 @@ class TransformersForkpointTests(unittest.TestCase):
                     sys.modules,
                     {"transformers": self.transformers_module(seeds)},
                 ),
-                mock.patch("smolvm_rollout.transformers.subprocess.run") as run,
+                mock.patch(
+                    "smolvm_rollout.integrations.transformers.subprocess.run"
+                ) as run,
                 mock.patch.dict(os.environ, {}, clear=True),
             ):
                 callback = transformers_forkpoint_callback(
@@ -75,7 +80,9 @@ class TransformersForkpointTests(unittest.TestCase):
                     sys.modules,
                     {"transformers": self.transformers_module(seeds)},
                 ),
-                mock.patch("smolvm_rollout.transformers.subprocess.run"),
+                mock.patch(
+                    "smolvm_rollout.integrations.transformers.subprocess.run"
+                ),
             ):
                 callback = transformers_forkpoint_callback(env_path=env_path)
                 callback.on_train_begin(args, None, object())
@@ -94,7 +101,9 @@ class TransformersForkpointTests(unittest.TestCase):
                     sys.modules,
                     {"transformers": self.transformers_module(seeds)},
                 ),
-                mock.patch("smolvm_rollout.transformers.subprocess.run") as run,
+                mock.patch(
+                    "smolvm_rollout.integrations.transformers.subprocess.run"
+                ) as run,
             ):
                 callback = transformers_forkpoint_callback(env_path=env_path)
                 with self.assertRaisesRegex(ValueError, "invalid fork environment"):
@@ -124,7 +133,9 @@ class TransformersForkpointTests(unittest.TestCase):
                     sys.modules,
                     {"transformers": self.transformers_module(seeds)},
                 ),
-                mock.patch("smolvm_rollout.transformers.subprocess.run") as run,
+                mock.patch(
+                    "smolvm_rollout.integrations.transformers.subprocess.run"
+                ) as run,
             ):
                 callback = transformers_forkpoint_callback(
                     command="fork-ready",

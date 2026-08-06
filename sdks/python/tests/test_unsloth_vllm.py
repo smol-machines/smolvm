@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
-from smolvm_rollout import UnslothVllmExecutor
+from smolvm_rollout.integrations import UnslothVllmExecutor
 
 
 @dataclass

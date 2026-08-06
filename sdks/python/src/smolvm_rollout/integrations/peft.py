@@ -6,7 +6,7 @@ import os
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from .device_handoff import publish_device_adapter
+from ..device_handoff import publish_device_adapter
 
 
 def _enum_value(value: Any) -> str:

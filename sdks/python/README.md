@@ -74,3 +74,20 @@ callbacks. `import_torch_device_adapter` provides named PyTorch views over the
 received CUDA allocation; the server retains them until smolvm drains active
 requests and the unload callback succeeds. Filesystem publication remains the
 fallback when a framework has no device-adapter callback.
+
+## Optional framework integrations
+
+The core package is framework-neutral and does not import training frameworks.
+Adapters are isolated under `smolvm_rollout.integrations` and are used explicitly:
+
+```python
+from smolvm_rollout.integrations import (
+    UnslothVllmExecutor,
+    add_transformers_forkpoint,
+    publish_peft_adapter,
+)
+```
+
+These adapters translate framework objects into the stable rollout, forkpoint,
+and device-publication contracts; the VM runtime and API contain no Unsloth,
+Transformers, or PEFT behavior.

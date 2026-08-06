@@ -14,8 +14,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
 
-from .device_handoff import DeviceAdapterBundle, DeviceAdapterServer
-from .torch_handoff import import_torch_device_adapter
+from ..device_handoff import DeviceAdapterBundle, DeviceAdapterServer
+from ..torch_handoff import import_torch_device_adapter
 
 
 _MAX_BODY_BYTES = 64 * 1024 * 1024

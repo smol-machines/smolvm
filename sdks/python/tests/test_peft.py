@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
-from smolvm_rollout import peft_lora_tensors, publish_peft_adapter
+from smolvm_rollout.integrations import peft_lora_tensors, publish_peft_adapter
 
 
 class Parameter:
@@ -58,7 +58,9 @@ class PeftTests(unittest.TestCase):
 
     def test_publishes_the_extracted_tensors_and_configuration(self):
         model = Model()
-        with mock.patch("smolvm_rollout.peft.publish_device_adapter") as publish:
+        with mock.patch(
+            "smolvm_rollout.integrations.peft.publish_device_adapter"
+        ) as publish:
             publish.return_value = bytes(range(32))
             token = publish_peft_adapter(
                 model,
