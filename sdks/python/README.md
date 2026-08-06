@@ -53,15 +53,13 @@ batch policies before admitting stragglers. Use
 set `auto_fork_cohort_max_wait_ms` to tune the bounded wait.
 
 For colocated CUDA trainers, `publish_device_adapter` replaces the checkpoint
-write with an immutable device allocation. Register a mode-0600 sidecar socket,
-then publish the returned one-use token:
+write with an immutable device allocation. Framework adapters provide a mapping
+of named tensors and a serializable adapter configuration to the core contract:
 
 ```python
-from peft import get_peft_model_state_dict
 from smolvm_rollout import publish_device_adapter
 
-state = get_peft_model_state_dict(model)
-token = publish_device_adapter(state, model.peft_config[model.active_adapter].to_dict())
+token = publish_device_adapter(adapter_tensors, adapter_config)
 client.publish_device_policy("experiment-a", "step-41", token)
 ```
 
