@@ -5,6 +5,7 @@ rollouts. A trainer publishes each immutable LoRA version and submits text or
 token-ID prompts; smolvm verifies and routes the version while one local vLLM
 engine continuously batches compatible policies. Unsupported workflows can use
 the executor's advertised `fallbackPool` with the ordinary fork-lease API.
+Training-framework adapters remain optional layers above this core contract.
 
 The vLLM server must bind to loopback, enable LoRA and runtime adapter updates,
 and reserve at least one spare CPU LoRA slot so a new policy version can load
