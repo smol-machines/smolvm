@@ -143,12 +143,63 @@ class DeviceHandoffTests(unittest.TestCase):
                 io_timeout_secs=0.05,
             )
             thread = start_server(server)
+            self.assertTrue(server.ready)
             stalled = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             stalled.connect(str(path))
             stalled.sendall(b"S")
             time.sleep(0.1)
             stalled.close()
             self.assertEqual(request(path, 0), (b"SMVDHR01", 0, b""))
+            server.shutdown()
+            thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+            self.assertFalse(server.ready)
+
+    def test_drain_unloads_every_retained_mapping(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "adapter.sock"
+            unloaded = []
+
+            def load(model, bundle):
+                return Owner(bundle.descriptor)
+
+            def unload(model, _owner):
+                unloaded.append(model)
+
+            server = DeviceAdapterServer(path, load_adapter=load, unload_adapter=unload)
+            thread = start_server(server)
+            manifest = json.dumps(
+                {
+                    "schema": "smolvm.device-lora.v1",
+                    "adapterConfig": {},
+                    "tensors": [
+                        {
+                            "name": "q_proj.lora_A.weight",
+                            "shape": [2, 4],
+                            "dtype": "float16",
+                        }
+                    ],
+                },
+                separators=(",", ":"),
+            ).encode()
+            metadata = (
+                struct.pack("<II", len(manifest), 1)
+                + manifest
+                + struct.pack("<QQ", 0, 16)
+            )
+            with tempfile.TemporaryFile() as allocation:
+                self.assertEqual(
+                    request(path, 1, "policy-a", metadata, allocation.fileno(), 64)[1],
+                    0,
+                )
+                self.assertEqual(
+                    request(path, 1, "policy-b", metadata, allocation.fileno(), 64)[1],
+                    0,
+                )
+
+            server.drain()
+            self.assertEqual(unloaded, ["policy-a", "policy-b"])
+            self.assertFalse(server._loaded)
             server.shutdown()
             thread.join(timeout=2)
             self.assertFalse(thread.is_alive())

@@ -274,6 +274,12 @@ class DeviceAdapterServer:
         self._ready = threading.Event()
         self._startup_error: BaseException | None = None
 
+    @property
+    def ready(self) -> bool:
+        """Return whether the private socket has completed bind and listen."""
+
+        return self._listener is not None
+
     def serve_forever(self) -> None:
         """Bind the private socket and process requests until ``shutdown``."""
 
@@ -314,12 +320,10 @@ class DeviceAdapterServer:
             if listener is not None:
                 listener.close()
             _remove_owned_socket(self.path, socket_identity)
-            for model in tuple(self._loaded):
-                try:
-                    self._unload(model)
-                except Exception as error:
-                    if cleanup_error is None:
-                        cleanup_error = error
+            try:
+                self.drain()
+            except Exception as error:
+                cleanup_error = error
         if cleanup_error is not None:
             raise cleanup_error
 
@@ -341,10 +345,31 @@ class DeviceAdapterServer:
         self._stopping.set()
         listener = self._listener
         if listener is not None:
+            wake = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            wake.settimeout(0.1)
+            try:
+                wake.connect(str(self.path))
+            except OSError:
+                pass
+            finally:
+                wake.close()
             try:
                 listener.close()
             except OSError:
                 pass
+
+    def drain(self) -> None:
+        """Unload every retained mapping, preserving failures for a safe retry."""
+
+        first_error: Exception | None = None
+        for model in tuple(self._loaded):
+            try:
+                self._unload(model)
+            except Exception as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
 
     def _serve_one(self, connection: socket.socket) -> None:
         descriptor = -1
