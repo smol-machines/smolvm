@@ -149,6 +149,7 @@ use state::ApiState;
         rollout::PublishDeviceRolloutPolicyRequest,
         rollout::RolloutPrompt,
         rollout::RolloutSamplingParams,
+        rollout::RolloutCohort,
         rollout::RolloutGenerateRequest,
         rollout::RolloutBatchRequest,
         // Response types
