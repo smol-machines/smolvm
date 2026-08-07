@@ -374,8 +374,11 @@ impl MachineCmd {
 ///   smolvm machine run --net -v ./src:/app --image node -- npm start
 #[derive(Args, Debug)]
 pub struct RunCmd {
-    /// Container image (e.g., alpine, ubuntu:22.04, ghcr.io/org/image).
-    /// Optional when a Smolfile provides the image, or for bare VM mode.
+    /// Container image: a registry reference (alpine, ubuntu:22.04,
+    /// ghcr.io/org/image), a `docker save` archive (./myapp.tar, or `-` to read
+    /// one from stdin), or an unpacked rootfs directory (./rootfs/). A bare name
+    /// is always a registry reference — pipe `docker save` to use a locally
+    /// built image. Optional when a Smolfile provides the image, or for bare VM mode.
     #[arg(short = 'I', long, value_name = "IMAGE", value_parser = parse_image)]
     pub image: Option<String>,
 
@@ -2620,7 +2623,10 @@ pub struct CreateCmd {
     #[arg(short = 'n', long, value_name = "NAME")]
     pub name: Option<String>,
 
-    /// Container image (e.g., alpine, python:3.12-alpine)
+    /// Container image: a registry reference (alpine, python:3.12-alpine), a
+    /// `docker save` archive (./myapp.tar, or `-` to read one from stdin), or an
+    /// unpacked rootfs directory (./rootfs/). A bare name is always a registry
+    /// reference — pipe `docker save` to use a locally built image.
     #[arg(short = 'I', long, value_name = "IMAGE", value_parser = parse_image)]
     pub image: Option<String>,
 
