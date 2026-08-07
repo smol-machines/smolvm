@@ -163,6 +163,31 @@ fn parse_published_sockets(
                 ),
             ));
         }
+        // The guest resolves this path in its own namespace (and bind-mounts a
+        // mounted socket there), so a relative path would silently land next to
+        // whatever the resolving process happens to be rooted at.
+        if !s.guest_path.starts_with('/') {
+            return Err(smolvm::Error::config(
+                "publish-socket",
+                format!("guest path '{}' must be absolute", s.guest_path),
+            ));
+        }
+    }
+    // Two mount bridges at the same guest path silently shadow each other in
+    // the guest, the later bind mount wins, leaving the first bridge's host
+    // socket unreachable. Reject the config instead of paying out a dead
+    // bridge. (Expose entries only *dial* their guest path, so duplicates
+    // there are harmless.)
+    let mut mounted_paths = std::collections::HashSet::new();
+    for s in &out {
+        if s.direction == smolvm::config::SocketDirection::Mount
+            && !mounted_paths.insert(&s.guest_path)
+        {
+            return Err(smolvm::Error::config(
+                "mount-socket",
+                format!("guest path '{}' is mounted more than once", s.guest_path),
+            ));
+        }
     }
     Ok(out)
 }
@@ -1975,6 +2000,20 @@ mod tests {
         assert!(parse_published_sockets(&[], &["/only-host".to_string()]).is_err());
         assert!(parse_published_sockets(&[":/tmp/h.sock".to_string()], &[]).is_err());
         assert!(parse_published_sockets(&["/run/a;b.sock".to_string()], &[]).is_err());
+        // Relative guest paths resolve against whatever the guest process is
+        // rooted at, so they can never name the socket the user meant.
+        assert!(parse_published_sockets(&["app.sock".to_string()], &[]).is_err());
+        assert!(parse_published_sockets(&[], &["/run/h.sock:app.sock".to_string()]).is_err());
+        // Two mount bridges at one guest path shadow each other in the guest,
+        // leaving the first host socket unreachable.
+        assert!(parse_published_sockets(
+            &[],
+            &[
+                "/run/h1.sock:/run/control/engine.sock".to_string(),
+                "/run/h2.sock:/run/control/engine.sock".to_string(),
+            ]
+        )
+        .is_err());
     }
 
     #[test]

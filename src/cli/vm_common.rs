@@ -1967,6 +1967,111 @@ pub fn stop_vm_default() -> smolvm::Result<()> {
 // Delete
 // ============================================================================
 
+/// Host-side paths behind which a `--mount-socket` publish may have left a
+/// placeholder for this machine: the guest agent bind-mounts its VM-private
+/// listener node at the caller's guest path, a file bind mount needs the
+/// destination to exist, and inside a `--volume` (virtiofs) share that
+/// destination lands on the host filesystem as a 0-byte regular file.
+///
+/// Only mount-direction sockets create placeholders, only for guest paths
+/// inside a declared volume (otherwise the node lives on the VM's own rootfs).
+/// When volumes nest, the deepest guest mountpoint owns the path. Volume host
+/// paths are canonicalized so differently-spelled references (`/tmp` vs
+/// `/private/tmp`) to the same share compare equal.
+fn mount_socket_placeholder_paths(record: &VmRecord) -> Vec<std::path::PathBuf> {
+    use smolvm::config::SocketDirection;
+    use std::path::{Path, PathBuf};
+
+    let mut out = Vec::new();
+    for sock in &record.published_sockets {
+        if sock.direction != SocketDirection::Mount {
+            continue;
+        }
+        let guest_path = Path::new(&sock.guest_path);
+        if !guest_path.is_absolute() {
+            continue;
+        }
+        let deepest = record
+            .mounts
+            .iter()
+            .filter(|(_, guest_target, _)| guest_path.starts_with(Path::new(guest_target)))
+            .max_by_key(|(_, guest_target, _)| guest_target.len());
+        let Some((host_source, guest_target, _)) = deepest else {
+            continue;
+        };
+        let Ok(rel) = guest_path.strip_prefix(guest_target) else {
+            continue;
+        };
+        let host_source: PathBuf =
+            std::fs::canonicalize(host_source).unwrap_or_else(|_| PathBuf::from(host_source));
+        out.push(host_source.join(rel));
+    }
+    out
+}
+
+/// Remove mount-socket placeholder files this machine left in shared `--volume`
+/// dirs (see [`mount_socket_placeholder_paths`]), except any `claimed` by
+/// another machine. Best-effort housekeeping: failures are debug-logged, never
+/// fatal to machine deletion.
+fn remove_mount_socket_placeholders_except(
+    record: &VmRecord,
+    claimed: &std::collections::HashSet<std::path::PathBuf>,
+) {
+    for placeholder in mount_socket_placeholder_paths(record) {
+        if claimed.contains(&placeholder) {
+            continue;
+        }
+        // Only ever remove provably-inert nodes: zero-byte *regular files*, not
+        // symlinks. Anything else at that path is the user's, not ours.
+        let Ok(meta) = std::fs::symlink_metadata(&placeholder) else {
+            continue; // never created, or already gone
+        };
+        if !meta.file_type().is_file() || meta.len() != 0 {
+            continue;
+        }
+        match std::fs::remove_file(&placeholder) {
+            Ok(()) => {
+                tracing::debug!(
+                    path = %placeholder.display(),
+                    "removed mount-socket placeholder from shared volume"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %placeholder.display(),
+                    error = %e,
+                    "failed to remove mount-socket placeholder"
+                );
+            }
+        }
+    }
+}
+
+/// Remove machine `record`'s mount-socket placeholders from shared `--volume`
+/// dirs — but only those no other machine record claims.
+///
+/// The claim check is load-bearing, not just tidiness: over virtiofs, removing
+/// the placeholder on the host invalidates the mountpoint dentry of a *running*
+/// VM that bind-mounted over it, severing its guest path with ENOENT. A
+/// placeholder is inert once every machine declaring the same path is deleted,
+/// so cleanup converges instead of racing co-mounted machines.
+pub fn remove_mount_socket_placeholders(record: &VmRecord) {
+    let claimed: std::collections::HashSet<std::path::PathBuf> = match SmolvmConfig::load() {
+        Ok(cfg) => cfg
+            .list_vms()
+            .filter(|(name, _)| name.as_str() != record.name)
+            .flat_map(|(_, other)| mount_socket_placeholder_paths(other))
+            .collect(),
+        // Can't enumerate other machines? Remove nothing — leaving litter is the
+        // fail-safe direction; deleting under a running VM is not.
+        Err(e) => {
+            tracing::debug!(error = %e, "skipping placeholder cleanup: cannot list machines");
+            return;
+        }
+    };
+    remove_mount_socket_placeholders_except(record, &claimed);
+}
+
 /// Options for machine delete behavior.
 pub struct DeleteVmOptions {
     /// If true, stop the VM before deleting when it is running.
@@ -2111,6 +2216,12 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
             name,
         ));
     }
+
+    // Drop mount-socket placeholder files this machine left in shared --volume
+    // dirs. Runs after the VM is confirmed stopped (or was never running), so
+    // no live bind mount can reference the host-side node; a machine that still
+    // declares the same socket recreates its placeholder at its next boot.
+    remove_mount_socket_placeholders(&record);
 
     let data_dir = vm_data_dir(name);
     if data_dir.exists() {
@@ -3078,5 +3189,190 @@ mod init_runner_tests {
                 ("BAZ".to_string(), "from-cli".to_string()),
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod mount_socket_placeholder_tests {
+    use super::{mount_socket_placeholder_paths, remove_mount_socket_placeholders_except};
+    use smolvm::config::{PublishedSocketConfig, SocketDirection, VmRecord};
+    use std::collections::HashSet;
+
+    fn remove_placeholders(record: &VmRecord) {
+        remove_mount_socket_placeholders_except(record, &HashSet::new());
+    }
+
+    fn mount_sock(guest_path: &str) -> PublishedSocketConfig {
+        PublishedSocketConfig {
+            direction: SocketDirection::Mount,
+            guest_path: guest_path.to_string(),
+            host_path: Some("/tmp/host.sock".to_string()),
+        }
+    }
+
+    fn record_with(
+        share: &std::path::Path,
+        guest_target: &str,
+        sockets: Vec<PublishedSocketConfig>,
+    ) -> VmRecord {
+        let mut record = VmRecord::new(
+            "t".to_string(),
+            1,
+            256,
+            vec![(
+                share.to_string_lossy().into_owned(),
+                guest_target.to_string(),
+                false,
+            )],
+            vec![],
+            false,
+        );
+        record.published_sockets = sockets;
+        record
+    }
+
+    #[test]
+    fn removes_only_inert_placeholder_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let share = tmp.path().join("shared");
+        std::fs::create_dir_all(&share).unwrap();
+        let placeholder = share.join("engine.sock");
+        std::fs::write(&placeholder, b"").unwrap(); // the 0-byte node the agent leaves
+        let user_data = share.join("real.sock");
+        std::fs::write(&user_data, b"user data").unwrap();
+        let dir = share.join("dir.sock");
+        std::fs::create_dir(&dir).unwrap();
+
+        let record = record_with(
+            &share,
+            "/run/control",
+            vec![
+                mount_sock("/run/control/engine.sock"),
+                mount_sock("/run/control/real.sock"),
+                mount_sock("/run/control/dir.sock"),
+                // Expose entries only dial; they never create placeholders.
+                PublishedSocketConfig {
+                    direction: SocketDirection::Expose,
+                    guest_path: "/run/control/exposed.sock".to_string(),
+                    host_path: None,
+                },
+                // A socket whose guest path is inside no volume touches nothing.
+                mount_sock("/elsewhere/engine.sock"),
+                // Pre-fix records could hold relative paths; never follow them.
+                mount_sock("relative/engine.sock"),
+            ],
+        );
+        remove_placeholders(&record);
+
+        assert!(!placeholder.exists(), "inert 0-byte placeholder must go");
+        assert!(user_data.exists(), "user data must survive");
+        assert!(dir.is_dir(), "directories must survive");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlink_at_placeholder_path_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let share = tmp.path().join("shared");
+        std::fs::create_dir_all(&share).unwrap();
+        let target = share.join("target-empty");
+        std::fs::write(&target, b"").unwrap();
+        let link = share.join("engine.sock");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let record = record_with(
+            &share,
+            "/run/control",
+            vec![mount_sock("/run/control/engine.sock")],
+        );
+        remove_placeholders(&record);
+
+        // We only ever recognize our own placeholders — a symlink is the user's
+        // and both it and its target survive.
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(target.exists());
+    }
+
+    #[test]
+    fn deepest_volume_wins_when_mounts_nest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let share = tmp.path().join("shared");
+        let deep = tmp.path().join("deep");
+        std::fs::create_dir_all(share.join("sub")).unwrap();
+        std::fs::create_dir_all(&deep).unwrap();
+        // Same guest path maps to different host files depending on which
+        // volume owns the prefix; only the deepest mount is authoritative.
+        let shallow_file = share.join("sub/engine.sock");
+        std::fs::write(&shallow_file, b"").unwrap();
+        let real = deep.join("engine.sock");
+        std::fs::write(&real, b"").unwrap();
+
+        let mut record = record_with(
+            &share,
+            "/run/control",
+            vec![mount_sock("/run/control/sub/engine.sock")],
+        );
+        record.mounts.push((
+            deep.to_string_lossy().into_owned(),
+            "/run/control/sub".to_string(),
+            false,
+        ));
+        remove_placeholders(&record);
+
+        assert!(!real.exists(), "deepest volume's placeholder must go");
+        assert!(shallow_file.exists(), "shallow mapping's file must survive");
+    }
+
+    #[test]
+    fn shared_placeholder_survives_while_another_machine_claims_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let share = tmp.path().join("shared");
+        std::fs::create_dir_all(&share).unwrap();
+        let placeholder = share.join("engine.sock");
+        std::fs::write(&placeholder, b"").unwrap();
+
+        let mut record_a = record_with(
+            &share,
+            "/run/control",
+            vec![mount_sock("/run/control/engine.sock")],
+        );
+        record_a.name = "sock-a".to_string();
+        let mut record_b = record_with(
+            &share,
+            "/run/control",
+            vec![mount_sock("/run/control/engine.sock")],
+        );
+        record_b.name = "sock-b".to_string();
+
+        // Deleting A while B still exists must NOT remove the placeholder:
+        // over virtiofs that invalidates the running B's mountpoint dentry.
+        let claimed: HashSet<_> = mount_socket_placeholder_paths(&record_b)
+            .into_iter()
+            .collect();
+        remove_mount_socket_placeholders_except(&record_a, &claimed);
+        assert!(
+            placeholder.exists(),
+            "placeholder must survive while another machine claims it"
+        );
+
+        // Once B is the last one left, its delete cleans up.
+        remove_mount_socket_placeholders_except(&record_b, &HashSet::new());
+        assert!(
+            !placeholder.exists(),
+            "last machine's delete removes the placeholder"
+        );
+    }
+
+    #[test]
+    fn missing_placeholder_is_not_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let share = tmp.path().join("shared");
+        std::fs::create_dir_all(&share).unwrap();
+        let record = record_with(
+            &share,
+            "/run/control",
+            vec![mount_sock("/run/control/engine.sock")],
+        );
+        remove_placeholders(&record); // nothing present: no failure
     }
 }

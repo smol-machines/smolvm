@@ -2743,6 +2743,7 @@ pub fn run_command(
 
         // Forward SSH agent into the container if enabled at boot.
         crate::ssh_agent::inject_into_container(&mut spec);
+        crate::publish_socket::inject_into_container(&mut spec);
         crate::forkpoint::inject_into_container(&mut spec);
         crate::cuda::inject_into_container(&mut spec, Path::new(&prepared.rootfs_path));
 
@@ -2837,6 +2838,7 @@ pub fn spawn_in_overlay(
     add_storage_fallback(&mut spec, mounts, unprivileged);
 
     crate::ssh_agent::inject_into_container(&mut spec);
+    crate::publish_socket::inject_into_container(&mut spec);
     crate::forkpoint::inject_into_container(&mut spec);
     crate::cuda::inject_into_container(&mut spec, Path::new(&prepared.rootfs_path));
     spec.add_gpu_devices_if_available();
