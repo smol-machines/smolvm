@@ -112,14 +112,19 @@ log_test() {
     echo -e "${YELLOW}[TEST]${NC} $1"
 }
 
+# Counters use arithmetic EXPANSION, not the `((...))` arithmetic command.
+# `((x++))` yields the value of the expression as its exit status, and
+# post-increment evaluates to the OLD value — so the first increment of a
+# zero-initialized counter exits 1 and `set -e` (line 8) kills the suite. That
+# aborted every suite at its first passing test.
 log_pass() {
     echo -e "${GREEN}[PASS]${NC} $1"
-    ((TESTS_PASSED++))
+    TESTS_PASSED=$((TESTS_PASSED + 1))
 }
 
 log_fail() {
     echo -e "${RED}[FAIL]${NC} $1"
-    ((TESTS_FAILED++))
+    TESTS_FAILED=$((TESTS_FAILED + 1))
 }
 
 log_skip() {
@@ -168,7 +173,7 @@ run_test() {
         return 0
     fi
 
-    ((TESTS_RUN++))
+    TESTS_RUN=$((TESTS_RUN + 1))
     log_test "$test_name"
 
     local output_file
@@ -349,7 +354,7 @@ run_with_timeout() {
     local count=0
     while kill -0 "$pid" 2>/dev/null; do
         sleep 1
-        ((count++))
+        count=$((count + 1))
         if [[ $count -ge $timeout_secs ]]; then
             echo "[TIMEOUT] Command timed out after ${timeout_secs}s: $*" >&2
             # Kill the process and all its children
