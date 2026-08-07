@@ -1,0 +1,18 @@
+# PyTorch worker on smolvm with CUDA forwarding.
+#
+# PyTorch and its CUDA libraries must be present at pull time so smolvm can
+# stage its forwarding shims. PRs #602 and #638 add support for this official
+# conda image layout; see README.md.
+#   smolvm machine run --cuda -s examples/cuda-pytorch/pytorch.smolfile -- python3 train.py
+
+image = "pytorch/pytorch:2.4.0-cuda12.4-cudnn9-runtime"
+cuda = true
+net = true
+memory = 16384
+
+# expandable-segments off is safer on the current CUDA remoting VMM surface.
+env = ["PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False"]
+
+[dev]
+volumes = ["./work:/work"]
+workdir = "/work"
