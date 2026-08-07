@@ -43,7 +43,10 @@ zstd = "0.13"
 
 # Linux-specific dependencies for vsock
 [target.'cfg(target_os = "linux")'.dependencies]
-nix = { version = "0.27", features = ["socket", "fs"] }
+# "uio" carries sendmsg/recvmsg and the SCM_RIGHTS control-message types, which
+# the ns-file `connect` op uses to hand a descriptor back out of the container's
+# mount namespace. "socket" alone does not enable them.
+nix = { version = "0.27", features = ["socket", "fs", "uio"] }
 # The new mount API (fsopen/fsconfig/fsmount/move_mount) for overlay mounts — lets
 # us append each lower layer via `lowerdir+` instead of shelling out to `mount(8)`,
 # whose `-o lowerdir=` value is capped at ~255 bytes. Already in the workspace lock.

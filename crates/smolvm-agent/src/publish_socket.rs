@@ -57,8 +57,6 @@ fn start_one(sock: PublishedSocket) {
 /// socket and relay. Mirrors the Docker bridge but with a caller-supplied path.
 #[cfg(target_os = "linux")]
 fn serve_expose(sock: &PublishedSocket) -> io::Result<()> {
-    use std::os::unix::net::UnixStream;
-
     let listener = crate::vsock::VsockListener::bind(sock.vsock_port)?;
     tracing::info!(
         vsock_port = sock.vsock_port,
@@ -79,7 +77,7 @@ fn serve_expose(sock: &PublishedSocket) -> io::Result<()> {
         let guest_path = sock.guest_path.clone();
         thread::Builder::new()
             .name("expose-sock-fwd".into())
-            .spawn(move || match UnixStream::connect(&guest_path) {
+            .spawn(move || match dial_app(&guest_path) {
                 Ok(app) => {
                     if let Err(e) = relay(host_conn, app) {
                         tracing::debug!(error = %e, "expose-socket relay ended");
@@ -95,6 +93,45 @@ fn serve_expose(sock: &PublishedSocket) -> io::Result<()> {
                 ),
             })
             .ok();
+    }
+}
+
+/// Dial the app's socket, in the agent's namespace first and the workload
+/// container's second.
+///
+/// The agent runs in the VM root mount namespace; on an `--image` machine the
+/// workload runs under crun with its own, including a private tmpfs `/run`. A
+/// socket the app binds at `/run/control/app.sock` therefore does not exist for
+/// the agent, and the bridge accepted the host connection and then had nothing
+/// to relay to — the host client hung until it timed out.
+///
+/// Root namespace is tried FIRST so the cases that already work keep their exact
+/// behavior and cost: a bare VM, and a socket bound inside a `--volume` share,
+/// which is bind-mounted identically in both namespaces. The container is a
+/// fallback, and only when there is exactly one running workload to be
+/// unambiguous about — with none or several, this is just the old behavior.
+#[cfg(target_os = "linux")]
+fn dial_app(guest_path: &str) -> io::Result<std::os::unix::net::UnixStream> {
+    use std::os::unix::net::UnixStream;
+
+    let agent_ns_err = match UnixStream::connect(guest_path) {
+        Ok(app) => return Ok(app),
+        Err(e) => e,
+    };
+    match crate::nsfile::connect_in_container(guest_path) {
+        Some(Ok(app)) => {
+            tracing::debug!(
+                guest_path = %guest_path,
+                "expose-socket: dialed the app socket in the workload container's namespace"
+            );
+            Ok(app)
+        }
+        // Report the container attempt: with a workload running, that is the
+        // namespace the path was meant for, so its error is the informative one.
+        Some(Err(e)) => Err(io::Error::other(e)),
+        // No single running workload — nothing was tried beyond the root
+        // namespace, so that error is the whole story.
+        None => Err(agent_ns_err),
     }
 }
 
