@@ -340,6 +340,44 @@ if [[ -n "$CUDART_SHIM_SRC" && -f "$CUDART_SHIM_SRC" \
     mkdir -p "$OUTPUT_DIR/usr/local/lib/smolvm-cuda"
     cp "$CUDART_SHIM_SRC" "$OUTPUT_DIR/usr/local/lib/smolvm-cuda/libcudart-shim.so"
     cp "$CUDA_DRIVER_SHIM_SRC" "$OUTPUT_DIR/usr/local/lib/smolvm-cuda/libcuda.so.1"
+    # Conda/extra-dir staging replaces the real cudart soname, so it is safe
+    # only when the shim can satisfy the versioned imports observed in conda
+    # PyTorch. Verify the actual packaged binary; the agent trusts only this
+    # build-time capability stamp and otherwise preserves LD_PRELOAD fallthrough.
+    RUNTIME_CAPABILITIES="$OUTPUT_DIR/usr/local/lib/smolvm-cuda/runtime-capabilities"
+    rm -f "$RUNTIME_CAPABILITIES"
+    REQUIRED_CONDA_EXPORTS=(
+        cudaDeviceGetLimit
+        cudaDeviceSetLimit
+        cudaGraphAddKernelNode
+        cudaGraphAddHostNode
+        cudaGraphAddEventRecordNode
+        cudaGraphAddEventWaitNode
+        cudaGraphRetainUserObject
+        cudaUserObjectCreate
+        cudaStreamUpdateCaptureDependencies
+    )
+    if command -v nm &> /dev/null; then
+        CUDART_EXPORTS="$(
+            nm -D --defined-only --format=posix "$CUDART_SHIM_SRC" 2>/dev/null \
+                | awk '{ sub(/@.*/, "", $1); print $1 }' || true
+        )"
+        MISSING_CONDA_EXPORTS=()
+        for symbol in "${REQUIRED_CONDA_EXPORTS[@]}"; do
+            if ! grep -Fxq "$symbol" <<<"$CUDART_EXPORTS"; then
+                MISSING_CONDA_EXPORTS+=("$symbol")
+            fi
+        done
+        if [[ "${#MISSING_CONDA_EXPORTS[@]}" -eq 0 ]]; then
+            printf '%s\n' "conda-overmount-v1" > "$RUNTIME_CAPABILITIES"
+            echo "Enabled conda/extra-dir CUDA runtime overmounts"
+        else
+            echo "CUDA runtime shim lacks conda overmount exports: ${MISSING_CONDA_EXPORTS[*]}"
+            echo "Conda/extra-dir libraries will remain untouched for LD_PRELOAD fallback"
+        fi
+    else
+        echo "nm unavailable; conda/extra-dir libraries will remain untouched for LD_PRELOAD fallback"
+    fi
     # Unversioned linker ("dev") names next to the sonames. Code that *links*
     # against CUDA at runtime — Triton's JIT compiles cuda_utils with
     # `gcc … -lcuda`, taking its -L from LD_LIBRARY_PATH, which the shim dir
