@@ -34,8 +34,8 @@ const AGENT_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const WAIT_FOR_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn should_retry_kvm_enomem(cpus: u8, fork_clone: bool) -> bool {
-    cpus == 1 || fork_clone
+fn should_retry_kvm_enomem(cpus: u8, forkable: bool, fork_clone: bool) -> bool {
+    cpus == 1 || forkable || fork_clone
 }
 
 #[cfg(unix)]
@@ -1812,16 +1812,16 @@ impl AgentManager {
             }
             let fork_clone = features.snapshot_dir.is_some();
             let cuda_clone = fork_clone && (features.cuda || resources_for_config.cuda);
-            // Some KVM kernels return a spurious ENOMEM while concurrent fork
-            // clones enter KVM. Keep the first-entry delay specific to one-vCPU
-            // guests, but enable the bounded retry path for every fork clone;
+            // Some KVM kernels return a spurious ENOMEM while a signalled vCPU
+            // enters KVM. Keep the first-entry delay specific to one-vCPU
+            // guests, but enable bounded retries for fork bases and clones;
             // retries add no delay unless KVM actually returns ENOMEM.
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             if resources_for_config.cpus == 1 {
                 v.push(("KRUN_FIRST_RUN_DELAY", "1".to_string()));
             }
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-            if should_retry_kvm_enomem(resources_for_config.cpus, fork_clone) {
+            if should_retry_kvm_enomem(resources_for_config.cpus, features.forkable, fork_clone) {
                 v.push(("KRUN_ENOMEM_RETRY", "1".to_string()));
             }
             // A CUDA fork clone must stay ptrace-readable by the same-uid daemon
@@ -2899,10 +2899,11 @@ mod tests {
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
-    fn kvm_enomem_retries_cover_multi_vcpu_fork_clones() {
-        assert!(should_retry_kvm_enomem(1, false));
-        assert!(should_retry_kvm_enomem(3, true));
-        assert!(!should_retry_kvm_enomem(3, false));
+    fn kvm_enomem_retries_cover_multi_vcpu_fork_vms() {
+        assert!(should_retry_kvm_enomem(1, false, false));
+        assert!(should_retry_kvm_enomem(3, true, false));
+        assert!(should_retry_kvm_enomem(3, false, true));
+        assert!(!should_retry_kvm_enomem(3, false, false));
     }
 
     #[test]
