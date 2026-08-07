@@ -180,6 +180,76 @@ repair_executable_modes() {
     done
 }
 
+normalize_owner_only_modes() {
+    local rootfs_dir="$1"
+
+    # The stock Alpine minirootfs ships four paths only their owner can read.
+    # A mode-preserving install — packaging/arch/PKGBUILD and packaging/nfpm.yaml
+    # both copy the tree as-is — lands them root-owned under a system prefix such
+    # as /usr/lib/smolvm/agent-rootfs, where the user running smolvm cannot read
+    # them. `pack create` tars the whole rootfs and cannot skip anything, so it
+    # hard-fails with "Permission denied" (collect_agent_rootfs,
+    # crates/smolvm-pack/src/assets.rs). That also breaks plain `machine run`
+    # whenever an init layer is baked via `pack create --from-vm` — a Smolfile
+    # with [dev] init steps, or any --oci-cache run.
+    #
+    # Booting is unaffected either way: the guest never opens these files, and
+    # since the vsock readiness doorbell the host no longer writes into this
+    # directory to signal ready.
+    #
+    # Widening them discloses nothing. This tree is a build artifact published on
+    # a public release page and byte-identical for every user: `shadow` carries no
+    # hashes (root:*, every other account !), /etc/crontabs/root is the stock
+    # run-parts schedule, /root is empty, and lib/apk/db/lock is zero bytes.
+    # Ownership and write bits are left alone.
+    echo "Normalizing owner-only permissions..."
+    local owner_only_dirs=(
+        # The tree root itself: created by this script under the builder's umask,
+        # so a restrictive umask would otherwise produce a rootfs nobody but the
+        # owner can even traverse into.
+        "$rootfs_dir"
+        "$rootfs_dir/root"
+    )
+    local owner_only_files=(
+        "$rootfs_dir/etc/shadow"
+        "$rootfs_dir/etc/crontabs/root"
+        "$rootfs_dir/lib/apk/db/lock"
+    )
+    for path in "${owner_only_dirs[@]}"; do
+        if [[ -d "$path" ]]; then
+            chmod 0755 "$path"
+        fi
+    done
+    for path in "${owner_only_files[@]}"; do
+        if [[ -f "$path" ]]; then
+            chmod 0644 "$path"
+        fi
+    done
+
+    # Then verify the whole tree, and fail the build on anything still owner-only.
+    #
+    # Deliberately not a blanket `chmod -R a+rX`: this script also runs against
+    # user-supplied trees, and SMOLVM_AGENT_ROOTFS can boot one. The rootfs is
+    # shared into every VM, so a recursive widen would quietly expose a custom
+    # tree's 0600 registry token or signing key to every workload. Naming the
+    # known paths and hard-failing on the rest means a later Alpine bump that adds
+    # a fifth one stops the build here — instead of shipping a rootfs that cannot
+    # be packed, or widening something nobody looked at.
+    local owner_only
+    owner_only="$(find "$rootfs_dir" \
+        \( -type f ! -perm -o=r \) -o \( -type d ! -perm -o=rx \) 2>/dev/null || true)"
+    if [[ -n "$owner_only" ]]; then
+        echo "Error: agent rootfs has paths unreadable to a non-owner:" >&2
+        echo "$owner_only" | sed "s#^${rootfs_dir}#  #" >&2
+        echo "" >&2
+        echo "A mode-preserving install makes these unreadable to the user running" >&2
+        echo "smolvm, and 'pack create' fails on them. Either widen them by name in" >&2
+        echo "normalize_owner_only_modes() once you have confirmed they hold nothing" >&2
+        echo "secret, or keep them out of the rootfs." >&2
+        exit 1
+    fi
+}
+
 if [[ "$(uname -s)" == "Linux" ]]; then
     # On Linux, apk.static is preferred — it handles cross-arch correctly
     install_packages_apk_static
@@ -378,6 +448,9 @@ if [[ -n "$CUDART_SHIM_SRC" && -f "$CUDART_SHIM_SRC" \
 else
     echo "Skipping CUDA guest shims (no prebuilt paths, cross-arch, or no cargo) — auto-staging disabled in this rootfs"
 fi
+
+# Last, so it covers every file the steps above installed — not just the Alpine base.
+normalize_owner_only_modes "$OUTPUT_DIR"
 
 echo ""
 echo "Agent rootfs created at: $OUTPUT_DIR"
