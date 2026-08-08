@@ -2711,20 +2711,24 @@ fn reserve_clone_address_exact(b: &mut dyn Backend, va: u64, size: u64, align: u
 }
 
 #[cfg(unix)]
+const MIN_CLONE_RESERVATION_GRANULARITY: u64 = 1 << 16;
+#[cfg(unix)]
+const MAX_CLONE_RESERVATION_GRANULARITY: u64 = 1 << 31;
+
+#[cfg(unix)]
 fn reserve_clone_layout_exact(
     b: &mut dyn Backend,
     layout: &str,
     device: i32,
 ) -> (Vec<(u64, u64)>, u64) {
-    const MIN_GRANULARITY: u64 = 1 << 16;
-    const MAX_HINT_GRANULARITY: u64 = 1 << 30;
-
     let mut granularity = b
         .mem_get_allocation_granularity(device, 0)
         .unwrap_or(1 << 21)
-        .max(MIN_GRANULARITY)
+        .max(MIN_CLONE_RESERVATION_GRANULARITY)
         .next_power_of_two();
-    while granularity <= MAX_HINT_GRANULARITY {
+    // Most workers resolve at 32 MiB. Keep one validated 2 GiB envelope as a
+    // final fallback for contexts whose allocator moves every smaller hint.
+    while granularity <= MAX_CLONE_RESERVATION_GRANULARITY {
         let envelopes = clone_layout_reservation_envelopes(layout, granularity);
         let mut reserved = Vec::with_capacity(envelopes.len());
         let mut complete = true;
@@ -6047,7 +6051,7 @@ impl Drop for FileLock {
 #[cfg(all(test, target_os = "linux"))]
 mod mps_tests {
     use super::{
-        clone_layout_reservation_envelopes, clone_worker_idle_expired,
+        clone_layout_reservation_envelopes, clone_layout_reservations, clone_worker_idle_expired,
         clone_worker_idle_timeout_from, clone_worker_share_env, clone_worker_spawn_pace,
         clone_worker_status_dir_for, clone_worker_vm_is_alive, consume_procmem_preamble,
         create_host_snapshot_memfd, create_private_mps_paths, daemon_has_live_cuda_clients,
@@ -6064,7 +6068,7 @@ mod mps_tests {
         spawn_clone_attach_listener_with_timeout, spawn_tensor_bundle_receiver,
         tensor_bundle_ttl_from, unique_live_clone_worker, validate_tensor_bundle_metadata,
         write_module_handoff, CloneWorkerSpawnFds, CloneWorkerStatus, DEFAULT_TENSOR_BUNDLE_TTL,
-        TENSOR_CONSUME_MAGIC,
+        MAX_CLONE_RESERVATION_GRANULARITY, TENSOR_CONSUME_MAGIC,
     };
     use std::collections::HashMap;
     use std::io::{self, Write};
@@ -6919,6 +6923,12 @@ mod mps_tests {
         assert!(range_is_reserved(&ranges, 0x314000000, 0x1400000));
         assert!(range_is_reserved(&ranges, 0x7a5ed2600000, 0x200000));
         assert!(!range_is_reserved(&ranges, 0x316000000, 0x200000));
+
+        let fallback =
+            clone_layout_reservation_envelopes(layout, MAX_CLONE_RESERVATION_GRANULARITY);
+        for (base, size) in clone_layout_reservations(layout) {
+            assert!(range_is_reserved(&fallback, base, size));
+        }
     }
 
     #[test]
