@@ -1157,6 +1157,14 @@ pub fn activate_held_fork(
     unreachable!("held-fork activation loop always returns")
 }
 
+const WORKER_READY_TRANSPORT_MARGIN: Duration = Duration::from_secs(30);
+
+fn worker_ready_command_timeout(timeout: Duration) -> Result<Duration> {
+    timeout
+        .checked_add(WORKER_READY_TRANSPORT_MARGIN)
+        .ok_or_else(|| Error::config("worker readiness", "timeout is too large"))
+}
+
 /// Wait until a released workload proves that clone-local preparation finished.
 pub fn wait_for_worker_ready(clone: &str, token: &str, timeout: Duration) -> Result<()> {
     if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -1179,6 +1187,17 @@ pub fn wait_for_worker_ready(clone: &str, token: &str, timeout: Duration) -> Res
     let socket = vm_data_dir(clone).join("agent.sock");
     let mut client = AgentClient::connect_with_retry(&socket)
         .map_err(|error| Error::agent("wait for worker readiness", error.to_string()))?;
+    if !client
+        .supports_capability(smolvm_protocol::forkpoint::WORKER_READY_CAPABILITY)
+        .map_err(|error| Error::agent("check worker readiness capability", error.to_string()))?
+    {
+        return Err(Error::agent(
+            "wait for worker readiness",
+            format!(
+                "clone '{clone}' uses an incompatible guest agent without the worker-readiness capability; rebuild the agent rootfs or remove the stale SMOLVM_AGENT_ROOTFS override"
+            ),
+        ));
+    }
     let command = vec![
         "/bin/sh".into(),
         "-c".into(),
@@ -1187,9 +1206,11 @@ pub fn wait_for_worker_ready(clone: &str, token: &str, timeout: Duration) -> Res
         token.to_ascii_lowercase(),
         polls.to_string(),
     ];
-    let command_timeout = timeout
-        .checked_add(Duration::from_secs(5))
-        .ok_or_else(|| Error::config("worker readiness", "timeout is too large"))?;
+    // The guest poll loop launches `sleep` on every iteration, so its elapsed
+    // wall time can exceed the nominal polling window under CPU contention.
+    // Keep this transport deadline within the controller's reserved activation
+    // grace while allowing the script to report its specific timeout code.
+    let command_timeout = worker_ready_command_timeout(timeout)?;
     match client.vm_exec(command, vec![], None, Some(command_timeout), None) {
         Ok((0, _, _)) => Ok(()),
         Ok((44, _, _)) => Err(Error::agent(
@@ -1607,6 +1628,14 @@ mod tests {
             .unwrap();
         assert_eq!(timeout.status.code(), Some(44));
         assert!(!script.contains(expected));
+    }
+
+    #[test]
+    fn worker_ready_transport_deadline_allows_poll_loop_overhead() {
+        assert_eq!(
+            worker_ready_command_timeout(Duration::from_secs(120)).unwrap(),
+            Duration::from_secs(150)
+        );
     }
 
     #[test]

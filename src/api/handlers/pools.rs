@@ -1042,6 +1042,15 @@ fn validate_lease_batch(leases: &[AcquireForkLeaseRequest]) -> Result<(), ApiErr
             "idempotencyKey '{duplicate}' is duplicated within the lease batch"
         )));
     }
+    let readiness_waiters = leases
+        .iter()
+        .filter(|lease| lease.await_worker_ready)
+        .count();
+    if readiness_waiters > MAX_CONCURRENT_LEASE_ACTIVATIONS {
+        return Err(ApiError::BadRequest(format!(
+            "at most {MAX_CONCURRENT_LEASE_ACTIVATIONS} batch items may set awaitWorkerReady=true"
+        )));
+    }
     Ok(())
 }
 
@@ -1238,6 +1247,21 @@ mod tests {
             .collect::<Vec<_>>();
         let error = validate_lease_batch(&oversized).unwrap_err();
         assert!(bad_request(error).contains("between 1 and 256"));
+
+        let readiness_waiters = (0..=MAX_CONCURRENT_LEASE_ACTIVATIONS)
+            .map(|index| AcquireForkLeaseRequest {
+                await_worker_ready: true,
+                ..lease_request(&format!("ready-{index}"))
+            })
+            .collect::<Vec<_>>();
+        let error = validate_lease_batch(&readiness_waiters).unwrap_err();
+        assert!(bad_request(error).contains("at most 32 batch items"));
+
+        let bounded_readiness_waiters = readiness_waiters
+            .into_iter()
+            .take(MAX_CONCURRENT_LEASE_ACTIVATIONS)
+            .collect::<Vec<_>>();
+        assert!(validate_lease_batch(&bounded_readiness_waiters).is_ok());
     }
 
     #[test]

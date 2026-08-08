@@ -996,7 +996,9 @@ pub struct AcquireForkLeaseRequest {
     /// Keep the lease activating until the workload calls `smolvm-worker-ready`.
     #[serde(default)]
     pub await_worker_ready: bool,
-    /// Optional readiness timeout in seconds; defaults to 240 when enabled.
+    /// Optional readiness timeout in seconds; defaults to 240 when enabled. The
+    /// acquisition request can remain open for this duration, so clients must use
+    /// a longer request deadline.
     #[serde(default)]
     pub worker_ready_timeout_secs: Option<u64>,
     /// Optional fused-rollout access granted only to this lease's executor and policy.
@@ -1008,7 +1010,8 @@ pub struct AcquireForkLeaseRequest {
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct AcquireForkLeaseBatchRequest {
-    /// Independent lease requests. Each item retains its normal idempotency semantics.
+    /// Independent lease requests. Each item retains its normal idempotency semantics;
+    /// at most 32 items may wait for workload readiness in one call.
     pub leases: Vec<AcquireForkLeaseRequest>,
 }
 

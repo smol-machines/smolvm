@@ -12,6 +12,9 @@ pub const READY_VERSION: &str = "smolvm-forkpoint-v1";
 /// Optional readiness-marker capability requesting eager clone module loading.
 pub const CUDA_PRELOAD_MODULES_HINT: &str = "cuda-preload-modules";
 
+/// Agent capability required by readiness-gated fork-pool leases.
+pub const WORKER_READY_CAPABILITY: &str = "fork-worker-ready-v1";
+
 /// Marker written after a restored clone can safely enter ordinary timed waits.
 pub const RESTORED_PATH: &str = "/run/smolvm/forkpoint/restored";
 

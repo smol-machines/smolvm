@@ -2078,6 +2078,7 @@ fn handle_request(
     match request {
         AgentRequest::Ping => AgentResponse::Pong {
             version: PROTOCOL_VERSION,
+            capabilities: vec![smolvm_protocol::forkpoint::WORKER_READY_CAPABILITY.to_string()],
         },
 
         AgentRequest::FsNotify { events } => handle_fsnotify(&events),

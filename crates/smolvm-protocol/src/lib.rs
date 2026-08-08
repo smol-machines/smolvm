@@ -652,6 +652,9 @@ pub enum AgentResponse {
     Pong {
         /// Protocol version.
         version: u32,
+        /// Optional agent features that can evolve independently of the base protocol.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        capabilities: Vec<String>,
     },
 
     /// Progress update (for long operations like pull).
@@ -1314,9 +1317,21 @@ mod tests {
     fn test_agent_response_serialization() {
         let resp = AgentResponse::Pong {
             version: PROTOCOL_VERSION,
+            capabilities: vec![forkpoint::WORKER_READY_CAPABILITY.to_string()],
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("pong"));
+        assert!(json.contains(forkpoint::WORKER_READY_CAPABILITY));
+
+        let legacy: AgentResponse =
+            serde_json::from_str(r#"{"status":"pong","version":1}"#).unwrap();
+        assert!(matches!(
+            legacy,
+            AgentResponse::Pong {
+                version: PROTOCOL_VERSION,
+                capabilities
+            } if capabilities.is_empty()
+        ));
 
         let resp = AgentResponse::Progress {
             message: "Pulling layer 1/3".to_string(),

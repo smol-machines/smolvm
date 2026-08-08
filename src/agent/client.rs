@@ -586,15 +586,14 @@ impl AgentClient {
         self.receive()
     }
 
-    /// Ping the helper daemon and validate the protocol version.
-    ///
-    /// Returns the agent's protocol version. Logs a warning if the version
-    /// doesn't match the host's expected version.
-    pub fn ping(&mut self) -> Result<u32> {
+    fn ping_info(&mut self) -> Result<(u32, Vec<String>)> {
         let resp = self.request(&AgentRequest::Ping)?;
 
         match resp {
-            AgentResponse::Pong { version } => {
+            AgentResponse::Pong {
+                version,
+                capabilities,
+            } => {
                 if version != PROTOCOL_VERSION {
                     tracing::warn!(
                         host_version = PROTOCOL_VERSION,
@@ -602,11 +601,28 @@ impl AgentClient {
                         "protocol version mismatch — agent may be outdated or newer than host"
                     );
                 }
-                Ok(version)
+                Ok((version, capabilities))
             }
             AgentResponse::Error { message, .. } => Err(Error::agent("ping", message)),
             _ => Err(Error::agent("ping", "unexpected response type")),
         }
+    }
+
+    /// Ping the helper daemon and validate the protocol version.
+    ///
+    /// Returns the agent's protocol version. Logs a warning if the version
+    /// doesn't match the host's expected version.
+    pub fn ping(&mut self) -> Result<u32> {
+        self.ping_info().map(|(version, _)| version)
+    }
+
+    /// Return whether the live guest agent advertises an optional feature.
+    pub fn supports_capability(&mut self, capability: &str) -> Result<bool> {
+        self.ping_info().map(|(_, capabilities)| {
+            capabilities
+                .iter()
+                .any(|advertised| advertised == capability)
+        })
     }
 
     /// Replay host-originated filesystem changes into the guest as fsnotify
@@ -2357,7 +2373,11 @@ mod read_cap_tests {
 
     #[test]
     fn read_cap_rejects_unexpected_response_type() {
-        let err = drive(vec![AgentResponse::Pong { version: 1 }]).unwrap_err();
+        let err = drive(vec![AgentResponse::Pong {
+            version: 1,
+            capabilities: vec![],
+        }])
+        .unwrap_err();
         assert!(format!("{}", err).contains("unexpected response"));
     }
 }
