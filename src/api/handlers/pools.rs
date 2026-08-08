@@ -5,14 +5,17 @@ use axum::{
     Json,
 };
 use base64::Engine as _;
+use futures_util::{stream, StreamExt};
 use sha2::{Digest, Sha256};
 use std::{sync::Arc, time::Duration};
 
 use crate::api::error::ApiError;
 use crate::api::state::ApiState;
 use crate::api::types::{
-    AcquireForkLeaseRequest, ApiErrorResponse, CreateForkPoolRequest, DeleteForkPoolQuery,
-    DeleteResponse, ForkLeaseInfo, ForkPoolInfo, ListForkPoolsResponse, ResizeForkPoolRequest,
+    AcquireForkLeaseBatchRequest, AcquireForkLeaseBatchResponse, AcquireForkLeaseRequest,
+    ApiErrorResponse, CreateForkPoolRequest, DeleteForkPoolQuery, DeleteResponse,
+    ForkLeaseBatchItemResponse, ForkLeaseInfo, ForkPoolInfo, ListForkPoolsResponse,
+    ResizeForkPoolRequest,
 };
 use crate::data::validate_vm_name;
 use crate::db::ForkPoolSlotClaim;
@@ -27,6 +30,8 @@ const MAX_POOL_READY: u32 = 256;
 const MIN_LEASE_TTL_SECS: u64 = 30;
 const MAX_LEASE_TTL_SECS: u64 = 24 * 60 * 60;
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
+const MAX_LEASE_BATCH_SIZE: usize = MAX_POOL_READY as usize;
+const MAX_CONCURRENT_LEASE_ACTIVATIONS: usize = 32;
 const MAX_LEASE_PAYLOAD_FILES: usize = 32;
 const MAX_LEASE_PAYLOAD_BYTES: usize = 1024 * 1024;
 const MAX_LEASE_PAYLOAD_PATH_BYTES: usize = 512;
@@ -773,6 +778,14 @@ pub async fn acquire_lease(
     Path(pool_name): Path<String>,
     Json(req): Json<AcquireForkLeaseRequest>,
 ) -> Result<Json<ForkLeaseInfo>, ApiError> {
+    Ok(Json(acquire_lease_inner(state, pool_name, req).await?))
+}
+
+async fn acquire_lease_inner(
+    state: Arc<ApiState>,
+    pool_name: String,
+    req: AcquireForkLeaseRequest,
+) -> Result<ForkLeaseInfo, ApiError> {
     if req.idempotency_key.is_empty()
         || req.idempotency_key.len() > MAX_IDEMPOTENCY_KEY_BYTES
         || req.idempotency_key.chars().any(char::is_control)
@@ -887,7 +900,7 @@ pub async fn acquire_lease(
             } else {
                 lease
             };
-            return Ok(Json(lease_info(lease)));
+            return Ok(lease_info(lease));
         }
         ClaimForkPoolSlot::NoReadySlot => {
             return Err(ApiError::Unavailable(format!(
@@ -945,7 +958,105 @@ pub async fn acquire_lease(
     // staging and any requested worker-readiness wait complete. Starting
     // replacement VMs earlier can starve the held workers' control channels.
     state.notify_pool_reconcile();
-    Ok(Json(lease_info(active)))
+    Ok(lease_info(active))
+}
+
+/// Acquire and activate a bounded group of independently idempotent workers.
+#[utoipa::path(
+    post,
+    path = "/api/v1/pools/{name}/lease-batches",
+    tag = "Pools",
+    params(("name" = String, Path, description = "Pool name")),
+    request_body = AcquireForkLeaseBatchRequest,
+    responses(
+        (status = 200, description = "Ordered per-request lease results", body = AcquireForkLeaseBatchResponse),
+        (status = 400, description = "Invalid or oversized batch", body = ApiErrorResponse)
+    )
+)]
+pub async fn acquire_lease_batch(
+    State(state): State<Arc<ApiState>>,
+    Path(pool_name): Path<String>,
+    Json(req): Json<AcquireForkLeaseBatchRequest>,
+) -> Result<Json<AcquireForkLeaseBatchResponse>, ApiError> {
+    validate_lease_batch(&req.leases)?;
+    metrics::counter!("smolvm_fork_lease_batches_total").increment(1);
+    metrics::histogram!("smolvm_fork_lease_batch_size").record(req.leases.len() as f64);
+
+    let mut results = stream::iter(req.leases.into_iter().enumerate().map(|(index, request)| {
+        let state = state.clone();
+        let pool_name = pool_name.clone();
+        async move {
+            let idempotency_key = request.idempotency_key.clone();
+            let result = match acquire_lease_inner(state, pool_name, request).await {
+                Ok(lease) => ForkLeaseBatchItemResponse {
+                    idempotency_key,
+                    lease: Some(lease),
+                    error_code: None,
+                    error: None,
+                },
+                Err(error) => {
+                    let (error_code, error) = lease_batch_error(error);
+                    ForkLeaseBatchItemResponse {
+                        idempotency_key,
+                        lease: None,
+                        error_code: Some(error_code.into()),
+                        error: Some(error),
+                    }
+                }
+            };
+            (index, result)
+        }
+    }))
+    .buffer_unordered(MAX_CONCURRENT_LEASE_ACTIVATIONS)
+    .collect::<Vec<_>>()
+    .await;
+    results.sort_unstable_by_key(|(index, _)| *index);
+    let leases = results
+        .into_iter()
+        .map(|(_, result)| result)
+        .collect::<Vec<_>>();
+    let succeeded = leases
+        .iter()
+        .filter(|result| result.lease.is_some())
+        .count();
+    metrics::counter!("smolvm_fork_lease_batch_items_total", "status" => "succeeded")
+        .increment(succeeded as u64);
+    metrics::counter!("smolvm_fork_lease_batch_items_total", "status" => "failed")
+        .increment((leases.len() - succeeded) as u64);
+    Ok(Json(AcquireForkLeaseBatchResponse { leases }))
+}
+
+fn validate_lease_batch(leases: &[AcquireForkLeaseRequest]) -> Result<(), ApiError> {
+    if leases.is_empty() || leases.len() > MAX_LEASE_BATCH_SIZE {
+        return Err(ApiError::BadRequest(format!(
+            "leases must contain between 1 and {MAX_LEASE_BATCH_SIZE} items"
+        )));
+    }
+    let mut keys = std::collections::HashSet::with_capacity(leases.len());
+    if let Some(duplicate) = leases
+        .iter()
+        .map(|lease| lease.idempotency_key.as_str())
+        .find(|key| !keys.insert((*key).to_string()))
+    {
+        return Err(ApiError::BadRequest(format!(
+            "idempotencyKey '{duplicate}' is duplicated within the lease batch"
+        )));
+    }
+    Ok(())
+}
+
+fn lease_batch_error(error: ApiError) -> (&'static str, String) {
+    match error {
+        ApiError::Unauthorized(message) => ("UNAUTHORIZED", message),
+        ApiError::Forbidden(message) => ("FORBIDDEN", message),
+        ApiError::NotFound(message) => ("NOT_FOUND", message),
+        ApiError::Conflict(message) => ("CONFLICT", message),
+        ApiError::PortConflict(message) => ("PORT_IN_USE", message),
+        ApiError::BadRequest(message) => ("BAD_REQUEST", message),
+        ApiError::Timeout => ("TIMEOUT", "request timed out".into()),
+        ApiError::Unavailable(message) => ("UNAVAILABLE", message),
+        ApiError::Internal(message) => ("INTERNAL_ERROR", message),
+    }
 }
 
 /// Get one lease's durable state.
@@ -1088,7 +1199,7 @@ pub async fn complete_lease(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::types::ForkLeasePayloadFile;
+    use crate::api::types::{ForkLeasePayloadFile, RolloutLeaseAccess};
 
     fn payload(path: &str, data: &[u8], mode: Option<u32>) -> ForkLeasePayloadFile {
         ForkLeasePayloadFile {
@@ -1103,6 +1214,115 @@ mod tests {
             ApiError::BadRequest(message) => message,
             other => panic!("expected bad request, got {other:?}"),
         }
+    }
+
+    fn lease_request(idempotency_key: &str) -> AcquireForkLeaseRequest {
+        AcquireForkLeaseRequest {
+            idempotency_key: idempotency_key.into(),
+            env: Vec::new(),
+            files: Vec::new(),
+            ttl_secs: None,
+            await_worker_ready: false,
+            worker_ready_timeout_secs: None,
+            rollout_access: None,
+        }
+    }
+
+    #[test]
+    fn lease_batch_requires_a_bounded_nonempty_group() {
+        let error = validate_lease_batch(&[]).unwrap_err();
+        assert!(bad_request(error).contains("between 1 and 256"));
+
+        let oversized = (0..=MAX_LEASE_BATCH_SIZE)
+            .map(|index| lease_request(&format!("request-{index}")))
+            .collect::<Vec<_>>();
+        let error = validate_lease_batch(&oversized).unwrap_err();
+        assert!(bad_request(error).contains("between 1 and 256"));
+    }
+
+    #[test]
+    fn lease_batch_rejects_duplicate_retry_keys_before_claiming() {
+        let error =
+            validate_lease_batch(&[lease_request("same"), lease_request("same")]).unwrap_err();
+        assert!(bad_request(error).contains("'same' is duplicated"));
+        assert!(validate_lease_batch(&[lease_request("first"), lease_request("second"),]).is_ok());
+    }
+
+    #[test]
+    fn lease_batch_error_codes_match_the_public_api() {
+        let cases = [
+            (ApiError::BadRequest("bad".into()), "BAD_REQUEST", "bad"),
+            (ApiError::Conflict("busy".into()), "CONFLICT", "busy"),
+            (
+                ApiError::Unavailable("empty".into()),
+                "UNAVAILABLE",
+                "empty",
+            ),
+            (ApiError::Timeout, "TIMEOUT", "request timed out"),
+        ];
+        for (error, expected_code, expected_message) in cases {
+            let (code, message) = lease_batch_error(error);
+            assert_eq!(code, expected_code);
+            assert_eq!(message, expected_message);
+        }
+    }
+
+    #[test]
+    fn lease_batch_request_debug_redacts_nested_payloads() {
+        let request = AcquireForkLeaseBatchRequest {
+            leases: vec![AcquireForkLeaseRequest {
+                files: vec![payload("job.json", b"private-job-data", None)],
+                rollout_access: Some(RolloutLeaseAccess {
+                    executor: "rollouts".into(),
+                    policy: "policy-a".into(),
+                }),
+                ..lease_request("request-1")
+            }],
+        };
+        let shown = format!("{request:?}");
+        assert!(!shown.contains("private-job-data"));
+        assert!(shown.contains("<redacted>"));
+    }
+
+    #[tokio::test]
+    async fn lease_batch_preserves_input_order_for_independent_failures() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let db = crate::db::SmolvmDb::open_at(&directory.path().join("test.db")).unwrap();
+        let state = Arc::new(ApiState::with_db(db));
+        let response = acquire_lease_batch(
+            State(state),
+            Path("missing-pool".into()),
+            Json(AcquireForkLeaseBatchRequest {
+                leases: vec![
+                    lease_request("first"),
+                    lease_request("second"),
+                    lease_request("third"),
+                ],
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert_eq!(
+            response
+                .leases
+                .iter()
+                .map(|item| item.idempotency_key.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second", "third"]
+        );
+        assert!(
+            response.leases.iter().all(|item| {
+                item.lease.is_none()
+                    && item.error_code.as_deref() == Some("NOT_FOUND")
+                    && item.error.as_deref().is_some_and(|message| {
+                        message.contains("fork pool 'missing-pool' not found")
+                    })
+            }),
+            "{:?}",
+            response.leases
+        );
     }
 
     #[test]

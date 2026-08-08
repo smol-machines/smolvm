@@ -1004,6 +1004,39 @@ pub struct AcquireForkLeaseRequest {
     pub rollout_access: Option<RolloutLeaseAccess>,
 }
 
+/// A bounded group of ordinary fork-pool lease requests.
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AcquireForkLeaseBatchRequest {
+    /// Independent lease requests. Each item retains its normal idempotency semantics.
+    pub leases: Vec<AcquireForkLeaseRequest>,
+}
+
+/// One ordered result from a fork-pool lease batch.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ForkLeaseBatchItemResponse {
+    /// Retry key from the submitted lease request.
+    pub idempotency_key: String,
+    /// Activated worker lease when acquisition succeeded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease: Option<ForkLeaseInfo>,
+    /// Stable API error category when this item failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    /// Human-readable failure for this item.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Ordered results from a bounded fork-pool lease batch.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AcquireForkLeaseBatchResponse {
+    /// One result per submitted lease request, in input order.
+    pub leases: Vec<ForkLeaseBatchItemResponse>,
+}
+
 /// Least-privilege fused-rollout scope injected into one pool worker.
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]

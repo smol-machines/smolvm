@@ -106,6 +106,7 @@ use state::ApiState;
         handlers::pools::resize_pool,
         handlers::pools::delete_pool,
         handlers::pools::acquire_lease,
+        handlers::pools::acquire_lease_batch,
         handlers::pools::get_lease,
         handlers::pools::heartbeat_lease,
         handlers::pools::complete_lease,
@@ -141,6 +142,7 @@ use state::ApiState;
         types::CreateForkPoolRequest,
         types::DeleteForkPoolQuery,
         types::AcquireForkLeaseRequest,
+        types::AcquireForkLeaseBatchRequest,
         types::RolloutLeaseAccess,
         types::ForkLeasePayloadFile,
         types::ResizeForkPoolRequest,
@@ -170,6 +172,8 @@ use state::ApiState;
         types::ForkPoolInfo,
         types::ListForkPoolsResponse,
         types::ForkLeaseInfo,
+        types::ForkLeaseBatchItemResponse,
+        types::AcquireForkLeaseBatchResponse,
         rollout::RolloutExecutorInfo,
         rollout::RolloutPolicyInfo,
         rollout::RolloutCompletion,
@@ -302,6 +306,10 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .route("/{name}", delete(handlers::pools::delete_pool))
         .route("/{name}/size", put(handlers::pools::resize_pool))
         .route("/{name}/leases", post(handlers::pools::acquire_lease))
+        .route(
+            "/{name}/lease-batches",
+            post(handlers::pools::acquire_lease_batch),
+        )
         .route("/{name}/leases/{lease}", get(handlers::pools::get_lease))
         .route(
             "/{name}/leases/{lease}/heartbeat",
