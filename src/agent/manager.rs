@@ -22,6 +22,17 @@ use super::{HostMount, PortMapping, VmResources};
 
 /// Timeout for the agent to become ready after starting.
 const AGENT_READY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Restored CUDA clones resume an already-initialized agent accept loop. If it
+/// does not answer within this window, the restore is wedged rather than cold-booting.
+const CLONE_AGENT_READY_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn agent_ready_timeout(is_cuda_clone: bool) -> Duration {
+    if is_cuda_clone {
+        CLONE_AGENT_READY_TIMEOUT
+    } else {
+        AGENT_READY_TIMEOUT
+    }
+}
 
 // Re-use shared polling constants from process module.
 use crate::process::FAST_POLL_INTERVAL;
@@ -177,6 +188,9 @@ struct AgentInner {
     /// the flag without a process-global env var (unsafe in the multithreaded
     /// `serve` process where concurrent forks would race).
     is_clone: bool,
+    /// True when the restored clone also remotes CUDA. CUDA pool clones resume
+    /// an already-hot agent and use a shorter stuck-restore deadline.
+    is_cuda_clone: bool,
     /// Held while the VM is running. Released on stop/Drop to allow other
     /// processes to start the VM. The kernel releases the lock automatically
     /// if the process crashes.
@@ -666,6 +680,7 @@ impl AgentManager {
                 config_state: ConfigState::Unknown,
                 detached: false,
                 is_clone: false,
+                is_cuda_clone: false,
                 #[cfg(unix)]
                 vm_lock_handle: None,
             })),
@@ -1771,6 +1786,8 @@ impl AgentManager {
         // `std::env::set_var`. A process-global env var is a data race in the
         // multithreaded `serve` process, where concurrent forks would clobber
         // each other (and `set_var` is `unsafe` in edition 2024 for that reason).
+        let fork_clone = features.snapshot_dir.is_some();
+        let cuda_clone = fork_clone && (features.cuda || resources_for_config.cuda);
         let fork_env: Vec<(&str, String)> = {
             let mut v = Vec::new();
             if features.forkable {
@@ -1810,8 +1827,6 @@ impl AgentManager {
             if let Some(limit_mib) = features.cuda_vram_limit_mib {
                 v.push(("SMOLVM_CUDA_VRAM_LIMIT_MB", limit_mib.to_string()));
             }
-            let fork_clone = features.snapshot_dir.is_some();
-            let cuda_clone = fork_clone && (features.cuda || resources_for_config.cuda);
             // Some KVM kernels return a spurious ENOMEM while a signalled vCPU
             // enters KVM. Keep the first-entry delay specific to one-vCPU
             // guests, but enable bounded retries for fork bases and clones;
@@ -1868,7 +1883,11 @@ impl AgentManager {
             }
             v
         };
-        self.inner.lock().is_clone = features.snapshot_dir.is_some();
+        {
+            let mut inner = self.inner.lock();
+            inner.is_clone = fork_clone;
+            inner.is_cuda_clone = cuda_clone;
+        }
 
         // Per-VM uid isolation: when running privileged (root `serve`), give this
         // VMM its own dedicated, collision-free unprivileged uid so a guest→VMM
@@ -2584,15 +2603,18 @@ impl AgentManager {
     /// Polling at 1ms for the first second to give sub-poll-interval resolution
     /// for boot timing experiments. Falls back to 5ms after 1 second.
     fn wait_for_ready(&self) -> Result<()> {
-        let timeout = AGENT_READY_TIMEOUT;
+        // Fork clone: the guest resumes past boot, so it never (re)writes the
+        // `.smolvm-ready` marker. Detect readiness by pinging the restored agent
+        // directly (it is already in its accept loop) — no marker, no grace.
+        let (is_clone, is_cuda_clone) = {
+            let inner = self.inner.lock();
+            (inner.is_clone, inner.is_cuda_clone)
+        };
+        let timeout = agent_ready_timeout(is_cuda_clone);
         let start = Instant::now();
 
         tracing::debug!("waiting for agent to be ready");
 
-        // Fork clone: the guest resumes past boot, so it never (re)writes the
-        // `.smolvm-ready` marker. Detect readiness by pinging the restored agent
-        // directly (it is already in its accept loop) — no marker, no grace.
-        let is_clone = self.inner.lock().is_clone;
         if is_clone {
             while start.elapsed() < timeout {
                 {
@@ -2896,6 +2918,12 @@ fn boot_failure_reason(exit_code: Option<i32>, startup_log: Option<&str>) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restored_cuda_clones_fail_faster_than_other_boots() {
+        assert_eq!(agent_ready_timeout(true), Duration::from_secs(10));
+        assert_eq!(agent_ready_timeout(false), Duration::from_secs(30));
+    }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
