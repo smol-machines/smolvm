@@ -141,12 +141,28 @@ install_packages_apk_static() {
     # are aarch64 ELF binaries that the host kernel can't exec, causing exit
     # code 127. The minirootfs already ships busybox symlinks, and seatd runs
     # as root in the VM so the 'seat' group creation is not required.
-    /tmp/apk-static/sbin/apk.static \
+    local -a APK_STATIC_COMMAND=(/tmp/apk-static/sbin/apk.static)
+    local -a APK_STATIC_OWNERSHIP_ARGS=()
+    if [[ "$EUID" != "0" ]]; then
+        # apk reconciles package directory ownership even with --no-chown. In
+        # an ordinary user namespace, uid 0 maps back to the invoking user, so
+        # both file and directory metadata can be installed without spurious
+        # EPERM diagnostics or privileged host writes.
+        if command -v unshare &> /dev/null \
+            && unshare --user --map-root-user true 2>/dev/null; then
+            APK_STATIC_COMMAND=(unshare --user --map-root-user "${APK_STATIC_COMMAND[@]}")
+            APK_STATIC_OWNERSHIP_ARGS=(--no-chown)
+        else
+            echo "Warning: user namespaces are unavailable; apk may report ownership errors and retain invoking-user ownership"
+        fi
+    fi
+    "${APK_STATIC_COMMAND[@]}" \
         --root "$OUTPUT_DIR" \
         --initdb \
         --no-cache \
         --allow-untrusted \
         --no-scripts \
+        "${APK_STATIC_OWNERSHIP_ARGS[@]}" \
         --arch "$ALPINE_ARCH" \
         add $APK_PACKAGES
     echo "Packages installed successfully"
@@ -290,8 +306,7 @@ fi
 # Install the agent binary into the rootfs (if we have one)
 if [[ -n "${AGENT_BINARY:-}" ]] && [[ -f "${AGENT_BINARY}" ]]; then
     echo "Installing smolvm-agent binary..."
-    cp "$AGENT_BINARY" "$OUTPUT_DIR/usr/local/bin/smolvm-agent"
-    chmod +x "$OUTPUT_DIR/usr/local/bin/smolvm-agent"
+    install -m 0755 "$AGENT_BINARY" "$OUTPUT_DIR/usr/local/bin/smolvm-agent"
 elif [[ "$NO_BUILD_AGENT" != "1" ]]; then
     echo "Error: smolvm-agent binary not found at ${AGENT_BINARY:-<unset>}"
     exit 1
@@ -301,8 +316,7 @@ fi
 # means the image ships without it; CUDA is opt-in via `machine create --cuda`).
 if [[ -n "${CUDA_GUEST_BINARY:-}" ]] && [[ -f "${CUDA_GUEST_BINARY}" ]]; then
     echo "Installing smolvm-cuda-run binary..."
-    cp "$CUDA_GUEST_BINARY" "$OUTPUT_DIR/usr/local/bin/smolvm-cuda-run"
-    chmod +x "$OUTPUT_DIR/usr/local/bin/smolvm-cuda-run"
+    install -m 0755 "$CUDA_GUEST_BINARY" "$OUTPUT_DIR/usr/local/bin/smolvm-cuda-run"
 fi
 
 # CUDA guest shims: glibc cdylibs the agent bind-mounts into workload
