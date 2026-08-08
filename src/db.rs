@@ -78,8 +78,8 @@ const POOL_MAX_CONNS: usize = 8;
 
 /// A small fixed-capacity pool of SQLite connections to the same database file.
 ///
-/// Each connection is opened with the WAL pragmas + `busy_timeout`, so multiple
-/// readers proceed in parallel and a writer only blocks other *writers*. A
+/// Each connection is opened read-only at the SQL layer with `busy_timeout`, so
+/// multiple readers proceed in parallel and a writer only blocks other *writers*. A
 /// connection is checked out for the duration of one `with_conn` closure and
 /// returned on drop (discarded if the closure panicked, so a half-applied
 /// statement can't be handed to the next caller). Checkout blocks only when all
@@ -121,7 +121,7 @@ impl ConnPool {
             if inner.open < POOL_MAX_CONNS {
                 inner.open += 1;
                 drop(inner);
-                match SmolvmDb::open_connection(&self.path) {
+                match SmolvmDb::open_reader_connection(&self.path) {
                     Ok(conn) => return Ok(conn),
                     Err(e) => {
                         // Roll back the reservation and let a waiter retry.
@@ -186,13 +186,15 @@ impl<T, E: std::fmt::Display> DbResultExt<T> for std::result::Result<T, E> {
 /// small pool of separate connections that run concurrently under WAL. A reader
 /// therefore never waits on the writer, so a stalled write can no longer park the
 /// async reactor that serves the liveness probes (the single-`Mutex<Connection>`
-/// failure mode; see `tests/reactor_wedge.rs`). Connections open lazily.
+/// failure mode; see `tests/reactor_wedge.rs`). The writer opens eagerly so WAL
+/// and schema initialization finish before read connections can fan out.
 /// Cross-process concurrency is still handled by WAL + busy_timeout.
 #[derive(Clone)]
 pub struct SmolvmDb {
     path: PathBuf,
     /// Single connection serializing writes (and the rare read that must observe
-    /// its own just-committed write on the same connection). Opened on first use.
+    /// its own just-committed write on the same connection). Opened eagerly so
+    /// WAL and schema initialization precede concurrent reads.
     writer: Arc<Mutex<Option<Connection>>>,
     /// Pool of connections for concurrent reads. Never used for writes.
     readers: Arc<ConnPool>,
@@ -209,7 +211,7 @@ impl std::fmt::Debug for SmolvmDb {
 }
 
 impl SmolvmDb {
-    /// Run a closure with the single writer connection, opening it on first use.
+    /// Run a closure with the single writer connection, reopening it if needed.
     /// Serializes all writers in-process so they never collide at the SQLite
     /// write lock. Use for every mutation (and any read that must see a write it
     /// just made on this connection).
@@ -219,7 +221,7 @@ impl SmolvmDb {
     {
         let mut guard = self.writer.lock();
         if guard.is_none() {
-            *guard = Some(Self::open_connection(&self.path)?);
+            *guard = Some(Self::open_writer_connection(&self.path)?);
         }
         f(guard.as_mut().expect("writer connection present"))
     }
@@ -240,16 +242,20 @@ impl SmolvmDb {
         f(guard.conn.as_mut().expect("reader connection present"))
     }
 
-    /// Open the SQLite connection, configure pragmas, and ensure tables exist.
-    fn open_connection(path: &Path) -> Result<Connection> {
+    /// Open the serialized writer, configure WAL, and ensure tables exist.
+    fn open_writer_connection(path: &Path) -> Result<Connection> {
         let conn = Connection::open(path)
             .map_err(|e| Error::database_unavailable(format!("open database: {}", e)))?;
 
+        // Install the busy handler before any pragma or schema statement that
+        // may need SQLite's write lock. Reader connections open lazily and can
+        // arrive as a burst, so setting this after `journal_mode=WAL` allowed
+        // first-use concurrency to fail immediately with SQLITE_BUSY.
+        conn.busy_timeout(BUSY_TIMEOUT).db_err("set busy_timeout")?;
         // WAL lets readers and writers overlap across processes; synchronous=NORMAL
         // is safe under WAL and significantly faster than the default FULL.
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
             .db_err("configure pragmas")?;
-        conn.busy_timeout(BUSY_TIMEOUT).db_err("set busy_timeout")?;
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS vms (
@@ -298,27 +304,42 @@ impl SmolvmDb {
         Ok(conn)
     }
 
+    /// Open one pooled reader after the eager writer initialized WAL and schema.
+    fn open_reader_connection(path: &Path) -> Result<Connection> {
+        let conn = Connection::open(path)
+            .map_err(|e| Error::database_unavailable(format!("open database reader: {e}")))?;
+        conn.busy_timeout(BUSY_TIMEOUT)
+            .db_err("set reader busy_timeout")?;
+        // Reader setup must not repeat journal-mode or schema writes. Bursts of
+        // first-use reads otherwise race each other before the pool has idle
+        // connections to reuse. query_only also enforces the pool contract.
+        conn.execute_batch("PRAGMA query_only=ON; PRAGMA synchronous=NORMAL;")
+            .db_err("configure reader pragmas")?;
+        Ok(conn)
+    }
+
     /// Open the database at the default location.
     ///
     /// Default path: `~/Library/Application Support/smolvm/server/smolvm.db` (macOS)
     /// or `~/.local/share/smolvm/server/smolvm.db` (Linux)
     ///
-    /// If the database doesn't exist, it will be created.
+    /// If the database doesn't exist, it will be created and initialized.
     pub fn open() -> Result<Self> {
         let path = Self::default_path()?;
         Self::open_at(&path)
     }
 
-    /// Open the database at a specific path. Parent directories are created
-    /// if missing; the connection itself is opened lazily on first use.
+    /// Open the database at a specific path. Parent directories are created if
+    /// missing; WAL and tables are initialized before this returns.
     pub fn open_at(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).db_err("create directory")?;
         }
 
+        let writer = Self::open_writer_connection(path)?;
         Ok(Self {
             path: path.to_path_buf(),
-            writer: Arc::new(Mutex::new(None)),
+            writer: Arc::new(Mutex::new(Some(writer))),
             readers: Arc::new(ConnPool::new(path.to_path_buf())),
         })
     }
@@ -333,8 +354,7 @@ impl SmolvmDb {
 
     /// Initialize database tables.
     ///
-    /// Tables are created automatically when the connection opens, so this
-    /// just forces the connection open. Retained for API compatibility.
+    /// Tables are initialized eagerly by `open_at`; retained for API compatibility.
     pub fn init_tables(&self) -> Result<()> {
         self.with_conn(|_| Ok(()))
     }
@@ -2128,6 +2148,38 @@ mod tests {
 
         let vms = db.list_vms().unwrap();
         assert_eq!(vms.len(), 10);
+    }
+
+    #[test]
+    fn fresh_reader_burst_does_not_race_database_initialization() {
+        let (_dir, db) = temp_db();
+        let start = Arc::new(std::sync::Barrier::new(POOL_MAX_CONNS));
+        let readers = (0..POOL_MAX_CONNS)
+            .map(|_| {
+                let db = db.clone();
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    db.with_read_conn(|conn| {
+                        let missing: Option<Vec<u8>> = conn
+                            .query_row(
+                                "SELECT data FROM vms WHERE name = 'not-present'",
+                                [],
+                                |row| row.get(0),
+                            )
+                            .optional()
+                            .db_err("read absent VM during connection burst")?;
+                        assert!(missing.is_none());
+                        std::thread::sleep(Duration::from_millis(50));
+                        Ok(())
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for reader in readers {
+            reader.join().unwrap().unwrap();
+        }
     }
 
     #[test]
