@@ -1393,9 +1393,6 @@ pub fn setup_pack_idmap_mount(
     }
 
     // Move the now-idmapped tree onto the per-VM mountpoint.
-    // MOVE_MOUNT_F_EMPTY_PATH is a kernel-internal flag the libc crate no
-    // longer exports; its value is stable ABI (0x4).
-    const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 0x4;
     let rc = unsafe {
         libc::syscall(
             libc::SYS_move_mount,
@@ -1403,7 +1400,7 @@ pub fn setup_pack_idmap_mount(
             c"".as_ptr(),
             libc::AT_FDCWD,
             target_c.as_ptr(),
-            MOVE_MOUNT_F_EMPTY_PATH,
+            libc::MOVE_MOUNT_F_EMPTY_PATH as libc::c_uint,
         )
     };
     let result = if rc != 0 { Err(errno()) } else { Ok(()) };
