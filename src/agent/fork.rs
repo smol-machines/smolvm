@@ -310,12 +310,20 @@ pub fn prepare_held_fork(
 /// Freeze a golden once and prepare every requested clone from the same RAM
 /// snapshot. Preparation is transactional: if any clone fails, all clone
 /// records and disks created by this call are removed.
+///
+/// A successful fork leaves the golden paused forever as the copy-on-write base,
+/// so the checkpoint it just took is retained and reused by every later fork of
+/// that same golden process. Without the retain a golden could be forked exactly
+/// once and every call after it failed with "already paused".
 pub fn prepare_forks(
     db: &SmolvmDb,
     golden: &str,
     specs: &[ForkSpec<'_>],
 ) -> Result<Vec<PreparedFork>> {
-    Ok(prepare_forks_reusing(db, golden, specs, None, false)?.forks)
+    let retained = db
+        .retained_fork_snapshot(golden)
+        .map_err(|error| Error::agent("read retained fork checkpoint", error.to_string()))?;
+    Ok(prepare_forks_reusing(db, golden, specs, retained.as_ref(), true)?.forks)
 }
 
 /// Prepare a batch while reusing a proven checkpoint when it still belongs to
@@ -480,9 +488,9 @@ pub(crate) fn prepare_forks_reusing(
                 )
             })
             .and_then(|snapshot| {
-                db.set_fork_pool_snapshot(golden, snapshot)
+                db.set_retained_fork_snapshot(golden, snapshot)
                     .map_err(|error| {
-                        Error::agent("persist fork pool checkpoint", error.to_string())
+                        Error::agent("persist retained fork checkpoint", error.to_string())
                     })
             });
         if let Err(error) = persisted {
@@ -550,8 +558,8 @@ fn rollback_new_snapshot(
         );
     }
     if persisted {
-        if let Err(remove_error) = db.remove_fork_pool_snapshot(golden) {
-            tracing::warn!(%golden, %remove_error, "failed to remove rolled-back fork pool checkpoint");
+        if let Err(remove_error) = db.remove_retained_fork_snapshot(golden) {
+            tracing::warn!(%golden, %remove_error, "failed to remove rolled-back retained fork checkpoint");
         }
     }
     if let Err(remove_error) = std::fs::remove_dir_all(snapshot_dir) {

@@ -44,7 +44,7 @@ impl ForkPoolController {
                 None
             }
         };
-        let retained_snapshots = match state.db().list_fork_pool_snapshots() {
+        let retained_snapshots = match state.db().list_retained_fork_snapshots() {
             Ok(snapshots) => {
                 if !snapshots.is_empty() {
                     tracing::info!(
@@ -239,7 +239,7 @@ impl ForkPoolController {
             let db = self.state.db().clone();
             match tokio::task::spawn_blocking(move || {
                 for golden in stale_snapshots {
-                    if let Err(error) = db.remove_fork_pool_snapshot(&golden) {
+                    if let Err(error) = db.remove_retained_fork_snapshot(&golden) {
                         tracing::warn!(%golden, %error, "failed to remove inactive fork pool checkpoint");
                     }
                 }
