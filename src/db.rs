@@ -78,8 +78,8 @@ const POOL_MAX_CONNS: usize = 8;
 
 /// A small fixed-capacity pool of SQLite connections to the same database file.
 ///
-/// Each connection is opened with the WAL pragmas + `busy_timeout`, so multiple
-/// readers proceed in parallel and a writer only blocks other *writers*. A
+/// Each connection is opened read-only at the SQL layer with `busy_timeout`, so
+/// multiple readers proceed in parallel and a writer only blocks other *writers*. A
 /// connection is checked out for the duration of one `with_conn` closure and
 /// returned on drop (discarded if the closure panicked, so a half-applied
 /// statement can't be handed to the next caller). Checkout blocks only when all
@@ -121,7 +121,7 @@ impl ConnPool {
             if inner.open < POOL_MAX_CONNS {
                 inner.open += 1;
                 drop(inner);
-                match SmolvmDb::open_connection(&self.path) {
+                match SmolvmDb::open_reader_connection(&self.path) {
                     Ok(conn) => return Ok(conn),
                     Err(e) => {
                         // Roll back the reservation and let a waiter retry.
@@ -186,13 +186,15 @@ impl<T, E: std::fmt::Display> DbResultExt<T> for std::result::Result<T, E> {
 /// small pool of separate connections that run concurrently under WAL. A reader
 /// therefore never waits on the writer, so a stalled write can no longer park the
 /// async reactor that serves the liveness probes (the single-`Mutex<Connection>`
-/// failure mode; see `tests/reactor_wedge.rs`). Connections open lazily.
+/// failure mode; see `tests/reactor_wedge.rs`). The writer opens eagerly so WAL
+/// and schema initialization finish before read connections can fan out.
 /// Cross-process concurrency is still handled by WAL + busy_timeout.
 #[derive(Clone)]
 pub struct SmolvmDb {
     path: PathBuf,
     /// Single connection serializing writes (and the rare read that must observe
-    /// its own just-committed write on the same connection). Opened on first use.
+    /// its own just-committed write on the same connection). Opened eagerly so
+    /// WAL and schema initialization precede concurrent reads.
     writer: Arc<Mutex<Option<Connection>>>,
     /// Pool of connections for concurrent reads. Never used for writes.
     readers: Arc<ConnPool>,
@@ -209,7 +211,7 @@ impl std::fmt::Debug for SmolvmDb {
 }
 
 impl SmolvmDb {
-    /// Run a closure with the single writer connection, opening it on first use.
+    /// Run a closure with the single writer connection, reopening it if needed.
     /// Serializes all writers in-process so they never collide at the SQLite
     /// write lock. Use for every mutation (and any read that must see a write it
     /// just made on this connection).
@@ -219,7 +221,7 @@ impl SmolvmDb {
     {
         let mut guard = self.writer.lock();
         if guard.is_none() {
-            *guard = Some(Self::open_connection(&self.path)?);
+            *guard = Some(Self::open_writer_connection(&self.path)?);
         }
         f(guard.as_mut().expect("writer connection present"))
     }
@@ -240,16 +242,20 @@ impl SmolvmDb {
         f(guard.conn.as_mut().expect("reader connection present"))
     }
 
-    /// Open the SQLite connection, configure pragmas, and ensure tables exist.
-    fn open_connection(path: &Path) -> Result<Connection> {
+    /// Open the serialized writer, configure WAL, and ensure tables exist.
+    fn open_writer_connection(path: &Path) -> Result<Connection> {
         let conn = Connection::open(path)
             .map_err(|e| Error::database_unavailable(format!("open database: {}", e)))?;
 
+        // Install the busy handler before any pragma or schema statement that
+        // may need SQLite's write lock. Reader connections open lazily and can
+        // arrive as a burst, so setting this after `journal_mode=WAL` allowed
+        // first-use concurrency to fail immediately with SQLITE_BUSY.
+        conn.busy_timeout(BUSY_TIMEOUT).db_err("set busy_timeout")?;
         // WAL lets readers and writers overlap across processes; synchronous=NORMAL
         // is safe under WAL and significantly faster than the default FULL.
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
             .db_err("configure pragmas")?;
-        conn.busy_timeout(BUSY_TIMEOUT).db_err("set busy_timeout")?;
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS vms (
@@ -298,27 +304,42 @@ impl SmolvmDb {
         Ok(conn)
     }
 
+    /// Open one pooled reader after the eager writer initialized WAL and schema.
+    fn open_reader_connection(path: &Path) -> Result<Connection> {
+        let conn = Connection::open(path)
+            .map_err(|e| Error::database_unavailable(format!("open database reader: {e}")))?;
+        conn.busy_timeout(BUSY_TIMEOUT)
+            .db_err("set reader busy_timeout")?;
+        // Reader setup must not repeat journal-mode or schema writes. Bursts of
+        // first-use reads otherwise race each other before the pool has idle
+        // connections to reuse. query_only also enforces the pool contract.
+        conn.execute_batch("PRAGMA query_only=ON; PRAGMA synchronous=NORMAL;")
+            .db_err("configure reader pragmas")?;
+        Ok(conn)
+    }
+
     /// Open the database at the default location.
     ///
     /// Default path: `~/Library/Application Support/smolvm/server/smolvm.db` (macOS)
     /// or `~/.local/share/smolvm/server/smolvm.db` (Linux)
     ///
-    /// If the database doesn't exist, it will be created.
+    /// If the database doesn't exist, it will be created and initialized.
     pub fn open() -> Result<Self> {
         let path = Self::default_path()?;
         Self::open_at(&path)
     }
 
-    /// Open the database at a specific path. Parent directories are created
-    /// if missing; the connection itself is opened lazily on first use.
+    /// Open the database at a specific path. Parent directories are created if
+    /// missing; WAL and tables are initialized before this returns.
     pub fn open_at(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).db_err("create directory")?;
         }
 
+        let writer = Self::open_writer_connection(path)?;
         Ok(Self {
             path: path.to_path_buf(),
-            writer: Arc::new(Mutex::new(None)),
+            writer: Arc::new(Mutex::new(Some(writer))),
             readers: Arc::new(ConnPool::new(path.to_path_buf())),
         })
     }
@@ -333,8 +354,7 @@ impl SmolvmDb {
 
     /// Initialize database tables.
     ///
-    /// Tables are created automatically when the connection opens, so this
-    /// just forces the connection open. Retained for API compatibility.
+    /// Tables are initialized eagerly by `open_at`; retained for API compatibility.
     pub fn init_tables(&self) -> Result<()> {
         self.with_conn(|_| Ok(()))
     }
@@ -562,6 +582,14 @@ impl SmolvmDb {
                         .db_err(format!("deserialize vm record '{}'", name))?;
                     tx.execute("DELETE FROM vms WHERE name = ?1", params![name])
                         .db_err(format!("remove vm '{}'", name))?;
+                    // A retained checkpoint only means anything while its golden
+                    // process is alive, so it dies with the record rather than
+                    // waiting for a sweep that only the pool controller runs.
+                    tx.execute(
+                        "DELETE FROM fork_pool_snapshots WHERE golden = ?1",
+                        params![name],
+                    )
+                    .db_err(format!("remove retained fork snapshot for '{}'", name))?;
                     Some(r)
                 }
                 None => None,
@@ -706,57 +734,84 @@ impl SmolvmDb {
         })
     }
 
-    /// Durably publish the RAM checkpoint that can refill pools for one golden.
-    pub(crate) fn set_fork_pool_snapshot(
+    /// Durably publish the RAM checkpoint every later fork of this golden reuses.
+    ///
+    /// The `fork_pool_snapshots` table predates plain forks using this and keeps
+    /// its name so no migration is needed; it is not pool-specific.
+    pub(crate) fn set_retained_fork_snapshot(
         &self,
         golden: &str,
         snapshot: &crate::agent::fork::RetainedForkSnapshot,
     ) -> Result<()> {
-        let data = serde_json::to_vec(snapshot).db_err("serialize fork pool snapshot")?;
+        let data = serde_json::to_vec(snapshot).db_err("serialize retained fork snapshot")?;
         self.with_conn(|conn| {
             conn.execute(
                 "INSERT INTO fork_pool_snapshots (golden, data) VALUES (?1, ?2)
                  ON CONFLICT(golden) DO UPDATE SET data = excluded.data",
                 params![golden, data],
             )
-            .db_err(format!("set fork pool snapshot for '{golden}'"))?;
+            .db_err(format!("set retained fork snapshot for '{golden}'"))?;
             Ok(())
         })
     }
 
-    /// Load every retained pool checkpoint after a controller restart.
-    pub(crate) fn list_fork_pool_snapshots(
+    /// Read one golden's retained checkpoint, if it still has one.
+    pub(crate) fn retained_fork_snapshot(
+        &self,
+        golden: &str,
+    ) -> Result<Option<crate::agent::fork::RetainedForkSnapshot>> {
+        self.with_read_conn(|conn| {
+            let data: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT data FROM fork_pool_snapshots WHERE golden = ?1",
+                    params![golden],
+                    |row| row.get(0),
+                )
+                .optional()
+                .db_err(format!("get retained fork snapshot for '{golden}'"))?;
+            match data {
+                Some(bytes) => Ok(Some(
+                    serde_json::from_slice(&bytes)
+                        .db_err(format!("deserialize retained fork snapshot for '{golden}'"))?,
+                )),
+                None => Ok(None),
+            }
+        })
+    }
+
+    /// Load every retained checkpoint after a controller restart.
+    pub(crate) fn list_retained_fork_snapshots(
         &self,
     ) -> Result<Vec<(String, crate::agent::fork::RetainedForkSnapshot)>> {
         self.with_read_conn(|conn| {
             let mut stmt = conn
                 .prepare_cached("SELECT golden, data FROM fork_pool_snapshots ORDER BY golden")
-                .db_err("prepare list fork pool snapshots")?;
+                .db_err("prepare list retained fork snapshots")?;
             let rows = stmt
                 .query_map([], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
                 })
-                .db_err("query fork pool snapshots")?;
+                .db_err("query retained fork snapshots")?;
             let mut snapshots = Vec::new();
             for row in rows {
-                let (golden, data) = row.db_err("read fork pool snapshot row")?;
+                let (golden, data) = row.db_err("read retained fork snapshot row")?;
                 let snapshot = serde_json::from_slice(&data)
-                    .db_err(format!("deserialize fork pool snapshot for '{golden}'"))?;
+                    .db_err(format!("deserialize retained fork snapshot for '{golden}'"))?;
                 snapshots.push((golden, snapshot));
             }
             Ok(snapshots)
         })
     }
 
-    /// Forget a checkpoint only after its golden is resumed or no pool can use it.
-    pub(crate) fn remove_fork_pool_snapshot(&self, golden: &str) -> Result<bool> {
+    /// Forget a checkpoint only after its golden is resumed or no clone can use it.
+    pub(crate) fn remove_retained_fork_snapshot(&self, golden: &str) -> Result<bool> {
         self.with_conn(|conn| {
             let changed = conn
                 .execute(
                     "DELETE FROM fork_pool_snapshots WHERE golden = ?1",
                     params![golden],
                 )
-                .db_err(format!("remove fork pool snapshot for '{golden}'"))?;
+                .db_err(format!("remove retained fork snapshot for '{golden}'"))?;
             Ok(changed == 1)
         })
     }
@@ -1365,6 +1420,22 @@ impl SmolvmDb {
                 .query_row(
                     "SELECT data FROM fork_leases WHERE pool_name = ?1 AND id = ?2",
                     params![pool_name, lease_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .db_err(format!("get fork lease '{lease_id}'"))?;
+            data.map(|bytes| serde_json::from_slice(&bytes).db_err("deserialize fork lease"))
+                .transpose()
+        })
+    }
+
+    /// Read one lease by its globally unique opaque ID.
+    pub fn get_fork_lease_by_id(&self, lease_id: &str) -> Result<Option<ForkLeaseRecord>> {
+        self.with_read_conn(|conn| {
+            let data: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT data FROM fork_leases WHERE id = ?1",
+                    params![lease_id],
                     |row| row.get(0),
                 )
                 .optional()
@@ -2115,6 +2186,38 @@ mod tests {
     }
 
     #[test]
+    fn fresh_reader_burst_does_not_race_database_initialization() {
+        let (_dir, db) = temp_db();
+        let start = Arc::new(std::sync::Barrier::new(POOL_MAX_CONNS));
+        let readers = (0..POOL_MAX_CONNS)
+            .map(|_| {
+                let db = db.clone();
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    db.with_read_conn(|conn| {
+                        let missing: Option<Vec<u8>> = conn
+                            .query_row(
+                                "SELECT data FROM vms WHERE name = 'not-present'",
+                                [],
+                                |row| row.get(0),
+                            )
+                            .optional()
+                            .db_err("read absent VM during connection burst")?;
+                        assert!(missing.is_none());
+                        std::thread::sleep(Duration::from_millis(50));
+                        Ok(())
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for reader in readers {
+            reader.join().unwrap().unwrap();
+        }
+    }
+
+    #[test]
     fn test_config_settings() {
         let (_dir, db) = temp_db();
 
@@ -2134,17 +2237,47 @@ mod tests {
             golden_pid: 123,
             golden_pid_start_time: 456,
         };
-        db.set_fork_pool_snapshot("golden", &snapshot).unwrap();
+        db.set_retained_fork_snapshot("golden", &snapshot).unwrap();
         drop(db);
 
         let reopened = SmolvmDb::open_at(&dir.path().join("test.db")).unwrap();
         assert_eq!(
-            reopened.list_fork_pool_snapshots().unwrap(),
-            vec![("golden".to_string(), snapshot)]
+            reopened.list_retained_fork_snapshots().unwrap(),
+            vec![("golden".to_string(), snapshot.clone())]
         );
-        assert!(reopened.remove_fork_pool_snapshot("golden").unwrap());
-        assert!(reopened.list_fork_pool_snapshots().unwrap().is_empty());
-        assert!(!reopened.remove_fork_pool_snapshot("golden").unwrap());
+        assert_eq!(
+            reopened.retained_fork_snapshot("golden").unwrap().as_ref(),
+            Some(&snapshot)
+        );
+        assert!(reopened.retained_fork_snapshot("other").unwrap().is_none());
+        assert!(reopened.remove_retained_fork_snapshot("golden").unwrap());
+        assert!(reopened.list_retained_fork_snapshots().unwrap().is_empty());
+        assert!(!reopened.remove_retained_fork_snapshot("golden").unwrap());
+    }
+
+    /// A retained checkpoint restores RAM from one specific golden process, so it
+    /// must not outlive that golden's record — otherwise a later machine reusing
+    /// the name would inherit a checkpoint that belongs to a dead VM.
+    #[test]
+    fn removing_a_golden_also_drops_its_retained_fork_snapshot() {
+        let (_dir, db) = temp_db();
+        db.insert_vm(
+            "golden",
+            &VmRecord::new("golden".to_string(), 1, 256, vec![], vec![], true),
+        )
+        .unwrap();
+        db.set_retained_fork_snapshot(
+            "golden",
+            &crate::agent::fork::RetainedForkSnapshot {
+                path: PathBuf::from("/golden/s/12345678"),
+                golden_pid: 123,
+                golden_pid_start_time: 456,
+            },
+        )
+        .unwrap();
+
+        assert!(db.remove_vm("golden").unwrap().is_some());
+        assert!(db.retained_fork_snapshot("golden").unwrap().is_none());
     }
 
     #[test]

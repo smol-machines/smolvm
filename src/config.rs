@@ -526,6 +526,10 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cuda_vram_limit_mib: Option<u64>,
 
+    /// Preload this fork lineage's staged CUDA modules while clone workers boot.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cuda_preload_modules: bool,
+
     /// Expose the guest's Docker daemon socket to the host as a Unix socket in
     /// the VM data dir, so a host client can drive it with `DOCKER_HOST=unix://…`.
     #[serde(default)]
@@ -655,6 +659,7 @@ impl VmRecord {
             cuda: false,
             cuda_fork_pool_size: None,
             cuda_vram_limit_mib: None,
+            cuda_preload_modules: false,
             docker_socket: false,
             dns_filter_hosts: None,
             ephemeral: false,
@@ -716,6 +721,7 @@ impl VmRecord {
             cuda: false,
             cuda_fork_pool_size: None,
             cuda_vram_limit_mib: None,
+            cuda_preload_modules: false,
             docker_socket: false,
             dns_filter_hosts: None,
             ephemeral: false,
@@ -787,7 +793,20 @@ impl VmRecord {
     /// directory is resolved from bytes the host already has, and a
     /// `.smolmachine` artifact has its layers extracted at create — all three are
     /// legitimately network-free and must keep working.
+    ///
+    /// A `.smolmachine` is checked by SOURCE, not by `image`: the create path
+    /// sets both fields, so the artifact's provenance ref is present and looks
+    /// exactly like a pull that will never happen.
     pub fn validate_image_fetchable(&self) -> crate::Result<()> {
+        // A `.smolmachine` source carries the ORIGINAL registry reference in
+        // `image` as provenance, while the bytes come from the artifact's layers,
+        // extracted at create. Judging it by `image` alone reads that provenance
+        // as a pull that has to happen and rejects a machine that needs no
+        // network at all — which took the warm pool offline in prod, because
+        // pooled VMs are deliberately created network-less from a pack.
+        if self.source_smolmachine.is_some() {
+            return Ok(());
+        }
         let Some(image) = self.image.as_deref() else {
             return Ok(());
         };
@@ -914,13 +933,37 @@ mod tests {
 
     #[test]
     fn a_machine_with_no_image_is_unaffected() {
-        // Bare VMs (and `.smolmachine` artifacts, whose layers are extracted on
-        // the host at create) carry no pullable image reference.
+        // A bare VM carries no pullable image reference.
         assert!(
             VmRecord::new("m".to_string(), 1, 512, vec![], vec![], false)
                 .validate_image_fetchable()
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn a_smolmachine_source_needs_no_network_even_though_it_names_a_registry_image() {
+        // The create path sets BOTH fields for an artifact-sourced machine: the
+        // layers come from the `.smolmachine`, and `image` is retained only as
+        // provenance. Reading `image` alone made this look like an impossible
+        // pull, which is how warm-pool fill (network-less, artifact-sourced)
+        // started failing every create in production.
+        let mut r = rec_with_image("alpine:3.20", false, vec![]);
+        r.source_smolmachine = Some("library/alpine:latest".to_string());
+        assert!(
+            r.validate_image_fetchable().is_ok(),
+            "an artifact-sourced machine extracts its layers locally and must not \
+             require network"
+        );
+    }
+
+    #[test]
+    fn a_registry_image_with_no_network_is_still_rejected_without_an_artifact() {
+        // The guard #807 added must survive the fix above: no artifact source,
+        // no network, registry ref → still a create-time rejection.
+        let mut r = rec_with_image("alpine:3.20", false, vec![]);
+        r.source_smolmachine = None;
+        assert!(r.validate_image_fetchable().is_err());
     }
 
     #[test]
@@ -1304,11 +1347,13 @@ mod tests {
         record.cuda = true;
         record.cuda_fork_pool_size = Some(4);
         record.cuda_vram_limit_mib = Some(10240);
+        record.cuda_preload_modules = true;
 
         let encoded = serde_json::to_vec(&record).unwrap();
         let decoded: VmRecord = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded.cuda_fork_pool_size, Some(4));
         assert_eq!(decoded.cuda_vram_limit_mib, Some(10240));
+        assert!(decoded.cuda_preload_modules);
 
         let mut legacy_value = serde_json::to_value(VmRecord::new(
             "legacy".to_string(),
@@ -1322,9 +1367,11 @@ mod tests {
         let legacy_object = legacy_value.as_object_mut().unwrap();
         legacy_object.remove("cuda_fork_pool_size");
         legacy_object.remove("cuda_vram_limit_mib");
+        legacy_object.remove("cuda_preload_modules");
         let legacy: VmRecord = serde_json::from_value(legacy_value).unwrap();
         assert_eq!(legacy.cuda_fork_pool_size, None);
         assert_eq!(legacy.cuda_vram_limit_mib, None);
+        assert!(!legacy.cuda_preload_modules);
     }
 
     #[test]

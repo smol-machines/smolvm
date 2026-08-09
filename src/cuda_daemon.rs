@@ -365,7 +365,8 @@ const TENSOR_RESPONSE_MAGIC: [u8; 4] = *b"TBR1";
 const MAX_TENSOR_BUNDLE_METADATA: usize = (2 << 20) + 64;
 const MAX_PENDING_TENSOR_BUNDLES: usize = 64;
 const MAX_PENDING_TENSOR_BYTES: u64 = 32 << 30;
-const TENSOR_BUNDLE_TTL: Duration = Duration::from_secs(60);
+const DEFAULT_TENSOR_BUNDLE_TTL: Duration = Duration::from_secs(5 * 60);
+const MAX_TENSOR_BUNDLE_TTL_SECS: u64 = 60 * 60;
 static TENSOR_BUNDLE_SERVICE_READY: AtomicBool = AtomicBool::new(false);
 #[cfg(unix)]
 const MAX_MODULE_HANDOFF_BLOB_BYTES: u64 = 32 << 30;
@@ -385,6 +386,26 @@ fn pending_tensor_bundles(
     static BUNDLES: OnceLock<Mutex<std::collections::HashMap<Vec<u8>, PendingTensorBundle>>> =
         OnceLock::new();
     BUNDLES.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn tensor_bundle_ttl_from(value: Option<&str>) -> Duration {
+    value
+        .map(str::trim)
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| (1..=MAX_TENSOR_BUNDLE_TTL_SECS).contains(seconds))
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_TENSOR_BUNDLE_TTL)
+}
+
+fn tensor_bundle_ttl() -> Duration {
+    static TTL: OnceLock<Duration> = OnceLock::new();
+    *TTL.get_or_init(|| {
+        tensor_bundle_ttl_from(
+            std::env::var("SMOLVM_CUDA_TENSOR_BUNDLE_TTL_SECS")
+                .ok()
+                .as_deref(),
+        )
+    })
 }
 
 fn tensor_bundle_socket_path(cuda_socket: &Path) -> PathBuf {
@@ -407,7 +428,7 @@ fn prune_tensor_bundles(
     bundles: &mut std::collections::HashMap<Vec<u8>, PendingTensorBundle>,
     now: Instant,
 ) {
-    bundles.retain(|_, bundle| now.duration_since(bundle.created) < TENSOR_BUNDLE_TTL);
+    bundles.retain(|_, bundle| now.duration_since(bundle.created) < tensor_bundle_ttl());
 }
 
 fn pending_tensor_bytes(bundles: &std::collections::HashMap<Vec<u8>, PendingTensorBundle>) -> u64 {
@@ -2690,20 +2711,24 @@ fn reserve_clone_address_exact(b: &mut dyn Backend, va: u64, size: u64, align: u
 }
 
 #[cfg(unix)]
+const MIN_CLONE_RESERVATION_GRANULARITY: u64 = 1 << 16;
+#[cfg(unix)]
+const MAX_CLONE_RESERVATION_GRANULARITY: u64 = 1 << 31;
+
+#[cfg(unix)]
 fn reserve_clone_layout_exact(
     b: &mut dyn Backend,
     layout: &str,
     device: i32,
 ) -> (Vec<(u64, u64)>, u64) {
-    const MIN_GRANULARITY: u64 = 1 << 16;
-    const MAX_HINT_GRANULARITY: u64 = 1 << 30;
-
     let mut granularity = b
         .mem_get_allocation_granularity(device, 0)
         .unwrap_or(1 << 21)
-        .max(MIN_GRANULARITY)
+        .max(MIN_CLONE_RESERVATION_GRANULARITY)
         .next_power_of_two();
-    while granularity <= MAX_HINT_GRANULARITY {
+    // Most workers resolve at 32 MiB. Keep one validated 2 GiB envelope as a
+    // final fallback for contexts whose allocator moves every smaller hint.
+    while granularity <= MAX_CLONE_RESERVATION_GRANULARITY {
         let envelopes = clone_layout_reservation_envelopes(layout, granularity);
         let mut reserved = Vec::with_capacity(envelopes.len());
         let mut complete = true;
@@ -3890,6 +3915,7 @@ fn route_clone_connection(
         return consumed;
     }
     let share_weights = flags & 1 != 0;
+    let preload_modules = flags & 4 != 0;
     // Warm dial (flag bit 1): the clone VM's proxy dials at STARTUP so worker
     // spawn (CUDA init + memory reconstruction + module/graph pre-warm) runs
     // concurrent with guest resume instead of on the guest's first CUDA call.
@@ -3956,6 +3982,7 @@ fn route_clone_connection(
             fd,
             *token,
             share_weights,
+            preload_modules,
             ring_dir,
             procmem.clone(),
             *options,
@@ -4131,6 +4158,7 @@ fn route_clone_connection(
         fd,
         token,
         share_weights,
+        preload_modules,
         ring_dir,
         procmem.clone(),
         *options,
@@ -5243,6 +5271,7 @@ fn spawn_clone_worker(
     conn_fd: std::os::unix::io::RawFd,
     token: u64,
     share_weights: bool,
+    preload_modules: bool,
     ring_dir: Option<&str>,
     procmem: Option<ProcMemAdvert>,
     options: ServeOptions,
@@ -5768,6 +5797,12 @@ fn spawn_clone_worker(
             std::ffi::OsString::from(ctrl_slot.to_string()),
         ),
     ];
+    if preload_modules {
+        worker_env.push((
+            std::ffi::OsString::from("SMOLVM_CUDA_PRELOAD_MODULES"),
+            std::ffi::OsString::from("1"),
+        ));
+    }
     if publish_enabled {
         worker_env.push((
             std::ffi::OsString::from("SMOLVM_CUDA_CLONE_PUBLISH_CTRL"),
@@ -6016,7 +6051,7 @@ impl Drop for FileLock {
 #[cfg(all(test, target_os = "linux"))]
 mod mps_tests {
     use super::{
-        clone_layout_reservation_envelopes, clone_worker_idle_expired,
+        clone_layout_reservation_envelopes, clone_layout_reservations, clone_worker_idle_expired,
         clone_worker_idle_timeout_from, clone_worker_share_env, clone_worker_spawn_pace,
         clone_worker_status_dir_for, clone_worker_vm_is_alive, consume_procmem_preamble,
         create_host_snapshot_memfd, create_private_mps_paths, daemon_has_live_cuda_clients,
@@ -6031,8 +6066,9 @@ mod mps_tests {
         reconstruct_golden_modules, recv_fd, redeem_tensor_bundle_from_stream, seal_host_snapshot,
         select_golden_owner, send_fd, send_tensor_bundle_to_parent, serve_tensor_bundle_consumer,
         spawn_clone_attach_listener_with_timeout, spawn_tensor_bundle_receiver,
-        unique_live_clone_worker, validate_tensor_bundle_metadata, write_module_handoff,
-        CloneWorkerSpawnFds, CloneWorkerStatus, TENSOR_CONSUME_MAGIC,
+        tensor_bundle_ttl_from, unique_live_clone_worker, validate_tensor_bundle_metadata,
+        write_module_handoff, CloneWorkerSpawnFds, CloneWorkerStatus, DEFAULT_TENSOR_BUNDLE_TTL,
+        MAX_CLONE_RESERVATION_GRANULARITY, TENSOR_CONSUME_MAGIC,
     };
     use std::collections::HashMap;
     use std::io::{self, Write};
@@ -6448,6 +6484,24 @@ mod mps_tests {
         assert_eq!(
             clone_worker_idle_timeout_from(Some("invalid")).as_secs(),
             300
+        );
+    }
+
+    #[test]
+    fn tensor_bundle_lifetime_covers_delayed_cohort_consumers() {
+        assert_eq!(tensor_bundle_ttl_from(None), Duration::from_secs(300));
+        assert_eq!(
+            tensor_bundle_ttl_from(Some(" 600 ")),
+            Duration::from_secs(600)
+        );
+        assert_eq!(tensor_bundle_ttl_from(Some("0")), DEFAULT_TENSOR_BUNDLE_TTL);
+        assert_eq!(
+            tensor_bundle_ttl_from(Some("3601")),
+            DEFAULT_TENSOR_BUNDLE_TTL
+        );
+        assert_eq!(
+            tensor_bundle_ttl_from(Some("invalid")),
+            DEFAULT_TENSOR_BUNDLE_TTL
         );
     }
 
@@ -6869,6 +6923,12 @@ mod mps_tests {
         assert!(range_is_reserved(&ranges, 0x314000000, 0x1400000));
         assert!(range_is_reserved(&ranges, 0x7a5ed2600000, 0x200000));
         assert!(!range_is_reserved(&ranges, 0x316000000, 0x200000));
+
+        let fallback =
+            clone_layout_reservation_envelopes(layout, MAX_CLONE_RESERVATION_GRANULARITY);
+        for (base, size) in clone_layout_reservations(layout) {
+            assert!(range_is_reserved(&fallback, base, size));
+        }
     }
 
     #[test]

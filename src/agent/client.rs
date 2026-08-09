@@ -409,6 +409,26 @@ fn expect_data<T: serde::de::DeserializeOwned>(resp: AgentResponse, op: &str) ->
     }
 }
 
+/// Give a PTY session a `TERM` unless the caller already set one.
+///
+/// A shell's line editor needs `TERM` to look up the terminal's cursor-movement
+/// capabilities. Without it the edit still happens — the buffer is correct — but
+/// the redraw is not: the screen never catches up, so backspace looks like it
+/// advances the cursor and deletes nothing. zsh's ZLE is strict here; bash's
+/// readline has built-in fallbacks and hides the problem.
+///
+/// The host's own `TERM` is deliberately NOT forwarded. An exotic value
+/// (`alacritty`, `foot`, …) often has no terminfo entry inside a slim container
+/// image, which fails exactly the same way — so a value every image ships with
+/// is the safer default. It also matches the `TERM` the launcher and OCI paths
+/// already set. Callers wanting something else pass `TERM` in `env` explicitly.
+fn with_term_default(mut env: Vec<(String, String)>, tty: bool) -> Vec<(String, String)> {
+    if tty && !env.iter().any(|(key, _)| key == "TERM") {
+        env.push(("TERM".to_string(), "xterm-256color".to_string()));
+    }
+    env
+}
+
 /// Expect an `Ok` response, ignoring any data.
 fn expect_ok(resp: AgentResponse, op: &str) -> Result<()> {
     match resp {
@@ -586,15 +606,14 @@ impl AgentClient {
         self.receive()
     }
 
-    /// Ping the helper daemon and validate the protocol version.
-    ///
-    /// Returns the agent's protocol version. Logs a warning if the version
-    /// doesn't match the host's expected version.
-    pub fn ping(&mut self) -> Result<u32> {
+    fn ping_info(&mut self) -> Result<(u32, Vec<String>)> {
         let resp = self.request(&AgentRequest::Ping)?;
 
         match resp {
-            AgentResponse::Pong { version } => {
+            AgentResponse::Pong {
+                version,
+                capabilities,
+            } => {
                 if version != PROTOCOL_VERSION {
                     tracing::warn!(
                         host_version = PROTOCOL_VERSION,
@@ -602,11 +621,28 @@ impl AgentClient {
                         "protocol version mismatch — agent may be outdated or newer than host"
                     );
                 }
-                Ok(version)
+                Ok((version, capabilities))
             }
             AgentResponse::Error { message, .. } => Err(Error::agent("ping", message)),
             _ => Err(Error::agent("ping", "unexpected response type")),
         }
+    }
+
+    /// Ping the helper daemon and validate the protocol version.
+    ///
+    /// Returns the agent's protocol version. Logs a warning if the version
+    /// doesn't match the host's expected version.
+    pub fn ping(&mut self) -> Result<u32> {
+        self.ping_info().map(|(version, _)| version)
+    }
+
+    /// Return whether the live guest agent advertises an optional feature.
+    pub fn supports_capability(&mut self, capability: &str) -> Result<bool> {
+        self.ping_info().map(|(_, capabilities)| {
+            capabilities
+                .iter()
+                .any(|advertised| advertised == capability)
+        })
     }
 
     /// Replay host-originated filesystem changes into the guest as fsnotify
@@ -1169,6 +1205,7 @@ impl AgentClient {
         tty: bool,
     ) -> Result<i32> {
         let timeout_ms = timeout.map(|t| t.as_millis() as u64);
+        let env = with_term_default(env, tty);
         self.interactive_session(
             AgentRequest::VmExec {
                 command,
@@ -1300,11 +1337,12 @@ impl AgentClient {
     pub fn run_interactive(&mut self, config: RunConfig) -> Result<i32> {
         let timeout_ms = config.timeout.map(|t| t.as_millis() as u64);
         let tty = config.tty;
+        let env = with_term_default(config.env, tty);
         self.interactive_session(
             AgentRequest::Run {
                 image: config.image,
                 command: config.command,
-                env: config.env,
+                env,
                 workdir: config.workdir,
                 user: config.user,
                 mounts: config.mounts,
@@ -1521,6 +1559,7 @@ impl AgentClient {
     where
         F: FnMut(InteractiveOutput),
     {
+        let env = with_term_default(env, tty);
         self.interactive_session_io(
             AgentRequest::VmExec {
                 command,
@@ -1550,11 +1589,12 @@ impl AgentClient {
         F: FnMut(InteractiveOutput),
     {
         let tty = config.tty;
+        let env = with_term_default(config.env, tty);
         self.interactive_session_io(
             AgentRequest::Run {
                 image: config.image,
                 command: config.command,
-                env: config.env,
+                env,
                 workdir: config.workdir,
                 user: config.user,
                 mounts: config.mounts,
@@ -2357,7 +2397,11 @@ mod read_cap_tests {
 
     #[test]
     fn read_cap_rejects_unexpected_response_type() {
-        let err = drive(vec![AgentResponse::Pong { version: 1 }]).unwrap_err();
+        let err = drive(vec![AgentResponse::Pong {
+            version: 1,
+            capabilities: vec![],
+        }])
+        .unwrap_err();
         assert!(format!("{}", err).contains("unexpected response"));
     }
 }
@@ -2854,5 +2898,43 @@ mod stalled_body_tests {
         );
 
         server.join().expect("server thread joined");
+    }
+}
+
+#[cfg(test)]
+mod term_default_tests {
+    use super::with_term_default;
+
+    fn term_of(env: &[(String, String)]) -> Option<&str> {
+        env.iter()
+            .find(|(k, _)| k == "TERM")
+            .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn pty_session_gets_a_term() {
+        // Without this the guest shell's line editor cannot redraw, and backspace
+        // appears to advance the cursor instead of deleting.
+        let env = with_term_default(vec![], true);
+        assert_eq!(term_of(&env), Some("xterm-256color"));
+    }
+
+    #[test]
+    fn caller_supplied_term_is_kept() {
+        let env = with_term_default(
+            vec![("TERM".to_string(), "screen-256color".to_string())],
+            true,
+        );
+        assert_eq!(term_of(&env), Some("screen-256color"));
+        assert_eq!(env.len(), 1, "must not append a second TERM");
+    }
+
+    #[test]
+    fn non_tty_exec_is_untouched() {
+        // A piped exec has no terminal to describe; adding TERM there would make
+        // programs emit escape sequences into what is usually captured output.
+        let env = with_term_default(vec![("A".to_string(), "b".to_string())], false);
+        assert_eq!(term_of(&env), None);
+        assert_eq!(env.len(), 1);
     }
 }

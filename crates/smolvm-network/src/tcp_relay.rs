@@ -69,6 +69,9 @@ pub struct TcpRelayTable {
     /// so the host-side relay connects to loopback instead of the gateway's own
     /// (non-routable) userspace address. See `host_connect_addr`.
     gateway_ips: Vec<IpAddr>,
+    /// One authenticated smolvm-owned loopback service allowed through the
+    /// otherwise-denied gateway address.
+    host_service: Option<crate::GatewayHostService>,
 }
 
 /// Newly established guest connection ready for a host relay thread.
@@ -193,6 +196,7 @@ impl TcpRelayTable {
         max_connections: Option<usize>,
         egress: PolicyHandle,
         gateway_ips: Vec<IpAddr>,
+        host_service: Option<crate::GatewayHostService>,
     ) -> Self {
         Self {
             connections: HashMap::new(),
@@ -202,7 +206,16 @@ impl TcpRelayTable {
             max_connections: max_connections.unwrap_or(MAX_CONNECTIONS),
             egress,
             gateway_ips,
+            host_service,
         }
+    }
+
+    fn destination_allowed(&self, destination: SocketAddr) -> bool {
+        self.egress.allows(destination.ip(), Some(destination.port()))
+            || (self
+                .host_service
+                .is_some_and(|service| service.guest_port == destination.port())
+                && self.gateway_ips.contains(&destination.ip()))
     }
 
     /// The host-side address the relay should dial for a guest flow.
@@ -228,7 +241,11 @@ impl TcpRelayTable {
             } else {
                 IpAddr::V6(Ipv6Addr::LOCALHOST)
             };
-            return SocketAddr::new(loopback, destination.port());
+            let port = self
+                .host_service
+                .filter(|service| service.guest_port == destination.port())
+                .map_or(destination.port(), |service| service.host_port);
+            return SocketAddr::new(loopback, port);
         }
         destination
     }
@@ -268,10 +285,7 @@ impl TcpRelayTable {
         // Egress policy: drop the guest SYN before any socket is created when the
         // destination isn't allowed, so the guest just sees the connection fail.
         // Inbound published-port flows take a separate path and are unaffected.
-        if !self
-            .egress
-            .allows(destination.ip(), Some(destination.port()))
-        {
+        if !self.destination_allowed(destination) {
             tracing::debug!(
                 %destination,
                 "virtio-net: blocking outbound connection by egress policy"
@@ -876,6 +890,7 @@ mod tests {
             None,
             Arc::new(crate::egress::EgressPolicy::unrestricted()),
             vec![gw4, gw6],
+            None,
         );
 
         // A guest reaching "the host" via its gateway IP must dial loopback, not
@@ -920,7 +935,7 @@ mod tests {
     #[test]
     fn a_policy_rewrite_takes_precedence_over_the_gateway_ip_redirect() {
         let gw: IpAddr = "100.96.0.1".parse().unwrap();
-        let table = TcpRelayTable::new(None, Arc::new(StandinPolicy), vec![gw]);
+        let table = TcpRelayTable::new(None, Arc::new(StandinPolicy), vec![gw], None);
 
         // The policy gets first say: its stand-in is dialed as what it stands
         // for, with the port the guest asked for.
@@ -955,7 +970,7 @@ mod tests {
             }
         }
 
-        let mut table = TcpRelayTable::new(None, Arc::new(OnlyHttps), vec![]);
+        let mut table = TcpRelayTable::new(None, Arc::new(OnlyHttps), vec![], None);
         let mut sockets = SocketSet::new(vec![]);
         let source: SocketAddr = "100.96.0.2:40000".parse().unwrap();
         let dst = |port| SocketAddr::new("1.1.1.1".parse().unwrap(), port);
@@ -968,5 +983,28 @@ mod tests {
         // guest just sees the connection fail.
         assert!(!table.create_tcp_socket(source, dst(80), &mut sockets));
         assert!(!table.has_socket_for(&source, &dst(80)));
+    }
+
+    #[test]
+    fn dedicated_gateway_service_does_not_weaken_other_egress() {
+        let gateway: IpAddr = "100.96.0.1".parse().unwrap();
+        let external: IpAddr = "8.8.8.8".parse().unwrap();
+        let table = TcpRelayTable::new(
+            None,
+            Arc::new(crate::egress::EgressPolicy::from_allowed_cidrs(Some(&[]))),
+            vec![gateway],
+            Some(crate::GatewayHostService {
+                guest_port: 10_081,
+                host_port: 40_081,
+            }),
+        );
+
+        assert!(table.destination_allowed(SocketAddr::new(gateway, 10_081)));
+        assert!(!table.destination_allowed(SocketAddr::new(gateway, 22)));
+        assert!(!table.destination_allowed(SocketAddr::new(external, 10_081)));
+        assert_eq!(
+            table.host_connect_addr(SocketAddr::new(gateway, 10_081)),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40_081)
+        );
     }
 }

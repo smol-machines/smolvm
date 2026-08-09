@@ -22,6 +22,17 @@ use super::{HostMount, PortMapping, VmResources};
 
 /// Timeout for the agent to become ready after starting.
 const AGENT_READY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Restored CUDA clones resume an already-initialized agent accept loop. If it
+/// does not answer within this window, the restore is wedged rather than cold-booting.
+const CLONE_AGENT_READY_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn agent_ready_timeout(is_cuda_clone: bool) -> Duration {
+    if is_cuda_clone {
+        CLONE_AGENT_READY_TIMEOUT
+    } else {
+        AGENT_READY_TIMEOUT
+    }
+}
 
 // Re-use shared polling constants from process module.
 use crate::process::FAST_POLL_INTERVAL;
@@ -34,8 +45,13 @@ const AGENT_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const WAIT_FOR_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn should_retry_kvm_enomem(cpus: u8, fork_clone: bool) -> bool {
-    cpus == 1 || fork_clone
+fn should_retry_kvm_enomem(cpus: u8, forkable: bool, fork_clone: bool) -> bool {
+    cpus == 1 || forkable || fork_clone
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn should_delay_first_kvm_run(cpus: u8, cuda_clone: bool) -> bool {
+    cpus == 1 || cuda_clone
 }
 
 #[cfg(unix)]
@@ -177,6 +193,9 @@ struct AgentInner {
     /// the flag without a process-global env var (unsafe in the multithreaded
     /// `serve` process where concurrent forks would race).
     is_clone: bool,
+    /// True when the restored clone also remotes CUDA. CUDA pool clones resume
+    /// an already-hot agent and use a shorter stuck-restore deadline.
+    is_cuda_clone: bool,
     /// Held while the VM is running. Released on stop/Drop to allow other
     /// processes to start the VM. The kernel releases the lock automatically
     /// if the process crashes.
@@ -666,6 +685,7 @@ impl AgentManager {
                 config_state: ConfigState::Unknown,
                 detached: false,
                 is_clone: false,
+                is_cuda_clone: false,
                 #[cfg(unix)]
                 vm_lock_handle: None,
             })),
@@ -1771,6 +1791,8 @@ impl AgentManager {
         // `std::env::set_var`. A process-global env var is a data race in the
         // multithreaded `serve` process, where concurrent forks would clobber
         // each other (and `set_var` is `unsafe` in edition 2024 for that reason).
+        let fork_clone = features.snapshot_dir.is_some();
+        let cuda_clone = fork_clone && (features.cuda || resources_for_config.cuda);
         let fork_env: Vec<(&str, String)> = {
             let mut v = Vec::new();
             if features.forkable {
@@ -1798,6 +1820,9 @@ impl AgentManager {
                 // golden's loaded weights instead of copying them.
                 v.push(("SMOLVM_CUDA_CLONE_SHARE", "1".to_string()));
             }
+            if features.cuda_preload_modules {
+                v.push(("SMOLVM_CUDA_CLONE_PRELOAD_MODULES", "1".to_string()));
+            }
             if let Some(pool_size) = features.cuda_fork_pool_size {
                 v.push((
                     smolvm_protocol::guest_env::CUDA_FORK_POOL_SIZE,
@@ -1807,18 +1832,19 @@ impl AgentManager {
             if let Some(limit_mib) = features.cuda_vram_limit_mib {
                 v.push(("SMOLVM_CUDA_VRAM_LIMIT_MB", limit_mib.to_string()));
             }
-            let fork_clone = features.snapshot_dir.is_some();
-            let cuda_clone = fork_clone && (features.cuda || resources_for_config.cuda);
-            // Some KVM kernels return a spurious ENOMEM while concurrent fork
-            // clones enter KVM. Keep the first-entry delay specific to one-vCPU
-            // guests, but enable the bounded retry path for every fork clone;
-            // retries add no delay unless KVM actually returns ENOMEM.
+            // Some KVM kernels have a first-entry race. Keep the existing
+            // one-vCPU workaround and cover restored CUDA clones, where
+            // immediate entry can leave the VMM alive while the guest agent
+            // never responds. This sleeps once for 5 ms before the first
+            // KVM_RUN and has no steady-state cost.
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-            if resources_for_config.cpus == 1 {
+            if should_delay_first_kvm_run(resources_for_config.cpus, cuda_clone) {
                 v.push(("KRUN_FIRST_RUN_DELAY", "1".to_string()));
             }
+            // Bounded retries remain separate: they add no delay unless
+            // KVM_RUN actually returns ENOMEM.
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-            if should_retry_kvm_enomem(resources_for_config.cpus, fork_clone) {
+            if should_retry_kvm_enomem(resources_for_config.cpus, features.forkable, fork_clone) {
                 v.push(("KRUN_ENOMEM_RETRY", "1".to_string()));
             }
             // A CUDA fork clone must stay ptrace-readable by the same-uid daemon
@@ -1865,7 +1891,11 @@ impl AgentManager {
             }
             v
         };
-        self.inner.lock().is_clone = features.snapshot_dir.is_some();
+        {
+            let mut inner = self.inner.lock();
+            inner.is_clone = fork_clone;
+            inner.is_cuda_clone = cuda_clone;
+        }
 
         // Per-VM uid isolation: when running privileged (root `serve`), give this
         // VMM its own dedicated, collision-free unprivileged uid so a guest→VMM
@@ -2061,6 +2091,14 @@ impl AgentManager {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| exe.clone());
         let mut cmd = std::process::Command::new(&boot_exe);
+        if let Some(service) = crate::network::launch::guest_host_service()
+            .map_err(|reason| Error::config("configure guest rollout ingress", reason))?
+        {
+            cmd.env(
+                crate::api::guest_rollout::GUEST_HOST_SERVICE_ENV,
+                format!("{}:{}", service.guest_port, service.host_port),
+            );
+        }
         // libkrun dlopen()s libkrunfw by bare soname at krun_start_enter time and
         // carries no rpath, so the dynamic linker must be told where to look
         // BEFORE the child launches — the loader caches its search path at
@@ -2573,16 +2611,22 @@ impl AgentManager {
     /// Polling at 1ms for the first second to give sub-poll-interval resolution
     /// for boot timing experiments. Falls back to 5ms after 1 second.
     fn wait_for_ready(&self) -> Result<()> {
-        let timeout = AGENT_READY_TIMEOUT;
+        // Fork clone: the guest resumes past boot, so it never (re)writes the
+        // `.smolvm-ready` marker. Detect readiness by pinging the restored agent
+        // directly (it is already in its accept loop) — no marker, no grace.
+        let (is_clone, is_cuda_clone) = {
+            let inner = self.inner.lock();
+            (inner.is_clone, inner.is_cuda_clone)
+        };
+        let timeout = agent_ready_timeout(is_cuda_clone);
         let start = Instant::now();
 
         tracing::debug!("waiting for agent to be ready");
 
-        // Fork clone: the guest resumes past boot, so it never (re)writes the
-        // `.smolvm-ready` marker. Detect readiness by pinging the restored agent
-        // directly (it is already in its accept loop) — no marker, no grace.
-        let is_clone = self.inner.lock().is_clone;
         if is_clone {
+            let mut socket_observations = 0_u64;
+            let mut connect_successes = 0_u64;
+            let mut last_probe_error = None;
             while start.elapsed() < timeout {
                 {
                     let mut inner = self.inner.lock();
@@ -2601,23 +2645,43 @@ impl AgentManager {
                     }
                 }
                 if self.vsock_socket.exists() {
-                    if let Ok(mut client) =
-                        super::AgentClient::connect_with_boot_probe_timeout(&self.vsock_socket)
-                    {
-                        if client.ping().is_ok() {
-                            tracing::info!(
-                                elapsed_ms = start.elapsed().as_millis(),
-                                "clone agent ready (ping)"
-                            );
-                            return Ok(());
+                    socket_observations += 1;
+                    match super::AgentClient::connect_with_boot_probe_timeout(&self.vsock_socket) {
+                        Ok(mut client) => {
+                            connect_successes += 1;
+                            match client.ping() {
+                                Ok(_) => {
+                                    tracing::info!(
+                                        elapsed_ms = start.elapsed().as_millis(),
+                                        "clone agent ready (ping)"
+                                    );
+                                    return Ok(());
+                                }
+                                Err(error) => last_probe_error = Some(error.to_string()),
+                            }
                         }
+                        Err(error) => last_probe_error = Some(error.to_string()),
                     }
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
+
+            let (child_pid, child_alive) = {
+                let mut inner = self.inner.lock();
+                match inner.child.as_mut() {
+                    Some(child) => (Some(child.pid()), child.is_running()),
+                    None => (None, false),
+                }
+            };
+            let socket_exists = self.vsock_socket.exists();
+            let diagnostic = format!(
+                "socket_exists={socket_exists} socket_observations={socket_observations} connect_successes={connect_successes} child_pid={child_pid:?} child_alive={child_alive} last_probe_error={}",
+                last_probe_error.as_deref().unwrap_or("none")
+            );
+            tracing::warn!(%diagnostic, "clone agent readiness timed out");
             return Err(Error::agent(
                 "wait for ready",
-                "clone agent did not respond to ping within timeout".to_string(),
+                format!("clone agent did not respond to ping within timeout ({diagnostic})"),
             ));
         }
 
@@ -2829,8 +2893,9 @@ impl Drop for AgentManager {
 /// far more useful than whatever benign WARN happened to be logged last (on
 /// Windows the guest console isn't captured, so the log is often just that).
 fn boot_failure_reason(exit_code: Option<i32>, startup_log: Option<&str>) -> String {
-    let real_error = startup_log.and_then(|log| {
-        log.lines()
+    let real_error = startup_log
+        .and_then(|log| {
+            log.lines()
             .rev()
             .find_map(|line| {
                 let lower = line.to_ascii_lowercase();
@@ -2855,7 +2920,16 @@ fn boot_failure_reason(exit_code: Option<i32>, startup_log: Option<&str>) -> Str
                     .find(|l| !l.is_empty())
                     .map(str::to_string)
             })
-    });
+        })
+        .map(|error| {
+            if error.contains("Failure during vcpu run: Cannot allocate memory (os error 12)") {
+                format!(
+                    "{error} — this can be the affected-host KVM first-run bug rather than memory pressure; update the host kernel to include upstream fix 916b7f42b3b3"
+                )
+            } else {
+                error
+            }
+        });
 
     let code_note = match exit_code {
         Some(code) => {
@@ -2886,12 +2960,27 @@ fn boot_failure_reason(exit_code: Option<i32>, startup_log: Option<&str>) -> Str
 mod tests {
     use super::*;
 
+    #[test]
+    fn restored_cuda_clones_fail_faster_than_other_boots() {
+        assert_eq!(agent_ready_timeout(true), Duration::from_secs(10));
+        assert_eq!(agent_ready_timeout(false), Duration::from_secs(30));
+    }
+
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
-    fn kvm_enomem_retries_cover_multi_vcpu_fork_clones() {
-        assert!(should_retry_kvm_enomem(1, false));
-        assert!(should_retry_kvm_enomem(3, true));
-        assert!(!should_retry_kvm_enomem(3, false));
+    fn first_kvm_run_delay_covers_only_one_vcpu_guests_and_cuda_clones() {
+        assert!(should_delay_first_kvm_run(1, false));
+        assert!(should_delay_first_kvm_run(4, true));
+        assert!(!should_delay_first_kvm_run(4, false));
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn kvm_enomem_retries_cover_multi_vcpu_fork_vms() {
+        assert!(should_retry_kvm_enomem(1, false, false));
+        assert!(should_retry_kvm_enomem(3, true, false));
+        assert!(should_retry_kvm_enomem(3, false, true));
+        assert!(!should_retry_kvm_enomem(3, false, false));
     }
 
     #[test]
@@ -2987,6 +3076,17 @@ mod tests {
         let r = boot_failure_reason(Some(1), Some(log));
         assert!(r.contains("krun_add_disk2"), "{r}");
         assert!(r.contains("code 1"), "{r}");
+    }
+
+    #[test]
+    fn boot_failure_identifies_the_affected_host_kvm_enomem() {
+        let log = "[ERROR krun_vmm::linux::vstate] Failure during vcpu run: Cannot allocate memory (os error 12)";
+        let reason = boot_failure_reason(Some(1), Some(log));
+        assert!(
+            reason.contains("affected-host KVM first-run bug"),
+            "{reason}"
+        );
+        assert!(reason.contains("916b7f42b3b3"), "{reason}");
     }
 
     #[test]

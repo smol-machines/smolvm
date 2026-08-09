@@ -993,6 +993,61 @@ pub struct AcquireForkLeaseRequest {
     /// Optional lease duration override for this worker.
     #[serde(default)]
     pub ttl_secs: Option<u64>,
+    /// Keep the lease activating until the workload calls `smolvm-worker-ready`.
+    #[serde(default)]
+    pub await_worker_ready: bool,
+    /// Optional readiness timeout in seconds; defaults to 240 when enabled. The
+    /// acquisition request can remain open for this duration, so clients must use
+    /// a longer request deadline.
+    #[serde(default)]
+    pub worker_ready_timeout_secs: Option<u64>,
+    /// Optional fused-rollout access granted only to this lease's executor and policy.
+    #[serde(default)]
+    pub rollout_access: Option<RolloutLeaseAccess>,
+}
+
+/// A bounded group of ordinary fork-pool lease requests.
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AcquireForkLeaseBatchRequest {
+    /// Independent lease requests. Each item retains its normal idempotency semantics;
+    /// at most 32 items may wait for workload readiness in one call.
+    pub leases: Vec<AcquireForkLeaseRequest>,
+}
+
+/// One ordered result from a fork-pool lease batch.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ForkLeaseBatchItemResponse {
+    /// Retry key from the submitted lease request.
+    pub idempotency_key: String,
+    /// Activated worker lease when acquisition succeeded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease: Option<ForkLeaseInfo>,
+    /// Stable API error category when this item failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    /// Human-readable failure for this item.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Ordered results from a bounded fork-pool lease batch.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AcquireForkLeaseBatchResponse {
+    /// One result per submitted lease request, in input order.
+    pub leases: Vec<ForkLeaseBatchItemResponse>,
+}
+
+/// Least-privilege fused-rollout scope injected into one pool worker.
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RolloutLeaseAccess {
+    /// Existing rollout executor this worker may call.
+    pub executor: String,
+    /// Logical policy this worker may publish, generate, and retire.
+    pub policy: String,
 }
 
 /// One file staged into a held worker before lease activation.

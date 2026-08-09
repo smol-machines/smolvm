@@ -210,6 +210,7 @@ pub fn start_with_clone_mode(socket_path: &Path, is_fork_clone: bool) -> std::io
 struct CloneProxyIdentity {
     id: u64,
     share_weights: bool,
+    preload_modules: bool,
 }
 
 fn clone_proxy_identity(is_fork_clone: bool) -> Option<CloneProxyIdentity> {
@@ -228,6 +229,7 @@ fn clone_proxy_identity(is_fork_clone: bool) -> Option<CloneProxyIdentity> {
     Some(CloneProxyIdentity {
         id: u64::from_le_bytes(bytes) ^ u64::from(std::process::id()),
         share_weights: std::env::var_os("SMOLVM_CUDA_CLONE_SHARE").is_some(),
+        preload_modules: std::env::var_os("SMOLVM_CUDA_CLONE_PRELOAD_MODULES").is_some(),
     })
 }
 
@@ -239,7 +241,8 @@ fn clone_proxy_identity(is_fork_clone: bool) -> Option<CloneProxyIdentity> {
 ///
 /// The 17-byte clone-connection preamble (magic + clone id + flags), `None`
 /// on non-clone VMs. Flag bit 0: forked with `--share-weights`; bit 1: warm
-/// dial (spawn the worker eagerly, no Init follows on this connection).
+/// dial (spawn the worker eagerly, no Init follows on this connection); bit 2:
+/// preload staged CUDA modules before reporting the clone worker ready.
 fn clone_preamble(identity: Option<CloneProxyIdentity>, warm: bool) -> Option<[u8; 17]> {
     let identity = identity?;
     let mut p = [0u8; 17];
@@ -252,6 +255,9 @@ fn clone_preamble(identity: Option<CloneProxyIdentity>, warm: bool) -> Option<[u
     }
     if warm {
         p[16] |= 2;
+    }
+    if identity.preload_modules {
+        p[16] |= 4;
     }
     if std::env::var_os("SMOLVM_CUDA_PROXY_TRACE").is_some() {
         eprintln!(
@@ -561,6 +567,7 @@ mod tests {
         let identity = CloneProxyIdentity {
             id: 0x1122_3344_5566_7788,
             share_weights: true,
+            preload_modules: false,
         };
         let regular = clone_preamble(Some(identity), false).unwrap();
         assert_eq!(&regular[..8], &smolvm_cuda::proto::CLONE_PREAMBLE_MAGIC);
@@ -572,5 +579,15 @@ mod tests {
 
         let warm = clone_preamble(Some(identity), true).unwrap();
         assert_eq!(warm[16], 3);
+
+        let preload = clone_preamble(
+            Some(CloneProxyIdentity {
+                preload_modules: true,
+                ..identity
+            }),
+            false,
+        )
+        .unwrap();
+        assert_eq!(preload[16], 5);
     }
 }

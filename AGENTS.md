@@ -86,6 +86,7 @@ smolvm machine create --name myvm --image ./myapp.tar     # persistent, from a l
 - **`pack run`** — ephemeral. Each run starts fresh from the packed image.
 - **`pack start` + `exec`** — daemon mode. `/workspace` persists across exec sessions and stop/start. Container overlay resets per exec (package installs don't persist — use `/workspace` for durable data).
 - **`machine create --from .smolmachine`** — creates a persistent named machine from a packed artifact. Boots from pre-extracted layers (~250ms, no image pull). Full `machine exec` persistence — package installs, file writes all survive across exec and stop/start.
+- **Memory-backed paths** — `/tmp`, `/run`, and `/dev/shm` are tmpfs regardless of the mode above. They keep their contents while the machine runs, including across `exec` sessions, but are empty again after a stop and start. `/workspace` and the rest of the machine filesystem are on the storage disk, so write anything that must outlive a restart there — including credentials and configuration, which should not sit in `/tmp` or behind a symlink into it.
 
 ## CLI Structure
 

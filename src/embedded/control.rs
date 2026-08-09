@@ -187,6 +187,7 @@ pub fn fork_vm(
     // Boot the clone from the golden's in-memory snapshot instead of cold-booting.
     let features = LaunchFeatures {
         snapshot_dir: Some(prep.snapshot_dir.clone()),
+        cuda_preload_modules: prep.clone_record.cuda_preload_modules,
         ..LaunchFeatures::default()
     };
     match launch_from_record(&prep.clone_record, features) {

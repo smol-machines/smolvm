@@ -235,6 +235,12 @@ CUDA API Remoting
 
 CUDA remoting requires an NVIDIA GPU and a working NVIDIA driver on the host. It is not GPU passthrough: the guest receives neither the physical device nor an NVIDIA driver.
 
+Fork-heavy Linux hosts should use a kernel containing upstream KVM fix
+[`916b7f4`](https://github.com/torvalds/linux/commit/916b7f42b3b3b539a71c204a9b49fdc4ca92cd82).
+Affected kernels can intermittently report `ENOMEM` on the first `KVM_RUN` even
+with ample host memory; smolvm reduces exposure and replaces a failed worker,
+but the kernel update is the definitive fix.
+
 The VM boundary still isolates the workload's CPU, memory, and filesystem. GPU access is mediated by host processes and the shared host GPU, so GPU isolation remains process-level rather than a hardware or VM boundary. Do not treat CUDA remoting as a hardened multi-tenant GPU isolation boundary.
 
 See [GPU access by API remoting: how a driverless microVM runs CUDA](https://smolmachines.com/engineering/gpu-over-vsock) for the design, trade-offs, and comparison with passthrough.

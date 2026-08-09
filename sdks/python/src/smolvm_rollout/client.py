@@ -13,6 +13,19 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 
+_FORK_ENV_PATH = Path("/etc/smolvm/fork-env")
+_ROLLOUT_URL_ENV = "SMOLVM_ROLLOUT_URL"
+_ROLLOUT_TOKEN_ENV = "SMOLVM_ROLLOUT_TOKEN"
+_ROLLOUT_EXECUTOR_ENV = "SMOLVM_ROLLOUT_EXECUTOR"
+_ROLLOUT_POLICY_ENV = "SMOLVM_ROLLOUT_POLICY"
+_ROLLOUT_LEASE_KEYS = (
+    _ROLLOUT_URL_ENV,
+    _ROLLOUT_TOKEN_ENV,
+    _ROLLOUT_EXECUTOR_ENV,
+    _ROLLOUT_POLICY_ENV,
+)
+
+
 class RolloutError(RuntimeError):
     """A structured error returned by smolvm's rollout API."""
 
@@ -21,6 +34,57 @@ class RolloutError(RuntimeError):
         self.status = status
         self.code = code
         self.message = message
+
+
+def _read_fork_env(path: Path) -> dict[str, str]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return {}
+    except OSError as error:
+        raise RuntimeError(f"cannot read smolvm fork assignment {path}: {error}") from error
+
+    values: dict[str, str] = {}
+    for number, line in enumerate(lines, start=1):
+        if not line or line.startswith("#"):
+            continue
+        key, separator, value = line.partition("=")
+        if not separator or not key:
+            raise RuntimeError(f"invalid smolvm fork assignment at {path}:{number}")
+        if key in values:
+            raise RuntimeError(f"duplicate {key} in smolvm fork assignment {path}")
+        values[key] = value
+    return values
+
+
+def _lease_configuration(path: Path) -> tuple[str, str, str, str]:
+    values = _read_fork_env(path)
+    for key in _ROLLOUT_LEASE_KEYS:
+        if key in os.environ:
+            values[key] = os.environ[key]
+    missing = [key for key in _ROLLOUT_LEASE_KEYS if not values.get(key)]
+    if missing:
+        raise RuntimeError(
+            "smolvm rollout lease configuration is unavailable: missing "
+            + ", ".join(missing)
+        )
+
+    url = values[_ROLLOUT_URL_ENV].rstrip("/")
+    executor = values[_ROLLOUT_EXECUTOR_ENV]
+    suffix = f"/rollout-executors/{executor}"
+    if not url.endswith(suffix):
+        raise RuntimeError(
+            f"{_ROLLOUT_URL_ENV} does not match {_ROLLOUT_EXECUTOR_ENV}"
+        )
+    api_url = url[: -len(suffix)]
+    if not api_url.startswith(("http://", "https://")):
+        raise RuntimeError(f"{_ROLLOUT_URL_ENV} must be an HTTP URL")
+    return (
+        api_url,
+        executor,
+        values[_ROLLOUT_TOKEN_ENV],
+        values[_ROLLOUT_POLICY_ENV],
+    )
 
 
 def adapter_sha256(directory: str | os.PathLike[str]) -> str:
@@ -61,14 +125,28 @@ class RolloutClient:
 
     def __init__(
         self,
-        api_url: str,
-        executor: str,
+        api_url: str | None = None,
+        executor: str | None = None,
         *,
+        bearer_token: str | None = None,
+        fork_env_path: str | os.PathLike[str] = _FORK_ENV_PATH,
         timeout: float = 300.0,
         ssl_context: ssl.SSLContext | None = None,
     ) -> None:
+        lease_policy = None
+        if api_url is None and executor is None:
+            api_url, executor, discovered_token, lease_policy = _lease_configuration(
+                Path(fork_env_path)
+            )
+            if bearer_token is not None and bearer_token != discovered_token:
+                raise ValueError("bearer_token conflicts with the smolvm lease credential")
+            bearer_token = discovered_token
+        elif api_url is None or executor is None:
+            raise TypeError("api_url and executor must be provided together")
         self.api_url = api_url.rstrip("/")
         self.executor = executor
+        self.bearer_token = bearer_token
+        self.lease_policy = lease_policy
         self.timeout = timeout
         self.ssl_context = ssl_context
 
@@ -79,11 +157,14 @@ class RolloutClient:
         body: dict[str, Any] | None = None,
     ) -> Any:
         data = None if body is None else json.dumps(body, separators=(",", ":")).encode()
+        headers = {"content-type": "application/json"}
+        if self.bearer_token is not None:
+            headers["authorization"] = f"Bearer {self.bearer_token}"
         request = urllib.request.Request(
             f"{self.api_url}{path}",
             data=data,
             method=method,
-            headers={"content-type": "application/json"},
+            headers=headers,
         )
         try:
             with urllib.request.urlopen(

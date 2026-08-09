@@ -695,6 +695,8 @@ pub struct ForkLaunch {
     /// Clone boot only: share the golden's loaded CUDA weights instead of
     /// copying them (`machine fork --share-weights`).
     pub share_weights: bool,
+    /// Preload the golden's staged CUDA modules while this clone boots.
+    pub preload_modules: bool,
     /// Planned number of runnable CUDA clones. Set only when starting a golden;
     /// the value is persisted on its record and inherited by clone records.
     pub pool_size: Option<u32>,
@@ -710,6 +712,7 @@ pub fn forkable_launch() -> ForkLaunch {
         forkable: true,
         snapshot_dir: None,
         share_weights: false,
+        preload_modules: false,
         pool_size: None,
         vram_limit_mib: None,
     }
@@ -1026,6 +1029,7 @@ fn boot_prepared_fork(
     fork_env: &[(String, String)],
     retry_gate: Option<&std::sync::Mutex<()>>,
 ) -> smolvm::Result<()> {
+    let preload_modules = prep.clone_record.cuda_preload_modules;
     eprintln!("Booting clone '{clone}' from snapshot...");
     let mut start = || {
         start_vm_named_with_db(
@@ -1037,6 +1041,7 @@ fn boot_prepared_fork(
             ForkLaunch {
                 snapshot_dir: Some(prep.snapshot_dir.clone()),
                 share_weights,
+                preload_modules,
                 ..Default::default()
             },
         )
@@ -1337,6 +1342,7 @@ fn start_vm_named_with_db(
     features.forkable = fork.forkable;
     features.snapshot_dir = fork.snapshot_dir;
     features.cuda_share_weights = fork.share_weights;
+    features.cuda_preload_modules = fork.preload_modules;
     features.cuda_fork_pool_size = record.cuda_fork_pool_size;
     features.cuda_vram_limit_mib = record.cuda_vram_limit_mib;
     // A machine created from a local image archive/dir persists a `local:…`

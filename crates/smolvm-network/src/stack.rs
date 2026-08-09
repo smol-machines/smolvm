@@ -124,6 +124,8 @@ pub struct VirtioPollConfig {
     pub prefix_len6: u8,
     /// Upstream resolver the gateway forwards guest DNS queries to.
     pub upstream_dns: Ipv4Addr,
+    /// Dedicated loopback service reachable only at the guest-visible gateway.
+    pub host_service: Option<crate::GatewayHostService>,
     /// IP-level MTU.
     pub mtu: usize,
 }
@@ -213,7 +215,12 @@ fn run_network_stack(
     // the resolver the guest picked wins over the answer.
     let intercept_dns_tcp = egress.intercepts_dns();
     let relay_wake = Arc::new(queues.relay_wake.clone());
-    let mut relays = TcpRelayTable::new(None, egress.clone(), gateway_addrs.to_vec());
+    let mut relays = TcpRelayTable::new(
+        None,
+        egress.clone(),
+        gateway_addrs.to_vec(),
+        config.host_service,
+    );
     let mut udp_sockets = udp_relay::UdpSocketTable::new();
     let udp_channels = {
         let shutdown_queues = queues.clone();

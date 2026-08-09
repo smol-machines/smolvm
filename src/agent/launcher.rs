@@ -212,6 +212,8 @@ pub struct LaunchFeatures {
     /// golden's loaded weight physicals instead of copying them (one base copy
     /// in VRAM across sibling clones; correct for frozen-base fine-tuning).
     pub cuda_share_weights: bool,
+    /// Preload the golden's staged CUDA modules while a clone worker boots.
+    pub cuda_preload_modules: bool,
     /// Number of runnable CUDA fork clones planned for this golden. The host
     /// uses it before guest CUDA initialization to expose a safe per-session
     /// VRAM share to cache-sizing frameworks such as vLLM.
@@ -892,6 +894,8 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 }
 
                 let mut guest_network = GuestNetworkConfig::default();
+                guest_network.host_service = crate::network::launch::guest_host_service()
+                    .map_err(|reason| Error::config("configure guest rollout ingress", reason))?;
                 // A custom resolver (--dns) becomes the gateway's upstream: the
                 // guest still points at the gateway (100.96.0.1), which forwards
                 // queries to this address instead of the default.

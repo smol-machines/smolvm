@@ -200,6 +200,9 @@ fn maybe_set_clock_from_host() {
 }
 
 fn main() {
+    if forkpoint::worker_ready_helper_requested() {
+        std::process::exit(forkpoint::run_worker_ready_helper());
+    }
     if forkpoint::helper_requested() {
         std::process::exit(forkpoint::run_helper());
     }
@@ -2075,6 +2078,7 @@ fn handle_request(
     match request {
         AgentRequest::Ping => AgentResponse::Pong {
             version: PROTOCOL_VERSION,
+            capabilities: vec![smolvm_protocol::forkpoint::WORKER_READY_CAPABILITY.to_string()],
         },
 
         AgentRequest::FsNotify { events } => handle_fsnotify(&events),

@@ -319,7 +319,8 @@ pub fn launch_agent_vm_dynamic(
                 free_ctx_on_err!("krun_add_vsock failed");
             }
 
-            let guest_network = GuestNetworkConfig::default();
+            let mut guest_network = GuestNetworkConfig::default();
+            guest_network.host_service = crate::network::launch::guest_host_service()?;
             let mut guest_mac = guest_network.guest_mac;
             let port_mappings: Vec<VirtioPortMapping> = config
                 .port_mappings

@@ -1539,7 +1539,7 @@ pub(crate) async fn fork_held_machines_inner(
             }
         }
         if rollback_completed {
-            if let Err(error) = state.db().remove_fork_pool_snapshot(&golden) {
+            if let Err(error) = state.db().remove_retained_fork_snapshot(&golden) {
                 tracing::warn!(%golden, %error, "failed to remove rolled-back fork pool checkpoint");
             }
             if let Err(error) = std::fs::remove_dir_all(&snapshot_dir) {
@@ -1636,6 +1636,7 @@ async fn boot_prepared_fork_inner(
         // Boot from the golden's snapshot instead of cold-booting.
         features.snapshot_dir = Some(prep.snapshot_dir);
         features.cuda_share_weights = share_weights;
+        features.cuda_preload_modules = record.cuda_preload_modules;
         features.cuda_fork_pool_size = record.cuda_fork_pool_size;
         features.cuda_vram_limit_mib = record.cuda_vram_limit_mib;
 

@@ -11,6 +11,10 @@ use std::fmt::Display;
 /// API error type with HTTP status code mapping.
 #[derive(Debug)]
 pub enum ApiError {
+    /// Missing or invalid authentication credentials (401).
+    Unauthorized(String),
+    /// Authenticated caller is not allowed to access this resource (403).
+    Forbidden(String),
     /// Resource not found (404).
     NotFound(String),
     /// Conflict - resource already exists or invalid state (409).
@@ -52,6 +56,8 @@ struct ErrorResponse {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, code, message) = match self {
+            ApiError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, "UNAUTHORIZED", msg),
+            ApiError::Forbidden(msg) => (StatusCode::FORBIDDEN, "FORBIDDEN", msg),
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, "NOT_FOUND", msg),
             ApiError::Conflict(msg) => (StatusCode::CONFLICT, "CONFLICT", msg),
             ApiError::PortConflict(msg) => (StatusCode::CONFLICT, "PORT_IN_USE", msg),
@@ -124,6 +130,8 @@ mod tests {
     #[test]
     fn test_api_error_status_codes() {
         let cases = [
+            (ApiError::Unauthorized("x".into()), StatusCode::UNAUTHORIZED),
+            (ApiError::Forbidden("x".into()), StatusCode::FORBIDDEN),
             (ApiError::NotFound("x".into()), StatusCode::NOT_FOUND),
             (ApiError::Conflict("x".into()), StatusCode::CONFLICT),
             (ApiError::BadRequest("x".into()), StatusCode::BAD_REQUEST),

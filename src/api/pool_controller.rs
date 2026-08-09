@@ -18,6 +18,27 @@ const MAX_PREPARED_POOL_WORKERS: usize = 32;
 // four-worker checkpoint barriers.
 const MAX_CONCURRENT_POOL_BOOTS: usize = 4;
 
+fn provision_failure_reason(message: &str) -> &'static str {
+    if message.contains("Failure during vcpu run: Cannot allocate memory (os error 12)") {
+        "kvm_enomem"
+    } else if message.contains("clone agent did not respond to ping within timeout") {
+        "agent_timeout"
+    } else if message.contains("CUDA clone worker failed during reconstruction") {
+        "cuda_reconstruction"
+    } else {
+        "other"
+    }
+}
+
+fn record_provision(status: &'static str, reason: &'static str) {
+    metrics::counter!(
+        "smolvm_fork_pool_provisions_total",
+        "status" => status,
+        "reason" => reason
+    )
+    .increment(1);
+}
+
 type RetainedSnapshotMap = Arc<
     parking_lot::Mutex<std::collections::HashMap<String, crate::agent::fork::RetainedForkSnapshot>>,
 >;
@@ -44,7 +65,7 @@ impl ForkPoolController {
                 None
             }
         };
-        let retained_snapshots = match state.db().list_fork_pool_snapshots() {
+        let retained_snapshots = match state.db().list_retained_fork_snapshots() {
             Ok(snapshots) => {
                 if !snapshots.is_empty() {
                     tracing::info!(
@@ -239,7 +260,7 @@ impl ForkPoolController {
             let db = self.state.db().clone();
             match tokio::task::spawn_blocking(move || {
                 for golden in stale_snapshots {
-                    if let Err(error) = db.remove_fork_pool_snapshot(&golden) {
+                    if let Err(error) = db.remove_retained_fork_snapshot(&golden) {
                         tracing::warn!(%golden, %error, "failed to remove inactive fork pool checkpoint");
                     }
                 }
@@ -569,6 +590,7 @@ impl ForkPoolController {
                 tracing::warn!(pool = %pool.name, error = ?error, workers = machines.len(), "failed to prepare fork pool worker batch");
                 for machine in machines {
                     if !completed.contains(&machine) {
+                        record_provision("failed", "batch");
                         Self::retire_failed_provision(&state, machine, format!("{error:?}")).await;
                     }
                 }
@@ -592,30 +614,37 @@ impl ForkPoolController {
                 .await
                 {
                     Ok(Ok(true)) => {
+                        record_provision("ready", "none");
                         tracing::info!(pool = %pool.name, machine = %machine, "fork pool worker ready");
                         return;
                     }
                     Ok(Ok(false)) => {
+                        record_provision("failed", "pool_changed");
                         tracing::info!(pool = %pool.name, machine = %machine, "pool changed while worker was provisioning; retiring worker");
                         "pool changed while worker was provisioning".into()
                     }
                     Ok(Err(error)) => {
+                        record_provision("failed", "state");
                         tracing::warn!(pool = %pool.name, machine = %machine, %error, "failed to mark fork pool worker ready");
                         error.to_string()
                     }
                     Err(error) => {
+                        record_provision("failed", "state_task");
                         tracing::warn!(pool = %pool.name, machine = %machine, %error, "fork pool ready task failed");
                         error.to_string()
                     }
                 }
             }
             Ok(_) => {
+                record_provision("failed", "not_held");
                 tracing::warn!(pool = %pool.name, machine = %machine, "forked pool worker was not held");
                 "forked pool worker was not held".into()
             }
             Err(error) => {
+                let detail = format!("{error:?}");
+                record_provision("failed", provision_failure_reason(&detail));
                 tracing::warn!(pool = %pool.name, machine = %machine, error = ?error, "failed to provision fork pool worker");
-                format!("{error:?}")
+                detail
             }
         };
         Self::retire_failed_provision(state, machine, retirement_reason).await;
@@ -679,5 +708,24 @@ mod tests {
         snapshots.insert("golden".into(), newer.clone());
         update_retained_snapshot(&mut snapshots, "golden", Some(&prior), None);
         assert_eq!(snapshots.get("golden"), Some(&newer));
+    }
+
+    #[test]
+    fn provisioning_metrics_classify_the_affected_kvm_enomem() {
+        assert_eq!(
+            provision_failure_reason(
+                "Failure during vcpu run: Cannot allocate memory (os error 12)"
+            ),
+            "kvm_enomem"
+        );
+        assert_eq!(
+            provision_failure_reason("clone agent did not respond to ping within timeout"),
+            "agent_timeout"
+        );
+        assert_eq!(
+            provision_failure_reason("CUDA clone worker failed during reconstruction"),
+            "cuda_reconstruction"
+        );
+        assert_eq!(provision_failure_reason("agent never pinged"), "other");
     }
 }

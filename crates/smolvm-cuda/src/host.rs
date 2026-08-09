@@ -1455,17 +1455,23 @@ fn prereplay_enabled() -> bool {
     prereplay_setting(std::env::var("SMOLVM_CUDA_PREREPLAY").ok().as_deref())
 }
 
-/// P3b: pre-warm a clone worker at SPAWN, before any guest channel attaches —
+fn module_preload_enabled() -> bool {
+    prereplay_setting(std::env::var("SMOLVM_CUDA_PRELOAD_MODULES").ok().as_deref())
+}
+
+/// Pre-warm a clone worker at spawn, before any guest channel attaches —
 /// eagerly reload every staged golden module and re-capture every inherited
 /// graph into the process-wide registries. Serving sessions then ADOPT the
 /// results at resume instead of paying reload/re-capture on the guest's first
 /// CUDA call. Must run on the worker main thread AFTER module staging and
 /// lib-handle replay (their thread-locals seed the scratch session).
-/// Opt in: SMOLVM_CUDA_PREREPLAY=1. Replaying every captured shape can execute
-/// stale/unneeded buffers and poison the context; lazy first-launch replay is
-/// the safe default.
+/// `SMOLVM_CUDA_PRELOAD_MODULES=1` performs module loading only, while the
+/// separate diagnostic `SMOLVM_CUDA_PREREPLAY=1` also replays captured graphs.
+/// Replaying every captured shape can execute stale or unneeded buffers and
+/// poison the context, so graph replay remains explicitly opt-in.
 pub fn prewarm_clone_worker(b: &mut dyn Backend) {
-    if !prereplay_enabled() {
+    let replay_graphs = prereplay_enabled();
+    if !replay_graphs && !module_preload_enabled() {
         return;
     }
     let t0 = std::time::Instant::now();
@@ -1482,7 +1488,11 @@ pub fn prewarm_clone_worker(b: &mut dyn Backend) {
         ..Session::default()
     };
     gpu::set_lib_trans(&sess.dptr_trans);
-    let oplogs = worker_graph_oplogs_peek();
+    let oplogs = if replay_graphs {
+        worker_graph_oplogs_peek()
+    } else {
+        Vec::new()
+    };
     let (mut ok, mut failed) = (0u32, 0u32);
     for (_graph_vh, exec_vh, ops) in oplogs {
         if replayed_exec_get(exec_vh).is_some() {
@@ -1495,13 +1505,13 @@ pub fn prewarm_clone_worker(b: &mut dyn Backend) {
                 ok += 1;
             }
             Err(e) => {
-                eprintln!("[p3b] spawn pre-replay exec {exec_vh:#x} failed st={e}");
+                eprintln!("clone pre-replay exec {exec_vh:#x} failed st={e}");
                 failed += 1;
             }
         }
     }
     eprintln!(
-        "[p3b] spawn pre-warm: {nmods} module(s) in {t_mods} ms, {ok} graph(s) re-captured \
+        "clone pre-warm: {nmods} module(s) in {t_mods} ms, {ok} graph(s) re-captured \
          ({failed} deferred) in {} ms total",
         t0.elapsed().as_millis()
     );
