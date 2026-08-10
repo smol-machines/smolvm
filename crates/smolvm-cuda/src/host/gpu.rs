@@ -949,7 +949,7 @@ impl GpuBackend {
                     None => response(CUDA_ERROR_INVALID_VALUE, std::ptr::null_mut()),
                 }
             }
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             14 => {
                 use std::os::unix::io::AsRawFd;
                 const TMPFS_MAGIC: libc::c_long = 0x0102_1994;
@@ -1110,7 +1110,7 @@ impl Backend for GpuBackend {
         Ok(uuid)
     }
     fn device_get_pci_bus_id(&mut self, device: i32) -> CuResult<String> {
-        let mut value = [0i8; 32];
+        let mut value: [c_char; 32] = [0; 32];
         unsafe {
             chk((self.device_get_pci_bus_id)(
                 value.as_mut_ptr(),
