@@ -421,6 +421,8 @@ fn format_init_failure(index: usize, exit_code: i32, stdout: &str, stderr: &str)
 /// Parameters for [`create_vm`].
 pub struct CreateVmParams {
     pub name: String,
+    /// Caller metadata, passed through to [`VmRecord::labels`] verbatim.
+    pub labels: std::collections::BTreeMap<String, String>,
     pub image: Option<String>,
     pub entrypoint: Vec<String>,
     pub cmd: Vec<String>,
@@ -648,6 +650,7 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
     record.dns_filter_hosts = params.dns_filter_hosts.clone();
     record.published_sockets = params.published_sockets.clone();
     record.source_smolmachine = params.source_smolmachine.clone();
+    record.labels = params.labels.clone();
 
     // A registry image with no network can never be pulled (the guest runs the
     // pull), so refuse here rather than deferring to a `start` that must fail.
@@ -2229,6 +2232,7 @@ fn machine_status_json(name: &str, record: &VmRecord) -> serde_json::Value {
         "gpu": record.gpu.unwrap_or(false),
         "gpu_vram_mib": record.gpu_vram_mib,
         "forkpoint_held": record.forkpoint_held,
+        "labels": record.labels,
         "restart_policy": record.restart.policy.to_string(),
         "restart_max_retries": record.restart.max_retries,
         "restart_count": record.restart.restart_count,

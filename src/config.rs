@@ -488,6 +488,17 @@ pub struct VmRecord {
     #[serde(default)]
     pub cmd: Vec<String>,
 
+    /// Caller-supplied metadata (`--label k=v`), never interpreted by smolvm.
+    ///
+    /// Exists so a process managing many machines can recognise its own later:
+    /// which sandbox a machine belongs to, which owner created it, when it may be
+    /// reclaimed. Without it the only per-machine identifier is the name, so
+    /// orchestrators are forced to encode state into names (and cannot read it
+    /// back, since the table view truncates them). Ordered so `machine ls --json`
+    /// is stable to diff.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub labels: std::collections::BTreeMap<String, String>,
+
     /// Health check command (run inside VM to verify workload is healthy).
     #[serde(default)]
     pub health_cmd: Option<Vec<String>>,
@@ -650,6 +661,7 @@ impl VmRecord {
             image: None,
             entrypoint: Vec::new(),
             cmd: Vec::new(),
+            labels: Default::default(),
             health_cmd: None,
             health_interval_secs: None,
             health_timeout_secs: None,
@@ -712,6 +724,7 @@ impl VmRecord {
             image: None,
             entrypoint: Vec::new(),
             cmd: Vec::new(),
+            labels: Default::default(),
             health_cmd: None,
             health_interval_secs: None,
             health_timeout_secs: None,

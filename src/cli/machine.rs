@@ -362,6 +362,31 @@ impl MachineCmd {
 // Run Command (Ephemeral)
 // ============================================================================
 
+/// Parse repeated `--label key=value` pairs.
+///
+/// Split on the FIRST `=` only, so values may contain `=` (base64, query
+/// strings). An empty key is rejected: it would be unaddressable, and silently
+/// keeping it would corrupt `machine ls --json` for the caller reading it back.
+fn parse_labels(raw: &[String]) -> smolvm::Result<std::collections::BTreeMap<String, String>> {
+    let mut labels = std::collections::BTreeMap::new();
+    for entry in raw {
+        let Some((key, value)) = entry.split_once('=') else {
+            return Err(smolvm::Error::config(
+                "--label",
+                format!("expected KEY=VALUE, got '{entry}'"),
+            ));
+        };
+        if key.is_empty() {
+            return Err(smolvm::Error::config(
+                "--label",
+                format!("label key cannot be empty (in '{entry}')"),
+            ));
+        }
+        labels.insert(key.to_string(), value.to_string());
+    }
+    Ok(labels)
+}
+
 /// Run a container image in an ephemeral machine.
 ///
 /// By default, runs in ephemeral mode (machine cleaned up after exit).
@@ -1027,6 +1052,9 @@ impl RunCmd {
             self.storage,
             self.overlay,
             cli_allow_cidrs,
+            // Ephemeral runs are not addressable later, so they carry no labels;
+            // `machine create` is the path an orchestrator labels.
+            Default::default(),
         )?;
 
         let mut params = params;
@@ -1358,6 +1386,18 @@ impl RunCmd {
             cuda: self.cuda || params.cuda,
             expose_docker: self.docker_socket || params.docker_socket,
             dns_filter_hosts: params.dns_filter_hosts.clone(),
+            // A foreground ephemeral VM exists only to serve this command, so bind
+            // its lifetime to this process. Without the watchdog the VM survives a
+            // SIGKILL of the CLI — which is how orchestrators (and CI) enforce
+            // timeouts — and then holds its full RAM until some later `machine run`
+            // happens to sweep it (see the bounded reclaim in `MachineCmd::run`).
+            // That sweep stays as the backstop for cases the watchdog can't cover,
+            // such as a host that sleeps mid-run.
+            //
+            // `--detach` deliberately leaves the VM up for later `machine exec`, so
+            // it must opt out: arming this there would kill the VM the moment the
+            // launching CLI returned.
+            watch_parent: Some(!self.detach),
             packed_layers_dir,
             extra_disks: std::env::var("SMOLVM_EXTRA_DISK")
                 .ok()
@@ -1889,6 +1929,38 @@ impl RunCmd {
 
 #[cfg(test)]
 mod tests {
+    use super::parse_labels;
+
+    #[test]
+    fn parses_labels_and_keeps_values_containing_equals() {
+        let labels = parse_labels(&[
+            "owner=exo".to_string(),
+            // Values are opaque to smolvm, so `=` inside one must survive.
+            "token=abc=def==".to_string(),
+            "empty=".to_string(),
+        ])
+        .expect("valid labels");
+        assert_eq!(labels.get("owner").map(String::as_str), Some("exo"));
+        assert_eq!(labels.get("token").map(String::as_str), Some("abc=def=="));
+        assert_eq!(labels.get("empty").map(String::as_str), Some(""));
+    }
+
+    #[test]
+    fn rejects_labels_that_could_not_be_read_back() {
+        // No separator: silently treating this as a valueless key would hand the
+        // caller back something they never wrote.
+        assert!(parse_labels(&["notakeyvalue".to_string()]).is_err());
+        // Empty key is unaddressable.
+        assert!(parse_labels(&["=value".to_string()]).is_err());
+    }
+
+    #[test]
+    fn later_label_wins_for_a_repeated_key() {
+        let labels =
+            parse_labels(&["k=first".to_string(), "k=second".to_string()]).expect("valid labels");
+        assert_eq!(labels.get("k").map(String::as_str), Some("second"));
+    }
+
     use super::*;
     use clap::Parser;
 
@@ -2623,6 +2695,16 @@ pub struct CreateCmd {
     #[arg(short = 'n', long, value_name = "NAME")]
     pub name: Option<String>,
 
+    /// Attach metadata to the machine (repeatable), e.g.
+    /// `--label owner=exo --label sandbox=agent-7`.
+    ///
+    /// smolvm never interprets these. They exist so a process managing many
+    /// machines can identify its own later — which sandbox a machine serves, who
+    /// created it, whether it may be reclaimed — instead of encoding that into
+    /// the name. Read them back with `machine ls --json`.
+    #[arg(long = "label", value_name = "KEY=VALUE")]
+    pub labels: Vec<String>,
+
     /// Container image: a registry reference (alpine, python:3.12-alpine), a
     /// `docker save` archive (./myapp.tar, or `-` to read one from stdin), or an
     /// unpacked rootfs directory (./rootfs/). A bare name is always a registry
@@ -2845,6 +2927,7 @@ impl CreateCmd {
             self.storage,
             self.overlay,
             cli_allow_cidrs,
+            parse_labels(&self.labels)?,
         )?;
         let mut params = params;
         if self.auto_graph {
@@ -3054,6 +3137,7 @@ impl CreateCmd {
             restart_policy: None,
             restart_max_retries: None,
             restart_max_backoff_secs: None,
+            labels: parse_labels(&self.labels)?,
             health_cmd: None,
             health_interval_secs: None,
             health_timeout_secs: None,

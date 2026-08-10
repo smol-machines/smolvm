@@ -50,6 +50,10 @@ pub fn build_create_params(
     cli_storage_gb: Option<u64>,
     cli_overlay_gb: Option<u64>,
     cli_allow_cidr: Vec<String>,
+    // Labels come only from the CLI today; a Smolfile has no `labels` key yet.
+    // Threaded explicitly so `--label` is not silently dropped when a Smolfile
+    // is also supplied.
+    cli_labels: std::collections::BTreeMap<String, String>,
 ) -> smolvm::Result<CreateVmParams> {
     let cidrs_to_option = |v: Vec<String>| if v.is_empty() { None } else { Some(v) };
 
@@ -60,6 +64,7 @@ pub fn build_create_params(
             return Ok(CreateVmParams {
                 secret_refs: Default::default(),
                 name,
+                labels: cli_labels,
                 image: cli_image,
                 entrypoint: cli_entrypoint.map(|e| vec![e]).unwrap_or_default(),
                 cmd: cli_cmd,
@@ -258,6 +263,7 @@ pub fn build_create_params(
         .and_then(|s| parse_duration_secs(s));
 
     Ok(CreateVmParams {
+        labels: cli_labels,
         secret_refs: sf.secrets,
         name,
         image,
@@ -474,6 +480,7 @@ mod tests {
             None,
             None,
             vec![],
+            Default::default(),
         )
         .unwrap();
 
