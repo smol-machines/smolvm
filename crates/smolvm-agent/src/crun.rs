@@ -596,6 +596,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn workload_cleanup_kills_background_descendants() {
         let mut shell = std::process::Command::new("/bin/sh")
             .args(["-c", "sleep 60 & wait"])
