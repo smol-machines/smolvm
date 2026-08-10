@@ -362,6 +362,17 @@ if [[ -n "$CUDART_SHIM_SRC" && -f "$CUDART_SHIM_SRC" \
     # failure and users hand-symlink the shim to fix it.
     ln -sf libcuda.so.1 "$OUTPUT_DIR/usr/local/lib/smolvm-cuda/libcuda.so"
     ln -sf libcudart-shim.so "$OUTPUT_DIR/usr/local/lib/smolvm-cuda/libcudart.so"
+    # Dynamic CUDA applications carry versioned DT_NEEDED entries. PyTorch's
+    # wheel-local copies are covered by per-file bind mounts, but an ordinary
+    # nvcc binary expects the matching soname to exist directly on
+    # LD_LIBRARY_PATH. Route every runtime/library ABI the shim advertises to
+    # the same implementation so those binaries start without manual links.
+    for soname in \
+        libcudart.so.13 libcublas.so.13 libcublasLt.so.13 \
+        libcudart.so.12 libcublas.so.12 libcublasLt.so.12 libcudnn.so.9 \
+        libcudart.so.11.0 libcublas.so.11 libcublasLt.so.11 libcudnn.so.8; do
+        ln -sf libcudart-shim.so "$OUTPUT_DIR/usr/local/lib/smolvm-cuda/$soname"
+    done
     # NVML drop-in: frameworks (vLLM) detect the GPU through NVML, not the CUDA
     # driver — the shim dir rides LD_LIBRARY_PATH, so the plain-soname dlopen of
     # libnvidia-ml.so.1 resolves here. Best-effort: absent on non-Linux builds.

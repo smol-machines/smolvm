@@ -196,9 +196,20 @@ jobs:
         run: |
           for f in \
             usr/local/lib/smolvm-cuda/libcudart-shim.so \
+            usr/local/lib/smolvm-cuda/libcudart.so.13 \
+            usr/local/lib/smolvm-cuda/libcublas.so.13 \
+            usr/local/lib/smolvm-cuda/libcublasLt.so.13 \
+            usr/local/lib/smolvm-cuda/libcudart.so.12 \
+            usr/local/lib/smolvm-cuda/libcublas.so.12 \
+            usr/local/lib/smolvm-cuda/libcublasLt.so.12 \
+            usr/local/lib/smolvm-cuda/libcudnn.so.9 \
+            usr/local/lib/smolvm-cuda/libcudart.so.11.0 \
+            usr/local/lib/smolvm-cuda/libcublas.so.11 \
+            usr/local/lib/smolvm-cuda/libcublasLt.so.11 \
+            usr/local/lib/smolvm-cuda/libcudnn.so.8 \
             usr/local/lib/smolvm-cuda/libcuda.so.1 \
             usr/local/bin/smolvm-cuda-run; do
-            if [[ ! -f "target/agent-rootfs/$f" ]]; then
+            if [[ ! -e "target/agent-rootfs/$f" ]]; then
               echo "::error::missing $f in agent-rootfs (CUDA auto-staging would be disabled)"
               exit 1
             fi
