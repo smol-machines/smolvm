@@ -1105,21 +1105,23 @@ fn rollback_failed_fork(
     resume_golden: bool,
     error: smolvm::Error,
 ) -> smolvm::Result<()> {
-    let resume_error = if resume_golden {
-        smolvm::agent::fork::resume_golden(golden, snapshot_dir).err()
-    } else {
-        None
-    };
+    if resume_golden {
+        if let Err(resume_error) = smolvm::agent::fork::resume_golden(golden, snapshot_dir) {
+            return Err(smolvm::Error::agent(
+                "fork rollback",
+                format!(
+                    "{error}; golden rollback failed: {resume_error}; preserved checkpoint {} for recovery",
+                    snapshot_dir.display()
+                ),
+            ));
+        }
+    }
     let cleanup_error = std::fs::remove_dir_all(snapshot_dir).err();
-    match (cleanup_error, resume_error) {
-        (None, None) => Err(error),
-        (cleanup, resume) => Err(smolvm::Error::agent(
+    match cleanup_error {
+        None => Err(error),
+        Some(cleanup) => Err(smolvm::Error::agent(
             "fork rollback",
-            format!(
-                "{error}; snapshot cleanup: {}; golden resume: {}",
-                cleanup.map_or_else(|| "ok".to_string(), |e| e.to_string()),
-                resume.map_or_else(|| "ok".to_string(), |e| e.to_string()),
-            ),
+            format!("{error}; golden rollback succeeded but snapshot cleanup failed: {cleanup}"),
         )),
     }
 }

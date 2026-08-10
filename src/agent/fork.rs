@@ -618,7 +618,13 @@ fn rollback_new_snapshot(
 ) -> Error {
     let mut rollback_errors = Vec::new();
     if let Err(resume_error) = resume_golden(golden, snapshot_dir) {
-        rollback_errors.push(format!("golden resume failed: {resume_error}"));
+        return Error::agent(
+            "fork",
+            format!(
+                "{error}; golden rollback failed: {resume_error}; preserved checkpoint {} for recovery",
+                snapshot_dir.display()
+            ),
+        );
     }
     if persisted {
         if let Err(remove_error) = db.remove_retained_fork_snapshot(golden) {
