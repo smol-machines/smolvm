@@ -51,6 +51,7 @@ impl MachineSpec {
         record.network_backend = self.resources.network_backend;
         record.gpu = Some(self.resources.gpu);
         record.gpu_vram_mib = self.resources.gpu_vram_mib;
+        record.cuda = self.resources.cuda;
         record.image = self.image.clone();
         record.ephemeral = !self.persistent;
         record.runtime_managed = self.runtime_managed;
@@ -410,20 +411,25 @@ mod tests {
 
     #[test]
     fn record_carries_gpu_resources() {
-        // GPU must survive MachineSpec -> VmRecord (the `_boot-vm` config),
-        // otherwise the SDK's `resources.gpu` is silently dropped before launch.
+        // Vulkan and CUDA must survive MachineSpec -> VmRecord (the `_boot-vm`
+        // config), otherwise SDK and Kubernetes requests are silently dropped.
         let mut spec = test_spec("gpu", false);
         spec.resources.gpu = true;
         spec.resources.gpu_vram_mib = Some(512);
+        spec.resources.cuda = true;
         let record = spec.to_record();
         assert_eq!(record.gpu, Some(true));
         assert_eq!(record.gpu_vram_mib, Some(512));
         assert!(record.vm_resources().gpu);
+        assert!(record.cuda);
+        assert!(record.vm_resources().cuda);
 
         // Default (no GPU) records leave gpu off.
         let plain = test_spec("plain", false).to_record();
         assert_eq!(plain.gpu, Some(false));
         assert!(!plain.vm_resources().gpu);
+        assert!(!plain.cuda);
+        assert!(!plain.vm_resources().cuda);
     }
 
     #[test]
