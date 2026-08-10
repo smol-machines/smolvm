@@ -85,6 +85,24 @@ fn resolve_egress_flags(
     Ok((allow_cidr, net, dns_filter_hosts))
 }
 
+fn smolmachine_egress_fields(
+    manifest_network: bool,
+    allow_cidrs: Vec<String>,
+    cli_network: bool,
+    dns_filter_hosts: Option<Vec<String>>,
+) -> (bool, Option<Vec<String>>, Option<Vec<String>>) {
+    let allowed_cidrs = if allow_cidrs.is_empty() {
+        None
+    } else {
+        Some(allow_cidrs)
+    };
+    (
+        manifest_network || cli_network,
+        allowed_cidrs,
+        dns_filter_hosts,
+    )
+}
+
 /// Parse `--secret-env KEY=HOST_VAR` and `--secret-file KEY=PATH` flag values
 /// into validated [`SecretRef`]s keyed by the guest-side env var name.
 ///
@@ -1974,6 +1992,24 @@ mod tests {
     }
 
     #[test]
+    fn smolmachine_egress_fields_preserve_resolved_cli_policy() {
+        let cidrs = vec!["192.0.2.10/32".to_string()];
+        let hosts = Some(vec!["provider.test".to_string()]);
+        assert_eq!(
+            smolmachine_egress_fields(false, cidrs.clone(), true, hosts.clone()),
+            (true, Some(cidrs), hosts)
+        );
+    }
+
+    #[test]
+    fn smolmachine_egress_fields_preserve_manifest_network_default() {
+        assert_eq!(
+            smolmachine_egress_fields(true, Vec::new(), false, None),
+            (true, None, None)
+        );
+    }
+
+    #[test]
     fn parse_published_sockets_rejects_bad_specs() {
         assert!(parse_published_sockets(&[], &["/only-host".to_string()]).is_err());
         assert!(parse_published_sockets(&[":/tmp/h.sock".to_string()], &[]).is_err());
@@ -2990,6 +3026,19 @@ impl CreateCmd {
             manifest.mem
         };
 
+        let (cli_allow_cidrs, cli_network, cli_dns_filter_hosts) = resolve_egress_flags(
+            self.allow_cidr.clone(),
+            self.allow_host.clone(),
+            self.outbound_localhost_only,
+            self.net,
+        )?;
+        let (network, allowed_cidrs, dns_filter_hosts) = smolmachine_egress_fields(
+            manifest.network,
+            cli_allow_cidrs,
+            cli_network,
+            cli_dns_filter_hosts,
+        );
+
         // A .smolmachine is an untrusted, portable artifact: validate its secret
         // refs under the Untrusted scope, which rejects every source kind. A
         // packed `from_env`/`from_file` ref would otherwise read THIS host's
@@ -3035,7 +3084,7 @@ impl CreateCmd {
             mem,
             volume: self.volume.clone(),
             port: self.port.clone(),
-            net: self.net || manifest.network,
+            net: network,
             network_backend: self.net_backend,
             dns: self.dns,
             init: self.init.clone(),
@@ -3050,7 +3099,7 @@ impl CreateCmd {
             workdir: manifest.workdir,
             storage_gb: self.storage,
             overlay_gb: self.overlay,
-            allowed_cidrs: None,
+            allowed_cidrs,
             restart_policy: None,
             restart_max_retries: None,
             restart_max_backoff_secs: None,
@@ -3062,13 +3111,34 @@ impl CreateCmd {
             ssh_agent: self.ssh_agent,
             cuda: self.cuda || self.auto_graph,
             docker_socket: self.docker_socket,
-            dns_filter_hosts: None,
+            dns_filter_hosts,
             published_sockets: parse_published_sockets(&self.expose_socket, &self.mount_socket)?,
             gpu: manifest.gpu,
             gpu_vram_mib: None,
             rosetta: false,
             source_smolmachine: Some(canonical_path),
         };
+
+        let resources = VmResources {
+            cpus: params.cpus,
+            memory_mib: params.mem,
+            network: params.net,
+            network_backend: params.network_backend,
+            dns: params.dns,
+            gpu: params.gpu,
+            gpu_vram_mib: params.gpu_vram_mib,
+            cuda: params.cuda,
+            rosetta: params.rosetta,
+            storage_gib: params.storage_gb,
+            overlay_gib: params.overlay_gb,
+            allowed_cidrs: params.allowed_cidrs.clone(),
+        };
+        resources.validate()?;
+        validate_requested_network_backend(
+            &resources,
+            params.dns_filter_hosts.as_deref(),
+            params.port.len(),
+        )?;
 
         let record = vm_common::build_vm_record(&params)?;
         let reservation = vm_common::CreateVmReservation::reserve(&name_for_layers)?;
