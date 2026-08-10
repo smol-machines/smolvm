@@ -181,14 +181,18 @@ pub struct ClientRing {
     _file_mapping: Option<ClientRingMapping>,
 }
 
+#[cfg(unix)]
 struct ClientRingMapping {
     base: usize,
     len: usize,
 }
 
+#[cfg(not(unix))]
+struct ClientRingMapping;
+
+#[cfg(unix)]
 impl Drop for ClientRingMapping {
     fn drop(&mut self) {
-        #[cfg(unix)]
         // SAFETY: base/len are the exact successful mmap result transferred to
         // ClientRing after the host accepts the file-ring upgrade.
         unsafe {
@@ -316,6 +320,7 @@ impl<S: Read + Write> Client<S> {
     /// `fname` (inside the guest's dax ring mount) MAP_SHARED and hands the
     /// page pointers here; the host mmaps the same file through the dir its
     /// proxy advertised. Layout: req pages, then resp, then bounce.
+    #[cfg(unix)]
     pub fn ring_setup_file(
         &mut self,
         page_size: usize,

@@ -3001,11 +3001,16 @@ struct HostRings {
     _file_mapping: Option<RingFileMapping>,
 }
 
+#[cfg(unix)]
 struct RingFileMapping {
     base: *mut libc::c_void,
     len: usize,
 }
 
+#[cfg(not(unix))]
+struct RingFileMapping;
+
+#[cfg(unix)]
 impl Drop for RingFileMapping {
     fn drop(&mut self) {
         // SAFETY: base/len are the exact successful mmap result retained by
@@ -5806,19 +5811,21 @@ mod tests {
         let rings = HostRings::map_file(PAGE as u32, 1, 1, 1, b"ring.bin").unwrap();
         ring_dir_set(None);
 
-        let mapping = rings._file_mapping.as_ref().unwrap();
-        let base = mapping.base;
-        let mut residency = 0_u8;
-        // SAFETY: base identifies the live page-aligned mapping owned by rings.
-        assert_eq!(unsafe { libc::mincore(base, PAGE, &mut residency) }, 0);
+        let canonical = path.canonicalize().unwrap();
+        let mapping_is_listed = || {
+            std::fs::read_to_string("/proc/self/maps")
+                .unwrap()
+                .lines()
+                .filter_map(|line| line.split_whitespace().last())
+                .any(|mapped| mapped == canonical.to_string_lossy())
+        };
+        assert!(rings._file_mapping.is_some());
+        assert!(mapping_is_listed());
         drop(rings);
-        // SAFETY: mincore only queries the address range; it does not dereference
-        // it. The call must now reject the unmapped range with ENOMEM.
-        assert_eq!(unsafe { libc::mincore(base, PAGE, &mut residency) }, -1);
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::ENOMEM)
-        );
+        // Do not query the stale address with mincore: another parallel test
+        // can immediately reuse that VA and make the mapping appear live. The
+        // unique backing path proves this owner's mapping itself was removed.
+        assert!(!mapping_is_listed());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
