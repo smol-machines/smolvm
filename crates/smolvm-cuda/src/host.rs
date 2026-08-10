@@ -26,6 +26,8 @@ pub type CuResult<T> = Result<T, i32>;
 
 /// `CUDA_ERROR_INVALID_HANDLE`.
 pub const CUDA_ERROR_INVALID_HANDLE: i32 = 400;
+/// `CUDA_ERROR_INVALID_VALUE`.
+pub const CUDA_ERROR_INVALID_VALUE: i32 = 1;
 /// Bit-63 marks a guest-minted virtual handle (see `raw_graph`, cublas vh).
 const VHANDLE_TAG: u64 = 1 << 63;
 /// `CUDA_ERROR_NOT_FOUND`.
@@ -118,6 +120,8 @@ pub trait Backend: Send {
     fn driver_get_version(&mut self) -> CuResult<i32>;
     fn device_get_attribute(&mut self, attrib: i32, device: i32) -> CuResult<i32>;
     fn device_get_uuid(&mut self, device: i32) -> CuResult<[u8; 16]>;
+    fn device_get_pci_bus_id(&mut self, device: i32) -> CuResult<String>;
+    fn device_get_by_pci_bus_id(&mut self, pci_bus_id: &str) -> CuResult<i32>;
     fn ctx_create(&mut self, device: i32) -> CuResult<u64>;
     fn ctx_destroy(&mut self, ctx: u64) -> CuResult<()>;
     fn primary_ctx_retain(&mut self, device: i32) -> CuResult<u64>;
@@ -138,6 +142,32 @@ pub trait Backend: Send {
     }
     fn mem_alloc(&mut self, bytes: u64) -> CuResult<u64>;
     fn mem_free(&mut self, dptr: u64) -> CuResult<()>;
+    fn mem_pool_create(
+        &mut self,
+        alloc_type: i32,
+        handle_types: u32,
+        location_type: i32,
+        location_id: i32,
+        max_size: u64,
+        usage: u16,
+    ) -> CuResult<u64>;
+    fn mem_pool_destroy(&mut self, pool: u64) -> CuResult<()>;
+    fn mem_pool_set_attribute(&mut self, pool: u64, attr: i32, value: u64) -> CuResult<()>;
+    fn mem_pool_get_attribute(&mut self, pool: u64, attr: i32) -> CuResult<u64>;
+    fn mem_pool_set_access(&mut self, pool: u64, descriptors: &[(i32, i32, u64)]) -> CuResult<()>;
+    fn mem_pool_get_access(
+        &mut self,
+        pool: u64,
+        location_type: i32,
+        location_id: i32,
+    ) -> CuResult<u64>;
+    fn mem_pool_trim_to(&mut self, pool: u64, min_bytes: u64) -> CuResult<()>;
+    fn mem_alloc_from_pool_async(&mut self, bytes: u64, pool: u64, stream: u64) -> CuResult<u64>;
+    fn mem_alloc_async(&mut self, bytes: u64, stream: u64) -> CuResult<u64>;
+    fn mem_free_async(&mut self, dptr: u64, stream: u64) -> CuResult<()>;
+    fn device_get_default_mem_pool(&mut self, device: i32) -> CuResult<u64>;
+    fn device_get_mem_pool(&mut self, device: i32) -> CuResult<u64>;
+    fn device_set_mem_pool(&mut self, device: i32, pool: u64) -> CuResult<()>;
     /// Copy with stream ordering: prior work on `stream` (0 = legacy default)
     /// must complete first. Torch's pool streams are created non-blocking, so
     /// a NULL-stream copy does NOT order against them — dropping `stream`
@@ -528,6 +558,8 @@ struct Session {
     contexts: HashMap<u64, u64>,
     streams: HashMap<u64, u64>,
     events: HashMap<u64, u64>,
+    mem_pools: HashMap<u64, u64>,
+    owned_mem_pools: std::collections::HashSet<u64>,
     cublas_handles: HashMap<u64, u64>,
     /// Guest-minted virtual graph/exec handles → real (bit-63 tagged). Lets
     /// EndCapture / GraphInstantiate be fire-and-forget: the guest invents the
@@ -611,6 +643,9 @@ struct Session {
 fn reclaim_session(sess: &mut Session, b: &mut dyn Backend) {
     for (d, _size) in std::mem::take(&mut sess.owned_dptrs) {
         let _ = b.mem_free(d);
+    }
+    for pool in std::mem::take(&mut sess.owned_mem_pools) {
+        let _ = b.mem_pool_destroy(pool);
     }
     // VMM teardown order: unmap, release physical, free reservations.
     for (va, size) in std::mem::take(&mut sess.owned_vmm_maps) {
@@ -2141,6 +2176,34 @@ fn ring_dir_get() -> Option<String> {
     RING_DIR.with(|r| r.borrow().clone())
 }
 
+#[cfg(unix)]
+pub(crate) fn open_ring_file(fname: &[u8], minimum_len: usize) -> Result<std::fs::File, i32> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let Some(dir) = ring_dir_get() else {
+        return Err(CUDA_ERROR_NOT_SUPPORTED);
+    };
+    let name = std::str::from_utf8(fname).map_err(|_| CUDA_ERROR_INVALID_VALUE)?;
+    if name.is_empty() || name.contains('/') || name.contains("..") {
+        return Err(CUDA_ERROR_INVALID_VALUE);
+    }
+    let path = std::path::Path::new(&dir).join(name);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        // A guest controls this private directory. Never follow a final
+        // symlink into an unrelated host path, even if the name passed the
+        // traversal check above.
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|_| CUDA_ERROR_INVALID_VALUE)?;
+    let metadata = file.metadata().map_err(|_| CUDA_ERROR_INVALID_VALUE)?;
+    if !metadata.file_type().is_file() || metadata.len() < minimum_len as u64 {
+        return Err(CUDA_ERROR_INVALID_VALUE);
+    }
+    Ok(file)
+}
+
 fn xlat_stream(h: u64) -> u64 {
     // Thread-local first (P3b replay overrides are deliberately per-thread),
     // then the process-global map for channels served on unseeded threads.
@@ -2621,6 +2684,10 @@ fn translate_dptrs(trans: &[(u64, u64, u64)], req: Request) -> Request {
         Request::MemFree { dptr } => Request::MemFree {
             dptr: xlat(trans, dptr),
         },
+        Request::MemFreeAsync { dptr, stream } => Request::MemFreeAsync {
+            dptr: xlat(trans, dptr),
+            stream,
+        },
         Request::LaunchKernel {
             function,
             grid,
@@ -2929,6 +2996,24 @@ struct HostRings {
     /// Bounce pages (host VAs) for responses too large for an inline record.
     bounce: Vec<*mut u8>,
     page_size: usize,
+    /// Owns an mmap created for file-backed rings. GPA-backed rings point into
+    /// guest RAM and therefore carry no mapping here.
+    _file_mapping: Option<RingFileMapping>,
+}
+
+struct RingFileMapping {
+    base: *mut libc::c_void,
+    len: usize,
+}
+
+impl Drop for RingFileMapping {
+    fn drop(&mut self) {
+        // SAFETY: base/len are the exact successful mmap result retained by
+        // HostRings, and this owner is constructed only once for that mapping.
+        unsafe {
+            libc::munmap(self.base, self.len);
+        }
+    }
 }
 
 impl HostRings {
@@ -2965,6 +3050,7 @@ impl HostRings {
             resp: unsafe { crate::ring::Ring::from_pages(resp, ps) },
             bounce,
             page_size: ps,
+            _file_mapping: None,
         })
     }
 
@@ -2990,27 +3076,8 @@ impl HostRings {
         {
             return Err(1);
         }
-        let Some(dir) = ring_dir_get() else {
-            return Err(801); // no advert on this connection -> not supported
-        };
-        let name = std::str::from_utf8(fname).map_err(|_| 1)?;
-        // Bare names only: the guest must not traverse out of the ring dir.
-        if name.is_empty() || name.contains('/') || name.contains("..") {
-            return Err(1);
-        }
         let total = (req_n + resp_n + bounce_n) as usize * ps;
-        let path = std::path::Path::new(&dir).join(name);
-        let f = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .map_err(|_| 1)?;
-        if f.metadata()
-            .map(|m| (m.len() as usize) < total)
-            .unwrap_or(true)
-        {
-            return Err(1);
-        }
+        let f = open_ring_file(fname, total)?;
         // SAFETY: mapping a regular file we just validated, MAP_SHARED so the
         // guest's dax view and ours are the same physical pages.
         let base = unsafe {
@@ -3034,15 +3101,16 @@ impl HostRings {
         let req = pages(0, req_n as usize);
         let resp = pages(req_n as usize, resp_n as usize);
         let bounce = pages((req_n + resp_n) as usize, bounce_n as usize);
-        // The mapping (and an O_RDWR fd via the mmap ref) lives for the
-        // connection; the file itself can be unlinked by either side later.
-        // SAFETY: pages are backed by the shared file mapping for the
-        // connection's lifetime (never munmap'd until process exit).
+        // Keep one owner so the mapping is released as soon as the connection
+        // exits. Without this, every short-lived clone leaked one mapping and
+        // its tmpfs pages in the long-lived shared CUDA daemon.
+        // SAFETY: pages remain backed by this owner for the connection lifetime.
         Ok(HostRings {
             req: unsafe { crate::ring::Ring::from_pages(req, ps) },
             resp: unsafe { crate::ring::Ring::from_pages(resp, ps) },
             bounce,
             page_size: ps,
+            _file_mapping: Some(RingFileMapping { base, len: total }),
         })
     }
 
@@ -3981,6 +4049,20 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
         Request::DeviceGetUuid { device } => b
             .device_get_uuid(dev(sess, device))
             .map(|u| Response::Data(u.to_vec())),
+        Request::DeviceGetPciBusId { device } => b
+            .device_get_pci_bus_id(dev(sess, device))
+            .map(Response::Name),
+        Request::DeviceGetByPciBusId { pci_bus_id } => {
+            let physical = b.device_get_by_pci_bus_id(&pci_bus_id)?;
+            if sess.device_pinned {
+                if physical != sess.device_base {
+                    return Err(101); // CUDA_ERROR_INVALID_DEVICE
+                }
+                Ok(Response::Count(0))
+            } else {
+                Ok(Response::Count(physical))
+            }
+        }
         Request::CtxCreate { device } => {
             let raw = b.ctx_create(dev(sess, device))?;
             let id = sess.mint();
@@ -4311,6 +4393,139 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
             } else {
                 b.mem_free(dptr).map(|_| Response::Ok)
             }
+        }
+        Request::MemPoolCreate {
+            alloc_type,
+            handle_types,
+            location_type,
+            location_id,
+            max_size,
+            usage,
+        } => {
+            let location_id = if location_type == 1 {
+                dev(sess, location_id)
+            } else {
+                location_id
+            };
+            let pool = b.mem_pool_create(
+                alloc_type,
+                handle_types,
+                location_type,
+                location_id,
+                max_size,
+                usage,
+            )?;
+            let id = sess.mint();
+            sess.mem_pools.insert(id, pool);
+            sess.owned_mem_pools.insert(pool);
+            Ok(Response::Handle(id))
+        }
+        Request::MemPoolDestroy { pool } => {
+            let raw_pool = raw(&sess.mem_pools, pool)?;
+            b.mem_pool_destroy(raw_pool)?;
+            sess.mem_pools.remove(&pool);
+            sess.owned_mem_pools.remove(&raw_pool);
+            Ok(Response::Ok)
+        }
+        Request::MemPoolSetAttribute { pool, attr, value } => {
+            let raw_pool = raw(&sess.mem_pools, pool)?;
+            b.mem_pool_set_attribute(raw_pool, attr, value)
+                .map(|_| Response::Ok)
+        }
+        Request::MemPoolGetAttribute { pool, attr } => {
+            let raw_pool = raw(&sess.mem_pools, pool)?;
+            b.mem_pool_get_attribute(raw_pool, attr)
+                .map(Response::Bytes)
+        }
+        Request::MemPoolSetAccess {
+            pool,
+            mut descriptors,
+        } => {
+            let raw_pool = raw(&sess.mem_pools, pool)?;
+            for (location_type, location_id, _) in &mut descriptors {
+                if *location_type == 1 {
+                    *location_id = dev(sess, *location_id);
+                }
+            }
+            b.mem_pool_set_access(raw_pool, &descriptors)
+                .map(|_| Response::Ok)
+        }
+        Request::MemPoolGetAccess {
+            pool,
+            location_type,
+            location_id,
+        } => {
+            let raw_pool = raw(&sess.mem_pools, pool)?;
+            let location_id = if location_type == 1 {
+                dev(sess, location_id)
+            } else {
+                location_id
+            };
+            b.mem_pool_get_access(raw_pool, location_type, location_id)
+                .map(Response::Bytes)
+        }
+        Request::MemPoolTrimTo { pool, min_bytes } => {
+            let raw_pool = raw(&sess.mem_pools, pool)?;
+            b.mem_pool_trim_to(raw_pool, min_bytes)
+                .map(|_| Response::Ok)
+        }
+        Request::MemAllocFromPoolAsync {
+            bytes,
+            pool,
+            stream,
+        } => {
+            let limit = allocation_vram_limit(sess, b)?;
+            let used: u64 = sess.owned_dptrs.values().sum::<u64>()
+                + sess.owned_vmm_handles.values().sum::<u64>();
+            if used.saturating_add(bytes) > limit {
+                return Err(2);
+            }
+            let raw_pool = raw(&sess.mem_pools, pool)?;
+            let dptr = b.mem_alloc_from_pool_async(bytes, raw_pool, raw_stream(sess, stream)?)?;
+            sess.owned_dptrs.insert(dptr, bytes);
+            sess.alloc_table
+                .lock()
+                .unwrap()
+                .insert(dptr, (bytes, false));
+            Ok(Response::Dptr(dptr))
+        }
+        Request::MemAllocAsync { bytes, stream } => {
+            let limit = allocation_vram_limit(sess, b)?;
+            let used: u64 = sess.owned_dptrs.values().sum::<u64>()
+                + sess.owned_vmm_handles.values().sum::<u64>();
+            if used.saturating_add(bytes) > limit {
+                return Err(2);
+            }
+            let dptr = b.mem_alloc_async(bytes, raw_stream(sess, stream)?)?;
+            sess.owned_dptrs.insert(dptr, bytes);
+            sess.alloc_table
+                .lock()
+                .unwrap()
+                .insert(dptr, (bytes, false));
+            Ok(Response::Dptr(dptr))
+        }
+        Request::MemFreeAsync { dptr, stream } => {
+            b.mem_free_async(dptr, raw_stream(sess, stream)?)?;
+            sess.owned_dptrs.remove(&dptr);
+            sess.alloc_table.lock().unwrap().remove(&dptr);
+            Ok(Response::Ok)
+        }
+        Request::DeviceGetDefaultMemPool { device } => {
+            let pool = b.device_get_default_mem_pool(dev(sess, device))?;
+            let id = sess.mint();
+            sess.mem_pools.insert(id, pool);
+            Ok(Response::Handle(id))
+        }
+        Request::DeviceGetMemPool { device } => {
+            let pool = b.device_get_mem_pool(dev(sess, device))?;
+            let id = sess.mint();
+            sess.mem_pools.insert(id, pool);
+            Ok(Response::Handle(id))
+        }
+        Request::DeviceSetMemPool { device, pool } => {
+            let raw_pool = raw(&sess.mem_pools, pool)?;
+            b.device_set_mem_pool(dev(sess, device), raw_pool)
+                .map(|_| Response::Ok)
         }
         Request::MemcpyHtoD { dptr, stream, data } => {
             mark_loaded(&sess.alloc_table, dptr); // H2D write → weight/read-only
@@ -5217,6 +5432,12 @@ impl Backend for CpuBackend {
     fn device_get_uuid(&mut self, _device: i32) -> CuResult<[u8; 16]> {
         Ok(*b"smolvm-cpu-emul\0")
     }
+    fn device_get_pci_bus_id(&mut self, _device: i32) -> CuResult<String> {
+        Ok("0000:00:00.0".to_string())
+    }
+    fn device_get_by_pci_bus_id(&mut self, pci_bus_id: &str) -> CuResult<i32> {
+        (pci_bus_id == "0000:00:00.0").then_some(0).ok_or(101)
+    }
     fn ctx_create(&mut self, _device: i32) -> CuResult<u64> {
         Ok(self.handle())
     }
@@ -5266,6 +5487,62 @@ impl Backend for CpuBackend {
             .remove(&dptr)
             .map(|_| ())
             .ok_or(CUDA_ERROR_INVALID_HANDLE)
+    }
+    fn mem_pool_create(
+        &mut self,
+        _alloc_type: i32,
+        _handle_types: u32,
+        _location_type: i32,
+        _location_id: i32,
+        _max_size: u64,
+        _usage: u16,
+    ) -> CuResult<u64> {
+        Ok(self.handle())
+    }
+    fn mem_pool_destroy(&mut self, _pool: u64) -> CuResult<()> {
+        Ok(())
+    }
+    fn mem_pool_set_attribute(&mut self, _pool: u64, _attr: i32, _value: u64) -> CuResult<()> {
+        Ok(())
+    }
+    fn mem_pool_get_attribute(&mut self, _pool: u64, _attr: i32) -> CuResult<u64> {
+        Ok(0)
+    }
+    fn mem_pool_set_access(
+        &mut self,
+        _pool: u64,
+        _descriptors: &[(i32, i32, u64)],
+    ) -> CuResult<()> {
+        Ok(())
+    }
+    fn mem_pool_get_access(
+        &mut self,
+        _pool: u64,
+        _location_type: i32,
+        _location_id: i32,
+    ) -> CuResult<u64> {
+        Ok(3)
+    }
+    fn mem_pool_trim_to(&mut self, _pool: u64, _min_bytes: u64) -> CuResult<()> {
+        Ok(())
+    }
+    fn mem_alloc_from_pool_async(&mut self, bytes: u64, _pool: u64, _stream: u64) -> CuResult<u64> {
+        self.mem_alloc(bytes)
+    }
+    fn mem_alloc_async(&mut self, bytes: u64, _stream: u64) -> CuResult<u64> {
+        self.mem_alloc(bytes)
+    }
+    fn mem_free_async(&mut self, dptr: u64, _stream: u64) -> CuResult<()> {
+        self.mem_free(dptr)
+    }
+    fn device_get_default_mem_pool(&mut self, _device: i32) -> CuResult<u64> {
+        Ok(1)
+    }
+    fn device_get_mem_pool(&mut self, _device: i32) -> CuResult<u64> {
+        Ok(1)
+    }
+    fn device_set_mem_pool(&mut self, _device: i32, _pool: u64) -> CuResult<()> {
+        Ok(())
     }
     fn memcpy_htod(&mut self, dptr: u64, data: &[u8], _stream: u64) -> CuResult<()> {
         let buf = self.mem.get_mut(&dptr).ok_or(CUDA_ERROR_INVALID_HANDLE)?;
@@ -5478,6 +5755,72 @@ mod tests {
     use super::*;
     use crate::client::Client;
     use std::io::{Read, Write};
+
+    #[cfg(unix)]
+    #[test]
+    fn ring_files_reject_traversal_and_final_symlinks() {
+        use std::os::unix::fs::symlink;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "smolvm-ring-test-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("ring.bin"), [0_u8; 64]).unwrap();
+        symlink(dir.join("ring.bin"), dir.join("link.bin")).unwrap();
+        ring_dir_set(Some(dir.to_string_lossy().into_owned()));
+        assert!(open_ring_file(b"ring.bin", 64).is_ok());
+        assert!(open_ring_file(b"link.bin", 64).is_err());
+        assert!(open_ring_file(b"../ring.bin", 64).is_err());
+        ring_dir_set(None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_ring_mapping_is_unmapped_when_connection_rings_drop() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        const PAGE: usize = 4096;
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "smolvm-ring-unmap-test-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("ring.bin");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        file.set_len((3 * PAGE) as u64).unwrap();
+        ring_dir_set(Some(dir.to_string_lossy().into_owned()));
+        let rings = HostRings::map_file(PAGE as u32, 1, 1, 1, b"ring.bin").unwrap();
+        ring_dir_set(None);
+
+        let mapping = rings._file_mapping.as_ref().unwrap();
+        let base = mapping.base;
+        let mut residency = 0_u8;
+        // SAFETY: base identifies the live page-aligned mapping owned by rings.
+        assert_eq!(unsafe { libc::mincore(base, PAGE, &mut residency) }, 0);
+        drop(rings);
+        // SAFETY: mincore only queries the address range; it does not dereference
+        // it. The call must now reject the unmapped range with ENOMEM.
+        assert_eq!(unsafe { libc::mincore(base, PAGE, &mut residency) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ENOMEM)
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -5989,6 +6332,8 @@ mod tests {
         let mut cli = Client::new(client_side);
         cli.init(0).unwrap();
         assert_eq!(cli.device_get_count().unwrap(), 1);
+        assert_eq!(cli.device_get_pci_bus_id(0).unwrap(), "0000:00:00.0");
+        assert_eq!(cli.device_get_by_pci_bus_id("0000:00:00.0").unwrap(), 0);
         let module = cli.module_load_data(b"<ptx>").unwrap();
         let func = cli.module_get_function(module, "vecadd").unwrap();
         let n = 8usize;
@@ -6023,6 +6368,15 @@ mod tests {
             .collect();
         let expect: Vec<f32> = (0..n).map(|i| (3 * i) as f32).collect();
         assert_eq!(c, expect);
+        let pool = cli.mem_pool_create(1, 0, 1, 0, 0, 0).unwrap();
+        cli.mem_pool_set_attribute(pool, 4, 1 << 20).unwrap();
+        assert_eq!(cli.mem_pool_get_attribute(pool, 4).unwrap(), 0);
+        cli.mem_pool_set_access(pool, vec![(1, 0, 3)]).unwrap();
+        assert_eq!(cli.mem_pool_get_access(pool, 1, 0).unwrap(), 3);
+        let pooled = cli.mem_alloc_from_pool_async(4096, pool, 0).unwrap();
+        cli.mem_free_async(pooled, 0).unwrap();
+        cli.ctx_synchronize().unwrap();
+        cli.mem_pool_destroy(pool).unwrap();
         drop(cli); // closes client_side → server sees EOF
         server.join().unwrap();
     }

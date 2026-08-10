@@ -49,6 +49,8 @@ pub enum Op {
     DriverGetVersion = 0x05,
     DeviceGetAttribute = 0x06,
     DeviceGetUuid = 0x07,
+    DeviceGetPciBusId = 0x08,
+    DeviceGetByPciBusId = 0x09,
     CtxCreate = 0x10,
     CtxDestroy = 0x11,
     PrimaryCtxRetain = 0x12,
@@ -67,7 +69,20 @@ pub enum Op {
     MemcpyDtoD = 0x34,
     MemsetD8 = 0x35,
     MemGetInfo = 0x36,
+    MemPoolCreate = 0x37,
+    MemPoolDestroy = 0x38,
+    MemPoolSetAttribute = 0x39,
+    MemPoolGetAttribute = 0x3A,
+    MemPoolSetAccess = 0x3B,
+    MemPoolGetAccess = 0x3C,
+    MemPoolTrimTo = 0x3D,
+    MemAllocFromPoolAsync = 0x3E,
+    MemAllocAsync = 0x3F,
     LaunchKernel = 0x40,
+    MemFreeAsync = 0x41,
+    DeviceGetDefaultMemPool = 0x42,
+    DeviceGetMemPool = 0x43,
+    DeviceSetMemPool = 0x44,
     CtxSynchronize = 0x50,
     StreamCreate = 0x60,
     StreamDestroy = 0x61,
@@ -160,6 +175,8 @@ impl Op {
             0x05 => Op::DriverGetVersion,
             0x06 => Op::DeviceGetAttribute,
             0x07 => Op::DeviceGetUuid,
+            0x08 => Op::DeviceGetPciBusId,
+            0x09 => Op::DeviceGetByPciBusId,
             0x10 => Op::CtxCreate,
             0x11 => Op::CtxDestroy,
             0x12 => Op::PrimaryCtxRetain,
@@ -178,7 +195,20 @@ impl Op {
             0x34 => Op::MemcpyDtoD,
             0x35 => Op::MemsetD8,
             0x36 => Op::MemGetInfo,
+            0x37 => Op::MemPoolCreate,
+            0x38 => Op::MemPoolDestroy,
+            0x39 => Op::MemPoolSetAttribute,
+            0x3A => Op::MemPoolGetAttribute,
+            0x3B => Op::MemPoolSetAccess,
+            0x3C => Op::MemPoolGetAccess,
+            0x3D => Op::MemPoolTrimTo,
+            0x3E => Op::MemAllocFromPoolAsync,
+            0x3F => Op::MemAllocAsync,
             0x40 => Op::LaunchKernel,
+            0x41 => Op::MemFreeAsync,
+            0x42 => Op::DeviceGetDefaultMemPool,
+            0x43 => Op::DeviceGetMemPool,
+            0x44 => Op::DeviceSetMemPool,
             0x50 => Op::CtxSynchronize,
             0xC0 => Op::StreamBeginCapture,
             0xC1 => Op::StreamEndCapture,
@@ -258,6 +288,12 @@ pub enum Request {
     },
     DeviceGetUuid {
         device: i32,
+    },
+    DeviceGetPciBusId {
+        device: i32,
+    },
+    DeviceGetByPciBusId {
+        pci_bus_id: String,
     },
     CtxCreate {
         device: i32,
@@ -339,6 +375,66 @@ pub enum Request {
         bytes: u64,
     },
     MemGetInfo,
+    /// Create a stream-ordered allocation pool. Pointer-bearing/reserved fields
+    /// from `CUmemPoolProps` are deliberately not transported.
+    MemPoolCreate {
+        alloc_type: i32,
+        handle_types: u32,
+        location_type: i32,
+        location_id: i32,
+        max_size: u64,
+        usage: u16,
+    },
+    MemPoolDestroy {
+        pool: u64,
+    },
+    /// Attribute values are normalized to 8 bytes; int-valued attributes use
+    /// the low four bytes and uint64-valued attributes use all eight.
+    MemPoolSetAttribute {
+        pool: u64,
+        attr: i32,
+        value: u64,
+    },
+    MemPoolGetAttribute {
+        pool: u64,
+        attr: i32,
+    },
+    MemPoolSetAccess {
+        pool: u64,
+        descriptors: Vec<(i32, i32, u64)>,
+    },
+    MemPoolGetAccess {
+        pool: u64,
+        location_type: i32,
+        location_id: i32,
+    },
+    MemPoolTrimTo {
+        pool: u64,
+        min_bytes: u64,
+    },
+    MemAllocFromPoolAsync {
+        bytes: u64,
+        pool: u64,
+        stream: u64,
+    },
+    MemAllocAsync {
+        bytes: u64,
+        stream: u64,
+    },
+    MemFreeAsync {
+        dptr: u64,
+        stream: u64,
+    },
+    DeviceGetDefaultMemPool {
+        device: i32,
+    },
+    DeviceGetMemPool {
+        device: i32,
+    },
+    DeviceSetMemPool {
+        device: i32,
+        pool: u64,
+    },
     /// Launch `function` with the given geometry. `params` is one byte-blob per
     /// kernel argument, in order — the host rebuilds the `void*[]` the Driver
     /// API expects by pointing at local copies of each blob. `stream` is an
@@ -642,6 +738,9 @@ fn w_i32(b: &mut Vec<u8>, v: i32) {
 fn w_u32(b: &mut Vec<u8>, v: u32) {
     b.extend_from_slice(&v.to_le_bytes());
 }
+fn w_u16(b: &mut Vec<u8>, v: u16) {
+    b.extend_from_slice(&v.to_le_bytes());
+}
 fn w_u64(b: &mut Vec<u8>, v: u64) {
     b.extend_from_slice(&v.to_le_bytes());
 }
@@ -678,6 +777,9 @@ impl<'a> Cur<'a> {
     }
     fn i32(&mut self) -> io::Result<i32> {
         Ok(i32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+    fn u16(&mut self) -> io::Result<u16> {
+        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
     }
     pub(crate) fn u32(&mut self) -> io::Result<u32> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
@@ -794,6 +896,14 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
             w_u8(&mut b, Op::DeviceGetUuid as u8);
             w_i32(&mut b, *device);
         }
+        Request::DeviceGetPciBusId { device } => {
+            w_u8(&mut b, Op::DeviceGetPciBusId as u8);
+            w_i32(&mut b, *device);
+        }
+        Request::DeviceGetByPciBusId { pci_bus_id } => {
+            w_u8(&mut b, Op::DeviceGetByPciBusId as u8);
+            w_str(&mut b, pci_bus_id);
+        }
         Request::CtxCreate { device } => {
             w_u8(&mut b, Op::CtxCreate as u8);
             w_i32(&mut b, *device);
@@ -854,6 +964,95 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
         Request::MemFree { dptr } => {
             w_u8(&mut b, Op::MemFree as u8);
             w_u64(&mut b, *dptr);
+        }
+        Request::MemPoolCreate {
+            alloc_type,
+            handle_types,
+            location_type,
+            location_id,
+            max_size,
+            usage,
+        } => {
+            w_u8(&mut b, Op::MemPoolCreate as u8);
+            w_i32(&mut b, *alloc_type);
+            w_u32(&mut b, *handle_types);
+            w_i32(&mut b, *location_type);
+            w_i32(&mut b, *location_id);
+            w_u64(&mut b, *max_size);
+            w_u16(&mut b, *usage);
+        }
+        Request::MemPoolDestroy { pool } => {
+            w_u8(&mut b, Op::MemPoolDestroy as u8);
+            w_u64(&mut b, *pool);
+        }
+        Request::MemPoolSetAttribute { pool, attr, value } => {
+            w_u8(&mut b, Op::MemPoolSetAttribute as u8);
+            w_u64(&mut b, *pool);
+            w_i32(&mut b, *attr);
+            w_u64(&mut b, *value);
+        }
+        Request::MemPoolGetAttribute { pool, attr } => {
+            w_u8(&mut b, Op::MemPoolGetAttribute as u8);
+            w_u64(&mut b, *pool);
+            w_i32(&mut b, *attr);
+        }
+        Request::MemPoolSetAccess { pool, descriptors } => {
+            w_u8(&mut b, Op::MemPoolSetAccess as u8);
+            w_u64(&mut b, *pool);
+            w_u32(&mut b, descriptors.len() as u32);
+            for &(location_type, location_id, flags) in descriptors {
+                w_i32(&mut b, location_type);
+                w_i32(&mut b, location_id);
+                w_u64(&mut b, flags);
+            }
+        }
+        Request::MemPoolGetAccess {
+            pool,
+            location_type,
+            location_id,
+        } => {
+            w_u8(&mut b, Op::MemPoolGetAccess as u8);
+            w_u64(&mut b, *pool);
+            w_i32(&mut b, *location_type);
+            w_i32(&mut b, *location_id);
+        }
+        Request::MemPoolTrimTo { pool, min_bytes } => {
+            w_u8(&mut b, Op::MemPoolTrimTo as u8);
+            w_u64(&mut b, *pool);
+            w_u64(&mut b, *min_bytes);
+        }
+        Request::MemAllocFromPoolAsync {
+            bytes,
+            pool,
+            stream,
+        } => {
+            w_u8(&mut b, Op::MemAllocFromPoolAsync as u8);
+            w_u64(&mut b, *bytes);
+            w_u64(&mut b, *pool);
+            w_u64(&mut b, *stream);
+        }
+        Request::MemAllocAsync { bytes, stream } => {
+            w_u8(&mut b, Op::MemAllocAsync as u8);
+            w_u64(&mut b, *bytes);
+            w_u64(&mut b, *stream);
+        }
+        Request::MemFreeAsync { dptr, stream } => {
+            w_u8(&mut b, Op::MemFreeAsync as u8);
+            w_u64(&mut b, *dptr);
+            w_u64(&mut b, *stream);
+        }
+        Request::DeviceGetDefaultMemPool { device } => {
+            w_u8(&mut b, Op::DeviceGetDefaultMemPool as u8);
+            w_i32(&mut b, *device);
+        }
+        Request::DeviceGetMemPool { device } => {
+            w_u8(&mut b, Op::DeviceGetMemPool as u8);
+            w_i32(&mut b, *device);
+        }
+        Request::DeviceSetMemPool { device, pool } => {
+            w_u8(&mut b, Op::DeviceSetMemPool as u8);
+            w_i32(&mut b, *device);
+            w_u64(&mut b, *pool);
         }
         Request::MemcpyHtoD { dptr, stream, data } => {
             w_u8(&mut b, Op::MemcpyHtoD as u8);
@@ -1289,6 +1488,10 @@ pub fn decode_request(payload: &[u8]) -> io::Result<Request> {
             device: c.i32()?,
         },
         Op::DeviceGetUuid => Request::DeviceGetUuid { device: c.i32()? },
+        Op::DeviceGetPciBusId => Request::DeviceGetPciBusId { device: c.i32()? },
+        Op::DeviceGetByPciBusId => Request::DeviceGetByPciBusId {
+            pci_bus_id: c.string()?,
+        },
         Op::CtxCreate => Request::CtxCreate { device: c.i32()? },
         Op::CtxDestroy => Request::CtxDestroy { ctx: c.u64()? },
         Op::PrimaryCtxRetain => Request::PrimaryCtxRetain { device: c.i32()? },
@@ -1315,6 +1518,64 @@ pub fn decode_request(payload: &[u8]) -> io::Result<Request> {
         },
         Op::MemAlloc => Request::MemAlloc { bytes: c.u64()? },
         Op::MemFree => Request::MemFree { dptr: c.u64()? },
+        Op::MemPoolCreate => Request::MemPoolCreate {
+            alloc_type: c.i32()?,
+            handle_types: c.u32()?,
+            location_type: c.i32()?,
+            location_id: c.i32()?,
+            max_size: c.u64()?,
+            usage: c.u16()?,
+        },
+        Op::MemPoolDestroy => Request::MemPoolDestroy { pool: c.u64()? },
+        Op::MemPoolSetAttribute => Request::MemPoolSetAttribute {
+            pool: c.u64()?,
+            attr: c.i32()?,
+            value: c.u64()?,
+        },
+        Op::MemPoolGetAttribute => Request::MemPoolGetAttribute {
+            pool: c.u64()?,
+            attr: c.i32()?,
+        },
+        Op::MemPoolSetAccess => {
+            let pool = c.u64()?;
+            let count = c.u32()? as usize;
+            if count > 1024 {
+                return Err(bad());
+            }
+            let mut descriptors = Vec::with_capacity(count);
+            for _ in 0..count {
+                descriptors.push((c.i32()?, c.i32()?, c.u64()?));
+            }
+            Request::MemPoolSetAccess { pool, descriptors }
+        }
+        Op::MemPoolGetAccess => Request::MemPoolGetAccess {
+            pool: c.u64()?,
+            location_type: c.i32()?,
+            location_id: c.i32()?,
+        },
+        Op::MemPoolTrimTo => Request::MemPoolTrimTo {
+            pool: c.u64()?,
+            min_bytes: c.u64()?,
+        },
+        Op::MemAllocFromPoolAsync => Request::MemAllocFromPoolAsync {
+            bytes: c.u64()?,
+            pool: c.u64()?,
+            stream: c.u64()?,
+        },
+        Op::MemAllocAsync => Request::MemAllocAsync {
+            bytes: c.u64()?,
+            stream: c.u64()?,
+        },
+        Op::MemFreeAsync => Request::MemFreeAsync {
+            dptr: c.u64()?,
+            stream: c.u64()?,
+        },
+        Op::DeviceGetDefaultMemPool => Request::DeviceGetDefaultMemPool { device: c.i32()? },
+        Op::DeviceGetMemPool => Request::DeviceGetMemPool { device: c.i32()? },
+        Op::DeviceSetMemPool => Request::DeviceSetMemPool {
+            device: c.i32()?,
+            pool: c.u64()?,
+        },
         Op::MemcpyHtoD => Request::MemcpyHtoD {
             dptr: c.u64()?,
             stream: c.u64()?,
@@ -1606,23 +1867,29 @@ pub fn decode_response(op: Op, payload: &[u8]) -> io::Result<(i32, Response)> {
     }
     let body = match op {
         Op::DeviceGetCount
+        | Op::DeviceGetByPciBusId
         | Op::DriverGetVersion
         | Op::DeviceGetAttribute
         | Op::ThreadExchangeCaptureMode
         | Op::StreamQuery
         | Op::EventQuery
         | Op::FuncGetAttribute => Response::Count(c.i32()?),
-        Op::DeviceGetName => Response::Name(c.string()?),
+        Op::DeviceGetName | Op::DeviceGetPciBusId => Response::Name(c.string()?),
         Op::DeviceTotalMem => Response::Bytes(c.u64()?),
         // Init hands back this session's lineage token (for fork-clone handoff).
         Op::Init => Response::Handle(c.u64()?),
-        Op::CtxCreate | Op::PrimaryCtxRetain => Response::Handle(c.u64()?),
+        Op::CtxCreate
+        | Op::PrimaryCtxRetain
+        | Op::MemPoolCreate
+        | Op::DeviceGetDefaultMemPool
+        | Op::DeviceGetMemPool => Response::Handle(c.u64()?),
         Op::ModuleLoadData | Op::ModuleGetFunction => Response::Handle(c.u64()?),
         Op::StreamCreate | Op::EventCreate => Response::Handle(c.u64()?),
         Op::StreamEndCapture | Op::GraphInstantiate => Response::Handle(c.u64()?),
         Op::GraphGetNodes => Response::Bytes(c.u64()?),
         Op::StreamCaptureInfo => Response::Pair(c.u64()?, c.u64()?),
-        Op::MemAlloc => Response::Dptr(c.u64()?),
+        Op::MemAlloc | Op::MemAllocFromPoolAsync | Op::MemAllocAsync => Response::Dptr(c.u64()?),
+        Op::MemPoolGetAttribute | Op::MemPoolGetAccess => Response::Bytes(c.u64()?),
         Op::MemcpyDtoH
         | Op::DeviceGetUuid
         | Op::FuncGetParamInfo
@@ -1647,6 +1914,12 @@ pub fn decode_response(op: Op, payload: &[u8]) -> io::Result<(i32, Response)> {
         | Op::ModuleUnload
         | Op::FuncSetAttribute
         | Op::MemFree
+        | Op::MemPoolDestroy
+        | Op::MemPoolSetAttribute
+        | Op::MemPoolSetAccess
+        | Op::MemPoolTrimTo
+        | Op::MemFreeAsync
+        | Op::DeviceSetMemPool
         | Op::MemcpyHtoD
         | Op::MemcpyDtoD
         | Op::MemsetD8
@@ -1724,6 +1997,33 @@ mod tests {
         });
         roundtrip(Request::MemAlloc { bytes: 4096 });
         roundtrip(Request::MemFree { dptr: 0x7f00_0000 });
+        roundtrip(Request::MemPoolCreate {
+            alloc_type: 1,
+            handle_types: 0,
+            location_type: 1,
+            location_id: 0,
+            max_size: 1 << 30,
+            usage: 3,
+        });
+        roundtrip(Request::MemPoolSetAttribute {
+            pool: 17,
+            attr: 4,
+            value: 1 << 20,
+        });
+        roundtrip(Request::MemPoolSetAccess {
+            pool: 17,
+            descriptors: vec![(1, 0, 3), (1, 1, 1)],
+        });
+        roundtrip(Request::MemAllocFromPoolAsync {
+            bytes: 8192,
+            pool: 17,
+            stream: 23,
+        });
+        roundtrip(Request::MemFreeAsync {
+            dptr: 0x7f00_1000,
+            stream: 23,
+        });
+        roundtrip(Request::DeviceGetDefaultMemPool { device: 0 });
         roundtrip(Request::MemcpyHtoD {
             dptr: 0x7f00_0000,
             stream: 0x7001,
@@ -1800,6 +2100,10 @@ mod tests {
             device: 0,
         });
         roundtrip(Request::DeviceGetUuid { device: 0 });
+        roundtrip(Request::DeviceGetPciBusId { device: 0 });
+        roundtrip(Request::DeviceGetByPciBusId {
+            pci_bus_id: "0000:65:00.0".to_string(),
+        });
         roundtrip(Request::PrimaryCtxRetain { device: 0 });
         roundtrip(Request::PrimaryCtxRelease { device: 0 });
         roundtrip(Request::ModuleUnload { module: 7 });

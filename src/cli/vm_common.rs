@@ -1105,12 +1105,12 @@ fn rollback_failed_fork(
     resume_golden: bool,
     error: smolvm::Error,
 ) -> smolvm::Result<()> {
-    let cleanup_error = std::fs::remove_dir_all(snapshot_dir).err();
     let resume_error = if resume_golden {
-        smolvm::agent::fork::resume_golden(golden).err()
+        smolvm::agent::fork::resume_golden(golden, snapshot_dir).err()
     } else {
         None
     };
+    let cleanup_error = std::fs::remove_dir_all(snapshot_dir).err();
     match (cleanup_error, resume_error) {
         (None, None) => Err(error),
         (cleanup, resume) => Err(smolvm::Error::agent(
@@ -1210,19 +1210,20 @@ fn start_vm_named_with_db(
             cli_recover_if_unreachable(name)?;
         }
         RecordState::Frozen => {
-            // Snapshot-frozen fork base: relaunching it writable would
-            // corrupt the clones whose disks CoW-back onto it. Refuse —
-            // delete the clones first to reuse the name.
             let clones = db.dependent_clones(name).unwrap_or_default();
-            return Err(Error::agent(
-                "start",
+            let reason = if clones.is_empty() {
+                "it retains a reusable fork checkpoint; stop it before restarting, or fork it again"
+                    .to_string()
+            } else {
                 format!(
-                    "'{name}' is the fork base for {} live clone(s) ({}); their disks are \
-                     copy-on-write overlays backed by its disks, so it cannot be re-launched \
-                     while they exist — delete the clones first",
+                    "it is the fork base for {} live clone(s) ({}); their disks are copy-on-write overlays backed by its disks, so it cannot be re-launched while they exist — delete the clones first",
                     clones.len(),
                     clones.join(", ")
-                ),
+                )
+            };
+            return Err(Error::agent(
+                "start",
+                format!("'{name}' is frozen because {reason}"),
             ));
         }
         RecordState::Stopped | RecordState::Created | RecordState::Failed => {
@@ -1814,19 +1815,24 @@ pub fn stop_vm_named(name: &str) -> smolvm::Result<()> {
             // fall through to the normal stop path
         }
         RecordState::Frozen => {
-            // Snapshot-frozen fork base: it must outlive its clones (their
-            // disks CoW-back onto its disks). Refuse instead of tearing it
-            // down — mirrors `delete`'s guard.
             let clones = SmolvmDb::open()?.dependent_clones(name).unwrap_or_default();
-            return Err(smolvm::Error::agent(
-                "stop",
-                format!(
-                    "machine '{name}' is the fork base for {} live clone(s) ({}); \
-                     stop or delete the clones first",
-                    clones.len(),
-                    clones.join(", ")
-                ),
-            ));
+            if !clones.is_empty() {
+                // A snapshot-frozen fork base must outlive its clones: their
+                // disks CoW-back onto its disks and their RAM maps its memfd.
+                return Err(smolvm::Error::agent(
+                    "stop",
+                    format!(
+                        "machine '{name}' is the fork base for {} live clone(s) ({}); \
+                         stop or delete the clones first",
+                        clones.len(),
+                        clones.join(", ")
+                    ),
+                ));
+            }
+            // A retained checkpoint deliberately keeps the golden frozen
+            // between fills even when no clones exist. It is now safe to kill
+            // the paused VMM; AgentManager::stop removes the exact retained
+            // checkpoint only after confirming process death.
         }
         other => {
             // Not running. If a prior start mounted the layers volume but the

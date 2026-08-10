@@ -1304,10 +1304,11 @@ impl AgentClient {
         F: FnMut(ExecEvent),
     {
         let timeout_ms = config.timeout.map(|t| t.as_millis() as u64);
-
-        self.stream
-            .set_read_timeout(None)
-            .map_err(|e| Error::agent("set read timeout", e.to_string()))?;
+        // Keep a host-side deadline whenever the caller requested one. The
+        // guest normally enforces the command timeout, but a wedged restored
+        // VM cannot send its terminal event and must not leave the CLI blocked
+        // forever on an otherwise-open vsock connection.
+        let _timeout_guard = self.set_exec_timeout(config.timeout)?;
 
         self.send(&AgentRequest::Run {
             image: config.image,
@@ -1935,10 +1936,7 @@ impl AgentClient {
         F: FnMut(ExecEvent),
     {
         let timeout_ms = timeout.map(|t| t.as_millis() as u64);
-
-        self.stream
-            .set_read_timeout(None)
-            .map_err(|e| Error::agent("set read timeout", e.to_string()))?;
+        let _timeout_guard = self.set_exec_timeout(timeout)?;
 
         self.send(&AgentRequest::VmExec {
             command,

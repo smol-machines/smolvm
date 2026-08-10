@@ -174,11 +174,34 @@ pub fn release_forkpoint(clone: &str) -> Result<()> {
     }
 }
 
-/// Resume a golden after every clone prepared from its snapshot has been torn
-/// down. This is used only for failed transactional batch forks; a successful
-/// fork keeps the golden frozen as the copy-on-write base.
-pub fn resume_golden(golden: &str) -> Result<()> {
-    let reply = control_socket_cmd(&control_socket_path(golden), "RESUME")?;
+/// Roll back a golden after every clone prepared from its snapshot has been
+/// torn down. A completed fork checkpoint must be reapplied before resuming;
+/// if capture failed before producing one, an ordinary resume is sufficient.
+fn golden_resume_command(snapshot_dir: &Path) -> Result<String> {
+    let checkpoint = snapshot_dir.join("checkpoint.bin");
+    match std::fs::symlink_metadata(&checkpoint) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            Ok(format!("ROLLBACK_FORK {}", snapshot_dir.display()))
+        }
+        Ok(_) => Err(Error::agent(
+            "resume golden",
+            format!(
+                "refusing non-regular rollback checkpoint {}",
+                checkpoint.display()
+            ),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok("RESUME".to_string()),
+        Err(error) => Err(Error::agent(
+            "resume golden",
+            format!("inspect rollback checkpoint: {error}"),
+        )),
+    }
+}
+
+/// Resume a failed fork's golden, restoring its completed checkpoint when one exists.
+pub fn resume_golden(golden: &str, snapshot_dir: &Path) -> Result<()> {
+    let command = golden_resume_command(snapshot_dir)?;
+    let reply = control_socket_cmd(&control_socket_path(golden), &command)?;
     if reply.starts_with("OK") {
         Ok(())
     } else {
@@ -187,6 +210,38 @@ pub fn resume_golden(golden: &str) -> Result<()> {
             format!("golden '{golden}' RESUME failed: {reply}"),
         ))
     }
+}
+
+/// Remove every retained RAM checkpoint for a golden whose VMM is confirmed
+/// dead and which has no dependent clones. A checkpoint is tied to the exact
+/// golden PID/memfd identity and can never be valid after that process exits.
+pub(crate) fn discard_retained_snapshots(db: &SmolvmDb, golden: &str) -> Result<()> {
+    let snapshot_root = vm_data_dir(golden).join("s");
+    match std::fs::symlink_metadata(&snapshot_root) {
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            std::fs::remove_dir_all(&snapshot_root).map_err(|error| {
+                Error::agent("remove retained fork snapshots", error.to_string())
+            })?;
+        }
+        Ok(_) => {
+            return Err(Error::agent(
+                "remove retained fork snapshots",
+                format!(
+                    "refusing to remove non-directory {}",
+                    snapshot_root.display()
+                ),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(Error::agent(
+                "inspect retained fork snapshots",
+                error.to_string(),
+            ));
+        }
+    }
+    db.remove_retained_fork_snapshot(golden)?;
+    Ok(())
 }
 
 /// The result of preparing a fork: the golden is frozen + snapshotted and the
@@ -452,12 +507,22 @@ pub(crate) fn prepare_forks_reusing(
         let reply = match reply {
             Ok(reply) if reply.starts_with("OK") => reply,
             Ok(reply) => {
-                let _ = std::fs::remove_dir_all(&snapshot_dir);
-                return Err(Error::agent("fork", format!("golden FORK failed: {reply}")));
+                return Err(rollback_new_snapshot(
+                    db,
+                    golden,
+                    &snapshot_dir,
+                    false,
+                    Error::agent("fork", format!("golden FORK failed: {reply}")),
+                ));
             }
             Err(error) => {
-                let _ = std::fs::remove_dir_all(&snapshot_dir);
-                return Err(error);
+                return Err(rollback_new_snapshot(
+                    db,
+                    golden,
+                    &snapshot_dir,
+                    false,
+                    error,
+                ));
             }
         };
         tracing::info!(
@@ -551,21 +616,35 @@ fn rollback_new_snapshot(
     persisted: bool,
     error: Error,
 ) -> Error {
-    if let Err(resume_error) = resume_golden(golden) {
-        return Error::agent(
-            "fork",
-            format!("{error}; golden rollback also failed: {resume_error}"),
-        );
+    let mut rollback_errors = Vec::new();
+    if let Err(resume_error) = resume_golden(golden, snapshot_dir) {
+        rollback_errors.push(format!("golden resume failed: {resume_error}"));
     }
     if persisted {
         if let Err(remove_error) = db.remove_retained_fork_snapshot(golden) {
             tracing::warn!(%golden, %remove_error, "failed to remove rolled-back retained fork checkpoint");
+            rollback_errors.push(format!(
+                "retained-checkpoint cleanup failed: {remove_error}"
+            ));
         }
     }
     if let Err(remove_error) = std::fs::remove_dir_all(snapshot_dir) {
         tracing::warn!(path = %snapshot_dir.display(), %remove_error, "failed to remove rolled-back fork snapshot");
+        if remove_error.kind() != std::io::ErrorKind::NotFound {
+            rollback_errors.push(format!("snapshot cleanup failed: {remove_error}"));
+        }
     }
-    error
+    if rollback_errors.is_empty() {
+        error
+    } else {
+        Error::agent(
+            "fork",
+            format!(
+                "{error}; rollback also failed: {}",
+                rollback_errors.join("; ")
+            ),
+        )
+    }
 }
 
 fn reusable_snapshot_path(snapshot_root: &Path, snapshot: &Path) -> bool {
@@ -587,8 +666,19 @@ fn retained_snapshot_is_reusable(
     snapshot_root: &Path,
     snapshot: &RetainedForkSnapshot,
 ) -> bool {
-    golden_was_paused
-        && golden.pid == Some(snapshot.golden_pid)
+    golden_was_paused && retained_snapshot_matches_golden(golden, snapshot_root, snapshot)
+}
+
+/// Return whether a retained checkpoint belongs to the exact live golden
+/// process recorded in the registry and still occupies an owned snapshot path.
+/// State probing uses this to recognize a deliberately paused fork base even
+/// between pool fills, when it temporarily has no dependent clone rows.
+pub(crate) fn retained_snapshot_matches_golden(
+    golden: &VmRecord,
+    snapshot_root: &Path,
+    snapshot: &RetainedForkSnapshot,
+) -> bool {
+    golden.pid == Some(snapshot.golden_pid)
         && golden.pid_start_time == Some(snapshot.golden_pid_start_time)
         && reusable_snapshot_path(snapshot_root, &snapshot.path)
 }
@@ -1382,6 +1472,22 @@ mod tests {
     }
 
     #[test]
+    fn golden_rollback_reapplies_a_completed_checkpoint_only() {
+        let temp = tempfile::tempdir().unwrap();
+        assert_eq!(golden_resume_command(temp.path()).unwrap(), "RESUME");
+
+        std::fs::write(temp.path().join("checkpoint.bin"), b"checkpoint").unwrap();
+        assert_eq!(
+            golden_resume_command(temp.path()).unwrap(),
+            format!("ROLLBACK_FORK {}", temp.path().display())
+        );
+
+        std::fs::remove_file(temp.path().join("checkpoint.bin")).unwrap();
+        std::fs::create_dir(temp.path().join("checkpoint.bin")).unwrap();
+        assert!(golden_resume_command(temp.path()).is_err());
+    }
+
+    #[test]
     fn forkpoint_profile_parses_optional_cuda_preload_hint() {
         assert_eq!(
             parse_forkpoint_profile(b"smolvm-forkpoint-v1\n"),
@@ -1415,6 +1521,11 @@ mod tests {
             &snapshot_root,
             &snapshot
         ));
+        assert!(retained_snapshot_matches_golden(
+            &golden,
+            &snapshot_root,
+            &snapshot
+        ));
         assert!(!retained_snapshot_is_reusable(
             &golden,
             false,
@@ -1422,6 +1533,11 @@ mod tests {
             &snapshot
         ));
         golden.pid_start_time = Some(457);
+        assert!(!retained_snapshot_matches_golden(
+            &golden,
+            &snapshot_root,
+            &snapshot
+        ));
         assert!(!retained_snapshot_is_reusable(
             &golden,
             true,

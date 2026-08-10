@@ -1,0 +1,200 @@
+//! CUDA runtime integrity response used by the private cudart export table.
+//!
+//! The byte-mixing algorithm and table layout are compatible with the public
+//! ZLUDA implementation (Apache-2.0/MIT). Inputs remain local to the guest
+//! process because the hash intentionally includes its table/function
+//! addresses, process id, and thread id.
+
+#[repr(C)]
+struct Pass3Input {
+    driver_version: u32,
+    version: u32,
+    current_process: u32,
+    current_thread: u32,
+    cudart_table: usize,
+    integrity_check_table: usize,
+    function_address: usize,
+    unix_seconds: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct DeviceHashInfo {
+    pub(crate) uuid: [u8; 16],
+    pub(crate) pci_domain: i32,
+    pub(crate) pci_bus: i32,
+    pub(crate) pci_device: i32,
+}
+
+pub(crate) struct Inputs<'a> {
+    pub(crate) version: u32,
+    pub(crate) unix_seconds: u64,
+    pub(crate) driver_version: u32,
+    pub(crate) process: u32,
+    pub(crate) thread: u32,
+    pub(crate) integrity_check_table: usize,
+    pub(crate) cudart_table: usize,
+    pub(crate) function_address: usize,
+    pub(crate) devices: &'a [DeviceHashInfo],
+}
+
+pub(crate) fn compute(inputs: Inputs<'_>) -> [u64; 2] {
+    match inputs.version % 10 {
+        0 => return [0x3341_181c_03cb_675c, 0x8ed3_83aa_1f4c_d1e8],
+        1 => return [0x1841_181c_03cb_675c, 0x8ed3_83aa_1f4c_d1e8],
+        _ => {}
+    }
+
+    const PASS1: [u8; 16] = [
+        0x14, 0x6a, 0xdd, 0xae, 0x53, 0xa9, 0xa7, 0x52, 0xaa, 0x08, 0x41, 0x36, 0x0b, 0xf5, 0x5a,
+        0x9f,
+    ];
+    let mut accumulator = [0u8; 66];
+    hash_pass(&mut accumulator, &PASS1, 0x36);
+    hash_pass(
+        &mut accumulator,
+        &Pass3Input {
+            driver_version: inputs.driver_version,
+            version: inputs.version,
+            current_process: inputs.process,
+            current_thread: inputs.thread,
+            cudart_table: inputs.cudart_table,
+            integrity_check_table: inputs.integrity_check_table,
+            function_address: inputs.function_address,
+            unix_seconds: inputs.unix_seconds,
+        },
+        0,
+    );
+    for device in inputs.devices {
+        hash_pass(&mut accumulator, device, 0);
+    }
+    let first = finish(&mut accumulator);
+    accumulator[..16].fill(0);
+    accumulator[48..].fill(0);
+    hash_pass(&mut accumulator, &PASS1, 0x5c);
+    hash_pass(&mut accumulator, &first, 0);
+    finish(&mut accumulator)
+}
+
+fn hash_pass<T>(accumulator: &mut [u8; 66], input: &T, xor_mask: u8) {
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            std::ptr::from_ref(input).cast::<u8>(),
+            std::mem::size_of_val(input),
+        )
+    };
+    for byte in bytes {
+        mix(accumulator, byte ^ xor_mask);
+    }
+}
+
+fn finish(accumulator: &mut [u8; 66]) -> [u64; 2] {
+    let padding = 16u8.wrapping_sub(accumulator[64]);
+    for _ in 0..padding {
+        mix(accumulator, padding);
+    }
+    for index in 48..64 {
+        mix(accumulator, accumulator[index]);
+    }
+    [
+        u64::from_ne_bytes(accumulator[..8].try_into().expect("eight bytes")),
+        u64::from_ne_bytes(accumulator[8..16].try_into().expect("eight bytes")),
+    ]
+}
+
+fn mix(state: &mut [u8; 66], byte: u8) {
+    const TABLE: [u8; 256] = [
+        0x29, 0x2e, 0x43, 0xc9, 0xa2, 0xd8, 0x7c, 0x01, 0x3d, 0x36, 0x54, 0xa1, 0xec, 0xf0, 0x06,
+        0x13, 0x62, 0xa7, 0x05, 0xf3, 0xc0, 0xc7, 0x73, 0x8c, 0x98, 0x93, 0x2b, 0xd9, 0xbc, 0x4c,
+        0x82, 0xca, 0x1e, 0x9b, 0x57, 0x3c, 0xfd, 0xd4, 0xe0, 0x16, 0x67, 0x42, 0x6f, 0x18, 0x8a,
+        0x17, 0xe5, 0x12, 0xbe, 0x4e, 0xc4, 0xd6, 0xda, 0x9e, 0xde, 0x49, 0xa0, 0xfb, 0xf5, 0x8e,
+        0xbb, 0x2f, 0xee, 0x7a, 0xa9, 0x68, 0x79, 0x91, 0x15, 0xb2, 0x07, 0x3f, 0x94, 0xc2, 0x10,
+        0x89, 0x0b, 0x22, 0x5f, 0x21, 0x80, 0x7f, 0x5d, 0x9a, 0x5a, 0x90, 0x32, 0x27, 0x35, 0x3e,
+        0xcc, 0xe7, 0xbf, 0xf7, 0x97, 0x03, 0xff, 0x19, 0x30, 0xb3, 0x48, 0xa5, 0xb5, 0xd1, 0xd7,
+        0x5e, 0x92, 0x2a, 0xac, 0x56, 0xaa, 0xc6, 0x4f, 0xb8, 0x38, 0xd2, 0x96, 0xa4, 0x7d, 0xb6,
+        0x76, 0xfc, 0x6b, 0xe2, 0x9c, 0x74, 0x04, 0xf1, 0x45, 0x9d, 0x70, 0x59, 0x64, 0x71, 0x87,
+        0x20, 0x86, 0x5b, 0xcf, 0x65, 0xe6, 0x2d, 0xa8, 0x02, 0x1b, 0x60, 0x25, 0xad, 0xae, 0xb0,
+        0xb9, 0xf6, 0x1c, 0x46, 0x61, 0x69, 0x34, 0x40, 0x7e, 0x0f, 0x55, 0x47, 0xa3, 0x23, 0xdd,
+        0x51, 0xaf, 0x3a, 0xc3, 0x5c, 0xf9, 0xce, 0xba, 0xc5, 0xea, 0x26, 0x2c, 0x53, 0x0d, 0x6e,
+        0x85, 0x28, 0x84, 0x09, 0xd3, 0xdf, 0xcd, 0xf4, 0x41, 0x81, 0x4d, 0x52, 0x6a, 0xdc, 0x37,
+        0xc8, 0x6c, 0xc1, 0xab, 0xfa, 0x24, 0xe1, 0x7b, 0x08, 0x0c, 0xbd, 0xb1, 0x4a, 0x78, 0x88,
+        0x95, 0x8b, 0xe3, 0x63, 0xe8, 0x6d, 0xe9, 0xcb, 0xd5, 0xfe, 0x3b, 0x00, 0x1d, 0x39, 0xf2,
+        0xef, 0xb7, 0x0e, 0x66, 0x58, 0xd0, 0xe4, 0xa6, 0x77, 0x72, 0xf8, 0xeb, 0x75, 0x4b, 0x0a,
+        0x31, 0x44, 0x50, 0xb4, 0x8f, 0xed, 0x1f, 0x1a, 0xdb, 0x99, 0x8d, 0x33, 0x9f, 0x11, 0x83,
+        0x14,
+    ];
+    let cursor = state[64] as usize;
+    state[cursor + 16] = byte;
+    let next = (state[64] + 1) & 0xf;
+    state[cursor + 32] = state[cursor] ^ byte;
+    let substituted = TABLE[(byte ^ state[65]) as usize];
+    let mixed = substituted ^ state[cursor + 48];
+    state[cursor + 48] = mixed;
+    state[65] = mixed;
+    state[64] = next;
+    if next != 0 {
+        return;
+    }
+
+    let mut value = 0x29u8;
+    for round in 0..0x12u8 {
+        value ^= state[0];
+        state[0] = value;
+        for slot in state.iter_mut().take(48).skip(1) {
+            value = *slot ^ TABLE[value as usize];
+            *slot = value;
+        }
+        value = value.wrapping_add(round);
+        if round != 0x11 {
+            value = TABLE[value as usize];
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixed_versions_match_runtime_constants() {
+        let input = |version| Inputs {
+            version,
+            unix_seconds: 0,
+            driver_version: 0,
+            process: 0,
+            thread: 0,
+            integrity_check_table: 0,
+            cudart_table: 0,
+            function_address: 0,
+            devices: &[],
+        };
+        assert_eq!(
+            compute(input(12080)),
+            [0x3341_181c_03cb_675c, 0x8ed3_83aa_1f4c_d1e8]
+        );
+        assert_eq!(
+            compute(input(12081)),
+            [0x1841_181c_03cb_675c, 0x8ed3_83aa_1f4c_d1e8]
+        );
+    }
+
+    #[test]
+    fn pass2_matches_known_vector() {
+        const PASS1: [u8; 16] = [
+            0x14, 0x6a, 0xdd, 0xae, 0x53, 0xa9, 0xa7, 0x52, 0xaa, 0x08, 0x41, 0x36, 0x0b, 0xf5,
+            0x5a, 0x9f,
+        ];
+        let mut state = [0u8; 66];
+        hash_pass(&mut state, &PASS1, 0x36);
+        assert_eq!(
+            state,
+            [
+                0x8b, 0x21, 0x9a, 0x49, 0xe8, 0x6d, 0x1a, 0xee, 0xf2, 0x37, 0xf9, 0xb5, 0x4a, 0x8c,
+                0x3c, 0x75, 0xc7, 0x1e, 0xee, 0x21, 0xcf, 0x29, 0x8a, 0xe5, 0x13, 0x83, 0xf4, 0xec,
+                0x33, 0x04, 0xe2, 0xfd, 0xb0, 0x2f, 0x09, 0x01, 0x4f, 0xf7, 0x68, 0x6d, 0x69, 0x46,
+                0x43, 0x7e, 0xb6, 0x2b, 0x21, 0xed, 0x57, 0xa1, 0x10, 0x86, 0x0e, 0x60, 0x44, 0x1e,
+                0x70, 0x5f, 0x67, 0xd1, 0xeb, 0x67, 0xa1, 0x3d, 0x00, 0x3d,
+            ]
+        );
+    }
+}

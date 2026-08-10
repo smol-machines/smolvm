@@ -176,6 +176,25 @@ pub struct ClientRing {
     /// never simultaneously, the queue is strictly request-then-response).
     bounce: Vec<*mut u8>,
     page_size: usize,
+    /// Owns the mmap behind file-backed rings. Ordinary GPA-backed rings use
+    /// guest allocations owned elsewhere and leave this empty.
+    _file_mapping: Option<ClientRingMapping>,
+}
+
+struct ClientRingMapping {
+    base: usize,
+    len: usize,
+}
+
+impl Drop for ClientRingMapping {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        // SAFETY: base/len are the exact successful mmap result transferred to
+        // ClientRing after the host accepts the file-ring upgrade.
+        unsafe {
+            libc::munmap(self.base as *mut libc::c_void, self.len);
+        }
+    }
 }
 
 // SAFETY: raw pointers reference process-owned pinned pages; the shim holds
@@ -288,6 +307,7 @@ impl<S: Read + Write> Client<S> {
             resp: unsafe { crate::ring::Ring::from_pages(resp.0, page_size) },
             bounce: bounce.0,
             page_size,
+            _file_mapping: None,
         });
         Ok(())
     }
@@ -300,6 +320,7 @@ impl<S: Read + Write> Client<S> {
         &mut self,
         page_size: usize,
         fname: &str,
+        mapping: (*mut u8, usize),
         req: Vec<*mut u8>,
         resp: Vec<*mut u8>,
         bounce: Vec<*mut u8>,
@@ -314,13 +335,17 @@ impl<S: Read + Write> Client<S> {
             },
             Op::RingSetupFile,
         )?;
-        // SAFETY: the file mapping is owned by the shim and stays mapped for
-        // the process lifetime (never munmap'd).
+        // SAFETY: the accepted file mapping remains live until this ClientRing
+        // is replaced or dropped, at which point its owner munmaps it.
         self.ring = Some(ClientRing {
             req: unsafe { crate::ring::Ring::from_pages(req, page_size) },
             resp: unsafe { crate::ring::Ring::from_pages(resp, page_size) },
             bounce,
             page_size,
+            _file_mapping: Some(ClientRingMapping {
+                base: mapping.0 as usize,
+                len: mapping.1,
+            }),
         });
         Ok(())
     }
@@ -700,6 +725,8 @@ impl<S: Read + Write> Client<S> {
             | Op::DriverGetVersion
             | Op::DeviceGetAttribute
             | Op::DeviceGetUuid
+            | Op::DeviceGetPciBusId
+            | Op::DeviceGetByPciBusId
             | Op::ModuleGetFunction
             | Op::FuncGetParamInfo
             | Op::FuncGetAttribute
@@ -829,6 +856,28 @@ impl<S: Read + Write> Client<S> {
         }
     }
 
+    pub fn device_get_pci_bus_id(&mut self, device: i32) -> Result<String> {
+        match self.call(
+            &Request::DeviceGetPciBusId { device },
+            Op::DeviceGetPciBusId,
+        )? {
+            Response::Name(value) => Ok(value),
+            _ => Err(CudaRpcError::Protocol("expected Name")),
+        }
+    }
+
+    pub fn device_get_by_pci_bus_id(&mut self, pci_bus_id: &str) -> Result<i32> {
+        match self.call(
+            &Request::DeviceGetByPciBusId {
+                pci_bus_id: pci_bus_id.to_string(),
+            },
+            Op::DeviceGetByPciBusId,
+        )? {
+            Response::Count(device) => Ok(device),
+            _ => Err(CudaRpcError::Protocol("expected Count")),
+        }
+    }
+
     pub fn device_total_mem(&mut self, device: i32) -> Result<u64> {
         match self.call(&Request::DeviceTotalMem { device }, Op::DeviceTotalMem)? {
             Response::Bytes(v) => Ok(v),
@@ -916,6 +965,144 @@ impl<S: Read + Write> Client<S> {
     pub fn mem_free(&mut self, dptr: u64) -> Result<()> {
         // Deferred: status-only, and callers ignore free failures anyway.
         self.call_deferred(&Request::MemFree { dptr }, Op::MemFree)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn mem_pool_create(
+        &mut self,
+        alloc_type: i32,
+        handle_types: u32,
+        location_type: i32,
+        location_id: i32,
+        max_size: u64,
+        usage: u16,
+    ) -> Result<u64> {
+        match self.call(
+            &Request::MemPoolCreate {
+                alloc_type,
+                handle_types,
+                location_type,
+                location_id,
+                max_size,
+                usage,
+            },
+            Op::MemPoolCreate,
+        )? {
+            Response::Handle(pool) => Ok(pool),
+            _ => Err(CudaRpcError::Protocol("expected Handle")),
+        }
+    }
+
+    pub fn mem_pool_destroy(&mut self, pool: u64) -> Result<()> {
+        self.call(&Request::MemPoolDestroy { pool }, Op::MemPoolDestroy)
+            .map(|_| ())
+    }
+
+    pub fn mem_pool_set_attribute(&mut self, pool: u64, attr: i32, value: u64) -> Result<()> {
+        self.call(
+            &Request::MemPoolSetAttribute { pool, attr, value },
+            Op::MemPoolSetAttribute,
+        )
+        .map(|_| ())
+    }
+
+    pub fn mem_pool_get_attribute(&mut self, pool: u64, attr: i32) -> Result<u64> {
+        match self.call(
+            &Request::MemPoolGetAttribute { pool, attr },
+            Op::MemPoolGetAttribute,
+        )? {
+            Response::Bytes(value) => Ok(value),
+            _ => Err(CudaRpcError::Protocol("expected Bytes")),
+        }
+    }
+
+    pub fn mem_pool_set_access(
+        &mut self,
+        pool: u64,
+        descriptors: Vec<(i32, i32, u64)>,
+    ) -> Result<()> {
+        self.call(
+            &Request::MemPoolSetAccess { pool, descriptors },
+            Op::MemPoolSetAccess,
+        )
+        .map(|_| ())
+    }
+
+    pub fn mem_pool_get_access(
+        &mut self,
+        pool: u64,
+        location_type: i32,
+        location_id: i32,
+    ) -> Result<u64> {
+        match self.call(
+            &Request::MemPoolGetAccess {
+                pool,
+                location_type,
+                location_id,
+            },
+            Op::MemPoolGetAccess,
+        )? {
+            Response::Bytes(flags) => Ok(flags),
+            _ => Err(CudaRpcError::Protocol("expected Bytes")),
+        }
+    }
+
+    pub fn mem_pool_trim_to(&mut self, pool: u64, min_bytes: u64) -> Result<()> {
+        self.call(
+            &Request::MemPoolTrimTo { pool, min_bytes },
+            Op::MemPoolTrimTo,
+        )
+        .map(|_| ())
+    }
+
+    pub fn mem_alloc_from_pool_async(&mut self, bytes: u64, pool: u64, stream: u64) -> Result<u64> {
+        match self.call(
+            &Request::MemAllocFromPoolAsync {
+                bytes,
+                pool,
+                stream,
+            },
+            Op::MemAllocFromPoolAsync,
+        )? {
+            Response::Dptr(dptr) => Ok(dptr),
+            _ => Err(CudaRpcError::Protocol("expected Dptr")),
+        }
+    }
+
+    pub fn mem_alloc_async(&mut self, bytes: u64, stream: u64) -> Result<u64> {
+        match self.call(&Request::MemAllocAsync { bytes, stream }, Op::MemAllocAsync)? {
+            Response::Dptr(dptr) => Ok(dptr),
+            _ => Err(CudaRpcError::Protocol("expected Dptr")),
+        }
+    }
+
+    pub fn mem_free_async(&mut self, dptr: u64, stream: u64) -> Result<()> {
+        self.call_deferred(&Request::MemFreeAsync { dptr, stream }, Op::MemFreeAsync)
+    }
+
+    pub fn device_get_default_mem_pool(&mut self, device: i32) -> Result<u64> {
+        match self.call(
+            &Request::DeviceGetDefaultMemPool { device },
+            Op::DeviceGetDefaultMemPool,
+        )? {
+            Response::Handle(pool) => Ok(pool),
+            _ => Err(CudaRpcError::Protocol("expected Handle")),
+        }
+    }
+
+    pub fn device_get_mem_pool(&mut self, device: i32) -> Result<u64> {
+        match self.call(&Request::DeviceGetMemPool { device }, Op::DeviceGetMemPool)? {
+            Response::Handle(pool) => Ok(pool),
+            _ => Err(CudaRpcError::Protocol("expected Handle")),
+        }
+    }
+
+    pub fn device_set_mem_pool(&mut self, device: i32, pool: u64) -> Result<()> {
+        self.call(
+            &Request::DeviceSetMemPool { device, pool },
+            Op::DeviceSetMemPool,
+        )
+        .map(|_| ())
     }
 
     pub fn memcpy_htod(&mut self, dptr: u64, data: &[u8], stream: u64) -> Result<()> {

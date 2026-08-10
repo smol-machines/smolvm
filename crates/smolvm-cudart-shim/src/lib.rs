@@ -666,11 +666,15 @@ fn ring_try_setup_file(client: &mut Client<Stream>) {
     match client.ring_setup_file(
         PAGE,
         &fname,
+        (base.cast(), total),
         pages(0, REQ_N),
         pages(REQ_N, RESP_N),
         pages(REQ_N + RESP_N, BOUNCE_N),
     ) {
         Ok(()) => {
+            // Both sides have mapped the inode now; keeping a directory entry
+            // would accumulate one visible tmpfs file per process/reconnect.
+            let _ = std::fs::remove_file(&path);
             if trace {
                 eprintln!("[ring-file] file-backed rings active ({fname})");
             }

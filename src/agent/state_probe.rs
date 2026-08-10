@@ -46,13 +46,15 @@ pub fn resolve_state(name: &str, record: &VmRecord) -> RecordState {
     let pid_alive = record.is_process_alive();
 
     if pid_alive {
-        // A fork base with live clones was snapshot-frozen by `machine
-        // fork`: its guest is paused and never answers a vsock ping.
+        // A fork base with live clones or a retained checkpoint was
+        // snapshot-frozen by `machine fork`: its guest is paused and never
+        // answers a vsock ping. A retained checkpoint remains authoritative
+        // between pool fills, when there may be zero dependent clone rows.
         // Report it as Frozen *without* probing — this distinguishes it
         // from a genuine zombie (so the reaper and supervisor leave it
         // alone) and avoids a multi-second ping timeout on a VM we know
         // won't respond (the `machine status`/`ls` hang).
-        if has_live_clones(name) {
+        if has_frozen_fork_state(name, record) {
             return RecordState::Frozen;
         }
         // PID alive: confirm the agent responds. If it doesn't, the
@@ -77,13 +79,16 @@ pub fn resolve_state(name: &str, record: &VmRecord) -> RecordState {
 }
 
 /// Cheap (no vsock probe) check for a snapshot-frozen fork base: its
-/// record says `Running`, its VMM PID is alive, and it has dependent
-/// clones. Such a VM's guest agent is paused and must not be connected to
-/// or probed — doing so blocks for the full vsock timeout. Callers report
-/// it as [`RecordState::Frozen`] directly. Shares the same condition
-/// `resolve_state` uses, so the two never disagree.
+/// record says `Running`, its VMM PID is alive, and it has dependent clones
+/// or a retained checkpoint bound to that exact process. Such a VM's guest
+/// agent is paused and must not be connected to or probed — doing so blocks
+/// for the full vsock timeout. Callers report it as [`RecordState::Frozen`]
+/// directly. Shares the same condition `resolve_state` uses, so the two never
+/// disagree.
 pub fn is_frozen_fork_base(name: &str, record: &VmRecord) -> bool {
-    record.state == RecordState::Running && record.is_process_alive() && has_live_clones(name)
+    record.state == RecordState::Running
+        && record.is_process_alive()
+        && has_frozen_fork_state(name, record)
 }
 
 /// True if `name` is a fork base — at least one VM record's disk overlays
@@ -92,10 +97,27 @@ pub fn is_frozen_fork_base(name: &str, record: &VmRecord) -> bool {
 /// auto-restarted; it has to outlive its clones. Best-effort: a DB error
 /// resolves to `false` (treat as not-a-fork-base) so a transient failure
 /// can't wedge state resolution.
-fn has_live_clones(name: &str) -> bool {
-    SmolvmDb::open()
-        .and_then(|db| db.dependent_clones(name))
+fn has_frozen_fork_state(name: &str, record: &VmRecord) -> bool {
+    let Ok(db) = SmolvmDb::open() else {
+        return false;
+    };
+    if db
+        .dependent_clones(name)
         .map(|clones| !clones.is_empty())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    db.retained_fork_snapshot(name)
+        .ok()
+        .flatten()
+        .map(|snapshot| {
+            crate::agent::fork::retained_snapshot_matches_golden(
+                record,
+                &crate::agent::vm_data_dir(name).join("s"),
+                &snapshot,
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -133,6 +155,14 @@ fn recover_unreachable_machine_in_db(record: &VmRecord, db: &SmolvmDb) -> crate:
                 crate::process::VM_SIGKILL_TIMEOUT,
             )?;
         }
+    }
+
+    if let Err(error) = crate::agent::cleanup_dead_vm_runtime_in_db(&record.name, db) {
+        tracing::warn!(
+            machine = %record.name,
+            %error,
+            "failed to clean runtime after unreachable VM teardown"
+        );
     }
 
     // Write via SmolvmDb (not SmolvmConfig) to avoid pulling the full

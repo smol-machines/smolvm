@@ -257,6 +257,68 @@ fn ensure_mount_target_under_root(rootfs: &Path, container_path: &str) -> Result
     Ok(final_canon)
 }
 
+/// Create a regular-file mountpoint without following a final symlink outside
+/// the container root. OCI runtimes require a file destination when the bind
+/// source is a file.
+pub(crate) fn ensure_file_mount_target_under_root(
+    rootfs: &Path,
+    container_path: &str,
+) -> Result<PathBuf> {
+    let relative = validate_container_destination_path(container_path)?;
+    let file_name = relative
+        .file_name()
+        .ok_or_else(|| StorageError::ValidationFailed {
+            context: "mount destination".to_string(),
+            reason: "file mount destination has no filename".to_string(),
+        })?;
+    let parent = relative
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| StorageError::ValidationFailed {
+            context: "mount destination".to_string(),
+            reason: "file mount destination must have a parent directory".to_string(),
+        })?;
+    let parent_destination = format!("/{}", parent.display());
+    let parent_path = ensure_mount_target_under_root(rootfs, &parent_destination)?;
+    let target = parent_path.join(file_name);
+
+    match std::fs::symlink_metadata(&target) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            std::fs::remove_file(&target).map_err(|error| StorageError::ReadFile {
+                path: target.display().to_string(),
+                cause: format!("failed to replace symlink at file mount target: {error}"),
+            })?;
+            std::fs::File::create(&target).map_err(|error| StorageError::ReadFile {
+                path: target.display().to_string(),
+                cause: format!("failed to create file mount target: {error}"),
+            })?;
+        }
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => {
+            return Err(StorageError::ValidationFailed {
+                context: "mount destination".to_string(),
+                reason: format!(
+                    "file mount destination is not a regular file: {}",
+                    target.display()
+                ),
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::File::create(&target).map_err(|error| StorageError::ReadFile {
+                path: target.display().to_string(),
+                cause: format!("failed to create file mount target: {error}"),
+            })?;
+        }
+        Err(error) => {
+            return Err(StorageError::ReadFile {
+                path: target.display().to_string(),
+                cause: error.to_string(),
+            });
+        }
+    }
+    Ok(target)
+}
+
 /// Global state for packed layers support.
 /// Set at startup if SMOLVM_PACKED_LAYERS env var is present.
 static PACKED_LAYERS_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
@@ -399,6 +461,49 @@ pub fn init_volume_mounts() -> &'static [(String, String, bool)] {
 
         mounts
     })
+}
+
+/// Re-establish boot-time virtiofs mounts after a fork restore.
+///
+/// A clone resumes the golden agent after its one-time boot initialization,
+/// while libkrun attaches fresh virtiofs devices to the clone VMM. The restored
+/// mount can remain under the golden's old overlay tree, but a newly selected
+/// clone overlay hides its bind target. Accessing that stale mount can block in
+/// the dead golden virtiofs session indefinitely. Check only mount metadata
+/// (never the stale filesystem), detach a stale staging mount if present, and
+/// bind the clone's fresh device before acknowledging its first host request.
+#[cfg(target_os = "linux")]
+pub fn repair_boot_volume_mounts() -> Result<()> {
+    let missing = init_volume_mounts()
+        .iter()
+        .filter(|(_, target, _)| !is_mountpoint(Path::new(target)))
+        .cloned()
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    for mount in &missing {
+        let (tag, target, _) = mount;
+        let staging = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
+        if is_mountpoint(&staging) {
+            detach_mount(&staging);
+        }
+        setup_volume_mounts("/", std::slice::from_ref(mount))?;
+        if !is_mountpoint(Path::new(target)) {
+            return Err(StorageError::new(format!(
+                "boot volume mount '{}' was not restored at '{}'",
+                tag, target
+            )));
+        }
+        info!(tag = %tag, target = %target, "restored boot volume mount after clone resume");
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn repair_boot_volume_mounts() -> Result<()> {
+    Ok(())
 }
 
 /// Add the /storage/workspace → /workspace fallback bind mount to an OCI spec,
@@ -3157,7 +3262,10 @@ fn run_exec_in_container(
 ) -> Result<RunResult> {
     info!(container_id = %container_id, command = ?command, "joining container via crun exec");
 
+    let exec_pid_file = crate::crun::ExecPidFile::new()
+        .map_err(|e| StorageError::new(format!("create crun exec pid file failed: {}", e)))?;
     let mut child = CrunCommand::exec(container_id, env, command, workdir, false)
+        .pid_file(exec_pid_file.path())
         .stdin_null()
         .capture_output()
         .spawn()
@@ -3166,13 +3274,12 @@ fn run_exec_in_container(
     // On timeout/disconnect, kill only the exec'd process — NOT the main
     // container. The main container hosts the shared namespace for all execs;
     // a timed-out `exec -- sleep 10` must not destroy the workload.
-    let exec_pid = child.id();
     let result = crate::process::wait_with_timeout_cleanup_and_liveness(
         &mut child,
         timeout_ms,
         client_fd,
-        || unsafe {
-            libc::kill(exec_pid as libc::pid_t, libc::SIGKILL);
+        || {
+            exec_pid_file.kill_workload();
         },
     )?;
 
@@ -4494,6 +4601,36 @@ mod tests {
             workspace_link.is_dir(),
             "/workspace should now be a directory"
         );
+    }
+
+    #[test]
+    fn file_mount_target_creates_parent_and_regular_file() {
+        let root = tempfile::tempdir().unwrap();
+        let rootfs = root.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+
+        let target = ensure_file_mount_target_under_root(&rootfs, "/run/smolvm/init").unwrap();
+        assert!(target.is_file());
+        assert!(target.starts_with(rootfs.canonicalize().unwrap()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_mount_target_replaces_final_symlink_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let rootfs = root.path().join("rootfs");
+        let destination_parent = rootfs.join("run/smolvm");
+        std::fs::create_dir_all(&destination_parent).unwrap();
+        let destination = destination_parent.join("init");
+        symlink(outside.path(), &destination).unwrap();
+
+        let target = ensure_file_mount_target_under_root(&rootfs, "/run/smolvm/init").unwrap();
+        assert!(target.is_file());
+        assert!(!target.is_symlink());
+        assert!(outside.path().is_file());
     }
 
     #[test]

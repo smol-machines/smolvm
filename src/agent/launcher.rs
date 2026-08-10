@@ -48,6 +48,96 @@ const EGRESS_CIDR_CAP: usize = 512;
 /// disabling the root DAX region for benchmarking.
 const ENV_SMOLVM_ROOTFS_DAX: &str = "SMOLVM_ROOTFS_DAX";
 
+/// Stable tmpfs directory used by one VM's CUDA file-ring transport.
+///
+/// The path is derived from the full per-VM runtime directory rather than its
+/// basename. This avoids collisions when two independent smolvm homes contain
+/// a machine with the same name. A stable path lets the lifecycle manager
+/// reclaim it after a signal-terminated VMM, where Rust destructors do not run.
+#[cfg(target_os = "linux")]
+pub(crate) fn cuda_ring_tmpfs_path(vm_runtime_dir: &Path) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::ffi::OsStrExt;
+
+    let digest = Sha256::digest(vm_runtime_dir.as_os_str().as_bytes());
+    PathBuf::from("/dev/shm").join(format!("smolvm-cuda-ring-{}", hex::encode(&digest[..8])))
+}
+
+/// Remove an exact directory only when it is a real directory owned by this
+/// process's uid. Refusing symlinks and foreign-owned paths prevents lifecycle
+/// cleanup from following an attacker-controlled replacement in shared tmpfs.
+#[cfg(target_os = "linux")]
+fn remove_owned_directory(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if !metadata.file_type().is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("refusing to remove non-directory {}", path.display()),
+        ));
+    }
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let effective_uid = unsafe { libc::geteuid() };
+    if metadata.uid() != effective_uid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing to remove {} owned by uid {} (effective uid {})",
+                path.display(),
+                metadata.uid(),
+                effective_uid
+            ),
+        ));
+    }
+    std::fs::remove_dir_all(path)
+}
+
+/// Reclaim a VM's deterministic CUDA tmpfs directory after its VMM is dead.
+#[cfg(target_os = "linux")]
+pub(crate) fn cleanup_cuda_ring_dir(vm_runtime_dir: &Path) -> std::io::Result<()> {
+    remove_owned_directory(&cuda_ring_tmpfs_path(vm_runtime_dir))?;
+    remove_owned_directory(&vm_runtime_dir.join("cuda-ring"))
+}
+
+#[cfg(target_os = "linux")]
+struct CudaRingDirGuard {
+    path: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for CudaRingDirGuard {
+    fn drop(&mut self) {
+        if let Err(error) = remove_owned_directory(&self.path) {
+            tracing::warn!(
+                %error,
+                path = %self.path.display(),
+                "failed to clean CUDA tmpfs ring directory"
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn create_cuda_ring_dir(vm_runtime_dir: &Path) -> std::io::Result<CudaRingDirGuard> {
+    let path = cuda_ring_tmpfs_path(vm_runtime_dir);
+    create_owned_directory(&path)?;
+    Ok(CudaRingDirGuard { path })
+}
+
+#[cfg(target_os = "linux")]
+fn create_owned_directory(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    remove_owned_directory(path)?;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700).create(path)
+}
+
 /// Root virtiofs DAX window (512 MB), matching the default the removed
 /// `krun_set_root` configured. DAX gives the host a coherent shared mapping of
 /// the root fs so the guest agent's ready-marker write is visible to the host
@@ -538,11 +628,18 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
 
     // CUDA machines get an implicit dax RING mount: a per-machine host dir the
     // guest shim and the CUDA daemon both mmap for the file-backed clone-ring
-    // transport (see cuda_host::ring_dir_advert / RingSetupFile). The dir sits
-    // next to the per-VM cuda socket; the guest sees it at /opt/smolvm-ring.
+    // transport and mapped host allocations. On Linux, tmpfs backing is
+    // required for NVIDIA cuMemHostRegister; an ordinary disk file is rejected
+    // by the driver. Linux uses a deterministic, per-machine tmpfs directory so
+    // AgentManager can reclaim it even when the VMM is terminated by a signal
+    // and this process's destructors do not run. Other platforms retain a
+    // per-VM directory used by file rings. The guest sees either at
+    // /opt/smolvm-ring.
     // Opt out with SMOLVM_CUDA_FILE_RING=0.
     let mut mounts_vec: Vec<crate::data::storage::HostMount> = mounts.to_vec();
-    if let Some(cs) = cuda_socket {
+    #[cfg(target_os = "linux")]
+    let mut _cuda_ring_guard: Option<CudaRingDirGuard> = None;
+    if cuda_socket.is_some() {
         // Device-slot budget: libkrun EINVALs the VM config once the virtio
         // device count crosses its table size (measured: 4 user mounts + the
         // ring device fails; either alone boots). Skip the ring mount rather
@@ -553,8 +650,40 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 "skipping CUDA ring mount: virtio device budget exhausted (clone rings unavailable; socket transport)"
             );
         } else if std::env::var("SMOLVM_CUDA_FILE_RING").as_deref() != Ok("0") {
-            if let Some(dir) = cs.parent().map(|d| d.join("cuda-ring")) {
-                if std::fs::create_dir_all(&dir).is_ok() {
+            let vm_runtime_dir = vsock_socket.parent().unwrap_or_else(|| Path::new("."));
+            let fallback_ring_dir = vm_runtime_dir.join("cuda-ring");
+            let mut ring_dir: Option<PathBuf> = None;
+            #[cfg(target_os = "linux")]
+            match create_cuda_ring_dir(vm_runtime_dir) {
+                Ok(guard) => {
+                    ring_dir = Some(guard.path.clone());
+                    _cuda_ring_guard = Some(guard);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "CUDA tmpfs ring unavailable; mapped host allocations will use the contiguous-memory fallback"
+                    );
+                    match create_owned_directory(&fallback_ring_dir) {
+                        Ok(()) => ring_dir = Some(fallback_ring_dir.clone()),
+                        Err(error) => tracing::warn!(
+                            %error,
+                            path = %fallback_ring_dir.display(),
+                            "CUDA fallback ring directory unavailable; using socket transport"
+                        ),
+                    }
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                ring_dir = Some(fallback_ring_dir);
+            }
+            if let Some(dir) = ring_dir {
+                #[cfg(target_os = "linux")]
+                let directory_ready = true;
+                #[cfg(not(target_os = "linux"))]
+                let directory_ready = std::fs::create_dir_all(&dir).is_ok();
+                if directory_ready {
                     // SAFETY-free env set: single-threaded launch path, before
                     // the proxy threads spawn (they read these lazily anyway).
                     unsafe {
@@ -2081,6 +2210,43 @@ fn spawn_idle_reclaim(ctl: PathBuf, memory_mib: u32, idle_minutes: u64) {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cuda_ring_tmpfs_path_is_stable_and_scoped_to_full_runtime_path() {
+        let first = cuda_ring_tmpfs_path(Path::new("/tmp/home-a/vms/deadbeef"));
+        assert_eq!(
+            first,
+            cuda_ring_tmpfs_path(Path::new("/tmp/home-a/vms/deadbeef"))
+        );
+        assert_ne!(
+            first,
+            cuda_ring_tmpfs_path(Path::new("/tmp/home-b/vms/deadbeef"))
+        );
+        assert_eq!(first.parent(), Some(Path::new("/dev/shm")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owned_directory_cleanup_removes_directory_but_refuses_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let owned = tmp.path().join("owned");
+        fs::create_dir(&owned).unwrap();
+        fs::write(owned.join("state"), b"test").unwrap();
+        remove_owned_directory(&owned).unwrap();
+        assert!(!owned.exists());
+
+        let target = tmp.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let link = tmp.path().join("link");
+        symlink(&target, &link).unwrap();
+        let error = remove_owned_directory(&link).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(target.is_dir());
+        assert!(link.symlink_metadata().is_ok());
+    }
 
     fn scoped(hosts: &[&str]) -> LaunchFeatures {
         LaunchFeatures {

@@ -225,6 +225,30 @@ pub fn vm_data_dir(name: &str) -> PathBuf {
     vm_cache_root().join(vm_dir_hash(name))
 }
 
+/// Reclaim CUDA transport state after a named VM process is confirmed dead.
+///
+/// Some teardown paths terminate a VMM directly because its guest agent is
+/// unreachable and therefore never construct an [`AgentManager`] that can run
+/// normal lifecycle cleanup. Keeping this name-based entry point next to
+/// [`vm_data_dir`] makes those recovery paths clean the same exact directories.
+pub(crate) fn cleanup_dead_vm_runtime(name: &str) -> Result<()> {
+    let db = crate::db::SmolvmDb::open()?;
+    cleanup_dead_vm_runtime_in_db(name, &db)
+}
+
+pub(crate) fn cleanup_dead_vm_runtime_in_db(name: &str, db: &crate::db::SmolvmDb) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    launcher::cleanup_cuda_ring_dir(&vm_data_dir(name))
+        .map_err(|error| Error::agent("clean CUDA ring directory", error.to_string()))?;
+    #[cfg(not(target_os = "linux"))]
+    let _ = name;
+
+    if db.dependent_clones(name)?.is_empty() {
+        crate::agent::fork::discard_retained_snapshots(db, name)?;
+    }
+    Ok(())
+}
+
 /// Node-shared, content-addressed pack store: `<vm_cache_root>/_shared`. Each
 /// build-constant pack is extracted here once per node under `<checksum>/`
 /// (root-owned, read-only) and presented to every machine via a per-VM idmapped
@@ -2407,6 +2431,32 @@ impl AgentManager {
         }
     }
 
+    /// Remove the per-VM CUDA tmpfs transport directory after the VMM is known
+    /// to be dead. VMMs are normally terminated by signal, so launcher-local
+    /// destructors cannot provide authoritative cleanup.
+    fn cleanup_cuda_ring_dir(&self) {
+        #[cfg(target_os = "linux")]
+        if let Some(runtime_dir) = self.vsock_socket.parent() {
+            if let Err(error) = launcher::cleanup_cuda_ring_dir(runtime_dir) {
+                tracing::warn!(
+                    %error,
+                    path = %runtime_dir.display(),
+                    "failed to clean CUDA tmpfs ring directory"
+                );
+            }
+        }
+    }
+
+    fn cleanup_dead_vm_runtime(&self) {
+        if let Some(name) = self.name.as_deref() {
+            if let Err(error) = cleanup_dead_vm_runtime(name) {
+                tracing::warn!(%name, %error, "failed to clean dead VM runtime state");
+            }
+        } else {
+            self.cleanup_cuda_ring_dir();
+        }
+    }
+
     /// Kill the VM process immediately with SIGKILL. No graceful shutdown.
     ///
     /// Used for ephemeral `machine run` where the command has already finished
@@ -2461,7 +2511,7 @@ impl AgentManager {
             },
         };
 
-        if let Some(pid) = killed_pid {
+        let confirmed_dead = if let Some(pid) = killed_pid {
             // Brief wait for the kernel to reap (SIGKILL is near-instant).
             // try_wait reaps zombie children; is_alive catches non-children
             // that have been reparented to init/launchd.
@@ -2471,14 +2521,23 @@ impl AgentManager {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
+            !process::is_alive(pid)
+        } else {
+            // If an unverified live pid-file remains, do not remove resources
+            // out from under a process that we deliberately refused to signal.
+            !self.pid_file.exists()
+        };
+        if confirmed_dead {
+            self.cleanup_marker_files();
+            self.cleanup_dead_vm_runtime();
         }
-        self.cleanup_marker_files();
     }
 
     /// Remove the VM's entire data directory (storage, overlay, socket, logs).
     ///
     /// Only safe for ephemeral VMs after the process is confirmed dead.
     pub fn cleanup_data_dir(&self) {
+        self.cleanup_cuda_ring_dir();
         if let Some(ref name) = self.name {
             let dir = vm_data_dir(name);
             // Release this VM's per-VM uid (if any) back to the allocator before
@@ -2518,6 +2577,7 @@ impl AgentManager {
                 }
                 self.cleanup_marker_files();
             }
+            self.cleanup_dead_vm_runtime();
             return Ok(());
         }
 
@@ -2584,6 +2644,7 @@ impl AgentManager {
         }
 
         self.cleanup_marker_files();
+        self.cleanup_dead_vm_runtime();
         metrics::gauge!("smolvm_machines_running").decrement(1.0);
 
         Ok(())
