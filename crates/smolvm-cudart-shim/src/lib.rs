@@ -43,6 +43,7 @@ const CUDA_SUCCESS: c_int = 0;
 const CUDA_ERROR_INVALID_VALUE: c_int = 1;
 const CUDA_ERROR_MEMORY_ALLOCATION: c_int = 2;
 const CUDA_ERROR_INITIALIZATION: c_int = 3;
+const CUDA_ERROR_INVALID_SYMBOL: c_int = 13;
 const CUDA_ERROR_INVALID_DEVICE_POINTER: c_int = 17;
 const CUDA_ERROR_INVALID_RESOURCE_HANDLE: c_int = 400;
 const CUDA_ERROR_NO_DEVICE: c_int = 100;
@@ -185,6 +186,22 @@ struct FuncRec {
     param_sizes: Vec<u32>,
 }
 
+/// A CUDA 12+ runtime library lowered to the existing Driver-API module RPCs.
+/// Kernel handles minted from the library are tracked so unload invalidates
+/// them just like the native runtime does.
+struct LibraryRec {
+    module: u64,
+    kernels: Vec<usize>,
+    globals: Vec<u64>,
+}
+
+#[derive(Clone)]
+struct SymbolRec {
+    module: u64,
+    name: String,
+    address: u64,
+}
+
 struct ShimState {
     client: Client<Stream>,
     initialized: bool,
@@ -192,6 +209,10 @@ struct ShimState {
     modules: HashMap<usize, u64>,
     /// `__cudaRegisterFunction` host stub pointer → resolved kernel.
     funcs: HashMap<usize, FuncRec>,
+    /// `cudaLibrary_t` virtual handle → loaded driver module and its kernels.
+    libraries: HashMap<usize, LibraryRec>,
+    /// Runtime host-symbol address → module/name for driver global lookup.
+    symbols: HashMap<usize, SymbolRec>,
     /// Host pinned-memory allocations (guest RAM) → layout, for cudaFreeHost.
     host_allocs: HashMap<usize, std::alloc::Layout>,
     /// Live device allocations, base → size. Range-queried (not exact-match):
@@ -276,6 +297,13 @@ fn map_err(e: CudaRpcError) -> c_int {
             TRANSPORT_ERR.with(|t| t.set(true));
             CUDA_ERROR_UNKNOWN
         }
+    }
+}
+
+fn map_symbol_err(e: CudaRpcError) -> c_int {
+    match e {
+        CudaRpcError::Cuda(500) => CUDA_ERROR_INVALID_SYMBOL,
+        other => map_err(other),
     }
 }
 
@@ -766,6 +794,8 @@ fn with_client<T>(
                 initialized: true,
                 modules: HashMap::new(),
                 funcs: HashMap::new(),
+                libraries: HashMap::new(),
+                symbols: HashMap::new(),
                 host_allocs: HashMap::new(),
                 dev_allocs: std::collections::BTreeMap::new(),
                 capture: None,
@@ -1563,6 +1593,48 @@ pub extern "C" fn cudaMemcpy(dst: *mut c_void, src: *const c_void, n: usize, kin
     set_last(retry_transport_c(|| do_memcpy(dst, src, n, kind, 0)))
 }
 
+/// Runtime-API 2D copy. The wire protocol currently exposes linear copies, so
+/// preserve CUDA's pitched-memory semantics by lowering each logical row to a
+/// linear copy. Contiguous layouts retain the one-RPC fast path.
+#[no_mangle]
+pub extern "C" fn cudaMemcpy2D(
+    dst: *mut c_void,
+    dpitch: usize,
+    src: *const c_void,
+    spitch: usize,
+    width: usize,
+    height: usize,
+    kind: c_int,
+) -> c_int {
+    if width == 0 || height == 0 {
+        return set_last(CUDA_SUCCESS);
+    }
+    if dst.is_null() || src.is_null() || width > dpitch || width > spitch {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    if dpitch == width && spitch == width {
+        let Some(bytes) = width.checked_mul(height) else {
+            return set_last(CUDA_ERROR_INVALID_VALUE);
+        };
+        return cudaMemcpy(dst, src, bytes, kind);
+    }
+    for row in 0..height {
+        let Some(dst_off) = row.checked_mul(dpitch) else {
+            return set_last(CUDA_ERROR_INVALID_VALUE);
+        };
+        let Some(src_off) = row.checked_mul(spitch) else {
+            return set_last(CUDA_ERROR_INVALID_VALUE);
+        };
+        let row_dst = (dst as *mut u8).wrapping_add(dst_off).cast();
+        let row_src = (src as *const u8).wrapping_add(src_off).cast();
+        let rc = do_memcpy(row_dst, row_src, width, kind, 0);
+        if rc != CUDA_SUCCESS {
+            return set_last(rc);
+        }
+    }
+    set_last(CUDA_SUCCESS)
+}
+
 #[no_mangle]
 pub extern "C" fn cudaMemcpyAsync(
     dst: *mut c_void,
@@ -1593,6 +1665,47 @@ pub extern "C" fn cudaMemcpyAsync(
     set_last(retry_transport_c(|| {
         do_memcpy(dst, src, n, kind, stream as u64)
     }))
+}
+
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn cudaMemcpy2DAsync(
+    dst: *mut c_void,
+    dpitch: usize,
+    src: *const c_void,
+    spitch: usize,
+    width: usize,
+    height: usize,
+    kind: c_int,
+    stream: *mut c_void,
+) -> c_int {
+    if width == 0 || height == 0 {
+        return set_last(CUDA_SUCCESS);
+    }
+    if dst.is_null() || src.is_null() || width > dpitch || width > spitch {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    if dpitch == width && spitch == width {
+        let Some(bytes) = width.checked_mul(height) else {
+            return set_last(CUDA_ERROR_INVALID_VALUE);
+        };
+        return cudaMemcpyAsync(dst, src, bytes, kind, stream);
+    }
+    for row in 0..height {
+        let Some(dst_off) = row.checked_mul(dpitch) else {
+            return set_last(CUDA_ERROR_INVALID_VALUE);
+        };
+        let Some(src_off) = row.checked_mul(spitch) else {
+            return set_last(CUDA_ERROR_INVALID_VALUE);
+        };
+        let row_dst = (dst as *mut u8).wrapping_add(dst_off).cast();
+        let row_src = (src as *const u8).wrapping_add(src_off).cast();
+        let rc = cudaMemcpyAsync(row_dst, row_src, width, kind, stream);
+        if rc != CUDA_SUCCESS {
+            return set_last(rc);
+        }
+    }
+    set_last(CUDA_SUCCESS)
 }
 
 #[no_mangle]
@@ -2424,7 +2537,64 @@ fn graph_add_node_unsupported(p_graph_node: *mut *mut c_void) -> c_int {
     if !p_graph_node.is_null() {
         unsafe { *p_graph_node = std::ptr::null_mut() };
     }
-    set_last(801) // cudaErrorNotSupported
+    set_last(CUDA_ERROR_NOT_SUPPORTED)
+}
+
+#[no_mangle]
+pub extern "C" fn cudaGraphAddEmptyNode(
+    p_graph_node: *mut *mut c_void,
+    _graph: *mut c_void,
+    _deps: *const *const c_void,
+    _num_deps: usize,
+) -> c_int {
+    graph_add_node_unsupported(p_graph_node)
+}
+
+#[no_mangle]
+pub extern "C" fn cudaGraphAddNode(
+    p_graph_node: *mut *mut c_void,
+    _graph: *mut c_void,
+    _deps: *const *const c_void,
+    _dependency_data: *const c_void,
+    _num_deps: usize,
+    _node_params: *mut c_void,
+) -> c_int {
+    graph_add_node_unsupported(p_graph_node)
+}
+
+#[no_mangle]
+pub extern "C" fn cudaGraphNodeGetType(_node: *mut c_void, node_type: *mut c_int) -> c_int {
+    if !node_type.is_null() {
+        unsafe { *node_type = 0 };
+    }
+    set_last(CUDA_ERROR_NOT_SUPPORTED)
+}
+
+#[no_mangle]
+pub extern "C" fn cudaGraphConditionalHandleCreate(
+    handle_out: *mut u64,
+    _graph: *mut c_void,
+    _default_launch_value: c_uint,
+    _flags: c_uint,
+) -> c_int {
+    if !handle_out.is_null() {
+        unsafe { *handle_out = 0 };
+    }
+    set_last(CUDA_ERROR_NOT_SUPPORTED)
+}
+
+/// Capturing into a caller-provided graph carries dependency-edge semantics
+/// that `cudaStreamBeginCapture` cannot represent, so reject it explicitly.
+#[no_mangle]
+pub extern "C" fn cudaStreamBeginCaptureToGraph(
+    _stream: *mut c_void,
+    _graph: *mut c_void,
+    _dependencies: *const *const c_void,
+    _dependency_data: *const c_void,
+    _num_dependencies: usize,
+    _mode: c_int,
+) -> c_int {
+    set_last(CUDA_ERROR_NOT_SUPPORTED)
 }
 
 #[no_mangle]
@@ -2828,8 +2998,206 @@ pub extern "C" fn cudaOccupancyMaxActiveBlocksPerMultiprocessor(
 }
 
 #[no_mangle]
+pub extern "C" fn cudaOccupancyMaxActiveClusters(
+    num_clusters: *mut c_int,
+    func: *const c_void,
+    launch_config: *const c_void,
+) -> c_int {
+    if num_clusters.is_null() || func.is_null() || launch_config.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    // Cluster launch attributes are not yet carried by cudaLaunchKernelExC.
+    // Reporting a fabricated occupancy could make a caller select a launch
+    // configuration the runtime cannot preserve, so fail explicitly.
+    unsafe { *num_clusters = 0 };
+    set_last(CUDA_ERROR_NOT_SUPPORTED)
+}
+
+#[no_mangle]
 pub extern "C" fn cublasLtGetVersion() -> usize {
     130000
+}
+
+/// CUDA 12+ Library API, lowered to the module/function RPC surface already
+/// used by nvcc's runtime registration hooks.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn cudaLibraryLoadData(
+    library: *mut *mut c_void,
+    code: *const c_void,
+    _jit_options: *const c_int,
+    _jit_option_values: *mut *mut c_void,
+    num_jit_options: c_uint,
+    _library_options: *const c_int,
+    _library_option_values: *mut *mut c_void,
+    num_library_options: c_uint,
+) -> c_int {
+    if library.is_null() || code.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    unsafe { *library = std::ptr::null_mut() };
+    // Options affect linking/loading semantics. Silently ignoring them could
+    // load a different program, so only the unadorned form is supported.
+    if num_jit_options != 0 || num_library_options != 0 {
+        return set_last(CUDA_ERROR_NOT_SUPPORTED);
+    }
+    let len = match unsafe { module_image_len(code) } {
+        Ok(len) => len,
+        Err(e) => return set_last(e),
+    };
+    let blob = unsafe { std::slice::from_raw_parts(code.cast::<u8>(), len) }.to_vec();
+    set_last(
+        match with_state(|s| {
+            let module = s.client.module_load_data(&blob).map_err(map_err)?;
+            let handle = alloc_vhandle() as usize;
+            s.libraries.insert(
+                handle,
+                LibraryRec {
+                    module,
+                    kernels: Vec::new(),
+                    globals: Vec::new(),
+                },
+            );
+            Ok(handle)
+        }) {
+            Ok(handle) => unsafe { out(library, handle as *mut c_void) },
+            Err(e) => e,
+        },
+    )
+}
+
+#[no_mangle]
+pub extern "C" fn cudaLibraryGetKernel(
+    kernel: *mut *mut c_void,
+    library: *mut c_void,
+    name: *const c_char,
+) -> c_int {
+    if kernel.is_null() || library.is_null() || name.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    unsafe { *kernel = std::ptr::null_mut() };
+    let name = match unsafe { CStr::from_ptr(name) }.to_str() {
+        Ok(name) => name.to_owned(),
+        Err(_) => return set_last(CUDA_ERROR_INVALID_VALUE),
+    };
+    set_last(
+        match with_state(|s| {
+            let module = s
+                .libraries
+                .get(&(library as usize))
+                .ok_or(CUDA_ERROR_INVALID_RESOURCE_HANDLE)?
+                .module;
+            let fid = s
+                .client
+                .module_get_function(module, &name)
+                .map_err(map_err)?;
+            let param_sizes = s.client.func_get_param_info(fid).map_err(map_err)?;
+            let handle = alloc_vhandle() as usize;
+            s.funcs.insert(handle, FuncRec { fid, param_sizes });
+            s.libraries
+                .get_mut(&(library as usize))
+                .expect("library validated above")
+                .kernels
+                .push(handle);
+            Ok(handle)
+        }) {
+            Ok(handle) => unsafe { out(kernel, handle as *mut c_void) },
+            Err(e) => e,
+        },
+    )
+}
+
+#[no_mangle]
+pub extern "C" fn cudaLibraryGetGlobal(
+    dptr: *mut *mut c_void,
+    bytes: *mut usize,
+    library: *mut c_void,
+    name: *const c_char,
+) -> c_int {
+    if dptr.is_null() || bytes.is_null() || library.is_null() || name.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    unsafe {
+        *dptr = std::ptr::null_mut();
+        *bytes = 0;
+    }
+    let name = match unsafe { CStr::from_ptr(name) }.to_str() {
+        Ok(name) => name.to_owned(),
+        Err(_) => return set_last(CUDA_ERROR_INVALID_VALUE),
+    };
+    set_last(
+        match with_state(|s| {
+            let module = s
+                .libraries
+                .get(&(library as usize))
+                .ok_or(CUDA_ERROR_INVALID_RESOURCE_HANDLE)?
+                .module;
+            let (address, size) = s
+                .client
+                .module_get_global(module, &name)
+                .map_err(map_symbol_err)?;
+            s.dev_allocs.insert(address, size);
+            let globals = &mut s
+                .libraries
+                .get_mut(&(library as usize))
+                .expect("library validated above")
+                .globals;
+            if !globals.contains(&address) {
+                globals.push(address);
+            }
+            Ok((address, size))
+        }) {
+            Ok((address, size)) => unsafe {
+                *bytes = size as usize;
+                out(dptr, address as *mut c_void)
+            },
+            Err(e) => e,
+        },
+    )
+}
+
+#[no_mangle]
+pub extern "C" fn cudaKernelSetAttributeForDevice(
+    kernel: *mut c_void,
+    attr: c_int,
+    value: c_int,
+    device: c_int,
+) -> c_int {
+    if device != 0 {
+        return set_last(10); // cudaErrorInvalidDevice
+    }
+    cudaFuncSetAttribute(kernel, attr, value)
+}
+
+#[no_mangle]
+pub extern "C" fn cudaLibraryUnload(library: *mut c_void) -> c_int {
+    if library.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    set_last(
+        match with_state(|s| {
+            let module = s
+                .libraries
+                .get(&(library as usize))
+                .ok_or(CUDA_ERROR_INVALID_RESOURCE_HANDLE)?
+                .module;
+            s.client.module_unload(module).map_err(map_err)?;
+            let rec = s
+                .libraries
+                .remove(&(library as usize))
+                .expect("library validated above");
+            for kernel in rec.kernels {
+                s.funcs.remove(&kernel);
+            }
+            for global in rec.globals {
+                s.dev_allocs.remove(&global);
+            }
+            Ok(())
+        }) {
+            Ok(()) => CUDA_SUCCESS,
+            Err(e) => e,
+        },
+    )
 }
 
 /// Driver entry-point lookup (cudart 13): resolve `symbol` from the staged
@@ -2890,24 +3258,125 @@ pub extern "C" fn cudaGetDriverEntryPointByVersion(
 }
 
 #[no_mangle]
-pub extern "C" fn cudaGetSymbolAddress(
-    _dev_ptr: *mut *mut c_void,
-    _symbol: *const c_void,
-) -> c_int {
-    // Device-global symbol lookup is not remoted; callers treat this as
-    // "symbol unavailable" (cudaErrorInvalidSymbol).
-    set_last(13)
+pub extern "C" fn cudaGetSymbolAddress(dev_ptr: *mut *mut c_void, symbol: *const c_void) -> c_int {
+    if dev_ptr.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    unsafe { *dev_ptr = std::ptr::null_mut() };
+    set_last(match resolve_symbol(symbol) {
+        Ok((address, _)) => unsafe { out(dev_ptr, address as *mut c_void) },
+        Err(e) => e,
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn cudaMemcpyToSymbol(
-    _symbol: *const c_void,
-    _src: *const c_void,
-    _count: usize,
-    _offset: usize,
-    _kind: c_int,
+    symbol: *const c_void,
+    src: *const c_void,
+    count: usize,
+    offset: usize,
+    kind: c_int,
 ) -> c_int {
-    set_last(13)
+    let address = match symbol_range(symbol, offset, count) {
+        Ok(address) => address,
+        Err(e) => return set_last(e),
+    };
+    set_last(do_memcpy(address as *mut c_void, src, count, kind, 0))
+}
+
+#[no_mangle]
+pub extern "C" fn cudaMemcpyFromSymbol(
+    dst: *mut c_void,
+    symbol: *const c_void,
+    count: usize,
+    offset: usize,
+    kind: c_int,
+) -> c_int {
+    let address = match symbol_range(symbol, offset, count) {
+        Ok(address) => address,
+        Err(e) => return set_last(e),
+    };
+    set_last(do_memcpy(dst, address as *const c_void, count, kind, 0))
+}
+
+#[no_mangle]
+pub extern "C" fn cudaMemcpyToSymbolAsync(
+    symbol: *const c_void,
+    src: *const c_void,
+    count: usize,
+    offset: usize,
+    kind: c_int,
+    stream: *mut c_void,
+) -> c_int {
+    let address = match symbol_range(symbol, offset, count) {
+        Ok(address) => address,
+        Err(e) => return set_last(e),
+    };
+    cudaMemcpyAsync(address as *mut c_void, src, count, kind, stream)
+}
+
+#[no_mangle]
+pub extern "C" fn cudaMemcpyFromSymbolAsync(
+    dst: *mut c_void,
+    symbol: *const c_void,
+    count: usize,
+    offset: usize,
+    kind: c_int,
+    stream: *mut c_void,
+) -> c_int {
+    let address = match symbol_range(symbol, offset, count) {
+        Ok(address) => address,
+        Err(e) => return set_last(e),
+    };
+    cudaMemcpyAsync(dst, address as *const c_void, count, kind, stream)
+}
+
+#[no_mangle]
+pub extern "C" fn cudaGetSymbolSize(size: *mut usize, symbol: *const c_void) -> c_int {
+    if size.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    unsafe { *size = 0 };
+    set_last(match resolve_symbol(symbol) {
+        Ok((_, bytes)) => unsafe { out(size, bytes as usize) },
+        Err(e) => e,
+    })
+}
+
+fn resolve_symbol(symbol: *const c_void) -> Result<(u64, u64), c_int> {
+    if symbol.is_null() {
+        return Err(CUDA_ERROR_INVALID_SYMBOL);
+    }
+    with_state(|s| {
+        let rec = s
+            .symbols
+            .get(&(symbol as usize))
+            .cloned()
+            .ok_or(CUDA_ERROR_INVALID_SYMBOL)?;
+        let result = s
+            .client
+            .module_get_global(rec.module, &rec.name)
+            .map_err(map_symbol_err)?;
+        if rec.address != result.0 {
+            s.dev_allocs.remove(&rec.address);
+        }
+        s.dev_allocs.insert(result.0, result.1);
+        if let Some(stored) = s.symbols.get_mut(&(symbol as usize)) {
+            stored.address = result.0;
+        }
+        Ok(result)
+    })
+}
+
+fn symbol_range(symbol: *const c_void, offset: usize, count: usize) -> Result<u64, c_int> {
+    let (address, bytes) = resolve_symbol(symbol)?;
+    let end = offset.checked_add(count).ok_or(CUDA_ERROR_INVALID_VALUE)?;
+    if end as u64 > bytes {
+        return Err(CUDA_ERROR_INVALID_VALUE);
+    }
+    address
+        .checked_add(offset as u64)
+        .ok_or(CUDA_ERROR_INVALID_VALUE)
 }
 
 #[no_mangle]
@@ -2969,6 +3438,18 @@ pub extern "C" fn cudaDeviceGetPCIBusId(buf: *mut c_char, len: c_int, _device: c
     set_last(CUDA_SUCCESS)
 }
 
+#[no_mangle]
+pub extern "C" fn cudaDeviceGetByPCIBusId(device: *mut c_int, pci_bus_id: *const c_char) -> c_int {
+    if device.is_null() || pci_bus_id.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    let requested = unsafe { CStr::from_ptr(pci_bus_id) }.to_bytes();
+    if requested != b"0000:01:00.0" {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    set_last(unsafe { out(device, 0) })
+}
+
 // ---- kernel registration + launch -------------------------------------------
 
 /// `__fatBinC_Wrapper_t`: what `__cudaRegisterFatBinary` receives. `data` points
@@ -2981,44 +3462,117 @@ struct FatBinWrapper {
     filename_or_fatbins: *const c_void,
 }
 
-/// Length of a fatbin container from its header (magic `0xBA55ED50`,
-/// u16 version, u16 headerSize, u64 fatSize).
-unsafe fn fatbin_len(data: *const c_void) -> Option<usize> {
-    if data.is_null() {
-        return None;
+/// Byte length of a CUDA module/library image handed to a pointer-only API.
+/// Fatbins carry a byte count, cubins are ELF, and PTX is NUL-terminated.
+unsafe fn module_image_len(image: *const c_void) -> Result<usize, c_int> {
+    const MAX_IMAGE_BYTES: usize = 128 * 1024 * 1024;
+    if image.is_null() {
+        return Err(CUDA_ERROR_INVALID_VALUE);
     }
-    // Walk every back-to-back container, not just the first — later
-    // containers can carry the only SASS for newer arches (sm90: truncating
-    // them made loads fail 209 NO_BINARY_FOR_GPU on H100).
-    let p = data as *const u8;
-    let chain = std::env::var_os("SMOLVM_CUDA_FATBIN_CHAIN").is_some();
-    let mut total = 0usize;
-    loop {
-        let q = unsafe { p.add(total) };
-        let magic = u32::from_le_bytes(unsafe { *(q as *const [u8; 4]) });
-        if magic != 0xBA55_ED50 {
-            break;
+    let p = image as *const u8;
+    let magic = unsafe { std::slice::from_raw_parts(p, 4) };
+    if magic == [0x50, 0xED, 0x55, 0xBA] {
+        let chain = std::env::var_os("SMOLVM_CUDA_FATBIN_CHAIN").is_some();
+        let mut total = 0usize;
+        loop {
+            let q = unsafe { p.add(total) };
+            if unsafe { std::slice::from_raw_parts(q, 4) } != [0x50, 0xED, 0x55, 0xBA] {
+                break;
+            }
+            let header_size = u16::from_le_bytes(unsafe { *(q.add(6) as *const [u8; 2]) }) as usize;
+            let fat_size = u64::from_le_bytes(unsafe { *(q.add(8) as *const [u8; 8]) }) as usize;
+            let Some(next) = header_size
+                .checked_add(fat_size)
+                .and_then(|n| total.checked_add(n))
+            else {
+                return Err(CUDA_ERROR_INVALID_VALUE);
+            };
+            if header_size == 0 || fat_size == 0 || next > MAX_IMAGE_BYTES {
+                break;
+            }
+            total = next;
+            if !chain {
+                break;
+            }
         }
-        let header_size = u16::from_le_bytes(unsafe { *(q.add(6) as *const [u8; 2]) }) as usize;
-        let fat_size = u64::from_le_bytes(unsafe { *(q.add(8) as *const [u8; 8]) }) as usize;
-        if header_size == 0 || fat_size == 0 {
-            break;
+        return (total > 0).then_some(total).ok_or(CUDA_ERROR_INVALID_VALUE);
+    }
+    if magic == [0x7F, b'E', b'L', b'F'] {
+        // CUDA cubins are little-endian ELF64. Include the furthest file-backed
+        // segment/section, rather than assuming the header tables are last.
+        if unsafe { *p.add(4) } != 2 || unsafe { *p.add(5) } != 1 {
+            return Err(CUDA_ERROR_INVALID_VALUE);
         }
-        total += header_size + fat_size;
-        if !chain {
-            break;
+        let to_usize = |value: u64| usize::try_from(value).map_err(|_| CUDA_ERROR_INVALID_VALUE);
+        let phoff = to_usize(u64::from_le_bytes(unsafe {
+            *(p.add(0x20) as *const [u8; 8])
+        }))?;
+        let phsize = u16::from_le_bytes(unsafe { *(p.add(0x36) as *const [u8; 2]) }) as usize;
+        let phnum = u16::from_le_bytes(unsafe { *(p.add(0x38) as *const [u8; 2]) }) as usize;
+        let shoff = to_usize(u64::from_le_bytes(unsafe {
+            *(p.add(0x28) as *const [u8; 8])
+        }))?;
+        let shsize = u16::from_le_bytes(unsafe { *(p.add(0x3A) as *const [u8; 2]) }) as usize;
+        let shnum = u16::from_le_bytes(unsafe { *(p.add(0x3C) as *const [u8; 2]) }) as usize;
+        if (phnum > 0 && phsize < 56) || (shnum > 0 && shsize < 64) {
+            return Err(CUDA_ERROR_INVALID_VALUE);
         }
-        // Chains abutting in .rodata can run away (the walk cannot see
-        // module boundaries); cap well above any real per-module chain.
-        if total >= 128 * 1024 * 1024 {
-            break;
+        let mut end = 64usize;
+        end = end.max(
+            phsize
+                .checked_mul(phnum)
+                .and_then(|n| phoff.checked_add(n))
+                .ok_or(CUDA_ERROR_INVALID_VALUE)?,
+        );
+        end = end.max(
+            shsize
+                .checked_mul(shnum)
+                .and_then(|n| shoff.checked_add(n))
+                .ok_or(CUDA_ERROR_INVALID_VALUE)?,
+        );
+        if end > MAX_IMAGE_BYTES {
+            return Err(CUDA_ERROR_INVALID_VALUE);
+        }
+        for index in 0..phnum {
+            let entry = unsafe { p.add(phoff + index * phsize) };
+            let offset = to_usize(u64::from_le_bytes(unsafe {
+                *(entry.add(8) as *const [u8; 8])
+            }))?;
+            let size = to_usize(u64::from_le_bytes(unsafe {
+                *(entry.add(32) as *const [u8; 8])
+            }))?;
+            let segment_end = offset
+                .checked_add(size)
+                .filter(|end| *end <= MAX_IMAGE_BYTES)
+                .ok_or(CUDA_ERROR_INVALID_VALUE)?;
+            end = end.max(segment_end);
+        }
+        for index in 0..shnum {
+            let entry = unsafe { p.add(shoff + index * shsize) };
+            let section_type = u32::from_le_bytes(unsafe { *(entry.add(4) as *const [u8; 4]) });
+            if section_type == 8 {
+                continue; // SHT_NOBITS occupies no bytes in the cubin image.
+            }
+            let offset = to_usize(u64::from_le_bytes(unsafe {
+                *(entry.add(24) as *const [u8; 8])
+            }))?;
+            let size = to_usize(u64::from_le_bytes(unsafe {
+                *(entry.add(32) as *const [u8; 8])
+            }))?;
+            let section_end = offset
+                .checked_add(size)
+                .filter(|end| *end <= MAX_IMAGE_BYTES)
+                .ok_or(CUDA_ERROR_INVALID_VALUE)?;
+            end = end.max(section_end);
+        }
+        return Ok(end);
+    }
+    for len in 0..MAX_IMAGE_BYTES {
+        if unsafe { *p.add(len) } == 0 {
+            return Ok(len + 1);
         }
     }
-    if total > 0 {
-        Some(total)
-    } else {
-        None
-    }
+    Err(CUDA_ERROR_INVALID_VALUE)
 }
 
 #[no_mangle]
@@ -3031,7 +3585,7 @@ pub extern "C" fn __cudaRegisterFatBinary(fat_cubin: *mut c_void) -> *mut *mut c
     }
     let wrapper = fat_cubin as *const FatBinWrapper;
     let data = unsafe { (*wrapper).data };
-    let Some(len) = (unsafe { fatbin_len(data) }) else {
+    let Ok(len) = (unsafe { module_image_len(data) }) else {
         return handle;
     };
     let blob = unsafe { std::slice::from_raw_parts(data as *const u8, len) }.to_vec();
@@ -3097,9 +3651,70 @@ pub extern "C" fn __cudaRegisterFunction(
 }
 
 #[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn __cudaRegisterVar(
+    fat_cubin_handle: *mut *mut c_void,
+    host_var: *mut c_char,
+    device_address: *mut c_char,
+    device_name: *const c_char,
+    _ext: c_int,
+    _size: usize,
+    _constant: c_int,
+    _global: c_int,
+) {
+    if host_var.is_null() {
+        return;
+    }
+    let name_ptr = if !device_name.is_null() {
+        device_name
+    } else {
+        device_address.cast_const()
+    };
+    if name_ptr.is_null() {
+        return;
+    }
+    let name = match unsafe { CStr::from_ptr(name_ptr) }.to_str() {
+        Ok(name) => name.to_owned(),
+        Err(_) => return,
+    };
+    let _ = with_state(|s| {
+        let module = *s
+            .modules
+            .get(&(fat_cubin_handle as usize))
+            .ok_or(CUDA_ERROR_INVALID_RESOURCE_HANDLE)?;
+        // Validate the registration now. Calls re-resolve by module/name so an
+        // isolating fork can translate the inherited module to its local copy.
+        let (address, size) = s
+            .client
+            .module_get_global(module, &name)
+            .map_err(map_symbol_err)?;
+        s.dev_allocs.insert(address, size);
+        s.symbols.insert(
+            host_var as usize,
+            SymbolRec {
+                module,
+                name,
+                address,
+            },
+        );
+        Ok(())
+    });
+}
+
+#[no_mangle]
 pub extern "C" fn __cudaUnregisterFatBinary(handle: *mut *mut c_void) {
     let _ = with_state(|s| {
         if let Some(module) = s.modules.remove(&(handle as usize)) {
+            let global_addresses: Vec<u64> = s
+                .symbols
+                .values()
+                .filter(|symbol| symbol.module == module)
+                .map(|symbol| symbol.address)
+                .collect();
+            s.symbols.retain(|_, symbol| symbol.module != module);
+            for address in global_addresses {
+                s.dev_allocs.remove(&address);
+            }
             let _ = s.client.module_unload(module);
         }
         Ok(())
@@ -4417,4 +5032,124 @@ pub extern "C" fn cudnnGetBatchNormalizationTrainingExReserveSpaceSize(
     a.extend_from_slice(&(act_desc as u64).to_le_bytes());
     a.extend_from_slice(&(x_desc as u64).to_le_bytes());
     bn_size_call(7, a, size_out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn module_image_lengths_cover_ptx_fatbin_and_elf() {
+        let ptx = b".version 7.0\0";
+        assert_eq!(
+            unsafe { module_image_len(ptx.as_ptr().cast()) },
+            Ok(ptx.len())
+        );
+
+        let mut fatbin = [0u8; 32];
+        fatbin[..4].copy_from_slice(&0xBA55_ED50u32.to_le_bytes());
+        fatbin[6..8].copy_from_slice(&16u16.to_le_bytes());
+        fatbin[8..16].copy_from_slice(&16u64.to_le_bytes());
+        assert_eq!(unsafe { module_image_len(fatbin.as_ptr().cast()) }, Ok(32));
+
+        let mut elf = [0u8; 256];
+        elf[..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2; // ELFCLASS64
+        elf[5] = 1; // ELFDATA2LSB
+        elf[0x20..0x28].copy_from_slice(&64u64.to_le_bytes());
+        elf[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
+        elf[0x38..0x3a].copy_from_slice(&2u16.to_le_bytes());
+        elf[0x28..0x30].copy_from_slice(&128u64.to_le_bytes());
+        elf[0x3a..0x3c].copy_from_slice(&64u16.to_le_bytes());
+        elf[0x3c..0x3e].copy_from_slice(&2u16.to_le_bytes());
+        assert_eq!(unsafe { module_image_len(elf.as_ptr().cast()) }, Ok(256));
+
+        let mut oversized_elf = [0u8; 64];
+        oversized_elf[..4].copy_from_slice(b"\x7fELF");
+        oversized_elf[4] = 2;
+        oversized_elf[5] = 1;
+        oversized_elf[0x20..0x28].copy_from_slice(&(128u64 * 1024 * 1024).to_le_bytes());
+        oversized_elf[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
+        oversized_elf[0x38..0x3a].copy_from_slice(&1u16.to_le_bytes());
+        assert_eq!(
+            unsafe { module_image_len(oversized_elf.as_ptr().cast()) },
+            Err(CUDA_ERROR_INVALID_VALUE)
+        );
+    }
+
+    #[test]
+    fn unsupported_graph_builders_clear_outputs() {
+        let mut node = std::ptr::dangling_mut::<c_void>();
+        assert_eq!(
+            cudaGraphAddEmptyNode(&mut node, std::ptr::null_mut(), std::ptr::null(), 0),
+            CUDA_ERROR_NOT_SUPPORTED
+        );
+        assert!(node.is_null());
+
+        let mut node_type = 123;
+        assert_eq!(
+            cudaGraphNodeGetType(std::ptr::null_mut(), &mut node_type),
+            CUDA_ERROR_NOT_SUPPORTED
+        );
+        assert_eq!(node_type, 0);
+
+        let mut generic_node = std::ptr::dangling_mut::<c_void>();
+        assert_eq!(
+            cudaGraphAddNode(
+                &mut generic_node,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+            ),
+            CUDA_ERROR_NOT_SUPPORTED
+        );
+        assert!(generic_node.is_null());
+
+        let mut clusters = 99;
+        assert_eq!(
+            cudaOccupancyMaxActiveClusters(
+                &mut clusters,
+                std::ptr::dangling(),
+                std::ptr::dangling(),
+            ),
+            CUDA_ERROR_NOT_SUPPORTED
+        );
+        assert_eq!(clusters, 0);
+    }
+
+    #[test]
+    fn library_options_fail_without_connecting() {
+        let mut library = std::ptr::dangling_mut::<c_void>();
+        let code = b".version 7.0\0";
+        assert_eq!(
+            cudaLibraryLoadData(
+                &mut library,
+                code.as_ptr().cast(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                1,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                0,
+            ),
+            CUDA_ERROR_NOT_SUPPORTED
+        );
+        assert!(library.is_null());
+    }
+
+    #[test]
+    fn pci_bus_lookup_matches_the_advertised_device() {
+        let mut device = -1;
+        assert_eq!(
+            cudaDeviceGetByPCIBusId(&mut device, c"0000:01:00.0".as_ptr()),
+            CUDA_SUCCESS
+        );
+        assert_eq!(device, 0);
+        assert_eq!(
+            cudaDeviceGetByPCIBusId(&mut device, c"0000:02:00.0".as_ptr()),
+            CUDA_ERROR_INVALID_VALUE
+        );
+    }
 }

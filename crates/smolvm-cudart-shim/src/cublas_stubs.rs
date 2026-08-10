@@ -482,21 +482,6 @@ pub extern "C" fn cudaMemcpyPeerAsync() -> c_int {
 pub extern "C" fn cudaRegisterVar() -> c_int {
     rt_stub("cudaRegisterVar")
 }
-/// `__cudaRegisterVar` — registers a __device__/__constant__ global. No-op:
-/// forwarded workloads that don't use cudaMemcpyToSymbol never need the mapping.
-#[no_mangle]
-pub extern "C" fn __cudaRegisterVar(
-    _fat: *mut *mut std::os::raw::c_void,
-    _host_var: *mut std::os::raw::c_char,
-    _dev_addr: *mut std::os::raw::c_char,
-    _dev_name: *const std::os::raw::c_char,
-    _ext: c_int,
-    _size: usize,
-    _constant: c_int,
-    _global: c_int,
-) {
-}
-
 // ---- remaining cudart runtime functions PyTorch links -----------------------
 use std::os::raw::c_void;
 #[no_mangle]
@@ -517,10 +502,6 @@ pub extern "C" fn cudaStreamGetPriority(_s: *mut c_void, priority: *mut c_int) -
         unsafe { *priority = 0 }
     }
     0
-}
-#[no_mangle]
-pub extern "C" fn cudaMemcpy2DAsync() -> c_int {
-    rt_stub("cudaMemcpy2DAsync")
 }
 #[no_mangle]
 pub extern "C" fn cublasCaxpy_v2() -> c_int {

@@ -124,6 +124,9 @@ pub trait Backend: Send {
     fn primary_ctx_release(&mut self, device: i32) -> CuResult<()>;
     fn module_load_data(&mut self, image: &[u8]) -> CuResult<u64>;
     fn module_get_function(&mut self, module: u64, name: &str) -> CuResult<u64>;
+    fn module_get_global(&mut self, _module: u64, _name: &str) -> CuResult<(u64, u64)> {
+        Err(CUDA_ERROR_NOT_SUPPORTED)
+    }
     fn module_unload(&mut self, module: u64) -> CuResult<()>;
     /// Per-parameter byte sizes of the kernel's arguments, in declaration order.
     fn func_get_param_info(&mut self, function: u64) -> CuResult<Vec<u32>>;
@@ -4224,6 +4227,14 @@ fn dispatch(sess: &mut Session, b: &mut dyn Backend, req: Request) -> (i32, Resp
                 layout.handoff_revision = layout.handoff_revision.wrapping_add(1);
             }
             Ok(Response::Handle(raw_fn))
+        }
+        Request::ModuleGetGlobal { module, name } => {
+            let raw_mod = raw_module(sess, b, module);
+            let (dptr, bytes) = b.module_get_global(raw_mod, &name)?;
+            let mut out = Vec::with_capacity(16);
+            out.extend_from_slice(&dptr.to_le_bytes());
+            out.extend_from_slice(&bytes.to_le_bytes());
+            Ok(Response::Data(out))
         }
         Request::ModuleUnload { module } => {
             let raw_mod = raw_module(sess, b, module);

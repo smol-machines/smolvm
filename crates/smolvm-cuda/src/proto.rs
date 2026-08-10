@@ -59,6 +59,7 @@ pub enum Op {
     FuncGetParamInfo = 0x23,
     FuncSetAttribute = 0x24,
     FuncGetAttribute = 0x25,
+    ModuleGetGlobal = 0x26,
     MemAlloc = 0x30,
     MemFree = 0x31,
     MemcpyHtoD = 0x32,
@@ -169,6 +170,7 @@ impl Op {
             0x23 => Op::FuncGetParamInfo,
             0x24 => Op::FuncSetAttribute,
             0x25 => Op::FuncGetAttribute,
+            0x26 => Op::ModuleGetGlobal,
             0x30 => Op::MemAlloc,
             0x31 => Op::MemFree,
             0x32 => Op::MemcpyHtoD,
@@ -278,6 +280,10 @@ pub enum Request {
     },
     ModuleUnload {
         module: u64,
+    },
+    ModuleGetGlobal {
+        module: u64,
+        name: String,
     },
     /// Per-parameter byte sizes of `function`'s kernel arguments, in declaration
     /// order — what a generic client needs to serialize `kernelParams` blobs.
@@ -817,6 +823,11 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
             w_u8(&mut b, Op::ModuleUnload as u8);
             w_u64(&mut b, *module);
         }
+        Request::ModuleGetGlobal { module, name } => {
+            w_u8(&mut b, Op::ModuleGetGlobal as u8);
+            w_u64(&mut b, *module);
+            w_str(&mut b, name);
+        }
         Request::FuncGetParamInfo { function } => {
             w_u8(&mut b, Op::FuncGetParamInfo as u8);
             w_u64(&mut b, *function);
@@ -1288,6 +1299,10 @@ pub fn decode_request(payload: &[u8]) -> io::Result<Request> {
             name: c.string()?,
         },
         Op::ModuleUnload => Request::ModuleUnload { module: c.u64()? },
+        Op::ModuleGetGlobal => Request::ModuleGetGlobal {
+            module: c.u64()?,
+            name: c.string()?,
+        },
         Op::FuncGetParamInfo => Request::FuncGetParamInfo { function: c.u64()? },
         Op::FuncSetAttribute => Request::FuncSetAttribute {
             function: c.u64()?,
@@ -1608,9 +1623,11 @@ pub fn decode_response(op: Op, payload: &[u8]) -> io::Result<(i32, Response)> {
         Op::GraphGetNodes => Response::Bytes(c.u64()?),
         Op::StreamCaptureInfo => Response::Pair(c.u64()?, c.u64()?),
         Op::MemAlloc => Response::Dptr(c.u64()?),
-        Op::MemcpyDtoH | Op::DeviceGetUuid | Op::FuncGetParamInfo | Op::PublishTensorBundle => {
-            Response::Data(c.bytes()?)
-        }
+        Op::MemcpyDtoH
+        | Op::DeviceGetUuid
+        | Op::FuncGetParamInfo
+        | Op::ModuleGetGlobal
+        | Op::PublishTensorBundle => Response::Data(c.bytes()?),
         Op::MemGetInfo => Response::Pair(c.u64()?, c.u64()?),
         // nvcomp calls carry their own nvcompStatus in the body (transport
         // status stays 0): TempSize -> (status, temp_bytes); Decompress -> status.
@@ -1786,6 +1803,10 @@ mod tests {
         roundtrip(Request::PrimaryCtxRetain { device: 0 });
         roundtrip(Request::PrimaryCtxRelease { device: 0 });
         roundtrip(Request::ModuleUnload { module: 7 });
+        roundtrip(Request::ModuleGetGlobal {
+            module: 7,
+            name: "device_counter".into(),
+        });
         roundtrip(Request::FuncGetParamInfo { function: 9 });
         roundtrip(Request::FuncSetAttribute {
             function: 9,
@@ -1839,6 +1860,7 @@ mod tests {
                 Op::FuncGetParamInfo,
                 Response::Data(vec![8, 0, 0, 0, 4, 0, 0, 0]),
             ),
+            (Op::ModuleGetGlobal, Response::Data(vec![0u8; 16])),
             (Op::MemGetInfo, Response::Pair(6 << 30, 8 << 30)),
             (Op::StreamCreate, Response::Handle(21)),
             (Op::EventCreate, Response::Handle(22)),

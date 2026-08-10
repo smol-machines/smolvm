@@ -44,6 +44,7 @@ fn sync_key(req: &Request, op: Op) -> String {
     match req {
         Request::LibCall { lib, func, .. } => format!("LibCall(lib={lib},func={func})"),
         Request::ModuleGetFunction { name, .. } => format!("ModuleGetFunction({name})"),
+        Request::ModuleGetGlobal { name, .. } => format!("ModuleGetGlobal({name})"),
         Request::FuncGetParamInfo { function } => format!("FuncGetParamInfo(fid={function})"),
         Request::ModuleLoadData { image } => format!("ModuleLoadData(len={})", image.len()),
         _ => format!("{op:?}"),
@@ -886,6 +887,22 @@ impl<S: Read + Write> Client<S> {
         )? {
             Response::Handle(h) => Ok(h),
             _ => Err(CudaRpcError::Protocol("expected Handle")),
+        }
+    }
+
+    pub fn module_get_global(&mut self, module: u64, name: &str) -> Result<(u64, u64)> {
+        match self.call(
+            &Request::ModuleGetGlobal {
+                module,
+                name: name.to_string(),
+            },
+            Op::ModuleGetGlobal,
+        )? {
+            Response::Data(data) if data.len() == 16 => Ok((
+                u64::from_le_bytes(data[..8].try_into().unwrap()),
+                u64::from_le_bytes(data[8..].try_into().unwrap()),
+            )),
+            _ => Err(CudaRpcError::Protocol("expected global pointer and size")),
         }
     }
 

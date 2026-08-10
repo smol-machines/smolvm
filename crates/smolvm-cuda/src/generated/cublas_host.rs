@@ -35,6 +35,25 @@ pub struct GenLib { _lib: Library,
     f_cublasDsymm_v2: unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, c_int, *const f64, *const f64, c_int, *const f64, c_int, *const f64, *mut f64, c_int) -> c_int,
     f_cublasStrsm_v2: unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, c_int, c_int, c_int, *const f32, *const f32, c_int, *mut f32, c_int) -> c_int,
     f_cublasDtrsm_v2: unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, c_int, c_int, c_int, *const f64, *const f64, c_int, *mut f64, c_int) -> c_int,
+    f_cublasSetSmCountTarget: unsafe extern "C" fn(*mut c_void, c_int) -> c_int,
+    f_cublasGetStream_v2: unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> c_int,
+    f_cublasGetVersion_v2: unsafe extern "C" fn(*mut c_void, *mut c_int) -> c_int,
+    f_cublasSdgmm: unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, *const f32, c_int, *const f32, c_int, *mut f32, c_int) -> c_int,
+    f_cublasDdgmm: unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, *const f64, c_int, *const f64, c_int, *mut f64, c_int) -> c_int,
+    f_cublasCdgmm: unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, *const c_void, c_int, *const c_void, c_int, *mut c_void, c_int) -> c_int,
+    f_cublasZdgmm: unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, *const c_void, c_int, *const c_void, c_int, *mut c_void, c_int) -> c_int,
+    f_cublasSsbmv_v2: unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, *const f32, *const f32, c_int, *const f32, c_int, *const f32, *mut f32, c_int) -> c_int,
+    f_cublasDsbmv_v2: unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, *const f64, *const f64, c_int, *const f64, c_int, *const f64, *mut f64, c_int) -> c_int,
+    f_cublasStpttr: unsafe extern "C" fn(*mut c_void, c_int, c_int, *const f32, *mut f32, c_int) -> c_int,
+    f_cublasDtpttr: unsafe extern "C" fn(*mut c_void, c_int, c_int, *const f64, *mut f64, c_int) -> c_int,
+    f_cublasStrttp: unsafe extern "C" fn(*mut c_void, c_int, c_int, *const f32, c_int, *mut f32) -> c_int,
+    f_cublasDtrttp: unsafe extern "C" fn(*mut c_void, c_int, c_int, *const f64, c_int, *mut f64) -> c_int,
+    f_cublasSgetriBatched: unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int, *const c_int, *mut c_void, c_int, *mut c_int, c_int) -> c_int,
+    f_cublasDgetriBatched: unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int, *const c_int, *mut c_void, c_int, *mut c_int, c_int) -> c_int,
+    f_cublasCgetriBatched: unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int, *const c_int, *mut c_void, c_int, *mut c_int, c_int) -> c_int,
+    f_cublasZgetriBatched: unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int, *const c_int, *mut c_void, c_int, *mut c_int, c_int) -> c_int,
+    f_cublasCgeam: unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, c_int, *const c_void, *const c_void, c_int, *const c_void, *const c_void, c_int, *mut c_void, c_int) -> c_int,
+    f_cublasZgeam: unsafe extern "C" fn(*mut c_void, c_int, c_int, c_int, c_int, *const c_void, *const c_void, c_int, *const c_void, *const c_void, c_int, *mut c_void, c_int) -> c_int,
 }
 impl GenLib {
     pub fn load() -> Result<GenLib, String> {
@@ -76,6 +95,25 @@ impl GenLib {
                 f_cublasDsymm_v2: sym(&lib, b"cublasDsymm_v2\0")?,
                 f_cublasStrsm_v2: sym(&lib, b"cublasStrsm_v2\0")?,
                 f_cublasDtrsm_v2: sym(&lib, b"cublasDtrsm_v2\0")?,
+                f_cublasSetSmCountTarget: sym(&lib, b"cublasSetSmCountTarget\0")?,
+                f_cublasGetStream_v2: sym(&lib, b"cublasGetStream_v2\0")?,
+                f_cublasGetVersion_v2: sym(&lib, b"cublasGetVersion_v2\0")?,
+                f_cublasSdgmm: sym(&lib, b"cublasSdgmm\0")?,
+                f_cublasDdgmm: sym(&lib, b"cublasDdgmm\0")?,
+                f_cublasCdgmm: sym(&lib, b"cublasCdgmm\0")?,
+                f_cublasZdgmm: sym(&lib, b"cublasZdgmm\0")?,
+                f_cublasSsbmv_v2: sym(&lib, b"cublasSsbmv_v2\0")?,
+                f_cublasDsbmv_v2: sym(&lib, b"cublasDsbmv_v2\0")?,
+                f_cublasStpttr: sym(&lib, b"cublasStpttr\0")?,
+                f_cublasDtpttr: sym(&lib, b"cublasDtpttr\0")?,
+                f_cublasStrttp: sym(&lib, b"cublasStrttp\0")?,
+                f_cublasDtrttp: sym(&lib, b"cublasDtrttp\0")?,
+                f_cublasSgetriBatched: sym(&lib, b"cublasSgetriBatched\0")?,
+                f_cublasDgetriBatched: sym(&lib, b"cublasDgetriBatched\0")?,
+                f_cublasCgetriBatched: sym(&lib, b"cublasCgetriBatched\0")?,
+                f_cublasZgetriBatched: sym(&lib, b"cublasZgetriBatched\0")?,
+                f_cublasCgeam: sym(&lib, b"cublasCgeam\0")?,
+                f_cublasZgeam: sym(&lib, b"cublasZgeam\0")?,
                 _lib: lib,
             })
         }
@@ -599,6 +637,259 @@ impl GenLib {
                 let ldb = __c.i32();
                 let mut out = Vec::new();
                 let st = unsafe { (self.f_cublasDtrsm_v2)(handle, side as c_int, uplo as c_int, trans as c_int, diag as c_int, m as c_int, n as c_int, &alpha_v, A, lda as c_int, B, ldb as c_int) };
+                (st, out)
+            }
+            35 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let sm_count_target = __c.i32();
+                let mut out = Vec::new();
+                let st = unsafe { (self.f_cublasSetSmCountTarget)(handle, sm_count_target as c_int) };
+                (st, out)
+            }
+            36 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let mut stream_v: *mut c_void = std::ptr::null_mut();
+                let mut out = Vec::new();
+                let st = unsafe { (self.f_cublasGetStream_v2)(handle, &mut stream_v) };
+                out.extend_from_slice(&super::stream_unresolve(__streams, stream_v as u64).to_le_bytes());
+                (st, out)
+            }
+            37 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let mut version_v: c_int = 0 as c_int;
+                let mut out = Vec::new();
+                let st = unsafe { (self.f_cublasGetVersion_v2)(handle, &mut version_v) };
+                out.extend_from_slice(&(version_v as i32).to_le_bytes());
+                (st, out)
+            }
+            38 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let mode = __c.i32();
+                let m = __c.i32();
+                let n = __c.i32();
+                let A = super::dptr_resolve(__c.u64()) as *const f32;
+                let lda = __c.i32();
+                let x = super::dptr_resolve(__c.u64()) as *const f32;
+                let incx = __c.i32();
+                let C = super::dptr_resolve(__c.u64()) as *mut f32;
+                let ldc = __c.i32();
+                let mut out = Vec::new();
+                let st = unsafe { (self.f_cublasSdgmm)(handle, mode as c_int, m as c_int, n as c_int, A, lda as c_int, x, incx as c_int, C, ldc as c_int) };
+                (st, out)
+            }
+            39 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let mode = __c.i32();
+                let m = __c.i32();
+                let n = __c.i32();
+                let A = super::dptr_resolve(__c.u64()) as *const f64;
+                let lda = __c.i32();
+                let x = super::dptr_resolve(__c.u64()) as *const f64;
+                let incx = __c.i32();
+                let C = super::dptr_resolve(__c.u64()) as *mut f64;
+                let ldc = __c.i32();
+                let mut out = Vec::new();
+                let st = unsafe { (self.f_cublasDdgmm)(handle, mode as c_int, m as c_int, n as c_int, A, lda as c_int, x, incx as c_int, C, ldc as c_int) };
+                (st, out)
+            }
+            40 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let mode = __c.i32();
+                let m = __c.i32();
+                let n = __c.i32();
+                let A = super::dptr_resolve(__c.u64()) as *const c_void;
+                let lda = __c.i32();
+                let x = super::dptr_resolve(__c.u64()) as *const c_void;
+                let incx = __c.i32();
+                let C = super::dptr_resolve(__c.u64()) as *mut c_void;
+                let ldc = __c.i32();
+                let mut out = Vec::new();
+                let st = unsafe { (self.f_cublasCdgmm)(handle, mode as c_int, m as c_int, n as c_int, A, lda as c_int, x, incx as c_int, C, ldc as c_int) };
+                (st, out)
+            }
+            41 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let mode = __c.i32();
+                let m = __c.i32();
+                let n = __c.i32();
+                let A = super::dptr_resolve(__c.u64()) as *const c_void;
+                let lda = __c.i32();
+                let x = super::dptr_resolve(__c.u64()) as *const c_void;
+                let incx = __c.i32();
+                let C = super::dptr_resolve(__c.u64()) as *mut c_void;
+                let ldc = __c.i32();
+                let mut out = Vec::new();
+                let st = unsafe { (self.f_cublasZdgmm)(handle, mode as c_int, m as c_int, n as c_int, A, lda as c_int, x, incx as c_int, C, ldc as c_int) };
+                (st, out)
+            }
+            42 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let uplo = __c.i32();
+                let n = __c.i32();
+                let k = __c.i32();
+                let alpha_v = __c.f32();
+                let A = super::dptr_resolve(__c.u64()) as *const f32;
+                let lda = __c.i32();
+                let x = super::dptr_resolve(__c.u64()) as *const f32;
+                let incx = __c.i32();
+                let beta_v = __c.f32();
+                let y = super::dptr_resolve(__c.u64()) as *mut f32;
+                let incy = __c.i32();
+                let mut out = Vec::new();
+                let st = unsafe { (self.f_cublasSsbmv_v2)(handle, uplo as c_int, n as c_int, k as c_int, &alpha_v, A, lda as c_int, x, incx as c_int, &beta_v, y, incy as c_int) };
+                (st, out)
+            }
+            43 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let uplo = __c.i32();
+                let n = __c.i32();
+                let k = __c.i32();
+                let alpha_v = __c.f64();
+                let A = super::dptr_resolve(__c.u64()) as *const f64;
+                let lda = __c.i32();
+                let x = super::dptr_resolve(__c.u64()) as *const f64;
+                let incx = __c.i32();
+                let beta_v = __c.f64();
+                let y = super::dptr_resolve(__c.u64()) as *mut f64;
+                let incy = __c.i32();
+                let mut out = Vec::new();
+                let st = unsafe { (self.f_cublasDsbmv_v2)(handle, uplo as c_int, n as c_int, k as c_int, &alpha_v, A, lda as c_int, x, incx as c_int, &beta_v, y, incy as c_int) };
+                (st, out)
+            }
+            44 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let uplo = __c.i32();
+                let n = __c.i32();
+                let src = super::dptr_resolve(__c.u64()) as *const f32;
+                let dst = super::dptr_resolve(__c.u64()) as *mut f32;
+                let lda = __c.i32();
+                let mut out = Vec::new();
+                let st = unsafe { (self.f_cublasStpttr)(handle, uplo as c_int, n as c_int, src, dst, lda as c_int) };
+                (st, out)
+            }
+            45 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let uplo = __c.i32();
+                let n = __c.i32();
+                let src = super::dptr_resolve(__c.u64()) as *const f64;
+                let dst = super::dptr_resolve(__c.u64()) as *mut f64;
+                let lda = __c.i32();
+                let mut out = Vec::new();
+                let st = unsafe { (self.f_cublasDtpttr)(handle, uplo as c_int, n as c_int, src, dst, lda as c_int) };
+                (st, out)
+            }
+            46 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let uplo = __c.i32();
+                let n = __c.i32();
+                let src = super::dptr_resolve(__c.u64()) as *const f32;
+                let lda = __c.i32();
+                let dst = super::dptr_resolve(__c.u64()) as *mut f32;
+                let mut out = Vec::new();
+                let st = unsafe { (self.f_cublasStrttp)(handle, uplo as c_int, n as c_int, src, lda as c_int, dst) };
+                (st, out)
+            }
+            47 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let uplo = __c.i32();
+                let n = __c.i32();
+                let src = super::dptr_resolve(__c.u64()) as *const f64;
+                let lda = __c.i32();
+                let dst = super::dptr_resolve(__c.u64()) as *mut f64;
+                let mut out = Vec::new();
+                let st = unsafe { (self.f_cublasDtrttp)(handle, uplo as c_int, n as c_int, src, lda as c_int, dst) };
+                (st, out)
+            }
+            48 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let n = __c.i32();
+                let Aarray = super::dptr_resolve(__c.u64()) as *const c_void;
+                let lda = __c.i32();
+                let pivots = super::dptr_resolve(__c.u64()) as *const c_int;
+                let Carray = super::dptr_resolve(__c.u64()) as *mut c_void;
+                let ldc = __c.i32();
+                let info = super::dptr_resolve(__c.u64()) as *mut c_int;
+                let batch_size = __c.i32();
+                let mut out = Vec::new();
+                let st = unsafe { (self.f_cublasSgetriBatched)(handle, n as c_int, Aarray, lda as c_int, pivots, Carray, ldc as c_int, info, batch_size as c_int) };
+                (st, out)
+            }
+            49 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let n = __c.i32();
+                let Aarray = super::dptr_resolve(__c.u64()) as *const c_void;
+                let lda = __c.i32();
+                let pivots = super::dptr_resolve(__c.u64()) as *const c_int;
+                let Carray = super::dptr_resolve(__c.u64()) as *mut c_void;
+                let ldc = __c.i32();
+                let info = super::dptr_resolve(__c.u64()) as *mut c_int;
+                let batch_size = __c.i32();
+                let mut out = Vec::new();
+                let st = unsafe { (self.f_cublasDgetriBatched)(handle, n as c_int, Aarray, lda as c_int, pivots, Carray, ldc as c_int, info, batch_size as c_int) };
+                (st, out)
+            }
+            50 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let n = __c.i32();
+                let Aarray = super::dptr_resolve(__c.u64()) as *const c_void;
+                let lda = __c.i32();
+                let pivots = super::dptr_resolve(__c.u64()) as *const c_int;
+                let Carray = super::dptr_resolve(__c.u64()) as *mut c_void;
+                let ldc = __c.i32();
+                let info = super::dptr_resolve(__c.u64()) as *mut c_int;
+                let batch_size = __c.i32();
+                let mut out = Vec::new();
+                let st = unsafe { (self.f_cublasCgetriBatched)(handle, n as c_int, Aarray, lda as c_int, pivots, Carray, ldc as c_int, info, batch_size as c_int) };
+                (st, out)
+            }
+            51 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let n = __c.i32();
+                let Aarray = super::dptr_resolve(__c.u64()) as *const c_void;
+                let lda = __c.i32();
+                let pivots = super::dptr_resolve(__c.u64()) as *const c_int;
+                let Carray = super::dptr_resolve(__c.u64()) as *mut c_void;
+                let ldc = __c.i32();
+                let info = super::dptr_resolve(__c.u64()) as *mut c_int;
+                let batch_size = __c.i32();
+                let mut out = Vec::new();
+                let st = unsafe { (self.f_cublasZgetriBatched)(handle, n as c_int, Aarray, lda as c_int, pivots, Carray, ldc as c_int, info, batch_size as c_int) };
+                (st, out)
+            }
+            52 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let transa = __c.i32();
+                let transb = __c.i32();
+                let m = __c.i32();
+                let n = __c.i32();
+                let alpha_v = [__c.u64()];
+                let A = super::dptr_resolve(__c.u64()) as *const c_void;
+                let lda = __c.i32();
+                let beta_v = [__c.u64()];
+                let B = super::dptr_resolve(__c.u64()) as *const c_void;
+                let ldb = __c.i32();
+                let C = super::dptr_resolve(__c.u64()) as *mut c_void;
+                let ldc = __c.i32();
+                let mut out = Vec::new();
+                let st = unsafe { (self.f_cublasCgeam)(handle, transa as c_int, transb as c_int, m as c_int, n as c_int, alpha_v.as_ptr().cast(), A, lda as c_int, beta_v.as_ptr().cast(), B, ldb as c_int, C, ldc as c_int) };
+                (st, out)
+            }
+            53 => {
+                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let transa = __c.i32();
+                let transb = __c.i32();
+                let m = __c.i32();
+                let n = __c.i32();
+                let alpha_v = [__c.u64(), __c.u64()];
+                let A = super::dptr_resolve(__c.u64()) as *const c_void;
+                let lda = __c.i32();
+                let beta_v = [__c.u64(), __c.u64()];
+                let B = super::dptr_resolve(__c.u64()) as *const c_void;
+                let ldb = __c.i32();
+                let C = super::dptr_resolve(__c.u64()) as *mut c_void;
+                let ldc = __c.i32();
+                let mut out = Vec::new();
+                let st = unsafe { (self.f_cublasZgeam)(handle, transa as c_int, transb as c_int, m as c_int, n as c_int, alpha_v.as_ptr().cast(), A, lda as c_int, beta_v.as_ptr().cast(), B, ldb as c_int, C, ldc as c_int) };
                 (st, out)
             }
             _ => (super::super::CUDA_ERROR_NOT_FOUND, Vec::new()),

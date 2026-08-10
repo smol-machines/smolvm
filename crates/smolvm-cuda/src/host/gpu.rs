@@ -42,6 +42,8 @@ pub struct GpuBackend {
     module_load_data: unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> CuResultCode,
     module_get_function:
         unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const c_char) -> CuResultCode,
+    module_get_global:
+        unsafe extern "C" fn(*mut u64, *mut usize, *mut c_void, *const c_char) -> CuResultCode,
     module_unload: unsafe extern "C" fn(*mut c_void) -> CuResultCode,
     /// `cuFuncGetParamInfo` — CUDA 12.4+. `None` on older drivers, where
     /// [`Backend::func_get_param_info`] reports `CUDA_ERROR_NOT_SUPPORTED`.
@@ -411,6 +413,7 @@ impl GpuBackend {
                 )?,
                 module_load_data: sym(&lib, b"cuModuleLoadData\0")?,
                 module_get_function: sym(&lib, b"cuModuleGetFunction\0")?,
+                module_get_global: sym2(&lib, b"cuModuleGetGlobal_v2\0", b"cuModuleGetGlobal\0")?,
                 module_unload: sym(&lib, b"cuModuleUnload\0")?,
                 func_get_param_info: sym(&lib, b"cuFuncGetParamInfo\0").ok(),
                 func_set_attribute: sym(&lib, b"cuFuncSetAttribute\0")?,
@@ -668,6 +671,20 @@ impl Backend for GpuBackend {
             ))?
         };
         Ok(func as u64)
+    }
+    fn module_get_global(&mut self, module: u64, name: &str) -> CuResult<(u64, u64)> {
+        let cname = CString::new(name).map_err(|_| super::CUDA_ERROR_NOT_FOUND)?;
+        let mut dptr = 0u64;
+        let mut bytes = 0usize;
+        unsafe {
+            chk((self.module_get_global)(
+                &mut dptr,
+                &mut bytes,
+                module as *mut c_void,
+                cname.as_ptr(),
+            ))?
+        };
+        Ok((dptr, bytes as u64))
     }
     fn module_unload(&mut self, module: u64) -> CuResult<()> {
         unsafe { chk((self.module_unload)(module as *mut c_void)) }
@@ -2310,6 +2327,18 @@ fn stream_resolve(map: &std::collections::HashMap<u64, u64>, s: u64) -> u64 {
         // non-clone sessions, so the common case is one thread-local miss.
         super::xlat_stream(map.get(&s).copied().unwrap_or(s))
     }
+}
+
+/// Convert a real library stream back to the session-scoped handle that the
+/// guest CUDA runtime minted for it.
+fn stream_unresolve(map: &std::collections::HashMap<u64, u64>, raw: u64) -> u64 {
+    if raw == 0 {
+        return 0;
+    }
+    map.keys()
+        .find(|&&guest| stream_resolve(map, guest) == raw)
+        .copied()
+        .unwrap_or(raw)
 }
 
 // Fork-isolation pointer translation for forwarded library calls (cuBLAS/cuDNN).

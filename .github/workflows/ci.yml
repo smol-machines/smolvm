@@ -405,6 +405,9 @@ jobs:
       - name: Guest CUDA shims build standalone
         run: cargo build --release -p smolvm-cudart-shim -p smolvm-cuda-shim -p smolvm-nvml-shim -p smolvm-cuda-guest
 
+      - name: Guest CUDA shim application ABI
+        run: scripts/check-cuda-shim-exports.sh
+
   # ==========================================================================
   # Downstream compatibility: the smol CLI builds this workspace via path deps
   # (`smolvm = { path = ".." }`) and releases in version lockstep, so an engine
