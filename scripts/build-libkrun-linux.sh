@@ -50,7 +50,7 @@ if [[ "${SKIP_DEPS:-0}" != "1" ]] && command -v apt-get >/dev/null 2>&1; then
     # kernel build (libkrunfw)        + libkrun (rust/bindgen) + git-lfs/runtime
     sudo apt-get install -y -q \
         build-essential flex bison libelf-dev libssl-dev bc cpio rsync kmod \
-        python3 python3-pyelftools pkg-config clang llvm libclang-dev curl git git-lfs \
+        python3 python3-pyelftools pkg-config clang llvm libclang-dev curl git git-lfs patchelf \
         $([[ "$GPU" == "1" ]] && echo "libvirglrenderer-dev libepoxy-dev libdrm-dev libgbm-dev" || true)
     if ! command -v cargo >/dev/null 2>&1; then
         echo "--- installing rust toolchain ---"
@@ -162,6 +162,23 @@ KRUN_FNAME="$(basename "$KRUN_SO")"; KRUN_VER="${KRUN_FNAME#libkrun.so.}"; KRUN_
 cp -f "$KRUN_SO" "$LIBDIR/$KRUN_FNAME"
 cp -f "$KRUN_SO" "$LIBDIR/libkrun.so"
 ln -sf "libkrun.so" "$LIBDIR/libkrun.so.${KRUN_MAJOR}"
+
+# The GPU feature links libkrun against virglrenderer, but CUDA-only and CPU-only
+# hosts must still be able to load the same bundled VMM without installing the
+# Vulkan stack. smolvm loads libkrun lazily and preloads virglrenderer only when
+# it is available, so remove the eager ELF dependency from every real copy in
+# the committed bundle. Fail the build instead of emitting an artifact that only
+# boots on the builder image.
+if [[ "$GPU" == "1" ]]; then
+    command -v patchelf >/dev/null 2>&1 \
+        || { echo "ERROR: GPU=1 requires patchelf to keep virglrenderer optional" >&2; exit 1; }
+    for lk in "$LIBDIR"/libkrun.so*; do
+        [[ -f "$lk" && ! -L "$lk" ]] || continue
+        if patchelf --print-needed "$lk" | grep -qx 'libvirglrenderer.so.1'; then
+            patchelf --remove-needed libvirglrenderer.so.1 "$lk"
+        fi
+    done
+fi
 
 # Record which submodule commits these libs came from, so CI can detect a stale
 # bundle (scripts/check-libkrun-provenance.sh). When libkrunfw was reused rather
