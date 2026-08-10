@@ -652,12 +652,12 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         } else if std::env::var("SMOLVM_CUDA_FILE_RING").as_deref() != Ok("0") {
             let vm_runtime_dir = vsock_socket.parent().unwrap_or_else(|| Path::new("."));
             let fallback_ring_dir = vm_runtime_dir.join("cuda-ring");
-            let mut ring_dir: Option<PathBuf> = None;
             #[cfg(target_os = "linux")]
-            match create_cuda_ring_dir(vm_runtime_dir) {
+            let ring_dir = match create_cuda_ring_dir(vm_runtime_dir) {
                 Ok(guard) => {
-                    ring_dir = Some(guard.path.clone());
+                    let path = guard.path.clone();
                     _cuda_ring_guard = Some(guard);
+                    Some(path)
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -665,19 +665,20 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                         "CUDA tmpfs ring unavailable; mapped host allocations will use the contiguous-memory fallback"
                     );
                     match create_owned_directory(&fallback_ring_dir) {
-                        Ok(()) => ring_dir = Some(fallback_ring_dir.clone()),
-                        Err(error) => tracing::warn!(
-                            %error,
-                            path = %fallback_ring_dir.display(),
-                            "CUDA fallback ring directory unavailable; using socket transport"
-                        ),
+                        Ok(()) => Some(fallback_ring_dir.clone()),
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                path = %fallback_ring_dir.display(),
+                                "CUDA fallback ring directory unavailable; using socket transport"
+                            );
+                            None
+                        }
                     }
                 }
-            }
+            };
             #[cfg(not(target_os = "linux"))]
-            {
-                ring_dir = Some(fallback_ring_dir);
-            }
+            let ring_dir = Some(fallback_ring_dir);
             if let Some(dir) = ring_dir {
                 #[cfg(target_os = "linux")]
                 let directory_ready = true;
