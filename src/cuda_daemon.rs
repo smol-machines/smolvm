@@ -26,6 +26,8 @@ use std::time::{Duration, Instant};
 /// Stable host-device enumeration shared with device-scoped admission.
 const CUDA_DEVICE_ORDER: &str = "PCI_BUS_ID";
 const CUDA_WORKER_STATUS_SOCKET_ENV: &str = "SMOLVM_CUDA_WORKER_STATUS_SOCKET";
+const CUDA_CLONE_RESERVATION_REEXEC_ENV: &str = "SMOLVM_CUDA_CLONE_RESERVATION_REEXEC";
+const MAX_CUDA_CLONE_RESERVATION_REEXECS: u8 = 2;
 const CLONE_WORKER_READINESS_CAPABILITY_VERSION: u32 = 1;
 const CLONE_WORKER_CAPABILITY_FILE: &str = "daemon.capability";
 
@@ -2007,6 +2009,32 @@ impl Drop for CloneWorkerReadiness {
     }
 }
 
+fn next_clone_reservation_reexec(
+    attempt: Option<&str>,
+    has_layout: bool,
+    reservation_succeeded: bool,
+) -> Option<u8> {
+    if !has_layout || reservation_succeeded {
+        return None;
+    }
+    let attempt = attempt.and_then(|value| value.parse().ok()).unwrap_or(0);
+    (attempt < MAX_CUDA_CLONE_RESERVATION_REEXECS).then_some(attempt + 1)
+}
+
+/// Replace the worker image without changing its PID or inherited clone fds.
+#[cfg(unix)]
+fn reexec_clone_worker(fd: std::os::unix::io::RawFd, attempt: u8) -> io::Result<()> {
+    use std::os::unix::process::CommandExt as _;
+
+    let executable = std::env::current_exe()?;
+    let fd = fd.to_string();
+    let error = Command::new(executable)
+        .args(["_cuda-clone-worker", fd.as_str()])
+        .env(CUDA_CLONE_RESERVATION_REEXEC_ENV, attempt.to_string())
+        .exec();
+    Err(error)
+}
+
 /// Path 3 (M1): serve one isolating fork-clone connection in THIS separate worker
 /// process. A per-clone process has its own CUDA primary context and thus its own
 /// UVA space, so it can place memory at the golden's exact virtual addresses
@@ -2059,6 +2087,23 @@ pub fn run_clone_worker(fd: std::os::unix::io::RawFd) -> io::Result<()> {
             granularity,
             "clone-worker: reserved golden address ranges before context creation"
         );
+        let has_layout =
+            !clone_layout_reservation_envelopes(layout, MIN_CLONE_RESERVATION_GRANULARITY)
+                .is_empty();
+        if let Some(next_attempt) = next_clone_reservation_reexec(
+            std::env::var(CUDA_CLONE_RESERVATION_REEXEC_ENV)
+                .ok()
+                .as_deref(),
+            has_layout,
+            !pre_reserved.is_empty(),
+        ) {
+            tracing::warn!(
+                next_attempt,
+                granularity,
+                "clone-worker: re-executing after CUDA address collision"
+            );
+            return reexec_clone_worker(fd, next_attempt);
+        }
     }
     let _ = backend.primary_ctx_retain(clone_dev);
     // Clone transport: consume the proc-mem advert (SMVGPVM1) the clone proxy
@@ -2727,7 +2772,7 @@ fn reserve_clone_layout_exact(
         .max(MIN_CLONE_RESERVATION_GRANULARITY)
         .next_power_of_two();
     // Most workers resolve at 32 MiB. Keep one validated 2 GiB envelope as a
-    // final fallback for contexts whose allocator moves every smaller hint.
+    // final fallback, then re-exec the worker if its address space collides.
     while granularity <= MAX_CLONE_RESERVATION_GRANULARITY {
         let envelopes = clone_layout_reservation_envelopes(layout, granularity);
         let mut reserved = Vec::with_capacity(envelopes.len());
@@ -6060,8 +6105,8 @@ mod mps_tests {
         encode_clone_worker_capability, encode_clone_worker_status, fork_snapshot_enabled,
         golden_eviction_enabled, host_snapshot_fits, host_snapshot_reconstructable, lift_owned_fds,
         live_host_snapshot_count, local_cuda_daemon_socket, map_module_blob_fd, mps_enabled,
-        ordinary_regions_are_reserved, posix_spawn_clone_worker, prepare_module_blob,
-        prepare_streamed_module_blob, prune_dead_clone_worker_statuses_in,
+        next_clone_reservation_reexec, ordinary_regions_are_reserved, posix_spawn_clone_worker,
+        prepare_module_blob, prepare_streamed_module_blob, prune_dead_clone_worker_statuses_in,
         publish_clone_worker_capability, range_is_reserved, read_host_snapshot,
         reconstruct_golden_modules, recv_fd, redeem_tensor_bundle_from_stream, seal_host_snapshot,
         select_golden_owner, send_fd, send_tensor_bundle_to_parent, serve_tensor_bundle_consumer,
@@ -6929,6 +6974,22 @@ mod mps_tests {
         for (base, size) in clone_layout_reservations(layout) {
             assert!(range_is_reserved(&fallback, base, size));
         }
+    }
+
+    #[test]
+    fn clone_address_collision_reexec_is_bounded() {
+        assert_eq!(next_clone_reservation_reexec(None, true, false), Some(1));
+        assert_eq!(
+            next_clone_reservation_reexec(Some("1"), true, false),
+            Some(2)
+        );
+        assert_eq!(next_clone_reservation_reexec(Some("2"), true, false), None);
+        assert_eq!(
+            next_clone_reservation_reexec(Some("invalid"), true, false),
+            Some(1)
+        );
+        assert_eq!(next_clone_reservation_reexec(None, false, false), None);
+        assert_eq!(next_clone_reservation_reexec(None, true, true), None);
     }
 
     #[test]

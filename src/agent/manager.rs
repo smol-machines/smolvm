@@ -2646,7 +2646,7 @@ impl AgentManager {
                 }
                 if self.vsock_socket.exists() {
                     socket_observations += 1;
-                    match super::AgentClient::connect_with_boot_probe_timeout(&self.vsock_socket) {
+                    match super::AgentClient::connect_with_clone_ready_timeout(&self.vsock_socket) {
                         Ok(mut client) => {
                             connect_successes += 1;
                             match client.ping() {

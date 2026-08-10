@@ -550,6 +550,13 @@ impl AgentClient {
         Self::connect_with_timeouts_ms(socket_path.as_ref(), 5, 5)
     }
 
+    /// Connect to a restored clone while allowing its resumed vsock transport
+    /// to complete the handshake. Reopening 5 ms boot probes can fill the
+    /// restored RX queue before the agent receives any ping payload.
+    pub fn connect_with_clone_ready_timeout(socket_path: impl AsRef<Path>) -> Result<Self> {
+        Self::connect_with_timeouts_ms(socket_path.as_ref(), 1000, 1000)
+    }
+
     /// Internal connect implementation (single attempt).
     fn connect_once(socket_path: &Path) -> Result<Self> {
         Self::connect_with_timeouts(
