@@ -115,7 +115,7 @@ allow_hosts = ["api.stripe.com", "db.example.com"]
 
 [dev]
 init = ["pip install -r requirements.txt"]
-volumes = ["./src:/app"]
+volumes = ["~/src:/app"]
 
 [auth]
 ssh_agent = true
