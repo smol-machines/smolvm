@@ -1892,6 +1892,24 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    #[test]
+    fn cli_overlay_owner_uses_the_golden_for_fork_clones() {
+        let ordinary =
+            smolvm::config::VmRecord::new("ordinary".into(), 1, 512, Vec::new(), Vec::new(), false);
+        assert_eq!(
+            persistent_overlay_owner_for_record("ordinary", Some(&ordinary)),
+            "ordinary"
+        );
+
+        let mut clone =
+            smolvm::config::VmRecord::new("clone-a".into(), 1, 512, Vec::new(), Vec::new(), false);
+        clone.golden = Some("golden-a".into());
+        assert_eq!(
+            persistent_overlay_owner_for_record("clone-a", Some(&clone)),
+            "golden-a"
+        );
+    }
+
     /// `--oci-cache` resolves the image digest at the auth gate and mixes it into
     /// the key, so the cache tracks CONTENT. Without this a mutable tag like
     /// `alpine:latest` hashes identically forever and the first run's image keeps
@@ -2311,6 +2329,21 @@ mod tests {
 // Exec Command (Persistent) - Direct VM Execution
 // ============================================================================
 
+/// Resolve the persistent container overlay visible to CLI operations.
+///
+/// A fork clone inherits the golden's overlay directory through its CoW storage
+/// disk. Addressing a new directory under the clone's name would silently give
+/// `machine exec` and `machine cp` a clean image instead of the forked rootfs.
+fn persistent_overlay_owner_for_record(
+    machine_name: &str,
+    record: Option<&smolvm::config::VmRecord>,
+) -> String {
+    smolvm::workload::persistent_overlay_owner(
+        machine_name,
+        record.and_then(|record| record.golden.as_deref()),
+    )
+}
+
 /// Execute a command directly in the VM's Alpine rootfs.
 ///
 /// This runs commands at the VM level, not inside a container. Useful for
@@ -2442,16 +2475,16 @@ impl ExecCmd {
                 workdir.as_deref(),
             );
             // Image-based machine: exec inside the image's rootfs via crun.
-            // Use machine name as persistent overlay ID so filesystem changes
-            // (e.g. package installs) survive across exec sessions.
-            let machine_name = name.clone();
+            // Fork clones address the golden's inherited overlay; ordinary
+            // machines use their own name.
+            let overlay_owner = persistent_overlay_owner_for_record(&name, record.as_ref());
             if self.detach {
                 let config = smolvm::agent::RunConfig::new(image, self.command.clone())
                     .with_env(defaults.env)
                     .with_workdir(defaults.workdir)
                     .with_user(defaults.user)
                     .with_mounts(mount_bindings)
-                    .with_persistent_overlay(Some(machine_name));
+                    .with_persistent_overlay(Some(overlay_owner));
                 let pid = client.run_background(config)?;
                 println!("{pid}");
                 return Ok(());
@@ -2464,7 +2497,7 @@ impl ExecCmd {
                     .with_mounts(mount_bindings)
                     .with_timeout(self.timeout)
                     .with_tty(self.tty)
-                    .with_persistent_overlay(Some(machine_name.clone()));
+                    .with_persistent_overlay(Some(overlay_owner.clone()));
                 let exit_code = client.run_interactive(config)?;
                 std::process::exit(exit_code);
             }
@@ -2476,7 +2509,7 @@ impl ExecCmd {
                     .with_user(defaults.user.clone())
                     .with_mounts(mount_bindings)
                     .with_timeout(self.timeout)
-                    .with_persistent_overlay(Some(machine_name.clone()));
+                    .with_persistent_overlay(Some(overlay_owner.clone()));
                 let mut printer = ExecEventPrinter::default();
                 client.run_streaming_with(config, |event| printer.handle(event))?;
                 std::process::exit(printer.exit_code);
@@ -2488,7 +2521,7 @@ impl ExecCmd {
                 .with_user(defaults.user)
                 .with_mounts(mount_bindings)
                 .with_timeout(self.timeout)
-                .with_persistent_overlay(Some(machine_name));
+                .with_persistent_overlay(Some(overlay_owner));
             let (exit_code, stdout, stderr) = client.run_non_interactive(config)?;
             vm_common::print_output_and_exit(&manager, exit_code, &stdout, &stderr);
         } else {
@@ -4439,13 +4472,15 @@ impl CpCmd {
         // mounted so cp targets the container filesystem (not the VM rootfs).
         // prepare_overlay is idempotent: reuses if mounted, remounts if upper
         // exists, creates fresh otherwise.
-        if let Some(image) = smolvm::db::SmolvmDb::open()
+        if let Some(record) = smolvm::db::SmolvmDb::open()
             .ok()
             .and_then(|db| db.get_vm(&machine_name).ok().flatten())
-            .and_then(|r| r.image.clone())
         {
-            let overlay_id = format!("persistent-{}", machine_name);
-            client.prepare_overlay(&image, &overlay_id)?;
+            if let Some(image) = record.image.as_ref() {
+                let owner = persistent_overlay_owner_for_record(&machine_name, Some(&record));
+                let overlay_id = format!("persistent-{owner}");
+                client.prepare_overlay(image, &overlay_id)?;
+            }
         }
 
         if is_upload {
