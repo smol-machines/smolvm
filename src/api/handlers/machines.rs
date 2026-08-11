@@ -392,6 +392,34 @@ pub async fn create_machine(
     // affect the socket path — only character sanity + a generous length
     // cap are needed.
     let name = req.name.clone().unwrap_or_else(generate_machine_name);
+
+    // Fill the host image store for a registry-image machine, here rather than at
+    // start, because this is the request that carries the caller's registry
+    // credential — the store re-authorizes every fill, and a start has no
+    // credential of its own. Once filled, the machine's back-reference lets every
+    // later start re-present the same layers with no registry round-trip.
+    //
+    // The node's own configured credentials are deliberately NOT a fallback: on a
+    // shared node they would let one caller's fill be authorized with rights it
+    // never presented. Without a token the gate runs anonymously, which reaches
+    // exactly the public images an unauthenticated in-guest pull could reach.
+    if let Some(image) = req.image.clone() {
+        let auth = match req.registry_identity_token.as_deref() {
+            Some(token) => crate::registry::PullAuth::Identity(token.to_string()),
+            None => crate::registry::PullAuth::Anonymous,
+        };
+        // Reconcile claims against the machines that actually exist, so a
+        // discarded database cannot pin entries against the LRU forever.
+        if let Ok(vms) = state.db().list_vms() {
+            crate::image_store::sweep_refs(vms.iter().map(|(n, _)| n.as_str()));
+        }
+        let machine = name.clone();
+        // Blocking pull + extract; keep it off the async worker threads.
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::image_store::prepare_layers(&machine, Some(&image), Some(&auth))
+        })
+        .await;
+    }
     validate_vm_name(&name, "machine name").map_err(ApiError::BadRequest)?;
 
     // Validate mount paths
@@ -1070,6 +1098,9 @@ pub async fn start_machine(
             Some(&name_clone),
             source_smolmachine.as_deref(),
             dns_filter_hosts,
+            // The fill happened at create, where the caller's registry credential
+            // was in hand; a start only re-presents that entry.
+            None,
         )
         .map_err(|e| format!("failed to prepare packed layers: {}", e))?;
         // A fork clone shares its golden's uid. On a cold (re)start there is no
@@ -1631,6 +1662,9 @@ async fn boot_prepared_fork_inner(
             Some(&clone_b),
             record.source_smolmachine.as_deref(),
             record.dns_filter_hosts.clone(),
+            // A clone boots from its golden's snapshot; any store entry it needs
+            // is re-presented from its own back-reference.
+            None,
         )
         .map_err(|e| format!("failed to prepare packed layers: {}", e))?;
         // Boot from the golden's snapshot instead of cold-booting.
@@ -2226,6 +2260,10 @@ pub(crate) async fn delete_one(
     let state_rm = state.clone();
     let name_rm = name.clone();
     tokio::task::spawn_blocking(move || -> Result<(), ApiError> {
+        // Release this machine's claim on its shared store entry, so the LRU may
+        // reclaim it once nothing boots from it. The entry itself is shared and
+        // stays. Mirrors the CLI delete path.
+        crate::image_store::forget_entry(&name_rm);
         match state_rm.remove_machine(&name_rm) {
             Ok(_) => Ok(()),
             Err(ApiError::NotFound(_)) => {

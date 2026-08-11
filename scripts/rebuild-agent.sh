@@ -10,7 +10,15 @@ set -ex
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-ROOTFS_DIR="$HOME/Library/Application Support/smolvm/agent-rootfs"
+# The agent rootfs lives under the platform's data dir — macOS keeps it in
+# "Application Support", Linux under XDG's ~/.local/share. Hardcoding the macOS
+# path made this script unrunnable on Linux, where the guest agent actually ships
+# from.
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  ROOTFS_DIR="$HOME/Library/Application Support/smolvm/agent-rootfs"
+else
+  ROOTFS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/smolvm/agent-rootfs"
+fi
 
 cd "$PROJECT_DIR"
 

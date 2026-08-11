@@ -130,15 +130,87 @@ pub fn create_overlay_whiteout(_path: &Path) -> std::io::Result<()> {
     ))
 }
 
-/// Mark `dir` opaque for overlayfs via the `trusted.overlay.opaque` xattr — the
-/// representation of OCI's `.wh..wh..opq` marker. Linux-only (see
-/// [`create_overlay_whiteout`]).
+/// Which xattr namespace opaque-directory markers are written in.
+///
+/// This is NOT a stylistic choice — it must match how the overlay that reads
+/// these layers is mounted, and a mismatch fails **silently**: the kernel simply
+/// ignores markers from the other namespace and stale lower-layer content shows
+/// through with no error. Measured both ways.
+///
+/// The deciding question is *who reads the marker*:
+///
+/// * [`OpaqueXattr::Trusted`] — the reader is root on a local filesystem (the
+///   guest agent extracting its own pulled layers). `trusted.*` requires
+///   `CAP_SYS_ADMIN` to read, which it has. This is the long-standing behavior
+///   and every existing `.smolmachine` relies on it.
+/// * [`OpaqueXattr::User`] — the reader is **unprivileged**. Host-produced layers
+///   are served to the guest over virtiofs by a VMM that has dropped to a per-VM
+///   uid, and an unprivileged process cannot even see a `trusted.*` xattr. Such
+///   layers must use `user.*`, and the overlay that consumes them must be mounted
+///   with the `userxattr` option.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpaqueXattr {
+    /// `trusted.overlay.opaque` — for layers read by a privileged local reader.
+    Trusted,
+    /// `user.overlay.opaque` — for layers read by an unprivileged reader, whose
+    /// overlay must be mounted with `userxattr`.
+    User,
+}
+
+impl OpaqueXattr {
+    /// The xattr name this flavor writes. Consumed only by the Linux
+    /// `setxattr` path; the non-Linux build keeps the enum for API parity.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn name(self) -> &'static str {
+        match self {
+            OpaqueXattr::Trusted => "trusted.overlay.opaque",
+            OpaqueXattr::User => "user.overlay.opaque",
+        }
+    }
+}
+
+/// How a layer should be written to disk.
+#[derive(Debug, Clone, Copy)]
+pub struct ExtractOptions {
+    /// Namespace for opaque-directory markers. See [`OpaqueXattr`].
+    pub opaque_xattr: OpaqueXattr,
+    /// Whether to restore each entry's uid/gid from the archive.
+    ///
+    /// `true` for the guest, which is root on a local filesystem and must honor
+    /// images that ship non-root-owned paths (a `node`/`postgres` user's home).
+    ///
+    /// `false` for host-side extraction, matching the pack store: the layers are
+    /// presented to the guest through an **idmapped** mount that shifts a single
+    /// uid, so preserving arbitrary owners would defeat the mapping. Leaving
+    /// ownership alone also means extraction needs no `CAP_CHOWN`.
+    pub preserve_ownership: bool,
+}
+
+impl ExtractOptions {
+    /// Layers extracted by the guest for its own use: privileged local reader,
+    /// image ownership preserved. The long-standing behavior.
+    pub const GUEST: Self = Self {
+        opaque_xattr: OpaqueXattr::Trusted,
+        preserve_ownership: true,
+    };
+
+    /// Layers extracted on the host and served to a guest over virtiofs by an
+    /// unprivileged VMM, through an idmapped mount.
+    pub const HOST_SHARED: Self = Self {
+        opaque_xattr: OpaqueXattr::User,
+        preserve_ownership: false,
+    };
+}
+
+/// Mark `dir` opaque for overlayfs — the representation of OCI's `.wh..wh..opq`
+/// marker. Linux-only (see [`create_overlay_whiteout`]). See [`OpaqueXattr`] for
+/// why the namespace matters.
 #[cfg(target_os = "linux")]
-pub fn set_overlay_opaque(dir: &Path) -> std::io::Result<()> {
+pub fn set_overlay_opaque(dir: &Path, flavor: OpaqueXattr) -> std::io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let c_path = std::ffi::CString::new(dir.as_os_str().as_bytes())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let name = std::ffi::CString::new("trusted.overlay.opaque").expect("static xattr name");
+    let name = std::ffi::CString::new(flavor.name()).expect("static xattr name");
     let value = b"y";
     // SAFETY: path/name are NUL-terminated; value/len describe a valid buffer.
     let rc = unsafe {
@@ -157,7 +229,7 @@ pub fn set_overlay_opaque(dir: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn set_overlay_opaque(_dir: &Path) -> std::io::Result<()> {
+pub fn set_overlay_opaque(_dir: &Path, _flavor: OpaqueXattr) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "overlayfs opaque dirs are only set on Linux",
@@ -232,7 +304,11 @@ fn pack_sidecar_sentinel(path: &Path) -> Option<&'static str> {
 /// `reader` yields the raw layer blob (gzip/zstd/plain — decompressed here). The
 /// whiteout translation only takes effect on Linux; on other hosts the markers
 /// would surface as `Unsupported` errors, so this is called on the Linux node.
-pub fn extract_oci_layer<R: Read>(reader: R, dest: &Path) -> std::io::Result<()> {
+pub fn extract_oci_layer<R: Read>(
+    reader: R,
+    dest: &Path,
+    opts: ExtractOptions,
+) -> std::io::Result<()> {
     // Layers arrive gzip- or zstd-compressed (or, rarely, plain). Decompress
     // transparently so a zstd layer no longer breaks extraction.
     let reader = decompress_layer_reader(reader)?;
@@ -242,8 +318,16 @@ pub fn extract_oci_layer<R: Read>(reader: R, dest: &Path) -> std::io::Result<()>
     // Preserve the archive's uid/gid. The caller runs as root (CAP_CHOWN) so this
     // chowns each entry to the image's intended owner; without it every file is
     // owned by root, breaking images that ship non-root-owned paths.
-    archive.set_preserve_ownerships(true);
+    archive.set_preserve_ownerships(opts.preserve_ownership);
     archive.set_overwrite(true);
+
+    // Directory modes are restored AFTER all entries are written. The loop below
+    // force-opens each parent to 0755 so restrictive directories cannot block the
+    // extraction of their own contents; without this deferred pass those widened
+    // modes would be what the image ships with, silently turning a 0700 directory
+    // (a private PGDATA, an .ssh, a secrets dir) world-readable.
+    #[cfg(unix)]
+    let mut deferred_dir_modes: Vec<(std::path::PathBuf, u32)> = Vec::new();
 
     for entry in archive.entries()? {
         let mut entry = entry?;
@@ -276,7 +360,7 @@ pub fn extract_oci_layer<R: Read>(reader: R, dest: &Path) -> std::io::Result<()>
                 LayerEntry::OpaqueDir => {
                     if let Some(parent) = full_path.parent() {
                         std::fs::create_dir_all(parent)?;
-                        set_overlay_opaque(parent)?;
+                        set_overlay_opaque(parent, opts.opaque_xattr)?;
                     }
                     continue;
                 }
@@ -312,6 +396,13 @@ pub fn extract_oci_layer<R: Read>(reader: R, dest: &Path) -> std::io::Result<()>
             }
         }
 
+        #[cfg(unix)]
+        if entry.header().entry_type() == tar::EntryType::Directory {
+            if let Ok(mode) = entry.header().mode() {
+                deferred_dir_modes.push((full_path.clone(), mode));
+            }
+        }
+
         if let Err(e) = entry.unpack_in(dest) {
             // Regular files and directories failing is a real error; non-regular
             // entries (symlinks, device nodes, fifos) can fail benignly — skip.
@@ -331,12 +422,45 @@ pub fn extract_oci_layer<R: Read>(reader: R, dest: &Path) -> std::io::Result<()>
             }
         }
     }
+
+    // Deepest first: a parent re-tightened before its children were written would
+    // block them, so this runs only once every entry is on disk.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        deferred_dir_modes.sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
+        for (path, mode) in deferred_dir_modes {
+            if path.is_dir() {
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode));
+            }
+        }
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two presets encode a pairing that must hold, because getting it wrong
+    /// fails SILENTLY (the kernel ignores markers from the other namespace and
+    /// shows stale lower content, with no error). Measured on Linux 6.x:
+    /// `user.overlay.opaque` is honored only under a `userxattr` mount, and an
+    /// unprivileged reader cannot see `trusted.*` at all.
+    #[test]
+    fn presets_pair_xattr_flavor_with_the_reader() {
+        // Guest: privileged local reader, so trusted.* — and it must keep image
+        // ownership, since it is root and images ship non-root-owned paths.
+        assert_eq!(ExtractOptions::GUEST.opaque_xattr, OpaqueXattr::Trusted);
+        const { assert!(ExtractOptions::GUEST.preserve_ownership) };
+        assert_eq!(OpaqueXattr::Trusted.name(), "trusted.overlay.opaque");
+
+        // Host-shared: read by an UNPRIVILEGED virtiofs server through an
+        // idmapped mount, so user.* and no ownership preservation.
+        assert_eq!(ExtractOptions::HOST_SHARED.opaque_xattr, OpaqueXattr::User);
+        const { assert!(!ExtractOptions::HOST_SHARED.preserve_ownership) };
+        assert_eq!(OpaqueXattr::User.name(), "user.overlay.opaque");
+    }
 
     #[test]
     fn classify_recognizes_markers_and_normals() {
@@ -466,5 +590,51 @@ mod tests {
                 .collect();
             assert_eq!(names, vec!["hello".to_string()], "{label} entry list");
         }
+    }
+
+    /// A layer that ships a 0700 directory containing a file must keep 0700 after
+    /// extraction. The extractor force-opens parents to 0755 so restrictive
+    /// directories cannot block their own contents; without the deferred restore
+    /// that widening is what survives, silently exposing private directories.
+    #[cfg(unix)]
+    #[test]
+    fn restrictive_directory_modes_survive_extraction() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        let mut tar = tar::Builder::new(Vec::new());
+        let mut dir = tar::Header::new_gnu();
+        dir.set_entry_type(tar::EntryType::Directory);
+        dir.set_mode(0o700);
+        dir.set_size(0);
+        tar.append_data(&mut dir, "private/", std::io::empty())
+            .unwrap();
+        let mut file = tar::Header::new_gnu();
+        file.set_entry_type(tar::EntryType::Regular);
+        file.set_mode(0o600);
+        file.set_size(3);
+        tar.append_data(&mut file, "private/secret", &b"hi\n"[..])
+            .unwrap();
+        let archive = tar.into_inner().unwrap();
+
+        extract_oci_layer(
+            std::io::Cursor::new(archive),
+            &dest,
+            ExtractOptions::HOST_SHARED,
+        )
+        .unwrap();
+
+        let got = std::fs::metadata(dest.join("private"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(got, 0o700, "directory mode widened to {got:o}");
+        assert!(
+            dest.join("private/secret").is_file(),
+            "contents still extracted"
+        );
     }
 }

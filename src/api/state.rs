@@ -1138,6 +1138,22 @@ where
 // Shared Machine Helpers
 // ============================================================================
 
+/// A registry image an API-started machine may take its layers from.
+pub struct StoreImage<'a> {
+    /// The image reference the machine was created with, when the caller has it.
+    /// Absent on start paths that only re-present an already-filled entry.
+    pub reference: Option<&'a str>,
+    /// The credential the store must re-authorize this caller with.
+    ///
+    /// `None` declines a fill. The node's own configured credentials are
+    /// deliberately NOT a fallback: on a shared node they would authorize one
+    /// tenant's cache hit with another tenant's rights, which is exactly what
+    /// the per-caller gate exists to prevent. Declining costs a pull, not
+    /// correctness — and an entry this machine already booted from is still
+    /// re-presented, having passed the gate when it was filled.
+    pub auth: Option<crate::registry::PullAuth>,
+}
+
 /// Build `LaunchFeatures` for an API-driven machine start.
 ///
 /// Thin wrapper over [`crate::agent::LaunchFeatures::with_packed_layers`]
@@ -1155,6 +1171,7 @@ pub fn build_launch_features(
     machine_name: Option<&str>,
     source_smolmachine: Option<&str>,
     dns_filter_hosts: Option<Vec<String>>,
+    image: Option<StoreImage<'_>>,
 ) -> crate::Result<crate::agent::LaunchFeatures> {
     let features = crate::agent::LaunchFeatures::default();
     let mut features = match machine_name {
@@ -1164,6 +1181,25 @@ pub fn build_launch_features(
         )?,
         None => features,
     };
+    // Registry-image machines: present the host image store's shared lowerdirs,
+    // through the same `prepare_layers` the CLI uses. A `.smolmachine` machine
+    // already has its layers above and never reaches this.
+    // Attempted on every start path, including those holding no image reference:
+    // re-presenting an already-filled entry is keyed by the machine alone, and
+    // skipping it would leave a store-backed machine with no rootfs.
+    if features.packed_layers_dir.is_none() {
+        if let Some(name) = machine_name {
+            let image = image.as_ref();
+            if let Some(layers) = crate::image_store::prepare_layers(
+                name,
+                image.and_then(|i| i.reference),
+                image.and_then(|i| i.auth.as_ref()),
+            ) {
+                features.pack_idmap_source = Some(layers.idmap_source);
+                features.packed_layers_dir = Some(layers.mountpoint);
+            }
+        }
+    }
     // Carry the egress hostname allow-list into the boot config; `internal_boot`
     // starts the DNS filter for these names and learns their answers into the
     // egress allow-list (parity with the CLI `--allow-host` path).
@@ -1221,6 +1257,9 @@ pub async fn ensure_machine_running(
                 entry.manager.name(),
                 entry.source_smolmachine.as_deref(),
                 entry.resources.allowed_hosts.clone(),
+                // An autostart re-presents an already-filled entry; the in-memory
+                // entry carries no image reference or tenant credential.
+                None,
             )?
         };
         features.cuda_fork_pool_size = entry.cuda_fork_pool_size;
@@ -1637,11 +1676,11 @@ mod tests {
         // The serve-API launch path must forward the egress hostname allow-list
         // into the boot config, so `internal_boot` starts the DNS filter for it.
         let hosts = vec!["api.anthropic.com".to_string(), "pypi.org".to_string()];
-        let features = build_launch_features(None, None, Some(hosts.clone())).unwrap();
+        let features = build_launch_features(None, None, Some(hosts.clone()), None).unwrap();
         assert_eq!(features.dns_filter_hosts, Some(hosts));
 
         // No hostname policy stays None (unrestricted egress, unchanged behavior).
-        let features = build_launch_features(None, None, None).unwrap();
+        let features = build_launch_features(None, None, None, None).unwrap();
         assert_eq!(features.dns_filter_hosts, None);
     }
 
