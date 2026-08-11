@@ -233,6 +233,27 @@ fn parse_cli_secret_refs(
     Ok(out)
 }
 
+fn smolmachine_secret_refs(
+    manifest_refs: std::collections::BTreeMap<String, smolvm::secrets::SecretRef>,
+    secret_env: &[String],
+    secret_file: &[String],
+) -> smolvm::Result<std::collections::BTreeMap<String, smolvm::secrets::SecretRef>> {
+    for (key, r) in &manifest_refs {
+        smolvm::secrets::validate_ref(r, smolvm::secrets::ResolutionScope::Untrusted).map_err(
+            |e| {
+                smolvm::Error::config(
+                    "create from .smolmachine",
+                    format!("secret '{}': {} (packs may not carry secret refs)", key, e),
+                )
+            },
+        )?;
+    }
+
+    let mut refs = manifest_refs;
+    refs.extend(parse_cli_secret_refs(secret_env, secret_file)?);
+    Ok(refs)
+}
+
 /// Spawn a detached `smolvm _cleanup-ephemeral` helper process so the parent
 /// CLI can exit immediately after flushing output.
 ///
@@ -2123,6 +2144,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn smolmachine_secret_refs_adds_local_cli_refs() {
+        let refs = smolmachine_secret_refs(
+            std::collections::BTreeMap::new(),
+            &["GUEST_TOKEN=HOST_TOKEN".to_string()],
+            &["GUEST_KEY=/abs/key".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(refs["GUEST_TOKEN"].from_env.as_deref(), Some("HOST_TOKEN"));
+        assert_eq!(
+            refs["GUEST_KEY"]
+                .from_file
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+            Some("/abs/key".to_string())
+        );
+    }
+
+    #[test]
+    fn smolmachine_secret_refs_rejects_artifact_refs() {
+        let manifest_refs = std::collections::BTreeMap::from([(
+            "GUEST_TOKEN".to_string(),
+            smolvm::secrets::env_ref("PACK_HOST_TOKEN"),
+        )]);
+
+        let err = smolmachine_secret_refs(manifest_refs, &[], &[]).unwrap_err();
+        assert!(err.to_string().contains("packs may not carry secret refs"));
+    }
+
     #[derive(Parser, Debug)]
     #[command(name = "machine")]
     struct TestMachineCli {
@@ -3112,24 +3163,13 @@ impl CreateCmd {
             manifest.mem
         };
 
-        // A .smolmachine is an untrusted, portable artifact: validate its secret
-        // refs under the Untrusted scope, which rejects every source kind. A
-        // packed `from_env`/`from_file` ref would otherwise read THIS host's
-        // env/files at exec time — reject at create rather than carry an exfil
-        // primitive. Configure secrets locally via the CLI instead.
-        for (key, r) in &manifest.secret_refs {
-            smolvm::secrets::validate_ref(r, smolvm::secrets::ResolutionScope::Untrusted).map_err(
-                |e| {
-                    smolvm::Error::config(
-                        "create from .smolmachine",
-                        format!("secret '{}': {} (packs may not carry secret refs)", key, e),
-                    )
-                },
-            )?;
-        }
+        // A .smolmachine is an untrusted, portable artifact: reject refs carried
+        // by the pack, then add refs explicitly configured on this host.
+        let secret_refs =
+            smolmachine_secret_refs(manifest.secret_refs, &self.secret_env, &self.secret_file)?;
 
         let params = vm_common::CreateVmParams {
-            secret_refs: manifest.secret_refs,
+            secret_refs,
             name,
             // A VM-mode pack is a VM, not a container: its synthetic `vm://<name>`
             // label would make exec/start/re-pack treat it as a pullable image
