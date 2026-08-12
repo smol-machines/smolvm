@@ -504,36 +504,56 @@ fn main() {
 /// event-driven readiness signal that — unlike the marker — needs no writable
 /// filesystem, so it works even when the rootfs share is root-owned (packaged
 /// installs). Best-effort: a failure just falls back to the marker/ping.
+/// Returns whether the doorbell was answered — i.e. the host is listening and
+/// has already observed readiness. The caller uses that to decide whether the
+/// marker file is needed at all.
 #[cfg(target_os = "linux")]
-fn ready_doorbell() {
+fn ready_doorbell() -> bool {
     unsafe {
         let fd = libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0);
         if fd < 0 {
-            return;
+            return false;
         }
         let mut addr: libc::sockaddr_vm = std::mem::zeroed();
         addr.svm_family = libc::AF_VSOCK as libc::sa_family_t;
         addr.svm_cid = libc::VMADDR_CID_HOST;
         addr.svm_port = smolvm_protocol::ports::AGENT_READY;
-        let _ = libc::connect(
+        let connected = libc::connect(
             fd,
             &addr as *const libc::sockaddr_vm as *const libc::sockaddr,
             std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t,
-        );
+        ) == 0;
         libc::close(fd);
+        connected
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn ready_doorbell() {}
+fn ready_doorbell() -> bool {
+    false
+}
 
 fn signal_ready_to_host() {
     use std::path::Path;
 
-    // Ring the event-driven doorbell first (a single connect), then write the file
-    // marker — both go out microseconds apart, and the host takes whichever it
-    // sees first.
-    ready_doorbell();
+    // Ring the event-driven doorbell first. A successful connect means the host
+    // has *already* observed readiness, so the marker would be write-only state:
+    // nothing reads it, and it is never cleaned up on this path.
+    //
+    // Skipping it matters beyond tidiness. The marker lands in the SHARED agent
+    // rootfs, and under per-VM uid isolation it is created owned by the VM's
+    // dropped uid with mode 0600. `collect_agent_rootfs` must read every byte of
+    // that tree, so each leftover marker is a file that makes `pack create` fail
+    // with EACCES for any other user (BUG-151, #865) — and the host's
+    // `prune_orphaned_ready_markers` cannot remove them on a root-owned packaged
+    // install, by its own admission.
+    //
+    // The marker is still written when the doorbell goes unanswered: an older
+    // host does not bind the listener, and a host whose doorbell vsock port
+    // failed to add falls back to marker/ping. Those hosts keep working.
+    if ready_doorbell() {
+        return;
+    }
 
     let content = uptime_ms().to_string();
 
