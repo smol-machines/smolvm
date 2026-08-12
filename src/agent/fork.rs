@@ -765,6 +765,9 @@ fn prepare_clone_from_snapshot(
             clone_rec.ports = remapped;
         }
         clone_rec.golden = Some(golden.to_string());
+        // Clones are leaf machines. Do not inherit a Smolfile-declared
+        // forkable launch default from the golden on later cold starts.
+        clone_rec.forkable = spec.clone_forkable;
         clone_rec.forkpoint_held = spec.hold;
         clone_rec.fork_env = spec.fork_env.to_vec();
         db.insert_vm(clone, &clone_rec)?;

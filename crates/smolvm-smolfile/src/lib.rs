@@ -19,8 +19,8 @@
 //! | `cmd` | string[] | No | Default args appended to entrypoint. Overrides image CMD. |
 //! | `env` | string[] | No | Environment variables as `KEY=VALUE`. |
 //! | `workdir` | string | No | Working directory inside the VM. |
-//! | `cpus` | int | No | Number of vCPUs (default: 1). |
-//! | `memory` | int | No | Memory in MiB (default: 256). |
+//! | `cpus` | int | No | Number of vCPUs (default: 4). |
+//! | `memory` | int | No | Memory in MiB (default: 8192). |
 //! | `net` | bool | No | Enable outbound networking via NAT. |
 //! | `cuda` | bool | No | Enable CUDA-over-vsock (host NVIDIA GPU). |
 //! | `auto_graph` | bool | No | Best-effort framework CUDA graphs; implies `cuda`. |
@@ -65,6 +65,18 @@
 //! |-------|------|-------------|
 //! | `allow_hosts` | string[] | Allowed hostnames (resolved to IPs at start) |
 //! | `allow_cidrs` | string[] | Allowed CIDR ranges (`"10.0.0.0/8"`) |
+//!
+//! ### `[fork]` — Forkable launch and CUDA capacity
+//!
+//! Controls how a machine created from this Smolfile starts. A configured pool
+//! size implies `enabled = true` and applies the same transparent CUDA capacity
+//! policy as `machine start --fork-pool-size`.
+//!
+//! | Field | Type | Description |
+//! |-------|------|-------------|
+//! | `enabled` | bool | Start as a copy-on-write fork base |
+//! | `pool_size` | int | Planned number of runnable CUDA clones; implies `enabled` |
+//! | `cuda_vram_limit_mib` | int | Logical VRAM limit per golden/clone; requires `pool_size` |
 //!
 //! ### `[health]` — Health checks
 //!
@@ -133,6 +145,7 @@
 //! cpus = 2
 //! memory = 1024
 //! net = true
+//! cuda = true
 //!
 //! [dev]
 //! volumes = ["./src:/app"]
@@ -146,6 +159,11 @@
 //! [network]
 //! allow_hosts = ["pypi.org"]
 //! allow_cidrs = ["10.0.0.0/8"]
+//!
+//! [fork]
+//! enabled = true
+//! pool_size = 8
+//! cuda_vram_limit_mib = 8192
 //!
 //! [health]
 //! exec = ["curl", "-f", "http://localhost:8080/health"]
@@ -278,6 +296,8 @@ pub struct Smolfile {
     // Sections
     /// Network egress policy.
     pub network: Option<NetworkConfig>,
+    /// Forkable launch and CUDA fork-capacity policy.
+    pub fork: Option<ForkConfig>,
     /// Health check configuration.
     pub health: Option<HealthConfig>,
     /// Restart policy.
@@ -298,6 +318,19 @@ pub struct NetworkConfig {
     /// Allowed egress CIDR ranges (e.g., `["10.0.0.0/8", "1.1.1.1"]`).
     #[serde(default)]
     pub allow_cidrs: Vec<String>,
+}
+
+/// Forkable launch and CUDA fork-capacity policy.
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ForkConfig {
+    /// Start the machine as a copy-on-write fork base.
+    pub enabled: Option<bool>,
+    /// Planned number of runnable CUDA clones. Implies `enabled`.
+    pub pool_size: Option<u32>,
+    /// Explicit logical VRAM limit for each golden/clone CUDA session.
+    /// Requires `pool_size`.
+    pub cuda_vram_limit_mib: Option<u64>,
 }
 
 /// Credential forwarding configuration.
@@ -505,6 +538,11 @@ memory = 2048
 allow_hosts = ["pypi.org"]
 allow_cidrs = ["10.0.0.0/8"]
 
+[fork]
+enabled = true
+pool_size = 8
+cuda_vram_limit_mib = 8192
+
 [health]
 exec = ["curl", "-f", "http://localhost/health"]
 interval = "10s"
@@ -545,6 +583,11 @@ protocol = "http"
         let network = sf.network.unwrap();
         assert_eq!(network.allow_hosts, vec!["pypi.org"]);
 
+        let fork = sf.fork.unwrap();
+        assert_eq!(fork.enabled, Some(true));
+        assert_eq!(fork.pool_size, Some(8));
+        assert_eq!(fork.cuda_vram_limit_mib, Some(8192));
+
         let health = sf.health.unwrap();
         assert_eq!(health.retries, Some(3));
 
@@ -577,6 +620,23 @@ protocol = "http"
 
         let sf = parse("").unwrap();
         assert_eq!(sf.auto_graph, None);
+    }
+
+    #[test]
+    fn parse_fork_section() {
+        let sf = parse(
+            r#"
+[fork]
+enabled = true
+pool_size = 16
+cuda_vram_limit_mib = 4096
+"#,
+        )
+        .unwrap();
+        let fork = sf.fork.unwrap();
+        assert_eq!(fork.enabled, Some(true));
+        assert_eq!(fork.pool_size, Some(16));
+        assert_eq!(fork.cuda_vram_limit_mib, Some(4096));
     }
 
     #[test]

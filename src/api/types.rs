@@ -631,6 +631,8 @@ pub struct MachineInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = 2)]
     pub overlay_gb: Option<u64>,
+    /// Whether ordinary starts launch this machine as a fork base.
+    pub forkable: bool,
     /// Planned runnable CUDA clone count used for automatic capacity budgeting.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cuda_fork_pool_size: Option<u32>,

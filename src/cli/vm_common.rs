@@ -450,6 +450,12 @@ pub struct CreateVmParams {
     pub ssh_agent: bool,
     /// Enable CUDA-over-vsock (remote guest CUDA Driver-API to the host GPU).
     pub cuda: bool,
+    /// Start this machine as a copy-on-write fork base by default.
+    pub forkable: bool,
+    /// Planned number of runnable CUDA fork clones.
+    pub cuda_fork_pool_size: Option<u32>,
+    /// Explicit logical VRAM limit for each golden/clone CUDA session.
+    pub cuda_vram_limit_mib: Option<u64>,
     /// Expose the guest's Docker daemon socket to the host as a Unix socket.
     pub docker_socket: bool,
     /// Enable GPU acceleration (virtio-gpu with Venus/Vulkan).
@@ -601,6 +607,31 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
         )?;
     }
 
+    if params.cuda_fork_pool_size == Some(0) {
+        return Err(smolvm::Error::config(
+            "create machine",
+            "fork pool size must be greater than zero",
+        ));
+    }
+    if params.cuda_vram_limit_mib == Some(0) {
+        return Err(smolvm::Error::config(
+            "create machine",
+            "CUDA VRAM limit must be greater than zero",
+        ));
+    }
+    if params.cuda_fork_pool_size.is_some() && !params.cuda {
+        return Err(smolvm::Error::config(
+            "create machine",
+            "fork pool size requires a CUDA-enabled machine",
+        ));
+    }
+    if params.cuda_vram_limit_mib.is_some() && params.cuda_fork_pool_size.is_none() {
+        return Err(smolvm::Error::config(
+            "create machine",
+            "CUDA VRAM limit requires a fork pool size",
+        ));
+    }
+
     // Create record with restart policy if configured
     let restart = smolvm::config::RestartConfig {
         policy: params
@@ -646,6 +677,9 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
     record.health_startup_grace_secs = params.health_startup_grace_secs;
     record.ssh_agent = params.ssh_agent;
     record.cuda = params.cuda;
+    record.forkable = params.forkable || params.cuda_fork_pool_size.is_some();
+    record.cuda_fork_pool_size = params.cuda_fork_pool_size;
+    record.cuda_vram_limit_mib = params.cuda_vram_limit_mib;
     record.docker_socket = params.docker_socket;
     record.dns_filter_hosts = params.dns_filter_hosts.clone();
     record.published_sockets = params.published_sockets.clone();
@@ -1189,12 +1223,19 @@ fn start_vm_named_with_db(
     proxy: Option<&str>,
     no_proxy: Option<&str>,
     from_snapshot: bool,
-    fork: ForkLaunch,
+    mut fork: ForkLaunch,
 ) -> smolvm::Result<()> {
     use smolvm::Error;
 
     // Direct DB lookup — 1 read cycle instead of loading everything
     let mut record = db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))?;
+    // A Smolfile-declared fork base starts forkable without requiring the user
+    // to repeat `--forkable`. Older records that persisted a CUDA pool before
+    // the explicit field existed get the same behavior, but clones remain
+    // leaves even though they inherit the golden's CUDA capacity policy.
+    if record.forkable_on_start() {
+        fork.forkable = true;
+    }
 
     // Resolve via the shared probe (PID + vsock ping). The plain
     // `actual_state()` is PID-only and would treat a zombie VMM
@@ -2350,6 +2391,10 @@ fn machine_status_json(name: &str, record: &VmRecord) -> serde_json::Value {
         "ephemeral": record.ephemeral,
         "gpu": record.gpu.unwrap_or(false),
         "gpu_vram_mib": record.gpu_vram_mib,
+        "cuda": record.cuda,
+        "forkable": record.forkable_on_start(),
+        "cuda_fork_pool_size": record.cuda_fork_pool_size,
+        "cuda_vram_limit_mib": record.cuda_vram_limit_mib,
         "forkpoint_held": record.forkpoint_held,
         "labels": record.labels,
         "restart_policy": record.restart.policy.to_string(),
@@ -2464,6 +2509,15 @@ pub fn list_vms(verbose: bool, json: bool) -> smolvm::Result<()> {
                         Some(vram) => println!("  GPU: enabled ({} MiB VRAM)", vram),
                         None => println!("  GPU: enabled"),
                     }
+                }
+                if record.forkable_on_start() {
+                    println!("  Forkable: enabled");
+                }
+                if let Some(pool_size) = record.cuda_fork_pool_size {
+                    println!("  CUDA fork pool: {} clone(s)", pool_size);
+                }
+                if let Some(limit_mib) = record.cuda_vram_limit_mib {
+                    println!("  CUDA VRAM limit: {} MiB per session", limit_mib);
                 }
                 if record.forkpoint_held {
                     println!("  Fork slot: held");

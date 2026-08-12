@@ -108,6 +108,7 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
         // when unset.
         storage_gb: Some(record.storage_gb.unwrap_or(DEFAULT_STORAGE_SIZE_GIB)),
         overlay_gb: Some(record.overlay_gb.unwrap_or(DEFAULT_OVERLAY_SIZE_GIB)),
+        forkable: record.forkable_on_start(),
         cuda_fork_pool_size: record.cuda_fork_pool_size,
         cuda_vram_limit_mib: record.cuda_vram_limit_mib,
         forkpoint_held: record.forkpoint_held,
@@ -176,6 +177,7 @@ fn machine_entry_from_record(record: &VmRecord, manager: AgentManager) -> Machin
         network: record.network,
         secret_refs: record.secret_refs.clone(),
         source_smolmachine: record.source_smolmachine.clone(),
+        forkable: record.forkable_on_start(),
         cuda_fork_pool_size: record.cuda_fork_pool_size,
         cuda_vram_limit_mib: record.cuda_vram_limit_mib,
         forkpoint_held: record.forkpoint_held,
@@ -1088,7 +1090,7 @@ pub async fn start_machine(
     let record_golden = record.golden.clone();
     let cuda_fork_pool_size = record.cuda_fork_pool_size;
     let cuda_vram_limit_mib = record.cuda_vram_limit_mib;
-    let forkable = query.forkable || query.fork_pool_size.is_some();
+    let forkable = query.forkable || query.fork_pool_size.is_some() || record.forkable_on_start();
     let (manager, pid) = tokio::task::spawn_blocking(move || {
         let manager = AgentManager::for_vm_with_sizes(&name_clone, storage_gb, overlay_gb)
             .map_err(|e| format!("failed to create agent manager: {}", e))?;

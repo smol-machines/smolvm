@@ -528,6 +528,10 @@ pub struct VmRecord {
     #[serde(default)]
     pub cuda: bool,
 
+    /// Start this machine as a copy-on-write fork base by default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub forkable: bool,
+
     /// Planned number of runnable CUDA fork clones. Persisted so every clone
     /// receives the same pre-initialization VRAM policy as its golden.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -621,6 +625,15 @@ fn default_mem() -> u32 {
 }
 
 impl VmRecord {
+    /// Whether an ordinary start should launch this machine as a fork base.
+    ///
+    /// The pool check preserves the behavior of records created before the
+    /// explicit `forkable` field existed. Fork clones inherit CUDA capacity
+    /// settings from their golden, but remain non-forkable leaves.
+    pub fn forkable_on_start(&self) -> bool {
+        self.forkable || (self.golden.is_none() && self.cuda_fork_pool_size.is_some())
+    }
+
     /// Create a new VM record.
     pub fn new(
         name: String,
@@ -669,6 +682,7 @@ impl VmRecord {
             health_startup_grace_secs: None,
             ssh_agent: false,
             cuda: false,
+            forkable: false,
             cuda_fork_pool_size: None,
             cuda_vram_limit_mib: None,
             cuda_preload_modules: false,
@@ -732,6 +746,7 @@ impl VmRecord {
             health_startup_grace_secs: None,
             ssh_agent: false,
             cuda: false,
+            forkable: false,
             cuda_fork_pool_size: None,
             cuda_vram_limit_mib: None,
             cuda_preload_modules: false,
@@ -1358,12 +1373,14 @@ mod tests {
     fn cuda_fork_capacity_policy_roundtrips_and_defaults_absent() {
         let mut record = VmRecord::new("cuda-pool".to_string(), 4, 4096, vec![], vec![], false);
         record.cuda = true;
+        record.forkable = true;
         record.cuda_fork_pool_size = Some(4);
         record.cuda_vram_limit_mib = Some(10240);
         record.cuda_preload_modules = true;
 
         let encoded = serde_json::to_vec(&record).unwrap();
         let decoded: VmRecord = serde_json::from_slice(&encoded).unwrap();
+        assert!(decoded.forkable_on_start());
         assert_eq!(decoded.cuda_fork_pool_size, Some(4));
         assert_eq!(decoded.cuda_vram_limit_mib, Some(10240));
         assert!(decoded.cuda_preload_modules);
@@ -1381,10 +1398,24 @@ mod tests {
         legacy_object.remove("cuda_fork_pool_size");
         legacy_object.remove("cuda_vram_limit_mib");
         legacy_object.remove("cuda_preload_modules");
+        legacy_object.remove("forkable");
         let legacy: VmRecord = serde_json::from_value(legacy_value).unwrap();
         assert_eq!(legacy.cuda_fork_pool_size, None);
         assert_eq!(legacy.cuda_vram_limit_mib, None);
         assert!(!legacy.cuda_preload_modules);
+        assert!(!legacy.forkable_on_start());
+    }
+
+    #[test]
+    fn legacy_cuda_pool_implies_forkable_only_for_a_golden() {
+        let mut golden = VmRecord::new("golden".to_string(), 4, 4096, vec![], vec![], false);
+        golden.cuda_fork_pool_size = Some(8);
+        assert!(golden.forkable_on_start());
+
+        let mut clone = golden.clone();
+        clone.name = "clone".to_string();
+        clone.golden = Some("golden".to_string());
+        assert!(!clone.forkable_on_start());
     }
 
     #[test]

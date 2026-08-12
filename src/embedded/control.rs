@@ -95,6 +95,9 @@ fn start_vm_from_record(record: &VmRecord) -> Result<VmHandle> {
 /// the plain, forkable-golden, and fork-clone start paths so they can't drift.
 fn launch_from_record(record: &VmRecord, features: LaunchFeatures) -> Result<VmHandle> {
     let mut features = features;
+    if record.forkable_on_start() {
+        features.forkable = true;
+    }
     if features.cuda_fork_pool_size.is_none() {
         features.cuda_fork_pool_size = record.cuda_fork_pool_size;
     }
