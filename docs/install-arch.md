@@ -30,9 +30,9 @@ Upgrades arrive with your normal `pacman -Syu`.
 
 ## Notes
 
-- The repository is served from GitHub Pages (the `pacman-repo` branch);
-  packages are built by CI from the release artifacts and published on every
-  release (`.github/workflows/pacman-repo.yml`). It is a rolling repo — the
+- The repository is served from an atomic GitHub Pages deployment; packages are
+  built by CI from the release artifacts and published on every release
+  (`.github/workflows/pacman-repo.yml`). It is a rolling repo — the
   latest release only (older versions remain on the GitHub Releases page).
 - Package signing (GPG) is planned; until then integrity is provided by
   sha256-pinned sources built in CI and served over HTTPS.
