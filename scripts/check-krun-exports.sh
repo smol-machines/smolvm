@@ -10,21 +10,43 @@
 # `blk`/disk API) sails through green and breaks only on a user's machine.
 # This check is that missing dlopen, done statically at build time.
 #
-# Optional symbols (load_optional_sym!) are intentionally NOT required.
+# Most optional symbols (load_optional_sym!) are genuinely optional and NOT
+# required. Some are not: they are resolved optionally because the struct field
+# is an `Option`, but every code path that uses them turns `None` into a hard
+# error rather than falling back. Checking only the load_sym! set is what let a
+# libkrun built without `NET=1` ship green and then fail at machine start with
+# "libkrun does not expose krun_add_net_unixstream" — a dlopen-time contract the
+# dlopen never got to enforce, because the symbol resolves lazily to None.
+# Those are tagged `// required-export` in krun.rs, next to the line that loads
+# them, so the list cannot drift from the code the way a copy here would.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 KRUN_RS="$ROOT/src/agent/krun.rs"
 
-# Source of truth: the identifiers passed to load_sym!(...) (required), not the
-# string literals passed to load_optional_sym!(...) (optional).
-mapfile -t REQUIRED < <(grep -oE 'load_sym!\(krun_[a-z0-9_]+\)' "$KRUN_RS" \
-  | sed -E 's/.*\((krun_[a-z0-9_]+)\)/\1/' | sort -u)
+# Source of truth: identifiers passed to load_sym!(...), plus the string
+# literals of load_optional_sym!(...) lines tagged `// required-export`.
+mapfile -t REQUIRED < <({
+  grep -oE 'load_sym!\(krun_[a-z0-9_]+\)' "$KRUN_RS" \
+    | sed -E 's/.*\((krun_[a-z0-9_]+)\)/\1/'
+  grep -E 'load_optional_sym!\("krun_[a-z0-9_]+"\).*// required-export' "$KRUN_RS" \
+    | grep -oE 'krun_[a-z0-9_]+'
+} | sort -u)
 if [ "${#REQUIRED[@]}" -eq 0 ]; then
   echo "ERROR: parsed 0 required symbols from $KRUN_RS — check the load_sym! pattern"
   exit 1
 fi
-echo "smolvm requires ${#REQUIRED[@]} krun symbols (load_sym!):"
+# A tag that stops matching (renamed macro, reworded comment) would silently
+# shrink the required set back to the load_sym! list, which is the exact failure
+# this check exists to prevent. Assert the tagged ones are actually in it.
+for tagged in $(grep -E '// required-export' "$KRUN_RS" | grep -oE 'krun_[a-z0-9_]+'); do
+  printf '%s\n' "${REQUIRED[@]}" | grep -qxF "$tagged" || {
+    echo "ERROR: '$tagged' is tagged // required-export in $KRUN_RS but was not parsed"
+    echo "into the required set — the load_optional_sym! pattern in this script has drifted."
+    exit 1
+  }
+done
+echo "smolvm requires ${#REQUIRED[@]} krun symbols (load_sym! + required-export):"
 printf '  %s\n' "${REQUIRED[@]}"
 echo
 

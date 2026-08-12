@@ -113,8 +113,16 @@ pub struct ResourceSpec {
     /// them by name. Combine with `allowed_cidrs` to also permit fixed ranges.
     #[serde(default)]
     pub allowed_hosts: Option<Vec<String>>,
-    /// Network backend: `tsi` (default, outbound-only) or `virtio-net`
-    /// (required for published `ports`). Omit for the default (TSI).
+    /// Network backend: `tsi` (outbound-only) or `virtio-net` (required for
+    /// published `ports`).
+    ///
+    /// Omit to let the server choose. The default is conditional, not always
+    /// `tsi`: a networked machine gets `virtio-net` whenever it publishes
+    /// ports, sets an egress policy (`allowed_cidrs`/`allowed_hosts`), or runs
+    /// under a server that enables the internal guest gateway — which the API
+    /// server does for every machine, so machines created through this API
+    /// default to `virtio-net`. Only an outbound-only machine with no policy
+    /// falls to `tsi`. Set this explicitly to pin a backend either way.
     #[serde(default)]
     pub network_backend: Option<crate::network::NetworkBackend>,
 }
@@ -535,8 +543,10 @@ pub struct CreateMachineRequest {
     /// names are learned into the egress allow-list.
     #[serde(default)]
     pub allowed_hosts: Option<Vec<String>>,
-    /// Network backend: `tsi` (default, outbound-only) or `virtio-net`.
-    /// Published `ports` require `virtio-net` (TSI has no inbound path).
+    /// Network backend: `tsi` (outbound-only) or `virtio-net`. Published
+    /// `ports` require `virtio-net` (TSI has no inbound path). Omitted means
+    /// the server chooses; see `CreateMachineRequest::network_backend` — the
+    /// choice is conditional and is `virtio-net` for API-created machines.
     #[serde(default)]
     pub network_backend: Option<crate::network::NetworkBackend>,
     /// Restart policy configuration.
@@ -613,8 +623,11 @@ pub struct MachineInfo {
     pub ports: Vec<PortSpec>,
     /// Whether outbound network access is enabled.
     pub network: bool,
-    /// Network backend the machine runs (`tsi` or `virtio-net`). Omitted when
-    /// unset (the default TSI). Echoes back what `create` accepted.
+    /// Network backend the machine runs (`tsi` or `virtio-net`). Echoes back
+    /// what `create` accepted, so it is omitted when the caller did not pin one
+    /// — the backend the machine actually runs is then the conditional default
+    /// described on `CreateMachineRequest::network_backend`, not necessarily
+    /// `tsi`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub network_backend: Option<crate::network::NetworkBackend>,
     /// Allowed egress CIDRs. Omitted when unrestricted; an empty list denies all.

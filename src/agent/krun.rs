@@ -143,18 +143,26 @@ impl KrunFunctions {
         let add_disk2 = load_sym!(krun_add_disk2);
         let add_vsock_port2 = load_sym!(krun_add_vsock_port2);
         let add_virtiofs = load_sym!(krun_add_virtiofs);
-        let add_virtiofs3 = load_optional_sym!("krun_add_virtiofs3");
+        let add_virtiofs3 = load_optional_sym!("krun_add_virtiofs3"); // required-export
         let start_enter = load_sym!(krun_start_enter);
         let add_vsock = load_sym!(krun_add_vsock);
         let add_virtio_console_default = load_sym!(krun_add_virtio_console_default);
-        let set_egress_policy = load_optional_sym!("krun_set_egress_policy");
-        let add_net_unixstream = load_optional_sym!("krun_add_net_unixstream");
+
+        // Symbols below are resolved optionally because the struct holds them as
+        // `Option`, but the code paths that use them have no fallback: they turn a
+        // missing symbol into a hard error. A lib built without the matching
+        // feature therefore loads fine and fails later, at machine start, on that
+        // platform only. `// required-export` marks those so
+        // scripts/check-krun-exports.sh refuses to ship such a lib — the export
+        // check is the dlopen that CI never performs.
+        let set_egress_policy = load_optional_sym!("krun_set_egress_policy"); // required-export
+        let add_net_unixstream = load_optional_sym!("krun_add_net_unixstream"); // required-export
         let get_egress_handle = load_optional_sym!("krun_get_egress_handle");
         let set_gpu_options2 = load_optional_sym!("krun_set_gpu_options2");
         let get_guest_ram = load_optional_sym!("krun_get_guest_ram");
         let set_control_socket = load_optional_sym!("krun_set_control_socket");
         let set_snapshot = load_optional_sym!("krun_set_snapshot");
-        let create_disk_overlay = load_optional_sym!("krun_create_disk_overlay");
+        let create_disk_overlay = load_optional_sym!("krun_create_disk_overlay"); // required-export
 
         Ok(Self {
             _handle: handle,
