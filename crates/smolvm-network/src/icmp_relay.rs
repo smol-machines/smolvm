@@ -310,8 +310,19 @@ fn create_flow_socket(destination: IpAddr) -> std::io::Result<HostSocket> {
 }
 
 /// Build the raw ICMP echo-request bytes (type byte through payload) sent to a
-/// host ping socket. The kernel overwrites the identifier with the socket's
-/// port and fills the checksum, so both are left zero here.
+/// host ping socket.
+///
+/// The IPv4 checksum is computed here rather than left to the kernel. Linux ping
+/// sockets fill it in; Darwin does not — it transmits the message as handed over,
+/// so a zero checksum goes out on the wire and every reply is lost with no error
+/// anywhere. The identifier is likewise rewritten by Linux (to the socket's port)
+/// but passed through untouched by Darwin, so it is included in the checksummed
+/// bytes as-is; the relay restores the guest's own identifier on the way back
+/// either way.
+///
+/// IPv6 is deliberately left at zero: the ICMPv6 checksum covers a pseudo-header
+/// containing the source address, which the sender does not choose, so the kernel
+/// is required to compute it (RFC 3542).
 fn echo_request_bytes(destination: IpAddr, seq: u16, data: &[u8]) -> Vec<u8> {
     let type_byte = if destination.is_ipv6() {
         ICMPV6_ECHO_REQUEST
@@ -321,18 +332,67 @@ fn echo_request_bytes(destination: IpAddr, seq: u16, data: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(8 + data.len());
     buf.push(type_byte);
     buf.push(0); // code
-    buf.extend_from_slice(&[0, 0]); // checksum (kernel fills)
-    buf.extend_from_slice(&[0, 0]); // identifier (kernel overwrites)
+    buf.extend_from_slice(&[0, 0]); // checksum (filled below for v4)
+    buf.extend_from_slice(&[0, 0]); // identifier
     buf.extend_from_slice(&seq.to_be_bytes());
     buf.extend_from_slice(data);
+    if !destination.is_ipv6() {
+        let checksum = internet_checksum(&buf);
+        buf[2..4].copy_from_slice(&checksum.to_be_bytes());
+    }
     buf
 }
 
-/// Decode a host ping socket's reply (an ICMP message, no IP header) into the
-/// echo `(seq, data)`. The identifier is dropped — the relay restores the
-/// guest's own. Returns `None` for anything that isn't an echo reply (e.g. an
-/// ICMP error the kernel surfaced on the socket).
+/// One's-complement sum of 16-bit words, complemented — the ICMP/IP checksum.
+fn internet_checksum(bytes: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut chunks = bytes.chunks_exact(2);
+    for chunk in &mut chunks {
+        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+    }
+    // A trailing odd byte is padded on the right with zero.
+    if let [last] = chunks.remainder() {
+        sum += (*last as u32) << 8;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// Strip the IP header some platforms prepend to a datagram read from a ping
+/// socket, returning the ICMP message.
+///
+/// Linux hands back the ICMP message alone; Darwin prepends the full IPv4 header
+/// (BSD raw-socket convention), so the reply parser saw `0x45` where it expected
+/// an ICMP type byte and dropped every reply. Detected from the version nibble
+/// rather than `cfg`, because the distinction is a property of the datagram, not
+/// of the build target — and an ICMP echo reply's type byte (0 for v4, 129 for
+/// v6) can never collide with an IP version nibble of 4 or 6.
+fn strip_ip_header(bytes: &[u8]) -> &[u8] {
+    match bytes.first() {
+        Some(first) if first >> 4 == 4 => {
+            let header_len = ((first & 0x0f) as usize) * 4;
+            // A valid IPv4 header is 20-60 bytes; anything else is not one.
+            if (20..=60).contains(&header_len) && bytes.len() > header_len {
+                return &bytes[header_len..];
+            }
+            bytes
+        }
+        // IPv6 headers are a fixed 40 bytes. Not observed in practice (Darwin
+        // does not prepend one for ICMPv6), handled for symmetry.
+        Some(first) if first >> 4 == 6 && bytes.len() > 40 => &bytes[40..],
+        _ => bytes,
+    }
+}
+
+/// Decode a host ping socket's reply into the echo `(seq, data)`. The identifier
+/// is dropped — the relay restores the guest's own. Returns `None` for anything
+/// that isn't an echo reply (e.g. an ICMP error the kernel surfaced on the
+/// socket). Any IP header the platform prepended is stripped first; see
+/// [`strip_ip_header`].
 fn parse_echo_reply(destination: IpAddr, bytes: &[u8]) -> Option<(u16, Vec<u8>)> {
+    let bytes = strip_ip_header(bytes);
     if bytes.len() < 8 {
         return None;
     }
@@ -455,6 +515,77 @@ pub fn build_echo_reply_v6(reply: &IcmpEcho) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Darwin transmits the message exactly as handed to the socket, so a zero
+    /// checksum goes out on the wire and every reply is silently lost. Linux
+    /// happens to fill it in, which is why this only ever failed on macOS.
+    #[test]
+    fn ipv4_echo_request_carries_a_valid_checksum() {
+        let v4 = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
+        let request = echo_request_bytes(v4, 7, b"payload");
+
+        assert_ne!(&request[2..4], &[0, 0], "checksum must not be left zero");
+        // A correct checksum makes the one's-complement sum over the whole
+        // message come out zero.
+        assert_eq!(internet_checksum(&request), 0);
+    }
+
+    /// The ICMPv6 checksum covers a pseudo-header with the source address the
+    /// sender does not choose, so it must stay the kernel's job.
+    #[test]
+    fn ipv6_echo_request_leaves_the_checksum_to_the_kernel() {
+        let v6 = IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111));
+        let request = echo_request_bytes(v6, 7, b"payload");
+        assert_eq!(&request[2..4], &[0, 0]);
+    }
+
+    /// An odd-length payload exercises the trailing-byte path of the checksum.
+    #[test]
+    fn checksum_handles_odd_length_payloads() {
+        let v4 = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+        let request = echo_request_bytes(v4, 1, b"odd");
+        assert_eq!(request.len() % 2, 1);
+        assert_eq!(internet_checksum(&request), 0);
+    }
+
+    /// Darwin prepends the full IPv4 header (BSD raw-socket convention); Linux
+    /// does not. The parser must accept both framings.
+    #[test]
+    fn parses_replies_with_and_without_a_leading_ip_header() {
+        let v4 = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
+        let mut icmp = vec![ICMPV4_ECHO_REPLY, 0, 0, 0, 0x12, 0x34];
+        icmp.extend_from_slice(&9u16.to_be_bytes()); // seq
+        icmp.extend_from_slice(b"payload");
+
+        // Linux framing: ICMP message alone.
+        let (seq, data) = parse_echo_reply(v4, &icmp).expect("bare ICMP reply");
+        assert_eq!(seq, 9);
+        assert_eq!(data, b"payload");
+
+        // Darwin framing: 20-byte IPv4 header in front (version 4, IHL 5).
+        let mut with_header = vec![0x45u8; 20];
+        with_header[0] = 0x45;
+        with_header.extend_from_slice(&icmp);
+        let (seq, data) = parse_echo_reply(v4, &with_header).expect("IP-framed reply");
+        assert_eq!(seq, 9);
+        assert_eq!(data, b"payload");
+    }
+
+    /// The version nibble is only a hint; a malformed leading byte must not make
+    /// the parser slice into the middle of a real message.
+    #[test]
+    fn strip_ip_header_leaves_non_ip_datagrams_alone() {
+        // An echo reply starts with type 0, which is not a version nibble.
+        let icmp = [ICMPV4_ECHO_REPLY, 0, 0, 0, 0, 0, 0, 1, 2, 3];
+        assert_eq!(strip_ip_header(&icmp).len(), icmp.len());
+        // Version 4 but an impossible header length: left untouched.
+        let bogus = [0x40u8, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(strip_ip_header(&bogus).len(), bogus.len());
+        // Truncated: header length exceeds the datagram.
+        let truncated = [0x45u8, 0, 0, 0];
+        assert_eq!(strip_ip_header(&truncated).len(), truncated.len());
+    }
+
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
     use std::sync::atomic::{AtomicBool, Ordering};
