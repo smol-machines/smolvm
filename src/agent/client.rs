@@ -15,6 +15,8 @@ use smolvm_protocol::{
 };
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Events from a streaming exec session.
@@ -111,6 +113,23 @@ const STDIN_BUF_SIZE: usize = 4096;
 /// Short enough for responsive SIGWINCH handling, long enough to avoid busy-waiting.
 const POLL_TIMEOUT_MS: i32 = 100;
 
+/// Poll interval while waiting for writer-queue capacity.
+///
+/// A short interval limits added stdin latency without busy-waiting.
+const BACKPRESSURE_POLL_TIMEOUT_MS: i32 = 5;
+
+/// Maximum frames buffered by the interactive writer.
+///
+/// When full, stdin polling stops, providing backpressure instead of buffering
+/// indefinitely. 64 × 4 KiB stdin frames encode to roughly 350 KiB worst case.
+const WRITER_QUEUE_FRAMES: usize = 64;
+
+/// Write timeout for the interactive writer thread.
+///
+/// A short timeout lets blocked writes periodically observe shutdown.
+/// `WouldBlock` is flow control and is retried from the current frame offset.
+const WRITER_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// Exit code reported when a channel-driven interactive session ends because the
 /// remote peer (e.g. a WebSocket terminal) disconnected rather than the command
 /// exiting. 128 + SIGINT(2), matching the shell convention for an interrupted job.
@@ -140,6 +159,226 @@ impl Drop for ReadTimeoutGuard {
             .set_read_timeout(Some(Duration::from_secs(DEFAULT_READ_TIMEOUT_SECS)))
         {
             tracing::warn!(error = %e, "failed to reset socket read timeout to default");
+        }
+    }
+}
+
+/// Dedicated writer for interactive-session frames.
+///
+/// Keeping socket writes off the session loop lets it continue draining guest
+/// output while writes are blocked, avoiding the full-duplex deadlock in issue #926.
+/// A single writer also lets partial writes resume without corrupting framing.
+struct FrameWriter {
+    /// Queued frames, bounded by [`WRITER_QUEUE_FRAMES`]. Taken (dropped) during
+    /// shutdown so the thread's `recv` returns and `join` cannot deadlock.
+    tx: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    shutdown: Arc<AtomicBool>,
+    /// First fatal write error, published for the session loop to pick up.
+    error: Arc<Mutex<Option<std::io::Error>>>,
+    /// Extra handle to the same socket, kept only to restore the default write
+    /// timeout once the thread is gone.
+    restore: UdsStream,
+}
+
+impl FrameWriter {
+    /// Clone `stream` and start the writer thread on the clone.
+    ///
+    /// Note that socket options are properties of the socket, not of the
+    /// descriptor, so the write timeout set here applies to the caller's handle
+    /// too. That is harmless — an interactive session performs no direct writes
+    /// while the thread lives — and [`Drop`] puts the default back.
+    fn spawn(stream: &UdsStream) -> Result<Self> {
+        let write_half = stream
+            .try_clone()
+            .map_err(|e| Error::agent("clone agent socket", e.to_string()))?;
+        let restore = stream
+            .try_clone()
+            .map_err(|e| Error::agent("clone agent socket", e.to_string()))?;
+        // Best effort; on failure the writer retains the inherited timeout.
+        if let Err(e) = write_half.set_write_timeout(Some(WRITER_WRITE_TIMEOUT)) {
+            tracing::debug!(error = %e, "could not shorten agent socket write timeout");
+        }
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(WRITER_QUEUE_FRAMES);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let error = Arc::new(Mutex::new(None));
+
+        let thread_shutdown = Arc::clone(&shutdown);
+        let thread_error = Arc::clone(&error);
+        let handle = std::thread::Builder::new()
+            .name("smolvm-agent-writer".to_string())
+            .spawn(move || {
+                write_frames(write_half, rx, &thread_shutdown, &thread_error);
+            })
+            .map_err(|e| Error::agent("spawn writer thread", e.to_string()))?;
+
+        Ok(Self {
+            tx: Some(tx),
+            handle: Some(handle),
+            shutdown,
+            error,
+            restore,
+        })
+    }
+
+    /// Queue `frame` without blocking.
+    ///
+    /// Returns `Ok(None)` when queued and `Ok(Some(frame))` — the frame handed
+    /// back — when the queue is full, so the caller can hold it and stop reading
+    /// more input. `Err` means the writer thread is gone.
+    fn try_send(&self, frame: Vec<u8>) -> Result<Option<Vec<u8>>> {
+        let tx = match self.tx.as_ref() {
+            Some(tx) => tx,
+            None => return Err(self.writer_gone_error()),
+        };
+        match tx.try_send(frame) {
+            Ok(()) => Ok(None),
+            Err(std::sync::mpsc::TrySendError::Full(frame)) => Ok(Some(frame)),
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => Err(self.writer_gone_error()),
+        }
+    }
+
+    /// Take the writer's fatal error, if it has hit one.
+    fn take_error(&self) -> Option<std::io::Error> {
+        self.error.lock().ok().and_then(|mut slot| slot.take())
+    }
+
+    /// The error to report when the thread has exited: its own if it stored one,
+    /// otherwise a generic description.
+    fn writer_gone_error(&self) -> Error {
+        match self.take_error() {
+            Some(e) => Error::agent("send message", e.to_string()),
+            None => Error::agent("send message", "agent socket writer stopped".to_string()),
+        }
+    }
+}
+
+impl Drop for FrameWriter {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        // Drop the sender first: a thread parked in `recv` wakes on disconnect,
+        // and one parked in `write` sees the flag at its next timeout tick.
+        self.tx = None;
+        if let Some(handle) = self.handle.take() {
+            if handle.join().is_err() {
+                tracing::warn!("agent socket writer thread panicked");
+            }
+        }
+        if let Err(e) = self
+            .restore
+            .set_write_timeout(Some(Duration::from_secs(DEFAULT_WRITE_TIMEOUT_SECS)))
+        {
+            tracing::warn!(error = %e, "failed to reset socket write timeout to default");
+        }
+    }
+}
+
+/// How writing one frame ended.
+enum FrameOutcome {
+    /// Every byte reached the socket.
+    Done,
+    /// Shutdown was requested before the frame finished.
+    Abandoned,
+    /// The socket rejected the write.
+    Failed(std::io::Error),
+}
+
+/// Body of the writer thread: drain `rx` and write each frame in full.
+fn write_frames(
+    stream: UdsStream,
+    rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    shutdown: &AtomicBool,
+    error: &Mutex<Option<std::io::Error>>,
+) {
+    let mut sink = &stream;
+    // `recv` ends when every sender is dropped, i.e. at session teardown.
+    while let Ok(frame) = rx.recv() {
+        let mut pos = 0;
+        let outcome = loop {
+            if pos == frame.len() {
+                break FrameOutcome::Done;
+            }
+            match sink.write(&frame[pos..]) {
+                Ok(0) => {
+                    break FrameOutcome::Failed(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "agent socket accepted no bytes",
+                    ))
+                }
+                Ok(n) => pos += n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // The send timeout expired because the guest is not draining
+                    // yet — the very condition that used to abort the session.
+                    // Resume from `pos` unless we are shutting down.
+                    if shutdown.load(Ordering::Relaxed) {
+                        break FrameOutcome::Abandoned;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => break FrameOutcome::Failed(e),
+            }
+        };
+
+        match outcome {
+            FrameOutcome::Done => {
+                if let Err(e) = sink.flush() {
+                    store_writer_error(error, e);
+                    return;
+                }
+            }
+            FrameOutcome::Abandoned => {
+                close_write_half_if_truncated(&stream, pos);
+                return;
+            }
+            FrameOutcome::Failed(e) => {
+                store_writer_error(error, e);
+                close_write_half_if_truncated(&stream, pos);
+                return;
+            }
+        }
+    }
+}
+
+/// Close the write half after a partial frame.
+///
+/// Otherwise the peer can wait indefinitely for the remaining bytes or
+/// interpret subsequent data as part of the incomplete frame.
+fn close_write_half_if_truncated(stream: &UdsStream, written: usize) {
+    if written == 0 {
+        return;
+    }
+    tracing::debug!(
+        written,
+        "agent socket writer stopped mid-frame; closing the write half"
+    );
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+}
+
+/// Hand as many queued frames as fit to the writer thread, in order.
+///
+/// Anything left in `pending` means the writer is behind; the session loop then
+/// stops taking new input until this drains, which is what keeps host memory
+/// bounded without ever blocking the loop's read side.
+fn pump_frames(
+    writer: &FrameWriter,
+    pending: &mut std::collections::VecDeque<Vec<u8>>,
+) -> Result<()> {
+    while let Some(frame) = pending.pop_front() {
+        if let Some(frame) = writer.try_send(frame)? {
+            pending.push_front(frame);
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Publish the writer thread's first fatal error.
+fn store_writer_error(slot: &Mutex<Option<std::io::Error>>, err: std::io::Error) {
+    tracing::debug!(error = %err, "agent socket writer failed");
+    if let Ok(mut slot) = slot.lock() {
+        if slot.is_none() {
+            *slot = Some(err);
         }
     }
 }
@@ -1114,10 +1353,14 @@ impl AgentClient {
             None
         };
 
+        // Route session writes through the dedicated writer.
+        let writer = FrameWriter::spawn(&self.stream)?;
+        let mut pending: std::collections::VecDeque<Vec<u8>> = std::collections::VecDeque::new();
+
         // Send initial terminal size so PTY starts at the right dimensions
         if tty {
             if let Some((cols, rows)) = get_terminal_size() {
-                self.send(&AgentRequest::Resize { cols, rows })?;
+                pending.push_back(self.encode_traced(&AgentRequest::Resize { cols, rows })?);
             }
             install_sigwinch_handler();
         }
@@ -1126,9 +1369,8 @@ impl AgentClient {
         let _nonblock_stdin = NonBlockingStdin::new()
             .map_err(|e| Error::agent("set stdin nonblocking", e.to_string()))?;
 
-        // Socket stays blocking — poll() determines readiness, then blocking
-        // read/write completes immediately. This avoids partial-read/write bugs
-        // that occur with non-blocking read_exact/write_all.
+        // Socket reads remain blocking; poll() determines read readiness.
+        // Outbound frames are handled by FrameWriter.
         let mut stdin_handle = stdin();
         let stdin_fd = stdin_raw_fd();
         let socket_fd = self.stream_raw_fd();
@@ -1136,14 +1378,30 @@ impl AgentClient {
         let mut stdin_eof = false;
 
         let exit_code = loop {
-            let effective_stdin_fd = if stdin_eof { -1 } else { stdin_fd };
-            let poll_result = poll_io(effective_stdin_fd, socket_fd, POLL_TIMEOUT_MS)
+            if let Some(e) = writer.take_error() {
+                return Err(Error::agent(op, format!("failed to send to agent: {}", e)));
+            }
+            pump_frames(&writer, &mut pending)?;
+
+            // Stop reading stdin while the writer is backed up, bounding memory use.
+            let backpressured = !pending.is_empty();
+            let effective_stdin_fd = if stdin_eof || backpressured {
+                -1
+            } else {
+                stdin_fd
+            };
+            let poll_timeout = if backpressured {
+                BACKPRESSURE_POLL_TIMEOUT_MS
+            } else {
+                POLL_TIMEOUT_MS
+            };
+            let poll_result = poll_io(effective_stdin_fd, socket_fd, poll_timeout)
                 .map_err(|e| Error::agent("poll", e.to_string()))?;
 
             // Check for terminal resize (SIGWINCH)
             if tty && check_sigwinch() {
                 if let Some((cols, rows)) = get_terminal_size() {
-                    self.send(&AgentRequest::Resize { cols, rows })?;
+                    pending.push_back(self.encode_traced(&AgentRequest::Resize { cols, rows })?);
                 }
             }
 
@@ -1189,23 +1447,27 @@ impl AgentClient {
                 return Err(Error::agent(op, "connection to VM lost".to_string()));
             }
 
-            // Handle stdin input — send to agent
+            // Handle stdin input — queue it for the writer thread
             if poll_result.stdin_ready && !stdin_eof {
                 match stdin_handle.read(&mut stdin_buf) {
                     Ok(0) => {
                         stdin_eof = true;
-                        self.send(&AgentRequest::Stdin { data: Vec::new() })?;
+                        pending.push_back(
+                            self.encode_traced(&AgentRequest::Stdin { data: Vec::new() })?,
+                        );
                     }
                     Ok(n) => {
-                        self.send(&AgentRequest::Stdin {
+                        pending.push_back(self.encode_traced(&AgentRequest::Stdin {
                             data: stdin_buf[..n].to_vec(),
-                        })?;
+                        })?);
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(e) => {
                         tracing::debug!(error = %e, "stdin read error, treating as EOF");
                         stdin_eof = true;
-                        self.send(&AgentRequest::Stdin { data: Vec::new() })?;
+                        pending.push_back(
+                            self.encode_traced(&AgentRequest::Stdin { data: Vec::new() })?,
+                        );
                     }
                 }
             }
@@ -1494,9 +1756,23 @@ impl AgentClient {
         let socket_fd = self.stream_raw_fd();
         let mut input_eof_sent = false;
 
+        // Route channel input through the same writer as `interactive_session`.
+        let writer = FrameWriter::spawn(&self.stream)?;
+        let mut pending: std::collections::VecDeque<Vec<u8>> = std::collections::VecDeque::new();
+
         let exit_code = loop {
+            if let Some(e) = writer.take_error() {
+                return Err(Error::agent(op, format!("failed to send to agent: {}", e)));
+            }
+            pump_frames(&writer, &mut pending)?;
+
             // stdin_fd = -1 → poll() ignores it; only the socket drives readiness.
-            let poll_result = poll_io(-1, socket_fd, POLL_TIMEOUT_MS)
+            let poll_timeout = if pending.is_empty() {
+                POLL_TIMEOUT_MS
+            } else {
+                BACKPRESSURE_POLL_TIMEOUT_MS
+            };
+            let poll_result = poll_io(-1, socket_fd, poll_timeout)
                 .map_err(|e| Error::agent("poll", e.to_string()))?;
 
             // Drain agent output first (prevents deadlock when its send buffer fills).
@@ -1531,18 +1807,22 @@ impl AgentClient {
                 return Err(Error::agent(op, "connection to VM lost".to_string()));
             }
 
-            // Forward any pending input without blocking the output path.
-            loop {
+            // Forward any pending input without blocking the output path. While
+            // the writer queue is backed up the events stay in their source
+            // channel, so backpressure composes instead of buffering here.
+            while pending.is_empty() {
                 match input.try_recv() {
                     Ok(InteractiveInput::Stdin(data)) => {
-                        self.send(&AgentRequest::Stdin { data })?
+                        pending.push_back(self.encode_traced(&AgentRequest::Stdin { data })?)
                     }
                     Ok(InteractiveInput::Resize { cols, rows }) => {
-                        self.send(&AgentRequest::Resize { cols, rows })?
+                        pending.push_back(self.encode_traced(&AgentRequest::Resize { cols, rows })?)
                     }
                     Ok(InteractiveInput::Eof) => {
                         if !input_eof_sent {
-                            self.send(&AgentRequest::Stdin { data: Vec::new() })?;
+                            pending.push_back(
+                                self.encode_traced(&AgentRequest::Stdin { data: Vec::new() })?,
+                            );
                             input_eof_sent = true;
                         }
                     }
@@ -1559,6 +1839,9 @@ impl AgentClient {
                         return Ok(DISCONNECT_EXIT_CODE);
                     }
                 }
+                // Hand the event straight on, so a writer that is keeping up
+                // leaves `pending` empty and this keeps draining the channel.
+                pump_frames(&writer, &mut pending)?;
             }
         };
 
@@ -2812,6 +3095,162 @@ mod run_streaming_tests {
             ]
         );
         server.join().expect("server thread joined cleanly");
+    }
+}
+
+#[cfg(test)]
+mod writer_thread_tests {
+    //! Regression tests for issue #926.
+    //!
+    //! They verify nonblocking enqueueing, retry after write timeout, frame
+    //! ordering, error propagation, and bounded teardown.
+    use super::*;
+    use std::collections::VecDeque;
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+
+    const FRAME_LEN: usize = 4096;
+
+    /// Frames whose byte pattern encodes their index, so a reordered or spliced
+    /// stream is detectable.
+    fn make_frames(count: usize) -> Vec<Vec<u8>> {
+        (0..count).map(|i| vec![i as u8; FRAME_LEN]).collect()
+    }
+
+    /// Shrink both socket buffers so a peer that stops reading wedges the writer
+    /// after a few frames instead of hundreds of KiB.
+    fn shrink_buffers(a: &UdsStream, b: &UdsStream) {
+        for s in [a, b] {
+            let _ = s.as_socket().set_send_buffer_size(FRAME_LEN);
+            let _ = s.as_socket().set_recv_buffer_size(FRAME_LEN);
+        }
+    }
+
+    #[test]
+    fn stalled_peer_does_not_abort_or_reorder_the_stream() {
+        let (client_stream, mut peer) = UdsStream::pair().unwrap();
+        shrink_buffers(&client_stream, &peer);
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("set peer read timeout");
+
+        let frames = make_frames(WRITER_QUEUE_FRAMES + 16);
+        let total: usize = frames.iter().map(|f| f.len()).sum();
+
+        // Peer wedges past a full WRITER_WRITE_TIMEOUT tick before draining, so
+        // the writer must survive at least one expired write mid-frame.
+        let peer_thread = std::thread::spawn(move || {
+            std::thread::sleep(WRITER_WRITE_TIMEOUT + Duration::from_millis(200));
+            let mut received = vec![0u8; total];
+            peer.read_exact(&mut received)
+                .expect("peer reads all bytes");
+            received
+        });
+
+        let writer = FrameWriter::spawn(&client_stream).expect("spawn writer");
+
+        // Queue with the session loop's discipline: one held frame, retried until
+        // it fits. The first WRITER_QUEUE_FRAMES sends must not block.
+        let start = Instant::now();
+        let mut pending: VecDeque<Vec<u8>> = frames.iter().cloned().collect();
+        let mut queued = 0;
+        while queued < WRITER_QUEUE_FRAMES {
+            let frame = pending.pop_front().expect("frames remain");
+            assert!(
+                writer.try_send(frame).expect("writer alive").is_none(),
+                "the first {WRITER_QUEUE_FRAMES} frames must fit in the queue"
+            );
+            queued += 1;
+        }
+        let enqueue_time = start.elapsed();
+        assert!(
+            enqueue_time < Duration::from_millis(500),
+            "enqueueing must not block on a stalled peer (took {enqueue_time:?})"
+        );
+
+        // Remainder: exactly the held-frame retry the session loop performs.
+        while let Some(frame) = pending.pop_front() {
+            let mut held = Some(frame);
+            while let Some(frame) = held.take() {
+                held = writer.try_send(frame).expect("writer alive");
+                if held.is_some() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+
+        let received = peer_thread.join().expect("peer thread joined");
+        assert_eq!(
+            received,
+            frames.concat(),
+            "every frame must arrive whole and in order"
+        );
+        assert!(
+            writer.take_error().is_none(),
+            "a slow peer is not a write error"
+        );
+        drop(writer);
+    }
+
+    #[test]
+    fn teardown_does_not_hang_on_a_wedged_peer() {
+        let (client_stream, peer) = UdsStream::pair().unwrap();
+        shrink_buffers(&client_stream, &peer);
+
+        let writer = FrameWriter::spawn(&client_stream).expect("spawn writer");
+        // Push until the queue backs up, which means the socket buffers are full
+        // and the writer thread is parked inside write() — the wedged-guest state.
+        let mut wedged = false;
+        for frame in make_frames(4 * WRITER_QUEUE_FRAMES) {
+            if writer.try_send(frame).expect("writer alive").is_some() {
+                wedged = true;
+                break;
+            }
+        }
+        assert!(
+            wedged,
+            "peer never applied backpressure; test is not exercising a parked writer"
+        );
+
+        let start = Instant::now();
+        drop(writer);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < WRITER_WRITE_TIMEOUT * 3,
+            "dropping the writer must not wait on the peer (took {elapsed:?})"
+        );
+        drop(peer);
+    }
+
+    #[test]
+    fn write_error_is_published_instead_of_lost() {
+        let (client_stream, peer) = UdsStream::pair().unwrap();
+        shrink_buffers(&client_stream, &peer);
+
+        let writer = FrameWriter::spawn(&client_stream).expect("spawn writer");
+        drop(peer); // Connection dies mid-session: broken pipe on the next write.
+
+        // The session loop learns of the failure one iteration late, either from
+        // the error slot or from a send onto the now-dead channel.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut reported = false;
+        while Instant::now() < deadline {
+            if writer.take_error().is_some() {
+                reported = true;
+                break;
+            }
+            match writer.try_send(vec![0u8; FRAME_LEN]) {
+                Ok(_) => std::thread::sleep(Duration::from_millis(10)),
+                Err(e) => {
+                    assert!(
+                        e.to_string().contains("send message"),
+                        "writer failure must surface as a send error, got: {e}"
+                    );
+                    reported = true;
+                    break;
+                }
+            }
+        }
+        assert!(reported, "a dead socket must surface as an error");
     }
 }
 
