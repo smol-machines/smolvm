@@ -159,8 +159,68 @@ pub fn parse_size_bytes(s: &str) -> Result<u64, String> {
     Ok(bytes)
 }
 
+/// Parse repeated `--label key=value` pairs into machine labels.
+///
+/// Lives in the library rather than a front end because both CLIs and SDK
+/// callers set labels: two parsers would eventually disagree about where the key
+/// ends, and a label the writer and the reader parse differently is worse than
+/// no label at all.
+///
+/// Split on the FIRST `=` only, so values may contain `=` (base64, query
+/// strings). An empty key is rejected: it would be unaddressable, and silently
+/// keeping it would corrupt `machine ls --json` for the caller reading it back.
+pub fn parse_labels(raw: &[String]) -> crate::Result<std::collections::BTreeMap<String, String>> {
+    let mut labels = std::collections::BTreeMap::new();
+    for entry in raw {
+        let Some((key, value)) = entry.split_once('=') else {
+            return Err(crate::Error::config(
+                "--label",
+                format!("expected KEY=VALUE, got '{entry}'"),
+            ));
+        };
+        if key.is_empty() {
+            return Err(crate::Error::config(
+                "--label",
+                format!("label key cannot be empty (in '{entry}')"),
+            ));
+        }
+        labels.insert(key.to_string(), value.to_string());
+    }
+    Ok(labels)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parses_labels_and_keeps_values_containing_equals() {
+        let labels = super::parse_labels(&[
+            "owner=exo".to_string(),
+            // Values are opaque to smolvm, so `=` inside one must survive.
+            "token=abc=def==".to_string(),
+            "empty=".to_string(),
+        ])
+        .expect("valid labels");
+        assert_eq!(labels.get("owner").map(String::as_str), Some("exo"));
+        assert_eq!(labels.get("token").map(String::as_str), Some("abc=def=="));
+        assert_eq!(labels.get("empty").map(String::as_str), Some(""));
+    }
+
+    #[test]
+    fn rejects_labels_that_could_not_be_read_back() {
+        // No separator: treating this as a valueless key would hand the caller
+        // back something they never wrote.
+        assert!(super::parse_labels(&["notakeyvalue".to_string()]).is_err());
+        // Empty key is unaddressable.
+        assert!(super::parse_labels(&["=value".to_string()]).is_err());
+    }
+
+    #[test]
+    fn later_label_wins_for_a_repeated_key() {
+        let labels = super::parse_labels(&["k=first".to_string(), "k=second".to_string()])
+            .expect("valid labels");
+        assert_eq!(labels.get("k").map(String::as_str), Some("second"));
+    }
+
     use super::*;
     use std::collections::HashSet;
 

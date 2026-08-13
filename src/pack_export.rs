@@ -48,6 +48,17 @@ pub struct FromVmAssets {
     pub mode: PackMode,
     /// The machine's image reference (image-based machines only).
     pub image: Option<String>,
+    /// The image's OCI `ENV`, as `KEY=VALUE`.
+    ///
+    /// A running machine gets these because the agent reads the image config at
+    /// exec time, but flattening the layers leaves the pack with no image config
+    /// to read — so they have to travel in the manifest instead, or the packed
+    /// machine loses the image's `PATH` and every other declared variable.
+    ///
+    /// Empty for a bare machine, and for a machine created from a `.smolmachine`:
+    /// that path already copied the source manifest's env into the record, so the
+    /// machine's own env is the complete set.
+    pub image_env: Vec<String>,
 }
 
 /// Collect a stopped machine's pack assets into `collector` and report the
@@ -93,6 +104,11 @@ pub fn collect_from_vm_assets(
         ));
     }
 
+    // Only the registry path can report the image's declared env: an artifact
+    // machine already carries the source manifest's env in its own record, and a
+    // bare machine has no image at all.
+    let mut image_env: Vec<String> = Vec::new();
+
     if is_artifact_sourced && !opts.rebase_from_image {
         export_flattened_from_artifact_sourced(collector, vm_name, &vm_dir, staging_dir)?;
     } else if is_image_based {
@@ -114,7 +130,8 @@ pub fn collect_from_vm_assets(
                 ),
             ));
         }
-        export_flattened_from_registry_image(collector, vm_name, &vm_dir, &image, opts)?;
+        image_env =
+            export_flattened_from_registry_image(collector, vm_name, &vm_dir, &image, opts)?;
     } else {
         // Bare VM: its state is the rootfs overlay disk. VM-mode restores boot
         // from the template; a default-size overlay is a qcow2 CoW image and
@@ -140,6 +157,7 @@ pub fn collect_from_vm_assets(
             PackMode::Vm
         },
         image: vm.image.clone(),
+        image_env,
     })
 }
 
@@ -159,9 +177,30 @@ pub fn seed_manifest_from_vm(manifest: &mut PackManifest, vm: &VmRecord, assets:
         vec!["/bin/sh".to_string()]
     };
     manifest.cmd = vm.cmd.clone();
-    manifest.env = vm.env.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+    manifest.env = merge_env(&assets.image_env, &vm.env);
     manifest.workdir = vm.workdir.clone();
     manifest.secret_refs = vm.secret_refs.clone();
+}
+
+/// Layer a machine's own env over the image's declared env, as `KEY=VALUE`.
+///
+/// This is the order a running machine resolves: the agent applies the image
+/// config first, then whatever the machine was created with. Packing has to
+/// reproduce it, because flattening the layers leaves no image config for the
+/// packed machine to read — the image's `PATH` in particular only survives if it
+/// travels in the manifest.
+fn merge_env(image_env: &[String], vm_env: &[(String, String)]) -> Vec<String> {
+    let mut merged = image_env.to_vec();
+    for (key, value) in vm_env {
+        merged.retain(|entry| {
+            entry
+                .split_once('=')
+                .map(|(existing, _)| existing != key)
+                .unwrap_or(true)
+        });
+        merged.push(format!("{key}={value}"));
+    }
+    merged
 }
 
 /// A helper VM used to read the source machine's disks and flatten layers.
@@ -294,7 +333,7 @@ fn export_flattened_from_registry_image(
     vm_dir: &Path,
     image: &str,
     opts: &FromVmExportOptions,
-) -> crate::Result<()> {
+) -> crate::Result<Vec<String>> {
     let export_vm = ExportVm::start(vm_name, vm_dir, None, true)?;
     let mut client = export_vm.connect()?;
     export_vm.mount_source_storage(&mut client)?;
@@ -318,7 +357,8 @@ fn export_flattened_from_registry_image(
         })
         .collect();
 
-    flatten_and_export(collector, &mut client, vm_name, &lowers)
+    flatten_and_export(collector, &mut client, vm_name, &lowers)?;
+    Ok(image_info.env)
 }
 
 /// Artifact-sourced machine: its extracted layer dirs live in the host-side
@@ -435,51 +475,24 @@ fn flatten_and_export(
     if lowers.is_empty() {
         return Err(Error::agent("flatten layers", "no layers to flatten"));
     }
+    // Topmost first, which is the order the agent stacks them in: the machine's
+    // own writes outrank every image layer, then the image layers from top down.
+    // `lowers` arrives bottom-up as the image lists them, so it has to be
+    // reversed — leaving it as-is makes the base layer win every conflict.
+    // The agent drops the overlay if the machine never wrote to it, so it needs
+    // no probe from here.
     let upper = format!("/mnt/source-storage/overlays/persistent-{}/upper", vm_name);
-    // overlayfs wants topmost-first in `lowerdir=`.
-    let base_chain: Vec<&str> = lowers.iter().rev().map(String::as_str).collect();
-    let base_chain = base_chain.join(":");
+    let mut stack: Vec<String> = vec![upper];
+    stack.extend(lowers.iter().rev().cloned());
 
     println!(
         "Flattening {} layer(s) + container overlay...",
         lowers.len()
     );
-    let script = format!(
-        "set -e\n\
-         low='{base_chain}'\n\
-         n={n}\n\
-         if [ -d '{upper}' ] && [ -n \"$(ls -A '{upper}' 2>/dev/null)\" ]; then\n\
-           low=\"{upper}:$low\"; n=$((n+1))\n\
-         fi\n\
-         if [ \"$n\" -eq 1 ]; then\n\
-           tar cf /storage/flat-export.tar -C \"${{low%%:*}}\" .\n\
-         else\n\
-           mkdir -p /tmp/flatview\n\
-           mount -t overlay overlay -o lowerdir=\"$low\" /tmp/flatview\n\
-           tar cf /storage/flat-export.tar -C /tmp/flatview .\n\
-           umount /tmp/flatview\n\
-         fi\n\
-         echo FLAT_OK\n",
-        n = lowers.len(),
-    );
-    let (exit_code, stdout, stderr) = client.vm_exec(
-        vec!["sh".to_string(), "-c".to_string(), script],
-        vec![],
-        None,
-        None,
-        None,
-    )?;
-    let stdout_str = String::from_utf8_lossy(&stdout);
-    if exit_code != 0 || !stdout_str.contains("FLAT_OK") {
-        return Err(Error::agent(
-            "flatten layers",
-            format!(
-                "flatten failed (exit {}): {}",
-                exit_code,
-                String::from_utf8_lossy(&stderr)
-            ),
-        ));
-    }
+    // Driven agent-side rather than through `mount(8)` over VmExec: `mount(8)`
+    // rejects a `lowerdir=` value past ~255 bytes, which any image with four or
+    // more layers exceeds.
+    client.flatten_layers(&stack, "/storage/flat-export.tar")?;
 
     // Stream the flattened tar to disk (never buffered whole in memory), then
     // content-address it. Stage in the layers dir so the final rename is
@@ -633,4 +646,55 @@ fn read_qcow2_virtual_size(path: &Path) -> crate::Result<u64> {
         ));
     }
     Ok(u64::from_be_bytes(header[24..32].try_into().unwrap()))
+}
+
+#[cfg(test)]
+mod env_merge_tests {
+    use super::merge_env;
+
+    /// The image's `PATH` is what makes its binaries resolve, so a machine that
+    /// set no env of its own must still carry the image's.
+    #[test]
+    fn image_env_survives_when_the_machine_adds_none() {
+        let image = vec![
+            "PATH=/usr/local/bin:/usr/bin:/usr/lib/postgresql/16/bin".to_string(),
+            "PG_VERSION=16.14".to_string(),
+        ];
+        assert_eq!(merge_env(&image, &[]), image);
+    }
+
+    /// A machine created with `-e` overrides the image rather than appending a
+    /// second entry for the same key, which would leave the winner to whichever
+    /// end of the vector the consumer happens to read last.
+    #[test]
+    fn machine_env_replaces_the_image_entry_for_the_same_key() {
+        let image = vec!["PATH=/usr/bin".to_string(), "LANG=C".to_string()];
+        let vm = vec![
+            ("PATH".to_string(), "/opt/bin".to_string()),
+            ("EXTRA".to_string(), "1".to_string()),
+        ];
+
+        let merged = merge_env(&image, &vm);
+
+        assert_eq!(
+            merged,
+            vec![
+                "LANG=C".to_string(),
+                "PATH=/opt/bin".to_string(),
+                "EXTRA=1".to_string()
+            ]
+        );
+        assert_eq!(
+            merged.iter().filter(|e| e.starts_with("PATH=")).count(),
+            1,
+            "exactly one PATH entry"
+        );
+    }
+
+    /// A bare machine has no image, so the machine's env is the whole set.
+    #[test]
+    fn machine_env_stands_alone_without_an_image() {
+        let vm = vec![("FOO".to_string(), "bar".to_string())];
+        assert_eq!(merge_env(&[], &vm), vec!["FOO=bar".to_string()]);
+    }
 }

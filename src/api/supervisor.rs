@@ -291,6 +291,7 @@ impl Supervisor {
         let dns_filter_hosts = record.dns_filter_hosts.clone();
         let cuda_fork_pool_size = record.cuda_fork_pool_size;
         let cuda_vram_limit_mib = record.cuda_vram_limit_mib;
+        let forkable = record.forkable_on_start();
         let name_for_features = name.to_string();
 
         let entry_clone = entry.clone();
@@ -304,6 +305,7 @@ impl Supervisor {
             )?;
             features.cuda_fork_pool_size = cuda_fork_pool_size;
             features.cuda_vram_limit_mib = cuda_vram_limit_mib;
+            features.forkable = forkable;
             entry
                 .manager
                 .ensure_running_via_subprocess(mounts, ports, resources, features)

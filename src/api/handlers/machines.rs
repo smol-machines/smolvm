@@ -108,6 +108,7 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
         // when unset.
         storage_gb: Some(record.storage_gb.unwrap_or(DEFAULT_STORAGE_SIZE_GIB)),
         overlay_gb: Some(record.overlay_gb.unwrap_or(DEFAULT_OVERLAY_SIZE_GIB)),
+        forkable: record.forkable_on_start(),
         cuda_fork_pool_size: record.cuda_fork_pool_size,
         cuda_vram_limit_mib: record.cuda_vram_limit_mib,
         forkpoint_held: record.forkpoint_held,
@@ -176,6 +177,7 @@ fn machine_entry_from_record(record: &VmRecord, manager: AgentManager) -> Machin
         network: record.network,
         secret_refs: record.secret_refs.clone(),
         source_smolmachine: record.source_smolmachine.clone(),
+        forkable: record.forkable_on_start(),
         cuda_fork_pool_size: record.cuda_fork_pool_size,
         cuda_vram_limit_mib: record.cuda_vram_limit_mib,
         forkpoint_held: record.forkpoint_held,
@@ -263,6 +265,9 @@ fn shutdown_machine_process(
                 .map(|mut c| c.ping().is_ok())
                 .unwrap_or(false);
             if !reachable {
+                if let Err(error) = crate::agent::cleanup_dead_vm_runtime(name) {
+                    tracing::warn!(%name, %error, "failed to clean runtime after VM teardown");
+                }
                 return true;
             }
             std::thread::sleep(std::time::Duration::from_millis(300));
@@ -274,6 +279,9 @@ fn shutdown_machine_process(
         return false;
     }
 
+    if let Err(error) = crate::agent::cleanup_dead_vm_runtime(name) {
+        tracing::warn!(%name, %error, "failed to clean runtime after VM teardown");
+    }
     true
 }
 
@@ -991,6 +999,28 @@ pub async fn start_machine(
         return Ok(Json(record_to_info(&name, &record)));
     }
 
+    if resolved == RecordState::Frozen {
+        let db = state.db().clone();
+        let golden = name.clone();
+        let clones = tokio::task::spawn_blocking(move || db.dependent_clones(&golden))
+            .await
+            .map_err(|e| ApiError::internal(format!("task error: {e}")))?
+            .map_err(ApiError::database)?;
+        let reason = if clones.is_empty() {
+            "it retains a reusable fork checkpoint; stop it before restarting, or fork it again"
+                .to_string()
+        } else {
+            format!(
+                "it is the fork base for {} live clone(s) ({}); delete the clones first",
+                clones.len(),
+                clones.join(", ")
+            )
+        };
+        return Err(ApiError::Conflict(format!(
+            "machine '{name}' is frozen because {reason}"
+        )));
+    }
+
     if resolved == RecordState::Unreachable {
         // Zombie: verified-kill the VMM and clear the DB record
         // before falling through to a clean fresh start. Any stale
@@ -1060,7 +1090,7 @@ pub async fn start_machine(
     let record_golden = record.golden.clone();
     let cuda_fork_pool_size = record.cuda_fork_pool_size;
     let cuda_vram_limit_mib = record.cuda_vram_limit_mib;
-    let forkable = query.forkable || query.fork_pool_size.is_some();
+    let forkable = query.forkable || query.fork_pool_size.is_some() || record.forkable_on_start();
     let (manager, pid) = tokio::task::spawn_blocking(move || {
         let manager = AgentManager::for_vm_with_sizes(&name_clone, storage_gb, overlay_gb)
             .map_err(|e| format!("failed to create agent manager: {}", e))?;
@@ -1533,7 +1563,7 @@ pub(crate) async fn fork_held_machines_inner(
     let mut rollback_completed = true;
     if !any_succeeded && !snapshot_reused {
         if resume_golden_on_rollback {
-            if let Err(error) = crate::agent::fork::resume_golden(&golden) {
+            if let Err(error) = crate::agent::fork::resume_golden(&golden, &snapshot_dir) {
                 tracing::warn!(%golden, %error, "failed to resume golden after batch restore failure");
                 rollback_completed = false;
             }

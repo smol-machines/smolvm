@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>smolvm apt repository</title>
+  <link rel="stylesheet" href="../site.css">
+</head>
+<body>
+  <h1>smolvm apt repository</h1>
+  <pre>echo 'deb [trusted=yes] https://smol-machines.github.io/smolvm/apt ./' | sudo tee /etc/apt/sources.list.d/smolvm.list
+sudo apt-get update
+sudo apt-get install smolvm</pre>
+  <p><a href="Packages">Packages</a> · <a href="Packages.gz">Packages.gz</a></p>
+  <footer><a href="../">Downloads</a> · <a href="https://github.com/smol-machines/smolvm/blob/main/docs/install-debian.md">Documentation</a></footer>
+</body>
+</html>

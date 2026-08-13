@@ -113,8 +113,14 @@ pub struct ResourceSpec {
     /// them by name. Combine with `allowed_cidrs` to also permit fixed ranges.
     #[serde(default)]
     pub allowed_hosts: Option<Vec<String>>,
-    /// Network backend: `tsi` (default, outbound-only) or `virtio-net`
-    /// (required for published `ports`). Omit for the default (TSI).
+    /// Network backend: `tsi` (outbound-only) or `virtio-net`.
+    ///
+    /// When omitted the backend is chosen from context: machines managed by
+    /// `smolvm serve` (every API machine), machines with published `ports`,
+    /// an egress policy (`allowedCidrs`/`allowedHosts`) or fleet mode default
+    /// to `virtio-net`; only outbound-only machines launched outside `serve`
+    /// (plain CLI) default to `tsi`. Set `tsi` explicitly to force the
+    /// lighter outbound-only backend (rejected alongside published `ports`).
     #[serde(default)]
     pub network_backend: Option<crate::network::NetworkBackend>,
 }
@@ -535,8 +541,15 @@ pub struct CreateMachineRequest {
     /// names are learned into the egress allow-list.
     #[serde(default)]
     pub allowed_hosts: Option<Vec<String>>,
-    /// Network backend: `tsi` (default, outbound-only) or `virtio-net`.
-    /// Published `ports` require `virtio-net` (TSI has no inbound path).
+    /// Network backend: `tsi` (outbound-only) or `virtio-net`.
+    ///
+    /// When omitted, machines created through the API default to `virtio-net`:
+    /// the server configures a guest host-service (the rollout ingress), and
+    /// published `ports`, egress policies and fleet mode need virtio-net too.
+    /// (`tsi` is the default only for outbound-only machines launched outside
+    /// `smolvm serve`.) Set `tsi` explicitly for the lighter outbound-only
+    /// backend; published `ports` require `virtio-net` (TSI has no inbound
+    /// path), so that combination is rejected.
     #[serde(default)]
     pub network_backend: Option<crate::network::NetworkBackend>,
     /// Restart policy configuration.
@@ -613,8 +626,10 @@ pub struct MachineInfo {
     pub ports: Vec<PortSpec>,
     /// Whether outbound network access is enabled.
     pub network: bool,
-    /// Network backend the machine runs (`tsi` or `virtio-net`). Omitted when
-    /// unset (the default TSI). Echoes back what `create` accepted.
+    /// Network backend the machine runs (`tsi` or `virtio-net`). Echoes back
+    /// what `create` accepted; omitted when `create` left it unset (the
+    /// launch then picks the contextual default — `virtio-net` under
+    /// `smolvm serve`, with ports, or with an egress policy; `tsi` otherwise).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub network_backend: Option<crate::network::NetworkBackend>,
     /// Allowed egress CIDRs. Omitted when unrestricted; an empty list denies all.
@@ -631,6 +646,8 @@ pub struct MachineInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = 2)]
     pub overlay_gb: Option<u64>,
+    /// Whether ordinary starts launch this machine as a fork base.
+    pub forkable: bool,
     /// Planned runnable CUDA clone count used for automatic capacity budgeting.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cuda_fork_pool_size: Option<u32>,

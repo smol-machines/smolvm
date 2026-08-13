@@ -1,59 +1,61 @@
-name: Publish pacman repo
+name: Publish package repositories
 
-# Builds Arch packages from the release binaries and publishes them to the
-# GitHub Pages `pacman-repo` branch, served at
-# https://smol-machines.github.io/smolvm/pacman/$arch — a single stable
-# repository endpoint (no per-arch release entries). See docs/install-arch.md.
-#
-# Triggers:
-#  - workflow_call: invoked by release.yml right after it creates the GitHub
-#    Release. This is the real automation path — the `release: published` event
-#    does NOT fire here on its own, because that release is created with the
-#    default GITHUB_TOKEN and GitHub does not start workflows from token-created
-#    releases (same reason release.yml pings the Homebrew tap explicitly).
-#  - workflow_dispatch: manual re-run / backfill for a given tag.
-#  - release: kept as a safety net for releases published by a human/PAT.
+# Builds the rolling pacman, apt, and yum repositories from a smolvm release
+# and deploys the complete site as a GitHub Pages artifact. Package binaries
+# never enter Git history, while the existing /smolvm/{pacman,apt,yum} URLs stay
+# unchanged.
 on:
   release:
     types: [published]
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag to package (e.g. v1.5.0)'
+        description: 'Release tag to package (e.g. v1.7.7)'
         required: true
+      publish:
+        description: 'Deploy the assembled repositories to GitHub Pages'
+        required: true
+        type: boolean
+        default: true
+      preserve_legacy_snapshot:
+        description: 'Deploy the current pacman-repo branch byte-for-byte for migration'
+        required: true
+        type: boolean
+        default: false
   workflow_call:
     inputs:
       tag:
-        description: 'Release tag to package (e.g. v1.5.0)'
+        description: 'Release tag to package (e.g. v1.7.7)'
         required: true
         type: string
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: package-pages
+  cancel-in-progress: false
 
 jobs:
-  publish:
+  build-pacman:
+    name: Build pacman repository
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.preserve_legacy_snapshot }}
     runs-on: ubuntu-latest
     container:
       image: archlinux:base-devel
-      # fakeroot's SysV IPC breaks under GitHub's default container seccomp
-      # profile ("libfakeroot: payload not recognized" during makepkg package());
-      # unconfined seccomp lets faked's msgsnd/msgrcv through.
       options: --security-opt seccomp=unconfined
-    env:
-      GH_TOKEN: ${{ github.token }}
     steps:
       - name: Resolve tag
         id: tag
         run: |
-          TAG='${{ github.event.release.tag_name || inputs.tag }}'
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "pkgver=${TAG#v}" >> "$GITHUB_OUTPUT"
+          tag='${{ github.event.release.tag_name || inputs.tag }}'
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
 
       - name: Install tooling
         run: pacman -Syu --noconfirm pacman-contrib git
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Prepare build user
         run: |
@@ -62,44 +64,243 @@ jobs:
           cp -r packaging/arch /home/builder/build
           chown -R builder /home/builder/build
 
-      - name: Build packages (both arches; repackage-only, no compilation)
+      - name: Build packages
         run: |
           cd /home/builder/build
-          sed -i "s/^pkgver=.*/pkgver=${{ steps.tag.outputs.pkgver }}/; s/^pkgrel=.*/pkgrel=1/" PKGBUILD
+          sed -i \
+            "s/^pkgver=.*/pkgver=${{ steps.tag.outputs.version }}/; s/^pkgrel=.*/pkgrel=1/" \
+            PKGBUILD
           sudo -u builder updpkgsums
           sudo -u builder makepkg -df --noconfirm
           sudo -u builder env CARCH=aarch64 makepkg -df --noconfirm --ignorearch
-          ls -l *.pkg.tar.zst
 
-      - name: Publish to the GitHub Pages pacman repo (branch pacman-repo)
+      - name: Assemble pacman repository
         run: |
-          cd /home/builder/build
-          git config --global user.name  'github-actions[bot]'
-          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          git config --global --add safe.directory '*'
-          # Pages serves the pacman-repo branch at https://<owner>.github.io/<repo>/
-          # (Deploy from a branch); the pacman endpoint is pacman/$arch/. Pushing
-          # to the branch triggers the Pages build.
-          auth="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          git clone --depth 1 --branch pacman-repo "$auth" pages
+          set -euo pipefail
+          source_dir=/home/builder/build
+          site="$GITHUB_WORKSPACE/package-site/pacman"
           for arch in x86_64 aarch64; do
-            dir="pages/pacman/$arch"
-            mkdir -p "$dir"
-            # Rolling repo: keep only the current version's package so the branch
-            # stays small. repo-add then builds a fresh single-entry db.
-            rm -f "$dir"/smolvm-*.pkg.tar.zst "$dir"/smol-machines.db* "$dir"/smol-machines.files*
-            cp smolvm-*-"$arch".pkg.tar.zst "$dir/"
+            mkdir -p "$site/$arch"
+            cp "$source_dir"/smolvm-*-$arch.pkg.tar.zst "$site/$arch/"
             (
-              cd "$dir"
-              repo-add smol-machines.db.tar.gz smolvm-*-"$arch".pkg.tar.zst
-              # GitHub Pages does not serve broken symlinks — materialize the
-              # convenience `.db`/`.files` names as real copies of their targets.
+              cd "$site/$arch"
+              repo-add smol-machines.db.tar.gz smolvm-*-$arch.pkg.tar.zst
               cp --remove-destination "$(readlink -f smol-machines.db)" smol-machines.db
               cp --remove-destination "$(readlink -f smol-machines.files)" smol-machines.files
             )
           done
-          cd pages
-          git add -A
-          git commit -m "pacman: publish ${{ steps.tag.outputs.tag }}" \
-            || { echo "no package changes to publish"; exit 0; }
-          git push origin pacman-repo
+
+      - name: Upload pacman repository
+        uses: actions/upload-artifact@v7
+        with:
+          name: pacman-repository
+          path: package-site/pacman
+          if-no-files-found: error
+          retention-days: 1
+
+  build-deb-rpm:
+    name: Build apt and yum repositories
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.preserve_legacy_snapshot }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag
+        id: tag
+        run: |
+          tag='${{ github.event.release.tag_name || inputs.tag }}'
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v6
+
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends dpkg-dev createrepo-c jq curl ca-certificates
+          url=$(curl -fsSL https://api.github.com/repos/goreleaser/nfpm/releases/latest \
+            | jq -r '.assets[] | select(.name|test("_amd64\\.deb$")) | .browser_download_url')
+          curl -fsSL "$url" -o /tmp/nfpm.deb
+          sudo dpkg -i /tmp/nfpm.deb
+
+      - name: Build packages
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          build() {
+            local release_arch="$1" package_arch="$2"
+            curl -fsSL \
+              "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/smolvm-${VERSION}-linux-${release_arch}.tar.gz" \
+              -o tarball.tgz
+            rm -rf pkgroot
+            mkdir pkgroot
+            tar -xzf tarball.tgz --strip-components=1 -C pkgroot
+            cp packaging/deb/copyright pkgroot/copyright
+            sed -i \
+              -e 's|^SMOLVM_BIN=.*|SMOLVM_BIN=/usr/lib/smolvm/smolvm-bin|' \
+              -e 's|^SMOLVM_LIB=.*|SMOLVM_LIB=/usr/lib/smolvm/lib|' \
+              -e 's|^SMOLVM_BUNDLED_ROOTFS=.*|SMOLVM_BUNDLED_ROOTFS=/usr/lib/smolvm/agent-rootfs|' \
+              pkgroot/smolvm
+            find pkgroot/lib -type f -name '*.so*' -exec chmod 0644 {} +
+            export NFPM_ARCH="$package_arch" NFPM_VERSION="$VERSION"
+            nfpm package -f packaging/nfpm.yaml -p deb -t out/
+            nfpm package -f packaging/nfpm.yaml -p rpm -t out/
+          }
+          build x86_64 amd64
+          build arm64 arm64
+
+      - name: Assemble apt and yum repositories
+        run: |
+          set -euo pipefail
+          site="$GITHUB_WORKSPACE/package-site"
+          mkdir -p "$site/apt" "$site/yum"
+          cp out/*.deb "$site/apt/"
+          (cd "$site/apt" && dpkg-scanpackages --multiversion . > Packages && gzip -9 -k Packages)
+          cp out/*.rpm "$site/yum/"
+          createrepo_c "$site/yum"
+
+      - name: Upload apt and yum repositories
+        uses: actions/upload-artifact@v7
+        with:
+          name: system-repositories
+          path: package-site
+          if-no-files-found: error
+          retention-days: 1
+
+  deploy:
+    name: Deploy package repositories
+    if: ${{ github.event_name != 'workflow_dispatch' || (inputs.publish && !inputs.preserve_legacy_snapshot) }}
+    needs: [build-pacman, build-deb-rpm]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Assemble static site
+        run: cp -R packaging/repos/site site
+
+      - name: Download pacman repository
+        uses: actions/download-artifact@v8
+        with:
+          name: pacman-repository
+          path: site/pacman
+
+      - name: Download apt and yum repositories
+        uses: actions/download-artifact@v8
+        with:
+          name: system-repositories
+          path: site
+
+      - name: Add architecture indexes
+        run: |
+          for arch in x86_64 aarch64; do
+            sed "s/{{ARCH}}/$arch/g" packaging/repos/pacman-arch-index.html \
+              > "site/pacman/$arch/index.html"
+          done
+
+      - name: Validate repository site
+        run: |
+          set -euo pipefail
+          test "$(find site/pacman -name 'smolvm-*.pkg.tar.zst' | wc -l)" -eq 2
+          test "$(find site/apt -name '*.deb' | wc -l)" -eq 2
+          test "$(find site/yum -name '*.rpm' | wc -l)" -eq 2
+          test -s site/pacman/x86_64/smol-machines.db
+          test -s site/pacman/aarch64/smol-machines.db
+          test -s site/apt/Packages.gz
+          test -s site/yum/repodata/repomd.xml
+          if find site -type l | grep -q .; then
+            echo 'Package site must not contain symlinks'
+            exit 1
+          fi
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+      - name: Deploy GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+  stage-legacy-snapshot:
+    name: Stage legacy repository snapshot
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.preserve_legacy_snapshot }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out legacy repository
+        uses: actions/checkout@v6
+        with:
+          ref: pacman-repo
+          path: legacy
+          fetch-depth: 1
+
+      - name: Export exact repository snapshot
+        run: |
+          mkdir site
+          git -C legacy archive HEAD | tar -x -C site
+
+      - name: Validate repository site
+        run: |
+          set -euo pipefail
+          test "$(find site/pacman -name 'smolvm-*.pkg.tar.zst' | wc -l)" -eq 2
+          test "$(find site/apt -name '*.deb' | wc -l)" -eq 2
+          test "$(find site/yum -name '*.rpm' | wc -l)" -eq 2
+          test -s site/pacman/x86_64/smol-machines.db
+          test -s site/pacman/aarch64/smol-machines.db
+          test -s site/apt/Packages.gz
+          test -s site/yum/repodata/repomd.xml
+          if find site -type l | grep -q .; then
+            echo 'Package site must not contain symlinks'
+            exit 1
+          fi
+
+      - name: Upload legacy repository snapshot
+        uses: actions/upload-artifact@v7
+        with:
+          name: legacy-repository-snapshot
+          path: site
+          if-no-files-found: error
+          retention-days: 1
+
+  deploy-legacy-snapshot:
+    name: Deploy legacy repository snapshot
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish && inputs.preserve_legacy_snapshot }}
+    needs: stage-legacy-snapshot
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Download legacy repository snapshot
+        uses: actions/download-artifact@v8
+        with:
+          name: legacy-repository-snapshot
+          path: site
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+      - name: Deploy GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

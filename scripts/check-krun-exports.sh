@@ -24,7 +24,24 @@ if [ "${#REQUIRED[@]}" -eq 0 ]; then
   echo "ERROR: parsed 0 required symbols from $KRUN_RS — check the load_sym! pattern"
   exit 1
 fi
-echo "smolvm requires ${#REQUIRED[@]} krun symbols (load_sym!):"
+
+# Some load_optional_sym! symbols are optional only at dlsym time: a DEFAULT-
+# shaped launch hard-errors without them (issue #884 — a 1.7.5 dylib built
+# without NET=1 shipped green, then every serve/API machine failed with
+# "libkrun does not expose krun_add_net_unixstream"). Require those too, so a
+# lib rebuilt with the wrong feature set can't sail through CI again.
+REQUIRED_DEFAULT_PATH=(
+  krun_add_net_unixstream  # virtio-net attach — the DEFAULT backend under
+                           # serve/ports/egress-policy/fleet; launcher.rs and
+                           # launcher_dynamic.rs error without it (needs NET=1)
+  krun_set_egress_policy   # --allow-cidr/--allow-host egress enforcement;
+                           # launcher hard-errors when a policy is configured
+  krun_create_disk_overlay # copy-on-write disk overlays for fork/clone;
+                           # create_disk_overlays() hard-errors without it
+)
+REQUIRED+=("${REQUIRED_DEFAULT_PATH[@]}")
+
+echo "smolvm requires ${#REQUIRED[@]} krun symbols (load_sym! + default-path):"
 printf '  %s\n' "${REQUIRED[@]}"
 echo
 

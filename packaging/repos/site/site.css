@@ -1,0 +1,24 @@
+:root { color-scheme: light dark; }
+body {
+  background: #fff;
+  color: #1a1a1a;
+  font: 14px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  margin: 5rem auto 4rem;
+  max-width: 52rem;
+  padding: 0 1.25rem;
+}
+@media (prefers-color-scheme: dark) {
+  body { background: #111; color: #d8d8d8; }
+}
+h1 { font-size: 1.2rem; margin-bottom: .25rem; }
+h2 { font-size: .95rem; margin-top: 2.5rem; opacity: .85; }
+.sub, footer { opacity: .6; }
+pre {
+  background: rgba(127, 127, 127, .12);
+  border-radius: 4px;
+  overflow-x: auto;
+  padding: .85rem 1rem;
+}
+a { color: inherit; text-underline-offset: 2px; }
+li { margin: .3rem 0; }
+footer { border-top: 1px solid rgba(127, 127, 127, .25); margin-top: 3rem; padding-top: 1rem; }

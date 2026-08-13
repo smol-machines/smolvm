@@ -101,6 +101,8 @@ pub struct MachineEntry {
     /// virtiofs instead of having the guest pull from a registry. `None` for
     /// image/registry-sourced machines. Mirrors `VmRecord::source_smolmachine`.
     pub source_smolmachine: Option<String>,
+    /// Whether ordinary starts should launch this machine as a fork base.
+    pub forkable: bool,
     /// Planned CUDA clone count used to restore the same virtual-VRAM policy
     /// on implicit starts.
     pub cuda_fork_pool_size: Option<u32>,
@@ -430,6 +432,7 @@ impl ApiState {
                             network: record.network,
                             secret_refs: record.secret_refs.clone(),
                             source_smolmachine: record.source_smolmachine.clone(),
+                            forkable: record.forkable_on_start(),
                             cuda_fork_pool_size: record.cuda_fork_pool_size,
                             cuda_vram_limit_mib: record.cuda_vram_limit_mib,
                             forkpoint_held: record.forkpoint_held,
@@ -915,6 +918,7 @@ impl ApiState {
                         network: reg.network,
                         secret_refs: reg.secret_refs,
                         source_smolmachine: reg.source_smolmachine,
+                        forkable: false,
                         cuda_fork_pool_size: None,
                         cuda_vram_limit_mib: None,
                         forkpoint_held: false,
@@ -1225,6 +1229,7 @@ pub async fn ensure_machine_running(
         };
         features.cuda_fork_pool_size = entry.cuda_fork_pool_size;
         features.cuda_vram_limit_mib = entry.cuda_vram_limit_mib;
+        features.forkable = entry.forkable;
         entry
             .manager
             .ensure_running_via_subprocess(mounts, ports, resources, features)?;
@@ -1284,6 +1289,7 @@ pub async fn ensure_running_and_persist(
         e.resources.cpus = Some(record.cpus);
         e.resources.memory_mb = Some(record.mem);
         e.network = record.network;
+        e.forkable = record.forkable_on_start();
         e.cuda_fork_pool_size = record.cuda_fork_pool_size;
         e.cuda_vram_limit_mib = record.cuda_vram_limit_mib;
     }
@@ -1554,6 +1560,7 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
         allowed_hosts: entry.resources.allowed_hosts.clone(),
         storage_gb: entry.resources.storage_gb,
         overlay_gb: entry.resources.overlay_gb,
+        forkable: entry.forkable,
         cuda_fork_pool_size: entry.cuda_fork_pool_size,
         cuda_vram_limit_mib: entry.cuda_vram_limit_mib,
         forkpoint_held: entry.forkpoint_held,
@@ -1691,6 +1698,7 @@ mod tests {
                 network: false,
                 secret_refs: Default::default(),
                 source_smolmachine: None,
+                forkable: false,
                 cuda_fork_pool_size: None,
                 cuda_vram_limit_mib: None,
                 forkpoint_held: false,
@@ -1757,6 +1765,7 @@ mod tests {
                 network: false,
                 secret_refs: Default::default(),
                 source_smolmachine: None,
+                forkable: false,
                 cuda_fork_pool_size: None,
                 cuda_vram_limit_mib: None,
                 forkpoint_held: false,

@@ -257,6 +257,68 @@ fn ensure_mount_target_under_root(rootfs: &Path, container_path: &str) -> Result
     Ok(final_canon)
 }
 
+/// Create a regular-file mountpoint without following a final symlink outside
+/// the container root. OCI runtimes require a file destination when the bind
+/// source is a file.
+pub(crate) fn ensure_file_mount_target_under_root(
+    rootfs: &Path,
+    container_path: &str,
+) -> Result<PathBuf> {
+    let relative = validate_container_destination_path(container_path)?;
+    let file_name = relative
+        .file_name()
+        .ok_or_else(|| StorageError::ValidationFailed {
+            context: "mount destination".to_string(),
+            reason: "file mount destination has no filename".to_string(),
+        })?;
+    let parent = relative
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| StorageError::ValidationFailed {
+            context: "mount destination".to_string(),
+            reason: "file mount destination must have a parent directory".to_string(),
+        })?;
+    let parent_destination = format!("/{}", parent.display());
+    let parent_path = ensure_mount_target_under_root(rootfs, &parent_destination)?;
+    let target = parent_path.join(file_name);
+
+    match std::fs::symlink_metadata(&target) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            std::fs::remove_file(&target).map_err(|error| StorageError::ReadFile {
+                path: target.display().to_string(),
+                cause: format!("failed to replace symlink at file mount target: {error}"),
+            })?;
+            std::fs::File::create(&target).map_err(|error| StorageError::ReadFile {
+                path: target.display().to_string(),
+                cause: format!("failed to create file mount target: {error}"),
+            })?;
+        }
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => {
+            return Err(StorageError::ValidationFailed {
+                context: "mount destination".to_string(),
+                reason: format!(
+                    "file mount destination is not a regular file: {}",
+                    target.display()
+                ),
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::File::create(&target).map_err(|error| StorageError::ReadFile {
+                path: target.display().to_string(),
+                cause: format!("failed to create file mount target: {error}"),
+            })?;
+        }
+        Err(error) => {
+            return Err(StorageError::ReadFile {
+                path: target.display().to_string(),
+                cause: error.to_string(),
+            });
+        }
+    }
+    Ok(target)
+}
+
 /// Global state for packed layers support.
 /// Set at startup if SMOLVM_PACKED_LAYERS env var is present.
 static PACKED_LAYERS_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
@@ -399,6 +461,49 @@ pub fn init_volume_mounts() -> &'static [(String, String, bool)] {
 
         mounts
     })
+}
+
+/// Re-establish boot-time virtiofs mounts after a fork restore.
+///
+/// A clone resumes the golden agent after its one-time boot initialization,
+/// while libkrun attaches fresh virtiofs devices to the clone VMM. The restored
+/// mount can remain under the golden's old overlay tree, but a newly selected
+/// clone overlay hides its bind target. Accessing that stale mount can block in
+/// the dead golden virtiofs session indefinitely. Check only mount metadata
+/// (never the stale filesystem), detach a stale staging mount if present, and
+/// bind the clone's fresh device before acknowledging its first host request.
+#[cfg(target_os = "linux")]
+pub fn repair_boot_volume_mounts() -> Result<()> {
+    let missing = init_volume_mounts()
+        .iter()
+        .filter(|(_, target, _)| !is_mountpoint(Path::new(target)))
+        .cloned()
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    for mount in &missing {
+        let (tag, target, _) = mount;
+        let staging = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
+        if is_mountpoint(&staging) {
+            detach_mount(&staging);
+        }
+        setup_volume_mounts("/", std::slice::from_ref(mount))?;
+        if !is_mountpoint(Path::new(target)) {
+            return Err(StorageError::new(format!(
+                "boot volume mount '{}' was not restored at '{}'",
+                tag, target
+            )));
+        }
+        info!(tag = %tag, target = %target, "restored boot volume mount after clone resume");
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn repair_boot_volume_mounts() -> Result<()> {
+    Ok(())
 }
 
 /// Add the /storage/workspace → /workspace fallback bind mount to an OCI spec,
@@ -2743,6 +2848,7 @@ pub fn run_command(
 
         // Forward SSH agent into the container if enabled at boot.
         crate::ssh_agent::inject_into_container(&mut spec);
+        crate::publish_socket::inject_into_container(&mut spec);
         crate::forkpoint::inject_into_container(&mut spec);
         crate::cuda::inject_into_container(&mut spec, Path::new(&prepared.rootfs_path));
 
@@ -2837,6 +2943,7 @@ pub fn spawn_in_overlay(
     add_storage_fallback(&mut spec, mounts, unprivileged);
 
     crate::ssh_agent::inject_into_container(&mut spec);
+    crate::publish_socket::inject_into_container(&mut spec);
     crate::forkpoint::inject_into_container(&mut spec);
     crate::cuda::inject_into_container(&mut spec, Path::new(&prepared.rootfs_path));
     spec.add_gpu_devices_if_available();
@@ -3157,7 +3264,10 @@ fn run_exec_in_container(
 ) -> Result<RunResult> {
     info!(container_id = %container_id, command = ?command, "joining container via crun exec");
 
+    let exec_pid_file = crate::crun::ExecPidFile::new()
+        .map_err(|e| StorageError::new(format!("create crun exec pid file failed: {}", e)))?;
     let mut child = CrunCommand::exec(container_id, env, command, workdir, false)
+        .pid_file(exec_pid_file.path())
         .stdin_null()
         .capture_output()
         .spawn()
@@ -3166,13 +3276,12 @@ fn run_exec_in_container(
     // On timeout/disconnect, kill only the exec'd process — NOT the main
     // container. The main container hosts the shared namespace for all execs;
     // a timed-out `exec -- sleep 10` must not destroy the workload.
-    let exec_pid = child.id();
     let result = crate::process::wait_with_timeout_cleanup_and_liveness(
         &mut child,
         timeout_ms,
         client_fd,
-        || unsafe {
-            libc::kill(exec_pid as libc::pid_t, libc::SIGKILL);
+        || {
+            exec_pid_file.kill_workload();
         },
     )?;
 
@@ -3431,6 +3540,161 @@ fn mount_overlay_fsconfig(
     _work_path: &Path,
     _merged_path: &Path,
 ) -> Result<()> {
+    Err(StorageError::new(
+        "overlay mount is only supported on Linux".to_string(),
+    ))
+}
+
+/// Merge `lowerdirs` into `output` as a single tar archive.
+///
+/// Backs [`AgentRequest::FlattenLayers`](smolvm_protocol::AgentRequest::FlattenLayers).
+/// The merge is a read-only overlay mount so that whiteouts and opaque markers
+/// resolve exactly as they do for a running container — a file copy would ship
+/// deleted paths back into the flattened layer.
+///
+/// `lowerdirs` is **topmost first**, the same order the runtime container mount
+/// uses, because that is the order `lowerdir+` stacks them in. Passing an image's
+/// layers bottom-up instead silently inverts precedence: the base layer wins
+/// every conflicting path, so a merged `/etc/passwd` loses the users later layers
+/// added and the machine's own writes rank lowest of all.
+///
+/// Entries that are missing or empty are dropped: callers pass a container
+/// overlay's upper dir without knowing whether the machine ever wrote to it, and
+/// overlayfs rejects a lowerdir that does not exist. A single surviving directory
+/// is tarred directly, since overlayfs requires two lower layers when there is no
+/// upperdir.
+pub fn flatten_layers_to_tar(lowerdirs: &[String], output: &Path) -> Result<()> {
+    let present = mountable_lowerdirs(lowerdirs);
+
+    let source = match present.len() {
+        0 => {
+            return Err(StorageError::new(
+                "no layers to flatten: every directory was missing or empty".to_string(),
+            ))
+        }
+        // One layer needs no merge, and overlayfs would refuse it anyway.
+        1 => PathBuf::from(&present[0]),
+        _ => {
+            let merged = Path::new(STORAGE_ROOT).join("flatten-merged");
+            let _ = std::fs::remove_dir_all(&merged);
+            std::fs::create_dir_all(&merged)?;
+            mount_overlay_lowers_only(&present, &merged)?;
+            merged
+        }
+    };
+
+    let tar_result = tar_directory(&source, output);
+
+    if source != Path::new(&present[0]) {
+        // Best-effort: a failed unmount must not mask a tar error.
+        let _ = std::process::Command::new("umount").arg(&source).status();
+        let _ = std::fs::remove_dir_all(&source);
+    }
+
+    tar_result
+}
+
+/// Keep the entries of `lowerdirs` that overlayfs can actually stack.
+///
+/// overlayfs fails the whole mount on a lowerdir that does not exist, and an
+/// empty directory contributes nothing to the merge, so dropping both lets a
+/// caller pass a container overlay's upper dir unconditionally.
+fn mountable_lowerdirs(lowerdirs: &[String]) -> Vec<String> {
+    lowerdirs
+        .iter()
+        .filter(|dir| {
+            let path = Path::new(dir);
+            path.is_dir()
+                && std::fs::read_dir(path)
+                    .map(|mut entries| entries.next().is_some())
+                    .unwrap_or(false)
+        })
+        .cloned()
+        .collect()
+}
+
+/// Tar `dir`'s contents (not the directory itself) into `output`.
+fn tar_directory(dir: &Path, output: &Path) -> Result<()> {
+    let status = std::process::Command::new("tar")
+        .arg("cf")
+        .arg(output)
+        .arg("-C")
+        .arg(dir)
+        .arg(".")
+        .status()
+        .map_err(|e| StorageError::new(format!("spawning tar failed: {e}")))?;
+    if !status.success() {
+        return Err(StorageError::new(format!(
+            "tar of {} failed: {status}",
+            dir.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Mount a read-only overlay of `lowerdirs` (topmost first) at `merged_path`.
+///
+/// Same `fsconfig` path as [`mount_overlay_fsconfig`] but with no upperdir or
+/// workdir, which is what makes the mount read-only. Appending each layer with
+/// its own `lowerdir+` is the whole point: a single `lowerdir=` string caps out
+/// at ~255 bytes through `mount(8)`, which is only about three layer paths.
+#[cfg(target_os = "linux")]
+fn mount_overlay_lowers_only(lowerdirs: &[String], merged_path: &Path) -> Result<()> {
+    use rustix::fd::AsFd;
+    use rustix::mount::{
+        fsconfig_create, fsconfig_set_string, fsmount, fsopen, move_mount, FsMountFlags,
+        FsOpenFlags, MountAttrFlags, MoveMountFlags,
+    };
+
+    info!(
+        layer_count = lowerdirs.len(),
+        merged_path = %merged_path.display(),
+        "mounting read-only overlay for flatten"
+    );
+
+    let fs = fsopen("overlay", FsOpenFlags::FSOPEN_CLOEXEC)
+        .map_err(|e| StorageError::new(format!("fsopen(overlay) failed: {e}")))?;
+
+    // Each `lowerdir+` ranks below the one before it, so the caller's
+    // topmost-first order is passed straight through.
+    for lower in lowerdirs {
+        fsconfig_set_string(fs.as_fd(), "lowerdir+", lower.as_str()).map_err(|e| {
+            StorageError::new(format!(
+                "fsconfig lowerdir+={lower} failed (kernel may lack lowerdir+ (<6.7)): {e}"
+            ))
+        })?;
+    }
+
+    fsconfig_create(fs.as_fd())
+        .map_err(|e| StorageError::new(format!("fsconfig create (overlay) failed: {e}")))?;
+
+    let mnt = fsmount(
+        fs.as_fd(),
+        FsMountFlags::FSMOUNT_CLOEXEC,
+        MountAttrFlags::empty(),
+    )
+    .map_err(|e| StorageError::new(format!("fsmount(overlay) failed: {e}")))?;
+
+    move_mount(
+        mnt.as_fd(),
+        "",
+        rustix::fs::CWD,
+        merged_path,
+        MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
+    )
+    .map_err(|e| {
+        StorageError::new(format!(
+            "move_mount to {} failed: {e}",
+            merged_path.display()
+        ))
+    })?;
+
+    Ok(())
+}
+
+/// Non-Linux stub: overlayfs is Linux-only.
+#[cfg(not(target_os = "linux"))]
+fn mount_overlay_lowers_only(_lowerdirs: &[String], _merged_path: &Path) -> Result<()> {
     Err(StorageError::new(
         "overlay mount is only supported on Linux".to_string(),
     ))
@@ -3904,6 +4168,77 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// A machine that has never written to its container overlay still has the
+    /// caller append that upper dir, and overlayfs fails the whole mount on a
+    /// lowerdir that is not there — so it has to be dropped, not passed through.
+    #[test]
+    fn flatten_drops_lowerdirs_that_are_missing_or_empty() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let populated = tmp.path().join("layer");
+        std::fs::create_dir_all(&populated).expect("create layer");
+        std::fs::write(populated.join("file"), b"x").expect("write file");
+        let empty = tmp.path().join("empty-upper");
+        std::fs::create_dir_all(&empty).expect("create empty");
+        let missing = tmp.path().join("never-created");
+
+        let kept = mountable_lowerdirs(&[
+            populated.to_string_lossy().into_owned(),
+            empty.to_string_lossy().into_owned(),
+            missing.to_string_lossy().into_owned(),
+        ]);
+
+        assert_eq!(
+            kept,
+            vec![populated.to_string_lossy().into_owned()],
+            "only the populated directory is mountable"
+        );
+    }
+
+    /// Order is the whole contract — `lowerdir+` ranks each layer below the one
+    /// before it, so the caller's topmost-first list must survive filtering
+    /// unreordered. Passing it bottom-up instead inverts precedence silently:
+    /// the base layer wins every conflicting path and the machine's own writes
+    /// rank lowest, which reads as an image that lost its later layers.
+    #[test]
+    fn flatten_preserves_topmost_first_order() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dirs: Vec<String> = ["upper", "top-layer", "base"]
+            .iter()
+            .map(|name| {
+                let dir = tmp.path().join(name);
+                std::fs::create_dir_all(&dir).expect("create dir");
+                std::fs::write(dir.join("f"), name.as_bytes()).expect("write");
+                dir.to_string_lossy().into_owned()
+            })
+            .collect();
+
+        assert_eq!(mountable_lowerdirs(&dirs), dirs);
+    }
+
+    /// Dropping an empty entry must not disturb the rank of the ones that stay:
+    /// a machine that never wrote anything still has its (empty) overlay passed
+    /// first, and removing it has to leave the image layers in their own order.
+    #[test]
+    fn flatten_keeps_rank_when_an_entry_is_dropped() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let make = |name: &str, populated: bool| {
+            let dir = tmp.path().join(name);
+            std::fs::create_dir_all(&dir).expect("create dir");
+            if populated {
+                std::fs::write(dir.join("f"), name.as_bytes()).expect("write");
+            }
+            dir.to_string_lossy().into_owned()
+        };
+        let empty_upper = make("empty-upper", false);
+        let top = make("top-layer", true);
+        let base = make("base", true);
+
+        assert_eq!(
+            mountable_lowerdirs(&[empty_upper, top.clone(), base.clone()]),
+            vec![top, base]
+        );
     }
 
     #[test]
@@ -4494,6 +4829,36 @@ mod tests {
             workspace_link.is_dir(),
             "/workspace should now be a directory"
         );
+    }
+
+    #[test]
+    fn file_mount_target_creates_parent_and_regular_file() {
+        let root = tempfile::tempdir().unwrap();
+        let rootfs = root.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+
+        let target = ensure_file_mount_target_under_root(&rootfs, "/run/smolvm/init").unwrap();
+        assert!(target.is_file());
+        assert!(target.starts_with(rootfs.canonicalize().unwrap()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_mount_target_replaces_final_symlink_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let rootfs = root.path().join("rootfs");
+        let destination_parent = rootfs.join("run/smolvm");
+        std::fs::create_dir_all(&destination_parent).unwrap();
+        let destination = destination_parent.join("init");
+        symlink(outside.path(), &destination).unwrap();
+
+        let target = ensure_file_mount_target_under_root(&rootfs, "/run/smolvm/init").unwrap();
+        assert!(target.is_file());
+        assert!(!target.is_symlink());
+        assert!(outside.path().is_file());
     }
 
     #[test]

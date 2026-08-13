@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>smolvm pacman repository</title>
+  <link rel="stylesheet" href="../site.css">
+</head>
+<body>
+  <h1>smolvm pacman repository</h1>
+  <p>Add this repository to <code>/etc/pacman.conf</code>:</p>
+  <pre>[smol-machines]
+SigLevel = Optional TrustAll
+Server = https://smol-machines.github.io/smolvm/pacman/$arch</pre>
+  <p>Then run <code>sudo pacman -Sy smolvm</code>.</p>
+  <ul>
+    <li><a href="x86_64/">x86_64</a></li>
+    <li><a href="aarch64/">aarch64</a></li>
+  </ul>
+  <footer><a href="../">Downloads</a> · <a href="https://github.com/smol-machines/smolvm/blob/main/docs/install-arch.md">Documentation</a></footer>
+</body>
+</html>

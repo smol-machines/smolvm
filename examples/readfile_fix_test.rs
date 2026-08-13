@@ -21,6 +21,7 @@ fn main() {
         image: None,
         persistent: false,
         runtime_managed: false,
+        labels: Default::default(),
     });
     rt.start_machine(name).expect("start");
 

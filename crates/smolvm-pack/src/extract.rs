@@ -502,9 +502,20 @@ fn safe_unpack_with_limits<R: Read>(
         }
 
         // Save the tar's intended directory mode for deferred application.
+        //
+        // Every directory has to be recorded, not just ones the owner cannot
+        // write: each is forced to 0755 below so its children can be created, so
+        // any mode that is not 0755 is lost unless it is restored afterwards.
+        // Only checking for a missing owner-write bit caught `dr-xr-xr-x` while
+        // silently widening the far more common restrictive-but-writable modes —
+        // a 0700 data directory arrived as 0755, which PostgreSQL refuses to
+        // start on, and a 0700 `.ssh` arrived world-readable.
+        //
+        // Masked to the permission bits so a hostile header cannot carry setuid,
+        // setgid or sticky through, matching the sparse path.
         if entry_type == tar::EntryType::Directory {
-            let mode = entry.header().mode().unwrap_or(0o755);
-            if mode & 0o200 == 0 {
+            let mode = entry.header().mode().unwrap_or(0o755) & 0o777;
+            if mode != 0o755 {
                 deferred_dir_modes.push((full_path.clone(), mode));
             }
         }
@@ -550,6 +561,11 @@ fn safe_unpack_with_limits<R: Read>(
     }
 
     // Apply deferred directory permissions now that all children are written.
+    //
+    // Deepest first: a tar lists a parent before its children, and restoring a
+    // parent that drops the owner's execute bit (0o444, say) would make every
+    // path beneath it untraversable, so the children's own restores would fail.
+    deferred_dir_modes.sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
     for (path, mode) in deferred_dir_modes {
         if path.is_dir() {
             set_mode(&path, mode);
@@ -2258,6 +2274,87 @@ mod tests {
         header.set_mode(0o777);
         builder.append_link(&mut header, name, link_target).unwrap();
         builder.into_inner().unwrap()
+    }
+
+    /// Build a tar holding `dir/` at `dir_mode` with one regular file inside.
+    #[cfg(unix)]
+    fn make_dir_with_child_tar(dir: &str, dir_mode: u32) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+
+        let mut dir_header = tar::Header::new_gnu();
+        dir_header.set_entry_type(tar::EntryType::Directory);
+        dir_header.set_size(0);
+        dir_header.set_mode(dir_mode);
+        dir_header.set_cksum();
+        builder
+            .append_data(&mut dir_header, format!("{dir}/"), std::io::empty())
+            .unwrap();
+
+        let contents = b"data";
+        let mut file_header = tar::Header::new_gnu();
+        file_header.set_entry_type(tar::EntryType::Regular);
+        file_header.set_size(contents.len() as u64);
+        file_header.set_mode(0o600);
+        file_header.set_cksum();
+        builder
+            .append_data(&mut file_header, format!("{dir}/child"), &contents[..])
+            .unwrap();
+
+        builder.into_inner().unwrap()
+    }
+
+    /// Directories are forced writable mid-extraction so their children can be
+    /// created, so every non-default mode has to be restored afterwards.
+    ///
+    /// Restoring only directories the owner could not write left every
+    /// restrictive-but-writable mode widened to 0755: a packed PostgreSQL data
+    /// directory arrived world-readable and the server refused to start on it,
+    /// and a packed 0700 `.ssh` lost its privacy the same way.
+    #[cfg(unix)]
+    #[test]
+    fn test_safe_unpack_restores_restrictive_but_writable_directory_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dest = temp_dir.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+
+        let tar_bytes = make_dir_with_child_tar("pgdata", 0o700);
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        safe_unpack(&mut archive, &dest).unwrap();
+
+        let extracted = dest.join("pgdata");
+        let mode = fs::metadata(&extracted).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "0700 directory must not be widened to 0755 by the extraction"
+        );
+        assert_eq!(
+            fs::read(extracted.join("child")).unwrap(),
+            b"data",
+            "the child still has to be written while the directory was writable"
+        );
+    }
+
+    /// A read-only directory keeps working — the case the original condition
+    /// was written for — and its children are still extracted.
+    #[cfg(unix)]
+    #[test]
+    fn test_safe_unpack_restores_read_only_directory_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dest = temp_dir.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+
+        let tar_bytes = make_dir_with_child_tar("readonly", 0o555);
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        safe_unpack(&mut archive, &dest).unwrap();
+
+        let extracted = dest.join("readonly");
+        let mode = fs::metadata(&extracted).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o555, "read-only directory mode must be restored");
+        assert!(extracted.join("child").exists());
     }
 
     #[cfg(unix)]

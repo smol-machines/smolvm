@@ -22,6 +22,70 @@ const CUDA_LIB: &str = "libcuda.dylib"; // not expected to exist; macOS has no C
 
 type CuResultCode = c_int;
 
+const CUDA_ERROR_INVALID_VALUE: c_int = 1;
+const CUDA_ERROR_INVALID_HANDLE: c_int = 400;
+const CUDA_ERROR_NOT_SUPPORTED: c_int = 801;
+
+/// CUfunction handles are process-local driver objects.  A remoted guest can
+/// accidentally send one of its own code pointers (static libcudart does this
+/// for unavailable fallback kernels), and NVIDIA's driver dereferences rather
+/// than validates some such values.  Record every function minted in this
+/// daemon process so untrusted wire handles fail as INVALID_HANDLE instead of
+/// taking down the shared CUDA daemon.
+fn live_cuda_functions() -> &'static std::sync::Mutex<std::collections::HashSet<u64>> {
+    static FUNCTIONS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u64>>> =
+        std::sync::OnceLock::new();
+    FUNCTIONS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+fn register_cuda_function(function: u64) {
+    if function != 0 {
+        live_cuda_functions().lock().unwrap().insert(function);
+    }
+}
+
+fn validate_cuda_function(function: u64) -> CuResult<()> {
+    live_cuda_functions()
+        .lock()
+        .unwrap()
+        .contains(&function)
+        .then_some(())
+        .ok_or(CUDA_ERROR_INVALID_HANDLE)
+}
+
+#[repr(C)]
+struct FatbincWrapper {
+    magic: c_uint,
+    version: c_uint,
+    data: *const c_void,
+    filename_or_fatbins: *const c_void,
+}
+
+#[repr(C)]
+struct CuMemLocation {
+    type_: c_int,
+    id: c_int,
+}
+
+/// CUDA 13 `CUmemPoolProps_v1`. Pointer and reserved fields are always local
+/// zeroes; the guest transports only the stable scalar fields.
+#[repr(C)]
+struct CuMemPoolProps {
+    alloc_type: c_int,
+    handle_types: c_uint,
+    location: CuMemLocation,
+    win32_security_attributes: *mut c_void,
+    max_size: usize,
+    usage: u16,
+    reserved: [u8; 54],
+}
+
+#[repr(C)]
+struct CuMemAccessDesc {
+    location: CuMemLocation,
+    flags: c_int,
+}
+
 /// Hand-declared driver entry points. Stored as `'static` fn pointers; `_lib`
 /// keeps the library mapped for as long as the backend lives.
 pub struct GpuBackend {
@@ -33,6 +97,8 @@ pub struct GpuBackend {
     driver_get_version: unsafe extern "C" fn(*mut c_int) -> CuResultCode,
     device_get_attribute: unsafe extern "C" fn(*mut c_int, c_int, c_int) -> CuResultCode,
     device_get_uuid: unsafe extern "C" fn(*mut u8, c_int) -> CuResultCode,
+    device_get_pci_bus_id: unsafe extern "C" fn(*mut c_char, c_int, c_int) -> CuResultCode,
+    device_get_by_pci_bus_id: unsafe extern "C" fn(*mut c_int, *const c_char) -> CuResultCode,
     ctx_create: unsafe extern "C" fn(*mut *mut c_void, c_uint, c_int) -> CuResultCode,
     ctx_destroy: unsafe extern "C" fn(*mut c_void) -> CuResultCode,
     ctx_set_current: unsafe extern "C" fn(*mut c_void) -> CuResultCode,
@@ -42,7 +108,30 @@ pub struct GpuBackend {
     module_load_data: unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> CuResultCode,
     module_get_function:
         unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const c_char) -> CuResultCode,
+    module_get_global:
+        unsafe extern "C" fn(*mut u64, *mut usize, *mut c_void, *const c_char) -> CuResultCode,
     module_unload: unsafe extern "C" fn(*mut c_void) -> CuResultCode,
+    library_load_data: Option<
+        unsafe extern "C" fn(
+            *mut *mut c_void,
+            *const c_void,
+            *mut c_int,
+            *mut *mut c_void,
+            c_uint,
+            *mut c_int,
+            *mut *mut c_void,
+            c_uint,
+        ) -> CuResultCode,
+    >,
+    library_unload: Option<unsafe extern "C" fn(*mut c_void) -> CuResultCode>,
+    library_get_kernel:
+        Option<unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const c_char) -> CuResultCode>,
+    library_get_module: Option<unsafe extern "C" fn(*mut *mut c_void, *mut c_void) -> CuResultCode>,
+    kernel_get_function:
+        Option<unsafe extern "C" fn(*mut *mut c_void, *mut c_void) -> CuResultCode>,
+    cuda_library_builds: std::collections::HashMap<u64, (u32, Vec<Vec<u8>>)>,
+    next_cuda_library_build: u64,
+    live_cuda_libraries: std::collections::HashSet<u64>,
     /// `cuFuncGetParamInfo` — CUDA 12.4+. `None` on older drivers, where
     /// [`Backend::func_get_param_info`] reports `CUDA_ERROR_NOT_SUPPORTED`.
     func_get_param_info:
@@ -51,6 +140,22 @@ pub struct GpuBackend {
     func_get_attribute: unsafe extern "C" fn(*mut c_int, c_int, *mut c_void) -> CuResultCode,
     mem_alloc: unsafe extern "C" fn(*mut u64, usize) -> CuResultCode,
     mem_free: unsafe extern "C" fn(u64) -> CuResultCode,
+    mem_pool_create: unsafe extern "C" fn(*mut *mut c_void, *const CuMemPoolProps) -> CuResultCode,
+    mem_pool_destroy: unsafe extern "C" fn(*mut c_void) -> CuResultCode,
+    mem_pool_set_attribute: unsafe extern "C" fn(*mut c_void, c_int, *mut c_void) -> CuResultCode,
+    mem_pool_get_attribute: unsafe extern "C" fn(*mut c_void, c_int, *mut c_void) -> CuResultCode,
+    mem_pool_set_access:
+        unsafe extern "C" fn(*mut c_void, *const CuMemAccessDesc, usize) -> CuResultCode,
+    mem_pool_get_access:
+        unsafe extern "C" fn(*mut c_int, *mut c_void, *const CuMemLocation) -> CuResultCode,
+    mem_pool_trim_to: unsafe extern "C" fn(*mut c_void, usize) -> CuResultCode,
+    mem_alloc_from_pool_async:
+        unsafe extern "C" fn(*mut u64, usize, *mut c_void, *mut c_void) -> CuResultCode,
+    mem_alloc_async: unsafe extern "C" fn(*mut u64, usize, *mut c_void) -> CuResultCode,
+    mem_free_async: unsafe extern "C" fn(u64, *mut c_void) -> CuResultCode,
+    device_get_default_mem_pool: unsafe extern "C" fn(*mut *mut c_void, c_int) -> CuResultCode,
+    device_get_mem_pool: unsafe extern "C" fn(*mut *mut c_void, c_int) -> CuResultCode,
+    device_set_mem_pool: unsafe extern "C" fn(c_int, *mut c_void) -> CuResultCode,
     memcpy_htod: unsafe extern "C" fn(u64, *const c_void, usize) -> CuResultCode,
     memcpy_dtoh: unsafe extern "C" fn(*mut c_void, u64, usize) -> CuResultCode,
     memcpy_dtod: unsafe extern "C" fn(u64, u64, usize) -> CuResultCode,
@@ -217,6 +322,9 @@ pub struct GpuBackend {
     /// `cuMemHostRegister` (to unregister on drop). Excludes ranges another
     /// connection already owns. Empty until the first zero-copy transfer.
     registered: Vec<(u64, u64)>,
+    /// Tmpfs file mappings registered for guest `cuMemHostAlloc`. Each mapping
+    /// is also present in `registered`; keep it alive until CUDA unregisters it.
+    mapped_host_files: Vec<(u64, u64)>,
     /// Whether lazy guest-RAM pinning has been attempted (once per backend).
     guest_ram_pin_tried: bool,
     /// Reusable pinned host staging buffer `(addr, capacity)` for the gather /
@@ -231,6 +339,21 @@ pub struct GpuBackend {
 /// — past here the per-DMA launch overhead of thousands of tiny copies costs
 /// more than a single host-side gather plus one big transfer.
 const ZC_DIRECT_MAX_SEGMENTS: usize = 16;
+fn containing_registered_range(
+    registered: &[(u64, u64)],
+    address: u64,
+    len: u64,
+) -> Option<(usize, u64, u64)> {
+    let end = address.checked_add(len)?;
+    registered
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|&(_, (base, size))| {
+            base <= address && base.checked_add(size).is_some_and(|limit| end <= limit)
+        })
+        .map(|(index, (base, size))| (index, base, size))
+}
 
 /// Code-generated forward-to-host-lib dispatch (see `smolvm-cuda-codegen`).
 /// Each `include!`d module exposes a `GenLib` with `load()` + `dispatch()`.
@@ -399,6 +522,8 @@ impl GpuBackend {
                 driver_get_version: sym(&lib, b"cuDriverGetVersion\0")?,
                 device_get_attribute: sym(&lib, b"cuDeviceGetAttribute\0")?,
                 device_get_uuid: sym2(&lib, b"cuDeviceGetUuid_v2\0", b"cuDeviceGetUuid\0")?,
+                device_get_pci_bus_id: sym(&lib, b"cuDeviceGetPCIBusId\0")?,
+                device_get_by_pci_bus_id: sym(&lib, b"cuDeviceGetByPCIBusId\0")?,
                 ctx_create: sym(&lib, b"cuCtxCreate_v2\0")?,
                 ctx_destroy: sym(&lib, b"cuCtxDestroy_v2\0")?,
                 ctx_set_current: sym(&lib, b"cuCtxSetCurrent\0")?,
@@ -411,12 +536,34 @@ impl GpuBackend {
                 )?,
                 module_load_data: sym(&lib, b"cuModuleLoadData\0")?,
                 module_get_function: sym(&lib, b"cuModuleGetFunction\0")?,
+                module_get_global: sym2(&lib, b"cuModuleGetGlobal_v2\0", b"cuModuleGetGlobal\0")?,
                 module_unload: sym(&lib, b"cuModuleUnload\0")?,
+                library_load_data: sym(&lib, b"cuLibraryLoadData\0").ok(),
+                library_unload: sym(&lib, b"cuLibraryUnload\0").ok(),
+                library_get_kernel: sym(&lib, b"cuLibraryGetKernel\0").ok(),
+                library_get_module: sym(&lib, b"cuLibraryGetModule\0").ok(),
+                kernel_get_function: sym(&lib, b"cuKernelGetFunction\0").ok(),
+                cuda_library_builds: std::collections::HashMap::new(),
+                next_cuda_library_build: 1,
+                live_cuda_libraries: std::collections::HashSet::new(),
                 func_get_param_info: sym(&lib, b"cuFuncGetParamInfo\0").ok(),
                 func_set_attribute: sym(&lib, b"cuFuncSetAttribute\0")?,
                 func_get_attribute: sym(&lib, b"cuFuncGetAttribute\0")?,
                 mem_alloc: sym(&lib, b"cuMemAlloc_v2\0")?,
                 mem_free: sym(&lib, b"cuMemFree_v2\0")?,
+                mem_pool_create: sym(&lib, b"cuMemPoolCreate\0")?,
+                mem_pool_destroy: sym(&lib, b"cuMemPoolDestroy\0")?,
+                mem_pool_set_attribute: sym(&lib, b"cuMemPoolSetAttribute\0")?,
+                mem_pool_get_attribute: sym(&lib, b"cuMemPoolGetAttribute\0")?,
+                mem_pool_set_access: sym(&lib, b"cuMemPoolSetAccess\0")?,
+                mem_pool_get_access: sym(&lib, b"cuMemPoolGetAccess\0")?,
+                mem_pool_trim_to: sym(&lib, b"cuMemPoolTrimTo\0")?,
+                mem_alloc_from_pool_async: sym(&lib, b"cuMemAllocFromPoolAsync\0")?,
+                mem_alloc_async: sym(&lib, b"cuMemAllocAsync\0")?,
+                mem_free_async: sym(&lib, b"cuMemFreeAsync\0")?,
+                device_get_default_mem_pool: sym(&lib, b"cuDeviceGetDefaultMemPool\0")?,
+                device_get_mem_pool: sym(&lib, b"cuDeviceGetMemPool\0")?,
+                device_set_mem_pool: sym(&lib, b"cuDeviceSetMemPool\0")?,
                 memcpy_htod: sym(&lib, b"cuMemcpyHtoD_v2\0")?,
                 memcpy_dtoh: sym(&lib, b"cuMemcpyDtoH_v2\0")?,
                 memcpy_dtod: sym(&lib, b"cuMemcpyDtoD_v2\0")?,
@@ -514,12 +661,357 @@ impl GpuBackend {
                 #[cfg(unix)]
                 proc_mem_regions: Vec::new(),
                 registered: Vec::new(),
+                mapped_host_files: Vec::new(),
                 guest_ram_pin_tried: false,
                 staging: (0, 0),
                 _lib: lib,
             };
             Ok(b)
         }
+    }
+
+    /// Driver Library API bridge used by generic library id 6, functions
+    /// 3..=11. Images arrive incrementally so a large static-runtime wrapper
+    /// (NCCL has hundreds of fatbins) never exceeds the 256 MiB wire frame.
+    fn cuda_driver_library_call(
+        &mut self,
+        func: u16,
+        args: &[u8],
+    ) -> Option<CuResult<(i32, Vec<u8>)>> {
+        // One primary image plus up to 4096 v2 prelinked dependencies.
+        const MAX_IMAGES: usize = 4097;
+        const MAX_LIBRARY_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
+        let read_handle = |bytes: &[u8]| -> Result<u64, c_int> {
+            bytes
+                .get(..8)
+                .and_then(|b| b.try_into().ok())
+                .map(u64::from_le_bytes)
+                .ok_or(CUDA_ERROR_INVALID_VALUE)
+        };
+        let response = |status: c_int, handle: *mut c_void| {
+            Ok((
+                status,
+                if status == 0 {
+                    (handle as u64).to_le_bytes().to_vec()
+                } else {
+                    Vec::new()
+                },
+            ))
+        };
+
+        Some(match func {
+            3 => {
+                let kind = args
+                    .get(..4)
+                    .and_then(|b| b.try_into().ok())
+                    .map(u32::from_le_bytes)
+                    .filter(|kind| *kind <= 2)
+                    .ok_or(CUDA_ERROR_INVALID_VALUE);
+                match kind {
+                    Ok(kind) => {
+                        let build = self.next_cuda_library_build.max(1);
+                        self.next_cuda_library_build = build.wrapping_add(1).max(1);
+                        self.cuda_library_builds.insert(build, (kind, Vec::new()));
+                        response(0, build as *mut c_void)
+                    }
+                    Err(status) => response(status, std::ptr::null_mut()),
+                }
+            }
+            4 => match read_handle(args) {
+                Ok(build) => match self.cuda_library_builds.get_mut(&build) {
+                    Some((_, images)) => {
+                        let total = images
+                            .iter()
+                            .try_fold(0usize, |n, image| n.checked_add(image.len()))
+                            .and_then(|n| n.checked_add(args.len().saturating_sub(8)));
+                        if images.len() >= MAX_IMAGES
+                            || total.is_none_or(|n| n > MAX_LIBRARY_BYTES)
+                            || args.len() <= 8
+                        {
+                            response(CUDA_ERROR_INVALID_VALUE, std::ptr::null_mut())
+                        } else {
+                            images.push(args[8..].to_vec());
+                            response(0, std::ptr::null_mut())
+                        }
+                    }
+                    None => response(CUDA_ERROR_INVALID_VALUE, std::ptr::null_mut()),
+                },
+                Err(status) => response(status, std::ptr::null_mut()),
+            },
+            5 => match read_handle(args) {
+                Ok(build) => match self.cuda_library_builds.remove(&build) {
+                    Some((kind, images)) if !images.is_empty() => {
+                        let Some(load) = self.library_load_data else {
+                            return Some(response(CUDA_ERROR_NOT_SUPPORTED, std::ptr::null_mut()));
+                        };
+                        if (kind < 2 && images.len() != 1) || (kind == 2 && images.len() < 2) {
+                            response(CUDA_ERROR_INVALID_VALUE, std::ptr::null_mut())
+                        } else {
+                            let pointers: Vec<*const c_void> = images
+                                .iter()
+                                .skip(if kind == 2 { 1 } else { 0 })
+                                .map(|image| image.as_ptr().cast())
+                                .chain(std::iter::once(std::ptr::null()))
+                                .collect();
+                            let wrapper = FatbincWrapper {
+                                magic: 0x4662_43b1,
+                                version: kind,
+                                data: images[0].as_ptr().cast(),
+                                filename_or_fatbins: if kind == 2 {
+                                    pointers.as_ptr().cast()
+                                } else {
+                                    std::ptr::null()
+                                },
+                            };
+                            let code = if kind == 0 {
+                                images[0].as_ptr().cast()
+                            } else {
+                                (&wrapper as *const FatbincWrapper).cast()
+                            };
+                            let mut library = std::ptr::null_mut();
+                            let status = unsafe {
+                                load(
+                                    &mut library,
+                                    code,
+                                    std::ptr::null_mut(),
+                                    std::ptr::null_mut(),
+                                    0,
+                                    std::ptr::null_mut(),
+                                    std::ptr::null_mut(),
+                                    0,
+                                )
+                            };
+                            if status == 0 {
+                                self.live_cuda_libraries.insert(library as u64);
+                            }
+                            response(status, library)
+                        }
+                    }
+                    _ => response(CUDA_ERROR_INVALID_VALUE, std::ptr::null_mut()),
+                },
+                Err(status) => response(status, std::ptr::null_mut()),
+            },
+            6 => match (read_handle(args), self.library_unload) {
+                (Ok(library), Some(unload)) => {
+                    let status = unsafe { unload(library as *mut c_void) };
+                    if status == 0 {
+                        self.live_cuda_libraries.remove(&library);
+                    }
+                    response(status, std::ptr::null_mut())
+                }
+                (Err(status), _) => response(status, std::ptr::null_mut()),
+                (_, None) => response(CUDA_ERROR_NOT_SUPPORTED, std::ptr::null_mut()),
+            },
+            7 => match (read_handle(args), self.library_get_kernel) {
+                (Ok(library), Some(get_kernel)) if args.len() > 8 => {
+                    match CString::new(&args[8..]) {
+                        Ok(name) => {
+                            let mut kernel = std::ptr::null_mut();
+                            let status = unsafe {
+                                get_kernel(&mut kernel, library as *mut c_void, name.as_ptr())
+                            };
+                            response(status, kernel)
+                        }
+                        Err(_) => response(CUDA_ERROR_INVALID_VALUE, std::ptr::null_mut()),
+                    }
+                }
+                (Err(status), _) => response(status, std::ptr::null_mut()),
+                (_, None) => response(CUDA_ERROR_NOT_SUPPORTED, std::ptr::null_mut()),
+                _ => response(CUDA_ERROR_INVALID_VALUE, std::ptr::null_mut()),
+            },
+            8 => match (read_handle(args), self.kernel_get_function) {
+                (Ok(kernel), Some(get_function)) => {
+                    let mut function = std::ptr::null_mut();
+                    let status = unsafe { get_function(&mut function, kernel as *mut c_void) };
+                    if status == 0 {
+                        register_cuda_function(function as u64);
+                    }
+                    response(status, function)
+                }
+                (Err(status), _) => response(status, std::ptr::null_mut()),
+                (_, None) => response(CUDA_ERROR_NOT_SUPPORTED, std::ptr::null_mut()),
+            },
+            9 => match (read_handle(args), self.library_get_module) {
+                (Ok(library), Some(get_module)) => {
+                    let mut module = std::ptr::null_mut();
+                    let status = unsafe { get_module(&mut module, library as *mut c_void) };
+                    response(status, module)
+                }
+                (Err(status), _) => response(status, std::ptr::null_mut()),
+                (_, None) => response(CUDA_ERROR_NOT_SUPPORTED, std::ptr::null_mut()),
+            },
+            10 => match read_handle(args) {
+                Ok(build) => response(
+                    if self.cuda_library_builds.remove(&build).is_some() {
+                        0
+                    } else {
+                        CUDA_ERROR_INVALID_VALUE
+                    },
+                    std::ptr::null_mut(),
+                ),
+                Err(status) => response(status, std::ptr::null_mut()),
+            },
+            11 => match read_handle(args) {
+                Ok(module) if args.len() > 8 => match CString::new(&args[8..]) {
+                    Ok(name) => {
+                        let mut pointer = 0u64;
+                        let mut bytes = 0usize;
+                        let status = unsafe {
+                            (self.module_get_global)(
+                                &mut pointer,
+                                &mut bytes,
+                                module as *mut c_void,
+                                name.as_ptr(),
+                            )
+                        };
+                        Ok((
+                            status,
+                            if status == 0 {
+                                [pointer.to_le_bytes(), (bytes as u64).to_le_bytes()].concat()
+                            } else {
+                                Vec::new()
+                            },
+                        ))
+                    }
+                    Err(_) => response(CUDA_ERROR_INVALID_VALUE, std::ptr::null_mut()),
+                },
+                Ok(_) => response(CUDA_ERROR_INVALID_VALUE, std::ptr::null_mut()),
+                Err(status) => response(status, std::ptr::null_mut()),
+            },
+            12 => {
+                let parsed = args
+                    .get(..16)
+                    .and_then(|bytes| {
+                        Some((
+                            u64::from_le_bytes(bytes[..8].try_into().ok()?),
+                            u64::from_le_bytes(bytes[8..].try_into().ok()?),
+                        ))
+                    })
+                    .filter(|(_, len)| *len != 0);
+                match (parsed, self.mem_host_register) {
+                    (Some((gpa, len)), Some(register)) => {
+                        let Some(hva) = self.gpa_to_hva(gpa, len) else {
+                            return Some(response(CUDA_ERROR_NOT_SUPPORTED, std::ptr::null_mut()));
+                        };
+                        let mut unified = 0;
+                        let attribute_status =
+                            unsafe { (self.device_get_attribute)(&mut unified, 41, 0) };
+                        if attribute_status != 0 || unified == 0 {
+                            return Some(response(CUDA_ERROR_NOT_SUPPORTED, std::ptr::null_mut()));
+                        }
+                        if containing_registered_range(&self.registered, hva, len).is_some() {
+                            return Some(response(0, hva as *mut c_void));
+                        }
+                        let status = unsafe { register(hva as *mut c_void, len as usize, 2) };
+                        if status == 0 {
+                            self.registered.push((hva, len));
+                        }
+                        response(status, hva as *mut c_void)
+                    }
+                    _ => response(CUDA_ERROR_NOT_SUPPORTED, std::ptr::null_mut()),
+                }
+            }
+            13 => {
+                let parsed = args.get(..16).and_then(|bytes| {
+                    Some((
+                        u64::from_le_bytes(bytes[..8].try_into().ok()?),
+                        u64::from_le_bytes(bytes[8..].try_into().ok()?),
+                    ))
+                });
+                match parsed {
+                    Some((hva, len)) => {
+                        let owned =
+                            self.registered
+                                .iter()
+                                .position(|&(registered, registered_len)| {
+                                    registered == hva && registered_len == len
+                                });
+                        match (owned, self.mem_host_unregister) {
+                            (Some(index), Some(unregister)) => {
+                                let status = unsafe { unregister(hva as *mut c_void) };
+                                if status == 0 {
+                                    self.registered.swap_remove(index);
+                                    self.unmap_mapped_host_file(hva, len);
+                                }
+                                response(status, std::ptr::null_mut())
+                            }
+                            // A containing whole-RAM pin owns this allocation;
+                            // keep it until the backend's normal teardown.
+                            _ if containing_registered_range(&self.registered, hva, len)
+                                .is_some() =>
+                            {
+                                response(0, std::ptr::null_mut())
+                            }
+                            _ => response(CUDA_ERROR_INVALID_VALUE, std::ptr::null_mut()),
+                        }
+                    }
+                    None => response(CUDA_ERROR_INVALID_VALUE, std::ptr::null_mut()),
+                }
+            }
+            #[cfg(target_os = "linux")]
+            14 => {
+                use std::os::unix::io::AsRawFd;
+                const TMPFS_MAGIC: libc::c_long = 0x0102_1994;
+                const MAX_HOST_ALLOCATION: u64 = 256 * 1024 * 1024;
+
+                let parsed = args.get(..8).and_then(|bytes| {
+                    let len = u64::from_le_bytes(bytes.try_into().ok()?);
+                    (len > 0 && len <= MAX_HOST_ALLOCATION && args.len() > 8)
+                        .then_some((len, &args[8..]))
+                });
+                match (parsed, self.mem_host_register) {
+                    (Some((len, name)), Some(register)) => {
+                        let Ok(len_usize) = usize::try_from(len) else {
+                            return Some(response(CUDA_ERROR_INVALID_VALUE, std::ptr::null_mut()));
+                        };
+                        let file = match super::open_ring_file(name, len_usize) {
+                            Ok(file) => file,
+                            Err(status) => {
+                                return Some(response(status, std::ptr::null_mut()));
+                            }
+                        };
+                        let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+                        if unsafe { libc::fstatfs(file.as_raw_fd(), &mut stat) } != 0
+                            || stat.f_type != TMPFS_MAGIC
+                        {
+                            return Some(response(CUDA_ERROR_NOT_SUPPORTED, std::ptr::null_mut()));
+                        }
+                        let mapping = unsafe {
+                            libc::mmap(
+                                std::ptr::null_mut(),
+                                len_usize,
+                                libc::PROT_READ | libc::PROT_WRITE,
+                                libc::MAP_SHARED,
+                                file.as_raw_fd(),
+                                0,
+                            )
+                        };
+                        if mapping == libc::MAP_FAILED {
+                            return Some(response(2, std::ptr::null_mut()));
+                        }
+                        let hva = mapping as u64;
+                        let mut unified = 0;
+                        let attribute_status =
+                            unsafe { (self.device_get_attribute)(&mut unified, 41, 0) };
+                        if attribute_status != 0 || unified == 0 {
+                            unsafe { libc::munmap(mapping, len_usize) };
+                            return Some(response(CUDA_ERROR_NOT_SUPPORTED, std::ptr::null_mut()));
+                        }
+                        let status = unsafe { register(mapping, len_usize, 2) };
+                        if status == 0 {
+                            self.registered.push((hva, len));
+                            self.mapped_host_files.push((hva, len));
+                        } else {
+                            unsafe { libc::munmap(mapping, len_usize) };
+                        }
+                        response(status, mapping)
+                    }
+                    _ => response(CUDA_ERROR_NOT_SUPPORTED, std::ptr::null_mut()),
+                }
+            }
+            _ => return None,
+        })
     }
 }
 
@@ -617,6 +1109,30 @@ impl Backend for GpuBackend {
         unsafe { chk((self.device_get_uuid)(uuid.as_mut_ptr(), device))? };
         Ok(uuid)
     }
+    fn device_get_pci_bus_id(&mut self, device: i32) -> CuResult<String> {
+        let mut value: [c_char; 32] = [0; 32];
+        unsafe {
+            chk((self.device_get_pci_bus_id)(
+                value.as_mut_ptr(),
+                value.len() as c_int,
+                device,
+            ))?
+        };
+        Ok(unsafe { CStr::from_ptr(value.as_ptr()) }
+            .to_string_lossy()
+            .into_owned())
+    }
+    fn device_get_by_pci_bus_id(&mut self, pci_bus_id: &str) -> CuResult<i32> {
+        let pci_bus_id = CString::new(pci_bus_id).map_err(|_| CUDA_ERROR_INVALID_VALUE)?;
+        let mut device = 0;
+        unsafe {
+            chk((self.device_get_by_pci_bus_id)(
+                &mut device,
+                pci_bus_id.as_ptr(),
+            ))?
+        };
+        Ok(device)
+    }
     fn ctx_create(&mut self, device: i32) -> CuResult<u64> {
         let mut ctx: *mut c_void = std::ptr::null_mut();
         unsafe { chk((self.ctx_create)(&mut ctx, 0, device))? };
@@ -667,7 +1183,22 @@ impl Backend for GpuBackend {
                 cname.as_ptr(),
             ))?
         };
+        register_cuda_function(func as u64);
         Ok(func as u64)
+    }
+    fn module_get_global(&mut self, module: u64, name: &str) -> CuResult<(u64, u64)> {
+        let cname = CString::new(name).map_err(|_| super::CUDA_ERROR_NOT_FOUND)?;
+        let mut dptr = 0u64;
+        let mut bytes = 0usize;
+        unsafe {
+            chk((self.module_get_global)(
+                &mut dptr,
+                &mut bytes,
+                module as *mut c_void,
+                cname.as_ptr(),
+            ))?
+        };
+        Ok((dptr, bytes as u64))
     }
     fn module_unload(&mut self, module: u64) -> CuResult<()> {
         unsafe { chk((self.module_unload)(module as *mut c_void)) }
@@ -676,6 +1207,7 @@ impl Backend for GpuBackend {
         // CUDA 12.4+. Walk parameter indices until INVALID_VALUE marks the end.
         const CUDA_ERROR_INVALID_VALUE: i32 = 1;
         const CUDA_ERROR_NOT_SUPPORTED: i32 = 801;
+        validate_cuda_function(function)?;
         let f = self.func_get_param_info.ok_or(CUDA_ERROR_NOT_SUPPORTED)?;
         let mut sizes = Vec::new();
         for i in 0.. {
@@ -690,6 +1222,7 @@ impl Backend for GpuBackend {
         Ok(sizes)
     }
     fn func_set_attribute(&mut self, function: u64, attrib: i32, value: i32) -> CuResult<()> {
+        validate_cuda_function(function)?;
         unsafe {
             chk((self.func_set_attribute)(
                 function as *mut c_void,
@@ -699,6 +1232,7 @@ impl Backend for GpuBackend {
         }
     }
     fn func_get_attribute(&mut self, function: u64, attrib: i32) -> CuResult<i32> {
+        validate_cuda_function(function)?;
         let mut v = 0;
         unsafe {
             chk((self.func_get_attribute)(
@@ -716,6 +1250,138 @@ impl Backend for GpuBackend {
     }
     fn mem_free(&mut self, dptr: u64) -> CuResult<()> {
         unsafe { chk((self.mem_free)(dptr)) }
+    }
+    fn mem_pool_create(
+        &mut self,
+        alloc_type: i32,
+        handle_types: u32,
+        location_type: i32,
+        location_id: i32,
+        max_size: u64,
+        usage: u16,
+    ) -> CuResult<u64> {
+        let props = CuMemPoolProps {
+            alloc_type,
+            handle_types,
+            location: CuMemLocation {
+                type_: location_type,
+                id: location_id,
+            },
+            win32_security_attributes: std::ptr::null_mut(),
+            max_size: usize::try_from(max_size).map_err(|_| CUDA_ERROR_INVALID_VALUE)?,
+            usage,
+            reserved: [0; 54],
+        };
+        let mut pool = std::ptr::null_mut();
+        unsafe { chk((self.mem_pool_create)(&mut pool, &props))? };
+        Ok(pool as u64)
+    }
+    fn mem_pool_destroy(&mut self, pool: u64) -> CuResult<()> {
+        unsafe { chk((self.mem_pool_destroy)(pool as *mut c_void)) }
+    }
+    fn mem_pool_set_attribute(&mut self, pool: u64, attr: i32, value: u64) -> CuResult<()> {
+        let mut value = value;
+        unsafe {
+            chk((self.mem_pool_set_attribute)(
+                pool as *mut c_void,
+                attr,
+                (&mut value as *mut u64).cast(),
+            ))
+        }
+    }
+    fn mem_pool_get_attribute(&mut self, pool: u64, attr: i32) -> CuResult<u64> {
+        let mut value = 0u64;
+        unsafe {
+            chk((self.mem_pool_get_attribute)(
+                pool as *mut c_void,
+                attr,
+                (&mut value as *mut u64).cast(),
+            ))?
+        };
+        Ok(value)
+    }
+    fn mem_pool_set_access(&mut self, pool: u64, descriptors: &[(i32, i32, u64)]) -> CuResult<()> {
+        let descriptors = descriptors
+            .iter()
+            .map(|&(type_, id, flags)| {
+                Ok(CuMemAccessDesc {
+                    location: CuMemLocation { type_, id },
+                    flags: i32::try_from(flags).map_err(|_| CUDA_ERROR_INVALID_VALUE)?,
+                })
+            })
+            .collect::<CuResult<Vec<_>>>()?;
+        unsafe {
+            chk((self.mem_pool_set_access)(
+                pool as *mut c_void,
+                descriptors.as_ptr(),
+                descriptors.len(),
+            ))
+        }
+    }
+    fn mem_pool_get_access(
+        &mut self,
+        pool: u64,
+        location_type: i32,
+        location_id: i32,
+    ) -> CuResult<u64> {
+        let location = CuMemLocation {
+            type_: location_type,
+            id: location_id,
+        };
+        let mut flags = 0i32;
+        unsafe {
+            chk((self.mem_pool_get_access)(
+                &mut flags,
+                pool as *mut c_void,
+                &location,
+            ))?
+        };
+        Ok(flags as u32 as u64)
+    }
+    fn mem_pool_trim_to(&mut self, pool: u64, min_bytes: u64) -> CuResult<()> {
+        let min_bytes = usize::try_from(min_bytes).map_err(|_| CUDA_ERROR_INVALID_VALUE)?;
+        unsafe { chk((self.mem_pool_trim_to)(pool as *mut c_void, min_bytes)) }
+    }
+    fn mem_alloc_from_pool_async(&mut self, bytes: u64, pool: u64, stream: u64) -> CuResult<u64> {
+        let mut dptr = 0;
+        let bytes = usize::try_from(bytes).map_err(|_| CUDA_ERROR_INVALID_VALUE)?;
+        unsafe {
+            chk((self.mem_alloc_from_pool_async)(
+                &mut dptr,
+                bytes,
+                pool as *mut c_void,
+                stream as *mut c_void,
+            ))?
+        };
+        Ok(dptr)
+    }
+    fn mem_alloc_async(&mut self, bytes: u64, stream: u64) -> CuResult<u64> {
+        let mut dptr = 0;
+        let bytes = usize::try_from(bytes).map_err(|_| CUDA_ERROR_INVALID_VALUE)?;
+        unsafe {
+            chk((self.mem_alloc_async)(
+                &mut dptr,
+                bytes,
+                stream as *mut c_void,
+            ))?
+        };
+        Ok(dptr)
+    }
+    fn mem_free_async(&mut self, dptr: u64, stream: u64) -> CuResult<()> {
+        unsafe { chk((self.mem_free_async)(dptr, stream as *mut c_void)) }
+    }
+    fn device_get_default_mem_pool(&mut self, device: i32) -> CuResult<u64> {
+        let mut pool = std::ptr::null_mut();
+        unsafe { chk((self.device_get_default_mem_pool)(&mut pool, device))? };
+        Ok(pool as u64)
+    }
+    fn device_get_mem_pool(&mut self, device: i32) -> CuResult<u64> {
+        let mut pool = std::ptr::null_mut();
+        unsafe { chk((self.device_get_mem_pool)(&mut pool, device))? };
+        Ok(pool as u64)
+    }
+    fn device_set_mem_pool(&mut self, device: i32, pool: u64) -> CuResult<()> {
+        unsafe { chk((self.device_set_mem_pool)(device, pool as *mut c_void)) }
     }
     fn memcpy_htod(&mut self, dptr: u64, data: &[u8], stream: u64) -> CuResult<()> {
         self.wait_stream(stream)?;
@@ -1087,6 +1753,7 @@ impl Backend for GpuBackend {
         stream: u64,
         params: &[Vec<u8>],
     ) -> CuResult<()> {
+        validate_cuda_function(function)?;
         // The Driver API wants `void* kernelParams[]`, each pointing at one
         // argument's value. Point at each param blob in place (CUDA only reads).
         let mut ptrs: Vec<*mut c_void> = params.iter().map(|p| p.as_ptr() as *mut c_void).collect();
@@ -1791,6 +2458,11 @@ impl Backend for GpuBackend {
         args: &[u8],
         streams: &std::collections::HashMap<u64, u64>,
     ) -> CuResult<(i32, Vec<u8>)> {
+        if lib == 6 {
+            if let Some(result) = self.cuda_driver_library_call(func, args) {
+                return result;
+            }
+        }
         self.gen_lib_call(lib, func, args, streams)
     }
     fn lib_handle_alias(&mut self, golden: u64, real: u64) {
@@ -2312,6 +2984,18 @@ fn stream_resolve(map: &std::collections::HashMap<u64, u64>, s: u64) -> u64 {
     }
 }
 
+/// Convert a real library stream back to the session-scoped handle that the
+/// guest CUDA runtime minted for it.
+fn stream_unresolve(map: &std::collections::HashMap<u64, u64>, raw: u64) -> u64 {
+    if raw == 0 {
+        return 0;
+    }
+    map.keys()
+        .find(|&&guest| stream_resolve(map, guest) == raw)
+        .copied()
+        .unwrap_or(raw)
+}
+
 // Fork-isolation pointer translation for forwarded library calls (cuBLAS/cuDNN).
 // The generated `dispatch` reads each DevPtr arg through `dptr_resolve`, so a
 // clone's inherited device pointers hit its private copies — TYPED at the exact
@@ -2769,6 +3453,15 @@ impl CudnnBn {
 
 impl Drop for GpuBackend {
     fn drop(&mut self) {
+        if let Some(unload) = self.library_unload {
+            for library in self.live_cuda_libraries.drain() {
+                // SAFETY: these handles were returned by cuLibraryLoadData in
+                // this backend and have not been unloaded successfully yet.
+                unsafe {
+                    unload(library as *mut c_void);
+                }
+            }
+        }
         // Release any guest-RAM pins this backend took so the next connection can
         // re-register them. Safe to call at drop: the context is still alive.
         if let Some(unreg) = self.mem_host_unregister {
@@ -2778,6 +3471,14 @@ impl Drop for GpuBackend {
                     unreg(hva as *mut c_void);
                 }
             }
+        }
+        for (address, len) in self.mapped_host_files.drain(..) {
+            #[cfg(unix)]
+            if let (Ok(address), Ok(len)) = (usize::try_from(address), usize::try_from(len)) {
+                unsafe { libc::munmap(address as *mut c_void, len) };
+            }
+            #[cfg(not(unix))]
+            let _ = (address, len);
         }
         let (addr, _) = self.staging;
         if addr != 0 {
@@ -2903,6 +3604,23 @@ fn vmm_prop(device: i32) -> VmmProp {
 }
 
 impl GpuBackend {
+    #[cfg(unix)]
+    fn unmap_mapped_host_file(&mut self, address: u64, len: u64) {
+        if let Some(index) = self
+            .mapped_host_files
+            .iter()
+            .position(|&(candidate, candidate_len)| candidate == address && candidate_len == len)
+        {
+            self.mapped_host_files.swap_remove(index);
+            if let (Ok(address), Ok(len)) = (usize::try_from(address), usize::try_from(len)) {
+                unsafe { libc::munmap(address as *mut c_void, len) };
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn unmap_mapped_host_file(&mut self, _address: u64, _len: u64) {}
+
     /// CLONE transport: move `total` bytes between the GPU (`dptr`) and the
     /// clone's LIVE guest RAM via /proc/<pid>/mem + pinned staging. `to_guest`:
     /// D2H (GPU -> pwrite guest); else H2D (pread guest -> GPU).
@@ -3003,7 +3721,7 @@ impl GpuBackend {
         };
         for &(_, hva, len) in &self.guest_ram {
             // SAFETY: [hva, hva+len) is a live host mapping of guest RAM.
-            let rc = unsafe { reg(hva as *mut c_void, len as usize, 0) };
+            let rc = unsafe { reg(hva as *mut c_void, len as usize, 2) };
             match rc {
                 0 => {
                     self.registered.push((hva, len));
@@ -3284,6 +4002,30 @@ fn zc_trace_segments(dir: &str, segments: &[(u64, u64)]) {
             "[zc-host] {dir} gpa memcpy: {total} bytes in {} segment(s)",
             segments.len()
         ));
+    }
+}
+
+#[cfg(test)]
+mod registered_range_tests {
+    use super::containing_registered_range;
+
+    #[test]
+    fn finds_the_registration_containing_a_subrange() {
+        let ranges = [(0x1000, 0x1000), (0x4000, 0x2000)];
+        assert_eq!(
+            containing_registered_range(&ranges, 0x4800, 0x400),
+            Some((1, 0x4000, 0x2000))
+        );
+        assert_eq!(containing_registered_range(&ranges, 0x3000, 1), None);
+        assert_eq!(containing_registered_range(&ranges, 0x5f00, 0x200), None);
+    }
+
+    #[test]
+    fn rejects_overflowing_ranges() {
+        assert_eq!(
+            containing_registered_range(&[(0, u64::MAX)], u64::MAX, 2),
+            None
+        );
     }
 }
 

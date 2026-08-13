@@ -184,6 +184,9 @@ pub fn start_with_clone_mode(socket_path: &Path, is_fork_clone: bool) -> std::io
                                     }
                                     return;
                                 }
+                                smolvm_cuda::host::ring_dir_set(
+                                    std::env::var("SMOLVM_CUDA_RING_HOST_DIR").ok(),
+                                );
                                 let mut backend = make_backend();
                                 if let Err(e) =
                                     serve_with_options(stream, backend.as_mut(), options)

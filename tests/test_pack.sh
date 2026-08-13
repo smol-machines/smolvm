@@ -934,6 +934,84 @@ test_from_vm_imported_layers_preserved_on_repack() {
     cleanup_from_vm_imported_layers_preserved
 }
 
+# Regression: pack a machine whose image has MORE THAN THREE layers, and keep
+# the image's declared environment.
+#
+# Both failures below were invisible to the other --from-vm tests because those
+# use alpine, a single-layer image with no declared env:
+#
+#   1. The layer merge shelled out to `mount -o lowerdir=...`, and mount(8)
+#      rejects an option value past ~255 bytes — about three OCI layer paths.
+#      A single layer never mounts an overlay at all, so alpine sailed through
+#      while every real image failed with a bad superblock error.
+#   2. The manifest recorded only the env the machine was created with, so the
+#      image's own env was dropped. Flattening leaves no image config for the
+#      packed machine to read, so anything the image put on PATH stopped
+#      resolving.
+#
+# python:3.12-slim is the smallest handy image that has both properties: four
+# layers, and a declared PYTHON_VERSION/LANG that the default env cannot supply.
+test_from_vm_multi_layer_and_image_env() {
+    local vm_name="from-vm-multilayer-$$"
+    local pack_output="$TEST_DIR/from-vm-multilayer"
+
+    cleanup_multi_layer() {
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
+        rm -f "$pack_output" "$pack_output.smolmachine"
+    }
+    cleanup_multi_layer
+
+    echo "  Step 1: Create a machine from a multi-layer image and write a marker..."
+    $SMOLVM machine create --name "$vm_name" --image python:3.12-slim --net 2>&1 || {
+        echo "FAIL: machine create failed"; cleanup_multi_layer; return 1
+    }
+    $SMOLVM machine start --name "$vm_name" 2>&1 || {
+        echo "FAIL: machine start failed"; cleanup_multi_layer; return 1
+    }
+    $SMOLVM machine exec --name "$vm_name" -- sh -c 'echo baked > /root/multilayer-marker' 2>&1 || {
+        echo "FAIL: could not write marker"; cleanup_multi_layer; return 1
+    }
+    $SMOLVM machine stop --name "$vm_name" 2>&1 || {
+        echo "FAIL: machine stop failed"; cleanup_multi_layer; return 1
+    }
+
+    echo "  Step 2: Pack it (this is what failed once an image had four layers)..."
+    $SMOLVM pack create --from-vm "$vm_name" -o "$pack_output" 2>&1 || {
+        echo "FAIL: pack --from-vm failed on a multi-layer image"
+        cleanup_multi_layer; return 1
+    }
+    [[ -f "$pack_output.smolmachine" ]] || {
+        echo "FAIL: no .smolmachine sidecar produced"; cleanup_multi_layer; return 1
+    }
+
+    echo "  Step 3: The packed machine keeps its baked file and the image env..."
+    local result
+    result=$(run_with_timeout 90 "$pack_output" run -- sh -c \
+        'cat /root/multilayer-marker; echo "PYVER=$PYTHON_VERSION"; echo "LANG=$LANG"; python3 --version' 2>&1)
+
+    [[ "$result" == *"baked"* ]] || {
+        echo "FAIL: baked marker missing from packed machine (got: $result)"
+        cleanup_multi_layer; return 1
+    }
+    # Empty PYVER= means the image's env never reached the manifest.
+    [[ "$result" == *"PYVER=3.12"* ]] || {
+        echo "FAIL: image env PYTHON_VERSION missing from packed machine (got: $result)"
+        cleanup_multi_layer; return 1
+    }
+    [[ "$result" == *"LANG=C.UTF-8"* ]] || {
+        echo "FAIL: image env LANG missing from packed machine (got: $result)"
+        cleanup_multi_layer; return 1
+    }
+    # Resolved through the image's PATH rather than an absolute path.
+    [[ "$result" == *"Python 3.12"* ]] || {
+        echo "FAIL: python3 did not resolve on PATH in packed machine (got: $result)"
+        cleanup_multi_layer; return 1
+    }
+
+    cleanup_multi_layer
+}
+
 # Regression: --rebase-from-image intentionally rebuilds lower image layers and
 # drops imported artifact layers, while keeping the current writable overlay.
 test_from_vm_rebase_from_image_drops_imported_layers() {
@@ -1581,6 +1659,7 @@ if [[ "$QUICK_MODE" != "true" ]]; then
     run_test "from-vm-image: container overlay captured" test_from_vm_image_overlay || true
     run_test "from-vm-image: imported layers preserved on repack" test_from_vm_imported_layers_preserved_on_repack || true
     run_test "from-vm-image: rebase flag drops imported layers" test_from_vm_rebase_from_image_drops_imported_layers || true
+    run_test "from-vm-image: multi-layer image packs and keeps image env" test_from_vm_multi_layer_and_image_env || true
 
     echo ""
     echo "Running Debian Pack Roundtrip Tests..."

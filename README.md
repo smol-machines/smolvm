@@ -44,6 +44,63 @@ smolvm machine run --net -it --image alpine -- /bin/sh
 # inside the VM: apk add sl && sl && exit
 ```
 
+Smolfile
+--------
+
+A Smolfile declares a machine in TOML — the equivalent of a `Dockerfile` or a
+cloud-init file, but for a whole VM: image, resources, network policy, mounts,
+ports, and setup commands in one checked-in file.
+
+```toml
+image = "python:3.12-alpine"
+net = true
+cpus = 4
+memory = 4096
+
+ports = ["8000:8000"]
+volumes = ["./src:/app"]
+init = ["pip install -r /app/requirements.txt"]
+
+[network]
+allow_hosts = ["api.stripe.com", "pypi.org"]
+
+[auth]
+ssh_agent = true
+```
+
+```bash
+smolvm machine create --name myvm -s Smolfile   # or --smolfile <PATH>
+smolvm machine start --name myvm
+```
+
+Unknown keys are rejected rather than ignored, so a typo fails at create time
+instead of silently doing nothing.
+
+Common keys: `image`, `cpus`, `memory`, `net`, `ports`, `volumes`, `env`,
+`init`, `workdir`, `gpu`, `cuda`, `docker_socket`, `storage`, `overlay`, and the
+`[network]`, `[dev]`, `[auth]`, `[health]`, `[restart]`, `[service]` tables.
+
+### Snapshot a machine into a reusable image
+
+You don't need a Dockerfile to keep an environment. Set a machine up however you
+like — by hand, or from a Smolfile — then pack the stopped machine into a
+`.smolmachine` artifact and push it to any OCI registry:
+
+```bash
+smolvm machine shell --name myvm          # install and configure interactively
+smolvm machine stop  --name myvm
+smolvm pack create --from-vm myvm -o myvm.smolmachine
+smolvm pack push --file myvm.smolmachine ghcr.io/you/myvm:v1
+```
+
+Anyone can then pull it and boot the exact same machine:
+
+```bash
+smolvm pack pull ghcr.io/you/myvm:v1
+```
+
+Working Smolfiles: [python](https://github.com/smol-machines/smolvm/tree/main/examples/python-app) · [node](https://github.com/smol-machines/smolvm/tree/main/examples/node-app) · [docker-in-vm](https://github.com/smol-machines/smolvm/tree/main/examples/docker-in-vm) · [local-llm](https://github.com/smol-machines/smolvm/tree/main/examples/local-llm) · [headless-browser](https://github.com/smol-machines/smolvm/tree/main/examples/headless-browser) · [doom](https://github.com/smol-machines/smolvm/tree/main/examples/doom-web)
+
 Use This For
 ------------
 
@@ -104,29 +161,9 @@ smolvm machine run --ssh-agent --net --image alpine -- sh -c "apk add -q openssh
 smolvm machine exec --name myvm -- git clone git@github.com:org/private-repo.git
 ```
 
-**Declare environments with a Smolfile** — reproducible VM config in a simple TOML file.
-
-```toml
-image = "python:3.12-alpine"
-net = true
-
-[network]
-allow_hosts = ["api.stripe.com", "db.example.com"]
-
-[dev]
-init = ["pip install -r requirements.txt"]
-volumes = ["./src:/app"]
-
-[auth]
-ssh_agent = true
-```
-
-```bash
-smolvm machine create --name myvm -s Smolfile
-smolvm machine start --name myvm
-```
-
-More examples: [python](https://github.com/smol-machines/smolvm/tree/main/examples/python-app) · [node](https://github.com/smol-machines/smolvm/tree/main/examples/node-app) · [doom](https://github.com/smol-machines/smolvm/tree/main/examples/doom-web)
+**Declare environments in a file** — see [Smolfile](#smolfile) above for
+reproducible machine config, and for snapshotting a configured machine into a
+reusable `.smolmachine` image without writing a Dockerfile.
 
 How It Works
 ------------

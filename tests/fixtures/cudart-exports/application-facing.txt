@@ -1,0 +1,58 @@
+# Application-facing cudart/cuBLAS symbols the shim is expected to export.
+#
+# This is the gate's required set. It is deliberately NARROWER than union.txt:
+# of the 220 symbols the matrix requires that the 405-export shim does not
+# provide, 187 are reachable only through real NVIDIA math libraries
+# (cuSOLVER, cuSOLVER-Mg, nvBLAS) that link the staged libcublas.so.13. Those
+# are mostly cuBLAS ILP64 `_64` variants, cublasXt*, and private
+# cublasLt_for_cublas_* ABI, and are not intended to be implemented. Gating on
+# union.txt would therefore fail on day one for all 187.
+#
+# Membership rule: the symbol is imported by at least one object that is NOT
+# itself an NVIDIA math library — i.e. some application binary actually binds
+# it, so a missing export is a user-visible failure rather than a path nothing
+# reaches. Derived from the per-image fixtures' underlying scan; the trailing
+# comment on each line names the importing object(s).
+#
+# 33 symbols. NOTE: the PR description originally said 26. That count
+# reported 'required only by torch' (10) and 'required only by other
+# application libraries' (16) as if they partitioned the set, and silently
+# dropped 7 symbols that cuPy's cublas binding imports alongside cuSOLVER.
+# Omitting those 7 would leave cuPy broken, so they are included here.
+
+# --- required by torch's own libraries (10) ---
+cublasSetSmCountTarget            # libtorch_cuda.so
+cudaGraphAddEmptyNode             # libc10_cuda.so
+cudaGraphAddNode                  # libtorch_cuda.so
+cudaGraphConditionalHandleCreate  # libtorch_cuda.so
+cudaGraphNodeGetType              # libc10_cuda.so
+cudaKernelSetAttributeForDevice   # libtorch_cuda.so
+cudaLibraryGetKernel              # libtorch_cuda.so
+cudaLibraryLoadData               # libtorch_cuda.so
+cudaLibraryUnload                 # libtorch_cuda.so
+cudaStreamBeginCaptureToGraph     # libtorch_cuda.so
+
+# --- required by other application-level libraries (23) ---
+cublasCdgmm                       # cublas.cpython-312-x86_64-linux-gnu.so
+cublasCgeam                       # cublas.cpython-312-x86_64-linux-gnu.so
+cublasCgetriBatched               # cublas.cpython-312-x86_64-linux-gnu.so
+cublasDdgmm                       # cublas.cpython-312-x86_64-linux-gnu.so
+cublasDgetriBatched               # cublas.cpython-312-x86_64-linux-gnu.so
+cublasDsbmv_v2                    # cublas.cpython-312-x86_64-linux-gnu.so
+cublasDtpttr                      # cublas.cpython-312-x86_64-linux-gnu.so
+cublasDtrttp                      # cublas.cpython-312-x86_64-linux-gnu.so
+cublasGetStream_v2                # cublas.cpython-312-x86_64-linux-gnu.so
+cublasGetVersion_v2               # cublas.cpython-312-x86_64-linux-gnu.so
+cublasSdgmm                       # cublas.cpython-312-x86_64-linux-gnu.so
+cublasSgetriBatched               # cublas.cpython-312-x86_64-linux-gnu.so
+cublasSsbmv_v2                    # cublas.cpython-312-x86_64-linux-gnu.so
+cublasStpttr                      # cublas.cpython-312-x86_64-linux-gnu.so
+cublasStrttp                      # cublas.cpython-312-x86_64-linux-gnu.so
+cublasZdgmm                       # cublas.cpython-312-x86_64-linux-gnu.so
+cublasZgeam                       # cublas.cpython-312-x86_64-linux-gnu.so
+cublasZgetriBatched               # cublas.cpython-312-x86_64-linux-gnu.so
+cudaDeviceGetByPCIBusId           # libplugin_GPUNETIO.so
+cudaGetSymbolSize                 # libucm_cuda.so, libucm_cuda.so.0, libucm_cuda.so.0.0.0
+cudaMemcpy2D                      # 5 objects
+cudaMemcpyFromSymbol              # 388 objects
+cudaOccupancyMaxActiveClusters    # gemm_sm100.so

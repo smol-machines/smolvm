@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>smolvm — downloads</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font: 14px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    max-width: 52rem; margin: 5rem auto 4rem; padding: 0 1.25rem;
+    color: #1a1a1a; background: #fff;
+  }
+  @media (prefers-color-scheme: dark) { body { color: #d8d8d8; background: #111; } }
+  h1 { font-size: 1.2rem; font-weight: 600; margin: 0 0 .25rem; }
+  h2 { font-size: .95rem; font-weight: 600; margin: 2.5rem 0 .75rem; opacity: .85; }
+  .sub { opacity: .6; margin: 0 0 2rem; }
+  pre { background: rgba(127,127,127,.12); padding: .85rem 1rem; border-radius: 4px; overflow-x: auto; margin: .75rem 0; }
+  a { color: inherit; text-underline-offset: 2px; }
+  .grid { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: .3rem 1rem .3rem 0; white-space: nowrap; border-bottom: 1px solid rgba(127,127,127,.16); }
+  th { font-weight: 600; opacity: .55; font-size: .82rem; }
+  td.ver { font-weight: 600; }
+  .latest td.ver::after { content: "latest"; margin-left: .5rem; font-weight: 400; font-size: .72rem; opacity: .55; }
+  td.dim, .dim { opacity: .35; }
+  hr { border: 0; border-top: 1px solid rgba(127,127,127,.25); margin: 3rem 0 1.25rem; }
+  footer { opacity: .5; font-size: .85rem; }
+</style>
+</head>
+<body>
+  <h1>smolvm</h1>
+  <p class="sub">Ship and run software with isolation by default — per-workload microVMs, sub-second boot, macOS / Linux / Windows.</p>
+
+  <h2>install</h2>
+  <p>macOS &amp; Linux:</p>
+  <pre>curl -sSL https://smolmachines.com/install.sh | bash</pre>
+  <p>Arch Linux (pacman) — add to <code>/etc/pacman.conf</code>, then <code>sudo pacman -Sy smolvm</code>:</p>
+  <pre>[smol-machines]
+SigLevel = Optional TrustAll
+Server  = https://smol-machines.github.io/smolvm/pacman/$arch</pre>
+  <p>Debian / Ubuntu (apt) — <code>amd64</code> &amp; <code>arm64</code>:</p>
+  <pre>echo 'deb [trusted=yes] https://smol-machines.github.io/smolvm/apt ./' | sudo tee /etc/apt/sources.list.d/smolvm.list
+sudo apt-get update &amp;&amp; sudo apt-get install smolvm</pre>
+  <p>Fedora / RHEL (dnf) — <code>x86_64</code> &amp; <code>aarch64</code>:</p>
+  <pre>sudo tee /etc/yum.repos.d/smolvm.repo &lt;&lt;'EOF'
+[smolvm]
+name=smolvm
+baseurl=https://smol-machines.github.io/smolvm/yum
+enabled=1
+gpgcheck=0
+EOF
+sudo dnf install smolvm</pre>
+  <p>Nix (flake) — <code>x86_64/aarch64-linux</code> &amp; <code>aarch64-darwin</code>:</p>
+  <pre>nix profile install github:smol-machines/smolvm</pre>
+  <p>Windows: download the <span class="win-link">windows-x86_64</span> build below and run <code>smolvm.exe</code> (needs the Windows Hypervisor Platform enabled).</p>
+
+  <h2>releases</h2>
+  <div class="grid">
+    <table>
+      <thead><tr>
+        <th>version</th><th>date</th>
+        <th>macOS arm64</th><th>Linux x86_64</th><th>Linux arm64</th><th>Windows x86_64</th><th>sha256</th>
+      </tr></thead>
+      <tbody id="rows"><tr><td colspan="7" class="dim">loading…</td></tr></tbody>
+    </table>
+  </div>
+
+  <hr>
+  <footer>
+    <a href="https://github.com/smol-machines/smolvm">source</a> ·
+    <a href="https://github.com/smol-machines/smolvm/blob/main/README.md">docs</a> ·
+    <a href="https://github.com/smol-machines/smolvm/releases">all&nbsp;releases</a> ·
+    <a href="pacman/">pacman</a> ·
+    <a href="apt/">apt</a> ·
+    <a href="yum/">yum</a>
+  </footer>
+
+<script>
+const REPO = "smol-machines/smolvm";
+const PLATS = [
+  ["darwin-arm64",  a => a.includes("darwin-arm64")],
+  ["linux-x86_64",  a => a.includes("linux-x86_64")],
+  ["linux-arm64",   a => a.includes("linux-arm64")],
+  ["windows-x86_64",a => a.includes("windows")],
+  ["sha256",        a => a.includes("checksums") || a.endsWith(".sha256")],
+];
+const cell = (assets, pred) => {
+  const a = assets.find(x => pred(x.name));
+  if (!a) return '<td class="dim">—</td>';
+  const label = /\.(zip)$/.test(a.name) ? "zip" : (a.name.endsWith(".sha256") ? "txt" : "tar.gz");
+  return `<td><a href="${a.browser_download_url}">${label}</a></td>`;
+};
+fetch(`https://api.github.com/repos/${REPO}/releases?per_page=100`)
+  .then(r => r.ok ? r.json() : Promise.reject(r.status))
+  .then(rels => {
+    const versions = rels.filter(r => /^v\d/.test(r.tag_name) && !r.draft);
+    if (!versions.length) throw "no releases";
+    const rows = versions.map((r, i) => {
+      const date = (r.published_at || "").slice(0, 10);
+      const cells = PLATS.map(([, pred]) => cell(r.assets, pred)).join("");
+      return `<tr class="${i === 0 ? "latest" : ""}"><td class="ver">${r.tag_name}</td><td>${date}</td>${cells}</tr>`;
+    }).join("");
+    document.getElementById("rows").innerHTML = rows;
+  })
+  .catch(() => {
+    document.getElementById("rows").innerHTML =
+      '<tr><td colspan="7">See <a href="https://github.com/smol-machines/smolvm/releases">github.com/smol-machines/smolvm/releases</a>.</td></tr>';
+  });
+</script>
+</body>
+</html>

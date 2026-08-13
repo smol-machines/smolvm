@@ -322,6 +322,26 @@ pub enum AgentRequest {
         layer_index: usize,
     },
 
+    /// Merge a stack of directories into a single tar archive.
+    ///
+    /// `pack create --from-vm` ships the machine's image layers plus whatever the
+    /// container has written since as ONE flattened layer. The merge has to apply
+    /// whiteouts and opaque markers exactly as the runtime would, so it is done
+    /// with a read-only overlay mount rather than a file copy.
+    ///
+    /// The agent owns this rather than the host driving `mount(8)` over `VmExec`,
+    /// because `mount(8)` rejects a `lowerdir=` value beyond ~255 bytes — about
+    /// three OCI layer paths — while the agent can append each layer separately
+    /// through the same `fsconfig` path the runtime container mount uses.
+    FlattenLayers {
+        /// Directories to merge, bottom -> top. Entries that are missing or empty
+        /// are dropped, so a caller may include a container overlay's upper dir
+        /// without first checking whether the machine ever wrote to it.
+        lowerdirs: Vec<String>,
+        /// Guest path to write the tar archive to.
+        output: String,
+    },
+
     /// Execute a command directly in the VM (not in a container).
     ///
     /// This runs the command in the agent's Alpine rootfs without any
@@ -607,6 +627,9 @@ impl AgentRequest {
             AgentRequest::NetworkTest { .. } => "NetworkTest".into(),
             AgentRequest::Shutdown => "Shutdown".into(),
             AgentRequest::ExportLayer { .. } => "ExportLayer".into(),
+            AgentRequest::FlattenLayers { lowerdirs, .. } => {
+                format!("FlattenLayers {{ count: {} }}", lowerdirs.len())
+            }
             AgentRequest::VmExec { .. } => "VmExec".into(),
             AgentRequest::Run { image, .. } => format!("Run {{ image: {image} }}"),
             AgentRequest::Stdin { .. } => "Stdin".into(),

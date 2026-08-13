@@ -200,6 +200,9 @@ fn maybe_set_clock_from_host() {
 }
 
 fn main() {
+    if process::container_init_requested() {
+        std::process::exit(process::run_container_init());
+    }
     if forkpoint::worker_ready_helper_requested() {
         std::process::exit(forkpoint::run_worker_ready_helper());
     }
@@ -501,36 +504,56 @@ fn main() {
 /// event-driven readiness signal that — unlike the marker — needs no writable
 /// filesystem, so it works even when the rootfs share is root-owned (packaged
 /// installs). Best-effort: a failure just falls back to the marker/ping.
+/// Returns whether the doorbell was answered — i.e. the host is listening and
+/// has already observed readiness. The caller uses that to decide whether the
+/// marker file is needed at all.
 #[cfg(target_os = "linux")]
-fn ready_doorbell() {
+fn ready_doorbell() -> bool {
     unsafe {
         let fd = libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0);
         if fd < 0 {
-            return;
+            return false;
         }
         let mut addr: libc::sockaddr_vm = std::mem::zeroed();
         addr.svm_family = libc::AF_VSOCK as libc::sa_family_t;
         addr.svm_cid = libc::VMADDR_CID_HOST;
         addr.svm_port = smolvm_protocol::ports::AGENT_READY;
-        let _ = libc::connect(
+        let connected = libc::connect(
             fd,
             &addr as *const libc::sockaddr_vm as *const libc::sockaddr,
             std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t,
-        );
+        ) == 0;
         libc::close(fd);
+        connected
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn ready_doorbell() {}
+fn ready_doorbell() -> bool {
+    false
+}
 
 fn signal_ready_to_host() {
     use std::path::Path;
 
-    // Ring the event-driven doorbell first (a single connect), then write the file
-    // marker — both go out microseconds apart, and the host takes whichever it
-    // sees first.
-    ready_doorbell();
+    // Ring the event-driven doorbell first. A successful connect means the host
+    // has *already* observed readiness, so the marker would be write-only state:
+    // nothing reads it, and it is never cleaned up on this path.
+    //
+    // Skipping it matters beyond tidiness. The marker lands in the SHARED agent
+    // rootfs, and under per-VM uid isolation it is created owned by the VM's
+    // dropped uid with mode 0600. `collect_agent_rootfs` must read every byte of
+    // that tree, so each leftover marker is a file that makes `pack create` fail
+    // with EACCES for any other user (BUG-151, #865) — and the host's
+    // `prune_orphaned_ready_markers` cannot remove them on a root-owned packaged
+    // install, by its own admission.
+    //
+    // The marker is still written when the doorbell goes unanswered: an older
+    // host does not bind the listener, and a host whose doorbell vsock port
+    // failed to add falls back to marker/ping. Those hosts keep working.
+    if ready_doorbell() {
+        return;
+    }
 
     let content = uptime_ms().to_string();
 
@@ -1909,6 +1932,22 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
 
         debug!(method = %request.log_summary(), "received request");
 
+        // A fork clone resumes this already-initialized agent with fresh
+        // virtiofs devices. Repair hidden/stale boot mounts before replying to
+        // even a Ping, so fork readiness cannot race the inherited workload's
+        // first access to a dead golden mount (notably /opt/smolvm-ring).
+        if let Err(error) = storage::repair_boot_volume_mounts() {
+            warn!(%error, "failed to restore boot volume mounts");
+            send_response(
+                stream,
+                &AgentResponse::error(
+                    format!("restore boot volume mounts: {error}"),
+                    error_codes::INTERNAL_ERROR,
+                ),
+            )?;
+            continue;
+        }
+
         // Check if this is an interactive run request
         if let AgentRequest::Run {
             interactive: true, ..
@@ -2101,6 +2140,10 @@ fn handle_request(
         AgentRequest::FormatStorage => handle_format_storage(),
 
         AgentRequest::StorageStatus => handle_storage_status(),
+
+        AgentRequest::FlattenLayers { lowerdirs, output } => {
+            handle_flatten_layers(&lowerdirs, &output)
+        }
 
         AgentRequest::NetworkTest { url } => {
             info!(url = %url, "testing network connectivity directly from agent");
@@ -3270,6 +3313,7 @@ fn write_oci_bundle(
     mounts: &[(String, String, bool)],
     tty: bool,
     unprivileged: bool,
+    container_init: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
     use std::path::Path;
 
@@ -3299,6 +3343,13 @@ fn write_oci_bundle(
     // shells see /dev/dri when the VM was started with --gpu.
     spec.add_gpu_devices_if_available();
 
+    if container_init {
+        const INIT_SOURCE: &str = "/usr/local/bin/smolvm-agent";
+        const INIT_DESTINATION: &str = "/run/smolvm/init";
+        storage::ensure_file_mount_target_under_root(rootfs_path, INIT_DESTINATION)?;
+        spec.add_bind_mount(INIT_SOURCE, INIT_DESTINATION, true);
+    }
+
     for (tag, container_path, read_only) in mounts {
         let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
         spec.add_bind_mount(
@@ -3312,6 +3363,7 @@ fn write_oci_bundle(
     storage::add_storage_fallback(&mut spec, mounts, unprivileged);
 
     ssh_agent::inject_into_container(&mut spec);
+    publish_socket::inject_into_container(&mut spec);
     rosetta::inject_into_container(&mut spec);
     forkpoint::inject_into_container(&mut spec);
     cuda::inject_into_container(&mut spec, rootfs_path);
@@ -3480,6 +3532,7 @@ fn handle_run_detached(
         &mounts,
         false,
         unprivileged,
+        false,
     ) {
         Ok(id) => id,
         Err(e) => {
@@ -3855,6 +3908,10 @@ pub fn resolve_main_container(persistent_overlay_id: Option<&str>) -> Option<Str
         return None;
     }
 
+    if let Some(pid) = crun_container_pid(&cid) {
+        stabilize_new_container(pid);
+    }
+
     if is_container_running(&cid) {
         // A restored fork clone's keep-alive container is alive (its process
         // came back with the golden's RAM) but runs from the golden's
@@ -3877,6 +3934,42 @@ pub fn resolve_main_container(persistent_overlay_id: Option<&str>) -> Option<Str
     let _ = std::fs::remove_file(&id_path);
     let _ = crun::CrunCommand::delete(&cid, true).output();
     None
+}
+
+/// Close the short `crun start` race where a container reports running, its
+/// main command exits immediately afterwards, and an exec reaches crun before
+/// stale-state cleanup. Mature containers pay no delay; only a process in its
+/// first 100 ms is allowed to settle before the second validated state check.
+#[cfg(target_os = "linux")]
+fn stabilize_new_container(pid: u32) {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return;
+    };
+    let Some((_, remainder)) = stat.rsplit_once(')') else {
+        return;
+    };
+    let Some(start_ticks) = remainder
+        .split_whitespace()
+        .nth(19)
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return;
+    };
+    let Some(uptime) = std::fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|value| value.split_whitespace().next()?.parse::<f64>().ok())
+    else {
+        return;
+    };
+    let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if ticks_per_second <= 0 {
+        return;
+    }
+    let age = uptime - start_ticks as f64 / ticks_per_second as f64;
+    const SETTLE_SECONDS: f64 = 0.1;
+    if (0.0..SETTLE_SECONDS).contains(&age) {
+        std::thread::sleep(std::time::Duration::from_secs_f64(SETTLE_SECONDS - age));
+    }
 }
 
 /// Non-Linux stub.
@@ -3907,9 +4000,9 @@ static CONSOLE_SOCKET_WORKS: std::sync::atomic::AtomicBool =
 /// resize message is silently applied to the wrong terminal. See GH
 /// #156.
 /// Establish the long-lived "main" container for a persistent overlay and return
-/// its id. PID 1 is a keep-alive (`tail -f /dev/null`, present on both busybox and
-/// coreutils) that never exits, so processes a later `crun exec` backgrounds
-/// inside it survive across exec calls for the machine's lifetime. Env / workdir /
+/// its id. PID 1 is smolvm's image-independent keepalive and child reaper, so
+/// processes a later `crun exec` backgrounds inside it survive across exec calls
+/// for the machine's lifetime without accumulating orphan zombies. Env / workdir /
 /// user are inherited from the image so exec'd commands see the right environment.
 /// Uses the same two-step `crun create` + `crun start` as [`handle_run_detached`]
 /// (`crun run --detach` hangs in the smolvm VM environment).
@@ -3924,11 +4017,7 @@ fn ensure_main_container(
     use std::path::Path;
 
     let keepalive = ResolvedLaunch {
-        command: vec![
-            "tail".to_string(),
-            "-f".to_string(),
-            "/dev/null".to_string(),
-        ],
+        command: vec!["/run/smolvm/init".to_string(), "container-init".to_string()],
         env: base_launch.env.clone(),
         workdir: base_launch.workdir.clone(),
         user: base_launch.user.clone(),
@@ -3950,6 +4039,7 @@ fn ensure_main_container(
         mounts,
         false,
         unprivileged,
+        true,
     )?;
 
     let create = crun::CrunCommand::create(&bundle_path, &container_id).output()?;
@@ -4018,7 +4108,7 @@ fn spawn_interactive_command(
     }
 
     // On a persistent machine with no main container yet, establish a long-lived
-    // keep-alive container (PID 1 = `tail -f /dev/null`) and exec the command INTO
+    // keep-alive container (PID 1 = smolvm's child reaper) and exec the command INTO
     // it, rather than running the command AS the container. Without this, PID 1 is
     // the command itself, so the container — and anything the command backgrounds
     // (a `dockerd`, a dev server, a k3d cluster) — is torn down the moment the
@@ -4048,8 +4138,15 @@ fn spawn_interactive_command(
     // Build the OCI bundle (config.json) and get a fresh container ID. When
     // tty=true the spec sets terminal:true and a starting consoleSize, and the
     // PTY master is obtained from crun via --console-socket below.
-    let container_id =
-        write_oci_bundle(rootfs_path, &bundle_path, launch, mounts, tty, unprivileged)?;
+    let container_id = write_oci_bundle(
+        rootfs_path,
+        &bundle_path,
+        launch,
+        mounts,
+        tty,
+        unprivileged,
+        false,
+    )?;
 
     // Persist the container ID so subsequent execs join this container.
     // Written before spawn: if spawn fails the ID is stale, but
@@ -4227,6 +4324,7 @@ fn spawn_interactive_command(
 
     // Forward SSH agent into the container if enabled at boot.
     ssh_agent::inject_into_container(&mut spec);
+    publish_socket::inject_into_container(&mut spec);
     rosetta::inject_into_container(&mut spec);
     forkpoint::inject_into_container(&mut spec);
     cuda::inject_into_container(&mut spec, rootfs_path);
@@ -5219,7 +5317,7 @@ fn run_in_keepalive_container(
     )?;
 
     // Reuse the running keep-alive container, or establish one now so this and
-    // every later exec join the same container (PID 1 = `tail -f /dev/null`).
+    // every later exec join the same container (PID 1 = smolvm's child reaper).
     // Also carry the container's rootfs so the user can be resolved against its
     // /etc/passwd below.
     let (cid, rootfs) = match resolve_main_container(Some(overlay_id)) {
@@ -5250,6 +5348,7 @@ fn run_in_keepalive_container(
     // previously used blocking `.output()` / `wait_with_output()`, which
     // silently ignored `timeout_ms` — an `exec --timeout N` against an image
     // machine ran to completion regardless (found by QA 2026-07-19).
+    let exec_pid_file = crun::ExecPidFile::new()?;
     let mut builder = crun::CrunCommand::exec(
         &cid,
         &launch.env,
@@ -5258,6 +5357,7 @@ fn run_in_keepalive_container(
         false,
     )
     .user(launch.user.as_deref())
+    .pid_file(exec_pid_file.path())
     .capture_output();
     builder = if stdin_data.is_some() {
         builder.stdin_piped()
@@ -5273,13 +5373,12 @@ fn run_in_keepalive_container(
     // Kill only the exec'd process on timeout/disconnect — NOT the keep-alive
     // container, which hosts the shared namespace for every exec (a timed-out
     // `exec -- sleep 10` must not destroy the machine's workload).
-    let exec_pid = child.id();
     let result = crate::process::wait_with_timeout_cleanup_and_liveness(
         &mut child,
         timeout_ms,
         client_fd,
-        || unsafe {
-            libc::kill(exec_pid as libc::pid_t, libc::SIGKILL);
+        || {
+            exec_pid_file.kill_workload();
         },
     )?;
 
@@ -5329,6 +5428,14 @@ fn handle_run(
     unprivileged: bool,
 ) -> AgentResponse {
     info!(image = %image, command = ?command, mounts = ?mounts, timeout_ms = ?timeout_ms, persistent = persistent_overlay_id.is_some(), stdin = stdin_data.is_some(), "running command");
+
+    // Host-injected boot mounts (including the implicit CUDA ring) must be
+    // present in ordinary non-interactive containers too. Interactive and
+    // detached paths already merge them; omitting them here creates a fresh
+    // post-fork overlay with a plain /opt/smolvm-ring directory, so mapped
+    // host allocations fall back or can hit the clone's stale golden mount.
+    let mounts = storage::merged_with_boot_mounts(mounts);
+    let mounts = &mounts[..];
 
     // SSH agent forwarding: make SSH_AUTH_SOCK part of the command env so it
     // survives the keep-alive `crun exec` path (#542), which runs commands with
@@ -5500,6 +5607,15 @@ fn handle_cleanup_overlay(workload_id: &str) -> AgentResponse {
     match storage::cleanup_overlay(workload_id) {
         Ok(_) => AgentResponse::ok(None),
         Err(e) => AgentResponse::from_err(e, error_codes::CLEANUP_FAILED),
+    }
+}
+
+/// Handle a request to merge layer directories into one tar archive.
+fn handle_flatten_layers(lowerdirs: &[String], output: &str) -> AgentResponse {
+    info!(layer_count = lowerdirs.len(), output = %output, "flattening layers");
+    match storage::flatten_layers_to_tar(lowerdirs, std::path::Path::new(output)) {
+        Ok(_) => AgentResponse::ok(None),
+        Err(e) => AgentResponse::from_err(e, error_codes::MOUNT_FAILED),
     }
 }
 

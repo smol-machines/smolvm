@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use crate::agent::{AgentClient, AgentManager, ExecEvent, RunConfig};
+use crate::config::VmRecord;
 use crate::Result;
 use smolvm_protocol::ImageInfo;
 
@@ -103,6 +104,18 @@ impl VmHandle {
         self.client_mut()?.list_images()
     }
 
+    /// Pull and launch an image machine's persistent workload before the SDK
+    /// reports create/start complete.
+    pub fn launch_image_workload(&mut self, name: &str, record: &VmRecord) -> Result<()> {
+        let Some(image) = record.image.as_deref() else {
+            return Ok(());
+        };
+        let client = self.client_mut()?;
+        client.pull_with_registry_config(image)?;
+        crate::workload::launch_image_workload(client, name, record, record.env.clone())?;
+        Ok(())
+    }
+
     /// Write a file into the VM.
     pub fn write_file(&mut self, path: &str, data: &[u8], mode: Option<u32>) -> Result<()> {
         self.client_mut()?.write_file(path, data, mode)
@@ -145,5 +158,10 @@ impl VmHandle {
     pub fn stop(&mut self) -> Result<()> {
         self.client = None;
         self.manager.stop()
+    }
+
+    /// Let a CLI-started VM outlive the process that launched it.
+    pub fn detach(self) {
+        self.manager.detach();
     }
 }

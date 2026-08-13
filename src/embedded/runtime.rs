@@ -41,6 +41,19 @@ impl EmbeddedRuntime {
         self.with_name_lock(&spec.name, || control::create_vm(&self.db, &spec))
     }
 
+    /// Create a persisted image machine with its launch-time environment and
+    /// working directory.
+    pub fn create_machine_with_workload(
+        &self,
+        spec: MachineSpec,
+        env: Vec<(String, String)>,
+        workdir: Option<String>,
+    ) -> Result<()> {
+        self.with_name_lock(&spec.name, || {
+            control::create_vm_with_workload(&self.db, &spec, env, workdir)
+        })
+    }
+
     /// Reclaim shim-managed sandbox VMs whose process is gone (node reboot or a
     /// shim crash left the record + disks behind). See
     /// [`control::reconcile_runtime_machines`]. Returns the count reclaimed.
@@ -59,7 +72,15 @@ impl EmbeddedRuntime {
                 self.remove_cached_handle(name)?;
             }
 
-            let handle = control::start_vm(&self.db, name)?;
+            let started = control::start_vm(&self.db, name)?;
+            let mut handle = started.handle;
+            if started.freshly_started {
+                if let Err(error) = self.launch_image_workload(name, &mut handle) {
+                    let _ = handle.stop();
+                    let _ = control::mark_stopped(&self.db, name);
+                    return Err(error);
+                }
+            }
             self.insert_handle(name, handle)?;
             Ok(())
         })
@@ -98,7 +119,15 @@ impl EmbeddedRuntime {
                 self.remove_cached_handle(name)?;
             }
 
-            let handle = control::start_forkable_vm(&self.db, name)?;
+            let started = control::start_forkable_vm(&self.db, name)?;
+            let mut handle = started.handle;
+            if started.freshly_started {
+                if let Err(error) = self.launch_image_workload(name, &mut handle) {
+                    let _ = handle.stop();
+                    let _ = control::mark_stopped(&self.db, name);
+                    return Err(error);
+                }
+            }
             self.insert_handle(name, handle)?;
             Ok(())
         })
@@ -113,6 +142,30 @@ impl EmbeddedRuntime {
         self.with_name_lock(clone, || {
             let handle = control::fork_vm(&self.db, golden, clone, ports)?;
             self.insert_handle(clone, handle)?;
+            Ok(())
+        })
+    }
+
+    /// Fork a machine for a detached CLI operation. Unlike the SDK path, the
+    /// clone intentionally outlives this process; all preparation, retained
+    /// snapshot reuse, and fail-closed identity rejuvenation remain shared.
+    pub fn fork_machine_detached(
+        &self,
+        golden: &str,
+        clone: &str,
+        ports: &[(u16, u16)],
+        share_weights: bool,
+    ) -> Result<()> {
+        self.with_name_lock(clone, || {
+            let handle = control::fork_vm_with_options(
+                &self.db,
+                golden,
+                clone,
+                ports,
+                share_weights,
+                Some(false),
+            )?;
+            handle.detach();
             Ok(())
         })
     }
@@ -176,7 +229,7 @@ impl EmbeddedRuntime {
         workdir: Option<String>,
         timeout: Option<Duration>,
     ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
-        let image = self.image_of(name);
+        let (image, overlay_owner) = self.image_and_overlay_owner(name)?;
         let handle = self.started_handle(name)?;
         let mut handle = lock_handle(&handle)?;
         match image {
@@ -190,7 +243,7 @@ impl EmbeddedRuntime {
                     .with_env(env)
                     .with_workdir(workdir)
                     .with_timeout(timeout)
-                    .with_persistent_overlay(Some(name.to_string()));
+                    .with_persistent_overlay(Some(overlay_owner));
                 handle.run_config(config)
             }
             // Bare VM: exec directly against the guest.
@@ -235,23 +288,83 @@ impl EmbeddedRuntime {
         data: Vec<u8>,
         mode: Option<u32>,
     ) -> Result<()> {
+        let (image, overlay_owner) = self.image_and_overlay_owner(name)?;
         let handle = self.started_handle(name)?;
         let mut handle = lock_handle(&handle)?;
+        Self::activate_image_overlay(&mut handle, image, overlay_owner)?;
         handle.write_file(path, &data, mode)
     }
 
     /// Read a file from the machine.
     pub fn read_file(&self, name: &str, path: &str) -> Result<Vec<u8>> {
+        let (image, overlay_owner) = self.image_and_overlay_owner(name)?;
         let handle = self.started_handle(name)?;
         let mut handle = lock_handle(&handle)?;
+        Self::activate_image_overlay(&mut handle, image, overlay_owner)?;
         handle.read_file(path)
+    }
+
+    /// Make an image machine's persistent container rootfs the active target
+    /// for the file RPCs that follow. Preparing the overlay alone only mounts
+    /// it; a no-op container run also switches the agent's active file root.
+    fn activate_image_overlay(
+        handle: &mut VmHandle,
+        image: Option<String>,
+        overlay_owner: String,
+    ) -> Result<()> {
+        let Some(image) = image else {
+            return Ok(());
+        };
+        let (code, _, stderr) = handle.run_config(
+            RunConfig::new(image, vec!["/bin/true".to_string()])
+                .with_persistent_overlay(Some(overlay_owner)),
+        )?;
+        if code == 0 {
+            Ok(())
+        } else {
+            Err(Error::agent(
+                "activate image overlay",
+                format!(
+                    "container probe exited {code}: {}",
+                    String::from_utf8_lossy(&stderr).trim()
+                ),
+            ))
+        }
+    }
+
+    /// Return the host port currently forwarding to `guest_port`.
+    ///
+    /// Forks with unpinned ports receive fresh host ports, so SDK callers must
+    /// read the clone's persisted mapping instead of assuming the golden's.
+    pub fn host_port(&self, name: &str, guest_port: u16) -> Result<Option<u16>> {
+        Ok(control::get_record(&self.db, name)?
+            .ports
+            .into_iter()
+            .find_map(|(host, guest)| (guest == guest_port).then_some(host)))
+    }
+
+    /// Return all published guest ports for readiness checks.
+    pub fn guest_ports(&self, name: &str) -> Result<Vec<u16>> {
+        Ok(control::get_record(&self.db, name)?
+            .ports
+            .into_iter()
+            .map(|(_, guest)| guest)
+            .collect())
+    }
+
+    fn launch_image_workload(&self, name: &str, handle: &mut VmHandle) -> Result<()> {
+        let record = control::get_record(&self.db, name)?;
+        handle.launch_image_workload(name, &record)
     }
 
     /// The machine's image, if it is an image (container-workload) machine.
     /// Streamed execs on such a machine must run inside its persistent container
     /// overlay so their writes survive — matching non-streaming exec.
-    fn image_of(&self, name: &str) -> Option<String> {
-        self.db.get_vm(name).ok().flatten().and_then(|r| r.image)
+    fn image_and_overlay_owner(&self, name: &str) -> Result<(Option<String>, String)> {
+        let record = control::get_record(&self.db, name)?;
+        let overlay_owner =
+            crate::workload::persistent_overlay_owner(name, record.golden.as_deref());
+        Ok((record.image, overlay_owner))
     }
 
     /// Execute a command and collect streaming output events.
@@ -280,7 +393,7 @@ impl EmbeddedRuntime {
         timeout: Option<Duration>,
         on_event: F,
     ) -> Result<()> {
-        let image = self.image_of(name);
+        let (image, overlay_owner) = self.image_and_overlay_owner(name)?;
         let handle = self.started_handle(name)?;
         let mut handle = lock_handle(&handle)?;
         match image {
@@ -292,7 +405,7 @@ impl EmbeddedRuntime {
                     .with_env(env)
                     .with_workdir(workdir)
                     .with_timeout(timeout)
-                    .with_persistent_overlay(Some(name.to_string()));
+                    .with_persistent_overlay(Some(overlay_owner));
                 handle.run_streaming_with(config, on_event)
             }
             // Bare VM: stream directly against the guest.
@@ -474,7 +587,8 @@ mod tests {
             resources: crate::agent::VmResources::default(),
             image: None,
             persistent,
-            runtime_managed: false,
+            // Spread the rest so a new spec field does not break the fixtures.
+            ..MachineSpec::default()
         }
     }
 
@@ -533,6 +647,62 @@ mod tests {
         assert_eq!(runtime.state("runtime-state"), "stopped");
         assert!(!runtime.is_running("runtime-state"));
         assert_eq!(runtime.pid("runtime-state"), None);
+    }
+
+    #[test]
+    fn image_overlay_owner_uses_machine_name_for_regular_machines() {
+        let runtime = EmbeddedRuntime::with_db(test_db());
+        let mut spec = test_spec("runtime-image", true);
+        spec.image = Some("example/image:latest".to_string());
+        runtime.create_machine(spec).unwrap();
+
+        assert_eq!(
+            runtime.image_and_overlay_owner("runtime-image").unwrap(),
+            (
+                Some("example/image:latest".to_string()),
+                "runtime-image".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn image_overlay_owner_uses_golden_name_for_clones() {
+        let runtime = EmbeddedRuntime::with_db(test_db());
+        let mut record = test_spec("runtime-clone", true).to_record();
+        record.image = Some("example/image:latest".to_string());
+        record.golden = Some("runtime-golden".to_string());
+        runtime.db.insert_vm("runtime-clone", &record).unwrap();
+
+        assert_eq!(
+            runtime.image_and_overlay_owner("runtime-clone").unwrap(),
+            (
+                Some("example/image:latest".to_string()),
+                "runtime-golden".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn image_overlay_owner_fails_closed_for_missing_records() {
+        let runtime = EmbeddedRuntime::with_db(test_db());
+        assert!(matches!(
+            runtime.image_and_overlay_owner("missing"),
+            Err(crate::Error::VmNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn host_port_reads_the_persisted_mapping() {
+        let runtime = EmbeddedRuntime::with_db(test_db());
+        let mut spec = test_spec("runtime-ports", true);
+        spec.ports = vec![crate::data::network::PortMapping::new(49152, 3000)];
+        runtime.create_machine(spec).unwrap();
+
+        assert_eq!(
+            runtime.host_port("runtime-ports", 3000).unwrap(),
+            Some(49152)
+        );
+        assert_eq!(runtime.host_port("runtime-ports", 9222).unwrap(), None);
     }
 
     #[test]

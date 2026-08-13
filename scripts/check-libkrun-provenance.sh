@@ -45,6 +45,18 @@ for dir in "${LIB_DIRS[@]}"; do
     echo "FAIL  $dir: libkrunfw built from $got_fw but submodule is pinned at $want_fw"
     dir_ok=0; fail=1
   fi
+
+  # A GPU-enabled Linux libkrun normally records virglrenderer as DT_NEEDED.
+  # The runtime deliberately makes Vulkan optional, so committed artifacts must
+  # have that eager dependency removed; otherwise even CPU-only/CUDA-only VMs
+  # fail before boot on hosts without virglrenderer installed.
+  if [[ "$dir" == lib/linux-* ]]; then
+    libkrun="$dir/libkrun.so"
+    if readelf -d "$libkrun" 2>/dev/null | grep -q 'libvirglrenderer\.so\.1'; then
+      echo "FAIL  $dir: libkrun has a hard libvirglrenderer dependency"
+      dir_ok=0; fail=1
+    fi
+  fi
   [[ "$dir_ok" == "1" ]] && echo "OK    $dir (libkrun=$got_krun)"
 done
 

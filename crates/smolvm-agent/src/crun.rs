@@ -3,8 +3,9 @@
 //! This module provides a consistent interface for invoking crun commands
 //! with the correct configuration (cgroup-manager, etc.).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::paths;
 
@@ -41,6 +42,107 @@ pub struct CrunCommand {
     /// the very end in `spawn`/`output`/`status` so options added later (e.g.
     /// `--console-socket` via `console_socket()`) still land before them.
     pending_positionals: Vec<String>,
+}
+
+/// Unique pid file for one foreground `crun exec` invocation.
+///
+/// The PID of the `crun` client is not the PID of the workload in the
+/// container. Keeping the pid file alive until the wait completes lets timeout
+/// and disconnect cleanup signal the workload itself, then removes the runtime
+/// artifact on every return path.
+pub struct ExecPidFile {
+    path: PathBuf,
+}
+
+impl ExecPidFile {
+    pub fn new() -> std::io::Result<Self> {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+
+        std::fs::create_dir_all(paths::CONTAINERS_RUN_DIR)?;
+        let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path = Path::new(paths::CONTAINERS_RUN_DIR)
+            .join(format!("exec-{}-{sequence}.pid", std::process::id()));
+        Ok(Self { path })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Signal the actual container workload recorded by crun. Returns false
+    /// when crun did not create a valid pid file, in which case killing the
+    /// foreground crun child remains the caller's fallback.
+    pub fn kill_workload(&self) -> bool {
+        let Some(pid) = read_pid_file(&self.path) else {
+            return false;
+        };
+        // PID 1 is never a valid foreground exec target and must not be
+        // signalled if a corrupt pid file is encountered.
+        if pid <= 1 {
+            return false;
+        }
+        kill_process_tree(pid)
+    }
+}
+
+impl Drop for ExecPidFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn read_pid_file(path: &Path) -> Option<libc::pid_t> {
+    std::fs::read_to_string(path)
+        .ok()?
+        .trim()
+        .parse::<libc::pid_t>()
+        .ok()
+}
+
+/// Stop a foreground exec process, discover its descendants while it can no
+/// longer create more, then kill the entire tree. Killing only the pid crun
+/// records leaks background children such as `sh -c 'worker & wait'`, which can
+/// keep GPU memory, ports, and files live after the client has timed out.
+fn kill_process_tree(root: libc::pid_t) -> bool {
+    // SAFETY: `root` came from crun's pid file and was validated above.
+    if unsafe { libc::kill(root, libc::SIGSTOP) } != 0 {
+        return false;
+    }
+
+    let mut descendants = Vec::new();
+    let mut pending = vec![root];
+    let mut seen = std::collections::HashSet::from([root]);
+    while let Some(pid) = pending.pop() {
+        for child in process_children(pid) {
+            if !seen.insert(child) {
+                continue;
+            }
+            // Stop each child before walking its own children. Once every
+            // discovered process is stopped, the tree is stable.
+            unsafe {
+                libc::kill(child, libc::SIGSTOP);
+            }
+            descendants.push(child);
+            pending.push(child);
+        }
+    }
+
+    // Children first avoids leaving work running after its parent disappears.
+    for pid in descendants.into_iter().rev() {
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+    }
+    unsafe { libc::kill(root, libc::SIGKILL) == 0 }
+}
+
+fn process_children(pid: libc::pid_t) -> Vec<libc::pid_t> {
+    std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter_map(|child| child.parse().ok())
+        .filter(|child| *child > 1)
+        .collect()
 }
 
 impl CrunCommand {
@@ -207,6 +309,13 @@ impl CrunCommand {
         self
     }
 
+    /// Ask crun to record the PID of the process launched inside the
+    /// container. This is valid for foreground and detached `exec` commands.
+    pub fn pid_file(mut self, path: &Path) -> Self {
+        self.cmd.arg("--pid-file").arg(path);
+        self
+    }
+
     /// Start a container: `crun start <id>`
     pub fn start(container_id: &str) -> Self {
         let mut c = Self::new();
@@ -252,7 +361,7 @@ impl CrunCommand {
     /// Execute a command DETACHED inside a running container:
     /// `crun exec --detach <id> <cmd…>`. crun starts the process in the
     /// container's namespaces and returns immediately; the process keeps
-    /// running as a child of the container's PID 1 (the keep-alive `tail -f`)
+    /// running as a child of the container's PID 1 (smolvm's child reaper)
     /// for the machine's lifetime — this is how a background exec (a dev
     /// server, an agent) survives across foreground execs, sharing the
     /// container view every other exec sees. Stdio is detached (no pipes to
@@ -473,5 +582,55 @@ mod tests {
         let result = ensure_path_in_env(&env);
         assert_eq!(result.len(), 2);
         assert!(result.iter().any(|(k, _)| k == "PATH"));
+    }
+
+    #[test]
+    fn read_pid_file_rejects_invalid_content() {
+        let path =
+            std::env::temp_dir().join(format!("smolvm-crun-pid-test-{}", std::process::id()));
+        std::fs::write(&path, "not-a-pid\n").unwrap();
+        assert_eq!(read_pid_file(&path), None);
+        std::fs::write(&path, "4242\n").unwrap();
+        assert_eq!(read_pid_file(&path), Some(4242));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn workload_cleanup_kills_background_descendants() {
+        let mut shell = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 60 & wait"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let root = shell.id() as libc::pid_t;
+        let mut children = Vec::new();
+        for _ in 0..50 {
+            children = process_children(root);
+            if !children.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !children.is_empty(),
+            "shell did not start its background child"
+        );
+        assert!(kill_process_tree(root));
+        shell.wait().unwrap();
+        for child in children {
+            for _ in 0..50 {
+                if !Path::new(&format!("/proc/{child}")).exists() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(
+                !Path::new(&format!("/proc/{child}")).exists(),
+                "background child {child} survived cleanup"
+            );
+        }
     }
 }

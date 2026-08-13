@@ -40,10 +40,17 @@ enum Kind {
     /// A host input scalar behind a pointer (cuBLAS alpha/beta) — read `*p` on
     /// the guest, ship the value, rebuild a pointer to a local on the host.
     HostInScalar(&'static str),
+    /// A fixed-size host input object whose C ABI is pointer-only (for example
+    /// cuComplex). Copy bytes guest-side and rebuild them in 8-byte-aligned
+    /// host storage without imposing Rust's `u128` alignment on C callers.
+    HostInBytes(usize),
     /// A host output scalar behind a pointer (cuDNN workspace size) — the host
     /// fills a local and ships it back; the guest writes it through `*p`. `.0` is
     /// the wire scalar type; the pointee type comes from the param's `cty`.
     HostOutScalar(&'static str),
+    /// A host output `cudaStream_t`. The host converts the real stream back to
+    /// its session-scoped guest handle before returning it.
+    HostOutStream,
 }
 
 /// The pointee of a `*mut T` C type (for building a local of the right type).
@@ -246,6 +253,25 @@ fn cublas_spec() -> Lib {
             ic("ldc"),
         ],
     };
+    let geam_complex = |sym, real, scalar_bytes: usize| Fun {
+        sym,
+        real,
+        params: vec![
+            handle(),
+            ic("transa"),
+            ic("transb"),
+            ic("m"),
+            ic("n"),
+            p("alpha", "*const c_void", HostInBytes(scalar_bytes)),
+            p("A", "*const c_void", DevPtr),
+            ic("lda"),
+            p("beta", "*const c_void", HostInBytes(scalar_bytes)),
+            p("B", "*const c_void", DevPtr),
+            ic("ldb"),
+            p("C", "*mut c_void", DevPtr),
+            ic("ldc"),
+        ],
+    };
     let syrk = |sym, real, ety: &'static str| Fun {
         sym,
         real,
@@ -298,6 +324,79 @@ fn cublas_spec() -> Lib {
             ic("lda"),
             dp("B", ety, true),
             ic("ldb"),
+        ],
+    };
+    let dgmm = |sym, real, ety: &'static str| Fun {
+        sym,
+        real,
+        params: vec![
+            handle(),
+            ic("mode"),
+            ic("m"),
+            ic("n"),
+            dp("A", ety, false),
+            ic("lda"),
+            dp("x", ety, false),
+            ic("incx"),
+            dp("C", ety, true),
+            ic("ldc"),
+        ],
+    };
+    let sbmv = |sym, real, ety: &'static str| Fun {
+        sym,
+        real,
+        params: vec![
+            handle(),
+            ic("uplo"),
+            ic("n"),
+            ic("k"),
+            hin("alpha", ety),
+            dp("A", ety, false),
+            ic("lda"),
+            dp("x", ety, false),
+            ic("incx"),
+            hin("beta", ety),
+            dp("y", ety, true),
+            ic("incy"),
+        ],
+    };
+    let packed = |sym, real, ety: &'static str| Fun {
+        sym,
+        real,
+        params: vec![
+            handle(),
+            ic("uplo"),
+            ic("n"),
+            dp("src", ety, false),
+            dp("dst", ety, true),
+            ic("lda"),
+        ],
+    };
+    let unpacked_to_packed = |sym, real, ety: &'static str| Fun {
+        sym,
+        real,
+        params: vec![
+            handle(),
+            ic("uplo"),
+            ic("n"),
+            dp("src", ety, false),
+            ic("lda"),
+            dp("dst", ety, true),
+        ],
+    };
+    let getri_batched = |sym, real| Fun {
+        sym,
+        real,
+        params: vec![
+            handle(),
+            ic("n"),
+            p("Aarray", "*const c_void", DevPtr),
+            ic("lda"),
+            p("pivots", "*const c_int", DevPtr),
+            p("Carray", "*mut c_void", DevPtr),
+            ic("ldc"),
+            p("info", "*mut c_int", DevPtr),
+            ic("batch_size"),
         ],
     };
     Lib {
@@ -472,6 +571,40 @@ fn cublas_spec() -> Lib {
             symm("cublasDsymm_v2", "cublasDsymm_v2", "f64"),
             trsm("cublasStrsm_v2", "cublasStrsm_v2", "f32"),
             trsm("cublasDtrsm_v2", "cublasDtrsm_v2", "f64"),
+            // CUDA 13 import surface. Append to preserve every existing wire id.
+            Fun {
+                sym: "cublasSetSmCountTarget",
+                real: "cublasSetSmCountTarget",
+                params: vec![handle(), i("sm_count_target")],
+            },
+            // Application-facing CUDA 13 image imports. Keep appends stable:
+            // the vector index is the wire function id.
+            Fun {
+                sym: "cublasGetStream_v2",
+                real: "cublasGetStream_v2",
+                params: vec![handle(), p("stream", "*mut *mut c_void", HostOutStream)],
+            },
+            Fun {
+                sym: "cublasGetVersion_v2",
+                real: "cublasGetVersion_v2",
+                params: vec![handle(), p("version", "*mut c_int", HostOutScalar("i32"))],
+            },
+            dgmm("cublasSdgmm", "cublasSdgmm", "f32"),
+            dgmm("cublasDdgmm", "cublasDdgmm", "f64"),
+            dgmm("cublasCdgmm", "cublasCdgmm", "c_void"),
+            dgmm("cublasZdgmm", "cublasZdgmm", "c_void"),
+            sbmv("cublasSsbmv_v2", "cublasSsbmv_v2", "f32"),
+            sbmv("cublasDsbmv_v2", "cublasDsbmv_v2", "f64"),
+            packed("cublasStpttr", "cublasStpttr", "f32"),
+            packed("cublasDtpttr", "cublasDtpttr", "f64"),
+            unpacked_to_packed("cublasStrttp", "cublasStrttp", "f32"),
+            unpacked_to_packed("cublasDtrttp", "cublasDtrttp", "f64"),
+            getri_batched("cublasSgetriBatched", "cublasSgetriBatched"),
+            getri_batched("cublasDgetriBatched", "cublasDgetriBatched"),
+            getri_batched("cublasCgetriBatched", "cublasCgetriBatched"),
+            getri_batched("cublasZgetriBatched", "cublasZgetriBatched"),
+            geam_complex("cublasCgeam", "cublasCgeam", 8),
+            geam_complex("cublasZgeam", "cublasZgeam", 16),
         ],
     }
 }
@@ -691,7 +824,14 @@ fn gen_guest(lib: &Lib) -> String {
                         n = p.name
                     );
                 }
-                Kind::HostOutScalar(_) => {} // output-only: nothing to send
+                Kind::HostInBytes(bytes) => {
+                    let _ = writeln!(
+                        s,
+                        "    if {n}.is_null() {{ return 1; }}\n    a.extend_from_slice(unsafe {{ std::slice::from_raw_parts({n}.cast::<u8>(), {bytes}) }});",
+                        n = p.name
+                    );
+                }
+                Kind::HostOutScalar(_) | Kind::HostOutStream => {} // output-only
             }
         }
         // Output params (in declaration order) come back in `out`.
@@ -700,6 +840,7 @@ fn gen_guest(lib: &Lib) -> String {
             .iter()
             .filter_map(|p| match p.kind {
                 Kind::HostOutScalar(t) => Some((p.name, t)),
+                Kind::HostOutStream => Some((p.name, "u64")),
                 _ => None,
             })
             .collect();
@@ -840,6 +981,15 @@ fn gen_host(lib: &Lib) -> String {
                     let _ = writeln!(binds, "                let {}_v = __c.{t}();", p.name);
                     call.push(format!("&{}_v", p.name));
                 }
+                Kind::HostInBytes(bytes) => {
+                    let words = bytes.div_ceil(8);
+                    let values = std::iter::repeat_with(|| "__c.u64()")
+                        .take(words)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let _ = writeln!(binds, "                let {}_v = [{values}];", p.name);
+                    call.push(format!("{}_v.as_ptr().cast()", p.name));
+                }
                 Kind::HostOutScalar(t) => {
                     let pt = pointee(p.cty);
                     let _ = writeln!(
@@ -851,6 +1001,19 @@ fn gen_host(lib: &Lib) -> String {
                     let _ = writeln!(
                         outs,
                         "                out.extend_from_slice(&({}_v as {t}).to_le_bytes());",
+                        p.name
+                    );
+                }
+                Kind::HostOutStream => {
+                    let _ = writeln!(
+                        binds,
+                        "                let mut {}_v: *mut c_void = std::ptr::null_mut();",
+                        p.name
+                    );
+                    call.push(format!("&mut {}_v", p.name));
+                    let _ = writeln!(
+                        outs,
+                        "                out.extend_from_slice(&super::stream_unresolve(__streams, {}_v as u64).to_le_bytes());",
                         p.name
                     );
                 }

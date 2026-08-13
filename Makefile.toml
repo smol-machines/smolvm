@@ -140,6 +140,17 @@ script = [
 '''
 set -e
 ARCH=$(uname -m)
+# krun-init (the guest's PID-1 bootstrap embedded in libkrun) must be a STATIC
+# linux binary. Without the musl target, libkrun's build only WARNS and links
+# it dynamically — the resulting lib configures VMs fine but every guest exits
+# on boot ("boot process exited (code 0) before the agent was ready").
+RUST_ARCH="$ARCH"; [ "$RUST_ARCH" = "arm64" ] && RUST_ARCH=aarch64
+if ! rustup target list --installed 2>/dev/null | grep -q "${RUST_ARCH}-unknown-linux-musl"; then
+  echo "error: rust target ${RUST_ARCH}-unknown-linux-musl is not installed;"
+  echo "krun-init would be dynamically linked and no guest would boot."
+  echo "Fix: rustup target add ${RUST_ARCH}-unknown-linux-musl"
+  exit 1
+fi
 make -C libkrun BLK=1 NET=1 GPU=1
 if [ "$(uname -s)" = "Darwin" ]; then
   # macOS: the dylib lives in lib/ (alongside libkrunfw.5.dylib).

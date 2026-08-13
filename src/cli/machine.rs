@@ -85,6 +85,24 @@ fn resolve_egress_flags(
     Ok((allow_cidr, net, dns_filter_hosts))
 }
 
+fn smolmachine_egress_fields(
+    manifest_network: bool,
+    allow_cidrs: Vec<String>,
+    cli_network: bool,
+    dns_filter_hosts: Option<Vec<String>>,
+) -> (bool, Option<Vec<String>>, Option<Vec<String>>) {
+    let allowed_cidrs = if allow_cidrs.is_empty() {
+        None
+    } else {
+        Some(allow_cidrs)
+    };
+    (
+        manifest_network || cli_network,
+        allowed_cidrs,
+        dns_filter_hosts,
+    )
+}
+
 /// Parse `--secret-env KEY=HOST_VAR` and `--secret-file KEY=PATH` flag values
 /// into validated [`SecretRef`]s keyed by the guest-side env var name.
 ///
@@ -161,6 +179,31 @@ fn parse_published_sockets(
                     "guest path '{}' contains an unsupported character (';' or '|')",
                     s.guest_path
                 ),
+            ));
+        }
+        // The guest resolves this path in its own namespace (and bind-mounts a
+        // mounted socket there), so a relative path would silently land next to
+        // whatever the resolving process happens to be rooted at.
+        if !s.guest_path.starts_with('/') {
+            return Err(smolvm::Error::config(
+                "publish-socket",
+                format!("guest path '{}' must be absolute", s.guest_path),
+            ));
+        }
+    }
+    // Two mount bridges at the same guest path silently shadow each other in
+    // the guest, the later bind mount wins, leaving the first bridge's host
+    // socket unreachable. Reject the config instead of paying out a dead
+    // bridge. (Expose entries only *dial* their guest path, so duplicates
+    // there are harmless.)
+    let mut mounted_paths = std::collections::HashSet::new();
+    for s in &out {
+        if s.direction == smolvm::config::SocketDirection::Mount
+            && !mounted_paths.insert(&s.guest_path)
+        {
+            return Err(smolvm::Error::config(
+                "mount-socket",
+                format!("guest path '{}' is mounted more than once", s.guest_path),
             ));
         }
     }
@@ -1027,6 +1070,9 @@ impl RunCmd {
             self.storage,
             self.overlay,
             cli_allow_cidrs,
+            // Ephemeral runs are not addressable later, so they carry no labels;
+            // `machine create` is the path an orchestrator labels.
+            Default::default(),
         )?;
 
         let mut params = params;
@@ -1358,6 +1404,18 @@ impl RunCmd {
             cuda: self.cuda || params.cuda,
             expose_docker: self.docker_socket || params.docker_socket,
             dns_filter_hosts: params.dns_filter_hosts.clone(),
+            // A foreground ephemeral VM exists only to serve this command, so bind
+            // its lifetime to this process. Without the watchdog the VM survives a
+            // SIGKILL of the CLI — which is how orchestrators (and CI) enforce
+            // timeouts — and then holds its full RAM until some later `machine run`
+            // happens to sweep it (see the bounded reclaim in `MachineCmd::run`).
+            // That sweep stays as the backstop for cases the watchdog can't cover,
+            // such as a host that sleeps mid-run.
+            //
+            // `--detach` deliberately leaves the VM up for later `machine exec`, so
+            // it must opt out: arming this there would kill the VM the moment the
+            // launching CLI returned.
+            watch_parent: Some(!self.detach),
             packed_layers_dir,
             extra_disks: std::env::var("SMOLVM_EXTRA_DISK")
                 .ok()
@@ -1889,8 +1947,27 @@ impl RunCmd {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn cli_overlay_owner_uses_the_golden_for_fork_clones() {
+        let ordinary =
+            smolvm::config::VmRecord::new("ordinary".into(), 1, 512, Vec::new(), Vec::new(), false);
+        assert_eq!(
+            persistent_overlay_owner_for_record("ordinary", Some(&ordinary)),
+            "ordinary"
+        );
+
+        let mut clone =
+            smolvm::config::VmRecord::new("clone-a".into(), 1, 512, Vec::new(), Vec::new(), false);
+        clone.golden = Some("golden-a".into());
+        assert_eq!(
+            persistent_overlay_owner_for_record("clone-a", Some(&clone)),
+            "golden-a"
+        );
+    }
 
     /// `--oci-cache` resolves the image digest at the auth gate and mixes it into
     /// the key, so the cache tracks CONTENT. Without this a mutable tag like
@@ -1974,10 +2051,42 @@ mod tests {
     }
 
     #[test]
+    fn smolmachine_egress_fields_preserve_resolved_cli_policy() {
+        let cidrs = vec!["192.0.2.10/32".to_string()];
+        let hosts = Some(vec!["provider.test".to_string()]);
+        assert_eq!(
+            smolmachine_egress_fields(false, cidrs.clone(), true, hosts.clone()),
+            (true, Some(cidrs), hosts)
+        );
+    }
+
+    #[test]
+    fn smolmachine_egress_fields_preserve_manifest_network_default() {
+        assert_eq!(
+            smolmachine_egress_fields(true, Vec::new(), false, None),
+            (true, None, None)
+        );
+    }
+
+    #[test]
     fn parse_published_sockets_rejects_bad_specs() {
         assert!(parse_published_sockets(&[], &["/only-host".to_string()]).is_err());
         assert!(parse_published_sockets(&[":/tmp/h.sock".to_string()], &[]).is_err());
         assert!(parse_published_sockets(&["/run/a;b.sock".to_string()], &[]).is_err());
+        // Relative guest paths resolve against whatever the guest process is
+        // rooted at, so they can never name the socket the user meant.
+        assert!(parse_published_sockets(&["app.sock".to_string()], &[]).is_err());
+        assert!(parse_published_sockets(&[], &["/run/h.sock:app.sock".to_string()]).is_err());
+        // Two mount bridges at one guest path shadow each other in the guest,
+        // leaving the first host socket unreachable.
+        assert!(parse_published_sockets(
+            &[],
+            &[
+                "/run/h1.sock:/run/control/engine.sock".to_string(),
+                "/run/h2.sock:/run/control/engine.sock".to_string(),
+            ]
+        )
+        .is_err());
     }
 
     #[test]
@@ -2311,6 +2420,21 @@ mod tests {
 // Exec Command (Persistent) - Direct VM Execution
 // ============================================================================
 
+/// Resolve the persistent container overlay visible to CLI operations.
+///
+/// A fork clone inherits the golden's overlay directory through its CoW storage
+/// disk. Addressing a new directory under the clone's name would silently give
+/// `machine exec` and `machine cp` a clean image instead of the forked rootfs.
+fn persistent_overlay_owner_for_record(
+    machine_name: &str,
+    record: Option<&smolvm::config::VmRecord>,
+) -> String {
+    smolvm::workload::persistent_overlay_owner(
+        machine_name,
+        record.and_then(|record| record.golden.as_deref()),
+    )
+}
+
 /// Execute a command directly in the VM's Alpine rootfs.
 ///
 /// This runs commands at the VM level, not inside a container. Useful for
@@ -2442,16 +2566,16 @@ impl ExecCmd {
                 workdir.as_deref(),
             );
             // Image-based machine: exec inside the image's rootfs via crun.
-            // Use machine name as persistent overlay ID so filesystem changes
-            // (e.g. package installs) survive across exec sessions.
-            let machine_name = name.clone();
+            // Fork clones address the golden's inherited overlay; ordinary
+            // machines use their own name.
+            let overlay_owner = persistent_overlay_owner_for_record(&name, record.as_ref());
             if self.detach {
                 let config = smolvm::agent::RunConfig::new(image, self.command.clone())
                     .with_env(defaults.env)
                     .with_workdir(defaults.workdir)
                     .with_user(defaults.user)
                     .with_mounts(mount_bindings)
-                    .with_persistent_overlay(Some(machine_name));
+                    .with_persistent_overlay(Some(overlay_owner));
                 let pid = client.run_background(config)?;
                 println!("{pid}");
                 return Ok(());
@@ -2464,7 +2588,7 @@ impl ExecCmd {
                     .with_mounts(mount_bindings)
                     .with_timeout(self.timeout)
                     .with_tty(self.tty)
-                    .with_persistent_overlay(Some(machine_name.clone()));
+                    .with_persistent_overlay(Some(overlay_owner.clone()));
                 let exit_code = client.run_interactive(config)?;
                 std::process::exit(exit_code);
             }
@@ -2476,7 +2600,7 @@ impl ExecCmd {
                     .with_user(defaults.user.clone())
                     .with_mounts(mount_bindings)
                     .with_timeout(self.timeout)
-                    .with_persistent_overlay(Some(machine_name.clone()));
+                    .with_persistent_overlay(Some(overlay_owner.clone()));
                 let mut printer = ExecEventPrinter::default();
                 client.run_streaming_with(config, |event| printer.handle(event))?;
                 std::process::exit(printer.exit_code);
@@ -2488,7 +2612,7 @@ impl ExecCmd {
                 .with_user(defaults.user)
                 .with_mounts(mount_bindings)
                 .with_timeout(self.timeout)
-                .with_persistent_overlay(Some(machine_name));
+                .with_persistent_overlay(Some(overlay_owner));
             let (exit_code, stdout, stderr) = client.run_non_interactive(config)?;
             vm_common::print_output_and_exit(&manager, exit_code, &stdout, &stderr);
         } else {
@@ -2622,6 +2746,16 @@ pub struct CreateCmd {
     /// Name for the machine (auto-generated if omitted)
     #[arg(short = 'n', long, value_name = "NAME")]
     pub name: Option<String>,
+
+    /// Attach metadata to the machine (repeatable), e.g.
+    /// `--label owner=exo --label sandbox=agent-7`.
+    ///
+    /// smolvm never interprets these. They exist so a process managing many
+    /// machines can identify its own later — which sandbox a machine serves, who
+    /// created it, whether it may be reclaimed — instead of encoding that into
+    /// the name. Read them back with `machine ls --json`.
+    #[arg(long = "label", value_name = "KEY=VALUE")]
+    pub labels: Vec<String>,
 
     /// Container image: a registry reference (alpine, python:3.12-alpine), a
     /// `docker save` archive (./myapp.tar, or `-` to read one from stdin), or an
@@ -2845,6 +2979,7 @@ impl CreateCmd {
             self.storage,
             self.overlay,
             cli_allow_cidrs,
+            smolvm::util::parse_labels(&self.labels)?,
         )?;
         let mut params = params;
         if self.auto_graph {
@@ -2990,6 +3125,19 @@ impl CreateCmd {
             manifest.mem
         };
 
+        let (cli_allow_cidrs, cli_network, cli_dns_filter_hosts) = resolve_egress_flags(
+            self.allow_cidr.clone(),
+            self.allow_host.clone(),
+            self.outbound_localhost_only,
+            self.net,
+        )?;
+        let (network, allowed_cidrs, dns_filter_hosts) = smolmachine_egress_fields(
+            manifest.network,
+            cli_allow_cidrs,
+            cli_network,
+            cli_dns_filter_hosts,
+        );
+
         // A .smolmachine is an untrusted, portable artifact: validate its secret
         // refs under the Untrusted scope, which rejects every source kind. A
         // packed `from_env`/`from_file` ref would otherwise read THIS host's
@@ -3035,7 +3183,7 @@ impl CreateCmd {
             mem,
             volume: self.volume.clone(),
             port: self.port.clone(),
-            net: self.net || manifest.network,
+            net: network,
             network_backend: self.net_backend,
             dns: self.dns,
             init: self.init.clone(),
@@ -3050,10 +3198,11 @@ impl CreateCmd {
             workdir: manifest.workdir,
             storage_gb: self.storage,
             overlay_gb: self.overlay,
-            allowed_cidrs: None,
+            allowed_cidrs,
             restart_policy: None,
             restart_max_retries: None,
             restart_max_backoff_secs: None,
+            labels: smolvm::util::parse_labels(&self.labels)?,
             health_cmd: None,
             health_interval_secs: None,
             health_timeout_secs: None,
@@ -3061,14 +3210,38 @@ impl CreateCmd {
             health_startup_grace_secs: None,
             ssh_agent: self.ssh_agent,
             cuda: self.cuda || self.auto_graph,
+            forkable: false,
+            cuda_fork_pool_size: None,
+            cuda_vram_limit_mib: None,
             docker_socket: self.docker_socket,
-            dns_filter_hosts: None,
+            dns_filter_hosts,
             published_sockets: parse_published_sockets(&self.expose_socket, &self.mount_socket)?,
             gpu: manifest.gpu,
             gpu_vram_mib: None,
             rosetta: false,
             source_smolmachine: Some(canonical_path),
         };
+
+        let resources = VmResources {
+            cpus: params.cpus,
+            memory_mib: params.mem,
+            network: params.net,
+            network_backend: params.network_backend,
+            dns: params.dns,
+            gpu: params.gpu,
+            gpu_vram_mib: params.gpu_vram_mib,
+            cuda: params.cuda,
+            rosetta: params.rosetta,
+            storage_gib: params.storage_gb,
+            overlay_gib: params.overlay_gb,
+            allowed_cidrs: params.allowed_cidrs.clone(),
+        };
+        resources.validate()?;
+        validate_requested_network_backend(
+            &resources,
+            params.dns_filter_hosts.as_deref(),
+            params.port.len(),
+        )?;
 
         let record = vm_common::build_vm_record(&params)?;
         let reservation = vm_common::CreateVmReservation::reserve(&name_for_layers)?;
@@ -4439,13 +4612,15 @@ impl CpCmd {
         // mounted so cp targets the container filesystem (not the VM rootfs).
         // prepare_overlay is idempotent: reuses if mounted, remounts if upper
         // exists, creates fresh otherwise.
-        if let Some(image) = smolvm::db::SmolvmDb::open()
+        if let Some(record) = smolvm::db::SmolvmDb::open()
             .ok()
             .and_then(|db| db.get_vm(&machine_name).ok().flatten())
-            .and_then(|r| r.image.clone())
         {
-            let overlay_id = format!("persistent-{}", machine_name);
-            client.prepare_overlay(&image, &overlay_id)?;
+            if let Some(image) = record.image.as_ref() {
+                let owner = persistent_overlay_owner_for_record(&machine_name, Some(&record));
+                let overlay_id = format!("persistent-{owner}");
+                client.prepare_overlay(image, &overlay_id)?;
+            }
         }
 
         if is_upload {

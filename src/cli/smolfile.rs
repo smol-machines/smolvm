@@ -50,6 +50,10 @@ pub fn build_create_params(
     cli_storage_gb: Option<u64>,
     cli_overlay_gb: Option<u64>,
     cli_allow_cidr: Vec<String>,
+    // Labels come only from the CLI today; a Smolfile has no `labels` key yet.
+    // Threaded explicitly so `--label` is not silently dropped when a Smolfile
+    // is also supplied.
+    cli_labels: std::collections::BTreeMap<String, String>,
 ) -> smolvm::Result<CreateVmParams> {
     let cidrs_to_option = |v: Vec<String>| if v.is_empty() { None } else { Some(v) };
 
@@ -60,6 +64,7 @@ pub fn build_create_params(
             return Ok(CreateVmParams {
                 secret_refs: Default::default(),
                 name,
+                labels: cli_labels,
                 image: cli_image,
                 entrypoint: cli_entrypoint.map(|e| vec![e]).unwrap_or_default(),
                 cmd: cli_cmd,
@@ -86,6 +91,9 @@ pub fn build_create_params(
                 health_startup_grace_secs: None,
                 ssh_agent: false,
                 cuda: false,
+                forkable: false,
+                cuda_fork_pool_size: None,
+                cuda_vram_limit_mib: None,
                 docker_socket: false,
                 gpu: false,
                 gpu_vram_mib: None,
@@ -97,6 +105,33 @@ pub fn build_create_params(
         }
     };
     let auto_graph = sf.auto_graph.unwrap_or(false);
+    let cuda = sf.cuda.unwrap_or(false) || auto_graph;
+    let fork = sf.fork.unwrap_or_default();
+    if fork.pool_size == Some(0) {
+        return Err(smolvm::Error::config(
+            "smolfile [fork] pool_size",
+            "must be greater than zero",
+        ));
+    }
+    if fork.cuda_vram_limit_mib == Some(0) {
+        return Err(smolvm::Error::config(
+            "smolfile [fork] cuda_vram_limit_mib",
+            "must be greater than zero",
+        ));
+    }
+    if fork.pool_size.is_some() && !cuda {
+        return Err(smolvm::Error::config(
+            "smolfile [fork] pool_size",
+            "requires cuda = true (or auto_graph = true)",
+        ));
+    }
+    if fork.cuda_vram_limit_mib.is_some() && fork.pool_size.is_none() {
+        return Err(smolvm::Error::config(
+            "smolfile [fork] cuda_vram_limit_mib",
+            "requires pool_size",
+        ));
+    }
+    let forkable = fork.enabled.unwrap_or(false) || fork.pool_size.is_some();
 
     // Image: CLI > Smolfile > None
     let image = cli_image.or(sf.image);
@@ -258,6 +293,7 @@ pub fn build_create_params(
         .and_then(|s| parse_duration_secs(s));
 
     Ok(CreateVmParams {
+        labels: cli_labels,
         secret_refs: sf.secrets,
         name,
         image,
@@ -285,7 +321,10 @@ pub fn build_create_params(
         health_retries,
         health_startup_grace_secs,
         ssh_agent: sf.auth.as_ref().and_then(|a| a.ssh_agent).unwrap_or(false),
-        cuda: sf.cuda.unwrap_or(false) || auto_graph,
+        cuda,
+        forkable,
+        cuda_fork_pool_size: fork.pool_size,
+        cuda_vram_limit_mib: fork.cuda_vram_limit_mib,
         docker_socket: sf.docker_socket.unwrap_or(false),
         gpu,
         gpu_vram_mib: sf.gpu_vram,
@@ -445,6 +484,30 @@ pub fn resolve_pack_config(
 mod tests {
     use super::*;
 
+    fn build_from_smolfile(path: PathBuf) -> smolvm::Result<CreateVmParams> {
+        build_create_params(
+            "test-vm".to_string(),
+            None,
+            None,
+            vec![],
+            DEFAULT_MICROVM_CPU_COUNT,
+            DEFAULT_MICROVM_MEMORY_MIB,
+            vec![],
+            vec![],
+            false,
+            None,
+            None,
+            vec![],
+            vec![],
+            None,
+            Some(path),
+            None,
+            None,
+            vec![],
+            Default::default(),
+        )
+    }
+
     #[test]
     fn auto_graph_smolfile_enables_cuda_and_framework_policy() {
         let dir = tempfile::tempdir().unwrap();
@@ -474,6 +537,7 @@ mod tests {
             None,
             None,
             vec![],
+            Default::default(),
         )
         .unwrap();
 
@@ -486,5 +550,46 @@ mod tests {
                 "TORCHINDUCTOR_CUDAGRAPHS=1".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn fork_smolfile_persists_launch_and_cuda_capacity_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Smolfile");
+        std::fs::write(
+            &path,
+            "cuda = true\n[fork]\nenabled = true\npool_size = 8\ncuda_vram_limit_mib = 6144\n",
+        )
+        .unwrap();
+
+        let params = build_from_smolfile(path).unwrap();
+        assert!(params.forkable);
+        assert_eq!(params.cuda_fork_pool_size, Some(8));
+        assert_eq!(params.cuda_vram_limit_mib, Some(6144));
+
+        let record = crate::cli::vm_common::build_vm_record(&params).unwrap();
+        assert!(record.forkable_on_start());
+        assert_eq!(record.cuda_fork_pool_size, Some(8));
+        assert_eq!(record.cuda_vram_limit_mib, Some(6144));
+    }
+
+    #[test]
+    fn fork_pool_requires_cuda() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Smolfile");
+        std::fs::write(&path, "[fork]\npool_size = 8\n").unwrap();
+
+        let error = build_from_smolfile(path).err().unwrap().to_string();
+        assert!(error.contains("requires cuda = true"), "{error}");
+    }
+
+    #[test]
+    fn cuda_vram_limit_requires_pool_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Smolfile");
+        std::fs::write(&path, "cuda = true\n[fork]\ncuda_vram_limit_mib = 6144\n").unwrap();
+
+        let error = build_from_smolfile(path).err().unwrap().to_string();
+        assert!(error.contains("requires pool_size"), "{error}");
     }
 }

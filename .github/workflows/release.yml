@@ -196,9 +196,20 @@ jobs:
         run: |
           for f in \
             usr/local/lib/smolvm-cuda/libcudart-shim.so \
+            usr/local/lib/smolvm-cuda/libcudart.so.13 \
+            usr/local/lib/smolvm-cuda/libcublas.so.13 \
+            usr/local/lib/smolvm-cuda/libcublasLt.so.13 \
+            usr/local/lib/smolvm-cuda/libcudart.so.12 \
+            usr/local/lib/smolvm-cuda/libcublas.so.12 \
+            usr/local/lib/smolvm-cuda/libcublasLt.so.12 \
+            usr/local/lib/smolvm-cuda/libcudnn.so.9 \
+            usr/local/lib/smolvm-cuda/libcudart.so.11.0 \
+            usr/local/lib/smolvm-cuda/libcublas.so.11 \
+            usr/local/lib/smolvm-cuda/libcublasLt.so.11 \
+            usr/local/lib/smolvm-cuda/libcudnn.so.8 \
             usr/local/lib/smolvm-cuda/libcuda.so.1 \
             usr/local/bin/smolvm-cuda-run; do
-            if [[ ! -f "target/agent-rootfs/$f" ]]; then
+            if [[ ! -e "target/agent-rootfs/$f" ]]; then
               echo "::error::missing $f in agent-rootfs (CUDA auto-staging would be disabled)"
               exit 1
             fi
@@ -547,30 +558,18 @@ jobs:
             -f "client_payload[version]=$version"
           echo "Dispatched smolvm-release ($version) to the Homebrew tap."
 
-  # Build + publish the Arch/pacman packages for this release. Invoked directly
-  # (not via the `release: published` event) because that event never fires for a
-  # release created with the default GITHUB_TOKEN — the same GitHub restriction
-  # the Homebrew step above works around. Runs after the release exists so the
-  # PKGBUILD can download its release binaries.
-  publish-pacman:
-    name: Publish pacman repo
+  # Build and atomically deploy the pacman, apt, and yum repositories as a Pages
+  # artifact. Invoked directly because releases created with GITHUB_TOKEN do not
+  # emit another workflow event.
+  publish-package-repositories:
+    name: Publish package repositories
     needs: release
     permissions:
-      contents: write
+      actions: read
+      contents: read
+      pages: write
+      id-token: write
     uses: ./.github/workflows/pacman-repo.yml
-    with:
-      tag: ${{ github.ref_name }}
-
-  # Build + publish the .deb / .rpm repos. Same reasoning as publish-pacman
-  # (the `release: published` event never fires for a GITHUB_TOKEN release).
-  # Runs after publish-pacman so the sequential pushes to the shared Pages
-  # branch (pacman-repo) never race.
-  publish-deb-rpm:
-    name: Publish deb/rpm repos
-    needs: publish-pacman
-    permissions:
-      contents: write
-    uses: ./.github/workflows/deb-rpm-repo.yml
     with:
       tag: ${{ github.ref_name }}
 

@@ -123,6 +123,12 @@ pub fn plan_launch_network(
     // enforce it (verified: a non-allowed IP stays reachable under TSI). Falling
     // to TSI here would make the egress flags a silent no-op — a security hole —
     // so a policy forces virtio-net unless the caller explicitly picked a backend.
+    //
+    // A configured guest host-service (the rollout ingress `serve` always sets
+    // up) likewise forces virtio-net: the guest reaches it through the virtio
+    // gateway's port mapping, which TSI doesn't provide. Net effect: EVERY
+    // networked machine under `serve` defaults to virtio-net — keep the API
+    // schema docs on `networkBackend` (src/api/types.rs) in sync with this.
     let fleet_mode = std::env::var_os("SMOLVM_PUBLISH_ADDR").is_some();
     let backend = resources.network_backend.unwrap_or(
         if has_ports || fleet_mode || has_cidr_policy || has_dns_filter || has_host_service {

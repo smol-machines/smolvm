@@ -421,6 +421,8 @@ fn format_init_failure(index: usize, exit_code: i32, stdout: &str, stderr: &str)
 /// Parameters for [`create_vm`].
 pub struct CreateVmParams {
     pub name: String,
+    /// Caller metadata, passed through to [`VmRecord::labels`] verbatim.
+    pub labels: std::collections::BTreeMap<String, String>,
     pub image: Option<String>,
     pub entrypoint: Vec<String>,
     pub cmd: Vec<String>,
@@ -448,6 +450,12 @@ pub struct CreateVmParams {
     pub ssh_agent: bool,
     /// Enable CUDA-over-vsock (remote guest CUDA Driver-API to the host GPU).
     pub cuda: bool,
+    /// Start this machine as a copy-on-write fork base by default.
+    pub forkable: bool,
+    /// Planned number of runnable CUDA fork clones.
+    pub cuda_fork_pool_size: Option<u32>,
+    /// Explicit logical VRAM limit for each golden/clone CUDA session.
+    pub cuda_vram_limit_mib: Option<u64>,
     /// Expose the guest's Docker daemon socket to the host as a Unix socket.
     pub docker_socket: bool,
     /// Enable GPU acceleration (virtio-gpu with Venus/Vulkan).
@@ -599,6 +607,31 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
         )?;
     }
 
+    if params.cuda_fork_pool_size == Some(0) {
+        return Err(smolvm::Error::config(
+            "create machine",
+            "fork pool size must be greater than zero",
+        ));
+    }
+    if params.cuda_vram_limit_mib == Some(0) {
+        return Err(smolvm::Error::config(
+            "create machine",
+            "CUDA VRAM limit must be greater than zero",
+        ));
+    }
+    if params.cuda_fork_pool_size.is_some() && !params.cuda {
+        return Err(smolvm::Error::config(
+            "create machine",
+            "fork pool size requires a CUDA-enabled machine",
+        ));
+    }
+    if params.cuda_vram_limit_mib.is_some() && params.cuda_fork_pool_size.is_none() {
+        return Err(smolvm::Error::config(
+            "create machine",
+            "CUDA VRAM limit requires a fork pool size",
+        ));
+    }
+
     // Create record with restart policy if configured
     let restart = smolvm::config::RestartConfig {
         policy: params
@@ -644,10 +677,14 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
     record.health_startup_grace_secs = params.health_startup_grace_secs;
     record.ssh_agent = params.ssh_agent;
     record.cuda = params.cuda;
+    record.forkable = params.forkable || params.cuda_fork_pool_size.is_some();
+    record.cuda_fork_pool_size = params.cuda_fork_pool_size;
+    record.cuda_vram_limit_mib = params.cuda_vram_limit_mib;
     record.docker_socket = params.docker_socket;
     record.dns_filter_hosts = params.dns_filter_hosts.clone();
     record.published_sockets = params.published_sockets.clone();
     record.source_smolmachine = params.source_smolmachine.clone();
+    record.labels = params.labels.clone();
 
     // A registry image with no network can never be pulled (the guest runs the
     // pull), so refuse here rather than deferring to a `start` that must fail.
@@ -1105,21 +1142,23 @@ fn rollback_failed_fork(
     resume_golden: bool,
     error: smolvm::Error,
 ) -> smolvm::Result<()> {
+    if resume_golden {
+        if let Err(resume_error) = smolvm::agent::fork::resume_golden(golden, snapshot_dir) {
+            return Err(smolvm::Error::agent(
+                "fork rollback",
+                format!(
+                    "{error}; golden rollback failed: {resume_error}; preserved checkpoint {} for recovery",
+                    snapshot_dir.display()
+                ),
+            ));
+        }
+    }
     let cleanup_error = std::fs::remove_dir_all(snapshot_dir).err();
-    let resume_error = if resume_golden {
-        smolvm::agent::fork::resume_golden(golden).err()
-    } else {
-        None
-    };
-    match (cleanup_error, resume_error) {
-        (None, None) => Err(error),
-        (cleanup, resume) => Err(smolvm::Error::agent(
+    match cleanup_error {
+        None => Err(error),
+        Some(cleanup) => Err(smolvm::Error::agent(
             "fork rollback",
-            format!(
-                "{error}; snapshot cleanup: {}; golden resume: {}",
-                cleanup.map_or_else(|| "ok".to_string(), |e| e.to_string()),
-                resume.map_or_else(|| "ok".to_string(), |e| e.to_string()),
-            ),
+            format!("{error}; golden rollback succeeded but snapshot cleanup failed: {cleanup}"),
         )),
     }
 }
@@ -1184,12 +1223,19 @@ fn start_vm_named_with_db(
     proxy: Option<&str>,
     no_proxy: Option<&str>,
     from_snapshot: bool,
-    fork: ForkLaunch,
+    mut fork: ForkLaunch,
 ) -> smolvm::Result<()> {
     use smolvm::Error;
 
     // Direct DB lookup — 1 read cycle instead of loading everything
     let mut record = db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))?;
+    // A Smolfile-declared fork base starts forkable without requiring the user
+    // to repeat `--forkable`. Older records that persisted a CUDA pool before
+    // the explicit field existed get the same behavior, but clones remain
+    // leaves even though they inherit the golden's CUDA capacity policy.
+    if record.forkable_on_start() {
+        fork.forkable = true;
+    }
 
     // Resolve via the shared probe (PID + vsock ping). The plain
     // `actual_state()` is PID-only and would treat a zombie VMM
@@ -1210,19 +1256,20 @@ fn start_vm_named_with_db(
             cli_recover_if_unreachable(name)?;
         }
         RecordState::Frozen => {
-            // Snapshot-frozen fork base: relaunching it writable would
-            // corrupt the clones whose disks CoW-back onto it. Refuse —
-            // delete the clones first to reuse the name.
             let clones = db.dependent_clones(name).unwrap_or_default();
-            return Err(Error::agent(
-                "start",
+            let reason = if clones.is_empty() {
+                "it retains a reusable fork checkpoint; stop it before restarting, or fork it again"
+                    .to_string()
+            } else {
                 format!(
-                    "'{name}' is the fork base for {} live clone(s) ({}); their disks are \
-                     copy-on-write overlays backed by its disks, so it cannot be re-launched \
-                     while they exist — delete the clones first",
+                    "it is the fork base for {} live clone(s) ({}); their disks are copy-on-write overlays backed by its disks, so it cannot be re-launched while they exist — delete the clones first",
                     clones.len(),
                     clones.join(", ")
-                ),
+                )
+            };
+            return Err(Error::agent(
+                "start",
+                format!("'{name}' is frozen because {reason}"),
             ));
         }
         RecordState::Stopped | RecordState::Created | RecordState::Failed => {
@@ -1814,19 +1861,24 @@ pub fn stop_vm_named(name: &str) -> smolvm::Result<()> {
             // fall through to the normal stop path
         }
         RecordState::Frozen => {
-            // Snapshot-frozen fork base: it must outlive its clones (their
-            // disks CoW-back onto its disks). Refuse instead of tearing it
-            // down — mirrors `delete`'s guard.
             let clones = SmolvmDb::open()?.dependent_clones(name).unwrap_or_default();
-            return Err(smolvm::Error::agent(
-                "stop",
-                format!(
-                    "machine '{name}' is the fork base for {} live clone(s) ({}); \
-                     stop or delete the clones first",
-                    clones.len(),
-                    clones.join(", ")
-                ),
-            ));
+            if !clones.is_empty() {
+                // A snapshot-frozen fork base must outlive its clones: their
+                // disks CoW-back onto its disks and their RAM maps its memfd.
+                return Err(smolvm::Error::agent(
+                    "stop",
+                    format!(
+                        "machine '{name}' is the fork base for {} live clone(s) ({}); \
+                         stop or delete the clones first",
+                        clones.len(),
+                        clones.join(", ")
+                    ),
+                ));
+            }
+            // A retained checkpoint deliberately keeps the golden frozen
+            // between fills even when no clones exist. It is now safe to kill
+            // the paused VMM; AgentManager::stop removes the exact retained
+            // checkpoint only after confirming process death.
         }
         other => {
             // Not running. If a prior start mounted the layers volume but the
@@ -1966,6 +2018,111 @@ pub fn stop_vm_default() -> smolvm::Result<()> {
 // ============================================================================
 // Delete
 // ============================================================================
+
+/// Host-side paths behind which a `--mount-socket` publish may have left a
+/// placeholder for this machine: the guest agent bind-mounts its VM-private
+/// listener node at the caller's guest path, a file bind mount needs the
+/// destination to exist, and inside a `--volume` (virtiofs) share that
+/// destination lands on the host filesystem as a 0-byte regular file.
+///
+/// Only mount-direction sockets create placeholders, only for guest paths
+/// inside a declared volume (otherwise the node lives on the VM's own rootfs).
+/// When volumes nest, the deepest guest mountpoint owns the path. Volume host
+/// paths are canonicalized so differently-spelled references (`/tmp` vs
+/// `/private/tmp`) to the same share compare equal.
+fn mount_socket_placeholder_paths(record: &VmRecord) -> Vec<std::path::PathBuf> {
+    use smolvm::config::SocketDirection;
+    use std::path::{Path, PathBuf};
+
+    let mut out = Vec::new();
+    for sock in &record.published_sockets {
+        if sock.direction != SocketDirection::Mount {
+            continue;
+        }
+        let guest_path = Path::new(&sock.guest_path);
+        if !guest_path.is_absolute() {
+            continue;
+        }
+        let deepest = record
+            .mounts
+            .iter()
+            .filter(|(_, guest_target, _)| guest_path.starts_with(Path::new(guest_target)))
+            .max_by_key(|(_, guest_target, _)| guest_target.len());
+        let Some((host_source, guest_target, _)) = deepest else {
+            continue;
+        };
+        let Ok(rel) = guest_path.strip_prefix(guest_target) else {
+            continue;
+        };
+        let host_source: PathBuf =
+            std::fs::canonicalize(host_source).unwrap_or_else(|_| PathBuf::from(host_source));
+        out.push(host_source.join(rel));
+    }
+    out
+}
+
+/// Remove mount-socket placeholder files this machine left in shared `--volume`
+/// dirs (see [`mount_socket_placeholder_paths`]), except any `claimed` by
+/// another machine. Best-effort housekeeping: failures are debug-logged, never
+/// fatal to machine deletion.
+fn remove_mount_socket_placeholders_except(
+    record: &VmRecord,
+    claimed: &std::collections::HashSet<std::path::PathBuf>,
+) {
+    for placeholder in mount_socket_placeholder_paths(record) {
+        if claimed.contains(&placeholder) {
+            continue;
+        }
+        // Only ever remove provably-inert nodes: zero-byte *regular files*, not
+        // symlinks. Anything else at that path is the user's, not ours.
+        let Ok(meta) = std::fs::symlink_metadata(&placeholder) else {
+            continue; // never created, or already gone
+        };
+        if !meta.file_type().is_file() || meta.len() != 0 {
+            continue;
+        }
+        match std::fs::remove_file(&placeholder) {
+            Ok(()) => {
+                tracing::debug!(
+                    path = %placeholder.display(),
+                    "removed mount-socket placeholder from shared volume"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %placeholder.display(),
+                    error = %e,
+                    "failed to remove mount-socket placeholder"
+                );
+            }
+        }
+    }
+}
+
+/// Remove machine `record`'s mount-socket placeholders from shared `--volume`
+/// dirs — but only those no other machine record claims.
+///
+/// The claim check is load-bearing, not just tidiness: over virtiofs, removing
+/// the placeholder on the host invalidates the mountpoint dentry of a *running*
+/// VM that bind-mounted over it, severing its guest path with ENOENT. A
+/// placeholder is inert once every machine declaring the same path is deleted,
+/// so cleanup converges instead of racing co-mounted machines.
+pub fn remove_mount_socket_placeholders(record: &VmRecord) {
+    let claimed: std::collections::HashSet<std::path::PathBuf> = match SmolvmConfig::load() {
+        Ok(cfg) => cfg
+            .list_vms()
+            .filter(|(name, _)| name.as_str() != record.name)
+            .flat_map(|(_, other)| mount_socket_placeholder_paths(other))
+            .collect(),
+        // Can't enumerate other machines? Remove nothing — leaving litter is the
+        // fail-safe direction; deleting under a running VM is not.
+        Err(e) => {
+            tracing::debug!(error = %e, "skipping placeholder cleanup: cannot list machines");
+            return;
+        }
+    };
+    remove_mount_socket_placeholders_except(record, &claimed);
+}
 
 /// Options for machine delete behavior.
 pub struct DeleteVmOptions {
@@ -2112,6 +2269,12 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
         ));
     }
 
+    // Drop mount-socket placeholder files this machine left in shared --volume
+    // dirs. Runs after the VM is confirmed stopped (or was never running), so
+    // no live bind mount can reference the host-side node; a machine that still
+    // declares the same socket recreates its placeholder at its next boot.
+    remove_mount_socket_placeholders(&record);
+
     let data_dir = vm_data_dir(name);
     if data_dir.exists() {
         println!("Cleaning up data directory for vm: {}", name);
@@ -2228,7 +2391,12 @@ fn machine_status_json(name: &str, record: &VmRecord) -> serde_json::Value {
         "ephemeral": record.ephemeral,
         "gpu": record.gpu.unwrap_or(false),
         "gpu_vram_mib": record.gpu_vram_mib,
+        "cuda": record.cuda,
+        "forkable": record.forkable_on_start(),
+        "cuda_fork_pool_size": record.cuda_fork_pool_size,
+        "cuda_vram_limit_mib": record.cuda_vram_limit_mib,
         "forkpoint_held": record.forkpoint_held,
+        "labels": record.labels,
         "restart_policy": record.restart.policy.to_string(),
         "restart_max_retries": record.restart.max_retries,
         "restart_count": record.restart.restart_count,
@@ -2341,6 +2509,15 @@ pub fn list_vms(verbose: bool, json: bool) -> smolvm::Result<()> {
                         Some(vram) => println!("  GPU: enabled ({} MiB VRAM)", vram),
                         None => println!("  GPU: enabled"),
                     }
+                }
+                if record.forkable_on_start() {
+                    println!("  Forkable: enabled");
+                }
+                if let Some(pool_size) = record.cuda_fork_pool_size {
+                    println!("  CUDA fork pool: {} clone(s)", pool_size);
+                }
+                if let Some(limit_mib) = record.cuda_vram_limit_mib {
+                    println!("  CUDA VRAM limit: {} MiB per session", limit_mib);
                 }
                 if record.forkpoint_held {
                     println!("  Fork slot: held");
@@ -3078,5 +3255,190 @@ mod init_runner_tests {
                 ("BAZ".to_string(), "from-cli".to_string()),
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod mount_socket_placeholder_tests {
+    use super::{mount_socket_placeholder_paths, remove_mount_socket_placeholders_except};
+    use smolvm::config::{PublishedSocketConfig, SocketDirection, VmRecord};
+    use std::collections::HashSet;
+
+    fn remove_placeholders(record: &VmRecord) {
+        remove_mount_socket_placeholders_except(record, &HashSet::new());
+    }
+
+    fn mount_sock(guest_path: &str) -> PublishedSocketConfig {
+        PublishedSocketConfig {
+            direction: SocketDirection::Mount,
+            guest_path: guest_path.to_string(),
+            host_path: Some("/tmp/host.sock".to_string()),
+        }
+    }
+
+    fn record_with(
+        share: &std::path::Path,
+        guest_target: &str,
+        sockets: Vec<PublishedSocketConfig>,
+    ) -> VmRecord {
+        let mut record = VmRecord::new(
+            "t".to_string(),
+            1,
+            256,
+            vec![(
+                share.to_string_lossy().into_owned(),
+                guest_target.to_string(),
+                false,
+            )],
+            vec![],
+            false,
+        );
+        record.published_sockets = sockets;
+        record
+    }
+
+    #[test]
+    fn removes_only_inert_placeholder_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let share = tmp.path().join("shared");
+        std::fs::create_dir_all(&share).unwrap();
+        let placeholder = share.join("engine.sock");
+        std::fs::write(&placeholder, b"").unwrap(); // the 0-byte node the agent leaves
+        let user_data = share.join("real.sock");
+        std::fs::write(&user_data, b"user data").unwrap();
+        let dir = share.join("dir.sock");
+        std::fs::create_dir(&dir).unwrap();
+
+        let record = record_with(
+            &share,
+            "/run/control",
+            vec![
+                mount_sock("/run/control/engine.sock"),
+                mount_sock("/run/control/real.sock"),
+                mount_sock("/run/control/dir.sock"),
+                // Expose entries only dial; they never create placeholders.
+                PublishedSocketConfig {
+                    direction: SocketDirection::Expose,
+                    guest_path: "/run/control/exposed.sock".to_string(),
+                    host_path: None,
+                },
+                // A socket whose guest path is inside no volume touches nothing.
+                mount_sock("/elsewhere/engine.sock"),
+                // Pre-fix records could hold relative paths; never follow them.
+                mount_sock("relative/engine.sock"),
+            ],
+        );
+        remove_placeholders(&record);
+
+        assert!(!placeholder.exists(), "inert 0-byte placeholder must go");
+        assert!(user_data.exists(), "user data must survive");
+        assert!(dir.is_dir(), "directories must survive");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlink_at_placeholder_path_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let share = tmp.path().join("shared");
+        std::fs::create_dir_all(&share).unwrap();
+        let target = share.join("target-empty");
+        std::fs::write(&target, b"").unwrap();
+        let link = share.join("engine.sock");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let record = record_with(
+            &share,
+            "/run/control",
+            vec![mount_sock("/run/control/engine.sock")],
+        );
+        remove_placeholders(&record);
+
+        // We only ever recognize our own placeholders — a symlink is the user's
+        // and both it and its target survive.
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(target.exists());
+    }
+
+    #[test]
+    fn deepest_volume_wins_when_mounts_nest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let share = tmp.path().join("shared");
+        let deep = tmp.path().join("deep");
+        std::fs::create_dir_all(share.join("sub")).unwrap();
+        std::fs::create_dir_all(&deep).unwrap();
+        // Same guest path maps to different host files depending on which
+        // volume owns the prefix; only the deepest mount is authoritative.
+        let shallow_file = share.join("sub/engine.sock");
+        std::fs::write(&shallow_file, b"").unwrap();
+        let real = deep.join("engine.sock");
+        std::fs::write(&real, b"").unwrap();
+
+        let mut record = record_with(
+            &share,
+            "/run/control",
+            vec![mount_sock("/run/control/sub/engine.sock")],
+        );
+        record.mounts.push((
+            deep.to_string_lossy().into_owned(),
+            "/run/control/sub".to_string(),
+            false,
+        ));
+        remove_placeholders(&record);
+
+        assert!(!real.exists(), "deepest volume's placeholder must go");
+        assert!(shallow_file.exists(), "shallow mapping's file must survive");
+    }
+
+    #[test]
+    fn shared_placeholder_survives_while_another_machine_claims_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let share = tmp.path().join("shared");
+        std::fs::create_dir_all(&share).unwrap();
+        let placeholder = share.join("engine.sock");
+        std::fs::write(&placeholder, b"").unwrap();
+
+        let mut record_a = record_with(
+            &share,
+            "/run/control",
+            vec![mount_sock("/run/control/engine.sock")],
+        );
+        record_a.name = "sock-a".to_string();
+        let mut record_b = record_with(
+            &share,
+            "/run/control",
+            vec![mount_sock("/run/control/engine.sock")],
+        );
+        record_b.name = "sock-b".to_string();
+
+        // Deleting A while B still exists must NOT remove the placeholder:
+        // over virtiofs that invalidates the running B's mountpoint dentry.
+        let claimed: HashSet<_> = mount_socket_placeholder_paths(&record_b)
+            .into_iter()
+            .collect();
+        remove_mount_socket_placeholders_except(&record_a, &claimed);
+        assert!(
+            placeholder.exists(),
+            "placeholder must survive while another machine claims it"
+        );
+
+        // Once B is the last one left, its delete cleans up.
+        remove_mount_socket_placeholders_except(&record_b, &HashSet::new());
+        assert!(
+            !placeholder.exists(),
+            "last machine's delete removes the placeholder"
+        );
+    }
+
+    #[test]
+    fn missing_placeholder_is_not_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let share = tmp.path().join("shared");
+        std::fs::create_dir_all(&share).unwrap();
+        let record = record_with(
+            &share,
+            "/run/control",
+            vec![mount_sock("/run/control/engine.sock")],
+        );
+        remove_placeholders(&record); // nothing present: no failure
     }
 }

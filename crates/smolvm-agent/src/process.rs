@@ -7,6 +7,59 @@ use std::io::Read;
 use std::process::Child;
 use std::time::{Duration, Instant};
 
+const CONTAINER_INIT_ARG: &str = "container-init";
+
+/// Whether this agent invocation is the image-independent init process used by
+/// a persistent workload container.
+pub fn container_init_requested() -> bool {
+    std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new(CONTAINER_INIT_ARG))
+}
+
+/// Run a minimal PID-1 reaper for a persistent workload container.
+///
+/// Foreground execs can create background descendants. When timeout cleanup
+/// kills that process tree, the descendants are reparented to container PID 1.
+/// A passive keepalive such as `tail -f /dev/null` never waits for them and
+/// therefore leaks zombies across execs. Block the relevant signals and use
+/// `sigwait`, which closes the usual reap-before-sleep race without requiring
+/// an async signal handler.
+#[cfg(target_os = "linux")]
+pub fn run_container_init() -> i32 {
+    let mut signals = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+    unsafe {
+        libc::sigemptyset(&mut signals);
+        libc::sigaddset(&mut signals, libc::SIGCHLD);
+        libc::sigaddset(&mut signals, libc::SIGTERM);
+        libc::sigaddset(&mut signals, libc::SIGINT);
+    }
+    if unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &signals, std::ptr::null_mut()) } != 0 {
+        return 1;
+    }
+
+    loop {
+        loop {
+            let mut status = 0;
+            let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+            if pid <= 0 {
+                break;
+            }
+        }
+
+        let mut signal = 0;
+        if unsafe { libc::sigwait(&signals, &mut signal) } != 0 {
+            return 1;
+        }
+        if signal == libc::SIGTERM || signal == libc::SIGINT {
+            return 0;
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn run_container_init() -> i32 {
+    1
+}
+
 /// Exit code used when a command is killed due to timeout.
 pub const TIMEOUT_EXIT_CODE: i32 = 124;
 
@@ -141,7 +194,7 @@ pub fn wait_with_timeout_cleanup_and_liveness<F>(
     child: &mut Child,
     timeout_ms: Option<u64>,
     client_fd: Option<std::os::unix::io::RawFd>,
-    on_timeout: F,
+    on_abort: F,
 ) -> std::io::Result<WaitResult>
 where
     F: FnOnce(),
@@ -264,6 +317,7 @@ where
             Ok(None) => {
                 if let Some(fd) = client_fd {
                     if is_peer_closed(fd) {
+                        on_abort();
                         let _ = child.kill();
                         let _ = child.wait();
                         drain_channels(&stdout_rx, &stderr_rx, &mut stdout_buf, &mut stderr_buf);
@@ -278,7 +332,7 @@ where
 
                 if let Some(deadline) = deadline {
                     if Instant::now() >= deadline {
-                        on_timeout();
+                        on_abort();
                         let _ = child.kill();
                         let _ = child.wait();
                         drain_channels(&stdout_rx, &stderr_rx, &mut stdout_buf, &mut stderr_buf);

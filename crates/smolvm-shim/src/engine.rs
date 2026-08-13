@@ -614,6 +614,7 @@ impl PodBackend for EnginePodBackend {
                 },
                 persistent: true,
                 runtime_managed: true,
+                labels: Default::default(),
             };
             match rt.create_machine(spec.clone()) {
                 Ok(()) => {}

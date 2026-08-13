@@ -112,6 +112,82 @@ test_machine_network_dns_resolution() {
     [[ $exit_code -eq 0 ]] && [[ "$output" == *"Address"* ]]
 }
 
+# Regression: a machine must reach the internet by NAME, not just by address.
+#
+# Resolving a name yields both an A and a AAAA record for most hosts, and the
+# resolver decides which to use by connecting a datagram socket to each
+# candidate and seeing which is routable (RFC 6724). The guest kernel's TSI
+# datagram connect() once reported success for every destination, including
+# ones with no route at all, so on an IPv4-only host the resolver concluded
+# IPv6 was reachable, sorted it first, and every name-based connection went to
+# an address the host could never reach. Connecting to a literal IPv4 address
+# still worked, which is why this hid from every test that used one.
+#
+# Assert the name path specifically, and assert it on a bare machine: that is
+# the default `--net` experience, and `apk`/`wget` inside it were unusable for
+# several releases while the address path looked healthy.
+test_machine_network_connect_by_hostname() {
+    local vm_name="net-hostname-$$"
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
+
+    $SMOLVM machine create --name "$vm_name" --net 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || {
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1
+    }
+
+    # captive.apple.com serves plain HTTP and never redirects, so a failure here
+    # is a connectivity failure rather than a TLS or redirect-chain problem.
+    local output exit_code=0
+    output=$($SMOLVM machine exec --name "$vm_name" -- \
+        wget -q -O- -T15 http://captive.apple.com/ 2>&1) || exit_code=$?
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
+    ensure_data_dir_deleted "$vm_name"
+
+    if [[ $exit_code -ne 0 ]] || [[ "$output" != *"Success"* ]]; then
+        echo "FAIL: could not fetch over HTTP by hostname (got: $output)"
+        return 1
+    fi
+}
+
+# Regression: the resolver must not be told an unroutable destination is
+# reachable.
+#
+# This is the invariant behind the test above, asserted directly so a failure
+# names the cause rather than the symptom. A datagram connect() is only a route
+# lookup — no packet leaves — so connecting to a documentation-range address
+# that the guest has no route to must report an error. Returning success there
+# is what corrupts the resolver's address sorting.
+test_machine_dgram_connect_reports_unroutable() {
+    local vm_name="net-dgram-errno-$$"
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
+
+    $SMOLVM machine create --name "$vm_name" --net 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || {
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1
+    }
+
+    # 2001:db8::/32 is the reserved documentation prefix: never globally
+    # routable, so a connect to it must fail on any host, with or without IPv6.
+    local rc
+    rc=$($SMOLVM machine exec --name "$vm_name" -- sh -c \
+        'echo x | nc -u -w2 2001:db8::1 53 >/dev/null 2>&1; echo $?' 2>&1 | tr -d "[:space:]")
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
+    ensure_data_dir_deleted "$vm_name"
+
+    if [[ "$rc" == "0" ]]; then
+        echo "FAIL: datagram connect to an unroutable address reported success"
+        return 1
+    fi
+}
+
 test_machine_network_multiple_dns_lookups() {
     local vm_name="net-multi-dns-test-$$"
 
@@ -713,6 +789,8 @@ print(\"grpcio_channel_ready: PASS\")
 
 run_test "Network: disabled by default" test_machine_network_disabled_by_default || true
 run_test "Network: DNS resolution" test_machine_network_dns_resolution || true
+run_test "Network: connect by hostname (not just by address)" test_machine_network_connect_by_hostname || true
+run_test "Network: datagram connect reports an unroutable destination" test_machine_dgram_connect_reports_unroutable || true
 run_test "Network: multiple DNS lookups" test_machine_network_multiple_dns_lookups || true
 run_test "Egress: allow-cidr permits matching traffic" test_machine_egress_allow_cidr_permitted || true
 run_test "Egress: allow-cidr blocks non-matching traffic" test_machine_egress_allow_cidr_blocked || true

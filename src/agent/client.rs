@@ -550,6 +550,13 @@ impl AgentClient {
         Self::connect_with_timeouts_ms(socket_path.as_ref(), 5, 5)
     }
 
+    /// Connect to a restored clone while allowing its resumed vsock transport
+    /// to complete the handshake. Reopening 5 ms boot probes can fill the
+    /// restored RX queue before the agent receives any ping payload.
+    pub fn connect_with_clone_ready_timeout(socket_path: impl AsRef<Path>) -> Result<Self> {
+        Self::connect_with_timeouts_ms(socket_path.as_ref(), 1000, 1000)
+    }
+
     /// Internal connect implementation (single attempt).
     fn connect_once(socket_path: &Path) -> Result<Self> {
         Self::connect_with_timeouts(
@@ -906,6 +913,18 @@ impl AgentClient {
     pub fn format_storage(&mut self) -> Result<()> {
         let resp = self.request(&AgentRequest::FormatStorage)?;
         expect_ok(resp, "format storage")
+    }
+
+    /// Merge `lowerdirs` (bottom -> top) into a single tar at `output` in the guest.
+    ///
+    /// Missing or empty entries are dropped guest-side, so callers can append a
+    /// container overlay's upper dir without probing it first.
+    pub fn flatten_layers(&mut self, lowerdirs: &[String], output: &str) -> Result<()> {
+        let resp = self.request(&AgentRequest::FlattenLayers {
+            lowerdirs: lowerdirs.to_vec(),
+            output: output.to_string(),
+        })?;
+        expect_ok(resp, "flatten layers")
     }
 
     /// Get storage status.
@@ -1297,10 +1316,11 @@ impl AgentClient {
         F: FnMut(ExecEvent),
     {
         let timeout_ms = config.timeout.map(|t| t.as_millis() as u64);
-
-        self.stream
-            .set_read_timeout(None)
-            .map_err(|e| Error::agent("set read timeout", e.to_string()))?;
+        // Keep a host-side deadline whenever the caller requested one. The
+        // guest normally enforces the command timeout, but a wedged restored
+        // VM cannot send its terminal event and must not leave the CLI blocked
+        // forever on an otherwise-open vsock connection.
+        let _timeout_guard = self.set_exec_timeout(config.timeout)?;
 
         self.send(&AgentRequest::Run {
             image: config.image,
@@ -1928,10 +1948,7 @@ impl AgentClient {
         F: FnMut(ExecEvent),
     {
         let timeout_ms = timeout.map(|t| t.as_millis() as u64);
-
-        self.stream
-            .set_read_timeout(None)
-            .map_err(|e| Error::agent("set read timeout", e.to_string()))?;
+        let _timeout_guard = self.set_exec_timeout(timeout)?;
 
         self.send(&AgentRequest::VmExec {
             command,

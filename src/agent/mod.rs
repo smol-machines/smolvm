@@ -29,6 +29,7 @@ pub use launcher::{
     create_disk_overlays, find_lib_dir, launch_agent_vm, DiskOverlaySpec, LaunchConfig,
     LaunchFeatures, VmDisks,
 };
+pub(crate) use manager::{cleanup_dead_vm_runtime, cleanup_dead_vm_runtime_in_db};
 pub use manager::{
     disk_used_mb, docker_config_dir, docker_config_mount, ensure_vm_dir, machine_layers_cache_dir,
     prune_orphaned_ready_markers, read_egress_telemetry, read_shared_pack_pointer,
