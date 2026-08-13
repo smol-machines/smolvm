@@ -26,7 +26,7 @@
 //! - the relay thread owns the host-facing TCP socket
 //! - channels bridge payloads between them
 
-use crate::egress::EgressPolicy;
+use crate::policy::PolicyHandle;
 use crate::queues::WakePipe;
 use crate::virtio_net_log;
 use smoltcp::iface::{Interface, SocketHandle, SocketSet};
@@ -63,7 +63,7 @@ pub struct TcpRelayTable {
     max_connections: usize,
     /// Outbound allow-list applied before opening a host connection for a
     /// guest-initiated flow. Inbound published-port connections bypass it.
-    egress: EgressPolicy,
+    egress: PolicyHandle,
     /// The guest-visible gateway addresses (IPv4/IPv6/link-local). A guest flow
     /// destined to one of these is dialing "the host" via its default gateway,
     /// so the host-side relay connects to loopback instead of the gateway's own
@@ -194,7 +194,7 @@ impl TcpRelayTable {
     /// Create a new relay table.
     pub fn new(
         max_connections: Option<usize>,
-        egress: EgressPolicy,
+        egress: PolicyHandle,
         gateway_ips: Vec<IpAddr>,
         host_service: Option<crate::GatewayHostService>,
     ) -> Self {
@@ -211,7 +211,7 @@ impl TcpRelayTable {
     }
 
     fn destination_allowed(&self, destination: SocketAddr) -> bool {
-        self.egress.allows(destination.ip())
+        self.egress.allows(destination.ip(), Some(destination.port()))
             || (self
                 .host_service
                 .is_some_and(|service| service.guest_port == destination.port())
@@ -232,6 +232,9 @@ impl TcpRelayTable {
     /// reaches here — this redirect only applies where reaching the host is the
     /// intended, local-default behavior.
     fn host_connect_addr(&self, destination: SocketAddr) -> SocketAddr {
+        if let Some(ip) = self.egress.rewrite(destination.ip()) {
+            return SocketAddr::new(ip, destination.port());
+        }
         if self.gateway_ips.contains(&destination.ip()) {
             let loopback = if destination.is_ipv4() {
                 IpAddr::V4(Ipv4Addr::LOCALHOST)
@@ -883,7 +886,12 @@ mod tests {
     fn gateway_ip_destination_dials_the_host_over_loopback() {
         let gw4: IpAddr = "100.96.0.1".parse().unwrap();
         let gw6: IpAddr = "fd00::1".parse().unwrap();
-        let table = TcpRelayTable::new(None, EgressPolicy::unrestricted(), vec![gw4, gw6], None);
+        let table = TcpRelayTable::new(
+            None,
+            Arc::new(crate::egress::EgressPolicy::unrestricted()),
+            vec![gw4, gw6],
+            None,
+        );
 
         // A guest reaching "the host" via its gateway IP must dial loopback, not
         // the gateway's own (non-routable) userspace address — the bug that made
@@ -906,13 +914,84 @@ mod tests {
         );
     }
 
+    /// A policy that publishes one stand-in address and keeps the real
+    /// destination to itself.
+    struct StandinPolicy;
+
+    /// RFC 5737 TEST-NET-1: never a real destination.
+    const STANDIN: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+    const REAL: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3));
+
+    impl crate::policy::Policy for StandinPolicy {
+        fn allows(&self, _ip: IpAddr, _port: Option<u16>) -> bool {
+            true
+        }
+
+        fn rewrite(&self, ip: IpAddr) -> Option<IpAddr> {
+            (ip == STANDIN).then_some(REAL)
+        }
+    }
+
+    #[test]
+    fn a_policy_rewrite_takes_precedence_over_the_gateway_ip_redirect() {
+        let gw: IpAddr = "100.96.0.1".parse().unwrap();
+        let table = TcpRelayTable::new(None, Arc::new(StandinPolicy), vec![gw], None);
+
+        // The policy gets first say: its stand-in is dialed as what it stands
+        // for, with the port the guest asked for.
+        assert_eq!(
+            table.host_connect_addr(SocketAddr::new(STANDIN, 5432)),
+            SocketAddr::new(REAL, 5432),
+        );
+        // The gateway-IP redirect still covers everything the policy leaves
+        // alone, so the two mechanisms do not shadow each other.
+        assert_eq!(
+            table.host_connect_addr(SocketAddr::new(gw, 8080)),
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080),
+        );
+        // ...and an ordinary destination is dialed unchanged.
+        let public: IpAddr = "1.1.1.1".parse().unwrap();
+        assert_eq!(
+            table.host_connect_addr(SocketAddr::new(public, 443)),
+            SocketAddr::new(public, 443),
+        );
+    }
+
+    /// The port reaches the policy, and a denial happens before any host socket
+    /// exists. Per-port grants are the thing the built-in policy cannot express,
+    /// so this is the plumbing an embedder actually plugs in for.
+    #[test]
+    fn a_custom_policy_gates_the_syn_by_port() {
+        struct OnlyHttps;
+
+        impl crate::policy::Policy for OnlyHttps {
+            fn allows(&self, _ip: IpAddr, port: Option<u16>) -> bool {
+                port == Some(443)
+            }
+        }
+
+        let mut table = TcpRelayTable::new(None, Arc::new(OnlyHttps), vec![], None);
+        let mut sockets = SocketSet::new(vec![]);
+        let source: SocketAddr = "100.96.0.2:40000".parse().unwrap();
+        let dst = |port| SocketAddr::new("1.1.1.1".parse().unwrap(), port);
+
+        // A port the policy grants gets a guest-facing socket and a relay entry.
+        assert!(table.create_tcp_socket(source, dst(443), &mut sockets));
+        assert!(table.has_socket_for(&source, &dst(443)));
+
+        // One it does not is dropped outright — no socket, no entry, and the
+        // guest just sees the connection fail.
+        assert!(!table.create_tcp_socket(source, dst(80), &mut sockets));
+        assert!(!table.has_socket_for(&source, &dst(80)));
+    }
+
     #[test]
     fn dedicated_gateway_service_does_not_weaken_other_egress() {
         let gateway: IpAddr = "100.96.0.1".parse().unwrap();
         let external: IpAddr = "8.8.8.8".parse().unwrap();
         let table = TcpRelayTable::new(
             None,
-            EgressPolicy::from_allowed_cidrs(Some(&[])),
+            Arc::new(crate::egress::EgressPolicy::from_allowed_cidrs(Some(&[]))),
             vec![gateway],
             Some(crate::GatewayHostService {
                 guest_port: 10_081,
