@@ -211,7 +211,8 @@ impl TcpRelayTable {
     }
 
     fn destination_allowed(&self, destination: SocketAddr) -> bool {
-        self.egress.allows(destination.ip())
+        self.egress
+            .allows(destination.ip(), Some(destination.port()))
             || (self
                 .host_service
                 .is_some_and(|service| service.guest_port == destination.port())
@@ -290,6 +291,13 @@ impl TcpRelayTable {
             return false;
         }
 
+        // Sentinel → host loopback; guest-facing smoltcp socket keeps the sentinel.
+        let connect_to = self
+            .egress
+            .host_forward(destination.ip())
+            .map(|ip| SocketAddr::new(ip, destination.port()))
+            .unwrap_or(destination);
+
         let rx_buffer = tcp::SocketBuffer::new(vec![0u8; TCP_RX_BUFFER_BYTES]);
         let tx_buffer = tcp::SocketBuffer::new(vec![0u8; TCP_TX_BUFFER_BYTES]);
         let mut socket = tcp::Socket::new(rx_buffer, tx_buffer);
@@ -319,7 +327,7 @@ impl TcpRelayTable {
                 pending_proxy_endpoints: Some(PendingProxyEndpoints {
                     from_smoltcp: to_proxy_rx,
                     to_smoltcp: from_proxy_tx,
-                    relay_target: RelayTarget::Connect(self.host_connect_addr(destination)),
+                    relay_target: RelayTarget::Connect(self.host_connect_addr(connect_to)),
                 }),
                 relay_spawned: false,
                 buffered_guest_data: None,
@@ -844,6 +852,7 @@ fn flush_proxy_data(socket: &mut tcp::Socket<'_>, connection: &mut TrackedConnec
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::egress::EgressConfig;
 
     fn test_connection(to_proxy: SyncSender<Vec<u8>>) -> TrackedConnection {
         let (_from_proxy_tx, from_proxy) = mpsc::sync_channel(CHANNEL_CAPACITY);
@@ -912,7 +921,7 @@ mod tests {
         let external: IpAddr = "8.8.8.8".parse().unwrap();
         let table = TcpRelayTable::new(
             None,
-            EgressPolicy::from_allowed_cidrs(Some(&[])),
+            EgressPolicy::new(EgressConfig::from_allow_lists(Some(Vec::new()), None)),
             vec![gateway],
             Some(crate::GatewayHostService {
                 guest_port: 10_081,

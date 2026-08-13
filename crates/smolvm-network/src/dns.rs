@@ -168,6 +168,56 @@ pub fn error_response(query: &[u8], rcode: u16) -> Vec<u8> {
     response
 }
 
+/// Synthesize a DNS response for `query` with the given `ips` (A/AAAA, `ttl` s).
+/// SERVFAIL if the question is unparseable; QTYPE filtering — only matching record
+/// types are answered.
+pub fn build_ip_response(query: &[u8], ips: &[IpAddr], ttl: u32) -> Vec<u8> {
+    let Some(question_end) = question_section_end(query) else {
+        return error_response(query, DNS_RCODE_SERVFAIL);
+    };
+    let qtype = read_u16(query, question_end - 4).unwrap_or(0);
+    let ips: Vec<IpAddr> = ips
+        .iter()
+        .copied()
+        .filter(|ip| {
+            matches!(
+                (qtype, ip),
+                (DNS_TYPE_A, IpAddr::V4(_)) | (DNS_TYPE_AAAA, IpAddr::V6(_))
+            )
+        })
+        .collect();
+    let flags = DNS_FLAG_RESPONSE
+        | (read_u16(query, DNS_FLAGS_OFFSET).unwrap_or(0) & DNS_FLAG_RECURSION_DESIRED)
+        | DNS_FLAG_RECURSION_AVAILABLE;
+    let ancount = u16::try_from(ips.len()).unwrap_or(0);
+
+    let mut response =
+        Vec::with_capacity(question_end + ips.len() * (DNS_RR_FIXED_LEN + DNS_AAAA_RDATA_LEN));
+    response.extend_from_slice(&query[..DNS_ID_LEN]);
+    response.extend_from_slice(&flags.to_be_bytes());
+    response.extend_from_slice(&DNS_ONE_QUESTION.to_be_bytes()); // qdcount
+    response.extend_from_slice(&ancount.to_be_bytes());
+    response.extend_from_slice(&0u16.to_be_bytes()); // nscount
+    response.extend_from_slice(&0u16.to_be_bytes()); // arcount
+    response.extend_from_slice(&query[DNS_HEADER_LEN..question_end]); // echo question
+
+    // Name pointer to the question name at the fixed header offset.
+    let name_pointer = [DNS_POINTER_TAG, DNS_HEADER_LEN as u8];
+    for ip in &ips {
+        response.extend_from_slice(&name_pointer);
+        let (rtype, rdata) = match ip {
+            IpAddr::V4(v4) => (DNS_TYPE_A, v4.octets().to_vec()),
+            IpAddr::V6(v6) => (DNS_TYPE_AAAA, v6.octets().to_vec()),
+        };
+        response.extend_from_slice(&rtype.to_be_bytes());
+        response.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
+        response.extend_from_slice(&ttl.to_be_bytes());
+        response.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        response.extend_from_slice(&rdata);
+    }
+    response
+}
+
 fn question_section_end(packet: &[u8]) -> Option<usize> {
     if packet.len() < DNS_HEADER_LEN || read_u16(packet, DNS_QDCOUNT_OFFSET)? != DNS_ONE_QUESTION {
         return None;
@@ -250,6 +300,14 @@ mod tests {
     use super::*;
 
     /// A query for `name` with one question (A/IN).
+    fn query_for_type(name: &str, qtype: u16) -> Vec<u8> {
+        let mut q = query_for(name);
+        // Overwrite the trailing QTYPE (the last four bytes are QTYPE+QCLASS).
+        let qtype_at = q.len() - 4;
+        q[qtype_at..qtype_at + 2].copy_from_slice(&qtype.to_be_bytes());
+        q
+    }
+
     fn query_for(name: &str) -> Vec<u8> {
         let mut q = vec![
             0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -308,6 +366,10 @@ mod tests {
             records,
             vec![(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 300)]
         );
+        // A response echoes its question, so the name is recoverable from the
+        // answer alone — which is how the gateway learns records under a name
+        // without carrying the query string alongside the pending request.
+        assert_eq!(question_name(&r).as_deref(), Some("example.com"));
     }
 
     #[test]
@@ -370,6 +432,34 @@ mod tests {
         assert_eq!(flags & DNS_FLAG_RESPONSE, DNS_FLAG_RESPONSE);
         assert_eq!(flags & DNS_RCODE_MASK, DNS_RCODE_NXDOMAIN);
         assert_eq!(&resp[..2], &q[..2]); // echoed id
+    }
+
+    #[test]
+    fn build_ip_response_round_trips_through_parser() {
+        let ips = vec![
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
+            IpAddr::V6("2606:4700::1".parse().unwrap()),
+        ];
+
+        // Answers are filtered to the question's type: an A query must not carry
+        // the AAAA record, or a resolver that asked for A sees an answer it did
+        // not request (and a guest with no v6 route follows it).
+        for (qtype, expected) in [(DNS_TYPE_A, ips[0]), (DNS_TYPE_AAAA, ips[1])] {
+            let query = query_for_type("api.internal", qtype);
+            let response = build_ip_response(&query, &ips, 60);
+            assert_eq!(&response[..2], &query[..2]); // echoed id
+            let flags = read_u16(&response, DNS_FLAGS_OFFSET).unwrap();
+            assert_eq!(flags & DNS_FLAG_RESPONSE, DNS_FLAG_RESPONSE);
+            // Our own parser must extract exactly the synthesized record.
+            assert_eq!(answer_ip_records(&response), vec![(expected, 60)]);
+        }
+    }
+
+    #[test]
+    fn build_ip_response_servfails_on_bad_query() {
+        let response = build_ip_response(&[0, 1, 2], &[IpAddr::V4(Ipv4Addr::LOCALHOST)], 60);
+        let flags = read_u16(&response, DNS_FLAGS_OFFSET).unwrap();
+        assert_eq!(flags & DNS_RCODE_MASK, DNS_RCODE_SERVFAIL);
     }
 
     #[test]

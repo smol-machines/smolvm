@@ -33,27 +33,27 @@ pub fn load(path: &Path) -> crate::Result<Smolfile> {
 /// Hostnames are resolved via the host DNS at VM start time and each result
 /// address is formatted with the correct prefix length.
 ///
-/// Rejects `host:port` syntax — port filtering is not supported by the TSI
-/// egress policy (all ports to a resolved IP are implicitly allowed).
+/// A trailing `:port` (or `[v6]:port`) narrows the grant to that port and is
+/// carried through onto every resolved CIDR, so the egress policy gates on it.
+/// Only the virtio-net stack enforces ports; callers that have explicitly
+/// selected TSI must reject a port suffix rather than silently granting every
+/// port — see `port_suffix_unsupported_on_tsi`.
 pub fn resolve_host_to_cidrs(host: &str) -> Result<Vec<String>, String> {
     use ipnet::IpNet;
     use std::net::{IpAddr, ToSocketAddrs};
 
-    // Try parsing as a bare IP first — must come before the ':' check so that
-    // IPv6 addresses like "::1" or "2001:db8::1" (which contain ':') are
-    // handled correctly rather than being rejected as host:port syntax.
+    // Try parsing as a bare IP first — must come before the port split so that
+    // IPv6 addresses like "::1" or "2001:db8::1" (which contain ':') are read as
+    // addresses rather than host:port.
     if let Ok(ip) = host.parse::<IpAddr>() {
         return Ok(vec![IpNet::from(ip).to_string()]);
     }
 
-    // Reject host:port syntax (e.g. "example.com:443").
-    if host.contains(':') {
-        return Err(format!(
-            "invalid hostname '{}': port suffixes are not supported. \
-             Use the hostname only (all ports are allowed to resolved IPs).",
-            host
-        ));
-    }
+    // Split with the policy's own parser, so what the CLI accepts and what the
+    // egress layer later enforces cannot drift apart.
+    let (host, port) = smolvm_network::split_port(host)
+        .ok_or_else(|| format!("invalid hostname '{host}': malformed port suffix"))?;
+    let suffix = port.map(|p| format!(":{p}")).unwrap_or_default();
 
     // Resolve hostname with a timeout to avoid hanging on slow/unreachable DNS.
     let host_owned = host.to_string();
@@ -76,7 +76,20 @@ pub fn resolve_host_to_cidrs(host: &str) -> Result<Vec<String>, String> {
         return Err(format!("'{}' resolved to no addresses", host));
     }
 
-    Ok(addrs)
+    // Carry the port grant onto every resolved CIDR so the policy narrows each
+    // one; without this the static entries would allow every port to those IPs
+    // and quietly defeat the gate the user asked for.
+    Ok(addrs.into_iter().map(|c| format!("{c}{suffix}")).collect())
+}
+
+/// Whether an allow-list entry carries a port suffix. TSI cannot enforce ports,
+/// so a caller that has explicitly selected it must refuse rather than grant
+/// every port.
+pub fn has_port_suffix(entry: &str) -> bool {
+    if entry.parse::<std::net::IpAddr>().is_ok() {
+        return false;
+    }
+    smolvm_network::split_port(entry).is_some_and(|(_, port)| port.is_some())
 }
 
 /// Parse and validate a CIDR specification (e.g., `"10.0.0.0/8"`, `"1.1.1.1"`).
@@ -123,13 +136,33 @@ mod tests {
     }
 
     #[test]
-    fn resolve_host_rejects_port_suffix() {
-        let err = resolve_host_to_cidrs("example.com:443").unwrap_err();
-        assert!(err.contains("port suffixes are not supported"), "{}", err);
+    fn resolve_host_carries_the_port_onto_every_cidr() {
+        // IP literals so the test never depends on DNS. The port must land on
+        // the CIDR, or the static allow entry would grant every port and defeat
+        // the gate the user asked for.
+        assert_eq!(
+            resolve_host_to_cidrs("1.2.3.4:443").unwrap(),
+            vec!["1.2.3.4/32:443".to_string()]
+        );
+        assert_eq!(
+            resolve_host_to_cidrs("[::1]:80").unwrap(),
+            vec!["::1/128:80".to_string()]
+        );
+        // No suffix → unchanged, every port allowed to the resolved IPs.
+        assert_eq!(
+            resolve_host_to_cidrs("1.2.3.4").unwrap(),
+            vec!["1.2.3.4/32".to_string()]
+        );
+    }
 
-        // Bracketed IPv6 with port must also be rejected.
-        let err = resolve_host_to_cidrs("[::1]:80").unwrap_err();
-        assert!(err.contains("port suffixes are not supported"), "{}", err);
+    #[test]
+    fn port_suffix_detection_ignores_bare_addresses() {
+        assert!(has_port_suffix("example.com:443"));
+        assert!(has_port_suffix("[::1]:80"));
+        assert!(!has_port_suffix("example.com"));
+        // A bare v6 literal is full of colons but carries no port.
+        assert!(!has_port_suffix("2001:db8::1"));
+        assert!(!has_port_suffix("10.0.0.0/8"));
     }
 
     #[test]

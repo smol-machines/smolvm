@@ -60,7 +60,26 @@ fn resolve_egress_flags(
     allow_host: Vec<String>,
     outbound_localhost_only: bool,
     net: bool,
+    explicit_backend: Option<NetworkBackend>,
 ) -> smolvm::Result<(Vec<String>, bool, Option<Vec<String>>)> {
+    // A port grant is only honoured by the host-side stack. An egress policy
+    // already forces virtio-net, so the sole way to ask for something we cannot
+    // deliver is to pick TSI explicitly — refuse instead of silently granting
+    // every port, which is the failure mode that matters for an allow-list.
+    if explicit_backend == Some(NetworkBackend::Tsi) {
+        for entry in allow_cidr.iter().chain(allow_host.iter()) {
+            if crate::cli::parsers::has_port_suffix(entry) {
+                return Err(smolvm::Error::config(
+                    "--allow-host",
+                    format!(
+                        "port suffix in '{entry}' cannot be enforced by the tsi backend; \
+                         drop the port or use --net-backend virtio-net"
+                    ),
+                ));
+            }
+        }
+    }
+
     // Resolve hostnames to CIDRs — fail hard on resolution errors
     for host in &allow_host {
         let cidrs = crate::cli::parsers::resolve_host_to_cidrs(host)
@@ -1049,6 +1068,7 @@ impl RunCmd {
             self.allow_host,
             self.outbound_localhost_only,
             self.net,
+            self.net_backend,
         )?;
 
         let params = crate::cli::smolfile::build_create_params(
@@ -2939,6 +2959,7 @@ impl CreateCmd {
             self.allow_host,
             self.outbound_localhost_only,
             self.net,
+            self.net_backend,
         )?;
 
         let name = self
@@ -3130,6 +3151,7 @@ impl CreateCmd {
             self.allow_host.clone(),
             self.outbound_localhost_only,
             self.net,
+            self.net_backend,
         )?;
         let (network, allowed_cidrs, dns_filter_hosts) = smolmachine_egress_fields(
             manifest.network,

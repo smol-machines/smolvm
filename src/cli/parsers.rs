@@ -99,7 +99,7 @@ pub fn record_mounts_to_runconfig_bindings(
 }
 
 // Network helpers delegated to the library.
-pub use smolvm::smolfile::{parse_cidr, resolve_host_to_cidrs};
+pub use smolvm::smolfile::{has_port_suffix, parse_cidr, resolve_host_to_cidrs};
 
 #[cfg(test)]
 mod tests {
