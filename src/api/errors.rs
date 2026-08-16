@@ -24,6 +24,9 @@ pub enum ApiError {
     /// specific, retryable failure (reallocate a different port and retry)
     /// instead of treating it as a generic 500/409.
     PortConflict(String),
+    /// A restored clone could not prove that its inherited machine identity was
+    /// replaced. The clone has been torn down, so callers may safely retry.
+    CloneIdentityRejuvenationFailed(String),
     /// Bad request - invalid input (400).
     BadRequest(String),
     /// Request timeout (408).
@@ -61,6 +64,11 @@ impl IntoResponse for ApiError {
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, "NOT_FOUND", msg),
             ApiError::Conflict(msg) => (StatusCode::CONFLICT, "CONFLICT", msg),
             ApiError::PortConflict(msg) => (StatusCode::CONFLICT, "PORT_IN_USE", msg),
+            ApiError::CloneIdentityRejuvenationFailed(msg) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "CLONE_IDENTITY_REJUVENATION_FAILED",
+                msg,
+            ),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, "BAD_REQUEST", msg),
             ApiError::Timeout => (
                 StatusCode::REQUEST_TIMEOUT,
@@ -134,6 +142,10 @@ mod tests {
             (ApiError::Forbidden("x".into()), StatusCode::FORBIDDEN),
             (ApiError::NotFound("x".into()), StatusCode::NOT_FOUND),
             (ApiError::Conflict("x".into()), StatusCode::CONFLICT),
+            (
+                ApiError::CloneIdentityRejuvenationFailed("x".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
             (ApiError::BadRequest("x".into()), StatusCode::BAD_REQUEST),
             (ApiError::Timeout, StatusCode::REQUEST_TIMEOUT),
             (
@@ -148,6 +160,19 @@ mod tests {
         for (error, expected) in cases {
             assert_eq!(error.into_response().status(), expected);
         }
+    }
+
+    #[tokio::test]
+    async fn clone_rejuvenation_failure_has_a_stable_public_code() {
+        let response = ApiError::CloneIdentityRejuvenationFailed("identity reset failed".into())
+            .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(body["code"], "CLONE_IDENTITY_REJUVENATION_FAILED");
+        assert_eq!(body["error"], "identity reset failed");
     }
 
     #[test]

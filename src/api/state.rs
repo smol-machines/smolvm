@@ -27,7 +27,7 @@ pub struct ApiState {
     /// Reserved machine names (creation in progress).
     /// This prevents race conditions during machine creation.
     reserved_names: RwLock<HashSet<String>>,
-    /// Per-machine lifecycle locks serializing start/stop/delete/restart.
+    /// Per-machine lifecycle locks serializing start/stop/delete/restart/fork.
     ///
     /// On macOS, stop/delete `hdiutil`-detach a machine's case-sensitive
     /// packed-layers volume while a concurrent start acquires+mounts+launches
@@ -39,10 +39,12 @@ pub struct ApiState {
     /// for the whole operation, so mount and detach can never interleave for one
     /// machine. Lock order is lifecycle (tokio, async) → entry (parking_lot,
     /// inside `spawn_blocking`); no entry-holding path ever takes lifecycle, so
-    /// there is no inversion. On Linux the guarded detach/mount are compile-time
-    /// no-ops, making this harmless serialization. Scope: the API server only —
-    /// the embedded (`control.rs`) and CLI (`vm_common.rs`) paths are separate
-    /// processes with no shared in-process lock.
+    /// there is no inversion. Forks that need two lifecycle locks take the
+    /// golden before the clone, matching the pool controller. On Linux the
+    /// guarded detach/mount are compile-time no-ops, making this harmless
+    /// serialization. Scope: the API server only — the embedded (`control.rs`)
+    /// and CLI (`vm_common.rs`) paths are separate processes with no shared
+    /// in-process lock.
     ///
     /// Entries are created on first use and never removed: the map is bounded by
     /// the number of distinct machine names, so a retained `Arc<Mutex<()>>` per
@@ -516,7 +518,7 @@ impl ApiState {
     /// Get the per-machine lifecycle lock for `name`, creating it on first use.
     ///
     /// Callers `.lock().await` the returned mutex at the top of
-    /// start/stop/delete/restart and hold the guard for the whole operation so
+    /// start/stop/delete/restart/fork and hold the guard for the whole operation so
     /// the macOS layers-volume mount (start) and detach (stop/delete) can never
     /// interleave for one machine. See the `lifecycle_locks` field docs for the
     /// lock-ordering and scope contract.

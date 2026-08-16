@@ -1379,6 +1379,12 @@ pub(crate) async fn fork_machine_inner(
     crate::agent::fork::validate_fork_env(&fork_env)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
+    if clone == golden {
+        return Err(ApiError::Conflict(format!(
+            "clone name '{clone}' is already used by the golden"
+        )));
+    }
+
     // Validate pinned ports as the create path does: fork uses these host ports
     // as-is (no remapping), so port 0 or a duplicated host port would otherwise
     // surface only as a confusing clone-boot bind failure instead of a clean 400.
@@ -1400,6 +1406,23 @@ pub(crate) async fn fork_machine_inner(
         }
     }
 
+    // A failed clone finalization may need to roll back the golden and discard
+    // the retained checkpoint that produced it. Keep that state transition in
+    // one owner-level critical section so another fork/start/stop/delete cannot
+    // observe the golden between failed-clone teardown and rollback.
+    let golden_lifecycle = state.lifecycle_lock(&golden);
+    let _golden_guard = golden_lifecycle.lock().await;
+
+    // Reject an already-registered target before taking its lifecycle lock.
+    // Besides avoiding a pointless forkpoint wait, this prevents two invalid
+    // cross-forks (X -> Y and Y -> X) from each holding one golden while waiting
+    // forever on the other machine's clone lock.
+    if state.lookup_vm(&clone).await?.is_some() {
+        return Err(ApiError::Conflict(format!(
+            "machine '{clone}' already exists"
+        )));
+    }
+
     if wait_ready {
         let golden_b = golden.clone();
         tokio::task::spawn_blocking(move || {
@@ -1411,8 +1434,8 @@ pub(crate) async fn fork_machine_inner(
     }
 
     // Serialize lifecycle on the CLONE name so a concurrent start/stop/delete of
-    // the same clone can't race the fork's register + boot. The golden is only
-    // read + frozen via its control socket, which tolerates concurrent forks.
+    // the same clone can't race the fork's register + boot. Golden is always
+    // acquired before clone, matching the fork-pool lock order.
     let lifecycle = state.lifecycle_lock(&clone);
     let _guard = lifecycle.lock().await;
 
@@ -1444,8 +1467,10 @@ pub(crate) async fn fork_machine_inner(
         .map_err(classify_fork_error)?
     };
 
-    boot_prepared_fork_inner(
-        state,
+    let snapshot_dir = prep.snapshot_dir.clone();
+    let resume_golden_on_rollback = prep.resume_golden_on_rollback;
+    let result = boot_prepared_fork_inner(
+        state.clone(),
         clone,
         prep,
         PreparedForkBoot {
@@ -1457,7 +1482,40 @@ pub(crate) async fn fork_machine_inner(
             boot_permit: None,
         },
     )
+    .await;
+
+    let Err(ApiError::CloneIdentityRejuvenationFailed(message)) = result else {
+        return result;
+    };
+    if !resume_golden_on_rollback {
+        return Err(ApiError::CloneIdentityRejuvenationFailed(message));
+    }
+
+    // `fail_closed_on_rejuvenation` has torn down the only clone prepared from
+    // this new checkpoint. It is therefore safe to restore the initially-running
+    // golden and invalidate the checkpoint before releasing its lifecycle lock.
+    let db = state.db().clone();
+    let golden_for_rollback = golden.clone();
+    let rollback = match tokio::task::spawn_blocking(move || {
+        crate::agent::fork::rollback_retained_fork_snapshot(
+            &db,
+            &golden_for_rollback,
+            &snapshot_dir,
+            true,
+        )
+    })
     .await
+    {
+        Ok(result) => result,
+        Err(error) => Err(SmolvmError::agent(
+            "fork rollback",
+            format!("task error: {error}"),
+        )),
+    };
+    match rollback {
+        Ok(()) => Err(ApiError::CloneIdentityRejuvenationFailed(message)),
+        Err(rollback_error) => Err(ApiError::Internal(format!("{message}; {rollback_error}"))),
+    }
 }
 
 /// Prepare several clean held workers from one golden checkpoint and boot them
@@ -1670,6 +1728,26 @@ struct PreparedForkBoot {
     boot_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
+enum PreparedForkBootError {
+    Launch(String),
+    CloneIdentityRejuvenation(String),
+}
+
+impl From<String> for PreparedForkBootError {
+    fn from(message: String) -> Self {
+        Self::Launch(message)
+    }
+}
+
+fn classify_prepared_fork_boot_error(error: PreparedForkBootError) -> ApiError {
+    match error {
+        PreparedForkBootError::Launch(message) => classify_launch_error(message),
+        PreparedForkBootError::CloneIdentityRejuvenation(message) => {
+            ApiError::CloneIdentityRejuvenationFailed(message)
+        }
+    }
+}
+
 async fn boot_prepared_fork_inner(
     state: Arc<ApiState>,
     clone: String,
@@ -1717,7 +1795,7 @@ async fn boot_prepared_fork_inner(
             // leaves nothing half-created.
             let _ = db.remove_vm(&clone_b);
             let _ = std::fs::remove_dir_all(vm_data_dir(&clone_b));
-            return Err(format!("failed to boot clone: {}", e));
+            return Err(format!("failed to boot clone: {}", e).into());
         }
 
         let pid = manager.child_pid();
@@ -1736,7 +1814,11 @@ async fn boot_prepared_fork_inner(
             crate::agent::fork::rejuvenate_clone(&clone_b, &record),
             teardown,
         )
-        .map_err(|e| format!("clone identity rejuvenation failed: {}", e))?;
+        .map_err(|e| {
+            PreparedForkBootError::CloneIdentityRejuvenation(format!(
+                "clone identity rejuvenation failed: {e}"
+            ))
+        })?;
         // Per-fork parameters: same fail-closed contract — a clone that asked
         // for parameters but can't receive them must not be vended.
         crate::agent::fork::fail_closed_on_rejuvenation(
@@ -1769,7 +1851,7 @@ async fn boot_prepared_fork_inner(
                 });
             if let Err(error) = worker_ready {
                 teardown();
-                return Err(format!("CUDA clone worker readiness failed: {error}"));
+                return Err(format!("CUDA clone worker readiness failed: {error}").into());
             }
         }
         #[cfg(not(unix))]
@@ -1782,11 +1864,11 @@ async fn boot_prepared_fork_inner(
             .map_err(|e| format!("forkpoint release failed: {e}"))?;
         }
 
-        Ok::<_, String>((manager, pid, record))
+        Ok::<_, PreparedForkBootError>((manager, pid, record))
     })
     .await
     .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
-    .map_err(classify_launch_error)?;
+    .map_err(classify_prepared_fork_boot_error)?;
 
     // Register the clone so exec/run endpoints can reach it.
     state.insert_machine(&clone, machine_entry_from_record(&clone_record, manager));
@@ -2267,13 +2349,13 @@ pub(crate) async fn delete_one(
     }
 
     // Re-check for dependent clones now that the golden's process (and its fork
-    // control socket) is down. `fork_machine` locks only the CLONE name, not the
-    // golden, so a fork could have snapshotted + registered a clone between the
-    // initial check above and here. With the golden killed no NEW fork can
-    // snapshot, so this catches that race window. Abort BEFORE removing the DB
-    // record or the data dir — the clones' copy-on-write disks are backed by this
-    // golden's disks, so removing them would be silent data loss. The golden is
-    // left stopped with its disks intact; delete the clones and retry.
+    // control socket) is down. API forks share the lifecycle lock held here, but
+    // a separate CLI/embedded process has no access to that in-process lock and
+    // could have registered a clone after the initial check. Abort BEFORE
+    // removing the DB record or data dir — the clones' copy-on-write disks are
+    // backed by this golden's disks, so removing them would be silent data loss.
+    // The golden is left stopped with its disks intact; delete the clones and
+    // retry.
     {
         let db = state.db().clone();
         let golden = name.clone();
@@ -3090,6 +3172,17 @@ mod tests {
         assert!(matches!(
             classify_launch_error(e),
             ApiError::PortConflict(_)
+        ));
+    }
+
+    #[test]
+    fn prepared_fork_boot_error_preserves_clone_rejuvenation_identity() {
+        let error = PreparedForkBootError::CloneIdentityRejuvenation(
+            "clone identity rejuvenation failed: identity reset could not be confirmed".to_string(),
+        );
+        assert!(matches!(
+            classify_prepared_fork_boot_error(error),
+            ApiError::CloneIdentityRejuvenationFailed(_)
         ));
     }
 

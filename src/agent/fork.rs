@@ -609,22 +609,36 @@ pub(crate) fn prepare_forks_reusing(
     })
 }
 
-fn rollback_new_snapshot(
+/// Restore an initially-running golden after a failed clone finalization and
+/// discard the checkpoint that produced that clone. Callers must ensure no
+/// successfully booted clone depends on `snapshot_dir` before invoking this.
+pub(crate) fn rollback_retained_fork_snapshot(
     db: &SmolvmDb,
     golden: &str,
     snapshot_dir: &Path,
     persisted: bool,
-    error: Error,
-) -> Error {
+) -> Result<()> {
+    let dependent_clones = db.dependent_clones(golden)?;
+    if !dependent_clones.is_empty() {
+        return Err(Error::agent(
+            "fork rollback",
+            format!(
+                "refusing to resume golden '{golden}': {} live clone(s) still depend on its checkpoint ({})",
+                dependent_clones.len(),
+                dependent_clones.join(", ")
+            ),
+        ));
+    }
+
     let mut rollback_errors = Vec::new();
     if let Err(resume_error) = resume_golden(golden, snapshot_dir) {
-        return Error::agent(
-            "fork",
+        return Err(Error::agent(
+            "fork rollback",
             format!(
-                "{error}; golden rollback failed: {resume_error}; preserved checkpoint {} for recovery",
+                "golden rollback failed: {resume_error}; preserved checkpoint {} for recovery",
                 snapshot_dir.display()
             ),
-        );
+        ));
     }
     if persisted {
         if let Err(remove_error) = db.remove_retained_fork_snapshot(golden) {
@@ -641,15 +655,22 @@ fn rollback_new_snapshot(
         }
     }
     if rollback_errors.is_empty() {
-        error
+        Ok(())
     } else {
-        Error::agent(
-            "fork",
-            format!(
-                "{error}; rollback also failed: {}",
-                rollback_errors.join("; ")
-            ),
-        )
+        Err(Error::agent("fork rollback", rollback_errors.join("; ")))
+    }
+}
+
+fn rollback_new_snapshot(
+    db: &SmolvmDb,
+    golden: &str,
+    snapshot_dir: &Path,
+    persisted: bool,
+    error: Error,
+) -> Error {
+    match rollback_retained_fork_snapshot(db, golden, snapshot_dir, persisted) {
+        Ok(()) => error,
+        Err(rollback_error) => Error::agent("fork", format!("{error}; {rollback_error}")),
     }
 }
 
@@ -1571,6 +1592,25 @@ mod tests {
         std::fs::remove_file(temp.path().join("checkpoint.bin")).unwrap();
         std::fs::create_dir(temp.path().join("checkpoint.bin")).unwrap();
         assert!(golden_resume_command(temp.path()).is_err());
+    }
+
+    #[test]
+    fn golden_rollback_refuses_to_invalidate_a_live_clones_checkpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = SmolvmDb::open_at(&temp.path().join("test.db")).unwrap();
+        let golden = VmRecord::new("golden".into(), 2, 1024, vec![], vec![], false);
+        db.insert_vm("golden", &golden).unwrap();
+        let mut clone = VmRecord::new("clone".into(), 2, 1024, vec![], vec![], false);
+        clone.golden = Some("golden".into());
+        db.insert_vm("clone", &clone).unwrap();
+        let snapshot = temp.path().join("snapshot");
+        std::fs::create_dir(&snapshot).unwrap();
+
+        let error = rollback_retained_fork_snapshot(&db, "golden", &snapshot, true)
+            .expect_err("a live clone must keep its checkpoint");
+
+        assert!(error.to_string().contains("1 live clone(s)"));
+        assert!(snapshot.exists());
     }
 
     #[test]

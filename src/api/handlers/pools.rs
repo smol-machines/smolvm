@@ -1061,6 +1061,9 @@ fn lease_batch_error(error: ApiError) -> (&'static str, String) {
         ApiError::NotFound(message) => ("NOT_FOUND", message),
         ApiError::Conflict(message) => ("CONFLICT", message),
         ApiError::PortConflict(message) => ("PORT_IN_USE", message),
+        ApiError::CloneIdentityRejuvenationFailed(message) => {
+            ("CLONE_IDENTITY_REJUVENATION_FAILED", message)
+        }
         ApiError::BadRequest(message) => ("BAD_REQUEST", message),
         ApiError::Timeout => ("TIMEOUT", "request timed out".into()),
         ApiError::Unavailable(message) => ("UNAVAILABLE", message),
@@ -1277,6 +1280,11 @@ mod tests {
         let cases = [
             (ApiError::BadRequest("bad".into()), "BAD_REQUEST", "bad"),
             (ApiError::Conflict("busy".into()), "CONFLICT", "busy"),
+            (
+                ApiError::CloneIdentityRejuvenationFailed("reset failed".into()),
+                "CLONE_IDENTITY_REJUVENATION_FAILED",
+                "reset failed",
+            ),
             (
                 ApiError::Unavailable("empty".into()),
                 "UNAVAILABLE",
