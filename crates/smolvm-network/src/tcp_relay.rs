@@ -98,7 +98,8 @@ struct TrackedConnection {
     source: SocketAddr,
     destination: SocketAddr,
     // guest -> host relay payloads
-    to_proxy: SyncSender<Vec<u8>>,
+    to_proxy: Option<SyncSender<Vec<u8>>>,
+
     // host -> guest relay payloads
     from_proxy: Receiver<Vec<u8>>,
     // endpoints are held here until the guest-side handshake completes
@@ -318,8 +319,9 @@ impl TcpRelayTable {
             TrackedConnection {
                 source,
                 destination,
-                to_proxy: to_proxy_tx,
+                to_proxy: Some(to_proxy_tx),
                 from_proxy: from_proxy_rx,
+
                 pending_proxy_endpoints: Some(PendingProxyEndpoints {
                     from_smoltcp: to_proxy_rx,
                     to_smoltcp: from_proxy_tx,
@@ -412,8 +414,9 @@ impl TcpRelayTable {
             TrackedConnection {
                 source,
                 destination,
-                to_proxy: to_proxy_tx,
+                to_proxy: Some(to_proxy_tx),
                 from_proxy: from_proxy_rx,
+
                 pending_proxy_endpoints: Some(PendingProxyEndpoints {
                     from_smoltcp: to_proxy_rx,
                     to_smoltcp: from_proxy_tx,
@@ -496,6 +499,10 @@ impl TcpRelayTable {
                 }
             }
 
+            if connection.buffered_guest_data.is_none() && !socket.may_recv() {
+                connection.to_proxy = None;
+            }
+
             flush_proxy_data(socket, connection);
         }
     }
@@ -514,7 +521,8 @@ impl TcpRelayTable {
             }
 
             let socket = sockets.get::<tcp::Socket>(handle);
-            if socket.state() == tcp::State::Established {
+            let state = socket.state();
+            if state == tcp::State::Established || state == tcp::State::CloseWait {
                 connection.relay_spawned = true;
 
                 if let Some(endpoints) = connection.pending_proxy_endpoints.take() {
@@ -793,13 +801,19 @@ fn flush_guest_data(connection: &mut TrackedConnection) {
 }
 
 fn send_guest_payload(connection: &mut TrackedConnection, payload: Vec<u8>) -> bool {
-    match connection.to_proxy.try_send(payload) {
+    let Some(to_proxy) = &connection.to_proxy else {
+        return false;
+    };
+    match to_proxy.try_send(payload) {
         Ok(()) => true,
         Err(TrySendError::Full(payload)) => {
             connection.buffered_guest_data = Some(payload);
             false
         }
-        Err(TrySendError::Disconnected(_)) => false,
+        Err(TrySendError::Disconnected(_)) => {
+            connection.to_proxy = None;
+            false
+        }
     }
 }
 
@@ -854,7 +868,7 @@ mod tests {
         TrackedConnection {
             source: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 12_345),
             destination: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 80),
-            to_proxy,
+            to_proxy: Some(to_proxy),
             from_proxy,
             pending_proxy_endpoints: None,
             relay_spawned: true,
@@ -931,5 +945,70 @@ mod tests {
             table.host_connect_addr(SocketAddr::new(gateway, 10_081)),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40_081)
         );
+    }
+
+    #[test]
+    fn guest_fin_drops_to_proxy_channel() {
+        let (to_proxy, from_smoltcp) = mpsc::sync_channel(1);
+        let connection = test_connection(to_proxy);
+        let rx_buffer = tcp::SocketBuffer::new(vec![0; 1024]);
+        let tx_buffer = tcp::SocketBuffer::new(vec![0; 1024]);
+        let socket = tcp::Socket::new(rx_buffer, tx_buffer);
+        // A closed or FIN-received socket has may_recv() == false
+        assert!(!socket.may_recv());
+
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = sockets.add(socket);
+
+        let mut table = TcpRelayTable::new(None, EgressPolicy::unrestricted(), vec![], None);
+        table.connections.insert(handle, connection);
+
+        table.relay_data(&mut sockets);
+
+        // to_proxy in the connection must have been dropped (set to None)
+        assert!(table.connections.get(&handle).unwrap().to_proxy.is_none());
+        // The receiver on the relay thread side must see Disconnected
+        assert_eq!(from_smoltcp.try_recv(), Err(TryRecvError::Disconnected));
+    }
+
+    #[test]
+    fn tcp_relay_loop_handles_guest_write_shutdown_cleanly() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        let (from_smoltcp_tx, from_smoltcp_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+        let (to_smoltcp_tx, _to_smoltcp_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+        let wake_pipe = Arc::new(WakePipe::new());
+        let exit_state = RelayExitState::new();
+
+        // Send a payload then drop from_smoltcp_tx (simulating guest FIN)
+        from_smoltcp_tx.send(b"hello server".to_vec()).unwrap();
+        drop(from_smoltcp_tx);
+
+        let server_thread = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 64];
+            let n = stream.read(&mut buf).unwrap();
+            assert_eq!(&buf[..n], b"hello server");
+            // Server should now read EOF (0 bytes) because client shut down write half
+            let eof = stream.read(&mut buf).unwrap();
+            assert_eq!(eof, 0);
+            drop(stream);
+        });
+
+        let relay_exit = tcp_relay_loop(
+            server_addr,
+            RelayTarget::Connect(server_addr),
+            from_smoltcp_rx,
+            to_smoltcp_tx,
+            wake_pipe,
+            &exit_state,
+        )
+        .unwrap();
+
+        assert_eq!(relay_exit, RelayExitMode::Graceful);
+        server_thread.join().unwrap();
     }
 }
