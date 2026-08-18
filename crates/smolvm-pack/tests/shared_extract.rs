@@ -13,8 +13,12 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
+use sha2::{Digest, Sha256};
 use smolvm_pack::assets::AssetCollector;
-use smolvm_pack::extract::{extract_sidecar, extract_sidecar_shared, shared_extract_enabled};
+use smolvm_pack::extract::{
+    extract_sidecar, extract_sidecar_shared, read_shared_artifact_sha256,
+    shared_artifact_sha256_path, shared_extract_enabled,
+};
 use smolvm_pack::format::PackManifest;
 use smolvm_pack::{read_footer_from_sidecar, sidecar_path_for, Packer};
 
@@ -112,6 +116,13 @@ fn shared_extraction_is_content_addressed_idempotent_and_locked_down() {
         "shared dir must be keyed by the footer checksum"
     );
     assert!(shared_dir.is_dir(), "shared extraction dir must exist");
+    let expected_digest = format!("{:x}", Sha256::digest(fs::read(&sidecar).unwrap()));
+    assert_eq!(
+        read_shared_artifact_sha256(&shared_dir).unwrap(),
+        expected_digest,
+        "shared extraction must cache the full artifact SHA-256"
+    );
+    assert!(shared_artifact_sha256_path(&shared_dir).is_file());
 
     // 2) The shared view is byte-identical to a plain per-machine extraction —
     //    the idmapped mount only remaps ownership, never content.

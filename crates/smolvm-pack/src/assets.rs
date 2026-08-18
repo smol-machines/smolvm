@@ -218,6 +218,7 @@ impl AssetCollector {
                 },
                 layers: Vec::new(),
                 storage_template: None,
+                storage_logical_size: None,
                 overlay_template: None,
                 overlay_logical_size: None,
             },
@@ -636,6 +637,28 @@ impl AssetCollector {
         Ok(())
     }
 
+    /// Add a stopped VM's persistent storage disk as the VM-mode template.
+    /// Trailing sparse space is stripped for packing and its original logical
+    /// size is recorded so cold-create can normalize one safe COW base.
+    pub fn add_vm_storage_template(&mut self, path: &Path) -> Result<()> {
+        if !path.exists() {
+            return Err(PackError::AssetNotFound(format!(
+                "storage disk not found: {}",
+                path.display()
+            )));
+        }
+
+        const STORAGE_NAME: &str = "storage.ext4";
+        let dst = self.staging_dir.join(STORAGE_NAME);
+        let (logical_size, truncated_size) = sparse_copy_overlay(path, &dst)?;
+        self.inventory.storage_template = Some(AssetEntry {
+            path: STORAGE_NAME.to_string(),
+            size: truncated_size,
+        });
+        self.inventory.storage_logical_size = Some(logical_size);
+        Ok(())
+    }
+
     /// Get the current asset inventory.
     pub fn inventory(&self) -> &AssetInventory {
         &self.inventory
@@ -959,6 +982,33 @@ mod tests {
         assert_eq!(dst_data[0], 0x01);
         assert_eq!(dst_data[511], 0xFF);
         assert_eq!(dst_data[256], 0x00); // interior zero is preserved
+    }
+
+    #[test]
+    fn vm_storage_template_preserves_logical_size_without_packing_the_tail() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("storage.raw");
+        let mut file = File::create(&source).unwrap();
+        file.write_all(b"docker-layer").unwrap();
+        file.set_len(4 * 1024 * 1024).unwrap();
+
+        let staging = temp.path().join("staging");
+        let mut collector = AssetCollector::new(staging.clone()).unwrap();
+        collector.add_vm_storage_template(&source).unwrap();
+        let inventory = collector.inventory();
+        let template = inventory.storage_template.as_ref().unwrap();
+
+        assert_eq!(template.path, "storage.ext4");
+        assert_eq!(inventory.storage_logical_size, Some(4 * 1024 * 1024));
+        assert_eq!(
+            fs::metadata(staging.join(&template.path)).unwrap().len(),
+            template.size
+        );
+        assert!(template.size < 4 * 1024 * 1024);
+        assert_eq!(
+            fs::read(staging.join(&template.path)).unwrap(),
+            b"docker-layer"
+        );
     }
 
     #[test]

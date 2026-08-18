@@ -461,8 +461,14 @@ impl PackRunCmd {
             .storage_template
             .as_ref()
             .map(|t| t.path.as_str());
-        extract::create_or_copy_storage_disk(&cache_dir, template, &storage_path, storage_gib)
-            .map_err(|e| Error::agent("create storage disk", e.to_string()))?;
+        extract::create_or_copy_storage_disk(
+            &cache_dir,
+            template,
+            &storage_path,
+            manifest.assets.storage_logical_size,
+            storage_gib,
+        )
+        .map_err(|e| Error::agent("create storage disk", e.to_string()))?;
 
         let overlay_runtime_path = setup_vm_overlay(
             &manifest,
@@ -1532,8 +1538,14 @@ fn run_from_cache(
         .storage_template
         .as_ref()
         .map(|t| t.path.as_str());
-    extract::create_or_copy_storage_disk(cache_dir, template, &storage_path, storage_gib)
-        .map_err(|e| Error::agent("create storage disk", e.to_string()))?;
+    extract::create_or_copy_storage_disk(
+        cache_dir,
+        template,
+        &storage_path,
+        manifest.assets.storage_logical_size,
+        storage_gib,
+    )
+    .map_err(|e| Error::agent("create storage disk", e.to_string()))?;
 
     let overlay_runtime_path = setup_vm_overlay(
         manifest,
@@ -1933,8 +1945,14 @@ fn daemon_start(
             .storage_template
             .as_ref()
             .map(|t| t.path.as_str());
-        extract::create_or_copy_storage_disk(&cache_dir, template, &storage_path, storage_gib)
-            .map_err(|e| Error::agent("create storage disk", e.to_string()))?;
+        extract::create_or_copy_storage_disk(
+            &cache_dir,
+            template,
+            &storage_path,
+            manifest.assets.storage_logical_size,
+            storage_gib,
+        )
+        .map_err(|e| Error::agent("create storage disk", e.to_string()))?;
     }
 
     // Create overlay disk (preserves existing disk on restart)

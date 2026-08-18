@@ -661,6 +661,10 @@ test_from_vm_setup() {
         return 1
     }
 
+    # VM-mode packs must snapshot the independent persistent storage disk too.
+    $SMOLVM machine exec --name "$FROM_VM_NAME" -- sh -c \
+        "printf source > /storage/from-vm-cow-marker" 2>&1 || return 1
+
     # Stop the VM (pack requires it to be stopped)
     $SMOLVM machine stop --name "$FROM_VM_NAME" 2>&1
 }
@@ -710,6 +714,69 @@ test_from_vm_run_finds_installed_package() {
 
     [[ $exit_code -eq 124 ]] && { echo "TIMEOUT"; return 1; }
     [[ "$result" == *"/usr/bin/curl"* ]]
+}
+
+test_from_vm_cow_cold_boot_isolation_and_persistence() {
+    if [[ ! -f "$FROM_VM_OUTPUT.smolmachine" ]]; then
+        echo "SKIP: no packed sidecar (setup or pack failed)"
+        return 1
+    fi
+
+    local first="from-vm-cow-a-$$"
+    local second="from-vm-cow-b-$$"
+    cleanup_from_vm_cow() {
+        $SMOLVM machine stop --name "$first" 2>/dev/null || true
+        $SMOLVM machine delete --name "$first" -f 2>/dev/null || true
+        $SMOLVM machine stop --name "$second" 2>/dev/null || true
+        $SMOLVM machine delete --name "$second" -f 2>/dev/null || true
+    }
+    cleanup_from_vm_cow
+
+    $SMOLVM machine create --name "$first" --from "$FROM_VM_OUTPUT.smolmachine" 2>&1 || {
+        cleanup_from_vm_cow; return 1
+    }
+    $SMOLVM machine create --name "$second" --from "$FROM_VM_OUTPUT.smolmachine" 2>&1 || {
+        cleanup_from_vm_cow; return 1
+    }
+    $SMOLVM machine start --name "$first" 2>&1 || { cleanup_from_vm_cow; return 1; }
+    $SMOLVM machine start --name "$second" 2>&1 || { cleanup_from_vm_cow; return 1; }
+
+    local first_value second_value
+    first_value=$($SMOLVM machine exec --name "$first" -- cat /storage/from-vm-cow-marker 2>&1) || {
+        cleanup_from_vm_cow; return 1
+    }
+    second_value=$($SMOLVM machine exec --name "$second" -- cat /storage/from-vm-cow-marker 2>&1) || {
+        cleanup_from_vm_cow; return 1
+    }
+    [[ "$first_value" == *"source"* && "$second_value" == *"source"* ]] || {
+        cleanup_from_vm_cow; return 1
+    }
+
+    $SMOLVM machine exec --name "$first" -- sh -c \
+        "printf first-private > /storage/from-vm-cow-marker" 2>&1 || {
+        cleanup_from_vm_cow; return 1
+    }
+    second_value=$($SMOLVM machine exec --name "$second" -- cat /storage/from-vm-cow-marker 2>&1) || {
+        cleanup_from_vm_cow; return 1
+    }
+    [[ "$second_value" == *"source"* ]] || { cleanup_from_vm_cow; return 1; }
+
+    $SMOLVM machine stop --name "$first" 2>&1 || { cleanup_from_vm_cow; return 1; }
+    $SMOLVM machine start --name "$first" 2>&1 || { cleanup_from_vm_cow; return 1; }
+    first_value=$($SMOLVM machine exec --name "$first" -- cat /storage/from-vm-cow-marker 2>&1) || {
+        cleanup_from_vm_cow; return 1
+    }
+    [[ "$first_value" == *"first-private"* ]] || { cleanup_from_vm_cow; return 1; }
+
+    $SMOLVM machine stop --name "$first" 2>&1 || true
+    $SMOLVM machine delete --name "$first" -f 2>&1 || { cleanup_from_vm_cow; return 1; }
+    second_value=$($SMOLVM machine exec --name "$second" -- cat /storage/from-vm-cow-marker 2>&1) || {
+        cleanup_from_vm_cow; return 1
+    }
+    [[ "$second_value" == *"source"* ]] || { cleanup_from_vm_cow; return 1; }
+
+    cleanup_from_vm_cow
+    return 0
 }
 
 test_from_vm_cleanup() {
@@ -1650,6 +1717,7 @@ if [[ "$QUICK_MODE" != "true" ]]; then
     run_test "from-vm: setup VM with curl" test_from_vm_setup || true
     run_test "from-vm: pack stopped VM" test_from_vm_pack || true
     run_test "from-vm: finds installed package" test_from_vm_run_finds_installed_package || true
+    run_test "from-vm: COW cold boots isolate and persist storage" test_from_vm_cow_cold_boot_isolation_and_persistence || true
     run_test "from-vm: cleanup" test_from_vm_cleanup || true
 
     echo ""

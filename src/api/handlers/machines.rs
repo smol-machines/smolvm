@@ -298,6 +298,8 @@ struct VmModeSeed {
     /// template has its trailing zero extent stripped, so the disk must be
     /// ftruncated back to this before boot or it isn't a valid full filesystem.
     overlay_logical_size: Option<u64>,
+    /// Original virtual size of the packed persistent storage disk.
+    storage_logical_size: Option<u64>,
     /// Requested disk sizes (GiB) from the create request, honored as a lower
     /// bound on the seeded disks (the guest grows the inherited fs with resize2fs).
     storage_gb: Option<u64>,
@@ -521,6 +523,7 @@ pub async fn create_machine(
                     .as_ref()
                     .map(|t| t.path.clone()),
                 overlay_logical_size: manifest.assets.overlay_logical_size,
+                storage_logical_size: manifest.assets.storage_logical_size,
                 storage_gb: req.storage_gb,
                 overlay_gb: req.overlay_gb,
             })
@@ -713,16 +716,31 @@ pub async fn create_machine(
             // (the per-machine `pack` dir is an empty mountpoint), so seed the
             // VM-mode disk templates from the shared copy. Falls back to the
             // per-machine dir when no pointer was written (macOS / kill-switch).
-            let pack_content_dir =
-                crate::agent::read_shared_pack_pointer(&cache_dir).unwrap_or(cache_dir);
+            let (pack_content_dir, artifact_sha256) =
+                if let Some(shared_dir) = crate::agent::read_shared_pack_pointer(&cache_dir) {
+                    let digest = smolvm_pack::extract::read_shared_artifact_sha256(&shared_dir)
+                        .map_err(|e| {
+                            ApiError::internal(format!(
+                                "read shared artifact SHA-256 {}: {e}",
+                                shared_dir.display()
+                            ))
+                        })?;
+                    (shared_dir, Some(digest))
+                } else {
+                    (cache_dir, None)
+                };
             crate::storage::seed_vm_mode_disks(
                 &disk_dir,
                 &pack_content_dir,
-                seed.overlay_template.as_deref(),
-                seed.storage_template.as_deref(),
-                seed.overlay_logical_size,
-                seed.overlay_gb,
-                seed.storage_gb,
+                crate::storage::VmModeDiskSeedSpec {
+                    artifact_sha256: artifact_sha256.as_deref(),
+                    overlay_template: seed.overlay_template.as_deref(),
+                    storage_template: seed.storage_template.as_deref(),
+                    overlay_logical_size: seed.overlay_logical_size,
+                    storage_logical_size: seed.storage_logical_size,
+                    overlay_gb: seed.overlay_gb,
+                    storage_gb: seed.storage_gb,
+                },
             )
             .map_err(|e| ApiError::internal(format!("seed VM-mode disks: {}", e)))
         })

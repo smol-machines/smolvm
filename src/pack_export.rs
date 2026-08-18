@@ -98,6 +98,7 @@ pub fn collect_from_vm_assets(
 
     let vm_dir = vm_data_dir(vm_name);
     let (overlay_disk, overlay_fmt) = resolve_disk_image(&vm_dir, OVERLAY_DISK_FILENAME);
+    let (storage_disk, storage_fmt) = resolve_disk_image(&vm_dir, STORAGE_DISK_FILENAME);
     let is_image_based = vm.image.is_some();
     let is_artifact_sourced = is_image_based && vm.source_smolmachine.is_some();
 
@@ -155,6 +156,25 @@ pub fn collect_from_vm_assets(
         collector
             .add_overlay_template(&overlay_for_pack)
             .map_err(|e| Error::agent("collect overlay", e.to_string()))?;
+
+        if !storage_disk.exists() {
+            return Err(Error::agent(
+                "collect storage",
+                format!("storage disk not found at {}", storage_disk.display()),
+            ));
+        }
+        let storage_for_pack = match storage_fmt {
+            DiskFormat::Raw => storage_disk.clone(),
+            DiskFormat::Qcow2 => {
+                let flat = staging_dir.join("storage-flat.raw");
+                flatten_qcow2_to_raw(&storage_disk, &flat)?;
+                flat
+            }
+        };
+        println!("Copying storage disk ({})...", storage_for_pack.display());
+        collector
+            .add_vm_storage_template(&storage_for_pack)
+            .map_err(|e| Error::agent("collect storage", e.to_string()))?;
     }
 
     Ok(FromVmAssets {
