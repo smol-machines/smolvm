@@ -27,11 +27,11 @@ use serde::{Deserialize, Serialize};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
-#[cfg(any(target_os = "linux", all(test, unix)))]
+#[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
-#[cfg(any(target_os = "linux", all(test, unix)))]
+#[cfg(target_os = "linux")]
 use std::os::unix::fs::PermissionsExt;
-#[cfg(any(target_os = "linux", all(test, unix)))]
+#[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Seed a VM-mode machine's overlay+storage disks from extracted pack templates so
@@ -130,7 +130,7 @@ fn seed_vm_mode_disks_by_copy(
     )
 }
 
-#[cfg(any(target_os = "linux", all(test, unix)))]
+#[cfg(target_os = "linux")]
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct CowBaseMetadata {
     artifact_sha256: String,
@@ -140,13 +140,13 @@ struct CowBaseMetadata {
     logical_size: u64,
 }
 
-#[cfg(any(target_os = "linux", all(test, unix)))]
+#[cfg(target_os = "linux")]
 static COW_BASE_STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Build all immutable bases first, then create both private overlays in one
 /// libkrun load. A missing/corrupt base is a hard error; only an unavailable
 /// qcow2 implementation falls back to the existing sparse-copy behavior.
-#[cfg(any(target_os = "linux", all(test, unix)))]
+#[cfg(target_os = "linux")]
 fn try_seed_vm_mode_disks_cow<F>(
     disk_dir: &Path,
     cache_dir: &Path,
@@ -233,7 +233,7 @@ where
     Ok(true)
 }
 
-#[cfg(any(target_os = "linux", all(test, unix)))]
+#[cfg(target_os = "linux")]
 fn validate_artifact_sha256(digest: &str) -> std::io::Result<()> {
     if digest.len() == 64
         && digest
@@ -248,7 +248,7 @@ fn validate_artifact_sha256(digest: &str) -> std::io::Result<()> {
     ))
 }
 
-#[cfg(any(target_os = "linux", all(test, unix)))]
+#[cfg(target_os = "linux")]
 fn disk_target_size(
     source_size: u64,
     logical_size: Option<u64>,
@@ -271,7 +271,7 @@ fn disk_target_size(
 /// Return one immutable normalized raw base, creating it atomically on the
 /// first request. The final directory is the completion marker: readers can
 /// never observe a base without matching metadata.
-#[cfg(any(target_os = "linux", all(test, unix)))]
+#[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 fn prepare_cow_base(
     cache_dir: &Path,
@@ -345,7 +345,7 @@ fn prepare_cow_base(
     result
 }
 
-#[cfg(any(target_os = "linux", all(test, unix)))]
+#[cfg(target_os = "linux")]
 fn validate_cow_base(base_dir: &Path, expected: &CowBaseMetadata) -> std::io::Result<PathBuf> {
     let base = base_dir.join("base.raw");
     let metadata_path = base_dir.join("metadata.json");
@@ -842,11 +842,11 @@ pub fn expand_disk<D: DiskType>(path: &Path, new_size_gb: u64) -> Result<()> {
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     const TEST_ARTIFACT_SHA256: &str =
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn write_sparse_template(path: &Path, logical_size: u64, marker: &[u8]) {
         let mut file = std::fs::File::create(path).unwrap();
         use std::io::Write as _;
@@ -854,7 +854,7 @@ mod tests {
         file.set_len(logical_size).unwrap();
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn make_fake_overlays(specs: &[crate::agent::DiskOverlaySpec]) -> crate::Result<()> {
         for (overlay, _, _) in specs {
             let mut file = std::fs::File::create(overlay)?;
@@ -865,7 +865,7 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn make_tree_removable(root: &Path) {
         if let Ok(entries) = std::fs::read_dir(root) {
             for entry in entries.flatten() {
@@ -878,7 +878,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn vm_mode_cow_uses_tiny_private_disks_and_one_immutable_base() {
         let temp = tempfile::tempdir().unwrap();
         let cache = temp.path().join("shared-pack");
@@ -952,7 +952,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn concurrent_first_cow_base_creation_is_atomic() {
         use std::sync::{Arc, Barrier};
 
@@ -1000,7 +1000,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn corrupt_cow_base_is_rejected_without_replacement() {
         let temp = tempfile::tempdir().unwrap();
         let cache = temp.path().join("shared-pack");
@@ -1035,7 +1035,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn missing_file_in_completed_cow_base_fails_without_rebuilding() {
         let temp = tempfile::tempdir().unwrap();
         let cache = temp.path().join("shared-pack");
@@ -1076,7 +1076,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     fn unavailable_qcow_support_leaves_no_partial_overlay_and_copy_fallback_works() {
         let temp = tempfile::tempdir().unwrap();
         let cache = temp.path().join("shared-pack");
