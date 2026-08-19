@@ -92,6 +92,9 @@ pub fn seed_vm_mode_disks(
 
     #[cfg(target_os = "linux")]
     if let Some(artifact_sha256) = seed.artifact_sha256 {
+        // `.pack-shared` is the durable lease used by reference-aware pruning.
+        // Never publish a qcow2 backing dependency that has no matching lease.
+        crate::artifact_cache::validate_cow_lease(disk_dir, cache_dir, artifact_sha256)?;
         if try_seed_vm_mode_disks_cow(
             disk_dir,
             cache_dir,

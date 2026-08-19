@@ -63,6 +63,9 @@
 
 pub mod agent;
 pub mod api;
+/// Reference-safe lifecycle management for Linux shared pack and COW caches.
+#[cfg(target_os = "linux")]
+pub mod artifact_cache;
 pub mod config;
 // The shared CUDA daemon manages unix-domain sockets, flock, and detached
 // process groups — all POSIX. GPU acceleration is unavailable on Windows anyway,

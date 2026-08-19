@@ -1046,7 +1046,9 @@ impl PackCreateCmd {
 /// Clean up cached pack extractions to free disk space.
 ///
 /// Removes old extracted pack caches from ~/.cache/smolvm-pack/ and
-/// ~/.cache/smolvm-libs/. By default keeps the 5 most recently used.
+/// ~/.cache/smolvm-libs/. On Linux it also removes unreferenced shared pack
+/// extractions and immutable COW disk bases. By default keeps the 5 most
+/// recently used entries in addition to every artifact referenced by a machine.
 ///
 /// Examples:
 ///   smolvm pack prune              # keep 5 most recent
@@ -1055,11 +1057,11 @@ impl PackCreateCmd {
 ///   smolvm pack prune --dry-run    # show what would be removed
 #[derive(Args, Debug)]
 pub struct PackPruneCmd {
-    /// Number of cached extractions to keep (default: 5)
+    /// Number of unused cached entries to keep (default: 5)
     #[arg(long, default_value = "5", value_name = "N")]
     pub keep: usize,
 
-    /// Remove all cached extractions
+    /// Remove all unused cached entries (machine references are always retained)
     #[arg(long)]
     pub all: bool,
 
@@ -1074,6 +1076,53 @@ impl PackPruneCmd {
 
         let mut total_freed: u64 = 0;
         let mut total_removed: usize = 0;
+
+        // Validate every machine artifact lease before pruning any cache. A
+        // malformed live pointer therefore fails the whole command closed,
+        // without first deleting unrelated generic pack caches.
+        #[cfg(target_os = "linux")]
+        {
+            let report = smolvm::artifact_cache::prune_artifact_caches(keep, self.dry_run)
+                .map_err(|error| {
+                    smolvm::Error::agent("prune shared artifact caches", error.to_string())
+                })?;
+            if report.referenced_entries > 0 {
+                let noun = if report.referenced_entries == 1 {
+                    "entry"
+                } else {
+                    "entries"
+                };
+                println!(
+                    "  retaining {} artifact cache {} referenced by machines",
+                    report.referenced_entries, noun
+                );
+            }
+            for entry in report.entries {
+                let paths = entry
+                    .paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if self.dry_run {
+                    println!(
+                        "  would remove artifact cache {}: {} ({})",
+                        entry.artifact,
+                        paths,
+                        crate::cli::format_bytes(entry.allocated_bytes)
+                    );
+                } else {
+                    println!(
+                        "  removed artifact cache {}: {} ({})",
+                        entry.artifact,
+                        paths,
+                        crate::cli::format_bytes(entry.allocated_bytes)
+                    );
+                }
+                total_freed = total_freed.saturating_add(entry.allocated_bytes);
+                total_removed += 1;
+            }
+        }
 
         // Clean pack sidecar cache
         if let Some(base) = dirs::cache_dir() {

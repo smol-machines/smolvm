@@ -3322,25 +3322,19 @@ impl CreateCmd {
 
             println!("Extracting .smolmachine assets...");
             let result = if smolvm_pack::extract::shared_extract_enabled() {
-                let shared_dir = smolvm_pack::extract::extract_sidecar_shared(
-                    sidecar_path,
-                    &smolvm::agent::shared_pack_cache_root(),
-                    &footer,
-                    false,
-                )
-                .map_err(|e| smolvm::Error::agent("extract sidecar (shared)", e.to_string()))?;
-                std::fs::create_dir_all(&cache_dir)
-                    .map_err(|e| smolvm::Error::agent("create pack mountpoint", e.to_string()))?;
-                std::fs::write(
-                    smolvm::agent::shared_pack_pointer_path(&cache_dir),
-                    shared_dir.to_string_lossy().as_bytes(),
-                )
-                .map_err(|e| smolvm::Error::agent("write shared pack pointer", e.to_string()))?;
-                let digest = smolvm_pack::extract::read_shared_artifact_sha256(&shared_dir)
-                    .map_err(|e| {
-                        smolvm::Error::agent("read shared artifact SHA-256", e.to_string())
-                    })?;
-                Ok((shared_dir, Some(digest)))
+                #[cfg(target_os = "linux")]
+                {
+                    let lease = smolvm::artifact_cache::materialize_shared_pack_lease(
+                        sidecar_path,
+                        &footer,
+                        &cache_dir,
+                        false,
+                    )
+                    .map_err(|e| smolvm::Error::agent("extract sidecar (shared)", e.to_string()))?;
+                    Ok((lease.shared_dir, Some(lease.artifact_sha256)))
+                }
+                #[cfg(not(target_os = "linux"))]
+                unreachable!("shared pack extraction is Linux-only")
             } else {
                 smolvm_pack::extract::extract_sidecar(
                     sidecar_path,

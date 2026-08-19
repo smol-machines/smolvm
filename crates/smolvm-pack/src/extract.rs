@@ -952,12 +952,12 @@ pub fn extract_sidecar(
 /// `cache_dir.parent()` after a successful extraction.
 ///
 /// It MUST be `false` for the node-shared store (`_shared`): those entries are
-/// reference-shared across many VMs via `.pack-shared` pointers and hold NO
-/// per-VM lease, so capping the shared root would LRU-evict a pack still mounted
-/// by live pool VMs — their `/packed_layers` then reads empty and the guest
-/// fails with "no layer directories found in /packed_layers" (exit 255 on
-/// connect/exec). Only the private per-machine cache (`smolvm-pack/<checksum>`),
-/// whose running entries DO hold leases, is safe to cap. See
+/// reference-shared across many VMs via durable `.pack-shared` pointer leases,
+/// but this generic size cap does not inspect those pointers. Blindly capping
+/// the shared root could therefore evict a pack still mounted by live pool VMs —
+/// their `/packed_layers` then reads empty and the guest fails with "no layer
+/// directories found in /packed_layers" (exit 255 on connect/exec). Explicit
+/// `smolvm pack prune` performs the reference-aware cleanup instead. See
 /// `extract_sidecar_shared`, which passes `false`.
 fn extract_sidecar_capped(
     sidecar_path: &Path,
@@ -1086,10 +1086,10 @@ pub fn extract_sidecar_shared(
     debug: bool,
 ) -> std::io::Result<PathBuf> {
     let shared_dir = shared_pack_dir(shared_root, footer.checksum);
-    // cap_cache=false: NEVER LRU-evict the shared store. Its entries are
-    // reference-shared across every VM via `.pack-shared` pointers and take no
-    // per-VM lease, so an oldest-first size-cap here would delete a pack still
-    // mounted by live pool VMs. See `extract_sidecar_capped`.
+    // cap_cache=false: never perform blind automatic LRU eviction here. Shared
+    // entries are maintained explicitly by `smolvm pack prune`, which treats
+    // each machine's `.pack-shared` pointer as a durable lease and therefore
+    // cannot delete a pack mounted by a running or stopped VM.
     extract_sidecar_capped(sidecar_path, &shared_dir, footer, false, debug, false)?;
     ensure_shared_artifact_sha256(sidecar_path, &shared_dir)?;
     // Lock down the store so a dropped per-VM uid can't read the shared copy

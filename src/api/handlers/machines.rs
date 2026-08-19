@@ -631,31 +631,27 @@ pub async fn create_machine(
                 let footer = smolvm_pack::packer::read_footer_from_sidecar(path)
                     .map_err(|e| ApiError::internal(format!("read sidecar footer: {}", e)))?;
                 if smolvm_pack::extract::shared_extract_enabled() {
-                    // Shared content-addressed store: extract the build-constant
-                    // pack ONCE per node into `_shared/<checksum>` (root-owned,
-                    // read-only) instead of a private per-machine copy, and drop a
-                    // pointer beside this machine. The per-machine `pack` dir is
-                    // left an empty mountpoint that the boot path idmap-binds the
-                    // shared copy onto (mapping on-disk uid 0 -> the VM's dropped
-                    // uid), so a 28.6 MB / 362-file agent-rootfs decodes once per
-                    // node rather than once per machine — the cold-start tax this
-                    // removes — with the per-VM uid isolation (#456) preserved.
-                    let shared_root = crate::agent::shared_pack_cache_root();
-                    let shared_dir = smolvm_pack::extract::extract_sidecar_shared(
-                        path,
-                        &shared_root,
-                        &footer,
-                        false,
-                    )
-                    .map_err(|e| ApiError::internal(format!("extract sidecar (shared): {}", e)))?;
-                    std::fs::create_dir_all(&cache_dir).map_err(|e| {
-                        ApiError::internal(format!("create pack mountpoint: {}", e))
-                    })?;
-                    let pointer = crate::agent::shared_pack_pointer_path(&cache_dir);
-                    std::fs::write(&pointer, shared_dir.to_string_lossy().as_bytes()).map_err(
-                        |e| ApiError::internal(format!("write shared pack pointer: {}", e)),
-                    )?;
-                    Ok(())
+                    #[cfg(target_os = "linux")]
+                    {
+                        // Shared content-addressed store: extract the build-constant
+                        // pack ONCE per node into `_shared/<checksum>` (root-owned,
+                        // read-only) instead of a private per-machine copy, and drop a
+                        // pointer beside this machine. The per-machine `pack` dir is
+                        // left an empty mountpoint that the boot path idmap-binds the
+                        // shared copy onto (mapping on-disk uid 0 -> the VM's dropped
+                        // uid), so a 28.6 MB / 362-file agent-rootfs decodes once per
+                        // node rather than once per machine — the cold-start tax this
+                        // removes — with the per-VM uid isolation (#456) preserved.
+                        crate::artifact_cache::materialize_shared_pack_lease(
+                            path, &footer, &cache_dir, false,
+                        )
+                        .map_err(|e| {
+                            ApiError::internal(format!("extract sidecar (shared): {}", e))
+                        })?;
+                        Ok(())
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    unreachable!("shared pack extraction is Linux-only")
                 } else {
                     // Per-machine extraction: macOS case-sensitive layers volume
                     // (owned 1:1 by the machine), or the `SMOLVM_DISABLE_SHARED_EXTRACT`

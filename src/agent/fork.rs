@@ -730,23 +730,25 @@ fn prepare_clone_from_snapshot(
             .map_err(|e| Error::agent("create clone dir", e.to_string()))?;
 
         let golden_layers = crate::agent::machine_layers_cache_dir(golden);
-        let golden_ptr = crate::agent::shared_pack_pointer_path(&golden_layers);
-        if golden_ptr.exists() {
+        #[cfg(target_os = "linux")]
+        {
             let clone_layers = crate::agent::machine_layers_cache_dir(clone);
-            std::fs::create_dir_all(&clone_layers)
-                .map_err(|e| Error::agent("create clone pack dir", e.to_string()))?;
-            std::fs::copy(
-                &golden_ptr,
-                crate::agent::shared_pack_pointer_path(&clone_layers),
-            )
-            .map_err(|e| Error::agent("copy shared pack pointer", e.to_string()))?;
-        } else if smolvm_pack::extract::is_extracted(&golden_layers) {
+            let copied_shared_lease =
+                crate::artifact_cache::copy_shared_pack_lease(&golden_layers, &clone_layers)
+                    .map_err(|e| Error::agent("copy shared pack lease", e.to_string()))?;
+            if copied_shared_lease.is_none() && smolvm_pack::extract::is_extracted(&golden_layers) {
+                std::os::unix::fs::symlink(&golden_layers, &clone_layers)
+                    .map_err(|e| Error::agent("link clone pack dir", e.to_string()))?;
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        if smolvm_pack::extract::is_extracted(&golden_layers) {
             #[cfg(unix)]
-            std::os::unix::fs::symlink(
-                &golden_layers,
-                crate::agent::machine_layers_cache_dir(clone),
-            )
-            .map_err(|e| Error::agent("link clone pack dir", e.to_string()))?;
+            {
+                let clone_layers = crate::agent::machine_layers_cache_dir(clone);
+                std::os::unix::fs::symlink(&golden_layers, &clone_layers)
+                    .map_err(|e| Error::agent("link clone pack dir", e.to_string()))?;
+            }
         }
 
         let mut clone_rec = golden_rec.clone();
