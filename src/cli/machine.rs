@@ -3343,7 +3343,7 @@ impl CreateCmd {
                     false,
                     false,
                 )
-                .map(|()| (cache_dir.clone(), None))
+                .map(|()| (cache_dir.clone(), None::<String>))
                 .map_err(|e| smolvm::Error::agent("extract sidecar", e.to_string()))
             };
             // Detach unconditionally: extraction mounts the case-sensitive volume on
