@@ -95,6 +95,7 @@ pub fn seed_vm_mode_disks(
         if try_seed_vm_mode_disks_cow(
             disk_dir,
             cache_dir,
+            &cow_base_cache_root(),
             artifact_sha256,
             seed,
             crate::agent::create_disk_overlays,
@@ -143,6 +144,16 @@ struct CowBaseMetadata {
 #[cfg(target_os = "linux")]
 static COW_BASE_STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// Root for immutable VM-mode disk bases. Keep it outside the root-only shared
+/// pack extraction tree: each VMM drops to a distinct uid before libkrun opens
+/// its qcow2 backing files, so those uids must be able to traverse the base
+/// path. Directories below this root are execute-only to other uids and the VMM
+/// is still Landlock-confined to its exact backing chain.
+#[cfg(target_os = "linux")]
+pub(crate) fn cow_base_cache_root() -> PathBuf {
+    crate::agent::vm_cache_root().join("_cow-bases")
+}
+
 /// Build all immutable bases first, then create both private overlays in one
 /// libkrun load. A missing/corrupt base is a hard error; only an unavailable
 /// qcow2 implementation falls back to the existing sparse-copy behavior.
@@ -150,6 +161,7 @@ static COW_BASE_STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 fn try_seed_vm_mode_disks_cow<F>(
     disk_dir: &Path,
     cache_dir: &Path,
+    base_cache_root: &Path,
     artifact_sha256: &str,
     seed: VmModeDiskSeedSpec<'_>,
     create_overlays: F,
@@ -192,7 +204,7 @@ where
             .len();
         let target_size = disk_target_size(source_size, *logical_size, *size_gb_override)?;
         let base = prepare_cow_base(
-            cache_dir,
+            base_cache_root,
             artifact_sha256,
             disk_type,
             template,
@@ -274,7 +286,7 @@ fn disk_target_size(
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 fn prepare_cow_base(
-    cache_dir: &Path,
+    base_cache_root: &Path,
     artifact_sha256: &str,
     disk_type: &str,
     source_template: &str,
@@ -283,9 +295,11 @@ fn prepare_cow_base(
     logical_size: u64,
 ) -> std::io::Result<PathBuf> {
     validate_artifact_sha256(artifact_sha256)?;
-    let digest_dir = cache_dir.join(".cow-bases").join(artifact_sha256);
+    std::fs::create_dir_all(base_cache_root)?;
+    std::fs::set_permissions(base_cache_root, std::fs::Permissions::from_mode(0o711))?;
+    let digest_dir = base_cache_root.join(artifact_sha256);
     std::fs::create_dir_all(&digest_dir)?;
-    std::fs::set_permissions(&digest_dir, std::fs::Permissions::from_mode(0o700))?;
+    std::fs::set_permissions(&digest_dir, std::fs::Permissions::from_mode(0o711))?;
 
     let key = format!("{disk_type}-{logical_size}");
     let final_dir = digest_dir.join(&key);
@@ -882,6 +896,7 @@ mod tests {
     fn vm_mode_cow_uses_tiny_private_disks_and_one_immutable_base() {
         let temp = tempfile::tempdir().unwrap();
         let cache = temp.path().join("shared-pack");
+        let base_cache = temp.path().join("cow-bases");
         let first = temp.path().join("machine-a");
         let second = temp.path().join("machine-b");
         std::fs::create_dir_all(&cache).unwrap();
@@ -894,6 +909,7 @@ mod tests {
             assert!(try_seed_vm_mode_disks_cow(
                 machine,
                 &cache,
+                &base_cache,
                 TEST_ARTIFACT_SHA256,
                 VmModeDiskSeedSpec {
                     artifact_sha256: Some(TEST_ARTIFACT_SHA256),
@@ -917,7 +933,17 @@ mod tests {
             assert!(machine.join("storage.formatted").exists());
         }
 
-        let base_root = cache.join(".cow-bases").join(TEST_ARTIFACT_SHA256);
+        assert_eq!(
+            std::fs::metadata(&base_cache).unwrap().permissions().mode() & 0o777,
+            0o711,
+            "the uid-dropped VMM must be able to traverse the shared base store"
+        );
+        let base_root = base_cache.join(TEST_ARTIFACT_SHA256);
+        assert_eq!(
+            std::fs::metadata(&base_root).unwrap().permissions().mode() & 0o777,
+            0o711,
+            "the artifact digest directory must be traversable but non-listable"
+        );
         let bases: Vec<_> = std::fs::read_dir(&base_root)
             .unwrap()
             .filter_map(|entry| entry.ok())
@@ -926,9 +952,12 @@ mod tests {
         assert_eq!(bases.len(), 2, "one normalized base per disk type");
         for entry in &bases {
             let base = entry.path().join("base.raw");
-            assert_eq!(
-                std::fs::metadata(base).unwrap().permissions().mode() & 0o222,
-                0
+            let metadata = std::fs::metadata(base).unwrap();
+            assert_eq!(metadata.permissions().mode() & 0o222, 0);
+            use std::os::unix::fs::MetadataExt as _;
+            assert!(
+                metadata.blocks() * 512 < metadata.len() / 2,
+                "restoring the logical tail must keep the immutable base sparse"
             );
         }
 
@@ -949,6 +978,7 @@ mod tests {
             "deleting a sibling must retain shared bases"
         );
         make_tree_removable(&cache);
+        make_tree_removable(&base_cache);
     }
 
     #[test]
@@ -958,19 +988,20 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let cache = temp.path().join("shared-pack");
+        let base_cache = temp.path().join("cow-bases");
         std::fs::create_dir_all(&cache).unwrap();
         let source = cache.join("overlay.raw");
         write_sparse_template(&source, 1024 * 1024, b"root");
         let barrier = Arc::new(Barrier::new(8));
         let mut workers = Vec::new();
         for _ in 0..8 {
-            let cache = cache.clone();
+            let base_cache = base_cache.clone();
             let source = source.clone();
             let barrier = Arc::clone(&barrier);
             workers.push(std::thread::spawn(move || {
                 barrier.wait();
                 prepare_cow_base(
-                    &cache,
+                    &base_cache,
                     TEST_ARTIFACT_SHA256,
                     "overlay",
                     "overlay.raw",
@@ -987,7 +1018,7 @@ mod tests {
             .collect();
         assert!(paths.iter().all(|path| path == &paths[0]));
         assert_eq!(std::fs::metadata(&paths[0]).unwrap().len(), 4 * 1024 * 1024);
-        let digest_dir = cache.join(".cow-bases").join(TEST_ARTIFACT_SHA256);
+        let digest_dir = base_cache.join(TEST_ARTIFACT_SHA256);
         assert_eq!(
             std::fs::read_dir(&digest_dir)
                 .unwrap()
@@ -997,6 +1028,7 @@ mod tests {
             1
         );
         make_tree_removable(&cache);
+        make_tree_removable(&base_cache);
     }
 
     #[test]
@@ -1004,11 +1036,12 @@ mod tests {
     fn corrupt_cow_base_is_rejected_without_replacement() {
         let temp = tempfile::tempdir().unwrap();
         let cache = temp.path().join("shared-pack");
+        let base_cache = temp.path().join("cow-bases");
         std::fs::create_dir_all(&cache).unwrap();
         let source = cache.join("overlay.raw");
         write_sparse_template(&source, 1024 * 1024, b"root");
         let base = prepare_cow_base(
-            &cache,
+            &base_cache,
             TEST_ARTIFACT_SHA256,
             "overlay",
             "overlay.raw",
@@ -1019,7 +1052,7 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o644)).unwrap();
         let error = prepare_cow_base(
-            &cache,
+            &base_cache,
             TEST_ARTIFACT_SHA256,
             "overlay",
             "overlay.raw",
@@ -1032,6 +1065,7 @@ mod tests {
         assert!(error.to_string().contains("writable"));
         assert_eq!(std::fs::metadata(&base).unwrap().len(), 2 * 1024 * 1024);
         make_tree_removable(&cache);
+        make_tree_removable(&base_cache);
     }
 
     #[test]
@@ -1039,11 +1073,12 @@ mod tests {
     fn missing_file_in_completed_cow_base_fails_without_rebuilding() {
         let temp = tempfile::tempdir().unwrap();
         let cache = temp.path().join("shared-pack");
+        let base_cache = temp.path().join("cow-bases");
         std::fs::create_dir_all(&cache).unwrap();
         let source = cache.join("overlay.raw");
         write_sparse_template(&source, 1024 * 1024, b"root");
         let base = prepare_cow_base(
-            &cache,
+            &base_cache,
             TEST_ARTIFACT_SHA256,
             "overlay",
             "overlay.raw",
@@ -1058,7 +1093,7 @@ mod tests {
         std::fs::set_permissions(base_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
 
         let error = prepare_cow_base(
-            &cache,
+            &base_cache,
             TEST_ARTIFACT_SHA256,
             "overlay",
             "overlay.raw",
@@ -1073,6 +1108,7 @@ mod tests {
             "a completed but broken base is never replaced"
         );
         make_tree_removable(&cache);
+        make_tree_removable(&base_cache);
     }
 
     #[test]
@@ -1080,6 +1116,7 @@ mod tests {
     fn unavailable_qcow_support_leaves_no_partial_overlay_and_copy_fallback_works() {
         let temp = tempfile::tempdir().unwrap();
         let cache = temp.path().join("shared-pack");
+        let base_cache = temp.path().join("cow-bases");
         let machine = temp.path().join("machine");
         std::fs::create_dir_all(&cache).unwrap();
         std::fs::create_dir_all(&machine).unwrap();
@@ -1087,6 +1124,7 @@ mod tests {
         let used_cow = try_seed_vm_mode_disks_cow(
             &machine,
             &cache,
+            &base_cache,
             TEST_ARTIFACT_SHA256,
             VmModeDiskSeedSpec {
                 artifact_sha256: Some(TEST_ARTIFACT_SHA256),
@@ -1127,6 +1165,7 @@ mod tests {
         );
         assert!(machine.join("overlay.formatted").exists());
         make_tree_removable(&cache);
+        make_tree_removable(&base_cache);
     }
 
     #[test]

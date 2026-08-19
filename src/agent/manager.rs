@@ -2088,6 +2088,15 @@ impl AgentManager {
                 if let Some(home) = dirs::home_dir() {
                     crate::process::ensure_traversable(&home.join(".smolvm"));
                 }
+                #[cfg(target_os = "linux")]
+                {
+                    // VM-mode `create --from` qcow2 disks point at immutable bases
+                    // in the node-wide COW store. libkrun opens those paths after
+                    // this process drops to the per-VM uid, so make the store's
+                    // ancestor chain traversable (the store itself remains
+                    // non-listable and Landlock grants only this VM's exact chain).
+                    crate::process::ensure_traversable(&crate::storage::cow_base_cache_root());
+                }
                 // Pre-create this VM's per-VM readiness marker owned by its uid
                 // (0600): the dropped guest can overwrite it but couldn't create a
                 // file in the shared, host-user-owned rootfs. Per-VM name + 0600 =
