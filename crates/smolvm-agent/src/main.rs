@@ -2741,15 +2741,31 @@ fn install_file_atomic(path: &str, data: &[u8], mode: Option<u32>) -> AgentRespo
 /// With no running workload the local write is correct and is kept: overlayfs
 /// reads `upper` at mount time, so seeding it before the container starts is
 /// exactly how the file becomes visible once it does.
+/// The in-container write is complete only when it ran AND succeeded
+/// (`Some(Ok)`). `Some(Err)` (the container write was attempted but failed) and
+/// `None` (no single workload container to enter) both fall back to writing the
+/// VM's own filesystem — see [`handle_file_write`].
+fn container_write_complete(result: &Option<Result<(), String>>) -> bool {
+    matches!(result, Some(Ok(())))
+}
+
 fn handle_file_write(path: &str, data: &[u8], mode: Option<u32>) -> AgentResponse {
-    if let Some(result) = nsfile::write_to_container(path, data, mode) {
-        return match result {
-            Ok(()) => AgentResponse::Ok { data: None },
-            Err(e) => AgentResponse::error(
-                format!("failed to write {} in the workload container: {}", path, e),
-                error_codes::FILE_IO_FAILED,
-            ),
-        };
+    let container = nsfile::write_to_container(path, data, mode);
+    if container_write_complete(&container) {
+        return AgentResponse::Ok { data: None };
+    }
+    // The in-container write was attempted and failed. Rather than surfacing a
+    // hard error (which broke uploads for machines whose workload container the
+    // ns-file helper cannot write into — e.g. pack-based machines), fall back to
+    // writing the VM filesystem, the same path taken when there is no workload
+    // container at all. The upload succeeds; the warning records why the
+    // container write could not be used so it stays diagnosable.
+    if let Some(Err(e)) = &container {
+        tracing::warn!(
+            path,
+            error = %e,
+            "in-container file write failed; falling back to the VM filesystem"
+        );
     }
     install_file_atomic(path, data, mode)
 }
@@ -6375,6 +6391,19 @@ mod bg_reap_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn container_write_completes_only_on_success() {
+        // The write is done only when the in-container write ran and succeeded.
+        assert!(container_write_complete(&Some(Ok(()))));
+        // A failed in-container write must NOT be treated as complete — it falls
+        // back to the VM filesystem (previously this hard-errored as a 500).
+        assert!(!container_write_complete(&Some(Err(
+            "create staging: Read-only file system".to_string()
+        ))));
+        // No workload container to enter → fall back, as before.
+        assert!(!container_write_complete(&None));
+    }
 
     #[cfg(target_os = "linux")]
     fn proc_stat_fixture(pid: u32, state: char, start_time: u64) -> String {
