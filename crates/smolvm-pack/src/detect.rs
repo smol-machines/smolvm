@@ -42,6 +42,18 @@ pub enum PackedMode {
     },
 }
 
+/// Minimum section byte length required to hold the header plus a manifest and
+/// assets of the declared sizes, or `None` if the sum overflows `usize` (a
+/// crafted `assets_size` must not wrap the bound into a small value that a
+/// later `size >= expected` check would accept). Pure and platform-independent
+/// so the overflow guard is unit-testable off macOS.
+#[cfg(any(target_os = "macos", test))]
+fn embedded_section_extent(manifest_size: u32, assets_size: u64) -> Option<usize> {
+    crate::format::SECTION_HEADER_SIZE
+        .checked_add(manifest_size as usize)
+        .and_then(|s| s.checked_add(usize::try_from(assets_size).ok()?))
+}
+
 /// Detect whether this process is running as a packed binary.
 ///
 /// Checks in order:
@@ -203,12 +215,15 @@ fn read_embedded_section() -> Option<EmbeddedData> {
         let header_bytes = std::slice::from_raw_parts(data_ptr, SECTION_HEADER_SIZE);
         let section_header = SectionHeader::from_bytes(header_bytes).ok()?;
 
-        // Validate sizes
-        let expected_size = SECTION_HEADER_SIZE
-            + section_header.manifest_size as usize
-            + section_header.assets_size as usize;
-        if size < expected_size {
-            return None;
+        // Validate sizes with checked arithmetic. A crafted or corrupt
+        // `assets_size` (u64) could otherwise overflow the sum, wrapping the
+        // expected size small so `size <` passes and a bogus `assets_size`
+        // reaches the raw `assets_ptr` below as an out-of-bounds length. The
+        // file-parsing path (`packer.rs::validate_footer`) already uses
+        // `checked_add`; keep them consistent.
+        match embedded_section_extent(section_header.manifest_size, section_header.assets_size) {
+            Some(exp) if size >= exp => {}
+            _ => return None,
         }
 
         // Parse manifest
@@ -232,6 +247,19 @@ fn read_embedded_section() -> Option<EmbeddedData> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A crafted assets_size (u64 near max) must not overflow the section-extent
+    // sum: an unchecked `+` wraps it small, defeating the `size >= expected`
+    // bound and handing a huge assets_size to the raw pointer read.
+    #[test]
+    fn embedded_section_extent_rejects_overflow() {
+        assert_eq!(
+            embedded_section_extent(100, 200),
+            Some(crate::format::SECTION_HEADER_SIZE + 300)
+        );
+        assert_eq!(embedded_section_extent(100, u64::MAX), None);
+        assert_eq!(embedded_section_extent(u32::MAX, u64::MAX), None);
+    }
 
     #[test]
     fn test_detect_returns_none_for_normal_binary() {

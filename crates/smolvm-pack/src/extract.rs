@@ -342,7 +342,10 @@ fn verify_parent_within_dest(path: &Path, real_dest: &Path) -> std::io::Result<(
 /// links that alias the destination root) and opens regular files with
 /// `O_NOFOLLOW` plus a canonicalized-parent check, so a write can never
 /// follow a planted symlink out of `dest`.
-fn safe_unpack<R: Read>(archive: &mut tar::Archive<R>, dest: &Path) -> std::io::Result<()> {
+pub(crate) fn safe_unpack<R: Read>(
+    archive: &mut tar::Archive<R>,
+    dest: &Path,
+) -> std::io::Result<()> {
     safe_unpack_with_limits(archive, dest, &SafeUnpackLimits::from_env())
 }
 
