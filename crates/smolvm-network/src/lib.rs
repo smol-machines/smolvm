@@ -81,9 +81,10 @@ pub use egress::EgressPolicy;
 use socket2::Socket;
 use std::fmt;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket};
+use std::sync::OnceLock;
 use std::thread::JoinHandle;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use frame_stream::{start_frame_stream_bridge, FrameStreamBridge};
 use queues::NetworkFrameQueues;
@@ -192,20 +193,67 @@ impl GuestNetworkConfig {
 /// socket by the launcher and read back by the host's `read_egress_denials`.
 pub const EGRESS_DENIALS_LOG: &str = "egress-denials.log";
 
-/// Whether the host can route IPv6 to the internet.
+/// Whether the host can actually reach the IPv6 internet.
 ///
 /// Advertising the guest a global-scope IPv6 address (the ULA link pair) makes
 /// every dual-stack client sort AAAA answers first (RFC 6724) — but the
-/// gateway can only relay v6 flows the host itself can dial. On a v6-less
-/// host every such connection dies, so callers use this probe to withhold the
-/// guest's IPv6 configuration entirely and keep such guests v4-first.
+/// gateway can only relay v6 flows the host itself can dial. On a host with no
+/// working v6 every such connection dies, so callers use this probe to withhold
+/// the guest's IPv6 configuration entirely and keep such guests v4-first.
 ///
-/// A connected UDP socket performs only a local route lookup — no packets are
-/// sent — which is the same signal the host's own applications act on.
+/// This must reflect END-TO-END reachability, not a configured route: a
+/// connected `UdpSocket` performs only a local route lookup (no packets), so it
+/// returns `true` whenever any v6 default route exists — including a stale or
+/// ULA-only one with no path to the internet (common on Windows and some Linux
+/// setups). That false positive is exactly what made dual-stack guests prefer
+/// AAAA and then hang. So the route lookup is used only as a cheap, zero-latency
+/// NECESSARY condition; when it passes, a real TCP handshake — the same
+/// operation the relay performs per flow — confirms the path actually works.
+///
+/// The result is cached for the process: within one smolvm run the host's v6
+/// capability is effectively stable, and a stale cache is harmless because the
+/// guest is also configured v4-first (see the agent's gai.conf handling), so a
+/// wrongly-advertised v6 never causes a hard hang.
 pub fn host_has_ipv6_route() -> bool {
-    std::net::UdpSocket::bind("[::]:0")
-        .and_then(|socket| socket.connect("[2001:4860:4860::8888]:53"))
-        .is_ok()
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(probe_ipv6_reachable)
+}
+
+fn probe_ipv6_reachable() -> bool {
+    // Cheap necessary condition: no v6 default route at all → no v6, no latency.
+    let has_route = UdpSocket::bind("[::]:0")
+        .and_then(|s| s.connect("[2606:4700:4700::1111]:53"))
+        .is_ok();
+    if !has_route {
+        return false;
+    }
+    // A route exists but may be non-functional. Confirm with a real TCP
+    // handshake to well-known v6 anycast endpoints, raced with a short timeout.
+    // A false negative (v6 works but these targets are filtered) is safe — the
+    // guest stays v4-only; a false positive would reintroduce the hang.
+    const TARGETS: [&str; 2] = [
+        "[2606:4700:4700::1111]:443", // Cloudflare
+        "[2001:4860:4860::8888]:443", // Google
+    ];
+    const TIMEOUT: Duration = Duration::from_millis(1000);
+    let (tx, rx) = std::sync::mpsc::channel();
+    for target in TARGETS {
+        if let Ok(addr) = target.parse::<SocketAddr>() {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(TcpStream::connect_timeout(&addr, TIMEOUT).is_ok());
+            });
+        }
+    }
+    drop(tx);
+    // First success wins; otherwise drain until every probe reported (senders
+    // dropped), capped by the connect timeout since the probes run in parallel.
+    while let Ok(ok) = rx.recv() {
+        if ok {
+            return true;
+        }
+    }
+    false
 }
 
 pub(crate) fn format_network_log_line(timestamp: SystemTime, message: &str) -> String {

@@ -2596,6 +2596,29 @@ impl OverlaySetup {
             warn!(error = %e, "failed to write resolv.conf to upper layer");
         }
 
+        // Prefer IPv4 for dual-stack destinations so a flaky or wrongly-advertised
+        // IPv6 path can never cause a hard hang: glibc reads /etc/gai.conf, and
+        // this entry ranks IPv4-mapped addresses above the default IPv6
+        // precedences (RFC 6724), so clients try v4 first and fall back to v6
+        // only when v4 is unavailable. The host only advertises v6 when a real
+        // reachability probe passes; this is the belt-and-suspenders for the
+        // window where an advertised v6 later goes bad. Distros ship gai.conf
+        // with this line COMMENTED (Debian/Ubuntu), so provide it unless the
+        // image sets its own active rules; musl does its own sorting and ignores
+        // gai.conf, so those guests rely solely on the host probe.
+        let gai_path = upper_etc.join("gai.conf");
+        let image_has_gai_rules = lowerdirs
+            .iter()
+            .any(|l| hosts_file_has_entries(&Path::new(l).join("etc/gai.conf")));
+        if !image_has_gai_rules && !gai_path.exists() {
+            let gai_contents =
+                "# Managed by smolvm: prefer IPv4 so a flaky IPv6 path cannot hang clients.\n\
+                 precedence ::ffff:0:0/96  100\n";
+            if let Err(e) = std::fs::write(&gai_path, gai_contents) {
+                warn!(error = %e, "failed to write gai.conf to upper layer");
+            }
+        }
+
         // Container runtimes are expected to provide /etc/hosts (Docker bind-
         // mounts a generated one), so minimal images like rancher/k3s ship
         // without it — and software that templates from it (containerd's pod
