@@ -31,7 +31,18 @@ echo "==> logs show the workload ran inside a VM kernel"
 LOGS=$($K logs "$POD")
 echo "$LOGS" | sed 's/^/    /'
 echo "$LOGS" | grep -q SMOLVM_K8S_E2E_OK || fail "expected marker not in logs"
-echo "$LOGS" | grep -qi "kernel:" || fail "no kernel line in logs"
+
+# The assertion that can actually fail. A microVM boots its own kernel, so the
+# guest's `uname -sr` differs from the node's; under runc the container shares
+# the host kernel and the two strings are identical. Grepping for the "kernel:"
+# prefix only matched the echo in example-pod.yaml, which any runtime prints.
+GUEST_KERNEL=$(printf '%s\n' "$LOGS" | sed -n 's/^kernel: //p' | head -1)
+[ -n "$GUEST_KERNEL" ] || fail "no kernel line in logs"
+HOST_KERNEL=$(uname -sr)
+echo "    guest kernel: $GUEST_KERNEL"
+echo "    host kernel:  $HOST_KERNEL"
+[ "$GUEST_KERNEL" != "$HOST_KERNEL" ] \
+    || fail "guest kernel '$GUEST_KERNEL' is the node's own — the workload is not in a microVM"
 
 echo "==> exec into the running microVM"
 UID_OUT=$($K exec "$POD" -- id 2>/dev/null) || fail "kubectl exec failed"

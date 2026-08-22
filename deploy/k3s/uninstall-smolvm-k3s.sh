@@ -29,14 +29,13 @@ fi
 
 echo "==> removing the smolvm runtime block from the containerd template"
 if [ -f "$TMPL" ]; then
-  # Restore the newest pre-smolvm backup when the installer made one (it only
-  # does so when a template already existed), otherwise strip just our block so
-  # any operator config in the file survives.
-  BACKUP=$(ls -1t "$TMPL".pre-smolvm.* 2>/dev/null | head -1 || true)
-  if [ -n "$BACKUP" ]; then
-    echo "    restoring $BACKUP"
-    mv "$BACKUP" "$TMPL"
-  else
+  # Always strip just our block, never restore the install-time backup over the
+  # live file. The installer states the rule this follows: config.toml.tmpl is
+  # where operators put registry mirrors and private-registry auth, "so it is NOT
+  # ours to overwrite", and "a lost mirror config breaks image pulls cluster-wide
+  # and the cause is hard to trace". Restoring a snapshot taken at install time
+  # discards everything the operator added since, which can be months of edits.
+  if grep -q 'runtimes\.smolvm\]' "$TMPL"; then
     # Drop the smolvm table header and its runtime_type line.
     sed -i '/runtimes\.smolvm\]/,+1d' "$TMPL"
     # A template that is now nothing but the base include is what k3s generates
@@ -44,6 +43,16 @@ if [ -f "$TMPL" ]; then
     if [ "$(grep -cvE '^[[:space:]]*($|\{\{ template "base" \. \}\})' "$TMPL")" = 0 ]; then
       rm -f "$TMPL"
       echo "    template held only the base include — removed"
+    fi
+  else
+    # Our block is absent, so there is nothing to strip. This is the one case the
+    # backup is for: a template edited between our header and its runtime_type
+    # line, which sed cannot match. Leave both files alone and say so, rather
+    # than overwriting the operator's file on a guess.
+    echo "    no smolvm runtime block found in $TMPL — leaving it untouched"
+    BACKUP=$(ls -1t "$TMPL".pre-smolvm.* 2>/dev/null | head -1 || true)
+    if [ -n "$BACKUP" ]; then
+      echo "    if it was hand-edited, the install-time copy is at $BACKUP"
     fi
   fi
 fi
