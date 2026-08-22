@@ -49,6 +49,45 @@ use crate::backend::{ExitInfo, ExitWatch, PodBackend, ProcessSpec, Stdio};
 /// rejects). One `<id>/podshare` subdir per sandbox.
 const POD_SHARE_HOST_ROOT: &str = "/var/lib/containerd-shim-smolvm";
 
+/// Resolve a sandbox's share tree — `<root>/<sandbox-id>`, the parent of the
+/// `podshare` dir handed to the VM.
+///
+/// Returns `None` for an id that could climb out of `root`. containerd ids are
+/// hex, but this path feeds `remove_dir_all`, so it is checked rather than
+/// trusted.
+fn share_tree_in(root: &Path, id: &str) -> Option<PathBuf> {
+    if id.is_empty() || id == "." || id == ".." || id.contains('/') || id.contains('\\') {
+        return None;
+    }
+    Some(root.join(id))
+}
+
+fn remove_share_tree(root: &Path, id: &str) {
+    let Some(dir) = share_tree_in(root, id) else {
+        warn!("refusing to remove share tree for suspicious sandbox id {id:?}");
+        return;
+    };
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => debug!("removed sandbox share tree {}", dir.display()),
+        // Already gone is the common case (a second teardown path ran first).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warn!("rm {}: {e}", dir.display()),
+    }
+}
+
+/// Remove the host share tree belonging to `id`.
+///
+/// The sandbox VM is reaped by sandbox id on three separate teardown paths, and
+/// this directory is keyed by that same id, so it has to go with it. Nothing
+/// else can reclaim it: a graceful delete removes the machine record first, so
+/// the startup reconcile — which only walks surviving records — can never see
+/// that the tree is orphaned.
+///
+/// Best-effort: teardown must not fail because residue could not be removed.
+pub(crate) fn remove_sandbox_share_tree(id: &str) {
+    remove_share_tree(Path::new(POD_SHARE_HOST_ROOT), id);
+}
+
 const POD_SHARE_GUEST_PATH: &str = "/podshare";
 
 /// Where the agent's pod handlers resolve `PodCreate.rootfs_rel` from:
@@ -626,6 +665,13 @@ impl PodBackend for EnginePodBackend {
                 }) => {
                     warn!("sandbox machine {id_owned} already exists; recreating");
                     let _ = rt.delete_machine(&id_owned);
+                    // The predecessor's share tree is stale too, and on this
+                    // path it still holds its container rootfs copies — the
+                    // per-container delete never ran. Replace it alongside the
+                    // record rather than letting the new sandbox inherit it.
+                    remove_sandbox_share_tree(&id_owned);
+                    std::fs::create_dir_all(&share_dir)
+                        .map_err(|e| format!("mkdir {}: {e}", share_dir.display()))?;
                     rt.create_machine(spec).map_err(|e| e.to_string())?;
                 }
                 Err(e) => return Err(e.to_string()),
@@ -906,8 +952,14 @@ impl PodBackend for EnginePodBackend {
                 if let Err(e) = rt.stop_machine(&sandbox.id) {
                     warn!("stop sandbox VM {}: {e}", sandbox.id);
                 }
-                rt.delete_machine(&sandbox.id)
-                    .map_err(|e| format!("delete sandbox VM: {e}"))
+                let deleted = rt
+                    .delete_machine(&sandbox.id)
+                    .map_err(|e| format!("delete sandbox VM: {e}"));
+                // The share tree outlives the VM it was created for unless it
+                // is removed here; do it even if the VM teardown reported an
+                // error, since the pod is going away either way.
+                remove_sandbox_share_tree(&sandbox.id);
+                deleted
             })
             .await
             .map_err(|e| e.to_string())??;
@@ -1256,5 +1308,64 @@ impl PodBackend for ShimBackend {
             Self::Mock(b) => b.stats(id).await,
             Self::Engine(b) => b.stats(id).await,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The sandbox VM is reaped by sandbox id on every teardown path; the host
+    /// share tree is keyed by that same id and has to go with it. What makes it
+    /// expensive is the crash profile: the per-container delete never ran, so
+    /// the tree still holds full `cp -a` image rootfs copies.
+    #[test]
+    fn removing_a_sandbox_share_tree_takes_its_container_rootfs_copies_with_it() {
+        let root = tempfile::tempdir().unwrap();
+        let sandbox = "a1b2c3";
+        let rootfs = root.path().join(sandbox).join("podshare/ctr-1/rootfs");
+        std::fs::create_dir_all(rootfs.join("bin")).unwrap();
+        std::fs::write(rootfs.join("bin/sh"), b"#!/bin/sh").unwrap();
+        // A second sandbox on the same node must be left strictly alone.
+        let other = root.path().join("d4e5f6").join("podshare");
+        std::fs::create_dir_all(&other).unwrap();
+
+        remove_share_tree(root.path(), sandbox);
+
+        assert!(
+            !root.path().join(sandbox).exists(),
+            "share tree survived sandbox teardown"
+        );
+        assert!(other.exists(), "teardown removed an unrelated sandbox");
+
+        // Teardown runs from more than one path, so a tree that is already gone
+        // is the normal case, not an error.
+        remove_share_tree(root.path(), sandbox);
+    }
+
+    #[test]
+    fn a_share_tree_path_cannot_climb_out_of_the_share_root() {
+        let root = Path::new(POD_SHARE_HOST_ROOT);
+        assert_eq!(
+            share_tree_in(root, "a1b2c3"),
+            Some(root.join("a1b2c3")),
+            "an ordinary containerd id must resolve"
+        );
+        for bad in ["", ".", "..", "../..", "a/b", "..\\x"] {
+            assert_eq!(share_tree_in(root, bad), None, "accepted id {bad:?}");
+        }
+    }
+
+    /// The tree removed on teardown is the PARENT of the dir handed to the VM,
+    /// so the per-sandbox `podshare` goes with it rather than being orphaned.
+    #[test]
+    fn the_share_tree_is_the_parent_of_the_dir_mounted_into_the_vm() {
+        let root = Path::new(POD_SHARE_HOST_ROOT);
+        let mounted = root.join("a1b2c3").join("podshare");
+        assert_eq!(
+            share_tree_in(root, "a1b2c3").as_deref(),
+            mounted.parent(),
+            "teardown must remove the sandbox dir, not just its podshare"
+        );
     }
 }

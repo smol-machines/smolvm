@@ -36,6 +36,12 @@ pub const POD_SHARE_TAG: &str = "podshare";
 /// Guest directory holding per-pod-container state (crun bundle dirs).
 const POD_STATE_DIR: &str = "/storage/containers/pods";
 
+/// Guest directory holding each container's writable overlay (`upper`/`work`/
+/// `merged`) and its materialized CRI mounts (`mnt/`). A second per-container
+/// tree alongside [`POD_STATE_DIR`]; both are created on start and both are
+/// torn down by `PodDelete`.
+const POD_OVERLAY_DIR: &str = "/storage/pods";
+
 // ============================================================================
 // Registry
 // ============================================================================
@@ -312,6 +318,31 @@ fn parse_pod_mounts(spec: &serde_json::Value) -> Vec<PodMount> {
 fn pod_dir(id: &str) -> PathBuf {
     PathBuf::from(POD_STATE_DIR).join(id)
 }
+
+/// Per-container overlay directory (holds `upper`/`work`/`merged` and `mnt/`).
+fn pod_overlay_dir(id: &str) -> PathBuf {
+    PathBuf::from(POD_OVERLAY_DIR).join(id)
+}
+
+/// Detach an overlay mounted at `merged`, if one is there.
+///
+/// `MNT_DETACH` because a container that died badly can still hold references:
+/// a lazy unmount always succeeds in taking the mountpoint out of the namespace
+/// and lets the kernel release it when the last reference goes. Not being
+/// mounted is the common case and not an error, so the result is discarded.
+#[cfg(target_os = "linux")]
+fn detach_overlay(merged: &Path) {
+    use std::ffi::CString;
+    if let Ok(c) = CString::new(merged.to_string_lossy().as_bytes()) {
+        // SAFETY: `c` is a valid NUL-terminated C string that outlives the call;
+        // the agent is PID 1 with CAP_SYS_ADMIN, so umount2 is permitted.
+        unsafe { libc::umount2(c.as_ptr(), libc::MNT_DETACH) };
+    }
+}
+
+/// Guest overlays only exist on Linux; nothing to detach elsewhere.
+#[cfg(not(target_os = "linux"))]
+fn detach_overlay(_merged: &Path) {}
 
 // ============================================================================
 // PID helpers
@@ -773,18 +804,37 @@ pub fn handle_pod_delete(id: &str, exec_id: Option<&str>) -> AgentResponse {
     let _ = crun::CrunCommand::delete(id, true)
         .discard_output()
         .output();
-    // Only touch the bundle dir for ids we actually created (or whose dir
-    // exists) — pod_dir(id) is validated-id-safe but stay conservative.
+    // Only touch on-disk state for ids we actually created (or whose dirs
+    // exist) — the path helpers are validated-id-safe but stay conservative.
     if validate_id(id).is_ok() {
-        let dir = pod_dir(id);
-        if dir.exists() {
-            if let Err(e) = std::fs::remove_dir_all(&dir) {
-                warn!(id = %id, error = %e, "failed to remove pod state dir");
-            }
-        }
+        remove_container_state(&pod_dir(id), &pod_overlay_dir(id));
     }
     info!(id = %id, existed = existed, "pod container deleted");
     AgentResponse::ok(None)
+}
+
+/// Remove both per-container trees that starting a container creates: the crun
+/// bundle under [`POD_STATE_DIR`] and the writable overlay under
+/// [`POD_OVERLAY_DIR`].
+///
+/// The overlay's `merged` mount is detached BEFORE its tree is removed. The
+/// other order recurses into a live overlay and deletes *through* it — which
+/// destroys the content the lower is showing and still leaves the mount behind.
+///
+/// Best-effort throughout, like the rest of delete: failures are logged, never
+/// propagated, so leftover state cannot wedge a CRI delete.
+fn remove_container_state(bundle: &Path, overlay: &Path) {
+    if bundle.exists() {
+        if let Err(e) = std::fs::remove_dir_all(bundle) {
+            warn!(dir = %bundle.display(), error = %e, "failed to remove pod state dir");
+        }
+    }
+    detach_overlay(&overlay.join("merged"));
+    if overlay.exists() {
+        if let Err(e) = std::fs::remove_dir_all(overlay) {
+            warn!(dir = %overlay.display(), error = %e, "failed to remove pod overlay dir");
+        }
+    }
 }
 
 // ============================================================================
@@ -1057,7 +1107,7 @@ fn materialize_pod_mounts(id: &str, mounts: &[PodMount]) -> Vec<(PathBuf, String
     // The copy makes the volume writable + guest-local (correct emptyDir/configMap
     // /secret semantics; smolvm's virtiofs share is read-only so a live bind of the
     // host source couldn't be written).
-    let base = Path::new("/storage/pods").join(id).join("mnt");
+    let base = pod_overlay_dir(id).join("mnt");
     let mut binds = Vec::new();
     for (n, m) in mounts.iter().enumerate() {
         let dst = base.join(n.to_string());
@@ -1267,7 +1317,7 @@ fn cgroups_available() -> bool {
 /// unmounted first.
 #[cfg(target_os = "linux")]
 fn mount_writable_rootfs(id: &str, lower: &std::path::Path) -> Result<PathBuf, String> {
-    let base = Path::new("/storage/pods").join(id);
+    let base = pod_overlay_dir(id);
     let upper = base.join("upper");
     let work = base.join("work");
     let merged = base.join("merged");
@@ -1278,8 +1328,10 @@ fn mount_writable_rootfs(id: &str, lower: &std::path::Path) -> Result<PathBuf, S
     use std::ffi::CString;
     let cstr = |p: &str| CString::new(p).map_err(|e| format!("cstr {p}: {e}"));
     let merged_c = cstr(&merged.to_string_lossy())?;
-    // Drop any leftover mount from a previous start attempt (MNT_DETACH = 2).
-    unsafe { libc::umount2(merged_c.as_ptr(), 2) };
+    // Drop any leftover mount from a previous start attempt of THIS id. A
+    // predecessor container has a different id and is reclaimed by its own
+    // delete, not here.
+    detach_overlay(&merged);
 
     let overlay_c = cstr("overlay")?;
     let data = format!(
@@ -1785,6 +1837,45 @@ mod tests {
 
         // Gone from the registry.
         assert!(matches!(handle_pod_pids(id), AgentResponse::Error { .. }));
+    }
+
+    #[test]
+    fn deleting_a_container_removes_both_of_its_state_trees() {
+        // Starting a container creates two trees: the crun bundle and the
+        // writable overlay (upper/work/merged) with its materialized CRI
+        // mounts. Delete owns both — leaving either behind means a container
+        // that restarts under a fresh id (which every k8s restart does)
+        // accumulates one orphan per restart inside the same sandbox.
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join("containers/pods/ctr-a");
+        let overlay = tmp.path().join("pods/ctr-a");
+        std::fs::create_dir_all(bundle.join("rootfs")).unwrap();
+        for d in ["upper/etc", "work/work", "merged", "mnt/0"] {
+            std::fs::create_dir_all(overlay.join(d)).unwrap();
+        }
+        std::fs::write(overlay.join("upper/etc/hosts"), b"127.0.0.1").unwrap();
+
+        remove_container_state(&bundle, &overlay);
+
+        assert!(!bundle.exists(), "crun bundle survived delete");
+        assert!(!overlay.exists(), "writable overlay survived delete");
+
+        // Deleting twice, and deleting something that was never started, are
+        // both fine: delete is idempotent and must never fail the CRI call.
+        remove_container_state(&bundle, &overlay);
+        remove_container_state(&tmp.path().join("nope"), &tmp.path().join("nope2"));
+    }
+
+    #[test]
+    fn a_containers_two_state_trees_are_siblings_under_distinct_roots() {
+        // The overlay root is deliberately NOT under the bundle root: removing
+        // the bundle cannot reclaim the overlay by accident, which is exactly
+        // why delete has to name both.
+        let bundle = pod_dir("ctr-a");
+        let overlay = pod_overlay_dir("ctr-a");
+        assert_eq!(bundle, Path::new("/storage/containers/pods/ctr-a"));
+        assert_eq!(overlay, Path::new("/storage/pods/ctr-a"));
+        assert!(!overlay.starts_with(POD_STATE_DIR));
     }
 
     #[test]
