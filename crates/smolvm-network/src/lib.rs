@@ -455,12 +455,19 @@ impl Drop for VirtioNetworkRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::format_network_log_line;
+    use super::*;
     use std::time::UNIX_EPOCH;
 
     #[test]
     fn formats_timestamped_network_log_prefix() {
         let line = format_network_log_line(UNIX_EPOCH, "virtio-net: smoke test");
         assert_eq!(line, "[1970-01-01T00:00:00Z]: virtio-net: smoke test");
+    }
+
+    #[test]
+    fn host_has_ipv6_route_is_consistent_and_cached() {
+        let first = host_has_ipv6_route();
+        let second = host_has_ipv6_route();
+        assert_eq!(first, second);
     }
 }

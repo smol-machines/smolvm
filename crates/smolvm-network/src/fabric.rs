@@ -444,7 +444,7 @@ pub fn start_fabric(
     ))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
