@@ -161,20 +161,40 @@ check_requirements() {
 # Get latest version from GitHub
 get_latest_version() {
     local url="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
-    local version
+    local body version
 
+    # Keep the body rather than piping straight into grep: on a rate-limit the
+    # API answers 200-or-403 with a JSON error object, and that object is the
+    # only thing that says which failure this is. `|| body=""` because `set -e`
+    # would otherwise kill the subshell before the diagnosis below can run.
     if command -v curl &> /dev/null; then
-        version=$(curl -sSL "$url" 2>/dev/null | grep '"tag_name"' | sed -E 's/.*"tag_name": *"v?([^"]+)".*/\1/')
+        body=$(curl -sSL "$url" 2>/dev/null) || body=""
     else
-        version=$(wget -qO- "$url" 2>/dev/null | grep '"tag_name"' | sed -E 's/.*"tag_name": *"v?([^"]+)".*/\1/')
+        body=$(wget -qO- "$url" 2>/dev/null) || body=""
     fi
 
-    if [[ -z "$version" ]]; then
-        # Fallback to a default version if GitHub API fails
-        echo "0.1.1"
-    else
+    version=$(printf '%s' "$body" | grep '"tag_name"' | sed -E 's/.*"tag_name": *"v?([^"]+)".*/\1/')
+
+    if [[ -n "$version" ]]; then
         echo "$version"
+        return 0
     fi
+
+    # No tag_name means the API did not hand us a release. Never guess one: the
+    # hardcoded fallback that used to live here published no Linux asset, so it
+    # 404'd there, and on macOS it silently installed *older* than what was
+    # already on the machine. Failing loudly is the only safe answer.
+    error "Could not determine the latest smolvm version from the GitHub API."
+    if printf '%s' "$body" | grep -q "rate limit exceeded"; then
+        error "GitHub is rate-limiting this machine, so the release lookup was refused."
+        error "Wait for the limit to reset, or install a specific version:"
+    else
+        error "No release information came back from $url"
+        error "Check network access to api.github.com, or install a specific version:"
+    fi
+    error "  curl -sSL https://smolmachines.com/install.sh | bash -s -- --version VERSION"
+    error "Released versions: https://github.com/${GITHUB_REPO}/releases"
+    exit 1
 }
 
 # Download file
