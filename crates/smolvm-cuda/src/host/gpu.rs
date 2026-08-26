@@ -1044,10 +1044,8 @@ impl GpuBackend {
                             }
                         };
                         let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
-                        // `f_type`'s signedness varies across libc versions; cast
-                        // both sides so the comparison holds either way.
                         if unsafe { libc::fstatfs(file.as_raw_fd(), &mut stat) } != 0
-                            || stat.f_type != TMPFS_MAGIC as _
+                            || stat.f_type != TMPFS_MAGIC
                         {
                             return Some(response(CUDA_ERROR_NOT_SUPPORTED, std::ptr::null_mut()));
                         }
