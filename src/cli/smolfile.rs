@@ -6,7 +6,7 @@
 
 use crate::cli::parsers::parse_cidr;
 use crate::cli::vm_common::CreateVmParams;
-use smolvm::data::network::PortMapping;
+use smolvm::data::network::PortMappingSpec;
 use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
 use smolvm::network::NetworkBackend;
 use std::path::PathBuf;
@@ -39,7 +39,7 @@ pub fn build_create_params(
     cli_cpus: u8,
     cli_mem: u32,
     cli_volume: Vec<String>,
-    cli_port: Vec<PortMapping>,
+    cli_port: Vec<PortMappingSpec>,
     cli_net: bool,
     cli_network_backend: Option<NetworkBackend>,
     cli_dns: Option<std::net::Ipv4Addr>,
@@ -61,6 +61,8 @@ pub fn build_create_params(
     let sf = match smolfile_path {
         Some(path) => load(&path)?,
         None => {
+            let ports = PortMappingSpec::expand_all(&cli_port)
+                .map_err(|e| smolvm::Error::config("CLI ports", e))?;
             let net = cli_net
                 || !cli_allow_cidr.is_empty()
                 || cli_dns.is_some()
@@ -75,7 +77,7 @@ pub fn build_create_params(
                 cpus: cli_cpus,
                 mem: cli_mem,
                 volume: cli_volume,
-                port: cli_port,
+                port: ports,
                 net,
                 network_backend: cli_network_backend,
                 dns: cli_dns,
@@ -160,12 +162,14 @@ pub fn build_create_params(
     } else {
         sf.ports
     };
-    let mut ports: Vec<PortMapping> = sf_ports
+    let mut port_specs: Vec<PortMappingSpec> = sf_ports
         .iter()
-        .map(|s| PortMapping::parse(s))
-        .collect::<Result<Vec<_>, _>>()
+        .map(|s| PortMappingSpec::parse(s))
+        .collect::<Result<_, _>>()
         .map_err(|e| smolvm::Error::config("smolfile ports", e))?;
-    ports.extend(cli_port);
+    port_specs.extend(cli_port);
+    let ports = PortMappingSpec::expand_all(&port_specs)
+        .map_err(|e| smolvm::Error::config("smolfile ports", e))?;
 
     // Volumes: [dev].volumes > top-level volumes, then CLI extends
     let sf_volumes = if !dev.volumes.is_empty() {
@@ -489,6 +493,7 @@ pub fn resolve_pack_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use smolvm::data::network::PortMapping;
 
     fn build_from_smolfile(path: PathBuf) -> smolvm::Result<CreateVmParams> {
         build_create_params(
@@ -513,6 +518,24 @@ mod tests {
             vec![],
             Default::default(),
         )
+    }
+
+    #[test]
+    fn smolfile_port_ranges_expand_before_create() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Smolfile");
+        std::fs::write(&path, "[dev]\nports = [\"5173-5175:6173-6175\"]\n").unwrap();
+
+        let params = build_from_smolfile(path).unwrap();
+
+        assert_eq!(
+            params.port,
+            vec![
+                PortMapping::new(5173, 6173),
+                PortMapping::new(5174, 6174),
+                PortMapping::new(5175, 6175),
+            ]
+        );
     }
 
     #[test]

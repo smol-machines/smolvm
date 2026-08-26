@@ -18,7 +18,7 @@ use crate::cli::vm_common::{self, DeleteVmOptions};
 use clap::{Args, Subcommand};
 use sha2::{Digest, Sha256};
 use smolvm::agent::{docker_config_mount, AgentClient, AgentManager, RunConfig, VmResources};
-use smolvm::data::network::PortMapping;
+use smolvm::data::network::{PortMapping, PortMappingSpec, MAX_PORT_MAPPINGS};
 use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
 use smolvm::data::storage::HostMount;
 use smolvm::network::{validate_requested_network_backend, NetworkBackend};
@@ -530,8 +530,8 @@ pub struct RunCmd {
     pub volume: Vec<String>,
 
     /// Expose port from container to host (can be used multiple times)
-    #[arg(short = 'p', long = "port", value_parser = PortMapping::parse, value_name = "HOST:GUEST", help_heading = "Network")]
-    pub port: Vec<PortMapping>,
+    #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "HOST:GUEST", help_heading = "Network")]
+    pub port: Vec<PortMappingSpec>,
 
     /// Enable outbound network access
     #[arg(long, help_heading = "Network")]
@@ -1066,6 +1066,8 @@ impl RunCmd {
         // flags pass through. Flags the sidecar runner can't honor are rejected
         // at parse time via `conflicts_with_all` on `from`.
         if let Some(from) = self.from {
+            let port = PortMappingSpec::expand_all(&self.port)
+                .map_err(|e| smolvm::Error::config("machine run ports", e))?;
             let mut env = self.env;
             if self.auto_graph {
                 smolvm::util::enable_cuda_auto_graph_env_specs(&mut env);
@@ -1079,7 +1081,7 @@ impl RunCmd {
                 workdir: self.workdir,
                 env,
                 volume: self.volume,
-                port: self.port,
+                port: port.into_iter().map(PortMappingSpec::from).collect(),
                 net: self.net,
                 net_backend: self.net_backend,
                 cpus: (self.cpus != DEFAULT_MICROVM_CPU_COUNT).then_some(self.cpus),
@@ -1215,7 +1217,12 @@ impl RunCmd {
                     workdir: params.workdir.clone(),
                     env: params.env.clone(),
                     volume: params.volume.clone(),
-                    port: params.port.clone(),
+                    port: params
+                        .port
+                        .iter()
+                        .copied()
+                        .map(PortMappingSpec::from)
+                        .collect(),
                     net: params.net,
                     net_backend: params.network_backend,
                     cpus: (params.cpus != DEFAULT_MICROVM_CPU_COUNT).then_some(params.cpus),
@@ -1326,7 +1333,12 @@ impl RunCmd {
                 workdir: params.workdir.clone(),
                 env: params.env.clone(),
                 volume: params.volume.clone(),
-                port: params.port.clone(),
+                port: params
+                    .port
+                    .iter()
+                    .copied()
+                    .map(PortMappingSpec::from)
+                    .collect(),
                 net: params.net,
                 net_backend: params.network_backend,
                 cpus: (params.cpus != DEFAULT_MICROVM_CPU_COUNT).then_some(params.cpus),
@@ -2297,6 +2309,30 @@ mod tests {
     }
 
     #[test]
+    fn create_accepts_port_ranges() {
+        let cli = TestMachineCli::parse_from([
+            "machine",
+            "create",
+            "--name",
+            "range-test",
+            "--port",
+            "5173-5175:6173-6175",
+        ]);
+        let MachineCmd::Create(cmd) = cli.command else {
+            panic!("expected machine create command");
+        };
+
+        assert_eq!(
+            PortMappingSpec::expand_all(&cmd.port).unwrap(),
+            vec![
+                PortMapping::new(5173, 6173),
+                PortMapping::new(5174, 6174),
+                PortMapping::new(5175, 6175),
+            ]
+        );
+    }
+
+    #[test]
     fn run_detach_accepts_name_flag() {
         let cli = TestMachineCli::parse_from([
             "machine", "run", "-d", "--name", "foo", "--image", "alpine",
@@ -3024,8 +3060,8 @@ pub struct CreateCmd {
     pub volume: Vec<String>,
 
     /// Expose port from VM to host (can be used multiple times)
-    #[arg(short = 'p', long = "port", value_parser = PortMapping::parse, value_name = "HOST:GUEST")]
-    pub port: Vec<PortMapping>,
+    #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "HOST:GUEST")]
+    pub port: Vec<PortMappingSpec>,
 
     /// Enable outbound network access
     #[arg(long)]
@@ -3421,6 +3457,8 @@ impl CreateCmd {
             )?;
         }
 
+        let ports = PortMappingSpec::expand_all(&self.port)
+            .map_err(|e| smolvm::Error::config("create from .smolmachine ports", e))?;
         let params = vm_common::CreateVmParams {
             secret_refs: manifest.secret_refs,
             name,
@@ -3449,7 +3487,7 @@ impl CreateCmd {
             cpus,
             mem,
             volume: self.volume.clone(),
-            port: self.port.clone(),
+            port: ports,
             net: network,
             network_backend: self.net_backend,
             dns: self.dns,
@@ -3761,8 +3799,8 @@ pub struct ForkCmd {
 
     /// Pin the clone's inbound port forwards (repeatable). Without this, the
     /// golden's forwards are remapped to freshly-allocated host ports.
-    #[arg(short = 'p', long = "port", value_parser = PortMapping::parse, value_name = "HOST:GUEST", help_heading = "Network")]
-    pub port: Vec<PortMapping>,
+    #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "HOST:GUEST", help_heading = "Network")]
+    pub port: Vec<PortMappingSpec>,
 
     /// Share the golden's loaded CUDA weights with this clone instead of
     /// copying them — sibling clones then keep ONE copy of the base model in
@@ -3804,7 +3842,11 @@ pub struct ForkCmd {
 
 impl ForkCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        let ports: Vec<(u16, u16)> = self.port.iter().map(|p| (p.host, p.guest)).collect();
+        let ports: Vec<(u16, u16)> = PortMappingSpec::expand_all(&self.port)
+            .map_err(|e| smolvm::Error::config("fork ports", e))?
+            .into_iter()
+            .map(|port| port.to_tuple())
+            .collect();
         // Parse per-fork secret refs (TrustedLocal — host env/absolute file);
         // they merge into the clone's secret_refs and resolve fresh per exec.
         let fork_secrets = parse_cli_secret_refs(&self.secret_env, &self.secret_file)?;
@@ -4253,12 +4295,12 @@ pub struct UpdateCmd {
     pub remove_volume: Vec<String>,
 
     /// Add port mapping (HOST:GUEST)
-    #[arg(short = 'p', long = "port", value_parser = PortMapping::parse, value_name = "HOST:GUEST")]
-    pub port: Vec<PortMapping>,
+    #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "HOST:GUEST")]
+    pub port: Vec<PortMappingSpec>,
 
     /// Remove port mapping (HOST:GUEST)
-    #[arg(long, value_parser = PortMapping::parse, value_name = "HOST:GUEST")]
-    pub remove_port: Vec<PortMapping>,
+    #[arg(long, value_parser = PortMappingSpec::parse, value_name = "HOST:GUEST")]
+    pub remove_port: Vec<PortMappingSpec>,
 
     /// Set vCPU count
     #[arg(long, value_name = "N")]
@@ -4361,27 +4403,35 @@ impl UpdateCmd {
         // Parse and validate new mounts (after state check so
         // "machine is running" takes priority over "directory not found")
         let new_mounts = HostMount::parse(&self.volume)?;
+        let add_ports = PortMappingSpec::expand_all(&self.port)
+            .map_err(|e| smolvm::Error::config("update ports", e))?;
+        let remove_ports = PortMappingSpec::expand_all(&self.remove_port)
+            .map_err(|e| smolvm::Error::config("update remove ports", e))?;
 
         // Validate no duplicate host ports after proposed changes
         {
             let mut final_ports: Vec<PortMapping> = record
                 .ports
                 .iter()
-                .filter(|&&(h, g)| {
-                    !self
-                        .remove_port
-                        .iter()
-                        .any(|rm| rm.host == h && rm.guest == g)
-                })
+                .filter(|&&(h, g)| !remove_ports.iter().any(|rm| rm.host == h && rm.guest == g))
                 .map(|&(h, g)| PortMapping::new(h, g))
                 .collect();
-            for p in &self.port {
+            for p in &add_ports {
                 if !final_ports
                     .iter()
                     .any(|existing| existing.host == p.host && existing.guest == p.guest)
                 {
                     final_ports.push(*p);
                 }
+            }
+            if final_ports.len() > MAX_PORT_MAPPINGS {
+                return Err(smolvm::Error::config(
+                    "update",
+                    format!(
+                        "port mappings expand to {} entries; the maximum per machine is {MAX_PORT_MAPPINGS}",
+                        final_ports.len()
+                    ),
+                ));
             }
             PortMapping::check_duplicates(&final_ports)
                 .map_err(|e| smolvm::Error::config("update", e))?;
@@ -4485,14 +4535,14 @@ impl UpdateCmd {
             }
 
             // Ports: add new, remove specified
-            for rm in &self.remove_port {
+            for rm in &remove_ports {
                 let before = r.ports.len();
                 r.ports.retain(|&(h, g)| h != rm.host || g != rm.guest);
                 if r.ports.len() < before {
                     changes.push(format!("  removed port: {}:{}", rm.host, rm.guest));
                 }
             }
-            for p in &self.port {
+            for p in &add_ports {
                 let tuple = p.to_tuple();
                 if !r.ports.contains(&tuple) {
                     changes.push(format!("  added port: {}:{}", tuple.0, tuple.1));

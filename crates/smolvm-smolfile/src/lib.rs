@@ -26,7 +26,7 @@
 //! | `auto_graph` | bool | No | Best-effort framework CUDA graphs; implies `cuda`. |
 //! | `storage` | int | No | Storage disk size in GiB. |
 //! | `overlay` | int | No | Overlay disk size in GiB. |
-//! | `ports` | string[] | No | Port mappings (`"host:guest"`). Prefer `[dev] ports`. |
+//! | `ports` | string[] | No | Port mappings (`"host:guest"` or equal-length `"host-start-host-end:guest-start-guest-end"` ranges). Prefer `[dev] ports`. |
 //! | `volumes` | string[] | No | Volume mounts (`"host:guest"`). Prefer `[dev] volumes`. |
 //! | `init` | string[] | No | Commands run on every VM start. Prefer `[dev] init`. |
 //!
@@ -42,7 +42,7 @@
 //! | `env` | string[] | Dev-only environment variables |
 //! | `init` | string[] | Bootstrap commands run on start |
 //! | `workdir` | string | Dev working directory override |
-//! | `ports` | string[] | Port mappings for development |
+//! | `ports` | string[] | Port mappings or equal-length one-to-one ranges for development |
 //!
 //! ### `[artifact]` — Pack/distribution overrides
 //!
