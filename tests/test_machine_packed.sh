@@ -154,7 +154,34 @@ test_cp_preserves_state_on_packed_vm() {
 }
 
 
+# The same at/below-/workspace volume matrix as the --image suite, against a
+# packed machine. Packed layers only change where the rootfs comes from, not how
+# the container spec's mounts are assembled, so the matrix must come out
+# identical — this is the arm that proves it rather than assuming it.
+test_packed_volume_targets_resolve_inside_guest() {
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    local pack_output="$tmpdir/vol-matrix-pack"
+
+    if ! $SMOLVM pack create --image alpine:latest -o "$pack_output" --cpus 1 --mem 512 2>&1; then
+        echo "FAIL: pack create failed, packed arm not validated"
+        rm -rf "$tmpdir"
+        return 1
+    fi
+    if [[ ! -f "$pack_output.smolmachine" ]]; then
+        echo "FAIL: no .smolmachine sidecar produced"
+        rm -rf "$tmpdir"
+        return 1
+    fi
+
+    assert_volume_targets_resolve packed --from "$pack_output.smolmachine"
+    local rc=$?
+    rm -rf "$tmpdir"
+    return $rc
+}
+
 run_test "Create from .smolmachine" test_create_from_smolmachine || true
 run_test "File cp preserves state on packed VM" test_cp_preserves_state_on_packed_vm || true
+run_test "Packed: volume targets at/below /workspace resolve in guest" test_packed_volume_targets_resolve_inside_guest || true
 
 print_summary "Packed Machine Tests"

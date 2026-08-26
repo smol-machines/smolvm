@@ -19,7 +19,8 @@ fn main() {
         image: None,
         persistent: false,
         runtime_managed: false,
-        labels: Default::default(),
+        // Spread the rest so a new spec field does not break the fixture.
+        ..Default::default()
     })
     .expect("create");
     rt.delete_machine(name).expect("first delete");

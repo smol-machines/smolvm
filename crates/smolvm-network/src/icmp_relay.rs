@@ -346,12 +346,12 @@ fn echo_request_bytes(destination: IpAddr, seq: u16, data: &[u8]) -> Vec<u8> {
 /// One's-complement sum of 16-bit words, complemented — the ICMP/IP checksum.
 fn internet_checksum(bytes: &[u8]) -> u16 {
     let mut sum: u32 = 0;
-    let mut chunks = bytes.chunks_exact(2);
-    for chunk in &mut chunks {
+    let (words, rem) = bytes.as_chunks::<2>();
+    for chunk in words {
         sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
     }
     // A trailing odd byte is padded on the right with zero.
-    if let [last] = chunks.remainder() {
+    if let [last] = rem {
         sum += (*last as u32) << 8;
     }
     while sum >> 16 != 0 {

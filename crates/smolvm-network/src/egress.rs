@@ -104,12 +104,19 @@ pub enum FloorMode {
     /// Trusted single-tenant/local override (`SMOLVM_EGRESS_ALLOW_PRIVATE=1`):
     /// floor nothing — the guest reaches exactly what the host can.
     Off,
-    /// Local default: deny ONLY the cloud-metadata link-local range
-    /// (`169.254.0.0/16`, incl. `169.254.169.254`) — never a legitimate
-    /// destination and the canonical SSRF/credential-theft target, but still
-    /// protects users running on their own cloud VM. The guest keeps reaching the
-    /// host's LAN, loopback, etc., so local behavior is reasonable and clear.
+    /// Loopback-permitted local mode (`SMOLVM_ALLOW_HOST_LOOPBACK=1`, e.g. the
+    /// `--allow-host-loopback` CLI flag): deny ONLY the cloud-metadata link-local
+    /// range, leaving the host's own loopback reachable so a developer can hit a
+    /// service on their host's `127.0.0.1` from the sandbox on purpose.
     MetadataOnly,
+    /// Local DEFAULT: deny the cloud-metadata link-local range
+    /// (`169.254.0.0/16`, incl. `169.254.169.254`) AND the host's own loopback
+    /// (`127.0.0.0/8`, `::1`, `0.0.0.0`/`::`). A guest reaching `127.0.0.1`
+    /// means "myself", but the gateway would forward it to the HOST's loopback —
+    /// a confused-deputy path onto host debuggers, Docker, and local databases.
+    /// The host's LAN stays reachable (legitimate local dev), and an explicit
+    /// allow-list entry can also re-open loopback (see [`EgressPolicy::allows`]).
+    MetadataAndLoopback,
     /// Multi-tenant/fleet (`SMOLVM_PUBLISH_ADDR` set): the full floor — metadata,
     /// host/control internal subnets, loopback, link/unique-local, and the
     /// gateway CGNAT range — so a guest can't steal host credentials, pivot to
@@ -148,11 +155,26 @@ fn floor_mode() -> FloorMode {
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     if allow_private {
-        FloorMode::Off
-    } else if std::env::var_os("SMOLVM_PUBLISH_ADDR").is_some() {
-        FloorMode::Strict
-    } else {
+        return FloorMode::Off;
+    }
+    // Fleet mode is absolute: no env flag relaxes Strict once
+    // `SMOLVM_PUBLISH_ADDR` is set, so host loopback / control-plane doors stay
+    // shut on a multi-tenant node.
+    if std::env::var_os("SMOLVM_PUBLISH_ADDR").is_some() {
+        return FloorMode::Strict;
+    }
+    // Fork default: inverted vs upstream — this fork keeps host loopback
+    // reachable locally (the loopback-forwarding feature relies on it), so
+    // `MetadataOnly` is the default and `SMOLVM_ALLOW_HOST_LOOPBACK=0` opts
+    // into upstream's hardened `MetadataAndLoopback` floor. Fleet mode above
+    // is unaffected.
+    let allow_host_loopback = std::env::var("SMOLVM_ALLOW_HOST_LOOPBACK")
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true);
+    if allow_host_loopback {
         FloorMode::MetadataOnly
+    } else {
+        FloorMode::MetadataAndLoopback
     }
 }
 
@@ -165,6 +187,24 @@ fn is_link_local(ip: IpAddr) -> bool {
         IpAddr::V6(v6) => {
             (v6.segments()[0] & 0xffc0) == 0xfe80
                 || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_link_local())
+        }
+    }
+}
+
+/// The host's own loopback / unspecified addresses — what `127.0.0.1` and `::1`
+/// mean to the guest, but which the gateway forwards to the HOST. Floored in
+/// every mode except `Off`; re-openable in the local modes only by an explicit
+/// static allow-list entry (never a learned DNS IP, so it can't be reached by
+/// rebinding). Covers the IPv4-mapped IPv6 form so it can't be smuggled past.
+fn is_host_loopback(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_unspecified(),
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6
+                    .to_ipv4_mapped()
+                    .is_some_and(|v4| v4.is_loopback() || v4.is_unspecified())
         }
     }
 }
@@ -188,6 +228,7 @@ pub fn is_floored(ip: IpAddr, mode: FloorMode) -> bool {
     match mode {
         FloorMode::Off => false,
         FloorMode::MetadataOnly => is_link_local(ip),
+        FloorMode::MetadataAndLoopback => is_link_local(ip) || is_host_loopback(ip),
         FloorMode::Strict => match ip {
             IpAddr::V4(v4) => is_reserved_v4(v4),
             IpAddr::V6(v6) => {
@@ -210,6 +251,10 @@ pub struct EgressPolicy {
     inner: Option<Arc<AllowList>>,
     /// Hard-floor scope, resolved once from the deployment context at creation.
     floor: FloorMode,
+    /// Audit sink for denials. When set, every denied connect/sendto/resolve is
+    /// appended here in addition to the runtime's stderr line, so the record
+    /// can't be evicted by ordinary connection chatter in the boot log.
+    denial_log: Option<Arc<std::path::PathBuf>>,
 }
 
 impl EgressPolicy {
@@ -218,6 +263,7 @@ impl EgressPolicy {
         Self {
             inner: None,
             floor: floor_mode(),
+            denial_log: None,
         }
     }
 
@@ -253,10 +299,50 @@ impl EgressPolicy {
                 learned: Mutex::new(HashMap::new()),
             })),
             floor: floor_mode(),
+            denial_log: None,
         }
     }
 
-    /// Convenience for the CIDR-only case.
+    /// Attach the audit sink denials are appended to. The launcher points this
+    /// at the machine's data dir so the host can read denials back.
+    pub fn with_denial_log(mut self, path: std::path::PathBuf) -> Self {
+        self.denial_log = Some(Arc::new(path));
+        self
+    }
+
+    /// Record one denial: a stderr line for anyone tailing the boot log, and —
+    /// when a sink is attached — an appended line in the dedicated audit file,
+    /// which connection chatter can never evict. Keep the marker text stable:
+    /// the host's `read_egress_denials` parses `egress policy denied <op> <dest>`.
+    ///
+    /// The sink rotates once past 8 MiB (`.1` suffix) so a workload hammering a
+    /// denied destination at packet rate can't fill the host disk.
+    pub fn record_denial(&self, operation: &str, dest: &dyn std::fmt::Display) {
+        crate::virtio_net_log!("egress policy denied {} {}", operation, dest);
+        let Some(path) = self.denial_log.as_deref() else {
+            return;
+        };
+        const ROTATE_BYTES: u64 = 8 * 1024 * 1024;
+        if std::fs::metadata(path).is_ok_and(|m| m.len() > ROTATE_BYTES) {
+            let _ = std::fs::rename(path, path.with_extension("log.1"));
+        }
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(
+                file,
+                "{}",
+                crate::format_network_log_line(
+                    std::time::SystemTime::now(),
+                    &format!("egress policy denied {operation} {dest}"),
+                )
+            );
+        }
+    }
+
     pub fn from_allowed_cidrs(allowed: Option<&[String]>) -> Self {
         Self::new(allowed, None)
     }
@@ -287,9 +373,24 @@ impl EgressPolicy {
 
     /// Whether an outbound connection to `ip` (v4 or v6) is permitted.
     pub fn allows(&self, ip: IpAddr) -> bool {
-        // Platform hard-floor: deny per the resolved FloorMode (metadata-only
-        // locally, full floor under fleet mode) regardless of the allow-list.
+        // Platform hard-floor: deny per the resolved FloorMode (metadata + host
+        // loopback locally, the full internal floor under fleet mode). The floor
+        // is absolute under `Strict`; in the softer local modes an EXPLICIT
+        // static allow-list CIDR (`--allow-cidr`, `--outbound-localhost-only`)
+        // may deliberately re-open a floored destination — e.g. reaching a dev
+        // server on the host's 127.0.0.1. A learned DNS IP never qualifies, so
+        // the floor still defeats DNS rebinding.
         if is_floored(ip, self.floor) {
+            // Only host loopback, floored by the local default, may be
+            // deliberately re-opened by an explicit static CIDR. Cloud-metadata
+            // (link-local) and — under Strict — the internal ranges stay
+            // absolute: no allow-list entry can re-expose the credential door.
+            if self.floor != FloorMode::Strict && is_host_loopback(ip) {
+                return self
+                    .inner
+                    .as_ref()
+                    .is_some_and(|list| list.cidrs.iter().any(|cidr| cidr.contains(ip)));
+            }
             return false;
         }
         match &self.inner {
@@ -361,6 +462,8 @@ impl Policy for EgressPolicy {
                     "virtio-net: blocking DNS query by allow-host policy name={}",
                     name
                 );
+                // Standardized marker for the egress audit trail (`read_egress_denials`).
+                self.record_denial("resolve", &name);
                 DnsDecision::Immediate(dns::error_response(query, dns::DNS_RCODE_NXDOMAIN))
             }
             None => DnsDecision::Immediate(dns::error_response(query, dns::DNS_RCODE_SERVFAIL)),
@@ -369,6 +472,10 @@ impl Policy for EgressPolicy {
 
     fn learn(&self, answer: &[u8]) {
         self.learn_ip_records(&dns::answer_ip_records(answer));
+    }
+
+    fn denied(&self, operation: &str, dest: &dyn std::fmt::Display) {
+        self.record_denial(operation, dest);
     }
 }
 
@@ -425,17 +532,52 @@ mod tests {
 
     #[test]
     fn unrestricted_local_floors_only_metadata() {
-        // Local default (no fleet mode): only the cloud-metadata link-local range
-        // is denied; the host's LAN, loopback, and CGNAT stay reachable — so a
-        // local VM behaves predictably.
+        // Local default (no fleet mode): only the cloud-metadata link-local
+        // range is denied — the fork keeps host loopback reachable by default
+        // (`SMOLVM_ALLOW_HOST_LOOPBACK=0` opts into the harder floor). The
+        // host's LAN and CGNAT stay reachable, so a local VM behaves predictably.
         let p = EgressPolicy::unrestricted();
         assert!(!p.allows_v4(Ipv4Addr::new(169, 254, 169, 254))); // metadata: denied
-        assert!(p.allows_v4(Ipv4Addr::new(10, 0, 0, 4))); // LAN: reachable
         assert!(p.allows_v4(Ipv4Addr::new(127, 0, 0, 1))); // loopback: reachable
+        assert!(p.allows_v4(Ipv4Addr::new(10, 0, 0, 4))); // LAN: reachable
         assert!(p.allows_v4(Ipv4Addr::new(192, 168, 1, 1)));
         assert!(p.allows_v4(Ipv4Addr::new(172, 16, 0, 1)));
         assert!(p.allows_v4(Ipv4Addr::new(100, 96, 0, 1))); // CGNAT: reachable
         assert!(p.allows_v4(Ipv4Addr::new(1, 1, 1, 1))); // public: reachable
+    }
+
+    #[test]
+    fn explicit_cidr_reopens_loopback_locally_but_learned_ip_does_not() {
+        // Under the hardened local floor (upstream's default), a developer who
+        // deliberately allow-lists loopback CAN reach a host service on
+        // 127.0.0.1. Constructed directly so the test pins this floor mode
+        // regardless of the environment-defaulted one.
+        let local = EgressPolicy {
+            inner: Some(Arc::new(AllowList {
+                cidrs: vec![Cidr::parse("127.0.0.1/32").unwrap()],
+                allowed_hosts: None,
+                learned: Mutex::new(HashMap::new()),
+            })),
+            floor: FloorMode::MetadataAndLoopback,
+            denial_log: None,
+        };
+        assert!(local.allows_v4(Ipv4Addr::new(127, 0, 0, 1)));
+        // ...but only the named address — a sibling loopback IP stays floored.
+        assert!(!local.allows_v4(Ipv4Addr::new(127, 0, 0, 2)));
+        // A learned DNS answer for loopback never re-opens it (anti-rebinding):
+        // only a static CIDR defeats the floor, and Strict keeps it absolute
+        // (see `floor_strict_blocks_internal_and_metadata`).
+        let learned = EgressPolicy {
+            inner: Some(Arc::new(AllowList {
+                cidrs: vec![],
+                allowed_hosts: Some(vec!["evil.test".into()]),
+                learned: Mutex::new(HashMap::new()),
+            })),
+            floor: FloorMode::MetadataAndLoopback,
+            denial_log: None,
+        };
+        learned.learn_ip_records(&[(IpAddr::V4(Ipv4Addr::LOCALHOST), 300)]);
+        assert!(!learned.allows_v4(Ipv4Addr::LOCALHOST));
     }
 
     #[test]
@@ -455,7 +597,7 @@ mod tests {
 
     #[test]
     fn metadata_floor_blocks_mapped_and_v6_link_local() {
-        let p = EgressPolicy::unrestricted(); // MetadataOnly default
+        let p = EgressPolicy::unrestricted(); // MetadataAndLoopback default
                                               // mapped metadata + v6 link-local are denied...
         assert!(!p.allows_v6("::ffff:169.254.169.254".parse().unwrap()));
         assert!(!p.allows_v6("fe80::1".parse().unwrap()));
@@ -542,28 +684,55 @@ mod tests {
     }
 
     #[test]
-    fn floor_metadata_only_blocks_just_link_local() {
-        // Local default: only the cloud-metadata link-local range is denied; the
-        // host's LAN, loopback and the public internet stay reachable.
-        assert!(is_floored(v4(169, 254, 169, 254), FloorMode::MetadataOnly));
-        assert!(is_floored(v4(169, 254, 0, 1), FloorMode::MetadataOnly));
+    fn floor_default_blocks_link_local_and_loopback() {
+        // Local default: the cloud-metadata link-local range AND host loopback /
+        // unspecified are denied; the host's LAN and the public internet stay
+        // reachable.
+        for ip in [
+            v4(169, 254, 169, 254),
+            v4(169, 254, 0, 1),
+            v4(127, 0, 0, 1), // loopback
+            v4(127, 1, 2, 3),
+            v4(0, 0, 0, 0), // unspecified
+        ] {
+            assert!(
+                is_floored(ip, FloorMode::MetadataAndLoopback),
+                "{ip} should be floored locally"
+            );
+        }
         for ip in [
             v4(8, 8, 8, 8),
             v4(192, 168, 1, 5),
             v4(10, 0, 0, 7),
-            v4(127, 0, 0, 1),
             v4(172, 16, 5, 5),
         ] {
             assert!(
-                !is_floored(ip, FloorMode::MetadataOnly),
+                !is_floored(ip, FloorMode::MetadataAndLoopback),
                 "{ip} should be reachable locally"
             );
         }
-        // IPv4-mapped metadata must not slip past.
+        // IPv4-mapped metadata and loopback must not slip past via the v6 form.
         assert!(is_floored(
             "::ffff:169.254.169.254".parse().unwrap(),
-            FloorMode::MetadataOnly
+            FloorMode::MetadataAndLoopback
         ));
+        assert!(is_floored(
+            "::1".parse().unwrap(),
+            FloorMode::MetadataAndLoopback
+        ));
+        assert!(is_floored(
+            "::ffff:127.0.0.1".parse().unwrap(),
+            FloorMode::MetadataAndLoopback
+        ));
+    }
+
+    #[test]
+    fn floor_metadata_only_allows_loopback() {
+        // The `--allow-host-loopback` mode floors cloud-metadata but lets a guest
+        // reach the host's own 127.0.0.1 on purpose.
+        assert!(is_floored(v4(169, 254, 169, 254), FloorMode::MetadataOnly));
+        assert!(!is_floored(v4(127, 0, 0, 1), FloorMode::MetadataOnly));
+        assert!(!is_floored(v4(0, 0, 0, 0), FloorMode::MetadataOnly));
     }
 
     #[test]

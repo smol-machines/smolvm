@@ -27,7 +27,7 @@ pub struct ApiState {
     /// Reserved machine names (creation in progress).
     /// This prevents race conditions during machine creation.
     reserved_names: RwLock<HashSet<String>>,
-    /// Per-machine lifecycle locks serializing start/stop/delete/restart.
+    /// Per-machine lifecycle locks serializing start/stop/delete/restart/fork.
     ///
     /// On macOS, stop/delete `hdiutil`-detach a machine's case-sensitive
     /// packed-layers volume while a concurrent start acquires+mounts+launches
@@ -39,10 +39,12 @@ pub struct ApiState {
     /// for the whole operation, so mount and detach can never interleave for one
     /// machine. Lock order is lifecycle (tokio, async) → entry (parking_lot,
     /// inside `spawn_blocking`); no entry-holding path ever takes lifecycle, so
-    /// there is no inversion. On Linux the guarded detach/mount are compile-time
-    /// no-ops, making this harmless serialization. Scope: the API server only —
-    /// the embedded (`control.rs`) and CLI (`vm_common.rs`) paths are separate
-    /// processes with no shared in-process lock.
+    /// there is no inversion. Forks that need two lifecycle locks take the
+    /// golden before the clone, matching the pool controller. On Linux the
+    /// guarded detach/mount are compile-time no-ops, making this harmless
+    /// serialization. Scope: the API server only — the embedded (`control.rs`)
+    /// and CLI (`vm_common.rs`) paths are separate processes with no shared
+    /// in-process lock.
     ///
     /// Entries are created on first use and never removed: the map is bounded by
     /// the number of distinct machine names, so a retained `Arc<Mutex<()>>` per
@@ -70,6 +72,15 @@ pub struct ApiState {
     /// Runtime-only CUDA pool admission state. Durable pool configuration lives
     /// in SQLite; learned telemetry is intentionally rebuilt after a restart.
     admission: crate::api::admission::AdmissionRegistry,
+    /// Latest node-wide CUDA inventory and telemetry from the controller's
+    /// existing NVML sampler. The timestamp prevents `/capacity` from
+    /// advertising stale GPUs if the sampling loop stops making progress.
+    cuda_devices: parking_lot::Mutex<
+        Option<(
+            std::time::Instant,
+            Vec<crate::api::admission::GpuDeviceSample>,
+        )>,
+    >,
     /// Advisory wake-up for the automatic fork-pool reconciler. Durable SQLite
     /// state remains authoritative; this only removes the polling delay after a
     /// pool mutation while the periodic pass remains the recovery fallback.
@@ -118,6 +129,8 @@ pub struct MachineRegistration {
     pub manager: AgentManager,
     /// Host mounts to configure.
     pub mounts: Vec<MountSpec>,
+    /// Remote volumes (`s3://`) to mount in the workload.
+    pub remote_volumes: Vec<crate::remote_volume::RemoteVolume>,
     /// Port mappings to configure.
     pub ports: Vec<PortSpec>,
     /// VM resources to configure.
@@ -242,6 +255,7 @@ impl ApiState {
             started_at: std::time::Instant::now(),
             runtime_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
             admission: crate::api::admission::AdmissionRegistry::default(),
+            cuda_devices: parking_lot::Mutex::new(None),
             pool_reconcile: Arc::new(tokio::sync::Notify::new()),
             rollout: crate::api::rollout::RolloutRegistry::default(),
         })
@@ -260,6 +274,7 @@ impl ApiState {
             started_at: std::time::Instant::now(),
             runtime_heartbeat_ms: std::sync::atomic::AtomicU64::new(0),
             admission: crate::api::admission::AdmissionRegistry::default(),
+            cuda_devices: parking_lot::Mutex::new(None),
             pool_reconcile: Arc::new(tokio::sync::Notify::new()),
             rollout: crate::api::rollout::RolloutRegistry::default(),
         }
@@ -269,6 +284,28 @@ impl ApiState {
     /// the atomic lease claim path.
     pub fn admission(&self) -> &crate::api::admission::AdmissionRegistry {
         &self.admission
+    }
+
+    /// Publish the latest node-wide CUDA sample. `None` clears previously
+    /// advertised devices after an NVML failure instead of leaving schedulers
+    /// with stale capacity.
+    pub(crate) fn record_cuda_devices(
+        &self,
+        devices: Option<Vec<crate::api::admission::GpuDeviceSample>>,
+    ) {
+        *self.cuda_devices.lock() = devices.map(|devices| (std::time::Instant::now(), devices));
+    }
+
+    /// Return fresh CUDA telemetry for the node capacity endpoint. The pool
+    /// controller samples every second; five seconds leaves ample scheduling
+    /// jitter while failing closed if that controller stalls or exits.
+    pub(crate) fn cuda_devices(&self) -> Option<Vec<crate::api::admission::GpuDeviceSample>> {
+        const MAX_AGE: std::time::Duration = std::time::Duration::from_secs(5);
+        self.cuda_devices
+            .lock()
+            .as_ref()
+            .filter(|(sampled_at, _)| sampled_at.elapsed() <= MAX_AGE)
+            .map(|(_, devices)| devices.clone())
     }
 
     /// Wake the automatic pool controller after durable pool state changes.
@@ -516,7 +553,7 @@ impl ApiState {
     /// Get the per-machine lifecycle lock for `name`, creating it on first use.
     ///
     /// Callers `.lock().await` the returned mutex at the top of
-    /// start/stop/delete/restart and hold the guard for the whole operation so
+    /// start/stop/delete/restart/fork and hold the guard for the whole operation so
     /// the macOS layers-volume mount (start) and detach (stop/delete) can never
     /// interleave for one machine. See the `lifecycle_locks` field docs for the
     /// lock-ordering and scope contract.
@@ -884,6 +921,10 @@ impl ApiState {
         record.env = reg.env;
         record.workdir = reg.workdir;
         record.secret_refs = reg.secret_refs.clone();
+        record.remote_volumes = reg.remote_volumes.clone();
+        record
+            .validate_remote_volumes()
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
         // A registry image with no network can never be pulled (the guest runs
         // the pull), so reject with a 400 here instead of persisting a machine
@@ -1359,6 +1400,10 @@ async fn relaunch_image_workload(
         crate::api::handlers::record_secret_refs_env(entry)
             .map_err(|e| crate::Error::agent("resolve workload secrets", format!("{e:?}")))?,
     ));
+    // Remote volumes mount inside the workload container; build the mount script
+    // here and let the agent run it ahead of the image-resolved command, so a
+    // service image's own entrypoint is preserved rather than clobbered.
+    let s3_volumes = crate::remote_volume::to_s3_volumes(&record.remote_volumes, &env);
     let workdir = record.workdir.clone();
     let user = record.user.clone();
     let mounts_config = {
@@ -1369,7 +1414,11 @@ async fn relaunch_image_workload(
             .map(|(i, m)| (HostMount::mount_tag(i), m.target.clone(), m.readonly))
             .collect::<Vec<_>>()
     };
-    let overlay_id = crate::workload::persistent_overlay_owner(name, record.golden.as_deref());
+    let overlay_id = crate::workload::persistent_overlay_owner_with_lineage(
+        name,
+        record.golden.as_deref(),
+        record.fork_overlay_owner.as_deref(),
+    );
 
     let image_pull = image.clone();
     with_machine_client_traced(entry, None, move |c| {
@@ -1387,7 +1436,8 @@ async fn relaunch_image_workload(
             .with_workdir(workdir)
             .with_user(user)
             .with_mounts(mounts_config)
-            .with_persistent_overlay(Some(overlay_id));
+            .with_persistent_overlay(Some(overlay_id))
+            .with_s3_volumes(s3_volumes);
         c.run_container_detached(config).map(|_| ())
     })
     .await
@@ -1474,6 +1524,7 @@ pub fn resource_spec_to_vm_resources(spec: &ResourceSpec, network: bool) -> VmRe
         // Custom DNS is a local-CLI feature for now; the cloud ResourceSpec
         // does not expose it, so API-launched VMs inherit the backend default.
         dns: None,
+        network_name: None,
     }
 }
 
@@ -1555,6 +1606,8 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
             .collect(),
         ports: entry.ports.clone(),
         network: entry.network,
+        gpu: entry.resources.gpu.unwrap_or(false),
+        cuda: entry.resources.cuda.unwrap_or(false),
         network_backend: entry.resources.network_backend,
         allowed_cidrs: entry.resources.allowed_cidrs.clone(),
         allowed_hosts: entry.resources.allowed_hosts.clone(),
@@ -1597,6 +1650,25 @@ mod tests {
 
         assert!(notify.notified().now_or_never().is_some());
         assert!(notify.notified().now_or_never().is_none());
+    }
+
+    #[test]
+    fn stale_cuda_inventory_fails_closed() {
+        let (_dir, state) = temp_api_state();
+        state.record_cuda_devices(Some(vec![crate::api::admission::GpuDeviceSample {
+            device_ordinal: 0,
+            uuid: "GPU-test".into(),
+            name: "test".into(),
+            utilization_percent: 0.0,
+            used_memory_mib: 0,
+            free_memory_mib: 80_000,
+            total_memory_mib: 80_000,
+        }]));
+        assert_eq!(state.cuda_devices().unwrap().len(), 1);
+
+        state.cuda_devices.lock().as_mut().unwrap().0 =
+            std::time::Instant::now() - std::time::Duration::from_secs(6);
+        assert!(state.cuda_devices().is_none());
     }
 
     #[test]

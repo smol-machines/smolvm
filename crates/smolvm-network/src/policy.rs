@@ -5,6 +5,7 @@
 //! with the `allowed_cidrs` + `--allow-host` semantics libkrun's TSI path
 //! uses.
 
+use std::fmt;
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -42,6 +43,11 @@ pub trait Policy: Send + Sync {
     /// An upstream answer to a query [`Self::dns`] asked to learn from. The
     /// answer echoes its question, so the name is recoverable.
     fn learn(&self, _answer: &[u8]) {}
+
+    /// A flow was denied. Called once per denied destination — not per packet —
+    /// on the gateway's poll thread; the built-in policy appends it to the
+    /// machine's egress audit log (`read_egress_denials` reads that file back).
+    fn denied(&self, _operation: &str, _dest: &dyn fmt::Display) {}
 
     /// Whether every DNS query must reach [`Self::dns`], even TCP/53 to a
     /// resolver the guest picked. A policy that *answers* names must set it, or

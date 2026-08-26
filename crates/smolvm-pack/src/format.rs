@@ -435,6 +435,14 @@ pub struct AssetInventory {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_template: Option<AssetEntry>,
 
+    /// Original sparse size of a VM-mode storage disk, in bytes.
+    ///
+    /// Like the root overlay, a stopped VM's storage disk is packed without its
+    /// trailing hole and must be extended to this size before it is used as a
+    /// raw backing disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_logical_size: Option<u64>,
+
     /// Overlay disk template (optional, VM mode only).
     /// Contains the VM's persistent rootfs state from a `--from-vm` pack.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -509,6 +517,7 @@ impl PackManifest {
                 },
                 layers: Vec::new(),
                 storage_template: None,
+                storage_logical_size: None,
                 overlay_template: None,
                 overlay_logical_size: None,
             },

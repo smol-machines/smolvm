@@ -236,11 +236,18 @@ EOF
 }
 
 
+# The at/below-/workspace volume matrix against a registry --image machine.
+# The driver and the reasoning live in common.sh.
+test_image_volume_targets_resolve_inside_guest() {
+    assert_volume_targets_resolve img --image alpine:latest --net
+}
+
 run_test "Volume: mount visible to exec" test_machine_volume_mount_visible_to_exec || true
 run_test "Volume: -v host:/workspace is virtiofs not symlink" test_volume_mount_workspace_is_virtiofs_not_symlink || true
 run_test "Volume: arbitrary mount path (/data)" test_volume_mount_arbitrary_path || true
 run_test "Volume: default /workspace symlink without -v" test_default_workspace_symlink_without_volume || true
 run_test "Create with --image: volume mount visible to exec" test_image_exec_volume_mount_visible || true
 run_test "Create with --image: Smolfile volumes visible to exec" test_image_exec_volume_mount_visible_smolfile || true
+run_test "Create with --image: volume targets at/below /workspace resolve in guest" test_image_volume_targets_resolve_inside_guest || true
 
 print_summary "Volume Tests"

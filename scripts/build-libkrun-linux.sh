@@ -123,7 +123,7 @@ else
 fi
 
 # --- 4. libkrun (VMM) --------------------------------------------------------
-echo "--- building libkrun (BLK=1 NET=1 ${GPU_FLAG}) ---"
+echo "--- building libkrun (BLK=1 NET=1 INPUT=1 ${GPU_FLAG}) ---"
 # Link with partial RELRO (lazy binding), NOT full RELRO. The GPU-enabled libkrun
 # carries a hard virglrenderer NEEDED that build-dist.sh strips via patchelf so
 # non-GPU hosts can dlopen it (paired with RTLD_LAZY in src/agent/krun.rs). That
@@ -133,7 +133,7 @@ echo "--- building libkrun (BLK=1 NET=1 ${GPU_FLAG}) ---"
 ( cd libkrun && make clean >/dev/null 2>&1 || true; \
   env "${INIT_ENV[@]}" \
   RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C relro-level=partial" \
-  make --no-print-directory BLK=1 NET=1 "${GPU_FLAG}" )
+  make --no-print-directory BLK=1 NET=1 INPUT=1 "${GPU_FLAG}" )
 KRUN_SO="$(ls -1 libkrun/target/release/libkrun.so.*.*.* 2>/dev/null | head -1)"
 [[ -n "$KRUN_SO" ]] || { echo "ERROR: libkrun build produced no .so" >&2; exit 1; }
 

@@ -18,6 +18,38 @@
 
 use serde::{Deserialize, Serialize};
 
+/// One S3-compatible bucket to mount inside the workload container.
+///
+/// Structured rather than a shell command: the agent mounts it natively, so
+/// nothing has to be installed in the image and no command is interpolated.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct S3Volume {
+    /// Service endpoint, e.g. `https://s3.us-east-1.amazonaws.com` or a
+    /// self-hosted `http://minio:9000`.
+    pub endpoint: String,
+    /// Region used for request signing.
+    pub region: String,
+    /// Bucket to mount.
+    pub bucket: String,
+    /// Optional key prefix, so a mount can expose one sub-tree of a bucket.
+    #[serde(default)]
+    pub prefix: String,
+    /// Absolute path inside the container where the bucket appears.
+    pub mountpoint: String,
+    /// Mount read-only; the kernel then rejects writes before they reach us.
+    #[serde(default)]
+    pub read_only: bool,
+    /// Access key. Absent (with the secret) means anonymous access.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_key_id: Option<String>,
+    /// Secret key paired with `access_key_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_access_key: Option<String>,
+    /// Session token, when temporary credentials are in use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_token: Option<String>,
+}
+
 pub mod forkpoint;
 pub mod guest_env;
 pub mod image_ref;
@@ -432,6 +464,11 @@ pub enum AgentRequest {
         /// Incompatible with `interactive` and `tty`.
         #[serde(default)]
         background: bool,
+        /// S3 volumes to mount into the workload container. The agent mounts
+        /// them between `crun create` and `crun start`, so the workload's first
+        /// instruction already sees them and its command is never rewritten.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        s3_volumes: Vec<S3Volume>,
     },
 
     /// Send stdin data to a running interactive command.
@@ -467,6 +504,12 @@ pub enum AgentRequest {
         /// File mode (e.g., 0o644). None = default (0644).
         #[serde(default)]
         mode: Option<u32>,
+        /// Owner uid to apply after the write. None = leave as written (root).
+        #[serde(default)]
+        uid: Option<u32>,
+        /// Owner gid to apply after the write. None = leave as written (root).
+        #[serde(default)]
+        gid: Option<u32>,
     },
 
     /// Open a streaming file upload session on this connection.
@@ -484,6 +527,12 @@ pub enum AgentRequest {
         /// File mode (e.g., 0o644). None = default (0644).
         #[serde(default)]
         mode: Option<u32>,
+        /// Owner uid to apply on finalize. None = leave as written (root).
+        #[serde(default)]
+        uid: Option<u32>,
+        /// Owner gid to apply on finalize. None = leave as written (root).
+        #[serde(default)]
+        gid: Option<u32>,
         /// Expected total size in bytes. Rejected if it exceeds
         /// [`FILE_TRANSFER_MAX_TOTAL`]. The agent uses this for an
         /// early-fail check only; the actual size written is the sum
@@ -1222,6 +1271,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn file_write_without_owner_fields_still_parses() {
+        // Requests from clients predating uid/gid must keep deserializing.
+        let old = r#"{"method":"file_write","path":"/x","data":"aGk=","mode":420}"#;
+        let req: AgentRequest = serde_json::from_str(old).unwrap();
+        match req {
+            AgentRequest::FileWrite { mode, uid, gid, .. } => {
+                assert_eq!(mode, Some(420));
+                assert_eq!(uid, None);
+                assert_eq!(gid, None);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_encode_decode_roundtrip() {
         let req = AgentRequest::Pull {
             image: "alpine:latest".to_string(),
@@ -1370,6 +1434,8 @@ mod tests {
         let req = AgentRequest::FileWriteBegin {
             path: "/tmp/target".into(),
             mode: Some(0o600),
+            uid: Some(1000),
+            gid: Some(1000),
             total_size: 123_456_789,
         };
         let bytes = encode_message(&req).unwrap();
@@ -1378,10 +1444,14 @@ mod tests {
             AgentRequest::FileWriteBegin {
                 path,
                 mode,
+                uid,
+                gid,
                 total_size,
             } => {
                 assert_eq!(path, "/tmp/target");
                 assert_eq!(mode, Some(0o600));
+                assert_eq!(uid, Some(1000));
+                assert_eq!(gid, Some(1000));
                 assert_eq!(total_size, 123_456_789);
             }
             _ => panic!("wrong variant"),

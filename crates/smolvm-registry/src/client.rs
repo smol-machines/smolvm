@@ -9,7 +9,7 @@
 
 use crate::{OciIndex, OciPlatform, RegistryError, Result, INDEX_MEDIA_TYPE, MANIFEST_MEDIA_TYPE};
 use reqwest::header::{
-    ACCEPT, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, LINK, LOCATION, WWW_AUTHENTICATE,
+    ACCEPT, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, LINK, LOCATION, RANGE, WWW_AUTHENTICATE,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -27,6 +27,67 @@ const MAX_MANIFEST_BYTES: usize = 32 * 1024 * 1024;
 /// [`RegistryClient::pull_blob_stream`], which streams to disk. 64 MiB is a
 /// generous ceiling that still bounds the in-memory buffer.
 const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
+
+/// How long to wait for a connection to the registry.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a response may go without delivering any bytes.
+///
+/// This is a gap-between-reads deadline, NOT a deadline on the whole transfer,
+/// which is the distinction that matters for a multi-hundred-megabyte layer: a
+/// slow-but-progressing download runs as long as it needs, while a registry that
+/// accepts the connection and then goes silent fails in seconds. A whole-request
+/// `timeout()` cannot be used here — it would abort large healthy pulls. Without
+/// either one, a half-open connection parks the caller forever: the request task
+/// never wakes, and enough of them turn a node into one that accepts creates and
+/// completes none.
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Floor for the whole-request deadline on upload steps, covering the server's
+/// post-body work (committing a blob to backing storage can take a minute).
+const UPLOAD_TIMEOUT_FLOOR: Duration = Duration::from_secs(300);
+
+/// Minimum sustained upload rate assumed when sizing an upload deadline.
+///
+/// Anything slower than this on a multi-gigabyte blob is indistinguishable from
+/// a stalled connection; the deadline exists as a runaway bound, not a pace car.
+const UPLOAD_MIN_RATE: u64 = 256 * 1024;
+
+/// Chunk size for the chunked-upload fallback (see
+/// [`RegistryClient::push_blob_file`]).
+///
+/// Small enough that one chunk transmits well inside a registry's ~60 s
+/// body-read deadline even at [`UPLOAD_MIN_RATE`] (8 MiB / 256 KiB/s = 32 s),
+/// uniform per chunk with only the final one short — the shape S3-compatible
+/// multipart backends require.
+const FALLBACK_CHUNK_SIZE: usize = 8 * 1024 * 1024;
+
+/// The shared HTTP client for every registry request, with the deadlines above.
+fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(READ_TIMEOUT)
+        .build()
+        // A builder failure here means no TLS backend; the default client at
+        // least keeps the caller working (timeouts are the thing lost).
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// The client for requests that UPLOAD a body: no `read_timeout`.
+///
+/// `read_timeout` is a gap-between-reads deadline, and an upload produces no
+/// readable bytes until the server has consumed the whole body AND finished
+/// committing it — for a multi-gigabyte blob that silence easily exceeds any
+/// sane read gap, so the shared client kills every large push mid-body ("error
+/// sending request"). Uploads instead get a whole-request deadline scaled to
+/// the body size (see [`RegistryClient::upload_request`]), which bounds a
+/// stalled transfer without capping a slow-but-progressing one.
+fn upload_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
 
 /// Buffer a response body into memory, refusing to read more than `cap` bytes.
 ///
@@ -76,6 +137,9 @@ pub fn validate_digest(digest: &str) -> Result<()> {
 /// HTTP client for an OCI Distribution registry.
 pub struct RegistryClient {
     http: reqwest::Client,
+    /// Separate client for body-bearing upload steps (no read timeout — see
+    /// [`upload_http_client`]).
+    upload_http: reqwest::Client,
     /// Base URL including scheme (e.g., "http://localhost:5000" or "https://registry.smolmachines.com").
     base_url: String,
     /// Optional Bearer token sent directly to the registry for authenticated requests.
@@ -102,7 +166,8 @@ impl RegistryClient {
     /// Create a new client for the given registry base URL.
     pub fn new(base_url: String) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: http_client(),
+            upload_http: upload_http_client(),
             base_url,
             auth_token: None,
             identity_token: None,
@@ -231,7 +296,7 @@ impl RegistryClient {
 
         let resp = self
             .send_replayable(
-                self.request(reqwest::Method::PUT, &put_url)
+                self.upload_request(reqwest::Method::PUT, &put_url, data.len() as u64)
                     .header(CONTENT_TYPE, "application/octet-stream")
                     .header(CONTENT_LENGTH, data.len())
                     .body(data.to_vec()),
@@ -352,7 +417,7 @@ impl RegistryClient {
         // encoding for streamed bodies, which some registries reject.
         // The factory is called once per attempt (preemptive + up to 2 retries).
         let base_req = self
-            .request(reqwest::Method::PUT, &put_url)
+            .upload_request(reqwest::Method::PUT, &put_url, size)
             .header(CONTENT_TYPE, "application/octet-stream")
             .header(CONTENT_LENGTH, size);
 
@@ -366,6 +431,60 @@ impl RegistryClient {
         }
 
         Ok(())
+    }
+
+    /// Upload a blob from a file, monolithically first, falling back to OCI
+    /// **chunked** mode when the single-request upload is rejected.
+    ///
+    /// The monolithic PUT is one request carrying the whole blob, which some
+    /// registry stacks cannot accept for large blobs: a proxy may cap the body
+    /// (413), and a registry may enforce a deadline on receiving the request
+    /// body — zot cuts the connection ~60 s in, so any blob that takes longer
+    /// than that to transmit can NEVER go through in one request, regardless of
+    /// client patience. Chunked mode keeps every request small enough to finish
+    /// well inside any such window.
+    ///
+    /// The fallback triggers on transport errors and 5xx/413 — responses that
+    /// say "this request couldn't be carried", not "you may not do this"
+    /// (auth and 4xx client errors fail fast; retrying those differently
+    /// cannot help).
+    pub async fn push_blob_file(
+        &self,
+        repo: &str,
+        digest: &str,
+        path: &std::path::Path,
+    ) -> Result<()> {
+        let size = tokio::fs::metadata(path).await?.len();
+        let stream_path = path.to_path_buf();
+        let attempt = self
+            .push_blob_stream(repo, digest, size, move || {
+                let file = std::fs::File::open(&stream_path).map_err(RegistryError::from)?;
+                let async_file = tokio::fs::File::from_std(file);
+                let stream = tokio_util::io::ReaderStream::with_capacity(async_file, 256 * 1024);
+                Ok(reqwest::Body::wrap_stream(stream))
+            })
+            .await;
+
+        match attempt {
+            Ok(()) => Ok(()),
+            Err(
+                e @ (RegistryError::Http(_)
+                | RegistryError::ApiError {
+                    status: 500..=599 | 413,
+                    ..
+                }),
+            ) => {
+                tracing::warn!(
+                    digest = %digest,
+                    size,
+                    error = %e,
+                    "monolithic blob upload rejected; retrying as a chunked upload"
+                );
+                self.push_blob_chunked(repo, digest, path, FALLBACK_CHUNK_SIZE)
+                    .await
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Upload a blob in OCI **chunked** mode: POST to open a session, one PATCH
@@ -438,7 +557,7 @@ impl RegistryClient {
             let end = offset + filled as u64 - 1;
             let resp = self
                 .send_replayable(
-                    self.request(reqwest::Method::PATCH, &location)
+                    self.upload_request(reqwest::Method::PATCH, &location, filled as u64)
                         .header(CONTENT_TYPE, "application/octet-stream")
                         .header(CONTENT_RANGE, format!("{start}-{end}"))
                         .header(CONTENT_LENGTH, filled)
@@ -456,11 +575,13 @@ impl RegistryClient {
         }
 
         // Step 3: PUT (empty body) to close the session, carrying the digest.
+        // The body is empty but the server commits the WHOLE blob before
+        // responding, so the deadline is sized to the full blob, not the body.
         let separator = if location.contains('?') { "&" } else { "?" };
         let put_url = format!("{location}{separator}digest={digest}");
         let resp = self
             .send_replayable(
-                self.request(reqwest::Method::PUT, &put_url)
+                self.upload_request(reqwest::Method::PUT, &put_url, offset)
                     .header(CONTENT_LENGTH, 0),
             )
             .await?;
@@ -487,7 +608,58 @@ impl RegistryClient {
         self.resolve_location(loc)
     }
 
-    /// Download a blob as a byte stream.
+    /// Download a blob as a byte stream, optionally resuming at `offset`.
+    ///
+    /// Returns the stream and the byte offset the body actually begins at: the
+    /// requested `offset` when the registry honored the range (206), or 0 when it
+    /// ignored the header and restarted the whole blob (200). A caller resuming a
+    /// partial file MUST truncate it when 0 comes back, or it would concatenate a
+    /// second copy onto the first and fail the digest check.
+    ///
+    /// Resuming matters for large layers: without it, a transfer that breaks near
+    /// the end restarts from byte zero, so a registry dropping connections at a
+    /// consistent point means the download never converges no matter how many
+    /// times it is retried.
+    ///
+    /// Returns the stream after verifying the response status. The caller is
+    /// responsible for digest verification (hash while writing to disk).
+    pub async fn pull_blob_stream_from(
+        &self,
+        repo: &str,
+        digest: &str,
+        offset: u64,
+    ) -> Result<(
+        impl futures_util::Stream<Item = reqwest::Result<bytes::Bytes>>,
+        u64,
+    )> {
+        validate_digest(digest)?;
+        let url = format!("{}/v2/{}/blobs/{}", self.base_url, repo, digest);
+        let mut req = self.request(reqwest::Method::GET, &url);
+        if offset > 0 {
+            req = req.header(RANGE, format!("bytes={offset}-"));
+        }
+        let resp = self.send_replayable(req).await?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(RegistryError::BlobNotFound(digest.to_string()));
+        }
+
+        if !resp.status().is_success() {
+            return Err(RegistryError::ApiError {
+                status: resp.status().as_u16(),
+                body: resp.text().await.unwrap_or_default(),
+            });
+        }
+
+        let resumed_at = if resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+            offset
+        } else {
+            0
+        };
+        Ok((resp.bytes_stream(), resumed_at))
+    }
+
+    /// Download a blob as a byte stream from the beginning.
     ///
     /// Returns the stream after verifying the response status. The caller is
     /// responsible for digest verification (hash while writing to disk).
@@ -859,6 +1031,24 @@ impl RegistryClient {
     /// Build a request with optional auth header.
     fn request(&self, method: reqwest::Method, url: &str) -> reqwest::RequestBuilder {
         let mut req = self.http.request(method, url);
+        if let Some(ref token) = self.auth_token {
+            req = req.bearer_auth(token);
+        }
+        req
+    }
+
+    /// Build an upload-step request: no read timeout (an upload's socket is
+    /// silent until the server commits the body), bounded instead by a
+    /// whole-request deadline sized to `body_len` so a stalled transfer still
+    /// fails while a slow-but-progressing one runs to completion.
+    fn upload_request(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        body_len: u64,
+    ) -> reqwest::RequestBuilder {
+        let deadline = UPLOAD_TIMEOUT_FLOOR + Duration::from_secs(body_len / UPLOAD_MIN_RATE);
+        let mut req = self.upload_http.request(method, url).timeout(deadline);
         if let Some(ref token) = self.auth_token {
             req = req.bearer_auth(token);
         }
@@ -2117,5 +2307,110 @@ mod http_tests {
         let resp2 = reqwest::get(format!("{}/big", server.uri())).await.unwrap();
         let ok = read_body_capped(resp2, 8192, "test").await.unwrap();
         assert_eq!(ok.len(), 4096);
+    }
+
+    // -----------------------------------------------------------------------
+    // Upload steps must survive a registry that answers only AFTER the shared
+    // client's read-gap deadline: an upload's socket delivers no bytes until
+    // the server has consumed the body and committed the blob, which for a
+    // multi-gigabyte layer takes well over any sane read timeout. This is the
+    // failure that made every large `pack push` die with "error sending
+    // request" while the same PUT from curl returned 201.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_push_blob_stream_survives_slow_commit() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v2/myrepo/blobs/uploads/"))
+            .respond_with(
+                ResponseTemplate::new(202)
+                    .insert_header("Location", "/v2/myrepo/blobs/uploads/session1"),
+            )
+            .mount(&server)
+            .await;
+        // The 201 arrives only after the read-gap deadline has long passed.
+        Mock::given(method("PUT"))
+            .respond_with(
+                ResponseTemplate::new(201).set_delay(READ_TIMEOUT + Duration::from_secs(3)),
+            )
+            .mount(&server)
+            .await;
+
+        let client = RegistryClient::new(server.uri().to_string());
+        let body = b"large blob stand-in".to_vec();
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(&body)));
+        client
+            .push_blob_stream("myrepo", &digest, body.len() as u64, move || {
+                Ok(reqwest::Body::from(body.clone()))
+            })
+            .await
+            .expect("upload must outlive a slow server-side blob commit");
+    }
+
+    // -----------------------------------------------------------------------
+    // When the monolithic PUT is rejected with a 5xx (a registry or proxy that
+    // cannot carry the blob in one request — zot's ~60 s body deadline, a
+    // proxy's 413), push_blob_file must retry the same blob as a chunked
+    // upload rather than surfacing the failure.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_push_blob_file_falls_back_to_chunked() {
+        let server = MockServer::start().await;
+        let content: &[u8] = b"blob that cannot travel whole";
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(content)));
+
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v2/myrepo/blobs/uploads/"))
+            .respond_with(
+                ResponseTemplate::new(202)
+                    .insert_header("Location", "/v2/myrepo/blobs/uploads/sess-fb"),
+            )
+            .mount(&server)
+            .await;
+        // First PUT (the monolithic attempt) → 502; consumed once, so the
+        // chunked finalize below reaches the 201 mock.
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(502))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path("/v2/myrepo/blobs/uploads/sess-fb"))
+            .respond_with(
+                ResponseTemplate::new(202)
+                    .insert_header("Location", "/v2/myrepo/blobs/uploads/sess-fb"),
+            )
+            .expect(1..)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let dir = std::env::temp_dir().join(format!("smolvm-fallback-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let blob_path = dir.join("blob.bin");
+        std::fs::write(&blob_path, content).unwrap();
+
+        let client = RegistryClient::new(server.uri().to_string());
+        client
+            .push_blob_file("myrepo", &digest, &blob_path)
+            .await
+            .expect("5xx on the monolithic PUT must fall back to chunked");
+
+        std::fs::remove_dir_all(&dir).ok();
+        // MockServer drop asserts the chunked PATCH + finalize PUT both ran.
     }
 }

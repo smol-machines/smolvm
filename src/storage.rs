@@ -27,6 +27,13 @@ use serde::{Deserialize, Serialize};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicU64, Ordering};
+
 /// Seed a VM-mode machine's overlay+storage disks from extracted pack templates so
 /// it boots the source VM's filesystem rather than a freshly-mkfs'd empty overlay.
 ///
@@ -34,9 +41,12 @@ use std::path::{Path, PathBuf};
 /// template has its trailing zero extent stripped, so the disk must be grown back to
 /// its logical size before boot. The caller's [`AgentManager`] has already created
 /// default `.qcow2` overlays backed by the EMPTY default template; this removes them
-/// and writes the seeded RAW disks under their place so [`resolve_disk_image`] picks
-/// these at start. A `.formatted` marker stops the host from reformatting the
-/// inherited (already-formatted) filesystem; the guest still grows it with resize2fs.
+/// and replaces them with disks backed by the packed image. On Linux, a shared
+/// extraction with an artifact SHA-256 creates one immutable, normalized raw base
+/// per artifact/disk/size and gives every machine a tiny qcow2 overlay. macOS keeps
+/// using APFS clonefile, while unsupported qcow2 hosts retain the sparse-copy path.
+/// A `.formatted` marker stops the host from reformatting the inherited filesystem;
+/// the guest still grows it with resize2fs.
 ///
 /// The template → disk copy uses [`crate::disk_utils::clone_or_copy_file`] (clonefile
 /// CoW on macOS, `SEEK_HOLE` sparse copy on Linux), NOT a dense `fs::copy`: the
@@ -49,14 +59,29 @@ use std::path::{Path, PathBuf};
 ///
 /// [`AgentManager`]: crate::agent::AgentManager
 /// [`resolve_disk_image`]: crate::agent::manager::resolve_disk_image
+#[derive(Debug, Clone, Copy)]
+pub struct VmModeDiskSeedSpec<'a> {
+    /// SHA-256 of the source pack, used to key immutable Linux COW bases.
+    pub artifact_sha256: Option<&'a str>,
+    /// Relative path to the packed root overlay template.
+    pub overlay_template: Option<&'a str>,
+    /// Relative path to the packed persistent storage template.
+    pub storage_template: Option<&'a str>,
+    /// Logical byte length to restore for the root overlay.
+    pub overlay_logical_size: Option<u64>,
+    /// Logical byte length to restore for persistent storage.
+    pub storage_logical_size: Option<u64>,
+    /// Requested root overlay size when the manifest lacks a logical length.
+    pub overlay_gb: Option<u64>,
+    /// Requested storage size when the manifest lacks a logical length.
+    pub storage_gb: Option<u64>,
+}
+
+/// Seeds one VM-mode machine from the extracted pack disk templates.
 pub fn seed_vm_mode_disks(
     disk_dir: &Path,
     cache_dir: &Path,
-    overlay_template: Option<&str>,
-    storage_template: Option<&str>,
-    overlay_logical_size: Option<u64>,
-    overlay_gb: Option<u64>,
-    storage_gb: Option<u64>,
+    seed: VmModeDiskSeedSpec<'_>,
 ) -> std::io::Result<()> {
     // Drop the manager's default qcow2 overlays (backed by the empty default
     // template) so the seeded raw disks below are what start resolves.
@@ -65,24 +90,312 @@ pub fn seed_vm_mode_disks(
         let _ = std::fs::remove_file(disk_dir.join(stem.with_extension("qcow2")));
     }
 
-    // The overlay carries the rootfs and is grown back to its (pre-truncation)
-    // logical size; storage to the requested size. Both VM-mode templates are
-    // normally present, but tolerate a missing one with an empty disk.
+    #[cfg(target_os = "linux")]
+    if let Some(artifact_sha256) = seed.artifact_sha256 {
+        // `.pack-shared` is the durable lease used by reference-aware pruning.
+        // Never publish a qcow2 backing dependency that has no matching lease.
+        crate::artifact_cache::validate_cow_lease(disk_dir, cache_dir, artifact_sha256)?;
+        if try_seed_vm_mode_disks_cow(
+            disk_dir,
+            cache_dir,
+            &cow_base_cache_root(),
+            artifact_sha256,
+            seed,
+            crate::agent::create_disk_overlays,
+        )? {
+            return Ok(());
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = seed.artifact_sha256;
+
+    seed_vm_mode_disks_by_copy(disk_dir, cache_dir, seed)
+}
+
+/// Portable sparse-copy fallback for VM-mode disks.
+fn seed_vm_mode_disks_by_copy(
+    disk_dir: &Path,
+    cache_dir: &Path,
+    seed: VmModeDiskSeedSpec<'_>,
+) -> std::io::Result<()> {
     seed_one_disk(
         cache_dir,
-        overlay_template,
+        seed.overlay_template,
         &disk_dir.join(OVERLAY_DISK_FILENAME),
-        overlay_logical_size,
-        overlay_gb,
+        seed.overlay_logical_size,
+        seed.overlay_gb,
     )?;
     seed_one_disk(
         cache_dir,
-        storage_template,
+        seed.storage_template,
         &disk_dir.join(STORAGE_DISK_FILENAME),
-        None,
-        storage_gb,
-    )?;
-    Ok(())
+        seed.storage_logical_size,
+        seed.storage_gb,
+    )
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct CowBaseMetadata {
+    artifact_sha256: String,
+    disk_type: String,
+    source_template: String,
+    source_size: u64,
+    logical_size: u64,
+}
+
+#[cfg(target_os = "linux")]
+static COW_BASE_STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Root for immutable VM-mode disk bases. Keep it outside the root-only shared
+/// pack extraction tree: each VMM drops to a distinct uid before libkrun opens
+/// its qcow2 backing files, so those uids must be able to traverse the base
+/// path. Directories below this root are execute-only to other uids and the VMM
+/// is still Landlock-confined to its exact backing chain.
+#[cfg(target_os = "linux")]
+pub(crate) fn cow_base_cache_root() -> PathBuf {
+    crate::agent::vm_cache_root().join("_cow-bases")
+}
+
+/// Build all immutable bases first, then create both private overlays in one
+/// libkrun load. A missing/corrupt base is a hard error; only an unavailable
+/// qcow2 implementation falls back to the existing sparse-copy behavior.
+#[cfg(target_os = "linux")]
+fn try_seed_vm_mode_disks_cow<F>(
+    disk_dir: &Path,
+    cache_dir: &Path,
+    base_cache_root: &Path,
+    artifact_sha256: &str,
+    seed: VmModeDiskSeedSpec<'_>,
+    create_overlays: F,
+) -> std::io::Result<bool>
+where
+    F: FnOnce(&[crate::agent::DiskOverlaySpec]) -> crate::Result<()>,
+{
+    validate_artifact_sha256(artifact_sha256)?;
+    let definitions = [
+        (
+            "overlay",
+            seed.overlay_template,
+            disk_dir.join(OVERLAY_DISK_FILENAME),
+            seed.overlay_logical_size,
+            seed.overlay_gb,
+        ),
+        (
+            "storage",
+            seed.storage_template,
+            disk_dir.join(STORAGE_DISK_FILENAME),
+            seed.storage_logical_size,
+            seed.storage_gb,
+        ),
+    ];
+
+    let mut overlay_specs = Vec::with_capacity(2);
+    let mut overlay_paths = Vec::with_capacity(2);
+    for (disk_type, template, dest, logical_size, size_gb_override) in &definitions {
+        let Some(template) = template else {
+            continue;
+        };
+        let source = resolve_template_in_cache(cache_dir, template)?;
+        let source_size = std::fs::metadata(&source)
+            .map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("VM-mode template {}: {error}", source.display()),
+                )
+            })?
+            .len();
+        let target_size = disk_target_size(source_size, *logical_size, *size_gb_override)?;
+        let base = prepare_cow_base(
+            base_cache_root,
+            artifact_sha256,
+            disk_type,
+            template,
+            &source,
+            source_size,
+            target_size,
+        )?;
+        let overlay = dest.with_extension("qcow2");
+        let _ = std::fs::remove_file(dest);
+        let _ = std::fs::remove_file(dest.with_extension("formatted"));
+        let _ = std::fs::remove_file(&overlay);
+        overlay_specs.push((overlay.clone(), base, DiskFormat::Raw));
+        overlay_paths.push(overlay);
+    }
+
+    if overlay_specs.is_empty() {
+        return Ok(false);
+    }
+
+    if let Err(error) = create_overlays(&overlay_specs) {
+        for overlay in &overlay_paths {
+            let _ = std::fs::remove_file(overlay);
+        }
+        tracing::warn!(
+            %error,
+            "VM-mode qcow2 overlay creation unavailable; falling back to sparse disk copies"
+        );
+        return Ok(false);
+    }
+
+    for (_, template, dest, _, size_gb_override) in definitions {
+        if template.is_some() {
+            std::fs::write(dest.with_extension("formatted"), b"1")?;
+        } else {
+            seed_one_disk(cache_dir, None, &dest, None, size_gb_override)?;
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_artifact_sha256(digest: &str) -> std::io::Result<()> {
+    if digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "artifact SHA-256 must be 64 lowercase hexadecimal characters",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn disk_target_size(
+    source_size: u64,
+    logical_size: Option<u64>,
+    size_gb_override: Option<u64>,
+) -> std::io::Result<u64> {
+    let requested_size = size_gb_override
+        .map(|gb| {
+            gb.checked_mul(BYTES_PER_GIB).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "disk size overflow")
+            })
+        })
+        .transpose()?;
+    Ok([Some(source_size), logical_size, requested_size]
+        .into_iter()
+        .flatten()
+        .max()
+        .unwrap_or(source_size))
+}
+
+/// Return one immutable normalized raw base, creating it atomically on the
+/// first request. The final directory is the completion marker: readers can
+/// never observe a base without matching metadata.
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn prepare_cow_base(
+    base_cache_root: &Path,
+    artifact_sha256: &str,
+    disk_type: &str,
+    source_template: &str,
+    source: &Path,
+    source_size: u64,
+    logical_size: u64,
+) -> std::io::Result<PathBuf> {
+    validate_artifact_sha256(artifact_sha256)?;
+    std::fs::create_dir_all(base_cache_root)?;
+    std::fs::set_permissions(base_cache_root, std::fs::Permissions::from_mode(0o711))?;
+    let digest_dir = base_cache_root.join(artifact_sha256);
+    std::fs::create_dir_all(&digest_dir)?;
+    std::fs::set_permissions(&digest_dir, std::fs::Permissions::from_mode(0o711))?;
+
+    let key = format!("{disk_type}-{logical_size}");
+    let final_dir = digest_dir.join(&key);
+    let lock_path = digest_dir.join(format!("{key}.lock"));
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)?;
+    let lock_result = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) };
+    if lock_result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let expected = CowBaseMetadata {
+        artifact_sha256: artifact_sha256.to_string(),
+        disk_type: disk_type.to_string(),
+        source_template: source_template.to_string(),
+        source_size,
+        logical_size,
+    };
+    if final_dir.exists() {
+        return validate_cow_base(&final_dir, &expected);
+    }
+
+    let sequence = COW_BASE_STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let staging_dir = digest_dir.join(format!(".{key}.tmp-{}-{sequence}", std::process::id()));
+    let result = (|| {
+        std::fs::create_dir(&staging_dir)?;
+        let base = staging_dir.join("base.raw");
+        crate::disk_utils::clone_or_copy_file(source, &base)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let file = std::fs::OpenOptions::new().write(true).open(&base)?;
+        file.set_len(logical_size)?;
+        file.sync_all()?;
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o444))?;
+
+        let metadata_bytes = serde_json::to_vec_pretty(&expected)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let metadata_path = staging_dir.join("metadata.json");
+        let mut metadata_file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&metadata_path)?;
+        use std::io::Write as _;
+        metadata_file.write_all(&metadata_bytes)?;
+        metadata_file.sync_all()?;
+        std::fs::set_permissions(&metadata_path, std::fs::Permissions::from_mode(0o444))?;
+        std::fs::set_permissions(&staging_dir, std::fs::Permissions::from_mode(0o555))?;
+        std::fs::rename(&staging_dir, &final_dir)?;
+        validate_cow_base(&final_dir, &expected)
+    })();
+    if result.is_err() && staging_dir.exists() {
+        let _ = std::fs::set_permissions(&staging_dir, std::fs::Permissions::from_mode(0o700));
+        let _ = std::fs::remove_dir_all(&staging_dir);
+    }
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn validate_cow_base(base_dir: &Path, expected: &CowBaseMetadata) -> std::io::Result<PathBuf> {
+    let base = base_dir.join("base.raw");
+    let metadata_path = base_dir.join("metadata.json");
+    let actual: CowBaseMetadata =
+        serde_json::from_slice(&std::fs::read(&metadata_path)?).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "corrupt COW base metadata {}: {error}",
+                    metadata_path.display()
+                ),
+            )
+        })?;
+    if &actual != expected {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("COW base metadata mismatch: {}", base_dir.display()),
+        ));
+    }
+    let file_metadata = std::fs::metadata(&base)?;
+    if !file_metadata.is_file() || file_metadata.len() != expected.logical_size {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("COW base has an unsafe size or type: {}", base.display()),
+        ));
+    }
+    if file_metadata.permissions().mode() & 0o222 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("COW base is writable: {}", base.display()),
+        ));
+    }
+    base.canonicalize()
 }
 
 /// Sparse-copy one packed template into `dest`, grow it to the largest of its copied
@@ -242,10 +555,21 @@ impl<K: DiskType> VmDisk<K> {
         let size_bytes = size_gb * BYTES_PER_GIB;
 
         if path.exists() {
-            let metadata = std::fs::metadata(path)?;
+            // An existing disk keeps whatever size it was created at, so a
+            // machine whose data dir outlived a delete would boot the previous,
+            // smaller disk while its record reports the requested size. Grow it
+            // to the request instead (sparse, so it costs nothing); the guest's
+            // resize2fs expands the filesystem into the new space at boot. A
+            // disk that is already larger is left alone — callers that open with
+            // the default size must not shrink a machine's storage.
+            let mut on_disk = std::fs::metadata(path)?.len();
+            if on_disk < size_bytes {
+                expand_disk::<K>(path, size_gb)?;
+                on_disk = std::fs::metadata(path)?.len();
+            }
             Ok(Self {
                 path: path.to_path_buf(),
-                size_bytes: metadata.len(),
+                size_bytes: on_disk,
                 format: DiskFormat::Raw,
                 _kind: PhantomData,
             })
@@ -546,6 +870,318 @@ pub fn expand_disk<D: DiskType>(path: &Path, new_size_gb: u64) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    const TEST_ARTIFACT_SHA256: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[cfg(target_os = "linux")]
+    fn write_sparse_template(path: &Path, logical_size: u64, marker: &[u8]) {
+        let mut file = std::fs::File::create(path).unwrap();
+        use std::io::Write as _;
+        file.write_all(marker).unwrap();
+        file.set_len(logical_size).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn make_fake_overlays(specs: &[crate::agent::DiskOverlaySpec]) -> crate::Result<()> {
+        for (overlay, _, _) in specs {
+            let mut file = std::fs::File::create(overlay)?;
+            use std::io::Write as _;
+            file.write_all(b"QFI\xfb")?;
+            file.set_len(256 * 1024)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn make_tree_removable(root: &Path) {
+        if let Ok(entries) = std::fs::read_dir(root) {
+            for entry in entries.flatten() {
+                if entry.path().is_dir() {
+                    make_tree_removable(&entry.path());
+                }
+            }
+        }
+        let _ = std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn vm_mode_cow_uses_tiny_private_disks_and_one_immutable_base() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("shared-pack");
+        let base_cache = temp.path().join("cow-bases");
+        let first = temp.path().join("machine-a");
+        let second = temp.path().join("machine-b");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        write_sparse_template(&cache.join("overlay.raw"), 2 * 1024 * 1024, b"root-a");
+        write_sparse_template(&cache.join("storage.raw"), 1024 * 1024, b"data-a");
+
+        for machine in [&first, &second] {
+            assert!(try_seed_vm_mode_disks_cow(
+                machine,
+                &cache,
+                &base_cache,
+                TEST_ARTIFACT_SHA256,
+                VmModeDiskSeedSpec {
+                    artifact_sha256: Some(TEST_ARTIFACT_SHA256),
+                    overlay_template: Some("overlay.raw"),
+                    storage_template: Some("storage.raw"),
+                    overlay_logical_size: Some(4 * 1024 * 1024),
+                    storage_logical_size: Some(3 * 1024 * 1024),
+                    overlay_gb: None,
+                    storage_gb: None,
+                },
+                make_fake_overlays,
+            )
+            .unwrap());
+            for disk in ["overlay.qcow2", "storage.qcow2"] {
+                let metadata = std::fs::metadata(machine.join(disk)).unwrap();
+                assert_eq!(metadata.len(), 256 * 1024, "private disk must stay tiny");
+            }
+            assert!(!machine.join(OVERLAY_DISK_FILENAME).exists());
+            assert!(!machine.join(STORAGE_DISK_FILENAME).exists());
+            assert!(machine.join("overlay.formatted").exists());
+            assert!(machine.join("storage.formatted").exists());
+        }
+
+        assert_eq!(
+            std::fs::metadata(&base_cache).unwrap().permissions().mode() & 0o777,
+            0o711,
+            "the uid-dropped VMM must be able to traverse the shared base store"
+        );
+        let base_root = base_cache.join(TEST_ARTIFACT_SHA256);
+        assert_eq!(
+            std::fs::metadata(&base_root).unwrap().permissions().mode() & 0o777,
+            0o711,
+            "the artifact digest directory must be traversable but non-listable"
+        );
+        let bases: Vec<_> = std::fs::read_dir(&base_root)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().is_dir())
+            .collect();
+        assert_eq!(bases.len(), 2, "one normalized base per disk type");
+        for entry in &bases {
+            let base = entry.path().join("base.raw");
+            let metadata = std::fs::metadata(base).unwrap();
+            assert_eq!(metadata.permissions().mode() & 0o222, 0);
+            use std::os::unix::fs::MetadataExt as _;
+            assert!(
+                metadata.blocks() * 512 < metadata.len() / 2,
+                "restoring the logical tail must keep the immutable base sparse"
+            );
+        }
+
+        std::fs::write(first.join("overlay.qcow2"), b"first-private").unwrap();
+        assert_eq!(
+            std::fs::read(second.join("overlay.qcow2")).unwrap()[..4],
+            *b"QFI\xfb"
+        );
+        assert_eq!(
+            std::fs::read(base_root.join("overlay-4194304/base.raw")).unwrap()[..6],
+            *b"root-a"
+        );
+
+        std::fs::remove_dir_all(&first).unwrap();
+        assert!(second.join("overlay.qcow2").exists());
+        assert!(
+            bases.iter().all(|entry| entry.path().exists()),
+            "deleting a sibling must retain shared bases"
+        );
+        make_tree_removable(&cache);
+        make_tree_removable(&base_cache);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn concurrent_first_cow_base_creation_is_atomic() {
+        use std::sync::{Arc, Barrier};
+
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("shared-pack");
+        let base_cache = temp.path().join("cow-bases");
+        std::fs::create_dir_all(&cache).unwrap();
+        let source = cache.join("overlay.raw");
+        write_sparse_template(&source, 1024 * 1024, b"root");
+        let barrier = Arc::new(Barrier::new(8));
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let base_cache = base_cache.clone();
+            let source = source.clone();
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                prepare_cow_base(
+                    &base_cache,
+                    TEST_ARTIFACT_SHA256,
+                    "overlay",
+                    "overlay.raw",
+                    &source,
+                    1024 * 1024,
+                    4 * 1024 * 1024,
+                )
+                .unwrap()
+            }));
+        }
+        let paths: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert!(paths.iter().all(|path| path == &paths[0]));
+        assert_eq!(std::fs::metadata(&paths[0]).unwrap().len(), 4 * 1024 * 1024);
+        let digest_dir = base_cache.join(TEST_ARTIFACT_SHA256);
+        assert_eq!(
+            std::fs::read_dir(&digest_dir)
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.path().is_dir())
+                .count(),
+            1
+        );
+        make_tree_removable(&cache);
+        make_tree_removable(&base_cache);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn corrupt_cow_base_is_rejected_without_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("shared-pack");
+        let base_cache = temp.path().join("cow-bases");
+        std::fs::create_dir_all(&cache).unwrap();
+        let source = cache.join("overlay.raw");
+        write_sparse_template(&source, 1024 * 1024, b"root");
+        let base = prepare_cow_base(
+            &base_cache,
+            TEST_ARTIFACT_SHA256,
+            "overlay",
+            "overlay.raw",
+            &source,
+            1024 * 1024,
+            2 * 1024 * 1024,
+        )
+        .unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let error = prepare_cow_base(
+            &base_cache,
+            TEST_ARTIFACT_SHA256,
+            "overlay",
+            "overlay.raw",
+            &source,
+            1024 * 1024,
+            2 * 1024 * 1024,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("writable"));
+        assert_eq!(std::fs::metadata(&base).unwrap().len(), 2 * 1024 * 1024);
+        make_tree_removable(&cache);
+        make_tree_removable(&base_cache);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn missing_file_in_completed_cow_base_fails_without_rebuilding() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("shared-pack");
+        let base_cache = temp.path().join("cow-bases");
+        std::fs::create_dir_all(&cache).unwrap();
+        let source = cache.join("overlay.raw");
+        write_sparse_template(&source, 1024 * 1024, b"root");
+        let base = prepare_cow_base(
+            &base_cache,
+            TEST_ARTIFACT_SHA256,
+            "overlay",
+            "overlay.raw",
+            &source,
+            1024 * 1024,
+            2 * 1024 * 1024,
+        )
+        .unwrap();
+        let base_dir = base.parent().unwrap();
+        std::fs::set_permissions(base_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_file(&base).unwrap();
+        std::fs::set_permissions(base_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let error = prepare_cow_base(
+            &base_cache,
+            TEST_ARTIFACT_SHA256,
+            "overlay",
+            "overlay.raw",
+            &source,
+            1024 * 1024,
+            2 * 1024 * 1024,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(
+            !base.exists(),
+            "a completed but broken base is never replaced"
+        );
+        make_tree_removable(&cache);
+        make_tree_removable(&base_cache);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn unavailable_qcow_support_leaves_no_partial_overlay_and_copy_fallback_works() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("shared-pack");
+        let base_cache = temp.path().join("cow-bases");
+        let machine = temp.path().join("machine");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::create_dir_all(&machine).unwrap();
+        write_sparse_template(&cache.join("overlay.raw"), 1024 * 1024, b"root");
+        let used_cow = try_seed_vm_mode_disks_cow(
+            &machine,
+            &cache,
+            &base_cache,
+            TEST_ARTIFACT_SHA256,
+            VmModeDiskSeedSpec {
+                artifact_sha256: Some(TEST_ARTIFACT_SHA256),
+                overlay_template: Some("overlay.raw"),
+                storage_template: None,
+                overlay_logical_size: None,
+                storage_logical_size: None,
+                overlay_gb: None,
+                storage_gb: None,
+            },
+            |specs| {
+                std::fs::write(&specs[0].0, b"partial")?;
+                Err(Error::agent("create disk overlay", "unsupported"))
+            },
+        )
+        .unwrap();
+        assert!(!used_cow);
+        assert!(!machine.join("overlay.qcow2").exists());
+        seed_vm_mode_disks_by_copy(
+            &machine,
+            &cache,
+            VmModeDiskSeedSpec {
+                artifact_sha256: None,
+                overlay_template: Some("overlay.raw"),
+                storage_template: None,
+                overlay_logical_size: Some(2 * 1024 * 1024),
+                storage_logical_size: None,
+                overlay_gb: None,
+                storage_gb: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::metadata(machine.join(OVERLAY_DISK_FILENAME))
+                .unwrap()
+                .len(),
+            2 * 1024 * 1024
+        );
+        assert!(machine.join("overlay.formatted").exists());
+        make_tree_removable(&cache);
+        make_tree_removable(&base_cache);
+    }
+
     #[test]
     fn test_disk_version_compatibility() {
         let version = DiskVersion::new("sha256:abc123");
@@ -712,6 +1348,35 @@ mod tests {
         assert_eq!(disk.size_gib(), 2);
         let metadata = std::fs::metadata(&disk_path).unwrap();
         assert_eq!(metadata.len(), 2 * BYTES_PER_GIB);
+
+        let _ = std::fs::remove_file(&disk_path);
+        let _ = std::fs::remove_dir(&temp_dir);
+    }
+
+    #[test]
+    fn open_or_create_at_grows_an_existing_smaller_disk() {
+        let temp_dir = std::env::temp_dir().join("smolvm_test_open_grows");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let disk_path = temp_dir.join("grow_test.raw");
+        let _ = std::fs::remove_file(&disk_path);
+
+        // A disk left behind at the old size (a data dir that outlived a
+        // delete) must present the newly requested size, not the stale one.
+        disk_utils::create_sparse_disk::<Storage>(&disk_path, BYTES_PER_GIB).unwrap();
+        let disk = StorageDisk::open_or_create_at(&disk_path, 2).unwrap();
+        assert_eq!(disk.size_gib(), 2);
+        assert_eq!(
+            std::fs::metadata(&disk_path).unwrap().len(),
+            2 * BYTES_PER_GIB
+        );
+
+        // Opening with a smaller size never shrinks an existing disk.
+        let disk = StorageDisk::open_or_create_at(&disk_path, 1).unwrap();
+        assert_eq!(disk.size_gib(), 2);
+        assert_eq!(
+            std::fs::metadata(&disk_path).unwrap().len(),
+            2 * BYTES_PER_GIB
+        );
 
         let _ = std::fs::remove_file(&disk_path);
         let _ = std::fs::remove_dir(&temp_dir);

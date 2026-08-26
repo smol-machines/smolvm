@@ -1,6 +1,6 @@
 [package]
 name = "smolvm-agent"
-version = "1.7.5"
+version = "1.13.0"
 edition = "2021"
 description = "Guest agent for smolvm VMs (handles OCI operations and command execution)"
 license = "Apache-2.0"
@@ -15,6 +15,7 @@ smolvm-protocol = { path = "../smolvm-protocol", version = "1.6.1" }
 # Shared, pure-Rust OCI layer extraction (decompress + untar + whiteout→overlay
 # translation). The single implementation this guest and the host image cache
 # both call. Dependency-light + no C-linked crate so it links under musl.
+smolvm-s3fs = { path = "../smolvm-s3fs", version = "1.10.0" }
 smolvm-oci-layer = { path = "../smolvm-oci-layer", version = "1.7.2" }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -23,6 +23,7 @@ kill_orphan_smolvm_processes
 # API server configuration
 API_SOCKET="${XDG_RUNTIME_DIR:-/tmp}/smolvm.sock"
 API_URL="http://localhost"
+SERVER_LOG="$(mktemp -t smolvm-api-test-server)"
 SERVER_PID=""
 MACHINE_NAME="api-test-machine"
 REGISTRY_TEST_NAME="registry-coherence-test"
@@ -37,7 +38,10 @@ CURL=(curl --unix-socket "$API_SOCKET")
 start_server() {
     log_info "Starting API server on unix://$API_SOCKET..."
     rm -f "$API_SOCKET"
-    $SMOLVM serve start &
+    # Detach the server from our stdio: run_test pipes each test through
+    # `tee`, and a server started inside a test would inherit that pipe and
+    # hold it open forever — the suite then hangs after the test returns.
+    $SMOLVM serve start </dev/null >"$SERVER_LOG" 2>&1 &
     SERVER_PID=$!
 
     local retries=30

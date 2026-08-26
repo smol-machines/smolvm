@@ -183,7 +183,7 @@ memory = 1024
 net = true
 
 [dev]
-init = ["command -v dpkg > /tmp/dpkg-path.txt"]
+init = ["command -v dpkg > /root/dpkg-path.txt"]
 EOF
 
     $SMOLVM machine create --name "$vm_name" --smolfile "$SMOLFILE_TMPDIR/Smolfile.initcontainer" 2>&1 || return 1
@@ -194,7 +194,7 @@ EOF
     # Init wrote dpkg's path inside the container's overlay. Verify
     # via exec that it's there.
     local output
-    output=$($SMOLVM machine exec --name "$vm_name" -- cat /tmp/dpkg-path.txt 2>&1)
+    output=$($SMOLVM machine exec --name "$vm_name" -- cat /root/dpkg-path.txt 2>&1)
 
     cleanup_vm "$vm_name"
 
@@ -563,6 +563,7 @@ test_smolfile_artifact_section_parses() {
 image = "python:3.12-alpine"
 cpus = 2
 memory = 1024
+net = true
 
 [artifact]
 cpus = 4
@@ -583,6 +584,7 @@ EOF
 test_smolfile_pack_alias_parses() {
     cat > "$SMOLFILE_TMPDIR/Smolfile.pack" <<'EOF'
 image = "alpine:latest"
+net = true
 
 [pack]
 cpus = 4
@@ -1264,13 +1266,14 @@ EOF
     $SMOLVM machine create --name "$vm_name" -s "$SMOLFILE_TMPDIR/network.smolfile" 2>&1 || return 1
     $SMOLVM machine start --name "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
 
-    # Allowed host's IP should be reachable
+    # The filter is name-based: an allowed name resolves (and its answer is
+    # learned as allowed egress), a non-allowed name gets NXDOMAIN no matter
+    # which resolver address the guest asks.
     local exit_code_allowed=0
-    $SMOLVM machine exec --name "$vm_name" -- nslookup cloudflare.com 1.1.1.1 2>&1 || exit_code_allowed=$?
+    $SMOLVM machine exec --name "$vm_name" -- nslookup one.one.one.one 2>&1 || exit_code_allowed=$?
 
-    # Non-allowed IP should be blocked
     local exit_code_blocked=0
-    $SMOLVM machine exec --name "$vm_name" -- nslookup cloudflare.com 8.8.8.8 2>&1 || exit_code_blocked=$?
+    $SMOLVM machine exec --name "$vm_name" -- nslookup cloudflare.com 2>&1 || exit_code_blocked=$?
 
     cleanup_vm "$vm_name"
 
@@ -1291,13 +1294,14 @@ EOF
     $SMOLVM machine create --name "$vm_name" -s "$SMOLFILE_TMPDIR/network-cidr.smolfile" 2>&1 || return 1
     $SMOLVM machine start --name "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
 
-    # Allowed CIDR should work
+    # DNS resolution has a deliberate carve-out under CIDR-only policies, so
+    # enforcement is asserted at connect time: TCP to the allowed address
+    # works, TCP anywhere else black-holes (times out).
     local exit_code_allowed=0
-    $SMOLVM machine exec --name "$vm_name" -- nslookup cloudflare.com 1.1.1.1 2>&1 || exit_code_allowed=$?
+    $SMOLVM machine exec --name "$vm_name" -- timeout 8 nc -w 6 1.1.1.1 443 </dev/null 2>&1 || exit_code_allowed=$?
 
-    # Non-allowed IP should be blocked
     local exit_code_blocked=0
-    $SMOLVM machine exec --name "$vm_name" -- nslookup cloudflare.com 8.8.8.8 2>&1 || exit_code_blocked=$?
+    $SMOLVM machine exec --name "$vm_name" -- timeout 8 nc -w 6 9.9.9.9 443 </dev/null 2>&1 || exit_code_blocked=$?
 
     cleanup_vm "$vm_name"
 
@@ -1319,16 +1323,20 @@ EOF
     $SMOLVM machine create --name "$vm_name" -s "$SMOLFILE_TMPDIR/network-mixed.smolfile" 2>&1 || return 1
     $SMOLVM machine start --name "$vm_name" 2>&1 || { cleanup_vm "$vm_name"; return 1; }
 
-    # Both should be reachable
+    # The allowed name resolves through the name filter; the allowed CIDR
+    # accepts TCP; a name outside the list is NXDOMAIN.
     local exit_code_host=0
-    $SMOLVM machine exec --name "$vm_name" -- nslookup cloudflare.com 1.1.1.1 2>&1 || exit_code_host=$?
+    $SMOLVM machine exec --name "$vm_name" -- nslookup one.one.one.one 2>&1 || exit_code_host=$?
 
     local exit_code_cidr=0
-    $SMOLVM machine exec --name "$vm_name" -- nslookup cloudflare.com 8.8.8.8 2>&1 || exit_code_cidr=$?
+    $SMOLVM machine exec --name "$vm_name" -- timeout 8 nc -w 6 8.8.8.8 443 </dev/null 2>&1 || exit_code_cidr=$?
+
+    local exit_code_blocked=0
+    $SMOLVM machine exec --name "$vm_name" -- nslookup cloudflare.com 2>&1 || exit_code_blocked=$?
 
     cleanup_vm "$vm_name"
 
-    [[ $exit_code_host -eq 0 ]] && [[ $exit_code_cidr -eq 0 ]]
+    [[ $exit_code_host -eq 0 ]] && [[ $exit_code_cidr -eq 0 ]] && [[ $exit_code_blocked -ne 0 ]]
 }
 
 echo ""

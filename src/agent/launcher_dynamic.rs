@@ -70,6 +70,11 @@ pub struct PackedLaunchConfig<'a> {
     /// `cuda_host` server loaded the real driver. Mirrors the non-packed
     /// launcher's `cuda_socket`.
     pub cuda_socket: Option<&'a Path>,
+    /// Hostnames the egress policy permits resolving and connecting to
+    /// (`--allow-host`), mirroring the main launcher's `egress_refresh_hosts`.
+    /// Owned because the launch runs in a forked child that outlives the
+    /// caller's borrows.
+    pub dns_filter_hosts: Option<Vec<String>>,
 }
 
 /// The `krun_add_disk2` image-format code for a disk file: `1` (qcow2) when it
@@ -105,7 +110,7 @@ pub fn launch_agent_vm_dynamic(
 ) -> Result<(), String> {
     crate::network::validate_requested_network_backend(
         &config.resources,
-        None,
+        config.dns_filter_hosts.as_deref(),
         config.port_mappings.len(),
     )
     .map_err(|e| e.to_string())?;
@@ -137,6 +142,10 @@ pub fn launch_agent_vm_dynamic(
 
     // SAFETY: Each FFI call below is individually wrapped in unsafe.
     // All CString/pointer construction is safe Rust outside the unsafe blocks.
+
+    if config.resources.gpu {
+        krun.ensure_gpu_runtime()?;
+    }
 
     // Set log level (0 = off, 1 = error, 2 = warn, 3 = info, 4 = debug).
     // Honor SMOLVM_KRUN_LOG_LEVEL like the non-packed launcher so a packed VM's
@@ -201,6 +210,110 @@ pub fn launch_agent_vm_dynamic(
                     ));
                 }
                 tracing::info!("GPU enabled (Venus/Vulkan via virtio-gpu)");
+
+                // Optional virtio-gpu scanout. Venus gives the guest GPU
+                // *rendering*; a scanout gives it a *display*. Without one the
+                // device reports num_scanouts = 0, so the guest sees no
+                // connector and card0 is render-only — which is why DRM
+                // compositors fail with "not a KMS device". Opt-in for now:
+                // adding a connector changes guest topology, and existing GPU
+                // workloads (CUDA, headless Vulkan) neither need nor want one.
+                if let Some((w, h)) =
+                    super::parse_display_size(std::env::var("SMOLVM_DISPLAY").ok().as_deref())
+                {
+                    super::default_gpu_backend_for_display();
+                    match krun.add_display {
+                        Some(add_display) => {
+                            let ret = unsafe { add_display(ctx, w, h) };
+                            if ret < 0 {
+                                free_ctx_on_err!(format!(
+                                    "krun_add_display({w}x{h}) failed (ret={ret})"
+                                ));
+                            }
+                            tracing::info!(
+                                width = w,
+                                height = h,
+                                display_id = ret,
+                                "virtio-gpu scanout added (guest gets a KMS connector)"
+                            );
+
+                            // A described display is not a usable one. With no
+                            // backend to consume frames libkrun installs a
+                            // no-op that fails every scanout call, so the
+                            // guest's first page flip never completes and a
+                            // compositor blocks on it forever.
+                            let Some(set_backend) = krun.set_display_backend else {
+                                free_ctx_on_err!(
+                                    "SMOLVM_DISPLAY set but this libkrun has no \
+                                     krun_set_display_backend; without it the guest \
+                                     would hang on its first page flip"
+                                );
+                            };
+                            let framebuffer = match crate::agent::display::install(set_backend, ctx)
+                            {
+                                Ok(fb) => fb,
+                                Err(e) => free_ctx_on_err!(e.to_string()),
+                            };
+
+                            // Serving RFB from the host means the guest needs
+                            // no capture tool and no compositor-specific
+                            // screencopy protocol.
+                            if let Some(bind) = std::env::var("SMOLVM_VNC")
+                                .ok()
+                                .as_deref()
+                                .and_then(crate::agent::vnc::parse_bind_addr)
+                            {
+                                // Input is best-effort: a libkrun without the
+                                // input feature degrades to view-only rather
+                                // than blocking the display.
+                                let input = match krun.add_input_device {
+                                    Some(add_input) => {
+                                        match crate::agent::input::install(add_input, ctx) {
+                                            Ok(i) => {
+                                                tracing::info!(
+                                                    "vnc input devices attached \
+                                                     (keyboard + pointer)"
+                                                );
+                                                Some(i)
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    error = %e,
+                                                    "vnc input unavailable; view-only"
+                                                );
+                                                None
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                        tracing::info!(
+                                            "libkrun has no krun_add_input_device; \
+                                             vnc is view-only"
+                                        );
+                                        None
+                                    }
+                                };
+                                match crate::agent::vnc::serve(&bind, framebuffer, input) {
+                                    Ok(addr) => {
+                                        tracing::info!(%addr, "vnc server listening")
+                                    }
+                                    // A failed viewer must not take down the
+                                    // VM; the display works without it.
+                                    Err(e) => tracing::warn!(
+                                        bind = %bind,
+                                        error = %e,
+                                        "vnc server failed to start"
+                                    ),
+                                }
+                            }
+                        }
+                        None => {
+                            free_ctx_on_err!(
+                                "SMOLVM_DISPLAY set but this libkrun has no krun_add_display"
+                            );
+                        }
+                    }
+                }
             }
             None => {
                 free_ctx_on_err!(
@@ -266,38 +379,65 @@ pub fn launch_agent_vm_dynamic(
                 free_ctx_on_err!("krun_set_port_map failed");
             }
 
-            if let Some(ref cidrs) = config.resources.allowed_cidrs {
-                if !cidrs.is_empty() {
-                    let set_egress = krun.set_egress_policy.ok_or_else(|| {
-                        "libkrun does not support egress policy (krun_set_egress_policy not found). \
-                         Update libkrun or remove --allow-cidr flags."
-                            .to_string()
-                    })?;
+            // Egress policy: static CIDRs plus DNS allow-host filtering enforced
+            // inside libkrun, mirroring the main launcher's TSI arm. When
+            // allow-hosts are set, guest UDP:53 queries are forwarded only to the
+            // trusted resolver and A/AAAA answers for allowed hosts become
+            // temporarily allowed IPs.
+            let egress_hosts = config.dns_filter_hosts.clone().unwrap_or_default();
+            let has_cidrs = config
+                .resources
+                .allowed_cidrs
+                .as_ref()
+                .is_some_and(|cidrs| !cidrs.is_empty());
+            if has_cidrs || !egress_hosts.is_empty() {
+                let set_egress = krun.set_egress_policy.ok_or_else(|| {
+                    "libkrun does not support egress policy (krun_set_egress_policy not found). \
+                     Update libkrun or remove --allow-cidr/--allow-host flags."
+                        .to_string()
+                })?;
 
-                    let mut all_cidrs = cidrs.clone();
-                    crate::data::network::ensure_dns_in_cidrs(&mut all_cidrs);
+                let mut all_cidrs = config.resources.allowed_cidrs.clone().unwrap_or_default();
+                crate::data::network::ensure_dns_in_cidrs(&mut all_cidrs);
 
-                    let cidr_cstrings: Vec<CString> = match all_cidrs
-                        .iter()
-                        .map(|c| CString::new(c.as_str()))
-                        .collect::<std::result::Result<Vec<_>, _>>()
-                    {
-                        Ok(v) => v,
-                        Err(_) => free_ctx_on_err!("allow-CIDR contains an interior NUL byte"),
-                    };
-                    let mut cidr_ptrs: Vec<*const libc::c_char> =
-                        cidr_cstrings.iter().map(|s| s.as_ptr()).collect();
-                    cidr_ptrs.push(std::ptr::null());
+                let cidr_cstrings: Vec<CString> = match all_cidrs
+                    .iter()
+                    .map(|c| CString::new(c.as_str()))
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                {
+                    Ok(v) => v,
+                    Err(_) => free_ctx_on_err!("allow-CIDR contains an interior NUL byte"),
+                };
+                let mut cidr_ptrs: Vec<*const libc::c_char> =
+                    cidr_cstrings.iter().map(|s| s.as_ptr()).collect();
+                cidr_ptrs.push(std::ptr::null());
 
-                    // The dynamic path enforces CIDR-only egress; DNS allow-host
-                    // filtering (hosts + resolver args) is wired in the main
-                    // launcher path.
-                    if unsafe {
-                        (set_egress)(ctx, cidr_ptrs.as_ptr(), std::ptr::null(), std::ptr::null())
-                    } < 0
-                    {
-                        free_ctx_on_err!("krun_set_egress_policy failed");
-                    }
+                let host_cstrings: Vec<CString> = match egress_hosts
+                    .iter()
+                    .map(|h| CString::new(h.as_str()))
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                {
+                    Ok(v) => v,
+                    Err(_) => free_ctx_on_err!("allow-host contains an interior NUL byte"),
+                };
+                let mut host_ptrs: Vec<*const libc::c_char> =
+                    host_cstrings.iter().map(|s| s.as_ptr()).collect();
+                host_ptrs.push(std::ptr::null());
+
+                let resolver_cstring =
+                    CString::new(crate::data::network::default_dns_addr().to_string())
+                        .expect("resolver IP has no null bytes");
+                let resolver_ptrs: Vec<*const libc::c_char> =
+                    vec![resolver_cstring.as_ptr(), std::ptr::null()];
+
+                let (host_arg, resolver_arg) = if egress_hosts.is_empty() {
+                    (std::ptr::null(), std::ptr::null())
+                } else {
+                    (host_ptrs.as_ptr(), resolver_ptrs.as_ptr())
+                };
+
+                if unsafe { (set_egress)(ctx, cidr_ptrs.as_ptr(), host_arg, resolver_arg) } < 0 {
+                    free_ctx_on_err!("krun_set_egress_policy failed");
                 }
             }
 
@@ -327,9 +467,14 @@ pub fn launch_agent_vm_dynamic(
                 .iter()
                 .map(|(host, guest)| VirtioPortMapping::new(*host, *guest))
                 .collect();
-            let egress = smolvm_network::EgressPolicy::from_allowed_cidrs(
+            // Denial sink beside the vsock socket, mirroring the static launcher.
+            let mut egress = smolvm_network::EgressPolicy::new(
                 config.resources.allowed_cidrs.as_deref(),
+                config.dns_filter_hosts.as_deref(),
             );
+            if let Some(dir) = config.vsock_socket.parent() {
+                egress = egress.with_denial_log(dir.join(smolvm_network::EGRESS_DENIALS_LOG));
+            }
 
             // The host/guest ends of the virtio-net channel are an AF_UNIX
             // stream: a socketpair fd on Unix, a per-VM path listener libkrun
@@ -345,6 +490,7 @@ pub fn launch_agent_vm_dynamic(
                     guest_network,
                     &port_mappings,
                     egress,
+                    None,
                 ) {
                     Ok(runtime) => runtime,
                     Err(err) => {
@@ -404,7 +550,7 @@ pub fn launch_agent_vm_dynamic(
                     .name("smolvm-net-accept".into())
                     .spawn(move || match listener.accept() {
                         Ok((sock, _)) => {
-                            match start_virtio_network(sock, guest_network, &port_mappings, egress) {
+                            match start_virtio_network(sock, guest_network, &port_mappings, egress, None) {
                                 Ok(runtime) => runtime.block_until_shutdown(),
                                 Err(err) => {
                                     tracing::error!(error = %err, "virtio-net runtime failed to start")
@@ -752,7 +898,72 @@ pub(crate) fn describe_krun_start_error(ret: i32) -> String {
     #[cfg(not(target_os = "linux"))]
     let kvm_error: Option<String> = None;
 
+    // Same idea on macOS: `hv_vm_create` returns HV_UNSUPPORTED without the
+    // com.apple.security.hypervisor entitlement, and libkrun reports that in
+    // the same errno class as a disk that could not be opened — so the generic
+    // hint sends the user after disks when the real fix is re-signing. A
+    // re-signed (`codesign --force --sign -` with no `--entitlements`) or
+    // freshly built binary silently loses the entitlement.
+    #[cfg(target_os = "macos")]
+    if matches!(-ret, 1 | 13 | 19 | 22) && !has_hypervisor_entitlement() {
+        return format!(
+            "krun_start_enter returned: {ret} (this binary is not signed with the \
+             com.apple.security.hypervisor entitlement required by \
+             Hypervisor.framework — re-sign it: codesign --force --sign - \
+             --entitlements hv.entitlements <path-to-binary>)"
+        );
+    }
+
     describe_start_error_with_probe(ret, kvm_error.as_deref())
+}
+
+/// Whether the running binary carries the macOS hypervisor entitlement.
+///
+/// Probed with `codesign`, the same tool `smolvm_pack::signing` uses to add the
+/// entitlement when packing. An unreadable signature counts as missing (an
+/// unsigned binary is not entitled); a missing `codesign` counts as present, so
+/// a tooling gap never rewrites an unrelated boot failure.
+#[cfg(target_os = "macos")]
+fn has_hypervisor_entitlement() -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        return true;
+    };
+    // The packed run/start paths install a global `waitpid(-1)` SIGCHLD reaper
+    // before forking (`process::install_sigchld_handler`), which can reap
+    // `codesign` before `output()` waits and yield ECHILD — the same race
+    // `smolvm_pack::signing` documents. Probe under the default disposition.
+    let previous = unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
+    let probed = std::process::Command::new("codesign")
+        .args(["-d", "--entitlements", "-"])
+        .arg(&exe)
+        .output();
+    unsafe { libc::signal(libc::SIGCHLD, previous) };
+
+    let Ok(out) = probed else {
+        return true;
+    };
+    out.status.success() && entitlement_enabled(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Whether a `codesign -d --entitlements -` dump grants the hypervisor
+/// entitlement.
+///
+/// codesign names the key even when a signature sets it to `false`, so the
+/// value decides. It prints either `[Key] … [Value] [Bool] true` lines or an
+/// XML plist, so require a `true` between the key and the next entitlement.
+#[cfg(target_os = "macos")]
+fn entitlement_enabled(entitlements: &str) -> bool {
+    let Some((_, rest)) = entitlements.split_once("com.apple.security.hypervisor") else {
+        return false;
+    };
+    let mut value = rest;
+    if let Some(end) = value.find("[Key]") {
+        value = &value[..end];
+    }
+    if let Some(end) = value.find("<key>") {
+        value = &value[..end];
+    }
+    value.contains("true")
 }
 
 /// Pure core of [`describe_krun_start_error`], with the KVM probe result
@@ -877,6 +1088,46 @@ mod tests {
         let eio = describe_start_error_with_probe(-5, Some("should be ignored"));
         assert!(eio.contains("EIO"));
         assert!(!eio.contains("privilege drop"));
+    }
+
+    // cargo's test binaries are ad-hoc signed without entitlements, so a
+    // hypervisor-access errno must name the missing entitlement instead of the
+    // generic disk/overlay guess — while keeping the grep contract intact.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn describe_krun_start_error_names_missing_hypervisor_entitlement() {
+        let msg = describe_krun_start_error(-22);
+        assert!(msg.contains("krun_start_enter returned: -22"), "{msg}");
+        assert!(msg.contains("com.apple.security.hypervisor"), "{msg}");
+        assert!(msg.contains("codesign"), "{msg}");
+    }
+
+    // codesign names the entitlement key even when a signature sets it to
+    // false, so the value — not the key's presence — decides.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn entitlement_is_granted_only_when_value_is_true() {
+        assert!(entitlement_enabled(
+            "[Key] com.apple.security.hypervisor\n[Value]\n[Bool] true"
+        ));
+        assert!(!entitlement_enabled(
+            "[Key] com.apple.security.hypervisor\n[Value]\n[Bool] false"
+        ));
+        assert!(entitlement_enabled(
+            "<key>com.apple.security.hypervisor</key><true/>"
+        ));
+        assert!(!entitlement_enabled(
+            "<key>com.apple.security.hypervisor</key><false/>"
+        ));
+        // A later entitlement's `true` must not leak into the decision.
+        assert!(!entitlement_enabled(
+            "<key>com.apple.security.hypervisor</key><false/>\
+             <key>com.apple.security.cs.allow-jit</key><true/>"
+        ));
+        // A dump without the key at all is not granted.
+        assert!(!entitlement_enabled(
+            "<key>com.apple.security.cs.allow-jit</key><true/>"
+        ));
     }
 
     #[test]

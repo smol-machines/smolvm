@@ -318,6 +318,7 @@ impl PackCreateCmd {
                 network: true,
                 network_backend: None,
                 dns: None,
+                network_name: None,
                 gpu: false,
                 cuda: false,
                 storage_gib: None,
@@ -339,8 +340,8 @@ impl PackCreateCmd {
             &mut client,
             &image,
             pack_config.oci_platform.as_deref(),
-            self.proxy_opts.proxy(),
-            self.proxy_opts.no_proxy(),
+            self.proxy_opts.resolved_proxy()?.as_deref(),
+            self.proxy_opts.no_proxy().as_deref(),
         )?;
         debug!(image_info = ?image_info, "image pulled");
 
@@ -452,7 +453,12 @@ impl PackCreateCmd {
             let merged_file = collector.layer_staging_path(&merged_digest);
 
             let total_bytes = client
-                .read_file_to_path("/tmp/merged-layers.tar", &merged_file, |_| {})
+                .read_file_to_path_capped(
+                    "/tmp/merged-layers.tar",
+                    &merged_file,
+                    smolvm::agent::pack_export_max_total(),
+                    |_| {},
+                )
                 .map_err(|e| Error::agent("export merged layer", e.to_string()))?;
             println!(" {} MB done", total_bytes / (1024 * 1024));
 
@@ -536,6 +542,22 @@ impl PackCreateCmd {
             ));
         }
 
+        // The pack format has no notion of remote volumes; packing quietly
+        // producing an artifact without them would look like data loss at run
+        // time, so say it up front.
+        if !vm.remote_volumes.is_empty() {
+            warn!(
+                "VM '{}' has remote volumes ({}); .smolmachine artifacts do not carry them — \
+                 re-attach with -v when creating machines from this artifact",
+                vm_name,
+                vm.remote_volumes
+                    .iter()
+                    .map(|v| v.target.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+
         println!("Packing VM '{}' snapshot...", vm_name);
 
         // 2. Create temporary staging directory
@@ -553,8 +575,8 @@ impl PackCreateCmd {
         // single-layer flatten).
         self.collect_base_assets(&mut collector)?;
         let export_opts = smolvm::pack_export::FromVmExportOptions {
-            proxy: self.proxy_opts.proxy().map(str::to_string),
-            no_proxy: self.proxy_opts.no_proxy().map(str::to_string),
+            proxy: self.proxy_opts.resolved_proxy()?,
+            no_proxy: self.proxy_opts.no_proxy(),
             rebase_from_image: self.rebase_from_image,
         };
         let assets = smolvm::pack_export::collect_from_vm_assets(
@@ -969,13 +991,9 @@ impl PackCreateCmd {
         let mut total_bytes = 0u64;
         let mut last_progress = Instant::now();
         // Pack export legitimately streams multi-GiB layers (a provisioned
-        // VM's rootfs with baked venvs / model caches), so the general 4 GiB
-        // file-transfer cap is too small here: honor an explicit override,
-        // otherwise allow 64 GiB before calling the stream runaway.
-        let cap = std::env::var("SMOLVM_FILE_TRANSFER_MAX_BYTES")
-            .ok()
-            .and_then(|s| smolvm::util::parse_size_bytes(s.trim()).ok())
-            .unwrap_or(64 << 30);
+        // VM's rootfs with baked venvs / model caches), so it carries the
+        // pack ceiling rather than the general file-transfer cap.
+        let cap = smolvm::agent::pack_export_max_total();
         loop {
             if start.elapsed() > LAYER_EXPORT_TIMEOUT {
                 return Err(Error::agent(
@@ -1044,7 +1062,9 @@ impl PackCreateCmd {
 /// Clean up cached pack extractions to free disk space.
 ///
 /// Removes old extracted pack caches from ~/.cache/smolvm-pack/ and
-/// ~/.cache/smolvm-libs/. By default keeps the 5 most recently used.
+/// ~/.cache/smolvm-libs/. On Linux it also removes unreferenced shared pack
+/// extractions and immutable COW disk bases. By default keeps the 5 most
+/// recently used entries in addition to every artifact referenced by a machine.
 ///
 /// Examples:
 ///   smolvm pack prune              # keep 5 most recent
@@ -1053,11 +1073,11 @@ impl PackCreateCmd {
 ///   smolvm pack prune --dry-run    # show what would be removed
 #[derive(Args, Debug)]
 pub struct PackPruneCmd {
-    /// Number of cached extractions to keep (default: 5)
+    /// Number of unused cached entries to keep (default: 5)
     #[arg(long, default_value = "5", value_name = "N")]
     pub keep: usize,
 
-    /// Remove all cached extractions
+    /// Remove all unused cached entries (machine references are always retained)
     #[arg(long)]
     pub all: bool,
 
@@ -1072,6 +1092,53 @@ impl PackPruneCmd {
 
         let mut total_freed: u64 = 0;
         let mut total_removed: usize = 0;
+
+        // Validate every machine artifact lease before pruning any cache. A
+        // malformed live pointer therefore fails the whole command closed,
+        // without first deleting unrelated generic pack caches.
+        #[cfg(target_os = "linux")]
+        {
+            let report = smolvm::artifact_cache::prune_artifact_caches(keep, self.dry_run)
+                .map_err(|error| {
+                    smolvm::Error::agent("prune shared artifact caches", error.to_string())
+                })?;
+            if report.referenced_entries > 0 {
+                let noun = if report.referenced_entries == 1 {
+                    "entry"
+                } else {
+                    "entries"
+                };
+                println!(
+                    "  retaining {} artifact cache {} referenced by machines",
+                    report.referenced_entries, noun
+                );
+            }
+            for entry in report.entries {
+                let paths = entry
+                    .paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if self.dry_run {
+                    println!(
+                        "  would remove artifact cache {}: {} ({})",
+                        entry.artifact,
+                        paths,
+                        crate::cli::format_bytes(entry.allocated_bytes)
+                    );
+                } else {
+                    println!(
+                        "  removed artifact cache {}: {} ({})",
+                        entry.artifact,
+                        paths,
+                        crate::cli::format_bytes(entry.allocated_bytes)
+                    );
+                }
+                total_freed = total_freed.saturating_add(entry.allocated_bytes);
+                total_removed += 1;
+            }
+        }
 
         // Clean pack sidecar cache
         if let Some(base) = dirs::cache_dir() {

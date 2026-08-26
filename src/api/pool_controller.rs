@@ -241,27 +241,28 @@ impl ForkPoolController {
             .await
             .map_err(|e| e.to_string())?
             .map_err(|e| e.to_string())?;
-        let active_goldens = pools
-            .iter()
-            .filter(|pool| !pool.deleting)
-            .map(|pool| pool.golden.as_str())
+        // Retained checkpoints are shared by automatic pools and the plain
+        // machine fork API.  A checkpoint stays valid for as long as its
+        // source VM record exists; limiting this set to active pool goldens
+        // discarded ordinary fork checkpoints on the first serve restart.
+        let db = self.state.db().clone();
+        let checkpoint_sources = tokio::task::spawn_blocking(move || db.list_vms())
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|(name, _)| name)
             .collect::<std::collections::HashSet<_>>();
         let stale_snapshots = {
             let mut snapshots = self.retained_snapshots.lock();
-            let stale = snapshots
-                .keys()
-                .filter(|golden| !active_goldens.contains(golden.as_str()))
-                .cloned()
-                .collect::<Vec<_>>();
-            snapshots.retain(|golden, _| active_goldens.contains(golden.as_str()));
-            stale
+            retain_existing_checkpoint_sources(&mut snapshots, &checkpoint_sources)
         };
         if !stale_snapshots.is_empty() {
             let db = self.state.db().clone();
             match tokio::task::spawn_blocking(move || {
                 for golden in stale_snapshots {
                     if let Err(error) = db.remove_retained_fork_snapshot(&golden) {
-                        tracing::warn!(%golden, %error, "failed to remove inactive fork pool checkpoint");
+                        tracing::warn!(%golden, %error, "failed to remove orphan retained fork checkpoint");
                     }
                 }
             })
@@ -269,7 +270,7 @@ impl ForkPoolController {
             {
                 Ok(()) => {}
                 Err(error) => {
-                    tracing::warn!(%error, "inactive fork pool checkpoint cleanup task failed");
+                    tracing::warn!(%error, "orphan retained fork checkpoint cleanup task failed");
                 }
             }
         }
@@ -304,11 +305,23 @@ impl ForkPoolController {
         pools: &[ForkPoolRecord],
         sample: bool,
     ) -> Result<(), String> {
-        let gpu = if sample {
-            self.nvml.as_mut().and_then(|nvml| nvml.sample())
+        let gpu_devices = if sample {
+            self.nvml.as_mut().and_then(|nvml| nvml.sample_devices())
         } else {
             None
         };
+        if sample {
+            // Keep node capability reporting on the existing one-second NVML
+            // sampling path. A failed sample clears the cache so the fleet
+            // scheduler fails closed instead of dispatching to stale capacity.
+            self.state.record_cuda_devices(gpu_devices.clone());
+        }
+        let gpu = gpu_devices.as_ref().map(|devices| {
+            devices
+                .iter()
+                .map(|device| (device.device_ordinal, device.admission_sample()))
+                .collect::<std::collections::HashMap<_, _>>()
+        });
         let host_cpu = if sample { self.host_cpu.sample() } else { None };
         let mut observations = Vec::with_capacity(pools.len());
         for pool in pools.iter().filter(|pool| !pool.deleting) {
@@ -676,6 +689,19 @@ fn update_retained_snapshot(
     }
 }
 
+fn retain_existing_checkpoint_sources(
+    snapshots: &mut std::collections::HashMap<String, crate::agent::fork::RetainedForkSnapshot>,
+    checkpoint_sources: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let stale = snapshots
+        .keys()
+        .filter(|golden| !checkpoint_sources.contains(golden.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    snapshots.retain(|golden, _| checkpoint_sources.contains(golden.as_str()));
+    stale
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -708,6 +734,29 @@ mod tests {
         snapshots.insert("golden".into(), newer.clone());
         update_retained_snapshot(&mut snapshots, "golden", Some(&prior), None);
         assert_eq!(snapshots.get("golden"), Some(&newer));
+    }
+
+    #[test]
+    fn reconciliation_keeps_plain_machine_checkpoints_without_a_pool() {
+        let plain = snapshot("12345678", 1);
+        let pooled = snapshot("abcdef01", 2);
+        let orphan = snapshot("deadbeef", 3);
+        let mut snapshots = std::collections::HashMap::from([
+            ("plain-machine".into(), plain.clone()),
+            ("pool-golden".into(), pooled.clone()),
+            ("removed-machine".into(), orphan),
+        ]);
+        let checkpoint_sources = std::collections::HashSet::from([
+            "plain-machine".to_string(),
+            "pool-golden".to_string(),
+        ]);
+
+        let mut stale = retain_existing_checkpoint_sources(&mut snapshots, &checkpoint_sources);
+        stale.sort();
+
+        assert_eq!(stale, vec!["removed-machine"]);
+        assert_eq!(snapshots.get("plain-machine"), Some(&plain));
+        assert_eq!(snapshots.get("pool-golden"), Some(&pooled));
     }
 
     #[test]

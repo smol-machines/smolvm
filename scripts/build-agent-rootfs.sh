@@ -474,6 +474,18 @@ else
     echo "Skipping CUDA guest shims (no prebuilt paths, cross-arch, or no cargo) — auto-staging disabled in this rootfs"
 fi
 
+# Vulkan (Venus) guest driver bundle: the patched Mesa virtio ICD plus its
+# shared-library closure and the Vulkan loader, pinned by URL + sha256. The
+# agent bind-mounts it into --gpu workload containers so stock glibc images
+# get working Vulkan with no setup (crates/smolvm-agent/src/vulkan.rs).
+# Best-effort: without it, --gpu still works in the manual-setup mode.
+if "$SCRIPT_DIR/fetch-vulkan-guest-driver.sh" "$ALPINE_ARCH" "$OUTPUT_DIR/usr/local/lib/smolvm-vulkan"; then
+    echo "Installed Vulkan guest driver bundle"
+else
+    echo "Vulkan guest driver fetch failed — rootfs ships without auto-staging"
+    rm -rf "$OUTPUT_DIR/usr/local/lib/smolvm-vulkan"
+fi
+
 # Last, so it covers every file the steps above installed — not just the Alpine base.
 normalize_owner_only_modes "$OUTPUT_DIR"
 

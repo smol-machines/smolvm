@@ -61,8 +61,10 @@ fn main() {
             let check: Vec<f32> = cu
                 .memcpy_dtoh(va_a, 32, 0)
                 .unwrap()
-                .chunks_exact(4)
-                .map(|p| f32::from_le_bytes(p.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|p| f32::from_le_bytes(*p))
                 .collect();
             eprintln!("golden: wrote a; reads back a[0..8]={check:?}");
             std::fs::write(state, format!("{token} {va_a} {va_b} {va_c} {func}")).unwrap();
@@ -96,14 +98,18 @@ fn main() {
             let ra: Vec<f32> = cu
                 .memcpy_dtoh(va_a, 32, 0)
                 .expect("d2h a")
-                .chunks_exact(4)
-                .map(|p| f32::from_le_bytes(p.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|p| f32::from_le_bytes(*p))
                 .collect();
             let rb: Vec<f32> = cu
                 .memcpy_dtoh(va_b, 32, 0)
                 .expect("d2h b")
-                .chunks_exact(4)
-                .map(|p| f32::from_le_bytes(p.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|p| f32::from_le_bytes(*p))
                 .collect();
             eprintln!("clone: read golden a[0..8]={ra:?} b[0..8]={rb:?}");
             eprintln!("clone: launching vecadd with INHERITED func={func:#x}");
@@ -126,8 +132,10 @@ fn main() {
             cu.ctx_synchronize().expect("sync");
             let out = cu.memcpy_dtoh(va_c, (N * 4) as u64, 0).expect("d2h");
             let c: Vec<f32> = out
-                .chunks_exact(4)
-                .map(|p| f32::from_le_bytes(p.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|p| f32::from_le_bytes(*p))
                 .collect();
             let ok = (0..N).all(|i| (c[i] - (4 * i) as f32).abs() < 1e-2);
             std::fs::write(&done, "done").ok();

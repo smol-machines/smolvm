@@ -16,11 +16,8 @@ const OBSERVATION_WINDOW: Duration = Duration::from_secs(8);
 const MIN_STABLE_SAMPLES: u32 = 5;
 const PRESSURE_TTL: Duration = Duration::from_secs(30);
 const REPROBE_INTERVAL: Duration = Duration::from_secs(15 * 60);
-#[cfg(any(target_os = "linux", test))]
 const TARGET_VRAM_RESERVE_MIB: u64 = 8 * 1024;
-#[cfg(any(target_os = "linux", test))]
 const VRAM_RESERVE_PERCENT: u64 = 10;
-#[cfg(any(target_os = "linux", test))]
 const SMALL_DEVICE_RESERVE_CAP_PERCENT: u64 = 25;
 const CPU_SATURATION_PERCENT: f64 = 90.0;
 const MARGINAL_GAIN_PERCENT: f64 = 2.0;
@@ -43,8 +40,40 @@ pub struct GpuSample {
     reserve_mib: u64,
 }
 
+/// Identity plus live telemetry for one CUDA-visible device. This is sampled
+/// once by the pool controller and shared with both admission and `/capacity`,
+/// so fleet polling never initializes NVML on the HTTP request path.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GpuDeviceSample {
+    /// CUDA-visible ordinal used by `SMOLVM_CUDA_DEVICE`.
+    pub device_ordinal: u32,
+    /// Stable physical-GPU or MIG UUID.
+    pub uuid: String,
+    /// Device model reported by NVML.
+    pub name: String,
+    /// Streaming-multiprocessor utilization.
+    pub utilization_percent: f64,
+    /// Used device memory in MiB.
+    pub used_memory_mib: u64,
+    /// Free device memory in MiB.
+    pub free_memory_mib: u64,
+    /// Total device memory in MiB.
+    pub total_memory_mib: u64,
+}
+
+impl GpuDeviceSample {
+    pub(crate) fn admission_sample(&self) -> GpuSample {
+        GpuSample::new(
+            self.device_ordinal,
+            self.utilization_percent,
+            self.used_memory_mib,
+            self.free_memory_mib,
+            self.total_memory_mib,
+        )
+    }
+}
+
 impl GpuSample {
-    #[cfg(any(target_os = "linux", test))]
     fn new(
         device_ordinal: u32,
         utilization_percent: f64,
@@ -67,7 +96,6 @@ impl GpuSample {
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
 fn device_reserve_mib(total_memory_mib: u64) -> u64 {
     let percentage_reserve = total_memory_mib.saturating_mul(VRAM_RESERVE_PERCENT) / 100;
     // An absolute 8 GiB reserve would consume all capacity on an 8 GiB GPU and
@@ -914,7 +942,7 @@ pub struct NvmlSampler {
         unsafe extern "C" fn(*const std::ffi::c_char, *mut *mut std::ffi::c_void) -> i32,
     memory_info: unsafe extern "C" fn(*mut std::ffi::c_void, *mut NvmlMemory) -> i32,
     utilization: unsafe extern "C" fn(*mut std::ffi::c_void, *mut NvmlUtilization) -> i32,
-    cuda_device_uuids: Vec<std::ffi::CString>,
+    cuda_devices: Vec<NvmlDeviceIdentity>,
 }
 
 #[cfg(target_os = "linux")]
@@ -948,8 +976,10 @@ struct NvmlPciInfo {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Clone)]
 struct NvmlDeviceIdentity {
     uuid: std::ffi::CString,
+    name: String,
     domain: u32,
     bus: u32,
     device: u32,
@@ -960,10 +990,10 @@ struct NvmlDeviceIdentity {
 fn select_visible_devices(
     mut devices: Vec<NvmlDeviceIdentity>,
     visible: Option<&str>,
-) -> Result<Vec<std::ffi::CString>, String> {
+) -> Result<Vec<NvmlDeviceIdentity>, String> {
     devices.sort_unstable_by_key(|device| (device.domain, device.bus, device.device));
     let Some(visible) = visible else {
-        return Ok(devices.into_iter().map(|device| device.uuid).collect());
+        return Ok(devices);
     };
     if visible.trim().is_empty() {
         return Ok(Vec::new());
@@ -981,7 +1011,7 @@ fn select_visible_devices(
                     devices.len()
                 ));
             };
-            selected.push(device.uuid.clone());
+            selected.push(device.clone());
             continue;
         }
         let matches = devices
@@ -993,7 +1023,7 @@ fn select_visible_devices(
                 "CUDA_VISIBLE_DEVICES token '{token}' did not uniquely identify an NVML device"
             ));
         }
-        selected.push(matches[0].uuid.clone());
+        selected.push(matches[0].clone());
     }
     Ok(selected)
 }
@@ -1009,6 +1039,8 @@ impl NvmlSampler {
         type DeviceByUuid =
             unsafe extern "C" fn(*const std::ffi::c_char, *mut *mut std::ffi::c_void) -> i32;
         type DeviceUuid =
+            unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_char, u32) -> i32;
+        type DeviceName =
             unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_char, u32) -> i32;
         type PciInfo = unsafe extern "C" fn(*mut std::ffi::c_void, *mut NvmlPciInfo) -> i32;
         type MigMode = unsafe extern "C" fn(*mut std::ffi::c_void, *mut u32, *mut u32) -> i32;
@@ -1038,6 +1070,9 @@ impl NvmlSampler {
             let device_uuid = *library
                 .get::<DeviceUuid>(b"nvmlDeviceGetUUID\0")
                 .map_err(|error| format!("resolve nvmlDeviceGetUUID: {error}"))?;
+            let device_name = *library
+                .get::<DeviceName>(b"nvmlDeviceGetName\0")
+                .map_err(|error| format!("resolve nvmlDeviceGetName: {error}"))?;
             let pci_info = match library.get::<PciInfo>(b"nvmlDeviceGetPciInfo_v3\0") {
                 Ok(symbol) => *symbol,
                 Err(_) => *library
@@ -1059,7 +1094,7 @@ impl NvmlSampler {
                 return Err(format!("nvmlInit_v2 returned {status}"));
             }
 
-            let cuda_device_uuids = (|| -> Result<Vec<std::ffi::CString>, String> {
+            let cuda_devices = (|| -> Result<Vec<NvmlDeviceIdentity>, String> {
                 let mut count = 0_u32;
                 let status = device_count(&mut count);
                 if status != 0 || count == 0 {
@@ -1082,6 +1117,14 @@ impl NvmlSampler {
                         return Err(format!("nvmlDeviceGetUUID({index}) returned {status}"));
                     }
                     let uuid = std::ffi::CStr::from_ptr(uuid.as_ptr()).to_owned();
+                    let mut name = [0 as std::ffi::c_char; 96];
+                    let status = device_name(device, name.as_mut_ptr(), name.len() as u32);
+                    if status != 0 {
+                        return Err(format!("nvmlDeviceGetName({index}) returned {status}"));
+                    }
+                    let name = std::ffi::CStr::from_ptr(name.as_ptr())
+                        .to_string_lossy()
+                        .into_owned();
                     let mut pci = NvmlPciInfo::default();
                     let status = pci_info(device, &mut pci);
                     if status != 0 {
@@ -1096,6 +1139,7 @@ impl NvmlSampler {
                     };
                     identities.push(NvmlDeviceIdentity {
                         uuid,
+                        name,
                         domain: pci.domain,
                         bus: pci.bus,
                         device: pci.device,
@@ -1124,7 +1168,23 @@ impl NvmlSampler {
                         if device_by_uuid(uuid.as_ptr(), &mut handle) != 0 || handle.is_null() {
                             return Err(format!("NVML could not resolve MIG UUID '{token}'"));
                         }
-                        selected.push(uuid);
+                        let mut name = [0 as std::ffi::c_char; 96];
+                        let status = device_name(handle, name.as_mut_ptr(), name.len() as u32);
+                        if status != 0 {
+                            return Err(format!(
+                                "nvmlDeviceGetName for MIG UUID '{token}' returned {status}"
+                            ));
+                        }
+                        selected.push(NvmlDeviceIdentity {
+                            uuid,
+                            name: std::ffi::CStr::from_ptr(name.as_ptr())
+                                .to_string_lossy()
+                                .into_owned(),
+                            domain: 0,
+                            bus: 0,
+                            device: 0,
+                            mig_enabled: true,
+                        });
                     }
                     selected
                 } else {
@@ -1135,8 +1195,8 @@ impl NvmlSampler {
                 }
                 Ok(selected)
             })();
-            let cuda_device_uuids = match cuda_device_uuids {
-                Ok(uuids) => uuids,
+            let cuda_devices = match cuda_devices {
+                Ok(devices) => devices,
                 Err(error) => {
                     shutdown();
                     return Err(error);
@@ -1148,20 +1208,23 @@ impl NvmlSampler {
                 device_by_uuid,
                 memory_info,
                 utilization,
-                cuda_device_uuids,
+                cuda_devices,
             })
         }
     }
 
-    /// Sample utilization and memory safety independently for each CUDA device.
-    pub fn sample(&mut self) -> Option<HashMap<u32, GpuSample>> {
+    /// Sample identity, utilization, and memory independently for every
+    /// CUDA-visible device.
+    pub fn sample_devices(&mut self) -> Option<Vec<GpuDeviceSample>> {
         // SAFETY: NVML owns device handles; all output pointers target valid,
         // initialized storage with the ABI layouts documented by NVML.
         unsafe {
-            let mut devices = HashMap::with_capacity(self.cuda_device_uuids.len());
-            for (index, uuid) in self.cuda_device_uuids.iter().enumerate() {
+            let mut samples = Vec::with_capacity(self.cuda_devices.len());
+            for (index, identity) in self.cuda_devices.iter().enumerate() {
                 let mut device = std::ptr::null_mut();
-                if (self.device_by_uuid)(uuid.as_ptr(), &mut device) != 0 || device.is_null() {
+                if (self.device_by_uuid)(identity.uuid.as_ptr(), &mut device) != 0
+                    || device.is_null()
+                {
                     return None;
                 }
                 let mut memory = NvmlMemory::default();
@@ -1172,19 +1235,28 @@ impl NvmlSampler {
                     return None;
                 }
                 let index = u32::try_from(index).ok()?;
-                devices.insert(
-                    index,
-                    GpuSample::new(
-                        index,
-                        f64::from(utilization.gpu),
-                        memory.used / (1024 * 1024),
-                        memory.free / (1024 * 1024),
-                        memory.total / (1024 * 1024),
-                    ),
-                );
+                samples.push(GpuDeviceSample {
+                    device_ordinal: index,
+                    uuid: identity.uuid.to_string_lossy().into_owned(),
+                    name: identity.name.clone(),
+                    utilization_percent: f64::from(utilization.gpu),
+                    used_memory_mib: memory.used / (1024 * 1024),
+                    free_memory_mib: memory.free / (1024 * 1024),
+                    total_memory_mib: memory.total / (1024 * 1024),
+                });
             }
-            Some(devices)
+            Some(samples)
         }
+    }
+
+    /// Sample the compact telemetry used by fork-pool admission.
+    pub fn sample(&mut self) -> Option<HashMap<u32, GpuSample>> {
+        Some(
+            self.sample_devices()?
+                .into_iter()
+                .map(|sample| (sample.device_ordinal, sample.admission_sample()))
+                .collect(),
+        )
     }
 }
 
@@ -1211,6 +1283,11 @@ impl NvmlSampler {
 
     /// Return no GPU sample on unsupported hosts.
     pub fn sample(&mut self) -> Option<HashMap<u32, GpuSample>> {
+        None
+    }
+
+    /// Return no detailed device telemetry on unsupported hosts.
+    pub fn sample_devices(&mut self) -> Option<Vec<GpuDeviceSample>> {
         None
     }
 }
@@ -1282,6 +1359,7 @@ mod tests {
             vec![
                 NvmlDeviceIdentity {
                     uuid: std::ffi::CString::new("GPU-second").unwrap(),
+                    name: "second".into(),
                     domain: 0,
                     bus: 2,
                     device: 0,
@@ -1289,6 +1367,7 @@ mod tests {
                 },
                 NvmlDeviceIdentity {
                     uuid: std::ffi::CString::new("GPU-first").unwrap(),
+                    name: "first".into(),
                     domain: 0,
                     bus: 1,
                     device: 0,
@@ -1300,7 +1379,7 @@ mod tests {
             select_visible_devices(devices(), None)
                 .unwrap()
                 .into_iter()
-                .map(|uuid| uuid.into_string().unwrap())
+                .map(|device| device.uuid.into_string().unwrap())
                 .collect::<Vec<_>>(),
             ["GPU-first", "GPU-second"]
         );
@@ -1308,7 +1387,7 @@ mod tests {
             select_visible_devices(devices(), Some("1,0"))
                 .unwrap()
                 .into_iter()
-                .map(|uuid| uuid.into_string().unwrap())
+                .map(|device| device.uuid.into_string().unwrap())
                 .collect::<Vec<_>>(),
             ["GPU-second", "GPU-first"]
         );

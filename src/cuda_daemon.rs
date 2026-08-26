@@ -475,7 +475,7 @@ fn validate_tensor_bundle_metadata(metadata: &[u8], allocation_size: u64) -> io:
         ));
     }
     let mut prior_end = 0u64;
-    for tensor in metadata[8 + manifest_len..].chunks_exact(16) {
+    for tensor in metadata[8 + manifest_len..].as_chunks::<16>().0 {
         let offset = u64::from_le_bytes(tensor[0..8].try_into().unwrap());
         let size = u64::from_le_bytes(tensor[8..16].try_into().unwrap());
         let end = offset
@@ -4287,7 +4287,7 @@ fn decode_attach_procmem(data: &[u8]) -> io::Result<Option<ProcMemAdvert>> {
         return Ok(None);
     }
     let mut regions = Vec::with_capacity(n);
-    for chunk in data[12..].chunks_exact(24) {
+    for chunk in data[12..].as_chunks::<24>().0 {
         regions.push((
             u64::from_le_bytes(chunk[0..8].try_into().unwrap()),
             u64::from_le_bytes(chunk[8..16].try_into().unwrap()),

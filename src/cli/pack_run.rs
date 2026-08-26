@@ -273,6 +273,48 @@ pub struct PackRunCmd {
     /// Implies --cuda; arbitrary eager CUDA calls are not captured.
     #[arg(long)]
     pub auto_graph: bool,
+
+    /// Egress policy already resolved by `machine run` when it serves a run
+    /// through this command instead of the direct boot path. Not a CLI flag:
+    /// direct `pack run` invocations carry no policy and keep the
+    /// manifest-driven behavior.
+    #[clap(skip)]
+    pub egress: Option<ResolvedEgressPolicy>,
+}
+
+/// Network policy resolved from `--allow-cidr`/`--allow-host`/
+/// `--outbound-localhost-only` and the Smolfile before a run is handed to the
+/// pack-run boot path. Without this the hand-off would silently drop the
+/// policy and boot the workload with unrestricted egress.
+#[derive(Debug, Clone, Default)]
+pub struct ResolvedEgressPolicy {
+    /// Overrides the manifest-driven network default entirely when set. A baked
+    /// cache artifact's manifest records the BAKE VM's networking (enabled, to
+    /// pull the image), not the workload's requested posture, so serving from
+    /// the cache must not let it re-enable outbound access. `None` keeps the
+    /// manifest fallback — a user-supplied `.smolmachine`'s manifest is the
+    /// packaged intent.
+    pub network_override: Option<bool>,
+    /// Outbound CIDR allow-list, with `--allow-host` names already resolved.
+    pub allowed_cidrs: Option<Vec<String>>,
+    /// Hostnames the guest DNS filter permits resolving.
+    pub dns_filter_hosts: Option<Vec<String>>,
+}
+
+/// Outbound-network decision for a pack-run boot: a resolved policy's override
+/// is absolute (matching the direct `machine run` path, where ports and the
+/// artifact manifest never re-enable networking); otherwise the manifest and
+/// flags decide as before.
+fn effective_network(
+    egress: Option<&ResolvedEgressPolicy>,
+    net_flag: bool,
+    manifest_network: bool,
+    has_ports: bool,
+) -> bool {
+    match egress.and_then(|policy| policy.network_override) {
+        Some(network) => network,
+        None => net_flag || manifest_network || has_ports,
+    }
 }
 
 impl PackRunCmd {
@@ -419,8 +461,14 @@ impl PackRunCmd {
             .storage_template
             .as_ref()
             .map(|t| t.path.as_str());
-        extract::create_or_copy_storage_disk(&cache_dir, template, &storage_path, storage_gib)
-            .map_err(|e| Error::agent("create storage disk", e.to_string()))?;
+        extract::create_or_copy_storage_disk(
+            &cache_dir,
+            template,
+            &storage_path,
+            manifest.assets.storage_logical_size,
+            storage_gib,
+        )
+        .map_err(|e| Error::agent("create storage disk", e.to_string()))?;
 
         let overlay_runtime_path = setup_vm_overlay(
             &manifest,
@@ -436,18 +484,33 @@ impl PackRunCmd {
         let resources = VmResources {
             cpus: self.cpus.unwrap_or(manifest.cpus),
             memory_mib: self.mem.unwrap_or(manifest.mem),
-            network: self.net || manifest.network || !self.port.is_empty(),
+            network: effective_network(
+                self.egress.as_ref(),
+                self.net,
+                manifest.network,
+                !self.port.is_empty(),
+            ),
             network_backend: self.net_backend,
             dns: None,
+            network_name: None,
             gpu: manifest.gpu,
             cuda: cuda_enabled,
             storage_gib,
             overlay_gib: self.overlay,
             gpu_vram_mib: None,
             rosetta: false,
-            allowed_cidrs: None,
+            allowed_cidrs: self
+                .egress
+                .as_ref()
+                .and_then(|policy| policy.allowed_cidrs.clone()),
         };
-        validate_requested_network_backend(&resources, None, self.port.len())?;
+        validate_requested_network_backend(
+            &resources,
+            self.egress
+                .as_ref()
+                .and_then(|policy| policy.dns_filter_hosts.as_deref()),
+            self.port.len(),
+        )?;
 
         // Build packed mounts for the launcher
         let packed_mounts = mounts_to_packed(&mounts);
@@ -478,6 +541,10 @@ impl PackRunCmd {
         let child_pid = {
             let vsock_path_clone = vsock_path.clone();
             let cuda_sock_clone = cuda_sock.clone();
+            let dns_filter_hosts = self
+                .egress
+                .as_ref()
+                .and_then(|policy| policy.dns_filter_hosts.clone());
             smolvm::process::fork_session_leader(move || {
                 // Child process: load libkrun via dlopen and launch VM
                 let krun = match unsafe { KrunFunctions::load(&lib_dir) } {
@@ -504,6 +571,7 @@ impl PackRunCmd {
                     } else {
                         None
                     },
+                    dns_filter_hosts,
                 };
 
                 // Detach from parent's terminal so libkrun doesn't
@@ -553,7 +621,10 @@ impl PackRunCmd {
                 cuda: false,
                 expose_docker: false,
                 published_sockets: Vec::new(),
-                dns_filter_hosts: None,
+                dns_filter_hosts: self
+                    .egress
+                    .as_ref()
+                    .and_then(|policy| policy.dns_filter_hosts.clone()),
                 packed_layers_dir: Some(layers_dir.to_path_buf()),
                 pack_idmap_source: None,
                 extra_disks: vec![],
@@ -566,7 +637,7 @@ impl PackRunCmd {
             std::fs::write(&config_path, &config_json)
                 .map_err(|e| Error::agent("write boot config", e.to_string()))?;
 
-            let exe = std::env::current_exe()
+            let exe = smolvm::process::self_exe_for_spawn()
                 .map_err(|e| Error::agent("find smolvm binary", e.to_string()))?;
             let mut cmd = std::process::Command::new(&exe);
             cmd.args(["_boot-vm", &config_path.to_string_lossy()])
@@ -1356,6 +1427,7 @@ fn run_ephemeral(
                 mem: args.mem,
                 storage: args.storage,
                 overlay: args.overlay,
+                egress: None,
                 force_extract,
                 info: false,
                 debug,
@@ -1466,8 +1538,14 @@ fn run_from_cache(
         .storage_template
         .as_ref()
         .map(|t| t.path.as_str());
-    extract::create_or_copy_storage_disk(cache_dir, template, &storage_path, storage_gib)
-        .map_err(|e| Error::agent("create storage disk", e.to_string()))?;
+    extract::create_or_copy_storage_disk(
+        cache_dir,
+        template,
+        &storage_path,
+        manifest.assets.storage_logical_size,
+        storage_gib,
+    )
+    .map_err(|e| Error::agent("create storage disk", e.to_string()))?;
 
     let overlay_runtime_path = setup_vm_overlay(
         manifest,
@@ -1484,6 +1562,7 @@ fn run_from_cache(
         network: args.net || manifest.network || !args.port.is_empty(),
         network_backend: args.net_backend,
         dns: None,
+        network_name: None,
         gpu: manifest.gpu,
         cuda: manifest.cuda,
         storage_gib,
@@ -1524,6 +1603,9 @@ fn run_from_cache(
             // CUDA-over-vsock for the persistent/daemon packed paths is not
             // wired yet; the `run` path starts the host server.
             cuda_socket: None,
+            // Packed binaries carry no egress flags; policy comes only from a
+            // `machine run` hand-off.
+            dns_filter_hosts: None,
         };
 
         // Detach from parent's terminal so libkrun doesn't
@@ -1576,7 +1658,7 @@ fn run_from_cache(
             .map_err(|e| Error::agent("serialize boot config", e.to_string()))?;
         std::fs::write(&config_path, &config_json)
             .map_err(|e| Error::agent("write boot config", e.to_string()))?;
-        let exe = std::env::current_exe()
+        let exe = smolvm::process::self_exe_for_spawn()
             .map_err(|e| Error::agent("find smolvm binary", e.to_string()))?;
         let mut cmd = std::process::Command::new(&exe);
         cmd.args(["_boot-vm", &config_path.to_string_lossy()])
@@ -1863,8 +1945,14 @@ fn daemon_start(
             .storage_template
             .as_ref()
             .map(|t| t.path.as_str());
-        extract::create_or_copy_storage_disk(&cache_dir, template, &storage_path, storage_gib)
-            .map_err(|e| Error::agent("create storage disk", e.to_string()))?;
+        extract::create_or_copy_storage_disk(
+            &cache_dir,
+            template,
+            &storage_path,
+            manifest.assets.storage_logical_size,
+            storage_gib,
+        )
+        .map_err(|e| Error::agent("create storage disk", e.to_string()))?;
     }
 
     // Create overlay disk (preserves existing disk on restart)
@@ -1887,6 +1975,7 @@ fn daemon_start(
         network: args.net || manifest.network || !args.port.is_empty(),
         network_backend: args.net_backend,
         dns: None,
+        network_name: None,
         gpu: manifest.gpu,
         cuda: manifest.cuda,
         storage_gib,
@@ -1950,6 +2039,9 @@ fn daemon_start(
             // CUDA-over-vsock for the persistent/daemon packed paths is not
             // wired yet; the `run` path starts the host server.
             cuda_socket: None,
+            // Packed binaries carry no egress flags; policy comes only from a
+            // `machine run` hand-off.
+            dns_filter_hosts: None,
         };
 
         // Detach from parent's terminal before launching the VM.
@@ -2152,4 +2244,49 @@ fn daemon_status(checksum: u32) -> smolvm::Result<()> {
 
     println!("Status: running (PID: {}, agent not responding)", pid);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolved_policy_decides_network_instead_of_the_baked_manifest() {
+        // The baked artifact's manifest records the bake VM's networking
+        // (enabled, for the pull); the workload asked for none. The override
+        // must win, and ports must not re-enable it either.
+        let closed = ResolvedEgressPolicy {
+            network_override: Some(false),
+            allowed_cidrs: None,
+            dns_filter_hosts: None,
+        };
+        assert!(!effective_network(Some(&closed), false, true, true));
+
+        let open = ResolvedEgressPolicy {
+            network_override: Some(true),
+            ..Default::default()
+        };
+        assert!(effective_network(Some(&open), false, false, false));
+    }
+
+    #[test]
+    fn policy_without_override_keeps_the_manifest_default() {
+        // A user-supplied `.smolmachine` carries its packaged intent: the
+        // allow-list rides along but the manifest still decides the default.
+        let policy = ResolvedEgressPolicy {
+            network_override: None,
+            allowed_cidrs: Some(vec!["140.82.112.0/20".to_string()]),
+            dns_filter_hosts: Some(vec!["github.com".to_string()]),
+        };
+        assert!(effective_network(Some(&policy), false, true, false));
+        assert!(!effective_network(Some(&policy), false, false, false));
+    }
+
+    #[test]
+    fn no_policy_preserves_the_flag_manifest_port_default() {
+        assert!(!effective_network(None, false, false, false));
+        assert!(effective_network(None, true, false, false));
+        assert!(effective_network(None, false, true, false));
+        assert!(effective_network(None, false, false, true));
+    }
 }

@@ -98,7 +98,9 @@ pub fn plan_launch_network(
         .is_some_and(|cidrs| !cidrs.is_empty());
     let has_dns_filter = dns_filter_hosts.is_some_and(|hosts| !hosts.is_empty());
     let has_host_service = guest_host_service_configured();
-    let wants_network = resources.network || has_ports || has_cidr_policy || has_dns_filter;
+    let has_fabric = resources.network_name.is_some();
+    let wants_network =
+        resources.network || has_ports || has_cidr_policy || has_dns_filter || has_fabric;
 
     if !wants_network {
         return LaunchNetworkPlan {
@@ -130,8 +132,16 @@ pub fn plan_launch_network(
     // networked machine under `serve` defaults to virtio-net — keep the API
     // schema docs on `networkBackend` (src/api/types.rs) in sync with this.
     let fleet_mode = std::env::var_os("SMOLVM_PUBLISH_ADDR").is_some();
+    // A named inter-VM network is fabric routing in the host-side stack, which
+    // only virtio-net has — it forces the default the same way ports do.
     let backend = resources.network_backend.unwrap_or(
-        if has_ports || fleet_mode || has_cidr_policy || has_dns_filter || has_host_service {
+        if has_ports
+            || fleet_mode
+            || has_cidr_policy
+            || has_dns_filter
+            || has_host_service
+            || has_fabric
+        {
             NetworkBackend::VirtioNet
         } else {
             NetworkBackend::Tsi
@@ -173,7 +183,11 @@ pub fn validate_requested_network_backend(
     // policy) ⇒ virtio-net. So only an EXPLICIT `--net-backend tsi` alongside
     // ports/egress is a misconfig.
     let backend = resources.network_backend.unwrap_or(
-        if port_count > 0 || has_egress_policy || has_host_service {
+        if port_count > 0
+            || has_egress_policy
+            || has_host_service
+            || resources.network_name.is_some()
+        {
             NetworkBackend::VirtioNet
         } else {
             NetworkBackend::Tsi
@@ -187,6 +201,15 @@ pub fn validate_requested_network_backend(
             "ports",
             "published ports require the virtio-net backend (TSI is outbound-only); \
              remove --net-backend tsi or set it to virtio-net",
+        ));
+    }
+
+    // A named network's fabric lives in the virtio-net stack; explicit TSI
+    // alongside --network would silently isolate the member.
+    if resources.network_name.is_some() && backend != NetworkBackend::VirtioNet {
+        return Err(crate::Error::config(
+            "network",
+            "--network requires the virtio-net backend; remove --net-backend tsi or set it to virtio-net",
         ));
     }
 

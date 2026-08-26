@@ -439,3 +439,106 @@ ensure_clean_test_environment() {
         ps aux | grep -E "(smolvm serve|smolvm-bin machine|smolvm machine)" | grep -v grep || true
     fi
 }
+
+# Drive the at/below-/workspace volume matrix against one machine source and
+# assert the host file RESOLVES inside the guest at every target.
+#
+# The /storage/workspace fallback is appended to the container spec after the
+# user's mounts. While its guard matched only an exact /workspace target, a user
+# mount at /workspace/project let the fallback through, and binding
+# /storage/workspace onto /workspace replaced the directory that nested mount
+# hangs from. The mount itself survived: /proc/self/mountinfo still listed the
+# target as virtiofs, so it still looked mounted, while every read through it
+# returned the empty fallback directory instead of the host's files.
+#
+# That is why this asserts file CONTENT. An assertion that greps
+# /proc/self/mountinfo passes on the broken build and is worth nothing here.
+#
+# Each target pins one rule:
+#   /workspace              exact match, always suppressed the fallback
+#   /workspace/project      the regression — absent before the fix
+#   /workspaces/project     the trap: shares the string prefix but is a sibling
+#                           rather than a child, so it still gets the fallback
+#                           and must still resolve
+#   /mnt/project            unrelated target, fallback still added
+#   /opt/workspace/project  /workspace appears mid-path and must not match
+#
+# A trailing-slash target is deliberately NOT driven here: any volume target
+# written with a trailing slash fails `machine start` outright, on /mnt/ and
+# /data/ just as much as under /workspace, so it cannot reach the guard this
+# exercises. The guard's own slash-normalization is covered by the unit test.
+#
+# Usage: assert_volume_targets_resolve <label> <machine-create-arg>...
+#   e.g. assert_volume_targets_resolve img --image alpine:latest --net
+#        assert_volume_targets_resolve packed --from /path/to/x.smolmachine
+assert_volume_targets_resolve() {
+    local label="$1"
+    shift
+    local source_args=("$@")
+
+    local targets=(
+        "/workspace"
+        "/workspace/project"
+        "/workspaces/project"
+        "/mnt/project"
+        "/opt/workspace/project"
+    )
+
+    local failures=()
+    local idx=0
+
+    for target in "${targets[@]}"; do
+        idx=$((idx + 1))
+        local vm_name="volws-$label-$idx-$$"
+        # The path to read back: the mount target without a trailing slash.
+        local read_path="${target%/}"
+        local marker="host-marker-$label-$idx-$$"
+
+        local tmpdir
+        tmpdir=$(mktemp -d)
+        echo "$marker" > "$tmpdir/marker.txt"
+
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
+
+        if ! $SMOLVM machine create --name "$vm_name" "${source_args[@]}" \
+            -v "$tmpdir:$target" 2>&1; then
+            failures+=("$target: create failed")
+            rm -rf "$tmpdir"
+            continue
+        fi
+
+        run_with_timeout 120 $SMOLVM machine start --name "$vm_name" >/dev/null 2>&1
+        if [[ $? -eq 124 ]]; then
+            failures+=("$target: TIMEOUT on start")
+            $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
+            rm -rf "$tmpdir"
+            continue
+        fi
+
+        local exec_out
+        exec_out=$(run_with_timeout 30 $SMOLVM machine exec --name "$vm_name" -- \
+            cat "$read_path/marker.txt" 2>&1)
+        local exec_rc=$?
+
+        if [[ $exec_rc -eq 124 ]]; then
+            failures+=("$target: TIMEOUT on exec")
+        elif [[ "$exec_out" != *"$marker"* ]]; then
+            # When the fallback shadows the mount this reads as "No such file or
+            # directory" on a target the guest's mount table still lists.
+            failures+=("$target: expected '$marker', got '$exec_out'")
+        fi
+
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
+        rm -rf "$tmpdir"
+        ensure_data_dir_deleted "$vm_name"
+    done
+
+    if [[ ${#failures[@]} -gt 0 ]]; then
+        echo "FAIL: ${#failures[@]} of ${#targets[@]} targets did not resolve:"
+        printf '  %s\n' "${failures[@]}"
+        return 1
+    fi
+    return 0
+}

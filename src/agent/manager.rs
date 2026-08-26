@@ -78,6 +78,13 @@ struct RunningVmConfig {
     mounts: Vec<HostMount>,
     ports: Vec<PortMapping>,
     resources: VmResources,
+    /// Whether the running VM was launched forkable (memfd-backed RAM). Persisted
+    /// so a config-change restart can re-assert it: without this a routine
+    /// reconfigure relaunches a forkable golden without memfd and silently breaks
+    /// forking — the live VM loses forkability while the control DB still marks
+    /// the machine forkable, so every later fork fails "no memfd-backed RAM".
+    #[serde(default)]
+    forkable: bool,
 }
 
 impl RunningVmConfig {
@@ -184,6 +191,10 @@ struct AgentInner {
     resources: VmResources,
     /// Whether the in-memory config is trustworthy.
     config_state: ConfigState,
+    /// Whether the running VM was launched forkable (memfd-backed RAM). Tracked so
+    /// a config-change restart preserves forkability instead of relaunching a
+    /// forkable golden as a plain VM. Restored from disk on reconnect.
+    forkable: bool,
     /// If true, the agent has been detached and should not be stopped on drop.
     detached: bool,
     /// True for the most recent launch via a fork snapshot. A clone resumes past
@@ -360,6 +371,97 @@ pub fn egress_telemetry_file(name: &str) -> PathBuf {
     vm_data_dir(name).join("egress")
 }
 
+/// Per-VM egress denial audit log: `<vm_data_dir>/egress-denials.log`. The
+/// virtio-net runtime appends one line per denied connect/sendto/resolve
+/// (append mode, so prior boots survive; rotated once past 8 MiB). Dedicated
+/// so ordinary connection chatter in the boot log can never evict an audit
+/// event. Resolved from the name on both sides of the process boundary, like
+/// [`egress_telemetry_file`].
+pub fn egress_denials_log_file(name: &str) -> PathBuf {
+    vm_data_dir(name).join(smolvm_network::EGRESS_DENIALS_LOG)
+}
+
+/// One egress denial observed by the VMM: the policy refused a guest's
+/// connect or sendto toward `dest`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct EgressDenial {
+    /// Denial time as logged by the VMM (RFC 3339, microsecond precision), or
+    /// empty when the line carried no parseable timestamp.
+    pub timestamp: String,
+    /// The refused operation: `connect` (TCP) or `sendto` (UDP).
+    pub operation: String,
+    /// The destination the guest tried to reach, as `ip:port`.
+    pub dest: String,
+}
+
+/// How much of the denial log tail to scan. The file holds only denial lines
+/// (~100 bytes each), so this window is a few thousand events — far more than
+/// a caller pages through — while bounding the read.
+const EGRESS_DENIAL_SCAN_BYTES: u64 = 256 * 1024;
+
+/// Read the egress denials recorded for `name`, oldest first, capped at
+/// `limit`. Returns an empty list when the machine has no VMM log (never
+/// booted, or built before the log existed) — absence of the file is
+/// "no denials observed", not an error.
+pub fn read_egress_denials(name: &str, limit: usize) -> Vec<EgressDenial> {
+    let path = egress_denials_log_file(name);
+    let Ok(mut file) = std::fs::File::open(&path) else {
+        return Vec::new();
+    };
+    use std::io::{Read, Seek, SeekFrom};
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if len > EGRESS_DENIAL_SCAN_BYTES {
+        let _ = file.seek(SeekFrom::End(-(EGRESS_DENIAL_SCAN_BYTES as i64)));
+    }
+    let mut tail = String::new();
+    if file.read_to_string(&mut tail).is_err() {
+        return Vec::new();
+    }
+    let mut events: Vec<EgressDenial> = tail.lines().filter_map(parse_egress_denial_line).collect();
+    if events.len() > limit {
+        events.drain(..events.len() - limit);
+    }
+    events
+}
+
+/// Parse one boot-log line into a denial event, or `None` for any other line.
+///
+/// The virtio-net runtime emits three shapes (see `smolvm-network`'s tcp/udp
+/// relays and DNS filter), prefixed `[<ts>]: `:
+///   `egress policy denied connect to <ip:port>`
+///   `egress policy denied sendto <ip:port>`
+///   `egress policy denied resolve <hostname>`
+/// Matching is anchored on the `egress policy denied ` marker rather than the
+/// prefix, so surrounding format drift can't silently discard events; libkrun's
+/// TSI muxer logs the same marker, so those parse too if they ever appear.
+fn parse_egress_denial_line(line: &str) -> Option<EgressDenial> {
+    const MARKER: &str = "egress policy denied ";
+    let after = &line[line.find(MARKER)? + MARKER.len()..];
+    let (operation, rest) = after.split_once(' ')?;
+    if operation != "connect" && operation != "sendto" && operation != "resolve" {
+        return None;
+    }
+    let dest = rest.strip_prefix("to ").unwrap_or(rest).trim();
+    if dest.is_empty() {
+        return None;
+    }
+    // virtio-net lines look like `[2026-08-13T02:31:05Z]: ...`; env_logger's
+    // (libkrun) like `[2026-08-13T02:31:05.123456Z WARN ...] ...`. Both start
+    // with a bracketed timestamp token.
+    let timestamp = line
+        .strip_prefix('[')
+        .and_then(|r| r.split_whitespace().next())
+        .unwrap_or("")
+        .trim_end_matches(':')
+        .trim_end_matches(']')
+        .to_string();
+    Some(EgressDenial {
+        timestamp,
+        operation: operation.to_string(),
+        dest: dest.to_string(),
+    })
+}
+
 /// How often the VM subprocess flushes its egress counter to disk. The control
 /// plane's egress rollup runs on a multi-minute cadence, so a value this small
 /// keeps the file comfortably fresh while writing only a few bytes.
@@ -405,6 +507,19 @@ pub fn vm_cache_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join("smolvm")
         .join("vms")
+}
+
+/// Registry directory for a named inter-VM network
+/// (`<cache_dir>/smolvm/net/<hash16>/`), a sibling of the VM data dirs. Each
+/// member VM binds its fabric subnet's Unix socket here; the same 16-char
+/// name hash as [`vm_data_dir`] keeps every socket path inside the kernel's
+/// `sockaddr_un` budget regardless of the network's name.
+pub fn network_registry_dir(network: &str) -> PathBuf {
+    vm_cache_root()
+        .parent()
+        .map(|smolvm_root| smolvm_root.join("net"))
+        .unwrap_or_else(|| PathBuf::from("/tmp/smolvm-net"))
+        .join(vm_dir_hash(network))
 }
 
 /// Per-node registry for the collision-free per-VM uid allocator
@@ -707,6 +822,7 @@ impl AgentManager {
                 ports: Vec::new(),
                 resources: VmResources::default(),
                 config_state: ConfigState::Unknown,
+                forkable: false,
                 detached: false,
                 is_clone: false,
                 is_cuda_clone: false,
@@ -1102,6 +1218,7 @@ impl AgentManager {
                             inner.mounts = config.mounts;
                             inner.ports = config.ports;
                             inner.resources = config.resources;
+                            inner.forkable = config.forkable;
                             inner.config_state = ConfigState::Known;
                         }
                         Err(reason) => {
@@ -1145,6 +1262,9 @@ impl AgentManager {
             mounts: mounts.to_vec(),
             ports: ports.to_vec(),
             resources: resources.clone(),
+            // Read from inner: the launch path sets `inner.forkable` before this
+            // runs, so the persisted config records how the VM was actually booted.
+            forkable: self.inner.lock().forkable,
         };
         match serde_json::to_string(&config) {
             Ok(json) => {
@@ -1385,6 +1505,16 @@ impl AgentManager {
         // Re-attach packed layers if a config-change restart dropped them
         // (see `rewire_packed_layers_if_extracted`).
         self.rewire_packed_layers_if_extracted(&mut features)?;
+
+        // Preserve forkability across the restart. `forkable` is durable in the
+        // control DB, but this path uses whatever features the caller assembled —
+        // usually non-forkable — so without this a routine reconfigure relaunches
+        // a forkable golden without memfd-backed RAM, silently breaking every
+        // later fork. `stop()` above leaves `inner.forkable` intact, so it still
+        // reflects how the VM was actually running.
+        if self.inner.lock().forkable {
+            features.forkable = true;
+        }
 
         // Start with new config
         self.start_with_full_config(mounts, ports, resources, features)?;
@@ -1757,7 +1887,7 @@ impl AgentManager {
             ) {
                 let daemon_executable = match std::env::var_os("SMOLVM_BOOT_BINARY") {
                     Some(path) => PathBuf::from(path),
-                    None => std::env::current_exe()
+                    None => crate::process::self_exe_for_spawn()
                         .map_err(|error| Error::agent("find smolvm binary", error.to_string()))?,
                 };
                 crate::cuda_daemon::ensure_running_with_executable(
@@ -1919,6 +2049,7 @@ impl AgentManager {
             let mut inner = self.inner.lock();
             inner.is_clone = fork_clone;
             inner.is_cuda_clone = cuda_clone;
+            inner.forkable = features.forkable;
         }
 
         // Per-VM uid isolation: when running privileged (root `serve`), give this
@@ -1983,6 +2114,15 @@ impl AgentManager {
                 crate::process::ensure_traversable(&self.rootfs_path);
                 if let Some(home) = dirs::home_dir() {
                     crate::process::ensure_traversable(&home.join(".smolvm"));
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    // VM-mode `create --from` qcow2 disks point at immutable bases
+                    // in the node-wide COW store. libkrun opens those paths after
+                    // this process drops to the per-VM uid, so make the store's
+                    // ancestor chain traversable (the store itself remains
+                    // non-listable and Landlock grants only this VM's exact chain).
+                    crate::process::ensure_traversable(&crate::storage::cow_base_cache_root());
                 }
                 // Pre-create this VM's per-VM readiness marker owned by its uid
                 // (0600): the dropped guest can overwrite it but couldn't create a
@@ -2092,7 +2232,7 @@ impl AgentManager {
         );
 
         // Spawn fresh subprocess (posix_spawn on macOS — safe for multi-threaded parents)
-        let exe = std::env::current_exe()
+        let exe = crate::process::self_exe_for_spawn()
             .map_err(|e| Error::agent("find smolvm binary", e.to_string()))?;
         let spawn_start = Instant::now();
         // Embedders (e.g. the Node SDK, where current_exe is `node`) can point the
@@ -2322,6 +2462,13 @@ impl AgentManager {
         // Re-attach packed layers if a config-change restart dropped them
         // (see `rewire_packed_layers_if_extracted`).
         self.rewire_packed_layers_if_extracted(&mut features)?;
+
+        // Preserve forkability across the restart (see the note in
+        // `ensure_running_with_full_config`): a reconfigure must not silently
+        // relaunch a forkable golden without memfd-backed RAM.
+        if self.inner.lock().forkable {
+            features.forkable = true;
+        }
 
         self.start_via_subprocess(mounts, ports, resources, features)?;
         Ok(true)
@@ -3025,6 +3172,111 @@ mod tests {
     fn restored_cuda_clones_fail_faster_than_other_boots() {
         assert_eq!(agent_ready_timeout(true), Duration::from_secs(10));
         assert_eq!(agent_ready_timeout(false), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn running_config_persists_forkable_and_stays_backward_compatible() {
+        // Round-trip: forkable survives save/load, so a config-change restart can
+        // re-assert it — the fix for a golden silently losing memfd-backed RAM
+        // when a routine reconfigure relaunches it without SMOLVM_FORKABLE.
+        let cfg = RunningVmConfig {
+            version: RunningVmConfig::CURRENT_VERSION,
+            mounts: Vec::new(),
+            ports: Vec::new(),
+            resources: VmResources::default(),
+            forkable: true,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: RunningVmConfig = serde_json::from_str(&json).unwrap();
+        assert!(
+            back.forkable,
+            "forkable must round-trip through the config file"
+        );
+
+        // Backward compatibility: a config written before this field existed (drop
+        // it from a real serialization) must still load, defaulting to
+        // non-forkable rather than failing the reconnect and forcing a restart.
+        let mut val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        val.as_object_mut().unwrap().remove("forkable");
+        let parsed: RunningVmConfig =
+            serde_json::from_value(val).expect("a pre-forkable config must still deserialize");
+        assert!(
+            !parsed.forkable,
+            "a missing forkable field defaults to false"
+        );
+    }
+
+    /// The three denial shapes the virtio-net runtime emits parse into
+    /// structured events — and libkrun's muxer format parses too — while
+    /// everything else in a boot log is ignored.
+    #[test]
+    fn egress_denial_lines_parse_and_noise_is_ignored() {
+        let connect = parse_egress_denial_line(
+            "[2026-08-14T03:13:08Z]: egress policy denied connect to 8.8.8.8:443",
+        )
+        .expect("connect line parses");
+        assert_eq!(connect.timestamp, "2026-08-14T03:13:08Z");
+        assert_eq!(connect.operation, "connect");
+        assert_eq!(connect.dest, "8.8.8.8:443");
+
+        let sendto = parse_egress_denial_line(
+            "[2026-08-14T03:13:09Z]: egress policy denied sendto 9.9.9.9:123",
+        )
+        .expect("sendto line parses");
+        assert_eq!(sendto.operation, "sendto");
+        assert_eq!(sendto.dest, "9.9.9.9:123");
+
+        let resolve = parse_egress_denial_line(
+            "[2026-08-14T03:13:10Z]: egress policy denied resolve evil.example.com",
+        )
+        .expect("resolve line parses");
+        assert_eq!(resolve.operation, "resolve");
+        assert_eq!(resolve.dest, "evil.example.com");
+
+        // libkrun's TSI muxer format (env_logger) parses as well.
+        let muxer = parse_egress_denial_line(
+            "[2026-08-13T02:31:05.123456Z WARN  devices::virtio::vsock::muxer] \
+             egress policy denied connect to 93.184.215.14:443",
+        )
+        .expect("muxer line parses");
+        assert_eq!(muxer.timestamp, "2026-08-13T02:31:05.123456Z");
+        assert_eq!(muxer.dest, "93.184.215.14:443");
+
+        for noise in [
+            "[2026-08-14T03:13:08Z]: virtio-net: guest TCP SYN source=x destination=y",
+            "[2026-08-13T02:31:07Z INFO  libkrun] egress policy configured with 2 CIDR rule(s)",
+            "plain unrelated stderr line",
+            "[ts WARN x] egress policy denied", // no operation/dest
+        ] {
+            assert!(
+                parse_egress_denial_line(noise).is_none(),
+                "must ignore: {noise}"
+            );
+        }
+    }
+
+    /// `read_egress_denials` reads the newest events from the log tail and
+    /// honors the caller's cap, keeping the most recent entries.
+    #[test]
+    fn read_egress_denials_caps_to_newest() {
+        // Write the log exactly where vmm_log_file() resolves for a
+        // pid-namespaced throwaway name, and remove that dir afterwards.
+        let name = format!("egress-test-{}", std::process::id());
+        let log = egress_denials_log_file(&name);
+        std::fs::create_dir_all(log.parent().expect("parent")).expect("mkdir");
+        let mut contents = String::new();
+        for i in 0..10 {
+            contents.push_str(&format!(
+                "[2026-08-13T02:31:{i:02}Z]: egress policy denied connect to 10.0.0.{i}:443\n"
+            ));
+        }
+        std::fs::write(&log, contents).expect("write log");
+
+        let events = read_egress_denials(&name, 3);
+        std::fs::remove_dir_all(vm_data_dir(&name)).ok();
+        assert_eq!(events.len(), 3, "capped to limit");
+        assert_eq!(events[0].dest, "10.0.0.7:443", "oldest of the kept tail");
+        assert_eq!(events[2].dest, "10.0.0.9:443", "newest kept last");
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

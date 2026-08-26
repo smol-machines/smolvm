@@ -92,6 +92,7 @@ use state::ApiState;
         handlers::machines::create_machine,
         handlers::machines::list_machines,
         handlers::machines::get_machine,
+        handlers::machines::get_machine_egress_events,
         handlers::machines::start_machine,
         handlers::machines::fork_machine,
         handlers::machines::release_held_fork,
@@ -157,7 +158,10 @@ use state::ApiState;
         // Response types
         types::HealthResponse,
         types::CapacityResponse,
+        types::CudaDeviceCapacity,
         types::MachineInfo,
+        types::EgressDenialInfo,
+        types::EgressEventsResponse,
         types::MountInfo,
         types::ListMachinesResponse,
         types::ExecResponse,
@@ -256,6 +260,10 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .route("/", post(handlers::machines::create_machine))
         .route("/", get(handlers::machines::list_machines))
         .route("/{id}", get(handlers::machines::get_machine))
+        .route(
+            "/{id}/egress-events",
+            get(handlers::machines::get_machine_egress_events),
+        )
         .route("/{id}/start", post(handlers::machines::start_machine))
         .route("/{id}/fork", post(handlers::machines::fork_machine))
         .route(

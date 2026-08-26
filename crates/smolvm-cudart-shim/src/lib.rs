@@ -30,10 +30,11 @@
 #![allow(non_snake_case)]
 
 use smolvm_cuda::client::{Client, CudaRpcError};
+use smolvm_cuda::proto::Request;
 mod cublas_stubs;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
+use std::ffi::{c_char, c_int, c_uint, c_void, CStr};
 use std::io::{Read, Write};
 use std::sync::Mutex;
 
@@ -46,6 +47,7 @@ const CUDA_ERROR_INITIALIZATION: c_int = 3;
 const CUDA_ERROR_INVALID_SYMBOL: c_int = 13;
 const CUDA_ERROR_INVALID_DEVICE_POINTER: c_int = 17;
 const CUDA_ERROR_INVALID_RESOURCE_HANDLE: c_int = 400;
+const CUDA_ERROR_ILLEGAL_STATE: c_int = 401;
 const CUDA_ERROR_NO_DEVICE: c_int = 100;
 const CUDA_ERROR_NOT_SUPPORTED: c_int = 801;
 const CUDA_ERROR_UNKNOWN: c_int = 999;
@@ -191,6 +193,7 @@ struct FuncRec {
 /// them just like the native runtime does.
 struct LibraryRec {
     module: u64,
+    device: i32,
     kernels: Vec<usize>,
     globals: Vec<u64>,
 }
@@ -202,29 +205,55 @@ struct SymbolRec {
     address: u64,
 }
 
+#[derive(Clone)]
+struct StaticFuncRec {
+    fatbin: usize,
+    name: String,
+}
+
+#[derive(Clone)]
+struct StaticSymbolRec {
+    fatbin: usize,
+    name: String,
+}
+
 struct ShimState {
     client: Client<Stream>,
     initialized: bool,
     /// `__cudaRegisterFatBinary` handle (the pointer we minted) → driver module id.
-    modules: HashMap<usize, u64>,
+    modules: HashMap<(i32, usize), u64>,
     /// `__cudaRegisterFunction` host stub pointer → resolved kernel.
-    funcs: HashMap<usize, FuncRec>,
+    funcs: HashMap<(i32, usize), FuncRec>,
     /// `cudaLibrary_t` virtual handle → loaded driver module and its kernels.
     libraries: HashMap<usize, LibraryRec>,
     /// Runtime host-symbol address → module/name for driver global lookup.
-    symbols: HashMap<usize, SymbolRec>,
+    symbols: HashMap<(i32, usize), SymbolRec>,
     /// Host pinned-memory allocations (guest RAM) → layout, for cudaFreeHost.
     host_allocs: HashMap<usize, std::alloc::Layout>,
+    /// CPU-visible mapped-host range → daemon GPU-visible pointer. The two
+    /// virtual addresses differ across the remoting boundary.
+    host_device_ptrs: std::collections::BTreeMap<u64, (u64, u64)>,
+    driver_host_allocs: std::collections::HashSet<u64>,
     /// Live device allocations, base → size. Range-queried (not exact-match):
     /// PyTorch's caching allocator suballocates, so tensor data pointers are
     /// interior to a cudaMalloc'd block — `cudaPointerGetAttributes` on one
     /// must still report Device or torch's `getDeviceFromPtr` throws.
-    dev_allocs: std::collections::BTreeMap<u64, u64>,
-    /// Active CUDA graph capture, `(stream_handle, capture_id)`. Kept
-    /// guest-side so the per-launch hot queries (`cudaStreamIsCapturing`,
-    /// `cudaStreamGetCaptureInfo` — PyTorch's allocator calls them constantly)
-    /// answer locally instead of round-tripping.
-    capture: Option<(u64, u64)>,
+    dev_allocs: std::collections::BTreeMap<u64, (u64, i32)>,
+    /// Active CUDA graph captures keyed by root stream. Multiple relaxed-mode
+    /// captures may coexist in one process. Root-stream queries stay local;
+    /// side streams use the host capture ID to find the matching local record.
+    captures: HashMap<u64, CaptureRecord>,
+    /// Virtual captured graph handle → exact node count returned alongside the
+    /// synchronous EndCapture response. This makes GraphGetNodes a local,
+    /// truthful query rather than one extra RTT per graph.
+    graph_node_counts: HashMap<u64, usize>,
+    /// Same-flag raw events provisioned in one host round trip. Frameworks
+    /// create/destroy events at very high frequency; keeping a small local
+    /// handle reserve removes synchronous creation RTTs without changing event
+    /// ordering, query, or destruction semantics.
+    event_spares: HashMap<(i32, u32), Vec<u64>>,
+    stream_devices: HashMap<u64, i32>,
+    event_devices: HashMap<u64, i32>,
     /// PID that opened `client`. If the process forks (or a snapshotted VM is
     /// restored as a clone), the inherited socket fd + ring mapping belong to
     /// the parent and are dead here; a mismatch triggers a transparent
@@ -246,9 +275,34 @@ struct ShimState {
     /// first post-fork call), so `with_client_retrying` forces an unconditional
     /// reconnect on its retry instead of trusting the peek.
     force_reconnect: bool,
+    /// Primary-context handles retained on this host connection, keyed by the
+    /// guest-visible device ordinal, plus the device currently bound on the
+    /// single host serving thread.
+    primary_ctx: HashMap<i32, u64>,
+    bound_device: Option<i32>,
+    /// Exact context currently bound on the daemon's single serving thread.
+    /// Driver and runtime calls share this connection, so a device ordinal
+    /// alone cannot describe an explicit driver context.
+    bound_context: Option<u64>,
+    /// Driver API's intended current context. Runtime calls temporarily bind a
+    /// primary context; the next bridged driver call restores this one first.
+    bridge_context: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+struct CaptureRecord {
+    local_id: u64,
+    host_id: Option<u64>,
 }
 
 static STATE: Mutex<Option<ShimState>> = Mutex::new(None);
+// Native libcudart only records static fatbins during ELF initialization and
+// materializes a module when one of its kernels/globals is first used. Keep the
+// same split here: registration must not connect to the host or upload hundreds
+// of unused modules in tokenizer/controller processes that merely import torch.
+static STATIC_MODULES: Mutex<Option<HashMap<usize, Vec<u8>>>> = Mutex::new(None);
+static STATIC_FUNCS: Mutex<Option<HashMap<usize, StaticFuncRec>>> = Mutex::new(None);
+static STATIC_SYMBOLS: Mutex<Option<HashMap<usize, StaticSymbolRec>>> = Mutex::new(None);
 
 thread_local! {
     /// `__cudaPushCallConfiguration` stash, popped by `__cudaPopCallConfiguration`.
@@ -259,6 +313,9 @@ thread_local! {
     /// op never reached the host. `retry_transport_c` consults this to decide
     /// that one forced-reconnect retry runs the op exactly once.
     static TRANSPORT_ERR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// CUDA runtime device selection is thread-local. The shared RPC connection
+    /// rebinds its host context before serving each calling thread.
+    static CURRENT_DEVICE: std::cell::Cell<c_int> = const { std::cell::Cell::new(0) };
 }
 
 fn set_last(code: c_int) -> c_int {
@@ -283,6 +340,10 @@ fn map_err(e: CudaRpcError) -> c_int {
             200 | 218 => CUDA_ERROR_INVALID_VALUE, // invalid image / PTX
             400 => CUDA_ERROR_INVALID_RESOURCE_HANDLE,
             801 => CUDA_ERROR_NOT_SUPPORTED,
+            // Driver and Runtime capture failures intentionally use the same
+            // numeric range. Preserve them so frameworks can distinguish an
+            // invalidated capture from a transport or unknown device failure.
+            900..=910 => code,
             other => {
                 if std::env::var_os("SMOLVM_CUDA_SHIM_TRACE").is_some() {
                     eprintln!("[map-err] unmapped driver code {other}");
@@ -453,6 +514,107 @@ pub extern "C" fn smolvm_cuda_publish_tensor_bundle(
 /// retries with a big-enough one (null request = fetch).
 static BRIDGE_PENDING: Mutex<Option<Vec<u8>>> = Mutex::new(None);
 
+fn set_bound_context(state: &mut ShimState, context: u64) {
+    state.bound_context = Some(context);
+    state.bound_device = state
+        .primary_ctx
+        .iter()
+        .find_map(|(&device, &candidate)| (candidate == context).then_some(device));
+}
+
+/// Restore the driver API's current context after any intervening runtime API
+/// call. Both APIs share one daemon connection, so this must happen while the
+/// same state lock also protects the following driver request.
+fn prepare_bridge_context(state: &mut ShimState) -> Result<(), c_int> {
+    if let Some(context) = state.bridge_context {
+        if state.bound_context != Some(context) {
+            state.client.ctx_set_current(context).map_err(map_err)?;
+            set_bound_context(state, context);
+        }
+    }
+    Ok(())
+}
+
+fn response_succeeded(payload: &[u8]) -> bool {
+    payload
+        .get(..4)
+        .map(|status| i32::from_le_bytes(status.try_into().unwrap()) == 0)
+        .unwrap_or(false)
+}
+
+fn response_handle(payload: &[u8]) -> Option<u64> {
+    response_succeeded(payload)
+        .then(|| payload.get(4..12))
+        .flatten()
+        .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+/// Mirror context-changing driver requests so later bridged operations can be
+/// rebound after a runtime call temporarily selected another device/context.
+fn finish_bridge_context(state: &mut ShimState, request: &Request, payload: &[u8]) {
+    if !response_succeeded(payload) {
+        return;
+    }
+    match request {
+        Request::CtxSetCurrent { ctx } => {
+            state.bridge_context = Some(*ctx);
+            set_bound_context(state, *ctx);
+        }
+        Request::CtxCreate { device } | Request::PrimaryCtxRetain { device } => {
+            if let Some(context) = response_handle(payload) {
+                if matches!(request, Request::PrimaryCtxRetain { .. }) {
+                    state.primary_ctx.entry(*device).or_insert(context);
+                }
+                state.bridge_context = Some(context);
+                set_bound_context(state, context);
+            }
+        }
+        Request::CtxDestroy { ctx } if state.bridge_context == Some(*ctx) => {
+            state.bridge_context = Some(0);
+            set_bound_context(state, 0);
+        }
+        Request::PrimaryCtxRelease { device }
+            if state
+                .primary_ctx
+                .get(device)
+                .is_some_and(|context| state.bridge_context == Some(*context)) =>
+        {
+            state.bridge_context = None;
+            state.bound_context = None;
+            state.bound_device = None;
+        }
+        _ => {}
+    }
+}
+
+fn bridge_raw_quiet(bytes: &[u8]) -> Result<(), c_int> {
+    let request = smolvm_cuda::proto::decode_request(bytes).ok();
+    with_client_state(false, |state| {
+        prepare_bridge_context(state)?;
+        state.client.raw_quiet(bytes).map_err(map_err)?;
+        // CtxSetCurrent is ordered but response-free. Mirror its virtual
+        // context immediately so the next bridged Driver call does not restore
+        // the context that preceded this queued bind.
+        if let Some(Request::CtxSetCurrent { ctx }) = request {
+            state.bridge_context = Some(ctx);
+            set_bound_context(state, ctx);
+        }
+        Ok(())
+    })
+}
+
+fn bridge_raw_call(bytes: &[u8]) -> Result<Vec<u8>, c_int> {
+    let request = smolvm_cuda::proto::decode_request(bytes).ok();
+    with_client_state(false, |state| {
+        prepare_bridge_context(state)?;
+        let payload = state.client.raw_call(bytes).map_err(map_err)?;
+        if let Some(request) = request.as_ref() {
+            finish_bridge_context(state, request, &payload);
+        }
+        Ok(payload)
+    })
+}
+
 /// Fire-and-forget: append one encoded request to the shared pipeline.
 /// Nonzero = transport failure.
 #[no_mangle]
@@ -464,12 +626,12 @@ pub extern "C" fn smolvm_cudart_bridge_quiet(req: *const u8, len: usize) -> i32 
     // Transport-classified retry (see retry_transport_c): a fork clone's
     // bridged op racing the reconnect never reached the host — rerun once.
     TRANSPORT_ERR.with(|t| t.set(false));
-    match with_client(|c| c.raw_quiet(bytes)) {
+    match bridge_raw_quiet(bytes) {
         Ok(()) => 0,
         Err(_) if TRANSPORT_ERR.with(|t| t.get()) => {
             mark_force_reconnect();
             TRANSPORT_ERR.with(|t| t.set(false));
-            match with_client(|c| c.raw_quiet(bytes)) {
+            match bridge_raw_quiet(bytes) {
                 Ok(()) => 0,
                 Err(_) => 999,
             }
@@ -497,12 +659,12 @@ pub extern "C" fn smolvm_cudart_bridge_call(
     } else {
         let bytes = unsafe { std::slice::from_raw_parts(req, req_len) };
         TRANSPORT_ERR.with(|t| t.set(false));
-        match with_client(|c| c.raw_call(bytes)) {
+        match bridge_raw_call(bytes) {
             Ok(p) => p,
             Err(_) if TRANSPORT_ERR.with(|t| t.get()) => {
                 mark_force_reconnect();
                 TRANSPORT_ERR.with(|t| t.set(false));
-                match with_client(|c| c.raw_call(bytes)) {
+                match bridge_raw_call(bytes) {
                     Ok(p) => p,
                     Err(_) => return -1,
                 }
@@ -717,7 +879,7 @@ fn set_recv_timeout(fd: i32, secs: i64) {
     }
 }
 
-fn bring_up_client(resume_token: u64) -> Result<(Client<Stream>, u64, i32), c_int> {
+fn bring_up_client(resume_token: u64) -> Result<(Client<Stream>, u64, i32, u64), c_int> {
     let stream = connect()?;
     #[cfg(target_os = "linux")]
     let try_ring = matches!(stream, Stream::Vsock(_))
@@ -757,7 +919,7 @@ fn bring_up_client(resume_token: u64) -> Result<(Client<Stream>, u64, i32), c_in
     if trace {
         eprintln!("[shim] bring_up: init ok token={token}");
     }
-    client.primary_ctx_retain(0).map_err(|e| {
+    let primary_ctx = client.primary_ctx_retain(0).map_err(|e| {
         if trace {
             eprintln!("[shim] bring_up: primary_ctx_retain FAILED {e:?}");
         }
@@ -782,17 +944,18 @@ fn bring_up_client(resume_token: u64) -> Result<(Client<Stream>, u64, i32), c_in
     if trace {
         eprintln!("[shim] bring_up: complete");
     }
-    Ok((client, token, fd))
+    Ok((client, token, fd, primary_ctx))
 }
 
-fn with_client<T>(
-    f: impl FnOnce(&mut Client<Stream>) -> Result<T, CudaRpcError>,
+fn with_client_state<T>(
+    bind_runtime_context: bool,
+    f: impl FnOnce(&mut ShimState) -> Result<T, c_int>,
 ) -> Result<T, c_int> {
     let mut guard = STATE.lock().map_err(|_| CUDA_ERROR_UNKNOWN)?;
     let pid = unsafe { libc::getpid() };
     match guard.as_mut() {
         None => {
-            let (client, token, fd) = bring_up_client(0)?;
+            let (client, token, fd, primary_ctx) = bring_up_client(0)?;
             *guard = Some(ShimState {
                 client,
                 initialized: true,
@@ -801,12 +964,22 @@ fn with_client<T>(
                 libraries: HashMap::new(),
                 symbols: HashMap::new(),
                 host_allocs: HashMap::new(),
+                host_device_ptrs: std::collections::BTreeMap::new(),
+                driver_host_allocs: std::collections::HashSet::new(),
                 dev_allocs: std::collections::BTreeMap::new(),
-                capture: None,
+                captures: HashMap::new(),
+                graph_node_counts: HashMap::new(),
+                event_spares: HashMap::new(),
+                stream_devices: HashMap::new(),
+                event_devices: HashMap::new(),
                 conn_pid: pid,
                 conn_token: token,
                 conn_fd: fd,
                 force_reconnect: false,
+                primary_ctx: HashMap::from([(0, primary_ctx)]),
+                bound_device: Some(0),
+                bound_context: Some(primary_ctx),
+                bridge_context: None,
             });
         }
         // We forked and the inherited connection is dead — either an in-guest
@@ -838,7 +1011,7 @@ fn with_client<T>(
                 // first sync) would otherwise be silently lost, leaving reads
                 // stale and compute wrong.
                 let (journal, sticky) = st.client.take_journal();
-                let (mut client, token, fd) = bring_up_client(st.conn_token)?;
+                let (mut client, token, fd, primary_ctx) = bring_up_client(st.conn_token)?;
                 if let Err(e) = client.replay_journal(journal, sticky) {
                     if std::env::var_os("SHIM_TRACE").is_some() {
                         eprintln!("[shim] journal replay failed: {e:?}");
@@ -850,15 +1023,43 @@ fn with_client<T>(
                 st.conn_pid = pid;
                 st.conn_fd = fd;
                 st.force_reconnect = false;
-                st.capture = None; // any in-flight capture belonged to the parent
+                st.primary_ctx.clear();
+                st.primary_ctx.insert(0, primary_ctx);
+                st.bound_device = Some(0);
+                st.bound_context = Some(primary_ctx);
+                st.bridge_context = None;
+                st.captures.clear(); // in-flight captures belonged to the parent
+                                     // The old session owns and reclaims unused provisioned events;
+                                     // none of its raw handles may be issued after reconnect/fork.
+                st.event_spares.clear();
             }
         }
     }
     let st = guard.as_mut().ok_or(CUDA_ERROR_INITIALIZATION)?;
     debug_assert!(st.initialized);
-    // SAFETY-free: split the borrow so `f` gets the client while we keep the lock.
-    let client = &mut st.client;
-    f(client).map_err(map_err)
+    if bind_runtime_context {
+        let desired = CURRENT_DEVICE.with(|device| device.get());
+        let ctx = match st.primary_ctx.get(&desired).copied() {
+            Some(ctx) => ctx,
+            None => {
+                let ctx = st.client.primary_ctx_retain(desired).map_err(map_err)?;
+                st.primary_ctx.insert(desired, ctx);
+                ctx
+            }
+        };
+        if st.bound_context != Some(ctx) {
+            st.client.ctx_set_current(ctx).map_err(map_err)?;
+        }
+        st.bound_device = Some(desired);
+        st.bound_context = Some(ctx);
+    }
+    f(st)
+}
+
+fn with_client<T>(
+    f: impl FnOnce(&mut Client<Stream>) -> Result<T, CudaRpcError>,
+) -> Result<T, c_int> {
+    with_client_state(true, |state| f(&mut state.client).map_err(map_err))
 }
 
 /// Like [`with_client`], but transparently retries once on a transport error.
@@ -899,11 +1100,80 @@ fn with_client_retrying<T>(
 
 /// Run `f` with the full state (client + registries) under the lock.
 fn with_state<T>(f: impl FnOnce(&mut ShimState) -> Result<T, c_int>) -> Result<T, c_int> {
-    // Ensure init first (reuses with_client's bring-up), then re-lock.
-    with_client(|_| Ok(()))?;
-    let mut guard = STATE.lock().map_err(|_| CUDA_ERROR_UNKNOWN)?;
-    let st = guard.as_mut().ok_or(CUDA_ERROR_INITIALIZATION)?;
-    f(st)
+    with_client_state(true, f)
+}
+
+fn with_client_on_device<T>(
+    device: i32,
+    f: impl FnOnce(&mut Client<Stream>) -> Result<T, CudaRpcError>,
+) -> Result<T, c_int> {
+    let previous = CURRENT_DEVICE.with(|current| current.replace(device));
+    if let Ok(mut state) = STATE.lock() {
+        if let Some(state) = state.as_mut() {
+            state.bound_device = None;
+            state.bound_context = None;
+        }
+    }
+    let result = with_client(f);
+    CURRENT_DEVICE.with(|current| current.set(previous));
+    result
+}
+
+fn with_state_on_device<T>(
+    device: i32,
+    f: impl FnOnce(&mut ShimState) -> Result<T, c_int>,
+) -> Result<T, c_int> {
+    let previous = CURRENT_DEVICE.with(|current| current.replace(device));
+    if let Ok(mut state) = STATE.lock() {
+        if let Some(state) = state.as_mut() {
+            state.bound_device = None;
+            state.bound_context = None;
+        }
+    }
+    let result = with_state(f);
+    CURRENT_DEVICE.with(|current| current.set(previous));
+    result
+}
+
+fn stream_device(stream: *mut c_void) -> i32 {
+    if stream.is_null() {
+        return CURRENT_DEVICE.with(|current| current.get());
+    }
+    STATE
+        .lock()
+        .ok()
+        .and_then(|state| {
+            state
+                .as_ref()
+                .and_then(|state| state.stream_devices.get(&(stream as u64)).copied())
+        })
+        .unwrap_or_else(|| CURRENT_DEVICE.with(|current| current.get()))
+}
+
+fn event_device(event: *mut c_void) -> i32 {
+    STATE
+        .lock()
+        .ok()
+        .and_then(|state| {
+            state
+                .as_ref()
+                .and_then(|state| state.event_devices.get(&(event as u64)).copied())
+        })
+        .unwrap_or_else(|| CURRENT_DEVICE.with(|current| current.get()))
+}
+
+fn function_device(function: *const c_void) -> i32 {
+    STATE
+        .lock()
+        .ok()
+        .and_then(|state| {
+            state.as_ref().and_then(|state| {
+                state.funcs.iter().find_map(|(&(device, handle), record)| {
+                    (handle == function as usize || record.fid == function as u64).then_some(device)
+                })
+            })
+        })
+        .unwrap_or_else(|| CURRENT_DEVICE.with(|current| current.get()))
 }
 
 unsafe fn out<T>(p: *mut T, v: T) -> c_int {
@@ -918,7 +1188,7 @@ unsafe fn out<T>(p: *mut T, v: T) -> c_int {
 
 #[no_mangle]
 pub extern "C" fn cudaGetDeviceCount(count: *mut c_int) -> c_int {
-    set_last(match with_client_retrying(|c| c.device_get_count()) {
+    set_last(match cached_device_count() {
         Ok(n) => unsafe { out(count, n) },
         Err(e) => {
             // A CUDA program treats "0 devices" as recoverable; surface the count.
@@ -928,19 +1198,43 @@ pub extern "C" fn cudaGetDeviceCount(count: *mut c_int) -> c_int {
     })
 }
 
+fn cached_device_count() -> Result<c_int, c_int> {
+    use std::sync::atomic::{AtomicI32, Ordering};
+    static DEVICE_COUNT: AtomicI32 = AtomicI32::new(-1);
+    let cached = DEVICE_COUNT.load(Ordering::Relaxed);
+    if cached >= 0 {
+        return Ok(cached);
+    }
+    let count = with_client_retrying(|client| client.device_get_count())?;
+    DEVICE_COUNT.store(count, Ordering::Relaxed);
+    Ok(count)
+}
+
 #[no_mangle]
 pub extern "C" fn cudaSetDevice(device: c_int) -> c_int {
-    // Single-device model: only device 0 exists.
-    set_last(if device == 0 {
-        CUDA_SUCCESS
-    } else {
-        CUDA_ERROR_INVALID_VALUE
-    })
+    if device < 0 {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    let count = match cached_device_count() {
+        Ok(count) => count,
+        Err(error) => return set_last(error),
+    };
+    if device >= count {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    let previous = CURRENT_DEVICE.with(|current| current.replace(device));
+    match with_client(|_| Ok(())) {
+        Ok(()) => set_last(CUDA_SUCCESS),
+        Err(error) => {
+            CURRENT_DEVICE.with(|current| current.set(previous));
+            set_last(error)
+        }
+    }
 }
 
 #[no_mangle]
 pub extern "C" fn cudaGetDevice(device: *mut c_int) -> c_int {
-    set_last(unsafe { out(device, 0) })
+    set_last(unsafe { out(device, CURRENT_DEVICE.with(|current| current.get())) })
 }
 
 #[no_mangle]
@@ -1005,7 +1299,10 @@ pub extern "C" fn cudaMalloc(dev_ptr: *mut *mut c_void, size: usize) -> c_int {
     set_last(retry_transport_c(|| {
         match with_state(|s| {
             let d = s.client.mem_alloc(size as u64).map_err(map_err)?;
-            s.dev_allocs.insert(d, size as u64);
+            s.dev_allocs.insert(
+                d,
+                (size as u64, CURRENT_DEVICE.with(|current| current.get())),
+            );
             Ok(d)
         }) {
             Ok(d) => unsafe { out(dev_ptr, d as *mut c_void) },
@@ -1053,11 +1350,15 @@ pub extern "C" fn cudaMemPrefetchAsync(
 }
 
 /// Is `p` inside any live device allocation (base ≤ p < base+size)?
-fn dev_contains(allocs: &std::collections::BTreeMap<u64, u64>, p: u64) -> bool {
+fn dev_device(allocs: &std::collections::BTreeMap<u64, (u64, i32)>, p: u64) -> Option<i32> {
     allocs
         .range(..=p)
         .next_back()
-        .is_some_and(|(base, size)| p < base + size)
+        .and_then(|(base, (size, device))| (p < base + size).then_some(*device))
+}
+
+fn dev_contains(allocs: &std::collections::BTreeMap<u64, (u64, i32)>, p: u64) -> bool {
+    dev_device(allocs, p).is_some()
 }
 
 #[no_mangle]
@@ -1078,13 +1379,13 @@ pub extern "C" fn cudaFree(dev_ptr: *mut c_void) -> c_int {
 }
 
 #[no_mangle]
-pub extern "C" fn cudaHostAlloc(ptr: *mut *mut c_void, size: usize, _flags: c_uint) -> c_int {
-    cuda_host_malloc(ptr, size.max(1))
+pub extern "C" fn cudaHostAlloc(ptr: *mut *mut c_void, size: usize, flags: c_uint) -> c_int {
+    cuda_host_malloc(ptr, size.max(1), flags)
 }
 
 #[no_mangle]
 pub extern "C" fn cudaMallocHost(ptr: *mut *mut c_void, size: usize) -> c_int {
-    cuda_host_malloc(ptr, size.max(1))
+    cuda_host_malloc(ptr, size.max(1), 0)
 }
 
 // ---- shared-memory zero-copy staging ----------------------------------------
@@ -1327,6 +1628,22 @@ mod guestmem {
         reg.iter().any(|b| ptr >= b.base && ptr < b.base + b.size)
     }
 
+    pub fn device_gpa(ptr: usize) -> Option<u64> {
+        let reg = PINNED.lock().unwrap();
+        let allocation = reg
+            .iter()
+            .find(|allocation| ptr >= allocation.base && ptr < allocation.base + allocation.size)?;
+        if allocation
+            .page_gpas
+            .windows(2)
+            .any(|pair| pair[1] != pair[0] + PAGE as u64)
+        {
+            return None;
+        }
+        let offset = ptr - allocation.base;
+        Some(allocation.page_gpas[offset / PAGE] + (offset % PAGE) as u64)
+    }
+
     pub fn free(ptr: usize) -> bool {
         let mut reg = PINNED.lock().unwrap();
         if let Some(i) = reg.iter().position(|b| b.base == ptr) {
@@ -1349,6 +1666,9 @@ mod guestmem {
     }
     pub fn is_pinned(_: usize) -> bool {
         false
+    }
+    pub fn device_gpa(_: usize) -> Option<u64> {
+        None
     }
     pub fn free(_: usize) -> bool {
         false
@@ -1395,14 +1715,137 @@ fn shm_offset(ptr: *const c_void) -> Option<u64> {
     }
 }
 
-fn cuda_host_malloc(ptr: *mut *mut c_void, size: usize) -> c_int {
+fn mapped_host_source(pointer: *const c_void) -> Option<(u8, u64)> {
+    shm_offset(pointer)
+        .map(|offset| (0, offset))
+        .or_else(|| guestmem::device_gpa(pointer as usize).map(|gpa| (1, gpa)))
+}
+
+#[cfg(target_os = "linux")]
+fn driver_mapped_host_allocate(
+    size: usize,
+    flags: c_uint,
+) -> Option<Result<(*mut u8, u64), c_int>> {
+    extern "C" {
+        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    }
+    type Allocate = extern "C" fn(*mut *mut c_void, usize, c_uint) -> c_int;
+    type DevicePointer = extern "C" fn(*mut u64, *mut c_void, c_uint) -> c_int;
+    type Free = extern "C" fn(*mut c_void) -> c_int;
+    static API: std::sync::OnceLock<Option<(usize, usize, usize)>> = std::sync::OnceLock::new();
+    let &(allocate, device_pointer, free) = API
+        .get_or_init(|| unsafe {
+            let allocate = dlsym(std::ptr::null_mut(), c"cuMemHostAlloc".as_ptr()) as usize;
+            let device_pointer = dlsym(
+                std::ptr::null_mut(),
+                c"cuMemHostGetDevicePointer_v2".as_ptr(),
+            ) as usize;
+            let free = dlsym(std::ptr::null_mut(), c"cuMemFreeHost".as_ptr()) as usize;
+            (allocate != 0 && device_pointer != 0 && free != 0).then_some((
+                allocate,
+                device_pointer,
+                free,
+            ))
+        })
+        .as_ref()?;
+    let allocate: Allocate = unsafe { std::mem::transmute(allocate) };
+    let device_pointer: DevicePointer = unsafe { std::mem::transmute(device_pointer) };
+    let free: Free = unsafe { std::mem::transmute(free) };
+    let mut host = std::ptr::null_mut();
+    let status = allocate(&mut host, size, flags);
+    if status != 0 {
+        return Some(Err(status));
+    }
+    let mut device = 0u64;
+    let status = device_pointer(&mut device, host, 0);
+    if status != 0 {
+        free(host);
+        return Some(Err(status));
+    }
+    Some(Ok((host.cast(), device)))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn driver_mapped_host_allocate(
+    _size: usize,
+    _flags: c_uint,
+) -> Option<Result<(*mut u8, u64), c_int>> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn driver_mapped_host_free(pointer: *mut c_void) -> c_int {
+    unsafe {
+        let free = libc::dlsym(libc::RTLD_DEFAULT, c"cuMemFreeHost".as_ptr()) as usize;
+        if free == 0 {
+            return 801;
+        }
+        let free: extern "C" fn(*mut c_void) -> c_int = std::mem::transmute(free);
+        free(pointer)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn driver_mapped_host_free(_pointer: *mut c_void) -> c_int {
+    801
+}
+
+fn register_mapped_host(pointer: *mut u8, size: usize, flags: c_uint) -> Result<(), c_int> {
+    if flags & 2 == 0 {
+        return Ok(());
+    }
+    let (source, address) = mapped_host_source(pointer.cast()).ok_or(801)?;
+    with_state(|state| {
+        let device_pointer = state
+            .client
+            .host_get_device_pointer(source, address)
+            .map_err(map_err)?;
+        state
+            .host_device_ptrs
+            .insert(pointer as u64, (size as u64, device_pointer));
+        Ok(())
+    })
+}
+
+fn cuda_host_malloc(ptr: *mut *mut c_void, size: usize, flags: c_uint) -> c_int {
+    if flags & 2 != 0 {
+        if let Some(result) = driver_mapped_host_allocate(size, flags) {
+            match result {
+                Ok((host, device)) => {
+                    let tracked = with_state(|state| {
+                        state
+                            .host_device_ptrs
+                            .insert(host as u64, (size as u64, device));
+                        state.driver_host_allocs.insert(host as u64);
+                        Ok(())
+                    });
+                    if let Err(code) = tracked {
+                        driver_mapped_host_free(host.cast());
+                        return set_last(code);
+                    }
+                    return set_last(unsafe { out(ptr, host.cast()) });
+                }
+                Err(code) if !matches!(code, 1 | 2 | 801) => return set_last(code),
+                Err(_) => {}
+            }
+        }
+    }
     // Zero-copy backings, in order of preference: guest-RAM (microVM) then the
     // same-host shared region. Either lets a memcpy skip shipping the bytes.
     if let Some(mem) = guestmem::alloc(size) {
-        return set_last(unsafe { out(ptr, mem as *mut c_void) });
+        return match register_mapped_host(mem, size, flags) {
+            Ok(()) => set_last(unsafe { out(ptr, mem as *mut c_void) }),
+            Err(code) => {
+                guestmem::free(mem as usize);
+                set_last(code)
+            }
+        };
     }
     if let Some(mem) = shm_alloc(size) {
-        return set_last(unsafe { out(ptr, mem as *mut c_void) });
+        return match register_mapped_host(mem, size, flags) {
+            Ok(()) => set_last(unsafe { out(ptr, mem as *mut c_void) }),
+            Err(code) => set_last(code),
+        };
     }
     let layout = match std::alloc::Layout::from_size_align(size, 256) {
         Ok(l) => l,
@@ -1412,24 +1855,40 @@ fn cuda_host_malloc(ptr: *mut *mut c_void, size: usize) -> c_int {
     if mem.is_null() {
         return set_last(CUDA_ERROR_MEMORY_ALLOCATION);
     }
-    set_last(
-        match with_state(|s| {
-            s.host_allocs.insert(mem as usize, layout);
-            Ok(())
-        }) {
-            Ok(()) => unsafe { out(ptr, mem as *mut c_void) },
-            Err(e) => {
-                unsafe { std::alloc::dealloc(mem, layout) };
-                e
+    let tracked = with_state(|s| {
+        s.host_allocs.insert(mem as usize, layout);
+        Ok(())
+    });
+    if let Err(error) = tracked {
+        unsafe { std::alloc::dealloc(mem, layout) };
+        return set_last(error);
+    }
+    if let Err(error) = register_mapped_host(mem, size, flags) {
+        if let Ok(mut state) = STATE.lock() {
+            if let Some(state) = state.as_mut() {
+                state.host_allocs.remove(&(mem as usize));
             }
-        },
-    )
+        }
+        unsafe { std::alloc::dealloc(mem, layout) };
+        return set_last(error);
+    }
+    set_last(unsafe { out(ptr, mem as *mut c_void) })
 }
 
 #[no_mangle]
 pub extern "C" fn cudaFreeHost(ptr: *mut c_void) -> c_int {
     if ptr.is_null() {
         return set_last(CUDA_SUCCESS);
+    }
+    let mut driver_allocation = false;
+    if let Ok(mut state) = STATE.lock() {
+        if let Some(state) = state.as_mut() {
+            state.host_device_ptrs.remove(&(ptr as u64));
+            driver_allocation = state.driver_host_allocs.remove(&(ptr as u64));
+        }
+    }
+    if driver_allocation {
+        return set_last(driver_mapped_host_free(ptr));
     }
     // Guest-RAM pinned buffers: munmap + unpin.
     if guestmem::free(ptr as usize) {
@@ -1451,13 +1910,78 @@ pub extern "C" fn cudaFreeHost(ptr: *mut c_void) -> c_int {
     )
 }
 
-/// Resolve `cudaMemcpyDefault` to a concrete direction from tracked allocations.
-fn resolve_kind(s: &ShimState, dst: *const c_void, src: *const c_void, kind: c_int) -> c_int {
+/// Classify a pointer that may have been allocated through either the runtime
+/// or driver API. NCCL allocates through libcuda and later calls runtime
+/// `cudaMemcpyDefault`; relying only on libcudart's local allocation table
+/// misclassifies both device pointers as host memory and dereferences GPU VAs.
+fn pointer_is_device(s: &mut ShimState, pointer: *const c_void) -> bool {
+    if pointer.is_null() {
+        return false;
+    }
+    if dev_contains(&s.dev_allocs, pointer as u64) {
+        return true;
+    }
+    let is_device = s
+        .client
+        .lib_call(6, 2, (pointer as u64).to_le_bytes().to_vec())
+        .map(|(status, output)| status == 0 && output.first() == Some(&2))
+        .unwrap_or(false);
+    if is_device {
+        // The exact pointer is enough to avoid repeating the control-plane
+        // query for NCCL's small setup copies; the daemon remains authoritative
+        // for other interior pointers whose allocation extent is unknown here.
+        s.dev_allocs
+            .entry(pointer as u64)
+            .or_insert((1, CURRENT_DEVICE.with(|d| d.get())));
+    }
+    is_device
+}
+
+fn mapped_host_device_pointer(state: &ShimState, pointer: u64) -> Option<u64> {
+    let (&base, &(bytes, device_base)) = state.host_device_ptrs.range(..=pointer).next_back()?;
+    (pointer < base.saturating_add(bytes)).then(|| device_base + (pointer - base))
+}
+
+fn patch_mapped_host_pointers(state: &ShimState, bytes: &mut [u8]) -> usize {
+    let mut replacements = 0;
+    let mut offset = 0;
+    while offset + 8 <= bytes.len() {
+        let value = u64::from_ne_bytes(bytes[offset..offset + 8].try_into().unwrap());
+        if let Some(mapped) = mapped_host_device_pointer(state, value) {
+            bytes[offset..offset + 8].copy_from_slice(&mapped.to_ne_bytes());
+            replacements += 1;
+        }
+        offset += 8;
+    }
+    replacements
+}
+
+/// Driver launches from libraries with embedded cudart still pass through the
+/// libcuda shim. Let it patch mapped-host addresses using this runtime-owned
+/// allocation table before forwarding a packed kernel argument buffer.
+#[no_mangle]
+pub extern "C" fn smolvm_cudart_translate_host_pointers(bytes: *mut u8, len: usize) -> usize {
+    if bytes.is_null() || len > 16 * 1024 * 1024 {
+        return 0;
+    }
+    let Ok(state) = STATE.lock() else {
+        return 0;
+    };
+    let Some(state) = state.as_ref() else {
+        return 0;
+    };
+    let bytes = unsafe { std::slice::from_raw_parts_mut(bytes, len) };
+    patch_mapped_host_pointers(state, bytes)
+}
+
+/// Resolve `cudaMemcpyDefault` to a concrete direction from local and
+/// daemon-owned allocations.
+fn resolve_kind(s: &mut ShimState, dst: *const c_void, src: *const c_void, kind: c_int) -> c_int {
     if kind != MEMCPY_DEFAULT {
         return kind;
     }
-    let dst_dev = dev_contains(&s.dev_allocs, dst as u64);
-    let src_dev = dev_contains(&s.dev_allocs, src as u64);
+    let dst_dev = pointer_is_device(s, dst);
+    let src_dev = pointer_is_device(s, src);
     match (src_dev, dst_dev) {
         (false, true) => MEMCPY_HTOD,
         (true, false) => MEMCPY_DTOH,
@@ -1477,8 +2001,8 @@ fn do_memcpy(dst: *mut c_void, src: *const c_void, n: usize, kind: c_int, stream
         mark_force_reconnect();
         r = do_memcpy_inner(dst, src, n, kind, stream);
     }
-    if dbg && r != CUDA_SUCCESS {
-        eprintln!("[memcpy-err] kind={kind} n={n} -> {r}");
+    if dbg {
+        eprintln!("[memcpy] src={src:p} dst={dst:p} kind={kind} n={n} stream={stream:#x} -> {r}");
     }
     r
 }
@@ -1529,7 +2053,15 @@ fn do_memcpy_inner(
                 // Chunk: one frame must stay far below the transport's
                 // 256 MiB message cap (a 272 MiB embedding tensor here killed
                 // the connection). Host-synchronous copies chunk safely.
-                let data = unsafe { std::slice::from_raw_parts(src as *const u8, n) };
+                let original = unsafe { std::slice::from_raw_parts(src as *const u8, n) };
+                let mut translated = Vec::new();
+                let data = if n <= 1024 * 1024 && !s.host_device_ptrs.is_empty() {
+                    translated.extend_from_slice(original);
+                    patch_mapped_host_pointers(s, &mut translated);
+                    translated.as_slice()
+                } else {
+                    original
+                };
                 const CHUNK: usize = 64 * 1024 * 1024;
                 for (i, piece) in data.chunks(CHUNK).enumerate() {
                     s.client
@@ -1651,6 +2183,11 @@ pub extern "C" fn cudaMemcpyAsync(
     // pipelines like a launch and — critically — records into an active graph
     // capture instead of invalidating it (the sync form is capture-unsafe).
     let resolved = with_state(|s| Ok(resolve_kind(s, dst, src, kind))).unwrap_or(kind);
+    if std::env::var_os("SMOLVM_CUDA_TRACE_MEMCPY").is_some() {
+        eprintln!(
+            "[memcpy-async] src={src:p} dst={dst:p} requested={kind} resolved={resolved} n={n} stream={stream:p}"
+        );
+    }
     if resolved == MEMCPY_DTOD {
         return set_last(
             match with_client(|c| {
@@ -1745,18 +2282,32 @@ pub extern "C" fn cudaMemsetAsync(
 
 #[no_mangle]
 pub extern "C" fn cudaStreamCreate(stream: *mut *mut c_void) -> c_int {
-    set_last(match with_client(|c| c.stream_create(0)) {
-        Ok(h) => unsafe { out(stream, h as *mut c_void) },
-        Err(e) => e,
-    })
+    let device = CURRENT_DEVICE.with(|current| current.get());
+    set_last(
+        match with_state(|state| {
+            let handle = state.client.stream_create(0).map_err(map_err)?;
+            state.stream_devices.insert(handle, device);
+            Ok(handle)
+        }) {
+            Ok(h) => unsafe { out(stream, h as *mut c_void) },
+            Err(e) => e,
+        },
+    )
 }
 
 #[no_mangle]
 pub extern "C" fn cudaStreamCreateWithFlags(stream: *mut *mut c_void, flags: c_uint) -> c_int {
-    set_last(match with_client(|c| c.stream_create(flags)) {
-        Ok(h) => unsafe { out(stream, h as *mut c_void) },
-        Err(e) => e,
-    })
+    let device = CURRENT_DEVICE.with(|current| current.get());
+    set_last(
+        match with_state(|state| {
+            let handle = state.client.stream_create(flags).map_err(map_err)?;
+            state.stream_devices.insert(handle, device);
+            Ok(handle)
+        }) {
+            Ok(h) => unsafe { out(stream, h as *mut c_void) },
+            Err(e) => e,
+        },
+    )
 }
 
 #[no_mangle]
@@ -1764,16 +2315,28 @@ pub extern "C" fn cudaStreamDestroy(stream: *mut c_void) -> c_int {
     if stream.is_null() {
         return set_last(CUDA_SUCCESS); // destroying the default stream is a no-op
     }
-    set_last(match with_client(|c| c.stream_destroy(stream as u64)) {
-        Ok(()) => CUDA_SUCCESS,
-        Err(e) => e,
-    })
+    let device = stream_device(stream);
+    set_last(
+        match with_state_on_device(device, |state| {
+            state
+                .client
+                .stream_destroy(stream as u64)
+                .map_err(map_err)?;
+            state.stream_devices.remove(&(stream as u64));
+            Ok(())
+        }) {
+            Ok(()) => CUDA_SUCCESS,
+            Err(e) => e,
+        },
+    )
 }
 
 #[no_mangle]
 pub extern "C" fn cudaStreamSynchronize(stream: *mut c_void) -> c_int {
     set_last(
-        match with_client_retrying(|c| c.stream_synchronize(stream as u64)) {
+        match with_client_on_device(stream_device(stream), |c| {
+            c.stream_synchronize(stream as u64)
+        }) {
             Ok(()) => CUDA_SUCCESS,
             Err(e) => e,
         },
@@ -2075,19 +2638,36 @@ pub extern "C" fn cudaSetDeviceFlags(_flags: c_uint) -> c_int {
     CUDA_SUCCESS
 }
 
-/// Whole-graph exec update: report "update failed" — ggml (and torch) fall
-/// back to destroying and re-instantiating the graph, which we forward.
+/// Whole-graph exec update. The host driver checks topology compatibility and
+/// patches the executable graph in place; error-node handles remain host-local,
+/// so only the portable result enum is returned to the guest.
 #[no_mangle]
 pub extern "C" fn cudaGraphExecUpdate(
-    _exec: *mut c_void,
-    _graph: *mut c_void,
+    exec: *mut c_void,
+    graph: *mut c_void,
     result_info: *mut c_void,
 ) -> c_int {
-    if !result_info.is_null() {
-        // cudaGraphExecUpdateResultInfo { result, errorNode, errorFromNode }
-        unsafe { std::ptr::write_bytes(result_info as *mut u8, 0, 24) };
+    if result_info.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
     }
-    910 // cudaErrorGraphExecUpdateFailure
+    set_last(
+        match with_client_retrying(|c| c.graph_exec_update(exec as u64, graph as u64)) {
+            Ok(result) => {
+                // cudaGraphExecUpdateResultInfo { i32 result; pad; ptr; ptr }.
+                // Raw host graph-node pointers cannot cross the transport.
+                unsafe {
+                    std::ptr::write_bytes(result_info as *mut u8, 0, 24);
+                    (result_info as *mut c_int).write(result);
+                }
+                if result == 0 {
+                    CUDA_SUCCESS
+                } else {
+                    910 // cudaErrorGraphExecUpdateFailure
+                }
+            }
+            Err(error) => error,
+        },
+    )
 }
 
 /// Cooperative launches need grid-wide sync the transport can't fake; the
@@ -2233,31 +2813,70 @@ pub extern "C" fn cudaGetDeviceProperties_v2(prop: *mut c_void, device: c_int) -
 
 // ---- events (forward to host) -----------------------------------------------
 
+const EVENT_CREATE_BATCH_SIZE: u32 = 64;
+
+fn event_create_cached(event: *mut *mut c_void, flags: c_uint) -> c_int {
+    if event.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    set_last(
+        match with_state(|st| {
+            let device = CURRENT_DEVICE.with(|current| current.get());
+            let key = (device, flags);
+            if let Some(handle) = st.event_spares.get_mut(&key).and_then(Vec::pop) {
+                st.event_devices.insert(handle, device);
+                return Ok(handle);
+            }
+
+            let mut handles = st
+                .client
+                .event_create_batch(flags, EVENT_CREATE_BATCH_SIZE)
+                .map_err(map_err)?;
+            let handle = handles.pop().ok_or(CUDA_ERROR_UNKNOWN)?;
+            for &spare in &handles {
+                st.event_devices.insert(spare, device);
+            }
+            st.event_spares.entry(key).or_default().extend(handles);
+            st.event_devices.insert(handle, device);
+            Ok(handle)
+        }) {
+            Ok(handle) => unsafe { out(event, handle as *mut c_void) },
+            Err(code) => code,
+        },
+    )
+}
+
 #[no_mangle]
 pub extern "C" fn cudaEventCreate(event: *mut *mut c_void) -> c_int {
-    set_last(match with_client(|c| c.event_create(0)) {
-        Ok(h) => unsafe { out(event, h as *mut c_void) },
-        Err(e) => e,
-    })
+    event_create_cached(event, 0)
 }
 #[no_mangle]
 pub extern "C" fn cudaEventCreateWithFlags(event: *mut *mut c_void, flags: c_uint) -> c_int {
-    set_last(match with_client(|c| c.event_create(flags)) {
-        Ok(h) => unsafe { out(event, h as *mut c_void) },
-        Err(e) => e,
-    })
+    event_create_cached(event, flags)
 }
 #[no_mangle]
 pub extern "C" fn cudaEventDestroy(event: *mut c_void) -> c_int {
-    set_last(match with_client(|c| c.event_destroy(event as u64)) {
-        Ok(()) => CUDA_SUCCESS,
-        Err(e) => e,
-    })
+    let device = event_device(event);
+    set_last(
+        match with_state_on_device(device, |state| {
+            state.client.event_destroy(event as u64).map_err(map_err)?;
+            state.event_devices.remove(&(event as u64));
+            Ok(())
+        }) {
+            Ok(()) => CUDA_SUCCESS,
+            Err(e) => e,
+        },
+    )
 }
 #[no_mangle]
 pub extern "C" fn cudaEventRecord(event: *mut c_void, stream: *mut c_void) -> c_int {
+    let device = if stream.is_null() {
+        event_device(event)
+    } else {
+        stream_device(stream)
+    };
     set_last(
-        match with_client(|c| c.event_record(event as u64, stream as u64)) {
+        match with_client_on_device(device, |c| c.event_record(event as u64, stream as u64)) {
             Ok(()) => CUDA_SUCCESS,
             Err(e) => e,
         },
@@ -2273,10 +2892,12 @@ pub extern "C" fn cudaEventRecordWithFlags(
 }
 #[no_mangle]
 pub extern "C" fn cudaEventSynchronize(event: *mut c_void) -> c_int {
-    set_last(match with_client(|c| c.event_synchronize(event as u64)) {
-        Ok(()) => CUDA_SUCCESS,
-        Err(e) => e,
-    })
+    set_last(
+        match with_client_on_device(event_device(event), |c| c.event_synchronize(event as u64)) {
+            Ok(()) => CUDA_SUCCESS,
+            Err(e) => e,
+        },
+    )
 }
 #[no_mangle]
 pub extern "C" fn cudaEventQuery(event: *mut c_void) -> c_int {
@@ -2285,7 +2906,7 @@ pub extern "C" fn cudaEventQuery(event: *mut c_void) -> c_int {
     // reuse (ILLEGAL_ADDRESS) once work really ran on side streams. NotReady
     // (600) latches into last-error exactly like real cudart; torch clears it.
     set_last(
-        match with_client_retrying(|c| c.event_query(event as u64)) {
+        match with_client_on_device(event_device(event), |c| c.event_query(event as u64)) {
             Ok(code) => code,
             Err(e) => e,
         },
@@ -2313,10 +2934,17 @@ pub extern "C" fn cudaStreamCreateWithPriority(
     flags: c_uint,
     _priority: c_int,
 ) -> c_int {
-    set_last(match with_client(|c| c.stream_create(flags)) {
-        Ok(h) => unsafe { out(stream, h as *mut c_void) },
-        Err(e) => e,
-    })
+    let device = CURRENT_DEVICE.with(|current| current.get());
+    set_last(
+        match with_state(|state| {
+            let handle = state.client.stream_create(flags).map_err(map_err)?;
+            state.stream_devices.insert(handle, device);
+            Ok(handle)
+        }) {
+            Ok(h) => unsafe { out(stream, h as *mut c_void) },
+            Err(e) => e,
+        },
+    )
 }
 #[no_mangle]
 pub extern "C" fn cudaStreamWaitEvent(
@@ -2328,7 +2956,9 @@ pub extern "C" fn cudaStreamWaitEvent(
     // (and a graph dependency during capture) — dropping it made replays racy
     // (ILLEGAL_ADDRESS). Deferred like a launch.
     set_last(
-        match with_client(|c| c.stream_wait_event(stream as u64, event as u64, flags)) {
+        match with_client_on_device(stream_device(stream), |c| {
+            c.stream_wait_event(stream as u64, event as u64, flags)
+        }) {
             Ok(()) => CUDA_SUCCESS,
             Err(e) => e,
         },
@@ -2338,7 +2968,7 @@ pub extern "C" fn cudaStreamWaitEvent(
 pub extern "C" fn cudaStreamQuery(stream: *mut c_void) -> c_int {
     // Honest completion status (0 or 600-NotReady), same as cudaEventQuery.
     set_last(
-        match with_client_retrying(|c| c.stream_query(stream as u64)) {
+        match with_client_on_device(stream_device(stream), |c| c.stream_query(stream as u64)) {
             Ok(code) => code,
             Err(e) => e,
         },
@@ -2350,27 +2980,108 @@ pub extern "C" fn cudaStreamQuery(stream: *mut c_void) -> c_int {
 // recorded (not executed) by the real driver. Replay is a single GraphLaunch
 // message for the whole graph — the antidote to per-launch round-trips in
 // launch-bound inference. The hot capture-status queries answer from the
-// guest-side `capture` field, costing nothing outside capture.
+// guest-side `capture` field, costing nothing outside capture and on the root
+// stream. Queries for side streams participating through event edges go to the
+// host driver; treating them as inactive leaves a forked capture branch
+// unjoined and breaks segmented graph implementations that track side-stream
+// forks.
 
+/// cudaStreamCaptureStatusNone.
+const CAPTURE_NONE: c_int = 0;
 /// cudaStreamCaptureStatusActive.
 const CAPTURE_ACTIVE: c_int = 1;
+
+fn local_capture_info(captures: &HashMap<u64, CaptureRecord>, stream: u64) -> Option<(c_int, u64)> {
+    if let Some(record) = captures.get(&stream) {
+        Some((CAPTURE_ACTIVE, record.local_id))
+    } else if captures.is_empty() {
+        Some((CAPTURE_NONE, 0))
+    } else {
+        None
+    }
+}
+
+fn capture_info_for_stream(s: &mut ShimState, stream: u64) -> Result<(c_int, u64), c_int> {
+    if let Some(info) = local_capture_info(&s.captures, stream) {
+        return Ok(info);
+    }
+
+    // CUDA owns side-stream participation: event edges can join a non-root
+    // stream to one of several active captures. Ask the host which capture it
+    // joined, then translate the host's ID to the process-local ID frameworks
+    // use to correlate allocator state.
+    let (status, side_host_id) = s.client.stream_capture_info(stream).map_err(map_err)?;
+    if status as c_int != CAPTURE_ACTIVE {
+        return Ok((status as c_int, 0));
+    }
+    if let Some(record) = s
+        .captures
+        .values()
+        .find(|record| record.host_id == Some(side_host_id))
+    {
+        return Ok((CAPTURE_ACTIVE, record.local_id));
+    }
+
+    // BeginCapture is pipelined, so host IDs are populated lazily only when a
+    // side-stream query needs them. This keeps the common root-only path at
+    // zero RTT while correctly disambiguating concurrent capture DAGs.
+    let unresolved: Vec<u64> = s
+        .captures
+        .iter()
+        .filter_map(|(&root, record)| record.host_id.is_none().then_some(root))
+        .collect();
+    for root in unresolved {
+        let (root_status, root_host_id) = s.client.stream_capture_info(root).map_err(map_err)?;
+        if root_status as c_int == CAPTURE_ACTIVE {
+            if let Some(record) = s.captures.get_mut(&root) {
+                record.host_id = Some(root_host_id);
+                if root_host_id == side_host_id {
+                    return Ok((CAPTURE_ACTIVE, record.local_id));
+                }
+            }
+        }
+    }
+
+    // A capture started outside this runtime shim can still be reported by the
+    // host. Its host ID is already stable, so expose it rather than claiming the
+    // stream is inactive or attaching it to the wrong local capture.
+    Ok((CAPTURE_ACTIVE, side_host_id))
+}
 
 #[no_mangle]
 pub extern "C" fn cudaStreamBeginCapture(stream: *mut c_void, mode: c_int) -> c_int {
     set_last(
         match with_state(|s| {
+            let stream = stream as u64;
+            if s.captures.contains_key(&stream) {
+                return Err(CUDA_ERROR_ILLEGAL_STATE);
+            }
             // Fire-and-forget: the host starts capture when this drains, and
             // the (also-deferred) launches record in order. The capture id is
             // torch-visible only (its allocator correlates via the local
             // GetCaptureInfo queries; the host tracks capture by stream), so
-            // mint it locally. Both save a host round-trip per captured graph,
-            // which dominates coldstart over a network (~1400 graphs).
-            s.client
-                .stream_begin_capture_deferred(stream as u64, mode)
-                .map_err(map_err)?;
+            // mint it locally. This saves a host round-trip per captured graph;
+            // EndCapture remains synchronous because it reports invalidation.
+            if s.captures.is_empty() {
+                s.client
+                    .stream_begin_capture_deferred(stream, mode)
+                    .map_err(map_err)?;
+            } else {
+                // Concurrent captures are uncommon and need host validation;
+                // keep only the first/root-only capture on the zero-RTT path.
+                s.client
+                    .stream_begin_capture(stream, mode)
+                    .map_err(map_err)?;
+            }
             static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
             let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            s.capture = Some((stream as u64, id));
+            s.captures.insert(
+                stream,
+                CaptureRecord {
+                    local_id: id,
+                    host_id: None,
+                },
+            );
             Ok(())
         }) {
             Ok(()) => CUDA_SUCCESS,
@@ -2384,21 +3095,25 @@ pub extern "C" fn cudaStreamEndCapture(stream: *mut c_void, graph: *mut *mut c_v
     if graph.is_null() {
         return set_last(CUDA_ERROR_INVALID_VALUE);
     }
+    unsafe { *graph = std::ptr::null_mut() };
     set_last(
         match with_state(|s| {
-            // Mint a virtual graph handle; the host maps it to the real
-            // captured graph when this deferred end drains.
+            // Mint a virtual graph handle; the host maps it to the real graph.
+            // EndCapture is a validation boundary: it must synchronously report
+            // an invalidated capture and leave `graph` null, matching libcudart.
             let vh = alloc_vhandle();
-            s.client
-                .stream_end_capture_deferred(stream as u64, vh)
+            let node_count = s
+                .client
+                .stream_end_capture(stream as u64, vh)
                 .map_err(map_err)?;
-            s.capture = None;
+            s.captures.remove(&(stream as u64));
+            s.graph_node_counts.insert(vh, node_count as usize);
             Ok(vh)
         }) {
             Ok(g) => unsafe { out(graph, g as *mut c_void) },
             Err(e) => {
                 let _ = with_state(|s| {
-                    s.capture = None;
+                    s.captures.remove(&(stream as u64));
                     Ok(())
                 });
                 e
@@ -2409,9 +3124,15 @@ pub extern "C" fn cudaStreamEndCapture(stream: *mut c_void, graph: *mut *mut c_v
 
 #[no_mangle]
 pub extern "C" fn cudaStreamIsCapturing(stream: *mut c_void, status: *mut c_int) -> c_int {
-    let active = with_state(|s| Ok(matches!(s.capture, Some((cs, _)) if cs == stream as u64)))
-        .unwrap_or(false);
-    set_last(unsafe { out(status, if active { CAPTURE_ACTIVE } else { 0 }) })
+    if status.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    set_last(
+        match with_state(|s| capture_info_for_stream(s, stream as u64)) {
+            Ok((capture_status, _)) => unsafe { out(status, capture_status) },
+            Err(error) => error,
+        },
+    )
 }
 
 #[no_mangle]
@@ -2423,10 +3144,12 @@ pub extern "C" fn cudaStreamGetCaptureInfo_v2(
     deps: *mut *mut *const c_void,
     num_deps: *mut usize,
 ) -> c_int {
-    let cap = with_state(|s| Ok(s.capture)).unwrap_or(None);
-    let (st, cid) = match cap {
-        Some((cs, cid)) if cs == stream as u64 => (CAPTURE_ACTIVE, cid),
-        _ => (0, 0),
+    if status.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    let (st, cid) = match with_state(|s| capture_info_for_stream(s, stream as u64)) {
+        Ok(info) => info,
+        Err(error) => return set_last(error),
     };
     unsafe {
         let _ = out(status, st);
@@ -2468,10 +3191,10 @@ pub extern "C" fn cudaGraphInstantiateWithFlags(
     }
     set_last(
         match with_client(|c| {
-            // Mint a virtual exec handle; host maps it when this deferred
-            // instantiate drains (graph is itself a virtual graph handle).
+            // Mint a virtual exec handle; the host maps it after validating the
+            // graph. Instantiation errors are synchronous in libcudart.
             let exec_vh = alloc_vhandle();
-            c.graph_instantiate_deferred(graph as u64, exec_vh)?;
+            c.graph_instantiate(graph as u64, exec_vh)?;
             Ok(exec_vh)
         }) {
             Ok(e) => unsafe { out(graph_exec, e as *mut c_void) },
@@ -2495,25 +3218,27 @@ pub extern "C" fn cudaGraphLaunch(graph_exec: *mut c_void, stream: *mut c_void) 
 /// empty captures. Filling a caller-provided node array is not supported.
 #[no_mangle]
 pub extern "C" fn cudaGraphGetNodes(
-    _graph: *mut c_void,
+    graph: *mut c_void,
     nodes: *mut *mut c_void,
     num_nodes: *mut usize,
 ) -> c_int {
     if num_nodes.is_null() {
         return set_last(CUDA_ERROR_INVALID_VALUE);
     }
-    // The real node list is never requested (nodes != NULL is rejected below);
-    // torch calls this only with nodes = NULL to check for an EMPTY graph and
-    // warn. A captured decode graph is never empty, so answer the count query
-    // locally with a non-zero value instead of a host round-trip — fetching
-    // the true count cost one RTT per captured graph (~1400), dominating
-    // coldstart over a network. (This can only suppress a cosmetic empty-graph
-    // warning, never cause wrong behavior — unlike the fake-data stubs that
-    // were replaced with real values.)
     if !nodes.is_null() {
         return set_last(CUDA_ERROR_INVALID_VALUE);
     }
-    set_last(unsafe { out(num_nodes, 1usize) })
+    set_last(
+        match with_state(|s| {
+            s.graph_node_counts
+                .get(&(graph as u64))
+                .copied()
+                .ok_or(CUDA_ERROR_INVALID_RESOURCE_HANDLE)
+        }) {
+            Ok(count) => unsafe { out(num_nodes, count) },
+            Err(error) => error,
+        },
+    )
 }
 
 #[no_mangle]
@@ -2528,10 +3253,15 @@ pub extern "C" fn cudaGraphExecDestroy(graph_exec: *mut c_void) -> c_int {
 
 #[no_mangle]
 pub extern "C" fn cudaGraphDestroy(graph: *mut c_void) -> c_int {
-    set_last(match with_client(|c| c.graph_destroy(graph as u64)) {
-        Ok(()) => CUDA_SUCCESS,
-        Err(e) => e,
-    })
+    set_last(
+        match with_state(|s| {
+            s.graph_node_counts.remove(&(graph as u64));
+            s.client.graph_destroy(graph as u64).map_err(map_err)
+        }) {
+            Ok(()) => CUDA_SUCCESS,
+            Err(e) => e,
+        },
+    )
 }
 
 /// Manual graph-build APIs. Conda `libtorch_cuda.so` version-requires these at
@@ -2805,6 +3535,12 @@ struct CudaPointerAttributes {
     device_pointer: *mut c_void,
     host_pointer: *mut c_void,
 }
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct CudaIpcHandle {
+    reserved: [u8; 64],
+}
 #[no_mangle]
 pub extern "C" fn cudaPointerGetAttributes(attr: *mut c_void, ptr: *const c_void) -> c_int {
     if attr.is_null() {
@@ -2816,7 +3552,8 @@ pub extern "C" fn cudaPointerGetAttributes(attr: *mut c_void, ptr: *const c_void
     // unregistered, and PyTorch's `is_pinned()` relies on that: reporting Host
     // for arbitrary pointers made `pin_memory()` a silent no-op, so pinned
     // transfers never reached the zero-copy path.
-    let is_dev = with_state(|s| Ok(dev_contains(&s.dev_allocs, ptr as u64))).unwrap_or(false)
+    let tracked_device = with_state(|s| Ok(dev_device(&s.dev_allocs, ptr as u64))).unwrap_or(None);
+    let is_dev = tracked_device.is_some()
         // Driver-VMM allocations (torch expandable_segments) never enter this
         // shim's tables — ask the server, which knows every session range
         // (LibCall 6/2 → [2] iff device). Without this, CUDA-graph capture
@@ -2846,7 +3583,7 @@ pub extern "C" fn cudaPointerGetAttributes(attr: *mut c_void, ptr: *const c_void
     } else {
         0
     };
-    a.device = 0;
+    a.device = tracked_device.unwrap_or_else(|| CURRENT_DEVICE.with(|current| current.get()));
     a.device_pointer = if is_dev {
         ptr as *mut c_void
     } else {
@@ -2871,21 +3608,34 @@ pub extern "C" fn cudaFuncGetAttributes(attr: *mut c_void, func: *const c_void) 
     unsafe { std::ptr::write_bytes(attr as *mut u8, 0, 72) };
     // Kernel attributes are immutable — memoize the packed 72-byte blob per
     // function (torch may query per-launch; each miss is 7 host round-trips).
-    static FUNC_ATTRS: Mutex<Option<HashMap<usize, [u8; 72]>>> = Mutex::new(None);
+    type FuncAttrsCache = HashMap<(i32, usize), [u8; 72]>;
+    static FUNC_ATTRS: Mutex<Option<FuncAttrsCache>> = Mutex::new(None);
+    let device = function_device(func);
     if let Ok(mut g) = FUNC_ATTRS.lock() {
-        if let Some(blob) = g.get_or_insert_with(HashMap::new).get(&(func as usize)) {
+        if let Some(blob) = g
+            .get_or_insert_with(HashMap::new)
+            .get(&(device, func as usize))
+        {
             unsafe { std::ptr::copy_nonoverlapping(blob.as_ptr(), attr as *mut u8, 72) };
             return set_last(CUDA_SUCCESS);
         }
     }
     // CUfunction_attribute: MAX_THREADS_PER_BLOCK=0, SHARED=1, CONST=2,
     // LOCAL=3, NUM_REGS=4, PTX_VERSION=5, BINARY_VERSION=6.
-    let r = with_state(|s| {
-        let fid = s
-            .funcs
-            .get(&(func as usize))
-            .ok_or(CUDA_ERROR_INVALID_DEVICE_POINTER)?
-            .fid;
+    let r = with_state_on_device(device, |s| {
+        let (fid, _) = ensure_registered_func(s, func as usize).inspect_err(|code| {
+            if std::env::var_os("SMOLVM_CUDA_SHIM_TRACE").is_some() {
+                let known: Vec<_> = s
+                    .funcs
+                    .keys()
+                    .filter(|(_, handle)| *handle == func as usize)
+                    .copied()
+                    .collect();
+                eprintln!(
+                    "[func-attrs] resolve failed code={code} device={device} func={func:p} known={known:?}"
+                );
+            }
+        })?;
         let get = |s: &mut ShimState, a: i32| s.client.func_get_attribute(fid, a).unwrap_or(0);
         let shared = get(s, 1);
         let cst = get(s, 2);
@@ -2912,7 +3662,7 @@ pub extern "C" fn cudaFuncGetAttributes(attr: *mut c_void, func: *const c_void) 
             let mut blob = [0u8; 72];
             unsafe { std::ptr::copy_nonoverlapping(attr as *const u8, blob.as_mut_ptr(), 72) };
             g.get_or_insert_with(HashMap::new)
-                .insert(func as usize, blob);
+                .insert((device, func as usize), blob);
         }
     }
     set_last(r.err().unwrap_or(CUDA_SUCCESS))
@@ -2927,22 +3677,32 @@ pub extern "C" fn cudaFuncSetAttribute(func: *const c_void, attr: c_int, value: 
     // Kernels re-assert the same attribute before every launch (FlashAttention
     // raises the shared-memory cap each call) — skip repeats, each was a sync
     // round-trip.
-    static APPLIED: Mutex<Option<HashMap<(usize, c_int), c_int>>> = Mutex::new(None);
+    type AppliedAttributes = HashMap<(i32, usize, c_int), c_int>;
+    static APPLIED: Mutex<Option<AppliedAttributes>> = Mutex::new(None);
+    let device = function_device(func);
     if APPLIED
         .lock()
         .unwrap()
         .get_or_insert_with(HashMap::new)
-        .get(&(func as usize, attr))
+        .get(&(device, func as usize, attr))
         == Some(&value)
     {
         return CUDA_SUCCESS;
     }
-    let r = with_state(|s| {
-        let fid = s
-            .funcs
-            .get(&(func as usize))
-            .ok_or(CUDA_ERROR_INVALID_DEVICE_POINTER)?
-            .fid;
+    let r = with_state_on_device(device, |s| {
+        let (fid, _) = ensure_registered_func(s, func as usize).inspect_err(|code| {
+            if std::env::var_os("SMOLVM_CUDA_SHIM_TRACE").is_some() {
+                let known: Vec<_> = s
+                    .funcs
+                    .keys()
+                    .filter(|(_, handle)| *handle == func as usize)
+                    .copied()
+                    .collect();
+                eprintln!(
+                    "[func-attr-set] resolve failed code={code} device={device} func={func:p} known={known:?}"
+                );
+            }
+        })?;
         s.client
             .func_set_attribute(fid, attr, value)
             .map_err(map_err)
@@ -2952,10 +3712,32 @@ pub extern "C" fn cudaFuncSetAttribute(func: *const c_void, attr: c_int, value: 
             .lock()
             .unwrap()
             .get_or_insert_with(HashMap::new)
-            .insert((func as usize, attr), value);
+            .insert((device, func as usize, attr), value);
     }
     set_last(r.err().unwrap_or(CUDA_SUCCESS))
 }
+
+/// Resolve a statically registered kernel symbol to a runtime function
+/// handle. Return the daemon's real CUfunction so callers may use the result
+/// with either Runtime or Driver launch APIs, as NCCL does.
+#[no_mangle]
+pub extern "C" fn cudaGetFuncBySymbol(function: *mut *mut c_void, symbol: *const c_void) -> c_int {
+    if function.is_null() || symbol.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    let device = function_device(symbol);
+    let result = with_state_on_device(device, |state| {
+        ensure_registered_func(state, symbol as usize).map(|(function, _)| function)
+    });
+    match result {
+        Ok(resolved) => {
+            unsafe { *function = resolved as *mut c_void };
+            set_last(CUDA_SUCCESS)
+        }
+        Err(code) => set_last(code),
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(
     num_blocks: *mut c_int,
@@ -2980,8 +3762,17 @@ pub extern "C" fn cudaStreamGetCaptureInfo(
     id: *mut u64,
     graph: *mut *mut c_void,
     deps: *mut *mut *const c_void,
+    edge_data: *mut *const c_void,
     num_deps: *mut usize,
 ) -> c_int {
+    // CUDA 13 added the edge-data output before `numDependencies`; current
+    // cuda-python bindings call this seven-argument ABI.
+    if !edge_data.is_null() && deps.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    if !edge_data.is_null() {
+        unsafe { *edge_data = std::ptr::null() };
+    }
     cudaStreamGetCaptureInfo_v2(stream, status, id, graph, deps, num_deps)
 }
 
@@ -3058,6 +3849,7 @@ pub extern "C" fn cudaLibraryLoadData(
                 handle,
                 LibraryRec {
                     module,
+                    device: CURRENT_DEVICE.with(|current| current.get()),
                     kernels: Vec::new(),
                     globals: Vec::new(),
                 },
@@ -3086,18 +3878,24 @@ pub extern "C" fn cudaLibraryGetKernel(
     };
     set_last(
         match with_state(|s| {
-            let module = s
+            let rec = s
                 .libraries
                 .get(&(library as usize))
-                .ok_or(CUDA_ERROR_INVALID_RESOURCE_HANDLE)?
-                .module;
+                .ok_or(CUDA_ERROR_INVALID_RESOURCE_HANDLE)?;
+            let device = CURRENT_DEVICE.with(|current| current.get());
+            if rec.device != device {
+                return Err(CUDA_ERROR_INVALID_RESOURCE_HANDLE);
+            }
+            let module = rec.module;
             let fid = s
                 .client
                 .module_get_function(module, &name)
                 .map_err(map_err)?;
             let param_sizes = s.client.func_get_param_info(fid).map_err(map_err)?;
             let handle = alloc_vhandle() as usize;
-            s.funcs.insert(handle, FuncRec { fid, param_sizes });
+            let device = CURRENT_DEVICE.with(|current| current.get());
+            s.funcs
+                .insert((device, handle), FuncRec { fid, param_sizes });
             s.libraries
                 .get_mut(&(library as usize))
                 .expect("library validated above")
@@ -3131,16 +3929,23 @@ pub extern "C" fn cudaLibraryGetGlobal(
     };
     set_last(
         match with_state(|s| {
-            let module = s
+            let rec = s
                 .libraries
                 .get(&(library as usize))
-                .ok_or(CUDA_ERROR_INVALID_RESOURCE_HANDLE)?
-                .module;
+                .ok_or(CUDA_ERROR_INVALID_RESOURCE_HANDLE)?;
+            let device = CURRENT_DEVICE.with(|current| current.get());
+            if rec.device != device {
+                return Err(CUDA_ERROR_INVALID_RESOURCE_HANDLE);
+            }
+            let module = rec.module;
             let (address, size) = s
                 .client
                 .module_get_global(module, &name)
                 .map_err(map_symbol_err)?;
-            s.dev_allocs.insert(address, size);
+            s.dev_allocs.insert(
+                address,
+                (size, CURRENT_DEVICE.with(|current| current.get())),
+            );
             let globals = &mut s
                 .libraries
                 .get_mut(&(library as usize))
@@ -3167,10 +3972,17 @@ pub extern "C" fn cudaKernelSetAttributeForDevice(
     value: c_int,
     device: c_int,
 ) -> c_int {
-    if device != 0 {
+    let count = match with_client_retrying(|client| client.device_get_count()) {
+        Ok(count) => count,
+        Err(error) => return set_last(error),
+    };
+    if device < 0 || device >= count {
         return set_last(10); // cudaErrorInvalidDevice
     }
-    cudaFuncSetAttribute(kernel, attr, value)
+    let previous = CURRENT_DEVICE.with(|current| current.replace(device));
+    let result = cudaFuncSetAttribute(kernel, attr, value);
+    CURRENT_DEVICE.with(|current| current.set(previous));
+    result
 }
 
 #[no_mangle]
@@ -3191,7 +4003,7 @@ pub extern "C" fn cudaLibraryUnload(library: *mut c_void) -> c_int {
                 .remove(&(library as usize))
                 .expect("library validated above");
             for kernel in rec.kernels {
-                s.funcs.remove(&kernel);
+                s.funcs.retain(|(_, handle), _| *handle != kernel);
             }
             for global in rec.globals {
                 s.dev_allocs.remove(&global);
@@ -3240,13 +4052,18 @@ pub extern "C" fn cudaGetDriverEntryPointByVersion(
     if symbol.is_null() || func_ptr.is_null() {
         return set_last(CUDA_ERROR_INVALID_VALUE);
     }
-    let found = unsafe {
-        let lib = dlopen(c"libcuda.so.1".as_ptr(), RTLD_NOW | RTLD_GLOBAL);
-        if lib.is_null() {
-            std::ptr::null_mut()
-        } else {
-            dlsym(lib, symbol)
+    let symbol_name = unsafe { CStr::from_ptr(symbol) };
+    let found = if driver_entrypoint_supported(symbol_name) {
+        unsafe {
+            let lib = dlopen(c"libcuda.so.1".as_ptr(), RTLD_NOW | RTLD_GLOBAL);
+            if lib.is_null() {
+                std::ptr::null_mut()
+            } else {
+                dlsym(lib, symbol)
+            }
         }
+    } else {
+        std::ptr::null_mut()
     };
     unsafe {
         *func_ptr = found;
@@ -3259,6 +4076,16 @@ pub extern "C" fn cudaGetDriverEntryPointByVersion(
         }
     }
     set_last(CUDA_SUCCESS)
+}
+
+/// CUDA VMM itself is forwarded, but exporting its generic allocation handles
+/// across guest processes is not.  `cuMemCreate` is the standard capability
+/// probe used by NCCL before selecting its CUMEM transport; exposing it through
+/// the runtime lookup would advertise a transport that later fails at handle
+/// export.  Direct Driver API users retain the supported, process-local VMM
+/// surface through libcuda/cuGetProcAddress.
+fn driver_entrypoint_supported(symbol: &CStr) -> bool {
+    symbol.to_bytes() != b"cuMemCreate"
 }
 
 #[no_mangle]
@@ -3352,11 +4179,35 @@ fn resolve_symbol(symbol: *const c_void) -> Result<(u64, u64), c_int> {
         return Err(CUDA_ERROR_INVALID_SYMBOL);
     }
     with_state(|s| {
-        let rec = s
-            .symbols
-            .get(&(symbol as usize))
-            .cloned()
-            .ok_or(CUDA_ERROR_INVALID_SYMBOL)?;
+        let key = (
+            CURRENT_DEVICE.with(|current| current.get()),
+            symbol as usize,
+        );
+        if !s.symbols.contains_key(&key) {
+            let source = STATIC_SYMBOLS
+                .lock()
+                .map_err(|_| CUDA_ERROR_UNKNOWN)?
+                .as_ref()
+                .and_then(|symbols| symbols.get(&key.1))
+                .cloned()
+                .ok_or(CUDA_ERROR_INVALID_SYMBOL)?;
+            let module = ensure_static_module(s, source.fatbin)?;
+            let (address, size) = s
+                .client
+                .module_get_global(module, &source.name)
+                .map_err(map_symbol_err)?;
+            s.dev_allocs.insert(address, (size, key.0));
+            s.symbols.insert(
+                key,
+                SymbolRec {
+                    module,
+                    name: source.name,
+                    address,
+                },
+            );
+            return Ok((address, size));
+        }
+        let rec = s.symbols.get(&key).cloned().expect("checked above");
         let result = s
             .client
             .module_get_global(rec.module, &rec.name)
@@ -3364,8 +4215,8 @@ fn resolve_symbol(symbol: *const c_void) -> Result<(u64, u64), c_int> {
         if rec.address != result.0 {
             s.dev_allocs.remove(&rec.address);
         }
-        s.dev_allocs.insert(result.0, result.1);
-        if let Some(stored) = s.symbols.get_mut(&(symbol as usize)) {
+        s.dev_allocs.insert(result.0, (result.1, key.0));
+        if let Some(stored) = s.symbols.get_mut(&key) {
             stored.address = result.0;
         }
         Ok(result)
@@ -3413,31 +4264,184 @@ pub extern "C" fn cudaHostGetDevicePointer(
     host: *mut c_void,
     _flags: c_uint,
 ) -> c_int {
-    // Unified-addressing convention: device VA == host VA. Correct for the
-    // memcpy path (the host recognizes guest-RAM addresses and DMAs them).
-    // KNOWN LIMITATION: a mapped host pointer passed as a KERNEL ARG can't be
-    // dereferenced by the host GPU (a guest VA isn't device-addressable) — that
-    // needs true unified memory we don't have. No validated workload does this;
-    // those that would should use explicit cudaMemcpy instead.
-    set_last(unsafe { out(p_device, host) })
+    if p_device.is_null() || host.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    if let Ok(state) = STATE.lock() {
+        if let Some(pointer) = state
+            .as_ref()
+            .and_then(|state| mapped_host_device_pointer(state, host as u64))
+        {
+            return set_last(unsafe { out(p_device, pointer as *mut c_void) });
+        }
+    }
+    let source = mapped_host_source(host);
+    let Some((source, address)) = source else {
+        return set_last(801);
+    };
+    set_last(
+        match with_client_retrying(|client| client.host_get_device_pointer(source, address)) {
+            Ok(pointer) => unsafe { out(p_device, pointer as *mut c_void) },
+            Err(error) => error,
+        },
+    )
 }
 #[no_mangle]
-pub extern "C" fn cudaDeviceCanAccessPeer(can: *mut c_int, _device: c_int, _peer: c_int) -> c_int {
-    set_last(unsafe { out(can, 0) }) // single device
+pub extern "C" fn cudaDeviceCanAccessPeer(can: *mut c_int, device: c_int, peer: c_int) -> c_int {
+    set_last(
+        match with_client_retrying(|client| client.device_can_access_peer(device, peer)) {
+            Ok(value) => unsafe { out(can, value) },
+            Err(error) => error,
+        },
+    )
 }
 #[no_mangle]
-pub extern "C" fn cudaDeviceEnablePeerAccess(_peer: c_int, _flags: c_uint) -> c_int {
-    set_last(CUDA_SUCCESS)
+pub extern "C" fn cudaDeviceEnablePeerAccess(peer: c_int, flags: c_uint) -> c_int {
+    set_last(
+        match with_client(|client| client.device_enable_peer_access(peer, flags)) {
+            Ok(()) => CUDA_SUCCESS,
+            Err(error) => error,
+        },
+    )
 }
 #[no_mangle]
-pub extern "C" fn cudaDeviceGetPCIBusId(buf: *mut c_char, len: c_int, _device: c_int) -> c_int {
-    let id = b"0000:01:00.0\0";
-    if !buf.is_null() && len > 0 {
-        let n = (len as usize - 1).min(id.len() - 1);
-        // `.cast()`: c_char is u8 on aarch64 Linux (making `as` a no-op cast
-        // clippy rejects) but i8 elsewhere.
-        unsafe { std::ptr::copy_nonoverlapping(id.as_ptr().cast::<c_char>(), buf, n) };
-        unsafe { *buf.add(n) = 0 };
+pub extern "C" fn cudaDeviceDisablePeerAccess(peer: c_int) -> c_int {
+    set_last(
+        match with_client(|client| client.device_disable_peer_access(peer)) {
+            Ok(()) => CUDA_SUCCESS,
+            Err(error) => error,
+        },
+    )
+}
+#[no_mangle]
+pub extern "C" fn cudaMemcpyPeerAsync(
+    dst: *mut c_void,
+    dst_device: c_int,
+    src: *const c_void,
+    src_device: c_int,
+    count: usize,
+    stream: *mut c_void,
+) -> c_int {
+    if (dst.is_null() || src.is_null()) && count != 0 {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    set_last(
+        match with_client(|client| {
+            client.memcpy_peer_async(
+                dst as u64,
+                dst_device,
+                src as u64,
+                src_device,
+                count as u64,
+                stream as u64,
+            )
+        }) {
+            Ok(()) => CUDA_SUCCESS,
+            Err(error) => error,
+        },
+    )
+}
+#[no_mangle]
+pub extern "C" fn cudaIpcGetMemHandle(handle: *mut CudaIpcHandle, dptr: *mut c_void) -> c_int {
+    if handle.is_null() || dptr.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    set_last(
+        match with_client_retrying(|client| client.ipc_get_mem_handle(dptr as u64)) {
+            Ok(bytes) => {
+                unsafe { (*handle).reserved.copy_from_slice(&bytes) };
+                CUDA_SUCCESS
+            }
+            Err(error) => error,
+        },
+    )
+}
+#[no_mangle]
+pub extern "C" fn cudaIpcOpenMemHandle(
+    dptr: *mut *mut c_void,
+    handle: CudaIpcHandle,
+    flags: c_uint,
+) -> c_int {
+    if dptr.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    set_last(
+        match with_state(|state| {
+            let pointer = state
+                .client
+                .ipc_open_mem_handle(handle.reserved.to_vec(), flags)
+                .map_err(map_err)?;
+            state
+                .dev_allocs
+                .insert(pointer, (1, CURRENT_DEVICE.with(|current| current.get())));
+            Ok(pointer)
+        }) {
+            Ok(pointer) => unsafe { out(dptr, pointer as *mut c_void) },
+            Err(error) => error,
+        },
+    )
+}
+#[no_mangle]
+pub extern "C" fn cudaIpcCloseMemHandle(dptr: *mut c_void) -> c_int {
+    if dptr.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    set_last(
+        match with_state(|state| {
+            state
+                .client
+                .ipc_close_mem_handle(dptr as u64)
+                .map_err(map_err)?;
+            state.dev_allocs.remove(&(dptr as u64));
+            Ok(())
+        }) {
+            Ok(()) => CUDA_SUCCESS,
+            Err(error) => error,
+        },
+    )
+}
+#[no_mangle]
+pub extern "C" fn cudaIpcGetEventHandle(handle: *mut CudaIpcHandle, event: *mut c_void) -> c_int {
+    if handle.is_null() || event.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    set_last(
+        match with_client_retrying(|client| client.ipc_get_event_handle(event as u64)) {
+            Ok(bytes) => {
+                unsafe { (*handle).reserved.copy_from_slice(&bytes) };
+                CUDA_SUCCESS
+            }
+            Err(error) => error,
+        },
+    )
+}
+#[no_mangle]
+pub extern "C" fn cudaIpcOpenEventHandle(event: *mut *mut c_void, handle: CudaIpcHandle) -> c_int {
+    if event.is_null() {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    set_last(
+        match with_client_retrying(|client| client.ipc_open_event_handle(handle.reserved.to_vec()))
+        {
+            Ok(raw) => unsafe { out(event, raw as *mut c_void) },
+            Err(error) => error,
+        },
+    )
+}
+#[no_mangle]
+pub extern "C" fn cudaDeviceGetPCIBusId(buf: *mut c_char, len: c_int, device: c_int) -> c_int {
+    if buf.is_null() || len <= 0 {
+        return set_last(CUDA_ERROR_INVALID_VALUE);
+    }
+    let id = match with_client_retrying(|client| client.device_get_pci_bus_id(device)) {
+        Ok(id) => id,
+        Err(error) => return set_last(error),
+    };
+    let bytes = id.as_bytes();
+    let count = (len as usize - 1).min(bytes.len());
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr().cast::<c_char>(), buf, count);
+        *buf.add(count) = 0;
     }
     set_last(CUDA_SUCCESS)
 }
@@ -3448,13 +4452,88 @@ pub extern "C" fn cudaDeviceGetByPCIBusId(device: *mut c_int, pci_bus_id: *const
         return set_last(CUDA_ERROR_INVALID_VALUE);
     }
     let requested = unsafe { CStr::from_ptr(pci_bus_id) }.to_bytes();
-    if requested != b"0000:01:00.0" {
-        return set_last(CUDA_ERROR_INVALID_VALUE);
-    }
-    set_last(unsafe { out(device, 0) })
+    let requested = match std::str::from_utf8(requested) {
+        Ok(requested) => requested,
+        Err(_) => return set_last(CUDA_ERROR_INVALID_VALUE),
+    };
+    set_last(
+        match with_client_retrying(|client| client.device_get_by_pci_bus_id(requested)) {
+            Ok(ordinal) => unsafe { out(device, ordinal) },
+            Err(error) => error,
+        },
+    )
 }
 
 // ---- kernel registration + launch -------------------------------------------
+
+fn ensure_static_module(s: &mut ShimState, fatbin: usize) -> Result<u64, c_int> {
+    let key = (CURRENT_DEVICE.with(|current| current.get()), fatbin);
+    if let Some(&module) = s.modules.get(&key) {
+        return Ok(module);
+    }
+    let blob = STATIC_MODULES
+        .lock()
+        .map_err(|_| CUDA_ERROR_UNKNOWN)?
+        .as_ref()
+        .and_then(|modules| modules.get(&fatbin))
+        .cloned()
+        .ok_or(CUDA_ERROR_INVALID_RESOURCE_HANDLE)?;
+    let module = s.client.module_load_data(&blob).map_err(map_err)?;
+    s.modules.insert(key, module);
+    Ok(module)
+}
+
+fn ensure_registered_func(s: &mut ShimState, key: usize) -> Result<(u64, Vec<u32>), c_int> {
+    let device_key = (CURRENT_DEVICE.with(|current| current.get()), key);
+    if let Some(rec) = s.funcs.get(&device_key) {
+        return Ok((rec.fid, rec.param_sizes.clone()));
+    }
+    // cudaGetFuncBySymbol returns the already-resolved daemon CUfunction. A
+    // subsequent Runtime launch may hand that value back instead of the
+    // original registration stub.
+    let current_device = device_key.0;
+    if let Some(record) = s.funcs.iter().find_map(|(&(device, _), record)| {
+        (device == current_device && record.fid == key as u64).then_some(record)
+    }) {
+        return Ok((record.fid, record.param_sizes.clone()));
+    }
+    let source = STATIC_FUNCS
+        .lock()
+        .map_err(|_| CUDA_ERROR_UNKNOWN)?
+        .as_ref()
+        .and_then(|funcs| funcs.get(&key))
+        .cloned()
+        .ok_or(CUDA_ERROR_INVALID_DEVICE_POINTER)?;
+    let module = ensure_static_module(s, source.fatbin).inspect_err(|code| {
+        if std::env::var_os("SMOLVM_CUDA_SHIM_TRACE").is_some() {
+            eprintln!(
+                "[func-resolve] module failed code={code} device={} fatbin={:#x} name={}",
+                device_key.0, source.fatbin, source.name
+            );
+        }
+    })?;
+    let fid = s
+        .client
+        .module_get_function(module, &source.name)
+        .map_err(map_err)
+        .inspect_err(|code| {
+            if std::env::var_os("SMOLVM_CUDA_SHIM_TRACE").is_some() {
+                eprintln!(
+                    "[func-resolve] function failed code={code} device={} module={module:#x} name={}",
+                    device_key.0, source.name
+                );
+            }
+        })?;
+    let param_sizes = s.client.func_get_param_info(fid).map_err(map_err)?;
+    s.funcs.insert(
+        device_key,
+        FuncRec {
+            fid,
+            param_sizes: param_sizes.clone(),
+        },
+    );
+    Ok((fid, param_sizes))
+}
 
 /// `__fatBinC_Wrapper_t`: what `__cudaRegisterFatBinary` receives. `data` points
 /// at the fatbin container (its own header carries the length).
@@ -3469,7 +4548,11 @@ struct FatBinWrapper {
 /// Byte length of a CUDA module/library image handed to a pointer-only API.
 /// Fatbins carry a byte count, cubins are ELF, and PTX is NUL-terminated.
 unsafe fn module_image_len(image: *const c_void) -> Result<usize, c_int> {
-    const MAX_IMAGE_BYTES: usize = 128 * 1024 * 1024;
+    // NCCL 2.26's all-architecture v2 fatbin is about 193 MiB. Keep the bound
+    // high enough for a real vendor module while still rejecting corrupt
+    // headers before they turn into an unbounded guest-memory read.
+    const MAX_FATBIN_BYTES: usize = 512 * 1024 * 1024;
+    const MAX_OTHER_IMAGE_BYTES: usize = 128 * 1024 * 1024;
     if image.is_null() {
         return Err(CUDA_ERROR_INVALID_VALUE);
     }
@@ -3491,7 +4574,7 @@ unsafe fn module_image_len(image: *const c_void) -> Result<usize, c_int> {
             else {
                 return Err(CUDA_ERROR_INVALID_VALUE);
             };
-            if header_size == 0 || fat_size == 0 || next > MAX_IMAGE_BYTES {
+            if header_size == 0 || fat_size == 0 || next > MAX_FATBIN_BYTES {
                 break;
             }
             total = next;
@@ -3534,7 +4617,7 @@ unsafe fn module_image_len(image: *const c_void) -> Result<usize, c_int> {
                 .and_then(|n| shoff.checked_add(n))
                 .ok_or(CUDA_ERROR_INVALID_VALUE)?,
         );
-        if end > MAX_IMAGE_BYTES {
+        if end > MAX_OTHER_IMAGE_BYTES {
             return Err(CUDA_ERROR_INVALID_VALUE);
         }
         for index in 0..phnum {
@@ -3547,7 +4630,7 @@ unsafe fn module_image_len(image: *const c_void) -> Result<usize, c_int> {
             }))?;
             let segment_end = offset
                 .checked_add(size)
-                .filter(|end| *end <= MAX_IMAGE_BYTES)
+                .filter(|end| *end <= MAX_OTHER_IMAGE_BYTES)
                 .ok_or(CUDA_ERROR_INVALID_VALUE)?;
             end = end.max(segment_end);
         }
@@ -3565,13 +4648,13 @@ unsafe fn module_image_len(image: *const c_void) -> Result<usize, c_int> {
             }))?;
             let section_end = offset
                 .checked_add(size)
-                .filter(|end| *end <= MAX_IMAGE_BYTES)
+                .filter(|end| *end <= MAX_OTHER_IMAGE_BYTES)
                 .ok_or(CUDA_ERROR_INVALID_VALUE)?;
             end = end.max(section_end);
         }
         return Ok(end);
     }
-    for len in 0..MAX_IMAGE_BYTES {
+    for len in 0..MAX_OTHER_IMAGE_BYTES {
         if unsafe { *p.add(len) } == 0 {
             return Ok(len + 1);
         }
@@ -3581,27 +4664,38 @@ unsafe fn module_image_len(image: *const c_void) -> Result<usize, c_int> {
 
 #[no_mangle]
 pub extern "C" fn __cudaRegisterFatBinary(fat_cubin: *mut c_void) -> *mut *mut c_void {
-    // Mint a stable handle the app hands back to Register/Unregister; map it to
-    // the driver module we load from the embedded fatbin.
+    // Mint a stable handle the app hands back to Register/Unregister. Preserve
+    // the image locally; the first kernel/global use uploads it to the host.
     let handle = Box::into_raw(Box::new(0u8)) as *mut *mut c_void;
     if fat_cubin.is_null() {
         return handle;
     }
     let wrapper = fat_cubin as *const FatBinWrapper;
     let data = unsafe { (*wrapper).data };
-    let Ok(len) = (unsafe { module_image_len(data) }) else {
-        return handle;
+    let len = match unsafe { module_image_len(data) } {
+        Ok(len) => len,
+        Err(code) => {
+            if std::env::var_os("SMOLVM_CUDA_SHIM_TRACE").is_some() {
+                let version = unsafe { (*wrapper).version };
+                let alternatives = unsafe { (*wrapper).filename_or_fatbins };
+                let head = if data.is_null() {
+                    Vec::new()
+                } else {
+                    unsafe { std::slice::from_raw_parts(data.cast::<u8>(), 16) }.to_vec()
+                };
+                eprintln!(
+                    "[fatbin-register] rejected code={code} version={version} data={data:p} alternatives={alternatives:p} handle={handle:p} head={head:02x?}"
+                );
+            }
+            return handle;
+        }
     };
     let blob = unsafe { std::slice::from_raw_parts(data as *const u8, len) }.to_vec();
-    let _ = with_state(|s| {
-        match s.client.module_load_data(&blob) {
-            Ok(module) => {
-                s.modules.insert(handle as usize, module);
-            }
-            Err(e) => return Err(map_err(e)),
-        }
-        Ok(())
-    });
+    if let Ok(mut modules) = STATIC_MODULES.lock() {
+        modules
+            .get_or_insert_with(HashMap::new)
+            .insert(handle as usize, blob);
+    }
     handle
 }
 
@@ -3637,21 +4731,15 @@ pub extern "C" fn __cudaRegisterFunction(
         Ok(n) => n.to_string(),
         Err(_) => return,
     };
-    let _ = with_state(|s| {
-        let module = *s
-            .modules
-            .get(&(fat_cubin_handle as usize))
-            .ok_or(CUDA_ERROR_INVALID_RESOURCE_HANDLE)?;
-        let cname = CString::new(name.clone()).map_err(|_| CUDA_ERROR_INVALID_VALUE)?;
-        let fid = s
-            .client
-            .module_get_function(module, cname.to_str().unwrap())
-            .map_err(map_err)?;
-        let param_sizes = s.client.func_get_param_info(fid).map_err(map_err)?;
-        s.funcs
-            .insert(host_fun as usize, FuncRec { fid, param_sizes });
-        Ok(())
-    });
+    if let Ok(mut funcs) = STATIC_FUNCS.lock() {
+        funcs.get_or_insert_with(HashMap::new).insert(
+            host_fun as usize,
+            StaticFuncRec {
+                fatbin: fat_cubin_handle as usize,
+                name,
+            },
+        );
+    }
 }
 
 #[no_mangle]
@@ -3681,48 +4769,100 @@ pub extern "C" fn __cudaRegisterVar(
         Ok(name) => name.to_owned(),
         Err(_) => return,
     };
-    let _ = with_state(|s| {
-        let module = *s
-            .modules
-            .get(&(fat_cubin_handle as usize))
-            .ok_or(CUDA_ERROR_INVALID_RESOURCE_HANDLE)?;
-        // Validate the registration now. Calls re-resolve by module/name so an
-        // isolating fork can translate the inherited module to its local copy.
-        let (address, size) = s
-            .client
-            .module_get_global(module, &name)
-            .map_err(map_symbol_err)?;
-        s.dev_allocs.insert(address, size);
-        s.symbols.insert(
+    if let Ok(mut symbols) = STATIC_SYMBOLS.lock() {
+        symbols.get_or_insert_with(HashMap::new).insert(
             host_var as usize,
-            SymbolRec {
-                module,
+            StaticSymbolRec {
+                fatbin: fat_cubin_handle as usize,
                 name,
-                address,
             },
         );
-        Ok(())
-    });
+    }
 }
 
 #[no_mangle]
 pub extern "C" fn __cudaUnregisterFatBinary(handle: *mut *mut c_void) {
-    let _ = with_state(|s| {
-        if let Some(module) = s.modules.remove(&(handle as usize)) {
-            let global_addresses: Vec<u64> = s
-                .symbols
-                .values()
-                .filter(|symbol| symbol.module == module)
-                .map(|symbol| symbol.address)
-                .collect();
-            s.symbols.retain(|_, symbol| symbol.module != module);
-            for address in global_addresses {
-                s.dev_allocs.remove(&address);
-            }
-            let _ = s.client.module_unload(module);
+    let fatbin = handle as usize;
+    if let Ok(mut modules) = STATIC_MODULES.lock() {
+        if let Some(modules) = modules.as_mut() {
+            modules.remove(&fatbin);
         }
-        Ok(())
-    });
+    }
+    let function_keys = STATIC_FUNCS
+        .lock()
+        .ok()
+        .and_then(|mut funcs| {
+            let funcs = funcs.as_mut()?;
+            let keys: Vec<usize> = funcs
+                .iter()
+                .filter_map(|(&key, rec)| (rec.fatbin == fatbin).then_some(key))
+                .collect();
+            for key in &keys {
+                funcs.remove(key);
+            }
+            Some(keys)
+        })
+        .unwrap_or_default();
+    let symbol_keys = STATIC_SYMBOLS
+        .lock()
+        .ok()
+        .and_then(|mut symbols| {
+            let symbols = symbols.as_mut()?;
+            let keys: Vec<usize> = symbols
+                .iter()
+                .filter_map(|(&key, rec)| (rec.fatbin == fatbin).then_some(key))
+                .collect();
+            for key in &keys {
+                symbols.remove(key);
+            }
+            Some(keys)
+        })
+        .unwrap_or_default();
+    // Do not create a CUDA connection during ELF teardown. Unload only when
+    // this process actually materialized the module earlier.
+    if let Ok(mut state) = STATE.lock() {
+        if let Some(s) = state.as_mut() {
+            for key in function_keys {
+                s.funcs.retain(|(_, handle), _| *handle != key);
+            }
+            for key in symbol_keys {
+                let device_keys: Vec<(i32, usize)> = s
+                    .symbols
+                    .keys()
+                    .filter(|(_, handle)| *handle == key)
+                    .copied()
+                    .collect();
+                for device_key in device_keys {
+                    let Some(symbol) = s.symbols.remove(&device_key) else {
+                        continue;
+                    };
+                    s.dev_allocs.remove(&symbol.address);
+                }
+            }
+            let module_keys: Vec<(i32, usize)> = s
+                .modules
+                .keys()
+                .filter(|(_, registered)| *registered == fatbin)
+                .copied()
+                .collect();
+            for module_key in module_keys {
+                let Some(module) = s.modules.remove(&module_key) else {
+                    continue;
+                };
+                let global_addresses: Vec<u64> = s
+                    .symbols
+                    .values()
+                    .filter(|symbol| symbol.module == module)
+                    .map(|symbol| symbol.address)
+                    .collect();
+                s.symbols.retain(|_, symbol| symbol.module != module);
+                for address in global_addresses {
+                    s.dev_allocs.remove(&address);
+                }
+                let _ = s.client.module_unload(module);
+            }
+        }
+    }
     if !handle.is_null() {
         unsafe { drop(Box::from_raw(handle as *mut u8)) };
     }
@@ -3847,15 +4987,15 @@ fn do_launch_inner(
     if *NOOP.get_or_init(|| std::env::var_os("SMOLVM_CUDA_NOOP_LAUNCH").is_some()) {
         return CUDA_SUCCESS;
     }
-    with_state(|s| {
-        let rec = s
-            .funcs
-            .get(&(func as usize))
-            .ok_or(CUDA_ERROR_INVALID_DEVICE_POINTER)?;
-        let fid = rec.fid;
-        let sizes = rec.param_sizes.clone();
+    let device = if stream == 0 {
+        function_device(func)
+    } else {
+        stream_device(stream as *mut c_void)
+    };
+    with_state_on_device(device, |s| {
+        let (fid, sizes) = ensure_registered_func(s, func as usize)?;
         // Reconstruct one byte-blob per kernel argument from `args[i]`.
-        let params: Vec<Vec<u8>> = if sizes.is_empty() {
+        let mut params: Vec<Vec<u8>> = if sizes.is_empty() {
             Vec::new()
         } else if args.is_null() {
             return Err(CUDA_ERROR_INVALID_VALUE);
@@ -3869,6 +5009,9 @@ fn do_launch_inner(
                 })
                 .collect()
         };
+        for parameter in &mut params {
+            patch_mapped_host_pointers(s, parameter);
+        }
         s.client
             .launch_kernel(fid, grid, block, shared_mem as u32, stream, &params)
             .map_err(map_err)
@@ -3960,6 +5103,9 @@ pub extern "C" fn cudaGetLastError() -> c_int {
     LAST_ERROR.with(|e| {
         let v = e.get();
         e.set(CUDA_SUCCESS);
+        if v != CUDA_SUCCESS && std::env::var_os("SMOLVM_CUDA_SHIM_TRACE").is_some() {
+            eprintln!("[cuda-get-last-error] returning {v}");
+        }
         v
     })
 }
@@ -3978,6 +5124,9 @@ fn merge_sticky_async_error() {
     let _ = with_state(|s| {
         let code = s.client.take_sticky();
         if code != 0 {
+            if std::env::var_os("SMOLVM_CUDA_SHIM_TRACE").is_some() {
+                eprintln!("[cuda-sticky-error] collected driver status {code}");
+            }
             set_last(map_err(CudaRpcError::Cuda(code)));
         }
         Ok(())
@@ -4909,8 +6058,8 @@ fn bn_memo_key(func: u16, args: &[u8]) -> Option<Vec<u8>> {
     let mut key = Vec::with_capacity(args.len() * 4);
     key.extend_from_slice(&func.to_le_bytes());
     key.extend_from_slice(&args[..16]);
-    for chunk in args[16..].chunks_exact(8) {
-        let h = u64::from_le_bytes(chunk.try_into().unwrap());
+    for chunk in args[16..].as_chunks::<8>().0 {
+        let h = u64::from_le_bytes(*chunk);
         if h == 0 {
             key.push(0);
             continue;
@@ -5043,6 +6192,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn capture_info_stays_local_for_independent_roots() {
+        let mut captures = HashMap::new();
+        assert_eq!(local_capture_info(&captures, 22), Some((CAPTURE_NONE, 0)));
+        captures.insert(
+            11,
+            CaptureRecord {
+                local_id: 77,
+                host_id: None,
+            },
+        );
+        captures.insert(
+            22,
+            CaptureRecord {
+                local_id: 88,
+                host_id: None,
+            },
+        );
+        assert_eq!(
+            local_capture_info(&captures, 11),
+            Some((CAPTURE_ACTIVE, 77))
+        );
+        assert_eq!(
+            local_capture_info(&captures, 22),
+            Some((CAPTURE_ACTIVE, 88))
+        );
+    }
+
+    #[test]
+    fn unrelated_side_stream_stays_outside_capture() {
+        let captures = HashMap::from([(
+            11,
+            CaptureRecord {
+                local_id: 77,
+                host_id: None,
+            },
+        )]);
+        assert_eq!(local_capture_info(&captures, 22), None);
+    }
+
+    #[test]
+    fn capture_errors_preserve_runtime_codes() {
+        for code in 900..=910 {
+            assert_eq!(map_err(CudaRpcError::Cuda(code)), code);
+        }
+    }
+
+    #[test]
     fn module_image_lengths_cover_ptx_fatbin_and_elf() {
         let ptx = b".version 7.0\0";
         assert_eq!(
@@ -5079,6 +6275,55 @@ mod tests {
             unsafe { module_image_len(oversized_elf.as_ptr().cast()) },
             Err(CUDA_ERROR_INVALID_VALUE)
         );
+    }
+
+    #[test]
+    fn static_registration_stays_local_until_first_use() {
+        let ptx = b".version 7.0\n.entry lazy_test() { ret; }\0";
+        let wrapper = FatBinWrapper {
+            magic: 0x4662_43b1_u32 as c_int,
+            version: 1,
+            data: ptx.as_ptr().cast(),
+            filename_or_fatbins: std::ptr::null(),
+        };
+        let handle = __cudaRegisterFatBinary((&wrapper as *const FatBinWrapper).cast_mut().cast());
+        let host_stub = std::ptr::dangling::<c_char>();
+        __cudaRegisterFunction(
+            handle,
+            host_stub,
+            std::ptr::null_mut(),
+            c"lazy_test".as_ptr(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+
+        assert!(STATIC_MODULES
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|modules| modules.contains_key(&(handle as usize))));
+        assert!(STATIC_FUNCS
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|funcs| funcs.contains_key(&(host_stub as usize))));
+        assert!(STATE.lock().unwrap().is_none());
+
+        __cudaUnregisterFatBinary(handle);
+        assert!(!STATIC_MODULES
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|modules| modules.contains_key(&(handle as usize))));
+        assert!(!STATIC_FUNCS
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|funcs| funcs.contains_key(&(host_stub as usize))));
     }
 
     #[test]
@@ -5144,16 +6389,21 @@ mod tests {
     }
 
     #[test]
-    fn pci_bus_lookup_matches_the_advertised_device() {
+    fn pci_bus_lookup_rejects_invalid_pointers_without_connecting() {
         let mut device = -1;
         assert_eq!(
-            cudaDeviceGetByPCIBusId(&mut device, c"0000:01:00.0".as_ptr()),
-            CUDA_SUCCESS
-        );
-        assert_eq!(device, 0);
-        assert_eq!(
-            cudaDeviceGetByPCIBusId(&mut device, c"0000:02:00.0".as_ptr()),
+            cudaDeviceGetByPCIBusId(&mut device, std::ptr::null()),
             CUDA_ERROR_INVALID_VALUE
         );
+        assert_eq!(
+            cudaDeviceGetByPCIBusId(std::ptr::null_mut(), c"0000:01:00.0".as_ptr()),
+            CUDA_ERROR_INVALID_VALUE
+        );
+    }
+
+    #[test]
+    fn runtime_lookup_does_not_advertise_cross_process_vmm() {
+        assert!(!driver_entrypoint_supported(c"cuMemCreate"));
+        assert!(driver_entrypoint_supported(c"cuMemAlloc_v2"));
     }
 }

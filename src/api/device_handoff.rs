@@ -200,7 +200,7 @@ fn validate_bundle_metadata(metadata: &[u8], allocation_size: u64) -> Result<(),
     for (tensor, range) in manifest
         .tensors
         .iter()
-        .zip(metadata[ranges_offset..].chunks_exact(16))
+        .zip(metadata[ranges_offset..].as_chunks::<16>().0.iter())
     {
         if tensor.name.is_empty()
             || tensor.name.len() > MAX_TENSOR_NAME_BYTES

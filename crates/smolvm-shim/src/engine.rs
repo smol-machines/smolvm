@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use log::{debug, warn};
+use log::{debug, info, warn};
 use tokio::sync::watch;
 
 use smolvm::agent::{AgentClient, HostMount, VmResources};
@@ -59,6 +59,57 @@ const POD_SHARE_GUEST_MOUNT: &str = "/mnt/virtiofs/podshare";
 /// Default sandbox VM sizing until pod-overhead plumbing lands.
 const SANDBOX_CPUS: u8 = 2;
 const SANDBOX_MEMORY_MIB: u32 = 1024;
+
+/// Pod annotation opting the sandbox VM into a virtio-gpu device (Venus/Vulkan).
+///
+/// A GPU has to be decided HERE, at sandbox creation: libkrun takes it via
+/// `krun_set_gpu_options2` before the VM starts, and there is no hot-plug. That
+/// rules out deriving it from a container's allocated devices, which kubelet
+/// only reports after the sandbox is already running — so the request rides a
+/// pod annotation, which containerd propagates onto the sandbox OCI spec.
+const ANN_GPU: &str = "smolvm.io/gpu";
+/// Pod annotation sizing the GPU's shared-memory region, in MiB. Absent → the
+/// engine's default. Ignored unless [`ANN_GPU`] is set.
+const ANN_GPU_VRAM_MIB: &str = "smolvm.io/gpu-vram-mib";
+
+/// A sandbox's GPU request, read off the pod's annotations.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct GpuRequest {
+    enabled: bool,
+    vram_mib: Option<u32>,
+}
+
+/// Read the GPU request from a sandbox OCI spec.
+///
+/// Unparseable or out-of-range sizes fall back to the engine default rather
+/// than failing the pod: the workload asked for a GPU, and a bad size hint is
+/// not a reason to deny it one.
+fn sandbox_gpu_request(spec: Option<&serde_json::Value>) -> GpuRequest {
+    let Some(annotations) = spec.and_then(|v| v.get("annotations")) else {
+        return GpuRequest::default();
+    };
+    let flag = annotations.get(ANN_GPU).and_then(|v| v.as_str());
+    // Only an explicit affirmative enables it; anything else (including a
+    // typo'd value) leaves the pod on the CPU path it would have had anyway.
+    if !matches!(
+        flag.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("true") | Some("1")
+    ) {
+        return GpuRequest::default();
+    }
+    let vram_mib = annotations
+        .get(ANN_GPU_VRAM_MIB)
+        .and_then(|v| v.as_str())
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|mib| *mib > 0);
+    if annotations.get(ANN_GPU_VRAM_MIB).is_some() && vram_mib.is_none() {
+        warn!("{ANN_GPU_VRAM_MIB} is not a positive integer; using the default VRAM size");
+    }
+    GpuRequest {
+        enabled: true,
+        vram_mib,
+    }
+}
 
 /// How long `start` waits for the agent's `Started` frame.
 const START_TIMEOUT: Duration = Duration::from_secs(60);
@@ -582,6 +633,15 @@ impl PodBackend for EnginePodBackend {
                 .and_then(|v| v.pointer("/linux/sysctl"))
                 .filter(|v| v.as_object().map(|o| !o.is_empty()).unwrap_or(false))
                 .cloned();
+            let gpu = sandbox_gpu_request(sandbox_spec.as_ref());
+            if gpu.enabled {
+                info!(
+                    "sandbox {id_owned}: GPU requested (vram_mib={})",
+                    gpu.vram_mib
+                        .map(|m| m.to_string())
+                        .unwrap_or_else(|| "default".into())
+                );
+            }
 
             // The bundle lives under /run/containerd/... which the engine's mount
             // validation rejects as a protected system path. Host the pod share
@@ -610,11 +670,15 @@ impl PodBackend for EnginePodBackend {
                     // prerequisite for bridging it to a CNI tap in the pod netns
                     // so the pod carries its CNI-assigned IP.
                     network_backend: Some(NetworkBackend::VirtioNet),
+                    gpu: gpu.enabled,
+                    gpu_vram_mib: gpu.vram_mib,
                     ..VmResources::default()
                 },
                 persistent: true,
                 runtime_managed: true,
-                labels: Default::default(),
+                // Spread the rest so a new spec field does not break the shim.
+                // A pod sandbox mounts nothing remote of its own.
+                ..Default::default()
             };
             match rt.create_machine(spec.clone()) {
                 Ok(()) => {}
@@ -1256,5 +1320,93 @@ impl PodBackend for ShimBackend {
             Self::Mock(b) => b.stats(id).await,
             Self::Engine(b) => b.stats(id).await,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec_with(annotations: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "annotations": annotations })
+    }
+
+    #[test]
+    fn no_annotations_means_no_gpu() {
+        assert_eq!(sandbox_gpu_request(None), GpuRequest::default());
+        assert_eq!(
+            sandbox_gpu_request(Some(&serde_json::json!({}))),
+            GpuRequest::default()
+        );
+        assert_eq!(
+            sandbox_gpu_request(Some(&spec_with(serde_json::json!({})))),
+            GpuRequest::default()
+        );
+    }
+
+    #[test]
+    fn affirmative_values_enable_the_gpu() {
+        for v in ["true", "1", "TRUE", " true "] {
+            assert_eq!(
+                sandbox_gpu_request(Some(&spec_with(serde_json::json!({ ANN_GPU: v })))),
+                GpuRequest {
+                    enabled: true,
+                    vram_mib: None
+                },
+                "expected {v:?} to enable the GPU"
+            );
+        }
+    }
+
+    /// A pod that did not clearly ask for a GPU keeps the CPU-only VM it would
+    /// otherwise have had — a 4 GiB VRAM reservation is not a safe default.
+    #[test]
+    fn non_affirmative_values_leave_the_gpu_off() {
+        for v in ["false", "0", "", "yes", "maybe"] {
+            assert_eq!(
+                sandbox_gpu_request(Some(&spec_with(serde_json::json!({ ANN_GPU: v })))),
+                GpuRequest::default(),
+                "expected {v:?} to leave the GPU off"
+            );
+        }
+    }
+
+    #[test]
+    fn vram_size_is_read_when_the_gpu_is_on() {
+        assert_eq!(
+            sandbox_gpu_request(Some(&spec_with(
+                serde_json::json!({ ANN_GPU: "true", ANN_GPU_VRAM_MIB: "2048" })
+            ))),
+            GpuRequest {
+                enabled: true,
+                vram_mib: Some(2048)
+            }
+        );
+    }
+
+    #[test]
+    fn a_bad_vram_size_falls_back_to_the_default_without_denying_the_gpu() {
+        for v in ["0", "-1", "lots", ""] {
+            assert_eq!(
+                sandbox_gpu_request(Some(&spec_with(
+                    serde_json::json!({ ANN_GPU: "true", ANN_GPU_VRAM_MIB: v })
+                ))),
+                GpuRequest {
+                    enabled: true,
+                    vram_mib: None
+                },
+                "expected {v:?} to fall back to the default size"
+            );
+        }
+    }
+
+    #[test]
+    fn vram_size_alone_does_not_enable_the_gpu() {
+        assert_eq!(
+            sandbox_gpu_request(Some(&spec_with(
+                serde_json::json!({ ANN_GPU_VRAM_MIB: "2048" })
+            ))),
+            GpuRequest::default()
+        );
     }
 }

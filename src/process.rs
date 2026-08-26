@@ -1298,6 +1298,14 @@ fn make_idmap_userns(uid: u32, gid: u32) -> std::io::Result<libc::c_int> {
     finish(Ok(nsfd))
 }
 
+// fork: gnu libc binds move_mount(2)'s flags; musl's does not — fall back to the
+// stable kernel UAPI value so a musl build still compiles.
+#[cfg(target_os = "linux")]
+#[cfg(target_env = "gnu")]
+use libc::MOVE_MOUNT_F_EMPTY_PATH;
+#[cfg(all(target_os = "linux", not(target_env = "gnu")))]
+const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 0x0000_0004;
+
 /// Present the root-owned shared pack at `shared` onto the per-VM mountpoint
 /// `target` via an idmapped bind mount that maps on-disk uid/gid 0 -> `(uid, gid)`
 /// — so the VMM (about to drop to that uid) reads every file as its owner, while
@@ -1400,7 +1408,7 @@ pub fn setup_pack_idmap_mount(
             c"".as_ptr(),
             libc::AT_FDCWD,
             target_c.as_ptr(),
-            libc::MOVE_MOUNT_F_EMPTY_PATH as libc::c_uint,
+            MOVE_MOUNT_F_EMPTY_PATH as libc::c_uint,
         )
     };
     let result = if rc != 0 { Err(errno()) } else { Ok(()) };
@@ -1408,6 +1416,28 @@ pub fn setup_pack_idmap_mount(
     close_tree();
     close_userns();
     result
+}
+
+/// Path to spawn another copy of the currently running executable.
+///
+/// On Linux this returns `/proc/self/exe`, which the kernel resolves at exec
+/// time to the running binary's inode — even after the file at the binary's
+/// on-disk path has been replaced or unlinked. A long-lived `serve` whose
+/// binary is swapped by an install/upgrade would otherwise see
+/// `current_exe()` = "…/smolvm-bin (deleted)" and fail every subsequent VM
+/// boot with ENOENT; spawning through `/proc/self/exe` also guarantees the
+/// boot subprocess runs the same code version as the process that spawned it,
+/// never a half-written replacement. Elsewhere the textual path is the only
+/// option.
+pub fn self_exe_for_spawn() -> std::io::Result<std::path::PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        let proc_self = std::path::Path::new("/proc/self/exe");
+        if proc_self.exists() {
+            return Ok(proc_self.to_path_buf());
+        }
+    }
+    std::env::current_exe()
 }
 
 /// PIDs of detached VM boot subprocesses to reap. Registered by

@@ -13,6 +13,7 @@ members = [
     "crates/smolvm-pack",
     "crates/smolvm-protocol",
     "crates/smolvm-registry",
+    "crates/smolvm-s3fs",
     "crates/smolvm-shim",
     "crates/smolvm-smolfile",
 ]
@@ -20,7 +21,7 @@ resolver = "2"
 
 [package]
 name = "smolvm"
-version = "1.7.5"
+version = "1.13.0"
 edition = "2021"
 description = "OCI-native microVM runtime"
 license = "Apache-2.0"

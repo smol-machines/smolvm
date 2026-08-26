@@ -80,6 +80,7 @@ fn boot_log(level: &str, msg: &str) {
     }
 }
 mod cuda;
+mod disk_trim;
 mod dns_proxy;
 mod docker_bridge;
 mod forkpoint;
@@ -94,11 +95,13 @@ mod pty;
 mod publish_socket;
 mod retry;
 mod rosetta;
+mod s3mount;
 mod ssh_agent;
 mod storage;
 #[cfg(target_os = "linux")]
 mod timesync;
 mod vsock;
+mod vulkan;
 
 // ============================================================================
 // Configuration Constants
@@ -122,6 +125,37 @@ const NETWORK_TEST_TIMEOUT_SECS: u64 = 10;
 
 /// Poll interval for checking process completion in VM exec.
 const PROCESS_POLL_INTERVAL_MS: u64 = 10;
+
+/// Match mainstream container runtimes and leave enough descriptor headroom
+/// for package managers, browsers, language servers, and concurrent tools.
+pub(crate) const DEFAULT_NOFILE_LIMIT: u64 = 1_048_576;
+
+#[cfg(target_os = "linux")]
+fn raise_nofile_limit() {
+    let desired = libc::rlimit {
+        rlim_cur: DEFAULT_NOFILE_LIMIT as libc::rlim_t,
+        rlim_max: DEFAULT_NOFILE_LIMIT as libc::rlim_t,
+    };
+    // SAFETY: `desired` is initialized and setrlimit copies it synchronously.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &desired) } == 0 {
+        return;
+    }
+
+    // Some kernels cap the hard limit below the conventional 1M default. Use
+    // every descriptor the guest was granted instead of leaving the legacy
+    // soft limit at 1,024.
+    let mut available = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `available` points to writable storage for one rlimit value.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut available) } == 0 {
+        available.rlim_cur = available.rlim_max;
+        // SAFETY: `available` came from getrlimit and only its soft limit was
+        // raised to the already-authorized hard limit.
+        let _ = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &available) };
+    }
+}
 
 /// Get system uptime in milliseconds (for timing relative to boot).
 fn uptime_ms() -> u64 {
@@ -216,6 +250,13 @@ fn main() {
         std::process::exit(nsfile::run_helper());
     }
 
+    // S3 volume mount helper. Same reason as above: it enters the workload
+    // container's mount namespace, and then stays alive serving the FUSE
+    // session for the life of the mount.
+    if s3mount::helper_requested() {
+        std::process::exit(s3mount::run_helper());
+    }
+
     // Quick --version check (used by init script to detect rootfs updates)
     if std::env::args().any(|a| a == "--version") {
         println!("{}", env!("CARGO_PKG_VERSION"));
@@ -228,6 +269,11 @@ fn main() {
         "INFO",
         &format!("boot agent_entry uptime_ms={}", boottime_ms()),
     );
+
+    // crun exec inherits the agent's descriptor ceiling rather than the
+    // original OCI process limit, so raise PID 1 before launching workloads.
+    #[cfg(target_os = "linux")]
+    raise_nofile_limit();
 
     // Seed the guest wall clock from the host's launch time when the hypervisor
     // gives the guest no readable paravirt clock and it boots at ~1999 (WHP on
@@ -253,6 +299,9 @@ fn main() {
         "INFO",
         &format!("boot mounts_done uptime_ms={}", uptime_ms()),
     );
+
+    #[cfg(target_os = "linux")]
+    delegate_root_cgroup_controllers();
 
     // Create /dev/dri device nodes only when GPU is enabled. The setup
     // function polls up to 500ms for the virtio-gpu driver to finish probing —
@@ -486,6 +535,10 @@ fn main() {
     // ensure_storage_mounted() also guards any concurrent call from a request
     // that races in the brief window on very fast hosts.
     ensure_storage_mounted();
+
+    // With the disks mounted, start reclaiming freed blocks back to the host
+    // sparse files so disk footprint tracks live data (see disk_trim).
+    disk_trim::spawn();
 
     // Start accepting connections (listener already bound)
     if let Err(e) = run_server_with_listener(listener) {
@@ -728,6 +781,65 @@ fn mount_essential_filesystems() {
             // The networking will be set up by TSI anyway
             libc::close(fd);
         }
+    }
+}
+
+/// Enable every available cgroup2 controller for child cgroups, once, at boot.
+///
+/// libkrun mounts `/sys/fs/cgroup` read-only with nothing in
+/// `cgroup.subtree_control`, so software that manages its own sub-cgroups —
+/// kubelet, dockerd, systemd — finds an undelegated hierarchy and either
+/// fails or runs unbounded, and users had to hand-write the delegation
+/// before starting it. The root cgroup is exempt from cgroup2's
+/// no-internal-processes rule, so enabling controllers here while the agent
+/// and its containers stay in the root is valid; the cost is one extra level
+/// of hierarchical accounting. Best-effort: on any failure workloads behave
+/// exactly as before.
+#[cfg(target_os = "linux")]
+fn delegate_root_cgroup_controllers() {
+    use std::ffi::CString;
+    let Ok(target) = CString::new("/sys/fs/cgroup") else {
+        return;
+    };
+    // Remount read-write; MS_REMOUNT preserves the mount and omitting
+    // MS_RDONLY clears the read-only flag.
+    let flags = libc::MS_REMOUNT | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC;
+    // SAFETY: `target` is a valid NUL-terminated path; the agent is PID-1 and
+    // holds CAP_SYS_ADMIN. Null source/type/data is valid for a remount.
+    let rc = unsafe {
+        libc::mount(
+            std::ptr::null(),
+            target.as_ptr(),
+            std::ptr::null(),
+            flags,
+            std::ptr::null(),
+        )
+    };
+    if rc != 0 {
+        boot_log(
+            "WARN",
+            "cgroup2 remount rw failed; controllers not delegated",
+        );
+        return;
+    }
+    let controllers =
+        std::fs::read_to_string("/sys/fs/cgroup/cgroup.controllers").unwrap_or_default();
+    let enable: Vec<String> = controllers
+        .split_whitespace()
+        .map(|c| format!("+{c}"))
+        .collect();
+    if enable.is_empty() {
+        return;
+    }
+    match std::fs::write("/sys/fs/cgroup/cgroup.subtree_control", enable.join(" ")) {
+        Ok(()) => boot_log(
+            "INFO",
+            &format!("cgroup2 controllers delegated: {}", controllers.trim()),
+        ),
+        Err(e) => boot_log(
+            "WARN",
+            &format!("cgroup2 controller delegation failed: {e}"),
+        ),
     }
 }
 
@@ -1948,6 +2060,24 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
             continue;
         }
 
+        // A Stdin/Resize frame at the TOP level is a stray leftover from a
+        // just-ended interactive session: that session's async FrameWriter can
+        // flush a still-queued EOF-stdin or resize frame during teardown, after
+        // the session's own request/response already completed. It has no
+        // interactive session to apply to (interactive Run/VmExec/PodStart
+        // consume their own stdin/resize internally), and it is fire-and-forget
+        // — the host never awaits a response to it. Drop it silently; replying
+        // with an error here instead desynchronizes the stream, because the host
+        // reads that error as the response to its NEXT request (e.g. a detached
+        // workload launch during a remote-volume start), failing it spuriously.
+        if matches!(
+            &request,
+            AgentRequest::Stdin { .. } | AgentRequest::Resize { .. }
+        ) {
+            debug!("ignoring stray stdin/resize outside an interactive session");
+            continue;
+        }
+
         // Check if this is an interactive run request
         if let AgentRequest::Run {
             interactive: true, ..
@@ -2027,6 +2157,8 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
         if let AgentRequest::FileWriteBegin {
             path,
             mode,
+            uid,
+            gid,
             total_size,
         } = request
         {
@@ -2034,7 +2166,7 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
             // starting a new one. `take()` makes the drop explicit and keeps the
             // value from looking like a dead store.
             let _ = write_session.take();
-            let (new_session, response) = handle_file_write_begin(path, mode, total_size);
+            let (new_session, response) = handle_file_write_begin(path, mode, uid, gid, total_size);
             write_session = new_session;
             send_response(stream, &response)?;
             continue;
@@ -2266,6 +2398,7 @@ fn handle_request(
             persistent_overlay_id,
             stdin_data,
             background,
+            s3_volumes,
         } => {
             if background {
                 handle_run_background(
@@ -2277,6 +2410,7 @@ fn handle_request(
                     &mounts,
                     persistent_overlay_id.as_deref(),
                     unprivileged,
+                    &s3_volumes,
                 )
             } else {
                 handle_run(
@@ -2291,6 +2425,7 @@ fn handle_request(
                     stdin_data.as_deref(),
                     client_fd,
                     unprivileged,
+                    &s3_volumes,
                 )
             }
         }
@@ -2313,7 +2448,13 @@ fn handle_request(
             AgentResponse::error("export layer not handled here", error_codes::INTERNAL_ERROR)
         }
 
-        AgentRequest::FileWrite { path, data, mode } => handle_file_write(&path, &data, mode),
+        AgentRequest::FileWrite {
+            path,
+            data,
+            mode,
+            uid,
+            gid,
+        } => handle_file_write(&path, &data, mode, uid, gid),
 
         // Streaming uploads go through `handle_connection`'s
         // per-connection session state so they can't land here.
@@ -2616,7 +2757,13 @@ fn resolve_guest_io_path(
 /// finalize step. The atomic-rename pattern is the thing both paths
 /// need to guarantee: partial contents never appear at `path` under
 /// any error or kill scenario.
-fn install_file_atomic(path: &str, data: &[u8], mode: Option<u32>) -> AgentResponse {
+fn install_file_atomic(
+    path: &str,
+    data: &[u8],
+    mode: Option<u32>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+) -> AgentResponse {
     let resolved = match resolve_guest_io_path(path, FilePathAccess::Write) {
         Ok(p) => p,
         Err(resp) => return resp,
@@ -2659,6 +2806,17 @@ fn install_file_atomic(path: &str, data: &[u8], mode: Option<u32>) -> AgentRespo
     if let Some(m) = mode {
         apply_mode_best_effort(target, m);
     }
+    // Ownership was requested explicitly, so a failure is an error, not a
+    // best-effort shrug — a non-root workload silently unable to read its own
+    // upload is exactly the bug this exists to prevent.
+    if uid.is_some() || gid.is_some() {
+        if let Err(e) = std::os::unix::fs::chown(target, uid, gid) {
+            return AgentResponse::error(
+                format!("failed to chown {}: {}", path, e),
+                error_codes::FILE_IO_FAILED,
+            );
+        }
+    }
     info!(path = %path, size = data.len(), "file written");
     AgentResponse::Ok { data: None }
 }
@@ -2674,17 +2832,26 @@ fn install_file_atomic(path: &str, data: &[u8], mode: Option<u32>) -> AgentRespo
 /// With no running workload the local write is correct and is kept: overlayfs
 /// reads `upper` at mount time, so seeding it before the container starts is
 /// exactly how the file becomes visible once it does.
-fn handle_file_write(path: &str, data: &[u8], mode: Option<u32>) -> AgentResponse {
-    if let Some(result) = nsfile::write_to_container(path, data, mode) {
-        return match result {
+fn handle_file_write(
+    path: &str,
+    data: &[u8],
+    mode: Option<u32>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+) -> AgentResponse {
+    match nsfile::GuestNs::for_workload() {
+        nsfile::GuestNs::Container(ns) => match ns.write(path, data, mode, uid, gid) {
             Ok(()) => AgentResponse::Ok { data: None },
             Err(e) => AgentResponse::error(
                 format!("failed to write {} in the workload container: {}", path, e),
                 error_codes::FILE_IO_FAILED,
             ),
-        };
+        },
+        // Seeding the VM's own namespace, which `install_file_atomic` maps into
+        // the machine's overlay. Correct with no workload running, and a
+        // deliberate branch rather than a fallthrough.
+        nsfile::GuestNs::Root(_) => install_file_atomic(path, data, mode, uid, gid),
     }
-    install_file_atomic(path, data, mode)
 }
 
 /// State for an in-progress streaming file upload on one connection.
@@ -2703,6 +2870,10 @@ struct WriteSession {
     tmp_file: std::fs::File,
     /// Permissions to apply after rename.
     mode: Option<u32>,
+    /// Owner uid to apply after rename.
+    uid: Option<u32>,
+    /// Owner gid to apply after rename.
+    gid: Option<u32>,
     /// Running total — compared against `total_size` as a DoS guard.
     bytes_written: u64,
     /// Caller-declared total; the agent refuses chunks that would
@@ -2715,6 +2886,8 @@ impl WriteSession {
     fn open(
         target: std::path::PathBuf,
         mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
         total_size: u64,
     ) -> std::io::Result<Self> {
         if let Some(parent) = target.parent() {
@@ -2746,6 +2919,8 @@ impl WriteSession {
             tmp_path,
             tmp_file,
             mode,
+            uid,
+            gid,
             bytes_written: 0,
             total_size,
         })
@@ -2800,6 +2975,48 @@ impl WriteSession {
                 error_codes::FILE_IO_FAILED,
             );
         }
+        // A running workload reads the CONTAINER filesystem, not the agent's
+        // namespace — finalize through the ns helper there, mirroring the
+        // single-shot path (writing here would land in the overlay's upper
+        // beneath a live overlayfs, invisible to the workload: BUG-240's
+        // streaming twin). The staged bytes are piped, never re-buffered.
+        match std::fs::File::open(&self.tmp_path) {
+            Ok(mut staged) => {
+                if let nsfile::GuestNs::Container(ns) = nsfile::GuestNs::for_workload() {
+                    // Session Drop still cleans the staging file.
+                    return match ns.write_reader(
+                        &self.target.to_string_lossy(),
+                        &mut staged,
+                        self.mode,
+                        self.uid,
+                        self.gid,
+                    ) {
+                        Ok(()) => {
+                            info!(
+                                path = %self.target.display(),
+                                size = self.bytes_written,
+                                "file written into workload container"
+                            );
+                            AgentResponse::Ok { data: None }
+                        }
+                        Err(e) => AgentResponse::error(
+                            format!(
+                                "failed to write {} in the workload container: {}",
+                                self.target.display(),
+                                e
+                            ),
+                            error_codes::FILE_IO_FAILED,
+                        ),
+                    };
+                }
+            }
+            Err(e) => {
+                return AgentResponse::error(
+                    format!("failed to reopen staging file: {}", e),
+                    error_codes::FILE_IO_FAILED,
+                );
+            }
+        }
         // Disarm Drop before rename; if the rename fails we'll
         // re-arm below by restoring the path.
         let tmp = std::mem::take(&mut self.tmp_path);
@@ -2814,6 +3031,14 @@ impl WriteSession {
         }
         if let Some(m) = self.mode {
             apply_mode_best_effort(&self.target, m);
+        }
+        if self.uid.is_some() || self.gid.is_some() {
+            if let Err(e) = std::os::unix::fs::chown(&self.target, self.uid, self.gid) {
+                return AgentResponse::error(
+                    format!("failed to chown {}: {}", self.target.display(), e),
+                    error_codes::FILE_IO_FAILED,
+                );
+            }
         }
         info!(
             path = %self.target.display(),
@@ -2840,6 +3065,8 @@ impl Drop for WriteSession {
 fn handle_file_write_begin(
     path: String,
     mode: Option<u32>,
+    uid: Option<u32>,
+    gid: Option<u32>,
     total_size: u64,
 ) -> (Option<WriteSession>, AgentResponse) {
     if total_size > smolvm_protocol::FILE_TRANSFER_MAX_TOTAL {
@@ -2859,7 +3086,7 @@ fn handle_file_write_begin(
         Ok(p) => p,
         Err(resp) => return (None, resp),
     };
-    match WriteSession::open(resolved, mode, total_size) {
+    match WriteSession::open(resolved, mode, uid, gid, total_size) {
         Ok(session) => (Some(session), AgentResponse::Ok { data: None }),
         Err(e) => (
             None,
@@ -2982,8 +3209,8 @@ fn handle_streaming_file_read(
     // layer, so a file the container itself created came back 404 (BUG-240).
     // Both directions must move together: fixing only writes would break the
     // upload-then-download round trip, which is self-consistent today.
-    if let Some(opened) = nsfile::open_in_container(path) {
-        match opened {
+    if let nsfile::GuestNs::Container(ns) = nsfile::GuestNs::for_workload() {
+        match ns.open(path) {
             Ok(mut cf) => {
                 info!(path = %path, size = cf.size, "streaming file read (container)");
                 return send_data_chunks(
@@ -3082,6 +3309,7 @@ fn handle_interactive_run(
         tty,
         persistent_overlay_id,
         unprivileged,
+        s3_volumes,
     ) = match request {
         AgentRequest::Run {
             image,
@@ -3094,6 +3322,7 @@ fn handle_interactive_run(
             tty,
             persistent_overlay_id,
             unprivileged,
+            s3_volumes,
             ..
         } => (
             image,
@@ -3106,6 +3335,7 @@ fn handle_interactive_run(
             tty,
             persistent_overlay_id,
             unprivileged,
+            s3_volumes,
         ),
         _ => {
             send_response(
@@ -3153,17 +3383,18 @@ fn handle_interactive_run(
     // Resolve the container's launch settings from the image's OCI config (with
     // request overrides). Required to call spawn_interactive_command, so the
     // interactive path can't drop the image's Env/WorkingDir/User either.
-    let launch = match ResolvedLaunch::resolve(&image, command, env, workdir, user) {
-        Ok(l) => l,
-        Err(e) => {
-            maybe_cleanup(&prepared.workload_id);
-            send_response(
-                stream,
-                &AgentResponse::error(e.to_string(), error_codes::INVALID_REQUEST),
-            )?;
-            return Ok(());
-        }
-    };
+    let launch =
+        match ResolvedLaunch::resolve(&image, command, env, workdir, user, s3_volumes.clone()) {
+            Ok(l) => l,
+            Err(e) => {
+                maybe_cleanup(&prepared.workload_id);
+                send_response(
+                    stream,
+                    &AgentResponse::error(e.to_string(), error_codes::INVALID_REQUEST),
+                )?;
+                return Ok(());
+            }
+        };
 
     // Spawn the command with crun
     let (mut child, pty_master) = match spawn_interactive_command(
@@ -3173,6 +3404,7 @@ fn handle_interactive_run(
         tty,
         persistent_overlay_id.as_deref(),
         unprivileged,
+        &s3_volumes,
     ) {
         Ok(result) => result,
         Err(e) => {
@@ -3254,6 +3486,7 @@ impl ResolvedLaunch {
         env: Vec<(String, String)>,
         workdir: Option<String>,
         user: Option<String>,
+        s3_volumes: Vec<smolvm_protocol::S3Volume>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let info = storage::query_image(image)?.ok_or_else(|| -> Box<dyn std::error::Error> {
             format!("image not found: {image}").into()
@@ -3262,15 +3495,32 @@ impl ResolvedLaunch {
             let mut resolved = info.entrypoint;
             resolved.extend(info.cmd);
             if resolved.is_empty() {
-                return Err(format!(
-                    "no command given and image '{image}' defines no entrypoint or cmd"
-                )
-                .into());
+                if !s3_volumes.is_empty() {
+                    // Remote volumes mount inside the workload container, which
+                    // exec/shell join. An image with no entrypoint would
+                    // otherwise downgrade to a bare-agent boot with nowhere for
+                    // the mount to live — give it a keep-alive workload so the
+                    // FUSE mount persists and is reachable.
+                    vec!["sleep".to_string(), "infinity".to_string()]
+                } else {
+                    // The host's workload launcher matches on this exact phrase
+                    // to downgrade a metadata-less image (e.g. a bare rootfs
+                    // directory) to a bare-agent boot instead of failing the
+                    // machine start — keep the wording stable.
+                    return Err(format!(
+                        "no command given and image '{image}' defines no entrypoint or cmd"
+                    )
+                    .into());
+                }
+            } else {
+                resolved
             }
-            resolved
         } else {
             command
         };
+        // Nothing is wrapped around the workload any more: remote volumes are
+        // mounted natively between the container's create and start, so the
+        // image's own entrypoint runs exactly as written.
         Ok(Self {
             command,
             env: merge_image_env(info.env, env),
@@ -3367,6 +3617,7 @@ fn write_oci_bundle(
     rosetta::inject_into_container(&mut spec);
     forkpoint::inject_into_container(&mut spec);
     cuda::inject_into_container(&mut spec, rootfs_path);
+    vulkan::inject_into_container(&mut spec, rootfs_path);
     spec.write_to(bundle_path)
         .map_err(|e| format!("failed to write OCI spec: {}", e))?;
 
@@ -3391,36 +3642,47 @@ fn handle_run_detached(
 
     ensure_storage_mounted();
 
-    let (image, command, env, workdir, user, mounts, persistent_overlay_id, unprivileged) =
-        match request {
-            AgentRequest::Run {
-                image,
-                command,
-                env,
-                workdir,
-                user,
-                mounts,
-                persistent_overlay_id,
-                unprivileged,
-                ..
-            } => (
-                image,
-                command,
-                env,
-                workdir,
-                user,
-                mounts,
-                persistent_overlay_id,
-                unprivileged,
-            ),
-            _ => {
-                send_response(
-                    stream,
-                    &AgentResponse::error("expected Run request", error_codes::INVALID_REQUEST),
-                )?;
-                return Ok(());
-            }
-        };
+    let (
+        image,
+        command,
+        env,
+        workdir,
+        user,
+        mounts,
+        persistent_overlay_id,
+        unprivileged,
+        s3_volumes,
+    ) = match request {
+        AgentRequest::Run {
+            image,
+            command,
+            env,
+            workdir,
+            user,
+            mounts,
+            persistent_overlay_id,
+            unprivileged,
+            s3_volumes,
+            ..
+        } => (
+            image,
+            command,
+            env,
+            workdir,
+            user,
+            mounts,
+            persistent_overlay_id,
+            unprivileged,
+            s3_volumes,
+        ),
+        _ => {
+            send_response(
+                stream,
+                &AgentResponse::error("expected Run request", error_codes::INVALID_REQUEST),
+            )?;
+            return Ok(());
+        }
+    };
 
     // An empty command is allowed here: it means "run the image's own
     // ENTRYPOINT/CMD". We resolve it from the image config below, after the
@@ -3476,16 +3738,19 @@ fn handle_run_detached(
     // (command, Env, WorkingDir, User) with the request layered on top.
     // `write_oci_bundle` requires a `ResolvedLaunch`, so the image config can't be
     // silently dropped here or on any other launch path.
-    let launch = match ResolvedLaunch::resolve(&image, command, env, workdir, user) {
-        Ok(l) => l,
-        Err(e) => {
-            send_response(
-                stream,
-                &AgentResponse::error(e.to_string(), error_codes::INVALID_REQUEST),
-            )?;
-            return Ok(());
-        }
-    };
+    // `resolve` only needs to know WHETHER volumes exist (to pick a keep-alive
+    // command); the mount step below needs the values themselves.
+    let launch =
+        match ResolvedLaunch::resolve(&image, command, env, workdir, user, s3_volumes.clone()) {
+            Ok(l) => l,
+            Err(e) => {
+                send_response(
+                    stream,
+                    &AgentResponse::error(e.to_string(), error_codes::INVALID_REQUEST),
+                )?;
+                return Ok(());
+            }
+        };
     info!(image = %image, command = ?launch.command, workdir = ?launch.workdir, user = ?launch.user, "resolved launch from request + image config");
 
     if let Err(e) = storage::setup_mounts(&prepared.rootfs_path, &mounts) {
@@ -3580,6 +3845,27 @@ fn handle_run_detached(
             send_response(
                 stream,
                 &AgentResponse::from_err(e, error_codes::SPAWN_FAILED),
+            )?;
+            return Ok(());
+        }
+    }
+
+    // Mount S3 volumes BETWEEN create and start. The container's namespaces
+    // exist after `create` but its PID 1 has not run yet, so mounting here means
+    // the workload's very first instruction already sees the bucket — a workload
+    // that reads its data directory immediately cannot race the mount. It also
+    // means the workload command itself is never rewritten: the image's own
+    // entrypoint runs exactly as its author wrote it.
+    if !s3_volumes.is_empty() {
+        if let Err(e) = s3mount::mount_all(&container_id, &s3_volumes) {
+            let _ = crun::CrunCommand::kill(&container_id, "SIGKILL").status();
+            let _ = crun::CrunCommand::delete(&container_id, true).output();
+            send_response(
+                stream,
+                &AgentResponse::error(
+                    format!("mount remote volume: {e}"),
+                    error_codes::SPAWN_FAILED,
+                ),
             )?;
             return Ok(());
         }
@@ -3681,6 +3967,24 @@ pub fn crun_container_pid(container_id: &str) -> Option<u32> {
         container_id,
         std::path::Path::new(paths::CRUN_ROOT_DIR),
         std::path::Path::new("/proc"),
+        true,
+    )
+}
+
+/// PID of a container that has been created but not yet started.
+///
+/// [`crun_container_pid`] deliberately reports nothing until `crun start`
+/// releases the container, because its callers are asking "can I exec into
+/// this?". Mounting happens in exactly that window: after `create` the
+/// namespaces exist and PID 1 is parked on `exec.fifo`, which is precisely when
+/// a volume must be mounted so the workload's first instruction already sees it.
+#[cfg(target_os = "linux")]
+pub fn crun_created_container_pid(container_id: &str) -> Option<u32> {
+    crun_container_pid_at(
+        container_id,
+        std::path::Path::new(paths::CRUN_ROOT_DIR),
+        std::path::Path::new("/proc"),
+        false,
     )
 }
 
@@ -3689,6 +3993,7 @@ fn crun_container_pid_at(
     container_id: &str,
     state_root: &std::path::Path,
     proc_root: &std::path::Path,
+    require_running: bool,
 ) -> Option<u32> {
     if !valid_crun_container_id(container_id) {
         return None;
@@ -3699,7 +4004,7 @@ fn crun_container_pid_at(
     // crun leaves exec.fifo present until `crun start` releases a created
     // container. The old `crun state` path reported that state as `created`,
     // not `running`; preserve that distinction without entering crun.
-    if state_dir.join("exec.fifo").exists() {
+    if require_running && state_dir.join("exec.fifo").exists() {
         return None;
     }
 
@@ -3798,9 +4103,10 @@ fn spawn_exec_in_container(
     container_id: &str,
     launch: &ResolvedLaunch,
     tty: bool,
+    unprivileged: bool,
 ) -> Result<(Child, Option<pty::PtyMaster>), Box<dyn std::error::Error>> {
     use std::io::Read as _;
-    use std::os::unix::io::AsRawFd as _;
+    use std::os::unix::io::{AsRawFd as _, FromRawFd as _};
     use std::sync::atomic::Ordering;
 
     // An exec joining a running container inherits the same image-resolved env /
@@ -3813,8 +4119,37 @@ fn spawn_exec_in_container(
         container_id = %container_id,
         command = ?command,
         tty = tty,
-        "joining running container via crun exec"
+        "joining running container"
     );
+
+    // A restored crun runtime can accept several execs and then stall even
+    // though the container and its processes remain healthy. Entering the
+    // inherited namespaces directly avoids that restored-runtime state while
+    // preserving the workload's live memory and process tree.
+    if !unprivileged {
+        if let Some(mut command) = restored_container_exec_command(container_id, launch)? {
+            if tty {
+                let (pty_master, slave_fd) = pty::open_pty(80, 24)?;
+                let slave_raw = slave_fd.as_raw_fd();
+                // SAFETY: `slave_fd` is a valid open PTY slave descriptor.
+                unsafe {
+                    command
+                        .stdin(Stdio::from_raw_fd(libc::dup(slave_raw)))
+                        .stdout(Stdio::from_raw_fd(libc::dup(slave_raw)))
+                        .stderr(Stdio::from_raw_fd(libc::dup(slave_raw)));
+                }
+                let child = command.spawn()?;
+                drop(slave_fd);
+                return Ok((child, Some(pty_master)));
+            }
+            let child = command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?;
+            return Ok((child, None));
+        }
+    }
 
     if tty {
         // Preferred: console socket (resizable). Mirrors the create path.
@@ -3887,6 +4222,127 @@ fn spawn_exec_in_container(
             .spawn()?;
         Ok((child, None))
     }
+}
+
+#[cfg(target_os = "linux")]
+fn restored_container_id() -> Option<String> {
+    restored_container_id_at(std::path::Path::new(
+        smolvm_protocol::forkpoint::RESTORED_CONTAINER_PATH,
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn restored_container_id_at(path: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(target_os = "linux")]
+fn container_workdir_path(
+    root: &std::path::Path,
+    guest_workdir: &str,
+) -> Result<std::path::PathBuf, String> {
+    use std::path::Component;
+
+    let path = std::path::Path::new(guest_workdir);
+    if !path.is_absolute() {
+        return Err(format!(
+            "container workdir must be absolute: {guest_workdir}"
+        ));
+    }
+    let mut relative = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(value) => relative.push(value),
+            Component::ParentDir => {
+                if !relative.pop() {
+                    return Err(format!(
+                        "container workdir escapes its root: {guest_workdir}"
+                    ));
+                }
+            }
+            Component::Prefix(_) => {
+                return Err(format!("invalid container workdir: {guest_workdir}"));
+            }
+        }
+    }
+    Ok(root.join(relative))
+}
+
+/// Build a process that enters a snapshot-restored workload container without
+/// asking crun to create another process through restored runtime state.
+///
+/// Returning `None` means this is a fresh container and should use the normal
+/// OCI runtime path. Unprivileged workloads deliberately never call this path.
+#[cfg(target_os = "linux")]
+fn restored_container_exec_command(
+    container_id: &str,
+    launch: &ResolvedLaunch,
+) -> Result<Option<Command>, Box<dyn std::error::Error>> {
+    if restored_container_id().as_deref() != Some(container_id) {
+        return Ok(None);
+    }
+    let pid = crun_container_pid(container_id).ok_or_else(|| {
+        format!("restored container '{container_id}' no longer has a live init process")
+    })?;
+    let root = std::path::PathBuf::from(format!("/proc/{pid}/root"));
+    let guest_workdir = launch.workdir.as_deref().unwrap_or("/");
+    let host_workdir = container_workdir_path(&root, guest_workdir)?;
+
+    let target_environment = std::fs::read(format!("/proc/{pid}/environ"))?;
+    let mut environment = target_environment
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| std::str::from_utf8(entry).ok())
+        .filter_map(|entry| entry.split_once('='))
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect::<Vec<_>>();
+    for (key, value) in &launch.env {
+        environment.retain(|(existing, _)| existing != key);
+        environment.push((key.clone(), value.clone()));
+    }
+    let environment = crun::augmented_exec_env(&environment, container_id);
+
+    let user = launch.user.as_deref().unwrap_or("0:0");
+    let (uid, gid) = user
+        .split_once(':')
+        .ok_or_else(|| format!("resolved container user is not uid:gid: {user}"))?;
+    let uid: u32 = uid.parse()?;
+    let gid: u32 = gid.parse()?;
+
+    let mut command = Command::new("/usr/bin/nsenter");
+    command
+        .arg("--target")
+        .arg(pid.to_string())
+        .args(["--mount", "--uts", "--ipc", "--pid"])
+        .arg(format!("--root={}", root.display()))
+        .arg(format!("--wd={}", host_workdir.display()))
+        .arg(format!("--setgid={gid}"))
+        .arg(format!("--setuid={uid}"))
+        .arg("--")
+        .args(&launch.command)
+        .env_clear()
+        .envs(environment);
+
+    use std::os::unix::process::CommandExt as _;
+    // SAFETY: setgroups is async-signal-safe and touches only child credentials.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setgroups(0, std::ptr::null()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    info!(
+        container_id,
+        pid,
+        command = ?launch.command,
+        "joining snapshot-restored container namespaces"
+    );
+    Ok(Some(command))
 }
 
 /// Look up a running main workload container for the given overlay ID.
@@ -4007,12 +4463,14 @@ static CONSOLE_SOCKET_WORKS: std::sync::atomic::AtomicBool =
 /// Uses the same two-step `crun create` + `crun start` as [`handle_run_detached`]
 /// (`crun run --detach` hangs in the smolvm VM environment).
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 fn ensure_main_container(
     rootfs: &str,
-    overlay_id: &str,
+    overlay_id: Option<&str>,
     mounts: &[(String, String, bool)],
     unprivileged: bool,
     base_launch: &ResolvedLaunch,
+    s3_volumes: &[smolvm_protocol::S3Volume],
 ) -> Result<String, Box<dyn std::error::Error>> {
     use std::path::Path;
 
@@ -4050,6 +4508,19 @@ fn ensure_main_container(
         )
         .into());
     }
+    // Mount remote volumes in the window between create and start: the
+    // container's namespaces exist but its first instruction has not run, so
+    // anything exec'd into it afterwards is guaranteed to see the bucket. This
+    // is the same ordering `handle_run_detached` relies on, and the reason the
+    // container is established in two steps rather than with `crun run`.
+    if !s3_volumes.is_empty() {
+        if let Err(e) = s3mount::mount_all(&container_id, s3_volumes) {
+            let _ = crun::CrunCommand::kill(&container_id, "SIGKILL").status();
+            let _ = crun::CrunCommand::delete(&container_id, true).output();
+            return Err(format!("mount remote volume: {e}").into());
+        }
+    }
+
     let start = crun::CrunCommand::start(&container_id).output()?;
     if !start.status.success() {
         let _ = crun::CrunCommand::delete(&container_id, true).output();
@@ -4060,16 +4531,20 @@ fn ensure_main_container(
         .into());
     }
 
-    let workload_id = format!("persistent-{}", overlay_id);
-    if let Err(e) = std::fs::write(
-        paths::main_container_id_path(&workload_id),
-        container_id.as_bytes(),
-    ) {
-        let _ = crun::CrunCommand::kill(&container_id, "SIGKILL").status();
-        let _ = crun::CrunCommand::delete(&container_id, true).output();
-        return Err(format!("failed to persist main container id: {}", e).into());
+    // An ephemeral run has no overlay to key the container by; it lives and
+    // dies with this session, so there is nothing for a later exec to rejoin.
+    if let Some(overlay_id) = overlay_id {
+        let workload_id = format!("persistent-{}", overlay_id);
+        if let Err(e) = std::fs::write(
+            paths::main_container_id_path(&workload_id),
+            container_id.as_bytes(),
+        ) {
+            let _ = crun::CrunCommand::kill(&container_id, "SIGKILL").status();
+            let _ = crun::CrunCommand::delete(&container_id, true).output();
+            return Err(format!("failed to persist main container id: {}", e).into());
+        }
     }
-    info!(container_id = %container_id, overlay_id = %overlay_id, "established keep-alive main container for persistent machine");
+    info!(container_id = %container_id, overlay_id = ?overlay_id, "established keep-alive main container");
     Ok(container_id)
 }
 
@@ -4082,6 +4557,7 @@ fn spawn_interactive_command(
     tty: bool,
     persistent_overlay_id: Option<&str>,
     unprivileged: bool,
+    s3_volumes: &[smolvm_protocol::S3Volume],
 ) -> Result<(Child, Option<pty::PtyMaster>), Box<dyn std::error::Error>> {
     use std::path::Path;
 
@@ -4104,7 +4580,7 @@ fn spawn_interactive_command(
 
     // If a main workload container is running for this overlay, join it.
     if let Some(cid) = resolve_main_container(persistent_overlay_id) {
-        return spawn_exec_in_container(&cid, launch, tty);
+        return spawn_exec_in_container(&cid, launch, tty, unprivileged);
     }
 
     // On a persistent machine with no main container yet, establish a long-lived
@@ -4117,12 +4593,35 @@ fn spawn_interactive_command(
     // the machine's lifetime. On failure, fall through to the fresh-container path
     // so exec never breaks outright.
     if let Some(overlay_id) = persistent_overlay_id {
-        match ensure_main_container(rootfs, overlay_id, mounts, unprivileged, launch) {
-            Ok(cid) => return spawn_exec_in_container(&cid, launch, tty),
+        match ensure_main_container(
+            rootfs,
+            Some(overlay_id),
+            mounts,
+            unprivileged,
+            launch,
+            s3_volumes,
+        ) {
+            Ok(cid) => return spawn_exec_in_container(&cid, launch, tty, unprivileged),
             Err(e) => {
+                // Falling back to a fresh container would silently drop the
+                // remote volumes, leaving the workload reading an empty
+                // directory. When volumes were requested the failure is the
+                // answer, not something to work around.
+                if !s3_volumes.is_empty() {
+                    return Err(e);
+                }
                 warn!(error = %e, "keep-alive main container setup failed; running in a fresh container")
             }
         }
+    }
+
+    // An ephemeral run with a remote volume cannot use `crun run`: that
+    // collapses create and start, leaving no window in which to mount, and the
+    // workload's first instruction would race the mount. Establish the
+    // container in two steps and exec the command into it instead.
+    if !s3_volumes.is_empty() {
+        let cid = ensure_main_container(rootfs, None, mounts, unprivileged, launch, s3_volumes)?;
+        return spawn_exec_in_container(&cid, launch, tty, unprivileged);
     }
 
     let rootfs_path = Path::new(rootfs);
@@ -4283,6 +4782,7 @@ fn spawn_interactive_command(
     _tty: bool,
     _persistent_overlay_id: Option<&str>,
     unprivileged: bool,
+    _s3_volumes: &[smolvm_protocol::S3Volume],
 ) -> Result<(Child, Option<()>), Box<dyn std::error::Error>> {
     use std::path::Path;
 
@@ -4328,6 +4828,7 @@ fn spawn_interactive_command(
     rosetta::inject_into_container(&mut spec);
     forkpoint::inject_into_container(&mut spec);
     cuda::inject_into_container(&mut spec, rootfs_path);
+    vulkan::inject_into_container(&mut spec, rootfs_path);
 
     spec.write_to(&bundle_path)
         .map_err(|e| format!("failed to write OCI spec: {}", e))?;
@@ -5095,6 +5596,7 @@ fn handle_run_background(
     mounts: &[(String, String, bool)],
     persistent_overlay_id: Option<&str>,
     unprivileged: bool,
+    s3_volumes: &[smolvm_protocol::S3Volume],
 ) -> AgentResponse {
     info!(image = %image, command = ?command, mounts = ?mounts, "running command in background");
 
@@ -5126,9 +5628,20 @@ fn handle_run_background(
             user,
             mounts,
             unprivileged,
+            s3_volumes,
         ) {
             Ok(resp) => return resp,
             Err(e) => {
+                // Falling back to a fresh container would silently drop the
+                // remote volumes, leaving the workload reading an empty
+                // directory. When volumes were requested the failure is the
+                // answer, not something to work around.
+                if !s3_volumes.is_empty() {
+                    return AgentResponse::error(
+                        format!("mount remote volume: {e}"),
+                        error_codes::SPAWN_FAILED,
+                    );
+                }
                 warn!(error = %e, "keep-alive background exec failed; falling back to a fresh container");
             }
         }
@@ -5168,6 +5681,7 @@ fn run_background_in_keepalive(
     user: Option<&str>,
     mounts: &[(String, String, bool)],
     unprivileged: bool,
+    s3_volumes: &[smolvm_protocol::S3Volume],
 ) -> Result<AgentResponse, Box<dyn std::error::Error>> {
     let mut launch = ResolvedLaunch::resolve(
         image,
@@ -5175,6 +5689,9 @@ fn run_background_in_keepalive(
         env.to_vec(),
         workdir.map(str::to_string),
         user.map(str::to_string),
+        // Keep-alive/exec path: it JOINS the workload container that already
+        // holds the remote-volume mount, so no mount is established here.
+        Vec::new(),
     )?;
 
     let (cid, rootfs) = match resolve_main_container(Some(overlay_id)) {
@@ -5184,10 +5701,11 @@ fn run_background_in_keepalive(
             storage::setup_mounts(&prepared.rootfs_path, mounts)?;
             let cid = ensure_main_container(
                 &prepared.rootfs_path,
-                overlay_id,
+                Some(overlay_id),
                 mounts,
                 unprivileged,
                 &launch,
+                s3_volumes,
             )?;
             (cid, std::path::PathBuf::from(&prepared.rootfs_path))
         }
@@ -5210,30 +5728,20 @@ fn run_background_in_keepalive(
             .map(|d| d.as_nanos())
             .unwrap_or(0)
     ));
-    let status = crun::CrunCommand::exec_detached(
-        &cid,
-        &launch.env,
-        &launch.command,
-        launch.workdir.as_deref(),
-        Some(&pid_file),
-    )
-    .user(launch.user.as_deref())
-    .stdin_null()
-    .discard_output()
-    .status()?;
-    if !status.success() {
-        let _ = std::fs::remove_file(&pid_file);
-        return Err(format!(
-            "crun exec --detach failed (exit {})",
-            status.code().unwrap_or(-1)
-        )
-        .into());
-    }
-
-    let pid: u32 = std::fs::read_to_string(&pid_file)
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0);
+    let pid = if !unprivileged {
+        if let Some(mut command) = restored_container_exec_command(&cid, &launch)? {
+            let child = command
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?;
+            child.id()
+        } else {
+            run_crun_background_exec(&cid, &launch, &pid_file)?
+        }
+    } else {
+        run_crun_background_exec(&cid, &launch, &pid_file)?
+    };
     let _ = std::fs::remove_file(&pid_file);
 
     Ok(AgentResponse::Completed {
@@ -5241,6 +5749,36 @@ fn run_background_in_keepalive(
         stdout: format!("{pid}").into_bytes(),
         stderr: Vec::new(),
     })
+}
+
+#[cfg(target_os = "linux")]
+fn run_crun_background_exec(
+    container_id: &str,
+    launch: &ResolvedLaunch,
+    pid_file: &std::path::Path,
+) -> Result<u32, Box<dyn std::error::Error>> {
+    let status = crun::CrunCommand::exec_detached(
+        container_id,
+        &launch.env,
+        &launch.command,
+        launch.workdir.as_deref(),
+        Some(pid_file),
+    )
+    .user(launch.user.as_deref())
+    .stdin_null()
+    .discard_output()
+    .status()?;
+    if !status.success() {
+        return Err(format!(
+            "crun exec --detach failed (exit {})",
+            status.code().unwrap_or(-1)
+        )
+        .into());
+    }
+    Ok(std::fs::read_to_string(pid_file)
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(0))
 }
 
 /// Non-streaming exec/run returns the whole output in a single wire frame. If it
@@ -5291,10 +5829,29 @@ fn cap_exec_response(resp: AgentResponse) -> AgentResponse {
 /// lets a process this command backgrounds (a `dockerd`, a dev server, a k3d
 /// cluster) survive into later execs for the machine's lifetime. Returns the
 /// captured result; the caller falls back to a fresh container on error.
+/// Deletes a container when dropped, or does nothing when there is none.
+///
+/// An ephemeral `run` establishes its own container so a remote volume can be
+/// mounted between create and start. Nothing will ever rejoin that container,
+/// so it has to go when the run returns — including on the error paths, which
+/// is why this is a guard rather than a call at the end.
+#[cfg(target_os = "linux")]
+struct EphemeralContainer(Option<String>);
+
+#[cfg(target_os = "linux")]
+impl Drop for EphemeralContainer {
+    fn drop(&mut self) {
+        if let Some(id) = self.0.take() {
+            let _ = crun::CrunCommand::kill(&id, "SIGKILL").status();
+            let _ = crun::CrunCommand::delete(&id, true).output();
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 fn run_in_keepalive_container(
-    overlay_id: &str,
+    overlay_id: Option<&str>,
     image: &str,
     command: &[String],
     env: &[(String, String)],
@@ -5305,6 +5862,7 @@ fn run_in_keepalive_container(
     timeout_ms: Option<u64>,
     stdin_data: Option<&str>,
     client_fd: Option<std::os::unix::io::RawFd>,
+    s3_volumes: &[smolvm_protocol::S3Volume],
 ) -> Result<AgentResponse, Box<dyn std::error::Error>> {
     use std::io::Write as _;
 
@@ -5314,16 +5872,25 @@ fn run_in_keepalive_container(
         env.to_vec(),
         workdir.map(str::to_string),
         user.map(str::to_string),
+        // Keep-alive/exec path: it JOINS the workload container that already
+        // holds the remote-volume mount, so no mount is established here.
+        Vec::new(),
     )?;
 
     // Reuse the running keep-alive container, or establish one now so this and
     // every later exec join the same container (PID 1 = smolvm's child reaper).
     // Also carry the container's rootfs so the user can be resolved against its
     // /etc/passwd below.
-    let (cid, rootfs) = match resolve_main_container(Some(overlay_id)) {
-        Some(c) => (c, storage::persistent_overlay_rootfs(overlay_id)),
-        None => {
-            let prepared = storage::prepare_for_run_persistent(image, overlay_id)?;
+    // An ephemeral run has no overlay to key a container by, so there is never
+    // one to rejoin: it establishes its own and tears it down when it returns.
+    let reusable = overlay_id.and_then(|id| resolve_main_container(Some(id)));
+    let (cid, rootfs, ephemeral) = match (reusable, overlay_id) {
+        (Some(c), Some(id)) => (c, storage::persistent_overlay_rootfs(id), false),
+        _ => {
+            let prepared = match overlay_id {
+                Some(id) => storage::prepare_for_run_persistent(image, id)?,
+                None => storage::prepare_for_run(image)?,
+            };
             storage::setup_mounts(&prepared.rootfs_path, mounts)?;
             let cid = ensure_main_container(
                 &prepared.rootfs_path,
@@ -5331,10 +5898,18 @@ fn run_in_keepalive_container(
                 mounts,
                 unprivileged,
                 &launch,
+                s3_volumes,
             )?;
-            (cid, std::path::PathBuf::from(&prepared.rootfs_path))
+            (
+                cid,
+                std::path::PathBuf::from(&prepared.rootfs_path),
+                overlay_id.is_none(),
+            )
         }
     };
+    // A container established for an ephemeral run must not outlive it, or a
+    // long-lived VM accumulates one per `run`. Dropped on every exit path.
+    let _reaper = EphemeralContainer(ephemeral.then(|| cid.clone()));
 
     // The workload runs via `crun exec --user`, which requires a NUMERIC uid[:gid]
     // — a username (the image's `config.User`, e.g. `nobody`/`node`, or the
@@ -5349,22 +5924,30 @@ fn run_in_keepalive_container(
     // silently ignored `timeout_ms` — an `exec --timeout N` against an image
     // machine ran to completion regardless (found by QA 2026-07-19).
     let exec_pid_file = crun::ExecPidFile::new()?;
-    let mut builder = crun::CrunCommand::exec(
-        &cid,
-        &launch.env,
-        &launch.command,
-        launch.workdir.as_deref(),
-        false,
-    )
-    .user(launch.user.as_deref())
-    .pid_file(exec_pid_file.path())
-    .capture_output();
-    builder = if stdin_data.is_some() {
-        builder.stdin_piped()
+    let (mut child, namespace_exec) = if !unprivileged {
+        if let Some(mut command) = restored_container_exec_command(&cid, &launch)? {
+            command.stdout(Stdio::piped()).stderr(Stdio::piped());
+            if stdin_data.is_some() {
+                command.stdin(Stdio::piped());
+            } else {
+                command.stdin(Stdio::null());
+            }
+            (command.spawn()?, true)
+        } else {
+            (
+                spawn_crun_foreground_exec(&cid, &launch, &exec_pid_file, stdin_data)?,
+                false,
+            )
+        }
     } else {
-        builder.stdin_null()
+        (
+            spawn_crun_foreground_exec(&cid, &launch, &exec_pid_file, stdin_data)?,
+            false,
+        )
     };
-    let mut child = builder.spawn()?;
+    if namespace_exec {
+        std::fs::write(exec_pid_file.path(), child.id().to_string())?;
+    }
     if let (Some(data), Some(mut stdin)) = (stdin_data, child.stdin.take()) {
         let _ = stdin.write_all(data.as_bytes());
         // Drop closes the pipe → the command sees EOF.
@@ -5411,6 +5994,31 @@ fn run_in_keepalive_container(
     })
 }
 
+#[cfg(target_os = "linux")]
+fn spawn_crun_foreground_exec(
+    container_id: &str,
+    launch: &ResolvedLaunch,
+    exec_pid_file: &crun::ExecPidFile,
+    stdin_data: Option<&str>,
+) -> Result<Child, Box<dyn std::error::Error>> {
+    let mut builder = crun::CrunCommand::exec(
+        container_id,
+        &launch.env,
+        &launch.command,
+        launch.workdir.as_deref(),
+        false,
+    )
+    .user(launch.user.as_deref())
+    .pid_file(exec_pid_file.path())
+    .capture_output();
+    builder = if stdin_data.is_some() {
+        builder.stdin_piped()
+    } else {
+        builder.stdin_null()
+    };
+    Ok(builder.spawn()?)
+}
+
 // Mirrors `storage::run_command`'s workload parameter list one-for-one; both
 // want folding into a shared spec struct rather than trimming here.
 #[allow(clippy::too_many_arguments)]
@@ -5426,6 +6034,7 @@ fn handle_run(
     stdin_data: Option<&str>,
     client_fd: Option<std::os::unix::io::RawFd>,
     unprivileged: bool,
+    s3_volumes: &[smolvm_protocol::S3Volume],
 ) -> AgentResponse {
     info!(image = %image, command = ?command, mounts = ?mounts, timeout_ms = ?timeout_ms, persistent = persistent_overlay_id.is_some(), stdin = stdin_data.is_some(), "running command");
 
@@ -5466,9 +6075,13 @@ fn handle_run(
     // if the keep-alive can't be established, so exec never breaks outright.
     #[cfg(target_os = "linux")]
     {
-        if let Some(overlay_id) = persistent_overlay_id {
+        // A remote volume can only be mounted into a container established in
+        // two steps, which is what the keep-alive runner does — so route there
+        // even without an overlay rather than falling through to the
+        // single-step path, which would run with the volume silently missing.
+        if persistent_overlay_id.is_some() || !s3_volumes.is_empty() {
             match run_in_keepalive_container(
-                overlay_id,
+                persistent_overlay_id,
                 image,
                 command,
                 env,
@@ -5479,9 +6092,20 @@ fn handle_run(
                 timeout_ms,
                 stdin_data,
                 client_fd,
+                s3_volumes,
             ) {
                 Ok(resp) => return cap_exec_response(resp),
                 Err(e) => {
+                    // Falling back to a fresh container would silently drop the
+                    // remote volumes, leaving the workload reading an empty
+                    // directory. When volumes were requested the failure is the
+                    // answer, not something to work around.
+                    if !s3_volumes.is_empty() {
+                        return AgentResponse::error(
+                            format!("mount remote volume: {e}"),
+                            error_codes::SPAWN_FAILED,
+                        );
+                    }
                     warn!(error = %e, "keep-alive exec failed; running in a fresh container")
                 }
             }
@@ -6306,6 +6930,33 @@ mod tests {
     use super::*;
 
     #[cfg(target_os = "linux")]
+    #[test]
+    fn restored_container_marker_is_trimmed_and_empty_is_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("restored-container");
+        assert_eq!(restored_container_id_at(&marker), None);
+        std::fs::write(&marker, "  smolvm-restored-1\n").unwrap();
+        assert_eq!(
+            restored_container_id_at(&marker).as_deref(),
+            Some("smolvm-restored-1")
+        );
+        std::fs::write(&marker, " \n").unwrap();
+        assert_eq!(restored_container_id_at(&marker), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restored_container_workdir_cannot_escape_proc_root() {
+        let root = std::path::Path::new("/proc/123/root");
+        assert_eq!(
+            container_workdir_path(root, "/testbed/./src/../tests").unwrap(),
+            root.join("testbed/tests")
+        );
+        assert!(container_workdir_path(root, "relative").is_err());
+        assert!(container_workdir_path(root, "/../../agent-root").is_err());
+    }
+
+    #[cfg(target_os = "linux")]
     fn proc_stat_fixture(pid: u32, state: char, start_time: u64) -> String {
         let before_start = (1..=18)
             .map(|field| field.to_string())
@@ -6348,7 +6999,7 @@ mod tests {
         std::fs::write(proc_dir.join("stat"), proc_stat_fixture(123, 'S', 4242)).unwrap();
 
         assert_eq!(
-            crun_container_pid_at("smolvm-test", &state_root, &proc_root),
+            crun_container_pid_at("smolvm-test", &state_root, &proc_root, true),
             Some(123)
         );
 
@@ -6356,14 +7007,22 @@ mod tests {
         // running workload and must not be selected for namespace entry.
         std::fs::write(state_dir.join("exec.fifo"), []).unwrap();
         assert_eq!(
-            crun_container_pid_at("smolvm-test", &state_root, &proc_root),
+            crun_container_pid_at("smolvm-test", &state_root, &proc_root, true),
             None
         );
 
         // Path traversal is rejected before any status lookup.
         assert_eq!(
-            crun_container_pid_at("../smolvm-test", &state_root, &proc_root),
+            crun_container_pid_at("../smolvm-test", &state_root, &proc_root, true),
             None
+        );
+
+        // Remote volumes are mounted between `crun create` and `crun start`,
+        // when the fifo still exists: that lookup must find the same pid the
+        // running one would, or the mount has no namespace to enter.
+        assert_eq!(
+            crun_container_pid_at("smolvm-test", &state_root, &proc_root, false),
+            Some(123)
         );
     }
 
@@ -6633,6 +7292,8 @@ mod tests {
         let (session, resp) = handle_file_write_begin(
             target.to_string_lossy().into(),
             None,
+            None,
+            None,
             smolvm_protocol::FILE_TRANSFER_MAX_TOTAL + 1,
         );
         assert!(session.is_none(), "session must not be created");
@@ -6688,6 +7349,8 @@ mod tests {
         let (session, resp) = handle_file_write_begin(
             target.to_string_lossy().into(),
             Some(0o600),
+            None,
+            None,
             payload.len() as u64,
         );
         assert!(matches!(resp, AgentResponse::Ok { .. }));
@@ -6725,8 +7388,13 @@ mod tests {
         let target = tmp_target(&tmp, "multi.bin");
         let total = 1024usize;
 
-        let (mut session, resp) =
-            handle_file_write_begin(target.to_string_lossy().into(), None, total as u64);
+        let (mut session, resp) = handle_file_write_begin(
+            target.to_string_lossy().into(),
+            None,
+            None,
+            None,
+            total as u64,
+        );
         assert!(matches!(resp, AgentResponse::Ok { .. }));
 
         // Three chunks: 400 + 400 + 224 bytes, each a distinct fill byte.
@@ -6760,7 +7428,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp_target(&tmp, "overflow.bin");
 
-        let (session, _resp) = handle_file_write_begin(target.to_string_lossy().into(), None, 10);
+        let (session, _resp) =
+            handle_file_write_begin(target.to_string_lossy().into(), None, None, None, 10);
         assert!(session.is_some());
 
         // First chunk fits.
@@ -6789,7 +7458,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp_target(&tmp, "dropped.bin");
 
-        let (session, _) = handle_file_write_begin(target.to_string_lossy().into(), None, 100);
+        let (session, _) =
+            handle_file_write_begin(target.to_string_lossy().into(), None, None, None, 100);
         let (session, _) = handle_file_write_chunk(session, &[0u8; 50], false);
         assert!(session.is_some());
         // Staging file exists mid-stream.
@@ -6817,7 +7487,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp_target(&tmp, "empty.bin");
 
-        let (session, _) = handle_file_write_begin(target.to_string_lossy().into(), None, 0);
+        let (session, _) =
+            handle_file_write_begin(target.to_string_lossy().into(), None, None, None, 0);
         let (session, resp) = handle_file_write_chunk(session, &[], true);
         assert!(matches!(resp, AgentResponse::Ok { .. }));
         assert!(session.is_none());
@@ -6840,7 +7511,7 @@ mod tests {
         let target = tmp_target(&tmp, "single.bin");
         let payload = b"small file contents".to_vec();
 
-        let resp = handle_file_write(&target.to_string_lossy(), &payload, Some(0o644));
+        let resp = handle_file_write(&target.to_string_lossy(), &payload, Some(0o644), None, None);
         assert!(
             matches!(resp, AgentResponse::Ok { .. }),
             "write failed: {:?}",

@@ -141,14 +141,6 @@ pub extern "C" fn cuCtxDetach() -> c_int {
     unsupported(stringify!(cuCtxDetach))
 }
 #[no_mangle]
-pub extern "C" fn cuCtxDisablePeerAccess() -> c_int {
-    unsupported(stringify!(cuCtxDisablePeerAccess))
-}
-#[no_mangle]
-pub extern "C" fn cuCtxEnablePeerAccess() -> c_int {
-    unsupported(stringify!(cuCtxEnablePeerAccess))
-}
-#[no_mangle]
 pub extern "C" fn cuCtxFromGreenCtx() -> c_int {
     unsupported(stringify!(cuCtxFromGreenCtx))
 }
@@ -183,10 +175,6 @@ pub extern "C" fn cuCtxGetId() -> c_int {
 #[no_mangle]
 pub extern "C" fn cuCtxGetSharedMemConfig() -> c_int {
     unsupported(stringify!(cuCtxGetSharedMemConfig))
-}
-#[no_mangle]
-pub extern "C" fn cuCtxGetStreamPriorityRange() -> c_int {
-    unsupported(stringify!(cuCtxGetStreamPriorityRange))
 }
 #[no_mangle]
 pub extern "C" fn cuCtxPopCurrent() -> c_int {
@@ -231,10 +219,6 @@ pub extern "C" fn cuDestroyExternalMemory() -> c_int {
 #[no_mangle]
 pub extern "C" fn cuDestroyExternalSemaphore() -> c_int {
     unsupported(stringify!(cuDestroyExternalSemaphore))
-}
-#[no_mangle]
-pub extern "C" fn cuDeviceCanAccessPeer() -> c_int {
-    unsupported(stringify!(cuDeviceCanAccessPeer))
 }
 #[no_mangle]
 pub extern "C" fn cuDeviceGetDevResource() -> c_int {
@@ -597,10 +581,6 @@ pub extern "C" fn cuGraphDebugDotPrint() -> c_int {
     unsupported(stringify!(cuGraphDebugDotPrint))
 }
 #[no_mangle]
-pub extern "C" fn cuGraphDestroy() -> c_int {
-    unsupported(stringify!(cuGraphDestroy))
-}
-#[no_mangle]
 pub extern "C" fn cuGraphDestroyNode() -> c_int {
     unsupported(stringify!(cuGraphDestroyNode))
 }
@@ -627,10 +607,6 @@ pub extern "C" fn cuGraphExecBatchMemOpNodeSetParams() -> c_int {
 #[no_mangle]
 pub extern "C" fn cuGraphExecChildGraphNodeSetParams() -> c_int {
     unsupported(stringify!(cuGraphExecChildGraphNodeSetParams))
-}
-#[no_mangle]
-pub extern "C" fn cuGraphExecDestroy() -> c_int {
-    unsupported(stringify!(cuGraphExecDestroy))
 }
 #[no_mangle]
 pub extern "C" fn cuGraphExecEventRecordNodeSetEvent() -> c_int {
@@ -681,14 +657,6 @@ pub extern "C" fn cuGraphExecNodeSetParams() -> c_int {
     unsupported(stringify!(cuGraphExecNodeSetParams))
 }
 #[no_mangle]
-pub extern "C" fn cuGraphExecUpdate() -> c_int {
-    unsupported(stringify!(cuGraphExecUpdate))
-}
-#[no_mangle]
-pub extern "C" fn cuGraphExecUpdate_v2() -> c_int {
-    unsupported(stringify!(cuGraphExecUpdate_v2))
-}
-#[no_mangle]
 pub extern "C" fn cuGraphExternalSemaphoresSignalNodeGetParams() -> c_int {
     unsupported(stringify!(cuGraphExternalSemaphoresSignalNodeGetParams))
 }
@@ -715,10 +683,6 @@ pub extern "C" fn cuGraphGetEdges_v2() -> c_int {
 #[no_mangle]
 pub extern "C" fn cuGraphGetId() -> c_int {
     unsupported(stringify!(cuGraphGetId))
-}
-#[no_mangle]
-pub extern "C" fn cuGraphGetNodes() -> c_int {
-    unsupported(stringify!(cuGraphGetNodes))
 }
 #[no_mangle]
 pub extern "C" fn cuGraphGetRootNodes() -> c_int {
@@ -801,18 +765,6 @@ pub extern "C" fn cuGraphicsVDPAURegisterVideoSurface() -> c_int {
     unsupported(stringify!(cuGraphicsVDPAURegisterVideoSurface))
 }
 #[no_mangle]
-pub extern "C" fn cuGraphInstantiate() -> c_int {
-    unsupported(stringify!(cuGraphInstantiate))
-}
-#[no_mangle]
-pub extern "C" fn cuGraphInstantiate_v2() -> c_int {
-    unsupported(stringify!(cuGraphInstantiate_v2))
-}
-#[no_mangle]
-pub extern "C" fn cuGraphInstantiateWithFlags() -> c_int {
-    unsupported(stringify!(cuGraphInstantiateWithFlags))
-}
-#[no_mangle]
 pub extern "C" fn cuGraphInstantiateWithParams() -> c_int {
     unsupported(stringify!(cuGraphInstantiateWithParams))
 }
@@ -847,14 +799,6 @@ pub extern "C" fn cuGraphKernelNodeSetParams() -> c_int {
 #[no_mangle]
 pub extern "C" fn cuGraphKernelNodeSetParams_v2() -> c_int {
     unsupported(stringify!(cuGraphKernelNodeSetParams_v2))
-}
-#[no_mangle]
-pub extern "C" fn cuGraphLaunch() -> c_int {
-    unsupported(stringify!(cuGraphLaunch))
-}
-#[no_mangle]
-pub extern "C" fn cuGraphLaunch_ptsz() -> c_int {
-    unsupported(stringify!(cuGraphLaunch_ptsz))
 }
 #[no_mangle]
 pub extern "C" fn cuGraphMemAllocNodeGetParams() -> c_int {
@@ -993,34 +937,6 @@ pub extern "C" fn cuImportExternalSemaphore() -> c_int {
     unsupported(stringify!(cuImportExternalSemaphore))
 }
 #[no_mangle]
-pub extern "C" fn cuIpcCloseMemHandle() -> c_int {
-    unsupported(stringify!(cuIpcCloseMemHandle))
-}
-#[no_mangle]
-pub extern "C" fn cuIpcGetEventHandle() -> c_int {
-    unsupported(stringify!(cuIpcGetEventHandle))
-}
-#[no_mangle]
-pub extern "C" fn cuIpcGetMemHandle() -> c_int {
-    unsupported(stringify!(cuIpcGetMemHandle))
-}
-#[no_mangle]
-pub extern "C" fn cuIpcOpenEventHandle() -> c_int {
-    unsupported(stringify!(cuIpcOpenEventHandle))
-}
-#[no_mangle]
-pub extern "C" fn cuIpcOpenMemHandle() -> c_int {
-    unsupported(stringify!(cuIpcOpenMemHandle))
-}
-#[no_mangle]
-pub extern "C" fn cuIpcOpenMemHandle_v2() -> c_int {
-    unsupported(stringify!(cuIpcOpenMemHandle_v2))
-}
-#[no_mangle]
-pub extern "C" fn cuKernelGetAttribute() -> c_int {
-    unsupported(stringify!(cuKernelGetAttribute))
-}
-#[no_mangle]
 pub extern "C" fn cuKernelGetLibrary() -> c_int {
     unsupported(stringify!(cuKernelGetLibrary))
 }
@@ -1035,10 +951,6 @@ pub extern "C" fn cuKernelGetParamCount() -> c_int {
 #[no_mangle]
 pub extern "C" fn cuKernelGetParamInfo() -> c_int {
     unsupported(stringify!(cuKernelGetParamInfo))
-}
-#[no_mangle]
-pub extern "C" fn cuKernelSetAttribute() -> c_int {
-    unsupported(stringify!(cuKernelSetAttribute))
 }
 #[no_mangle]
 pub extern "C" fn cuKernelSetCacheConfig() -> c_int {
@@ -1485,22 +1397,6 @@ pub extern "C" fn cuMemcpyHtoD_v2_ptds() -> c_int {
     unsupported(stringify!(cuMemcpyHtoD_v2_ptds))
 }
 #[no_mangle]
-pub extern "C" fn cuMemcpyPeer() -> c_int {
-    unsupported(stringify!(cuMemcpyPeer))
-}
-#[no_mangle]
-pub extern "C" fn cuMemcpyPeerAsync() -> c_int {
-    unsupported(stringify!(cuMemcpyPeerAsync))
-}
-#[no_mangle]
-pub extern "C" fn cuMemcpyPeerAsync_ptsz() -> c_int {
-    unsupported(stringify!(cuMemcpyPeerAsync_ptsz))
-}
-#[no_mangle]
-pub extern "C" fn cuMemcpyPeer_ptds() -> c_int {
-    unsupported(stringify!(cuMemcpyPeer_ptds))
-}
-#[no_mangle]
 pub extern "C" fn cuMemcpy_ptds() -> c_int {
     unsupported(stringify!(cuMemcpy_ptds))
 }
@@ -1925,14 +1821,6 @@ pub extern "C" fn cuStreamBatchMemOp_v2_ptsz() -> c_int {
     unsupported(stringify!(cuStreamBatchMemOp_v2_ptsz))
 }
 #[no_mangle]
-pub extern "C" fn cuStreamBeginCapture() -> c_int {
-    unsupported(stringify!(cuStreamBeginCapture))
-}
-#[no_mangle]
-pub extern "C" fn cuStreamBeginCapture_ptsz() -> c_int {
-    unsupported(stringify!(cuStreamBeginCapture_ptsz))
-}
-#[no_mangle]
 pub extern "C" fn cuStreamBeginCaptureToCig() -> c_int {
     unsupported(stringify!(cuStreamBeginCaptureToCig))
 }
@@ -1947,14 +1835,6 @@ pub extern "C" fn cuStreamBeginCaptureToGraph() -> c_int {
 #[no_mangle]
 pub extern "C" fn cuStreamBeginCaptureToGraph_ptsz() -> c_int {
     unsupported(stringify!(cuStreamBeginCaptureToGraph_ptsz))
-}
-#[no_mangle]
-pub extern "C" fn cuStreamBeginCapture_v2() -> c_int {
-    unsupported(stringify!(cuStreamBeginCapture_v2))
-}
-#[no_mangle]
-pub extern "C" fn cuStreamBeginCapture_v2_ptsz() -> c_int {
-    unsupported(stringify!(cuStreamBeginCapture_v2_ptsz))
 }
 #[no_mangle]
 pub extern "C" fn cuStreamBeginRecaptureToGraph() -> c_int {
@@ -1975,14 +1855,6 @@ pub extern "C" fn cuStreamCopyAttributes_ptsz() -> c_int {
 #[no_mangle]
 pub extern "C" fn cuStreamDestroy() -> c_int {
     unsupported(stringify!(cuStreamDestroy))
-}
-#[no_mangle]
-pub extern "C" fn cuStreamEndCapture() -> c_int {
-    unsupported(stringify!(cuStreamEndCapture))
-}
-#[no_mangle]
-pub extern "C" fn cuStreamEndCapture_ptsz() -> c_int {
-    unsupported(stringify!(cuStreamEndCapture_ptsz))
 }
 #[no_mangle]
 pub extern "C" fn cuStreamEndCaptureToCig() -> c_int {
@@ -2083,14 +1955,6 @@ pub extern "C" fn cuStreamGetPriority() -> c_int {
 #[no_mangle]
 pub extern "C" fn cuStreamGetPriority_ptsz() -> c_int {
     unsupported(stringify!(cuStreamGetPriority_ptsz))
-}
-#[no_mangle]
-pub extern "C" fn cuStreamIsCapturing() -> c_int {
-    unsupported(stringify!(cuStreamIsCapturing))
-}
-#[no_mangle]
-pub extern "C" fn cuStreamIsCapturing_ptsz() -> c_int {
-    unsupported(stringify!(cuStreamIsCapturing_ptsz))
 }
 #[no_mangle]
 pub extern "C" fn cuStreamQuery_ptsz() -> c_int {

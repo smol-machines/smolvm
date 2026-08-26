@@ -537,8 +537,8 @@ impl OciSpec {
                 capabilities: Some(capabilities),
                 rlimits: Some(vec![OciRlimit {
                     rlimit_type: "RLIMIT_NOFILE".to_string(),
-                    hard: 1024,
-                    soft: 1024,
+                    hard: crate::DEFAULT_NOFILE_LIMIT,
+                    soft: crate::DEFAULT_NOFILE_LIMIT,
                 }]),
                 no_new_privileges: false,
             },
@@ -598,7 +598,7 @@ impl OciSpec {
                 },
             },
             mounts: default_mounts(unprivileged),
-            hostname: Some("container".to_string()),
+            hostname: Some(container_hostname()),
         }
     }
 
@@ -1013,6 +1013,21 @@ fn default_devices() -> Vec<OciDevice> {
             uid: Some(0),
             gid: Some(0),
         },
+        // /dev/fuse - userspace filesystems. The guest kernel has FUSE, but the
+        // container /dev is built from this list, so without an entry here any
+        // FUSE client in the image (JuiceFS, s3fs, SeaweedFS, sshfs) fails to
+        // mount until the user runs `mknod /dev/fuse c 10 229` by hand. The
+        // agent's own remote-volume mounts create the node themselves; this
+        // makes a client the user brings work the same way.
+        OciDevice {
+            device_type: "c".to_string(),
+            path: "/dev/fuse".to_string(),
+            major: 10,
+            minor: 229,
+            file_mode: Some(0o666),
+            uid: Some(0),
+            gid: Some(0),
+        },
     ]
 }
 
@@ -1164,8 +1179,90 @@ fn proc_filesystems_has(fstype: &str) -> bool {
         .unwrap_or(true)
 }
 
+/// The container's hostname.
+///
+/// A normal boot uses the machine name supplied in the agent environment. A
+/// restored fork clone inherits that immutable process environment from its
+/// golden, but clone rejuvenation updates the VM's kernel hostname before it
+/// publishes `RESTORED_PATH`. Prefer that runtime hostname only after restore,
+/// so a recycled keep-alive container receives the clone's identity rather
+/// than recreating the golden's private UTS namespace.
+pub fn container_hostname() -> String {
+    let restored = Path::new(smolvm_protocol::forkpoint::RESTORED_PATH).is_file();
+    let runtime = restored
+        .then(|| fs::read_to_string("/proc/sys/kernel/hostname").ok())
+        .flatten();
+    let configured = std::env::var(smolvm_protocol::guest_env::MACHINE_NAME).ok();
+    resolve_container_hostname(restored, runtime.as_deref(), configured.as_deref())
+}
+
+fn resolve_container_hostname(
+    restored: bool,
+    runtime: Option<&str>,
+    configured: Option<&str>,
+) -> String {
+    restored
+        .then_some(runtime)
+        .flatten()
+        .into_iter()
+        .chain(configured)
+        .map(str::trim)
+        .find(|name| is_dns_label(name))
+        .unwrap_or("container")
+        .to_string()
+}
+
+/// Whether `s` is a lowercase DNS label usable verbatim as a hostname:
+/// non-empty, ≤63 bytes, `[a-z0-9-]`, no edge hyphens.
+fn is_dns_label(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 63
+        && !s.starts_with('-')
+        && !s.ends_with('-')
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dns_label_check_accepts_valid_names_rejects_the_rest() {
+        use super::is_dns_label;
+        // Valid machine names (validate_vm_name guarantees this shape) pass verbatim.
+        assert!(is_dns_label("my-vm"));
+        assert!(is_dns_label("worker-1"));
+        assert!(is_dns_label("vm-1a2b3c4d"));
+        // Anything not already a label is rejected (falls back to "container"),
+        // never transformed — so distinct names never collide.
+        assert!(!is_dns_label(""));
+        assert!(!is_dns_label("My-VM")); // uppercase
+        assert!(!is_dns_label("my_vm")); // underscore
+        assert!(!is_dns_label("-edge"));
+        assert!(!is_dns_label("edge-"));
+        assert!(!is_dns_label(&"a".repeat(64)));
+    }
+
+    #[test]
+    fn restored_container_prefers_rejuvenated_runtime_hostname() {
+        assert_eq!(
+            resolve_container_hostname(true, Some("clone-7\n"), Some("golden")),
+            "clone-7"
+        );
+        assert_eq!(
+            resolve_container_hostname(false, Some("clone-7"), Some("golden")),
+            "golden"
+        );
+    }
+
+    #[test]
+    fn invalid_runtime_hostname_falls_back_to_configured_name() {
+        assert_eq!(
+            resolve_container_hostname(true, Some("NOT A LABEL"), Some("golden")),
+            "golden"
+        );
+        assert_eq!(resolve_container_hostname(true, None, None), "container");
+    }
+
     use super::*;
     use tempfile::tempdir;
 
@@ -1261,6 +1358,19 @@ mod tests {
             (kmsg.device_type.as_str(), kmsg.major, kmsg.minor),
             ("c", 1, 11)
         );
+
+        // /dev/fuse (10:229) must be there too, or a FUSE client the user
+        // brings (JuiceFS, s3fs, sshfs) cannot mount without mknod'ing it.
+        let fuse = spec
+            .linux
+            .devices
+            .iter()
+            .find(|d| d.path == "/dev/fuse")
+            .expect("/dev/fuse device present");
+        assert_eq!(
+            (fuse.device_type.as_str(), fuse.major, fuse.minor),
+            ("c", 10, 229)
+        );
     }
 
     #[test]
@@ -1303,6 +1413,25 @@ mod tests {
                 .is_none(),
             "consoleSize must be omitted when unset"
         );
+    }
+
+    #[test]
+    fn default_nofile_limit_supports_dependency_heavy_workloads() {
+        let spec = OciSpec::new(
+            &["sh".to_string()],
+            &[],
+            "/",
+            false,
+            &ProcessIdentity::root(),
+            false,
+        );
+        let limits = spec.process.rlimits.expect("default process limits");
+        let nofile = limits
+            .iter()
+            .find(|limit| limit.rlimit_type == "RLIMIT_NOFILE")
+            .expect("RLIMIT_NOFILE");
+        assert_eq!(nofile.soft, 1_048_576);
+        assert_eq!(nofile.hard, 1_048_576);
     }
 
     #[test]

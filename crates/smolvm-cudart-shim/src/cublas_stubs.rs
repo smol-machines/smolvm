@@ -455,30 +455,6 @@ pub extern "C" fn cudaGraphDebugDotPrint() -> c_int {
     rt_stub("cudaGraphDebugDotPrint")
 }
 #[no_mangle]
-pub extern "C" fn cudaIpcCloseMemHandle() -> c_int {
-    rt_stub("cudaIpcCloseMemHandle")
-}
-#[no_mangle]
-pub extern "C" fn cudaIpcGetEventHandle() -> c_int {
-    rt_stub("cudaIpcGetEventHandle")
-}
-#[no_mangle]
-pub extern "C" fn cudaIpcGetMemHandle() -> c_int {
-    rt_stub("cudaIpcGetMemHandle")
-}
-#[no_mangle]
-pub extern "C" fn cudaIpcOpenEventHandle() -> c_int {
-    rt_stub("cudaIpcOpenEventHandle")
-}
-#[no_mangle]
-pub extern "C" fn cudaIpcOpenMemHandle() -> c_int {
-    rt_stub("cudaIpcOpenMemHandle")
-}
-#[no_mangle]
-pub extern "C" fn cudaMemcpyPeerAsync() -> c_int {
-    rt_stub("cudaMemcpyPeerAsync")
-}
-#[no_mangle]
 pub extern "C" fn cudaRegisterVar() -> c_int {
     rt_stub("cudaRegisterVar")
 }

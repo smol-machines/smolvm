@@ -1,6 +1,6 @@
 [package]
 name = "smolvm-network"
-version = "1.7.5"
+version = "1.13.0"
 edition = "2021"
 description = "Host-side virtio-net runtime for smolvm"
 license = "Apache-2.0"
@@ -28,6 +28,9 @@ smoltcp = { version = "0.13", default-features = false, features = [
 ] }
 socket2 = "0.6"
 tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
 
 [features]
 # Exposes fuzz-only entrypoints (e.g. fuzz_classify_guest_frame). Never enabled in normal builds.

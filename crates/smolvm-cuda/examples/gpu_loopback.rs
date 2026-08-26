@@ -58,7 +58,7 @@ fn main() {
         "gpu_loopback: {count} device(s); device 0 = {name} ({} MiB)",
         vram / (1024 * 1024)
     );
-    let _ctx = cu.ctx_create(0).expect("ctx create");
+    let ctx = cu.ctx_create(0).expect("ctx create");
 
     // Arbitrary module + named kernel — the general path, not a baked op.
     let module = cu
@@ -98,8 +98,10 @@ fn main() {
 
     let out = cu.memcpy_dtoh(dc, bytes, 0).expect("d2h");
     let c: Vec<f32> = out
-        .chunks_exact(4)
-        .map(|p| f32::from_le_bytes(p.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|p| f32::from_le_bytes(*p))
         .collect();
     for i in 0..n {
         let expect = a[i] + b[i]; // i + 3i = 4i
@@ -108,6 +110,229 @@ fn main() {
             std::process::exit(3);
         }
     }
+
+    // Capture the same topology twice with different kernel arguments, update
+    // the first executable in place, and verify that replay uses graph 2's
+    // parameters. This is the dynamic-input path used by piecewise graph runtimes.
+    let stream = cu.stream_create(1).expect("graph stream");
+    let graph_one = (1_u64 << 63) | 0x101;
+    let graph_two = (1_u64 << 63) | 0x102;
+    let graph_exec = (1_u64 << 63) | 0x201;
+    cu.stream_begin_capture(stream, 2)
+        .expect("begin first capture");
+    cu.launch_kernel(
+        func,
+        [grid, 1, 1],
+        [block, 1, 1],
+        0,
+        stream,
+        &[
+            da.to_le_bytes().to_vec(),
+            db.to_le_bytes().to_vec(),
+            dc.to_le_bytes().to_vec(),
+            (n as u32).to_le_bytes().to_vec(),
+        ],
+    )
+    .expect("capture first kernel");
+    assert_eq!(
+        cu.stream_end_capture(stream, graph_one)
+            .expect("end first capture"),
+        1
+    );
+    cu.graph_instantiate(graph_one, graph_exec)
+        .expect("instantiate first graph");
+
+    cu.stream_begin_capture(stream, 2)
+        .expect("begin updated capture");
+    cu.launch_kernel(
+        func,
+        [grid, 1, 1],
+        [block, 1, 1],
+        0,
+        stream,
+        &[
+            da.to_le_bytes().to_vec(),
+            da.to_le_bytes().to_vec(),
+            dc.to_le_bytes().to_vec(),
+            (n as u32).to_le_bytes().to_vec(),
+        ],
+    )
+    .expect("capture updated kernel");
+    assert_eq!(
+        cu.stream_end_capture(stream, graph_two)
+            .expect("end updated capture"),
+        1
+    );
+    assert_eq!(
+        cu.graph_exec_update(graph_exec, graph_two)
+            .expect("update graph exec"),
+        0
+    );
+    cu.graph_launch(graph_exec, stream)
+        .expect("launch updated graph");
+    cu.stream_synchronize(stream)
+        .expect("synchronize updated graph");
+    let updated = cu.memcpy_dtoh(dc, bytes, stream).expect("updated d2h");
+    let updated: Vec<f32> = updated
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|p| f32::from_le_bytes(*p))
+        .collect();
+    for (i, &value) in updated.iter().enumerate() {
+        let expect = (2 * i) as f32;
+        if (value - expect).abs() > 1e-2 {
+            eprintln!("gpu_loopback: graph update mismatch at {i}: got {value} want {expect}");
+            std::process::exit(4);
+        }
+    }
+
+    // With SMOLVM_CUDA_AUTO_GRAPH=1 these two asynchronous launches are
+    // automatically grouped at StreamSynchronize. Repeating the shape with
+    // different pointers exercises host capture + GraphExecUpdate without any
+    // framework graph API calls; the final exact repeat exercises cached replay.
+    if std::env::var("SMOLVM_CUDA_AUTO_GRAPH").as_deref() == Ok("1") {
+        let dd = cu.mem_alloc(bytes).expect("alloc auto-graph output");
+        let run_segment = |cu: &mut Client<TcpStream>, left: u64, right: u64, tail: u64| {
+            cu.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [block, 1, 1],
+                0,
+                stream,
+                &[
+                    left.to_le_bytes().to_vec(),
+                    right.to_le_bytes().to_vec(),
+                    dc.to_le_bytes().to_vec(),
+                    (n as u32).to_le_bytes().to_vec(),
+                ],
+            )?;
+            cu.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [block, 1, 1],
+                0,
+                stream,
+                &[
+                    dc.to_le_bytes().to_vec(),
+                    tail.to_le_bytes().to_vec(),
+                    dd.to_le_bytes().to_vec(),
+                    (n as u32).to_le_bytes().to_vec(),
+                ],
+            )?;
+            cu.stream_synchronize(stream)
+        };
+        run_segment(&mut cu, da, db, da).expect("auto graph eager observation");
+        run_segment(&mut cu, da, da, db).expect("auto graph second observation");
+        run_segment(&mut cu, db, db, da).expect("auto graph third observation");
+        run_segment(&mut cu, da, db, da).expect("auto graph promotion");
+        run_segment(&mut cu, db, db, da).expect("auto graph parameter update");
+        run_segment(&mut cu, db, db, da).expect("auto graph exact replay");
+        let auto = cu
+            .memcpy_dtoh(dd, bytes, stream)
+            .expect("auto graph output");
+        for (i, value) in auto.as_chunks::<4>().0.iter().enumerate() {
+            let value = f32::from_le_bytes(*value);
+            let expect = (7 * i) as f32;
+            if (value - expect).abs() > 1e-2 {
+                eprintln!("gpu_loopback: auto graph mismatch at {i}: got {value} want {expect}");
+                std::process::exit(5);
+            }
+        }
+        cu.mem_free(dd).ok();
+        println!("AUTO-GRAPH-OK: eager, capture, update, and exact replay verified");
+    }
+    if let Some(segments) = std::env::var("SMOLVM_CUDA_AUTO_GRAPH_BENCH_SEGMENTS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+    {
+        let width = std::env::var("SMOLVM_CUDA_AUTO_GRAPH_BENCH_WIDTH")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|&value| value > 1)
+            .unwrap_or(32);
+        for dynamic in [false, true] {
+            // Consumer cards aggressively downclock between commands; enough
+            // warmup is required so baseline and graph modes measure steady
+            // execution rather than different clock-ramp phases.
+            for iteration in 0..100 {
+                let second = if dynamic && iteration % 2 == 0 {
+                    da
+                } else {
+                    db
+                };
+                run_bench_segment(&mut cu, func, grid, block, stream, da, second, dc, n, width);
+            }
+            let started = std::time::Instant::now();
+            for iteration in 0..segments {
+                let second = if dynamic && iteration.is_multiple_of(2) {
+                    da
+                } else {
+                    db
+                };
+                run_bench_segment(&mut cu, func, grid, block, stream, da, second, dc, n, width);
+            }
+            let elapsed = started.elapsed();
+            let launches = segments * width;
+            println!(
+                "AUTO-GRAPH-BENCH mode={} segments={} width={} elapsed_ms={:.3} launches_per_s={:.0}",
+                if dynamic { "dynamic" } else { "fixed" },
+                segments,
+                width,
+                elapsed.as_secs_f64() * 1000.0,
+                launches as f64 / elapsed.as_secs_f64()
+            );
+        }
+    }
+    if count >= 2 {
+        let pci0 = cu.device_get_pci_bus_id(0).expect("device 0 PCI id");
+        let pci1 = cu.device_get_pci_bus_id(1).expect("device 1 PCI id");
+        assert_ne!(pci0, pci1, "distinct GPUs must expose distinct PCI IDs");
+        let can_peer = cu
+            .device_can_access_peer(1, 0)
+            .expect("peer-access capability");
+        let ctx0 = cu.primary_ctx_retain(0).expect("retain device 0");
+        cu.ctx_set_current(ctx0).expect("bind device 0");
+        let peer_bytes = 4096u64;
+        let source: Vec<u32> = (0..peer_bytes as u32 / 4).collect();
+        let peer_src = cu.mem_alloc(peer_bytes).expect("device 0 peer source");
+        cu.memcpy_htod(peer_src, bytemuck_u32(&source), 0)
+            .expect("upload peer source");
+
+        let ctx1 = cu.primary_ctx_retain(1).expect("retain device 1");
+        cu.ctx_set_current(ctx1).expect("bind device 1");
+        let peer_dst = cu.mem_alloc(peer_bytes).expect("device 1 peer destination");
+        if can_peer != 0 {
+            cu.device_enable_peer_access(0, 0)
+                .expect("enable device 1 to device 0 peer access");
+        }
+        cu.memcpy_peer_async(peer_dst, 1, peer_src, 0, peer_bytes, 0)
+            .expect("peer copy");
+        cu.ctx_synchronize().expect("peer copy synchronize");
+        let copied = cu
+            .memcpy_dtoh(peer_dst, peer_bytes, 0)
+            .expect("download peer destination");
+        assert_eq!(copied, bytemuck_u32(&source));
+        if can_peer != 0 {
+            cu.device_disable_peer_access(0)
+                .expect("disable peer access");
+        }
+        cu.mem_free(peer_dst).ok();
+        cu.ctx_set_current(ctx0).expect("restore device 0");
+        cu.mem_free(peer_src).ok();
+        cu.primary_ctx_release(1).ok();
+        cu.primary_ctx_release(0).ok();
+        // The main workload's module, graphs, stream, and allocations belong
+        // to the explicit device-0 context created above, not its primary
+        // context. Restore it before destroying those context-owned objects.
+        cu.ctx_set_current(ctx).expect("restore original context");
+        println!("MULTI-GPU-OK: device 0 ({pci0}) -> device 1 ({pci1}), peer_access={can_peer}");
+    }
+    cu.graph_exec_destroy(graph_exec).ok();
+    cu.graph_destroy(graph_one).ok();
+    cu.graph_destroy(graph_two).ok();
+    cu.stream_destroy(stream).ok();
     cu.mem_free(da).ok();
     cu.mem_free(db).ok();
     cu.mem_free(dc).ok();
@@ -120,10 +345,49 @@ fn main() {
         c[n - 1]
     );
     println!("GPU-VERIFY-OK: {name}");
+    println!("GRAPH-UPDATE-OK: topology-compatible parameters patched in place");
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_bench_segment(
+    cu: &mut Client<TcpStream>,
+    func: u64,
+    grid: u32,
+    block: u32,
+    stream: u64,
+    first: u64,
+    second: u64,
+    output: u64,
+    n: usize,
+    width: usize,
+) {
+    for _ in 0..width {
+        cu.launch_kernel(
+            func,
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            stream,
+            &[
+                first.to_le_bytes().to_vec(),
+                second.to_le_bytes().to_vec(),
+                output.to_le_bytes().to_vec(),
+                (n as u32).to_le_bytes().to_vec(),
+            ],
+        )
+        .expect("benchmark launch");
+    }
+    cu.stream_synchronize(stream)
+        .expect("benchmark synchronize");
 }
 
 /// Reinterpret `&[f32]` as bytes (f32 has no invalid bit patterns).
 fn bytemuck(v: &[f32]) -> &[u8] {
     // SAFETY: f32 is plain-old-data; reading its bytes is sound.
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+}
+
+fn bytemuck_u32(v: &[u32]) -> &[u8] {
+    // SAFETY: u32 is plain-old-data; reading its bytes is sound.
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }

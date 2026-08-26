@@ -13,8 +13,12 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
+use sha2::{Digest, Sha256};
 use smolvm_pack::assets::AssetCollector;
-use smolvm_pack::extract::{extract_sidecar, extract_sidecar_shared, shared_extract_enabled};
+use smolvm_pack::extract::{
+    extract_sidecar, extract_sidecar_shared, read_shared_artifact_sha256,
+    shared_artifact_sha256_path, shared_extract_enabled,
+};
 use smolvm_pack::format::PackManifest;
 use smolvm_pack::{read_footer_from_sidecar, sidecar_path_for, Packer};
 
@@ -112,6 +116,13 @@ fn shared_extraction_is_content_addressed_idempotent_and_locked_down() {
         "shared dir must be keyed by the footer checksum"
     );
     assert!(shared_dir.is_dir(), "shared extraction dir must exist");
+    let expected_digest = format!("{:x}", Sha256::digest(fs::read(&sidecar).unwrap()));
+    assert_eq!(
+        read_shared_artifact_sha256(&shared_dir).unwrap(),
+        expected_digest,
+        "shared extraction must cache the full artifact SHA-256"
+    );
+    assert!(shared_artifact_sha256_path(&shared_dir).is_file());
 
     // 2) The shared view is byte-identical to a plain per-machine extraction —
     //    the idmapped mount only remaps ownership, never content.
@@ -240,13 +251,21 @@ fn shared_store_is_not_lru_evicted_by_a_later_pack() {
         "first shared entry must SURVIVE a later extraction (not be LRU-evicted)"
     );
     assert!(db.is_dir(), "second shared entry must exist");
-    // Both entries keep their extracted layer dirs (not just an empty shell).
+    // Both entries keep their layer payloads (not just an empty shell). A
+    // privileged Linux host extracts directories here; an unprivileged host
+    // intentionally retains the tar for faithful in-guest ownership restore.
     for d in [&da, &db] {
-        let n = fs::read_dir(d.join("layers"))
+        let entries: Vec<_> = fs::read_dir(d.join("layers"))
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().is_dir())
-            .count();
-        assert!(n > 0, "{} must keep its layer dirs", d.display());
+            .collect();
+        let has_payload = entries.iter().any(|entry| {
+            entry.path().is_dir()
+                || entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "tar")
+        });
+        assert!(has_payload, "{} must keep its layer payloads", d.display());
     }
 }

@@ -59,6 +59,13 @@ pub struct FromVmAssets {
     /// that path already copied the source manifest's env into the record, so the
     /// machine's own env is the complete set.
     pub image_env: Vec<String>,
+    /// Total bytes of the layer tars collected for this pack.
+    ///
+    /// Recorded as the manifest's `image_size` so the run-time storage
+    /// auto-sizer reserves room for them; without it a from-vm pack falls back
+    /// to the minimal default disk, which cannot hold the layers when the
+    /// guest has to unpack staged tars onto it.
+    pub layer_bytes: u64,
 }
 
 /// Collect a stopped machine's pack assets into `collector` and report the
@@ -91,6 +98,7 @@ pub fn collect_from_vm_assets(
 
     let vm_dir = vm_data_dir(vm_name);
     let (overlay_disk, overlay_fmt) = resolve_disk_image(&vm_dir, OVERLAY_DISK_FILENAME);
+    let (storage_disk, storage_fmt) = resolve_disk_image(&vm_dir, STORAGE_DISK_FILENAME);
     let is_image_based = vm.image.is_some();
     let is_artifact_sourced = is_image_based && vm.source_smolmachine.is_some();
 
@@ -110,7 +118,13 @@ pub fn collect_from_vm_assets(
     let mut image_env: Vec<String> = Vec::new();
 
     if is_artifact_sourced && !opts.rebase_from_image {
-        export_flattened_from_artifact_sourced(collector, vm_name, &vm_dir, staging_dir)?;
+        export_flattened_from_artifact_sourced(
+            collector,
+            vm_name,
+            &vm_dir,
+            staging_dir,
+            vm.source_smolmachine.as_deref(),
+        )?;
     } else if is_image_based {
         let image = vm.image.clone().unwrap();
         // A locally-sourced image (`--image -` / `--image file.tar` / a rootfs
@@ -119,19 +133,15 @@ pub fn collect_from_vm_assets(
         // message instead of a confusing registry "UNAUTHORIZED" on
         // `local:<hash>`.
         if crate::data::image_source::is_local_ref(&image) {
-            return Err(Error::agent(
-                "pack from VM",
-                format!(
-                    "VM '{vm_name}' was created from a local image ({image}). \
-                     `pack create --from-vm` can only snapshot VMs created from a \
-                     REGISTRY image — local archives and rootfs directories are \
-                     flattened on boot and have no registry manifest to re-pull. \
-                     Recreate the machine from a registry reference to pack it."
-                ),
-            ));
+            // No registry manifest to re-pull, but the base rootfs is still
+            // reachable: an archive was flattened onto the machine's own storage
+            // disk at boot, and a rootfs dir is still the host directory the
+            // machine boots from. Either can be the lower layer.
+            export_flattened_from_local_image(collector, vm_name, &vm_dir, &image)?;
+        } else {
+            image_env =
+                export_flattened_from_registry_image(collector, vm_name, &vm_dir, &image, opts)?;
         }
-        image_env =
-            export_flattened_from_registry_image(collector, vm_name, &vm_dir, &image, opts)?;
     } else {
         // Bare VM: its state is the rootfs overlay disk. VM-mode restores boot
         // from the template; a default-size overlay is a qcow2 CoW image and
@@ -148,6 +158,25 @@ pub fn collect_from_vm_assets(
         collector
             .add_overlay_template(&overlay_for_pack)
             .map_err(|e| Error::agent("collect overlay", e.to_string()))?;
+
+        if !storage_disk.exists() {
+            return Err(Error::agent(
+                "collect storage",
+                format!("storage disk not found at {}", storage_disk.display()),
+            ));
+        }
+        let storage_for_pack = match storage_fmt {
+            DiskFormat::Raw => storage_disk.clone(),
+            DiskFormat::Qcow2 => {
+                let flat = staging_dir.join("storage-flat.raw");
+                flatten_qcow2_to_raw(&storage_disk, &flat)?;
+                flat
+            }
+        };
+        println!("Copying storage disk ({})...", storage_for_pack.display());
+        collector
+            .add_vm_storage_template(&storage_for_pack)
+            .map_err(|e| Error::agent("collect storage", e.to_string()))?;
     }
 
     Ok(FromVmAssets {
@@ -158,6 +187,7 @@ pub fn collect_from_vm_assets(
         },
         image: vm.image.clone(),
         image_env,
+        layer_bytes: collector.staged_layer_bytes(),
     })
 }
 
@@ -165,6 +195,10 @@ pub fn collect_from_vm_assets(
 /// Smolfile overrides layer on top of this baseline at the call site.
 pub fn seed_manifest_from_vm(manifest: &mut PackManifest, vm: &VmRecord, assets: &FromVmAssets) {
     manifest.mode = assets.mode.clone();
+    // Without this the run-time storage auto-sizer sees a legacy manifest and
+    // creates the minimal default disk — too small to hold the layers when the
+    // guest unpacks staged tars onto it.
+    manifest.image_size = assets.layer_bytes;
     if let Some(ref image) = assets.image {
         manifest.image = image.clone();
     }
@@ -273,6 +307,7 @@ impl ExportVm {
                 storage_gib: None,
                 overlay_gib: None,
                 allowed_cidrs: None,
+                network_name: None,
             },
             features,
         ) {
@@ -365,22 +400,171 @@ fn export_flattened_from_registry_image(
 /// machine layers cache; share them into the helper VM, stage them onto its
 /// local disk (overlayfs cannot use virtiofs-backed lowers), and flatten with
 /// the current container overlay.
+/// Export a machine created from a local image (`--image ./x.tar`, `--image -`,
+/// or `--image ./rootfs/`).
+///
+/// There is no registry manifest to re-pull, but the base rootfs is still
+/// available in one of two places depending on how it was supplied:
+///
+/// - **archive** (`local:<hash>`): flattened onto the machine's own storage disk
+///   at boot, under `image-archives/<key>/0000_rootfs`. The helper already
+///   mounts that disk read-only, so the layer is read straight from it.
+/// - **rootfs dir** (`local-dir:<path>`): never copied into the machine at all —
+///   the guest boots from the host directory over virtiofs, so the export shares
+///   that same directory into the helper.
+///
+/// Either way the machine's persistent container overlay goes on top, exactly as
+/// the registry and artifact paths do, so the packed result is the machine as it
+/// actually is rather than as it was first created.
+fn export_flattened_from_local_image(
+    collector: &mut AssetCollector,
+    vm_name: &str,
+    vm_dir: &Path,
+    image: &str,
+) -> crate::Result<()> {
+    let host_dir = crate::data::image_source::packed_layers_dir_for_ref(image);
+    let is_dir_source = image.starts_with("local-dir:");
+
+    // A rootfs dir is the only source of its own base layer: if the host
+    // directory is gone, nothing on the machine can stand in for it.
+    if is_dir_source {
+        match host_dir.as_deref() {
+            Some(dir) if dir.is_dir() => {}
+            _ => {
+                return Err(Error::agent(
+                    "pack from VM",
+                    format!(
+                        "machine '{vm_name}' was created from the rootfs directory {image}, \
+                         but that directory is no longer present. The machine boots its base \
+                         layer from there, so it has to exist to export. Restore it, or \
+                         recreate the machine from an image that carries its own layers."
+                    ),
+                ));
+            }
+        }
+    }
+
+    let export_vm = ExportVm::start(vm_name, vm_dir, host_dir.clone(), false)?;
+    let mut client = export_vm.connect()?;
+    export_vm.mount_source_storage(&mut client)?;
+
+    // Stage the base layer onto the helper's own disk through tar, so whiteout
+    // devices and opaque-dir xattrs survive into the overlay mount below.
+    let src = if is_dir_source {
+        "/packed_layers".to_string()
+    } else {
+        locate_flattened_archive_rootfs(&mut client, vm_name)?
+    };
+    println!("Staging the machine's base layer for flatten...");
+    let dst = "/storage/stage/0".to_string();
+    let stage_cmd =
+        format!("mkdir -p '{dst}' && (cd '{src}' && tar cf - .) | (cd '{dst}' && tar xf -)");
+    let (exit_code, _, stderr) = client.vm_exec(
+        vec!["sh".to_string(), "-c".to_string(), stage_cmd],
+        vec![],
+        None,
+        None,
+        None,
+    )?;
+    if exit_code != 0 {
+        return Err(Error::agent(
+            "stage local base layer",
+            format!(
+                "staging {src} failed (exit {}): {}",
+                exit_code,
+                String::from_utf8_lossy(&stderr)
+            ),
+        ));
+    }
+
+    flatten_and_export(collector, &mut client, vm_name, &[dst])
+}
+
+/// The flattened rootfs of a local *archive* image on the source machine's
+/// storage disk, as a helper-local path.
+///
+/// The directory is keyed by a content hash the exporter does not have, so it is
+/// discovered rather than computed; a machine boots exactly one local archive,
+/// so a single match is expected.
+fn locate_flattened_archive_rootfs(
+    client: &mut AgentClient,
+    vm_name: &str,
+) -> crate::Result<String> {
+    let (exit_code, stdout, _) = client.vm_exec(
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "ls -d /mnt/source-storage/image-archives/*/0000_rootfs 2>/dev/null".to_string(),
+        ],
+        vec![],
+        None,
+        None,
+        None,
+    )?;
+    let found: Vec<String> = String::from_utf8_lossy(&stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    match found.as_slice() {
+        [one] if exit_code == 0 => Ok(one.clone()),
+        [] => Err(Error::agent(
+            "pack from VM",
+            format!(
+                "machine '{vm_name}' was created from a local image archive, but no flattened \
+                 rootfs was found on its storage disk. The archive is flattened on first boot — \
+                 start the machine once, then re-run the export."
+            ),
+        )),
+        many => Err(Error::agent(
+            "pack from VM",
+            format!(
+                "machine '{vm_name}' has {} flattened image archives on its storage disk, so \
+                 the base layer is ambiguous. Recreate the machine from a single image and \
+                 export that.",
+                many.len()
+            ),
+        )),
+    }
+}
+
 fn export_flattened_from_artifact_sourced(
     collector: &mut AssetCollector,
     vm_name: &str,
     vm_dir: &Path,
     _staging_dir: &Path,
+    source_smolmachine: Option<&str>,
 ) -> crate::Result<()> {
     let cache_dir = machine_layers_cache_dir(vm_name);
-    let pack_content_dir = read_shared_pack_pointer(&cache_dir).unwrap_or(cache_dir);
-    let layer_ids = ordered_cached_layer_ids(&pack_content_dir).ok_or_else(|| {
+    let pack_content_dir = read_shared_pack_pointer(&cache_dir).unwrap_or(cache_dir.clone());
+    let mut layer_ids = ordered_cached_layer_ids(&pack_content_dir);
+    // Self-heal a missing or damaged layer cache from the machine's source
+    // artifact (a cache cleaner can delete the layer files while leaving the
+    // extraction marker, in which case a start does NOT re-extract either —
+    // the old "start the machine once" advice was a dead end there). Only the
+    // per-machine cache is healed here; a shared-store entry heals at boot.
+    if layer_ids.is_none() && pack_content_dir == cache_dir {
+        if let Some(sidecar) = source_smolmachine.map(Path::new).filter(|s| s.exists()) {
+            eprintln!("Imported layer cache is missing; re-extracting from the source artifact...");
+            let footer = smolvm_pack::packer::read_footer_from_sidecar(sidecar)
+                .map_err(|e| Error::agent("read sidecar footer", e.to_string()))?;
+            smolvm_pack::extract::extract_sidecar(sidecar, &cache_dir, &footer, true, false)
+                .map_err(|e| Error::agent("re-extract source artifact", e.to_string()))?;
+            layer_ids = ordered_cached_layer_ids(&pack_content_dir);
+        }
+    }
+    let layer_ids = layer_ids.ok_or_else(|| {
         Error::agent(
             "pack from VM",
             format!(
                 "VM '{vm_name}' was created from a .smolmachine artifact, but its \
-                 imported layer cache is missing ({}). Start the machine once to \
-                 re-extract it, then re-run the export.",
-                pack_content_dir.display()
+                 imported layer cache is missing ({}) and could not be rebuilt: \
+                 the source artifact ({}) is not available. Restore the source \
+                 .smolmachine at that path, or start the machine once to \
+                 re-extract, then re-run the export.",
+                pack_content_dir.display(),
+                source_smolmachine.unwrap_or("unknown path"),
             ),
         )
     })?;
@@ -400,14 +584,15 @@ fn export_flattened_from_artifact_sourced(
     for (i, id) in layer_ids.iter().enumerate() {
         let src = format!("/packed_layers/{}", id);
         let dst = format!("/storage/stage/{}", i);
+        // A tar-form layer extracts directly; a dir-form layer streams
+        // through tar so whiteout devices and opaque-dir xattrs stay intact.
+        let stage_cmd = if id.ends_with(".tar") {
+            format!("mkdir -p '{dst}' && tar xf '{src}' -C '{dst}'")
+        } else {
+            format!("mkdir -p '{dst}' && (cd '{src}' && tar cf - .) | (cd '{dst}' && tar xf -)")
+        };
         let (exit_code, _, stderr) = client.vm_exec(
-            vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                format!(
-                    "mkdir -p '{dst}' && (cd '{src}' && tar cf - .) | (cd '{dst}' && tar xf -)"
-                ),
-            ],
+            vec!["sh".to_string(), "-c".to_string(), stage_cmd],
             vec![],
             None,
             None,
@@ -430,35 +615,48 @@ fn export_flattened_from_artifact_sourced(
     flatten_and_export(collector, &mut client, vm_name, &lowers)
 }
 
-/// The extracted layer dirs of an imported pack, bottom -> top, as short ids.
-/// `None` when the cache (or its ordering) is gone.
+/// The cached layers of an imported pack, bottom -> top, as paths relative to
+/// the pack content dir. A layer is either an extracted dir (`layers/<id>`,
+/// hosts that can reproduce archived ownership) or a staged tar
+/// (`layers/<id>.tar`, hosts that leave extraction to the guest) — both forms
+/// are written by the artifact import, so both must be exportable. `None`
+/// when the cache (or its ordering) is gone.
 fn ordered_cached_layer_ids(pack_content_dir: &Path) -> Option<Vec<String>> {
     let layers_dir = pack_content_dir.join("layers");
     let order_path = layers_dir.join("layer-order");
-    let ids: Vec<String> = if let Ok(contents) = std::fs::read_to_string(&order_path) {
-        contents
+    let cached_form = |id: &str| -> Option<String> {
+        if layers_dir.join(id).is_dir() {
+            Some(format!("layers/{}", id))
+        } else if layers_dir.join(format!("{id}.tar")).is_file() {
+            Some(format!("layers/{}.tar", id))
+        } else {
+            None
+        }
+    };
+    if let Ok(contents) = std::fs::read_to_string(&order_path) {
+        let ids: Vec<&str> = contents
             .lines()
             .map(str::trim)
             .filter(|id| !id.is_empty())
-            .map(str::to_string)
-            .collect()
-    } else {
-        // No order file: only unambiguous for a single extracted layer dir.
-        let mut dirs: Vec<String> = std::fs::read_dir(&layers_dir)
-            .ok()?
-            .flatten()
-            .filter(|e| e.path().is_dir())
-            .filter_map(|e| e.file_name().to_str().map(str::to_string))
             .collect();
-        if dirs.len() != 1 {
+        if ids.is_empty() {
             return None;
         }
-        vec![dirs.pop().unwrap()]
-    };
-    if ids.is_empty() || !ids.iter().all(|id| layers_dir.join(id).is_dir()) {
+        return ids.iter().map(|id| cached_form(id)).collect();
+    }
+    // No order file: only unambiguous for a single cached layer.
+    let mut entries: Vec<String> = std::fs::read_dir(&layers_dir)
+        .ok()?
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .filter_map(|name| cached_form(name.strip_suffix(".tar").unwrap_or(&name)))
+        .collect();
+    entries.sort();
+    entries.dedup();
+    if entries.len() != 1 {
         return None;
     }
-    Some(ids.iter().map(|id| format!("layers/{}", id)).collect())
+    Some(entries)
 }
 
 /// Overlay-mount `lowers` (bottom -> top, helper-local paths) with the source
@@ -501,7 +699,12 @@ fn flatten_and_export(
         .layer_staging_path(&format!("sha256:{}", "0".repeat(64)))
         .with_file_name("flat-export.tmp");
     let total = client
-        .read_file_to_path("/storage/flat-export.tar", &tmp_file, |_| {})
+        .read_file_to_path_capped(
+            "/storage/flat-export.tar",
+            &tmp_file,
+            crate::agent::pack_export_max_total(),
+            |_| {},
+        )
         .map_err(|e| Error::agent("export flattened layer", e.to_string()))?;
     if total == 0 {
         let _ = std::fs::remove_file(&tmp_file);
@@ -591,6 +794,7 @@ fn flatten_qcow2_to_raw(qcow2_path: &Path, dest_raw: &Path) -> crate::Result<()>
             storage_gib: None,
             overlay_gib: None,
             allowed_cidrs: None,
+            network_name: None,
         },
         features,
     )?;

@@ -20,6 +20,7 @@ const EXPANDABLE_SEGMENTS_ENV: &str = smolvm_protocol::guest_env::CUDA_EXPANDABL
 const PYTORCH_ALLOC_CONF: &str = "PYTORCH_ALLOC_CONF";
 const PYTORCH_CUDA_ALLOC_CONF: &str = "PYTORCH_CUDA_ALLOC_CONF";
 const EXPANDABLE_SEGMENTS: &str = "expandable_segments:True";
+const NCCL_SHM_DISABLE: &str = "NCCL_SHM_DISABLE";
 
 /// Whether CUDA guest-RAM zero-copy was requested for this VM.
 pub fn zerocopy_enabled() -> bool {
@@ -117,6 +118,27 @@ fn inject_expandable_segments_pairs(env: &mut Vec<(String, String)>, enabled: bo
     }
 }
 
+/// NCCL's host-SHM transport registers an arbitrary `/dev/shm` mapping with
+/// CUDA. That mapping exists only inside the guest, so it cannot be registered
+/// in the host process that owns the remoted CUDA context. Keep NCCL's faster
+/// P2P/IPC transport enabled and make it fall back to NET when P2P is
+/// unavailable. An explicit workload setting remains authoritative.
+fn inject_nccl_shm_disable_specs(env: &mut Vec<String>) {
+    if !env.iter().any(|entry| {
+        entry
+            .split_once('=')
+            .is_some_and(|(key, _)| key == NCCL_SHM_DISABLE)
+    }) {
+        env.push(format!("{NCCL_SHM_DISABLE}=1"));
+    }
+}
+
+fn inject_nccl_shm_disable_pairs(env: &mut Vec<(String, String)>) {
+    if !env.iter().any(|(key, _)| key == NCCL_SHM_DISABLE) {
+        env.push((NCCL_SHM_DISABLE.to_string(), "1".to_string()));
+    }
+}
+
 /// Where the guest CUDA shims ship inside the VM rootfs (from the agent
 /// rootfs). Absent on builds without CUDA shim bundling — every staging step
 /// degrades to a no-op so `--cuda` still works in the manual-setup mode.
@@ -170,6 +192,7 @@ fn inject_into_container_if(
         return;
     }
     spec.add_env(ZEROCOPY_ENV, "1");
+    inject_nccl_shm_disable_specs(&mut spec.process.env);
     inject_expandable_segments_specs(&mut spec.process.env, fork_pool);
     stage_shims(spec, rootfs, std::path::Path::new(GUEST_SHIM_DIR));
 }
@@ -287,6 +310,7 @@ pub fn augment_exec_env(mut env: Vec<(String, String)>) -> Vec<(String, String)>
             CONTAINER_SHIM_DIR.to_string(),
         )),
     }
+    inject_nccl_shm_disable_pairs(&mut env);
     inject_expandable_segments_pairs(&mut env, fork_pool_enabled());
     env
 }
@@ -312,6 +336,7 @@ mod tests {
         let mut s = spec();
         inject_into_container_if(&mut s, std::path::Path::new("/nonexistent"), true, false);
         assert!(s.process.env.iter().any(|e| e == "SMOLVM_CUDA_ZEROCOPY=1"));
+        assert!(s.process.env.iter().any(|e| e == "NCCL_SHM_DISABLE=1"));
     }
 
     #[test]
@@ -323,6 +348,22 @@ mod tests {
             .env
             .iter()
             .any(|e| e.starts_with("SMOLVM_CUDA_ZEROCOPY")));
+        assert!(!s
+            .process
+            .env
+            .iter()
+            .any(|e| e.starts_with("NCCL_SHM_DISABLE")));
+    }
+
+    #[test]
+    fn preserves_explicit_nccl_shm_choice() {
+        let mut specs = vec!["NCCL_SHM_DISABLE=0".to_string()];
+        inject_nccl_shm_disable_specs(&mut specs);
+        assert_eq!(specs, ["NCCL_SHM_DISABLE=0"]);
+
+        let mut pairs = vec![("NCCL_SHM_DISABLE".to_string(), "0".to_string())];
+        inject_nccl_shm_disable_pairs(&mut pairs);
+        assert_eq!(pairs, [("NCCL_SHM_DISABLE".to_string(), "0".to_string())]);
     }
 
     #[test]

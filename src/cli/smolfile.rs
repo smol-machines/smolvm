@@ -43,6 +43,7 @@ pub fn build_create_params(
     cli_net: bool,
     cli_network_backend: Option<NetworkBackend>,
     cli_dns: Option<std::net::Ipv4Addr>,
+    cli_network_name: Option<String>,
     cli_init: Vec<String>,
     cli_env: Vec<String>,
     cli_workdir: Option<String>,
@@ -60,7 +61,10 @@ pub fn build_create_params(
     let sf = match smolfile_path {
         Some(path) => load(&path)?,
         None => {
-            let net = cli_net || !cli_allow_cidr.is_empty() || cli_dns.is_some();
+            let net = cli_net
+                || !cli_allow_cidr.is_empty()
+                || cli_dns.is_some()
+                || cli_network_name.is_some();
             return Ok(CreateVmParams {
                 secret_refs: Default::default(),
                 name,
@@ -75,6 +79,7 @@ pub fn build_create_params(
                 net,
                 network_backend: cli_network_backend,
                 dns: cli_dns,
+                network_name: cli_network_name,
                 init: cli_init,
                 env: cli_env,
                 workdir: cli_workdir,
@@ -306,6 +311,7 @@ pub fn build_create_params(
         net,
         network_backend: cli_network_backend,
         dns: cli_dns,
+        network_name: cli_network_name,
         init,
         env,
         workdir,
@@ -497,6 +503,7 @@ mod tests {
             false,
             None,
             None,
+            None,
             vec![],
             vec![],
             None,
@@ -528,6 +535,7 @@ mod tests {
             vec![],
             vec![],
             false,
+            None,
             None,
             None,
             vec![],

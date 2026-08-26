@@ -356,6 +356,36 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
             echo "Bundled GPU library: $gpu_lib ($(du -h "$DIST_DIR/lib/$gpu_lib" | cut -f1))"
         fi
     done
+
+    # libkrun.dylib links the GPU libraries at their Homebrew build paths, so
+    # its load commands carry absolute /opt/homebrew (or /usr/local) entries.
+    # The plain CLI masks this because smolvm-wrapper.sh exports
+    # DYLD_LIBRARY_PATH before exec, but a packed launcher dlopens libkrun with
+    # no such override, so dyld resolves those dependents from the host's
+    # Homebrew install instead of the bundled copies — the forked VM child is
+    # killed mid-dlopen (code-signature-invalid) or fails outright when the
+    # host copy is broken or missing, and the launcher surfaces only the
+    # generic agent-readiness timeout (#1011). Rewrite every such dependent to
+    # @loader_path so libkrun always loads the dylibs bundled beside it, then
+    # re-sign (install_name_tool invalidates the signature).
+    RELOCATED=0
+    while read -r dep; do
+        leaf="$(basename "$dep")"
+        if [[ ! -f "$DIST_DIR/lib/$leaf" ]]; then
+            echo "Error: libkrun.dylib depends on $dep but $leaf is not bundled in lib/"
+            exit 1
+        fi
+        echo "Relocating libkrun dependency: $dep -> @loader_path/$leaf"
+        install_name_tool -change "$dep" "@loader_path/$leaf" "$DIST_DIR/lib/libkrun.dylib"
+        RELOCATED=1
+    done < <(otool -L "$DIST_DIR/lib/libkrun.dylib" | awk 'NR>1 {print $1}' | grep -E '^(/opt/homebrew|/usr/local)/' || true)
+    if [[ "$RELOCATED" == "1" ]]; then
+        DYLIB_SIGN_ARGS=(--force --sign "$IDENTITY")
+        if [[ "$IDENTITY" != "-" ]]; then
+            DYLIB_SIGN_ARGS+=(--options runtime)
+        fi
+        codesign "${DYLIB_SIGN_ARGS[@]}" "$DIST_DIR/lib/libkrun.dylib"
+    fi
 else
     copy_so_with_symlinks() {
         local lib_prefix="$1"

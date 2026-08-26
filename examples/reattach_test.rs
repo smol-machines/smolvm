@@ -21,7 +21,8 @@ fn main() {
         image: None,
         persistent: true,
         runtime_managed: false,
-        labels: Default::default(),
+        // Spread the rest so a new spec field does not break the fixture.
+        ..Default::default()
     })
     .expect("create");
     rt.start_machine(name).expect("start");

@@ -79,8 +79,10 @@ fn main() {
     cu.ctx_synchronize().expect("sync");
     let out = cu.memcpy_dtoh(dc, bytes, 0).expect("d2h");
     let c: Vec<f32> = out
-        .chunks_exact(4)
-        .map(|p| f32::from_le_bytes(p.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|p| f32::from_le_bytes(*p))
         .collect();
     let ok = (0..n).all(|i| (c[i] - (a[i] + b[i])).abs() < 1e-2);
     println!(

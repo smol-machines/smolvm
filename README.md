@@ -89,7 +89,7 @@ like — by hand, or from a Smolfile — then pack the stopped machine into a
 ```bash
 smolvm machine shell --name myvm          # install and configure interactively
 smolvm machine stop  --name myvm
-smolvm pack create --from-vm myvm -o myvm.smolmachine
+smolvm pack create --from-vm myvm -o myvm
 smolvm pack push --file myvm.smolmachine ghcr.io/you/myvm:v1
 ```
 
@@ -217,7 +217,7 @@ Known Limitations
 
 * Network is opt-in (`--net` on `machine create`). TCP/UDP only, no ICMP.
 * Volume mounts: directories only (no single files). Mounting at `/workspace` (`-v /host/dir:/workspace`) takes priority over the default storage-disk workspace — your host directory is used instead.
-* macOS: binary must be signed with Hypervisor.framework entitlements.
+* macOS: binary must be signed with Hypervisor.framework entitlements (`com.apple.security.hypervisor`). The shipped release is; a re-signed or freshly built binary silently loses it and every VM start then fails with `krun_start_enter returned: -22 (EINVAL)`. Re-sign it (ad-hoc is fine): `codesign --force --sign - --entitlements hv.entitlements <smolvm-bin>` where `hv.entitlements` is a plist containing `<key>com.apple.security.hypervisor</key><true/>`.
 * `--ssh-agent` requires an SSH agent running on the host (`SSH_AUTH_SOCK` must be set).
 * GPU acceleration requires libkrun built with `GPU=1` and virglrenderer + a Vulkan driver on the host (see [GPU Acceleration](#gpu-acceleration) below).
 * Windows: `--net` works the same as on other platforms (virtio-net with inbound port-forwarding; TSI for outbound-only VMs), as do `machine exec` / interactive sessions and `machine stats`. Not yet available on Windows: GPU acceleration and `machine fork` / snapshot. Pack *create* needs `storage-template.ext4` / `overlay-template.ext4` next to `smolvm.exe` (Windows has no host `mkfs.ext4`).

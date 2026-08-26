@@ -15,7 +15,32 @@ use smolvm_protocol::{
 };
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+/// Metadata applied to an uploaded file after it lands: permissions and
+/// ownership. Ownership matters for non-root workload images — a root-owned
+/// upload is unreadable/unwritable to the user the container actually runs as.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FileWriteMeta {
+    /// File mode (e.g. 0o644). None = the agent's default.
+    pub mode: Option<u32>,
+    /// Owner uid. None = leave as written.
+    pub uid: Option<u32>,
+    /// Owner gid. None = leave as written.
+    pub gid: Option<u32>,
+}
+
+impl FileWriteMeta {
+    /// The pre-existing mode-only shape, for callers without ownership needs.
+    pub fn mode_only(mode: Option<u32>) -> Self {
+        Self {
+            mode,
+            ..Self::default()
+        }
+    }
+}
 
 /// Events from a streaming exec session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,7 +109,21 @@ const IMAGE_PULL_TIMEOUT_SECS: u64 = 600;
 /// Archive flattening may take arbitrarily long, but the agent streams progress
 /// while work is advancing. Each progress response starts a fresh socket read,
 /// so this remains an inactivity timeout rather than a total operation limit.
-const DETACHED_START_TIMEOUT_SECS: u64 = 120;
+const DETACHED_START_TIMEOUT_SECS: u64 = 600;
+
+/// Resolve the detached-start read window, honoring `SMOLVM_START_TIMEOUT_SECS`
+/// (seconds, must be > 0). A pack-backed machine's FIRST boot unpacks the whole
+/// flattened layer into guest storage before the workload can start, which on a
+/// loaded disk takes minutes — a window sized for warm boots kills every cold
+/// one.
+fn detached_start_timeout() -> Duration {
+    let secs = std::env::var("SMOLVM_START_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(DETACHED_START_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
 
 // (Removed INTERACTIVE_TIMEOUT_SECS — no-user-timeout execs now disable
 // the socket read timeout entirely, matching interactive_session behavior.)
@@ -100,6 +139,24 @@ const TIMEOUT_BUFFER_SECS: u64 = 5;
 /// likely already torn down — safe to proceed with SIGTERM.
 const SHUTDOWN_ACK_TIMEOUT_SECS: u64 = 5;
 
+/// Default read window for a guest-side flatten (overlay merge + tar of tens
+/// of GiB to the guest disk). The guest stays quiet while tar runs, so the
+/// window must cover the whole tar, not just the mount. Pack size is
+/// unbounded, so a fixed window cannot cover every pack — raise it for very
+/// large packs with `SMOLVM_FLATTEN_TIMEOUT_SECS`.
+const FLATTEN_TIMEOUT_DEFAULT_SECS: u64 = 900;
+
+/// Resolve the flatten read window, honoring `SMOLVM_FLATTEN_TIMEOUT_SECS`
+/// (seconds, must be > 0). Falls back to [`FLATTEN_TIMEOUT_DEFAULT_SECS`].
+fn flatten_timeout() -> Duration {
+    let secs = std::env::var("SMOLVM_FLATTEN_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(FLATTEN_TIMEOUT_DEFAULT_SECS);
+    Duration::from_secs(secs)
+}
+
 // ============================================================================
 // I/O Constants
 // ============================================================================
@@ -110,6 +167,23 @@ const STDIN_BUF_SIZE: usize = 4096;
 /// Poll timeout in milliseconds for interactive I/O loops.
 /// Short enough for responsive SIGWINCH handling, long enough to avoid busy-waiting.
 const POLL_TIMEOUT_MS: i32 = 100;
+
+/// Poll interval while waiting for writer-queue capacity.
+///
+/// A short interval limits added stdin latency without busy-waiting.
+const BACKPRESSURE_POLL_TIMEOUT_MS: i32 = 5;
+
+/// Maximum frames buffered by the interactive writer.
+///
+/// When full, stdin polling stops, providing backpressure instead of buffering
+/// indefinitely. 64 × 4 KiB stdin frames encode to roughly 350 KiB worst case.
+const WRITER_QUEUE_FRAMES: usize = 64;
+
+/// Write timeout for the interactive writer thread.
+///
+/// A short timeout lets blocked writes periodically observe shutdown.
+/// `WouldBlock` is flow control and is retried from the current frame offset.
+const WRITER_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Exit code reported when a channel-driven interactive session ends because the
 /// remote peer (e.g. a WebSocket terminal) disconnected rather than the command
@@ -144,6 +218,226 @@ impl Drop for ReadTimeoutGuard {
     }
 }
 
+/// Dedicated writer for interactive-session frames.
+///
+/// Keeping socket writes off the session loop lets it continue draining guest
+/// output while writes are blocked, avoiding the full-duplex deadlock in issue #926.
+/// A single writer also lets partial writes resume without corrupting framing.
+struct FrameWriter {
+    /// Queued frames, bounded by [`WRITER_QUEUE_FRAMES`]. Taken (dropped) during
+    /// shutdown so the thread's `recv` returns and `join` cannot deadlock.
+    tx: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    shutdown: Arc<AtomicBool>,
+    /// First fatal write error, published for the session loop to pick up.
+    error: Arc<Mutex<Option<std::io::Error>>>,
+    /// Extra handle to the same socket, kept only to restore the default write
+    /// timeout once the thread is gone.
+    restore: UdsStream,
+}
+
+impl FrameWriter {
+    /// Clone `stream` and start the writer thread on the clone.
+    ///
+    /// Note that socket options are properties of the socket, not of the
+    /// descriptor, so the write timeout set here applies to the caller's handle
+    /// too. That is harmless — an interactive session performs no direct writes
+    /// while the thread lives — and [`Drop`] puts the default back.
+    fn spawn(stream: &UdsStream) -> Result<Self> {
+        let write_half = stream
+            .try_clone()
+            .map_err(|e| Error::agent("clone agent socket", e.to_string()))?;
+        let restore = stream
+            .try_clone()
+            .map_err(|e| Error::agent("clone agent socket", e.to_string()))?;
+        // Best effort; on failure the writer retains the inherited timeout.
+        if let Err(e) = write_half.set_write_timeout(Some(WRITER_WRITE_TIMEOUT)) {
+            tracing::debug!(error = %e, "could not shorten agent socket write timeout");
+        }
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(WRITER_QUEUE_FRAMES);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let error = Arc::new(Mutex::new(None));
+
+        let thread_shutdown = Arc::clone(&shutdown);
+        let thread_error = Arc::clone(&error);
+        let handle = std::thread::Builder::new()
+            .name("smolvm-agent-writer".to_string())
+            .spawn(move || {
+                write_frames(write_half, rx, &thread_shutdown, &thread_error);
+            })
+            .map_err(|e| Error::agent("spawn writer thread", e.to_string()))?;
+
+        Ok(Self {
+            tx: Some(tx),
+            handle: Some(handle),
+            shutdown,
+            error,
+            restore,
+        })
+    }
+
+    /// Queue `frame` without blocking.
+    ///
+    /// Returns `Ok(None)` when queued and `Ok(Some(frame))` — the frame handed
+    /// back — when the queue is full, so the caller can hold it and stop reading
+    /// more input. `Err` means the writer thread is gone.
+    fn try_send(&self, frame: Vec<u8>) -> Result<Option<Vec<u8>>> {
+        let tx = match self.tx.as_ref() {
+            Some(tx) => tx,
+            None => return Err(self.writer_gone_error()),
+        };
+        match tx.try_send(frame) {
+            Ok(()) => Ok(None),
+            Err(std::sync::mpsc::TrySendError::Full(frame)) => Ok(Some(frame)),
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => Err(self.writer_gone_error()),
+        }
+    }
+
+    /// Take the writer's fatal error, if it has hit one.
+    fn take_error(&self) -> Option<std::io::Error> {
+        self.error.lock().ok().and_then(|mut slot| slot.take())
+    }
+
+    /// The error to report when the thread has exited: its own if it stored one,
+    /// otherwise a generic description.
+    fn writer_gone_error(&self) -> Error {
+        match self.take_error() {
+            Some(e) => Error::agent("send message", e.to_string()),
+            None => Error::agent("send message", "agent socket writer stopped".to_string()),
+        }
+    }
+}
+
+impl Drop for FrameWriter {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        // Drop the sender first: a thread parked in `recv` wakes on disconnect,
+        // and one parked in `write` sees the flag at its next timeout tick.
+        self.tx = None;
+        if let Some(handle) = self.handle.take() {
+            if handle.join().is_err() {
+                tracing::warn!("agent socket writer thread panicked");
+            }
+        }
+        if let Err(e) = self
+            .restore
+            .set_write_timeout(Some(Duration::from_secs(DEFAULT_WRITE_TIMEOUT_SECS)))
+        {
+            tracing::warn!(error = %e, "failed to reset socket write timeout to default");
+        }
+    }
+}
+
+/// How writing one frame ended.
+enum FrameOutcome {
+    /// Every byte reached the socket.
+    Done,
+    /// Shutdown was requested before the frame finished.
+    Abandoned,
+    /// The socket rejected the write.
+    Failed(std::io::Error),
+}
+
+/// Body of the writer thread: drain `rx` and write each frame in full.
+fn write_frames(
+    stream: UdsStream,
+    rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    shutdown: &AtomicBool,
+    error: &Mutex<Option<std::io::Error>>,
+) {
+    let mut sink = &stream;
+    // `recv` ends when every sender is dropped, i.e. at session teardown.
+    while let Ok(frame) = rx.recv() {
+        let mut pos = 0;
+        let outcome = loop {
+            if pos == frame.len() {
+                break FrameOutcome::Done;
+            }
+            match sink.write(&frame[pos..]) {
+                Ok(0) => {
+                    break FrameOutcome::Failed(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "agent socket accepted no bytes",
+                    ))
+                }
+                Ok(n) => pos += n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // The send timeout expired because the guest is not draining
+                    // yet — the very condition that used to abort the session.
+                    // Resume from `pos` unless we are shutting down.
+                    if shutdown.load(Ordering::Relaxed) {
+                        break FrameOutcome::Abandoned;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => break FrameOutcome::Failed(e),
+            }
+        };
+
+        match outcome {
+            FrameOutcome::Done => {
+                if let Err(e) = sink.flush() {
+                    store_writer_error(error, e);
+                    return;
+                }
+            }
+            FrameOutcome::Abandoned => {
+                close_write_half_if_truncated(&stream, pos);
+                return;
+            }
+            FrameOutcome::Failed(e) => {
+                store_writer_error(error, e);
+                close_write_half_if_truncated(&stream, pos);
+                return;
+            }
+        }
+    }
+}
+
+/// Close the write half after a partial frame.
+///
+/// Otherwise the peer can wait indefinitely for the remaining bytes or
+/// interpret subsequent data as part of the incomplete frame.
+fn close_write_half_if_truncated(stream: &UdsStream, written: usize) {
+    if written == 0 {
+        return;
+    }
+    tracing::debug!(
+        written,
+        "agent socket writer stopped mid-frame; closing the write half"
+    );
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+}
+
+/// Hand as many queued frames as fit to the writer thread, in order.
+///
+/// Anything left in `pending` means the writer is behind; the session loop then
+/// stops taking new input until this drains, which is what keeps host memory
+/// bounded without ever blocking the loop's read side.
+fn pump_frames(
+    writer: &FrameWriter,
+    pending: &mut std::collections::VecDeque<Vec<u8>>,
+) -> Result<()> {
+    while let Some(frame) = pending.pop_front() {
+        if let Some(frame) = writer.try_send(frame)? {
+            pending.push_front(frame);
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Publish the writer thread's first fatal error.
+fn store_writer_error(slot: &Mutex<Option<std::io::Error>>, err: std::io::Error) {
+    tracing::debug!(error = %err, "agent socket writer failed");
+    if let Ok(mut slot) = slot.lock() {
+        if slot.is_none() {
+            *slot = Some(err);
+        }
+    }
+}
+
 /// Configuration for running a command interactively.
 #[derive(Debug, Clone)]
 pub struct RunConfig {
@@ -172,6 +466,10 @@ pub struct RunConfig {
     /// Run as an unprivileged container (restricted caps, ro cgroup, no extra
     /// tmpfs). Default false = "VM-grade" (the microVM is the boundary).
     pub unprivileged: bool,
+    /// Remote-volume mount script to run inside the workload container before
+    /// its (image-resolved) command. Set by the workload launcher; the agent
+    /// wraps the resolved command so the image's real entrypoint still runs.
+    pub s3_volumes: Vec<smolvm_protocol::S3Volume>,
 }
 
 impl RunConfig {
@@ -193,7 +491,61 @@ impl RunConfig {
             persistent_overlay_id: None,
             stdin: None,
             unprivileged: false,
+            s3_volumes: Vec::new(),
         }
+    }
+
+    /// Target an existing machine: the overlay it runs in AND the buckets it
+    /// mounts, which must travel together.
+    ///
+    /// These two facts were previously set independently at ~15 launch and exec
+    /// sites, and a site that set the overlay but forgot the volumes produced a
+    /// workload running in the right filesystem with its bucket silently
+    /// missing — an empty directory, not an error. Binding them to one call
+    /// means a site either targets a machine completely or not at all, and a
+    /// future per-machine fact is added here rather than at every caller.
+    ///
+    /// `env` is the environment the machine will actually see (request env and
+    /// resolved secrets merged over the record's), because that is where the
+    /// bucket credentials come from.
+    pub fn in_machine(
+        mut self,
+        record: &crate::config::VmRecord,
+        machine_name: &str,
+        env: &[(String, String)],
+    ) -> Self {
+        // A caller with no env of its own (an interactive session, say) still
+        // needs the machine's credentials, which live on the record.
+        let env = if env.is_empty() { &record.env } else { env };
+        self.s3_volumes = crate::remote_volume::to_s3_volumes(&record.remote_volumes, env);
+        self.persistent_overlay_id = Some(crate::workload::persistent_overlay_owner_with_lineage(
+            machine_name,
+            record.golden.as_deref(),
+            record.fork_overlay_owner.as_deref(),
+        ));
+        self
+    }
+
+    /// [`Self::in_machine`] for callers holding an optional record.
+    ///
+    /// A machine with no record (an ephemeral or bare-VM session) simply keeps
+    /// the config as-is, so a caller never has to branch on it.
+    pub fn in_machine_opt(
+        self,
+        record: Option<&crate::config::VmRecord>,
+        machine_name: &str,
+        env: &[(String, String)],
+    ) -> Self {
+        match record {
+            Some(record) => self.in_machine(record, machine_name, env),
+            None => self,
+        }
+    }
+
+    /// Set the remote-volume mount script run inside the workload container.
+    pub fn with_s3_volumes(mut self, volumes: Vec<smolvm_protocol::S3Volume>) -> Self {
+        self.s3_volumes = volumes;
+        self
     }
 
     /// Set environment variables.
@@ -390,6 +742,20 @@ pub struct AgentClient {
     stream: UdsStream,
     /// Trace ID for correlating this client session's requests with host API calls.
     trace_id: Option<String>,
+}
+
+fn stalled_read_error(bytes_read: usize, propagate_initial_wouldblock: bool) -> std::io::Error {
+    if bytes_read == 0 && propagate_initial_wouldblock {
+        std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "timed out waiting for an agent response frame",
+        )
+    } else {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timed out reading frame body: peer stalled mid-frame",
+        )
+    }
 }
 
 // ============================================================================
@@ -920,6 +1286,12 @@ impl AgentClient {
     /// Missing or empty entries are dropped guest-side, so callers can append a
     /// container overlay's upper dir without probing it first.
     pub fn flatten_layers(&mut self, lowerdirs: &[String], output: &str) -> Result<()> {
+        // Merging the lower dirs and tarring the result runs for minutes on a
+        // large base, and the agent sends nothing in between — far past the
+        // default read timeout, which surfaces as a spurious EAGAIN. Widen the
+        // window for the whole flatten, as the file-read paths do for large
+        // transfers. Configurable because pack size is unbounded.
+        let _timeout_guard = self.set_extended_read_timeout(flatten_timeout())?;
         let resp = self.request(&AgentRequest::FlattenLayers {
             lowerdirs: lowerdirs.to_vec(),
             output: output.to_string(),
@@ -1114,10 +1486,14 @@ impl AgentClient {
             None
         };
 
+        // Route session writes through the dedicated writer.
+        let writer = FrameWriter::spawn(&self.stream)?;
+        let mut pending: std::collections::VecDeque<Vec<u8>> = std::collections::VecDeque::new();
+
         // Send initial terminal size so PTY starts at the right dimensions
         if tty {
             if let Some((cols, rows)) = get_terminal_size() {
-                self.send(&AgentRequest::Resize { cols, rows })?;
+                pending.push_back(self.encode_traced(&AgentRequest::Resize { cols, rows })?);
             }
             install_sigwinch_handler();
         }
@@ -1126,9 +1502,8 @@ impl AgentClient {
         let _nonblock_stdin = NonBlockingStdin::new()
             .map_err(|e| Error::agent("set stdin nonblocking", e.to_string()))?;
 
-        // Socket stays blocking — poll() determines readiness, then blocking
-        // read/write completes immediately. This avoids partial-read/write bugs
-        // that occur with non-blocking read_exact/write_all.
+        // Socket reads remain blocking; poll() determines read readiness.
+        // Outbound frames are handled by FrameWriter.
         let mut stdin_handle = stdin();
         let stdin_fd = stdin_raw_fd();
         let socket_fd = self.stream_raw_fd();
@@ -1136,14 +1511,30 @@ impl AgentClient {
         let mut stdin_eof = false;
 
         let exit_code = loop {
-            let effective_stdin_fd = if stdin_eof { -1 } else { stdin_fd };
-            let poll_result = poll_io(effective_stdin_fd, socket_fd, POLL_TIMEOUT_MS)
+            if let Some(e) = writer.take_error() {
+                return Err(Error::agent(op, format!("failed to send to agent: {}", e)));
+            }
+            pump_frames(&writer, &mut pending)?;
+
+            // Stop reading stdin while the writer is backed up, bounding memory use.
+            let backpressured = !pending.is_empty();
+            let effective_stdin_fd = if stdin_eof || backpressured {
+                -1
+            } else {
+                stdin_fd
+            };
+            let poll_timeout = if backpressured {
+                BACKPRESSURE_POLL_TIMEOUT_MS
+            } else {
+                POLL_TIMEOUT_MS
+            };
+            let poll_result = poll_io(effective_stdin_fd, socket_fd, poll_timeout)
                 .map_err(|e| Error::agent("poll", e.to_string()))?;
 
             // Check for terminal resize (SIGWINCH)
             if tty && check_sigwinch() {
                 if let Some((cols, rows)) = get_terminal_size() {
-                    self.send(&AgentRequest::Resize { cols, rows })?;
+                    pending.push_back(self.encode_traced(&AgentRequest::Resize { cols, rows })?);
                 }
             }
 
@@ -1189,23 +1580,27 @@ impl AgentClient {
                 return Err(Error::agent(op, "connection to VM lost".to_string()));
             }
 
-            // Handle stdin input — send to agent
+            // Handle stdin input — queue it for the writer thread
             if poll_result.stdin_ready && !stdin_eof {
                 match stdin_handle.read(&mut stdin_buf) {
                     Ok(0) => {
                         stdin_eof = true;
-                        self.send(&AgentRequest::Stdin { data: Vec::new() })?;
+                        pending.push_back(
+                            self.encode_traced(&AgentRequest::Stdin { data: Vec::new() })?,
+                        );
                     }
                     Ok(n) => {
-                        self.send(&AgentRequest::Stdin {
+                        pending.push_back(self.encode_traced(&AgentRequest::Stdin {
                             data: stdin_buf[..n].to_vec(),
-                        })?;
+                        })?);
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(e) => {
                         tracing::debug!(error = %e, "stdin read error, treating as EOF");
                         stdin_eof = true;
-                        self.send(&AgentRequest::Stdin { data: Vec::new() })?;
+                        pending.push_back(
+                            self.encode_traced(&AgentRequest::Stdin { data: Vec::new() })?,
+                        );
                     }
                 }
             }
@@ -1268,6 +1663,7 @@ impl AgentClient {
             persistent_overlay_id: config.persistent_overlay_id,
             stdin_data: config.stdin,
             background: false,
+            s3_volumes: config.s3_volumes.clone(),
         })?;
 
         expect_completed(resp, "run command")
@@ -1294,6 +1690,7 @@ impl AgentClient {
             persistent_overlay_id: config.persistent_overlay_id,
             stdin_data: None,
             background: true,
+            s3_volumes: config.s3_volumes.clone(),
         })?;
 
         let (exit_code, stdout, _stderr) = expect_completed(resp, "run background")?;
@@ -1337,6 +1734,7 @@ impl AgentClient {
             persistent_overlay_id: config.persistent_overlay_id,
             stdin_data: None,
             background: false,
+            s3_volumes: config.s3_volumes.clone(),
         })?;
 
         collect_exec_events(self, "run streaming", on_event)
@@ -1374,6 +1772,7 @@ impl AgentClient {
                 persistent_overlay_id: config.persistent_overlay_id,
                 stdin_data: None,
                 background: false,
+                s3_volumes: config.s3_volumes.clone(),
             },
             tty,
             "run interactive",
@@ -1394,8 +1793,7 @@ impl AgentClient {
         // Container startup involves overlay setup, a one-time flatten of a local
         // image archive into guest storage, and crun init, which can far exceed
         // the default 30s read timeout on first run (cold overlay, cold image).
-        let _timeout_guard =
-            self.set_extended_read_timeout(Duration::from_secs(DETACHED_START_TIMEOUT_SECS))?;
+        let _timeout_guard = self.set_extended_read_timeout(detached_start_timeout())?;
 
         self.send(&AgentRequest::Run {
             image: config.image,
@@ -1412,6 +1810,7 @@ impl AgentClient {
             persistent_overlay_id: config.persistent_overlay_id,
             stdin_data: None,
             background: false,
+            s3_volumes: config.s3_volumes,
         })?;
         let resp = loop {
             match self.receive()? {
@@ -1494,9 +1893,23 @@ impl AgentClient {
         let socket_fd = self.stream_raw_fd();
         let mut input_eof_sent = false;
 
+        // Route channel input through the same writer as `interactive_session`.
+        let writer = FrameWriter::spawn(&self.stream)?;
+        let mut pending: std::collections::VecDeque<Vec<u8>> = std::collections::VecDeque::new();
+
         let exit_code = loop {
+            if let Some(e) = writer.take_error() {
+                return Err(Error::agent(op, format!("failed to send to agent: {}", e)));
+            }
+            pump_frames(&writer, &mut pending)?;
+
             // stdin_fd = -1 → poll() ignores it; only the socket drives readiness.
-            let poll_result = poll_io(-1, socket_fd, POLL_TIMEOUT_MS)
+            let poll_timeout = if pending.is_empty() {
+                POLL_TIMEOUT_MS
+            } else {
+                BACKPRESSURE_POLL_TIMEOUT_MS
+            };
+            let poll_result = poll_io(-1, socket_fd, poll_timeout)
                 .map_err(|e| Error::agent("poll", e.to_string()))?;
 
             // Drain agent output first (prevents deadlock when its send buffer fills).
@@ -1531,18 +1944,22 @@ impl AgentClient {
                 return Err(Error::agent(op, "connection to VM lost".to_string()));
             }
 
-            // Forward any pending input without blocking the output path.
-            loop {
+            // Forward any pending input without blocking the output path. While
+            // the writer queue is backed up the events stay in their source
+            // channel, so backpressure composes instead of buffering here.
+            while pending.is_empty() {
                 match input.try_recv() {
                     Ok(InteractiveInput::Stdin(data)) => {
-                        self.send(&AgentRequest::Stdin { data })?
+                        pending.push_back(self.encode_traced(&AgentRequest::Stdin { data })?)
                     }
                     Ok(InteractiveInput::Resize { cols, rows }) => {
-                        self.send(&AgentRequest::Resize { cols, rows })?
+                        pending.push_back(self.encode_traced(&AgentRequest::Resize { cols, rows })?)
                     }
                     Ok(InteractiveInput::Eof) => {
                         if !input_eof_sent {
-                            self.send(&AgentRequest::Stdin { data: Vec::new() })?;
+                            pending.push_back(
+                                self.encode_traced(&AgentRequest::Stdin { data: Vec::new() })?,
+                            );
                             input_eof_sent = true;
                         }
                     }
@@ -1559,6 +1976,9 @@ impl AgentClient {
                         return Ok(DISCONNECT_EXIT_CODE);
                     }
                 }
+                // Hand the event straight on, so a writer that is keeping up
+                // leaves `pending` empty and this keeps draining the channel.
+                pump_frames(&writer, &mut pending)?;
             }
         };
 
@@ -1626,6 +2046,7 @@ impl AgentClient {
                 persistent_overlay_id: config.persistent_overlay_id,
                 stdin_data: None,
                 background: false,
+                s3_volumes: config.s3_volumes.clone(),
             },
             input,
             on_output,
@@ -1653,7 +2074,7 @@ impl AgentClient {
     ///   limit — without it the send blocks the socket (EAGAIN
     ///   after write timeout) and risks OOMing the guest agent.
     pub fn write_file(&mut self, path: &str, data: &[u8], mode: Option<u32>) -> Result<()> {
-        self.write_file_with_progress(path, data, mode, |_| {})
+        self.write_file_with_progress(path, data, FileWriteMeta::mode_only(mode), |_| {})
     }
 
     /// Write a file into the VM with a progress callback.
@@ -1666,20 +2087,22 @@ impl AgentClient {
         &mut self,
         path: &str,
         data: &[u8],
-        mode: Option<u32>,
+        meta: FileWriteMeta,
         mut on_progress: F,
     ) -> Result<()> {
         if data.len() <= FILE_WRITE_SINGLE_SHOT_MAX {
             let resp = self.request(&AgentRequest::FileWrite {
                 path: path.to_string(),
                 data: data.to_vec(),
-                mode,
+                mode: meta.mode,
+                uid: meta.uid,
+                gid: meta.gid,
             })?;
             expect_ok(resp, "write file")?;
             on_progress(data.len() as u64);
             Ok(())
         } else {
-            self.write_file_streaming(path, data, mode, &mut on_progress)
+            self.write_file_streaming(path, data, meta, &mut on_progress)
         }
     }
 
@@ -1688,14 +2111,14 @@ impl AgentClient {
         &mut self,
         path: &str,
         data: &[u8],
-        mode: Option<u32>,
+        meta: FileWriteMeta,
         on_progress: &mut F,
     ) -> Result<()> {
         self.write_file_streaming_from_reader(
             path,
             &mut std::io::Cursor::new(data),
             data.len() as u64,
-            mode,
+            meta,
             on_progress,
         )
     }
@@ -1713,7 +2136,13 @@ impl AgentClient {
         total_size: u64,
         mode: Option<u32>,
     ) -> Result<()> {
-        self.write_file_from_reader_with_progress(path, reader, total_size, mode, |_| {})
+        self.write_file_from_reader_with_progress(
+            path,
+            reader,
+            total_size,
+            FileWriteMeta::mode_only(mode),
+            |_| {},
+        )
     }
 
     /// Stream a file from a [`Read`] source with progress callback.
@@ -1722,7 +2151,7 @@ impl AgentClient {
         path: &str,
         reader: R,
         total_size: u64,
-        mode: Option<u32>,
+        meta: FileWriteMeta,
         mut on_progress: F,
     ) -> Result<()> {
         if total_size <= FILE_WRITE_SINGLE_SHOT_MAX as u64 {
@@ -1730,13 +2159,13 @@ impl AgentClient {
             let mut data = Vec::with_capacity(total_size as usize);
             std::io::Read::read_to_end(&mut std::io::Read::take(reader, total_size), &mut data)
                 .map_err(|e| Error::agent("read source file", e.to_string()))?;
-            return self.write_file_with_progress(path, &data, mode, on_progress);
+            return self.write_file_with_progress(path, &data, meta, on_progress);
         }
         self.write_file_streaming_from_reader(
             path,
             &mut { reader },
             total_size,
-            mode,
+            meta,
             &mut on_progress,
         )
     }
@@ -1749,12 +2178,14 @@ impl AgentClient {
         path: &str,
         reader: &mut R,
         total_size: u64,
-        mode: Option<u32>,
+        meta: FileWriteMeta,
         on_progress: &mut F,
     ) -> Result<()> {
         let resp = self.request(&AgentRequest::FileWriteBegin {
             path: path.to_string(),
-            mode,
+            mode: meta.mode,
+            uid: meta.uid,
+            gid: meta.gid,
             total_size,
         })?;
         expect_ok(resp, "begin streaming write")?;
@@ -1849,6 +2280,26 @@ impl AgentClient {
         &mut self,
         guest_path: &str,
         local_path: &std::path::Path,
+        on_progress: F,
+    ) -> Result<u64> {
+        self.read_file_to_path_capped(
+            guest_path,
+            local_path,
+            file_transfer_max_total(),
+            on_progress,
+        )
+    }
+
+    /// [`Self::read_file_to_path`] with an explicit byte ceiling.
+    ///
+    /// The pack paths read back a layer smolvm itself asked the guest to
+    /// produce, so they pass [`pack_export_max_total`] instead of the general
+    /// guest-driven transfer bound.
+    pub fn read_file_to_path_capped<F: FnMut(u64)>(
+        &mut self,
+        guest_path: &str,
+        local_path: &std::path::Path,
+        cap: u64,
         mut on_progress: F,
     ) -> Result<u64> {
         use std::io::Write;
@@ -1867,7 +2318,6 @@ impl AgentClient {
         })?;
 
         let mut total = 0u64;
-        let cap = file_transfer_max_total();
         loop {
             match self.recv_raw()? {
                 AgentResponse::DataChunk { data, done } => {
@@ -2054,6 +2504,43 @@ impl AgentClient {
 
         let mut pos = 0;
         while pos < buf.len() {
+            // SO_RCVTIMEO is normally enough to bound a blocking read, but a
+            // restored vsock/UDS bridge can occasionally leave recv() blocked
+            // past that socket timeout while many clones reconnect at once.
+            // Poll the descriptor against the same idle deadline before every
+            // read on Unix so a missing response cannot pin a fork-batch worker
+            // forever. A readable event also covers EOF/error; read() below
+            // preserves the precise result in those cases.
+            #[cfg(unix)]
+            if let Some(d) = deadline {
+                let mut pollfd = libc::pollfd {
+                    fd: std::os::unix::io::AsRawFd::as_raw_fd(&self.stream),
+                    events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+                    revents: 0,
+                };
+                loop {
+                    let now = std::time::Instant::now();
+                    if now >= d {
+                        return Err(stalled_read_error(pos, propagate_initial_wouldblock));
+                    }
+                    let remaining = d.saturating_duration_since(now);
+                    let timeout_ms = remaining.as_millis().max(1).min(i32::MAX as u128) as i32;
+                    // SAFETY: `pollfd` points to one initialized entry for the
+                    // duration of the call; poll does not retain the pointer.
+                    let ready = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+                    if ready > 0 {
+                        break;
+                    }
+                    if ready == 0 {
+                        return Err(stalled_read_error(pos, propagate_initial_wouldblock));
+                    }
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(error);
+                }
+            }
             match self.stream.read(&mut buf[pos..]) {
                 Ok(0) => {
                     return Err(std::io::Error::new(
@@ -2078,10 +2565,7 @@ impl AgentClient {
                     // can't busy-spin forever.
                     if let Some(d) = deadline {
                         if std::time::Instant::now() >= d {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::TimedOut,
-                                "timed out reading frame body: peer stalled mid-frame",
-                            ));
+                            return Err(stalled_read_error(pos, propagate_initial_wouldblock));
                         }
                     }
                     std::thread::sleep(std::time::Duration::from_millis(1));
@@ -2258,6 +2742,25 @@ pub fn file_transfer_max_total() -> u64 {
         .unwrap_or(FILE_TRANSFER_MAX_TOTAL)
 }
 
+/// Default ceiling for pack-export reads (64 GiB).
+const PACK_EXPORT_MAX_TOTAL: u64 = 64 << 30;
+
+/// The size cap for pack-export reads, in bytes. Defaults to 64 GiB and honors
+/// the same `SMOLVM_FILE_TRANSFER_MAX_BYTES` override as
+/// [`file_transfer_max_total`].
+///
+/// Pack export reads back a layer smolvm itself asked the guest to write, and a
+/// provisioned machine's flattened rootfs is routinely tens of GiB, so the
+/// general transfer bound — sized for `machine cp` against a guest that chooses
+/// its own payload — is the wrong ceiling here. Every pack read shares this one
+/// so the routes of a single export cannot disagree.
+pub fn pack_export_max_total() -> u64 {
+    std::env::var("SMOLVM_FILE_TRANSFER_MAX_BYTES")
+        .ok()
+        .and_then(|s| crate::util::parse_size_bytes(s.trim()).ok())
+        .unwrap_or(PACK_EXPORT_MAX_TOTAL)
+}
+
 fn consume_streamed_read_with_progress<F, P>(next_response: F, on_progress: P) -> Result<Vec<u8>>
 where
     F: FnMut() -> Result<AgentResponse>,
@@ -2356,6 +2859,15 @@ mod read_cap_tests {
     fn read_cap_terminator_returns_full_buffer() {
         let out = drive(vec![chunk(100, false), chunk(50, true)]).unwrap();
         assert_eq!(out.len(), 150);
+    }
+
+    // Pack export reads back a layer smolvm asked the guest to produce, not a
+    // guest-chosen payload, so its ceiling must never be the more restrictive
+    // of the two. Holds with or without the shared override, since both caps
+    // read it.
+    #[test]
+    fn pack_export_cap_is_never_below_the_transfer_cap() {
+        assert!(pack_export_max_total() >= file_transfer_max_total());
     }
 
     #[test]
@@ -2816,6 +3328,162 @@ mod run_streaming_tests {
 }
 
 #[cfg(test)]
+mod writer_thread_tests {
+    //! Regression tests for issue #926.
+    //!
+    //! They verify nonblocking enqueueing, retry after write timeout, frame
+    //! ordering, error propagation, and bounded teardown.
+    use super::*;
+    use std::collections::VecDeque;
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+
+    const FRAME_LEN: usize = 4096;
+
+    /// Frames whose byte pattern encodes their index, so a reordered or spliced
+    /// stream is detectable.
+    fn make_frames(count: usize) -> Vec<Vec<u8>> {
+        (0..count).map(|i| vec![i as u8; FRAME_LEN]).collect()
+    }
+
+    /// Shrink both socket buffers so a peer that stops reading wedges the writer
+    /// after a few frames instead of hundreds of KiB.
+    fn shrink_buffers(a: &UdsStream, b: &UdsStream) {
+        for s in [a, b] {
+            let _ = s.as_socket().set_send_buffer_size(FRAME_LEN);
+            let _ = s.as_socket().set_recv_buffer_size(FRAME_LEN);
+        }
+    }
+
+    #[test]
+    fn stalled_peer_does_not_abort_or_reorder_the_stream() {
+        let (client_stream, mut peer) = UdsStream::pair().unwrap();
+        shrink_buffers(&client_stream, &peer);
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("set peer read timeout");
+
+        let frames = make_frames(WRITER_QUEUE_FRAMES + 16);
+        let total: usize = frames.iter().map(|f| f.len()).sum();
+
+        // Peer wedges past a full WRITER_WRITE_TIMEOUT tick before draining, so
+        // the writer must survive at least one expired write mid-frame.
+        let peer_thread = std::thread::spawn(move || {
+            std::thread::sleep(WRITER_WRITE_TIMEOUT + Duration::from_millis(200));
+            let mut received = vec![0u8; total];
+            peer.read_exact(&mut received)
+                .expect("peer reads all bytes");
+            received
+        });
+
+        let writer = FrameWriter::spawn(&client_stream).expect("spawn writer");
+
+        // Queue with the session loop's discipline: one held frame, retried until
+        // it fits. The first WRITER_QUEUE_FRAMES sends must not block.
+        let start = Instant::now();
+        let mut pending: VecDeque<Vec<u8>> = frames.iter().cloned().collect();
+        let mut queued = 0;
+        while queued < WRITER_QUEUE_FRAMES {
+            let frame = pending.pop_front().expect("frames remain");
+            assert!(
+                writer.try_send(frame).expect("writer alive").is_none(),
+                "the first {WRITER_QUEUE_FRAMES} frames must fit in the queue"
+            );
+            queued += 1;
+        }
+        let enqueue_time = start.elapsed();
+        assert!(
+            enqueue_time < Duration::from_millis(500),
+            "enqueueing must not block on a stalled peer (took {enqueue_time:?})"
+        );
+
+        // Remainder: exactly the held-frame retry the session loop performs.
+        while let Some(frame) = pending.pop_front() {
+            let mut held = Some(frame);
+            while let Some(frame) = held.take() {
+                held = writer.try_send(frame).expect("writer alive");
+                if held.is_some() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+
+        let received = peer_thread.join().expect("peer thread joined");
+        assert_eq!(
+            received,
+            frames.concat(),
+            "every frame must arrive whole and in order"
+        );
+        assert!(
+            writer.take_error().is_none(),
+            "a slow peer is not a write error"
+        );
+        drop(writer);
+    }
+
+    #[test]
+    fn teardown_does_not_hang_on_a_wedged_peer() {
+        let (client_stream, peer) = UdsStream::pair().unwrap();
+        shrink_buffers(&client_stream, &peer);
+
+        let writer = FrameWriter::spawn(&client_stream).expect("spawn writer");
+        // Push until the queue backs up, which means the socket buffers are full
+        // and the writer thread is parked inside write() — the wedged-guest state.
+        let mut wedged = false;
+        for frame in make_frames(4 * WRITER_QUEUE_FRAMES) {
+            if writer.try_send(frame).expect("writer alive").is_some() {
+                wedged = true;
+                break;
+            }
+        }
+        assert!(
+            wedged,
+            "peer never applied backpressure; test is not exercising a parked writer"
+        );
+
+        let start = Instant::now();
+        drop(writer);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < WRITER_WRITE_TIMEOUT * 3,
+            "dropping the writer must not wait on the peer (took {elapsed:?})"
+        );
+        drop(peer);
+    }
+
+    #[test]
+    fn write_error_is_published_instead_of_lost() {
+        let (client_stream, peer) = UdsStream::pair().unwrap();
+        shrink_buffers(&client_stream, &peer);
+
+        let writer = FrameWriter::spawn(&client_stream).expect("spawn writer");
+        drop(peer); // Connection dies mid-session: broken pipe on the next write.
+
+        // The session loop learns of the failure one iteration late, either from
+        // the error slot or from a send onto the now-dead channel.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut reported = false;
+        while Instant::now() < deadline {
+            if writer.take_error().is_some() {
+                reported = true;
+                break;
+            }
+            match writer.try_send(vec![0u8; FRAME_LEN]) {
+                Ok(_) => std::thread::sleep(Duration::from_millis(10)),
+                Err(e) => {
+                    assert!(
+                        e.to_string().contains("send message"),
+                        "writer failure must surface as a send error, got: {e}"
+                    );
+                    reported = true;
+                    break;
+                }
+            }
+        }
+        assert!(reported, "a dead socket must surface as an error");
+    }
+}
+
+#[cfg(test)]
 mod stalled_body_tests {
     //! Regression for the busy-spin-forever on a stalled mid-frame body.
     //!
@@ -2828,6 +3496,33 @@ mod stalled_body_tests {
     use super::*;
     use std::io::Write;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn receive_times_out_when_peer_never_starts_a_frame() {
+        let (client_stream, server_stream) = UdsStream::pair().unwrap();
+        client_stream
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("set read timeout");
+
+        let server = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(3));
+            drop(server_stream);
+        });
+        let mut client = AgentClient::from_stream(client_stream);
+
+        let start = Instant::now();
+        let error = client
+            .receive()
+            .expect_err("an idle peer must not block receive forever");
+        let elapsed = start.elapsed();
+
+        assert!(error.to_string().contains("timed out waiting"));
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "an idle response must honor the socket deadline (got {elapsed:?})"
+        );
+        server.join().expect("server thread joined");
+    }
 
     #[test]
     fn receive_times_out_on_stalled_mid_frame_body() {
@@ -2953,5 +3648,54 @@ mod term_default_tests {
         let env = with_term_default(vec![("A".to_string(), "b".to_string())], false);
         assert_eq!(term_of(&env), None);
         assert_eq!(env.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod flatten_timeout_tests {
+    use super::*;
+
+    // `set_var`/`remove_var` are process-global and the tests run in parallel
+    // threads; serialize them so one test's override can't bleed into another.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_env(value: Option<&str>, f: impl FnOnce()) {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        match value {
+            Some(v) => std::env::set_var("SMOLVM_FLATTEN_TIMEOUT_SECS", v),
+            None => std::env::remove_var("SMOLVM_FLATTEN_TIMEOUT_SECS"),
+        }
+        f();
+        std::env::remove_var("SMOLVM_FLATTEN_TIMEOUT_SECS");
+    }
+
+    #[test]
+    fn defaults_to_900_seconds_without_env() {
+        with_env(None, || {
+            assert_eq!(
+                flatten_timeout(),
+                Duration::from_secs(FLATTEN_TIMEOUT_DEFAULT_SECS)
+            );
+        });
+    }
+
+    #[test]
+    fn honors_a_valid_override() {
+        with_env(Some("3600"), || {
+            assert_eq!(flatten_timeout(), Duration::from_secs(3600));
+        });
+    }
+
+    #[test]
+    fn rejects_zero_unparsable_and_empty_values() {
+        for bad in ["0", "-5", "abc", "", "  "] {
+            with_env(Some(bad), || {
+                assert_eq!(
+                    flatten_timeout(),
+                    Duration::from_secs(FLATTEN_TIMEOUT_DEFAULT_SECS),
+                    "value {bad:?} must fall back to the default"
+                );
+            });
+        }
     }
 }

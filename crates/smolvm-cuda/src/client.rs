@@ -244,6 +244,15 @@ pub struct Client<S> {
     /// prior request was consumed (journal clears); on reconnect the journal
     /// replays the unproven suffix. Bounded by MAX_DEFERRED (drain fences).
     journal: Vec<Vec<u8>>,
+    /// Opt-in transparent graph segmentation. Eligible asynchronous requests
+    /// are held until the next semantic boundary and sent as one segment for
+    /// host-side shape recognition, parameter update, and eager fallback.
+    auto_graph: bool,
+    auto_ops: Vec<Vec<u8>>,
+    auto_bytes: usize,
+    /// Explicit framework capture must pass through verbatim; wrapping work
+    /// already inside a capture would create an illegal nested capture.
+    explicit_capture_depth: usize,
 }
 
 /// Outstanding-response cap. Responses are ~8 bytes, so even the smallest
@@ -253,6 +262,19 @@ const MAX_DEFERRED: usize = 512;
 /// Flush the deferred-write buffer beyond this size even without a sync point,
 /// so bulk H2D byte-shipping doesn't accumulate unbounded copies in memory.
 const WBUF_FLUSH: usize = 256 * 1024;
+const AUTO_SEGMENT_MAX_OPS: usize = 256;
+const AUTO_SEGMENT_MAX_BYTES: usize = 128 * 1024;
+
+fn auto_graph_eligible(req: &Request) -> bool {
+    matches!(
+        req,
+        Request::LaunchKernel { .. }
+            | Request::LaunchKernelPacked { .. }
+            | Request::LibCall { .. }
+            | Request::MemsetD8Async { .. }
+            | Request::MemcpyDtoDAsync { .. }
+    )
+}
 
 impl<S: Read + Write> Client<S> {
     pub fn new(stream: S) -> Self {
@@ -268,6 +290,10 @@ impl<S: Read + Write> Client<S> {
             clean_stream: 0,
             wbuf: Vec::new(),
             journal: Vec::new(),
+            auto_graph: std::env::var("SMOLVM_CUDA_AUTO_GRAPH").as_deref() == Ok("1"),
+            auto_ops: Vec::new(),
+            auto_bytes: 0,
+            explicit_capture_depth: 0,
         }
     }
 
@@ -526,6 +552,9 @@ impl<S: Read + Write> Client<S> {
     /// program order (fatal once CUDA-graph capture records the misorder).
     pub fn set_defer_enabled(&mut self, on: bool) {
         self.defer_enabled = on;
+        if !on {
+            self.auto_graph = false;
+        }
     }
 
     /// Take this client's replay journal — every quiet request not yet proven
@@ -539,6 +568,8 @@ impl<S: Read + Write> Client<S> {
     /// before gating), so an empty journal is the common case and replay of a
     /// host-side-executed op cannot arise there.
     pub fn take_journal(&mut self) -> (Vec<Vec<u8>>, i32) {
+        let pending = self.take_auto_payloads();
+        self.journal.extend(pending);
         let sticky = std::mem::take(&mut self.sticky);
         self.deferred = 0;
         self.wbuf.clear(); // superseded: the journal holds sent AND unsent
@@ -566,6 +597,7 @@ impl<S: Read + Write> Client<S> {
     /// wake-up on vsock), so one fence reply carries the first failure among
     /// them.
     pub fn drain(&mut self) -> Result<()> {
+        self.flush_auto_segment()?;
         if self.ring.is_some() {
             if self.deferred == 0 {
                 return Ok(());
@@ -651,6 +683,52 @@ impl<S: Read + Write> Client<S> {
     /// comes FIRST so a payload whose transport write fails is still replayed
     /// after the reconnect that failure triggers.
     fn enqueue_quiet(&mut self, payload: Vec<u8>) -> Result<()> {
+        if self.auto_graph {
+            if let Ok(req) = crate::proto::decode_request(&payload) {
+                if matches!(req, Request::StreamBeginCapture { .. }) {
+                    self.flush_auto_segment()?;
+                    self.enqueue_quiet_direct(payload)?;
+                    self.explicit_capture_depth = self.explicit_capture_depth.saturating_add(1);
+                    return Ok(());
+                }
+                if self.explicit_capture_depth == 0 && auto_graph_eligible(&req) {
+                    self.auto_bytes = self.auto_bytes.saturating_add(payload.len());
+                    self.auto_ops.push(payload);
+                    if self.auto_ops.len() >= AUTO_SEGMENT_MAX_OPS
+                        || self.auto_bytes >= AUTO_SEGMENT_MAX_BYTES
+                    {
+                        self.flush_auto_segment()?;
+                    }
+                    return Ok(());
+                }
+            }
+            self.flush_auto_segment()?;
+        }
+        self.enqueue_quiet_direct(payload)
+    }
+
+    /// Convert the pending segment into one protocol request (or retain a
+    /// single operation unchanged, avoiding wrapper overhead).
+    fn take_auto_payloads(&mut self) -> Vec<Vec<u8>> {
+        self.auto_bytes = 0;
+        match self.auto_ops.len() {
+            0 => Vec::new(),
+            1 => vec![self.auto_ops.pop().unwrap()],
+            _ => vec![encode_request(&Request::AutoGraphSegment {
+                ops: std::mem::take(&mut self.auto_ops),
+            })],
+        }
+    }
+
+    fn flush_auto_segment(&mut self) -> Result<()> {
+        for payload in self.take_auto_payloads() {
+            self.enqueue_quiet_direct(payload)?;
+        }
+        Ok(())
+    }
+
+    /// Transport one already-segmented quiet request.
+    fn enqueue_quiet_direct(&mut self, payload: Vec<u8>) -> Result<()> {
         if self.deferred >= MAX_DEFERRED {
             self.drain()?;
         }
@@ -715,6 +793,7 @@ impl<S: Read + Write> Client<S> {
     }
 
     fn call(&mut self, req: &Request, op: Op) -> Result<Response> {
+        self.flush_auto_segment()?;
         // Sync-elision bookkeeping: only ops that can leave PENDING device
         // work dirty the pipeline. Pure queries return existing state, and
         // the blocking transfer forms complete before the host responds —
@@ -744,8 +823,10 @@ impl<S: Read + Write> Client<S> {
             | Op::StreamQuery
             | Op::EventQuery
             | Op::EventCreate
+            | Op::EventCreateBatch
             | Op::EventDestroy
             | Op::EventElapsedTime
+            | Op::CtxGetStreamPriorityRange
             | Op::StreamCaptureInfo => {}
             _ => self.clean = false,
         }
@@ -775,16 +856,25 @@ impl<S: Read + Write> Client<S> {
         if let Some(t0) = t0 {
             count_sync_key(&sync_key(req, op), t0.elapsed());
         }
+        if status == 0 && matches!(req, Request::StreamBeginCapture { .. }) {
+            self.explicit_capture_depth = self.explicit_capture_depth.saturating_add(1);
+        }
+        if matches!(req, Request::StreamEndCapture { .. }) {
+            self.explicit_capture_depth = self.explicit_capture_depth.saturating_sub(1);
+        }
         if status != 0 {
             return Err(CudaRpcError::Cuda(status));
         }
         Ok(resp)
     }
 
-    /// Serve a bridged peer: append one pre-encoded request to this
-    /// connection's deferred pipeline, preserving arrival order. In strict
-    /// mode (`SMOLVM_CUDA_ASYNC=0`) the request round-trips instead and a
-    /// failure status is collected as this connection's sticky error.
+    /// Serve a bridged Driver-API peer: append one pre-encoded request to this
+    /// connection's deferred pipeline, preserving arrival order. Driver work
+    /// is an auto-graph boundary: libraries such as NCCL launch through
+    /// libcuda and require collective, cross-process capture coordination that
+    /// a per-process transparent segment cannot provide. In strict mode
+    /// (`SMOLVM_CUDA_ASYNC=0`) the request round-trips instead and a failure
+    /// status is collected as this connection's sticky error.
     pub fn raw_quiet(&mut self, payload: &[u8]) -> Result<()> {
         self.clean = false; // bridged driver-shim work dirties the pipeline
         if !self.defer_enabled {
@@ -797,7 +887,14 @@ impl<S: Read + Write> Client<S> {
             }
             return Ok(());
         }
-        self.enqueue_quiet(payload.to_vec())
+        self.flush_auto_segment()?;
+        if matches!(
+            crate::proto::decode_request(payload),
+            Ok(Request::StreamBeginCapture { .. })
+        ) {
+            self.explicit_capture_depth = self.explicit_capture_depth.saturating_add(1);
+        }
+        self.enqueue_quiet_direct(payload.to_vec())
     }
 
     /// Serve a bridged peer: one pre-encoded synchronous round-trip. Returns
@@ -805,15 +902,29 @@ impl<S: Read + Write> Client<S> {
     /// decode, so nothing is lost to error mapping.
     pub fn raw_call(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
         self.clean = false; // bridged driver-shim work dirties the pipeline
+        self.flush_auto_segment()?;
         static TALLY_RAW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *TALLY_RAW.get_or_init(|| std::env::var_os("SMOLVM_CUDA_COUNT_SYNC").is_some()) {
             let t0 = std::time::Instant::now();
             let r = self.raw_call_inner(payload);
             let key = format!("Bridged(0x{:02x})", payload.first().copied().unwrap_or(0));
             count_sync_key(&key, t0.elapsed());
+            if matches!(
+                crate::proto::decode_request(payload),
+                Ok(Request::StreamEndCapture { .. })
+            ) {
+                self.explicit_capture_depth = self.explicit_capture_depth.saturating_sub(1);
+            }
             return r;
         }
-        self.raw_call_inner(payload)
+        let result = self.raw_call_inner(payload);
+        if matches!(
+            crate::proto::decode_request(payload),
+            Ok(Request::StreamEndCapture { .. })
+        ) {
+            self.explicit_capture_depth = self.explicit_capture_depth.saturating_sub(1);
+        }
+        result
     }
 
     fn raw_call_inner(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
@@ -883,6 +994,32 @@ impl<S: Read + Write> Client<S> {
         }
     }
 
+    pub fn device_can_access_peer(&mut self, device: i32, peer: i32) -> Result<i32> {
+        match self.call(
+            &Request::DeviceCanAccessPeer { device, peer },
+            Op::DeviceCanAccessPeer,
+        )? {
+            Response::Count(value) => Ok(value),
+            _ => Err(CudaRpcError::Protocol("expected Count")),
+        }
+    }
+
+    pub fn device_enable_peer_access(&mut self, peer: i32, flags: u32) -> Result<()> {
+        self.call(
+            &Request::DeviceEnablePeerAccess { peer, flags },
+            Op::DeviceEnablePeerAccess,
+        )
+        .map(|_| ())
+    }
+
+    pub fn device_disable_peer_access(&mut self, peer: i32) -> Result<()> {
+        self.call(
+            &Request::DeviceDisablePeerAccess { peer },
+            Op::DeviceDisablePeerAccess,
+        )
+        .map(|_| ())
+    }
+
     pub fn device_total_mem(&mut self, device: i32) -> Result<u64> {
         match self.call(&Request::DeviceTotalMem { device }, Op::DeviceTotalMem)? {
             Response::Bytes(v) => Ok(v),
@@ -900,6 +1037,14 @@ impl<S: Read + Write> Client<S> {
     pub fn ctx_destroy(&mut self, ctx: u64) -> Result<()> {
         self.call(&Request::CtxDestroy { ctx }, Op::CtxDestroy)
             .map(|_| ())
+    }
+
+    pub fn ctx_set_current(&mut self, ctx: u64) -> Result<()> {
+        // A context bind has no output and only constrains the operations that
+        // follow it. Preserve that ordering in the deferred pipeline instead
+        // of paying a round trip for every proxy-thread bind (NCCL performs
+        // several thousand of these during ordinary collective progress).
+        self.call_deferred(&Request::CtxSetCurrent { ctx }, Op::CtxSetCurrent)
     }
 
     pub fn module_load_data(&mut self, image: &[u8]) -> Result<u64> {
@@ -1113,28 +1258,56 @@ impl<S: Read + Write> Client<S> {
     pub fn memcpy_htod(&mut self, dptr: u64, data: &[u8], stream: u64) -> Result<()> {
         // Deferred: the bytes are copied into the request, so the caller may
         // reuse its buffer immediately — synchronous-memcpy semantics hold.
-        self.call_deferred(
-            &Request::MemcpyHtoD {
-                dptr,
-                stream,
-                data: data.to_vec(),
-            },
-            Op::MemcpyHtoD,
-        )
+        // Chunk here (rather than only in the runtime shim) because CUDA
+        // libraries and static runtimes call the driver shim directly. Large
+        // embedding tensors routinely exceed the protocol's 256 MiB frame.
+        const CHUNK: usize = 64 * 1024 * 1024;
+        for (offset, chunk) in data.chunks(CHUNK).enumerate() {
+            let chunk_dptr = dptr
+                .checked_add((offset * CHUNK) as u64)
+                .ok_or(CudaRpcError::Protocol("copy address overflow"))?;
+            self.call_deferred(
+                &Request::MemcpyHtoD {
+                    dptr: chunk_dptr,
+                    stream,
+                    data: chunk.to_vec(),
+                },
+                Op::MemcpyHtoD,
+            )?;
+        }
+        Ok(())
     }
 
     pub fn memcpy_dtoh(&mut self, dptr: u64, bytes: u64, stream: u64) -> Result<Vec<u8>> {
-        match self.call(
-            &Request::MemcpyDtoH {
-                dptr,
-                bytes,
-                stream,
-            },
-            Op::MemcpyDtoH,
-        )? {
-            Response::Data(d) => Ok(d),
-            _ => Err(CudaRpcError::Protocol("expected Data")),
+        const CHUNK: u64 = 64 * 1024 * 1024;
+        let capacity = usize::try_from(bytes)
+            .map_err(|_| CudaRpcError::Protocol("copy size exceeds address space"))?;
+        let mut out = Vec::with_capacity(capacity);
+        let mut offset = 0_u64;
+        while offset < bytes {
+            let count = (bytes - offset).min(CHUNK);
+            let chunk_dptr = dptr
+                .checked_add(offset)
+                .ok_or(CudaRpcError::Protocol("copy address overflow"))?;
+            match self.call(
+                &Request::MemcpyDtoH {
+                    dptr: chunk_dptr,
+                    bytes: count,
+                    stream,
+                },
+                Op::MemcpyDtoH,
+            )? {
+                Response::Data(data) if data.len() == count as usize => {
+                    out.extend_from_slice(&data)
+                }
+                Response::Data(_) => {
+                    return Err(CudaRpcError::Protocol("invalid memcpy response length"));
+                }
+                _ => return Err(CudaRpcError::Protocol("expected Data")),
+            }
+            offset += count;
         }
+        Ok(out)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1161,6 +1334,39 @@ impl<S: Read + Write> Client<S> {
             },
             Op::LaunchKernel,
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_kernel_packed(
+        &mut self,
+        function: u64,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_bytes: u32,
+        stream: u64,
+        args: &[u8],
+    ) -> Result<()> {
+        self.call_deferred(
+            &Request::LaunchKernelPacked {
+                function,
+                grid,
+                block,
+                shared_bytes,
+                stream,
+                args: args.to_vec(),
+            },
+            Op::LaunchKernelPacked,
+        )
+    }
+
+    pub fn host_get_device_pointer(&mut self, source: u8, address: u64) -> Result<u64> {
+        match self.call(
+            &Request::HostGetDevicePointer { source, address },
+            Op::HostGetDevicePointer,
+        )? {
+            Response::Handle(pointer) => Ok(pointer),
+            _ => Err(CudaRpcError::Protocol("expected Handle")),
+        }
     }
 
     /// Exchange the serving thread's stream-capture interaction mode; returns
@@ -1193,13 +1399,18 @@ impl<S: Read + Write> Client<S> {
         )
     }
 
-    /// Fire-and-forget end-capture: the guest supplies a virtual graph handle
-    /// it minted; the host maps it to the real captured graph when it drains.
-    pub fn stream_end_capture_deferred(&mut self, stream: u64, graph_vh: u64) -> Result<()> {
-        self.call_deferred(
+    /// End capture synchronously so capture invalidation is reported by
+    /// `cudaStreamEndCapture` instead of being deferred until a later fence.
+    /// Returns the real node count with the same response, avoiding the extra
+    /// graph-introspection RTT frameworks otherwise pay after every capture.
+    pub fn stream_end_capture(&mut self, stream: u64, graph_vh: u64) -> Result<u64> {
+        match self.call(
             &Request::StreamEndCapture { stream, graph_vh },
             Op::StreamEndCapture,
-        )
+        )? {
+            Response::Pair(_, node_count) => Ok(node_count),
+            _ => Err(CudaRpcError::Protocol("expected Pair")),
+        }
     }
 
     /// `(capture_status, capture_id)` straight from the host driver.
@@ -1222,6 +1433,18 @@ impl<S: Read + Write> Client<S> {
         )
     }
 
+    /// Instantiate synchronously: unlike graph launch, instantiation is a
+    /// validation API and must return malformed/invalid graph errors directly.
+    pub fn graph_instantiate(&mut self, graph: u64, exec_vh: u64) -> Result<()> {
+        match self.call(
+            &Request::GraphInstantiate { graph, exec_vh },
+            Op::GraphInstantiate,
+        )? {
+            Response::Handle(_) => Ok(()),
+            _ => Err(CudaRpcError::Protocol("expected Handle")),
+        }
+    }
+
     /// Replay an instantiated graph — the hot path (one message replays every
     /// captured kernel), so it pipelines like a kernel launch.
     pub fn graph_launch(&mut self, graph_exec: u64, stream: u64) -> Result<()> {
@@ -1229,6 +1452,19 @@ impl<S: Read + Write> Client<S> {
             &Request::GraphLaunch { graph_exec, stream },
             Op::GraphLaunch,
         )
+    }
+
+    /// Patch an instantiated graph from a topology-compatible captured graph.
+    /// The returned value is `cudaGraphExecUpdateResult`; transport/driver
+    /// failures remain ordinary RPC errors.
+    pub fn graph_exec_update(&mut self, graph_exec: u64, graph: u64) -> Result<i32> {
+        match self.call(
+            &Request::GraphExecUpdate { graph_exec, graph },
+            Op::GraphExecUpdate,
+        )? {
+            Response::Count(result) => Ok(result),
+            _ => Err(CudaRpcError::Protocol("expected Count")),
+        }
     }
 
     /// Node count of a captured graph (count-only query; PyTorch uses it to
@@ -1277,6 +1513,68 @@ impl<S: Read + Write> Client<S> {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn memcpy_peer_async(
+        &mut self,
+        dst: u64,
+        dst_device: i32,
+        src: u64,
+        src_device: i32,
+        bytes: u64,
+        stream: u64,
+    ) -> Result<()> {
+        self.call_deferred(
+            &Request::MemcpyPeerAsync {
+                dst,
+                dst_device,
+                src,
+                src_device,
+                bytes,
+                stream,
+            },
+            Op::MemcpyPeerAsync,
+        )
+    }
+
+    pub fn ipc_get_mem_handle(&mut self, dptr: u64) -> Result<Vec<u8>> {
+        match self.call(&Request::IpcGetMemHandle { dptr }, Op::IpcGetMemHandle)? {
+            Response::Data(handle) if handle.len() == 64 => Ok(handle),
+            _ => Err(CudaRpcError::Protocol("bad IPC memory handle")),
+        }
+    }
+
+    pub fn ipc_open_mem_handle(&mut self, handle: Vec<u8>, flags: u32) -> Result<u64> {
+        match self.call(
+            &Request::IpcOpenMemHandle { handle, flags },
+            Op::IpcOpenMemHandle,
+        )? {
+            Response::Dptr(dptr) => Ok(dptr),
+            _ => Err(CudaRpcError::Protocol("bad IPC memory pointer")),
+        }
+    }
+
+    pub fn ipc_close_mem_handle(&mut self, dptr: u64) -> Result<()> {
+        self.call(&Request::IpcCloseMemHandle { dptr }, Op::IpcCloseMemHandle)
+            .map(|_| ())
+    }
+
+    pub fn ipc_get_event_handle(&mut self, event: u64) -> Result<Vec<u8>> {
+        match self.call(&Request::IpcGetEventHandle { event }, Op::IpcGetEventHandle)? {
+            Response::Data(handle) if handle.len() == 64 => Ok(handle),
+            _ => Err(CudaRpcError::Protocol("bad IPC event handle")),
+        }
+    }
+
+    pub fn ipc_open_event_handle(&mut self, handle: Vec<u8>) -> Result<u64> {
+        match self.call(
+            &Request::IpcOpenEventHandle { handle },
+            Op::IpcOpenEventHandle,
+        )? {
+            Response::Handle(event) => Ok(event),
+            _ => Err(CudaRpcError::Protocol("bad IPC event")),
+        }
+    }
+
     pub fn ctx_synchronize(&mut self) -> Result<()> {
         // Clean-pipeline elision: nothing was issued since a context-wide
         // sync completed, so there is nothing to wait for — skip the trip.
@@ -1297,6 +1595,16 @@ impl<S: Read + Write> Client<S> {
         match self.take_sticky() {
             0 => Ok(()),
             code => Err(CudaRpcError::Cuda(code)),
+        }
+    }
+
+    pub fn ctx_get_stream_priority_range(&mut self) -> Result<(i32, i32)> {
+        match self.call(
+            &Request::CtxGetStreamPriorityRange,
+            Op::CtxGetStreamPriorityRange,
+        )? {
+            Response::Pair(least, greatest) => Ok((least as i64 as i32, greatest as i64 as i32)),
+            _ => Err(CudaRpcError::Protocol("expected Pair")),
         }
     }
 
@@ -1379,8 +1687,10 @@ impl<S: Read + Write> Client<S> {
             Op::FuncGetParamInfo,
         )? {
             Response::Data(d) if d.len() % 4 == 0 => Ok(d
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| u32::from_le_bytes(*c))
                 .collect()),
             _ => Err(CudaRpcError::Protocol("expected u32-array Data")),
         }
@@ -1470,6 +1780,25 @@ impl<S: Read + Write> Client<S> {
         match self.call(&Request::EventCreate { flags }, Op::EventCreate)? {
             Response::Handle(h) => Ok(h),
             _ => Err(CudaRpcError::Protocol("expected Handle")),
+        }
+    }
+
+    /// Provision several raw host events with identical flags in one blocking
+    /// call. Individual event use and destruction remain unchanged; this only
+    /// amortizes the synchronous handle-return path used by high-churn runtimes.
+    pub fn event_create_batch(&mut self, flags: u32, count: u32) -> Result<Vec<u64>> {
+        match self.call(
+            &Request::EventCreateBatch { flags, count },
+            Op::EventCreateBatch,
+        )? {
+            Response::Data(bytes) if bytes.len() == count as usize * 8 => Ok(bytes
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|chunk| u64::from_le_bytes(*chunk))
+                .collect()),
+            Response::Data(_) => Err(CudaRpcError::Protocol("invalid event batch length")),
+            _ => Err(CudaRpcError::Protocol("expected Data")),
         }
     }
 
@@ -1918,5 +2247,101 @@ mod tests {
         expect.push(QUIET_PREFIX);
         expect.extend_from_slice(&payload);
         assert_eq!(direct.wbuf, expect);
+    }
+
+    #[test]
+    fn context_binding_is_ordered_without_a_round_trip() {
+        let mut client: Client<std::io::Cursor<Vec<u8>>> =
+            Client::new(std::io::Cursor::new(Vec::new()));
+        client.set_defer_enabled(true);
+        client.ctx_set_current(0xCAFE).unwrap();
+
+        let payload = encode_request(&Request::CtxSetCurrent { ctx: 0xCAFE });
+        let mut expected = ((payload.len() + 1) as u32).to_le_bytes().to_vec();
+        expected.push(QUIET_PREFIX);
+        expected.extend_from_slice(&payload);
+        assert_eq!(client.wbuf, expected);
+        assert_eq!(client.deferred, 1);
+    }
+
+    #[test]
+    fn auto_graph_groups_eligible_ops_at_the_boundary() {
+        let mut c: Client<std::io::Cursor<Vec<u8>>> = Client::new(std::io::Cursor::new(Vec::new()));
+        c.auto_graph = true;
+        c.launch_kernel(1, [1, 1, 1], [1, 1, 1], 0, 7, &[]).unwrap();
+        c.launch_kernel(2, [1, 1, 1], [1, 1, 1], 0, 7, &[]).unwrap();
+        assert!(c.journal.is_empty(), "segment stays local until a boundary");
+        let (journal, _) = c.take_journal();
+        assert_eq!(journal.len(), 1);
+        match crate::proto::decode_request(&journal[0]).unwrap() {
+            Request::AutoGraphSegment { ops } => assert_eq!(ops.len(), 2),
+            other => panic!("expected auto graph segment, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bridged_driver_work_is_an_auto_graph_boundary() {
+        let mut c: Client<std::io::Cursor<Vec<u8>>> = Client::new(std::io::Cursor::new(Vec::new()));
+        c.auto_graph = true;
+        c.launch_kernel(1, [1, 1, 1], [1, 1, 1], 0, 7, &[]).unwrap();
+        c.launch_kernel(2, [1, 1, 1], [1, 1, 1], 0, 7, &[]).unwrap();
+        let driver = encode_request(&Request::LaunchKernel {
+            function: 3,
+            grid: [1, 1, 1],
+            block: [1, 1, 1],
+            shared_bytes: 0,
+            stream: 7,
+            params: Vec::new(),
+        });
+        c.raw_quiet(&driver).unwrap();
+
+        let (journal, _) = c.take_journal();
+        assert_eq!(journal.len(), 2);
+        assert!(matches!(
+            crate::proto::decode_request(&journal[0]),
+            Ok(Request::AutoGraphSegment { ref ops }) if ops.len() == 2
+        ));
+        assert!(matches!(
+            crate::proto::decode_request(&journal[1]),
+            Ok(Request::LaunchKernel { function: 3, .. })
+        ));
+    }
+
+    #[test]
+    fn synchronization_events_are_auto_graph_boundaries() {
+        let mut c: Client<std::io::Cursor<Vec<u8>>> = Client::new(std::io::Cursor::new(Vec::new()));
+        c.auto_graph = true;
+        c.launch_kernel(1, [1, 1, 1], [1, 1, 1], 0, 7, &[]).unwrap();
+        c.launch_kernel(2, [1, 1, 1], [1, 1, 1], 0, 7, &[]).unwrap();
+        c.event_record(9, 7).unwrap();
+
+        let (journal, _) = c.take_journal();
+        assert_eq!(journal.len(), 2);
+        assert!(matches!(
+            crate::proto::decode_request(&journal[0]),
+            Ok(Request::AutoGraphSegment { ref ops }) if ops.len() == 2
+        ));
+        assert!(matches!(
+            crate::proto::decode_request(&journal[1]),
+            Ok(Request::EventRecord {
+                event: 9,
+                stream: 7
+            })
+        ));
+    }
+
+    #[test]
+    fn explicit_capture_is_never_nested_in_auto_graph() {
+        let mut c: Client<std::io::Cursor<Vec<u8>>> = Client::new(std::io::Cursor::new(Vec::new()));
+        c.auto_graph = true;
+        c.stream_begin_capture_deferred(7, 2).unwrap();
+        c.launch_kernel(1, [1, 1, 1], [1, 1, 1], 0, 7, &[]).unwrap();
+        c.launch_kernel(2, [1, 1, 1], [1, 1, 1], 0, 7, &[]).unwrap();
+        let (journal, _) = c.take_journal();
+        assert_eq!(journal.len(), 3);
+        assert!(journal.iter().all(|payload| !matches!(
+            crate::proto::decode_request(payload),
+            Ok(Request::AutoGraphSegment { .. })
+        )));
     }
 }

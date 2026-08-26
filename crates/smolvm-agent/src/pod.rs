@@ -967,6 +967,7 @@ fn write_pod_bundle(
     crate::rosetta::inject_into_container(&mut spec);
     crate::forkpoint::inject_into_container(&mut spec);
     crate::cuda::inject_into_container(&mut spec, &pod.rootfs);
+    crate::vulkan::inject_into_container(&mut spec, &pod.rootfs);
 
     // Graft the container's securityContext from the host OCI spec so the
     // container runs with exactly what Kubernetes requested. OciSpec models
@@ -1491,7 +1492,7 @@ fn spawn_pod_exec(
     use_process_spec: bool,
 ) -> Result<(std::process::Child, Option<crate::pty::PtyMaster>), Box<dyn std::error::Error>> {
     if !use_process_spec {
-        return crate::spawn_exec_in_container(id, launch, entry.tty);
+        return crate::spawn_exec_in_container(id, launch, entry.tty, false);
     }
     let bundle = pod_dir(id).join("bundle");
     std::fs::create_dir_all(&bundle)?;

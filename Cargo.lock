@@ -876,6 +876,7 @@ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer",
  "crypto-common",
+ "subtle",
 ]
 
 [[package]]
@@ -1256,9 +1257,9 @@ dependencies = [
 
 [[package]]
 name = "h2"
-version = "0.4.14"
+version = "0.4.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "171fefbc92fe4a4de27e0698d6a5b392d6a0e333506bc49133760b3bcf948733"
+checksum = "a9f37a958b41b3b19ee2707c06439c0e9e547e847223eb791ecb0cb821c65e27"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -1359,6 +1360,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+dependencies = [
+ "digest",
+]
+
+[[package]]
 name = "home"
 version = "0.5.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1453,7 +1463,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
- "webpki-roots",
+ "webpki-roots 1.0.7",
 ]
 
 [[package]]
@@ -2609,7 +2619,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams",
  "web-sys",
- "webpki-roots",
+ "webpki-roots 1.0.7",
 ]
 
 [[package]]
@@ -2713,6 +2723,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
 dependencies = [
  "aws-lc-rs",
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -2985,7 +2996,7 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
 name = "smolfile"
-version = "1.7.5"
+version = "1.13.0"
 dependencies = [
  "serde",
  "smolvm-protocol",
@@ -3011,7 +3022,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm"
-version = "1.7.5"
+version = "1.13.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -3070,7 +3081,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-agent"
-version = "1.7.5"
+version = "1.13.0"
 dependencies = [
  "flate2",
  "lazy_static",
@@ -3083,6 +3094,7 @@ dependencies = [
  "serde_json",
  "smolvm-oci-layer",
  "smolvm-protocol",
+ "smolvm-s3fs",
  "tar",
  "tempfile",
  "tracing",
@@ -3092,19 +3104,20 @@ dependencies = [
 
 [[package]]
 name = "smolvm-cuda"
-version = "1.7.5"
+version = "1.13.0"
 dependencies = [
+ "getrandom 0.3.4",
  "libc",
  "libloading",
 ]
 
 [[package]]
 name = "smolvm-cuda-codegen"
-version = "1.7.5"
+version = "1.13.0"
 
 [[package]]
 name = "smolvm-cuda-guest"
-version = "1.7.5"
+version = "1.13.0"
 dependencies = [
  "smolvm-cuda",
  "vsock",
@@ -3112,7 +3125,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-cuda-shim"
-version = "1.7.5"
+version = "1.13.0"
 dependencies = [
  "libc",
  "smolvm-cuda",
@@ -3121,7 +3134,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-cudart-shim"
-version = "1.7.5"
+version = "1.13.0"
 dependencies = [
  "libc",
  "smolvm-cuda",
@@ -3130,7 +3143,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-network"
-version = "1.7.5"
+version = "1.13.0"
 dependencies = [
  "crossbeam-queue",
  "humantime",
@@ -3138,19 +3151,20 @@ dependencies = [
  "polling",
  "smoltcp",
  "socket2",
+ "tempfile",
  "tracing",
 ]
 
 [[package]]
 name = "smolvm-nvml-shim"
-version = "1.7.5"
+version = "1.13.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "smolvm-oci-layer"
-version = "1.7.5"
+version = "1.13.0"
 dependencies = [
  "flate2",
  "libc",
@@ -3163,7 +3177,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-pack"
-version = "1.7.5"
+version = "1.13.0"
 dependencies = [
  "crc32fast",
  "dirs",
@@ -3182,7 +3196,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-protocol"
-version = "1.7.5"
+version = "1.13.0"
 dependencies = [
  "base64",
  "serde",
@@ -3192,7 +3206,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-registry"
-version = "1.7.5"
+version = "1.13.0"
 dependencies = [
  "bytes",
  "dirs",
@@ -3210,6 +3224,17 @@ dependencies = [
  "tokio-util",
  "tracing",
  "wiremock",
+]
+
+[[package]]
+name = "smolvm-s3fs"
+version = "1.13.0"
+dependencies = [
+ "hmac",
+ "libc",
+ "sha2",
+ "tracing",
+ "ureq",
 ]
 
 [[package]]
@@ -3868,6 +3893,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
+name = "ureq"
+version = "2.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "02d1a66277ed75f640d608235660df48c8e3c19f3b4edb6a263315626cc3c01d"
+dependencies = [
+ "base64",
+ "flate2",
+ "log",
+ "once_cell",
+ "rustls",
+ "rustls-pki-types",
+ "url",
+ "webpki-roots 0.26.11",
+]
+
+[[package]]
 name = "url"
 version = "2.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4161,6 +4202,15 @@ checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "0.26.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
+dependencies = [
+ "webpki-roots 1.0.7",
 ]
 
 [[package]]

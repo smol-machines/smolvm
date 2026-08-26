@@ -137,7 +137,10 @@ pub fn recover_unreachable_machine(record: &VmRecord) -> crate::Result<()> {
     recover_unreachable_machine_in_db(record, &db)
 }
 
-fn recover_unreachable_machine_in_db(record: &VmRecord, db: &SmolvmDb) -> crate::Result<()> {
+pub(crate) fn recover_unreachable_machine_in_db(
+    record: &VmRecord,
+    db: &SmolvmDb,
+) -> crate::Result<()> {
     if let Some(pid) = record.pid {
         if crate::process::is_alive(pid) {
             if !crate::process::is_our_process_strict(pid, record.pid_start_time) {

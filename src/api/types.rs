@@ -130,8 +130,13 @@ pub struct ResourceSpec {
 // ============================================================================
 
 /// Request to execute a command in a machine.
+///
+/// `deny_unknown_fields`: an unknown or mis-cased field is a hard 400, not a
+/// silent no-op. This matters for the safety fields (`timeoutSecs`, etc.) — a
+/// caller who writes `timeout_secs` must be told, not left running an untrusted
+/// command with no timeout because the field was quietly dropped.
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ExecRequest {
     /// Command and arguments.
     #[schema(example = json!(["echo", "hello"]))]
@@ -282,8 +287,11 @@ pub struct WarmArtifactResponse {
 }
 
 /// Request to run a command in an image.
+///
+/// `deny_unknown_fields`: like `ExecRequest`, a mis-cased safety field
+/// (`timeout_secs` for `timeoutSecs`) is a 400, never a silent drop.
 #[derive(Debug, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RunRequest {
     /// Image to run in.
     #[schema(example = "python:3.12-alpine")]
@@ -458,6 +466,32 @@ pub struct CapacityResponse {
     /// in-memory VM state) was wiped, so it can prune the now-stale pool records.
     #[serde(default)]
     pub boot_id: String,
+    /// CUDA devices currently visible to this runtime. Omitted when NVML is
+    /// unavailable, no CUDA device is visible, or the latest sample failed.
+    /// Device ordinals use the same CUDA-visible ordering as
+    /// `SMOLVM_CUDA_DEVICE` and fork-pool admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cuda_devices: Option<Vec<CudaDeviceCapacity>>,
+}
+
+/// Live capacity and identity for one host CUDA device.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CudaDeviceCapacity {
+    /// CUDA-visible ordinal used to assign a machine or pool to this device.
+    pub ordinal: u32,
+    /// Stable NVIDIA GPU or MIG UUID.
+    pub uuid: String,
+    /// Device model reported by NVML.
+    pub name: String,
+    /// Current streaming-multiprocessor utilization percentage.
+    pub utilization_percent: f64,
+    /// Current device-memory usage in MiB.
+    pub memory_used_mib: u64,
+    /// Current free device memory in MiB.
+    pub memory_free_mib: u64,
+    /// Total device-memory capacity in MiB.
+    pub memory_total_mib: u64,
 }
 
 // ============================================================================
@@ -626,6 +660,10 @@ pub struct MachineInfo {
     pub ports: Vec<PortSpec>,
     /// Whether outbound network access is enabled.
     pub network: bool,
+    /// Whether Vulkan/graphics GPU acceleration is enabled for this machine.
+    pub gpu: bool,
+    /// Whether transparent CUDA remoting is enabled for this machine.
+    pub cuda: bool,
     /// Network backend the machine runs (`tsi` or `virtio-net`). Echoes back
     /// what `create` accepted; omitted when `create` left it unset (the
     /// launch then picks the contextual default — `virtio-net` under
@@ -694,6 +732,41 @@ pub struct MachineInfo {
     pub disk_used_mb: Option<u64>,
     /// Creation timestamp (seconds since Unix epoch).
     pub created_at: u64,
+}
+
+/// One egress denial: the machine's egress policy refused an outbound
+/// connect or sendto. These are the machine's only record of blocked
+/// traffic, read from the VMM's log.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EgressDenialInfo {
+    /// Denial time (RFC 3339, microsecond precision), or empty when the
+    /// log line carried no parseable timestamp.
+    #[schema(example = "2026-08-13T02:31:05.123456Z")]
+    pub timestamp: String,
+    /// The refused operation: `connect` (TCP) or `sendto` (UDP).
+    #[schema(example = "connect")]
+    pub operation: String,
+    /// The destination the guest tried to reach.
+    #[schema(example = "93.184.215.14:443")]
+    pub dest: String,
+}
+
+impl From<crate::agent::EgressDenial> for EgressDenialInfo {
+    fn from(d: crate::agent::EgressDenial) -> Self {
+        Self {
+            timestamp: d.timestamp,
+            operation: d.operation,
+            dest: d.dest,
+        }
+    }
+}
+
+/// Egress denial events response.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct EgressEventsResponse {
+    /// Denials oldest-first, capped by the `limit` query parameter.
+    pub events: Vec<EgressDenialInfo>,
 }
 
 /// List machines response.
@@ -824,6 +897,11 @@ pub struct ForkRequest {
     /// Name for the new clone machine.
     #[schema(example = "clone-1")]
     pub name: String,
+    /// Materialize the restored clone as a new checkpoint source so it can be
+    /// forked again. This pays one eager guest-memory copy at clone boot;
+    /// descendants remain copy-on-write.
+    #[serde(default)]
+    pub forkable: bool,
     /// Pin the clone's inbound port forwards. Without this, the golden's
     /// forwards are remapped to freshly-allocated host ports so the clone does
     /// not collide with the still-running golden or sibling clones.
@@ -1112,6 +1190,45 @@ pub struct ForkLeaseInfo {
     /// Activation failure, when present.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+#[cfg(test)]
+mod deny_unknown_field_tests {
+    use super::*;
+
+    /// The correct camelCase `timeoutSecs` deserializes and applies.
+    #[test]
+    fn exec_request_accepts_camelcase_timeout() {
+        let req: ExecRequest = serde_json::from_value(
+            serde_json::json!({"command": ["sleep", "30"], "timeoutSecs": 5}),
+        )
+        .expect("camelCase timeoutSecs should parse");
+        assert_eq!(req.timeout_secs, Some(5));
+    }
+
+    /// A mis-cased safety field is REJECTED, not silently dropped — otherwise an
+    /// untrusted command runs with no timeout because the caller wrote
+    /// `timeout_secs`. This is the regression this test guards.
+    #[test]
+    fn exec_request_rejects_snake_case_timeout() {
+        let err = serde_json::from_value::<ExecRequest>(
+            serde_json::json!({"command": ["sleep", "30"], "timeout_secs": 5}),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("timeout_secs"),
+            "error should name the offending field: {err}"
+        );
+    }
+
+    /// Any unknown field is a hard error, not ignored.
+    #[test]
+    fn run_request_rejects_unknown_field() {
+        assert!(serde_json::from_value::<RunRequest>(
+            serde_json::json!({"image": "alpine", "command": ["true"], "bogus": 1})
+        )
+        .is_err());
+    }
 }
 
 #[cfg(test)]

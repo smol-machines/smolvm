@@ -6,7 +6,7 @@
 //! libraries and load them from the cache.
 
 use crate::util::{libkrun_filename, libkrunfw_filename};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Function pointers loaded from libkrun.
 ///
@@ -21,6 +21,9 @@ pub struct KrunFunctions {
     // Wrapped in `Option` so `Drop` can `take()` and `forget()` it, keeping
     // libkrunfw resident (never unloaded) for any libkrun-owned references.
     _fw_handle: Option<libloading::Library>,
+    // Retained so feature-specific preflights can validate the exact libkrun
+    // that supplied the function table rather than searching the host again.
+    _lib_dir: PathBuf,
     pub set_log_level: unsafe extern "C" fn(u32) -> i32,
     pub create_ctx: unsafe extern "C" fn() -> i32,
     pub free_ctx: unsafe extern "C" fn(u32),
@@ -59,6 +62,26 @@ pub struct KrunFunctions {
     >,
     pub get_egress_handle: Option<unsafe extern "C" fn(u32) -> *mut libc::c_void>,
     pub set_gpu_options2: Option<unsafe extern "C" fn(u32, u32, u64) -> i32>,
+    /// Add a virtio-gpu scanout (display) of the given width/height.
+    ///
+    /// Without at least one display the device reports `num_scanouts = 0`, the
+    /// guest virtio-gpu driver creates no connector, and `/dev/dri/card0` is a
+    /// render node only — so DRM compositors (Hyprland, GNOME, KDE) refuse to
+    /// start with "not a KMS device". `None` on libkrun builds predating the API.
+    pub add_display: Option<unsafe extern "C" fn(u32, u32, u32) -> i32>,
+    /// Register a host display backend that consumes scanout frames.
+    ///
+    /// `krun_add_display` only *describes* a display. Without a backend
+    /// libkrun installs a no-op whose `configure_scanout`/`alloc_frame`/
+    /// `present_frame` all fail, so the guest's first page flip never
+    /// completes and a compositor blocks on it forever. `None` on libkrun
+    /// builds predating the API.
+    pub set_display_backend: Option<unsafe extern "C" fn(u32, *const libc::c_void, usize) -> i32>,
+    /// Registers a virtio-input device from a config vtable and an event
+    /// provider vtable; present only in libkrun builds with the input feature.
+    pub add_input_device: Option<
+        unsafe extern "C" fn(u32, *const libc::c_void, usize, *const libc::c_void, usize) -> i32,
+    >,
     /// Retrieve guest RAM regions (`gpa_start, host_va, len` triples) for
     /// zero-copy CUDA transfers. `None` on libkrun builds that predate the API.
     pub get_guest_ram: Option<unsafe extern "C" fn(u32, *mut u64, u32, *mut u64) -> i32>,
@@ -151,6 +174,9 @@ impl KrunFunctions {
         let add_net_unixstream = load_optional_sym!("krun_add_net_unixstream");
         let get_egress_handle = load_optional_sym!("krun_get_egress_handle");
         let set_gpu_options2 = load_optional_sym!("krun_set_gpu_options2");
+        let add_display = load_optional_sym!("krun_add_display");
+        let set_display_backend = load_optional_sym!("krun_set_display_backend");
+        let add_input_device = load_optional_sym!("krun_add_input_device");
         let get_guest_ram = load_optional_sym!("krun_get_guest_ram");
         let set_control_socket = load_optional_sym!("krun_set_control_socket");
         let set_snapshot = load_optional_sym!("krun_set_snapshot");
@@ -159,6 +185,7 @@ impl KrunFunctions {
         Ok(Self {
             _handle: handle,
             _fw_handle: Some(fw_handle),
+            _lib_dir: lib_dir.to_path_buf(),
             set_log_level,
             create_ctx,
             free_ctx,
@@ -177,6 +204,9 @@ impl KrunFunctions {
             add_net_unixstream,
             get_egress_handle,
             set_gpu_options2,
+            add_display,
+            set_display_backend,
+            add_input_device,
             get_guest_ram,
             set_control_socket,
             set_snapshot,
@@ -186,6 +216,26 @@ impl KrunFunctions {
 }
 
 impl KrunFunctions {
+    /// Validate the optional host libraries needed by libkrun's Vulkan path.
+    ///
+    /// Linux release artifacts deliberately remove libkrun's hard
+    /// `libvirglrenderer.so.1` dependency so CPU- and CUDA-only machines still
+    /// boot on hosts without a Vulkan stack. That makes the dependency lazy,
+    /// but calling `krun_set_gpu_options2` with an absent or ABI-incompatible
+    /// virglrenderer would otherwise terminate the VMM at symbol resolution.
+    /// Resolve the entire libkrun object with `RTLD_NOW` first and return an
+    /// actionable error while the caller can still abort cleanly.
+    pub fn ensure_gpu_runtime(&self) -> Result<(), String> {
+        #[cfg(target_os = "linux")]
+        {
+            ensure_linux_gpu_dependencies(&self._lib_dir)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Ok(())
+        }
+    }
+
     /// Redirect the guest console output to `path`, using the upstream
     /// virtio-console API (the replacement for the removed
     /// `krun_set_console_output`). Returns libkrun's rc, or a negative value if
@@ -275,8 +325,8 @@ fn dlerror_message() -> String {
 fn preload_linux_gpu_dependencies(lib_dir: &Path) {
     for lib_name in &["libepoxy.so.0", "libvirglrenderer.so.1"] {
         let path = lib_dir.join(lib_name);
-        if path.exists() {
-            dlopen_global(&path);
+        let loaded = if path.exists() {
+            dlopen_global(&path)
         } else {
             // Not bundled: try the host's copy by soname. A GPU host has
             // virglrenderer (and its X11/DRM/Mesa chain) installed system-wide;
@@ -284,7 +334,10 @@ fn preload_linux_gpu_dependencies(lib_dir: &Path) {
             // symbols resolve when the GPU path runs. Best-effort — on a non-GPU
             // host it simply isn't found, which is fine: those symbols are never
             // called, and the libkrun NEEDED entry was stripped at package time.
-            dlopen_global_soname(lib_name);
+            dlopen_global_soname(lib_name)
+        };
+        if let Err(error) = loaded {
+            tracing::debug!(library = lib_name, %error, "optional GPU dependency unavailable");
         }
     }
 
@@ -298,25 +351,60 @@ fn preload_linux_gpu_dependencies(lib_dir: &Path) {
 }
 
 #[cfg(target_os = "linux")]
-fn dlopen_global(path: &Path) -> bool {
+fn ensure_linux_gpu_dependencies(lib_dir: &Path) -> Result<(), String> {
+    // Epoxy is commonly a transitive virglrenderer dependency. Preload a
+    // bundled copy when present, but let virglrenderer's own loader diagnose a
+    // missing system copy so statically-linked builds remain valid.
+    let epoxy = lib_dir.join("libepoxy.so.0");
+    if epoxy.exists() {
+        dlopen_global(&epoxy).map_err(linux_gpu_runtime_error)?;
+    } else {
+        let _ = dlopen_global_soname("libepoxy.so.0");
+    }
+
+    let virgl = lib_dir.join("libvirglrenderer.so.1");
+    if virgl.exists() {
+        dlopen_global(&virgl).map_err(linux_gpu_runtime_error)?;
+    } else {
+        dlopen_global_soname("libvirglrenderer.so.1").map_err(linux_gpu_runtime_error)?;
+    }
+
+    // Force every lazy undefined symbol in this exact libkrun to resolve now.
+    // This catches an installed virglrenderer with the wrong ABI (the observed
+    // failure was a missing `virgl_set_debug_callback`) before the first GPU
+    // FFI call can make the dynamic linker abort the VMM process.
+    dlopen_now(&lib_dir.join(libkrun_filename())).map_err(linux_gpu_runtime_error)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_gpu_runtime_error(detail: String) -> String {
+    format!(
+        "Linux Vulkan GPU support (--gpu) requires a compatible \
+         libvirglrenderer.so.1 and host Vulkan driver. Install virglrenderer \
+         plus your Mesa/Vulkan driver (Debian/Ubuntu: `apt install \
+         virglrenderer0 mesa-vulkan-drivers`; Arch: `pacman -S virglrenderer`): {detail}"
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn dlopen_global(path: &Path) -> Result<(), String> {
     use std::ffi::CString;
-    let Ok(path_c) = CString::new(path.to_string_lossy().as_bytes()) else {
-        return false;
-    };
+    let path_c = CString::new(path.to_string_lossy().as_bytes())
+        .map_err(|_| format!("library path contains NUL: {}", path.display()))?;
 
     unsafe {
+        libc::dlerror();
         let handle = libc::dlopen(path_c.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL);
         if handle.is_null() {
-            tracing::warn!(
-                path = %path.display(),
-                error = %dlerror_message(),
-                "failed to preload library"
-            );
-            return false;
+            return Err(format!(
+                "failed to load {}: {}",
+                path.display(),
+                dlerror_message()
+            ));
         }
     }
 
-    true
+    Ok(())
 }
 
 /// Load a library by soname (no path), letting the dynamic loader search the
@@ -324,10 +412,55 @@ fn dlopen_global(path: &Path) -> bool {
 /// system-installed virglrenderer when it isn't bundled. Best-effort: on a
 /// non-GPU host the library is absent, which is expected and not an error.
 #[cfg(target_os = "linux")]
-fn dlopen_global_soname(soname: &str) -> bool {
+fn dlopen_global_soname(soname: &str) -> Result<(), String> {
     use std::ffi::CString;
-    let Ok(soname_c) = CString::new(soname) else {
-        return false;
-    };
-    unsafe { !libc::dlopen(soname_c.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL).is_null() }
+    let soname_c = CString::new(soname).map_err(|_| format!("invalid library name: {soname}"))?;
+    unsafe {
+        libc::dlerror();
+        let handle = libc::dlopen(soname_c.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL);
+        if handle.is_null() {
+            Err(format!("failed to load {soname}: {}", dlerror_message()))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn dlopen_now(path: &Path) -> Result<(), String> {
+    use std::ffi::CString;
+    let path_c = CString::new(path.to_string_lossy().as_bytes())
+        .map_err(|_| format!("library path contains NUL: {}", path.display()))?;
+    unsafe {
+        libc::dlerror();
+        let handle = libc::dlopen(path_c.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
+        if handle.is_null() {
+            Err(format!(
+                "{} is incompatible with the installed Vulkan stack: {}",
+                path.display(),
+                dlerror_message()
+            ))
+        } else {
+            // `KrunFunctions` retains the original libkrun handle. Balance only
+            // this validation reference; the object and resolved symbols remain
+            // resident through `_handle`.
+            libc::dlclose(handle);
+            Ok(())
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_gpu_tests {
+    use super::linux_gpu_runtime_error;
+
+    #[test]
+    fn gpu_runtime_error_is_actionable() {
+        let error = linux_gpu_runtime_error("undefined symbol: virgl_example".to_string());
+        assert!(error.contains("--gpu"));
+        assert!(error.contains("libvirglrenderer.so.1"));
+        assert!(error.contains("apt install"));
+        assert!(error.contains("pacman -S"));
+        assert!(error.contains("virgl_example"));
+    }
 }

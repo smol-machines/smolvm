@@ -139,8 +139,6 @@ fn inject_sockets_into_container(spec: &mut crate::oci::OciSpec, sockets: &[Publ
 /// socket and relay. Mirrors the Docker bridge but with a caller-supplied path.
 #[cfg(target_os = "linux")]
 fn serve_expose(sock: &PublishedSocket) -> io::Result<()> {
-    use std::os::unix::net::UnixStream;
-
     let listener = crate::vsock::VsockListener::bind(sock.vsock_port)?;
     tracing::info!(
         vsock_port = sock.vsock_port,
@@ -161,7 +159,7 @@ fn serve_expose(sock: &PublishedSocket) -> io::Result<()> {
         let guest_path = sock.guest_path.clone();
         thread::Builder::new()
             .name("expose-sock-fwd".into())
-            .spawn(move || match UnixStream::connect(&guest_path) {
+            .spawn(move || match dial_app(&guest_path) {
                 Ok(app) => {
                     if let Err(e) = relay(host_conn, app) {
                         tracing::debug!(error = %e, "expose-socket relay ended");
@@ -606,5 +604,33 @@ mod tests {
         server_thread.join().unwrap();
         relay_thread.join().unwrap();
         assert_eq!(&resp, b"pong");
+    }
+}
+
+/// Dial the guest app's socket where the workload can actually see it.
+///
+/// On an `--image` machine the app runs under crun with its own mount
+/// namespace, so the socket it binds does not exist in the agent's namespace at
+/// all — a direct connect finds nothing and the host client hangs waiting for a
+/// server that is listening a namespace away. With no container running the
+/// agent's own namespace IS the workload's, and the direct connect is right.
+// Same gate as the bridge that calls it.
+#[cfg(target_os = "linux")]
+fn dial_app(guest_path: &str) -> io::Result<std::os::unix::net::UnixStream> {
+    match crate::nsfile::GuestNs::for_workload() {
+        crate::nsfile::GuestNs::Container(ns) => ns
+            .connect(guest_path)
+            .map_err(|e| io::Error::new(io::ErrorKind::NotConnected, e)),
+        // Carry WHY we are dialing here into the error. A bare "not reachable"
+        // cannot distinguish "the app is not listening" from "the app is
+        // listening in a container we declined to enter", which is the whole
+        // failure this path exists to fix.
+        crate::nsfile::GuestNs::Root(reason) => std::os::unix::net::UnixStream::connect(guest_path)
+            .map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("{e} (dialed in the VM namespace: {reason})"),
+                )
+            }),
     }
 }

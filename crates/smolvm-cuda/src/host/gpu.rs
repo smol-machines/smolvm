@@ -26,12 +26,12 @@ const CUDA_ERROR_INVALID_VALUE: c_int = 1;
 const CUDA_ERROR_INVALID_HANDLE: c_int = 400;
 const CUDA_ERROR_NOT_SUPPORTED: c_int = 801;
 
-/// CUfunction handles are process-local driver objects.  A remoted guest can
-/// accidentally send one of its own code pointers (static libcudart does this
-/// for unavailable fallback kernels), and NVIDIA's driver dereferences rather
-/// than validates some such values.  Record every function minted in this
-/// daemon process so untrusted wire handles fail as INVALID_HANDLE instead of
-/// taking down the shared CUDA daemon.
+/// CUfunction and CUkernel handles are process-local driver objects. A remoted
+/// guest can accidentally send one of its own code pointers (static libcudart
+/// does this for unavailable fallback kernels), and NVIDIA's driver
+/// dereferences rather than validates some such values. Record every
+/// launchable minted in this daemon process so untrusted wire handles fail as
+/// INVALID_HANDLE instead of taking down the shared CUDA daemon.
 fn live_cuda_functions() -> &'static std::sync::Mutex<std::collections::HashSet<u64>> {
     static FUNCTIONS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u64>>> =
         std::sync::OnceLock::new();
@@ -86,6 +86,12 @@ struct CuMemAccessDesc {
     flags: c_int,
 }
 
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct CuIpcHandle {
+    reserved: [u8; 64],
+}
+
 /// Hand-declared driver entry points. Stored as `'static` fn pointers; `_lib`
 /// keeps the library mapped for as long as the backend lives.
 pub struct GpuBackend {
@@ -99,10 +105,14 @@ pub struct GpuBackend {
     device_get_uuid: unsafe extern "C" fn(*mut u8, c_int) -> CuResultCode,
     device_get_pci_bus_id: unsafe extern "C" fn(*mut c_char, c_int, c_int) -> CuResultCode,
     device_get_by_pci_bus_id: unsafe extern "C" fn(*mut c_int, *const c_char) -> CuResultCode,
+    device_can_access_peer: unsafe extern "C" fn(*mut c_int, c_int, c_int) -> CuResultCode,
     ctx_create: unsafe extern "C" fn(*mut *mut c_void, c_uint, c_int) -> CuResultCode,
     ctx_destroy: unsafe extern "C" fn(*mut c_void) -> CuResultCode,
     ctx_set_current: unsafe extern "C" fn(*mut c_void) -> CuResultCode,
     ctx_get_current: unsafe extern "C" fn(*mut *mut c_void) -> CuResultCode,
+    ctx_enable_peer_access: unsafe extern "C" fn(*mut c_void, c_uint) -> CuResultCode,
+    ctx_disable_peer_access: unsafe extern "C" fn(*mut c_void) -> CuResultCode,
+    ctx_get_stream_priority_range: unsafe extern "C" fn(*mut c_int, *mut c_int) -> CuResultCode,
     primary_ctx_retain: unsafe extern "C" fn(*mut *mut c_void, c_int) -> CuResultCode,
     primary_ctx_release: unsafe extern "C" fn(c_int) -> CuResultCode,
     module_load_data: unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> CuResultCode,
@@ -111,6 +121,7 @@ pub struct GpuBackend {
     module_get_global:
         unsafe extern "C" fn(*mut u64, *mut usize, *mut c_void, *const c_char) -> CuResultCode,
     module_unload: unsafe extern "C" fn(*mut c_void) -> CuResultCode,
+    module_get_loading_mode: Option<unsafe extern "C" fn(*mut c_int) -> CuResultCode>,
     library_load_data: Option<
         unsafe extern "C" fn(
             *mut *mut c_void,
@@ -129,12 +140,20 @@ pub struct GpuBackend {
     library_get_module: Option<unsafe extern "C" fn(*mut *mut c_void, *mut c_void) -> CuResultCode>,
     kernel_get_function:
         Option<unsafe extern "C" fn(*mut *mut c_void, *mut c_void) -> CuResultCode>,
+    kernel_get_attribute:
+        Option<unsafe extern "C" fn(*mut c_int, c_int, *mut c_void, c_int) -> CuResultCode>,
+    kernel_set_attribute:
+        Option<unsafe extern "C" fn(c_int, c_int, *mut c_void, c_int) -> CuResultCode>,
     cuda_library_builds: std::collections::HashMap<u64, (u32, Vec<Vec<u8>>)>,
     next_cuda_library_build: u64,
     live_cuda_libraries: std::collections::HashSet<u64>,
     /// `cuFuncGetParamInfo` — CUDA 12.4+. `None` on older drivers, where
     /// [`Backend::func_get_param_info`] reports `CUDA_ERROR_NOT_SUPPORTED`.
     func_get_param_info:
+        Option<unsafe extern "C" fn(*mut c_void, usize, *mut usize, *mut usize) -> CuResultCode>,
+    /// CUDA 13 Library API kernels are `CUkernel`, not `CUfunction`, and must
+    /// be queried with `cuKernelGetParamInfo` before they can be launched.
+    kernel_get_param_info:
         Option<unsafe extern "C" fn(*mut c_void, usize, *mut usize, *mut usize) -> CuResultCode>,
     func_set_attribute: unsafe extern "C" fn(*mut c_void, c_int, c_int) -> CuResultCode,
     func_get_attribute: unsafe extern "C" fn(*mut c_int, c_int, *mut c_void) -> CuResultCode,
@@ -167,6 +186,8 @@ pub struct GpuBackend {
     /// for zero-copy. Registration needs a current context, so it happens lazily
     /// on the first zero-copy transfer, not at `set_guest_ram`.
     mem_host_register: Option<unsafe extern "C" fn(*mut c_void, usize, c_uint) -> CuResultCode>,
+    mem_host_get_device_pointer:
+        Option<unsafe extern "C" fn(*mut u64, *mut c_void, c_uint) -> CuResultCode>,
     mem_host_unregister: Option<unsafe extern "C" fn(*mut c_void) -> CuResultCode>,
     /// `cuMemAllocHost_v2` / `cuMemFreeHost` — allocate pinned host memory, used
     /// for the gather/scatter staging buffer on heavily-fragmented zero-copy
@@ -199,6 +220,11 @@ pub struct GpuBackend {
     graph_instantiate_with_flags:
         unsafe extern "C" fn(*mut *mut c_void, *mut c_void, u64) -> CuResultCode,
     graph_launch: unsafe extern "C" fn(*mut c_void, *mut c_void) -> CuResultCode,
+    graph_exec_update: unsafe extern "C" fn(
+        *mut c_void,
+        *mut c_void,
+        *mut GraphExecUpdateResultInfo,
+    ) -> CuResultCode,
     graph_exec_destroy: unsafe extern "C" fn(*mut c_void) -> CuResultCode,
     graph_destroy: unsafe extern "C" fn(*mut c_void) -> CuResultCode,
     graph_get_nodes:
@@ -246,6 +272,19 @@ pub struct GpuBackend {
     ) -> CuResultCode,
     memset_d8_async: unsafe extern "C" fn(u64, u8, usize, *mut c_void) -> CuResultCode,
     memcpy_dtod_async: unsafe extern "C" fn(u64, u64, usize, *mut c_void) -> CuResultCode,
+    memcpy_peer_async: unsafe extern "C" fn(
+        u64,
+        *mut c_void,
+        u64,
+        *mut c_void,
+        usize,
+        *mut c_void,
+    ) -> CuResultCode,
+    ipc_get_mem_handle: unsafe extern "C" fn(*mut CuIpcHandle, u64) -> CuResultCode,
+    ipc_open_mem_handle: unsafe extern "C" fn(*mut u64, CuIpcHandle, c_uint) -> CuResultCode,
+    ipc_close_mem_handle: unsafe extern "C" fn(u64) -> CuResultCode,
+    ipc_get_event_handle: unsafe extern "C" fn(*mut CuIpcHandle, *mut c_void) -> CuResultCode,
+    ipc_open_event_handle: unsafe extern "C" fn(*mut *mut c_void, CuIpcHandle) -> CuResultCode,
     stream_destroy: unsafe extern "C" fn(*mut c_void) -> CuResultCode,
     stream_synchronize: unsafe extern "C" fn(*mut c_void) -> CuResultCode,
     stream_query: unsafe extern "C" fn(*mut c_void) -> CuResultCode,
@@ -327,6 +366,7 @@ pub struct GpuBackend {
     mapped_host_files: Vec<(u64, u64)>,
     /// Whether lazy guest-RAM pinning has been attempted (once per backend).
     guest_ram_pin_tried: bool,
+    shm_pin_tried: bool,
     /// Reusable pinned host staging buffer `(addr, capacity)` for the gather /
     /// scatter path on fragmented zero-copy transfers. Held as an address (not a
     /// pointer) so the backend stays `Send`; 0 until first needed, grown on
@@ -524,10 +564,14 @@ impl GpuBackend {
                 device_get_uuid: sym2(&lib, b"cuDeviceGetUuid_v2\0", b"cuDeviceGetUuid\0")?,
                 device_get_pci_bus_id: sym(&lib, b"cuDeviceGetPCIBusId\0")?,
                 device_get_by_pci_bus_id: sym(&lib, b"cuDeviceGetByPCIBusId\0")?,
+                device_can_access_peer: sym(&lib, b"cuDeviceCanAccessPeer\0")?,
                 ctx_create: sym(&lib, b"cuCtxCreate_v2\0")?,
                 ctx_destroy: sym(&lib, b"cuCtxDestroy_v2\0")?,
                 ctx_set_current: sym(&lib, b"cuCtxSetCurrent\0")?,
                 ctx_get_current: sym(&lib, b"cuCtxGetCurrent\0")?,
+                ctx_enable_peer_access: sym(&lib, b"cuCtxEnablePeerAccess\0")?,
+                ctx_disable_peer_access: sym(&lib, b"cuCtxDisablePeerAccess\0")?,
+                ctx_get_stream_priority_range: sym(&lib, b"cuCtxGetStreamPriorityRange\0")?,
                 primary_ctx_retain: sym(&lib, b"cuDevicePrimaryCtxRetain\0")?,
                 primary_ctx_release: sym2(
                     &lib,
@@ -538,15 +582,19 @@ impl GpuBackend {
                 module_get_function: sym(&lib, b"cuModuleGetFunction\0")?,
                 module_get_global: sym2(&lib, b"cuModuleGetGlobal_v2\0", b"cuModuleGetGlobal\0")?,
                 module_unload: sym(&lib, b"cuModuleUnload\0")?,
+                module_get_loading_mode: sym(&lib, b"cuModuleGetLoadingMode\0").ok(),
                 library_load_data: sym(&lib, b"cuLibraryLoadData\0").ok(),
                 library_unload: sym(&lib, b"cuLibraryUnload\0").ok(),
                 library_get_kernel: sym(&lib, b"cuLibraryGetKernel\0").ok(),
                 library_get_module: sym(&lib, b"cuLibraryGetModule\0").ok(),
                 kernel_get_function: sym(&lib, b"cuKernelGetFunction\0").ok(),
+                kernel_get_attribute: sym(&lib, b"cuKernelGetAttribute\0").ok(),
+                kernel_set_attribute: sym(&lib, b"cuKernelSetAttribute\0").ok(),
                 cuda_library_builds: std::collections::HashMap::new(),
                 next_cuda_library_build: 1,
                 live_cuda_libraries: std::collections::HashSet::new(),
                 func_get_param_info: sym(&lib, b"cuFuncGetParamInfo\0").ok(),
+                kernel_get_param_info: sym(&lib, b"cuKernelGetParamInfo\0").ok(),
                 func_set_attribute: sym(&lib, b"cuFuncSetAttribute\0")?,
                 func_get_attribute: sym(&lib, b"cuFuncGetAttribute\0")?,
                 mem_alloc: sym(&lib, b"cuMemAlloc_v2\0")?,
@@ -570,6 +618,12 @@ impl GpuBackend {
                 memset_d8: sym(&lib, b"cuMemsetD8_v2\0")?,
                 mem_get_info: sym(&lib, b"cuMemGetInfo_v2\0")?,
                 mem_host_register: sym(&lib, b"cuMemHostRegister_v2\0").ok(),
+                mem_host_get_device_pointer: sym2(
+                    &lib,
+                    b"cuMemHostGetDevicePointer_v2\0",
+                    b"cuMemHostGetDevicePointer\0",
+                )
+                .ok(),
                 mem_host_unregister: sym(&lib, b"cuMemHostUnregister\0").ok(),
                 mem_host_alloc: sym(&lib, b"cuMemAllocHost_v2\0").ok(),
                 mem_free_host: sym(&lib, b"cuMemFreeHost\0").ok(),
@@ -590,6 +644,10 @@ impl GpuBackend {
                 )?,
                 graph_instantiate_with_flags: sym(&lib, b"cuGraphInstantiateWithFlags\0")?,
                 graph_launch: sym(&lib, b"cuGraphLaunch\0")?,
+                // The unversioned symbol retains the legacy four-argument ABI
+                // on older drivers; the public CUDA 12+ header maps the modern
+                // result-info API to this explicit v2 symbol.
+                graph_exec_update: sym(&lib, b"cuGraphExecUpdate_v2\0")?,
                 graph_exec_destroy: sym(&lib, b"cuGraphExecDestroy\0")?,
                 graph_destroy: sym(&lib, b"cuGraphDestroy\0")?,
                 graph_get_nodes: sym(&lib, b"cuGraphGetNodes\0")?,
@@ -609,6 +667,16 @@ impl GpuBackend {
                 graph_exec_memcpy_node_set_params: sym(&lib, b"cuGraphExecMemcpyNodeSetParams\0")?,
                 memset_d8_async: sym(&lib, b"cuMemsetD8Async\0")?,
                 memcpy_dtod_async: sym2(&lib, b"cuMemcpyDtoDAsync_v2\0", b"cuMemcpyDtoDAsync\0")?,
+                memcpy_peer_async: sym2(&lib, b"cuMemcpyPeerAsync_v2\0", b"cuMemcpyPeerAsync\0")?,
+                ipc_get_mem_handle: sym(&lib, b"cuIpcGetMemHandle\0")?,
+                ipc_open_mem_handle: sym2(
+                    &lib,
+                    b"cuIpcOpenMemHandle_v2\0",
+                    b"cuIpcOpenMemHandle\0",
+                )?,
+                ipc_close_mem_handle: sym(&lib, b"cuIpcCloseMemHandle\0")?,
+                ipc_get_event_handle: sym(&lib, b"cuIpcGetEventHandle\0")?,
+                ipc_open_event_handle: sym(&lib, b"cuIpcOpenEventHandle\0")?,
                 stream_destroy: sym2(&lib, b"cuStreamDestroy_v2\0", b"cuStreamDestroy\0")?,
                 stream_synchronize: sym(&lib, b"cuStreamSynchronize\0")?,
                 stream_query: sym(&lib, b"cuStreamQuery\0")?,
@@ -663,6 +731,7 @@ impl GpuBackend {
                 registered: Vec::new(),
                 mapped_host_files: Vec::new(),
                 guest_ram_pin_tried: false,
+                shm_pin_tried: false,
                 staging: (0, 0),
                 _lib: lib,
             };
@@ -811,6 +880,9 @@ impl GpuBackend {
                             let status = unsafe {
                                 get_kernel(&mut kernel, library as *mut c_void, name.as_ptr())
                             };
+                            if status == 0 {
+                                register_cuda_function(kernel as u64);
+                            }
                             response(status, kernel)
                         }
                         Err(_) => response(CUDA_ERROR_INVALID_VALUE, std::ptr::null_mut()),
@@ -972,8 +1044,10 @@ impl GpuBackend {
                             }
                         };
                         let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+                        // `f_type`'s signedness varies across libc versions; cast
+                        // both sides so the comparison holds either way.
                         if unsafe { libc::fstatfs(file.as_raw_fd(), &mut stat) } != 0
-                            || stat.f_type != TMPFS_MAGIC
+                            || stat.f_type != TMPFS_MAGIC as _
                         {
                             return Some(response(CUDA_ERROR_NOT_SUPPORTED, std::ptr::null_mut()));
                         }
@@ -1010,6 +1084,65 @@ impl GpuBackend {
                     _ => response(CUDA_ERROR_NOT_SUPPORTED, std::ptr::null_mut()),
                 }
             }
+            15 => {
+                let parsed = args.get(..16).and_then(|bytes| {
+                    Some((
+                        u64::from_le_bytes(bytes[..8].try_into().ok()?),
+                        i32::from_le_bytes(bytes[8..12].try_into().ok()?),
+                        i32::from_le_bytes(bytes[12..16].try_into().ok()?),
+                    ))
+                });
+                match (parsed, self.kernel_get_attribute) {
+                    (Some((kernel, attrib, device)), Some(get_attribute)) => {
+                        let mut value = 0;
+                        let status = unsafe {
+                            get_attribute(&mut value, attrib, kernel as *mut c_void, device)
+                        };
+                        Ok((
+                            status,
+                            if status == 0 {
+                                value.to_le_bytes().to_vec()
+                            } else {
+                                Vec::new()
+                            },
+                        ))
+                    }
+                    _ => response(CUDA_ERROR_NOT_SUPPORTED, std::ptr::null_mut()),
+                }
+            }
+            16 => {
+                let parsed = args.get(..20).and_then(|bytes| {
+                    Some((
+                        u64::from_le_bytes(bytes[..8].try_into().ok()?),
+                        i32::from_le_bytes(bytes[8..12].try_into().ok()?),
+                        i32::from_le_bytes(bytes[12..16].try_into().ok()?),
+                        i32::from_le_bytes(bytes[16..20].try_into().ok()?),
+                    ))
+                });
+                match (parsed, self.kernel_set_attribute) {
+                    (Some((kernel, attrib, value, device)), Some(set_attribute)) => {
+                        let status =
+                            unsafe { set_attribute(attrib, value, kernel as *mut c_void, device) };
+                        response(status, std::ptr::null_mut())
+                    }
+                    _ => response(CUDA_ERROR_NOT_SUPPORTED, std::ptr::null_mut()),
+                }
+            }
+            17 => match self.module_get_loading_mode {
+                Some(get_loading_mode) if args.is_empty() => {
+                    let mut mode = 0;
+                    let status = unsafe { get_loading_mode(&mut mode) };
+                    Ok((
+                        status,
+                        if status == 0 {
+                            mode.to_le_bytes().to_vec()
+                        } else {
+                            Vec::new()
+                        },
+                    ))
+                }
+                _ => response(CUDA_ERROR_NOT_SUPPORTED, std::ptr::null_mut()),
+            },
             _ => return None,
         })
     }
@@ -1133,6 +1266,11 @@ impl Backend for GpuBackend {
         };
         Ok(device)
     }
+    fn device_can_access_peer(&mut self, device: i32, peer: i32) -> CuResult<i32> {
+        let mut can_access = 0;
+        unsafe { chk((self.device_can_access_peer)(&mut can_access, device, peer))? };
+        Ok(can_access)
+    }
     fn ctx_create(&mut self, device: i32) -> CuResult<u64> {
         let mut ctx: *mut c_void = std::ptr::null_mut();
         unsafe { chk((self.ctx_create)(&mut ctx, 0, device))? };
@@ -1140,6 +1278,31 @@ impl Backend for GpuBackend {
     }
     fn ctx_destroy(&mut self, ctx: u64) -> CuResult<()> {
         unsafe { chk((self.ctx_destroy)(ctx as *mut c_void)) }
+    }
+    fn ctx_set_current(&mut self, ctx: u64) -> CuResult<()> {
+        unsafe { chk((self.ctx_set_current)(ctx as *mut c_void)) }
+    }
+    fn ctx_enable_peer_access(&mut self, peer_ctx: u64, flags: u32) -> CuResult<()> {
+        unsafe {
+            chk((self.ctx_enable_peer_access)(
+                peer_ctx as *mut c_void,
+                flags,
+            ))
+        }
+    }
+    fn ctx_disable_peer_access(&mut self, peer_ctx: u64) -> CuResult<()> {
+        unsafe { chk((self.ctx_disable_peer_access)(peer_ctx as *mut c_void)) }
+    }
+    fn ctx_get_stream_priority_range(&mut self) -> CuResult<(i32, i32)> {
+        let mut least = 0;
+        let mut greatest = 0;
+        unsafe {
+            chk((self.ctx_get_stream_priority_range)(
+                &mut least,
+                &mut greatest,
+            ))?
+        };
+        Ok((least, greatest))
     }
     fn primary_ctx_retain(&mut self, device: i32) -> CuResult<u64> {
         let mut ctx: *mut c_void = std::ptr::null_mut();
@@ -1205,19 +1368,33 @@ impl Backend for GpuBackend {
     }
     fn func_get_param_info(&mut self, function: u64) -> CuResult<Vec<u32>> {
         // CUDA 12.4+. Walk parameter indices until INVALID_VALUE marks the end.
+        // CUDA 13's Library API returns an opaque CUkernel. cuLaunchKernel
+        // accepts that handle, but cuFuncGetParamInfo rejects it with
+        // INVALID_RESOURCE_HANDLE; retry with the matching kernel API.
         const CUDA_ERROR_INVALID_VALUE: i32 = 1;
+        const CUDA_ERROR_INVALID_RESOURCE_HANDLE: i32 = 400;
         const CUDA_ERROR_NOT_SUPPORTED: i32 = 801;
         validate_cuda_function(function)?;
-        let f = self.func_get_param_info.ok_or(CUDA_ERROR_NOT_SUPPORTED)?;
+        let func_info = self.func_get_param_info.ok_or(CUDA_ERROR_NOT_SUPPORTED)?;
+        let mut selected = func_info;
         let mut sizes = Vec::new();
-        for i in 0.. {
+        let mut i = 0;
+        loop {
             let (mut offset, mut size): (usize, usize) = (0, 0);
-            let code = unsafe { f(function as *mut c_void, i, &mut offset, &mut size) };
+            let mut code = unsafe { selected(function as *mut c_void, i, &mut offset, &mut size) };
+            if i == 0 && code == CUDA_ERROR_INVALID_RESOURCE_HANDLE {
+                let kernel_info = self
+                    .kernel_get_param_info
+                    .ok_or(CUDA_ERROR_INVALID_RESOURCE_HANDLE)?;
+                selected = kernel_info;
+                code = unsafe { selected(function as *mut c_void, i, &mut offset, &mut size) };
+            }
             match code {
                 0 => sizes.push(size as u32),
                 CUDA_ERROR_INVALID_VALUE => break,
                 other => return Err(other),
             }
+            i += 1;
         }
         Ok(sizes)
     }
@@ -1778,6 +1955,111 @@ impl Backend for GpuBackend {
             ))
         }
     }
+    fn launch_kernel_packed(
+        &mut self,
+        function: u64,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_bytes: u32,
+        stream: u64,
+        args: &[u8],
+    ) -> CuResult<()> {
+        if let Err(code) = validate_cuda_function(function) {
+            if std::env::var_os("SMOLVM_CUDA_HOST_OPLOG").is_some() {
+                eprintln!(
+                    "[launch-packed] unregistered fn={function:#x} stream={stream:#x} args={} code={code}",
+                    args.len()
+                );
+            }
+            return Err(code);
+        }
+        // CUDA's packed launch ABI is an alternating key/value array. The
+        // argument buffer remains live for the duration of cuLaunchKernel.
+        const CU_LAUNCH_PARAM_BUFFER_POINTER: usize = 1;
+        const CU_LAUNCH_PARAM_BUFFER_SIZE: usize = 2;
+        let mut args_len = args.len();
+        let mut extra = [
+            CU_LAUNCH_PARAM_BUFFER_POINTER as *mut c_void,
+            args.as_ptr() as *mut c_void,
+            CU_LAUNCH_PARAM_BUFFER_SIZE as *mut c_void,
+            (&mut args_len as *mut usize).cast::<c_void>(),
+            std::ptr::null_mut(),
+        ];
+        unsafe {
+            let code = (self.launch_kernel)(
+                function as *mut c_void,
+                grid[0],
+                grid[1],
+                grid[2],
+                block[0],
+                block[1],
+                block[2],
+                shared_bytes,
+                stream as *mut c_void,
+                std::ptr::null_mut(),
+                extra.as_mut_ptr(),
+            );
+            if code != 0 && std::env::var_os("SMOLVM_CUDA_HOST_OPLOG").is_some() {
+                let mut context = std::ptr::null_mut();
+                let context_code = (self.ctx_get_current)(&mut context);
+                let mut max_threads = 0;
+                let function_code =
+                    (self.func_get_attribute)(&mut max_threads, 0, function as *mut c_void);
+                let stream_code = if stream == 0 {
+                    0
+                } else {
+                    (self.stream_query)(stream as *mut c_void)
+                };
+                eprintln!(
+                    "[launch-packed] code={code} fn={function:#x} stream={stream:#x} ctx={context:p} ctx_code={context_code} fn_code={function_code} stream_code={stream_code} args={}",
+                    args.len()
+                );
+            }
+            chk(code)
+        }
+    }
+    fn host_get_device_pointer(&mut self, source: u8, address: u64) -> CuResult<u64> {
+        let host = match source {
+            0 => {
+                #[cfg(target_os = "linux")]
+                {
+                    crate::shm::get_or_create()
+                        .and_then(|region| region.checked(address, 1))
+                        .ok_or(CUDA_ERROR_INVALID_VALUE)?
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    return Err(CUDA_ERROR_NOT_SUPPORTED);
+                }
+            }
+            1 => self.gpa_to_host(address, 1)?,
+            _ => return Err(CUDA_ERROR_INVALID_VALUE),
+        };
+        if source == 0 && !self.shm_pin_tried {
+            #[cfg(target_os = "linux")]
+            {
+                self.shm_pin_tried = true;
+                let region = crate::shm::get_or_create().ok_or(CUDA_ERROR_NOT_SUPPORTED)?;
+                let register = self.mem_host_register.ok_or(CUDA_ERROR_NOT_SUPPORTED)?;
+                let code = unsafe { register(region.base().cast(), region.len(), 3) };
+                if code != 0 && code != 712 {
+                    return Err(code);
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                return Err(CUDA_ERROR_NOT_SUPPORTED);
+            }
+        } else if source == 1 {
+            self.ensure_guest_ram_pinned();
+        }
+        let get = self
+            .mem_host_get_device_pointer
+            .ok_or(CUDA_ERROR_NOT_SUPPORTED)?;
+        let mut pointer = 0u64;
+        unsafe { chk(get(&mut pointer, host.cast(), 0))? };
+        Ok(pointer)
+    }
     fn ctx_synchronize(&mut self) -> CuResult<()> {
         unsafe { chk((self.ctx_synchronize)()) }
     }
@@ -1831,6 +2113,23 @@ impl Backend for GpuBackend {
                 graph_exec as *mut c_void,
                 stream as *mut c_void,
             ))
+        }
+    }
+    fn graph_exec_update(&mut self, graph_exec: u64, graph: u64) -> CuResult<i32> {
+        let mut info = GraphExecUpdateResultInfo {
+            result: 0,
+            error_node: std::ptr::null_mut(),
+            error_from_node: std::ptr::null_mut(),
+        };
+        let status = unsafe {
+            (self.graph_exec_update)(graph_exec as *mut c_void, graph as *mut c_void, &mut info)
+        };
+        // CUDA_ERROR_GRAPH_EXEC_UPDATE_FAILURE (910) is a compatibility result,
+        // not a transport failure; the specific reason is carried in `result`.
+        if status == 0 || status == 910 {
+            Ok(info.result)
+        } else {
+            Err(status)
         }
     }
     fn graph_exec_patch(
@@ -2278,6 +2577,66 @@ impl Backend for GpuBackend {
             ))
         }
     }
+    fn memcpy_peer_async(
+        &mut self,
+        dst: u64,
+        dst_ctx: u64,
+        src: u64,
+        src_ctx: u64,
+        bytes: u64,
+        stream: u64,
+    ) -> CuResult<()> {
+        let bytes = usize::try_from(bytes).map_err(|_| CUDA_ERROR_INVALID_VALUE)?;
+        unsafe {
+            chk((self.memcpy_peer_async)(
+                dst,
+                dst_ctx as *mut c_void,
+                src,
+                src_ctx as *mut c_void,
+                bytes,
+                stream as *mut c_void,
+            ))
+        }
+    }
+    fn ipc_get_mem_handle(&mut self, dptr: u64) -> CuResult<[u8; 64]> {
+        let mut handle = CuIpcHandle { reserved: [0; 64] };
+        unsafe { chk((self.ipc_get_mem_handle)(&mut handle, dptr))? };
+        Ok(handle.reserved)
+    }
+    fn ipc_open_mem_handle(&mut self, handle: [u8; 64], flags: u32) -> CuResult<u64> {
+        let mut dptr = 0;
+        unsafe {
+            chk((self.ipc_open_mem_handle)(
+                &mut dptr,
+                CuIpcHandle { reserved: handle },
+                flags,
+            ))?
+        };
+        Ok(dptr)
+    }
+    fn ipc_close_mem_handle(&mut self, dptr: u64) -> CuResult<()> {
+        unsafe { chk((self.ipc_close_mem_handle)(dptr)) }
+    }
+    fn ipc_get_event_handle(&mut self, event: u64) -> CuResult<[u8; 64]> {
+        let mut handle = CuIpcHandle { reserved: [0; 64] };
+        unsafe {
+            chk((self.ipc_get_event_handle)(
+                &mut handle,
+                event as *mut c_void,
+            ))?
+        };
+        Ok(handle.reserved)
+    }
+    fn ipc_open_event_handle(&mut self, handle: [u8; 64]) -> CuResult<u64> {
+        let mut event = std::ptr::null_mut();
+        unsafe {
+            chk((self.ipc_open_event_handle)(
+                &mut event,
+                CuIpcHandle { reserved: handle },
+            ))?
+        };
+        Ok(event as u64)
+    }
     fn stream_destroy(&mut self, stream: u64) -> CuResult<()> {
         unsafe { chk((self.stream_destroy)(stream as *mut c_void)) }
     }
@@ -2577,8 +2936,8 @@ impl CudnnBackend {
                 let count = rd_i64(args, 16);
                 let mut elems = args[24..].to_vec();
                 if handle_bearing(ty) {
-                    for chunk in elems.chunks_exact_mut(8) {
-                        let h = u64::from_le_bytes(chunk.try_into().unwrap());
+                    for chunk in elems.as_chunks_mut::<8>().0 {
+                        let h = u64::from_le_bytes(*chunk);
                         // VOID_PTR(6) = device pointer (fork-translate); HANDLE(0)
                         // / BACKEND_DESCRIPTOR(15) = opaque handle (vh_resolve).
                         let r = if ty == 6 {
@@ -2586,7 +2945,7 @@ impl CudnnBackend {
                         } else {
                             vh_resolve(vh, h)
                         };
-                        chunk.copy_from_slice(&r.to_le_bytes());
+                        *chunk = r.to_le_bytes();
                     }
                 }
                 let st = unsafe { (self.set_attr)(desc, name, ty, count, elems.as_ptr().cast()) };
@@ -2608,14 +2967,14 @@ impl CudnnBackend {
                 let seed = input.len().min(cap);
                 buf[..seed].copy_from_slice(&input[..seed]);
                 if handle_bearing(ty) {
-                    for chunk in buf[..seed].chunks_exact_mut(8) {
-                        let h = u64::from_le_bytes(chunk.try_into().unwrap());
+                    for chunk in buf[..seed].as_chunks_mut::<8>().0 {
+                        let h = u64::from_le_bytes(*chunk);
                         let r = if ty == 6 {
                             dptr_resolve(h)
                         } else {
                             vh_resolve(vh, h)
                         };
-                        chunk.copy_from_slice(&r.to_le_bytes());
+                        *chunk = r.to_le_bytes();
                     }
                 }
                 let mut count: i64 = 0;
@@ -2972,16 +3331,10 @@ fn vh_resolve(map: &std::collections::HashMap<u64, u64>, h: u64) -> u64 {
 /// default stream) and unmapped values (the legacy 0x1/0x2 stream constants)
 /// pass through.
 fn stream_resolve(map: &std::collections::HashMap<u64, u64>, s: u64) -> u64 {
-    if s == 0 {
-        0
-    } else {
-        // Clone workers additionally remap the GOLDEN's raw stream to their own
-        // re-created stream (M3a stream_trans) — without this, a raw-stream
-        // guest's cublasSetStream(golden ptr) dereferences a foreign heap
-        // pointer inside libcuda (SIGSEGV in cuStreamGetGreenCtx). Identity on
-        // non-clone sessions, so the common case is one thread-local miss.
-        super::xlat_stream(map.get(&s).copied().unwrap_or(s))
-    }
+    // Clone workers remap inherited streams, and transparent graph capture
+    // temporarily redirects every stream (including the default stream) to a
+    // private capture stream. With no mapping this remains identity.
+    super::xlat_stream(map.get(&s).copied().unwrap_or(s))
 }
 
 /// Convert a real library stream back to the session-scoped handle that the
@@ -3512,6 +3865,13 @@ pub struct KernelNodeParams {
     ctx: *mut c_void,  // v2: CUcontext
 }
 
+#[repr(C)]
+struct GraphExecUpdateResultInfo {
+    result: c_int,
+    error_node: *mut c_void,
+    error_from_node: *mut c_void,
+}
+
 /// `CUDA_MEMSET_NODE_PARAMS` — a graph memset node's target + fill.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -3721,7 +4081,7 @@ impl GpuBackend {
         };
         for &(_, hva, len) in &self.guest_ram {
             // SAFETY: [hva, hva+len) is a live host mapping of guest RAM.
-            let rc = unsafe { reg(hva as *mut c_void, len as usize, 2) };
+            let rc = unsafe { reg(hva as *mut c_void, len as usize, 3) };
             match rc {
                 0 => {
                     self.registered.push((hva, len));

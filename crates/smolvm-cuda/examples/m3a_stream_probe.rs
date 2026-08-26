@@ -121,8 +121,10 @@ fn main() {
             cu.stream_synchronize(stream).expect("stream_synchronize");
             let out = cu.memcpy_dtoh(va_c, (N * 4) as u64, 0).expect("d2h");
             let c: Vec<f32> = out
-                .chunks_exact(4)
-                .map(|p| f32::from_le_bytes(p.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|p| f32::from_le_bytes(*p))
                 .collect();
             let ok = (0..N).all(|i| (c[i] - (4 * i) as f32).abs() < 1e-2);
             std::fs::write(&done, "done").ok();

@@ -1,0 +1,13 @@
+[package]
+name = "smolvm-s3fs"
+version = "1.13.0"
+edition = "2021"
+description = "POSIX filesystem over S3-compatible object storage, mounted through FUSE without libfuse or a helper binary"
+license = "Apache-2.0"
+
+[dependencies]
+hmac = "0.12"
+sha2 = "0.10"
+libc = "0.2"
+ureq = { version = "2", default-features = false, features = ["tls", "gzip"] }
+tracing = { workspace = true }

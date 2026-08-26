@@ -63,6 +63,12 @@ pub struct VmResources {
     /// blocks the default resolver (e.g. 8.8.8.8) still resolve names.
     #[serde(default)]
     pub dns: Option<std::net::Ipv4Addr>,
+    /// Named inter-VM network to join (virtio-net only). Members lease
+    /// distinct guest addresses and route IP packets to each other through
+    /// the host-side fabric; VMs on different networks (or none) stay fully
+    /// isolated from each other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_name: Option<String>,
 }
 
 /// Minimum memory required for the VM to boot (kernel + agent).
@@ -132,6 +138,7 @@ impl Default for VmResources {
             overlay_gib: None,
             allowed_cidrs: None,
             dns: None,
+            network_name: None,
         }
     }
 }

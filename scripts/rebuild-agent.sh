@@ -10,7 +10,11 @@ set -ex
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-ROOTFS_DIR="$HOME/Library/Application Support/smolvm/agent-rootfs"
+# Match the directory smolvm itself resolves (dirs::data_dir()), which differs
+# per platform: hard-coding the macOS one made every Linux run build the agent
+# and then fail before installing it.
+[[ "$OSTYPE" == darwin* ]] && DATA_DIR="$HOME/Library/Application Support" || DATA_DIR="$HOME/.local/share"
+ROOTFS_DIR="$DATA_DIR/smolvm/agent-rootfs"
 
 cd "$PROJECT_DIR"
 

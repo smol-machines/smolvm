@@ -11,7 +11,7 @@
 //! listening, so scripts can wait for the line then point a shim-linked binary
 //! at it via `SMOLVM_CUDA_RPC=tcp:<addr>`.
 
-use smolvm_cuda::host::{serve, Backend, CpuBackend, GpuBackend};
+use smolvm_cuda::host::{ring_dir_set, serve, Backend, CpuBackend, GpuBackend};
 use std::net::TcpListener;
 
 fn main() {
@@ -28,6 +28,7 @@ fn main() {
         let Ok(stream) = stream else { continue };
         let __r = stream.set_nodelay(true); // low-latency request/response
         std::thread::spawn(move || {
+            ring_dir_set(std::env::var("SMOLVM_CUDA_RING_HOST_DIR").ok());
             let mut backend: Box<dyn Backend> = match GpuBackend::load() {
                 Ok(b) => Box::new(b),
                 Err(_) => Box::<CpuBackend>::default(),

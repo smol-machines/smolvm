@@ -776,6 +776,58 @@ test_exec_cat_no_interactive() {
 
 run_test "Exec: 'exec -- cat' exits cleanly with null stdin" test_exec_cat_no_interactive || true
 
+test_exec_interactive_large_stdin() {
+    # Regression for issue #926: large, unpaced stdin could deadlock with
+    # guest output and fail with EAGAIN. Use 1 MiB because it failed
+    # reliably on the unfixed build.
+    "$SMOLVM" machine stop --name "$_EXEC_STDIN_MACHINE" 2>/dev/null || true
+    "$SMOLVM" machine delete --name "$_EXEC_STDIN_MACHINE" -f 2>/dev/null || true
+    "$SMOLVM" machine create --name "$_EXEC_STDIN_MACHINE" 2>/dev/null || return 1
+    "$SMOLVM" machine start --name "$_EXEC_STDIN_MACHINE" 2>/dev/null || return 1
+
+    local in_file out_file
+    in_file=$(mktemp)
+    out_file=$(mktemp)
+
+    # 1 MiB of unpaced stdin, echoed back by `cat`.
+    head -c 1048576 /dev/urandom > "$in_file"
+    local out exit_code=0
+    out=$(run_with_timeout 60 sh -c \
+        "'$SMOLVM' machine exec -i --name '$_EXEC_STDIN_MACHINE' -- cat < '$in_file' > '$out_file'" \
+        2>&1) || exit_code=$?
+    local big_matches=0
+    cmp -s "$in_file" "$out_file" && big_matches=1
+
+    # Re-test the 270,336-byte reproducer from issue #926.
+    head -c 270336 /dev/urandom > "$in_file"
+    local out_boundary exit_code_boundary=0
+    out_boundary=$(run_with_timeout 30 sh -c \
+        "'$SMOLVM' machine exec -i --name '$_EXEC_STDIN_MACHINE' -- cat < '$in_file' > '$out_file'" \
+        2>&1) || exit_code_boundary=$?
+    local boundary_matches=0
+    cmp -s "$in_file" "$out_file" && boundary_matches=1
+
+    rm -f "$in_file" "$out_file"
+    "$SMOLVM" machine stop --name "$_EXEC_STDIN_MACHINE" 2>/dev/null || true
+    "$SMOLVM" machine delete --name "$_EXEC_STDIN_MACHINE" -f 2>/dev/null || true
+
+    if echo "$out$out_boundary" | grep -qi "temporarily unavailable"; then
+        echo "FAIL: stdin streaming hit EAGAIN on the agent socket (#926)"
+        return 1
+    fi
+    [[ $exit_code -ne 124 ]] || { echo "FAIL: 1 MiB 'exec -i' timed out"; return 1; }
+    [[ $exit_code -eq 0 ]] || { echo "FAIL: 1 MiB 'exec -i' exit $exit_code: $out"; return 1; }
+    [[ $big_matches -eq 1 ]] || { echo "FAIL: 1 MiB round-trip differs from input"; return 1; }
+    [[ $exit_code_boundary -ne 124 ]] || { echo "FAIL: 270336-byte 'exec -i' timed out"; return 1; }
+    [[ $exit_code_boundary -eq 0 ]] || {
+        echo "FAIL: 270336-byte 'exec -i' exit $exit_code_boundary: $out_boundary"
+        return 1
+    }
+    [[ $boundary_matches -eq 1 ]] || { echo "FAIL: 270336-byte round-trip differs from input"; return 1; }
+}
+
+run_test "Exec: 'exec -i' streams 1 MiB of piped stdin (#926)" test_exec_interactive_large_stdin || true
+
 test_exec_tty_piped_stdin_terminates() {
     # `--tty` runs the child on a PTY. A PTY cannot have one direction
     # closed, so when the feeding pipe (`echo`) closes, end-of-input must

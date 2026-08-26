@@ -51,6 +51,7 @@
 //! ```
 
 use crate::device::VirtioNetworkDevice;
+use crate::dns;
 use crate::dns_relay::{self, DnsQuery, DnsResponse, DnsTransport};
 use crate::icmp_relay;
 use crate::policy::{Policy, PolicyHandle};
@@ -141,6 +142,11 @@ enum FrameAction {
     UdpFlow {
         destination: SocketAddr,
     },
+    /// Destined to another VM on this network's fabric: the raw IP packet is
+    /// forwarded to the peer stack and never enters smoltcp (see `fabric`).
+    Fabric {
+        index: u8,
+    },
     Passthrough,
 }
 
@@ -158,6 +164,7 @@ pub fn start_network_stack(
     config: VirtioPollConfig,
     tcp_receiver: Option<Receiver<AcceptedTcpConnection>>,
     egress: PolicyHandle,
+    fabric: Option<crate::fabric::FabricHandle>,
 ) -> std::io::Result<JoinHandle<()>> {
     virtio_net_log!(
         "virtio-net: spawning poll thread guest_ip={} gateway_ip={} mtu={}",
@@ -167,7 +174,7 @@ pub fn start_network_stack(
     );
     thread::Builder::new()
         .name("smolvm-net-poll".into())
-        .spawn(move || run_network_stack(queues, config, tcp_receiver, egress))
+        .spawn(move || run_network_stack(queues, config, tcp_receiver, egress, fabric))
 }
 
 fn run_network_stack(
@@ -175,6 +182,7 @@ fn run_network_stack(
     config: VirtioPollConfig,
     mut tcp_receiver: Option<Receiver<AcceptedTcpConnection>>,
     egress: PolicyHandle,
+    fabric: Option<crate::fabric::FabricHandle>,
 ) {
     // Poll loop overview:
     //
@@ -198,6 +206,10 @@ fn run_network_stack(
     let mut device = VirtioNetworkDevice::new(queues.clone(), config.mtu);
     let mut interface = create_interface(&mut device, &config);
     let mut sockets = SocketSet::new(vec![]);
+    let dns_routing = DnsRouting {
+        upstream: config.upstream_dns,
+        gateway: config.gateway_ipv4,
+    };
     let dns_socket_handle = add_dns_socket(&mut sockets);
     let dns_tcp_handles = add_dns_tcp_sockets(&mut sockets);
     let mut dns_tcp_conns: Vec<DnsTcpConn> = (0..dns_tcp_handles.len())
@@ -272,7 +284,28 @@ fn run_network_stack(
             // - TCP SYN: pre-create a matching smoltcp socket + relay entry
             // - DNS UDP: allow through for gateway-side forwarding
             // - other UDP: pre-create the destination-keyed relay socket
-            match classify_guest_frame(frame, &gateway_addrs, intercept_dns_tcp) {
+            let action = classify_guest_frame(
+                frame,
+                &gateway_addrs,
+                intercept_dns_tcp,
+                fabric.as_ref().map(|f| f.own_index),
+            );
+            // Copy the IP packet (everything after the 14-byte Ethernet
+            // header) out while the staged frame is still borrowed; the
+            // fabric arm below needs it after the device is touched again.
+            let fabric_payload = match action {
+                FrameAction::Fabric { .. } if frame.len() > 14 => Some(frame[14..].to_vec()),
+                _ => None,
+            };
+            match action {
+                FrameAction::Fabric { index } => {
+                    if let (Some(handle), Some(packet)) = (fabric.as_ref(), fabric_payload) {
+                        // The peer stack re-frames the packet for its own
+                        // guest; smoltcp never sees this frame.
+                        handle.forward(index, packet);
+                    }
+                    device.drop_staged_frame();
+                }
                 FrameAction::TcpSyn {
                     source,
                     destination,
@@ -302,10 +335,14 @@ fn run_network_stack(
                 }
                 FrameAction::UdpFlow { destination } => {
                     // Same egress policy as TCP; a denied destination's datagram
-                    // is silently dropped (a guest sees a normal UDP black hole).
-                    if udp_relay::should_relay_udp(destination, egress.as_ref())
-                        && udp_sockets.ensure_socket(destination, &mut sockets)
-                    {
+                    // is silently dropped (a guest sees a normal UDP black hole),
+                    // but the denial is recorded in the boot log — these lines are
+                    // the machine's egress audit trail (`read_egress_denials`).
+                    let relay_allowed = udp_relay::should_relay_udp(destination, egress.as_ref());
+                    if !relay_allowed && destination.port() != 53 {
+                        egress.denied("sendto", &destination);
+                    }
+                    if relay_allowed && udp_sockets.ensure_socket(destination, &mut sockets) {
                         if matches!(
                             interface.poll_ingress_single(now, &mut device, &mut sockets),
                             PollIngressSingleResult::None
@@ -345,7 +382,7 @@ fn run_network_stack(
             dns_socket_handle,
             &mut sockets,
             egress.as_ref(),
-            config.upstream_dns,
+            dns_routing,
             &mut dns_gateway,
             &dns_channels.to_relay,
         );
@@ -354,7 +391,7 @@ fn run_network_stack(
             &mut dns_tcp_conns,
             &mut sockets,
             egress.as_ref(),
-            config.upstream_dns,
+            dns_routing,
             &mut dns_gateway,
             &dns_channels.to_relay,
         );
@@ -755,9 +792,30 @@ impl DnsGateway {
     }
 }
 
+/// Where guest DNS answers come from: the upstream resolver queries are
+/// forwarded to, and the gateway address answered for the gateway's own name.
+#[derive(Clone, Copy)]
+struct DnsRouting {
+    upstream: Ipv4Addr,
+    gateway: Ipv4Addr,
+}
+
 /// The decision for a single guest DNS query, made on the poll thread by the
 /// egress policy (no host I/O).
 use crate::policy::DnsDecision;
+
+/// Classify a query through the pluggable policy. The gateway's own name is
+/// answered before the policy runs: it names gateway-internal plumbing, not
+/// egress, so it must resolve even under a strict allow-host policy.
+fn classify_dns_query(query: &[u8], egress: &dyn Policy, gateway_ipv4: Ipv4Addr) -> DnsDecision {
+    if dns::question_name(query)
+        .and_then(|n| dns::normalize_hostname(&n))
+        .is_some_and(|n| n == dns::GATEWAY_HOSTNAME)
+    {
+        return DnsDecision::Immediate(dns::gateway_response(query, gateway_ipv4));
+    }
+    egress.dns(query)
+}
 
 /// Drain guest UDP/53 queries out of the gateway socket. Blocked queries are
 /// answered inline (no host I/O); allowed queries are handed to the DNS offload
@@ -767,7 +825,7 @@ fn dispatch_dns_udp(
     dns_socket_handle: SocketHandle,
     sockets: &mut SocketSet<'_>,
     egress: &dyn Policy,
-    upstream_dns: Ipv4Addr,
+    routing: DnsRouting,
     gateway: &mut DnsGateway,
     to_relay: &SyncSender<DnsQuery>,
 ) -> bool {
@@ -780,7 +838,7 @@ fn dispatch_dns_udp(
             Ok((q, m)) => (q.to_vec(), m.endpoint, m.local_address),
             Err(_) => break,
         };
-        match egress.dns(&query) {
+        match classify_dns_query(&query, egress, routing.gateway) {
             DnsDecision::Immediate(response) => {
                 let response_meta = UdpMetadata {
                     endpoint,
@@ -806,7 +864,7 @@ fn dispatch_dns_udp(
                 match to_relay.try_send(DnsQuery {
                     id,
                     transport: DnsTransport::Udp,
-                    upstream: upstream_dns,
+                    upstream: routing.upstream,
                     query,
                 }) {
                     Ok(()) => queued = true,
@@ -942,7 +1000,7 @@ fn process_dns_tcp(
     conns: &mut [DnsTcpConn],
     sockets: &mut SocketSet<'_>,
     egress: &dyn Policy,
-    upstream_dns: Ipv4Addr,
+    routing: DnsRouting,
     gateway: &mut DnsGateway,
     to_relay: &SyncSender<DnsQuery>,
 ) -> bool {
@@ -1005,9 +1063,9 @@ fn process_dns_tcp(
                 virtio_net_log!(
                     "virtio-net: DNS/TCP query query_len={} upstream_dns={}",
                     query.len(),
-                    upstream_dns
+                    routing.upstream
                 );
-                match egress.dns(&query) {
+                match classify_dns_query(&query, egress, routing.gateway) {
                     DnsDecision::Immediate(response) => {
                         frame_dns_tcp_response(conn, &response);
                         conn.done = true;
@@ -1020,7 +1078,7 @@ fn process_dns_tcp(
                         match to_relay.try_send(DnsQuery {
                             id,
                             transport: DnsTransport::Tcp,
-                            upstream: upstream_dns,
+                            upstream: routing.upstream,
                             query,
                         }) {
                             Ok(()) => {
@@ -1091,11 +1149,28 @@ fn classify_guest_frame(
     frame: &[u8],
     gateway_addrs: &[IpAddr],
     intercept_dns_tcp: bool,
+    fabric_own_index: Option<u8>,
 ) -> FrameAction {
     let ethernet = match EthernetFrame::new_checked(frame) {
         Ok(frame) => frame,
         Err(_) => return FrameAction::Passthrough,
     };
+
+    // Fabric member: any IPv4 destination inside the fabric pool but outside
+    // this VM's own /30 is another member's address — forward the whole IP
+    // packet regardless of transport protocol (this is routing, so ICMP and
+    // encapsulations like VXLAN work the same as TCP/UDP).
+    if let Some(own_index) = fabric_own_index {
+        if ethernet.ethertype() == EthernetProtocol::Ipv4 {
+            if let Ok(ipv4) = Ipv4Packet::new_checked(ethernet.payload()) {
+                if let Some(index) = crate::fabric::fabric_index(ipv4.dst_addr()) {
+                    if index != own_index && index != 0 {
+                        return FrameAction::Fabric { index };
+                    }
+                }
+            }
+        }
+    }
 
     // Extract (src, dst, transport protocol, transport payload) from either IP
     // family. Anything that isn't plain IPv4/IPv6 — ARP, and IPv6 packets with
@@ -1180,7 +1255,7 @@ fn classify_guest_frame(
 /// behind the `fuzzing` feature so it never ships in a normal build.
 #[cfg(feature = "fuzzing")]
 pub fn fuzz_classify_guest_frame(frame: &[u8]) {
-    let _ = classify_guest_frame(frame, &[], false);
+    let _ = classify_guest_frame(frame, &[], false, Some(1));
 }
 
 #[cfg(test)]
@@ -1209,11 +1284,36 @@ mod tests {
     }
 
     #[test]
+    fn fabric_member_forwards_other_subnets_but_not_its_own() {
+        let gw = IpAddr::V4(Ipv4Addr::new(100, 96, 3, 1));
+        // Another member's guest: forwarded to its subnet regardless of port.
+        assert_eq!(
+            classify_guest_frame(&tcp_syn_frame([100, 96, 5, 2], 443), &[gw], false, Some(3)),
+            FrameAction::Fabric { index: 5 }
+        );
+        // Own subnet stays local (the gateway relay path).
+        assert!(matches!(
+            classify_guest_frame(&tcp_syn_frame([100, 96, 3, 1], 443), &[gw], false, Some(3)),
+            FrameAction::TcpSyn { .. }
+        ));
+        // Subnet 0 is the default non-fabric link, never a peer.
+        assert!(matches!(
+            classify_guest_frame(&tcp_syn_frame([100, 96, 0, 2], 443), &[gw], false, Some(3)),
+            FrameAction::TcpSyn { .. }
+        ));
+        // Without a fabric, the same frame relays normally.
+        assert!(matches!(
+            classify_guest_frame(&tcp_syn_frame([100, 96, 5, 2], 443), &[gw], false, None),
+            FrameAction::TcpSyn { .. }
+        ));
+    }
+
+    #[test]
     fn dns_tcp_to_gateway_is_intercepted_not_relayed() {
         let gw = IpAddr::V4(Ipv4Addr::new(100, 96, 0, 1));
         // TCP/53 to the gateway -> handled by the local DNS listeners (Passthrough).
         assert_eq!(
-            classify_guest_frame(&tcp_syn_frame([100, 96, 0, 1], 53), &[gw], false),
+            classify_guest_frame(&tcp_syn_frame([100, 96, 0, 1], 53), &[gw], false, None),
             FrameAction::Passthrough
         );
     }
@@ -1224,7 +1324,7 @@ mod tests {
         // TCP/53 to an external (allow-listed) resolver must go through the egress
         // relay, NOT be swallowed by the gateway DNS listeners.
         assert!(matches!(
-            classify_guest_frame(&tcp_syn_frame([1, 1, 1, 1], 53), &[gw], false),
+            classify_guest_frame(&tcp_syn_frame([1, 1, 1, 1], 53), &[gw], false, None),
             FrameAction::TcpSyn { .. }
         ));
     }
@@ -1235,7 +1335,7 @@ mod tests {
         // A policy that answers names itself must not lose to the guest's own
         // resolver, so every TCP/53 SYN lands on the gateway DNS listeners.
         assert_eq!(
-            classify_guest_frame(&tcp_syn_frame([1, 1, 1, 1], 53), &[gw], true),
+            classify_guest_frame(&tcp_syn_frame([1, 1, 1, 1], 53), &[gw], true, None),
             FrameAction::Passthrough
         );
     }
@@ -1245,12 +1345,12 @@ mod tests {
         let gw = IpAddr::V4(Ipv4Addr::new(100, 96, 0, 1));
         // Only port 53 is intercepted; other gateway ports relay as usual.
         assert!(matches!(
-            classify_guest_frame(&tcp_syn_frame([100, 96, 0, 1], 443), &[gw], false),
+            classify_guest_frame(&tcp_syn_frame([100, 96, 0, 1], 443), &[gw], false, None),
             FrameAction::TcpSyn { .. }
         ));
         // ...even with the DNS/TCP intercept armed.
         assert!(matches!(
-            classify_guest_frame(&tcp_syn_frame([1, 1, 1, 1], 443), &[gw], true),
+            classify_guest_frame(&tcp_syn_frame([1, 1, 1, 1], 443), &[gw], true, None),
             FrameAction::TcpSyn { .. }
         ));
     }

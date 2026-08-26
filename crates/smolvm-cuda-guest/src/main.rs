@@ -96,8 +96,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let out = cu.memcpy_dtoh(dc, bytes, 0)?;
     let c: Vec<f32> = out
-        .chunks_exact(4)
-        .map(|p| f32::from_le_bytes(p.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|p| f32::from_le_bytes(*p))
         .collect();
 
     for i in 0..n {
@@ -181,7 +183,10 @@ fn run_loop() -> Result<(), Box<dyn std::error::Error>> {
     cu.ctx_synchronize()?;
     append(format!("BOOT tag={tag} dptr=0x{dptr:x} token={token}"));
 
-    for tick in 0.. {
+    let mut counter: u64 = 0;
+    loop {
+        let tick = counter;
+        counter += 1;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
@@ -189,8 +194,10 @@ fn run_loop() -> Result<(), Box<dyn std::error::Error>> {
         match cu.memcpy_dtoh(dptr, 16, 0) {
             Ok(bytes) => {
                 let v: Vec<f32> = bytes
-                    .chunks_exact(4)
-                    .map(|p| f32::from_le_bytes(p.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|p| f32::from_le_bytes(*p))
                     .collect();
                 let ok = v
                     .iter()
@@ -216,7 +223,6 @@ fn run_loop() -> Result<(), Box<dyn std::error::Error>> {
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
-    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -256,8 +262,10 @@ fn run_reader(
     let dptr = u64::from_str_radix(ptr_env.trim().trim_start_matches("0x"), 16)?;
     let out = cu.memcpy_dtoh(dptr, 16, 0)?;
     let got: Vec<f32> = out
-        .chunks_exact(4)
-        .map(|p| f32::from_le_bytes(p.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|p| f32::from_le_bytes(*p))
         .collect();
     let ok = got
         .iter()

@@ -40,6 +40,16 @@ const DNS_POINTER_OFFSET_MASK: u8 = 0x3f;
 const DNS_MAX_COMPRESSION_JUMPS: usize = 16;
 const DNS_MAX_LABEL_LEN: usize = 63;
 
+/// The gateway's own name: the guest's stand-in for "the host" (a guest flow
+/// to the gateway address is relayed to host loopback), answered
+/// authoritatively by the gateway so guests need not hardcode its address.
+/// Mirrors Docker's `host.docker.internal`.
+pub const GATEWAY_HOSTNAME: &str = "host.smolvm.internal";
+
+/// TTL for the gateway's self-answer. Short so a stack restart with a
+/// different gateway address is picked up quickly.
+const GATEWAY_TTL_SECS: u32 = 60;
+
 /// Lowercase + strip a trailing dot. `None` for an empty name.
 pub fn normalize_hostname(hostname: &str) -> Option<String> {
     let hostname = hostname.trim_end_matches('.').to_ascii_lowercase();
@@ -131,6 +141,30 @@ fn parse_answer_ip_records(packet: &[u8]) -> Option<Vec<(IpAddr, u32)>> {
         offset += rdlen;
     }
     Some(ips)
+}
+
+/// A NOERROR answer for the gateway's own name ([`GATEWAY_HOSTNAME`]): an A
+/// query gets the gateway address, any other qtype an empty answer section
+/// (AAAA in particular — v6-first resolvers then settle on the A record).
+pub fn gateway_response(query: &[u8], gateway: Ipv4Addr) -> Vec<u8> {
+    let mut response = error_response(query, 0);
+    let Some(end) = question_section_end(query) else {
+        return response;
+    };
+    if read_u16(query, end - DNS_QUESTION_FIXED_LEN) != Some(DNS_TYPE_A) {
+        return response;
+    }
+    response[DNS_ANCOUNT_OFFSET..DNS_ANCOUNT_OFFSET + DNS_U16_LEN]
+        .copy_from_slice(&1u16.to_be_bytes());
+    // One answer record: a compression pointer to the question name, then
+    // A/IN, TTL, and the 4-byte address.
+    response.extend_from_slice(&[DNS_POINTER_TAG, DNS_HEADER_LEN as u8]);
+    response.extend_from_slice(&DNS_TYPE_A.to_be_bytes());
+    response.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
+    response.extend_from_slice(&GATEWAY_TTL_SECS.to_be_bytes());
+    response.extend_from_slice(&(DNS_A_RDATA_LEN as u16).to_be_bytes());
+    response.extend_from_slice(&gateway.octets());
+    response
 }
 
 /// Build a DNS response carrying just an error `rcode` (e.g. NXDOMAIN), echoing
@@ -335,6 +369,36 @@ mod tests {
     #[test]
     fn empty_allow_list_blocks_all() {
         assert!(!hostname_allowed("example.com", &[]));
+    }
+
+    #[test]
+    fn gateway_response_answers_a_with_the_gateway_address() {
+        let gw = Ipv4Addr::new(100, 96, 0, 1);
+        let response = gateway_response(&query_for(GATEWAY_HOSTNAME), gw);
+        assert_eq!(response[..2], [0x12, 0x34]); // id echoed
+        assert_eq!(
+            read_u16(&response, DNS_FLAGS_OFFSET).unwrap() & DNS_RCODE_MASK,
+            0
+        );
+        let records = answer_ip_records(&response);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].0, IpAddr::V4(gw));
+        assert_eq!(records[0].1, GATEWAY_TTL_SECS);
+    }
+
+    #[test]
+    fn gateway_response_gives_aaaa_an_empty_noerror() {
+        let mut query = query_for(GATEWAY_HOSTNAME);
+        let qtype_offset = query.len() - DNS_QUESTION_FIXED_LEN;
+        query[qtype_offset..qtype_offset + DNS_U16_LEN]
+            .copy_from_slice(&DNS_TYPE_AAAA.to_be_bytes());
+        let response = gateway_response(&query, Ipv4Addr::new(100, 96, 0, 1));
+        assert_eq!(
+            read_u16(&response, DNS_FLAGS_OFFSET).unwrap() & DNS_RCODE_MASK,
+            0
+        );
+        assert_eq!(read_u16(&response, DNS_ANCOUNT_OFFSET).unwrap(), 0);
+        assert!(answer_ip_records(&response).is_empty());
     }
 
     #[test]

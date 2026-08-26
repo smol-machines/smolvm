@@ -1,6 +1,6 @@
 [package]
 name = "smolvm-cuda"
-version = "1.7.5"
+version = "1.13.0"
 edition = "2021"
 description = "CUDA Driver-API remoting over vsock for smolvm guests"
 license = "Apache-2.0"
@@ -15,3 +15,4 @@ gpu = ["host", "dep:libloading"]
 [dependencies]
 libloading = { version = "0.8", optional = true }
 libc = "0.2"
+getrandom = "0.3"

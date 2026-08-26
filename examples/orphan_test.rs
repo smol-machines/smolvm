@@ -24,7 +24,8 @@ fn main() {
         image: None,
         persistent: false,
         runtime_managed: false,
-        labels: Default::default(),
+        // Spread the rest so a new spec field does not break the fixture.
+        ..Default::default()
     };
     let _ = rt.create_machine(spec); // ignore "already exists" on reruns
     rt.start_machine(&name).expect("start machine");
