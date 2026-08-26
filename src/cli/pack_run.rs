@@ -1215,8 +1215,8 @@ struct PackedRunArgs {
     #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro]")]
     volume: Vec<String>,
 
-    /// Expose port from container to host
-    #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "HOST:GUEST")]
+    /// Expose port from container to host (single port or one-to-one range)
+    #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "PORT[-END]|HOST[-END]:GUEST[-END]")]
     port: Vec<PortMappingSpec>,
 
     /// Enable outbound network access
@@ -1272,8 +1272,8 @@ struct PackedStartArgs {
     #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro]")]
     volume: Vec<String>,
 
-    /// Expose port from container to host
-    #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "HOST:GUEST")]
+    /// Expose port from container to host (single port or one-to-one range)
+    #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "PORT[-END]|HOST[-END]:GUEST[-END]")]
     port: Vec<PortMappingSpec>,
 
     /// Enable outbound network access

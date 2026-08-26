@@ -529,8 +529,8 @@ pub struct RunCmd {
     )]
     pub volume: Vec<String>,
 
-    /// Expose port from container to host (can be used multiple times)
-    #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "HOST:GUEST", help_heading = "Network")]
+    /// Expose port from container to host (single port or one-to-one range, repeatable)
+    #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "PORT[-END]|HOST[-END]:GUEST[-END]", help_heading = "Network")]
     pub port: Vec<PortMappingSpec>,
 
     /// Enable outbound network access
@@ -3059,8 +3059,8 @@ pub struct CreateCmd {
     #[arg(short = 'v', long = "volume", value_name = "HOST|REMOTE:GUEST[:ro]")]
     pub volume: Vec<String>,
 
-    /// Expose port from VM to host (can be used multiple times)
-    #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "HOST:GUEST")]
+    /// Expose port from VM to host (single port or one-to-one range, repeatable)
+    #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "PORT[-END]|HOST[-END]:GUEST[-END]")]
     pub port: Vec<PortMappingSpec>,
 
     /// Enable outbound network access
@@ -3797,9 +3797,9 @@ pub struct ForkCmd {
     #[arg(long, visible_alias = "checkpointable")]
     pub forkable: bool,
 
-    /// Pin the clone's inbound port forwards (repeatable). Without this, the
-    /// golden's forwards are remapped to freshly-allocated host ports.
-    #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "HOST:GUEST", help_heading = "Network")]
+    /// Pin the clone's inbound port forwards (single port or one-to-one range, repeatable).
+    /// Without this, the golden's forwards are remapped to freshly-allocated host ports.
+    #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "PORT[-END]|HOST[-END]:GUEST[-END]", help_heading = "Network")]
     pub port: Vec<PortMappingSpec>,
 
     /// Share the golden's loaded CUDA weights with this clone instead of
@@ -4294,12 +4294,12 @@ pub struct UpdateCmd {
     #[arg(long, value_name = "HOST:GUEST")]
     pub remove_volume: Vec<String>,
 
-    /// Add port mapping (HOST:GUEST)
-    #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "HOST:GUEST")]
+    /// Add port mapping or one-to-one range
+    #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "PORT[-END]|HOST[-END]:GUEST[-END]")]
     pub port: Vec<PortMappingSpec>,
 
-    /// Remove port mapping (HOST:GUEST)
-    #[arg(long, value_parser = PortMappingSpec::parse, value_name = "HOST:GUEST")]
+    /// Remove port mapping or one-to-one range
+    #[arg(long, value_parser = PortMappingSpec::parse, value_name = "PORT[-END]|HOST[-END]:GUEST[-END]")]
     pub remove_port: Vec<PortMappingSpec>,
 
     /// Set vCPU count

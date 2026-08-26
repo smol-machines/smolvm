@@ -158,11 +158,11 @@ impl PortMappingSpec {
     }
 
     /// Expand this specification into its concrete host-to-guest mappings.
-    pub fn expand(self) -> Result<Vec<PortMapping>, String> {
-        Ok((self.host.start..=self.host.end)
+    pub fn expand(self) -> Vec<PortMapping> {
+        (self.host.start..=self.host.end)
             .zip(self.guest.start..=self.guest.end)
             .map(|(host, guest)| PortMapping::new(host, guest))
-            .collect())
+            .collect()
     }
 
     /// Expand all user-supplied specs while enforcing the per-machine mapping cap.
@@ -176,7 +176,7 @@ impl PortMappingSpec {
 
         let mut ports = Vec::with_capacity(count);
         for spec in specs {
-            ports.extend(spec.expand()?);
+            ports.extend(spec.expand());
         }
         Ok(ports)
     }
@@ -378,8 +378,7 @@ mod tests {
     fn port_mapping_spec_expands_equal_length_ranges() {
         let ports = PortMappingSpec::parse("5173-5175:6173-6175")
             .unwrap()
-            .expand()
-            .unwrap();
+            .expand();
 
         assert_eq!(
             ports,
@@ -389,6 +388,14 @@ mod tests {
                 PortMapping::new(5175, 6175),
             ]
         );
+    }
+
+    #[test]
+    fn port_mapping_spec_rejects_invalid_ranges() {
+        assert!(PortMappingSpec::parse("5173-5175:6173-6174").is_err());
+        assert!(PortMappingSpec::parse("5175-5173").is_err());
+        assert!(PortMappingSpec::parse("0-1").is_err());
+        assert!(PortMappingSpec::parse("5173--5175").is_err());
     }
 
     #[test]
