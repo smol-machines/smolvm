@@ -1298,14 +1298,6 @@ fn make_idmap_userns(uid: u32, gid: u32) -> std::io::Result<libc::c_int> {
     finish(Ok(nsfd))
 }
 
-// fork: gnu libc binds move_mount(2)'s flags; musl's does not — fall back to the
-// stable kernel UAPI value so a musl build still compiles.
-#[cfg(target_os = "linux")]
-#[cfg(target_env = "gnu")]
-use libc::MOVE_MOUNT_F_EMPTY_PATH;
-#[cfg(all(target_os = "linux", not(target_env = "gnu")))]
-const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 0x0000_0004;
-
 /// Present the root-owned shared pack at `shared` onto the per-VM mountpoint
 /// `target` via an idmapped bind mount that maps on-disk uid/gid 0 -> `(uid, gid)`
 /// — so the VMM (about to drop to that uid) reads every file as its owner, while
@@ -1408,7 +1400,7 @@ pub fn setup_pack_idmap_mount(
             c"".as_ptr(),
             libc::AT_FDCWD,
             target_c.as_ptr(),
-            MOVE_MOUNT_F_EMPTY_PATH as libc::c_uint,
+            libc::MOVE_MOUNT_F_EMPTY_PATH as libc::c_uint,
         )
     };
     let result = if rc != 0 { Err(errno()) } else { Ok(()) };
