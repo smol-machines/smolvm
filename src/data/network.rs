@@ -157,14 +157,6 @@ impl PortMappingSpec {
         Ok(Self { host, guest })
     }
 
-    /// Expand this specification into its concrete host-to-guest mappings.
-    pub fn expand(self) -> Vec<PortMapping> {
-        (self.host.start..=self.host.end)
-            .zip(self.guest.start..=self.guest.end)
-            .map(|(host, guest)| PortMapping::new(host, guest))
-            .collect()
-    }
-
     /// Expand all user-supplied specs while enforcing the per-machine mapping cap.
     pub fn expand_all(specs: &[Self]) -> Result<Vec<PortMapping>, String> {
         let count = specs.iter().map(|spec| spec.host.len() as usize).sum();
@@ -176,7 +168,11 @@ impl PortMappingSpec {
 
         let mut ports = Vec::with_capacity(count);
         for spec in specs {
-            ports.extend(spec.expand());
+            ports.extend(
+                (spec.host.start..=spec.host.end)
+                    .zip(spec.guest.start..=spec.guest.end)
+                    .map(|(host, guest)| PortMapping::new(host, guest)),
+            );
         }
         Ok(ports)
     }
@@ -376,9 +372,8 @@ mod tests {
 
     #[test]
     fn port_mapping_spec_expands_equal_length_ranges() {
-        let ports = PortMappingSpec::parse("5173-5175:6173-6175")
-            .unwrap()
-            .expand();
+        let spec = PortMappingSpec::parse("5173-5175:6173-6175").unwrap();
+        let ports = PortMappingSpec::expand_all(&[spec]).unwrap();
 
         assert_eq!(
             ports,
@@ -391,10 +386,22 @@ mod tests {
     }
 
     #[test]
-    fn port_mapping_spec_rejects_invalid_ranges() {
+    fn port_mapping_spec_rejects_mismatched_range_lengths() {
         assert!(PortMappingSpec::parse("5173-5175:6173-6174").is_err());
+    }
+
+    #[test]
+    fn port_mapping_spec_rejects_descending_ranges() {
         assert!(PortMappingSpec::parse("5175-5173").is_err());
+    }
+
+    #[test]
+    fn port_mapping_spec_rejects_zero_in_ranges() {
         assert!(PortMappingSpec::parse("0-1").is_err());
+    }
+
+    #[test]
+    fn port_mapping_spec_rejects_malformed_ranges() {
         assert!(PortMappingSpec::parse("5173--5175").is_err());
     }
 
