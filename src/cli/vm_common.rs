@@ -1273,10 +1273,11 @@ fn start_vm_named_with_db(
     // Direct DB lookup — 1 read cycle instead of loading everything
     let mut record = db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))?;
     // A durable checkpoint restores the already-running guest and workload just
-    // like an in-memory fork snapshot. Capture this before AgentManager consumes
-    // the one-shot payload at readiness, so the workload is not launched twice.
-    let from_snapshot = from_snapshot
-        || smolvm::portable_checkpoint::pending_dir(&smolvm::agent::vm_data_dir(name)).is_some();
+    // like an in-memory fork snapshot. Capture this before finalization consumes
+    // the one-shot payload, so the workload is not launched twice.
+    let restoring_checkpoint =
+        smolvm::portable_checkpoint::pending_dir(&smolvm::agent::vm_data_dir(name)).is_some();
+    let from_snapshot = from_snapshot || restoring_checkpoint;
     // A Smolfile-declared fork base starts forkable without requiring the user
     // to repeat `--forkable`. Older records that persisted a CUDA pool before
     // the explicit field existed get the same behavior, but clones remain
@@ -1482,6 +1483,15 @@ fn start_vm_named_with_db(
     // image's filesystem (package managers, distro-specific paths)
     // would hit the bare Alpine agent and fail with "not found".
     let mut client = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
+
+    if restoring_checkpoint {
+        if let Err(error) = smolvm::portable_checkpoint::finalize_live_restore(name, &record)
+            .and_then(|()| smolvm::portable_checkpoint::consume(&smolvm::agent::vm_data_dir(name)))
+        {
+            let _ = manager.stop();
+            return Err(error);
+        }
+    }
 
     // Resolve secret refs to plaintext on the host and inject them only into
     // the env handed to guest commands (init + workload entrypoint). Only the

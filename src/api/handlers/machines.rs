@@ -628,7 +628,7 @@ pub async fn create_machine(
     // the discarded boot log), leaving egress MORE restrictive than requested
     // with no error. Normalizing (bare IP -> /32) keeps the stored policy
     // identical to what the CLI persists.
-    let normalized_cidrs = match &req.allowed_cidrs {
+    let mut normalized_cidrs = match &req.allowed_cidrs {
         Some(cidrs) => Some(
             cidrs
                 .iter()
@@ -732,7 +732,12 @@ pub async fn create_machine(
         // exec run `crun` over a nonexistent image instead of `vm_exec` in the VM
         // (the /bin/sh-not-found bug). Store None so every consumer treats it as a
         // VM; provenance lives in `source_smolmachine`.
-        let image = if vm_seed.is_some() || checkpoint.is_some() {
+        let image = if let Some(workload) = checkpoint
+            .as_ref()
+            .and_then(|checkpoint| checkpoint.workload.as_ref())
+        {
+            Some(workload.image.clone())
+        } else if vm_seed.is_some() || checkpoint.is_some() {
             None
         } else {
             Some(manifest.image)
@@ -775,6 +780,41 @@ pub async fn create_machine(
         )
     };
 
+    let checkpoint_network = manifest_checkpoint
+        .as_ref()
+        .and_then(|checkpoint| checkpoint.network.as_ref());
+    let restored_storage_gb = manifest_checkpoint
+        .as_ref()
+        .and_then(|checkpoint| checkpoint.storage_gib)
+        .or(req.storage_gb);
+    let restored_overlay_gb = manifest_checkpoint
+        .as_ref()
+        .and_then(|checkpoint| checkpoint.overlay_gib)
+        .or(req.overlay_gb);
+    let restored_ports: Vec<PortSpec> = checkpoint_network
+        .map(|network| {
+            network
+                .ports
+                .iter()
+                .map(|port| PortSpec {
+                    host: port.host,
+                    guest: port.guest,
+                })
+                .collect()
+        })
+        .unwrap_or_else(|| req.ports.clone());
+    let restored_network_backend = match manifest_checkpoint.as_ref() {
+        Some(checkpoint) => crate::portable_checkpoint::restored_network_backend(checkpoint)
+            .map_err(|error| ApiError::BadRequest(error.to_string()))?,
+        None => req.network_backend,
+    };
+    let restored_allowed_hosts = checkpoint_network
+        .and_then(|network| network.dns_filter_hosts.clone())
+        .or_else(|| req.allowed_hosts.clone());
+    if let Some(network) = checkpoint_network {
+        normalized_cidrs = network.allowed_cidrs.clone();
+    }
+
     // Use explicit API resources when provided. Otherwise, preserve packed
     // artifact manifest defaults, or the high VM defaults for non-artifact
     // machines. Memory is ballooned, so a generous default does not imply
@@ -811,13 +851,15 @@ pub async fn create_machine(
     crate::data::resources::VmResources {
         cpus,
         memory_mib: mem,
-        storage_gib: req.storage_gb,
-        overlay_gib: req.overlay_gb,
+        storage_gib: restored_storage_gb,
+        overlay_gib: restored_overlay_gb,
         ..Default::default()
     }
     .validate()
     .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    let network = req.network || manifest_net;
+    let network = checkpoint_network
+        .map(|network| network.enabled)
+        .unwrap_or(req.network || manifest_net);
 
     // Reserve the name atomically (prevents concurrent creation)
     let guard = ReservationGuard::new(&state, name.clone())?;
@@ -825,8 +867,8 @@ pub async fn create_machine(
     // Create manager (does not boot the VM)
     let manager = tokio::task::spawn_blocking({
         let name = name.clone();
-        let storage_gb = req.storage_gb;
-        let overlay_gb = req.overlay_gb;
+        let storage_gb = restored_storage_gb;
+        let overlay_gb = restored_overlay_gb;
         move || {
             AgentManager::for_vm_with_sizes(&name, storage_gb, overlay_gb)
                 .map_err(|e| ApiError::internal(format!("failed to create agent manager: {}", e)))
@@ -1004,11 +1046,11 @@ pub async fn create_machine(
         network: Some(network),
         gpu: Some(req.gpu),
         cuda: Some(req.cuda || req.auto_graph),
-        storage_gb: req.storage_gb,
-        overlay_gb: req.overlay_gb,
+        storage_gb: restored_storage_gb,
+        overlay_gb: restored_overlay_gb,
         allowed_cidrs: normalized_cidrs,
-        allowed_hosts: req.allowed_hosts.clone(),
-        network_backend: req.network_backend,
+        allowed_hosts: restored_allowed_hosts,
+        network_backend: restored_network_backend,
     };
 
     // Validate request-body secret refs before persisting. Untrusted
@@ -1027,23 +1069,38 @@ pub async fn create_machine(
         manager,
         mounts: host_mount_specs,
         remote_volumes,
-        ports: req.ports.clone(),
+        ports: restored_ports,
         resources: resources.clone(),
-        restart: match req.restart {
-            Some(ref spec) => {
-                let policy = spec
-                    .policy
-                    .as_deref()
-                    .unwrap_or("never")
+        restart: if let Some(workload) = manifest_checkpoint
+            .as_ref()
+            .and_then(|checkpoint| checkpoint.workload.as_ref())
+        {
+            RestartConfig {
+                policy: workload
+                    .restart_policy
                     .parse()
-                    .map_err(|e: String| ApiError::BadRequest(e))?;
-                RestartConfig {
-                    policy,
-                    max_retries: spec.max_retries.unwrap_or(0),
-                    ..Default::default()
-                }
+                    .map_err(ApiError::BadRequest)?,
+                max_retries: workload.restart_max_retries,
+                max_backoff_secs: workload.restart_max_backoff_secs,
+                ..Default::default()
             }
-            None => RestartConfig::default(),
+        } else {
+            match req.restart {
+                Some(ref spec) => {
+                    let policy = spec
+                        .policy
+                        .as_deref()
+                        .unwrap_or("never")
+                        .parse()
+                        .map_err(|e: String| ApiError::BadRequest(e))?;
+                    RestartConfig {
+                        policy,
+                        max_retries: spec.max_retries.unwrap_or(0),
+                        ..Default::default()
+                    }
+                }
+                None => RestartConfig::default(),
+            }
         },
         network,
         forkable: manifest_checkpoint.is_some(),
@@ -1062,6 +1119,14 @@ pub async fn create_machine(
         cmd,
         env: workload_env,
         workdir: req.workdir.clone().or(workdir),
+        user: manifest_checkpoint
+            .as_ref()
+            .and_then(|checkpoint| checkpoint.workload.as_ref())
+            .and_then(|workload| workload.user.clone()),
+        fork_overlay_owner: manifest_checkpoint
+            .as_ref()
+            .and_then(|checkpoint| checkpoint.workload.as_ref())
+            .map(|workload| workload.overlay_owner.clone()),
         // Record secrets = packed refs from --from (validated Untrusted above)
         // merged with request refs (validated Untrusted at ~line 333); request
         // refs win on key collision. Both sources are store-only, so RecordReplay
@@ -1394,8 +1459,8 @@ pub async fn start_machine(
     let ports = record.port_mappings();
     let resources = record.vm_resources();
     // Snapshot restore inherits the already-running workload. Remember this
-    // before AgentManager consumes the one-shot payload at readiness so the API
-    // does not launch a duplicate container afterwards.
+    // before finalization consumes the one-shot payload so the API does not
+    // launch a duplicate container afterwards.
     let restoring_checkpoint =
         crate::portable_checkpoint::pending_dir(&vm_data_dir(&name)).is_some();
 
@@ -1409,6 +1474,7 @@ pub async fn start_machine(
     let record_golden = record.golden.clone();
     let cuda_fork_pool_size = record.cuda_fork_pool_size;
     let cuda_vram_limit_mib = record.cuda_vram_limit_mib;
+    let restore_record = record.clone();
     let forkable = query.forkable || query.fork_pool_size.is_some() || record.forkable_on_start();
     let (manager, pid) = tokio::task::spawn_blocking(move || {
         let manager = AgentManager::for_vm_with_sizes(&name_clone, storage_gb, overlay_gb)
@@ -1439,6 +1505,16 @@ pub async fn start_machine(
         let _ = manager
             .ensure_running_via_subprocess(mounts, ports, resources, features)
             .map_err(|e| format!("failed to start machine: {}", e))?;
+
+        if restoring_checkpoint {
+            if let Err(error) =
+                crate::portable_checkpoint::finalize_live_restore(&name_clone, &restore_record)
+                    .and_then(|()| crate::portable_checkpoint::consume(&vm_data_dir(&name_clone)))
+            {
+                let _ = manager.stop();
+                return Err(format!("failed to finalize checkpoint restore: {error}"));
+            }
+        }
 
         let pid = manager.child_pid();
         Ok::<_, String>((manager, pid))

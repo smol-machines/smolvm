@@ -13,15 +13,17 @@ use imago::{FormatDriverBuilder, PermissiveImplicitOpenGate};
 use sha2::{Digest, Sha256};
 use smolvm_pack::assets::AssetCollector;
 use smolvm_pack::format::{
-    CheckpointAsset, CheckpointDisk, CheckpointDiskFile, PackManifest, PackMode,
-    PortableCheckpointManifest,
+    CheckpointAsset, CheckpointDisk, CheckpointDiskFile, CheckpointNetwork, CheckpointPort,
+    CheckpointWorkload, PackManifest, PackMode, PortableCheckpointManifest,
 };
 use smolvm_pack::packer::Packer;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-/// First portable-checkpoint metadata version.
-pub const FORMAT_VERSION: u32 = 1;
+/// Current portable-checkpoint metadata version.
+pub const FORMAT_VERSION: u32 = 2;
+/// Oldest metadata version this runtime can restore.
+pub const MIN_FORMAT_VERSION: u32 = 1;
 /// libkrun VM/vCPU/device-state compatibility identifier.
 pub const RUNTIME_ABI: &str = "libkrun-portable-snapshot-v1";
 /// Device topology supported by the initial portable checkpoint profile.
@@ -245,6 +247,12 @@ pub fn capture_to_path(
         host_platform.clone(),
     );
     crate::pack_export::seed_manifest_from_vm(&mut manifest, vm, &assets);
+    // A normal VM-mode pack supplies `/bin/sh` when the source has no explicit
+    // entrypoint because it packages a flattened rootfs. A live checkpoint must
+    // preserve the exact OCI launch vector instead: injecting `/bin/sh` turns a
+    // valid `python3 ...` workload into the invalid `/bin/sh python3 ...` after
+    // the restored machine's first ordinary cold restart.
+    manifest.entrypoint = vm.entrypoint.clone();
     manifest.cpus = vm.cpus;
     manifest.mem = vm.mem;
     manifest.checkpoint = Some(PortableCheckpointManifest {
@@ -254,6 +262,17 @@ pub fn capture_to_path(
         cpu_fingerprint: cpu_fingerprint()?,
         cpus: vm.cpus,
         memory_mib: vm.mem,
+        // Persist the effective sizes, not the optional user overrides. This
+        // keeps the artifact self-describing if runtime defaults change before
+        // it is restored on another host.
+        storage_gib: Some(
+            vm.storage_gb
+                .unwrap_or(crate::storage::DEFAULT_STORAGE_SIZE_GIB),
+        ),
+        overlay_gib: Some(
+            vm.overlay_gb
+                .unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GIB),
+        ),
         device_profile: DEVICE_PROFILE.to_string(),
         state: describe_asset(
             &snapshot_dir.join("checkpoint.bin"),
@@ -265,6 +284,8 @@ pub fn capture_to_path(
             "checkpoint/manifest.bin",
         )?,
         disks: checkpoint_disks,
+        workload: checkpoint_workload(name, vm),
+        network: Some(checkpoint_network(vm)),
     });
     manifest.assets = collector.into_inventory();
 
@@ -278,6 +299,21 @@ pub fn capture_to_path(
         size_bytes: info.total_size,
         source_pause,
         elapsed: started.elapsed(),
+    })
+}
+
+fn checkpoint_workload(name: &str, vm: &VmRecord) -> Option<CheckpointWorkload> {
+    vm.image.as_ref().map(|image| CheckpointWorkload {
+        image: image.clone(),
+        user: vm.user.clone(),
+        overlay_owner: crate::workload::persistent_overlay_owner_with_lineage(
+            name,
+            vm.golden.as_deref(),
+            vm.fork_overlay_owner.as_deref(),
+        ),
+        restart_policy: vm.restart.policy.to_string(),
+        restart_max_retries: vm.restart.max_retries,
+        restart_max_backoff_secs: vm.restart.max_backoff_secs,
     })
 }
 
@@ -351,14 +387,29 @@ pub fn validate_capture_profile(vm: &VmRecord) -> Result<()> {
     if !vm.mounts.is_empty() {
         unsupported.push("host mounts");
     }
-    if !vm.ports.is_empty() || vm.network {
-        unsupported.push("network/port forwarding");
-    }
     if !vm.published_sockets.is_empty() {
         unsupported.push("published sockets");
     }
     if !vm.remote_volumes.is_empty() {
         unsupported.push("remote volumes");
+    }
+    if !vm.secret_refs.is_empty() {
+        unsupported.push("host secret references");
+    }
+    if vm.source_smolmachine.is_some()
+        || vm
+            .image
+            .as_deref()
+            .and_then(crate::data::image_source::packed_layers_dir_for_ref)
+            .is_some()
+    {
+        unsupported.push("host-backed image layers");
+    }
+    if vm.dns.is_some() {
+        unsupported.push("custom DNS");
+    }
+    if vm.network_name.is_some() {
+        unsupported.push("named inter-VM networking");
     }
     if vm.gpu.unwrap_or(false) {
         unsupported.push("Vulkan GPU state");
@@ -375,9 +426,6 @@ pub fn validate_capture_profile(vm: &VmRecord) -> Result<()> {
     if vm.docker_socket {
         unsupported.push("Docker socket forwarding");
     }
-    if vm.image.is_some() {
-        unsupported.push("image-backed rootfs");
-    }
     if unsupported.is_empty() {
         return Ok(());
     }
@@ -388,6 +436,56 @@ pub fn validate_capture_profile(vm: &VmRecord) -> Result<()> {
             unsupported.join(", ")
         ),
     ))
+}
+
+/// Parse the effective network backend persisted by a version-two checkpoint.
+pub fn restored_network_backend(
+    checkpoint: &PortableCheckpointManifest,
+) -> Result<Option<crate::network::NetworkBackend>> {
+    let Some(label) = checkpoint
+        .network
+        .as_ref()
+        .and_then(|network| network.backend.as_deref())
+    else {
+        return Ok(None);
+    };
+    match label {
+        "tsi" => Ok(Some(crate::network::NetworkBackend::Tsi)),
+        "virtio-net" => Ok(Some(crate::network::NetworkBackend::VirtioNet)),
+        other => Err(Error::agent(
+            "restore checkpoint",
+            format!("checkpoint uses unknown network backend '{other}'"),
+        )),
+    }
+}
+
+fn checkpoint_network(vm: &VmRecord) -> CheckpointNetwork {
+    let effective = crate::network::plan_launch_network(
+        &vm.vm_resources(),
+        vm.dns_filter_hosts.as_deref(),
+        vm.ports.len(),
+    );
+    let backend = match effective.backend {
+        crate::network::EffectiveNetworkBackend::None => None,
+        crate::network::EffectiveNetworkBackend::Tsi => Some("tsi".to_string()),
+        crate::network::EffectiveNetworkBackend::VirtioNet => Some("virtio-net".to_string()),
+    };
+    CheckpointNetwork {
+        enabled: effective.has_network(),
+        ports: vm
+            .ports
+            .iter()
+            .map(|(host, guest)| CheckpointPort {
+                host: *host,
+                guest: *guest,
+            })
+            .collect(),
+        backend,
+        dns: vm.dns.map(|dns| dns.to_string()),
+        network_name: vm.network_name.clone(),
+        allowed_cidrs: vm.allowed_cidrs.clone(),
+        dns_filter_hosts: vm.dns_filter_hosts.clone(),
+    }
 }
 
 fn disk_target(role: &str, index: usize, format: &str) -> Result<String> {
@@ -679,12 +777,12 @@ pub fn describe_asset(path: &Path, relative_path: &str) -> Result<CheckpointAsse
 
 /// Validate that a checkpoint may be restored by this host and runtime.
 pub fn validate_compatibility(checkpoint: &PortableCheckpointManifest) -> Result<()> {
-    if checkpoint.version != FORMAT_VERSION {
+    if !(MIN_FORMAT_VERSION..=FORMAT_VERSION).contains(&checkpoint.version) {
         return Err(Error::agent(
             "restore checkpoint",
             format!(
-                "unsupported checkpoint version {} (runtime supports {})",
-                checkpoint.version, FORMAT_VERSION
+                "unsupported checkpoint version {} (runtime supports {} through {})",
+                checkpoint.version, MIN_FORMAT_VERSION, FORMAT_VERSION
             ),
         ));
     }
@@ -717,6 +815,60 @@ pub fn validate_compatibility(checkpoint: &PortableCheckpointManifest) -> Result
                 checkpoint.device_profile
             ),
         ));
+    }
+    if checkpoint.version >= 2 {
+        let network = checkpoint.network.as_ref().ok_or_else(|| {
+            Error::agent(
+                "restore checkpoint",
+                "version-two checkpoint is missing its network descriptor",
+            )
+        })?;
+        let backend = restored_network_backend(checkpoint)?;
+        let mut hosts = std::collections::HashSet::new();
+        for port in &network.ports {
+            if port.host == 0 || port.guest == 0 || !hosts.insert(port.host) {
+                return Err(Error::agent(
+                    "restore checkpoint",
+                    "checkpoint contains an invalid or duplicate port mapping",
+                ));
+            }
+        }
+        if !network.ports.is_empty() && backend != Some(crate::network::NetworkBackend::VirtioNet) {
+            return Err(Error::agent(
+                "restore checkpoint",
+                "checkpoint port mappings require the virtio-net backend",
+            ));
+        }
+        if !network.enabled && (!network.ports.is_empty() || backend.is_some()) {
+            return Err(Error::agent(
+                "restore checkpoint",
+                "checkpoint network descriptor is internally inconsistent",
+            ));
+        }
+        if let Some(workload) = checkpoint.workload.as_ref() {
+            if workload.image.trim().is_empty() {
+                return Err(Error::agent(
+                    "restore checkpoint",
+                    "checkpoint workload image is empty",
+                ));
+            }
+            if crate::data::validate_vm_name(&workload.overlay_owner, "overlay owner").is_err() {
+                return Err(Error::agent(
+                    "restore checkpoint",
+                    "checkpoint workload overlay owner is invalid",
+                ));
+            }
+            if workload
+                .restart_policy
+                .parse::<crate::config::RestartPolicy>()
+                .is_err()
+            {
+                return Err(Error::agent(
+                    "restore checkpoint",
+                    "checkpoint workload restart policy is invalid",
+                ));
+            }
+        }
     }
     if checkpoint.cpus == 0 || checkpoint.memory_mib == 0 {
         return Err(Error::agent(
@@ -1039,6 +1191,17 @@ pub fn install(
     result
 }
 
+/// Finish a portable live restore before exposing the machine to callers.
+///
+/// The restored guest still contains the source machine's live container and
+/// per-machine identity. Rejuvenation re-mints that identity and records the
+/// inherited crun container ID so later `machine exec` calls join the restored
+/// workload instead of silently creating a second container.
+pub fn finalize_live_restore(name: &str, record: &VmRecord) -> Result<()> {
+    crate::agent::fork::rejuvenate_clone(name, record)?;
+    crate::agent::fork::release_forkpoint(name)
+}
+
 /// Return the pending one-shot checkpoint directory for a machine, if any.
 pub fn pending_dir(vm_data_dir: &Path) -> Option<PathBuf> {
     let dir = vm_data_dir.join(INSTALLED_DIR);
@@ -1108,6 +1271,8 @@ mod tests {
             cpu_fingerprint: cpu_fingerprint().unwrap(),
             cpus: 2,
             memory_mib: 512,
+            storage_gib: None,
+            overlay_gib: None,
             device_profile: DEVICE_PROFILE.to_string(),
             state: describe_asset(&source.join("checkpoint.bin"), "checkpoint/checkpoint.bin")
                 .unwrap(),
@@ -1118,6 +1283,8 @@ mod tests {
                 disk("storage", "storage.raw"),
                 disk("overlay", "overlay.raw"),
             ],
+            workload: None,
+            network: Some(CheckpointNetwork::default()),
         };
         let machine = tempfile::tempdir().unwrap();
         install(extracted.path(), machine.path(), &metadata).unwrap();
@@ -1157,5 +1324,98 @@ mod tests {
         let mut incompatible = metadata;
         incompatible.runtime_abi.push_str("-other");
         assert!(validate_compatibility(&incompatible).is_err());
+    }
+
+    #[test]
+    fn common_image_service_is_checkpoint_eligible() {
+        let mut record = VmRecord::new(
+            "image-service".to_string(),
+            2,
+            1024,
+            Vec::new(),
+            vec![(18080, 8080)],
+            true,
+        );
+        record.image = Some("python:3.12-alpine".to_string());
+        record.network_backend = Some(crate::network::NetworkBackend::VirtioNet);
+        record.restart.policy = crate::config::RestartPolicy::OnFailure;
+        record.restart.max_retries = 7;
+        record.restart.max_backoff_secs = 19;
+
+        validate_capture_profile(&record).expect("image + network + ports must be portable");
+        let workload = checkpoint_workload(&record.name, &record).unwrap();
+        assert_eq!(workload.image, "python:3.12-alpine");
+        assert_eq!(workload.overlay_owner, "image-service");
+        assert_eq!(workload.restart_policy, "on-failure");
+        assert_eq!(workload.restart_max_retries, 7);
+        assert_eq!(workload.restart_max_backoff_secs, 19);
+        let network = checkpoint_network(&record);
+        assert!(network.enabled);
+        assert_eq!(network.backend.as_deref(), Some("virtio-net"));
+        assert_eq!(
+            network.ports,
+            vec![CheckpointPort {
+                host: 18080,
+                guest: 8080
+            }]
+        );
+    }
+
+    #[test]
+    fn host_bound_attachments_remain_ineligible() {
+        let mut record = VmRecord::new(
+            "host-bound".to_string(),
+            2,
+            1024,
+            vec![("/host".to_string(), "/guest".to_string(), true)],
+            Vec::new(),
+            false,
+        );
+        record.image = Some("alpine:3.20".to_string());
+        let error = validate_capture_profile(&record).unwrap_err().to_string();
+        assert!(error.contains("host mounts"), "{error}");
+
+        record.mounts.clear();
+        record.source_smolmachine = Some("/tmp/source.smolmachine".to_string());
+        let error = validate_capture_profile(&record).unwrap_err().to_string();
+        assert!(error.contains("host-backed image layers"), "{error}");
+    }
+
+    #[test]
+    fn version_one_bare_checkpoint_remains_compatible() {
+        let mut metadata = PortableCheckpointManifest {
+            version: 1,
+            runtime_abi: RUNTIME_ABI.to_string(),
+            host_platform: crate::platform::Platform::current()
+                .host_oci_platform()
+                .to_string(),
+            cpu_fingerprint: cpu_fingerprint().unwrap(),
+            cpus: 1,
+            memory_mib: 1,
+            storage_gib: None,
+            overlay_gib: None,
+            device_profile: DEVICE_PROFILE.to_string(),
+            state: CheckpointAsset {
+                path: "checkpoint/checkpoint.bin".to_string(),
+                size: 1,
+                sha256: "00".repeat(32),
+            },
+            memory: CheckpointAsset {
+                path: "checkpoint/memory.bin".to_string(),
+                size: 1,
+                sha256: "00".repeat(32),
+            },
+            layout: CheckpointAsset {
+                path: "checkpoint/manifest.bin".to_string(),
+                size: 1,
+                sha256: "00".repeat(32),
+            },
+            disks: Vec::new(),
+            workload: None,
+            network: None,
+        };
+        validate_compatibility(&metadata).unwrap();
+        metadata.version = 0;
+        assert!(validate_compatibility(&metadata).is_err());
     }
 }

@@ -363,6 +363,72 @@ pub struct CheckpointDisk {
     pub files: Vec<CheckpointDiskFile>,
 }
 
+/// Container workload identity needed after a live checkpoint is restored.
+///
+/// The running container itself is present in guest RAM. These fields are for
+/// host-side routing (`machine exec`) and for launching the same persistent
+/// workload exactly once after a later ordinary stop/start cycle.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointWorkload {
+    /// OCI image identity used by the persistent workload.
+    pub image: String,
+    /// Container user resolved from the image or supplied by the caller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// Persistent overlay identifier containing the restored container state.
+    ///
+    /// A checkpoint may be restored under a different machine name, but the
+    /// live overlay mount and crun state retain the identifier used at capture.
+    pub overlay_owner: String,
+    /// Restart policy to apply after the live checkpoint has been consumed.
+    pub restart_policy: String,
+    /// Maximum automatic restart attempts (`0` means unlimited).
+    #[serde(default)]
+    pub restart_max_retries: u32,
+    /// Maximum restart backoff in seconds (`0` selects the runtime default).
+    #[serde(default)]
+    pub restart_max_backoff_secs: u64,
+}
+
+/// One host-to-guest TCP forward restored around a live VM.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointPort {
+    /// Host TCP port on the restoring node.
+    pub host: u16,
+    /// Guest TCP port reached by the host listener.
+    pub guest: u16,
+}
+
+/// Re-creatable host networking attached to a live checkpoint.
+///
+/// Open host sockets are deliberately not serialized. The target recreates
+/// the same virtual network device and fresh host listeners before resuming
+/// the captured guest; pre-existing external connections may be lost.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CheckpointNetwork {
+    /// Whether the captured VM had a network backend attached.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Host listeners to recreate around the restored VM.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<CheckpointPort>,
+    /// Effective backend used at capture: `tsi` or `virtio-net`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    /// Custom IPv4 DNS resolver, when one was explicitly configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns: Option<String>,
+    /// Named local inter-VM network joined by the captured machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_name: Option<String>,
+    /// Captured outbound CIDR allow-list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_cidrs: Option<Vec<String>>,
+    /// Captured outbound DNS hostname allow-list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_filter_hosts: Option<Vec<String>>,
+}
+
 /// Compatibility and payload metadata for a portable live checkpoint.
 ///
 /// The pack container itself is portable storage; live CPU/device state is
@@ -382,6 +448,12 @@ pub struct PortableCheckpointManifest {
     pub cpus: u8,
     /// Configured guest memory in MiB.
     pub memory_mib: u32,
+    /// Effective persistent storage size in GiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_gib: Option<u64>,
+    /// Effective writable overlay size in GiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_gib: Option<u64>,
     /// Stable identifier for the captured virtual device topology.
     pub device_profile: String,
     /// Serialized VM, vCPU, and device state.
@@ -393,6 +465,13 @@ pub struct PortableCheckpointManifest {
     /// Exact block-image chains from the same paused boundary as RAM.
     #[serde(default)]
     pub disks: Vec<CheckpointDisk>,
+    /// Persistent container identity. Absent on version-one bare-VM
+    /// checkpoints and on checkpoints captured from an imageless machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload: Option<CheckpointWorkload>,
+    /// Host networking reconstructed around the restored VM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<CheckpointNetwork>,
 }
 
 /// Manifest describing the packed image and configuration.

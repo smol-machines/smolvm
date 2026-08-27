@@ -3485,6 +3485,18 @@ impl CreateCmd {
             cli_network,
             cli_dns_filter_hosts,
         );
+        let checkpoint_network = checkpoint
+            .as_ref()
+            .and_then(|checkpoint| checkpoint.network.as_ref());
+        let network = checkpoint_network
+            .map(|captured| captured.enabled)
+            .unwrap_or(network);
+        let allowed_cidrs = checkpoint_network
+            .and_then(|captured| captured.allowed_cidrs.clone())
+            .or(allowed_cidrs);
+        let dns_filter_hosts = checkpoint_network
+            .and_then(|captured| captured.dns_filter_hosts.clone())
+            .or(dns_filter_hosts);
 
         // A .smolmachine is an untrusted, portable artifact: validate its secret
         // refs under the Untrusted scope, which rejects every source kind. A
@@ -3502,8 +3514,20 @@ impl CreateCmd {
             )?;
         }
 
-        let ports = PortMappingSpec::expand_all(&self.port)
-            .map_err(|e| smolvm::Error::config("create from .smolmachine ports", e))?;
+        let ports = if checkpoint.is_some() && self.port.is_empty() {
+            checkpoint_network
+                .into_iter()
+                .flat_map(|network| network.ports.iter())
+                .map(|port| PortMapping::new(port.host, port.guest))
+                .collect()
+        } else {
+            PortMappingSpec::expand_all(&self.port)
+                .map_err(|e| smolvm::Error::config("create from .smolmachine ports", e))?
+        };
+        let checkpoint_backend = match checkpoint.as_ref() {
+            Some(checkpoint) => smolvm::portable_checkpoint::restored_network_backend(checkpoint)?,
+            None => None,
+        };
         let params = vm_common::CreateVmParams {
             secret_refs: manifest.secret_refs,
             name,
@@ -3511,7 +3535,12 @@ impl CreateCmd {
             // label would make exec/start/re-pack treat it as a pullable image
             // (the /bin/sh-not-found bug). None routes every `image.is_some()`
             // consumer to VM behavior; provenance is in `source_smolmachine`.
-            image: if vm_seed.is_some() || checkpoint.is_some() {
+            image: if let Some(workload) = checkpoint
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.workload.as_ref())
+            {
+                Some(workload.image.clone())
+            } else if vm_seed.is_some() || checkpoint.is_some() {
                 None
             } else {
                 Some(manifest.image)
@@ -3534,7 +3563,7 @@ impl CreateCmd {
             volume: self.volume.clone(),
             port: ports,
             net: network,
-            network_backend: self.net_backend,
+            network_backend: checkpoint_backend.or(self.net_backend),
             dns: self.dns,
             network_name: self.network_name.clone(),
             init: self.init.clone(),
@@ -3547,12 +3576,31 @@ impl CreateCmd {
                 env
             },
             workdir: manifest.workdir,
-            storage_gb: self.storage,
-            overlay_gb: self.overlay,
+            storage_gb: checkpoint
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.storage_gib)
+                .or(self.storage),
+            overlay_gb: checkpoint
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.overlay_gib)
+                .or(self.overlay),
             allowed_cidrs,
-            restart_policy: None,
-            restart_max_retries: None,
-            restart_max_backoff_secs: None,
+            restart_policy: checkpoint
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.workload.as_ref())
+                .map(|workload| workload.restart_policy.parse())
+                .transpose()
+                .map_err(|error: String| {
+                    smolvm::Error::config("restore checkpoint restart policy", error)
+                })?,
+            restart_max_retries: checkpoint
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.workload.as_ref())
+                .map(|workload| workload.restart_max_retries),
+            restart_max_backoff_secs: checkpoint
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.workload.as_ref())
+                .map(|workload| workload.restart_max_backoff_secs),
             labels: smolvm::util::parse_labels(&self.labels)?,
             health_cmd: None,
             health_interval_secs: None,
@@ -3609,6 +3657,14 @@ impl CreateCmd {
             // running workload. Re-running image pull/init after resume would
             // duplicate side effects and violate checkpoint semantics.
             record.init_completed = true;
+            record.user = checkpoint
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.workload.as_ref())
+                .and_then(|workload| workload.user.clone());
+            record.fork_overlay_owner = checkpoint
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.workload.as_ref())
+                .map(|workload| workload.overlay_owner.clone());
         }
         let reservation = vm_common::CreateVmReservation::reserve(&name_for_layers)?;
 

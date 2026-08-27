@@ -157,6 +157,10 @@ pub struct MachineRegistration {
     pub env: Vec<(String, String)>,
     /// Working directory (from manifest).
     pub workdir: Option<String>,
+    /// Container user captured with a live image workload.
+    pub user: Option<String>,
+    /// Persistent overlay identifier inherited by a restored image workload.
+    pub fork_overlay_owner: Option<String>,
     /// Secret refs to attach to this machine (from a Smolfile or
     /// `CreateMachineRequest.secrets`).
     pub secret_refs: std::collections::BTreeMap<String, smolvm_protocol::SecretRef>,
@@ -926,6 +930,8 @@ impl ApiState {
         record.cmd = reg.cmd;
         record.env = reg.env;
         record.workdir = reg.workdir;
+        record.user = reg.user;
+        record.fork_overlay_owner = reg.fork_overlay_owner;
         record.secret_refs = reg.secret_refs.clone();
         record.remote_volumes = reg.remote_volumes.clone();
         record
