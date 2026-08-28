@@ -78,12 +78,19 @@ pub fn ensure_running_and_connect(
         // so a typo in the name gives a clear error rather than the
         // generic "not running / use start" message.
         if let Some(ref n) = name {
-            let exists = SmolvmDb::open()
+            let record = SmolvmDb::open()
                 .ok()
-                .and_then(|db| db.get_vm(n).ok().flatten())
-                .is_some();
-            if !exists {
+                .and_then(|db| db.get_vm(n).ok().flatten());
+            let Some(record) = record else {
                 return Err(smolvm::Error::vm_not_found(n));
+            };
+            if smolvm::agent::state_probe::resolve_state(n, &record) == RecordState::Frozen {
+                return Err(smolvm::Error::agent(
+                    "connect",
+                    format!(
+                        "machine '{n}' is frozen as a reusable fork base; fork it again, or delete its descendants and stop it before restarting"
+                    ),
+                ));
             }
         }
 
@@ -171,6 +178,12 @@ fn mark_unreachable_if_zombie(name: &str) {
     }
     if !record.is_process_alive() {
         // PID dead → next list will see Stopped without our help.
+        return;
+    }
+    // A fork base is intentionally paused and cannot answer its agent socket.
+    // Treating that expected silence as a zombie corrupts the source record to
+    // Unreachable and makes later retained-checkpoint forks inherit bad state.
+    if smolvm::agent::state_probe::is_frozen_fork_base(name, record) {
         return;
     }
     // PID alive + ensure_running_and_connect failed → zombie. Persist

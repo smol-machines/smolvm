@@ -3754,11 +3754,9 @@ impl CreateCmd {
             }
 
             if let Some(ref checkpoint) = checkpoint {
-                smolvm::portable_checkpoint::install(
-                    &pack_content_dir,
-                    &smolvm::agent::vm_data_dir(&name_for_layers),
-                    checkpoint,
-                )?;
+                let vm_data_dir = smolvm::agent::vm_data_dir(&name_for_layers);
+                smolvm::portable_checkpoint::install(&pack_content_dir, &vm_data_dir, checkpoint)?;
+                smolvm::portable_checkpoint::discard_transport_pack(&vm_data_dir)?;
             }
 
             reservation.commit(&record)?;

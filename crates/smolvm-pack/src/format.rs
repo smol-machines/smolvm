@@ -338,8 +338,8 @@ pub struct CheckpointAsset {
     pub path: String,
     /// Uncompressed byte length.
     pub size: u64,
-    /// Lowercase SHA-256 digest of the file contents. Empty for sparse block
-    /// files whose integrity is provided by the pack container checksum.
+    /// Lowercase SHA-256 digest of the file contents. Empty for sparse memory
+    /// or block files whose integrity is provided by the pack container.
     pub sha256: String,
 }
 

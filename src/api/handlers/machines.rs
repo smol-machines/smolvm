@@ -1030,6 +1030,11 @@ pub async fn create_machine(
                 &vm_data_dir(&name_for_checkpoint),
                 &checkpoint,
             )
+            .and_then(|()| {
+                crate::portable_checkpoint::discard_transport_pack(&vm_data_dir(
+                    &name_for_checkpoint,
+                ))
+            })
             .map_err(|error| ApiError::BadRequest(error.to_string()))
         })
         .await

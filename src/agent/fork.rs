@@ -923,6 +923,11 @@ fn prepare_clone_from_snapshot(
 
         let mut clone_rec = golden_rec.clone();
         clone_rec.name = clone.to_string();
+        // The record exists before its restored VMM does. Never inherit the
+        // source's Running/Unreachable state: start must treat this as a clean
+        // launch, and only persist Running after the clone answers its agent
+        // readiness probe.
+        clone_rec.state = crate::config::RecordState::Created;
         clone_rec.pid = None;
         clone_rec.pid_start_time = None;
         if !spec.fork_env.is_empty() {
