@@ -161,6 +161,52 @@ fn process_children(pid: libc::pid_t) -> Vec<libc::pid_t> {
         .collect()
 }
 
+/// Where crun records its own diagnostics for a [`CrunCommand::create`].
+///
+/// `crun create` hands its stdout and stderr to the container process, so the
+/// builder cannot capture them to find out why a create failed. `--log` is the
+/// one channel that carries crun's errors without touching container stdio.
+pub fn create_log_path(container_id: &str) -> PathBuf {
+    // Part of the id reaches here from a machine name, so it is reduced to
+    // characters that cannot walk out of the run directory.
+    let stem: String = container_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    Path::new(paths::CONTAINERS_RUN_DIR).join(format!("create-{stem}.log"))
+}
+
+/// Read back and remove the diagnostics crun recorded for a failed create.
+/// Empty when crun logged nothing, so callers should fall back to stderr.
+pub fn take_create_log(container_id: &str) -> String {
+    let path = create_log_path(container_id);
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let _ = std::fs::remove_file(&path);
+    text.trim().to_string()
+}
+
+/// Best available explanation for a failed create: crun's log, its stderr when
+/// the log is empty, and failing both the exit status -- which at least
+/// distinguishes a rejected config from a crun that died on a signal.
+pub fn create_failure_reason(container_id: &str, output: &std::process::Output) -> String {
+    let logged = take_create_log(container_id);
+    if !logged.is_empty() {
+        return logged;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    if !stderr.is_empty() {
+        return stderr.to_string();
+    }
+    format!("crun {} and reported nothing", output.status)
+}
+
 impl CrunCommand {
     /// Create a new crun command with standard configuration.
     ///
@@ -188,10 +234,23 @@ impl CrunCommand {
     /// Create a container: `crun create --bundle <path> <id>`
     ///
     /// This puts the container in "created" state, ready for `crun start`.
-    /// Stdio defaults to null because capturing pipes can block when child
-    /// processes inherit file descriptors.
+    /// Stdio is null because the created container inherits it: capturing the
+    /// pipes would make `output()` block until the container itself exits.
+    /// crun's own diagnostics therefore go to [`create_log_path`], which a
+    /// failed create reads back with [`take_create_log`].
     pub fn create(bundle_dir: &Path, container_id: &str) -> Self {
+        let log_path = create_log_path(container_id);
+        // A stale log from an earlier attempt would be misreported as this
+        // one's reason, and crun refuses to start if it cannot open the file.
+        let log_ready = std::fs::create_dir_all(paths::CONTAINERS_RUN_DIR).is_ok()
+            && match std::fs::remove_file(&log_path) {
+                Ok(()) => true,
+                Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+            };
         let mut c = Self::new();
+        if log_ready {
+            c.cmd.args(["--log", &log_path.to_string_lossy()]);
+        }
         c.cmd.args([
             "create",
             "--bundle",

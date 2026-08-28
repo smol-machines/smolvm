@@ -783,13 +783,29 @@ fn ordered_packed_layer_names(packed_dir: &Path) -> Result<Vec<String>> {
         let entry = entry?;
         if entry.path().is_dir() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if !name.ends_with(".tar") {
+            // A packed store is a volume root on macOS, so it always carries
+            // filesystem bookkeeping directories. They are not image layers,
+            // and mistaking one for the whole image builds a rootfs out of it.
+            if !name.ends_with(".tar") && !is_volume_metadata(&entry.file_name()) {
                 present.insert(name);
             }
         }
     }
 
+    // A store with no usable layer directory at all cannot produce the image's
+    // filesystem. Returning an empty list here would hand the caller an overlay
+    // with no lower layer, which surfaces much later as a missing executable.
+    if present.is_empty() {
+        return Err(StorageError::new(format!(
+            "no image layers are present in {}. The image has to be unpacked again \
+             before this machine can start.",
+            packed_dir.display()
+        )));
+    }
+
     // Prefer the explicit order index when it resolves to layers we actually have.
+    // A stale index that names a layer we do not have falls back to the name sort
+    // below rather than dropping the real layers that are here.
     if let Ok(contents) = std::fs::read_to_string(packed_dir.join(LAYER_ORDER_FILE)) {
         let ordered: Vec<String> = contents
             .lines()
@@ -2578,6 +2594,71 @@ pub fn garbage_collect(dry_run: bool) -> Result<u64> {
 ///
 /// Encapsulates the common logic for preparing overlay directories,
 /// mounting layers, and creating OCI bundles.
+/// Entries a filesystem puts at a volume root that never belong to an image
+/// layer. A layer store on macOS is an APFS volume, so it always carries at
+/// least `.fseventsd` -- which made an emptied store look populated and let a
+/// container start on an image that no longer had a filesystem.
+fn is_volume_metadata(name: &std::ffi::OsStr) -> bool {
+    matches!(
+        name.to_string_lossy().as_ref(),
+        ".fseventsd"
+            | ".Spotlight-V100"
+            | ".Trashes"
+            | ".TemporaryItems"
+            | ".DS_Store"
+            | ".DocumentRevisions-V100"
+            | "lost+found"
+    )
+}
+
+/// Reject lower layers that cannot produce the image's filesystem.
+///
+/// A single empty layer is legal -- an OCI layer may carry only metadata or
+/// whiteouts. Every layer being empty is not: the image then contributes
+/// nothing, the container runs on its upper layer alone, and the first sign of
+/// trouble is `executable file not found in $PATH` for a binary the image was
+/// supposed to provide. Failing here names the real problem instead.
+fn verify_layers(lowerdirs: &[String]) -> Result<()> {
+    let mut populated = 0usize;
+    for layer_path in lowerdirs {
+        let path = Path::new(layer_path);
+        if !path.exists() {
+            return Err(StorageError::new(format!(
+                "layer path does not exist: {}",
+                layer_path
+            )));
+        }
+        let entry_count = std::fs::read_dir(path)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| !is_volume_metadata(&e.file_name()))
+                    .count()
+            })
+            .unwrap_or(0);
+        if entry_count == 0 {
+            warn!(layer = %layer_path, "layer directory is empty");
+        } else {
+            populated += 1;
+        }
+    }
+    if populated == 0 && !lowerdirs.is_empty() {
+        return Err(StorageError::new(format!(
+            "the machine's image layers are missing: all {} unpacked layer \
+             director{} empty, so the container would have no image \
+             filesystem. The image has to be unpacked again before this \
+             machine can start.",
+            lowerdirs.len(),
+            if lowerdirs.len() == 1 {
+                "y is"
+            } else {
+                "ies are"
+            },
+        )));
+    }
+    Ok(())
+}
+
 struct OverlaySetup {
     overlay_root: PathBuf,
     upper_path: PathBuf,
@@ -2687,23 +2768,7 @@ impl OverlaySetup {
 
     /// Verify that all layer paths exist and log warnings for empty layers.
     fn verify_layers(&self, lowerdirs: &[String]) -> Result<()> {
-        for layer_path in lowerdirs {
-            let path = Path::new(layer_path);
-            if !path.exists() {
-                return Err(StorageError::new(format!(
-                    "layer path does not exist: {}",
-                    layer_path
-                )));
-            }
-            // Check if layer has contents
-            let entry_count = std::fs::read_dir(path)
-                .map(|entries| entries.count())
-                .unwrap_or(0);
-            if entry_count == 0 {
-                warn!(layer = %layer_path, "layer directory is empty");
-            }
-        }
-        Ok(())
+        verify_layers(lowerdirs)
     }
 
     /// Mount the overlay filesystem with fallback from multi-lowerdir to sequential.
@@ -3685,7 +3750,7 @@ fn establish_keepalive_container(
     if !create.status.success() {
         return Err(StorageError::new(format!(
             "keep-alive crun create failed: {}",
-            String::from_utf8_lossy(&create.stderr).trim()
+            crate::crun::create_failure_reason(&container_id, &create)
         )));
     }
 
@@ -4635,6 +4700,106 @@ fn dir_size(path: &Path) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    /// One empty layer is a legal OCI layer (metadata or whiteouts only), so
+    /// verification must not reject an image just for containing one.
+    #[test]
+    fn a_single_empty_layer_beside_a_populated_one_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty");
+        let full = dir.path().join("full");
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::create_dir_all(full.join("usr")).unwrap();
+        let layers = vec![
+            empty.to_string_lossy().into_owned(),
+            full.to_string_lossy().into_owned(),
+        ];
+        assert!(verify_layers(&layers).is_ok());
+    }
+
+    /// Every layer empty means the container would run on its upper layer
+    /// alone. That used to be accepted with only a warning, and surfaced much
+    /// later as a misleading "executable file not found in $PATH".
+    #[test]
+    fn layers_that_are_all_empty_are_rejected_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let layers = vec![
+            a.to_string_lossy().into_owned(),
+            b.to_string_lossy().into_owned(),
+        ];
+        let err = verify_layers(&layers).expect_err("all-empty layers must not be accepted");
+        assert!(
+            err.to_string().contains("image layers are missing"),
+            "error should name the real problem, got: {err}"
+        );
+    }
+
+    /// The failure this pair of fixes came from: an emptied macOS layer store
+    /// still has `.fseventsd`, which was enumerated as the image's only layer,
+    /// so the container came up on a rootfs made of filesystem bookkeeping.
+    #[test]
+    fn volume_metadata_is_never_enumerated_as_an_image_layer() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".fseventsd")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".Spotlight-V100")).unwrap();
+        let err = ordered_packed_layer_names(dir.path())
+            .expect_err("bookkeeping directories are not layers");
+        assert!(err.to_string().contains("no image layers"), "got: {err}");
+    }
+
+    /// A store with no usable layer directory cannot produce the image, so it
+    /// must fail by name rather than hand back an empty layer list.
+    #[test]
+    fn a_store_with_no_usable_layer_directory_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".fseventsd")).unwrap();
+        std::fs::write(dir.path().join(LAYER_ORDER_FILE), "aaaa1111bbbb\n").unwrap();
+        let err = ordered_packed_layer_names(dir.path())
+            .expect_err("a store holding no layer must not resolve");
+        assert!(err.to_string().contains("no image layers"), "got: {err}");
+    }
+
+    /// The fallback still works for a legacy store that has no index at all.
+    #[test]
+    fn a_store_without_an_order_index_still_sorts_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("bbbb")).unwrap();
+        std::fs::create_dir_all(dir.path().join("aaaa")).unwrap();
+        let names = ordered_packed_layer_names(dir.path()).unwrap();
+        assert_eq!(names, vec!["aaaa".to_string(), "bbbb".to_string()]);
+    }
+
+    /// The exact shape that got through: a layer store that is an emptied
+    /// macOS volume still carries `.fseventsd`, which counted as content and
+    /// let a container start on an image with no filesystem.
+    #[test]
+    fn a_layer_holding_only_volume_metadata_counts_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("layers-cs");
+        std::fs::create_dir_all(store.join(".fseventsd")).unwrap();
+        std::fs::write(store.join(".DS_Store"), b"").unwrap();
+        let layers = vec![store.to_string_lossy().into_owned()];
+        let err = verify_layers(&layers).expect_err("volume metadata is not image content");
+        assert!(
+            err.to_string().contains("image layers are missing"),
+            "got: {err}"
+        );
+    }
+
+    /// A missing layer directory is still reported as such, not folded into
+    /// the all-empty case.
+    #[test]
+    fn a_missing_layer_path_is_reported_as_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("gone");
+        let layers = vec![gone.to_string_lossy().into_owned()];
+        let err = verify_layers(&layers).expect_err("a missing layer must not be accepted");
+        assert!(err.to_string().contains("does not exist"), "got: {err}");
+    }
+
     use super::*;
     // OCI layer helpers now live in the shared crate; these tests exercise them
     // through its public API (the crate also unit-tests them independently).

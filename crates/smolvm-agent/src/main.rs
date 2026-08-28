@@ -3831,11 +3831,13 @@ fn handle_run_detached(
     match create_output {
         Ok(output) if output.status.success() => {}
         Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
             send_response(
                 stream,
                 &AgentResponse::error(
-                    format!("crun create failed: {}", stderr.trim()),
+                    format!(
+                        "crun create failed: {}",
+                        crun::create_failure_reason(&container_id, &output)
+                    ),
                     error_codes::SPAWN_FAILED,
                 ),
             )?;
@@ -4504,7 +4506,7 @@ fn ensure_main_container(
     if !create.status.success() {
         return Err(format!(
             "keep-alive crun create failed: {}",
-            String::from_utf8_lossy(&create.stderr).trim()
+            crun::create_failure_reason(&container_id, &create)
         )
         .into());
     }
