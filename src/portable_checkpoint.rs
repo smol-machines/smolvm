@@ -1499,13 +1499,19 @@ mod tests {
 
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         {
-            validate_compatibility(&metadata)
-                .expect("same-vendor KVM restore may cross CPU models");
-
-            assert_eq!(
-                metadata.cpu_contract,
-                CheckpointCpuContract::LinuxKvmIntelPortableV1
-            );
+            validate_compatibility(&metadata).expect("capturing host satisfies its CPU contract");
+            match cpu_vendor().unwrap().as_deref() {
+                Some("GenuineIntel") => assert_eq!(
+                    metadata.cpu_contract,
+                    CheckpointCpuContract::LinuxKvmIntelPortableV1
+                ),
+                _ => assert_eq!(
+                    metadata.cpu_contract,
+                    CheckpointCpuContract::ExactV1 {
+                        fingerprint: cpu_fingerprint().unwrap(),
+                    }
+                ),
+            }
         }
 
         let mut exact_mismatch = metadata.clone();
