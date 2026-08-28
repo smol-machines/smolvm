@@ -28,6 +28,7 @@ pub struct KrunFunctions {
     pub create_ctx: unsafe extern "C" fn() -> i32,
     pub free_ctx: unsafe extern "C" fn(u32),
     pub set_vm_config: unsafe extern "C" fn(u32, u8, u32) -> i32,
+    pub set_cpu_template: unsafe extern "C" fn(u32, u32) -> i32,
     pub set_workdir: unsafe extern "C" fn(u32, *const libc::c_char) -> i32,
     pub set_exec: unsafe extern "C" fn(
         u32,
@@ -44,6 +45,7 @@ pub struct KrunFunctions {
         unsafe extern "C" fn(u32, *const libc::c_char, *const libc::c_char, u64, bool) -> i32,
     >,
     pub start_enter: unsafe extern "C" fn(u32) -> i32,
+    pub get_last_error: Option<unsafe extern "C" fn() -> *const libc::c_char>,
     pub add_vsock: unsafe extern "C" fn(u32, u32) -> i32,
     /// Add a virtio-console device (the upstream replacement for the removed
     /// `krun_set_console_output`). Unix: input/output/err file descriptors.
@@ -160,6 +162,7 @@ impl KrunFunctions {
         let create_ctx = load_sym!(krun_create_ctx);
         let free_ctx = load_sym!(krun_free_ctx);
         let set_vm_config = load_sym!(krun_set_vm_config);
+        let set_cpu_template = load_sym!(krun_set_cpu_template);
         let set_workdir = load_sym!(krun_set_workdir);
         let set_exec = load_sym!(krun_set_exec);
         let set_port_map = load_sym!(krun_set_port_map);
@@ -168,6 +171,7 @@ impl KrunFunctions {
         let add_virtiofs = load_sym!(krun_add_virtiofs);
         let add_virtiofs3 = load_optional_sym!("krun_add_virtiofs3");
         let start_enter = load_sym!(krun_start_enter);
+        let get_last_error = load_optional_sym!("krun_get_last_error");
         let add_vsock = load_sym!(krun_add_vsock);
         let add_virtio_console_default = load_sym!(krun_add_virtio_console_default);
         let set_egress_policy = load_optional_sym!("krun_set_egress_policy");
@@ -190,6 +194,7 @@ impl KrunFunctions {
             create_ctx,
             free_ctx,
             set_vm_config,
+            set_cpu_template,
             set_workdir,
             set_exec,
             set_port_map,
@@ -198,6 +203,7 @@ impl KrunFunctions {
             add_virtiofs,
             add_virtiofs3,
             start_enter,
+            get_last_error,
             add_vsock,
             add_virtio_console_default,
             set_egress_policy,
@@ -216,6 +222,23 @@ impl KrunFunctions {
 }
 
 impl KrunFunctions {
+    /// Copy libkrun's thread-local diagnostic before another FFI call can
+    /// replace it. Older compatible libraries simply return no detail.
+    pub fn last_error_message(&self) -> Option<String> {
+        let get_last_error = self.get_last_error?;
+        // SAFETY: libkrun owns a NUL-terminated thread-local string whose
+        // lifetime extends until the next error update; copy it immediately.
+        let ptr = unsafe { get_last_error() };
+        if ptr.is_null() {
+            return None;
+        }
+        Some(
+            unsafe { std::ffi::CStr::from_ptr(ptr) }
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+
     /// Validate the optional host libraries needed by libkrun's Vulkan path.
     ///
     /// Linux release artifacts deliberately remove libkrun's hard

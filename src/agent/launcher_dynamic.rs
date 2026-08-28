@@ -191,6 +191,13 @@ pub fn launch_agent_vm_dynamic(
     {
         free_ctx_on_err!("krun_set_vm_config failed");
     }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        let cpu_profile_result = unsafe { (krun.set_cpu_template)(ctx, 1) };
+        if cpu_profile_result < 0 && cpu_profile_result != -libc::ENOTSUP {
+            free_ctx_on_err!("libkrun does not support the portable CPU profile");
+        }
+    }
 
     // Enable GPU (virtio-gpu / Venus Vulkan) when requested by the manifest.
     // Flag logic lives in super::gpu_virgl_flags() — see mod.rs for the full
@@ -863,12 +870,16 @@ pub fn launch_agent_vm_dynamic(
     // Start VM (never returns on success)
     // SAFETY: ctx is valid, all configuration has been set
     let ret = unsafe { (krun.start_enter)(ctx) };
+    let start_error_detail = krun.last_error_message();
 
     // If we get here, something went wrong — free the context before returning
     // SAFETY: ctx is a valid context from krun_create_ctx
     unsafe { (krun.free_ctx)(ctx) };
     drop(virtio_network_runtime);
-    Err(describe_krun_start_error(ret))
+    Err(describe_krun_start_error_with_detail(
+        ret,
+        start_error_detail.as_deref(),
+    ))
 }
 
 /// Create a CString from a static string that is known not to contain NUL bytes.
@@ -917,6 +928,14 @@ pub(crate) fn describe_krun_start_error(ret: i32) -> String {
     }
 
     describe_start_error_with_probe(ret, kvm_error.as_deref())
+}
+
+pub(crate) fn describe_krun_start_error_with_detail(ret: i32, detail: Option<&str>) -> String {
+    let summary = describe_krun_start_error(ret);
+    match detail.map(str::trim).filter(|detail| !detail.is_empty()) {
+        Some(detail) => format!("{summary}; libkrun detail: {detail}"),
+        None => summary,
+    }
 }
 
 /// Whether the running binary carries the macOS hypervisor entitlement.
@@ -1090,6 +1109,20 @@ mod tests {
         let eio = describe_start_error_with_probe(-5, Some("should be ignored"));
         assert!(eio.contains("EIO"));
         assert!(!eio.contains("privilege drop"));
+    }
+
+    #[test]
+    fn describe_krun_start_error_appends_library_detail() {
+        let message = describe_krun_start_error_with_detail(
+            -22,
+            Some("build microVM: vCPU rejected checkpoint state"),
+        );
+        assert!(message.contains("krun_start_enter returned: -22"));
+        assert!(message.contains("vCPU rejected checkpoint state"));
+        assert_eq!(
+            describe_krun_start_error_with_detail(-5, Some("  ")),
+            describe_krun_start_error(-5)
+        );
     }
 
     // cargo's test binaries are ad-hoc signed without entitlements, so a

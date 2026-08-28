@@ -754,6 +754,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         let krun_create_ctx = krun.create_ctx;
         let krun_free_ctx = krun.free_ctx;
         let krun_set_vm_config = krun.set_vm_config;
+        let krun_set_cpu_template = krun.set_cpu_template;
         let krun_set_workdir = krun.set_workdir;
         let krun_set_exec = krun.set_exec;
         let krun_add_disk2 = krun.add_disk2;
@@ -785,6 +786,17 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         if krun_set_vm_config(ctx, resources.cpus, resources.memory_mib) < 0 {
             krun_free_ctx(ctx);
             return Err(Error::agent("configure vm", "krun_set_vm_config failed"));
+        }
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            let cpu_profile_result = krun_set_cpu_template(ctx, 1);
+            if cpu_profile_result < 0 && cpu_profile_result != -libc::ENOTSUP {
+                krun_free_ctx(ctx);
+                return Err(Error::agent(
+                    "configure vm",
+                    "libkrun does not support the portable CPU profile",
+                ));
+            }
         }
 
         // Enable GPU if requested (virgl for OpenGL + Venus for Vulkan via virtio-gpu).
@@ -2136,6 +2148,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // Start VM (this replaces the process on success)
         boot_timing!("entering vm");
         let ret = krun_start_enter(ctx);
+        let start_error_detail = krun.last_error_message();
 
         // If we get here, something went wrong — free the context before returning
         krun_free_ctx(ctx);
@@ -2144,7 +2157,10 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         drop(netns_bridge);
         Err(Error::agent(
             "start vm",
-            super::launcher_dynamic::describe_krun_start_error(ret),
+            super::launcher_dynamic::describe_krun_start_error_with_detail(
+                ret,
+                start_error_detail.as_deref(),
+            ),
         ))
     }
 }

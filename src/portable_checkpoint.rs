@@ -2,7 +2,7 @@
 //!
 //! A `.smolcheckpoint` uses the ordinary pack container for files and disks,
 //! plus a durable libkrun memory/device snapshot. The container can be copied
-//! anywhere; live state is restored only under an exact, fail-closed runtime
+//! anywhere; live state is restored only under a versioned, fail-closed runtime
 //! compatibility contract.
 
 use crate::config::{RecordState, SmolvmConfig, VmRecord};
@@ -13,17 +13,15 @@ use imago::{FormatDriverBuilder, PermissiveImplicitOpenGate};
 use sha2::{Digest, Sha256};
 use smolvm_pack::assets::AssetCollector;
 use smolvm_pack::format::{
-    CheckpointAsset, CheckpointDisk, CheckpointDiskFile, CheckpointNetwork, CheckpointPort,
-    CheckpointWorkload, PackManifest, PackMode, PortableCheckpointManifest,
+    CheckpointAsset, CheckpointCpuContract, CheckpointDisk, CheckpointDiskFile, CheckpointNetwork,
+    CheckpointPort, CheckpointWorkload, PackManifest, PackMode, PortableCheckpointManifest,
 };
 use smolvm_pack::packer::Packer;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 /// Current portable-checkpoint metadata version.
-pub const FORMAT_VERSION: u32 = 2;
-/// Oldest metadata version this runtime can restore.
-pub const MIN_FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 3;
 /// libkrun VM/vCPU/device-state compatibility identifier.
 pub const RUNTIME_ABI: &str = "libkrun-portable-snapshot-v1";
 /// Device topology supported by the initial portable checkpoint profile.
@@ -260,7 +258,7 @@ pub fn capture_to_path(
         version: FORMAT_VERSION,
         runtime_abi: RUNTIME_ABI.to_string(),
         host_platform,
-        cpu_fingerprint: cpu_fingerprint()?,
+        cpu_contract: checkpoint_cpu_contract()?,
         cpus: vm.cpus,
         memory_mib: vm.mem,
         // Persist the effective sizes, not the optional user overrides. This
@@ -384,6 +382,74 @@ pub fn cpu_fingerprint() -> Result<String> {
         identity.push_str(&std::env::var("PROCESSOR_ARCHITECTURE").unwrap_or_default());
     }
     Ok(hex::encode(Sha256::digest(identity.as_bytes())))
+}
+
+fn linux_cpu_vendor(cpuinfo: &str) -> Option<String> {
+    cpuinfo
+        .lines()
+        .take_while(|line| !line.trim().is_empty())
+        .find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            (key.trim() == "vendor_id")
+                .then(|| value.trim().to_string())
+                .filter(|vendor| !vendor.is_empty() && vendor.len() <= 64)
+        })
+}
+
+fn cpu_vendor() -> Result<Option<String>> {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        let cpuinfo = std::fs::read_to_string("/proc/cpuinfo")
+            .map_err(|error| Error::agent("identify CPU vendor", error.to_string()))?;
+        Ok(linux_cpu_vendor(&cpuinfo))
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    {
+        Ok(None)
+    }
+}
+
+fn checkpoint_cpu_contract() -> Result<CheckpointCpuContract> {
+    if cpu_vendor()?.as_deref() == Some("GenuineIntel") {
+        return Ok(CheckpointCpuContract::LinuxKvmIntelPortableV1);
+    }
+    Ok(CheckpointCpuContract::ExactV1 {
+        fingerprint: cpu_fingerprint()?,
+    })
+}
+
+fn validate_cpu_compatibility(checkpoint: &PortableCheckpointManifest) -> Result<()> {
+    match &checkpoint.cpu_contract {
+        CheckpointCpuContract::ExactV1 { fingerprint } => {
+            if fingerprint == &cpu_fingerprint()? {
+                return Ok(());
+            }
+            return Err(Error::agent(
+                "restore checkpoint",
+                "checkpoint CPU feature contract does not match this host",
+            ));
+        }
+        CheckpointCpuContract::LinuxKvmIntelPortableV1 => {
+            let current_vendor = cpu_vendor()?.ok_or_else(|| {
+                Error::agent(
+                    "restore checkpoint",
+                    "checkpoint CPU contract requires Linux KVM on x86_64",
+                )
+            })?;
+            if current_vendor != "GenuineIntel" {
+                return Err(Error::agent(
+                    "restore checkpoint",
+                    format!("checkpoint requires an Intel KVM host, found '{current_vendor}'"),
+                ));
+            }
+        }
+    }
+
+    // The durable vCPU state contains the exact guest CPUID and MSR contract.
+    // KVM validates those values when libkrun applies the checkpoint, so a
+    // destination missing any required architectural feature still fails
+    // closed even though host model/stepping differences are accepted here.
+    Ok(())
 }
 
 /// Reject host-bound device state that cannot yet be resumed from an artifact.
@@ -798,12 +864,12 @@ fn describe_sparse_asset(path: &Path, relative_path: &str) -> Result<CheckpointA
 
 /// Validate that a checkpoint may be restored by this host and runtime.
 pub fn validate_compatibility(checkpoint: &PortableCheckpointManifest) -> Result<()> {
-    if !(MIN_FORMAT_VERSION..=FORMAT_VERSION).contains(&checkpoint.version) {
+    if checkpoint.version != FORMAT_VERSION {
         return Err(Error::agent(
             "restore checkpoint",
             format!(
-                "unsupported checkpoint version {} (runtime supports {} through {})",
-                checkpoint.version, MIN_FORMAT_VERSION, FORMAT_VERSION
+                "unsupported checkpoint version {} (runtime requires {})",
+                checkpoint.version, FORMAT_VERSION
             ),
         ));
     }
@@ -922,14 +988,7 @@ pub fn validate_compatibility(checkpoint: &PortableCheckpointManifest) -> Result
             "checkpoint payload sizes are inconsistent with the captured machine",
         ));
     }
-    let current_cpu = cpu_fingerprint()?;
-    if checkpoint.cpu_fingerprint != current_cpu {
-        return Err(Error::agent(
-            "restore checkpoint",
-            "checkpoint CPU feature contract does not match this host",
-        ));
-    }
-    Ok(())
+    validate_cpu_compatibility(checkpoint)
 }
 
 fn expected_assets(
@@ -1372,7 +1431,7 @@ mod tests {
             host_platform: crate::platform::Platform::current()
                 .host_oci_platform()
                 .to_string(),
-            cpu_fingerprint: cpu_fingerprint().unwrap(),
+            cpu_contract: checkpoint_cpu_contract().unwrap(),
             cpus: 2,
             memory_mib: 512,
             storage_gib: None,
@@ -1436,6 +1495,23 @@ mod tests {
         oversized.memory.size =
             u64::from(oversized.memory_mib) * 1024 * 1024 + 2 * 1024 * 1024 * 1024 + 1;
         assert!(validate_compatibility(&oversized).is_err());
+
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            validate_compatibility(&metadata)
+                .expect("same-vendor KVM restore may cross CPU models");
+
+            assert_eq!(
+                metadata.cpu_contract,
+                CheckpointCpuContract::LinuxKvmIntelPortableV1
+            );
+        }
+
+        let mut exact_mismatch = metadata.clone();
+        exact_mismatch.cpu_contract = CheckpointCpuContract::ExactV1 {
+            fingerprint: "different-host".to_string(),
+        };
+        assert!(validate_compatibility(&exact_mismatch).is_err());
 
         let mut incompatible = metadata;
         incompatible.runtime_abi.push_str("-other");
@@ -1549,14 +1625,14 @@ mod tests {
     }
 
     #[test]
-    fn version_one_bare_checkpoint_remains_compatible() {
+    fn unreleased_checkpoint_versions_are_rejected() {
         let mut metadata = PortableCheckpointManifest {
-            version: 1,
+            version: FORMAT_VERSION,
             runtime_abi: RUNTIME_ABI.to_string(),
             host_platform: crate::platform::Platform::current()
                 .host_oci_platform()
                 .to_string(),
-            cpu_fingerprint: cpu_fingerprint().unwrap(),
+            cpu_contract: checkpoint_cpu_contract().unwrap(),
             cpus: 1,
             memory_mib: 1,
             storage_gib: None,
@@ -1579,10 +1655,26 @@ mod tests {
             },
             disks: Vec::new(),
             workload: None,
-            network: None,
+            network: Some(CheckpointNetwork::default()),
         };
         validate_compatibility(&metadata).unwrap();
-        metadata.version = 0;
+        metadata.version = FORMAT_VERSION - 1;
         assert!(validate_compatibility(&metadata).is_err());
+    }
+
+    #[test]
+    fn linux_cpu_vendor_parser_is_bounded_and_first_processor_only() {
+        assert_eq!(
+            linux_cpu_vendor(
+                "processor: 0\nvendor_id: GenuineIntel\n\nprocessor: 1\nvendor_id: Other\n"
+            ),
+            Some("GenuineIntel".to_string())
+        );
+        assert_eq!(linux_cpu_vendor("processor: 0\nmodel: 1\n\n"), None);
+        let oversized = "x".repeat(65);
+        assert_eq!(
+            linux_cpu_vendor(&format!("vendor_id: {oversized}\n\n")),
+            None
+        );
     }
 }

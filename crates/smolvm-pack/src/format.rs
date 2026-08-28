@@ -429,6 +429,26 @@ pub struct CheckpointNetwork {
     pub dns_filter_hosts: Option<Vec<String>>,
 }
 
+/// Versioned host CPU compatibility contract for a live checkpoint.
+///
+/// A recognized contract permits a restore on a different CPU model while the
+/// hypervisor remains the final authority for applying the captured
+/// architectural CPU state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum CheckpointCpuContract {
+    /// Stable Haswell-era Intel/KVM virtual CPU profile. The source VM ran
+    /// under this profile from its first instruction, so host-specific extended
+    /// state cannot leak into a live checkpoint.
+    LinuxKvmIntelPortableV1,
+    /// Platforms without a hypervisor-level compatibility check require the
+    /// exact source CPU feature fingerprint.
+    ExactV1 {
+        /// Hash of the host CPU virtualization feature contract.
+        fingerprint: String,
+    },
+}
+
 /// Compatibility and payload metadata for a portable live checkpoint.
 ///
 /// The pack container itself is portable storage; live CPU/device state is
@@ -442,8 +462,8 @@ pub struct PortableCheckpointManifest {
     pub runtime_abi: String,
     /// Host OS and architecture that captured the live state.
     pub host_platform: String,
-    /// Hash of the host CPU virtualization feature contract.
-    pub cpu_fingerprint: String,
+    /// Versioned CPU migration contract.
+    pub cpu_contract: CheckpointCpuContract,
     /// Number of virtual CPUs in the captured machine.
     pub cpus: u8,
     /// Configured guest memory in MiB.
