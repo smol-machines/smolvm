@@ -316,6 +316,11 @@ function sendKey(down, keysym) {
 }
 for (const [type, down] of [["keydown", true], ["keyup", false]]) {
   canvas.addEventListener(type, (ev) => {
+    // A held key repeats in the browser AND again in the guest, because the
+    // guest runs its own evdev auto-repeat. Forwarding the browser's repeats
+    // stacks the two, which doubles characters and makes a held backspace run
+    // away. Send the press once and let the guest repeat it.
+    if (ev.repeat) { ev.preventDefault(); return; }
     const keysym = keysymOf(ev);
     if (keysym === null) return;
     ev.preventDefault();
