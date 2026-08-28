@@ -38,6 +38,7 @@ name = "smolvm"
 path = "src/main.rs"
 
 [dependencies]
+flate2 = "1"
 smolvm-network = { path = "crates/smolvm-network", version = "1.7.5" }
 smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.7.5" }
 smolvm-cuda = { path = "crates/smolvm-cuda", version = "1.7.5" }
