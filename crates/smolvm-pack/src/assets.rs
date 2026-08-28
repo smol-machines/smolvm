@@ -12,6 +12,204 @@ use std::path::{Path, PathBuf};
 use crate::format::{AssetEntry, AssetInventory, LayerEntry};
 use crate::{PackError, Result};
 
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug)]
+struct SparseExtent {
+    offset: u64,
+    len: u64,
+}
+
+/// Return the allocated byte ranges of an APFS sparse file.
+///
+/// The `tar` crate intentionally disables its `SEEK_DATA`/`SEEK_HOLE` path on
+/// macOS, so its otherwise sparse-aware builder expands holes into a dense tar
+/// stream. Checkpoint RAM and disk images can be tens of GiB logically while
+/// containing only a few MiB of allocated pages; preserve those extents using
+/// the GNU sparse-tar representation that the same crate already restores.
+#[cfg(target_os = "macos")]
+fn macos_sparse_extents(file: &mut File) -> std::io::Result<Option<Vec<SparseExtent>>> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata()?;
+    let logical_len = metadata.len();
+    if logical_len == 0 || metadata.blocks().saturating_mul(512) >= logical_len {
+        return Ok(None);
+    }
+
+    let mut extents = Vec::new();
+    let mut offset = 0_u64;
+    while offset < logical_len {
+        let seek_offset = i64::try_from(offset).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "sparse file offset exceeds the host off_t range",
+            )
+        })?;
+        let data_offset = unsafe { libc::lseek(file.as_raw_fd(), seek_offset, libc::SEEK_DATA) };
+        if data_offset < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ENXIO) {
+                break;
+            }
+            // A filesystem without sparse-seek support is still valid; let the
+            // ordinary tar path copy it densely rather than failing a pack.
+            if error.raw_os_error() == Some(libc::EINVAL) {
+                file.seek(SeekFrom::Start(0))?;
+                return Ok(None);
+            }
+            return Err(error);
+        }
+        let data = data_offset as u64;
+        if data >= logical_len {
+            break;
+        }
+
+        let hole = unsafe { libc::lseek(file.as_raw_fd(), data_offset, libc::SEEK_HOLE) };
+        if hole < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let hole = (hole as u64).min(logical_len);
+        if hole <= data {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "sparse extent did not advance",
+            ));
+        }
+        extents.push(SparseExtent {
+            offset: data,
+            len: hole - data,
+        });
+        offset = hole;
+    }
+    file.seek(SeekFrom::Start(0))?;
+
+    let allocated = extents.iter().map(|extent| extent.len).sum::<u64>();
+    if allocated >= logical_len {
+        return Ok(None);
+    }
+    // A zero-length final entry carries a trailing hole's logical endpoint in
+    // old-GNU sparse tar. Without it extraction would truncate the file at the
+    // end of the final allocated extent.
+    if extents
+        .last()
+        .is_none_or(|extent| extent.offset + extent.len < logical_len)
+    {
+        extents.push(SparseExtent {
+            offset: logical_len,
+            len: 0,
+        });
+    }
+    Ok(Some(extents))
+}
+
+#[cfg(target_os = "macos")]
+fn append_macos_sparse_file<W: Write>(
+    builder: &mut tar::Builder<W>,
+    source: &Path,
+    archive_path: &Path,
+) -> std::io::Result<bool> {
+    let mut file = File::open(source)?;
+    let metadata = file.metadata()?;
+    let Some(extents) = macos_sparse_extents(&mut file)? else {
+        return Ok(false);
+    };
+    let stored_len = extents.iter().try_fold(0_u64, |total, extent| {
+        total.checked_add(extent.len).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "sparse archive payload is too large",
+            )
+        })
+    })?;
+
+    let mut header = tar::Header::new_gnu();
+    // Old-GNU sparse headers have a short path field. Let the ordinary tar
+    // builder emit its long-name extension rather than making an unrelated
+    // sparse asset with a long path un-packable.
+    if header.set_path(archive_path).is_err() {
+        return Ok(false);
+    }
+    header.set_metadata(&metadata);
+    header.set_entry_type(tar::EntryType::GNUSparse);
+    header.set_size(stored_len);
+    let first_header_entries = {
+        let gnu = header.as_gnu_mut().expect("new GNU header");
+        gnu.set_real_size(metadata.len());
+        let slots_len = gnu.sparse.len();
+        for (extent, slot) in extents.iter().zip(gnu.sparse.iter_mut()) {
+            slot.set_offset(extent.offset);
+            slot.set_length(extent.len);
+        }
+        gnu.set_is_extended(extents.len() > slots_len);
+        slots_len
+    };
+    header.set_cksum();
+    builder.get_mut().write_all(header.as_bytes())?;
+
+    let remaining = &extents[first_header_entries.min(extents.len())..];
+    for (index, chunk) in remaining.chunks(21).enumerate() {
+        let mut extended = tar::GnuExtSparseHeader::new();
+        for (extent, slot) in chunk.iter().zip(extended.sparse_mut().iter_mut()) {
+            slot.set_offset(extent.offset);
+            slot.set_length(extent.len);
+        }
+        extended.set_is_extended((index + 1) * 21 < remaining.len());
+        builder.get_mut().write_all(extended.as_bytes())?;
+    }
+
+    for extent in &extents {
+        if extent.len == 0 {
+            continue;
+        }
+        file.seek(SeekFrom::Start(extent.offset))?;
+        let copied = std::io::copy(&mut (&file).take(extent.len), builder.get_mut())?;
+        if copied != extent.len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "sparse file changed while it was archived",
+            ));
+        }
+    }
+    let padding = (512 - stored_len % 512) % 512;
+    if padding != 0 {
+        builder
+            .get_mut()
+            .write_all(&[0_u8; 512][..padding as usize])?;
+    }
+    Ok(true)
+}
+
+#[cfg(target_os = "macos")]
+fn append_macos_tree<W: Write>(
+    builder: &mut tar::Builder<W>,
+    source: &Path,
+    archive_path: &Path,
+) -> Result<()> {
+    let metadata = fs::symlink_metadata(source)?;
+    if metadata.is_dir() {
+        builder
+            .append_dir(archive_path, source)
+            .map_err(|error| PackError::Tar(error.to_string()))?;
+        let mut entries = fs::read_dir(source)?.collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            append_macos_tree(
+                builder,
+                &entry.path(),
+                &archive_path.join(entry.file_name()),
+            )?;
+        }
+    } else if metadata.is_file() && append_macos_sparse_file(builder, source, archive_path)? {
+        // The sparse entry was written directly above.
+    } else {
+        builder
+            .append_path_with_name(source, archive_path)
+            .map_err(|error| PackError::Tar(error.to_string()))?;
+    }
+    Ok(())
+}
+
 /// Convert a digest string to a filename for layer tars.
 ///
 /// Strips an optional `sha256:` prefix and uses the full remaining digest hex.
@@ -692,14 +890,19 @@ impl AssetCollector {
                 continue; // libs go in the stub, not the sidecar
             }
             let path = entry.path();
-            if path.is_dir() {
-                tar_builder
-                    .append_dir_all(name.to_string_lossy().as_ref(), &path)
-                    .map_err(|e| PackError::Tar(e.to_string()))?;
-            } else {
-                tar_builder
-                    .append_path_with_name(&path, name.to_string_lossy().as_ref())
-                    .map_err(|e| PackError::Tar(e.to_string()))?;
+            #[cfg(target_os = "macos")]
+            append_macos_tree(&mut tar_builder, &path, Path::new(&name))?;
+            #[cfg(not(target_os = "macos"))]
+            {
+                if path.is_dir() {
+                    tar_builder
+                        .append_dir_all(name.to_string_lossy().as_ref(), &path)
+                        .map_err(|e| PackError::Tar(e.to_string()))?;
+                } else {
+                    tar_builder
+                        .append_path_with_name(&path, name.to_string_lossy().as_ref())
+                        .map_err(|e| PackError::Tar(e.to_string()))?;
+                }
             }
         }
 
@@ -1113,6 +1316,52 @@ mod tests {
         let restored = output.join("test.txt");
         assert!(restored.exists());
         assert_eq!(fs::read_to_string(&restored).unwrap(), "hello world");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn compression_preserves_sparse_files_on_macos() {
+        use std::os::unix::fs::MetadataExt;
+
+        const LOGICAL_SIZE: u64 = 64 * 1024 * 1024;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let staging = temp_dir.path().join("staging");
+        let collector = AssetCollector::new(staging.clone()).unwrap();
+        let checkpoint = staging.join("checkpoint");
+        fs::create_dir_all(&checkpoint).unwrap();
+        let memory = checkpoint.join("memory.bin");
+        let mut file = File::create(&memory).unwrap();
+        file.set_len(LOGICAL_SIZE).unwrap();
+        file.seek(SeekFrom::Start(4096)).unwrap();
+        file.write_all(&[0xA5; 4096]).unwrap();
+        file.seek(SeekFrom::Start(32 * 1024 * 1024)).unwrap();
+        file.write_all(&[0x5A; 4096]).unwrap();
+        file.sync_all().unwrap();
+
+        let compressed = temp_dir.path().join("assets.tar.zst");
+        collector.compress(&compressed, false).unwrap();
+        assert!(
+            fs::metadata(&compressed).unwrap().len() < 1024 * 1024,
+            "sparse holes were expanded into the compressed archive"
+        );
+
+        let output = temp_dir.path().join("output");
+        decompress_assets_from_file(&compressed, &output).unwrap();
+        let restored = output.join("checkpoint/memory.bin");
+        let metadata = fs::metadata(&restored).unwrap();
+        assert_eq!(metadata.len(), LOGICAL_SIZE);
+        assert!(metadata.blocks() * 512 < LOGICAL_SIZE / 4);
+        let mut restored = File::open(restored).unwrap();
+        let mut page = [0_u8; 4096];
+        restored.seek(SeekFrom::Start(4096)).unwrap();
+        restored.read_exact(&mut page).unwrap();
+        assert_eq!(page, [0xA5; 4096]);
+        restored.seek(SeekFrom::Start(32 * 1024 * 1024)).unwrap();
+        restored.read_exact(&mut page).unwrap();
+        assert_eq!(page, [0x5A; 4096]);
+        restored.seek(SeekFrom::End(-1)).unwrap();
+        restored.read_exact(&mut page[..1]).unwrap();
+        assert_eq!(page[0], 0);
     }
 }
 

@@ -645,11 +645,29 @@ fn safe_unpack_with_limits<R: Read>(
         let uid = entry.header().uid().unwrap_or(0);
         let gid = entry.header().gid().unwrap_or(0);
 
-        // For large regular files use a sparse write: ftruncate creates the
+        // GNU sparse entries already carry an exact extent map. Let the tar
+        // reader seek over those holes directly instead of expanding them and
+        // rediscovering zero chunks in `unpack_sparse`. This is especially
+        // important for portable RAM images: scanning a mostly-empty 1 GiB
+        // guest address space made checkpoint import take seconds even though
+        // only tens of MiB were present in the archive.
+        if entry_type == tar::EntryType::GNUSparse {
+            verify_parent_within_dest(&full_path, &real_dest)?;
+            if let Err(e) = entry.unpack_in(dest) {
+                return Err(std::io::Error::new(
+                    e.kind(),
+                    format!("failed to unpack '{}': {}", entry_path.display(), e),
+                ));
+            }
+            // `Entry::unpack_in` handles the sparse extent stream, while these
+            // final assignments retain safe_unpack's permission policy.
+            set_mode(&full_path, entry.header().mode().unwrap_or(0o644) & 0o777);
+            set_owner(&full_path, uid, gid);
+        // For large ordinary files use a sparse write: ftruncate creates the
         // hole skeleton, then we only pwrite non-zero 64 KiB chunks.  This
         // prevents 10 GiB overlay disks from materialising as dense files on
         // disk and causing ENOSPC or slow extraction.
-        if is_regular && entry.header().size().unwrap_or(0) >= limits.sparse_threshold {
+        } else if is_regular && entry.header().size().unwrap_or(0) >= limits.sparse_threshold {
             let entry_size = entry.header().size()?;
             let mode = entry.header().mode().unwrap_or(0o644);
             if let Err(e) = unpack_sparse(&mut entry, &full_path, entry_size, mode, &real_dest) {
@@ -3125,6 +3143,81 @@ mod tests {
         let err = safe_unpack_with_limits(&mut archive, &dest, &limits).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("max total size"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn safe_unpack_uses_the_archived_sparse_extent_map() {
+        use crate::assets::AssetCollector;
+        use std::os::unix::fs::MetadataExt;
+
+        const LOGICAL_SIZE: u64 = 64 * 1024 * 1024;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let staging = temp_dir.path().join("staging");
+        let collector = AssetCollector::new(staging.clone()).unwrap();
+        let checkpoint = staging.join("checkpoint");
+        fs::create_dir_all(&checkpoint).unwrap();
+        let source = checkpoint.join("memory.bin");
+        let mut source_file = File::create(&source).unwrap();
+        source_file.set_len(LOGICAL_SIZE).unwrap();
+        source_file.seek(SeekFrom::Start(4096)).unwrap();
+        source_file.write_all(&[0xA5; 4096]).unwrap();
+        source_file.seek(SeekFrom::Start(32 * 1024 * 1024)).unwrap();
+        source_file.write_all(&[0x5A; 4096]).unwrap();
+        source_file.sync_all().unwrap();
+
+        let compressed = temp_dir.path().join("assets.tar.zst");
+        collector.compress(&compressed, false).unwrap();
+        let decoder = zstd::stream::Decoder::new(File::open(&compressed).unwrap()).unwrap();
+        let mut archive = tar::Archive::new(decoder);
+        let output = temp_dir.path().join("output");
+        fs::create_dir(&output).unwrap();
+        safe_unpack(&mut archive, &output).unwrap();
+
+        let restored = output.join("checkpoint/memory.bin");
+        let metadata = fs::metadata(&restored).unwrap();
+        assert_eq!(metadata.len(), LOGICAL_SIZE);
+        assert!(metadata.blocks() * 512 < LOGICAL_SIZE / 4);
+        let mut restored = File::open(restored).unwrap();
+        let mut page = [0_u8; 4096];
+        restored.seek(SeekFrom::Start(4096)).unwrap();
+        restored.read_exact(&mut page).unwrap();
+        assert_eq!(page, [0xA5; 4096]);
+        restored.seek(SeekFrom::Start(32 * 1024 * 1024)).unwrap();
+        restored.read_exact(&mut page).unwrap();
+        assert_eq!(page, [0x5A; 4096]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn archived_sparse_extent_cannot_escape_through_a_symlink_parent() {
+        use crate::assets::AssetCollector;
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let staging = temp_dir.path().join("staging");
+        let collector = AssetCollector::new(staging.clone()).unwrap();
+        let source_dir = staging.join("foo");
+        fs::create_dir_all(&source_dir).unwrap();
+        let mut source = File::create(source_dir.join("pwned.bin")).unwrap();
+        source.set_len(64 * 1024 * 1024).unwrap();
+        source.seek(SeekFrom::Start(4096)).unwrap();
+        source.write_all(&[0xA5; 4096]).unwrap();
+        source.sync_all().unwrap();
+        let compressed = temp_dir.path().join("assets.tar.zst");
+        collector.compress(&compressed, false).unwrap();
+
+        let output = temp_dir.path().join("output");
+        let outside = temp_dir.path().join("outside");
+        fs::create_dir(&output).unwrap();
+        fs::create_dir(&outside).unwrap();
+        symlink(&outside, output.join("foo")).unwrap();
+        let decoder = zstd::stream::Decoder::new(File::open(&compressed).unwrap()).unwrap();
+        let mut archive = tar::Archive::new(decoder);
+        let error = safe_unpack(&mut archive, &output).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(!outside.join("pwned.bin").exists());
     }
 
     #[test]
