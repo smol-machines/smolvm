@@ -384,6 +384,7 @@ pub fn cpu_fingerprint() -> Result<String> {
     Ok(hex::encode(Sha256::digest(identity.as_bytes())))
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn linux_cpu_vendor(cpuinfo: &str) -> Option<String> {
     cpuinfo
         .lines()
@@ -1662,6 +1663,7 @@ mod tests {
         assert!(validate_compatibility(&metadata).is_err());
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn linux_cpu_vendor_parser_is_bounded_and_first_processor_only() {
         assert_eq!(

@@ -754,6 +754,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         let krun_create_ctx = krun.create_ctx;
         let krun_free_ctx = krun.free_ctx;
         let krun_set_vm_config = krun.set_vm_config;
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         let krun_set_cpu_template = krun.set_cpu_template;
         let krun_set_workdir = krun.set_workdir;
         let krun_set_exec = krun.set_exec;
