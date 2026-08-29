@@ -99,8 +99,13 @@ pub fn plan_launch_network(
     let has_dns_filter = dns_filter_hosts.is_some_and(|hosts| !hosts.is_empty());
     let has_host_service = guest_host_service_configured();
     let has_fabric = resources.network_name.is_some();
-    let wants_network =
-        resources.network || has_ports || has_cidr_policy || has_dns_filter || has_fabric;
+    let has_egress_proxy = resources.egress_proxy.is_some();
+    let wants_network = resources.network
+        || has_ports
+        || has_cidr_policy
+        || has_dns_filter
+        || has_fabric
+        || has_egress_proxy;
 
     if !wants_network {
         return LaunchNetworkPlan {
@@ -141,6 +146,7 @@ pub fn plan_launch_network(
             || has_dns_filter
             || has_host_service
             || has_fabric
+            || has_egress_proxy
         {
             NetworkBackend::VirtioNet
         } else {
@@ -178,6 +184,7 @@ pub fn validate_requested_network_backend(
         .is_some_and(|c| !c.is_empty())
         || dns_filter_hosts.is_some_and(|h| !h.is_empty());
     let has_host_service = guest_host_service_configured();
+    let has_egress_proxy = resources.egress_proxy.is_some();
 
     // Mirror plan_launch_network's default: unset backend + (ports OR egress
     // policy) ⇒ virtio-net. So only an EXPLICIT `--net-backend tsi` alongside
@@ -187,6 +194,7 @@ pub fn validate_requested_network_backend(
             || has_egress_policy
             || has_host_service
             || resources.network_name.is_some()
+            || has_egress_proxy
         {
             NetworkBackend::VirtioNet
         } else {
@@ -222,6 +230,13 @@ pub fn validate_requested_network_backend(
         ));
     }
 
+    if has_egress_proxy && backend != NetworkBackend::VirtioNet {
+        return Err(crate::Error::config(
+            "egress proxy",
+            "--egress-proxy requires the virtio-net backend; remove --net-backend tsi or set it to virtio-net",
+        ));
+    }
+
     if resources.network_backend != Some(NetworkBackend::VirtioNet) {
         return Ok(());
     }
@@ -231,7 +246,11 @@ pub fn validate_requested_network_backend(
         .as_ref()
         .is_some_and(|cidrs| !cidrs.is_empty());
     let has_dns_filter = dns_filter_hosts.is_some_and(|hosts| !hosts.is_empty());
-    let wants_network = resources.network || port_count > 0 || has_cidr_policy || has_dns_filter;
+    let wants_network = resources.network
+        || port_count > 0
+        || has_cidr_policy
+        || has_dns_filter
+        || has_egress_proxy;
 
     if !wants_network {
         return Err(crate::Error::config(
@@ -342,6 +361,23 @@ mod tests {
         resources.network = true;
         resources.network_backend = Some(NetworkBackend::VirtioNet);
         validate_requested_network_backend(&resources, None, 0).unwrap();
+    }
+
+    #[test]
+    fn test_egress_proxy_defaults_to_virtio() {
+        let mut resources = resources();
+        resources.egress_proxy = Some("socks5://127.0.0.1:7891".into());
+        let plan = plan_launch_network(&resources, None, 0);
+        assert_eq!(plan.backend, EffectiveNetworkBackend::VirtioNet);
+        validate_requested_network_backend(&resources, None, 0).unwrap();
+    }
+
+    #[test]
+    fn test_egress_proxy_rejects_explicit_tsi() {
+        let mut resources = resources();
+        resources.network_backend = Some(NetworkBackend::Tsi);
+        resources.egress_proxy = Some("socks5://127.0.0.1:7891".into());
+        assert!(validate_requested_network_backend(&resources, None, 0).is_err());
     }
 
     #[test]

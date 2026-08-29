@@ -373,6 +373,7 @@ impl PackCreateCmd {
                 memory_mib: 8192,
                 network: true,
                 network_backend: None,
+                egress_proxy: None,
                 dns: None,
                 network_name: None,
                 gpu: false,

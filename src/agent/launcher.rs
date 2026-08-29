@@ -1226,6 +1226,13 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     egress = egress.with_denial_log(path);
                 }
                 let egress_path = egress_telemetry.map(|p| p.to_path_buf());
+                let host_egress = resources
+                    .egress_proxy
+                    .as_deref()
+                    .map(smolvm_network::HostEgressTransport::parse)
+                    .transpose()
+                    .map_err(|err| Error::agent("configure egress proxy", err.to_string()))?
+                    .unwrap_or_default();
 
                 // The host and guest ends of the virtio-net channel are an AF_UNIX
                 // stream. On Unix we hand libkrun one end of a socketpair fd and run
@@ -1295,6 +1302,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                                 guest_network,
                                 &virtio_port_mappings,
                                 egress,
+                                host_egress,
                                 fabric_lease,
                             ) {
                                 Ok(runtime) => runtime,
@@ -1381,6 +1389,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                                 guest_network,
                                 &virtio_port_mappings,
                                 egress,
+                                host_egress,
                                 fabric_lease,
                             ) {
                                 Ok(runtime) => {

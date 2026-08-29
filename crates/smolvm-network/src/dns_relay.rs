@@ -29,7 +29,7 @@
 //!        no  -> answer NXDOMAIN/SERVFAIL immediately (no relay)
 //!        yes -> assign id, remember reply context, channel (id, query) to relay
 //!   -> relay thread: UDP -> non-blocking connected host socket + poller
-//!                    TCP -> bounded detached worker (rare path)
+//!                    TCP/DoH -> bounded detached worker
 //!   -> answer bytes -> channel back -> reply_wake
 //!   -> poll loop: learn A/AAAA records, write answer into the guest socket
 //! ```
@@ -39,6 +39,7 @@
 
 use crate::queues::WakePipe;
 use crate::virtio_net_log;
+use crate::HostEgressTransport;
 use polling::{Event, Events};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket as HostUdpSocket};
@@ -110,6 +111,7 @@ pub struct DnsRelayChannels {
 pub fn start_dns_relay(
     reply_wake: Arc<WakePipe>,
     shutdown: Arc<dyn Fn() -> bool + Send + Sync>,
+    egress_transport: HostEgressTransport,
 ) -> DnsRelayChannels {
     let (to_relay_tx, to_relay_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
     let (from_relay_tx, from_relay_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
@@ -125,6 +127,7 @@ pub fn start_dns_relay(
                 thread_wake,
                 reply_wake,
                 shutdown,
+                egress_transport,
             );
         });
 
@@ -164,6 +167,7 @@ fn run_dns_relay(
     wake: WakePipe,
     reply_wake: Arc<WakePipe>,
     shutdown: Arc<dyn Fn() -> bool + Send + Sync>,
+    egress_transport: HostEgressTransport,
 ) {
     let mut inflight: std::collections::HashMap<u64, InflightUdp> =
         std::collections::HashMap::new();
@@ -180,6 +184,20 @@ fn run_dns_relay(
         // Outbound: queries handed over by the poll loop.
         loop {
             match outbound.try_recv() {
+                Ok(query) if egress_transport.is_proxy_required() => {
+                    // SOCKS5 has no portable datagram contract that can be
+                    // assumed of every host proxy. Carry the raw DNS message
+                    // as DoH over the same required SOCKS5 TCP transport. The
+                    // DoH peer is addressed by IP, so there is no bootstrap
+                    // lookup and therefore no host DNS leak.
+                    spawn_tcp_query(
+                        &inbound,
+                        &reply_wake,
+                        &tcp_inflight,
+                        query,
+                        egress_transport.clone(),
+                    );
+                }
                 Ok(query) => match query.transport {
                     DnsTransport::Udp => {
                         if inflight.len() >= MAX_INFLIGHT_UDP {
@@ -212,7 +230,13 @@ fn run_dns_relay(
                         }
                     }
                     DnsTransport::Tcp => {
-                        spawn_tcp_query(&inbound, &reply_wake, &tcp_inflight, query);
+                        spawn_tcp_query(
+                            &inbound,
+                            &reply_wake,
+                            &tcp_inflight,
+                            query,
+                            HostEgressTransport::Direct,
+                        );
                     }
                 },
                 Err(TryRecvError::Empty) => break,
@@ -305,7 +329,8 @@ fn start_udp_query(upstream: SocketAddr, query: &[u8]) -> std::io::Result<HostUd
     Ok(socket)
 }
 
-/// Resolve a DNS-over-TCP query on a bounded, detached worker thread.
+/// Resolve a DNS-over-TCP or proxied DNS-over-HTTPS query on a bounded,
+/// detached worker thread.
 ///
 /// DNS/TCP is the rare fallback path (truncated/large answers). Rather than
 /// build a non-blocking length-prefixed TCP state machine, each query gets its
@@ -317,6 +342,7 @@ fn spawn_tcp_query(
     reply_wake: &Arc<WakePipe>,
     tcp_inflight: &Arc<AtomicUsize>,
     query: DnsQuery,
+    egress_transport: HostEgressTransport,
 ) {
     if tcp_inflight.load(Ordering::Relaxed) >= MAX_INFLIGHT_TCP {
         virtio_net_log!(
@@ -336,8 +362,25 @@ fn spawn_tcp_query(
     let spawned = thread::Builder::new()
         .name("smolvm-dns-tcp".into())
         .spawn(move || {
-            let upstream = SocketAddr::new(IpAddr::V4(query.upstream), DNS_PORT);
-            let answer = forward_dns_query_tcp(upstream, &query.query).ok();
+            let result = if egress_transport.is_proxy_required() {
+                forward_dns_query_socks_udp(&egress_transport, query.upstream, &query.query)
+            } else {
+                let upstream = SocketAddr::new(IpAddr::V4(query.upstream), DNS_PORT);
+                forward_dns_query_tcp(&egress_transport, upstream, &query.query)
+            };
+            let answer = match result {
+                Ok(answer) => Some(answer),
+                Err(err) => {
+                    virtio_net_log!(
+                        "virtio-net: DNS upstream failed id={} upstream={} proxied={} error={}",
+                        id,
+                        query.upstream,
+                        egress_transport.is_proxy_required(),
+                        err
+                    );
+                    None
+                }
+            };
             if deliver_answer(&worker_inbound, id, answer) {
                 worker_wake.wake();
             }
@@ -356,11 +399,19 @@ fn spawn_tcp_query(
 /// RFC 1035 §4.2.2) and return the raw response message. Blocking host TCP
 /// exchange with a short timeout — runs only on a detached worker, never the
 /// poll thread.
-fn forward_dns_query_tcp(upstream: SocketAddr, query: &[u8]) -> std::io::Result<Vec<u8>> {
+fn forward_dns_query_tcp(
+    egress_transport: &HostEgressTransport,
+    upstream: SocketAddr,
+    query: &[u8],
+) -> std::io::Result<Vec<u8>> {
     use std::io::{Error, ErrorKind};
     let len = u16::try_from(query.len())
         .map_err(|_| Error::new(ErrorKind::InvalidInput, "DNS query too large for TCP"))?;
-    let mut stream = TcpStream::connect_timeout(&upstream, UPSTREAM_TIMEOUT)?;
+    let mut stream = if egress_transport.is_proxy_required() {
+        egress_transport.connect_tcp(upstream)?
+    } else {
+        TcpStream::connect_timeout(&upstream, UPSTREAM_TIMEOUT)?
+    };
     stream.set_read_timeout(Some(UPSTREAM_TIMEOUT))?;
     stream.set_write_timeout(Some(UPSTREAM_TIMEOUT))?;
     stream.write_all(&len.to_be_bytes())?;
@@ -379,6 +430,35 @@ fn forward_dns_query_tcp(upstream: SocketAddr, query: &[u8]) -> std::io::Result<
     let mut response = vec![0u8; resp_len];
     stream.read_exact(&mut response)?;
     Ok(response)
+}
+
+/// Send a raw DNS wire message through a SOCKS5 UDP association. The resolver
+/// is addressed by IP, so neither the guest nor host resolver is consulted.
+fn forward_dns_query_socks_udp(
+    egress_transport: &HostEgressTransport,
+    upstream_dns: Ipv4Addr,
+    query: &[u8],
+) -> std::io::Result<Vec<u8>> {
+    use std::io::{Error, ErrorKind};
+
+    if !egress_transport.is_proxy_required() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "SOCKS5 UDP forwarding requires an egress proxy",
+        ));
+    }
+    if query.is_empty() || query.len() > DNS_MAX_MSG {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "DNS query length out of range",
+        ));
+    }
+    egress_transport.exchange_udp(
+        SocketAddr::new(IpAddr::V4(upstream_dns), DNS_PORT),
+        query,
+        DNS_MAX_MSG,
+        UPSTREAM_TIMEOUT,
+    )
 }
 
 #[cfg(test)]
@@ -433,6 +513,7 @@ mod tests {
         let channels = start_dns_relay(
             reply_wake.clone(),
             Arc::new(move || stop_flag.load(Ordering::Relaxed)),
+            HostEgressTransport::Direct,
         );
 
         // 192.0.2.1 is TEST-NET-1 (RFC 5737): guaranteed unroutable, so the
@@ -490,8 +571,59 @@ mod tests {
             sock.write_all(answer).unwrap();
         });
 
-        let resp = forward_dns_query_tcp(addr, b"tcp-query").unwrap();
+        let resp = forward_dns_query_tcp(&HostEgressTransport::Direct, addr, b"tcp-query").unwrap();
         assert_eq!(resp, b"answer-bytes");
         server.join().unwrap();
+    }
+
+    /// Optional real-network smoke test. It is ignored in CI and can be run
+    /// against a local Mihomo/Clash SOCKS listener with:
+    /// `SMOLVM_TEST_SOCKS5=socks5://127.0.0.1:7891 cargo test -p smolvm-network live_dns -- --ignored`
+    #[test]
+    #[ignore = "requires an explicitly configured local SOCKS5 proxy"]
+    fn live_dns_over_socks5_udp() {
+        let proxy = std::env::var("SMOLVM_TEST_SOCKS5").expect("SMOLVM_TEST_SOCKS5 must be set");
+        let transport = HostEgressTransport::parse(&proxy).unwrap();
+        let mut query = vec![
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        for label in ["api", "ipify", "org"] {
+            query.push(label.len() as u8);
+            query.extend_from_slice(label.as_bytes());
+        }
+        query.extend_from_slice(&[0, 0, 1, 0, 1]);
+
+        let reply_wake = Arc::new(WakePipe::new());
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = stop.clone();
+        let channels = start_dns_relay(
+            reply_wake,
+            Arc::new(move || stop_flag.load(Ordering::Relaxed)),
+            transport,
+        );
+        for id in [42, 43] {
+            channels
+                .to_relay
+                .send(DnsQuery {
+                    id,
+                    transport: DnsTransport::Udp,
+                    upstream: Ipv4Addr::new(223, 5, 5, 5),
+                    query: query.clone(),
+                })
+                .unwrap();
+        }
+        channels.relay_thread_wake.wake();
+        for _ in 0..2 {
+            let response = channels
+                .from_relay
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            let answer = response.answer.unwrap();
+            assert!(answer.len() >= 12);
+            assert_eq!(&answer[..2], &[0x12, 0x34]);
+            assert_ne!(u16::from_be_bytes([answer[6], answer[7]]), 0);
+        }
+        stop.store(true, Ordering::Relaxed);
+        channels.relay_thread_wake.wake();
     }
 }

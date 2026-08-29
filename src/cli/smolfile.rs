@@ -42,6 +42,7 @@ pub fn build_create_params(
     cli_port: Vec<PortMappingSpec>,
     cli_net: bool,
     cli_network_backend: Option<NetworkBackend>,
+    cli_egress_proxy: Option<String>,
     cli_dns: Option<std::net::Ipv4Addr>,
     cli_network_name: Option<String>,
     cli_init: Vec<String>,
@@ -80,6 +81,7 @@ pub fn build_create_params(
                 port: ports,
                 net,
                 network_backend: cli_network_backend,
+                egress_proxy: cli_egress_proxy,
                 dns: cli_dns,
                 network_name: cli_network_name,
                 init: cli_init,
@@ -233,6 +235,7 @@ pub fn build_create_params(
 
     // Merge network policy: [network] section, then CLI extends
     let network = sf.network.unwrap_or_default();
+    let egress_proxy = cli_egress_proxy.or(network.egress_proxy);
 
     // Preserve original hostnames for DNS filtering.
     // Do NOT resolve these to CIDRs here — CDN-backed hosts rotate IPs and the
@@ -254,7 +257,11 @@ pub fn build_create_params(
     allowed_cidrs_vec.extend(cli_allow_cidr);
 
     // --allow-cidr / --allow-host / [network] / --dns implies --net
-    let net = if !allowed_cidrs_vec.is_empty() || !sf_allow_hosts.is_empty() || cli_dns.is_some() {
+    let net = if !allowed_cidrs_vec.is_empty()
+        || !sf_allow_hosts.is_empty()
+        || cli_dns.is_some()
+        || egress_proxy.is_some()
+    {
         true
     } else {
         net
@@ -314,6 +321,7 @@ pub fn build_create_params(
         port: ports,
         net,
         network_backend: cli_network_backend,
+        egress_proxy,
         dns: cli_dns,
         network_name: cli_network_name,
         init,
@@ -474,10 +482,9 @@ pub fn resolve_pack_config(
         // matching the same logic in build_create_params().
         // Preserve the tri-state: None = unspecified, Some = explicit.
         net: {
-            let network_section_implies_net = sf
-                .network
-                .as_ref()
-                .is_some_and(|n| !n.allow_hosts.is_empty() || !n.allow_cidrs.is_empty());
+            let network_section_implies_net = sf.network.as_ref().is_some_and(|n| {
+                !n.allow_hosts.is_empty() || !n.allow_cidrs.is_empty() || n.egress_proxy.is_some()
+            });
             if network_section_implies_net {
                 Some(true)
             } else {
@@ -506,6 +513,7 @@ mod tests {
             vec![],
             vec![],
             false,
+            None,
             None,
             None,
             None,
@@ -539,6 +547,24 @@ mod tests {
     }
 
     #[test]
+    fn smolfile_egress_proxy_implies_network_and_persists_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Smolfile");
+        std::fs::write(
+            &path,
+            "[network]\negress_proxy = \"socks5://127.0.0.1:7891\"\n",
+        )
+        .unwrap();
+
+        let params = build_from_smolfile(path).unwrap();
+        assert!(params.net);
+        assert_eq!(
+            params.egress_proxy.as_deref(),
+            Some("socks5://127.0.0.1:7891")
+        );
+    }
+
+    #[test]
     fn auto_graph_smolfile_enables_cuda_and_framework_policy() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("Smolfile");
@@ -558,6 +584,7 @@ mod tests {
             vec![],
             vec![],
             false,
+            None,
             None,
             None,
             None,

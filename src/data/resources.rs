@@ -32,6 +32,11 @@ pub struct VmResources {
     /// Preferred network backend override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_backend: Option<NetworkBackend>,
+    /// Optional host-side egress proxy. The first supported form is an
+    /// unauthenticated `socks5://IP:PORT` endpoint. When set, virtio-net sends
+    /// TCP and DNS through that proxy and blocks direct UDP/ICMP egress.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_proxy: Option<String>,
     /// Enable GPU acceleration (virtio-gpu with Venus/Vulkan).
     #[serde(default)]
     pub gpu: bool,
@@ -119,6 +124,11 @@ impl VmResources {
                 "overlay disk size must be greater than 0 GiB",
             ));
         }
+        if let Some(proxy) = self.egress_proxy.as_deref() {
+            smolvm_network::HostEgressTransport::parse(proxy).map_err(|err| {
+                crate::Error::config("validate resources", format!("invalid egress proxy: {err}"))
+            })?;
+        }
         Ok(())
     }
 }
@@ -130,6 +140,7 @@ impl Default for VmResources {
             memory_mib: DEFAULT_MICROVM_MEMORY_MIB,
             network: false,
             network_backend: None,
+            egress_proxy: None,
             gpu: false,
             gpu_vram_mib: None,
             cuda: false,

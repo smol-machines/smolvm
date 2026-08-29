@@ -54,6 +54,7 @@ use crate::device::VirtioNetworkDevice;
 use crate::dns;
 use crate::dns_relay::{self, DnsQuery, DnsResponse, DnsTransport};
 use crate::egress::EgressPolicy;
+use crate::egress_transport::HostEgressTransport;
 use crate::icmp_relay;
 use crate::queues::NetworkFrameQueues;
 use crate::tcp_listeners::AcceptedTcpConnection;
@@ -164,6 +165,7 @@ pub fn start_network_stack(
     config: VirtioPollConfig,
     tcp_receiver: Option<Receiver<AcceptedTcpConnection>>,
     egress: EgressPolicy,
+    egress_transport: HostEgressTransport,
     fabric: Option<crate::fabric::FabricHandle>,
 ) -> std::io::Result<JoinHandle<()>> {
     virtio_net_log!(
@@ -174,7 +176,16 @@ pub fn start_network_stack(
     );
     thread::Builder::new()
         .name("smolvm-net-poll".into())
-        .spawn(move || run_network_stack(queues, config, tcp_receiver, egress, fabric))
+        .spawn(move || {
+            run_network_stack(
+                queues,
+                config,
+                tcp_receiver,
+                egress,
+                egress_transport,
+                fabric,
+            )
+        })
 }
 
 fn run_network_stack(
@@ -182,6 +193,7 @@ fn run_network_stack(
     config: VirtioPollConfig,
     mut tcp_receiver: Option<Receiver<AcceptedTcpConnection>>,
     egress: EgressPolicy,
+    egress_transport: HostEgressTransport,
     fabric: Option<crate::fabric::FabricHandle>,
 ) {
     // Poll loop overview:
@@ -227,6 +239,7 @@ fn run_network_stack(
     let mut relays = TcpRelayTable::new(
         None,
         egress.clone(),
+        egress_transport.clone(),
         gateway_addrs.to_vec(),
         config.host_service,
     );
@@ -253,6 +266,7 @@ fn run_network_stack(
         dns_relay::start_dns_relay(
             relay_wake.clone(),
             Arc::new(move || shutdown_queues.is_shutting_down()),
+            egress_transport.clone(),
         )
     };
     let mut dns_gateway = DnsGateway::new();
@@ -330,7 +344,8 @@ fn run_network_stack(
                     // is silently dropped (a guest sees a normal UDP black hole),
                     // but the denial is recorded in the boot log — these lines are
                     // the machine's egress audit trail (`read_egress_denials`).
-                    let relay_allowed = udp_relay::should_relay_udp(destination, &egress);
+                    let relay_allowed = !egress_transport.is_proxy_required()
+                        && udp_relay::should_relay_udp(destination, &egress);
                     if !relay_allowed && destination.port() != 53 {
                         egress.record_denial("sendto", &destination);
                     }
@@ -418,6 +433,7 @@ fn run_network_stack(
             false,
             &egress,
             &gateway_addrs,
+            !egress_transport.is_proxy_required(),
             &icmp_channels.to_relay,
         );
         woke_icmp |= drain_icmp_echo(
@@ -426,6 +442,7 @@ fn run_network_stack(
             true,
             &egress,
             &gateway_addrs,
+            !egress_transport.is_proxy_required(),
             &icmp_channels.to_relay,
         );
         if woke_icmp {
@@ -601,6 +618,7 @@ fn drain_icmp_echo(
     is_ipv6: bool,
     egress: &EgressPolicy,
     gateway_addrs: &[IpAddr],
+    allow_external: bool,
     to_relay: &SyncSender<icmp_relay::IcmpEcho>,
 ) -> bool {
     // Phase 1: drain received requests into owned values so the socket can be
@@ -629,7 +647,7 @@ fn drain_icmp_echo(
     for echo in echoes {
         if gateway_addrs.contains(&echo.destination) {
             local_replies.push(echo);
-        } else if icmp_relay::should_relay_icmp(echo.destination, egress) {
+        } else if allow_external && icmp_relay::should_relay_icmp(echo.destination, egress) {
             match to_relay.try_send(echo) {
                 Ok(()) => woke = true,
                 Err(TrySendError::Full(_)) => {
