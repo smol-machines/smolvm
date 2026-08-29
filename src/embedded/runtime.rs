@@ -54,6 +54,63 @@ impl EmbeddedRuntime {
         })
     }
 
+    /// Capture a running checkpointable machine into a portable artifact.
+    ///
+    /// The source resumes as soon as its consistent RAM/disk boundary is
+    /// staged; compression continues without holding the source pause.
+    pub fn checkpoint_machine(
+        &self,
+        name: &str,
+        output: &std::path::Path,
+        options: &crate::portable_checkpoint::CaptureOptions,
+    ) -> Result<crate::portable_checkpoint::CaptureResult> {
+        self.with_name_lock(name, || {
+            crate::portable_checkpoint::capture_to_path(name, output, options)
+        })
+    }
+
+    /// Create a stopped machine from a portable live checkpoint artifact.
+    ///
+    /// Its first start resumes the captured execution state. The restored
+    /// machine is also a fork/checkpoint source, which makes it suitable as a
+    /// durable rollback root.
+    pub fn restore_checkpoint_machine(&self, name: &str, artifact: &std::path::Path) -> Result<()> {
+        self.with_name_lock(name, || {
+            crate::portable_checkpoint::restore_from_path(&self.db, name, artifact)
+        })
+    }
+
+    /// Restore and start a checkpoint for a detached CLI operation.
+    ///
+    /// The VMM outlives the caller, unlike the process-owned SDK handle.
+    pub fn restore_checkpoint_machine_detached(
+        &self,
+        name: &str,
+        artifact: &std::path::Path,
+    ) -> Result<()> {
+        self.with_name_lock(name, || {
+            crate::portable_checkpoint::restore_from_path(&self.db, name, artifact)?;
+            let start = (|| -> Result<VmHandle> {
+                let started = control::start_vm(&self.db, name)?;
+                let mut handle = started.handle;
+                if started.freshly_started {
+                    self.launch_image_workload(name, &mut handle)?;
+                }
+                Ok(handle)
+            })();
+            match start {
+                Ok(handle) => {
+                    handle.detach();
+                    Ok(())
+                }
+                Err(error) => {
+                    let _ = control::delete_vm(&self.db, name);
+                    Err(error)
+                }
+            }
+        })
+    }
+
     /// Reclaim shim-managed sandbox VMs whose process is gone (node reboot or a
     /// shim crash left the record + disks behind). See
     /// [`control::reconcile_runtime_machines`]. Returns the count reclaimed.
@@ -180,8 +237,8 @@ impl EmbeddedRuntime {
     /// Fork a running, forkable `golden` into a new `clone` (copy-on-write guest
     /// RAM + disks, same host) and cache the clone's handle so it can be exec'd
     /// by name. `ports` are `(host, guest)` inbound forwards for the clone; empty
-    /// remaps the golden's forwards to fresh host ports. The golden freezes as the
-    /// shared base and must not be started again while clones exist.
+    /// remaps the golden's forwards to fresh host ports. Supported hosts resume
+    /// the source after publishing a consistent fork generation.
     pub fn fork_machine(&self, golden: &str, clone: &str, ports: &[(u16, u16)]) -> Result<()> {
         self.with_name_locks(&[golden, clone], || {
             let handle = control::fork_vm(&self.db, golden, clone, ports)?;
@@ -238,6 +295,31 @@ impl EmbeddedRuntime {
             };
             for (name, handle) in started {
                 registry.insert(name, Arc::new(Mutex::new(handle)));
+            }
+            Ok(())
+        })
+    }
+
+    /// Fork several machines for a detached CLI operation. The group is
+    /// prepared transactionally from one generation and every successful clone
+    /// outlives this process.
+    pub fn fork_machines_detached(
+        &self,
+        golden: &str,
+        clones: &[String],
+        ports: &[(u16, u16)],
+        parallel: usize,
+    ) -> Result<()> {
+        let mut lock_names = Vec::with_capacity(clones.len() + 1);
+        lock_names.push(golden);
+        lock_names.extend(clones.iter().map(String::as_str));
+        self.with_name_locks(&lock_names, || {
+            let requests: Vec<_> = clones
+                .iter()
+                .map(|name| (name.clone(), ports.to_vec()))
+                .collect();
+            for (_, handle) in control::fork_vm_batch(&self.db, golden, &requests, parallel)? {
+                handle.detach();
             }
             Ok(())
         })
