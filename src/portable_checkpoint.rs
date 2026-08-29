@@ -21,7 +21,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 /// Current portable-checkpoint metadata version.
-pub const FORMAT_VERSION: u32 = 3;
+pub const FORMAT_VERSION: u32 = 4;
 /// libkrun VM/vCPU/device-state compatibility identifier.
 pub const RUNTIME_ABI: &str = "libkrun-portable-snapshot-v1";
 /// Device topology supported by the initial portable checkpoint profile.
@@ -53,6 +53,191 @@ pub struct CaptureResult {
     pub source_pause: std::time::Duration,
     /// Complete capture and compression time.
     pub elapsed: std::time::Duration,
+}
+
+/// Restore a portable live checkpoint into a new stopped machine record.
+///
+/// The restored machine preserves the checkpoint's CPU, memory, disks,
+/// workload, and network topology. Its first start resumes the captured live
+/// state, and the machine remains checkpointable so it can immediately serve
+/// as a reusable rollback/fork root.
+pub fn restore_from_path(db: &crate::db::SmolvmDb, name: &str, artifact: &Path) -> Result<()> {
+    crate::data::validate_vm_name(name, "machine name")
+        .map_err(|reason| Error::config("restore checkpoint", reason))?;
+    if !artifact.is_file() {
+        return Err(Error::config(
+            "restore checkpoint",
+            format!("file not found: {}", artifact.display()),
+        ));
+    }
+
+    let manifest = smolvm_pack::packer::read_manifest_from_sidecar(artifact)
+        .map_err(|error| Error::agent("read checkpoint manifest", error.to_string()))?;
+    let checkpoint = manifest.checkpoint.as_ref().ok_or_else(|| {
+        Error::config(
+            "restore checkpoint",
+            format!("{} is not a .smolcheckpoint artifact", artifact.display()),
+        )
+    })?;
+    validate_compatibility(checkpoint)?;
+    crate::platform::ensure_artifact_arch_matches_host(&manifest.platform)?;
+
+    // Reserve the name before touching its data directory. SDKs and CLIs may
+    // run in separate processes, so a process-local lifecycle mutex is not a
+    // sufficient creation boundary.
+    let token = crate::db::SmolvmDb::create_reservation_token();
+    if !db.reserve_vm_create(name, &token)? {
+        return Err(Error::agent_conflict(
+            "restore checkpoint",
+            format!("machine '{name}' already exists or is being created"),
+        ));
+    }
+    let mut reservation = RestoreReservation {
+        db: db.clone(),
+        name: name.to_string(),
+        token,
+        committed: false,
+    };
+
+    let record = restored_record(name, &manifest, checkpoint)?;
+    let footer = smolvm_pack::packer::read_footer_from_sidecar(artifact)
+        .map_err(|error| Error::agent("read checkpoint footer", error.to_string()))?;
+    let vm_data = crate::agent::vm_data_dir(name);
+    let cache_dir = crate::agent::machine_layers_cache_dir(name);
+    let result = (|| -> Result<()> {
+        let _manager = crate::agent::AgentManager::for_vm_with_sizes(
+            name,
+            checkpoint.storage_gib,
+            checkpoint.overlay_gib,
+        )?;
+        smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
+        match std::fs::remove_dir_all(&cache_dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(Error::agent(
+                    "clear checkpoint extraction",
+                    error.to_string(),
+                ));
+            }
+        }
+        smolvm_pack::extract::extract_sidecar(artifact, &cache_dir, &footer, false, false)
+            .map_err(|error| Error::agent("extract checkpoint", error.to_string()))?;
+        install(&cache_dir, &vm_data, checkpoint)?;
+        discard_transport_pack(&vm_data)?;
+        if !reservation
+            .db
+            .commit_reserved_vm(name, &reservation.token, &record)?
+        {
+            return Err(Error::agent_conflict(
+                "restore checkpoint",
+                format!("machine '{name}' is no longer reserved"),
+            ));
+        }
+        reservation.committed = true;
+        Ok(())
+    })();
+    smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
+    if let Err(error) = result {
+        if let Err(remove_error) = std::fs::remove_dir_all(&vm_data) {
+            if remove_error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    machine = %name,
+                    error = %remove_error,
+                    "failed to clean checkpoint restore after error"
+                );
+            }
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+struct RestoreReservation {
+    db: crate::db::SmolvmDb,
+    name: String,
+    token: String,
+    committed: bool,
+}
+
+impl Drop for RestoreReservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            if let Err(error) = self
+                .db
+                .release_vm_create_reservation(&self.name, &self.token)
+            {
+                tracing::warn!(
+                    machine = %self.name,
+                    %error,
+                    "failed to release checkpoint restore reservation"
+                );
+            }
+        }
+    }
+}
+
+fn restored_record(
+    name: &str,
+    manifest: &PackManifest,
+    checkpoint: &PortableCheckpointManifest,
+) -> Result<VmRecord> {
+    let network = checkpoint.network.as_ref();
+    let mut record = VmRecord::new(
+        name.to_string(),
+        checkpoint.cpus,
+        checkpoint.memory_mib,
+        Vec::new(),
+        network
+            .into_iter()
+            .flat_map(|network| network.ports.iter())
+            .map(|port| (port.host, port.guest))
+            .collect(),
+        network.is_some_and(|network| network.enabled),
+    );
+    record.storage_gb = checkpoint.storage_gib;
+    record.overlay_gb = checkpoint.overlay_gib;
+    record.allowed_cidrs = network.and_then(|network| network.allowed_cidrs.clone());
+    record.dns_filter_hosts = network.and_then(|network| network.dns_filter_hosts.clone());
+    record.network_backend = restored_network_backend(checkpoint)?;
+    record.dns = network
+        .and_then(|network| network.dns.as_deref())
+        .map(str::parse)
+        .transpose()
+        .map_err(|error: std::net::AddrParseError| {
+            Error::config("restore checkpoint DNS", error.to_string())
+        })?;
+    record.network_name = network.and_then(|network| network.network_name.clone());
+    record.entrypoint = manifest.entrypoint.clone();
+    record.cmd = manifest.cmd.clone();
+    record.env = crate::util::parse_env_list(&manifest.env);
+    record.workdir = manifest.workdir.clone();
+    record.secret_refs = manifest.secret_refs.clone();
+    for (key, reference) in &record.secret_refs {
+        crate::secrets::validate_ref(reference, crate::secrets::ResolutionScope::Untrusted)
+            .map_err(|error| {
+                Error::config(
+                    "restore checkpoint",
+                    format!("secret '{key}': {error} (checkpoints may not carry host secret refs)"),
+                )
+            })?;
+    }
+    if let Some(workload) = &checkpoint.workload {
+        record.image = Some(workload.image.clone());
+        record.user = workload.user.clone();
+        record.fork_overlay_owner = Some(workload.overlay_owner.clone());
+        record.restart.policy = workload
+            .restart_policy
+            .parse()
+            .map_err(|error: String| Error::config("restore checkpoint restart policy", error))?;
+        record.restart.max_retries = workload.restart_max_retries;
+        record.restart.max_backoff_secs = workload.restart_max_backoff_secs;
+    }
+    // The live guest already contains the initialized workload. Re-running
+    // image pull/init on its first start would duplicate side effects.
+    record.init_completed = true;
+    record.forkable = true;
+    Ok(record)
 }
 
 struct SavedVmPause {
@@ -595,23 +780,29 @@ fn disk_target(role: &str, index: usize, format: &str) -> Result<String> {
             )),
         };
     }
-    let alphabet = match role {
-        "storage" => b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ".as_slice(),
-        "overlay" => b"abcdefghijklmnopqrstuvwxyz".as_slice(),
-        _ => {
-            return Err(Error::agent(
-                "checkpoint disk",
-                format!("invalid disk role '{role}'"),
-            ));
-        }
-    };
-    let byte = *alphabet.get(index - 1).ok_or_else(|| {
-        Error::agent(
+    if role != "storage" && role != "overlay" {
+        return Err(Error::agent(
+            "checkpoint disk",
+            format!("invalid disk role '{role}'"),
+        ));
+    }
+    if format != "raw" && format != "qcow2" {
+        return Err(Error::agent(
+            "checkpoint disk",
+            format!("invalid disk format '{format}'"),
+        ));
+    }
+    if index >= 64 {
+        return Err(Error::agent(
             "checkpoint disk",
             format!("{role} backing chain is too deep"),
-        )
-    })?;
-    Ok(char::from(byte).to_string())
+        ));
+    }
+    // Backings live beside the active top layer because qcow2 backing paths
+    // are relative to the image that references them. Use an explicit reserved
+    // namespace: the earlier single-character names eventually collided with
+    // live-fork's `d/` disk-generation directory at deeper lineage depths.
+    Ok(format!(".smolcheckpoint-{role}-{index}.{format}"))
 }
 
 fn inspect_qcow2(path: &Path) -> Result<(Option<String>, Option<String>)> {
@@ -755,24 +946,7 @@ pub fn stage_disk_chains(
             let target = disk_target(role, index, format)?;
             let artifact_path = format!("checkpoint/disks/{role}/{index}");
             let staged = disk_staging.join(index.to_string());
-            if index == 0 {
-                // The active top layer is writable. Capture an independent
-                // reflink/sparse copy at the frozen disk boundary.
-                crate::disk_utils::clone_or_copy_file(&source, &staged)?;
-            } else {
-                // Qcow backings are immutable while referenced by a writable
-                // top. An owned hard link is an exact O(1) snapshot and remains
-                // valid even if the source machine is later deleted.
-                match std::fs::hard_link(&source, &staged) {
-                    Ok(()) => {}
-                    Err(error) if error.raw_os_error() == Some(libc::EXDEV) => {
-                        crate::disk_utils::clone_or_copy_file(&source, &staged)?;
-                    }
-                    Err(error) => {
-                        return Err(Error::agent("stage checkpoint disk", error.to_string()));
-                    }
-                }
-            }
+            stage_checkpoint_disk_layer(&source, &staged, index, format)?;
 
             let next = if format == "qcow2" {
                 let (backing, backing_format) = inspect_qcow2(&source)?;
@@ -837,6 +1011,31 @@ pub fn stage_disk_chains(
         ));
     }
     Ok(disks)
+}
+
+fn stage_checkpoint_disk_layer(
+    source: &Path,
+    staged: &Path,
+    index: usize,
+    format: &str,
+) -> Result<()> {
+    if index == 0 || format == "qcow2" {
+        // The active top is writable, and every qcow2 layer below it has a
+        // backing filename that is rewritten for the self-contained artifact.
+        // Both therefore need a private inode. Hard-linking a qcow2 backing and
+        // editing its header corrupts the live source's disk chain.
+        return crate::disk_utils::clone_or_copy_file(source, staged);
+    }
+
+    // Terminal raw backings are immutable and carry no header to rewrite. An
+    // owned hard link is an exact O(1) snapshot and survives source deletion.
+    match std::fs::hard_link(source, staged) {
+        Ok(()) => Ok(()),
+        Err(error) if error.raw_os_error() == Some(libc::EXDEV) => {
+            crate::disk_utils::clone_or_copy_file(source, staged)
+        }
+        Err(error) => Err(Error::agent("stage checkpoint disk", error.to_string())),
+    }
 }
 
 /// Build an integrity entry for a staged checkpoint payload.
@@ -1576,6 +1775,42 @@ mod tests {
         discard_transport_pack(machine.path()).unwrap();
 
         assert!(!pack.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn qcow2_backing_staging_never_aliases_the_live_header() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let qcow_staged = dir.path().join("qcow-staged");
+        let raw_staged = dir.path().join("raw-staged");
+        std::fs::write(&source, b"disk-layer").unwrap();
+
+        stage_checkpoint_disk_layer(&source, &qcow_staged, 1, "qcow2").unwrap();
+        assert_ne!(
+            std::fs::metadata(&source).unwrap().ino(),
+            std::fs::metadata(&qcow_staged).unwrap().ino()
+        );
+
+        stage_checkpoint_disk_layer(&source, &raw_staged, 1, "raw").unwrap();
+        assert_eq!(
+            std::fs::metadata(&source).unwrap().ino(),
+            std::fs::metadata(&raw_staged).unwrap().ino()
+        );
+    }
+
+    #[test]
+    fn checkpoint_backings_do_not_collide_with_runtime_directories() {
+        for role in ["storage", "overlay"] {
+            for index in 1..64 {
+                let target = disk_target(role, index, "qcow2").unwrap();
+                assert_ne!(target, "d");
+                assert_ne!(target, "s");
+                assert!(target.starts_with(".smolcheckpoint-"));
+            }
+        }
     }
 
     #[test]
