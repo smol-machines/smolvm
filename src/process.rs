@@ -687,11 +687,19 @@ fn build_seccomp_program(enforce: bool) -> std::result::Result<seccompiler::BpfP
     // arch-gated. The arm64 set is a starting point — refine from an audit run.
     #[cfg(target_arch = "x86_64")]
     allowed.extend_from_slice(&[
+        // A live fork generation creates a syscall-only RAM guardian after all
+        // vCPUs and device workers are quiesced. `clone` was already allowed;
+        // `fork` is the equivalent kernel entry used by this constrained path.
+        libc::SYS_fork,
         libc::SYS_dup2,
         libc::SYS_readlink,
         libc::SYS_unlink,
         libc::SYS_rename,
         libc::SYS_mkdir,
+        // A fresh live-fork generation binds its private RAM-guardian socket,
+        // then restricts that path to the owning VM uid before forking the
+        // guardian. Rust's path-based set_permissions uses chmod(2) here.
+        libc::SYS_chmod,
         libc::SYS_access,
         libc::SYS_epoll_wait,
         libc::SYS_poll,
@@ -2779,6 +2787,42 @@ mod tests {
             assert!(
                 libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSYS,
                 "forbidden syscall (kexec_load) should trigger SIGSYS, status={status:#x}"
+            );
+        }
+    }
+
+    /// A second live fork must be able to protect the previous generation's
+    /// RAM-guardian socket while the VMM is confined. This is deliberately a
+    /// direct syscall check so a future stdlib implementation change cannot
+    /// hide the exact x86_64 allowlist requirement.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn seccomp_allows_guardian_socket_chmod() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("guardian.sock");
+        std::fs::write(&path, b"").expect("create guardian stand-in");
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("cstring");
+        let program = build_seccomp_program(true).expect("build seccomp program");
+
+        unsafe {
+            let pid = libc::fork();
+            assert!(pid >= 0, "fork failed");
+            if pid == 0 {
+                if seccompiler::apply_filter(&program).is_err() {
+                    libc::_exit(2);
+                }
+                if libc::syscall(libc::SYS_chmod, path.as_ptr(), 0o600) != 0 {
+                    libc::_exit(3);
+                }
+                libc::_exit(0);
+            }
+            let mut status: libc::c_int = 0;
+            libc::waitpid(pid, &mut status, 0);
+            assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "guardian chmod should survive seccomp, status={status:#x}"
             );
         }
     }

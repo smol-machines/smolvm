@@ -824,7 +824,8 @@ pub struct ResizeMachineRequest {
 pub struct StartMachineQuery {
     /// Start as a fork base: back the guest RAM with a memfd (copy-on-write
     /// cloneable) and expose a control socket so the machine can later be forked
-    /// with `POST /machines/{name}/fork`. The golden freezes after its first fork.
+    /// with `POST /machines/{name}/fork`. Linux/x86_64 keeps the source running;
+    /// other hosts retain it as the frozen copy-on-write base.
     #[serde(default)]
     pub forkable: bool,
     /// Number of runnable CUDA fork clones planned for this golden. Supplying

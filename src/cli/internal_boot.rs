@@ -12,6 +12,53 @@ use smolvm::data::disk::{DiskFormat, DiskType};
 use smolvm::storage::VmDisk;
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "linux")]
+const GUARDIAN_MANIFEST_MAGIC: u64 = 0x534d4f4c4752444e;
+#[cfg(target_os = "linux")]
+const PREOPENED_USERFAULTFD_FD: libc::c_int = 198;
+
+#[cfg(target_os = "linux")]
+fn preopen_guardian_userfaultfd() -> smolvm::Result<()> {
+    let Some(snapshot_dir) = std::env::var_os("SMOLVM_SNAPSHOT_DIR") else {
+        return Ok(());
+    };
+    let manifest_path = PathBuf::from(snapshot_dir).join("manifest.bin");
+    let manifest = std::fs::read(&manifest_path)
+        .map_err(|error| smolvm::Error::agent("read fork manifest", error.to_string()))?;
+    let magic = manifest
+        .get(..8)
+        .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
+        .ok_or_else(|| smolvm::Error::agent("read fork manifest", "manifest is truncated"))?;
+    if magic != GUARDIAN_MANIFEST_MAGIC {
+        return Ok(());
+    }
+
+    let fd = unsafe {
+        libc::syscall(libc::SYS_userfaultfd, libc::O_CLOEXEC | libc::O_NONBLOCK) as libc::c_int
+    };
+    if fd < 0 {
+        return Err(smolvm::Error::agent(
+            "prepare demand-paged clone RAM",
+            format!(
+                "kernel-fault-capable userfaultfd is unavailable: {}; run the privileged SmolVM service so it can open userfaultfd before the per-VM uid drop",
+                std::io::Error::last_os_error()
+            ),
+        ));
+    }
+    if fd != PREOPENED_USERFAULTFD_FD {
+        if unsafe { libc::dup3(fd, PREOPENED_USERFAULTFD_FD, libc::O_CLOEXEC) } < 0 {
+            let error = std::io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(smolvm::Error::agent(
+                "prepare demand-paged clone RAM",
+                format!("reserve userfaultfd descriptor: {error}"),
+            ));
+        }
+        unsafe { libc::close(fd) };
+    }
+    Ok(())
+}
+
 /// Open a boot disk honoring its on-disk format. A fork clone's disk path ends
 /// in `.qcow2` (a copy-on-write overlay, opened as-is over its backing image);
 /// every other disk is a raw image that may need creating/formatting. The path
@@ -134,6 +181,12 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
     // guest: block setuid privilege escalation and core dumps (which would leak
     // guest RAM). See docs/runtime-isolation-hardening.md for the full roadmap.
     smolvm::process::harden_self();
+
+    // A guardian-backed clone needs userfaultfd to resolve faults originating
+    // inside KVM. Open it while this dedicated boot process still has the host
+    // service's privileges; libkrun takes ownership after the uid drop.
+    #[cfg(target_os = "linux")]
+    preopen_guardian_userfaultfd()?;
 
     // If the supervisor delegated a cgroup v2 root (via SMOLVM_CGROUP_ROOT),
     // place this VMM in a per-VM cgroup with cpu/pids/memory caps so an untrusted
@@ -666,9 +719,10 @@ fn qcow2_backing_chain(path: &std::path::Path) -> Vec<std::path::PathBuf> {
     use std::io::{Read, Seek, SeekFrom};
     let mut chain = Vec::new();
     let mut current = path.to_path_buf();
-    // A backing chain deeper than a handful of links is not something this
-    // engine produces; the bound only guards against cycles.
-    for _ in 0..8 {
+    // Live fork-and-continue intentionally adds one immutable layer per fresh
+    // checkpoint. Fork creation caps the supported chain at 32; leave headroom
+    // here for imported and nested chains while still bounding corrupt cycles.
+    for _ in 0..64 {
         let Ok(mut f) = std::fs::File::open(&current) else {
             break;
         };
@@ -693,6 +747,14 @@ fn qcow2_backing_chain(path: &std::path::Path) -> Vec<std::path::PathBuf> {
             break;
         };
         let backing = std::path::PathBuf::from(backing);
+        let backing = if backing.is_absolute() {
+            backing
+        } else {
+            current
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join(backing)
+        };
         if chain.contains(&backing) {
             break;
         }
@@ -746,6 +808,12 @@ mod backing_chain_tests {
         assert!(qcow2_backing_chain(&raw).is_empty());
         let solo = fake_qcow2(&dir, "solo.qcow2", None);
         assert!(qcow2_backing_chain(&solo).is_empty());
+        let relative = fake_qcow2(
+            &dir,
+            "relative.qcow2",
+            Some(std::path::Path::new("template.raw")),
+        );
+        assert_eq!(qcow2_backing_chain(&relative), vec![raw.clone()]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

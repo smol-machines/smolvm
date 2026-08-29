@@ -582,6 +582,13 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub golden: Option<String>,
 
+    /// Immutable RAM/disk generation inherited by this clone. This is the
+    /// short directory id under the golden's `s/` tree, never a caller-supplied
+    /// path. It lets the host retain a demand-paging guardian exactly while a
+    /// live clone can still fault pages from it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_generation: Option<String>,
+
     /// Persistent container-overlay owner inherited from the root of a fork
     /// lineage. A clone's live overlay keeps its original on-disk name across
     /// every generation; descendants must continue addressing that root name.
@@ -709,6 +716,7 @@ impl VmRecord {
             ephemeral: false,
             source_smolmachine: None,
             golden: None,
+            fork_generation: None,
             fork_overlay_owner: None,
             forkpoint_held: false,
             fork_env: Vec::new(),
@@ -776,6 +784,7 @@ impl VmRecord {
             ephemeral: false,
             source_smolmachine: None,
             golden: None,
+            fork_generation: None,
             fork_overlay_owner: None,
             forkpoint_held: false,
             fork_env: Vec::new(),

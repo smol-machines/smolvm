@@ -1337,6 +1337,10 @@ pub async fn start_machine(
     // spawn_blocking). Linux: the guarded detach/mount are no-ops.
     let lifecycle = state.lifecycle_lock(&name);
     let _guard = lifecycle.lock().await;
+    // Cross-process serialization with CLI/API fork preparation. Lifecycle
+    // locks cover this server instance; the flock also prevents a direct CLI
+    // fork from racing a restart and binding to a superseded VMM identity.
+    let _source_lock = acquire_fork_source_lock(name.clone()).await?;
 
     // Get VM record from database (off the reactor)
     let mut record = state
@@ -1460,6 +1464,18 @@ pub async fn start_machine(
             .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
     }
 
+    // Like forkPoolSize above, an explicit forkable start is a durable launch
+    // property rather than a one-process hint. Persist it before registering
+    // the in-memory entry so the response is truthful and an API-service
+    // restart preserves the machine's ability to fork.
+    if query.forkable && !record.forkable {
+        record.forkable = true;
+        state
+            .update_vm(&name, |r| r.forkable = true)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
+    }
+
     let mounts = record.host_mounts();
     let ports = record.port_mappings();
     let resources = record.vm_resources();
@@ -1477,6 +1493,7 @@ pub async fn start_machine(
     let source_smolmachine = record.source_smolmachine.clone();
     let dns_filter_hosts = record.dns_filter_hosts.clone();
     let record_golden = record.golden.clone();
+    let record_fork_overlay_owner = record.fork_overlay_owner.clone();
     let cuda_fork_pool_size = record.cuda_fork_pool_size;
     let cuda_vram_limit_mib = record.cuda_vram_limit_mib;
     let restore_record = record.clone();
@@ -1497,8 +1514,11 @@ pub async fn start_machine(
         // explicitly — without it the clone claims a fresh uid that cannot
         // traverse the golden's 0700 dir to open its copy-on-write disk
         // backing, and the boot dies configuring virtio-blk.
-        if let Some(ref g) = record_golden {
-            features.uid_share_dir = Some(crate::agent::vm_data_dir(g));
+        if let Some(owner) = record_fork_overlay_owner
+            .as_deref()
+            .or(record_golden.as_deref())
+        {
+            features.uid_share_dir = Some(crate::agent::vm_data_dir(owner));
         }
         // Forkable start: memfd-back guest RAM and expose a control socket at the
         // machine's known path so it can later be forked via the fork endpoint.
@@ -1953,6 +1973,7 @@ pub(crate) async fn fork_held_machines_inner(
                 &specs,
                 retained_snapshot.as_ref(),
                 true,
+                true,
             )
         })
         .await
@@ -2329,13 +2350,17 @@ pub async fn stop_machine(
 ) -> Result<Json<MachineInfo>, ApiError> {
     // Hold the per-machine lifecycle lock across the whole stop so the layers
     // volume detach below cannot race a concurrent start's acquire+mount+launch
-    // (review finding #3). Acquired before the DB read and actual_state() probe
+    // (review finding #3). Acquired before the DB read and liveness probe
     // so the liveness check and the detach act on the same held lock — without
     // it, stop could decide "running" off a snapshot a concurrent start has
     // already superseded, then detach a volume that start just mounted. Outermost
     // lock; the entry mutex is not taken here. Linux: detach is a no-op.
     let lifecycle = state.lifecycle_lock(&name);
     let _guard = lifecycle.lock().await;
+    // Cross-process serialization with CLI/API fork preparation. Lifecycle
+    // locks cover this server instance; the flock also prevents a direct CLI
+    // fork from racing source shutdown between checkpoint and clone commit.
+    let _source_lock = acquire_fork_source_lock(name.clone()).await?;
 
     // Get VM record from database (off the reactor)
     let record = state
@@ -2343,13 +2368,19 @@ pub async fn stop_machine(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
 
-    // A frozen fork base must outlive its clones: they CoW-map its guest RAM
-    // (memfd) and CoW-back their disks onto its disks, so stopping it — which
-    // kills the VMM and frees the memfd — corrupts every live clone. `actual_state`
-    // does not resolve the on-the-fly `Frozen` state, so a golden with clones
-    // looks `Running` here and would be torn down. Refuse, mirroring `delete` and
-    // the CLI stop guard.
-    {
+    // Resolve the control-plane state, not only PID liveness. A non-Linux fork
+    // base is genuinely Frozen and its source VMM owns the RAM backing, so it
+    // must outlive its clones. A Linux fork-and-continue source is Running:
+    // each clone has opened its RAM generation and its disk bases are retained
+    // on disk, so stopping that source is safe and must remain possible.
+    let name_probe = name.clone();
+    let record_probe = record.clone();
+    let resolved = tokio::task::spawn_blocking(move || {
+        crate::agent::state_probe::resolve_state(&name_probe, &record_probe)
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("task error: {e}")))?;
+    if resolved == RecordState::Frozen {
         let db = state.db().clone();
         let golden = name.clone();
         let clones = tokio::task::spawn_blocking(move || db.dependent_clones(&golden))
@@ -2367,9 +2398,12 @@ pub async fn stop_machine(
         }
     }
 
-    // Check state
-    let actual_state = record.actual_state();
-    if actual_state != RecordState::Running {
+    // An unreachable process is still live and must go through the verified
+    // shutdown path below. Frozen-without-clones is also safe to terminate.
+    if !matches!(
+        resolved,
+        RecordState::Running | RecordState::Frozen | RecordState::Unreachable
+    ) {
         // Not running. If a prior start mounted the layers volume but the VM
         // then failed to boot (or the server crashed while running), the volume
         // could still be mounted — detach it so a stopped machine never holds a
