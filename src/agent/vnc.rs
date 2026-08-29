@@ -1196,6 +1196,20 @@ mod tests {
         assert!(CLIENT_HTML.contains("/websockify"));
         assert!(CLIENT_HTML.contains("/video"));
         assert!(CLIENT_HTML.contains("VideoDecoder"));
+        // The browser is the path a cloud desktop takes, and Raw costs ~12 MB/s
+        // there. Losing any of these silently drops it back to Raw.
+        assert!(
+            CLIENT_HTML.contains("DecompressionStream"),
+            "the client must be able to inflate ZRLE"
+        );
+        assert!(
+            CLIENT_HTML.contains("encodings.unshift(16)"),
+            "the client must advertise ZRLE, or the server keeps sending Raw"
+        );
+        assert!(
+            CLIENT_HTML.contains("drawZrle"),
+            "the client must decode the ZRLE rectangles it asked for"
+        );
         assert!(CLIENT_HTML.trim_end().ends_with("</html>"));
     }
 
