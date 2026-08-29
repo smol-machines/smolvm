@@ -135,32 +135,7 @@ fn checkpoint_rootfs_dir(options: &CaptureOptions) -> Result<PathBuf> {
         })
 }
 
-/// Capture a running checkpointable machine into a self-contained artifact.
-///
-/// The source is paused only while libkrun saves execution state and the exact
-/// disk chains are cloned. Hashing and compression continue after it resumes.
-pub fn capture_to_path(
-    name: &str,
-    output: &Path,
-    options: &CaptureOptions,
-) -> Result<CaptureResult> {
-    let started = std::time::Instant::now();
-    if output
-        .extension()
-        .is_none_or(|extension| !extension.eq_ignore_ascii_case("smolcheckpoint"))
-    {
-        return Err(Error::config(
-            "checkpoint machine",
-            "output must end in .smolcheckpoint",
-        ));
-    }
-    if output.exists() {
-        return Err(Error::config(
-            "checkpoint machine",
-            format!("refusing to overwrite {}", output.display()),
-        ));
-    }
-
+fn validated_capture_source(name: &str) -> Result<SmolvmConfig> {
     let config = SmolvmConfig::load()?;
     let vm = config
         .vms
@@ -189,6 +164,40 @@ pub fn capture_to_path(
             format!("machine '{name}' is not checkpointable: {status}"),
         ));
     }
+    Ok(config)
+}
+
+/// Capture a running checkpointable machine into a self-contained artifact.
+///
+/// The source is paused only while libkrun saves execution state and the exact
+/// disk chains are cloned. Hashing and compression continue after it resumes.
+pub fn capture_to_path(
+    name: &str,
+    output: &Path,
+    options: &CaptureOptions,
+) -> Result<CaptureResult> {
+    let started = std::time::Instant::now();
+    if output
+        .extension()
+        .is_none_or(|extension| !extension.eq_ignore_ascii_case("smolcheckpoint"))
+    {
+        return Err(Error::config(
+            "checkpoint machine",
+            "output must end in .smolcheckpoint",
+        ));
+    }
+    if output.exists() {
+        return Err(Error::config(
+            "checkpoint machine",
+            format!("refusing to overwrite {}", output.display()),
+        ));
+    }
+
+    // Fail before staging runtime assets when the source is already known to
+    // be ineligible. The source is revalidated under the cross-process lock
+    // immediately before capture so this fast preflight is never trusted for
+    // the consistency boundary.
+    let _ = validated_capture_source(name)?;
 
     let temp_dir = tempfile::Builder::new()
         .prefix("checkpoint-staging-")
@@ -207,6 +216,18 @@ pub fn capture_to_path(
         .create_storage_template()
         .map_err(|error| Error::agent("create checkpoint storage template", error.to_string()))?;
 
+    // A serve process has its own lifecycle mutex, but another CLI process
+    // does not share it. Use the same source lock as `machine fork` so SAVE and
+    // fork can never overlap or produce two competing source generations.
+    // Release it as soon as the source resumes; hashing and compression do not
+    // touch the live machine and must not delay a subsequent fork.
+    let source_lock = crate::agent::fork::lock_fork_source(name)?;
+    let config = validated_capture_source(name)?;
+    let vm = config
+        .vms
+        .get(name)
+        .expect("validated checkpoint source must remain in its loaded config");
+    let control = crate::agent::fork::control_socket_path(name);
     crate::agent::fork::sync_fork_source(name)?;
     let snapshot_dir = staging_dir.join(ASSET_DIR);
     let pause_started = std::time::Instant::now();
@@ -228,6 +249,7 @@ pub fn capture_to_path(
     let checkpoint_disks = stage_disk_chains(&crate::agent::vm_data_dir(name), &snapshot_dir)?;
     pause.resume()?;
     let source_pause = pause_started.elapsed();
+    drop(source_lock);
 
     let assets = crate::pack_export::FromVmAssets {
         mode: PackMode::Vm,

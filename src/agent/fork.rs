@@ -28,7 +28,7 @@ const MAX_FORK_LINEAGE_DEPTH: usize = 32;
 
 type ForkDisk = (&'static str, PathBuf, crate::data::disk::DiskFormat);
 
-/// Cross-process guard for one source machine's complete fork transaction.
+/// Cross-process guard for one source machine's fork or checkpoint transaction.
 ///
 /// The in-process API/SDK lifecycle locks cannot serialize a separate CLI
 /// process. Without this guard, two first forks can both wait in the guest;
@@ -56,9 +56,11 @@ impl ForkSourceLock {
     }
 }
 
-/// Serialize a complete fork operation for `source` across CLI, SDK, and serve
-/// processes. The sibling lock file intentionally lives outside the machine's
-/// removable data directory, so a concurrent delete cannot replace its inode.
+/// Serialize source-state capture for `source` across CLI, SDK, and serve
+/// processes. A fork retains the guard for its complete transaction; a portable
+/// checkpoint releases it once the source resumes. The sibling lock file lives
+/// outside the removable machine data directory, so concurrent deletion cannot
+/// replace its inode.
 pub fn lock_fork_source(source: &str) -> Result<ForkSourceLock> {
     validate_vm_name(source, "fork source").map_err(|error| Error::config("fork source", error))?;
     ForkSourceLock::acquire_at(&fork_source_lock_path(source))
@@ -519,6 +521,10 @@ fn prepare_running_disk_generation(
         let active = gdir.join(Path::new(raw).with_extension("qcow2"));
         let base = if format == DiskFormat::Qcow2 {
             let generation_base = generation_disk_dir.join(format!("{id}.base.qcow2"));
+            if let Err(error) = stage_relocated_qcow2_backings(&base, &generation_base) {
+                rollback_prepared_disk_generation(&overlays, &rotations, &generation_disk_dir);
+                return Err(error);
+            }
             if let Err(error) = std::fs::rename(&base, &generation_base) {
                 rollback_prepared_disk_generation(&overlays, &rotations, &generation_disk_dir);
                 return Err(Error::agent(
@@ -612,8 +618,6 @@ const MAX_FORK_DISK_CHAIN_DEPTH: usize = 32;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn qcow2_backing_depth(path: &Path) -> Result<usize> {
-    use std::io::{Read, Seek, SeekFrom};
-
     let mut current = path.canonicalize().map_err(|error| {
         Error::agent(
             "inspect fork disk chain",
@@ -629,61 +633,9 @@ fn qcow2_backing_depth(path: &Path) -> Result<usize> {
                 format!("cycle at {}", current.display()),
             ));
         }
-        let mut file = File::open(&current).map_err(|error| {
-            Error::agent(
-                "inspect fork disk chain",
-                format!("{}: {error}", current.display()),
-            )
-        })?;
-        let mut header = [0_u8; 20];
-        file.read_exact(&mut header).map_err(|error| {
-            Error::agent(
-                "inspect fork disk chain",
-                format!("{}: {error}", current.display()),
-            )
-        })?;
-        if header[..4] != *b"QFI\xfb" {
+        let Some(backing) = qcow2_backing_name(&current)? else {
             return Ok(depth);
-        }
-        let offset = u64::from_be_bytes(header[8..16].try_into().unwrap());
-        let length = u32::from_be_bytes(header[16..20].try_into().unwrap()) as usize;
-        if offset == 0 && length == 0 {
-            return Ok(depth);
-        }
-        if offset == 0 || length == 0 || length > 4096 {
-            return Err(Error::agent(
-                "inspect fork disk chain",
-                format!("{} has invalid qcow2 backing metadata", current.display()),
-            ));
-        }
-        let end = offset
-            .checked_add(length as u64)
-            .ok_or_else(|| Error::agent("inspect fork disk chain", "backing offset overflow"))?;
-        if end
-            > file
-                .metadata()
-                .map_err(|error| Error::agent("inspect fork disk chain", error.to_string()))?
-                .len()
-        {
-            return Err(Error::agent(
-                "inspect fork disk chain",
-                format!("{} has a truncated qcow2 backing name", current.display()),
-            ));
-        }
-        let mut name = vec![0_u8; length];
-        file.seek(SeekFrom::Start(offset))
-            .and_then(|_| file.read_exact(&mut name))
-            .map_err(|error| Error::agent("inspect fork disk chain", error.to_string()))?;
-        let backing = std::str::from_utf8(&name).map_err(|error| {
-            Error::agent(
-                "inspect fork disk chain",
-                format!(
-                    "{} has a non-UTF-8 backing name: {error}",
-                    current.display()
-                ),
-            )
-        })?;
-        let backing = PathBuf::from(backing);
+        };
         let next = if backing.is_absolute() {
             backing
         } else {
@@ -705,6 +657,172 @@ fn qcow2_backing_depth(path: &Path) -> Result<usize> {
             return Ok(depth);
         }
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn qcow2_backing_name(path: &Path) -> Result<Option<PathBuf>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = File::open(path).map_err(|error| {
+        Error::agent(
+            "inspect fork disk chain",
+            format!("{}: {error}", path.display()),
+        )
+    })?;
+    let mut header = [0_u8; 20];
+    file.read_exact(&mut header).map_err(|error| {
+        Error::agent(
+            "inspect fork disk chain",
+            format!("{}: {error}", path.display()),
+        )
+    })?;
+    if header[..4] != *b"QFI\xfb" {
+        return Ok(None);
+    }
+    let offset = u64::from_be_bytes(header[8..16].try_into().unwrap());
+    let length = u32::from_be_bytes(header[16..20].try_into().unwrap()) as usize;
+    if offset == 0 && length == 0 {
+        return Ok(None);
+    }
+    if offset == 0 || length == 0 || length > 4096 {
+        return Err(Error::agent(
+            "inspect fork disk chain",
+            format!("{} has invalid qcow2 backing metadata", path.display()),
+        ));
+    }
+    let end = offset
+        .checked_add(length as u64)
+        .ok_or_else(|| Error::agent("inspect fork disk chain", "backing offset overflow"))?;
+    if end
+        > file
+            .metadata()
+            .map_err(|error| Error::agent("inspect fork disk chain", error.to_string()))?
+            .len()
+    {
+        return Err(Error::agent(
+            "inspect fork disk chain",
+            format!("{} has a truncated qcow2 backing name", path.display()),
+        ));
+    }
+    let mut name = vec![0_u8; length];
+    file.seek(SeekFrom::Start(offset))
+        .and_then(|_| file.read_exact(&mut name))
+        .map_err(|error| Error::agent("inspect fork disk chain", error.to_string()))?;
+    let backing = std::str::from_utf8(&name).map_err(|error| {
+        Error::agent(
+            "inspect fork disk chain",
+            format!("{} has a non-UTF-8 backing name: {error}", path.display()),
+        )
+    })?;
+    Ok(Some(PathBuf::from(backing)))
+}
+
+/// Preserve relative backing names when an active qcow2 image is moved into a
+/// fork-generation directory. Portable checkpoint disks deliberately use
+/// compact relative names (`0`, `1`, ...); moving only the top image would make
+/// those names resolve inside the new directory and break the first fork of a
+/// restored machine. Hard-linking the immutable backing chain keeps the move
+/// O(metadata) and does not duplicate disk contents.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn stage_relocated_qcow2_backings(source_top: &Path, relocated_top: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Component;
+
+    let mut source = source_top.canonicalize().map_err(|error| {
+        Error::agent(
+            "stage fork disk backing",
+            format!("{}: {error}", source_top.display()),
+        )
+    })?;
+    let mut relocated = relocated_top.to_path_buf();
+    let mut seen = HashSet::new();
+    for _ in 0..MAX_FORK_DISK_CHAIN_DEPTH {
+        if !seen.insert(source.clone()) {
+            return Err(Error::agent(
+                "stage fork disk backing",
+                format!("cycle at {}", source.display()),
+            ));
+        }
+        let Some(backing) = qcow2_backing_name(&source)? else {
+            return Ok(());
+        };
+        if backing.is_absolute() {
+            return Ok(());
+        }
+        if !backing
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+        {
+            return Err(Error::agent(
+                "stage fork disk backing",
+                format!(
+                    "{} has unsafe relative backing name {}",
+                    source.display(),
+                    backing.display()
+                ),
+            ));
+        }
+        let source_next = source
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(&backing)
+            .canonicalize()
+            .map_err(|error| {
+                Error::agent(
+                    "stage fork disk backing",
+                    format!("backing of {}: {error}", source.display()),
+                )
+            })?;
+        let relocated_next = relocated
+            .parent()
+            .ok_or_else(|| Error::agent("stage fork disk backing", "missing parent directory"))?
+            .join(&backing);
+        if let Some(parent) = relocated_next.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| Error::agent("stage fork disk backing", error.to_string()))?;
+        }
+        match std::fs::hard_link(&source_next, &relocated_next) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let source_meta = std::fs::metadata(&source_next).map_err(|inspect| {
+                    Error::agent("stage fork disk backing", inspect.to_string())
+                })?;
+                let relocated_meta = std::fs::metadata(&relocated_next).map_err(|inspect| {
+                    Error::agent("stage fork disk backing", inspect.to_string())
+                })?;
+                if source_meta.dev() != relocated_meta.dev()
+                    || source_meta.ino() != relocated_meta.ino()
+                {
+                    return Err(Error::agent(
+                        "stage fork disk backing",
+                        format!(
+                            "{} already exists for a different backing file",
+                            relocated_next.display()
+                        ),
+                    ));
+                }
+            }
+            Err(error) => {
+                return Err(Error::agent(
+                    "stage fork disk backing",
+                    format!(
+                        "{} -> {}: {error}",
+                        source_next.display(),
+                        relocated_next.display()
+                    ),
+                ));
+            }
+        }
+        source = source_next;
+        relocated = relocated_next;
+    }
+    Err(Error::agent(
+        "stage fork disk backing",
+        format!(
+            "{} exceeds the safe backing depth of {MAX_FORK_DISK_CHAIN_DEPTH}",
+            source_top.display()
+        ),
+    ))
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -837,7 +955,7 @@ fn rollback_uncommitted_disk_generation(gdir: &Path, snapshot_dir: &Path) -> Res
             }
         }
     }
-    match std::fs::remove_dir(&generation_disk_dir) {
+    match std::fs::remove_dir_all(&generation_disk_dir) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
@@ -967,7 +1085,7 @@ fn rollback_prepared_disk_generation(
     for (generation_base, original) in rotations.iter().rev() {
         let _ = std::fs::rename(generation_base, original);
     }
-    let _ = std::fs::remove_dir(generation_disk_dir);
+    let _ = std::fs::remove_dir_all(generation_disk_dir);
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -2827,6 +2945,31 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("cycle"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn relocating_qcow2_keeps_its_relative_backing_chain_valid() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let raw = temp.path().join("0");
+        std::fs::write(&raw, vec![0_u8; 20]).unwrap();
+        let top = temp.path().join("storage.qcow2");
+        write_test_qcow2(&top, Some("0"));
+
+        let generation = temp.path().join("d/generation");
+        std::fs::create_dir_all(&generation).unwrap();
+        let relocated = generation.join("storage.base.qcow2");
+        stage_relocated_qcow2_backings(&top, &relocated).unwrap();
+        std::fs::rename(&top, &relocated).unwrap();
+
+        assert_eq!(qcow2_backing_depth(&relocated).unwrap(), 1);
+        assert_eq!(
+            std::fs::metadata(&raw).unwrap().ino(),
+            std::fs::metadata(generation.join("0")).unwrap().ino(),
+            "backing should be preserved without copying its contents"
+        );
     }
 
     #[cfg(target_os = "linux")]
