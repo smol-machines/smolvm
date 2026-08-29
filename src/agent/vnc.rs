@@ -614,19 +614,56 @@ fn handle_client<S: Read + Write>(
                 }
             }
             6 => {
-                // ClientCutText: 3 padding + u32 length + text
+                // ClientCutText: 3 padding + i32 length + text.
+                //
+                // 🔴 That length is SIGNED. A negative value means the
+                // extended-clipboard extension and the payload is |len| bytes.
+                // Reading it as unsigned turned -28 into ~4.29 billion, which
+                // tripped the size guard and ended the session -- and a viewer
+                // announces its clipboard as soon as it takes focus, so the
+                // desktop froze a second or two after being touched.
                 let mut head = [0u8; 7];
                 s.read_exact(&mut head)?;
-                let len = u32::from_be_bytes([head[3], head[4], head[5], head[6]]) as usize;
-                // Bound it: a hostile length would otherwise allocate freely.
-                if len > 1 << 20 {
-                    return Ok(());
+                let len = i32::from_be_bytes([head[3], head[4], head[5], head[6]]).unsigned_abs()
+                    as usize;
+                // Discard in bounded chunks. The clipboard is not used here, so
+                // neither a huge paste nor an extension we do not implement
+                // should cost unbounded memory -- or, far worse, the session.
+                let mut remaining = len;
+                let mut sink = [0u8; 8192];
+                while remaining > 0 {
+                    let take = remaining.min(sink.len());
+                    s.read_exact(&mut sink[..take])?;
+                    remaining -= take;
                 }
-                let mut text = vec![0u8; len];
-                s.read_exact(&mut text)?;
+            }
+            251 => {
+                // SetDesktopSize: the client asking us to change the guest's
+                // resolution. The guest owns its mode, so this is consumed and
+                // ignored -- but it must never end the session. A viewer sends
+                // it as soon as it shrinks its window to fit the monitor, and
+                // dropping the connection there leaves a half-drawn desktop
+                // frozen on screen with no hint of why.
+                let mut head = [0u8; 7];
+                s.read_exact(&mut head)?;
+                let screens = head[5] as usize;
+                let mut rest = vec![0u8; screens * 16];
+                s.read_exact(&mut rest)?;
+                tracing::debug!(
+                    width = u16::from_be_bytes([head[1], head[2]]),
+                    height = u16::from_be_bytes([head[3], head[4]]),
+                    "vnc client asked to resize the desktop; the guest owns its mode"
+                );
             }
             other => {
-                tracing::debug!(message_type = other, "unknown vnc client message; closing");
+                // Nothing else can be skipped safely: without knowing a
+                // message's length the stream cannot be resynchronised. Warn
+                // rather than debug, because from the client's side this looks
+                // like the session simply freezing.
+                tracing::warn!(
+                    message_type = other,
+                    "unknown vnc client message; closing the session"
+                );
                 return Ok(());
             }
         }
@@ -1140,6 +1177,76 @@ mod tests {
             self.2 += n;
             Ok(n)
         }
+    }
+
+    /// Clipboard announcements must not end the session, in either form.
+    ///
+    /// Regression: the ClientCutText length is signed, and a negative value
+    /// means the extended-clipboard extension. Parsed as unsigned it became
+    /// ~4.29 billion, tripped the size guard and closed the connection —
+    /// which looked like the desktop freezing seconds after a viewer touched
+    /// it, because TigerVNC announces its clipboard on focus.
+    #[test]
+    fn a_clipboard_announcement_does_not_end_the_session() {
+        for (label, len) in [("normal", 5i32), ("extended", -28i32)] {
+            let addr = serve_a_test_desktop();
+            let mut s = connect(addr);
+            let _ = drive_rfb_session(&mut s);
+
+            let mut msg = vec![6u8, 0, 0, 0];
+            msg.extend_from_slice(&len.to_be_bytes());
+            msg.extend_from_slice(&vec![b'x'; len.unsigned_abs() as usize]);
+            s.write_all(&msg).unwrap();
+
+            let mut req = vec![3u8, 0];
+            req.extend_from_slice(&0u16.to_be_bytes());
+            req.extend_from_slice(&0u16.to_be_bytes());
+            req.extend_from_slice(&(TEST_W as u16).to_be_bytes());
+            req.extend_from_slice(&(TEST_H as u16).to_be_bytes());
+            s.write_all(&req).unwrap();
+            let mut head = [0u8; 4];
+            s.read_exact(&mut head)
+                .unwrap_or_else(|e| panic!("{label} clipboard ended the session ({e})"));
+            assert_eq!(head[0], 0, "{label}: expected a FramebufferUpdate");
+        }
+    }
+
+    /// A client asking to resize the desktop must not end the session.
+    ///
+    /// Regression: TigerVNC shrinks its window to fit the monitor as soon as it
+    /// connects, and with RemoteResize on that sends SetDesktopSize. The server
+    /// used to close on any unrecognised message, so the viewer was left with a
+    /// half-drawn desktop that never updated again and swallowed all input.
+    #[test]
+    fn a_desktop_resize_request_does_not_end_the_session() {
+        let addr = serve_a_test_desktop();
+        let mut s = connect(addr);
+        let _ = drive_rfb_session(&mut s); // handshake + first update
+
+        // SetDesktopSize: type, padding, w, h, screen count, padding, 1 screen.
+        let mut msg = vec![251u8, 0];
+        msg.extend_from_slice(&1024u16.to_be_bytes());
+        msg.extend_from_slice(&640u16.to_be_bytes());
+        msg.extend_from_slice(&[1, 0]);
+        msg.extend_from_slice(&1u32.to_be_bytes());
+        msg.extend_from_slice(&0u16.to_be_bytes());
+        msg.extend_from_slice(&0u16.to_be_bytes());
+        msg.extend_from_slice(&1024u16.to_be_bytes());
+        msg.extend_from_slice(&640u16.to_be_bytes());
+        msg.extend_from_slice(&0u32.to_be_bytes());
+        s.write_all(&msg).unwrap();
+
+        // The session must still answer a full update request.
+        let mut req = vec![3u8, 0];
+        req.extend_from_slice(&0u16.to_be_bytes());
+        req.extend_from_slice(&0u16.to_be_bytes());
+        req.extend_from_slice(&(TEST_W as u16).to_be_bytes());
+        req.extend_from_slice(&(TEST_H as u16).to_be_bytes());
+        s.write_all(&req).unwrap();
+        let mut head = [0u8; 4];
+        s.read_exact(&mut head)
+            .expect("server closed after SetDesktopSize instead of ignoring it");
+        assert_eq!(head[0], 0, "expected a FramebufferUpdate");
     }
 
     #[test]
