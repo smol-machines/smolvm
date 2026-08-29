@@ -80,7 +80,21 @@ fn inject_into_container_if(
 
     // Loader fallback for images without libvulkan.so.1 — appended, so an
     // image-provided loader earlier on the path still wins.
-    append_ld_library_path(&mut spec.process.env, CONTAINER_BUNDLE_DIR);
+    // 🔴 Only for images that ship no Vulkan loader of their own.
+    //
+    // Every LD_LIBRARY_PATH entry outranks the system paths, so exposing the
+    // whole bundle also shadows the libdrm and libexpat it carries -- against
+    // which the image's own Mesa was not built. Measured on Arch: with the
+    // bundle on the path, `eglInitialize` fails outright and every GL client in
+    // the container falls back to software. The injection meant to add Vulkan
+    // was silently removing OpenGL.
+    //
+    // The bundled driver resolves its dependencies from any normal image
+    // (verified: Venus enumerates with LD_LIBRARY_PATH unset), so the path is
+    // only needed when there is no loader to resolve against.
+    if !image_has_vulkan_loader(rootfs) {
+        append_ld_library_path(&mut spec.process.env, CONTAINER_BUNDLE_DIR);
+    }
 }
 
 /// Append the Vulkan loader pin (and the bundle's loader path) to an explicit
@@ -167,6 +181,22 @@ fn is_musl_image(rootfs: &std::path::Path) -> bool {
                 .any(|e| e.file_name().to_string_lossy().starts_with("ld-musl-"))
         })
         .unwrap_or(false)
+}
+
+/// Does the image ship its own Vulkan loader?
+///
+/// The bundle carries one for images that have none, but putting it on the
+/// library path is only safe when nothing else would be shadowed by it.
+fn image_has_vulkan_loader(rootfs: &std::path::Path) -> bool {
+    [
+        "usr/lib",
+        "usr/lib64",
+        "lib",
+        "usr/lib/x86_64-linux-gnu",
+        "usr/lib/aarch64-linux-gnu",
+    ]
+    .iter()
+    .any(|dir| rootfs.join(dir).join("libvulkan.so.1").exists())
 }
 
 /// Append `dir` to the spec's `LD_LIBRARY_PATH`, preserving an image-provided
