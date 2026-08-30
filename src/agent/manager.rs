@@ -3217,6 +3217,31 @@ mod tests {
     }
 
     #[test]
+    fn manager_open_uses_preseeded_qcow_disks_without_creating_raw_disks() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage_qcow = temp.path().join("storage.qcow2");
+        let overlay_qcow = temp.path().join("overlay.qcow2");
+        std::fs::write(&storage_qcow, b"QFI\xfb-storage").unwrap();
+        std::fs::write(&overlay_qcow, b"QFI\xfb-overlay").unwrap();
+
+        let (storage_path, storage_format) =
+            resolve_disk_image(temp.path(), crate::storage::STORAGE_DISK_FILENAME);
+        let (overlay_path, overlay_format) =
+            resolve_disk_image(temp.path(), crate::storage::OVERLAY_DISK_FILENAME);
+        let storage =
+            open_storage_disk_for_manager(&storage_path, storage_format, Some(20)).unwrap();
+        let overlay =
+            open_overlay_disk_for_manager(&overlay_path, overlay_format, Some(10)).unwrap();
+
+        assert_eq!(storage.path(), storage_qcow);
+        assert_eq!(storage.format(), DiskFormat::Qcow2);
+        assert_eq!(overlay.path(), overlay_qcow);
+        assert_eq!(overlay.format(), DiskFormat::Qcow2);
+        assert!(!temp.path().join("storage.raw").exists());
+        assert!(!temp.path().join("overlay.raw").exists());
+    }
+
+    #[test]
     fn restored_cuda_clones_fail_faster_than_other_boots() {
         assert_eq!(agent_ready_timeout(true), Duration::from_secs(10));
         assert_eq!(agent_ready_timeout(false), Duration::from_secs(30));
