@@ -47,11 +47,12 @@ const UPDATE_WAIT: Duration = Duration::from_secs(1);
 /// happens when the compositor sets a mode different from the initial one.
 const ENCODING_DESKTOP_SIZE: i32 = -223;
 const ENCODING_RAW: i32 = 0;
+const ENCODING_ZRLE: i32 = 16;
 
 /// The pixel layout a client asked for. Defaults to what we natively hold, so
 /// a client that never sends SetPixelFormat gets a zero-copy path.
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct PixelFormat {
+pub(crate) struct PixelFormat {
     bits_per_pixel: u8,
     depth: u8,
     big_endian: bool,
@@ -67,7 +68,7 @@ struct PixelFormat {
 impl PixelFormat {
     /// Little-endian 32-bit true colour with R=16/G=8/B=0, i.e. bytes B,G,R,X
     /// in memory — the layout `display::to_bgrx` produces.
-    const fn bgrx() -> Self {
+    pub(crate) const fn bgrx() -> Self {
         Self {
             bits_per_pixel: 32,
             depth: 24,
@@ -109,6 +110,15 @@ impl PixelFormat {
             green_shift: raw[11],
             blue_shift: raw[12],
         }
+    }
+
+    /// The pieces ZRLE needs to decide its CPIXEL layout: bits per pixel,
+    /// depth, byte order, and which bits of a pixel carry colour at all.
+    pub(crate) fn cpixel_inputs(&self) -> (u8, u8, bool, u32) {
+        let mask = ((self.red_max as u32) << self.red_shift)
+            | ((self.green_max as u32) << self.green_shift)
+            | ((self.blue_max as u32) << self.blue_shift);
+        (self.bits_per_pixel, self.depth, self.big_endian, mask)
     }
 
     /// Can we serve this layout by rewriting our BGRX bytes?
@@ -452,6 +462,8 @@ struct ClientState {
     fmt: PixelFormat,
     /// Set by SetEncodings on the reader, used by the writer.
     supports_resize: bool,
+    /// The client advertised ZRLE, so updates can be compressed.
+    supports_zrle: bool,
     /// Current desktop geometry. The writer updates it when the guest changes
     /// mode; the reader scales absolute pointer coordinates against it.
     width: u32,
@@ -527,6 +539,7 @@ where
             closed: false,
             fmt,
             supports_resize: false,
+            supports_zrle: false,
             width,
             height,
         }),
@@ -606,10 +619,14 @@ fn read_client_messages<R: Read>(
                 let mut encodings = vec![0u8; count * 4];
                 s.read_exact(&mut encodings)?;
                 let (encodings, _) = encodings.as_chunks::<4>();
-                let supports_resize = encodings
-                    .iter()
-                    .any(|c| i32::from_be_bytes(*c) == ENCODING_DESKTOP_SIZE);
-                lock_state(state).supports_resize = supports_resize;
+                let supports = |want: i32| encodings.iter().any(|c| i32::from_be_bytes(*c) == want);
+                let (supports_resize, supports_zrle) =
+                    (supports(ENCODING_DESKTOP_SIZE), supports(ENCODING_ZRLE));
+                let mut g = lock_state(state);
+                g.supports_resize = supports_resize;
+                // Raw is the fallback for clients that never advertise
+                // anything, including our own browser client.
+                g.supports_zrle = supports_zrle;
             }
             3 => {
                 // FramebufferUpdateRequest: incremental + x,y,w,h.
@@ -764,10 +781,13 @@ fn write_updates<W: Write>(mut s: W, fb: Arc<DisplayFramebuffer>, state: SharedS
     let mut last_generation = 0u64;
     // BGRX pixels of the last frame this client was sent, for damage diffing.
     let mut last_sent: Option<Vec<u8>> = None;
+    // One zlib stream for the whole connection: ZRLE requires it to be
+    // continuous, so it lives with the writer and is never reset.
+    let mut zrle = super::zrle::Encoder::new();
 
     loop {
         // Wait until the client actually wants an update.
-        let (incremental, fmt, supports_resize) = {
+        let (incremental, fmt, supports_resize, supports_zrle) = {
             let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
             while !g.update_outstanding && !g.closed {
                 g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
@@ -780,7 +800,7 @@ fn write_updates<W: Write>(mut s: W, fb: Arc<DisplayFramebuffer>, state: SharedS
             // than be swallowed by a later clear -- that lost wakeup parks the
             // writer and the client waiting on each other forever.
             g.update_outstanding = false;
-            (g.incremental, g.fmt, g.supports_resize)
+            (g.incremental, g.fmt, g.supports_resize, g.supports_zrle)
         };
 
         let frame = if incremental {
@@ -823,11 +843,12 @@ fn write_updates<W: Write>(mut s: W, fb: Arc<DisplayFramebuffer>, state: SharedS
                 }
                 if outcome.is_ok() {
                     let bgrx = display::to_bgrx(&frame);
+                    let zrle = supports_zrle.then_some(&mut zrle);
                     outcome = match last_sent.as_ref() {
                         Some(prev) if incremental && prev.len() == bgrx.len() => {
-                            send_frame_diff(&mut s, &frame, &bgrx, prev, &fmt)
+                            send_frame_diff(&mut s, &frame, &bgrx, prev, &fmt, zrle)
                         }
-                        _ => send_frame(&mut s, &frame, &bgrx, &fmt),
+                        _ => send_frame(&mut s, &frame, &bgrx, &fmt, zrle),
                     };
                     last_sent = Some(bgrx.into_owned());
                 }
@@ -854,23 +875,65 @@ fn send_resize<S: Write>(s: &mut S, width: u32, height: u32) -> std::io::Result<
     s.write_all(&msg)
 }
 
+/// Write one rectangle in whichever encoding the client negotiated.
+///
+/// Raw is the fallback and stays byte-for-byte what it always was, so a client
+/// that advertises nothing — including our own browser client — is unaffected.
+fn write_rect<S: Write>(
+    s: &mut S,
+    at: super::zrle::Rect,
+    pixels: &[u8],
+    fb_width: usize,
+    fmt: &PixelFormat,
+    zrle: Option<&mut super::zrle::Encoder>,
+) -> std::io::Result<()> {
+    let mut rect = Vec::with_capacity(12);
+    rect.extend_from_slice(&(at.x as u16).to_be_bytes());
+    rect.extend_from_slice(&(at.y as u16).to_be_bytes());
+    rect.extend_from_slice(&(at.w as u16).to_be_bytes());
+    rect.extend_from_slice(&(at.h as u16).to_be_bytes());
+    match zrle {
+        Some(encoder) => {
+            rect.extend_from_slice(&ENCODING_ZRLE.to_be_bytes());
+            let cpixel = super::zrle::Cpixel::for_format(fmt);
+            // ZRLE carries client-format pixels, so convert first and hand the
+            // encoder a buffer laid out exactly like the framebuffer.
+            let converted = encode_pixels(pixels, fmt);
+            let origin = super::zrle::Rect {
+                x: 0,
+                y: 0,
+                w: at.w,
+                h: at.h,
+            };
+            let payload = encoder.encode_rect(&converted, fb_width, origin, cpixel);
+            s.write_all(&rect)?;
+            s.write_all(&payload)
+        }
+        None => {
+            rect.extend_from_slice(&ENCODING_RAW.to_be_bytes());
+            s.write_all(&rect)?;
+            s.write_all(&encode_pixels(pixels, fmt))
+        }
+    }
+}
+
 fn send_frame<S: Write>(
     s: &mut S,
     frame: &Frame,
     bgrx: &[u8],
     fmt: &PixelFormat,
+    zrle: Option<&mut super::zrle::Encoder>,
 ) -> std::io::Result<()> {
-    let pixels = encode_pixels(bgrx, fmt);
-
     let mut header = vec![0u8, 0];
     header.extend_from_slice(&1u16.to_be_bytes()); // one rectangle
-    header.extend_from_slice(&0u16.to_be_bytes()); // x
-    header.extend_from_slice(&0u16.to_be_bytes()); // y
-    header.extend_from_slice(&(frame.width as u16).to_be_bytes());
-    header.extend_from_slice(&(frame.height as u16).to_be_bytes());
-    header.extend_from_slice(&ENCODING_RAW.to_be_bytes());
     s.write_all(&header)?;
-    s.write_all(&pixels)
+    let whole = super::zrle::Rect {
+        x: 0,
+        y: 0,
+        w: frame.width as usize,
+        h: frame.height as usize,
+    };
+    write_rect(s, whole, bgrx, frame.width as usize, fmt, zrle)
 }
 
 /// Send only the row bands that changed since the frame this client last
@@ -883,6 +946,7 @@ fn send_frame_diff<S: Write>(
     bgrx: &[u8],
     prev: &[u8],
     fmt: &PixelFormat,
+    mut zrle: Option<&mut super::zrle::Encoder>,
 ) -> std::io::Result<()> {
     const BAND_ROWS: usize = 16;
     let row = frame.width as usize * 4;
@@ -911,15 +975,14 @@ fn send_frame_diff<S: Write>(
     header.extend_from_slice(&(rects.len() as u16).to_be_bytes());
     s.write_all(&header)?;
     for (band_start, band_rows) in rects {
-        let mut rect = Vec::with_capacity(12);
-        rect.extend_from_slice(&0u16.to_be_bytes());
-        rect.extend_from_slice(&(band_start as u16).to_be_bytes());
-        rect.extend_from_slice(&(frame.width as u16).to_be_bytes());
-        rect.extend_from_slice(&(band_rows as u16).to_be_bytes());
-        rect.extend_from_slice(&ENCODING_RAW.to_be_bytes());
-        s.write_all(&rect)?;
         let band = &bgrx[band_start * row..(band_start + band_rows) * row];
-        s.write_all(&encode_pixels(band, fmt))?;
+        let at = super::zrle::Rect {
+            x: 0,
+            y: band_start,
+            w: frame.width as usize,
+            h: band_rows,
+        };
+        write_rect(s, at, band, frame.width as usize, fmt, zrle.as_deref_mut())?;
     }
     Ok(())
 }
@@ -1133,6 +1196,20 @@ mod tests {
         assert!(CLIENT_HTML.contains("/websockify"));
         assert!(CLIENT_HTML.contains("/video"));
         assert!(CLIENT_HTML.contains("VideoDecoder"));
+        // The browser is the path a cloud desktop takes, and Raw costs ~12 MB/s
+        // there. Losing any of these silently drops it back to Raw.
+        assert!(
+            CLIENT_HTML.contains("DecompressionStream"),
+            "the client must be able to inflate ZRLE"
+        );
+        assert!(
+            CLIENT_HTML.contains("encodings.unshift(16)"),
+            "the client must advertise ZRLE, or the server keeps sending Raw"
+        );
+        assert!(
+            CLIENT_HTML.contains("drawZrle"),
+            "the client must decode the ZRLE rectangles it asked for"
+        );
         assert!(CLIENT_HTML.trim_end().ends_with("</html>"));
     }
 

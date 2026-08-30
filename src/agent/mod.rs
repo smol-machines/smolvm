@@ -71,6 +71,7 @@ pub mod video {
 pub mod vnc;
 mod vsock_service;
 mod websocket;
+mod zrle;
 
 pub use crate::data::network::PortMapping;
 pub use crate::data::resources::VmResources;

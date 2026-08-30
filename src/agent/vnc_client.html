@@ -116,8 +116,16 @@ async function session() {
   // Keep RFB connected for keyboard and pointer input in both modes.  A
   // second WebSocket carries encoded H.264 when the browser and host support
   // it; otherwise this same session falls back to ordinary Raw rectangles.
-  const enc = new Uint8Array(12);
-  enc[0] = 2; putU16(enc, 2, 2); putI32(enc, 4, -223); putI32(enc, 8, 0);
+  // Raw costs 4 bytes per pixel: ~12 MB/s for a desktop with only a cursor
+  // moving, which is merely slow over loopback and unusable across a WAN.
+  // ZRLE is ~18x smaller on the same screen. Only ask for it when this browser
+  // can inflate it, so a browser without DecompressionStream keeps getting Raw
+  // rather than a stream it cannot read.
+  const encodings = [-223, 0];
+  if ("DecompressionStream" in window) encodings.unshift(16);
+  const enc = new Uint8Array(4 + encodings.length * 4);
+  enc[0] = 2; putU16(enc, 2, encodings.length);
+  encodings.forEach((e, i) => putI32(enc, 4 + i * 4, e));
   send(enc);
 
   if ("VideoDecoder" in window) {
@@ -152,6 +160,8 @@ async function rawLoop() {
       const encoding = i32(r, 8);
       if (encoding === 0) {
         draw(x, y, w, h, await recv(w * h * 4));
+      } else if (encoding === 16) {
+        await drawZrle(x, y, w, h);
       } else if (encoding === -223) {
         resize(w, h);                                         // DesktopSize
       } else {
@@ -246,6 +256,78 @@ function draw(x, y, w, h, pixels) {
     out[p + 1] = pixels[p + 1];
     out[p + 2] = pixels[p];
     out[p + 3] = 255;
+  }
+  ctx.putImageData(img, x, y);
+}
+
+// ---------------------------------------------------------------------- zrle
+//
+// 🔴 ZRLE compresses every rectangle of a session through ONE zlib stream, so
+// this inflate stream is created once and never reset. Restarting it would
+// decode the first rectangle and turn everything after it into garbage.
+let zlib = null, zBuf = new Uint8Array(0), zAt = 0;
+
+function zStart() {
+  const ds = new DecompressionStream("deflate");
+  zlib = { writer: ds.writable.getWriter(), reader: ds.readable.getReader() };
+}
+
+// Pull exactly n decompressed bytes, reading more from the stream as needed:
+// a tile's length is only known once its subencoding byte has been read.
+async function zRead(n) {
+  while (zBuf.length - zAt < n) {
+    const { value, done } = await zlib.reader.read();
+    if (done || !value) throw new Error("ZRLE stream ended early");
+    const keep = zBuf.subarray(zAt);
+    const merged = new Uint8Array(keep.length + value.length);
+    merged.set(keep);
+    merged.set(value, keep.length);
+    zBuf = merged;
+    zAt = 0;
+  }
+  const out = zBuf.subarray(zAt, zAt + n);
+  zAt += n;
+  return out;
+}
+
+async function drawZrle(x, y, w, h) {
+  if (!zlib) zStart();
+  const len = u32(await recv(4), 0);
+  const compressed = await recv(len);
+  // 🔴 Deliberately not awaited. A write larger than the stream's internal
+  // queue only settles once the readable side is drained, and the code below
+  // is what drains it -- awaiting here deadlocks on every full-screen update.
+  zlib.writer.write(compressed).catch(() => {});
+
+  const img = ctx.createImageData(w, h);
+  const out = img.data;
+  for (let ty = 0; ty < h; ty += 64) {
+    const th = Math.min(64, h - ty);
+    for (let tx = 0; tx < w; tx += 64) {
+      const tw = Math.min(64, w - tx);
+      const sub = (await zRead(1))[0];
+      if (sub === 1) {
+        // One colour for the whole tile. CPIXEL is B,G,R.
+        const p = await zRead(3);
+        for (let row = 0; row < th; row++) {
+          let o = ((ty + row) * w + tx) * 4;
+          for (let col = 0; col < tw; col++, o += 4) {
+            out[o] = p[2]; out[o + 1] = p[1]; out[o + 2] = p[0]; out[o + 3] = 255;
+          }
+        }
+      } else if (sub === 0) {
+        const px = await zRead(tw * th * 3);
+        let s = 0;
+        for (let row = 0; row < th; row++) {
+          let o = ((ty + row) * w + tx) * 4;
+          for (let col = 0; col < tw; col++, o += 4, s += 3) {
+            out[o] = px[s + 2]; out[o + 1] = px[s + 1]; out[o + 2] = px[s]; out[o + 3] = 255;
+          }
+        }
+      } else {
+        throw new Error("unsupported ZRLE subencoding " + sub);
+      }
+    }
   }
   ctx.putImageData(img, x, y);
 }
