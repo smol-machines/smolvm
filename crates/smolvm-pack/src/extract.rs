@@ -122,6 +122,13 @@ fn set_mode(path: &Path, mode: u32) {
 /// can only ever chown to itself, so EPERM there is expected rather than a
 /// failure worth reporting. Callers still mask setuid/setgid out of the mode,
 /// so a hostile header cannot pair a chosen owner with an escalating bit.
+///
+/// This only runs while HOST-unpacking a layer's contents, which
+/// [`host_unpack_preserves_ownership`] restricts to the cases where those owners
+/// reach the guest faithfully. Under the per-VM uid drop that function stages the
+/// layers for in-guest unpack instead, so `set_owner` is never reached for their
+/// contents — the idmapped mount would otherwise corrupt any non-`root` owner.
+/// See smol-machines/smolvm#1095.
 #[inline]
 fn set_owner(path: &Path, uid: u64, gid: u64) {
     #[cfg(unix)]
@@ -142,6 +149,29 @@ fn set_owner(path: &Path, uid: u64, gid: u64) {
     }
 }
 
+/// Whether this run drops each VMM to a distinct per-VM uid and presents the
+/// shared pack store through an idmapped bind mount — the launcher's default
+/// when privileged. Mirrors `crate::process::vm_uid_drop_active` (which this
+/// crate cannot call): root on Linux, unless `SMOLVM_VM_UID_DROP=off`.
+///
+/// Under it, host-side ownership does not reach the guest faithfully — the
+/// idmapped mount maps only on-disk id 0 — so extraction must not preserve
+/// owners on disk and must prefer staging layers for in-guest unpack. See
+/// smol-machines/smolvm#1095.
+fn per_vm_uid_drop_active() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let is_root = unsafe { libc::geteuid() == 0 };
+        let opted_out =
+            std::env::var_os("SMOLVM_VM_UID_DROP").as_deref() == Some(std::ffi::OsStr::new("off"));
+        is_root && !opted_out
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
 /// Whether unpacking a pack's layers on this host reproduces the uid/gid the
 /// archive recorded.
 ///
@@ -155,10 +185,18 @@ fn set_owner(path: &Path, uid: u64, gid: u64) {
 /// the guest, where the agent is always root. Host-side unpacking stays the
 /// default where it is faithful, because one extracted copy is shared by every
 /// VM built on the pack; the in-guest copy lives on a single machine's disk.
+///
+/// Root alone is not enough: when the per-VM uid drop is active the host-extracted
+/// copy reaches the guest through a count-1 idmapped mount that only maps on-disk
+/// id 0, so preserved owners are surfaced as the overflow uid (non-zero) or the
+/// raw VM uid (zero) — not faithfully. There we stage the layers for in-guest
+/// unpack instead, which reproduces every owner exactly. See
+/// smol-machines/smolvm#1095. (The build-constant agent rootfs is still shared
+/// root-owned; only the image layers move to the per-machine in-guest copy.)
 fn host_unpack_preserves_ownership() -> bool {
     #[cfg(unix)]
     {
-        unsafe { libc::geteuid() == 0 }
+        unsafe { libc::geteuid() == 0 && !per_vm_uid_drop_active() }
     }
     #[cfg(not(unix))]
     {
@@ -1173,7 +1211,9 @@ pub fn shared_pack_dir(shared_root: &Path, checksum: u32) -> PathBuf {
 /// and the store directories are locked to `0700 root`. No other uid can read the
 /// copy directly; a VM reaches it only through its own idmapped bind mount, which
 /// re-presents on-disk uid 0 as that VM's uid — preserving the per-VM isolation
-/// (#456) without a per-machine chown.
+/// (#456) without a per-machine chown. Image layers whose archived owners must
+/// survive are staged for in-guest unpack rather than host-unpacked into this
+/// store (see [`host_unpack_preserves_ownership`]).
 ///
 /// Idempotent + concurrency-safe: delegates to [`extract_sidecar`], whose flock +
 /// `.smolvm-extracted` marker serialize concurrent first extractions of the same
@@ -2817,6 +2857,22 @@ mod tests {
             fs::symlink_metadata(&link).unwrap().uid(),
             999,
             "the link itself is re-owned"
+        );
+    }
+
+    /// The #1095 invariant: the per-VM uid drop and "host extraction preserves
+    /// ownership" can never both hold. When the drop is active the shared copy
+    /// reaches the guest through a count-1 idmapped mount that maps only on-disk
+    /// id 0, so any host-preserved owner is corrupted (non-zero -> overflow uid,
+    /// zero -> the raw VM uid). Host-side extraction must therefore never be
+    /// treated as faithful under the drop; the layers stage for in-guest unpack.
+    /// Deterministic at any privilege level and without mutating the environment.
+    #[test]
+    fn uid_drop_and_host_preserved_ownership_are_mutually_exclusive() {
+        assert!(
+            !(per_vm_uid_drop_active() && host_unpack_preserves_ownership()),
+            "under the per-VM uid drop, host extraction must stage layers rather \
+             than claim to preserve ownership (see smol-machines/smolvm#1095)"
         );
     }
 
