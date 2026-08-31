@@ -775,6 +775,9 @@ pub struct ForkLaunch {
     pub pool_size: Option<u32>,
     /// Optional explicit logical VRAM limit per golden/clone session.
     pub vram_limit_mib: Option<u64>,
+    /// Leave a restored process registered but defer its Running transition so
+    /// a batch caller can publish all prepared clones atomically.
+    pub defer_running_persistence: bool,
 }
 
 /// Fork parameters for starting a machine as a forkable base (memfd RAM), so
@@ -788,6 +791,7 @@ pub fn forkable_launch() -> ForkLaunch {
         preload_modules: false,
         pool_size: None,
         vram_limit_mib: None,
+        defer_running_persistence: false,
     }
 }
 
@@ -1042,23 +1046,16 @@ pub fn fork_vm_batch(
     }
 
     if first_error.is_none() {
-        for name in &all_names {
-            if let Err(error) = persist_batch_clone_running(&db, name) {
-                first_error = Some(error);
-                break;
-            }
+        if let Err(error) = persist_batch_clones_running(&db, &all_names) {
+            first_error = Some(error);
         }
     }
 
     if first_error.is_none() && wait_ready.is_some() && !hold {
-        for name in &all_names {
-            if let Err(error) = smolvm::agent::fork::release_forkpoint(name) {
-                first_error = Some(smolvm::Error::agent(
-                    "batch fork",
-                    format!("clone '{name}' release failed: {error}"),
-                ));
-                break;
-            }
+        if let Err(error) = run_bounded_clone_jobs(&all_names, width, |name| {
+            smolvm::agent::fork::release_forkpoint(name)
+        }) {
+            first_error = Some(error);
         }
     }
 
@@ -1161,6 +1158,7 @@ fn boot_prepared_fork(
                 snapshot_dir: Some(prep.snapshot_dir.clone()),
                 share_weights,
                 preload_modules,
+                defer_running_persistence: retry_gate.is_some(),
                 ..Default::default()
             },
         )
@@ -1237,20 +1235,107 @@ fn retain_failed_fork(
     ))
 }
 
-fn persist_batch_clone_running(db: &SmolvmDb, clone: &str) -> smolvm::Result<()> {
-    let manager = AgentManager::for_vm(clone)
-        .map_err(|error| smolvm::Error::agent("batch fork", error.to_string()))?;
-    let (pid, pid_start_time) = manager.pid_and_start_time().ok_or_else(|| {
-        smolvm::Error::agent(
-            "batch fork",
-            format!("clone '{clone}' has no running process after boot"),
-        )
-    })?;
-    db.update_vm(clone, |record| {
+fn persist_batch_clones_running(db: &SmolvmDb, clones: &[String]) -> smolvm::Result<()> {
+    let mut processes = std::collections::HashMap::with_capacity(clones.len());
+    for clone in clones {
+        let manager = AgentManager::for_vm(clone)
+            .map_err(|error| smolvm::Error::agent("batch fork", error.to_string()))?;
+        let identity = manager.pid_and_start_time().ok_or_else(|| {
+            smolvm::Error::agent(
+                "batch fork",
+                format!("clone '{clone}' has no running process after boot"),
+            )
+        })?;
+        processes.insert(clone.as_str(), identity);
+    }
+    db.update_vms(clones, |name, record| {
+        let (pid, pid_start_time) = processes[name];
         record.state = RecordState::Running;
         record.pid = Some(pid);
         record.pid_start_time = pid_start_time;
     })?;
+    Ok(())
+}
+
+/// Run one fail-closed batch phase with bounded concurrency. After the first
+/// failure no new job starts; already-running jobs finish so their agent
+/// connections are not abandoned midway through a protocol exchange.
+fn run_bounded_clone_jobs<F>(clones: &[String], parallel: usize, operation: F) -> smolvm::Result<()>
+where
+    F: Fn(&str) -> smolvm::Result<()> + Sync,
+{
+    if clones.is_empty() {
+        return Ok(());
+    }
+    let width = parallel.max(1).min(clones.len());
+    let queue = std::sync::Mutex::new(std::collections::VecDeque::from(
+        clones.iter().cloned().enumerate().collect::<Vec<_>>(),
+    ));
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let results = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..width)
+            .map(|_| {
+                let queue = &queue;
+                let stop = &stop;
+                let operation = &operation;
+                scope.spawn(move || {
+                    let mut results = Vec::new();
+                    loop {
+                        if stop.load(std::sync::atomic::Ordering::Acquire) {
+                            break;
+                        }
+                        let job = queue
+                            .lock()
+                            .expect("batch clone job queue poisoned")
+                            .pop_front();
+                        let Some((index, clone)) = job else {
+                            break;
+                        };
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            operation(&clone)
+                        }))
+                        .unwrap_or_else(|_| {
+                            Err(smolvm::Error::agent(
+                                "batch fork",
+                                format!("clone '{clone}' worker panicked"),
+                            ))
+                        });
+                        if result.is_err() {
+                            stop.store(true, std::sync::atomic::Ordering::Release);
+                        }
+                        results.push((index, clone, result));
+                    }
+                    results
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| match worker.join() {
+                Ok(results) => results,
+                Err(_) => vec![(
+                    usize::MAX,
+                    "unknown".to_string(),
+                    Err(smolvm::Error::agent(
+                        "batch fork",
+                        "clone worker terminated unexpectedly",
+                    )),
+                )],
+            })
+            .collect::<Vec<_>>()
+    });
+
+    let mut results = results;
+    results.sort_by_key(|(index, _, _)| *index);
+    if let Some((_, clone, error)) = results
+        .into_iter()
+        .find_map(|(index, clone, result)| result.err().map(|error| (index, clone, error)))
+    {
+        return Err(smolvm::Error::agent(
+            "batch fork",
+            format!("clone '{clone}' release failed: {error}"),
+        ));
+    }
     Ok(())
 }
 
@@ -1669,15 +1754,17 @@ fn start_vm_named_with_db(
         println!("Machine '{}' running (PID: {})", name, pid.unwrap_or(0));
     }
 
-    // Persist running state. The 15s busy_timeout handles SQLite contention
-    // from concurrent starts — no application-level retry needed.
-    let pid_start_time = pid.and_then(smolvm::process::process_start_time);
-    if let Err(e) = db.update_vm(name, |r| {
-        r.state = RecordState::Running;
-        r.pid = pid;
-        r.pid_start_time = pid_start_time;
-    }) {
-        tracing::warn!(error = %e, vm = %name, "failed to persist running state");
+    if !fork.defer_running_persistence {
+        // Persist running state. The 15s busy_timeout handles SQLite contention
+        // from concurrent starts — no application-level retry needed.
+        let pid_start_time = pid.and_then(smolvm::process::process_start_time);
+        if let Err(e) = db.update_vm(name, |r| {
+            r.state = RecordState::Running;
+            r.pid = pid;
+            r.pid_start_time = pid_start_time;
+        }) {
+            tracing::warn!(error = %e, vm = %name, "failed to persist running state");
+        }
     }
 
     // Keep VM running (persistent)
@@ -2909,6 +2996,47 @@ pub fn cleanup_orphaned_ephemeral_vms_bounded(limit: usize) {
 #[cfg(test)]
 mod init_runner_tests {
     use super::*;
+
+    #[test]
+    fn bounded_clone_jobs_run_every_successful_job() {
+        let names: Vec<_> = (0..16).map(|index| format!("clone-{index}")).collect();
+        let active = std::sync::atomic::AtomicUsize::new(0);
+        let peak = std::sync::atomic::AtomicUsize::new(0);
+        let completed = std::sync::atomic::AtomicUsize::new(0);
+
+        run_bounded_clone_jobs(&names, 4, |_| {
+            let now = active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            peak.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            completed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(completed.load(std::sync::atomic::Ordering::SeqCst), 16);
+        assert!(peak.load(std::sync::atomic::Ordering::SeqCst) <= 4);
+        assert!(peak.load(std::sync::atomic::Ordering::SeqCst) > 1);
+    }
+
+    #[test]
+    fn bounded_clone_jobs_stop_queued_work_after_failure() {
+        let names = ["bad", "must-not-run"].map(str::to_string);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+
+        let error = run_bounded_clone_jobs(&names, 1, |name| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if name == "bad" {
+                Err(smolvm::Error::agent("injected", "release failed"))
+            } else {
+                Ok(())
+            }
+        })
+        .expect_err("the batch must fail closed");
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(error.to_string().contains("clone 'bad' release failed"));
+    }
 
     #[test]
     fn batch_boot_retry_is_skipped_after_success() {

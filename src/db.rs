@@ -769,6 +769,54 @@ impl SmolvmDb {
         })
     }
 
+    /// Update several VM records atomically in one write transaction.
+    ///
+    /// Unlike repeated [`Self::update_vm`] calls, either every named record is
+    /// present and committed or none of the mutations become visible.
+    pub fn update_vms<F>(&self, names: &[String], mut f: F) -> Result<Vec<VmRecord>>
+    where
+        F: FnMut(&str, &mut VmRecord),
+    {
+        self.with_conn(|conn| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .db_err("begin batch vm update")?;
+            let mut updated = Vec::with_capacity(names.len());
+            let mut seen = HashSet::with_capacity(names.len());
+
+            for name in names {
+                if !seen.insert(name.as_str()) {
+                    return Err(Error::database(
+                        "batch vm update",
+                        format!("duplicate machine name '{name}'"),
+                    ));
+                }
+                let data: Option<Vec<u8>> = tx
+                    .query_row(
+                        "SELECT data FROM vms WHERE name = ?1",
+                        params![name],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .db_err(format!("get vm '{name}' for batch update"))?;
+                let bytes = data.ok_or_else(|| Error::vm_not_found(name))?;
+                let mut record: VmRecord = serde_json::from_slice(&bytes)
+                    .db_err(format!("deserialize vm record '{name}'"))?;
+                f(name, &mut record);
+                let new_data = serde_json::to_vec(&record).db_err("serialize batch vm record")?;
+                tx.execute(
+                    "UPDATE vms SET data = ?2 WHERE name = ?1",
+                    params![name, new_data],
+                )
+                .db_err(format!("update vm '{name}' in batch"))?;
+                updated.push(record);
+            }
+
+            tx.commit().db_err("commit batch vm update")?;
+            Ok(updated)
+        })
+    }
+
     // ========================================================================
     // Automatic fork-pool operations
     // ========================================================================
@@ -2413,6 +2461,59 @@ mod tests {
 
         let result = db.update_vm("nonexistent", |_| {}).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn batch_vm_update_commits_every_record_together() {
+        let (_dir, db) = temp_db();
+        for name in ["clone-0", "clone-1", "clone-2"] {
+            db.insert_vm(
+                name,
+                &VmRecord::new(name.to_string(), 1, 128, vec![], vec![], false),
+            )
+            .unwrap();
+        }
+        let names = ["clone-0", "clone-1", "clone-2"].map(str::to_string);
+
+        let updated = db
+            .update_vms(&names, |name, record| {
+                record.state = RecordState::Running;
+                record.pid = Some(100 + name.as_bytes()[6] as i32);
+            })
+            .unwrap();
+
+        assert_eq!(updated.len(), names.len());
+        for name in names {
+            let record = db.get_vm(&name).unwrap().unwrap();
+            assert_eq!(record.state, RecordState::Running);
+            assert!(record.pid.is_some());
+        }
+    }
+
+    #[test]
+    fn batch_vm_update_rolls_back_when_one_record_is_missing() {
+        let (_dir, db) = temp_db();
+        for name in ["clone-0", "clone-2"] {
+            db.insert_vm(
+                name,
+                &VmRecord::new(name.to_string(), 1, 128, vec![], vec![], false),
+            )
+            .unwrap();
+        }
+        let names = ["clone-0", "missing", "clone-2"].map(str::to_string);
+
+        db.update_vms(&names, |_, record| {
+            record.state = RecordState::Running;
+        })
+        .expect_err("a missing member must reject the complete batch");
+
+        for name in ["clone-0", "clone-2"] {
+            assert_eq!(
+                db.get_vm(name).unwrap().unwrap().state,
+                RecordState::Created,
+                "the transaction must not publish a partial prefix"
+            );
+        }
     }
 
     #[test]
