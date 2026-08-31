@@ -617,13 +617,185 @@ fn cpu_vendor() -> Result<Option<String>> {
     }
 }
 
+/// Architectural features a guest on this aarch64 host can use, by name.
+///
+/// The guest sees the host's own ID registers, so the host's feature set is the
+/// guest's feature set — with one deliberate subtraction: libkrun masks SME out
+/// of `ID_AA64PFR1_EL1` before the guest runs, because a guest that sees SME
+/// "will break after enabling the MMU". Anything SME is therefore invisible to
+/// the guest on every host and must not enter the contract, or checkpoints would
+/// be refused over a feature no guest can reach.
+///
+/// Names are the ARM `FEAT_*` identifiers, which both platforms already speak:
+/// macOS publishes them through `sysctl hw.optional.arm.*`, Linux through the
+/// `Features` line in `/proc/cpuinfo`.
+#[cfg(target_arch = "aarch64")]
+fn aarch64_guest_features() -> Result<Vec<String>> {
+    let mut features = collect_aarch64_host_features()?;
+    features.retain(|name| !is_masked_from_guest(name));
+    features.sort();
+    features.dedup();
+    Ok(features)
+}
+
+/// Features the VMM removes before the guest ever sees them. Keep in step with
+/// libkrun's vCPU setup.
+#[cfg(any(target_arch = "aarch64", test))]
+#[allow(dead_code)]
+fn is_masked_from_guest(name: &str) -> bool {
+    // libkrun: `val & !AA64PFR1_EL1_SMEMASK`. Covers FEAT_SME, FEAT_SME2 and
+    // every SME_* sub-feature.
+    name.contains("SME")
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+fn collect_aarch64_host_features() -> Result<Vec<String>> {
+    let output = std::process::Command::new("sysctl")
+        .arg("-a")
+        .output()
+        .map_err(|error| Error::agent("read CPU features", error.to_string()))?;
+    if !output.status.success() {
+        return Err(Error::agent(
+            "read CPU features",
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ));
+    }
+    Ok(parse_macos_features(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+/// Pull the enabled `FEAT_*` names out of `sysctl -a`.
+///
+/// macOS reports one line per feature, `hw.optional.arm.FEAT_X: 1`, where 0
+/// means the silicon lacks it. Separated from the command so the parsing is
+/// testable against recorded output from real machines.
+// The two parsers below are pure string functions. They are compiled on every
+// aarch64 host and under `cfg(test)` everywhere, so macOS CI exercises the Linux
+// parser and vice versa; each is used by exactly one OS at runtime, hence the
+// dead-code allowance.
+#[cfg(any(target_arch = "aarch64", test))]
+#[allow(dead_code)]
+fn parse_macos_features(sysctl_output: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in sysctl_output.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let Some(name) = key.trim().strip_prefix("hw.optional.arm.") else {
+            continue;
+        };
+        if value.trim() == "1" && !name.is_empty() {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+fn collect_aarch64_host_features() -> Result<Vec<String>> {
+    let cpuinfo = std::fs::read_to_string("/proc/cpuinfo")
+        .map_err(|error| Error::agent("read CPU features", error.to_string()))?;
+    Ok(parse_linux_features(&cpuinfo))
+}
+
+/// Pull the HWCAP names out of `/proc/cpuinfo`'s `Features` line.
+///
+/// Linux prints lowercase HWCAP tokens (`asimd`, `bf16`, `i8mm`) rather than
+/// ARM's `FEAT_*` spelling, so they are normalised to a common form. Only the
+/// first processor block is read: every core in a machine smolvm will run on
+/// presents the same features.
+#[cfg(any(target_arch = "aarch64", test))]
+#[allow(dead_code)]
+fn parse_linux_features(cpuinfo: &str) -> Vec<String> {
+    for line in cpuinfo.lines().take_while(|line| !line.trim().is_empty()) {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        if key.trim() != "Features" {
+            continue;
+        }
+        return value
+            .split_whitespace()
+            .map(|token| format!("FEAT_{}", token.to_ascii_uppercase()))
+            .collect();
+    }
+    Vec::new()
+}
+
 fn checkpoint_cpu_contract() -> Result<CheckpointCpuContract> {
     if cpu_vendor()?.as_deref() == Some("GenuineIntel") {
         return Ok(CheckpointCpuContract::LinuxKvmIntelPortableV1);
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return Ok(CheckpointCpuContract::Aarch64FeaturesV1 {
+            features: aarch64_guest_features()?,
+        });
+    }
+    #[allow(unreachable_code)]
     Ok(CheckpointCpuContract::ExactV1 {
         fingerprint: cpu_fingerprint()?,
     })
+}
+
+/// Accept a checkpoint whose recorded features this host also provides.
+///
+/// A superset is enough: extra features on the destination are harmless, since
+/// the guest already decided at boot what it would use. Anything missing is
+/// named, because "does not match this host" gives an operator nothing to act
+/// on, while "missing FEAT_BF16, FEAT_I8MM" says which machines can take it.
+///
+/// Note this is a genuine set comparison, not a generation ordering. Newer
+/// silicon is not automatically a superset: an M4 Max provides twenty features
+/// an M1 Pro lacks, yet lacks FEAT_SSBS that the M1 Pro has, so neither
+/// direction is safe between them and both are correctly refused.
+#[cfg(target_arch = "aarch64")]
+fn validate_aarch64_features(required: &[String]) -> Result<()> {
+    let available = aarch64_guest_features()?;
+    let missing = missing_features(required, &available);
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(Error::agent(
+        "restore checkpoint",
+        format!(
+            "this host does not provide {} the checkpoint's guest was given: {}",
+            if missing.len() == 1 {
+                "a CPU feature"
+            } else {
+                "CPU features"
+            },
+            missing.join(", ")
+        ),
+    ))
+}
+
+/// On a non-aarch64 host an aarch64 feature contract can never be satisfied;
+/// the architecture check upstream already refuses it, so this only keeps the
+/// match exhaustive.
+#[cfg(not(target_arch = "aarch64"))]
+fn validate_aarch64_features(_required: &[String]) -> Result<()> {
+    Err(Error::agent(
+        "restore checkpoint",
+        "checkpoint requires an aarch64 host",
+    ))
+}
+
+/// Recorded features this host does not provide. Pure, so the comparison is
+/// testable against feature sets captured from real machines.
+///
+/// Gated to match its only caller — the aarch64 validator — plus tests, so a
+/// non-aarch64 cross build does not see it as dead code.
+#[cfg(any(target_arch = "aarch64", test))]
+#[allow(dead_code)]
+fn missing_features(required: &[String], available: &[String]) -> Vec<String> {
+    let have: std::collections::HashSet<&str> = available.iter().map(String::as_str).collect();
+    required
+        .iter()
+        .filter(|name| !have.contains(name.as_str()))
+        .cloned()
+        .collect()
 }
 
 fn validate_cpu_compatibility(checkpoint: &PortableCheckpointManifest) -> Result<()> {
@@ -636,6 +808,9 @@ fn validate_cpu_compatibility(checkpoint: &PortableCheckpointManifest) -> Result
                 "restore checkpoint",
                 "checkpoint CPU feature contract does not match this host",
             ));
+        }
+        CheckpointCpuContract::Aarch64FeaturesV1 { features } => {
+            return validate_aarch64_features(features);
         }
         CheckpointCpuContract::LinuxKvmIntelPortableV1 => {
             let current_vendor = cpu_vendor()?.ok_or_else(|| {
@@ -1941,5 +2116,161 @@ mod tests {
             linux_cpu_vendor(&format!("vendor_id: {oversized}\n\n")),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod aarch64_feature_contract_tests {
+    //! Fixtures are real `sysctl -a` output shapes from an M1 Pro
+    //! (MacBookPro18,3) and an M4 Max (Mac16,6), captured 2026-08-30.
+    use super::missing_features;
+
+    fn v(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The twenty features an M4 Max has that an M1 Pro does not, minus SME
+    /// (masked from every guest), leaves these ten.
+    const M4_ONLY: &[&str] = &[
+        "FEAT_AFP",
+        "FEAT_BF16",
+        "FEAT_BTI",
+        "FEAT_ECV",
+        "FEAT_FPAC",
+        "FEAT_FPACCOMBINE",
+        "FEAT_I8MM",
+        "FEAT_PAuth2",
+        "FEAT_RPRES",
+        "FEAT_WFxT",
+    ];
+    /// The one feature an M1 Pro has that an M4 Max does not.
+    const M1_ONLY: &[&str] = &["FEAT_SSBS"];
+    const SHARED: &[&str] = &["FEAT_LSE", "FEAT_FP16", "FEAT_DotProd", "FEAT_PAuth"];
+
+    fn m4() -> Vec<String> {
+        let mut f = v(SHARED);
+        f.extend(v(M4_ONLY));
+        f
+    }
+    fn m1() -> Vec<String> {
+        let mut f = v(SHARED);
+        f.extend(v(M1_ONLY));
+        f
+    }
+
+    #[test]
+    fn a_host_with_the_same_features_accepts_the_checkpoint() {
+        assert!(missing_features(&m4(), &m4()).is_empty());
+    }
+
+    /// Extra features on the destination are harmless: the guest already decided
+    /// at boot what it would use.
+    #[test]
+    fn a_richer_host_accepts_a_leaner_checkpoint() {
+        let lean = v(SHARED);
+        assert!(missing_features(&lean, &m4()).is_empty());
+    }
+
+    /// The case the whole contract exists for: a guest that probed an M4 cannot
+    /// resume where those instructions do not exist.
+    #[test]
+    fn an_m4_checkpoint_is_refused_on_an_m1() {
+        let missing = missing_features(&m4(), &m1());
+        assert_eq!(
+            missing,
+            v(M4_ONLY),
+            "every M4-only feature must be reported"
+        );
+        assert!(missing.contains(&"FEAT_BF16".to_string()));
+        assert!(missing.contains(&"FEAT_I8MM".to_string()));
+    }
+
+    /// Newer is NOT automatically a superset, so "older to newer is safe" is
+    /// wrong as a rule. The M4 Max lacks FEAT_SSBS, which the M1 Pro has — these
+    /// two are unordered and both directions must be refused.
+    #[test]
+    fn newer_silicon_is_not_automatically_a_superset() {
+        let missing = missing_features(&m1(), &m4());
+        assert_eq!(
+            missing,
+            v(M1_ONLY),
+            "an M1 checkpoint must be refused on an M4 over FEAT_SSBS"
+        );
+    }
+
+    /// SME must never reach the contract: libkrun masks it out of every guest,
+    /// so recording it would refuse checkpoints over a feature no guest can use.
+    #[test]
+    fn sme_is_excluded_from_the_contract() {
+        use super::is_masked_from_guest;
+        for name in [
+            "FEAT_SME",
+            "FEAT_SME2",
+            "FEAT_SME_F64F64",
+            "SME_I8I32",
+            "SME_B16F32",
+        ] {
+            assert!(is_masked_from_guest(name), "{name} must be masked");
+        }
+        for name in ["FEAT_BF16", "FEAT_I8MM", "FEAT_SSBS", "FEAT_LSE"] {
+            assert!(!is_masked_from_guest(name), "{name} must be kept");
+        }
+    }
+
+    #[test]
+    fn macos_sysctl_output_is_parsed() {
+        use super::parse_macos_features;
+        let out = "hw.optional.arm.FEAT_BF16: 1\n\
+                   hw.optional.arm.FEAT_SSBS: 0\n\
+                   hw.optional.arm.FEAT_I8MM: 1\n\
+                   hw.optional.floatingpoint: 1\n\
+                   hw.memsize: 38654705664\n";
+        let got = parse_macos_features(out);
+        assert_eq!(got, vec!["FEAT_BF16".to_string(), "FEAT_I8MM".to_string()]);
+    }
+
+    #[test]
+    fn linux_cpuinfo_features_are_normalised() {
+        use super::parse_linux_features;
+        let cpuinfo = "processor\t: 0\n\
+                       Features\t: fp asimd bf16 i8mm\n\
+                       CPU part\t: 0xd4f\n\
+                       \n\
+                       processor\t: 1\n\
+                       Features\t: fp\n";
+        let got = parse_linux_features(cpuinfo);
+        assert_eq!(
+            got,
+            vec![
+                "FEAT_FP".to_string(),
+                "FEAT_ASIMD".to_string(),
+                "FEAT_BF16".to_string(),
+                "FEAT_I8MM".to_string()
+            ],
+            "only the first processor block, upper-cased"
+        );
+    }
+}
+
+#[cfg(test)]
+mod aarch64_live_host_tests {
+    /// Enumerates THIS machine. Proves the contract is built from real hardware
+    /// rather than only from fixtures, and that SME never reaches it.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn this_host_reports_a_usable_feature_set() {
+        let features = super::aarch64_guest_features().expect("enumerate host features");
+        assert!(
+            features.len() > 10,
+            "expected a real feature set, got {features:?}"
+        );
+        assert!(
+            !features.iter().any(|f| f.contains("SME")),
+            "SME is masked from guests and must not be in the contract: {features:?}"
+        );
+        let mut sorted = features.clone();
+        sorted.sort();
+        assert_eq!(sorted, features, "contract must be sorted for stability");
+        eprintln!("host provides {} guest-visible features", features.len());
     }
 }

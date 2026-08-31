@@ -447,6 +447,25 @@ pub enum CheckpointCpuContract {
         /// Hash of the host CPU virtualization feature contract.
         fingerprint: String,
     },
+    /// The architectural features the source guest was given, by name.
+    ///
+    /// aarch64 has no equivalent of the x86 `KVM_SET_CPUID2` check: the guest is
+    /// handed the host's own ID registers (libkrun only ORs in EL2/GICv3 and
+    /// masks out SME), and nothing compares them on restore. So a guest that
+    /// probed the source CPU at boot carries those conclusions in its restored
+    /// memory, and meeting an instruction the destination does not implement is
+    /// an undefined-instruction fault inside the guest rather than a clean
+    /// refusal.
+    ///
+    /// Recording the set by NAME replaces an opaque equality hash with a
+    /// question that can actually be answered: does this host provide
+    /// everything the guest was told it had? A destination that does is
+    /// accepted even if its model differs; one that does not is refused with
+    /// the missing features named.
+    Aarch64FeaturesV1 {
+        /// Sorted, de-duplicated `FEAT_*` names the source guest could use.
+        features: Vec<String>,
+    },
 }
 
 /// Compatibility and payload metadata for a portable live checkpoint.
