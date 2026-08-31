@@ -158,6 +158,12 @@ fn set_owner(path: &Path, uid: u64, gid: u64) {
 /// idmapped mount maps only on-disk id 0 — so extraction must not preserve
 /// owners on disk and must prefer staging layers for in-guest unpack. See
 /// smol-machines/smolvm#1095.
+///
+/// Gated to `unix` to match its only caller. Windows has no uid to drop to and
+/// no idmapped mounts, so on that target the caller is compiled out and an
+/// ungated definition is dead code — which the cross build rejects under
+/// `-D warnings`. The non-Linux arm below still earns its place: macOS is unix.
+#[cfg(unix)]
 fn per_vm_uid_drop_active() -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -2867,6 +2873,9 @@ mod tests {
     /// zero -> the raw VM uid). Host-side extraction must therefore never be
     /// treated as faithful under the drop; the layers stage for in-guest unpack.
     /// Deterministic at any privilege level and without mutating the environment.
+    /// Unix-only for the same reason as the function it exercises: the uid drop
+    /// does not exist on Windows. Linux and macOS CI both run it.
+    #[cfg(unix)]
     #[test]
     fn uid_drop_and_host_preserved_ownership_are_mutually_exclusive() {
         assert!(
