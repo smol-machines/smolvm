@@ -1406,12 +1406,57 @@ fn sync_and_unmount_storage() {
         libc::sync();
     }
 
-    // Note: We don't unmount /storage here because:
-    // 1. The overlay filesystem uses /storage/layers and /storage/overlays
-    // 2. Unmounting /storage while overlay is active causes issues
-    // 3. The sync() call ensures all pending writes are flushed to disk
-    // 4. When the VM terminates, the kernel will clean up mounts
+    // Flushing is not enough on its own: ext4 clears its recovery flag only
+    // when the filesystem is taken read-only or unmounted, so a machine that
+    // was merely synced leaves a journal for the next boot to replay. Replaying
+    // one that still holds metadata for recent writes can leave the image
+    // manifest unreadable, and the machine then starts with "image not found"
+    // even though nothing was lost.
+    //
+    // /storage cannot be unmounted -- the overlay sits on top of it -- but a
+    // read-only remount checkpoints the journal just the same and leaves the
+    // filesystem clean for the next mount.
+    remount_storage_read_only();
 }
+
+/// Takes /storage read-only so ext4 checkpoints its journal.
+#[cfg(target_os = "linux")]
+fn remount_storage_read_only() {
+    let Ok(target) = std::ffi::CString::new(paths::STORAGE_ROOT) else {
+        return;
+    };
+
+    // SAFETY: a remount needs only the target path; the source, filesystem type
+    // and options are unused and may be null.
+    let ret = unsafe {
+        libc::mount(
+            std::ptr::null(),
+            target.as_ptr(),
+            std::ptr::null(),
+            libc::MS_REMOUNT | libc::MS_RDONLY,
+            std::ptr::null(),
+        )
+    };
+
+    if ret == 0 {
+        info!(
+            "remounted {} read-only; journal checkpointed",
+            paths::STORAGE_ROOT
+        );
+    } else {
+        // Something still holds it writable. The sync above already flushed the
+        // data, so the next boot replays the journal as it did before.
+        warn!(
+            "could not remount {} read-only: {}; the next boot will replay the journal instead",
+            paths::STORAGE_ROOT,
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+/// Stub for non-Linux platforms.
+#[cfg(not(target_os = "linux"))]
+fn remount_storage_read_only() {}
 
 /// Stub for non-Linux platforms.
 #[cfg(not(target_os = "linux"))]
