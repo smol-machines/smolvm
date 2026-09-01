@@ -470,7 +470,7 @@ pub struct RunCmd {
     #[arg(
         long,
         value_name = "PATH",
-        conflicts_with_all = ["image", "smolfile", "detach", "name", "gpu", "gpu_vram_mib", "oci_platform", "allow_cidr", "allow_host", "outbound_localhost_only", "secret_env", "secret_file"],
+        conflicts_with_all = ["image", "smolfile", "detach", "name", "gpu", "gpu_vram_mib", "oci_platform", "allow_cidr", "allow_host", "outbound_localhost_only", "egress_proxy", "secret_env", "secret_file"],
         help_heading = "Machine source"
     )]
     pub from: Option<PathBuf>,
@@ -544,6 +544,16 @@ pub struct RunCmd {
     /// Select the networking backend.
     #[arg(long = "net-backend", value_enum, help_heading = "Network")]
     pub net_backend: Option<NetworkBackend>,
+
+    /// Route guest TCP and DNS through a host-side SOCKS5 proxy. The endpoint
+    /// must be `socks5://IP:PORT`; other UDP and ICMP egress is blocked. Implies
+    /// --net and requires virtio-net. Proxy failure never falls back to direct.
+    #[arg(
+        long = "egress-proxy",
+        value_name = "socks5://IP:PORT",
+        help_heading = "Network"
+    )]
+    pub egress_proxy: Option<String>,
 
     /// Custom DNS resolver for the guest (implies --net). Use this when the
     /// default public resolvers (8.8.8.8/1.1.1.1) are blocked on your network.
@@ -1151,6 +1161,7 @@ impl RunCmd {
             self.port,
             net,
             self.net_backend,
+            self.egress_proxy.clone(),
             self.dns,
             self.network_name.clone(),
             vec![],
@@ -1193,6 +1204,12 @@ impl RunCmd {
         // the normal in-guest pull.
         if let Some(img) = params.image.clone() {
             if let Some(sidecar) = smolvm::data::pack_ref::resolve_pack_ref_blocking(&img)? {
+                if params.egress_proxy.is_some() {
+                    return Err(Error::config(
+                        "machine run",
+                        "--egress-proxy is not yet supported when --image resolves to a .smolmachine pack artifact",
+                    ));
+                }
                 if self.detach {
                     // pack-run is ephemeral-only; a persistent machine from a
                     // pack ref goes through create (which reroutes the same way).
@@ -1269,6 +1286,10 @@ impl RunCmd {
         // the pull — the same bake path, just with an empty init layer.
         if !self.no_init_cache
             && !self.detach
+            // Pack-run does not yet carry host egress transport metadata.
+            // Keep proxy-enabled runs on the direct machine-run path rather
+            // than silently dropping their fail-closed network setting.
+            && params.egress_proxy.is_none()
             && image_bakeable(params.image.as_deref())
             && (!params.init.is_empty() || self.oci_cache)
         {
@@ -1466,6 +1487,7 @@ impl RunCmd {
             memory_mib: params.mem,
             network: params.net,
             network_backend: params.network_backend,
+            egress_proxy: params.egress_proxy.clone(),
             dns: params.dns,
             network_name: params.network_name.clone(),
             // CLI --gpu wins; Smolfile gpu = true also enables it.
@@ -3075,6 +3097,11 @@ pub struct CreateCmd {
     #[arg(long = "net-backend", value_enum)]
     pub net_backend: Option<NetworkBackend>,
 
+    /// Route guest TCP and DNS through a host-side SOCKS5 proxy. Other UDP and
+    /// ICMP egress is blocked. Implies --net and requires virtio-net.
+    #[arg(long = "egress-proxy", value_name = "socks5://IP:PORT")]
+    pub egress_proxy: Option<String>,
+
     /// Custom DNS resolver for the guest (implies --net). Use this when the
     /// default public resolvers (8.8.8.8/1.1.1.1) are blocked on your network.
     #[arg(long, value_name = "IP")]
@@ -3269,6 +3296,7 @@ impl CreateCmd {
             self.port,
             net,
             self.net_backend,
+            self.egress_proxy.clone(),
             self.dns,
             self.network_name.clone(),
             self.init,
@@ -3305,6 +3333,7 @@ impl CreateCmd {
             memory_mib: params.mem,
             network: params.net,
             network_backend: params.network_backend,
+            egress_proxy: params.egress_proxy.clone(),
             dns: params.dns,
             network_name: params.network_name.clone(),
             gpu: params.gpu,
@@ -3564,6 +3593,7 @@ impl CreateCmd {
             port: ports,
             net: network,
             network_backend: checkpoint_backend.or(self.net_backend),
+            egress_proxy: self.egress_proxy.clone(),
             dns: self.dns,
             network_name: self.network_name.clone(),
             init: self.init.clone(),
@@ -3634,6 +3664,7 @@ impl CreateCmd {
             memory_mib: params.mem,
             network: params.net,
             network_backend: params.network_backend,
+            egress_proxy: params.egress_proxy.clone(),
             dns: params.dns,
             network_name: params.network_name.clone(),
             gpu: params.gpu,
@@ -4439,6 +4470,19 @@ pub struct UpdateCmd {
     #[arg(long, conflicts_with = "net")]
     pub no_net: bool,
 
+    /// Set the host-side SOCKS5 egress endpoint. The machine must be stopped;
+    /// the new endpoint takes effect on the next start.
+    #[arg(
+        long = "egress-proxy",
+        value_name = "socks5://IP:PORT",
+        conflicts_with = "no_net"
+    )]
+    pub egress_proxy: Option<String>,
+
+    /// Remove the host-side egress proxy and restore the normal network path.
+    #[arg(long = "clear-egress-proxy", conflicts_with = "egress_proxy")]
+    pub clear_egress_proxy: bool,
+
     /// Add/replace environment variable (KEY=VALUE)
     #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
     pub env: Vec<String>,
@@ -4501,12 +4545,25 @@ impl UpdateCmd {
         // Validate proposed resource values using the same logic as machine start.
         // Construct a temporary VmResources with the new values (falling back to
         // the record's current values) and run validate() — single source of truth.
+        let proposed_egress_proxy = if self.clear_egress_proxy {
+            None
+        } else {
+            self.egress_proxy
+                .clone()
+                .or_else(|| record.egress_proxy.clone())
+        };
         let proposed = smolvm::agent::VmResources {
             cpus: self.cpus.unwrap_or(record.cpus),
             memory_mib: self.mem.unwrap_or(record.mem),
+            egress_proxy: proposed_egress_proxy,
             ..record.vm_resources()
         };
         proposed.validate()?;
+        validate_requested_network_backend(
+            &proposed,
+            record.dns_filter_hosts.as_deref(),
+            record.ports.len(),
+        )?;
 
         // Validate env specs have KEY=VALUE format with non-empty key
         for spec in &self.env {
@@ -4686,6 +4743,14 @@ impl UpdateCmd {
                 changes.push("  network: enabled".to_string());
                 r.network = true;
             }
+            if let Some(ref proxy) = self.egress_proxy {
+                changes.push(format!("  egress proxy: {proxy}"));
+                r.egress_proxy = Some(proxy.clone());
+                r.network = true;
+            }
+            if self.clear_egress_proxy && r.egress_proxy.take().is_some() {
+                changes.push("  cleared egress proxy".to_string());
+            }
             if self.no_net {
                 changes.push("  network: disabled".to_string());
                 r.network = false;
@@ -4698,6 +4763,9 @@ impl UpdateCmd {
                 if r.dns_filter_hosts.is_some() {
                     changes.push("  cleared dns_filter_hosts".to_string());
                     r.dns_filter_hosts = None;
+                }
+                if r.egress_proxy.take().is_some() {
+                    changes.push("  cleared egress proxy".to_string());
                 }
             }
 

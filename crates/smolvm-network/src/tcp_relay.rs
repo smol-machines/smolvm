@@ -27,6 +27,7 @@
 //! - channels bridge payloads between them
 
 use crate::egress::EgressPolicy;
+use crate::egress_transport::HostEgressTransport;
 use crate::queues::WakePipe;
 use crate::virtio_net_log;
 use smoltcp::iface::{Interface, SocketHandle, SocketSet};
@@ -64,6 +65,9 @@ pub struct TcpRelayTable {
     /// Outbound allow-list applied before opening a host connection for a
     /// guest-initiated flow. Inbound published-port connections bypass it.
     egress: EgressPolicy,
+    /// Host-side transport for guest-originated external TCP connections.
+    /// Published ports and the smolvm-owned gateway service never use it.
+    egress_transport: HostEgressTransport,
     /// The guest-visible gateway addresses (IPv4/IPv6/link-local). A guest flow
     /// destined to one of these is dialing "the host" via its default gateway,
     /// so the host-side relay connects to loopback instead of the gateway's own
@@ -132,8 +136,11 @@ struct PendingProxyEndpoints {
 /// How a host-side TCP relay should obtain its remote socket.
 #[derive(Debug)]
 pub enum RelayTarget {
-    /// Open a new outbound host `TcpStream` to the destination.
-    Connect(SocketAddr),
+    /// Open a new outbound host `TcpStream` using the selected transport.
+    Connect {
+        destination: SocketAddr,
+        transport: HostEgressTransport,
+    },
     /// Use an already-accepted host `TcpStream` from a published port listener.
     Attached(TcpStream),
 }
@@ -196,6 +203,7 @@ impl TcpRelayTable {
     pub fn new(
         max_connections: Option<usize>,
         egress: EgressPolicy,
+        egress_transport: HostEgressTransport,
         gateway_ips: Vec<IpAddr>,
         host_service: Option<crate::GatewayHostService>,
     ) -> Self {
@@ -206,6 +214,7 @@ impl TcpRelayTable {
             next_published_port: PUBLISHED_PORT_START,
             max_connections: max_connections.unwrap_or(MAX_CONNECTIONS),
             egress,
+            egress_transport,
             gateway_ips,
             host_service,
         }
@@ -325,7 +334,17 @@ impl TcpRelayTable {
                 pending_proxy_endpoints: Some(PendingProxyEndpoints {
                     from_smoltcp: to_proxy_rx,
                     to_smoltcp: from_proxy_tx,
-                    relay_target: RelayTarget::Connect(self.host_connect_addr(destination)),
+                    relay_target: RelayTarget::Connect {
+                        destination: self.host_connect_addr(destination),
+                        // Gateway traffic targets a smolvm-owned host service,
+                        // not the Internet. Keep that control-plane hop direct;
+                        // everything else follows the configured host egress.
+                        transport: if self.gateway_ips.contains(&destination.ip()) {
+                            HostEgressTransport::Direct
+                        } else {
+                            self.egress_transport.clone()
+                        },
+                    },
                 }),
                 relay_spawned: false,
                 buffered_guest_data: None,
@@ -681,12 +700,16 @@ fn tcp_relay_loop(
     // 3. Non-blockingly read remote payloads from the socket into the channel.
     // 4. If neither side made progress, sleep briefly to avoid a hot spin loop.
     let mut stream = match relay_target {
-        RelayTarget::Connect(destination) => {
+        RelayTarget::Connect {
+            destination,
+            transport,
+        } => {
             virtio_net_log!(
-                "virtio-net: connecting host TCP relay socket destination={}",
-                destination
+                "virtio-net: connecting host TCP relay socket destination={} transport={:?}",
+                destination,
+                transport
             );
-            let stream = TcpStream::connect(destination)?;
+            let stream = transport.connect_tcp(destination)?;
             virtio_net_log!(
                 "virtio-net: host TCP relay socket connected destination={}",
                 destination
@@ -909,7 +932,13 @@ mod tests {
     fn gateway_ip_destination_dials_the_host_over_loopback() {
         let gw4: IpAddr = "100.96.0.1".parse().unwrap();
         let gw6: IpAddr = "fd00::1".parse().unwrap();
-        let table = TcpRelayTable::new(None, EgressPolicy::unrestricted(), vec![gw4, gw6], None);
+        let table = TcpRelayTable::new(
+            None,
+            EgressPolicy::unrestricted(),
+            HostEgressTransport::Direct,
+            vec![gw4, gw6],
+            None,
+        );
 
         // A guest reaching "the host" via its gateway IP must dial loopback, not
         // the gateway's own (non-routable) userspace address — the bug that made
@@ -939,6 +968,7 @@ mod tests {
         let table = TcpRelayTable::new(
             None,
             EgressPolicy::from_allowed_cidrs(Some(&[])),
+            HostEgressTransport::Direct,
             vec![gateway],
             Some(crate::GatewayHostService {
                 guest_port: 10_081,
@@ -968,7 +998,13 @@ mod tests {
         let mut sockets = SocketSet::new(vec![]);
         let handle = sockets.add(socket);
 
-        let mut table = TcpRelayTable::new(None, EgressPolicy::unrestricted(), vec![], None);
+        let mut table = TcpRelayTable::new(
+            None,
+            EgressPolicy::unrestricted(),
+            HostEgressTransport::Direct,
+            vec![],
+            None,
+        );
         table.connections.insert(handle, connection);
 
         table.relay_data(&mut sockets);
@@ -1008,7 +1044,10 @@ mod tests {
 
         let relay_exit = tcp_relay_loop(
             server_addr,
-            RelayTarget::Connect(server_addr),
+            RelayTarget::Connect {
+                destination: server_addr,
+                transport: HostEgressTransport::Direct,
+            },
             from_smoltcp_rx,
             to_smoltcp_tx,
             wake_pipe,
@@ -1049,7 +1088,13 @@ mod tests {
         interface.set_any_ip(true);
 
         let mut sockets = SocketSet::new(vec![]);
-        let mut table = TcpRelayTable::new(None, EgressPolicy::unrestricted(), vec![], None);
+        let mut table = TcpRelayTable::new(
+            None,
+            EgressPolicy::unrestricted(),
+            HostEgressTransport::Direct,
+            vec![],
+            None,
+        );
 
         // The "guest" dials an external destination; the relay pre-creates the
         // intercepting listen socket exactly like the poll loop does on SYN.

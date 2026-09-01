@@ -477,6 +477,11 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_backend: Option<NetworkBackend>,
 
+    /// Host-side SOCKS5 egress proxy. Contains only a non-secret endpoint;
+    /// provider credentials remain in the host proxy and never enter the VM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_proxy: Option<String>,
+
     /// Custom DNS resolver for the guest. None = backend default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns: Option<std::net::Ipv4Addr>,
@@ -694,6 +699,7 @@ impl VmRecord {
             overlay_gb: None,
             allowed_cidrs: None,
             network_backend: None,
+            egress_proxy: None,
             dns: None,
             network_name: None,
             image: None,
@@ -762,6 +768,7 @@ impl VmRecord {
             overlay_gb: None,
             allowed_cidrs: None,
             network_backend: None,
+            egress_proxy: None,
             dns: None,
             network_name: None,
             image: None,
@@ -938,6 +945,7 @@ impl VmRecord {
             memory_mib: self.mem,
             network: self.network,
             network_backend: self.network_backend,
+            egress_proxy: self.egress_proxy.clone(),
             gpu: self.gpu.unwrap_or(false),
             gpu_vram_mib: self.gpu_vram_mib,
             cuda: self.cuda,

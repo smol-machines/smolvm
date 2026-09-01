@@ -445,6 +445,7 @@ pub struct CreateVmParams {
     pub port: Vec<PortMapping>,
     pub net: bool,
     pub network_backend: Option<NetworkBackend>,
+    pub egress_proxy: Option<String>,
     pub dns: Option<std::net::Ipv4Addr>,
     pub network_name: Option<String>,
     pub init: Vec<String>,
@@ -689,6 +690,7 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
     record.overlay_gb = params.overlay_gb;
     record.allowed_cidrs = params.allowed_cidrs.clone();
     record.network_backend = params.network_backend;
+    record.egress_proxy = params.egress_proxy.clone();
     record.dns = params.dns;
     record.network_name = params.network_name.clone();
     record.gpu = if params.gpu { Some(true) } else { None };

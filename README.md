@@ -121,6 +121,21 @@ smolvm machine run --net --image alpine --allow-host registry.npmjs.org -- wget 
 # fails — not in allow list
 ```
 
+**Route guest egress through a host proxy** — keep proxy configuration and
+credentials out of the VM while transparently routing guest TCP and DNS through
+a host-local SOCKS5 listener:
+
+```bash
+smolvm machine run --image alpine \
+  --egress-proxy socks5://127.0.0.1:7891 \
+  -- wget -qO- https://api.ipify.org
+```
+
+The proxy option implies `--net` and the `virtio-net` backend. Proxy failure is
+fail-closed; non-DNS UDP and external ICMP are blocked. See
+[Host-side egress proxy](docs/host-egress-proxy.md) for persistent machines,
+Smolfile configuration, and security details.
+
 **Pack into portable executables** — turn any workload into a self-contained binary. All dependencies are pre-baked — no install step, no runtime downloads, boots in <200ms.
 
 ```bash

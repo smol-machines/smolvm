@@ -1576,6 +1576,7 @@ pub fn resource_spec_to_vm_resources(spec: &ResourceSpec, network: bool) -> VmRe
         memory_mib: spec.memory_mb.unwrap_or(DEFAULT_MICROVM_MEMORY_MIB),
         network,
         network_backend: spec.network_backend,
+        egress_proxy: None,
         gpu: spec.gpu.unwrap_or(false),
         // gpu_vram_mib not currently on ResourceSpec — API callers
         // inherit the default. Add to ResourceSpec if the API ever

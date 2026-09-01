@@ -318,6 +318,9 @@ pub struct NetworkConfig {
     /// Allowed egress CIDR ranges (e.g., `["10.0.0.0/8", "1.1.1.1"]`).
     #[serde(default)]
     pub allow_cidrs: Vec<String>,
+    /// Host-side SOCKS5 egress endpoint. Proxy credentials stay in the host
+    /// proxy and are never represented in the Smolfile or guest environment.
+    pub egress_proxy: Option<String>,
 }
 
 /// Forkable launch and CUDA fork-capacity policy.

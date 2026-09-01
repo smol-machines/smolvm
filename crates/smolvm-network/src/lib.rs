@@ -61,6 +61,7 @@ pub mod device;
 pub mod dns;
 pub mod dns_relay;
 pub mod egress;
+pub mod egress_transport;
 pub mod fabric;
 // The libkrun frame bridge speaks over an AF_UNIX stream socket, available on
 // both Unix and Windows (10 1809+), so the whole stack is cross-platform.
@@ -77,6 +78,7 @@ pub mod tcp_relay;
 pub mod udp_relay;
 
 pub use egress::EgressPolicy;
+pub use egress_transport::{HostEgressTransport, Socks5Proxy};
 
 use socket2::Socket;
 use std::fmt;
@@ -350,6 +352,7 @@ pub fn start_virtio_network(
     guest_network: GuestNetworkConfig,
     published_ports: &[PortMapping],
     egress: EgressPolicy,
+    egress_transport: HostEgressTransport,
     fabric_lease: Option<fabric::FabricLease>,
 ) -> io::Result<VirtioNetworkRuntime> {
     virtio_net_log!(
@@ -397,6 +400,7 @@ pub fn start_virtio_network(
         },
         tcp_listeners.as_ref().map(|_| tcp_receiver),
         egress,
+        egress_transport,
         fabric,
     )?;
 

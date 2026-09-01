@@ -470,6 +470,12 @@ pub fn launch_agent_vm_dynamic(
 
             let mut guest_network = GuestNetworkConfig::default();
             guest_network.host_service = crate::network::launch::guest_host_service()?;
+            // Keep the dynamically loaded libkrun path in parity with the
+            // static launcher: `--dns` selects the host-side relay upstream,
+            // while the guest itself still points at the virtio gateway.
+            if let Some(dns) = config.resources.dns {
+                guest_network.upstream_dns = dns;
+            }
             let mut guest_mac = guest_network.guest_mac;
             let port_mappings: Vec<VirtioPortMapping> = config
                 .port_mappings
@@ -484,6 +490,14 @@ pub fn launch_agent_vm_dynamic(
             if let Some(dir) = config.vsock_socket.parent() {
                 egress = egress.with_denial_log(dir.join(smolvm_network::EGRESS_DENIALS_LOG));
             }
+            let host_egress = config
+                .resources
+                .egress_proxy
+                .as_deref()
+                .map(smolvm_network::HostEgressTransport::parse)
+                .transpose()
+                .map_err(|err| format!("configure egress proxy: {err}"))?
+                .unwrap_or_default();
 
             // The host/guest ends of the virtio-net channel are an AF_UNIX
             // stream: a socketpair fd on Unix, a per-VM path listener libkrun
@@ -499,6 +513,7 @@ pub fn launch_agent_vm_dynamic(
                     guest_network,
                     &port_mappings,
                     egress,
+                    host_egress,
                     None,
                 ) {
                     Ok(runtime) => runtime,
@@ -559,7 +574,14 @@ pub fn launch_agent_vm_dynamic(
                     .name("smolvm-net-accept".into())
                     .spawn(move || match listener.accept() {
                         Ok((sock, _)) => {
-                            match start_virtio_network(sock, guest_network, &port_mappings, egress, None) {
+                            match start_virtio_network(
+                                sock,
+                                guest_network,
+                                &port_mappings,
+                                egress,
+                                host_egress,
+                                None,
+                            ) {
                                 Ok(runtime) => runtime.block_until_shutdown(),
                                 Err(err) => {
                                     tracing::error!(error = %err, "virtio-net runtime failed to start")
