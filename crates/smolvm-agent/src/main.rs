@@ -3425,6 +3425,18 @@ fn handle_interactive_run(
         return Ok(());
     }
 
+    // SSH agent forwarding: mirror `handle_run`'s injection. The #542 fix wired
+    // SSH_AUTH_SOCK into the exec/run env because the keep-alive `crun exec` path
+    // builds a fresh process env rather than inheriting the container's — but it
+    // only did so for the non-interactive handler. Interactive sessions reach the
+    // same keep-alive container (an ephemeral `machine run` also carries a
+    // persistent overlay id, so `-i`/`-t` joins it too), so without this the
+    // variable is silently absent for every interactive session and the
+    // container-spec injection alone never reaches it. No-op when forwarding is
+    // off; never overrides a user-supplied value.
+    let mut env = env;
+    ssh_agent::inject_into_env(&mut env);
+
     // Resolve the container's launch settings from the image's OCI config (with
     // request overrides). Required to call spawn_interactive_command, so the
     // interactive path can't drop the image's Env/WorkingDir/User either.
