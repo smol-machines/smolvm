@@ -11,6 +11,21 @@ set -e
 # Resolve symlinks to get the actual script location
 resolve_symlink() {
     local target="$1"
+    # If target is a relative path or bare command from PATH, resolve it to an absolute path first
+    if [[ "$target" != /* ]]; then
+        if [[ "$target" == */* ]]; then
+            target="$PWD/$target"
+        else
+            local found
+            found="$(command -v "$target" 2>/dev/null || type -P "$target" 2>/dev/null || true)"
+            if [[ -n "$found" && -e "$found" ]]; then
+                target="$found"
+            else
+                target="$PWD/$target"
+            fi
+        fi
+    fi
+
     while [[ -L "$target" ]]; do
         local link_dir
         link_dir="$(cd "$(dirname "$target")" && pwd)"

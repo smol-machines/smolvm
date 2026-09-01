@@ -1319,7 +1319,45 @@ fn recover_archive_config(archive: &Path, dest: &Path) -> Result<()> {
         StorageError::new("archive manifest.json has no Config entry".to_string())
     })?;
     let config_bytes = extract_tar_member(archive, config_path)?;
+    if let Ok(config_json) = serde_json::from_slice::<serde_json::Value>(&config_bytes) {
+        if let Some(arch) = config_json["architecture"].as_str() {
+            ensure_archive_arch_compatible(arch)?;
+        }
+    }
     std::fs::write(dest, &config_bytes)?;
+    Ok(())
+}
+
+/// Validate that a local image archive's architecture is compatible with the guest microVM.
+fn ensure_archive_arch_compatible(archive_arch: &str) -> Result<()> {
+    let guest_arch = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
+    };
+    let norm_arch = match archive_arch.trim() {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        "i386" | "i486" | "i586" | "i686" => "386",
+        "armhf" | "armel" | "armv5" | "armv6" | "armv7" => "arm",
+        other => other,
+    };
+
+    // If Rosetta translation is active on an arm64 guest, amd64 is supported.
+    let rosetta_supported =
+        guest_arch == "arm64" && norm_arch == "amd64" && crate::rosetta::is_enabled();
+
+    if matches!(
+        norm_arch,
+        "amd64" | "arm64" | "386" | "arm" | "riscv64" | "ppc64le" | "s390x"
+    ) && norm_arch != guest_arch
+        && !rosetta_supported
+    {
+        return Err(StorageError::new(format!(
+            "this local image archive is built for architecture '{archive_arch}', but this guest microVM is '{guest_arch}'. \
+             A local image archive carries native binaries and cannot run on an incompatible CPU architecture — save the image on or for an '{guest_arch}' system."
+        )));
+    }
     Ok(())
 }
 
@@ -4700,6 +4738,31 @@ fn dir_size(path: &Path) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn test_archive_arch_compatibility() {
+        let guest_arch = match std::env::consts::ARCH {
+            "x86_64" => "amd64",
+            "aarch64" => "arm64",
+            other => other,
+        };
+        let other_arch = if guest_arch == "amd64" {
+            "arm64"
+        } else {
+            "386"
+        };
+
+        // Same arch is accepted
+        assert!(ensure_archive_arch_compatible(guest_arch).is_ok());
+        // Unknown / empty arch is leniently accepted
+        assert!(ensure_archive_arch_compatible("").is_ok());
+        assert!(ensure_archive_arch_compatible("unknown_arch").is_ok());
+        // Incompatible arch is rejected
+        let err = ensure_archive_arch_compatible(other_arch).unwrap_err();
+        assert!(err.to_string().contains("is built for architecture"));
+    }
+
     /// One empty layer is a legal OCI layer (metadata or whiteouts only), so
     /// verification must not reject an image just for containing one.
     #[test]
