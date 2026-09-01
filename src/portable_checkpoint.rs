@@ -242,6 +242,7 @@ fn restored_record(
 
 struct SavedVmPause {
     control: PathBuf,
+    prepared_save: Option<PathBuf>,
     armed: bool,
 }
 
@@ -260,6 +261,25 @@ impl SavedVmPause {
         self.armed = false;
         Ok(())
     }
+
+    fn finish_save(&mut self) -> Result<()> {
+        let Some(dir) = self.prepared_save.as_ref() else {
+            return Ok(());
+        };
+        let reply = crate::agent::fork::control_socket_cmd_with_timeout(
+            &self.control,
+            &format!("FINISH_SAVE {}", dir.display()),
+            std::time::Duration::from_secs(30 * 60),
+        )?;
+        if !reply.starts_with("OK") {
+            return Err(Error::agent(
+                "finish checkpoint RAM serialization",
+                format!("libkrun returned: {reply}"),
+            ));
+        }
+        self.prepared_save = None;
+        Ok(())
+    }
 }
 
 impl Drop for SavedVmPause {
@@ -269,6 +289,18 @@ impl Drop for SavedVmPause {
                 Ok(reply) if reply.starts_with("OK") => {}
                 Ok(reply) => tracing::warn!(%reply, "failed to resume checkpoint source"),
                 Err(error) => tracing::warn!(%error, "failed to resume checkpoint source"),
+            }
+        }
+        if let Some(dir) = self.prepared_save.take() {
+            let command = format!("CANCEL_SAVE {}", dir.display());
+            match crate::agent::fork::control_socket_cmd_with_timeout(
+                &self.control,
+                &command,
+                std::time::Duration::from_secs(30 * 60),
+            ) {
+                Ok(reply) if reply.starts_with("OK") => {}
+                Ok(reply) => tracing::warn!(%reply, "failed to cancel prepared checkpoint"),
+                Err(error) => tracing::warn!(%error, "failed to cancel prepared checkpoint"),
             }
         }
     }
@@ -416,11 +448,32 @@ pub fn capture_to_path(
     crate::agent::fork::sync_fork_source(name)?;
     let snapshot_dir = staging_dir.join(ASSET_DIR);
     let pause_started = std::time::Instant::now();
-    let reply = crate::agent::fork::control_socket_cmd_with_timeout(
-        &control,
-        &format!("SAVE {}", snapshot_dir.display()),
-        std::time::Duration::from_secs(30 * 60),
-    )?;
+    let deferred_supported = cfg!(any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        target_os = "macos"
+    ));
+    let mut prepared_save = false;
+    let mut reply = if deferred_supported {
+        crate::agent::fork::control_socket_cmd_with_timeout(
+            &control,
+            &format!("PREPARE_SAVE {}", snapshot_dir.display()),
+            std::time::Duration::from_secs(30 * 60),
+        )?
+    } else {
+        String::new()
+    };
+    if deferred_supported && reply.starts_with("OK") {
+        prepared_save = true;
+    } else if !deferred_supported
+        || reply.starts_with("ERR ENOTSUP")
+        || reply.trim() == "ERR EINVAL unknown command"
+    {
+        reply = crate::agent::fork::control_socket_cmd_with_timeout(
+            &control,
+            &format!("SAVE {}", snapshot_dir.display()),
+            std::time::Duration::from_secs(30 * 60),
+        )?;
+    }
     if !reply.starts_with("OK") {
         return Err(Error::agent(
             "checkpoint machine",
@@ -429,12 +482,14 @@ pub fn capture_to_path(
     }
     let mut pause = SavedVmPause {
         control,
+        prepared_save: prepared_save.then(|| snapshot_dir.clone()),
         armed: true,
     };
     let checkpoint_disks = stage_disk_chains(&crate::agent::vm_data_dir(name), &snapshot_dir)?;
     pause.resume()?;
     let source_pause = pause_started.elapsed();
     drop(source_lock);
+    pause.finish_save()?;
 
     let assets = crate::pack_export::FromVmAssets {
         mode: PackMode::Vm,

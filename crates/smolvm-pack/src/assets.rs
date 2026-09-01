@@ -874,7 +874,18 @@ impl AssetCollector {
     /// When false, everything is included (single-file mode).
     pub fn compress(&self, output: &Path, exclude_libs: bool) -> Result<u64> {
         let output_file = File::create(output)?;
-        let encoder = zstd::stream::Encoder::new(output_file, ZSTD_LEVEL)
+        let output_file = self.compress_into(output_file, exclude_libs)?;
+        Ok(output_file.metadata()?.len())
+    }
+
+    /// Compress staged assets into an existing writer and return it at the end
+    /// of the zstd stream.
+    ///
+    /// Portable artifacts use this to write assets directly into their atomic
+    /// destination instead of writing and then copying a second compressed
+    /// temporary file.
+    pub fn compress_into<W: Write>(&self, output: W, exclude_libs: bool) -> Result<W> {
+        let encoder = zstd::stream::Encoder::new(output, ZSTD_LEVEL)
             .map_err(|e| PackError::Compression(e.to_string()))?;
         let mut tar_builder = tar::Builder::new(encoder);
 
@@ -909,12 +920,10 @@ impl AssetCollector {
         let encoder = tar_builder
             .into_inner()
             .map_err(|e| PackError::Tar(e.to_string()))?;
-        encoder
+        let output = encoder
             .finish()
             .map_err(|e| PackError::Compression(e.to_string()))?;
-
-        let metadata = fs::metadata(output)?;
-        Ok(metadata.len())
+        Ok(output)
     }
 }
 

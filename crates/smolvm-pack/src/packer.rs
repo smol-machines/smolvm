@@ -171,22 +171,18 @@ impl Packer {
         fs::create_dir_all(parent)?;
         let temp = tempfile::NamedTempFile::new_in(parent)?;
         let temp_path = temp.into_temp_path();
-        let assets_temp = tempfile::NamedTempFile::new_in(parent)?;
-        let assets_path = assets_temp.into_temp_path();
-
-        let assets_size = if let Some(collector) = &self.asset_collector {
-            collector.compress(&assets_path, false)?
-        } else {
-            let empty_file = File::create(&assets_path)?;
-            let encoder = zstd::stream::Encoder::new(empty_file, 1)?;
-            let tar_builder = tar::Builder::new(encoder);
-            let encoder = tar_builder.into_inner()?;
-            encoder.finish()?;
-            fs::metadata(&assets_path)?.len()
-        };
 
         let mut artifact = File::create(&temp_path)?;
-        std::io::copy(&mut File::open(&assets_path)?, &mut artifact)?;
+        artifact = if let Some(collector) = &self.asset_collector {
+            collector.compress_into(artifact, false)?
+        } else {
+            let encoder = zstd::stream::Encoder::new(artifact, 1)?;
+            let tar_builder = tar::Builder::new(encoder);
+            let encoder = tar_builder.into_inner()?;
+            encoder.finish()?
+        };
+        let assets_size = artifact.stream_position()?;
+
         let manifest_json = self.manifest.to_json()?;
         let manifest_offset = assets_size;
         let manifest_size = manifest_json.len() as u64;
