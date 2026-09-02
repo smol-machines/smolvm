@@ -329,8 +329,10 @@ static PACKED_LAYERS_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
 static BOOT_VOLUME_MOUNTS: OnceLock<Vec<(String, String, bool)>> = OnceLock::new();
 
 /// Mount a virtiofs device with one policy for every host-backed filesystem:
-/// request DAX first, then fall back to the normal synchronous data path when
-/// the host did not give this device a DAX window.
+/// request DAX first, then fall back to the normal buffered data path when the
+/// host did not give this device a DAX window. Explicit fsync still provides
+/// durability; forcing the whole mount synchronous serializes every small
+/// write and is unlike Docker/Podman's bind-mount behavior.
 #[cfg(target_os = "linux")]
 fn mount_virtiofs(tag: &str, mount_point: &Path) -> std::io::Result<bool> {
     let src = std::ffi::CString::new(tag)
@@ -339,8 +341,7 @@ fn mount_virtiofs(tag: &str, mount_point: &Path) -> std::io::Result<bool> {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid mount point")
     })?;
     let fstype = std::ffi::CString::new("virtiofs").expect("static filesystem type");
-    let opts_dax = std::ffi::CString::new("dax,sync").expect("static mount options");
-    let opts_plain = std::ffi::CString::new("sync").expect("static mount options");
+    let opts_dax = std::ffi::CString::new("dax").expect("static mount options");
 
     // SAFETY: every argument is a valid, live CString and mount() copies them.
     let dax_rc = unsafe {
@@ -363,7 +364,7 @@ fn mount_virtiofs(tag: &str, mount_point: &Path) -> std::io::Result<bool> {
             dst.as_ptr(),
             fstype.as_ptr(),
             0,
-            opts_plain.as_ptr() as *const libc::c_void,
+            std::ptr::null(),
         )
     };
     if plain_rc == 0 {
