@@ -66,17 +66,18 @@
 //! | `allow_hosts` | string[] | Allowed hostnames (resolved to IPs at start) |
 //! | `allow_cidrs` | string[] | Allowed CIDR ranges (`"10.0.0.0/8"`) |
 //!
-//! ### `[fork]` — Forkable launch and CUDA capacity
+//! ### `[branch]` — Branchable launch and CUDA capacity
 //!
 //! Controls how a machine created from this Smolfile starts. A configured pool
 //! size implies `enabled = true` and applies the same transparent CUDA capacity
-//! policy as `machine start --fork-pool-size`.
+//! policy as `machine start --branch-pool-size`. `[fork]` remains accepted as a
+//! compatibility alias.
 //!
 //! | Field | Type | Description |
 //! |-------|------|-------------|
-//! | `enabled` | bool | Start as a copy-on-write fork base |
-//! | `pool_size` | int | Planned number of runnable CUDA clones; implies `enabled` |
-//! | `cuda_vram_limit_mib` | int | Logical VRAM limit per golden/clone; requires `pool_size` |
+//! | `enabled` | bool | Start as a copy-on-write branch source |
+//! | `pool_size` | int | Planned number of runnable CUDA children; implies `enabled` |
+//! | `cuda_vram_limit_mib` | int | Logical VRAM limit per source/child; requires `pool_size` |
 //!
 //! ### `[health]` — Health checks
 //!
@@ -160,7 +161,7 @@
 //! allow_hosts = ["pypi.org"]
 //! allow_cidrs = ["10.0.0.0/8"]
 //!
-//! [fork]
+//! [branch]
 //! enabled = true
 //! pool_size = 8
 //! cuda_vram_limit_mib = 8192
@@ -296,7 +297,11 @@ pub struct Smolfile {
     // Sections
     /// Network egress policy.
     pub network: Option<NetworkConfig>,
-    /// Forkable launch and CUDA fork-capacity policy.
+    /// Branchable launch and CUDA branch-capacity policy.
+    ///
+    /// `[branch]` is the preferred section name; `[fork]` remains accepted for
+    /// compatibility with existing Smolfiles.
+    #[serde(alias = "branch")]
     pub fork: Option<ForkConfig>,
     /// Health check configuration.
     pub health: Option<HealthConfig>,
@@ -320,18 +325,21 @@ pub struct NetworkConfig {
     pub allow_cidrs: Vec<String>,
 }
 
-/// Forkable launch and CUDA fork-capacity policy.
+/// Branchable launch and CUDA branch-capacity policy.
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ForkConfig {
-    /// Start the machine as a copy-on-write fork base.
+    /// Start the machine as a copy-on-write branch source.
     pub enabled: Option<bool>,
-    /// Planned number of runnable CUDA clones. Implies `enabled`.
+    /// Planned number of runnable CUDA children. Implies `enabled`.
     pub pool_size: Option<u32>,
-    /// Explicit logical VRAM limit for each golden/clone CUDA session.
+    /// Explicit logical VRAM limit for each source/child CUDA session.
     /// Requires `pool_size`.
     pub cuda_vram_limit_mib: Option<u64>,
 }
+
+/// Preferred public name for [`ForkConfig`].
+pub type BranchConfig = ForkConfig;
 
 /// Credential forwarding configuration.
 #[derive(Debug, Deserialize, Default)]
@@ -637,6 +645,34 @@ cuda_vram_limit_mib = 4096
         assert_eq!(fork.enabled, Some(true));
         assert_eq!(fork.pool_size, Some(16));
         assert_eq!(fork.cuda_vram_limit_mib, Some(4096));
+    }
+
+    #[test]
+    fn parse_branch_section_and_reject_duplicate_legacy_section() {
+        let sf = parse(
+            r#"
+[branch]
+enabled = true
+pool_size = 16
+cuda_vram_limit_mib = 4096
+"#,
+        )
+        .unwrap();
+        let branch = sf.fork.unwrap();
+        assert_eq!(branch.enabled, Some(true));
+        assert_eq!(branch.pool_size, Some(16));
+        assert_eq!(branch.cuda_vram_limit_mib, Some(4096));
+
+        assert!(parse(
+            r#"
+[branch]
+enabled = true
+
+[fork]
+enabled = true
+"#,
+        )
+        .is_err());
     }
 
     #[test]

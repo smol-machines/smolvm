@@ -94,6 +94,7 @@ use state::ApiState;
         handlers::machines::get_machine,
         handlers::machines::get_machine_egress_events,
         handlers::machines::start_machine,
+        handlers::machines::branch_machine,
         handlers::machines::fork_machine,
         handlers::machines::release_held_fork,
         handlers::machines::stop_machine,
@@ -270,7 +271,12 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
             get(handlers::machines::get_machine_egress_events),
         )
         .route("/{id}/start", post(handlers::machines::start_machine))
+        .route("/{id}/branches", post(handlers::machines::branch_machine))
         .route("/{id}/fork", post(handlers::machines::fork_machine))
+        .route(
+            "/{id}/branch-release",
+            post(handlers::machines::release_held_fork),
+        )
         .route(
             "/{id}/fork-release",
             post(handlers::machines::release_held_fork),

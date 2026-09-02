@@ -1678,9 +1678,15 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
         allowed_hosts: entry.resources.allowed_hosts.clone(),
         storage_gb: entry.resources.storage_gb,
         overlay_gb: entry.resources.overlay_gb,
+        branchable: entry.forkable,
         forkable: entry.forkable,
+        // MachineEntry is an in-memory runtime view and does not retain the
+        // persisted parent relationship; database-backed responses include it.
+        parent_machine: None,
+        cuda_branch_pool_size: entry.cuda_fork_pool_size,
         cuda_fork_pool_size: entry.cuda_fork_pool_size,
         cuda_vram_limit_mib: entry.cuda_vram_limit_mib,
+        branchpoint_held: entry.forkpoint_held,
         forkpoint_held: entry.forkpoint_held,
         egress_bytes,
         cpu_seconds,

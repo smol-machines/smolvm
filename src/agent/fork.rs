@@ -2456,6 +2456,8 @@ fn rejuvenate_once(
 /// if the restored container is recycled — the overlay is the only surface
 /// shared by every instance and the running workload alike.
 pub const FORK_ENV_GUEST_PATH: &str = smolvm_protocol::forkpoint::FORK_ENV_PATH;
+/// Preferred branch-lifecycle alias for [`FORK_ENV_GUEST_PATH`].
+pub const BRANCH_ENV_GUEST_PATH: &str = smolvm_protocol::forkpoint::BRANCH_ENV_PATH;
 
 /// Validate per-fork parameters: keys must be non-empty `[A-Za-z_][A-Za-z0-9_]*`
 /// (they double as env var names for exec sessions) and values must be free of
@@ -2560,10 +2562,15 @@ pub fn write_fork_env(clone: &str, record: &VmRecord, env: &[(String, String)]) 
         format!(
             "if [ ! -d {merged} ]; then echo \"missing {merged}; overlays:\" >&2; \
              ls /storage/overlays >&2; exit 41; fi; \
-             mkdir -p {merged}/etc/smolvm && umask 077 && cat > {merged}{FORK_ENV_GUEST_PATH}"
+             mkdir -p {merged}/etc/smolvm && umask 077 && \
+             cat > {merged}{FORK_ENV_GUEST_PATH} && \
+             ln -sfn fork-env {merged}{BRANCH_ENV_GUEST_PATH}"
         )
     } else {
-        format!("mkdir -p /etc/smolvm && umask 077 && cat > {FORK_ENV_GUEST_PATH}")
+        format!(
+            "mkdir -p /etc/smolvm && umask 077 && cat > {FORK_ENV_GUEST_PATH} && \
+             ln -sfn fork-env {BRANCH_ENV_GUEST_PATH}"
+        )
     };
     let sock = vm_data_dir(clone).join("agent.sock");
     let mut client = AgentClient::connect_with_retry(&sock)
@@ -2616,6 +2623,11 @@ pub fn activate_held_fork(
     } else {
         FORK_ENV_GUEST_PATH.to_string()
     };
+    let branch_env_path = if record.image.is_some() {
+        format!("{merged_root}{BRANCH_ENV_GUEST_PATH}")
+    } else {
+        BRANCH_ENV_GUEST_PATH.to_string()
+    };
     let ensure_env_parent = if record.image.is_some() {
         format!(
             "if [ ! -d '{merged_root}' ]; then echo 'missing {merged_root}' >&2; exit 41; fi; \
@@ -2642,6 +2654,7 @@ pub fn activate_held_fork(
         &receipt,
         &ensure_env_parent,
         &env_path,
+        &branch_env_path,
         &activation_token,
     );
     let socket = vm_data_dir(clone).join("agent.sock");
@@ -2820,6 +2833,7 @@ fn build_activation_script(
     receipt: &str,
     ensure_env_parent: &str,
     env_path: &str,
+    branch_env_path: &str,
     activation_token: &str,
 ) -> String {
     format!(
@@ -2843,6 +2857,7 @@ fn build_activation_script(
          release_tmp='{release}.{activation_token}.'$$; \
          trap 'rm -f \"$env_tmp\" \"$release_tmp\"' EXIT; \
          cat > \"$env_tmp\"; mv \"$env_tmp\" '{env_path}'; \
+         ln -sfn fork-env '{branch_env_path}'; \
          if [ \"${{#generation}}\" -eq 32 ]; then \
            printf '%s%s\\n' '{release_prefix}' \"$generation\" > \"$release_tmp\"; \
          else printf '%s\\n' '{legacy_release}' > \"$release_tmp\"; fi; \
@@ -3483,6 +3498,7 @@ mod tests {
         let worker_ready = state.join("worker-ready");
         let receipt = state.join("activation");
         let env_path = workspace.join("fork-env");
+        let branch_env_path = workspace.join("branch-env");
         let ensure_parent = format!("mkdir -p '{}'", workspace.display());
         let token = "0123456789abcdef";
         std::fs::write(&worker_ready, b"stale\n").unwrap();
@@ -3493,6 +3509,7 @@ mod tests {
             receipt.to_str().unwrap(),
             &ensure_parent,
             env_path.to_str().unwrap(),
+            branch_env_path.to_str().unwrap(),
             token,
         );
 
@@ -3503,6 +3520,10 @@ mod tests {
             String::from_utf8_lossy(&first.stderr)
         );
         assert_eq!(std::fs::read_to_string(&env_path).unwrap(), "LR=1e-4\n");
+        assert_eq!(
+            std::fs::read_to_string(&branch_env_path).unwrap(),
+            "LR=1e-4\n"
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -3537,6 +3558,7 @@ mod tests {
             receipt.to_str().unwrap(),
             &ensure_parent,
             env_path.to_str().unwrap(),
+            branch_env_path.to_str().unwrap(),
             "fedcba9876543210",
         );
         assert_eq!(
@@ -3558,6 +3580,7 @@ mod tests {
         let worker_ready = state.join("worker-ready");
         let receipt = state.join("activation");
         let env_path = workspace.join("fork-env");
+        let branch_env_path = workspace.join("branch-env");
         let ensure_parent = format!("mkdir -p '{}'", workspace.display());
         let token = "0123456789abcdef";
         std::fs::write(&receipt, format!("{token}\n")).unwrap();
@@ -3568,6 +3591,7 @@ mod tests {
             receipt.to_str().unwrap(),
             &ensure_parent,
             env_path.to_str().unwrap(),
+            branch_env_path.to_str().unwrap(),
             token,
         );
 
@@ -3578,6 +3602,10 @@ mod tests {
             String::from_utf8_lossy(&retry.stderr)
         );
         assert_eq!(std::fs::read_to_string(&env_path).unwrap(), "LR=3e-4\n");
+        assert_eq!(
+            std::fs::read_to_string(&branch_env_path).unwrap(),
+            "LR=3e-4\n"
+        );
         assert!(release.is_file());
     }
 

@@ -114,9 +114,13 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
         // when unset.
         storage_gb: Some(record.storage_gb.unwrap_or(DEFAULT_STORAGE_SIZE_GIB)),
         overlay_gb: Some(record.overlay_gb.unwrap_or(DEFAULT_OVERLAY_SIZE_GIB)),
+        branchable: record.forkable_on_start(),
         forkable: record.forkable_on_start(),
+        parent_machine: record.golden.clone(),
+        cuda_branch_pool_size: record.cuda_fork_pool_size,
         cuda_fork_pool_size: record.cuda_fork_pool_size,
         cuda_vram_limit_mib: record.cuda_vram_limit_mib,
+        branchpoint_held: record.forkpoint_held,
         forkpoint_held: record.forkpoint_held,
         // Cumulative egress, read from the per-VM telemetry file the subprocess
         // flushes. Surfaced here so the control plane reads it from the machine
@@ -1752,6 +1756,31 @@ pub async fn fork_machine(
     Json(req): Json<ForkRequest>,
 ) -> Result<Json<MachineInfo>, ApiError> {
     fork_machine_inner(state, golden, req).await.map(Json)
+}
+
+/// Branch a running, branchable source machine into a new independent child.
+#[utoipa::path(
+    post,
+    path = "/api/v1/machines/{name}/branches",
+    tag = "Machines",
+    params(
+        ("name" = String, Path, description = "Branch source machine name")
+    ),
+    request_body = ForkRequest,
+    responses(
+        (status = 200, description = "Child branched and running", body = MachineInfo),
+        (status = 400, description = "Invalid or unsupported branch request", body = ApiErrorResponse),
+        (status = 404, description = "Source machine not found", body = ApiErrorResponse),
+        (status = 409, description = "Source is not branchable, or child name already exists", body = ApiErrorResponse),
+        (status = 500, description = "Branch failed", body = ApiErrorResponse)
+    )
+)]
+pub async fn branch_machine(
+    State(state): State<Arc<ApiState>>,
+    Path(source): Path<String>,
+    Json(req): Json<ForkRequest>,
+) -> Result<Json<MachineInfo>, ApiError> {
+    fork_machine_inner(state, source, req).await.map(Json)
 }
 
 /// Internal fork entry point shared by the HTTP handler and pool reconciler.
@@ -3540,6 +3569,8 @@ mod tests {
         );
         record.gpu = Some(true);
         record.cuda = true;
+        record.forkable = true;
+        record.golden = Some("parent-vm".to_string());
 
         let info = record_to_info("test-vm", &record);
 
@@ -3552,6 +3583,11 @@ mod tests {
         assert!(!info.network);
         assert!(info.gpu);
         assert!(info.cuda);
+        assert!(info.branchable);
+        assert!(info.forkable);
+        assert_eq!(info.parent_machine.as_deref(), Some("parent-vm"));
+        assert_eq!(info.cuda_branch_pool_size, info.cuda_fork_pool_size);
+        assert_eq!(info.branchpoint_held, info.forkpoint_held);
         assert!(info.pid.is_none());
     }
 

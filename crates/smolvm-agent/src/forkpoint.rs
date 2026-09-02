@@ -1,8 +1,8 @@
-//! Workload-facing live-fork coordination.
+//! Workload-facing live-branch coordination.
 //!
-//! A workload calls `smolvm-fork-ready` after initialization. The helper writes
+//! A workload calls `smolvm-branch-ready` after initialization. The helper writes
 //! a marker and blocks, so the application cannot mutate training state while
-//! the host freezes the golden. Restored clones are released independently by
+//! the host captures the source. Restored children are released independently by
 //! the host through a VM-private directory bind-mounted into the container.
 
 use std::io::{Read as _, Write as _};
@@ -12,9 +12,10 @@ use std::time::Duration;
 
 const AGENT_BINARY: &str = "/usr/local/bin/smolvm-agent";
 use smolvm_protocol::forkpoint::{
-    CUDA_PRELOAD_MODULES_HINT, FORK_ENV_PATH, GENERATION_PREFIX, HELPER_PATH, LEGACY_RELEASE_TOKEN,
-    READY_PATH, READY_VERSION, RELEASE_PATH, RELEASE_PREFIX, RESTORED_CONTAINER_PATH,
-    RESTORED_PATH, STATE_DIR, WORKER_READY_HELPER_PATH, WORKER_READY_PATH, WORKER_READY_TOKEN_ENV,
+    BRANCH_ENV_PATH, BRANCH_HELPER_PATH, CUDA_PRELOAD_MODULES_HINT, FORK_ENV_PATH,
+    GENERATION_PREFIX, HELPER_PATH, LEGACY_RELEASE_TOKEN, READY_PATH, READY_VERSION, RELEASE_PATH,
+    RELEASE_PREFIX, RESTORED_CONTAINER_PATH, RESTORED_PATH, STATE_DIR, WORKER_READY_HELPER_PATH,
+    WORKER_READY_PATH, WORKER_READY_TOKEN_ENV,
 };
 
 fn enabled() -> bool {
@@ -29,8 +30,11 @@ pub fn helper_requested() -> bool {
     let argv0 = args.next().unwrap_or_default();
     let helper_argv0 = Path::new(&argv0)
         .file_name()
-        .is_some_and(|name| name == "smolvm-fork-ready");
-    helper_argv0 || args.next().is_some_and(|arg| arg == "fork-ready")
+        .is_some_and(|name| name == "smolvm-fork-ready" || name == "smolvm-branch-ready");
+    helper_argv0
+        || args
+            .next()
+            .is_some_and(|arg| arg == "fork-ready" || arg == "branch-ready")
 }
 
 /// Whether this invocation is the post-restore worker-readiness helper.
@@ -64,7 +68,7 @@ pub fn setup() {
     let _ = std::fs::remove_file(RELEASE_PATH);
     let _ = std::fs::remove_file(WORKER_READY_PATH);
 
-    for helper in [HELPER_PATH, WORKER_READY_HELPER_PATH] {
+    for helper in [BRANCH_HELPER_PATH, HELPER_PATH, WORKER_READY_HELPER_PATH] {
         if !Path::new(helper).exists() {
             if let Err(error) = std::os::unix::fs::symlink(AGENT_BINARY, helper) {
                 tracing::warn!(%error, helper, "failed to install bare-VM forkpoint helper");
@@ -89,6 +93,7 @@ fn inject_into_container_if(
         return;
     }
     spec.add_bind_mount(agent_binary, HELPER_PATH, true);
+    spec.add_bind_mount(agent_binary, BRANCH_HELPER_PATH, true);
     spec.add_bind_mount(agent_binary, WORKER_READY_HELPER_PATH, true);
     spec.add_bind_mount(state_dir, STATE_DIR, false);
 }
@@ -97,7 +102,7 @@ fn inject_into_container_if(
 pub fn run_helper() -> i32 {
     let preload_modules = std::env::args_os().any(|argument| argument == "--cuda-preload-modules");
     if let Err(error) = run_helper_inner(preload_modules) {
-        eprintln!("smolvm-fork-ready: {error}");
+        eprintln!("smolvm-branch-ready: {error}");
         return 1;
     }
     0
@@ -145,7 +150,7 @@ fn run_helper_at(
             ready_path.display()
         )
     })?;
-    println!("smolvm forkpoint ready; waiting for clone release");
+    println!("smolvm branch point ready; waiting for child release");
     let _ = std::io::stdout().flush();
 
     // Keep the snapshot boundary out of a timed kernel wait. Some VMM restore
@@ -172,9 +177,14 @@ fn run_helper_at(
 
 /// Publish the host-issued activation token after clone-local setup completes.
 pub fn run_worker_ready_helper() -> i32 {
+    let env_path = if Path::new(BRANCH_ENV_PATH).is_file() {
+        BRANCH_ENV_PATH
+    } else {
+        FORK_ENV_PATH
+    };
     if let Err(error) = write_worker_ready_at(
         Path::new(STATE_DIR),
-        Path::new(FORK_ENV_PATH),
+        Path::new(env_path),
         Path::new(WORKER_READY_PATH),
     ) {
         eprintln!("smolvm-worker-ready: {error}");
@@ -311,6 +321,7 @@ mod tests {
             .mounts
             .iter()
             .all(|mount| mount.destination != HELPER_PATH
+                && mount.destination != BRANCH_HELPER_PATH
                 && mount.destination != WORKER_READY_HELPER_PATH));
     }
 
@@ -336,6 +347,13 @@ mod tests {
             .unwrap();
         assert_eq!(helper.source, agent.to_str().unwrap());
         assert!(helper.options.iter().any(|option| option == "ro"));
+        let branch_helper = spec
+            .mounts
+            .iter()
+            .find(|mount| mount.destination == BRANCH_HELPER_PATH)
+            .unwrap();
+        assert_eq!(branch_helper.source, agent.to_str().unwrap());
+        assert!(branch_helper.options.iter().any(|option| option == "ro"));
         let worker_ready_helper = spec
             .mounts
             .iter()

@@ -1,4 +1,4 @@
-//! Stable guest paths used to coordinate a live fork.
+//! Stable guest paths used to coordinate a live branch.
 
 /// Directory privately inherited by each restored VM.
 pub const STATE_DIR: &str = "/run/smolvm/forkpoint";
@@ -45,11 +45,17 @@ pub const WORKER_READY_PATH: &str = "/run/smolvm/forkpoint/worker-ready";
 /// Per-clone environment installed by the host before workload release.
 pub const FORK_ENV_PATH: &str = "/etc/smolvm/fork-env";
 
+/// Preferred branch-lifecycle alias for [`FORK_ENV_PATH`].
+pub const BRANCH_ENV_PATH: &str = "/etc/smolvm/branch-env";
+
 /// Host-generated readiness token delivered through [`FORK_ENV_PATH`].
 pub const WORKER_READY_TOKEN_ENV: &str = "SMOLVM_WORKER_READY_TOKEN";
 
 /// Workload-facing helper installed in bare VMs and workload containers.
 pub const HELPER_PATH: &str = "/usr/local/bin/smolvm-fork-ready";
+
+/// Preferred branch-lifecycle alias for [`HELPER_PATH`].
+pub const BRANCH_HELPER_PATH: &str = "/usr/local/bin/smolvm-branch-ready";
 
 /// Helper used by a released workload after clone-local preparation finishes.
 pub const WORKER_READY_HELPER_PATH: &str = "/usr/local/bin/smolvm-worker-ready";

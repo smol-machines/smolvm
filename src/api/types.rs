@@ -685,16 +685,26 @@ pub struct MachineInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = 2)]
     pub overlay_gb: Option<u64>,
-    /// Whether ordinary starts launch this machine as a fork base.
+    /// Whether ordinary starts launch this machine as a branch source.
+    pub branchable: bool,
+    /// Legacy alias for `branchable`.
     pub forkable: bool,
-    /// Planned runnable CUDA clone count used for automatic capacity budgeting.
+    /// Immediate parent machine when this machine was created by branching.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_machine: Option<String>,
+    /// Planned runnable CUDA child count used for automatic capacity budgeting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cuda_branch_pool_size: Option<u32>,
+    /// Legacy alias for `cuda_branch_pool_size`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cuda_fork_pool_size: Option<u32>,
-    /// Explicit logical CUDA memory limit per golden/clone session, in MiB.
+    /// Explicit logical CUDA memory limit per source/child session, in MiB.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cuda_vram_limit_mib: Option<u64>,
-    /// True while this clone is an already-booted clean slot parked at the
-    /// workload forkpoint and available for one assignment.
+    /// True while this child is an already-booted clean slot parked at the
+    /// workload branchpoint and available for one assignment.
+    pub branchpoint_held: bool,
+    /// Legacy alias for `branchpoint_held`.
     pub forkpoint_held: bool,
     /// Cumulative guest-outbound (egress) bytes since boot, for billing. Present
     /// only for virtio-net machines that have reported a value; omitted for TSI
@@ -822,18 +832,18 @@ pub struct ResizeMachineRequest {
 /// Query string for `POST /machines/{name}/start`.
 #[derive(Debug, Default, Deserialize, ToSchema)]
 pub struct StartMachineQuery {
-    /// Start as a fork base: back the guest RAM with a memfd (copy-on-write
-    /// cloneable) and expose a control socket so the machine can later be forked
-    /// with `POST /machines/{name}/fork`. Linux/x86_64 keeps the source running;
+    /// Start as a branch source: back the guest RAM with a memfd (copy-on-write
+    /// cloneable) and expose a control socket so the machine can later be branched
+    /// with `POST /machines/{name}/branches`. Linux/x86_64 keeps the source running;
     /// other hosts retain it as the frozen copy-on-write base.
-    #[serde(default)]
+    #[serde(default, rename = "branchable", alias = "forkable")]
     pub forkable: bool,
-    /// Number of runnable CUDA fork clones planned for this golden. Supplying
-    /// it enables forkable launch and transparent pre-initialization VRAM
+    /// Number of runnable CUDA children planned for this source. Supplying it
+    /// enables branchable launch and transparent pre-initialization VRAM
     /// budgeting for cache-sizing frameworks.
-    #[serde(default, rename = "forkPoolSize")]
+    #[serde(default, rename = "branchPoolSize", alias = "forkPoolSize")]
     pub fork_pool_size: Option<u32>,
-    /// Explicit logical VRAM limit per golden/clone session, in MiB.
+    /// Explicit logical VRAM limit per source/child session, in MiB.
     #[serde(default, rename = "cudaVramLimitMib")]
     pub cuda_vram_limit_mib: Option<u64>,
 }
@@ -892,17 +902,17 @@ pub struct StartMachineRequest {
     pub registry_auth: Option<RegistryAuthSpec>,
 }
 
-/// Request to fork a running, forkable golden machine into a new clone.
+/// Request to branch a running, branchable source machine into a new child.
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ForkRequest {
-    /// Name for the new clone machine.
+    /// Name for the new child machine.
     #[schema(example = "clone-1")]
     pub name: String,
-    /// Materialize the restored clone as a new checkpoint source so it can be
-    /// forked again. This pays one eager guest-memory copy at clone boot;
+    /// Materialize the restored child as a new branch source so it can be
+    /// branched again. This pays one eager guest-memory copy at child boot;
     /// descendants remain copy-on-write.
-    #[serde(default)]
+    #[serde(default, rename = "branchable", alias = "forkable")]
     pub forkable: bool,
     /// Pin the clone's inbound port forwards. Without this, the golden's
     /// forwards are remapped to freshly-allocated host ports so the clone does
@@ -943,6 +953,9 @@ pub struct ForkRequest {
     pub secrets: RequestSecretRefs,
 }
 
+/// Preferred public name for [`ForkRequest`].
+pub type BranchRequest = ForkRequest;
+
 /// Assignment for one already-booted held fork slot.
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -952,6 +965,9 @@ pub struct ForkReleaseRequest {
     #[serde(default)]
     pub env: Vec<String>,
 }
+
+/// Preferred public name for [`ForkReleaseRequest`].
+pub type BranchReleaseRequest = ForkReleaseRequest;
 
 // ============================================================================
 // Automatic fork-pool types
@@ -964,8 +980,9 @@ pub struct CreateForkPoolRequest {
     /// Stable pool name.
     #[schema(example = "grpo-rollouts")]
     pub name: String,
-    /// Existing running forkable machine whose workload is at the forkpoint.
-    #[schema(example = "policy-golden")]
+    /// Existing running branchable machine whose workload is at the branch point.
+    #[serde(rename = "source", alias = "golden")]
+    #[schema(example = "policy-source")]
     pub golden: String,
     /// Number of clean workers kept booted and ready.
     #[schema(example = 8)]
@@ -988,6 +1005,9 @@ pub struct CreateForkPoolRequest {
     pub lease_ttl_secs: Option<u64>,
 }
 
+/// Preferred public name for [`CreateForkPoolRequest`].
+pub type CreateBranchPoolRequest = CreateForkPoolRequest;
+
 /// Query parameters for deleting a fork pool.
 #[derive(Debug, Clone, Default, Deserialize, ToSchema)]
 pub struct DeleteForkPoolQuery {
@@ -995,6 +1015,9 @@ pub struct DeleteForkPoolQuery {
     #[serde(default)]
     pub force: bool,
 }
+
+/// Preferred public name for [`DeleteForkPoolQuery`].
+pub type DeleteBranchPoolQuery = DeleteForkPoolQuery;
 
 /// Request to change a pool's clean-worker target.
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
@@ -1004,13 +1027,18 @@ pub struct ResizeForkPoolRequest {
     pub desired_ready: u32,
 }
 
+/// Preferred public name for [`ResizeForkPoolRequest`].
+pub type ResizeBranchPoolRequest = ResizeForkPoolRequest;
+
 /// Current size and lifecycle state of an automatic fork pool.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ForkPoolInfo {
     /// Stable pool name.
     pub name: String,
-    /// Forkable source machine.
+    /// Branchable source machine.
+    pub source: String,
+    /// Legacy alias for `source`.
     pub golden: String,
     /// Configured clean-worker target.
     pub desired_ready: u32,
@@ -1066,12 +1094,18 @@ pub struct ForkPoolInfo {
     pub created_at: u64,
 }
 
+/// Preferred public name for [`ForkPoolInfo`].
+pub type BranchPoolInfo = ForkPoolInfo;
+
 /// List response for automatic fork pools.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ListForkPoolsResponse {
     /// All pools on this node.
     pub pools: Vec<ForkPoolInfo>,
 }
+
+/// Preferred public name for [`ListForkPoolsResponse`].
+pub type ListBranchPoolsResponse = ListForkPoolsResponse;
 
 /// Request to acquire one clean worker from a fork pool.
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
@@ -1103,6 +1137,9 @@ pub struct AcquireForkLeaseRequest {
     pub rollout_access: Option<RolloutLeaseAccess>,
 }
 
+/// Preferred public name for [`AcquireForkLeaseRequest`].
+pub type AcquireBranchLeaseRequest = AcquireForkLeaseRequest;
+
 /// A bounded group of ordinary fork-pool lease requests.
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -1111,6 +1148,9 @@ pub struct AcquireForkLeaseBatchRequest {
     /// at most 32 items may wait for workload readiness in one call.
     pub leases: Vec<AcquireForkLeaseRequest>,
 }
+
+/// Preferred public name for [`AcquireForkLeaseBatchRequest`].
+pub type AcquireBranchLeaseBatchRequest = AcquireForkLeaseBatchRequest;
 
 /// One ordered result from a fork-pool lease batch.
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -1129,6 +1169,9 @@ pub struct ForkLeaseBatchItemResponse {
     pub error: Option<String>,
 }
 
+/// Preferred public name for [`ForkLeaseBatchItemResponse`].
+pub type BranchLeaseBatchItemResponse = ForkLeaseBatchItemResponse;
+
 /// Ordered results from a bounded fork-pool lease batch.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -1136,6 +1179,9 @@ pub struct AcquireForkLeaseBatchResponse {
     /// One result per submitted lease request, in input order.
     pub leases: Vec<ForkLeaseBatchItemResponse>,
 }
+
+/// Preferred public name for [`AcquireForkLeaseBatchResponse`].
+pub type AcquireBranchLeaseBatchResponse = AcquireForkLeaseBatchResponse;
 
 /// Least-privilege fused-rollout scope injected into one pool worker.
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema, PartialEq, Eq)]
@@ -1162,6 +1208,9 @@ pub struct ForkLeasePayloadFile {
     #[schema(example = 420)]
     pub mode: Option<u32>,
 }
+
+/// Preferred public name for [`ForkLeasePayloadFile`].
+pub type BranchLeasePayloadFile = ForkLeasePayloadFile;
 
 impl std::fmt::Debug for ForkLeasePayloadFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1193,6 +1242,9 @@ pub struct ForkLeaseInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
+
+/// Preferred public name for [`ForkLeaseInfo`].
+pub type BranchLeaseInfo = ForkLeaseInfo;
 
 #[cfg(test)]
 mod deny_unknown_field_tests {
@@ -1307,5 +1359,45 @@ mod registry_auth_tests {
         assert!(!request.wait_ready);
         assert!(!request.hold);
         assert_eq!(request.ready_timeout_secs, None);
+    }
+
+    #[test]
+    fn branch_requests_accept_new_and_legacy_branchable_names() {
+        let branch: ForkRequest = serde_json::from_value(serde_json::json!({
+            "name": "child-1",
+            "branchable": true
+        }))
+        .unwrap();
+        assert!(branch.forkable);
+
+        let legacy: ForkRequest = serde_json::from_value(serde_json::json!({
+            "name": "child-2",
+            "forkable": true
+        }))
+        .unwrap();
+        assert!(legacy.forkable);
+
+        let serialized = serde_json::to_value(branch).unwrap();
+        assert_eq!(serialized["branchable"], true);
+        assert!(serialized.get("forkable").is_none());
+    }
+
+    #[test]
+    fn start_query_accepts_new_and_legacy_branchable_names() {
+        let branch: StartMachineQuery =
+            serde_json::from_value(serde_json::json!({"branchable": true})).unwrap();
+        assert!(branch.forkable);
+
+        let legacy: StartMachineQuery =
+            serde_json::from_value(serde_json::json!({"forkable": true})).unwrap();
+        assert!(legacy.forkable);
+
+        let branch_pool: StartMachineQuery =
+            serde_json::from_value(serde_json::json!({"branchPoolSize": 8})).unwrap();
+        assert_eq!(branch_pool.fork_pool_size, Some(8));
+
+        let legacy_pool: StartMachineQuery =
+            serde_json::from_value(serde_json::json!({"forkPoolSize": 4})).unwrap();
+        assert_eq!(legacy_pool.fork_pool_size, Some(4));
     }
 }

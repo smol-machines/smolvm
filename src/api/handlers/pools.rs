@@ -467,6 +467,7 @@ async fn pool_info(state: &ApiState, pool: ForkPoolRecord) -> Result<ForkPoolInf
     }
     Ok(ForkPoolInfo {
         name: pool.name,
+        source: pool.golden.clone(),
         golden: pool.golden,
         desired_ready: pool.desired_ready,
         max_active: pool.max_active,
