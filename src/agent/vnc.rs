@@ -401,6 +401,122 @@ fn respond<W: Write>(
     s.write_all(body)
 }
 
+/// Where a session's time actually goes, reported periodically when
+/// `SMOLVM_VNC_STATS` is set.
+///
+/// A slow desktop has three very different causes — the guest not presenting,
+/// our diffing and encoding, or the socket — and they are indistinguishable
+/// from the outside. Measuring them separately is what turns tuning from
+/// guesswork into arithmetic.
+struct Stats {
+    report_every: Duration,
+    /// Where reports go; see `Stats::new`.
+    sink: Option<std::fs::File>,
+    since: std::time::Instant,
+    frames: u64,
+    empty: u64,
+    bytes: u64,
+    waiting: Duration,
+    encoding: Duration,
+    retaining: Duration,
+}
+
+impl Stats {
+    fn new() -> Self {
+        Self::from_setting(std::env::var("SMOLVM_VNC_STATS").ok().as_deref())
+    }
+
+    /// Build from an explicit setting rather than reading the environment, so
+    /// tests do not mutate process-wide state that other tests are reading
+    /// concurrently.
+    ///
+    /// A bare on-switch ("1", "true", "yes", "on") reports through tracing;
+    /// any other value names a file to append to. Deliberately not "does it
+    /// look like a path" — a Windows path holds no '/', so that test would
+    /// silently drop the file and leave the operator with nothing.
+    ///
+    /// The file form matters because the VNC server runs inside the
+    /// `_boot-vm` child, whose stdout and stderr are /dev/null unless
+    /// SMOLVM_BOOT_DEBUG is set — the same reason `SMOLVM_DISPLAY_TRACE`
+    /// takes a path rather than a flag.
+    fn from_setting(setting: Option<&str>) -> Self {
+        let names_a_file = |v: &&str| {
+            !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "" | "1" | "true" | "yes" | "on"
+            )
+        };
+        let sink = setting.filter(names_a_file).and_then(|path| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok()
+        });
+        Self {
+            report_every: if setting.is_some() {
+                Duration::from_secs(2)
+            } else {
+                Duration::MAX
+            },
+            sink,
+            since: std::time::Instant::now(),
+            frames: 0,
+            empty: 0,
+            bytes: 0,
+            waiting: Duration::ZERO,
+            encoding: Duration::ZERO,
+            retaining: Duration::ZERO,
+        }
+    }
+
+    fn maybe_report(&mut self) {
+        let elapsed = self.since.elapsed();
+        if elapsed < self.report_every {
+            return;
+        }
+        let secs = elapsed.as_secs_f64();
+        let per = |d: Duration| {
+            if self.frames == 0 {
+                0.0
+            } else {
+                d.as_secs_f64() * 1000.0 / self.frames as f64
+            }
+        };
+        let line = format!(
+            "fps={:.1} mb_per_s={:.2} wait_ms={:.2} encode_ms={:.2} \
+             retain_ms={:.2} bytes_per_frame={:.0} empty={}",
+            self.frames as f64 / secs,
+            self.bytes as f64 / secs / 1e6,
+            per(self.waiting),
+            per(self.encoding),
+            per(self.retaining),
+            if self.frames == 0 {
+                0.0
+            } else {
+                self.bytes as f64 / self.frames as f64
+            },
+            self.empty,
+        );
+        match self.sink.as_mut() {
+            Some(f) => {
+                let _ = writeln!(f, "{line}");
+                let _ = f.flush();
+            }
+            None => tracing::info!("vnc stats {line}"),
+        }
+
+        // Reset the counters but keep the open sink.
+        self.since = std::time::Instant::now();
+        self.frames = 0;
+        self.empty = 0;
+        self.bytes = 0;
+        self.waiting = Duration::ZERO;
+        self.encoding = Duration::ZERO;
+        self.retaining = Duration::ZERO;
+    }
+}
+
 /// Drive one RFB session. Generic over the transport so the very same
 /// protocol code serves a native viewer on a raw socket and a browser over a
 /// WebSocket — the two differ only in how bytes are framed beneath this.
@@ -460,6 +576,7 @@ fn handle_client<S: Read + Write>(
     let mut last_sent: Option<Vec<u8>> = None;
     let mut client_supports_resize = false;
     let mut last_button_mask = 0u8;
+    let mut stats = Stats::new();
 
     loop {
         let mut kind = [0u8; 1];
@@ -506,22 +623,28 @@ fn handle_client<S: Read + Write>(
                 s.read_exact(&mut req)?;
                 let incremental = req[0] != 0;
 
+                let t_wait = std::time::Instant::now();
                 let frame = if incremental {
                     fb.wait_for_frame(last_generation, UPDATE_WAIT)
                         .or_else(|| fb.latest())
                 } else {
                     fb.latest()
                 };
+                stats.waiting += t_wait.elapsed();
 
                 let Some(frame) = frame else {
                     // Nothing presented yet. Answer with an empty update so the
                     // client stays in its request loop instead of stalling.
                     s.write_all(&[0u8, 0, 0, 0])?;
+                    stats.empty += 1;
+                    stats.maybe_report();
                     continue;
                 };
 
                 if incremental && frame.generation == last_generation {
                     s.write_all(&[0u8, 0, 0, 0])?;
+                    stats.empty += 1;
+                    stats.maybe_report();
                     continue;
                 }
                 last_generation = frame.generation;
@@ -541,14 +664,23 @@ fn handle_client<S: Read + Write>(
                     }
                 }
 
+                let t_encode = std::time::Instant::now();
                 let bgrx = display::to_bgrx(&frame);
-                match last_sent.as_ref() {
+                let sent = match last_sent.as_ref() {
                     Some(prev) if incremental && prev.len() == bgrx.len() => {
-                        send_frame_diff(&mut s, &frame, &bgrx, prev, &fmt)?;
+                        send_frame_diff(&mut s, &frame, &bgrx, prev, &fmt)?
                     }
                     _ => send_frame(&mut s, &frame, &bgrx, &fmt)?,
-                }
+                };
+                stats.encoding += t_encode.elapsed();
+
+                let t_retain = std::time::Instant::now();
                 last_sent = Some(bgrx.into_owned());
+                stats.retaining += t_retain.elapsed();
+
+                stats.frames += 1;
+                stats.bytes += sent as u64;
+                stats.maybe_report();
             }
             4 => {
                 // KeyEvent: down-flag, 2 bytes padding, u32 keysym.
@@ -681,12 +813,14 @@ fn send_resize<S: Write>(s: &mut S, width: u32, height: u32) -> std::io::Result<
     s.write_all(&msg)
 }
 
+/// Returns the number of bytes written, so a caller can account throughput
+/// without re-deriving it from the geometry.
 fn send_frame<S: Write>(
     s: &mut S,
     frame: &Frame,
     bgrx: &[u8],
     fmt: &PixelFormat,
-) -> std::io::Result<()> {
+) -> std::io::Result<usize> {
     let pixels = encode_pixels(bgrx, fmt);
 
     let mut header = vec![0u8, 0];
@@ -697,20 +831,22 @@ fn send_frame<S: Write>(
     header.extend_from_slice(&(frame.height as u16).to_be_bytes());
     header.extend_from_slice(&ENCODING_RAW.to_be_bytes());
     s.write_all(&header)?;
-    s.write_all(&pixels)
+    s.write_all(&pixels)?;
+    Ok(header.len() + pixels.len())
 }
 
 /// Send only the row bands that changed since the frame this client last
 /// received. Raw encoding ships every pixel of a rectangle, so cursor-sized
 /// damage would otherwise cost a full-frame update (~5 MB at 1440x900) on
 /// every pointer movement.
+/// Returns the number of bytes written.
 fn send_frame_diff<S: Write>(
     s: &mut S,
     frame: &Frame,
     bgrx: &[u8],
     prev: &[u8],
     fmt: &PixelFormat,
-) -> std::io::Result<()> {
+) -> std::io::Result<usize> {
     const BAND_ROWS: usize = 16;
     let row = frame.width as usize * 4;
     let height = frame.height as usize;
@@ -731,12 +867,14 @@ fn send_frame_diff<S: Write>(
 
     if rects.is_empty() {
         // The frame generation moved but the pixels did not.
-        return s.write_all(&[0u8, 0, 0, 0]);
+        s.write_all(&[0u8, 0, 0, 0])?;
+        return Ok(4);
     }
 
     let mut header = vec![0u8, 0];
     header.extend_from_slice(&(rects.len() as u16).to_be_bytes());
     s.write_all(&header)?;
+    let mut written = header.len();
     for (band_start, band_rows) in rects {
         let mut rect = Vec::with_capacity(12);
         rect.extend_from_slice(&0u16.to_be_bytes());
@@ -746,9 +884,11 @@ fn send_frame_diff<S: Write>(
         rect.extend_from_slice(&ENCODING_RAW.to_be_bytes());
         s.write_all(&rect)?;
         let band = &bgrx[band_start * row..(band_start + band_rows) * row];
-        s.write_all(&encode_pixels(band, fmt))?;
+        let pixels = encode_pixels(band, fmt);
+        s.write_all(&pixels)?;
+        written += rect.len() + pixels.len();
     }
-    Ok(())
+    Ok(written)
 }
 
 /// The URL to open in a browser for a server bound to `addr`. A wildcard
@@ -950,6 +1090,61 @@ mod tests {
             browser_url("[::]:5900".parse().unwrap()),
             "http://[::1]:5900/"
         );
+    }
+
+    #[test]
+    fn stats_are_off_unless_asked_for() {
+        // The timing itself always runs; only reporting is opt-in, so an
+        // absent setting must never produce output or open a file.
+        let s = Stats::from_setting(None);
+        assert_eq!(s.report_every, Duration::MAX);
+        assert!(s.sink.is_none());
+    }
+
+    #[test]
+    fn a_path_valued_setting_reports_to_that_file() {
+        // The file form is the one that works from inside the boot child,
+        // whose stdout is /dev/null.
+        let dir = std::env::temp_dir().join("smolvm-vnc-stats-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stats.log");
+        let _ = std::fs::remove_file(&path);
+        let mut s = Stats::from_setting(Some(path.to_str().unwrap()));
+        assert!(s.sink.is_some(), "a path setting should open a sink");
+        s.report_every = Duration::ZERO;
+        s.frames = 10;
+        s.bytes = 1000;
+        s.maybe_report();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("fps="), "got: {written}");
+        assert!(written.contains("wait_ms="));
+        // Counters reset, but the sink stays open across reports.
+        assert_eq!(s.frames, 0);
+        assert!(s.sink.is_some());
+    }
+
+    #[test]
+    fn a_bare_switch_reports_without_opening_a_file() {
+        for on in ["1", "true", "YES", "on"] {
+            let s = Stats::from_setting(Some(on));
+            assert_eq!(s.report_every, Duration::from_secs(2), "{on} should enable");
+            assert!(s.sink.is_none(), "{on} is a switch, not a filename");
+        }
+    }
+
+    #[test]
+    fn a_windows_style_path_still_names_a_file() {
+        // A path test based on '/' would treat this as a switch and silently
+        // report nowhere, since the boot child's stdout is discarded.
+        let dir = std::env::temp_dir().join("smolvm-vnc-stats-win");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.log");
+        let backslashed = path.to_string_lossy().replace('/', "\\");
+        let s = Stats::from_setting(Some(&backslashed));
+        assert_eq!(s.report_every, Duration::from_secs(2));
+        // On unix the backslash form is just an odd filename, which is still
+        // the point: anything that is not a switch must open a file.
+        assert!(s.sink.is_some(), "a non-switch value must open a sink");
     }
 
     #[test]
