@@ -246,9 +246,14 @@ fn collect_events(event: &Event, targets: &[WatchTarget], out: &mut Vec<FsNotify
                 mask: mask_for(&event.kind, host_path),
             });
         } else if let Some(parent) = rel.parent() {
-            // Deleted / moved away: the exact path no longer resolves in the
-            // guest, so fire a MODIFY on the (still-present) parent directory.
-            // Directory watchers re-scan and observe the removal.
+            // The guest may still cache the removed path. Send the exact name
+            // so the kernel can expire that entry and preserve the filename in
+            // directory-watch events, plus the surviving parent as a fallback
+            // when the guest had never looked the path up.
+            out.push(FsNotifyEvent {
+                path: join_guest(&t.guest_base, rel),
+                mask: fsnotify_mask::FS_DELETE,
+            });
             out.push(FsNotifyEvent {
                 path: join_guest(&t.guest_base, parent),
                 mask: fsnotify_mask::FS_MODIFY | fsnotify_mask::FS_ISDIR,
@@ -326,8 +331,7 @@ mod tests {
     }
 
     #[test]
-    fn deleted_path_fires_parent_dir_modify() {
-        // A path that does not exist on disk maps to a MODIFY on its parent.
+    fn deleted_path_expires_exact_name_and_wakes_parent() {
         let targets = vec![target()];
         let ev = Event {
             kind: EventKind::Remove(notify::event::RemoveKind::File),
@@ -336,10 +340,12 @@ mod tests {
         };
         let mut out = Vec::new();
         collect_events(&ev, &targets, &mut out);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].path, "/mnt/virtiofs/smolvm0/src");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].path, "/mnt/virtiofs/smolvm0/src/gone.js");
+        assert_eq!(out[0].mask, fsnotify_mask::FS_DELETE);
+        assert_eq!(out[1].path, "/mnt/virtiofs/smolvm0/src");
         assert_eq!(
-            out[0].mask & fsnotify_mask::FS_MODIFY,
+            out[1].mask & fsnotify_mask::FS_MODIFY,
             fsnotify_mask::FS_MODIFY
         );
     }
