@@ -4,7 +4,6 @@ Integration tests for smolvm. All tests invoke the `smolvm` binary directly
 against real VMs — no mocking.
 
 ---
-
 ## Runner: `run_tests.sh`
 
 Single entry point for all test suites.
@@ -22,7 +21,7 @@ SMOLVM_SKIP_SLOW=1 ./tests/run_tests.sh   # skip tests with long sleeps (~5 min)
 | `bare` | `test_machine_bare.sh` | 22 | Lifecycle, exec, shell, file I/O, observability |
 | `db` | `test_db.sh` | 6 | DB state persistence, VM state transitions |
 | `network` | `test_network.sh` | 17 | Network disable, DNS, egress, DNS filter, Smolfile allow_hosts |
-| `volumes` | `test_volumes.sh` | 6 | virtiofs mounts, /workspace priority |
+| `volumes` | `test_volumes.sh` | 9 | virtiofs mounts, hot reload, DAX, /workspace priority |
 | `ports` | `test_ports.sh` | 2 | Port mapping, cross-VM conflict detection |
 | `storage` | `test_storage.sh` | 12 | Overlay, image list, prune, storage resize |
 | `resources` | `test_resources.sh` | 8 | CLI validation — no VMs required |
@@ -94,4 +93,3 @@ Tests find the `smolvm` binary in this order:
 3. `dist/smolvm-*-darwin-*/smolvm` or `dist/smolvm-*-linux-*/smolvm`
 
 ---
-

@@ -328,6 +328,51 @@ static PACKED_LAYERS_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
 /// Set at startup if SMOLVM_MOUNT_COUNT env var is present.
 static BOOT_VOLUME_MOUNTS: OnceLock<Vec<(String, String, bool)>> = OnceLock::new();
 
+/// Mount a virtiofs device with one policy for every host-backed filesystem:
+/// request DAX first, then fall back to the normal synchronous data path when
+/// the host did not give this device a DAX window.
+#[cfg(target_os = "linux")]
+fn mount_virtiofs(tag: &str, mount_point: &Path) -> std::io::Result<bool> {
+    let src = std::ffi::CString::new(tag)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid tag"))?;
+    let dst = std::ffi::CString::new(mount_point.to_string_lossy().as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid mount point")
+    })?;
+    let fstype = std::ffi::CString::new("virtiofs").expect("static filesystem type");
+    let opts_dax = std::ffi::CString::new("dax,sync").expect("static mount options");
+    let opts_plain = std::ffi::CString::new("sync").expect("static mount options");
+
+    // SAFETY: every argument is a valid, live CString and mount() copies them.
+    let dax_rc = unsafe {
+        libc::mount(
+            src.as_ptr(),
+            dst.as_ptr(),
+            fstype.as_ptr(),
+            0,
+            opts_dax.as_ptr() as *const libc::c_void,
+        )
+    };
+    if dax_rc == 0 {
+        return Ok(true);
+    }
+
+    // SAFETY: same arguments and lifetime as the DAX attempt above.
+    let plain_rc = unsafe {
+        libc::mount(
+            src.as_ptr(),
+            dst.as_ptr(),
+            fstype.as_ptr(),
+            0,
+            opts_plain.as_ptr() as *const libc::c_void,
+        )
+    };
+    if plain_rc == 0 {
+        Ok(false)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 /// Initialize packed layers support by checking SMOLVM_PACKED_LAYERS env var.
 /// Format: "virtiofs_tag:mount_point" (e.g., "smolvm_layers:/packed_layers")
 /// Returns the mount point path if successfully mounted.
@@ -358,26 +403,14 @@ pub fn init_packed_layers() -> Option<PathBuf> {
     // Mount virtiofs using direct syscall (avoids ~3-5ms fork+exec overhead)
     #[cfg(target_os = "linux")]
     {
-        let src = std::ffi::CString::new(tag).ok()?;
-        let dst = std::ffi::CString::new(mount_point.to_str()?).ok()?;
-        let fstype = std::ffi::CString::new("virtiofs").unwrap();
-        // SAFETY: mount virtiofs with valid CString arguments
-        let rc = unsafe {
-            libc::mount(
-                src.as_ptr(),
-                dst.as_ptr(),
-                fstype.as_ptr(),
-                0,
-                std::ptr::null(),
-            )
+        let dax = match mount_virtiofs(tag, &mount_point) {
+            Ok(dax) => dax,
+            Err(err) => {
+                warn!(error = %err, tag = %tag, "failed to mount packed layers virtiofs");
+                return None;
+            }
         };
-
-        if rc != 0 {
-            let err = std::io::Error::last_os_error();
-            warn!(error = %err, tag = %tag, "failed to mount packed layers virtiofs");
-            return None;
-        }
-        info!(mount_point = %mount_point.display(), "packed layers mounted successfully");
+        info!(mount_point = %mount_point.display(), dax, "packed layers mounted successfully");
 
         // List contents for debugging (only at debug level to avoid boot overhead)
         if let Ok(entries) = std::fs::read_dir(&mount_point) {
@@ -3537,54 +3570,14 @@ fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Resul
         if !is_mountpoint(&virtiofs_mount) {
             info!(tag = %tag, mount_point = %virtiofs_mount.display(), "mounting virtiofs");
 
-            // Mount virtiofs using direct syscall (avoids ~3-5ms fork+exec overhead).
-            // Use sync option to ensure writes are persisted immediately.
-            let src = std::ffi::CString::new(tag.as_str()).map_err(|e| StorageError::Internal {
-                message: format!("invalid tag: {}", e),
-            })?;
-            let dst =
-                std::ffi::CString::new(virtiofs_mount.to_string_lossy().as_ref()).map_err(|e| {
-                    StorageError::Internal {
-                        message: format!("invalid mount point: {}", e),
-                    }
-                })?;
-            let fstype = std::ffi::CString::new("virtiofs").unwrap();
-            // DAX first: when the device has a DAX window (host passed a
-            // nonzero shm_size — SMOLVM_MOUNT_DAX=1), a dax mount maps host
-            // page-cache pages directly into the guest, making guest/host
-            // MAP_SHARED mmaps of the same file coherent shared memory (the
-            // clone-ring transport). The kernel silently downgrades dax on a
-            // window-less device; the explicit fallback covers kernels that
-            // reject the option outright.
-            let opts_dax = std::ffi::CString::new("dax,sync").unwrap();
-            let opts_plain = std::ffi::CString::new("sync").unwrap();
-            // SAFETY: mount virtiofs with valid CString arguments
-            let mut rc = unsafe {
-                libc::mount(
-                    src.as_ptr(),
-                    dst.as_ptr(),
-                    fstype.as_ptr(),
-                    0,
-                    opts_dax.as_ptr() as *const libc::c_void,
-                )
+            let dax = match mount_virtiofs(tag, &virtiofs_mount) {
+                Ok(dax) => dax,
+                Err(err) => {
+                    warn!(error = %err, tag = %tag, "failed to mount virtiofs device");
+                    continue;
+                }
             };
-            if rc != 0 {
-                // SAFETY: as above, plain options.
-                rc = unsafe {
-                    libc::mount(
-                        src.as_ptr(),
-                        dst.as_ptr(),
-                        fstype.as_ptr(),
-                        0,
-                        opts_plain.as_ptr() as *const libc::c_void,
-                    )
-                };
-            }
-            if rc != 0 {
-                let err = std::io::Error::last_os_error();
-                warn!(error = %err, tag = %tag, "failed to mount virtiofs device");
-                continue;
-            }
+            info!(tag = %tag, dax, "virtiofs mount active");
         }
 
         // Now bind-mount into the container rootfs

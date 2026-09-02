@@ -18,6 +18,7 @@ pub mod state_probe;
 pub mod terminal;
 #[cfg(unix)]
 pub mod video;
+pub(crate) mod virtiofs;
 /// Encoded browser video is unavailable on non-Unix hosts because the helper
 /// transport uses a mode-restricted Unix socket.
 #[cfg(not(unix))]

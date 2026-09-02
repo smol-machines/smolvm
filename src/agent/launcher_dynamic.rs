@@ -348,7 +348,16 @@ pub fn launch_agent_vm_dynamic(
         free_ctx_on_err!("root DAX requires libkrun with krun_add_virtiofs3");
     };
     // SAFETY: ctx is valid; root_tag/root are valid null-terminated C strings.
-    if unsafe { add_virtiofs3(ctx, root_tag.as_ptr(), root.as_ptr(), 1 << 29, false) } < 0 {
+    if unsafe {
+        add_virtiofs3(
+            ctx,
+            root_tag.as_ptr(),
+            root.as_ptr(),
+            super::virtiofs::rootfs_dax_window(),
+            false,
+        )
+    } < 0
+    {
         free_ctx_on_err!("krun_add_virtiofs3 failed for root filesystem");
     }
 
@@ -780,15 +789,8 @@ pub fn launch_agent_vm_dynamic(
         free_ctx_on_err!("krun_set_exec failed");
     }
 
-    // Every virtiofs mount gets a DAX window (like the root fs above): without
-    // DAX, virtiofs falls back to writeback caching where each file access is a
-    // FUSE round-trip over the virtio queue — pathological for read-heavy mounts
-    // with many files (a multi-GB Python venv took minutes just to import, and a
-    // single file larger than the window stalled entirely). 2 GiB exceeds any
-    // realistic single mapped file; the window is virtual host address space
-    // backed on demand, so oversizing costs nothing until touched.
-    const VIRTIOFS_DAX_WINDOW: u64 = 1 << 31;
-
+    // Packed image layers always use the shared data DAX window. User mounts
+    // follow the same explicit policy as every other launch path below.
     // Add virtiofs mount for packed layers (AFTER set_exec)
     if config.layers_dir.exists() {
         let layers_tag = cstr("smolvm_layers");
@@ -802,7 +804,7 @@ pub fn launch_agent_vm_dynamic(
                 ctx,
                 layers_tag.as_ptr(),
                 layers_path.as_ptr(),
-                VIRTIOFS_DAX_WINDOW,
+                super::virtiofs::DATA_DAX_WINDOW,
                 false,
             )
         } < 0
@@ -822,13 +824,14 @@ pub fn launch_agent_vm_dynamic(
             "mount path contains null byte"
         );
 
+        let dax_window = super::virtiofs::user_mount_dax_window(Path::new(&mount.guest_path));
         // SAFETY: ctx is valid, tag and host_path are valid C strings
         if unsafe {
             add_virtiofs3(
                 ctx,
                 tag.as_ptr(),
                 host_path.as_ptr(),
-                VIRTIOFS_DAX_WINDOW,
+                dax_window,
                 mount.read_only,
             )
         } < 0
@@ -837,6 +840,13 @@ pub fn launch_agent_vm_dynamic(
                 "krun_add_virtiofs failed for '{}' - requested mount cannot be attached",
                 mount.tag
             ));
+        }
+        if dax_window > 0 {
+            tracing::info!(
+                tag = %mount.tag,
+                dax_window_mib = dax_window >> 20,
+                "virtiofs DAX enabled"
+            );
         }
     }
 

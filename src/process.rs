@@ -604,6 +604,10 @@ fn build_seccomp_program(enforce: bool) -> std::result::Result<seccompiler::BpfP
         libc::SYS_dup, libc::SYS_dup3, libc::SYS_getdents64,
         libc::SYS_readlinkat, libc::SYS_faccessat, libc::SYS_faccessat2, libc::SYS_umask,
         libc::SYS_fgetxattr, libc::SYS_flistxattr, libc::SYS_pipe2,
+        // The VMM-owned host-mount watcher mirrors host changes into guest
+        // fsnotify after this filter is installed. `notify` uses inotify on
+        // Linux; without these, enabling a `-v` mount kills an enforced VMM.
+        libc::SYS_inotify_init1, libc::SYS_inotify_add_watch, libc::SYS_inotify_rm_watch,
         // memory (guest RAM, dlopen of libkrun)
         libc::SYS_mmap, libc::SYS_munmap, libc::SYS_mremap, libc::SYS_mprotect,
         libc::SYS_madvise, libc::SYS_brk,
@@ -703,6 +707,9 @@ fn build_seccomp_program(enforce: bool) -> std::result::Result<seccompiler::BpfP
         libc::SYS_access,
         libc::SYS_epoll_wait,
         libc::SYS_poll,
+        // notify-rs uses legacy inotify_init on x86_64; newer architectures
+        // expose only inotify_init1.
+        libc::SYS_inotify_init,
         libc::SYS_arch_prctl,
     ]);
     #[cfg(target_arch = "aarch64")]

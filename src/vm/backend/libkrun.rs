@@ -153,7 +153,13 @@ impl LibkrunVm {
                     "root DAX requires libkrun with krun_add_virtiofs3",
                 ));
             };
-            let ret = krun_add_virtiofs3(ctx, root_tag.as_ptr(), root.as_ptr(), 1 << 29, false);
+            let ret = krun_add_virtiofs3(
+                ctx,
+                root_tag.as_ptr(),
+                root.as_ptr(),
+                crate::agent::virtiofs::rootfs_dax_window(),
+                false,
+            );
             tracing::debug!("[libkrun] krun_add_virtiofs3(root) returned: {}", ret);
             if ret < 0 {
                 krun_free_ctx(ctx);
@@ -238,31 +244,21 @@ impl LibkrunVm {
                 return Err(Error::vm_creation("failed to set exec command"));
             }
 
-            // Add virtiofs mounts for host directories. Prefer krun_add_virtiofs3
-            // with a DAX window (like the root fs): without DAX, virtiofs falls
-            // back to writeback caching where every file access is a FUSE
-            // round-trip over the virtio queue — pathological for read-heavy
-            // mounts with many files (e.g. a multi-GB Python venv taking minutes
-            // just to import). DAX maps file contents through a coherent host
-            // window, giving near-native read throughput. Fall back to the plain
-            // API only on an older libkrun that lacks virtiofs3.
-            // 2 GiB: the window must exceed the largest single file mapped from
-            // the volume, or mapping that file stalls (a 902 MB libtorch_cuda.so
-            // hung against a 512 MB window). The window is virtual host address
-            // space backed on demand, so oversizing costs nothing until touched.
-            const VIRTIOFS_DAX_WINDOW: u64 = 1 << 31;
+            // User mounts follow the same explicit DAX policy as the agent and
+            // packed launchers. Read-only enforcement still requires virtiofs3.
             for (i, mount) in config.mounts.iter().enumerate() {
                 let tag = CString::new(HostMount::mount_tag(i))
                     .map_err(|_| Error::mount("create mount tag", "tag contains null byte"))?;
                 let path = path_to_cstring(&mount.source)?;
 
                 // `krun_add_virtiofs3` is already unwrapped above (the root fs
-                // requires it), so use it directly with a DAX window.
+                // requires it), so use it directly with the shared policy.
+                let dax_window = crate::agent::virtiofs::user_mount_dax_window(&mount.target);
                 let ret = krun_add_virtiofs3(
                     ctx,
                     tag.as_ptr(),
                     path.as_ptr(),
-                    VIRTIOFS_DAX_WINDOW,
+                    dax_window,
                     mount.read_only,
                 );
                 if ret < 0 {
@@ -270,6 +266,13 @@ impl LibkrunVm {
                         "failed to add virtiofs mount: {} -> {}",
                         mount.source.display(),
                         mount.target.display()
+                    );
+                }
+                if dax_window > 0 {
+                    tracing::info!(
+                        tag = %HostMount::mount_tag(i),
+                        dax_window_mib = dax_window >> 20,
+                        "virtiofs DAX enabled"
                     );
                 }
             }

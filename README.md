@@ -154,6 +154,18 @@ smolvm machine exec --name myvm -it -- /bin/sh
 smolvm machine stop --name myvm
 ```
 
+Host directory mounts propagate host-side changes into guest inotify, so tools
+such as Vite, nodemon, and file-watch test runners reload without polling. Set
+`SMOL_NO_HOT_RELOAD=1` in the host process to disable recursive watching for a
+machine with an unusually large directory tree.
+
+For sequential or mmap-heavy reads, `SMOLVM_MOUNT_DAX=1` enables a 2 GiB
+virtiofs DAX window for each user mount when the machine starts. This is a host
+process setting (set it on `smolvm serve` for served machines), and an existing
+machine needs a stop/start to apply it. DAX does not materially accelerate
+metadata-heavy traversal. Confirm it in the guest with
+`grep virtiofs /proc/mounts`; an active mount includes `dax=always`.
+
 **Use git and SSH without copying private keys into the guest.** Forward your host SSH agent into the VM. The guest can ask the agent to sign with any forwarded key while the socket is available, so forward it only to workloads you trust. Requires an SSH agent running on your host (`ssh-add -l` to check).
 
 ```bash

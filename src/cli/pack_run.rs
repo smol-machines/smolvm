@@ -584,6 +584,14 @@ impl PackRunCmd {
                 // steal keystrokes or corrupt terminal state.
                 detach_vm_child_stdio();
 
+                let _fsnotify_watcher = smolvm::agent::FsNotifyWatcher::start_tagged(
+                    config.vsock_socket.to_path_buf(),
+                    config
+                        .mounts
+                        .iter()
+                        .map(|mount| (PathBuf::from(&mount.host_path), mount.tag.clone())),
+                );
+
                 if let Err(e) = launch_agent_vm_dynamic(&krun, &config) {
                     let msg = format!("launch_agent_vm_dynamic failed: {}\n", e);
                     let _ = std::fs::write(&config.console_log, &msg);
@@ -1629,6 +1637,14 @@ fn run_from_cache(
         // steal keystrokes or corrupt terminal state.
         detach_vm_child_stdio();
 
+        let _fsnotify_watcher = smolvm::agent::FsNotifyWatcher::start_tagged(
+            config.vsock_socket.to_path_buf(),
+            config
+                .mounts
+                .iter()
+                .map(|mount| (PathBuf::from(&mount.host_path), mount.tag.clone())),
+        );
+
         if let Err(e) = launch_agent_vm_dynamic(&krun, &config) {
             let msg = format!("launch_agent_vm_dynamic failed: {}\n", e);
             let _ = std::fs::write(&config.console_log, &msg);
@@ -2067,6 +2083,14 @@ fn daemon_start(
         // Without this, libkrun's threads inherit stdin and steal
         // keystrokes from the user's shell.
         detach_vm_child_stdio();
+
+        let _fsnotify_watcher = smolvm::agent::FsNotifyWatcher::start_tagged(
+            config.vsock_socket.to_path_buf(),
+            config
+                .mounts
+                .iter()
+                .map(|mount| (PathBuf::from(&mount.host_path), mount.tag.clone())),
+        );
 
         if let Err(e) = launch_agent_vm_dynamic(&krun, &config) {
             let msg = format!("launch_agent_vm_dynamic failed: {}\n", e);

@@ -46,6 +46,11 @@ const GUEST_VIRTIOFS_ROOT: &str = "/mnt/virtiofs";
 /// into one round-trip while keeping latency well under a human-perceptible
 /// reload delay.
 const COALESCE_WINDOW: Duration = Duration::from_millis(25);
+/// Watcher startup is independent of VM readiness. Poll in short increments so
+/// a failed launch can tear down immediately instead of joining a sleeping
+/// exponential-backoff thread.
+const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+const CONNECT_RETRY_LIMIT: usize = 200;
 
 /// A single watched mount: host source directory → guest virtiofs staging base.
 struct WatchTarget {
@@ -70,6 +75,22 @@ impl FsNotifyWatcher {
     /// thread can't be spawned — the mount still works, only live change
     /// notifications are unavailable.
     pub fn start(socket_path: PathBuf, mounts: &[HostMount]) -> Option<Self> {
+        Self::start_tagged(
+            socket_path,
+            mounts
+                .iter()
+                .enumerate()
+                .map(|(i, mount)| (mount.source.clone(), HostMount::mount_tag(i))),
+        )
+    }
+
+    /// Start a watcher for launch paths that already resolved their virtiofs
+    /// tags (notably packed/sidecar VMs).
+    #[doc(hidden)]
+    pub fn start_tagged(
+        socket_path: PathBuf,
+        mounts: impl IntoIterator<Item = (PathBuf, String)>,
+    ) -> Option<Self> {
         // Opt-out escape hatch: setting SMOL_NO_HOT_RELOAD disables host FS
         // watching entirely (e.g. very large trees, or privacy preference).
         if std::env::var_os("SMOL_NO_HOT_RELOAD").is_some() {
@@ -80,12 +101,11 @@ impl FsNotifyWatcher {
         // is skipped. Read-only mounts are still watched: the host may edit them
         // (that is exactly the read-only-source hot-reload case).
         let targets: Vec<WatchTarget> = mounts
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| m.source.is_dir())
-            .map(|(i, m)| WatchTarget {
-                host_source: m.source.clone(),
-                guest_base: format!("{GUEST_VIRTIOFS_ROOT}/smolvm{i}"),
+            .into_iter()
+            .filter(|(source, _)| source.is_dir())
+            .map(|(host_source, tag)| WatchTarget {
+                host_source,
+                guest_base: format!("{GUEST_VIRTIOFS_ROOT}/{tag}"),
             })
             .collect();
         if targets.is_empty() {
@@ -139,12 +159,9 @@ fn run_watch(socket_path: PathBuf, targets: Vec<WatchTarget>, stop: Arc<AtomicBo
 
     // A dedicated connection so injected events never interleave with the
     // command's own request/response stream on the primary connection.
-    let mut client = match AgentClient::connect_with_retry(&socket_path) {
-        Ok(c) => c,
-        Err(e) => {
-            debug!(error = %e, "fsnotify watcher could not connect to agent; disabled");
-            return;
-        }
+    let mut client = match connect_to_agent(&socket_path, &stop) {
+        Some(client) => client,
+        None => return,
     };
 
     info!(
@@ -188,13 +205,28 @@ fn run_watch(socket_path: PathBuf, targets: Vec<WatchTarget>, stop: Arc<AtomicBo
     }
 }
 
+fn connect_to_agent(socket_path: &Path, stop: &AtomicBool) -> Option<AgentClient> {
+    let mut last_error = None;
+    for _ in 0..CONNECT_RETRY_LIMIT {
+        if stop.load(Ordering::SeqCst) {
+            return None;
+        }
+        match AgentClient::connect(socket_path) {
+            Ok(client) => return Some(client),
+            Err(error) => last_error = Some(error),
+        }
+        std::thread::sleep(CONNECT_RETRY_INTERVAL);
+    }
+    if let Some(error) = last_error {
+        debug!(%error, "fsnotify watcher could not connect to agent; disabled");
+    }
+    None
+}
+
 /// Translate one host event into guest-side [`FsNotifyEvent`]s, appended to `out`.
 fn collect_events(event: &Event, targets: &[WatchTarget], out: &mut Vec<FsNotifyEvent>) {
     for host_path in &event.paths {
-        let Some(t) = targets
-            .iter()
-            .find(|t| host_path.starts_with(&t.host_source))
-        else {
+        let Some(t) = matching_target(host_path, targets) else {
             continue;
         };
         let Ok(rel) = host_path.strip_prefix(&t.host_source) else {
@@ -223,6 +255,13 @@ fn collect_events(event: &Event, targets: &[WatchTarget], out: &mut Vec<FsNotify
             });
         }
     }
+}
+
+fn matching_target<'a>(path: &Path, targets: &'a [WatchTarget]) -> Option<&'a WatchTarget> {
+    targets
+        .iter()
+        .filter(|target| path.starts_with(&target.host_source))
+        .max_by_key(|target| target.host_source.components().count())
 }
 
 /// Join a guest base path with a host-relative path, normalizing separators.
@@ -334,5 +373,19 @@ mod tests {
         ];
         dedup(&mut batch);
         assert_eq!(batch.len(), 1);
+    }
+
+    #[test]
+    fn nested_mount_uses_most_specific_target() {
+        let targets = vec![
+            WatchTarget {
+                host_source: PathBuf::from("/host/project/vendor"),
+                guest_base: "/mnt/virtiofs/smolvm1".into(),
+            },
+            target(),
+        ];
+        let selected = matching_target(Path::new("/host/project/vendor/lib.js"), &targets)
+            .expect("nested path should match");
+        assert_eq!(selected.guest_base, "/mnt/virtiofs/smolvm1");
     }
 }

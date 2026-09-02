@@ -183,6 +183,49 @@ test_trusted_system_mount_is_explicit_and_readonly() {
     [[ ! -e "/etc/$probe" ]]
 }
 
+test_volume_mount_hot_reload_and_dax() {
+    local vm_name="vol-hot-reload-$$"
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    echo "before" > "$tmpdir/watched.txt"
+
+    $SMOLVM machine create --name "$vm_name" --cpus 2 --mem 512 \
+        -v "$tmpdir:/work" >/dev/null 2>&1 || { rm -rf "$tmpdir"; return 1; }
+    SMOLVM_MOUNT_DAX=1 $SMOLVM machine start --name "$vm_name" >/dev/null 2>&1 || {
+        $SMOLVM machine delete --name "$vm_name" -f >/dev/null 2>&1
+        rm -rf "$tmpdir"
+        return 1
+    }
+
+    local mount_options
+    mount_options=$($SMOLVM machine exec --name "$vm_name" -- \
+        sh -lc "awk '\$2 == \"/work\" { print \$4 }' /proc/mounts")
+    if [[ "$mount_options" != *"dax=always"* ]]; then
+        echo "FAIL: DAX was requested but /work options were: $mount_options"
+        $SMOLVM machine stop --name "$vm_name" >/dev/null 2>&1 || true
+        $SMOLVM machine delete --name "$vm_name" -f >/dev/null 2>&1 || true
+        rm -rf "$tmpdir"
+        return 1
+    fi
+
+    local watcher_pid
+    watcher_pid=$($SMOLVM machine exec --name "$vm_name" --detach -- \
+        sh -lc 'exec inotifyd - /work >/tmp/host-events')
+    sleep 1
+    echo "after" > "$tmpdir/watched.txt"
+    sleep 1
+
+    local content events
+    content=$($SMOLVM machine exec --name "$vm_name" -- cat /work/watched.txt)
+    events=$($SMOLVM machine exec --name "$vm_name" -- cat /tmp/host-events)
+    $SMOLVM machine exec --name "$vm_name" -- kill "$watcher_pid" >/dev/null 2>&1 || true
+    $SMOLVM machine stop --name "$vm_name" >/dev/null 2>&1 || true
+    $SMOLVM machine delete --name "$vm_name" -f >/dev/null 2>&1 || true
+    rm -rf "$tmpdir"
+
+    [[ "$content" == "after" && "$events" == *"watched.txt"* ]]
+}
+
 test_default_workspace_symlink_without_volume() {
     local vm_name="vol-ws-default-$$"
 
@@ -297,6 +340,7 @@ run_test "Volume: mount visible to exec" test_machine_volume_mount_visible_to_ex
 run_test "Volume: -v host:/workspace is virtiofs not symlink" test_volume_mount_workspace_is_virtiofs_not_symlink || true
 run_test "Volume: arbitrary mount path (/data)" test_volume_mount_arbitrary_path || true
 run_test "Volume: trusted host system mount is explicit and read-only" test_trusted_system_mount_is_explicit_and_readonly || true
+run_test "Volume: host changes notify guest and DAX is consistent" test_volume_mount_hot_reload_and_dax || true
 run_test "Volume: default /workspace symlink without -v" test_default_workspace_symlink_without_volume || true
 run_test "Create with --image: volume mount visible to exec" test_image_exec_volume_mount_visible || true
 run_test "Create with --image: Smolfile volumes visible to exec" test_image_exec_volume_mount_visible_smolfile || true

@@ -7,7 +7,7 @@
 //! Usage: smolvm _boot-vm <config-path>
 
 use smolvm::agent::boot_config::BootConfig;
-use smolvm::agent::{launch_agent_vm, LaunchConfig, VmDisks};
+use smolvm::agent::{launch_agent_vm, FsNotifyWatcher, LaunchConfig, VmDisks};
 use smolvm::data::disk::{DiskFormat, DiskType};
 use smolvm::storage::VmDisk;
 use std::path::{Path, PathBuf};
@@ -510,6 +510,12 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
         }
         _ => {}
     }
+
+    // The boot subprocess owns the VM for its full lifetime, including
+    // persistent machines whose initiating CLI has exited. Keep host→guest
+    // filesystem notifications here so the watcher cannot disappear early.
+    // Start after seccomp installation so its thread inherits the VMM policy.
+    let _fsnotify_watcher = FsNotifyWatcher::start(config.vsock_socket.clone(), &config.mounts);
 
     // Emit subprocess startup timing to the startup error log (stderr after
     // the stdio redirect above). These lines decompose the dark window between
