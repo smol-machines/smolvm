@@ -212,7 +212,8 @@ test_volume_mount_hot_reload_and_dax() {
     watcher_pid=$($SMOLVM machine exec --name "$vm_name" --detach -- \
         sh -lc 'exec inotifyd - /work >/tmp/host-events')
     sleep 1
-    echo "after" > "$tmpdir/watched.txt"
+    echo "after" > "$tmpdir/watched.txt.tmp"
+    mv "$tmpdir/watched.txt.tmp" "$tmpdir/watched.txt"
     sleep 1
 
     local content events
