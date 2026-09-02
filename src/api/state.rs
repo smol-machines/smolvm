@@ -1753,6 +1753,15 @@ mod tests {
         };
         assert!(!HostMount::try_from(&spec).unwrap().read_only);
 
+        // The trusted system-mount escape hatch is local-CLI-only. An HTTP
+        // caller cannot turn a read-only flag into access to the server host.
+        let system_spec = MountSpec {
+            source: "/etc".into(),
+            target: "/host/etc".into(),
+            readonly: true,
+        };
+        assert!(HostMount::try_from(&system_spec).is_err());
+
         // ResourceSpec with None uses defaults
         let spec = ResourceSpec {
             cpus: None,

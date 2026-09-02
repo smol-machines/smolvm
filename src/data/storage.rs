@@ -83,6 +83,21 @@ impl HostMount {
         target: impl Into<PathBuf>,
         read_only: bool,
     ) -> Result<Self> {
+        Self::new_with_system_mounts(source, target, read_only, false)
+    }
+
+    /// Create a host mount, optionally permitting selected host system trees.
+    ///
+    /// The opt-in is deliberately narrow: only configuration and log trees may
+    /// be exposed, they must be read-only, and they must appear below `/host`
+    /// in the guest. Virtual kernel filesystems and executable system trees
+    /// remain blocked even for trusted callers.
+    pub fn new_with_system_mounts(
+        source: impl Into<PathBuf>,
+        target: impl Into<PathBuf>,
+        read_only: bool,
+        allow_system_mounts: bool,
+    ) -> Result<Self> {
         let mut mount = Self {
             source: source.into(),
             target: target.into(),
@@ -111,7 +126,11 @@ impl HostMount {
                 format!("'{}': {}", mount.source.display(), e),
             )
         })?;
-        Self::validate(&mount)?;
+        if allow_system_mounts {
+            Self::validate_with_system_mounts(&mount, true)?;
+        } else {
+            Self::validate(&mount)?;
+        }
         Ok(mount)
     }
 
@@ -119,7 +138,7 @@ impl HostMount {
     ///
     /// If no mode is provided, the mount defaults to writable.
     /// The source path is validated, required to be a directory, and canonicalized.
-    fn _parse(spec: &str) -> Result<Self> {
+    fn _parse(spec: &str, allow_system_mounts: bool) -> Result<Self> {
         // Parse from the right so a Windows host path keeps its drive-letter
         // colon (e.g. `C:\data:/data:ro`). The guest path is a Unix path with no
         // colon, and the optional trailing mode is `ro`/`rw`; everything before
@@ -131,7 +150,7 @@ impl HostMount {
         };
         match rest.rsplit_once(':') {
             Some((source, target)) if !source.is_empty() && !target.is_empty() => {
-                Self::new(source, target, read_only)
+                Self::new_with_system_mounts(source, target, read_only, allow_system_mounts)
             }
             _ => Err(Error::invalid_mount_path(format!(
                 "invalid format '{}' (expected host:guest[:ro|:rw])",
@@ -142,9 +161,18 @@ impl HostMount {
 
     /// Parse multiple mount specifications.
     pub fn parse(specs: &[String]) -> Result<Vec<Self>> {
+        Self::parse_with_system_mounts(specs, false)
+    }
+
+    /// Parse mounts for a trusted local caller that explicitly opted into
+    /// read-only host system configuration/log mounts.
+    pub fn parse_with_system_mounts(
+        specs: &[String],
+        allow_system_mounts: bool,
+    ) -> Result<Vec<Self>> {
         let mounts: Vec<Self> = specs
             .iter()
-            .map(|spec| Self::_parse(spec))
+            .map(|spec| Self::_parse(spec, allow_system_mounts))
             .collect::<Result<_>>()?;
         Self::ensure_unique_targets(&mounts)?;
         Ok(mounts)
@@ -171,11 +199,36 @@ impl HostMount {
     }
 
     fn validate(mount: &Self) -> Result<()> {
+        Self::validate_with_system_mounts(mount, false)
+    }
+
+    fn validate_with_system_mounts(mount: &Self, allow_system_mounts: bool) -> Result<()> {
         for (illegal_path, block_subtree) in Self::ILLEGAL_SOURCE_MOUNT_PATH {
             let illegal_path = Path::new(illegal_path);
             if mount.source == illegal_path
                 || (*block_subtree && mount.source.starts_with(illegal_path))
             {
+                if allow_system_mounts && Self::trusted_system_source(&mount.source) {
+                    if !mount.read_only {
+                        return Err(Error::mount(
+                            "validate host path",
+                            format!(
+                                "system mount must be read-only; add ':ro' to the volume: {}",
+                                mount.source.display()
+                            ),
+                        ));
+                    }
+                    if !Self::target_is_below_host(&mount.target) {
+                        return Err(Error::mount(
+                            "validate guest path",
+                            format!(
+                                "system mount target must be /host or below it (for example /host/etc): {}",
+                                mount.target.display()
+                            ),
+                        ));
+                    }
+                    continue;
+                }
                 return Err(Error::mount(
                     "validate host path",
                     format!(
@@ -201,6 +254,43 @@ impl HostMount {
         }
 
         Ok(())
+    }
+
+    fn target_is_below_host(target: &Path) -> bool {
+        use std::path::Component;
+
+        let mut components = target.components();
+        if components.next() != Some(Component::RootDir)
+            || components.next() != Some(Component::Normal("host".as_ref()))
+        {
+            return false;
+        }
+
+        components.all(|component| matches!(component, Component::Normal(_)))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn trusted_system_source(source: &Path) -> bool {
+        source == Path::new("/etc")
+            || source.starts_with("/etc")
+            || source == Path::new("/var/log")
+            || source.starts_with("/var/log")
+    }
+
+    #[cfg(target_os = "macos")]
+    fn trusted_system_source(source: &Path) -> bool {
+        // `/etc` and `/var/log` canonicalize below `/private` on macOS.
+        source == Path::new("/private/etc")
+            || source.starts_with("/private/etc")
+            || source == Path::new("/private/var/log")
+            || source.starts_with("/private/var/log")
+    }
+
+    #[cfg(target_os = "windows")]
+    fn trusted_system_source(_source: &Path) -> bool {
+        // The initial capability is intentionally scoped to Unix `/etc` and
+        // `/var/log` semantics. Add Windows trees only with equivalent QA.
+        false
     }
 
     /// Generate a virtiofs mount tag for a given index.
@@ -303,6 +393,68 @@ mod tests {
                 "Error should explain that {} cannot be mounted, got: {}",
                 path,
                 err_msg
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn trusted_system_mounts_require_all_three_guards() {
+        let etc = vec!["/etc:/host/etc:ro".to_string()];
+
+        let default_err = HostMount::parse(&etc).unwrap_err().to_string();
+        assert!(default_err.contains("protected system path"));
+
+        let mounts = HostMount::parse_with_system_mounts(&etc, true).unwrap();
+        assert_eq!(mounts.len(), 1);
+        assert!(mounts[0].read_only);
+        assert_eq!(mounts[0].target, PathBuf::from("/host/etc"));
+
+        let writable =
+            HostMount::parse_with_system_mounts(&["/etc:/host/etc:rw".to_string()], true)
+                .unwrap_err()
+                .to_string();
+        assert!(writable.contains("must be read-only"));
+
+        let wrong_target = HostMount::parse_with_system_mounts(&["/etc:/etc:ro".to_string()], true)
+            .unwrap_err()
+            .to_string();
+        assert!(wrong_target.contains("must be /host or below"));
+
+        let traversal_target =
+            HostMount::parse_with_system_mounts(&["/etc:/host/../etc:ro".to_string()], true)
+                .unwrap_err()
+                .to_string();
+        assert!(traversal_target.contains("must be /host or below"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn trusted_system_mounts_accept_canonical_macos_etc() {
+        let mounts =
+            HostMount::parse_with_system_mounts(&["/etc:/host/etc:ro".to_string()], true).unwrap();
+        assert_eq!(mounts[0].source, PathBuf::from("/private/etc"));
+        assert_eq!(mounts[0].target, PathBuf::from("/host/etc"));
+        assert!(mounts[0].read_only);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn trusted_system_mounts_allow_logs_but_not_kernel_or_executable_trees() {
+        assert!(HostMount::parse_with_system_mounts(
+            &["/var/log:/host/var/log:ro".to_string()],
+            true,
+        )
+        .is_ok());
+
+        for source in ["/proc", "/sys", "/dev", "/usr"] {
+            let spec = format!("{source}:/host{source}:ro");
+            let err = HostMount::parse_with_system_mounts(&[spec], true)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("protected system path"),
+                "{source} should remain protected, got: {err}"
             );
         }
     }

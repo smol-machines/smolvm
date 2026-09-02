@@ -538,6 +538,12 @@ pub struct RunCmd {
     )]
     pub volume: Vec<String>,
 
+    /// Allow trusted read-only host `/etc` and `/var/log` mounts below `/host`.
+    /// This exposes sensitive host data to the guest and must not be used for
+    /// untrusted workloads.
+    #[arg(long, help_heading = "Container")]
+    pub allow_system_mounts: bool,
+
     /// Expose port from container to host (single port or one-to-one range, repeatable)
     #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "PORT[-END]|HOST[-END]:GUEST[-END]", help_heading = "Network")]
     pub port: Vec<PortMappingSpec>,
@@ -962,6 +968,9 @@ fn ensure_init_layer(
             create.push("-e".into());
             create.push(e.clone());
         }
+        if params.allow_system_mounts {
+            create.push("--allow-system-mounts".into());
+        }
         // Forward the run's network config so the bake's one-time in-guest pull can
         // reach the registry. The cached artifact carries the layers, so later runs
         // from it need no network to source the image.
@@ -1090,6 +1099,7 @@ impl RunCmd {
                 workdir: self.workdir,
                 env,
                 volume: self.volume,
+                allow_system_mounts: self.allow_system_mounts,
                 port: port.into_iter().map(PortMappingSpec::from).collect(),
                 net: self.net,
                 net_backend: self.net_backend,
@@ -1171,6 +1181,7 @@ impl RunCmd {
         )?;
 
         let mut params = params;
+        params.allow_system_mounts = self.allow_system_mounts;
         if self.auto_graph {
             smolvm::util::enable_cuda_auto_graph_env_specs(&mut params.env);
             params.cuda = true;
@@ -1226,6 +1237,7 @@ impl RunCmd {
                     workdir: params.workdir.clone(),
                     env: params.env.clone(),
                     volume: params.volume.clone(),
+                    allow_system_mounts: params.allow_system_mounts,
                     port: params
                         .port
                         .iter()
@@ -1342,6 +1354,7 @@ impl RunCmd {
                 workdir: params.workdir.clone(),
                 env: params.env.clone(),
                 volume: params.volume.clone(),
+                allow_system_mounts: params.allow_system_mounts,
                 port: params
                     .port
                     .iter()
@@ -1378,7 +1391,8 @@ impl RunCmd {
         // source as a missing directory.
         let (host_volume_specs, remote_volumes) =
             smolvm::remote_volume::split_specs(&params.volume)?;
-        let mut mounts = HostMount::parse(&host_volume_specs)?;
+        let mut mounts =
+            HostMount::parse_with_system_mounts(&host_volume_specs, params.allow_system_mounts)?;
         if !remote_volumes.is_empty() && !params.net {
             return Err(Error::config(
                 "machine run",
@@ -3068,6 +3082,12 @@ pub struct CreateCmd {
     #[arg(short = 'v', long = "volume", value_name = "HOST|REMOTE:GUEST[:ro]")]
     pub volume: Vec<String>,
 
+    /// Allow trusted read-only host `/etc` and `/var/log` mounts below `/host`.
+    /// This exposes sensitive host data to the guest and must not be used for
+    /// untrusted workloads.
+    #[arg(long)]
+    pub allow_system_mounts: bool,
+
     /// Expose port from VM to host (single port or one-to-one range, repeatable)
     #[arg(short = 'p', long = "port", value_parser = PortMappingSpec::parse, value_name = "PORT[-END]|HOST[-END]:GUEST[-END]")]
     pub port: Vec<PortMappingSpec>,
@@ -3286,6 +3306,7 @@ impl CreateCmd {
             smolvm::util::parse_labels(&self.labels)?,
         )?;
         let mut params = params;
+        params.allow_system_mounts = self.allow_system_mounts;
         if self.auto_graph {
             smolvm::util::enable_cuda_auto_graph_env_specs(&mut params.env);
             params.cuda = true;
@@ -3566,6 +3587,7 @@ impl CreateCmd {
             cpus,
             mem,
             volume: self.volume.clone(),
+            allow_system_mounts: self.allow_system_mounts,
             port: ports,
             net: network,
             network_backend: checkpoint_backend.or(self.net_backend),
@@ -4416,6 +4438,11 @@ pub struct UpdateCmd {
     #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro]")]
     pub volume: Vec<String>,
 
+    /// Allow adding trusted read-only host `/etc` and `/var/log` mounts below
+    /// `/host`. This exposes sensitive host data to the guest.
+    #[arg(long)]
+    pub allow_system_mounts: bool,
+
     /// Remove volume mount (HOST:GUEST)
     #[arg(long, value_name = "HOST:GUEST")]
     pub remove_volume: Vec<String>,
@@ -4528,7 +4555,8 @@ impl UpdateCmd {
 
         // Parse and validate new mounts (after state check so
         // "machine is running" takes priority over "directory not found")
-        let new_mounts = HostMount::parse(&self.volume)?;
+        let new_mounts =
+            HostMount::parse_with_system_mounts(&self.volume, self.allow_system_mounts)?;
         let add_ports = PortMappingSpec::expand_all(&self.port)
             .map_err(|e| smolvm::Error::config("update ports", e))?;
         let remove_ports = PortMappingSpec::expand_all(&self.remove_port)

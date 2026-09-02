@@ -442,6 +442,8 @@ pub struct CreateVmParams {
     pub cpus: u8,
     pub mem: u32,
     pub volume: Vec<String>,
+    /// Permit selected protected host trees as explicit read-only `/host/*` mounts.
+    pub allow_system_mounts: bool,
     pub port: Vec<PortMapping>,
     pub net: bool,
     pub network_backend: Option<NetworkBackend>,
@@ -604,10 +606,11 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
     let (host_volume_specs, remote_volumes) = smolvm::remote_volume::split_specs(&params.volume)?;
 
     // Parse and validate volume mounts
-    let mounts: Vec<(String, String, bool)> = HostMount::parse(&host_volume_specs)?
-        .into_iter()
-        .map(|m| m.to_storage_tuple())
-        .collect();
+    let mounts: Vec<(String, String, bool)> =
+        HostMount::parse_with_system_mounts(&host_volume_specs, params.allow_system_mounts)?
+            .into_iter()
+            .map(|m| m.to_storage_tuple())
+            .collect();
     for volume in &remote_volumes {
         if mounts.iter().any(|(_, target, _)| target == &volume.target) {
             return Err(smolvm::Error::config(
